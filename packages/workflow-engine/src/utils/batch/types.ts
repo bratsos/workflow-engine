@@ -15,8 +15,8 @@
  * - RawBatchResult: raw text before parsing, index
  */
 
-import type { z } from "zod";
 import type { ToolSet } from "ai";
+import type { z } from "zod";
 import type { ModelKey } from "../../ai/model-helper";
 import type { LogLevel } from "../../core/types";
 

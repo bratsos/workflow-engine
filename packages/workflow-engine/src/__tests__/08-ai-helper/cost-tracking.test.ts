@@ -4,9 +4,9 @@
  * Tests for the cost tracking and statistics functionality of AIHelper.
  */
 
-import { describe, it, expect, beforeEach } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
-import { MockAIHelper, createMockAIHelper } from "../utils/mock-ai-helper.js";
+import { createMockAIHelper, MockAIHelper } from "../utils/mock-ai-helper.js";
 
 describe("I want to track AI costs using AIHelper", () => {
   let ai: MockAIHelper;

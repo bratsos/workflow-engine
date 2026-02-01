@@ -4,7 +4,7 @@
  * Tests for job queuing, claiming, and distribution across workers.
  */
 
-import { describe, it, expect, beforeEach } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { InMemoryJobQueue } from "../utils/in-memory-job-queue.js";
 
 describe("I want to distribute jobs across workers", () => {

@@ -7,16 +7,16 @@
  * - Validation workflows with parallel checks
  */
 
-import { describe, it, expect, beforeEach } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
-import { WorkflowBuilder } from "../../core/workflow.js";
 import { WorkflowExecutor } from "../../core/executor.js";
 import { defineStage } from "../../core/stage-factory.js";
-import {
-  InMemoryWorkflowPersistence,
-  InMemoryAICallLogger,
-} from "../utils/index.js";
 import { InMemoryStageStorage } from "../../core/storage-providers/memory-storage.js";
+import { WorkflowBuilder } from "../../core/workflow.js";
+import {
+  InMemoryAICallLogger,
+  InMemoryWorkflowPersistence,
+} from "../utils/index.js";
 
 describe("I want to implement real-world workflow patterns", () => {
   let persistence: InMemoryWorkflowPersistence;

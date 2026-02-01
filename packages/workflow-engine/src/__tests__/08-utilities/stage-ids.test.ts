@@ -4,16 +4,16 @@
  * Tests for stage ID utilities: createStageIds, defineStageIds, isValidStageId, assertValidStageId.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, expect, it } from "vitest";
 import { z } from "zod";
+import { defineStage } from "../../core/stage-factory.js";
 import {
+  assertValidStageId,
   createStageIds,
   defineStageIds,
   isValidStageId,
-  assertValidStageId,
 } from "../../core/stage-ids.js";
 import { WorkflowBuilder } from "../../core/workflow.js";
-import { defineStage } from "../../core/stage-factory.js";
 
 // Helper to create a test stage
 function createTestStage(id: string) {

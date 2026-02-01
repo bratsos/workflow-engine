@@ -7,8 +7,8 @@
  * This is migrated from the original services/job-queue.server.ts
  */
 
-import type { DequeueResult, EnqueueJobInput, JobQueue } from "../interface";
 import { createLogger } from "../../utils/logger";
+import type { DequeueResult, EnqueueJobInput, JobQueue } from "../interface";
 import { createEnumHelper, type PrismaEnumHelper } from "./enum-compat";
 import type { DatabaseType } from "./persistence";
 

@@ -6,14 +6,14 @@
  * configuration, and parallel execution patterns.
  */
 
-import { describe, it, expect, beforeEach } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
-import { WorkflowBuilder } from "../../core/workflow.js";
 import { WorkflowExecutor } from "../../core/executor.js";
 import { defineStage } from "../../core/stage-factory.js";
+import { WorkflowBuilder } from "../../core/workflow.js";
 import {
-  InMemoryWorkflowPersistence,
   InMemoryAICallLogger,
+  InMemoryWorkflowPersistence,
   TestSchemas,
 } from "../utils/index.js";
 

@@ -4,11 +4,11 @@
  * Tests for defining and creating synchronous stages using defineStage().
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { defineStage } from "../../core/stage-factory.js";
-import { TestSchemas, TestConfigSchemas } from "../utils/index.js";
 import type { StageContext } from "../../core/stage.js";
+import { defineStage } from "../../core/stage-factory.js";
+import { TestConfigSchemas, TestSchemas } from "../utils/index.js";
 
 describe("I want to define synchronous stages", () => {
   describe("basic stage creation", () => {

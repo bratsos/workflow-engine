@@ -7,11 +7,11 @@
 
 import { randomUUID } from "crypto";
 import type {
+  DequeueResult,
+  EnqueueJobInput,
   JobQueue,
   JobRecord,
   JobStatus,
-  EnqueueJobInput,
-  DequeueResult,
 } from "../../persistence/interface.js";
 
 export class InMemoryJobQueue implements JobQueue {

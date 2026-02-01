@@ -4,20 +4,20 @@
  * Tests for the model helper utilities: getModel, calculateCost, ModelStatsTracker, etc.
  */
 
-import { describe, it, expect, beforeEach } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import {
-  getModel,
-  getDefaultModel,
-  calculateCost,
-  ModelStatsTracker,
-  listModels,
-  modelSupportsBatch,
   AVAILABLE_MODELS,
+  calculateCost,
   DEFAULT_MODEL_KEY,
-  registerModels,
+  getDefaultModel,
+  getModel,
   getRegisteredModel,
+  listModels,
   listRegisteredModels,
   type ModelConfig,
+  ModelStatsTracker,
+  modelSupportsBatch,
+  registerModels,
 } from "../../ai/model-helper.js";
 
 describe("I want to use model helper utilities", () => {

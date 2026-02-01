@@ -5,12 +5,12 @@
  * for non-blocking logging during AI operations.
  */
 
+import { createLogger } from "../../utils/logger";
 import type {
   AICallLogger,
   AIHelperStats,
   CreateAICallInput,
 } from "../interface";
-import { createLogger } from "../../utils/logger";
 
 const logger = createLogger("AICallLogger");
 

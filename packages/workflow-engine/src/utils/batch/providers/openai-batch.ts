@@ -6,9 +6,9 @@
  * Supports up to 50,000 requests per batch with 24h processing window.
  */
 
+import { jsonSchema } from "ai";
 // Optional peer dependency
 import OpenAI from "openai";
-import { jsonSchema } from "ai";
 import { resolveModelForProvider } from "../model-mapping";
 import type {
   BatchHandle,

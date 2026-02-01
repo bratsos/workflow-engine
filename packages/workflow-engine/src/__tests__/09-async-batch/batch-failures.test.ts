@@ -11,22 +11,22 @@
  * - Failure during different phases (initiate, check, resume)
  */
 
-import { describe, it, expect, beforeEach } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
-import { WorkflowBuilder } from "../../core/workflow.js";
 import { WorkflowExecutor } from "../../core/executor.js";
+import type { SimpleSuspendedResult } from "../../core/stage-factory.js";
 import {
   defineAsyncBatchStage,
   defineStage,
 } from "../../core/stage-factory.js";
+import type { CompletionCheckResult } from "../../core/types.js";
+import { WorkflowBuilder } from "../../core/workflow.js";
 import {
-  InMemoryWorkflowPersistence,
-  InMemoryAICallLogger,
   createFailingSuspendStage,
+  InMemoryAICallLogger,
+  InMemoryWorkflowPersistence,
   TestSchemas,
 } from "../utils/index.js";
-import type { SimpleSuspendedResult } from "../../core/stage-factory.js";
-import type { CompletionCheckResult } from "../../core/types.js";
 
 describe("I want to handle failures in async-batch stages", () => {
   let persistence: InMemoryWorkflowPersistence;

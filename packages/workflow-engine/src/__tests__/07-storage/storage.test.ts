@@ -4,12 +4,12 @@
  * Tests for the storage system including InMemoryStageStorage and StorageFactory.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { InMemoryStageStorage } from "../../core/storage-providers/memory-storage.js";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   createStorage,
   getDefaultStorageProvider,
 } from "../../core/storage-factory.js";
+import { InMemoryStageStorage } from "../../core/storage-providers/memory-storage.js";
 
 describe("I want to use the storage system", () => {
   const workflowRunId = "test-run-123";

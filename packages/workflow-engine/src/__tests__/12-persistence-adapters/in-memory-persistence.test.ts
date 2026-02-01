@@ -4,7 +4,7 @@
  * Tests for the InMemoryWorkflowPersistence utility.
  */
 
-import { describe, it, expect, beforeEach } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { InMemoryWorkflowPersistence } from "../utils/in-memory-persistence.js";
 
 describe("I want to use InMemoryWorkflowPersistence in tests", () => {

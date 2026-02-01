@@ -15,7 +15,7 @@
 
 import { EventEmitter } from "node:events";
 import { createLogger } from "../utils/logger";
-import type { WorkflowSSEEvent, WorkflowEventType } from "./workflow-events";
+import type { WorkflowEventType, WorkflowSSEEvent } from "./workflow-events";
 
 const logger = createLogger("WorkflowEventBus");
 

@@ -4,14 +4,14 @@
  * Tests for the batch model mapping utilities.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
+  BatchProviderName,
+  getBatchCompatibleModels,
+  getBestProviderForModel,
   getProviderModelId,
   getSupportedModels,
   isModelSupported,
-  getBestProviderForModel,
-  getBatchCompatibleModels,
-  BatchProviderName,
 } from "../../utils/batch/model-mapping.js";
 
 describe("I want to use batch model mapping utilities", () => {

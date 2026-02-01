@@ -4,11 +4,11 @@
  * Tests for requireStageOutput, getStageOutput, and NoInputSchema.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
-  requireStageOutput,
   getStageOutput,
   NoInputSchema,
+  requireStageOutput,
 } from "../../core/schema-helpers.js";
 
 describe("I want to use schema helpers to access stage outputs", () => {

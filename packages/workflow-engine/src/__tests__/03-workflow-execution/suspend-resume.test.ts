@@ -4,19 +4,19 @@
  * Tests for async-batch stages that suspend and resume execution.
  */
 
-import { describe, it, expect, beforeEach } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
-import { WorkflowBuilder } from "../../core/workflow.js";
 import { WorkflowExecutor } from "../../core/executor.js";
+import type { SimpleSuspendedResult } from "../../core/stage-factory.js";
 import { defineAsyncBatchStage } from "../../core/stage-factory.js";
+import { WorkflowBuilder } from "../../core/workflow.js";
 import {
-  InMemoryWorkflowPersistence,
-  InMemoryAICallLogger,
   createPassthroughStage,
   createSuspendingStage,
+  InMemoryAICallLogger,
+  InMemoryWorkflowPersistence,
   TestSchemas,
 } from "../utils/index.js";
-import type { SimpleSuspendedResult } from "../../core/stage-factory.js";
 
 describe("I want to handle workflow suspension and resumption", () => {
   let persistence: InMemoryWorkflowPersistence;

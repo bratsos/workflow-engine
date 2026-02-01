@@ -5,13 +5,13 @@
  * Verifies same input to all parallel stages, output merging by index.
  */
 
-import { describe, it, expect, beforeEach } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
-import { WorkflowBuilder } from "../../core/workflow";
 import { WorkflowExecutor } from "../../core/executor";
 import { defineStage } from "../../core/stage-factory";
-import { InMemoryWorkflowPersistence } from "../utils/in-memory-persistence";
+import { WorkflowBuilder } from "../../core/workflow";
 import { InMemoryAICallLogger } from "../utils/in-memory-ai-logger";
+import { InMemoryWorkflowPersistence } from "../utils/in-memory-persistence";
 
 describe("I want data to flow through parallel stages", () => {
   let persistence: InMemoryWorkflowPersistence;

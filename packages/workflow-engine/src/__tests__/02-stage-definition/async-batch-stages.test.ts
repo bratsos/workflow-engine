@@ -4,11 +4,11 @@
  * Tests for defining stages that suspend for long-running batch operations.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, expect, it } from "vitest";
 import { z } from "zod";
+import type { CheckCompletionContext, StageContext } from "../../core/stage.js";
 import { defineAsyncBatchStage } from "../../core/stage-factory.js";
 import { TestSchemas } from "../utils/index.js";
-import type { StageContext, CheckCompletionContext } from "../../core/stage.js";
 
 describe("I want to define async-batch stages", () => {
   describe("stage creation", () => {

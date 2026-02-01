@@ -7,20 +7,20 @@
 
 import { randomUUID } from "crypto";
 import type {
+  CreateLogInput,
+  CreateRunInput,
+  CreateStageInput,
+  SaveArtifactInput,
+  UpdateRunInput,
+  UpdateStageInput,
+  UpsertStageInput,
+  WorkflowArtifactRecord,
+  WorkflowLogRecord,
   WorkflowPersistence,
   WorkflowRunRecord,
   WorkflowStageRecord,
-  WorkflowLogRecord,
-  WorkflowArtifactRecord,
-  WorkflowStatus,
   WorkflowStageStatus,
-  CreateRunInput,
-  UpdateRunInput,
-  CreateStageInput,
-  UpdateStageInput,
-  UpsertStageInput,
-  CreateLogInput,
-  SaveArtifactInput,
+  WorkflowStatus,
 } from "../../persistence/interface.js";
 
 export class InMemoryWorkflowPersistence implements WorkflowPersistence {

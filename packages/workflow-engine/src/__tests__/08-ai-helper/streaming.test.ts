@@ -4,8 +4,8 @@
  * Tests for the streamText functionality of AIHelper.
  */
 
-import { describe, it, expect, beforeEach } from "vitest";
-import { MockAIHelper, createMockAIHelper } from "../utils/mock-ai-helper.js";
+import { beforeEach, describe, expect, it } from "vitest";
+import { createMockAIHelper, MockAIHelper } from "../utils/mock-ai-helper.js";
 
 describe("I want to stream text using AIHelper", () => {
   let ai: MockAIHelper;

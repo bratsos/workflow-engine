@@ -4,11 +4,11 @@
  * Tests for the workflow event bus and event types.
  */
 
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { EventEmitter } from "node:events";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
-  WorkflowSSEEvent,
   WorkflowEventType,
+  WorkflowSSEEvent,
 } from "../../core/workflow-events.js";
 
 // Create a fresh WorkflowEventBus class for each test to avoid singleton state issues

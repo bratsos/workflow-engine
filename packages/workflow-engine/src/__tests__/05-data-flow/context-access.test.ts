@@ -5,14 +5,14 @@
  * Verifies accumulation, non-adjacent access, and typed retrieval.
  */
 
-import { describe, it, expect, beforeEach } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
-import { WorkflowBuilder } from "../../core/workflow";
 import { WorkflowExecutor } from "../../core/executor";
+import { getStageOutput, requireStageOutput } from "../../core/schema-helpers";
 import { defineStage } from "../../core/stage-factory";
-import { InMemoryWorkflowPersistence } from "../utils/in-memory-persistence";
+import { WorkflowBuilder } from "../../core/workflow";
 import { InMemoryAICallLogger } from "../utils/in-memory-ai-logger";
-import { requireStageOutput, getStageOutput } from "../../core/schema-helpers";
+import { InMemoryWorkflowPersistence } from "../utils/in-memory-persistence";
 
 describe("I want to access previous stage outputs", () => {
   let persistence: InMemoryWorkflowPersistence;

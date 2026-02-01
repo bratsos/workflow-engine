@@ -4,7 +4,7 @@
  * Tests for resuming jobs after worker failures.
  */
 
-import { describe, it, expect, beforeEach } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { InMemoryJobQueue } from "../utils/in-memory-job-queue.js";
 
 describe("I want to recover from worker crashes", () => {

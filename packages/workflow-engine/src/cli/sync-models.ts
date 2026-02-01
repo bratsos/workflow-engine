@@ -13,7 +13,7 @@
 
 /// <reference types="node" />
 
-import { existsSync, writeFileSync, mkdirSync } from "fs";
+import { existsSync, mkdirSync, writeFileSync } from "fs";
 import { dirname, join, resolve } from "path";
 import { pathToFileURL } from "url";
 import { type ModelConfig, type ModelSyncConfig } from "../ai/model-helper";

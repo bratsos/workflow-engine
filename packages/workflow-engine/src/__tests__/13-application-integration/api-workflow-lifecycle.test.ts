@@ -8,18 +8,18 @@
  * - Canceling workflows
  */
 
-import { describe, it, expect, beforeEach } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
-import { WorkflowBuilder } from "../../core/workflow.js";
+import type { WorkflowRegistry } from "../../core/stage-executor.js";
 import { defineStage } from "../../core/stage-factory.js";
+import type { Workflow } from "../../core/workflow.js";
+import { WorkflowBuilder } from "../../core/workflow.js";
 import {
-  InMemoryWorkflowPersistence,
-  InMemoryJobQueue,
   InMemoryAICallLogger,
+  InMemoryJobQueue,
+  InMemoryWorkflowPersistence,
   TestSchemas,
 } from "../utils/index.js";
-import type { WorkflowRegistry } from "../../core/stage-executor.js";
-import type { Workflow } from "../../core/workflow.js";
 
 describe("I want to manage workflow lifecycle from an API", () => {
   let persistence: InMemoryWorkflowPersistence;

@@ -7,7 +7,7 @@
  * Uses FOR UPDATE SKIP LOCKED pattern for atomic claiming.
  */
 
-import { describe, it, expect, beforeEach } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { InMemoryWorkflowPersistence } from "../utils/in-memory-persistence.js";
 
 describe("I want to prevent race conditions when claiming workflows", () => {

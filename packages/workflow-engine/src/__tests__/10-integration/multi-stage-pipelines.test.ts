@@ -5,14 +5,14 @@
  * Tests sequential, mixed, and context accumulation patterns.
  */
 
-import { describe, it, expect, beforeEach } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
-import { WorkflowBuilder } from "../../core/workflow.js";
 import { WorkflowExecutor } from "../../core/executor.js";
 import { defineStage } from "../../core/stage-factory.js";
+import { WorkflowBuilder } from "../../core/workflow.js";
 import {
-  InMemoryWorkflowPersistence,
   InMemoryAICallLogger,
+  InMemoryWorkflowPersistence,
 } from "../utils/index.js";
 
 describe("I want to build multi-stage pipelines", () => {

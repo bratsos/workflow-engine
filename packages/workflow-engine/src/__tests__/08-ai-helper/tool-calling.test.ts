@@ -4,9 +4,9 @@
  * Tests for the tool calling functionality of AIHelper.
  */
 
-import { describe, it, expect, beforeEach } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
-import { MockAIHelper, createMockAIHelper } from "../utils/mock-ai-helper.js";
+import { createMockAIHelper, MockAIHelper } from "../utils/mock-ai-helper.js";
 
 describe("I want to use tools with AIHelper", () => {
   let ai: MockAIHelper;

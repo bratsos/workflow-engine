@@ -4,21 +4,21 @@
  * Tests for config preset schemas and combinator functions.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import {
   AIConfigSchema,
   ConcurrencyConfigSchema,
-  FeatureFlagsConfigSchema,
   DebugConfigSchema,
+  EmptyConfigSchema,
+  FeatureFlagsConfigSchema,
+  MinimalAIConfigSchema,
   withAIConfig,
   withConcurrency,
-  withFeatureFlags,
   withDebug,
-  withStandardConfig,
+  withFeatureFlags,
   withFullConfig,
-  EmptyConfigSchema,
-  MinimalAIConfigSchema,
+  withStandardConfig,
 } from "../../core/config-presets.js";
 
 describe("I want to use config presets for my stages", () => {

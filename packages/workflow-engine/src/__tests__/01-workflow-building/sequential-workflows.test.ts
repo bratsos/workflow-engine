@@ -4,13 +4,13 @@
  * Tests for creating and configuring sequential workflows using the WorkflowBuilder API.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { WorkflowBuilder } from "../../core/workflow.js";
 import {
+  createFixedOutputStage,
   createPassthroughStage,
   createTransformStage,
-  createFixedOutputStage,
   TestSchemas,
 } from "../utils/index.js";
 

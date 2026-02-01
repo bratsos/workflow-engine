@@ -5,14 +5,14 @@
  * Covers saving, loading, checking existence, deleting artifacts, and key generation.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
-import { WorkflowBuilder } from "../../core/workflow.js";
 import { WorkflowExecutor } from "../../core/executor.js";
 import { defineStage } from "../../core/stage-factory.js";
-import { InMemoryWorkflowPersistence } from "../utils/in-memory-persistence.js";
-import { InMemoryAICallLogger } from "../utils/in-memory-ai-logger.js";
 import { InMemoryStageStorage } from "../../core/storage-providers/memory-storage.js";
+import { WorkflowBuilder } from "../../core/workflow.js";
+import { InMemoryAICallLogger } from "../utils/in-memory-ai-logger.js";
+import { InMemoryWorkflowPersistence } from "../utils/in-memory-persistence.js";
 
 describe("I want to use stage storage", () => {
   let persistence: InMemoryWorkflowPersistence;

@@ -4,9 +4,9 @@
  * Tests for the in-memory AI call logger used in testing.
  */
 
-import { describe, it, expect, beforeEach } from "vitest";
-import { InMemoryAICallLogger } from "../utils/in-memory-ai-logger.js";
+import { beforeEach, describe, expect, it } from "vitest";
 import type { CreateAICallInput } from "../../persistence/interface.js";
+import { InMemoryAICallLogger } from "../utils/in-memory-ai-logger.js";
 
 describe("I want to use InMemoryAICallLogger in tests", () => {
   let logger: InMemoryAICallLogger;

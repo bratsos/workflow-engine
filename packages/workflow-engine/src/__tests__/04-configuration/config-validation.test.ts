@@ -4,10 +4,10 @@
  * Tests for workflow configuration validation using workflow.validateConfig().
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { WorkflowBuilder } from "../../core/workflow.js";
 import { defineStage } from "../../core/stage-factory.js";
+import { WorkflowBuilder } from "../../core/workflow.js";
 import { createPassthroughStage, TestSchemas } from "../utils/index.js";
 
 describe("I want to validate workflow configuration", () => {
