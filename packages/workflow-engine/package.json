@@ -1,0 +1,112 @@
+{
+  "name": "@bratsos/workflow-engine",
+  "version": "0.0.11",
+  "description": "Type-safe, distributed workflow engine for AI-orchestrated processes with suspend/resume, parallel execution, and cost tracking",
+  "type": "module",
+  "license": "MIT",
+  "author": "Alex Bratsos",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bratsos/workflow-engine"
+  },
+  "homepage": "https://github.com/bratsos/workflow-engine#readme",
+  "bugs": {
+    "url": "https://github.com/bratsos/workflow-engine/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "workflow",
+    "workflow-engine",
+    "ai",
+    "orchestration",
+    "typescript",
+    "async",
+    "batch-processing",
+    "distributed",
+    "suspend-resume",
+    "llm"
+  ],
+  "bin": {
+    "workflow-engine-sync": "./dist/cli/sync-models.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./client": {
+      "types": "./dist/client.d.ts",
+      "import": "./dist/client.js",
+      "default": "./dist/client.js"
+    },
+    "./testing": {
+      "types": "./dist/testing/index.d.ts",
+      "import": "./dist/testing/index.js",
+      "default": "./dist/testing/index.js"
+    },
+    "./persistence": {
+      "types": "./dist/persistence/index.d.ts",
+      "import": "./dist/persistence/index.js",
+      "default": "./dist/persistence/index.js"
+    },
+    "./persistence/prisma": {
+      "types": "./dist/persistence/prisma/index.d.ts",
+      "import": "./dist/persistence/prisma/index.js",
+      "default": "./dist/persistence/prisma/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "skills",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsup",
+    "test": "vitest run",
+    "sync-models": "tsx src/cli/sync-models.ts"
+  },
+  "dependencies": {
+    "@ai-sdk/google": "^3.0.1",
+    "@openrouter/ai-sdk-provider": "^2.1.1",
+    "ai": "^6.0.3",
+    "js-tiktoken": "^1.0.21",
+    "zod": "^4.1.12"
+  },
+  "peerDependencies": {
+    "@anthropic-ai/sdk": ">=0.35.0",
+    "@google/genai": ">=1.0.0",
+    "@prisma/client": ">=6.0.0",
+    "openai": ">=4.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@prisma/client": {
+      "optional": true
+    },
+    "@anthropic-ai/sdk": {
+      "optional": true
+    },
+    "@google/genai": {
+      "optional": true
+    },
+    "openai": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "tsup": "^8.5.1",
+    "tsx": "^4.19.0",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4"
+  },
+  "engines": {
+    "node": ">=22.11.0"
+  }
+}
