@@ -18,7 +18,7 @@
 import { google } from "@ai-sdk/google";
 import { openrouter } from "@openrouter/ai-sdk-provider";
 import type { StepResult, ToolSet } from "ai";
-import { embed, generateObject, generateText, streamText } from "ai";
+import { embed, generateText, Output, streamText } from "ai";
 import type { z } from "zod";
 import type { AICallLogger } from "../persistence";
 import { getBestProviderForModel } from "../utils/batch/model-mapping";
@@ -344,10 +344,13 @@ function getModelProvider(modelConfig: ModelConfig) {
   if (modelConfig.provider === "openrouter") {
     // strict pricing: don't pay more than the model's defined cost
     // this effectively prevents routing to more expensive providers
+    // require_parameters ensures routing only to providers that support
+    // the requested features (e.g., json_schema for structured output)
     return openrouter(modelConfig.id, {
       extraBody: {
         provider: {
           sort: "throughput",
+          require_parameters: true,
           max_price: {
             prompt: modelConfig.inputCostPerMillion,
             completion: modelConfig.outputCostPerMillion,
@@ -679,10 +682,11 @@ class AIHelperImpl implements AIHelper {
           .join("\n") || "[multimodal content]"
       : (prompt as string);
 
-    // Build request based on input type
+    // Build request using AI SDK v6 pattern: generateText with Output.object()
+    // This replaces the deprecated generateObject() and has better provider compatibility
     const baseOptions = {
       model,
-      schema,
+      output: Output.object({ schema }),
       temperature: options.temperature ?? 0,
       maxOutputTokens: options.maxTokens,
       // Tool-related options (only included if tools are provided)
@@ -708,7 +712,7 @@ class AIHelperImpl implements AIHelper {
 
     try {
       const result = isMultimodal
-        ? await generateObject({
+        ? await generateText({
             ...baseOptions,
             messages: [
               {
@@ -726,7 +730,7 @@ class AIHelperImpl implements AIHelper {
               },
             ],
           })
-        : await generateObject({
+        : await generateText({
             ...baseOptions,
             prompt,
           });
@@ -747,7 +751,7 @@ class AIHelperImpl implements AIHelper {
         modelKey,
         modelId: modelConfig.id,
         prompt: promptForLog,
-        response: JSON.stringify(result.object, null, 2),
+        response: JSON.stringify(result.output, null, 2),
         inputTokens,
         outputTokens,
         cost,
@@ -767,7 +771,7 @@ class AIHelperImpl implements AIHelper {
       });
 
       // Trace log after successful AI call
-      const responseStr = JSON.stringify(result.object);
+      const responseStr = JSON.stringify(result.output);
       logger.debug(`generateObject response`, {
         model: modelKey,
         response:
@@ -781,7 +785,7 @@ class AIHelperImpl implements AIHelper {
       });
 
       return {
-        object: result.object as z.infer<TSchema>,
+        object: result.output as z.infer<TSchema>,
         inputTokens,
         outputTokens,
         cost,
