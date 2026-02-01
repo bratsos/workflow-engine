@@ -300,6 +300,91 @@ process.on("SIGTERM", () => {
 });
 ```
 
+## Rerunning Workflows from a Specific Stage
+
+You can rerun a workflow starting from a specific stage, skipping earlier stages and using their persisted outputs. This is useful for:
+- Retrying after a stage failure (fix the bug, rerun from the failed stage)
+- Re-processing data with updated stage logic
+- Testing specific stages in isolation
+
+### Using WorkflowExecutor.execute() with fromStage
+
+```typescript
+import { WorkflowExecutor } from "@bratsos/workflow-engine";
+
+// Given: A workflow that has already been run (stages 1-4 completed)
+const executor = new WorkflowExecutor(
+  workflow,
+  workflowRunId,
+  workflowType,
+  { persistence, aiLogger }
+);
+
+// Rerun from stage 3 - skips stages 1-2, runs 3-4
+const result = await executor.execute(
+  input,    // Original input (not used when fromStage is set)
+  config,
+  { fromStage: "stage-3" }
+);
+```
+
+### How It Works
+
+1. **Finds the execution group** containing the specified stage
+2. **Loads input** from the previous stage's persisted output (or workflow input if first stage)
+3. **Rebuilds workflowContext** from all completed stages before the target group
+4. **Deletes stage records** for the target stage and all subsequent stages (clean re-execution)
+5. **Executes** from the target stage forward
+
+### Requirements
+
+- **Previous stages must have been executed** - their outputs must be persisted
+- **Stage must exist** in the workflow definition
+
+### Error Handling
+
+```typescript
+// Error: Stage doesn't exist
+await executor.execute(input, config, { fromStage: "non-existent" });
+// Throws: Stage "non-existent" not found in workflow "my-workflow"
+
+// Error: No prior execution
+await executor.execute(input, config, { fromStage: "stage-3" });
+// Throws: Cannot rerun from stage "stage-3": no completed stages found before execution group 3
+```
+
+### Common Use Cases
+
+**Retry After Failure:**
+```typescript
+// Stage 3 failed, you fixed the bug
+await executor.execute(input, config, { fromStage: "stage-3" });
+```
+
+**Re-process with Updated Logic:**
+```typescript
+// Updated stage-2 implementation, want to rerun from there
+await executor.execute(input, config, { fromStage: "stage-2" });
+```
+
+**Fresh Start from Beginning:**
+```typescript
+// Rerun entire workflow
+await executor.execute(input, config, { fromStage: "stage-1" });
+```
+
+### workflowContext Availability
+
+When rerunning from a stage, `ctx.workflowContext` contains outputs from all stages **before** the target group:
+
+```typescript
+// Rerunning from stage-3 (group 3)
+// ctx.workflowContext contains:
+// - "stage-1": { ... }  // from group 1
+// - "stage-2": { ... }  // from group 2
+// - NOT "stage-3" or later
+```
+
 ## Worker Deployment Patterns
 
 ### Single Worker

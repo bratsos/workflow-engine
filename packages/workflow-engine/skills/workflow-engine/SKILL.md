@@ -40,6 +40,7 @@ Type-safe workflow engine for building AI-powered, multi-stage pipelines with pe
 - User needs AI integration (generateText, generateObject, embeddings, batch)
 - User is building multi-stage data processing pipelines
 - User mentions workflow runtime, job queues, or stage execution
+- User wants to rerun a workflow from a specific stage (retry after failure)
 - User needs to test workflows with mocks
 
 ## Quick Start
