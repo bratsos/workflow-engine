@@ -4,7 +4,8 @@ description: Guide for @bratsos/workflow-engine - a type-safe workflow engine wi
 license: MIT
 metadata:
   author: bratsos
-  version: "0.0.11"
+  version: "0.1.0"
+  repository: https://github.com/bratsos/workflow-engine
 ---
 
 # @bratsos/workflow-engine Skill
