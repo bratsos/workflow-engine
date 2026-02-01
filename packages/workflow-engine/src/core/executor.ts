@@ -200,7 +200,7 @@ export class WorkflowExecutor extends EventEmitter {
   async execute<TInput, TOutput>(
     input: TInput,
     config: Record<string, unknown>,
-    options: { resume?: boolean } = {},
+    options: { resume?: boolean; fromStage?: string } = {},
   ): Promise<TOutput | "suspended"> {
     try {
       // Validate config before execution
@@ -247,6 +247,23 @@ export class WorkflowExecutor extends EventEmitter {
             `Loaded ${Object.keys(workflowContext).length} previous stage outputs into context`,
           );
         }
+      }
+
+      // Handle fromStage option - rerun from a specific stage
+      if (options.fromStage) {
+        const fromStageData = await this.loadFromStageState(options.fromStage);
+        startGroupNumber = fromStageData.executionGroup;
+        currentOutput = fromStageData.input;
+        workflowContext = fromStageData.workflowContext;
+
+        this.log(
+          "INFO",
+          `Rerunning from stage "${options.fromStage}" (group ${startGroupNumber})`,
+        );
+        this.log(
+          "INFO",
+          `Loaded ${Object.keys(workflowContext).length} previous stage outputs into context`,
+        );
       }
 
       // Execute stage groups
@@ -841,6 +858,162 @@ export class WorkflowExecutor extends EventEmitter {
     );
 
     return workflowContext;
+  }
+
+  /**
+   * Load state for rerunning from a specific stage.
+   * Requires that previous stages have already been executed and their outputs persisted.
+   *
+   * @param stageId - The stage ID to start execution from
+   * @returns The execution group, input data, and workflow context
+   */
+  private async loadFromStageState(stageId: string): Promise<{
+    executionGroup: number;
+    input: any;
+    workflowContext: Record<string, unknown>;
+  }> {
+    // Find the stage in the workflow definition
+    const stage = this.workflow.getStage(stageId);
+    if (!stage) {
+      throw new Error(
+        `Stage "${stageId}" not found in workflow "${this.workflow.id}"`,
+      );
+    }
+
+    // Find the execution group for this stage
+    const executionPlan = this.workflow.getExecutionPlan();
+    let executionGroup = -1;
+
+    for (const group of executionPlan) {
+      const foundInGroup = group.find((node) => node.stage.id === stageId);
+      if (foundInGroup) {
+        executionGroup = foundInGroup.executionGroup;
+        break;
+      }
+    }
+
+    if (executionGroup === -1) {
+      throw new Error(
+        `Stage "${stageId}" not found in execution plan for workflow "${this.workflow.id}"`,
+      );
+    }
+
+    logger.debug(
+      `loadFromStageState: stage "${stageId}" is in execution group ${executionGroup}`,
+    );
+
+    // Load input for this stage
+    let input: any;
+
+    if (executionGroup === 1) {
+      // First group: use the original workflow input
+      const run = await this.persistence.getRun(this.workflowRunId);
+      if (!run) {
+        throw new Error(`WorkflowRun "${this.workflowRunId}" not found`);
+      }
+      input = run.input;
+      logger.debug(`Using workflow input for first group stage`);
+    } else {
+      // Later groups: load output from the previous group's stage(s)
+      const previousGroup = executionGroup - 1;
+
+      // Find the last completed stage in the previous group
+      const previousCompleted =
+        await this.persistence.getLastCompletedStageBefore(
+          this.workflowRunId,
+          executionGroup,
+        );
+
+      if (!previousCompleted) {
+        throw new Error(
+          `Cannot rerun from stage "${stageId}": no completed stages found before execution group ${executionGroup}. ` +
+            `You must run the workflow from the beginning first.`,
+        );
+      }
+
+      // Load the output from the previous stage
+      const outputData = previousCompleted.outputData as any;
+
+      if (outputData?._artifactKey) {
+        input = await this.persistence.loadArtifact(
+          this.workflowRunId,
+          outputData._artifactKey,
+        );
+        logger.debug(`Loaded input from artifact: ${outputData._artifactKey}`);
+      } else if (outputData) {
+        input = outputData;
+        logger.debug(
+          `Using outputData directly from stage ${previousCompleted.stageId}`,
+        );
+      } else {
+        throw new Error(
+          `Cannot rerun from stage "${stageId}": no output data found for previous stage "${previousCompleted.stageId}"`,
+        );
+      }
+    }
+
+    // Load workflow context from all completed stages before this group
+    // But only include stages from groups BEFORE the target group
+    const completedStages = await this.persistence.getStagesByRun(
+      this.workflowRunId,
+      {
+        status: "COMPLETED",
+        orderBy: "asc",
+      },
+    );
+
+    const workflowContext: Record<string, unknown> = {};
+
+    for (const completedStage of completedStages) {
+      // Only include stages from groups before the target group
+      if (completedStage.executionGroup >= executionGroup) {
+        continue;
+      }
+
+      const outputData = completedStage.outputData as any;
+      let output: any;
+
+      if (outputData?._artifactKey) {
+        output = await this.persistence.loadArtifact(
+          this.workflowRunId,
+          outputData._artifactKey,
+        );
+      } else if (outputData) {
+        output = outputData;
+      } else {
+        logger.warn(
+          `No output data found for completed stage ${completedStage.stageId}`,
+        );
+        continue;
+      }
+
+      workflowContext[completedStage.stageId] = output;
+      logger.debug(
+        `Loaded output for stage ${completedStage.stageId} into workflowContext`,
+      );
+    }
+
+    // Delete any existing stage records for this stage and later stages
+    // so they can be re-executed fresh
+    const stagesToDelete = await this.persistence.getStagesByRun(
+      this.workflowRunId,
+      {},
+    );
+
+    for (const stageToDelete of stagesToDelete) {
+      if (stageToDelete.executionGroup >= executionGroup) {
+        await this.persistence.deleteStage(stageToDelete.id);
+        logger.debug(
+          `Deleted stage ${stageToDelete.stageId} (group ${stageToDelete.executionGroup}) for re-execution`,
+        );
+      }
+    }
+
+    return {
+      executionGroup,
+      input,
+      workflowContext,
+    };
   }
 
   /**
