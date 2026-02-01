@@ -6,12 +6,14 @@
   "scripts": {
     "test": "cd packages/workflow-engine && pnpm test",
     "build": "cd packages/workflow-engine && pnpm build",
+    "typecheck": "cd packages/workflow-engine && pnpm tsc --noEmit",
     "check": "pnpm biome check .",
     "check:fix": "pnpm biome check --write .",
     "format": "pnpm biome format .",
     "format:fix": "pnpm biome format --write .",
     "lint": "pnpm biome check .",
     "lint:fix": "pnpm biome check --write .",
+    "ci": "pnpm lint && pnpm typecheck && pnpm test && pnpm build",
     "changeset": "changeset",
     "version": "changeset version",
     "release": "pnpm build && cd packages/workflow-engine && npm publish --access public --provenance"

@@ -381,18 +381,22 @@ function calculateCostWithDiscount(
 
 class AIHelperImpl implements AIHelper {
   readonly topic: string;
-  private readonly logger: AICallLogger;
+  private readonly aiCallLogger: AICallLogger;
   private readonly logContext?: LogContext;
   private readonly batchLogFn?: BatchLogFn;
 
-  constructor(topic: string, logger: AICallLogger, logContext?: LogContext) {
-    if (!logger) {
+  constructor(
+    topic: string,
+    aiCallLogger: AICallLogger,
+    logContext?: LogContext,
+  ) {
+    if (!aiCallLogger) {
       throw new Error(
         "AIHelperImpl requires a logger. Create one using createPrismaAICallLogger(prisma).",
       );
     }
     this.topic = topic;
-    this.logger = logger;
+    this.aiCallLogger = aiCallLogger;
     this.logContext = logContext;
 
     // Create batch log function if logContext is provided
@@ -457,7 +461,7 @@ class AIHelperImpl implements AIHelper {
               };
               if (result.toolName) {
                 const childTopic = `${this.topic}.tool.${result.toolName}`;
-                this.logger.logCall({
+                this.aiCallLogger.logCall({
                   topic: childTopic,
                   callType: "text",
                   modelKey: modelKey,
@@ -567,7 +571,7 @@ class AIHelperImpl implements AIHelper {
       const durationMs = Date.now() - startTime;
 
       // Log the call (including error cases where finishReason is "error")
-      this.logger.logCall({
+      this.aiCallLogger.logCall({
         topic: this.topic,
         callType: "text",
         modelKey,
@@ -628,7 +632,7 @@ class AIHelperImpl implements AIHelper {
         durationMs,
       });
 
-      this.logger.logCall({
+      this.aiCallLogger.logCall({
         topic: this.topic,
         callType: "text",
         modelKey,
@@ -737,7 +741,7 @@ class AIHelperImpl implements AIHelper {
       const durationMs = Date.now() - startTime;
 
       // Log the call (including error cases where finishReason is "error")
-      this.logger.logCall({
+      this.aiCallLogger.logCall({
         topic: this.topic,
         callType: "object",
         modelKey,
@@ -795,7 +799,7 @@ class AIHelperImpl implements AIHelper {
         durationMs,
       });
 
-      this.logger.logCall({
+      this.aiCallLogger.logCall({
         topic: this.topic,
         callType: "object",
         modelKey,
@@ -879,7 +883,7 @@ class AIHelperImpl implements AIHelper {
       );
       const durationMs = Date.now() - startTime;
 
-      this.logger.logCall({
+      this.aiCallLogger.logCall({
         topic: this.topic,
         callType: "embed",
         modelKey,
@@ -927,7 +931,7 @@ class AIHelperImpl implements AIHelper {
         durationMs,
       });
 
-      this.logger.logCall({
+      this.aiCallLogger.logCall({
         topic: this.topic,
         callType: "embed",
         modelKey,
@@ -979,7 +983,7 @@ class AIHelperImpl implements AIHelper {
       const errorMessage =
         error instanceof Error ? error.message : String(error);
 
-      this.logger.logCall({
+      this.aiCallLogger.logCall({
         topic: this.topic,
         callType: "stream",
         modelKey,
@@ -1117,7 +1121,7 @@ class AIHelperImpl implements AIHelper {
         });
 
         // Persist to DB
-        this.logger.logCall({
+        this.aiCallLogger.logCall({
           topic: this.topic,
           callType: "stream",
           modelKey,
@@ -1166,12 +1170,12 @@ class AIHelperImpl implements AIHelper {
       ? `${this.topic}.${segment}.${id}`
       : `${this.topic}.${segment}`;
     // Preserve logContext for child helpers (same workflow context)
-    return new AIHelperImpl(newTopic, this.logger, this.logContext);
+    return new AIHelperImpl(newTopic, this.aiCallLogger, this.logContext);
   }
 
   /** @internal Get the logger for batch operations */
   getLogger(): AICallLogger {
-    return this.logger;
+    return this.aiCallLogger;
   }
 
   // Overloaded recordCall to support both new object-based API and legacy positional API
@@ -1236,7 +1240,7 @@ class AIHelperImpl implements AIHelper {
     );
 
     // Persist to DB (fire and forget)
-    this.logger.logCall({
+    this.aiCallLogger.logCall({
       topic: this.topic,
       callType,
       modelKey,
@@ -1251,7 +1255,7 @@ class AIHelperImpl implements AIHelper {
   }
 
   async getStats(): Promise<AIHelperStats> {
-    return this.logger.getStats(this.topic);
+    return this.aiCallLogger.getStats(this.topic);
   }
 }
 
