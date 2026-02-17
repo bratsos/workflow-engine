@@ -190,3 +190,60 @@ export type {
   RawBatchResult,
   SerializedBatch,
 } from "./utils/batch/types";
+
+// =============================================================================
+// Kernel API (Phase 1)
+// =============================================================================
+
+export {
+  createKernel,
+  type Kernel,
+  type KernelConfig,
+  type WorkflowRegistry as KernelWorkflowRegistry,
+} from "./kernel/kernel";
+export type {
+  KernelCommand,
+  KernelCommandType,
+  CommandResult,
+  RunCreateCommand,
+  RunCreateResult,
+  RunClaimPendingCommand,
+  RunClaimPendingResult,
+  RunTransitionCommand,
+  RunTransitionResult,
+  RunCancelCommand,
+  RunCancelResult,
+  JobExecuteCommand,
+  JobExecuteResult,
+  StagePollSuspendedCommand,
+  StagePollSuspendedResult,
+  LeaseReapStaleCommand,
+  LeaseReapStaleResult,
+  PluginReplayDLQCommand,
+  PluginReplayDLQResult,
+} from "./kernel/commands";
+export type {
+  KernelEvent,
+  KernelEventType,
+} from "./kernel/events";
+export type {
+  Clock,
+  Persistence,
+  BlobStore,
+  JobTransport,
+  EventSink,
+  Scheduler,
+} from "./kernel/ports";
+export {
+  definePlugin,
+  createPluginRunner,
+  type PluginDefinition,
+  type PluginRunnerConfig,
+  type PluginRunner,
+} from "./kernel/plugins";
+export { StaleVersionError } from "./persistence/interface";
+export type {
+  OutboxRecord,
+  CreateOutboxEventInput,
+  IdempotencyRecord,
+} from "./persistence/interface";
