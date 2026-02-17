@@ -15,21 +15,25 @@
  */
 
 import { randomUUID } from "crypto";
-import type {
-  CreateLogInput,
-  CreateRunInput,
-  CreateStageInput,
-  SaveArtifactInput,
-  UpdateRunInput,
-  UpdateStageInput,
-  UpsertStageInput,
-  WorkflowArtifactRecord,
-  WorkflowLogRecord,
-  WorkflowPersistence,
-  WorkflowRunRecord,
-  WorkflowStageRecord,
-  WorkflowStageStatus,
-  WorkflowStatus,
+import {
+  StaleVersionError,
+  type CreateLogInput,
+  type CreateOutboxEventInput,
+  type CreateRunInput,
+  type CreateStageInput,
+  type IdempotencyRecord,
+  type OutboxRecord,
+  type SaveArtifactInput,
+  type UpdateRunInput,
+  type UpdateStageInput,
+  type UpsertStageInput,
+  type WorkflowArtifactRecord,
+  type WorkflowLogRecord,
+  type WorkflowPersistence,
+  type WorkflowRunRecord,
+  type WorkflowStageRecord,
+  type WorkflowStageStatus,
+  type WorkflowStatus,
 } from "../persistence/interface.js";
 
 export class InMemoryWorkflowPersistence implements WorkflowPersistence {
@@ -37,6 +41,9 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
   private stages = new Map<string, WorkflowStageRecord>();
   private logs = new Map<string, WorkflowLogRecord>();
   private artifacts = new Map<string, WorkflowArtifactRecord>();
+  private outbox: OutboxRecord[] = [];
+  private idempotencyKeys = new Map<string, IdempotencyRecord>();
+  private outboxSequences = new Map<string, number>();
 
   // Helper to generate composite keys for stages
   private stageKey(runId: string, stageId: string): string {
@@ -58,6 +65,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
       id: data.id ?? randomUUID(),
       createdAt: now,
       updatedAt: now,
+      version: 1,
       workflowId: data.workflowId,
       workflowName: data.workflowName,
       workflowType: data.workflowType,
@@ -82,10 +90,16 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
       throw new Error(`WorkflowRun not found: ${id}`);
     }
 
+    if (data.expectedVersion !== undefined && run.version !== data.expectedVersion) {
+      throw new StaleVersionError("WorkflowRun", id, data.expectedVersion, run.version);
+    }
+
+    const { expectedVersion: _, ...rest } = data;
     const updated: WorkflowRunRecord = {
       ...run,
-      ...data,
+      ...rest,
       updatedAt: new Date(),
+      version: run.version + 1,
     };
     this.runs.set(id, updated);
   }
@@ -118,6 +132,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
       status: "RUNNING",
       startedAt: new Date(),
       updatedAt: new Date(),
+      version: run.version + 1,
     };
     this.runs.set(id, updated);
     return true;
@@ -157,6 +172,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
       status: "RUNNING",
       startedAt: new Date(),
       updatedAt: new Date(),
+      version: currentRun.version + 1,
     };
     this.runs.set(claimed.id, claimed);
 
@@ -174,6 +190,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
       id,
       createdAt: now,
       updatedAt: now,
+      version: 1,
       workflowRunId: data.workflowRunId,
       stageId: data.stageId,
       stageName: data.stageName,
@@ -211,6 +228,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
         ...existing,
         ...data.update,
         updatedAt: new Date(),
+        version: existing.version + 1,
       };
       this.stages.set(existing.id, updated);
       this.stages.set(key, updated);
@@ -226,10 +244,16 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
       throw new Error(`WorkflowStage not found: ${id}`);
     }
 
+    if (data.expectedVersion !== undefined && stage.version !== data.expectedVersion) {
+      throw new StaleVersionError("WorkflowStage", id, data.expectedVersion, stage.version);
+    }
+
+    const { expectedVersion: _, ...rest } = data;
     const updated: WorkflowStageRecord = {
       ...stage,
-      ...data,
+      ...rest,
       updatedAt: new Date(),
+      version: stage.version + 1,
     };
     this.stages.set(id, updated);
     this.stages.set(this.stageKey(stage.workflowRunId, stage.stageId), updated);
@@ -246,10 +270,16 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
       throw new Error(`WorkflowStage not found: ${workflowRunId}/${stageId}`);
     }
 
+    if (data.expectedVersion !== undefined && stage.version !== data.expectedVersion) {
+      throw new StaleVersionError("WorkflowStage", `${workflowRunId}/${stageId}`, data.expectedVersion, stage.version);
+    }
+
+    const { expectedVersion: _, ...rest } = data;
     const updated: WorkflowStageRecord = {
       ...stage,
-      ...data,
+      ...rest,
       updatedAt: new Date(),
+      version: stage.version + 1,
     };
     this.stages.set(stage.id, updated);
     this.stages.set(key, updated);
@@ -296,14 +326,17 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
   }
 
   async getSuspendedStages(beforeDate: Date): Promise<WorkflowStageRecord[]> {
+    const seenIds = new Set<string>();
     return Array.from(this.stages.values())
-      .filter(
-        (s) =>
+      .filter((s) => {
+        if (seenIds.has(s.id)) return false;
+        seenIds.add(s.id);
+        return (
           s.status === "SUSPENDED" &&
-          s.nextPollAt &&
-          s.nextPollAt <= beforeDate &&
-          this.stages.get(s.id) === s,
-      )
+          s.nextPollAt !== null &&
+          s.nextPollAt <= beforeDate
+        );
+      })
       .map((s) => ({ ...s }));
   }
 
@@ -368,6 +401,108 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
       metadata: data.metadata ?? null,
     };
     this.logs.set(record.id, record);
+  }
+
+  // ============================================================================
+  // Outbox Operations
+  // ============================================================================
+
+  async appendOutboxEvents(events: CreateOutboxEventInput[]): Promise<void> {
+    for (const event of events) {
+      const currentSeq = this.outboxSequences.get(event.workflowRunId) ?? 0;
+      const nextSeq = currentSeq + 1;
+      this.outboxSequences.set(event.workflowRunId, nextSeq);
+
+      const record: OutboxRecord = {
+        id: randomUUID(),
+        workflowRunId: event.workflowRunId,
+        sequence: nextSeq,
+        eventType: event.eventType,
+        payload: event.payload,
+        causationId: event.causationId,
+        occurredAt: event.occurredAt,
+        publishedAt: null,
+        retryCount: 0,
+        dlqAt: null,
+      };
+      this.outbox.push(record);
+    }
+  }
+
+  async getUnpublishedOutboxEvents(limit?: number): Promise<OutboxRecord[]> {
+    const effectiveLimit = limit ?? 100;
+    return this.outbox
+      .filter((r) => r.publishedAt === null && r.dlqAt === null)
+      .sort((a, b) => {
+        const runCmp = a.workflowRunId.localeCompare(b.workflowRunId);
+        if (runCmp !== 0) return runCmp;
+        return a.sequence - b.sequence;
+      })
+      .slice(0, effectiveLimit)
+      .map((r) => ({ ...r }));
+  }
+
+  async markOutboxEventsPublished(ids: string[]): Promise<void> {
+    const idSet = new Set(ids);
+    for (const record of this.outbox) {
+      if (idSet.has(record.id)) {
+        record.publishedAt = new Date();
+      }
+    }
+  }
+
+  async incrementOutboxRetryCount(id: string): Promise<number> {
+    const record = this.outbox.find((r) => r.id === id);
+    if (!record) throw new Error(`Outbox event not found: ${id}`);
+    record.retryCount++;
+    return record.retryCount;
+  }
+
+  async moveOutboxEventToDLQ(id: string): Promise<void> {
+    const record = this.outbox.find((r) => r.id === id);
+    if (!record) throw new Error(`Outbox event not found: ${id}`);
+    record.dlqAt = new Date();
+  }
+
+  async replayDLQEvents(maxEvents: number): Promise<number> {
+    const dlqEvents = this.outbox
+      .filter((r) => r.dlqAt !== null)
+      .slice(0, maxEvents);
+    for (const record of dlqEvents) {
+      record.dlqAt = null;
+      record.retryCount = 0;
+    }
+    return dlqEvents.length;
+  }
+
+  // ============================================================================
+  // Idempotency Operations
+  // ============================================================================
+
+  async checkIdempotencyKey(
+    key: string,
+    commandType: string,
+  ): Promise<{ exists: boolean; result?: unknown }> {
+    const compositeKey = `${commandType}:${key}`;
+    const record = this.idempotencyKeys.get(compositeKey);
+    if (record) {
+      return { exists: true, result: record.result };
+    }
+    return { exists: false };
+  }
+
+  async setIdempotencyKey(
+    key: string,
+    commandType: string,
+    result: unknown,
+  ): Promise<void> {
+    const compositeKey = `${commandType}:${key}`;
+    this.idempotencyKeys.set(compositeKey, {
+      key,
+      commandType,
+      result,
+      createdAt: new Date(),
+    });
   }
 
   // ============================================================================
@@ -461,6 +596,9 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
     this.stages.clear();
     this.logs.clear();
     this.artifacts.clear();
+    this.outbox = [];
+    this.idempotencyKeys.clear();
+    this.outboxSequences.clear();
   }
 
   /**

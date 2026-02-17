@@ -543,6 +543,22 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
   }
 
   // ============================================================================
+  // Outbox DLQ Operations (stubs - not yet implemented for Prisma)
+  // ============================================================================
+
+  async incrementOutboxRetryCount(_id: string): Promise<number> {
+    throw new Error("Not implemented: incrementOutboxRetryCount");
+  }
+
+  async moveOutboxEventToDLQ(_id: string): Promise<void> {
+    throw new Error("Not implemented: moveOutboxEventToDLQ");
+  }
+
+  async replayDLQEvents(_maxEvents: number): Promise<number> {
+    throw new Error("Not implemented: replayDLQEvents");
+  }
+
+  // ============================================================================
   // Type Mappers
   // ============================================================================
 
@@ -564,6 +580,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       totalCost: run.totalCost,
       totalTokens: run.totalTokens,
       priority: run.priority,
+      version: run.version ?? 0,
     };
   }
 
@@ -592,6 +609,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       metrics: stage.metrics,
       embeddingInfo: stage.embeddingInfo,
       errorMessage: stage.errorMessage,
+      version: stage.version ?? 0,
     };
   }
 

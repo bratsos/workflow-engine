@@ -48,6 +48,20 @@ export type LogLevel = "DEBUG" | "INFO" | "WARN" | "ERROR";
 
 export type ArtifactType = "STAGE_OUTPUT" | "ARTIFACT" | "METADATA";
 
+export class StaleVersionError extends Error {
+  constructor(
+    public readonly entity: string,
+    public readonly id: string,
+    public readonly expected: number,
+    public readonly actual: number,
+  ) {
+    super(
+      `Stale version on ${entity} ${id}: expected ${expected}, got ${actual}`,
+    );
+    this.name = "StaleVersionError";
+  }
+}
+
 // ============================================================================
 // Record Types (minimal fields needed by the workflow engine)
 // ============================================================================
@@ -56,6 +70,7 @@ export interface WorkflowRunRecord {
   id: string;
   createdAt: Date;
   updatedAt: Date;
+  version: number;
   workflowId: string;
   workflowName: string;
   workflowType: string;
@@ -75,6 +90,7 @@ export interface WorkflowStageRecord {
   id: string;
   createdAt: Date;
   updatedAt: Date;
+  version: number;
   workflowRunId: string;
   stageId: string;
   stageName: string;
@@ -120,6 +136,42 @@ export interface WorkflowArtifactRecord {
   metadata: unknown | null;
 }
 
+// ============================================================================
+// Outbox and Idempotency Record Types (for kernel transactional outbox)
+// ============================================================================
+
+export interface OutboxRecord {
+  id: string;
+  workflowRunId: string;
+  sequence: number;
+  eventType: string;
+  payload: unknown;
+  causationId: string;
+  occurredAt: Date;
+  publishedAt: Date | null;
+  retryCount: number;
+  dlqAt: Date | null;
+}
+
+export interface CreateOutboxEventInput {
+  workflowRunId: string;
+  eventType: string;
+  payload: unknown;
+  causationId: string;
+  occurredAt: Date;
+}
+
+export interface IdempotencyRecord {
+  key: string;
+  commandType: string;
+  result: unknown;
+  createdAt: Date;
+}
+
+// ============================================================================
+// AI Call Record Types
+// ============================================================================
+
 export interface AICallRecord {
   id: string;
   createdAt: Date;
@@ -140,6 +192,7 @@ export interface JobRecord {
   createdAt: Date;
   updatedAt: Date;
   workflowRunId: string;
+  workflowId: string;
   stageId: string;
   status: JobStatus;
   priority: number;
@@ -178,6 +231,7 @@ export interface UpdateRunInput {
   output?: unknown;
   totalCost?: number;
   totalTokens?: number;
+  expectedVersion?: number;
 }
 
 export interface CreateStageInput {
@@ -208,6 +262,7 @@ export interface UpdateStageInput {
   embeddingInfo?: unknown;
   artifacts?: unknown;
   errorMessage?: string;
+  expectedVersion?: number;
 }
 
 export interface UpsertStageInput {
@@ -250,6 +305,7 @@ export interface CreateAICallInput {
 
 export interface EnqueueJobInput {
   workflowRunId: string;
+  workflowId: string;
   stageId: string;
   priority?: number;
   payload?: Record<string, unknown>;
@@ -259,6 +315,7 @@ export interface EnqueueJobInput {
 export interface DequeueResult {
   jobId: string;
   workflowRunId: string;
+  workflowId: string;
   stageId: string;
   priority: number;
   attempt: number;
@@ -342,6 +399,16 @@ export interface WorkflowPersistence {
     stageId: string,
     output: unknown,
   ): Promise<string>;
+
+  // Outbox DLQ operations
+  /** Increment retry count for a failed outbox event. Returns new count. */
+  incrementOutboxRetryCount(id: string): Promise<number>;
+
+  /** Move an outbox event to DLQ (sets dlqAt). */
+  moveOutboxEventToDLQ(id: string): Promise<void>;
+
+  /** Reset DLQ events so they can be reprocessed by outbox.flush. Returns count reset. */
+  replayDLQEvents(maxEvents: number): Promise<number>;
 }
 
 // ============================================================================
