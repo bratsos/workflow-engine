@@ -190,6 +190,8 @@ export type {
   LeaseReapStaleResult,
   PluginReplayDLQCommand,
   PluginReplayDLQResult,
+  RunRerunFromCommand,
+  RunRerunFromResult,
 } from "./kernel/commands";
 export type {
   KernelEvent,

@@ -36,6 +36,8 @@ export type {
   OutboxFlushResult,
   PluginReplayDLQCommand,
   PluginReplayDLQResult,
+  RunRerunFromCommand,
+  RunRerunFromResult,
 } from "./commands.js";
 
 // Event types
