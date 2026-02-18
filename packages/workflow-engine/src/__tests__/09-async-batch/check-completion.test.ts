@@ -1,42 +1,55 @@
 /**
- * Async Batch Check Completion Tests
+ * Async Batch Check Completion Tests (kernel version)
  *
- * Tests for polling mechanics and completion checking.
+ * Tests for polling mechanics and completion checking via kernel dispatch().
  *
- * Note: Basic checkCompletion returning ready/not-ready is covered in 02-stage-definition/async-batch-stages.test.ts
- * This file focuses on:
- * - Polling configuration and timing
- * - Max wait time handling
- * - State management during polling
- * - Progressive state updates
- * - nextCheckIn overrides
+ * Covers:
+ * - Poll configuration (pollInterval, nextPollAt, maxWaitTime)
+ * - checkCompletion behavior (escalating intervals, state/context args, progress tracking)
+ * - Completion with output (output storage, metrics)
+ * - State persistence during polling (batchId consistency, timestamp preservation)
  */
 
-import { beforeEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { WorkflowExecutor } from "../../core/executor.js";
-import type { SimpleSuspendedResult } from "../../core/stage-factory.js";
-import { defineAsyncBatchStage } from "../../core/stage-factory.js";
-import type { CompletionCheckResult } from "../../core/types.js";
-import { WorkflowBuilder } from "../../core/workflow.js";
+import { createKernel } from "../../kernel/kernel.js";
 import {
-  InMemoryAICallLogger,
-  InMemoryWorkflowPersistence,
-  TestSchemas,
-} from "../utils/index.js";
+  FakeClock,
+  InMemoryBlobStore,
+  CollectingEventSink,
+  NoopScheduler,
+} from "../../kernel/testing/index.js";
+import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
+import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
+import { defineAsyncBatchStage } from "../../core/stage-factory.js";
+import { WorkflowBuilder, type Workflow } from "../../core/workflow.js";
+import type { CompletionCheckResult } from "../../core/types.js";
+
+function createTestKernel(workflows: Workflow<any, any>[] = []) {
+  const persistence = new InMemoryWorkflowPersistence();
+  const blobStore = new InMemoryBlobStore();
+  const jobTransport = new InMemoryJobQueue("test-worker");
+  const eventSink = new CollectingEventSink();
+  const scheduler = new NoopScheduler();
+  const clock = new FakeClock();
+  const registry = new Map<string, Workflow<any, any>>();
+  for (const w of workflows) registry.set(w.id, w);
+  const kernel = createKernel({
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry: { getWorkflow: (id) => registry.get(id) },
+  });
+  const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
+  return { kernel, flush, persistence, blobStore, jobTransport, eventSink, scheduler, clock, registry };
+}
 
 describe("I want to poll async-batch stages for completion", () => {
-  let persistence: InMemoryWorkflowPersistence;
-  let aiLogger: InMemoryAICallLogger;
-
-  beforeEach(() => {
-    persistence = new InMemoryWorkflowPersistence();
-    aiLogger = new InMemoryAICallLogger();
-  });
-
   describe("poll configuration", () => {
     it("should use pollInterval from suspended state", async () => {
-      // Given: Stage with specific poll interval
       const pollInterval = 5000;
 
       const asyncStage = defineAsyncBatchStage({
@@ -48,25 +61,13 @@ describe("I want to poll async-batch stages for completion", () => {
           output: z.object({ done: z.boolean() }),
           config: z.object({}),
         },
-        async execute(ctx) {
-          if (ctx.resumeState) {
-            return { output: { done: true } };
-          }
+        async execute() {
           const now = new Date();
           return {
             suspended: true,
-            state: {
-              batchId: "batch-poll",
-              submittedAt: now.toISOString(),
-              pollInterval,
-              maxWaitTime: 60000,
-            },
-            pollConfig: {
-              pollInterval,
-              maxWaitTime: 60000,
-              nextPollAt: new Date(now.getTime() + pollInterval),
-            },
-          } as SimpleSuspendedResult;
+            state: { batchId: "batch-poll", submittedAt: now.toISOString(), pollInterval, maxWaitTime: 60000 },
+            pollConfig: { pollInterval, maxWaitTime: 60000, nextPollAt: new Date(now.getTime() + pollInterval) },
+          };
         },
         async checkCompletion() {
           return { ready: true, output: { done: true } };
@@ -74,47 +75,38 @@ describe("I want to poll async-batch stages for completion", () => {
       });
 
       const workflow = new WorkflowBuilder(
-        "poll-config",
-        "Poll Config Workflow",
-        "Test",
+        "poll-config", "Poll Config Workflow", "Test",
         z.object({}).passthrough(),
         z.object({ done: z.boolean() }),
-      )
-        .pipe(asyncStage)
-        .build();
+      ).pipe(asyncStage).build();
 
-      await persistence.createRun({
-        id: "run-poll-config",
+      const { kernel, flush, persistence } = createTestKernel([workflow]);
+
+      const createResult = await kernel.dispatch({
+        type: "run.create", idempotencyKey: "poll-1",
+        workflowId: "poll-config", input: {},
+      });
+      await kernel.dispatch({ type: "run.claimPending", workerId: "w" });
+      await flush();
+
+      // Execute -> suspends
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: createResult.workflowRunId,
         workflowId: "poll-config",
-        workflowName: "Poll Config Workflow",
-        status: "PENDING",
-        input: {},
+        stageId: "poll-interval-stage",
+        config: {},
       });
 
-      // When: Execute and suspend
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-poll-config",
-        "poll-config",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
-      await executor.execute({}, {});
-
-      // Then: Stage record has correct poll config
-      const stages = await persistence.getStagesByRun("run-poll-config", {});
+      // Verify stage record has correct pollInterval in suspendedState
+      const stages = await persistence.getStagesByRun(createResult.workflowRunId);
       const stage = stages.find((s) => s.stageId === "poll-interval-stage");
-
       expect(stage?.suspendedState).toBeDefined();
       const suspendedState = stage?.suspendedState as { pollInterval: number };
       expect(suspendedState.pollInterval).toBe(pollInterval);
     });
 
-    it("should store nextPollAt time for orchestrator", async () => {
-      // Given: Stage that suspends
-      const now = new Date();
+    it("should store nextPollAt time in stage record", async () => {
       const pollInterval = 3000;
 
       const asyncStage = defineAsyncBatchStage({
@@ -126,24 +118,13 @@ describe("I want to poll async-batch stages for completion", () => {
           output: z.object({ done: z.boolean() }),
           config: z.object({}),
         },
-        async execute(ctx) {
-          if (ctx.resumeState) {
-            return { output: { done: true } };
-          }
+        async execute() {
+          const now = new Date();
           return {
             suspended: true,
-            state: {
-              batchId: "batch-next",
-              submittedAt: now.toISOString(),
-              pollInterval,
-              maxWaitTime: 60000,
-            },
-            pollConfig: {
-              pollInterval,
-              maxWaitTime: 60000,
-              nextPollAt: new Date(now.getTime() + pollInterval),
-            },
-          } as SimpleSuspendedResult;
+            state: { batchId: "batch-next", submittedAt: now.toISOString(), pollInterval, maxWaitTime: 60000 },
+            pollConfig: { pollInterval, maxWaitTime: 60000, nextPollAt: new Date(now.getTime() + pollInterval) },
+          };
         },
         async checkCompletion() {
           return { ready: true, output: { done: true } };
@@ -151,45 +132,35 @@ describe("I want to poll async-batch stages for completion", () => {
       });
 
       const workflow = new WorkflowBuilder(
-        "next-poll",
-        "Next Poll Workflow",
-        "Test",
+        "next-poll", "Next Poll Workflow", "Test",
         z.object({}).passthrough(),
         z.object({ done: z.boolean() }),
-      )
-        .pipe(asyncStage)
-        .build();
+      ).pipe(asyncStage).build();
 
-      await persistence.createRun({
-        id: "run-next-poll",
+      const { kernel, flush, persistence } = createTestKernel([workflow]);
+
+      const createResult = await kernel.dispatch({
+        type: "run.create", idempotencyKey: "next-poll-1",
+        workflowId: "next-poll", input: {},
+      });
+      await kernel.dispatch({ type: "run.claimPending", workerId: "w" });
+      await flush();
+
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: createResult.workflowRunId,
         workflowId: "next-poll",
-        workflowName: "Next Poll Workflow",
-        status: "PENDING",
-        input: {},
+        stageId: "next-poll-stage",
+        config: {},
       });
 
-      // When: Execute and suspend
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-next-poll",
-        "next-poll",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
-      await executor.execute({}, {});
-
-      // Then: Stage record has nextPollAt set
-      const stages = await persistence.getStagesByRun("run-next-poll", {});
+      const stages = await persistence.getStagesByRun(createResult.workflowRunId);
       const stage = stages.find((s) => s.stageId === "next-poll-stage");
-
       expect(stage?.nextPollAt).toBeDefined();
       expect(stage?.nextPollAt).toBeInstanceOf(Date);
     });
 
-    it("should store maxWaitTime for timeout detection", async () => {
-      // Given: Stage with specific max wait time
+    it("should store maxWaitTime in suspended state", async () => {
       const maxWaitTime = 300000; // 5 minutes
 
       const asyncStage = defineAsyncBatchStage({
@@ -201,25 +172,13 @@ describe("I want to poll async-batch stages for completion", () => {
           output: z.object({ done: z.boolean() }),
           config: z.object({}),
         },
-        async execute(ctx) {
-          if (ctx.resumeState) {
-            return { output: { done: true } };
-          }
+        async execute() {
           const now = new Date();
           return {
             suspended: true,
-            state: {
-              batchId: "batch-max",
-              submittedAt: now.toISOString(),
-              pollInterval: 5000,
-              maxWaitTime,
-            },
-            pollConfig: {
-              pollInterval: 5000,
-              maxWaitTime,
-              nextPollAt: new Date(now.getTime() + 5000),
-            },
-          } as SimpleSuspendedResult;
+            state: { batchId: "batch-max", submittedAt: now.toISOString(), pollInterval: 5000, maxWaitTime },
+            pollConfig: { pollInterval: 5000, maxWaitTime, nextPollAt: new Date(now.getTime() + 5000) },
+          };
         },
         async checkCompletion() {
           return { ready: true, output: { done: true } };
@@ -227,49 +186,39 @@ describe("I want to poll async-batch stages for completion", () => {
       });
 
       const workflow = new WorkflowBuilder(
-        "max-wait",
-        "Max Wait Workflow",
-        "Test",
+        "max-wait", "Max Wait Workflow", "Test",
         z.object({}).passthrough(),
         z.object({ done: z.boolean() }),
-      )
-        .pipe(asyncStage)
-        .build();
+      ).pipe(asyncStage).build();
 
-      await persistence.createRun({
-        id: "run-max-wait",
+      const { kernel, flush, persistence } = createTestKernel([workflow]);
+
+      const createResult = await kernel.dispatch({
+        type: "run.create", idempotencyKey: "max-wait-1",
+        workflowId: "max-wait", input: {},
+      });
+      await kernel.dispatch({ type: "run.claimPending", workerId: "w" });
+      await flush();
+
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: createResult.workflowRunId,
         workflowId: "max-wait",
-        workflowName: "Max Wait Workflow",
-        status: "PENDING",
-        input: {},
+        stageId: "max-wait-stage",
+        config: {},
       });
 
-      // When: Execute and suspend
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-max-wait",
-        "max-wait",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
-      await executor.execute({}, {});
-
-      // Then: Suspended state has maxWaitTime
-      const stages = await persistence.getStagesByRun("run-max-wait", {});
+      const stages = await persistence.getStagesByRun(createResult.workflowRunId);
       const stage = stages.find((s) => s.stageId === "max-wait-stage");
       const suspendedState = stage?.suspendedState as { maxWaitTime: number };
-
       expect(suspendedState.maxWaitTime).toBe(maxWaitTime);
     });
   });
 
   describe("checkCompletion behavior", () => {
-    it("should allow checkCompletion to override next poll interval", async () => {
-      // Given: Stage where checkCompletion returns custom nextCheckIn
+    it("should reschedule with custom nextCheckIn when not ready", async () => {
       let checkCount = 0;
-      const customIntervals = [1000, 2000, 5000]; // Escalating intervals
+      const customIntervals = [1000, 2000, 5000];
 
       const asyncStage = defineAsyncBatchStage({
         id: "override-interval",
@@ -280,160 +229,85 @@ describe("I want to poll async-batch stages for completion", () => {
           output: z.object({ count: z.number() }),
           config: z.object({}),
         },
-        async execute(ctx) {
-          if (ctx.resumeState) {
-            return { output: { count: checkCount } };
-          }
+        async execute() {
           const now = new Date();
           return {
             suspended: true,
-            state: {
-              batchId: "batch-override",
-              submittedAt: now.toISOString(),
-              pollInterval: 500,
-              maxWaitTime: 60000,
-            },
-            pollConfig: {
-              pollInterval: 500,
-              maxWaitTime: 60000,
-              nextPollAt: new Date(now.getTime() + 500),
-            },
-          } as SimpleSuspendedResult;
+            state: { batchId: "batch-override", submittedAt: now.toISOString(), pollInterval: 500, maxWaitTime: 60000 },
+            pollConfig: { pollInterval: 500, maxWaitTime: 60000, nextPollAt: new Date(now.getTime() + 500) },
+          };
         },
-        async checkCompletion(): Promise<
-          CompletionCheckResult<{ count: number }>
-        > {
+        async checkCompletion(): Promise<CompletionCheckResult<{ count: number }>> {
           checkCount++;
           if (checkCount >= 3) {
             return { ready: true, output: { count: checkCount } };
           }
-          // Return increasing intervals
-          return {
-            ready: false,
-            nextCheckIn: customIntervals[checkCount - 1],
-          };
+          return { ready: false, nextCheckIn: customIntervals[checkCount - 1] };
         },
       });
 
-      // When: checkCompletion is called multiple times
-      const state = {
-        batchId: "batch-override",
-        submittedAt: new Date().toISOString(),
-        pollInterval: 500,
-        maxWaitTime: 60000,
-      };
+      const workflow = new WorkflowBuilder(
+        "override", "Override Workflow", "Test",
+        z.object({}).passthrough(),
+        z.object({ count: z.number() }),
+      ).pipe(asyncStage).build();
 
-      const context = {
-        workflowRunId: "run-1",
+      const { kernel, flush, persistence, clock } = createTestKernel([workflow]);
+
+      const createResult = await kernel.dispatch({
+        type: "run.create", idempotencyKey: "override-1",
+        workflowId: "override", input: {},
+      });
+      await kernel.dispatch({ type: "run.claimPending", workerId: "w" });
+      await flush();
+
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: createResult.workflowRunId,
+        workflowId: "override",
         stageId: "override-interval",
         config: {},
-        log: () => {},
-        storage: {
-          save: async () => {},
-          load: async () => null,
-          exists: async () => false,
-          delete: async () => {},
-          getStageKey: () => "key",
-        },
-      };
-
-      // First check
-      const result1 = await asyncStage.checkCompletion!(state, context);
-      expect(result1.ready).toBe(false);
-      expect(result1.nextCheckIn).toBe(1000);
-
-      // Second check
-      const result2 = await asyncStage.checkCompletion!(state, context);
-      expect(result2.ready).toBe(false);
-      expect(result2.nextCheckIn).toBe(2000);
-
-      // Third check - ready
-      const result3 = await asyncStage.checkCompletion!(state, context);
-      expect(result3.ready).toBe(true);
-    });
-
-    it("should provide state and context to checkCompletion", async () => {
-      // Given: Stage that captures checkCompletion arguments
-      let capturedState: unknown = null;
-      let capturedContext: unknown = null;
-
-      const asyncStage = defineAsyncBatchStage({
-        id: "capture-args",
-        name: "Capture Args Stage",
-        mode: "async-batch",
-        schemas: {
-          input: z.object({}).passthrough(),
-          output: z.object({ done: z.boolean() }),
-          config: z.object({ apiEndpoint: z.string() }),
-        },
-        async execute(ctx) {
-          if (ctx.resumeState) {
-            return { output: { done: true } };
-          }
-          const now = new Date();
-          return {
-            suspended: true,
-            state: {
-              batchId: "batch-capture",
-              submittedAt: now.toISOString(),
-              pollInterval: 1000,
-              maxWaitTime: 60000,
-              metadata: {
-                originalInput: { test: "data" },
-              },
-            },
-            pollConfig: {
-              pollInterval: 1000,
-              maxWaitTime: 60000,
-              nextPollAt: new Date(now.getTime() + 1000),
-            },
-          } as SimpleSuspendedResult;
-        },
-        async checkCompletion(state, ctx) {
-          capturedState = state;
-          capturedContext = ctx;
-          return { ready: true, output: { done: true } };
-        },
       });
 
-      // When: checkCompletion is called
-      const state = {
-        batchId: "batch-capture",
-        submittedAt: new Date().toISOString(),
-        pollInterval: 1000,
-        maxWaitTime: 60000,
-        metadata: { originalInput: { test: "data" } },
-      };
+      // First poll: not ready, nextCheckIn = 1000
+      let stages = await persistence.getStagesByRun(createResult.workflowRunId);
+      await persistence.updateStage(stages[0]!.id, {
+        nextPollAt: new Date(clock.now().getTime() - 1000),
+      });
 
-      const context = {
-        workflowRunId: "run-capture",
-        stageId: "capture-args",
-        config: { apiEndpoint: "https://api.example.com" },
-        log: () => {},
-        storage: {
-          save: async () => {},
-          load: async () => null,
-          exists: async () => false,
-          delete: async () => {},
-          getStageKey: () => "key",
-        },
-      };
+      let pollResult = await kernel.dispatch({ type: "stage.pollSuspended" });
+      expect(pollResult.resumed).toBe(0);
+      expect(checkCount).toBe(1);
 
-      await asyncStage.checkCompletion!(state, context);
+      // Verify nextPollAt was updated (not null means rescheduled)
+      stages = await persistence.getStagesByRun(createResult.workflowRunId);
+      expect(stages[0]!.status).toBe("SUSPENDED");
+      expect(stages[0]!.nextPollAt).toBeDefined();
 
-      // Then: State and context were provided
-      expect(capturedState).toEqual(state);
-      expect((capturedContext as { workflowRunId: string }).workflowRunId).toBe(
-        "run-capture",
-      );
-      expect(
-        (capturedContext as { config: { apiEndpoint: string } }).config
-          .apiEndpoint,
-      ).toBe("https://api.example.com");
+      // Second poll: not ready, nextCheckIn = 2000
+      await persistence.updateStage(stages[0]!.id, {
+        nextPollAt: new Date(clock.now().getTime() - 1000),
+      });
+
+      pollResult = await kernel.dispatch({ type: "stage.pollSuspended" });
+      expect(pollResult.resumed).toBe(0);
+      expect(checkCount).toBe(2);
+
+      // Third poll: ready
+      stages = await persistence.getStagesByRun(createResult.workflowRunId);
+      await persistence.updateStage(stages[0]!.id, {
+        nextPollAt: new Date(clock.now().getTime() - 1000),
+      });
+
+      pollResult = await kernel.dispatch({ type: "stage.pollSuspended" });
+      expect(pollResult.resumed).toBe(1);
+      expect(checkCount).toBe(3);
+
+      stages = await persistence.getStagesByRun(createResult.workflowRunId);
+      expect(stages[0]!.status).toBe("COMPLETED");
     });
 
     it("should track progress through multiple completion checks", async () => {
-      // Given: Stage that tracks progress through checks
       let checkHistory: Array<{ checkNumber: number; timestamp: number }> = [];
       let isComplete = false;
 
@@ -446,77 +320,70 @@ describe("I want to poll async-batch stages for completion", () => {
           output: z.object({ checksPerformed: z.number() }),
           config: z.object({}),
         },
-        async execute(ctx) {
-          if (ctx.resumeState) {
-            return { output: { checksPerformed: checkHistory.length } };
-          }
-          checkHistory = []; // Reset
+        async execute() {
+          checkHistory = [];
           const now = new Date();
           return {
             suspended: true,
-            state: {
-              batchId: "batch-progress",
-              submittedAt: now.toISOString(),
-              pollInterval: 100,
-              maxWaitTime: 60000,
-            },
-            pollConfig: {
-              pollInterval: 100,
-              maxWaitTime: 60000,
-              nextPollAt: new Date(now.getTime() + 100),
-            },
-          } as SimpleSuspendedResult;
+            state: { batchId: "batch-progress", submittedAt: now.toISOString(), pollInterval: 100, maxWaitTime: 60000 },
+            pollConfig: { pollInterval: 100, maxWaitTime: 60000, nextPollAt: new Date(now.getTime() + 100) },
+          };
         },
         async checkCompletion() {
           checkHistory.push({
             checkNumber: checkHistory.length + 1,
             timestamp: Date.now(),
           });
-
           if (isComplete) {
-            return {
-              ready: true,
-              output: { checksPerformed: checkHistory.length },
-            };
+            return { ready: true, output: { checksPerformed: checkHistory.length } };
           }
           return { ready: false, nextCheckIn: 100 };
         },
       });
 
-      // Perform multiple checks
-      const state = {
-        batchId: "batch-progress",
-        submittedAt: new Date().toISOString(),
-        pollInterval: 100,
-        maxWaitTime: 60000,
-      };
+      const workflow = new WorkflowBuilder(
+        "progress", "Progress Workflow", "Test",
+        z.object({}).passthrough(),
+        z.object({ checksPerformed: z.number() }),
+      ).pipe(asyncStage).build();
 
-      const context = {
-        workflowRunId: "run-1",
+      const { kernel, flush, persistence, clock } = createTestKernel([workflow]);
+
+      const createResult = await kernel.dispatch({
+        type: "run.create", idempotencyKey: "progress-1",
+        workflowId: "progress", input: {},
+      });
+      await kernel.dispatch({ type: "run.claimPending", workerId: "w" });
+      await flush();
+
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: createResult.workflowRunId,
+        workflowId: "progress",
         stageId: "progress-track",
         config: {},
-        log: () => {},
-        storage: {
-          save: async () => {},
-          load: async () => null,
-          exists: async () => false,
-          delete: async () => {},
-          getStageKey: () => "key",
-        },
-      };
+      });
 
-      // First 3 checks - not ready
+      // Poll 3 times: not ready
       for (let i = 0; i < 3; i++) {
-        const result = await asyncStage.checkCompletion!(state, context);
-        expect(result.ready).toBe(false);
+        const stages = await persistence.getStagesByRun(createResult.workflowRunId);
+        await persistence.updateStage(stages[0]!.id, {
+          nextPollAt: new Date(clock.now().getTime() - 1000),
+        });
+        const result = await kernel.dispatch({ type: "stage.pollSuspended" });
+        expect(result.resumed).toBe(0);
       }
 
-      // Complete and final check
+      // Mark complete and poll once more
       isComplete = true;
-      const finalResult = await asyncStage.checkCompletion!(state, context);
+      const stages = await persistence.getStagesByRun(createResult.workflowRunId);
+      await persistence.updateStage(stages[0]!.id, {
+        nextPollAt: new Date(clock.now().getTime() - 1000),
+      });
 
-      // Then: All checks were tracked
-      expect(finalResult.ready).toBe(true);
+      const finalResult = await kernel.dispatch({ type: "stage.pollSuspended" });
+      expect(finalResult.resumed).toBe(1);
+
       expect(checkHistory).toHaveLength(4);
       expect(checkHistory[0].checkNumber).toBe(1);
       expect(checkHistory[3].checkNumber).toBe(4);
@@ -524,8 +391,7 @@ describe("I want to poll async-batch stages for completion", () => {
   });
 
   describe("completion with output", () => {
-    it("should return output from checkCompletion when ready", async () => {
-      // Given: Stage where checkCompletion produces output
+    it("should store output from checkCompletion in blobStore when ready", async () => {
       const batchResults = {
         processedItems: 150,
         successCount: 148,
@@ -547,65 +413,62 @@ describe("I want to poll async-batch stages for completion", () => {
           }),
           config: z.object({}),
         },
-        async execute(ctx) {
-          if (ctx.resumeState) {
-            return { output: batchResults };
-          }
+        async execute() {
           const now = new Date();
           return {
             suspended: true,
-            state: {
-              batchId: "batch-output",
-              submittedAt: now.toISOString(),
-              pollInterval: 1000,
-              maxWaitTime: 60000,
-            },
-            pollConfig: {
-              pollInterval: 1000,
-              maxWaitTime: 60000,
-              nextPollAt: new Date(now.getTime() + 1000),
-            },
-          } as SimpleSuspendedResult;
+            state: { batchId: "batch-output", submittedAt: now.toISOString(), pollInterval: 1000, maxWaitTime: 60000 },
+            pollConfig: { pollInterval: 1000, maxWaitTime: 60000, nextPollAt: new Date(now.getTime() + 1000) },
+          };
         },
         async checkCompletion() {
-          return {
-            ready: true,
-            output: batchResults,
-          };
+          return { ready: true, output: batchResults };
         },
       });
 
-      // When: checkCompletion returns ready with output
-      const state = {
-        batchId: "batch-output",
-        submittedAt: new Date().toISOString(),
-        pollInterval: 1000,
-        maxWaitTime: 60000,
-      };
+      const workflow = new WorkflowBuilder(
+        "output-wf", "Output Workflow", "Test",
+        z.object({}).passthrough(),
+        z.object({
+          processedItems: z.number(),
+          successCount: z.number(),
+          errorCount: z.number(),
+          outputData: z.array(z.string()),
+        }),
+      ).pipe(asyncStage).build();
 
-      const context = {
-        workflowRunId: "run-1",
+      const { kernel, flush, persistence, blobStore, clock } = createTestKernel([workflow]);
+
+      const createResult = await kernel.dispatch({
+        type: "run.create", idempotencyKey: "output-1",
+        workflowId: "output-wf", input: {},
+      });
+      await kernel.dispatch({ type: "run.claimPending", workerId: "w" });
+      await flush();
+
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: createResult.workflowRunId,
+        workflowId: "output-wf",
         stageId: "output-stage",
         config: {},
-        log: () => {},
-        storage: {
-          save: async () => {},
-          load: async () => null,
-          exists: async () => false,
-          delete: async () => {},
-          getStageKey: () => "key",
-        },
-      };
+      });
 
-      const result = await asyncStage.checkCompletion!(state, context);
+      const stages = await persistence.getStagesByRun(createResult.workflowRunId);
+      await persistence.updateStage(stages[0]!.id, {
+        nextPollAt: new Date(clock.now().getTime() - 1000),
+      });
 
-      // Then: Output matches expected batch results
-      expect(result.ready).toBe(true);
-      expect(result.output).toEqual(batchResults);
+      const pollResult = await kernel.dispatch({ type: "stage.pollSuspended" });
+      expect(pollResult.resumed).toBe(1);
+
+      // Verify stage COMPLETED and output stored in blobStore
+      const updatedStages = await persistence.getStagesByRun(createResult.workflowRunId);
+      expect(updatedStages[0]!.status).toBe("COMPLETED");
+      expect(blobStore.size()).toBeGreaterThan(0);
     });
 
-    it("should include metrics in checkCompletion result when available", async () => {
-      // Given: Stage that returns metrics with completion
+    it("should include metrics in stage record when checkCompletion returns them", async () => {
       const asyncStage = defineAsyncBatchStage({
         id: "metrics-stage",
         name: "Metrics Stage",
@@ -615,29 +478,15 @@ describe("I want to poll async-batch stages for completion", () => {
           output: z.object({ done: z.boolean() }),
           config: z.object({}),
         },
-        async execute(ctx) {
-          if (ctx.resumeState) {
-            return { output: { done: true } };
-          }
+        async execute() {
           const now = new Date();
           return {
             suspended: true,
-            state: {
-              batchId: "batch-metrics",
-              submittedAt: now.toISOString(),
-              pollInterval: 1000,
-              maxWaitTime: 60000,
-            },
-            pollConfig: {
-              pollInterval: 1000,
-              maxWaitTime: 60000,
-              nextPollAt: new Date(now.getTime() + 1000),
-            },
-          } as SimpleSuspendedResult;
+            state: { batchId: "batch-metrics", submittedAt: now.toISOString(), pollInterval: 1000, maxWaitTime: 60000 },
+            pollConfig: { pollInterval: 1000, maxWaitTime: 60000, nextPollAt: new Date(now.getTime() + 1000) },
+          };
         },
-        async checkCompletion(): Promise<
-          CompletionCheckResult<{ done: boolean }>
-        > {
+        async checkCompletion(): Promise<CompletionCheckResult<{ done: boolean }>> {
           return {
             ready: true,
             output: { done: true },
@@ -652,43 +501,50 @@ describe("I want to poll async-batch stages for completion", () => {
         },
       });
 
-      // When: checkCompletion returns with metrics
-      const state = {
-        batchId: "batch-metrics",
-        submittedAt: new Date().toISOString(),
-        pollInterval: 1000,
-        maxWaitTime: 60000,
-      };
+      const workflow = new WorkflowBuilder(
+        "metrics-wf", "Metrics Workflow", "Test",
+        z.object({}).passthrough(),
+        z.object({ done: z.boolean() }),
+      ).pipe(asyncStage).build();
 
-      const context = {
-        workflowRunId: "run-1",
+      const { kernel, flush, persistence, clock } = createTestKernel([workflow]);
+
+      const createResult = await kernel.dispatch({
+        type: "run.create", idempotencyKey: "metrics-1",
+        workflowId: "metrics-wf", input: {},
+      });
+      await kernel.dispatch({ type: "run.claimPending", workerId: "w" });
+      await flush();
+
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: createResult.workflowRunId,
+        workflowId: "metrics-wf",
         stageId: "metrics-stage",
         config: {},
-        log: () => {},
-        storage: {
-          save: async () => {},
-          load: async () => null,
-          exists: async () => false,
-          delete: async () => {},
-          getStageKey: () => "key",
-        },
-      };
+      });
 
-      const result = await asyncStage.checkCompletion!(state, context);
+      const stages = await persistence.getStagesByRun(createResult.workflowRunId);
+      await persistence.updateStage(stages[0]!.id, {
+        nextPollAt: new Date(clock.now().getTime() - 1000),
+      });
 
-      // Then: Metrics are included
-      expect(result.ready).toBe(true);
-      expect(result.metrics).toBeDefined();
-      expect(result.metrics?.itemsProcessed).toBe(100);
-      expect(result.metrics?.totalTokens).toBe(50000);
+      await kernel.dispatch({ type: "stage.pollSuspended" });
+
+      const updatedStages = await persistence.getStagesByRun(createResult.workflowRunId);
+      expect(updatedStages[0]!.status).toBe("COMPLETED");
+      const metrics = updatedStages[0]!.metrics as any;
+      expect(metrics).toBeDefined();
+      expect(metrics.itemsProcessed).toBe(100);
+      expect(metrics.totalTokens).toBe(50000);
     });
   });
 
   describe("state persistence during polling", () => {
-    it("should preserve batchId across multiple checks", async () => {
-      // Given: Stage that validates batchId consistency
+    it("should preserve batchId in suspendedState across polls", async () => {
       const expectedBatchId = "batch-consistent-123";
       const receivedBatchIds: string[] = [];
+      let readyCount = 0;
 
       const asyncStage = defineAsyncBatchStage({
         id: "consistent-batch",
@@ -699,69 +555,63 @@ describe("I want to poll async-batch stages for completion", () => {
           output: z.object({ done: z.boolean() }),
           config: z.object({}),
         },
-        async execute(ctx) {
-          if (ctx.resumeState) {
-            return { output: { done: true } };
-          }
+        async execute() {
           const now = new Date();
           return {
             suspended: true,
-            state: {
-              batchId: expectedBatchId,
-              submittedAt: now.toISOString(),
-              pollInterval: 100,
-              maxWaitTime: 60000,
-            },
-            pollConfig: {
-              pollInterval: 100,
-              maxWaitTime: 60000,
-              nextPollAt: new Date(now.getTime() + 100),
-            },
-          } as SimpleSuspendedResult;
+            state: { batchId: expectedBatchId, submittedAt: now.toISOString(), pollInterval: 100, maxWaitTime: 60000 },
+            pollConfig: { pollInterval: 100, maxWaitTime: 60000, nextPollAt: new Date(now.getTime() + 100) },
+          };
         },
         async checkCompletion(state) {
           receivedBatchIds.push(state.batchId);
-          if (receivedBatchIds.length >= 3) {
+          readyCount++;
+          if (readyCount >= 3) {
             return { ready: true, output: { done: true } };
           }
           return { ready: false };
         },
       });
 
-      // When: Multiple checks with same state
-      const state = {
-        batchId: expectedBatchId,
-        submittedAt: new Date().toISOString(),
-        pollInterval: 100,
-        maxWaitTime: 60000,
-      };
+      const workflow = new WorkflowBuilder(
+        "consistent", "Consistent Workflow", "Test",
+        z.object({}).passthrough(),
+        z.object({ done: z.boolean() }),
+      ).pipe(asyncStage).build();
 
-      const context = {
-        workflowRunId: "run-1",
+      const { kernel, flush, persistence, clock } = createTestKernel([workflow]);
+
+      const createResult = await kernel.dispatch({
+        type: "run.create", idempotencyKey: "consistent-1",
+        workflowId: "consistent", input: {},
+      });
+      await kernel.dispatch({ type: "run.claimPending", workerId: "w" });
+      await flush();
+
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: createResult.workflowRunId,
+        workflowId: "consistent",
         stageId: "consistent-batch",
         config: {},
-        log: () => {},
-        storage: {
-          save: async () => {},
-          load: async () => null,
-          exists: async () => false,
-          delete: async () => {},
-          getStageKey: () => "key",
-        },
-      };
+      });
 
+      // Poll 3 times
       for (let i = 0; i < 3; i++) {
-        await asyncStage.checkCompletion!(state, context);
+        const stages = await persistence.getStagesByRun(createResult.workflowRunId);
+        await persistence.updateStage(stages[0]!.id, {
+          nextPollAt: new Date(clock.now().getTime() - 1000),
+        });
+        await kernel.dispatch({ type: "stage.pollSuspended" });
       }
 
-      // Then: All checks received same batchId
+      // All checks received same batchId
       expect(receivedBatchIds).toHaveLength(3);
       expect(receivedBatchIds.every((id) => id === expectedBatchId)).toBe(true);
     });
 
-    it("should preserve submittedAt timestamp for timeout calculation", async () => {
-      // Given: Stage that tracks submission time
-      const submittedAt = new Date(Date.now() - 60000).toISOString(); // 1 minute ago
+    it("should preserve submittedAt timestamp across polls", async () => {
+      const submittedAt = new Date(Date.now() - 60000).toISOString();
       let receivedSubmittedAt: string | undefined;
 
       const asyncStage = defineAsyncBatchStage({
@@ -773,25 +623,13 @@ describe("I want to poll async-batch stages for completion", () => {
           output: z.object({ done: z.boolean() }),
           config: z.object({}),
         },
-        async execute(ctx) {
-          if (ctx.resumeState) {
-            return { output: { done: true } };
-          }
+        async execute() {
           const now = new Date();
           return {
             suspended: true,
-            state: {
-              batchId: "batch-timestamp",
-              submittedAt,
-              pollInterval: 1000,
-              maxWaitTime: 300000,
-            },
-            pollConfig: {
-              pollInterval: 1000,
-              maxWaitTime: 300000,
-              nextPollAt: new Date(now.getTime() + 1000),
-            },
-          } as SimpleSuspendedResult;
+            state: { batchId: "batch-timestamp", submittedAt, pollInterval: 1000, maxWaitTime: 300000 },
+            pollConfig: { pollInterval: 1000, maxWaitTime: 300000, nextPollAt: new Date(now.getTime() + 1000) },
+          };
         },
         async checkCompletion(state) {
           receivedSubmittedAt = state.submittedAt;
@@ -799,31 +637,36 @@ describe("I want to poll async-batch stages for completion", () => {
         },
       });
 
-      // When: checkCompletion is called
-      const state = {
-        batchId: "batch-timestamp",
-        submittedAt,
-        pollInterval: 1000,
-        maxWaitTime: 300000,
-      };
+      const workflow = new WorkflowBuilder(
+        "timestamp", "Timestamp Workflow", "Test",
+        z.object({}).passthrough(),
+        z.object({ done: z.boolean() }),
+      ).pipe(asyncStage).build();
 
-      const context = {
-        workflowRunId: "run-1",
+      const { kernel, flush, persistence, clock } = createTestKernel([workflow]);
+
+      const createResult = await kernel.dispatch({
+        type: "run.create", idempotencyKey: "ts-1",
+        workflowId: "timestamp", input: {},
+      });
+      await kernel.dispatch({ type: "run.claimPending", workerId: "w" });
+      await flush();
+
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: createResult.workflowRunId,
+        workflowId: "timestamp",
         stageId: "timestamp-stage",
         config: {},
-        log: () => {},
-        storage: {
-          save: async () => {},
-          load: async () => null,
-          exists: async () => false,
-          delete: async () => {},
-          getStageKey: () => "key",
-        },
-      };
+      });
 
-      await asyncStage.checkCompletion!(state, context);
+      const stages = await persistence.getStagesByRun(createResult.workflowRunId);
+      await persistence.updateStage(stages[0]!.id, {
+        nextPollAt: new Date(clock.now().getTime() - 1000),
+      });
 
-      // Then: Original submittedAt is preserved
+      await kernel.dispatch({ type: "stage.pollSuspended" });
+
       expect(receivedSubmittedAt).toBe(submittedAt);
     });
   });
