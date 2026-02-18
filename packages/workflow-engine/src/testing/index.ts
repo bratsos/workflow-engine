@@ -17,12 +17,13 @@
  * const jobQueue = new InMemoryJobQueue();
  * const aiLogger = new InMemoryAICallLogger();
  *
- * // Use with WorkflowRuntime
- * const runtime = createWorkflowRuntime({
+ * // Use with kernel
+ * const kernel = createKernel({
  *   persistence,
- *   jobQueue,
- *   aiLogger,
- *   workflows: [myWorkflow],
+ *   jobTransport: jobQueue,
+ *   blobStore: new InMemoryBlobStore(),
+ *   eventSink: new CollectingEventSink(),
+ *   registry: { getWorkflow: (id) => workflows.get(id) },
  * });
  *
  * // Reset between tests
