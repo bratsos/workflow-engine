@@ -341,7 +341,56 @@ describe("I want to track stage progress", () => {
   });
 
   describe("progress event details", () => {
-    it.skip("TODO: progress reporting with details not supported by kernel stage:progress event schema (only progress + message)", () => {});
+    it("should include details in progress event", async () => {
+      // Given: A stage that reports progress with details
+      const stage = defineStage({
+        id: "details-progress-stage",
+        name: "Details Progress Stage",
+        schemas: {
+          input: TestStringSchema,
+          output: TestStringSchema,
+          config: z.object({}),
+        },
+        async execute(ctx) {
+          ctx.onProgress({
+            progress: 50,
+            message: "processing",
+            details: { itemsProcessed: 50, totalItems: 100 },
+          });
+          return { output: ctx.input };
+        },
+      });
+
+      const workflow = new WorkflowBuilder(
+        "details-progress-test",
+        "Details Progress Test",
+        "Test",
+        TestStringSchema,
+        TestStringSchema,
+      )
+        .pipe(stage)
+        .build();
+
+      const { kernel, flush, eventSink } = createTestKernel([workflow]);
+      const workflowRunId = await setupRun(kernel, flush, eventSink, "details-progress-test", { value: "test" });
+
+      // When: Execute
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "details-progress-test",
+        stageId: "details-progress-stage",
+        config: {},
+      });
+      await flush();
+
+      // Then: Progress event includes details
+      const progressEvents = eventSink.getByType("stage:progress");
+      expect(progressEvents).toHaveLength(1);
+      expect(progressEvents[0]!.progress).toBe(50);
+      expect(progressEvents[0]!.message).toBe("processing");
+      expect(progressEvents[0]!.details).toEqual({ itemsProcessed: 50, totalItems: 100 });
+    });
 
     it("should handle progress without details", async () => {
       // Given: A stage that reports progress without details
@@ -389,6 +438,61 @@ describe("I want to track stage progress", () => {
       expect(progressEvents[0]!.message).toBe("halfway");
     });
 
-    it.skip("TODO: nested details in progress events not supported by kernel stage:progress event schema", () => {});
+    it("should pass through nested details in progress event", async () => {
+      // Given: A stage that reports progress with nested details
+      const stage = defineStage({
+        id: "nested-details-stage",
+        name: "Nested Details Stage",
+        schemas: {
+          input: TestStringSchema,
+          output: TestStringSchema,
+          config: z.object({}),
+        },
+        async execute(ctx) {
+          ctx.onProgress({
+            progress: 75,
+            message: "batch processing",
+            details: {
+              batch: { id: "batch-1", processed: 75, total: 100 },
+              errors: [],
+            },
+          });
+          return { output: ctx.input };
+        },
+      });
+
+      const workflow = new WorkflowBuilder(
+        "nested-details-test",
+        "Nested Details Test",
+        "Test",
+        TestStringSchema,
+        TestStringSchema,
+      )
+        .pipe(stage)
+        .build();
+
+      const { kernel, flush, eventSink } = createTestKernel([workflow]);
+      const workflowRunId = await setupRun(kernel, flush, eventSink, "nested-details-test", { value: "test" });
+
+      // When: Execute
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "nested-details-test",
+        stageId: "nested-details-stage",
+        config: {},
+      });
+      await flush();
+
+      // Then: Nested details come through correctly
+      const progressEvents = eventSink.getByType("stage:progress");
+      expect(progressEvents).toHaveLength(1);
+      expect(progressEvents[0]!.progress).toBe(75);
+      expect(progressEvents[0]!.message).toBe("batch processing");
+      expect(progressEvents[0]!.details).toEqual({
+        batch: { id: "batch-1", processed: 75, total: 100 },
+        errors: [],
+      });
+    });
   });
 });
