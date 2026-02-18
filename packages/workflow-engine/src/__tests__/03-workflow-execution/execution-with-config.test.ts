@@ -1,29 +1,50 @@
 /**
- * Workflow Execution with Configuration Tests
+ * Workflow Execution with Configuration Tests (Kernel)
  *
- * Tests for passing configuration to stages during workflow execution.
+ * Tests for passing configuration to stages during workflow execution
+ * via kernel dispatch.
  */
 
-import { beforeEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { WorkflowExecutor } from "../../core/executor.js";
-import { defineStage } from "../../core/stage-factory.js";
-import { WorkflowBuilder } from "../../core/workflow.js";
+import { createKernel } from "../../kernel/kernel.js";
 import {
-  InMemoryAICallLogger,
-  InMemoryWorkflowPersistence,
-  TestSchemas,
-} from "../utils/index.js";
+  FakeClock,
+  InMemoryBlobStore,
+  CollectingEventSink,
+  NoopScheduler,
+} from "../../kernel/testing/index.js";
+import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
+import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
+import { defineStage } from "../../core/stage-factory.js";
+import { WorkflowBuilder, type Workflow } from "../../core/workflow.js";
 
-describe("I want to execute workflows with configuration", () => {
-  let persistence: InMemoryWorkflowPersistence;
-  let aiLogger: InMemoryAICallLogger;
+function createTestKernel(workflows: Workflow<any, any>[] = []) {
+  const persistence = new InMemoryWorkflowPersistence();
+  const blobStore = new InMemoryBlobStore();
+  const jobTransport = new InMemoryJobQueue("test-worker");
+  const eventSink = new CollectingEventSink();
+  const scheduler = new NoopScheduler();
+  const clock = new FakeClock();
 
-  beforeEach(() => {
-    persistence = new InMemoryWorkflowPersistence();
-    aiLogger = new InMemoryAICallLogger();
+  const registry = new Map<string, Workflow<any, any>>();
+  for (const w of workflows) registry.set(w.id, w);
+
+  const kernel = createKernel({
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry: { getWorkflow: (id) => registry.get(id) },
   });
 
+  const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
+  return { kernel, flush, persistence, blobStore, jobTransport, eventSink, scheduler, clock, registry };
+}
+
+describe("I want to execute workflows with configuration", () => {
   describe("passing config to stages", () => {
     it("should pass config to each stage", async () => {
       // Given: A workflow with multiple stages that use config
@@ -33,8 +54,8 @@ describe("I want to execute workflows with configuration", () => {
         id: "stage-a",
         name: "Stage A",
         schemas: {
-          input: TestSchemas.number,
-          output: TestSchemas.number,
+          input: z.object({ value: z.number() }),
+          output: z.object({ value: z.number() }),
           config: z.object({
             multiplier: z.number(),
           }),
@@ -49,8 +70,8 @@ describe("I want to execute workflows with configuration", () => {
         id: "stage-b",
         name: "Stage B",
         schemas: {
-          input: TestSchemas.number,
-          output: TestSchemas.number,
+          input: z.object({ value: z.number() }),
+          output: z.object({ value: z.number() }),
           config: z.object({
             offset: z.number(),
           }),
@@ -65,46 +86,60 @@ describe("I want to execute workflows with configuration", () => {
         "multi-config",
         "Multi Config Workflow",
         "Test",
-        TestSchemas.number,
-        TestSchemas.number,
+        z.object({ value: z.number() }),
+        z.object({ value: z.number() }),
       )
         .pipe(stageA)
         .pipe(stageB)
         .build();
 
-      await persistence.createRun({
-        id: "run-multi-config",
+      const config = {
+        "stage-a": { multiplier: 3 },
+        "stage-b": { offset: 5 },
+      };
+
+      const { kernel, flush } = createTestKernel([workflow]);
+
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-1",
         workflowId: "multi-config",
-        workflowName: "Multi Config Workflow",
-        status: "PENDING",
         input: { value: 10 },
+        config,
       });
 
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-multi-config",
-        "multi-config",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
+      await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
 
-      // When: I execute with config for each stage
-      const result = await executor.execute(
-        { value: 10 },
-        {
-          "stage-a": { multiplier: 3 },
-          "stage-b": { offset: 5 },
-        },
-      );
+      // Execute stage-a: 10 * 3 = 30
+      const rA = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "multi-config",
+        stageId: "stage-a",
+        config,
+      });
+      expect(rA.outcome).toBe("completed");
+      expect(rA.output).toEqual({ value: 30 });
+
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+
+      // Execute stage-b: 30 + 5 = 35
+      const rB = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "multi-config",
+        stageId: "stage-b",
+        config,
+      });
+      expect(rB.outcome).toBe("completed");
+      expect(rB.output).toEqual({ value: 35 });
+
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+      await flush();
 
       // Then: Each stage received its config
       expect(capturedConfigs["stage-a"]).toEqual({ multiplier: 3 });
       expect(capturedConfigs["stage-b"]).toEqual({ offset: 5 });
-
-      // And: Result is correctly computed (10 * 3 = 30, 30 + 5 = 35)
-      expect(result).toEqual({ value: 35 });
     });
   });
 
@@ -117,21 +152,19 @@ describe("I want to execute workflows with configuration", () => {
         id: "with-defaults",
         name: "With Defaults Stage",
         schemas: {
-          input: TestSchemas.number,
-          output: TestSchemas.number,
+          input: z.object({ value: z.number() }),
+          output: z.object({ value: z.number() }),
           config: z.object({
             multiplier: z.number().default(2),
             addend: z.number().default(0),
           }),
         },
         async execute(ctx) {
-          // Parse config through schema to apply defaults
-          const parsedConfig = configuredStage.configSchema.parse(ctx.config);
-          capturedConfig = parsedConfig;
+          capturedConfig = ctx.config as { multiplier: number; addend: number };
           return {
             output: {
               value:
-                ctx.input.value * parsedConfig.multiplier + parsedConfig.addend,
+                ctx.input.value * ctx.config.multiplier + ctx.config.addend,
             },
           };
         },
@@ -141,40 +174,42 @@ describe("I want to execute workflows with configuration", () => {
         "defaults-test",
         "Defaults Test Workflow",
         "Test",
-        TestSchemas.number,
-        TestSchemas.number,
+        z.object({ value: z.number() }),
+        z.object({ value: z.number() }),
       )
         .pipe(configuredStage)
         .build();
 
-      await persistence.createRun({
-        id: "run-defaults",
+      const config = { "with-defaults": { addend: 10 } };
+
+      const { kernel, flush } = createTestKernel([workflow]);
+
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-1",
         workflowId: "defaults-test",
-        workflowName: "Defaults Test Workflow",
-        status: "PENDING",
         input: { value: 5 },
+        config,
       });
 
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-defaults",
-        "defaults-test",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
+      await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
 
-      // When: I execute with partial config (only addend provided)
-      const result = await executor.execute(
-        { value: 5 },
-        { "with-defaults": { addend: 10 } },
-      );
+      const result = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "defaults-test",
+        stageId: "with-defaults",
+        config,
+      });
+
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+      await flush();
 
       // Then: Default multiplier is used, provided addend is applied
       expect(capturedConfig).toEqual({ multiplier: 2, addend: 10 });
+      expect(result.outcome).toBe("completed");
       // Result: 5 * 2 + 10 = 20
-      expect(result).toEqual({ value: 20 });
+      expect(result.output).toEqual({ value: 20 });
     });
 
     it("should use all defaults when no config provided", async () => {
@@ -185,21 +220,19 @@ describe("I want to execute workflows with configuration", () => {
         id: "all-defaults",
         name: "All Defaults Stage",
         schemas: {
-          input: TestSchemas.number,
-          output: TestSchemas.number,
+          input: z.object({ value: z.number() }),
+          output: z.object({ value: z.number() }),
           config: z.object({
             multiplier: z.number().default(3),
             addend: z.number().default(1),
           }),
         },
         async execute(ctx) {
-          // Parse config through schema to apply defaults
-          const parsedConfig = configuredStage.configSchema.parse(ctx.config);
-          capturedConfig = parsedConfig;
+          capturedConfig = ctx.config as { multiplier: number; addend: number };
           return {
             output: {
               value:
-                ctx.input.value * parsedConfig.multiplier + parsedConfig.addend,
+                ctx.input.value * ctx.config.multiplier + ctx.config.addend,
             },
           };
         },
@@ -209,40 +242,42 @@ describe("I want to execute workflows with configuration", () => {
         "all-defaults-test",
         "All Defaults Test Workflow",
         "Test",
-        TestSchemas.number,
-        TestSchemas.number,
+        z.object({ value: z.number() }),
+        z.object({ value: z.number() }),
       )
         .pipe(configuredStage)
         .build();
 
-      await persistence.createRun({
-        id: "run-all-defaults",
+      const config = { "all-defaults": {} };
+
+      const { kernel, flush } = createTestKernel([workflow]);
+
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-1",
         workflowId: "all-defaults-test",
-        workflowName: "All Defaults Test Workflow",
-        status: "PENDING",
         input: { value: 4 },
+        config,
       });
 
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-all-defaults",
-        "all-defaults-test",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
+      await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
 
-      // When: I execute with empty config for the stage
-      const result = await executor.execute(
-        { value: 4 },
-        { "all-defaults": {} },
-      );
+      const result = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "all-defaults-test",
+        stageId: "all-defaults",
+        config,
+      });
+
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+      await flush();
 
       // Then: All defaults are applied
       expect(capturedConfig).toEqual({ multiplier: 3, addend: 1 });
+      expect(result.outcome).toBe("completed");
       // Result: 4 * 3 + 1 = 13
-      expect(result).toEqual({ value: 13 });
+      expect(result.output).toEqual({ value: 13 });
     });
   });
 
@@ -255,8 +290,8 @@ describe("I want to execute workflows with configuration", () => {
         id: "override-stage",
         name: "Override Stage",
         schemas: {
-          input: TestSchemas.number,
-          output: TestSchemas.number,
+          input: z.object({ value: z.number() }),
+          output: z.object({ value: z.number() }),
           config: z.object({
             multiplier: z.number().default(2),
             addend: z.number().default(0),
@@ -277,40 +312,42 @@ describe("I want to execute workflows with configuration", () => {
         "override-test",
         "Override Test Workflow",
         "Test",
-        TestSchemas.number,
-        TestSchemas.number,
+        z.object({ value: z.number() }),
+        z.object({ value: z.number() }),
       )
         .pipe(configuredStage)
         .build();
 
-      await persistence.createRun({
-        id: "run-override",
+      const config = { "override-stage": { multiplier: 10, addend: 100 } };
+
+      const { kernel, flush } = createTestKernel([workflow]);
+
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-1",
         workflowId: "override-test",
-        workflowName: "Override Test Workflow",
-        status: "PENDING",
         input: { value: 6 },
+        config,
       });
 
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-override",
-        "override-test",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
+      await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
 
-      // When: I execute with full config override
-      const result = await executor.execute(
-        { value: 6 },
-        { "override-stage": { multiplier: 10, addend: 100 } },
-      );
+      const result = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "override-test",
+        stageId: "override-stage",
+        config,
+      });
+
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+      await flush();
 
       // Then: Provided values override defaults
       expect(capturedConfig).toEqual({ multiplier: 10, addend: 100 });
+      expect(result.outcome).toBe("completed");
       // Result: 6 * 10 + 100 = 160
-      expect(result).toEqual({ value: 160 });
+      expect(result.output).toEqual({ value: 160 });
     });
   });
 
@@ -348,25 +385,27 @@ describe("I want to execute workflows with configuration", () => {
         .pipe(strictStage)
         .build();
 
-      await persistence.createRun({
-        id: "run-invalid-input",
+      const { kernel, persistence } = createTestKernel([workflow]);
+
+      // Create run manually with invalid input (bypass run.create validation)
+      const run = await persistence.createRun({
         workflowId: "input-validation-test",
         workflowName: "Input Validation Test",
-        status: "PENDING",
+        workflowType: "input-validation-test",
         input: { name: "", count: -1 }, // Invalid input
       });
+      await persistence.updateRun(run.id, { status: "RUNNING" });
 
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-invalid-input",
-        "input-validation-test",
-        { persistence, aiLogger },
-      );
+      // When/Then: Execution with invalid input should return failed
+      const result = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: run.id,
+        workflowId: "input-validation-test",
+        stageId: "strict-input",
+        config: {},
+      });
 
-      // When/Then: Execution with invalid input should throw
-      await expect(
-        executor.execute({ name: "", count: -1 }, {}),
-      ).rejects.toThrow();
+      expect(result.outcome).toBe("failed");
     });
 
     it("should reject input with missing required fields", async () => {
@@ -406,37 +445,39 @@ describe("I want to execute workflows with configuration", () => {
         .pipe(requiredFieldsStage)
         .build();
 
-      await persistence.createRun({
-        id: "run-missing-fields",
+      const { kernel, persistence } = createTestKernel([workflow]);
+
+      // Create run manually with missing field
+      const run = await persistence.createRun({
         workflowId: "required-fields-test",
         workflowName: "Required Fields Test",
-        status: "PENDING",
+        workflowType: "required-fields-test",
         input: { id: "test-id" }, // Missing data field
       });
+      await persistence.updateRun(run.id, { status: "RUNNING" });
 
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-missing-fields",
-        "required-fields-test",
-        { persistence, aiLogger },
-      );
+      // When/Then: Execution with missing required fields should return failed
+      const result = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: run.id,
+        workflowId: "required-fields-test",
+        stageId: "required-fields",
+        config: {},
+      });
 
-      // When/Then: Execution with missing required fields should throw
-      await expect(
-        executor.execute({ id: "test-id" } as never, {}),
-      ).rejects.toThrow();
+      expect(result.outcome).toBe("failed");
     });
   });
 
   describe("config validation", () => {
-    it("should reject invalid config", async () => {
+    it("should reject invalid config types at run creation", async () => {
       // Given: A stage with strict config validation
       const strictConfigStage = defineStage({
         id: "strict-config",
         name: "Strict Config Stage",
         schemas: {
-          input: TestSchemas.string,
-          output: TestSchemas.string,
+          input: z.object({ value: z.string() }),
+          output: z.object({ value: z.string() }),
           config: z.object({
             model: z.string().min(1),
             temperature: z.number().min(0).max(2),
@@ -451,44 +492,34 @@ describe("I want to execute workflows with configuration", () => {
         "config-validation-test",
         "Config Validation Test",
         "Test",
-        TestSchemas.string,
-        TestSchemas.string,
+        z.object({ value: z.string() }),
+        z.object({ value: z.string() }),
       )
         .pipe(strictConfigStage)
         .build();
 
-      await persistence.createRun({
-        id: "run-invalid-config",
-        workflowId: "config-validation-test",
-        workflowName: "Config Validation Test",
-        status: "PENDING",
-        input: { value: "test" },
-      });
+      const { kernel } = createTestKernel([workflow]);
 
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-invalid-config",
-        "config-validation-test",
-        { persistence, aiLogger },
-      );
-
-      // When/Then: Execution with invalid config types should throw
+      // When/Then: Kernel validates config at run.create time and rejects wrong types
       await expect(
-        executor.execute(
-          { value: "test" },
-          { "strict-config": { model: 123, temperature: "hot" } }, // Wrong types
-        ),
-      ).rejects.toThrow(/config validation failed/i);
+        kernel.dispatch({
+          type: "run.create",
+          idempotencyKey: "key-1",
+          workflowId: "config-validation-test",
+          input: { value: "test" },
+          config: { "strict-config": { model: 123, temperature: "hot" } },
+        }),
+      ).rejects.toThrow(/invalid workflow config/i);
     });
 
-    it("should reject config with out-of-range values", async () => {
+    it("should reject config with out-of-range values at run creation", async () => {
       // Given: A stage with numeric constraints on config
       const rangeConfigStage = defineStage({
         id: "range-config",
         name: "Range Config Stage",
         schemas: {
-          input: TestSchemas.string,
-          output: TestSchemas.string,
+          input: z.object({ value: z.string() }),
+          output: z.object({ value: z.string() }),
           config: z.object({
             maxRetries: z.number().int().min(0).max(10),
             timeout: z.number().positive(),
@@ -503,44 +534,34 @@ describe("I want to execute workflows with configuration", () => {
         "range-config-test",
         "Range Config Test",
         "Test",
-        TestSchemas.string,
-        TestSchemas.string,
+        z.object({ value: z.string() }),
+        z.object({ value: z.string() }),
       )
         .pipe(rangeConfigStage)
         .build();
 
-      await persistence.createRun({
-        id: "run-out-of-range",
-        workflowId: "range-config-test",
-        workflowName: "Range Config Test",
-        status: "PENDING",
-        input: { value: "test" },
-      });
+      const { kernel } = createTestKernel([workflow]);
 
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-out-of-range",
-        "range-config-test",
-        { persistence, aiLogger },
-      );
-
-      // When/Then: Execution with out-of-range config values should throw
+      // When/Then: Kernel validates config at run.create time and rejects out-of-range values
       await expect(
-        executor.execute(
-          { value: "test" },
-          { "range-config": { maxRetries: 100, timeout: -5 } }, // Out of valid range
-        ),
-      ).rejects.toThrow(/config validation failed/i);
+        kernel.dispatch({
+          type: "run.create",
+          idempotencyKey: "key-1",
+          workflowId: "range-config-test",
+          input: { value: "test" },
+          config: { "range-config": { maxRetries: 100, timeout: -5 } },
+        }),
+      ).rejects.toThrow(/invalid workflow config/i);
     });
 
-    it("should reject config with missing required fields", async () => {
+    it("should reject config with missing required fields at run creation", async () => {
       // Given: A stage requiring specific config fields (no defaults)
       const requiredConfigStage = defineStage({
         id: "required-config",
         name: "Required Config Stage",
         schemas: {
-          input: TestSchemas.string,
-          output: TestSchemas.string,
+          input: z.object({ value: z.string() }),
+          output: z.object({ value: z.string() }),
           config: z.object({
             apiKey: z.string(),
             endpoint: z.string().url(),
@@ -555,34 +576,24 @@ describe("I want to execute workflows with configuration", () => {
         "required-config-test",
         "Required Config Test",
         "Test",
-        TestSchemas.string,
-        TestSchemas.string,
+        z.object({ value: z.string() }),
+        z.object({ value: z.string() }),
       )
         .pipe(requiredConfigStage)
         .build();
 
-      await persistence.createRun({
-        id: "run-missing-config",
-        workflowId: "required-config-test",
-        workflowName: "Required Config Test",
-        status: "PENDING",
-        input: { value: "test" },
-      });
+      const { kernel } = createTestKernel([workflow]);
 
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-missing-config",
-        "required-config-test",
-        { persistence, aiLogger },
-      );
-
-      // When/Then: Execution with missing required config fields should throw
+      // When/Then: Kernel validates config at run.create time and rejects missing fields
       await expect(
-        executor.execute(
-          { value: "test" },
-          { "required-config": { apiKey: "key-123" } }, // Missing endpoint
-        ),
-      ).rejects.toThrow(/config validation failed/i);
+        kernel.dispatch({
+          type: "run.create",
+          idempotencyKey: "key-1",
+          workflowId: "required-config-test",
+          input: { value: "test" },
+          config: { "required-config": { apiKey: "key-123" } },
+        }),
+      ).rejects.toThrow(/invalid workflow config/i);
     });
   });
 });
