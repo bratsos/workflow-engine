@@ -11,24 +11,10 @@
  *   InMemoryAICallLogger,
  *   createMockAIHelper,
  *   createPassthroughStage,
- *   createEventCollector,
  * } from "../utils";
  * ```
  */
 
-// Event helpers
-export {
-  assertEventSequence,
-  assertEventsExist,
-  assertExactEventSequence,
-  type CollectedEvent,
-  createEventCollector,
-  createMockEventBus,
-  type EventCollector,
-  type MockEventBus,
-  waitForEvent,
-  waitForEvents,
-} from "./event-helpers.js";
 export { InMemoryAICallLogger } from "./in-memory-ai-logger.js";
 export { InMemoryJobQueue } from "./in-memory-job-queue.js";
 // In-memory persistence implementations
