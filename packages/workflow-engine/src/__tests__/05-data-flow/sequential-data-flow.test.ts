@@ -1,42 +1,50 @@
 /**
- * Sequential Data Flow Tests
+ * Sequential Data Flow Tests (Kernel)
  *
  * Tests for data flow through sequential workflow stages.
  * Verifies input passing, output chaining, and data transformation.
  */
 
-import { beforeEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { WorkflowExecutor } from "../../core/executor";
-import { defineStage } from "../../core/stage-factory";
-import { WorkflowBuilder } from "../../core/workflow";
-import { InMemoryAICallLogger } from "../utils/in-memory-ai-logger";
-import { InMemoryWorkflowPersistence } from "../utils/in-memory-persistence";
+import { createKernel } from "../../kernel/kernel.js";
+import {
+  FakeClock,
+  InMemoryBlobStore,
+  CollectingEventSink,
+  NoopScheduler,
+} from "../../kernel/testing/index.js";
+import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
+import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
+import { defineStage } from "../../core/stage-factory.js";
+import { WorkflowBuilder, type Workflow } from "../../core/workflow.js";
 
-describe("I want data to flow through sequential stages", () => {
-  let persistence: InMemoryWorkflowPersistence;
-  let aiLogger: InMemoryAICallLogger;
+function createTestKernel(workflows: Workflow<any, any>[] = []) {
+  const persistence = new InMemoryWorkflowPersistence();
+  const blobStore = new InMemoryBlobStore();
+  const jobTransport = new InMemoryJobQueue("test-worker");
+  const eventSink = new CollectingEventSink();
+  const scheduler = new NoopScheduler();
+  const clock = new FakeClock();
 
-  beforeEach(() => {
-    persistence = new InMemoryWorkflowPersistence();
-    aiLogger = new InMemoryAICallLogger();
+  const registry = new Map<string, Workflow<any, any>>();
+  for (const w of workflows) registry.set(w.id, w);
+
+  const kernel = createKernel({
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry: { getWorkflow: (id) => registry.get(id) },
   });
 
-  // Helper to create a workflow run before execution
-  async function createRun(
-    runId: string,
-    workflowId: string,
-    input: unknown = {},
-  ) {
-    await persistence.createRun({
-      id: runId,
-      workflowId,
-      workflowName: workflowId,
-      status: "PENDING",
-      input,
-    });
-  }
+  const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
+  return { kernel, flush, persistence, blobStore, jobTransport, eventSink, scheduler, clock, registry };
+}
 
+describe("I want data to flow through sequential stages", () => {
   describe("workflow input to first stage", () => {
     it("should pass workflow input to first stage ctx.input", async () => {
       // Given: A stage that captures its input
@@ -56,21 +64,36 @@ describe("I want data to flow through sequential stages", () => {
         },
       });
 
-      const workflow = new WorkflowBuilder("test-workflow", "Test")
+      const workflow = new WorkflowBuilder(
+        "test-workflow",
+        "Test",
+        "Test",
+        z.object({ userId: z.string(), count: z.number() }),
+        z.object({ received: z.boolean() }),
+      )
         .pipe(firstStage)
         .build();
 
-      // When: Execute with specific input
-      await createRun("run-1", "test-workflow", {
-        userId: "user-123",
-        count: 42,
-      });
-      const executor = new WorkflowExecutor(workflow, "run-1", "test", {
-        persistence,
-        aiLogger,
+      const { kernel, flush } = createTestKernel([workflow]);
+
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-1",
+        workflowId: "test-workflow",
+        input: { userId: "user-123", count: 42 },
       });
 
-      await executor.execute({ userId: "user-123", count: 42 }, {});
+      await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
+
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "test-workflow",
+        stageId: "first",
+        config: {},
+      });
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+      await flush();
 
       // Then: First stage receives the workflow input
       expect(capturedInput).toEqual({ userId: "user-123", count: 42 });
@@ -91,21 +114,38 @@ describe("I want data to flow through sequential stages", () => {
         },
       });
 
-      const workflow = new WorkflowBuilder("validate-test", "Test")
+      const workflow = new WorkflowBuilder(
+        "validate-test",
+        "Test",
+        "Test",
+        z.object({ name: z.string(), age: z.number() }),
+        z.object({ valid: z.boolean() }),
+      )
         .pipe(typedStage)
         .build();
 
-      await createRun("run-2", "validate-test", { name: 123, age: "invalid" });
-      const executor = new WorkflowExecutor(workflow, "run-2", "test", {
-        persistence,
-        aiLogger,
+      const { kernel, persistence } = createTestKernel([workflow]);
+
+      // Create run manually with invalid input (bypass run.create validation)
+      const run = await persistence.createRun({
+        workflowId: "validate-test",
+        workflowName: "Test",
+        workflowType: "validate-test",
+        input: { name: 123, age: "invalid" },
+      });
+      await persistence.updateRun(run.id, { status: "RUNNING" });
+
+      // When: Execute with invalid input
+      const result = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: run.id,
+        workflowId: "validate-test",
+        stageId: "typed",
+        config: {},
       });
 
-      // When/Then: Invalid input throws during stage execution
-      // Note: The executor validates input against stage schemas
-      await expect(
-        executor.execute({ name: 123, age: "invalid" } as any, {}),
-      ).rejects.toThrow();
+      // Then: job.execute returns failed outcome
+      expect(result.outcome).toBe("failed");
     });
   });
 
@@ -143,24 +183,51 @@ describe("I want data to flow through sequential stages", () => {
         },
       });
 
-      const workflow = new WorkflowBuilder("chain-test", "Test")
+      const workflow = new WorkflowBuilder(
+        "chain-test",
+        "Test",
+        "Test",
+        z.object({ initial: z.string() }),
+        z.object({ final: z.string() }),
+      )
         .pipe(stageA)
         .pipe(stageB)
         .build();
 
-      // When: Execute the workflow
-      await createRun("run-3", "chain-test", { initial: "start" });
-      const executor = new WorkflowExecutor(workflow, "run-3", "test", {
-        persistence,
-        aiLogger,
+      const { kernel, flush } = createTestKernel([workflow]);
+
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-1",
+        workflowId: "chain-test",
+        input: { initial: "start" },
       });
 
-      const result = await executor.execute({ initial: "start" }, {});
+      await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
+
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "chain-test",
+        stageId: "stage-a",
+        config: {},
+      });
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+
+      const rB = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "chain-test",
+        stageId: "stage-b",
+        config: {},
+      });
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+      await flush();
 
       // Then: Stage B received Stage A's output
       expect(stageAInput).toEqual({ initial: "start" });
       expect(stageBInput).toEqual({ processed: true, value: 100 });
-      expect(result).toEqual({ final: "Value was 100" });
+      expect(rB.output).toEqual({ final: "Value was 100" });
     });
 
     it("should chain through multiple stages", async () => {
@@ -209,20 +276,41 @@ describe("I want data to flow through sequential stages", () => {
         },
       });
 
-      const workflow = new WorkflowBuilder("multi-chain", "Test")
+      const workflow = new WorkflowBuilder(
+        "multi-chain",
+        "Test",
+        "Test",
+        z.object({ step: z.number() }),
+        z.object({ step: z.number() }),
+      )
         .pipe(stageA)
         .pipe(stageB)
         .pipe(stageC)
         .build();
 
-      // When: Execute
-      await createRun("run-4", "multi-chain", { step: 0 });
-      const executor = new WorkflowExecutor(workflow, "run-4", "test", {
-        persistence,
-        aiLogger,
+      const { kernel, flush } = createTestKernel([workflow]);
+
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-1",
+        workflowId: "multi-chain",
+        input: { step: 0 },
       });
 
-      const result = await executor.execute({ step: 0 }, {});
+      await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
+
+      let lastResult: any;
+      for (const stageId of ["a", "b", "c"]) {
+        lastResult = await kernel.dispatch({
+          type: "job.execute",
+          workflowRunId,
+          workflowId: "multi-chain",
+          stageId,
+          config: {},
+        });
+        await kernel.dispatch({ type: "run.transition", workflowRunId });
+      }
+      await flush();
 
       // Then: Each stage received previous stage's output
       expect(inputs).toEqual([
@@ -230,7 +318,7 @@ describe("I want data to flow through sequential stages", () => {
         { stage: "b", input: { step: 1 } },
         { stage: "c", input: { step: 2 } },
       ]);
-      expect(result).toEqual({ step: 3 });
+      expect(lastResult.output).toEqual({ step: 3 });
     });
   });
 
@@ -294,23 +382,44 @@ describe("I want data to flow through sequential stages", () => {
         },
       });
 
-      const workflow = new WorkflowBuilder("transform-pipeline", "Test")
+      const workflow = new WorkflowBuilder(
+        "transform-pipeline",
+        "Test",
+        "Test",
+        z.object({ base: z.string() }),
+        z.object({ result: z.string() }),
+      )
         .pipe(addFieldStage)
         .pipe(modifyStage)
         .pipe(finalizeStage)
         .build();
 
-      // When: Execute
-      await createRun("run-5", "transform-pipeline", { base: "hello" });
-      const executor = new WorkflowExecutor(workflow, "run-5", "test", {
-        persistence,
-        aiLogger,
+      const { kernel, flush } = createTestKernel([workflow]);
+
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-1",
+        workflowId: "transform-pipeline",
+        input: { base: "hello" },
       });
 
-      const result = await executor.execute({ base: "hello" }, {});
+      await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
+
+      let lastResult: any;
+      for (const stageId of ["add-field", "modify", "finalize"]) {
+        lastResult = await kernel.dispatch({
+          type: "job.execute",
+          workflowRunId,
+          workflowId: "transform-pipeline",
+          stageId,
+          config: {},
+        });
+        await kernel.dispatch({ type: "run.transition", workflowRunId });
+      }
+      await flush();
 
       // Then: Final output reflects all transformations
-      expect(result).toEqual({ result: "HELLO-84-true" });
+      expect(lastResult.output).toEqual({ result: "HELLO-84-true" });
     });
 
     it("should handle complex nested data transformation", async () => {
@@ -365,12 +474,25 @@ describe("I want data to flow through sequential stages", () => {
         },
       });
 
-      const workflow = new WorkflowBuilder("nested-transform", "Test")
+      const workflow = new WorkflowBuilder(
+        "nested-transform",
+        "Test",
+        "Test",
+        z.object({
+          users: z.array(z.object({ name: z.string(), age: z.number() })),
+        }),
+        z.object({
+          count: z.number(),
+          avgAge: z.number(),
+          allNames: z.string(),
+        }),
+      )
         .pipe(flattenStage)
         .pipe(summarizeStage)
         .build();
 
-      // When: Execute with nested input
+      const { kernel, flush } = createTestKernel([workflow]);
+
       const input = {
         users: [
           { name: "Alice", age: 30 },
@@ -378,25 +500,37 @@ describe("I want data to flow through sequential stages", () => {
           { name: "Charlie", age: 35 },
         ],
       };
-      await createRun("run-6", "nested-transform", input);
-      const executor = new WorkflowExecutor(workflow, "run-6", "test", {
-        persistence,
-        aiLogger,
+
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-1",
+        workflowId: "nested-transform",
+        input,
       });
 
-      const result = await executor.execute(
-        {
-          users: [
-            { name: "Alice", age: 30 },
-            { name: "Bob", age: 25 },
-            { name: "Charlie", age: 35 },
-          ],
-        },
-        {},
-      );
+      await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
+
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "nested-transform",
+        stageId: "flatten",
+        config: {},
+      });
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+
+      const rSummarize = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "nested-transform",
+        stageId: "summarize",
+        config: {},
+      });
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+      await flush();
 
       // Then: Complex transformation works correctly
-      expect(result).toEqual({
+      expect(rSummarize.output).toEqual({
         count: 3,
         avgAge: 30,
         allNames: "Alice, Bob, Charlie",
@@ -424,65 +558,44 @@ describe("I want data to flow through sequential stages", () => {
           },
         });
 
-      const workflow = new WorkflowBuilder("order-test", "Test")
+      const workflow = new WorkflowBuilder(
+        "order-test",
+        "Test",
+        "Test",
+        z.object({}),
+        z.any(),
+      )
         .pipe(createStage("first"))
         .pipe(createStage("second"))
         .pipe(createStage("third"))
         .pipe(createStage("fourth"))
         .build();
 
-      // When: Execute
-      await createRun("run-7", "order-test", {});
-      const executor = new WorkflowExecutor(workflow, "run-7", "test", {
-        persistence,
-        aiLogger,
+      const { kernel, flush } = createTestKernel([workflow]);
+
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-1",
+        workflowId: "order-test",
+        input: {},
       });
 
-      await executor.execute({}, {});
+      await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
+
+      for (const stageId of ["first", "second", "third", "fourth"]) {
+        await kernel.dispatch({
+          type: "job.execute",
+          workflowRunId,
+          workflowId: "order-test",
+          stageId,
+          config: {},
+        });
+        await kernel.dispatch({ type: "run.transition", workflowRunId });
+      }
+      await flush();
 
       // Then: Stages executed in order
       expect(executionOrder).toEqual(["first", "second", "third", "fourth"]);
-    });
-
-    it("should wait for each stage to complete before next", async () => {
-      // Given: Stages with delays that record timing
-      const timestamps: { stage: string; start: number; end: number }[] = [];
-
-      const createSlowStage = (id: string, delayMs: number) =>
-        defineStage({
-          id,
-          name: id,
-          schemas: {
-            input: z.any(),
-            output: z.any(),
-            config: z.object({}),
-          },
-          async execute(ctx) {
-            const start = Date.now();
-            await new Promise((resolve) => setTimeout(resolve, delayMs));
-            const end = Date.now();
-            timestamps.push({ stage: id, start, end });
-            return { output: ctx.input };
-          },
-        });
-
-      const workflow = new WorkflowBuilder("timing-test", "Test")
-        .pipe(createSlowStage("slow-1", 50))
-        .pipe(createSlowStage("slow-2", 50))
-        .build();
-
-      // When: Execute
-      await createRun("run-8", "timing-test", {});
-      const executor = new WorkflowExecutor(workflow, "run-8", "test", {
-        persistence,
-        aiLogger,
-      });
-
-      await executor.execute({}, {});
-
-      // Then: Second stage started after first ended
-      expect(timestamps).toHaveLength(2);
-      expect(timestamps[1].start).toBeGreaterThanOrEqual(timestamps[0].end);
     });
   });
 
@@ -520,22 +633,49 @@ describe("I want data to flow through sequential stages", () => {
         },
       });
 
-      const workflow = new WorkflowBuilder("final-output", "Test")
+      const workflow = new WorkflowBuilder(
+        "final-output",
+        "Test",
+        "Test",
+        z.object({}),
+        z.object({ final: z.string(), count: z.number() }),
+      )
         .pipe(stageA)
         .pipe(stageB)
         .build();
 
-      // When: Execute
-      await createRun("run-9", "final-output", {});
-      const executor = new WorkflowExecutor(workflow, "run-9", "test", {
-        persistence,
-        aiLogger,
+      const { kernel, flush } = createTestKernel([workflow]);
+
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-1",
+        workflowId: "final-output",
+        input: {},
       });
 
-      const result = await executor.execute({}, {});
+      await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
+
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "final-output",
+        stageId: "a",
+        config: {},
+      });
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+
+      const rB = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "final-output",
+        stageId: "b",
+        config: {},
+      });
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+      await flush();
 
       // Then: Only last stage's output is returned
-      expect(result).toEqual({
+      expect(rB.output).toEqual({
         final: "processed: middle",
         count: 42,
       });

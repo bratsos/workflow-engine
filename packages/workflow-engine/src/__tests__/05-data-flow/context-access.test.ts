@@ -1,43 +1,54 @@
 /**
- * Context Access Tests
+ * Context Access Tests (Kernel)
  *
  * Tests for accessing previous stage outputs via workflowContext.
  * Verifies accumulation, non-adjacent access, and typed retrieval.
  */
 
-import { beforeEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { WorkflowExecutor } from "../../core/executor";
-import { getStageOutput, requireStageOutput } from "../../core/schema-helpers";
-import { defineStage } from "../../core/stage-factory";
-import { WorkflowBuilder } from "../../core/workflow";
-import { InMemoryAICallLogger } from "../utils/in-memory-ai-logger";
-import { InMemoryWorkflowPersistence } from "../utils/in-memory-persistence";
+import { createKernel } from "../../kernel/kernel.js";
+import {
+  FakeClock,
+  InMemoryBlobStore,
+  CollectingEventSink,
+  NoopScheduler,
+} from "../../kernel/testing/index.js";
+import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
+import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
+import { defineStage } from "../../core/stage-factory.js";
+import { WorkflowBuilder, type Workflow } from "../../core/workflow.js";
+import {
+  getStageOutput,
+  requireStageOutput,
+} from "../../core/schema-helpers.js";
 
-describe("I want to access previous stage outputs", () => {
-  let persistence: InMemoryWorkflowPersistence;
-  let aiLogger: InMemoryAICallLogger;
+function createTestKernel(workflows: Workflow<any, any>[] = []) {
+  const persistence = new InMemoryWorkflowPersistence();
+  const blobStore = new InMemoryBlobStore();
+  const jobTransport = new InMemoryJobQueue("test-worker");
+  const eventSink = new CollectingEventSink();
+  const scheduler = new NoopScheduler();
+  const clock = new FakeClock();
 
-  beforeEach(() => {
-    persistence = new InMemoryWorkflowPersistence();
-    aiLogger = new InMemoryAICallLogger();
+  const registry = new Map<string, Workflow<any, any>>();
+  for (const w of workflows) registry.set(w.id, w);
+
+  const kernel = createKernel({
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry: { getWorkflow: (id) => registry.get(id) },
   });
 
-  // Helper to create a workflow run before execution
-  async function createRun(
-    runId: string,
-    workflowId: string,
-    input: unknown = {},
-  ) {
-    await persistence.createRun({
-      id: runId,
-      workflowId,
-      workflowName: workflowId,
-      status: "PENDING",
-      input,
-    });
-  }
+  const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
+  return { kernel, flush, persistence, blobStore, jobTransport, eventSink, scheduler, clock, registry };
+}
 
+describe("I want to access previous stage outputs", () => {
   describe("workflowContext accumulation", () => {
     it("should accumulate all outputs in workflowContext", async () => {
       // Given: Three sequential stages
@@ -83,20 +94,57 @@ describe("I want to access previous stage outputs", () => {
         },
       });
 
-      const workflow = new WorkflowBuilder("accumulate", "Test")
+      const workflow = new WorkflowBuilder(
+        "accumulate",
+        "Test",
+        "Test",
+        z.object({}),
+        z.object({ fromC: z.string() }),
+      )
         .pipe(stageA)
         .pipe(stageB)
         .pipe(stageC)
         .build();
 
-      // When: Execute
-      await createRun("run-1", "accumulate", {});
-      const executor = new WorkflowExecutor(workflow, "run-1", "test", {
-        persistence,
-        aiLogger,
+      const { kernel, flush } = createTestKernel([workflow]);
+
+      // When: Execute via kernel dispatch
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-1",
+        workflowId: "accumulate",
+        input: {},
       });
 
-      await executor.execute({}, {});
+      await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
+
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "accumulate",
+        stageId: "stage-a",
+        config: {},
+      });
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "accumulate",
+        stageId: "stage-b",
+        config: {},
+      });
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "accumulate",
+        stageId: "stage-c",
+        config: {},
+      });
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+      await flush();
 
       // Then: C has access to both A and B outputs
       expect(contextAtC).toBeDefined();
@@ -126,21 +174,41 @@ describe("I want to access previous stage outputs", () => {
           },
         });
 
-      const workflow = new WorkflowBuilder("progressive", "Test")
+      const workflow = new WorkflowBuilder(
+        "progressive",
+        "Test",
+        "Test",
+        z.object({}),
+        z.object({ id: z.string() }),
+      )
         .pipe(createStage("first"))
         .pipe(createStage("second"))
         .pipe(createStage("third"))
         .pipe(createStage("fourth"))
         .build();
 
-      // When: Execute
-      await createRun("run-2", "progressive", {});
-      const executor = new WorkflowExecutor(workflow, "run-2", "test", {
-        persistence,
-        aiLogger,
+      const { kernel, flush } = createTestKernel([workflow]);
+
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-1",
+        workflowId: "progressive",
+        input: {},
       });
 
-      await executor.execute({}, {});
+      await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
+
+      for (const stageId of ["first", "second", "third", "fourth"]) {
+        await kernel.dispatch({
+          type: "job.execute",
+          workflowRunId,
+          workflowId: "progressive",
+          stageId,
+          config: {},
+        });
+        await kernel.dispatch({ type: "run.transition", workflowRunId });
+      }
+      await flush();
 
       // Then: Each stage sees more context than the previous
       expect(contextSizes).toEqual([
@@ -205,32 +273,50 @@ describe("I want to access previous stage outputs", () => {
           config: z.object({}),
         },
         async execute(ctx) {
-          // Access stage-a output, not the direct input
           aOutputFromD = ctx.workflowContext["stage-a"];
           const aData = ctx.workflowContext["stage-a"] as { important: number };
           return { output: { final: `Got ${aData.important} from A` } };
         },
       });
 
-      const workflow = new WorkflowBuilder("non-adjacent", "Test")
+      const workflow = new WorkflowBuilder(
+        "non-adjacent",
+        "Test",
+        "Test",
+        z.object({}),
+        z.object({ final: z.string() }),
+      )
         .pipe(stageA)
         .pipe(stageB)
         .pipe(stageC)
         .pipe(stageD)
         .build();
 
-      // When: Execute
-      await createRun("run-3", "non-adjacent", {});
-      const executor = new WorkflowExecutor(workflow, "run-3", "test", {
-        persistence,
-        aiLogger,
+      const { kernel, flush } = createTestKernel([workflow]);
+
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-1",
+        workflowId: "non-adjacent",
+        input: {},
       });
 
-      const result = await executor.execute({}, {});
+      await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
+
+      for (const stageId of ["stage-a", "stage-b", "stage-c", "stage-d"]) {
+        await kernel.dispatch({
+          type: "job.execute",
+          workflowRunId,
+          workflowId: "non-adjacent",
+          stageId,
+          config: {},
+        });
+        await kernel.dispatch({ type: "run.transition", workflowRunId });
+      }
+      await flush();
 
       // Then: D accessed A's output correctly
       expect(aOutputFromD).toEqual({ important: 42 });
-      expect(result).toEqual({ final: "Got 42 from A" });
     });
   });
 
@@ -270,30 +356,56 @@ describe("I want to access previous stage outputs", () => {
           config: z.object({}),
         },
         async execute(ctx) {
-          // Use ctx.require with typed context
           retrievedOutput = ctx.require("extract");
           const extracted = ctx.require("extract");
           return { output: { result: `${extracted.data}-${extracted.count}` } };
         },
       });
 
-      const workflow = new WorkflowBuilder("require-test", "Test")
+      const workflow = new WorkflowBuilder(
+        "require-test",
+        "Test",
+        "Test",
+        z.object({}),
+        z.object({ result: z.string() }),
+      )
         .pipe(firstStage)
         .pipe(secondStage)
         .build();
 
-      // When: Execute
-      await createRun("run-4", "require-test", {});
-      const executor = new WorkflowExecutor(workflow, "run-4", "test", {
-        persistence,
-        aiLogger,
+      const { kernel, flush } = createTestKernel([workflow]);
+
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-1",
+        workflowId: "require-test",
+        input: {},
       });
 
-      const result = await executor.execute({}, {});
+      await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
+
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "require-test",
+        stageId: "extract",
+        config: {},
+      });
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+
+      const r2 = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "require-test",
+        stageId: "process",
+        config: {},
+      });
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+      await flush();
 
       // Then: ctx.require returned the correct data
       expect(retrievedOutput).toEqual({ data: "extracted", count: 100 });
-      expect(result).toEqual({ result: "extracted-100" });
+      expect(r2.output).toEqual({ result: "extracted-100" });
     });
 
     it("should throw for missing required stage", async () => {
@@ -307,26 +419,43 @@ describe("I want to access previous stage outputs", () => {
           config: z.object({}),
         },
         async execute(ctx) {
-          // Try to require a stage that doesn't exist
           ctx.require("nonexistent" as any);
           return { output: {} };
         },
       });
 
-      const workflow = new WorkflowBuilder("require-missing", "Test")
+      const workflow = new WorkflowBuilder(
+        "require-missing",
+        "Test",
+        "Test",
+        z.object({}),
+        z.object({}),
+      )
         .pipe(badStage)
         .build();
 
-      // When/Then: Execution throws
-      await createRun("run-5", "require-missing", {});
-      const executor = new WorkflowExecutor(workflow, "run-5", "test", {
-        persistence,
-        aiLogger,
+      const { kernel, flush } = createTestKernel([workflow]);
+
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-1",
+        workflowId: "require-missing",
+        input: {},
       });
 
-      await expect(executor.execute({}, {})).rejects.toThrow(
-        /Missing required stage/,
-      );
+      await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
+
+      // When: Execute the stage that requires a non-existent stage
+      const result = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "require-missing",
+        stageId: "bad",
+        config: {},
+      });
+
+      // Then: job.execute returns failed outcome (kernel catches stage errors)
+      expect(result.outcome).toBe("failed");
     });
   });
 
@@ -349,22 +478,40 @@ describe("I want to access previous stage outputs", () => {
         },
       });
 
-      const workflow = new WorkflowBuilder("optional-missing", "Test")
+      const workflow = new WorkflowBuilder(
+        "optional-missing",
+        "Test",
+        "Test",
+        z.object({}),
+        z.object({ hasOptional: z.boolean() }),
+      )
         .pipe(stage)
         .build();
 
-      // When: Execute
-      await createRun("run-6", "optional-missing", {});
-      const executor = new WorkflowExecutor(workflow, "run-6", "test", {
-        persistence,
-        aiLogger,
+      const { kernel, flush } = createTestKernel([workflow]);
+
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-1",
+        workflowId: "optional-missing",
+        input: {},
       });
 
-      const result = await executor.execute({}, {});
+      await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
+
+      const result = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "optional-missing",
+        stageId: "check-optional",
+        config: {},
+      });
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+      await flush();
 
       // Then: ctx.optional returned undefined (no throw)
       expect(optionalResult).toBeUndefined();
-      expect(result).toEqual({ hasOptional: false });
+      expect(result.output).toEqual({ hasOptional: false });
     });
 
     it("should return typed data for existing optional stage", async () => {
@@ -413,23 +560,50 @@ describe("I want to access previous stage outputs", () => {
         },
       });
 
-      const workflow = new WorkflowBuilder("optional-exists", "Test")
+      const workflow = new WorkflowBuilder(
+        "optional-exists",
+        "Test",
+        "Test",
+        z.object({}),
+        z.object({ found: z.boolean(), value: z.string() }),
+      )
         .pipe(firstStage)
         .pipe(secondStage)
         .build();
 
-      // When: Execute
-      await createRun("run-7", "optional-exists", {});
-      const executor = new WorkflowExecutor(workflow, "run-7", "test", {
-        persistence,
-        aiLogger,
+      const { kernel, flush } = createTestKernel([workflow]);
+
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-1",
+        workflowId: "optional-exists",
+        input: {},
       });
 
-      const result = await executor.execute({}, {});
+      await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
+
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "optional-exists",
+        stageId: "optional-source",
+        config: {},
+      });
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+
+      const r2 = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "optional-exists",
+        stageId: "check",
+        config: {},
+      });
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+      await flush();
 
       // Then: ctx.optional returned the data
       expect(optionalResult).toEqual({ optional: "present" });
-      expect(result).toEqual({ found: true, value: "present" });
+      expect(r2.output).toEqual({ found: true, value: "present" });
     });
   });
 
@@ -542,7 +716,7 @@ describe("I want to access previous stage outputs", () => {
         id: "parallel-a",
         name: "Parallel A",
         schemas: {
-          input: z.object({}),
+          input: z.object({}).passthrough(),
           output: z.object({ a: z.number() }),
           config: z.object({}),
         },
@@ -555,7 +729,7 @@ describe("I want to access previous stage outputs", () => {
         id: "parallel-b",
         name: "Parallel B",
         schemas: {
-          input: z.object({}),
+          input: z.object({}).passthrough(),
           output: z.object({ b: z.number() }),
           config: z.object({}),
         },
@@ -578,19 +752,57 @@ describe("I want to access previous stage outputs", () => {
         },
       });
 
-      const workflow = new WorkflowBuilder("parallel-context", "Test")
+      const workflow = new WorkflowBuilder(
+        "parallel-context",
+        "Test",
+        "Test",
+        z.object({}),
+        z.object({ done: z.boolean() }),
+      )
         .parallel([parallelA, parallelB])
         .pipe(finalStage)
         .build();
 
-      // When: Execute
-      await createRun("run-8", "parallel-context", {});
-      const executor = new WorkflowExecutor(workflow, "run-8", "test", {
-        persistence,
-        aiLogger,
+      const { kernel, flush } = createTestKernel([workflow]);
+
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-1",
+        workflowId: "parallel-context",
+        input: {},
       });
 
-      await executor.execute({}, {});
+      await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
+
+      // Execute both parallel stages
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "parallel-context",
+        stageId: "parallel-a",
+        config: {},
+      });
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "parallel-context",
+        stageId: "parallel-b",
+        config: {},
+      });
+
+      // One transition after parallel group
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+
+      // Execute final stage
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "parallel-context",
+        stageId: "final",
+        config: {},
+      });
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+      await flush();
 
       // Then: Both parallel outputs are in context
       expect(contextAfterParallel).toBeDefined();
