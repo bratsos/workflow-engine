@@ -82,6 +82,24 @@ export interface RunCancelResult {
 }
 
 // ---------------------------------------------------------------------------
+// run.rerunFrom
+// ---------------------------------------------------------------------------
+
+/** Reruns a workflow from a specific stage, deleting stages at/after that point. */
+export interface RunRerunFromCommand {
+  readonly type: "run.rerunFrom";
+  readonly workflowRunId: string;
+  readonly fromStageId: string;
+}
+
+/** Result of a `run.rerunFrom` command. */
+export interface RunRerunFromResult {
+  readonly workflowRunId: string;
+  readonly fromStageId: string;
+  readonly deletedStages: string[];
+}
+
+// ---------------------------------------------------------------------------
 // job.execute
 // ---------------------------------------------------------------------------
 
@@ -175,6 +193,7 @@ export type KernelCommand =
   | RunClaimPendingCommand
   | RunTransitionCommand
   | RunCancelCommand
+  | RunRerunFromCommand
   | JobExecuteCommand
   | StagePollSuspendedCommand
   | LeaseReapStaleCommand
@@ -190,6 +209,7 @@ export type CommandResult<T extends KernelCommand> =
   T extends RunClaimPendingCommand ? RunClaimPendingResult :
   T extends RunTransitionCommand ? RunTransitionResult :
   T extends RunCancelCommand ? RunCancelResult :
+  T extends RunRerunFromCommand ? RunRerunFromResult :
   T extends JobExecuteCommand ? JobExecuteResult :
   T extends StagePollSuspendedCommand ? StagePollSuspendedResult :
   T extends LeaseReapStaleCommand ? LeaseReapStaleResult :

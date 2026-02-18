@@ -19,6 +19,7 @@ import type {
   RunClaimPendingCommand,
   RunTransitionCommand,
   RunCancelCommand,
+  RunRerunFromCommand,
   JobExecuteCommand,
   StagePollSuspendedCommand,
   LeaseReapStaleCommand,
@@ -39,6 +40,7 @@ import { handleRunCreate } from "./handlers/run-create";
 import { handleRunClaimPending } from "./handlers/run-claim-pending";
 import { handleRunTransition } from "./handlers/run-transition";
 import { handleRunCancel } from "./handlers/run-cancel";
+import { handleRunRerunFrom } from "./handlers/run-rerun-from";
 import { handleJobExecute } from "./handlers/job-execute";
 import { handleStagePollSuspended } from "./handlers/stage-poll-suspended";
 import { handleLeaseReapStale } from "./handlers/lease-reap-stale";
@@ -187,6 +189,12 @@ export function createKernel(config: KernelConfig): Kernel {
         break;
       case "run.cancel":
         result = await handleRunCancel(command as RunCancelCommand, deps);
+        break;
+      case "run.rerunFrom":
+        result = await handleRunRerunFrom(
+          command as RunRerunFromCommand,
+          deps,
+        );
         break;
       case "job.execute":
         result = await handleJobExecute(command as JobExecuteCommand, deps);
