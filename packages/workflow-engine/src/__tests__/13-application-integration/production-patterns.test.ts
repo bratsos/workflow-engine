@@ -423,8 +423,6 @@ describe("I want to use production-ready patterns", () => {
   });
 
   describe("monitoring patterns", () => {
-    it.skip("TODO: monitoring hooks now handled by host packages", () => {});
-
     it("should track processing metrics via event sink", async () => {
       // Given: A kernel with a simple workflow
       const schema = z.object({ value: z.string() });

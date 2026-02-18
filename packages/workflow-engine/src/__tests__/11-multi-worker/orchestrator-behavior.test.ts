@@ -443,12 +443,6 @@ describe("I want orchestrator to manage workflow state", () => {
     });
   });
 
-  describe("runtime lifecycle", () => {
-    it.skip("TODO: AI helper creation now handled by host packages", () => {});
-    it.skip("TODO: AI helper creation now handled by host packages", () => {});
-    it.skip("TODO: log context creation now handled by host packages", () => {});
-  });
-
   describe("error handling", () => {
     it("should handle non-existent run gracefully on transition", async () => {
       const { kernel } = createTestKernel([]);

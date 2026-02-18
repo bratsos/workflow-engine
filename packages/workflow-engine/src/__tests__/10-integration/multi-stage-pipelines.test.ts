@@ -320,10 +320,89 @@ describe("I want to build multi-stage pipelines", () => {
       expect(publishStageRecord!.status).toBe("COMPLETED");
     });
 
-    it.skip("TODO: timing not meaningful with synchronous dispatch", async () => {
-      // Original test: should track timing across 6-stage pipeline
-      // Timing measurements are not meaningful in the kernel model because
-      // dispatch is synchronous and there is no real concurrency overhead.
+    it("should record completedAt and duration on run and stage records", async () => {
+      // Given: A 3-stage pipeline where each stage advances the clock during execution
+      const inputSchema = z.object({ value: z.string() });
+      const outputSchema = z.object({ value: z.string() });
+
+      // We need a FakeClock initialized to "now" so that run.createdAt (set by
+      // InMemoryWorkflowPersistence via new Date()) roughly matches the fake
+      // clock's time. This avoids a negative duration when the transition
+      // handler computes clock.now() - run.createdAt.
+      const clock = new FakeClock(new Date());
+
+      const makeStage = (id: string) =>
+        defineStage({
+          id,
+          name: id,
+          schemas: { input: inputSchema, output: outputSchema, config: z.object({}) },
+          async execute(ctx) {
+            // Advance the clock during execution so stage duration > 0
+            clock.advance(500);
+            return { output: { value: ctx.input.value } };
+          },
+        });
+
+      const workflow = new WorkflowBuilder(
+        "timing-pipeline",
+        "Timing Pipeline",
+        "3-stage timing test",
+        inputSchema,
+        outputSchema,
+      )
+        .pipe(makeStage("step-a"))
+        .pipe(makeStage("step-b"))
+        .pipe(makeStage("step-c"))
+        .build();
+
+      const persistence = new InMemoryWorkflowPersistence();
+      const blobStore = new InMemoryBlobStore();
+      const jobTransport = new InMemoryJobQueue("test-worker");
+      const eventSink = new CollectingEventSink();
+      const scheduler = new NoopScheduler();
+      const registry = new Map<string, Workflow<any, any>>();
+      registry.set(workflow.id, workflow);
+      const kernel = createKernel({
+        persistence, blobStore, jobTransport, eventSink, scheduler, clock,
+        registry: { getWorkflow: (id) => registry.get(id) },
+      });
+      const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
+
+      // When: I create and execute the pipeline, advancing the clock between stages
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-timing",
+        workflowId: "timing-pipeline",
+        input: { value: "hello" },
+      });
+      await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
+
+      for (const stageId of ["step-a", "step-b", "step-c"]) {
+        clock.advance(1000);
+        await kernel.dispatch({
+          type: "job.execute",
+          workflowRunId,
+          workflowId: "timing-pipeline",
+          stageId,
+          config: {},
+        });
+        await kernel.dispatch({ type: "run.transition", workflowRunId });
+      }
+      await flush();
+
+      // Then: The run is completed with a positive duration
+      const run = await persistence.getRun(workflowRunId);
+      expect(run!.status).toBe("COMPLETED");
+      expect(run!.completedAt).toBeInstanceOf(Date);
+      expect(run!.duration).toBeGreaterThan(0);
+
+      // And: Each stage record has a completedAt date and positive duration
+      const stages = await persistence.getStagesByRun(workflowRunId);
+      expect(stages).toHaveLength(3);
+      for (const stage of stages) {
+        expect(stage.completedAt).toBeInstanceOf(Date);
+        expect(stage.duration).toBeGreaterThan(0);
+      }
     });
   });
 
