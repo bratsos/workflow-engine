@@ -1,10 +1,8 @@
 /**
  * Error Recovery Tests
  *
- * Tests for workflow recovery after failures, rewritten to use kernel dispatch().
- *
- * The kernel does not have a built-in retry/resume command. Tests that required
- * the old WorkflowExecutor's `resume: true` option are skipped with a TODO note.
+ * Tests for workflow recovery after failures, rewritten to use kernel dispatch()
+ * and the run.rerunFrom kernel command.
  */
 
 import { describe, expect, it } from "vitest";
@@ -233,26 +231,377 @@ describe("I want to recover from workflow failures", () => {
   });
 
   describe("retry from failed stage", () => {
-    it.skip("should allow retry from failed stage using resume (TODO: needs retry/recovery kernel command)", async () => {
-      // The kernel does not yet have a retry/resume command.
-      // This test previously relied on WorkflowExecutor's `resume: true` option.
+    it("should allow retry from failed stage using run.rerunFrom", async () => {
+      // Given: A 2-stage workflow where stage2 fails on first attempt, succeeds on second
+      let stage2Attempts = 0;
+
+      const stage1 = defineStage({
+        id: "stage1-id",
+        name: "Stage 1",
+        schemas: { input: StringSchema, output: StringSchema, config: z.object({}) },
+        async execute() {
+          return { output: { value: "stage1-done" } };
+        },
+      });
+
+      const stage2 = defineStage({
+        id: "stage2-id",
+        name: "Stage 2",
+        schemas: { input: z.any(), output: StringSchema, config: z.object({}) },
+        async execute() {
+          stage2Attempts++;
+          if (stage2Attempts === 1) throw new Error("stage2 failed on first attempt");
+          return { output: { value: "stage2-done" } };
+        },
+      });
+
+      const workflow = new WorkflowBuilder(
+        "retry-wf",
+        "Retry Workflow",
+        "Test",
+        StringSchema,
+        StringSchema,
+      )
+        .pipe(stage1)
+        .pipe(stage2)
+        .build();
+
+      const { kernel, flush, persistence } = createTestKernel([workflow]);
+
+      // Create and claim
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-retry-1",
+        workflowId: "retry-wf",
+        input: { value: "start" },
+      });
+      await kernel.dispatch({ type: "run.claimPending", workerId: "w1" });
+
+      // Execute stage1 successfully
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "retry-wf",
+        stageId: "stage1-id",
+        config: {},
+      });
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+
+      // Execute stage2 (fails on first attempt)
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "retry-wf",
+        stageId: "stage2-id",
+        config: {},
+      });
+      const transResult = await kernel.dispatch({ type: "run.transition", workflowRunId });
+      expect(transResult.action).toBe("failed");
+
+      const failedRun = await persistence.getRun(workflowRunId);
+      expect(failedRun!.status).toBe("FAILED");
+
+      // Retry from the failed stage
+      await kernel.dispatch({
+        type: "run.rerunFrom",
+        workflowRunId,
+        fromStageId: "stage2-id",
+      });
+
+      // Execute stage2 again (succeeds this time)
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "retry-wf",
+        stageId: "stage2-id",
+        config: {},
+      });
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+      await flush();
+
+      // Verify: run is COMPLETED, stage2 was attempted twice
+      const run = await persistence.getRun(workflowRunId);
+      expect(run!.status).toBe("COMPLETED");
+      expect(stage2Attempts).toBe(2);
     });
 
-    it.skip("should not re-execute completed stages on retry (TODO: needs retry/recovery kernel command)", async () => {
-      // The kernel does not yet have a retry/resume command.
-      // This test previously relied on WorkflowExecutor's `resume: true` option.
+    it("should not re-execute completed stages on retry", async () => {
+      // Given: A 2-stage workflow with execution counters on both stages
+      let stage1Count = 0;
+      let stage2Count = 0;
+
+      const stage1 = defineStage({
+        id: "stage1-id",
+        name: "Stage 1",
+        schemas: { input: StringSchema, output: StringSchema, config: z.object({}) },
+        async execute() {
+          stage1Count++;
+          return { output: { value: "stage1-done" } };
+        },
+      });
+
+      const stage2 = defineStage({
+        id: "stage2-id",
+        name: "Stage 2",
+        schemas: { input: z.any(), output: StringSchema, config: z.object({}) },
+        async execute() {
+          stage2Count++;
+          if (stage2Count === 1) throw new Error("stage2 fails first time");
+          return { output: { value: "stage2-done" } };
+        },
+      });
+
+      const workflow = new WorkflowBuilder(
+        "no-reexec-wf",
+        "No Re-Execute Workflow",
+        "Test",
+        StringSchema,
+        StringSchema,
+      )
+        .pipe(stage1)
+        .pipe(stage2)
+        .build();
+
+      const { kernel, flush, persistence } = createTestKernel([workflow]);
+
+      // Create and claim
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-no-reexec",
+        workflowId: "no-reexec-wf",
+        input: { value: "start" },
+      });
+      await kernel.dispatch({ type: "run.claimPending", workerId: "w1" });
+
+      // Execute stage1, transition, execute stage2 (fails), transition (FAILED)
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "no-reexec-wf",
+        stageId: "stage1-id",
+        config: {},
+      });
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "no-reexec-wf",
+        stageId: "stage2-id",
+        config: {},
+      });
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+
+      // Retry from stage2
+      await kernel.dispatch({
+        type: "run.rerunFrom",
+        workflowRunId,
+        fromStageId: "stage2-id",
+      });
+
+      // Execute stage2 again (succeeds)
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "no-reexec-wf",
+        stageId: "stage2-id",
+        config: {},
+      });
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+      await flush();
+
+      // Verify: stage1 was only executed once, stage2 was executed twice
+      expect(stage1Count).toBe(1);
+      expect(stage2Count).toBe(2);
+
+      const run = await persistence.getRun(workflowRunId);
+      expect(run!.status).toBe("COMPLETED");
     });
 
-    it.skip("should use output from last completed stage when retrying (TODO: needs retry/recovery kernel command)", async () => {
-      // The kernel does not yet have a retry/resume command.
-      // This test previously relied on WorkflowExecutor's `resume: true` option.
+    it("should use output from last completed stage when retrying", async () => {
+      // Given: A 2-stage workflow where stage1 outputs a specific value
+      // and stage2 captures its input
+      let capturedInput: unknown = null;
+      let stage2Count = 0;
+
+      const stage1 = defineStage({
+        id: "stage1-id",
+        name: "Stage 1",
+        schemas: { input: StringSchema, output: z.object({ processed: z.string() }), config: z.object({}) },
+        async execute() {
+          return { output: { processed: "stage1-result" } };
+        },
+      });
+
+      const stage2 = defineStage({
+        id: "stage2-id",
+        name: "Stage 2",
+        schemas: { input: z.any(), output: StringSchema, config: z.object({}) },
+        async execute(ctx) {
+          stage2Count++;
+          capturedInput = ctx.input;
+          if (stage2Count === 1) throw new Error("stage2 fails first time");
+          return { output: { value: "stage2-done" } };
+        },
+      });
+
+      const workflow = new WorkflowBuilder(
+        "input-pass-wf",
+        "Input Pass Workflow",
+        "Test",
+        StringSchema,
+        StringSchema,
+      )
+        .pipe(stage1)
+        .pipe(stage2)
+        .build();
+
+      const { kernel, flush, persistence } = createTestKernel([workflow]);
+
+      // Create and claim
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-input-pass",
+        workflowId: "input-pass-wf",
+        input: { value: "start" },
+      });
+      await kernel.dispatch({ type: "run.claimPending", workerId: "w1" });
+
+      // Execute stage1, transition, execute stage2 (fails), transition (FAILED)
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "input-pass-wf",
+        stageId: "stage1-id",
+        config: {},
+      });
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "input-pass-wf",
+        stageId: "stage2-id",
+        config: {},
+      });
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+
+      // Retry from stage2
+      await kernel.dispatch({
+        type: "run.rerunFrom",
+        workflowRunId,
+        fromStageId: "stage2-id",
+      });
+
+      // Execute stage2 again (succeeds)
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "input-pass-wf",
+        stageId: "stage2-id",
+        config: {},
+      });
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+      await flush();
+
+      // Verify: stage2 received stage1's output as input on retry
+      expect(capturedInput).toEqual({ processed: "stage1-result" });
+
+      const run = await persistence.getRun(workflowRunId);
+      expect(run!.status).toBe("COMPLETED");
     });
   });
 
   describe("recovery state", () => {
-    it.skip("should maintain workflow context after recovery (TODO: needs retry/recovery kernel command)", async () => {
-      // The kernel does not yet have a retry/resume command.
-      // This test previously relied on WorkflowExecutor's `resume: true` option.
+    it("should maintain workflow context after recovery", async () => {
+      // Given: A 2-stage workflow where stage1 outputs { data: "preserved" }
+      // and stage2 captures ctx.workflowContext
+      let capturedWorkflowContext: Record<string, unknown> = {};
+      let stage2Count = 0;
+
+      const stage1 = defineStage({
+        id: "stage1-id",
+        name: "Stage 1",
+        schemas: { input: StringSchema, output: z.object({ data: z.string() }), config: z.object({}) },
+        async execute() {
+          return { output: { data: "preserved" } };
+        },
+      });
+
+      const stage2 = defineStage({
+        id: "stage2-id",
+        name: "Stage 2",
+        schemas: { input: z.any(), output: StringSchema, config: z.object({}) },
+        async execute(ctx) {
+          stage2Count++;
+          capturedWorkflowContext = { ...ctx.workflowContext };
+          if (stage2Count === 1) throw new Error("stage2 fails first time");
+          return { output: { value: "stage2-done" } };
+        },
+      });
+
+      const workflow = new WorkflowBuilder(
+        "context-wf",
+        "Context Workflow",
+        "Test",
+        StringSchema,
+        StringSchema,
+      )
+        .pipe(stage1)
+        .pipe(stage2)
+        .build();
+
+      const { kernel, flush, persistence } = createTestKernel([workflow]);
+
+      // Create and claim
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-context-recovery",
+        workflowId: "context-wf",
+        input: { value: "start" },
+      });
+      await kernel.dispatch({ type: "run.claimPending", workerId: "w1" });
+
+      // Execute stage1, transition, execute stage2 (fails), transition (FAILED)
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "context-wf",
+        stageId: "stage1-id",
+        config: {},
+      });
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "context-wf",
+        stageId: "stage2-id",
+        config: {},
+      });
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+
+      // Retry from stage2
+      await kernel.dispatch({
+        type: "run.rerunFrom",
+        workflowRunId,
+        fromStageId: "stage2-id",
+      });
+
+      // Execute stage2 again (succeeds)
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "context-wf",
+        stageId: "stage2-id",
+        config: {},
+      });
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+      await flush();
+
+      // Verify: workflowContext contains stage1's output after recovery
+      expect(capturedWorkflowContext).toHaveProperty("stage1-id");
+      expect(capturedWorkflowContext["stage1-id"]).toEqual({ data: "preserved" });
+
+      const run = await persistence.getRun(workflowRunId);
+      expect(run!.status).toBe("COMPLETED");
     });
   });
 });
