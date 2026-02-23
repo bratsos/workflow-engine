@@ -8,7 +8,7 @@
  */
 
 import { beforeEach, describe, expect, it } from "vitest";
-import { InMemoryWorkflowPersistence } from "../utils/in-memory-persistence.js";
+import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 
 describe("I want to prevent race conditions when claiming workflows", () => {
   let persistence: InMemoryWorkflowPersistence;

@@ -76,6 +76,9 @@ export interface Clock {
  * by the BlobStore port.
  */
 export interface Persistence {
+  /** Execute operations within a transaction boundary. */
+  withTransaction<T>(fn: (tx: Persistence) => Promise<T>): Promise<T>;
+
   // -- Run operations --------------------------------------------------------
 
   createRun(data: CreateRunInput): Promise<WorkflowRunRecord>;
@@ -156,18 +159,25 @@ export interface Persistence {
 
   // -- Idempotency operations -----------------------------------------------
 
-  /** Check if an idempotency key exists. Returns cached result if found. */
-  checkIdempotencyKey(
+  /** Atomically acquire an idempotency key for command execution. */
+  acquireIdempotencyKey(
     key: string,
     commandType: string,
-  ): Promise<{ exists: boolean; result?: unknown }>;
+  ): Promise<
+    | { status: "acquired" }
+    | { status: "replay"; result: unknown }
+    | { status: "in_progress" }
+  >;
 
-  /** Store an idempotency key with its command result (success only). */
-  setIdempotencyKey(
+  /** Mark an idempotency key as completed and cache the command result. */
+  completeIdempotencyKey(
     key: string,
     commandType: string,
     result: unknown,
   ): Promise<void>;
+
+  /** Release an in-progress idempotency key after command failure. */
+  releaseIdempotencyKey(key: string, commandType: string): Promise<void>;
 }
 
 // ============================================================================

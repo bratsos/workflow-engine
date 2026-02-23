@@ -51,7 +51,7 @@ export class PrismaJobQueue implements JobQueue {
         workflowRunId: options.workflowRunId,
         stageId: options.stageId,
         priority: options.priority ?? 5,
-        payload: (options.payload || {}) as unknown,
+        payload: { ...options.payload, _workflowId: options.workflowId } as unknown,
         status: this.enums.status("PENDING"),
         nextPollAt: options.scheduledFor,
       },
@@ -76,7 +76,7 @@ export class PrismaJobQueue implements JobQueue {
             workflowRunId: job.workflowRunId,
             stageId: job.stageId,
             priority: job.priority ?? 5,
-            payload: (job.payload || {}) as unknown,
+            payload: { ...job.payload, _workflowId: job.workflowId } as unknown,
             status: this.enums.status("PENDING"),
           },
         }),
@@ -109,6 +109,7 @@ export class PrismaJobQueue implements JobQueue {
           stageId: string;
           priority: number;
           attempt: number;
+          maxAttempts: number;
           payload: unknown;
         }>
       >`
@@ -127,7 +128,7 @@ export class PrismaJobQueue implements JobQueue {
           LIMIT 1
           FOR UPDATE SKIP LOCKED
         )
-        RETURNING id, "workflowRunId", "stageId", priority, attempt, payload
+        RETURNING id, "workflowRunId", "stageId", priority, attempt, "maxAttempts", payload
       `;
 
       if (result.length === 0) {
@@ -139,13 +140,17 @@ export class PrismaJobQueue implements JobQueue {
         `Dequeued job ${job.id} (stage: ${job.stageId}, attempt: ${job.attempt})`,
       );
 
+      const payload = job.payload as Record<string, unknown>;
+      const { _workflowId, ...rest } = payload;
       return {
         jobId: job.id,
         workflowRunId: job.workflowRunId,
+        workflowId: (_workflowId as string) ?? "",
         stageId: job.stageId,
         priority: job.priority,
         attempt: job.attempt,
-        payload: job.payload as Record<string, unknown>,
+        maxAttempts: job.maxAttempts,
+        payload: rest,
       };
     } catch (error) {
       logger.error("Error dequeuing job:", error);
@@ -210,13 +215,17 @@ export class PrismaJobQueue implements JobQueue {
         `Dequeued job ${claimedJob.id} (stage: ${claimedJob.stageId}, attempt: ${claimedJob.attempt})`,
       );
 
+      const claimedPayload = claimedJob.payload as Record<string, unknown>;
+      const { _workflowId: claimedWfId, ...claimedRest } = claimedPayload;
       return {
         jobId: claimedJob.id,
         workflowRunId: claimedJob.workflowRunId,
+        workflowId: (claimedWfId as string) ?? "",
         stageId: claimedJob.stageId,
         priority: claimedJob.priority,
         attempt: claimedJob.attempt,
-        payload: claimedJob.payload as Record<string, unknown>,
+        maxAttempts: claimedJob.maxAttempts,
+        payload: claimedRest,
       };
     } catch (error) {
       logger.error("Error dequeuing job:", error);

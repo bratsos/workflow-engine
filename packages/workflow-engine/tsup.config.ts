@@ -7,6 +7,8 @@ export default defineConfig({
     "testing/index": "src/testing/index.ts",
     "persistence/index": "src/persistence/index.ts",
     "persistence/prisma/index": "src/persistence/prisma/index.ts",
+    "kernel/index": "src/kernel/index.ts",
+    "kernel/testing/index": "src/kernel/testing/index.ts",
     "cli/sync-models": "src/cli/sync-models.ts",
   },
   format: ["esm"],

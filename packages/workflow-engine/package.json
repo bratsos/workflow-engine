@@ -58,6 +58,16 @@
       "types": "./dist/persistence/prisma/index.d.ts",
       "import": "./dist/persistence/prisma/index.js",
       "default": "./dist/persistence/prisma/index.js"
+    },
+    "./kernel": {
+      "types": "./dist/kernel/index.d.ts",
+      "import": "./dist/kernel/index.js",
+      "default": "./dist/kernel/index.js"
+    },
+    "./kernel/testing": {
+      "types": "./dist/kernel/testing/index.d.ts",
+      "import": "./dist/kernel/testing/index.js",
+      "default": "./dist/kernel/testing/index.js"
     }
   },
   "files": [

@@ -13,12 +13,13 @@ A **type-safe, distributed workflow engine** for AI-orchestrated processes. Feat
   - [1. Database Setup](#1-database-setup)
   - [2. Define Your First Stage](#2-define-your-first-stage)
   - [3. Build a Workflow](#3-build-a-workflow)
-  - [4. Create the Runtime](#4-create-the-runtime)
-  - [5. Run a Workflow](#5-run-a-workflow)
+  - [4. Create the Kernel](#4-create-the-kernel)
+  - [5. Choose a Host](#5-choose-a-host)
 - [Core Concepts](#core-concepts)
   - [Stages](#stages)
   - [Workflows](#workflows)
-  - [Runtime](#runtime)
+  - [Kernel](#kernel)
+  - [Hosts](#hosts)
   - [Persistence](#persistence)
 - [Common Patterns](#common-patterns)
   - [Accessing Previous Stage Output](#accessing-previous-stage-output)
@@ -39,23 +40,21 @@ A **type-safe, distributed workflow engine** for AI-orchestrated processes. Feat
 | **Type-Safe** | Full TypeScript inference from input to output across all stages |
 | **Async-First** | Native support for long-running operations (batch jobs that take hours/days) |
 | **AI-Native** | Built-in tracking of prompts, responses, tokens, and costs |
-| **Event-Driven** | Real-time progress updates via Server-Sent Events |
+| **Event-Driven** | Transactional outbox pattern for reliable event delivery |
 | **Parallel Execution** | Run independent stages concurrently |
 | **Resume Capability** | Automatic state persistence and recovery from failures |
 | **Distributed** | Job queue with priority support and stale lock recovery |
+| **Environment-Agnostic** | Pure command kernel runs on Node.js, serverless, edge, or any runtime |
 
 ---
 
 ## Requirements
 
-- **Node.js** >= 18.0.0
 - **TypeScript** >= 5.0.0
+- **Zod** >= 4.0.0
 - **PostgreSQL** >= 14 (for Prisma persistence)
-- **Zod** >= 3.22.0
 
 ### Optional Peer Dependencies
-
-Install based on which AI providers you use:
 
 ```bash
 # For Google AI
@@ -76,18 +75,19 @@ npm install @prisma/client
 ## Installation
 
 ```bash
+# Core library
 npm install @bratsos/workflow-engine zod
-# or
-pnpm add @bratsos/workflow-engine zod
-# or
-yarn add @bratsos/workflow-engine zod
+
+# Node.js host (long-running worker processes)
+npm install @bratsos/workflow-engine-host-node
+
+# Serverless host (Cloudflare Workers, AWS Lambda, Vercel Edge, etc.)
+npm install @bratsos/workflow-engine-host-serverless
 ```
 
 ---
 
 ## Getting Started
-
-This guide walks you through creating your first workflow from scratch.
 
 ### 1. Database Setup
 
@@ -96,7 +96,6 @@ The engine requires persistence tables. Add these to your Prisma schema:
 ```prisma
 // schema.prisma
 
-// Unified status enum for workflows, stages, and jobs
 enum Status {
   PENDING
   RUNNING
@@ -111,20 +110,20 @@ model WorkflowRun {
   id            String   @id @default(cuid())
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
-  workflowId    String   // e.g., "document-processor"
-  workflowName  String   // e.g., "Document Processor"
-  workflowType  String   // For grouping/filtering
+  workflowId    String
+  workflowName  String
+  workflowType  String
   status        Status   @default(PENDING)
   startedAt     DateTime?
   completedAt   DateTime?
-  duration      Int?           // milliseconds
+  duration      Int?
   input         Json
   output        Json?
   config        Json           @default("{}")
   totalCost     Float          @default(0)
   totalTokens   Int            @default(0)
   priority      Int            @default(5)
-  metadata      Json?          // Optional domain-specific data
+  metadata      Json?
 
   stages        WorkflowStage[]
   logs          WorkflowLog[]
@@ -140,23 +139,23 @@ model WorkflowStage {
   updatedAt       DateTime            @updatedAt
   workflowRunId   String
   workflowRun     WorkflowRun         @relation(fields: [workflowRunId], references: [id], onDelete: Cascade)
-  stageId         String              // e.g., "extract-text"
-  stageName       String              // e.g., "Extract Text"
-  stageNumber     Int                 // 1-based execution order
-  executionGroup  Int                 // For parallel grouping
+  stageId         String
+  stageName       String
+  stageNumber     Int
+  executionGroup  Int
   status          Status              @default(PENDING)
   startedAt       DateTime?
   completedAt     DateTime?
-  duration        Int?                // milliseconds
+  duration        Int?
   inputData       Json?
-  outputData      Json?               // May contain { _artifactKey: "..." }
+  outputData      Json?
   config          Json?
-  suspendedState  Json?               // State for async batch stages
+  suspendedState  Json?
   resumeData      Json?
-  nextPollAt      DateTime?           // When to check again
-  pollInterval    Int?                // milliseconds
+  nextPollAt      DateTime?
+  pollInterval    Int?
   maxWaitUntil    DateTime?
-  metrics         Json?               // { cost, tokens, custom... }
+  metrics         Json?
   embeddingInfo   Json?
   errorMessage    String?
 
@@ -174,7 +173,7 @@ model WorkflowLog {
   workflowRun     WorkflowRun?    @relation(fields: [workflowRunId], references: [id], onDelete: Cascade)
   workflowStageId String?
   workflowStage   WorkflowStage?  @relation(fields: [workflowStageId], references: [id], onDelete: Cascade)
-  level           String          // DEBUG, INFO, WARN, ERROR
+  level           String
   message         String
   metadata        Json?
 
@@ -187,10 +186,10 @@ model WorkflowArtifact {
   createdAt     DateTime @default(now())
   workflowRunId String
   workflowRun   WorkflowRun @relation(fields: [workflowRunId], references: [id], onDelete: Cascade)
-  key           String   // Unique key within the run
-  type          String   // STAGE_OUTPUT, ARTIFACT, METADATA
+  key           String
+  type          String
   data          Json
-  size          Int      // bytes
+  size          Int
 
   @@unique([workflowRunId, key])
   @@index([workflowRunId])
@@ -199,10 +198,10 @@ model WorkflowArtifact {
 model AICall {
   id            String   @id @default(cuid())
   createdAt     DateTime @default(now())
-  topic         String   // Hierarchical: "workflow.{runId}.stage.{stageId}"
-  callType      String   // text, object, embed, stream
-  modelKey      String   // e.g., "gemini-2.5-flash"
-  modelId       String   // e.g., "google/gemini-2.5-flash-preview"
+  topic         String
+  callType      String
+  modelKey      String
+  modelId       String
   prompt        String   @db.Text
   response      String   @db.Text
   inputTokens   Int
@@ -231,6 +230,35 @@ model JobQueue {
   @@index([status, priority])
   @@index([nextPollAt])
 }
+
+model OutboxEvent {
+  id              String    @id @default(cuid())
+  createdAt       DateTime  @default(now())
+  workflowRunId   String
+  sequence        Int
+  eventType       String
+  payload         Json
+  causationId     String
+  occurredAt      DateTime
+  publishedAt     DateTime?
+  retryCount      Int       @default(0)
+  dlqAt           DateTime?
+
+  @@unique([workflowRunId, sequence])
+  @@index([publishedAt])
+  @@map("outbox_events")
+}
+
+model IdempotencyKey {
+  id          String   @id @default(cuid())
+  createdAt   DateTime @default(now())
+  key         String
+  commandType String
+  result      Json
+
+  @@unique([key, commandType])
+  @@map("idempotency_keys")
+}
 ```
 
 Run the migration:
@@ -242,215 +270,121 @@ npx prisma generate
 
 ### 2. Define Your First Stage
 
-Create a file `stages/extract-text.ts`:
-
 ```typescript
 import { defineStage } from "@bratsos/workflow-engine";
 import { z } from "zod";
 
-// Define schemas for type safety
-const InputSchema = z.object({
-  url: z.string().url().describe("URL of the document to process"),
-});
-
-const OutputSchema = z.object({
-  text: z.string().describe("Extracted text content"),
-  wordCount: z.number().describe("Number of words extracted"),
-  metadata: z.object({
-    title: z.string().optional(),
-    author: z.string().optional(),
-  }),
-});
-
-const ConfigSchema = z.object({
-  maxLength: z.number().default(50000).describe("Maximum text length to extract"),
-  includeMetadata: z.boolean().default(true),
-});
-
 export const extractTextStage = defineStage({
   id: "extract-text",
   name: "Extract Text",
-  description: "Extracts text content from a document URL",
-
   schemas: {
-    input: InputSchema,
-    output: OutputSchema,
-    config: ConfigSchema,
+    input: z.object({ url: z.string().url() }),
+    output: z.object({ text: z.string(), wordCount: z.number() }),
+    config: z.object({ maxLength: z.number().default(50000) }),
   },
-
   async execute(ctx) {
-    const { url } = ctx.input;
-    const { maxLength, includeMetadata } = ctx.config;
-
-    // Log progress
-    ctx.log("INFO", "Starting text extraction", { url });
-
-    // Simulate fetching document (replace with real implementation)
-    const response = await fetch(url);
-    const text = await response.text();
-    const truncatedText = text.slice(0, maxLength);
-
-    ctx.log("INFO", "Extraction complete", { 
-      originalLength: text.length,
-      truncatedLength: truncatedText.length,
-    });
-
+    const response = await fetch(ctx.input.url);
+    const text = (await response.text()).slice(0, ctx.config.maxLength);
+    ctx.log("INFO", "Extraction complete", { length: text.length });
     return {
-      output: {
-        text: truncatedText,
-        wordCount: truncatedText.split(/\s+/).length,
-        metadata: includeMetadata ? { title: "Document Title" } : {},
-      },
-      // Optional: custom metrics for observability
-      customMetrics: {
-        bytesProcessed: text.length,
-      },
+      output: { text, wordCount: text.split(/\s+/).length },
     };
   },
 });
-
-// Export types for use in other stages
-export type ExtractTextOutput = z.infer<typeof OutputSchema>;
 ```
 
 ### 3. Build a Workflow
 
-Create a file `workflows/document-processor.ts`:
-
 ```typescript
 import { WorkflowBuilder } from "@bratsos/workflow-engine";
 import { z } from "zod";
-import { extractTextStage } from "../stages/extract-text";
-import { summarizeStage } from "../stages/summarize";
-import { analyzeStage } from "../stages/analyze";
-
-const InputSchema = z.object({
-  url: z.string().url(),
-  options: z.object({
-    generateSummary: z.boolean().default(true),
-    analyzeContent: z.boolean().default(true),
-  }).optional(),
-});
+import { extractTextStage } from "./stages/extract-text";
+import { summarizeStage } from "./stages/summarize";
 
 export const documentProcessorWorkflow = new WorkflowBuilder(
-  "document-processor",       // Unique ID
-  "Document Processor",       // Display name
-  "Extracts, summarizes, and analyzes documents",
-  InputSchema,
-  InputSchema                 // Initial output type (will be inferred)
+  "document-processor",
+  "Document Processor",
+  "Extracts and summarizes documents",
+  z.object({ url: z.string().url() }),
+  z.object({ url: z.string().url() }),
 )
-  .pipe(extractTextStage)     // Stage 1: Extract
-  .pipe(summarizeStage)       // Stage 2: Summarize
-  .pipe(analyzeStage)         // Stage 3: Analyze
+  .pipe(extractTextStage)
+  .pipe(summarizeStage)
   .build();
-
-// Export input type for API consumers
-export type DocumentProcessorInput = z.infer<typeof InputSchema>;
 ```
 
-### 4. Create the Runtime
+### 4. Create the Kernel
 
-Create a file `runtime.ts`:
+The kernel is the core command dispatcher. It's environment-agnostic -- no timers, no signals, no global state.
 
 ```typescript
+import { createKernel } from "@bratsos/workflow-engine/kernel";
 import {
-  createWorkflowRuntime,
   createPrismaWorkflowPersistence,
   createPrismaJobQueue,
-  createPrismaAICallLogger,
-  type WorkflowRegistry,
 } from "@bratsos/workflow-engine";
 import { PrismaClient } from "@prisma/client";
 import { documentProcessorWorkflow } from "./workflows/document-processor";
 
-// Initialize Prisma client
 const prisma = new PrismaClient();
 
-// Create persistence implementations
-const persistence = createPrismaWorkflowPersistence(prisma);
-const jobQueue = createPrismaJobQueue(prisma);
-const aiCallLogger = createPrismaAICallLogger(prisma);
-
-// Create a workflow registry
-const registry: WorkflowRegistry = {
-  getWorkflow(id: string) {
-    const workflows: Record<string, any> = {
-      "document-processor": documentProcessorWorkflow,
-      // Add more workflows here
-    };
-    return workflows[id];
+const kernel = createKernel({
+  persistence: createPrismaWorkflowPersistence(prisma),
+  blobStore: myBlobStore,         // BlobStore implementation
+  jobTransport: createPrismaJobQueue(prisma),
+  eventSink: myEventSink,         // EventSink implementation
+  scheduler: myScheduler,         // Scheduler implementation
+  clock: { now: () => new Date() },
+  registry: {
+    getWorkflow: (id) =>
+      id === "document-processor" ? documentProcessorWorkflow : undefined,
   },
-};
+});
+```
 
-// Optional: Define priority function for different workflow types
-function getWorkflowPriority(workflowId: string): number {
-  const priorities: Record<string, number> = {
-    "document-processor": 5,   // Normal priority
-    "urgent-task": 10,         // High priority
-    "background-job": 2,       // Low priority
-  };
-  return priorities[workflowId] ?? 5;
-}
+### 5. Choose a Host
 
-// Create the runtime
-export const runtime = createWorkflowRuntime({
-  persistence,
-  jobQueue,
-  registry,
-  aiCallLogger,
-  pollIntervalMs: 10000,      // Check for suspended stages every 10s
-  jobPollIntervalMs: 1000,    // Poll job queue every 1s
-  getWorkflowPriority,        // Optional priority function
+#### Option A: Node.js Worker (Recommended for Production)
+
+```typescript
+import { createNodeHost } from "@bratsos/workflow-engine-host-node";
+
+const host = createNodeHost({
+  kernel,
+  jobTransport: createPrismaJobQueue(prisma),
+  workerId: "worker-1",
+  orchestrationIntervalMs: 10_000,
+  jobPollIntervalMs: 1_000,
 });
 
-// Convenience exports
-export { prisma, persistence, jobQueue };
+// Start polling loops + signal handlers
+await host.start();
+
+// Queue a workflow
+await kernel.dispatch({
+  type: "run.create",
+  idempotencyKey: crypto.randomUUID(),
+  workflowId: "document-processor",
+  input: { url: "https://example.com/doc.pdf" },
+});
 ```
 
-### 5. Run a Workflow
-
-#### Option A: Worker Process (Recommended for Production)
-
-Create a file `worker.ts`:
+#### Option B: Serverless (Cloudflare Workers, Lambda, etc.)
 
 ```typescript
-import { runtime } from "./runtime";
+import { createServerlessHost } from "@bratsos/workflow-engine-host-serverless";
 
-// Register shutdown handlers
-process.on("SIGTERM", () => runtime.stop());
-process.on("SIGINT", () => runtime.stop());
+const host = createServerlessHost({
+  kernel,
+  jobTransport,
+  workerId: "my-worker",
+});
 
-// Start the worker
-console.log("Starting workflow worker...");
-runtime.start();
-```
+// Handle a single job from a queue message
+const result = await host.handleJob(msg);
 
-Run the worker:
-
-```bash
-npx tsx worker.ts
-```
-
-#### Option B: Queue from API Endpoint
-
-```typescript
-import { runtime } from "./runtime";
-
-// In your API route handler
-export async function POST(request: Request) {
-  const { url } = await request.json();
-
-  const { workflowRunId } = await runtime.createRun({
-    workflowId: "document-processor",
-    input: { url },
-    config: {
-      "extract-text": { maxLength: 100000 },
-      "summarize": { modelKey: "gemini-2.5-flash" },
-    },
-  });
-
-  return Response.json({ workflowRunId });
-}
+// Run maintenance from a cron trigger
+const tick = await host.runMaintenanceTick();
 ```
 
 ---
@@ -459,16 +393,7 @@ export async function POST(request: Request) {
 
 ### Stages
 
-A stage is the atomic unit of work. Every stage has:
-
-| Property | Description |
-|----------|-------------|
-| `id` | Unique identifier within the workflow |
-| `name` | Human-readable name |
-| `inputSchema` | Zod schema for input validation |
-| `outputSchema` | Zod schema for output validation |
-| `configSchema` | Zod schema for stage configuration |
-| `execute(ctx)` | The function that performs the work |
+A stage is the atomic unit of work. Every stage has typed input, output, and config schemas.
 
 **Stage Modes:**
 
@@ -490,62 +415,67 @@ new WorkflowBuilder(id, name, description, inputSchema, outputSchema)
   .build();
 ```
 
-### Runtime
+### Kernel
 
-The `WorkflowRuntime` manages workflow execution:
+The `Kernel` is a pure command dispatcher. All operations are expressed as typed commands:
 
 ```typescript
-const runtime = createWorkflowRuntime({
-  persistence,    // Database operations
-  jobQueue,       // Distributed job queue
-  registry,       // Workflow definitions
-  aiCallLogger,   // AI call tracking (optional)
+// Create a run
+const { workflowRunId } = await kernel.dispatch({
+  type: "run.create",
+  idempotencyKey: "unique-key",
+  workflowId: "my-workflow",
+  input: { data: "hello" },
 });
 
-// Start as a worker process
-await runtime.start();
+// Cancel a run
+await kernel.dispatch({
+  type: "run.cancel",
+  workflowRunId,
+  reason: "User requested",
+});
 
-// Queue a new workflow run
-await runtime.createRun({ workflowId, input, config });
-
-// Create AI helper for a stage
-const ai = runtime.createAIHelper("workflow.run-123.stage.extract");
+// Rerun from a specific stage
+await kernel.dispatch({
+  type: "run.rerunFrom",
+  workflowRunId,
+  fromStageId: "extract-text",
+});
 ```
+
+The kernel depends on 7 port interfaces (injected at creation):
+
+| Port | Purpose |
+|------|---------|
+| `Persistence` | Runs, stages, logs, outbox, idempotency CRUD |
+| `BlobStore` | Large payload storage (put/get/has/delete/list) |
+| `JobTransport` | Job queue (enqueue/dequeue/complete/suspend/fail) |
+| `EventSink` | Async event publishing |
+| `Scheduler` | Deferred command triggers |
+| `Clock` | Injectable time source |
+| `WorkflowRegistry` | Workflow definition lookup |
+
+### Hosts
+
+Hosts wrap the kernel with environment-specific process management:
+
+**Node Host** (`@bratsos/workflow-engine-host-node`): Long-running worker process with polling loops, signal handling (SIGTERM/SIGINT), and continuous job dequeuing.
+
+**Serverless Host** (`@bratsos/workflow-engine-host-serverless`): Stateless single-invocation methods for queue-driven environments. Consumers wire platform-specific glue (ack/retry/waitUntil) around the host methods.
 
 ### Persistence
 
-The engine uses three persistence interfaces:
-
 | Interface | Purpose |
 |-----------|---------|
-| `WorkflowPersistence` | Workflow runs, stages, logs, artifacts |
-| `JobQueue` | Distributed job queue with priority and retries |
+| `Persistence` | Workflow runs, stages, logs, outbox, idempotency |
+| `JobTransport` | Distributed job queue with priority and retries |
+| `BlobStore` | Large payload storage |
 | `AICallLogger` | AI call tracking with cost aggregation |
 
 **Built-in implementations:**
 - `createPrismaWorkflowPersistence(prisma)` - PostgreSQL via Prisma
 - `createPrismaJobQueue(prisma)` - PostgreSQL with `FOR UPDATE SKIP LOCKED`
 - `createPrismaAICallLogger(prisma)` - PostgreSQL
-
-**Prisma version compatibility:**
-
-The persistence layer supports both Prisma 6.x and 7.x. Enum values are automatically resolved based on your Prisma version:
-
-```typescript
-import { createPrismaWorkflowPersistence } from "@bratsos/workflow-engine/persistence/prisma";
-
-// Works with both Prisma 6.x (string enums) and Prisma 7.x (typed enums)
-const persistence = createPrismaWorkflowPersistence(prisma);
-```
-
-For advanced use cases, you can use the enum helper directly:
-
-```typescript
-import { createEnumHelper } from "@bratsos/workflow-engine/persistence/prisma";
-
-const enums = createEnumHelper(prisma);
-const status = enums.status("PENDING");  // Returns typed enum for Prisma 7.x, string for 6.x
-```
 
 ---
 
@@ -559,308 +489,187 @@ Use `ctx.require()` for type-safe access to any previous stage's output:
 export const analyzeStage = defineStage({
   id: "analyze",
   name: "Analyze Content",
-
   schemas: {
-    input: "none",  // This stage reads from workflowContext
+    input: "none",
     output: AnalysisOutputSchema,
     config: ConfigSchema,
   },
-
   async execute(ctx) {
-    // Type-safe access to previous stage output
     const extracted = ctx.require("extract-text");  // Throws if missing
     const summary = ctx.optional("summarize");       // Returns undefined if missing
-
-    // Use the data
-    console.log(`Analyzing ${extracted.wordCount} words`);
-
-    return {
-      output: { /* ... */ },
-    };
+    return { output: { /* ... */ } };
   },
 });
 ```
 
-> **Important:** Use `input: "none"` for stages that read from `workflowContext` instead of receiving direct input from the previous stage.
-
 ### Parallel Execution
-
-Run independent stages concurrently:
 
 ```typescript
 const workflow = new WorkflowBuilder(/* ... */)
   .pipe(extractStage)
   .parallel([
-    sentimentAnalysisStage,  // These three run
-    keywordExtractionStage,  // at the same time
-    languageDetectionStage,  
+    sentimentAnalysisStage,
+    keywordExtractionStage,
+    languageDetectionStage,
   ])
-  .pipe(aggregateResultsStage)  // Runs after all parallel stages complete
+  .pipe(aggregateResultsStage)
   .build();
-```
-
-In subsequent stages, access parallel outputs by stage ID:
-
-```typescript
-async execute(ctx) {
-  const sentiment = ctx.require("sentiment-analysis");
-  const keywords = ctx.require("keyword-extraction");
-  const language = ctx.require("language-detection");
-  // ...
-}
 ```
 
 ### AI Integration
 
-Use the `AIHelper` for tracked AI calls:
-
 ```typescript
-import { createAIHelper, type AIHelper } from "@bratsos/workflow-engine";
+import { createAIHelper } from "@bratsos/workflow-engine";
 
 async execute(ctx) {
-  // Create AI helper with topic for cost tracking
-  const ai = runtime.createAIHelper(`workflow.${ctx.workflowRunId}.${ctx.stageId}`);
-
-  // Generate text
-  const { text, cost, inputTokens, outputTokens } = await ai.generateText(
-    "gemini-2.5-flash",
-    "Summarize this document: " + ctx.input.text
+  const ai = createAIHelper(
+    `workflow.${ctx.workflowRunId}.stage.${ctx.stageId}`,
+    aiCallLogger,
   );
 
-  // Generate structured object
+  const { text, cost } = await ai.generateText("gemini-2.5-flash", "Summarize: " + ctx.input.text);
+
   const { object: analysis } = await ai.generateObject(
     "gemini-2.5-flash",
-    "Analyze this text: " + ctx.input.text,
-    z.object({
-      sentiment: z.enum(["positive", "negative", "neutral"]),
-      topics: z.array(z.string()),
-    })
+    "Analyze: " + ctx.input.text,
+    z.object({ sentiment: z.enum(["positive", "negative", "neutral"]) })
   );
 
-  // Generate embeddings
-  const { embedding, dimensions } = await ai.embed(
-    "gemini-embedding-001",
-    ctx.input.text,
-    { dimensions: 768 }
-  );
-
-  // All calls are automatically logged with cost tracking
-  return { output: { text, analysis, embedding } };
+  return { output: { text, analysis } };
 }
 ```
 
 ### Long-Running Batch Jobs
 
-For operations that may take hours (OpenAI Batch API, Google Vertex Batch, etc.):
-
 ```typescript
 import { defineAsyncBatchStage } from "@bratsos/workflow-engine";
 
-export const batchProcessingStage = defineAsyncBatchStage({
+export const batchStage = defineAsyncBatchStage({
   id: "batch-process",
   name: "Batch Processing",
-  mode: "async-batch",  // Required for async stages
-
+  mode: "async-batch",
   schemas: { input: InputSchema, output: OutputSchema, config: ConfigSchema },
 
   async execute(ctx) {
-    // If we're resuming from suspension, the batch is complete
     if (ctx.resumeState) {
-      const results = await fetchBatchResults(ctx.resumeState.batchId);
-      return { output: results };
+      return { output: await fetchBatchResults(ctx.resumeState.batchId) };
     }
 
-    // First execution: submit the batch job
-    const batch = await submitBatchToOpenAI(ctx.input.prompts);
-
-    // Return suspended state - workflow will pause here
+    const batch = await submitBatch(ctx.input.prompts);
     return {
       suspended: true,
-      state: {
-        batchId: batch.id,
-        submittedAt: new Date().toISOString(),
-        pollInterval: 3600000,   // 1 hour
-        maxWaitTime: 86400000,   // 24 hours
-      },
-      pollConfig: {
-        pollInterval: 3600000,
-        maxWaitTime: 86400000,
-        nextPollAt: new Date(Date.now() + 3600000),
-      },
+      state: { batchId: batch.id },
+      pollConfig: { pollInterval: 3600000, maxWaitTime: 86400000, nextPollAt: new Date(Date.now() + 3600000) },
     };
   },
 
-  // Called by the orchestrator to check if batch is ready
-  async checkCompletion(state, ctx) {
+  async checkCompletion(state) {
     const status = await checkBatchStatus(state.batchId);
-
     if (status === "completed") {
-      return { ready: true };  // Workflow will resume
+      const output = await fetchBatchResults(state.batchId);
+      return { ready: true, output };
     }
-
-    if (status === "failed") {
-      return { ready: true, error: "Batch processing failed" };
-    }
-
-    // Not ready yet - check again later
-    return {
-      ready: false,
-      nextCheckIn: 60000,  // Override poll interval for this check
-    };
+    if (status === "failed") return { ready: false, error: "Batch failed" };
+    return { ready: false };
   },
 });
 ```
 
 ### Config Presets
 
-Use built-in config presets for common patterns:
-
 ```typescript
-import { 
-  withAIConfig, 
-  withStandardConfig, 
-  withFullConfig 
-} from "@bratsos/workflow-engine";
+import { withAIConfig, withStandardConfig } from "@bratsos/workflow-engine";
 import { z } from "zod";
 
-// AI-focused config (model, temperature, maxTokens)
-const MyConfigSchema = withAIConfig(z.object({
-  customField: z.string(),
-}));
-
-// Standard config (AI + concurrency + featureFlags)
-const StandardConfigSchema = withStandardConfig(z.object({
-  specificOption: z.boolean().default(true),
-}));
-
-// Full config (Standard + debug options)
-const DebugConfigSchema = withFullConfig(z.object({
-  processType: z.string(),
-}));
+const MyConfigSchema = withAIConfig(z.object({ customField: z.string() }));
 ```
 
 ---
 
 ## Best Practices
 
-### 1. Schema Design
+### Schema Design
 
 ```typescript
-// ✅ Good: Strict schemas with descriptions and defaults
+// Good: Strict schemas with descriptions and defaults
 const ConfigSchema = z.object({
-  modelKey: z.string()
-    .default("gemini-2.5-flash")
-    .describe("AI model to use for processing"),
-  maxRetries: z.number()
-    .min(0)
-    .max(10)
-    .default(3)
-    .describe("Maximum retry attempts on failure"),
-});
-
-// ❌ Bad: Loose typing
-const ConfigSchema = z.object({
-  model: z.any(),
-  retries: z.number(),
+  modelKey: z.string().default("gemini-2.5-flash").describe("AI model to use"),
+  maxRetries: z.number().min(0).max(10).default(3),
 });
 ```
 
-### 2. Stage Dependencies
-
-```typescript
-// ✅ Good: Declare dependencies explicitly
-export const analyzeStage = defineStage({
-  id: "analyze",
-  dependencies: ["extract-text", "summarize"],  // Build-time validation
-  schemas: { input: "none", /* ... */ },
-  // ...
-});
-
-// ❌ Bad: Hidden dependencies
-export const analyzeStage = defineStage({
-  id: "analyze",
-  schemas: { input: SomeSchema, /* ... */ },  // Where does input come from?
-  // ...
-});
-```
-
-### 3. Logging
+### Logging
 
 ```typescript
 async execute(ctx) {
-  // ✅ Good: Structured logging with context
-  ctx.log("INFO", "Starting processing", { 
-    itemCount: items.length,
-    config: ctx.config,
-  });
+  ctx.log("INFO", "Starting processing", { itemCount: items.length });
 
-  // ✅ Good: Progress updates for long operations
   for (const [index, item] of items.entries()) {
     ctx.onProgress({
       progress: (index + 1) / items.length,
       message: `Processing item ${index + 1}/${items.length}`,
     });
   }
-
-  // ❌ Bad: Console.log (not persisted)
-  console.log("Processing...");
 }
 ```
 
-### 4. Error Handling
+### Error Handling
 
 ```typescript
 async execute(ctx) {
   try {
-    // Validate early
-    if (!ctx.input.url.startsWith("https://")) {
-      throw new Error("Only HTTPS URLs are supported");
-    }
-
     const result = await processDocument(ctx.input);
     return { output: result };
-
   } catch (error) {
-    // Log errors with context
     ctx.log("ERROR", "Processing failed", {
       error: error instanceof Error ? error.message : String(error),
-      input: ctx.input,
     });
-
-    // Re-throw to mark stage as failed
     throw error;
   }
-}
-```
-
-### 5. Performance
-
-```typescript
-// ✅ Good: Use parallel stages for independent work
-.parallel([
-  fetchDataFromSourceA,
-  fetchDataFromSourceB,
-  fetchDataFromSourceC,
-])
-
-// ✅ Good: Use batch processing for many AI calls
-const results = await ai.batch("gpt-4o").submit(
-  items.map((item, i) => ({
-    id: `item-${i}`,
-    prompt: `Process: ${item}`,
-    schema: OutputSchema,
-  }))
-);
-
-// ❌ Bad: Sequential AI calls when parallel would work
-for (const item of items) {
-  await ai.generateText("gpt-4o", `Process: ${item}`);
 }
 ```
 
 ---
 
 ## API Reference
+
+### Kernel Commands
+
+| Command | Description | Key Fields |
+|---------|-------------|------------|
+| `run.create` | Create a new workflow run | `idempotencyKey`, `workflowId`, `input`, `config?`, `priority?` |
+| `run.claimPending` | Claim pending runs for processing | `workerId`, `maxClaims?` |
+| `run.transition` | Advance to next stage group | `workflowRunId` |
+| `run.cancel` | Cancel a running workflow | `workflowRunId`, `reason?` |
+| `run.rerunFrom` | Rerun from a specific stage | `workflowRunId`, `fromStageId` |
+| `job.execute` | Execute a single stage | `idempotencyKey?`, `workflowRunId`, `workflowId`, `stageId`, `config` |
+| `stage.pollSuspended` | Poll suspended stages | `maxChecks?` (returns `resumedWorkflowRunIds`) |
+| `lease.reapStale` | Release stale job leases | `staleThresholdMs` |
+| `outbox.flush` | Publish pending events | `maxEvents?` |
+| `plugin.replayDLQ` | Replay dead-letter queue events | `maxEvents?` |
+
+Idempotency behavior:
+- Replaying the same `idempotencyKey` returns cached results.
+- If the same key is already executing, dispatch throws `IdempotencyInProgressError`.
+
+### Node Host Config
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `kernel` | `Kernel` | required | Kernel instance |
+| `jobTransport` | `JobTransport` | required | Job queue |
+| `workerId` | `string` | required | Unique worker ID |
+| `orchestrationIntervalMs` | `number` | 10000 | Orchestration poll interval |
+| `jobPollIntervalMs` | `number` | 1000 | Job dequeue interval |
+| `staleLeaseThresholdMs` | `number` | 60000 | Stale lease timeout |
+
+### Serverless Host
+
+| Method | Description |
+|--------|-------------|
+| `handleJob(msg)` | Execute a single pre-dequeued job. Returns `{ outcome, error? }` |
+| `processAvailableJobs(opts?)` | Dequeue and process jobs. Returns `{ processed, succeeded, failed }` |
+| `runMaintenanceTick()` | Claim, poll, reap, flush in one call. Returns structured result |
 
 ### Core Exports
 
@@ -871,63 +680,28 @@ import { defineStage, defineAsyncBatchStage } from "@bratsos/workflow-engine";
 // Workflow building
 import { WorkflowBuilder, Workflow } from "@bratsos/workflow-engine";
 
-// Runtime
-import { createWorkflowRuntime, WorkflowRuntime } from "@bratsos/workflow-engine";
+// Kernel
+import { createKernel, type Kernel, type KernelConfig } from "@bratsos/workflow-engine/kernel";
+
+// Kernel types
+import type { KernelCommand, CommandResult, KernelEvent } from "@bratsos/workflow-engine/kernel";
+
+// Port interfaces
+import type { Persistence, BlobStore, JobTransport, EventSink, Scheduler, Clock } from "@bratsos/workflow-engine/kernel";
+
+// Plugins
+import { definePlugin, createPluginRunner } from "@bratsos/workflow-engine/kernel";
 
 // Persistence (Prisma)
-import {
-  createPrismaWorkflowPersistence,
-  createPrismaJobQueue,
-  createPrismaAICallLogger,
-} from "@bratsos/workflow-engine";
+import { createPrismaWorkflowPersistence, createPrismaJobQueue, createPrismaAICallLogger } from "@bratsos/workflow-engine";
 
 // AI Helper
 import { createAIHelper, type AIHelper } from "@bratsos/workflow-engine";
 
-// Types
-import type {
-  WorkflowPersistence,
-  JobQueue,
-  AICallLogger,
-  WorkflowRunRecord,
-  WorkflowStageRecord,
-} from "@bratsos/workflow-engine";
+// Testing
+import { InMemoryWorkflowPersistence, InMemoryJobQueue } from "@bratsos/workflow-engine/testing";
+import { FakeClock, InMemoryBlobStore, CollectingEventSink, NoopScheduler } from "@bratsos/workflow-engine/kernel/testing";
 ```
-
-### `createWorkflowRuntime(config)`
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `persistence` | `WorkflowPersistence` | required | Database operations |
-| `jobQueue` | `JobQueue` | required | Job queue implementation |
-| `registry` | `WorkflowRegistry` | required | Workflow definitions |
-| `aiCallLogger` | `AICallLogger` | optional | AI call tracking |
-| `pollIntervalMs` | `number` | 10000 | Interval for checking suspended stages |
-| `jobPollIntervalMs` | `number` | 1000 | Interval for polling job queue |
-| `workerId` | `string` | auto | Unique worker identifier |
-| `staleJobThresholdMs` | `number` | 60000 | Time before a job is considered stale |
-| `getWorkflowPriority` | `(id: string) => number` | optional | Priority function (1-10, higher = more important) |
-
-### `WorkflowRuntime`
-
-| Method | Description |
-|--------|-------------|
-| `start()` | Start polling for jobs (runs forever until stopped) |
-| `stop()` | Stop the worker gracefully |
-| `createRun(options)` | Queue a new workflow run |
-| `createAIHelper(topic)` | Create an AI helper bound to the logger |
-| `transitionWorkflow(runId)` | Manually transition a workflow to next stage |
-| `pollSuspendedStages()` | Manually poll suspended stages |
-
-### `CreateRunOptions`
-
-| Option | Type | Required | Description |
-|--------|------|----------|-------------|
-| `workflowId` | `string` | yes | ID of the workflow to run |
-| `input` | `object` | yes | Input data matching workflow's input schema |
-| `config` | `object` | no | Stage configurations keyed by stage ID |
-| `priority` | `number` | no | Priority (1-10, overrides `getWorkflowPriority`) |
-| `metadata` | `object` | no | Domain-specific metadata |
 
 ---
 
@@ -935,17 +709,18 @@ import type {
 
 ### "Workflow not found in registry"
 
-Ensure the workflow is registered before creating runs:
+Ensure the workflow is registered in the `registry` passed to `createKernel`:
 
 ```typescript
-const registry = {
-  getWorkflow(id) {
-    const workflows = {
-      "my-workflow": myWorkflow,  // Add your workflow here
-    };
-    return workflows[id];
+const kernel = createKernel({
+  // ...
+  registry: {
+    getWorkflow(id) {
+      const workflows = { "my-workflow": myWorkflow };
+      return workflows[id];
+    },
   },
-};
+});
 ```
 
 ### "Stage X depends on Y which was not found"
@@ -953,31 +728,13 @@ const registry = {
 Verify all dependencies are included in the workflow:
 
 ```typescript
-// If stage "analyze" depends on "extract":
 .pipe(extractStage)   // Must be piped before
 .pipe(analyzeStage)   // analyze can now access extract's output
 ```
 
-### Jobs stuck in "PROCESSING"
+### Jobs stuck in "RUNNING"
 
-This usually means a worker crashed. The stale lock recovery will automatically release jobs after `staleJobThresholdMs` (default 60s).
-
-To manually release stale jobs:
-
-```typescript
-await jobQueue.releaseStaleJobs(60000);  // Release jobs locked > 60s
-```
-
-### AI calls not being tracked
-
-Ensure you pass `aiCallLogger` to the runtime:
-
-```typescript
-const runtime = createWorkflowRuntime({
-  // ...
-  aiCallLogger: createPrismaAICallLogger(prisma),  // Required for tracking
-});
-```
+A worker likely crashed. The stale lease recovery (`lease.reapStale` command) automatically releases jobs. In Node host, this runs on each orchestration tick. For serverless, call `runMaintenanceTick()` from a cron trigger.
 
 ---
 

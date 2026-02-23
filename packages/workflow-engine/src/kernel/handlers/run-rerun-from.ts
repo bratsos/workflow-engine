@@ -79,7 +79,7 @@ export async function handleRunRerunFrom(
   // 11. Reset run to RUNNING
   await deps.persistence.updateRun(workflowRunId, {
     status: "RUNNING",
-    completedAt: undefined as any,
+    completedAt: null,
   });
 
   // 12. Create new stage records for the target execution group

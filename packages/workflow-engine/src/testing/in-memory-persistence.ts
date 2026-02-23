@@ -43,6 +43,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
   private artifacts = new Map<string, WorkflowArtifactRecord>();
   private outbox: OutboxRecord[] = [];
   private idempotencyKeys = new Map<string, IdempotencyRecord>();
+  private idempotencyInProgress = new Set<string>();
   private outboxSequences = new Map<string, number>();
 
   // Helper to generate composite keys for stages
@@ -53,6 +54,16 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
   // Helper to generate composite keys for artifacts
   private artifactKey(runId: string, key: string): string {
     return `${runId}:${key}`;
+  }
+
+  private idempotencyCompositeKey(commandType: string, key: string): string {
+    return `${commandType}:${key}`;
+  }
+
+  async withTransaction<T>(
+    fn: (tx: WorkflowPersistence) => Promise<T>,
+  ): Promise<T> {
+    return fn(this);
   }
 
   // ============================================================================
@@ -479,30 +490,48 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
   // Idempotency Operations
   // ============================================================================
 
-  async checkIdempotencyKey(
+  async acquireIdempotencyKey(
     key: string,
     commandType: string,
-  ): Promise<{ exists: boolean; result?: unknown }> {
-    const compositeKey = `${commandType}:${key}`;
+  ): Promise<
+    | { status: "acquired" }
+    | { status: "replay"; result: unknown }
+    | { status: "in_progress" }
+  > {
+    const compositeKey = this.idempotencyCompositeKey(commandType, key);
     const record = this.idempotencyKeys.get(compositeKey);
     if (record) {
-      return { exists: true, result: record.result };
+      return { status: "replay", result: record.result };
     }
-    return { exists: false };
+    if (this.idempotencyInProgress.has(compositeKey)) {
+      return { status: "in_progress" };
+    }
+    this.idempotencyInProgress.add(compositeKey);
+    return { status: "acquired" };
   }
 
-  async setIdempotencyKey(
+  async completeIdempotencyKey(
     key: string,
     commandType: string,
     result: unknown,
   ): Promise<void> {
-    const compositeKey = `${commandType}:${key}`;
+    const compositeKey = this.idempotencyCompositeKey(commandType, key);
+    this.idempotencyInProgress.delete(compositeKey);
     this.idempotencyKeys.set(compositeKey, {
       key,
       commandType,
       result,
       createdAt: new Date(),
     });
+  }
+
+  async releaseIdempotencyKey(
+    key: string,
+    commandType: string,
+  ): Promise<void> {
+    this.idempotencyInProgress.delete(
+      this.idempotencyCompositeKey(commandType, key),
+    );
   }
 
   // ============================================================================
@@ -598,6 +627,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
     this.artifacts.clear();
     this.outbox = [];
     this.idempotencyKeys.clear();
+    this.idempotencyInProgress.clear();
     this.outboxSequences.clear();
   }
 

@@ -226,7 +226,7 @@ export interface CreateRunInput {
 export interface UpdateRunInput {
   status?: WorkflowStatus;
   startedAt?: Date;
-  completedAt?: Date;
+  completedAt?: Date | null;
   duration?: number;
   output?: unknown;
   totalCost?: number;
@@ -319,6 +319,7 @@ export interface DequeueResult {
   stageId: string;
   priority: number;
   attempt: number;
+  maxAttempts: number;
   payload: Record<string, unknown>;
 }
 
@@ -327,6 +328,9 @@ export interface DequeueResult {
 // ============================================================================
 
 export interface WorkflowPersistence {
+  /** Execute operations within a transaction boundary. */
+  withTransaction<T>(fn: (tx: WorkflowPersistence) => Promise<T>): Promise<T>;
+
   // WorkflowRun operations
   createRun(data: CreateRunInput): Promise<WorkflowRunRecord>;
   updateRun(id: string, data: UpdateRunInput): Promise<void>;
@@ -409,6 +413,37 @@ export interface WorkflowPersistence {
 
   /** Reset DLQ events so they can be reprocessed by outbox.flush. Returns count reset. */
   replayDLQEvents(maxEvents: number): Promise<number>;
+
+  // Outbox operations
+  /** Write events to the outbox. Sequences are auto-assigned per workflowRunId. */
+  appendOutboxEvents(events: CreateOutboxEventInput[]): Promise<void>;
+
+  /** Read unpublished events ordered by (workflowRunId, sequence). */
+  getUnpublishedOutboxEvents(limit?: number): Promise<OutboxRecord[]>;
+
+  /** Mark events as published. */
+  markOutboxEventsPublished(ids: string[]): Promise<void>;
+
+  // Idempotency operations
+  /** Atomically acquire an idempotency key for command execution. */
+  acquireIdempotencyKey(
+    key: string,
+    commandType: string,
+  ): Promise<
+    | { status: "acquired" }
+    | { status: "replay"; result: unknown }
+    | { status: "in_progress" }
+  >;
+
+  /** Mark an idempotency key as completed and cache the command result. */
+  completeIdempotencyKey(
+    key: string,
+    commandType: string,
+    result: unknown,
+  ): Promise<void>;
+
+  /** Release an in-progress idempotency key after command failure. */
+  releaseIdempotencyKey(key: string, commandType: string): Promise<void>;
 }
 
 // ============================================================================

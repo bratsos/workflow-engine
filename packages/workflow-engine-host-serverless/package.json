@@ -1,0 +1,32 @@
+{
+  "name": "@bratsos/workflow-engine-host-serverless",
+  "version": "0.1.0",
+  "description": "Platform-agnostic serverless host for @bratsos/workflow-engine command kernel",
+  "type": "module",
+  "license": "MIT",
+  "author": "Alex Bratsos",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@bratsos/workflow-engine": "workspace:*"
+  },
+  "devDependencies": {
+    "tsup": "^8.5.1",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4",
+    "zod": "^4.1.12"
+  }
+}

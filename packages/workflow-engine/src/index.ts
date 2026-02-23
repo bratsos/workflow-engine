@@ -76,9 +76,21 @@ export {
   registerModels,
 } from "./ai/model-helper";
 export {
-  createStorage,
-  getDefaultStorageProvider,
-} from "./core/storage-factory";
+  AIConfigSchema,
+  ConcurrencyConfigSchema,
+  DebugConfigSchema,
+  FeatureFlagsConfigSchema,
+  withAIConfig,
+  withConcurrency,
+  withFeatureFlags,
+  withStandardConfig,
+} from "./core/config-presets";
+export type {
+  AIConfig,
+  ConcurrencyConfig,
+  DebugConfig,
+  FeatureFlagsConfig,
+} from "./core/config-presets";
 export type {
   WorkflowEventType,
   WorkflowSSEEvent,
@@ -188,6 +200,8 @@ export type {
   StagePollSuspendedResult,
   LeaseReapStaleCommand,
   LeaseReapStaleResult,
+  OutboxFlushCommand,
+  OutboxFlushResult,
   PluginReplayDLQCommand,
   PluginReplayDLQResult,
   RunRerunFromCommand,
@@ -213,6 +227,7 @@ export {
   type PluginRunner,
 } from "./kernel/plugins";
 export { StaleVersionError } from "./persistence/interface";
+export { IdempotencyInProgressError } from "./kernel/errors";
 export type {
   OutboxRecord,
   CreateOutboxEventInput,

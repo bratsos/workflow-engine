@@ -16,9 +16,8 @@
  */
 
 export { InMemoryAICallLogger } from "./in-memory-ai-logger.js";
-export { InMemoryJobQueue } from "./in-memory-job-queue.js";
-// In-memory persistence implementations
-export { InMemoryWorkflowPersistence } from "./in-memory-persistence.js";
+export { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
+export { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 // Mock AI helper
 export {
   createMockAIHelper,

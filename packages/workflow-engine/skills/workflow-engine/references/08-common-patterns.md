@@ -1,503 +1,190 @@
 # Common Patterns
 
-Best practices, recipes, and troubleshooting for the workflow engine.
+Best practices, recipes, and patterns for the command kernel.
+
+## Idempotency
+
+The `run.create` and `job.execute` commands support idempotency keys. Replaying a command with the same key returns the cached result without re-executing:
+
+```typescript
+const cmd = {
+  type: "run.create" as const,
+  idempotencyKey: "order-123-workflow",
+  workflowId: "process-order",
+  input: { orderId: "123" },
+};
+
+// First call creates the run
+const first = await kernel.dispatch(cmd);
+
+// Second call returns cached result (no duplicate run)
+const second = await kernel.dispatch(cmd);
+// first.workflowRunId === second.workflowRunId
+```
+
+Use deterministic keys derived from domain data (e.g., `order-${orderId}`) to prevent duplicate processing.
+
+If the same key is currently executing, dispatch throws `IdempotencyInProgressError`. Retry with backoff instead of issuing parallel same-key commands.
+
+## Transactional Outbox
+
+Events are not emitted directly. Instead, handlers write events to a transactional outbox table. The `outbox.flush` command publishes pending events through the EventSink:
+
+```typescript
+// Events accumulate in the outbox as commands execute
+await kernel.dispatch({ type: "run.create", ... });
+await kernel.dispatch({ type: "job.execute", ... });
+
+// Flush publishes all pending events
+await kernel.dispatch({ type: "outbox.flush", maxEvents: 100 });
+```
+
+This ensures events are only published after the underlying database transaction succeeds, preventing lost or phantom events.
+
+The outbox includes retry logic with a dead-letter queue (DLQ). Events that fail to publish are retried up to 3 times before being moved to the DLQ. Use `plugin.replayDLQ` to reprocess them:
+
+```typescript
+await kernel.dispatch({ type: "plugin.replayDLQ", maxEvents: 50 });
+```
+
+## Stale Lease Recovery
+
+When a worker crashes, its job leases become stale. The `lease.reapStale` command releases them:
+
+```typescript
+await kernel.dispatch({
+  type: "lease.reapStale",
+  staleThresholdMs: 60_000, // Release jobs locked > 60s
+});
+```
+
+In the Node host, this runs automatically on each orchestration tick. For serverless, include it in your maintenance cron.
+
+## Rerun From Stage
+
+Rerun a workflow from a specific stage, keeping outputs from earlier stages:
+
+```typescript
+const { deletedStages } = await kernel.dispatch({
+  type: "run.rerunFrom",
+  workflowRunId: "run-123",
+  fromStageId: "summarize",
+});
+
+// Stages from "summarize" onward are deleted and re-queued
+// Earlier stages (e.g., "extract") keep their outputs
+```
+
+## Plugin System
+
+Plugins react to kernel events published through the outbox:
+
+```typescript
+import { definePlugin, createPluginRunner } from "@bratsos/workflow-engine/kernel";
+
+const metricsPlugin = definePlugin({
+  name: "metrics",
+  handlers: {
+    "workflow:completed": async (event) => {
+      await recordMetric("workflow_completed", { workflowId: event.workflowId });
+    },
+    "stage:failed": async (event) => {
+      await alertOnFailure(event);
+    },
+  },
+});
+
+const runner = createPluginRunner({
+  plugins: [metricsPlugin],
+  eventSink: myEventSink,
+});
+
+// Process events from the outbox
+await runner.processEvents(events);
+```
+
+## Multi-Worker Coordination
+
+Multiple workers can process jobs from the same queue safely:
+
+- **Run claiming** uses `FOR UPDATE SKIP LOCKED` in PostgreSQL -- no duplicate claims
+- **Job dequeuing** uses atomic `UPDATE ... WHERE status = 'PENDING'` -- no duplicate execution
+- **Stale lease recovery** releases jobs from crashed workers
+
+```typescript
+// Worker 1 and Worker 2 can run simultaneously
+const host1 = createNodeHost({ kernel, jobTransport, workerId: "worker-1" });
+const host2 = createNodeHost({ kernel, jobTransport, workerId: "worker-2" });
+```
+
+## Optimistic Concurrency
+
+The persistence layer uses version fields on records to detect concurrent modifications:
+
+```typescript
+// If two workers try to update the same run simultaneously,
+// one will get a StaleVersionError and retry
+import { StaleVersionError } from "@bratsos/workflow-engine";
+```
 
 ## Document Processing Pipeline
 
-A common pattern for processing documents through multiple stages:
+A common pattern combining sequential and parallel stages:
 
 ```typescript
-import { WorkflowBuilder, defineStage } from "@bratsos/workflow-engine";
-import { z } from "zod";
-
-// Stage 1: Extract content
-const extractStage = defineStage({
-  id: "extract",
-  name: "Extract Content",
-  schemas: {
-    input: z.object({ documentUrl: z.string().url() }),
-    output: z.object({
-      text: z.string(),
-      metadata: z.object({
-        title: z.string().optional(),
-        pageCount: z.number(),
-      }),
-    }),
-    config: z.object({
-      maxPages: z.number().default(100),
-    }),
-  },
-  async execute(ctx) {
-    const content = await fetchAndExtract(ctx.input.documentUrl, ctx.config);
-    return { output: content };
-  },
-});
-
-// Stage 2: Analyze (parallel)
-const classifyStage = defineStage({
-  id: "classify",
-  name: "Classify",
-  dependencies: ["extract"],
-  schemas: {
-    input: "none",
-    output: z.object({ categories: z.array(z.string()) }),
-    config: z.object({ model: z.string().default("gemini-2.5-flash") }),
-  },
-  async execute(ctx) {
-    const { text } = ctx.require("extract");
-    const ai = createAIHelper("classify", aiLogger);
-    const { object } = await ai.generateObject(ctx.config.model, text, ctx.schemas.output);
-    return { output: object };
-  },
-});
-
-const summarizeStage = defineStage({
-  id: "summarize",
-  name: "Summarize",
-  dependencies: ["extract"],
-  schemas: {
-    input: "none",
-    output: z.object({ summary: z.string() }),
-    config: z.object({
-      maxWords: z.number().default(200),
-      model: z.string().default("gemini-2.5-flash"),
-    }),
-  },
-  async execute(ctx) {
-    const { text } = ctx.require("extract");
-    const ai = createAIHelper("summarize", aiLogger);
-    const { text: summary } = await ai.generateText(
-      ctx.config.model,
-      `Summarize in ${ctx.config.maxWords} words:\n\n${text}`
-    );
-    return { output: { summary } };
-  },
-});
-
-// Stage 3: Merge results
-const mergeStage = defineStage({
-  id: "merge",
-  name: "Merge Results",
-  dependencies: ["classify", "summarize"],
-  schemas: {
-    input: "none",
-    output: z.object({
-      title: z.string().optional(),
-      summary: z.string(),
-      categories: z.array(z.string()),
-    }),
-    config: z.object({}),
-  },
-  async execute(ctx) {
-    const extraction = ctx.require("extract");
-    const classification = ctx.require("classify");
-    const summary = ctx.require("summarize");
-
-    return {
-      output: {
-        title: extraction.metadata.title,
-        summary: summary.summary,
-        categories: classification.categories,
-      },
-    };
-  },
-});
-
-// Build workflow
-const documentPipeline = new WorkflowBuilder(
-  "document-pipeline",
-  "Document Pipeline",
-  "Extract, classify, and summarize documents",
-  z.object({ documentUrl: z.string().url() }),
-  z.object({ title: z.string().optional(), summary: z.string(), categories: z.array(z.string()) })
+const workflow = new WorkflowBuilder(
+  "doc-processor", "Document Processor", "Process documents",
+  InputSchema, OutputSchema,
 )
-  .pipe(extractStage)
-  .parallel([classifyStage, summarizeStage])
-  .pipe(mergeStage)
+  .pipe(extractTextStage)              // Stage 1: Extract
+  .parallel([
+    sentimentAnalysisStage,            // Stage 2a: Analyze sentiment
+    keywordExtractionStage,            // Stage 2b: Extract keywords
+  ])
+  .pipe(aggregateResultsStage)         // Stage 3: Combine results
   .build();
 ```
 
-## AI Classification Workflow
-
-Pattern for multi-label classification with confidence scores:
-
-```typescript
-const ClassificationSchema = z.object({
-  labels: z.array(z.object({
-    name: z.string(),
-    confidence: z.number().min(0).max(1),
-    reasoning: z.string(),
-  })),
-  primaryLabel: z.string(),
-});
-
-const classificationStage = defineStage({
-  id: "classification",
-  name: "AI Classification",
-  schemas: {
-    input: z.object({ text: z.string() }),
-    output: ClassificationSchema,
-    config: z.object({
-      model: z.string().default("gemini-2.5-flash"),
-      labels: z.array(z.string()),
-      minConfidence: z.number().default(0.7),
-    }),
-  },
-  async execute(ctx) {
-    const ai = createAIHelper("classification", aiLogger);
-
-    const prompt = `Classify the following text into these categories: ${ctx.config.labels.join(", ")}
-
-For each applicable label, provide:
-- The label name
-- A confidence score (0-1)
-- Brief reasoning
-
-Text to classify:
-${ctx.input.text}`;
-
-    const { object } = await ai.generateObject(ctx.config.model, prompt, ClassificationSchema);
-
-    // Filter by minimum confidence
-    const filtered = {
-      ...object,
-      labels: object.labels.filter(l => l.confidence >= ctx.config.minConfidence),
-    };
-
-    return { output: filtered };
-  },
-});
-```
-
-## Error Recovery Pattern
-
-Graceful error handling with fallbacks:
-
-```typescript
-const robustStage = defineStage({
-  id: "robust-stage",
-  name: "Robust Stage",
-  schemas: {
-    input: z.object({ data: z.any() }),
-    output: z.object({
-      result: z.any(),
-      usedFallback: z.boolean(),
-      error: z.string().optional(),
-    }),
-    config: z.object({
-      primaryModel: z.string().default("claude-sonnet-4-20250514"),
-      fallbackModel: z.string().default("gemini-2.5-flash"),
-      maxRetries: z.number().default(3),
-    }),
-  },
-  async execute(ctx) {
-    const ai = createAIHelper("robust", aiLogger);
-
-    // Try primary model
-    for (let attempt = 1; attempt <= ctx.config.maxRetries; attempt++) {
-      try {
-        const result = await ai.generateText(ctx.config.primaryModel, ctx.input.data);
-        return {
-          output: { result: result.text, usedFallback: false },
-        };
-      } catch (error) {
-        await ctx.log("WARN", `Primary model failed (attempt ${attempt})`, {
-          error: error.message,
-        });
-
-        if (attempt === ctx.config.maxRetries) break;
-        await sleep(1000 * attempt); // Exponential backoff
-      }
-    }
-
-    // Try fallback model
-    try {
-      await ctx.log("INFO", "Using fallback model");
-      const result = await ai.generateText(ctx.config.fallbackModel, ctx.input.data);
-      return {
-        output: {
-          result: result.text,
-          usedFallback: true,
-          error: "Primary model failed, used fallback",
-        },
-      };
-    } catch (error) {
-      await ctx.log("ERROR", "Fallback model also failed");
-      throw new Error(`All models failed: ${error.message}`);
-    }
-  },
-});
-```
-
-## Cost Optimization Strategies
-
-### 1. Use Batch Operations
-
-```typescript
-// Instead of many individual calls
-for (const item of items) {
-  await ai.generateText(model, item.prompt);  // Expensive!
-}
-
-// Use batch for 50% savings
-const batch = ai.batch(model, "anthropic");
-const handle = await batch.submit(items.map((item, i) => ({
-  id: `item-${i}`,
-  prompt: item.prompt,
-})));
-```
-
-### 2. Cache Expensive Results
+Subsequent stages access parallel outputs by stage ID:
 
 ```typescript
 async execute(ctx) {
-  const cacheKey = `result-${hash(ctx.input)}`;
-
-  // Check cache
-  if (await ctx.storage.exists(cacheKey)) {
-    return { output: await ctx.storage.load(cacheKey) };
-  }
-
-  // Compute expensive result
-  const result = await expensiveOperation(ctx.input);
-
-  // Cache for future runs
-  await ctx.storage.save(cacheKey, result);
-
-  return { output: result };
+  const sentiment = ctx.require("sentiment-analysis");
+  const keywords = ctx.require("keyword-extraction");
+  // ...
 }
 ```
 
-### 3. Use Appropriate Models
-
-```typescript
-// Quick classification - use fast model
-const { object } = await ai.generateObject("gemini-2.5-flash", prompt, schema);
-
-// Complex reasoning - use powerful model
-const { text } = await ai.generateText("claude-sonnet-4-20250514", complexPrompt, {
-  maxTokens: 4000,
-});
-```
-
-### 4. Optimize Token Usage
-
-```typescript
-// Truncate long inputs
-const truncatedText = text.slice(0, 50000);
-
-// Use structured output to reduce tokens
-const { object } = await ai.generateObject(model, prompt, schema);
-// vs: const { text } = await ai.generateText(model, prompt); JSON.parse(text);
-```
-
-## Logging Best Practices
-
-### Structured Logging
+## Error Handling in Stages
 
 ```typescript
 async execute(ctx) {
-  await ctx.log("INFO", "Stage started", {
-    inputSize: JSON.stringify(ctx.input).length,
-    config: ctx.config,
-  });
-
   try {
-    const result = await processData(ctx.input);
-
-    await ctx.log("INFO", "Processing complete", {
-      itemsProcessed: result.items.length,
-      duration: Date.now() - startTime,
-    });
-
+    const result = await processDocument(ctx.input);
     return { output: result };
   } catch (error) {
-    await ctx.log("ERROR", "Processing failed", {
-      error: error.message,
-      stack: error.stack,
+    ctx.log("ERROR", "Processing failed", {
+      error: error instanceof Error ? error.message : String(error),
     });
-    throw error;
+    throw error; // Re-throw to mark stage as FAILED
   }
 }
 ```
 
-### Log Levels
+Failed stages trigger the `stage:failed` event. The host's maintenance tick detects failure through `run.transition`, which marks the workflow as FAILED.
 
-| Level | Use For |
-|-------|---------|
-| DEBUG | Detailed debugging info |
-| INFO | Normal operations |
-| WARN | Recoverable issues |
-| ERROR | Failures |
-
-## Type-Safe Context Passing
-
-### Define Workflow Context Type
+## Progress Reporting
 
 ```typescript
-// Define exact shape of workflow context
-type MyWorkflowContext = {
-  "extract": { text: string; metadata: { title: string } };
-  "classify": { categories: string[] };
-  "summarize": { summary: string };
-};
-
-// Use in stage definition
-const mergeStage = defineStage<
-  "none",
-  typeof OutputSchema,
-  typeof ConfigSchema,
-  MyWorkflowContext
->({
-  id: "merge",
-  // ctx.require("extract") is now typed as { text: string; metadata: { title: string } }
-  async execute(ctx) {
-    const extract = ctx.require("extract"); // Typed!
-    const classify = ctx.require("classify"); // Typed!
-  },
-});
-```
-
-### Infer from Workflow
-
-```typescript
-import type { InferWorkflowContext } from "@bratsos/workflow-engine";
-
-const workflow = new WorkflowBuilder(...)
-  .pipe(extractStage)
-  .pipe(classifyStage)
-  .build();
-
-type WorkflowContext = InferWorkflowContext<typeof workflow>;
-```
-
-## Troubleshooting Guide
-
-### Stage Not Found in Context
-
-**Error**: `Missing required stage output: "stage-id"`
-
-**Cause**: Stage dependency not in workflow or hasn't run yet.
-
-**Fix**:
-1. Check `dependencies` array includes the stage
-2. Verify stage is added before dependent stage in workflow
-3. Use `ctx.optional()` if stage is truly optional
-
-### Batch Never Completes
-
-**Symptoms**: Stage stays SUSPENDED forever
-
-**Causes**:
-1. `nextPollAt` not being updated
-2. `maxWaitTime` too short
-3. Batch provider issues
-
-**Fix**:
-```typescript
-// In checkCompletion
-return {
-  ready: false,
-  nextCheckIn: 60000,  // Make sure this is set
-};
-
-// Check batch status manually
-const batch = ai.batch(model, provider);
-const status = await batch.getStatus(batchId);
-console.log("Batch status:", status);
-```
-
-### Type Mismatch in Workflow
-
-**Error**: TypeScript errors about incompatible types
-
-**Cause**: Output of one stage doesn't match input of next.
-
-**Fix**:
-1. Use `input: "none"` for stages that only use context
-2. Ensure schemas match across stages
-3. Use `.passthrough()` on Zod schemas for flexibility
-
-### Prisma Enum Errors
-
-**Error**: `Invalid value for argument 'status'. Expected Status`
-
-**Cause**: Prisma 7.x requires typed enums, not strings
-
-**Fix**: The library handles this automatically via the enum compatibility layer. If you see this error:
-1. Ensure you're using `createPrismaWorkflowPersistence(prisma)`
-2. Check you're not bypassing the persistence layer with direct Prisma calls
-
-### Memory Issues with Large Batches
-
-**Symptoms**: Process crashes or slows down
-
-**Fix**:
-```typescript
-// Process in smaller batches
-const CHUNK_SIZE = 100;
-for (let i = 0; i < items.length; i += CHUNK_SIZE) {
-  const chunk = items.slice(i, i + CHUNK_SIZE);
-  await processChunk(chunk);
+async execute(ctx) {
+  for (const [index, item] of items.entries()) {
+    ctx.onProgress({
+      progress: (index + 1) / items.length,
+      message: `Processing item ${index + 1}/${items.length}`,
+      details: { currentItem: item.id },
+    });
+    await processItem(item);
+  }
+  return { output: { processedCount: items.length } };
 }
-
-// Stream instead of loading all at once
-for await (const chunk of streamResults(batchId)) {
-  yield processChunk(chunk);
-}
-```
-
-### Workflow Stuck in RUNNING
-
-**Symptoms**: Workflow never completes
-
-**Causes**:
-1. Stage threw unhandled error
-2. Job queue not processing
-3. Worker crashed
-
-**Fix**:
-```typescript
-// Check for failed stages
-const stages = await persistence.getStagesByRun(runId);
-const failed = stages.filter(s => s.status === "FAILED");
-if (failed.length > 0) {
-  console.log("Failed stages:", failed.map(s => ({ id: s.stageId, error: s.errorMessage })));
-}
-
-// Release stale jobs
-await jobQueue.releaseStaleJobs(60000);
-```
-
-## Configuration Recipes
-
-### Development Config
-
-```typescript
-const devConfig = {
-  pollIntervalMs: 2000,
-  jobPollIntervalMs: 500,
-  staleJobThresholdMs: 30000,
-};
-```
-
-### Production Config
-
-```typescript
-const prodConfig = {
-  pollIntervalMs: 10000,
-  jobPollIntervalMs: 1000,
-  staleJobThresholdMs: 120000,
-  workerId: `worker-${process.env.HOSTNAME}`,
-};
-```
-
-### High-Throughput Config
-
-```typescript
-const throughputConfig = {
-  pollIntervalMs: 5000,
-  jobPollIntervalMs: 100,
-  staleJobThresholdMs: 300000,
-};
 ```

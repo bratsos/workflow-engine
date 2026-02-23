@@ -6,7 +6,7 @@
 
 import { beforeEach, describe, expect, it } from "vitest";
 import type { CreateAICallInput } from "../../persistence/interface.js";
-import { InMemoryAICallLogger } from "../utils/in-memory-ai-logger.js";
+import { InMemoryAICallLogger } from "../../testing/in-memory-ai-logger.js";
 
 describe("I want to use InMemoryAICallLogger in tests", () => {
   let logger: InMemoryAICallLogger;

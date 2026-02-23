@@ -10,7 +10,6 @@
  * cached result without re-executing the handler.
  */
 
-import { randomUUID } from "node:crypto";
 import type { Workflow } from "../core/workflow";
 import type {
   KernelCommand,
@@ -46,6 +45,7 @@ import { handleStagePollSuspended } from "./handlers/stage-poll-suspended";
 import { handleLeaseReapStale } from "./handlers/lease-reap-stale";
 import { handleOutboxFlush } from "./handlers/outbox-flush";
 import { handlePluginReplayDLQ } from "./handlers/plugin-replay-dlq";
+import { IdempotencyInProgressError } from "./errors";
 
 // ============================================================================
 // Public interfaces
@@ -153,102 +153,116 @@ export function createKernel(config: KernelConfig): Kernel {
     }
 
     // -----------------------------------------------------------------
-    // Idempotency check
+    // Idempotency acquisition
     // -----------------------------------------------------------------
     const idempotencyKey = getIdempotencyKey(command);
+    let idempotencyAcquired = false;
+
     if (idempotencyKey) {
-      const cached = await persistence.checkIdempotencyKey(
+      const acquired = await persistence.acquireIdempotencyKey(
         idempotencyKey,
         command.type,
       );
-      if (cached.exists) {
-        return cached.result as CommandResult<T>;
+
+      if (acquired.status === "replay") {
+        return acquired.result as CommandResult<T>;
       }
+      if (acquired.status === "in_progress") {
+        throw new IdempotencyInProgressError(idempotencyKey, command.type);
+      }
+      idempotencyAcquired = true;
     }
 
-    // -----------------------------------------------------------------
-    // Route to handler
-    // -----------------------------------------------------------------
-    let result: HandlerResult<any>;
+    try {
+      // ---------------------------------------------------------------
+      // Route to handler + append outbox events in one transaction
+      // ---------------------------------------------------------------
+      const publicResult = await persistence.withTransaction(async (tx) => {
+        const txDeps: KernelDeps = { ...deps, persistence: tx };
+        let result: HandlerResult<any>;
 
-    switch (command.type) {
-      case "run.create":
-        result = await handleRunCreate(command as RunCreateCommand, deps);
-        break;
-      case "run.claimPending":
-        result = await handleRunClaimPending(
-          command as RunClaimPendingCommand,
-          deps,
-        );
-        break;
-      case "run.transition":
-        result = await handleRunTransition(
-          command as RunTransitionCommand,
-          deps,
-        );
-        break;
-      case "run.cancel":
-        result = await handleRunCancel(command as RunCancelCommand, deps);
-        break;
-      case "run.rerunFrom":
-        result = await handleRunRerunFrom(
-          command as RunRerunFromCommand,
-          deps,
-        );
-        break;
-      case "job.execute":
-        result = await handleJobExecute(command as JobExecuteCommand, deps);
-        break;
-      case "stage.pollSuspended":
-        result = await handleStagePollSuspended(
-          command as StagePollSuspendedCommand,
-          deps,
-        );
-        break;
-      case "lease.reapStale":
-        result = await handleLeaseReapStale(
-          command as LeaseReapStaleCommand,
-          deps,
-        );
-        break;
-      default: {
-        const _exhaustive: never = command;
-        throw new Error(
-          `Unknown command type: ${(_exhaustive as KernelCommand).type}`,
+        switch (command.type) {
+          case "run.create":
+            result = await handleRunCreate(command as RunCreateCommand, txDeps);
+            break;
+          case "run.claimPending":
+            result = await handleRunClaimPending(
+              command as RunClaimPendingCommand,
+              txDeps,
+            );
+            break;
+          case "run.transition":
+            result = await handleRunTransition(
+              command as RunTransitionCommand,
+              txDeps,
+            );
+            break;
+          case "run.cancel":
+            result = await handleRunCancel(command as RunCancelCommand, txDeps);
+            break;
+          case "run.rerunFrom":
+            result = await handleRunRerunFrom(
+              command as RunRerunFromCommand,
+              txDeps,
+            );
+            break;
+          case "job.execute":
+            result = await handleJobExecute(command as JobExecuteCommand, txDeps);
+            break;
+          case "stage.pollSuspended":
+            result = await handleStagePollSuspended(
+              command as StagePollSuspendedCommand,
+              txDeps,
+            );
+            break;
+          case "lease.reapStale":
+            result = await handleLeaseReapStale(
+              command as LeaseReapStaleCommand,
+              txDeps,
+            );
+            break;
+          default: {
+            const _exhaustive: never = command;
+            throw new Error(
+              `Unknown command type: ${(_exhaustive as KernelCommand).type}`,
+            );
+          }
+        }
+
+        const events = result._events as KernelEvent[];
+        if (events.length > 0) {
+          const causationId = idempotencyKey ?? crypto.randomUUID();
+          const outboxEvents: CreateOutboxEventInput[] = events.map((event) => ({
+            workflowRunId: event.workflowRunId,
+            eventType: event.type,
+            payload: event,
+            causationId,
+            occurredAt: event.timestamp,
+          }));
+          await tx.appendOutboxEvents(outboxEvents);
+        }
+
+        const { _events: _, ...stripped } = result;
+        return stripped as CommandResult<T>;
+      });
+
+      if (idempotencyKey && idempotencyAcquired) {
+        await persistence.completeIdempotencyKey(
+          idempotencyKey,
+          command.type,
+          publicResult,
         );
       }
+
+      return publicResult;
+    } catch (error) {
+      if (idempotencyKey && idempotencyAcquired) {
+        await persistence
+          .releaseIdempotencyKey(idempotencyKey, command.type)
+          .catch(() => {});
+      }
+      throw error;
     }
-
-    // -----------------------------------------------------------------
-    // Write events to transactional outbox
-    // -----------------------------------------------------------------
-    const events = result._events as KernelEvent[];
-    if (events.length > 0) {
-      const causationId = idempotencyKey ?? randomUUID();
-      const outboxEvents: CreateOutboxEventInput[] = events.map((event) => ({
-        workflowRunId: event.workflowRunId,
-        eventType: event.type,
-        payload: event,
-        causationId,
-        occurredAt: event.timestamp,
-      }));
-      await persistence.appendOutboxEvents(outboxEvents);
-    }
-
-    // -----------------------------------------------------------------
-    // Strip _events and cache result
-    // -----------------------------------------------------------------
-    const { _events: _, ...publicResult } = result;
-
-    if (idempotencyKey) {
-      await persistence.setIdempotencyKey(
-        idempotencyKey,
-        command.type,
-        publicResult,
-      );
-    }
-
-    return publicResult as CommandResult<T>;
   }
 
   return { dispatch };

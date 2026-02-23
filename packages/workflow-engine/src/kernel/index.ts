@@ -81,3 +81,6 @@ export {
 
 // Kernel helpers
 export { saveStageOutput, loadWorkflowContext } from "./helpers/index.js";
+
+// Kernel errors
+export { IdempotencyInProgressError } from "./errors.js";

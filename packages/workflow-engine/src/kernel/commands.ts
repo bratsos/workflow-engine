@@ -136,6 +136,7 @@ export interface StagePollSuspendedResult {
   readonly checked: number;
   readonly resumed: number;
   readonly failed: number;
+  readonly resumedWorkflowRunIds: string[];
 }
 
 // ---------------------------------------------------------------------------
