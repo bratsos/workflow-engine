@@ -4,7 +4,7 @@
  * Prisma storage requires a PrismaClient to be passed via options.
  */
 
-import type { StageStorage } from "./storage";
+import type { StageStorage } from "./stage";
 import { InMemoryStageStorage } from "./storage-providers/memory-storage";
 import { PrismaStageStorage } from "./storage-providers/prisma-storage";
 

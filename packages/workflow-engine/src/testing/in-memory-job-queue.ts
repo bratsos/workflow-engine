@@ -45,6 +45,7 @@ export class InMemoryJobQueue implements JobQueue {
       createdAt: now,
       updatedAt: now,
       workflowRunId: options.workflowRunId,
+      workflowId: options.workflowId,
       stageId: options.stageId,
       status: "PENDING",
       priority: options.priority ?? 5,
@@ -110,9 +111,11 @@ export class InMemoryJobQueue implements JobQueue {
     return {
       jobId: job.id,
       workflowRunId: job.workflowRunId,
+      workflowId: job.workflowId,
       stageId: job.stageId,
       priority: job.priority,
       attempt: job.attempt,
+      maxAttempts: job.maxAttempts,
       payload: job.payload,
     };
   }

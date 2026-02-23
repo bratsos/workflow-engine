@@ -4,33 +4,23 @@ description: Guide for @bratsos/workflow-engine - a type-safe workflow engine wi
 license: MIT
 metadata:
   author: bratsos
-  version: "0.1.0"
+  version: "0.2.0"
   repository: https://github.com/bratsos/workflow-engine
 ---
 
 # @bratsos/workflow-engine Skill
 
-Type-safe workflow engine for building AI-powered, multi-stage pipelines with persistence and batch processing support.
+Type-safe workflow engine for building AI-powered, multi-stage pipelines with persistence and batch processing support. Uses a **command kernel** architecture with environment-agnostic design.
 
-## ⚠️ CRITICAL: Required Prisma Models
+## Architecture Overview
 
-**Before using this library, your Prisma schema MUST include ALL of these models with EXACT field names:**
+The engine follows a **kernel + host** pattern:
 
-| Model | Required | Purpose |
-|-------|----------|---------|
-| `WorkflowRun` | ✅ Yes | Workflow execution records |
-| `WorkflowStage` | ✅ Yes | Stage execution state |
-| `WorkflowLog` | ✅ Yes | Stage logging |
-| `WorkflowArtifact` | ✅ Yes | Stage output storage |
-| `JobQueue` | ✅ Yes | Job scheduling |
-| `AICall` | Optional | AI call tracking |
+- **Core library** (`@bratsos/workflow-engine`) - Command kernel, stage/workflow definitions, persistence adapters
+- **Node Host** (`@bratsos/workflow-engine-host-node`) - Long-running worker with polling loops and signal handling
+- **Serverless Host** (`@bratsos/workflow-engine-host-serverless`) - Stateless single-invocation for edge/lambda/workers
 
-**Common Errors:**
-- `Cannot read properties of undefined (reading 'create')` → Missing `WorkflowLog` model
-- `Cannot read properties of undefined (reading 'upsert')` → Missing `WorkflowArtifact` model
-- `Unknown argument 'duration'. Did you mean 'durationMs'?` → Field name mismatch (use `duration`, not `durationMs`)
-
-**See [05-persistence-setup.md](references/05-persistence-setup.md) for the complete schema.**
+The **kernel** is a pure command dispatcher. All workflow operations are expressed as typed commands dispatched via `kernel.dispatch()`. Hosts wrap the kernel with environment-specific process management.
 
 ## When to Apply
 
@@ -39,20 +29,20 @@ Type-safe workflow engine for building AI-powered, multi-stage pipelines with pe
 - User is implementing workflow persistence with Prisma
 - User needs AI integration (generateText, generateObject, embeddings, batch)
 - User is building multi-stage data processing pipelines
-- User mentions workflow runtime, job queues, or stage execution
-- User wants to rerun a workflow from a specific stage (retry after failure)
-- User needs to test workflows with mocks
+- User mentions kernel, command dispatch, or job execution
+- User wants to set up a Node.js worker or serverless worker
+- User wants to rerun a workflow from a specific stage
+- User needs to test workflows with in-memory adapters
 
 ## Quick Start
 
 ```typescript
+import { defineStage, WorkflowBuilder } from "@bratsos/workflow-engine";
+import { createKernel } from "@bratsos/workflow-engine/kernel";
+import { createNodeHost } from "@bratsos/workflow-engine-host-node";
 import {
-  defineStage,
-  WorkflowBuilder,
-  createWorkflowRuntime,
   createPrismaWorkflowPersistence,
   createPrismaJobQueue,
-  createPrismaAICallLogger,
 } from "@bratsos/workflow-engine";
 import { z } from "zod";
 
@@ -66,32 +56,42 @@ const processStage = defineStage({
     config: z.object({ verbose: z.boolean().default(false) }),
   },
   async execute(ctx) {
-    const processed = ctx.input.data.toUpperCase();
-    return { output: { result: processed } };
+    return { output: { result: ctx.input.data.toUpperCase() } };
   },
 });
 
 // 2. Build a workflow
 const workflow = new WorkflowBuilder(
-  "my-workflow",
-  "My Workflow",
-  "Processes data",
+  "my-workflow", "My Workflow", "Processes data",
   z.object({ data: z.string() }),
   z.object({ result: z.string() })
 )
   .pipe(processStage)
   .build();
 
-// 3. Create runtime and execute
-const runtime = createWorkflowRuntime({
+// 3. Create kernel
+const kernel = createKernel({
   persistence: createPrismaWorkflowPersistence(prisma),
-  jobQueue: createPrismaJobQueue(prisma),
-  aiCallLogger: createPrismaAICallLogger(prisma),
-  registry: { getWorkflow: (id) => (id === "my-workflow" ? workflow : null) },
+  blobStore: myBlobStore,
+  jobTransport: createPrismaJobQueue(prisma),
+  eventSink: myEventSink,
+  scheduler: myScheduler,
+  clock: { now: () => new Date() },
+  registry: { getWorkflow: (id) => (id === "my-workflow" ? workflow : undefined) },
 });
 
-await runtime.start();
-const { workflowRunId } = await runtime.createRun({
+// 4. Start a Node host
+const host = createNodeHost({
+  kernel,
+  jobTransport: createPrismaJobQueue(prisma),
+  workerId: "worker-1",
+});
+await host.start();
+
+// 5. Dispatch a command
+await kernel.dispatch({
+  type: "run.create",
+  idempotencyKey: crypto.randomUUID(),
   workflowId: "my-workflow",
   input: { data: "hello" },
 });
@@ -99,18 +99,34 @@ const { workflowRunId } = await runtime.createRun({
 
 ## Core Exports Reference
 
-| Export | Type | Purpose |
-|--------|------|---------|
-| `defineStage` | Function | Create sync stages |
-| `defineAsyncBatchStage` | Function | Create async/batch stages |
-| `WorkflowBuilder` | Class | Chain stages into workflows |
-| `Workflow` | Class | Built workflow definition |
-| `WorkflowRuntime` | Class | Execute workflows with persistence |
-| `createAIHelper` | Function | AI operations (text, object, embed, batch) |
-| `AVAILABLE_MODELS` | Object | Model configurations |
-| `registerModels` | Function | Add custom models |
-| `calculateCost` | Function | Estimate token costs |
-| `NoInputSchema` | Schema | For stages without input |
+| Export | Type | Import Path | Purpose |
+|--------|------|-------------|---------|
+| `defineStage` | Function | `@bratsos/workflow-engine` | Create sync stages |
+| `defineAsyncBatchStage` | Function | `@bratsos/workflow-engine` | Create async/batch stages |
+| `WorkflowBuilder` | Class | `@bratsos/workflow-engine` | Chain stages into workflows |
+| `createKernel` | Function | `@bratsos/workflow-engine/kernel` | Create command kernel |
+| `createNodeHost` | Function | `@bratsos/workflow-engine-host-node` | Create Node.js host |
+| `createServerlessHost` | Function | `@bratsos/workflow-engine-host-serverless` | Create serverless host |
+| `createAIHelper` | Function | `@bratsos/workflow-engine` | AI operations (text, object, embed, batch) |
+| `definePlugin` | Function | `@bratsos/workflow-engine/kernel` | Define kernel plugins |
+| `createPluginRunner` | Function | `@bratsos/workflow-engine/kernel` | Create plugin event processor |
+
+## Kernel Commands
+
+All operations go through `kernel.dispatch(command)`:
+
+| Command | Description |
+|---------|-------------|
+| `run.create` | Create a new workflow run |
+| `run.claimPending` | Claim pending runs, enqueue first-stage jobs |
+| `run.transition` | Advance to next stage group or complete |
+| `run.cancel` | Cancel a running workflow |
+| `run.rerunFrom` | Rerun from a specific stage |
+| `job.execute` | Execute a single stage |
+| `stage.pollSuspended` | Poll suspended stages for readiness (returns `resumedWorkflowRunIds`) |
+| `lease.reapStale` | Release stale job leases |
+| `outbox.flush` | Publish pending outbox events |
+| `plugin.replayDLQ` | Replay dead-letter queue events |
 
 ## Stage Definition
 
@@ -118,33 +134,27 @@ const { workflowRunId } = await runtime.createRun({
 
 ```typescript
 const myStage = defineStage({
-  id: "my-stage",           // Unique identifier
-  name: "My Stage",         // Display name
-  description: "Optional",  // Description
-  dependencies: ["prev"],   // Required previous stages
+  id: "my-stage",
+  name: "My Stage",
+  description: "Optional",
+  dependencies: ["prev"],
 
   schemas: {
     input: InputSchema,     // Zod schema or "none"
-    output: OutputSchema,   // Zod schema
-    config: ConfigSchema,   // Zod schema with defaults
+    output: OutputSchema,
+    config: ConfigSchema,
   },
 
   async execute(ctx) {
-    // Access input, config, workflow context
     const { input, config, workflowContext } = ctx;
+    const prevOutput = ctx.require("prev");
+    const optOutput = ctx.optional("other");
 
-    // Get output from previous stages
-    const prevOutput = ctx.require("prev");      // Throws if missing
-    const optOutput = ctx.optional("other");     // Returns undefined if missing
-
-    // Access services
     await ctx.log("INFO", "Processing...");
-    await ctx.storage.save("key", data);
 
     return {
       output: { ... },
       customMetrics: { itemsProcessed: 10 },
-      artifacts: { rawData: data },
     };
   },
 });
@@ -156,51 +166,26 @@ const myStage = defineStage({
 const batchStage = defineAsyncBatchStage({
   id: "batch-process",
   name: "Batch Process",
-  mode: "async-batch",  // Required
-
-  schemas: {
-    input: "none",
-    output: OutputSchema,
-    config: ConfigSchema,
-  },
+  mode: "async-batch",
+  schemas: { input: "none", output: OutputSchema, config: ConfigSchema },
 
   async execute(ctx) {
-    // Check if resuming from suspension
     if (ctx.resumeState) {
       return { output: ctx.resumeState.cachedResult };
     }
 
-    // Submit batch and suspend
     const batchId = await submitBatchJob(ctx.input);
-
     return {
       suspended: true,
-      state: {
-        batchId,
-        submittedAt: new Date().toISOString(),
-        pollInterval: 60000,
-        maxWaitTime: 3600000,
-      },
-      pollConfig: {
-        pollInterval: 60000,
-        maxWaitTime: 3600000,
-        nextPollAt: new Date(Date.now() + 60000),
-      },
+      state: { batchId, pollInterval: 60000, maxWaitTime: 3600000 },
+      pollConfig: { pollInterval: 60000, maxWaitTime: 3600000, nextPollAt: new Date(Date.now() + 60000) },
     };
   },
 
   async checkCompletion(suspendedState, ctx) {
     const status = await checkBatchStatus(suspendedState.batchId);
-
-    if (status === "completed") {
-      const results = await getBatchResults(suspendedState.batchId);
-      return { ready: true, output: { results } };
-    }
-
-    if (status === "failed") {
-      return { ready: false, error: "Batch failed" };
-    }
-
+    if (status === "completed") return { ready: true, output: { results } };
+    if (status === "failed") return { ready: false, error: "Batch failed" };
     return { ready: false, nextCheckIn: 60000 };
   },
 });
@@ -210,235 +195,156 @@ const batchStage = defineAsyncBatchStage({
 
 ```typescript
 const workflow = new WorkflowBuilder(
-  "workflow-id",
-  "Workflow Name",
-  "Description",
-  InputSchema,
-  OutputSchema
+  "workflow-id", "Workflow Name", "Description",
+  InputSchema, OutputSchema
 )
-  .pipe(stage1)                    // Sequential
+  .pipe(stage1)
   .pipe(stage2)
-  .parallel([stage3a, stage3b])    // Parallel execution
+  .parallel([stage3a, stage3b])
   .pipe(stage4)
   .build();
 
-// Workflow utilities
-workflow.getStageIds();            // ["stage1", "stage2", ...]
-workflow.getExecutionPlan();       // Grouped by execution order
-workflow.getDefaultConfig();       // Default config for all stages
-workflow.validateConfig(config);   // Validate config object
+workflow.getStageIds();
+workflow.getExecutionPlan();
+workflow.getDefaultConfig();
+workflow.validateConfig(config);
+```
+
+## Kernel Setup
+
+```typescript
+import { createKernel } from "@bratsos/workflow-engine/kernel";
+import type { Kernel, KernelConfig, Persistence, BlobStore, JobTransport, EventSink, Scheduler, Clock } from "@bratsos/workflow-engine/kernel";
+
+const kernel = createKernel({
+  persistence,   // Persistence port - runs, stages, logs, outbox, idempotency
+  blobStore,     // BlobStore port - large payload storage
+  jobTransport,  // JobTransport port - job queue
+  eventSink,     // EventSink port - async event publishing
+  scheduler,     // Scheduler port - deferred command triggers
+  clock,         // Clock port - injectable time source
+  registry,      // WorkflowRegistry - { getWorkflow(id) }
+});
+
+// Dispatch typed commands
+const { workflowRunId } = await kernel.dispatch({
+  type: "run.create",
+  idempotencyKey: "unique-key",
+  workflowId: "my-workflow",
+  input: { data: "hello" },
+});
+```
+
+### Node Host
+
+```typescript
+import { createNodeHost } from "@bratsos/workflow-engine-host-node";
+
+const host = createNodeHost({
+  kernel,
+  jobTransport,
+  workerId: "worker-1",
+  orchestrationIntervalMs: 10_000,
+  jobPollIntervalMs: 1_000,
+  staleLeaseThresholdMs: 60_000,
+});
+
+await host.start();   // Starts polling loops + signal handlers
+await host.stop();    // Graceful shutdown
+host.getStats();      // { workerId, jobsProcessed, orchestrationTicks, isRunning, uptimeMs }
+```
+
+### Serverless Host
+
+```typescript
+import {
+  createServerlessHost,
+  type ServerlessHost,
+  type ServerlessHostConfig,
+  type JobMessage,
+  type JobResult,
+  type ProcessJobsResult,
+  type MaintenanceTickResult,
+} from "@bratsos/workflow-engine-host-serverless";
+
+const host = createServerlessHost({
+  kernel,
+  jobTransport,
+  workerId: "my-worker",
+  // Optional tuning (same defaults as Node host)
+  staleLeaseThresholdMs: 60_000,
+  maxClaimsPerTick: 10,
+  maxSuspendedChecksPerTick: 10,
+  maxOutboxFlushPerTick: 100,
+});
+```
+
+#### `handleJob(msg: JobMessage): Promise<JobResult>`
+
+Execute a single pre-dequeued job. Consumers wire platform-specific ack/retry around the result.
+
+```typescript
+// JobMessage shape (matches queue message body)
+interface JobMessage {
+  jobId: string;
+  workflowRunId: string;
+  workflowId: string;
+  stageId: string;
+  attempt: number;
+  maxAttempts?: number;
+  payload: Record<string, unknown>;
+}
+
+// JobResult
+interface JobResult {
+  outcome: "completed" | "suspended" | "failed";
+  error?: string;
+}
+
+const result = await host.handleJob(msg);
+if (result.outcome === "completed") msg.ack();
+else if (result.outcome === "suspended") msg.ack();
+else msg.retry();
+```
+
+#### `processAvailableJobs(opts?): Promise<ProcessJobsResult>`
+
+Dequeue and process jobs from the job transport. Defaults to 1 job (safe for edge runtimes with CPU limits).
+
+```typescript
+const result = await host.processAvailableJobs({ maxJobs: 5 });
+// { processed: number, succeeded: number, failed: number }
+```
+
+#### `runMaintenanceTick(): Promise<MaintenanceTickResult>`
+
+Run one bounded maintenance cycle: claim pending, poll suspended, reap stale, flush outbox.
+
+```typescript
+const tick = await host.runMaintenanceTick();
+// { claimed: number, suspendedChecked: number, staleReleased: number, eventsFlushed: number }
+// Note: resumed suspended stages are automatically followed by run.transition.
 ```
 
 ## AI Integration & Cost Tracking
 
-### Topic Convention for Cost Aggregation
-
-Use hierarchical topics to enable cost tracking at different levels:
-
 ```typescript
-// In a stage - use the standard convention
-const ai = runtime.createAIHelper(`workflow.${ctx.workflowRunId}.stage.${ctx.stageId}`);
-
-// Later, query costs by prefix:
-const workflowCost = await aiLogger.getStats(`workflow.${workflowRunId}`);  // All stages
-const stageCost = await aiLogger.getStats(`workflow.${workflowRunId}.stage.extraction`);  // One stage
-```
-
-**Note:** When a workflow completes, `WorkflowRun.totalCost` and `totalTokens` are automatically populated.
-
-### AI Methods
-
-```typescript
-// Text generation
-const { text, cost } = await ai.generateText("gemini-2.5-flash", prompt, {
-  temperature: 0.7,
-  maxTokens: 1000,
-});
-
-// Structured output
-const { object } = await ai.generateObject(
-  "gemini-2.5-flash",
-  prompt,
-  z.object({ items: z.array(z.string()) })
+const ai = createAIHelper(
+  `workflow.${ctx.workflowRunId}.stage.${ctx.stageId}`,
+  aiCallLogger,
 );
 
-// Embeddings
-const { embedding, embeddings } = await ai.embed(
-  "text-embedding-004",
-  ["text1", "text2"],
-  { dimensions: 768 }
-);
-
-// Batch operations (50% cost savings)
-const batch = ai.batch("claude-sonnet-4-20250514", "anthropic");
-const handle = await batch.submit([
-  { id: "req1", prompt: "..." },
-  { id: "req2", prompt: "...", schema: OutputSchema },
-]);
-
-// Check status and get results
-const status = await batch.getStatus(handle.id);
-const results = await batch.getResults(handle.id);
-
-// Get aggregated stats
-const stats = await ai.getStats();
-console.log(`Cost: $${stats.totalCost.toFixed(4)}, Tokens: ${stats.totalInputTokens + stats.totalOutputTokens}`);
+const { text, cost } = await ai.generateText("gemini-2.5-flash", prompt);
+const { object } = await ai.generateObject("gemini-2.5-flash", prompt, schema);
+const { embedding } = await ai.embed("text-embedding-004", ["text1"], { dimensions: 768 });
 ```
-
-**See [04-ai-integration.md](references/04-ai-integration.md) for complete topic convention and cost tracking docs.**
 
 ## Persistence Setup
 
-### ⚠️ Required Prisma Models (ALL are required)
+### Required Prisma Models (ALL are required)
 
-Copy this complete schema. Missing models or wrong field names will cause runtime errors.
-
-```prisma
-// Required enums
-enum Status {
-  PENDING
-  RUNNING
-  SUSPENDED
-  COMPLETED
-  FAILED
-  CANCELLED
-  SKIPPED
-}
-
-enum LogLevel {
-  DEBUG
-  INFO
-  WARN
-  ERROR
-}
-
-enum ArtifactType {
-  STAGE_OUTPUT
-  ARTIFACT
-  METADATA
-}
-
-// ✅ REQUIRED: WorkflowRun
-model WorkflowRun {
-  id           String    @id @default(cuid())
-  createdAt    DateTime  @default(now())
-  updatedAt    DateTime  @updatedAt
-  workflowId   String
-  workflowName String
-  workflowType String
-  status       Status    @default(PENDING)
-  startedAt    DateTime?
-  completedAt  DateTime?
-  duration     Int?                          // ⚠️ Must be "duration", not "durationMs"
-  input        Json
-  output       Json?
-  config       Json      @default("{}")
-  totalCost    Float     @default(0)
-  totalTokens  Int       @default(0)
-  priority     Int       @default(5)
-
-  stages       WorkflowStage[]
-  logs         WorkflowLog[]
-  artifacts    WorkflowArtifact[]
-
-  @@index([status])
-  @@map("workflow_runs")
-}
-
-// ✅ REQUIRED: WorkflowStage
-model WorkflowStage {
-  id              String    @id @default(cuid())
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @updatedAt
-  workflowRunId   String
-  stageId         String
-  stageName       String
-  stageNumber     Int
-  executionGroup  Int
-  status          Status    @default(PENDING)
-  startedAt       DateTime?
-  completedAt     DateTime?
-  duration        Int?                        // ⚠️ Must be "duration", not "durationMs"
-  inputData       Json?
-  outputData      Json?
-  config          Json?
-  suspendedState  Json?
-  resumeData      Json?
-  nextPollAt      DateTime?
-  pollInterval    Int?
-  maxWaitUntil    DateTime?
-  metrics         Json?
-  embeddingInfo   Json?
-  errorMessage    String?
-
-  workflowRun     WorkflowRun        @relation(fields: [workflowRunId], references: [id], onDelete: Cascade)
-  logs            WorkflowLog[]
-  artifacts       WorkflowArtifact[]
-
-  @@unique([workflowRunId, stageId])
-  @@map("workflow_stages")
-}
-
-// ✅ REQUIRED: WorkflowLog (missing = "Cannot read 'create'" error)
-model WorkflowLog {
-  id              String         @id @default(cuid())
-  createdAt       DateTime       @default(now())
-  workflowRunId   String?
-  workflowStageId String?
-  level           LogLevel
-  message         String
-  metadata        Json?
-
-  workflowRun     WorkflowRun?   @relation(fields: [workflowRunId], references: [id], onDelete: Cascade)
-  workflowStage   WorkflowStage? @relation(fields: [workflowStageId], references: [id], onDelete: Cascade)
-
-  @@index([workflowRunId])
-  @@map("workflow_logs")
-}
-
-// ✅ REQUIRED: WorkflowArtifact (missing = "Cannot read 'upsert'" error)
-model WorkflowArtifact {
-  id              String       @id @default(cuid())
-  createdAt       DateTime     @default(now())
-  updatedAt       DateTime     @updatedAt
-  workflowRunId   String
-  workflowStageId String?
-  key             String
-  type            ArtifactType
-  data            Json
-  size            Int
-  metadata        Json?
-
-  workflowRun     WorkflowRun   @relation(fields: [workflowRunId], references: [id], onDelete: Cascade)
-  workflowStage   WorkflowStage? @relation(fields: [workflowStageId], references: [id], onDelete: Cascade)
-
-  @@unique([workflowRunId, key])
-  @@map("workflow_artifacts")
-}
-
-// ✅ REQUIRED: JobQueue
-model JobQueue {
-  id            String    @id @default(cuid())
-  createdAt     DateTime  @default(now())
-  updatedAt     DateTime  @updatedAt
-  workflowRunId String
-  stageId       String
-  status        Status    @default(PENDING)
-  priority      Int       @default(5)
-  workerId      String?
-  lockedAt      DateTime?
-  startedAt     DateTime?
-  completedAt   DateTime?
-  attempt       Int       @default(0)
-  maxAttempts   Int       @default(3)
-  lastError     String?
-  nextPollAt    DateTime?
-  payload       Json      @default("{}")
-
-  @@index([status, nextPollAt])
-  @@map("job_queue")
-}
-```
+Copy the complete schema from the [package README](../../README.md#1-database-setup). This includes:
+WorkflowRun, WorkflowStage, WorkflowLog, WorkflowArtifact, AICall, JobQueue, OutboxEvent, IdempotencyKey.
 
 ### Create Persistence
 
@@ -449,91 +355,71 @@ import {
   createPrismaAICallLogger,
 } from "@bratsos/workflow-engine/persistence/prisma";
 
-// PostgreSQL (default)
 const persistence = createPrismaWorkflowPersistence(prisma);
 const jobQueue = createPrismaJobQueue(prisma);
+const aiCallLogger = createPrismaAICallLogger(prisma);
 
 // SQLite - MUST pass databaseType option
 const persistence = createPrismaWorkflowPersistence(prisma, { databaseType: "sqlite" });
 const jobQueue = createPrismaJobQueue(prisma, { databaseType: "sqlite" });
-
-const aiCallLogger = createPrismaAICallLogger(prisma);
-```
-
-## Runtime Configuration
-
-```typescript
-const runtime = createWorkflowRuntime({
-  persistence,
-  jobQueue,
-  aiCallLogger,
-  registry: {
-    getWorkflow: (id) => workflowMap[id] ?? null,
-  },
-
-  // Optional configuration
-  pollIntervalMs: 10000,      // Orchestration poll interval
-  jobPollIntervalMs: 1000,    // Job dequeue interval
-  staleJobThresholdMs: 60000, // Stale job timeout
-  workerId: "worker-1",       // Custom worker ID
-});
-
-// Lifecycle
-await runtime.start();        // Start processing
-runtime.stop();               // Graceful shutdown
-
-// Manual operations
-await runtime.createRun({ workflowId, input });
-await runtime.transitionWorkflow(runId);
-await runtime.pollSuspendedStages();
 ```
 
 ## Testing
 
 ```typescript
+// In-memory persistence and job queue
 import {
-  TestWorkflowPersistence,
-  TestJobQueue,
-  MockAIHelper,
+  InMemoryWorkflowPersistence,
+  InMemoryJobQueue,
+  InMemoryAICallLogger,
 } from "@bratsos/workflow-engine/testing";
 
-const persistence = new TestWorkflowPersistence();
-const jobQueue = new TestJobQueue();
-const mockAI = new MockAIHelper();
+// Kernel-specific test adapters
+import {
+  FakeClock,
+  InMemoryBlobStore,
+  CollectingEventSink,
+  NoopScheduler,
+} from "@bratsos/workflow-engine/kernel/testing";
 
-// Configure mock responses
-mockAI.mockGenerateText("Expected response");
-mockAI.mockGenerateObject({ items: ["a", "b"] });
-
-// Test stage execution
-const result = await myStage.execute({
-  input: { data: "test" },
-  config: { verbose: true },
-  workflowContext: {},
-  workflowRunId: "test-run",
-  stageId: "my-stage",
-  log: async () => {},
-  storage: persistence.createStorage("test-run"),
+// Create kernel with all in-memory adapters
+const persistence = new InMemoryWorkflowPersistence();
+const jobQueue = new InMemoryJobQueue();
+const kernel = createKernel({
+  persistence,
+  blobStore: new InMemoryBlobStore(),
+  jobTransport: jobQueue,
+  eventSink: new CollectingEventSink(),
+  scheduler: new NoopScheduler(),
+  clock: new FakeClock(),
+  registry: { getWorkflow: (id) => workflows.get(id) },
 });
+
+// Test a full workflow lifecycle
+await kernel.dispatch({ type: "run.create", idempotencyKey: "test", workflowId: "my-wf", input: {} });
+await kernel.dispatch({ type: "run.claimPending", workerId: "test-worker" });
+const job = await jobQueue.dequeue();
+await kernel.dispatch({ type: "job.execute", workflowRunId: job.workflowRunId, workflowId: job.workflowId, stageId: job.stageId, config: {} });
+await kernel.dispatch({ type: "run.transition", workflowRunId: job.workflowRunId });
 ```
 
 ## Reference Files
 
-For detailed documentation, see the reference files:
-
 - [01-stage-definitions.md](references/01-stage-definitions.md) - Complete stage API
 - [02-workflow-builder.md](references/02-workflow-builder.md) - WorkflowBuilder patterns
-- [03-runtime-setup.md](references/03-runtime-setup.md) - Runtime configuration
+- [03-kernel-host-setup.md](references/03-runtime-setup.md) - Kernel & host configuration
 - [04-ai-integration.md](references/04-ai-integration.md) - AI helper methods
 - [05-persistence-setup.md](references/05-persistence-setup.md) - Database setup
 - [06-async-batch-stages.md](references/06-async-batch-stages.md) - Async operations
-- [07-testing-patterns.md](references/07-testing-patterns.md) - Testing utilities
-- [08-common-patterns.md](references/08-common-patterns.md) - Best practices
+- [07-testing-patterns.md](references/07-testing-patterns.md) - Testing with kernel
+- [08-common-patterns.md](references/08-common-patterns.md) - Kernel patterns & best practices
 
 ## Key Principles
 
 1. **Type Safety**: All schemas are Zod - types flow through the entire pipeline
-2. **Context Access**: Use `ctx.require()` and `ctx.optional()` for type-safe stage output access
-3. **Unified Status**: Single `Status` enum for workflows, stages, and jobs
-4. **Cost Tracking**: All AI calls automatically track tokens and costs
-5. **Batch Savings**: Use async-batch stages for 50% cost savings on large operations
+2. **Command Kernel**: All operations are typed commands dispatched through `kernel.dispatch()`
+3. **Environment-Agnostic**: Kernel has no timers, no signals, no global state
+4. **Context Access**: Use `ctx.require()` and `ctx.optional()` for type-safe stage output access
+5. **Transactional Outbox**: Events written to outbox, published via `outbox.flush` command
+6. **Idempotency**: `run.create` and `job.execute` replay cached results by key; concurrent same-key dispatch throws `IdempotencyInProgressError`
+7. **Cost Tracking**: All AI calls automatically track tokens and costs

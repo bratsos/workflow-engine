@@ -1,47 +1,96 @@
 /**
- * Async Batch Suspend/Resume Tests
+ * Async Batch Suspend/Resume Tests (kernel version)
  *
- * Tests for multi-stage async batch workflows and chaining.
+ * Tests for multi-stage async batch workflows and chaining via kernel dispatch().
  *
- * Note: Basic suspend/resume mechanics are covered in 03-workflow-execution/suspend-resume.test.ts
- * This file focuses on:
- * - Chaining multiple async-batch stages
- * - Sequential async-batch workflows
+ * Covers:
+ * - Sequential async-batch stages (suspend, poll, transition, repeat)
  * - Mixed sync and async-batch stages
- * - State preservation across multiple suspensions
+ * - State management across suspensions (metadata, unique batch IDs)
  */
 
-import { beforeEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { WorkflowExecutor } from "../../core/executor.js";
-import type { SimpleSuspendedResult } from "../../core/stage-factory.js";
 import {
   defineAsyncBatchStage,
   defineStage,
 } from "../../core/stage-factory.js";
-import { WorkflowBuilder } from "../../core/workflow.js";
+import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
+import { createKernel } from "../../kernel/kernel.js";
 import {
-  createPassthroughStage,
-  InMemoryAICallLogger,
-  InMemoryWorkflowPersistence,
-  TestSchemas,
-} from "../utils/index.js";
+  CollectingEventSink,
+  FakeClock,
+  InMemoryBlobStore,
+  NoopScheduler,
+} from "../../kernel/testing/index.js";
+import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
+import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
+
+function createTestKernel(workflows: Workflow<any, any>[] = []) {
+  const persistence = new InMemoryWorkflowPersistence();
+  const blobStore = new InMemoryBlobStore();
+  const jobTransport = new InMemoryJobQueue("test-worker");
+  const eventSink = new CollectingEventSink();
+  const scheduler = new NoopScheduler();
+  const clock = new FakeClock();
+  const registry = new Map<string, Workflow<any, any>>();
+  for (const w of workflows) registry.set(w.id, w);
+  const kernel = createKernel({
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry: { getWorkflow: (id) => registry.get(id) },
+  });
+  const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
+  return {
+    kernel,
+    flush,
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry,
+  };
+}
+
+/**
+ * Helper to drive a suspended stage through poll -> completion -> transition.
+ * Returns the transition result.
+ */
+async function pollAndTransition(
+  kernel: ReturnType<typeof createTestKernel>["kernel"],
+  persistence: InMemoryWorkflowPersistence,
+  clock: FakeClock,
+  workflowRunId: string,
+  stageId: string,
+) {
+  // Make the suspended stage eligible for polling
+  const stages = await persistence.getStagesByRun(workflowRunId);
+  const stage = stages.find((s) => s.stageId === stageId);
+  if (stage) {
+    await persistence.updateStage(stage.id, {
+      nextPollAt: new Date(clock.now().getTime() - 1000),
+    });
+  }
+
+  // Poll
+  await kernel.dispatch({ type: "stage.pollSuspended" });
+
+  // Transition
+  return kernel.dispatch({ type: "run.transition", workflowRunId });
+}
 
 describe("I want to chain multiple async-batch stages", () => {
-  let persistence: InMemoryWorkflowPersistence;
-  let aiLogger: InMemoryAICallLogger;
-
-  beforeEach(() => {
-    persistence = new InMemoryWorkflowPersistence();
-    aiLogger = new InMemoryAICallLogger();
-  });
-
   describe("sequential async-batch stages", () => {
-    it("should suspend on first async-batch stage, then on second after resume", async () => {
-      // Given: Two async-batch stages in sequence
+    it("should suspend on first stage, complete via poll, then advance to second", async () => {
       const executionLog: string[] = [];
-      let firstComplete = false;
-      let secondComplete = false;
+      let firstReady = false;
+      let secondReady = false;
 
       const firstAsyncStage = defineAsyncBatchStage({
         id: "first-async",
@@ -52,12 +101,8 @@ describe("I want to chain multiple async-batch stages", () => {
           output: z.object({ firstResult: z.string() }),
           config: z.object({}),
         },
-        async execute(ctx) {
+        async execute() {
           executionLog.push("first-execute");
-          if (ctx.resumeState) {
-            executionLog.push("first-resume");
-            return { output: { firstResult: `processed-${ctx.input.value}` } };
-          }
           const now = new Date();
           return {
             suspended: true,
@@ -72,13 +117,14 @@ describe("I want to chain multiple async-batch stages", () => {
               maxWaitTime: 10000,
               nextPollAt: new Date(now.getTime() + 100),
             },
-          } as SimpleSuspendedResult;
+          };
         },
         async checkCompletion() {
-          return {
-            ready: firstComplete,
-            output: { firstResult: "batch-1-done" },
-          };
+          if (firstReady) {
+            executionLog.push("first-check-ready");
+            return { ready: true, output: { firstResult: "processed-test" } };
+          }
+          return { ready: false };
         },
       });
 
@@ -91,14 +137,8 @@ describe("I want to chain multiple async-batch stages", () => {
           output: z.object({ finalResult: z.string() }),
           config: z.object({}),
         },
-        async execute(ctx) {
+        async execute() {
           executionLog.push("second-execute");
-          if (ctx.resumeState) {
-            executionLog.push("second-resume");
-            return {
-              output: { finalResult: `final-${ctx.input.firstResult}` },
-            };
-          }
           const now = new Date();
           return {
             suspended: true,
@@ -113,13 +153,17 @@ describe("I want to chain multiple async-batch stages", () => {
               maxWaitTime: 10000,
               nextPollAt: new Date(now.getTime() + 100),
             },
-          } as SimpleSuspendedResult;
+          };
         },
         async checkCompletion() {
-          return {
-            ready: secondComplete,
-            output: { finalResult: "batch-2-done" },
-          };
+          if (secondReady) {
+            executionLog.push("second-check-ready");
+            return {
+              ready: true,
+              output: { finalResult: "final-processed-test" },
+            };
+          }
+          return { ready: false };
         },
       });
 
@@ -134,114 +178,83 @@ describe("I want to chain multiple async-batch stages", () => {
         .pipe(secondAsyncStage)
         .build();
 
-      // Create run
-      await persistence.createRun({
-        id: "run-chain-1",
+      const { kernel, flush, persistence, clock } = createTestKernel([
+        workflow,
+      ]);
+
+      // Create and claim run
+      const createResult = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "chain-1",
         workflowId: "chained-async",
-        workflowName: "Chained Async Workflow",
-        status: "PENDING",
         input: { value: "test" },
       });
+      await kernel.dispatch({ type: "run.claimPending", workerId: "w" });
+      await flush();
 
-      // When: First execution - should suspend on first stage
-      const executor1 = new WorkflowExecutor(
-        workflow,
-        "run-chain-1",
-        "chained-async",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
-      const result1 = await executor1.execute({ value: "test" }, {});
-
-      // Then: Suspended on first stage
-      expect(result1).toBe("suspended");
+      // Execute first stage -> suspends
+      const execResult1 = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: createResult.workflowRunId,
+        workflowId: "chained-async",
+        stageId: "first-async",
+        config: {},
+      });
+      expect(execResult1.outcome).toBe("suspended");
       expect(executionLog).toEqual(["first-execute"]);
 
-      // When: First stage completes and we resume
-      firstComplete = true;
-      const stages = await persistence.getStagesByRun("run-chain-1", {});
-      const firstStage = stages.find((s) => s.stageId === "first-async");
-      if (firstStage) {
-        await persistence.updateStage(firstStage.id, {
-          nextPollAt: new Date(Date.now() - 1000),
-        });
-      }
-
-      const executor2 = new WorkflowExecutor(
-        workflow,
-        "run-chain-1",
-        "chained-async",
-        {
-          persistence,
-          aiLogger,
-        },
+      // First stage completes via poll
+      firstReady = true;
+      const trans1 = await pollAndTransition(
+        kernel,
+        persistence,
+        clock,
+        createResult.workflowRunId,
+        "first-async",
       );
-      const result2 = await executor2.execute(
-        { value: "test" },
-        {},
-        { resume: true },
-      );
+      expect(trans1.action).toBe("advanced");
+      expect(executionLog).toContain("first-check-ready");
 
-      // Then: Should suspend on second stage
-      expect(result2).toBe("suspended");
-      expect(executionLog).toContain("first-resume");
+      // Execute second stage -> suspends
+      const execResult2 = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: createResult.workflowRunId,
+        workflowId: "chained-async",
+        stageId: "second-async",
+        config: {},
+      });
+      expect(execResult2.outcome).toBe("suspended");
       expect(executionLog).toContain("second-execute");
 
-      // When: Second stage completes and we resume
-      secondComplete = true;
-      const stages2 = await persistence.getStagesByRun("run-chain-1", {});
-      const secondStage = stages2.find((s) => s.stageId === "second-async");
-      if (secondStage) {
-        await persistence.updateStage(secondStage.id, {
-          nextPollAt: new Date(Date.now() - 1000),
-        });
-      }
-
-      const executor3 = new WorkflowExecutor(
-        workflow,
-        "run-chain-1",
-        "chained-async",
-        {
-          persistence,
-          aiLogger,
-        },
+      // Second stage completes via poll
+      secondReady = true;
+      const trans2 = await pollAndTransition(
+        kernel,
+        persistence,
+        clock,
+        createResult.workflowRunId,
+        "second-async",
       );
-      const result3 = await executor3.execute(
-        { value: "test" },
-        {},
-        { resume: true },
-      );
+      // No more stages -> completed
+      expect(trans2.action).toBe("completed");
+      expect(executionLog).toContain("second-check-ready");
 
-      // Then: Workflow completes
-      expect(result3).toEqual({ finalResult: "final-processed-test" });
-      expect(executionLog).toContain("second-resume");
+      // Workflow should be completed
+      const run = await persistence.getRun(createResult.workflowRunId);
+      expect(run!.status).toBe("COMPLETED");
     });
 
-    it("should track suspension count across multiple stages", async () => {
-      // Given: Workflow with tracking of suspension events
-      const suspendEvents: Array<{ stageId: string; stageName: string }> = [];
-      let stagesReady = new Set<string>();
+    it("should emit stage:suspended events for each async-batch stage", async () => {
+      let firstReady = false;
+      let secondReady = false;
 
-      const createTrackedAsyncStage = (
-        id: string,
-        inputSchema: z.ZodTypeAny,
-        outputSchema: z.ZodTypeAny,
-      ) => {
-        return defineAsyncBatchStage({
+      const createBatchStage = (id: string, schema: z.ZodTypeAny) =>
+        defineAsyncBatchStage({
           id,
           name: `Stage ${id}`,
           mode: "async-batch",
-          schemas: {
-            input: inputSchema,
-            output: outputSchema,
-            config: z.object({}),
-          },
-          async execute(ctx) {
-            if (ctx.resumeState) {
-              return { output: ctx.input };
-            }
+          schemas: { input: schema, output: schema, config: z.object({}) },
+          async execute() {
             const now = new Date();
             return {
               suspended: true,
@@ -256,104 +269,84 @@ describe("I want to chain multiple async-batch stages", () => {
                 maxWaitTime: 10000,
                 nextPollAt: new Date(now.getTime() + 100),
               },
-            } as SimpleSuspendedResult;
+            };
           },
           async checkCompletion() {
-            return { ready: stagesReady.has(id) };
+            const ready = id === "stage-a" ? firstReady : secondReady;
+            if (ready) return { ready: true, output: { value: "done" } };
+            return { ready: false };
           },
         });
-      };
 
+      const schema = z.object({ value: z.string() });
       const workflow = new WorkflowBuilder(
         "multi-suspend",
-        "Multi Suspend Workflow",
+        "Multi Suspend",
         "Test",
-        TestSchemas.string,
-        TestSchemas.string,
+        schema,
+        schema,
       )
-        .pipe(
-          createTrackedAsyncStage(
-            "stage-a",
-            TestSchemas.string,
-            TestSchemas.string,
-          ),
-        )
-        .pipe(
-          createTrackedAsyncStage(
-            "stage-b",
-            TestSchemas.string,
-            TestSchemas.string,
-          ),
-        )
-        .pipe(
-          createTrackedAsyncStage(
-            "stage-c",
-            TestSchemas.string,
-            TestSchemas.string,
-          ),
-        )
+        .pipe(createBatchStage("stage-a", schema))
+        .pipe(createBatchStage("stage-b", schema))
         .build();
 
-      await persistence.createRun({
-        id: "run-multi-suspend",
+      const { kernel, flush, persistence, clock, eventSink } = createTestKernel(
+        [workflow],
+      );
+
+      const createResult = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "multi-1",
         workflowId: "multi-suspend",
-        workflowName: "Multi Suspend Workflow",
-        status: "PENDING",
         input: { value: "data" },
       });
+      await kernel.dispatch({ type: "run.claimPending", workerId: "w" });
+      await flush();
+      eventSink.clear();
 
-      // Execute and track suspensions
-      const executeAndResume = async () => {
-        const executor = new WorkflowExecutor(
-          workflow,
-          "run-multi-suspend",
-          "multi-suspend",
-          { persistence, aiLogger },
-        );
-        executor.on("stage:suspended", (data) => {
-          suspendEvents.push(data as { stageId: string; stageName: string });
-        });
-        return executor.execute(
-          { value: "data" },
-          {},
-          { resume: suspendEvents.length > 0 },
-        );
-      };
+      // Execute stage-a -> suspended
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: createResult.workflowRunId,
+        workflowId: "multi-suspend",
+        stageId: "stage-a",
+        config: {},
+      });
+      await flush();
 
-      // First suspension
-      await executeAndResume();
-      expect(suspendEvents).toHaveLength(1);
-      expect(suspendEvents[0].stageId).toBe("stage-a");
+      const suspendedEventsA = eventSink.getByType("stage:suspended");
+      expect(suspendedEventsA).toHaveLength(1);
+      expect((suspendedEventsA[0] as any).stageId).toBe("stage-a");
 
-      // Resume stage-a, suspend on stage-b
-      stagesReady.add("stage-a");
-      const stages1 = await persistence.getStagesByRun("run-multi-suspend", {});
-      for (const stage of stages1) {
-        await persistence.updateStage(stage.id, {
-          nextPollAt: new Date(Date.now() - 1000),
-        });
-      }
-      await executeAndResume();
-      expect(suspendEvents).toHaveLength(2);
-      expect(suspendEvents[1].stageId).toBe("stage-b");
+      // Complete stage-a via poll, transition, execute stage-b
+      firstReady = true;
+      await pollAndTransition(
+        kernel,
+        persistence,
+        clock,
+        createResult.workflowRunId,
+        "stage-a",
+      );
 
-      // Resume stage-b, suspend on stage-c
-      stagesReady.add("stage-b");
-      const stages2 = await persistence.getStagesByRun("run-multi-suspend", {});
-      for (const stage of stages2) {
-        await persistence.updateStage(stage.id, {
-          nextPollAt: new Date(Date.now() - 1000),
-        });
-      }
-      await executeAndResume();
-      expect(suspendEvents).toHaveLength(3);
-      expect(suspendEvents[2].stageId).toBe("stage-c");
+      eventSink.clear();
+
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: createResult.workflowRunId,
+        workflowId: "multi-suspend",
+        stageId: "stage-b",
+        config: {},
+      });
+      await flush();
+
+      const suspendedEventsB = eventSink.getByType("stage:suspended");
+      expect(suspendedEventsB).toHaveLength(1);
+      expect((suspendedEventsB[0] as any).stageId).toBe("stage-b");
     });
   });
 
   describe("mixed sync and async-batch stages", () => {
     it("should execute sync stages before async-batch stage suspends", async () => {
-      // Given: Sync -> Async-batch -> Sync workflow
       const executionOrder: string[] = [];
 
       const syncFirst = defineStage({
@@ -379,12 +372,8 @@ describe("I want to chain multiple async-batch stages", () => {
           output: z.object({ value: z.string(), asyncProcessed: z.boolean() }),
           config: z.object({}),
         },
-        async execute(ctx) {
+        async execute() {
           executionOrder.push("async-middle");
-          if (ctx.resumeState) {
-            executionOrder.push("async-middle-resume");
-            return { output: { value: ctx.input.value, asyncProcessed: true } };
-          }
           const now = new Date();
           return {
             suspended: true,
@@ -399,12 +388,13 @@ describe("I want to chain multiple async-batch stages", () => {
               maxWaitTime: 10000,
               nextPollAt: new Date(now.getTime() + 100),
             },
-          } as SimpleSuspendedResult;
+          };
         },
         async checkCompletion() {
+          executionOrder.push("async-middle-check");
           return {
             ready: true,
-            output: { value: "async-done", asyncProcessed: true },
+            output: { value: "test", asyncProcessed: true },
           };
         },
       });
@@ -435,62 +425,80 @@ describe("I want to chain multiple async-batch stages", () => {
         .pipe(syncLast)
         .build();
 
-      await persistence.createRun({
-        id: "run-mixed",
+      const { kernel, flush, persistence, clock } = createTestKernel([
+        workflow,
+      ]);
+
+      const createResult = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "mixed-1",
         workflowId: "mixed-workflow",
-        workflowName: "Mixed Workflow",
-        status: "PENDING",
         input: { value: "test" },
       });
+      await kernel.dispatch({ type: "run.claimPending", workerId: "w" });
+      await flush();
 
-      // When: First execution
-      const executor1 = new WorkflowExecutor(
-        workflow,
-        "run-mixed",
-        "mixed-workflow",
-        {
-          persistence,
-          aiLogger,
-        },
+      // Execute sync-first -> completed
+      const exec1 = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: createResult.workflowRunId,
+        workflowId: "mixed-workflow",
+        stageId: "sync-first",
+        config: {},
+      });
+      expect(exec1.outcome).toBe("completed");
+      expect(executionOrder).toEqual(["sync-first"]);
+
+      // Transition to group 2 (async-middle)
+      const trans1 = await kernel.dispatch({
+        type: "run.transition",
+        workflowRunId: createResult.workflowRunId,
+      });
+      expect(trans1.action).toBe("advanced");
+
+      // Execute async-middle -> suspended
+      const exec2 = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: createResult.workflowRunId,
+        workflowId: "mixed-workflow",
+        stageId: "async-middle",
+        config: {},
+      });
+      expect(exec2.outcome).toBe("suspended");
+      expect(executionOrder).toContain("async-middle");
+
+      // Poll completes async-middle, then transition to group 3
+      const trans2 = await pollAndTransition(
+        kernel,
+        persistence,
+        clock,
+        createResult.workflowRunId,
+        "async-middle",
       );
-      const result1 = await executor1.execute({ value: "test" }, {});
+      expect(trans2.action).toBe("advanced");
+      expect(executionOrder).toContain("async-middle-check");
 
-      // Then: Sync first ran, async suspended
-      expect(result1).toBe("suspended");
-      expect(executionOrder).toEqual(["sync-first", "async-middle"]);
-
-      // When: Resume
-      const stages = await persistence.getStagesByRun("run-mixed", {});
-      const asyncStage = stages.find((s) => s.stageId === "async-middle");
-      if (asyncStage) {
-        await persistence.updateStage(asyncStage.id, {
-          nextPollAt: new Date(Date.now() - 1000),
-        });
-      }
-
-      const executor2 = new WorkflowExecutor(
-        workflow,
-        "run-mixed",
-        "mixed-workflow",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
-      const result2 = await executor2.execute(
-        { value: "test" },
-        {},
-        { resume: true },
-      );
-
-      // Then: All stages completed
-      expect(result2).toEqual({ finalValue: "final-test" });
-      expect(executionOrder).toContain("async-middle-resume");
+      // Execute sync-last -> completed
+      const exec3 = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: createResult.workflowRunId,
+        workflowId: "mixed-workflow",
+        stageId: "sync-last",
+        config: {},
+      });
+      expect(exec3.outcome).toBe("completed");
+      expect(exec3.output).toEqual({ finalValue: "final-test" });
       expect(executionOrder).toContain("sync-last");
+
+      // Final transition completes workflow
+      const trans3 = await kernel.dispatch({
+        type: "run.transition",
+        workflowRunId: createResult.workflowRunId,
+      });
+      expect(trans3.action).toBe("completed");
     });
 
-    it("should preserve sync stage outputs when async-batch suspends", async () => {
-      // Given: Sync stage that produces output used by later stages
+    it("should preserve sync stage output for async-batch stage input", async () => {
       const syncStage = defineStage({
         id: "data-producer",
         name: "Data Producer",
@@ -508,7 +516,6 @@ describe("I want to chain multiple async-batch stages", () => {
         },
       });
 
-      let resumeCount = 0;
       const asyncStage = defineAsyncBatchStage({
         id: "data-processor",
         name: "Data Processor",
@@ -518,13 +525,7 @@ describe("I want to chain multiple async-batch stages", () => {
           output: z.object({ sum: z.number() }),
           config: z.object({}),
         },
-        async execute(ctx) {
-          if (ctx.resumeState) {
-            resumeCount++;
-            // Should receive the data from sync stage
-            const sum = ctx.input.data.reduce((a, b) => a + b, 0);
-            return { output: { sum } };
-          }
+        async execute() {
           const now = new Date();
           return {
             suspended: true,
@@ -539,9 +540,10 @@ describe("I want to chain multiple async-batch stages", () => {
               maxWaitTime: 10000,
               nextPollAt: new Date(now.getTime() + 100),
             },
-          } as SimpleSuspendedResult;
+          };
         },
         async checkCompletion() {
+          // 10 + 20 + 30 = 60
           return { ready: true, output: { sum: 60 } };
         },
       });
@@ -557,63 +559,67 @@ describe("I want to chain multiple async-batch stages", () => {
         .pipe(asyncStage)
         .build();
 
-      await persistence.createRun({
-        id: "run-preserve",
+      const { kernel, flush, persistence, clock, blobStore } = createTestKernel(
+        [workflow],
+      );
+
+      const createResult = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "preserve-1",
         workflowId: "preserve-output",
-        workflowName: "Preserve Output Workflow",
-        status: "PENDING",
         input: { seed: 10 },
       });
+      await kernel.dispatch({ type: "run.claimPending", workerId: "w" });
+      await flush();
 
-      // Execute and suspend
-      const executor1 = new WorkflowExecutor(
-        workflow,
-        "run-preserve",
-        "preserve-output",
-        {
-          persistence,
-          aiLogger,
-        },
+      // Execute sync stage -> completed
+      const exec1 = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: createResult.workflowRunId,
+        workflowId: "preserve-output",
+        stageId: "data-producer",
+        config: {},
+      });
+      expect(exec1.outcome).toBe("completed");
+      expect(exec1.output).toEqual({ data: [10, 20, 30] });
+
+      // Transition
+      await kernel.dispatch({
+        type: "run.transition",
+        workflowRunId: createResult.workflowRunId,
+      });
+
+      // Execute async stage -> suspended
+      const exec2 = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: createResult.workflowRunId,
+        workflowId: "preserve-output",
+        stageId: "data-processor",
+        config: {},
+      });
+      expect(exec2.outcome).toBe("suspended");
+
+      // Poll completes it
+      const stages = await persistence.getStagesByRun(
+        createResult.workflowRunId,
       );
-      await executor1.execute({ seed: 10 }, {});
-
-      // Resume
-      const stages = await persistence.getStagesByRun("run-preserve", {});
       const asyncStageRecord = stages.find(
         (s) => s.stageId === "data-processor",
       );
-      if (asyncStageRecord) {
-        await persistence.updateStage(asyncStageRecord.id, {
-          nextPollAt: new Date(Date.now() - 1000),
-        });
-      }
+      await persistence.updateStage(asyncStageRecord!.id, {
+        nextPollAt: new Date(clock.now().getTime() - 1000),
+      });
 
-      const executor2 = new WorkflowExecutor(
-        workflow,
-        "run-preserve",
-        "preserve-output",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
-      const result = await executor2.execute(
-        { seed: 10 },
-        {},
-        { resume: true },
-      );
+      const pollResult = await kernel.dispatch({ type: "stage.pollSuspended" });
+      expect(pollResult.resumed).toBe(1);
 
-      // Then: Resume received correct data from sync stage
-      expect(resumeCount).toBe(1);
-      expect(result).toEqual({ sum: 60 }); // 10 + 20 + 30 = 60
+      // Output stored in blobStore
+      expect(blobStore.size()).toBeGreaterThan(0);
     });
   });
 
   describe("async-batch state management", () => {
-    it("should preserve custom metadata in suspended state across resume", async () => {
-      // Given: Stage that stores custom metadata
-      let capturedMetadata: Record<string, unknown> | undefined;
-
+    it("should preserve custom metadata in suspended state", async () => {
       const asyncStage = defineAsyncBatchStage({
         id: "metadata-stage",
         name: "Metadata Stage",
@@ -623,11 +629,7 @@ describe("I want to chain multiple async-batch stages", () => {
           output: z.object({ processed: z.boolean() }),
           config: z.object({}),
         },
-        async execute(ctx) {
-          if (ctx.resumeState) {
-            capturedMetadata = ctx.resumeState.metadata;
-            return { output: { processed: true } };
-          }
+        async execute() {
           const now = new Date();
           return {
             suspended: true,
@@ -647,9 +649,15 @@ describe("I want to chain multiple async-batch stages", () => {
               maxWaitTime: 10000,
               nextPollAt: new Date(now.getTime() + 100),
             },
-          } as SimpleSuspendedResult;
+          };
         },
-        async checkCompletion() {
+        async checkCompletion(state) {
+          // Verify metadata is preserved in the state passed to checkCompletion
+          expect(state.metadata).toEqual({
+            customField: "custom-value",
+            itemCount: 42,
+            tags: ["tag1", "tag2"],
+          });
           return { ready: true, output: { processed: true } };
         },
       });
@@ -664,59 +672,52 @@ describe("I want to chain multiple async-batch stages", () => {
         .pipe(asyncStage)
         .build();
 
-      await persistence.createRun({
-        id: "run-metadata",
+      const { kernel, flush, persistence, clock } = createTestKernel([
+        workflow,
+      ]);
+
+      const createResult = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "meta-1",
         workflowId: "metadata-workflow",
-        workflowName: "Metadata Workflow",
-        status: "PENDING",
         input: {},
       });
+      await kernel.dispatch({ type: "run.claimPending", workerId: "w" });
+      await flush();
 
-      // Execute and suspend
-      const executor1 = new WorkflowExecutor(
-        workflow,
-        "run-metadata",
-        "metadata-workflow",
-        {
-          persistence,
-          aiLogger,
-        },
+      // Execute -> suspends
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: createResult.workflowRunId,
+        workflowId: "metadata-workflow",
+        stageId: "metadata-stage",
+        config: {},
+      });
+
+      // Verify metadata is stored in persistence
+      const stages = await persistence.getStagesByRun(
+        createResult.workflowRunId,
       );
-      await executor1.execute({}, {});
-
-      // Resume
-      const stages = await persistence.getStagesByRun("run-metadata", {});
-      const stage = stages.find((s) => s.stageId === "metadata-stage");
-      if (stage) {
-        await persistence.updateStage(stage.id, {
-          nextPollAt: new Date(Date.now() - 1000),
-        });
-      }
-
-      const executor2 = new WorkflowExecutor(
-        workflow,
-        "run-metadata",
-        "metadata-workflow",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
-      await executor2.execute({}, {}, { resume: true });
-
-      // Then: Metadata was preserved
-      expect(capturedMetadata).toEqual({
+      const suspendedState = stages[0]!.suspendedState as any;
+      expect(suspendedState.metadata).toEqual({
         customField: "custom-value",
         itemCount: 42,
         tags: ["tag1", "tag2"],
       });
+
+      // Poll -> checkCompletion receives the state with metadata
+      await persistence.updateStage(stages[0]!.id, {
+        nextPollAt: new Date(clock.now().getTime() - 1000),
+      });
+
+      const pollResult = await kernel.dispatch({ type: "stage.pollSuspended" });
+      expect(pollResult.resumed).toBe(1);
     });
 
     it("should provide unique batch IDs for each stage in chain", async () => {
-      // Given: Multiple async stages that record their batch IDs
       const batchIds: string[] = [];
 
-      const createBatchIdStage = (id: string, order: number) => {
+      const createBatchIdStage = (id: string) => {
         return defineAsyncBatchStage({
           id,
           name: `Stage ${id}`,
@@ -726,10 +727,7 @@ describe("I want to chain multiple async-batch stages", () => {
             output: z.object({}).passthrough(),
             config: z.object({}),
           },
-          async execute(ctx) {
-            if (ctx.resumeState) {
-              return { output: {} };
-            }
+          async execute() {
             const batchId = `batch-${id}-${Date.now()}`;
             batchIds.push(batchId);
             const now = new Date();
@@ -746,7 +744,7 @@ describe("I want to chain multiple async-batch stages", () => {
                 maxWaitTime: 10000,
                 nextPollAt: new Date(now.getTime() + 100),
               },
-            } as SimpleSuspendedResult;
+            };
           },
           async checkCompletion() {
             return { ready: true, output: {} };
@@ -761,51 +759,51 @@ describe("I want to chain multiple async-batch stages", () => {
         z.object({}).passthrough(),
         z.object({}).passthrough(),
       )
-        .pipe(createBatchIdStage("stage-1", 1))
-        .pipe(createBatchIdStage("stage-2", 2))
+        .pipe(createBatchIdStage("stage-1"))
+        .pipe(createBatchIdStage("stage-2"))
         .build();
 
-      await persistence.createRun({
-        id: "run-batch-ids",
+      const { kernel, flush, persistence, clock } = createTestKernel([
+        workflow,
+      ]);
+
+      const createResult = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "unique-1",
         workflowId: "unique-batch-ids",
-        workflowName: "Unique Batch IDs Workflow",
-        status: "PENDING",
         input: {},
       });
+      await kernel.dispatch({ type: "run.claimPending", workerId: "w" });
+      await flush();
 
-      // Execute stage 1
-      const executor1 = new WorkflowExecutor(
-        workflow,
-        "run-batch-ids",
-        "unique-batch-ids",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
-      await executor1.execute({}, {});
+      // Execute stage-1 -> suspends
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: createResult.workflowRunId,
+        workflowId: "unique-batch-ids",
+        stageId: "stage-1",
+        config: {},
+      });
       expect(batchIds).toHaveLength(1);
 
-      // Resume and execute stage 2
-      const stages = await persistence.getStagesByRun("run-batch-ids", {});
-      for (const stage of stages) {
-        await persistence.updateStage(stage.id, {
-          nextPollAt: new Date(Date.now() - 1000),
-        });
-      }
-
-      const executor2 = new WorkflowExecutor(
-        workflow,
-        "run-batch-ids",
-        "unique-batch-ids",
-        {
-          persistence,
-          aiLogger,
-        },
+      // Poll, transition, execute stage-2
+      await pollAndTransition(
+        kernel,
+        persistence,
+        clock,
+        createResult.workflowRunId,
+        "stage-1",
       );
-      await executor2.execute({}, {}, { resume: true });
 
-      // Then: Each stage has unique batch ID
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: createResult.workflowRunId,
+        workflowId: "unique-batch-ids",
+        stageId: "stage-2",
+        config: {},
+      });
+
+      // Each stage has a unique batch ID
       expect(batchIds).toHaveLength(2);
       expect(batchIds[0]).not.toBe(batchIds[1]);
       expect(batchIds[0]).toContain("stage-1");

@@ -7,8 +7,10 @@
 
 import type {
   CreateLogInput,
+  CreateOutboxEventInput,
   CreateRunInput,
   CreateStageInput,
+  OutboxRecord,
   SaveArtifactInput,
   UpdateRunInput,
   UpdateStageInput,
@@ -20,6 +22,7 @@ import type {
   WorkflowStageStatus,
   WorkflowStatus,
 } from "../interface";
+import { StaleVersionError } from "../interface";
 import { createEnumHelper, type PrismaEnumHelper } from "./enum-compat";
 
 // Type for prisma client - using any to avoid dependency on specific prisma client
@@ -35,6 +38,17 @@ export interface PrismaWorkflowPersistenceOptions {
   databaseType?: DatabaseType;
 }
 
+const IDEMPOTENCY_IN_PROGRESS_MARKER = {
+  __workflowEngineState: "in_progress",
+};
+
+function isInProgressResult(result: unknown): boolean {
+  if (!result || typeof result !== "object") return false;
+  return (
+    (result as Record<string, unknown>).__workflowEngineState === "in_progress"
+  );
+}
+
 export class PrismaWorkflowPersistence implements WorkflowPersistence {
   private enums: PrismaEnumHelper;
   private databaseType: DatabaseType;
@@ -45,6 +59,20 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
   ) {
     this.enums = createEnumHelper(prisma);
     this.databaseType = options.databaseType ?? "postgresql";
+  }
+
+  async withTransaction<T>(
+    fn: (tx: WorkflowPersistence) => Promise<T>,
+  ): Promise<T> {
+    if (typeof this.prisma.$transaction !== "function") {
+      return fn(this);
+    }
+    return this.prisma.$transaction(async (tx: PrismaClient) => {
+      const txPersistence = new PrismaWorkflowPersistence(tx, {
+        databaseType: this.databaseType,
+      });
+      return fn(txPersistence);
+    });
   }
 
   // ============================================================================
@@ -69,18 +97,36 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
   }
 
   async updateRun(id: string, data: UpdateRunInput): Promise<void> {
-    await this.prisma.workflowRun.update({
-      where: { id },
+    const updateData = this.buildRunUpdateData(data);
+
+    if (data.expectedVersion === undefined) {
+      await this.prisma.workflowRun.update({
+        where: { id },
+        data: updateData,
+      });
+      return;
+    }
+
+    const result = await this.prisma.workflowRun.updateMany({
+      where: { id, version: data.expectedVersion },
       data: {
-        status: data.status ? this.enums.status(data.status) : undefined,
-        startedAt: data.startedAt,
-        completedAt: data.completedAt,
-        duration: data.duration,
-        output: data.output as unknown,
-        totalCost: data.totalCost,
-        totalTokens: data.totalTokens,
+        ...updateData,
+        version: { increment: 1 },
       },
     });
+
+    if (result.count === 0) {
+      const current = await this.prisma.workflowRun.findUnique({
+        where: { id },
+        select: { version: true },
+      });
+      throw new StaleVersionError(
+        "WorkflowRun",
+        id,
+        data.expectedVersion,
+        current?.version ?? -1,
+      );
+    }
   }
 
   async getRun(id: string): Promise<WorkflowRunRecord | null> {
@@ -264,10 +310,36 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
   }
 
   async updateStage(id: string, data: UpdateStageInput): Promise<void> {
-    await this.prisma.workflowStage.update({
-      where: { id },
-      data: this.buildStageUpdateData(data),
+    const updateData = this.buildStageUpdateData(data);
+
+    if (data.expectedVersion === undefined) {
+      await this.prisma.workflowStage.update({
+        where: { id },
+        data: updateData,
+      });
+      return;
+    }
+
+    const result = await this.prisma.workflowStage.updateMany({
+      where: { id, version: data.expectedVersion },
+      data: {
+        ...updateData,
+        version: { increment: 1 },
+      },
     });
+
+    if (result.count === 0) {
+      const current = await this.prisma.workflowStage.findUnique({
+        where: { id },
+        select: { version: true },
+      });
+      throw new StaleVersionError(
+        "WorkflowStage",
+        id,
+        data.expectedVersion,
+        current?.version ?? -1,
+      );
+    }
   }
 
   async updateStageByRunAndStageId(
@@ -275,12 +347,54 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     stageId: string,
     data: UpdateStageInput,
   ): Promise<void> {
-    await this.prisma.workflowStage.update({
+    const updateData = this.buildStageUpdateData(data);
+
+    if (data.expectedVersion === undefined) {
+      await this.prisma.workflowStage.update({
+        where: {
+          workflowRunId_stageId: { workflowRunId, stageId },
+        },
+        data: updateData,
+      });
+      return;
+    }
+
+    const result = await this.prisma.workflowStage.updateMany({
       where: {
-        workflowRunId_stageId: { workflowRunId, stageId },
+        workflowRunId,
+        stageId,
+        version: data.expectedVersion,
       },
-      data: this.buildStageUpdateData(data),
+      data: {
+        ...updateData,
+        version: { increment: 1 },
+      },
     });
+
+    if (result.count === 0) {
+      const current = await this.prisma.workflowStage.findFirst({
+        where: { workflowRunId, stageId },
+        select: { id: true, version: true },
+      });
+      throw new StaleVersionError(
+        "WorkflowStage",
+        current?.id ?? `${workflowRunId}/${stageId}`,
+        data.expectedVersion,
+        current?.version ?? -1,
+      );
+    }
+  }
+
+  private buildRunUpdateData(data: UpdateRunInput): Record<string, unknown> {
+    return {
+      status: data.status ? this.enums.status(data.status) : undefined,
+      startedAt: data.startedAt,
+      completedAt: data.completedAt,
+      duration: data.duration,
+      output: data.output as unknown,
+      totalCost: data.totalCost,
+      totalTokens: data.totalTokens,
+    };
   }
 
   private buildStageUpdateData(
@@ -543,6 +657,174 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
   }
 
   // ============================================================================
+  // Outbox Operations
+  // ============================================================================
+
+  async appendOutboxEvents(events: CreateOutboxEventInput[]): Promise<void> {
+    if (events.length === 0) return;
+
+    // Group by workflowRunId to assign sequences per-run
+    const byRun = new Map<string, CreateOutboxEventInput[]>();
+    for (const event of events) {
+      const list = byRun.get(event.workflowRunId) ?? [];
+      list.push(event);
+      byRun.set(event.workflowRunId, list);
+    }
+
+    const rows: Array<{
+      workflowRunId: string;
+      sequence: number;
+      eventType: string;
+      payload: unknown;
+      causationId: string;
+      occurredAt: Date;
+    }> = [];
+
+    for (const [workflowRunId, runEvents] of byRun) {
+      if (
+        this.databaseType === "postgresql" &&
+        typeof this.prisma.$executeRaw === "function"
+      ) {
+        // Serialize per-run sequence assignment inside the transaction.
+        await this.prisma.$executeRaw`
+          SELECT pg_advisory_xact_lock(hashtext(${workflowRunId}))
+        `;
+      }
+
+      // Get the current max sequence for this run
+      const maxResult = await this.prisma.outboxEvent.aggregate({
+        where: { workflowRunId },
+        _max: { sequence: true },
+      });
+      let seq = maxResult._max.sequence ?? 0;
+
+      for (const event of runEvents) {
+        seq++;
+        rows.push({
+          workflowRunId: event.workflowRunId,
+          sequence: seq,
+          eventType: event.eventType,
+          payload: event.payload as any,
+          causationId: event.causationId,
+          occurredAt: event.occurredAt,
+        });
+      }
+    }
+
+    await this.prisma.outboxEvent.createMany({ data: rows });
+  }
+
+  async getUnpublishedOutboxEvents(limit?: number): Promise<OutboxRecord[]> {
+    const effectiveLimit = limit ?? 100;
+    const records = await this.prisma.outboxEvent.findMany({
+      where: { publishedAt: null, dlqAt: null },
+      orderBy: [{ workflowRunId: "asc" }, { sequence: "asc" }],
+      take: effectiveLimit,
+    });
+    return records.map((r: any) => this.mapOutboxEvent(r));
+  }
+
+  async markOutboxEventsPublished(ids: string[]): Promise<void> {
+    if (ids.length === 0) return;
+    await this.prisma.outboxEvent.updateMany({
+      where: { id: { in: ids } },
+      data: { publishedAt: new Date() },
+    });
+  }
+
+  // ============================================================================
+  // Outbox DLQ Operations
+  // ============================================================================
+
+  async incrementOutboxRetryCount(id: string): Promise<number> {
+    const record = await this.prisma.outboxEvent.update({
+      where: { id },
+      data: { retryCount: { increment: 1 } },
+      select: { retryCount: true },
+    });
+    return record.retryCount;
+  }
+
+  async moveOutboxEventToDLQ(id: string): Promise<void> {
+    await this.prisma.outboxEvent.update({
+      where: { id },
+      data: { dlqAt: new Date() },
+    });
+  }
+
+  async replayDLQEvents(maxEvents: number): Promise<number> {
+    const dlqEvents = await this.prisma.outboxEvent.findMany({
+      where: { dlqAt: { not: null } },
+      take: maxEvents,
+      select: { id: true },
+    });
+
+    if (dlqEvents.length === 0) return 0;
+
+    const result = await this.prisma.outboxEvent.updateMany({
+      where: { id: { in: dlqEvents.map((e: any) => e.id) } },
+      data: { dlqAt: null, retryCount: 0 },
+    });
+    return result.count;
+  }
+
+  // ============================================================================
+  // Idempotency Operations
+  // ============================================================================
+
+  async acquireIdempotencyKey(
+    key: string,
+    commandType: string,
+  ): Promise<
+    | { status: "acquired" }
+    | { status: "replay"; result: unknown }
+    | { status: "in_progress" }
+  > {
+    try {
+      await this.prisma.idempotencyKey.create({
+        data: {
+          key,
+          commandType,
+          result: IDEMPOTENCY_IN_PROGRESS_MARKER as any,
+        },
+      });
+      return { status: "acquired" };
+    } catch (error: any) {
+      if (error?.code !== "P2002") {
+        throw error;
+      }
+    }
+
+    const existing = await this.prisma.idempotencyKey.findUnique({
+      where: { key_commandType: { key, commandType } },
+      select: { result: true },
+    });
+
+    if (!existing || isInProgressResult(existing.result)) {
+      return { status: "in_progress" };
+    }
+
+    return { status: "replay", result: existing.result };
+  }
+
+  async completeIdempotencyKey(
+    key: string,
+    commandType: string,
+    result: unknown,
+  ): Promise<void> {
+    await this.prisma.idempotencyKey.update({
+      where: { key_commandType: { key, commandType } },
+      data: { result: result as any },
+    });
+  }
+
+  async releaseIdempotencyKey(key: string, commandType: string): Promise<void> {
+    await this.prisma.idempotencyKey.deleteMany({
+      where: { key, commandType },
+    });
+  }
+
+  // ============================================================================
   // Type Mappers
   // ============================================================================
 
@@ -564,6 +846,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       totalCost: run.totalCost,
       totalTokens: run.totalTokens,
       priority: run.priority,
+      version: run.version ?? 0,
     };
   }
 
@@ -592,6 +875,22 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       metrics: stage.metrics,
       embeddingInfo: stage.embeddingInfo,
       errorMessage: stage.errorMessage,
+      version: stage.version ?? 0,
+    };
+  }
+
+  private mapOutboxEvent(record: any): OutboxRecord {
+    return {
+      id: record.id,
+      workflowRunId: record.workflowRunId,
+      sequence: record.sequence,
+      eventType: record.eventType,
+      payload: record.payload,
+      causationId: record.causationId,
+      occurredAt: record.occurredAt,
+      publishedAt: record.publishedAt,
+      retryCount: record.retryCount,
+      dlqAt: record.dlqAt,
     };
   }
 

@@ -10,10 +10,10 @@
 
 import { beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
-import type { WorkflowRegistry } from "../../core/stage-executor.js";
 import { defineStage } from "../../core/stage-factory.js";
 import type { Workflow } from "../../core/workflow.js";
 import { WorkflowBuilder } from "../../core/workflow.js";
+import type { WorkflowRegistry } from "../../kernel/kernel.js";
 import {
   InMemoryAICallLogger,
   InMemoryJobQueue,

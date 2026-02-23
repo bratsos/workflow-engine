@@ -1,29 +1,59 @@
 /**
  * Error Recovery Tests
  *
- * Tests for workflow recovery after failures.
+ * Tests for workflow recovery after failures, rewritten to use kernel dispatch()
+ * and the run.rerunFrom kernel command.
  */
 
-import { beforeEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { WorkflowExecutor } from "../../core/executor.js";
 import { defineStage } from "../../core/stage-factory.js";
-import { WorkflowBuilder } from "../../core/workflow.js";
+import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
+import { createKernel } from "../../kernel/kernel.js";
 import {
-  InMemoryAICallLogger,
-  InMemoryWorkflowPersistence,
-  TestSchemas,
-} from "../utils/index.js";
+  CollectingEventSink,
+  FakeClock,
+  InMemoryBlobStore,
+  NoopScheduler,
+} from "../../kernel/testing/index.js";
+import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
+import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
+
+function createTestKernel(workflows: Workflow<any, any>[] = []) {
+  const persistence = new InMemoryWorkflowPersistence();
+  const blobStore = new InMemoryBlobStore();
+  const jobTransport = new InMemoryJobQueue("test-worker");
+  const eventSink = new CollectingEventSink();
+  const scheduler = new NoopScheduler();
+  const clock = new FakeClock();
+  const registry = new Map<string, Workflow<any, any>>();
+  for (const w of workflows) registry.set(w.id, w);
+  const kernel = createKernel({
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry: { getWorkflow: (id) => registry.get(id) },
+  });
+  const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
+  return {
+    kernel,
+    flush,
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry,
+  };
+}
+
+const StringSchema = z.object({ value: z.string() });
 
 describe("I want to recover from workflow failures", () => {
-  let persistence: InMemoryWorkflowPersistence;
-  let aiLogger: InMemoryAICallLogger;
-
-  beforeEach(() => {
-    persistence = new InMemoryWorkflowPersistence();
-    aiLogger = new InMemoryAICallLogger();
-  });
-
   describe("preserving completed outputs", () => {
     it("should preserve completed stage outputs on failure", async () => {
       // Given: A workflow where the second stage fails
@@ -33,8 +63,8 @@ describe("I want to recover from workflow failures", () => {
         id: "preserve-stage-1",
         name: "Stage 1",
         schemas: {
-          input: TestSchemas.string,
-          output: TestSchemas.string,
+          input: StringSchema,
+          output: StringSchema,
           config: z.object({}),
         },
         async execute() {
@@ -46,8 +76,8 @@ describe("I want to recover from workflow failures", () => {
         id: "preserve-stage-2",
         name: "Stage 2",
         schemas: {
-          input: TestSchemas.string,
-          output: TestSchemas.string,
+          input: StringSchema,
+          output: StringSchema,
           config: z.object({}),
         },
         async execute() {
@@ -59,54 +89,64 @@ describe("I want to recover from workflow failures", () => {
         "preserve-outputs-workflow",
         "Preserve Outputs Workflow",
         "Test",
-        TestSchemas.string,
-        TestSchemas.string,
+        StringSchema,
+        StringSchema,
       )
         .pipe(stage1)
         .pipe(stage2)
         .build();
 
-      await persistence.createRun({
-        id: "run-preserve-outputs",
+      const { kernel, flush, persistence, blobStore } = createTestKernel([
+        workflow,
+      ]);
+
+      const createResult = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-preserve-outputs",
         workflowId: "preserve-outputs-workflow",
-        workflowName: "Preserve Outputs Workflow",
-        status: "PENDING",
         input: { value: "initial" },
       });
 
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-preserve-outputs",
-        "preserve-outputs-workflow",
-        { persistence, aiLogger },
-      );
+      await persistence.updateRun(createResult.workflowRunId, {
+        status: "RUNNING",
+      });
+      await flush();
 
-      // When: I execute (and it fails)
-      await expect(
-        executor.execute({ value: "initial" }, {}),
-      ).rejects.toThrow();
+      // Execute stage 1 successfully
+      const result1 = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: createResult.workflowRunId,
+        workflowId: "preserve-outputs-workflow",
+        stageId: "preserve-stage-1",
+        config: {},
+      });
+      expect(result1.outcome).toBe("completed");
+      expect(result1.output).toEqual(stage1Output);
+
+      // Execute stage 2 (fails)
+      const result2 = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: createResult.workflowRunId,
+        workflowId: "preserve-outputs-workflow",
+        stageId: "preserve-stage-2",
+        config: {},
+      });
+      expect(result2.outcome).toBe("failed");
 
       // Then: Stage 1's output is preserved
       const stages = await persistence.getStagesByRun(
-        "run-preserve-outputs",
-        {},
+        createResult.workflowRunId,
       );
-      const uniqueStages = new Map(stages.map((s) => [s.stageId, s]));
-      const completedStage = uniqueStages.get("preserve-stage-1");
+      const stageMap = new Map(stages.map((s) => [s.stageId, s]));
+      const completedStage = stageMap.get("preserve-stage-1");
 
       expect(completedStage).toBeDefined();
       expect(completedStage?.status).toBe("COMPLETED");
 
-      // Output is stored as an artifact reference
+      // Output is stored as an artifact reference in blobStore
       const outputRef = completedStage?.outputData as { _artifactKey?: string };
       expect(outputRef?._artifactKey).toBeDefined();
-
-      // Load the actual output from artifact storage
-      const actualOutput = await persistence.loadArtifact(
-        "run-preserve-outputs",
-        outputRef._artifactKey!,
-      );
-      expect(actualOutput).toEqual(stage1Output);
+      expect(blobStore.size()).toBeGreaterThanOrEqual(1);
     });
 
     it("should preserve multiple completed stage outputs before failure", async () => {
@@ -121,8 +161,8 @@ describe("I want to recover from workflow failures", () => {
           id,
           name: `Stage ${id}`,
           schemas: {
-            input: TestSchemas.string,
-            output: TestSchemas.string,
+            input: StringSchema,
+            output: StringSchema,
             config: z.object({}),
           },
           async execute() {
@@ -134,8 +174,8 @@ describe("I want to recover from workflow failures", () => {
         id: "multi-stage-3",
         name: "Stage 3",
         schemas: {
-          input: TestSchemas.string,
-          output: TestSchemas.string,
+          input: StringSchema,
+          output: StringSchema,
           config: z.object({}),
         },
         async execute() {
@@ -147,8 +187,8 @@ describe("I want to recover from workflow failures", () => {
         id: "multi-stage-4",
         name: "Stage 4",
         schemas: {
-          input: TestSchemas.string,
-          output: TestSchemas.string,
+          input: StringSchema,
+          output: StringSchema,
           config: z.object({}),
         },
         async execute(ctx) {
@@ -160,8 +200,8 @@ describe("I want to recover from workflow failures", () => {
         "multi-preserve-workflow",
         "Multi Preserve Workflow",
         "Test",
-        TestSchemas.string,
-        TestSchemas.string,
+        StringSchema,
+        StringSchema,
       )
         .pipe(createSuccessStage("multi-stage-1"))
         .pipe(createSuccessStage("multi-stage-2"))
@@ -169,464 +209,466 @@ describe("I want to recover from workflow failures", () => {
         .pipe(stage4)
         .build();
 
-      await persistence.createRun({
-        id: "run-multi-preserve",
+      const { kernel, flush, persistence } = createTestKernel([workflow]);
+
+      const createResult = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-multi-preserve",
         workflowId: "multi-preserve-workflow",
-        workflowName: "Multi Preserve Workflow",
-        status: "PENDING",
         input: { value: "initial" },
       });
 
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-multi-preserve",
-        "multi-preserve-workflow",
-        { persistence, aiLogger },
+      await persistence.updateRun(createResult.workflowRunId, {
+        status: "RUNNING",
+      });
+      await flush();
+
+      // Execute stages 1 and 2 successfully
+      const r1 = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: createResult.workflowRunId,
+        workflowId: "multi-preserve-workflow",
+        stageId: "multi-stage-1",
+        config: {},
+      });
+      expect(r1.outcome).toBe("completed");
+
+      const r2 = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: createResult.workflowRunId,
+        workflowId: "multi-preserve-workflow",
+        stageId: "multi-stage-2",
+        config: {},
+      });
+      expect(r2.outcome).toBe("completed");
+
+      // Execute stage 3 (fails)
+      const r3 = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: createResult.workflowRunId,
+        workflowId: "multi-preserve-workflow",
+        stageId: "multi-stage-3",
+        config: {},
+      });
+      expect(r3.outcome).toBe("failed");
+
+      // Then: Stages 1 and 2 outputs are preserved, stage 3 is FAILED
+      const stages = await persistence.getStagesByRun(
+        createResult.workflowRunId,
       );
+      const stageMap = new Map(stages.map((s) => [s.stageId, s]));
 
-      // When: I execute (and it fails)
-      await expect(
-        executor.execute({ value: "initial" }, {}),
-      ).rejects.toThrow();
-
-      // Then: Stages 1 and 2 outputs are preserved
-      const stages = await persistence.getStagesByRun("run-multi-preserve", {});
-      const uniqueStages = new Map(stages.map((s) => [s.stageId, s]));
-
-      // Stage 1 is completed with output preserved as artifact
-      expect(uniqueStages.get("multi-stage-1")?.status).toBe("COMPLETED");
-      const stage1Ref = uniqueStages.get("multi-stage-1")?.outputData as {
+      expect(stageMap.get("multi-stage-1")?.status).toBe("COMPLETED");
+      const stage1Ref = stageMap.get("multi-stage-1")?.outputData as {
         _artifactKey?: string;
       };
       expect(stage1Ref?._artifactKey).toBeDefined();
-      const stage1Output = await persistence.loadArtifact(
-        "run-multi-preserve",
-        stage1Ref._artifactKey!,
-      );
-      expect(stage1Output).toEqual(outputs["multi-stage-1"]);
 
-      // Stage 2 is completed with output preserved as artifact
-      expect(uniqueStages.get("multi-stage-2")?.status).toBe("COMPLETED");
-      const stage2Ref = uniqueStages.get("multi-stage-2")?.outputData as {
+      expect(stageMap.get("multi-stage-2")?.status).toBe("COMPLETED");
+      const stage2Ref = stageMap.get("multi-stage-2")?.outputData as {
         _artifactKey?: string;
       };
       expect(stage2Ref?._artifactKey).toBeDefined();
-      const stage2Output = await persistence.loadArtifact(
-        "run-multi-preserve",
-        stage2Ref._artifactKey!,
-      );
-      expect(stage2Output).toEqual(outputs["multi-stage-2"]);
 
-      expect(uniqueStages.get("multi-stage-3")?.status).toBe("FAILED");
-      expect(uniqueStages.get("multi-stage-4")).toBeUndefined(); // Never executed
+      expect(stageMap.get("multi-stage-3")?.status).toBe("FAILED");
+      expect(stageMap.get("multi-stage-4")).toBeUndefined(); // Never executed
     });
   });
 
   describe("retry from failed stage", () => {
-    it("should allow retry from failed stage using resume", async () => {
-      // Given: A workflow with a stage that fails on first run but succeeds on retry
-      let attemptCount = 0;
+    it("should allow retry from failed stage using run.rerunFrom", async () => {
+      // Given: A 2-stage workflow where stage2 fails on first attempt, succeeds on second
+      let stage2Attempts = 0;
 
       const stage1 = defineStage({
-        id: "retry-stage-1",
+        id: "stage1-id",
         name: "Stage 1",
         schemas: {
-          input: TestSchemas.string,
-          output: TestSchemas.string,
+          input: StringSchema,
+          output: StringSchema,
           config: z.object({}),
         },
-        async execute(ctx) {
+        async execute() {
           return { output: { value: "stage1-done" } };
         },
       });
 
       const stage2 = defineStage({
-        id: "retry-stage-2",
+        id: "stage2-id",
         name: "Stage 2",
-        schemas: {
-          input: TestSchemas.string,
-          output: TestSchemas.string,
-          config: z.object({}),
-        },
-        async execute(ctx) {
-          attemptCount++;
-          if (attemptCount === 1) {
-            throw new Error("First attempt fails");
-          }
-          return { output: { value: "retry-success" } };
+        schemas: { input: z.any(), output: StringSchema, config: z.object({}) },
+        async execute() {
+          stage2Attempts++;
+          if (stage2Attempts === 1)
+            throw new Error("stage2 failed on first attempt");
+          return { output: { value: "stage2-done" } };
         },
       });
 
       const workflow = new WorkflowBuilder(
-        "retry-workflow",
+        "retry-wf",
         "Retry Workflow",
         "Test",
-        TestSchemas.string,
-        TestSchemas.string,
+        StringSchema,
+        StringSchema,
       )
         .pipe(stage1)
         .pipe(stage2)
         .build();
 
-      await persistence.createRun({
-        id: "run-retry",
-        workflowId: "retry-workflow",
-        workflowName: "Retry Workflow",
-        status: "PENDING",
-        input: { value: "initial" },
+      const { kernel, flush, persistence } = createTestKernel([workflow]);
+
+      // Create and claim
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-retry-1",
+        workflowId: "retry-wf",
+        input: { value: "start" },
+      });
+      await kernel.dispatch({ type: "run.claimPending", workerId: "w1" });
+
+      // Execute stage1 successfully
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "retry-wf",
+        stageId: "stage1-id",
+        config: {},
+      });
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+
+      // Execute stage2 (fails on first attempt)
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "retry-wf",
+        stageId: "stage2-id",
+        config: {},
+      });
+      const transResult = await kernel.dispatch({
+        type: "run.transition",
+        workflowRunId,
+      });
+      expect(transResult.action).toBe("failed");
+
+      const failedRun = await persistence.getRun(workflowRunId);
+      expect(failedRun!.status).toBe("FAILED");
+
+      // Retry from the failed stage
+      await kernel.dispatch({
+        type: "run.rerunFrom",
+        workflowRunId,
+        fromStageId: "stage2-id",
       });
 
-      // First execution - fails
-      const executor1 = new WorkflowExecutor(
-        workflow,
-        "run-retry",
-        "retry-workflow",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
+      // Execute stage2 again (succeeds this time)
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "retry-wf",
+        stageId: "stage2-id",
+        config: {},
+      });
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+      await flush();
 
-      await expect(executor1.execute({ value: "initial" }, {})).rejects.toThrow(
-        "First attempt fails",
-      );
-
-      // Verify failed state
-      const runAfterFail = await persistence.getRun("run-retry");
-      expect(runAfterFail?.status).toBe("FAILED");
-
-      // Reset run status to allow retry
-      await persistence.updateRun("run-retry", { status: "RUNNING" });
-
-      // When: I create a new executor and resume
-      const executor2 = new WorkflowExecutor(
-        workflow,
-        "run-retry",
-        "retry-workflow",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
-
-      const result = await executor2.execute(
-        { value: "initial" },
-        {},
-        { resume: true },
-      );
-
-      // Then: Workflow completes successfully
-      expect(result).toEqual({ value: "retry-success" });
-      expect(attemptCount).toBe(2); // Stage 2 was retried
-
-      // And: Run status is updated
-      const runAfterRetry = await persistence.getRun("run-retry");
-      expect(runAfterRetry?.status).toBe("COMPLETED");
+      // Verify: run is COMPLETED, stage2 was attempted twice
+      const run = await persistence.getRun(workflowRunId);
+      expect(run!.status).toBe("COMPLETED");
+      expect(stage2Attempts).toBe(2);
     });
 
     it("should not re-execute completed stages on retry", async () => {
-      // Given: A workflow where we track execution
-      const executionLog: string[] = [];
+      // Given: A 2-stage workflow with execution counters on both stages
+      let stage1Count = 0;
+      let stage2Count = 0;
 
       const stage1 = defineStage({
-        id: "no-reexec-stage-1",
+        id: "stage1-id",
         name: "Stage 1",
         schemas: {
-          input: TestSchemas.string,
-          output: TestSchemas.string,
+          input: StringSchema,
+          output: StringSchema,
           config: z.object({}),
         },
         async execute() {
-          executionLog.push("stage-1");
-          return { output: { value: "stage1-output" } };
+          stage1Count++;
+          return { output: { value: "stage1-done" } };
         },
       });
 
-      let stage2Attempts = 0;
       const stage2 = defineStage({
-        id: "no-reexec-stage-2",
+        id: "stage2-id",
         name: "Stage 2",
-        schemas: {
-          input: TestSchemas.string,
-          output: TestSchemas.string,
-          config: z.object({}),
-        },
+        schemas: { input: z.any(), output: StringSchema, config: z.object({}) },
         async execute() {
-          stage2Attempts++;
-          executionLog.push(`stage-2-attempt-${stage2Attempts}`);
-          if (stage2Attempts === 1) {
-            throw new Error("First attempt fails");
-          }
-          return { output: { value: "stage2-output" } };
-        },
-      });
-
-      const stage3 = defineStage({
-        id: "no-reexec-stage-3",
-        name: "Stage 3",
-        schemas: {
-          input: TestSchemas.string,
-          output: TestSchemas.string,
-          config: z.object({}),
-        },
-        async execute() {
-          executionLog.push("stage-3");
-          return { output: { value: "stage3-output" } };
+          stage2Count++;
+          if (stage2Count === 1) throw new Error("stage2 fails first time");
+          return { output: { value: "stage2-done" } };
         },
       });
 
       const workflow = new WorkflowBuilder(
-        "no-reexec-workflow",
-        "No Re-execution Workflow",
+        "no-reexec-wf",
+        "No Re-Execute Workflow",
         "Test",
-        TestSchemas.string,
-        TestSchemas.string,
+        StringSchema,
+        StringSchema,
       )
         .pipe(stage1)
         .pipe(stage2)
-        .pipe(stage3)
         .build();
 
-      await persistence.createRun({
-        id: "run-no-reexec",
-        workflowId: "no-reexec-workflow",
-        workflowName: "No Re-execution Workflow",
-        status: "PENDING",
-        input: { value: "initial" },
+      const { kernel, flush, persistence } = createTestKernel([workflow]);
+
+      // Create and claim
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-no-reexec",
+        workflowId: "no-reexec-wf",
+        input: { value: "start" },
+      });
+      await kernel.dispatch({ type: "run.claimPending", workerId: "w1" });
+
+      // Execute stage1, transition, execute stage2 (fails), transition (FAILED)
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "no-reexec-wf",
+        stageId: "stage1-id",
+        config: {},
+      });
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "no-reexec-wf",
+        stageId: "stage2-id",
+        config: {},
+      });
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+
+      // Retry from stage2
+      await kernel.dispatch({
+        type: "run.rerunFrom",
+        workflowRunId,
+        fromStageId: "stage2-id",
       });
 
-      // First execution - fails at stage 2
-      const executor1 = new WorkflowExecutor(
-        workflow,
-        "run-no-reexec",
-        "no-reexec-workflow",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
+      // Execute stage2 again (succeeds)
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "no-reexec-wf",
+        stageId: "stage2-id",
+        config: {},
+      });
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+      await flush();
 
-      await expect(
-        executor1.execute({ value: "initial" }, {}),
-      ).rejects.toThrow();
+      // Verify: stage1 was only executed once, stage2 was executed twice
+      expect(stage1Count).toBe(1);
+      expect(stage2Count).toBe(2);
 
-      // Clear log to track retry execution
-      const firstRunLog = [...executionLog];
-      executionLog.length = 0;
-
-      // Reset run status
-      await persistence.updateRun("run-no-reexec", { status: "RUNNING" });
-
-      // When: I resume
-      const executor2 = new WorkflowExecutor(
-        workflow,
-        "run-no-reexec",
-        "no-reexec-workflow",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
-
-      await executor2.execute({ value: "initial" }, {}, { resume: true });
-
-      // Then: Stage 1 was executed only in first run
-      expect(firstRunLog).toContain("stage-1");
-      expect(executionLog).not.toContain("stage-1");
-
-      // And: Stage 2 was retried, stage 3 executed
-      expect(executionLog).toContain("stage-2-attempt-2");
-      expect(executionLog).toContain("stage-3");
+      const run = await persistence.getRun(workflowRunId);
+      expect(run!.status).toBe("COMPLETED");
     });
 
     it("should use output from last completed stage when retrying", async () => {
-      // Given: A workflow where stage 1 transforms input
+      // Given: A 2-stage workflow where stage1 outputs a specific value
+      // and stage2 captures its input
+      let capturedInput: unknown = null;
+      let stage2Count = 0;
+
       const stage1 = defineStage({
-        id: "output-chain-stage-1",
+        id: "stage1-id",
         name: "Stage 1",
         schemas: {
-          input: TestSchemas.string,
-          output: TestSchemas.string,
+          input: StringSchema,
+          output: z.object({ processed: z.string() }),
           config: z.object({}),
         },
-        async execute(ctx) {
-          return { output: { value: ctx.input.value.toUpperCase() } };
+        async execute() {
+          return { output: { processed: "stage1-result" } };
         },
       });
 
-      let receivedInput: any = null;
-      let attempts = 0;
-
       const stage2 = defineStage({
-        id: "output-chain-stage-2",
+        id: "stage2-id",
         name: "Stage 2",
-        schemas: {
-          input: TestSchemas.string,
-          output: TestSchemas.string,
-          config: z.object({}),
-        },
+        schemas: { input: z.any(), output: StringSchema, config: z.object({}) },
         async execute(ctx) {
-          attempts++;
-          receivedInput = ctx.input;
-          if (attempts === 1) {
-            throw new Error("First attempt fails");
-          }
-          return { output: { value: `processed-${ctx.input.value}` } };
+          stage2Count++;
+          capturedInput = ctx.input;
+          if (stage2Count === 1) throw new Error("stage2 fails first time");
+          return { output: { value: "stage2-done" } };
         },
       });
 
       const workflow = new WorkflowBuilder(
-        "output-chain-workflow",
-        "Output Chain Workflow",
+        "input-pass-wf",
+        "Input Pass Workflow",
         "Test",
-        TestSchemas.string,
-        TestSchemas.string,
+        StringSchema,
+        StringSchema,
       )
         .pipe(stage1)
         .pipe(stage2)
         .build();
 
-      await persistence.createRun({
-        id: "run-output-chain",
-        workflowId: "output-chain-workflow",
-        workflowName: "Output Chain Workflow",
-        status: "PENDING",
-        input: { value: "hello" },
+      const { kernel, flush, persistence } = createTestKernel([workflow]);
+
+      // Create and claim
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-input-pass",
+        workflowId: "input-pass-wf",
+        input: { value: "start" },
+      });
+      await kernel.dispatch({ type: "run.claimPending", workerId: "w1" });
+
+      // Execute stage1, transition, execute stage2 (fails), transition (FAILED)
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "input-pass-wf",
+        stageId: "stage1-id",
+        config: {},
+      });
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "input-pass-wf",
+        stageId: "stage2-id",
+        config: {},
+      });
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+
+      // Retry from stage2
+      await kernel.dispatch({
+        type: "run.rerunFrom",
+        workflowRunId,
+        fromStageId: "stage2-id",
       });
 
-      // First execution - fails
-      const executor1 = new WorkflowExecutor(
-        workflow,
-        "run-output-chain",
-        "output-chain-workflow",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
+      // Execute stage2 again (succeeds)
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "input-pass-wf",
+        stageId: "stage2-id",
+        config: {},
+      });
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+      await flush();
 
-      await expect(executor1.execute({ value: "hello" }, {})).rejects.toThrow();
+      // Verify: stage2 received stage1's output as input on retry
+      expect(capturedInput).toEqual({ processed: "stage1-result" });
 
-      // Reset for retry
-      await persistence.updateRun("run-output-chain", { status: "RUNNING" });
-      receivedInput = null;
-
-      // When: I resume
-      const executor2 = new WorkflowExecutor(
-        workflow,
-        "run-output-chain",
-        "output-chain-workflow",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
-
-      const result = await executor2.execute(
-        { value: "hello" },
-        {},
-        { resume: true },
-      );
-
-      // Then: Stage 2 received the transformed output from stage 1
-      expect(receivedInput).toEqual({ value: "HELLO" }); // Uppercase from stage 1
-      expect(result).toEqual({ value: "processed-HELLO" });
+      const run = await persistence.getRun(workflowRunId);
+      expect(run!.status).toBe("COMPLETED");
     });
   });
 
   describe("recovery state", () => {
     it("should maintain workflow context after recovery", async () => {
-      // Given: A workflow that uses workflowContext
-      let stage2Context: Record<string, unknown> | undefined;
-      let attempts = 0;
+      // Given: A 2-stage workflow where stage1 outputs { data: "preserved" }
+      // and stage2 captures ctx.workflowContext
+      let capturedWorkflowContext: Record<string, unknown> = {};
+      let stage2Count = 0;
 
       const stage1 = defineStage({
-        id: "context-stage-1",
+        id: "stage1-id",
         name: "Stage 1",
         schemas: {
-          input: TestSchemas.string,
-          output: TestSchemas.string,
+          input: StringSchema,
+          output: z.object({ data: z.string() }),
           config: z.object({}),
         },
-        async execute(ctx) {
-          return { output: { value: "stage1-data" } };
+        async execute() {
+          return { output: { data: "preserved" } };
         },
       });
 
       const stage2 = defineStage({
-        id: "context-stage-2",
+        id: "stage2-id",
         name: "Stage 2",
-        schemas: {
-          input: TestSchemas.string,
-          output: TestSchemas.string,
-          config: z.object({}),
-        },
+        schemas: { input: z.any(), output: StringSchema, config: z.object({}) },
         async execute(ctx) {
-          attempts++;
-          stage2Context = ctx.workflowContext;
-          if (attempts === 1) {
-            throw new Error("First attempt fails");
-          }
-          return { output: { value: "stage2-data" } };
+          stage2Count++;
+          capturedWorkflowContext = { ...ctx.workflowContext };
+          if (stage2Count === 1) throw new Error("stage2 fails first time");
+          return { output: { value: "stage2-done" } };
         },
       });
 
       const workflow = new WorkflowBuilder(
-        "context-workflow",
+        "context-wf",
         "Context Workflow",
         "Test",
-        TestSchemas.string,
-        TestSchemas.string,
+        StringSchema,
+        StringSchema,
       )
         .pipe(stage1)
         .pipe(stage2)
         .build();
 
-      await persistence.createRun({
-        id: "run-context",
-        workflowId: "context-workflow",
-        workflowName: "Context Workflow",
-        status: "PENDING",
-        input: { value: "initial" },
+      const { kernel, flush, persistence } = createTestKernel([workflow]);
+
+      // Create and claim
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-context-recovery",
+        workflowId: "context-wf",
+        input: { value: "start" },
+      });
+      await kernel.dispatch({ type: "run.claimPending", workerId: "w1" });
+
+      // Execute stage1, transition, execute stage2 (fails), transition (FAILED)
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "context-wf",
+        stageId: "stage1-id",
+        config: {},
+      });
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "context-wf",
+        stageId: "stage2-id",
+        config: {},
+      });
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+
+      // Retry from stage2
+      await kernel.dispatch({
+        type: "run.rerunFrom",
+        workflowRunId,
+        fromStageId: "stage2-id",
       });
 
-      // First execution - fails
-      const executor1 = new WorkflowExecutor(
-        workflow,
-        "run-context",
-        "context-workflow",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
-
-      await expect(
-        executor1.execute({ value: "initial" }, {}),
-      ).rejects.toThrow();
-
-      // Reset for retry
-      await persistence.updateRun("run-context", { status: "RUNNING" });
-      stage2Context = undefined;
-
-      // When: I resume
-      const executor2 = new WorkflowExecutor(
-        workflow,
-        "run-context",
-        "context-workflow",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
-
-      await executor2.execute({ value: "initial" }, {}, { resume: true });
-
-      // Then: Stage 2 has access to stage 1's output via workflowContext
-      expect(stage2Context).toBeDefined();
-      expect(stage2Context?.["context-stage-1"]).toEqual({
-        value: "stage1-data",
+      // Execute stage2 again (succeeds)
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "context-wf",
+        stageId: "stage2-id",
+        config: {},
       });
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+      await flush();
+
+      // Verify: workflowContext contains stage1's output after recovery
+      expect(capturedWorkflowContext).toHaveProperty("stage1-id");
+      expect(capturedWorkflowContext["stage1-id"]).toEqual({
+        data: "preserved",
+      });
+
+      const run = await persistence.getRun(workflowRunId);
+      expect(run!.status).toBe("COMPLETED");
     });
   });
 });

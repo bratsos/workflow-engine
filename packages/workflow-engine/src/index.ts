@@ -28,10 +28,8 @@ export {
 } from "./core/workflow";
 
 // =============================================================================
-// Internal/Advanced Exports
+// Advanced Exports
 // =============================================================================
-// These are considered internal implementation details. Most users should use
-// WorkflowRuntime as the primary API instead of these lower-level components.
 
 // AI Helper
 export {
@@ -77,31 +75,22 @@ export {
   printAvailableModels,
   registerModels,
 } from "./ai/model-helper";
-/**
- * @internal
- * WorkflowExecutor - Low-level executor for running workflows directly.
- * For most use cases, use WorkflowRuntime instead.
- */
-export { WorkflowExecutor } from "./core/executor";
-/**
- * @internal
- * StageExecutor - Low-level executor for running individual stages.
- * Used internally by WorkflowRuntime for distributed execution.
- */
+export type {
+  AIConfig,
+  ConcurrencyConfig,
+  DebugConfig,
+  FeatureFlagsConfig,
+} from "./core/config-presets";
 export {
-  type StageExecutionRequest,
-  type StageExecutionResult,
-  StageExecutor,
-  type WorkflowRegistry,
-} from "./core/stage-executor";
-export {
-  createStorage,
-  getDefaultStorageProvider,
-} from "./core/storage-factory";
-export {
-  type PgNotifyLike,
-  workflowEventBus,
-} from "./core/workflow-event-bus.server";
+  AIConfigSchema,
+  ConcurrencyConfigSchema,
+  DebugConfigSchema,
+  FeatureFlagsConfigSchema,
+  withAIConfig,
+  withConcurrency,
+  withFeatureFlags,
+  withStandardConfig,
+} from "./core/config-presets";
 export type {
   WorkflowEventType,
   WorkflowSSEEvent,
@@ -146,14 +135,6 @@ export {
   PrismaJobQueue,
   PrismaWorkflowPersistence,
 } from "./persistence";
-// Workflow Runtime (unified scheduling + orchestration)
-export {
-  type CreateRunOptions,
-  type CreateRunResult,
-  createWorkflowRuntime,
-  WorkflowRuntime,
-  type WorkflowRuntimeConfig,
-} from "./runtime";
 // Batch Model Mapping
 export {
   getBestProviderForModel,
@@ -190,3 +171,65 @@ export type {
   RawBatchResult,
   SerializedBatch,
 } from "./utils/batch/types";
+
+// =============================================================================
+// Kernel API (Phase 1)
+// =============================================================================
+
+export type {
+  CommandResult,
+  JobExecuteCommand,
+  JobExecuteResult,
+  KernelCommand,
+  KernelCommandType,
+  LeaseReapStaleCommand,
+  LeaseReapStaleResult,
+  OutboxFlushCommand,
+  OutboxFlushResult,
+  PluginReplayDLQCommand,
+  PluginReplayDLQResult,
+  RunCancelCommand,
+  RunCancelResult,
+  RunClaimPendingCommand,
+  RunClaimPendingResult,
+  RunCreateCommand,
+  RunCreateResult,
+  RunRerunFromCommand,
+  RunRerunFromResult,
+  RunTransitionCommand,
+  RunTransitionResult,
+  StagePollSuspendedCommand,
+  StagePollSuspendedResult,
+} from "./kernel/commands";
+export { IdempotencyInProgressError } from "./kernel/errors";
+export type {
+  KernelEvent,
+  KernelEventType,
+} from "./kernel/events";
+export {
+  createKernel,
+  type Kernel,
+  type KernelConfig,
+  type WorkflowRegistry as KernelWorkflowRegistry,
+} from "./kernel/kernel";
+export {
+  createPluginRunner,
+  definePlugin,
+  type PluginDefinition,
+  type PluginRunner,
+  type PluginRunnerConfig,
+} from "./kernel/plugins";
+export type {
+  BlobStore,
+  Clock,
+  EventSink,
+  JobTransport,
+  Persistence,
+  Scheduler,
+} from "./kernel/ports";
+export type {
+  CreateOutboxEventInput,
+  IdempotencyRecord,
+  OutboxRecord,
+} from "./persistence/interface";
+export { StaleVersionError } from "./persistence/interface";

@@ -1,63 +1,78 @@
 /**
- * Orchestrator Behavior Tests
+ * Orchestrator Behavior Tests (Kernel)
  *
- * Tests for WorkflowRuntime orchestration logic.
- * Note: WorkflowRuntime is the orchestrator in this workflow engine.
+ * Tests for kernel orchestration logic (run.create, run.transition, run.claimPending).
+ * Migrated from WorkflowRuntime to kernel dispatch API.
  */
 
-import { beforeEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import type { Workflow } from "../../core/workflow.js";
-import { WorkflowBuilder } from "../../core/workflow.js";
+import { defineStage } from "../../core/stage-factory.js";
+import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
+import { createKernel } from "../../kernel/kernel.js";
 import {
-  WorkflowRuntime,
-  type WorkflowRuntimeConfig,
-} from "../../runtime/index.js";
-import { InMemoryJobQueue } from "../utils/in-memory-job-queue.js";
-import {
-  createPassthroughStage,
-  InMemoryAICallLogger,
-  InMemoryWorkflowPersistence,
-  TestSchemas,
-} from "../utils/index.js";
+  CollectingEventSink,
+  FakeClock,
+  InMemoryBlobStore,
+  NoopScheduler,
+} from "../../kernel/testing/index.js";
+import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
+import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
+
+function createPassthroughStage(id: string, schema: z.ZodTypeAny) {
+  return defineStage({
+    id,
+    name: `Stage ${id}`,
+    schemas: { input: schema, output: schema, config: z.object({}) },
+    async execute(ctx) {
+      return { output: ctx.input };
+    },
+  });
+}
+
+const StringSchema = z.object({ value: z.string() });
+
+function createTestKernel(workflows: Workflow<any, any>[] = []) {
+  const persistence = new InMemoryWorkflowPersistence();
+  const blobStore = new InMemoryBlobStore();
+  const jobTransport = new InMemoryJobQueue("test-worker");
+  const eventSink = new CollectingEventSink();
+  const scheduler = new NoopScheduler();
+  const clock = new FakeClock();
+  const registry = new Map<string, Workflow<any, any>>();
+  for (const w of workflows) registry.set(w.id, w);
+  const kernel = createKernel({
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry: { getWorkflow: (id) => registry.get(id) },
+  });
+  const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
+  return {
+    kernel,
+    flush,
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry,
+  };
+}
 
 describe("I want orchestrator to manage workflow state", () => {
-  let persistence: InMemoryWorkflowPersistence;
-  let aiLogger: InMemoryAICallLogger;
-  let jobQueue: InMemoryJobQueue;
-  let registry: Map<string, Workflow<any, any>>;
-
-  beforeEach(() => {
-    persistence = new InMemoryWorkflowPersistence();
-    aiLogger = new InMemoryAICallLogger();
-    jobQueue = new InMemoryJobQueue("worker-test");
-    registry = new Map();
-  });
-
-  function createRuntime(overrides: Partial<WorkflowRuntimeConfig> = {}) {
-    return new WorkflowRuntime({
-      persistence,
-      jobQueue,
-      registry: {
-        getWorkflow: (id: string) => registry.get(id),
-      },
-      aiCallLogger: aiLogger,
-      pollIntervalMs: 100,
-      jobPollIntervalMs: 50,
-      staleJobThresholdMs: 5000,
-      ...overrides,
-    });
-  }
-
   describe("workflow creation", () => {
     it("should validate workflow exists in registry before creating run", async () => {
-      // Given: A runtime with an empty registry
-      const runtime = createRuntime();
+      const { kernel } = createTestKernel([]);
 
-      // When: I try to create a run for unknown workflow
-      // Then: It throws
       await expect(
-        runtime.createRun({
+        kernel.dispatch({
+          type: "run.create",
+          idempotencyKey: "key-1",
           workflowId: "unknown-workflow",
           input: { value: "test" },
         }),
@@ -65,25 +80,26 @@ describe("I want orchestrator to manage workflow state", () => {
     });
 
     it("should validate input against workflow schema", async () => {
-      // Given: A workflow with specific input schema
-      const stage = createPassthroughStage("process", TestSchemas.string);
+      const stage = createPassthroughStage(
+        "process",
+        z.object({ requiredField: z.string() }),
+      );
       const workflow = new WorkflowBuilder(
         "validated-workflow",
         "Validated Workflow",
         "Test",
         z.object({ requiredField: z.string() }),
-        TestSchemas.string,
+        z.object({ requiredField: z.string() }),
       )
         .pipe(stage)
         .build();
 
-      registry.set("validated-workflow", workflow);
-      const runtime = createRuntime();
+      const { kernel } = createTestKernel([workflow]);
 
-      // When: I try to create with invalid input
-      // Then: It throws
       await expect(
-        runtime.createRun({
+        kernel.dispatch({
+          type: "run.create",
+          idempotencyKey: "key-1",
           workflowId: "validated-workflow",
           input: { wrongField: "test" },
         }),
@@ -91,28 +107,26 @@ describe("I want orchestrator to manage workflow state", () => {
     });
 
     it("should create workflow run in PENDING status", async () => {
-      // Given: A valid workflow
-      const stage = createPassthroughStage("process", TestSchemas.string);
+      const stage = createPassthroughStage("process", StringSchema);
       const workflow = new WorkflowBuilder(
         "test-workflow",
         "Test Workflow",
         "Test",
-        TestSchemas.string,
-        TestSchemas.string,
+        StringSchema,
+        StringSchema,
       )
         .pipe(stage)
         .build();
 
-      registry.set("test-workflow", workflow);
-      const runtime = createRuntime();
+      const { kernel, persistence } = createTestKernel([workflow]);
 
-      // When: I create a run
-      const result = await runtime.createRun({
+      const result = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-1",
         workflowId: "test-workflow",
         input: { value: "test" },
       });
 
-      // Then: Run is created in PENDING status
       expect(result.workflowRunId).toBeDefined();
 
       const run = await persistence.getRun(result.workflowRunId);
@@ -122,313 +136,265 @@ describe("I want orchestrator to manage workflow state", () => {
     });
 
     it("should merge default config with provided config", async () => {
-      // Given: A workflow with default config
-      const configuredStage = {
+      const configuredStage = defineStage({
         id: "configured",
         name: "Configured Stage",
-        description: "Stage with config",
-        inputSchema: TestSchemas.string,
-        outputSchema: TestSchemas.string,
-        configSchema: z.object({
-          setting: z.string().default("default-value"),
-        }),
-        execute: async (ctx: any) => ({ output: ctx.input }),
-      };
+        schemas: {
+          input: StringSchema,
+          output: StringSchema,
+          config: z.object({ setting: z.string().default("default-value") }),
+        },
+        async execute(ctx) {
+          return { output: ctx.input };
+        },
+      });
 
       const workflow = new WorkflowBuilder(
         "config-workflow",
         "Config Workflow",
         "Test",
-        TestSchemas.string,
-        TestSchemas.string,
+        StringSchema,
+        StringSchema,
       )
-        .pipe(configuredStage as any)
+        .pipe(configuredStage)
         .build();
 
-      registry.set("config-workflow", workflow);
-      const runtime = createRuntime();
+      const { kernel, persistence } = createTestKernel([workflow]);
 
-      // When: I create with partial config
-      const result = await runtime.createRun({
+      const result = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-1",
         workflowId: "config-workflow",
         input: { value: "test" },
         config: { configured: { setting: "custom-value" } },
       });
 
-      // Then: Config is stored
       const run = await persistence.getRun(result.workflowRunId);
       expect(run?.config).toEqual({ configured: { setting: "custom-value" } });
     });
 
     it("should respect custom priority", async () => {
-      // Given: A workflow
-      const stage = createPassthroughStage("process", TestSchemas.string);
+      const stage = createPassthroughStage("process", StringSchema);
       const workflow = new WorkflowBuilder(
         "priority-workflow",
         "Priority Workflow",
         "Test",
-        TestSchemas.string,
-        TestSchemas.string,
+        StringSchema,
+        StringSchema,
       )
         .pipe(stage)
         .build();
 
-      registry.set("priority-workflow", workflow);
-      const runtime = createRuntime();
+      const { kernel, persistence } = createTestKernel([workflow]);
 
-      // When: I create with custom priority
-      const result = await runtime.createRun({
+      const result = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-1",
         workflowId: "priority-workflow",
         input: { value: "test" },
         priority: 10,
       });
 
-      // Then: Priority is stored
       const run = await persistence.getRun(result.workflowRunId);
       expect(run?.priority).toBe(10);
-    });
-
-    it("should use priority function when no explicit priority given", async () => {
-      // Given: A runtime with priority function
-      const stage = createPassthroughStage("process", TestSchemas.string);
-      const workflow = new WorkflowBuilder(
-        "auto-priority-workflow",
-        "Auto Priority Workflow",
-        "Test",
-        TestSchemas.string,
-        TestSchemas.string,
-      )
-        .pipe(stage)
-        .build();
-
-      registry.set("auto-priority-workflow", workflow);
-
-      const runtime = createRuntime({
-        getWorkflowPriority: (workflowId: string) => {
-          if (workflowId === "auto-priority-workflow") return 8;
-          return 5;
-        },
-      });
-
-      // When: I create without explicit priority
-      const result = await runtime.createRun({
-        workflowId: "auto-priority-workflow",
-        input: { value: "test" },
-      });
-
-      // Then: Priority function is used
-      const run = await persistence.getRun(result.workflowRunId);
-      expect(run?.priority).toBe(8);
     });
   });
 
   describe("workflow transition", () => {
     it("should transition completed workflow stages", async () => {
-      // Given: A multi-stage workflow
-      const stage1 = createPassthroughStage("stage-1", TestSchemas.string);
-      const stage2 = createPassthroughStage("stage-2", TestSchemas.string);
+      const stage1 = createPassthroughStage("stage-1", StringSchema);
+      const stage2 = createPassthroughStage("stage-2", StringSchema);
 
       const workflow = new WorkflowBuilder(
         "multi-stage",
         "Multi Stage Workflow",
         "Test",
-        TestSchemas.string,
-        TestSchemas.string,
+        StringSchema,
+        StringSchema,
       )
         .pipe(stage1)
         .pipe(stage2)
         .build();
 
-      registry.set("multi-stage", workflow);
-      const runtime = createRuntime();
+      const { kernel, persistence, jobTransport } = createTestKernel([
+        workflow,
+      ]);
 
-      // Create run and first stage
-      await persistence.createRun({
-        id: "run-1",
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-1",
         workflowId: "multi-stage",
-        workflowName: "Multi Stage Workflow",
         input: { value: "test" },
       });
 
+      await persistence.updateRun(workflowRunId, { status: "RUNNING" });
       await persistence.createStage({
-        workflowRunId: "run-1",
+        workflowRunId,
         stageId: "stage-1",
-        stageName: "Stage 1",
+        stageName: "Stage stage-1",
         stageNumber: 1,
         executionGroup: 1,
         status: "COMPLETED",
       });
 
-      await persistence.updateRun("run-1", { status: "RUNNING" });
+      const result = await kernel.dispatch({
+        type: "run.transition",
+        workflowRunId,
+      });
 
-      // When: I trigger transition
-      await runtime.transitionWorkflow("run-1");
-
-      // Then: Jobs for next stage are enqueued
-      const pendingJobs = jobQueue.getJobsByStatus("PENDING");
-      expect(pendingJobs).toHaveLength(1);
-      expect(pendingJobs[0]?.stageId).toBe("stage-2");
+      expect(result.action).toBe("advanced");
+      expect(jobTransport.getAllJobs()).toHaveLength(1);
     });
 
     it("should not transition while stages are still active", async () => {
-      // Given: A workflow with an active stage
-      const stage1 = createPassthroughStage("stage-1", TestSchemas.string);
-      const stage2 = createPassthroughStage("stage-2", TestSchemas.string);
+      const stage1 = createPassthroughStage("stage-1", StringSchema);
+      const stage2 = createPassthroughStage("stage-2", StringSchema);
 
       const workflow = new WorkflowBuilder(
         "active-workflow",
         "Active Workflow",
         "Test",
-        TestSchemas.string,
-        TestSchemas.string,
+        StringSchema,
+        StringSchema,
       )
         .pipe(stage1)
         .pipe(stage2)
         .build();
 
-      registry.set("active-workflow", workflow);
-      const runtime = createRuntime();
+      const { kernel, persistence } = createTestKernel([workflow]);
 
-      await persistence.createRun({
-        id: "run-active",
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-1",
         workflowId: "active-workflow",
-        workflowName: "Active Workflow",
         input: { value: "test" },
       });
 
+      await persistence.updateRun(workflowRunId, { status: "RUNNING" });
       await persistence.createStage({
-        workflowRunId: "run-active",
+        workflowRunId,
         stageId: "stage-1",
-        stageName: "Stage 1",
+        stageName: "Stage stage-1",
         stageNumber: 1,
         executionGroup: 1,
-        status: "RUNNING", // Still running
+        status: "RUNNING",
       });
 
-      await persistence.updateRun("run-active", { status: "RUNNING" });
+      const result = await kernel.dispatch({
+        type: "run.transition",
+        workflowRunId,
+      });
 
-      // When: I try to transition
-      await runtime.transitionWorkflow("run-active");
-
-      // Then: No new jobs enqueued
-      const pendingJobs = jobQueue.getJobsByStatus("PENDING");
-      expect(pendingJobs).toHaveLength(0);
+      expect(result.action).toBe("noop");
     });
 
     it("should complete workflow when all stages done", async () => {
-      // Given: A workflow with all stages completed
-      const stage = createPassthroughStage("only-stage", TestSchemas.string);
+      const stage = createPassthroughStage("only-stage", StringSchema);
 
       const workflow = new WorkflowBuilder(
         "complete-workflow",
         "Complete Workflow",
         "Test",
-        TestSchemas.string,
-        TestSchemas.string,
+        StringSchema,
+        StringSchema,
       )
         .pipe(stage)
         .build();
 
-      registry.set("complete-workflow", workflow);
-      const runtime = createRuntime();
+      const { kernel, persistence } = createTestKernel([workflow]);
 
-      await persistence.createRun({
-        id: "run-complete",
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-1",
         workflowId: "complete-workflow",
-        workflowName: "Complete Workflow",
         input: { value: "test" },
       });
 
+      await persistence.updateRun(workflowRunId, { status: "RUNNING" });
       await persistence.createStage({
-        workflowRunId: "run-complete",
+        workflowRunId,
         stageId: "only-stage",
-        stageName: "Only Stage",
+        stageName: "Stage only-stage",
         stageNumber: 1,
         executionGroup: 1,
         status: "COMPLETED",
       });
 
-      await persistence.updateRun("run-complete", { status: "RUNNING" });
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
 
-      // When: I trigger transition
-      await runtime.transitionWorkflow("run-complete");
-
-      // Then: Workflow is marked complete
-      const run = await persistence.getRun("run-complete");
+      const run = await persistence.getRun(workflowRunId);
       expect(run?.status).toBe("COMPLETED");
       expect(run?.completedAt).toBeInstanceOf(Date);
     });
 
     it("should not transition cancelled workflows", async () => {
-      // Given: A cancelled workflow
-      const stage = createPassthroughStage("stage", TestSchemas.string);
+      const stage = createPassthroughStage("stage", StringSchema);
       const workflow = new WorkflowBuilder(
         "cancelled-workflow",
         "Cancelled Workflow",
         "Test",
-        TestSchemas.string,
-        TestSchemas.string,
+        StringSchema,
+        StringSchema,
       )
         .pipe(stage)
         .build();
 
-      registry.set("cancelled-workflow", workflow);
-      const runtime = createRuntime();
+      const { kernel, persistence } = createTestKernel([workflow]);
 
-      await persistence.createRun({
-        id: "run-cancelled",
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-1",
         workflowId: "cancelled-workflow",
-        workflowName: "Cancelled Workflow",
         input: { value: "test" },
       });
 
-      await persistence.updateRun("run-cancelled", { status: "CANCELLED" });
+      await persistence.updateRun(workflowRunId, { status: "CANCELLED" });
 
-      // When: I try to transition
-      await runtime.transitionWorkflow("run-cancelled");
+      const result = await kernel.dispatch({
+        type: "run.transition",
+        workflowRunId,
+      });
 
-      // Then: No jobs enqueued, status unchanged
-      const pendingJobs = jobQueue.getJobsByStatus("PENDING");
-      expect(pendingJobs).toHaveLength(0);
+      expect(result.action).toBe("noop");
 
-      const run = await persistence.getRun("run-cancelled");
+      const run = await persistence.getRun(workflowRunId);
       expect(run?.status).toBe("CANCELLED");
     });
   });
 
   describe("parallel stage handling", () => {
     it("should enqueue all stages in an execution group", async () => {
-      // Given: A workflow with parallel stages
-      const stageA = createPassthroughStage("parallel-a", TestSchemas.string);
-      const stageB = createPassthroughStage("parallel-b", TestSchemas.string);
+      const stageA = createPassthroughStage("parallel-a", StringSchema);
+      const stageB = createPassthroughStage("parallel-b", StringSchema);
 
       const workflow = new WorkflowBuilder(
         "parallel-workflow",
         "Parallel Workflow",
         "Test",
-        TestSchemas.string,
+        StringSchema,
         z.any(),
       )
         .parallel([stageA, stageB])
         .build();
 
-      registry.set("parallel-workflow", workflow);
-      const runtime = createRuntime();
+      const { kernel, persistence, jobTransport } = createTestKernel([
+        workflow,
+      ]);
 
-      const result = await runtime.createRun({
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-1",
         workflowId: "parallel-workflow",
         input: { value: "test" },
       });
 
-      // Simulate pending workflow pickup
-      await persistence.updateRun(result.workflowRunId, { status: "RUNNING" });
-      await runtime.transitionWorkflow(result.workflowRunId);
+      // Claim pending triggers RUNNING + creates stage records + enqueues jobs
+      await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
 
-      // Then: Both parallel stages have jobs
-      const pendingJobs = jobQueue.getJobsByStatus("PENDING");
-      expect(pendingJobs).toHaveLength(2);
+      const allJobs = jobTransport.getAllJobs();
+      expect(allJobs).toHaveLength(2);
 
-      const stageIds = pendingJobs.map((j) => j.stageId);
+      const stageIds = allJobs.map((j) => j.stageId);
       expect(stageIds).toContain("parallel-a");
       expect(stageIds).toContain("parallel-b");
     });
@@ -436,7 +402,8 @@ describe("I want orchestrator to manage workflow state", () => {
 
   describe("suspended stage polling", () => {
     it("should find suspended stages ready to poll", async () => {
-      // Given: A suspended stage ready to check
+      const { persistence } = createTestKernel([]);
+
       await persistence.createRun({
         id: "run-suspended",
         workflowId: "test-workflow",
@@ -454,15 +421,11 @@ describe("I want orchestrator to manage workflow state", () => {
       });
 
       await persistence.updateStage(stage.id, {
-        nextPollAt: new Date(Date.now() - 1000), // Ready
+        nextPollAt: new Date(Date.now() - 1000),
         suspendedState: { batchId: "batch-123" },
       });
 
-      // When: I poll for suspended stages
-      const runtime = createRuntime();
       const suspendedStages = await persistence.getSuspendedStages(new Date());
-
-      // Then: Stage is found (filter for unique stageIds due to potential indexing)
       const uniqueStageIds = [
         ...new Set(suspendedStages.map((s) => s.stageId)),
       ];
@@ -471,7 +434,8 @@ describe("I want orchestrator to manage workflow state", () => {
     });
 
     it("should not return suspended stages not yet ready", async () => {
-      // Given: A suspended stage not yet ready
+      const { persistence } = createTestKernel([]);
+
       await persistence.createRun({
         id: "run-future",
         workflowId: "test-workflow",
@@ -489,94 +453,25 @@ describe("I want orchestrator to manage workflow state", () => {
       });
 
       await persistence.updateStage(stage.id, {
-        nextPollAt: new Date(Date.now() + 60000), // Not ready
+        nextPollAt: new Date(Date.now() + 60000),
         suspendedState: { batchId: "batch-future" },
       });
 
-      // When: I poll for suspended stages
       const suspendedStages = await persistence.getSuspendedStages(new Date());
-
-      // Then: Stage is not found
       expect(suspendedStages).toHaveLength(0);
     });
   });
 
-  describe("runtime lifecycle", () => {
-    it("should create AI helper when configured", async () => {
-      // Given: A runtime with AI logger
-      const runtime = createRuntime();
-
-      // When: I create an AI helper
-      const helper = runtime.createAIHelper("test.topic");
-
-      // Then: Helper is created
-      expect(helper).toBeDefined();
-    });
-
-    it("should throw when creating AI helper without logger", async () => {
-      // Given: A runtime without AI logger
-      const runtime = new WorkflowRuntime({
-        persistence,
-        jobQueue,
-        registry: { getWorkflow: (id) => registry.get(id) },
-        // aiCallLogger intentionally omitted
-      });
-
-      // When: I try to create an AI helper
-      // Then: It throws
-      expect(() => runtime.createAIHelper("test.topic")).toThrow(
-        /AICallLogger not configured/,
-      );
-    });
-
-    it("should create log context for workflow stages", async () => {
-      // Given: A runtime
-      const runtime = createRuntime();
-
-      // When: I create a log context
-      const logContext = runtime.createLogContext("run-123", "stage-456");
-
-      // Then: Log context has the right properties
-      expect(logContext.workflowRunId).toBe("run-123");
-      expect(logContext.stageRecordId).toBe("stage-456");
-      expect(typeof logContext.createLog).toBe("function");
-    });
-  });
-
   describe("error handling", () => {
-    it("should handle missing workflow gracefully on transition", async () => {
-      // Given: A run with unknown workflow
-      await persistence.createRun({
-        id: "run-unknown",
-        workflowId: "non-existent",
-        workflowName: "Non-existent",
-        input: { value: "test" },
+    it("should handle non-existent run gracefully on transition", async () => {
+      const { kernel } = createTestKernel([]);
+
+      const result = await kernel.dispatch({
+        type: "run.transition",
+        workflowRunId: "non-existent-run",
       });
 
-      await persistence.updateRun("run-unknown", { status: "RUNNING" });
-
-      const runtime = createRuntime();
-
-      // When: I try to transition (workflow not in registry)
-      // Should not throw, just return
-      await runtime.transitionWorkflow("run-unknown");
-
-      // Then: No jobs created, run unchanged
-      const pendingJobs = jobQueue.getJobsByStatus("PENDING");
-      expect(pendingJobs).toHaveLength(0);
-    });
-
-    it("should handle non-existent run gracefully on transition", async () => {
-      // Given: A runtime
-      const runtime = createRuntime();
-
-      // When: I try to transition a non-existent run
-      // Should not throw
-      await runtime.transitionWorkflow("non-existent-run");
-
-      // Then: No error, nothing happens
-      const pendingJobs = jobQueue.getJobsByStatus("PENDING");
-      expect(pendingJobs).toHaveLength(0);
+      expect(result.action).toBe("noop");
     });
   });
 });

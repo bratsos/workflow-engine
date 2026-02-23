@@ -1,5 +1,5 @@
 /**
- * Stage Events Tests
+ * Stage Events Tests (Kernel)
  *
  * Tests for stage lifecycle events during workflow execution:
  * - stage:started
@@ -7,86 +7,133 @@
  * - stage:failed
  */
 
-import { beforeEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { WorkflowExecutor } from "../../core/executor.js";
 import { defineStage } from "../../core/stage-factory.js";
-import { WorkflowBuilder } from "../../core/workflow.js";
+import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
+import { createKernel } from "../../kernel/kernel.js";
 import {
-  createErrorStage,
-  createPassthroughStage,
-  InMemoryAICallLogger,
-  InMemoryWorkflowPersistence,
-  TestSchemas,
-} from "../utils/index.js";
+  CollectingEventSink,
+  FakeClock,
+  InMemoryBlobStore,
+  NoopScheduler,
+} from "../../kernel/testing/index.js";
+import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
+import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
+
+const TestStringSchema = z.object({ value: z.string() });
+
+function createTestKernel(workflows: Workflow<any, any>[] = []) {
+  const persistence = new InMemoryWorkflowPersistence();
+  const blobStore = new InMemoryBlobStore();
+  const jobTransport = new InMemoryJobQueue("test-worker");
+  const eventSink = new CollectingEventSink();
+  const scheduler = new NoopScheduler();
+  const clock = new FakeClock();
+  const registry = new Map<string, Workflow<any, any>>();
+  for (const w of workflows) registry.set(w.id, w);
+  const kernel = createKernel({
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry: { getWorkflow: (id) => registry.get(id) },
+  });
+  const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
+  return {
+    kernel,
+    flush,
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry,
+  };
+}
+
+function createPassthroughStage(id: string) {
+  return defineStage({
+    id,
+    name: `Stage ${id}`,
+    schemas: {
+      input: TestStringSchema,
+      output: TestStringSchema,
+      config: z.object({}),
+    },
+    async execute(ctx) {
+      return { output: ctx.input };
+    },
+  });
+}
+
+/** Helper: create a run, claim it, and return the runId */
+async function setupRun(
+  kernel: ReturnType<typeof createTestKernel>["kernel"],
+  flush: () => Promise<any>,
+  eventSink: CollectingEventSink,
+  workflowId: string,
+  input: unknown,
+) {
+  const { workflowRunId } = await kernel.dispatch({
+    type: "run.create",
+    idempotencyKey: `key-${workflowId}-${Date.now()}`,
+    workflowId,
+    input,
+  });
+  await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
+  await flush();
+  eventSink.clear();
+  return workflowRunId;
+}
 
 describe("I want to track stage lifecycle events", () => {
-  let persistence: InMemoryWorkflowPersistence;
-  let aiLogger: InMemoryAICallLogger;
-
-  beforeEach(() => {
-    persistence = new InMemoryWorkflowPersistence();
-    aiLogger = new InMemoryAICallLogger();
-  });
-
-  // Helper to create a workflow run before execution
-  async function createRun(
-    runId: string,
-    workflowId: string,
-    input: unknown = {},
-  ) {
-    await persistence.createRun({
-      id: runId,
-      workflowId,
-      workflowName: workflowId,
-      status: "PENDING",
-      input,
-    });
-  }
-
   describe("stage:started events", () => {
     it("should emit stage:started for each stage", async () => {
       // Given: A workflow with multiple stages
-      const stageA = createPassthroughStage("stage-a", TestSchemas.string);
-      const stageB = createPassthroughStage("stage-b", TestSchemas.string);
-      const stageC = createPassthroughStage("stage-c", TestSchemas.string);
+      const stageA = createPassthroughStage("stage-a");
+      const stageB = createPassthroughStage("stage-b");
+      const stageC = createPassthroughStage("stage-c");
 
       const workflow = new WorkflowBuilder(
         "multi-stage-started",
         "Multi Stage Started Test",
         "Test",
-        TestSchemas.string,
-        TestSchemas.string,
+        TestStringSchema,
+        TestStringSchema,
       )
         .pipe(stageA)
         .pipe(stageB)
         .pipe(stageC)
         .build();
 
-      await createRun("run-started-1", "multi-stage-started", {
-        value: "test",
-      });
-
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-started-1",
+      const { kernel, flush, eventSink } = createTestKernel([workflow]);
+      const workflowRunId = await setupRun(
+        kernel,
+        flush,
+        eventSink,
         "multi-stage-started",
-        {
-          persistence,
-          aiLogger,
-        },
+        { value: "test" },
       );
 
-      // Collect stage:started events
-      const startedEvents: Array<{ stageId: string; stageName: string }> = [];
-      executor.on("stage:started", (data) => {
-        startedEvents.push(data as { stageId: string; stageName: string });
-      });
-
-      // When: Execute the workflow
-      await executor.execute({ value: "test" }, {});
+      // When: Execute all stages
+      for (const stageId of ["stage-a", "stage-b", "stage-c"]) {
+        await kernel.dispatch({
+          type: "job.execute",
+          workflowRunId,
+          workflowId: "multi-stage-started",
+          stageId,
+          config: {},
+        });
+        await kernel.dispatch({ type: "run.transition", workflowRunId });
+      }
+      await flush();
 
       // Then: stage:started was emitted for each stage
+      const startedEvents = eventSink.getByType("stage:started");
       expect(startedEvents).toHaveLength(3);
       expect(startedEvents.map((e) => e.stageId)).toEqual([
         "stage-a",
@@ -101,8 +148,8 @@ describe("I want to track stage lifecycle events", () => {
         id: "my-stage-id",
         name: "My Stage Name",
         schemas: {
-          input: TestSchemas.string,
-          output: TestSchemas.string,
+          input: TestStringSchema,
+          output: TestStringSchema,
           config: z.object({}),
         },
         async execute(ctx) {
@@ -114,133 +161,122 @@ describe("I want to track stage lifecycle events", () => {
         "stage-info-test",
         "Stage Info Test",
         "Test",
-        TestSchemas.string,
-        TestSchemas.string,
+        TestStringSchema,
+        TestStringSchema,
       )
         .pipe(stage)
         .build();
 
-      await createRun("run-started-2", "stage-info-test", { value: "test" });
-
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-started-2",
+      const { kernel, flush, eventSink } = createTestKernel([workflow]);
+      const workflowRunId = await setupRun(
+        kernel,
+        flush,
+        eventSink,
         "stage-info-test",
-        {
-          persistence,
-          aiLogger,
-        },
+        { value: "test" },
       );
 
-      // Collect stage:started events
-      let startedEvent: Record<string, unknown> | null = null;
-      executor.on("stage:started", (data) => {
-        startedEvent = data as Record<string, unknown>;
-      });
-
       // When: Execute
-      await executor.execute({ value: "test" }, {});
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "stage-info-test",
+        stageId: "my-stage-id",
+        config: {},
+      });
+      await flush();
 
       // Then: Event includes both stageId and stageName
-      expect(startedEvent).not.toBeNull();
-      expect(startedEvent?.stageId).toBe("my-stage-id");
-      expect(startedEvent?.stageName).toBe("My Stage Name");
+      const startedEvents = eventSink.getByType("stage:started");
+      expect(startedEvents).toHaveLength(1);
+      expect(startedEvents[0]!.stageId).toBe("my-stage-id");
+      expect(startedEvents[0]!.stageName).toBe("My Stage Name");
     });
 
-    it("should emit stage:started before stage execution begins", async () => {
-      // Given: A stage that tracks when it starts executing
-      const timeline: string[] = [];
-
-      const stage = defineStage({
-        id: "timing-stage",
-        name: "Timing Stage",
-        schemas: {
-          input: TestSchemas.string,
-          output: TestSchemas.string,
-          config: z.object({}),
-        },
-        async execute(ctx) {
-          timeline.push("stage-execute");
-          return { output: ctx.input };
-        },
-      });
+    it("should emit stage:started before stage:completed in event order", async () => {
+      // Given: A single-stage workflow
+      const stage = createPassthroughStage("timing-stage");
 
       const workflow = new WorkflowBuilder(
         "timing-test",
         "Timing Test",
         "Test",
-        TestSchemas.string,
-        TestSchemas.string,
+        TestStringSchema,
+        TestStringSchema,
       )
         .pipe(stage)
         .build();
 
-      await createRun("run-started-3", "timing-test", { value: "test" });
-
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-started-3",
+      const { kernel, flush, eventSink } = createTestKernel([workflow]);
+      const workflowRunId = await setupRun(
+        kernel,
+        flush,
+        eventSink,
         "timing-test",
-        {
-          persistence,
-          aiLogger,
-        },
+        { value: "test" },
       );
 
-      executor.on("stage:started", () => {
-        timeline.push("stage:started");
-      });
-
       // When: Execute
-      await executor.execute({ value: "test" }, {});
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "timing-test",
+        stageId: "timing-stage",
+        config: {},
+      });
+      await flush();
 
-      // Then: stage:started was emitted before execute ran
-      expect(timeline[0]).toBe("stage:started");
-      expect(timeline[1]).toBe("stage-execute");
+      // Then: stage:started was emitted before stage:completed
+      const allEvents = eventSink.events.filter(
+        (e) => e.type === "stage:started" || e.type === "stage:completed",
+      );
+      expect(allEvents).toHaveLength(2);
+      expect(allEvents[0]!.type).toBe("stage:started");
+      expect(allEvents[1]!.type).toBe("stage:completed");
     });
   });
 
   describe("stage:completed events", () => {
     it("should emit stage:completed for each stage", async () => {
       // Given: A workflow with multiple stages
-      const stageA = createPassthroughStage("stage-a", TestSchemas.string);
-      const stageB = createPassthroughStage("stage-b", TestSchemas.string);
+      const stageA = createPassthroughStage("stage-a");
+      const stageB = createPassthroughStage("stage-b");
 
       const workflow = new WorkflowBuilder(
         "multi-stage-completed",
         "Multi Stage Completed Test",
         "Test",
-        TestSchemas.string,
-        TestSchemas.string,
+        TestStringSchema,
+        TestStringSchema,
       )
         .pipe(stageA)
         .pipe(stageB)
         .build();
 
-      await createRun("run-completed-1", "multi-stage-completed", {
-        value: "test",
-      });
-
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-completed-1",
+      const { kernel, flush, eventSink } = createTestKernel([workflow]);
+      const workflowRunId = await setupRun(
+        kernel,
+        flush,
+        eventSink,
         "multi-stage-completed",
-        {
-          persistence,
-          aiLogger,
-        },
+        { value: "test" },
       );
 
-      // Collect stage:completed events
-      const completedEvents: Array<{ stageId: string }> = [];
-      executor.on("stage:completed", (data) => {
-        completedEvents.push(data as { stageId: string });
-      });
-
-      // When: Execute
-      await executor.execute({ value: "test" }, {});
+      // When: Execute all stages
+      for (const stageId of ["stage-a", "stage-b"]) {
+        await kernel.dispatch({
+          type: "job.execute",
+          workflowRunId,
+          workflowId: "multi-stage-completed",
+          stageId,
+          config: {},
+        });
+        await kernel.dispatch({ type: "run.transition", workflowRunId });
+      }
+      await flush();
 
       // Then: stage:completed was emitted for each stage
+      const completedEvents = eventSink.getByType("stage:completed");
       expect(completedEvents).toHaveLength(2);
       expect(completedEvents.map((e) => e.stageId)).toEqual([
         "stage-a",
@@ -248,18 +284,17 @@ describe("I want to track stage lifecycle events", () => {
       ]);
     });
 
-    it("should include timing in stage:completed event", async () => {
-      // Given: A stage that takes some time
+    it("should include duration in stage:completed event", async () => {
+      // Given: A stage
       const stage = defineStage({
         id: "slow-stage",
         name: "Slow Stage",
         schemas: {
-          input: TestSchemas.string,
-          output: TestSchemas.string,
+          input: TestStringSchema,
+          output: TestStringSchema,
           config: z.object({}),
         },
         async execute(ctx) {
-          await new Promise((r) => setTimeout(r, 50)); // Wait 50ms
           return { output: ctx.input };
         },
       });
@@ -268,80 +303,80 @@ describe("I want to track stage lifecycle events", () => {
         "timing-complete-test",
         "Timing Complete Test",
         "Test",
-        TestSchemas.string,
-        TestSchemas.string,
+        TestStringSchema,
+        TestStringSchema,
       )
         .pipe(stage)
         .build();
 
-      await createRun("run-completed-2", "timing-complete-test", {
-        value: "test",
-      });
-
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-completed-2",
+      const { kernel, flush, eventSink } = createTestKernel([workflow]);
+      const workflowRunId = await setupRun(
+        kernel,
+        flush,
+        eventSink,
         "timing-complete-test",
-        {
-          persistence,
-          aiLogger,
-        },
+        { value: "test" },
       );
 
-      // Collect stage:completed event
-      let completedEvent: Record<string, unknown> | null = null;
-      executor.on("stage:completed", (data) => {
-        completedEvent = data as Record<string, unknown>;
-      });
-
       // When: Execute
-      await executor.execute({ value: "test" }, {});
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "timing-complete-test",
+        stageId: "slow-stage",
+        config: {},
+      });
+      await flush();
 
       // Then: Event includes timing info
-      expect(completedEvent).not.toBeNull();
-      expect(completedEvent?.stageId).toBe("slow-stage");
-      // Duration should be at least 50ms (the event uses 'duration' not 'durationMs')
-      expect(completedEvent?.duration).toBeDefined();
-      expect(typeof completedEvent?.duration).toBe("number");
-      expect(completedEvent?.duration as number).toBeGreaterThanOrEqual(45); // Allow some tolerance
+      const completedEvents = eventSink.getByType("stage:completed");
+      expect(completedEvents).toHaveLength(1);
+      expect(completedEvents[0]!.stageId).toBe("slow-stage");
+      expect(completedEvents[0]!.duration).toBeDefined();
+      expect(typeof completedEvents[0]!.duration).toBe("number");
     });
 
     it("should emit stage:completed after stage:started", async () => {
       // Given: A stage
-      const stage = createPassthroughStage("order-test", TestSchemas.string);
+      const stage = createPassthroughStage("order-test");
 
       const workflow = new WorkflowBuilder(
         "event-order-test",
         "Event Order Test",
         "Test",
-        TestSchemas.string,
-        TestSchemas.string,
+        TestStringSchema,
+        TestStringSchema,
       )
         .pipe(stage)
         .build();
 
-      await createRun("run-completed-3", "event-order-test", { value: "test" });
-
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-completed-3",
+      const { kernel, flush, eventSink } = createTestKernel([workflow]);
+      const workflowRunId = await setupRun(
+        kernel,
+        flush,
+        eventSink,
         "event-order-test",
-        {
-          persistence,
-          aiLogger,
-        },
+        { value: "test" },
       );
 
-      // Collect events in order
-      const events: string[] = [];
-      executor.on("stage:started", () => events.push("stage:started"));
-      executor.on("stage:completed", () => events.push("stage:completed"));
-
       // When: Execute
-      await executor.execute({ value: "test" }, {});
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "event-order-test",
+        stageId: "order-test",
+        config: {},
+      });
+      await flush();
 
       // Then: Events are in correct order
-      expect(events).toEqual(["stage:started", "stage:completed"]);
+      const stageEvents = eventSink.events.filter(
+        (e) => e.type === "stage:started" || e.type === "stage:completed",
+      );
+      expect(stageEvents.map((e) => e.type)).toEqual([
+        "stage:started",
+        "stage:completed",
+      ]);
     });
 
     it("should include stageId and stageName in stage:completed event", async () => {
@@ -350,8 +385,8 @@ describe("I want to track stage lifecycle events", () => {
         id: "complete-info-stage",
         name: "Complete Info Stage",
         schemas: {
-          input: TestSchemas.string,
-          output: TestSchemas.string,
+          input: TestStringSchema,
+          output: TestStringSchema,
           config: z.object({}),
         },
         async execute(ctx) {
@@ -363,49 +398,54 @@ describe("I want to track stage lifecycle events", () => {
         "complete-info-test",
         "Complete Info Test",
         "Test",
-        TestSchemas.string,
-        TestSchemas.string,
+        TestStringSchema,
+        TestStringSchema,
       )
         .pipe(stage)
         .build();
 
-      await createRun("run-completed-4", "complete-info-test", {
-        value: "test",
-      });
-
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-completed-4",
+      const { kernel, flush, eventSink } = createTestKernel([workflow]);
+      const workflowRunId = await setupRun(
+        kernel,
+        flush,
+        eventSink,
         "complete-info-test",
-        {
-          persistence,
-          aiLogger,
-        },
+        { value: "test" },
       );
 
-      // Collect stage:completed event
-      let completedEvent: Record<string, unknown> | null = null;
-      executor.on("stage:completed", (data) => {
-        completedEvent = data as Record<string, unknown>;
-      });
-
       // When: Execute
-      await executor.execute({ value: "test" }, {});
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "complete-info-test",
+        stageId: "complete-info-stage",
+        config: {},
+      });
+      await flush();
 
       // Then: Event includes stageId and stageName
-      expect(completedEvent).not.toBeNull();
-      expect(completedEvent?.stageId).toBe("complete-info-stage");
-      expect(completedEvent?.stageName).toBe("Complete Info Stage");
+      const completedEvents = eventSink.getByType("stage:completed");
+      expect(completedEvents).toHaveLength(1);
+      expect(completedEvents[0]!.stageId).toBe("complete-info-stage");
+      expect(completedEvents[0]!.stageName).toBe("Complete Info Stage");
     });
   });
 
   describe("stage:failed events", () => {
     it("should emit stage:failed on stage error", async () => {
       // Given: A stage that throws an error
-      const errorStage = createErrorStage(
-        "failing-stage",
-        "Stage error message",
-      );
+      const errorStage = defineStage({
+        id: "failing-stage",
+        name: "Failing Stage",
+        schemas: {
+          input: z.object({}).passthrough(),
+          output: z.object({}),
+          config: z.object({}),
+        },
+        async execute() {
+          throw new Error("Stage error message");
+        },
+      });
 
       const workflow = new WorkflowBuilder(
         "stage-failed-test",
@@ -417,38 +457,46 @@ describe("I want to track stage lifecycle events", () => {
         .pipe(errorStage)
         .build();
 
-      await createRun("run-failed-1", "stage-failed-test", {});
-
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-failed-1",
+      const { kernel, flush, eventSink } = createTestKernel([workflow]);
+      const workflowRunId = await setupRun(
+        kernel,
+        flush,
+        eventSink,
         "stage-failed-test",
-        {
-          persistence,
-          aiLogger,
-        },
+        {},
       );
 
-      // Collect stage:failed events
-      let failedEvent: Record<string, unknown> | null = null;
-      executor.on("stage:failed", (data) => {
-        failedEvent = data as Record<string, unknown>;
-      });
-
       // When: Execute (and it fails)
-      await expect(executor.execute({}, {})).rejects.toThrow();
+      const result = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "stage-failed-test",
+        stageId: "failing-stage",
+        config: {},
+      });
+      await flush();
 
       // Then: stage:failed was emitted
-      expect(failedEvent).not.toBeNull();
-      expect(failedEvent?.stageId).toBe("failing-stage");
+      expect(result.outcome).toBe("failed");
+      const failedEvents = eventSink.getByType("stage:failed");
+      expect(failedEvents).toHaveLength(1);
+      expect(failedEvents[0]!.stageId).toBe("failing-stage");
     });
 
     it("should include error message in stage:failed event", async () => {
       // Given: A stage that throws a specific error
-      const errorStage = createErrorStage(
-        "error-msg-stage",
-        "Specific error message",
-      );
+      const errorStage = defineStage({
+        id: "error-msg-stage",
+        name: "Error Message Stage",
+        schemas: {
+          input: z.object({}).passthrough(),
+          output: z.object({}),
+          config: z.object({}),
+        },
+        async execute() {
+          throw new Error("Specific error message");
+        },
+      });
 
       const workflow = new WorkflowBuilder(
         "error-msg-test",
@@ -460,38 +508,45 @@ describe("I want to track stage lifecycle events", () => {
         .pipe(errorStage)
         .build();
 
-      await createRun("run-failed-2", "error-msg-test", {});
-
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-failed-2",
+      const { kernel, flush, eventSink } = createTestKernel([workflow]);
+      const workflowRunId = await setupRun(
+        kernel,
+        flush,
+        eventSink,
         "error-msg-test",
-        {
-          persistence,
-          aiLogger,
-        },
+        {},
       );
 
-      // Collect stage:failed event
-      let failedEvent: Record<string, unknown> | null = null;
-      executor.on("stage:failed", (data) => {
-        failedEvent = data as Record<string, unknown>;
-      });
-
       // When: Execute (and it fails)
-      await expect(executor.execute({}, {})).rejects.toThrow();
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "error-msg-test",
+        stageId: "error-msg-stage",
+        config: {},
+      });
+      await flush();
 
       // Then: Event includes the error message
-      expect(failedEvent).not.toBeNull();
-      expect(failedEvent?.error).toContain("Specific error message");
+      const failedEvents = eventSink.getByType("stage:failed");
+      expect(failedEvents).toHaveLength(1);
+      expect(failedEvents[0]!.error).toContain("Specific error message");
     });
 
     it("should emit stage:started before stage:failed", async () => {
       // Given: A failing stage
-      const errorStage = createErrorStage(
-        "fail-order-stage",
-        "Fail order test",
-      );
+      const errorStage = defineStage({
+        id: "fail-order-stage",
+        name: "Fail Order Stage",
+        schemas: {
+          input: z.object({}).passthrough(),
+          output: z.object({}),
+          config: z.object({}),
+        },
+        async execute() {
+          throw new Error("Fail order test");
+        },
+      });
 
       const workflow = new WorkflowBuilder(
         "fail-order-test",
@@ -503,42 +558,44 @@ describe("I want to track stage lifecycle events", () => {
         .pipe(errorStage)
         .build();
 
-      await createRun("run-failed-3", "fail-order-test", {});
-
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-failed-3",
+      const { kernel, flush, eventSink } = createTestKernel([workflow]);
+      const workflowRunId = await setupRun(
+        kernel,
+        flush,
+        eventSink,
         "fail-order-test",
-        {
-          persistence,
-          aiLogger,
-        },
+        {},
       );
 
-      // Collect events in order
-      const events: string[] = [];
-      executor.on("stage:started", () => events.push("stage:started"));
-      executor.on("stage:failed", () => events.push("stage:failed"));
-
       // When: Execute (and it fails)
-      await expect(executor.execute({}, {})).rejects.toThrow();
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "fail-order-test",
+        stageId: "fail-order-stage",
+        config: {},
+      });
+      await flush();
 
       // Then: stage:started came before stage:failed
-      expect(events).toEqual(["stage:started", "stage:failed"]);
+      const stageEvents = eventSink.events.filter(
+        (e) => e.type === "stage:started" || e.type === "stage:failed",
+      );
+      expect(stageEvents.map((e) => e.type)).toEqual([
+        "stage:started",
+        "stage:failed",
+      ]);
     });
 
     it("should only emit stage:failed for the failing stage in multi-stage workflow", async () => {
       // Given: A workflow where the second stage fails
-      const successStage = createPassthroughStage(
-        "success-stage",
-        TestSchemas.string,
-      );
+      const successStage = createPassthroughStage("success-stage");
       const errorStage = defineStage({
         id: "error-stage",
         name: "Error Stage",
         schemas: {
-          input: TestSchemas.string,
-          output: TestSchemas.string,
+          input: TestStringSchema,
+          output: TestStringSchema,
           config: z.object({}),
         },
         async execute() {
@@ -550,42 +607,47 @@ describe("I want to track stage lifecycle events", () => {
         "partial-fail-test",
         "Partial Fail Test",
         "Test",
-        TestSchemas.string,
-        TestSchemas.string,
+        TestStringSchema,
+        TestStringSchema,
       )
         .pipe(successStage)
         .pipe(errorStage)
         .build();
 
-      await createRun("run-failed-4", "partial-fail-test", { value: "test" });
-
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-failed-4",
+      const { kernel, flush, eventSink } = createTestKernel([workflow]);
+      const workflowRunId = await setupRun(
+        kernel,
+        flush,
+        eventSink,
         "partial-fail-test",
-        {
-          persistence,
-          aiLogger,
-        },
+        { value: "test" },
       );
 
-      // Collect events
-      const completedStages: string[] = [];
-      const failedStages: string[] = [];
-
-      executor.on("stage:completed", (data) => {
-        completedStages.push((data as { stageId: string }).stageId);
+      // Execute first stage (succeeds)
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "partial-fail-test",
+        stageId: "success-stage",
+        config: {},
       });
-      executor.on("stage:failed", (data) => {
-        failedStages.push((data as { stageId: string }).stageId);
-      });
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
 
-      // When: Execute (and it fails)
-      await expect(executor.execute({ value: "test" }, {})).rejects.toThrow();
+      // Execute second stage (fails)
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "partial-fail-test",
+        stageId: "error-stage",
+        config: {},
+      });
+      await flush();
 
       // Then: First stage completed, second stage failed
-      expect(completedStages).toEqual(["success-stage"]);
-      expect(failedStages).toEqual(["error-stage"]);
+      const completedEvents = eventSink.getByType("stage:completed");
+      const failedEvents = eventSink.getByType("stage:failed");
+      expect(completedEvents.map((e) => e.stageId)).toEqual(["success-stage"]);
+      expect(failedEvents.map((e) => e.stageId)).toEqual(["error-stage"]);
     });
   });
 });

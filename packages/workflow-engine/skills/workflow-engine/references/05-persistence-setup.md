@@ -39,6 +39,8 @@ The workflow engine uses three persistence interfaces:
 
 ```typescript
 interface WorkflowPersistence {
+  withTransaction<T>(fn: (tx: WorkflowPersistence) => Promise<T>): Promise<T>;
+
   // WorkflowRun operations
   createRun(data: CreateRunInput): Promise<WorkflowRunRecord>;
   updateRun(id: string, data: UpdateRunInput): Promise<void>;
@@ -74,6 +76,36 @@ interface WorkflowPersistence {
 
   // Stage output convenience
   saveStageOutput(runId, workflowType, stageId, output): Promise<string>;
+
+  // Outbox operations
+  appendOutboxEvents(events: CreateOutboxEventInput[]): Promise<void>;
+  getUnpublishedOutboxEvents(limit?: number): Promise<OutboxRecord[]>;
+  markOutboxEventsPublished(ids: string[]): Promise<void>;
+  incrementOutboxRetryCount(id: string): Promise<number>;
+  moveOutboxEventToDLQ(id: string): Promise<void>;
+  replayDLQEvents(maxEvents: number): Promise<number>;
+
+  // Idempotency operations
+  acquireIdempotencyKey(key: string, commandType: string): Promise<
+    | { status: "acquired" }
+    | { status: "replay"; result: unknown }
+    | { status: "in_progress" }
+  >;
+  completeIdempotencyKey(key: string, commandType: string, result: unknown): Promise<void>;
+  releaseIdempotencyKey(key: string, commandType: string): Promise<void>;
+}
+```
+
+```typescript
+interface DequeueResult {
+  jobId: string;
+  workflowRunId: string;
+  workflowId: string;
+  stageId: string;
+  priority: number;
+  attempt: number;
+  maxAttempts: number;
+  payload: Record<string, unknown>;
 }
 ```
 

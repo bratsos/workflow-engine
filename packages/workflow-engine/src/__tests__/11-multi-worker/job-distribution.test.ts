@@ -5,7 +5,7 @@
  */
 
 import { beforeEach, describe, expect, it } from "vitest";
-import { InMemoryJobQueue } from "../utils/in-memory-job-queue.js";
+import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
 
 describe("I want to distribute jobs across workers", () => {
   let jobQueue: InMemoryJobQueue;

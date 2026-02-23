@@ -1,29 +1,62 @@
 /**
  * Validation Error Tests
  *
- * Tests for input and config validation errors before workflow execution.
+ * Tests for input and config validation errors, rewritten to use kernel dispatch().
+ *
+ * - Input validation: `run.create` throws for invalid input
+ * - Config validation: `run.create` throws for invalid config
+ * - Stage-level input validation failures: `job.execute` returns `{ outcome: "failed" }`
  */
 
-import { beforeEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { WorkflowExecutor } from "../../core/executor.js";
 import { defineStage } from "../../core/stage-factory.js";
-import { WorkflowBuilder } from "../../core/workflow.js";
+import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
+import { createKernel } from "../../kernel/kernel.js";
 import {
-  InMemoryAICallLogger,
-  InMemoryWorkflowPersistence,
-  TestSchemas,
-} from "../utils/index.js";
+  CollectingEventSink,
+  FakeClock,
+  InMemoryBlobStore,
+  NoopScheduler,
+} from "../../kernel/testing/index.js";
+import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
+import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
+
+function createTestKernel(workflows: Workflow<any, any>[] = []) {
+  const persistence = new InMemoryWorkflowPersistence();
+  const blobStore = new InMemoryBlobStore();
+  const jobTransport = new InMemoryJobQueue("test-worker");
+  const eventSink = new CollectingEventSink();
+  const scheduler = new NoopScheduler();
+  const clock = new FakeClock();
+  const registry = new Map<string, Workflow<any, any>>();
+  for (const w of workflows) registry.set(w.id, w);
+  const kernel = createKernel({
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry: { getWorkflow: (id) => registry.get(id) },
+  });
+  const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
+  return {
+    kernel,
+    flush,
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry,
+  };
+}
+
+const StringSchema = z.object({ value: z.string() });
 
 describe("I want to validate input and config before execution", () => {
-  let persistence: InMemoryWorkflowPersistence;
-  let aiLogger: InMemoryAICallLogger;
-
-  beforeEach(() => {
-    persistence = new InMemoryWorkflowPersistence();
-    aiLogger = new InMemoryAICallLogger();
-  });
-
   describe("input validation", () => {
     it("should throw for invalid workflow input", async () => {
       // Given: A workflow with strict input schema
@@ -58,26 +91,18 @@ describe("I want to validate input and config before execution", () => {
         .pipe(strictInputStage)
         .build();
 
-      await persistence.createRun({
-        id: "run-invalid-input",
-        workflowId: "input-validation-workflow",
-        workflowName: "Input Validation Workflow",
-        status: "PENDING",
-        input: { name: "", age: -5 }, // Invalid: empty name and negative age
-      });
+      const { kernel } = createTestKernel([workflow]);
 
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-invalid-input",
-        "input-validation-workflow",
-        { persistence, aiLogger },
-      );
-
-      // When: I execute with invalid input
+      // When: I create a run with invalid input
       // Then: Throws validation error
       await expect(
-        executor.execute({ name: "", age: -5 }, {}),
-      ).rejects.toThrow();
+        kernel.dispatch({
+          type: "run.create",
+          idempotencyKey: "key-invalid-input",
+          workflowId: "input-validation-workflow",
+          input: { name: "", age: -5 }, // Invalid: empty name and negative age
+        }),
+      ).rejects.toThrow("Invalid workflow input");
     });
 
     it("should throw for missing required input fields", async () => {
@@ -111,24 +136,18 @@ describe("I want to validate input and config before execution", () => {
         .pipe(requiredFieldsStage)
         .build();
 
-      await persistence.createRun({
-        id: "run-missing-fields",
-        workflowId: "required-fields-workflow",
-        workflowName: "Required Fields Workflow",
-        status: "PENDING",
-        input: {}, // Missing required fields
-      });
+      const { kernel } = createTestKernel([workflow]);
 
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-missing-fields",
-        "required-fields-workflow",
-        { persistence, aiLogger },
-      );
-
-      // When: I execute with missing required fields
+      // When: I create a run with missing required fields
       // Then: Throws validation error
-      await expect(executor.execute({}, {})).rejects.toThrow();
+      await expect(
+        kernel.dispatch({
+          type: "run.create",
+          idempotencyKey: "key-missing-fields",
+          workflowId: "required-fields-workflow",
+          input: {}, // Missing required fields
+        }),
+      ).rejects.toThrow("Invalid workflow input");
     });
 
     it("should provide helpful error messages for input validation", async () => {
@@ -162,34 +181,25 @@ describe("I want to validate input and config before execution", () => {
         .pipe(validatedStage)
         .build();
 
-      await persistence.createRun({
-        id: "run-helpful-errors",
-        workflowId: "helpful-error-workflow",
-        workflowName: "Helpful Error Workflow",
-        status: "PENDING",
-        input: { email: "not-an-email", count: 0 },
-      });
+      const { kernel } = createTestKernel([workflow]);
 
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-helpful-errors",
-        "helpful-error-workflow",
-        { persistence, aiLogger },
-      );
-
-      // When: I execute with invalid data
+      // When: I create a run with invalid data
       // Then: Error message should be helpful
       try {
-        await executor.execute({ email: "not-an-email", count: 0 }, {});
+        await kernel.dispatch({
+          type: "run.create",
+          idempotencyKey: "key-helpful-errors",
+          workflowId: "helpful-error-workflow",
+          input: { email: "not-an-email", count: 0 },
+        });
         expect.fail("Should have thrown");
       } catch (error) {
         expect(error).toBeInstanceOf(Error);
-        // The error should contain information about what went wrong
         const errorMessage = (error as Error).message.toLowerCase();
         expect(
-          errorMessage.includes("email") ||
-            errorMessage.includes("validation") ||
-            errorMessage.includes("invalid"),
+          errorMessage.includes("invalid") ||
+            errorMessage.includes("email") ||
+            errorMessage.includes("validation"),
         ).toBe(true);
       }
     });
@@ -202,8 +212,8 @@ describe("I want to validate input and config before execution", () => {
         id: "config-required-stage",
         name: "Config Required Stage",
         schemas: {
-          input: TestSchemas.string,
-          output: TestSchemas.string,
+          input: StringSchema,
+          output: StringSchema,
           config: z.object({
             model: z.string(),
             temperature: z.number().min(0).max(2),
@@ -218,40 +228,30 @@ describe("I want to validate input and config before execution", () => {
         "config-validation-workflow",
         "Config Validation Workflow",
         "Test",
-        TestSchemas.string,
-        TestSchemas.string,
+        StringSchema,
+        StringSchema,
       )
         .pipe(configRequiredStage)
         .build();
 
-      await persistence.createRun({
-        id: "run-invalid-config",
-        workflowId: "config-validation-workflow",
-        workflowName: "Config Validation Workflow",
-        status: "PENDING",
-        input: { value: "test" },
-      });
+      const { kernel } = createTestKernel([workflow]);
 
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-invalid-config",
-        "config-validation-workflow",
-        { persistence, aiLogger },
-      );
-
-      // When: I execute with invalid config
-      // Then: Throws config validation error before execution
+      // When: I create a run with invalid config
+      // Then: Throws config validation error
       await expect(
-        executor.execute(
-          { value: "test" },
-          {
+        kernel.dispatch({
+          type: "run.create",
+          idempotencyKey: "key-invalid-config",
+          workflowId: "config-validation-workflow",
+          input: { value: "test" },
+          config: {
             "config-required-stage": {
               model: "", // Invalid: empty string
               temperature: 5, // Invalid: out of range
             },
           },
-        ),
-      ).rejects.toThrow(/config validation failed/i);
+        }),
+      ).rejects.toThrow(/invalid workflow config/i);
     });
 
     it("should throw for missing required config", async () => {
@@ -262,8 +262,8 @@ describe("I want to validate input and config before execution", () => {
         id: "strict-config-stage",
         name: "Strict Config Stage",
         schemas: {
-          input: TestSchemas.string,
-          output: TestSchemas.string,
+          input: StringSchema,
+          output: StringSchema,
           config: z.object({
             apiKey: z.string().min(1),
             endpoint: z.string().url(),
@@ -279,32 +279,25 @@ describe("I want to validate input and config before execution", () => {
         "strict-config-workflow",
         "Strict Config Workflow",
         "Test",
-        TestSchemas.string,
-        TestSchemas.string,
+        StringSchema,
+        StringSchema,
       )
         .pipe(strictConfigStage)
         .build();
 
-      await persistence.createRun({
-        id: "run-missing-config",
-        workflowId: "strict-config-workflow",
-        workflowName: "Strict Config Workflow",
-        status: "PENDING",
-        input: { value: "test" },
-      });
+      const { kernel } = createTestKernel([workflow]);
 
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-missing-config",
-        "strict-config-workflow",
-        { persistence, aiLogger },
-      );
-
-      // When: I execute with missing config
+      // When: I create a run with missing config
       // Then: Throws before stage executes
       await expect(
-        executor.execute({ value: "test" }, { "strict-config-stage": {} }),
-      ).rejects.toThrow(/config validation failed/i);
+        kernel.dispatch({
+          type: "run.create",
+          idempotencyKey: "key-missing-config",
+          workflowId: "strict-config-workflow",
+          input: { value: "test" },
+          config: { "strict-config-stage": {} },
+        }),
+      ).rejects.toThrow(/invalid workflow config/i);
 
       // Stage should not have been executed
       expect(tracker).toHaveLength(0);
@@ -316,8 +309,8 @@ describe("I want to validate input and config before execution", () => {
         id: "detailed-config-stage",
         name: "Detailed Config Stage",
         schemas: {
-          input: TestSchemas.string,
-          output: TestSchemas.string,
+          input: StringSchema,
+          output: StringSchema,
           config: z.object({
             maxRetries: z.number().int().positive("Must be a positive integer"),
             timeout: z.number().min(100, "Timeout must be at least 100ms"),
@@ -332,50 +325,40 @@ describe("I want to validate input and config before execution", () => {
         "detailed-config-workflow",
         "Detailed Config Workflow",
         "Test",
-        TestSchemas.string,
-        TestSchemas.string,
+        StringSchema,
+        StringSchema,
       )
         .pipe(detailedConfigStage)
         .build();
 
-      await persistence.createRun({
-        id: "run-detailed-config",
-        workflowId: "detailed-config-workflow",
-        workflowName: "Detailed Config Workflow",
-        status: "PENDING",
-        input: { value: "test" },
-      });
+      const { kernel } = createTestKernel([workflow]);
 
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-detailed-config",
-        "detailed-config-workflow",
-        { persistence, aiLogger },
-      );
-
-      // When: I execute with invalid config values
+      // When: I create a run with invalid config values
       try {
-        await executor.execute(
-          { value: "test" },
-          {
+        await kernel.dispatch({
+          type: "run.create",
+          idempotencyKey: "key-detailed-config",
+          workflowId: "detailed-config-workflow",
+          input: { value: "test" },
+          config: {
             "detailed-config-stage": {
               maxRetries: -1, // Invalid
               timeout: 50, // Too low
             },
           },
-        );
+        });
         expect.fail("Should have thrown");
       } catch (error) {
         expect(error).toBeInstanceOf(Error);
         const errorMessage = (error as Error).message.toLowerCase();
         // Error should mention config validation
-        expect(errorMessage).toContain("config validation failed");
+        expect(errorMessage).toContain("invalid workflow config");
       }
     });
   });
 
   describe("validation timing", () => {
-    it("should validate config before execution starts", async () => {
+    it("should validate config at run.create time, before any execution", async () => {
       // Given: A workflow where we track execution
       const executionLog: string[] = [];
 
@@ -383,8 +366,8 @@ describe("I want to validate input and config before execution", () => {
         id: "stage-1",
         name: "Stage 1",
         schemas: {
-          input: TestSchemas.string,
-          output: TestSchemas.string,
+          input: StringSchema,
+          output: StringSchema,
           config: z.object({}),
         },
         async execute(ctx) {
@@ -397,8 +380,8 @@ describe("I want to validate input and config before execution", () => {
         id: "stage-2",
         name: "Stage 2",
         schemas: {
-          input: TestSchemas.string,
-          output: TestSchemas.string,
+          input: StringSchema,
+          output: StringSchema,
           config: z.object({
             requiredField: z.string(),
           }),
@@ -413,39 +396,29 @@ describe("I want to validate input and config before execution", () => {
         "validation-timing-workflow",
         "Validation Timing Workflow",
         "Test",
-        TestSchemas.string,
-        TestSchemas.string,
+        StringSchema,
+        StringSchema,
       )
         .pipe(stage1)
         .pipe(stage2)
         .build();
 
-      await persistence.createRun({
-        id: "run-validation-timing",
-        workflowId: "validation-timing-workflow",
-        workflowName: "Validation Timing Workflow",
-        status: "PENDING",
-        input: { value: "test" },
-      });
+      const { kernel } = createTestKernel([workflow]);
 
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-validation-timing",
-        "validation-timing-workflow",
-        { persistence, aiLogger },
-      );
-
-      // When: I execute with invalid config for stage 2
+      // When: I create a run with invalid config for stage 2
       await expect(
-        executor.execute(
-          { value: "test" },
-          {
+        kernel.dispatch({
+          type: "run.create",
+          idempotencyKey: "key-validation-timing",
+          workflowId: "validation-timing-workflow",
+          input: { value: "test" },
+          config: {
             "stage-2": {}, // Missing required config
           },
-        ),
-      ).rejects.toThrow(/config validation failed/i);
+        }),
+      ).rejects.toThrow(/invalid workflow config/i);
 
-      // Then: Neither stage should have executed (validation happens first)
+      // Then: Neither stage should have executed (validation happens at create time)
       expect(executionLog).toHaveLength(0);
     });
   });

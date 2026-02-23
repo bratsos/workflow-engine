@@ -8,7 +8,7 @@
 // Type alias - actual client should be injected from app layer
 type PrismaClient = any;
 
-import type { StageStorage } from "../storage";
+import type { StageStorage } from "../stage";
 
 export class PrismaStageStorage implements StageStorage {
   readonly providerType = "prisma" as const;

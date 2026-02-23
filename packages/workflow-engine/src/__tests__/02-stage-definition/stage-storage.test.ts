@@ -1,48 +1,79 @@
 /**
- * Stage Storage Tests
+ * Stage Storage Tests (Kernel)
  *
  * Tests for the ctx.storage API available within stage execute functions.
+ * In the kernel, storage is backed by BlobStore (not InMemoryStageStorage).
  * Covers saving, loading, checking existence, deleting artifacts, and key generation.
  */
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { WorkflowExecutor } from "../../core/executor.js";
 import { defineStage } from "../../core/stage-factory.js";
-import { InMemoryStageStorage } from "../../core/storage-providers/memory-storage.js";
-import { WorkflowBuilder } from "../../core/workflow.js";
-import { InMemoryAICallLogger } from "../utils/in-memory-ai-logger.js";
-import { InMemoryWorkflowPersistence } from "../utils/in-memory-persistence.js";
+import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
+import { createKernel } from "../../kernel/kernel.js";
+import {
+  CollectingEventSink,
+  FakeClock,
+  InMemoryBlobStore,
+  NoopScheduler,
+} from "../../kernel/testing/index.js";
+import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
+import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
+
+function createTestKernel(workflows: Workflow<any, any>[] = []) {
+  const persistence = new InMemoryWorkflowPersistence();
+  const blobStore = new InMemoryBlobStore();
+  const jobTransport = new InMemoryJobQueue("test-worker");
+  const eventSink = new CollectingEventSink();
+  const scheduler = new NoopScheduler();
+  const clock = new FakeClock();
+  const registry = new Map<string, Workflow<any, any>>();
+  for (const w of workflows) registry.set(w.id, w);
+  const kernel = createKernel({
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry: { getWorkflow: (id) => registry.get(id) },
+  });
+  const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
+  return {
+    kernel,
+    flush,
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry,
+  };
+}
+
+/** Helper: create run, mark RUNNING, return runId */
+async function createAndStartRun(
+  kernel: ReturnType<typeof createTestKernel>["kernel"],
+  persistence: InMemoryWorkflowPersistence,
+  flush: () => Promise<any>,
+  workflowId: string,
+  input: Record<string, unknown> = {},
+) {
+  const createResult = await kernel.dispatch({
+    type: "run.create",
+    idempotencyKey: `key-${Date.now()}-${Math.random()}`,
+    workflowId,
+    input,
+  });
+  await persistence.updateRun(createResult.workflowRunId, {
+    status: "RUNNING",
+  });
+  await flush();
+  return createResult.workflowRunId;
+}
 
 describe("I want to use stage storage", () => {
-  let persistence: InMemoryWorkflowPersistence;
-  let aiLogger: InMemoryAICallLogger;
-
-  beforeEach(() => {
-    persistence = new InMemoryWorkflowPersistence();
-    aiLogger = new InMemoryAICallLogger();
-    InMemoryStageStorage.clear();
-  });
-
-  afterEach(() => {
-    InMemoryStageStorage.clear();
-  });
-
-  // Helper to create a workflow run before execution
-  async function createRun(
-    runId: string,
-    workflowId: string,
-    input: unknown = {},
-  ) {
-    await persistence.createRun({
-      id: runId,
-      workflowId,
-      workflowName: workflowId,
-      status: "PENDING",
-      input,
-    });
-  }
-
   describe("saving artifacts", () => {
     it("should save artifact with key", async () => {
       // Given: A stage that saves an artifact
@@ -66,23 +97,42 @@ describe("I want to use stage storage", () => {
         },
       });
 
-      const workflow = new WorkflowBuilder("save-test", "Test")
+      const workflow = new WorkflowBuilder(
+        "save-test",
+        "Test",
+        "Test",
+        z.object({}),
+        z.object({ saved: z.boolean() }),
+      )
         .pipe(stage)
         .build();
 
+      const { kernel, flush, persistence, blobStore } = createTestKernel([
+        workflow,
+      ]);
+
       // When: Execute the workflow
-      await createRun("run-save-1", "save-test", {});
-      const executor = new WorkflowExecutor(workflow, "run-save-1", "test", {
+      const runId = await createAndStartRun(
+        kernel,
         persistence,
-        aiLogger,
+        flush,
+        "save-test",
+      );
+      const result = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: runId,
+        workflowId: "save-test",
+        stageId: "save-artifact",
+        config: {},
       });
 
-      const result = await executor.execute({}, {});
-
       // Then: Artifact was saved successfully
-      expect(result).toEqual({ saved: true });
+      expect(result.outcome).toBe("completed");
+      expect(result.output).toEqual({ saved: true });
       expect(savedKey).toBeDefined();
       expect(savedKey).toContain("save-artifact");
+      // Blob store should have the artifact + the stage output
+      expect(blobStore.size()).toBeGreaterThanOrEqual(1);
     });
 
     it("should save complex nested artifacts", async () => {
@@ -109,20 +159,36 @@ describe("I want to use stage storage", () => {
         },
       });
 
-      const workflow = new WorkflowBuilder("nested-test", "Test")
+      const workflow = new WorkflowBuilder(
+        "nested-test",
+        "Test",
+        "Test",
+        z.object({}),
+        z.object({ saved: z.boolean() }),
+      )
         .pipe(stage)
         .build();
 
+      const { kernel, flush, persistence } = createTestKernel([workflow]);
+
       // When: Execute
-      await createRun("run-nested-1", "nested-test", {});
-      const executor = new WorkflowExecutor(workflow, "run-nested-1", "test", {
+      const runId = await createAndStartRun(
+        kernel,
         persistence,
-        aiLogger,
+        flush,
+        "nested-test",
+      );
+      const result = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: runId,
+        workflowId: "nested-test",
+        stageId: "save-nested",
+        config: {},
       });
 
       // Then: No error thrown
-      const result = await executor.execute({}, {});
-      expect(result).toEqual({ saved: true });
+      expect(result.outcome).toBe("completed");
+      expect(result.output).toEqual({ saved: true });
     });
   });
 
@@ -163,19 +229,40 @@ describe("I want to use stage storage", () => {
         },
       });
 
-      const workflow = new WorkflowBuilder("load-test", "Test")
+      const workflow = new WorkflowBuilder(
+        "load-test",
+        "Test",
+        "Test",
+        z.object({}),
+        z.object({ loaded: z.boolean() }),
+      )
         .pipe(saveStage)
         .pipe(loadStage)
         .build();
 
-      // When: Execute the workflow
-      await createRun("run-load-1", "load-test", {});
-      const executor = new WorkflowExecutor(workflow, "run-load-1", "test", {
-        persistence,
-        aiLogger,
-      });
+      const { kernel, flush, persistence } = createTestKernel([workflow]);
 
-      await executor.execute({}, {});
+      // When: Execute both stages
+      const runId = await createAndStartRun(
+        kernel,
+        persistence,
+        flush,
+        "load-test",
+      );
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: runId,
+        workflowId: "load-test",
+        stageId: "saver",
+        config: {},
+      });
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: runId,
+        workflowId: "load-test",
+        stageId: "loader",
+        config: {},
+      });
 
       // Then: Data was loaded correctly
       expect(loadedData).toEqual({ message: "hello from saver", value: 123 });
@@ -197,24 +284,36 @@ describe("I want to use stage storage", () => {
         },
       });
 
-      const workflow = new WorkflowBuilder("bad-load-test", "Test")
+      const workflow = new WorkflowBuilder(
+        "bad-load-test",
+        "Test",
+        "Test",
+        z.object({}),
+        z.object({}),
+      )
         .pipe(stage)
         .build();
 
-      // When: Execute
-      await createRun("run-bad-load-1", "bad-load-test", {});
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-bad-load-1",
-        "test",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
+      const { kernel, flush, persistence } = createTestKernel([workflow]);
 
-      // Then: Execution throws
-      await expect(executor.execute({}, {})).rejects.toThrow(/not found/i);
+      // When: Execute
+      const runId = await createAndStartRun(
+        kernel,
+        persistence,
+        flush,
+        "bad-load-test",
+      );
+      const result = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: runId,
+        workflowId: "bad-load-test",
+        stageId: "bad-loader",
+        config: {},
+      });
+
+      // Then: Execution fails (blob not found)
+      expect(result.outcome).toBe("failed");
+      expect(result.error).toMatch(/not found/i);
     });
   });
 
@@ -253,23 +352,37 @@ describe("I want to use stage storage", () => {
         },
       });
 
-      const workflow = new WorkflowBuilder("exists-test", "Test")
+      const workflow = new WorkflowBuilder(
+        "exists-test",
+        "Test",
+        "Test",
+        z.object({}),
+        z.object({ beforeSave: z.boolean(), afterSave: z.boolean() }),
+      )
         .pipe(stage)
         .build();
 
-      // When: Execute
-      await createRun("run-exists-1", "exists-test", {});
-      const executor = new WorkflowExecutor(workflow, "run-exists-1", "test", {
-        persistence,
-        aiLogger,
-      });
+      const { kernel, flush, persistence } = createTestKernel([workflow]);
 
-      const result = await executor.execute({}, {});
+      // When: Execute
+      const runId = await createAndStartRun(
+        kernel,
+        persistence,
+        flush,
+        "exists-test",
+      );
+      const result = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: runId,
+        workflowId: "exists-test",
+        stageId: "existence-check",
+        config: {},
+      });
 
       // Then: Existence checks are correct
       expect(existsBeforeSave).toBe(false);
       expect(existsAfterSave).toBe(true);
-      expect(result).toEqual({ beforeSave: false, afterSave: true });
+      expect(result.output).toEqual({ beforeSave: false, afterSave: true });
     });
 
     it("should return false for non-existent artifact", async () => {
@@ -290,27 +403,36 @@ describe("I want to use stage storage", () => {
         },
       });
 
-      const workflow = new WorkflowBuilder("nonexistent-test", "Test")
+      const workflow = new WorkflowBuilder(
+        "nonexistent-test",
+        "Test",
+        "Test",
+        z.object({}),
+        z.object({ exists: z.boolean() }),
+      )
         .pipe(stage)
         .build();
 
-      // When: Execute
-      await createRun("run-nonexistent-1", "nonexistent-test", {});
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-nonexistent-1",
-        "test",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
+      const { kernel, flush, persistence } = createTestKernel([workflow]);
 
-      const result = await executor.execute({}, {});
+      // When: Execute
+      const runId = await createAndStartRun(
+        kernel,
+        persistence,
+        flush,
+        "nonexistent-test",
+      );
+      const result = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: runId,
+        workflowId: "nonexistent-test",
+        stageId: "nonexistent-check",
+        config: {},
+      });
 
       // Then: Returns false
       expect(exists).toBe(false);
-      expect(result).toEqual({ exists: false });
+      expect(result.output).toEqual({ exists: false });
     });
   });
 
@@ -351,23 +473,37 @@ describe("I want to use stage storage", () => {
         },
       });
 
-      const workflow = new WorkflowBuilder("delete-test", "Test")
+      const workflow = new WorkflowBuilder(
+        "delete-test",
+        "Test",
+        "Test",
+        z.object({}),
+        z.object({ afterSave: z.boolean(), afterDelete: z.boolean() }),
+      )
         .pipe(stage)
         .build();
 
-      // When: Execute
-      await createRun("run-delete-1", "delete-test", {});
-      const executor = new WorkflowExecutor(workflow, "run-delete-1", "test", {
-        persistence,
-        aiLogger,
-      });
+      const { kernel, flush, persistence } = createTestKernel([workflow]);
 
-      const result = await executor.execute({}, {});
+      // When: Execute
+      const runId = await createAndStartRun(
+        kernel,
+        persistence,
+        flush,
+        "delete-test",
+      );
+      const result = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: runId,
+        workflowId: "delete-test",
+        stageId: "delete-artifact",
+        config: {},
+      });
 
       // Then: Artifact was deleted
       expect(existsAfterSave).toBe(true);
       expect(existsAfterDelete).toBe(false);
-      expect(result).toEqual({ afterSave: true, afterDelete: false });
+      expect(result.output).toEqual({ afterSave: true, afterDelete: false });
     });
 
     it("should not throw when deleting non-existent artifact", async () => {
@@ -387,29 +523,36 @@ describe("I want to use stage storage", () => {
         },
       });
 
-      const workflow = new WorkflowBuilder("delete-nonexistent-test", "Test")
+      const workflow = new WorkflowBuilder(
+        "delete-nonexistent-test",
+        "Test",
+        "Test",
+        z.object({}),
+        z.object({ completed: z.boolean() }),
+      )
         .pipe(stage)
         .build();
 
+      const { kernel, flush, persistence } = createTestKernel([workflow]);
+
       // When: Execute
-      await createRun(
-        "run-delete-nonexistent-1",
+      const runId = await createAndStartRun(
+        kernel,
+        persistence,
+        flush,
         "delete-nonexistent-test",
-        {},
       );
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-delete-nonexistent-1",
-        "test",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
+      const result = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: runId,
+        workflowId: "delete-nonexistent-test",
+        stageId: "delete-nonexistent",
+        config: {},
+      });
 
       // Then: Execution completes without error
-      const result = await executor.execute({}, {});
-      expect(result).toEqual({ completed: true });
+      expect(result.outcome).toBe("completed");
+      expect(result.output).toEqual({ completed: true });
     });
   });
 
@@ -441,18 +584,32 @@ describe("I want to use stage storage", () => {
         },
       });
 
-      const workflow = new WorkflowBuilder("key-gen-test", "Test")
+      const workflow = new WorkflowBuilder(
+        "key-gen-test",
+        "Test",
+        "Test",
+        z.object({}),
+        z.object({ key1: z.string(), key2: z.string(), key3: z.string() }),
+      )
         .pipe(stage)
         .build();
 
-      // When: Execute
-      await createRun("run-key-gen-1", "key-gen-test", {});
-      const executor = new WorkflowExecutor(workflow, "run-key-gen-1", "test", {
-        persistence,
-        aiLogger,
-      });
+      const { kernel, flush, persistence } = createTestKernel([workflow]);
 
-      const result = await executor.execute({}, {});
+      // When: Execute
+      const runId = await createAndStartRun(
+        kernel,
+        persistence,
+        flush,
+        "key-gen-test",
+      );
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: runId,
+        workflowId: "key-gen-test",
+        stageId: "key-generator",
+        config: {},
+      });
 
       // Then: Keys are generated correctly
       expect(key1).toBeDefined();
@@ -460,9 +617,9 @@ describe("I want to use stage storage", () => {
       expect(key3).toBeDefined();
 
       // Keys should contain workflow run ID
-      expect(key1).toContain("run-key-gen-1");
-      expect(key2).toContain("run-key-gen-1");
-      expect(key3).toContain("run-key-gen-1");
+      expect(key1).toContain(runId);
+      expect(key2).toContain(runId);
+      expect(key3).toContain(runId);
 
       // Keys should contain stage IDs
       expect(key1).toContain("stage-a");
@@ -495,23 +652,32 @@ describe("I want to use stage storage", () => {
         },
       });
 
-      const workflow = new WorkflowBuilder("default-suffix-test", "Test")
+      const workflow = new WorkflowBuilder(
+        "default-suffix-test",
+        "Test",
+        "Test",
+        z.object({}),
+        z.object({ key: z.string() }),
+      )
         .pipe(stage)
         .build();
 
-      // When: Execute
-      await createRun("run-default-suffix-1", "default-suffix-test", {});
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-default-suffix-1",
-        "test",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
+      const { kernel, flush, persistence } = createTestKernel([workflow]);
 
-      await executor.execute({}, {});
+      // When: Execute
+      const runId = await createAndStartRun(
+        kernel,
+        persistence,
+        flush,
+        "default-suffix-test",
+      );
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: runId,
+        workflowId: "default-suffix-test",
+        stageId: "default-suffix",
+        config: {},
+      });
 
       // Then: Key has output.json suffix
       expect(generatedKey).toBeDefined();
@@ -575,25 +741,48 @@ describe("I want to use stage storage", () => {
         },
       });
 
-      const workflow = new WorkflowBuilder("cross-stage-test", "Test")
+      const workflow = new WorkflowBuilder(
+        "cross-stage-test",
+        "Test",
+        "Test",
+        z.object({}),
+        z.object({ success: z.boolean() }),
+      )
         .pipe(stage1)
         .pipe(stage2)
         .pipe(stage3)
         .build();
 
-      // When: Execute
-      await createRun("run-cross-stage-1", "cross-stage-test", {});
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-cross-stage-1",
-        "test",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
+      const { kernel, flush, persistence } = createTestKernel([workflow]);
 
-      await executor.execute({}, {});
+      // When: Execute all stages in order
+      const runId = await createAndStartRun(
+        kernel,
+        persistence,
+        flush,
+        "cross-stage-test",
+      );
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: runId,
+        workflowId: "cross-stage-test",
+        stageId: "producer",
+        config: {},
+      });
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: runId,
+        workflowId: "cross-stage-test",
+        stageId: "transformer",
+        config: {},
+      });
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: runId,
+        workflowId: "cross-stage-test",
+        stageId: "consumer",
+        config: {},
+      });
 
       // Then: Final stage has combined data
       expect(finalData).toEqual({

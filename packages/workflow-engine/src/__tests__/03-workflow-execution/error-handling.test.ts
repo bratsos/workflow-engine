@@ -1,35 +1,76 @@
 /**
- * Workflow Error Handling Tests
+ * Workflow Error Handling Tests (Kernel)
  *
- * Tests for error handling during workflow execution.
+ * Tests for error handling during workflow execution via kernel dispatch.
+ * The kernel does NOT throw on stage failure -- it returns
+ * { outcome: "failed", error: "..." }.
  */
 
-import { beforeEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { WorkflowExecutor } from "../../core/executor.js";
 import { defineStage } from "../../core/stage-factory.js";
-import { WorkflowBuilder } from "../../core/workflow.js";
+import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
+import { createKernel } from "../../kernel/kernel.js";
 import {
-  createErrorStage,
-  createPassthroughStage,
-  InMemoryAICallLogger,
-  InMemoryWorkflowPersistence,
-  TestSchemas,
-} from "../utils/index.js";
+  CollectingEventSink,
+  FakeClock,
+  InMemoryBlobStore,
+  NoopScheduler,
+} from "../../kernel/testing/index.js";
+import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
+import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 
-describe("I want to handle workflow errors", () => {
-  let persistence: InMemoryWorkflowPersistence;
-  let aiLogger: InMemoryAICallLogger;
+function createTestKernel(workflows: Workflow<any, any>[] = []) {
+  const persistence = new InMemoryWorkflowPersistence();
+  const blobStore = new InMemoryBlobStore();
+  const jobTransport = new InMemoryJobQueue("test-worker");
+  const eventSink = new CollectingEventSink();
+  const scheduler = new NoopScheduler();
+  const clock = new FakeClock();
 
-  beforeEach(() => {
-    persistence = new InMemoryWorkflowPersistence();
-    aiLogger = new InMemoryAICallLogger();
+  const registry = new Map<string, Workflow<any, any>>();
+  for (const w of workflows) registry.set(w.id, w);
+
+  const kernel = createKernel({
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry: { getWorkflow: (id) => registry.get(id) },
   });
 
+  const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
+  return {
+    kernel,
+    flush,
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry,
+  };
+}
+
+describe("I want to handle workflow errors", () => {
   describe("stage failures", () => {
-    it("should propagate stage errors to workflow level", async () => {
+    it("should return failed outcome when stage throws", async () => {
       // Given: A workflow with a stage that throws
-      const errorStage = createErrorStage("failing-stage", "Stage exploded!");
+      const errorStage = defineStage({
+        id: "failing-stage",
+        name: "Stage failing-stage",
+        schemas: {
+          input: z.object({}).passthrough(),
+          output: z.object({}),
+          config: z.object({}),
+        },
+        async execute() {
+          throw new Error("Stage exploded!");
+        },
+      });
 
       const workflow = new WorkflowBuilder(
         "error-workflow",
@@ -41,32 +82,45 @@ describe("I want to handle workflow errors", () => {
         .pipe(errorStage)
         .build();
 
-      await persistence.createRun({
-        id: "run-error",
+      const { kernel, flush } = createTestKernel([workflow]);
+
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-1",
         workflowId: "error-workflow",
-        workflowName: "Error Workflow",
-        status: "PENDING",
         input: {},
       });
 
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-error",
-        "error-workflow",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
+      await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
 
       // When: I execute
-      // Then: Error is thrown
-      await expect(executor.execute({}, {})).rejects.toThrow("Stage exploded!");
+      const result = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "error-workflow",
+        stageId: "failing-stage",
+        config: {},
+      });
+
+      // Then: Returns failed outcome with error message
+      expect(result.outcome).toBe("failed");
+      expect(result.error).toBe("Stage exploded!");
     });
 
     it("should emit workflow:failed event on error", async () => {
       // Given: A workflow with a failing stage
-      const errorStage = createErrorStage("failing", "Something went wrong");
+      const errorStage = defineStage({
+        id: "failing",
+        name: "Stage failing",
+        schemas: {
+          input: z.object({}).passthrough(),
+          output: z.object({}),
+          config: z.object({}),
+        },
+        async execute() {
+          throw new Error("Something went wrong");
+        },
+      });
 
       const workflow = new WorkflowBuilder(
         "fail-event-workflow",
@@ -78,42 +132,53 @@ describe("I want to handle workflow errors", () => {
         .pipe(errorStage)
         .build();
 
-      await persistence.createRun({
-        id: "run-fail-event",
+      const { kernel, flush, eventSink } = createTestKernel([workflow]);
+
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-1",
         workflowId: "fail-event-workflow",
-        workflowName: "Fail Event Workflow",
-        status: "PENDING",
         input: {},
       });
 
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-fail-event",
-        "fail-event-workflow",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
-
-      // Collect events
-      let failedEvent: { workflowRunId: string; error: string } | null = null;
-      executor.on("workflow:failed", (data) => {
-        failedEvent = data as { workflowRunId: string; error: string };
-      });
+      await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
+      await flush();
+      eventSink.clear();
 
       // When: I execute (and it fails)
-      await expect(executor.execute({}, {})).rejects.toThrow();
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "fail-event-workflow",
+        stageId: "failing",
+        config: {},
+      });
+
+      // Transition to mark the run as failed
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+      await flush();
 
       // Then: workflow:failed event was emitted
-      expect(failedEvent).not.toBeNull();
-      expect(failedEvent?.workflowRunId).toBe("run-fail-event");
-      expect(failedEvent?.error).toContain("Something went wrong");
+      const failedEvents = eventSink.getByType("workflow:failed");
+      expect(failedEvents).toHaveLength(1);
+      expect((failedEvents[0] as any).workflowRunId).toBe(workflowRunId);
+      expect((failedEvents[0] as any).error).toContain("Something went wrong");
     });
 
     it("should emit stage:failed event on stage error", async () => {
       // Given: A workflow with a failing stage
-      const errorStage = createErrorStage("stage-fail", "Stage failed");
+      const errorStage = defineStage({
+        id: "stage-fail",
+        name: "Stage stage-fail",
+        schemas: {
+          input: z.object({}).passthrough(),
+          output: z.object({}),
+          config: z.object({}),
+        },
+        async execute() {
+          throw new Error("Stage failed");
+        },
+      });
 
       const workflow = new WorkflowBuilder(
         "stage-fail-event",
@@ -125,55 +190,53 @@ describe("I want to handle workflow errors", () => {
         .pipe(errorStage)
         .build();
 
-      await persistence.createRun({
-        id: "run-stage-fail-event",
+      const { kernel, flush, eventSink } = createTestKernel([workflow]);
+
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-1",
         workflowId: "stage-fail-event",
-        workflowName: "Stage Fail Event",
-        status: "PENDING",
         input: {},
       });
 
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-stage-fail-event",
-        "stage-fail-event",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
-
-      // Collect events
-      let stageFailedEvent: {
-        stageId: string;
-        stageName: string;
-        error: string;
-      } | null = null;
-      executor.on("stage:failed", (data) => {
-        stageFailedEvent = data as {
-          stageId: string;
-          stageName: string;
-          error: string;
-        };
-      });
+      await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
+      await flush();
+      eventSink.clear();
 
       // When: I execute
-      await expect(executor.execute({}, {})).rejects.toThrow();
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "stage-fail-event",
+        stageId: "stage-fail",
+        config: {},
+      });
+
+      await flush();
 
       // Then: stage:failed event was emitted
-      expect(stageFailedEvent).not.toBeNull();
-      expect(stageFailedEvent?.stageId).toBe("stage-fail");
-      expect(stageFailedEvent?.error).toContain("Stage failed");
+      const stageFailedEvents = eventSink.getByType("stage:failed");
+      expect(stageFailedEvents).toHaveLength(1);
+      expect((stageFailedEvents[0] as any).stageId).toBe("stage-fail");
+      expect((stageFailedEvents[0] as any).error).toContain("Stage failed");
     });
   });
 
   describe("persistence status updates on failure", () => {
     it("should update run status to FAILED on error", async () => {
       // Given: A failing workflow
-      const errorStage = createErrorStage(
-        "fail-status",
-        "Failure for status test",
-      );
+      const errorStage = defineStage({
+        id: "fail-status",
+        name: "Stage fail-status",
+        schemas: {
+          input: z.object({}).passthrough(),
+          output: z.object({}),
+          config: z.object({}),
+        },
+        async execute() {
+          throw new Error("Failure for status test");
+        },
+      });
 
       const workflow = new WorkflowBuilder(
         "fail-status-workflow",
@@ -185,39 +248,49 @@ describe("I want to handle workflow errors", () => {
         .pipe(errorStage)
         .build();
 
-      await persistence.createRun({
-        id: "run-fail-status",
+      const { kernel, flush, persistence } = createTestKernel([workflow]);
+
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-1",
         workflowId: "fail-status-workflow",
-        workflowName: "Fail Status Workflow",
-        status: "PENDING",
         input: {},
       });
 
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-fail-status",
-        "fail-status-workflow",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
+      await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
 
-      // When: I execute (and it fails)
-      await expect(executor.execute({}, {})).rejects.toThrow();
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "fail-status-workflow",
+        stageId: "fail-status",
+        config: {},
+      });
+
+      // Transition marks the run as failed
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+      await flush();
 
       // Then: Run status is FAILED
-      const run = await persistence.getRun("run-fail-status");
+      const run = await persistence.getRun(workflowRunId);
       expect(run?.status).toBe("FAILED");
       expect(run?.completedAt).toBeDefined();
     });
 
     it("should update stage status to FAILED on error", async () => {
       // Given: A failing workflow
-      const errorStage = createErrorStage(
-        "stage-fail-status",
-        "Stage status failure",
-      );
+      const errorStage = defineStage({
+        id: "stage-fail-status",
+        name: "Stage stage-fail-status",
+        schemas: {
+          input: z.object({}).passthrough(),
+          output: z.object({}),
+          config: z.object({}),
+        },
+        async execute() {
+          throw new Error("Stage status failure");
+        },
+      });
 
       const workflow = new WorkflowBuilder(
         "stage-fail-status-workflow",
@@ -229,29 +302,29 @@ describe("I want to handle workflow errors", () => {
         .pipe(errorStage)
         .build();
 
-      await persistence.createRun({
-        id: "run-stage-fail-status",
+      const { kernel, flush, persistence } = createTestKernel([workflow]);
+
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-1",
         workflowId: "stage-fail-status-workflow",
-        workflowName: "Stage Fail Status Workflow",
-        status: "PENDING",
         input: {},
       });
 
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-stage-fail-status",
-        "stage-fail-status-workflow",
-        { persistence, aiLogger },
-      );
+      await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
 
-      // When: I execute (and it fails)
-      await expect(executor.execute({}, {})).rejects.toThrow();
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "stage-fail-status-workflow",
+        stageId: "stage-fail-status",
+        config: {},
+      });
+
+      await flush();
 
       // Then: Stage status is FAILED with error message
-      const stages = await persistence.getStagesByRun(
-        "run-stage-fail-status",
-        {},
-      );
+      const stages = await persistence.getStagesByRun(workflowRunId);
       const uniqueStages = new Map(stages.map((s) => [s.stageId, s]));
       const failedStage = uniqueStages.get("stage-fail-status");
 
@@ -264,18 +337,21 @@ describe("I want to handle workflow errors", () => {
   describe("partial execution failure", () => {
     it("should mark only the failing stage as failed in multi-stage workflow", async () => {
       // Given: A workflow where second stage fails
-      const successStage = createPassthroughStage(
-        "success-stage",
-        TestSchemas.string,
-      );
+      const schema = z.object({ value: z.string() });
+
+      const successStage = defineStage({
+        id: "success-stage",
+        name: "Stage success-stage",
+        schemas: { input: schema, output: schema, config: z.object({}) },
+        async execute(ctx) {
+          return { output: ctx.input };
+        },
+      });
+
       const errorStage = defineStage({
         id: "error-stage",
         name: "Error Stage",
-        schemas: {
-          input: TestSchemas.string,
-          output: TestSchemas.string,
-          config: z.object({}),
-        },
+        schemas: { input: schema, output: schema, config: z.object({}) },
         async execute() {
           throw new Error("Second stage failed");
         },
@@ -285,38 +361,52 @@ describe("I want to handle workflow errors", () => {
         "partial-fail",
         "Partial Fail Workflow",
         "Test",
-        TestSchemas.string,
-        TestSchemas.string,
+        schema,
+        schema,
       )
         .pipe(successStage)
         .pipe(errorStage)
         .build();
 
-      await persistence.createRun({
-        id: "run-partial-fail",
+      const { kernel, flush, persistence } = createTestKernel([workflow]);
+
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-1",
         workflowId: "partial-fail",
-        workflowName: "Partial Fail Workflow",
-        status: "PENDING",
         input: { value: "test" },
       });
 
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-partial-fail",
-        "partial-fail",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
+      await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
 
-      // When: I execute (and it fails)
-      await expect(executor.execute({ value: "test" }, {})).rejects.toThrow(
-        "Second stage failed",
-      );
+      // Execute first stage (succeeds)
+      const r1 = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "partial-fail",
+        stageId: "success-stage",
+        config: {},
+      });
+      expect(r1.outcome).toBe("completed");
+
+      // Transition to second stage
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+
+      // Execute second stage (fails)
+      const r2 = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "partial-fail",
+        stageId: "error-stage",
+        config: {},
+      });
+      expect(r2.outcome).toBe("failed");
+      expect(r2.error).toBe("Second stage failed");
+
+      await flush();
 
       // Then: First stage is COMPLETED, second is FAILED
-      const stages = await persistence.getStagesByRun("run-partial-fail", {});
+      const stages = await persistence.getStagesByRun(workflowRunId);
       const uniqueStages = new Map(stages.map((s) => [s.stageId, s]));
 
       const firstStage = uniqueStages.get("success-stage");
@@ -329,15 +419,12 @@ describe("I want to handle workflow errors", () => {
     it("should not execute stages after a failure", async () => {
       // Given: A workflow with 3 stages where the 2nd fails
       const tracker: string[] = [];
+      const schema = z.object({ value: z.string() });
 
       const stage1 = defineStage({
         id: "stage-1",
         name: "Stage 1",
-        schemas: {
-          input: TestSchemas.string,
-          output: TestSchemas.string,
-          config: z.object({}),
-        },
+        schemas: { input: schema, output: schema, config: z.object({}) },
         async execute(ctx) {
           tracker.push("stage-1");
           return { output: ctx.input };
@@ -347,11 +434,7 @@ describe("I want to handle workflow errors", () => {
       const stage2 = defineStage({
         id: "stage-2",
         name: "Stage 2",
-        schemas: {
-          input: TestSchemas.string,
-          output: TestSchemas.string,
-          config: z.object({}),
-        },
+        schemas: { input: schema, output: schema, config: z.object({}) },
         async execute() {
           tracker.push("stage-2");
           throw new Error("Stage 2 failed");
@@ -361,11 +444,7 @@ describe("I want to handle workflow errors", () => {
       const stage3 = defineStage({
         id: "stage-3",
         name: "Stage 3",
-        schemas: {
-          input: TestSchemas.string,
-          output: TestSchemas.string,
-          config: z.object({}),
-        },
+        schemas: { input: schema, output: schema, config: z.object({}) },
         async execute(ctx) {
           tracker.push("stage-3");
           return { output: ctx.input };
@@ -376,34 +455,53 @@ describe("I want to handle workflow errors", () => {
         "stop-on-fail",
         "Stop On Fail Workflow",
         "Test",
-        TestSchemas.string,
-        TestSchemas.string,
+        schema,
+        schema,
       )
         .pipe(stage1)
         .pipe(stage2)
         .pipe(stage3)
         .build();
 
-      await persistence.createRun({
-        id: "run-stop-on-fail",
+      const { kernel, flush } = createTestKernel([workflow]);
+
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-1",
         workflowId: "stop-on-fail",
-        workflowName: "Stop On Fail Workflow",
-        status: "PENDING",
         input: { value: "test" },
       });
 
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-stop-on-fail",
-        "stop-on-fail",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
+      await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
 
-      // When: I execute (and it fails)
-      await expect(executor.execute({ value: "test" }, {})).rejects.toThrow();
+      // Execute stage 1 (succeeds)
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "stop-on-fail",
+        stageId: "stage-1",
+        config: {},
+      });
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+
+      // Execute stage 2 (fails)
+      const r2 = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "stop-on-fail",
+        stageId: "stage-2",
+        config: {},
+      });
+      expect(r2.outcome).toBe("failed");
+
+      // Transition marks workflow as failed, so stage 3 never gets enqueued
+      const transition = await kernel.dispatch({
+        type: "run.transition",
+        workflowRunId,
+      });
+      expect(transition.action).toBe("failed");
+
+      await flush();
 
       // Then: Stage 3 was never executed
       expect(tracker).toEqual(["stage-1", "stage-2"]);
@@ -412,7 +510,7 @@ describe("I want to handle workflow errors", () => {
   });
 
   describe("input validation errors", () => {
-    it("should throw on invalid stage input", async () => {
+    it("should return failed outcome on invalid stage input", async () => {
       // Given: A stage that requires specific input
       const strictStage = defineStage({
         id: "strict-input",
@@ -437,47 +535,45 @@ describe("I want to handle workflow errors", () => {
         .pipe(strictStage)
         .build();
 
-      await persistence.createRun({
-        id: "run-input-validation",
+      const { kernel, flush, persistence } = createTestKernel([workflow]);
+
+      // Create run manually with invalid input (bypass run.create validation)
+      const run = await persistence.createRun({
         workflowId: "input-validation",
         workflowName: "Input Validation",
-        status: "PENDING",
+        workflowType: "input-validation",
         input: {}, // Missing required field
       });
-
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-input-validation",
-        "input-validation",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
+      await persistence.updateRun(run.id, { status: "RUNNING" });
 
       // When: I execute with invalid input
-      // Then: Throws validation error
-      await expect(executor.execute({}, {})).rejects.toThrow();
+      const result = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: run.id,
+        workflowId: "input-validation",
+        stageId: "strict-input",
+        config: {},
+      });
+
+      // Then: Kernel returns failed outcome
+      expect(result.outcome).toBe("failed");
     });
   });
 
   describe("config validation errors", () => {
     it("should fail before execution with invalid config", async () => {
       // Given: A stage requiring specific config
-      const tracker: string[] = [];
-
       const configStage = defineStage({
         id: "config-required",
         name: "Config Required Stage",
         schemas: {
-          input: TestSchemas.string,
-          output: TestSchemas.string,
+          input: z.object({ value: z.string() }),
+          output: z.object({ value: z.string() }),
           config: z.object({
             model: z.string(),
           }),
         },
         async execute(ctx) {
-          tracker.push("executed");
           return { output: ctx.input };
         },
       });
@@ -486,38 +582,25 @@ describe("I want to handle workflow errors", () => {
         "config-validation",
         "Config Validation",
         "Test",
-        TestSchemas.string,
-        TestSchemas.string,
+        z.object({ value: z.string() }),
+        z.object({ value: z.string() }),
       )
         .pipe(configStage)
         .build();
 
-      await persistence.createRun({
-        id: "run-config-validation",
-        workflowId: "config-validation",
-        workflowName: "Config Validation",
-        status: "PENDING",
-        input: { value: "test" },
-      });
+      const { kernel } = createTestKernel([workflow]);
 
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-config-validation",
-        "config-validation",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
-
-      // When: I execute with missing config
-      // Then: Throws before stage executes
+      // When: I try to create a run with missing config
+      // Then: Kernel validates config at run.create time and throws
       await expect(
-        executor.execute({ value: "test" }, { "config-required": {} }),
-      ).rejects.toThrow(/config validation failed/i);
-
-      // Stage should not have been executed
-      expect(tracker).toHaveLength(0);
+        kernel.dispatch({
+          type: "run.create",
+          idempotencyKey: "key-1",
+          workflowId: "config-validation",
+          input: { value: "test" },
+          config: { "config-required": {} },
+        }),
+      ).rejects.toThrow(/invalid workflow config/i);
     });
   });
 });

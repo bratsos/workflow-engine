@@ -4,7 +4,7 @@
  * Stores artifacts in memory using a static Map for cross-instance access
  */
 
-import type { StageStorage } from "../storage";
+import type { StageStorage } from "../stage";
 
 export class InMemoryStageStorage implements StageStorage {
   readonly providerType = "memory" as const;

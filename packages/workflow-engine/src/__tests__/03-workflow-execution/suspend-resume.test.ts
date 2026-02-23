@@ -1,45 +1,101 @@
 /**
- * Workflow Suspend/Resume Tests
+ * Workflow Suspend/Resume Tests (Kernel)
  *
- * Tests for async-batch stages that suspend and resume execution.
+ * Tests for async-batch stages that suspend and resume execution
+ * via kernel dispatch. Uses job.execute -> check outcome === "suspended"
+ * -> stage.pollSuspended -> job.execute (resumed).
  */
 
-import { beforeEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { WorkflowExecutor } from "../../core/executor.js";
 import type { SimpleSuspendedResult } from "../../core/stage-factory.js";
-import { defineAsyncBatchStage } from "../../core/stage-factory.js";
-import { WorkflowBuilder } from "../../core/workflow.js";
 import {
-  createPassthroughStage,
-  createSuspendingStage,
-  InMemoryAICallLogger,
-  InMemoryWorkflowPersistence,
-  TestSchemas,
-} from "../utils/index.js";
+  defineAsyncBatchStage,
+  defineStage,
+} from "../../core/stage-factory.js";
+import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
+import { createKernel } from "../../kernel/kernel.js";
+import {
+  CollectingEventSink,
+  FakeClock,
+  InMemoryBlobStore,
+  NoopScheduler,
+} from "../../kernel/testing/index.js";
+import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
+import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 
-describe("I want to handle workflow suspension and resumption", () => {
-  let persistence: InMemoryWorkflowPersistence;
-  let aiLogger: InMemoryAICallLogger;
+function createTestKernel(workflows: Workflow<any, any>[] = []) {
+  const persistence = new InMemoryWorkflowPersistence();
+  const blobStore = new InMemoryBlobStore();
+  const jobTransport = new InMemoryJobQueue("test-worker");
+  const eventSink = new CollectingEventSink();
+  const scheduler = new NoopScheduler();
+  const clock = new FakeClock();
 
-  beforeEach(() => {
-    persistence = new InMemoryWorkflowPersistence();
-    aiLogger = new InMemoryAICallLogger();
+  const registry = new Map<string, Workflow<any, any>>();
+  for (const w of workflows) registry.set(w.id, w);
+
+  const kernel = createKernel({
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry: { getWorkflow: (id) => registry.get(id) },
   });
 
+  const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
+  return {
+    kernel,
+    flush,
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry,
+  };
+}
+
+describe("I want to handle workflow suspension and resumption", () => {
   describe("stage suspension", () => {
     it("should suspend workflow when stage returns SuspendedResult", async () => {
       // Given: A workflow with an async-batch stage that suspends
-      const suspendingStage = createSuspendingStage(
-        "batch-stage",
-        z.object({ result: z.string() }),
-        {
-          batchId: "batch-123",
-          pollInterval: 5000,
-          maxWaitTime: 60000,
-          getOutput: () => ({ result: "completed" }),
+      const suspendingStage = defineAsyncBatchStage({
+        id: "batch-stage",
+        name: "Batch Stage",
+        mode: "async-batch",
+        schemas: {
+          input: z.object({}).passthrough(),
+          output: z.object({ result: z.string() }),
+          config: z.object({}),
         },
-      );
+        async execute(ctx) {
+          if (ctx.resumeState) {
+            return { output: { result: "completed" } };
+          }
+          const now = new Date();
+          return {
+            suspended: true,
+            state: {
+              batchId: "batch-123",
+              submittedAt: now.toISOString(),
+              pollInterval: 5000,
+              maxWaitTime: 60000,
+            },
+            pollConfig: {
+              pollInterval: 5000,
+              maxWaitTime: 60000,
+              nextPollAt: new Date(now.getTime() + 5000),
+            },
+          } as SimpleSuspendedResult;
+        },
+        async checkCompletion() {
+          return { ready: true, output: { result: "completed" } };
+        },
+      });
 
       const workflow = new WorkflowBuilder(
         "suspend-workflow",
@@ -51,42 +107,63 @@ describe("I want to handle workflow suspension and resumption", () => {
         .pipe(suspendingStage)
         .build();
 
-      await persistence.createRun({
-        id: "run-suspend",
+      const { kernel, flush } = createTestKernel([workflow]);
+
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-1",
         workflowId: "suspend-workflow",
-        workflowName: "Suspend Workflow",
-        status: "PENDING",
         input: {},
       });
 
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-suspend",
-        "suspend-workflow",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
+      await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
 
       // When: I execute
-      const result = await executor.execute({}, {});
+      const result = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "suspend-workflow",
+        stageId: "batch-stage",
+        config: {},
+      });
 
-      // Then: Returns "suspended"
-      expect(result).toBe("suspended");
+      // Then: Returns "suspended" outcome
+      expect(result.outcome).toBe("suspended");
     });
 
     it("should emit stage:suspended event", async () => {
       // Given: A suspending stage
-      const suspendingStage = createSuspendingStage(
-        "event-stage",
-        z.object({ done: z.boolean() }),
-        {
-          pollInterval: 1000,
-          maxWaitTime: 30000,
-          getOutput: () => ({ done: true }),
+      const suspendingStage = defineAsyncBatchStage({
+        id: "event-stage",
+        name: "Event Stage",
+        mode: "async-batch",
+        schemas: {
+          input: z.object({}).passthrough(),
+          output: z.object({ done: z.boolean() }),
+          config: z.object({}),
         },
-      );
+        async execute(ctx) {
+          if (ctx.resumeState) return { output: { done: true } };
+          const now = new Date();
+          return {
+            suspended: true,
+            state: {
+              batchId: "batch-event",
+              submittedAt: now.toISOString(),
+              pollInterval: 1000,
+              maxWaitTime: 30000,
+            },
+            pollConfig: {
+              pollInterval: 1000,
+              maxWaitTime: 30000,
+              nextPollAt: new Date(now.getTime() + 1000),
+            },
+          } as SimpleSuspendedResult;
+        },
+        async checkCompletion() {
+          return { ready: true, output: { done: true } };
+        },
+      });
 
       const workflow = new WorkflowBuilder(
         "suspend-event",
@@ -98,91 +175,35 @@ describe("I want to handle workflow suspension and resumption", () => {
         .pipe(suspendingStage)
         .build();
 
-      await persistence.createRun({
-        id: "run-suspend-event",
+      const { kernel, flush, eventSink } = createTestKernel([workflow]);
+
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-1",
         workflowId: "suspend-event",
-        workflowName: "Suspend Event Workflow",
-        status: "PENDING",
         input: {},
       });
 
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-suspend-event",
-        "suspend-event",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
-
-      // Collect events
-      let suspendedEvent: {
-        stageId: string;
-        stageName: string;
-        resumeAt: Date;
-      } | null = null;
-      executor.on("stage:suspended", (data) => {
-        suspendedEvent = data as {
-          stageId: string;
-          stageName: string;
-          resumeAt: Date;
-        };
-      });
+      await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
+      await flush();
+      eventSink.clear();
 
       // When: I execute
-      await executor.execute({}, {});
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "suspend-event",
+        stageId: "event-stage",
+        config: {},
+      });
+
+      await flush();
 
       // Then: stage:suspended event was emitted
-      expect(suspendedEvent).not.toBeNull();
-      expect(suspendedEvent?.stageId).toBe("event-stage");
-      expect(suspendedEvent?.resumeAt).toBeInstanceOf(Date);
-    });
-
-    it("should update workflow run status to SUSPENDED", async () => {
-      // Given: A suspending stage
-      const suspendingStage = createSuspendingStage(
-        "status-stage",
-        z.object({ value: z.number() }),
-        {
-          getOutput: () => ({ value: 42 }),
-        },
-      );
-
-      const workflow = new WorkflowBuilder(
-        "suspend-status",
-        "Suspend Status Workflow",
-        "Test",
-        z.object({}).passthrough(),
-        z.object({ value: z.number() }),
-      )
-        .pipe(suspendingStage)
-        .build();
-
-      await persistence.createRun({
-        id: "run-suspend-status",
-        workflowId: "suspend-status",
-        workflowName: "Suspend Status Workflow",
-        status: "PENDING",
-        input: {},
-      });
-
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-suspend-status",
-        "suspend-status",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
-
-      // When: I execute
-      await executor.execute({}, {});
-
-      // Then: Run status is SUSPENDED
-      const run = await persistence.getRun("run-suspend-status");
-      expect(run?.status).toBe("SUSPENDED");
+      const suspendedEvents = eventSink.getByType("stage:suspended");
+      expect(suspendedEvents).toHaveLength(1);
+      expect((suspendedEvents[0] as any).stageId).toBe("event-stage");
+      expect((suspendedEvents[0] as any).nextPollAt).toBeDefined();
     });
 
     it("should update stage record with suspended state", async () => {
@@ -218,7 +239,7 @@ describe("I want to handle workflow suspension and resumption", () => {
             },
           } as SimpleSuspendedResult;
         },
-        async checkCompletion(state) {
+        async checkCompletion() {
           return { ready: true, output: { data: "complete" } };
         },
       });
@@ -233,29 +254,28 @@ describe("I want to handle workflow suspension and resumption", () => {
         .pipe(suspendingStage)
         .build();
 
-      await persistence.createRun({
-        id: "run-suspend-state",
+      const { kernel, flush, persistence } = createTestKernel([workflow]);
+
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-1",
         workflowId: "suspend-state",
-        workflowName: "Suspend State Workflow",
-        status: "PENDING",
         input: {},
       });
 
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-suspend-state",
-        "suspend-state",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
+      await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
 
       // When: I execute
-      await executor.execute({}, {});
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "suspend-state",
+        stageId: "state-stage",
+        config: {},
+      });
 
       // Then: Stage record has suspended state
-      const stages = await persistence.getStagesByRun("run-suspend-state", {});
+      const stages = await persistence.getStagesByRun(workflowRunId);
       const uniqueStages = new Map(stages.map((s) => [s.stageId, s]));
       const stage = uniqueStages.get("state-stage");
 
@@ -269,10 +289,8 @@ describe("I want to handle workflow suspension and resumption", () => {
   });
 
   describe("workflow resumption", () => {
-    it("should resume suspended workflow with resume option", async () => {
+    it("should resume suspended workflow via stage.pollSuspended", async () => {
       // Given: A previously suspended workflow that is now ready to complete
-      let isComplete = false;
-
       const suspendingStage = defineAsyncBatchStage({
         id: "resume-stage",
         name: "Resume Stage",
@@ -284,11 +302,8 @@ describe("I want to handle workflow suspension and resumption", () => {
         },
         async execute(ctx) {
           if (ctx.resumeState) {
-            // On resume, return the completed result
             return { output: { result: "workflow-completed" } };
           }
-
-          // First execution - suspend
           const now = new Date();
           return {
             suspended: true,
@@ -306,10 +321,7 @@ describe("I want to handle workflow suspension and resumption", () => {
           } as SimpleSuspendedResult;
         },
         async checkCompletion() {
-          if (isComplete) {
-            return { ready: true, output: { result: "from-check" } };
-          }
-          return { ready: false, nextCheckIn: 100 };
+          return { ready: true, output: { result: "from-check" } };
         },
       });
 
@@ -323,61 +335,59 @@ describe("I want to handle workflow suspension and resumption", () => {
         .pipe(suspendingStage)
         .build();
 
-      // First: Create and suspend the workflow
-      await persistence.createRun({
-        id: "run-resume",
+      const { kernel, flush, persistence, clock } = createTestKernel([
+        workflow,
+      ]);
+
+      // 1. Create and suspend the workflow
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-1",
         workflowId: "resume-workflow",
-        workflowName: "Resume Workflow",
-        status: "PENDING",
         input: {},
       });
 
-      const executor1 = new WorkflowExecutor(
-        workflow,
-        "run-resume",
-        "resume-workflow",
-        {
-          persistence,
-          aiLogger,
-        },
+      await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
+
+      const suspendResult = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "resume-workflow",
+        stageId: "resume-stage",
+        config: {},
+      });
+      expect(suspendResult.outcome).toBe("suspended");
+
+      // 2. Set nextPollAt to the past so pollSuspended picks it up
+      const stages = await persistence.getStagesByRun(workflowRunId);
+      await persistence.updateStage(stages[0]!.id, {
+        nextPollAt: new Date(clock.now().getTime() - 1000),
+      });
+
+      // 3. Poll suspended stages -- checkCompletion returns ready
+      const pollResult = await kernel.dispatch({
+        type: "stage.pollSuspended",
+      });
+
+      expect(pollResult.resumed).toBe(1);
+
+      // 4. The stage should now be COMPLETED
+      const updatedStages = await persistence.getStagesByRun(workflowRunId);
+      const resumedStage = updatedStages.find(
+        (s) => s.stageId === "resume-stage",
       );
+      expect(resumedStage?.status).toBe("COMPLETED");
 
-      const suspendResult = await executor1.execute({}, {});
-      expect(suspendResult).toBe("suspended");
+      // 5. Transition to complete the workflow
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+      await flush();
 
-      // Now the batch is "complete"
-      isComplete = true;
-
-      // Update stage to be ready for resume (set nextPollAt to past)
-      const stages = await persistence.getStagesByRun("run-resume", {});
-      const uniqueStages = new Map(stages.map((s) => [s.stageId, s]));
-      const stage = uniqueStages.get("resume-stage");
-      if (stage) {
-        await persistence.updateStage(stage.id, {
-          nextPollAt: new Date(Date.now() - 1000), // Past time - ready to resume
-        });
-      }
-
-      // When: I resume the workflow
-      const executor2 = new WorkflowExecutor(
-        workflow,
-        "run-resume",
-        "resume-workflow",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
-
-      const result = await executor2.execute({}, {}, { resume: true });
-
-      // Then: Workflow completes with output
-      expect(result).toEqual({ result: "workflow-completed" });
+      const run = await persistence.getRun(workflowRunId);
+      expect(run?.status).toBe("COMPLETED");
     });
 
     it("should continue with stages after resumed stage completes", async () => {
       // Given: A workflow with suspend stage followed by normal stage
-      let hasResumed = false;
       const executionOrder: string[] = [];
 
       const suspendStage = defineAsyncBatchStage({
@@ -385,8 +395,8 @@ describe("I want to handle workflow suspension and resumption", () => {
         name: "First Suspend",
         mode: "async-batch",
         schemas: {
-          input: TestSchemas.string,
-          output: TestSchemas.string,
+          input: z.object({ value: z.string() }),
+          output: z.object({ value: z.string() }),
           config: z.object({}),
         },
         async execute(ctx) {
@@ -414,149 +424,187 @@ describe("I want to handle workflow suspension and resumption", () => {
           } as SimpleSuspendedResult;
         },
         async checkCompletion() {
-          return { ready: hasResumed };
+          return { ready: true, output: { value: "from-poll" } };
         },
       });
 
-      const secondStage = createPassthroughStage(
-        "second-stage",
-        TestSchemas.string,
-      );
-
-      // Wrap to track execution
-      const originalExecute = secondStage.execute.bind(secondStage);
-      secondStage.execute = async (ctx) => {
-        executionOrder.push("second-execute");
-        return originalExecute(ctx);
-      };
+      const secondStage = defineStage({
+        id: "second-stage",
+        name: "Stage second-stage",
+        schemas: {
+          input: z.object({ value: z.string() }),
+          output: z.object({ value: z.string() }),
+          config: z.object({}),
+        },
+        async execute(ctx) {
+          executionOrder.push("second-execute");
+          return { output: ctx.input };
+        },
+      });
 
       const workflow = new WorkflowBuilder(
         "multi-resume",
         "Multi Resume Workflow",
         "Test",
-        TestSchemas.string,
-        TestSchemas.string,
+        z.object({ value: z.string() }),
+        z.object({ value: z.string() }),
       )
         .pipe(suspendStage)
         .pipe(secondStage)
         .build();
 
-      // First: Execute and suspend
-      await persistence.createRun({
-        id: "run-multi-resume",
+      const { kernel, flush, persistence, clock } = createTestKernel([
+        workflow,
+      ]);
+
+      // 1. Create and suspend
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-1",
         workflowId: "multi-resume",
-        workflowName: "Multi Resume Workflow",
-        status: "PENDING",
         input: { value: "test-data" },
       });
 
-      const executor1 = new WorkflowExecutor(
-        workflow,
-        "run-multi-resume",
-        "multi-resume",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
+      await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
 
-      const suspendResult = await executor1.execute({ value: "test-data" }, {});
-      expect(suspendResult).toBe("suspended");
+      const suspendResult = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "multi-resume",
+        stageId: "first-suspend",
+        config: {},
+      });
+      expect(suspendResult.outcome).toBe("suspended");
       expect(executionOrder).toEqual(["first-execute"]);
 
-      // Mark as ready
-      hasResumed = true;
+      // 2. Poll to complete the suspended stage
+      const stages = await persistence.getStagesByRun(workflowRunId);
+      const suspendedStage = stages.find((s) => s.stageId === "first-suspend");
+      await persistence.updateStage(suspendedStage!.id, {
+        nextPollAt: new Date(clock.now().getTime() - 1000),
+      });
 
-      // Update stage to be ready for resume
-      const stages = await persistence.getStagesByRun("run-multi-resume", {});
-      const uniqueStages = new Map(stages.map((s) => [s.stageId, s]));
-      const stage = uniqueStages.get("first-suspend");
-      if (stage) {
-        await persistence.updateStage(stage.id, {
-          nextPollAt: new Date(Date.now() - 1000),
-        });
-      }
+      await kernel.dispatch({ type: "stage.pollSuspended" });
 
-      // When: Resume
-      const executor2 = new WorkflowExecutor(
-        workflow,
-        "run-multi-resume",
-        "multi-resume",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
+      // 3. Transition to advance to next stage
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
 
-      const result = await executor2.execute(
-        { value: "test-data" },
-        {},
-        { resume: true },
-      );
+      // 4. Execute second stage
+      const r2 = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "multi-resume",
+        stageId: "second-stage",
+        config: {},
+      });
+      expect(r2.outcome).toBe("completed");
 
-      // Then: Both stages executed in order after resume
-      expect(result).toEqual({ value: "test-data" });
-      expect(executionOrder).toContain("first-resume");
+      // 5. Complete workflow
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
+      await flush();
+
       expect(executionOrder).toContain("second-execute");
+
+      const run = await persistence.getRun(workflowRunId);
+      expect(run?.status).toBe("COMPLETED");
     });
   });
 
   describe("suspension in multi-stage workflows", () => {
     it("should preserve completed stages when suspending", async () => {
       // Given: A workflow where second stage suspends
-      const firstStage = createPassthroughStage(
-        "first-done",
-        TestSchemas.string,
-      );
-
-      const secondSuspend = createSuspendingStage(
-        "second-suspend",
-        TestSchemas.string,
-        {
-          getOutput: () => ({ value: "suspended-output" }),
+      const firstStage = defineStage({
+        id: "first-done",
+        name: "Stage first-done",
+        schemas: {
+          input: z.object({ value: z.string() }),
+          output: z.object({ value: z.string() }),
+          config: z.object({}),
         },
-      );
+        async execute(ctx) {
+          return { output: ctx.input };
+        },
+      });
+
+      const secondSuspend = defineAsyncBatchStage({
+        id: "second-suspend",
+        name: "Second Suspend",
+        mode: "async-batch",
+        schemas: {
+          input: z.object({ value: z.string() }),
+          output: z.object({ value: z.string() }),
+          config: z.object({}),
+        },
+        async execute(ctx) {
+          if (ctx.resumeState) return { output: { value: "suspended-output" } };
+          const now = new Date();
+          return {
+            suspended: true,
+            state: {
+              batchId: "batch-second",
+              submittedAt: now.toISOString(),
+              pollInterval: 1000,
+              maxWaitTime: 60000,
+            },
+            pollConfig: {
+              pollInterval: 1000,
+              maxWaitTime: 60000,
+              nextPollAt: new Date(now.getTime() + 1000),
+            },
+          } as SimpleSuspendedResult;
+        },
+        async checkCompletion() {
+          return { ready: true, output: { value: "suspended-output" } };
+        },
+      });
 
       const workflow = new WorkflowBuilder(
         "partial-suspend",
         "Partial Suspend Workflow",
         "Test",
-        TestSchemas.string,
-        TestSchemas.string,
+        z.object({ value: z.string() }),
+        z.object({ value: z.string() }),
       )
         .pipe(firstStage)
         .pipe(secondSuspend)
         .build();
 
-      await persistence.createRun({
-        id: "run-partial-suspend",
+      const { kernel, flush, persistence } = createTestKernel([workflow]);
+
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-1",
         workflowId: "partial-suspend",
-        workflowName: "Partial Suspend Workflow",
-        status: "PENDING",
         input: { value: "input" },
       });
 
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-partial-suspend",
-        "partial-suspend",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
+      await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
 
-      // When: I execute
-      const result = await executor.execute({ value: "input" }, {});
+      // Execute first stage (completes)
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "partial-suspend",
+        stageId: "first-done",
+        config: {},
+      });
 
-      // Then: Workflow is suspended
-      expect(result).toBe("suspended");
+      // Transition to second stage
+      await kernel.dispatch({ type: "run.transition", workflowRunId });
 
-      // And: First stage is completed, second is suspended
-      const stages = await persistence.getStagesByRun(
-        "run-partial-suspend",
-        {},
-      );
+      // Execute second stage (suspends)
+      const result = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "partial-suspend",
+        stageId: "second-suspend",
+        config: {},
+      });
+
+      expect(result.outcome).toBe("suspended");
+
+      // Then: First stage is completed, second is suspended
+      const stages = await persistence.getStagesByRun(workflowRunId);
       const uniqueStages = new Map(stages.map((s) => [s.stageId, s]));
 
       expect(uniqueStages.get("first-done")?.status).toBe("COMPLETED");
@@ -565,51 +613,104 @@ describe("I want to handle workflow suspension and resumption", () => {
   });
 
   describe("parallel stage suspension", () => {
-    it("should suspend workflow if any parallel stage suspends", async () => {
+    it("should suspend when any parallel stage suspends", async () => {
       // Given: Parallel stages where one suspends
-      const normalStage = createPassthroughStage(
-        "parallel-normal",
-        TestSchemas.string,
-      );
-
-      const suspendStage = createSuspendingStage(
-        "parallel-suspend",
-        TestSchemas.string,
-        {
-          getOutput: () => ({ value: "suspended" }),
+      const normalStage = defineStage({
+        id: "parallel-normal",
+        name: "Parallel Normal",
+        schemas: {
+          input: z.object({ value: z.string() }),
+          output: z.object({ value: z.string() }),
+          config: z.object({}),
         },
-      );
+        async execute(ctx) {
+          return { output: ctx.input };
+        },
+      });
+
+      const suspendStage = defineAsyncBatchStage({
+        id: "parallel-suspend",
+        name: "Parallel Suspend",
+        mode: "async-batch",
+        schemas: {
+          input: z.object({ value: z.string() }),
+          output: z.object({ value: z.string() }),
+          config: z.object({}),
+        },
+        async execute(ctx) {
+          if (ctx.resumeState) return { output: { value: "suspended" } };
+          const now = new Date();
+          return {
+            suspended: true,
+            state: {
+              batchId: "batch-parallel",
+              submittedAt: now.toISOString(),
+              pollInterval: 1000,
+              maxWaitTime: 60000,
+            },
+            pollConfig: {
+              pollInterval: 1000,
+              maxWaitTime: 60000,
+              nextPollAt: new Date(now.getTime() + 1000),
+            },
+          } as SimpleSuspendedResult;
+        },
+        async checkCompletion() {
+          return { ready: true, output: { value: "suspended" } };
+        },
+      });
 
       const workflow = new WorkflowBuilder(
         "parallel-with-suspend",
         "Parallel With Suspend",
         "Test",
-        TestSchemas.string,
+        z.object({ value: z.string() }),
         z.any(),
       )
         .parallel([normalStage, suspendStage])
         .build();
 
-      await persistence.createRun({
-        id: "run-parallel-suspend",
+      const { kernel, flush, persistence } = createTestKernel([workflow]);
+
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-1",
         workflowId: "parallel-with-suspend",
-        workflowName: "Parallel With Suspend",
-        status: "PENDING",
         input: { value: "test" },
       });
 
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-parallel-suspend",
-        "parallel-with-suspend",
-        { persistence, aiLogger },
-      );
+      await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
 
-      // When: I execute
-      const result = await executor.execute({ value: "test" }, {});
+      // Execute normal stage (completes)
+      const rNormal = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "parallel-with-suspend",
+        stageId: "parallel-normal",
+        config: {},
+      });
+      expect(rNormal.outcome).toBe("completed");
 
-      // Then: Workflow is suspended
-      expect(result).toBe("suspended");
+      // Execute suspend stage (suspends)
+      const rSuspend = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "parallel-with-suspend",
+        stageId: "parallel-suspend",
+        config: {},
+      });
+      expect(rSuspend.outcome).toBe("suspended");
+
+      // Transition should noop because a stage is still SUSPENDED (active)
+      const transition = await kernel.dispatch({
+        type: "run.transition",
+        workflowRunId,
+      });
+      expect(transition.action).toBe("noop");
+
+      // Run should still be RUNNING (not completed)
+      const run = await persistence.getRun(workflowRunId);
+      expect(run?.status).toBe("RUNNING");
     });
   });
 });

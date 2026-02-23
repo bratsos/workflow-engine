@@ -20,9 +20,9 @@ import type {
   JobQueue,
   WorkflowPersistence,
 } from "../../persistence/interface.js";
-import { InMemoryAICallLogger } from "../utils/in-memory-ai-logger.js";
-import { InMemoryJobQueue } from "../utils/in-memory-job-queue.js";
-import { InMemoryWorkflowPersistence } from "../utils/in-memory-persistence.js";
+import { InMemoryAICallLogger } from "../../testing/in-memory-ai-logger.js";
+import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
+import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 
 // ============================================================================
 // Test Suite Factory Types
@@ -151,6 +151,19 @@ function createPersistenceConformanceTests(
         // When/Then: Updating non-existent run throws
         await expect(
           persistence.updateRun("non-existent-run", { status: "RUNNING" }),
+        ).rejects.toThrow();
+      });
+
+      it("should throw on stale run expectedVersion", async () => {
+        const run = await persistence.createRun(
+          createRunData({ id: "stale-run-test" }),
+        );
+
+        await expect(
+          persistence.updateRun(run.id, {
+            status: "RUNNING",
+            expectedVersion: run.version + 1,
+          }),
         ).rejects.toThrow();
       });
 
@@ -301,6 +314,22 @@ function createPersistenceConformanceTests(
           "update-by-ids-stage",
         );
         expect(stage?.status).toBe("COMPLETED");
+      });
+
+      it("should throw on stale stage expectedVersion", async () => {
+        const created = await persistence.createStage(
+          createStageData({
+            workflowRunId: "stale-stage-run",
+            stageId: "stale-stage",
+          }),
+        );
+
+        await expect(
+          persistence.updateStage(created.id, {
+            status: "RUNNING",
+            expectedVersion: created.version + 1,
+          }),
+        ).rejects.toThrow();
       });
 
       it("should upsert a stage - create when not exists", async () => {
@@ -790,6 +819,282 @@ function createPersistenceConformanceTests(
         }
       });
     });
+
+    describe("outbox operations", () => {
+      it("should append outbox events with auto-assigned sequences", async () => {
+        // Given: Two events for the same run
+        const events = [
+          {
+            workflowRunId: "outbox-run-1",
+            eventType: "run.started",
+            payload: { runId: "outbox-run-1" },
+            causationId: "cmd-1",
+            occurredAt: new Date(),
+          },
+          {
+            workflowRunId: "outbox-run-1",
+            eventType: "stage.completed",
+            payload: { stageId: "s1" },
+            causationId: "cmd-1",
+            occurredAt: new Date(),
+          },
+        ];
+
+        // When: Appending events
+        await persistence.appendOutboxEvents(events);
+
+        // Then: Events are stored with incrementing sequences
+        const unpublished = await persistence.getUnpublishedOutboxEvents();
+        const runEvents = unpublished.filter(
+          (e) => e.workflowRunId === "outbox-run-1",
+        );
+        expect(runEvents).toHaveLength(2);
+        expect(runEvents[0].sequence).toBe(1);
+        expect(runEvents[1].sequence).toBe(2);
+      });
+
+      it("should return unpublished events ordered by run and sequence", async () => {
+        // Given: Events for two different runs
+        await persistence.appendOutboxEvents([
+          {
+            workflowRunId: "outbox-run-b",
+            eventType: "run.started",
+            payload: {},
+            causationId: "cmd-b",
+            occurredAt: new Date(),
+          },
+          {
+            workflowRunId: "outbox-run-a",
+            eventType: "run.started",
+            payload: {},
+            causationId: "cmd-a",
+            occurredAt: new Date(),
+          },
+        ]);
+
+        // When: Getting unpublished events
+        const events = await persistence.getUnpublishedOutboxEvents();
+
+        // Then: Ordered by workflowRunId, then sequence
+        const runIds = events.map((e) => e.workflowRunId);
+        const aIdx = runIds.indexOf("outbox-run-a");
+        const bIdx = runIds.indexOf("outbox-run-b");
+        expect(aIdx).toBeLessThan(bIdx);
+      });
+
+      it("should respect the limit parameter", async () => {
+        // Given: 5 events
+        const events = Array.from({ length: 5 }, (_, i) => ({
+          workflowRunId: "outbox-limit-run",
+          eventType: `event-${i}`,
+          payload: {},
+          causationId: `cmd-${i}`,
+          occurredAt: new Date(),
+        }));
+        await persistence.appendOutboxEvents(events);
+
+        // When: Getting with limit of 2
+        const result = await persistence.getUnpublishedOutboxEvents(2);
+
+        // Then: Returns only 2
+        expect(result).toHaveLength(2);
+      });
+
+      it("should mark events as published", async () => {
+        // Given: Two unpublished events
+        await persistence.appendOutboxEvents([
+          {
+            workflowRunId: "outbox-publish-run",
+            eventType: "run.started",
+            payload: {},
+            causationId: "cmd-1",
+            occurredAt: new Date(),
+          },
+          {
+            workflowRunId: "outbox-publish-run",
+            eventType: "stage.completed",
+            payload: {},
+            causationId: "cmd-2",
+            occurredAt: new Date(),
+          },
+        ]);
+
+        const events = await persistence.getUnpublishedOutboxEvents();
+        const targetEvents = events.filter(
+          (e) => e.workflowRunId === "outbox-publish-run",
+        );
+        expect(targetEvents.length).toBeGreaterThanOrEqual(1);
+
+        // When: Marking the first event as published
+        await persistence.markOutboxEventsPublished([targetEvents[0].id]);
+
+        // Then: Published event no longer appears in unpublished
+        const remaining = await persistence.getUnpublishedOutboxEvents();
+        const remainingForRun = remaining.filter(
+          (e) => e.workflowRunId === "outbox-publish-run",
+        );
+        expect(remainingForRun.some((e) => e.id === targetEvents[0].id)).toBe(
+          false,
+        );
+      });
+
+      it("should handle empty arrays gracefully", async () => {
+        // When: Appending empty array and marking empty array
+        // Then: No errors thrown
+        await expect(persistence.appendOutboxEvents([])).resolves.not.toThrow();
+        await expect(
+          persistence.markOutboxEventsPublished([]),
+        ).resolves.not.toThrow();
+      });
+    });
+
+    describe("outbox DLQ operations", () => {
+      it("should increment retry count and return new count", async () => {
+        // Given: An outbox event
+        await persistence.appendOutboxEvents([
+          {
+            workflowRunId: "dlq-retry-run",
+            eventType: "run.started",
+            payload: {},
+            causationId: "cmd-1",
+            occurredAt: new Date(),
+          },
+        ]);
+        const events = await persistence.getUnpublishedOutboxEvents();
+        const event = events.find((e) => e.workflowRunId === "dlq-retry-run")!;
+        expect(event.retryCount).toBe(0);
+
+        // When: Incrementing retry count twice
+        const count1 = await persistence.incrementOutboxRetryCount(event.id);
+        const count2 = await persistence.incrementOutboxRetryCount(event.id);
+
+        // Then: Returns incrementing counts
+        expect(count1).toBe(1);
+        expect(count2).toBe(2);
+      });
+
+      it("should move event to DLQ and exclude from unpublished", async () => {
+        // Given: An outbox event
+        await persistence.appendOutboxEvents([
+          {
+            workflowRunId: "dlq-move-run",
+            eventType: "run.started",
+            payload: {},
+            causationId: "cmd-1",
+            occurredAt: new Date(),
+          },
+        ]);
+        const events = await persistence.getUnpublishedOutboxEvents();
+        const event = events.find((e) => e.workflowRunId === "dlq-move-run")!;
+
+        // When: Moving to DLQ
+        await persistence.moveOutboxEventToDLQ(event.id);
+
+        // Then: Event is no longer in unpublished results
+        const remaining = await persistence.getUnpublishedOutboxEvents();
+        expect(remaining.some((e) => e.id === event.id)).toBe(false);
+      });
+
+      it("should replay DLQ events back to unpublished", async () => {
+        // Given: An event in DLQ
+        await persistence.appendOutboxEvents([
+          {
+            workflowRunId: "dlq-replay-run",
+            eventType: "run.started",
+            payload: {},
+            causationId: "cmd-1",
+            occurredAt: new Date(),
+          },
+        ]);
+        const events = await persistence.getUnpublishedOutboxEvents();
+        const event = events.find((e) => e.workflowRunId === "dlq-replay-run")!;
+        await persistence.moveOutboxEventToDLQ(event.id);
+
+        // Verify it's gone from unpublished
+        const beforeReplay = await persistence.getUnpublishedOutboxEvents();
+        expect(beforeReplay.some((e) => e.id === event.id)).toBe(false);
+
+        // When: Replaying DLQ
+        const replayedCount = await persistence.replayDLQEvents(10);
+
+        // Then: Event is back in unpublished
+        expect(replayedCount).toBeGreaterThanOrEqual(1);
+        const afterReplay = await persistence.getUnpublishedOutboxEvents();
+        expect(afterReplay.some((e) => e.id === event.id)).toBe(true);
+      });
+
+      it("should return 0 when no DLQ events to replay", async () => {
+        // When: Replaying with no DLQ events
+        const count = await persistence.replayDLQEvents(10);
+
+        // Then: Returns 0
+        expect(count).toBe(0);
+      });
+    });
+
+    describe("idempotency operations", () => {
+      it("should acquire a new idempotency key", async () => {
+        const result = await persistence.acquireIdempotencyKey(
+          "idem-key-1",
+          "run.create",
+        );
+        expect(result.status).toBe("acquired");
+      });
+
+      it("should return in_progress when key is already acquired", async () => {
+        await persistence.acquireIdempotencyKey("idem-key-1", "run.create");
+
+        const second = await persistence.acquireIdempotencyKey(
+          "idem-key-1",
+          "run.create",
+        );
+        expect(second.status).toBe("in_progress");
+      });
+
+      it("should return replay after completion", async () => {
+        await persistence.acquireIdempotencyKey("idem-key-1", "run.create");
+        await persistence.completeIdempotencyKey("idem-key-1", "run.create", {
+          workflowRunId: "run-123",
+          status: "PENDING",
+        });
+
+        const replay = await persistence.acquireIdempotencyKey(
+          "idem-key-1",
+          "run.create",
+        );
+        expect(replay.status).toBe("replay");
+        if (replay.status === "replay") {
+          expect(replay.result).toEqual({
+            workflowRunId: "run-123",
+            status: "PENDING",
+          });
+        }
+      });
+
+      it("should release key back to available after failure", async () => {
+        await persistence.acquireIdempotencyKey("idem-key-1", "run.create");
+        await persistence.releaseIdempotencyKey("idem-key-1", "run.create");
+
+        const reacquire = await persistence.acquireIdempotencyKey(
+          "idem-key-1",
+          "run.create",
+        );
+        expect(reacquire.status).toBe("acquired");
+      });
+
+      it("should scope idempotency keys by command type", async () => {
+        await persistence.acquireIdempotencyKey("shared", "run.create");
+        await persistence.completeIdempotencyKey("shared", "run.create", {
+          type: "create",
+        });
+
+        const execute = await persistence.acquireIdempotencyKey(
+          "shared",
+          "job.execute",
+        );
+        expect(execute.status).toBe("acquired");
+      });
+    });
   });
 }
 
@@ -1106,6 +1411,7 @@ function createJobQueueConformanceTests(
         expect(result?.priority).toBe(7);
         expect(result?.payload).toEqual({ custom: "data" });
         expect(result?.attempt).toBeDefined();
+        expect(result?.maxAttempts).toBeDefined();
       });
     });
 

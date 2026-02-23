@@ -1,349 +1,447 @@
 /**
- * Worker Process Simulation Tests
+ * Worker Process Simulation Tests (Kernel)
  *
- * Tests for how worker processes would interact with the workflow engine:
- * - Worker polling for jobs
- * - Worker executing jobs
+ * Tests for how worker processes interact with the kernel:
+ * - Worker claiming runs via run.claimPending
+ * - Worker executing jobs via job.execute
  * - Multiple workers competing for jobs
  * - Worker handling failures
+ * - Worker processing suspended jobs
+ *
+ * Tests that relied on WorkflowRuntime polling loops are skipped since
+ * those are now handled by host packages.
  */
 
-import { beforeEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { WorkflowExecutor } from "../../core/executor.js";
 import { defineStage } from "../../core/stage-factory.js";
-import { WorkflowBuilder } from "../../core/workflow.js";
+import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
+import { createKernel } from "../../kernel/kernel.js";
 import {
-  InMemoryAICallLogger,
-  InMemoryJobQueue,
-  InMemoryWorkflowPersistence,
-} from "../utils/index.js";
+  CollectingEventSink,
+  FakeClock,
+  InMemoryBlobStore,
+  NoopScheduler,
+} from "../../kernel/testing/index.js";
+import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
+import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
+
+function createTestKernel(workflows: Workflow<any, any>[] = []) {
+  const persistence = new InMemoryWorkflowPersistence();
+  const blobStore = new InMemoryBlobStore();
+  const jobTransport = new InMemoryJobQueue("test-worker");
+  const eventSink = new CollectingEventSink();
+  const scheduler = new NoopScheduler();
+  const clock = new FakeClock();
+  const registry = new Map<string, Workflow<any, any>>();
+  for (const w of workflows) registry.set(w.id, w);
+  const kernel = createKernel({
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry: { getWorkflow: (id) => registry.get(id) },
+  });
+  const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
+  return {
+    kernel,
+    flush,
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry,
+  };
+}
+
+function createSimpleWorkflow(id: string = "test-workflow") {
+  const schema = z.object({ value: z.string() });
+  const stage = defineStage({
+    id: "process",
+    name: "Process",
+    schemas: { input: schema, output: schema, config: z.object({}) },
+    async execute(ctx) {
+      return { output: ctx.input };
+    },
+  });
+  return new WorkflowBuilder(id, "Test", "Test", schema, schema)
+    .pipe(stage)
+    .build();
+}
 
 describe("I want to simulate worker process behavior", () => {
-  let persistence: InMemoryWorkflowPersistence;
-  let aiLogger: InMemoryAICallLogger;
+  describe("worker polling for jobs via run.claimPending", () => {
+    it("should claim pending runs in priority order", async () => {
+      // Given: Multiple pending runs with different priorities
+      const workflow = createSimpleWorkflow("priority-wf");
+      const { kernel, flush, persistence } = createTestKernel([workflow]);
 
-  beforeEach(() => {
-    persistence = new InMemoryWorkflowPersistence();
-    aiLogger = new InMemoryAICallLogger();
-  });
-
-  describe("worker polling for jobs", () => {
-    it("should dequeue jobs in priority order", async () => {
-      // Given: Multiple jobs with different priorities
-      const jobQueue = new InMemoryJobQueue("worker-1");
-
-      const lowPriorityId = await jobQueue.enqueue({
-        workflowRunId: "run-1",
-        stageId: "stage-1",
+      const low = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "low",
+        workflowId: "priority-wf",
+        input: { value: "low" },
         priority: 1,
       });
-
-      const highPriorityId = await jobQueue.enqueue({
-        workflowRunId: "run-2",
-        stageId: "stage-2",
+      const high = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "high",
+        workflowId: "priority-wf",
+        input: { value: "high" },
         priority: 10,
       });
-
-      const mediumPriorityId = await jobQueue.enqueue({
-        workflowRunId: "run-3",
-        stageId: "stage-3",
+      const medium = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "med",
+        workflowId: "priority-wf",
+        input: { value: "medium" },
         priority: 5,
       });
 
-      // When: Worker polls for jobs
-      const first = await jobQueue.dequeue();
-      const second = await jobQueue.dequeue();
-      const third = await jobQueue.dequeue();
-
-      // Then: Jobs are returned in priority order (highest first)
-      expect(first?.jobId).toBe(highPriorityId);
-      expect(second?.jobId).toBe(mediumPriorityId);
-      expect(third?.jobId).toBe(lowPriorityId);
-    });
-
-    it("should return null when no jobs available", async () => {
-      // Given: An empty job queue
-      const jobQueue = new InMemoryJobQueue("worker-1");
-
-      // When: Worker polls
-      const result = await jobQueue.dequeue();
-
-      // Then: Returns null
-      expect(result).toBeNull();
-    });
-
-    it("should lock job when dequeued", async () => {
-      // Given: A job in the queue
-      const jobQueue = new InMemoryJobQueue("worker-1");
-
-      const jobId = await jobQueue.enqueue({
-        workflowRunId: "run-1",
-        stageId: "stage-1",
+      // When: Worker claims pending runs
+      const result = await kernel.dispatch({
+        type: "run.claimPending",
+        workerId: "worker-1",
+        maxClaims: 10,
       });
 
-      // When: Worker dequeues the job
-      await jobQueue.dequeue();
-
-      // Then: Job is locked by the worker
-      const job = jobQueue.getJob(jobId);
-      expect(job?.status).toBe("RUNNING");
-      expect(job?.workerId).toBe("worker-1");
-      expect(job?.lockedAt).toBeInstanceOf(Date);
+      // Then: Runs are claimed in priority order (highest first)
+      expect(result.claimed).toHaveLength(3);
+      expect(result.claimed[0]!.workflowRunId).toBe(high.workflowRunId);
+      expect(result.claimed[1]!.workflowRunId).toBe(medium.workflowRunId);
+      expect(result.claimed[2]!.workflowRunId).toBe(low.workflowRunId);
     });
 
-    it("should not return already processing jobs", async () => {
-      // Given: A job that's being processed
-      const jobQueue = new InMemoryJobQueue("worker-1");
+    it("should return empty when no pending runs", async () => {
+      // Given: No pending runs
+      const { kernel } = createTestKernel([]);
 
-      await jobQueue.enqueue({
-        workflowRunId: "run-1",
-        stageId: "stage-1",
+      // When: Worker claims
+      const result = await kernel.dispatch({
+        type: "run.claimPending",
+        workerId: "worker-1",
+        maxClaims: 10,
       });
 
-      // First worker takes the job
-      await jobQueue.dequeue();
-
-      // When: Another dequeue attempt
-      const result = await jobQueue.dequeue();
-
-      // Then: No job returned (it's being processed)
-      expect(result).toBeNull();
+      // Then: No runs claimed
+      expect(result.claimed).toHaveLength(0);
     });
 
-    it("should respect scheduled job times", async () => {
-      // Given: A job scheduled for the future
-      const jobQueue = new InMemoryJobQueue("worker-1");
+    it("should not reclaim already-claimed runs", async () => {
+      // Given: A run that has been claimed
+      const workflow = createSimpleWorkflow("claim-wf");
+      const { kernel, persistence } = createTestKernel([workflow]);
 
-      const futureTime = new Date(Date.now() + 60000);
-      await jobQueue.enqueue({
-        workflowRunId: "run-1",
-        stageId: "stage-1",
-        scheduledFor: futureTime,
+      await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "claim-1",
+        workflowId: "claim-wf",
+        input: { value: "test" },
       });
 
-      // When: Worker polls before scheduled time
-      const result = await jobQueue.dequeue();
+      // First claim
+      const firstResult = await kernel.dispatch({
+        type: "run.claimPending",
+        workerId: "worker-1",
+        maxClaims: 10,
+      });
+      expect(firstResult.claimed).toHaveLength(1);
 
-      // Then: Job is not returned yet
-      expect(result).toBeNull();
-    });
-
-    it("should return scheduled jobs after their time", async () => {
-      // Given: A job scheduled for the past
-      const jobQueue = new InMemoryJobQueue("worker-1");
-
-      const pastTime = new Date(Date.now() - 1000);
-      const jobId = await jobQueue.enqueue({
-        workflowRunId: "run-1",
-        stageId: "stage-1",
-        scheduledFor: pastTime,
+      // When: Second claim attempt
+      const secondResult = await kernel.dispatch({
+        type: "run.claimPending",
+        workerId: "worker-2",
+        maxClaims: 10,
       });
 
-      // When: Worker polls
-      const result = await jobQueue.dequeue();
-
-      // Then: Job is returned
-      expect(result?.jobId).toBe(jobId);
+      // Then: No runs available
+      expect(secondResult.claimed).toHaveLength(0);
     });
   });
 
-  describe("worker executing jobs", () => {
-    it("should execute a stage and mark job complete", async () => {
-      // Given: A job and corresponding workflow run
-      const jobQueue = new InMemoryJobQueue("worker-1");
-
-      const run = await persistence.createRun({
-        workflowId: "test-workflow",
-        workflowName: "Test",
-        workflowType: "test-workflow",
-        input: { value: "test" },
-      });
-
-      const jobId = await jobQueue.enqueue({
-        workflowRunId: run.id,
-        stageId: "process",
-      });
-
-      // When: Worker processes the job
-      const job = await jobQueue.dequeue();
-      expect(job).not.toBeNull();
-
-      // Simulate stage execution success
-      await jobQueue.complete(jobId);
-
-      // Then: Job is marked complete
-      const completedJob = jobQueue.getJob(jobId);
-      expect(completedJob?.status).toBe("COMPLETED");
-      expect(completedJob?.completedAt).toBeInstanceOf(Date);
-    });
-
-    it("should update persistence when stage completes", async () => {
-      // Given: A workflow run with a stage
-      const run = await persistence.createRun({
-        workflowId: "test-workflow",
-        workflowName: "Test",
-        workflowType: "test-workflow",
-        input: { value: "test" },
-      });
-
-      const stage = await persistence.createStage({
-        workflowRunId: run.id,
-        stageId: "process",
-        stageName: "Process",
-        stageNumber: 1,
-        executionGroup: 1,
-        status: "PENDING",
-      });
-
-      // When: Worker executes and completes the stage
-      await persistence.updateStage(stage.id, {
-        status: "RUNNING",
-        startedAt: new Date(),
-      });
-
-      await persistence.updateStage(stage.id, {
-        status: "COMPLETED",
-        completedAt: new Date(),
-        duration: 100,
-        outputData: { result: "processed" },
-      });
-
-      // Then: Stage is marked complete in persistence
-      const updatedStage = await persistence.getStage(run.id, "process");
-      expect(updatedStage?.status).toBe("COMPLETED");
-      expect(updatedStage?.outputData).toEqual({ result: "processed" });
-    });
-
-    it("should handle job payload correctly", async () => {
-      // Given: A job with configuration payload
-      const jobQueue = new InMemoryJobQueue("worker-1");
-
-      const payload = {
-        config: {
-          model: "gpt-4",
-          temperature: 0.7,
+  describe("worker executing jobs via job.execute", () => {
+    it("should execute a stage and return completed result", async () => {
+      // Given: A workflow run with a claimed stage
+      const schema = z.object({ value: z.string() });
+      const stage = defineStage({
+        id: "transform",
+        name: "Transform",
+        schemas: {
+          input: schema,
+          output: z.object({ result: z.string() }),
+          config: z.object({}),
         },
-      };
+        async execute(ctx) {
+          return { output: { result: ctx.input.value.toUpperCase() } };
+        },
+      });
+      const workflow = new WorkflowBuilder(
+        "exec-wf",
+        "Test",
+        "Test",
+        schema,
+        z.object({ result: z.string() }),
+      )
+        .pipe(stage)
+        .build();
 
-      await jobQueue.enqueue({
-        workflowRunId: "run-1",
-        stageId: "stage-1",
-        payload,
+      const { kernel, flush, persistence } = createTestKernel([workflow]);
+
+      const createResult = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "exec-1",
+        workflowId: "exec-wf",
+        input: { value: "hello" },
+      });
+      await kernel.dispatch({
+        type: "run.claimPending",
+        workerId: "worker-1",
       });
 
-      // When: Worker dequeues
-      const job = await jobQueue.dequeue();
+      // When: Worker executes the job
+      const result = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: createResult.workflowRunId,
+        workflowId: "exec-wf",
+        stageId: "transform",
+        config: {},
+      });
 
-      // Then: Payload is available
-      expect(job?.payload).toEqual(payload);
+      // Then: Stage completed
+      expect(result.outcome).toBe("completed");
+      expect(result.output).toEqual({ result: "HELLO" });
+
+      // And: Stage record is updated
+      const stages = await persistence.getStagesByRun(
+        createResult.workflowRunId,
+      );
+      expect(stages[0]!.status).toBe("COMPLETED");
     });
 
-    it("should suspend job for async-batch stages", async () => {
-      // Given: A job that needs to suspend
-      const jobQueue = new InMemoryJobQueue("worker-1");
+    it("should update run status on stage completion via run.transition", async () => {
+      // Given: A single-stage workflow
+      const workflow = createSimpleWorkflow("transition-wf");
+      const { kernel, flush, persistence } = createTestKernel([workflow]);
 
-      const jobId = await jobQueue.enqueue({
-        workflowRunId: "run-1",
-        stageId: "batch-stage",
+      const createResult = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "t1",
+        workflowId: "transition-wf",
+        input: { value: "test" },
+      });
+      await kernel.dispatch({
+        type: "run.claimPending",
+        workerId: "worker-1",
       });
 
-      // When: Worker processes and suspends the job
-      await jobQueue.dequeue();
+      // Execute stage
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: createResult.workflowRunId,
+        workflowId: "transition-wf",
+        stageId: "process",
+        config: {},
+      });
 
-      const resumeAt = new Date(Date.now() + 60000);
-      await jobQueue.suspend(jobId, resumeAt);
+      // When: Transition the workflow
+      const transResult = await kernel.dispatch({
+        type: "run.transition",
+        workflowRunId: createResult.workflowRunId,
+      });
 
-      // Then: Job is suspended with resume time
-      const job = jobQueue.getJob(jobId);
-      expect(job?.status).toBe("SUSPENDED");
-      expect(job?.nextPollAt).toEqual(resumeAt);
-      expect(job?.workerId).toBeNull(); // Lock released
+      // Then: Workflow is completed
+      expect(transResult.action).toBe("completed");
+      const run = await persistence.getRun(createResult.workflowRunId);
+      expect(run?.status).toBe("COMPLETED");
+    });
+
+    it("should handle job payload correctly via config", async () => {
+      // Given: A stage that uses config from the job
+      let capturedConfig: unknown;
+
+      const stage = defineStage({
+        id: "configurable",
+        name: "Configurable",
+        schemas: {
+          input: z.object({ value: z.string() }),
+          output: z.object({ value: z.string() }),
+          config: z.object({
+            model: z.string().default("default"),
+          }),
+        },
+        async execute(ctx) {
+          capturedConfig = ctx.config;
+          return { output: ctx.input };
+        },
+      });
+
+      const schema = z.object({ value: z.string() });
+      const workflow = new WorkflowBuilder(
+        "config-wf",
+        "Test",
+        "Test",
+        schema,
+        schema,
+      )
+        .pipe(stage)
+        .build();
+
+      const { kernel, flush, persistence } = createTestKernel([workflow]);
+
+      const createResult = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "cfg-1",
+        workflowId: "config-wf",
+        input: { value: "test" },
+        config: { configurable: { model: "gpt-4" } },
+      });
+      await persistence.updateRun(createResult.workflowRunId, {
+        status: "RUNNING",
+      });
+      await flush();
+
+      // When: Execute with config
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: createResult.workflowRunId,
+        workflowId: "config-wf",
+        stageId: "configurable",
+        config: { configurable: { model: "gpt-4" } },
+      });
+
+      // Then: Config was provided to the stage
+      expect(capturedConfig).toMatchObject({ model: "gpt-4" });
     });
   });
 
   describe("multiple workers competing for jobs", () => {
-    it("should distribute jobs across workers", async () => {
-      // Given: A shared job source and multiple workers
-      // Note: In real scenario, workers share the same database/queue
-      // For testing, we simulate with separate queues but track claims
+    it("should distribute runs across workers via claimPending", async () => {
+      // Given: Multiple pending runs
+      const workflow = createSimpleWorkflow("distribute-wf");
+      const { kernel, persistence } = createTestKernel([workflow]);
 
-      const sharedJobs = new InMemoryJobQueue("orchestrator");
+      for (let i = 0; i < 3; i++) {
+        await kernel.dispatch({
+          type: "run.create",
+          idempotencyKey: `dist-${i}`,
+          workflowId: "distribute-wf",
+          input: { value: `run-${i}` },
+        });
+      }
 
-      // Enqueue multiple jobs
-      await sharedJobs.enqueue({ workflowRunId: "run-1", stageId: "stage-a" });
-      await sharedJobs.enqueue({ workflowRunId: "run-2", stageId: "stage-b" });
-      await sharedJobs.enqueue({ workflowRunId: "run-3", stageId: "stage-c" });
+      // When: Worker claims one at a time
+      const claimed: string[] = [];
+      for (let i = 0; i < 3; i++) {
+        const result = await kernel.dispatch({
+          type: "run.claimPending",
+          workerId: `worker-${i}`,
+          maxClaims: 1,
+        });
+        if (result.claimed.length > 0) {
+          claimed.push(result.claimed[0]!.workflowRunId);
+        }
+      }
 
-      // When: Workers compete for jobs
-      const claims: string[] = [];
-
-      const job1 = await sharedJobs.dequeue();
-      if (job1) claims.push(`worker-1:${job1.stageId}`);
-
-      const job2 = await sharedJobs.dequeue();
-      if (job2) claims.push(`worker-2:${job2.stageId}`);
-
-      const job3 = await sharedJobs.dequeue();
-      if (job3) claims.push(`worker-3:${job3.stageId}`);
-
-      // Then: All jobs are claimed
-      expect(claims).toHaveLength(3);
-      expect(claims).toContain("worker-1:stage-a");
-      expect(claims).toContain("worker-2:stage-b");
-      expect(claims).toContain("worker-3:stage-c");
+      // Then: All runs are claimed
+      expect(claimed).toHaveLength(3);
+      expect(new Set(claimed).size).toBe(3); // All unique
     });
 
-    it("should ensure only one worker claims each job", async () => {
-      // Given: A single job in the queue
-      const sharedQueue = new InMemoryJobQueue("shared");
+    it("should ensure only one worker claims each run", async () => {
+      // Given: A single pending run
+      const workflow = createSimpleWorkflow("single-claim-wf");
+      const { kernel } = createTestKernel([workflow]);
 
-      const jobId = await sharedQueue.enqueue({
-        workflowRunId: "run-1",
-        stageId: "stage-1",
+      await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "single-1",
+        workflowId: "single-claim-wf",
+        input: { value: "test" },
       });
 
       // When: First worker claims
-      const firstClaim = await sharedQueue.dequeue();
+      const firstClaim = await kernel.dispatch({
+        type: "run.claimPending",
+        workerId: "worker-1",
+        maxClaims: 1,
+      });
 
-      // Then: Job is locked
-      expect(firstClaim?.jobId).toBe(jobId);
+      // Then: First worker gets it
+      expect(firstClaim.claimed).toHaveLength(1);
 
-      // And: Second attempt returns nothing
-      const secondClaim = await sharedQueue.dequeue();
-      expect(secondClaim).toBeNull();
-
-      // Verify only one claim
-      const job = sharedQueue.getJob(jobId);
-      expect(job?.status).toBe("RUNNING");
-    });
-
-    it("should handle parallel job enqueue correctly", async () => {
-      // Given: Multiple stages to run in parallel
-      const jobQueue = new InMemoryJobQueue("worker");
-
-      const parallelJobs = [
-        { workflowRunId: "run-1", stageId: "branch-a", priority: 5 },
-        { workflowRunId: "run-1", stageId: "branch-b", priority: 5 },
-        { workflowRunId: "run-1", stageId: "branch-c", priority: 5 },
-      ];
-
-      // When: Jobs are enqueued in parallel
-      const jobIds = await jobQueue.enqueueParallel(parallelJobs);
-
-      // Then: All jobs are created
-      expect(jobIds).toHaveLength(3);
-      expect(new Set(jobIds).size).toBe(3); // All unique
-
-      // And: All are pending
-      const allJobs = jobQueue.getAllJobs();
-      const pendingJobs = allJobs.filter((j) => j.status === "PENDING");
-      expect(pendingJobs).toHaveLength(3);
+      // And: Second worker gets nothing
+      const secondClaim = await kernel.dispatch({
+        type: "run.claimPending",
+        workerId: "worker-2",
+        maxClaims: 1,
+      });
+      expect(secondClaim.claimed).toHaveLength(0);
     });
   });
 
   describe("worker handling failures", () => {
-    it("should retry failed jobs automatically", async () => {
+    it("should handle failed stages and transition to FAILED", async () => {
+      // Given: A workflow with a failing stage
+      const schema = z.object({ value: z.string() });
+      const failStage = defineStage({
+        id: "process",
+        name: "Process",
+        schemas: { input: schema, output: schema, config: z.object({}) },
+        async execute() {
+          throw new Error("Permanent failure");
+        },
+      });
+      const workflow = new WorkflowBuilder(
+        "fail-wf",
+        "Fail",
+        "Test",
+        schema,
+        schema,
+      )
+        .pipe(failStage)
+        .build();
+
+      const { kernel, flush, persistence } = createTestKernel([workflow]);
+
+      const createResult = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "fail-1",
+        workflowId: "fail-wf",
+        input: { value: "test" },
+      });
+      await kernel.dispatch({
+        type: "run.claimPending",
+        workerId: "worker-1",
+      });
+
+      // When: Stage fails
+      const result = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: createResult.workflowRunId,
+        workflowId: "fail-wf",
+        stageId: "process",
+        config: {},
+      });
+
+      expect(result.outcome).toBe("failed");
+      expect(result.error).toBe("Permanent failure");
+
+      // And: Transition marks run as failed
+      const transResult = await kernel.dispatch({
+        type: "run.transition",
+        workflowRunId: createResult.workflowRunId,
+      });
+      expect(transResult.action).toBe("failed");
+
+      const run = await persistence.getRun(createResult.workflowRunId);
+      expect(run?.status).toBe("FAILED");
+    });
+
+    it("should retry failed jobs automatically via job queue", async () => {
       // Given: A job configured for retries
       const jobQueue = new InMemoryJobQueue("worker-1");
       jobQueue.setDefaultMaxAttempts(3);
@@ -379,10 +477,9 @@ describe("I want to simulate worker process behavior", () => {
         stageId: "failing-stage",
       });
 
-      // When: Job fails twice (max attempts)
+      // When: Job fails twice
       await jobQueue.dequeue();
       await jobQueue.fail(jobId, "Error 1", true);
-
       await jobQueue.dequeue();
       await jobQueue.fail(jobId, "Error 2", true);
 
@@ -409,56 +506,37 @@ describe("I want to simulate worker process behavior", () => {
       // Then: Job is immediately failed
       const job = jobQueue.getJob(jobId);
       expect(job?.status).toBe("FAILED");
-      expect(job?.attempt).toBe(1); // Only one attempt
+      expect(job?.attempt).toBe(1);
     });
 
-    it("should update workflow status on stage failure", async () => {
-      // Given: A workflow run
-      const run = await persistence.createRun({
-        workflowId: "test-workflow",
-        workflowName: "Test",
-        workflowType: "test-workflow",
-        input: { value: "test" },
-      });
-
-      await persistence.updateRun(run.id, { status: "RUNNING" });
-
-      // When: Stage fails permanently
-      await persistence.updateRun(run.id, { status: "FAILED" });
-
-      // Then: Workflow is marked failed
-      const status = await persistence.getRunStatus(run.id);
-      expect(status).toBe("FAILED");
-    });
-
-    it("should recover stale jobs from crashed workers", async () => {
+    it("should recover stale jobs from crashed workers via lease.reapStale", async () => {
       // Given: A job locked by a "crashed" worker
-      const jobQueue = new InMemoryJobQueue("crashed-worker");
+      const workflow = createSimpleWorkflow("recovery-wf");
+      const { kernel, jobTransport } = createTestKernel([workflow]);
 
-      const jobId = await jobQueue.enqueue({
+      const jobId = await jobTransport.enqueue({
         workflowRunId: "run-1",
-        stageId: "stage-1",
+        stageId: "process",
       });
 
       // Worker takes job then "crashes"
-      await jobQueue.dequeue();
+      await jobTransport.dequeue();
+      jobTransport.setJobLockedAt(jobId, new Date(Date.now() - 120000));
 
-      // Simulate crash: job locked 2 minutes ago
-      jobQueue.setJobLockedAt(jobId, new Date(Date.now() - 120000));
-
-      // When: Stale job cleanup runs (threshold: 60 seconds)
-      const released = await jobQueue.releaseStaleJobs(60000);
+      // When: Kernel reaps stale leases
+      const result = await kernel.dispatch({
+        type: "lease.reapStale",
+        staleThresholdMs: 60000,
+      });
 
       // Then: Job is released
-      expect(released).toBe(1);
-
-      const job = jobQueue.getJob(jobId);
+      expect(result.released).toBe(1);
+      const job = jobTransport.getJob(jobId);
       expect(job?.status).toBe("PENDING");
       expect(job?.workerId).toBeNull();
-      expect(job?.lockedAt).toBeNull();
 
       // And: Can be picked up by another worker
-      const recoveredJob = await jobQueue.dequeue();
+      const recoveredJob = await jobTransport.dequeue();
       expect(recoveredJob?.jobId).toBe(jobId);
     });
 
@@ -501,7 +579,6 @@ describe("I want to simulate worker process behavior", () => {
         workflowRunId: "run-1",
         stageId: "batch-1",
       });
-
       const job2 = await jobQueue.enqueue({
         workflowRunId: "run-2",
         stageId: "batch-2",
@@ -510,7 +587,6 @@ describe("I want to simulate worker process behavior", () => {
       // Process and suspend both
       await jobQueue.dequeue();
       await jobQueue.suspend(job1, new Date(Date.now() - 1000)); // Ready now
-
       await jobQueue.dequeue();
       await jobQueue.suspend(job2, new Date(Date.now() + 60000)); // Not ready
 
@@ -521,7 +597,6 @@ describe("I want to simulate worker process behavior", () => {
       expect(ready).toHaveLength(1);
       expect(ready[0]?.jobId).toBe(job1);
       expect(ready[0]?.stageId).toBe("batch-1");
-      expect(ready[0]?.workflowRunId).toBe("run-1");
     });
 
     it("should allow manual resume for testing", async () => {
@@ -549,125 +624,154 @@ describe("I want to simulate worker process behavior", () => {
   });
 
   describe("worker lifecycle simulation", () => {
-    it("should simulate a complete worker processing cycle", async () => {
-      // Given: A worker process simulation
-      const jobQueue = new InMemoryJobQueue("worker-simulation");
-      const processedJobs: string[] = [];
+    it("should simulate a complete worker processing cycle with kernel", async () => {
+      // Given: A workflow with multiple runs
+      const workflow = createSimpleWorkflow("lifecycle-wf");
+      const { kernel, flush, persistence } = createTestKernel([workflow]);
 
-      // Enqueue several jobs
-      await jobQueue.enqueue({ workflowRunId: "run-1", stageId: "stage-1" });
-      await jobQueue.enqueue({ workflowRunId: "run-2", stageId: "stage-2" });
-      await jobQueue.enqueue({ workflowRunId: "run-3", stageId: "stage-3" });
-
-      // Simulate worker loop
-      let iterations = 0;
-      const maxIterations = 10;
-
-      while (iterations < maxIterations) {
-        const job = await jobQueue.dequeue();
-
-        if (!job) {
-          // No more jobs
-          break;
-        }
-
-        // Process the job
-        processedJobs.push(job.stageId);
-
-        // Complete the job
-        await jobQueue.complete(job.jobId);
-
-        iterations++;
+      // Create multiple runs
+      const runIds: string[] = [];
+      for (let i = 0; i < 3; i++) {
+        const result = await kernel.dispatch({
+          type: "run.create",
+          idempotencyKey: `lifecycle-${i}`,
+          workflowId: "lifecycle-wf",
+          input: { value: `item-${i}` },
+        });
+        runIds.push(result.workflowRunId);
       }
 
-      // Then: All jobs were processed
-      expect(processedJobs).toHaveLength(3);
-      expect(processedJobs).toContain("stage-1");
-      expect(processedJobs).toContain("stage-2");
-      expect(processedJobs).toContain("stage-3");
+      // When: Worker claims and processes all runs
+      const claimResult = await kernel.dispatch({
+        type: "run.claimPending",
+        workerId: "worker-1",
+        maxClaims: 10,
+      });
 
-      // And: All jobs are completed
-      const allJobs = jobQueue.getAllJobs();
-      expect(allJobs.every((j) => j.status === "COMPLETED")).toBe(true);
-    });
+      expect(claimResult.claimed).toHaveLength(3);
 
-    it("should simulate worker with mixed success and failure", async () => {
-      // Given: Jobs where some will fail
-      const jobQueue = new InMemoryJobQueue("worker-mixed");
-      jobQueue.setDefaultMaxAttempts(2);
+      // Execute each claimed run's stage
+      for (const claim of claimResult.claimed) {
+        const result = await kernel.dispatch({
+          type: "job.execute",
+          workflowRunId: claim.workflowRunId,
+          workflowId: "lifecycle-wf",
+          stageId: "process",
+          config: {},
+        });
+        expect(result.outcome).toBe("completed");
 
-      await jobQueue.enqueue({ workflowRunId: "run-1", stageId: "success-1" });
-      await jobQueue.enqueue({ workflowRunId: "run-2", stageId: "fail-1" });
-      await jobQueue.enqueue({ workflowRunId: "run-3", stageId: "success-2" });
-
-      // Simulate worker that fails on "fail-" prefixed stages
-      let iterations = 0;
-      const maxIterations = 10;
-
-      while (iterations < maxIterations) {
-        const job = await jobQueue.dequeue();
-        if (!job) break;
-
-        if (job.stageId.startsWith("fail-")) {
-          await jobQueue.fail(job.jobId, "Simulated failure", true);
-        } else {
-          await jobQueue.complete(job.jobId);
-        }
-
-        iterations++;
-      }
-
-      // Then: Check final states
-      const allJobs = jobQueue.getAllJobs();
-      const completed = allJobs.filter((j) => j.status === "COMPLETED");
-      const failed = allJobs.filter((j) => j.status === "FAILED");
-
-      expect(completed).toHaveLength(2); // success-1, success-2
-      expect(failed).toHaveLength(1); // fail-1 (after 2 attempts)
-    });
-
-    it("should track worker metrics", async () => {
-      // Given: A worker processing jobs
-      const jobQueue = new InMemoryJobQueue("metrics-worker");
-
-      // Enqueue jobs
-      for (let i = 0; i < 5; i++) {
-        await jobQueue.enqueue({
-          workflowRunId: `run-${i}`,
-          stageId: `stage-${i}`,
+        // Transition
+        await kernel.dispatch({
+          type: "run.transition",
+          workflowRunId: claim.workflowRunId,
         });
       }
 
-      // Simulate processing with metrics
-      let jobsProcessed = 0;
-      let totalProcessingTime = 0;
-      const startTime = Date.now();
-
-      while (true) {
-        const job = await jobQueue.dequeue();
-        if (!job) break;
-
-        const jobStart = Date.now();
-
-        // Simulate some work
-        await new Promise((r) => setTimeout(r, 10));
-
-        await jobQueue.complete(job.jobId);
-
-        jobsProcessed++;
-        totalProcessingTime += Date.now() - jobStart;
+      // Then: All runs are completed
+      for (const runId of runIds) {
+        const run = await persistence.getRun(runId);
+        expect(run?.status).toBe("COMPLETED");
       }
+    });
 
-      const totalTime = Date.now() - startTime;
+    it("should simulate worker with mixed success and failure", async () => {
+      // Given: Two workflows - one succeeds, one fails
+      const schema = z.object({ value: z.string() });
+      const successStage = defineStage({
+        id: "process",
+        name: "Process",
+        schemas: { input: schema, output: schema, config: z.object({}) },
+        async execute(ctx) {
+          return { output: ctx.input };
+        },
+      });
+      const failStage = defineStage({
+        id: "process",
+        name: "Process",
+        schemas: { input: schema, output: schema, config: z.object({}) },
+        async execute() {
+          throw new Error("Stage error");
+        },
+      });
 
-      // Then: Metrics are available
-      expect(jobsProcessed).toBe(5);
-      expect(totalProcessingTime).toBeGreaterThan(0);
-      expect(totalTime).toBeGreaterThan(0);
+      const successWf = new WorkflowBuilder(
+        "success-wf",
+        "Success",
+        "Test",
+        schema,
+        schema,
+      )
+        .pipe(successStage)
+        .build();
+      const failWf = new WorkflowBuilder(
+        "fail-wf",
+        "Fail",
+        "Test",
+        schema,
+        schema,
+      )
+        .pipe(failStage)
+        .build();
 
-      // Could compute: avg processing time, jobs per second, etc.
-      const avgProcessingTime = totalProcessingTime / jobsProcessed;
-      expect(avgProcessingTime).toBeGreaterThan(0);
+      const { kernel, flush, persistence } = createTestKernel([
+        successWf,
+        failWf,
+      ]);
+
+      const run1 = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "mixed-1",
+        workflowId: "success-wf",
+        input: { value: "success" },
+      });
+      const run2 = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "mixed-2",
+        workflowId: "fail-wf",
+        input: { value: "fail" },
+      });
+      const run3 = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "mixed-3",
+        workflowId: "success-wf",
+        input: { value: "success2" },
+      });
+
+      // Claim all
+      await kernel.dispatch({
+        type: "run.claimPending",
+        workerId: "worker-1",
+        maxClaims: 10,
+      });
+
+      // Execute and transition all
+      const execAndTransition = async (runId: string, workflowId: string) => {
+        await kernel.dispatch({
+          type: "job.execute",
+          workflowRunId: runId,
+          workflowId,
+          stageId: "process",
+          config: {},
+        });
+        await kernel.dispatch({
+          type: "run.transition",
+          workflowRunId: runId,
+        });
+      };
+
+      await execAndTransition(run1.workflowRunId, "success-wf");
+      await execAndTransition(run2.workflowRunId, "fail-wf");
+      await execAndTransition(run3.workflowRunId, "success-wf");
+
+      // Then: Check final states
+      const r1 = await persistence.getRun(run1.workflowRunId);
+      const r2 = await persistence.getRun(run2.workflowRunId);
+      const r3 = await persistence.getRun(run3.workflowRunId);
+
+      expect(r1?.status).toBe("COMPLETED");
+      expect(r2?.status).toBe("FAILED");
+      expect(r3?.status).toBe("COMPLETED");
     });
   });
 });

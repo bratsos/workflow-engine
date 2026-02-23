@@ -1,799 +1,637 @@
 /**
- * Logging Tests
+ * Logging Tests (Kernel)
  *
- * Tests for log events during workflow execution:
- * - log events via ctx.onLog()
- * - Different log levels (INFO, WARN, ERROR, DEBUG)
- * - Metadata in log events
+ * In the kernel architecture, stage logging via ctx.log(level, message, meta)
+ * calls persistence.createLog() directly (fire-and-forget). These tests verify
+ * that log entries are correctly persisted with the expected level, message,
+ * metadata, workflowRunId, and workflowStageId.
  */
 
-import { beforeEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { WorkflowExecutor } from "../../core/executor.js";
 import { defineStage } from "../../core/stage-factory.js";
-import { WorkflowBuilder } from "../../core/workflow.js";
+import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
+import { createKernel } from "../../kernel/kernel.js";
 import {
-  InMemoryAICallLogger,
-  InMemoryWorkflowPersistence,
-  TestSchemas,
-} from "../utils/index.js";
+  CollectingEventSink,
+  FakeClock,
+  InMemoryBlobStore,
+  NoopScheduler,
+} from "../../kernel/testing/index.js";
+import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
+import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 
-describe("I want to log from stages", () => {
-  let persistence: InMemoryWorkflowPersistence;
-  let aiLogger: InMemoryAICallLogger;
+// ---------------------------------------------------------------------------
+// Shared schema for all test stages
+// ---------------------------------------------------------------------------
 
-  beforeEach(() => {
-    persistence = new InMemoryWorkflowPersistence();
-    aiLogger = new InMemoryAICallLogger();
-  });
+const valueSchema = z.object({ value: z.string() });
 
-  // Helper to create a workflow run before execution
-  async function createRun(
-    runId: string,
-    workflowId: string,
-    input: unknown = {},
-  ) {
-    await persistence.createRun({
-      id: runId,
-      workflowId,
-      workflowName: workflowId,
-      status: "PENDING",
-      input,
-    });
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function createTestKernel(workflows: Workflow<any, any>[]) {
+  const persistence = new InMemoryWorkflowPersistence();
+  const blobStore = new InMemoryBlobStore();
+  const jobTransport = new InMemoryJobQueue("test-worker");
+  const eventSink = new CollectingEventSink();
+  const scheduler = new NoopScheduler();
+  const clock = new FakeClock();
+
+  const registry = new Map<string, Workflow<any, any>>();
+  for (const w of workflows) {
+    registry.set(w.id, w);
   }
 
+  const kernel = createKernel({
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry: { getWorkflow: (id) => registry.get(id) },
+  });
+
+  return { kernel, persistence, eventSink, clock };
+}
+
+/**
+ * Creates a run, sets it to RUNNING, and executes the specified stage.
+ * Returns the workflowRunId so callers can inspect persistence afterwards.
+ */
+async function setupAndExecute(
+  kernel: ReturnType<typeof createTestKernel>["kernel"],
+  persistence: InMemoryWorkflowPersistence,
+  workflowId: string,
+  stageId: string,
+  input: unknown,
+): Promise<string> {
+  const createResult = await kernel.dispatch({
+    type: "run.create",
+    idempotencyKey: `key-${Date.now()}-${Math.random()}`,
+    workflowId,
+    input,
+  });
+
+  await persistence.updateRun(createResult.workflowRunId, {
+    status: "RUNNING",
+  });
+
+  await kernel.dispatch({
+    type: "job.execute",
+    workflowRunId: createResult.workflowRunId,
+    workflowId,
+    stageId,
+    config: {},
+  });
+
+  return createResult.workflowRunId;
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+describe("I want to log from stages", () => {
+  // -------------------------------------------------------------------------
+  // basic logging
+  // -------------------------------------------------------------------------
   describe("basic logging", () => {
-    it("should emit log events", async () => {
-      // Given: A stage that logs a message
+    it("should persist log entries via ctx.log()", async () => {
       const stage = defineStage({
-        id: "logging-stage",
-        name: "Logging Stage",
+        id: "log-stage",
+        name: "Log Stage",
         schemas: {
-          input: TestSchemas.string,
-          output: TestSchemas.string,
+          input: valueSchema,
+          output: valueSchema,
           config: z.object({}),
         },
         async execute(ctx) {
-          ctx.onLog("INFO", "This is a log message");
+          ctx.log("INFO", "Hello from stage");
           return { output: ctx.input };
         },
       });
 
       const workflow = new WorkflowBuilder(
-        "logging-test",
-        "Logging Test",
+        "log-wf",
+        "Log Workflow",
         "Test",
-        TestSchemas.string,
-        TestSchemas.string,
+        valueSchema,
+        valueSchema,
       )
         .pipe(stage)
         .build();
 
-      await createRun("run-log-1", "logging-test", { value: "test" });
-
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-log-1",
-        "logging-test",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
-
-      // Collect log events
-      const logEvents: unknown[] = [];
-      executor.on("log", (data) => {
-        logEvents.push(data);
+      const { kernel, persistence } = createTestKernel([workflow]);
+      await setupAndExecute(kernel, persistence, "log-wf", "log-stage", {
+        value: "test",
       });
 
-      // When: Execute
-      await executor.execute({ value: "test" }, {});
-
-      // Then: Log event was emitted
-      const stageLog = logEvents.find(
-        (e: any) => e.message === "This is a log message",
-      );
-      expect(stageLog).toBeDefined();
+      const logs = persistence.getAllLogs();
+      const match = logs.find((l) => l.message === "Hello from stage");
+      expect(match).toBeDefined();
+      expect(match!.level).toBe("INFO");
+      expect(match!.message).toBe("Hello from stage");
     });
 
-    it("should emit log event with correct structure", async () => {
-      // Given: A stage that logs
+    it("should include workflowRunId and workflowStageId on log records", async () => {
       const stage = defineStage({
-        id: "structured-logging-stage",
-        name: "Structured Logging Stage",
+        id: "id-stage",
+        name: "ID Stage",
         schemas: {
-          input: TestSchemas.string,
-          output: TestSchemas.string,
+          input: valueSchema,
+          output: valueSchema,
           config: z.object({}),
         },
         async execute(ctx) {
-          ctx.onLog("INFO", "Stage-specific log", { key: "value" });
+          ctx.log("INFO", "check ids");
           return { output: ctx.input };
         },
       });
 
       const workflow = new WorkflowBuilder(
-        "structured-log-test",
-        "Structured Log Test",
+        "id-wf",
+        "ID Workflow",
         "Test",
-        TestSchemas.string,
-        TestSchemas.string,
+        valueSchema,
+        valueSchema,
       )
         .pipe(stage)
         .build();
 
-      await createRun("run-log-2", "structured-log-test", { value: "test" });
-
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-log-2",
-        "structured-log-test",
-        {
-          persistence,
-          aiLogger,
-        },
+      const { kernel, persistence } = createTestKernel([workflow]);
+      const runId = await setupAndExecute(
+        kernel,
+        persistence,
+        "id-wf",
+        "id-stage",
+        { value: "test" },
       );
 
-      // Collect log events
-      const logEvents: Array<{
-        level: string;
-        message: string;
-        meta?: Record<string, unknown>;
-      }> = [];
-      executor.on("log", (data) => {
-        logEvents.push(
-          data as {
-            level: string;
-            message: string;
-            meta?: Record<string, unknown>;
-          },
-        );
-      });
-
-      // When: Execute
-      await executor.execute({ value: "test" }, {});
-
-      // Then: Log event has correct structure (level, message, meta)
-      const stageLog = logEvents.find(
-        (e) => e.message === "Stage-specific log",
-      );
-      expect(stageLog).toBeDefined();
-      expect(stageLog?.level).toBe("INFO");
-      expect(stageLog?.meta).toEqual({ key: "value" });
+      const logs = persistence.getAllLogs();
+      const match = logs.find((l) => l.message === "check ids");
+      expect(match).toBeDefined();
+      expect(match!.workflowRunId).toBe(runId);
+      expect(match!.workflowStageId).toBeDefined();
+      expect(typeof match!.workflowStageId).toBe("string");
     });
   });
 
+  // -------------------------------------------------------------------------
+  // log levels
+  // -------------------------------------------------------------------------
   describe("log levels", () => {
-    it("should support different log levels", async () => {
-      // Given: A stage that logs at various levels
+    it("should persist DEBUG level logs", async () => {
       const stage = defineStage({
-        id: "multi-level-stage",
-        name: "Multi Level Stage",
+        id: "debug-stage",
+        name: "Debug Stage",
         schemas: {
-          input: TestSchemas.string,
-          output: TestSchemas.string,
+          input: valueSchema,
+          output: valueSchema,
           config: z.object({}),
         },
         async execute(ctx) {
-          ctx.onLog("INFO", "info message");
-          ctx.onLog("WARN", "warning message");
-          ctx.onLog("ERROR", "error message");
-          ctx.onLog("DEBUG", "debug message");
+          ctx.log("DEBUG", "debug message");
           return { output: ctx.input };
         },
       });
 
       const workflow = new WorkflowBuilder(
-        "log-levels-test",
-        "Log Levels Test",
+        "debug-wf",
+        "Debug Workflow",
         "Test",
-        TestSchemas.string,
-        TestSchemas.string,
+        valueSchema,
+        valueSchema,
       )
         .pipe(stage)
         .build();
 
-      await createRun("run-log-3", "log-levels-test", { value: "test" });
-
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-log-3",
-        "log-levels-test",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
-
-      // Collect log events
-      const logEvents: Array<{ level: string; message: string }> = [];
-      executor.on("log", (data) => {
-        logEvents.push(data as { level: string; message: string });
+      const { kernel, persistence } = createTestKernel([workflow]);
+      await setupAndExecute(kernel, persistence, "debug-wf", "debug-stage", {
+        value: "test",
       });
 
-      // When: Execute
-      await executor.execute({ value: "test" }, {});
-
-      // Then: All log levels were captured
-      const infoLog = logEvents.find(
-        (e) => e.level === "INFO" && e.message === "info message",
-      );
-      const warnLog = logEvents.find(
-        (e) => e.level === "WARN" && e.message === "warning message",
-      );
-      const errorLog = logEvents.find(
-        (e) => e.level === "ERROR" && e.message === "error message",
-      );
-      const debugLog = logEvents.find(
-        (e) => e.level === "DEBUG" && e.message === "debug message",
-      );
-
-      expect(infoLog).toBeDefined();
-      expect(warnLog).toBeDefined();
-      expect(errorLog).toBeDefined();
-      expect(debugLog).toBeDefined();
+      const logs = persistence.getAllLogs();
+      const match = logs.find((l) => l.message === "debug message");
+      expect(match).toBeDefined();
+      expect(match!.level).toBe("DEBUG");
     });
 
-    it("should correctly tag INFO level logs", async () => {
-      // Given: A stage that logs at INFO level
+    it("should persist INFO level logs", async () => {
       const stage = defineStage({
         id: "info-stage",
         name: "Info Stage",
         schemas: {
-          input: TestSchemas.string,
-          output: TestSchemas.string,
+          input: valueSchema,
+          output: valueSchema,
           config: z.object({}),
         },
         async execute(ctx) {
-          ctx.onLog("INFO", "information message");
+          ctx.log("INFO", "info message");
           return { output: ctx.input };
         },
       });
 
       const workflow = new WorkflowBuilder(
-        "info-log-test",
-        "Info Log Test",
+        "info-wf",
+        "Info Workflow",
         "Test",
-        TestSchemas.string,
-        TestSchemas.string,
+        valueSchema,
+        valueSchema,
       )
         .pipe(stage)
         .build();
 
-      await createRun("run-log-4", "info-log-test", { value: "test" });
-
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-log-4",
-        "info-log-test",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
-
-      // Collect log events
-      let logEvent: Record<string, unknown> | null = null;
-      executor.on("log", (data) => {
-        const event = data as Record<string, unknown>;
-        if (event.message === "information message") {
-          logEvent = event;
-        }
+      const { kernel, persistence } = createTestKernel([workflow]);
+      await setupAndExecute(kernel, persistence, "info-wf", "info-stage", {
+        value: "test",
       });
 
-      // When: Execute
-      await executor.execute({ value: "test" }, {});
-
-      // Then: Log has INFO level
-      expect(logEvent).not.toBeNull();
-      expect(logEvent?.level).toBe("INFO");
+      const logs = persistence.getAllLogs();
+      const match = logs.find((l) => l.message === "info message");
+      expect(match).toBeDefined();
+      expect(match!.level).toBe("INFO");
     });
 
-    it("should correctly tag WARN level logs", async () => {
-      // Given: A stage that logs at WARN level
+    it("should persist WARN level logs", async () => {
       const stage = defineStage({
         id: "warn-stage",
         name: "Warn Stage",
         schemas: {
-          input: TestSchemas.string,
-          output: TestSchemas.string,
+          input: valueSchema,
+          output: valueSchema,
           config: z.object({}),
         },
         async execute(ctx) {
-          ctx.onLog("WARN", "warning message");
+          ctx.log("WARN", "warn message");
           return { output: ctx.input };
         },
       });
 
       const workflow = new WorkflowBuilder(
-        "warn-log-test",
-        "Warn Log Test",
+        "warn-wf",
+        "Warn Workflow",
         "Test",
-        TestSchemas.string,
-        TestSchemas.string,
+        valueSchema,
+        valueSchema,
       )
         .pipe(stage)
         .build();
 
-      await createRun("run-log-5", "warn-log-test", { value: "test" });
-
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-log-5",
-        "warn-log-test",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
-
-      // Collect log events
-      let logEvent: Record<string, unknown> | null = null;
-      executor.on("log", (data) => {
-        const event = data as Record<string, unknown>;
-        if (event.message === "warning message") {
-          logEvent = event;
-        }
+      const { kernel, persistence } = createTestKernel([workflow]);
+      await setupAndExecute(kernel, persistence, "warn-wf", "warn-stage", {
+        value: "test",
       });
 
-      // When: Execute
-      await executor.execute({ value: "test" }, {});
-
-      // Then: Log has WARN level
-      expect(logEvent).not.toBeNull();
-      expect(logEvent?.level).toBe("WARN");
+      const logs = persistence.getAllLogs();
+      const match = logs.find((l) => l.message === "warn message");
+      expect(match).toBeDefined();
+      expect(match!.level).toBe("WARN");
     });
 
-    it("should correctly tag ERROR level logs", async () => {
-      // Given: A stage that logs at ERROR level
+    it("should persist ERROR level logs", async () => {
       const stage = defineStage({
         id: "error-stage",
         name: "Error Stage",
         schemas: {
-          input: TestSchemas.string,
-          output: TestSchemas.string,
+          input: valueSchema,
+          output: valueSchema,
           config: z.object({}),
         },
         async execute(ctx) {
-          ctx.onLog("ERROR", "error message");
+          ctx.log("ERROR", "error message");
           return { output: ctx.input };
         },
       });
 
       const workflow = new WorkflowBuilder(
-        "error-log-test",
-        "Error Log Test",
+        "error-wf",
+        "Error Workflow",
         "Test",
-        TestSchemas.string,
-        TestSchemas.string,
+        valueSchema,
+        valueSchema,
       )
         .pipe(stage)
         .build();
 
-      await createRun("run-log-6", "error-log-test", { value: "test" });
-
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-log-6",
-        "error-log-test",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
-
-      // Collect log events
-      let logEvent: Record<string, unknown> | null = null;
-      executor.on("log", (data) => {
-        const event = data as Record<string, unknown>;
-        if (event.message === "error message") {
-          logEvent = event;
-        }
+      const { kernel, persistence } = createTestKernel([workflow]);
+      await setupAndExecute(kernel, persistence, "error-wf", "error-stage", {
+        value: "test",
       });
 
-      // When: Execute
-      await executor.execute({ value: "test" }, {});
-
-      // Then: Log has ERROR level
-      expect(logEvent).not.toBeNull();
-      expect(logEvent?.level).toBe("ERROR");
+      const logs = persistence.getAllLogs();
+      const match = logs.find((l) => l.message === "error message");
+      expect(match).toBeDefined();
+      expect(match!.level).toBe("ERROR");
     });
   });
 
+  // -------------------------------------------------------------------------
+  // log metadata
+  // -------------------------------------------------------------------------
   describe("log metadata", () => {
-    it("should include metadata in logs", async () => {
-      // Given: A stage that logs with metadata
+    it("should persist log metadata", async () => {
       const stage = defineStage({
-        id: "metadata-stage",
-        name: "Metadata Stage",
+        id: "meta-stage",
+        name: "Meta Stage",
         schemas: {
-          input: TestSchemas.string,
-          output: TestSchemas.string,
+          input: valueSchema,
+          output: valueSchema,
           config: z.object({}),
         },
         async execute(ctx) {
-          ctx.onLog("INFO", "log with metadata", { key: "value", count: 42 });
+          ctx.log("INFO", "with meta", { key: "value", count: 42 });
           return { output: ctx.input };
         },
       });
 
       const workflow = new WorkflowBuilder(
-        "metadata-log-test",
-        "Metadata Log Test",
+        "meta-wf",
+        "Meta Workflow",
         "Test",
-        TestSchemas.string,
-        TestSchemas.string,
+        valueSchema,
+        valueSchema,
       )
         .pipe(stage)
         .build();
 
-      await createRun("run-log-7", "metadata-log-test", { value: "test" });
-
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-log-7",
-        "metadata-log-test",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
-
-      // Collect log events
-      let logEvent: Record<string, unknown> | null = null;
-      executor.on("log", (data) => {
-        const event = data as Record<string, unknown>;
-        if (event.message === "log with metadata") {
-          logEvent = event;
-        }
+      const { kernel, persistence } = createTestKernel([workflow]);
+      await setupAndExecute(kernel, persistence, "meta-wf", "meta-stage", {
+        value: "test",
       });
 
-      // When: Execute
-      await executor.execute({ value: "test" }, {});
-
-      // Then: Log event includes metadata
-      expect(logEvent).not.toBeNull();
-      expect(logEvent?.meta).toEqual({ key: "value", count: 42 });
+      const logs = persistence.getAllLogs();
+      const match = logs.find((l) => l.message === "with meta");
+      expect(match).toBeDefined();
+      expect(match!.metadata).toEqual({ key: "value", count: 42 });
     });
 
-    it("should handle logs without metadata", async () => {
-      // Given: A stage that logs without metadata
+    it("should persist logs without metadata", async () => {
       const stage = defineStage({
-        id: "no-metadata-stage",
-        name: "No Metadata Stage",
+        id: "no-meta-stage",
+        name: "No Meta Stage",
         schemas: {
-          input: TestSchemas.string,
-          output: TestSchemas.string,
+          input: valueSchema,
+          output: valueSchema,
           config: z.object({}),
         },
         async execute(ctx) {
-          ctx.onLog("INFO", "log without metadata");
+          ctx.log("INFO", "no metadata");
           return { output: ctx.input };
         },
       });
 
       const workflow = new WorkflowBuilder(
-        "no-metadata-log-test",
-        "No Metadata Log Test",
+        "no-meta-wf",
+        "No Meta Workflow",
         "Test",
-        TestSchemas.string,
-        TestSchemas.string,
+        valueSchema,
+        valueSchema,
       )
         .pipe(stage)
         .build();
 
-      await createRun("run-log-8", "no-metadata-log-test", { value: "test" });
-
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-log-8",
-        "no-metadata-log-test",
-        {
-          persistence,
-          aiLogger,
-        },
+      const { kernel, persistence } = createTestKernel([workflow]);
+      await setupAndExecute(
+        kernel,
+        persistence,
+        "no-meta-wf",
+        "no-meta-stage",
+        { value: "test" },
       );
 
-      // Collect log events
-      let logEvent: Record<string, unknown> | null = null;
-      executor.on("log", (data) => {
-        const event = data as Record<string, unknown>;
-        if (event.message === "log without metadata") {
-          logEvent = event;
-        }
-      });
-
-      // When: Execute
-      await executor.execute({ value: "test" }, {});
-
-      // Then: Log event was emitted without error
-      expect(logEvent).not.toBeNull();
-      expect(logEvent?.message).toBe("log without metadata");
+      const logs = persistence.getAllLogs();
+      const match = logs.find((l) => l.message === "no metadata");
+      expect(match).toBeDefined();
+      // metadata should be null when not provided (persistence defaults undefined -> null)
+      expect(match!.metadata).toBeNull();
     });
 
-    it("should handle complex nested metadata", async () => {
-      // Given: A stage that logs with deeply nested metadata
+    it("should persist nested metadata", async () => {
       const stage = defineStage({
-        id: "nested-metadata-stage",
-        name: "Nested Metadata Stage",
+        id: "nested-stage",
+        name: "Nested Stage",
         schemas: {
-          input: TestSchemas.string,
-          output: TestSchemas.string,
+          input: valueSchema,
+          output: valueSchema,
           config: z.object({}),
         },
         async execute(ctx) {
-          ctx.onLog("INFO", "log with nested metadata", {
-            user: {
-              id: "user-123",
-              name: "Test User",
-            },
-            operation: {
-              type: "processing",
-              status: "in-progress",
-              metrics: {
-                duration: 100,
-                itemCount: 50,
-              },
-            },
-            tags: ["important", "automated"],
-          });
+          ctx.log("INFO", "nested meta", { outer: { inner: "deep" } });
           return { output: ctx.input };
         },
       });
 
       const workflow = new WorkflowBuilder(
-        "nested-metadata-test",
-        "Nested Metadata Test",
+        "nested-wf",
+        "Nested Workflow",
         "Test",
-        TestSchemas.string,
-        TestSchemas.string,
+        valueSchema,
+        valueSchema,
       )
         .pipe(stage)
         .build();
 
-      await createRun("run-log-9", "nested-metadata-test", { value: "test" });
-
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-log-9",
-        "nested-metadata-test",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
-
-      // Collect log events
-      let logEvent: Record<string, unknown> | null = null;
-      executor.on("log", (data) => {
-        const event = data as Record<string, unknown>;
-        if (event.message === "log with nested metadata") {
-          logEvent = event;
-        }
+      const { kernel, persistence } = createTestKernel([workflow]);
+      await setupAndExecute(kernel, persistence, "nested-wf", "nested-stage", {
+        value: "test",
       });
 
-      // When: Execute
-      await executor.execute({ value: "test" }, {});
-
-      // Then: Nested metadata is preserved
-      expect(logEvent).not.toBeNull();
-      const meta = logEvent?.meta as Record<string, unknown>;
-      expect(meta?.user).toEqual({ id: "user-123", name: "Test User" });
-      expect(meta?.operation).toEqual({
-        type: "processing",
-        status: "in-progress",
-        metrics: { duration: 100, itemCount: 50 },
-      });
-      expect(meta?.tags).toEqual(["important", "automated"]);
+      const logs = persistence.getAllLogs();
+      const match = logs.find((l) => l.message === "nested meta");
+      expect(match).toBeDefined();
+      expect(match!.metadata).toEqual({ outer: { inner: "deep" } });
     });
 
-    it("should include error code in ERROR level logs", async () => {
-      // Given: A stage that logs an error with error code
+    it("should persist error code metadata", async () => {
       const stage = defineStage({
-        id: "error-code-stage",
+        id: "errcode-stage",
         name: "Error Code Stage",
         schemas: {
-          input: TestSchemas.string,
-          output: TestSchemas.string,
+          input: valueSchema,
+          output: valueSchema,
           config: z.object({}),
         },
         async execute(ctx) {
-          ctx.onLog("ERROR", "operation failed", {
-            errorCode: 500,
-            errorType: "InternalError",
-            details: "Database connection failed",
+          ctx.log("ERROR", "timeout occurred", {
+            errorCode: "ERR_TIMEOUT",
+            retryable: true,
           });
           return { output: ctx.input };
         },
       });
 
       const workflow = new WorkflowBuilder(
-        "error-code-test",
-        "Error Code Test",
+        "errcode-wf",
+        "Error Code Workflow",
         "Test",
-        TestSchemas.string,
-        TestSchemas.string,
+        valueSchema,
+        valueSchema,
       )
         .pipe(stage)
         .build();
 
-      await createRun("run-log-10", "error-code-test", { value: "test" });
-
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-log-10",
-        "error-code-test",
-        {
-          persistence,
-          aiLogger,
-        },
+      const { kernel, persistence } = createTestKernel([workflow]);
+      await setupAndExecute(
+        kernel,
+        persistence,
+        "errcode-wf",
+        "errcode-stage",
+        { value: "test" },
       );
 
-      // Collect log events
-      let logEvent: Record<string, unknown> | null = null;
-      executor.on("log", (data) => {
-        const event = data as Record<string, unknown>;
-        if (event.message === "operation failed") {
-          logEvent = event;
-        }
+      const logs = persistence.getAllLogs();
+      const match = logs.find((l) => l.message === "timeout occurred");
+      expect(match).toBeDefined();
+      expect(match!.metadata).toEqual({
+        errorCode: "ERR_TIMEOUT",
+        retryable: true,
       });
-
-      // When: Execute
-      await executor.execute({ value: "test" }, {});
-
-      // Then: Error metadata is included
-      expect(logEvent).not.toBeNull();
-      expect(logEvent?.level).toBe("ERROR");
-      const meta = logEvent?.meta as Record<string, unknown>;
-      expect(meta?.errorCode).toBe(500);
-      expect(meta?.errorType).toBe("InternalError");
-      expect(meta?.details).toBe("Database connection failed");
     });
   });
 
+  // -------------------------------------------------------------------------
+  // multiple logs from stages
+  // -------------------------------------------------------------------------
   describe("multiple logs from stages", () => {
-    it("should emit multiple logs from a single stage", async () => {
-      // Given: A stage that logs multiple messages
+    it("should persist multiple logs from a single stage", async () => {
       const stage = defineStage({
         id: "multi-log-stage",
         name: "Multi Log Stage",
         schemas: {
-          input: TestSchemas.string,
-          output: TestSchemas.string,
+          input: valueSchema,
+          output: valueSchema,
           config: z.object({}),
         },
         async execute(ctx) {
-          ctx.onLog("INFO", "starting processing");
-          ctx.onLog("DEBUG", "item 1 processed");
-          ctx.onLog("DEBUG", "item 2 processed");
-          ctx.onLog("INFO", "finished processing");
+          ctx.log("INFO", "first log");
+          ctx.log("DEBUG", "second log");
+          ctx.log("WARN", "third log");
           return { output: ctx.input };
         },
       });
 
       const workflow = new WorkflowBuilder(
-        "multi-log-test",
-        "Multi Log Test",
+        "multi-wf",
+        "Multi Workflow",
         "Test",
-        TestSchemas.string,
-        TestSchemas.string,
+        valueSchema,
+        valueSchema,
       )
         .pipe(stage)
         .build();
 
-      await createRun("run-log-11", "multi-log-test", { value: "test" });
-
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-log-11",
-        "multi-log-test",
-        {
-          persistence,
-          aiLogger,
-        },
+      const { kernel, persistence } = createTestKernel([workflow]);
+      await setupAndExecute(
+        kernel,
+        persistence,
+        "multi-wf",
+        "multi-log-stage",
+        { value: "test" },
       );
 
-      // Collect log events with specific messages we're looking for
-      const stageLogMessages = [
-        "starting processing",
-        "item 1 processed",
-        "item 2 processed",
-        "finished processing",
-      ];
-      const logEvents: Array<{ message: string; level: string }> = [];
-      executor.on("log", (data) => {
-        const event = data as { message: string; level: string };
-        if (stageLogMessages.includes(event.message)) {
-          logEvents.push({ message: event.message, level: event.level });
-        }
-      });
+      const logs = persistence.getAllLogs();
+      const first = logs.find((l) => l.message === "first log");
+      const second = logs.find((l) => l.message === "second log");
+      const third = logs.find((l) => l.message === "third log");
 
-      // When: Execute
-      await executor.execute({ value: "test" }, {});
-
-      // Then: All our logs were emitted
-      expect(logEvents).toHaveLength(4);
-      expect(logEvents.map((e) => e.message)).toEqual([
-        "starting processing",
-        "item 1 processed",
-        "item 2 processed",
-        "finished processing",
-      ]);
+      expect(first).toBeDefined();
+      expect(first!.level).toBe("INFO");
+      expect(second).toBeDefined();
+      expect(second!.level).toBe("DEBUG");
+      expect(third).toBeDefined();
+      expect(third!.level).toBe("WARN");
     });
 
-    it("should track logs across multiple stages", async () => {
-      // Given: Multiple stages that each log with identifiable messages
-      const stageA = defineStage({
-        id: "log-stage-a",
-        name: "Log Stage A",
+    it("should persist logs across multiple stages", async () => {
+      const stage1 = defineStage({
+        id: "stage-a",
+        name: "Stage A",
         schemas: {
-          input: TestSchemas.string,
-          output: TestSchemas.string,
+          input: valueSchema,
+          output: valueSchema,
           config: z.object({}),
         },
         async execute(ctx) {
-          ctx.onLog("INFO", "stage A log");
+          ctx.log("INFO", "log from stage A");
           return { output: ctx.input };
         },
       });
 
-      const stageB = defineStage({
-        id: "log-stage-b",
-        name: "Log Stage B",
+      const stage2 = defineStage({
+        id: "stage-b",
+        name: "Stage B",
         schemas: {
-          input: TestSchemas.string,
-          output: TestSchemas.string,
+          input: valueSchema,
+          output: valueSchema,
           config: z.object({}),
         },
         async execute(ctx) {
-          ctx.onLog("INFO", "stage B log");
+          ctx.log("INFO", "log from stage B");
           return { output: ctx.input };
         },
       });
 
       const workflow = new WorkflowBuilder(
-        "multi-stage-log-test",
-        "Multi Stage Log Test",
+        "two-stage-wf",
+        "Two Stage Workflow",
         "Test",
-        TestSchemas.string,
-        TestSchemas.string,
+        valueSchema,
+        valueSchema,
       )
-        .pipe(stageA)
-        .pipe(stageB)
+        .pipe(stage1)
+        .pipe(stage2)
         .build();
 
-      await createRun("run-log-12", "multi-stage-log-test", { value: "test" });
+      const { kernel, persistence } = createTestKernel([workflow]);
 
-      const executor = new WorkflowExecutor(
-        workflow,
-        "run-log-12",
-        "multi-stage-log-test",
-        {
-          persistence,
-          aiLogger,
-        },
-      );
-
-      // Collect log events for specific messages
-      const logMessages: string[] = [];
-      executor.on("log", (data) => {
-        const event = data as { message: string };
-        if (
-          event.message === "stage A log" ||
-          event.message === "stage B log"
-        ) {
-          logMessages.push(event.message);
-        }
+      // Create a run and set it to RUNNING
+      const createResult = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: `key-two-stage-${Date.now()}`,
+        workflowId: "two-stage-wf",
+        input: { value: "test" },
       });
 
-      // When: Execute
-      await executor.execute({ value: "test" }, {});
+      await persistence.updateRun(createResult.workflowRunId, {
+        status: "RUNNING",
+      });
 
-      // Then: Both stages emitted their logs
-      expect(logMessages).toContain("stage A log");
-      expect(logMessages).toContain("stage B log");
-      expect(logMessages).toHaveLength(2);
+      // Execute stage A
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: createResult.workflowRunId,
+        workflowId: "two-stage-wf",
+        stageId: "stage-a",
+        config: {},
+      });
+
+      // Execute stage B
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: createResult.workflowRunId,
+        workflowId: "two-stage-wf",
+        stageId: "stage-b",
+        config: {},
+      });
+
+      const logs = persistence.getAllLogs();
+      const logA = logs.find((l) => l.message === "log from stage A");
+      const logB = logs.find((l) => l.message === "log from stage B");
+
+      expect(logA).toBeDefined();
+      expect(logB).toBeDefined();
+
+      // Both logs should share the same workflowRunId
+      expect(logA!.workflowRunId).toBe(createResult.workflowRunId);
+      expect(logB!.workflowRunId).toBe(createResult.workflowRunId);
+
+      // But they should have different workflowStageIds
+      expect(logA!.workflowStageId).toBeDefined();
+      expect(logB!.workflowStageId).toBeDefined();
+      expect(logA!.workflowStageId).not.toBe(logB!.workflowStageId);
     });
   });
 });
