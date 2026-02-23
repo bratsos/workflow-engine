@@ -9,17 +9,17 @@
 
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
+import { defineStage } from "../../core/stage-factory.js";
+import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
 import { createKernel } from "../../kernel/kernel.js";
 import {
+  CollectingEventSink,
   FakeClock,
   InMemoryBlobStore,
-  CollectingEventSink,
   NoopScheduler,
 } from "../../kernel/testing/index.js";
-import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
-import { defineStage } from "../../core/stage-factory.js";
-import { WorkflowBuilder, type Workflow } from "../../core/workflow.js";
+import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 
 // ---------------------------------------------------------------------------
 // Shared schema for all test stages
@@ -75,7 +75,9 @@ async function setupAndExecute(
     input,
   });
 
-  await persistence.updateRun(createResult.workflowRunId, { status: "RUNNING" });
+  await persistence.updateRun(createResult.workflowRunId, {
+    status: "RUNNING",
+  });
 
   await kernel.dispatch({
     type: "job.execute",
@@ -101,7 +103,11 @@ describe("I want to log from stages", () => {
       const stage = defineStage({
         id: "log-stage",
         name: "Log Stage",
-        schemas: { input: valueSchema, output: valueSchema, config: z.object({}) },
+        schemas: {
+          input: valueSchema,
+          output: valueSchema,
+          config: z.object({}),
+        },
         async execute(ctx) {
           ctx.log("INFO", "Hello from stage");
           return { output: ctx.input };
@@ -109,11 +115,19 @@ describe("I want to log from stages", () => {
       });
 
       const workflow = new WorkflowBuilder(
-        "log-wf", "Log Workflow", "Test", valueSchema, valueSchema,
-      ).pipe(stage).build();
+        "log-wf",
+        "Log Workflow",
+        "Test",
+        valueSchema,
+        valueSchema,
+      )
+        .pipe(stage)
+        .build();
 
       const { kernel, persistence } = createTestKernel([workflow]);
-      await setupAndExecute(kernel, persistence, "log-wf", "log-stage", { value: "test" });
+      await setupAndExecute(kernel, persistence, "log-wf", "log-stage", {
+        value: "test",
+      });
 
       const logs = persistence.getAllLogs();
       const match = logs.find((l) => l.message === "Hello from stage");
@@ -126,7 +140,11 @@ describe("I want to log from stages", () => {
       const stage = defineStage({
         id: "id-stage",
         name: "ID Stage",
-        schemas: { input: valueSchema, output: valueSchema, config: z.object({}) },
+        schemas: {
+          input: valueSchema,
+          output: valueSchema,
+          config: z.object({}),
+        },
         async execute(ctx) {
           ctx.log("INFO", "check ids");
           return { output: ctx.input };
@@ -134,11 +152,23 @@ describe("I want to log from stages", () => {
       });
 
       const workflow = new WorkflowBuilder(
-        "id-wf", "ID Workflow", "Test", valueSchema, valueSchema,
-      ).pipe(stage).build();
+        "id-wf",
+        "ID Workflow",
+        "Test",
+        valueSchema,
+        valueSchema,
+      )
+        .pipe(stage)
+        .build();
 
       const { kernel, persistence } = createTestKernel([workflow]);
-      const runId = await setupAndExecute(kernel, persistence, "id-wf", "id-stage", { value: "test" });
+      const runId = await setupAndExecute(
+        kernel,
+        persistence,
+        "id-wf",
+        "id-stage",
+        { value: "test" },
+      );
 
       const logs = persistence.getAllLogs();
       const match = logs.find((l) => l.message === "check ids");
@@ -157,7 +187,11 @@ describe("I want to log from stages", () => {
       const stage = defineStage({
         id: "debug-stage",
         name: "Debug Stage",
-        schemas: { input: valueSchema, output: valueSchema, config: z.object({}) },
+        schemas: {
+          input: valueSchema,
+          output: valueSchema,
+          config: z.object({}),
+        },
         async execute(ctx) {
           ctx.log("DEBUG", "debug message");
           return { output: ctx.input };
@@ -165,11 +199,19 @@ describe("I want to log from stages", () => {
       });
 
       const workflow = new WorkflowBuilder(
-        "debug-wf", "Debug Workflow", "Test", valueSchema, valueSchema,
-      ).pipe(stage).build();
+        "debug-wf",
+        "Debug Workflow",
+        "Test",
+        valueSchema,
+        valueSchema,
+      )
+        .pipe(stage)
+        .build();
 
       const { kernel, persistence } = createTestKernel([workflow]);
-      await setupAndExecute(kernel, persistence, "debug-wf", "debug-stage", { value: "test" });
+      await setupAndExecute(kernel, persistence, "debug-wf", "debug-stage", {
+        value: "test",
+      });
 
       const logs = persistence.getAllLogs();
       const match = logs.find((l) => l.message === "debug message");
@@ -181,7 +223,11 @@ describe("I want to log from stages", () => {
       const stage = defineStage({
         id: "info-stage",
         name: "Info Stage",
-        schemas: { input: valueSchema, output: valueSchema, config: z.object({}) },
+        schemas: {
+          input: valueSchema,
+          output: valueSchema,
+          config: z.object({}),
+        },
         async execute(ctx) {
           ctx.log("INFO", "info message");
           return { output: ctx.input };
@@ -189,11 +235,19 @@ describe("I want to log from stages", () => {
       });
 
       const workflow = new WorkflowBuilder(
-        "info-wf", "Info Workflow", "Test", valueSchema, valueSchema,
-      ).pipe(stage).build();
+        "info-wf",
+        "Info Workflow",
+        "Test",
+        valueSchema,
+        valueSchema,
+      )
+        .pipe(stage)
+        .build();
 
       const { kernel, persistence } = createTestKernel([workflow]);
-      await setupAndExecute(kernel, persistence, "info-wf", "info-stage", { value: "test" });
+      await setupAndExecute(kernel, persistence, "info-wf", "info-stage", {
+        value: "test",
+      });
 
       const logs = persistence.getAllLogs();
       const match = logs.find((l) => l.message === "info message");
@@ -205,7 +259,11 @@ describe("I want to log from stages", () => {
       const stage = defineStage({
         id: "warn-stage",
         name: "Warn Stage",
-        schemas: { input: valueSchema, output: valueSchema, config: z.object({}) },
+        schemas: {
+          input: valueSchema,
+          output: valueSchema,
+          config: z.object({}),
+        },
         async execute(ctx) {
           ctx.log("WARN", "warn message");
           return { output: ctx.input };
@@ -213,11 +271,19 @@ describe("I want to log from stages", () => {
       });
 
       const workflow = new WorkflowBuilder(
-        "warn-wf", "Warn Workflow", "Test", valueSchema, valueSchema,
-      ).pipe(stage).build();
+        "warn-wf",
+        "Warn Workflow",
+        "Test",
+        valueSchema,
+        valueSchema,
+      )
+        .pipe(stage)
+        .build();
 
       const { kernel, persistence } = createTestKernel([workflow]);
-      await setupAndExecute(kernel, persistence, "warn-wf", "warn-stage", { value: "test" });
+      await setupAndExecute(kernel, persistence, "warn-wf", "warn-stage", {
+        value: "test",
+      });
 
       const logs = persistence.getAllLogs();
       const match = logs.find((l) => l.message === "warn message");
@@ -229,7 +295,11 @@ describe("I want to log from stages", () => {
       const stage = defineStage({
         id: "error-stage",
         name: "Error Stage",
-        schemas: { input: valueSchema, output: valueSchema, config: z.object({}) },
+        schemas: {
+          input: valueSchema,
+          output: valueSchema,
+          config: z.object({}),
+        },
         async execute(ctx) {
           ctx.log("ERROR", "error message");
           return { output: ctx.input };
@@ -237,11 +307,19 @@ describe("I want to log from stages", () => {
       });
 
       const workflow = new WorkflowBuilder(
-        "error-wf", "Error Workflow", "Test", valueSchema, valueSchema,
-      ).pipe(stage).build();
+        "error-wf",
+        "Error Workflow",
+        "Test",
+        valueSchema,
+        valueSchema,
+      )
+        .pipe(stage)
+        .build();
 
       const { kernel, persistence } = createTestKernel([workflow]);
-      await setupAndExecute(kernel, persistence, "error-wf", "error-stage", { value: "test" });
+      await setupAndExecute(kernel, persistence, "error-wf", "error-stage", {
+        value: "test",
+      });
 
       const logs = persistence.getAllLogs();
       const match = logs.find((l) => l.message === "error message");
@@ -258,7 +336,11 @@ describe("I want to log from stages", () => {
       const stage = defineStage({
         id: "meta-stage",
         name: "Meta Stage",
-        schemas: { input: valueSchema, output: valueSchema, config: z.object({}) },
+        schemas: {
+          input: valueSchema,
+          output: valueSchema,
+          config: z.object({}),
+        },
         async execute(ctx) {
           ctx.log("INFO", "with meta", { key: "value", count: 42 });
           return { output: ctx.input };
@@ -266,11 +348,19 @@ describe("I want to log from stages", () => {
       });
 
       const workflow = new WorkflowBuilder(
-        "meta-wf", "Meta Workflow", "Test", valueSchema, valueSchema,
-      ).pipe(stage).build();
+        "meta-wf",
+        "Meta Workflow",
+        "Test",
+        valueSchema,
+        valueSchema,
+      )
+        .pipe(stage)
+        .build();
 
       const { kernel, persistence } = createTestKernel([workflow]);
-      await setupAndExecute(kernel, persistence, "meta-wf", "meta-stage", { value: "test" });
+      await setupAndExecute(kernel, persistence, "meta-wf", "meta-stage", {
+        value: "test",
+      });
 
       const logs = persistence.getAllLogs();
       const match = logs.find((l) => l.message === "with meta");
@@ -282,7 +372,11 @@ describe("I want to log from stages", () => {
       const stage = defineStage({
         id: "no-meta-stage",
         name: "No Meta Stage",
-        schemas: { input: valueSchema, output: valueSchema, config: z.object({}) },
+        schemas: {
+          input: valueSchema,
+          output: valueSchema,
+          config: z.object({}),
+        },
         async execute(ctx) {
           ctx.log("INFO", "no metadata");
           return { output: ctx.input };
@@ -290,11 +384,23 @@ describe("I want to log from stages", () => {
       });
 
       const workflow = new WorkflowBuilder(
-        "no-meta-wf", "No Meta Workflow", "Test", valueSchema, valueSchema,
-      ).pipe(stage).build();
+        "no-meta-wf",
+        "No Meta Workflow",
+        "Test",
+        valueSchema,
+        valueSchema,
+      )
+        .pipe(stage)
+        .build();
 
       const { kernel, persistence } = createTestKernel([workflow]);
-      await setupAndExecute(kernel, persistence, "no-meta-wf", "no-meta-stage", { value: "test" });
+      await setupAndExecute(
+        kernel,
+        persistence,
+        "no-meta-wf",
+        "no-meta-stage",
+        { value: "test" },
+      );
 
       const logs = persistence.getAllLogs();
       const match = logs.find((l) => l.message === "no metadata");
@@ -307,7 +413,11 @@ describe("I want to log from stages", () => {
       const stage = defineStage({
         id: "nested-stage",
         name: "Nested Stage",
-        schemas: { input: valueSchema, output: valueSchema, config: z.object({}) },
+        schemas: {
+          input: valueSchema,
+          output: valueSchema,
+          config: z.object({}),
+        },
         async execute(ctx) {
           ctx.log("INFO", "nested meta", { outer: { inner: "deep" } });
           return { output: ctx.input };
@@ -315,11 +425,19 @@ describe("I want to log from stages", () => {
       });
 
       const workflow = new WorkflowBuilder(
-        "nested-wf", "Nested Workflow", "Test", valueSchema, valueSchema,
-      ).pipe(stage).build();
+        "nested-wf",
+        "Nested Workflow",
+        "Test",
+        valueSchema,
+        valueSchema,
+      )
+        .pipe(stage)
+        .build();
 
       const { kernel, persistence } = createTestKernel([workflow]);
-      await setupAndExecute(kernel, persistence, "nested-wf", "nested-stage", { value: "test" });
+      await setupAndExecute(kernel, persistence, "nested-wf", "nested-stage", {
+        value: "test",
+      });
 
       const logs = persistence.getAllLogs();
       const match = logs.find((l) => l.message === "nested meta");
@@ -331,24 +449,46 @@ describe("I want to log from stages", () => {
       const stage = defineStage({
         id: "errcode-stage",
         name: "Error Code Stage",
-        schemas: { input: valueSchema, output: valueSchema, config: z.object({}) },
+        schemas: {
+          input: valueSchema,
+          output: valueSchema,
+          config: z.object({}),
+        },
         async execute(ctx) {
-          ctx.log("ERROR", "timeout occurred", { errorCode: "ERR_TIMEOUT", retryable: true });
+          ctx.log("ERROR", "timeout occurred", {
+            errorCode: "ERR_TIMEOUT",
+            retryable: true,
+          });
           return { output: ctx.input };
         },
       });
 
       const workflow = new WorkflowBuilder(
-        "errcode-wf", "Error Code Workflow", "Test", valueSchema, valueSchema,
-      ).pipe(stage).build();
+        "errcode-wf",
+        "Error Code Workflow",
+        "Test",
+        valueSchema,
+        valueSchema,
+      )
+        .pipe(stage)
+        .build();
 
       const { kernel, persistence } = createTestKernel([workflow]);
-      await setupAndExecute(kernel, persistence, "errcode-wf", "errcode-stage", { value: "test" });
+      await setupAndExecute(
+        kernel,
+        persistence,
+        "errcode-wf",
+        "errcode-stage",
+        { value: "test" },
+      );
 
       const logs = persistence.getAllLogs();
       const match = logs.find((l) => l.message === "timeout occurred");
       expect(match).toBeDefined();
-      expect(match!.metadata).toEqual({ errorCode: "ERR_TIMEOUT", retryable: true });
+      expect(match!.metadata).toEqual({
+        errorCode: "ERR_TIMEOUT",
+        retryable: true,
+      });
     });
   });
 
@@ -360,7 +500,11 @@ describe("I want to log from stages", () => {
       const stage = defineStage({
         id: "multi-log-stage",
         name: "Multi Log Stage",
-        schemas: { input: valueSchema, output: valueSchema, config: z.object({}) },
+        schemas: {
+          input: valueSchema,
+          output: valueSchema,
+          config: z.object({}),
+        },
         async execute(ctx) {
           ctx.log("INFO", "first log");
           ctx.log("DEBUG", "second log");
@@ -370,11 +514,23 @@ describe("I want to log from stages", () => {
       });
 
       const workflow = new WorkflowBuilder(
-        "multi-wf", "Multi Workflow", "Test", valueSchema, valueSchema,
-      ).pipe(stage).build();
+        "multi-wf",
+        "Multi Workflow",
+        "Test",
+        valueSchema,
+        valueSchema,
+      )
+        .pipe(stage)
+        .build();
 
       const { kernel, persistence } = createTestKernel([workflow]);
-      await setupAndExecute(kernel, persistence, "multi-wf", "multi-log-stage", { value: "test" });
+      await setupAndExecute(
+        kernel,
+        persistence,
+        "multi-wf",
+        "multi-log-stage",
+        { value: "test" },
+      );
 
       const logs = persistence.getAllLogs();
       const first = logs.find((l) => l.message === "first log");
@@ -393,7 +549,11 @@ describe("I want to log from stages", () => {
       const stage1 = defineStage({
         id: "stage-a",
         name: "Stage A",
-        schemas: { input: valueSchema, output: valueSchema, config: z.object({}) },
+        schemas: {
+          input: valueSchema,
+          output: valueSchema,
+          config: z.object({}),
+        },
         async execute(ctx) {
           ctx.log("INFO", "log from stage A");
           return { output: ctx.input };
@@ -403,7 +563,11 @@ describe("I want to log from stages", () => {
       const stage2 = defineStage({
         id: "stage-b",
         name: "Stage B",
-        schemas: { input: valueSchema, output: valueSchema, config: z.object({}) },
+        schemas: {
+          input: valueSchema,
+          output: valueSchema,
+          config: z.object({}),
+        },
         async execute(ctx) {
           ctx.log("INFO", "log from stage B");
           return { output: ctx.input };
@@ -411,8 +575,15 @@ describe("I want to log from stages", () => {
       });
 
       const workflow = new WorkflowBuilder(
-        "two-stage-wf", "Two Stage Workflow", "Test", valueSchema, valueSchema,
-      ).pipe(stage1).pipe(stage2).build();
+        "two-stage-wf",
+        "Two Stage Workflow",
+        "Test",
+        valueSchema,
+        valueSchema,
+      )
+        .pipe(stage1)
+        .pipe(stage2)
+        .build();
 
       const { kernel, persistence } = createTestKernel([workflow]);
 
@@ -424,7 +595,9 @@ describe("I want to log from stages", () => {
         input: { value: "test" },
       });
 
-      await persistence.updateRun(createResult.workflowRunId, { status: "RUNNING" });
+      await persistence.updateRun(createResult.workflowRunId, {
+        status: "RUNNING",
+      });
 
       // Execute stage A
       await kernel.dispatch({

@@ -14,17 +14,17 @@
 
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
+import { defineStage } from "../../core/stage-factory.js";
+import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
 import { createKernel } from "../../kernel/kernel.js";
 import {
+  CollectingEventSink,
   FakeClock,
   InMemoryBlobStore,
-  CollectingEventSink,
   NoopScheduler,
 } from "../../kernel/testing/index.js";
-import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
-import { defineStage } from "../../core/stage-factory.js";
-import { WorkflowBuilder, type Workflow } from "../../core/workflow.js";
+import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 
 function createTestKernel(workflows: Workflow<any, any>[] = []) {
   const persistence = new InMemoryWorkflowPersistence();
@@ -36,11 +36,26 @@ function createTestKernel(workflows: Workflow<any, any>[] = []) {
   const registry = new Map<string, Workflow<any, any>>();
   for (const w of workflows) registry.set(w.id, w);
   const kernel = createKernel({
-    persistence, blobStore, jobTransport, eventSink, scheduler, clock,
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
     registry: { getWorkflow: (id) => registry.get(id) },
   });
   const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
-  return { kernel, flush, persistence, blobStore, jobTransport, eventSink, scheduler, clock, registry };
+  return {
+    kernel,
+    flush,
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry,
+  };
 }
 
 function createSimpleWorkflow(id: string = "test-workflow") {
@@ -155,12 +170,22 @@ describe("I want to simulate worker process behavior", () => {
       const stage = defineStage({
         id: "transform",
         name: "Transform",
-        schemas: { input: schema, output: z.object({ result: z.string() }), config: z.object({}) },
+        schemas: {
+          input: schema,
+          output: z.object({ result: z.string() }),
+          config: z.object({}),
+        },
         async execute(ctx) {
           return { output: { result: ctx.input.value.toUpperCase() } };
         },
       });
-      const workflow = new WorkflowBuilder("exec-wf", "Test", "Test", schema, z.object({ result: z.string() }))
+      const workflow = new WorkflowBuilder(
+        "exec-wf",
+        "Test",
+        "Test",
+        schema,
+        z.object({ result: z.string() }),
+      )
         .pipe(stage)
         .build();
 
@@ -191,7 +216,9 @@ describe("I want to simulate worker process behavior", () => {
       expect(result.output).toEqual({ result: "HELLO" });
 
       // And: Stage record is updated
-      const stages = await persistence.getStagesByRun(createResult.workflowRunId);
+      const stages = await persistence.getStagesByRun(
+        createResult.workflowRunId,
+      );
       expect(stages[0]!.status).toBe("COMPLETED");
     });
 
@@ -253,7 +280,13 @@ describe("I want to simulate worker process behavior", () => {
       });
 
       const schema = z.object({ value: z.string() });
-      const workflow = new WorkflowBuilder("config-wf", "Test", "Test", schema, schema)
+      const workflow = new WorkflowBuilder(
+        "config-wf",
+        "Test",
+        "Test",
+        schema,
+        schema,
+      )
         .pipe(stage)
         .build();
 
@@ -266,7 +299,9 @@ describe("I want to simulate worker process behavior", () => {
         input: { value: "test" },
         config: { configurable: { model: "gpt-4" } },
       });
-      await persistence.updateRun(createResult.workflowRunId, { status: "RUNNING" });
+      await persistence.updateRun(createResult.workflowRunId, {
+        status: "RUNNING",
+      });
       await flush();
 
       // When: Execute with config
@@ -360,7 +395,13 @@ describe("I want to simulate worker process behavior", () => {
           throw new Error("Permanent failure");
         },
       });
-      const workflow = new WorkflowBuilder("fail-wf", "Fail", "Test", schema, schema)
+      const workflow = new WorkflowBuilder(
+        "fail-wf",
+        "Fail",
+        "Test",
+        schema,
+        schema,
+      )
         .pipe(failStage)
         .build();
 
@@ -641,23 +682,42 @@ describe("I want to simulate worker process behavior", () => {
         id: "process",
         name: "Process",
         schemas: { input: schema, output: schema, config: z.object({}) },
-        async execute(ctx) { return { output: ctx.input }; },
+        async execute(ctx) {
+          return { output: ctx.input };
+        },
       });
       const failStage = defineStage({
         id: "process",
         name: "Process",
         schemas: { input: schema, output: schema, config: z.object({}) },
-        async execute() { throw new Error("Stage error"); },
+        async execute() {
+          throw new Error("Stage error");
+        },
       });
 
-      const successWf = new WorkflowBuilder("success-wf", "Success", "Test", schema, schema)
+      const successWf = new WorkflowBuilder(
+        "success-wf",
+        "Success",
+        "Test",
+        schema,
+        schema,
+      )
         .pipe(successStage)
         .build();
-      const failWf = new WorkflowBuilder("fail-wf", "Fail", "Test", schema, schema)
+      const failWf = new WorkflowBuilder(
+        "fail-wf",
+        "Fail",
+        "Test",
+        schema,
+        schema,
+      )
         .pipe(failStage)
         .build();
 
-      const { kernel, flush, persistence } = createTestKernel([successWf, failWf]);
+      const { kernel, flush, persistence } = createTestKernel([
+        successWf,
+        failWf,
+      ]);
 
       const run1 = await kernel.dispatch({
         type: "run.create",

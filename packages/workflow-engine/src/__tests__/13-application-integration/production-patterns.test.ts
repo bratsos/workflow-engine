@@ -10,17 +10,17 @@
 
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
+import { defineStage } from "../../core/stage-factory.js";
+import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
 import { createKernel } from "../../kernel/kernel.js";
 import {
+  CollectingEventSink,
   FakeClock,
   InMemoryBlobStore,
-  CollectingEventSink,
   NoopScheduler,
 } from "../../kernel/testing/index.js";
-import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
-import { defineStage } from "../../core/stage-factory.js";
-import { WorkflowBuilder, type Workflow } from "../../core/workflow.js";
+import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 
 function createTestKernel(workflows: Workflow<any, any>[] = []) {
   const persistence = new InMemoryWorkflowPersistence();
@@ -32,11 +32,26 @@ function createTestKernel(workflows: Workflow<any, any>[] = []) {
   const registry = new Map<string, Workflow<any, any>>();
   for (const w of workflows) registry.set(w.id, w);
   const kernel = createKernel({
-    persistence, blobStore, jobTransport, eventSink, scheduler, clock,
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
     registry: { getWorkflow: (id) => registry.get(id) },
   });
   const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
-  return { kernel, flush, persistence, blobStore, jobTransport, eventSink, scheduler, clock, registry };
+  return {
+    kernel,
+    flush,
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry,
+  };
 }
 
 describe("I want to use production-ready patterns", () => {
@@ -61,7 +76,9 @@ describe("I want to use production-ready patterns", () => {
 
       const job1 = await jobQueue.dequeue();
       if (job1) {
-        setTimeout(() => { isShuttingDown = true; }, 10);
+        setTimeout(() => {
+          isShuttingDown = true;
+        }, 10);
         await processJob(job1.jobId, job1.stageId);
       }
 
@@ -109,9 +126,17 @@ describe("I want to use production-ready patterns", () => {
         id: "process",
         name: "Process",
         schemas: { input: schema, output: schema, config: z.object({}) },
-        async execute(ctx) { return { output: ctx.input }; },
+        async execute(ctx) {
+          return { output: ctx.input };
+        },
       });
-      const workflow = new WorkflowBuilder("stale-wf", "Stale", "Test", schema, schema)
+      const workflow = new WorkflowBuilder(
+        "stale-wf",
+        "Stale",
+        "Test",
+        schema,
+        schema,
+      )
         .pipe(stage)
         .build();
 
@@ -211,7 +236,10 @@ describe("I want to use production-ready patterns", () => {
   describe("retry patterns", () => {
     it("should implement exponential backoff for retries", async () => {
       // Given: A backoff calculation function
-      const calculateBackoff = (attempt: number, baseMs: number = 1000): number => {
+      const calculateBackoff = (
+        attempt: number,
+        baseMs: number = 1000,
+      ): number => {
         return baseMs * Math.pow(2, attempt - 1);
       };
 
@@ -337,7 +365,10 @@ describe("I want to use production-ready patterns", () => {
       const canExecute = (b: CircuitBreaker): boolean => {
         if (b.state === "closed") return true;
         if (b.state === "open") {
-          if (b.lastFailure && Date.now() - b.lastFailure.getTime() > b.resetTimeoutMs) {
+          if (
+            b.lastFailure &&
+            Date.now() - b.lastFailure.getTime() > b.resetTimeoutMs
+          ) {
             b.state = "half-open";
             return true;
           }
@@ -430,13 +461,23 @@ describe("I want to use production-ready patterns", () => {
         id: "process",
         name: "Process",
         schemas: { input: schema, output: schema, config: z.object({}) },
-        async execute(ctx) { return { output: ctx.input }; },
+        async execute(ctx) {
+          return { output: ctx.input };
+        },
       });
-      const workflow = new WorkflowBuilder("metrics-wf", "Metrics", "Test", schema, schema)
+      const workflow = new WorkflowBuilder(
+        "metrics-wf",
+        "Metrics",
+        "Test",
+        schema,
+        schema,
+      )
         .pipe(stage)
         .build();
 
-      const { kernel, flush, persistence, eventSink } = createTestKernel([workflow]);
+      const { kernel, flush, persistence, eventSink } = createTestKernel([
+        workflow,
+      ]);
 
       // Create, claim, and execute
       const run = await kernel.dispatch({

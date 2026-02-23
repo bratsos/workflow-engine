@@ -11,7 +11,7 @@
 
 import type { RunRerunFromCommand, RunRerunFromResult } from "../commands";
 import type { KernelEvent } from "../events";
-import type { KernelDeps, HandlerResult } from "../kernel";
+import type { HandlerResult, KernelDeps } from "../kernel";
 
 export async function handleRunRerunFrom(
   command: RunRerunFromCommand,
@@ -33,12 +33,15 @@ export async function handleRunRerunFrom(
 
   // 3. Load workflow definition
   const workflow = deps.registry.getWorkflow(run.workflowId);
-  if (!workflow) throw new Error(`Workflow ${run.workflowId} not found in registry`);
+  if (!workflow)
+    throw new Error(`Workflow ${run.workflowId} not found in registry`);
 
   // 4. Validate stage exists in workflow
   const stageDef = workflow.getStage(fromStageId);
   if (!stageDef) {
-    throw new Error(`Stage ${fromStageId} not found in workflow ${run.workflowId}`);
+    throw new Error(
+      `Stage ${fromStageId} not found in workflow ${run.workflowId}`,
+    );
   }
 
   // 5. Get the execution group of the target stage
@@ -49,7 +52,9 @@ export async function handleRunRerunFrom(
 
   // 7. Validate: stages before the target group must have been executed
   if (targetGroup > 1) {
-    const priorStages = existingStages.filter((s) => s.executionGroup < targetGroup);
+    const priorStages = existingStages.filter(
+      (s) => s.executionGroup < targetGroup,
+    );
     if (priorStages.length === 0) {
       throw new Error(
         `Cannot rerun from stage ${fromStageId}: previous stages have not been executed`,

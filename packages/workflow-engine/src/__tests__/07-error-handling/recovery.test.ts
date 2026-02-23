@@ -7,17 +7,17 @@
 
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
+import { defineStage } from "../../core/stage-factory.js";
+import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
 import { createKernel } from "../../kernel/kernel.js";
 import {
+  CollectingEventSink,
   FakeClock,
   InMemoryBlobStore,
-  CollectingEventSink,
   NoopScheduler,
 } from "../../kernel/testing/index.js";
-import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
-import { defineStage } from "../../core/stage-factory.js";
-import { WorkflowBuilder, type Workflow } from "../../core/workflow.js";
+import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 
 function createTestKernel(workflows: Workflow<any, any>[] = []) {
   const persistence = new InMemoryWorkflowPersistence();
@@ -29,11 +29,26 @@ function createTestKernel(workflows: Workflow<any, any>[] = []) {
   const registry = new Map<string, Workflow<any, any>>();
   for (const w of workflows) registry.set(w.id, w);
   const kernel = createKernel({
-    persistence, blobStore, jobTransport, eventSink, scheduler, clock,
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
     registry: { getWorkflow: (id) => registry.get(id) },
   });
   const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
-  return { kernel, flush, persistence, blobStore, jobTransport, eventSink, scheduler, clock, registry };
+  return {
+    kernel,
+    flush,
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry,
+  };
 }
 
 const StringSchema = z.object({ value: z.string() });
@@ -47,7 +62,11 @@ describe("I want to recover from workflow failures", () => {
       const stage1 = defineStage({
         id: "preserve-stage-1",
         name: "Stage 1",
-        schemas: { input: StringSchema, output: StringSchema, config: z.object({}) },
+        schemas: {
+          input: StringSchema,
+          output: StringSchema,
+          config: z.object({}),
+        },
         async execute() {
           return { output: stage1Output };
         },
@@ -56,7 +75,11 @@ describe("I want to recover from workflow failures", () => {
       const stage2 = defineStage({
         id: "preserve-stage-2",
         name: "Stage 2",
-        schemas: { input: StringSchema, output: StringSchema, config: z.object({}) },
+        schemas: {
+          input: StringSchema,
+          output: StringSchema,
+          config: z.object({}),
+        },
         async execute() {
           throw new Error("Stage 2 failed");
         },
@@ -73,7 +96,9 @@ describe("I want to recover from workflow failures", () => {
         .pipe(stage2)
         .build();
 
-      const { kernel, flush, persistence, blobStore } = createTestKernel([workflow]);
+      const { kernel, flush, persistence, blobStore } = createTestKernel([
+        workflow,
+      ]);
 
       const createResult = await kernel.dispatch({
         type: "run.create",
@@ -82,7 +107,9 @@ describe("I want to recover from workflow failures", () => {
         input: { value: "initial" },
       });
 
-      await persistence.updateRun(createResult.workflowRunId, { status: "RUNNING" });
+      await persistence.updateRun(createResult.workflowRunId, {
+        status: "RUNNING",
+      });
       await flush();
 
       // Execute stage 1 successfully
@@ -107,7 +134,9 @@ describe("I want to recover from workflow failures", () => {
       expect(result2.outcome).toBe("failed");
 
       // Then: Stage 1's output is preserved
-      const stages = await persistence.getStagesByRun(createResult.workflowRunId);
+      const stages = await persistence.getStagesByRun(
+        createResult.workflowRunId,
+      );
       const stageMap = new Map(stages.map((s) => [s.stageId, s]));
       const completedStage = stageMap.get("preserve-stage-1");
 
@@ -131,7 +160,11 @@ describe("I want to recover from workflow failures", () => {
         defineStage({
           id,
           name: `Stage ${id}`,
-          schemas: { input: StringSchema, output: StringSchema, config: z.object({}) },
+          schemas: {
+            input: StringSchema,
+            output: StringSchema,
+            config: z.object({}),
+          },
           async execute() {
             return { output: outputs[id] };
           },
@@ -140,7 +173,11 @@ describe("I want to recover from workflow failures", () => {
       const failingStage = defineStage({
         id: "multi-stage-3",
         name: "Stage 3",
-        schemas: { input: StringSchema, output: StringSchema, config: z.object({}) },
+        schemas: {
+          input: StringSchema,
+          output: StringSchema,
+          config: z.object({}),
+        },
         async execute() {
           throw new Error("Stage 3 failed");
         },
@@ -149,7 +186,11 @@ describe("I want to recover from workflow failures", () => {
       const stage4 = defineStage({
         id: "multi-stage-4",
         name: "Stage 4",
-        schemas: { input: StringSchema, output: StringSchema, config: z.object({}) },
+        schemas: {
+          input: StringSchema,
+          output: StringSchema,
+          config: z.object({}),
+        },
         async execute(ctx) {
           return { output: ctx.input };
         },
@@ -177,7 +218,9 @@ describe("I want to recover from workflow failures", () => {
         input: { value: "initial" },
       });
 
-      await persistence.updateRun(createResult.workflowRunId, { status: "RUNNING" });
+      await persistence.updateRun(createResult.workflowRunId, {
+        status: "RUNNING",
+      });
       await flush();
 
       // Execute stages 1 and 2 successfully
@@ -210,7 +253,9 @@ describe("I want to recover from workflow failures", () => {
       expect(r3.outcome).toBe("failed");
 
       // Then: Stages 1 and 2 outputs are preserved, stage 3 is FAILED
-      const stages = await persistence.getStagesByRun(createResult.workflowRunId);
+      const stages = await persistence.getStagesByRun(
+        createResult.workflowRunId,
+      );
       const stageMap = new Map(stages.map((s) => [s.stageId, s]));
 
       expect(stageMap.get("multi-stage-1")?.status).toBe("COMPLETED");
@@ -238,7 +283,11 @@ describe("I want to recover from workflow failures", () => {
       const stage1 = defineStage({
         id: "stage1-id",
         name: "Stage 1",
-        schemas: { input: StringSchema, output: StringSchema, config: z.object({}) },
+        schemas: {
+          input: StringSchema,
+          output: StringSchema,
+          config: z.object({}),
+        },
         async execute() {
           return { output: { value: "stage1-done" } };
         },
@@ -250,7 +299,8 @@ describe("I want to recover from workflow failures", () => {
         schemas: { input: z.any(), output: StringSchema, config: z.object({}) },
         async execute() {
           stage2Attempts++;
-          if (stage2Attempts === 1) throw new Error("stage2 failed on first attempt");
+          if (stage2Attempts === 1)
+            throw new Error("stage2 failed on first attempt");
           return { output: { value: "stage2-done" } };
         },
       });
@@ -295,7 +345,10 @@ describe("I want to recover from workflow failures", () => {
         stageId: "stage2-id",
         config: {},
       });
-      const transResult = await kernel.dispatch({ type: "run.transition", workflowRunId });
+      const transResult = await kernel.dispatch({
+        type: "run.transition",
+        workflowRunId,
+      });
       expect(transResult.action).toBe("failed");
 
       const failedRun = await persistence.getRun(workflowRunId);
@@ -333,7 +386,11 @@ describe("I want to recover from workflow failures", () => {
       const stage1 = defineStage({
         id: "stage1-id",
         name: "Stage 1",
-        schemas: { input: StringSchema, output: StringSchema, config: z.object({}) },
+        schemas: {
+          input: StringSchema,
+          output: StringSchema,
+          config: z.object({}),
+        },
         async execute() {
           stage1Count++;
           return { output: { value: "stage1-done" } };
@@ -426,7 +483,11 @@ describe("I want to recover from workflow failures", () => {
       const stage1 = defineStage({
         id: "stage1-id",
         name: "Stage 1",
-        schemas: { input: StringSchema, output: z.object({ processed: z.string() }), config: z.object({}) },
+        schemas: {
+          input: StringSchema,
+          output: z.object({ processed: z.string() }),
+          config: z.object({}),
+        },
         async execute() {
           return { output: { processed: "stage1-result" } };
         },
@@ -520,7 +581,11 @@ describe("I want to recover from workflow failures", () => {
       const stage1 = defineStage({
         id: "stage1-id",
         name: "Stage 1",
-        schemas: { input: StringSchema, output: z.object({ data: z.string() }), config: z.object({}) },
+        schemas: {
+          input: StringSchema,
+          output: z.object({ data: z.string() }),
+          config: z.object({}),
+        },
         async execute() {
           return { output: { data: "preserved" } };
         },
@@ -598,7 +663,9 @@ describe("I want to recover from workflow failures", () => {
 
       // Verify: workflowContext contains stage1's output after recovery
       expect(capturedWorkflowContext).toHaveProperty("stage1-id");
-      expect(capturedWorkflowContext["stage1-id"]).toEqual({ data: "preserved" });
+      expect(capturedWorkflowContext["stage1-id"]).toEqual({
+        data: "preserved",
+      });
 
       const run = await persistence.getRun(workflowRunId);
       expect(run!.status).toBe("COMPLETED");

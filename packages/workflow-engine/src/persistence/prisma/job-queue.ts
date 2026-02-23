@@ -51,7 +51,10 @@ export class PrismaJobQueue implements JobQueue {
         workflowRunId: options.workflowRunId,
         stageId: options.stageId,
         priority: options.priority ?? 5,
-        payload: { ...options.payload, _workflowId: options.workflowId } as unknown,
+        payload: {
+          ...options.payload,
+          _workflowId: options.workflowId,
+        } as unknown,
         status: this.enums.status("PENDING"),
         nextPollAt: options.scheduledFor,
       },

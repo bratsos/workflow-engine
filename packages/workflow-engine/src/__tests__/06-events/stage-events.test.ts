@@ -9,17 +9,17 @@
 
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
+import { defineStage } from "../../core/stage-factory.js";
+import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
 import { createKernel } from "../../kernel/kernel.js";
 import {
+  CollectingEventSink,
   FakeClock,
   InMemoryBlobStore,
-  CollectingEventSink,
   NoopScheduler,
 } from "../../kernel/testing/index.js";
-import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
-import { defineStage } from "../../core/stage-factory.js";
-import { WorkflowBuilder, type Workflow } from "../../core/workflow.js";
+import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 
 const TestStringSchema = z.object({ value: z.string() });
 
@@ -42,14 +42,28 @@ function createTestKernel(workflows: Workflow<any, any>[] = []) {
     registry: { getWorkflow: (id) => registry.get(id) },
   });
   const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
-  return { kernel, flush, persistence, blobStore, jobTransport, eventSink, scheduler, clock, registry };
+  return {
+    kernel,
+    flush,
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry,
+  };
 }
 
 function createPassthroughStage(id: string) {
   return defineStage({
     id,
     name: `Stage ${id}`,
-    schemas: { input: TestStringSchema, output: TestStringSchema, config: z.object({}) },
+    schemas: {
+      input: TestStringSchema,
+      output: TestStringSchema,
+      config: z.object({}),
+    },
     async execute(ctx) {
       return { output: ctx.input };
     },
@@ -97,7 +111,13 @@ describe("I want to track stage lifecycle events", () => {
         .build();
 
       const { kernel, flush, eventSink } = createTestKernel([workflow]);
-      const workflowRunId = await setupRun(kernel, flush, eventSink, "multi-stage-started", { value: "test" });
+      const workflowRunId = await setupRun(
+        kernel,
+        flush,
+        eventSink,
+        "multi-stage-started",
+        { value: "test" },
+      );
 
       // When: Execute all stages
       for (const stageId of ["stage-a", "stage-b", "stage-c"]) {
@@ -148,7 +168,13 @@ describe("I want to track stage lifecycle events", () => {
         .build();
 
       const { kernel, flush, eventSink } = createTestKernel([workflow]);
-      const workflowRunId = await setupRun(kernel, flush, eventSink, "stage-info-test", { value: "test" });
+      const workflowRunId = await setupRun(
+        kernel,
+        flush,
+        eventSink,
+        "stage-info-test",
+        { value: "test" },
+      );
 
       // When: Execute
       await kernel.dispatch({
@@ -182,7 +208,13 @@ describe("I want to track stage lifecycle events", () => {
         .build();
 
       const { kernel, flush, eventSink } = createTestKernel([workflow]);
-      const workflowRunId = await setupRun(kernel, flush, eventSink, "timing-test", { value: "test" });
+      const workflowRunId = await setupRun(
+        kernel,
+        flush,
+        eventSink,
+        "timing-test",
+        { value: "test" },
+      );
 
       // When: Execute
       await kernel.dispatch({
@@ -222,7 +254,13 @@ describe("I want to track stage lifecycle events", () => {
         .build();
 
       const { kernel, flush, eventSink } = createTestKernel([workflow]);
-      const workflowRunId = await setupRun(kernel, flush, eventSink, "multi-stage-completed", { value: "test" });
+      const workflowRunId = await setupRun(
+        kernel,
+        flush,
+        eventSink,
+        "multi-stage-completed",
+        { value: "test" },
+      );
 
       // When: Execute all stages
       for (const stageId of ["stage-a", "stage-b"]) {
@@ -272,7 +310,13 @@ describe("I want to track stage lifecycle events", () => {
         .build();
 
       const { kernel, flush, eventSink } = createTestKernel([workflow]);
-      const workflowRunId = await setupRun(kernel, flush, eventSink, "timing-complete-test", { value: "test" });
+      const workflowRunId = await setupRun(
+        kernel,
+        flush,
+        eventSink,
+        "timing-complete-test",
+        { value: "test" },
+      );
 
       // When: Execute
       await kernel.dispatch({
@@ -307,7 +351,13 @@ describe("I want to track stage lifecycle events", () => {
         .build();
 
       const { kernel, flush, eventSink } = createTestKernel([workflow]);
-      const workflowRunId = await setupRun(kernel, flush, eventSink, "event-order-test", { value: "test" });
+      const workflowRunId = await setupRun(
+        kernel,
+        flush,
+        eventSink,
+        "event-order-test",
+        { value: "test" },
+      );
 
       // When: Execute
       await kernel.dispatch({
@@ -323,7 +373,10 @@ describe("I want to track stage lifecycle events", () => {
       const stageEvents = eventSink.events.filter(
         (e) => e.type === "stage:started" || e.type === "stage:completed",
       );
-      expect(stageEvents.map((e) => e.type)).toEqual(["stage:started", "stage:completed"]);
+      expect(stageEvents.map((e) => e.type)).toEqual([
+        "stage:started",
+        "stage:completed",
+      ]);
     });
 
     it("should include stageId and stageName in stage:completed event", async () => {
@@ -352,7 +405,13 @@ describe("I want to track stage lifecycle events", () => {
         .build();
 
       const { kernel, flush, eventSink } = createTestKernel([workflow]);
-      const workflowRunId = await setupRun(kernel, flush, eventSink, "complete-info-test", { value: "test" });
+      const workflowRunId = await setupRun(
+        kernel,
+        flush,
+        eventSink,
+        "complete-info-test",
+        { value: "test" },
+      );
 
       // When: Execute
       await kernel.dispatch({
@@ -399,7 +458,13 @@ describe("I want to track stage lifecycle events", () => {
         .build();
 
       const { kernel, flush, eventSink } = createTestKernel([workflow]);
-      const workflowRunId = await setupRun(kernel, flush, eventSink, "stage-failed-test", {});
+      const workflowRunId = await setupRun(
+        kernel,
+        flush,
+        eventSink,
+        "stage-failed-test",
+        {},
+      );
 
       // When: Execute (and it fails)
       const result = await kernel.dispatch({
@@ -444,7 +509,13 @@ describe("I want to track stage lifecycle events", () => {
         .build();
 
       const { kernel, flush, eventSink } = createTestKernel([workflow]);
-      const workflowRunId = await setupRun(kernel, flush, eventSink, "error-msg-test", {});
+      const workflowRunId = await setupRun(
+        kernel,
+        flush,
+        eventSink,
+        "error-msg-test",
+        {},
+      );
 
       // When: Execute (and it fails)
       await kernel.dispatch({
@@ -488,7 +559,13 @@ describe("I want to track stage lifecycle events", () => {
         .build();
 
       const { kernel, flush, eventSink } = createTestKernel([workflow]);
-      const workflowRunId = await setupRun(kernel, flush, eventSink, "fail-order-test", {});
+      const workflowRunId = await setupRun(
+        kernel,
+        flush,
+        eventSink,
+        "fail-order-test",
+        {},
+      );
 
       // When: Execute (and it fails)
       await kernel.dispatch({
@@ -504,7 +581,10 @@ describe("I want to track stage lifecycle events", () => {
       const stageEvents = eventSink.events.filter(
         (e) => e.type === "stage:started" || e.type === "stage:failed",
       );
-      expect(stageEvents.map((e) => e.type)).toEqual(["stage:started", "stage:failed"]);
+      expect(stageEvents.map((e) => e.type)).toEqual([
+        "stage:started",
+        "stage:failed",
+      ]);
     });
 
     it("should only emit stage:failed for the failing stage in multi-stage workflow", async () => {
@@ -535,7 +615,13 @@ describe("I want to track stage lifecycle events", () => {
         .build();
 
       const { kernel, flush, eventSink } = createTestKernel([workflow]);
-      const workflowRunId = await setupRun(kernel, flush, eventSink, "partial-fail-test", { value: "test" });
+      const workflowRunId = await setupRun(
+        kernel,
+        flush,
+        eventSink,
+        "partial-fail-test",
+        { value: "test" },
+      );
 
       // Execute first stage (succeeds)
       await kernel.dispatch({

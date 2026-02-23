@@ -8,17 +8,17 @@
 
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
+import { defineStage } from "../../core/stage-factory.js";
+import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
 import { createKernel } from "../../kernel/kernel.js";
 import {
+  CollectingEventSink,
   FakeClock,
   InMemoryBlobStore,
-  CollectingEventSink,
   NoopScheduler,
 } from "../../kernel/testing/index.js";
-import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
-import { defineStage } from "../../core/stage-factory.js";
-import { WorkflowBuilder, type Workflow } from "../../core/workflow.js";
+import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 
 function createTestKernel(workflows: Workflow<any, any>[] = []) {
   const persistence = new InMemoryWorkflowPersistence();
@@ -42,7 +42,17 @@ function createTestKernel(workflows: Workflow<any, any>[] = []) {
   });
 
   const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
-  return { kernel, flush, persistence, blobStore, jobTransport, eventSink, scheduler, clock, registry };
+  return {
+    kernel,
+    flush,
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry,
+  };
 }
 
 describe("I want to ensure proper dependency resolution", () => {
@@ -390,7 +400,12 @@ describe("I want to ensure proper dependency resolution", () => {
 
       await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
 
-      for (const stageId of ["data-source", "config-source", "metadata-source", "processor"]) {
+      for (const stageId of [
+        "data-source",
+        "config-source",
+        "metadata-source",
+        "processor",
+      ]) {
         await kernel.dispatch({
           type: "job.execute",
           workflowRunId,

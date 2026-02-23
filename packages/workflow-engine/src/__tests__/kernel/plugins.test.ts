@@ -6,11 +6,8 @@
  */
 
 import { describe, expect, it, vi } from "vitest";
-import {
-  definePlugin,
-  createPluginRunner,
-} from "../../kernel/plugins.js";
 import type { KernelEvent } from "../../kernel/events.js";
+import { createPluginRunner, definePlugin } from "../../kernel/plugins.js";
 
 describe("kernel: plugin runner", () => {
   it("routes events to matching handlers", async () => {

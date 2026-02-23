@@ -10,17 +10,17 @@
 
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
+import { defineStage } from "../../core/stage-factory.js";
+import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
 import { createKernel } from "../../kernel/kernel.js";
 import {
+  CollectingEventSink,
   FakeClock,
   InMemoryBlobStore,
-  CollectingEventSink,
   NoopScheduler,
 } from "../../kernel/testing/index.js";
-import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
-import { defineStage } from "../../core/stage-factory.js";
-import { WorkflowBuilder, type Workflow } from "../../core/workflow.js";
+import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 
 function createTestKernel(workflows: Workflow<any, any>[] = []) {
   const persistence = new InMemoryWorkflowPersistence();
@@ -32,11 +32,26 @@ function createTestKernel(workflows: Workflow<any, any>[] = []) {
   const registry = new Map<string, Workflow<any, any>>();
   for (const w of workflows) registry.set(w.id, w);
   const kernel = createKernel({
-    persistence, blobStore, jobTransport, eventSink, scheduler, clock,
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
     registry: { getWorkflow: (id) => registry.get(id) },
   });
   const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
-  return { kernel, flush, persistence, blobStore, jobTransport, eventSink, scheduler, clock, registry };
+  return {
+    kernel,
+    flush,
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry,
+  };
 }
 
 const StringSchema = z.object({ value: z.string() });
@@ -350,7 +365,11 @@ describe("I want to validate input and config before execution", () => {
       const stage1 = defineStage({
         id: "stage-1",
         name: "Stage 1",
-        schemas: { input: StringSchema, output: StringSchema, config: z.object({}) },
+        schemas: {
+          input: StringSchema,
+          output: StringSchema,
+          config: z.object({}),
+        },
         async execute(ctx) {
           executionLog.push("stage-1-executed");
           return { output: ctx.input };

@@ -7,17 +7,17 @@
 
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
+import { defineStage } from "../../core/stage-factory.js";
+import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
 import { createKernel } from "../../kernel/kernel.js";
 import {
+  CollectingEventSink,
   FakeClock,
   InMemoryBlobStore,
-  CollectingEventSink,
   NoopScheduler,
 } from "../../kernel/testing/index.js";
-import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
-import { defineStage } from "../../core/stage-factory.js";
-import { WorkflowBuilder, type Workflow } from "../../core/workflow.js";
+import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -45,10 +45,23 @@ function createTestKernel(workflows: Workflow<any, any>[] = []) {
   });
 
   const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
-  return { kernel, flush, persistence, blobStore, jobTransport, eventSink, scheduler, clock, registry };
+  return {
+    kernel,
+    flush,
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry,
+  };
 }
 
-function createPassthroughStage(id: string, outputOverride?: Record<string, unknown>) {
+function createPassthroughStage(
+  id: string,
+  outputOverride?: Record<string, unknown>,
+) {
   const schema = z.object({ value: z.string() });
   return defineStage({
     id,
@@ -115,7 +128,9 @@ describe("I want to rerun a workflow from a specific stage", () => {
       const s4 = createPassthroughStage("s4");
 
       const workflow = new WorkflowBuilder(
-        "four-stage", "Four Stage", "Test",
+        "four-stage",
+        "Four Stage",
+        "Test",
         z.object({ value: z.string() }),
         z.object({ value: z.string() }),
       )
@@ -125,10 +140,15 @@ describe("I want to rerun a workflow from a specific stage", () => {
         .pipe(s4)
         .build();
 
-      const { kernel, flush, persistence, jobTransport } = createTestKernel([workflow]);
+      const { kernel, flush, persistence, jobTransport } = createTestKernel([
+        workflow,
+      ]);
 
       const workflowRunId = await runWorkflowToCompletion(
-        kernel, flush, "four-stage", ["s1", "s2", "s3", "s4"],
+        kernel,
+        flush,
+        "four-stage",
+        ["s1", "s2", "s3", "s4"],
         { value: "start" },
       );
 
@@ -180,7 +200,9 @@ describe("I want to rerun a workflow from a specific stage", () => {
       const s4 = createPassthroughStage("s4");
 
       const workflow = new WorkflowBuilder(
-        "four-stage", "Four Stage", "Test",
+        "four-stage",
+        "Four Stage",
+        "Test",
         z.object({ value: z.string() }),
         z.object({ value: z.string() }),
       )
@@ -193,7 +215,10 @@ describe("I want to rerun a workflow from a specific stage", () => {
       const { kernel, flush, persistence } = createTestKernel([workflow]);
 
       const workflowRunId = await runWorkflowToCompletion(
-        kernel, flush, "four-stage", ["s1", "s2", "s3", "s4"],
+        kernel,
+        flush,
+        "four-stage",
+        ["s1", "s2", "s3", "s4"],
         { value: "start" },
       );
 
@@ -261,7 +286,9 @@ describe("I want to rerun a workflow from a specific stage", () => {
       const finalStage = createPassthroughStage("final");
 
       const workflow = new WorkflowBuilder(
-        "counter-wf", "Counter Workflow", "Test",
+        "counter-wf",
+        "Counter Workflow",
+        "Test",
         z.object({ value: z.string() }),
         z.object({ value: z.string() }),
       )
@@ -273,7 +300,10 @@ describe("I want to rerun a workflow from a specific stage", () => {
 
       // Run to completion (counter increments to 1)
       const workflowRunId = await runWorkflowToCompletion(
-        kernel, flush, "counter-wf", ["counter", "final"],
+        kernel,
+        flush,
+        "counter-wf",
+        ["counter", "final"],
         { value: "start" },
       );
 
@@ -307,7 +337,9 @@ describe("I want to rerun a workflow from a specific stage", () => {
       const s1 = createPassthroughStage("s1");
 
       const workflow = new WorkflowBuilder(
-        "simple-wf", "Simple Workflow", "Test",
+        "simple-wf",
+        "Simple Workflow",
+        "Test",
         z.object({ value: z.string() }),
         z.object({ value: z.string() }),
       )
@@ -317,7 +349,10 @@ describe("I want to rerun a workflow from a specific stage", () => {
       const { kernel, flush } = createTestKernel([workflow]);
 
       const workflowRunId = await runWorkflowToCompletion(
-        kernel, flush, "simple-wf", ["s1"],
+        kernel,
+        flush,
+        "simple-wf",
+        ["s1"],
         { value: "start" },
       );
 
@@ -338,7 +373,9 @@ describe("I want to rerun a workflow from a specific stage", () => {
       const s3 = createPassthroughStage("s3");
 
       const workflow = new WorkflowBuilder(
-        "three-stage", "Three Stage", "Test",
+        "three-stage",
+        "Three Stage",
+        "Test",
         z.object({ value: z.string() }),
         z.object({ value: z.string() }),
       )
@@ -403,7 +440,9 @@ describe("I want to rerun a workflow from a specific stage", () => {
       });
 
       const workflow = new WorkflowBuilder(
-        "context-wf", "Context Workflow", "Test",
+        "context-wf",
+        "Context Workflow",
+        "Test",
         z.object({ value: z.string() }),
         z.object({ value: z.string() }),
       )
@@ -415,7 +454,10 @@ describe("I want to rerun a workflow from a specific stage", () => {
 
       // Run to completion first
       const workflowRunId = await runWorkflowToCompletion(
-        kernel, flush, "context-wf", ["stage1", "stage2"],
+        kernel,
+        flush,
+        "context-wf",
+        ["stage1", "stage2"],
         { value: "start" },
       );
 
@@ -449,7 +491,9 @@ describe("I want to rerun a workflow from a specific stage", () => {
       const s3 = createPassthroughStage("s3");
 
       const workflow = new WorkflowBuilder(
-        "three-stage", "Three Stage", "Test",
+        "three-stage",
+        "Three Stage",
+        "Test",
         z.object({ value: z.string() }),
         z.object({ value: z.string() }),
       )
@@ -461,7 +505,10 @@ describe("I want to rerun a workflow from a specific stage", () => {
       const { kernel, flush, persistence } = createTestKernel([workflow]);
 
       const workflowRunId = await runWorkflowToCompletion(
-        kernel, flush, "three-stage", ["s1", "s2", "s3"],
+        kernel,
+        flush,
+        "three-stage",
+        ["s1", "s2", "s3"],
         { value: "start" },
       );
 

@@ -6,17 +6,17 @@
 
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
+import { defineStage } from "../../core/stage-factory.js";
+import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
 import { createKernel } from "../../kernel/kernel.js";
 import {
+  CollectingEventSink,
   FakeClock,
   InMemoryBlobStore,
-  CollectingEventSink,
   NoopScheduler,
 } from "../../kernel/testing/index.js";
-import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
-import { defineStage } from "../../core/stage-factory.js";
-import { WorkflowBuilder, type Workflow } from "../../core/workflow.js";
+import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 
 function createTestKernel(workflows: Workflow<any, any>[] = []) {
   const persistence = new InMemoryWorkflowPersistence();
@@ -28,11 +28,26 @@ function createTestKernel(workflows: Workflow<any, any>[] = []) {
   const registry = new Map<string, Workflow<any, any>>();
   for (const w of workflows) registry.set(w.id, w);
   const kernel = createKernel({
-    persistence, blobStore, jobTransport, eventSink, scheduler, clock,
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
     registry: { getWorkflow: (id) => registry.get(id) },
   });
   const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
-  return { kernel, flush, persistence, blobStore, jobTransport, eventSink, scheduler, clock, registry };
+  return {
+    kernel,
+    flush,
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry,
+  };
 }
 
 const StringSchema = z.object({ value: z.string() });
@@ -73,7 +88,9 @@ describe("I want to handle execution errors properly", () => {
         input: {},
       });
 
-      await persistence.updateRun(createResult.workflowRunId, { status: "RUNNING" });
+      await persistence.updateRun(createResult.workflowRunId, {
+        status: "RUNNING",
+      });
       await flush();
 
       // When: I execute
@@ -125,7 +142,9 @@ describe("I want to handle execution errors properly", () => {
         input: {},
       });
 
-      await persistence.updateRun(createResult.workflowRunId, { status: "RUNNING" });
+      await persistence.updateRun(createResult.workflowRunId, {
+        status: "RUNNING",
+      });
       await flush();
 
       // When: I execute
@@ -169,7 +188,9 @@ describe("I want to handle execution errors properly", () => {
         .pipe(failingStage)
         .build();
 
-      const { kernel, flush, persistence, eventSink } = createTestKernel([workflow]);
+      const { kernel, flush, persistence, eventSink } = createTestKernel([
+        workflow,
+      ]);
 
       const createResult = await kernel.dispatch({
         type: "run.create",
@@ -178,7 +199,9 @@ describe("I want to handle execution errors properly", () => {
         input: {},
       });
 
-      await persistence.updateRun(createResult.workflowRunId, { status: "RUNNING" });
+      await persistence.updateRun(createResult.workflowRunId, {
+        status: "RUNNING",
+      });
       await flush();
       eventSink.clear();
 
@@ -238,7 +261,9 @@ describe("I want to handle execution errors properly", () => {
         input: {},
       });
 
-      await persistence.updateRun(createResult.workflowRunId, { status: "RUNNING" });
+      await persistence.updateRun(createResult.workflowRunId, {
+        status: "RUNNING",
+      });
       await flush();
 
       // When: I execute
@@ -291,7 +316,9 @@ describe("I want to handle execution errors properly", () => {
         input: {},
       });
 
-      await persistence.updateRun(createResult.workflowRunId, { status: "RUNNING" });
+      await persistence.updateRun(createResult.workflowRunId, {
+        status: "RUNNING",
+      });
       await flush();
 
       // When: Stage fails
@@ -351,7 +378,9 @@ describe("I want to handle execution errors properly", () => {
         input: {},
       });
 
-      await persistence.updateRun(createResult.workflowRunId, { status: "RUNNING" });
+      await persistence.updateRun(createResult.workflowRunId, {
+        status: "RUNNING",
+      });
       await flush();
 
       // When: Stage fails and run.transition fires
@@ -408,7 +437,9 @@ describe("I want to handle execution errors properly", () => {
         input: {},
       });
 
-      await persistence.updateRun(createResult.workflowRunId, { status: "RUNNING" });
+      await persistence.updateRun(createResult.workflowRunId, {
+        status: "RUNNING",
+      });
       await flush();
 
       // When: I execute (and it fails)
@@ -423,8 +454,12 @@ describe("I want to handle execution errors properly", () => {
       expect(result.outcome).toBe("failed");
 
       // Then: Stage has FAILED status with error message
-      const stages = await persistence.getStagesByRun(createResult.workflowRunId);
-      const failedStage = stages.find((s) => s.stageId === "specific-error-stage");
+      const stages = await persistence.getStagesByRun(
+        createResult.workflowRunId,
+      );
+      const failedStage = stages.find(
+        (s) => s.stageId === "specific-error-stage",
+      );
 
       expect(failedStage).toBeDefined();
       expect(failedStage?.status).toBe("FAILED");
@@ -440,7 +475,11 @@ describe("I want to handle execution errors properly", () => {
       const successStage = defineStage({
         id: "success-first",
         name: "Success First",
-        schemas: { input: StringSchema, output: StringSchema, config: z.object({}) },
+        schemas: {
+          input: StringSchema,
+          output: StringSchema,
+          config: z.object({}),
+        },
         async execute(ctx) {
           return { output: ctx.input };
         },
@@ -449,7 +488,11 @@ describe("I want to handle execution errors properly", () => {
       const failStage = defineStage({
         id: "fail-second",
         name: "Fail Second",
-        schemas: { input: StringSchema, output: StringSchema, config: z.object({}) },
+        schemas: {
+          input: StringSchema,
+          output: StringSchema,
+          config: z.object({}),
+        },
         async execute() {
           throw new Error("Second stage failed");
         },
@@ -475,7 +518,9 @@ describe("I want to handle execution errors properly", () => {
         input: { value: "test" },
       });
 
-      await persistence.updateRun(createResult.workflowRunId, { status: "RUNNING" });
+      await persistence.updateRun(createResult.workflowRunId, {
+        status: "RUNNING",
+      });
       await flush();
 
       // Execute stage 1 successfully
@@ -499,7 +544,9 @@ describe("I want to handle execution errors properly", () => {
       expect(result2.outcome).toBe("failed");
 
       // Then: First stage is COMPLETED, second is FAILED
-      const stages = await persistence.getStagesByRun(createResult.workflowRunId);
+      const stages = await persistence.getStagesByRun(
+        createResult.workflowRunId,
+      );
       const stageMap = new Map(stages.map((s) => [s.stageId, s]));
 
       expect(stageMap.get("success-first")?.status).toBe("COMPLETED");
@@ -513,7 +560,11 @@ describe("I want to handle execution errors properly", () => {
       const stage1 = defineStage({
         id: "exec-stage-1",
         name: "Stage 1",
-        schemas: { input: StringSchema, output: StringSchema, config: z.object({}) },
+        schemas: {
+          input: StringSchema,
+          output: StringSchema,
+          config: z.object({}),
+        },
         async execute(ctx) {
           executionOrder.push("stage-1");
           return { output: ctx.input };
@@ -523,7 +574,11 @@ describe("I want to handle execution errors properly", () => {
       const stage2 = defineStage({
         id: "exec-stage-2",
         name: "Stage 2",
-        schemas: { input: StringSchema, output: StringSchema, config: z.object({}) },
+        schemas: {
+          input: StringSchema,
+          output: StringSchema,
+          config: z.object({}),
+        },
         async execute() {
           executionOrder.push("stage-2");
           throw new Error("Stage 2 exploded");
@@ -533,7 +588,11 @@ describe("I want to handle execution errors properly", () => {
       const stage3 = defineStage({
         id: "exec-stage-3",
         name: "Stage 3",
-        schemas: { input: StringSchema, output: StringSchema, config: z.object({}) },
+        schemas: {
+          input: StringSchema,
+          output: StringSchema,
+          config: z.object({}),
+        },
         async execute(ctx) {
           executionOrder.push("stage-3");
           return { output: ctx.input };
@@ -561,7 +620,9 @@ describe("I want to handle execution errors properly", () => {
         input: { value: "test" },
       });
 
-      await persistence.updateRun(createResult.workflowRunId, { status: "RUNNING" });
+      await persistence.updateRun(createResult.workflowRunId, {
+        status: "RUNNING",
+      });
       await flush();
 
       // Execute stage 1
@@ -622,7 +683,9 @@ describe("I want to handle execution errors properly", () => {
         .pipe(errorStage)
         .build();
 
-      const { kernel, flush, persistence, eventSink } = createTestKernel([workflow]);
+      const { kernel, flush, persistence, eventSink } = createTestKernel([
+        workflow,
+      ]);
 
       const createResult = await kernel.dispatch({
         type: "run.create",
@@ -631,7 +694,9 @@ describe("I want to handle execution errors properly", () => {
         input: {},
       });
 
-      await persistence.updateRun(createResult.workflowRunId, { status: "RUNNING" });
+      await persistence.updateRun(createResult.workflowRunId, {
+        status: "RUNNING",
+      });
       await flush();
       eventSink.clear();
 
@@ -657,7 +722,9 @@ describe("I want to handle execution errors properly", () => {
       await flush();
       const workflowFailedEvents = eventSink.getByType("workflow:failed");
       expect(workflowFailedEvents).toHaveLength(1);
-      expect(workflowFailedEvents[0]!.workflowRunId).toBe(createResult.workflowRunId);
+      expect(workflowFailedEvents[0]!.workflowRunId).toBe(
+        createResult.workflowRunId,
+      );
       expect(workflowFailedEvents[0]!.error).toContain("Error for event test");
     });
   });

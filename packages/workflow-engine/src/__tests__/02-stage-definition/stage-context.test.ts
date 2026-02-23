@@ -11,17 +11,17 @@
 
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
+import { defineStage } from "../../core/stage-factory.js";
+import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
 import { createKernel } from "../../kernel/kernel.js";
 import {
+  CollectingEventSink,
   FakeClock,
   InMemoryBlobStore,
-  CollectingEventSink,
   NoopScheduler,
 } from "../../kernel/testing/index.js";
-import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
-import { defineStage } from "../../core/stage-factory.js";
-import { WorkflowBuilder, type Workflow } from "../../core/workflow.js";
+import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 
 function createTestKernel(workflows: Workflow<any, any>[] = []) {
   const persistence = new InMemoryWorkflowPersistence();
@@ -33,11 +33,26 @@ function createTestKernel(workflows: Workflow<any, any>[] = []) {
   const registry = new Map<string, Workflow<any, any>>();
   for (const w of workflows) registry.set(w.id, w);
   const kernel = createKernel({
-    persistence, blobStore, jobTransport, eventSink, scheduler, clock,
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
     registry: { getWorkflow: (id) => registry.get(id) },
   });
   const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
-  return { kernel, flush, persistence, blobStore, jobTransport, eventSink, scheduler, clock, registry };
+  return {
+    kernel,
+    flush,
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry,
+  };
 }
 
 /** Helper: create run, mark RUNNING, execute stage, return result */
@@ -56,7 +71,9 @@ async function runSingleStageWorkflow(
     input,
     config,
   });
-  await persistence.updateRun(createResult.workflowRunId, { status: "RUNNING" });
+  await persistence.updateRun(createResult.workflowRunId, {
+    status: "RUNNING",
+  });
   await flush();
   return createResult;
 }
@@ -81,14 +98,26 @@ describe("I want to use stage context", () => {
         },
       });
 
-      const workflow = new WorkflowBuilder("run-id-test", "Test", "Test", z.object({}), z.object({ runId: z.string() }))
+      const workflow = new WorkflowBuilder(
+        "run-id-test",
+        "Test",
+        "Test",
+        z.object({}),
+        z.object({ runId: z.string() }),
+      )
         .pipe(stage)
         .build();
 
       const { kernel, flush, persistence } = createTestKernel([workflow]);
 
       // When: Execute with kernel dispatch
-      const createResult = await runSingleStageWorkflow(kernel, persistence, flush, "run-id-test", {});
+      const createResult = await runSingleStageWorkflow(
+        kernel,
+        persistence,
+        flush,
+        "run-id-test",
+        {},
+      );
 
       const result = await kernel.dispatch({
         type: "job.execute",
@@ -123,14 +152,26 @@ describe("I want to use stage context", () => {
         },
       });
 
-      const workflow = new WorkflowBuilder("identity-test", "Test", "Test", z.object({}), z.object({}))
+      const workflow = new WorkflowBuilder(
+        "identity-test",
+        "Test",
+        "Test",
+        z.object({}),
+        z.object({}),
+      )
         .pipe(stage)
         .build();
 
       const { kernel, flush, persistence } = createTestKernel([workflow]);
 
       // When: Execute
-      const createResult = await runSingleStageWorkflow(kernel, persistence, flush, "identity-test", {});
+      const createResult = await runSingleStageWorkflow(
+        kernel,
+        persistence,
+        flush,
+        "identity-test",
+        {},
+      );
       await kernel.dispatch({
         type: "job.execute",
         workflowRunId: createResult.workflowRunId,
@@ -163,7 +204,13 @@ describe("I want to use stage context", () => {
           },
         });
 
-      const workflow = new WorkflowBuilder("number-test", "Test", "Test", z.any(), z.any())
+      const workflow = new WorkflowBuilder(
+        "number-test",
+        "Test",
+        "Test",
+        z.any(),
+        z.any(),
+      )
         .pipe(createStage("first"))
         .pipe(createStage("second"))
         .pipe(createStage("third"))
@@ -172,7 +219,13 @@ describe("I want to use stage context", () => {
       const { kernel, flush, persistence } = createTestKernel([workflow]);
 
       // When: Execute all stages in order via kernel
-      const createResult = await runSingleStageWorkflow(kernel, persistence, flush, "number-test", {});
+      const createResult = await runSingleStageWorkflow(
+        kernel,
+        persistence,
+        flush,
+        "number-test",
+        {},
+      );
       const runId = createResult.workflowRunId;
 
       await kernel.dispatch({
@@ -229,8 +282,18 @@ describe("I want to use stage context", () => {
         },
       });
 
-      const inputSchema = z.object({ name: z.string(), count: z.number(), active: z.boolean() });
-      const workflow = new WorkflowBuilder("input-test", "Test", "Test", inputSchema, z.object({ received: z.boolean() }))
+      const inputSchema = z.object({
+        name: z.string(),
+        count: z.number(),
+        active: z.boolean(),
+      });
+      const workflow = new WorkflowBuilder(
+        "input-test",
+        "Test",
+        "Test",
+        inputSchema,
+        z.object({ received: z.boolean() }),
+      )
         .pipe(stage)
         .build();
 
@@ -238,7 +301,13 @@ describe("I want to use stage context", () => {
 
       // When: Execute with matching input
       const input = { name: "test", count: 42, active: true };
-      const createResult = await runSingleStageWorkflow(kernel, persistence, flush, "input-test", input);
+      const createResult = await runSingleStageWorkflow(
+        kernel,
+        persistence,
+        flush,
+        "input-test",
+        input,
+      );
       await kernel.dispatch({
         type: "job.execute",
         workflowRunId: createResult.workflowRunId,
@@ -273,16 +342,29 @@ describe("I want to use stage context", () => {
         },
       });
 
-      const workflow = new WorkflowBuilder("config-test", "Test", "Test", z.object({}), z.object({}))
+      const workflow = new WorkflowBuilder(
+        "config-test",
+        "Test",
+        "Test",
+        z.object({}),
+        z.object({}),
+      )
         .pipe(stage)
         .build();
 
       const { kernel, flush, persistence } = createTestKernel([workflow]);
 
       // When: Execute with config
-      const createResult = await runSingleStageWorkflow(kernel, persistence, flush, "config-test", {}, {
-        "typed-config": { model: "gpt-4", temperature: 0.7 },
-      });
+      const createResult = await runSingleStageWorkflow(
+        kernel,
+        persistence,
+        flush,
+        "config-test",
+        {},
+        {
+          "typed-config": { model: "gpt-4", temperature: 0.7 },
+        },
+      );
       await kernel.dispatch({
         type: "job.execute",
         workflowRunId: createResult.workflowRunId,
@@ -320,14 +402,26 @@ describe("I want to use stage context", () => {
         },
       });
 
-      const workflow = new WorkflowBuilder("defaults-test", "Test", "Test", z.object({}), z.object({}))
+      const workflow = new WorkflowBuilder(
+        "defaults-test",
+        "Test",
+        "Test",
+        z.object({}),
+        z.object({}),
+      )
         .pipe(stage)
         .build();
 
       const { kernel, flush, persistence } = createTestKernel([workflow]);
 
       // When: Execute without config
-      const createResult = await runSingleStageWorkflow(kernel, persistence, flush, "defaults-test", {});
+      const createResult = await runSingleStageWorkflow(
+        kernel,
+        persistence,
+        flush,
+        "defaults-test",
+        {},
+      );
       await kernel.dispatch({
         type: "job.execute",
         workflowRunId: createResult.workflowRunId,
@@ -386,7 +480,13 @@ describe("I want to use stage context", () => {
         },
       });
 
-      const workflow = new WorkflowBuilder("require-test", "Test", "Test", z.object({}), z.object({ processed: z.string() }))
+      const workflow = new WorkflowBuilder(
+        "require-test",
+        "Test",
+        "Test",
+        z.object({}),
+        z.object({ processed: z.string() }),
+      )
         .pipe(extractStage)
         .pipe(processStage)
         .build();
@@ -394,7 +494,13 @@ describe("I want to use stage context", () => {
       const { kernel, flush, persistence } = createTestKernel([workflow]);
 
       // When: Execute both stages in order
-      const createResult = await runSingleStageWorkflow(kernel, persistence, flush, "require-test", {});
+      const createResult = await runSingleStageWorkflow(
+        kernel,
+        persistence,
+        flush,
+        "require-test",
+        {},
+      );
       const runId = createResult.workflowRunId;
 
       await kernel.dispatch({
@@ -432,14 +538,26 @@ describe("I want to use stage context", () => {
         },
       });
 
-      const workflow = new WorkflowBuilder("require-missing", "Test", "Test", z.object({}), z.object({}))
+      const workflow = new WorkflowBuilder(
+        "require-missing",
+        "Test",
+        "Test",
+        z.object({}),
+        z.object({}),
+      )
         .pipe(badStage)
         .build();
 
       const { kernel, flush, persistence } = createTestKernel([workflow]);
 
       // When: Execute
-      const createResult = await runSingleStageWorkflow(kernel, persistence, flush, "require-missing", {});
+      const createResult = await runSingleStageWorkflow(
+        kernel,
+        persistence,
+        flush,
+        "require-missing",
+        {},
+      );
       const result = await kernel.dispatch({
         type: "job.execute",
         workflowRunId: createResult.workflowRunId,
@@ -471,14 +589,26 @@ describe("I want to use stage context", () => {
         },
       });
 
-      const workflow = new WorkflowBuilder("optional-missing", "Test", "Test", z.object({}), z.object({ found: z.boolean() }))
+      const workflow = new WorkflowBuilder(
+        "optional-missing",
+        "Test",
+        "Test",
+        z.object({}),
+        z.object({ found: z.boolean() }),
+      )
         .pipe(stage)
         .build();
 
       const { kernel, flush, persistence } = createTestKernel([workflow]);
 
       // When: Execute
-      const createResult = await runSingleStageWorkflow(kernel, persistence, flush, "optional-missing", {});
+      const createResult = await runSingleStageWorkflow(
+        kernel,
+        persistence,
+        flush,
+        "optional-missing",
+        {},
+      );
       const result = await kernel.dispatch({
         type: "job.execute",
         workflowRunId: createResult.workflowRunId,
@@ -534,7 +664,13 @@ describe("I want to use stage context", () => {
         },
       });
 
-      const workflow = new WorkflowBuilder("optional-exists", "Test", "Test", z.object({}), z.object({ value: z.string() }))
+      const workflow = new WorkflowBuilder(
+        "optional-exists",
+        "Test",
+        "Test",
+        z.object({}),
+        z.object({ value: z.string() }),
+      )
         .pipe(optionalStage)
         .pipe(checkStage)
         .build();
@@ -542,7 +678,13 @@ describe("I want to use stage context", () => {
       const { kernel, flush, persistence } = createTestKernel([workflow]);
 
       // When: Execute both stages in order
-      const createResult = await runSingleStageWorkflow(kernel, persistence, flush, "optional-exists", {});
+      const createResult = await runSingleStageWorkflow(
+        kernel,
+        persistence,
+        flush,
+        "optional-exists",
+        {},
+      );
       const runId = createResult.workflowRunId;
 
       await kernel.dispatch({
@@ -587,14 +729,26 @@ describe("I want to use stage context", () => {
         },
       });
 
-      const workflow = new WorkflowBuilder("storage-test", "Test", "Test", z.object({}), z.object({}))
+      const workflow = new WorkflowBuilder(
+        "storage-test",
+        "Test",
+        "Test",
+        z.object({}),
+        z.object({}),
+      )
         .pipe(stage)
         .build();
 
       const { kernel, flush, persistence } = createTestKernel([workflow]);
 
       // When: Execute
-      const createResult = await runSingleStageWorkflow(kernel, persistence, flush, "storage-test", {});
+      const createResult = await runSingleStageWorkflow(
+        kernel,
+        persistence,
+        flush,
+        "storage-test",
+        {},
+      );
       await kernel.dispatch({
         type: "job.execute",
         workflowRunId: createResult.workflowRunId,
@@ -625,14 +779,28 @@ describe("I want to use stage context", () => {
         },
       });
 
-      const workflow = new WorkflowBuilder("progress-test", "Test", "Test", z.object({}), z.object({}))
+      const workflow = new WorkflowBuilder(
+        "progress-test",
+        "Test",
+        "Test",
+        z.object({}),
+        z.object({}),
+      )
         .pipe(stage)
         .build();
 
-      const { kernel, flush, persistence, eventSink } = createTestKernel([workflow]);
+      const { kernel, flush, persistence, eventSink } = createTestKernel([
+        workflow,
+      ]);
 
       // When: Execute
-      const createResult = await runSingleStageWorkflow(kernel, persistence, flush, "progress-test", {});
+      const createResult = await runSingleStageWorkflow(
+        kernel,
+        persistence,
+        flush,
+        "progress-test",
+        {},
+      );
       eventSink.clear();
 
       await kernel.dispatch({
@@ -674,14 +842,26 @@ describe("I want to use stage context", () => {
         },
       });
 
-      const workflow = new WorkflowBuilder("logging-test", "Test", "Test", z.object({}), z.object({}))
+      const workflow = new WorkflowBuilder(
+        "logging-test",
+        "Test",
+        "Test",
+        z.object({}),
+        z.object({}),
+      )
         .pipe(stage)
         .build();
 
       const { kernel, flush, persistence } = createTestKernel([workflow]);
 
       // When: Execute
-      const createResult = await runSingleStageWorkflow(kernel, persistence, flush, "logging-test", {});
+      const createResult = await runSingleStageWorkflow(
+        kernel,
+        persistence,
+        flush,
+        "logging-test",
+        {},
+      );
       const result = await kernel.dispatch({
         type: "job.execute",
         workflowRunId: createResult.workflowRunId,

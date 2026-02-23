@@ -7,18 +7,18 @@
 
 import { beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
+import { defineStage } from "../../core/stage-factory.js";
+import type { Workflow } from "../../core/workflow.js";
+import { WorkflowBuilder } from "../../core/workflow.js";
 import { createKernel, type Kernel } from "../../kernel/kernel.js";
 import {
+  CollectingEventSink,
   FakeClock,
   InMemoryBlobStore,
-  CollectingEventSink,
   NoopScheduler,
 } from "../../kernel/testing/index.js";
-import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
-import { defineStage } from "../../core/stage-factory.js";
-import { WorkflowBuilder } from "../../core/workflow.js";
-import type { Workflow } from "../../core/workflow.js";
+import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 
 // Helper: create a simple passthrough stage
 function createPassthroughStage(id: string, schema: z.ZodTypeAny) {
@@ -76,13 +76,24 @@ function createTestKernel(workflows: Workflow<any, any>[] = []) {
   });
 
   const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
-  return { kernel, flush, persistence, blobStore, jobTransport, eventSink, scheduler, clock, registry };
+  return {
+    kernel,
+    flush,
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry,
+  };
 }
 
 describe("kernel: run.claimPending", () => {
   it("claims pending runs and enqueues first-stage jobs", async () => {
     const workflow = createSimpleWorkflow();
-    const { kernel, flush, persistence, jobTransport, eventSink } = createTestKernel([workflow]);
+    const { kernel, flush, persistence, jobTransport, eventSink } =
+      createTestKernel([workflow]);
 
     // Create a run
     await kernel.dispatch({
@@ -105,7 +116,9 @@ describe("kernel: run.claimPending", () => {
     expect(result.claimed[0]!.jobIds).toHaveLength(1);
 
     // Verify stage was created
-    const stages = await persistence.getStagesByRun(result.claimed[0]!.workflowRunId);
+    const stages = await persistence.getStagesByRun(
+      result.claimed[0]!.workflowRunId,
+    );
     expect(stages).toHaveLength(1);
     expect(stages[0]!.stageId).toBe("stage-1");
     expect(stages[0]!.status).toBe("PENDING");

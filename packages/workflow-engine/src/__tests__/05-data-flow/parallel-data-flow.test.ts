@@ -7,17 +7,17 @@
 
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
+import { defineStage } from "../../core/stage-factory.js";
+import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
 import { createKernel } from "../../kernel/kernel.js";
 import {
+  CollectingEventSink,
   FakeClock,
   InMemoryBlobStore,
-  CollectingEventSink,
   NoopScheduler,
 } from "../../kernel/testing/index.js";
-import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
-import { defineStage } from "../../core/stage-factory.js";
-import { WorkflowBuilder, type Workflow } from "../../core/workflow.js";
+import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 
 function createTestKernel(workflows: Workflow<any, any>[] = []) {
   const persistence = new InMemoryWorkflowPersistence();
@@ -41,7 +41,17 @@ function createTestKernel(workflows: Workflow<any, any>[] = []) {
   });
 
   const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
-  return { kernel, flush, persistence, blobStore, jobTransport, eventSink, scheduler, clock, registry };
+  return {
+    kernel,
+    flush,
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry,
+  };
 }
 
 describe("I want data to flow through parallel stages", () => {
@@ -51,7 +61,8 @@ describe("I want data to flow through parallel stages", () => {
       // Note: In the kernel model, parallel stages may receive a sibling's
       // output as their direct input (via resolveStageInput). Stages should
       // use workflowContext to access the original shared data.
-      const capturedContextData: { stage: string; initialOutput: unknown }[] = [];
+      const capturedContextData: { stage: string; initialOutput: unknown }[] =
+        [];
 
       const createParallelStage = (id: string) =>
         defineStage({
@@ -571,7 +582,9 @@ describe("I want data to flow through parallel stages", () => {
           async execute(ctx) {
             executionLog.push(id);
             // Access initial stage output via workflowContext for reliable access
-            const initialOutput = ctx.workflowContext["initial"] as { value: number };
+            const initialOutput = ctx.workflowContext["initial"] as {
+              value: number;
+            };
             return { output: { result: initialOutput.value * multiplier } };
           },
         });
@@ -587,8 +600,12 @@ describe("I want data to flow through parallel stages", () => {
         async execute(ctx) {
           executionLog.push("final");
           // Access parallel results via workflowContext
-          const doubleOutput = ctx.workflowContext["double"] as { result: number };
-          const tripleOutput = ctx.workflowContext["triple"] as { result: number };
+          const doubleOutput = ctx.workflowContext["double"] as {
+            result: number;
+          };
+          const tripleOutput = ctx.workflowContext["triple"] as {
+            result: number;
+          };
           const sum = doubleOutput.result + tripleOutput.result;
           return { output: { sum } };
         },

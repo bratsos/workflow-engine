@@ -11,13 +11,10 @@ export async function loadWorkflowContext(
   workflowRunId: string,
   deps: KernelDeps,
 ): Promise<Record<string, unknown>> {
-  const completedStages = await deps.persistence.getStagesByRun(
-    workflowRunId,
-    {
-      status: "COMPLETED",
-      orderBy: "asc",
-    },
-  );
+  const completedStages = await deps.persistence.getStagesByRun(workflowRunId, {
+    status: "COMPLETED",
+    orderBy: "asc",
+  });
 
   const context: Record<string, unknown> = {};
 

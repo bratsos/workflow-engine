@@ -13,8 +13,8 @@ import type {
   StagePollSuspendedResult,
 } from "../commands";
 import type { KernelEvent } from "../events";
-import type { KernelDeps, HandlerResult } from "../kernel";
 import { createStorageShim, saveStageOutput } from "../helpers/index.js";
+import type { HandlerResult, KernelDeps } from "../kernel";
 
 // ---------------------------------------------------------------------------
 // Handler
@@ -216,9 +216,7 @@ export async function handleStagePollSuspended(
       } else {
         // Not ready -- update nextPollAt for next check
         const pollInterval =
-          checkResult.nextCheckIn ??
-          stageRecord.pollInterval ??
-          60000;
+          checkResult.nextCheckIn ?? stageRecord.pollInterval ?? 60000;
 
         const nextPollAt = new Date(deps.clock.now().getTime() + pollInterval);
 

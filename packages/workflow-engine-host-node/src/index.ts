@@ -7,7 +7,7 @@
 
 export {
   createNodeHost,
+  type HostStats,
   type NodeHost,
   type NodeHostConfig,
-  type HostStats,
 } from "./host.js";

@@ -9,17 +9,17 @@
 
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
+import { defineStage } from "../../core/stage-factory.js";
+import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
 import { createKernel } from "../../kernel/kernel.js";
 import {
+  CollectingEventSink,
   FakeClock,
   InMemoryBlobStore,
-  CollectingEventSink,
   NoopScheduler,
 } from "../../kernel/testing/index.js";
-import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
-import { defineStage } from "../../core/stage-factory.js";
-import { WorkflowBuilder, type Workflow } from "../../core/workflow.js";
+import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 
 function createTestKernel(workflows: Workflow<any, any>[] = []) {
   const persistence = new InMemoryWorkflowPersistence();
@@ -31,11 +31,26 @@ function createTestKernel(workflows: Workflow<any, any>[] = []) {
   const registry = new Map<string, Workflow<any, any>>();
   for (const w of workflows) registry.set(w.id, w);
   const kernel = createKernel({
-    persistence, blobStore, jobTransport, eventSink, scheduler, clock,
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
     registry: { getWorkflow: (id) => registry.get(id) },
   });
   const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
-  return { kernel, flush, persistence, blobStore, jobTransport, eventSink, scheduler, clock, registry };
+  return {
+    kernel,
+    flush,
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry,
+  };
 }
 
 describe("I want to implement real-world workflow patterns", () => {
@@ -303,7 +318,12 @@ describe("I want to implement real-world workflow patterns", () => {
       });
       await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
 
-      const stageIds = ["fetch-document", "parse-document", "transform-document", "store-document"];
+      const stageIds = [
+        "fetch-document",
+        "parse-document",
+        "transform-document",
+        "store-document",
+      ];
       for (const stageId of stageIds) {
         await kernel.dispatch({
           type: "job.execute",
@@ -321,7 +341,10 @@ describe("I want to implement real-world workflow patterns", () => {
       expect(run!.status).toBe("COMPLETED");
 
       // Verify final stage output
-      const storeStageRecord = await persistence.getStage(workflowRunId, "store-document");
+      const storeStageRecord = await persistence.getStage(
+        workflowRunId,
+        "store-document",
+      );
       expect(storeStageRecord!.status).toBe("COMPLETED");
 
       // And: All stages executed in order
@@ -647,7 +670,9 @@ describe("I want to implement real-world workflow patterns", () => {
         },
       };
 
-      const { kernel, flush, persistence, blobStore } = createTestKernel([workflow]);
+      const { kernel, flush, persistence, blobStore } = createTestKernel([
+        workflow,
+      ]);
 
       // When: I execute the ETL pipeline
       const { workflowRunId } = await kernel.dispatch({
@@ -721,8 +746,12 @@ describe("I want to implement real-world workflow patterns", () => {
         },
         async execute(ctx) {
           // Use workflowContext for reliable access to extract output
-          const extractOutput = ctx.workflowContext["extract"] as { data: number[] };
-          return { output: { sum: extractOutput.data.reduce((a, b) => a + b, 0) } };
+          const extractOutput = ctx.workflowContext["extract"] as {
+            data: number[];
+          };
+          return {
+            output: { sum: extractOutput.data.reduce((a, b) => a + b, 0) },
+          };
         },
       });
 
@@ -735,9 +764,12 @@ describe("I want to implement real-world workflow patterns", () => {
           config: z.object({}),
         },
         async execute(ctx) {
-          const extractOutput = ctx.workflowContext["extract"] as { data: number[] };
+          const extractOutput = ctx.workflowContext["extract"] as {
+            data: number[];
+          };
           const avg =
-            extractOutput.data.reduce((a, b) => a + b, 0) / extractOutput.data.length;
+            extractOutput.data.reduce((a, b) => a + b, 0) /
+            extractOutput.data.length;
           return { output: { average: avg } };
         },
       });
@@ -751,7 +783,9 @@ describe("I want to implement real-world workflow patterns", () => {
           config: z.object({}),
         },
         async execute(ctx) {
-          const extractOutput = ctx.workflowContext["extract"] as { data: number[] };
+          const extractOutput = ctx.workflowContext["extract"] as {
+            data: number[];
+          };
           return {
             output: {
               min: Math.min(...extractOutput.data),
@@ -842,7 +876,11 @@ describe("I want to implement real-world workflow patterns", () => {
       await kernel.dispatch({ type: "run.transition", workflowRunId });
 
       // Execute all parallel transforms
-      for (const stageId of ["transform-sum", "transform-avg", "transform-minmax"]) {
+      for (const stageId of [
+        "transform-sum",
+        "transform-avg",
+        "transform-minmax",
+      ]) {
         await kernel.dispatch({
           type: "job.execute",
           workflowRunId,
@@ -1166,7 +1204,12 @@ describe("I want to implement real-world workflow patterns", () => {
       await kernel.dispatch({ type: "run.transition", workflowRunId });
 
       // Execute all parallel checks
-      for (const stageId of ["check-email", "check-age", "check-country", "check-duplicate"]) {
+      for (const stageId of [
+        "check-email",
+        "check-age",
+        "check-country",
+        "check-duplicate",
+      ]) {
         await kernel.dispatch({
           type: "job.execute",
           workflowRunId,

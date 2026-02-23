@@ -8,17 +8,17 @@
 
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
+import { defineStage } from "../../core/stage-factory.js";
+import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
 import { createKernel } from "../../kernel/kernel.js";
 import {
+  CollectingEventSink,
   FakeClock,
   InMemoryBlobStore,
-  CollectingEventSink,
   NoopScheduler,
 } from "../../kernel/testing/index.js";
-import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
-import { defineStage } from "../../core/stage-factory.js";
-import { WorkflowBuilder, type Workflow } from "../../core/workflow.js";
+import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 
 function createTestKernel(workflows: Workflow<any, any>[] = []) {
   const persistence = new InMemoryWorkflowPersistence();
@@ -30,11 +30,26 @@ function createTestKernel(workflows: Workflow<any, any>[] = []) {
   const registry = new Map<string, Workflow<any, any>>();
   for (const w of workflows) registry.set(w.id, w);
   const kernel = createKernel({
-    persistence, blobStore, jobTransport, eventSink, scheduler, clock,
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
     registry: { getWorkflow: (id) => registry.get(id) },
   });
   const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
-  return { kernel, flush, persistence, blobStore, jobTransport, eventSink, scheduler, clock, registry };
+  return {
+    kernel,
+    flush,
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry,
+  };
 }
 
 /** Helper: create run, mark RUNNING, return runId */
@@ -51,7 +66,9 @@ async function createAndStartRun(
     workflowId,
     input,
   });
-  await persistence.updateRun(createResult.workflowRunId, { status: "RUNNING" });
+  await persistence.updateRun(createResult.workflowRunId, {
+    status: "RUNNING",
+  });
   await flush();
   return createResult.workflowRunId;
 }
@@ -80,14 +97,27 @@ describe("I want to use stage storage", () => {
         },
       });
 
-      const workflow = new WorkflowBuilder("save-test", "Test", "Test", z.object({}), z.object({ saved: z.boolean() }))
+      const workflow = new WorkflowBuilder(
+        "save-test",
+        "Test",
+        "Test",
+        z.object({}),
+        z.object({ saved: z.boolean() }),
+      )
         .pipe(stage)
         .build();
 
-      const { kernel, flush, persistence, blobStore } = createTestKernel([workflow]);
+      const { kernel, flush, persistence, blobStore } = createTestKernel([
+        workflow,
+      ]);
 
       // When: Execute the workflow
-      const runId = await createAndStartRun(kernel, persistence, flush, "save-test");
+      const runId = await createAndStartRun(
+        kernel,
+        persistence,
+        flush,
+        "save-test",
+      );
       const result = await kernel.dispatch({
         type: "job.execute",
         workflowRunId: runId,
@@ -129,14 +159,25 @@ describe("I want to use stage storage", () => {
         },
       });
 
-      const workflow = new WorkflowBuilder("nested-test", "Test", "Test", z.object({}), z.object({ saved: z.boolean() }))
+      const workflow = new WorkflowBuilder(
+        "nested-test",
+        "Test",
+        "Test",
+        z.object({}),
+        z.object({ saved: z.boolean() }),
+      )
         .pipe(stage)
         .build();
 
       const { kernel, flush, persistence } = createTestKernel([workflow]);
 
       // When: Execute
-      const runId = await createAndStartRun(kernel, persistence, flush, "nested-test");
+      const runId = await createAndStartRun(
+        kernel,
+        persistence,
+        flush,
+        "nested-test",
+      );
       const result = await kernel.dispatch({
         type: "job.execute",
         workflowRunId: runId,
@@ -188,7 +229,13 @@ describe("I want to use stage storage", () => {
         },
       });
 
-      const workflow = new WorkflowBuilder("load-test", "Test", "Test", z.object({}), z.object({ loaded: z.boolean() }))
+      const workflow = new WorkflowBuilder(
+        "load-test",
+        "Test",
+        "Test",
+        z.object({}),
+        z.object({ loaded: z.boolean() }),
+      )
         .pipe(saveStage)
         .pipe(loadStage)
         .build();
@@ -196,7 +243,12 @@ describe("I want to use stage storage", () => {
       const { kernel, flush, persistence } = createTestKernel([workflow]);
 
       // When: Execute both stages
-      const runId = await createAndStartRun(kernel, persistence, flush, "load-test");
+      const runId = await createAndStartRun(
+        kernel,
+        persistence,
+        flush,
+        "load-test",
+      );
       await kernel.dispatch({
         type: "job.execute",
         workflowRunId: runId,
@@ -232,14 +284,25 @@ describe("I want to use stage storage", () => {
         },
       });
 
-      const workflow = new WorkflowBuilder("bad-load-test", "Test", "Test", z.object({}), z.object({}))
+      const workflow = new WorkflowBuilder(
+        "bad-load-test",
+        "Test",
+        "Test",
+        z.object({}),
+        z.object({}),
+      )
         .pipe(stage)
         .build();
 
       const { kernel, flush, persistence } = createTestKernel([workflow]);
 
       // When: Execute
-      const runId = await createAndStartRun(kernel, persistence, flush, "bad-load-test");
+      const runId = await createAndStartRun(
+        kernel,
+        persistence,
+        flush,
+        "bad-load-test",
+      );
       const result = await kernel.dispatch({
         type: "job.execute",
         workflowRunId: runId,
@@ -289,14 +352,25 @@ describe("I want to use stage storage", () => {
         },
       });
 
-      const workflow = new WorkflowBuilder("exists-test", "Test", "Test", z.object({}), z.object({ beforeSave: z.boolean(), afterSave: z.boolean() }))
+      const workflow = new WorkflowBuilder(
+        "exists-test",
+        "Test",
+        "Test",
+        z.object({}),
+        z.object({ beforeSave: z.boolean(), afterSave: z.boolean() }),
+      )
         .pipe(stage)
         .build();
 
       const { kernel, flush, persistence } = createTestKernel([workflow]);
 
       // When: Execute
-      const runId = await createAndStartRun(kernel, persistence, flush, "exists-test");
+      const runId = await createAndStartRun(
+        kernel,
+        persistence,
+        flush,
+        "exists-test",
+      );
       const result = await kernel.dispatch({
         type: "job.execute",
         workflowRunId: runId,
@@ -329,14 +403,25 @@ describe("I want to use stage storage", () => {
         },
       });
 
-      const workflow = new WorkflowBuilder("nonexistent-test", "Test", "Test", z.object({}), z.object({ exists: z.boolean() }))
+      const workflow = new WorkflowBuilder(
+        "nonexistent-test",
+        "Test",
+        "Test",
+        z.object({}),
+        z.object({ exists: z.boolean() }),
+      )
         .pipe(stage)
         .build();
 
       const { kernel, flush, persistence } = createTestKernel([workflow]);
 
       // When: Execute
-      const runId = await createAndStartRun(kernel, persistence, flush, "nonexistent-test");
+      const runId = await createAndStartRun(
+        kernel,
+        persistence,
+        flush,
+        "nonexistent-test",
+      );
       const result = await kernel.dispatch({
         type: "job.execute",
         workflowRunId: runId,
@@ -388,14 +473,25 @@ describe("I want to use stage storage", () => {
         },
       });
 
-      const workflow = new WorkflowBuilder("delete-test", "Test", "Test", z.object({}), z.object({ afterSave: z.boolean(), afterDelete: z.boolean() }))
+      const workflow = new WorkflowBuilder(
+        "delete-test",
+        "Test",
+        "Test",
+        z.object({}),
+        z.object({ afterSave: z.boolean(), afterDelete: z.boolean() }),
+      )
         .pipe(stage)
         .build();
 
       const { kernel, flush, persistence } = createTestKernel([workflow]);
 
       // When: Execute
-      const runId = await createAndStartRun(kernel, persistence, flush, "delete-test");
+      const runId = await createAndStartRun(
+        kernel,
+        persistence,
+        flush,
+        "delete-test",
+      );
       const result = await kernel.dispatch({
         type: "job.execute",
         workflowRunId: runId,
@@ -427,14 +523,25 @@ describe("I want to use stage storage", () => {
         },
       });
 
-      const workflow = new WorkflowBuilder("delete-nonexistent-test", "Test", "Test", z.object({}), z.object({ completed: z.boolean() }))
+      const workflow = new WorkflowBuilder(
+        "delete-nonexistent-test",
+        "Test",
+        "Test",
+        z.object({}),
+        z.object({ completed: z.boolean() }),
+      )
         .pipe(stage)
         .build();
 
       const { kernel, flush, persistence } = createTestKernel([workflow]);
 
       // When: Execute
-      const runId = await createAndStartRun(kernel, persistence, flush, "delete-nonexistent-test");
+      const runId = await createAndStartRun(
+        kernel,
+        persistence,
+        flush,
+        "delete-nonexistent-test",
+      );
       const result = await kernel.dispatch({
         type: "job.execute",
         workflowRunId: runId,
@@ -477,14 +584,25 @@ describe("I want to use stage storage", () => {
         },
       });
 
-      const workflow = new WorkflowBuilder("key-gen-test", "Test", "Test", z.object({}), z.object({ key1: z.string(), key2: z.string(), key3: z.string() }))
+      const workflow = new WorkflowBuilder(
+        "key-gen-test",
+        "Test",
+        "Test",
+        z.object({}),
+        z.object({ key1: z.string(), key2: z.string(), key3: z.string() }),
+      )
         .pipe(stage)
         .build();
 
       const { kernel, flush, persistence } = createTestKernel([workflow]);
 
       // When: Execute
-      const runId = await createAndStartRun(kernel, persistence, flush, "key-gen-test");
+      const runId = await createAndStartRun(
+        kernel,
+        persistence,
+        flush,
+        "key-gen-test",
+      );
       await kernel.dispatch({
         type: "job.execute",
         workflowRunId: runId,
@@ -534,14 +652,25 @@ describe("I want to use stage storage", () => {
         },
       });
 
-      const workflow = new WorkflowBuilder("default-suffix-test", "Test", "Test", z.object({}), z.object({ key: z.string() }))
+      const workflow = new WorkflowBuilder(
+        "default-suffix-test",
+        "Test",
+        "Test",
+        z.object({}),
+        z.object({ key: z.string() }),
+      )
         .pipe(stage)
         .build();
 
       const { kernel, flush, persistence } = createTestKernel([workflow]);
 
       // When: Execute
-      const runId = await createAndStartRun(kernel, persistence, flush, "default-suffix-test");
+      const runId = await createAndStartRun(
+        kernel,
+        persistence,
+        flush,
+        "default-suffix-test",
+      );
       await kernel.dispatch({
         type: "job.execute",
         workflowRunId: runId,
@@ -612,7 +741,13 @@ describe("I want to use stage storage", () => {
         },
       });
 
-      const workflow = new WorkflowBuilder("cross-stage-test", "Test", "Test", z.object({}), z.object({ success: z.boolean() }))
+      const workflow = new WorkflowBuilder(
+        "cross-stage-test",
+        "Test",
+        "Test",
+        z.object({}),
+        z.object({ success: z.boolean() }),
+      )
         .pipe(stage1)
         .pipe(stage2)
         .pipe(stage3)
@@ -621,7 +756,12 @@ describe("I want to use stage storage", () => {
       const { kernel, flush, persistence } = createTestKernel([workflow]);
 
       // When: Execute all stages in order
-      const runId = await createAndStartRun(kernel, persistence, flush, "cross-stage-test");
+      const runId = await createAndStartRun(
+        kernel,
+        persistence,
+        flush,
+        "cross-stage-test",
+      );
       await kernel.dispatch({
         type: "job.execute",
         workflowRunId: runId,

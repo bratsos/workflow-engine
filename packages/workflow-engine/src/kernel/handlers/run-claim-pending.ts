@@ -10,7 +10,7 @@ import type {
   RunClaimPendingResult,
 } from "../commands";
 import type { KernelEvent } from "../events";
-import type { KernelDeps, HandlerResult } from "../kernel";
+import type { HandlerResult, KernelDeps } from "../kernel";
 
 export async function handleRunClaimPending(
   command: RunClaimPendingCommand,

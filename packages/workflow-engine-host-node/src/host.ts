@@ -9,7 +9,7 @@
  * and loop pacing live here.
  */
 
-import type { Kernel, JobTransport } from "@bratsos/workflow-engine/kernel";
+import type { JobTransport, Kernel } from "@bratsos/workflow-engine/kernel";
 
 // ============================================================================
 // Public interfaces

@@ -1,16 +1,19 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
+import {
+  defineAsyncBatchStage,
+  defineStage,
+} from "../../core/stage-factory.js";
+import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
 import { createKernel, type Kernel } from "../../kernel/kernel.js";
 import {
+  CollectingEventSink,
   FakeClock,
   InMemoryBlobStore,
-  CollectingEventSink,
   NoopScheduler,
 } from "../../kernel/testing/index.js";
-import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
-import { defineStage, defineAsyncBatchStage } from "../../core/stage-factory.js";
-import { WorkflowBuilder, type Workflow } from "../../core/workflow.js";
+import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 
 function createPassthroughStage(id: string, schema: z.ZodTypeAny) {
   return defineStage({
@@ -65,7 +68,17 @@ function createTestKernel(workflows: Workflow<any, any>[] = []) {
   });
 
   const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
-  return { kernel, flush, persistence, blobStore, jobTransport, eventSink, scheduler, clock, registry };
+  return {
+    kernel,
+    flush,
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry,
+  };
 }
 
 describe("kernel: stage.pollSuspended", () => {
@@ -77,7 +90,11 @@ describe("kernel: stage.pollSuspended", () => {
       id: "batch-stage",
       name: "Batch Stage",
       mode: "async-batch",
-      schemas: { input: schema, output: z.object({ result: z.string() }), config: z.object({}) },
+      schemas: {
+        input: schema,
+        output: z.object({ result: z.string() }),
+        config: z.object({}),
+      },
       async execute() {
         return {
           suspended: true,
@@ -101,12 +118,17 @@ describe("kernel: stage.pollSuspended", () => {
     });
 
     const workflow = new WorkflowBuilder(
-      "test-workflow", "Test", "Test",
+      "test-workflow",
+      "Test",
+      "Test",
       schema,
       z.object({ result: z.string() }),
-    ).pipe(stage).build();
+    )
+      .pipe(stage)
+      .build();
 
-    const { kernel, persistence, blobStore, clock, eventSink } = createTestKernel([workflow]);
+    const { kernel, persistence, blobStore, clock, eventSink } =
+      createTestKernel([workflow]);
 
     // Create run and a suspended stage
     const run = await persistence.createRun({
@@ -131,7 +153,12 @@ describe("kernel: stage.pollSuspended", () => {
     // Set the stage's nextPollAt to be in the past
     const stages = await persistence.getStagesByRun(run.id);
     await persistence.updateStage(stages[0]!.id, {
-      suspendedState: { batchId: "batch-1", submittedAt: new Date().toISOString(), pollInterval: 1000, maxWaitTime: 60000 },
+      suspendedState: {
+        batchId: "batch-1",
+        submittedAt: new Date().toISOString(),
+        pollInterval: 1000,
+        maxWaitTime: 60000,
+      },
       nextPollAt: new Date(clock.now().getTime() - 1000),
       pollInterval: 1000,
     });
@@ -239,12 +266,25 @@ describe("kernel: stage.pollSuspended", () => {
       id: "batch-stage",
       name: "Batch Stage",
       mode: "async-batch",
-      schemas: { input: schema, output: z.object({ result: z.string() }), config: z.object({}) },
+      schemas: {
+        input: schema,
+        output: z.object({ result: z.string() }),
+        config: z.object({}),
+      },
       async execute() {
         return {
           suspended: true,
-          state: { batchId: "batch-1", submittedAt: new Date().toISOString(), pollInterval: 5000, maxWaitTime: 60000 },
-          pollConfig: { pollInterval: 5000, maxWaitTime: 60000, nextPollAt: new Date(Date.now() + 5000) },
+          state: {
+            batchId: "batch-1",
+            submittedAt: new Date().toISOString(),
+            pollInterval: 5000,
+            maxWaitTime: 60000,
+          },
+          pollConfig: {
+            pollInterval: 5000,
+            maxWaitTime: 60000,
+            nextPollAt: new Date(Date.now() + 5000),
+          },
         };
       },
       async checkCompletion() {
@@ -253,8 +293,14 @@ describe("kernel: stage.pollSuspended", () => {
     });
 
     const workflow = new WorkflowBuilder(
-      "test-workflow", "Test", "Test", schema, z.object({ result: z.string() }),
-    ).pipe(stage).build();
+      "test-workflow",
+      "Test",
+      "Test",
+      schema,
+      z.object({ result: z.string() }),
+    )
+      .pipe(stage)
+      .build();
 
     const { kernel, persistence, clock } = createTestKernel([workflow]);
 
@@ -279,7 +325,12 @@ describe("kernel: stage.pollSuspended", () => {
 
     const stages = await persistence.getStagesByRun(run.id);
     await persistence.updateStage(stages[0]!.id, {
-      suspendedState: { batchId: "batch-1", submittedAt: new Date().toISOString(), pollInterval: 5000, maxWaitTime: 60000 },
+      suspendedState: {
+        batchId: "batch-1",
+        submittedAt: new Date().toISOString(),
+        pollInterval: 5000,
+        maxWaitTime: 60000,
+      },
       nextPollAt: new Date(clock.now().getTime() - 1000),
       pollInterval: 5000,
     });
@@ -316,12 +367,25 @@ describe("kernel: stage.pollSuspended", () => {
       id: "batch-stage",
       name: "Batch Stage",
       mode: "async-batch",
-      schemas: { input: schema, output: z.object({ result: z.string() }), config: z.object({}) },
+      schemas: {
+        input: schema,
+        output: z.object({ result: z.string() }),
+        config: z.object({}),
+      },
       async execute() {
         return {
           suspended: true,
-          state: { batchId: "batch-1", submittedAt: new Date().toISOString(), pollInterval: 1000, maxWaitTime: 60000 },
-          pollConfig: { pollInterval: 1000, maxWaitTime: 60000, nextPollAt: new Date(Date.now() + 1000) },
+          state: {
+            batchId: "batch-1",
+            submittedAt: new Date().toISOString(),
+            pollInterval: 1000,
+            maxWaitTime: 60000,
+          },
+          pollConfig: {
+            pollInterval: 1000,
+            maxWaitTime: 60000,
+            nextPollAt: new Date(Date.now() + 1000),
+          },
         };
       },
       async checkCompletion() {
@@ -330,8 +394,14 @@ describe("kernel: stage.pollSuspended", () => {
     });
 
     const workflow = new WorkflowBuilder(
-      "test-workflow", "Test", "Test", schema, z.object({ result: z.string() }),
-    ).pipe(stage).build();
+      "test-workflow",
+      "Test",
+      "Test",
+      schema,
+      z.object({ result: z.string() }),
+    )
+      .pipe(stage)
+      .build();
 
     const { kernel, persistence, clock } = createTestKernel([workflow]);
 
@@ -356,7 +426,12 @@ describe("kernel: stage.pollSuspended", () => {
 
     const stages = await persistence.getStagesByRun(run.id);
     await persistence.updateStage(stages[0]!.id, {
-      suspendedState: { batchId: "batch-1", submittedAt: new Date().toISOString(), pollInterval: 1000, maxWaitTime: 60000 },
+      suspendedState: {
+        batchId: "batch-1",
+        submittedAt: new Date().toISOString(),
+        pollInterval: 1000,
+        maxWaitTime: 60000,
+      },
       nextPollAt: new Date(clock.now().getTime() - 1000),
     });
 

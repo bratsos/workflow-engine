@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 import { StaleVersionError } from "../../persistence/interface.js";
+import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 
 describe("kernel: optimistic concurrency", () => {
   let persistence: InMemoryWorkflowPersistence;

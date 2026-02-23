@@ -5,23 +5,23 @@
  * start the host, verify the workflow completes end-to-end.
  */
 
-import { afterEach, describe, expect, it } from "vitest";
-import { z } from "zod";
-import { createKernel, type Kernel } from "@bratsos/workflow-engine/kernel";
-import {
-  FakeClock,
-  InMemoryBlobStore,
-  CollectingEventSink,
-  NoopScheduler,
-} from "@bratsos/workflow-engine/kernel/testing";
-import { InMemoryWorkflowPersistence } from "@bratsos/workflow-engine/testing";
-import { InMemoryJobQueue } from "@bratsos/workflow-engine/testing";
+import type { Workflow } from "@bratsos/workflow-engine";
 import {
   defineAsyncBatchStage,
   defineStage,
   WorkflowBuilder,
 } from "@bratsos/workflow-engine";
-import type { Workflow } from "@bratsos/workflow-engine";
+import { createKernel, type Kernel } from "@bratsos/workflow-engine/kernel";
+import {
+  CollectingEventSink,
+  FakeClock,
+  InMemoryBlobStore,
+  NoopScheduler,
+} from "@bratsos/workflow-engine/kernel/testing";
+import { InMemoryWorkflowPersistence } from "@bratsos/workflow-engine/testing";
+import { InMemoryJobQueue } from "@bratsos/workflow-engine/testing";
+import { afterEach, describe, expect, it } from "vitest";
+import { z } from "zod";
 import { createNodeHost, type NodeHost } from "../host.js";
 
 // ============================================================================
@@ -47,7 +47,11 @@ function createChainedStage(id: string) {
   return defineStage({
     id,
     name: `Stage ${id}`,
-    schemas: { input: outputSchema, output: outputSchema, config: z.object({}) },
+    schemas: {
+      input: outputSchema,
+      output: outputSchema,
+      config: z.object({}),
+    },
     async execute(ctx) {
       return { output: { result: ctx.input.result + "!" } };
     },
@@ -330,8 +334,9 @@ describe("NodeHost", () => {
 
   it("flushes outbox events through EventSink", async () => {
     const workflow = createSimpleWorkflow();
-    const { kernel, persistence, jobTransport, eventSink } =
-      createTestEnv([workflow]);
+    const { kernel, persistence, jobTransport, eventSink } = createTestEnv([
+      workflow,
+    ]);
 
     await kernel.dispatch({
       type: "run.create",

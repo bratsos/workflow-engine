@@ -1,16 +1,19 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
+import {
+  defineAsyncBatchStage,
+  defineStage,
+} from "../../core/stage-factory.js";
+import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
 import { createKernel, type Kernel } from "../../kernel/kernel.js";
 import {
+  CollectingEventSink,
   FakeClock,
   InMemoryBlobStore,
-  CollectingEventSink,
   NoopScheduler,
 } from "../../kernel/testing/index.js";
-import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
-import { defineStage, defineAsyncBatchStage } from "../../core/stage-factory.js";
-import { WorkflowBuilder, type Workflow } from "../../core/workflow.js";
+import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 
 function createPassthroughStage(id: string, schema: z.ZodTypeAny) {
   return defineStage({
@@ -65,7 +68,17 @@ function createTestKernel(workflows: Workflow<any, any>[] = []) {
   });
 
   const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
-  return { kernel, flush, persistence, blobStore, jobTransport, eventSink, scheduler, clock, registry };
+  return {
+    kernel,
+    flush,
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry,
+  };
 }
 
 describe("kernel: job.execute", () => {
@@ -74,19 +87,28 @@ describe("kernel: job.execute", () => {
     const stage = defineStage({
       id: "transform",
       name: "Transform",
-      schemas: { input: schema, output: z.object({ result: z.string() }), config: z.object({}) },
+      schemas: {
+        input: schema,
+        output: z.object({ result: z.string() }),
+        config: z.object({}),
+      },
       async execute(ctx) {
         return { output: { result: ctx.input.data.toUpperCase() } };
       },
     });
 
     const workflow = new WorkflowBuilder(
-      "test-workflow", "Test", "Test",
+      "test-workflow",
+      "Test",
+      "Test",
       schema,
       z.object({ result: z.string() }),
-    ).pipe(stage).build();
+    )
+      .pipe(stage)
+      .build();
 
-    const { kernel, flush, persistence, blobStore, eventSink } = createTestKernel([workflow]);
+    const { kernel, flush, persistence, blobStore, eventSink } =
+      createTestKernel([workflow]);
 
     // Create and claim a run
     const createResult = await kernel.dispatch({
@@ -96,7 +118,9 @@ describe("kernel: job.execute", () => {
       input: { data: "hello" },
     });
 
-    await persistence.updateRun(createResult.workflowRunId, { status: "RUNNING" });
+    await persistence.updateRun(createResult.workflowRunId, {
+      status: "RUNNING",
+    });
     await flush();
     eventSink.clear();
 
@@ -142,10 +166,19 @@ describe("kernel: job.execute", () => {
       },
     });
 
-    const workflow = new WorkflowBuilder("test-workflow", "Test", "Test", schema, schema)
-      .pipe(stage).build();
+    const workflow = new WorkflowBuilder(
+      "test-workflow",
+      "Test",
+      "Test",
+      schema,
+      schema,
+    )
+      .pipe(stage)
+      .build();
 
-    const { kernel, flush, persistence, eventSink } = createTestKernel([workflow]);
+    const { kernel, flush, persistence, eventSink } = createTestKernel([
+      workflow,
+    ]);
 
     const createResult = await kernel.dispatch({
       type: "run.create",
@@ -154,7 +187,9 @@ describe("kernel: job.execute", () => {
       input: { data: "hello" },
     });
 
-    await persistence.updateRun(createResult.workflowRunId, { status: "RUNNING" });
+    await persistence.updateRun(createResult.workflowRunId, {
+      status: "RUNNING",
+    });
     await flush();
     eventSink.clear();
 
@@ -185,7 +220,11 @@ describe("kernel: job.execute", () => {
       id: "suspending",
       name: "Suspending Stage",
       mode: "async-batch",
-      schemas: { input: schema, output: z.object({ result: z.string() }), config: z.object({}) },
+      schemas: {
+        input: schema,
+        output: z.object({ result: z.string() }),
+        config: z.object({}),
+      },
       async execute(ctx) {
         return {
           suspended: true,
@@ -208,10 +247,14 @@ describe("kernel: job.execute", () => {
     });
 
     const workflow = new WorkflowBuilder(
-      "test-workflow", "Test", "Test",
+      "test-workflow",
+      "Test",
+      "Test",
       schema,
       z.object({ result: z.string() }),
-    ).pipe(stage).build();
+    )
+      .pipe(stage)
+      .build();
 
     const { kernel, persistence, eventSink } = createTestKernel([workflow]);
 
@@ -222,7 +265,9 @@ describe("kernel: job.execute", () => {
       input: { data: "hello" },
     });
 
-    await persistence.updateRun(createResult.workflowRunId, { status: "RUNNING" });
+    await persistence.updateRun(createResult.workflowRunId, {
+      status: "RUNNING",
+    });
     eventSink.clear();
 
     const result = await kernel.dispatch({
@@ -261,12 +306,25 @@ describe("kernel: job.execute", () => {
     const stage = defineStage({
       id: "strict",
       name: "Strict",
-      schemas: { input: inputSchema, output: inputSchema, config: z.object({}) },
-      async execute(ctx) { return { output: ctx.input }; },
+      schemas: {
+        input: inputSchema,
+        output: inputSchema,
+        config: z.object({}),
+      },
+      async execute(ctx) {
+        return { output: ctx.input };
+      },
     });
 
-    const workflow = new WorkflowBuilder("test-workflow", "Test", "Test", inputSchema, inputSchema)
-      .pipe(stage).build();
+    const workflow = new WorkflowBuilder(
+      "test-workflow",
+      "Test",
+      "Test",
+      inputSchema,
+      inputSchema,
+    )
+      .pipe(stage)
+      .build();
 
     const { kernel, persistence } = createTestKernel([workflow]);
 

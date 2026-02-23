@@ -15,10 +15,7 @@ export class NoopScheduler implements Scheduler {
     this.scheduled.push({ commandType, payload, runAt });
   }
 
-  async cancel(
-    _commandType: string,
-    _correlationId: string,
-  ): Promise<void> {
+  async cancel(_commandType: string, _correlationId: string): Promise<void> {
     // No-op in Phase 1
   }
 

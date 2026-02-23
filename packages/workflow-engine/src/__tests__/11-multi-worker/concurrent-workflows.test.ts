@@ -8,17 +8,17 @@
 
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
+import { defineStage } from "../../core/stage-factory.js";
+import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
 import { createKernel } from "../../kernel/kernel.js";
 import {
+  CollectingEventSink,
   FakeClock,
   InMemoryBlobStore,
-  CollectingEventSink,
   NoopScheduler,
 } from "../../kernel/testing/index.js";
-import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
-import { defineStage } from "../../core/stage-factory.js";
-import { WorkflowBuilder, type Workflow } from "../../core/workflow.js";
+import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 
 function createTestKernel(workflows: Workflow<any, any>[] = []) {
   const persistence = new InMemoryWorkflowPersistence();
@@ -30,11 +30,26 @@ function createTestKernel(workflows: Workflow<any, any>[] = []) {
   const registry = new Map<string, Workflow<any, any>>();
   for (const w of workflows) registry.set(w.id, w);
   const kernel = createKernel({
-    persistence, blobStore, jobTransport, eventSink, scheduler, clock,
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
     registry: { getWorkflow: (id) => registry.get(id) },
   });
   const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
-  return { kernel, flush, persistence, blobStore, jobTransport, eventSink, scheduler, clock, registry };
+  return {
+    kernel,
+    flush,
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry,
+  };
 }
 
 function createPassthroughWorkflow(id: string) {
@@ -59,7 +74,10 @@ describe("I want to run multiple workflows concurrently", () => {
       const workflowA = createPassthroughWorkflow("workflow-a");
       const workflowB = createPassthroughWorkflow("workflow-b");
 
-      const { kernel, flush, persistence, jobTransport } = createTestKernel([workflowA, workflowB]);
+      const { kernel, flush, persistence, jobTransport } = createTestKernel([
+        workflowA,
+        workflowB,
+      ]);
 
       // Create runs for different workflows
       await kernel.dispatch({
@@ -99,7 +117,9 @@ describe("I want to run multiple workflows concurrently", () => {
     it("should process jobs in priority order across workflows", async () => {
       // Given: Workflows with different priorities
       const workflow = createPassthroughWorkflow("priority-wf");
-      const { kernel, flush, persistence, jobTransport } = createTestKernel([workflow]);
+      const { kernel, flush, persistence, jobTransport } = createTestKernel([
+        workflow,
+      ]);
 
       const low = await kernel.dispatch({
         type: "run.create",
@@ -226,7 +246,13 @@ describe("I want to run multiple workflows concurrently", () => {
           return { output: { value: ctx.input.value.toUpperCase() } };
         },
       });
-      const workflow = new WorkflowBuilder("concurrent-wf", "Concurrent", "Test", schema, schema)
+      const workflow = new WorkflowBuilder(
+        "concurrent-wf",
+        "Concurrent",
+        "Test",
+        schema,
+        schema,
+      )
         .pipe(stage)
         .build();
 
@@ -282,7 +308,10 @@ describe("I want to run multiple workflows concurrently", () => {
       // Given: Runs in different states
       const workflowA = createPassthroughWorkflow("filter-a");
       const workflowB = createPassthroughWorkflow("filter-b");
-      const { kernel, flush, persistence } = createTestKernel([workflowA, workflowB]);
+      const { kernel, flush, persistence } = createTestKernel([
+        workflowA,
+        workflowB,
+      ]);
 
       const runA1 = await kernel.dispatch({
         type: "run.create",
@@ -346,14 +375,29 @@ describe("I want to run multiple workflows concurrently", () => {
         },
       });
 
-      const successWorkflow = new WorkflowBuilder("success-wf", "Success", "Test", schema, schema)
+      const successWorkflow = new WorkflowBuilder(
+        "success-wf",
+        "Success",
+        "Test",
+        schema,
+        schema,
+      )
         .pipe(successStage)
         .build();
-      const failWorkflow = new WorkflowBuilder("fail-wf", "Fail", "Test", schema, schema)
+      const failWorkflow = new WorkflowBuilder(
+        "fail-wf",
+        "Fail",
+        "Test",
+        schema,
+        schema,
+      )
         .pipe(failStage)
         .build();
 
-      const { kernel, flush, persistence } = createTestKernel([successWorkflow, failWorkflow]);
+      const { kernel, flush, persistence } = createTestKernel([
+        successWorkflow,
+        failWorkflow,
+      ]);
 
       // Create runs
       const runSuccess = await kernel.dispatch({
@@ -401,8 +445,14 @@ describe("I want to run multiple workflows concurrently", () => {
       expect(result2.error).toBe("Intentional failure");
 
       // Transition both
-      await kernel.dispatch({ type: "run.transition", workflowRunId: runSuccess.workflowRunId });
-      await kernel.dispatch({ type: "run.transition", workflowRunId: runFail.workflowRunId });
+      await kernel.dispatch({
+        type: "run.transition",
+        workflowRunId: runSuccess.workflowRunId,
+      });
+      await kernel.dispatch({
+        type: "run.transition",
+        workflowRunId: runFail.workflowRunId,
+      });
 
       // Verify persistence reflects correct states
       const successRun = await persistence.getRun(runSuccess.workflowRunId);

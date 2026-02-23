@@ -6,17 +6,17 @@
 
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
+import { defineStage } from "../../core/stage-factory.js";
+import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
 import { createKernel } from "../../kernel/kernel.js";
 import {
+  CollectingEventSink,
   FakeClock,
   InMemoryBlobStore,
-  CollectingEventSink,
   NoopScheduler,
 } from "../../kernel/testing/index.js";
-import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
-import { defineStage } from "../../core/stage-factory.js";
-import { WorkflowBuilder, type Workflow } from "../../core/workflow.js";
+import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 
 function createTestKernel(workflows: Workflow<any, any>[] = []) {
   const persistence = new InMemoryWorkflowPersistence();
@@ -40,7 +40,17 @@ function createTestKernel(workflows: Workflow<any, any>[] = []) {
   });
 
   const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
-  return { kernel, flush, persistence, blobStore, jobTransport, eventSink, scheduler, clock, registry };
+  return {
+    kernel,
+    flush,
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry,
+  };
 }
 
 describe("I want to execute workflows", () => {
@@ -275,7 +285,9 @@ describe("I want to execute workflows", () => {
         .pipe(square)
         .build();
 
-      const { kernel, flush, persistence, jobTransport } = createTestKernel([workflow]);
+      const { kernel, flush, persistence, jobTransport } = createTestKernel([
+        workflow,
+      ]);
 
       const { workflowRunId } = await kernel.dispatch({
         type: "run.create",
@@ -341,19 +353,25 @@ describe("I want to execute workflows", () => {
         id: "stage-a",
         name: "Stage stage-a",
         schemas: { input: schema, output: schema, config: z.object({}) },
-        async execute(ctx) { return { output: ctx.input }; },
+        async execute(ctx) {
+          return { output: ctx.input };
+        },
       });
       const stageB = defineStage({
         id: "stage-b",
         name: "Stage stage-b",
         schemas: { input: schema, output: schema, config: z.object({}) },
-        async execute(ctx) { return { output: ctx.input }; },
+        async execute(ctx) {
+          return { output: ctx.input };
+        },
       });
       const stageC = defineStage({
         id: "stage-c",
         name: "Stage stage-c",
         schemas: { input: schema, output: schema, config: z.object({}) },
-        async execute(ctx) { return { output: ctx.input }; },
+        async execute(ctx) {
+          return { output: ctx.input };
+        },
       });
 
       const workflow = new WorkflowBuilder(
@@ -451,7 +469,9 @@ describe("I want to execute workflows", () => {
         .parallel([stageA, stageB])
         .build();
 
-      const { kernel, flush, persistence, jobTransport } = createTestKernel([workflow]);
+      const { kernel, flush, persistence, jobTransport } = createTestKernel([
+        workflow,
+      ]);
 
       const { workflowRunId } = await kernel.dispatch({
         type: "run.create",
@@ -461,7 +481,10 @@ describe("I want to execute workflows", () => {
       });
 
       // Claim creates jobs for both parallel stages
-      const claimResult = await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
+      const claimResult = await kernel.dispatch({
+        type: "run.claimPending",
+        workerId: "worker-1",
+      });
       expect(claimResult.claimed[0]!.jobIds).toHaveLength(2);
 
       // Execute both parallel stages
@@ -707,8 +730,14 @@ describe("I want to execute workflows", () => {
         },
         async execute(ctx) {
           capturedContext = { ...ctx.workflowContext };
-          const producerOutput = ctx.workflowContext["producer"] as { produced: string } | undefined;
-          return { output: { final: `consumed-${producerOutput?.produced ?? ctx.input.produced}` } };
+          const producerOutput = ctx.workflowContext["producer"] as
+            | { produced: string }
+            | undefined;
+          return {
+            output: {
+              final: `consumed-${producerOutput?.produced ?? ctx.input.produced}`,
+            },
+          };
         },
       });
 

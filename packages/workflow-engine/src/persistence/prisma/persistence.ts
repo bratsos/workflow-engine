@@ -818,10 +818,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     });
   }
 
-  async releaseIdempotencyKey(
-    key: string,
-    commandType: string,
-  ): Promise<void> {
+  async releaseIdempotencyKey(key: string, commandType: string): Promise<void> {
     await this.prisma.idempotencyKey.deleteMany({
       where: { key, commandType },
     });

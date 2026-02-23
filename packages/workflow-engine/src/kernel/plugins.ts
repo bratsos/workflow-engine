@@ -6,16 +6,14 @@
  * consumer wants domain side-effects on workflow events.
  */
 
-import type { EventSink } from "./ports.js";
 import type { KernelEvent, KernelEventType } from "./events.js";
+import type { EventSink } from "./ports.js";
 
 // ============================================================================
 // Types
 // ============================================================================
 
-export interface PluginDefinition<
-  T extends KernelEventType = KernelEventType,
-> {
+export interface PluginDefinition<T extends KernelEventType = KernelEventType> {
   readonly id: string;
   readonly name: string;
   readonly on: readonly T[];

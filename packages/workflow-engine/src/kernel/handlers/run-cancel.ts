@@ -5,7 +5,7 @@
  */
 
 import type { RunCancelCommand, RunCancelResult } from "../commands";
-import type { KernelDeps, HandlerResult } from "../kernel";
+import type { HandlerResult, KernelDeps } from "../kernel";
 
 const TERMINAL_STATUSES = new Set(["COMPLETED", "FAILED", "CANCELLED"]);
 

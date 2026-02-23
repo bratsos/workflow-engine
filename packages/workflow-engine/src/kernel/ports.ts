@@ -16,42 +16,42 @@
  */
 
 import type {
-  WorkflowRunRecord,
-  WorkflowStageRecord,
-  WorkflowLogRecord,
-  OutboxRecord,
+  CreateLogInput,
   CreateOutboxEventInput,
-  IdempotencyRecord,
   CreateRunInput,
-  UpdateRunInput,
   CreateStageInput,
+  DequeueResult,
+  EnqueueJobInput,
+  IdempotencyRecord,
+  OutboxRecord,
+  Status,
+  UpdateRunInput,
   UpdateStageInput,
   UpsertStageInput,
-  CreateLogInput,
-  EnqueueJobInput,
-  DequeueResult,
-  Status,
+  WorkflowLogRecord,
+  WorkflowRunRecord,
+  WorkflowStageRecord,
 } from "../persistence/interface";
 
 import type { KernelEvent } from "./events";
 
 // Re-export record and input types for convenience
 export type {
-  WorkflowRunRecord,
-  WorkflowStageRecord,
-  WorkflowLogRecord,
-  OutboxRecord,
+  CreateLogInput,
   CreateOutboxEventInput,
-  IdempotencyRecord,
   CreateRunInput,
-  UpdateRunInput,
   CreateStageInput,
+  DequeueResult,
+  EnqueueJobInput,
+  IdempotencyRecord,
+  OutboxRecord,
+  Status,
+  UpdateRunInput,
   UpdateStageInput,
   UpsertStageInput,
-  CreateLogInput,
-  EnqueueJobInput,
-  DequeueResult,
-  Status,
+  WorkflowLogRecord,
+  WorkflowRunRecord,
+  WorkflowStageRecord,
 } from "../persistence/interface";
 
 export type { KernelEvent } from "./events";
@@ -112,10 +112,7 @@ export interface Persistence {
     stageId: string,
     data: UpdateStageInput,
   ): Promise<void>;
-  getStage(
-    runId: string,
-    stageId: string,
-  ): Promise<WorkflowStageRecord | null>;
+  getStage(runId: string, stageId: string): Promise<WorkflowStageRecord | null>;
   getStageById(id: string): Promise<WorkflowStageRecord | null>;
   getStagesByRun(
     runId: string,

@@ -1,16 +1,19 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
+import {
+  defineAsyncBatchStage,
+  defineStage,
+} from "../../core/stage-factory.js";
+import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
 import { createKernel, type Kernel } from "../../kernel/kernel.js";
 import {
+  CollectingEventSink,
   FakeClock,
   InMemoryBlobStore,
-  CollectingEventSink,
   NoopScheduler,
 } from "../../kernel/testing/index.js";
-import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
-import { defineStage, defineAsyncBatchStage } from "../../core/stage-factory.js";
-import { WorkflowBuilder, type Workflow } from "../../core/workflow.js";
+import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 
 function createPassthroughStage(id: string, schema: z.ZodTypeAny) {
   return defineStage({
@@ -65,7 +68,17 @@ function createTestKernel(workflows: Workflow<any, any>[] = []) {
   });
 
   const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
-  return { kernel, flush, persistence, blobStore, jobTransport, eventSink, scheduler, clock, registry };
+  return {
+    kernel,
+    flush,
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry,
+  };
 }
 
 describe("kernel: run.transition", () => {
@@ -91,7 +104,9 @@ describe("kernel: run.transition", () => {
       input: { data: "hello" },
     });
 
-    await persistence.updateRun(createResult.workflowRunId, { status: "COMPLETED" });
+    await persistence.updateRun(createResult.workflowRunId, {
+      status: "COMPLETED",
+    });
 
     const result = await kernel.dispatch({
       type: "run.transition",
@@ -112,7 +127,9 @@ describe("kernel: run.transition", () => {
       input: { data: "hello" },
     });
 
-    await persistence.updateRun(createResult.workflowRunId, { status: "RUNNING" });
+    await persistence.updateRun(createResult.workflowRunId, {
+      status: "RUNNING",
+    });
 
     // Create a RUNNING stage
     await persistence.createStage({
@@ -134,7 +151,9 @@ describe("kernel: run.transition", () => {
 
   it("advances to next stage group when current group is complete", async () => {
     const workflow = createTwoStageWorkflow();
-    const { kernel, persistence, jobTransport, eventSink } = createTestKernel([workflow]);
+    const { kernel, persistence, jobTransport, eventSink } = createTestKernel([
+      workflow,
+    ]);
 
     const createResult = await kernel.dispatch({
       type: "run.create",
@@ -143,7 +162,9 @@ describe("kernel: run.transition", () => {
       input: { data: "hello" },
     });
 
-    await persistence.updateRun(createResult.workflowRunId, { status: "RUNNING" });
+    await persistence.updateRun(createResult.workflowRunId, {
+      status: "RUNNING",
+    });
 
     // Create a COMPLETED stage for group 1
     await persistence.createStage({
@@ -166,7 +187,7 @@ describe("kernel: run.transition", () => {
 
     // Verify next stage was created
     const stages = await persistence.getStagesByRun(createResult.workflowRunId);
-    const stage2 = stages.find(s => s.stageId === "stage-2");
+    const stage2 = stages.find((s) => s.stageId === "stage-2");
     expect(stage2).toBeDefined();
     expect(stage2!.status).toBe("PENDING");
 
@@ -176,7 +197,9 @@ describe("kernel: run.transition", () => {
 
   it("completes the workflow when all stages are done", async () => {
     const workflow = createSimpleWorkflow();
-    const { kernel, flush, persistence, eventSink } = createTestKernel([workflow]);
+    const { kernel, flush, persistence, eventSink } = createTestKernel([
+      workflow,
+    ]);
 
     const createResult = await kernel.dispatch({
       type: "run.create",
@@ -185,7 +208,9 @@ describe("kernel: run.transition", () => {
       input: { data: "hello" },
     });
 
-    await persistence.updateRun(createResult.workflowRunId, { status: "RUNNING" });
+    await persistence.updateRun(createResult.workflowRunId, {
+      status: "RUNNING",
+    });
 
     // Mark stage as completed
     await persistence.createStage({
@@ -228,7 +253,9 @@ describe("kernel: run.transition", () => {
       input: { data: "hello" },
     });
 
-    await persistence.updateRun(createResult.workflowRunId, { status: "RUNNING" });
+    await persistence.updateRun(createResult.workflowRunId, {
+      status: "RUNNING",
+    });
 
     // Mark stage as failed
     await persistence.createStage({

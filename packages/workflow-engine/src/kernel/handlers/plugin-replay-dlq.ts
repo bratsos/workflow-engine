@@ -7,8 +7,11 @@
  * This handler returns _events: [] — it does NOT produce new outbox events.
  */
 
-import type { PluginReplayDLQCommand, PluginReplayDLQResult } from "../commands";
-import type { KernelDeps, HandlerResult } from "../kernel";
+import type {
+  PluginReplayDLQCommand,
+  PluginReplayDLQResult,
+} from "../commands";
+import type { HandlerResult, KernelDeps } from "../kernel";
 
 export async function handlePluginReplayDLQ(
   command: PluginReplayDLQCommand,

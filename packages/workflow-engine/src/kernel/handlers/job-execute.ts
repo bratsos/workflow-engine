@@ -9,18 +9,18 @@
  * Extracted from StageExecutor.execute().
  */
 
-import type { Workflow } from "../../core/workflow";
 import type { StageContext } from "../../core/stage";
 import type { ProgressUpdate } from "../../core/types";
 import { isSuspendedResult } from "../../core/types";
+import type { Workflow } from "../../core/workflow";
 import type { JobExecuteCommand, JobExecuteResult } from "../commands";
 import type { KernelEvent } from "../events";
-import type { KernelDeps, HandlerResult } from "../kernel";
 import {
   createStorageShim,
-  saveStageOutput,
   loadWorkflowContext,
+  saveStageOutput,
 } from "../helpers/index.js";
+import type { HandlerResult, KernelDeps } from "../kernel";
 
 // ---------------------------------------------------------------------------
 // Helper: resolve stage input
@@ -58,10 +58,12 @@ export async function handleJobExecute(
 
   // 1. Get workflow and stage definition
   const workflow = deps.registry.getWorkflow(workflowId);
-  if (!workflow) throw new Error(`Workflow ${workflowId} not found in registry`);
+  if (!workflow)
+    throw new Error(`Workflow ${workflowId} not found in registry`);
 
   const stageDef = workflow.getStage(stageId);
-  if (!stageDef) throw new Error(`Stage ${stageId} not found in workflow ${workflowId}`);
+  if (!stageDef)
+    throw new Error(`Stage ${stageId} not found in workflow ${workflowId}`);
 
   // 2. Get workflow run
   const workflowRun = await deps.persistence.getRun(workflowRunId);
@@ -102,7 +104,12 @@ export async function handleJobExecute(
 
   try {
     // 6. Resolve and validate input
-    const rawInput = resolveStageInput(workflow, stageId, workflowRun, workflowContext);
+    const rawInput = resolveStageInput(
+      workflow,
+      stageId,
+      workflowRun,
+      workflowContext,
+    );
     const validatedInput = stageDef.inputSchema.parse(rawInput);
 
     // 7. Parse config
@@ -221,7 +228,11 @@ export async function handleJobExecute(
         duration,
       });
 
-      return { outcome: "completed" as const, output: result.output, _events: events };
+      return {
+        outcome: "completed" as const,
+        output: result.output,
+        _events: events,
+      };
     }
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);

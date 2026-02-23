@@ -941,9 +941,7 @@ function createPersistenceConformanceTests(
       it("should handle empty arrays gracefully", async () => {
         // When: Appending empty array and marking empty array
         // Then: No errors thrown
-        await expect(
-          persistence.appendOutboxEvents([]),
-        ).resolves.not.toThrow();
+        await expect(persistence.appendOutboxEvents([])).resolves.not.toThrow();
         await expect(
           persistence.markOutboxEventsPublished([]),
         ).resolves.not.toThrow();
@@ -963,9 +961,7 @@ function createPersistenceConformanceTests(
           },
         ]);
         const events = await persistence.getUnpublishedOutboxEvents();
-        const event = events.find(
-          (e) => e.workflowRunId === "dlq-retry-run",
-        )!;
+        const event = events.find((e) => e.workflowRunId === "dlq-retry-run")!;
         expect(event.retryCount).toBe(0);
 
         // When: Incrementing retry count twice
@@ -989,9 +985,7 @@ function createPersistenceConformanceTests(
           },
         ]);
         const events = await persistence.getUnpublishedOutboxEvents();
-        const event = events.find(
-          (e) => e.workflowRunId === "dlq-move-run",
-        )!;
+        const event = events.find((e) => e.workflowRunId === "dlq-move-run")!;
 
         // When: Moving to DLQ
         await persistence.moveOutboxEventToDLQ(event.id);
@@ -1013,9 +1007,7 @@ function createPersistenceConformanceTests(
           },
         ]);
         const events = await persistence.getUnpublishedOutboxEvents();
-        const event = events.find(
-          (e) => e.workflowRunId === "dlq-replay-run",
-        )!;
+        const event = events.find((e) => e.workflowRunId === "dlq-replay-run")!;
         await persistence.moveOutboxEventToDLQ(event.id);
 
         // Verify it's gone from unpublished
@@ -1061,11 +1053,10 @@ function createPersistenceConformanceTests(
 
       it("should return replay after completion", async () => {
         await persistence.acquireIdempotencyKey("idem-key-1", "run.create");
-        await persistence.completeIdempotencyKey(
-          "idem-key-1",
-          "run.create",
-          { workflowRunId: "run-123", status: "PENDING" },
-        );
+        await persistence.completeIdempotencyKey("idem-key-1", "run.create", {
+          workflowRunId: "run-123",
+          status: "PENDING",
+        });
 
         const replay = await persistence.acquireIdempotencyKey(
           "idem-key-1",

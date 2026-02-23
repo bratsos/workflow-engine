@@ -10,7 +10,7 @@
 import type { Workflow } from "../../core/workflow";
 import type { RunTransitionCommand, RunTransitionResult } from "../commands";
 import type { KernelEvent } from "../events";
-import type { KernelDeps, HandlerResult } from "../kernel";
+import type { HandlerResult, KernelDeps } from "../kernel";
 import type { WorkflowRunRecord } from "../ports";
 
 // ---------------------------------------------------------------------------

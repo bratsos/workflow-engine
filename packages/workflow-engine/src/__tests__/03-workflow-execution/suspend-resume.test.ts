@@ -8,18 +8,21 @@
 
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
+import type { SimpleSuspendedResult } from "../../core/stage-factory.js";
+import {
+  defineAsyncBatchStage,
+  defineStage,
+} from "../../core/stage-factory.js";
+import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
 import { createKernel } from "../../kernel/kernel.js";
 import {
+  CollectingEventSink,
   FakeClock,
   InMemoryBlobStore,
-  CollectingEventSink,
   NoopScheduler,
 } from "../../kernel/testing/index.js";
-import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
-import { defineStage, defineAsyncBatchStage } from "../../core/stage-factory.js";
-import type { SimpleSuspendedResult } from "../../core/stage-factory.js";
-import { WorkflowBuilder, type Workflow } from "../../core/workflow.js";
+import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 
 function createTestKernel(workflows: Workflow<any, any>[] = []) {
   const persistence = new InMemoryWorkflowPersistence();
@@ -43,7 +46,17 @@ function createTestKernel(workflows: Workflow<any, any>[] = []) {
   });
 
   const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
-  return { kernel, flush, persistence, blobStore, jobTransport, eventSink, scheduler, clock, registry };
+  return {
+    kernel,
+    flush,
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry,
+  };
 }
 
 describe("I want to handle workflow suspension and resumption", () => {
@@ -322,7 +335,9 @@ describe("I want to handle workflow suspension and resumption", () => {
         .pipe(suspendingStage)
         .build();
 
-      const { kernel, flush, persistence, clock } = createTestKernel([workflow]);
+      const { kernel, flush, persistence, clock } = createTestKernel([
+        workflow,
+      ]);
 
       // 1. Create and suspend the workflow
       const { workflowRunId } = await kernel.dispatch({
@@ -358,7 +373,9 @@ describe("I want to handle workflow suspension and resumption", () => {
 
       // 4. The stage should now be COMPLETED
       const updatedStages = await persistence.getStagesByRun(workflowRunId);
-      const resumedStage = updatedStages.find(s => s.stageId === "resume-stage");
+      const resumedStage = updatedStages.find(
+        (s) => s.stageId === "resume-stage",
+      );
       expect(resumedStage?.status).toBe("COMPLETED");
 
       // 5. Transition to complete the workflow
@@ -436,7 +453,9 @@ describe("I want to handle workflow suspension and resumption", () => {
         .pipe(secondStage)
         .build();
 
-      const { kernel, flush, persistence, clock } = createTestKernel([workflow]);
+      const { kernel, flush, persistence, clock } = createTestKernel([
+        workflow,
+      ]);
 
       // 1. Create and suspend
       const { workflowRunId } = await kernel.dispatch({
@@ -460,7 +479,7 @@ describe("I want to handle workflow suspension and resumption", () => {
 
       // 2. Poll to complete the suspended stage
       const stages = await persistence.getStagesByRun(workflowRunId);
-      const suspendedStage = stages.find(s => s.stageId === "first-suspend");
+      const suspendedStage = stages.find((s) => s.stageId === "first-suspend");
       await persistence.updateStage(suspendedStage!.id, {
         nextPollAt: new Date(clock.now().getTime() - 1000),
       });
@@ -502,7 +521,9 @@ describe("I want to handle workflow suspension and resumption", () => {
           output: z.object({ value: z.string() }),
           config: z.object({}),
         },
-        async execute(ctx) { return { output: ctx.input }; },
+        async execute(ctx) {
+          return { output: ctx.input };
+        },
       });
 
       const secondSuspend = defineAsyncBatchStage({
@@ -602,7 +623,9 @@ describe("I want to handle workflow suspension and resumption", () => {
           output: z.object({ value: z.string() }),
           config: z.object({}),
         },
-        async execute(ctx) { return { output: ctx.input }; },
+        async execute(ctx) {
+          return { output: ctx.input };
+        },
       });
 
       const suspendStage = defineAsyncBatchStage({
@@ -679,7 +702,10 @@ describe("I want to handle workflow suspension and resumption", () => {
       expect(rSuspend.outcome).toBe("suspended");
 
       // Transition should noop because a stage is still SUSPENDED (active)
-      const transition = await kernel.dispatch({ type: "run.transition", workflowRunId });
+      const transition = await kernel.dispatch({
+        type: "run.transition",
+        workflowRunId,
+      });
       expect(transition.action).toBe("noop");
 
       // Run should still be RUNNING (not completed)

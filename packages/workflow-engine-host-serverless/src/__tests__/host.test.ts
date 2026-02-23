@@ -5,23 +5,23 @@
  * no background loops, matching the serverless execution model.
  */
 
-import { describe, expect, it } from "vitest";
-import { z } from "zod";
-import { createKernel, type Kernel } from "@bratsos/workflow-engine/kernel";
-import {
-  FakeClock,
-  InMemoryBlobStore,
-  CollectingEventSink,
-  NoopScheduler,
-} from "@bratsos/workflow-engine/kernel/testing";
-import { InMemoryWorkflowPersistence } from "@bratsos/workflow-engine/testing";
-import { InMemoryJobQueue } from "@bratsos/workflow-engine/testing";
+import type { Workflow } from "@bratsos/workflow-engine";
 import {
   defineAsyncBatchStage,
   defineStage,
   WorkflowBuilder,
 } from "@bratsos/workflow-engine";
-import type { Workflow } from "@bratsos/workflow-engine";
+import { createKernel, type Kernel } from "@bratsos/workflow-engine/kernel";
+import {
+  CollectingEventSink,
+  FakeClock,
+  InMemoryBlobStore,
+  NoopScheduler,
+} from "@bratsos/workflow-engine/kernel/testing";
+import { InMemoryWorkflowPersistence } from "@bratsos/workflow-engine/testing";
+import { InMemoryJobQueue } from "@bratsos/workflow-engine/testing";
+import { describe, expect, it } from "vitest";
+import { z } from "zod";
 import {
   createServerlessHost,
   type JobMessage,
@@ -51,7 +51,11 @@ function createChainedStage(id: string) {
   return defineStage({
     id,
     name: `Stage ${id}`,
-    schemas: { input: outputSchema, output: outputSchema, config: z.object({}) },
+    schemas: {
+      input: outputSchema,
+      output: outputSchema,
+      config: z.object({}),
+    },
     async execute(ctx) {
       return { output: { result: ctx.input.result + "!" } };
     },
@@ -65,7 +69,11 @@ function createFailingStage(id: string) {
   return defineStage({
     id,
     name: `Stage ${id}`,
-    schemas: { input: failSchema, output: failOutputSchema, config: z.object({}) },
+    schemas: {
+      input: failSchema,
+      output: failOutputSchema,
+      config: z.object({}),
+    },
     async execute() {
       throw new Error("Stage exploded");
     },
@@ -461,8 +469,9 @@ describe("ServerlessHost", () => {
 
   it("flushes outbox events through EventSink", async () => {
     const workflow = createSimpleWorkflow();
-    const { kernel, persistence, jobTransport, eventSink } =
-      createTestEnv([workflow]);
+    const { kernel, persistence, jobTransport, eventSink } = createTestEnv([
+      workflow,
+    ]);
 
     const host = createServerlessHost({
       kernel,

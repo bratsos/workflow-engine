@@ -5,7 +5,7 @@
  */
 
 import type { LeaseReapStaleCommand, LeaseReapStaleResult } from "../commands";
-import type { KernelDeps, HandlerResult } from "../kernel";
+import type { HandlerResult, KernelDeps } from "../kernel";
 
 export async function handleLeaseReapStale(
   command: LeaseReapStaleCommand,

@@ -8,17 +8,17 @@
 
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
+import { defineStage } from "../../core/stage-factory.js";
+import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
 import { createKernel } from "../../kernel/kernel.js";
 import {
+  CollectingEventSink,
   FakeClock,
   InMemoryBlobStore,
-  CollectingEventSink,
   NoopScheduler,
 } from "../../kernel/testing/index.js";
-import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
-import { defineStage } from "../../core/stage-factory.js";
-import { WorkflowBuilder, type Workflow } from "../../core/workflow.js";
+import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 
 function createTestKernel(workflows: Workflow<any, any>[] = []) {
   const persistence = new InMemoryWorkflowPersistence();
@@ -30,11 +30,26 @@ function createTestKernel(workflows: Workflow<any, any>[] = []) {
   const registry = new Map<string, Workflow<any, any>>();
   for (const w of workflows) registry.set(w.id, w);
   const kernel = createKernel({
-    persistence, blobStore, jobTransport, eventSink, scheduler, clock,
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
     registry: { getWorkflow: (id) => registry.get(id) },
   });
   const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
-  return { kernel, flush, persistence, blobStore, jobTransport, eventSink, scheduler, clock, registry };
+  return {
+    kernel,
+    flush,
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry,
+  };
 }
 
 describe("I want to run complete workflow scenarios", () => {
@@ -156,7 +171,8 @@ describe("I want to run complete workflow scenarios", () => {
         .pipe(outputStage)
         .build();
 
-      const { kernel, flush, persistence, blobStore, eventSink } = createTestKernel([workflow]);
+      const { kernel, flush, persistence, blobStore, eventSink } =
+        createTestKernel([workflow]);
 
       const input = { source: "db", limit: 5 };
 
@@ -571,9 +587,13 @@ describe("I want to run complete workflow scenarios", () => {
         async execute(ctx) {
           executionOrder.push("branch-a");
           // Access split output via workflowContext for reliable access
-          const splitOutput = ctx.workflowContext["split"] as { parts: string[] };
+          const splitOutput = ctx.workflowContext["split"] as {
+            parts: string[];
+          };
           return {
-            output: { uppercase: splitOutput.parts.map((p) => p.toUpperCase()) },
+            output: {
+              uppercase: splitOutput.parts.map((p) => p.toUpperCase()),
+            },
           };
         },
       });
@@ -588,8 +608,12 @@ describe("I want to run complete workflow scenarios", () => {
         },
         async execute(ctx) {
           executionOrder.push("branch-b");
-          const splitOutput = ctx.workflowContext["split"] as { parts: string[] };
-          return { output: { lengths: splitOutput.parts.map((p) => p.length) } };
+          const splitOutput = ctx.workflowContext["split"] as {
+            parts: string[];
+          };
+          return {
+            output: { lengths: splitOutput.parts.map((p) => p.length) },
+          };
         },
       });
 
@@ -603,7 +627,9 @@ describe("I want to run complete workflow scenarios", () => {
         },
         async execute(ctx) {
           executionOrder.push("branch-c");
-          const splitOutput = ctx.workflowContext["split"] as { parts: string[] };
+          const splitOutput = ctx.workflowContext["split"] as {
+            parts: string[];
+          };
           return {
             output: {
               reversed: splitOutput.parts.map((p) =>

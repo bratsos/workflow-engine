@@ -5,6 +5,53 @@
  * Environment-agnostic: no timers, no process signals, no global singletons.
  */
 
+// Command types
+export type {
+  CommandResult,
+  JobExecuteCommand,
+  JobExecuteResult,
+  KernelCommand,
+  KernelCommandType,
+  LeaseReapStaleCommand,
+  LeaseReapStaleResult,
+  OutboxFlushCommand,
+  OutboxFlushResult,
+  PluginReplayDLQCommand,
+  PluginReplayDLQResult,
+  RunCancelCommand,
+  RunCancelResult,
+  RunClaimPendingCommand,
+  RunClaimPendingResult,
+  RunCreateCommand,
+  RunCreateResult,
+  RunRerunFromCommand,
+  RunRerunFromResult,
+  RunTransitionCommand,
+  RunTransitionResult,
+  StagePollSuspendedCommand,
+  StagePollSuspendedResult,
+} from "./commands.js";
+// Kernel errors
+export { IdempotencyInProgressError } from "./errors.js";
+
+// Event types
+export type {
+  KernelEvent,
+  KernelEventType,
+  StageCompletedEvent,
+  StageFailedEvent,
+  StageProgressEvent,
+  StageStartedEvent,
+  StageSuspendedEvent,
+  WorkflowCancelledEvent,
+  WorkflowCompletedEvent,
+  WorkflowCreatedEvent,
+  WorkflowFailedEvent,
+  WorkflowStartedEvent,
+  WorkflowSuspendedEvent,
+} from "./events.js";
+// Kernel helpers
+export { loadWorkflowContext, saveStageOutput } from "./helpers/index.js";
 // Kernel factory and core interfaces
 export {
   createKernel,
@@ -12,75 +59,23 @@ export {
   type KernelConfig,
   type WorkflowRegistry,
 } from "./kernel.js";
-
-// Command types
-export type {
-  KernelCommand,
-  KernelCommandType,
-  CommandResult,
-  RunCreateCommand,
-  RunCreateResult,
-  RunClaimPendingCommand,
-  RunClaimPendingResult,
-  RunTransitionCommand,
-  RunTransitionResult,
-  RunCancelCommand,
-  RunCancelResult,
-  JobExecuteCommand,
-  JobExecuteResult,
-  StagePollSuspendedCommand,
-  StagePollSuspendedResult,
-  LeaseReapStaleCommand,
-  LeaseReapStaleResult,
-  OutboxFlushCommand,
-  OutboxFlushResult,
-  PluginReplayDLQCommand,
-  PluginReplayDLQResult,
-  RunRerunFromCommand,
-  RunRerunFromResult,
-} from "./commands.js";
-
-// Event types
-export type {
-  KernelEvent,
-  KernelEventType,
-  WorkflowCreatedEvent,
-  WorkflowStartedEvent,
-  WorkflowCompletedEvent,
-  WorkflowFailedEvent,
-  WorkflowCancelledEvent,
-  WorkflowSuspendedEvent,
-  StageStartedEvent,
-  StageCompletedEvent,
-  StageSuspendedEvent,
-  StageFailedEvent,
-  StageProgressEvent,
-} from "./events.js";
-
-// Port interfaces
-export type {
-  Clock,
-  Persistence,
-  BlobStore,
-  JobTransport,
-  EventSink,
-  Scheduler,
-  OutboxRecord,
-  CreateOutboxEventInput,
-  IdempotencyRecord,
-} from "./ports.js";
-
 // Plugin system
 export {
-  definePlugin,
   createPluginRunner,
+  definePlugin,
   type PluginDefinition,
-  type PluginRunnerConfig,
   type PluginRunner,
+  type PluginRunnerConfig,
 } from "./plugins.js";
-
-// Kernel helpers
-export { saveStageOutput, loadWorkflowContext } from "./helpers/index.js";
-
-// Kernel errors
-export { IdempotencyInProgressError } from "./errors.js";
+// Port interfaces
+export type {
+  BlobStore,
+  Clock,
+  CreateOutboxEventInput,
+  EventSink,
+  IdempotencyRecord,
+  JobTransport,
+  OutboxRecord,
+  Persistence,
+  Scheduler,
+} from "./ports.js";

@@ -205,15 +205,24 @@ export type KernelCommand =
 export type KernelCommandType = KernelCommand["type"];
 
 /** Maps a `KernelCommand` to its corresponding result type. */
-export type CommandResult<T extends KernelCommand> =
-  T extends RunCreateCommand ? RunCreateResult :
-  T extends RunClaimPendingCommand ? RunClaimPendingResult :
-  T extends RunTransitionCommand ? RunTransitionResult :
-  T extends RunCancelCommand ? RunCancelResult :
-  T extends RunRerunFromCommand ? RunRerunFromResult :
-  T extends JobExecuteCommand ? JobExecuteResult :
-  T extends StagePollSuspendedCommand ? StagePollSuspendedResult :
-  T extends LeaseReapStaleCommand ? LeaseReapStaleResult :
-  T extends OutboxFlushCommand ? OutboxFlushResult :
-  T extends PluginReplayDLQCommand ? PluginReplayDLQResult :
-  never;
+export type CommandResult<T extends KernelCommand> = T extends RunCreateCommand
+  ? RunCreateResult
+  : T extends RunClaimPendingCommand
+    ? RunClaimPendingResult
+    : T extends RunTransitionCommand
+      ? RunTransitionResult
+      : T extends RunCancelCommand
+        ? RunCancelResult
+        : T extends RunRerunFromCommand
+          ? RunRerunFromResult
+          : T extends JobExecuteCommand
+            ? JobExecuteResult
+            : T extends StagePollSuspendedCommand
+              ? StagePollSuspendedResult
+              : T extends LeaseReapStaleCommand
+                ? LeaseReapStaleResult
+                : T extends OutboxFlushCommand
+                  ? OutboxFlushResult
+                  : T extends PluginReplayDLQCommand
+                    ? PluginReplayDLQResult
+                    : never;

@@ -16,7 +16,6 @@
 
 import { randomUUID } from "crypto";
 import {
-  StaleVersionError,
   type CreateLogInput,
   type CreateOutboxEventInput,
   type CreateRunInput,
@@ -24,6 +23,7 @@ import {
   type IdempotencyRecord,
   type OutboxRecord,
   type SaveArtifactInput,
+  StaleVersionError,
   type UpdateRunInput,
   type UpdateStageInput,
   type UpsertStageInput,
@@ -101,8 +101,16 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
       throw new Error(`WorkflowRun not found: ${id}`);
     }
 
-    if (data.expectedVersion !== undefined && run.version !== data.expectedVersion) {
-      throw new StaleVersionError("WorkflowRun", id, data.expectedVersion, run.version);
+    if (
+      data.expectedVersion !== undefined &&
+      run.version !== data.expectedVersion
+    ) {
+      throw new StaleVersionError(
+        "WorkflowRun",
+        id,
+        data.expectedVersion,
+        run.version,
+      );
     }
 
     const { expectedVersion: _, ...rest } = data;
@@ -255,8 +263,16 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
       throw new Error(`WorkflowStage not found: ${id}`);
     }
 
-    if (data.expectedVersion !== undefined && stage.version !== data.expectedVersion) {
-      throw new StaleVersionError("WorkflowStage", id, data.expectedVersion, stage.version);
+    if (
+      data.expectedVersion !== undefined &&
+      stage.version !== data.expectedVersion
+    ) {
+      throw new StaleVersionError(
+        "WorkflowStage",
+        id,
+        data.expectedVersion,
+        stage.version,
+      );
     }
 
     const { expectedVersion: _, ...rest } = data;
@@ -281,8 +297,16 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
       throw new Error(`WorkflowStage not found: ${workflowRunId}/${stageId}`);
     }
 
-    if (data.expectedVersion !== undefined && stage.version !== data.expectedVersion) {
-      throw new StaleVersionError("WorkflowStage", `${workflowRunId}/${stageId}`, data.expectedVersion, stage.version);
+    if (
+      data.expectedVersion !== undefined &&
+      stage.version !== data.expectedVersion
+    ) {
+      throw new StaleVersionError(
+        "WorkflowStage",
+        `${workflowRunId}/${stageId}`,
+        data.expectedVersion,
+        stage.version,
+      );
     }
 
     const { expectedVersion: _, ...rest } = data;
@@ -525,10 +549,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
     });
   }
 
-  async releaseIdempotencyKey(
-    key: string,
-    commandType: string,
-  ): Promise<void> {
+  async releaseIdempotencyKey(key: string, commandType: string): Promise<void> {
     this.idempotencyInProgress.delete(
       this.idempotencyCompositeKey(commandType, key),
     );

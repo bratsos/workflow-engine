@@ -75,6 +75,12 @@ export {
   printAvailableModels,
   registerModels,
 } from "./ai/model-helper";
+export type {
+  AIConfig,
+  ConcurrencyConfig,
+  DebugConfig,
+  FeatureFlagsConfig,
+} from "./core/config-presets";
 export {
   AIConfigSchema,
   ConcurrencyConfigSchema,
@@ -84,12 +90,6 @@ export {
   withConcurrency,
   withFeatureFlags,
   withStandardConfig,
-} from "./core/config-presets";
-export type {
-  AIConfig,
-  ConcurrencyConfig,
-  DebugConfig,
-  FeatureFlagsConfig,
 } from "./core/config-presets";
 export type {
   WorkflowEventType,
@@ -176,60 +176,60 @@ export type {
 // Kernel API (Phase 1)
 // =============================================================================
 
-export {
-  createKernel,
-  type Kernel,
-  type KernelConfig,
-  type WorkflowRegistry as KernelWorkflowRegistry,
-} from "./kernel/kernel";
 export type {
-  KernelCommand,
-  KernelCommandType,
   CommandResult,
-  RunCreateCommand,
-  RunCreateResult,
-  RunClaimPendingCommand,
-  RunClaimPendingResult,
-  RunTransitionCommand,
-  RunTransitionResult,
-  RunCancelCommand,
-  RunCancelResult,
   JobExecuteCommand,
   JobExecuteResult,
-  StagePollSuspendedCommand,
-  StagePollSuspendedResult,
+  KernelCommand,
+  KernelCommandType,
   LeaseReapStaleCommand,
   LeaseReapStaleResult,
   OutboxFlushCommand,
   OutboxFlushResult,
   PluginReplayDLQCommand,
   PluginReplayDLQResult,
+  RunCancelCommand,
+  RunCancelResult,
+  RunClaimPendingCommand,
+  RunClaimPendingResult,
+  RunCreateCommand,
+  RunCreateResult,
   RunRerunFromCommand,
   RunRerunFromResult,
+  RunTransitionCommand,
+  RunTransitionResult,
+  StagePollSuspendedCommand,
+  StagePollSuspendedResult,
 } from "./kernel/commands";
+export { IdempotencyInProgressError } from "./kernel/errors";
 export type {
   KernelEvent,
   KernelEventType,
 } from "./kernel/events";
+export {
+  createKernel,
+  type Kernel,
+  type KernelConfig,
+  type WorkflowRegistry as KernelWorkflowRegistry,
+} from "./kernel/kernel";
+export {
+  createPluginRunner,
+  definePlugin,
+  type PluginDefinition,
+  type PluginRunner,
+  type PluginRunnerConfig,
+} from "./kernel/plugins";
 export type {
-  Clock,
-  Persistence,
   BlobStore,
-  JobTransport,
+  Clock,
   EventSink,
+  JobTransport,
+  Persistence,
   Scheduler,
 } from "./kernel/ports";
-export {
-  definePlugin,
-  createPluginRunner,
-  type PluginDefinition,
-  type PluginRunnerConfig,
-  type PluginRunner,
-} from "./kernel/plugins";
-export { StaleVersionError } from "./persistence/interface";
-export { IdempotencyInProgressError } from "./kernel/errors";
 export type {
-  OutboxRecord,
   CreateOutboxEventInput,
   IdempotencyRecord,
+  OutboxRecord,
 } from "./persistence/interface";
+export { StaleVersionError } from "./persistence/interface";

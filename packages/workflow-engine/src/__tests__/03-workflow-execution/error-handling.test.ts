@@ -8,17 +8,17 @@
 
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
+import { defineStage } from "../../core/stage-factory.js";
+import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
 import { createKernel } from "../../kernel/kernel.js";
 import {
+  CollectingEventSink,
   FakeClock,
   InMemoryBlobStore,
-  CollectingEventSink,
   NoopScheduler,
 } from "../../kernel/testing/index.js";
-import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
-import { defineStage } from "../../core/stage-factory.js";
-import { WorkflowBuilder, type Workflow } from "../../core/workflow.js";
+import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 
 function createTestKernel(workflows: Workflow<any, any>[] = []) {
   const persistence = new InMemoryWorkflowPersistence();
@@ -42,7 +42,17 @@ function createTestKernel(workflows: Workflow<any, any>[] = []) {
   });
 
   const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
-  return { kernel, flush, persistence, blobStore, jobTransport, eventSink, scheduler, clock, registry };
+  return {
+    kernel,
+    flush,
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry,
+  };
 }
 
 describe("I want to handle workflow errors", () => {
@@ -333,7 +343,9 @@ describe("I want to handle workflow errors", () => {
         id: "success-stage",
         name: "Stage success-stage",
         schemas: { input: schema, output: schema, config: z.object({}) },
-        async execute(ctx) { return { output: ctx.input }; },
+        async execute(ctx) {
+          return { output: ctx.input };
+        },
       });
 
       const errorStage = defineStage({
@@ -483,7 +495,10 @@ describe("I want to handle workflow errors", () => {
       expect(r2.outcome).toBe("failed");
 
       // Transition marks workflow as failed, so stage 3 never gets enqueued
-      const transition = await kernel.dispatch({ type: "run.transition", workflowRunId });
+      const transition = await kernel.dispatch({
+        type: "run.transition",
+        workflowRunId,
+      });
       expect(transition.action).toBe("failed");
 
       await flush();

@@ -1,5 +1,5 @@
-import type { EventSink } from "../ports";
 import type { KernelEvent, KernelEventType } from "../events";
+import type { EventSink } from "../ports";
 
 export class CollectingEventSink implements EventSink {
   readonly events: KernelEvent[] = [];

@@ -9,17 +9,17 @@
 
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
+import { defineStage } from "../../core/stage-factory.js";
+import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
 import { createKernel } from "../../kernel/kernel.js";
 import {
+  CollectingEventSink,
   FakeClock,
   InMemoryBlobStore,
-  CollectingEventSink,
   NoopScheduler,
 } from "../../kernel/testing/index.js";
-import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
-import { defineStage } from "../../core/stage-factory.js";
-import { WorkflowBuilder, type Workflow } from "../../core/workflow.js";
+import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 
 const TestStringSchema = z.object({ value: z.string() });
 
@@ -42,7 +42,17 @@ function createTestKernel(workflows: Workflow<any, any>[] = []) {
     registry: { getWorkflow: (id) => registry.get(id) },
   });
   const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
-  return { kernel, flush, persistence, blobStore, jobTransport, eventSink, scheduler, clock, registry };
+  return {
+    kernel,
+    flush,
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry,
+  };
 }
 
 /** Helper: create a run, claim it, and return the runId */
@@ -94,7 +104,13 @@ describe("I want to track stage progress", () => {
         .build();
 
       const { kernel, flush, eventSink } = createTestKernel([workflow]);
-      const workflowRunId = await setupRun(kernel, flush, eventSink, "progress-test", { value: "test" });
+      const workflowRunId = await setupRun(
+        kernel,
+        flush,
+        eventSink,
+        "progress-test",
+        { value: "test" },
+      );
 
       // When: Execute
       await kernel.dispatch({
@@ -144,7 +160,13 @@ describe("I want to track stage progress", () => {
         .build();
 
       const { kernel, flush, eventSink } = createTestKernel([workflow]);
-      const workflowRunId = await setupRun(kernel, flush, eventSink, "full-progress-test", { value: "test" });
+      const workflowRunId = await setupRun(
+        kernel,
+        flush,
+        eventSink,
+        "full-progress-test",
+        { value: "test" },
+      );
 
       // When: Execute
       await kernel.dispatch({
@@ -196,7 +218,13 @@ describe("I want to track stage progress", () => {
         .build();
 
       const { kernel, flush, eventSink } = createTestKernel([workflow]);
-      const workflowRunId = await setupRun(kernel, flush, eventSink, "multi-progress-test", { value: "test" });
+      const workflowRunId = await setupRun(
+        kernel,
+        flush,
+        eventSink,
+        "multi-progress-test",
+        { value: "test" },
+      );
 
       // When: Execute
       await kernel.dispatch({
@@ -249,7 +277,13 @@ describe("I want to track stage progress", () => {
         .build();
 
       const { kernel, flush, eventSink } = createTestKernel([workflow]);
-      const workflowRunId = await setupRun(kernel, flush, eventSink, "ordered-progress-test", { value: "test" });
+      const workflowRunId = await setupRun(
+        kernel,
+        flush,
+        eventSink,
+        "ordered-progress-test",
+        { value: "test" },
+      );
 
       // When: Execute
       await kernel.dispatch({
@@ -311,7 +345,13 @@ describe("I want to track stage progress", () => {
         .build();
 
       const { kernel, flush, eventSink } = createTestKernel([workflow]);
-      const workflowRunId = await setupRun(kernel, flush, eventSink, "multi-stage-progress-test", { value: "test" });
+      const workflowRunId = await setupRun(
+        kernel,
+        flush,
+        eventSink,
+        "multi-stage-progress-test",
+        { value: "test" },
+      );
 
       // When: Execute both stages
       await kernel.dispatch({
@@ -372,7 +412,13 @@ describe("I want to track stage progress", () => {
         .build();
 
       const { kernel, flush, eventSink } = createTestKernel([workflow]);
-      const workflowRunId = await setupRun(kernel, flush, eventSink, "details-progress-test", { value: "test" });
+      const workflowRunId = await setupRun(
+        kernel,
+        flush,
+        eventSink,
+        "details-progress-test",
+        { value: "test" },
+      );
 
       // When: Execute
       await kernel.dispatch({
@@ -389,7 +435,10 @@ describe("I want to track stage progress", () => {
       expect(progressEvents).toHaveLength(1);
       expect(progressEvents[0]!.progress).toBe(50);
       expect(progressEvents[0]!.message).toBe("processing");
-      expect(progressEvents[0]!.details).toEqual({ itemsProcessed: 50, totalItems: 100 });
+      expect(progressEvents[0]!.details).toEqual({
+        itemsProcessed: 50,
+        totalItems: 100,
+      });
     });
 
     it("should handle progress without details", async () => {
@@ -419,7 +468,13 @@ describe("I want to track stage progress", () => {
         .build();
 
       const { kernel, flush, eventSink } = createTestKernel([workflow]);
-      const workflowRunId = await setupRun(kernel, flush, eventSink, "simple-progress-test", { value: "test" });
+      const workflowRunId = await setupRun(
+        kernel,
+        flush,
+        eventSink,
+        "simple-progress-test",
+        { value: "test" },
+      );
 
       // When: Execute
       await kernel.dispatch({
@@ -472,7 +527,13 @@ describe("I want to track stage progress", () => {
         .build();
 
       const { kernel, flush, eventSink } = createTestKernel([workflow]);
-      const workflowRunId = await setupRun(kernel, flush, eventSink, "nested-details-test", { value: "test" });
+      const workflowRunId = await setupRun(
+        kernel,
+        flush,
+        eventSink,
+        "nested-details-test",
+        { value: "test" },
+      );
 
       // When: Execute
       await kernel.dispatch({

@@ -5,7 +5,7 @@
  */
 
 import type { RunCreateCommand, RunCreateResult } from "../commands";
-import type { KernelDeps, HandlerResult } from "../kernel";
+import type { HandlerResult, KernelDeps } from "../kernel";
 
 export async function handleRunCreate(
   command: RunCreateCommand,
@@ -14,9 +14,7 @@ export async function handleRunCreate(
   // 1. Get workflow from registry
   const workflow = deps.registry.getWorkflow(command.workflowId);
   if (!workflow) {
-    throw new Error(
-      `Workflow ${command.workflowId} not found in registry`,
-    );
+    throw new Error(`Workflow ${command.workflowId} not found in registry`);
   }
 
   // 2. Validate input against workflow's input schema

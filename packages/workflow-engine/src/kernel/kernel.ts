@@ -11,41 +11,41 @@
  */
 
 import type { Workflow } from "../core/workflow";
+import type { CreateOutboxEventInput } from "../persistence/interface";
 import type {
-  KernelCommand,
   CommandResult,
-  RunCreateCommand,
-  RunClaimPendingCommand,
-  RunTransitionCommand,
-  RunCancelCommand,
-  RunRerunFromCommand,
   JobExecuteCommand,
-  StagePollSuspendedCommand,
+  KernelCommand,
   LeaseReapStaleCommand,
   OutboxFlushCommand,
   PluginReplayDLQCommand,
+  RunCancelCommand,
+  RunClaimPendingCommand,
+  RunCreateCommand,
+  RunRerunFromCommand,
+  RunTransitionCommand,
+  StagePollSuspendedCommand,
 } from "./commands";
-import type {
-  Persistence,
-  BlobStore,
-  JobTransport,
-  EventSink,
-  Scheduler,
-  Clock,
-} from "./ports";
-import type { CreateOutboxEventInput } from "../persistence/interface";
+import { IdempotencyInProgressError } from "./errors";
 import type { KernelEvent } from "./events";
-import { handleRunCreate } from "./handlers/run-create";
-import { handleRunClaimPending } from "./handlers/run-claim-pending";
-import { handleRunTransition } from "./handlers/run-transition";
-import { handleRunCancel } from "./handlers/run-cancel";
-import { handleRunRerunFrom } from "./handlers/run-rerun-from";
 import { handleJobExecute } from "./handlers/job-execute";
-import { handleStagePollSuspended } from "./handlers/stage-poll-suspended";
 import { handleLeaseReapStale } from "./handlers/lease-reap-stale";
 import { handleOutboxFlush } from "./handlers/outbox-flush";
 import { handlePluginReplayDLQ } from "./handlers/plugin-replay-dlq";
-import { IdempotencyInProgressError } from "./errors";
+import { handleRunCancel } from "./handlers/run-cancel";
+import { handleRunClaimPending } from "./handlers/run-claim-pending";
+import { handleRunCreate } from "./handlers/run-create";
+import { handleRunRerunFrom } from "./handlers/run-rerun-from";
+import { handleRunTransition } from "./handlers/run-transition";
+import { handleStagePollSuspended } from "./handlers/stage-poll-suspended";
+import type {
+  BlobStore,
+  Clock,
+  EventSink,
+  JobTransport,
+  Persistence,
+  Scheduler,
+} from "./ports";
 
 // ============================================================================
 // Public interfaces
@@ -207,7 +207,10 @@ export function createKernel(config: KernelConfig): Kernel {
             );
             break;
           case "job.execute":
-            result = await handleJobExecute(command as JobExecuteCommand, txDeps);
+            result = await handleJobExecute(
+              command as JobExecuteCommand,
+              txDeps,
+            );
             break;
           case "stage.pollSuspended":
             result = await handleStagePollSuspended(
@@ -232,13 +235,15 @@ export function createKernel(config: KernelConfig): Kernel {
         const events = result._events as KernelEvent[];
         if (events.length > 0) {
           const causationId = idempotencyKey ?? crypto.randomUUID();
-          const outboxEvents: CreateOutboxEventInput[] = events.map((event) => ({
-            workflowRunId: event.workflowRunId,
-            eventType: event.type,
-            payload: event,
-            causationId,
-            occurredAt: event.timestamp,
-          }));
+          const outboxEvents: CreateOutboxEventInput[] = events.map(
+            (event) => ({
+              workflowRunId: event.workflowRunId,
+              eventType: event.type,
+              payload: event,
+              causationId,
+              occurredAt: event.timestamp,
+            }),
+          );
           await tx.appendOutboxEvents(outboxEvents);
         }
 

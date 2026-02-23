@@ -10,7 +10,7 @@
  * cron triggers) around these methods.
  */
 
-import type { Kernel, JobTransport } from "@bratsos/workflow-engine/kernel";
+import type { JobTransport, Kernel } from "@bratsos/workflow-engine/kernel";
 
 // ============================================================================
 // Public interfaces
@@ -144,9 +144,9 @@ class ServerlessHostImpl implements ServerlessHost {
     return { outcome: "failed", error: result.error };
   }
 
-  async processAvailableJobs(
-    opts?: { maxJobs?: number },
-  ): Promise<ProcessJobsResult> {
+  async processAvailableJobs(opts?: {
+    maxJobs?: number;
+  }): Promise<ProcessJobsResult> {
     const maxJobs = opts?.maxJobs ?? 1;
     let processed = 0;
     let succeeded = 0;

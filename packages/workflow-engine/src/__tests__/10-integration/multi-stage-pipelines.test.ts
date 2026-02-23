@@ -7,17 +7,17 @@
 
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
+import { defineStage } from "../../core/stage-factory.js";
+import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
 import { createKernel } from "../../kernel/kernel.js";
 import {
+  CollectingEventSink,
   FakeClock,
   InMemoryBlobStore,
-  CollectingEventSink,
   NoopScheduler,
 } from "../../kernel/testing/index.js";
-import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
-import { defineStage } from "../../core/stage-factory.js";
-import { WorkflowBuilder, type Workflow } from "../../core/workflow.js";
+import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 
 function createTestKernel(workflows: Workflow<any, any>[] = []) {
   const persistence = new InMemoryWorkflowPersistence();
@@ -29,11 +29,26 @@ function createTestKernel(workflows: Workflow<any, any>[] = []) {
   const registry = new Map<string, Workflow<any, any>>();
   for (const w of workflows) registry.set(w.id, w);
   const kernel = createKernel({
-    persistence, blobStore, jobTransport, eventSink, scheduler, clock,
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
     registry: { getWorkflow: (id) => registry.get(id) },
   });
   const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
-  return { kernel, flush, persistence, blobStore, jobTransport, eventSink, scheduler, clock, registry };
+  return {
+    kernel,
+    flush,
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry,
+  };
 }
 
 describe("I want to build multi-stage pipelines", () => {
@@ -292,7 +307,15 @@ describe("I want to build multi-stage pipelines", () => {
       });
       await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
 
-      const stageIds = ["fetch", "parse", "validate", "normalize", "enrich", "format", "publish"];
+      const stageIds = [
+        "fetch",
+        "parse",
+        "validate",
+        "normalize",
+        "enrich",
+        "format",
+        "publish",
+      ];
       for (const stageId of stageIds) {
         await kernel.dispatch({
           type: "job.execute",
@@ -335,7 +358,11 @@ describe("I want to build multi-stage pipelines", () => {
         defineStage({
           id,
           name: id,
-          schemas: { input: inputSchema, output: outputSchema, config: z.object({}) },
+          schemas: {
+            input: inputSchema,
+            output: outputSchema,
+            config: z.object({}),
+          },
           async execute(ctx) {
             // Advance the clock during execution so stage duration > 0
             clock.advance(500);
@@ -363,7 +390,12 @@ describe("I want to build multi-stage pipelines", () => {
       const registry = new Map<string, Workflow<any, any>>();
       registry.set(workflow.id, workflow);
       const kernel = createKernel({
-        persistence, blobStore, jobTransport, eventSink, scheduler, clock,
+        persistence,
+        blobStore,
+        jobTransport,
+        eventSink,
+        scheduler,
+        clock,
         registry: { getWorkflow: (id) => registry.get(id) },
       });
       const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
@@ -435,7 +467,9 @@ describe("I want to build multi-stage pipelines", () => {
         },
         async execute(ctx) {
           executionLog.push("parallel-1");
-          const seq1Output = ctx.workflowContext["seq-1"] as { prepared: string };
+          const seq1Output = ctx.workflowContext["seq-1"] as {
+            prepared: string;
+          };
           return { output: { result1: `P1:${seq1Output.prepared}` } };
         },
       });
@@ -450,7 +484,9 @@ describe("I want to build multi-stage pipelines", () => {
         },
         async execute(ctx) {
           executionLog.push("parallel-2");
-          const seq1Output = ctx.workflowContext["seq-1"] as { prepared: string };
+          const seq1Output = ctx.workflowContext["seq-1"] as {
+            prepared: string;
+          };
           return { output: { result2: `P2:${seq1Output.prepared}` } };
         },
       });
@@ -465,7 +501,9 @@ describe("I want to build multi-stage pipelines", () => {
         },
         async execute(ctx) {
           executionLog.push("parallel-3");
-          const seq1Output = ctx.workflowContext["seq-1"] as { prepared: string };
+          const seq1Output = ctx.workflowContext["seq-1"] as {
+            prepared: string;
+          };
           return { output: { result3: `P3:${seq1Output.prepared}` } };
         },
       });
@@ -773,7 +811,10 @@ describe("I want to build multi-stage pipelines", () => {
       await flush();
 
       // Then: Final result has all accumulated values
-      const lastStageOutput = (await persistence.getStage(workflowRunId, "stage-5"))!;
+      const lastStageOutput = (await persistence.getStage(
+        workflowRunId,
+        "stage-5",
+      ))!;
       expect(lastStageOutput.status).toBe("COMPLETED");
 
       // Verify via the last job.execute output
@@ -919,7 +960,9 @@ describe("I want to build multi-stage pipelines", () => {
         .pipe(finalStage)
         .build();
 
-      const { kernel, flush, persistence, blobStore } = createTestKernel([workflow]);
+      const { kernel, flush, persistence, blobStore } = createTestKernel([
+        workflow,
+      ]);
 
       // When: I execute with seed=5
       // init: 5*2=10
@@ -936,7 +979,14 @@ describe("I want to build multi-stage pipelines", () => {
       });
       await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
 
-      const stageIds = ["init", "step-2", "step-3", "step-4", "step-5", "finalize"];
+      const stageIds = [
+        "init",
+        "step-2",
+        "step-3",
+        "step-4",
+        "step-5",
+        "finalize",
+      ];
       for (const stageId of stageIds) {
         await kernel.dispatch({
           type: "job.execute",

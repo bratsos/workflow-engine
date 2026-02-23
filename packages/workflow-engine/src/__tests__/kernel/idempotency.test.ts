@@ -9,18 +9,18 @@
 
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { createKernel } from "../../kernel/kernel.js";
+import { defineStage } from "../../core/stage-factory.js";
+import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
 import { IdempotencyInProgressError } from "../../kernel/errors.js";
+import { createKernel } from "../../kernel/kernel.js";
 import {
+  CollectingEventSink,
   FakeClock,
   InMemoryBlobStore,
-  CollectingEventSink,
   NoopScheduler,
 } from "../../kernel/testing/index.js";
-import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
-import { defineStage } from "../../core/stage-factory.js";
-import { WorkflowBuilder, type Workflow } from "../../core/workflow.js";
+import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -69,7 +69,17 @@ function createTestKernel(workflows: Workflow<any, any>[] = []) {
   });
 
   const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
-  return { kernel, flush, persistence, blobStore, jobTransport, eventSink, scheduler, clock, registry };
+  return {
+    kernel,
+    flush,
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -130,17 +140,25 @@ describe("kernel: idempotency", () => {
     const stage = defineStage({
       id: "transform",
       name: "Transform",
-      schemas: { input: schema, output: z.object({ result: z.string() }), config: z.object({}) },
+      schemas: {
+        input: schema,
+        output: z.object({ result: z.string() }),
+        config: z.object({}),
+      },
       async execute(ctx) {
         return { output: { result: ctx.input.data.toUpperCase() } };
       },
     });
 
     const workflow = new WorkflowBuilder(
-      "test-workflow", "Test", "Test",
+      "test-workflow",
+      "Test",
+      "Test",
       schema,
       z.object({ result: z.string() }),
-    ).pipe(stage).build();
+    )
+      .pipe(stage)
+      .build();
 
     const { kernel, persistence, eventSink } = createTestKernel([workflow]);
 
@@ -151,7 +169,9 @@ describe("kernel: idempotency", () => {
       workflowId: "test-workflow",
       input: { data: "hello" },
     });
-    await persistence.updateRun(createResult.workflowRunId, { status: "RUNNING" });
+    await persistence.updateRun(createResult.workflowRunId, {
+      status: "RUNNING",
+    });
     eventSink.clear();
 
     // Execute with an idempotency key
@@ -187,7 +207,11 @@ describe("kernel: idempotency", () => {
     const stage = defineStage({
       id: "counting",
       name: "Counting",
-      schemas: { input: schema, output: z.object({ count: z.number() }), config: z.object({}) },
+      schemas: {
+        input: schema,
+        output: z.object({ count: z.number() }),
+        config: z.object({}),
+      },
       async execute() {
         executionCount++;
         return { output: { count: executionCount } };
@@ -195,10 +219,14 @@ describe("kernel: idempotency", () => {
     });
 
     const workflow = new WorkflowBuilder(
-      "test-workflow", "Test", "Test",
+      "test-workflow",
+      "Test",
+      "Test",
       schema,
       z.object({ count: z.number() }),
-    ).pipe(stage).build();
+    )
+      .pipe(stage)
+      .build();
 
     const { kernel, persistence, eventSink } = createTestKernel([workflow]);
 
@@ -208,7 +236,9 @@ describe("kernel: idempotency", () => {
       workflowId: "test-workflow",
       input: { data: "hello" },
     });
-    await persistence.updateRun(createResult.workflowRunId, { status: "RUNNING" });
+    await persistence.updateRun(createResult.workflowRunId, {
+      status: "RUNNING",
+    });
     eventSink.clear();
 
     // First execution (no idempotency key)
@@ -245,17 +275,25 @@ describe("kernel: idempotency", () => {
     const stage = defineStage({
       id: "transform",
       name: "Transform",
-      schemas: { input: schema, output: z.object({ result: z.string() }), config: z.object({}) },
+      schemas: {
+        input: schema,
+        output: z.object({ result: z.string() }),
+        config: z.object({}),
+      },
       async execute(ctx) {
         return { output: { result: ctx.input.data.toUpperCase() } };
       },
     });
 
     const workflow = new WorkflowBuilder(
-      "test-workflow", "Test", "Test",
+      "test-workflow",
+      "Test",
+      "Test",
       schema,
       z.object({ result: z.string() }),
-    ).pipe(stage).build();
+    )
+      .pipe(stage)
+      .build();
 
     const { kernel, persistence, eventSink } = createTestKernel([workflow]);
 
@@ -269,7 +307,9 @@ describe("kernel: idempotency", () => {
     expect(createResult.workflowRunId).toBeDefined();
 
     // Set up the run for job execution
-    await persistence.updateRun(createResult.workflowRunId, { status: "RUNNING" });
+    await persistence.updateRun(createResult.workflowRunId, {
+      status: "RUNNING",
+    });
     eventSink.clear();
 
     // Dispatch job.execute with the SAME key "shared-key"

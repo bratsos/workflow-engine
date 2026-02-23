@@ -7,17 +7,17 @@
 
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
+import { defineStage } from "../../core/stage-factory.js";
+import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
 import { createKernel } from "../../kernel/kernel.js";
 import {
+  CollectingEventSink,
   FakeClock,
   InMemoryBlobStore,
-  CollectingEventSink,
   NoopScheduler,
 } from "../../kernel/testing/index.js";
-import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
-import { defineStage } from "../../core/stage-factory.js";
-import { WorkflowBuilder, type Workflow } from "../../core/workflow.js";
+import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 
 function createPassthroughStage(id: string, schema: z.ZodTypeAny) {
   return defineStage({
@@ -51,7 +51,17 @@ function createTestKernel(workflows: Workflow<any, any>[] = []) {
     registry: { getWorkflow: (id) => registry.get(id) },
   });
   const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
-  return { kernel, flush, persistence, blobStore, jobTransport, eventSink, scheduler, clock, registry };
+  return {
+    kernel,
+    flush,
+    persistence,
+    blobStore,
+    jobTransport,
+    eventSink,
+    scheduler,
+    clock,
+    registry,
+  };
 }
 
 describe("I want orchestrator to manage workflow state", () => {
@@ -70,7 +80,10 @@ describe("I want orchestrator to manage workflow state", () => {
     });
 
     it("should validate input against workflow schema", async () => {
-      const stage = createPassthroughStage("process", z.object({ requiredField: z.string() }));
+      const stage = createPassthroughStage(
+        "process",
+        z.object({ requiredField: z.string() }),
+      );
       const workflow = new WorkflowBuilder(
         "validated-workflow",
         "Validated Workflow",
@@ -203,7 +216,9 @@ describe("I want orchestrator to manage workflow state", () => {
         .pipe(stage2)
         .build();
 
-      const { kernel, persistence, jobTransport } = createTestKernel([workflow]);
+      const { kernel, persistence, jobTransport } = createTestKernel([
+        workflow,
+      ]);
 
       const { workflowRunId } = await kernel.dispatch({
         type: "run.create",
@@ -362,7 +377,9 @@ describe("I want orchestrator to manage workflow state", () => {
         .parallel([stageA, stageB])
         .build();
 
-      const { kernel, persistence, jobTransport } = createTestKernel([workflow]);
+      const { kernel, persistence, jobTransport } = createTestKernel([
+        workflow,
+      ]);
 
       const { workflowRunId } = await kernel.dispatch({
         type: "run.create",
@@ -409,7 +426,9 @@ describe("I want orchestrator to manage workflow state", () => {
       });
 
       const suspendedStages = await persistence.getSuspendedStages(new Date());
-      const uniqueStageIds = [...new Set(suspendedStages.map((s) => s.stageId))];
+      const uniqueStageIds = [
+        ...new Set(suspendedStages.map((s) => s.stageId)),
+      ];
       expect(uniqueStageIds).toHaveLength(1);
       expect(uniqueStageIds[0]).toBe("suspended-stage");
     });

@@ -7,10 +7,10 @@
 
 export {
   createServerlessHost,
-  type ServerlessHost,
-  type ServerlessHostConfig,
   type JobMessage,
   type JobResult,
-  type ProcessJobsResult,
   type MaintenanceTickResult,
+  type ProcessJobsResult,
+  type ServerlessHost,
+  type ServerlessHostConfig,
 } from "./host.js";

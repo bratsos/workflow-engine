@@ -13,9 +13,9 @@
  * This handler returns _events: [] — it does NOT produce new outbox events.
  */
 
-import type { KernelEvent } from "../events";
 import type { OutboxFlushCommand, OutboxFlushResult } from "../commands";
-import type { KernelDeps, HandlerResult } from "../kernel";
+import type { KernelEvent } from "../events";
+import type { HandlerResult, KernelDeps } from "../kernel";
 import type { PluginRunner } from "../plugins";
 
 export async function handleOutboxFlush(
