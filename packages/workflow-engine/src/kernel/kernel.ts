@@ -177,10 +177,7 @@ export function createKernel(config: KernelConfig): Kernel {
           return acquired.result as CommandResult<T>;
         }
         if (acquired.status === "in_progress") {
-          throw new IdempotencyInProgressError(
-            jobIdempotencyKey,
-            command.type,
-          );
+          throw new IdempotencyInProgressError(jobIdempotencyKey, command.type);
         }
         jobIdempotencyAcquired = true;
       }

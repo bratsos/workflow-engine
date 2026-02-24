@@ -211,11 +211,7 @@ export async function handleJobExecute(
       },
       onLog: logFn,
       log: logFn,
-      storage: createStorageShim(
-        workflowRunId,
-        workflowRun.workflowType,
-        deps,
-      ),
+      storage: createStorageShim(workflowRunId, workflowRun.workflowType, deps),
       workflowContext,
     };
 
