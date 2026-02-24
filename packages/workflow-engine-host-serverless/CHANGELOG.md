@@ -1,5 +1,11 @@
 # @bratsos/workflow-engine-host-serverless
 
+## 0.2.2
+
+### Patch Changes
+
+- d824b47: Fix publishing for host packages to npm registry
+
 ## 0.2.1
 
 ### Patch Changes
