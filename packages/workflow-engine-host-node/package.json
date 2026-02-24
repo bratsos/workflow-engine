@@ -1,6 +1,6 @@
 {
   "name": "@bratsos/workflow-engine-host-node",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Node.js host for @bratsos/workflow-engine command kernel",
   "type": "module",
   "license": "MIT",
