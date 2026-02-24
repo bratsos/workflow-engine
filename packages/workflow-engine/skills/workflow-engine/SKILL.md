@@ -122,7 +122,7 @@ All operations go through `kernel.dispatch(command)`:
 | `run.transition` | Advance to next stage group or complete |
 | `run.cancel` | Cancel a running workflow |
 | `run.rerunFrom` | Rerun from a specific stage |
-| `job.execute` | Execute a single stage |
+| `job.execute` | Execute a single stage (uses multi-phase transactions; see 08-common-patterns.md) |
 | `stage.pollSuspended` | Poll suspended stages for readiness (returns `resumedWorkflowRunIds`) |
 | `lease.reapStale` | Release stale job leases |
 | `outbox.flush` | Publish pending outbox events |
@@ -420,6 +420,6 @@ await kernel.dispatch({ type: "run.transition", workflowRunId: job.workflowRunId
 2. **Command Kernel**: All operations are typed commands dispatched through `kernel.dispatch()`
 3. **Environment-Agnostic**: Kernel has no timers, no signals, no global state
 4. **Context Access**: Use `ctx.require()` and `ctx.optional()` for type-safe stage output access
-5. **Transactional Outbox**: Events written to outbox, published via `outbox.flush` command
+5. **Transactional Outbox**: Events written to outbox, published via `outbox.flush` command. `job.execute` uses multi-phase transactions to avoid holding connections during long-running stage execution
 6. **Idempotency**: `run.create` and `job.execute` replay cached results by key; concurrent same-key dispatch throws `IdempotencyInProgressError`
 7. **Cost Tracking**: All AI calls automatically track tokens and costs

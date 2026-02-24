@@ -301,6 +301,133 @@ describe("kernel: job.execute", () => {
     ).rejects.toThrow("not found in registry");
   });
 
+  it("stage is visible as RUNNING during execution", async () => {
+    const schema = z.object({ data: z.string() });
+    let observedStatus: string | undefined;
+    let startedEventCount = 0;
+
+    const stage = defineStage({
+      id: "observable",
+      name: "Observable",
+      schemas: {
+        input: schema,
+        output: schema,
+        config: z.object({}),
+      },
+      async execute(ctx) {
+        // During execution (Phase 2), the RUNNING status should
+        // already be committed from Phase 1.
+        const stages = await persistence.getStagesByRun(ctx.workflowRunId);
+        observedStatus = stages[0]?.status;
+
+        // The stage:started outbox event should also be committed.
+        const outbox = await persistence.getUnpublishedOutboxEvents(100);
+        startedEventCount = outbox.filter(
+          (e) => e.eventType === "stage:started",
+        ).length;
+
+        return { output: ctx.input };
+      },
+    });
+
+    const workflow = new WorkflowBuilder(
+      "test-workflow",
+      "Test",
+      "Test",
+      schema,
+      schema,
+    )
+      .pipe(stage)
+      .build();
+
+    const { kernel, persistence } = createTestKernel([workflow]);
+
+    const createResult = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "key-observable",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+
+    await persistence.updateRun(createResult.workflowRunId, {
+      status: "RUNNING",
+    });
+
+    const result = await kernel.dispatch({
+      type: "job.execute",
+      workflowRunId: createResult.workflowRunId,
+      workflowId: "test-workflow",
+      stageId: "observable",
+      config: {},
+    });
+
+    expect(result.outcome).toBe("completed");
+    expect(observedStatus).toBe("RUNNING");
+    expect(startedEventCount).toBe(1);
+  });
+
+  it("progress events are written to outbox with completion event", async () => {
+    const schema = z.object({ data: z.string() });
+    const stage = defineStage({
+      id: "progress-stage",
+      name: "Progress Stage",
+      schemas: {
+        input: schema,
+        output: schema,
+        config: z.object({}),
+      },
+      async execute(ctx) {
+        ctx.onProgress({ progress: 50, message: "halfway" });
+        ctx.onProgress({ progress: 100, message: "done" });
+        return { output: ctx.input };
+      },
+    });
+
+    const workflow = new WorkflowBuilder(
+      "test-workflow",
+      "Test",
+      "Test",
+      schema,
+      schema,
+    )
+      .pipe(stage)
+      .build();
+
+    const { kernel, flush, persistence, eventSink } = createTestKernel([
+      workflow,
+    ]);
+
+    const createResult = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "key-progress",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+
+    await persistence.updateRun(createResult.workflowRunId, {
+      status: "RUNNING",
+    });
+    await flush();
+    eventSink.clear();
+
+    const result = await kernel.dispatch({
+      type: "job.execute",
+      workflowRunId: createResult.workflowRunId,
+      workflowId: "test-workflow",
+      stageId: "progress-stage",
+      config: {},
+    });
+
+    expect(result.outcome).toBe("completed");
+
+    // Flush and verify all events are published
+    await flush();
+    const progressEvents = eventSink.getByType("stage:progress");
+    expect(progressEvents).toHaveLength(2);
+    const completedEvents = eventSink.getByType("stage:completed");
+    expect(completedEvents).toHaveLength(1);
+  });
+
   it("validates input against stage schema", async () => {
     const inputSchema = z.object({ number: z.number() });
     const stage = defineStage({
