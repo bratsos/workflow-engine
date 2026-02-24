@@ -29,6 +29,9 @@ jobs:
       - name: Lint
         run: pnpm biome check .
 
+      - name: Build
+        run: pnpm build
+
       - name: Type check
         run: pnpm typecheck
 
@@ -36,6 +39,3 @@ jobs:
         run: pnpm test
         env:
           NODE_ENV: test
-
-      - name: Build
-        run: pnpm build
