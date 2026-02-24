@@ -642,7 +642,7 @@ async execute(ctx) {
 | `run.transition` | Advance to next stage group | `workflowRunId` |
 | `run.cancel` | Cancel a running workflow | `workflowRunId`, `reason?` |
 | `run.rerunFrom` | Rerun from a specific stage | `workflowRunId`, `fromStageId` |
-| `job.execute` | Execute a single stage | `idempotencyKey?`, `workflowRunId`, `workflowId`, `stageId`, `config` |
+| `job.execute` | Execute a single stage (multi-phase transactions) | `idempotencyKey?`, `workflowRunId`, `workflowId`, `stageId`, `config` |
 | `stage.pollSuspended` | Poll suspended stages | `maxChecks?` (returns `resumedWorkflowRunIds`) |
 | `lease.reapStale` | Release stale job leases | `staleThresholdMs` |
 | `outbox.flush` | Publish pending events | `maxEvents?` |
@@ -651,6 +651,10 @@ async execute(ctx) {
 Idempotency behavior:
 - Replaying the same `idempotencyKey` returns cached results.
 - If the same key is already executing, dispatch throws `IdempotencyInProgressError`.
+
+Transaction behavior:
+- Most commands execute inside a single database transaction (handler + outbox events).
+- `job.execute` uses multi-phase transactions: Phase 1 commits `RUNNING` status immediately, Phase 2 runs `stageDef.execute()` outside any transaction, Phase 3 commits the final status. This avoids holding a database connection during long-running stage execution.
 
 ### Node Host Config
 

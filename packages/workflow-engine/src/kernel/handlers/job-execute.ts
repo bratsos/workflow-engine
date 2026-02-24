@@ -1,18 +1,32 @@
 /**
  * Handler: job.execute
  *
- * Executes a single stage within a workflow run. This is the most complex
- * handler in the kernel -- it resolves input, builds the stage context,
- * runs the stage's execute() function, and handles completed / suspended /
- * failed outcomes.
+ * Executes a single stage within a workflow run using a multi-phase
+ * transaction pattern:
  *
- * Extracted from StageExecutor.execute().
+ *   Phase 1 (Start):   upsert stage to RUNNING + write stage:started
+ *                       outbox event in one transaction. Commits
+ *                       immediately so RUNNING is visible.
+ *
+ *   Phase 2 (Execute):  run stageDef.execute() outside any database
+ *                       transaction. Progress events are collected
+ *                       in memory.
+ *
+ *   Phase 3 (Complete): update stage to COMPLETED/SUSPENDED/FAILED +
+ *                       write completion outbox event (and progress
+ *                       events) in one transaction.
+ *
+ * This avoids holding a database transaction open for the duration of
+ * potentially long-running stage execution (AI calls, HTTP requests,
+ * etc.).  If the process crashes between Phase 1 and Phase 3, the
+ * stage stays RUNNING and lease.reapStale will retry the job.
  */
 
 import type { StageContext } from "../../core/stage";
 import type { ProgressUpdate } from "../../core/types";
 import { isSuspendedResult } from "../../core/types";
 import type { Workflow } from "../../core/workflow";
+import type { CreateOutboxEventInput } from "../../persistence/interface";
 import type { JobExecuteCommand, JobExecuteResult } from "../commands";
 import type { KernelEvent } from "../events";
 import {
@@ -45,6 +59,24 @@ function resolveStageInput(
 }
 
 // ---------------------------------------------------------------------------
+// Helper: build outbox event inputs from kernel events
+// ---------------------------------------------------------------------------
+
+function toOutboxEvents(
+  workflowRunId: string,
+  causationId: string,
+  events: KernelEvent[],
+): CreateOutboxEventInput[] {
+  return events.map((event) => ({
+    workflowRunId,
+    eventType: event.type,
+    payload: event,
+    causationId,
+    occurredAt: event.timestamp,
+  }));
+}
+
+// ---------------------------------------------------------------------------
 // Handler
 // ---------------------------------------------------------------------------
 
@@ -53,10 +85,12 @@ export async function handleJobExecute(
   deps: KernelDeps,
 ): Promise<HandlerResult<JobExecuteResult>> {
   const { workflowRunId, workflowId, stageId, config } = command;
-  const events: KernelEvent[] = [];
   const startTime = deps.clock.now().getTime();
+  const causationId = command.idempotencyKey ?? crypto.randomUUID();
 
-  // 1. Get workflow and stage definition
+  // ── Pre-flight (no transaction) ──────────────────────────────────
+  // Read-only lookups: workflow def, stage def, run record, context.
+
   const workflow = deps.registry.getWorkflow(workflowId);
   if (!workflow)
     throw new Error(`Workflow ${workflowId} not found in registry`);
@@ -65,45 +99,60 @@ export async function handleJobExecute(
   if (!stageDef)
     throw new Error(`Stage ${stageId} not found in workflow ${workflowId}`);
 
-  // 2. Get workflow run
   const workflowRun = await deps.persistence.getRun(workflowRunId);
   if (!workflowRun) throw new Error(`WorkflowRun ${workflowRunId} not found`);
 
-  // 3. Load workflow context
   const workflowContext = await loadWorkflowContext(workflowRunId, deps);
 
-  // 4. Upsert stage record
-  const stageRecord = await deps.persistence.upsertStage({
-    workflowRunId,
-    stageId,
-    create: {
+  // ── Phase 1: Start transaction ───────────────────────────────────
+  // Upsert stage to RUNNING and write stage:started outbox event.
+  // Commits immediately so RUNNING status is visible to observers.
+
+  const stageRecord = await deps.persistence.withTransaction(async (tx) => {
+    const record = await tx.upsertStage({
       workflowRunId,
       stageId,
-      stageName: stageDef.name,
-      stageNumber: workflow.getStageIndex(stageId) + 1,
-      executionGroup: workflow.getExecutionGroupIndex(stageId),
-      status: "RUNNING",
-      startedAt: deps.clock.now(),
-      config: config as any,
-    },
-    update: {
-      status: "RUNNING",
-      startedAt: deps.clock.now(),
-    },
+      create: {
+        workflowRunId,
+        stageId,
+        stageName: stageDef.name,
+        stageNumber: workflow.getStageIndex(stageId) + 1,
+        executionGroup: workflow.getExecutionGroupIndex(stageId),
+        status: "RUNNING",
+        startedAt: deps.clock.now(),
+        config: config as any,
+      },
+      update: {
+        status: "RUNNING",
+        startedAt: deps.clock.now(),
+      },
+    });
+
+    await tx.appendOutboxEvents(
+      toOutboxEvents(workflowRunId, causationId, [
+        {
+          type: "stage:started",
+          timestamp: deps.clock.now(),
+          workflowRunId,
+          stageId,
+          stageName: stageDef.name,
+          stageNumber: record.stageNumber,
+        },
+      ]),
+    );
+
+    return record;
   });
 
-  // 5. Emit stage:started
-  events.push({
-    type: "stage:started",
-    timestamp: deps.clock.now(),
-    workflowRunId,
-    stageId,
-    stageName: stageDef.name,
-    stageNumber: stageRecord.stageNumber,
-  });
+  // ── Phase 2: Execute (no transaction) ────────────────────────────
+  // The stage's execute() function runs outside any database
+  // transaction.  Progress events are collected in memory and
+  // written to the outbox in Phase 3.
+
+  const progressEvents: KernelEvent[] = [];
 
   try {
-    // 6. Resolve and validate input
+    // Resolve and validate input
     const rawInput = resolveStageInput(
       workflow,
       stageId,
@@ -112,7 +161,7 @@ export async function handleJobExecute(
     );
     const validatedInput = stageDef.inputSchema.parse(rawInput);
 
-    // 7. Parse config
+    // Parse config
     let stageConfig = (config as any)[stageId] || {};
     try {
       if (stageDef.configSchema) {
@@ -122,7 +171,7 @@ export async function handleJobExecute(
       // Fall back to raw config on parse failure
     }
 
-    // 8. Build log function
+    // Build log function (fire-and-forget, no transaction needed)
     const logFn = async (
       level: any,
       message: string,
@@ -139,7 +188,7 @@ export async function handleJobExecute(
         .catch(() => {});
     };
 
-    // 9. Build context
+    // Build context
     const context: StageContext<any, any, any> = {
       workflowRunId,
       stageId,
@@ -150,7 +199,7 @@ export async function handleJobExecute(
       config: stageConfig,
       resumeState: stageRecord.suspendedState as any,
       onProgress: (update: ProgressUpdate) => {
-        events.push({
+        progressEvents.push({
           type: "stage:progress",
           timestamp: deps.clock.now(),
           workflowRunId,
@@ -162,14 +211,18 @@ export async function handleJobExecute(
       },
       onLog: logFn,
       log: logFn,
-      storage: createStorageShim(workflowRunId, workflowRun.workflowType, deps),
+      storage: createStorageShim(
+        workflowRunId,
+        workflowRun.workflowType,
+        deps,
+      ),
       workflowContext,
     };
 
-    // 10. Execute
+    // Execute the stage — this is the potentially long-running part
     const result = await stageDef.execute(context);
 
-    // 11. Handle result
+    // ── Phase 3a: Complete transaction (success) ─────────────────
     if (isSuspendedResult(result)) {
       const { state, pollConfig, metrics } = result;
       const nextPollAt = new Date(
@@ -177,31 +230,40 @@ export async function handleJobExecute(
           deps.clock.now().getTime() + (pollConfig.pollInterval || 60000),
       );
 
-      await deps.persistence.updateStage(stageRecord.id, {
-        status: "SUSPENDED",
-        suspendedState: state as any,
-        nextPollAt,
-        pollInterval: pollConfig.pollInterval,
-        maxWaitUntil: pollConfig.maxWaitTime
-          ? new Date(deps.clock.now().getTime() + pollConfig.maxWaitTime)
-          : undefined,
-        metrics: metrics as any,
+      await deps.persistence.withTransaction(async (tx) => {
+        await tx.updateStage(stageRecord.id, {
+          status: "SUSPENDED",
+          suspendedState: state as any,
+          nextPollAt,
+          pollInterval: pollConfig.pollInterval,
+          maxWaitUntil: pollConfig.maxWaitTime
+            ? new Date(deps.clock.now().getTime() + pollConfig.maxWaitTime)
+            : undefined,
+          metrics: metrics as any,
+        });
+
+        const suspendedEvent: KernelEvent = {
+          type: "stage:suspended",
+          timestamp: deps.clock.now(),
+          workflowRunId,
+          stageId,
+          stageName: stageDef.name,
+          nextPollAt,
+        };
+
+        await tx.appendOutboxEvents(
+          toOutboxEvents(workflowRunId, causationId, [
+            ...progressEvents,
+            suspendedEvent,
+          ]),
+        );
       });
 
-      events.push({
-        type: "stage:suspended",
-        timestamp: deps.clock.now(),
-        workflowRunId,
-        stageId,
-        stageName: stageDef.name,
-        nextPollAt,
-      });
-
-      return { outcome: "suspended" as const, nextPollAt, _events: events };
+      return { outcome: "suspended" as const, nextPollAt, _events: [] };
     } else {
       const duration = deps.clock.now().getTime() - startTime;
 
-      // Save output
+      // Save output to blob store (not a DB operation)
       const outputKey = await saveStageOutput(
         workflowRunId,
         workflowRun.workflowType,
@@ -210,40 +272,78 @@ export async function handleJobExecute(
         deps,
       );
 
-      await deps.persistence.updateStage(stageRecord.id, {
-        status: "COMPLETED",
-        completedAt: deps.clock.now(),
-        duration,
-        outputData: { _artifactKey: outputKey } as any,
-        metrics: result.metrics as any,
-        embeddingInfo: result.embeddings as any,
-      });
+      await deps.persistence.withTransaction(async (tx) => {
+        await tx.updateStage(stageRecord.id, {
+          status: "COMPLETED",
+          completedAt: deps.clock.now(),
+          duration,
+          outputData: { _artifactKey: outputKey } as any,
+          metrics: result.metrics as any,
+          embeddingInfo: result.embeddings as any,
+        });
 
-      events.push({
-        type: "stage:completed",
-        timestamp: deps.clock.now(),
-        workflowRunId,
-        stageId,
-        stageName: stageDef.name,
-        duration,
+        const completedEvent: KernelEvent = {
+          type: "stage:completed",
+          timestamp: deps.clock.now(),
+          workflowRunId,
+          stageId,
+          stageName: stageDef.name,
+          duration,
+        };
+
+        await tx.appendOutboxEvents(
+          toOutboxEvents(workflowRunId, causationId, [
+            ...progressEvents,
+            completedEvent,
+          ]),
+        );
       });
 
       return {
         outcome: "completed" as const,
         output: result.output,
-        _events: events,
+        _events: [],
       };
     }
   } catch (error) {
+    // ── Phase 3b: Complete transaction (failure) ─────────────────
+    // The stage's execute() threw. Write FAILED status + outbox
+    // event.  If Phase 3 itself fails, re-throw the original error
+    // so the idempotency key is released and the job can be retried.
     const errorMessage = error instanceof Error ? error.message : String(error);
     const duration = deps.clock.now().getTime() - startTime;
 
-    await deps.persistence.updateStage(stageRecord.id, {
-      status: "FAILED",
-      completedAt: deps.clock.now(),
-      duration,
-      errorMessage,
-    });
+    try {
+      await deps.persistence.withTransaction(async (tx) => {
+        await tx.updateStage(stageRecord.id, {
+          status: "FAILED",
+          completedAt: deps.clock.now(),
+          duration,
+          errorMessage,
+        });
+
+        const failedEvent: KernelEvent = {
+          type: "stage:failed",
+          timestamp: deps.clock.now(),
+          workflowRunId,
+          stageId,
+          stageName: stageDef.name,
+          error: errorMessage,
+        };
+
+        await tx.appendOutboxEvents(
+          toOutboxEvents(workflowRunId, causationId, [
+            ...progressEvents,
+            failedEvent,
+          ]),
+        );
+      });
+    } catch {
+      // Phase 3 itself failed. Stage stays RUNNING.
+      // Re-throw the original error so the idempotency key is
+      // released and lease.reapStale can retry the job.
+      throw error;
+    }
 
     await deps.persistence
       .createLog({
@@ -254,15 +354,6 @@ export async function handleJobExecute(
       })
       .catch(() => {});
 
-    events.push({
-      type: "stage:failed",
-      timestamp: deps.clock.now(),
-      workflowRunId,
-      stageId,
-      stageName: stageDef.name,
-      error: errorMessage,
-    });
-
-    return { outcome: "failed" as const, error: errorMessage, _events: events };
+    return { outcome: "failed" as const, error: errorMessage, _events: [] };
   }
 }

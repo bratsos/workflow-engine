@@ -6,6 +6,12 @@
  * transactional outbox (not emitted directly). Use the `outbox.flush`
  * command to publish pending outbox events through EventSink.
  *
+ * Most commands execute inside a single database transaction (handler
+ * logic + outbox event writes). `job.execute` is the exception — it
+ * uses a multi-phase transaction pattern so that long-running stage
+ * execution does not hold a database connection open. See the handler
+ * in `handlers/job-execute.ts` for details.
+ *
  * Commands with idempotency keys are deduplicated: a replay returns the
  * cached result without re-executing the handler.
  */
@@ -153,6 +159,56 @@ export function createKernel(config: KernelConfig): Kernel {
     }
 
     // -----------------------------------------------------------------
+    // job.execute manages its own multi-phase transactions so that
+    // RUNNING status is visible immediately and long-running stage
+    // execution does not hold a database transaction open.
+    // -----------------------------------------------------------------
+    if (command.type === "job.execute") {
+      const jobCommand = command as JobExecuteCommand;
+      const jobIdempotencyKey = jobCommand.idempotencyKey;
+      let jobIdempotencyAcquired = false;
+
+      if (jobIdempotencyKey) {
+        const acquired = await persistence.acquireIdempotencyKey(
+          jobIdempotencyKey,
+          command.type,
+        );
+        if (acquired.status === "replay") {
+          return acquired.result as CommandResult<T>;
+        }
+        if (acquired.status === "in_progress") {
+          throw new IdempotencyInProgressError(
+            jobIdempotencyKey,
+            command.type,
+          );
+        }
+        jobIdempotencyAcquired = true;
+      }
+
+      try {
+        const result = await handleJobExecute(jobCommand, deps);
+        const { _events: _, ...publicResult } = result;
+
+        if (jobIdempotencyKey && jobIdempotencyAcquired) {
+          await persistence.completeIdempotencyKey(
+            jobIdempotencyKey,
+            command.type,
+            publicResult,
+          );
+        }
+
+        return publicResult as CommandResult<T>;
+      } catch (error) {
+        if (jobIdempotencyKey && jobIdempotencyAcquired) {
+          await persistence
+            .releaseIdempotencyKey(jobIdempotencyKey, command.type)
+            .catch(() => {});
+        }
+        throw error;
+      }
+    }
+
+    // -----------------------------------------------------------------
     // Idempotency acquisition
     // -----------------------------------------------------------------
     const idempotencyKey = getIdempotencyKey(command);
@@ -203,12 +259,6 @@ export function createKernel(config: KernelConfig): Kernel {
           case "run.rerunFrom":
             result = await handleRunRerunFrom(
               command as RunRerunFromCommand,
-              txDeps,
-            );
-            break;
-          case "job.execute":
-            result = await handleJobExecute(
-              command as JobExecuteCommand,
               txDeps,
             );
             break;
