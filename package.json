@@ -4,9 +4,9 @@
   "private": true,
   "description": "Type-safe, distributed workflow engine for AI-orchestrated processes",
   "scripts": {
-    "test": "cd packages/workflow-engine && pnpm test",
-    "build": "cd packages/workflow-engine && pnpm build",
-    "typecheck": "cd packages/workflow-engine && pnpm tsc --noEmit",
+    "test": "pnpm -r test",
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
     "check": "pnpm biome check .",
     "check:fix": "pnpm biome check --write .",
     "format": "pnpm biome format .",
@@ -16,7 +16,7 @@
     "ci": "pnpm lint && pnpm typecheck && pnpm test && pnpm build",
     "changeset": "changeset",
     "version": "changeset version",
-    "release": "pnpm build && cd packages/workflow-engine && npm publish --access public --provenance"
+    "release": "pnpm build && changeset publish"
   },
   "keywords": [],
   "author": "Alex Bratsos",
