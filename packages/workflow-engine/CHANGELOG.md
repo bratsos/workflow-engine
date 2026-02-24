@@ -1,5 +1,11 @@
 # @bratsos/workflow-engine
 
+## 0.2.1
+
+### Patch Changes
+
+- 71b84a9: Split job.execute into multi-phase transactions so RUNNING status is visible immediately and long-running stage execution does not hold a database connection open
+
 ## 0.2.0
 
 ### Minor Changes
