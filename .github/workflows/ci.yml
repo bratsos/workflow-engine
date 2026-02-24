@@ -30,15 +30,12 @@ jobs:
         run: pnpm biome check .
 
       - name: Type check
-        run: pnpm tsc --noEmit
-        working-directory: packages/workflow-engine
+        run: pnpm typecheck
 
       - name: Test
         run: pnpm test
-        working-directory: packages/workflow-engine
         env:
           NODE_ENV: test
 
       - name: Build
         run: pnpm build
-        working-directory: packages/workflow-engine
