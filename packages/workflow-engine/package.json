@@ -14,8 +14,7 @@
     "url": "https://github.com/bratsos/workflow-engine/issues"
   },
   "publishConfig": {
-    "access": "public",
-    "provenance": true
+    "access": "public"
   },
   "keywords": [
     "workflow",
