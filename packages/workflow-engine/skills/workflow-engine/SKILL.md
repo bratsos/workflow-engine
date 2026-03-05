@@ -337,6 +337,8 @@ const ai = createAIHelper(
 const { text, cost } = await ai.generateText("gemini-2.5-flash", prompt);
 const { object } = await ai.generateObject("gemini-2.5-flash", prompt, schema);
 const { embedding } = await ai.embed("text-embedding-004", ["text1"], { dimensions: 768 });
+// OpenRouter embedding models (OpenAI, Cohere, etc.)
+const { embedding } = await ai.embed("openai/text-embedding-3-small", ["text1"]);
 ```
 
 ## Persistence Setup

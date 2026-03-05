@@ -248,16 +248,16 @@ const result = await ai.generateObject(
 
 ## embed
 
-Generate embeddings for text.
+Generate embeddings for text. Supports Google and OpenRouter embedding providers.
 
 ```typescript
-// Single text
+// Google embedding model (with Google-specific options)
 const result = await ai.embed(
   "text-embedding-004",
   "The quick brown fox",
   {
     dimensions: 768,  // Output dimensions (default: 768)
-    taskType: "RETRIEVAL_DOCUMENT",  // or "RETRIEVAL_QUERY", "SEMANTIC_SIMILARITY"
+    taskType: "RETRIEVAL_DOCUMENT",  // Google-only: "RETRIEVAL_QUERY", "SEMANTIC_SIMILARITY"
   }
 );
 
@@ -265,6 +265,12 @@ console.log(result.embedding);     // number[] (768 dimensions)
 console.log(result.dimensions);    // 768
 console.log(result.inputTokens);
 console.log(result.cost);
+
+// OpenRouter embedding model (OpenAI, Cohere, etc.)
+const result = await ai.embed(
+  "openai/text-embedding-3-small",
+  "The quick brown fox",
+);
 
 // Multiple texts (batch)
 const result = await ai.embed("text-embedding-004", [
@@ -276,6 +282,10 @@ const result = await ai.embed("text-embedding-004", [
 console.log(result.embeddings);    // number[][] (3 embeddings)
 console.log(result.embedding);     // First embedding (convenience)
 ```
+
+> **Note:** `taskType` and `outputDimensionality` options only apply to Google embedding models.
+> OpenRouter embedding models work without provider-specific options. The provider is determined
+> by the `provider` field in the model's `ModelConfig`.
 
 ## streamText
 
@@ -463,6 +473,26 @@ registerModels({
 
 // Now usable
 const result = await ai.generateText("my-custom-model", prompt);
+```
+
+### Register Custom Embedding Models
+
+```typescript
+import { registerModels } from "@bratsos/workflow-engine";
+
+registerModels({
+  "openai/text-embedding-3-small": {
+    id: "openai/text-embedding-3-small",
+    name: "OpenAI text-embedding-3-small",
+    provider: "openrouter",
+    inputCostPerMillion: 0.02,
+    outputCostPerMillion: 0,
+    isEmbeddingModel: true,
+  },
+});
+
+// Now usable
+const { embedding } = await ai.embed("openai/text-embedding-3-small", "text");
 ```
 
 ### Cost Calculation

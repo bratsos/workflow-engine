@@ -320,6 +320,45 @@ describe("I want to generate embeddings using AIHelper", () => {
     });
   });
 
+  describe("embedding provider support", () => {
+    it("should accept OpenRouter embedding model keys", async () => {
+      // Given: A mock AI helper
+      // When: I embed with an OpenRouter model key
+      const result = await ai.embed(
+        "openai/text-embedding-3-small" as any,
+        "Test text",
+      );
+
+      // Then: Returns valid embedding and records the model key
+      expect(result.embedding).toBeDefined();
+      const lastCall = ai.getLastCall();
+      expect(lastCall?.modelKey).toBe("openai/text-embedding-3-small");
+    });
+
+    it("should accept Google embedding model keys", async () => {
+      // Given: A mock AI helper
+      // When: I embed with a Google model key
+      const result = await ai.embed("text-embedding-004", "Test text");
+
+      // Then: Returns valid embedding and records the model key
+      expect(result.embedding).toBeDefined();
+      const lastCall = ai.getLastCall();
+      expect(lastCall?.modelKey).toBe("text-embedding-004");
+    });
+
+    it("should record taskType in call metadata regardless of provider", async () => {
+      // Given: An OpenRouter model with taskType option
+      // When: I embed with taskType
+      await ai.embed("openai/text-embedding-3-small" as any, "Test", {
+        taskType: "RETRIEVAL_QUERY",
+      });
+
+      // Then: taskType is recorded in the call
+      const lastCall = ai.getLastCall();
+      expect(lastCall?.options).toHaveProperty("taskType", "RETRIEVAL_QUERY");
+    });
+  });
+
   describe("child helper embedding", () => {
     it("should inherit embedding capabilities", async () => {
       // Given: A child helper

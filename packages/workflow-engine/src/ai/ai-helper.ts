@@ -362,6 +362,20 @@ function getModelProvider(modelConfig: ModelConfig) {
   return google(modelConfig.id);
 }
 
+function getEmbeddingModelProvider(modelConfig: ModelConfig) {
+  if (modelConfig.provider === "openrouter") {
+    return openrouter.textEmbeddingModel(modelConfig.id);
+  }
+  if (modelConfig.provider === "google") {
+    const googleModelId = modelConfig.id.replace(/^google\//, "");
+    return google.embeddingModel(googleModelId);
+  }
+  throw new Error(
+    `Unsupported embedding provider "${modelConfig.provider}" for model "${modelConfig.id}". ` +
+      `Supported providers: "openrouter", "google".`,
+  );
+}
+
 function calculateCostWithDiscount(
   modelKey: ModelKey,
   inputTokens: number,
@@ -848,6 +862,7 @@ class AIHelperImpl implements AIHelper {
     logger.debug(`embed request`, {
       model: modelKey,
       modelId: modelConfig.id,
+      provider: modelConfig.provider,
       textCount: texts.length,
       textPreview,
       dimensions,
@@ -861,18 +876,19 @@ class AIHelperImpl implements AIHelper {
       let totalInputTokens = 0;
 
       for (const t of texts) {
-        // Strip google/ prefix if present - Google SDK expects just the model name
-        const embeddingModelId = modelConfig.id.replace(/^google\//, "");
+        const embeddingModel = getEmbeddingModelProvider(modelConfig);
 
         const result = await embed({
-          model: google.embeddingModel(embeddingModelId),
+          model: embeddingModel,
           value: t,
-          providerOptions: {
-            google: {
-              outputDimensionality: dimensions,
-              taskType: options.taskType ?? "RETRIEVAL_DOCUMENT",
+          ...(modelConfig.provider === "google" && {
+            providerOptions: {
+              google: {
+                outputDimensionality: dimensions,
+                taskType: options.taskType ?? "RETRIEVAL_DOCUMENT",
+              },
             },
-          },
+          }),
         });
 
         embeddings.push(result.embedding);
@@ -908,6 +924,7 @@ class AIHelperImpl implements AIHelper {
       // Trace log after successful embed call
       logger.debug(`embed response`, {
         model: modelKey,
+        provider: modelConfig.provider,
         embeddingsCount: embeddings.length,
         dimensions,
         inputTokens: totalInputTokens,
