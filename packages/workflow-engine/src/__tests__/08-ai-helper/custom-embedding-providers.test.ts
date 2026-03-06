@@ -72,7 +72,9 @@ describe("Custom Embedding Provider Registry", () => {
       registerEmbeddingProvider("cohere-multi", cohereFactory);
 
       // When: Each provider is used
-      getEmbeddingModelProvider(makeModelConfig("voyage-multi", "voyage-4-large"));
+      getEmbeddingModelProvider(
+        makeModelConfig("voyage-multi", "voyage-4-large"),
+      );
       getEmbeddingModelProvider(
         makeModelConfig("cohere-multi", "embed-english-v3.0"),
       );
