@@ -28,7 +28,7 @@ export interface ModelConfig {
   name: string;
   inputCostPerMillion: number; // Cost in USD per 1M input tokens
   outputCostPerMillion: number; // Cost in USD per 1M output tokens
-  provider: "openrouter" | "google" | "other";
+  provider: string;
   description?: string;
   supportsAsyncBatch?: boolean;
   batchDiscountPercent?: number; // e.g., 50 for Google Batch (50% off)

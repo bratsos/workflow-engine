@@ -16,6 +16,7 @@
  */
 
 import { google } from "@ai-sdk/google";
+import type { EmbeddingModelV3 } from "@ai-sdk/provider";
 import { openrouter } from "@openrouter/ai-sdk-provider";
 import type { StepResult, ToolSet } from "ai";
 import { embed, generateText, Output, streamText } from "ai";
@@ -37,6 +38,37 @@ const logger = createLogger("AIHelper");
 
 // Default embedding dimensions (can be overridden via options)
 const DEFAULT_EMBEDDING_DIMENSIONS = 768;
+
+// ============================================================================
+// Custom Embedding Provider Registry
+// ============================================================================
+
+const embeddingProviderRegistry = new Map<
+  string,
+  (modelId: string) => EmbeddingModelV3
+>();
+
+/**
+ * Register a custom embedding provider factory.
+ *
+ * Consumers can register any AI SDK community provider (Voyage, Cohere, Jina, etc.)
+ * without modifying the workflow engine. The factory receives the model ID and must
+ * return an EmbeddingModelV3 instance.
+ *
+ * @example
+ * ```typescript
+ * import { registerEmbeddingProvider } from "@bratsos/workflow-engine";
+ * import { voyage } from "voyage-ai-provider";
+ *
+ * registerEmbeddingProvider("voyage", (modelId) => voyage.embeddingModel(modelId));
+ * ```
+ */
+export function registerEmbeddingProvider(
+  providerName: string,
+  factory: (modelId: string) => EmbeddingModelV3,
+): void {
+  embeddingProviderRegistry.set(providerName, factory);
+}
 
 // ============================================================================
 // Types
@@ -362,7 +394,15 @@ function getModelProvider(modelConfig: ModelConfig) {
   return google(modelConfig.id);
 }
 
-function getEmbeddingModelProvider(modelConfig: ModelConfig) {
+/** @internal Exported for testing only */
+export function getEmbeddingModelProvider(modelConfig: ModelConfig) {
+  // Custom providers registered by consumer
+  const customFactory = embeddingProviderRegistry.get(modelConfig.provider);
+  if (customFactory) {
+    return customFactory(modelConfig.id);
+  }
+
+  // Built-in providers
   if (modelConfig.provider === "openrouter") {
     return openrouter.textEmbeddingModel(modelConfig.id);
   }
@@ -370,9 +410,10 @@ function getEmbeddingModelProvider(modelConfig: ModelConfig) {
     const googleModelId = modelConfig.id.replace(/^google\//, "");
     return google.embeddingModel(googleModelId);
   }
+
   throw new Error(
     `Unsupported embedding provider "${modelConfig.provider}" for model "${modelConfig.id}". ` +
-      `Supported providers: "openrouter", "google".`,
+      `Register it with registerEmbeddingProvider() or use a built-in provider ("openrouter", "google").`,
   );
 }
 

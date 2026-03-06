@@ -108,6 +108,7 @@ await kernel.dispatch({
 | `createNodeHost` | Function | `@bratsos/workflow-engine-host-node` | Create Node.js host |
 | `createServerlessHost` | Function | `@bratsos/workflow-engine-host-serverless` | Create serverless host |
 | `createAIHelper` | Function | `@bratsos/workflow-engine` | AI operations (text, object, embed, batch) |
+| `registerEmbeddingProvider` | Function | `@bratsos/workflow-engine` | Register custom embedding providers (Voyage, Cohere, etc.) |
 | `definePlugin` | Function | `@bratsos/workflow-engine/kernel` | Define kernel plugins |
 | `createPluginRunner` | Function | `@bratsos/workflow-engine/kernel` | Create plugin event processor |
 
@@ -339,6 +340,12 @@ const { object } = await ai.generateObject("gemini-2.5-flash", prompt, schema);
 const { embedding } = await ai.embed("text-embedding-004", ["text1"], { dimensions: 768 });
 // OpenRouter embedding models (OpenAI, Cohere, etc.)
 const { embedding } = await ai.embed("openai/text-embedding-3-small", ["text1"]);
+
+// Custom embedding providers (Voyage, Cohere, Jina, etc.)
+import { registerEmbeddingProvider } from "@bratsos/workflow-engine";
+import { voyage } from "voyage-ai-provider";
+registerEmbeddingProvider("voyage", (modelId) => voyage.embeddingModel(modelId));
+// Then register models with provider: "voyage" and use ai.embed() as usual
 ```
 
 ## Persistence Setup
