@@ -248,7 +248,7 @@ const result = await ai.generateObject(
 
 ## embed
 
-Generate embeddings for text. Supports Google and OpenRouter embedding providers.
+Generate embeddings for text. Supports Google and OpenRouter as built-in providers, plus any custom provider registered via `registerEmbeddingProvider()`.
 
 ```typescript
 // Google embedding model (with Google-specific options)
@@ -286,6 +286,39 @@ console.log(result.embedding);     // First embedding (convenience)
 > **Note:** `taskType` and `outputDimensionality` options only apply to Google embedding models.
 > OpenRouter embedding models work without provider-specific options. The provider is determined
 > by the `provider` field in the model's `ModelConfig`.
+
+### Custom Embedding Providers
+
+Use `registerEmbeddingProvider()` to add support for any AI SDK community embedding provider (Voyage, Cohere, Jina, etc.) without modifying the library. Call this once at application startup, before any `embed()` calls.
+
+```typescript
+import { registerEmbeddingProvider, registerModels } from "@bratsos/workflow-engine";
+import { voyage } from "voyage-ai-provider";
+
+// 1. Register the provider factory (once at startup)
+registerEmbeddingProvider("voyage", (modelId) => voyage.embeddingModel(modelId));
+
+// 2. Register models that use the provider
+registerModels({
+  "voyage-4-large": {
+    id: "voyage-4-large",
+    name: "Voyage 4 Large",
+    provider: "voyage",           // Must match the name in registerEmbeddingProvider()
+    inputCostPerMillion: 0.06,
+    outputCostPerMillion: 0,
+    isEmbeddingModel: true,
+  },
+});
+
+// 3. Use it like any other embedding model
+const { embedding } = await ai.embed("voyage-4-large", "Hello world");
+```
+
+**How it works:**
+- The factory receives the model's `id` from `ModelConfig` and must return an `EmbeddingModelV3` instance (from `@ai-sdk/provider`)
+- Custom providers are checked **before** built-in providers, so you can even override `"openrouter"` or `"google"` if needed
+- The workflow engine stays provider-agnostic — install your chosen provider package as your app's dependency, not the library's
+- Provider-specific options (like Google's `taskType`) are handled by each provider through the AI SDK's standard mechanism
 
 ## streamText
 

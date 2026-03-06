@@ -51,6 +51,7 @@ export {
   type LogContext,
   type ObjectOptions,
   type RecordCallParams,
+  registerEmbeddingProvider,
   type StreamOptions,
   type TextOptions,
 } from "./ai/ai-helper";
