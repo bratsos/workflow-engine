@@ -1,5 +1,11 @@
 # @bratsos/workflow-engine-host-serverless
 
+## 0.2.6
+
+### Patch Changes
+
+- b83ecb1: Republish host packages with resolved workspace dependencies and repository.url for provenance
+
 ## 0.2.5
 
 ### Patch Changes
