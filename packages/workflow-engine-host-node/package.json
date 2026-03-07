@@ -5,6 +5,11 @@
   "type": "module",
   "license": "MIT",
   "author": "Alex Bratsos",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bratsos/workflow-engine",
+    "directory": "packages/workflow-engine-host-node"
+  },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
