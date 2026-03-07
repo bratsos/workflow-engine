@@ -1,5 +1,11 @@
 # @bratsos/workflow-engine-host-node
 
+## 0.2.5
+
+### Patch Changes
+
+- f456a5f: Fix release script to use pnpm -r publish so workspace:\* dependencies are resolved to actual versions at publish time
+
 ## 0.2.4
 
 ### Patch Changes
