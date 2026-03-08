@@ -239,8 +239,9 @@ describe("kernel: run.claimPending", () => {
 
   it("handles orphaned stages from a previous failed claim (P2002 scenario)", async () => {
     const workflow = createSimpleWorkflow();
-    const { kernel, flush, persistence, jobTransport } =
-      createTestKernel([workflow]);
+    const { kernel, flush, persistence, jobTransport } = createTestKernel([
+      workflow,
+    ]);
 
     // Create a run
     await kernel.dispatch({
@@ -283,8 +284,9 @@ describe("kernel: run.claimPending", () => {
 
   it("skips enqueue for stages already RUNNING or COMPLETED", async () => {
     const workflow = createSimpleWorkflow();
-    const { kernel, flush, persistence, jobTransport } =
-      createTestKernel([workflow]);
+    const { kernel, flush, persistence, jobTransport } = createTestKernel([
+      workflow,
+    ]);
 
     // Create a run
     await kernel.dispatch({

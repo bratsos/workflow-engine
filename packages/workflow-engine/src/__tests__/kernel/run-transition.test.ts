@@ -330,9 +330,7 @@ describe("kernel: run.transition", () => {
     });
 
     // Verify stage-2 was created via upsert
-    const stages = await persistence.getStagesByRun(
-      createResult.workflowRunId,
-    );
+    const stages = await persistence.getStagesByRun(createResult.workflowRunId);
     const stage2 = stages.find((s) => s.stageId === "stage-2");
     expect(stage2).toBeDefined();
     expect(stage2!.status).toBe("PENDING");
