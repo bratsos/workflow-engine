@@ -98,29 +98,41 @@ export async function handleRunClaimPending(
       continue;
     }
 
-    // Create stage records
+    // Upsert stage records (idempotent — handles orphaned stages from previous failed claims)
+    const stagesToEnqueue: typeof stages = [];
     for (const stage of stages) {
-      await deps.persistence.createStage({
+      const record = await deps.persistence.upsertStage({
         workflowRunId: run.id,
         stageId: stage.id,
-        stageName: stage.name,
-        stageNumber: workflow.getStageIndex(stage.id) + 1,
-        executionGroup: 1,
-        status: "PENDING",
-        config: (run.config as any)?.[stage.id] || {},
+        create: {
+          workflowRunId: run.id,
+          stageId: stage.id,
+          stageName: stage.name,
+          stageNumber: workflow.getStageIndex(stage.id) + 1,
+          executionGroup: 1,
+          status: "PENDING",
+          config: (run.config as any)?.[stage.id] || {},
+        },
+        update: {},
       });
+      if (record.status === "PENDING") {
+        stagesToEnqueue.push(stage);
+      }
     }
 
-    // Enqueue jobs
-    const jobIds = await deps.jobTransport.enqueueParallel(
-      stages.map((stage) => ({
-        workflowRunId: run.id,
-        workflowId: run.workflowId,
-        stageId: stage.id,
-        priority: run.priority,
-        payload: { config: run.config || {} },
-      })),
-    );
+    // Enqueue jobs only for stages that are PENDING (skip RUNNING/COMPLETED/SUSPENDED)
+    const jobIds =
+      stagesToEnqueue.length > 0
+        ? await deps.jobTransport.enqueueParallel(
+            stagesToEnqueue.map((stage) => ({
+              workflowRunId: run.id,
+              workflowId: run.workflowId,
+              stageId: stage.id,
+              priority: run.priority,
+              payload: { config: run.config || {} },
+            })),
+          )
+        : [];
 
     events.push({
       type: "workflow:started",
