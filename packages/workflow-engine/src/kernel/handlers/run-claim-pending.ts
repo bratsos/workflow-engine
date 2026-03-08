@@ -28,123 +28,160 @@ export async function handleRunClaimPending(
     const run = await deps.persistence.claimNextPendingRun();
     if (!run) break;
 
-    const workflow = deps.registry.getWorkflow(run.workflowId);
-    if (!workflow) {
-      const error = `Workflow ${run.workflowId} not found in registry`;
-      const failedAt = deps.clock.now();
-      await deps.persistence.updateRun(run.id, {
-        status: "FAILED",
-        completedAt: failedAt,
-        output: {
-          error: {
-            code: "WORKFLOW_NOT_FOUND",
+    try {
+      const workflow = deps.registry.getWorkflow(run.workflowId);
+      if (!workflow) {
+        const error = `Workflow ${run.workflowId} not found in registry`;
+        const failedAt = deps.clock.now();
+        await deps.persistence.updateRun(run.id, {
+          status: "FAILED",
+          completedAt: failedAt,
+          output: {
+            error: {
+              code: "WORKFLOW_NOT_FOUND",
+              message: error,
+              workerId: command.workerId,
+            },
+          },
+        });
+        await deps.persistence
+          .createLog({
+            workflowRunId: run.id,
+            level: "ERROR",
             message: error,
-            workerId: command.workerId,
-          },
-        },
-      });
-      await deps.persistence
-        .createLog({
+            metadata: {
+              workerId: command.workerId,
+              code: "WORKFLOW_NOT_FOUND",
+            },
+          })
+          .catch(() => {});
+        events.push({
+          type: "workflow:failed",
+          timestamp: failedAt,
           workflowRunId: run.id,
-          level: "ERROR",
-          message: error,
-          metadata: {
-            workerId: command.workerId,
-            code: "WORKFLOW_NOT_FOUND",
-          },
-        })
-        .catch(() => {});
-      events.push({
-        type: "workflow:failed",
-        timestamp: failedAt,
-        workflowRunId: run.id,
-        error,
-      });
-      continue;
-    }
+          error,
+        });
+        continue;
+      }
 
-    const stages = workflow.getStagesInExecutionGroup(1);
-    if (stages.length === 0) {
-      const error = `Workflow ${run.workflowId} has no stages in execution group 1`;
-      const failedAt = deps.clock.now();
-      await deps.persistence.updateRun(run.id, {
-        status: "FAILED",
-        completedAt: failedAt,
-        output: {
-          error: {
-            code: "EMPTY_STAGE_GRAPH",
+      const stages = workflow.getStagesInExecutionGroup(1);
+      if (stages.length === 0) {
+        const error = `Workflow ${run.workflowId} has no stages in execution group 1`;
+        const failedAt = deps.clock.now();
+        await deps.persistence.updateRun(run.id, {
+          status: "FAILED",
+          completedAt: failedAt,
+          output: {
+            error: {
+              code: "EMPTY_STAGE_GRAPH",
+              message: error,
+              workerId: command.workerId,
+            },
+          },
+        });
+        await deps.persistence
+          .createLog({
+            workflowRunId: run.id,
+            level: "ERROR",
             message: error,
-            workerId: command.workerId,
-          },
-        },
-      });
-      await deps.persistence
-        .createLog({
+            metadata: {
+              workerId: command.workerId,
+              code: "EMPTY_STAGE_GRAPH",
+            },
+          })
+          .catch(() => {});
+        events.push({
+          type: "workflow:failed",
+          timestamp: failedAt,
           workflowRunId: run.id,
-          level: "ERROR",
-          message: error,
-          metadata: {
-            workerId: command.workerId,
-            code: "EMPTY_STAGE_GRAPH",
-          },
-        })
-        .catch(() => {});
-      events.push({
-        type: "workflow:failed",
-        timestamp: failedAt,
-        workflowRunId: run.id,
-        error,
-      });
-      continue;
-    }
+          error,
+        });
+        continue;
+      }
 
-    // Upsert stage records (idempotent — handles orphaned stages from previous failed claims)
-    const stagesToEnqueue: typeof stages = [];
-    for (const stage of stages) {
-      const record = await deps.persistence.upsertStage({
-        workflowRunId: run.id,
-        stageId: stage.id,
-        create: {
+      // Upsert stage records (idempotent — handles orphaned stages from previous failed claims)
+      const stagesToEnqueue: typeof stages = [];
+      for (const stage of stages) {
+        const record = await deps.persistence.upsertStage({
           workflowRunId: run.id,
           stageId: stage.id,
-          stageName: stage.name,
-          stageNumber: workflow.getStageIndex(stage.id) + 1,
-          executionGroup: 1,
-          status: "PENDING",
-          config: (run.config as any)?.[stage.id] || {},
-        },
-        update: {},
-      });
-      if (record.status === "PENDING") {
-        stagesToEnqueue.push(stage);
+          create: {
+            workflowRunId: run.id,
+            stageId: stage.id,
+            stageName: stage.name,
+            stageNumber: workflow.getStageIndex(stage.id) + 1,
+            executionGroup: 1,
+            status: "PENDING",
+            config: (run.config as any)?.[stage.id] || {},
+          },
+          update: {},
+        });
+        if (record.status === "PENDING") {
+          stagesToEnqueue.push(stage);
+        }
       }
+
+      // Enqueue jobs only for stages that are PENDING (skip RUNNING/COMPLETED/SUSPENDED)
+      const jobIds =
+        stagesToEnqueue.length > 0
+          ? await deps.jobTransport.enqueueParallel(
+              stagesToEnqueue.map((stage) => ({
+                workflowRunId: run.id,
+                workflowId: run.workflowId,
+                stageId: stage.id,
+                priority: run.priority,
+                payload: { config: run.config || {} },
+              })),
+            )
+          : [];
+
+      events.push({
+        type: "workflow:started",
+        timestamp: deps.clock.now(),
+        workflowRunId: run.id,
+      });
+
+      claimed.push({
+        workflowRunId: run.id,
+        workflowId: run.workflowId,
+        jobIds,
+      });
+    } catch (err) {
+      const error =
+        err instanceof Error ? err.message : "Unknown error during claim";
+      const failedAt = deps.clock.now();
+      await deps.persistence
+        .updateRun(run.id, {
+          status: "FAILED",
+          completedAt: failedAt,
+          output: {
+            error: {
+              code: "CLAIM_FAILED",
+              message: error,
+              workerId: command.workerId,
+            },
+          },
+        })
+        .catch(() => {});
+      await deps.persistence
+        .createLog({
+          workflowRunId: run.id,
+          level: "ERROR",
+          message: error,
+          metadata: {
+            workerId: command.workerId,
+            code: "CLAIM_FAILED",
+          },
+        })
+        .catch(() => {});
+      events.push({
+        type: "workflow:failed",
+        timestamp: failedAt,
+        workflowRunId: run.id,
+        error,
+      });
+      continue;
     }
-
-    // Enqueue jobs only for stages that are PENDING (skip RUNNING/COMPLETED/SUSPENDED)
-    const jobIds =
-      stagesToEnqueue.length > 0
-        ? await deps.jobTransport.enqueueParallel(
-            stagesToEnqueue.map((stage) => ({
-              workflowRunId: run.id,
-              workflowId: run.workflowId,
-              stageId: stage.id,
-              priority: run.priority,
-              payload: { config: run.config || {} },
-            })),
-          )
-        : [];
-
-    events.push({
-      type: "workflow:started",
-      timestamp: deps.clock.now(),
-      workflowRunId: run.id,
-    });
-
-    claimed.push({
-      workflowRunId: run.id,
-      workflowId: run.workflowId,
-      jobIds,
-    });
   }
 
   return { claimed, _events: events };

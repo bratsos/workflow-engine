@@ -325,4 +325,45 @@ describe("kernel: run.claimPending", () => {
     expect(stages).toHaveLength(1);
     expect(stages[0]!.status).toBe("RUNNING");
   });
+
+  it("marks individual run as FAILED on unexpected claim error and continues", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, persistence, jobTransport } = createTestKernel([workflow]);
+
+    // Create two runs
+    await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "key-1",
+      workflowId: "test-workflow",
+      input: { data: "hello-1" },
+    });
+    await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "key-2",
+      workflowId: "test-workflow",
+      input: { data: "hello-2" },
+    });
+
+    // Sabotage: make upsertStage throw on first call, then work normally
+    let callCount = 0;
+    const origUpsert = persistence.upsertStage.bind(persistence);
+    persistence.upsertStage = async (data: any) => {
+      callCount++;
+      if (callCount === 1) throw new Error("Simulated DB error");
+      return origUpsert(data);
+    };
+
+    const result = await kernel.dispatch({
+      type: "run.claimPending",
+      workerId: "worker-1",
+      maxClaims: 2,
+    });
+
+    // Second run should have been claimed successfully
+    expect(result.claimed).toHaveLength(1);
+
+    // First run should be marked FAILED
+    const failedRuns = await persistence.getRunsByStatus("FAILED");
+    expect(failedRuns).toHaveLength(1);
+  });
 });
