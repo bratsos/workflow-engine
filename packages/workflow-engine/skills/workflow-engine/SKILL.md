@@ -126,6 +126,7 @@ All operations go through `kernel.dispatch(command)`:
 | `job.execute` | Execute a single stage (uses multi-phase transactions; see 08-common-patterns.md) |
 | `stage.pollSuspended` | Poll suspended stages for readiness (returns `resumedWorkflowRunIds`) |
 | `lease.reapStale` | Release stale job leases |
+| `run.reapStuck` | Detect and fail RUNNING runs with no recent activity |
 | `outbox.flush` | Publish pending outbox events |
 | `plugin.replayDLQ` | Replay dead-letter queue events |
 
@@ -319,11 +320,11 @@ const result = await host.processAvailableJobs({ maxJobs: 5 });
 
 #### `runMaintenanceTick(): Promise<MaintenanceTickResult>`
 
-Run one bounded maintenance cycle: claim pending, poll suspended, reap stale, flush outbox.
+Run one bounded maintenance cycle: claim pending, poll suspended, reap stale, flush outbox, reap stuck runs.
 
 ```typescript
 const tick = await host.runMaintenanceTick();
-// { claimed: number, suspendedChecked: number, staleReleased: number, eventsFlushed: number }
+// { claimed, suspendedChecked, staleReleased, eventsFlushed, stuckReaped }
 // Note: resumed suspended stages are automatically followed by run.transition.
 ```
 
@@ -422,6 +423,7 @@ await kernel.dispatch({ type: "run.transition", workflowRunId: job.workflowRunId
 - [06-async-batch-stages.md](references/06-async-batch-stages.md) - Async operations
 - [07-testing-patterns.md](references/07-testing-patterns.md) - Testing with kernel
 - [08-common-patterns.md](references/08-common-patterns.md) - Kernel patterns & best practices
+- [09-troubleshooting.md](references/09-troubleshooting.md) - Debugging stuck runs, P2002 errors, ghost jobs
 
 ## Key Principles
 
@@ -431,4 +433,5 @@ await kernel.dispatch({ type: "run.transition", workflowRunId: job.workflowRunId
 4. **Context Access**: Use `ctx.require()` and `ctx.optional()` for type-safe stage output access
 5. **Transactional Outbox**: Events written to outbox, published via `outbox.flush` command. `job.execute` uses multi-phase transactions to avoid holding connections during long-running stage execution
 6. **Idempotency**: `run.create` and `job.execute` replay cached results by key; concurrent same-key dispatch throws `IdempotencyInProgressError`
-7. **Cost Tracking**: All AI calls automatically track tokens and costs
+7. **Self-Healing**: Stage creation is idempotent (upsert), orchestration steps are isolated, ghost jobs are discarded, stuck runs are automatically reaped
+8. **Cost Tracking**: All AI calls automatically track tokens and costs

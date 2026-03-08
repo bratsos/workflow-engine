@@ -183,6 +183,35 @@ async execute(ctx) {
 
 Failed stages trigger the `stage:failed` event. The host's maintenance tick detects failure through `run.transition`, which marks the workflow as FAILED.
 
+## Reliability & Self-Healing
+
+The engine has several built-in reliability mechanisms:
+
+### Idempotent Stage Creation
+
+Both `run.claimPending` and `run.transition` use `upsertStage` instead of `createStage` when creating stage records. This means:
+- If orphaned stages exist from a previous failed attempt, they're harmlessly overwritten
+- Only stages with status `PENDING` get jobs enqueued (stages already `RUNNING`/`COMPLETED`/`SUSPENDED` are skipped)
+- Prevents P2002 unique constraint violations that could otherwise cause infinite retry loops
+
+### Per-Run Error Isolation
+
+If claiming a specific run fails (e.g., workflow not found, database error), that run is marked `FAILED` with error code `CLAIM_FAILED` and processing continues to the next run. One bad run never blocks the entire claim batch.
+
+### Ghost Job Guard
+
+`job.execute` verifies the run is in `RUNNING` status before executing. Jobs for `PENDING`, `FAILED`, `CANCELLED`, or `COMPLETED` runs are discarded with `outcome: "failed"` (no retry). This prevents ghost jobs from rolled-back transactions from resurrecting invalid state.
+
+### Orchestration Tick Isolation
+
+Each step of the orchestration tick (claim pending, poll suspended, reap stale, flush outbox, reap stuck) runs in its own error boundary. If one step fails, the others still execute. This prevents a single error from starving unrelated maintenance work.
+
+### Stuck Run Detection
+
+The `run.reapStuck` command finds RUNNING runs with no recent activity (no updates to run or stage records within the threshold). These runs are marked `FAILED` with error code `STUCK_RUN_REAPED`. The threshold defaults to `max(3 * staleLeaseThresholdMs, 5 minutes)`.
+
+See [09-troubleshooting.md](09-troubleshooting.md) for debugging these scenarios.
+
 ## Progress Reporting
 
 ```typescript
