@@ -1,5 +1,13 @@
 # @bratsos/workflow-engine-host-serverless
 
+## 0.2.7
+
+### Patch Changes
+
+- fe65b06: Fix reliability issues: idempotent stage creation (prevents P2002 loops), ghost job detection with no-retry in hosts, per-run error isolation in claimPending, stuck run detection via run.reapStuck with race condition guard, and orchestration tick step isolation.
+- Updated dependencies [fe65b06]
+  - @bratsos/workflow-engine@0.4.1
+
 ## 0.2.6
 
 ### Patch Changes
