@@ -102,6 +102,15 @@ export async function handleJobExecute(
   const workflowRun = await deps.persistence.getRun(workflowRunId);
   if (!workflowRun) throw new Error(`WorkflowRun ${workflowRunId} not found`);
 
+  // Guard against ghost jobs — only execute if run is actively RUNNING
+  if (workflowRun.status !== "RUNNING") {
+    return {
+      outcome: "failed" as const,
+      error: `Run ${workflowRunId} is ${workflowRun.status}, expected RUNNING — ghost job discarded`,
+      _events: [],
+    };
+  }
+
   const workflowContext = await loadWorkflowContext(workflowRunId, deps);
 
   // ── Phase 1: Start transaction ───────────────────────────────────

@@ -428,6 +428,32 @@ describe("kernel: job.execute", () => {
     expect(completedEvents).toHaveLength(1);
   });
 
+  it("discards ghost job when run is not RUNNING", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, persistence } = createTestKernel([workflow]);
+
+    // Create a run but do NOT claim it (stays PENDING)
+    const createResult = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "key-1",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+
+    // Attempt to execute a job against this PENDING run (ghost job scenario)
+    const result = await kernel.dispatch({
+      type: "job.execute",
+      idempotencyKey: "ghost-job-1",
+      workflowRunId: createResult.workflowRunId,
+      workflowId: "test-workflow",
+      stageId: "stage-1",
+      config: {},
+    });
+
+    expect(result.outcome).toBe("failed");
+    expect(result.error).toContain("expected RUNNING");
+  });
+
   it("validates input against stage schema", async () => {
     const inputSchema = z.object({ number: z.number() });
     const stage = defineStage({
