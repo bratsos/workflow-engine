@@ -342,6 +342,11 @@ const { embedding } = await ai.embed("text-embedding-004", ["text1"], { dimensio
 // OpenRouter embedding models (OpenAI, Cohere, etc.)
 const { embedding } = await ai.embed("openai/text-embedding-3-small", ["text1"]);
 
+// Provider-specific options passthrough (Voyage, Cohere, etc.)
+const { embedding } = await ai.embed("voyage-4-large", ["text1"], {
+  providerOptions: { voyage: { outputDimension: 512, inputType: "document" } },
+});
+
 // Custom embedding providers (Voyage, Cohere, Jina, etc.)
 import { registerEmbeddingProvider } from "@bratsos/workflow-engine";
 import { voyage } from "voyage-ai-provider";

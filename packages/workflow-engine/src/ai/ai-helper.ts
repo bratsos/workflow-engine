@@ -170,6 +170,8 @@ export interface EmbedOptions {
   taskType?: "RETRIEVAL_QUERY" | "RETRIEVAL_DOCUMENT" | "SEMANTIC_SIMILARITY";
   /** Override the default embedding dimensions (from embedding-config.ts) */
   dimensions?: number;
+  /** Provider-specific options passed directly to the AI SDK's embed() call */
+  providerOptions?: Record<string, Record<string, unknown>>;
 }
 
 export interface StreamOptions {
@@ -922,14 +924,15 @@ class AIHelperImpl implements AIHelper {
         const result = await embed({
           model: embeddingModel,
           value: t,
-          ...(modelConfig.provider === "google" && {
-            providerOptions: {
+          providerOptions: {
+            ...(modelConfig.provider === "google" && {
               google: {
                 outputDimensionality: dimensions,
                 taskType: options.taskType ?? "RETRIEVAL_DOCUMENT",
               },
-            },
-          }),
+            }),
+            ...options.providerOptions,
+          },
         });
 
         embeddings.push(result.embedding);

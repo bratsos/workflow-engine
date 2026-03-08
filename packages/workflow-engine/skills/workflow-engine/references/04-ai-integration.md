@@ -283,9 +283,36 @@ console.log(result.embeddings);    // number[][] (3 embeddings)
 console.log(result.embedding);     // First embedding (convenience)
 ```
 
-> **Note:** `taskType` and `outputDimensionality` options only apply to Google embedding models.
-> OpenRouter embedding models work without provider-specific options. The provider is determined
-> by the `provider` field in the model's `ModelConfig`.
+### Provider Options Passthrough
+
+Pass provider-specific options directly to the AI SDK's `embed()` call using `providerOptions`. These are merged after any auto-mapped options (e.g., Google's `outputDimensionality`), so they can override defaults.
+
+```typescript
+// Voyage-specific options
+const result = await ai.embed("voyage-4-large", ["text"], {
+  providerOptions: {
+    voyage: { outputDimension: 512, inputType: "document" },
+  },
+});
+
+// Cohere-specific options
+const result = await ai.embed("cohere-embed-v4", ["text"], {
+  providerOptions: {
+    cohere: { inputType: "search_document", truncate: "END" },
+  },
+});
+
+// Override Google's auto-mapped options
+const result = await ai.embed("text-embedding-004", "query text", {
+  providerOptions: {
+    google: { outputDimensionality: 256, taskType: "RETRIEVAL_QUERY" },
+  },
+});
+```
+
+> **Note:** `taskType` and `outputDimensionality` are auto-mapped for Google models.
+> For all other providers, use `providerOptions` to pass provider-specific settings.
+> The provider is determined by the `provider` field in the model's `ModelConfig`.
 
 ### Custom Embedding Providers
 
