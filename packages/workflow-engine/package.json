@@ -1,6 +1,6 @@
 {
   "name": "@bratsos/workflow-engine",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "Type-safe, distributed workflow engine for AI-orchestrated processes with suspend/resume, parallel execution, and cost tracking",
   "type": "module",
   "license": "MIT",
