@@ -17,6 +17,13 @@ export async function handleRunReapStuck(
   for (const run of stuckRuns) {
     const stages = await deps.persistence.getStagesByRun(run.id);
 
+    // Status guard: only update if run is still RUNNING to avoid
+    // overwriting a run that recovered between query and update.
+    const currentStatus = await deps.persistence.getRunStatus(run.id);
+    if (currentStatus !== "RUNNING") {
+      continue;
+    }
+
     await deps.persistence.updateRun(run.id, {
       status: "FAILED",
       completedAt: deps.clock.now(),

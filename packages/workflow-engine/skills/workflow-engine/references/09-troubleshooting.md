@@ -24,7 +24,7 @@ Common issues, how the engine handles them, and how to debug.
 - A stage is stuck `RUNNING` with no active job (worker crashed during execution)
 - All stages in a group completed but the next group was never enqueued
 
-**Self-healing:** The `run.reapStuck` command runs on every orchestration tick. It finds `RUNNING` runs with no recent activity (no updates to run or any stage record within the threshold) and marks them `FAILED` with error code `STUCK_RUN_REAPED`. The output includes `stageStatuses` showing each stage's status at reap time.
+**Self-healing:** The `run.reapStuck` command runs on every orchestration tick. It finds `RUNNING` runs with no recent activity (no updates to run or any stage record within the threshold) and marks them `FAILED` with error code `STUCK_RUN_REAPED`. The output includes `stageStatuses` showing each stage's status at reap time. A status guard re-checks `status === "RUNNING"` before updating, preventing race conditions where a run recovers between the query and the update.
 
 **Manual investigation:**
 ```typescript
@@ -54,7 +54,9 @@ await kernel.dispatch({ type: "run.transition", workflowRunId: runId });
 
 **What it was:** If the kernel transaction rolled back after `jobTransport.enqueueParallel` committed (separate transaction), ghost jobs would exist in the queue pointing to runs/stages that were rolled back.
 
-**How it's fixed:** `job.execute` checks `workflowRun.status === "RUNNING"` before proceeding. Ghost jobs for non-RUNNING runs are discarded with `outcome: "failed"` and the error message `"expected RUNNING — ghost job discarded"`. The job transport marks them failed (no infinite retry).
+**How it's fixed (two layers):**
+1. **Kernel guard:** `job.execute` checks `workflowRun.status === "RUNNING"` before proceeding. Ghost jobs for non-RUNNING runs are discarded with `outcome: "failed"` and error message containing `"ghost job discarded"`.
+2. **Host no-retry:** Both Node and Serverless hosts detect ghost job failures (error contains `"ghost job discarded"`) and set `canRetry = false`, preventing infinite retry loops.
 
 ## One Bad Run Blocks Everything
 

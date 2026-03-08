@@ -129,4 +129,45 @@ describe("kernel: run.reapStuck", () => {
     // PENDING runs should NOT be reaped
     expect(result.failed).toBe(0);
   });
+
+  it("skips reaping a run that recovered between query and update", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, persistence, jobTransport, clock } = createTestKernel([
+      workflow,
+    ]);
+
+    const { workflowRunId } = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "key-1",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+    await kernel.dispatch({ type: "run.claimPending", workerId: "w1" });
+
+    // Execute the job so the run completes (recovers)
+    const job = await jobTransport.dequeue();
+    await kernel.dispatch({
+      type: "job.execute",
+      workflowRunId: job!.workflowRunId,
+      workflowId: job!.workflowId,
+      stageId: job!.stageId,
+      config: {},
+    });
+    await jobTransport.complete(job!.jobId);
+    await kernel.dispatch({ type: "run.transition", workflowRunId });
+
+    // Now the run is COMPLETED — advance clock and try to reap
+    clock.advance(10 * 60 * 1000);
+
+    // Simulate race: getStuckRuns might return this run (in real code,
+    // the query filters by RUNNING, but the status guard provides defense-in-depth)
+    const result = await kernel.dispatch({
+      type: "run.reapStuck",
+      stuckThresholdMs: 5 * 60 * 1000,
+    });
+
+    expect(result.failed).toBe(0);
+    const run = await persistence.getRun(workflowRunId);
+    expect(run!.status).toBe("COMPLETED");
+  });
 });

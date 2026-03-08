@@ -255,7 +255,11 @@ class NodeHostImpl implements NodeHost {
           const nextPollAt = result.nextPollAt ?? new Date(Date.now() + 60_000);
           await this.jobTransport.suspend(job.jobId, nextPollAt);
         } else if (result.outcome === "failed") {
-          const canRetry = job.attempt < (job.maxAttempts ?? 3);
+          // Ghost jobs (discarded by kernel because run is not RUNNING)
+          // should never be retried — they'll just fail again.
+          const isGhostJob = result.error?.includes("ghost job discarded");
+          const canRetry =
+            !isGhostJob && job.attempt < (job.maxAttempts ?? 3);
           await this.jobTransport.fail(
             job.jobId,
             result.error ?? "Unknown error",
