@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import {
   defineAsyncBatchStage,
@@ -278,5 +278,70 @@ describe("kernel: run.transition", () => {
 
     const run = await persistence.getRun(createResult.workflowRunId);
     expect(run!.status).toBe("FAILED");
+  });
+
+  it("handles pre-existing stages in execution group (idempotent)", async () => {
+    const workflow = createTwoStageWorkflow();
+    const { kernel, persistence, jobTransport } = createTestKernel([workflow]);
+
+    // Create a run and set it to RUNNING
+    const createResult = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "key-1",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+
+    await persistence.updateRun(createResult.workflowRunId, {
+      status: "RUNNING",
+    });
+
+    // Complete stage-1 in group 1
+    await persistence.createStage({
+      workflowRunId: createResult.workflowRunId,
+      stageId: "stage-1",
+      stageName: "Stage stage-1",
+      stageNumber: 1,
+      executionGroup: 1,
+      status: "COMPLETED",
+    });
+
+    // Spy on upsertStage to verify the handler uses it (not createStage)
+    const upsertSpy = vi.spyOn(persistence, "upsertStage");
+    const createSpy = vi.spyOn(persistence, "createStage");
+
+    // Transition should advance to group 2 using upsertStage
+    const result = await kernel.dispatch({
+      type: "run.transition",
+      workflowRunId: createResult.workflowRunId,
+    });
+
+    expect(result.action).toBe("advanced");
+
+    // The handler should use upsertStage, NOT createStage, to avoid P2002
+    expect(upsertSpy).toHaveBeenCalled();
+    // createStage may be called internally by upsertStage, but the handler
+    // itself should not call it directly for stage creation
+    const upsertCalls = upsertSpy.mock.calls;
+    expect(upsertCalls.length).toBeGreaterThanOrEqual(1);
+    expect(upsertCalls[0][0]).toMatchObject({
+      workflowRunId: createResult.workflowRunId,
+      stageId: "stage-2",
+    });
+
+    // Verify stage-2 was created via upsert
+    const stages = await persistence.getStagesByRun(
+      createResult.workflowRunId,
+    );
+    const stage2 = stages.find((s) => s.stageId === "stage-2");
+    expect(stage2).toBeDefined();
+    expect(stage2!.status).toBe("PENDING");
+
+    // Verify a job was enqueued for stage-2
+    expect(jobTransport.getAllJobs().length).toBeGreaterThanOrEqual(1);
+    const stage2Job = jobTransport
+      .getAllJobs()
+      .find((j: any) => j.stageId === "stage-2");
+    expect(stage2Job).toBeDefined();
   });
 });

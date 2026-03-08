@@ -38,20 +38,31 @@ async function enqueueExecutionGroup(
 ): Promise<string[]> {
   const stages = workflow.getStagesInExecutionGroup(groupIndex);
 
+  const stagesToEnqueue: typeof stages = [];
   for (const stage of stages) {
-    await deps.persistence.createStage({
+    const record = await deps.persistence.upsertStage({
       workflowRunId: run.id,
       stageId: stage.id,
-      stageName: stage.name,
-      stageNumber: workflow.getStageIndex(stage.id) + 1,
-      executionGroup: groupIndex,
-      status: "PENDING",
-      config: (run.config as any)?.[stage.id] || {},
+      create: {
+        workflowRunId: run.id,
+        stageId: stage.id,
+        stageName: stage.name,
+        stageNumber: workflow.getStageIndex(stage.id) + 1,
+        executionGroup: groupIndex,
+        status: "PENDING",
+        config: (run.config as any)?.[stage.id] || {},
+      },
+      update: {},
     });
+    if (record.status === "PENDING") {
+      stagesToEnqueue.push(stage);
+    }
   }
 
+  if (stagesToEnqueue.length === 0) return [];
+
   return deps.jobTransport.enqueueParallel(
-    stages.map((stage) => ({
+    stagesToEnqueue.map((stage) => ({
       workflowRunId: run.id,
       workflowId: run.workflowId,
       stageId: stage.id,
