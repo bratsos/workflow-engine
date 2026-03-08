@@ -178,42 +178,67 @@ class ServerlessHostImpl implements ServerlessHost {
   }
 
   async runMaintenanceTick(): Promise<MaintenanceTickResult> {
+    let claimed = 0;
+    let suspendedChecked = 0;
+    let staleReleased = 0;
+    let eventsFlushed = 0;
+
     // 1. Claim pending runs → enqueue first-stage jobs
-    const claimResult = await this.kernel.dispatch({
-      type: "run.claimPending",
-      workerId: this.workerId,
-      maxClaims: this.maxClaimsPerTick,
-    });
+    try {
+      const claimResult = await this.kernel.dispatch({
+        type: "run.claimPending",
+        workerId: this.workerId,
+        maxClaims: this.maxClaimsPerTick,
+      });
+      claimed = claimResult.claimed.length;
+    } catch (error) {
+      console.error("[ServerlessHost] run.claimPending error:", error);
+    }
 
     // 2. Poll suspended stages → resume if ready
-    const pollResult = await this.kernel.dispatch({
-      type: "stage.pollSuspended",
-      maxChecks: this.maxSuspendedChecksPerTick,
-    });
-    for (const workflowRunId of pollResult.resumedWorkflowRunIds) {
-      await this.kernel.dispatch({
-        type: "run.transition",
-        workflowRunId,
+    try {
+      const pollResult = await this.kernel.dispatch({
+        type: "stage.pollSuspended",
+        maxChecks: this.maxSuspendedChecksPerTick,
       });
+      suspendedChecked = pollResult.checked;
+      for (const workflowRunId of pollResult.resumedWorkflowRunIds) {
+        await this.kernel.dispatch({
+          type: "run.transition",
+          workflowRunId,
+        });
+      }
+    } catch (error) {
+      console.error("[ServerlessHost] stage.pollSuspended error:", error);
     }
 
     // 3. Reap stale leases → release crashed worker locks
-    const reapResult = await this.kernel.dispatch({
-      type: "lease.reapStale",
-      staleThresholdMs: this.staleLeaseThresholdMs,
-    });
+    try {
+      const reapResult = await this.kernel.dispatch({
+        type: "lease.reapStale",
+        staleThresholdMs: this.staleLeaseThresholdMs,
+      });
+      staleReleased = reapResult.released;
+    } catch (error) {
+      console.error("[ServerlessHost] lease.reapStale error:", error);
+    }
 
     // 4. Flush outbox → publish pending events through EventSink
-    const flushResult = await this.kernel.dispatch({
-      type: "outbox.flush",
-      maxEvents: this.maxOutboxFlushPerTick,
-    });
+    try {
+      const flushResult = await this.kernel.dispatch({
+        type: "outbox.flush",
+        maxEvents: this.maxOutboxFlushPerTick,
+      });
+      eventsFlushed = flushResult.published;
+    } catch (error) {
+      console.error("[ServerlessHost] outbox.flush error:", error);
+    }
 
     return {
-      claimed: claimResult.claimed.length,
-      suspendedChecked: pollResult.checked,
-      staleReleased: reapResult.released,
-      eventsFlushed: flushResult.published,
+      claimed,
+      suspendedChecked,
+      staleReleased,
+      eventsFlushed,
     };
   }
 }

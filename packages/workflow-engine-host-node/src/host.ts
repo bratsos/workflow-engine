@@ -157,17 +157,21 @@ class NodeHostImpl implements NodeHost {
   // --------------------------------------------------------------------------
 
   private async orchestrationTick(): Promise<void> {
-    try {
-      this.orchestrationTicks++;
+    this.orchestrationTicks++;
 
-      // 1. Claim pending runs → enqueue first-stage jobs
+    // 1. Claim pending runs → enqueue first-stage jobs
+    try {
       await this.kernel.dispatch({
         type: "run.claimPending",
         workerId: this.workerId,
         maxClaims: this.maxClaimsPerTick,
       });
+    } catch (error) {
+      console.error("[NodeHost] run.claimPending error:", error);
+    }
 
-      // 2. Poll suspended stages → resume if ready
+    // 2. Poll suspended stages → resume if ready
+    try {
       const pollResult = await this.kernel.dispatch({
         type: "stage.pollSuspended",
         maxChecks: this.maxSuspendedChecksPerTick,
@@ -178,21 +182,28 @@ class NodeHostImpl implements NodeHost {
           workflowRunId,
         });
       }
+    } catch (error) {
+      console.error("[NodeHost] stage.pollSuspended error:", error);
+    }
 
-      // 3. Reap stale leases → release crashed worker locks
+    // 3. Reap stale leases → release crashed worker locks
+    try {
       await this.kernel.dispatch({
         type: "lease.reapStale",
         staleThresholdMs: this.staleLeaseThresholdMs,
       });
+    } catch (error) {
+      console.error("[NodeHost] lease.reapStale error:", error);
+    }
 
-      // 4. Flush outbox → publish pending events through EventSink
+    // 4. Flush outbox → publish pending events through EventSink
+    try {
       await this.kernel.dispatch({
         type: "outbox.flush",
         maxEvents: this.maxOutboxFlushPerTick,
       });
     } catch (error) {
-      // Orchestration errors are non-fatal — the next tick will retry
-      console.error("[NodeHost] Orchestration tick error:", error);
+      console.error("[NodeHost] outbox.flush error:", error);
     }
   }
 
