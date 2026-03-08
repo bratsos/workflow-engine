@@ -185,6 +185,22 @@ export interface PluginReplayDLQResult {
 }
 
 // ---------------------------------------------------------------------------
+// run.reapStuck
+// ---------------------------------------------------------------------------
+
+/** Detects and handles RUNNING runs with no recent activity. */
+export interface RunReapStuckCommand {
+  readonly type: "run.reapStuck";
+  readonly stuckThresholdMs: number;
+}
+
+/** Result of a `run.reapStuck` command. */
+export interface RunReapStuckResult {
+  readonly transitioned: number;
+  readonly failed: number;
+}
+
+// ---------------------------------------------------------------------------
 // Union & conditional result mapping
 // ---------------------------------------------------------------------------
 
@@ -199,7 +215,8 @@ export type KernelCommand =
   | StagePollSuspendedCommand
   | LeaseReapStaleCommand
   | OutboxFlushCommand
-  | PluginReplayDLQCommand;
+  | PluginReplayDLQCommand
+  | RunReapStuckCommand;
 
 /** String literal union of all kernel command type discriminants. */
 export type KernelCommandType = KernelCommand["type"];
@@ -225,4 +242,6 @@ export type CommandResult<T extends KernelCommand> = T extends RunCreateCommand
                   ? OutboxFlushResult
                   : T extends PluginReplayDLQCommand
                     ? PluginReplayDLQResult
-                    : never;
+                    : T extends RunReapStuckCommand
+                      ? RunReapStuckResult
+                      : never;

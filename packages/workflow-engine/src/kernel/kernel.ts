@@ -28,6 +28,7 @@ import type {
   RunCancelCommand,
   RunClaimPendingCommand,
   RunCreateCommand,
+  RunReapStuckCommand,
   RunRerunFromCommand,
   RunTransitionCommand,
   StagePollSuspendedCommand,
@@ -41,6 +42,7 @@ import { handlePluginReplayDLQ } from "./handlers/plugin-replay-dlq";
 import { handleRunCancel } from "./handlers/run-cancel";
 import { handleRunClaimPending } from "./handlers/run-claim-pending";
 import { handleRunCreate } from "./handlers/run-create";
+import { handleRunReapStuck } from "./handlers/run-reap-stuck";
 import { handleRunRerunFrom } from "./handlers/run-rerun-from";
 import { handleRunTransition } from "./handlers/run-transition";
 import { handleStagePollSuspended } from "./handlers/stage-poll-suspended";
@@ -268,6 +270,12 @@ export function createKernel(config: KernelConfig): Kernel {
           case "lease.reapStale":
             result = await handleLeaseReapStale(
               command as LeaseReapStaleCommand,
+              txDeps,
+            );
+            break;
+          case "run.reapStuck":
+            result = await handleRunReapStuck(
+              command as RunReapStuckCommand,
               txDeps,
             );
             break;

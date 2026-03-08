@@ -150,6 +150,11 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     return runs.map((run: any) => this.mapWorkflowRun(run));
   }
 
+  async getStuckRuns(_stuckSince: Date): Promise<WorkflowRunRecord[]> {
+    // TODO: Implement Prisma query for stuck runs
+    throw new Error("getStuckRuns not yet implemented for Prisma persistence");
+  }
+
   async claimPendingRun(id: string): Promise<boolean> {
     // Atomic update: only succeeds if status is still PENDING
     // This prevents race conditions when multiple workers try to claim the same run
