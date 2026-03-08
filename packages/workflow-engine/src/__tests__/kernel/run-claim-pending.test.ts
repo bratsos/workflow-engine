@@ -236,4 +236,136 @@ describe("kernel: run.claimPending", () => {
     expect(result.claimed[0]!.jobIds).toHaveLength(2);
     expect(jobTransport.getAllJobs()).toHaveLength(2);
   });
+
+  it("handles orphaned stages from a previous failed claim (P2002 scenario)", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, flush, persistence, jobTransport } = createTestKernel([
+      workflow,
+    ]);
+
+    // Create a run
+    await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "key-1",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+    await flush();
+
+    // Get the run to find its ID
+    const pendingRuns = await persistence.getRunsByStatus("PENDING");
+    const run = pendingRuns[0]!;
+
+    // Manually insert a PENDING stage record (simulating an orphan from a previous partial claim)
+    await persistence.createStage({
+      workflowRunId: run.id,
+      stageId: "stage-1",
+      stageName: "Stage stage-1",
+      stageNumber: 1,
+      executionGroup: 1,
+      status: "PENDING",
+      config: {},
+    });
+
+    // Call claimPending — should NOT throw, should upsert over the orphan
+    const result = await kernel.dispatch({
+      type: "run.claimPending",
+      workerId: "worker-1",
+    });
+
+    expect(result.claimed).toHaveLength(1);
+    expect(result.claimed[0]!.jobIds).toHaveLength(1);
+
+    // Only 1 stage record exists (not duplicated), status is PENDING
+    const stages = await persistence.getStagesByRun(run.id);
+    expect(stages).toHaveLength(1);
+    expect(stages[0]!.status).toBe("PENDING");
+  });
+
+  it("skips enqueue for stages already RUNNING or COMPLETED", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, flush, persistence, jobTransport } = createTestKernel([
+      workflow,
+    ]);
+
+    // Create a run
+    await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "key-1",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+    await flush();
+
+    // Get the run to find its ID
+    const pendingRuns = await persistence.getRunsByStatus("PENDING");
+    const run = pendingRuns[0]!;
+
+    // Manually insert a RUNNING stage record
+    await persistence.createStage({
+      workflowRunId: run.id,
+      stageId: "stage-1",
+      stageName: "Stage stage-1",
+      stageNumber: 1,
+      executionGroup: 1,
+      status: "RUNNING",
+      config: {},
+    });
+
+    // Call claimPending
+    const result = await kernel.dispatch({
+      type: "run.claimPending",
+      workerId: "worker-1",
+    });
+
+    expect(result.claimed).toHaveLength(1);
+    // No jobs enqueued for active stage
+    expect(result.claimed[0]!.jobIds).toHaveLength(0);
+
+    // Stage status is still RUNNING (not reset to PENDING)
+    const stages = await persistence.getStagesByRun(run.id);
+    expect(stages).toHaveLength(1);
+    expect(stages[0]!.status).toBe("RUNNING");
+  });
+
+  it("marks individual run as FAILED on unexpected claim error and continues", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, persistence, jobTransport } = createTestKernel([workflow]);
+
+    // Create two runs
+    await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "key-1",
+      workflowId: "test-workflow",
+      input: { data: "hello-1" },
+    });
+    await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "key-2",
+      workflowId: "test-workflow",
+      input: { data: "hello-2" },
+    });
+
+    // Sabotage: make upsertStage throw on first call, then work normally
+    let callCount = 0;
+    const origUpsert = persistence.upsertStage.bind(persistence);
+    persistence.upsertStage = async (data: any) => {
+      callCount++;
+      if (callCount === 1) throw new Error("Simulated DB error");
+      return origUpsert(data);
+    };
+
+    const result = await kernel.dispatch({
+      type: "run.claimPending",
+      workerId: "worker-1",
+      maxClaims: 2,
+    });
+
+    // Second run should have been claimed successfully
+    expect(result.claimed).toHaveLength(1);
+
+    // First run should be marked FAILED
+    const failedRuns = await persistence.getRunsByStatus("FAILED");
+    expect(failedRuns).toHaveLength(1);
+  });
 });

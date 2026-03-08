@@ -157,17 +157,21 @@ class NodeHostImpl implements NodeHost {
   // --------------------------------------------------------------------------
 
   private async orchestrationTick(): Promise<void> {
-    try {
-      this.orchestrationTicks++;
+    this.orchestrationTicks++;
 
-      // 1. Claim pending runs → enqueue first-stage jobs
+    // 1. Claim pending runs → enqueue first-stage jobs
+    try {
       await this.kernel.dispatch({
         type: "run.claimPending",
         workerId: this.workerId,
         maxClaims: this.maxClaimsPerTick,
       });
+    } catch (error) {
+      console.error("[NodeHost] run.claimPending error:", error);
+    }
 
-      // 2. Poll suspended stages → resume if ready
+    // 2. Poll suspended stages → resume if ready
+    try {
       const pollResult = await this.kernel.dispatch({
         type: "stage.pollSuspended",
         maxChecks: this.maxSuspendedChecksPerTick,
@@ -178,21 +182,38 @@ class NodeHostImpl implements NodeHost {
           workflowRunId,
         });
       }
+    } catch (error) {
+      console.error("[NodeHost] stage.pollSuspended error:", error);
+    }
 
-      // 3. Reap stale leases → release crashed worker locks
+    // 3. Reap stale leases → release crashed worker locks
+    try {
       await this.kernel.dispatch({
         type: "lease.reapStale",
         staleThresholdMs: this.staleLeaseThresholdMs,
       });
+    } catch (error) {
+      console.error("[NodeHost] lease.reapStale error:", error);
+    }
 
-      // 4. Flush outbox → publish pending events through EventSink
+    // 4. Flush outbox → publish pending events through EventSink
+    try {
       await this.kernel.dispatch({
         type: "outbox.flush",
         maxEvents: this.maxOutboxFlushPerTick,
       });
     } catch (error) {
-      // Orchestration errors are non-fatal — the next tick will retry
-      console.error("[NodeHost] Orchestration tick error:", error);
+      console.error("[NodeHost] outbox.flush error:", error);
+    }
+
+    // 5. Reap stuck runs → fail runs with no activity past threshold
+    try {
+      await this.kernel.dispatch({
+        type: "run.reapStuck",
+        stuckThresholdMs: Math.max(this.staleLeaseThresholdMs * 3, 5 * 60_000),
+      });
+    } catch (error) {
+      console.error("[NodeHost] run.reapStuck error:", error);
     }
   }
 
@@ -234,7 +255,10 @@ class NodeHostImpl implements NodeHost {
           const nextPollAt = result.nextPollAt ?? new Date(Date.now() + 60_000);
           await this.jobTransport.suspend(job.jobId, nextPollAt);
         } else if (result.outcome === "failed") {
-          const canRetry = job.attempt < (job.maxAttempts ?? 3);
+          // Ghost jobs (discarded by kernel because run is not RUNNING)
+          // should never be retried — they'll just fail again.
+          const isGhostJob = result.error?.includes("ghost job discarded");
+          const canRetry = !isGhostJob && job.attempt < (job.maxAttempts ?? 3);
           await this.jobTransport.fail(
             job.jobId,
             result.error ?? "Unknown error",

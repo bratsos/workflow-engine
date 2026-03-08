@@ -150,6 +150,25 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     return runs.map((run: any) => this.mapWorkflowRun(run));
   }
 
+  async getStuckRuns(stuckSince: Date): Promise<WorkflowRunRecord[]> {
+    // Find RUNNING runs where both the run and ALL its stages
+    // have not been updated since the threshold.
+    const runs = await this.prisma.workflowRun.findMany({
+      where: {
+        status: this.enums.status("RUNNING"),
+        updatedAt: { lte: stuckSince },
+        // No stage updated after the threshold
+        stages: {
+          none: {
+            updatedAt: { gt: stuckSince },
+          },
+        },
+      },
+      orderBy: { updatedAt: "asc" },
+    });
+    return runs.map((run: any) => this.mapWorkflowRun(run));
+  }
+
   async claimPendingRun(id: string): Promise<boolean> {
     // Atomic update: only succeeds if status is still PENDING
     // This prevents race conditions when multiple workers try to claim the same run

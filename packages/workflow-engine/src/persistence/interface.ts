@@ -337,6 +337,7 @@ export interface WorkflowPersistence {
   getRun(id: string): Promise<WorkflowRunRecord | null>;
   getRunStatus(id: string): Promise<WorkflowStatus | null>;
   getRunsByStatus(status: WorkflowStatus): Promise<WorkflowRunRecord[]>;
+  getStuckRuns(stuckSince: Date): Promise<WorkflowRunRecord[]>;
 
   /**
    * Atomically claim a pending workflow run for processing.

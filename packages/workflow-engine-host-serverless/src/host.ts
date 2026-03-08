@@ -66,6 +66,7 @@ export interface MaintenanceTickResult {
   suspendedChecked: number;
   staleReleased: number;
   eventsFlushed: number;
+  stuckReaped: number;
 }
 
 export interface ServerlessHost {
@@ -134,8 +135,9 @@ class ServerlessHostImpl implements ServerlessHost {
       return { outcome: "suspended" };
     }
 
-    // failed
-    const canRetry = msg.attempt < (msg.maxAttempts ?? 3);
+    // failed — ghost jobs should never be retried
+    const isGhostJob = result.error?.includes("ghost job discarded");
+    const canRetry = !isGhostJob && msg.attempt < (msg.maxAttempts ?? 3);
     await this.jobTransport.fail(
       msg.jobId,
       result.error ?? "Unknown error",
@@ -178,42 +180,80 @@ class ServerlessHostImpl implements ServerlessHost {
   }
 
   async runMaintenanceTick(): Promise<MaintenanceTickResult> {
+    let claimed = 0;
+    let suspendedChecked = 0;
+    let staleReleased = 0;
+    let eventsFlushed = 0;
+
     // 1. Claim pending runs → enqueue first-stage jobs
-    const claimResult = await this.kernel.dispatch({
-      type: "run.claimPending",
-      workerId: this.workerId,
-      maxClaims: this.maxClaimsPerTick,
-    });
+    try {
+      const claimResult = await this.kernel.dispatch({
+        type: "run.claimPending",
+        workerId: this.workerId,
+        maxClaims: this.maxClaimsPerTick,
+      });
+      claimed = claimResult.claimed.length;
+    } catch (error) {
+      console.error("[ServerlessHost] run.claimPending error:", error);
+    }
 
     // 2. Poll suspended stages → resume if ready
-    const pollResult = await this.kernel.dispatch({
-      type: "stage.pollSuspended",
-      maxChecks: this.maxSuspendedChecksPerTick,
-    });
-    for (const workflowRunId of pollResult.resumedWorkflowRunIds) {
-      await this.kernel.dispatch({
-        type: "run.transition",
-        workflowRunId,
+    try {
+      const pollResult = await this.kernel.dispatch({
+        type: "stage.pollSuspended",
+        maxChecks: this.maxSuspendedChecksPerTick,
       });
+      suspendedChecked = pollResult.checked;
+      for (const workflowRunId of pollResult.resumedWorkflowRunIds) {
+        await this.kernel.dispatch({
+          type: "run.transition",
+          workflowRunId,
+        });
+      }
+    } catch (error) {
+      console.error("[ServerlessHost] stage.pollSuspended error:", error);
     }
 
     // 3. Reap stale leases → release crashed worker locks
-    const reapResult = await this.kernel.dispatch({
-      type: "lease.reapStale",
-      staleThresholdMs: this.staleLeaseThresholdMs,
-    });
+    try {
+      const reapResult = await this.kernel.dispatch({
+        type: "lease.reapStale",
+        staleThresholdMs: this.staleLeaseThresholdMs,
+      });
+      staleReleased = reapResult.released;
+    } catch (error) {
+      console.error("[ServerlessHost] lease.reapStale error:", error);
+    }
 
     // 4. Flush outbox → publish pending events through EventSink
-    const flushResult = await this.kernel.dispatch({
-      type: "outbox.flush",
-      maxEvents: this.maxOutboxFlushPerTick,
-    });
+    try {
+      const flushResult = await this.kernel.dispatch({
+        type: "outbox.flush",
+        maxEvents: this.maxOutboxFlushPerTick,
+      });
+      eventsFlushed = flushResult.published;
+    } catch (error) {
+      console.error("[ServerlessHost] outbox.flush error:", error);
+    }
+
+    // 5. Reap stuck runs → fail runs with no activity past threshold
+    let stuckReaped = 0;
+    try {
+      const reapStuckResult = await this.kernel.dispatch({
+        type: "run.reapStuck",
+        stuckThresholdMs: Math.max(this.staleLeaseThresholdMs * 3, 5 * 60_000),
+      });
+      stuckReaped = reapStuckResult.failed;
+    } catch (error) {
+      console.error("[ServerlessHost] run.reapStuck error:", error);
+    }
 
     return {
-      claimed: claimResult.claimed.length,
-      suspendedChecked: pollResult.checked,
-      staleReleased: reapResult.released,
-      eventsFlushed: flushResult.published,
+      claimed,
+      suspendedChecked,
+      staleReleased,
+      eventsFlushed,
+      stuckReaped,
     };
   }
 }

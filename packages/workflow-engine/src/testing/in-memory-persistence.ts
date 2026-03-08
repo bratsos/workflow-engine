@@ -139,6 +139,27 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
       .map((run) => ({ ...run }));
   }
 
+  async getStuckRuns(stuckSince: Date): Promise<WorkflowRunRecord[]> {
+    const runningRuns = await this.getRunsByStatus("RUNNING");
+    return runningRuns.filter((run) => {
+      // Find all stages for this run (deduplicate by ID since stages are stored with composite keys)
+      const seenIds = new Set<string>();
+      const stages = Array.from(this.stages.values()).filter((s) => {
+        if (s.workflowRunId !== run.id) return false;
+        if (seenIds.has(s.id)) return false;
+        seenIds.add(s.id);
+        return true;
+      });
+      const lastStageUpdate = stages.reduce(
+        (max, s) => (s.updatedAt > max ? s.updatedAt : max),
+        new Date(0),
+      );
+      const lastActivity =
+        run.updatedAt > lastStageUpdate ? run.updatedAt : lastStageUpdate;
+      return lastActivity <= stuckSince;
+    });
+  }
+
   async claimPendingRun(id: string): Promise<boolean> {
     const run = this.runs.get(id);
     if (!run || run.status !== "PENDING") {

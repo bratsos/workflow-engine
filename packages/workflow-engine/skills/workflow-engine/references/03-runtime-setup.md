@@ -163,9 +163,11 @@ Run from a cron trigger (Cloudflare Cron, EventBridge, etc.):
 
 ```typescript
 const tick = await host.runMaintenanceTick();
-// { claimed, suspendedChecked, staleReleased, eventsFlushed }
+// { claimed, suspendedChecked, staleReleased, eventsFlushed, stuckReaped }
 // Resumed suspended stages are automatically followed by run.transition.
 ```
+
+Each maintenance step runs in its own error boundary — if one step fails, the others still execute. See [09-troubleshooting.md](09-troubleshooting.md) for details.
 
 ## Multi-Worker Setup
 
