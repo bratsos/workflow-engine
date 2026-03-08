@@ -205,6 +205,16 @@ class NodeHostImpl implements NodeHost {
     } catch (error) {
       console.error("[NodeHost] outbox.flush error:", error);
     }
+
+    // 5. Reap stuck runs → fail runs with no activity past threshold
+    try {
+      await this.kernel.dispatch({
+        type: "run.reapStuck",
+        stuckThresholdMs: Math.max(this.staleLeaseThresholdMs * 3, 5 * 60_000),
+      });
+    } catch (error) {
+      console.error("[NodeHost] run.reapStuck error:", error);
+    }
   }
 
   // --------------------------------------------------------------------------

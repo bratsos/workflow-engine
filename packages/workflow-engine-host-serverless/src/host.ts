@@ -66,6 +66,7 @@ export interface MaintenanceTickResult {
   suspendedChecked: number;
   staleReleased: number;
   eventsFlushed: number;
+  stuckReaped: number;
 }
 
 export interface ServerlessHost {
@@ -234,11 +235,24 @@ class ServerlessHostImpl implements ServerlessHost {
       console.error("[ServerlessHost] outbox.flush error:", error);
     }
 
+    // 5. Reap stuck runs → fail runs with no activity past threshold
+    let stuckReaped = 0;
+    try {
+      const reapStuckResult = await this.kernel.dispatch({
+        type: "run.reapStuck",
+        stuckThresholdMs: Math.max(this.staleLeaseThresholdMs * 3, 5 * 60_000),
+      });
+      stuckReaped = reapStuckResult.failed;
+    } catch (error) {
+      console.error("[ServerlessHost] run.reapStuck error:", error);
+    }
+
     return {
       claimed,
       suspendedChecked,
       staleReleased,
       eventsFlushed,
+      stuckReaped,
     };
   }
 }
