@@ -1,6 +1,6 @@
 {
   "name": "@bratsos/workflow-engine-host-serverless",
-  "version": "0.2.8",
+  "version": "0.2.9",
   "description": "Platform-agnostic serverless host for @bratsos/workflow-engine command kernel",
   "type": "module",
   "license": "MIT",
