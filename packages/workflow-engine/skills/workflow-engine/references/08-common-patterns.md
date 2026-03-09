@@ -41,15 +41,28 @@ await kernel.dispatch({ type: "outbox.flush", maxEvents: 100 });
 
 This ensures events are only published after the underlying database transaction succeeds, preventing lost or phantom events.
 
-### Multi-phase transactions for `job.execute`
+### Multi-phase transactions
 
-Most commands execute inside a single database transaction (handler logic + outbox event writes). `job.execute` is the exception — it uses a multi-phase transaction pattern to avoid holding a database connection open during long-running stage execution:
+Most commands execute inside a single database transaction (handler logic + outbox event writes). Two commands manage their own transactions to avoid holding connections during external I/O:
+
+#### `job.execute`
+
+Uses a 3-phase pattern so that long-running stage execution doesn't hold a DB connection:
 
 1. **Phase 1 (Start):** Upsert stage to `RUNNING` + write `stage:started` outbox event in one transaction. Commits immediately so `RUNNING` status is visible to observers.
 2. **Phase 2 (Execute):** `stageDef.execute()` runs outside any database transaction. Progress events are collected in memory.
 3. **Phase 3 (Complete):** Update stage to `COMPLETED`/`SUSPENDED`/`FAILED` + write completion and progress outbox events in one transaction.
 
 If the process crashes between Phase 1 and Phase 3, the stage stays in `RUNNING` and `lease.reapStale` will eventually retry the job.
+
+#### `stage.pollSuspended`
+
+Uses per-stage transactions so that `checkCompletion()` — which makes external HTTP calls to batch providers (Google Batch, OpenAI Batch, etc.) — runs outside any database transaction:
+
+1. **Phase 1 (Check):** `stageDef.checkCompletion()` runs outside any transaction. External API calls happen here.
+2. **Phase 2 (Persist):** Update stage status + append outbox events in one short transaction per stage.
+
+Without this, slow batch provider responses would exceed Prisma's interactive transaction timeout (default 5s), causing P2028 errors and leaving stages permanently stuck in `SUSPENDED`.
 
 The outbox includes retry logic with a dead-letter queue (DLQ). Events that fail to publish are retried up to 3 times before being moved to the DLQ. Use `plugin.replayDLQ` to reprocess them:
 

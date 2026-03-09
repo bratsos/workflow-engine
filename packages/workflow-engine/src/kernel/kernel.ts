@@ -7,10 +7,13 @@
  * command to publish pending outbox events through EventSink.
  *
  * Most commands execute inside a single database transaction (handler
- * logic + outbox event writes). `job.execute` is the exception — it
- * uses a multi-phase transaction pattern so that long-running stage
- * execution does not hold a database connection open. See the handler
- * in `handlers/job-execute.ts` for details.
+ * logic + outbox event writes). Two exceptions manage their own
+ * transactions to avoid holding connections during external I/O:
+ *
+ *  - `job.execute` — multi-phase pattern (see `handlers/job-execute.ts`)
+ *  - `stage.pollSuspended` — per-stage transactions so that
+ *    checkCompletion() HTTP calls run outside any transaction
+ *    (see `handlers/stage-poll-suspended.ts`)
  *
  * Commands with idempotency keys are deduplicated: a replay returns the
  * cached result without re-executing the handler.
@@ -161,6 +164,20 @@ export function createKernel(config: KernelConfig): Kernel {
     }
 
     // -----------------------------------------------------------------
+    // stage.pollSuspended manages its own per-stage transactions so
+    // that checkCompletion() (which makes external HTTP calls) does
+    // not hold a database transaction open.
+    // -----------------------------------------------------------------
+    if (command.type === "stage.pollSuspended") {
+      const result = await handleStagePollSuspended(
+        command as StagePollSuspendedCommand,
+        deps,
+      );
+      const { _events: _, ...publicResult } = result;
+      return publicResult as CommandResult<T>;
+    }
+
+    // -----------------------------------------------------------------
     // job.execute manages its own multi-phase transactions so that
     // RUNNING status is visible immediately and long-running stage
     // execution does not hold a database transaction open.
@@ -258,12 +275,6 @@ export function createKernel(config: KernelConfig): Kernel {
           case "run.rerunFrom":
             result = await handleRunRerunFrom(
               command as RunRerunFromCommand,
-              txDeps,
-            );
-            break;
-          case "stage.pollSuspended":
-            result = await handleStagePollSuspended(
-              command as StagePollSuspendedCommand,
               txDeps,
             );
             break;
