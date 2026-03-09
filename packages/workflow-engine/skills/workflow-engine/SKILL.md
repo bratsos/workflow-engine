@@ -124,7 +124,7 @@ All operations go through `kernel.dispatch(command)`:
 | `run.cancel` | Cancel a running workflow |
 | `run.rerunFrom` | Rerun from a specific stage |
 | `job.execute` | Execute a single stage (uses multi-phase transactions; see 08-common-patterns.md) |
-| `stage.pollSuspended` | Poll suspended stages for readiness (returns `resumedWorkflowRunIds`) |
+| `stage.pollSuspended` | Poll suspended stages for readiness (uses per-stage transactions; see 08-common-patterns.md) |
 | `lease.reapStale` | Release stale job leases |
 | `run.reapStuck` | Detect and fail RUNNING runs with no recent activity |
 | `outbox.flush` | Publish pending outbox events |
@@ -436,7 +436,7 @@ await kernel.dispatch({ type: "run.transition", workflowRunId: job.workflowRunId
 2. **Command Kernel**: All operations are typed commands dispatched through `kernel.dispatch()`
 3. **Environment-Agnostic**: Kernel has no timers, no signals, no global state
 4. **Context Access**: Use `ctx.require()` and `ctx.optional()` for type-safe stage output access
-5. **Transactional Outbox**: Events written to outbox, published via `outbox.flush` command. `job.execute` uses multi-phase transactions to avoid holding connections during long-running stage execution
+5. **Transactional Outbox**: Events written to outbox, published via `outbox.flush` command. `job.execute` and `stage.pollSuspended` use multi-phase transactions to avoid holding connections during external I/O
 6. **Idempotency**: `run.create` and `job.execute` replay cached results by key; concurrent same-key dispatch throws `IdempotencyInProgressError`
 7. **Self-Healing**: Stage creation is idempotent (upsert), orchestration steps are isolated, ghost jobs are discarded, stuck runs are automatically reaped
 8. **Cost Tracking**: All AI calls automatically track tokens and costs

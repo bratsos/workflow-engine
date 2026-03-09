@@ -48,6 +48,14 @@ await kernel.dispatch({ type: "run.transition", workflowRunId: runId });
 
 **If you still see P2002 errors:** They should only come from other parts of the system (e.g., idempotency key conflicts, which are expected and handled). Check the error's `meta.target` field to see which constraint was violated.
 
+## P2028 Transaction Timeout on Suspended Stage Polling
+
+**Symptom:** Logs show `P2028: Transaction API error: A query cannot be executed on an expired transaction` during `stage.pollSuspended`. Suspended stages never transition to `COMPLETED` even when the batch provider reports completion.
+
+**What it was:** `checkCompletion()` was running inside the kernel's global Prisma interactive transaction. Batch provider API calls (Google Batch, OpenAI Batch, etc.) that took longer than the default 5s timeout would expire the transaction, and the subsequent `updateStage()` call would fail.
+
+**How it's fixed:** `stage.pollSuspended` now manages its own per-stage transactions (same pattern as `job.execute`). `checkCompletion()` runs outside any transaction, and only the DB state update + outbox writes are wrapped in a short transaction afterward.
+
 ## Ghost Jobs
 
 **Symptom:** Jobs execute against runs that aren't `RUNNING`, or stages get upserted to `RUNNING` for runs that should be `FAILED`/`CANCELLED`.
