@@ -1,5 +1,11 @@
 # @bratsos/workflow-engine
 
+## 0.5.1
+
+### Patch Changes
+
+- 51ede14: Move checkCompletion() calls outside Prisma interactive transaction in stage.pollSuspended to prevent P2028 timeout errors when batch provider APIs are slow to respond.
+
 ## 0.5.0
 
 ### Minor Changes
