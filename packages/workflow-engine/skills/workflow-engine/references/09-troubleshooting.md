@@ -62,9 +62,10 @@ await kernel.dispatch({ type: "run.transition", workflowRunId: runId });
 
 **What it was:** If the kernel transaction rolled back after `jobTransport.enqueueParallel` committed (separate transaction), ghost jobs would exist in the queue pointing to runs/stages that were rolled back.
 
-**How it's fixed (two layers):**
-1. **Kernel guard:** `job.execute` checks `workflowRun.status === "RUNNING"` before proceeding. Ghost jobs for non-RUNNING runs are discarded with `outcome: "failed"` and error message containing `"ghost job discarded"`.
-2. **Host no-retry:** Both Node and Serverless hosts detect ghost job failures (error contains `"ghost job discarded"`) and set `canRetry = false`, preventing infinite retry loops.
+**How it's fixed (three layers):**
+1. **Authoritative cancellation:** `run.cancel` cancels all queued/suspended jobs via `jobTransport.cancelByRun()`, preventing most ghost jobs before dequeue.
+2. **Kernel guard:** `job.execute` checks `workflowRun.status === "RUNNING"` both before AND after stage execution. Ghost jobs are discarded with `outcome: "failed"` and a typed `ghost: true` flag in the result.
+3. **Host no-retry:** Both Node and Serverless hosts detect ghost jobs via the `ghost: true` flag (not string matching) and set `canRetry = false`, preventing infinite retry loops.
 
 ## One Bad Run Blocks Everything
 

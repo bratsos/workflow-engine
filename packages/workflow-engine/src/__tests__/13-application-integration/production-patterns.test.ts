@@ -267,10 +267,10 @@ describe("I want to use production-ready patterns", () => {
       await jobQueue.dequeue();
       await jobQueue.fail(jobId, "Timeout", true);
 
-      // Then: Job is back in queue for retry
+      // Then: Job is back in queue for retry (attempt reflects last dequeue)
       let job = jobQueue.getJob(jobId);
       expect(job?.status).toBe("PENDING");
-      expect(job?.attempt).toBe(2);
+      expect(job?.attempt).toBe(1);
 
       // Second attempt fails
       await jobQueue.dequeue();

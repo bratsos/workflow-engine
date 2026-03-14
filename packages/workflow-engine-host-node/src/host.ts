@@ -257,8 +257,8 @@ class NodeHostImpl implements NodeHost {
         } else if (result.outcome === "failed") {
           // Ghost jobs (discarded by kernel because run is not RUNNING)
           // should never be retried — they'll just fail again.
-          const isGhostJob = result.error?.includes("ghost job discarded");
-          const canRetry = !isGhostJob && job.attempt < (job.maxAttempts ?? 3);
+          const canRetry =
+            !result.ghost && job.attempt < (job.maxAttempts ?? 3);
           await this.jobTransport.fail(
             job.jobId,
             result.error ?? "Unknown error",

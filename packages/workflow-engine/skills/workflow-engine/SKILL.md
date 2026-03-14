@@ -4,7 +4,7 @@ description: Guide for @bratsos/workflow-engine - a type-safe workflow engine wi
 license: MIT
 metadata:
   author: bratsos
-  version: "0.2.0"
+  version: "0.3.0"
   repository: https://github.com/bratsos/workflow-engine
 ---
 
@@ -109,6 +109,10 @@ await kernel.dispatch({
 | `createServerlessHost` | Function | `@bratsos/workflow-engine-host-serverless` | Create serverless host |
 | `createAIHelper` | Function | `@bratsos/workflow-engine` | AI operations (text, object, embed, batch) |
 | `registerEmbeddingProvider` | Function | `@bratsos/workflow-engine` | Register custom embedding providers (Voyage, Cohere, etc.) |
+| `createStageIds` | Function | `@bratsos/workflow-engine` | Create stage ID constants from a workflow |
+| `defineStageIds` | Function | `@bratsos/workflow-engine` | Define stage ID constants from a tuple |
+| `isValidStageId` | Function | `@bratsos/workflow-engine` | Runtime stage ID validation |
+| `assertValidStageId` | Function | `@bratsos/workflow-engine` | Assert stage ID validity (throws) |
 | `definePlugin` | Function | `@bratsos/workflow-engine/kernel` | Define kernel plugins |
 | `createPluginRunner` | Function | `@bratsos/workflow-engine/kernel` | Create plugin event processor |
 
@@ -121,10 +125,10 @@ All operations go through `kernel.dispatch(command)`:
 | `run.create` | Create a new workflow run |
 | `run.claimPending` | Claim pending runs, enqueue first-stage jobs |
 | `run.transition` | Advance to next stage group or complete |
-| `run.cancel` | Cancel a running workflow |
-| `run.rerunFrom` | Rerun from a specific stage |
+| `run.cancel` | Cancel a running workflow (authoritative: cascades to stages + jobs) |
+| `run.rerunFrom` | Rerun from a specific stage (cleans up blob artifacts by prefix) |
 | `job.execute` | Execute a single stage (uses multi-phase transactions; see 08-common-patterns.md) |
-| `stage.pollSuspended` | Poll suspended stages for readiness (uses per-stage transactions; see 08-common-patterns.md) |
+| `stage.pollSuspended` | Poll suspended stages for readiness (skips cancelled runs; per-stage transactions) |
 | `lease.reapStale` | Release stale job leases |
 | `run.reapStuck` | Detect and fail RUNNING runs with no recent activity |
 | `outbox.flush` | Publish pending outbox events |
@@ -179,7 +183,12 @@ const batchStage = defineAsyncBatchStage({
     const batchId = await submitBatchJob(ctx.input);
     return {
       suspended: true,
-      state: { batchId, pollInterval: 60000, maxWaitTime: 3600000 },
+      state: {
+        batchId,
+        submittedAt: new Date().toISOString(),
+        pollInterval: 60000,
+        maxWaitTime: 3600000,
+      },
       pollConfig: { pollInterval: 60000, maxWaitTime: 3600000, nextPollAt: new Date(Date.now() + 60000) },
     };
   },
@@ -195,22 +204,30 @@ const batchStage = defineAsyncBatchStage({
 
 ## WorkflowBuilder
 
+Workflows are linear pipelines of **execution groups**. `.pipe()` creates single-stage groups; `.parallel()` creates multi-stage groups. Parallel group outputs are keyed by stage ID in the workflow context.
+
 ```typescript
 const workflow = new WorkflowBuilder(
   "workflow-id", "Workflow Name", "Description",
   InputSchema, OutputSchema
 )
-  .pipe(stage1)
-  .pipe(stage2)
-  .parallel([stage3a, stage3b])
-  .pipe(stage4)
+  .pipe(stage1)                          // Group 0
+  .pipe(stage2)                          // Group 1
+  .parallel([stage3a, stage3b])          // Group 2 (concurrent, output: { "stage3a-id": ..., "stage3b-id": ... })
+  .pipe(stage4)                          // Group 3
   .build();
+
+// In stage4, access parallel outputs by stage ID:
+ctx.require("stage3a-id")  // output of stage3a
+ctx.require("stage3b-id")  // output of stage3b
 
 workflow.getStageIds();
 workflow.getExecutionPlan();
 workflow.getDefaultConfig();
 workflow.validateConfig(config);
 ```
+
+When a workflow completes, the final execution group's output is persisted in `WorkflowRun.output` and included in the `workflow:completed` event.
 
 ## Kernel Setup
 
@@ -438,5 +455,7 @@ await kernel.dispatch({ type: "run.transition", workflowRunId: job.workflowRunId
 4. **Context Access**: Use `ctx.require()` and `ctx.optional()` for type-safe stage output access
 5. **Transactional Outbox**: Events written to outbox, published via `outbox.flush` command. `job.execute` and `stage.pollSuspended` use multi-phase transactions to avoid holding connections during external I/O
 6. **Idempotency**: `run.create` and `job.execute` replay cached results by key; concurrent same-key dispatch throws `IdempotencyInProgressError`
-7. **Self-Healing**: Stage creation is idempotent (upsert), orchestration steps are isolated, ghost jobs are discarded, stuck runs are automatically reaped
-8. **Cost Tracking**: All AI calls automatically track tokens and costs
+7. **Authoritative Cancellation**: `run.cancel` cascades to stages + jobs. Ghost jobs (running against non-RUNNING runs) are detected via `ghost: true` flag and not retried
+8. **Self-Healing**: Stage creation is idempotent (upsert), orchestration steps are isolated, stuck runs are automatically reaped
+9. **Cost Tracking**: All AI calls automatically track tokens and costs
+10. **BlobStore-Only Artifacts**: All artifact storage goes through the BlobStore port. `run.rerunFrom` cleans up artifacts by key prefix

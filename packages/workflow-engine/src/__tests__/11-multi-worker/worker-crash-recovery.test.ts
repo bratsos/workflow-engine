@@ -27,10 +27,10 @@ describe("I want to recover from worker crashes", () => {
       await jobQueue.dequeue();
       await jobQueue.fail(jobId, "First failure", true);
 
-      // Then: Job is back to PENDING for retry
+      // Then: Job is back to PENDING for retry (attempt stays at last dequeue value)
       let job = jobQueue.getJob(jobId);
       expect(job?.status).toBe("PENDING");
-      expect(job?.attempt).toBe(2);
+      expect(job?.attempt).toBe(1);
       expect(job?.lastError).toBe("First failure");
 
       // When: Second attempt also fails
@@ -39,7 +39,7 @@ describe("I want to recover from worker crashes", () => {
 
       job = jobQueue.getJob(jobId);
       expect(job?.status).toBe("PENDING");
-      expect(job?.attempt).toBe(3);
+      expect(job?.attempt).toBe(2);
       expect(job?.lastError).toBe("Second failure");
 
       // When: Third attempt fails (max attempts reached)
@@ -202,9 +202,9 @@ describe("I want to recover from worker crashes", () => {
       await jobQueue.dequeue();
       await jobQueue.fail(jobId, "Error 2", true);
 
-      // Then: Attempt count reflects history
+      // Then: Attempt count reflects last dequeue (2 dequeues = attempt 2)
       const job = jobQueue.getJob(jobId);
-      expect(job?.attempt).toBe(3);
+      expect(job?.attempt).toBe(2);
     });
   });
 

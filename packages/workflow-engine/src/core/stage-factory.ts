@@ -137,9 +137,10 @@ export interface SyncStageDefinition<
   TOutput extends z.ZodTypeAny,
   TConfig extends z.ZodTypeAny,
   TContext extends Record<string, unknown> = Record<string, unknown>,
+  TId extends string = string,
 > {
   /** Unique stage identifier */
-  id: string;
+  id: TId;
   /** Human-readable name */
   name: string;
   /** Optional description */
@@ -182,8 +183,9 @@ export interface AsyncBatchStageDefinition<
   TOutput extends z.ZodTypeAny,
   TConfig extends z.ZodTypeAny,
   TContext extends Record<string, unknown> = Record<string, unknown>,
+  TId extends string = string,
 > extends Omit<
-    SyncStageDefinition<TInput, TOutput, TConfig, TContext>,
+    SyncStageDefinition<TInput, TOutput, TConfig, TContext, TId>,
     "execute"
   > {
   /** Mark as async-batch mode */
@@ -222,53 +224,65 @@ export interface AsyncBatchStageDefinition<
  * Define a sync stage with simplified API
  */
 export function defineStage<
+  TId extends string,
   TInput extends z.ZodTypeAny | "none",
   TOutput extends z.ZodTypeAny,
   TConfig extends z.ZodTypeAny,
   TContext extends Record<string, unknown> = Record<string, unknown>,
 >(
-  definition: SyncStageDefinition<TInput, TOutput, TConfig, TContext>,
+  definition: SyncStageDefinition<TInput, TOutput, TConfig, TContext, TId>,
 ): Stage<
   TInput extends "none" ? typeof NoInputSchema : TInput,
   TOutput,
   TConfig,
-  TContext
+  TContext,
+  TId
 >;
 
 /**
  * Define an async-batch stage with simplified API
  */
 export function defineStage<
+  TId extends string,
   TInput extends z.ZodTypeAny | "none",
   TOutput extends z.ZodTypeAny,
   TConfig extends z.ZodTypeAny,
   TContext extends Record<string, unknown> = Record<string, unknown>,
 >(
-  definition: AsyncBatchStageDefinition<TInput, TOutput, TConfig, TContext>,
+  definition: AsyncBatchStageDefinition<
+    TInput,
+    TOutput,
+    TConfig,
+    TContext,
+    TId
+  >,
 ): Stage<
   TInput extends "none" ? typeof NoInputSchema : TInput,
   TOutput,
   TConfig,
-  TContext
+  TContext,
+  TId
 >;
 
 /**
  * Implementation
  */
 export function defineStage<
+  TId extends string,
   TInput extends z.ZodTypeAny | "none",
   TOutput extends z.ZodTypeAny,
   TConfig extends z.ZodTypeAny,
   TContext extends Record<string, unknown> = Record<string, unknown>,
 >(
   definition:
-    | SyncStageDefinition<TInput, TOutput, TConfig, TContext>
-    | AsyncBatchStageDefinition<TInput, TOutput, TConfig, TContext>,
+    | SyncStageDefinition<TInput, TOutput, TConfig, TContext, TId>
+    | AsyncBatchStageDefinition<TInput, TOutput, TConfig, TContext, TId>,
 ): Stage<
   TInput extends "none" ? typeof NoInputSchema : TInput,
   TOutput,
   TConfig,
-  TContext
+  TContext,
+  TId
 > {
   // Resolve input schema
   const inputSchema =
@@ -284,7 +298,8 @@ export function defineStage<
     TInput extends "none" ? typeof NoInputSchema : TInput,
     TOutput,
     TConfig,
-    TContext
+    TContext,
+    TId
   > = {
     id: definition.id,
     name: definition.name,
@@ -446,17 +461,25 @@ export type InferStageConfig<T> = T extends Stage<
  * infers callback parameter types without overload resolution ambiguity.
  */
 export function defineAsyncBatchStage<
+  TId extends string,
   TInput extends z.ZodTypeAny | "none",
   TOutput extends z.ZodTypeAny,
   TConfig extends z.ZodTypeAny,
   TContext extends Record<string, unknown> = Record<string, unknown>,
 >(
-  definition: AsyncBatchStageDefinition<TInput, TOutput, TConfig, TContext>,
+  definition: AsyncBatchStageDefinition<
+    TInput,
+    TOutput,
+    TConfig,
+    TContext,
+    TId
+  >,
 ): Stage<
   TInput extends "none" ? typeof NoInputSchema : TInput,
   TOutput,
   TConfig,
-  TContext
+  TContext,
+  TId
 > {
   return defineStage(definition);
 }

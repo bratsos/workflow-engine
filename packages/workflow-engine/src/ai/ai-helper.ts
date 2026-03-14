@@ -223,9 +223,6 @@ export type StreamTextInput =
 /** Provider identifier for batch operations */
 export type AIBatchProvider = "google" | "anthropic" | "openai";
 
-/** @deprecated Use AIBatchProvider instead */
-export type BatchProvider = AIBatchProvider;
-
 /** A request to be processed in a batch */
 export interface AIBatchRequest {
   /** Unique identifier for this request (used to match results) */
@@ -235,9 +232,6 @@ export interface AIBatchRequest {
   /** Optional Zod schema for structured JSON output */
   schema?: z.ZodTypeAny;
 }
-
-/** @deprecated Use AIBatchRequest instead */
-export type BatchRequest = AIBatchRequest;
 
 /** Result of a single request in a batch */
 export interface AIBatchResult<T = string> {
@@ -257,9 +251,6 @@ export interface AIBatchResult<T = string> {
   error?: string;
 }
 
-/** @deprecated Use AIBatchResult instead */
-export type BatchResult<T = string> = AIBatchResult<T>;
-
 /** Handle for tracking a submitted batch */
 export interface AIBatchHandle {
   /** Batch identifier from the provider */
@@ -269,9 +260,6 @@ export interface AIBatchHandle {
   /** The provider used for this batch (for resume support) */
   provider?: AIBatchProvider;
 }
-
-/** @deprecated Use AIBatchHandle instead */
-export type BatchHandle = AIBatchHandle;
 
 /** Interface for batch operations on an AI model */
 export interface AIBatch<T = string> {

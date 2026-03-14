@@ -18,7 +18,15 @@ export {
   type SimpleStageResult,
   type SyncStageDefinition,
 } from "./core/stage-factory";
-
+// Stage ID utilities
+export {
+  assertValidStageId,
+  createStageIds,
+  defineStageIds,
+  isValidStageId,
+  type ValidateStageIds,
+  type WorkflowStageId,
+} from "./core/stage-ids";
 export { type StageResult } from "./core/types";
 // Core Workflow
 export {
@@ -92,10 +100,6 @@ export {
   withFeatureFlags,
   withStandardConfig,
 } from "./core/config-presets";
-export type {
-  WorkflowEventType,
-  WorkflowSSEEvent,
-} from "./core/workflow-events";
 // Persistence interfaces and types
 export type {
   AICallLogger,
@@ -110,7 +114,6 @@ export type {
   EnqueueJobInput,
   JobQueue,
   JobRecord,
-  JobStatus,
   LogLevel,
   SaveArtifactInput,
   // Unified status type (preferred)
@@ -123,9 +126,6 @@ export type {
   WorkflowPersistence,
   WorkflowRunRecord,
   WorkflowStageRecord,
-  WorkflowStageStatus,
-  // Deprecated aliases (use Status instead)
-  WorkflowStatus,
 } from "./persistence";
 // Prisma implementations and factories
 export {
@@ -154,16 +154,11 @@ export {
 // Batch Types
 export type {
   AnthropicBatchRequest,
-  // Request types
   BaseBatchRequest,
-  BatchHandle,
   BatchLogger,
   BatchMetrics,
-  BatchProvider,
-  BatchRequest,
   BatchRequestText,
   BatchRequestWithSchema,
-  BatchResult,
   BatchState,
   BatchStatus,
   BatchSubmitOptions,

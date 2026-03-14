@@ -120,9 +120,10 @@ export interface Stage<
   TOutput extends z.ZodTypeAny,
   TConfig extends z.ZodTypeAny,
   TWorkflowContext = Record<string, unknown>,
+  TId extends string = string,
 > {
   // Metadata
-  id: string;
+  id: TId;
   name: string;
   description?: string;
 

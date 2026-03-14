@@ -53,7 +53,7 @@ export class InMemoryJobQueue implements JobQueue {
       lockedAt: null,
       startedAt: null,
       completedAt: null,
-      attempt: 1,
+      attempt: 0,
       maxAttempts: this.defaultMaxAttempts,
       lastError: null,
       nextPollAt: options.scheduledFor ?? null,
@@ -97,7 +97,8 @@ export class InMemoryJobQueue implements JobQueue {
 
     const job = pendingJobs[0]!;
 
-    // Lock the job
+    // Lock the job and increment attempt (matches Prisma dequeue semantics)
+    const newAttempt = job.attempt + 1;
     const updated: JobRecord = {
       ...job,
       status: "RUNNING",
@@ -105,6 +106,7 @@ export class InMemoryJobQueue implements JobQueue {
       lockedAt: now,
       startedAt: now,
       updatedAt: now,
+      attempt: newAttempt,
     };
     this.jobs.set(job.id, updated);
 
@@ -114,7 +116,7 @@ export class InMemoryJobQueue implements JobQueue {
       workflowId: job.workflowId,
       stageId: job.stageId,
       priority: job.priority,
-      attempt: job.attempt,
+      attempt: newAttempt,
       maxAttempts: job.maxAttempts,
       payload: job.payload,
     };
@@ -166,11 +168,10 @@ export class InMemoryJobQueue implements JobQueue {
     const now = new Date();
 
     if (shouldRetry && job.attempt < job.maxAttempts) {
-      // Retry: move back to PENDING with incremented attempt
+      // Retry: move back to PENDING (attempt was already incremented during dequeue)
       const updated: JobRecord = {
         ...job,
         status: "PENDING",
-        attempt: job.attempt + 1,
         lastError: error,
         workerId: null,
         lockedAt: null,
@@ -230,6 +231,27 @@ export class InMemoryJobQueue implements JobQueue {
     }
 
     return released;
+  }
+
+  async cancelByRun(workflowRunId: string): Promise<number> {
+    const now = new Date();
+    let count = 0;
+    for (const job of this.jobs.values()) {
+      if (
+        job.workflowRunId === workflowRunId &&
+        (job.status === "PENDING" || job.status === "SUSPENDED")
+      ) {
+        const updated: JobRecord = {
+          ...job,
+          status: "CANCELLED",
+          completedAt: now,
+          updatedAt: now,
+        };
+        this.jobs.set(job.id, updated);
+        count++;
+      }
+    }
+    return count;
   }
 
   // ============================================================================

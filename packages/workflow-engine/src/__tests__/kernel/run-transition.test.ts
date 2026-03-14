@@ -12,6 +12,7 @@ import {
   InMemoryBlobStore,
   NoopScheduler,
 } from "../../kernel/testing/index.js";
+import { StaleVersionError } from "../../persistence/interface.js";
 import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
 import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 
@@ -341,5 +342,60 @@ describe("kernel: run.transition", () => {
       .getAllJobs()
       .find((j: any) => j.stageId === "stage-2");
     expect(stage2Job).toBeDefined();
+  });
+
+  it("returns noop when another transition already claimed the run", async () => {
+    const workflow = createTwoStageWorkflow();
+    const { kernel, persistence, jobTransport } = createTestKernel([workflow]);
+
+    const createResult = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "key-stale-transition",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+
+    await persistence.updateRun(createResult.workflowRunId, {
+      status: "RUNNING",
+    });
+    await persistence.createStage({
+      workflowRunId: createResult.workflowRunId,
+      stageId: "stage-1",
+      stageName: "Stage stage-1",
+      stageNumber: 1,
+      executionGroup: 1,
+      status: "COMPLETED",
+    });
+
+    const updateRunSpy = vi.spyOn(persistence, "updateRun");
+    updateRunSpy.mockImplementation(async (id, data) => {
+      if (
+        id === createResult.workflowRunId &&
+        data.expectedVersion !== undefined &&
+        data.status === undefined &&
+        data.output === undefined
+      ) {
+        throw new StaleVersionError(
+          "WorkflowRun",
+          id,
+          data.expectedVersion,
+          data.expectedVersion + 1,
+        );
+      }
+
+      return InMemoryWorkflowPersistence.prototype.updateRun.call(
+        persistence,
+        id,
+        data,
+      );
+    });
+
+    const result = await kernel.dispatch({
+      type: "run.transition",
+      workflowRunId: createResult.workflowRunId,
+    });
+
+    expect(result.action).toBe("noop");
+    expect(jobTransport.getAllJobs()).toHaveLength(0);
   });
 });

@@ -119,6 +119,8 @@ export interface JobExecuteResult {
   readonly output?: unknown;
   readonly error?: string;
   readonly nextPollAt?: Date;
+  /** True when the job was discarded because the run is no longer RUNNING. */
+  readonly ghost?: boolean;
 }
 
 // ---------------------------------------------------------------------------

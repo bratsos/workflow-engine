@@ -58,7 +58,7 @@ const kernel = createKernel({
 |------|-----------|---------|
 | `persistence` | `Persistence` | CRUD for runs, stages, logs, outbox events, idempotency keys |
 | `blobStore` | `BlobStore` | `put(key, data)`, `get(key)`, `has(key)`, `delete(key)`, `list(prefix)` |
-| `jobTransport` | `JobTransport` | `enqueue`, `enqueueParallel`, `dequeue`, `complete`, `suspend`, `fail` |
+| `jobTransport` | `JobTransport` | `enqueue`, `enqueueParallel`, `dequeue`, `complete`, `suspend`, `fail`, `cancelByRun` |
 | `eventSink` | `EventSink` | `emit(event)` - async event publishing |
 | `scheduler` | `Scheduler` | `schedule(type, payload, runAt)`, `cancel(type, correlationId)` |
 | `clock` | `Clock` | `now()` - returns `Date` |

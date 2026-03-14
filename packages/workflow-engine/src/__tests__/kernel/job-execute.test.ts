@@ -155,6 +155,67 @@ describe("kernel: job.execute", () => {
     expect(finalRun!.version).toBeGreaterThanOrEqual(1);
   });
 
+  it("persists returned stage artifacts to blob storage", async () => {
+    const schema = z.object({ data: z.string() });
+    const stage = defineStage({
+      id: "artifact-stage",
+      name: "Artifact Stage",
+      schemas: {
+        input: schema,
+        output: z.object({ result: z.string() }),
+        config: z.object({}),
+      },
+      async execute(ctx) {
+        return {
+          output: { result: ctx.input.data.toUpperCase() },
+          artifacts: {
+            raw: { original: ctx.input.data },
+            meta: { length: ctx.input.data.length },
+          },
+        };
+      },
+    });
+
+    const workflow = new WorkflowBuilder(
+      "artifact-workflow",
+      "Artifact Workflow",
+      "Test",
+      schema,
+      z.object({ result: z.string() }),
+    )
+      .pipe(stage)
+      .build();
+
+    const { kernel, persistence, blobStore } = createTestKernel([workflow]);
+
+    const createResult = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "key-artifacts",
+      workflowId: "artifact-workflow",
+      input: { data: "hello" },
+    });
+
+    await persistence.updateRun(createResult.workflowRunId, {
+      status: "RUNNING",
+    });
+
+    const result = await kernel.dispatch({
+      type: "job.execute",
+      workflowRunId: createResult.workflowRunId,
+      workflowId: "artifact-workflow",
+      stageId: "artifact-stage",
+      config: {},
+    });
+
+    expect(result.outcome).toBe("completed");
+    expect(blobStore.size()).toBe(3);
+
+    const rawArtifactKey =
+      "workflow-v2/artifact-workflow/" +
+      `${createResult.workflowRunId}/artifact-stage/artifacts/raw.json`;
+    expect(await blobStore.has(rawArtifactKey)).toBe(true);
+  });
+
   it("handles a failed stage", async () => {
     const schema = z.object({ data: z.string() });
     const stage = defineStage({

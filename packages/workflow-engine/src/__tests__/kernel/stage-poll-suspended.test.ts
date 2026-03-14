@@ -449,4 +449,92 @@ describe("kernel: stage.pollSuspended", () => {
     const updatedRun = await persistence.getRun(run.id);
     expect(updatedRun!.status).toBe("FAILED");
   });
+
+  it("does not complete a stage if the run is cancelled during checkCompletion", async () => {
+    const schema = z.object({ data: z.string() });
+    let kernelRef: Kernel;
+    let runIdRef = "";
+
+    const stage = defineAsyncBatchStage({
+      id: "batch-stage",
+      name: "Batch Stage",
+      mode: "async-batch",
+      schemas: {
+        input: schema,
+        output: z.object({ result: z.string() }),
+        config: z.object({}),
+      },
+      async execute() {
+        return {
+          suspended: true,
+          state: { batchId: "batch-1" },
+          pollConfig: {
+            pollInterval: 1000,
+            maxWaitTime: 60000,
+            nextPollAt: new Date(Date.now() + 1000),
+          },
+        };
+      },
+      async checkCompletion() {
+        await kernelRef.dispatch({
+          type: "run.cancel",
+          workflowRunId: runIdRef,
+        });
+        return { ready: true, output: { result: "late result" } };
+      },
+    });
+
+    const workflow = new WorkflowBuilder(
+      "test-workflow",
+      "Test",
+      "Test",
+      schema,
+      z.object({ result: z.string() }),
+    )
+      .pipe(stage)
+      .build();
+
+    const { kernel, persistence, clock } = createTestKernel([workflow]);
+    kernelRef = kernel;
+
+    const run = await persistence.createRun({
+      workflowId: "test-workflow",
+      workflowName: "Test",
+      workflowType: "test-workflow",
+      input: { data: "hello" },
+    });
+    runIdRef = run.id;
+
+    await persistence.updateRun(run.id, { status: "RUNNING" });
+
+    await persistence.createStage({
+      workflowRunId: run.id,
+      stageId: "batch-stage",
+      stageName: "Batch Stage",
+      stageNumber: 1,
+      executionGroup: 1,
+      status: "SUSPENDED",
+      startedAt: clock.now(),
+    });
+
+    const stages = await persistence.getStagesByRun(run.id);
+    await persistence.updateStage(stages[0]!.id, {
+      suspendedState: { batchId: "batch-1" },
+      nextPollAt: new Date(clock.now().getTime() - 1000),
+      pollInterval: 1000,
+    });
+
+    const result = await kernel.dispatch({
+      type: "stage.pollSuspended",
+    });
+
+    expect(result.checked).toBe(1);
+    expect(result.resumed).toBe(0);
+
+    const updatedRun = await persistence.getRun(run.id);
+    expect(updatedRun!.status).toBe("CANCELLED");
+
+    const updatedStage = await persistence.getStage(run.id, "batch-stage");
+    expect(updatedStage?.status).toBe("CANCELLED");
+  });
 });

@@ -96,6 +96,7 @@ const { deletedStages } = await kernel.dispatch({
 
 // Stages from "summarize" onward are deleted and re-queued
 // Earlier stages (e.g., "extract") keep their outputs
+// Blob artifacts for deleted stages are cleaned up by key prefix
 ```
 
 ## Plugin System
@@ -213,7 +214,7 @@ If claiming a specific run fails (e.g., workflow not found, database error), tha
 
 ### Ghost Job Guard
 
-`job.execute` verifies the run is in `RUNNING` status before executing. Jobs for `PENDING`, `FAILED`, `CANCELLED`, or `COMPLETED` runs are discarded with `outcome: "failed"` (no retry). This prevents ghost jobs from rolled-back transactions from resurrecting invalid state.
+`job.execute` verifies the run is in `RUNNING` status both before and after executing the stage. Jobs for non-`RUNNING` runs are discarded with `outcome: "failed"` and a `ghost: true` flag in the result. Hosts check this flag to disable retries (`canRetry = false`). This prevents ghost jobs from rolled-back transactions or concurrent cancellations from resurrecting invalid state.
 
 ### Orchestration Tick Isolation
 
