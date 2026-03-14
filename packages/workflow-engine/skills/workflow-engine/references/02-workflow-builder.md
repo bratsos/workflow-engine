@@ -55,6 +55,8 @@ Parallel stages:
 - Run in the same execution group
 - Receive the same input (output from previous group)
 - Must not depend on each other
+- Their outputs are merged into the workflow context keyed by stage ID (e.g., `{ "classify": classifyOutput, "summarize": summarizeOutput }`)
+- Subsequent stages access each parallel stage's output via `ctx.require("classify")`, `ctx.require("summarize")`, etc.
 
 ### build()
 

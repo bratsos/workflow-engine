@@ -228,6 +228,9 @@ export interface JobTransport {
 
   /** Release stale locks (for crashed workers). */
   releaseStaleJobs(staleThresholdMs?: number): Promise<number>;
+
+  /** Cancel all pending/suspended jobs for a workflow run. Returns count cancelled. */
+  cancelByRun(workflowRunId: string): Promise<number>;
 }
 
 // ============================================================================

@@ -130,7 +130,12 @@ function createAsyncBatchWorkflow(): Workflow<any, any> {
     async execute() {
       return {
         suspended: true,
-        state: { batchId: "batch-1" },
+        state: {
+          batchId: "batch-1",
+          submittedAt: new Date(0).toISOString(),
+          pollInterval: 1,
+          maxWaitTime: 60_000,
+        },
         pollConfig: {
           pollInterval: 1,
           maxWaitTime: 60_000,

@@ -1,7 +1,10 @@
 /**
  * Handler: run.cancel
  *
- * Cancels a running workflow if it is not already in a terminal state.
+ * Cancels a running workflow authoritatively:
+ * 1. Marks the run as CANCELLED
+ * 2. Marks all non-terminal stages as CANCELLED
+ * 3. Cancels queued/suspended jobs via job transport
  */
 
 import type { RunCancelCommand, RunCancelResult } from "../commands";
@@ -19,10 +22,26 @@ export async function handleRunCancel(
     return { cancelled: false, _events: [] };
   }
 
+  // 1. Mark run as CANCELLED
   await deps.persistence.updateRun(command.workflowRunId, {
     status: "CANCELLED",
     completedAt: deps.clock.now(),
   });
+
+  // 2. Mark all non-terminal stages as CANCELLED
+  const stages = await deps.persistence.getStagesByRun(command.workflowRunId);
+  for (const stage of stages) {
+    if (!TERMINAL_STATUSES.has(stage.status)) {
+      await deps.persistence.updateStage(stage.id, {
+        status: "CANCELLED",
+        completedAt: deps.clock.now(),
+        nextPollAt: null,
+      });
+    }
+  }
+
+  // 3. Cancel queued/suspended jobs
+  await deps.jobTransport.cancelByRun(command.workflowRunId);
 
   return {
     cancelled: true,

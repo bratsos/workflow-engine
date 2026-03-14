@@ -455,13 +455,13 @@ describe("I want to simulate worker process behavior", () => {
       await jobQueue.dequeue();
       await jobQueue.fail(jobId, "Connection timeout", true);
 
-      // Then: Job is back in queue for retry
+      // Then: Job is back in queue for retry (attempt reflects last dequeue)
       let job = jobQueue.getJob(jobId);
       expect(job?.status).toBe("PENDING");
-      expect(job?.attempt).toBe(2);
+      expect(job?.attempt).toBe(1);
       expect(job?.lastError).toBe("Connection timeout");
 
-      // And: Can be picked up again
+      // And: Can be picked up again (second dequeue increments to 2)
       const retryJob = await jobQueue.dequeue();
       expect(retryJob?.jobId).toBe(jobId);
       expect(retryJob?.attempt).toBe(2);

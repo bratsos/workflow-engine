@@ -265,6 +265,50 @@ describe("I want to rerun a workflow from a specific stage", () => {
       expect(run!.status).toBe("COMPLETED");
     });
 
+    it("should clear stale run output and metrics when rerunning", async () => {
+      const s1 = createPassthroughStage("s1");
+      const s2 = createPassthroughStage("s2");
+
+      const workflow = new WorkflowBuilder(
+        "two-stage",
+        "Two Stage",
+        "Test",
+        z.object({ value: z.string() }),
+        z.object({ value: z.string() }),
+      )
+        .pipe(s1)
+        .pipe(s2)
+        .build();
+
+      const { kernel, flush, persistence } = createTestKernel([workflow]);
+
+      const workflowRunId = await runWorkflowToCompletion(
+        kernel,
+        flush,
+        "two-stage",
+        ["s1", "s2"],
+        { value: "start" },
+      );
+
+      const completedRun = await persistence.getRun(workflowRunId);
+      expect(completedRun!.status).toBe("COMPLETED");
+      expect(completedRun!.output).toEqual({ value: "output-from-s2" });
+
+      await kernel.dispatch({
+        type: "run.rerunFrom",
+        workflowRunId,
+        fromStageId: "s2",
+      });
+
+      const rerun = await persistence.getRun(workflowRunId);
+      expect(rerun!.status).toBe("RUNNING");
+      expect(rerun!.output).toBeNull();
+      expect(rerun!.duration).toBeNull();
+      expect(rerun!.totalCost).toBe(0);
+      expect(rerun!.totalTokens).toBe(0);
+      expect(rerun!.startedAt).not.toBeNull();
+    });
+
     it("should rerun from stage 1 (first stage) using workflow input", async () => {
       // Given: A 2-stage workflow with an execution counter
       let executionCount = 0;

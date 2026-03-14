@@ -390,37 +390,6 @@ export class ModelStatsTracker {
   }
 
   /**
-   * Get the model ID for use with AI SDK
-   * @deprecated Use getModelById(modelKey).id instead for parallel execution
-   */
-  getModelId(): string {
-    if (!this.modelConfig) {
-      throw new Error("Model not set for this tracker");
-    }
-    return this.modelConfig.id;
-  }
-
-  /**
-   * Get the model configuration
-   * @deprecated Use getModelById(modelKey) instead for parallel execution
-   */
-  getModelConfig(): ModelConfig {
-    if (!this.modelConfig) {
-      throw new Error("Model not set for this tracker");
-    }
-    return this.modelConfig;
-  }
-
-  /**
-   * Switch model (useful for sequential model switching)
-   * @deprecated For parallel execution, pass model key to recordCall() instead
-   */
-  switchModel(modelKey: ModelKey): void {
-    this.modelKey = modelKey;
-    this.modelConfig = getModel(modelKey);
-  }
-
-  /**
    * Get a model helper with bound recordCall for parallel execution
    * Perfect for running multiple AI calls in parallel with different models
    *

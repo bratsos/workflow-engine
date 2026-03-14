@@ -68,11 +68,12 @@ export async function handleRunRerunFrom(
   );
   const deletedStageIds = stagesToDelete.map((s) => s.stageId);
 
-  // 9. Delete blob artifacts for stages being removed
+  // 9. Delete blob artifacts for stages being removed (full prefix cleanup)
   for (const stage of stagesToDelete) {
-    const outputRef = stage.outputData as { _artifactKey?: string } | null;
-    if (outputRef?._artifactKey) {
-      await deps.blobStore.delete(outputRef._artifactKey).catch(() => {});
+    const prefix = `workflow-v2/${run.workflowType}/${workflowRunId}/${stage.stageId}/`;
+    const keys = await deps.blobStore.list(prefix).catch(() => [] as string[]);
+    for (const key of keys) {
+      await deps.blobStore.delete(key).catch(() => {});
     }
   }
 
@@ -84,7 +85,12 @@ export async function handleRunRerunFrom(
   // 11. Reset run to RUNNING
   await deps.persistence.updateRun(workflowRunId, {
     status: "RUNNING",
+    startedAt: deps.clock.now(),
     completedAt: null,
+    duration: null,
+    output: null,
+    totalCost: 0,
+    totalTokens: 0,
   });
 
   // 12. Create new stage records for the target execution group

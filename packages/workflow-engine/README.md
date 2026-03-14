@@ -24,6 +24,7 @@ A **type-safe, distributed workflow engine** for AI-orchestrated processes. Feat
 - [Common Patterns](#common-patterns)
   - [Accessing Previous Stage Output](#accessing-previous-stage-output)
   - [Parallel Execution](#parallel-execution)
+  - [Stage ID Utilities](#stage-id-utilities)
   - [AI Integration](#ai-integration)
   - [Long-Running Batch Jobs](#long-running-batch-jobs)
   - [Config Presets](#config-presets)
@@ -110,6 +111,7 @@ model WorkflowRun {
   id            String   @id @default(cuid())
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
+  version       Int      @default(1)
   workflowId    String
   workflowName  String
   workflowType  String
@@ -137,6 +139,7 @@ model WorkflowStage {
   id              String              @id @default(cuid())
   createdAt       DateTime            @default(now())
   updatedAt       DateTime            @updatedAt
+  version         Int                 @default(1)
   workflowRunId   String
   workflowRun     WorkflowRun         @relation(fields: [workflowRunId], references: [id], onDelete: Cascade)
   stageId         String
@@ -219,7 +222,7 @@ model JobQueue {
   stageId       String
   status        Status    @default(PENDING)
   priority      Int       @default(5)
-  attempt       Int       @default(1)
+  attempt       Int       @default(0)
   maxAttempts   Int       @default(3)
   workerId      String?
   lockedAt      DateTime?
@@ -404,16 +407,26 @@ A stage is the atomic unit of work. Every stage has typed input, output, and con
 
 ### Workflows
 
-A workflow is a directed graph of stages built using the fluent `WorkflowBuilder` API:
+Workflows are built as a linear pipeline of **execution groups**. Each group contains one or more stages. Sequential stages (`.pipe()`) form single-stage groups. Parallel stages (`.parallel()`) form multi-stage groups where all stages run concurrently.
 
 ```typescript
 new WorkflowBuilder(id, name, description, inputSchema, outputSchema)
-  .pipe(stageA)              // Sequential: stageA runs first
-  .pipe(stageB)              // Sequential: stageB runs after stageA
-  .parallel([stageC, stageD]) // Parallel: stageC and stageD run concurrently
-  .pipe(stageE)              // Sequential: stageE runs after both complete
+  .pipe(stageA)              // Group 0: stageA runs first
+  .pipe(stageB)              // Group 1: stageB runs after stageA
+  .parallel([stageC, stageD]) // Group 2: stageC and stageD run concurrently
+  .pipe(stageE)              // Group 3: stageE runs after both complete
   .build();
 ```
+
+The output of each execution group is stored in the workflow context keyed by stage ID. For parallel groups, the merged output is an object keyed by each stage's ID:
+
+```typescript
+// After group 2 completes, stageE receives:
+ctx.require("stageC") // output of stageC
+ctx.require("stageD") // output of stageD
+```
+
+When a workflow completes, the final execution group's output is persisted in `WorkflowRun.output` and included in the `workflow:completed` event.
 
 ### Kernel
 
@@ -504,16 +517,42 @@ export const analyzeStage = defineStage({
 
 ### Parallel Execution
 
+Parallel stages run concurrently in the same execution group. Their outputs are keyed by stage ID in the workflow context:
+
 ```typescript
 const workflow = new WorkflowBuilder(/* ... */)
   .pipe(extractStage)
   .parallel([
-    sentimentAnalysisStage,
-    keywordExtractionStage,
-    languageDetectionStage,
+    sentimentAnalysisStage,   // id: "sentiment"
+    keywordExtractionStage,   // id: "keywords"
+    languageDetectionStage,   // id: "language"
   ])
   .pipe(aggregateResultsStage)
   .build();
+
+// In aggregateResultsStage:
+async execute(ctx) {
+  const sentiment = ctx.require("sentiment");   // output of sentimentAnalysisStage
+  const keywords = ctx.require("keywords");     // output of keywordExtractionStage
+  const language = ctx.require("language");     // output of languageDetectionStage
+  // ...
+}
+```
+
+### Stage ID Utilities
+
+Use `createStageIds` or `defineStageIds` for type-safe stage ID constants with autocomplete:
+
+```typescript
+import { createStageIds, defineStageIds } from "@bratsos/workflow-engine";
+
+// From an existing workflow
+const STAGES = createStageIds(myWorkflow);
+STAGES.EXTRACT_TEXT    // "extract-text" (autocomplete + type-safe)
+STAGES.SUMMARIZE       // "summarize"
+
+// Or define upfront
+const STAGES = defineStageIds(["extract-text", "summarize"] as const);
 ```
 
 ### AI Integration
@@ -558,7 +597,12 @@ export const batchStage = defineAsyncBatchStage({
     const batch = await submitBatch(ctx.input.prompts);
     return {
       suspended: true,
-      state: { batchId: batch.id },
+      state: {
+        batchId: batch.id,
+        submittedAt: new Date().toISOString(),
+        pollInterval: 3600000,
+        maxWaitTime: 86400000,
+      },
       pollConfig: { pollInterval: 3600000, maxWaitTime: 86400000, nextPollAt: new Date(Date.now() + 3600000) },
     };
   },
@@ -640,11 +684,12 @@ async execute(ctx) {
 | `run.create` | Create a new workflow run | `idempotencyKey`, `workflowId`, `input`, `config?`, `priority?` |
 | `run.claimPending` | Claim pending runs for processing | `workerId`, `maxClaims?` |
 | `run.transition` | Advance to next stage group | `workflowRunId` |
-| `run.cancel` | Cancel a running workflow | `workflowRunId`, `reason?` |
-| `run.rerunFrom` | Rerun from a specific stage | `workflowRunId`, `fromStageId` |
+| `run.cancel` | Cancel a running workflow (cascades to stages + jobs) | `workflowRunId`, `reason?` |
+| `run.rerunFrom` | Rerun from a specific stage (cleans up artifacts) | `workflowRunId`, `fromStageId` |
 | `job.execute` | Execute a single stage (multi-phase transactions) | `idempotencyKey?`, `workflowRunId`, `workflowId`, `stageId`, `config` |
 | `stage.pollSuspended` | Poll suspended stages (per-stage transactions) | `maxChecks?` (returns `resumedWorkflowRunIds`) |
 | `lease.reapStale` | Release stale job leases | `staleThresholdMs` |
+| `run.reapStuck` | Fail runs stuck RUNNING with no activity | `stuckThresholdMs?` |
 | `outbox.flush` | Publish pending events | `maxEvents?` |
 | `plugin.replayDLQ` | Replay dead-letter queue events | `maxEvents?` |
 
@@ -656,6 +701,11 @@ Transaction behavior:
 - Most commands execute inside a single database transaction (handler + outbox events).
 - `job.execute` uses multi-phase transactions: Phase 1 commits `RUNNING` status immediately, Phase 2 runs `stageDef.execute()` outside any transaction, Phase 3 commits the final status. This avoids holding a database connection during long-running stage execution.
 - `stage.pollSuspended` uses per-stage transactions: `checkCompletion()` runs outside any transaction (external HTTP calls to batch providers), then DB updates + outbox events are committed in a short transaction per stage. This prevents P2028 timeout errors when batch APIs are slow.
+
+Cancellation semantics:
+- `run.cancel` is **authoritative**: it marks the run as `CANCELLED`, cascades to all non-terminal stages (setting them to `CANCELLED` and clearing `nextPollAt`), and cancels all queued/suspended jobs via `jobTransport.cancelByRun()`.
+- `stage.pollSuspended` skips stages whose run has been cancelled.
+- `job.execute` re-checks run status after stage execution. If the run was cancelled during execution, the result is discarded and a `ghost: true` flag is returned. Hosts use this flag to prevent retries.
 
 ### Node Host Config
 
@@ -702,6 +752,9 @@ import { createPrismaWorkflowPersistence, createPrismaJobQueue, createPrismaAICa
 
 // AI Helper
 import { createAIHelper, type AIHelper } from "@bratsos/workflow-engine";
+
+// Stage ID utilities
+import { createStageIds, defineStageIds, isValidStageId, assertValidStageId } from "@bratsos/workflow-engine";
 
 // Testing
 import { InMemoryWorkflowPersistence, InMemoryJobQueue } from "@bratsos/workflow-engine/testing";

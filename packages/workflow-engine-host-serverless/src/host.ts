@@ -136,8 +136,7 @@ class ServerlessHostImpl implements ServerlessHost {
     }
 
     // failed — ghost jobs should never be retried
-    const isGhostJob = result.error?.includes("ghost job discarded");
-    const canRetry = !isGhostJob && msg.attempt < (msg.maxAttempts ?? 3);
+    const canRetry = !result.ghost && msg.attempt < (msg.maxAttempts ?? 3);
     await this.jobTransport.fail(
       msg.jobId,
       result.error ?? "Unknown error",

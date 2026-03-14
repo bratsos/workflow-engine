@@ -373,12 +373,19 @@ export class WorkflowBuilder<
     TStageOutput extends z.ZodTypeAny,
     TStageConfig extends z.ZodTypeAny,
     TStageContext extends Record<string, unknown>,
+    TStageId extends string = string,
   >(
-    stage: Stage<TStageInput, TStageOutput, TStageConfig, TStageContext>,
+    stage: Stage<
+      TStageInput,
+      TStageOutput,
+      TStageConfig,
+      TStageContext,
+      TStageId
+    >,
   ): WorkflowBuilder<
     TInput,
     TStageOutput,
-    TContext & { [x: string]: z.infer<TStageOutput> }
+    TContext & { [K in TStageId]: z.infer<TStageOutput> }
   > {
     // Validate stage dependencies
     if (stage.dependencies) {
@@ -411,7 +418,7 @@ export class WorkflowBuilder<
     const builder = this as unknown as WorkflowBuilder<
       TInput,
       TStageOutput,
-      TContext & { [x: string]: z.infer<TStageOutput> }
+      TContext & { [K in TStageId]: z.infer<TStageOutput> }
     >;
     (builder as any).currentOutputSchema = stage.outputSchema;
 
@@ -429,7 +436,7 @@ export class WorkflowBuilder<
    * Add multiple stages that execute in parallel
    *
    * All stages receive the same input (current output)
-   * Their outputs are merged into an object by index AND accumulated in context by stage ID.
+   * Their outputs are merged into an object by stage ID and accumulated in context.
    *
    * Note: This accepts stages regardless of strict input type matching.
    * This is necessary because stages using passthrough() can accept objects
@@ -493,14 +500,14 @@ export class WorkflowBuilder<
       });
     }
 
-    // Create merged output schema
+    // Create merged output schema keyed by stage ID
     const mergedSchema = z.object(
       stages.reduce(
-        (acc, stage, index) => {
-          acc[index] = stage.outputSchema;
+        (acc, stage) => {
+          acc[stage.id] = stage.outputSchema;
           return acc;
         },
-        {} as Record<number, z.ZodTypeAny>,
+        {} as Record<string, z.ZodTypeAny>,
       ),
     ) as any;
 

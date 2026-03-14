@@ -336,6 +336,25 @@ export class PrismaJobQueue implements JobQueue {
   }
 
   /**
+   * Cancel all pending/suspended jobs for a workflow run.
+   */
+  async cancelByRun(workflowRunId: string): Promise<number> {
+    const result = await this.prisma.jobQueue.updateMany({
+      where: {
+        workflowRunId,
+        status: {
+          in: [this.enums.status("PENDING"), this.enums.status("SUSPENDED")],
+        },
+      },
+      data: {
+        status: this.enums.status("CANCELLED"),
+        completedAt: new Date(),
+      },
+    });
+    return result.count;
+  }
+
+  /**
    * Release stale locks (for crashed workers)
    */
   async releaseStaleJobs(staleThresholdMs: number = 300000): Promise<number> {

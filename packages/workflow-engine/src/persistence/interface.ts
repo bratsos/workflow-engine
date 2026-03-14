@@ -227,7 +227,7 @@ export interface UpdateRunInput {
   status?: WorkflowStatus;
   startedAt?: Date;
   completedAt?: Date | null;
-  duration?: number;
+  duration?: number | null;
   output?: unknown;
   totalCost?: number;
   totalTokens?: number;
@@ -530,6 +530,12 @@ export interface JobQueue {
    * Release stale locks (for crashed workers)
    */
   releaseStaleJobs(staleThresholdMs?: number): Promise<number>;
+
+  /**
+   * Cancel all pending/suspended jobs for a workflow run.
+   * Returns count of cancelled jobs.
+   */
+  cancelByRun(workflowRunId: string): Promise<number>;
 }
 
 // ============================================================================

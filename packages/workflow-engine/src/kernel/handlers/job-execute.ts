@@ -32,6 +32,8 @@ import type { KernelEvent } from "../events";
 import {
   createStorageShim,
   loadWorkflowContext,
+  resolveExecutionGroupOutput,
+  saveStageArtifacts,
   saveStageOutput,
 } from "../helpers/index.js";
 import type { HandlerResult, KernelDeps } from "../kernel";
@@ -48,14 +50,19 @@ function resolveStageInput(
 ): unknown {
   const groupIndex = workflow.getExecutionGroupIndex(stageId);
 
-  if (groupIndex === 0) return workflowRun.input;
+  // First execution group always uses workflow input
+  if (groupIndex <= 1) return workflowRun.input;
 
-  const prevStageId = workflow.getPreviousStageId(stageId);
-  if (prevStageId && workflowContext[prevStageId] !== undefined) {
-    return workflowContext[prevStageId];
-  }
+  // Resolve the previous execution group's output.
+  // For single-stage groups this returns that stage's output directly.
+  // For parallel groups this returns an object keyed by stage ID.
+  const prevOutput = resolveExecutionGroupOutput(
+    workflow,
+    groupIndex - 1,
+    workflowContext,
+  );
 
-  return workflowRun.input;
+  return prevOutput ?? workflowRun.input;
 }
 
 // ---------------------------------------------------------------------------
@@ -106,6 +113,7 @@ export async function handleJobExecute(
   if (workflowRun.status !== "RUNNING") {
     return {
       outcome: "failed" as const,
+      ghost: true,
       error: `Run ${workflowRunId} is ${workflowRun.status}, expected RUNNING — ghost job discarded`,
       _events: [],
     };
@@ -227,6 +235,17 @@ export async function handleJobExecute(
     // Execute the stage — this is the potentially long-running part
     const result = await stageDef.execute(context);
 
+    // Re-check run status — the run may have been cancelled during execution
+    const currentRunStatus = await deps.persistence.getRunStatus(workflowRunId);
+    if (currentRunStatus !== "RUNNING") {
+      return {
+        outcome: "failed" as const,
+        ghost: true,
+        error: `Run ${workflowRunId} was ${currentRunStatus} after stage execution — result discarded`,
+        _events: [],
+      };
+    }
+
     // ── Phase 3a: Complete transaction (success) ─────────────────
     if (isSuspendedResult(result)) {
       const { state, pollConfig, metrics } = result;
@@ -276,13 +295,26 @@ export async function handleJobExecute(
         result.output,
         deps,
       );
+      const artifactKeys =
+        result.artifacts && Object.keys(result.artifacts).length > 0
+          ? await saveStageArtifacts(
+              workflowRunId,
+              workflowRun.workflowType,
+              stageId,
+              result.artifacts,
+              deps,
+            )
+          : undefined;
 
       await deps.persistence.withTransaction(async (tx) => {
         await tx.updateStage(stageRecord.id, {
           status: "COMPLETED",
           completedAt: deps.clock.now(),
           duration,
-          outputData: { _artifactKey: outputKey } as any,
+          outputData: {
+            _artifactKey: outputKey,
+            ...(artifactKeys ? { _artifactKeys: artifactKeys } : {}),
+          } as any,
           metrics: result.metrics as any,
           embeddingInfo: result.embeddings as any,
         });

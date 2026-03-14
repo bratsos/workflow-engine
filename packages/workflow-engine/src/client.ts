@@ -38,16 +38,18 @@ export {
   type SimpleStageResult,
   type SyncStageDefinition,
 } from "./core/stage-factory";
-
 export type {
-  LogPayload,
-  StageCompletedPayload,
-  StageFailedPayload,
-  StageStartedPayload,
-  WorkflowCompletedPayload,
-  WorkflowEventType,
-  WorkflowFailedPayload,
-  WorkflowSSEEvent,
-  WorkflowStartedPayload,
-  WorkflowSuspendedPayload,
-} from "./core/workflow-events";
+  KernelEvent,
+  KernelEventType,
+  StageCompletedEvent,
+  StageFailedEvent,
+  StageProgressEvent,
+  StageStartedEvent,
+  StageSuspendedEvent,
+  WorkflowCancelledEvent,
+  WorkflowCompletedEvent,
+  WorkflowCreatedEvent,
+  WorkflowFailedEvent,
+  WorkflowStartedEvent,
+  WorkflowSuspendedEvent,
+} from "./kernel/events";

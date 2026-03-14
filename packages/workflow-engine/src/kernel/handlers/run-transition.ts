@@ -8,8 +8,13 @@
  */
 
 import type { Workflow } from "../../core/workflow";
+import { StaleVersionError } from "../../persistence/interface.js";
 import type { RunTransitionCommand, RunTransitionResult } from "../commands";
 import type { KernelEvent } from "../events";
+import {
+  loadWorkflowContext,
+  resolveExecutionGroupOutput,
+} from "../helpers/index.js";
 import type { HandlerResult, KernelDeps } from "../kernel";
 import type { WorkflowRunRecord } from "../ports";
 
@@ -29,6 +34,23 @@ const ACTIVE_STATUSES = new Set(["RUNNING", "PENDING", "SUSPENDED"]);
 // ---------------------------------------------------------------------------
 // Helper: enqueue an execution group
 // ---------------------------------------------------------------------------
+
+async function claimRunTransition(
+  run: WorkflowRunRecord,
+  deps: KernelDeps,
+): Promise<boolean> {
+  try {
+    await deps.persistence.updateRun(run.id, {
+      expectedVersion: run.version,
+    });
+    return true;
+  } catch (error) {
+    if (error instanceof StaleVersionError) {
+      return false;
+    }
+    throw error;
+  }
+}
 
 async function enqueueExecutionGroup(
   run: WorkflowRunRecord,
@@ -104,6 +126,9 @@ export async function handleRunTransition(
 
   // 5. If no stages exist, this is the first transition -- enqueue group 1
   if (stages.length === 0) {
+    if (!(await claimRunTransition(run, deps))) {
+      return { action: "noop" as const, _events: [] };
+    }
     await enqueueExecutionGroup(run, workflow, 1, deps);
 
     events.push({
@@ -124,6 +149,9 @@ export async function handleRunTransition(
   // 7. If any stage has failed, mark the entire run as failed
   const failedStage = stages.find((s) => s.status === "FAILED");
   if (failedStage) {
+    if (!(await claimRunTransition(run, deps))) {
+      return { action: "noop" as const, _events: [] };
+    }
     await deps.persistence.updateRun(command.workflowRunId, {
       status: "FAILED",
       completedAt: deps.clock.now(),
@@ -150,6 +178,9 @@ export async function handleRunTransition(
 
   // 10. If there are stages in the next group, enqueue them
   if (nextGroupStages.length > 0) {
+    if (!(await claimRunTransition(run, deps))) {
+      return { action: "noop" as const, _events: [] };
+    }
     await enqueueExecutionGroup(run, workflow, maxGroup + 1, deps);
     return {
       action: "advanced" as const,
@@ -172,10 +203,26 @@ export async function handleRunTransition(
 
   const duration = deps.clock.now().getTime() - run.createdAt.getTime();
 
+  // Resolve the final execution group's output for persistence
+  const workflowContext = await loadWorkflowContext(
+    command.workflowRunId,
+    deps,
+  );
+  const output = resolveExecutionGroupOutput(
+    workflow,
+    maxGroup,
+    workflowContext,
+  );
+
+  if (!(await claimRunTransition(run, deps))) {
+    return { action: "noop" as const, _events: [] };
+  }
+
   await deps.persistence.updateRun(command.workflowRunId, {
     status: "COMPLETED",
     completedAt: deps.clock.now(),
     duration,
+    output,
     totalCost,
     totalTokens,
   });
@@ -185,6 +232,7 @@ export async function handleRunTransition(
     timestamp: deps.clock.now(),
     workflowRunId: command.workflowRunId,
     duration,
+    output,
     totalCost,
     totalTokens,
   });
