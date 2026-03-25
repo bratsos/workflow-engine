@@ -76,11 +76,11 @@ export function registerEmbeddingProvider(
 
 /**
  * Custom provider resolver. Given a ModelConfig, return an AI SDK
- * LanguageModelV1 to use, or null/undefined to fall back to built-in resolution.
+ * LanguageModel to use, or null/undefined to fall back to built-in resolution.
  */
 export type ProviderResolver = (
   modelConfig: ModelConfig,
-) => import("ai").LanguageModelV1 | null | undefined;
+) => import("@ai-sdk/provider").LanguageModelV3 | null | undefined;
 
 export type AICallType = "text" | "object" | "embed" | "stream" | "batch";
 
