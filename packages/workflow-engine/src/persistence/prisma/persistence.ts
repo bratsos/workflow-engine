@@ -71,7 +71,10 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
   async withTransaction<T>(
     fn: (tx: WorkflowPersistence) => Promise<T>,
   ): Promise<T> {
-    if (this.skipTransactions || typeof this.prisma.$transaction !== "function") {
+    if (
+      this.skipTransactions ||
+      typeof this.prisma.$transaction !== "function"
+    ) {
       return fn(this);
     }
     return this.prisma.$transaction(async (tx: PrismaClient) => {

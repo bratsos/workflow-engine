@@ -16,12 +16,14 @@ export interface RunAndWaitPersistence {
   getStagesByRun(
     runId: string,
     options?: { orderBy?: "asc" | "desc" },
-  ): Promise<Array<{
-    stageId: string;
-    stageName: string;
-    status: string;
-    duration: number | null;
-  }>>;
+  ): Promise<
+    Array<{
+      stageId: string;
+      stageName: string;
+      status: string;
+      duration: number | null;
+    }>
+  >;
 }
 
 export interface StageStatus {
@@ -51,13 +53,21 @@ export interface RunAndWaitOptions {
   signal?: AbortSignal;
 }
 
-const TERMINAL_STATUSES = new Set<RunAndWaitResult["status"]>(["COMPLETED", "FAILED", "CANCELLED"]);
+const TERMINAL_STATUSES = new Set<RunAndWaitResult["status"]>([
+  "COMPLETED",
+  "FAILED",
+  "CANCELLED",
+]);
 
-function isTerminalStatus(status: string): status is RunAndWaitResult["status"] {
+function isTerminalStatus(
+  status: string,
+): status is RunAndWaitResult["status"] {
   return TERMINAL_STATUSES.has(status as RunAndWaitResult["status"]);
 }
 
-export async function runAndWait(options: RunAndWaitOptions): Promise<RunAndWaitResult> {
+export async function runAndWait(
+  options: RunAndWaitOptions,
+): Promise<RunAndWaitResult> {
   const {
     kernel,
     persistence,

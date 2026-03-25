@@ -1,6 +1,6 @@
 // packages/workflow-engine-host-node/src/__tests__/run-and-wait.test.ts
 import { describe, expect, it, vi } from "vitest";
-import { runAndWait, type RunAndWaitResult } from "../run-and-wait.js";
+import { type RunAndWaitResult, runAndWait } from "../run-and-wait.js";
 
 function createFakeKernel() {
   return {
@@ -8,15 +8,26 @@ function createFakeKernel() {
       if (command.type === "run.create") {
         return { workflowRunId: "run-1", status: "PENDING" };
       }
-      return { claimed: [], checked: 0, resumed: 0, failed: 0, resumedWorkflowRunIds: [], released: 0, published: 0, transitioned: 0 };
+      return {
+        claimed: [],
+        checked: 0,
+        resumed: 0,
+        failed: 0,
+        resumedWorkflowRunIds: [],
+        released: 0,
+        published: 0,
+        transitioned: 0,
+      };
     }),
   };
 }
 
-function createFakePersistence(opts: {
-  terminalStatus?: "COMPLETED" | "FAILED";
-  ticksBeforeTerminal?: number;
-} = {}) {
+function createFakePersistence(
+  opts: {
+    terminalStatus?: "COMPLETED" | "FAILED";
+    ticksBeforeTerminal?: number;
+  } = {},
+) {
   const { terminalStatus = "COMPLETED", ticksBeforeTerminal = 1 } = opts;
   let pollCount = 0;
   return {
@@ -35,8 +46,18 @@ function createFakePersistence(opts: {
       };
     }),
     getStagesByRun: vi.fn(async () => [
-      { stageId: "s1", stageName: "Stage 1", status: "COMPLETED", duration: 30_000 },
-      { stageId: "s2", stageName: "Stage 2", status: "COMPLETED", duration: 30_000 },
+      {
+        stageId: "s1",
+        stageName: "Stage 1",
+        status: "COMPLETED",
+        duration: 30_000,
+      },
+      {
+        stageId: "s2",
+        stageName: "Stage 2",
+        status: "COMPLETED",
+        duration: 30_000,
+      },
     ]),
   };
 }
@@ -44,9 +65,19 @@ function createFakePersistence(opts: {
 function createFakeHost(alreadyRunning = false) {
   let started = alreadyRunning;
   return {
-    start: vi.fn(async () => { started = true; }),
-    stop: vi.fn(async () => { started = false; }),
-    getStats: vi.fn(() => ({ isRunning: started, workerId: "w1", jobsProcessed: 0, orchestrationTicks: 0, uptimeMs: 0 })),
+    start: vi.fn(async () => {
+      started = true;
+    }),
+    stop: vi.fn(async () => {
+      started = false;
+    }),
+    getStats: vi.fn(() => ({
+      isRunning: started,
+      workerId: "w1",
+      jobsProcessed: 0,
+      orchestrationTicks: 0,
+      uptimeMs: 0,
+    })),
   };
 }
 
@@ -103,7 +134,9 @@ describe("runAndWait", () => {
   it("stops host even if polling throws", async () => {
     const kernel = createFakeKernel();
     const persistence = {
-      getRun: vi.fn(async () => { throw new Error("db down"); }),
+      getRun: vi.fn(async () => {
+        throw new Error("db down");
+      }),
       getStagesByRun: vi.fn(async () => []),
     };
     const host = createFakeHost();
@@ -195,9 +228,7 @@ describe("runAndWait", () => {
 
     expect(stageChanges).toHaveLength(1);
     expect(stageChanges[0]).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ stageId: "s1" }),
-      ]),
+      expect.arrayContaining([expect.objectContaining({ stageId: "s1" })]),
     );
   });
 });

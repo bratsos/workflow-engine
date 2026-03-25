@@ -483,7 +483,8 @@ class AIHelperImpl implements AIHelper {
     options: TextOptions<TTools> = {} as TextOptions<TTools>,
   ): Promise<AITextResult> {
     const modelConfig = getModel(modelKey);
-    const model = this.providerResolver?.(modelConfig) ?? getModelProvider(modelConfig);
+    const model =
+      this.providerResolver?.(modelConfig) ?? getModelProvider(modelConfig);
     const startTime = Date.now();
 
     // Determine if we have multimodal content
@@ -723,7 +724,8 @@ class AIHelperImpl implements AIHelper {
     options: ObjectOptions = {},
   ): Promise<AIObjectResult<z.infer<TSchema>>> {
     const modelConfig = getModel(modelKey);
-    const model = this.providerResolver?.(modelConfig) ?? getModelProvider(modelConfig);
+    const model =
+      this.providerResolver?.(modelConfig) ?? getModelProvider(modelConfig);
     const startTime = Date.now();
 
     // Determine if we have multimodal content
@@ -1025,7 +1027,8 @@ class AIHelperImpl implements AIHelper {
     options: StreamOptions = {},
   ): AIStreamResult {
     const modelConfig = getModel(modelKey);
-    const model = this.providerResolver?.(modelConfig) ?? getModelProvider(modelConfig);
+    const model =
+      this.providerResolver?.(modelConfig) ?? getModelProvider(modelConfig);
     const startTime = Date.now();
     const hasTools = options.tools !== undefined;
 
@@ -1234,7 +1237,12 @@ class AIHelperImpl implements AIHelper {
       ? `${this.topic}.${segment}.${id}`
       : `${this.topic}.${segment}`;
     // Preserve logContext and providerResolver for child helpers (same workflow context)
-    return new AIHelperImpl(newTopic, this.aiCallLogger, this.logContext, this.providerResolver);
+    return new AIHelperImpl(
+      newTopic,
+      this.aiCallLogger,
+      this.logContext,
+      this.providerResolver,
+    );
   }
 
   /** @internal Get the logger for batch operations */

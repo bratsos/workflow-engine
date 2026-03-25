@@ -13,9 +13,9 @@ export {
 } from "./host.js";
 
 export {
-  runAndWait,
   type RunAndWaitOptions,
-  type RunAndWaitResult,
   type RunAndWaitPersistence,
+  type RunAndWaitResult,
+  runAndWait,
   type StageStatus,
 } from "./run-and-wait.js";

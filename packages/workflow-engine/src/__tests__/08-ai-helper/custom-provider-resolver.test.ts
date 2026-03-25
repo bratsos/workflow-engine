@@ -9,7 +9,12 @@ describe("custom provider resolver", () => {
       getCalls: vi.fn().mockResolvedValue([]),
     };
 
-    const ai = createAIHelper("test-topic", fakeLogger as any, undefined, providerResolver);
+    const ai = createAIHelper(
+      "test-topic",
+      fakeLogger as any,
+      undefined,
+      providerResolver,
+    );
     expect(ai).toBeDefined();
   });
 
@@ -30,7 +35,12 @@ describe("custom provider resolver", () => {
       getCalls: vi.fn().mockResolvedValue([]),
     };
 
-    const ai = createAIHelper("test-topic", fakeLogger as any, undefined, providerResolver);
+    const ai = createAIHelper(
+      "test-topic",
+      fakeLogger as any,
+      undefined,
+      providerResolver,
+    );
     const child = ai.createChild("stage", "extraction");
     expect(child).toBeDefined();
     expect(child.topic).toBe("test-topic.stage.extraction");
