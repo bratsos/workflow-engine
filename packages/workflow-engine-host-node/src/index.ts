@@ -11,3 +11,11 @@ export {
   type NodeHost,
   type NodeHostConfig,
 } from "./host.js";
+
+export {
+  runAndWait,
+  type RunAndWaitOptions,
+  type RunAndWaitResult,
+  type RunAndWaitPersistence,
+  type StageStatus,
+} from "./run-and-wait.js";
