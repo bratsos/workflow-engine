@@ -14,6 +14,7 @@ export {
   type EmbedOptions,
   type ModelKey,
   type ObjectOptions,
+  type ProviderResolver,
   type RecordCallParams,
   type StreamOptions,
   type TextOptions,

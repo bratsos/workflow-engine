@@ -36,6 +36,11 @@ export interface PrismaWorkflowPersistenceOptions {
    * Set to "sqlite" when using SQLite (uses optimistic locking instead of FOR UPDATE SKIP LOCKED).
    */
   databaseType?: DatabaseType;
+  /**
+   * Skip interactive transactions. Defaults to false.
+   * Set to true in single-process environments where transactions are not needed.
+   */
+  skipInteractiveTransactions?: boolean;
 }
 
 const IDEMPOTENCY_IN_PROGRESS_MARKER = {
@@ -52,6 +57,7 @@ function isInProgressResult(result: unknown): boolean {
 export class PrismaWorkflowPersistence implements WorkflowPersistence {
   private enums: PrismaEnumHelper;
   private databaseType: DatabaseType;
+  private skipTransactions: boolean;
 
   constructor(
     private readonly prisma: PrismaClient,
@@ -59,17 +65,22 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
   ) {
     this.enums = createEnumHelper(prisma);
     this.databaseType = options.databaseType ?? "postgresql";
+    this.skipTransactions = options.skipInteractiveTransactions ?? false;
   }
 
   async withTransaction<T>(
     fn: (tx: WorkflowPersistence) => Promise<T>,
   ): Promise<T> {
-    if (typeof this.prisma.$transaction !== "function") {
+    if (
+      this.skipTransactions ||
+      typeof this.prisma.$transaction !== "function"
+    ) {
       return fn(this);
     }
     return this.prisma.$transaction(async (tx: PrismaClient) => {
       const txPersistence = new PrismaWorkflowPersistence(tx, {
         databaseType: this.databaseType,
+        skipInteractiveTransactions: this.skipTransactions,
       });
       return fn(txPersistence);
     });
@@ -89,8 +100,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
         input: data.input as unknown,
         config: (data.config ?? {}) as unknown,
         priority: data.priority ?? 5,
-        // Spread metadata for domain-specific fields (certificateId, etc.)
-        ...(data.metadata ?? {}),
+        metadata: (data.metadata ?? null) as unknown,
       },
     });
     return this.mapWorkflowRun(run);
@@ -865,6 +875,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       totalCost: run.totalCost,
       totalTokens: run.totalTokens,
       priority: run.priority,
+      metadata: run.metadata ?? null,
       version: run.version ?? 0,
     };
   }

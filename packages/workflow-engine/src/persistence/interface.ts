@@ -84,6 +84,7 @@ export interface WorkflowRunRecord {
   totalCost: number;
   totalTokens: number;
   priority: number;
+  metadata: unknown | null;
 }
 
 export interface WorkflowStageRecord {
@@ -219,7 +220,7 @@ export interface CreateRunInput {
   input: unknown;
   config?: unknown;
   priority?: number;
-  /** Optional metadata for domain-specific fields */
+  /** Optional metadata stored as JSON on the run record. NOT spread into Prisma fields. */
   metadata?: Record<string, unknown>;
 }
 
