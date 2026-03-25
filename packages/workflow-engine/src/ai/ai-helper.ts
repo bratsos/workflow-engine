@@ -74,6 +74,14 @@ export function registerEmbeddingProvider(
 // Types
 // ============================================================================
 
+/**
+ * Custom provider resolver. Given a ModelConfig, return an AI SDK
+ * LanguageModelV1 to use, or null/undefined to fall back to built-in resolution.
+ */
+export type ProviderResolver = (
+  modelConfig: ModelConfig,
+) => import("ai").LanguageModelV1 | null | undefined;
+
 export type AICallType = "text" | "object" | "embed" | "stream" | "batch";
 
 export interface AITextResult {
@@ -432,11 +440,13 @@ class AIHelperImpl implements AIHelper {
   private readonly aiCallLogger: AICallLogger;
   private readonly logContext?: LogContext;
   private readonly batchLogFn?: BatchLogFn;
+  private readonly providerResolver?: ProviderResolver;
 
   constructor(
     topic: string,
     aiCallLogger: AICallLogger,
     logContext?: LogContext,
+    providerResolver?: ProviderResolver,
   ) {
     if (!aiCallLogger) {
       throw new Error(
@@ -446,6 +456,7 @@ class AIHelperImpl implements AIHelper {
     this.topic = topic;
     this.aiCallLogger = aiCallLogger;
     this.logContext = logContext;
+    this.providerResolver = providerResolver;
 
     // Create batch log function if logContext is provided
     if (logContext) {
@@ -472,7 +483,7 @@ class AIHelperImpl implements AIHelper {
     options: TextOptions<TTools> = {} as TextOptions<TTools>,
   ): Promise<AITextResult> {
     const modelConfig = getModel(modelKey);
-    const model = getModelProvider(modelConfig);
+    const model = this.providerResolver?.(modelConfig) ?? getModelProvider(modelConfig);
     const startTime = Date.now();
 
     // Determine if we have multimodal content
@@ -712,7 +723,7 @@ class AIHelperImpl implements AIHelper {
     options: ObjectOptions = {},
   ): Promise<AIObjectResult<z.infer<TSchema>>> {
     const modelConfig = getModel(modelKey);
-    const model = getModelProvider(modelConfig);
+    const model = this.providerResolver?.(modelConfig) ?? getModelProvider(modelConfig);
     const startTime = Date.now();
 
     // Determine if we have multimodal content
@@ -1014,7 +1025,7 @@ class AIHelperImpl implements AIHelper {
     options: StreamOptions = {},
   ): AIStreamResult {
     const modelConfig = getModel(modelKey);
-    const model = getModelProvider(modelConfig);
+    const model = this.providerResolver?.(modelConfig) ?? getModelProvider(modelConfig);
     const startTime = Date.now();
     const hasTools = options.tools !== undefined;
 
@@ -1222,8 +1233,8 @@ class AIHelperImpl implements AIHelper {
     const newTopic = id
       ? `${this.topic}.${segment}.${id}`
       : `${this.topic}.${segment}`;
-    // Preserve logContext for child helpers (same workflow context)
-    return new AIHelperImpl(newTopic, this.aiCallLogger, this.logContext);
+    // Preserve logContext and providerResolver for child helpers (same workflow context)
+    return new AIHelperImpl(newTopic, this.aiCallLogger, this.logContext, this.providerResolver);
   }
 
   /** @internal Get the logger for batch operations */
@@ -1654,8 +1665,9 @@ export function createAIHelper(
   topic: string,
   logger: AICallLogger,
   logContext?: LogContext,
+  providerResolver?: ProviderResolver,
 ): AIHelper {
-  return new AIHelperImpl(topic, logger, logContext);
+  return new AIHelperImpl(topic, logger, logContext, providerResolver);
 }
 
 // Re-export types from this module
