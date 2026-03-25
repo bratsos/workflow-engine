@@ -90,6 +90,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
       totalCost: 0,
       totalTokens: 0,
       priority: data.priority ?? 5,
+      metadata: data.metadata ?? null,
     };
     this.runs.set(record.id, record);
     return { ...record };

@@ -89,8 +89,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
         input: data.input as unknown,
         config: (data.config ?? {}) as unknown,
         priority: data.priority ?? 5,
-        // Spread metadata for domain-specific fields (certificateId, etc.)
-        ...(data.metadata ?? {}),
+        metadata: (data.metadata ?? null) as unknown,
       },
     });
     return this.mapWorkflowRun(run);
@@ -865,6 +864,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       totalCost: run.totalCost,
       totalTokens: run.totalTokens,
       priority: run.priority,
+      metadata: run.metadata ?? null,
       version: run.version ?? 0,
     };
   }
