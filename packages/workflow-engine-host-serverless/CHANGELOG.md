@@ -1,5 +1,12 @@
 # @bratsos/workflow-engine-host-serverless
 
+## 0.2.11
+
+### Patch Changes
+
+- Updated dependencies [ce523b7]
+  - @bratsos/workflow-engine@0.7.0
+
 ## 0.2.10
 
 ### Patch Changes
