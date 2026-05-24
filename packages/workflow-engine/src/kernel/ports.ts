@@ -16,19 +16,20 @@
  */
 
 import type {
+  AnnotationFilters,
+  CreateAnnotationInput,
   CreateLogInput,
   CreateOutboxEventInput,
   CreateRunInput,
   CreateStageInput,
   DequeueResult,
   EnqueueJobInput,
-  IdempotencyRecord,
   OutboxRecord,
   Status,
   UpdateRunInput,
   UpdateStageInput,
   UpsertStageInput,
-  WorkflowLogRecord,
+  WorkflowAnnotationRecord,
   WorkflowRunRecord,
   WorkflowStageRecord,
 } from "../persistence/interface";
@@ -37,6 +38,10 @@ import type { KernelEvent } from "./events";
 
 // Re-export record and input types for convenience
 export type {
+  AnnotationActor,
+  AnnotationFilters,
+  AnnotationScope,
+  CreateAnnotationInput,
   CreateLogInput,
   CreateOutboxEventInput,
   CreateRunInput,
@@ -49,6 +54,7 @@ export type {
   UpdateRunInput,
   UpdateStageInput,
   UpsertStageInput,
+  WorkflowAnnotationRecord,
   WorkflowLogRecord,
   WorkflowRunRecord,
   WorkflowStageRecord,
@@ -134,6 +140,22 @@ export interface Persistence {
   // -- Log operations --------------------------------------------------------
 
   createLog(data: CreateLogInput): Promise<void>;
+
+  // -- Annotation operations -------------------------------------------------
+
+  /**
+   * Append annotations. Called both from outside transactions (run.create,
+   * external attach) and inside the stage-completion transactions in
+   * job-execute and stage-poll-suspended. Duplicates with the same
+   * `(workflowRunId, key, idempotencyKey)` are silently skipped.
+   */
+  appendAnnotations(inputs: CreateAnnotationInput[]): Promise<void>;
+
+  /** List annotations for a run, ordered by `createdAt` ascending. */
+  listAnnotations(
+    workflowRunId: string,
+    filters?: AnnotationFilters,
+  ): Promise<WorkflowAnnotationRecord[]>;
 
   // -- Outbox operations ----------------------------------------------------
 

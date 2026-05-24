@@ -22,6 +22,7 @@ export type {
   RunCancelResult,
   RunClaimPendingCommand,
   RunClaimPendingResult,
+  RunCreateAnnotation,
   RunCreateCommand,
   RunCreateResult,
   RunRerunFromCommand,
@@ -54,8 +55,10 @@ export type {
 export { loadWorkflowContext, saveStageOutput } from "./helpers/index.js";
 // Kernel factory and core interfaces
 export {
+  type AnnotateAttachInput,
   createKernel,
   type Kernel,
+  type KernelAnnotations,
   type KernelConfig,
   type WorkflowRegistry,
 } from "./kernel.js";
@@ -67,10 +70,14 @@ export {
   type PluginRunner,
   type PluginRunnerConfig,
 } from "./plugins.js";
-// Port interfaces
+// Port interfaces and annotation types
 export type {
+  AnnotationActor,
+  AnnotationFilters,
+  AnnotationScope,
   BlobStore,
   Clock,
+  CreateAnnotationInput,
   CreateOutboxEventInput,
   EventSink,
   IdempotencyRecord,
@@ -78,4 +85,5 @@ export type {
   OutboxRecord,
   Persistence,
   Scheduler,
+  WorkflowAnnotationRecord,
 } from "./ports.js";

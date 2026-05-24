@@ -20,7 +20,14 @@
  */
 
 import type { Workflow } from "../core/workflow";
-import type { CreateOutboxEventInput } from "../persistence/interface";
+import type {
+  AnnotationActor,
+  AnnotationFilters,
+  AnnotationScope,
+  CreateAnnotationInput,
+  CreateOutboxEventInput,
+  WorkflowAnnotationRecord,
+} from "../persistence/interface";
 import type {
   CommandResult,
   JobExecuteCommand,
@@ -49,6 +56,11 @@ import { handleRunReapStuck } from "./handlers/run-reap-stuck";
 import { handleRunRerunFrom } from "./handlers/run-rerun-from";
 import { handleRunTransition } from "./handlers/run-transition";
 import { handleStagePollSuspended } from "./handlers/stage-poll-suspended";
+import {
+  buildAnnotationEvents,
+  filterCouldMatchLegacy,
+  synthesizeLegacyMetadata,
+} from "./helpers/index.js";
 import type {
   BlobStore,
   Clock,
@@ -76,8 +88,46 @@ export interface KernelConfig {
   registry: WorkflowRegistry;
 }
 
+/** Input for the public `kernel.annotations.attach` helper. */
+export interface AnnotateAttachInput {
+  attributes: Record<string, unknown>;
+  actor?: AnnotationActor;
+  /**
+   * Defaults to "run". Set to "stage" with `scopeId` to scope an
+   * annotation to a specific stage (e.g., from a plugin observing
+   * stage events).
+   */
+  scope?: AnnotationScope;
+  scopeId?: string | null;
+  workflowStageRecordId?: string | null;
+  attempt?: number;
+  payload?: Record<string, unknown>;
+  idempotencyKey?: string;
+  /**
+   * If true, the engine writes an `annotation:created` outbox event
+   * for each attribute in this batch, in the same transaction as the
+   * annotation rows. Off by default.
+   */
+  emitEvent?: boolean;
+}
+
+/**
+ * Public helpers for working with annotations directly — for plugins,
+ * post-hoc reviews, external integrations, and query tooling. The
+ * `attach` path commits in a single transaction; the `list` path is a
+ * read-only query honoring the persistence-port filters.
+ */
+export interface KernelAnnotations {
+  attach(workflowRunId: string, input: AnnotateAttachInput): Promise<void>;
+  list(
+    workflowRunId: string,
+    filters?: AnnotationFilters,
+  ): Promise<WorkflowAnnotationRecord[]>;
+}
+
 export interface Kernel {
   dispatch<T extends KernelCommand>(command: T): Promise<CommandResult<T>>;
+  annotations: KernelAnnotations;
 }
 
 // ============================================================================
@@ -336,5 +386,91 @@ export function createKernel(config: KernelConfig): Kernel {
     }
   }
 
-  return { dispatch };
+  const annotations: KernelAnnotations = {
+    async attach(workflowRunId, input) {
+      const scope = input.scope ?? "run";
+      const inputs: CreateAnnotationInput[] = [];
+      for (const [key, value] of Object.entries(input.attributes)) {
+        // Skip `undefined` values (OTel pattern). This lets callers write
+        // { "x.id": maybeId } without guarding — present-or-absent.
+        if (value === undefined || value === null) continue;
+        inputs.push({
+          workflowRunId,
+          workflowStageRecordId: input.workflowStageRecordId ?? null,
+          attempt: input.attempt,
+          scope,
+          scopeId: input.scopeId ?? null,
+          actor: input.actor,
+          key,
+          value,
+          payload: input.payload,
+          idempotencyKey: input.idempotencyKey,
+          emitEvent: input.emitEvent,
+        });
+      }
+      if (inputs.length === 0) return;
+      // One causation id per attach call — matches the kernel's
+      // dispatch convention where all events from a single command
+      // share a causationId. Prefer the caller's idempotency key when
+      // supplied (stable across retries); otherwise a fresh UUID.
+      const causationId = input.idempotencyKey ?? crypto.randomUUID();
+      // Wrap in a transaction so all attributes commit atomically.
+      // Without this, an external-attach batch could partial-commit if
+      // the persistence layer fails mid-write.
+      await persistence.withTransaction(async (tx) => {
+        await tx.appendAnnotations(inputs);
+        const events = buildAnnotationEvents(inputs, clock.now());
+        if (events.length > 0) {
+          await tx.appendOutboxEvents(
+            events.map((event) => ({
+              workflowRunId: event.workflowRunId,
+              eventType: event.type,
+              payload: event,
+              causationId,
+              occurredAt: event.timestamp,
+            })),
+          );
+        }
+      });
+    },
+    async list(workflowRunId, filters) {
+      const persisted = await persistence.listAnnotations(
+        workflowRunId,
+        filters,
+      );
+
+      // Lazy migration shim for the deprecated WorkflowRun.metadata
+      // column. Synthesize virtual `legacy.metadata.*` rows iff:
+      //   - the filter could match legacy keys (cheap pre-check)
+      //   - AND no migrated `legacy.metadata.*` rows exist on the run
+      //     (detected via a separate, filter-agnostic query so that
+      //     a consumer's narrow filter — e.g. `{ keyPrefix: "x" }` or
+      //     a low `limit` — can't hide an already-migrated row and
+      //     trigger spurious synthesis)
+      // See helpers/legacy-metadata-shim.ts for the contract.
+      if (!filterCouldMatchLegacy(filters ?? {})) return persisted;
+
+      const migrationCheck = await persistence.listAnnotations(workflowRunId, {
+        keyPrefix: "legacy.metadata.",
+        limit: 1,
+      });
+      if (migrationCheck.length > 0) return persisted;
+
+      const run = await persistence.getRun(workflowRunId);
+      if (!run) return persisted;
+      const synthesized = synthesizeLegacyMetadata(run, filters);
+      if (synthesized.length === 0) return persisted;
+
+      const merged = [...persisted, ...synthesized].sort((a, b) => {
+        const cmp = a.createdAt.getTime() - b.createdAt.getTime();
+        if (cmp !== 0) return cmp;
+        return a.id.localeCompare(b.id);
+      });
+
+      const limit = filters?.limit ?? 1000;
+      return merged.slice(0, limit);
+    },
+  };
+
+  return { dispatch, annotations };
 }

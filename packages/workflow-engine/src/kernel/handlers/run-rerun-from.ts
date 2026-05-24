@@ -68,6 +68,18 @@ export async function handleRunRerunFrom(
   );
   const deletedStageIds = stagesToDelete.map((s) => s.stageId);
 
+  // Capture the highest attempt across the stages we're about to delete.
+  // New stage records will be created with attempt = (max prior + 1) so
+  // annotations from the new execution can be distinguished from those
+  // surviving the rerun (annotations have `onDelete: SetNull` on the
+  // stage relation, so their attempt value sticks even though their
+  // workflowStageRecordId is nulled).
+  const priorMaxAttempt = stagesToDelete.reduce(
+    (max, s) => (s.attempt > max ? s.attempt : max),
+    0,
+  );
+  const newAttempt = priorMaxAttempt + 1;
+
   // 9. Delete blob artifacts for stages being removed (full prefix cleanup)
   for (const stage of stagesToDelete) {
     const prefix = `workflow-v2/${run.workflowType}/${workflowRunId}/${stage.stageId}/`;
@@ -102,6 +114,7 @@ export async function handleRunRerunFrom(
       stageName: stage.name,
       stageNumber: workflow.getStageIndex(stage.id) + 1,
       executionGroup: targetGroup,
+      attempt: newAttempt,
       status: "PENDING",
       config: (run.config as any)?.[stage.id] || {},
     });

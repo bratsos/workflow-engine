@@ -68,6 +68,11 @@
       "types": "./dist/kernel/testing/index.d.ts",
       "import": "./dist/kernel/testing/index.js",
       "default": "./dist/kernel/testing/index.js"
+    },
+    "./conventions": {
+      "types": "./dist/conventions/index.d.ts",
+      "import": "./dist/conventions/index.js",
+      "default": "./dist/conventions/index.js"
     }
   },
   "files": [

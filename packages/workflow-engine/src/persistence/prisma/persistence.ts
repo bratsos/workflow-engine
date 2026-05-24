@@ -6,6 +6,8 @@
  */
 
 import type {
+  AnnotationFilters,
+  CreateAnnotationInput,
   CreateLogInput,
   CreateOutboxEventInput,
   CreateRunInput,
@@ -15,6 +17,7 @@ import type {
   UpdateRunInput,
   UpdateStageInput,
   UpsertStageInput,
+  WorkflowAnnotationRecord,
   WorkflowArtifactRecord,
   WorkflowPersistence,
   WorkflowRunRecord,
@@ -296,6 +299,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
         stageName: data.stageName,
         stageNumber: data.stageNumber,
         executionGroup: data.executionGroup,
+        attempt: data.attempt ?? 0,
         status: data.status
           ? this.enums.status(data.status)
           : this.enums.status("PENDING"),
@@ -321,6 +325,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
         stageName: data.create.stageName,
         stageNumber: data.create.stageNumber,
         executionGroup: data.create.executionGroup,
+        attempt: data.create.attempt ?? 0,
         status: data.create.status
           ? this.enums.status(data.create.status)
           : this.enums.status("RUNNING"),
@@ -645,6 +650,126 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
   }
 
   // ============================================================================
+  // WorkflowAnnotation Operations
+  // ============================================================================
+
+  async appendAnnotations(inputs: CreateAnnotationInput[]): Promise<void> {
+    if (inputs.length === 0) return;
+
+    const rows = inputs.map((input) => ({
+      workflowRunId: input.workflowRunId,
+      workflowStageRecordId: input.workflowStageRecordId ?? null,
+      attempt: input.attempt ?? 0,
+      scope: input.scope,
+      scopeId: input.scopeId ?? null,
+      actorKind: input.actor?.kind ?? null,
+      actorId: input.actor?.id ?? null,
+      actorVersion: input.actor?.version ?? null,
+      key: input.key,
+      value: input.value as unknown,
+      payload: (input.payload ?? null) as unknown,
+      idempotencyKey: input.idempotencyKey ?? null,
+    }));
+
+    const hasIdempotencyKey = rows.some((r) => r.idempotencyKey !== null);
+
+    // Fast path: no idempotency keys → no dedup needed (NULL values are
+    // distinct under the unique constraint). Plain createMany works on
+    // both Postgres and SQLite.
+    if (!hasIdempotencyKey) {
+      await this.prisma.workflowAnnotation.createMany({ data: rows });
+      return;
+    }
+
+    // Slow path: at least one row has an idempotency key, so the unique
+    // constraint on (workflowRunId, key, idempotencyKey) may trigger.
+    if (this.databaseType === "postgresql") {
+      // Postgres: `createMany({ skipDuplicates: true })` compiles to
+      // INSERT ... ON CONFLICT DO NOTHING — single statement, safe
+      // inside a transaction. (skipDuplicates is NOT supported on
+      // SQLite in Prisma, so we can't use it cross-DB.)
+      await this.prisma.workflowAnnotation.createMany({
+        data: rows,
+        skipDuplicates: true,
+      });
+      return;
+    }
+
+    // SQLite: per-row create + catch P2002. Unlike Postgres, SQLite
+    // does not abort the surrounding transaction on a constraint
+    // violation, so swallowing the JS error is safe here.
+    for (const row of rows) {
+      try {
+        await this.prisma.workflowAnnotation.create({ data: row });
+      } catch (error: any) {
+        if (error?.code === "P2002") continue;
+        throw error;
+      }
+    }
+  }
+
+  async listAnnotations(
+    workflowRunId: string,
+    filters: AnnotationFilters = {},
+  ): Promise<WorkflowAnnotationRecord[]> {
+    const where: Record<string, unknown> = { workflowRunId };
+
+    if (filters.key !== undefined) {
+      where.key = filters.key;
+    } else if (filters.keyPrefix !== undefined) {
+      // NOTE: Prisma's `startsWith` compiles to `LIKE 'prefix%'`. On
+      // Postgres this uses the (workflowRunId, key) index. On SQLite the
+      // default `LIKE` is case-insensitive and will not use the btree
+      // index; high-volume SQLite consumers should keep keys lowercase
+      // (engine convention) and accept the scan cost. Documented in the
+      // RFC.
+      where.key = { startsWith: filters.keyPrefix };
+    }
+
+    if (filters.scope !== undefined) where.scope = filters.scope;
+    if (filters.scopeId !== undefined) where.scopeId = filters.scopeId;
+    if (filters.actorId !== undefined) where.actorId = filters.actorId;
+    if (filters.actorKind !== undefined) where.actorKind = filters.actorKind;
+    if (filters.attempt !== undefined) where.attempt = filters.attempt;
+
+    if (filters.since !== undefined || filters.until !== undefined) {
+      const createdAt: Record<string, Date> = {};
+      if (filters.since !== undefined) createdAt.gte = filters.since;
+      if (filters.until !== undefined) createdAt.lte = filters.until;
+      where.createdAt = createdAt;
+    }
+
+    const records = await this.prisma.workflowAnnotation.findMany({
+      where,
+      // Secondary order by `id` keeps timeline deterministic when many
+      // rows are inserted in the same transaction (same `createdAt`).
+      // CUIDs are roughly chronological, so this preserves insert order.
+      orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+      take: filters.limit ?? 1000,
+    });
+    return records.map((r: any) => this.mapWorkflowAnnotation(r));
+  }
+
+  private mapWorkflowAnnotation(record: any): WorkflowAnnotationRecord {
+    return {
+      id: record.id,
+      createdAt: record.createdAt,
+      workflowRunId: record.workflowRunId,
+      workflowStageRecordId: record.workflowStageRecordId ?? null,
+      attempt: record.attempt ?? 0,
+      scope: record.scope,
+      scopeId: record.scopeId ?? null,
+      actorKind: record.actorKind ?? null,
+      actorId: record.actorId ?? null,
+      actorVersion: record.actorVersion ?? null,
+      key: record.key,
+      value: record.value,
+      payload: record.payload ?? null,
+      idempotencyKey: record.idempotencyKey ?? null,
+    };
+  }
+
+  // ============================================================================
   // Stage Output Convenience Methods
   // ============================================================================
 
@@ -890,6 +1015,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       stageName: stage.stageName,
       stageNumber: stage.stageNumber,
       executionGroup: stage.executionGroup,
+      attempt: stage.attempt ?? 0,
       status: stage.status,
       startedAt: stage.startedAt,
       completedAt: stage.completedAt,

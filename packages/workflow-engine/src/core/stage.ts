@@ -9,6 +9,7 @@
  */
 
 import type { z } from "zod";
+import type { AnnotationActor } from "../persistence/interface";
 import type {
   CompletionCheckResult,
   LogLevel,
@@ -18,6 +19,92 @@ import type {
   SuspendedResult,
   SuspendedStateSchema,
 } from "./types";
+
+// ============================================================================
+// Annotate API — shared between StageContext and CheckCompletionContext
+// ============================================================================
+
+/**
+ * Single-attribute form options.
+ *
+ * The `actor` field accepts an `AnnotationActor` ({ kind?, id?, version? }).
+ * `payload` is a separate blob slot for non-queryable rich data.
+ * `idempotencyKey` opts the annotation into the unique constraint on
+ * `(workflowRunId, key, idempotencyKey)` so retries are deduped.
+ */
+export interface AnnotateOpts {
+  actor?: AnnotationActor;
+  payload?: Record<string, unknown>;
+  idempotencyKey?: string;
+  /**
+   * If true, the engine writes an `annotation:created` outbox event in
+   * the same transaction as the annotation row. Useful for plugins or
+   * external systems (audit pipelines, SIEM, live dashboards) that
+   * want push notifications on provenance writes. Off by default.
+   */
+  emitEvent?: boolean;
+}
+
+/**
+ * Batch form — multiple attributes share one envelope (actor / payload /
+ * idempotencyKey / emitEvent). Each attribute becomes one row in
+ * WorkflowAnnotation; if `emitEvent` is set, each row also emits its
+ * own `annotation:created` outbox event.
+ */
+export interface AnnotateBatch {
+  attributes: Record<string, unknown>;
+  actor?: AnnotationActor;
+  payload?: Record<string, unknown>;
+  idempotencyKey?: string;
+  emitEvent?: boolean;
+}
+
+/**
+ * Stability level for a well-known annotation key, attached at definition
+ * time and surfaced to IDEs through the conventions module.
+ *
+ * Policy: once a key is `stable`, it is immutable. Renames and value-type
+ * changes must ship as new keys; the old key gets a `@deprecated` JSDoc
+ * tag. No env-var stability opt-in (we deliberately do not copy
+ * OpenTelemetry's `OTEL_SEMCONV_STABILITY_OPT_IN`).
+ */
+export type Stability = "stable" | "experimental" | "deprecated";
+
+/**
+ * Typed annotation key. The phantom `_valueType` parameter lets
+ * `ctx.annotate(key, value)` enforce that `value` matches `T` at compile
+ * time when the key was defined with `typedKey<T>(...)`. The marker is
+ * never set at runtime — only the `key` string is.
+ */
+export interface TypedKey<T = unknown> {
+  readonly key: string;
+  readonly stability: Stability;
+  readonly description?: string;
+  /** Phantom — never populated. Used only for `T` inference. */
+  readonly _valueType?: T;
+}
+
+/**
+ * Overloaded callable supporting three forms:
+ *
+ *   - **Typed key**: `ctx.annotate(Decision.outcome, "low")` — value type
+ *     is inferred from the TypedKey, giving compile-time linkage between
+ *     well-known keys and their expected value shapes.
+ *   - **String key**: `ctx.annotate("custom.namespace.key", value)` —
+ *     escape hatch for org-defined conventions.
+ *   - **Batch**: `ctx.annotate({ attributes: {...}, actor?, ... })` —
+ *     emit several related attributes sharing one envelope.
+ *
+ * All three return `void` from the caller's perspective; writes are
+ * buffered on the context and flushed inside the stage-completion
+ * transaction. `undefined` values are dropped (OTel pattern: callers can
+ * write `ctx.annotate("x.id", maybeId)` without guarding).
+ */
+export interface AnnotateFn {
+  <T>(key: TypedKey<T>, value: T, opts?: AnnotateOpts): void;
+  (key: string, value: unknown, opts?: AnnotateOpts): void;
+  (args: AnnotateBatch): void;
+}
 
 // ============================================================================
 // Stage Context - Available to execute() method
@@ -57,6 +144,10 @@ export interface StageContext<
     message: string,
     meta?: Record<string, unknown>,
   ) => void; // Convenience alias for onLog
+
+  // Annotations — durable provenance attached to this stage.
+  // Buffered and flushed inside the stage-completion transaction.
+  annotate: AnnotateFn;
 
   // Storage for stage artifacts
   storage: StageStorage;
@@ -106,6 +197,12 @@ export interface CheckCompletionContext<TConfig> {
     message: string,
     meta?: Record<string, unknown>,
   ) => void; // Convenience alias for onLog
+
+  // Annotations — durable provenance attached to this stage during the
+  // checkCompletion call. Buffered and flushed inside the Phase-2
+  // transaction; if Phase 2 rolls back on StaleVersionError, the buffer
+  // is discarded with it.
+  annotate: AnnotateFn;
 
   // Storage for stage artifacts
   storage: StageStorage;

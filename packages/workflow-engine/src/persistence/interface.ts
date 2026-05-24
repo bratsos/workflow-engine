@@ -97,6 +97,14 @@ export interface WorkflowStageRecord {
   stageName: string;
   stageNumber: number;
   executionGroup: number;
+  /**
+   * Rerun generation. 0 for the original execution; incremented each
+   * time `run.rerunFrom` recreates this stage. Annotations written by
+   * `ctx.annotate(...)` during this stage inherit this value so a
+   * future agent can distinguish decisions made on different attempts
+   * of the same logical stage.
+   */
+  attempt: number;
   status: WorkflowStageStatus;
   startedAt: Date | null;
   completedAt: Date | null;
@@ -135,6 +143,48 @@ export interface WorkflowArtifactRecord {
   data: unknown;
   size: number;
   metadata: unknown | null;
+}
+
+// ============================================================================
+// WorkflowAnnotation Record Types
+// ============================================================================
+
+/**
+ * Annotation actor — who or what produced this annotation.
+ * `kind` is open (recommended values: "agent", "user", "system") so consumers
+ * can introduce custom kinds. `id` and `version` are indexed individually for
+ * cross-version queries.
+ */
+export interface AnnotationActor {
+  kind?: string;
+  id?: string;
+  version?: string;
+}
+
+/**
+ * Annotation scope — which entity within a run this annotation describes.
+ * - "run": run-level (e.g., trigger context)
+ * - "stage": tied to a specific stage execution (linked via workflowStageRecordId)
+ * - "ai_call": tied to a specific AI call (custom; not used by the engine itself)
+ * - other strings allowed for consumer-defined scopes
+ */
+export type AnnotationScope = "run" | "stage" | "ai_call" | (string & {});
+
+export interface WorkflowAnnotationRecord {
+  id: string;
+  createdAt: Date;
+  workflowRunId: string;
+  workflowStageRecordId: string | null;
+  attempt: number;
+  scope: AnnotationScope;
+  scopeId: string | null;
+  actorKind: string | null;
+  actorId: string | null;
+  actorVersion: string | null;
+  key: string;
+  value: unknown;
+  payload: unknown | null;
+  idempotencyKey: string | null;
 }
 
 // ============================================================================
@@ -241,6 +291,8 @@ export interface CreateStageInput {
   stageName: string;
   stageNumber: number;
   executionGroup: number;
+  /** Rerun generation. Defaults to 0. Set by `run.rerunFrom` for recreated stages. */
+  attempt?: number;
   status?: WorkflowStageStatus;
   startedAt?: Date;
   config?: unknown;
@@ -289,6 +341,55 @@ export interface SaveArtifactInput {
   data: unknown;
   size: number;
   metadata?: unknown;
+}
+
+/**
+ * Input for appending an annotation. `attempt` defaults to 0; callers from
+ * `job-execute.ts` / `stage-poll-suspended.ts` are responsible for computing
+ * the correct attempt value (incremented when a stage is rerun).
+ *
+ * When `idempotencyKey` is set, the unique constraint on
+ * `(workflowRunId, key, idempotencyKey)` ensures duplicates are skipped on
+ * retry. When `idempotencyKey` is null, the constraint does not apply.
+ */
+export interface CreateAnnotationInput {
+  workflowRunId: string;
+  workflowStageRecordId?: string | null;
+  attempt?: number;
+  scope: AnnotationScope;
+  scopeId?: string | null;
+  actor?: AnnotationActor;
+  key: string;
+  value: unknown;
+  payload?: unknown;
+  idempotencyKey?: string | null;
+  /**
+   * If true, the engine emits an `annotation:created` outbox event when
+   * this row is persisted. Plumbed through the buffered-flush path so
+   * the event lands in the same transaction as the annotation row.
+   * Off by default — most provenance is read-only and doesn't need to
+   * be a real-time event.
+   */
+  emitEvent?: boolean;
+}
+
+/**
+ * Filters for `listAnnotations`. All filters are AND-combined.
+ * `keyPrefix` is implemented with `startsWith` (Postgres uses the
+ * `(workflowRunId, key)` index; SQLite may table-scan unless the engine
+ * branches to GLOB — see PrismaWorkflowPersistence).
+ */
+export interface AnnotationFilters {
+  key?: string;
+  keyPrefix?: string;
+  scope?: AnnotationScope;
+  scopeId?: string | null;
+  actorId?: string;
+  actorKind?: string;
+  attempt?: number;
+  since?: Date;
+  until?: Date;
+  limit?: number;
 }
 
 export interface CreateAICallInput {
@@ -397,6 +498,27 @@ export interface WorkflowPersistence {
   deleteArtifact(runId: string, key: string): Promise<void>;
   listArtifacts(runId: string): Promise<WorkflowArtifactRecord[]>;
   getStageIdForArtifact(runId: string, stageId: string): Promise<string | null>;
+
+  // WorkflowAnnotation operations
+  /**
+   * Append one or more annotations. Designed to be called both standalone
+   * (fire-and-forget from external attach) and inside an existing
+   * transaction (buffered during stage execution, flushed in the
+   * stage-completion transaction).
+   *
+   * Rows with the same `(workflowRunId, key, idempotencyKey)` are deduped
+   * via the unique constraint; duplicates are silently skipped.
+   */
+  appendAnnotations(inputs: CreateAnnotationInput[]): Promise<void>;
+
+  /**
+   * List annotations for a run, optionally filtered. Returns rows ordered
+   * by `createdAt` ascending (so consumers get a timeline by default).
+   */
+  listAnnotations(
+    workflowRunId: string,
+    filters?: AnnotationFilters,
+  ): Promise<WorkflowAnnotationRecord[]>;
 
   // Stage output convenience methods (replaces separate StageStorage)
   saveStageOutput(

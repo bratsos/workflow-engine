@@ -60,6 +60,18 @@ async function enqueueExecutionGroup(
 ): Promise<string[]> {
   const stages = workflow.getStagesInExecutionGroup(groupIndex);
 
+  // Compute the current run-level attempt by taking the max attempt
+  // across all existing stages. After `run.rerunFrom` bumps the target
+  // group's stage records to a new attempt, this propagates the same
+  // attempt to downstream groups created here, so annotations from a
+  // single rerun span share one attempt value (and are distinguishable
+  // from prior-attempt annotations preserved via SetNull).
+  const existingStages = await deps.persistence.getStagesByRun(run.id);
+  const currentAttempt = existingStages.reduce(
+    (max, s) => (s.attempt > max ? s.attempt : max),
+    0,
+  );
+
   const stagesToEnqueue: typeof stages = [];
   for (const stage of stages) {
     const record = await deps.persistence.upsertStage({
@@ -71,6 +83,7 @@ async function enqueueExecutionGroup(
         stageName: stage.name,
         stageNumber: workflow.getStageIndex(stage.id) + 1,
         executionGroup: groupIndex,
+        attempt: currentAttempt,
         status: "PENDING",
         config: (run.config as any)?.[stage.id] || {},
       },

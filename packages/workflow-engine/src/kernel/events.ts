@@ -118,6 +118,33 @@ export interface StageProgressEvent {
 }
 
 // ---------------------------------------------------------------------------
+// Annotation events (opt-in)
+// ---------------------------------------------------------------------------
+
+/**
+ * Emitted when an annotation is written with `emitEvent: true`. Lets
+ * plugins and external systems react to provenance writes in real time
+ * (audit pipelines, SIEM, live dashboards) without polling
+ * `kernel.annotations.list`.
+ *
+ * Off by default — annotations are primarily a queryable provenance
+ * surface, not an event stream. Most consumers won't need this.
+ */
+export interface AnnotationCreatedEvent {
+  readonly type: "annotation:created";
+  readonly timestamp: Date;
+  readonly workflowRunId: string;
+  readonly key: string;
+  readonly value: unknown;
+  readonly scope: string;
+  readonly scopeId?: string;
+  readonly attempt?: number;
+  readonly actorKind?: string;
+  readonly actorId?: string;
+  readonly actorVersion?: string;
+}
+
+// ---------------------------------------------------------------------------
 // Union & helpers
 // ---------------------------------------------------------------------------
 
@@ -133,7 +160,8 @@ export type KernelEvent =
   | StageCompletedEvent
   | StageSuspendedEvent
   | StageFailedEvent
-  | StageProgressEvent;
+  | StageProgressEvent
+  | AnnotationCreatedEvent;
 
 /** String literal union of all kernel event type discriminants. */
 export type KernelEventType = KernelEvent["type"];
