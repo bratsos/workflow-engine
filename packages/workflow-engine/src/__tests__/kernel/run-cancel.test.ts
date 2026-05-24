@@ -4,12 +4,12 @@
  * Tests for cancelling workflow runs via the kernel dispatch interface.
  */
 
-import { beforeEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { defineStage } from "../../core/stage-factory.js";
 import type { Workflow } from "../../core/workflow.js";
 import { WorkflowBuilder } from "../../core/workflow.js";
-import { createKernel, type Kernel } from "../../kernel/kernel.js";
+import { createKernel } from "../../kernel/kernel.js";
 import {
   CollectingEventSink,
   FakeClock,

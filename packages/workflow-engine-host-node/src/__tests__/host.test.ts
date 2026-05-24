@@ -11,7 +11,7 @@ import {
   defineStage,
   WorkflowBuilder,
 } from "@bratsos/workflow-engine";
-import { createKernel, type Kernel } from "@bratsos/workflow-engine/kernel";
+import { createKernel } from "@bratsos/workflow-engine/kernel";
 import {
   CollectingEventSink,
   FakeClock,

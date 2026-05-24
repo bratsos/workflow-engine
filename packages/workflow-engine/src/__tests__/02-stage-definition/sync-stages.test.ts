@@ -8,7 +8,7 @@ import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import type { StageContext } from "../../core/stage.js";
 import { defineStage } from "../../core/stage-factory.js";
-import { TestConfigSchemas, TestSchemas } from "../utils/index.js";
+import { TestSchemas } from "../utils/index.js";
 
 describe("I want to define synchronous stages", () => {
   describe("basic stage creation", () => {

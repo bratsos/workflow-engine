@@ -4,7 +4,7 @@
  * Tests for the model helper utilities: getModel, calculateCost, ModelStatsTracker, etc.
  */
 
-import { beforeEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
   AVAILABLE_MODELS,
   calculateCost,

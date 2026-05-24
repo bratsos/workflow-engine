@@ -6,7 +6,7 @@
  */
 
 import type { EmbeddingModelV3 } from "@ai-sdk/provider";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 // Mock optional peer dependencies that ai-helper.ts transitively imports
 vi.mock("@anthropic-ai/sdk", () => ({ Anthropic: class {} }));

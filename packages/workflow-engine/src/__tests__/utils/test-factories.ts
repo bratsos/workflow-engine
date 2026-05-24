@@ -6,16 +6,11 @@
  */
 
 import { z } from "zod";
-import type { Stage } from "../../core/stage.js";
-import type {
-  SimpleStageResult,
-  SimpleSuspendedResult,
-} from "../../core/stage-factory.js";
+import type { SimpleSuspendedResult } from "../../core/stage-factory.js";
 import {
   defineAsyncBatchStage,
   defineStage,
 } from "../../core/stage-factory.js";
-import type { CompletionCheckResult } from "../../core/types.js";
 import { Workflow, WorkflowBuilder } from "../../core/workflow.js";
 
 // ============================================================================
