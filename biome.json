@@ -20,6 +20,9 @@
       "recommended": false,
       "suspicious": {
         "noExplicitAny": "off"
+      },
+      "correctness": {
+        "noUnusedImports": "error"
       }
     }
   },

@@ -8,9 +8,25 @@
  * This file contains ONLY types -- no runtime code.
  */
 
+import type { AnnotationActor } from "../persistence/interface";
+
 // ---------------------------------------------------------------------------
 // run.create
 // ---------------------------------------------------------------------------
+
+/** Annotation to attach at run-creation time. */
+export interface RunCreateAnnotation {
+  readonly attributes: Record<string, unknown>;
+  readonly actor?: AnnotationActor;
+  readonly payload?: Record<string, unknown>;
+  readonly idempotencyKey?: string;
+  /**
+   * If true, the engine writes an `annotation:created` outbox event for
+   * each attribute in this batch, in the same transaction as the run
+   * creation. Off by default.
+   */
+  readonly emitEvent?: boolean;
+}
 
 /** Creates a new workflow run. */
 export interface RunCreateCommand {
@@ -20,7 +36,18 @@ export interface RunCreateCommand {
   readonly input: Record<string, unknown>;
   readonly config?: Record<string, unknown>;
   readonly priority?: number;
+  /**
+   * @deprecated since 0.8.0. Use `annotations` instead — annotations are
+   * queryable, indexed, and follow stable conventions. `metadata` will be
+   * removed in 1.0.
+   */
   readonly metadata?: Record<string, unknown>;
+  /**
+   * Annotations to attach at run creation time. Each entry becomes one
+   * row per attribute, sharing the supplied envelope (actor / payload /
+   * idempotencyKey). Written inside the same transaction as the run.
+   */
+  readonly annotations?: ReadonlyArray<RunCreateAnnotation>;
 }
 
 /** Result of a `run.create` command. */

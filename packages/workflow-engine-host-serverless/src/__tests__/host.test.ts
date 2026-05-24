@@ -11,7 +11,7 @@ import {
   defineStage,
   WorkflowBuilder,
 } from "@bratsos/workflow-engine";
-import { createKernel, type Kernel } from "@bratsos/workflow-engine/kernel";
+import { createKernel } from "@bratsos/workflow-engine/kernel";
 import {
   CollectingEventSink,
   FakeClock,
@@ -22,11 +22,7 @@ import { InMemoryWorkflowPersistence } from "@bratsos/workflow-engine/testing";
 import { InMemoryJobQueue } from "@bratsos/workflow-engine/testing";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import {
-  createServerlessHost,
-  type JobMessage,
-  type ServerlessHost,
-} from "../host.js";
+import { createServerlessHost, type JobMessage } from "../host.js";
 
 // ============================================================================
 // Test helpers

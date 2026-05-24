@@ -8,12 +8,7 @@ import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { defineStage } from "../../core/stage-factory.js";
 import { WorkflowBuilder } from "../../core/workflow.js";
-import {
-  createConfigurableStage,
-  createPassthroughStage,
-  TestConfigSchemas,
-  TestSchemas,
-} from "../utils/index.js";
+import { createPassthroughStage, TestSchemas } from "../utils/index.js";
 
 describe("I want to validate my workflow", () => {
   describe("dependency validation", () => {

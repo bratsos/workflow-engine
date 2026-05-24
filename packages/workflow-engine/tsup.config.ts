@@ -9,6 +9,7 @@ export default defineConfig({
     "persistence/prisma/index": "src/persistence/prisma/index.ts",
     "kernel/index": "src/kernel/index.ts",
     "kernel/testing/index": "src/kernel/testing/index.ts",
+    "conventions/index": "src/conventions/index.ts",
     "cli/sync-models": "src/cli/sync-models.ts",
   },
   format: ["esm"],

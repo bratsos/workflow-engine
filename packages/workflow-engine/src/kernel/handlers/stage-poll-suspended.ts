@@ -16,7 +16,9 @@
  * batch provider APIs are slow to respond.
  */
 
+import type { CheckCompletionContext } from "../../core/stage";
 import {
+  type CreateAnnotationInput,
   type CreateOutboxEventInput,
   StaleVersionError,
 } from "../../persistence/interface";
@@ -24,8 +26,15 @@ import type {
   StagePollSuspendedCommand,
   StagePollSuspendedResult,
 } from "../commands";
+import { RunNotRunningError } from "../errors";
 import type { KernelEvent } from "../events";
-import { createStorageShim, saveStageOutput } from "../helpers/index.js";
+import {
+  buildAnnotationEvents,
+  createAnnotationBuffer,
+  createStorageShim,
+  normalizeAnnotateArgs,
+  saveStageOutput,
+} from "../helpers/index.js";
 import type { HandlerResult, KernelDeps } from "../kernel";
 
 // ---------------------------------------------------------------------------
@@ -62,9 +71,20 @@ async function withClaimedRun<T>(
   expectedVersion: number,
   deps: KernelDeps,
   fn: (tx: KernelDeps["persistence"]) => Promise<T>,
-): Promise<{ status: "claimed"; value: T } | { status: "stale" }> {
+): Promise<
+  | { status: "claimed"; value: T }
+  | { status: "stale" }
+  | { status: "cancelled"; runStatus: string }
+> {
   try {
     const value = await deps.persistence.withTransaction(async (tx) => {
+      // Status guard: if cancel committed between the outer
+      // status check and this transaction, abort to roll back the
+      // pending writes (stage update, annotations, outbox events).
+      const runStatus = await tx.getRunStatus(workflowRunId);
+      if (runStatus !== "RUNNING") {
+        throw new RunNotRunningError(workflowRunId, runStatus ?? "DELETED");
+      }
       await tx.updateRun(workflowRunId, {
         expectedVersion,
       });
@@ -74,6 +94,9 @@ async function withClaimedRun<T>(
   } catch (error) {
     if (error instanceof StaleVersionError) {
       return { status: "stale" };
+    }
+    if (error instanceof RunNotRunningError) {
+      return { status: "cancelled", runStatus: error.currentStatus };
     }
     throw error;
   }
@@ -195,6 +218,34 @@ export async function handleStagePollSuspended(
         .catch(() => {});
     };
 
+    // Buffer annotations made during checkCompletion. Flushed inside
+    // the Phase-2 transaction (via withClaimedRun) so they persist
+    // atomically with the stage outcome — or are dropped if the
+    // transaction rolls back on StaleVersionError, preventing the
+    // phantom-annotation race the adversarial review surfaced.
+    const annotationBuffer = createAnnotationBuffer();
+    const annotateFn = ((...args: unknown[]) => {
+      const stageScopeFields = {
+        workflowRunId: stageRecord.workflowRunId,
+        workflowStageRecordId: stageRecord.id,
+        attempt: stageRecord.attempt,
+        scope: "stage" as const,
+        scopeId: stageRecord.stageId,
+      };
+      for (const { key, value, opts } of normalizeAnnotateArgs(args)) {
+        if (value === undefined || value === null) continue;
+        annotationBuffer.push({
+          ...stageScopeFields,
+          actor: opts?.actor,
+          key,
+          value,
+          payload: opts?.payload,
+          idempotencyKey: opts?.idempotencyKey,
+          emitEvent: opts?.emitEvent,
+        } satisfies CreateAnnotationInput);
+      }
+    }) as CheckCompletionContext<unknown>["annotate"];
+
     // 3e. Build check context
     const checkContext = {
       workflowRunId: run.id,
@@ -203,6 +254,7 @@ export async function handleStagePollSuspended(
       config: stageRecord.config || {},
       log: logFn,
       onLog: logFn,
+      annotate: annotateFn,
       storage,
     };
 
@@ -216,6 +268,7 @@ export async function handleStagePollSuspended(
 
       // ── Phase 2: persist results (transaction) ─────────────────────
       if (checkResult.error) {
+        const bufferedAnnotations = annotationBuffer.flush();
         const claimResult = await withClaimedRun(
           stageRecord.workflowRunId,
           run.version,
@@ -233,6 +286,10 @@ export async function handleStagePollSuspended(
               completedAt: deps.clock.now(),
             });
 
+            if (bufferedAnnotations.length > 0) {
+              await tx.appendAnnotations(bufferedAnnotations);
+            }
+
             await tx.appendOutboxEvents(
               toOutboxEvents(stageRecord.workflowRunId, [
                 {
@@ -249,6 +306,7 @@ export async function handleStagePollSuspended(
                   workflowRunId: stageRecord.workflowRunId,
                   error: checkResult.error!,
                 },
+                ...buildAnnotationEvents(bufferedAnnotations, deps.clock.now()),
               ]),
             );
           },
@@ -261,6 +319,14 @@ export async function handleStagePollSuspended(
           if (latestStatus === "CANCELLED") {
             await markStageCancelled(stageRecord.id, deps);
           }
+          continue;
+        }
+        if (claimResult.status === "cancelled") {
+          // Run was cancelled between our outer status check and the
+          // Phase 2 transaction. Mark this suspended stage as cancelled
+          // and move on; the Phase 2 writes (stage update, annotations,
+          // outbox events) all rolled back atomically.
+          await markStageCancelled(stageRecord.id, deps);
           continue;
         }
 
@@ -290,6 +356,7 @@ export async function handleStagePollSuspended(
           deps.clock.now().getTime() -
           (stageRecord.startedAt?.getTime() ?? deps.clock.now().getTime());
 
+        const bufferedAnnotations = annotationBuffer.flush();
         const claimResult = await withClaimedRun(
           stageRecord.workflowRunId,
           run.version,
@@ -305,6 +372,10 @@ export async function handleStagePollSuspended(
               embeddingInfo: checkResult.embeddings as any,
             });
 
+            if (bufferedAnnotations.length > 0) {
+              await tx.appendAnnotations(bufferedAnnotations);
+            }
+
             await tx.appendOutboxEvents(
               toOutboxEvents(stageRecord.workflowRunId, [
                 {
@@ -315,6 +386,7 @@ export async function handleStagePollSuspended(
                   stageName: stageRecord.stageName,
                   duration,
                 },
+                ...buildAnnotationEvents(bufferedAnnotations, deps.clock.now()),
               ]),
             );
           },
@@ -329,6 +401,14 @@ export async function handleStagePollSuspended(
           }
           continue;
         }
+        if (claimResult.status === "cancelled") {
+          // Run was cancelled between our outer status check and the
+          // Phase 2 transaction. Mark this suspended stage as cancelled
+          // and move on; the Phase 2 writes (stage update, annotations,
+          // outbox events) all rolled back atomically.
+          await markStageCancelled(stageRecord.id, deps);
+          continue;
+        }
 
         resumed++;
         resumedWorkflowRunIds.add(stageRecord.workflowRunId);
@@ -339,6 +419,7 @@ export async function handleStagePollSuspended(
 
         const nextPollAt = new Date(deps.clock.now().getTime() + pollInterval);
 
+        const bufferedAnnotations = annotationBuffer.flush();
         const claimResult = await withClaimedRun(
           stageRecord.workflowRunId,
           run.version,
@@ -347,6 +428,10 @@ export async function handleStagePollSuspended(
             await tx.updateStage(stageRecord.id, {
               nextPollAt,
             });
+
+            if (bufferedAnnotations.length > 0) {
+              await tx.appendAnnotations(bufferedAnnotations);
+            }
           },
         );
 
@@ -359,12 +444,23 @@ export async function handleStagePollSuspended(
           }
           continue;
         }
+        if (claimResult.status === "cancelled") {
+          // Run was cancelled between our outer status check and the
+          // Phase 2 transaction. Mark this suspended stage as cancelled
+          // and move on; the Phase 2 writes (stage update, annotations,
+          // outbox events) all rolled back atomically.
+          await markStageCancelled(stageRecord.id, deps);
+          continue;
+        }
       }
     } catch (error) {
       // Unexpected error during checkCompletion
       const errorMessage =
         error instanceof Error ? error.message : String(error);
 
+      // Flush any annotations recorded before the throw so they
+      // persist alongside the FAILED outcome.
+      const bufferedAnnotations = annotationBuffer.flush();
       const claimResult = await withClaimedRun(
         stageRecord.workflowRunId,
         run.version,
@@ -382,6 +478,10 @@ export async function handleStagePollSuspended(
             completedAt: deps.clock.now(),
           });
 
+          if (bufferedAnnotations.length > 0) {
+            await tx.appendAnnotations(bufferedAnnotations);
+          }
+
           await tx.appendOutboxEvents(
             toOutboxEvents(stageRecord.workflowRunId, [
               {
@@ -398,6 +498,7 @@ export async function handleStagePollSuspended(
                 workflowRunId: stageRecord.workflowRunId,
                 error: errorMessage,
               },
+              ...buildAnnotationEvents(bufferedAnnotations, deps.clock.now()),
             ]),
           );
         },
@@ -410,6 +511,10 @@ export async function handleStagePollSuspended(
         if (latestStatus === "CANCELLED") {
           await markStageCancelled(stageRecord.id, deps);
         }
+        continue;
+      }
+      if (claimResult.status === "cancelled") {
+        await markStageCancelled(stageRecord.id, deps);
         continue;
       }
 

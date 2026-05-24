@@ -1,6 +1,6 @@
 // packages/workflow-engine-host-node/src/__tests__/run-and-wait.test.ts
 import { describe, expect, it, vi } from "vitest";
-import { type RunAndWaitResult, runAndWait } from "../run-and-wait.js";
+import { runAndWait } from "../run-and-wait.js";
 
 function createFakeKernel() {
   return {

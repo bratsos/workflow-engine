@@ -2,9 +2,14 @@
  * Handler: run.create
  *
  * Creates a new workflow run record after validating input and config.
+ * Run-creation annotations (if provided) are written in the same
+ * transaction.
  */
 
+import type { CreateAnnotationInput } from "../../persistence/interface";
 import type { RunCreateCommand, RunCreateResult } from "../commands";
+import type { KernelEvent } from "../events";
+import { buildAnnotationEvents } from "../helpers/index.js";
 import type { HandlerResult, KernelDeps } from "../kernel";
 
 export async function handleRunCreate(
@@ -51,6 +56,37 @@ export async function handleRunCreate(
     metadata: command.metadata,
   });
 
+  // 7. Attach run-creation annotations, if any (atomic with createRun
+  //    since this handler runs inside kernel.dispatch's withTransaction).
+  const annotationEvents: KernelEvent[] = [];
+  if (command.annotations && command.annotations.length > 0) {
+    const annotationInputs: CreateAnnotationInput[] = [];
+    for (const entry of command.annotations) {
+      for (const [key, value] of Object.entries(entry.attributes)) {
+        // Skip undefined and null values (OTel pattern; Prisma requires
+        // explicit Prisma.JsonNull for JSON null and we don't want to
+        // leak that into the public API).
+        if (value === undefined || value === null) continue;
+        annotationInputs.push({
+          workflowRunId: run.id,
+          scope: "run",
+          actor: entry.actor,
+          key,
+          value,
+          payload: entry.payload,
+          idempotencyKey: entry.idempotencyKey,
+          emitEvent: entry.emitEvent,
+        });
+      }
+    }
+    if (annotationInputs.length > 0) {
+      await deps.persistence.appendAnnotations(annotationInputs);
+      annotationEvents.push(
+        ...buildAnnotationEvents(annotationInputs, deps.clock.now()),
+      );
+    }
+  }
+
   return {
     workflowRunId: run.id,
     status: "PENDING" as const,
@@ -61,6 +97,7 @@ export async function handleRunCreate(
         workflowRunId: run.id,
         workflowId: command.workflowId,
       },
+      ...annotationEvents,
     ],
   };
 }

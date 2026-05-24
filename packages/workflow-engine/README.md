@@ -27,6 +27,7 @@ A **type-safe, distributed workflow engine** for AI-orchestrated processes. Feat
   - [Stage ID Utilities](#stage-id-utilities)
   - [AI Integration](#ai-integration)
   - [Long-Running Batch Jobs](#long-running-batch-jobs)
+  - [Annotations (Provenance)](#annotations-provenance)
   - [Config Presets](#config-presets)
 - [Best Practices](#best-practices)
 - [API Reference](#api-reference)
@@ -130,6 +131,7 @@ model WorkflowRun {
   stages        WorkflowStage[]
   logs          WorkflowLog[]
   artifacts     WorkflowArtifact[]
+  annotations   WorkflowAnnotation[]
 
   @@index([status])
   @@index([workflowId])
@@ -146,6 +148,7 @@ model WorkflowStage {
   stageName       String
   stageNumber     Int
   executionGroup  Int
+  attempt         Int                 @default(0)
   status          Status              @default(PENDING)
   startedAt       DateTime?
   completedAt     DateTime?
@@ -163,6 +166,7 @@ model WorkflowStage {
   errorMessage    String?
 
   logs            WorkflowLog[]
+  annotations     WorkflowAnnotation[]
 
   @@unique([workflowRunId, stageId])
   @@index([status])
@@ -210,8 +214,40 @@ model AICall {
   inputTokens   Int
   outputTokens  Int
   cost          Float
+  metadata      Json?
 
   @@index([topic])
+}
+
+model WorkflowAnnotation {
+  id                    String   @id @default(cuid())
+  createdAt             DateTime @default(now())
+
+  workflowRunId         String
+  workflowRun           WorkflowRun     @relation(fields: [workflowRunId], references: [id], onDelete: Cascade)
+
+  workflowStageRecordId String?
+  workflowStage         WorkflowStage?  @relation(fields: [workflowStageRecordId], references: [id], onDelete: SetNull)
+  attempt               Int             @default(0)
+
+  scope                 String          // "run" | "stage" | "ai_call" | custom
+  scopeId               String?
+
+  actorKind             String?         // "agent" | "user" | "system" (open)
+  actorId               String?
+  actorVersion          String?
+
+  key                   String          // dot-namespaced, e.g. "trigger.source"
+  value                 Json            // scalar or scalar-array preferred
+  payload               Json?           // opt-in blob slot for non-queryable rich data
+
+  idempotencyKey        String?
+
+  @@unique([workflowRunId, key, idempotencyKey])
+  @@index([workflowRunId, key])
+  @@index([workflowRunId, createdAt])
+  @@index([workflowRunId, scope])
+  @@index([workflowRunId, actorId])
 }
 
 model JobQueue {
@@ -618,6 +654,63 @@ export const batchStage = defineAsyncBatchStage({
   },
 });
 ```
+
+### Annotations (Provenance)
+
+Available from **v0.8.0**. A first-class API for attaching typed key-value facts to runs and stages so future agents can understand *why* something happened. Inspired by OpenTelemetry semantic conventions: dot-namespaced flat keys, scalar/array values, separate `payload` slot for rich blobs.
+
+Annotations are **durable** — writes are buffered during stage execution and flushed atomically with the stage outcome. Not fire-and-forget.
+
+```typescript
+import { Decision, Trigger } from "@bratsos/workflow-engine/conventions";
+
+// Inside a stage's execute() — typed keys give compile-time value checking
+ctx.annotate(Decision.outcome, "low");
+ctx.annotate(Decision.confidence, 0.42);
+
+// String keys for custom org conventions
+ctx.annotate("acme.compliance.signoff", "alice@acme.com");
+
+// Batch form — multiple attributes share one envelope
+ctx.annotate({
+  actor: { kind: "agent", id: "triage-v3" },
+  attributes: {
+    "decision.outcome": "low",
+    "decision.rationale": "AI confidence below threshold",
+    "decision.used_fallback": true,
+  },
+});
+
+// At run creation — capture trigger context atomically with the run
+await kernel.dispatch({
+  type: "run.create",
+  workflowId: "ticket-triage",
+  input: { ticket },
+  annotations: [{
+    actor: { kind: "system", id: "zendesk" },
+    attributes: {
+      "trigger.source": "webhook:zendesk",
+      "trigger.parent_run_id": previousRunId,
+    },
+  }],
+});
+
+// External attach (plugins, post-hoc reviews) — idempotent retries
+await kernel.annotations.attach(runId, {
+  actor: { kind: "user", id: "alice" },
+  attributes: { "review.disposition": "approved-anyway" },
+  idempotencyKey: "review-2026-05-24-alice",
+});
+
+// Query
+await kernel.annotations.list(runId);                              // everything
+await kernel.annotations.list(runId, { keyPrefix: "decision." });  // by namespace
+await kernel.annotations.list(runId, { actorId: "triage-v3" });    // by actor
+```
+
+**Migration from `WorkflowRun.metadata`**: the `metadata` parameter on `run.create` is `@deprecated` in 0.8 and removed in 1.0. Existing rows are automatically projected as virtual `legacy.metadata.*` annotations when you call `kernel.annotations.list(...)` — no dual-write required.
+
+Well-known conventions live in `@bratsos/workflow-engine/conventions`: `Trigger.*`, `Decision.*`, `Approval.*`, `Revision.*`. Custom org keys keep working with the string form. See the [v0.8 migration guide](skills/workflow-engine/migrations/migrate-0.7-to-0.8.md) and the [annotations skill reference](skills/workflow-engine/references/10-annotations.md) for details.
 
 ### Config Presets
 

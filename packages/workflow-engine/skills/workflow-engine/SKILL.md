@@ -1,12 +1,16 @@
 ---
 name: workflow-engine
-description: Guide for @bratsos/workflow-engine - a type-safe workflow engine with AI integration, stage pipelines, and persistence. Use when building multi-stage workflows, AI-powered pipelines, implementing workflow persistence, defining stages, or working with batch AI operations.
+description: Guide for @bratsos/workflow-engine - a type-safe workflow engine with AI integration, stage pipelines, and persistence. Use when building multi-stage workflows, AI-powered pipelines, implementing workflow persistence, defining stages, or working with batch AI operations. For upgrades between published versions, route through `migrations/README.md`.
 license: MIT
 metadata:
   author: bratsos
   version: "0.3.0"
   repository: https://github.com/bratsos/workflow-engine
 ---
+
+## Upgrading between versions
+
+When the user wants to upgrade `@bratsos/workflow-engine` in their project (e.g., "upgrade my project to the latest workflow-engine version", "I just bumped workflow-engine, walk me through the migration"), route to `migrations/README.md` — the upgrade router. It explains how to detect the installed and previous versions, find the relevant migration guides, and apply them in order. Multi-version upgrades (e.g., 0.6 → 0.8) load and apply multiple migration files sequentially.
 
 # @bratsos/workflow-engine Skill
 
@@ -115,6 +119,8 @@ await kernel.dispatch({
 | `assertValidStageId` | Function | `@bratsos/workflow-engine` | Assert stage ID validity (throws) |
 | `definePlugin` | Function | `@bratsos/workflow-engine/kernel` | Define kernel plugins |
 | `createPluginRunner` | Function | `@bratsos/workflow-engine/kernel` | Create plugin event processor |
+| `typedKey` | Function | `@bratsos/workflow-engine/conventions` | Define a well-known annotation key with linked value type |
+| `Trigger` / `Decision` / `Approval` / `Revision` | Constants | `@bratsos/workflow-engine/conventions` | Well-known annotation key namespaces (v0.8+) |
 
 ## Kernel Commands
 
@@ -345,6 +351,55 @@ const tick = await host.runMaintenanceTick();
 // Note: resumed suspended stages are automatically followed by run.transition.
 ```
 
+## Annotations (Provenance)
+
+Attach typed key-value facts to runs and stages for queryable provenance — trigger context, decisions, approvals, anything else you'd want to ask back later. Writes are buffered during a stage and flushed atomically with the stage outcome (durable, not fire-and-forget).
+
+```typescript
+import { Decision, Trigger } from "@bratsos/workflow-engine/conventions";
+
+// Inside a stage's execute()
+ctx.annotate(Decision.outcome, "low");                       // typed
+ctx.annotate(Decision.confidence, 0.42);                     // typed
+ctx.annotate("acme.compliance.signoff", "alice@acme.com");   // custom key
+ctx.annotate({
+  actor: { kind: "agent", id: "triage-v3" },
+  attributes: {
+    "decision.outcome": "low",
+    "decision.rationale": "below threshold",
+    "decision.used_fallback": true,
+  },
+});
+
+// At run creation — captures trigger context
+await kernel.dispatch({
+  type: "run.create",
+  workflowId: "ticket-triage",
+  input: { ticket },
+  annotations: [{
+    actor: { kind: "system", id: "zendesk" },
+    attributes: {
+      "trigger.source": "webhook:zendesk",
+      "trigger.parent_run_id": previousRunId,
+    },
+  }],
+});
+
+// External attach (plugins, post-hoc reviews)
+await kernel.annotations.attach(runId, {
+  actor: { kind: "user", id: "alice@acme.com" },
+  attributes: { "review.disposition": "approved-anyway" },
+  idempotencyKey: "review-2026-05-24-alice",
+});
+
+// Query — flat key namespace, indexed
+await kernel.annotations.list(runId);
+await kernel.annotations.list(runId, { keyPrefix: "decision." });
+await kernel.annotations.list(runId, { actorId: "triage-v3" });
+```
+
+Annotations replace the deprecated `WorkflowRun.metadata` column. Existing `metadata` is automatically surfaced as `legacy.metadata.*` virtual rows when consumers call `kernel.annotations.list()` (no dual-write, lazy synthesis). See [`references/10-annotations.md`](references/10-annotations.md) for the full API and conventions catalog.
+
 ## AI Integration & Cost Tracking
 
 ```typescript
@@ -446,6 +501,7 @@ await kernel.dispatch({ type: "run.transition", workflowRunId: job.workflowRunId
 - [07-testing-patterns.md](references/07-testing-patterns.md) - Testing with kernel
 - [08-common-patterns.md](references/08-common-patterns.md) - Kernel patterns & best practices
 - [09-troubleshooting.md](references/09-troubleshooting.md) - Debugging stuck runs, P2002 errors, ghost jobs
+- [10-annotations.md](references/10-annotations.md) - First-class provenance surface: `ctx.annotate`, `kernel.annotations.*`, conventions catalog
 
 ## Key Principles
 
@@ -459,3 +515,4 @@ await kernel.dispatch({ type: "run.transition", workflowRunId: job.workflowRunId
 8. **Self-Healing**: Stage creation is idempotent (upsert), orchestration steps are isolated, stuck runs are automatically reaped
 9. **Cost Tracking**: All AI calls automatically track tokens and costs
 10. **BlobStore-Only Artifacts**: All artifact storage goes through the BlobStore port. `run.rerunFrom` cleans up artifacts by key prefix
+11. **Durable Provenance**: `ctx.annotate(...)` writes are buffered and flushed inside the stage-completion transaction. Annotations are atomic with the stage outcome — a stage's annotations either all persist or all roll back together with the stage update and outbox events.

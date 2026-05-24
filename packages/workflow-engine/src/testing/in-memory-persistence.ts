@@ -16,6 +16,8 @@
 
 import { randomUUID } from "crypto";
 import {
+  type AnnotationFilters,
+  type CreateAnnotationInput,
   type CreateLogInput,
   type CreateOutboxEventInput,
   type CreateRunInput,
@@ -27,6 +29,7 @@ import {
   type UpdateRunInput,
   type UpdateStageInput,
   type UpsertStageInput,
+  type WorkflowAnnotationRecord,
   type WorkflowArtifactRecord,
   type WorkflowLogRecord,
   type WorkflowPersistence,
@@ -41,6 +44,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
   private stages = new Map<string, WorkflowStageRecord>();
   private logs = new Map<string, WorkflowLogRecord>();
   private artifacts = new Map<string, WorkflowArtifactRecord>();
+  private annotations: WorkflowAnnotationRecord[] = [];
   private outbox: OutboxRecord[] = [];
   private idempotencyKeys = new Map<string, IdempotencyRecord>();
   private idempotencyInProgress = new Set<string>();
@@ -237,6 +241,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
       stageName: data.stageName,
       stageNumber: data.stageNumber,
       executionGroup: data.executionGroup,
+      attempt: data.attempt ?? 0,
       status: data.status ?? "PENDING",
       startedAt: data.startedAt ?? null,
       completedAt: null,
@@ -440,6 +445,15 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
     if (stage) {
       this.stages.delete(id);
       this.stages.delete(this.stageKey(stage.workflowRunId, stage.stageId));
+      // Mirror Prisma `onDelete: SetNull` on WorkflowAnnotation.workflowStage:
+      // surviving annotations keep their data but lose the FK to the
+      // deleted stage record. Their `attempt` value already captured at
+      // write time still disambiguates them from new attempts.
+      for (const annotation of this.annotations) {
+        if (annotation.workflowStageRecordId === id) {
+          annotation.workflowStageRecordId = null;
+        }
+      }
     }
   }
 
@@ -632,6 +646,94 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
   }
 
   // ============================================================================
+  // WorkflowAnnotation Operations
+  // ============================================================================
+
+  async appendAnnotations(inputs: CreateAnnotationInput[]): Promise<void> {
+    for (const input of inputs) {
+      // Honor the (workflowRunId, key, idempotencyKey) unique constraint.
+      if (input.idempotencyKey !== null && input.idempotencyKey !== undefined) {
+        const exists = this.annotations.some(
+          (a) =>
+            a.workflowRunId === input.workflowRunId &&
+            a.key === input.key &&
+            a.idempotencyKey === input.idempotencyKey,
+        );
+        if (exists) continue;
+      }
+
+      const record: WorkflowAnnotationRecord = {
+        id: randomUUID(),
+        createdAt: new Date(),
+        workflowRunId: input.workflowRunId,
+        workflowStageRecordId: input.workflowStageRecordId ?? null,
+        attempt: input.attempt ?? 0,
+        scope: input.scope,
+        scopeId: input.scopeId ?? null,
+        actorKind: input.actor?.kind ?? null,
+        actorId: input.actor?.id ?? null,
+        actorVersion: input.actor?.version ?? null,
+        key: input.key,
+        value: input.value,
+        payload: input.payload ?? null,
+        idempotencyKey: input.idempotencyKey ?? null,
+      };
+      this.annotations.push(record);
+    }
+  }
+
+  async listAnnotations(
+    workflowRunId: string,
+    filters: AnnotationFilters = {},
+  ): Promise<WorkflowAnnotationRecord[]> {
+    let rows = this.annotations.filter(
+      (a) => a.workflowRunId === workflowRunId,
+    );
+
+    if (filters.key !== undefined) {
+      rows = rows.filter((a) => a.key === filters.key);
+    } else if (filters.keyPrefix !== undefined) {
+      const prefix = filters.keyPrefix;
+      rows = rows.filter((a) => a.key.startsWith(prefix));
+    }
+
+    if (filters.scope !== undefined) {
+      rows = rows.filter((a) => a.scope === filters.scope);
+    }
+    if (filters.scopeId !== undefined) {
+      rows = rows.filter((a) => a.scopeId === filters.scopeId);
+    }
+    if (filters.actorId !== undefined) {
+      rows = rows.filter((a) => a.actorId === filters.actorId);
+    }
+    if (filters.actorKind !== undefined) {
+      rows = rows.filter((a) => a.actorKind === filters.actorKind);
+    }
+    if (filters.attempt !== undefined) {
+      rows = rows.filter((a) => a.attempt === filters.attempt);
+    }
+    if (filters.since !== undefined) {
+      const since = filters.since;
+      rows = rows.filter((a) => a.createdAt >= since);
+    }
+    if (filters.until !== undefined) {
+      const until = filters.until;
+      rows = rows.filter((a) => a.createdAt <= until);
+    }
+
+    // Sort by createdAt with id as tiebreaker (matches Prisma adapter,
+    // keeps batched-insert ordering deterministic).
+    rows.sort((a, b) => {
+      const cmp = a.createdAt.getTime() - b.createdAt.getTime();
+      if (cmp !== 0) return cmp;
+      return a.id.localeCompare(b.id);
+    });
+
+    const limit = filters.limit ?? 1000;
+    return rows.slice(0, limit).map((a) => ({ ...a }));
+  }
+
+  // ============================================================================
   // Stage Output Convenience Method
   // ============================================================================
 
@@ -668,6 +770,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
     this.stages.clear();
     this.logs.clear();
     this.artifacts.clear();
+    this.annotations = [];
     this.outbox = [];
     this.idempotencyKeys.clear();
     this.idempotencyInProgress.clear();
@@ -703,5 +806,12 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
    */
   getAllArtifacts(): WorkflowArtifactRecord[] {
     return Array.from(this.artifacts.values()).map((a) => ({ ...a }));
+  }
+
+  /**
+   * Get all annotations for inspection
+   */
+  getAllAnnotations(): WorkflowAnnotationRecord[] {
+    return this.annotations.map((a) => ({ ...a }));
   }
 }
