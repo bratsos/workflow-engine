@@ -387,6 +387,67 @@ const result = ai.streamText("gemini-2.5-flash", {
 });
 ```
 
+## Reasoning Models & Provider Options
+
+Reasoning models (e.g. `anthropic/claude-opus-4.x`, OpenRouter reasoning models) emit
+on a **separate reasoning channel**. Two facts drive how you use them here:
+
+1. **The answer (`text`) and the reasoning are different channels.** A model can reason
+   *and* answer, or reason *instead of* answering. When it reasons instead of answering,
+   the text channel — including the buffered `result.text` — is genuinely empty; the
+   content is in the reasoning channel.
+2. **Control reasoning per call with `providerOptions`.** This is the standard lever and
+   is forwarded by `generateText`, `generateObject`, and `streamText` (just like `embed`).
+
+### Controlling reasoning (`providerOptions`)
+
+```typescript
+// Disable reasoning so the model emits a normal text answer
+await ai.generateText("anthropic/claude-opus-4.8", prompt, {
+  providerOptions: { anthropic: { thinking: { type: "disabled" } } },
+});
+
+// OpenRouter reasoning controls
+await ai.generateText("some-openrouter-reasoning-model", prompt, {
+  providerOptions: { openrouter: { reasoning: { enabled: false } } }, // or { effort: "low" }
+});
+
+// Works the same on streamText / generateObject
+const result = ai.streamText("anthropic/claude-opus-4.8", { prompt }, {
+  providerOptions: { anthropic: { thinking: { type: "disabled" } } },
+});
+```
+
+> `providerOptions` is a per-call lever (`Record<string, Record<string, unknown>>`). It
+> complements the global `providerResolver` hook, which is set once at provider-creation
+> time and cannot vary per call.
+
+### Reading reasoning output
+
+`generateText` exposes `reasoning` on its result; `streamText` exposes `getText()` and
+`getReasoning()`. The streamed `.stream` carries only the **answer** text, never reasoning.
+
+```typescript
+// Non-streaming
+const { text, reasoning } = await ai.generateText("anthropic/claude-opus-4.8", prompt);
+if (!text && reasoning) {
+  // Model reasoned but did not answer — usually means reasoning should be
+  // suppressed (providerOptions above) or maxTokens raised (see budget note).
+}
+
+// Streaming
+const result = ai.streamText("anthropic/claude-opus-4.8", { prompt });
+let answer = "";
+for await (const chunk of result.stream) answer += chunk; // answer channel only
+const text = await result.getText();        // reconciled answer (== answer here)
+const reasoning = await result.getReasoning(); // reasoning channel, if any
+```
+
+> **Token budget (gap to be aware of):** reasoning tokens count against `maxTokens`
+> (`maxOutputTokens`). If `maxTokens` is small, the model can spend the whole budget
+> reasoning and emit no answer. Either raise `maxTokens` or disable reasoning via
+> `providerOptions` for a normal text answer.
+
 ## batch
 
 Submit batch operations for 50% cost savings.
@@ -576,7 +637,8 @@ interface AITextResult {
   inputTokens: number;
   outputTokens: number;
   cost: number;
-  output?: any;  // Present when experimental_output is used
+  output?: any;       // Present when experimental_output is used
+  reasoning?: string; // Reasoning/thinking text, when the model emitted any
 }
 
 interface AIObjectResult<T> {
@@ -597,6 +659,8 @@ interface AIEmbedResult {
 interface AIStreamResult {
   stream: AsyncIterable<string>;
   getUsage(): Promise<{ inputTokens, outputTokens, cost }>;
+  getText(): Promise<string>;                  // Full answer text, reconciled with the buffered result
+  getReasoning(): Promise<string | undefined>; // Reasoning/thinking text, when the model emitted any
   rawResult: AISDKStreamResult;
 }
 

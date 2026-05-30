@@ -38,6 +38,8 @@ export interface MockTextResponse {
   inputTokens?: number;
   outputTokens?: number;
   cost?: number;
+  /** Optional reasoning text, surfaced via AITextResult.reasoning / getReasoning() */
+  reasoning?: string;
 }
 
 export interface MockObjectResponse<T = unknown> {
@@ -158,6 +160,7 @@ export class MockAIHelper implements AIHelper {
       inputTokens: response.inputTokens ?? 10,
       outputTokens: response.outputTokens ?? 20,
       cost: response.cost ?? 0.001,
+      ...(response.reasoning ? { reasoning: response.reasoning } : {}),
     };
 
     this.recordCallInternal({
@@ -308,6 +311,8 @@ export class MockAIHelper implements AIHelper {
     return {
       stream: streamIterable,
       getUsage: async () => ({ inputTokens, outputTokens, cost }),
+      getText: async () => response.text,
+      getReasoning: async () => response.reasoning,
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       rawResult: {} as any, // Mock raw result
     };
