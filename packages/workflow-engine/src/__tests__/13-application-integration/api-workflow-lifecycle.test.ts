@@ -383,9 +383,13 @@ describe("I want to manage workflow lifecycle from an API", () => {
         duration,
       });
 
-      // Then: Duration is tracked
+      // Then: Duration is tracked — the persisted value round-trips exactly.
+      // (Asserting >= 100 against the setTimeout wall-clock is flaky: Node
+      // timers can fire ~1ms early relative to Date.now(), so the measured
+      // delta is occasionally 99ms.)
       const details = await persistence.getRun(run.id);
-      expect(details?.duration).toBeGreaterThanOrEqual(100);
+      expect(details?.duration).toBe(duration);
+      expect(details?.duration).toBeGreaterThan(0);
     });
   });
 
