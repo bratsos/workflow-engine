@@ -16,7 +16,10 @@
  */
 
 import { google } from "@ai-sdk/google";
-import type { EmbeddingModelV3 } from "@ai-sdk/provider";
+import type {
+  EmbeddingModelV3,
+  SharedV3ProviderOptions,
+} from "@ai-sdk/provider";
 import { openrouter } from "@openrouter/ai-sdk-provider";
 import type { StepResult, ToolSet } from "ai";
 import { embed, generateText, Output, streamText } from "ai";
@@ -91,6 +94,13 @@ export interface AITextResult {
   cost: number;
   /** Structured output when experimental_output is used */
   output?: any;
+  /**
+   * Reasoning/thinking text emitted by the model, when available. Reasoning
+   * models (e.g. via `providerOptions.anthropic.thinking` or OpenRouter's
+   * `reasoning`) emit on a separate channel; this surfaces it. It is NOT part
+   * of `text` (the answer). Undefined when the model produced no reasoning.
+   */
+  reasoning?: string;
 }
 
 export interface AIObjectResult<T> {
@@ -118,6 +128,21 @@ export interface AIStreamResult {
     outputTokens: number;
     cost: number;
   }>;
+  /**
+   * The full answer text, after the stream completes. Consumes the stream if
+   * not already consumed. When the model streamed nothing on the text channel
+   * (e.g. a reasoning model), this reconciles against the buffered final text,
+   * so a text answer is never lost. May be `""` for a reasoning-only response —
+   * in that case the content is in {@link getReasoning}.
+   */
+  getText(): Promise<string>;
+  /**
+   * The model's reasoning/thinking text, when available. Reasoning is a
+   * separate channel from the answer; a model can reason without emitting any
+   * answer text (in which case `getText()` is empty but this is not). Resolves
+   * to `undefined` when the model produced no reasoning.
+   */
+  getReasoning(): Promise<string | undefined>;
   /** The raw AI SDK result - use this for methods like toUIMessageStreamResponse */
   rawResult: AISDKStreamResult;
 }
@@ -161,6 +186,13 @@ export interface TextOptions<TTools extends ToolSet = ToolSet> {
   experimental_output?: Parameters<
     typeof generateText
   >[0]["experimental_output"];
+  /**
+   * Provider-specific options passed directly to the AI SDK call. Use this to
+   * control reasoning per call, e.g.
+   * `{ openrouter: { reasoning: { enabled: false } } }` or
+   * `{ anthropic: { thinking: { type: "disabled" } } }`.
+   */
+  providerOptions?: Record<string, Record<string, unknown>>;
 }
 
 export interface ObjectOptions<TTools extends ToolSet = ToolSet> {
@@ -172,6 +204,11 @@ export interface ObjectOptions<TTools extends ToolSet = ToolSet> {
   stopWhen?: Parameters<typeof generateText>[0]["stopWhen"];
   /** Callback fired when each step completes (for collecting tool results) */
   onStepFinish?: (stepResult: StepResult<TTools>) => Promise<void> | void;
+  /**
+   * Provider-specific options passed directly to the AI SDK call (e.g.
+   * `{ anthropic: { thinking: { type: "disabled" } } }`).
+   */
+  providerOptions?: Record<string, Record<string, unknown>>;
 }
 
 export interface EmbedOptions {
@@ -192,6 +229,13 @@ export interface StreamOptions {
   stopWhen?: Parameters<typeof streamText>[0]["stopWhen"];
   /** Callback fired when each step completes (for collecting tool results) */
   onStepFinish?: Parameters<typeof streamText>[0]["onStepFinish"];
+  /**
+   * Provider-specific options passed directly to the AI SDK call. Use this to
+   * control reasoning per call, e.g.
+   * `{ openrouter: { reasoning: { enabled: false } } }` or
+   * `{ anthropic: { thinking: { type: "disabled" } } }`.
+   */
+  providerOptions?: Record<string, Record<string, unknown>>;
 }
 
 // Multimodal content types for generateText/generateObject
@@ -554,6 +598,12 @@ class AIHelperImpl implements AIHelper {
       model,
       temperature: options.temperature ?? 0.7,
       maxOutputTokens: options.maxTokens,
+      // Provider-specific options (e.g. reasoning control) passed through.
+      // Cast: the public type uses `unknown` values for DX; the consumer is
+      // responsible for passing JSON-serializable provider options.
+      ...(options.providerOptions && {
+        providerOptions: options.providerOptions as SharedV3ProviderOptions,
+      }),
       // Tool-related options (only included if tools are provided)
       ...(hasTools && {
         tools: options.tools,
@@ -629,6 +679,9 @@ class AIHelperImpl implements AIHelper {
         outputTokens,
       );
       const durationMs = Date.now() - startTime;
+      // Reasoning models emit on a separate channel; surface it so a
+      // reasoning-only response isn't seen as empty output.
+      const reasoning = (result as { reasoningText?: string }).reasoningText;
 
       // Log the call (including error cases where finishReason is "error")
       this.aiCallLogger.logCall({
@@ -647,6 +700,7 @@ class AIHelperImpl implements AIHelper {
           finishReason: result.finishReason,
           durationMs,
           isMultimodal,
+          ...(reasoning ? { hasReasoning: true } : {}),
           ...(result.finishReason === "error" && { status: "error" }),
           ...(isMultimodal && {
             mediaTypes: (prompt as ContentPart[])
@@ -674,6 +728,7 @@ class AIHelperImpl implements AIHelper {
         inputTokens,
         outputTokens,
         cost,
+        ...(reasoning ? { reasoning } : {}),
         // Include structured output if experimental_output was used
         ...(hasOutputSchema && {
           output: (result as { output?: unknown }).output,
@@ -747,6 +802,12 @@ class AIHelperImpl implements AIHelper {
       output: Output.object({ schema }),
       temperature: options.temperature ?? 0,
       maxOutputTokens: options.maxTokens,
+      // Provider-specific options (e.g. reasoning control) passed through.
+      // Cast: the public type uses `unknown` values for DX; the consumer is
+      // responsible for passing JSON-serializable provider options.
+      ...(options.providerOptions && {
+        providerOptions: options.providerOptions as SharedV3ProviderOptions,
+      }),
       // Tool-related options (only included if tools are provided)
       ...(hasTools && {
         tools: options.tools,
@@ -1090,6 +1151,12 @@ class AIHelperImpl implements AIHelper {
       temperature: options.temperature ?? 0.7,
       maxOutputTokens: options.maxTokens,
       ...(input.system ? { system: input.system } : {}),
+      // Provider-specific options (e.g. reasoning control) passed through.
+      // Cast: the public type uses `unknown` values for DX; the consumer is
+      // responsible for passing JSON-serializable provider options.
+      ...(options.providerOptions && {
+        providerOptions: options.providerOptions as SharedV3ProviderOptions,
+      }),
       // Tool-related options (only included if tools are provided)
       ...(hasTools && {
         tools: options.tools,
@@ -1112,7 +1179,7 @@ class AIHelperImpl implements AIHelper {
 
     let fullText = "";
     let chunkCount = 0;
-    let streamConsumed = false;
+    let fallbackChecked = false;
     let usageResolved = false;
     let cachedUsage: {
       inputTokens: number;
@@ -1129,7 +1196,22 @@ class AIHelperImpl implements AIHelper {
             try {
               const { done, value } = await reader.next();
               if (done) {
-                streamConsumed = true;
+                // The text channel produced nothing — a reasoning model may
+                // have emitted only on the reasoning channel. Reconcile against
+                // the buffered final text so a text answer streamed all-at-once
+                // (or surfaced only on the buffered result) isn't lost.
+                if (!fallbackChecked) {
+                  fallbackChecked = true;
+                  if (chunkCount === 0) {
+                    const buffered = await result.text;
+                    if (buffered) {
+                      fullText += buffered;
+                      chunkCount++;
+                      options.onChunk?.(buffered);
+                      return { done: false, value: buffered };
+                    }
+                  }
+                }
                 return { done: true, value: undefined };
               }
               fullText += value;
@@ -1146,6 +1228,12 @@ class AIHelperImpl implements AIHelper {
       },
     };
 
+    // getUsage / getText / getReasoning read the AI SDK's own buffered promises
+    // (result.usage / result.text / result.reasoningText). These resolve
+    // independently of — and concurrently with — iterating `.stream`, so they
+    // never open a second reader on result.textStream (which would throw a
+    // ReadableStream lock error).
+
     // Create usage getter that waits for stream completion and persists
     const getUsage = async () => {
       // Return cached usage if already resolved
@@ -1153,14 +1241,9 @@ class AIHelperImpl implements AIHelper {
         return cachedUsage;
       }
 
-      // If stream not yet consumed, consume it first
-      if (!streamConsumed) {
-        for await (const _ of streamIterable) {
-          // Consume the stream
-        }
-      }
-
       const usage = await result.usage;
+      const reasoning = await result.reasoningText;
+      const responseText = (await result.text) || fullText;
       const inputTokens = usage?.inputTokens ?? 0;
       const outputTokens = usage?.outputTokens ?? 0;
       const cost = calculateCostWithDiscount(
@@ -1179,7 +1262,8 @@ class AIHelperImpl implements AIHelper {
         logger.debug(`streamText response`, {
           model: modelKey,
           response:
-            fullText.substring(0, 500) + (fullText.length > 500 ? "..." : ""),
+            responseText.substring(0, 500) +
+            (responseText.length > 500 ? "..." : ""),
           inputTokens,
           outputTokens,
           cost: cost.toFixed(6),
@@ -1194,7 +1278,7 @@ class AIHelperImpl implements AIHelper {
           modelKey,
           modelId: modelConfig.id,
           prompt: promptForLog,
-          response: fullText,
+          response: responseText,
           inputTokens,
           outputTokens,
           cost,
@@ -1203,6 +1287,7 @@ class AIHelperImpl implements AIHelper {
             maxTokens: options.maxTokens,
             streamChunks: chunkCount,
             durationMs,
+            ...(reasoning ? { hasReasoning: true } : {}),
             ...(input.system ? { system: input.system } : {}),
           },
         });
@@ -1211,9 +1296,19 @@ class AIHelperImpl implements AIHelper {
       return cachedUsage ?? { inputTokens, outputTokens, cost };
     };
 
+    // Full answer text, reconciled with the buffered result (handles models
+    // that don't stream text incrementally). Empty for reasoning-only output.
+    const getText = async () => (await result.text) || fullText;
+
+    // Reasoning/thinking text, when the model emitted any (separate channel
+    // from the answer). Undefined otherwise.
+    const getReasoning = async () => await result.reasoningText;
+
     return {
       stream: streamIterable,
       getUsage,
+      getText,
+      getReasoning,
       rawResult: result,
     };
   }

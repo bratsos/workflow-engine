@@ -614,6 +614,14 @@ async execute(ctx) {
 }
 ```
 
+Reasoning models work too — control reasoning per call with `providerOptions` and read the reasoning channel via `result.reasoning` (or `getReasoning()` when streaming):
+
+```typescript
+const { text, reasoning } = await ai.generateText("anthropic/claude-opus-4.8", prompt, {
+  providerOptions: { anthropic: { thinking: { type: "disabled" } } }, // or { openrouter: { reasoning: { enabled: false } } }
+});
+```
+
 ### Long-Running Batch Jobs
 
 ```typescript
