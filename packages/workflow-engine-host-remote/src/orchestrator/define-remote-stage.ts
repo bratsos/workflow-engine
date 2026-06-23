@@ -1,5 +1,6 @@
 import type { Stage } from "@bratsos/workflow-engine";
 import type { z } from "zod";
+import type { ActivityReport } from "../protocol.js";
 import type { OrchestratorTransport } from "../transport.js";
 
 export interface RemoteStageOptions {
@@ -124,8 +125,11 @@ export function defineRemoteStage(
       const storedVersion = meta?.stageCodeVersion as string | undefined;
       const poll = await transport.poll(taskId);
 
-      // Revision 3/4: the broker forgot this task (restart). Recover by
-      // reloading the claim-checked payload and re-registering idempotently.
+      // Revision 3/4: the broker forgot this task (restart). First check for a
+      // durable report written by the worker before it called broker.report() —
+      // if found, the work is already done and we recover without re-running.
+      // Only if no durable report exists do we re-register and let a worker
+      // pick up the task again.
       if (poll.state === "unknown") {
         try {
           const payloadKey =
@@ -140,6 +144,58 @@ export function defineRemoteStage(
               ready: false,
               error: "remote recovery payload missing — run cannot resume",
             };
+
+          // Durable-report recovery: the worker writes
+          // <artifactPrefix>/<taskId>/report.json to object storage BEFORE
+          // calling broker.report(), so if the broker restarts after the worker
+          // completed we can recover the outcome without re-running the work.
+          const durableReportKey = `${payload.artifactPrefix}/${taskId}/report.json`;
+          let durableReport: ActivityReport | undefined;
+          try {
+            const loaded =
+              await ctx.storage.load<ActivityReport>(durableReportKey);
+            if (loaded && typeof loaded === "object" && "outcome" in loaded) {
+              durableReport = loaded as ActivityReport;
+            }
+          } catch {
+            // Key absent or unreadable — fall through to re-register.
+          }
+
+          if (durableReport) {
+            // Replay buffered side-channels from the durable report.
+            for (const l of durableReport.logs)
+              ctx.log(l.level as "INFO", l.message, l.meta);
+            for (const a of durableReport.annotations)
+              (ctx.annotate as (...args: unknown[]) => void)(...a);
+            for (const p of durableReport.progress)
+              ctx.log(
+                "INFO",
+                `progress ${p.progress}%${p.message ? `: ${p.message}` : ""}`,
+              );
+
+            const outcome = durableReport.outcome;
+            if (outcome.kind === "failed")
+              return { ready: false, error: outcome.error };
+
+            // Strict trust gate — same as the normal "reported" path.
+            const parsed = real.outputSchema.safeParse(outcome.output);
+            if (!parsed.success) {
+              return {
+                ready: false,
+                error: `remote output failed schema validation: ${parsed.error.message}`,
+              };
+            }
+            const cm = outcome.customMetrics;
+            return {
+              ready: true,
+              output: parsed.data,
+              metrics: cm
+                ? { startTime: 0, endTime: 0, duration: 0, ...cm }
+                : undefined,
+            };
+          }
+
+          // No durable report — re-register the task so a worker picks it up.
           await transport.submit({
             workflowRunId: ctx.workflowRunId,
             stageId: ctx.stageId,

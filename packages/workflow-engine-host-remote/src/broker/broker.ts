@@ -156,6 +156,19 @@ export class Broker {
     await this.store.update(task.taskId, { status: "REPORTED", report: req });
   }
 
+  /**
+   * Refresh the lease timestamp so that a still-running, heartbeating worker is
+   * NOT reaped by the stale-lease sweep in `poll()`. Each heartbeat resets
+   * `leasedAt` to "now", giving the worker another full `staleLeaseMs` window
+   * before the next sweep can release the lease.
+   *
+   * Invariant: the worker's `heartbeatMs` MUST be less than the broker's
+   * `staleLeaseMs` (safe margin: heartbeatMs ≤ staleLeaseMs / 4) so that at
+   * least one heartbeat fires within every stale-lease window.
+   *
+   * Note: heartbeats do NOT extend the absolute `deadlineAt`. The deadline is
+   * set once at submit time and is unaffected by heartbeat activity.
+   */
   async heartbeat(req: HeartbeatRequest): Promise<HeartbeatResponse> {
     const task = await this.store.get(req.taskId);
     if (
@@ -165,6 +178,8 @@ export class Broker {
     ) {
       return { ok: false, cancel: true };
     }
+    // Refresh leasedAt — prevents the stale-lease sweep from releasing this
+    // lease while the worker is actively running and heartbeating.
     await this.store.update(task.taskId, { leasedAt: this.now() });
     return { ok: true, cancel: false };
   }
