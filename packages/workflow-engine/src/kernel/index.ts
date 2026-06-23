@@ -51,6 +51,12 @@ export type {
   WorkflowStartedEvent,
   WorkflowSuspendedEvent,
 } from "./events.js";
+// Executor implementations
+export { createLocalExecutor } from "./executor/local-executor.js";
+export {
+  createRoutingExecutor,
+  type RoutingExecutorOptions,
+} from "./executor/routing-executor.js";
 // Kernel helpers
 export { loadWorkflowContext, saveStageOutput } from "./helpers/index.js";
 // Kernel factory and core interfaces
