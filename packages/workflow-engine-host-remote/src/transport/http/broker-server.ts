@@ -1,3 +1,4 @@
+import { timingSafeEqual } from "node:crypto";
 import * as http from "node:http";
 import type { Broker } from "../../broker/broker.js";
 import type { InMemoryObjectStore } from "../../object-store.js";
@@ -6,6 +7,7 @@ import { ActivityReportSchema, LeaseRequestSchema } from "./schemas.js";
 export interface BrokerServerDeps {
   broker: Broker;
   objectStore: InMemoryObjectStore;
+  /** Bearer token required on every request. If omitted, NO auth is enforced — dev/local use only. */
   authToken?: string;
   publicBaseUrl?: string;
 }
@@ -22,6 +24,15 @@ export interface HandlerResponse {
   json?: unknown;
 }
 
+function tokensMatch(provided: string | undefined, expected: string): boolean {
+  if (provided === undefined) return false;
+  const a = Buffer.from(provided);
+  const b = Buffer.from(expected);
+  // Length check first (timingSafeEqual throws on length mismatch); leaking
+  // length is acceptable.
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
 /**
  * Pure handler function — no node:http dependency. Routes incoming requests
  * to broker methods and returns a structured response. Unit-testable without
@@ -36,7 +47,7 @@ export async function handleBrokerRequest(
     const authHeader = req.headers["authorization"];
     const raw = Array.isArray(authHeader) ? authHeader[0] : authHeader;
     const provided = raw?.startsWith("Bearer ") ? raw.slice(7) : undefined;
-    if (provided !== deps.authToken) {
+    if (!tokensMatch(provided, deps.authToken)) {
       return { status: 401, json: { error: "unauthorized" } };
     }
   }
@@ -88,6 +99,9 @@ export async function handleBrokerRequest(
 
   // POST /heartbeat
   if (method === "POST" && reqPath === "/heartbeat") {
+    if (req.body === null || typeof req.body !== "object") {
+      return { status: 400, json: { error: "invalid request body" } };
+    }
     const body = req.body as { taskId?: string; leaseToken?: string };
     if (!body.taskId || !body.leaseToken) {
       return { status: 400, json: { error: "taskId and leaseToken required" } };
@@ -101,6 +115,9 @@ export async function handleBrokerRequest(
 
   // POST /presign
   if (method === "POST" && reqPath === "/presign") {
+    if (req.body === null || typeof req.body !== "object") {
+      return { status: 400, json: { error: "invalid request body" } };
+    }
     const body = req.body as {
       taskId?: string;
       leaseToken?: string;
