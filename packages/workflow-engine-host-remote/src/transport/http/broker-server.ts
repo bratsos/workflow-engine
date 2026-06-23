@@ -4,6 +4,11 @@ import type { Broker } from "../../broker/broker.js";
 import type { InMemoryObjectStore } from "../../object-store.js";
 import { ActivityReportSchema, LeaseRequestSchema } from "./schemas.js";
 
+/** Returns true for absolute http/https URLs (S3, R2, MinIO). False for mem:// or relative. */
+function isAbsoluteHttpUrl(url: string): boolean {
+  return url.startsWith("http://") || url.startsWith("https://");
+}
+
 export interface BrokerServerDeps {
   broker: Broker;
   objectStore: InMemoryObjectStore;
@@ -139,10 +144,16 @@ export async function handleBrokerRequest(
       relKey: body.relKey,
       op: body.op,
     });
-    // presignResp.url is a mem:// url from InMemoryObjectStore. Wrap it as an
-    // HTTP blob URL pointing at THIS server so the worker can PUT/GET over HTTP.
-    const base = deps.publicBaseUrl ?? "http://127.0.0.1";
-    const blobUrl = `${base}/blob?u=${encodeURIComponent(presignResp.url)}`;
+    // If the presigner returned an absolute http(s):// URL (S3/R2/MinIO), return
+    // it as-is so the worker writes DIRECTLY to the object store (no /blob hop).
+    // Only wrap mem:// urls in the /blob shim for the in-memory dev/test case.
+    let blobUrl: string;
+    if (isAbsoluteHttpUrl(presignResp.url)) {
+      blobUrl = presignResp.url;
+    } else {
+      const base = deps.publicBaseUrl ?? "http://127.0.0.1";
+      blobUrl = `${base}/blob?u=${encodeURIComponent(presignResp.url)}`;
+    }
     return { status: 200, json: { url: blobUrl } };
   }
 

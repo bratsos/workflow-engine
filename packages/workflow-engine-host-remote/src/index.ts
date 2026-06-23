@@ -7,6 +7,11 @@ export {
   type TaskStatus,
 } from "./broker/store.js";
 export {
+  createS3BlobStore,
+  createS3Presigner,
+  type S3PresignerConfig,
+} from "./object-store/s3/index.js";
+export {
   type Clockish,
   InMemoryObjectStore,
   type ObjectStorePresigner,
