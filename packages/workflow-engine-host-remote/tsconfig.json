@@ -1,0 +1,23 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "./dist",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "noEmit": true,
+    "noUncheckedIndexedAccess": false,
+    "verbatimModuleSyntax": false,
+    "noImplicitOverride": false,
+    "paths": {
+      "@bratsos/workflow-engine": ["../workflow-engine/src/index.ts"],
+      "@bratsos/workflow-engine/kernel": ["../workflow-engine/src/kernel/index.ts"],
+      "@bratsos/workflow-engine/kernel/testing": ["../workflow-engine/src/kernel/testing/index.ts"],
+      "@bratsos/workflow-engine/testing": ["../workflow-engine/src/testing/index.ts"]
+    }
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist"]
+}
