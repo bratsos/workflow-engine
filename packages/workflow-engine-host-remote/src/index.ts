@@ -15,6 +15,10 @@ export {
   defineRemoteStage,
   type RemoteStageOptions,
 } from "./orchestrator/define-remote-stage.js";
+export {
+  createRemoteExecutor,
+  type RemoteExecutorOptions,
+} from "./orchestrator/remote-executor.js";
 export * from "./protocol.js";
 export {
   createInProcessTransport,

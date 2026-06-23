@@ -72,14 +72,19 @@ export {
 } from "./plugins.js";
 // Port interfaces and annotation types
 export type {
+  ActivityExecutor,
+  ActivityRunInput,
+  ActivityRunResult,
   AnnotationActor,
   AnnotationFilters,
   AnnotationScope,
   BlobStore,
+  BufferedLog,
   Clock,
   CreateAnnotationInput,
   CreateOutboxEventInput,
   EventSink,
+  ExecutorDeps,
   IdempotencyRecord,
   JobTransport,
   OutboxRecord,
