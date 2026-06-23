@@ -44,19 +44,59 @@ export class Broker {
   }
 
   async submit(req: SubmitRequest): Promise<SubmitResponse> {
-    const taskId = this.generateId();
+    const taskId = req.taskId ?? this.generateId();
     const now = this.now();
+
+    // Idempotent (Revision 2): task already exists (ANY status) — return the
+    // existing record's deadline WITHOUT calling store.create. This prevents
+    // two concurrent "unknown" re-registers from clobbering an ASSIGNED or
+    // REPORTED task.
+    const existing = await this.store.get(taskId);
+    if (existing) {
+      return {
+        taskId,
+        pollConfig: {
+          pollInterval: req.pollInterval,
+          maxWaitTime: req.maxWaitTime,
+          nextPollAt: new Date(now + req.pollInterval),
+        },
+        deadlineAt: existing.deadline,
+        stageCodeVersion: this.stageCodeVersion,
+      };
+    }
+
+    // Absolute deadline (Revision 1): honour a caller-supplied deadlineAt so the
+    // deadline is set ONCE at first submit and never reset on re-register.
+    const deadline = req.deadlineAt ?? now + req.maxWaitTime;
+
+    // A re-register may legitimately fail at create-time for two reasons:
+    //  - Revision 4: the proxy pinned a version that no longer matches the
+    //    broker's (a deploy changed stage code mid-suspension).
+    //  - Revision 3: the original absolute deadline has already passed, so the
+    //    task must NOT be re-queued for a worker — it goes straight to FAILED.
+    // Version mismatch takes precedence as the more actionable cause.
+    const versionMismatch =
+      req.pinnedVersion !== undefined &&
+      this.stageCodeVersion !== undefined &&
+      req.pinnedVersion !== this.stageCodeVersion;
+    const deadlinePassed = req.deadlineAt !== undefined && now > deadline;
+    const createFailureError = versionMismatch
+      ? "stage code version changed during suspension (deploy) — cannot safely resume"
+      : deadlinePassed
+        ? "remote activity deadline exceeded"
+        : null;
+
     await this.store.create({
       taskId,
       workflowRunId: req.workflowRunId,
       stageId: req.stageId,
       stageName: req.stageName,
       stageNumber: req.stageNumber,
-      status: "PENDING",
+      status: createFailureError !== null ? "FAILED" : "PENDING",
       leaseToken: null,
       leasedAt: null,
       attempt: 0,
-      deadline: now + req.maxWaitTime,
+      deadline,
       createdAt: now,
       payload: {
         input: req.input,
@@ -65,7 +105,8 @@ export class Broker {
         workflowContext: req.workflowContext,
       },
       report: null,
-      failureError: null,
+      failureError: createFailureError,
+      artifactPrefix: req.artifactPrefix,
     });
     return {
       taskId,
@@ -74,6 +115,8 @@ export class Broker {
         maxWaitTime: req.maxWaitTime,
         nextPollAt: new Date(now + req.pollInterval),
       },
+      deadlineAt: deadline,
+      stageCodeVersion: this.stageCodeVersion,
     };
   }
 
@@ -116,18 +159,30 @@ export class Broker {
 
   async poll(taskId: string): Promise<PollResponse> {
     const task = await this.store.get(taskId);
+    // Unknown (Revision 4 of state model): the broker has no record of this
+    // task — typically because it restarted and lost its in-memory store. The
+    // proxy treats "unknown" as a signal to re-register from the claim-checked
+    // payload, rather than failing the run.
     if (!task)
-      return { state: "failed", logs: [], annotations: [], progress: [] };
+      return { state: "unknown", logs: [], annotations: [], progress: [] };
 
     // deadline first — terminal
     if (task.status !== "REPORTED" && this.now() > task.deadline) {
+      const deadlineError =
+        task.failureError ?? "remote activity deadline exceeded";
       if (task.status !== "FAILED") {
         await this.store.update(taskId, {
           status: "FAILED",
-          failureError: "activity deadline exceeded",
+          failureError: deadlineError,
         });
       }
-      return { state: "failed", logs: [], annotations: [], progress: [] };
+      return {
+        state: "failed",
+        logs: [],
+        annotations: [],
+        progress: [],
+        error: deadlineError,
+      };
     }
 
     // stale lease → re-lease to PENDING (crash recovery)
@@ -155,7 +210,13 @@ export class Broker {
       };
     }
     if (task.status === "FAILED") {
-      return { state: "failed", logs: [], annotations: [], progress: [] };
+      return {
+        state: "failed",
+        logs: [],
+        annotations: [],
+        progress: [],
+        error: task.failureError ?? undefined,
+      };
     }
     return {
       state: task.status === "ASSIGNED" ? "assigned" : "pending",
@@ -197,7 +258,11 @@ export class Broker {
   }
 
   private prefixFor(task: TaskRecord): string {
-    return `remote-activity/${task.workflowRunId}/${task.stageId}/${task.taskId}/`;
+    // Revision 5: prefer the proxy-supplied artifactPrefix (aligned with the
+    // engine's stage storage key) so reruns reuse the same artifact namespace.
+    return task.artifactPrefix !== undefined
+      ? `${task.artifactPrefix}/${task.taskId}/`
+      : `remote-activity/${task.workflowRunId}/${task.stageId}/${task.taskId}/`;
   }
 
   private toActivityTask(task: TaskRecord): ActivityTask {

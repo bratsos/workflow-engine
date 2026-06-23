@@ -78,10 +78,16 @@ export interface SubmitRequest {
   workflowContext: Record<string, unknown>;
   pollInterval: number;
   maxWaitTime: number;
+  taskId?: string; // Revision 7: stable id for idempotent re-register
+  deadlineAt?: number; // Revision 1: epoch ms — preserved across restarts
+  pinnedVersion?: string; // Revision 4: version pin for deploy safety
+  artifactPrefix?: string; // Revision 5: rerun prefix alignment
 }
 export interface SubmitResponse {
   taskId: string;
   pollConfig: { pollInterval: number; maxWaitTime: number; nextPollAt: Date };
+  deadlineAt: number; // Revision 1: the broker's absolute deadline
+  stageCodeVersion?: string; // Revision 4: broker's current version, stashed by proxy
 }
 export interface LeaseRequest {
   workerId: string;
@@ -105,7 +111,12 @@ export interface PresignRequest {
 export interface PresignResponse {
   url: string;
 }
-export type PollState = "pending" | "assigned" | "reported" | "failed";
+export type PollState =
+  | "pending"
+  | "assigned"
+  | "reported"
+  | "failed"
+  | "unknown";
 export interface PollResponse {
   state: PollState;
   outcome?: ActivityOutcome;
@@ -113,4 +124,6 @@ export interface PollResponse {
   annotations: unknown[][];
   progress: BufferedProgress[];
   nextCheckIn?: number;
+  /** Broker's specific failure reason for `state:"failed"` (deadline, version, etc.). */
+  error?: string;
 }

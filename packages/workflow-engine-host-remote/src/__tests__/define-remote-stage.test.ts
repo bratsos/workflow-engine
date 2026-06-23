@@ -19,11 +19,13 @@ const real = defineStage({
 });
 
 function ctxStub() {
+  const blobs = new Map<string, unknown>();
   return {
     workflowRunId: "r1",
     stageId: "download",
     stageNumber: 1,
     stageName: "Download",
+    stageRecordId: "rec1",
     input: {},
     config: {},
     workflowContext: {},
@@ -31,7 +33,18 @@ function ctxStub() {
     onLog: vi.fn(),
     annotate: vi.fn(),
     onProgress: vi.fn(),
-    storage: {} as never,
+    storage: {
+      getStageKey: (id: string, suffix?: string) =>
+        `k/${id}/${suffix ?? "output.json"}`,
+      save: async <T>(key: string, data: T) => {
+        blobs.set(key, data);
+      },
+      load: async <T>(key: string) => blobs.get(key) as T,
+      exists: async (key: string) => blobs.has(key),
+      delete: async (_key: string) => {
+        blobs.delete(_key);
+      },
+    },
   };
 }
 
@@ -45,6 +58,8 @@ describe("defineRemoteStage", () => {
           maxWaitTime: 1000,
           nextPollAt: new Date(0),
         },
+        deadlineAt: 1000,
+        stageCodeVersion: "v1",
       })),
       poll: vi.fn(),
     };

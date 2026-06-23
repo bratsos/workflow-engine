@@ -24,6 +24,7 @@ export interface TaskRecord {
   payload: TaskPayload;
   report: ActivityReport | null;
   failureError: string | null;
+  artifactPrefix?: string; // Revision 5: stored so prefixFor() uses it
 }
 
 export interface BrokerStore {
@@ -42,7 +43,15 @@ export class InMemoryBrokerStore implements BrokerStore {
   private readonly tasks = new Map<string, TaskRecord>();
 
   async create(rec: TaskRecord): Promise<void> {
+    if (this.tasks.has(rec.taskId)) {
+      throw new Error(`task ${rec.taskId} already exists`);
+    }
     this.tasks.set(rec.taskId, { ...rec });
+  }
+
+  /** Test-only: empty the task map to simulate an orchestrator restart. */
+  clear(): void {
+    this.tasks.clear();
   }
 
   async get(taskId: string): Promise<TaskRecord | null> {
