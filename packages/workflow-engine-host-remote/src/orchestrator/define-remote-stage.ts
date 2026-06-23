@@ -15,6 +15,10 @@ const ZERO_METRICS = { startTime: 0, endTime: 0, duration: 0 };
  * The claim-checked worker payload. Saved to BlobStore at suspend-time so that,
  * if the orchestrator restarts and its in-memory broker forgets the task, the
  * proxy can reconstruct the submit request and re-register the work.
+ *
+ * Fix 4: deadlineAt and stageCodeVersion are included so that recovery is
+ * fully self-contained from the durable payload (preferred source:
+ * suspendedState.metadata; fallback: payload.deadlineAt / payload.stageCodeVersion).
  */
 interface RemotePayload {
   stageName: string;
@@ -26,6 +30,10 @@ interface RemotePayload {
   pollInterval: number;
   maxWaitTime: number;
   artifactPrefix: string;
+  /** Absolute deadline (ms since epoch) stashed for recovery self-sufficiency. */
+  deadlineAt?: number;
+  /** Stage code version stashed for version-pin self-sufficiency. */
+  stageCodeVersion?: string;
 }
 
 export function defineRemoteStage(
@@ -53,21 +61,6 @@ export function defineRemoteStage(
       // stage storage key so reruns reuse the same prefix.
       const artifactPrefix = ctx.storage.getStageKey(ctx.stageId, "remote");
 
-      // Revision 5/6: claim-check the full worker payload to BlobStore under a
-      // deterministic key BEFORE submitting, so the recovery path can reload it.
-      const payload: RemotePayload = {
-        stageName: ctx.stageName,
-        stageNumber: ctx.stageNumber,
-        input: ctx.input,
-        config: ctx.config,
-        resumeState: ctx.resumeState,
-        workflowContext: ctx.workflowContext as Record<string, unknown>,
-        pollInterval,
-        maxWaitTime,
-        artifactPrefix,
-      };
-      await ctx.storage.save(payloadKey, payload);
-
       const submitted = await transport.submit({
         workflowRunId: ctx.workflowRunId,
         stageId: ctx.stageId,
@@ -82,6 +75,25 @@ export function defineRemoteStage(
         taskId,
         artifactPrefix,
       });
+
+      // Revision 5/6 + Fix 4: claim-check the full worker payload to BlobStore
+      // AFTER submit so we can include the broker-confirmed deadlineAt and
+      // stageCodeVersion, making recovery fully self-contained from the durable
+      // payload (no reliance on suspendedState.metadata alone).
+      const payload: RemotePayload = {
+        stageName: ctx.stageName,
+        stageNumber: ctx.stageNumber,
+        input: ctx.input,
+        config: ctx.config,
+        resumeState: ctx.resumeState,
+        workflowContext: ctx.workflowContext as Record<string, unknown>,
+        pollInterval,
+        maxWaitTime,
+        artifactPrefix,
+        deadlineAt: submitted.deadlineAt,
+        stageCodeVersion: submitted.stageCodeVersion,
+      };
+      await ctx.storage.save(payloadKey, payload);
 
       return {
         suspended: true as const,
@@ -120,6 +132,14 @@ export function defineRemoteStage(
             (meta?.payloadKey as string | undefined) ??
             ctx.storage.getStageKey(ctx.stageId, "remote-payload.json");
           const payload = await ctx.storage.load<RemotePayload>(payloadKey);
+          // Fix 1: a missing payload is unrecoverable — the run cannot resume.
+          // Return a terminal error so the engine fails the run cleanly rather
+          // than suspending indefinitely with no path forward.
+          if (!payload)
+            return {
+              ready: false,
+              error: "remote recovery payload missing — run cannot resume",
+            };
           await transport.submit({
             workflowRunId: ctx.workflowRunId,
             stageId: ctx.stageId,
@@ -134,14 +154,20 @@ export function defineRemoteStage(
             taskId,
             // Revision 1: re-register with the ORIGINAL absolute deadline so the
             // deadline is never reset across restarts.
-            deadlineAt: storedDeadlineAt,
+            deadlineAt: storedDeadlineAt ?? payload.deadlineAt,
             // Revision 4: pin the version so a deploy that changed stage code
             // fails the run rather than resuming on incompatible code.
-            pinnedVersion: storedVersion,
+            pinnedVersion: storedVersion ?? payload.stageCodeVersion,
             artifactPrefix: payload.artifactPrefix,
           });
           return { ready: false, nextCheckIn: pollInterval };
-        } catch {
+        } catch (err) {
+          // Fix 2: log transient errors so a stage stuck in recovery is
+          // distinguishable from one normally waiting.
+          ctx.log("WARN", "remote recovery failed, will retry", {
+            taskId,
+            error: err instanceof Error ? err.message : String(err),
+          });
           // Revision 3: transient errors (e.g. BlobStore blip) must keep the
           // stage SUSPENDED for a later retry — never throw, never fail.
           return { ready: false, nextCheckIn: pollInterval };

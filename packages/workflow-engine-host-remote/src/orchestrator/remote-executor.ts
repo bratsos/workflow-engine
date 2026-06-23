@@ -151,8 +151,12 @@ export function createRemoteExecutor(
         return { error, progress: [], annotations: [], logs: [] };
       }
 
-      // Submit to broker
-      const submitted = await transport.submit({
+      // Fix 5: use stageRecordId as a stable taskId so a re-dispatch after a
+      // broker restart is idempotent (not a duplicate task).
+      const stableTaskId = stageRecordId;
+
+      // Submit args captured for potential re-submit on "unknown" state.
+      const submitArgs = {
         workflowRunId,
         stageId,
         stageName,
@@ -163,7 +167,11 @@ export function createRemoteExecutor(
         workflowContext,
         pollInterval: pollIntervalMs,
         maxWaitTime: maxWaitMs,
-      });
+        taskId: stableTaskId,
+      };
+
+      // Submit to broker
+      const submitted = await transport.submit(submitArgs);
 
       const { taskId } = submitted;
 
@@ -171,13 +179,25 @@ export function createRemoteExecutor(
       const MAX_ITERS = 10_000;
       let poll = await transport.poll(taskId);
       let iters = 0;
+      let resubmits = 0;
 
       while (
         poll.state !== "reported" &&
         poll.state !== "failed" &&
         iters < MAX_ITERS
       ) {
-        await new Promise<void>((resolve) => setTimeout(resolve, pollEveryMs));
+        // Fix 5: broker forgot the task (e.g. broker restart). Re-submit the
+        // same task (idempotent due to stable taskId) and keep polling.
+        if (poll.state === "unknown") {
+          if (resubmits < MAX_ITERS) {
+            await transport.submit(submitArgs);
+            resubmits++;
+          }
+        } else {
+          await new Promise<void>((resolve) =>
+            setTimeout(resolve, pollEveryMs),
+          );
+        }
         poll = await transport.poll(taskId);
         iters++;
       }

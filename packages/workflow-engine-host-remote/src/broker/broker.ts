@@ -18,6 +18,18 @@ export interface BrokerConfig {
   presigner: ObjectStorePresigner;
   clock: Clockish;
   staleLeaseMs?: number;
+  /**
+   * Fix 3: Version-pinning (and the lease version gate) require BOTH the broker
+   * AND the worker/proxy to set `stageCodeVersion`. If the broker leaves it
+   * unset, version-pinning is disabled — the broker will accept any
+   * `pinnedVersion` without mismatch checking and the lease gate is skipped.
+   *
+   * Note: if a submit request carries `req.pinnedVersion` but the broker has no
+   * `stageCodeVersion`, the mismatch check is silently skipped (no failure).
+   * This is the correct default behaviour — a broker without version config
+   * should not reject tasks — but it means pinning is effectively disabled until
+   * both sides are configured.
+   */
   stageCodeVersion?: string;
   generateId?: () => string;
 }

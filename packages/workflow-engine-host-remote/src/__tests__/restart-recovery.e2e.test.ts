@@ -227,7 +227,8 @@ describe("remote activity workers — restart recovery (no-table durability)", (
 
     const { workflowRunId } = await runToSuspend(s, "k-expired", 2);
 
-    // Push the clock past the original absolute deadline (submittedAt + 60s).
+    // Push the clock past the original absolute deadline (submittedAt + maxWaitMs).
+    // 60_001 > maxWaitMs (60_000) defined in the fixture's heavyStage / buildOrchestrator.
     s.clock.advance(60_001);
 
     brokerStore.clear();
@@ -249,6 +250,32 @@ describe("remote activity workers — restart recovery (no-table durability)", (
     const stages = await orch.persistence.getStagesByRun(workflowRunId);
     const failed = stages.find((st) => st.status === "FAILED");
     expect(failed?.errorMessage).toMatch(/deadline exceeded/i);
+  });
+
+  it("Test 1b: missing payload blob fails the run with a clear error (Fix 1)", async () => {
+    const s = setup();
+    const { orch, brokerStore, os } = s;
+
+    const { workflowRunId } = await runToSuspend(s, "k-missing-payload", 2);
+
+    const meta = await getSuspendedMetadata(orch, workflowRunId);
+    const payloadKey = meta.payloadKey as string;
+
+    // Wipe the broker AND the payload blob — unrecoverable state.
+    brokerStore.clear();
+    await os.delete(payloadKey);
+
+    // The first poll should fail the run cleanly (not hang/stay suspended).
+    await makeStageResumable(orch, workflowRunId);
+    const poll1 = await orch.kernel.dispatch({ type: "stage.pollSuspended" });
+    expect(poll1.failed).toBe(1);
+    expect(poll1.resumed).toBe(0);
+
+    const run = await orch.persistence.getRun(workflowRunId);
+    expect(run?.status).toBe("FAILED");
+    const stages = await orch.persistence.getStagesByRun(workflowRunId);
+    const failed = stages.find((st) => st.status === "FAILED");
+    expect(failed?.errorMessage).toMatch(/payload missing/i);
   });
 
   it("Test 3: a stage-code-version change during suspension fails the run", async () => {
