@@ -85,7 +85,14 @@ export function defineRemoteStage(
           error: `remote output failed schema validation: ${parsed.error.message}`,
         };
       }
-      return { ready: true, output: parsed.data };
+      const cm = outcome.customMetrics;
+      return {
+        ready: true,
+        output: parsed.data,
+        metrics: cm
+          ? { startTime: 0, endTime: 0, duration: 0, ...cm }
+          : undefined,
+      };
     },
   };
 }

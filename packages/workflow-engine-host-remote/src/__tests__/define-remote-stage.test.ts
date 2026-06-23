@@ -105,6 +105,31 @@ describe("defineRemoteStage", () => {
     expect(r.error).toMatch(/schema|valid/i);
   });
 
+  it("checkCompletion rounds-trip customMetrics from a reported-completed outcome", async () => {
+    const poll: PollResponse = {
+      state: "reported",
+      outcome: {
+        kind: "completed",
+        output: { key: "x" },
+        customMetrics: { items: 5 },
+      },
+      logs: [],
+      annotations: [],
+      progress: [],
+    };
+    const transport: OrchestratorTransport = {
+      submit: vi.fn(),
+      poll: vi.fn(async () => poll),
+    };
+    const proxy = defineRemoteStage(real, transport);
+    const r = await proxy.checkCompletion!(
+      { batchId: "t1" } as never,
+      ctxStub() as never,
+    );
+    expect(r.ready).toBe(true);
+    expect(r.metrics).toMatchObject({ items: 5 });
+  });
+
   it("checkCompletion keeps waiting while pending/assigned and fails on a failed outcome", async () => {
     const pending: PollResponse = {
       state: "pending",

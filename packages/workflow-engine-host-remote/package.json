@@ -27,14 +27,14 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@bratsos/workflow-engine": "workspace:*"
+    "@bratsos/workflow-engine": "workspace:*",
+    "zod": "^4.1.12"
   },
   "devDependencies": {
     "@types/node": "^22",
     "tsup": "^8.5.1",
     "typescript": "^5.8.3",
-    "vitest": "^3.2.4",
-    "zod": "^4.1.12"
+    "vitest": "^3.2.4"
   },
   "engines": { "node": ">=22.11.0" }
 }

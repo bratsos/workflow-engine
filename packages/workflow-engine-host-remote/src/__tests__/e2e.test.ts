@@ -209,7 +209,7 @@ describe("remote activity workers — e2e", () => {
     expect(first.outcome).toBe("suspended");
     expect(second.outcome).toBe("suspended");
     // Only one submit to the broker (idempotent replay returns the same suspended result).
-    expect(await worker.processOne()).toBe(true);  // leases + runs the single submitted task
+    expect(await worker.processOne()).toBe(true); // leases + runs the single submitted task
     expect(await worker.processOne()).toBe(false); // no second task — idempotency prevented a duplicate submit
   });
 });
