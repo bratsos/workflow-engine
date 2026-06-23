@@ -21,6 +21,15 @@ export {
 } from "./orchestrator/remote-executor.js";
 export * from "./protocol.js";
 export {
+  type BrokerServerDeps,
+  createBrokerHttpServer,
+  createHttpWorkerTransport,
+  type HandlerResponse,
+  type HttpWorkerTransportConfig,
+  handleBrokerRequest,
+  type IncomingRequest,
+} from "./transport/http/index.js";
+export {
   createInProcessTransport,
   type OrchestratorTransport,
   type WorkerTransport,

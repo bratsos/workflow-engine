@@ -1,0 +1,260 @@
+import * as http from "node:http";
+import type { Broker } from "../../broker/broker.js";
+import type { InMemoryObjectStore } from "../../object-store.js";
+import { ActivityReportSchema, LeaseRequestSchema } from "./schemas.js";
+
+export interface BrokerServerDeps {
+  broker: Broker;
+  objectStore: InMemoryObjectStore;
+  authToken?: string;
+  publicBaseUrl?: string;
+}
+
+export interface IncomingRequest {
+  method: string;
+  path: string;
+  headers: Record<string, string | string[] | undefined>;
+  body: unknown;
+}
+
+export interface HandlerResponse {
+  status: number;
+  json?: unknown;
+}
+
+/**
+ * Pure handler function — no node:http dependency. Routes incoming requests
+ * to broker methods and returns a structured response. Unit-testable without
+ * binding a real server port.
+ */
+export async function handleBrokerRequest(
+  deps: BrokerServerDeps,
+  req: IncomingRequest,
+): Promise<HandlerResponse> {
+  // Auth check: if a token is configured, require a matching Bearer header.
+  if (deps.authToken !== undefined) {
+    const authHeader = req.headers["authorization"];
+    const raw = Array.isArray(authHeader) ? authHeader[0] : authHeader;
+    const provided = raw?.startsWith("Bearer ") ? raw.slice(7) : undefined;
+    if (provided !== deps.authToken) {
+      return { status: 401, json: { error: "unauthorized" } };
+    }
+  }
+
+  const { method, path: reqPath } = req;
+
+  // POST /lease
+  if (method === "POST" && reqPath === "/lease") {
+    const parsed = LeaseRequestSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return {
+        status: 400,
+        json: { error: "invalid request", details: parsed.error.issues },
+      };
+    }
+    try {
+      const task = await deps.broker.lease(parsed.data);
+      if (task === null) {
+        return { status: 204 };
+      }
+      return { status: 200, json: task };
+    } catch (err) {
+      return {
+        status: 409,
+        json: { error: err instanceof Error ? err.message : String(err) },
+      };
+    }
+  }
+
+  // POST /report
+  if (method === "POST" && reqPath === "/report") {
+    const parsed = ActivityReportSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return {
+        status: 400,
+        json: { error: "invalid request", details: parsed.error.issues },
+      };
+    }
+    try {
+      await deps.broker.report(parsed.data);
+      return { status: 200, json: { ok: true } };
+    } catch (err) {
+      return {
+        status: 409,
+        json: { error: err instanceof Error ? err.message : String(err) },
+      };
+    }
+  }
+
+  // POST /heartbeat
+  if (method === "POST" && reqPath === "/heartbeat") {
+    const body = req.body as { taskId?: string; leaseToken?: string };
+    if (!body.taskId || !body.leaseToken) {
+      return { status: 400, json: { error: "taskId and leaseToken required" } };
+    }
+    const result = await deps.broker.heartbeat({
+      taskId: body.taskId,
+      leaseToken: body.leaseToken,
+    });
+    return { status: 200, json: result };
+  }
+
+  // POST /presign
+  if (method === "POST" && reqPath === "/presign") {
+    const body = req.body as {
+      taskId?: string;
+      leaseToken?: string;
+      relKey?: string;
+      op?: string;
+    };
+    if (!body.taskId || !body.leaseToken || !body.relKey || !body.op) {
+      return {
+        status: 400,
+        json: { error: "taskId, leaseToken, relKey and op required" },
+      };
+    }
+    if (body.op !== "put" && body.op !== "get") {
+      return { status: 400, json: { error: 'op must be "put" or "get"' } };
+    }
+    const presignResp = await deps.broker.presign({
+      taskId: body.taskId,
+      leaseToken: body.leaseToken,
+      relKey: body.relKey,
+      op: body.op,
+    });
+    // presignResp.url is a mem:// url from InMemoryObjectStore. Wrap it as an
+    // HTTP blob URL pointing at THIS server so the worker can PUT/GET over HTTP.
+    const base = deps.publicBaseUrl ?? "http://127.0.0.1";
+    const blobUrl = `${base}/blob?u=${encodeURIComponent(presignResp.url)}`;
+    return { status: 200, json: { url: blobUrl } };
+  }
+
+  // GET /blob?u=<memUrl>
+  if (method === "GET" && reqPath.startsWith("/blob")) {
+    const memUrl = extractBlobParam(reqPath);
+    if (!memUrl) {
+      return { status: 400, json: { error: "missing u= query param" } };
+    }
+    try {
+      const data = await deps.objectStore.getViaUrl(memUrl);
+      return { status: 200, json: data };
+    } catch (err) {
+      return {
+        status: 400,
+        json: { error: err instanceof Error ? err.message : String(err) },
+      };
+    }
+  }
+
+  // PUT /blob?u=<memUrl>
+  if (method === "PUT" && reqPath.startsWith("/blob")) {
+    const memUrl = extractBlobParam(reqPath);
+    if (!memUrl) {
+      return { status: 400, json: { error: "missing u= query param" } };
+    }
+    try {
+      await deps.objectStore.putViaUrl(memUrl, req.body);
+      return { status: 200, json: { ok: true } };
+    } catch (err) {
+      return {
+        status: 400,
+        json: { error: err instanceof Error ? err.message : String(err) },
+      };
+    }
+  }
+
+  return { status: 404, json: { error: "not found" } };
+}
+
+function extractBlobParam(reqPath: string): string | null {
+  const qIdx = reqPath.indexOf("?");
+  if (qIdx === -1) return null;
+  const qs = reqPath.slice(qIdx + 1);
+  const params = new URLSearchParams(qs);
+  return params.get("u");
+}
+
+/**
+ * Thin node:http wrapper around handleBrokerRequest. The returned server can
+ * be used as:
+ *   server.listen(0)   // ephemeral port (tests)
+ *   server.listen(3000)
+ */
+export function createBrokerHttpServer(deps: BrokerServerDeps): http.Server {
+  const server = http.createServer((req, res) => {
+    void handleRequest(deps, server, req, res);
+  });
+  return server;
+}
+
+async function handleRequest(
+  deps: BrokerServerDeps,
+  server: http.Server,
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+): Promise<void> {
+  try {
+    // Collect request body.
+    const bodyBuf = await readBody(req);
+    let body: unknown = null;
+    if (bodyBuf.length > 0) {
+      try {
+        body = JSON.parse(bodyBuf.toString("utf8"));
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "invalid JSON body" }));
+        return;
+      }
+    }
+
+    // Derive publicBaseUrl from Host header if not provided at construction.
+    let resolvedDeps = deps;
+    if (!deps.publicBaseUrl) {
+      const addr = server.address();
+      if (addr && typeof addr === "object") {
+        const host = req.headers["host"] ?? `127.0.0.1:${addr.port}`;
+        resolvedDeps = {
+          ...deps,
+          publicBaseUrl: `http://${host}`,
+        };
+      }
+    }
+
+    const incoming: IncomingRequest = {
+      method: req.method ?? "GET",
+      path: req.url ?? "/",
+      headers: req.headers as Record<string, string | string[] | undefined>,
+      body,
+    };
+
+    const result = await handleBrokerRequest(resolvedDeps, incoming);
+
+    if (result.status === 204) {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
+    const payload = JSON.stringify(result.json ?? null);
+    res.writeHead(result.status, {
+      "Content-Type": "application/json",
+      "Content-Length": Buffer.byteLength(payload),
+    });
+    res.end(payload);
+  } catch (err) {
+    const msg = JSON.stringify({
+      error: err instanceof Error ? err.message : String(err),
+    });
+    res.writeHead(500, { "Content-Type": "application/json" });
+    res.end(msg);
+  }
+}
+
+function readBody(req: http.IncomingMessage): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    req.on("end", () => resolve(Buffer.concat(chunks)));
+    req.on("error", reject);
+  });
+}
