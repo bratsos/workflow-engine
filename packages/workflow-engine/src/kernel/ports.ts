@@ -15,6 +15,8 @@
  *  - Scheduler      – deferred command triggers
  */
 
+import type { StageResult, SuspendedResult } from "../core/types";
+
 import type {
   AnnotationFilters,
   CreateAnnotationInput,
@@ -272,4 +274,81 @@ export interface EventSink {
 export interface Scheduler {
   schedule(commandType: string, payload: unknown, runAt: Date): Promise<void>;
   cancel(commandType: string, correlationId: string): Promise<void>;
+}
+
+// ============================================================================
+// ActivityExecutor
+// ============================================================================
+
+/**
+ * Minimal structural type for a stage definition as seen by the executor.
+ * LocalExecutor uses the full Stage; RemoteExecutor (host-remote) ships only
+ * ids and ignores stageDef.execute. Using `any` Zod schemas keeps the port
+ * free of Stage's type parameters.
+ */
+export interface SyncStageDefinitionLike {
+  id: string;
+  name: string;
+  inputSchema: { parse(v: unknown): unknown };
+  outputSchema?: { parse(v: unknown): unknown } | null;
+  configSchema?: { parse(v: unknown): unknown } | null;
+  execute(ctx: any): Promise<StageResult<unknown> | SuspendedResult>;
+}
+
+/** A log entry buffered by the executor for the handler to persist. */
+export interface BufferedLog {
+  level: string;
+  message: string;
+  meta?: Record<string, unknown>;
+}
+
+/** Input passed to ActivityExecutor.run(). */
+export interface ActivityRunInput {
+  stageDef: SyncStageDefinitionLike;
+  workflowId: string;
+  workflowRunId: string;
+  workflowType: string;
+  stageId: string;
+  stageName: string;
+  stageNumber: number;
+  stageRecordId: string;
+  attempt: number;
+  rawInput: unknown;
+  config: Record<string, unknown>;
+  resumeState?: unknown;
+  workflowContext: Record<string, unknown>;
+}
+
+/** Result from ActivityExecutor.run(). Exactly one of result / error is set. */
+export interface ActivityRunResult {
+  result?: StageResult<unknown> | SuspendedResult;
+  error?: string;
+  progress: KernelEvent[];
+  annotations: CreateAnnotationInput[];
+  /**
+   * Log entries for the handler to persist after run completes.
+   * LocalExecutor writes logs live during execute(), so it returns [].
+   * RemoteExecutor captures worker logs and returns them here.
+   */
+  logs: BufferedLog[];
+}
+
+/**
+ * Subset of KernelDeps that ActivityExecutor.run() needs.
+ * KernelDeps in kernel.ts structurally satisfies this interface; no adapter
+ * is needed when passing deps from the handler.
+ */
+export interface ExecutorDeps {
+  persistence: Persistence;
+  blobStore: BlobStore;
+  clock: Clock;
+}
+
+/**
+ * Port: controls where a stage body runs.
+ * Default implementation = LocalExecutor (inline, current-process).
+ * Swap for RemoteExecutor to run stages on remote workers.
+ */
+export interface ActivityExecutor {
+  run(input: ActivityRunInput, deps: ExecutorDeps): Promise<ActivityRunResult>;
 }

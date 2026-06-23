@@ -45,6 +45,7 @@ import type {
 } from "./commands";
 import { IdempotencyInProgressError } from "./errors";
 import type { KernelEvent } from "./events";
+import { createLocalExecutor } from "./executor/local-executor.js";
 import { handleJobExecute } from "./handlers/job-execute";
 import { handleLeaseReapStale } from "./handlers/lease-reap-stale";
 import { handleOutboxFlush } from "./handlers/outbox-flush";
@@ -62,6 +63,7 @@ import {
   synthesizeLegacyMetadata,
 } from "./helpers/index.js";
 import type {
+  ActivityExecutor,
   BlobStore,
   Clock,
   EventSink,
@@ -86,6 +88,7 @@ export interface KernelConfig {
   scheduler: Scheduler;
   clock: Clock;
   registry: WorkflowRegistry;
+  executor?: ActivityExecutor;
 }
 
 /** Input for the public `kernel.annotations.attach` helper. */
@@ -142,6 +145,7 @@ export interface KernelDeps {
   scheduler: Scheduler;
   clock: Clock;
   registry: WorkflowRegistry;
+  executor: ActivityExecutor;
 }
 
 // ============================================================================
@@ -176,6 +180,9 @@ export function createKernel(config: KernelConfig): Kernel {
     registry,
   } = config;
 
+  // Default to LocalExecutor if none provided
+  const executor = config.executor ?? createLocalExecutor();
+
   const deps: KernelDeps = {
     persistence,
     blobStore,
@@ -184,6 +191,7 @@ export function createKernel(config: KernelConfig): Kernel {
     scheduler,
     clock,
     registry,
+    executor,
   };
 
   async function dispatch<T extends KernelCommand>(
