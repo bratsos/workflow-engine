@@ -49,17 +49,29 @@ import { heavyStage, makeCoreStage } from "./fixtures.js";
 // Fake-S3 server (permissive — ignores signatures)
 // ---------------------------------------------------------------------------
 
+interface FakeS3Options {
+  /** If set, LIST responses will be paginated to this many keys per page. */
+  pageSize?: number;
+}
+
 interface FakeS3Server {
   baseUrl: string;
   bucket: string;
   getObject(path: string): Buffer | undefined;
   hasObject(path: string): boolean;
   allKeys(prefix?: string): string[];
+  /** Headers recorded for the most recent PUT to the given objectKey. */
+  getLastRequestHeaders(objectKey: string): Record<string, string> | undefined;
   close(): Promise<void>;
 }
 
-function startFakeS3(bucket: string): Promise<FakeS3Server> {
+function startFakeS3(
+  bucket: string,
+  options: FakeS3Options = {},
+): Promise<FakeS3Server> {
+  const { pageSize } = options;
   const store = new Map<string, Buffer>();
+  const headerCapture = new Map<string, Record<string, string>>();
 
   const server = http.createServer((req, res) => {
     const rawUrl = req.url ?? "/";
@@ -77,11 +89,39 @@ function startFakeS3(bucket: string): Promise<FakeS3Server> {
       params.get("list-type") === "2"
     ) {
       const prefix = params.get("prefix") ?? "";
-      const keys = [...store.keys()].filter((k) => k.startsWith(prefix));
-      const keyXml = keys
+      const continuationToken = params.get("continuation-token");
+
+      const allMatchingKeys = [...store.keys()]
+        .filter((k) => k.startsWith(prefix))
+        .sort();
+
+      // Find the start index based on the continuation token (which is the
+      // next key to start from).
+      let startIdx = 0;
+      if (continuationToken) {
+        const idx = allMatchingKeys.indexOf(continuationToken);
+        startIdx = idx >= 0 ? idx : allMatchingKeys.length;
+      }
+
+      const page =
+        pageSize !== undefined
+          ? allMatchingKeys.slice(startIdx, startIdx + pageSize)
+          : allMatchingKeys.slice(startIdx);
+
+      const nextStartIdx = startIdx + page.length;
+      const isTruncated = nextStartIdx < allMatchingKeys.length;
+      const nextContinuationToken = isTruncated
+        ? allMatchingKeys[nextStartIdx]
+        : undefined;
+
+      const keyXml = page
         .map((k) => `<Contents><Key>${k}</Key></Contents>`)
         .join("");
-      const xml = `<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>${bucket}</Name><Prefix>${prefix}</Prefix><IsTruncated>false</IsTruncated>${keyXml}</ListBucketResult>`;
+      const truncatedXml = `<IsTruncated>${isTruncated}</IsTruncated>`;
+      const nextTokenXml = nextContinuationToken
+        ? `<NextContinuationToken>${nextContinuationToken}</NextContinuationToken>`
+        : "";
+      const xml = `<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>${bucket}</Name><Prefix>${prefix}</Prefix>${truncatedXml}${nextTokenXml}${keyXml}</ListBucketResult>`;
       res.writeHead(200, { "Content-Type": "application/xml" });
       res.end(xml);
       return;
@@ -101,6 +141,12 @@ function startFakeS3(bucket: string): Promise<FakeS3Server> {
       req.on("data", (c: Buffer) => chunks.push(c));
       req.on("end", () => {
         store.set(objectKey, Buffer.concat(chunks));
+        // Capture all headers for this object key.
+        const captured: Record<string, string> = {};
+        for (const [k, v] of Object.entries(req.headers)) {
+          if (typeof v === "string") captured[k] = v;
+        }
+        headerCapture.set(objectKey, captured);
         res.writeHead(200);
         res.end();
       });
@@ -155,6 +201,7 @@ function startFakeS3(bucket: string): Promise<FakeS3Server> {
         hasObject: (key) => store.has(key),
         allKeys: (prefix = "") =>
           [...store.keys()].filter((k) => k.startsWith(prefix)),
+        getLastRequestHeaders: (key) => headerCapture.get(key),
         close: () =>
           new Promise<void>((res, rej) =>
             server.close((e) => (e ? rej(e) : res())),
@@ -233,6 +280,95 @@ describe("createS3BlobStore round-trip (fake-S3)", () => {
     expect(await store.has("folder/key1.json")).toBe(false);
     expect(await store.list("folder/")).toEqual(["folder/key2.json"]);
   });
+
+  it("list decodes XML entities in keys", { timeout: 10_000 }, async () => {
+    fakeS3 = await startFakeS3("my-bucket");
+    const store = createS3BlobStore(makeS3Config(fakeS3));
+
+    // Simpler approach: exercise parseListKeys directly by having the
+    // fake-S3 return XML with encoded keys. We call store.list() and
+    // assert decoded results.
+    //
+    // The fake-S3 server stores and retrieves keys verbatim. To simulate
+    // S3 encoding, we use a separate minimal HTTP server that returns
+    // hand-crafted XML with entity-encoded keys.
+    const xmlWithEntities = [
+      `<?xml version="1.0" encoding="UTF-8"?>`,
+      `<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">`,
+      `<Name>my-bucket</Name><Prefix>folder/</Prefix>`,
+      `<IsTruncated>false</IsTruncated>`,
+      `<Contents><Key>folder/a&amp;b.json</Key></Contents>`,
+      `<Contents><Key>folder/&lt;c&gt;.json</Key></Contents>`,
+      `<Contents><Key>folder/&quot;d&quot;.json</Key></Contents>`,
+      `<Contents><Key>folder/&apos;e&apos;.json</Key></Contents>`,
+      `</ListBucketResult>`,
+    ].join("");
+
+    // Stand up a tiny one-shot HTTP server that returns this XML.
+    const xmlServer = await new Promise<http.Server & { baseUrl: string }>(
+      (resolve) => {
+        const srv = http.createServer((_req, res) => {
+          res.writeHead(200, { "Content-Type": "application/xml" });
+          res.end(xmlWithEntities);
+        }) as http.Server & { baseUrl: string };
+        srv.listen(0, "127.0.0.1", () => {
+          const port = (srv.address() as AddressInfo).port;
+          srv.baseUrl = `http://127.0.0.1:${port}`;
+          resolve(srv);
+        });
+      },
+    );
+
+    const closeXmlServer = () =>
+      new Promise<void>((res, rej) =>
+        xmlServer.close((e) => (e ? rej(e) : res())),
+      );
+
+    try {
+      const xmlStore = createS3BlobStore({
+        endpoint: xmlServer.baseUrl,
+        region: "us-east-1",
+        bucket: "my-bucket",
+        accessKeyId: "fakeaccesskey",
+        secretAccessKey: "fakesecretkey",
+        pathStyle: true,
+      });
+
+      const keys = await xmlStore.list("folder/");
+      expect(keys).toEqual([
+        "folder/a&b.json",
+        "folder/<c>.json",
+        'folder/"d".json',
+        "folder/'e'.json",
+      ]);
+    } finally {
+      await closeXmlServer();
+    }
+  });
+
+  it(
+    "list paginates across multiple pages (pageSize=2)",
+    { timeout: 10_000 },
+    async () => {
+      fakeS3 = await startFakeS3("my-bucket", { pageSize: 2 });
+      const store = createS3BlobStore(makeS3Config(fakeS3));
+
+      // Put 5 objects so we need 3 pages at pageSize=2.
+      for (const i of [1, 2, 3, 4, 5]) {
+        await store.put(`folder/key${i}.json`, { i });
+      }
+
+      const keys = await store.list("folder/");
+      expect(keys).toHaveLength(5);
+      expect(keys.sort()).toEqual([
+        "folder/key1.json",
+        "folder/key2.json",
+        "folder/key3.json",
+        "folder/key4.json",
+        "folder/key5.json",
+      ]);
+    },
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -345,7 +481,12 @@ describe("S3 object store — full workflow e2e (worker direct-to-bucket)", () =
       );
 
       // 7. Worker transport connects to the broker via HTTP; blob writes go to fake-S3.
-      const wTransport = createHttpWorkerTransport({ baseUrl: brokerBaseUrl });
+      //    We pass an authToken so that the fix for Fix 1 is load-bearing: the
+      //    worker must NOT forward this broker token to the presigned S3 URL.
+      const wTransport = createHttpWorkerTransport({
+        baseUrl: brokerBaseUrl,
+        authToken: "test-broker-token",
+      });
       const worker = createActivityWorker({
         registry: new Map([["heavy", heavyStage]]),
         transport: wTransport,
@@ -393,6 +534,13 @@ describe("S3 object store — full workflow e2e (worker direct-to-bucket)", () =
       const rawBuf = fakeS3.getObject(artifactKey!);
       expect(rawBuf).toBeDefined();
       expect(JSON.parse(rawBuf!.toString())).toEqual({ data: ["x", "x", "x"] });
+
+      // CRITICAL (Fix 1): the worker must NOT have sent the broker auth header
+      // to fake-S3. Real S3/R2 rejects requests that have both query-string
+      // SigV4 auth AND an Authorization header (400/403).
+      const headersAtS3 = fakeS3.getLastRequestHeaders(artifactKey!);
+      expect(headersAtS3).toBeDefined();
+      expect(headersAtS3!["authorization"]).toBeUndefined();
 
       // 12. Poll + transition.
       await makeStageResumable(orch, workflowRunId);

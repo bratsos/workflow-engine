@@ -29,6 +29,11 @@ export function createHttpWorkerTransport(
     return { Authorization: `Bearer ${authToken}` };
   }
 
+  /** Returns true only when the URL targets the broker itself (not an external presigned URL). */
+  function isBrokerUrl(url: string): boolean {
+    return url.startsWith(baseUrl);
+  }
+
   return {
     async lease(req: LeaseRequest): Promise<ActivityTask | null> {
       const res = await fetch(`${baseUrl}/lease`, {
@@ -121,12 +126,13 @@ export function createHttpWorkerTransport(
     },
 
     async putBytes(url: string, data: unknown): Promise<void> {
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+        ...(isBrokerUrl(url) ? authHeaders() : {}),
+      };
       const res = await fetch(url, {
         method: "PUT",
-        headers: {
-          "Content-Type": "application/json",
-          ...authHeaders(),
-        },
+        headers,
         body: JSON.stringify(data),
       });
 
@@ -139,11 +145,12 @@ export function createHttpWorkerTransport(
     },
 
     async getBytes(url: string): Promise<unknown> {
+      const headers: Record<string, string> = isBrokerUrl(url)
+        ? authHeaders()
+        : {};
       const res = await fetch(url, {
         method: "GET",
-        headers: {
-          ...authHeaders(),
-        },
+        headers,
       });
 
       if (!res.ok) {

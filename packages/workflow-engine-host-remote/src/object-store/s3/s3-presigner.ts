@@ -1,5 +1,6 @@
 import { AwsV4Signer } from "aws4fetch";
 import type { ObjectStorePresigner } from "../../object-store.js";
+import { buildObjectUrl } from "./url.js";
 
 export interface S3PresignerConfig {
   /** S3-compatible base URL, e.g. https://s3.us-east-1.amazonaws.com or https://<acct>.r2.cloudflarestorage.com */
@@ -11,14 +12,6 @@ export interface S3PresignerConfig {
   sessionToken?: string;
   /** Default true — puts the bucket in the URL path (MinIO/R2/local). Set false for virtual-hosted-style AWS. */
   pathStyle?: boolean;
-}
-
-function buildObjectUrl(cfg: S3PresignerConfig, key: string): string {
-  const pathStyle = cfg.pathStyle !== false;
-  const base = cfg.endpoint.replace(/\/$/, "");
-  return pathStyle
-    ? `${base}/${cfg.bucket}/${key}`
-    : `${base.replace("://", `://${cfg.bucket}.`)}/${key}`;
 }
 
 async function presign(
