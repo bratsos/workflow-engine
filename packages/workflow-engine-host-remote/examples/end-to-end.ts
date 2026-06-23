@@ -39,6 +39,8 @@ async function main(): Promise<void> {
     workerId: "w1",
     stageIds: ["heavy"],
     stageCodeVersion: "v1",
+    // Poll frequently so the worker leases the heavy task promptly in this demo.
+    idleDelayMs: 5,
   });
 
   worker.start();
@@ -56,14 +58,19 @@ async function main(): Promise<void> {
   // Claim pending → enqueues group 0 jobs.
   await orch.kernel.dispatch({ type: "run.claimPending", workerId: "orch" });
 
-  // --- Drive loop ---
-  let attempts = 0;
-  const maxAttempts = 20;
+  // --- Drive loop: run until the run reaches a terminal state (or a safety timeout) ---
+  // The worker polls and runs the heavy stage independently (worker.start above); the
+  // orchestrator here dequeues jobs, suspends the remote stage, and polls for its
+  // completion. We loop on the actual run status rather than a fixed attempt count so
+  // the worker has time to lease + report regardless of timing.
+  const isTerminal = (s?: string): boolean =>
+    s === "COMPLETED" || s === "FAILED" || s === "CANCELLED";
+  const deadline = Date.now() + 10_000; // wall-clock safety net
 
-  while (attempts < maxAttempts) {
-    attempts++;
+  while (Date.now() < deadline) {
+    const current = await orch.persistence.getRun(workflowRunId);
+    if (isTerminal(current?.status)) break;
 
-    // Try to dequeue a job (group N is ready when the previous group fully completed).
     const job = await orch.jobQueue.dequeue();
 
     if (job) {
@@ -78,29 +85,28 @@ async function main(): Promise<void> {
 
       if (result.outcome === "completed") {
         await orch.jobQueue.complete(job.jobId);
-        const t = await orch.kernel.dispatch({ type: "run.transition", workflowRunId });
-        if (t.action === "completed") {
-          break;
-        }
+        await orch.kernel.dispatch({ type: "run.transition", workflowRunId });
       } else if (result.outcome === "suspended") {
-        // Mark the job suspended in the queue; the drive loop will poll for it.
-        await orch.jobQueue.suspend(job.jobId, new Date(orch.clock.now().getTime() + 100));
+        // The remote (heavy) stage suspended; the worker will run it. Poll for it below.
+        await orch.jobQueue.suspend(
+          job.jobId,
+          new Date(orch.clock.now().getTime() + 100),
+        );
       } else {
         console.error(`[example] Stage ${job.stageId} failed: ${result.error}`);
         break;
       }
     } else {
-      // No job ready — check for suspended stages that the worker has completed.
-      // First, make any suspended stage with a future nextPollAt resumable by moving time forward.
+      // No job ready — the remote stage is suspended while the worker runs it.
+      // Make it pollable, give the worker a tick to lease + report, then poll.
       const stages = await orch.persistence.getStagesByRun(workflowRunId);
       const suspended = stages.find((s) => s.status === "SUSPENDED");
-      if (suspended?.nextPollAt) {
+      if (suspended) {
         await orch.persistence.updateStage(suspended.id, {
           nextPollAt: new Date(orch.clock.now().getTime() - 1),
         });
       }
 
-      // Allow the worker a tick to process any pending tasks.
       await new Promise<void>((resolve) => setTimeout(resolve, 10));
 
       const poll = await orch.kernel.dispatch({ type: "stage.pollSuspended" });
