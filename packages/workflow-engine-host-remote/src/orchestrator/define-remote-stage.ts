@@ -25,6 +25,7 @@ interface RemotePayload {
   workflowContext: Record<string, unknown>;
   pollInterval: number;
   maxWaitTime: number;
+  artifactPrefix: string;
 }
 
 export function defineRemoteStage(
@@ -63,6 +64,7 @@ export function defineRemoteStage(
         workflowContext: ctx.workflowContext as Record<string, unknown>,
         pollInterval,
         maxWaitTime,
+        artifactPrefix,
       };
       await ctx.storage.save(payloadKey, payload);
 
@@ -136,6 +138,7 @@ export function defineRemoteStage(
             // Revision 4: pin the version so a deploy that changed stage code
             // fails the run rather than resuming on incompatible code.
             pinnedVersion: storedVersion,
+            artifactPrefix: payload.artifactPrefix,
           });
           return { ready: false, nextCheckIn: pollInterval };
         } catch {

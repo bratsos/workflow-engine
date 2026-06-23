@@ -142,6 +142,12 @@ describe("remote activity workers — restart recovery (no-table durability)", (
     expect(payloadKey).toBeTruthy();
     expect(await os.has(payloadKey)).toBe(true);
 
+    // Capture the original artifactPrefix from the broker before the restart.
+    const taskId = meta.taskId as string;
+    const originalTask = await brokerStore.get(taskId);
+    const originalArtifactPrefix = originalTask?.artifactPrefix;
+    expect(originalArtifactPrefix).toBeTruthy();
+
     // Simulate orchestrator restart: the in-memory broker loses all tasks.
     brokerStore.clear();
 
@@ -153,8 +159,12 @@ describe("remote activity workers — restart recovery (no-table durability)", (
     expect(poll1.resumed).toBe(0);
 
     // The re-registered task now exists in the broker again.
-    const taskId = meta.taskId as string;
     expect(await brokerStore.get(taskId)).not.toBeNull();
+
+    // Revision 5: the re-registered task must carry the ORIGINAL artifactPrefix
+    // so artifacts written after recovery land under the same prefix.
+    const reregisteredTask = await brokerStore.get(taskId);
+    expect(reregisteredTask?.artifactPrefix).toBe(originalArtifactPrefix);
 
     // Worker picks up the re-registered task and completes it.
     expect(await worker.processOne()).toBe(true);
