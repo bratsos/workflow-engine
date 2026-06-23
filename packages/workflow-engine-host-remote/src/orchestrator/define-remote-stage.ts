@@ -56,21 +56,34 @@ export function defineRemoteStage(
         return { ready: false, nextCheckIn: poll.nextCheckIn ?? pollInterval };
       }
       if (poll.state === "failed") {
-        return { ready: false, error: "remote activity failed (deadline or worker error)" };
+        return {
+          ready: false,
+          error: "remote activity failed (deadline or worker error)",
+        };
       }
       // reported — replay buffered side-channels into ctx before returning
       for (const l of poll.logs) ctx.log(l.level as "INFO", l.message, l.meta);
-      for (const a of poll.annotations) (ctx.annotate as (...args: unknown[]) => void)(...a);
-      for (const p of poll.progress) ctx.log("INFO", `progress ${p.progress}%${p.message ? `: ${p.message}` : ""}`);
+      for (const a of poll.annotations)
+        (ctx.annotate as (...args: unknown[]) => void)(...a);
+      for (const p of poll.progress)
+        ctx.log(
+          "INFO",
+          `progress ${p.progress}%${p.message ? `: ${p.message}` : ""}`,
+        );
 
       const outcome = poll.outcome;
-      if (!outcome) return { ready: false, error: "reported task missing outcome" };
-      if (outcome.kind === "failed") return { ready: false, error: outcome.error };
+      if (!outcome)
+        return { ready: false, error: "reported task missing outcome" };
+      if (outcome.kind === "failed")
+        return { ready: false, error: outcome.error };
 
       // strict trust gate — the engine's own resume-path validation is best-effort
       const parsed = real.outputSchema.safeParse(outcome.output);
       if (!parsed.success) {
-        return { ready: false, error: `remote output failed schema validation: ${parsed.error.message}` };
+        return {
+          ready: false,
+          error: `remote output failed schema validation: ${parsed.error.message}`,
+        };
       }
       return { ready: true, output: parsed.data };
     },

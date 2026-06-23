@@ -78,13 +78,20 @@ export class Broker {
   }
 
   async lease(req: LeaseRequest): Promise<ActivityTask | null> {
-    if (this.stageCodeVersion !== undefined && req.stageCodeVersion !== this.stageCodeVersion) {
+    if (
+      this.stageCodeVersion !== undefined &&
+      req.stageCodeVersion !== this.stageCodeVersion
+    ) {
       throw new Error(
         `stage code version mismatch: worker=${req.stageCodeVersion} broker=${this.stageCodeVersion}`,
       );
     }
     const leaseToken = this.generateId();
-    const task = await this.store.claimNext(req.stageIds, leaseToken, this.now());
+    const task = await this.store.claimNext(
+      req.stageIds,
+      leaseToken,
+      this.now(),
+    );
     if (!task) return null;
     return this.toActivityTask(task);
   }
@@ -96,7 +103,11 @@ export class Broker {
 
   async heartbeat(req: HeartbeatRequest): Promise<HeartbeatResponse> {
     const task = await this.store.get(req.taskId);
-    if (!task || task.leaseToken !== req.leaseToken || task.status !== "ASSIGNED") {
+    if (
+      !task ||
+      task.leaseToken !== req.leaseToken ||
+      task.status !== "ASSIGNED"
+    ) {
       return { ok: false, cancel: true };
     }
     await this.store.update(task.taskId, { leasedAt: this.now() });
@@ -105,19 +116,31 @@ export class Broker {
 
   async poll(taskId: string): Promise<PollResponse> {
     const task = await this.store.get(taskId);
-    if (!task) return { state: "failed", logs: [], annotations: [], progress: [] };
+    if (!task)
+      return { state: "failed", logs: [], annotations: [], progress: [] };
 
     // deadline first — terminal
     if (task.status !== "REPORTED" && this.now() > task.deadline) {
       if (task.status !== "FAILED") {
-        await this.store.update(taskId, { status: "FAILED", failureError: "activity deadline exceeded" });
+        await this.store.update(taskId, {
+          status: "FAILED",
+          failureError: "activity deadline exceeded",
+        });
       }
       return { state: "failed", logs: [], annotations: [], progress: [] };
     }
 
     // stale lease → re-lease to PENDING (crash recovery)
-    if (task.status === "ASSIGNED" && task.leasedAt !== null && this.now() - task.leasedAt > this.staleLeaseMs) {
-      await this.store.update(taskId, { status: "PENDING", leaseToken: null, leasedAt: null });
+    if (
+      task.status === "ASSIGNED" &&
+      task.leasedAt !== null &&
+      this.now() - task.leasedAt > this.staleLeaseMs
+    ) {
+      await this.store.update(taskId, {
+        status: "PENDING",
+        leaseToken: null,
+        leasedAt: null,
+      });
       return { state: "pending", logs: [], annotations: [], progress: [] };
     }
 
@@ -134,14 +157,21 @@ export class Broker {
     if (task.status === "FAILED") {
       return { state: "failed", logs: [], annotations: [], progress: [] };
     }
-    return { state: task.status === "ASSIGNED" ? "assigned" : "pending", logs: [], annotations: [], progress: [] };
+    return {
+      state: task.status === "ASSIGNED" ? "assigned" : "pending",
+      logs: [],
+      annotations: [],
+      progress: [],
+    };
   }
 
   async presign(req: PresignRequest): Promise<PresignResponse> {
     const task = await this.requireFencedTask(req.taskId, req.leaseToken);
     const prefix = this.prefixFor(task);
     if (!req.relKey.startsWith(prefix)) {
-      throw new Error(`presign key out of scope: ${req.relKey} not under prefix ${prefix}`);
+      throw new Error(
+        `presign key out of scope: ${req.relKey} not under prefix ${prefix}`,
+      );
     }
     const ttl = Math.max(0, task.deadline - this.now());
     const url =
@@ -151,7 +181,10 @@ export class Broker {
     return { url };
   }
 
-  private async requireFencedTask(taskId: string, leaseToken: string): Promise<TaskRecord> {
+  private async requireFencedTask(
+    taskId: string,
+    leaseToken: string,
+  ): Promise<TaskRecord> {
     const task = await this.store.get(taskId);
     if (!task) throw new Error(`task ${taskId} not found`);
     if (task.leaseToken !== leaseToken) {

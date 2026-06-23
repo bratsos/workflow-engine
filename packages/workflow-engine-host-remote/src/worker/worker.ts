@@ -18,7 +18,9 @@ export interface ActivityWorker {
   stop(): void;
 }
 
-export function createActivityWorker(cfg: ActivityWorkerConfig): ActivityWorker {
+export function createActivityWorker(
+  cfg: ActivityWorkerConfig,
+): ActivityWorker {
   const heartbeatMs = cfg.heartbeatMs ?? 5_000;
   const idleDelayMs = cfg.idleDelayMs ?? 500;
   let running = false;
@@ -34,15 +36,23 @@ export function createActivityWorker(cfg: ActivityWorkerConfig): ActivityWorker 
     const stage = cfg.registry.get(task.stageId);
     if (!stage) {
       await cfg.transport.report({
-        taskId: task.taskId, leaseToken: task.leaseToken,
-        outcome: { kind: "failed", error: `stage ${task.stageId} not registered on worker` },
-        logs: [], annotations: [], progress: [],
+        taskId: task.taskId,
+        leaseToken: task.leaseToken,
+        outcome: {
+          kind: "failed",
+          error: `stage ${task.stageId} not registered on worker`,
+        },
+        logs: [],
+        annotations: [],
+        progress: [],
       });
       return true;
     }
 
     const beat = setInterval(() => {
-      void cfg.transport.heartbeat({ taskId: task.taskId, leaseToken: task.leaseToken }).catch(() => {});
+      void cfg.transport
+        .heartbeat({ taskId: task.taskId, leaseToken: task.leaseToken })
+        .catch(() => {});
     }, heartbeatMs);
     try {
       const report = await runActivity(task, stage, cfg.transport);

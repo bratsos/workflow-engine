@@ -16,19 +16,36 @@ export function createScopedStorage(
 ): RemoteStageStorage {
   return {
     async save<T>(key: string, data: T): Promise<void> {
-      const { url } = await transport.presign({ taskId, leaseToken, relKey: key, op: "put" });
+      const { url } = await transport.presign({
+        taskId,
+        leaseToken,
+        relKey: key,
+        op: "put",
+      });
       await transport.putBytes(url, data);
     },
     async load<T>(key: string): Promise<T> {
-      const { url } = await transport.presign({ taskId, leaseToken, relKey: key, op: "get" });
+      const { url } = await transport.presign({
+        taskId,
+        leaseToken,
+        relKey: key,
+        op: "get",
+      });
       return (await transport.getBytes(url)) as T;
     },
     async exists(key: string): Promise<boolean> {
-      const { url } = await transport.presign({ taskId, leaseToken, relKey: key, op: "get" });
+      const { url } = await transport.presign({
+        taskId,
+        leaseToken,
+        relKey: key,
+        op: "get",
+      });
       return (await transport.getBytes(url)) !== undefined;
     },
     async delete(_key: string): Promise<void> {
-      throw new Error("scoped storage delete is not supported for remote stages (v1)");
+      throw new Error(
+        "scoped storage delete is not supported for remote stages (v1)",
+      );
     },
     getStageKey(_stageId: string, suffix?: string): string {
       return `${grant.prefix}${suffix ?? "output.json"}`;

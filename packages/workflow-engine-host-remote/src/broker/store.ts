@@ -31,7 +31,11 @@ export interface BrokerStore {
   get(taskId: string): Promise<TaskRecord | null>;
   update(taskId: string, patch: Partial<TaskRecord>): Promise<void>;
   /** Atomically claim the oldest PENDING task whose stageId is in `stageIds`. */
-  claimNext(stageIds: string[], leaseToken: string, now: number): Promise<TaskRecord | null>;
+  claimNext(
+    stageIds: string[],
+    leaseToken: string,
+    now: number,
+  ): Promise<TaskRecord | null>;
 }
 
 export class InMemoryBrokerStore implements BrokerStore {
@@ -52,7 +56,11 @@ export class InMemoryBrokerStore implements BrokerStore {
     this.tasks.set(taskId, { ...t, ...patch });
   }
 
-  async claimNext(stageIds: string[], leaseToken: string, now: number): Promise<TaskRecord | null> {
+  async claimNext(
+    stageIds: string[],
+    leaseToken: string,
+    now: number,
+  ): Promise<TaskRecord | null> {
     const candidates = [...this.tasks.values()]
       .filter((t) => t.status === "PENDING" && stageIds.includes(t.stageId))
       .sort((a, b) => a.createdAt - b.createdAt);
