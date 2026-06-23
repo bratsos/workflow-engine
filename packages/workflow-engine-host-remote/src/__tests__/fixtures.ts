@@ -1,7 +1,14 @@
 import { defineStage, WorkflowBuilder } from "@bratsos/workflow-engine";
 import { createKernel } from "@bratsos/workflow-engine/kernel";
-import { CollectingEventSink, FakeClock, NoopScheduler } from "@bratsos/workflow-engine/kernel/testing";
-import { InMemoryJobQueue, InMemoryWorkflowPersistence } from "@bratsos/workflow-engine/testing";
+import {
+  CollectingEventSink,
+  FakeClock,
+  NoopScheduler,
+} from "@bratsos/workflow-engine/kernel/testing";
+import {
+  InMemoryJobQueue,
+  InMemoryWorkflowPersistence,
+} from "@bratsos/workflow-engine/testing";
 import { z } from "zod";
 import type { InMemoryObjectStore } from "../object-store.js";
 import { defineRemoteStage } from "../orchestrator/define-remote-stage.js";
@@ -25,7 +32,9 @@ export const heavyStage = defineStage({
 });
 
 // A core (trusted) stage: reads the upstream key from workflowContext, loads the blob via blobStore.
-export function makeCoreStage(blobStore: { get(key: string): Promise<unknown> }) {
+export function makeCoreStage(blobStore: {
+  get(key: string): Promise<unknown>;
+}) {
   return defineStage({
     id: "core",
     name: "Core",
@@ -35,7 +44,9 @@ export function makeCoreStage(blobStore: { get(key: string): Promise<unknown> })
       config: z.object({}),
     },
     async execute(ctx) {
-      const blob = (await blobStore.get(ctx.input.artifactKey)) as { data: unknown[] };
+      const blob = (await blobStore.get(ctx.input.artifactKey)) as {
+        data: unknown[];
+      };
       return { output: { doubled: blob.data.length * 2 } };
     },
   });
@@ -49,10 +60,14 @@ export interface Orchestrator {
   workflowId: string;
 }
 
-export function buildOrchestrator(transport: OrchestratorTransport, objectStore: InMemoryObjectStore): Orchestrator {
+export function buildOrchestrator(
+  transport: OrchestratorTransport,
+  objectStore: InMemoryObjectStore,
+  clock?: FakeClock,
+): Orchestrator {
   const persistence = new InMemoryWorkflowPersistence();
   const jobQueue = new InMemoryJobQueue();
-  const clock = new FakeClock(new Date(0));
+  const resolvedClock = clock ?? new FakeClock(new Date(0));
   const coreStage = makeCoreStage(objectStore);
 
   const workflow = new WorkflowBuilder(
@@ -62,7 +77,12 @@ export function buildOrchestrator(transport: OrchestratorTransport, objectStore:
     z.object({ seed: z.number() }),
     z.object({ doubled: z.number() }),
   )
-    .pipe(defineRemoteStage(heavyStage, transport, { pollIntervalMs: 100, maxWaitMs: 60_000 }))
+    .pipe(
+      defineRemoteStage(heavyStage, transport, {
+        pollIntervalMs: 100,
+        maxWaitMs: 60_000,
+      }),
+    )
     .pipe(coreStage)
     .build();
 
@@ -72,9 +92,17 @@ export function buildOrchestrator(transport: OrchestratorTransport, objectStore:
     jobTransport: jobQueue,
     eventSink: new CollectingEventSink(),
     scheduler: new NoopScheduler(),
-    clock,
-    registry: { getWorkflow: (id: string) => (id === "media" ? workflow : undefined) },
+    clock: resolvedClock,
+    registry: {
+      getWorkflow: (id: string) => (id === "media" ? workflow : undefined),
+    },
   });
 
-  return { kernel, persistence, jobQueue, clock, workflowId: "media" };
+  return {
+    kernel,
+    persistence,
+    jobQueue,
+    clock: resolvedClock,
+    workflowId: "media",
+  };
 }

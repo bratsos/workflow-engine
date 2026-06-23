@@ -18,6 +18,6 @@
       "@bratsos/workflow-engine/testing": ["../workflow-engine/src/testing/index.ts"]
     }
   },
-  "include": ["src/**/*"],
+  "include": ["src/**/*", "examples/**/*"],
   "exclude": ["node_modules", "dist"]
 }
