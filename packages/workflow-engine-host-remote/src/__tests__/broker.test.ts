@@ -81,6 +81,15 @@ describe("Broker", () => {
     expect(poll.annotations).toEqual([["k", "v"]]);
   });
 
+  it("rejects a duplicate report from the same worker (double-report guard)", async () => {
+    const { broker } = build();
+    const { taskId } = await broker.submit(submitReq);
+    const a = await broker.lease({ workerId: "w1", stageIds: ["download"], stageCodeVersion: "v1" });
+    const reportReq = { taskId, leaseToken: a!.leaseToken, outcome: { kind: "completed" as const, output: {} }, logs: [], annotations: [], progress: [] };
+    await broker.report(reportReq); // first report succeeds
+    await expect(broker.report(reportReq)).rejects.toThrow(/ASSIGNED/i); // second report with same token rejected
+  });
+
   it("presigns only within the task prefix", async () => {
     const { broker } = build();
     const { taskId } = await broker.submit(submitReq);

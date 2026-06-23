@@ -157,6 +157,9 @@ export class Broker {
     if (task.leaseToken !== leaseToken) {
       throw new Error(`lease fenced: token for ${taskId} is stale`);
     }
+    if (task.status !== "ASSIGNED") {
+      throw new Error(`task ${taskId} is not ASSIGNED (status=${task.status})`);
+    }
     return task;
   }
 
