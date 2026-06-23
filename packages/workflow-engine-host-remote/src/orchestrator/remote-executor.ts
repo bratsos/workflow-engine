@@ -115,7 +115,7 @@ export function createRemoteExecutor(
   return {
     async run(
       input: ActivityRunInput,
-      _deps: ExecutorDeps,
+      deps: ExecutorDeps,
     ): Promise<ActivityRunResult> {
       const {
         stageDef,
@@ -250,7 +250,7 @@ export function createRemoteExecutor(
       const progress: KernelEvent[] = (poll.progress as BufferedProgress[]).map(
         (p) => ({
           type: "stage:progress" as const,
-          timestamp: new Date(),
+          timestamp: deps.clock.now(),
           workflowRunId,
           stageId,
           progress: p.progress,
