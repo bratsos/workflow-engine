@@ -22,11 +22,15 @@ export interface IncomingRequest {
   path: string;
   headers: Record<string, string | string[] | undefined>;
   body: unknown;
+  /** Present when Content-Type is application/octet-stream; body will be null in that case. */
+  rawBody?: Uint8Array;
 }
 
 export interface HandlerResponse {
   status: number;
   json?: unknown;
+  /** If set, serve as application/octet-stream instead of JSON. */
+  binary?: Uint8Array;
 }
 
 function tokensMatch(provided: string | undefined, expected: string): boolean {
@@ -165,6 +169,9 @@ export async function handleBrokerRequest(
     }
     try {
       const data = await deps.objectStore.getViaUrl(memUrl);
+      if (data instanceof Uint8Array) {
+        return { status: 200, binary: data };
+      }
       return { status: 200, json: data };
     } catch (err) {
       return {
@@ -181,7 +188,8 @@ export async function handleBrokerRequest(
       return { status: 400, json: { error: "missing u= query param" } };
     }
     try {
-      await deps.objectStore.putViaUrl(memUrl, req.body);
+      const payload = req.rawBody !== undefined ? req.rawBody : req.body;
+      await deps.objectStore.putViaUrl(memUrl, payload);
       return { status: 200, json: { ok: true } };
     } catch (err) {
       return {
@@ -224,8 +232,15 @@ async function handleRequest(
   try {
     // Collect request body.
     const bodyBuf = await readBody(req);
+    const contentType = (req.headers["content-type"] ?? "").toString();
+    const isBinaryRequest = contentType.startsWith("application/octet-stream");
+
     let body: unknown = null;
-    if (bodyBuf.length > 0) {
+    let rawBody: Uint8Array | undefined;
+
+    if (isBinaryRequest) {
+      rawBody = new Uint8Array(bodyBuf);
+    } else if (bodyBuf.length > 0) {
       try {
         body = JSON.parse(bodyBuf.toString("utf8"));
       } catch {
@@ -253,6 +268,7 @@ async function handleRequest(
       path: req.url ?? "/",
       headers: req.headers as Record<string, string | string[] | undefined>,
       body,
+      rawBody,
     };
 
     const result = await handleBrokerRequest(resolvedDeps, incoming);
@@ -260,6 +276,15 @@ async function handleRequest(
     if (result.status === 204) {
       res.writeHead(204);
       res.end();
+      return;
+    }
+
+    if (result.binary !== undefined) {
+      res.writeHead(result.status, {
+        "Content-Type": "application/octet-stream",
+        "Content-Length": String(result.binary.byteLength),
+      });
+      res.end(result.binary);
       return;
     }
 

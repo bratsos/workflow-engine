@@ -57,10 +57,20 @@ export function createS3BlobStore(cfg: S3PresignerConfig): BlobStore {
   return {
     async put(key: string, data: unknown): Promise<void> {
       const url = buildObjectUrl(cfg, key);
-      const body = JSON.stringify(data);
+      const isBinary =
+        data instanceof Uint8Array || data instanceof ArrayBuffer;
+      const body = isBinary
+        ? data instanceof ArrayBuffer
+          ? new Uint8Array(data)
+          : data
+        : JSON.stringify(data);
       const res = await client.fetch(url, {
         method: "PUT",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": isBinary
+            ? "application/octet-stream"
+            : "application/json",
+        },
         body,
       });
       if (!res.ok) {
@@ -78,6 +88,10 @@ export function createS3BlobStore(cfg: S3PresignerConfig): BlobStore {
         throw new Error(
           `S3 GET ${key} failed: ${res.status} ${res.statusText}`,
         );
+      }
+      const contentType = res.headers.get("content-type") ?? "";
+      if (contentType.startsWith("application/octet-stream")) {
+        return new Uint8Array(await res.arrayBuffer());
       }
       return (await res.json()) as unknown;
     },

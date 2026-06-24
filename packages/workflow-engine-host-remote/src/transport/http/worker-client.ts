@@ -126,21 +126,30 @@ export function createHttpWorkerTransport(
     },
 
     async putBytes(url: string, data: unknown): Promise<void> {
+      const isBinary =
+        data instanceof Uint8Array || data instanceof ArrayBuffer;
       const headers: Record<string, string> = {
-        "Content-Type": "application/json",
+        "Content-Type": isBinary
+          ? "application/octet-stream"
+          : "application/json",
         ...(isBrokerUrl(url) ? authHeaders() : {}),
       };
+      const body = isBinary
+        ? data instanceof ArrayBuffer
+          ? new Uint8Array(data)
+          : data
+        : JSON.stringify(data);
       const res = await fetch(url, {
         method: "PUT",
         headers,
-        body: JSON.stringify(data),
+        body,
       });
 
       if (!res.ok) {
-        const body = (await res.json().catch(() => ({}))) as {
+        const body2 = (await res.json().catch(() => ({}))) as {
           error?: string;
         };
-        throw new Error(body.error ?? `putBytes failed: ${res.status}`);
+        throw new Error(body2.error ?? `putBytes failed: ${res.status}`);
       }
     },
 
@@ -160,6 +169,10 @@ export function createHttpWorkerTransport(
         throw new Error(body.error ?? `getBytes failed: ${res.status}`);
       }
 
+      const contentType = res.headers.get("content-type") ?? "";
+      if (contentType.startsWith("application/octet-stream")) {
+        return new Uint8Array(await res.arrayBuffer());
+      }
       return res.json();
     },
   };
