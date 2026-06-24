@@ -76,6 +76,11 @@ async function main(): Promise<void> {
       defineRemoteStage(heavyStage, oTransport, {
         pollIntervalMs: 200,
         maxWaitMs: 30_000,
+        // Match the broker + worker stageCodeVersion. This enables the
+        // deploy-safety gate: after a deploy that bumps the version, a
+        // suspended task's durable report from the old version is NOT
+        // completed — the run fails rather than running stale output.
+        stageCodeVersion: "v1",
       }),
     )
     .pipe(coreStage)

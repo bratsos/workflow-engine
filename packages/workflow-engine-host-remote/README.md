@@ -156,6 +156,11 @@ Two patterns for wiring remote execution:
 workflow.pipe(defineRemoteStage(myHeavyStage, oTransport, {
   pollIntervalMs: 5_000,
   maxWaitMs: 3_600_000,
+  // Set the SAME stageCodeVersion you configure on the broker and workers.
+  // This enables deploy safety: after a deploy bumps the version, a task
+  // suspended under the old version is failed (not resumed from a stale
+  // durable report). Omit it to disable version pinning.
+  stageCodeVersion: "v1",
 }))
 ```
 
