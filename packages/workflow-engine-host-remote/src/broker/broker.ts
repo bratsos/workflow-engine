@@ -142,12 +142,26 @@ export class Broker {
       );
     }
     const leaseToken = this.generateId();
-    const task = await this.store.claimNext(
-      req.stageIds,
-      leaseToken,
-      this.now(),
-    );
+    const now = this.now();
+    const task = await this.store.claimNext(req.stageIds, leaseToken, now);
     if (!task) return null;
+
+    // Should-fix 1: a task claimed from the store may already be past its
+    // deadline (e.g. it was PENDING but never picked up in time). A worker
+    // should never start work that cannot be reported. Mark it FAILED
+    // immediately and return null so the worker is not handed a dead task.
+    // The next poll() / checkCompletion() will see the FAILED status.
+    if (now > task.deadline) {
+      const deadlineError = "remote activity deadline exceeded";
+      await this.store.update(task.taskId, {
+        status: "FAILED",
+        leaseToken: null,
+        leasedAt: null,
+        failureError: deadlineError,
+      });
+      return null;
+    }
+
     return this.toActivityTask(task);
   }
 

@@ -142,23 +142,33 @@ export async function handleBrokerRequest(
     if (body.op !== "put" && body.op !== "get") {
       return { status: 400, json: { error: 'op must be "put" or "get"' } };
     }
-    const presignResp = await deps.broker.presign({
-      taskId: body.taskId,
-      leaseToken: body.leaseToken,
-      relKey: body.relKey,
-      op: body.op,
-    });
-    // If the presigner returned an absolute http(s):// URL (S3/R2/MinIO), return
-    // it as-is so the worker writes DIRECTLY to the object store (no /blob hop).
-    // Only wrap mem:// urls in the /blob shim for the in-memory dev/test case.
-    let blobUrl: string;
-    if (isAbsoluteHttpUrl(presignResp.url)) {
-      blobUrl = presignResp.url;
-    } else {
-      const base = deps.publicBaseUrl ?? "http://127.0.0.1";
-      blobUrl = `${base}/blob?u=${encodeURIComponent(presignResp.url)}`;
+    try {
+      const presignResp = await deps.broker.presign({
+        taskId: body.taskId,
+        leaseToken: body.leaseToken,
+        relKey: body.relKey,
+        op: body.op,
+      });
+      // If the presigner returned an absolute http(s):// URL (S3/R2/MinIO), return
+      // it as-is so the worker writes DIRECTLY to the object store (no /blob hop).
+      // Only wrap mem:// urls in the /blob shim for the in-memory dev/test case.
+      let blobUrl: string;
+      if (isAbsoluteHttpUrl(presignResp.url)) {
+        blobUrl = presignResp.url;
+      } else {
+        const base = deps.publicBaseUrl ?? "http://127.0.0.1";
+        blobUrl = `${base}/blob?u=${encodeURIComponent(presignResp.url)}`;
+      }
+      return { status: 200, json: { url: blobUrl } };
+    } catch (err) {
+      // Should-fix 2: expected broker rejections (fenced lease, deadline
+      // exceeded, out-of-prefix) → 409 Conflict, consistent with /lease and
+      // /report. A 500 is reserved for genuinely unexpected errors.
+      return {
+        status: 409,
+        json: { error: err instanceof Error ? err.message : String(err) },
+      };
     }
-    return { status: 200, json: { url: blobUrl } };
   }
 
   // GET /blob?u=<memUrl>

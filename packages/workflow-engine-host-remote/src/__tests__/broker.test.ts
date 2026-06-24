@@ -233,6 +233,25 @@ describe("Broker", () => {
     ).rejects.toThrow(/deadline/i);
   });
 
+  it("should-fix 1: lease returns null and marks task FAILED when task is already past its deadline", async () => {
+    const { broker, store, set } = build();
+    // Submit a task with a short maxWaitTime
+    const { taskId } = await broker.submit({ ...submitReq, maxWaitTime: 500 });
+    // Advance clock past the deadline BEFORE leasing
+    set(1_000);
+    // lease() must NOT hand out the expired task — returns null
+    const task = await broker.lease({
+      workerId: "w1",
+      stageIds: ["download"],
+      stageCodeVersion: "v1",
+    });
+    expect(task).toBeNull();
+    // The task must now be FAILED in the store
+    const record = await store.get(taskId);
+    expect(record?.status).toBe("FAILED");
+    expect(record?.failureError).toMatch(/deadline/i);
+  });
+
   it("heartbeat returns cancel:true after deadline (B2)", async () => {
     const { broker, set } = build();
     const { taskId } = await broker.submit({ ...submitReq, maxWaitTime: 500 });

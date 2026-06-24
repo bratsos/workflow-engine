@@ -338,6 +338,240 @@ describe("durable reports — completed work survives an orchestrator restart", 
     expect((run?.output as { doubled: number }).doubled).toBe(6);
   });
 
+  it("deploy-staleness gate: checkCompletion rejects v1 durable report after orchestrator redeploys as v2", async () => {
+    // Sequence:
+    //  1. v1 orchestrator runs → stage suspends; broker configured with v1
+    //  2. v1 worker runs heavy stage, writes durable report (v1 output)
+    //  3. Simulate deploy: brokerStore.clear(), re-create broker+proxy with v2;
+    //     defineRemoteStage also gets stageCodeVersion:"v2"
+    //  4. checkCompletion sees unknown + valid v1 durable report BUT
+    //     opts.stageCodeVersion("v2") !== storedVersion("v1") → does NOT
+    //     complete. Falls through to re-register; broker (v2) creates FAILED
+    //     task (version mismatch). Run FAILS.
+    //  5. heavyRunCount stays 1 (the v1 work was never accepted as output).
+
+    let heavyRunCount = 0;
+
+    const countedHeavyStage = defineStage({
+      id: "heavy",
+      name: "Heavy",
+      schemas: {
+        input: z.object({ seed: z.number() }),
+        output: z.object({ artifactKey: z.string(), size: z.number() }),
+        config: z.object({}),
+      },
+      async execute(ctx) {
+        heavyRunCount++;
+        const key = ctx.storage.getStageKey("heavy", "blob.json");
+        const payload = { data: new Array(ctx.input.seed).fill("x") };
+        await ctx.storage.save(key, payload);
+        return { output: { artifactKey: key, size: payload.data.length } };
+      },
+    });
+
+    const clock = new FakeClock(new Date(0));
+    const os = new InMemoryObjectStore(clock);
+    const brokerStore = new InMemoryBrokerStore();
+
+    // ── Phase 1: v1 orchestrator ────────────────────────────────────────────
+    let broker = new Broker({
+      store: brokerStore,
+      presigner: os,
+      clock,
+      staleLeaseMs: 60_000,
+      stageCodeVersion: "v1",
+    });
+
+    let oTransport: OrchestratorTransport = {
+      submit: (req) => broker.submit(req),
+      poll: (taskId) => broker.poll(taskId),
+    };
+    const { worker: wTransport } = createInProcessTransport(broker, os);
+
+    const persistence = new InMemoryWorkflowPersistence();
+    const jobQueue = new InMemoryJobQueue();
+    const coreStage = makeCoreStage(os);
+
+    // v1 remote stage — no stageCodeVersion set yet (mimics pre-fix state);
+    // we'll rebuild with v2 after the simulated deploy.
+    let remoteHeavy = defineRemoteStage(countedHeavyStage, oTransport, {
+      pollIntervalMs: 100,
+      maxWaitMs: 60_000,
+      _clock: () => clock.now().getTime(),
+      stageCodeVersion: "v1",
+    });
+
+    const workflow = new WorkflowBuilder(
+      "media-deploy",
+      "Media",
+      "deploy-staleness gate test",
+      z.object({ seed: z.number() }),
+      z.object({ doubled: z.number() }),
+    )
+      .pipe(remoteHeavy)
+      .pipe(coreStage)
+      .build();
+
+    const kernel = createKernel({
+      persistence,
+      blobStore: os,
+      jobTransport: jobQueue,
+      eventSink: new CollectingEventSink(),
+      scheduler: new NoopScheduler(),
+      clock,
+      registry: {
+        getWorkflow: (id: string) =>
+          id === "media-deploy" ? workflow : undefined,
+      },
+    });
+
+    // Step 1: run → suspend
+    const { workflowRunId } = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "k-deploy-staleness",
+      workflowId: "media-deploy",
+      input: { seed: 3 },
+    });
+    await kernel.dispatch({ type: "run.claimPending", workerId: "orch" });
+    const job1 = await jobQueue.dequeue();
+    expect(job1).not.toBeNull();
+    const r1 = await kernel.dispatch({
+      type: "job.execute",
+      workflowRunId,
+      workflowId: "media-deploy",
+      stageId: job1!.stageId,
+      config: {},
+    });
+    expect(r1.outcome).toBe("suspended");
+    await jobQueue.suspend(job1!.jobId, new Date(clock.now().getTime() + 100));
+
+    // Step 2: v1 worker runs and writes the durable report
+    const worker = createActivityWorker({
+      registry: new Map([["heavy", countedHeavyStage]]),
+      transport: wTransport,
+      workerId: "w1",
+      stageIds: ["heavy"],
+      stageCodeVersion: "v1",
+    });
+    const didWork = await worker.processOne();
+    expect(didWork).toBe(true);
+    expect(heavyRunCount).toBe(1);
+
+    // Confirm durable report written
+    const allStages = await persistence.getStagesByRun(workflowRunId);
+    const suspendedStage = allStages.find((s) => s.status === "SUSPENDED");
+    const suspendedMeta = suspendedStage?.suspendedState as
+      | { batchId: string; metadata?: { taskId?: string } }
+      | undefined;
+    const taskId = suspendedMeta?.metadata?.taskId ?? suspendedMeta?.batchId;
+    expect(taskId).toBeTruthy();
+
+    const taskRecord = await brokerStore.get(taskId!);
+    expect(taskRecord?.status).toBe("REPORTED");
+    const artifactPrefix = taskRecord?.artifactPrefix;
+    const durableReportKey = `${artifactPrefix}/${taskId}/report.json`;
+    expect(await os.has(durableReportKey)).toBe(true);
+
+    // ── Phase 2: simulate deploy — wipe broker state, re-create with v2 ────
+    brokerStore.clear();
+
+    broker = new Broker({
+      store: brokerStore,
+      presigner: os,
+      clock,
+      staleLeaseMs: 60_000,
+      stageCodeVersion: "v2",
+    });
+
+    // Rebuild oTransport to point at the v2 broker
+    oTransport = {
+      submit: (req) => broker.submit(req),
+      poll: (taskId2) => broker.poll(taskId2),
+    };
+
+    // Rebuild remoteHeavy with stageCodeVersion:"v2" — this is the deploy gate
+    remoteHeavy = defineRemoteStage(countedHeavyStage, oTransport, {
+      pollIntervalMs: 100,
+      maxWaitMs: 60_000,
+      _clock: () => clock.now().getTime(),
+      stageCodeVersion: "v2",
+    });
+
+    // Rebuild checkCompletion by patching the workflow stage reference.
+    // In a real deploy the kernel would be restarted; we simulate by
+    // directly re-assigning the stage object the kernel sees through the
+    // registered workflow. Since WorkflowBuilder produces a frozen plan we
+    // test via the stage's checkCompletion directly on the suspended path.
+    // We do this by re-running stage.pollSuspended after making the stage
+    // resumable — the kernel calls checkCompletion on the registered stage.
+    // We must swap the workflow's registered heavy stage. In tests the
+    // simplest approach is: rebuild the entire kernel with the v2 workflow.
+
+    const workflowV2 = new WorkflowBuilder(
+      "media-deploy",
+      "Media",
+      "deploy-staleness gate test v2",
+      z.object({ seed: z.number() }),
+      z.object({ doubled: z.number() }),
+    )
+      .pipe(remoteHeavy)
+      .pipe(coreStage)
+      .build();
+
+    const kernelV2 = createKernel({
+      persistence, // same persistence — same runs/stages
+      blobStore: os,
+      jobTransport: jobQueue,
+      eventSink: new CollectingEventSink(),
+      scheduler: new NoopScheduler(),
+      clock,
+      registry: {
+        getWorkflow: (id: string) =>
+          id === "media-deploy" ? workflowV2 : undefined,
+      },
+    });
+
+    // Make the suspended stage resumable
+    const stages = await persistence.getStagesByRun(workflowRunId);
+    const suspended = stages.find((s) => s.status === "SUSPENDED");
+    expect(suspended).not.toBeUndefined();
+    await persistence.updateStage(suspended!.id, {
+      nextPollAt: new Date(clock.now().getTime() - 1),
+    });
+
+    // Step 4a: first checkCompletion — the version gate fires (v2 !== v1) and
+    // the durable report is rejected. Falls through to re-register. The broker
+    // (v2) creates the task as FAILED (version mismatch). This poll tick returns
+    // resumed:0 / failed:0 because the FAILED status is observed on the NEXT
+    // poll tick.
+    const poll1 = await kernelV2.dispatch({ type: "stage.pollSuspended" });
+    expect(poll1.resumed).toBe(0);
+    // heavyRunCount still 1 — the v1 report was NOT accepted.
+    expect(heavyRunCount).toBe(1);
+
+    // Step 4b: second checkCompletion — now poll.state === "failed" (broker
+    // already has the FAILED task). The stage is transitioned to FAILED.
+    // Make stage resumable again for the second tick.
+    const stages2 = await persistence.getStagesByRun(workflowRunId);
+    const suspended2 = stages2.find((s) => s.status === "SUSPENDED");
+    expect(suspended2).not.toBeUndefined();
+    await persistence.updateStage(suspended2!.id, {
+      nextPollAt: new Date(clock.now().getTime() - 1),
+    });
+    const poll2 = await kernelV2.dispatch({ type: "stage.pollSuspended" });
+
+    // The stage must now fail with the version mismatch error.
+    expect(poll2.resumed).toBe(0);
+    expect(poll2.failed).toBe(1);
+
+    // Step 5: heavy stage ran exactly once (v1 output was rejected, not rerun)
+    expect(heavyRunCount).toBe(1);
+
+    // The run must be in FAILED state
+    const run = await persistence.getRun(workflowRunId);
+    expect(run?.status).toBe("FAILED");
+  });
+
   it("corrupt durable report blob falls back to re-register (not complete, not hang)", async () => {
     let heavyRunCount = 0;
 

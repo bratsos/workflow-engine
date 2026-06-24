@@ -14,6 +14,19 @@ export interface RemoteStageOptions {
    * both use the real wall clock; in tests both should use the same FakeClock.
    */
   _clock?: () => number;
+  /**
+   * The orchestrator's CURRENT stage-code version — the same value the broker
+   * is configured with. When set, the durable-report fast-path will reject any
+   * report written by a worker that ran under a DIFFERENT version (i.e. the
+   * worker ran before a deploy changed stage code). The run falls through to
+   * the re-register path, which will create a FAILED task due to the version
+   * mismatch, failing the run with an actionable error.
+   *
+   * If unset, version-pinning is disabled and the durable-report path completes
+   * as before (no version concern). This matches the broker's "pinning requires
+   * both sides configured" semantics.
+   */
+  stageCodeVersion?: string;
 }
 
 type AnyStage = Stage<z.ZodTypeAny, z.ZodTypeAny, z.ZodTypeAny>;
@@ -210,44 +223,64 @@ export function defineRemoteStage(
           }
 
           if (durableReport) {
-            // Replay buffered side-channels from the durable report.
-            for (const l of durableReport.logs)
-              ctx.log(l.level as "INFO", l.message, l.meta);
-            for (const a of durableReport.annotations)
-              (ctx.annotate as (...args: unknown[]) => void)(...a);
-            for (const p of durableReport.progress)
-              ctx.log(
-                "INFO",
-                `progress ${p.progress}%${p.message ? `: ${p.message}` : ""}`,
-              );
+            // B1-gate: version-pin check. If the orchestrator has a
+            // stageCodeVersion configured AND the stashed version from
+            // suspendedState.metadata differs (i.e. a deploy happened between
+            // the worker writing the durable report and now), do NOT complete
+            // from the stale report. Fall through to re-register so the broker
+            // (configured with the new version) creates a FAILED task and the
+            // run fails with the version error — the correct conservative
+            // behavior. If opts.stageCodeVersion is unset, version-pinning is
+            // not in use and the durable report completes as before.
+            const versionGateBlocks =
+              opts.stageCodeVersion !== undefined &&
+              storedVersion !== undefined &&
+              opts.stageCodeVersion !== storedVersion;
 
-            const outcome = durableReport.outcome;
-            if (outcome.kind === "failed")
-              return { ready: false, error: outcome.error };
+            if (!versionGateBlocks) {
+              // Replay buffered side-channels from the durable report.
+              for (const l of durableReport.logs)
+                ctx.log(l.level as "INFO", l.message, l.meta);
+              for (const a of durableReport.annotations)
+                (ctx.annotate as (...args: unknown[]) => void)(...a);
+              for (const p of durableReport.progress)
+                ctx.log(
+                  "INFO",
+                  `progress ${p.progress}%${p.message ? `: ${p.message}` : ""}`,
+                );
 
-            // Strict trust gate — same as the normal "reported" path.
-            const outputParsed = real.outputSchema.safeParse(outcome.output);
-            if (outputParsed.success) {
-              // B3: Validate output key scope in durable-report path.
-              const grantPrefix = `${payload.artifactPrefix}/${taskId}/`;
-              const scopeError = validateOutputKeyScope(
-                outputParsed.data,
-                grantPrefix,
-                opts.ownedKeyPrefixes ?? ["workflow-v2/", "remote-activity/"],
-              );
-              if (scopeError) return { ready: false, error: scopeError };
+              const outcome = durableReport.outcome;
+              if (outcome.kind === "failed")
+                return { ready: false, error: outcome.error };
 
-              const cm = outcome.customMetrics;
-              return {
-                ready: true,
-                output: outputParsed.data,
-                metrics: cm
-                  ? { startTime: 0, endTime: 0, duration: 0, ...cm }
-                  : undefined,
-              };
+              // Strict trust gate — same as the normal "reported" path.
+              const outputParsed = real.outputSchema.safeParse(outcome.output);
+              if (outputParsed.success) {
+                // B3: Validate output key scope in durable-report path.
+                const grantPrefix = `${payload.artifactPrefix}/${taskId}/`;
+                const scopeError = validateOutputKeyScope(
+                  outputParsed.data,
+                  grantPrefix,
+                  opts.ownedKeyPrefixes ?? ["workflow-v2/", "remote-activity/"],
+                );
+                if (scopeError) return { ready: false, error: scopeError };
+
+                const cm = outcome.customMetrics;
+                return {
+                  ready: true,
+                  output: outputParsed.data,
+                  metrics: cm
+                    ? { startTime: 0, endTime: 0, duration: 0, ...cm }
+                    : undefined,
+                };
+              }
+              // B1: Output schema failure in durable-report path → fall through
+              // to re-register (not a terminal error).
             }
-            // B1: Output schema failure in durable-report path → fall through
-            // to re-register (not a terminal error).
+            // versionGateBlocks === true: deploy detected — fall through to
+            // re-register path below so the broker (configured with the new
+            // version) creates a FAILED task and the run fails with a version
+            // mismatch error — the correct conservative behavior.
           }
 
           // No valid durable report (absent, corrupt, or output schema failed) —

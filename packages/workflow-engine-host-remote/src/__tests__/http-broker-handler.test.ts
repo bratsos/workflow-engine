@@ -288,6 +288,80 @@ describe("handleBrokerRequest — presign", () => {
   });
 });
 
+describe("handleBrokerRequest — presign 409 (should-fix 2)", () => {
+  it("returns 409 when presign is called with a fenced (stale) lease token", async () => {
+    const { deps, broker } = makeSetup();
+    await submitTask(broker);
+
+    // Lease the task with worker w1.
+    const leaseRes = await handleBrokerRequest(
+      deps,
+      req("POST", "/lease", {
+        workerId: "w1",
+        stageIds: ["heavy"],
+        stageCodeVersion: "v1",
+      }),
+    );
+    const task = leaseRes.json as {
+      taskId: string;
+      leaseToken: string;
+      grant: { prefix: string };
+    };
+
+    // Attempt to presign with a bad (stale) lease token — broker throws a
+    // fence error which must become a 409, not a 500.
+    const presignRes = await handleBrokerRequest(
+      deps,
+      req("POST", "/presign", {
+        taskId: task.taskId,
+        leaseToken: "stale-token",
+        relKey: `${task.grant.prefix}artifact.json`,
+        op: "put",
+      }),
+    );
+    expect(presignRes.status).toBe(409);
+    expect((presignRes.json as { error: string }).error).toMatch(
+      /fenc|lease|not found/i,
+    );
+  });
+
+  it("returns 409 when presign is called after the task deadline has passed", async () => {
+    const { deps, broker, clock } = makeSetup();
+    await submitTask(broker);
+
+    // Lease the task.
+    const leaseRes = await handleBrokerRequest(
+      deps,
+      req("POST", "/lease", {
+        workerId: "w1",
+        stageIds: ["heavy"],
+        stageCodeVersion: "v1",
+      }),
+    );
+    const task = leaseRes.json as {
+      taskId: string;
+      leaseToken: string;
+      grant: { prefix: string };
+    };
+
+    // Advance past the deadline.
+    clock.advance(70_000);
+
+    // Presign after deadline must be 409, not 500.
+    const presignRes = await handleBrokerRequest(
+      deps,
+      req("POST", "/presign", {
+        taskId: task.taskId,
+        leaseToken: task.leaseToken,
+        relKey: `${task.grant.prefix}artifact.json`,
+        op: "put",
+      }),
+    );
+    expect(presignRes.status).toBe(409);
+    expect((presignRes.json as { error: string }).error).toMatch(/deadline/i);
+  });
+});
+
 describe("handleBrokerRequest — blob", () => {
   it("PUT then GET round-trips data through the object store via HTTP URLs", async () => {
     const { deps, broker } = makeSetup();
