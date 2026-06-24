@@ -233,17 +233,13 @@ describe("remote activity workers — restart recovery (no-table durability)", (
 
     brokerStore.clear();
 
-    // First poll re-registers the expired task; the broker, using its own clock,
-    // creates it already FAILED (never re-queued for a worker). The stage stays
-    // SUSPENDED for one more poll.
+    // B1: With the deadline pre-check, the first poll immediately fails the run
+    // (no re-registration round-trip needed — the proxy detects the expired
+    // deadline before any I/O and returns the terminal error directly).
     await makeStageResumable(orch, workflowRunId);
     const poll1 = await orch.kernel.dispatch({ type: "stage.pollSuspended" });
     expect(poll1.resumed).toBe(0);
-
-    // Second poll observes the FAILED task and fails the run with a precise cause.
-    await makeStageResumable(orch, workflowRunId);
-    const poll2 = await orch.kernel.dispatch({ type: "stage.pollSuspended" });
-    expect(poll2.failed).toBe(1);
+    expect(poll1.failed).toBe(1);
 
     const run = await orch.persistence.getRun(workflowRunId);
     expect(run?.status).toBe("FAILED");

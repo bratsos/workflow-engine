@@ -192,4 +192,61 @@ describe("Broker", () => {
       }),
     ).rejects.toThrow(/prefix|scope/i);
   });
+
+  it("report throws after deadline (B2)", async () => {
+    const { broker, set } = build();
+    const { taskId } = await broker.submit({ ...submitReq, maxWaitTime: 500 });
+    const a = await broker.lease({
+      workerId: "w1",
+      stageIds: ["download"],
+      stageCodeVersion: "v1",
+    });
+    set(1_000); // advance past deadline
+    await expect(
+      broker.report({
+        taskId,
+        leaseToken: a!.leaseToken,
+        outcome: { kind: "completed", output: {} },
+        logs: [],
+        annotations: [],
+        progress: [],
+      }),
+    ).rejects.toThrow(/deadline/i);
+  });
+
+  it("presign throws after deadline (B2)", async () => {
+    const { broker, set } = build();
+    const { taskId } = await broker.submit({ ...submitReq, maxWaitTime: 500 });
+    const a = await broker.lease({
+      workerId: "w1",
+      stageIds: ["download"],
+      stageCodeVersion: "v1",
+    });
+    set(1_000); // advance past deadline
+    await expect(
+      broker.presign({
+        taskId,
+        leaseToken: a!.leaseToken,
+        relKey: `${a!.grant.prefix}audio.bin`,
+        op: "put",
+      }),
+    ).rejects.toThrow(/deadline/i);
+  });
+
+  it("heartbeat returns cancel:true after deadline (B2)", async () => {
+    const { broker, set } = build();
+    const { taskId } = await broker.submit({ ...submitReq, maxWaitTime: 500 });
+    const a = await broker.lease({
+      workerId: "w1",
+      stageIds: ["download"],
+      stageCodeVersion: "v1",
+    });
+    set(1_000); // advance past deadline
+    const hb = await broker.heartbeat({
+      taskId,
+      leaseToken: a!.leaseToken,
+    });
+    expect(hb.ok).toBe(false);
+    expect(hb.cancel).toBe(true);
+  });
 });

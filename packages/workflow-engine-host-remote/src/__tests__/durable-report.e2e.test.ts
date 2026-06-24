@@ -80,6 +80,7 @@ describe("durable reports — completed work survives an orchestrator restart", 
     const remoteHeavy = defineRemoteStage(countedHeavyStage, oTransport, {
       pollIntervalMs: 100,
       maxWaitMs: 60_000,
+      _clock: () => clock.now().getTime(),
     });
     const workflow = new WorkflowBuilder(
       "media",
@@ -335,5 +336,151 @@ describe("durable reports — completed work survives an orchestrator restart", 
     const run = await orch.persistence.getRun(workflowRunId);
     expect(run?.status).toBe("COMPLETED");
     expect((run?.output as { doubled: number }).doubled).toBe(6);
+  });
+
+  it("corrupt durable report blob falls back to re-register (not complete, not hang)", async () => {
+    let heavyRunCount = 0;
+
+    const countedHeavyStage = defineStage({
+      id: "heavy",
+      name: "Heavy",
+      schemas: {
+        input: z.object({ seed: z.number() }),
+        output: z.object({ artifactKey: z.string(), size: z.number() }),
+        config: z.object({}),
+      },
+      async execute(ctx) {
+        heavyRunCount++;
+        const key = ctx.storage.getStageKey("heavy", "blob.json");
+        const payload = { data: new Array(ctx.input.seed).fill("x") };
+        await ctx.storage.save(key, payload);
+        return { output: { artifactKey: key, size: payload.data.length } };
+      },
+    });
+
+    const clock = new FakeClock(new Date(0));
+    const os = new InMemoryObjectStore(clock);
+    const brokerStore = new InMemoryBrokerStore();
+    const broker = new Broker({
+      store: brokerStore,
+      presigner: os,
+      clock,
+      staleLeaseMs: 60_000,
+    });
+
+    const oTransport: OrchestratorTransport = {
+      submit: (req) => broker.submit(req),
+      poll: (taskId) => broker.poll(taskId),
+    };
+    const { worker: wTransport } = createInProcessTransport(broker, os);
+
+    // Build an orchestrator with our counted heavy stage.
+    const persistence = new InMemoryWorkflowPersistence();
+    const jobQueue = new InMemoryJobQueue();
+    const coreStage = makeCoreStage(os);
+    const remoteHeavy = defineRemoteStage(countedHeavyStage, oTransport, {
+      pollIntervalMs: 100,
+      maxWaitMs: 60_000,
+      _clock: () => clock.now().getTime(),
+    });
+    const workflow = new WorkflowBuilder(
+      "media-corrupt",
+      "Media",
+      "remote heavy + core",
+      z.object({ seed: z.number() }),
+      z.object({ doubled: z.number() }),
+    )
+      .pipe(remoteHeavy)
+      .pipe(coreStage)
+      .build();
+
+    const kernel = createKernel({
+      persistence,
+      blobStore: os,
+      jobTransport: jobQueue,
+      eventSink: new CollectingEventSink(),
+      scheduler: new NoopScheduler(),
+      clock,
+      registry: {
+        getWorkflow: (id: string) =>
+          id === "media-corrupt" ? workflow : undefined,
+      },
+    });
+
+    // Step 1: run → suspend.
+    const { workflowRunId } = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "k-corrupt-durable-report",
+      workflowId: "media-corrupt",
+      input: { seed: 3 },
+    });
+    await kernel.dispatch({ type: "run.claimPending", workerId: "orch" });
+    const job1 = await jobQueue.dequeue();
+    expect(job1).not.toBeNull();
+    const r1 = await kernel.dispatch({
+      type: "job.execute",
+      workflowRunId,
+      workflowId: "media-corrupt",
+      stageId: job1!.stageId,
+      config: {},
+    });
+    expect(r1.outcome).toBe("suspended");
+    await jobQueue.suspend(job1!.jobId, new Date(clock.now().getTime() + 100));
+
+    // Step 2: worker runs heavy stage (writes durable report + calls broker.report).
+    const worker = createActivityWorker({
+      registry: new Map([["heavy", countedHeavyStage]]),
+      transport: wTransport,
+      workerId: "w1",
+      stageIds: ["heavy"],
+      stageCodeVersion: "v1",
+    });
+
+    const didWork = await worker.processOne();
+    expect(didWork).toBe(true);
+    expect(heavyRunCount).toBe(1);
+
+    // Get the durable report key.
+    const allStages = await persistence.getStagesByRun(workflowRunId);
+    const suspendedStage = allStages.find((s) => s.status === "SUSPENDED");
+    const suspendedMeta = suspendedStage?.suspendedState as
+      | { batchId: string; metadata?: { taskId?: string } }
+      | undefined;
+    const taskId = suspendedMeta?.metadata?.taskId ?? suspendedMeta?.batchId;
+    expect(taskId).toBeTruthy();
+
+    const taskRecord = await brokerStore.get(taskId!);
+    expect(taskRecord?.status).toBe("REPORTED");
+    const artifactPrefix = taskRecord?.artifactPrefix;
+    expect(artifactPrefix).toBeTruthy();
+
+    const durableReportKey = `${artifactPrefix}/${taskId}/report.json`;
+
+    // Overwrite the durable report with garbage BEFORE clearing broker state.
+    await os.put(durableReportKey, { garbage: true });
+
+    // Step 3: simulate restart — wipe broker state.
+    brokerStore.clear();
+    const pollAfterClear = await broker.poll(taskId!);
+    expect(pollAfterClear.state).toBe("unknown");
+
+    // Make stage resumable.
+    const stages = await persistence.getStagesByRun(workflowRunId);
+    const suspended = stages.find((s) => s.status === "SUSPENDED");
+    await persistence.updateStage(suspended!.id, {
+      nextPollAt: new Date(clock.now().getTime() - 1),
+    });
+
+    // poll → unknown → corrupt durable report → fall back to re-register.
+    const poll1 = await kernel.dispatch({ type: "stage.pollSuspended" });
+
+    // Should NOT have resumed (corrupt blob), should NOT have failed (terminal).
+    // Should have fallen back to re-register.
+    expect(poll1.resumed).toBe(0);
+    expect(poll1.failed).toBe(0);
+
+    // The task should now be re-registered in the broker store.
+    const taskAfterFallback = await brokerStore.get(taskId!);
+    expect(taskAfterFallback).not.toBeNull();
   });
 });

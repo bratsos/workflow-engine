@@ -153,6 +153,9 @@ export class Broker {
 
   async report(req: ActivityReport): Promise<void> {
     const task = await this.requireFencedTask(req.taskId, req.leaseToken);
+    if (this.now() > task.deadline) {
+      throw new Error("activity deadline exceeded");
+    }
     await this.store.update(task.taskId, { status: "REPORTED", report: req });
   }
 
@@ -174,7 +177,8 @@ export class Broker {
     if (
       !task ||
       task.leaseToken !== req.leaseToken ||
-      task.status !== "ASSIGNED"
+      task.status !== "ASSIGNED" ||
+      this.now() > task.deadline
     ) {
       return { ok: false, cancel: true };
     }
@@ -255,6 +259,9 @@ export class Broker {
 
   async presign(req: PresignRequest): Promise<PresignResponse> {
     const task = await this.requireFencedTask(req.taskId, req.leaseToken);
+    if (this.now() > task.deadline) {
+      throw new Error("activity deadline exceeded");
+    }
     const prefix = this.prefixFor(task);
     if (!req.relKey.startsWith(prefix)) {
       throw new Error(

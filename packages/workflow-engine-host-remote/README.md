@@ -169,7 +169,7 @@ import { createRoutingExecutor } from "@bratsos/workflow-engine/kernel";
 
 const kernel = createKernel({
   ...,
-  activityExecutor: createRoutingExecutor({
+  executor: createRoutingExecutor({
     remote: createRemoteExecutor(oTransport),
     remoteStageIds: ["heavy"],
   }),

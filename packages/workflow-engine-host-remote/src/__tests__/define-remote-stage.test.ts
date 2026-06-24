@@ -179,4 +179,74 @@ describe("defineRemoteStage", () => {
     expect(r.ready).toBe(false);
     expect(r.error).toBe("boom");
   });
+
+  it("checkCompletion rejects worker output with a cross-run owned key (B3 confused-deputy)", async () => {
+    // The real stage outputs `key: z.string()` — so a cross-run key passes schema
+    // validation but must be rejected by scope validation.
+    const poll: PollResponse = {
+      state: "reported",
+      outcome: {
+        kind: "completed",
+        // This key is under an "owned" prefix but NOT under the worker's grant prefix
+        output: { key: "workflow-v2/some-other-run/secret.json" },
+      },
+      logs: [],
+      annotations: [],
+      progress: [],
+    };
+    const transport: OrchestratorTransport = {
+      submit: vi.fn(),
+      poll: vi.fn(async () => poll),
+    };
+    const proxy = defineRemoteStage(real, transport);
+    // Provide metadata with artifactPrefix so scope validation can run.
+    // The grant prefix would be: artifactPrefix + "/" + taskId + "/"
+    // = "workflow-v2/r1/download/remote" + "/" + "t1" + "/"
+    // = "workflow-v2/r1/download/remote/t1/"
+    const r = await proxy.checkCompletion!(
+      {
+        batchId: "t1",
+        metadata: {
+          taskId: "t1",
+          artifactPrefix: "workflow-v2/r1/download/remote",
+        },
+      } as never,
+      ctxStub() as never,
+    );
+    expect(r.ready).toBe(false);
+    expect(r.error).toMatch(/confused-deputy/i);
+  });
+
+  it("checkCompletion accepts worker output with a key under the grant prefix (B3 happy path)", async () => {
+    // A key under the correct grant prefix must pass scope validation.
+    const poll: PollResponse = {
+      state: "reported",
+      outcome: {
+        kind: "completed",
+        output: { key: "workflow-v2/r1/download/remote/t1/blob.json" },
+      },
+      logs: [],
+      annotations: [],
+      progress: [],
+    };
+    const transport: OrchestratorTransport = {
+      submit: vi.fn(),
+      poll: vi.fn(async () => poll),
+    };
+    const proxy = defineRemoteStage(real, transport);
+    const r = await proxy.checkCompletion!(
+      {
+        batchId: "t1",
+        metadata: {
+          taskId: "t1",
+          artifactPrefix: "workflow-v2/r1/download/remote",
+        },
+      } as never,
+      ctxStub() as never,
+    );
+    expect(r.ready).toBe(true);
+    expect(r.output).toEqual({
+      key: "workflow-v2/r1/download/remote/t1/blob.json",
+    });
+  });
 });

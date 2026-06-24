@@ -81,6 +81,7 @@ export function buildOrchestrator(
       defineRemoteStage(heavyStage, transport, {
         pollIntervalMs: 100,
         maxWaitMs: 60_000,
+        _clock: () => resolvedClock.now().getTime(),
       }),
     )
     .pipe(coreStage)

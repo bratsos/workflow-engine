@@ -40,7 +40,11 @@ export function createScopedStorage(
         relKey: key,
         op: "get",
       });
-      return (await transport.getBytes(url)) !== undefined;
+      try {
+        return (await transport.getBytes(url)) !== undefined;
+      } catch {
+        return false;
+      }
     },
     async delete(_key: string): Promise<void> {
       throw new Error(

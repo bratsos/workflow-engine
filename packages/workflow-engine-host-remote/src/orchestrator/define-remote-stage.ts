@@ -1,11 +1,19 @@
 import type { Stage } from "@bratsos/workflow-engine";
 import type { z } from "zod";
 import type { ActivityReport } from "../protocol.js";
+import { ActivityReportSchema } from "../protocol.js";
 import type { OrchestratorTransport } from "../transport.js";
 
 export interface RemoteStageOptions {
   pollIntervalMs?: number;
   maxWaitMs?: number;
+  ownedKeyPrefixes?: string[];
+  /**
+   * Injectable clock for tests. Defaults to `Date.now`. The clock must be in
+   * the same time domain as the broker's `deadlineAt` values — in production
+   * both use the real wall clock; in tests both should use the same FakeClock.
+   */
+  _clock?: () => number;
 }
 
 type AnyStage = Stage<z.ZodTypeAny, z.ZodTypeAny, z.ZodTypeAny>;
@@ -37,6 +45,31 @@ interface RemotePayload {
   stageCodeVersion?: string;
 }
 
+function collectStrings(val: unknown): string[] {
+  if (typeof val === "string") return [val];
+  if (Array.isArray(val)) return val.flatMap(collectStrings);
+  if (val !== null && typeof val === "object") {
+    return Object.values(val as Record<string, unknown>).flatMap(
+      collectStrings,
+    );
+  }
+  return [];
+}
+
+function validateOutputKeyScope(
+  output: unknown,
+  grantPrefix: string,
+  ownedKeyPrefixes: string[],
+): string | null {
+  for (const s of collectStrings(output)) {
+    const isOwnedKey = ownedKeyPrefixes.some((p) => s.startsWith(p));
+    if (isOwnedKey && !s.startsWith(grantPrefix)) {
+      return `worker returned an object key outside its grant prefix (possible confused-deputy): ${s}`;
+    }
+  }
+  return null;
+}
+
 export function defineRemoteStage(
   real: AnyStage,
   transport: OrchestratorTransport,
@@ -44,6 +77,7 @@ export function defineRemoteStage(
 ): AnyStage {
   const pollInterval = opts.pollIntervalMs ?? 1_000;
   const maxWaitTime = opts.maxWaitMs ?? 3_600_000;
+  const nowMs = opts._clock ?? Date.now.bind(Date);
 
   return {
     ...real,
@@ -111,6 +145,7 @@ export function defineRemoteStage(
             payloadKey,
             deadlineAt: submitted.deadlineAt,
             stageCodeVersion: submitted.stageCodeVersion,
+            artifactPrefix,
           },
         },
         pollConfig: submitted.pollConfig,
@@ -123,6 +158,7 @@ export function defineRemoteStage(
         .metadata;
       const storedDeadlineAt = meta?.deadlineAt as number | undefined;
       const storedVersion = meta?.stageCodeVersion as string | undefined;
+      const storedArtifactPrefix = meta?.artifactPrefix as string | undefined;
       const poll = await transport.poll(taskId);
 
       // Revision 3/4: the broker forgot this task (restart). First check for a
@@ -131,6 +167,12 @@ export function defineRemoteStage(
       // Only if no durable report exists do we re-register and let a worker
       // pick up the task again.
       if (poll.state === "unknown") {
+        // B1: Deadline check runs FIRST — before any I/O. If deadline has
+        // passed, fail immediately instead of re-registering forever.
+        if (storedDeadlineAt !== undefined && nowMs() > storedDeadlineAt) {
+          return { ready: false, error: "remote activity deadline exceeded" };
+        }
+
         try {
           const payloadKey =
             (meta?.payloadKey as string | undefined) ??
@@ -150,12 +192,18 @@ export function defineRemoteStage(
           // calling broker.report(), so if the broker restarts after the worker
           // completed we can recover the outcome without re-running the work.
           const durableReportKey = `${payload.artifactPrefix}/${taskId}/report.json`;
+
+          // B1: Validate durable report with ActivityReportSchema.safeParse.
+          // Corrupt/forged blobs fall through to re-register (not complete, not fail).
           let durableReport: ActivityReport | undefined;
           try {
-            const loaded =
-              await ctx.storage.load<ActivityReport>(durableReportKey);
-            if (loaded && typeof loaded === "object" && "outcome" in loaded) {
-              durableReport = loaded as ActivityReport;
+            const rawLoaded = await ctx.storage.load<unknown>(durableReportKey);
+            if (rawLoaded !== undefined && rawLoaded !== null) {
+              const schemaParsed = ActivityReportSchema.safeParse(rawLoaded);
+              if (schemaParsed.success) {
+                durableReport = schemaParsed.data;
+              }
+              // If parse fails: fall through to re-register (corrupt blob is treated as absent)
             }
           } catch {
             // Key absent or unreadable — fall through to re-register.
@@ -178,24 +226,32 @@ export function defineRemoteStage(
               return { ready: false, error: outcome.error };
 
             // Strict trust gate — same as the normal "reported" path.
-            const parsed = real.outputSchema.safeParse(outcome.output);
-            if (!parsed.success) {
+            const outputParsed = real.outputSchema.safeParse(outcome.output);
+            if (outputParsed.success) {
+              // B3: Validate output key scope in durable-report path.
+              const grantPrefix = `${payload.artifactPrefix}/${taskId}/`;
+              const scopeError = validateOutputKeyScope(
+                outputParsed.data,
+                grantPrefix,
+                opts.ownedKeyPrefixes ?? ["workflow-v2/", "remote-activity/"],
+              );
+              if (scopeError) return { ready: false, error: scopeError };
+
+              const cm = outcome.customMetrics;
               return {
-                ready: false,
-                error: `remote output failed schema validation: ${parsed.error.message}`,
+                ready: true,
+                output: outputParsed.data,
+                metrics: cm
+                  ? { startTime: 0, endTime: 0, duration: 0, ...cm }
+                  : undefined,
               };
             }
-            const cm = outcome.customMetrics;
-            return {
-              ready: true,
-              output: parsed.data,
-              metrics: cm
-                ? { startTime: 0, endTime: 0, duration: 0, ...cm }
-                : undefined,
-            };
+            // B1: Output schema failure in durable-report path → fall through
+            // to re-register (not a terminal error).
           }
 
-          // No durable report — re-register the task so a worker picks it up.
+          // No valid durable report (absent, corrupt, or output schema failed) —
+          // re-register the task so a worker picks it up.
           await transport.submit({
             workflowRunId: ctx.workflowRunId,
             stageId: ctx.stageId,
@@ -267,6 +323,18 @@ export function defineRemoteStage(
           error: `remote output failed schema validation: ${parsed.error.message}`,
         };
       }
+
+      // B3: Validate output key scope in the normal "reported" path.
+      if (storedArtifactPrefix) {
+        const grantPrefix = `${storedArtifactPrefix}/${taskId}/`;
+        const scopeError = validateOutputKeyScope(
+          parsed.data,
+          grantPrefix,
+          opts.ownedKeyPrefixes ?? ["workflow-v2/", "remote-activity/"],
+        );
+        if (scopeError) return { ready: false, error: scopeError };
+      }
+
       const cm = outcome.customMetrics;
       return {
         ready: true,
