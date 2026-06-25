@@ -13,4 +13,4 @@ Run a workflow stage's `execute()` on a separate, disposable worker machine that
 - **Lease renewal** (heartbeat) and **durable reports** so a completed activity survives an orchestrator restart without re-running expensive work.
 - **Deploy safety** via per-task version pinning, a **prefix-validated** artifact-key boundary (confused-deputy prevention), **per-stage routing** (`createRoutingExecutor`), and a blocking `createRemoteExecutor` for the in-core `ActivityExecutor` port.
 
-See the package README and `RFC-REMOTE-ACTIVITY-WORKERS.md`.
+See the package README for the full quickstart and API reference.

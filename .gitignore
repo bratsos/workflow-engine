@@ -42,3 +42,8 @@ docs/
 
 # Conductor
 .context/
+
+# Agent scratch / working artifacts (RFCs, specs, plans created while pairing
+# with agents do NOT belong in the repo — only READMEs and skills do)
+.superpowers/
+.claude/

@@ -8,4 +8,4 @@ The `ActivityExecutor` port (`src/kernel/ports.ts`) lets the kernel's `job.execu
 
 Also exports `createLocalExecutor` and `createRoutingExecutor` from `@bratsos/workflow-engine/kernel` so that `@bratsos/workflow-engine-host-remote` can inject a `RemoteExecutor` (or a `RoutingExecutor` that routes specific stage IDs remotely and all others locally) without touching the kernel internals.
 
-The port is designed so that `@bratsos/workflow-engine-host-remote`'s `createRemoteExecutor` can implement it directly: submit work to a broker, block until the worker reports, and return an `ActivityRunResult`. This is Phase 2 of the remote-activity-workers design (RFC-REMOTE-ACTIVITY-WORKERS.md § Phase 2).
+The port is designed so that `@bratsos/workflow-engine-host-remote`'s `createRemoteExecutor` can implement it directly: submit work to a broker, block until the worker reports, and return an `ActivityRunResult`. This is the executor-port phase of the remote-activity-workers design.
