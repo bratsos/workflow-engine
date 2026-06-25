@@ -1,6 +1,6 @@
 {
   "name": "@bratsos/workflow-engine-host-remote",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Credential-free remote activity workers for @bratsos/workflow-engine",
   "type": "module",
   "license": "MIT",
