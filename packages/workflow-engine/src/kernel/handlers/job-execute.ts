@@ -8,9 +8,10 @@
  *                       outbox event in one transaction. Commits
  *                       immediately so RUNNING is visible.
  *
- *   Phase 2 (Execute):  run stageDef.execute() outside any database
- *                       transaction. Progress events are collected
- *                       in memory.
+ *   Phase 2 (Execute):  run stageDef.execute() via deps.executor.run()
+ *                       outside any database transaction. Progress events,
+ *                       annotations, and buffered logs are returned in the
+ *                       ActivityRunResult.
  *
  *   Phase 3 (Complete): update stage to COMPLETED/SUSPENDED/FAILED +
  *                       write completion outbox event (and progress
@@ -22,28 +23,21 @@
  * stage stays RUNNING and lease.reapStale will retry the job.
  */
 
-import type { StageContext } from "../../core/stage";
-import type { ProgressUpdate } from "../../core/types";
 import { isSuspendedResult } from "../../core/types";
 import type { Workflow } from "../../core/workflow";
-import type {
-  CreateAnnotationInput,
-  CreateOutboxEventInput,
-} from "../../persistence/interface";
+import type { CreateOutboxEventInput } from "../../persistence/interface";
 import type { JobExecuteCommand, JobExecuteResult } from "../commands";
 import { RunNotRunningError } from "../errors";
 import type { KernelEvent } from "../events";
 import {
   buildAnnotationEvents,
-  createAnnotationBuffer,
-  createStorageShim,
   loadWorkflowContext,
-  normalizeAnnotateArgs,
   resolveExecutionGroupOutput,
   saveStageArtifacts,
   saveStageOutput,
 } from "../helpers/index.js";
 import type { HandlerResult, KernelDeps } from "../kernel";
+import type { ActivityRunResult } from "../ports.js";
 
 // ---------------------------------------------------------------------------
 // Helper: resolve stage input
@@ -169,287 +163,64 @@ export async function handleJobExecute(
   });
 
   // ── Phase 2: Execute (no transaction) ────────────────────────────
-  // The stage's execute() function runs outside any database
-  // transaction.  Progress events are collected in memory and
-  // written to the outbox in Phase 3.
+  // The stage's execute() function runs through deps.executor.run().
+  // Progress events, annotations, and any buffered logs are returned
+  // in the ActivityRunResult. A throw from executor.run() itself
+  // (infra error) still propagates so the idempotency key is released.
 
-  const progressEvents: KernelEvent[] = [];
+  const rawInput = resolveStageInput(
+    workflow,
+    stageId,
+    workflowRun,
+    workflowContext,
+  );
 
-  // Buffer declared outside the try block so the failure-path catch can
-  // still flush any annotations the stage recorded before the throw.
-  const annotationBuffer = createAnnotationBuffer();
-
+  let run: ActivityRunResult;
   try {
-    // Resolve and validate input
-    const rawInput = resolveStageInput(
-      workflow,
-      stageId,
-      workflowRun,
-      workflowContext,
-    );
-    const validatedInput = stageDef.inputSchema.parse(rawInput);
-
-    // Parse config
-    let stageConfig = (config as any)[stageId] || {};
-    try {
-      if (stageDef.configSchema) {
-        stageConfig = stageDef.configSchema.parse(stageConfig);
-      }
-    } catch {
-      // Fall back to raw config on parse failure
-    }
-
-    // Build log function (fire-and-forget, no transaction needed)
-    const logFn = async (
-      level: any,
-      message: string,
-      meta?: Record<string, unknown>,
-    ) => {
-      await deps.persistence
-        .createLog({
-          workflowRunId,
-          workflowStageId: stageRecord.id,
-          level: level as any,
-          message,
-          metadata: meta,
-        })
-        .catch(() => {});
-    };
-
-    // Stage annotate function: pushes to the buffer declared above.
-    // Flushed inside the Phase 3 transaction so annotations persist
-    // atomically with the stage outcome (or are dropped if the
-    // transaction rolls back). Supports all three call forms (TypedKey,
-    // string, batch) via the shared normalizer.
-    const annotateFn = ((...args: unknown[]) => {
-      const stageScopeFields = {
+    run = await deps.executor.run(
+      {
+        stageDef,
+        workflowId,
         workflowRunId,
-        workflowStageRecordId: stageRecord.id,
-        attempt: stageRecord.attempt,
-        scope: "stage" as const,
-        scopeId: stageId,
-      };
-      for (const { key, value, opts } of normalizeAnnotateArgs(args)) {
-        // Skip undefined values — OTel pattern lets callers write
-        // ctx.annotate("x.id", maybeId) without guarding.
-        if (value === undefined || value === null) continue;
-        annotationBuffer.push({
-          ...stageScopeFields,
-          actor: opts?.actor,
-          key,
-          value,
-          payload: opts?.payload,
-          idempotencyKey: opts?.idempotencyKey,
-          emitEvent: opts?.emitEvent,
-        } satisfies CreateAnnotationInput);
-      }
-    }) as StageContext<any, any, any>["annotate"];
-
-    // Build context
-    const context: StageContext<any, any, any> = {
-      workflowRunId,
-      stageId,
-      stageNumber: stageRecord.stageNumber,
-      stageName: stageDef.name,
-      stageRecordId: stageRecord.id,
-      input: validatedInput,
-      config: stageConfig,
-      resumeState: stageRecord.suspendedState as any,
-      onProgress: (update: ProgressUpdate) => {
-        progressEvents.push({
-          type: "stage:progress",
-          timestamp: deps.clock.now(),
-          workflowRunId,
-          stageId,
-          progress: update.progress,
-          message: update.message,
-          details: update.details,
-        });
-      },
-      onLog: logFn,
-      log: logFn,
-      annotate: annotateFn,
-      storage: createStorageShim(workflowRunId, workflowRun.workflowType, deps),
-      workflowContext,
-    };
-
-    // Execute the stage — this is the potentially long-running part
-    const result = await stageDef.execute(context);
-
-    // Re-check run status — the run may have been cancelled during execution
-    const currentRunStatus = await deps.persistence.getRunStatus(workflowRunId);
-    if (currentRunStatus !== "RUNNING") {
-      return {
-        outcome: "failed" as const,
-        ghost: true,
-        error: `Run ${workflowRunId} was ${currentRunStatus} after stage execution — result discarded`,
-        _events: [],
-      };
-    }
-
-    // ── Phase 3a: Complete transaction (success) ─────────────────
-    if (isSuspendedResult(result)) {
-      const { state, pollConfig, metrics } = result;
-      const nextPollAt = new Date(
-        pollConfig.nextPollAt?.getTime() ??
-          deps.clock.now().getTime() + (pollConfig.pollInterval || 60000),
-      );
-
-      const bufferedAnnotations = annotationBuffer.flush();
-      try {
-        await deps.persistence.withTransaction(async (tx) => {
-          // Status guard: if cancel committed between the ghost check
-          // and this transaction, abort to roll back atomically.
-          const currentStatus = await tx.getRunStatus(workflowRunId);
-          if (currentStatus !== "RUNNING") {
-            throw new RunNotRunningError(
-              workflowRunId,
-              currentStatus ?? "DELETED",
-            );
-          }
-
-          await tx.updateStage(stageRecord.id, {
-            status: "SUSPENDED",
-            suspendedState: state as any,
-            nextPollAt,
-            pollInterval: pollConfig.pollInterval,
-            maxWaitUntil: pollConfig.maxWaitTime
-              ? new Date(deps.clock.now().getTime() + pollConfig.maxWaitTime)
-              : undefined,
-            metrics: metrics as any,
-          });
-
-          if (bufferedAnnotations.length > 0) {
-            await tx.appendAnnotations(bufferedAnnotations);
-          }
-
-          const suspendedEvent: KernelEvent = {
-            type: "stage:suspended",
-            timestamp: deps.clock.now(),
-            workflowRunId,
-            stageId,
-            stageName: stageDef.name,
-            nextPollAt,
-          };
-
-          await tx.appendOutboxEvents(
-            toOutboxEvents(workflowRunId, causationId, [
-              ...progressEvents,
-              suspendedEvent,
-              ...buildAnnotationEvents(bufferedAnnotations, deps.clock.now()),
-            ]),
-          );
-        });
-      } catch (txError) {
-        if (txError instanceof RunNotRunningError) {
-          return {
-            outcome: "failed" as const,
-            ghost: true,
-            error: txError.message,
-            _events: [],
-          };
-        }
-        throw txError;
-      }
-
-      return { outcome: "suspended" as const, nextPollAt, _events: [] };
-    } else {
-      const duration = deps.clock.now().getTime() - startTime;
-
-      // Save output to blob store (not a DB operation)
-      const outputKey = await saveStageOutput(
-        workflowRunId,
-        workflowRun.workflowType,
+        workflowType: workflowRun.workflowType,
         stageId,
-        result.output,
-        deps,
-      );
-      const artifactKeys =
-        result.artifacts && Object.keys(result.artifacts).length > 0
-          ? await saveStageArtifacts(
-              workflowRunId,
-              workflowRun.workflowType,
-              stageId,
-              result.artifacts,
-              deps,
-            )
-          : undefined;
+        stageName: stageDef.name,
+        stageNumber: stageRecord.stageNumber,
+        stageRecordId: stageRecord.id,
+        attempt: stageRecord.attempt,
+        rawInput,
+        config: config as Record<string, unknown>,
+        resumeState: stageRecord.suspendedState,
+        workflowContext,
+      },
+      deps,
+    );
+  } catch (infraError) {
+    // executor.run itself threw (infra / transport failure — not a stage-body
+    // error). Re-throw so the kernel releases the idempotency key.
+    throw infraError;
+  }
 
-      const bufferedAnnotations = annotationBuffer.flush();
-      try {
-        await deps.persistence.withTransaction(async (tx) => {
-          const currentStatus = await tx.getRunStatus(workflowRunId);
-          if (currentStatus !== "RUNNING") {
-            throw new RunNotRunningError(
-              workflowRunId,
-              currentStatus ?? "DELETED",
-            );
-          }
+  // Write buffered logs (LocalExecutor returns [] — no-op for local path)
+  for (const logEntry of run.logs) {
+    await deps.persistence
+      .createLog({
+        workflowRunId,
+        workflowStageId: stageRecord.id,
+        level: logEntry.level as any,
+        message: logEntry.message,
+        metadata: logEntry.meta,
+      })
+      .catch(() => {});
+  }
 
-          await tx.updateStage(stageRecord.id, {
-            status: "COMPLETED",
-            completedAt: deps.clock.now(),
-            duration,
-            outputData: {
-              _artifactKey: outputKey,
-              ...(artifactKeys ? { _artifactKeys: artifactKeys } : {}),
-            } as any,
-            metrics: result.metrics as any,
-            embeddingInfo: result.embeddings as any,
-          });
+  // ── Dispatch on run result ────────────────────────────────────────
 
-          if (bufferedAnnotations.length > 0) {
-            await tx.appendAnnotations(bufferedAnnotations);
-          }
-
-          const completedEvent: KernelEvent = {
-            type: "stage:completed",
-            timestamp: deps.clock.now(),
-            workflowRunId,
-            stageId,
-            stageName: stageDef.name,
-            duration,
-          };
-
-          await tx.appendOutboxEvents(
-            toOutboxEvents(workflowRunId, causationId, [
-              ...progressEvents,
-              completedEvent,
-              ...buildAnnotationEvents(bufferedAnnotations, deps.clock.now()),
-            ]),
-          );
-        });
-      } catch (txError) {
-        if (txError instanceof RunNotRunningError) {
-          return {
-            outcome: "failed" as const,
-            ghost: true,
-            error: txError.message,
-            _events: [],
-          };
-        }
-        throw txError;
-      }
-
-      return {
-        outcome: "completed" as const,
-        output: result.output,
-        _events: [],
-      };
-    }
-  } catch (error) {
-    // ── Phase 3b: Complete transaction (failure) ─────────────────
-    // The stage's execute() threw. Write FAILED status + outbox
-    // event.  If Phase 3 itself fails, re-throw the original error
-    // so the idempotency key is released and the job can be retried.
-    const errorMessage = error instanceof Error ? error.message : String(error);
+  if (run.error !== undefined) {
+    // Stage body threw; treat as Phase 3b failure (same path as the old catch block)
+    const errorMessage = run.error;
     const duration = deps.clock.now().getTime() - startTime;
-
-    // Flush any annotations recorded before the throw so they persist
-    // alongside the FAILED stage outcome. If the failure transaction
-    // itself rolls back, the buffer (already drained here) is lost —
-    // matching the all-or-nothing semantics of the outbox events.
-    const bufferedAnnotations = annotationBuffer.flush();
+    const bufferedAnnotations = run.annotations;
     try {
       await deps.persistence.withTransaction(async (tx) => {
         const currentStatus = await tx.getRunStatus(workflowRunId);
@@ -482,7 +253,7 @@ export async function handleJobExecute(
 
         await tx.appendOutboxEvents(
           toOutboxEvents(workflowRunId, causationId, [
-            ...progressEvents,
+            ...run.progress,
             failedEvent,
             ...buildAnnotationEvents(bufferedAnnotations, deps.clock.now()),
           ]),
@@ -490,9 +261,6 @@ export async function handleJobExecute(
       });
     } catch (txError) {
       if (txError instanceof RunNotRunningError) {
-        // Run was cancelled mid-failure-flow. Treat as ghost; the
-        // stage stays RUNNING and run.cancel's cascade has already
-        // handled (or will handle) cleanup.
         return {
           outcome: "failed" as const,
           ghost: true,
@@ -501,9 +269,9 @@ export async function handleJobExecute(
         };
       }
       // Phase 3 itself failed for some other reason. Stage stays
-      // RUNNING. Re-throw the original error so the idempotency key
-      // is released and lease.reapStale can retry the job.
-      throw error;
+      // RUNNING. Re-throw so the idempotency key is released and
+      // lease.reapStale can retry the job.
+      throw txError;
     }
 
     await deps.persistence
@@ -516,5 +284,168 @@ export async function handleJobExecute(
       .catch(() => {});
 
     return { outcome: "failed" as const, error: errorMessage, _events: [] };
+  }
+
+  // Stage body succeeded — re-check run status (cancellation guard)
+  const currentRunStatus = await deps.persistence.getRunStatus(workflowRunId);
+  if (currentRunStatus !== "RUNNING") {
+    return {
+      outcome: "failed" as const,
+      ghost: true,
+      error: `Run ${workflowRunId} was ${currentRunStatus} after stage execution — result discarded`,
+      _events: [],
+    };
+  }
+
+  // ── Phase 3a: Complete transaction (success) ─────────────────────
+  if (isSuspendedResult(run.result!)) {
+    const { state, pollConfig, metrics } = run.result!;
+    const nextPollAt = new Date(
+      pollConfig.nextPollAt?.getTime() ??
+        deps.clock.now().getTime() + (pollConfig.pollInterval || 60000),
+    );
+
+    const bufferedAnnotations = run.annotations;
+    try {
+      await deps.persistence.withTransaction(async (tx) => {
+        // Status guard: if cancel committed between the ghost check
+        // and this transaction, abort to roll back atomically.
+        const currentStatus = await tx.getRunStatus(workflowRunId);
+        if (currentStatus !== "RUNNING") {
+          throw new RunNotRunningError(
+            workflowRunId,
+            currentStatus ?? "DELETED",
+          );
+        }
+
+        await tx.updateStage(stageRecord.id, {
+          status: "SUSPENDED",
+          suspendedState: state as any,
+          nextPollAt,
+          pollInterval: pollConfig.pollInterval,
+          maxWaitUntil: pollConfig.maxWaitTime
+            ? new Date(deps.clock.now().getTime() + pollConfig.maxWaitTime)
+            : undefined,
+          metrics: metrics as any,
+        });
+
+        if (bufferedAnnotations.length > 0) {
+          await tx.appendAnnotations(bufferedAnnotations);
+        }
+
+        const suspendedEvent: KernelEvent = {
+          type: "stage:suspended",
+          timestamp: deps.clock.now(),
+          workflowRunId,
+          stageId,
+          stageName: stageDef.name,
+          nextPollAt,
+        };
+
+        await tx.appendOutboxEvents(
+          toOutboxEvents(workflowRunId, causationId, [
+            ...run.progress,
+            suspendedEvent,
+            ...buildAnnotationEvents(bufferedAnnotations, deps.clock.now()),
+          ]),
+        );
+      });
+    } catch (txError) {
+      if (txError instanceof RunNotRunningError) {
+        return {
+          outcome: "failed" as const,
+          ghost: true,
+          error: txError.message,
+          _events: [],
+        };
+      }
+      throw txError;
+    }
+
+    return { outcome: "suspended" as const, nextPollAt, _events: [] };
+  } else {
+    const result = run.result!;
+    const duration = deps.clock.now().getTime() - startTime;
+
+    // Save output to blob store (not a DB operation)
+    const outputKey = await saveStageOutput(
+      workflowRunId,
+      workflowRun.workflowType,
+      stageId,
+      result.output,
+      deps,
+    );
+    const artifactKeys =
+      result.artifacts && Object.keys(result.artifacts).length > 0
+        ? await saveStageArtifacts(
+            workflowRunId,
+            workflowRun.workflowType,
+            stageId,
+            result.artifacts,
+            deps,
+          )
+        : undefined;
+
+    const bufferedAnnotations = run.annotations;
+    try {
+      await deps.persistence.withTransaction(async (tx) => {
+        const currentStatus = await tx.getRunStatus(workflowRunId);
+        if (currentStatus !== "RUNNING") {
+          throw new RunNotRunningError(
+            workflowRunId,
+            currentStatus ?? "DELETED",
+          );
+        }
+
+        await tx.updateStage(stageRecord.id, {
+          status: "COMPLETED",
+          completedAt: deps.clock.now(),
+          duration,
+          outputData: {
+            _artifactKey: outputKey,
+            ...(artifactKeys ? { _artifactKeys: artifactKeys } : {}),
+          } as any,
+          metrics: result.metrics as any,
+          embeddingInfo: result.embeddings as any,
+        });
+
+        if (bufferedAnnotations.length > 0) {
+          await tx.appendAnnotations(bufferedAnnotations);
+        }
+
+        const completedEvent: KernelEvent = {
+          type: "stage:completed",
+          timestamp: deps.clock.now(),
+          workflowRunId,
+          stageId,
+          stageName: stageDef.name,
+          duration,
+        };
+
+        await tx.appendOutboxEvents(
+          toOutboxEvents(workflowRunId, causationId, [
+            ...run.progress,
+            completedEvent,
+            ...buildAnnotationEvents(bufferedAnnotations, deps.clock.now()),
+          ]),
+        );
+      });
+    } catch (txError) {
+      if (txError instanceof RunNotRunningError) {
+        return {
+          outcome: "failed" as const,
+          ghost: true,
+          error: txError.message,
+          _events: [],
+        };
+      }
+      throw txError;
+    }
+
+    return {
+      outcome: "completed" as const,
+      output: result.output,
+      _events: [],
+    };
   }
 }

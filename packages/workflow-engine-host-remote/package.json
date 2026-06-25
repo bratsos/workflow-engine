@@ -1,0 +1,47 @@
+{
+  "name": "@bratsos/workflow-engine-host-remote",
+  "version": "0.0.0",
+  "description": "Credential-free remote activity workers for @bratsos/workflow-engine",
+  "type": "module",
+  "license": "MIT",
+  "author": "Alex Bratsos",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bratsos/workflow-engine",
+    "directory": "packages/workflow-engine-host-remote"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@bratsos/workflow-engine": "workspace:*",
+    "aws4fetch": "^1.0.20",
+    "zod": "^4.1.12"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "tsup": "^8.5.1",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4"
+  },
+  "engines": {
+    "node": ">=22.11.0"
+  }
+}
