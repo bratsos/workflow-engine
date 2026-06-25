@@ -4,7 +4,7 @@ description: Guide for @bratsos/workflow-engine - a type-safe workflow engine wi
 license: MIT
 metadata:
   author: bratsos
-  version: "0.3.0"
+  version: "0.4.0"
   repository: https://github.com/bratsos/workflow-engine
 ---
 
@@ -23,6 +23,7 @@ The engine follows a **kernel + host** pattern:
 - **Core library** (`@bratsos/workflow-engine`) - Command kernel, stage/workflow definitions, persistence adapters
 - **Node Host** (`@bratsos/workflow-engine-host-node`) - Long-running worker with polling loops and signal handling
 - **Serverless Host** (`@bratsos/workflow-engine-host-serverless`) - Stateless single-invocation for edge/lambda/workers
+- **Remote Host** (`@bratsos/workflow-engine-host-remote`) - Credential-free remote activity workers: run a stage's `execute()` on a separate, disposable machine (no DB connection, no root object-store credentials)
 
 The **kernel** is a pure command dispatcher. All workflow operations are expressed as typed commands dispatched via `kernel.dispatch()`. Hosts wrap the kernel with environment-specific process management.
 
@@ -35,6 +36,7 @@ The **kernel** is a pure command dispatcher. All workflow operations are express
 - User is building multi-stage data processing pipelines
 - User mentions kernel, command dispatch, or job execution
 - User wants to set up a Node.js worker or serverless worker
+- User wants to run a stage on a separate / remote / disposable machine, or mentions credential-free workers, `defineRemoteStage`, the `ActivityExecutor` port, or offloading heavy stages (transcoding, ffmpeg, batch inference)
 - User wants to rerun a workflow from a specific stage
 - User needs to test workflows with in-memory adapters
 
@@ -111,6 +113,8 @@ await kernel.dispatch({
 | `createKernel` | Function | `@bratsos/workflow-engine/kernel` | Create command kernel |
 | `createNodeHost` | Function | `@bratsos/workflow-engine-host-node` | Create Node.js host |
 | `createServerlessHost` | Function | `@bratsos/workflow-engine-host-serverless` | Create serverless host |
+| `defineRemoteStage` / `createActivityWorker` | Function | `@bratsos/workflow-engine-host-remote` | Run a stage on a credential-free remote worker (see 11-remote-activity-workers.md) |
+| `createRoutingExecutor` / `createLocalExecutor` | Function | `@bratsos/workflow-engine/kernel` | `ActivityExecutor` port: route specific stages to a remote executor / default in-process executor |
 | `createAIHelper` | Function | `@bratsos/workflow-engine` | AI operations (text, object, embed, batch) |
 | `registerEmbeddingProvider` | Function | `@bratsos/workflow-engine` | Register custom embedding providers (Voyage, Cohere, etc.) |
 | `createStageIds` | Function | `@bratsos/workflow-engine` | Create stage ID constants from a workflow |
@@ -249,6 +253,7 @@ const kernel = createKernel({
   scheduler,     // Scheduler port - deferred command triggers
   clock,         // Clock port - injectable time source
   registry,      // WorkflowRegistry - { getWorkflow(id) }
+  // executor,   // optional ActivityExecutor port - defaults to in-process; inject to run stages on remote workers (see 11-remote-activity-workers.md)
 });
 
 // Dispatch typed commands
@@ -350,6 +355,27 @@ const tick = await host.runMaintenanceTick();
 // { claimed, suspendedChecked, staleReleased, eventsFlushed, stuckReaped }
 // Note: resumed suspended stages are automatically followed by run.transition.
 ```
+
+## Remote Activity Workers
+
+Run a stage's `execute()` on a **separate, credential-free machine** (no database connection, no root object-store credentials) via the **`@bratsos/workflow-engine-host-remote`** package. The orchestrator owns all state; a remote worker leases the task, runs the real stage code, writes large artifacts directly to object storage by reference, and reports back — all driven through the engine's existing suspend/resume machinery (no new DB table).
+
+Two wiring models:
+
+- **Proxy stage** (recommended for long stages): `defineRemoteStage(realStage, transport, opts?)` suspends immediately (releasing the kernel job lease) and resumes when the worker reports.
+- **`ActivityExecutor` port** (short stages / in-core routing): inject `createRemoteExecutor(transport)` — or `createRoutingExecutor({ remote, remoteStageIds })` to route only specific stages — via `createKernel({ executor })`. Backward-compatible: the default `createLocalExecutor()` is byte-for-byte the in-process behavior.
+
+```typescript
+import { defineRemoteStage } from "@bratsos/workflow-engine-host-remote";
+
+// Orchestrator: wrap a heavy stage so it runs on a remote worker
+const workflow = new WorkflowBuilder(...)
+  .pipe(defineRemoteStage(heavyStage, oTransport, { maxWaitMs: 3_600_000, stageCodeVersion: "v1" }))
+  .pipe(coreStage)
+  .build();
+```
+
+The worker runs in a separate process/machine with **zero standing credentials** (`createActivityWorker` + `createHttpWorkerTransport`), receiving a presigned URL per artifact. See [`references/11-remote-activity-workers.md`](references/11-remote-activity-workers.md) for the worker, broker, HTTP transport, S3/R2 artifacts, durability, and limitations.
 
 ## Annotations (Provenance)
 
@@ -502,6 +528,7 @@ await kernel.dispatch({ type: "run.transition", workflowRunId: job.workflowRunId
 - [08-common-patterns.md](references/08-common-patterns.md) - Kernel patterns & best practices
 - [09-troubleshooting.md](references/09-troubleshooting.md) - Debugging stuck runs, P2002 errors, ghost jobs
 - [10-annotations.md](references/10-annotations.md) - First-class provenance surface: `ctx.annotate`, `kernel.annotations.*`, conventions catalog
+- [11-remote-activity-workers.md](references/11-remote-activity-workers.md) - Credential-free remote workers: `defineRemoteStage`, broker, worker SDK, HTTP transport, S3/R2 artifacts, `ActivityExecutor` port
 
 ## Key Principles
 
@@ -516,3 +543,4 @@ await kernel.dispatch({ type: "run.transition", workflowRunId: job.workflowRunId
 9. **Cost Tracking**: All AI calls automatically track tokens and costs
 10. **BlobStore-Only Artifacts**: All artifact storage goes through the BlobStore port. `run.rerunFrom` cleans up artifacts by key prefix
 11. **Durable Provenance**: `ctx.annotate(...)` writes are buffered and flushed inside the stage-completion transaction. Annotations are atomic with the stage outcome — a stage's annotations either all persist or all roll back together with the stage update and outbox events.
+12. **Pluggable Execution**: stage execution goes through an injectable `ActivityExecutor` port (default in-process `LocalExecutor`). Inject a remote executor — or wrap a stage with `defineRemoteStage` — to run `execute()` on a separate credential-free machine without changing kernel internals.
