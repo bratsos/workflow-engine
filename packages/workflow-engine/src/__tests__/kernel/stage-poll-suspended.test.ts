@@ -450,6 +450,172 @@ describe("kernel: stage.pollSuspended", () => {
     expect(updatedRun!.status).toBe("FAILED");
   });
 
+  it("fails a suspended stage that exceeded maxWaitUntil instead of polling forever", async () => {
+    const schema = z.object({ data: z.string() });
+
+    const stage = defineAsyncBatchStage({
+      id: "batch-stage",
+      name: "Batch Stage",
+      mode: "async-batch",
+      schemas: {
+        input: schema,
+        output: z.object({ result: z.string() }),
+        config: z.object({}),
+      },
+      async execute() {
+        return {
+          suspended: true,
+          state: { batchId: "batch-1" },
+          pollConfig: {
+            pollInterval: 1000,
+            maxWaitTime: 60000,
+            nextPollAt: new Date(Date.now() + 1000),
+          },
+        };
+      },
+      // Never reports ready or an error — the provider is permanently
+      // stuck. Without maxWaitUntil enforcement this stage (and the run)
+      // would poll forever.
+      async checkCompletion() {
+        return { ready: false, nextCheckIn: 30000 };
+      },
+    });
+
+    const workflow = new WorkflowBuilder(
+      "test-workflow",
+      "Test",
+      "Test",
+      schema,
+      z.object({ result: z.string() }),
+    )
+      .pipe(stage)
+      .build();
+
+    const { kernel, persistence, clock } = createTestKernel([workflow]);
+
+    const run = await persistence.createRun({
+      workflowId: "test-workflow",
+      workflowName: "Test",
+      workflowType: "test-workflow",
+      input: { data: "hello" },
+    });
+
+    await persistence.updateRun(run.id, { status: "RUNNING" });
+
+    await persistence.createStage({
+      workflowRunId: run.id,
+      stageId: "batch-stage",
+      stageName: "Batch Stage",
+      stageNumber: 1,
+      executionGroup: 1,
+      status: "SUSPENDED",
+      startedAt: clock.now(),
+    });
+
+    const stages = await persistence.getStagesByRun(run.id);
+    await persistence.updateStage(stages[0]!.id, {
+      suspendedState: { batchId: "batch-1" },
+      nextPollAt: new Date(clock.now().getTime() - 1000),
+      pollInterval: 1000,
+      // Deadline already passed.
+      maxWaitUntil: new Date(clock.now().getTime() - 500),
+    });
+
+    const result = await kernel.dispatch({
+      type: "stage.pollSuspended",
+    });
+
+    expect(result.checked).toBe(1);
+    expect(result.resumed).toBe(0);
+    expect(result.failed).toBe(1);
+
+    const updatedStage = await persistence.getStage(run.id, "batch-stage");
+    expect(updatedStage?.status).toBe("FAILED");
+    expect(updatedStage?.errorMessage).toMatch(/maxWaitUntil/);
+
+    const updatedRun = await persistence.getRun(run.id);
+    expect(updatedRun!.status).toBe("FAILED");
+  });
+
+  it("reschedules (does not time out) when nextPollAt has passed but maxWaitUntil has not", async () => {
+    const schema = z.object({ data: z.string() });
+
+    const stage = defineAsyncBatchStage({
+      id: "batch-stage",
+      name: "Batch Stage",
+      mode: "async-batch",
+      schemas: {
+        input: schema,
+        output: z.object({ result: z.string() }),
+        config: z.object({}),
+      },
+      async execute() {
+        return {
+          suspended: true,
+          state: { batchId: "batch-1" },
+          pollConfig: {
+            pollInterval: 1000,
+            maxWaitTime: 60000,
+            nextPollAt: new Date(Date.now() + 1000),
+          },
+        };
+      },
+      async checkCompletion() {
+        return { ready: false, nextCheckIn: 5000 };
+      },
+    });
+
+    const workflow = new WorkflowBuilder(
+      "test-workflow",
+      "Test",
+      "Test",
+      schema,
+      z.object({ result: z.string() }),
+    )
+      .pipe(stage)
+      .build();
+
+    const { kernel, persistence, clock } = createTestKernel([workflow]);
+
+    const run = await persistence.createRun({
+      workflowId: "test-workflow",
+      workflowName: "Test",
+      workflowType: "test-workflow",
+      input: { data: "hello" },
+    });
+
+    await persistence.updateRun(run.id, { status: "RUNNING" });
+
+    await persistence.createStage({
+      workflowRunId: run.id,
+      stageId: "batch-stage",
+      stageName: "Batch Stage",
+      stageNumber: 1,
+      executionGroup: 1,
+      status: "SUSPENDED",
+      startedAt: clock.now(),
+    });
+
+    const stages = await persistence.getStagesByRun(run.id);
+    await persistence.updateStage(stages[0]!.id, {
+      suspendedState: { batchId: "batch-1" },
+      nextPollAt: new Date(clock.now().getTime() - 1000),
+      pollInterval: 1000,
+      // Deadline is well in the future.
+      maxWaitUntil: new Date(clock.now().getTime() + 60000),
+    });
+
+    const result = await kernel.dispatch({
+      type: "stage.pollSuspended",
+    });
+
+    expect(result.resumed).toBe(0);
+    expect(result.failed).toBe(0);
+
+    const updatedStage = await persistence.getStage(run.id, "batch-stage");
+    expect(updatedStage?.status).toBe("SUSPENDED");
+  });
+
   it("does not complete a stage if the run is cancelled during checkCompletion", async () => {
     const schema = z.object({ data: z.string() });
     let kernelRef: Kernel;

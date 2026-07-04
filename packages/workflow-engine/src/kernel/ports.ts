@@ -26,6 +26,7 @@ import type {
   CreateStageInput,
   DequeueResult,
   EnqueueJobInput,
+  JobRecord,
   OutboxRecord,
   Status,
   UpdateRunInput,
@@ -51,6 +52,7 @@ export type {
   DequeueResult,
   EnqueueJobInput,
   IdempotencyRecord,
+  JobRecord,
   OutboxRecord,
   Status,
   UpdateRunInput,
@@ -181,10 +183,15 @@ export interface Persistence {
 
   // -- Idempotency operations -----------------------------------------------
 
-  /** Atomically acquire an idempotency key for command execution. */
+  /**
+   * Atomically acquire an idempotency key for command execution. Pass
+   * `staleInProgressAfterMs` to allow reclaiming a key stuck `in_progress`
+   * for at least that long (see `WorkflowPersistence.acquireIdempotencyKey`).
+   */
   acquireIdempotencyKey(
     key: string,
     commandType: string,
+    options?: { now?: Date; staleInProgressAfterMs?: number },
   ): Promise<
     | { status: "acquired" }
     | { status: "replay"; result: unknown }
@@ -245,16 +252,20 @@ export interface JobTransport {
   /** Mark job as failed. */
   fail(jobId: string, error: string, shouldRetry?: boolean): Promise<void>;
 
-  /** Get suspended jobs that are ready to be checked. */
-  getSuspendedJobsReadyToPoll(): Promise<
-    Array<{ jobId: string; stageId: string; workflowRunId: string }>
-  >;
-
   /** Release stale locks (for crashed workers). */
   releaseStaleJobs(staleThresholdMs?: number): Promise<number>;
 
   /** Cancel all pending/suspended jobs for a workflow run. Returns count cancelled. */
   cancelByRun(workflowRunId: string): Promise<number>;
+
+  /**
+   * Get all job rows for a workflow run (any status). Used to detect
+   * pending/in-flight retries for a stage and to find orphaned job rows.
+   */
+  getJobsByWorkflowRun(workflowRunId: string): Promise<JobRecord[]>;
+
+  /** Refresh a running job's lease without changing status. */
+  touchJob(jobId: string): Promise<void>;
 }
 
 // ============================================================================
@@ -323,6 +334,18 @@ export interface ActivityRunInput {
 export interface ActivityRunResult {
   result?: StageResult<unknown> | SuspendedResult;
   error?: string;
+  /** Constructor name of the thrown error (e.g. "ZodError", "TypeError"), when known. */
+  errorName?: string;
+  /** Stack trace of the thrown error, when available — for diagnostics only. */
+  errorStack?: string;
+  /**
+   * Whether the failure is worth retrying. `false` marks a deterministic
+   * failure (e.g. Zod input/config validation) that will fail identically
+   * on every attempt — hosts should fail the job terminally instead of
+   * burning retry attempts. `undefined`/`true` preserves default retry
+   * behavior.
+   */
+  retryable?: boolean;
   progress: KernelEvent[];
   annotations: CreateAnnotationInput[];
   /**

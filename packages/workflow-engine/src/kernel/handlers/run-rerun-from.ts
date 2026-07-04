@@ -80,14 +80,15 @@ export async function handleRunRerunFrom(
   );
   const newAttempt = priorMaxAttempt + 1;
 
-  // 9. Delete blob artifacts for stages being removed (full prefix cleanup)
-  for (const stage of stagesToDelete) {
-    const prefix = `workflow-v2/${run.workflowType}/${workflowRunId}/${stage.stageId}/`;
-    const keys = await deps.blobStore.list(prefix).catch(() => [] as string[]);
-    for (const key of keys) {
-      await deps.blobStore.delete(key).catch(() => {});
-    }
-  }
+  // 9. Collect blob prefixes for stages being removed. Deletion is
+  // deferred to _postCommit (see below) — deleting mid-transaction would
+  // permanently lose the blobs even if the transaction later rolls back
+  // (e.g. a downstream write fails), since blob deletes aren't part of
+  // the DB transaction and can't be undone.
+  const blobPrefixesToDelete = stagesToDelete.map(
+    (stage) =>
+      `workflow-v2/${run.workflowType}/${workflowRunId}/${stage.stageId}/`,
+  );
 
   // 10. Delete stage records
   for (const stage of stagesToDelete) {
@@ -120,18 +121,7 @@ export async function handleRunRerunFrom(
     });
   }
 
-  // 13. Enqueue jobs
-  await deps.jobTransport.enqueueParallel(
-    targetStages.map((stage) => ({
-      workflowRunId,
-      workflowId: run.workflowId,
-      stageId: stage.id,
-      priority: run.priority,
-      payload: { config: run.config || {} },
-    })),
-  );
-
-  // 14. Emit workflow:started event (restarted)
+  // 13. Emit workflow:started event (restarted)
   events.push({
     type: "workflow:started",
     timestamp: deps.clock.now(),
@@ -143,5 +133,31 @@ export async function handleRunRerunFrom(
     fromStageId,
     deletedStages: deletedStageIds,
     _events: events,
+    // Runs only after the transaction above commits: enqueueing jobs
+    // mid-transaction risks an orphan job (tx rolls back after enqueue
+    // succeeds) or a lost job (process crashes after commit but before
+    // enqueue). Deferring to post-commit avoids the orphan case; the
+    // lost-job case is covered by run.reapStuck's PENDING-without-job
+    // recovery sweep.
+    _postCommit: async (postDeps) => {
+      for (const prefix of blobPrefixesToDelete) {
+        const keys = await postDeps.blobStore
+          .list(prefix)
+          .catch(() => [] as string[]);
+        for (const key of keys) {
+          await postDeps.blobStore.delete(key).catch(() => {});
+        }
+      }
+
+      await postDeps.jobTransport.enqueueParallel(
+        targetStages.map((stage) => ({
+          workflowRunId,
+          workflowId: run.workflowId,
+          stageId: stage.id,
+          priority: run.priority,
+          payload: { config: run.config || {} },
+        })),
+      );
+    },
   };
 }

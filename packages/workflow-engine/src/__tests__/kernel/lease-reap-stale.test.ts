@@ -96,6 +96,7 @@ describe("kernel: lease.reapStale", () => {
     // Enqueue and dequeue a job (making it "locked")
     await jobTransport.enqueue({
       workflowRunId: "run-1",
+      workflowId: "test-workflow",
       stageId: "stage-1",
       priority: 5,
     });

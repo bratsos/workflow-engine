@@ -201,7 +201,7 @@ describe("kernel: idempotency", () => {
     expect(result1.output).toEqual({ result: "HELLO" });
   });
 
-  it("job.execute without idempotencyKey always executes", async () => {
+  it("job.execute without idempotencyKey does not re-execute a COMPLETED stage", async () => {
     const schema = z.object({ data: z.string() });
     let executionCount = 0;
     const stage = defineStage({
@@ -252,10 +252,11 @@ describe("kernel: idempotency", () => {
     expect(result1.outcome).toBe("completed");
     expect(executionCount).toBe(1);
 
-    // Second execution without idempotency key -- the stage is already COMPLETED
-    // so the handler runs again (not cached) but may fail since the stage is done.
-    // The key assertion is that the handler actually ran (executionCount incremented
-    // or an error was produced), NOT that a cached result was returned.
+    // Second execution without idempotency key -- the stage is already
+    // COMPLETED. This is NOT idempotency-key caching (there is no key)
+    // but the Phase-1 double-execution guard in job-execute: a stale-lease
+    // duplicate delivery of a job whose stage already completed must not
+    // re-run the stage body. It returns the cached output directly.
     const result2 = await kernel.dispatch({
       type: "job.execute",
       workflowRunId: createResult.workflowRunId,
@@ -264,10 +265,9 @@ describe("kernel: idempotency", () => {
       config: {},
     });
 
-    // The handler was invoked again (not cached). It may complete or fail
-    // depending on whether the handler allows re-execution of a completed stage.
-    // Either way execution count went up, proving no caching happened.
-    expect(executionCount).toBe(2);
+    expect(result2.outcome).toBe("completed");
+    expect(result2.output).toEqual(result1.output);
+    expect(executionCount).toBe(1);
   });
 
   it("idempotency key is scoped to commandType", async () => {
@@ -375,6 +375,81 @@ describe("kernel: idempotency", () => {
         input: { data: "hello" },
       }),
     ).rejects.toBeInstanceOf(IdempotencyInProgressError);
+  });
+
+  it("reclaims an in_progress idempotency key after the default 10-minute TTL", async () => {
+    // Simulates a dispatcher that crashed between committing its
+    // transaction and calling completeIdempotencyKey: the key is stuck
+    // `in_progress` with no dispatcher left alive to complete or release
+    // it. Without a TTL reclaim, every future dispatch would throw
+    // IdempotencyInProgressError forever.
+    const workflow = createSimpleWorkflow();
+    const { kernel, persistence, clock } = createTestKernel([workflow]);
+
+    await persistence.acquireIdempotencyKey("crashed-key", "run.create", {
+      now: clock.now(),
+    });
+
+    // Not yet stale -- still rejected.
+    await expect(
+      kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "crashed-key",
+        workflowId: "test-workflow",
+        input: { data: "hello" },
+      }),
+    ).rejects.toBeInstanceOf(IdempotencyInProgressError);
+
+    // Advance past the default 10-minute reclaim threshold.
+    clock.advance(10 * 60 * 1000);
+
+    const result = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "crashed-key",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+    expect(result.status).toBe("PENDING");
+  });
+
+  it("respects a custom idempotencyStaleInProgressMs", async () => {
+    const workflow = createSimpleWorkflow();
+    const persistence = new InMemoryWorkflowPersistence();
+    const blobStore = new InMemoryBlobStore();
+    const jobTransport = new InMemoryJobQueue("test-worker");
+    const eventSink = new CollectingEventSink();
+    const scheduler = new NoopScheduler();
+    const clock = new FakeClock();
+    const registry = new Map<string, Workflow<any, any>>([
+      [workflow.id, workflow],
+    ]);
+
+    const kernel = createKernel({
+      persistence,
+      blobStore,
+      jobTransport,
+      eventSink,
+      scheduler,
+      clock,
+      registry: { getWorkflow: (id) => registry.get(id) },
+      idempotencyStaleInProgressMs: 60 * 1000,
+    });
+
+    await persistence.acquireIdempotencyKey("custom-ttl-key", "run.create", {
+      now: clock.now(),
+    });
+
+    // Advance past the custom 1-minute threshold (but well under the
+    // 10-minute default) -- should already be reclaimable.
+    clock.advance(60 * 1000);
+
+    const result = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "custom-ttl-key",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+    expect(result.status).toBe("PENDING");
   });
 
   it("releases idempotency key when handler throws", async () => {

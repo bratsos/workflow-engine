@@ -170,4 +170,103 @@ describe("kernel: run.reapStuck", () => {
     const run = await persistence.getRun(workflowRunId);
     expect(run!.status).toBe("COMPLETED");
   });
+
+  it("reports transitioned equal to failed (the only transition it performs)", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, clock } = createTestKernel([workflow]);
+
+    await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "key-1",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+    await kernel.dispatch({ type: "run.claimPending", workerId: "w1" });
+
+    clock.advance(10 * 60 * 1000);
+
+    const result = await kernel.dispatch({
+      type: "run.reapStuck",
+      stuckThresholdMs: 5 * 60 * 1000,
+    });
+
+    expect(result.failed).toBe(1);
+    expect(result.transitioned).toBe(1);
+  });
+
+  it("does not double-reap when a concurrent updateRun changed the version first (version guard)", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, persistence, clock } = createTestKernel([workflow]);
+
+    const { workflowRunId } = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "key-race",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+    await kernel.dispatch({ type: "run.claimPending", workerId: "w1" });
+
+    clock.advance(10 * 60 * 1000);
+
+    // Simulate a second host's reaper winning the race: it bumps the
+    // run's version out from under the query snapshot used below.
+    const runBeforeRace = await persistence.getRun(workflowRunId);
+    await persistence.updateRun(workflowRunId, {
+      expectedVersion: runBeforeRace!.version,
+      status: "FAILED",
+      completedAt: clock.now(),
+    });
+
+    const result = await kernel.dispatch({
+      type: "run.reapStuck",
+      stuckThresholdMs: 5 * 60 * 1000,
+    });
+
+    // The run is already FAILED (status guard), so this host's reap is a
+    // no-op — it must not throw or double-count.
+    expect(result.failed).toBe(0);
+    expect(result.transitioned).toBe(0);
+  });
+
+  it("re-enqueues a PENDING stage with no matching job instead of failing the run (enqueue-outside-tx recovery)", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, persistence, jobTransport, clock } = createTestKernel([
+      workflow,
+    ]);
+
+    const { workflowRunId } = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "key-recovery",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+    await kernel.dispatch({ type: "run.claimPending", workerId: "w1" });
+
+    // Simulate the enqueue-outside-the-transaction race: the stage
+    // record is PENDING but its job never made it into the queue (e.g.
+    // the process crashed after the DB transaction committed but before
+    // jobTransport.enqueueParallel ran).
+    jobTransport.clear();
+    expect(jobTransport.getAllJobs()).toHaveLength(0);
+
+    clock.advance(10 * 60 * 1000);
+
+    const result = await kernel.dispatch({
+      type: "run.reapStuck",
+      stuckThresholdMs: 5 * 60 * 1000,
+    });
+
+    // Recovered, not reaped.
+    expect(result.failed).toBe(0);
+    expect(result.transitioned).toBe(0);
+
+    const run = await persistence.getRun(workflowRunId);
+    expect(run!.status).toBe("RUNNING");
+
+    // A fresh job was enqueued for the orphaned PENDING stage.
+    const jobs = jobTransport.getAllJobs();
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0]!.workflowRunId).toBe(workflowRunId);
+    expect(jobs[0]!.status).toBe("PENDING");
+  });
 });

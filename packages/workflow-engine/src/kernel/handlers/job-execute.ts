@@ -63,7 +63,19 @@ function resolveStageInput(
     workflowContext,
   );
 
-  return prevOutput ?? workflowRun.input;
+  // Only the first execution group may fall back to workflow input. A
+  // missing previous-group output past group 1 means a blob went
+  // missing (or context loading raced a stage completion) — silently
+  // feeding workflow input to a downstream stage would corrupt its
+  // result instead of surfacing the problem. Fail loudly instead.
+  if (prevOutput === undefined) {
+    throw new Error(
+      `Stage ${stageId} (execution group ${groupIndex}) is missing the ` +
+        `output of execution group ${groupIndex - 1} — cannot resolve input`,
+    );
+  }
+
+  return prevOutput;
 }
 
 // ---------------------------------------------------------------------------
@@ -122,6 +134,20 @@ export async function handleJobExecute(
 
   const workflowContext = await loadWorkflowContext(workflowRunId, deps);
 
+  // Idempotent double-execution guard: a stale-lease job re-delivery
+  // (e.g. duplicate dequeue during a heartbeat gap) must not re-run a
+  // stage that already completed. Without this, Phase 1 below would
+  // unconditionally flip a COMPLETED stage back to RUNNING and
+  // re-execute it.
+  const existingStage = await deps.persistence.getStage(workflowRunId, stageId);
+  if (existingStage?.status === "COMPLETED") {
+    return {
+      outcome: "completed" as const,
+      output: workflowContext[stageId],
+      _events: [],
+    };
+  }
+
   // ── Phase 1: Start transaction ───────────────────────────────────
   // Upsert stage to RUNNING and write stage:started outbox event.
   // Commits immediately so RUNNING status is visible to observers.
@@ -168,37 +194,56 @@ export async function handleJobExecute(
   // in the ActivityRunResult. A throw from executor.run() itself
   // (infra error) still propagates so the idempotency key is released.
 
-  const rawInput = resolveStageInput(
-    workflow,
-    stageId,
-    workflowRun,
-    workflowContext,
-  );
-
   let run: ActivityRunResult;
+  let rawInput: unknown;
+  let inputResolutionError: string | undefined;
   try {
-    run = await deps.executor.run(
-      {
-        stageDef,
-        workflowId,
-        workflowRunId,
-        workflowType: workflowRun.workflowType,
-        stageId,
-        stageName: stageDef.name,
-        stageNumber: stageRecord.stageNumber,
-        stageRecordId: stageRecord.id,
-        attempt: stageRecord.attempt,
-        rawInput,
-        config: config as Record<string, unknown>,
-        resumeState: stageRecord.suspendedState,
-        workflowContext,
-      },
-      deps,
+    rawInput = resolveStageInput(
+      workflow,
+      stageId,
+      workflowRun,
+      workflowContext,
     );
-  } catch (infraError) {
-    // executor.run itself threw (infra / transport failure — not a stage-body
-    // error). Re-throw so the kernel releases the idempotency key.
-    throw infraError;
+  } catch (inputError) {
+    // Missing previous-group output past the first execution group.
+    // Treat this the same as a stage-body failure below — do NOT call
+    // executor.run() with corrupted input.
+    inputResolutionError =
+      inputError instanceof Error ? inputError.message : String(inputError);
+  }
+
+  if (inputResolutionError !== undefined) {
+    run = {
+      error: inputResolutionError,
+      progress: [],
+      annotations: [],
+      logs: [],
+    };
+  } else {
+    try {
+      run = await deps.executor.run(
+        {
+          stageDef,
+          workflowId,
+          workflowRunId,
+          workflowType: workflowRun.workflowType,
+          stageId,
+          stageName: stageDef.name,
+          stageNumber: stageRecord.stageNumber,
+          stageRecordId: stageRecord.id,
+          attempt: stageRecord.attempt,
+          rawInput,
+          config: config as Record<string, unknown>,
+          resumeState: stageRecord.suspendedState,
+          workflowContext,
+        },
+        deps,
+      );
+    } catch (infraError) {
+      // executor.run itself threw (infra / transport failure — not a stage-body
+      // error). Re-throw so the kernel releases the idempotency key.
+      throw infraError;
+    }
   }
 
   // Write buffered logs (LocalExecutor returns [] — no-op for local path)
@@ -218,7 +263,10 @@ export async function handleJobExecute(
 
   if (run.error !== undefined) {
     // Stage body threw; treat as Phase 3b failure (same path as the old catch block)
-    const errorMessage = run.error;
+    const errorMessage =
+      run.errorName && run.errorName !== "Error"
+        ? `${run.errorName}: ${run.error}`
+        : run.error;
     const duration = deps.clock.now().getTime() - startTime;
     const bufferedAnnotations = run.annotations;
     try {
@@ -283,7 +331,12 @@ export async function handleJobExecute(
       })
       .catch(() => {});
 
-    return { outcome: "failed" as const, error: errorMessage, _events: [] };
+    return {
+      outcome: "failed" as const,
+      error: errorMessage,
+      retryable: run.retryable,
+      _events: [],
+    };
   }
 
   // Stage body succeeded — re-check run status (cancellation guard)
@@ -342,10 +395,18 @@ export async function handleJobExecute(
           nextPollAt,
         };
 
+        const workflowSuspendedEvent: KernelEvent = {
+          type: "workflow:suspended",
+          timestamp: deps.clock.now(),
+          workflowRunId,
+          stageId,
+        };
+
         await tx.appendOutboxEvents(
           toOutboxEvents(workflowRunId, causationId, [
             ...run.progress,
             suspendedEvent,
+            workflowSuspendedEvent,
             ...buildAnnotationEvents(bufferedAnnotations, deps.clock.now()),
           ]),
         );

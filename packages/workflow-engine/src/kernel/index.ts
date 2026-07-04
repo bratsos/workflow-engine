@@ -25,6 +25,8 @@ export type {
   RunCreateAnnotation,
   RunCreateCommand,
   RunCreateResult,
+  RunReapStuckCommand,
+  RunReapStuckResult,
   RunRerunFromCommand,
   RunRerunFromResult,
   RunTransitionCommand,

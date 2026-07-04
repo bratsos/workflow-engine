@@ -1,14 +1,13 @@
 /**
  * LocalExecutor — default ActivityExecutor implementation.
  *
- * Runs stage execute() in the current process. This is an exact extraction
- * of the Phase-2 body from handlers/job-execute.ts; behavior is byte-for-byte
- * identical to the pre-refactor handler.
+ * Runs stage execute() in the current process.
  *
  * Logs are written live (fire-and-forget createLog) during execution, so
  * this executor returns logs: [] — the handler does not need to persist them.
  */
 
+import { ZodError } from "zod";
 import type { StageContext } from "../../core/stage.js";
 import type { ProgressUpdate } from "../../core/types.js";
 import type { CreateAnnotationInput } from "../../persistence/interface.js";
@@ -52,7 +51,7 @@ export function createLocalExecutor(): ActivityExecutor {
         // Validate input
         const validatedInput = stageDef.inputSchema.parse(rawInput);
 
-        // Parse config (same try/catch fallback as job-execute.ts:194-200)
+        // Parse config
         let stageConfig: unknown = (config as any)[stageId] || {};
         try {
           if (stageDef.configSchema) {
@@ -63,7 +62,6 @@ export function createLocalExecutor(): ActivityExecutor {
         }
 
         // Build log function — fire-and-forget, written live during execute
-        // (identical to job-execute.ts:203-217)
         const logFn = async (
           level: any,
           message: string,
@@ -80,8 +78,7 @@ export function createLocalExecutor(): ActivityExecutor {
             .catch(() => {});
         };
 
-        // Build annotate function — pushes to buffer, same normalizeAnnotateArgs
-        // shaping as job-execute.ts:224-246
+        // Build annotate function — pushes to buffer
         const annotateFn = ((...args: unknown[]) => {
           const stageScopeFields = {
             workflowRunId,
@@ -104,7 +101,7 @@ export function createLocalExecutor(): ActivityExecutor {
           }
         }) as StageContext<any, any, any>["annotate"];
 
-        // Build context (identical to job-execute.ts:249-274)
+        // Build context
         const context: StageContext<any, any, any> = {
           workflowRunId,
           stageId,
@@ -143,8 +140,15 @@ export function createLocalExecutor(): ActivityExecutor {
         };
       } catch (e) {
         const error = e instanceof Error ? e.message : String(e);
+        // Zod input/config validation errors are deterministic — retrying
+        // the same rawInput will fail identically, so mark non-retryable
+        // rather than let hosts burn retry attempts on a doomed job.
+        const retryable = e instanceof ZodError ? false : undefined;
         return {
           error,
+          errorName: e instanceof Error ? e.name : undefined,
+          errorStack: e instanceof Error ? e.stack : undefined,
+          retryable,
           progress: progressEvents,
           annotations: annotationBuffer.flush(),
           logs: [],

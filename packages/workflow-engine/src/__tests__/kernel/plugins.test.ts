@@ -7,7 +7,11 @@
 
 import { describe, expect, it, vi } from "vitest";
 import type { KernelEvent } from "../../kernel/events.js";
-import { createPluginRunner, definePlugin } from "../../kernel/plugins.js";
+import {
+  createPluginRunner,
+  definePlugin,
+  type PluginDefinition,
+} from "../../kernel/plugins.js";
 
 describe("kernel: plugin runner", () => {
   it("routes events to matching handlers", async () => {
@@ -19,7 +23,9 @@ describe("kernel: plugin runner", () => {
       handle: handler,
     });
 
-    const runner = createPluginRunner({ plugins: [plugin] });
+    const runner = createPluginRunner({
+      plugins: [plugin as PluginDefinition],
+    });
 
     const event: KernelEvent = {
       type: "workflow:completed",
@@ -40,7 +46,9 @@ describe("kernel: plugin runner", () => {
       handle: handler,
     });
 
-    const runner = createPluginRunner({ plugins: [plugin] });
+    const runner = createPluginRunner({
+      plugins: [plugin as PluginDefinition],
+    });
 
     const event: KernelEvent = {
       type: "workflow:created",
@@ -70,7 +78,9 @@ describe("kernel: plugin runner", () => {
       handle: handler2,
     });
 
-    const runner = createPluginRunner({ plugins: [plugin1, plugin2] });
+    const runner = createPluginRunner({
+      plugins: [plugin1 as PluginDefinition, plugin2 as PluginDefinition],
+    });
 
     const event: KernelEvent = {
       type: "workflow:completed",
@@ -93,7 +103,9 @@ describe("kernel: plugin runner", () => {
       },
     });
 
-    const runner = createPluginRunner({ plugins: [plugin] });
+    const runner = createPluginRunner({
+      plugins: [plugin as PluginDefinition],
+    });
 
     const event: KernelEvent = {
       type: "workflow:completed",
@@ -126,7 +138,9 @@ describe("kernel: plugin runner", () => {
       handle: handler,
     });
 
-    const runner = createPluginRunner({ plugins: [plugin] });
+    const runner = createPluginRunner({
+      plugins: [plugin as PluginDefinition],
+    });
 
     await runner.emit({
       type: "workflow:completed",

@@ -9,7 +9,11 @@ import { z } from "zod";
 import { defineStage } from "../../core/stage-factory.js";
 import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
 import { createKernel } from "../../kernel/kernel.js";
-import { createPluginRunner, definePlugin } from "../../kernel/plugins.js";
+import {
+  createPluginRunner,
+  definePlugin,
+  type PluginDefinition,
+} from "../../kernel/plugins.js";
 import {
   FakeClock,
   InMemoryBlobStore,
@@ -56,7 +60,10 @@ function createTestKernelWithFailingPlugin(maxRetries = 1) {
     handle: handler,
   });
 
-  const eventSink = createPluginRunner({ plugins: [plugin], maxRetries });
+  const eventSink = createPluginRunner({
+    plugins: [plugin as PluginDefinition],
+    maxRetries,
+  });
 
   const workflow = createSimpleWorkflow();
   const registry = new Map<string, Workflow<any, any>>();

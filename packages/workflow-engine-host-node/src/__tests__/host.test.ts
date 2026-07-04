@@ -18,8 +18,10 @@ import {
   InMemoryBlobStore,
   NoopScheduler,
 } from "@bratsos/workflow-engine/kernel/testing";
-import { InMemoryWorkflowPersistence } from "@bratsos/workflow-engine/testing";
-import { InMemoryJobQueue } from "@bratsos/workflow-engine/testing";
+import {
+  InMemoryJobQueue,
+  InMemoryWorkflowPersistence,
+} from "@bratsos/workflow-engine/testing";
 import { afterEach, describe, expect, it } from "vitest";
 import { z } from "zod";
 import { createNodeHost, type NodeHost } from "../host.js";
@@ -335,6 +337,136 @@ describe("NodeHost", () => {
     await host.start(); // should be a no-op
 
     expect(host.getStats().isRunning).toBe(true);
+  });
+
+  it("fails the run promptly (not via reapStuck) when a stage fails terminally", async () => {
+    const failingStage = defineStage({
+      id: "boom",
+      name: "Boom",
+      schemas: { input: schema, output: outputSchema, config: z.object({}) },
+      async execute() {
+        throw new Error("deterministic failure");
+      },
+    });
+    const workflow = new WorkflowBuilder(
+      "terminal-fail",
+      "Terminal Fail",
+      "Test",
+      schema,
+      outputSchema,
+    )
+      .pipe(failingStage)
+      .build();
+
+    const { kernel, persistence, jobTransport, eventSink } = createTestEnv([
+      workflow,
+    ]);
+
+    await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "terminal-fail-1",
+      workflowId: "terminal-fail",
+      input: { data: "hello" },
+    });
+
+    host = createNodeHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+      orchestrationIntervalMs: 50,
+      jobPollIntervalMs: 20,
+      // maxAttempts defaults to 3 on InMemoryJobQueue, but this stage
+      // fails on attempt 1 already (single attempt is enough to prove
+      // the run doesn't linger RUNNING) — set attempts to 1 so the very
+      // first failure is terminal.
+    });
+    jobTransport.setDefaultMaxAttempts(1);
+    await host.start();
+
+    // Without fix 1, the run would sit RUNNING until run.reapStuck (many
+    // minutes later) killed it with a generic STUCK_RUN_REAPED error.
+    // With the fix, run.transition is dispatched immediately after the
+    // terminal failure, so this resolves within the polling window.
+    await waitFor(async () => {
+      const runs = await persistence.getRunsByStatus("FAILED");
+      return runs.length > 0;
+    }, 2_000);
+
+    const failed = await persistence.getRunsByStatus("FAILED");
+    expect(failed).toHaveLength(1);
+    expect((failed[0]!.output as any)?.error?.code).not.toBe(
+      "STUCK_RUN_REAPED",
+    );
+
+    await new Promise((r) => setTimeout(r, 100));
+    const failedEvents = eventSink.events.filter(
+      (e) => e.type === "workflow:failed",
+    );
+    expect(failedEvents.length).toBeGreaterThan(0);
+    expect((failedEvents[0] as any).error).toContain("deterministic failure");
+  });
+
+  it("renews a job's lease while it executes (heartbeat)", async () => {
+    let releaseExecute: (() => void) | undefined;
+    const slowStage = defineStage({
+      id: "slow",
+      name: "Slow",
+      schemas: { input: schema, output: outputSchema, config: z.object({}) },
+      async execute(ctx) {
+        await new Promise<void>((resolve) => {
+          releaseExecute = resolve;
+        });
+        return { output: { result: ctx.input.data } };
+      },
+    });
+    const workflow = new WorkflowBuilder(
+      "slow-workflow",
+      "Slow",
+      "Test",
+      schema,
+      outputSchema,
+    )
+      .pipe(slowStage)
+      .build();
+
+    const { kernel, jobTransport } = createTestEnv([workflow]);
+
+    await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "heartbeat-1",
+      workflowId: "slow-workflow",
+      input: { data: "hello" },
+    });
+
+    host = createNodeHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+      orchestrationIntervalMs: 20,
+      jobPollIntervalMs: 20,
+      jobHeartbeatIntervalMs: 30,
+    });
+    await host.start();
+
+    // Wait for the job to be picked up and locked.
+    await waitFor(async () => {
+      const running = jobTransport.getJobsByStatus("RUNNING");
+      return running.length > 0;
+    });
+
+    const lockedAtBeforeHeartbeat =
+      jobTransport.getJobsByStatus("RUNNING")[0]!.lockedAt!;
+
+    // Give the heartbeat interval a couple of chances to fire while the
+    // stage is still "executing" (blocked on releaseExecute).
+    await new Promise((r) => setTimeout(r, 150));
+
+    const runningJob = jobTransport.getJobsByStatus("RUNNING")[0]!;
+    expect(runningJob.lockedAt!.getTime()).toBeGreaterThan(
+      lockedAtBeforeHeartbeat.getTime(),
+    );
+
+    releaseExecute?.();
   });
 
   it("flushes outbox events through EventSink", async () => {

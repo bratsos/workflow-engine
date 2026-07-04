@@ -3,8 +3,6 @@
  *
  * Advances a workflow run to its next execution group, or marks it as
  * completed/failed depending on the current state of its stages.
- *
- * Extracted from WorkflowRuntime.transitionWorkflow() and completeWorkflow().
  */
 
 import type { Workflow } from "../../core/workflow";
@@ -52,12 +50,21 @@ async function claimRunTransition(
   }
 }
 
-async function enqueueExecutionGroup(
+/**
+ * Upserts stage records for an execution group (must run inside the
+ * transaction) and returns a closure that enqueues jobs for the
+ * newly-PENDING stages. The enqueue itself is NOT performed here — the
+ * caller must invoke the returned closure from `_postCommit`, after the
+ * transaction has committed. Enqueueing mid-transaction risks an orphan
+ * job if the transaction later rolls back (jobTransport isn't part of
+ * the DB transaction, so its writes can't be undone).
+ */
+async function prepareExecutionGroup(
   run: WorkflowRunRecord,
   workflow: Workflow<any, any>,
   groupIndex: number,
   deps: KernelDeps,
-): Promise<string[]> {
+): Promise<() => Promise<string[]>> {
   const stages = workflow.getStagesInExecutionGroup(groupIndex);
 
   // Compute the current run-level attempt by taking the max attempt
@@ -94,17 +101,18 @@ async function enqueueExecutionGroup(
     }
   }
 
-  if (stagesToEnqueue.length === 0) return [];
-
-  return deps.jobTransport.enqueueParallel(
-    stagesToEnqueue.map((stage) => ({
-      workflowRunId: run.id,
-      workflowId: run.workflowId,
-      stageId: stage.id,
-      priority: run.priority,
-      payload: { config: run.config || {} },
-    })),
-  );
+  return () => {
+    if (stagesToEnqueue.length === 0) return Promise.resolve([]);
+    return deps.jobTransport.enqueueParallel(
+      stagesToEnqueue.map((stage) => ({
+        workflowRunId: run.id,
+        workflowId: run.workflowId,
+        stageId: stage.id,
+        priority: run.priority,
+        payload: { config: run.config || {} },
+      })),
+    );
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -142,7 +150,7 @@ export async function handleRunTransition(
     if (!(await claimRunTransition(run, deps))) {
       return { action: "noop" as const, _events: [] };
     }
-    await enqueueExecutionGroup(run, workflow, 1, deps);
+    const enqueue = await prepareExecutionGroup(run, workflow, 1, deps);
 
     events.push({
       type: "workflow:started",
@@ -150,7 +158,12 @@ export async function handleRunTransition(
       workflowRunId: run.id,
     });
 
-    return { action: "advanced" as const, nextGroup: 1, _events: events };
+    return {
+      action: "advanced" as const,
+      nextGroup: 1,
+      _events: events,
+      _postCommit: enqueue,
+    };
   }
 
   // 6. If any stage is still active, the run is in-flight -- noop
@@ -159,8 +172,42 @@ export async function handleRunTransition(
     return { action: "noop" as const, _events: [] };
   }
 
-  // 7. If any stage has failed, mark the entire run as failed
-  const failedStage = stages.find((s) => s.status === "FAILED");
+  // 7. If any stage has failed, mark the entire run as failed — unless a
+  // retry is still queued or in flight for it. A FAILED stage record does
+  // not necessarily mean the stage is done: job-execute flips the stage
+  // to FAILED on every throw, including ones the host will retry (job
+  // goes back to PENDING with backoff). If a sibling in the same
+  // execution group completes first, its run.transition dispatch must
+  // not race ahead and kill the run out from under the pending retry.
+  //
+  // A job is "still active" for a FAILED stage when it's RUNNING, or
+  // PENDING with attempt > 0 — the latter is the signature of a retry
+  // requeued by jobTransport.fail(..., shouldRetry: true) (dequeue()
+  // increments attempt before execution, and a retry-requeue preserves
+  // that count). A freshly-enqueued, never-dequeued job is PENDING with
+  // attempt === 0 and does not represent a retry in flight — it only
+  // occurs when a stage was enqueued but its job.execute was dispatched
+  // out-of-band (or hasn't run yet, in which case the stage wouldn't be
+  // FAILED in the first place).
+  const failedStages = stages.filter((s) => s.status === "FAILED");
+  let failedStage: (typeof failedStages)[number] | undefined;
+  if (failedStages.length > 0) {
+    const jobs = await deps.jobTransport.getJobsByWorkflowRun(run.id);
+    failedStage = failedStages.find(
+      (stage) =>
+        !jobs.some(
+          (job) =>
+            job.stageId === stage.stageId &&
+            (job.status === "RUNNING" ||
+              (job.status === "PENDING" && job.attempt > 0)),
+        ),
+    );
+    if (!failedStage) {
+      // Every FAILED stage still has a retry queued or in flight — the
+      // run is still active; wait for the retry's outcome.
+      return { action: "noop" as const, _events: [] };
+    }
+  }
   if (failedStage) {
     if (!(await claimRunTransition(run, deps))) {
       return { action: "noop" as const, _events: [] };
@@ -194,11 +241,17 @@ export async function handleRunTransition(
     if (!(await claimRunTransition(run, deps))) {
       return { action: "noop" as const, _events: [] };
     }
-    await enqueueExecutionGroup(run, workflow, maxGroup + 1, deps);
+    const enqueue = await prepareExecutionGroup(
+      run,
+      workflow,
+      maxGroup + 1,
+      deps,
+    );
     return {
       action: "advanced" as const,
       nextGroup: maxGroup + 1,
       _events: events,
+      _postCommit: enqueue,
     };
   }
 

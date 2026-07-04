@@ -23,6 +23,13 @@ export async function handleRunClaimPending(
     jobIds: string[];
   }> = [];
   const events: KernelEvent[] = [];
+  // NOTE: enqueueParallel here runs inside the enclosing DB transaction
+  // (unlike run.transition/run.rerunFrom, which defer enqueue to
+  // _postCommit — see prepareExecutionGroup in run-transition.ts) because
+  // this handler's public result includes the enqueued jobIds
+  // synchronously per claimed run. A crash between enqueue and commit can
+  // still orphan a job or lose one; run.reapStuck's PENDING-without-job
+  // recovery sweep (see there) covers the resulting stuck run either way.
 
   for (let i = 0; i < maxClaims; i++) {
     const run = await deps.persistence.claimNextPendingRun();

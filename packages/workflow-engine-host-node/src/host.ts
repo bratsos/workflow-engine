@@ -31,7 +31,7 @@ export interface NodeHostConfig {
   /** Job dequeue poll interval when queue is empty (default: 1_000). */
   jobPollIntervalMs?: number;
 
-  /** Stale lease threshold in milliseconds (default: 60_000). */
+  /** Stale lease threshold in milliseconds (default: 300_000). */
   staleLeaseThresholdMs?: number;
 
   /** Max pending runs to claim per orchestration tick (default: 10). */
@@ -42,6 +42,9 @@ export interface NodeHostConfig {
 
   /** Max outbox events to flush per tick (default: 100). */
   maxOutboxFlushPerTick?: number;
+
+  /** Job lease heartbeat interval in milliseconds (default: 60_000). */
+  jobHeartbeatIntervalMs?: number;
 }
 
 export interface HostStats {
@@ -79,6 +82,7 @@ class NodeHostImpl implements NodeHost {
   private readonly maxClaimsPerTick: number;
   private readonly maxSuspendedChecksPerTick: number;
   private readonly maxOutboxFlushPerTick: number;
+  private readonly jobHeartbeatIntervalMs: number;
 
   constructor(config: NodeHostConfig) {
     this.kernel = config.kernel;
@@ -86,10 +90,11 @@ class NodeHostImpl implements NodeHost {
     this.workerId = config.workerId;
     this.orchestrationIntervalMs = config.orchestrationIntervalMs ?? 10_000;
     this.jobPollIntervalMs = config.jobPollIntervalMs ?? 1_000;
-    this.staleLeaseThresholdMs = config.staleLeaseThresholdMs ?? 60_000;
+    this.staleLeaseThresholdMs = config.staleLeaseThresholdMs ?? 300_000;
     this.maxClaimsPerTick = config.maxClaimsPerTick ?? 10;
     this.maxSuspendedChecksPerTick = config.maxSuspendedChecksPerTick ?? 10;
     this.maxOutboxFlushPerTick = config.maxOutboxFlushPerTick ?? 100;
+    this.jobHeartbeatIntervalMs = config.jobHeartbeatIntervalMs ?? 60_000;
   }
 
   // --------------------------------------------------------------------------
@@ -234,14 +239,27 @@ class NodeHostImpl implements NodeHost {
         const config =
           (job.payload as { config?: Record<string, unknown> }).config || {};
 
-        const result = await this.kernel.dispatch({
-          type: "job.execute",
-          idempotencyKey: `job:${job.jobId}:attempt:${job.attempt}`,
-          workflowRunId: job.workflowRunId,
-          workflowId: job.workflowId,
-          stageId: job.stageId,
-          config,
-        });
+        // Heartbeat: periodically renew the job's lease while it executes
+        // so a long-running stage (> staleLeaseThresholdMs) isn't picked
+        // up as stale and duplicated by releaseStaleJobs.
+        const heartbeat = setInterval(
+          () => void this.jobTransport.touchJob(job.jobId).catch(() => {}),
+          this.jobHeartbeatIntervalMs,
+        );
+
+        let result;
+        try {
+          result = await this.kernel.dispatch({
+            type: "job.execute",
+            idempotencyKey: `job:${job.jobId}:attempt:${job.attempt}`,
+            workflowRunId: job.workflowRunId,
+            workflowId: job.workflowId,
+            stageId: job.stageId,
+            config,
+          });
+        } finally {
+          clearInterval(heartbeat);
+        }
 
         this.jobsProcessed++;
 
@@ -257,13 +275,36 @@ class NodeHostImpl implements NodeHost {
         } else if (result.outcome === "failed") {
           // Ghost jobs (discarded by kernel because run is not RUNNING)
           // should never be retried — they'll just fail again.
+          // A deterministic (non-retryable) stage error — e.g. Zod input
+          // validation — will fail identically on every attempt, so it
+          // is treated the same as an exhausted retry budget.
           const canRetry =
-            !result.ghost && job.attempt < (job.maxAttempts ?? 3);
+            !result.ghost &&
+            result.retryable !== false &&
+            job.attempt < (job.maxAttempts ?? 3);
           await this.jobTransport.fail(
             job.jobId,
             result.error ?? "Unknown error",
             canRetry,
           );
+          // Terminal failure: without this, the run lingers RUNNING
+          // until run.reapStuck kills it minutes later with a generic
+          // "STUCK_RUN_REAPED" error, losing the real stage error.
+          // Dispatch run.transition so the run fails promptly with the
+          // actual error from the FAILED stage record.
+          if (!canRetry && !result.ghost) {
+            try {
+              await this.kernel.dispatch({
+                type: "run.transition",
+                workflowRunId: job.workflowRunId,
+              });
+            } catch (error) {
+              console.error(
+                "[NodeHost] run.transition (terminal failure) error:",
+                error,
+              );
+            }
+          }
         }
       } catch (error) {
         // Job processing errors are non-fatal — back off and retry

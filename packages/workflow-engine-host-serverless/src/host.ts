@@ -26,7 +26,7 @@ export interface ServerlessHostConfig {
   /** Unique worker identifier (e.g. function name, worker name). */
   workerId: string;
 
-  /** Stale lease threshold in milliseconds (default: 60_000). */
+  /** Stale lease threshold in milliseconds (default: 300_000). */
   staleLeaseThresholdMs?: number;
 
   /** Max pending runs to claim per maintenance tick (default: 10). */
@@ -37,6 +37,9 @@ export interface ServerlessHostConfig {
 
   /** Max outbox events to flush per tick (default: 100). */
   maxOutboxFlushPerTick?: number;
+
+  /** Job lease heartbeat interval in milliseconds (default: 60_000). */
+  jobHeartbeatIntervalMs?: number;
 }
 
 /** Message shape representing a job to execute. Matches DequeueResult fields. */
@@ -96,29 +99,44 @@ class ServerlessHostImpl implements ServerlessHost {
   private readonly maxClaimsPerTick: number;
   private readonly maxSuspendedChecksPerTick: number;
   private readonly maxOutboxFlushPerTick: number;
+  private readonly jobHeartbeatIntervalMs: number;
 
   constructor(config: ServerlessHostConfig) {
     this.kernel = config.kernel;
     this.jobTransport = config.jobTransport;
     this.workerId = config.workerId;
-    this.staleLeaseThresholdMs = config.staleLeaseThresholdMs ?? 60_000;
+    this.staleLeaseThresholdMs = config.staleLeaseThresholdMs ?? 300_000;
     this.maxClaimsPerTick = config.maxClaimsPerTick ?? 10;
     this.maxSuspendedChecksPerTick = config.maxSuspendedChecksPerTick ?? 10;
     this.maxOutboxFlushPerTick = config.maxOutboxFlushPerTick ?? 100;
+    this.jobHeartbeatIntervalMs = config.jobHeartbeatIntervalMs ?? 60_000;
   }
 
   async handleJob(msg: JobMessage): Promise<JobResult> {
     const config =
       (msg.payload as { config?: Record<string, unknown> }).config || {};
 
-    const result = await this.kernel.dispatch({
-      type: "job.execute",
-      idempotencyKey: `job:${msg.jobId}:attempt:${msg.attempt}`,
-      workflowRunId: msg.workflowRunId,
-      workflowId: msg.workflowId,
-      stageId: msg.stageId,
-      config,
-    });
+    // Heartbeat: periodically renew the job's lease while it executes so
+    // a long-running stage isn't picked up as stale and duplicated by
+    // releaseStaleJobs.
+    const heartbeat = setInterval(
+      () => void this.jobTransport.touchJob(msg.jobId).catch(() => {}),
+      this.jobHeartbeatIntervalMs,
+    );
+
+    let result;
+    try {
+      result = await this.kernel.dispatch({
+        type: "job.execute",
+        idempotencyKey: `job:${msg.jobId}:attempt:${msg.attempt}`,
+        workflowRunId: msg.workflowRunId,
+        workflowId: msg.workflowId,
+        stageId: msg.stageId,
+        config,
+      });
+    } finally {
+      clearInterval(heartbeat);
+    }
 
     if (result.outcome === "completed") {
       await this.jobTransport.complete(msg.jobId);
@@ -135,13 +153,35 @@ class ServerlessHostImpl implements ServerlessHost {
       return { outcome: "suspended" };
     }
 
-    // failed — ghost jobs should never be retried
-    const canRetry = !result.ghost && msg.attempt < (msg.maxAttempts ?? 3);
+    // failed — ghost jobs and non-retryable (deterministic) errors should
+    // never be retried.
+    const canRetry =
+      !result.ghost &&
+      result.retryable !== false &&
+      msg.attempt < (msg.maxAttempts ?? 3);
     await this.jobTransport.fail(
       msg.jobId,
       result.error ?? "Unknown error",
       canRetry,
     );
+    // Terminal failure: without this, the run lingers RUNNING until
+    // run.reapStuck kills it minutes later with a generic
+    // "STUCK_RUN_REAPED" error, losing the real stage error. Dispatch
+    // run.transition so the run fails promptly with the actual error
+    // from the FAILED stage record.
+    if (!canRetry && !result.ghost) {
+      try {
+        await this.kernel.dispatch({
+          type: "run.transition",
+          workflowRunId: msg.workflowRunId,
+        });
+      } catch (error) {
+        console.error(
+          "[ServerlessHost] run.transition (terminal failure) error:",
+          error,
+        );
+      }
+    }
     return { outcome: "failed", error: result.error };
   }
 

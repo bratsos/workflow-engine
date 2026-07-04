@@ -89,7 +89,20 @@ export interface KernelConfig {
   clock: Clock;
   registry: WorkflowRegistry;
   executor?: ActivityExecutor;
+  /**
+   * How long an idempotency key may sit `in_progress` before a subsequent
+   * dispatch is allowed to reclaim it. Guards against a dispatcher that
+   * crashed between committing its transaction and calling
+   * `completeIdempotencyKey`, which would otherwise leave the key
+   * permanently stuck and every future dispatch with that key throwing
+   * `IdempotencyInProgressError`. Defaults to 10 minutes. Set to
+   * `Infinity` to disable reclaiming.
+   */
+  idempotencyStaleInProgressMs?: number;
 }
+
+/** Default TTL after which a stuck `in_progress` idempotency key can be reclaimed. */
+const DEFAULT_IDEMPOTENCY_STALE_IN_PROGRESS_MS = 10 * 60 * 1000;
 
 /** Input for the public `kernel.annotations.attach` helper. */
 export interface AnnotateAttachInput {
@@ -152,7 +165,17 @@ export interface KernelDeps {
 // Internal handler result type (includes _events for central emission)
 // ============================================================================
 
-export type HandlerResult<T> = T & { _events: KernelEvent[] };
+export type HandlerResult<T> = T & {
+  _events: KernelEvent[];
+  /**
+   * Optional side effect to run only after the enclosing transaction has
+   * committed — e.g. deleting blob artifacts that a rollback could not
+   * bring back. Handlers routed through the kernel's generic transaction
+   * path (see the `switch` in `dispatch`) may set this instead of
+   * performing the side effect inline mid-transaction.
+   */
+  _postCommit?: (deps: KernelDeps) => Promise<unknown>;
+};
 
 // ============================================================================
 // Helpers
@@ -162,6 +185,7 @@ export type HandlerResult<T> = T & { _events: KernelEvent[] };
 function getIdempotencyKey(command: KernelCommand): string | undefined {
   if (command.type === "run.create") return command.idempotencyKey;
   if (command.type === "job.execute") return command.idempotencyKey;
+  if (command.type === "run.rerunFrom") return command.idempotencyKey;
   return undefined;
 }
 
@@ -182,6 +206,9 @@ export function createKernel(config: KernelConfig): Kernel {
 
   // Default to LocalExecutor if none provided
   const executor = config.executor ?? createLocalExecutor();
+  const idempotencyStaleInProgressMs =
+    config.idempotencyStaleInProgressMs ??
+    DEFAULT_IDEMPOTENCY_STALE_IN_PROGRESS_MS;
 
   const deps: KernelDeps = {
     persistence,
@@ -249,6 +276,10 @@ export function createKernel(config: KernelConfig): Kernel {
         const acquired = await persistence.acquireIdempotencyKey(
           jobIdempotencyKey,
           command.type,
+          {
+            now: clock.now(),
+            staleInProgressAfterMs: idempotencyStaleInProgressMs,
+          },
         );
         if (acquired.status === "replay") {
           return acquired.result as CommandResult<T>;
@@ -292,6 +323,10 @@ export function createKernel(config: KernelConfig): Kernel {
       const acquired = await persistence.acquireIdempotencyKey(
         idempotencyKey,
         command.type,
+        {
+          now: clock.now(),
+          staleInProgressAfterMs: idempotencyStaleInProgressMs,
+        },
       );
 
       if (acquired.status === "replay") {
@@ -302,6 +337,8 @@ export function createKernel(config: KernelConfig): Kernel {
       }
       idempotencyAcquired = true;
     }
+
+    let postCommit: ((deps: KernelDeps) => Promise<unknown>) | undefined;
 
     try {
       // ---------------------------------------------------------------
@@ -371,9 +408,17 @@ export function createKernel(config: KernelConfig): Kernel {
           await tx.appendOutboxEvents(outboxEvents);
         }
 
-        const { _events: _, ...stripped } = result;
+        postCommit = result._postCommit;
+        const { _events: _, _postCommit: __, ...stripped } = result;
         return stripped as CommandResult<T>;
       });
+
+      if (postCommit) {
+        // Runs only now that the transaction has committed — the DB
+        // state this side effect depends on (e.g. deleted stage rows)
+        // can no longer be rolled back out from under it.
+        await postCommit(deps);
+      }
 
       if (idempotencyKey && idempotencyAcquired) {
         await persistence.completeIdempotencyKey(

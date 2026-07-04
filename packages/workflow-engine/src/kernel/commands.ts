@@ -117,6 +117,8 @@ export interface RunRerunFromCommand {
   readonly type: "run.rerunFrom";
   readonly workflowRunId: string;
   readonly fromStageId: string;
+  /** Optional idempotency key — a replayed call returns the cached result. */
+  readonly idempotencyKey?: string;
 }
 
 /** Result of a `run.rerunFrom` command. */
@@ -148,6 +150,12 @@ export interface JobExecuteResult {
   readonly nextPollAt?: Date;
   /** True when the job was discarded because the run is no longer RUNNING. */
   readonly ghost?: boolean;
+  /**
+   * False marks a deterministic failure (e.g. Zod input/config validation)
+   * that will not succeed on retry — hosts should fail the job terminally.
+   * `undefined`/`true` preserves default retry behavior.
+   */
+  readonly retryable?: boolean;
 }
 
 // ---------------------------------------------------------------------------

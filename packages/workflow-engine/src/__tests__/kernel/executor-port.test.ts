@@ -117,13 +117,14 @@ describe("ActivityExecutor port", () => {
     // Create + claim a run to get it to RUNNING
     const { workflowRunId } = await kernel.dispatch({
       type: "run.create" as const,
+      idempotencyKey: "key-executor-1",
       workflowId: "wf-executor-test",
       input: { value: "hello" },
     });
 
     await kernel.dispatch({
       type: "run.claimPending" as const,
-      workflowRunId,
+      workerId: "worker-1",
     });
 
     await runStage(kernel, infra, workflowRunId);
@@ -154,13 +155,14 @@ describe("ActivityExecutor port", () => {
 
     const { workflowRunId } = await kernel.dispatch({
       type: "run.create" as const,
+      idempotencyKey: "key-executor-2",
       workflowId: "wf-executor-test",
       input: { value: "default" },
     });
 
     await kernel.dispatch({
       type: "run.claimPending" as const,
-      workflowRunId,
+      workerId: "worker-1",
     });
 
     await runStage(kernel, infra, workflowRunId);

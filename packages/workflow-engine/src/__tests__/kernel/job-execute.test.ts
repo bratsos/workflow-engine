@@ -561,5 +561,109 @@ describe("kernel: job.execute", () => {
     });
 
     expect(result.outcome).toBe("failed");
+    // Deterministic Zod validation failures are marked non-retryable so
+    // hosts fail the job terminally instead of burning retry attempts.
+    expect(result.retryable).toBe(false);
+    expect(result.error).toContain("ZodError");
+  });
+
+  it("does not re-execute an already-COMPLETED stage (stale-lease duplicate guard)", async () => {
+    let executionCount = 0;
+    const schema = z.object({ data: z.string() });
+    const stage = defineStage({
+      id: "counted",
+      name: "Counted",
+      schemas: { input: schema, output: schema, config: z.object({}) },
+      async execute(ctx) {
+        executionCount++;
+        return { output: ctx.input };
+      },
+    });
+
+    const workflow = new WorkflowBuilder(
+      "test-workflow",
+      "Test",
+      "Test",
+      schema,
+      schema,
+    )
+      .pipe(stage)
+      .build();
+
+    const { kernel, persistence } = createTestKernel([workflow]);
+
+    const createResult = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "key-dup",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+    await persistence.updateRun(createResult.workflowRunId, {
+      status: "RUNNING",
+    });
+
+    const first = await kernel.dispatch({
+      type: "job.execute",
+      workflowRunId: createResult.workflowRunId,
+      workflowId: "test-workflow",
+      stageId: "counted",
+      config: {},
+    });
+    expect(first.outcome).toBe("completed");
+    expect(executionCount).toBe(1);
+
+    // Simulate a stale-lease duplicate delivery of the same job (e.g. a
+    // heartbeat gap caused releaseStaleJobs to re-enqueue it even though
+    // the stage already completed).
+    const duplicate = await kernel.dispatch({
+      type: "job.execute",
+      workflowRunId: createResult.workflowRunId,
+      workflowId: "test-workflow",
+      stageId: "counted",
+      config: {},
+    });
+
+    expect(duplicate.outcome).toBe("completed");
+    expect(duplicate.output).toEqual(first.output);
+    expect(executionCount).toBe(1);
+  });
+
+  it("fails loudly when a downstream stage's previous-group output is missing", async () => {
+    const schema = z.object({ data: z.string() });
+    const workflow = createTwoStageWorkflow();
+    const { kernel, persistence } = createTestKernel([workflow]);
+
+    const createResult = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "key-missing-output",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+    await persistence.updateRun(createResult.workflowRunId, {
+      status: "RUNNING",
+    });
+
+    // Execute stage-1 (group 1) normally so stage-2 (group 2) becomes
+    // eligible, but simulate the group-1 output blob going missing —
+    // e.g. corrupted/expired storage — by never actually persisting a
+    // COMPLETED stage-1 record. Instead, directly attempt stage-2, whose
+    // execution group is 2, so resolveStageInput must resolve group 1's
+    // output from workflowContext and find nothing.
+    const result = await kernel.dispatch({
+      type: "job.execute",
+      workflowRunId: createResult.workflowRunId,
+      workflowId: "test-workflow",
+      stageId: "stage-2",
+      config: {},
+    });
+
+    expect(result.outcome).toBe("failed");
+    expect(result.error).toMatch(/missing the output of execution group/);
+
+    // The workflow's original input must NOT have silently leaked into
+    // stage-2 as a fallback.
+    const stages = await persistence.getStagesByRun(createResult.workflowRunId);
+    const stage2 = stages.find((s) => s.stageId === "stage-2");
+    expect(stage2!.status).toBe("FAILED");
   });
 });

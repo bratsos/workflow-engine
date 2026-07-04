@@ -55,6 +55,24 @@ function toOutboxEvents(
   }));
 }
 
+async function completeSuspendedJobRow(
+  workflowRunId: string,
+  stageId: string,
+  deps: KernelDeps,
+): Promise<void> {
+  try {
+    const jobs = await deps.jobTransport.getJobsByWorkflowRun(workflowRunId);
+    const job = jobs.find(
+      (j) => j.stageId === stageId && j.status === "SUSPENDED",
+    );
+    if (job) {
+      await deps.jobTransport.complete(job.id);
+    }
+  } catch {
+    // Best-effort cleanup — a failure here must not fail the resume.
+  }
+}
+
 async function markStageCancelled(
   stageId: string,
   deps: KernelDeps,
@@ -412,6 +430,88 @@ export async function handleStagePollSuspended(
 
         resumed++;
         resumedWorkflowRunIds.add(stageRecord.workflowRunId);
+        // Resuming here bypasses the normal job.execute → jobTransport
+        // .complete() path entirely (this poll loop resumes stages
+        // purely via persistence), so the SUSPENDED job row for this
+        // stage is never marked complete. Without this, job_queue
+        // accumulates a permanently-SUSPENDED row per suspended stage.
+        await completeSuspendedJobRow(
+          stageRecord.workflowRunId,
+          stageRecord.stageId,
+          deps,
+        );
+      } else if (
+        stageRecord.maxWaitUntil &&
+        stageRecord.maxWaitUntil.getTime() <= deps.clock.now().getTime()
+      ) {
+        // Not ready, and the stage's maxWaitUntil deadline has now
+        // passed. checkCompletion() didn't report its own deadline
+        // error (stages that track their own deadline, e.g. remote
+        // activity workers, already fail via checkResult.error above),
+        // so this is the generic backstop: without it, a suspended
+        // stage whose provider never reports readiness or an error
+        // would reschedule via nextCheckIn forever.
+        const timeoutError = `Stage ${stageRecord.stageId} exceeded maxWaitUntil (${stageRecord.maxWaitUntil.toISOString()}) while suspended`;
+        const bufferedAnnotations = annotationBuffer.flush();
+        const claimResult = await withClaimedRun(
+          stageRecord.workflowRunId,
+          run.version,
+          deps,
+          async (tx) => {
+            await tx.updateStage(stageRecord.id, {
+              status: "FAILED",
+              completedAt: deps.clock.now(),
+              errorMessage: timeoutError,
+              nextPollAt: null,
+            });
+
+            await tx.updateRun(stageRecord.workflowRunId, {
+              status: "FAILED",
+              completedAt: deps.clock.now(),
+            });
+
+            if (bufferedAnnotations.length > 0) {
+              await tx.appendAnnotations(bufferedAnnotations);
+            }
+
+            await tx.appendOutboxEvents(
+              toOutboxEvents(stageRecord.workflowRunId, [
+                {
+                  type: "stage:failed",
+                  timestamp: deps.clock.now(),
+                  workflowRunId: stageRecord.workflowRunId,
+                  stageId: stageRecord.stageId,
+                  stageName: stageRecord.stageName,
+                  error: timeoutError,
+                },
+                {
+                  type: "workflow:failed",
+                  timestamp: deps.clock.now(),
+                  workflowRunId: stageRecord.workflowRunId,
+                  error: timeoutError,
+                },
+                ...buildAnnotationEvents(bufferedAnnotations, deps.clock.now()),
+              ]),
+            );
+          },
+        );
+
+        if (claimResult.status === "stale") {
+          const latestStatus = await deps.persistence.getRunStatus(
+            stageRecord.workflowRunId,
+          );
+          if (latestStatus === "CANCELLED") {
+            await markStageCancelled(stageRecord.id, deps);
+          }
+          continue;
+        }
+        if (claimResult.status === "cancelled") {
+          await markStageCancelled(stageRecord.id, deps);
+          continue;
+        }
+
+        failed++;
+        continue;
       } else {
         // Not ready -- update nextPollAt for next check
         const pollInterval =
