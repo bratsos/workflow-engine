@@ -135,6 +135,7 @@ model WorkflowRun {
 
   @@index([status])
   @@index([workflowId])
+  @@map("workflow_runs")
 }
 
 model WorkflowStage {
@@ -166,11 +167,13 @@ model WorkflowStage {
   errorMessage    String?
 
   logs            WorkflowLog[]
+  artifacts       WorkflowArtifact[]
   annotations     WorkflowAnnotation[]
 
   @@unique([workflowRunId, stageId])
   @@index([status])
   @@index([nextPollAt])
+  @@map("workflow_stages")
 }
 
 model WorkflowLog {
@@ -186,20 +189,26 @@ model WorkflowLog {
 
   @@index([workflowRunId])
   @@index([workflowStageId])
+  @@map("workflow_logs")
 }
 
 model WorkflowArtifact {
-  id            String   @id @default(cuid())
-  createdAt     DateTime @default(now())
-  workflowRunId String
-  workflowRun   WorkflowRun @relation(fields: [workflowRunId], references: [id], onDelete: Cascade)
-  key           String
-  type          String
-  data          Json
-  size          Int
+  id              String          @id @default(cuid())
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+  workflowRunId   String
+  workflowRun     WorkflowRun     @relation(fields: [workflowRunId], references: [id], onDelete: Cascade)
+  workflowStageId String?
+  workflowStage   WorkflowStage?  @relation(fields: [workflowStageId], references: [id], onDelete: SetNull)
+  key             String
+  type            String
+  data            Json
+  size            Int
+  metadata        Json?
 
   @@unique([workflowRunId, key])
   @@index([workflowRunId])
+  @@map("workflow_artifacts")
 }
 
 model AICall {
@@ -217,6 +226,7 @@ model AICall {
   metadata      Json?
 
   @@index([topic])
+  @@map("ai_calls")
 }
 
 model WorkflowAnnotation {
@@ -248,6 +258,7 @@ model WorkflowAnnotation {
   @@index([workflowRunId, createdAt])
   @@index([workflowRunId, scope])
   @@index([workflowRunId, actorId])
+  @@map("workflow_annotations")
 }
 
 model JobQueue {
@@ -262,12 +273,15 @@ model JobQueue {
   maxAttempts   Int       @default(3)
   workerId      String?
   lockedAt      DateTime?
+  startedAt     DateTime?
+  completedAt   DateTime?
   nextPollAt    DateTime?
   payload       Json?
   lastError     String?
 
   @@index([status, priority])
   @@index([nextPollAt])
+  @@map("job_queue")
 }
 
 model OutboxEvent {

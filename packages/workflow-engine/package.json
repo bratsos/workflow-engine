@@ -16,6 +16,7 @@
   "publishConfig": {
     "access": "public"
   },
+  "sideEffects": false,
   "keywords": [
     "workflow",
     "workflow-engine",
@@ -85,21 +86,24 @@
     "typecheck": "tsc --noEmit",
     "build": "tsup",
     "test": "vitest run",
-    "sync-models": "tsx src/cli/sync-models.ts"
+    "sync-models": "tsx src/cli/sync-models.ts",
+    "prisma:generate": "prisma generate --schema ./prisma/schema.prisma",
+    "prisma:db-push": "prisma db push --schema ./prisma/schema.prisma --skip-generate",
+    "test:pg": "vitest run src/__tests__/12-persistence-adapters/prisma-postgres-conformance.test.ts"
   },
   "dependencies": {
     "@ai-sdk/google": "^3.0.1",
     "@ai-sdk/provider": "^3.0.0",
     "@openrouter/ai-sdk-provider": "^2.1.1",
     "ai": "^6.0.3",
-    "js-tiktoken": "^1.0.21",
-    "zod": "^4.1.12"
+    "js-tiktoken": "^1.0.21"
   },
   "peerDependencies": {
     "@anthropic-ai/sdk": ">=0.35.0",
     "@google/genai": ">=1.0.0",
     "@prisma/client": ">=6.0.0",
-    "openai": ">=4.0.0"
+    "openai": ">=4.0.0",
+    "zod": "^4.1.12"
   },
   "peerDependenciesMeta": {
     "@prisma/client": {
@@ -116,11 +120,14 @@
     }
   },
   "devDependencies": {
+    "@prisma/client": "^6.0.0",
     "@types/node": "^22",
+    "prisma": "^6.0.0",
     "tsup": "^8.5.1",
     "tsx": "^4.19.0",
     "typescript": "^5.8.3",
-    "vitest": "^3.2.4"
+    "vitest": "^3.2.4",
+    "zod": "^4.1.12"
   },
   "engines": {
     "node": ">=22.11.0"

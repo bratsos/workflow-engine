@@ -7,6 +7,7 @@ Type-safe, distributed workflow engine for AI-orchestrated processes with suspen
 - [`@bratsos/workflow-engine`](./packages/workflow-engine) - Core library ([npm](https://www.npmjs.com/package/@bratsos/workflow-engine))
 - [`@bratsos/workflow-engine-host-node`](./packages/workflow-engine-host-node) - Node.js host with process loops, signal handling, and continuous job polling
 - [`@bratsos/workflow-engine-host-serverless`](./packages/workflow-engine-host-serverless) - Serverless host for Cloudflare Workers, AWS Lambda, Vercel Edge, etc.
+- [`@bratsos/workflow-engine-host-remote`](./packages/workflow-engine-host-remote) - Credential-free remote activity workers -- run a stage on a separate machine that never sees your database or provider credentials
 
 ## Architecture
 

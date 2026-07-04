@@ -6,14 +6,15 @@ Complete guide for setting up workflow persistence with Prisma.
 
 Before creating persistence instances, verify your Prisma schema:
 
-- [ ] `WorkflowRun` model exists with `duration` field (not `durationMs`)
-- [ ] `WorkflowStage` model exists with `duration` field (not `durationMs`)
+- [ ] `WorkflowRun` model exists with `duration` field (not `durationMs`) and a `version` field for optimistic concurrency
+- [ ] `WorkflowStage` model exists with `duration` field (not `durationMs`), `version`, and `attempt` fields
 - [ ] `WorkflowLog` model exists (required for `ctx.log()`)
 - [ ] `WorkflowArtifact` model exists (required for stage outputs)
+- [ ] `WorkflowAnnotation` model exists (required for `kernel.annotations` / `ctx.annotate()`)
 - [ ] `JobQueue` model exists (required for job processing)
+- [ ] `OutboxEvent` model exists (required for the transactional outbox / `outbox.flush`)
+- [ ] `IdempotencyKey` model exists (required for command idempotency keys)
 - [ ] `Status` enum exists with all values: PENDING, RUNNING, SUSPENDED, COMPLETED, FAILED, CANCELLED, SKIPPED
-- [ ] `LogLevel` enum exists: DEBUG, INFO, WARN, ERROR
-- [ ] `ArtifactType` enum exists: STAGE_OUTPUT, ARTIFACT, METADATA
 - [ ] Table names use `@@map` (e.g., `@@map("workflow_runs")`)
 - [ ] Run `prisma db push` or `prisma migrate dev` after schema changes
 
@@ -47,6 +48,9 @@ interface WorkflowPersistence {
   getRun(id: string): Promise<WorkflowRunRecord | null>;
   getRunStatus(id: string): Promise<WorkflowStatus | null>;
   getRunsByStatus(status: WorkflowStatus): Promise<WorkflowRunRecord[]>;
+  getStuckRuns(stuckSince: Date): Promise<WorkflowRunRecord[]>;
+  claimPendingRun(id: string): Promise<boolean>;
+  claimNextPendingRun(): Promise<WorkflowRunRecord | null>;
 
   // WorkflowStage operations
   createStage(data: CreateStageInput): Promise<WorkflowStageRecord>;
@@ -74,6 +78,10 @@ interface WorkflowPersistence {
   listArtifacts(runId): Promise<WorkflowArtifactRecord[]>;
   getStageIdForArtifact(runId, stageId): Promise<string | null>;
 
+  // WorkflowAnnotation operations
+  appendAnnotations(inputs: CreateAnnotationInput[]): Promise<void>;
+  listAnnotations(workflowRunId: string, filters?: AnnotationFilters): Promise<WorkflowAnnotationRecord[]>;
+
   // Stage output convenience
   saveStageOutput(runId, workflowType, stageId, output): Promise<string>;
 
@@ -86,7 +94,18 @@ interface WorkflowPersistence {
   replayDLQEvents(maxEvents: number): Promise<number>;
 
   // Idempotency operations
-  acquireIdempotencyKey(key: string, commandType: string): Promise<
+  //
+  // `options.staleInProgressAfterMs` lets a dispatch reclaim a key stuck
+  // `in_progress` (e.g. a previous dispatcher crashed between committing
+  // its transaction and calling `completeIdempotencyKey`) once it has
+  // been in progress for at least that long, measured against
+  // `options.now`. The kernel passes this automatically -- see
+  // `KernelConfig.idempotencyStaleInProgressMs` (default 10 minutes).
+  acquireIdempotencyKey(
+    key: string,
+    commandType: string,
+    options?: { now?: Date; staleInProgressAfterMs?: number },
+  ): Promise<
     | { status: "acquired" }
     | { status: "replay"; result: unknown }
     | { status: "in_progress" }
@@ -119,8 +138,10 @@ interface JobQueue {
   complete(jobId: string): Promise<void>;
   suspend(jobId: string, nextPollAt: Date): Promise<void>;
   fail(jobId: string, error: string, shouldRetry?: boolean): Promise<void>;
-  getSuspendedJobsReadyToPoll(): Promise<Array<{ jobId, stageId, workflowRunId }>>;
   releaseStaleJobs(staleThresholdMs?: number): Promise<number>;
+  cancelByRun(workflowRunId: string): Promise<number>;
+  getJobsByWorkflowRun(workflowRunId: string): Promise<JobRecord[]>;
+  touchJob(jobId: string): Promise<void>;
 }
 ```
 
@@ -137,7 +158,9 @@ interface AICallLogger {
 
 ## Prisma Schema
 
-### Required Enums
+The authoritative copy of this schema lives in the package [README](../../../README.md#getting-started) and in `prisma/schema.prisma`. If this block and the README ever disagree, trust the README / `prisma/schema.prisma`.
+
+### Required Enum
 
 ```prisma
 // Unified status enum for workflows, stages, and jobs
@@ -150,69 +173,62 @@ enum Status {
   CANCELLED
   SKIPPED
 }
-
-enum LogLevel {
-  DEBUG
-  INFO
-  WARN
-  ERROR
-}
-
-enum ArtifactType {
-  STAGE_OUTPUT
-  ARTIFACT
-  METADATA
-}
 ```
+
+`LogLevel` and `ArtifactType` are **not** enums -- `WorkflowLog.level` and `WorkflowArtifact.type` are plain `String` columns (the engine validates the values at the TypeScript layer).
 
 ### WorkflowRun Model
 
 ```prisma
 model WorkflowRun {
-  id            String    @id @default(cuid())
-  createdAt     DateTime  @default(now())
-  updatedAt     DateTime  @updatedAt
+  id            String   @id @default(cuid())
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  version       Int      @default(1)
   workflowId    String
   workflowName  String
   workflowType  String
-  status        Status    @default(PENDING)
+  status        Status   @default(PENDING)
   startedAt     DateTime?
   completedAt   DateTime?
   duration      Int?
   input         Json
   output        Json?
-  config        Json      @default("{}")
-  totalCost     Float     @default(0)
-  totalTokens   Int       @default(0)
-  priority      Int       @default(5)
+  config        Json           @default("{}")
+  totalCost     Float          @default(0)
+  totalTokens   Int            @default(0)
+  priority      Int            @default(5)
+  metadata      Json?
 
-  // Relations
   stages        WorkflowStage[]
   logs          WorkflowLog[]
   artifacts     WorkflowArtifact[]
+  annotations   WorkflowAnnotation[]
 
-  // Indexes for common queries
   @@index([status])
-  @@index([workflowType])
-  @@index([createdAt])
-
+  @@index([workflowId])
   @@map("workflow_runs")
 }
 ```
+
+`version` backs optimistic concurrency on `updateRun` (see `expectedVersion` on `UpdateRunInput`); it is incremented on every update, whether or not the caller passes `expectedVersion`. `metadata` is a free-form JSON slot passed through from `CreateRunInput.metadata` -- it is stored as-is, not spread into columns.
 
 ### WorkflowStage Model
 
 ```prisma
 model WorkflowStage {
-  id              String    @id @default(cuid())
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @updatedAt
+  id              String              @id @default(cuid())
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
+  version         Int                 @default(1)
   workflowRunId   String
+  workflowRun     WorkflowRun         @relation(fields: [workflowRunId], references: [id], onDelete: Cascade)
   stageId         String
   stageName       String
   stageNumber     Int
   executionGroup  Int
-  status          Status    @default(PENDING)
+  attempt         Int                 @default(0)
+  status          Status              @default(PENDING)
   startedAt       DateTime?
   completedAt     DateTime?
   duration        Int?
@@ -228,39 +244,35 @@ model WorkflowStage {
   embeddingInfo   Json?
   errorMessage    String?
 
-  // Relations
-  workflowRun     WorkflowRun        @relation(fields: [workflowRunId], references: [id], onDelete: Cascade)
   logs            WorkflowLog[]
   artifacts       WorkflowArtifact[]
+  annotations     WorkflowAnnotation[]
 
-  // Unique constraint for stage lookup
   @@unique([workflowRunId, stageId])
   @@index([status])
   @@index([nextPollAt])
-
   @@map("workflow_stages")
 }
 ```
+
+`attempt` is the rerun generation: 0 for the original execution, incremented each time `run.rerunFrom` recreates the stage. Annotations written by `ctx.annotate(...)` during a stage inherit its `attempt` value so a later query can distinguish decisions made on different attempts of the same logical stage.
 
 ### WorkflowLog Model
 
 ```prisma
 model WorkflowLog {
-  id              String         @id @default(cuid())
-  createdAt       DateTime       @default(now())
+  id              String          @id @default(cuid())
+  createdAt       DateTime        @default(now())
   workflowRunId   String?
+  workflowRun     WorkflowRun?    @relation(fields: [workflowRunId], references: [id], onDelete: Cascade)
   workflowStageId String?
-  level           LogLevel
+  workflowStage   WorkflowStage?  @relation(fields: [workflowStageId], references: [id], onDelete: Cascade)
+  level           String
   message         String
   metadata        Json?
 
-  // Relations
-  workflowRun     WorkflowRun?   @relation(fields: [workflowRunId], references: [id], onDelete: Cascade)
-  workflowStage   WorkflowStage? @relation(fields: [workflowStageId], references: [id], onDelete: Cascade)
-
   @@index([workflowRunId])
-  @@index([createdAt])
-
+  @@index([workflowStageId])
   @@map("workflow_logs")
 }
 ```
@@ -269,28 +281,62 @@ model WorkflowLog {
 
 ```prisma
 model WorkflowArtifact {
-  id              String       @id @default(cuid())
-  createdAt       DateTime     @default(now())
-  updatedAt       DateTime     @updatedAt
+  id              String          @id @default(cuid())
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
   workflowRunId   String
+  workflowRun     WorkflowRun     @relation(fields: [workflowRunId], references: [id], onDelete: Cascade)
   workflowStageId String?
+  workflowStage   WorkflowStage?  @relation(fields: [workflowStageId], references: [id], onDelete: SetNull)
   key             String
-  type            ArtifactType
+  type            String
   data            Json
   size            Int
   metadata        Json?
 
-  // Relations
-  workflowRun     WorkflowRun   @relation(fields: [workflowRunId], references: [id], onDelete: Cascade)
-  workflowStage   WorkflowStage? @relation(fields: [workflowStageId], references: [id], onDelete: Cascade)
-
-  // Unique constraint for artifact lookup
   @@unique([workflowRunId, key])
-  @@index([type])
-
+  @@index([workflowRunId])
   @@map("workflow_artifacts")
 }
 ```
+
+### WorkflowAnnotation Model
+
+```prisma
+model WorkflowAnnotation {
+  id                    String   @id @default(cuid())
+  createdAt             DateTime @default(now())
+
+  workflowRunId         String
+  workflowRun           WorkflowRun     @relation(fields: [workflowRunId], references: [id], onDelete: Cascade)
+
+  workflowStageRecordId String?
+  workflowStage         WorkflowStage?  @relation(fields: [workflowStageRecordId], references: [id], onDelete: SetNull)
+  attempt               Int             @default(0)
+
+  scope                 String          // "run" | "stage" | "ai_call" | custom
+  scopeId               String?
+
+  actorKind             String?         // "agent" | "user" | "system" (open)
+  actorId               String?
+  actorVersion          String?
+
+  key                   String          // dot-namespaced, e.g. "trigger.source"
+  value                 Json            // scalar or scalar-array preferred
+  payload               Json?           // opt-in blob slot for non-queryable rich data
+
+  idempotencyKey        String?
+
+  @@unique([workflowRunId, key, idempotencyKey])
+  @@index([workflowRunId, key])
+  @@index([workflowRunId, createdAt])
+  @@index([workflowRunId, scope])
+  @@index([workflowRunId, actorId])
+  @@map("workflow_annotations")
+}
+```
+
+Backs `kernel.annotations.attach(...)` / `kernel.annotations.list(...)` and `ctx.annotate(...)`. Rows sharing `(workflowRunId, key, idempotencyKey)` are deduplicated via the unique constraint -- retries with the same `idempotencyKey` are silently skipped rather than erroring.
 
 ### JobQueue Model
 
@@ -303,22 +349,62 @@ model JobQueue {
   stageId       String
   status        Status    @default(PENDING)
   priority      Int       @default(5)
+  attempt       Int       @default(0)
+  maxAttempts   Int       @default(3)
   workerId      String?
   lockedAt      DateTime?
   startedAt     DateTime?
   completedAt   DateTime?
-  attempt       Int       @default(0)
-  maxAttempts   Int       @default(3)
-  lastError     String?
   nextPollAt    DateTime?
-  payload       Json      @default("{}")
+  payload       Json?
+  lastError     String?
 
-  @@index([status, nextPollAt])
-  @@index([workflowRunId])
-
+  @@index([status, priority])
+  @@index([nextPollAt])
   @@map("job_queue")
 }
 ```
+
+### OutboxEvent Model
+
+```prisma
+model OutboxEvent {
+  id              String    @id @default(cuid())
+  createdAt       DateTime  @default(now())
+  workflowRunId   String
+  sequence        Int
+  eventType       String
+  payload         Json
+  causationId     String
+  occurredAt      DateTime
+  publishedAt     DateTime?
+  retryCount      Int       @default(0)
+  dlqAt           DateTime?
+
+  @@unique([workflowRunId, sequence])
+  @@index([publishedAt])
+  @@map("outbox_events")
+}
+```
+
+Backs the kernel's transactional outbox: command handlers write events here in the same transaction as their state changes, and `outbox.flush` publishes them to the `EventSink` afterward. `dlqAt` marks events that exhausted their retry budget; `replayDLQEvents` resets them for reprocessing.
+
+### IdempotencyKey Model
+
+```prisma
+model IdempotencyKey {
+  id          String   @id @default(cuid())
+  createdAt   DateTime @default(now())
+  key         String
+  commandType String
+  result      Json
+
+  @@unique([key, commandType])
+  @@map("idempotency_keys")
+}
+```
+
+Backs `acquireIdempotencyKey` / `completeIdempotencyKey` / `releaseIdempotencyKey`. A row's `result` holds an internal in-progress marker until the command completes, at which point it's overwritten with the cached command result (so a replayed dispatch with the same key returns it without re-executing). `createdAt` doubles as the "acquired at" timestamp: if a dispatcher crashes after committing its transaction but before calling `completeIdempotencyKey`, the row is left stuck with the in-progress marker forever. The kernel guards against this by reclaiming keys that have been `in_progress` for longer than `KernelConfig.idempotencyStaleInProgressMs` (default 10 minutes) -- see `acquireIdempotencyKey`'s `staleInProgressAfterMs` option above.
 
 ### AICall Model
 
@@ -338,9 +424,6 @@ model AICall {
   metadata      Json?
 
   @@index([topic])
-  @@index([createdAt])
-  @@index([modelKey])
-
   @@map("ai_calls")
 }
 ```
@@ -438,6 +521,7 @@ interface WorkflowRunRecord {
   id: string;
   createdAt: Date;
   updatedAt: Date;
+  version: number;
   workflowId: string;
   workflowName: string;
   workflowType: string;
@@ -451,17 +535,20 @@ interface WorkflowRunRecord {
   totalCost: number;
   totalTokens: number;
   priority: number;
+  metadata: unknown | null;
 }
 
 interface WorkflowStageRecord {
   id: string;
   createdAt: Date;
   updatedAt: Date;
+  version: number;
   workflowRunId: string;
   stageId: string;
   stageName: string;
   stageNumber: number;
   executionGroup: number;
+  attempt: number;   // rerun generation; 0 for the original execution
   status: WorkflowStageStatus;
   startedAt: Date | null;
   completedAt: Date | null;
@@ -497,11 +584,12 @@ interface CreateRunInput {
 interface UpdateRunInput {
   status?: WorkflowStatus;
   startedAt?: Date;
-  completedAt?: Date;
-  duration?: number;
+  completedAt?: Date | null;
+  duration?: number | null;
   output?: unknown;
   totalCost?: number;
   totalTokens?: number;
+  expectedVersion?: number;  // optimistic concurrency; version always bumps regardless
 }
 
 interface CreateStageInput {
@@ -510,6 +598,7 @@ interface CreateStageInput {
   stageName: string;
   stageNumber: number;
   executionGroup: number;
+  attempt?: number;  // rerun generation; defaults to 0
   status?: WorkflowStageStatus;
   startedAt?: Date;
   config?: unknown;
@@ -530,7 +619,9 @@ interface UpdateStageInput {
   maxWaitUntil?: Date;
   metrics?: unknown;
   embeddingInfo?: unknown;
+  artifacts?: unknown;
   errorMessage?: string;
+  expectedVersion?: number;
 }
 ```
 
@@ -550,6 +641,7 @@ class CustomPersistence implements WorkflowPersistence {
       id: data.id ?? crypto.randomUUID(),
       createdAt: new Date(),
       updatedAt: new Date(),
+      version: 1,
       workflowId: data.workflowId,
       workflowName: data.workflowName,
       workflowType: data.workflowType,
@@ -563,6 +655,7 @@ class CustomPersistence implements WorkflowPersistence {
       totalCost: 0,
       totalTokens: 0,
       priority: data.priority ?? 5,
+      metadata: data.metadata ?? null,
     };
     this.runs.set(run.id, run);
     return run;
