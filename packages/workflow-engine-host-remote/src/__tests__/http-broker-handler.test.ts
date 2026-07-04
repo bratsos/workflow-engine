@@ -430,6 +430,45 @@ describe("handleBrokerRequest — blob", () => {
   });
 });
 
+describe("handleBrokerRequest — presign without publicBaseUrl", () => {
+  it("fails loudly with 500 instead of minting a portless URL", async () => {
+    const { deps, broker } = makeSetup();
+    // Strip the publicBaseUrl configured by makeSetup — this reproduces the
+    // pure-handler path (handleBrokerRequest called directly, not through
+    // createBrokerHttpServer's Host-header derivation).
+    const depsWithoutBaseUrl = { ...deps, publicBaseUrl: undefined };
+    await submitTask(broker);
+
+    const leaseRes = await handleBrokerRequest(
+      depsWithoutBaseUrl,
+      req("POST", "/lease", {
+        workerId: "w1",
+        stageIds: ["heavy"],
+        stageCodeVersion: "v1",
+      }),
+    );
+    const task = leaseRes.json as {
+      taskId: string;
+      leaseToken: string;
+      grant: { prefix: string };
+    };
+
+    const presignRes = await handleBrokerRequest(
+      depsWithoutBaseUrl,
+      req("POST", "/presign", {
+        taskId: task.taskId,
+        leaseToken: task.leaseToken,
+        relKey: `${task.grant.prefix}artifact.json`,
+        op: "put",
+      }),
+    );
+    expect(presignRes.status).toBe(500);
+    expect((presignRes.json as { error: string }).error).toMatch(
+      /publicBaseUrl/,
+    );
+  });
+});
+
 describe("handleBrokerRequest — unknown route", () => {
   it("returns 404 for unknown paths", async () => {
     const { deps } = makeSetup();

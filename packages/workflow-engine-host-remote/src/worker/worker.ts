@@ -19,6 +19,14 @@ export interface ActivityWorkerConfig {
    */
   heartbeatMs?: number;
   idleDelayMs?: number;
+  /**
+   * Called whenever processOne() throws (e.g. a permanent lease/version
+   * mismatch). Defaults to console.error so failures are never silently
+   * swallowed. Receives the running count of consecutive failures — the
+   * loop also backs off (capped by maxBackoffMs) as this count grows.
+   */
+  onError?: (error: unknown, info: { consecutiveFailures: number }) => void;
+  maxBackoffMs?: number;
 }
 
 export interface ActivityWorker {
@@ -32,6 +40,15 @@ export function createActivityWorker(
 ): ActivityWorker {
   const heartbeatMs = cfg.heartbeatMs ?? 5_000;
   const idleDelayMs = cfg.idleDelayMs ?? 500;
+  const maxBackoffMs = cfg.maxBackoffMs ?? 30_000;
+  const onError =
+    cfg.onError ??
+    ((error: unknown, info: { consecutiveFailures: number }) => {
+      console.error(
+        `[activity-worker ${cfg.workerId}] processOne failed (consecutive failures: ${info.consecutiveFailures})`,
+        error,
+      );
+    });
   let running = false;
 
   async function processOne(): Promise<boolean> {
@@ -58,13 +75,31 @@ export function createActivityWorker(
       return true;
     }
 
+    // The Stage execution contract (see `Stage.execute` in
+    // @bratsos/workflow-engine) has no AbortSignal parameter, so a running
+    // activity cannot be interrupted mid-flight. Instead: as soon as the
+    // broker's heartbeat response signals `cancel` (the lease was fenced or
+    // reaped, e.g. by another worker or a stale-lease sweep), stop
+    // heartbeating and skip the presign/report once execution finishes — a
+    // reaped worker still burns the remaining compute, but it no longer
+    // wastes a doomed report round-trip afterwards.
+    let cancelled = false;
     const beat = setInterval(() => {
       void cfg.transport
         .heartbeat({ taskId: task.taskId, leaseToken: task.leaseToken })
+        .then((res) => {
+          if (!res.ok || res.cancel) {
+            cancelled = true;
+            clearInterval(beat);
+          }
+        })
         .catch(() => {});
     }, heartbeatMs);
     try {
       const report = await runActivity(task, stage, cfg.transport);
+      if (cancelled) {
+        return true;
+      }
       // Write a durable copy of the report to object storage BEFORE telling the
       // broker. This ensures that if the orchestrator restarts after the worker
       // completes (and the broker loses the REPORTED task), checkCompletion can
@@ -91,9 +126,26 @@ export function createActivityWorker(
   }
 
   async function loop(): Promise<void> {
+    let consecutiveFailures = 0;
     while (running) {
-      const did = await processOne().catch(() => false);
-      if (!did) await new Promise((r) => setTimeout(r, idleDelayMs));
+      let did = false;
+      try {
+        did = await processOne();
+        consecutiveFailures = 0;
+      } catch (error) {
+        consecutiveFailures++;
+        onError(error, { consecutiveFailures });
+      }
+      if (!did) {
+        const delay =
+          consecutiveFailures > 0
+            ? Math.min(
+                idleDelayMs * 2 ** (consecutiveFailures - 1),
+                maxBackoffMs,
+              )
+            : idleDelayMs;
+        await new Promise((r) => setTimeout(r, delay));
+      }
     }
   }
 

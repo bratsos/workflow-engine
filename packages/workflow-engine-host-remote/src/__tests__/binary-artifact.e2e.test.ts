@@ -124,91 +124,83 @@ describe("worker-client — binary round-trip over HTTP", () => {
     });
   }
 
-  it(
-    "putBytes with Uint8Array sends application/octet-stream",
-    { timeout: 5_000 },
-    async () => {
-      const { baseUrl, close } = await startEchoServer();
-      teardowns.push(close);
+  it("putBytes with Uint8Array sends application/octet-stream", {
+    timeout: 5_000,
+  }, async () => {
+    const { baseUrl, close } = await startEchoServer();
+    teardowns.push(close);
 
-      let capturedContentType: string | null = null;
-      let capturedBody: Buffer | null = null;
+    let capturedContentType: string | null = null;
+    let capturedBody: Buffer | null = null;
 
-      // Intercept the PUT using a second server that captures.
-      const captureServer = http.createServer((req, res) => {
-        const chunks: Buffer[] = [];
-        req.on("data", (c: Buffer) => chunks.push(c));
-        req.on("end", () => {
-          capturedContentType = req.headers["content-type"] ?? null;
-          capturedBody = Buffer.concat(chunks);
-          res.writeHead(200);
-          res.end();
-        });
+    // Intercept the PUT using a second server that captures.
+    const captureServer = http.createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (c: Buffer) => chunks.push(c));
+      req.on("end", () => {
+        capturedContentType = req.headers["content-type"] ?? null;
+        capturedBody = Buffer.concat(chunks);
+        res.writeHead(200);
+        res.end();
       });
+    });
 
-      await new Promise<void>((resolve) =>
-        captureServer.listen(0, "127.0.0.1", resolve),
-      );
-      const capturePort = (captureServer.address() as AddressInfo).port;
-      const captureUrl = `http://127.0.0.1:${capturePort}`;
-      teardowns.push(
-        () =>
-          new Promise<void>((res, rej) =>
-            captureServer.close((e) => (e ? rej(e) : res())),
-          ),
-      );
+    await new Promise<void>((resolve) =>
+      captureServer.listen(0, "127.0.0.1", resolve),
+    );
+    const capturePort = (captureServer.address() as AddressInfo).port;
+    const captureUrl = `http://127.0.0.1:${capturePort}`;
+    teardowns.push(
+      () =>
+        new Promise<void>((res, rej) =>
+          captureServer.close((e) => (e ? rej(e) : res())),
+        ),
+    );
 
-      // Use the capture URL as the baseUrl so auth headers are included and
-      // we can inspect what was sent.
-      const transport = createHttpWorkerTransport({ baseUrl: captureUrl });
-      await transport.putBytes(`${captureUrl}/data`, BINARY_BYTES);
+    // Use the capture URL as the baseUrl so auth headers are included and
+    // we can inspect what was sent.
+    const transport = createHttpWorkerTransport({ baseUrl: captureUrl });
+    await transport.putBytes(`${captureUrl}/data`, BINARY_BYTES);
 
-      expect(capturedContentType).toBe("application/octet-stream");
-      expect(capturedBody).not.toBeNull();
-      expect(Array.from(new Uint8Array(capturedBody!))).toEqual(
-        Array.from(BINARY_BYTES),
-      );
-    },
-  );
+    expect(capturedContentType).toBe("application/octet-stream");
+    expect(capturedBody).not.toBeNull();
+    expect(Array.from(new Uint8Array(capturedBody!))).toEqual(
+      Array.from(BINARY_BYTES),
+    );
+  });
 
-  it(
-    "getBytes receiving application/octet-stream returns Uint8Array",
-    { timeout: 5_000 },
-    async () => {
-      const { baseUrl, close } = await startEchoServer();
-      teardowns.push(close);
+  it("getBytes receiving application/octet-stream returns Uint8Array", {
+    timeout: 5_000,
+  }, async () => {
+    const { baseUrl, close } = await startEchoServer();
+    teardowns.push(close);
 
-      const transport = createHttpWorkerTransport({ baseUrl });
-      const putUrl = `${baseUrl}/data`;
-      const getUrl = `${baseUrl}/data`;
+    const transport = createHttpWorkerTransport({ baseUrl });
+    const putUrl = `${baseUrl}/data`;
+    const getUrl = `${baseUrl}/data`;
 
-      await transport.putBytes(putUrl, BINARY_BYTES);
-      const result = await transport.getBytes(getUrl);
+    await transport.putBytes(putUrl, BINARY_BYTES);
+    const result = await transport.getBytes(getUrl);
 
-      expect(result).toBeInstanceOf(Uint8Array);
-      expect(Array.from(result as Uint8Array)).toEqual(
-        Array.from(BINARY_BYTES),
-      );
-    },
-  );
+    expect(result).toBeInstanceOf(Uint8Array);
+    expect(Array.from(result as Uint8Array)).toEqual(Array.from(BINARY_BYTES));
+  });
 
-  it(
-    "JSON: putBytes with object sends application/json; getBytes returns object",
-    { timeout: 5_000 },
-    async () => {
-      const { baseUrl, close } = await startEchoServer();
-      teardowns.push(close);
+  it("JSON: putBytes with object sends application/json; getBytes returns object", {
+    timeout: 5_000,
+  }, async () => {
+    const { baseUrl, close } = await startEchoServer();
+    teardowns.push(close);
 
-      const transport = createHttpWorkerTransport({ baseUrl });
-      const putUrl = `${baseUrl}/data`;
-      const getUrl = `${baseUrl}/data`;
+    const transport = createHttpWorkerTransport({ baseUrl });
+    const putUrl = `${baseUrl}/data`;
+    const getUrl = `${baseUrl}/data`;
 
-      await transport.putBytes(putUrl, { hello: "world" });
-      const result = await transport.getBytes(getUrl);
+    await transport.putBytes(putUrl, { hello: "world" });
+    const result = await transport.getBytes(getUrl);
 
-      expect(result).toEqual({ hello: "world" });
-    },
-  );
+    expect(result).toEqual({ hello: "world" });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -347,62 +339,54 @@ describe("S3BlobStore — binary round-trip (fake-S3)", () => {
     teardowns.length = 0;
   });
 
-  it(
-    "put(key, Uint8Array) → get(key) returns equal bytes",
-    { timeout: 10_000 },
-    async () => {
-      const { baseUrl, close } = await startFakeS3Binary("test-bucket");
-      teardowns.push(close);
+  it("put(key, Uint8Array) → get(key) returns equal bytes", {
+    timeout: 10_000,
+  }, async () => {
+    const { baseUrl, close } = await startFakeS3Binary("test-bucket");
+    teardowns.push(close);
 
-      const store = createS3BlobStore(makeS3Config(baseUrl, "test-bucket"));
-      await store.put("binary/data.bin", BINARY_BYTES);
-      const result = await store.get("binary/data.bin");
+    const store = createS3BlobStore(makeS3Config(baseUrl, "test-bucket"));
+    await store.put("binary/data.bin", BINARY_BYTES);
+    const result = await store.get("binary/data.bin");
 
-      expect(result).toBeInstanceOf(Uint8Array);
-      expect(Array.from(result as Uint8Array)).toEqual(
-        Array.from(BINARY_BYTES),
-      );
-    },
-  );
+    expect(result).toBeInstanceOf(Uint8Array);
+    expect(Array.from(result as Uint8Array)).toEqual(Array.from(BINARY_BYTES));
+  });
 
-  it(
-    "put(key, JSON) → get(key) returns same JSON (JSON still works)",
-    { timeout: 10_000 },
-    async () => {
-      const { baseUrl, close } = await startFakeS3Binary("test-bucket");
-      teardowns.push(close);
+  it("put(key, JSON) → get(key) returns same JSON (JSON still works)", {
+    timeout: 10_000,
+  }, async () => {
+    const { baseUrl, close } = await startFakeS3Binary("test-bucket");
+    teardowns.push(close);
 
-      const store = createS3BlobStore(makeS3Config(baseUrl, "test-bucket"));
-      await store.put("json/data.json", { hello: "world" });
-      const result = await store.get("json/data.json");
+    const store = createS3BlobStore(makeS3Config(baseUrl, "test-bucket"));
+    await store.put("json/data.json", { hello: "world" });
+    const result = await store.get("json/data.json");
 
-      expect(result).toEqual({ hello: "world" });
-    },
-  );
+    expect(result).toEqual({ hello: "world" });
+  });
 
-  it(
-    "has, list, delete are unaffected by binary support",
-    { timeout: 10_000 },
-    async () => {
-      const { baseUrl, close } = await startFakeS3Binary("test-bucket");
-      teardowns.push(close);
+  it("has, list, delete are unaffected by binary support", {
+    timeout: 10_000,
+  }, async () => {
+    const { baseUrl, close } = await startFakeS3Binary("test-bucket");
+    teardowns.push(close);
 
-      const store = createS3BlobStore(makeS3Config(baseUrl, "test-bucket"));
-      await store.put("prefix/file1.bin", BINARY_BYTES);
-      await store.put("prefix/file2.json", { x: 1 });
+    const store = createS3BlobStore(makeS3Config(baseUrl, "test-bucket"));
+    await store.put("prefix/file1.bin", BINARY_BYTES);
+    await store.put("prefix/file2.json", { x: 1 });
 
-      expect(await store.has("prefix/file1.bin")).toBe(true);
-      expect(await store.has("prefix/file2.json")).toBe(true);
-      expect(await store.has("prefix/nonexistent")).toBe(false);
+    expect(await store.has("prefix/file1.bin")).toBe(true);
+    expect(await store.has("prefix/file2.json")).toBe(true);
+    expect(await store.has("prefix/nonexistent")).toBe(false);
 
-      const keys = await store.list("prefix/");
-      expect(keys).toContain("prefix/file1.bin");
-      expect(keys).toContain("prefix/file2.json");
+    const keys = await store.list("prefix/");
+    expect(keys).toContain("prefix/file1.bin");
+    expect(keys).toContain("prefix/file2.json");
 
-      await store.delete("prefix/file1.bin");
-      expect(await store.has("prefix/file1.bin")).toBe(false);
-    },
-  );
+    await store.delete("prefix/file1.bin");
+    expect(await store.has("prefix/file1.bin")).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -459,56 +443,50 @@ describe("broker-server blob shim — binary round-trip", () => {
     };
   }
 
-  it(
-    "binary Uint8Array round-trips through the /blob shim (PUT then GET)",
-    { timeout: 10_000 },
-    async () => {
-      const { brokerBaseUrl, os, close } = await startBlobShimServer();
-      teardowns.push(close);
+  it("binary Uint8Array round-trips through the /blob shim (PUT then GET)", {
+    timeout: 10_000,
+  }, async () => {
+    const { brokerBaseUrl, os, close } = await startBlobShimServer();
+    teardowns.push(close);
 
-      const transport = createHttpWorkerTransport({ baseUrl: brokerBaseUrl });
+    const transport = createHttpWorkerTransport({ baseUrl: brokerBaseUrl });
 
-      // Presign directly via the objectStore (bypasses broker lease check).
-      const memPutUrl = await os.presignPut("artifacts/binary.bin", 60_000);
-      const blobPutUrl = `${brokerBaseUrl}/blob?u=${encodeURIComponent(memPutUrl)}`;
+    // Presign directly via the objectStore (bypasses broker lease check).
+    const memPutUrl = await os.presignPut("artifacts/binary.bin", 60_000);
+    const blobPutUrl = `${brokerBaseUrl}/blob?u=${encodeURIComponent(memPutUrl)}`;
 
-      // PUT binary via transport through the /blob shim.
-      await transport.putBytes(blobPutUrl, BINARY_BYTES);
+    // PUT binary via transport through the /blob shim.
+    await transport.putBytes(blobPutUrl, BINARY_BYTES);
 
-      // Presign a GET URL for the same key.
-      const memGetUrl = await os.presignGet("artifacts/binary.bin", 60_000);
-      const blobGetUrl = `${brokerBaseUrl}/blob?u=${encodeURIComponent(memGetUrl)}`;
+    // Presign a GET URL for the same key.
+    const memGetUrl = await os.presignGet("artifacts/binary.bin", 60_000);
+    const blobGetUrl = `${brokerBaseUrl}/blob?u=${encodeURIComponent(memGetUrl)}`;
 
-      // GET via transport — must return the same bytes.
-      const result = await transport.getBytes(blobGetUrl);
+    // GET via transport — must return the same bytes.
+    const result = await transport.getBytes(blobGetUrl);
 
-      expect(result).toBeInstanceOf(Uint8Array);
-      expect(Array.from(result as Uint8Array)).toEqual(
-        Array.from(BINARY_BYTES),
-      );
-    },
-  );
+    expect(result).toBeInstanceOf(Uint8Array);
+    expect(Array.from(result as Uint8Array)).toEqual(Array.from(BINARY_BYTES));
+  });
 
-  it(
-    "JSON still round-trips through the /blob shim",
-    { timeout: 10_000 },
-    async () => {
-      const { brokerBaseUrl, os, close } = await startBlobShimServer();
-      teardowns.push(close);
+  it("JSON still round-trips through the /blob shim", {
+    timeout: 10_000,
+  }, async () => {
+    const { brokerBaseUrl, os, close } = await startBlobShimServer();
+    teardowns.push(close);
 
-      const transport = createHttpWorkerTransport({ baseUrl: brokerBaseUrl });
+    const transport = createHttpWorkerTransport({ baseUrl: brokerBaseUrl });
 
-      const memPutUrl = await os.presignPut("artifacts/data.json", 60_000);
-      const blobPutUrl = `${brokerBaseUrl}/blob?u=${encodeURIComponent(memPutUrl)}`;
+    const memPutUrl = await os.presignPut("artifacts/data.json", 60_000);
+    const blobPutUrl = `${brokerBaseUrl}/blob?u=${encodeURIComponent(memPutUrl)}`;
 
-      await transport.putBytes(blobPutUrl, { hello: "world" });
+    await transport.putBytes(blobPutUrl, { hello: "world" });
 
-      const memGetUrl = await os.presignGet("artifacts/data.json", 60_000);
-      const blobGetUrl = `${brokerBaseUrl}/blob?u=${encodeURIComponent(memGetUrl)}`;
+    const memGetUrl = await os.presignGet("artifacts/data.json", 60_000);
+    const blobGetUrl = `${brokerBaseUrl}/blob?u=${encodeURIComponent(memGetUrl)}`;
 
-      const result = await transport.getBytes(blobGetUrl);
+    const result = await transport.getBytes(blobGetUrl);
 
-      expect(result).toEqual({ hello: "world" });
-    },
-  );
+    expect(result).toEqual({ hello: "world" });
+  });
 });

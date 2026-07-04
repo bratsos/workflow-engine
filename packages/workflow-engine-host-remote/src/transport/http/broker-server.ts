@@ -155,9 +155,20 @@ export async function handleBrokerRequest(
       let blobUrl: string;
       if (isAbsoluteHttpUrl(presignResp.url)) {
         blobUrl = presignResp.url;
+      } else if (deps.publicBaseUrl) {
+        blobUrl = `${deps.publicBaseUrl}/blob?u=${encodeURIComponent(presignResp.url)}`;
       } else {
-        const base = deps.publicBaseUrl ?? "http://127.0.0.1";
-        blobUrl = `${base}/blob?u=${encodeURIComponent(presignResp.url)}`;
+        // No publicBaseUrl was configured or derivable (e.g. handleBrokerRequest
+        // called directly, outside createBrokerHttpServer's Host-header
+        // derivation). Minting a portless "http://127.0.0.1" URL here would be
+        // silently unusable — fail loudly instead.
+        return {
+          status: 500,
+          json: {
+            error:
+              "publicBaseUrl is not configured; cannot construct a blob URL for a non-absolute presigned URL",
+          },
+        };
       }
       return { status: 200, json: { url: blobUrl } };
     } catch (err) {
