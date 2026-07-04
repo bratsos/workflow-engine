@@ -158,6 +158,8 @@ const result = await ai.generateText(
   {
     temperature: 0.7,   // 0-2, default 0.7
     maxTokens: 1000,    // Max output tokens
+    maxRetries: 2,       // v0.11+: forwarded to the AI SDK call
+    abortSignal: controller.signal, // v0.11+: forwarded to the AI SDK call
   }
 );
 
@@ -166,6 +168,8 @@ console.log(result.inputTokens);    // Token count
 console.log(result.outputTokens);
 console.log(result.cost);           // Calculated cost
 ```
+
+`maxRetries` and `abortSignal` (v0.11+) are also available on `generateObject` and `streamText` options — see below. They are not available on `embed()` options.
 
 ### Multimodal Input
 
@@ -272,7 +276,8 @@ const result = await ai.embed(
   "The quick brown fox",
 );
 
-// Multiple texts (batch)
+// Multiple texts (batch) -- as of v0.11, backed by the AI SDK's embedMany()
+// (a single round-trip) instead of one embed() call per text.
 const result = await ai.embed("text-embedding-004", [
   "First document",
   "Second document",
@@ -469,7 +474,9 @@ console.log(handle.provider); // "anthropic"
 const status = await batch.getStatus(handle.id);
 // { id: "...", status: "processing" | "completed" | "failed", provider: "anthropic" }
 
-// Get results (when completed)
+// Get results (when completed) -- a request submitted with a `schema` has
+// its JSON output validated against it; a response that fails validation
+// comes back as status: "failed" rather than an unvalidated blob.
 const results = await batch.getResults(handle.id);
 // [
 //   { id: "req-1", result: "...", inputTokens: 100, outputTokens: 50, status: "succeeded" },
@@ -479,6 +486,24 @@ const results = await batch.getResults(handle.id);
 // Check if already recorded (avoid duplicate logging)
 const recorded = await batch.isRecorded(handle.id);
 ```
+
+### Cross-process result checking: re-supplying `schema`s (v0.11+)
+
+A `z.ZodTypeAny` passed to `submit()` isn't serializable, so it only survives for the lifetime of the `AIBatch` instance that submitted the request. If you check results from a *different* process or a fresh `AIBatch` instance (the common case for async-batch stages resuming after a suspend), re-supply the schemas keyed by request id so validation still applies:
+
+```typescript
+// submit() -- process/instance A
+const handle = await batch.submit([
+  { id: "req-1", prompt: "...", schema: ItemSchema },
+]);
+
+// getResults() -- process/instance B (e.g. checkCompletion() after resume)
+const results = await batch.getResults(handle.id, {
+  schemas: { "req-1": ItemSchema },
+});
+```
+
+Without `schemas`, results are still returned but without schema validation for requests whose schema wasn't re-supplied.
 
 ### Batch Providers
 
@@ -664,16 +689,30 @@ interface AIStreamResult {
   rawResult: AISDKStreamResult;
 }
 
-interface AIBatchResult<T = string> {
-  id: string;
-  prompt: string;
-  result: T;
-  inputTokens: number;
-  outputTokens: number;
-  status: "succeeded" | "failed";
-  error?: string;
-}
+// v0.11+: discriminated union -- `result` only exists on "succeeded",
+// `error` only exists on "failed". Check `status` before reading either.
+type AIBatchResult<T = string> =
+  | {
+      id: string;
+      prompt: string;
+      result: T;              // validated against the request's schema, if one was supplied
+      inputTokens: number;
+      outputTokens: number;
+      status: "succeeded";
+      error?: undefined;
+    }
+  | {
+      id: string;
+      prompt: string;
+      result?: undefined;     // no result on failure -- do not read this
+      inputTokens: number;
+      outputTokens: number;
+      status: "failed";
+      error: string;
+    };
 ```
+
+**Breaking in v0.11:** before this release, a failed result still carried a `result: T` field (an empty/placeholder value). Code that read `.result` without checking `.status` first will now see `undefined` instead of a placeholder. See [`../migrations/migrate-0.10-to-0.11.md`](../migrations/migrate-0.10-to-0.11.md) for the before/after migration pattern.
 
 ## Complete Example
 

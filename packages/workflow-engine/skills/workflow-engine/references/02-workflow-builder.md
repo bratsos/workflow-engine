@@ -20,6 +20,24 @@ const workflow = new WorkflowBuilder(
   .build();
 ```
 
+### `defineWorkflow({...})` (v0.11+, options-object alternative)
+
+An options-object alternative to the 5-argument constructor above — same builder, same chaining. `output` is optional: it's only the builder's *initial* output type before any stages are piped, and gets silently replaced by the last piped stage's output schema at `.build()`, exactly like the positional API. Most callers can omit it.
+
+```typescript
+import { defineWorkflow } from "@bratsos/workflow-engine";
+
+const workflow = defineWorkflow({
+  id: "workflow-id",
+  name: "Workflow Name",
+  description: "Description",
+  input: InputSchema,
+})
+  .pipe(stage1)
+  .pipe(stage2)
+  .build();
+```
+
 ## WorkflowBuilder Methods
 
 ### pipe(stage)

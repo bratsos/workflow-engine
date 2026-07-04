@@ -132,6 +132,13 @@ interface EnhancedStageContext<TInput, TConfig, TContext> {
   // Services
   log: LogFunction;                // Async logging
   storage: StageStorage;           // Artifact storage
+  onProgress: (update: {           // Progress reporting; stageId/stageName
+    stageId?: string;              // auto-fill from the current stage as of
+    stageName?: string;            // v0.11 (pass them to override)
+    progress: number;
+    message: string;
+    details?: Record<string, unknown>;
+  }) => void;
 
   // Resume state (for async-batch stages)
   resumeState?: SuspendedState;    // Present when resuming
@@ -244,13 +251,13 @@ interface SimpleSuspendedResult {
   suspended: true;                  // Required marker
   state: {
     batchId: string;               // Required: external job ID
-    submittedAt: string;           // Required: ISO timestamp
-    pollInterval: number;          // Required: ms between checks
-    maxWaitTime: number;           // Required: max wait ms
+    submittedAt?: string;          // Optional: ISO timestamp; defaults to now
+    pollInterval?: number;         // Optional: ms between checks; defaults to pollConfig.pollInterval or 30s
+    maxWaitTime?: number;          // Optional: max wait ms; defaults to pollConfig.maxWaitTime or 24h
     metadata?: Record<string, unknown>;  // Optional: custom data
     apiKey?: string;               // Optional: for resumption
   };
-  pollConfig: {
+  pollConfig?: {                    // Optional (v0.11+): derived from `state` when omitted
     pollInterval: number;          // ms between polls
     maxWaitTime: number;           // max total wait
     nextPollAt: Date;              // first poll time
@@ -259,7 +266,20 @@ interface SimpleSuspendedResult {
 }
 ```
 
+As of v0.11, only `state.batchId` is required — `pollConfig` (including `nextPollAt`) is derived automatically from `state.pollInterval` / `state.maxWaitTime` (or the 30s/24h defaults) when omitted.
+
 ### Example
+
+```typescript
+async execute(ctx) {
+  const batchId = await submitBatch(requests);
+
+  // Minimal form — everything else is derived
+  return { suspended: true, state: { batchId } };
+}
+```
+
+Or specify your own timing:
 
 ```typescript
 async execute(ctx) {
@@ -274,6 +294,7 @@ async execute(ctx) {
       maxWaitTime: 3600000,
       metadata: { requestCount: requests.length },
     },
+    // pollConfig is optional — this override is equivalent to the derived default
     pollConfig: {
       pollInterval: 60000,
       maxWaitTime: 3600000,

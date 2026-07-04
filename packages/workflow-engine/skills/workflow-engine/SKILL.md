@@ -110,6 +110,7 @@ await kernel.dispatch({
 | `defineStage` | Function | `@bratsos/workflow-engine` | Create sync stages |
 | `defineAsyncBatchStage` | Function | `@bratsos/workflow-engine` | Create async/batch stages |
 | `WorkflowBuilder` | Class | `@bratsos/workflow-engine` | Chain stages into workflows |
+| `defineWorkflow` | Function | `@bratsos/workflow-engine` | Options-object alternative to `new WorkflowBuilder(...)` (v0.11+); returns the same builder to `.pipe()`/`.parallel()`/`.build()` |
 | `createKernel` | Function | `@bratsos/workflow-engine/kernel` | Create command kernel |
 | `createNodeHost` | Function | `@bratsos/workflow-engine-host-node` | Create Node.js host |
 | `createServerlessHost` | Function | `@bratsos/workflow-engine-host-serverless` | Create serverless host |
@@ -125,6 +126,9 @@ await kernel.dispatch({
 | `createPluginRunner` | Function | `@bratsos/workflow-engine/kernel` | Create plugin event processor |
 | `typedKey` | Function | `@bratsos/workflow-engine/conventions` | Define a well-known annotation key with linked value type |
 | `Trigger` / `Decision` / `Approval` / `Revision` | Constants | `@bratsos/workflow-engine/conventions` | Well-known annotation key namespaces (v0.8+) |
+| `RunReapStuckCommand` / `RunReapStuckResult` | Types | `@bratsos/workflow-engine` | `run.reapStuck` command/result shapes (export-drift fix, v0.11+) |
+| `ModelFilter` | Type | `@bratsos/workflow-engine` | Filter shape for `listModels({ filter })` (export-drift fix, v0.11+) |
+| `persistenceConformanceSuite` / `jobQueueConformanceSuite` / `aiCallLoggerConformanceSuite` | Function | `@bratsos/workflow-engine/testing` | Vitest conformance suites for validating custom adapters (v0.11+) |
 
 ## Kernel Commands
 
@@ -136,7 +140,7 @@ All operations go through `kernel.dispatch(command)`:
 | `run.claimPending` | Claim pending runs, enqueue first-stage jobs |
 | `run.transition` | Advance to next stage group or complete |
 | `run.cancel` | Cancel a running workflow (authoritative: cascades to stages + jobs) |
-| `run.rerunFrom` | Rerun from a specific stage (cleans up blob artifacts by prefix) |
+| `run.rerunFrom` | Rerun from a specific stage (cleans up blob artifacts by prefix; accepts an optional `idempotencyKey`, v0.11+) |
 | `job.execute` | Execute a single stage (uses multi-phase transactions; see 08-common-patterns.md) |
 | `stage.pollSuspended` | Poll suspended stages for readiness (skips cancelled runs; per-stage transactions) |
 | `lease.reapStale` | Release stale job leases |
@@ -254,6 +258,7 @@ const kernel = createKernel({
   clock,         // Clock port - injectable time source
   registry,      // WorkflowRegistry - { getWorkflow(id) }
   // executor,   // optional ActivityExecutor port - defaults to in-process; inject to run stages on remote workers (see 11-remote-activity-workers.md)
+  // idempotencyStaleInProgressMs: 10 * 60 * 1000, // optional (v0.11+) - default 10 min; TTL before a stuck `in_progress` idempotency key can be reclaimed
 });
 
 // Dispatch typed commands
@@ -276,7 +281,8 @@ const host = createNodeHost({
   workerId: "worker-1",
   orchestrationIntervalMs: 10_000,
   jobPollIntervalMs: 1_000,
-  staleLeaseThresholdMs: 60_000,
+  staleLeaseThresholdMs: 300_000,   // default as of v0.11 (was 60_000)
+  jobHeartbeatIntervalMs: 60_000,   // v0.11+: heartbeat a job's lease while it executes
 });
 
 await host.start();   // Starts polling loops + signal handlers
@@ -302,7 +308,8 @@ const host = createServerlessHost({
   jobTransport,
   workerId: "my-worker",
   // Optional tuning (same defaults as Node host)
-  staleLeaseThresholdMs: 60_000,
+  staleLeaseThresholdMs: 300_000,   // default as of v0.11 (was 60_000)
+  jobHeartbeatIntervalMs: 60_000,   // v0.11+
   maxClaimsPerTick: 10,
   maxSuspendedChecksPerTick: 10,
   maxOutboxFlushPerTick: 100,
@@ -437,6 +444,7 @@ const ai = createAIHelper(
 const { text, cost } = await ai.generateText("gemini-2.5-flash", prompt);
 const { object } = await ai.generateObject("gemini-2.5-flash", prompt, schema);
 const { embedding } = await ai.embed("text-embedding-004", ["text1"], { dimensions: 768 });
+// generateText/generateObject/streamText options also accept maxRetries / abortSignal (v0.11+)
 // OpenRouter embedding models (OpenAI, Cohere, etc.)
 const { embedding } = await ai.embed("openai/text-embedding-3-small", ["text1"]);
 
@@ -516,6 +524,8 @@ await kernel.dispatch({ type: "job.execute", workflowRunId: job.workflowRunId, w
 await kernel.dispatch({ type: "run.transition", workflowRunId: job.workflowRunId });
 ```
 
+Implementing a custom `WorkflowPersistence`/`JobQueue`/`AICallLogger` adapter? Validate it with the exported conformance suites (v0.11+) instead of hand-rolling parity tests — see [07-testing-patterns.md](references/07-testing-patterns.md#conformance-suites-for-custom-adapters-v011).
+
 ## Reference Files
 
 - [01-stage-definitions.md](references/01-stage-definitions.md) - Complete stage API
@@ -537,7 +547,7 @@ await kernel.dispatch({ type: "run.transition", workflowRunId: job.workflowRunId
 3. **Environment-Agnostic**: Kernel has no timers, no signals, no global state
 4. **Context Access**: Use `ctx.require()` and `ctx.optional()` for type-safe stage output access
 5. **Transactional Outbox**: Events written to outbox, published via `outbox.flush` command. `job.execute` and `stage.pollSuspended` use multi-phase transactions to avoid holding connections during external I/O
-6. **Idempotency**: `run.create` and `job.execute` replay cached results by key; concurrent same-key dispatch throws `IdempotencyInProgressError`
+6. **Idempotency**: `run.create`, `job.execute`, and `run.rerunFrom` (v0.11+) replay cached results by key; concurrent same-key dispatch throws `IdempotencyInProgressError`; a key stuck `in_progress` past `KernelConfig.idempotencyStaleInProgressMs` (default 10 min, v0.11+) can be reclaimed
 7. **Authoritative Cancellation**: `run.cancel` cascades to stages + jobs. Ghost jobs (running against non-RUNNING runs) are detected via `ghost: true` flag and not retried
 8. **Self-Healing**: Stage creation is idempotent (upsert), orchestration steps are isolated, stuck runs are automatically reaped
 9. **Cost Tracking**: All AI calls automatically track tokens and costs

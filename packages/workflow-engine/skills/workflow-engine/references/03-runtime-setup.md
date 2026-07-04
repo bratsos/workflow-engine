@@ -49,6 +49,12 @@ const kernel = createKernel({
   registry: {
     getWorkflow: (id) => workflowMap.get(id),
   },
+
+  // Optional (v0.11+): how long an idempotency key may sit `in_progress`
+  // before a subsequent dispatch can reclaim it (guards against a crashed
+  // dispatcher leaving a key stuck forever). Default: 10 minutes.
+  // Set to `Infinity` to disable reclaiming.
+  idempotencyStaleInProgressMs: 10 * 60 * 1000,
 });
 ```
 
@@ -58,7 +64,7 @@ const kernel = createKernel({
 |------|-----------|---------|
 | `persistence` | `Persistence` | CRUD for runs, stages, logs, outbox events, idempotency keys |
 | `blobStore` | `BlobStore` | `put(key, data)`, `get(key)`, `has(key)`, `delete(key)`, `list(prefix)` |
-| `jobTransport` | `JobTransport` | `enqueue`, `enqueueParallel`, `dequeue`, `complete`, `suspend`, `fail`, `cancelByRun` |
+| `jobTransport` | `JobTransport` | `enqueue`, `enqueueParallel`, `dequeue`, `complete`, `suspend`, `fail`, `cancelByRun`, `touchJob` (v0.11+, lease heartbeat), `getJobsByWorkflowRun` (v0.11+) |
 | `eventSink` | `EventSink` | `emit(event)` - async event publishing |
 | `scheduler` | `Scheduler` | `schedule(type, payload, runAt)`, `cancel(type, correlationId)` |
 | `clock` | `Clock` | `now()` - returns `Date` |
@@ -78,7 +84,8 @@ const host = createNodeHost({
   // Optional tuning
   orchestrationIntervalMs: 10_000,    // Claim pending, poll suspended, reap stale, flush outbox
   jobPollIntervalMs: 1_000,           // Dequeue and execute jobs
-  staleLeaseThresholdMs: 60_000,      // Release stale job leases
+  staleLeaseThresholdMs: 300_000,     // Release stale job leases (default 300_000 as of v0.11, was 60_000)
+  jobHeartbeatIntervalMs: 60_000,     // v0.11+: heartbeat a job's lease while it executes
   maxClaimsPerTick: 10,               // Max pending runs to claim per tick
   maxSuspendedChecksPerTick: 10,      // Max suspended stages to poll per tick
   maxOutboxFlushPerTick: 100,         // Max outbox events to flush per tick
@@ -121,7 +128,8 @@ const host = createServerlessHost({
   workerId: "my-worker",
 
   // Optional tuning (same as Node host)
-  staleLeaseThresholdMs: 60_000,
+  staleLeaseThresholdMs: 300_000,     // default as of v0.11 (was 60_000)
+  jobHeartbeatIntervalMs: 60_000,     // v0.11+
   maxClaimsPerTick: 10,
   maxSuspendedChecksPerTick: 10,
   maxOutboxFlushPerTick: 100,

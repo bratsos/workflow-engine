@@ -211,3 +211,37 @@ beforeEach(() => {
   eventSink.events = [];
 });
 ```
+
+## Conformance Suites for Custom Adapters (v0.11+)
+
+If you implement `WorkflowPersistence`, `JobQueue`, or `AICallLogger` yourself (a non-Prisma database, a queue product, etc.), validate it against the same behavior the built-in Prisma and in-memory adapters are tested with, instead of hand-rolling parity tests:
+
+```typescript
+import {
+  persistenceConformanceSuite,
+  jobQueueConformanceSuite,
+  aiCallLoggerConformanceSuite,
+} from "@bratsos/workflow-engine/testing";
+```
+
+Each suite is a vitest side-effect registrar: calling it registers `describe`/`it` blocks, so it must be invoked at module scope inside a `*.test.ts` file, passing a factory that returns a fresh adapter instance per test:
+
+```typescript
+// my-adapter.conformance.test.ts
+import { persistenceConformanceSuite, jobQueueConformanceSuite } from "@bratsos/workflow-engine/testing";
+import { MyCustomPersistence } from "./my-custom-persistence";
+import { MyCustomJobQueue } from "./my-custom-job-queue";
+
+persistenceConformanceSuite("MyCustomPersistence", () => new MyCustomPersistence());
+jobQueueConformanceSuite("MyCustomJobQueue", () => new MyCustomJobQueue());
+```
+
+The factory type signatures:
+
+```typescript
+type PersistenceFactory = () => WorkflowPersistence & { clear?: () => void };
+type JobQueueFactory = () => JobQueue & { clear?: () => void };
+type AILoggerFactory = () => AICallLogger & { clear?: () => void };
+```
+
+Run it like any other test file (`vitest run my-adapter.conformance.test.ts`). A failing case points at a specific behavior your adapter diverges on -- e.g. version-bump semantics, suspended-readiness ordering, or retry defaults -- the same semantics the built-in Prisma/in-memory adapters are held to.

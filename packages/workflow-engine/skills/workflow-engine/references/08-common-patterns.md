@@ -92,11 +92,12 @@ const { deletedStages } = await kernel.dispatch({
   type: "run.rerunFrom",
   workflowRunId: "run-123",
   fromStageId: "summarize",
+  idempotencyKey: "rerun-run-123-summarize-1", // optional (v0.11+); replay returns the cached result
 });
 
 // Stages from "summarize" onward are deleted and re-queued
 // Earlier stages (e.g., "extract") keep their outputs
-// Blob artifacts for deleted stages are cleaned up by key prefix
+// Blob artifacts for deleted stages are cleaned up by key prefix (after commit, as of v0.11)
 ```
 
 ## Plugin System
@@ -151,6 +152,8 @@ The persistence layer uses version fields on records to detect concurrent modifi
 import { StaleVersionError } from "@bratsos/workflow-engine";
 ```
 
+`version` increments on every update, whether or not the caller passes `expectedVersion` — don't compute an expected next version from your own arithmetic; re-read the persisted record instead.
+
 ## Document Processing Pipeline
 
 A common pattern combining sequential and parallel stages:
@@ -195,7 +198,7 @@ async execute(ctx) {
 }
 ```
 
-Failed stages trigger the `stage:failed` event. The host's maintenance tick detects failure through `run.transition`, which marks the workflow as FAILED.
+Failed stages trigger the `stage:failed` event. As of v0.11, a terminal stage failure dispatches `run.transition` immediately (in the same `job.execute` completion), so the run fails with the real stage error right away rather than waiting for a later orchestration tick or `run.reapStuck` to notice.
 
 ## Reliability & Self-Healing
 
@@ -241,3 +244,5 @@ async execute(ctx) {
   return { output: { processedCount: items.length } };
 }
 ```
+
+As of v0.11, `stageId`/`stageName` are optional on `onProgress()` — the engine auto-fills them from the current stage (as shown above). Pass them explicitly only if you need to override.
