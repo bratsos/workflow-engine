@@ -108,7 +108,7 @@ describe("I want to use InMemoryAICallLogger in tests", () => {
     it("should handle null metadata", () => {
       // Given: A call without metadata
       const input = createCallInput();
-      delete (input as Record<string, unknown>).metadata;
+      delete input.metadata;
 
       // When: I log the call
       logger.logCall(input);

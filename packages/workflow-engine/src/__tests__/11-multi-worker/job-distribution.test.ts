@@ -19,6 +19,7 @@ describe("I want to distribute jobs across workers", () => {
       // Given: Job data
       const jobData = {
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "stage-1",
       };
 
@@ -39,9 +40,21 @@ describe("I want to distribute jobs across workers", () => {
     it("should enqueue multiple jobs in parallel", async () => {
       // Given: Multiple jobs
       const jobs = [
-        { workflowRunId: "run-1", stageId: "stage-a" },
-        { workflowRunId: "run-1", stageId: "stage-b" },
-        { workflowRunId: "run-1", stageId: "stage-c" },
+        {
+          workflowRunId: "run-1",
+          workflowId: "workflow-1",
+          stageId: "stage-a",
+        },
+        {
+          workflowRunId: "run-1",
+          workflowId: "workflow-1",
+          stageId: "stage-b",
+        },
+        {
+          workflowRunId: "run-1",
+          workflowId: "workflow-1",
+          stageId: "stage-c",
+        },
       ];
 
       // When: I enqueue them in parallel
@@ -56,6 +69,7 @@ describe("I want to distribute jobs across workers", () => {
       // Given: A job without explicit priority
       const jobId = await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "stage-1",
       });
 
@@ -68,6 +82,7 @@ describe("I want to distribute jobs across workers", () => {
       // Given: A job with custom priority
       const jobId = await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "stage-1",
         priority: 10,
       });
@@ -81,6 +96,7 @@ describe("I want to distribute jobs across workers", () => {
       // Given: A job with payload
       const jobId = await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "stage-1",
         payload: { config: { model: "gpt-4" } },
       });
@@ -96,6 +112,7 @@ describe("I want to distribute jobs across workers", () => {
       // Given: A pending job
       const jobId = await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "stage-1",
       });
 
@@ -126,6 +143,7 @@ describe("I want to distribute jobs across workers", () => {
       // Given: A job that's being processed
       const jobId = await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "stage-1",
       });
       await jobQueue.dequeue();
@@ -141,6 +159,7 @@ describe("I want to distribute jobs across workers", () => {
       // Given: A job
       await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "stage-1",
       });
 
@@ -164,10 +183,12 @@ describe("I want to distribute jobs across workers", () => {
 
       const jobId1 = await worker1.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "stage-1",
       });
       const jobId2 = await worker1.enqueue({
         workflowRunId: "run-2",
+        workflowId: "workflow-1",
         stageId: "stage-2",
       });
 
@@ -192,6 +213,7 @@ describe("I want to distribute jobs across workers", () => {
       // Given: Jobs claimed by different workers (simulated)
       const jobId = await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "stage-1",
       });
 
@@ -209,14 +231,17 @@ describe("I want to distribute jobs across workers", () => {
       // Given: Jobs in different states
       const jobId1 = await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "stage-1",
       });
       const jobId2 = await jobQueue.enqueue({
         workflowRunId: "run-2",
+        workflowId: "workflow-1",
         stageId: "stage-2",
       });
       const jobId3 = await jobQueue.enqueue({
         workflowRunId: "run-3",
+        workflowId: "workflow-1",
         stageId: "stage-3",
       });
 
@@ -245,9 +270,21 @@ describe("I want to distribute jobs across workers", () => {
 
     it("should get all jobs for inspection", async () => {
       // Given: Multiple jobs
-      await jobQueue.enqueue({ workflowRunId: "run-1", stageId: "stage-1" });
-      await jobQueue.enqueue({ workflowRunId: "run-2", stageId: "stage-2" });
-      await jobQueue.enqueue({ workflowRunId: "run-3", stageId: "stage-3" });
+      await jobQueue.enqueue({
+        workflowRunId: "run-1",
+        workflowId: "workflow-1",
+        stageId: "stage-1",
+      });
+      await jobQueue.enqueue({
+        workflowRunId: "run-2",
+        workflowId: "workflow-1",
+        stageId: "stage-2",
+      });
+      await jobQueue.enqueue({
+        workflowRunId: "run-3",
+        workflowId: "workflow-1",
+        stageId: "stage-3",
+      });
 
       // When: I get all jobs
       const allJobs = jobQueue.getAllJobs();
@@ -263,6 +300,7 @@ describe("I want to distribute jobs across workers", () => {
       const future = new Date(Date.now() + 60000); // 1 minute from now
       await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "stage-1",
         scheduledFor: future,
       });
@@ -279,6 +317,7 @@ describe("I want to distribute jobs across workers", () => {
       const past = new Date(Date.now() - 1000); // 1 second ago
       const jobId = await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "stage-1",
         scheduledFor: past,
       });
@@ -294,6 +333,7 @@ describe("I want to distribute jobs across workers", () => {
       // Given: A job without scheduled time
       const jobId = await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "stage-1",
       });
 
@@ -308,8 +348,16 @@ describe("I want to distribute jobs across workers", () => {
   describe("clearing the queue", () => {
     it("should clear all jobs", async () => {
       // Given: Multiple jobs
-      await jobQueue.enqueue({ workflowRunId: "run-1", stageId: "stage-1" });
-      await jobQueue.enqueue({ workflowRunId: "run-2", stageId: "stage-2" });
+      await jobQueue.enqueue({
+        workflowRunId: "run-1",
+        workflowId: "workflow-1",
+        stageId: "stage-1",
+      });
+      await jobQueue.enqueue({
+        workflowRunId: "run-2",
+        workflowId: "workflow-1",
+        stageId: "stage-2",
+      });
 
       // When: I clear the queue
       jobQueue.clear();

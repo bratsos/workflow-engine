@@ -435,6 +435,13 @@ export interface WorkflowPersistence {
 
   // WorkflowRun operations
   createRun(data: CreateRunInput): Promise<WorkflowRunRecord>;
+  /**
+   * Updates a run's fields. `version` is incremented on every call,
+   * whether or not `expectedVersion` is supplied -- callers relying on
+   * optimistic concurrency (e.g. `job.execute`'s claimed-run guard) can
+   * always detect a concurrent write, including unconditional writes like
+   * `run.cancel`.
+   */
   updateRun(id: string, data: UpdateRunInput): Promise<void>;
   getRun(id: string): Promise<WorkflowRunRecord | null>;
   getRunStatus(id: string): Promise<WorkflowStatus | null>;
@@ -472,11 +479,23 @@ export interface WorkflowPersistence {
   ): Promise<void>;
   getStage(runId: string, stageId: string): Promise<WorkflowStageRecord | null>;
   getStageById(id: string): Promise<WorkflowStageRecord | null>;
+  /**
+   * Ordered by `executionGroup` (actual execution/dependency order), with
+   * `stageNumber` (definition order) as a tiebreaker for stages that share
+   * an execution group (parallel stages).
+   */
   getStagesByRun(
     runId: string,
     options?: { status?: WorkflowStageStatus; orderBy?: "asc" | "desc" },
   ): Promise<WorkflowStageRecord[]>;
   getSuspendedStages(beforeDate: Date): Promise<WorkflowStageRecord[]>;
+  /**
+   * Find the first SUSPENDED stage whose `nextPollAt` has been explicitly
+   * cleared (set to `null`) by the orchestrator -- i.e. "ready to resume"
+   * means the poll loop already determined the suspend condition is
+   * satisfied, not merely that a poll deadline has elapsed. Use
+   * `getSuspendedStages` to find stages whose poll deadline has passed.
+   */
   getFirstSuspendedStageReadyToResume(
     runId: string,
   ): Promise<WorkflowStageRecord | null>;
@@ -493,6 +512,12 @@ export interface WorkflowPersistence {
 
   // WorkflowArtifact operations (for StageStorage)
   saveArtifact(data: SaveArtifactInput): Promise<void>;
+  /**
+   * Load an artifact's stored data. Returns `undefined` (not a throw) when
+   * no artifact exists for `(runId, key)` -- callers that need to
+   * distinguish "missing" from "present but empty" should check
+   * `hasArtifact` first.
+   */
   loadArtifact(runId: string, key: string): Promise<unknown>;
   hasArtifact(runId: string, key: string): Promise<boolean>;
   deleteArtifact(runId: string, key: string): Promise<void>;
@@ -549,10 +574,23 @@ export interface WorkflowPersistence {
   markOutboxEventsPublished(ids: string[]): Promise<void>;
 
   // Idempotency operations
-  /** Atomically acquire an idempotency key for command execution. */
+  /**
+   * Atomically acquire an idempotency key for command execution.
+   *
+   * If the key is currently `in_progress` (e.g. a previous dispatcher
+   * crashed between committing its transaction and calling
+   * `completeIdempotencyKey`), passing `staleInProgressAfterMs` allows the
+   * key to be reclaimed once it has been in progress for at least that
+   * long, measured against `options.now` (defaults to `new Date()`).
+   * Reclaiming is atomic: only one caller wins when multiple dispatchers
+   * race to reclaim the same stale key. When `staleInProgressAfterMs` is
+   * omitted, a stuck `in_progress` key is never reclaimed (matches prior
+   * behavior).
+   */
   acquireIdempotencyKey(
     key: string,
     commandType: string,
+    options?: { now?: Date; staleInProgressAfterMs?: number },
   ): Promise<
     | { status: "acquired" }
     | { status: "replay"; result: unknown }
@@ -638,16 +676,11 @@ export interface JobQueue {
   suspend(jobId: string, nextPollAt: Date): Promise<void>;
 
   /**
-   * Mark job as failed
+   * Mark job as failed. `shouldRetry` defaults to `false` -- callers must
+   * opt in to a retry rather than risk an unbounded retry loop for
+   * adapters/hosts that omit the argument.
    */
   fail(jobId: string, error: string, shouldRetry?: boolean): Promise<void>;
-
-  /**
-   * Get suspended jobs that are ready to be checked
-   */
-  getSuspendedJobsReadyToPoll(): Promise<
-    Array<{ jobId: string; stageId: string; workflowRunId: string }>
-  >;
 
   /**
    * Release stale locks (for crashed workers)
@@ -659,6 +692,21 @@ export interface JobQueue {
    * Returns count of cancelled jobs.
    */
   cancelByRun(workflowRunId: string): Promise<number>;
+
+  /**
+   * Get all job rows for a workflow run (any status). Used to detect
+   * pending/in-flight retries for a stage (so `run.transition` doesn't
+   * treat a FAILED stage with a queued retry as terminal) and to find
+   * orphaned SUSPENDED job rows or PENDING stages missing a queued job.
+   */
+  getJobsByWorkflowRun(workflowRunId: string): Promise<JobRecord[]>;
+
+  /**
+   * Refresh a running job's lease (`lockedAt`) without changing status.
+   * Called periodically by hosts while a long-running stage executes so
+   * `releaseStaleJobs` doesn't duplicate work still in-flight.
+   */
+  touchJob(jobId: string): Promise<void>;
 }
 
 // ============================================================================

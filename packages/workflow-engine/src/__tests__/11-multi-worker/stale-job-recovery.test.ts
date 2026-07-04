@@ -19,6 +19,7 @@ describe("I want to recover stale jobs", () => {
       // Given: A job that's been processing for a while
       const jobId = await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "stage-1",
       });
 
@@ -48,6 +49,7 @@ describe("I want to recover stale jobs", () => {
       // Given: A job that's been processing recently
       const jobId = await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "stage-1",
       });
 
@@ -63,10 +65,11 @@ describe("I want to recover stale jobs", () => {
       expect(job?.status).toBe("RUNNING");
     });
 
-    it("should use default threshold of 60 seconds", async () => {
-      // Given: A job locked 30 seconds ago (within default threshold)
+    it("should use default threshold of 300 seconds", async () => {
+      // Given: A job locked 30 seconds ago (well within default threshold)
       const jobId = await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "stage-1",
       });
 
@@ -78,7 +81,7 @@ describe("I want to recover stale jobs", () => {
       // When: I release stale jobs with default threshold
       const released = await jobQueue.releaseStaleJobs();
 
-      // Then: Job is not released (within 60s threshold)
+      // Then: Job is not released (within 300s threshold)
       expect(released).toBe(0);
     });
   });
@@ -88,14 +91,17 @@ describe("I want to recover stale jobs", () => {
       // Given: Multiple jobs that become stale
       const job1Id = await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "stage-1",
       });
       const job2Id = await jobQueue.enqueue({
         workflowRunId: "run-2",
+        workflowId: "workflow-1",
         stageId: "stage-2",
       });
       const job3Id = await jobQueue.enqueue({
         workflowRunId: "run-3",
+        workflowId: "workflow-1",
         stageId: "stage-3",
       });
 
@@ -126,10 +132,12 @@ describe("I want to recover stale jobs", () => {
       // Given: Mix of stale and fresh jobs
       const staleJobId = await jobQueue.enqueue({
         workflowRunId: "run-stale",
+        workflowId: "workflow-1",
         stageId: "stage-1",
       });
       const freshJobId = await jobQueue.enqueue({
         workflowRunId: "run-fresh",
+        workflowId: "workflow-1",
         stageId: "stage-2",
       });
 
@@ -156,6 +164,7 @@ describe("I want to recover stale jobs", () => {
       // Given: A job that was released from stale state
       const jobId = await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "stage-1",
       });
 
@@ -177,6 +186,7 @@ describe("I want to recover stale jobs", () => {
       // Given: A job with payload
       const jobId = await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "stage-1",
         priority: 8,
         payload: { config: { model: "test" } },
@@ -202,6 +212,7 @@ describe("I want to recover stale jobs", () => {
       // Given: A pending job
       await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "stage-1",
       });
 
@@ -216,6 +227,7 @@ describe("I want to recover stale jobs", () => {
       // Given: A completed job
       const jobId = await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "stage-1",
       });
 
@@ -237,6 +249,7 @@ describe("I want to recover stale jobs", () => {
       jobQueue.setDefaultMaxAttempts(1);
       const jobId = await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "stage-1",
       });
 
@@ -257,6 +270,7 @@ describe("I want to recover stale jobs", () => {
       // Given: A suspended job
       const jobId = await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "stage-1",
       });
 
@@ -279,6 +293,7 @@ describe("I want to recover stale jobs", () => {
       // Given: A job locked 30 seconds ago
       const jobId = await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "stage-1",
       });
 
@@ -297,6 +312,7 @@ describe("I want to recover stale jobs", () => {
       // Given: A job just locked
       const jobId = await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "stage-1",
       });
 
@@ -318,6 +334,7 @@ describe("I want to recover stale jobs", () => {
       // Given: A job being processed
       const jobId = await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "stage-1",
       });
 

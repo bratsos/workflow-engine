@@ -408,6 +408,7 @@ describe("I want orchestrator to manage workflow state", () => {
         id: "run-suspended",
         workflowId: "test-workflow",
         workflowName: "Test Workflow",
+        workflowType: "test-workflow",
         input: { value: "test" },
       });
 
@@ -440,6 +441,7 @@ describe("I want orchestrator to manage workflow state", () => {
         id: "run-future",
         workflowId: "test-workflow",
         workflowName: "Test Workflow",
+        workflowType: "test-workflow",
         input: { value: "test" },
       });
 

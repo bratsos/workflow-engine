@@ -471,11 +471,13 @@ describe("I want to run multiple workflows concurrently", () => {
       for (let i = 0; i < 3; i++) {
         await jobQueue.enqueue({
           workflowRunId: `workflow-a-run-${i}`,
+          workflowId: "workflow-a",
           stageId: "stage-1",
           priority: 5,
         });
         await jobQueue.enqueue({
           workflowRunId: `workflow-b-run-${i}`,
+          workflowId: "workflow-b",
           stageId: "stage-1",
           priority: 5,
         });

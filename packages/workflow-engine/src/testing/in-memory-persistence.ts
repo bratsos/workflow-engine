@@ -39,6 +39,30 @@ import {
   type WorkflowStatus,
 } from "../persistence/interface.js";
 
+/**
+ * Bounds retry loops for optimistic-lock claim paths so heavy contention
+ * degrades to "try again later" instead of unbounded recursion. Mirrors
+ * the Prisma SQLite/Postgres claim-retry bound.
+ */
+const MAX_CLAIM_ATTEMPTS = 10;
+
+/**
+ * Merges `rest` onto `base`, skipping keys whose value is `undefined`.
+ * Mirrors Prisma's `update({ data })` semantics, where an `undefined`
+ * field is omitted from the SQL UPDATE rather than clobbering the stored
+ * value with NULL.
+ */
+function mergeDefined<T extends object>(base: T, rest: Partial<T>): T {
+  const merged: T = { ...base };
+  for (const key of Object.keys(rest) as Array<keyof T>) {
+    const value = rest[key];
+    if (value !== undefined) {
+      merged[key] = value as T[typeof key];
+    }
+  }
+  return merged;
+}
+
 export class InMemoryWorkflowPersistence implements WorkflowPersistence {
   private runs = new Map<string, WorkflowRunRecord>();
   private stages = new Map<string, WorkflowStageRecord>();
@@ -47,7 +71,8 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
   private annotations: WorkflowAnnotationRecord[] = [];
   private outbox: OutboxRecord[] = [];
   private idempotencyKeys = new Map<string, IdempotencyRecord>();
-  private idempotencyInProgress = new Set<string>();
+  /** Maps composite key -> the time the key was (re)acquired as in-progress. */
+  private idempotencyInProgress = new Map<string, Date>();
   private outboxSequences = new Map<string, number>();
 
   // Helper to generate composite keys for stages
@@ -120,8 +145,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
 
     const { expectedVersion: _, ...rest } = data;
     const updated: WorkflowRunRecord = {
-      ...run,
-      ...rest,
+      ...mergeDefined(run, rest),
       updatedAt: new Date(),
       version: run.version + 1,
     };
@@ -183,7 +207,11 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
     return true;
   }
 
-  async claimNextPendingRun(): Promise<WorkflowRunRecord | null> {
+  async claimNextPendingRun(attempt = 0): Promise<WorkflowRunRecord | null> {
+    if (attempt >= MAX_CLAIM_ATTEMPTS) {
+      return null;
+    }
+
     // Find all pending runs
     const pendingRuns = Array.from(this.runs.values())
       .filter((run) => run.status === "PENDING")
@@ -207,8 +235,9 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
     if (!currentRun || currentRun.status !== "PENDING") {
       // Another worker claimed it between our query and now
       // In real FOR UPDATE SKIP LOCKED, this row would be skipped
-      // Try the next one recursively
-      return this.claimNextPendingRun();
+      // Try the next one recursively (bounded to avoid unbounded
+      // recursion under heavy contention)
+      return this.claimNextPendingRun(attempt + 1);
     }
 
     // Atomically update status to RUNNING
@@ -271,8 +300,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
 
     if (existing) {
       const updated: WorkflowStageRecord = {
-        ...existing,
-        ...data.update,
+        ...mergeDefined(existing, data.update),
         updatedAt: new Date(),
         version: existing.version + 1,
       };
@@ -304,8 +332,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
 
     const { expectedVersion: _, ...rest } = data;
     const updated: WorkflowStageRecord = {
-      ...stage,
-      ...rest,
+      ...mergeDefined(stage, rest),
       updatedAt: new Date(),
       version: stage.version + 1,
     };
@@ -338,8 +365,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
 
     const { expectedVersion: _, ...rest } = data;
     const updated: WorkflowStageRecord = {
-      ...stage,
-      ...rest,
+      ...mergeDefined(stage, rest),
       updatedAt: new Date(),
       version: stage.version + 1,
     };
@@ -378,9 +404,12 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
       stages = stages.filter((s) => s.status === options.status);
     }
 
-    // Sort by stageNumber
+    // Sort by executionGroup (actual execution/dependency order), with
+    // stageNumber (definition order) as a deterministic tiebreaker for
+    // stages that share an execution group (parallel stages).
     stages.sort((a, b) => {
-      const diff = a.stageNumber - b.stageNumber;
+      const diff =
+        a.executionGroup - b.executionGroup || a.stageNumber - b.stageNumber;
       return options?.orderBy === "desc" ? -diff : diff;
     });
 
@@ -406,8 +435,10 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
     runId: string,
   ): Promise<WorkflowStageRecord | null> {
     const stages = await this.getStagesByRun(runId, { status: "SUSPENDED" });
-    const now = new Date();
-    const ready = stages.find((s) => s.nextPollAt && s.nextPollAt <= now);
+    // "Ready to resume" means the orchestrator has explicitly cleared
+    // nextPollAt (see stage-poll-suspended.ts), not merely that a poll
+    // deadline has passed -- matches PrismaWorkflowPersistence.
+    const ready = stages.find((s) => s.nextPollAt === null);
     return ready ?? null;
   }
 
@@ -553,6 +584,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
   async acquireIdempotencyKey(
     key: string,
     commandType: string,
+    options?: { now?: Date; staleInProgressAfterMs?: number },
   ): Promise<
     | { status: "acquired" }
     | { status: "replay"; result: unknown }
@@ -563,10 +595,22 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
     if (record) {
       return { status: "replay", result: record.result };
     }
-    if (this.idempotencyInProgress.has(compositeKey)) {
+    const inProgressSince = this.idempotencyInProgress.get(compositeKey);
+    if (inProgressSince) {
+      const staleAfterMs = options?.staleInProgressAfterMs;
+      const now = options?.now ?? new Date();
+      if (
+        staleAfterMs !== undefined &&
+        now.getTime() - inProgressSince.getTime() >= staleAfterMs
+      ) {
+        // Reclaim the stale in-progress key (single-threaded JS: this
+        // Map write is atomic with respect to other dispatch calls).
+        this.idempotencyInProgress.set(compositeKey, now);
+        return { status: "acquired" };
+      }
       return { status: "in_progress" };
     }
-    this.idempotencyInProgress.add(compositeKey);
+    this.idempotencyInProgress.set(compositeKey, options?.now ?? new Date());
     return { status: "acquired" };
   }
 
@@ -617,10 +661,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
 
   async loadArtifact(runId: string, key: string): Promise<unknown> {
     const artifact = this.artifacts.get(this.artifactKey(runId, key));
-    if (!artifact) {
-      throw new Error(`Artifact not found: ${runId}/${key}`);
-    }
-    return artifact.data;
+    return artifact?.data;
   }
 
   async hasArtifact(runId: string, key: string): Promise<boolean> {

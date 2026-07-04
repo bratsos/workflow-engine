@@ -158,7 +158,7 @@ export class InMemoryJobQueue implements JobQueue {
   async fail(
     jobId: string,
     error: string,
-    shouldRetry: boolean = true,
+    shouldRetry: boolean = false,
   ): Promise<void> {
     const job = this.jobs.get(jobId);
     if (!job) {
@@ -191,22 +191,7 @@ export class InMemoryJobQueue implements JobQueue {
     }
   }
 
-  async getSuspendedJobsReadyToPoll(): Promise<
-    Array<{ jobId: string; stageId: string; workflowRunId: string }>
-  > {
-    const now = new Date();
-    return Array.from(this.jobs.values())
-      .filter(
-        (j) => j.status === "SUSPENDED" && j.nextPollAt && j.nextPollAt <= now,
-      )
-      .map((j) => ({
-        jobId: j.id,
-        stageId: j.stageId,
-        workflowRunId: j.workflowRunId,
-      }));
-  }
-
-  async releaseStaleJobs(staleThresholdMs: number = 60000): Promise<number> {
+  async releaseStaleJobs(staleThresholdMs: number = 300000): Promise<number> {
     const now = new Date();
     const threshold = new Date(now.getTime() - staleThresholdMs);
     let released = 0;
@@ -231,6 +216,22 @@ export class InMemoryJobQueue implements JobQueue {
     }
 
     return released;
+  }
+
+  async getJobsByWorkflowRun(workflowRunId: string): Promise<JobRecord[]> {
+    return Array.from(this.jobs.values())
+      .filter((j) => j.workflowRunId === workflowRunId)
+      .map((j) => ({ ...j }));
+  }
+
+  async touchJob(jobId: string): Promise<void> {
+    const job = this.jobs.get(jobId);
+    if (!job || job.status !== "RUNNING") return;
+    this.jobs.set(jobId, {
+      ...job,
+      lockedAt: new Date(),
+      updatedAt: new Date(),
+    });
   }
 
   async cancelByRun(workflowRunId: string): Promise<number> {
