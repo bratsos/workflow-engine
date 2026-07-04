@@ -39,6 +39,8 @@ dev.db
 
 # Documentation
 docs/
+!apps/docs/
+!apps/docs/**
 
 # Conductor
 .context/
