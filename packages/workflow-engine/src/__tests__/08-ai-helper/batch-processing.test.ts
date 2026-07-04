@@ -6,6 +6,7 @@
 
 import { beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
+import type { ModelKey } from "../../ai/model-helper.js";
 import { createMockAIHelper, MockAIHelper } from "../utils/mock-ai-helper.js";
 
 describe("I want to process AI requests in batches", () => {
@@ -41,8 +42,11 @@ describe("I want to process AI requests in batches", () => {
       // Given: Different providers
       // When: I create batches
       const googleBatch = ai.batch("gemini-2.5-flash", "google");
-      const anthropicBatch = ai.batch("claude-3-5-sonnet", "anthropic");
-      const openaiBatch = ai.batch("gpt-4o", "openai");
+      const anthropicBatch = ai.batch(
+        "claude-3-5-sonnet" as ModelKey,
+        "anthropic",
+      );
+      const openaiBatch = ai.batch("gpt-4o" as ModelKey, "openai");
 
       // Then: All batches are created
       expect(googleBatch).toBeDefined();
@@ -498,7 +502,6 @@ describe("I want to process AI requests in batches", () => {
         {
           id: "req-1",
           prompt: "Failed prompt",
-          result: {} as string,
           inputTokens: 0,
           outputTokens: 0,
           status: "failed",
@@ -521,7 +524,6 @@ describe("I want to process AI requests in batches", () => {
         {
           id: "req-1",
           prompt: "Test",
-          result: "" as string,
           inputTokens: 0,
           outputTokens: 0,
           status: "failed",

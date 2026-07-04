@@ -40,7 +40,7 @@ export function createPassthroughStage<T extends z.ZodTypeAny>(
       config: z.object({}),
     },
     async execute(ctx) {
-      return { output: ctx.input };
+      return { output: ctx.input as z.infer<T> };
     },
   });
 }
@@ -73,7 +73,7 @@ export function createTransformStage<
       config: z.object({}),
     },
     async execute(ctx) {
-      return { output: transform(ctx.input) };
+      return { output: transform(ctx.input as z.infer<TInput>) };
     },
   });
 }
@@ -148,7 +148,7 @@ export function createTrackingStage<T extends z.ZodTypeAny>(
         await new Promise((resolve) => setTimeout(resolve, options.delayMs));
       }
 
-      return { output: ctx.input };
+      return { output: ctx.input as z.infer<T> };
     },
   });
 }
@@ -212,7 +212,10 @@ export function createConfigurableStage<
     dependencies: options?.dependencies,
     schemas,
     async execute(ctx) {
-      const result = await execute(ctx.input, ctx.config);
+      const result = await execute(
+        ctx.input as z.infer<TInput>,
+        ctx.config as z.infer<TConfig>,
+      );
       return { output: result };
     },
   });

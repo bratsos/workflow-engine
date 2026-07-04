@@ -22,8 +22,8 @@ import type {
 } from "@ai-sdk/provider";
 import { openrouter } from "@openrouter/ai-sdk-provider";
 import type { StepResult, ToolSet } from "ai";
-import { embed, generateText, Output, streamText } from "ai";
-import type { z } from "zod";
+import { embed, embedMany, generateText, Output, streamText } from "ai";
+import { z } from "zod";
 import type { AICallLogger } from "../persistence";
 import { getBestProviderForModel } from "../utils/batch/model-mapping";
 import { AnthropicBatchProvider } from "../utils/batch/providers/anthropic-batch";
@@ -174,6 +174,10 @@ export type BatchLogFn = (
 export interface TextOptions<TTools extends ToolSet = ToolSet> {
   temperature?: number;
   maxTokens?: number;
+  /** Maximum number of retries for the AI SDK call (pass-through) */
+  maxRetries?: number;
+  /** Abort signal to cancel the AI SDK call (pass-through) */
+  abortSignal?: AbortSignal;
   /** Tool definitions for the model to use */
   tools?: TTools;
   /** Tool choice: 'auto' (default), 'required' (force tool use), 'none', or specific tool name */
@@ -198,6 +202,10 @@ export interface TextOptions<TTools extends ToolSet = ToolSet> {
 export interface ObjectOptions<TTools extends ToolSet = ToolSet> {
   temperature?: number;
   maxTokens?: number;
+  /** Maximum number of retries for the AI SDK call (pass-through) */
+  maxRetries?: number;
+  /** Abort signal to cancel the AI SDK call (pass-through) */
+  abortSignal?: AbortSignal;
   /** Tool definitions for the model to use */
   tools?: TTools;
   /** Condition to stop tool execution (e.g., stepCountIs(3)) */
@@ -213,7 +221,7 @@ export interface ObjectOptions<TTools extends ToolSet = ToolSet> {
 
 export interface EmbedOptions {
   taskType?: "RETRIEVAL_QUERY" | "RETRIEVAL_DOCUMENT" | "SEMANTIC_SIMILARITY";
-  /** Override the default embedding dimensions (from embedding-config.ts) */
+  /** Override the default embedding dimensions (DEFAULT_EMBEDDING_DIMENSIONS in this file) */
   dimensions?: number;
   /** Provider-specific options passed directly to the AI SDK's embed() call */
   providerOptions?: Record<string, Record<string, unknown>>;
@@ -222,6 +230,10 @@ export interface EmbedOptions {
 export interface StreamOptions {
   temperature?: number;
   maxTokens?: number;
+  /** Maximum number of retries for the AI SDK call (pass-through) */
+  maxRetries?: number;
+  /** Abort signal to cancel the AI SDK call (pass-through) */
+  abortSignal?: AbortSignal;
   onChunk?: (chunk: string) => void;
   /** Tool definitions for the model to use */
   tools?: Parameters<typeof streamText>[0]["tools"];
@@ -286,22 +298,37 @@ export interface AIBatchRequest {
 }
 
 /** Result of a single request in a batch */
-export interface AIBatchResult<T = string> {
-  /** The request ID (matches the id from AIBatchRequest) */
-  id: string;
-  /** Original prompt (may be empty if not available from provider) */
-  prompt: string;
-  /** The parsed result (JSON object if schema was provided, otherwise string) */
-  result: T;
-  /** Input tokens used */
-  inputTokens: number;
-  /** Output tokens used */
-  outputTokens: number;
-  /** Status of this individual result */
-  status: "succeeded" | "failed";
-  /** Error message if status is "failed" */
-  error?: string;
-}
+export type AIBatchResult<T = string> =
+  | {
+      /** The request ID (matches the id from AIBatchRequest) */
+      id: string;
+      /** Original prompt (may be empty if not available from provider) */
+      prompt: string;
+      /**
+       * The parsed result (JSON object if schema was provided, otherwise
+       * string). When a schema was provided at submit time, this has already
+       * been validated against it - a response that fails validation shows
+       * up as `status: "failed"` instead.
+       */
+      result: T;
+      /** Input tokens used */
+      inputTokens: number;
+      /** Output tokens used */
+      outputTokens: number;
+      status: "succeeded";
+      error?: undefined;
+    }
+  | {
+      id: string;
+      prompt: string;
+      /** No validated result is available for a failed request. */
+      result?: undefined;
+      inputTokens: number;
+      outputTokens: number;
+      status: "failed";
+      /** Error message describing why the request failed. */
+      error: string;
+    };
 
 /** Handle for tracking a submitted batch */
 export interface AIBatchHandle {
@@ -433,7 +460,14 @@ function getModelProvider(modelConfig: ModelConfig) {
       },
     });
   }
-  return google(modelConfig.id);
+  if (modelConfig.provider === "google") {
+    return google(modelConfig.id);
+  }
+
+  throw new Error(
+    `Unsupported provider "${modelConfig.provider}" for model "${modelConfig.id}". ` +
+      `Use a built-in provider ("openrouter", "google") or supply a providerResolver.`,
+  );
 }
 
 /** @internal Exported for testing only */
@@ -456,6 +490,21 @@ export function getEmbeddingModelProvider(modelConfig: ModelConfig) {
   throw new Error(
     `Unsupported embedding provider "${modelConfig.provider}" for model "${modelConfig.id}". ` +
       `Register it with registerEmbeddingProvider() or use a built-in provider ("openrouter", "google").`,
+  );
+}
+
+/**
+ * Build a system prompt that communicates the exact expected output shape
+ * to the model via its JSON Schema, rather than a vague "respond with JSON"
+ * instruction. Used for batch providers (Anthropic, OpenAI) that don't have
+ * native structured-output support in their batch APIs.
+ */
+function buildJsonSchemaSystemPrompt(schema: z.ZodTypeAny): string {
+  const jsonSchema = z.toJSONSchema(schema);
+  return (
+    "You must respond with valid JSON only that conforms exactly to the " +
+    "following JSON Schema. No markdown, no explanation, just the JSON object.\n\n" +
+    `JSON Schema:\n${JSON.stringify(jsonSchema)}`
   );
 }
 
@@ -564,6 +613,10 @@ class AIHelperImpl implements AIHelper {
                 output?: unknown;
               };
               if (result.toolName) {
+                // Tool-execution records are observability only, not billable
+                // events - the step's usage/cost is already logged once via
+                // the final call's aggregate usage. Logging it here too would
+                // double (or N+1) count cost across tool calls in the step.
                 const childTopic = `${this.topic}.tool.${result.toolName}`;
                 this.aiCallLogger.logCall({
                   topic: childTopic,
@@ -572,13 +625,9 @@ class AIHelperImpl implements AIHelper {
                   modelId: modelConfig.id,
                   prompt: JSON.stringify(result.input ?? {}, null, 2),
                   response: JSON.stringify(result.output ?? {}, null, 2),
-                  inputTokens: stepResult.usage.inputTokens || 0,
-                  outputTokens: stepResult.usage.outputTokens || 0,
-                  cost: calculateCostWithDiscount(
-                    modelKey,
-                    stepResult.usage.inputTokens || 0,
-                    stepResult.usage.outputTokens || 0,
-                  ),
+                  inputTokens: 0,
+                  outputTokens: 0,
+                  cost: 0,
                   metadata: {
                     toolName: result.toolName,
                     toolCallId: result.toolCallId,
@@ -598,6 +647,10 @@ class AIHelperImpl implements AIHelper {
       model,
       temperature: options.temperature ?? 0.7,
       maxOutputTokens: options.maxTokens,
+      ...(options.maxRetries !== undefined && {
+        maxRetries: options.maxRetries,
+      }),
+      ...(options.abortSignal && { abortSignal: options.abortSignal }),
       // Provider-specific options (e.g. reasoning control) passed through.
       // Cast: the public type uses `unknown` values for DX; the consumer is
       // responsible for passing JSON-serializable provider options.
@@ -666,8 +719,18 @@ class AIHelperImpl implements AIHelper {
       // Debug logging for result
       if (hasTools || hasOutputSchema) {
         const resultAny = result as { steps?: unknown[]; output?: unknown };
+        // `.output` is a getter that throws AI_NoOutputGeneratedError unless
+        // experimental_output was configured - only probe it when relevant.
+        let hasOutput = false;
+        if (hasOutputSchema) {
+          try {
+            hasOutput = resultAny.output !== undefined;
+          } catch {
+            hasOutput = false;
+          }
+        }
         logger.debug(
-          `generateText result: stepsCount=${resultAny.steps?.length ?? 0}, hasOutput=${resultAny.output !== undefined}, finishReason=${result.finishReason}`,
+          `generateText result: stepsCount=${resultAny.steps?.length ?? 0}, hasOutput=${hasOutput}, finishReason=${result.finishReason}`,
         );
       }
 
@@ -802,6 +865,10 @@ class AIHelperImpl implements AIHelper {
       output: Output.object({ schema }),
       temperature: options.temperature ?? 0,
       maxOutputTokens: options.maxTokens,
+      ...(options.maxRetries !== undefined && {
+        maxRetries: options.maxRetries,
+      }),
+      ...(options.abortSignal && { abortSignal: options.abortSignal }),
       // Provider-specific options (e.g. reasoning control) passed through.
       // Cast: the public type uses `unknown` values for DX; the consumer is
       // responsible for passing JSON-serializable provider options.
@@ -975,30 +1042,36 @@ class AIHelperImpl implements AIHelper {
     });
 
     try {
-      // For single text, use embed directly
-      // For multiple texts, we need to call embed for each (AI SDK doesn't have batch embed)
-      const embeddings: number[][] = [];
-      let totalInputTokens = 0;
+      const embeddingModel = getEmbeddingModelProvider(modelConfig);
+      const providerOptions = {
+        ...(modelConfig.provider === "google" && {
+          google: {
+            outputDimensionality: dimensions,
+            taskType: options.taskType ?? "RETRIEVAL_DOCUMENT",
+          },
+        }),
+        ...options.providerOptions,
+      };
 
-      for (const t of texts) {
-        const embeddingModel = getEmbeddingModelProvider(modelConfig);
+      let embeddings: number[][];
+      let totalInputTokens: number;
 
+      if (texts.length === 1) {
         const result = await embed({
           model: embeddingModel,
-          value: t,
-          providerOptions: {
-            ...(modelConfig.provider === "google" && {
-              google: {
-                outputDimensionality: dimensions,
-                taskType: options.taskType ?? "RETRIEVAL_DOCUMENT",
-              },
-            }),
-            ...options.providerOptions,
-          },
+          value: texts[0],
+          providerOptions,
         });
-
-        embeddings.push(result.embedding);
-        totalInputTokens += result.usage?.tokens || 0;
+        embeddings = [result.embedding];
+        totalInputTokens = result.usage?.tokens || 0;
+      } else {
+        const result = await embedMany({
+          model: embeddingModel,
+          values: texts,
+          providerOptions,
+        });
+        embeddings = result.embeddings;
+        totalInputTokens = result.usage?.tokens || 0;
       }
 
       const outputTokens = 0; // Embeddings have no output tokens
@@ -1145,11 +1218,81 @@ class AIHelperImpl implements AIHelper {
       hasSystem: !!input.system,
     });
 
+    let fullText = "";
+    let chunkCount = 0;
+    let fallbackChecked = false;
+    let usageResolved = false;
+    let cachedUsage: {
+      inputTokens: number;
+      outputTokens: number;
+      cost: number;
+    } | null = null;
+
+    // Persist the call exactly once, whether triggered by the AI SDK's
+    // onFinish callback (so a call is always logged even if the consumer
+    // never calls getUsage()) or by an explicit getUsage() call.
+    const persistUsage = (
+      inputTokens: number,
+      outputTokens: number,
+      responseText: string,
+      reasoning: string | undefined,
+    ) => {
+      if (usageResolved) return cachedUsage!;
+
+      const cost = calculateCostWithDiscount(
+        modelKey,
+        inputTokens,
+        outputTokens,
+      );
+      const durationMs = Date.now() - startTime;
+
+      usageResolved = true;
+      cachedUsage = { inputTokens, outputTokens, cost };
+
+      logger.debug(`streamText response`, {
+        model: modelKey,
+        response:
+          responseText.substring(0, 500) +
+          (responseText.length > 500 ? "..." : ""),
+        inputTokens,
+        outputTokens,
+        cost: cost.toFixed(6),
+        durationMs,
+        chunkCount,
+      });
+
+      this.aiCallLogger.logCall({
+        topic: this.topic,
+        callType: "stream",
+        modelKey,
+        modelId: modelConfig.id,
+        prompt: promptForLog,
+        response: responseText,
+        inputTokens,
+        outputTokens,
+        cost,
+        metadata: {
+          temperature: options.temperature,
+          maxTokens: options.maxTokens,
+          streamChunks: chunkCount,
+          durationMs,
+          ...(reasoning ? { hasReasoning: true } : {}),
+          ...(input.system ? { system: input.system } : {}),
+        },
+      });
+
+      return cachedUsage;
+    };
+
     // Build the streamText params based on input type
     const baseParams = {
       model,
       temperature: options.temperature ?? 0.7,
       maxOutputTokens: options.maxTokens,
+      ...(options.maxRetries !== undefined && {
+        maxRetries: options.maxRetries,
+      }),
+      ...(options.abortSignal && { abortSignal: options.abortSignal }),
       ...(input.system ? { system: input.system } : {}),
       // Provider-specific options (e.g. reasoning control) passed through.
       // Cast: the public type uses `unknown` values for DX; the consumer is
@@ -1167,6 +1310,23 @@ class AIHelperImpl implements AIHelper {
       onError: ({ error }: { error: unknown }) => {
         logError(error);
       },
+      // Ensure the call is always logged once the stream finishes, even if
+      // the consumer never calls getUsage(). Dedup'd against getUsage() via
+      // the usageResolved flag in persistUsage.
+      onFinish: (event: {
+        totalUsage?: { inputTokens?: number; outputTokens?: number };
+        text?: string;
+        reasoningText?: string;
+      }) => {
+        const inputTokens = event.totalUsage?.inputTokens ?? 0;
+        const outputTokens = event.totalUsage?.outputTokens ?? 0;
+        persistUsage(
+          inputTokens,
+          outputTokens,
+          event.text || fullText,
+          event.reasoningText,
+        );
+      },
     };
 
     const result =
@@ -1176,16 +1336,6 @@ class AIHelperImpl implements AIHelper {
             ...baseParams,
             prompt: (input as { prompt: string }).prompt,
           });
-
-    let fullText = "";
-    let chunkCount = 0;
-    let fallbackChecked = false;
-    let usageResolved = false;
-    let cachedUsage: {
-      inputTokens: number;
-      outputTokens: number;
-      cost: number;
-    } | null = null;
 
     // Create async iterable that collects text and calls onChunk
     const streamIterable: AsyncIterable<string> = {
@@ -1235,8 +1385,8 @@ class AIHelperImpl implements AIHelper {
     // ReadableStream lock error).
 
     // Create usage getter that waits for stream completion and persists
+    // (or reuses the persistence already done by onFinish).
     const getUsage = async () => {
-      // Return cached usage if already resolved
       if (usageResolved && cachedUsage) {
         return cachedUsage;
       }
@@ -1246,54 +1396,8 @@ class AIHelperImpl implements AIHelper {
       const responseText = (await result.text) || fullText;
       const inputTokens = usage?.inputTokens ?? 0;
       const outputTokens = usage?.outputTokens ?? 0;
-      const cost = calculateCostWithDiscount(
-        modelKey,
-        inputTokens,
-        outputTokens,
-      );
-      const durationMs = Date.now() - startTime;
 
-      // Only persist once
-      if (!usageResolved) {
-        usageResolved = true;
-        cachedUsage = { inputTokens, outputTokens, cost };
-
-        // Trace log after stream completion
-        logger.debug(`streamText response`, {
-          model: modelKey,
-          response:
-            responseText.substring(0, 500) +
-            (responseText.length > 500 ? "..." : ""),
-          inputTokens,
-          outputTokens,
-          cost: cost.toFixed(6),
-          durationMs,
-          chunkCount,
-        });
-
-        // Persist to DB
-        this.aiCallLogger.logCall({
-          topic: this.topic,
-          callType: "stream",
-          modelKey,
-          modelId: modelConfig.id,
-          prompt: promptForLog,
-          response: responseText,
-          inputTokens,
-          outputTokens,
-          cost,
-          metadata: {
-            temperature: options.temperature,
-            maxTokens: options.maxTokens,
-            streamChunks: chunkCount,
-            durationMs,
-            ...(reasoning ? { hasReasoning: true } : {}),
-            ...(input.system ? { system: input.system } : {}),
-          },
-        });
-      }
-
-      return cachedUsage ?? { inputTokens, outputTokens, cost };
+      return persistUsage(inputTokens, outputTokens, responseText, reasoning);
     };
 
     // Full answer text, reconciled with the buffered result (handles models
@@ -1435,6 +1539,19 @@ class AIBatchImpl<T = string> implements AIBatch<T> {
   private anthropicProvider: AnthropicBatchProvider | null = null;
   private openaiProvider: OpenAIBatchProvider | null = null;
 
+  /**
+   * Schemas keyed by batchId -> customId, populated at submit() time so
+   * getResults() can validate responses against them. This only survives
+   * for the lifetime of this AIBatchImpl instance (i.e. the same process) -
+   * a fresh instance created after a workflow suspend/resume won't have it.
+   * Callers that need validation across a resume can re-supply schemas via
+   * getResults(batchId, { schemas }).
+   */
+  private schemasByBatch = new Map<string, Map<string, z.ZodTypeAny>>();
+
+  /** Request counts keyed by batchId, populated at submit() time. */
+  private requestCountsByBatch = new Map<string, number>();
+
   constructor(
     private helper: AIHelperImpl,
     private modelKey: ModelKey,
@@ -1480,17 +1597,27 @@ class AIBatchImpl<T = string> implements AIBatch<T> {
       hasMoreRequests: requests.length > 10,
     });
 
-    const jsonSystemPrompt =
-      "You must respond with valid JSON only. No markdown, no explanation, just the JSON object.";
+    // Register schemas for later validation in getResults(), keyed by the
+    // request id supplied by the caller (not the batchId, which we don't
+    // have yet).
+    const schemasById = new Map<string, z.ZodTypeAny>();
+    for (const req of requests) {
+      if (req.schema) schemasById.set(req.id, req.schema);
+    }
 
     if (this.provider === "google" && this.googleProvider) {
       const googleRequests = requests.map((req) => ({
         id: req.id,
         prompt: req.prompt,
         model: this.modelKey,
-        ...(req.schema && { system: jsonSystemPrompt, schema: req.schema }),
+        // Google gets native structured output (responseMimeType +
+        // responseJsonSchema in google-batch.ts), so we just pass the schema
+        // through rather than synthesizing prompt text for it.
+        ...(req.schema && { schema: req.schema }),
       }));
       const handle = await this.googleProvider.submit(googleRequests);
+      this.schemasByBatch.set(handle.id, schemasById);
+      this.requestCountsByBatch.set(handle.id, requests.length);
       logger.debug(`batch submitted`, {
         provider: "google",
         batchId: handle.id,
@@ -1504,9 +1631,11 @@ class AIBatchImpl<T = string> implements AIBatch<T> {
         customId: req.id,
         prompt: req.prompt,
         model: this.modelKey,
-        ...(req.schema && { system: jsonSystemPrompt }),
+        ...(req.schema && { system: buildJsonSchemaSystemPrompt(req.schema) }),
       }));
       const handle = await this.anthropicProvider.submit(anthropicRequests);
+      this.schemasByBatch.set(handle.id, schemasById);
+      this.requestCountsByBatch.set(handle.id, requests.length);
       logger.debug(`batch submitted`, {
         provider: "anthropic",
         batchId: handle.id,
@@ -1520,9 +1649,11 @@ class AIBatchImpl<T = string> implements AIBatch<T> {
         customId: req.id,
         prompt: req.prompt,
         model: this.modelKey,
-        ...(req.schema && { system: jsonSystemPrompt }),
+        ...(req.schema && { system: buildJsonSchemaSystemPrompt(req.schema) }),
       }));
       const handle = await this.openaiProvider.submit(openaiRequests);
+      this.schemasByBatch.set(handle.id, schemasById);
+      this.requestCountsByBatch.set(handle.id, requests.length);
       logger.debug(`batch submitted`, {
         provider: "openai",
         batchId: handle.id,
@@ -1541,7 +1672,7 @@ class AIBatchImpl<T = string> implements AIBatch<T> {
     const handle = {
       id: batchId,
       provider: this.provider,
-      requestCount: 0,
+      requestCount: this.requestCountsByBatch.get(batchId) ?? 0,
       createdAt: new Date(),
     };
     let status: { state: string };
@@ -1595,7 +1726,7 @@ class AIBatchImpl<T = string> implements AIBatch<T> {
     const handle = {
       id: batchId,
       provider: this.provider,
-      requestCount: 0,
+      requestCount: this.requestCountsByBatch.get(batchId) ?? 0,
       createdAt: new Date(),
       metadata,
     };
@@ -1640,23 +1771,36 @@ class AIBatchImpl<T = string> implements AIBatch<T> {
       totalOutputTokens,
     });
 
+    // Schemas for validation: prefer ones re-supplied explicitly via
+    // metadata.schemas (works across a suspend/resume, since the caller is
+    // responsible for keeping hold of the Zod schema object), falling back
+    // to the in-process map populated at submit() time.
+    const suppliedSchemas = metadata?.schemas as
+      | Record<string, z.ZodTypeAny>
+      | undefined;
+    const inProcessSchemas = this.schemasByBatch.get(batchId);
+
     // Transform RawBatchResult to AIBatchResult<T>
     const results: AIBatchResult<T>[] = rawResults.map((raw, index) => {
-      // Check if this request failed
+      const id = raw.customId || `result-${index}`;
+      const inputTokens = raw.inputTokens || 0;
+      const outputTokens = raw.outputTokens || 0;
+
+      // Check if this request failed at the provider level
       if (raw.error) {
         return {
-          id: raw.customId || `result-${index}`,
+          id,
           prompt: "", // Not available from raw results
-          result: {} as T, // Empty result for failed requests
-          inputTokens: raw.inputTokens || 0,
-          outputTokens: raw.outputTokens || 0,
+          inputTokens,
+          outputTokens,
           status: "failed" as const,
           error: raw.error,
         };
       }
 
       // Try to parse JSON if the result looks like JSON
-      let parsedResult: T;
+      let parsedJson: unknown;
+      let parseError: string | undefined;
       try {
         // Clean markdown code blocks before parsing
         let cleaned = raw.text.trim();
@@ -1669,17 +1813,59 @@ class AIBatchImpl<T = string> implements AIBatch<T> {
           cleaned = cleaned.slice(0, -3);
         }
         cleaned = cleaned.trim();
-        parsedResult = JSON.parse(cleaned) as T;
-      } catch {
-        parsedResult = raw.text as unknown as T;
+        parsedJson = JSON.parse(cleaned);
+      } catch (err) {
+        parseError = err instanceof Error ? err.message : String(err);
       }
 
+      const schema = suppliedSchemas?.[id] ?? inProcessSchemas?.get(id);
+
+      if (schema) {
+        // A schema was supplied for this request - validate against it
+        // instead of blindly trusting the model's output.
+        if (parseError) {
+          return {
+            id,
+            prompt: "",
+            inputTokens,
+            outputTokens,
+            status: "failed" as const,
+            error: `Failed to parse JSON response for schema validation: ${parseError}`,
+          };
+        }
+
+        const validation = schema.safeParse(parsedJson);
+        if (!validation.success) {
+          return {
+            id,
+            prompt: "",
+            inputTokens,
+            outputTokens,
+            status: "failed" as const,
+            error: `Response did not match the request's schema: ${validation.error.message}`,
+          };
+        }
+
+        return {
+          id,
+          prompt: "",
+          result: validation.data as T,
+          inputTokens,
+          outputTokens,
+          status: "succeeded" as const,
+        };
+      }
+
+      // No schema to validate against - fall back to best-effort parsing,
+      // same as before, but only for a genuinely successful response.
+      const result = (parseError === undefined ? parsedJson : raw.text) as T;
+
       return {
-        id: raw.customId || `result-${index}`,
+        id,
         prompt: "", // Not available from raw results
-        result: parsedResult,
-        inputTokens: raw.inputTokens || 0,
-        outputTokens: raw.outputTokens || 0,
+        result,
+        inputTokens,
+        outputTokens,
         status: "succeeded" as const,
       };
     });
@@ -1729,11 +1915,18 @@ class AIBatchImpl<T = string> implements AIBatch<T> {
           modelId: modelConfig.id,
           prompt: r.prompt,
           response:
-            typeof r.result === "string" ? r.result : JSON.stringify(r.result),
+            r.status === "succeeded"
+              ? typeof r.result === "string"
+                ? r.result
+                : JSON.stringify(r.result)
+              : "",
           inputTokens: r.inputTokens,
           outputTokens: r.outputTokens,
           cost,
-          metadata: { batchId, requestId: r.id },
+          metadata:
+            r.status === "failed"
+              ? { batchId, requestId: r.id, status: "failed", error: r.error }
+              : { batchId, requestId: r.id },
         };
       }),
     );

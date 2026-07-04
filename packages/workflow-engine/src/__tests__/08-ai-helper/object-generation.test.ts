@@ -6,6 +6,7 @@
 
 import { beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
+import type { ModelKey } from "../../ai/model-helper.js";
 import { createMockAIHelper, MockAIHelper } from "../utils/mock-ai-helper.js";
 
 describe("I want to generate structured objects using AIHelper", () => {
@@ -68,7 +69,7 @@ describe("I want to generate structured objects using AIHelper", () => {
 
       // When: I call with different models
       await ai.generateObject("gemini-2.5-flash", "test", schema);
-      await ai.generateObject("gemini-2.5-pro", "test", schema);
+      await ai.generateObject("gemini-2.5-pro" as ModelKey, "test", schema);
 
       // Then: Both calls are recorded
       const calls = ai.getCallsByType("object");

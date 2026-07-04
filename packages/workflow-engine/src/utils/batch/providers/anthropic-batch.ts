@@ -208,13 +208,18 @@ export class AnthropicBatchProvider
         // Handle errored, canceled, or expired results
         let errorMsg: string;
         switch (entry.result.type) {
-          case "errored":
+          case "errored": {
             // ErrorResponse has error.type and error.message at different levels
-            errorMsg =
-              (entry.result.error as { message?: string })?.message ||
-              `Error type: ${entry.result.error?.type}` ||
-              "Request errored";
+            const errBody = entry.result.error as
+              | { message?: string; type?: string }
+              | undefined;
+            errorMsg = errBody?.message
+              ? errBody.message
+              : errBody?.type
+                ? `Error type: ${errBody.type}`
+                : "Request errored";
             break;
+          }
           case "canceled":
             errorMsg = "Request was canceled";
             break;

@@ -6,6 +6,7 @@
 
 import { beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
+import type { ModelKey } from "../../ai/model-helper.js";
 import { createMockAIHelper, MockAIHelper } from "../utils/mock-ai-helper.js";
 
 describe("I want to track AI costs using AIHelper", () => {
@@ -56,7 +57,10 @@ describe("I want to track AI costs using AIHelper", () => {
     it("should return cost with embed result", async () => {
       // Given: A mock AI helper (default embed has cost)
       // When: I embed
-      const result = await ai.embed("text-embedding-004", "Test text");
+      const result = await ai.embed(
+        "text-embedding-004" as ModelKey,
+        "Test text",
+      );
 
       // Then: Cost is included
       expect(result.cost).toBeGreaterThan(0);
@@ -119,7 +123,10 @@ describe("I want to track AI costs using AIHelper", () => {
     it("should track embedding tokens (input only)", async () => {
       // Given: A mock AI helper
       // When: I embed
-      const result = await ai.embed("text-embedding-004", "Some text");
+      const result = await ai.embed(
+        "text-embedding-004" as ModelKey,
+        "Some text",
+      );
 
       // Then: Only input tokens (no output for embeddings)
       expect(result.inputTokens).toBeGreaterThan(0);
@@ -234,7 +241,7 @@ describe("I want to track AI costs using AIHelper", () => {
     it("should track stats per model", async () => {
       // Given: Calls with different models
       await ai.generateText("gemini-2.5-flash", "Flash call");
-      await ai.generateText("gemini-2.5-pro", "Pro call");
+      await ai.generateText("gemini-2.5-pro" as ModelKey, "Pro call");
 
       // When: I get stats
       const stats = await ai.getStats();
@@ -248,7 +255,7 @@ describe("I want to track AI costs using AIHelper", () => {
       // Given: Multiple calls per model
       await ai.generateText("gemini-2.5-flash", "Flash 1");
       await ai.generateText("gemini-2.5-flash", "Flash 2");
-      await ai.generateText("gemini-2.5-pro", "Pro 1");
+      await ai.generateText("gemini-2.5-pro" as ModelKey, "Pro 1");
 
       // When: I get stats
       const stats = await ai.getStats();
@@ -274,7 +281,7 @@ describe("I want to track AI costs using AIHelper", () => {
       });
 
       await ai.generateText("gemini-2.5-flash", "flash");
-      await ai.generateText("gemini-2.5-pro", "pro");
+      await ai.generateText("gemini-2.5-pro" as ModelKey, "pro");
 
       // When: I get stats
       const stats = await ai.getStats();
@@ -302,7 +309,7 @@ describe("I want to track AI costs using AIHelper", () => {
       });
 
       await ai.generateText("gemini-2.5-flash", "flash");
-      await ai.generateText("gemini-2.5-pro", "pro");
+      await ai.generateText("gemini-2.5-pro" as ModelKey, "pro");
 
       // When: I get stats
       const stats = await ai.getStats();
@@ -334,7 +341,7 @@ describe("I want to track AI costs using AIHelper", () => {
 
       await ai.generateText("gemini-2.5-flash", "Text");
       await ai.generateObject("gemini-2.5-flash", "Object", schema);
-      await ai.embed("text-embedding-004", "Embed");
+      await ai.embed("text-embedding-004" as ModelKey, "Embed");
 
       const stream = ai.streamText("gemini-2.5-flash", { prompt: "Stream" });
       for await (const _ of stream.stream) {

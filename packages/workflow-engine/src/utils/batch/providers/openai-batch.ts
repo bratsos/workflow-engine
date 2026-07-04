@@ -123,7 +123,7 @@ export class OpenAIBatchProvider
                 : []),
               { role: "user" as const, content: req.prompt },
             ],
-            max_tokens: req.maxTokens || 1024,
+            max_completion_tokens: req.maxTokens || 1024,
             ...(req.temperature !== undefined && {
               temperature: req.temperature,
             }),
