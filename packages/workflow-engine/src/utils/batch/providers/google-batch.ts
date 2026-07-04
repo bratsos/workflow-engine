@@ -12,7 +12,7 @@ import {
   type InlinedRequest,
   JobState,
 } from "@google/genai";
-import { jsonSchema } from "ai";
+import { asSchema } from "ai";
 import { z } from "zod";
 import { resolveModelForProvider } from "../model-mapping";
 import type {
@@ -122,7 +122,7 @@ export class GoogleBatchProvider
                 description: tool.description,
                 // AI SDK uses inputSchema, convert to JSON Schema for Google
                 parameters: tool.inputSchema
-                  ? jsonSchema(tool.inputSchema)
+                  ? asSchema(tool.inputSchema).jsonSchema
                   : undefined,
               }),
             ),

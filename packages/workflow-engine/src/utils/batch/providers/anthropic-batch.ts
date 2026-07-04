@@ -7,7 +7,7 @@
 
 // Optional peer dependency
 import { Anthropic } from "@anthropic-ai/sdk";
-import { jsonSchema } from "ai";
+import { asSchema } from "ai";
 import { resolveModelForProvider } from "../model-mapping";
 import type {
   AnthropicBatchRequest,
@@ -76,7 +76,7 @@ export class AnthropicBatchProvider
               name,
               description: tool.description || "",
               input_schema: (tool.inputSchema
-                ? jsonSchema(tool.inputSchema)
+                ? asSchema(tool.inputSchema).jsonSchema
                 : {
                     type: "object",
                     properties: {},
