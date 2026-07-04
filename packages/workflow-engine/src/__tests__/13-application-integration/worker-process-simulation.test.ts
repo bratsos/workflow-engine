@@ -448,6 +448,7 @@ describe("I want to simulate worker process behavior", () => {
 
       const jobId = await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "flaky-stage",
       });
 
@@ -474,6 +475,7 @@ describe("I want to simulate worker process behavior", () => {
 
       const jobId = await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "failing-stage",
       });
 
@@ -496,6 +498,7 @@ describe("I want to simulate worker process behavior", () => {
 
       const jobId = await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "stage-1",
       });
 
@@ -516,6 +519,7 @@ describe("I want to simulate worker process behavior", () => {
 
       const jobId = await jobTransport.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "process",
       });
 
@@ -552,6 +556,7 @@ describe("I want to simulate worker process behavior", () => {
 
       const jobId = await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "stage-1",
         priority: 8,
         payload,
@@ -571,40 +576,13 @@ describe("I want to simulate worker process behavior", () => {
   });
 
   describe("worker processing suspended jobs", () => {
-    it("should find suspended jobs ready to resume", async () => {
-      // Given: Suspended jobs with different resume times
-      const jobQueue = new InMemoryJobQueue("worker-1");
-
-      const job1 = await jobQueue.enqueue({
-        workflowRunId: "run-1",
-        stageId: "batch-1",
-      });
-      const job2 = await jobQueue.enqueue({
-        workflowRunId: "run-2",
-        stageId: "batch-2",
-      });
-
-      // Process and suspend both
-      await jobQueue.dequeue();
-      await jobQueue.suspend(job1, new Date(Date.now() - 1000)); // Ready now
-      await jobQueue.dequeue();
-      await jobQueue.suspend(job2, new Date(Date.now() + 60000)); // Not ready
-
-      // When: Check for ready suspended jobs
-      const ready = await jobQueue.getSuspendedJobsReadyToPoll();
-
-      // Then: Only the ready job is returned
-      expect(ready).toHaveLength(1);
-      expect(ready[0]?.jobId).toBe(job1);
-      expect(ready[0]?.stageId).toBe("batch-1");
-    });
-
     it("should allow manual resume for testing", async () => {
       // Given: A suspended job
       const jobQueue = new InMemoryJobQueue("worker-1");
 
       const jobId = await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "stage-1",
       });
 

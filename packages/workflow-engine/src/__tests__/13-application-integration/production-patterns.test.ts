@@ -63,9 +63,21 @@ describe("I want to use production-ready patterns", () => {
       const processedJobs: string[] = [];
 
       // Enqueue multiple jobs
-      await jobQueue.enqueue({ workflowRunId: "run-1", stageId: "stage-1" });
-      await jobQueue.enqueue({ workflowRunId: "run-2", stageId: "stage-2" });
-      await jobQueue.enqueue({ workflowRunId: "run-3", stageId: "stage-3" });
+      await jobQueue.enqueue({
+        workflowRunId: "run-1",
+        workflowId: "workflow-1",
+        stageId: "stage-1",
+      });
+      await jobQueue.enqueue({
+        workflowRunId: "run-2",
+        workflowId: "workflow-1",
+        stageId: "stage-2",
+      });
+      await jobQueue.enqueue({
+        workflowRunId: "run-3",
+        workflowId: "workflow-1",
+        stageId: "stage-3",
+      });
 
       // When: Worker processes with graceful shutdown
       const processJob = async (jobId: string, stageId: string) => {
@@ -102,6 +114,7 @@ describe("I want to use production-ready patterns", () => {
       const jobQueue = new InMemoryJobQueue("worker-1");
       const jobId = await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "interrupted",
       });
 
@@ -145,6 +158,7 @@ describe("I want to use production-ready patterns", () => {
       // Enqueue and lock a job manually
       const jobId = await jobTransport.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "process",
       });
       await jobTransport.dequeue(); // locks it
@@ -185,7 +199,11 @@ describe("I want to use production-ready patterns", () => {
       };
 
       // When: Worker processes a job successfully
-      await jobQueue.enqueue({ workflowRunId: "run-1", stageId: "stage-1" });
+      await jobQueue.enqueue({
+        workflowRunId: "run-1",
+        workflowId: "workflow-1",
+        stageId: "stage-1",
+      });
       const job = await jobQueue.dequeue();
       if (job) {
         await jobQueue.complete(job.jobId);
@@ -260,6 +278,7 @@ describe("I want to use production-ready patterns", () => {
 
       const jobId = await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "flaky-stage",
       });
 
@@ -427,6 +446,7 @@ describe("I want to use production-ready patterns", () => {
 
       const jobId = await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "problematic-stage",
       });
 

@@ -95,6 +95,7 @@ describe("I want to ensure proper dependency resolution", () => {
       };
 
       const stageC = defineStage<
+        "stage-c",
         z.ZodObject<{ valueB: z.ZodNumber }>,
         z.ZodObject<{ combined: z.ZodNumber }>,
         z.ZodObject<{}>,
@@ -211,7 +212,8 @@ describe("I want to ensure proper dependency resolution", () => {
       };
 
       const stageD = defineStage<
-        z.ZodObject<{}, "passthrough">,
+        "dependent-d",
+        z.ZodTypeAny,
         z.ZodObject<{ combined: z.ZodString }>,
         z.ZodObject<{}>,
         ParallelContext
@@ -343,6 +345,7 @@ describe("I want to ensure proper dependency resolution", () => {
       };
 
       const stageD = defineStage<
+        "processor",
         z.ZodObject<{ version: z.ZodString; timestamp: z.ZodNumber }>,
         z.ZodObject<{ result: z.ZodString }>,
         z.ZodObject<{}>,
@@ -449,6 +452,7 @@ describe("I want to ensure proper dependency resolution", () => {
       };
 
       const dependentStage = defineStage<
+        "mixed-consumer",
         z.ZodObject<{ essential: z.ZodString }>,
         z.ZodObject<{ result: z.ZodString }>,
         z.ZodObject<{}>,
@@ -582,6 +586,7 @@ describe("I want to ensure proper dependency resolution", () => {
       };
 
       const stageD = defineStage<
+        "destination",
         z.ZodObject<{ further: z.ZodString }>,
         z.ZodObject<{ final: z.ZodString }>,
         z.ZodObject<{}>,
@@ -720,7 +725,8 @@ describe("I want to ensure proper dependency resolution", () => {
       };
 
       const combinerStage = defineStage<
-        z.ZodObject<{}, "passthrough">,
+        "combiner",
+        z.ZodTypeAny,
         z.ZodObject<{ total: z.ZodNumber }>,
         z.ZodObject<{}>,
         ParallelWorkersContext

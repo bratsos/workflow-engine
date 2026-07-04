@@ -239,6 +239,7 @@ describe("I want to handle execution errors properly", () => {
             throw new Error("Deep nested error");
           };
           innerFunction();
+          return { output: {} };
         },
       });
 

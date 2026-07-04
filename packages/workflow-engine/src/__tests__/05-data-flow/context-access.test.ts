@@ -353,6 +353,7 @@ describe("I want to access previous stage outputs", () => {
       };
 
       const secondStage = defineStage<
+        "process",
         z.ZodObject<{ data: z.ZodString; count: z.ZodNumber }>,
         z.ZodObject<{ result: z.ZodString }>,
         z.ZodObject<{}>,
@@ -546,6 +547,7 @@ describe("I want to access previous stage outputs", () => {
       };
 
       const secondStage = defineStage<
+        "check",
         z.ZodObject<{ optional: z.ZodString }>,
         z.ZodObject<{ found: z.ZodBoolean; value: z.ZodString }>,
         z.ZodObject<{}>,

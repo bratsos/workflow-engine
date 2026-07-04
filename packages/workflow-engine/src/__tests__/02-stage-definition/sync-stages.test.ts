@@ -103,10 +103,12 @@ describe("I want to define synchronous stages", () => {
         config: {},
         workflowContext: {},
         onProgress: () => {},
+        onLog: () => {},
         log: () => {},
+        annotate: () => {},
         storage: {
           save: async () => {},
-          load: async () => null,
+          load: async <T>(): Promise<T> => null as T,
           exists: async () => false,
           delete: async () => {},
           getStageKey: () => "key",
@@ -183,7 +185,7 @@ describe("I want to define synchronous stages", () => {
 
       // When: Executed with workflowContext populated
       const mockContext: StageContext<
-        unknown,
+        Record<string, never>,
         Record<string, never>,
         Record<string, unknown>
       > = {
@@ -198,10 +200,12 @@ describe("I want to define synchronous stages", () => {
           "previous-stage": { someData: "value" },
         },
         onProgress: () => {},
+        onLog: () => {},
         log: () => {},
+        annotate: () => {},
         storage: {
           save: async () => {},
-          load: async () => null,
+          load: async <T>(): Promise<T> => null as T,
           exists: async () => false,
           delete: async () => {},
           getStageKey: () => "key",
@@ -332,7 +336,7 @@ describe("I want to define synchronous stages", () => {
 
       // When: Executed with required stage in context
       const mockContext: StageContext<
-        unknown,
+        Record<string, never>,
         Record<string, never>,
         Record<string, unknown>
       > = {
@@ -347,10 +351,12 @@ describe("I want to define synchronous stages", () => {
           "previous-stage": { important: "data" },
         },
         onProgress: () => {},
+        onLog: () => {},
         log: () => {},
+        annotate: () => {},
         storage: {
           save: async () => {},
-          load: async () => null,
+          load: async <T>(): Promise<T> => null as T,
           exists: async () => false,
           delete: async () => {},
           getStageKey: () => "key",
@@ -381,7 +387,7 @@ describe("I want to define synchronous stages", () => {
 
       // When: Executed without the required stage
       const mockContext: StageContext<
-        unknown,
+        Record<string, never>,
         Record<string, never>,
         Record<string, unknown>
       > = {
@@ -394,10 +400,12 @@ describe("I want to define synchronous stages", () => {
         config: {},
         workflowContext: {},
         onProgress: () => {},
+        onLog: () => {},
         log: () => {},
+        annotate: () => {},
         storage: {
           save: async () => {},
-          load: async () => null,
+          load: async <T>(): Promise<T> => null as T,
           exists: async () => false,
           delete: async () => {},
           getStageKey: () => "key",
@@ -428,7 +436,7 @@ describe("I want to define synchronous stages", () => {
 
       // When: Executed without the optional stage
       const mockContext: StageContext<
-        unknown,
+        Record<string, never>,
         Record<string, never>,
         Record<string, unknown>
       > = {
@@ -441,10 +449,12 @@ describe("I want to define synchronous stages", () => {
         config: {},
         workflowContext: {},
         onProgress: () => {},
+        onLog: () => {},
         log: () => {},
+        annotate: () => {},
         storage: {
           save: async () => {},
-          load: async () => null,
+          load: async <T>(): Promise<T> => null as T,
           exists: async () => false,
           delete: async () => {},
           getStageKey: () => "key",
@@ -496,10 +506,12 @@ describe("I want to define synchronous stages", () => {
         config: {},
         workflowContext: {},
         onProgress: () => {},
+        onLog: () => {},
         log: () => {},
+        annotate: () => {},
         storage: {
           save: async () => {},
-          load: async () => null,
+          load: async <T>(): Promise<T> => null as T,
           exists: async () => false,
           delete: async () => {},
           getStageKey: () => "key",
@@ -513,7 +525,10 @@ describe("I want to define synchronous stages", () => {
       if ("output" in result) {
         expect(result.metrics).toBeDefined();
         expect(result.metrics?.itemsProcessed).toBe(3);
-        expect(result.metrics?.avgProcessTime).toBe(50);
+        expect(
+          (result.metrics as unknown as Record<string, unknown> | undefined)
+            ?.avgProcessTime,
+        ).toBe(50);
       }
     });
   });

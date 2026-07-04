@@ -66,7 +66,7 @@ async function setupAndExecute(
   persistence: InMemoryWorkflowPersistence,
   workflowId: string,
   stageId: string,
-  input: unknown,
+  input: Record<string, unknown>,
 ): Promise<string> {
   const createResult = await kernel.dispatch({
     type: "run.create",

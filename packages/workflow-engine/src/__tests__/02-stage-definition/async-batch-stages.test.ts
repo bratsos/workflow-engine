@@ -507,8 +507,8 @@ describe("I want to define async-batch stages", () => {
 
       // Then: Context includes workflowRunId and config
       expect(capturedContext).toBeDefined();
-      expect(capturedContext?.workflowRunId).toBe("run-abc-123");
-      expect(capturedContext?.config).toEqual({ apiKey: "secret-key" });
+      expect(capturedContext!.workflowRunId).toBe("run-abc-123");
+      expect(capturedContext!.config).toEqual({ apiKey: "secret-key" });
     });
   });
 
@@ -557,10 +557,10 @@ describe("I want to define async-batch stages", () => {
 // Helper Functions
 // ============================================================================
 
-function createMockContext(options: {
+function createMockContext<TInput>(options: {
   stageId: string;
   stageName: string;
-  input: unknown;
+  input: TInput;
   resumeState?: {
     batchId: string;
     submittedAt: string;
@@ -568,7 +568,7 @@ function createMockContext(options: {
     maxWaitTime: number;
     metadata?: Record<string, unknown>;
   };
-}): StageContext<unknown, Record<string, never>, Record<string, unknown>> {
+}): StageContext<TInput, Record<string, never>, Record<string, unknown>> {
   return {
     workflowRunId: "run-1",
     stageRecordId: "stage-record-1",
@@ -580,10 +580,12 @@ function createMockContext(options: {
     workflowContext: {},
     resumeState: options.resumeState,
     onProgress: () => {},
+    onLog: () => {},
     log: () => {},
+    annotate: () => {},
     storage: {
       save: async () => {},
-      load: async () => null,
+      load: async <T>(): Promise<T> => null as T,
       exists: async () => false,
       delete: async () => {},
       getStageKey: () => "key",
@@ -591,19 +593,21 @@ function createMockContext(options: {
   };
 }
 
-function createCheckContext(options: {
+function createCheckContext<TConfig extends Record<string, unknown>>(options: {
   stageId: string;
-  config: Record<string, unknown>;
+  config: TConfig;
   workflowRunId?: string;
-}): CheckCompletionContext<Record<string, unknown>> {
+}): CheckCompletionContext<TConfig> {
   return {
     workflowRunId: options.workflowRunId ?? "run-1",
     stageId: options.stageId,
     config: options.config,
+    onLog: () => {},
     log: () => {},
+    annotate: () => {},
     storage: {
       save: async () => {},
-      load: async () => null,
+      load: async <T>(): Promise<T> => null as T,
       exists: async () => false,
       delete: async () => {},
       getStageKey: () => "key",

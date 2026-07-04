@@ -88,7 +88,7 @@ async function runWorkflowToCompletion(
   flush: () => Promise<any>,
   workflowId: string,
   stageIds: string[],
-  input: unknown,
+  input: Record<string, unknown>,
 ): Promise<string> {
   const { workflowRunId } = await kernel.dispatch({
     type: "run.create",

@@ -76,7 +76,7 @@ async function setupRun(
   flush: () => Promise<any>,
   eventSink: CollectingEventSink,
   workflowId: string,
-  input: unknown,
+  input: Record<string, unknown>,
 ) {
   const { workflowRunId } = await kernel.dispatch({
     type: "run.create",

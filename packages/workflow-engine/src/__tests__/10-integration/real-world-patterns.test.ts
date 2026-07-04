@@ -533,7 +533,7 @@ describe("I want to implement real-world workflow patterns", () => {
           config: z.object({
             valueThreshold: z.number().default(0),
             categoryRules: z
-              .record(z.string())
+              .record(z.string(), z.string())
               .default({ low: "< 300", medium: "< 700", high: ">= 700" }),
           }),
         },

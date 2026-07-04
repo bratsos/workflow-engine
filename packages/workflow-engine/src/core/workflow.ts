@@ -38,6 +38,48 @@ export interface StageNode {
 }
 
 // ============================================================================
+// Parallel Context Merging Helpers
+// ============================================================================
+
+/**
+ * Merge the outputs of a tuple of parallel stages into a context map keyed by
+ * stage id. Uses `Extract` on the discriminated `id` field so each key maps
+ * to *its own* stage's output type instead of the union of every parallel
+ * stage's output (which is what a naive conditional over `TStages[number]`
+ * would produce).
+ */
+export type MergeParallelContext<
+  TStages extends {
+    id: string;
+    outputSchema: z.ZodTypeAny;
+    dependencies?: string[];
+  }[],
+> = {
+  [K in TStages[number]["id"]]: Extract<TStages[number], { id: K }> extends {
+    outputSchema: infer O extends z.ZodTypeAny;
+  }
+    ? z.infer<O>
+    : never;
+};
+
+/**
+ * The merged Zod object schema produced by combining the output schemas of a
+ * tuple of parallel stages, keyed by stage id.
+ */
+export type MergeParallelOutputSchema<
+  TStages extends {
+    id: string;
+    outputSchema: z.ZodTypeAny;
+    dependencies?: string[];
+  }[],
+> = z.ZodObject<{
+  [K in TStages[number]["id"]]: Extract<
+    TStages[number],
+    { id: K }
+  >["outputSchema"];
+}>;
+
+// ============================================================================
 // Workflow - Complete workflow definition
 // ============================================================================
 
@@ -454,16 +496,8 @@ export class WorkflowBuilder<
     stages: [...TStages],
   ): WorkflowBuilder<
     TInput,
-    z.ZodTypeAny,
-    TContext & {
-      [K in TStages[number]["id"]]: TStages[number] extends {
-        outputSchema: infer O;
-      }
-        ? O extends z.ZodTypeAny
-          ? z.infer<O>
-          : never
-        : never;
-    }
+    MergeParallelOutputSchema<TStages>,
+    TContext & MergeParallelContext<TStages>
   > {
     // Validate dependencies for all parallel stages
     const existingStageIds = this.stages.map((s) => s.stage.id);
@@ -509,24 +543,16 @@ export class WorkflowBuilder<
         },
         {} as Record<string, z.ZodTypeAny>,
       ),
-    ) as any;
+    ) as unknown as MergeParallelOutputSchema<TStages>;
 
     const builder = this as unknown as WorkflowBuilder<
       TInput,
-      any,
-      TContext & {
-        [K in TStages[number]["id"]]: TStages[number] extends Stage<
-          any,
-          infer O,
-          any
-        >
-          ? z.infer<O>
-          : never;
-      }
+      MergeParallelOutputSchema<TStages>,
+      TContext & MergeParallelContext<TStages>
     >;
     builder.currentOutputSchema = mergedSchema;
 
-    return builder as any;
+    return builder;
   }
 
   /**
@@ -559,16 +585,71 @@ export class WorkflowBuilder<
 }
 
 // ============================================================================
+// defineWorkflow - Options-Object Alternative to `new WorkflowBuilder(...)`
+// ============================================================================
+
+/**
+ * Options accepted by {@link defineWorkflow}.
+ */
+export interface DefineWorkflowOptions<
+  TInput extends z.ZodTypeAny,
+  TOutput extends z.ZodTypeAny,
+> {
+  id: string;
+  name: string;
+  description?: string;
+  input: TInput;
+  /**
+   * Optional. This is only used as the builder's *initial* output type
+   * (before any stages are piped) — it is silently replaced by the last
+   * piped stage's `outputSchema` when `.build()` is called, exactly like
+   * the 5th positional argument to `new WorkflowBuilder(...)`. It has no
+   * effect on the final workflow's output schema, so most callers can omit
+   * it and let `.pipe()`/`.parallel()` calls determine the output type.
+   */
+  output?: TOutput;
+}
+
+/**
+ * Create a {@link WorkflowBuilder} from an options object instead of the
+ * 5-positional-argument constructor.
+ *
+ * @example
+ * ```typescript
+ * const workflow = defineWorkflow({
+ *   id: "my-workflow",
+ *   name: "My Workflow",
+ *   description: "Does something useful",
+ *   input: InputSchema,
+ * })
+ *   .pipe(stage1)
+ *   .pipe(stage2)
+ *   .build();
+ * ```
+ */
+export function defineWorkflow<
+  TInput extends z.ZodTypeAny,
+  TOutput extends z.ZodTypeAny = TInput,
+>(
+  options: DefineWorkflowOptions<TInput, TOutput>,
+): WorkflowBuilder<TInput, TOutput> {
+  return new WorkflowBuilder(
+    options.id,
+    options.name,
+    options.description ?? "",
+    options.input,
+    (options.output ?? options.input) as TOutput,
+  );
+}
+
+// ============================================================================
 // Type Inference Utilities (Supplementary to Code Generator)
 // ============================================================================
 
 /**
- * NOTE: For most use cases, prefer using the generated types from `__generated__.ts`
- * which are created by running `pnpm generate:workflow-types`.
- *
  * These inference utilities are useful for:
- * - Quick prototyping before running the generator
- * - Dynamic workflows not covered by the generator
+ * - Deriving a workflow's context type without hand-writing it
+ * - Dynamic workflows where the context shape isn't known ahead of time
  * - Type assertions in tests
  */
 
@@ -594,6 +675,7 @@ export class WorkflowBuilder<
  *
  * // Use in stage definitions
  * export const myStage = defineStage<
+ *   "my-stage-id",
  *   "none",
  *   typeof OutputSchema,
  *   typeof ConfigSchema,
@@ -601,9 +683,8 @@ export class WorkflowBuilder<
  * >({ ... });
  * ```
  */
-export type InferWorkflowContext<W> = W extends Workflow<any, any, infer C>
-  ? C
-  : never;
+export type InferWorkflowContext<W> =
+  W extends Workflow<any, any, infer C> ? C : never;
 
 /**
  * Extract the input type from a Workflow instance
@@ -613,9 +694,8 @@ export type InferWorkflowContext<W> = W extends Workflow<any, any, infer C>
  * type Input = InferWorkflowInput<typeof myWorkflow>;
  * ```
  */
-export type InferWorkflowInput<W> = W extends Workflow<infer I, any, any>
-  ? z.infer<I>
-  : never;
+export type InferWorkflowInput<W> =
+  W extends Workflow<infer I, any, any> ? z.infer<I> : never;
 
 /**
  * Extract the output type from a Workflow instance
@@ -625,9 +705,8 @@ export type InferWorkflowInput<W> = W extends Workflow<infer I, any, any>
  * type Output = InferWorkflowOutput<typeof myWorkflow>;
  * ```
  */
-export type InferWorkflowOutput<W> = W extends Workflow<any, infer O, any>
-  ? z.infer<O>
-  : never;
+export type InferWorkflowOutput<W> =
+  W extends Workflow<any, infer O, any> ? z.infer<O> : never;
 
 /**
  * Extract stage IDs as a union type from a Workflow instance
@@ -642,9 +721,8 @@ export type InferWorkflowOutput<W> = W extends Workflow<any, infer O, any>
  * function getStageOutput(stageId: StageId) { ... }
  * ```
  */
-export type InferWorkflowStageIds<W> = W extends Workflow<any, any, infer C>
-  ? keyof C & string
-  : never;
+export type InferWorkflowStageIds<W> =
+  W extends Workflow<any, any, infer C> ? keyof C & string : never;
 
 /**
  * Get the output type for a specific stage ID from a Workflow
@@ -654,12 +732,9 @@ export type InferWorkflowStageIds<W> = W extends Workflow<any, any, infer C>
  * type DataOutput = InferStageOutputById<typeof workflow, "data-extraction">;
  * ```
  */
-export type InferStageOutputById<W, K extends string> = W extends Workflow<
-  any,
-  any,
-  infer C
->
-  ? K extends keyof C
-    ? C[K]
-    : never
-  : never;
+export type InferStageOutputById<W, K extends string> =
+  W extends Workflow<any, any, infer C>
+    ? K extends keyof C
+      ? C[K]
+      : never
+    : never;

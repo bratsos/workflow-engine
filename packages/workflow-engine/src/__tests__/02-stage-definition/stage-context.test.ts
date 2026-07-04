@@ -462,6 +462,7 @@ describe("I want to use stage context", () => {
       };
 
       const processStage = defineStage<
+        "process",
         z.ZodObject<{ extracted: z.ZodString }>,
         z.ZodObject<{ processed: z.ZodString }>,
         z.ZodObject<{}>,
@@ -645,6 +646,7 @@ describe("I want to use stage context", () => {
       };
 
       const checkStage = defineStage<
+        "check",
         z.ZodObject<{ optional: z.ZodString }>,
         z.ZodObject<{ value: z.ZodString }>,
         z.ZodObject<{}>,

@@ -30,6 +30,8 @@ export {
 export { type StageResult } from "./core/types";
 // Core Workflow
 export {
+  type DefineWorkflowOptions,
+  defineWorkflow,
   type InferWorkflowStageIds,
   Workflow,
   WorkflowBuilder,
@@ -75,6 +77,7 @@ export {
   listModels,
   listRegisteredModels,
   type ModelConfig,
+  type ModelFilter,
   ModelKey,
   type ModelRegistry,
   type ModelStats,
@@ -190,6 +193,8 @@ export type {
   RunClaimPendingResult,
   RunCreateCommand,
   RunCreateResult,
+  RunReapStuckCommand,
+  RunReapStuckResult,
   RunRerunFromCommand,
   RunRerunFromResult,
   RunTransitionCommand,
