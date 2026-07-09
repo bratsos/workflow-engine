@@ -490,9 +490,6 @@ describe("I want to use MockAIHelper in tests", () => {
         { id: "req-2", prompt: "Second" },
       ]);
 
-      // Wait for mock processing
-      await new Promise((resolve) => setTimeout(resolve, 150));
-
       // When: I get results
       const results = await batch.getResults(handle.id);
 
@@ -507,8 +504,7 @@ describe("I want to use MockAIHelper in tests", () => {
       const batch = ai.batch("gemini-2.5-flash");
       const handle = await batch.submit([{ id: "req-1", prompt: "Test" }]);
 
-      // Wait and get results to trigger recording
-      await new Promise((resolve) => setTimeout(resolve, 150));
+      // Get results to trigger recording
       await batch.getResults(handle.id);
 
       // Then: Batch calls are recorded

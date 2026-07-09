@@ -14,7 +14,6 @@ import {
 } from "@google/genai";
 import { asSchema } from "ai";
 import { z } from "zod";
-import { resolveModelForProvider } from "../model-mapping";
 import type {
   BatchHandle,
   BatchLogger,
@@ -25,6 +24,12 @@ import type {
   GoogleBatchRequest,
   RawBatchResult,
 } from "../types";
+import {
+  assertNonEmptyBatch,
+  resolveApiKey,
+  resolveBatchModel,
+  resolveCustomId,
+} from "./shared";
 
 export interface GoogleBatchProviderConfig {
   apiKey?: string;
@@ -40,13 +45,13 @@ export class GoogleBatchProvider
   private logger?: BatchLogger;
 
   constructor(config: GoogleBatchProviderConfig = {}, logger?: BatchLogger) {
-    const apiKey = config.apiKey || process.env.GOOGLE_GENERATIVE_AI_API_KEY;
-    if (!apiKey) {
-      throw new Error(
-        "Google API key is required. Set GOOGLE_GENERATIVE_AI_API_KEY or pass apiKey in config.",
-      );
-    }
-    this.ai = new GoogleGenAI({ apiKey });
+    this.ai = new GoogleGenAI({
+      apiKey: resolveApiKey(
+        config.apiKey,
+        "GOOGLE_GENERATIVE_AI_API_KEY",
+        "Google",
+      ),
+    });
     this.logger = logger;
   }
 
@@ -54,16 +59,13 @@ export class GoogleBatchProvider
     requests: GoogleBatchRequest[],
     options?: BatchSubmitOptions,
   ): Promise<BatchHandle> {
-    if (requests.length === 0) {
-      throw new Error("Cannot submit empty batch");
-    }
+    assertNonEmptyBatch(requests);
 
     // Convert ModelKey to Google-specific model ID
-    const modelKey = requests[0]?.model;
-    const model = resolveModelForProvider(modelKey, "google");
+    const { modelKey, model } = resolveBatchModel(requests, "google");
 
     // Extract customIds from requests to store in handle metadata
-    const customIds = requests.map((req, idx) => req.id || `request-${idx}`);
+    const customIds = requests.map((req, idx) => resolveCustomId(req.id, idx));
 
     this.logger?.log("INFO", "Submitting Google batch", {
       requestCount: requests.length,
@@ -76,7 +78,7 @@ export class GoogleBatchProvider
       const parts: Array<{ text: string }> = [{ text: req.prompt }];
 
       // Get customId from request (via id field passed from ai-helper)
-      const customId = req.id || `request-${reqIndex}`;
+      const customId = resolveCustomId(req.id, reqIndex);
 
       // Build the response object with metadata for ID tracking
       const response: Record<string, unknown> = {

@@ -19,6 +19,13 @@ import type {
   BatchSubmitOptions,
   RawBatchResult,
 } from "../types";
+import {
+  assertNonEmptyBatch,
+  logBatchResultsSummary,
+  resolveApiKey,
+  resolveBatchModel,
+  resolveCustomId,
+} from "./shared";
 
 export interface AnthropicBatchProviderConfig {
   apiKey?: string;
@@ -34,13 +41,9 @@ export class AnthropicBatchProvider
   private logger?: BatchLogger;
 
   constructor(config: AnthropicBatchProviderConfig = {}, logger?: BatchLogger) {
-    const apiKey = config.apiKey || process.env.ANTHROPIC_API_KEY;
-    if (!apiKey) {
-      throw new Error(
-        "Anthropic API key is required. Set ANTHROPIC_API_KEY or pass apiKey in config.",
-      );
-    }
-    this.client = new Anthropic({ apiKey });
+    this.client = new Anthropic({
+      apiKey: resolveApiKey(config.apiKey, "ANTHROPIC_API_KEY", "Anthropic"),
+    });
     this.logger = logger;
   }
 
@@ -48,13 +51,10 @@ export class AnthropicBatchProvider
     requests: AnthropicBatchRequest[],
     options?: BatchSubmitOptions,
   ): Promise<BatchHandle> {
-    if (requests.length === 0) {
-      throw new Error("Cannot submit empty batch");
-    }
+    assertNonEmptyBatch(requests);
 
     // Convert ModelKey to Anthropic-specific model ID
-    const modelKey = requests[0]?.model;
-    const model = resolveModelForProvider(modelKey, "anthropic");
+    const { modelKey, model } = resolveBatchModel(requests, "anthropic");
 
     this.logger?.log("INFO", "Submitting Anthropic batch", {
       requestCount: requests.length,
@@ -101,7 +101,7 @@ export class AnthropicBatchProvider
       }
 
       return {
-        custom_id: req.customId || `request-${i}`,
+        custom_id: resolveCustomId(req.customId, i),
         params: {
           model: reqModel,
           max_tokens: req.maxTokens || 1024,
@@ -242,12 +242,7 @@ export class AnthropicBatchProvider
       index++;
     }
 
-    this.logger?.log("INFO", "Anthropic batch results retrieved", {
-      batchId: handle.id,
-      resultCount: results.length,
-      successCount: results.filter((r) => !r.error).length,
-      errorCount: results.filter((r) => r.error).length,
-    });
+    logBatchResultsSummary(this.logger, "Anthropic", handle.id, results);
 
     return results;
   }

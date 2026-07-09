@@ -7,7 +7,11 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
 import type { ModelKey } from "../../ai/model-helper.js";
-import { createMockAIHelper, MockAIHelper } from "../utils/mock-ai-helper.js";
+import {
+  createMockAIHelper,
+  MockAIBatch,
+  MockAIHelper,
+} from "../utils/mock-ai-helper.js";
 
 describe("I want to process AI requests in batches", () => {
   let ai: MockAIHelper;
@@ -150,11 +154,11 @@ describe("I want to process AI requests in batches", () => {
 
     it("should return completed status after processing", async () => {
       // Given: A submitted batch
-      const batch = ai.batch("gemini-2.5-flash");
+      const batch = ai.batch("gemini-2.5-flash") as MockAIBatch;
       const handle = await batch.submit([{ id: "req-1", prompt: "Test" }]);
 
-      // Wait for mock processing
-      await new Promise((resolve) => setTimeout(resolve, 150));
+      // Mark processing complete (synchronous test hook, no real timer)
+      batch.setStatus(handle.id, "completed");
 
       // When: I check status
       const status = await batch.getStatus(handle.id);
@@ -198,9 +202,6 @@ describe("I want to process AI requests in batches", () => {
         { id: "req-3", prompt: "Third" },
       ]);
 
-      // Wait for processing
-      await new Promise((resolve) => setTimeout(resolve, 150));
-
       // When: I get results
       const results = await batch.getResults(handle.id);
 
@@ -216,8 +217,6 @@ describe("I want to process AI requests in batches", () => {
         { id: "custom-id-2", prompt: "Test 2" },
       ]);
 
-      await new Promise((resolve) => setTimeout(resolve, 150));
-
       // When: I get results
       const results = await batch.getResults(handle.id);
 
@@ -231,8 +230,6 @@ describe("I want to process AI requests in batches", () => {
       const batch = ai.batch("gemini-2.5-flash");
       const handle = await batch.submit([{ id: "req-1", prompt: "Test" }]);
 
-      await new Promise((resolve) => setTimeout(resolve, 150));
-
       // When: I get results
       const results = await batch.getResults(handle.id);
 
@@ -245,8 +242,6 @@ describe("I want to process AI requests in batches", () => {
       // Given: A submitted batch
       const batch = ai.batch("gemini-2.5-flash");
       const handle = await batch.submit([{ id: "req-1", prompt: "Test" }]);
-
-      await new Promise((resolve) => setTimeout(resolve, 150));
 
       // When: I get results
       const results = await batch.getResults(handle.id);
@@ -270,7 +265,6 @@ describe("I want to process AI requests in batches", () => {
       const batch = ai.batch("gemini-2.5-flash");
       const handle = await batch.submit([{ id: "req-1", prompt: "Test" }]);
 
-      await new Promise((resolve) => setTimeout(resolve, 150));
       await batch.getResults(handle.id);
 
       // Then: Batch calls are recorded
@@ -286,7 +280,6 @@ describe("I want to process AI requests in batches", () => {
       // Initially not recorded
       expect(await batch.isRecorded(handle.id)).toBe(false);
 
-      await new Promise((resolve) => setTimeout(resolve, 150));
       await batch.getResults(handle.id);
 
       // Then: Is recorded
@@ -297,8 +290,6 @@ describe("I want to process AI requests in batches", () => {
       // Given: A batch with recorded results
       const batch = ai.batch("gemini-2.5-flash");
       const handle = await batch.submit([{ id: "req-1", prompt: "Test" }]);
-
-      await new Promise((resolve) => setTimeout(resolve, 150));
 
       // When: I call getResults multiple times
       await batch.getResults(handle.id);
@@ -420,8 +411,6 @@ describe("I want to process AI requests in batches", () => {
         { id: "req-1", prompt: "Get result" },
       ]);
 
-      await new Promise((resolve) => setTimeout(resolve, 150));
-
       // When: I get results
       const results = await batch.getResults(handle.id);
 
@@ -433,8 +422,6 @@ describe("I want to process AI requests in batches", () => {
       // Given: A string batch (default)
       const batch = ai.batch<string>("gemini-2.5-flash");
       const handle = await batch.submit([{ id: "req-1", prompt: "Test" }]);
-
-      await new Promise((resolve) => setTimeout(resolve, 150));
 
       // When: I get results
       const results = await batch.getResults(handle.id);
@@ -453,7 +440,6 @@ describe("I want to process AI requests in batches", () => {
         { id: "req-2", prompt: "Test 2" },
       ]);
 
-      await new Promise((resolve) => setTimeout(resolve, 150));
       await batch.getResults(handle.id);
 
       // When: I get stats
@@ -482,7 +468,6 @@ describe("I want to process AI requests in batches", () => {
       const batch = child.batch("gemini-2.5-flash");
       const handle = await batch.submit([{ id: "req-1", prompt: "Test" }]);
 
-      await new Promise((resolve) => setTimeout(resolve, 150));
       await batch.getResults(handle.id);
 
       // Then: Child has batch calls

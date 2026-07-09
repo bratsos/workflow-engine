@@ -599,7 +599,7 @@ export class MockAIHelper implements AIHelper {
 // MockAIBatch Implementation
 // ============================================================================
 
-class MockAIBatch<T = string> implements AIBatch<T> {
+export class MockAIBatch<T = string> implements AIBatch<T> {
   private submittedBatches = new Map<string, AIBatchRequest[]>();
   private batchResults = new Map<string, AIBatchResult<T>[]>();
   private batchStatuses = new Map<string, AIBatchHandle["status"]>();
@@ -625,11 +625,6 @@ class MockAIBatch<T = string> implements AIBatch<T> {
       status: "succeeded" as const,
     }));
     this.batchResults.set(batchId, results);
-
-    // Simulate processing
-    setTimeout(() => {
-      this.batchStatuses.set(batchId, "completed");
-    }, 100);
 
     return { id: batchId, status: "pending", provider: "google" };
   }

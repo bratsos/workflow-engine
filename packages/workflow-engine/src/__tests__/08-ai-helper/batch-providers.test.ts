@@ -14,9 +14,13 @@
  *    message -> type -> generic, with no "Error type: undefined".
  */
 
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { registerModels } from "../../ai/model-helper.js";
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
 
 // ============================================================================
 // Google
@@ -46,7 +50,7 @@ vi.mock("@google/genai", () => ({
 
 describe("GoogleBatchProvider.submit", () => {
   it("uses native systemInstruction/generationConfig fields instead of stuffing prompt text", async () => {
-    process.env.GOOGLE_GENERATIVE_AI_API_KEY = "test-key";
+    vi.stubEnv("GOOGLE_GENERATIVE_AI_API_KEY", "test-key");
     const { GoogleBatchProvider } = await import(
       "../../utils/batch/providers/google-batch.js"
     );
@@ -79,7 +83,7 @@ describe("GoogleBatchProvider.submit", () => {
   });
 
   it("uses native responseMimeType + responseJsonSchema for structured output", async () => {
-    process.env.GOOGLE_GENERATIVE_AI_API_KEY = "test-key";
+    vi.stubEnv("GOOGLE_GENERATIVE_AI_API_KEY", "test-key");
     const { GoogleBatchProvider } = await import(
       "../../utils/batch/providers/google-batch.js"
     );
@@ -111,7 +115,7 @@ describe("GoogleBatchProvider.submit", () => {
   });
 
   it("adds an id field to GoogleBatchRequest without needing an unsafe cast", async () => {
-    process.env.GOOGLE_GENERATIVE_AI_API_KEY = "test-key";
+    vi.stubEnv("GOOGLE_GENERATIVE_AI_API_KEY", "test-key");
     const { GoogleBatchProvider } = await import(
       "../../utils/batch/providers/google-batch.js"
     );

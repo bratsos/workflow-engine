@@ -20,6 +20,13 @@ import type {
   OpenAIBatchRequest,
   RawBatchResult,
 } from "../types";
+import {
+  assertNonEmptyBatch,
+  logBatchResultsSummary,
+  resolveApiKey,
+  resolveBatchModel,
+  resolveCustomId,
+} from "./shared";
 
 export interface OpenAIBatchProviderConfig {
   apiKey?: string;
@@ -35,13 +42,9 @@ export class OpenAIBatchProvider
   private logger?: BatchLogger;
 
   constructor(config: OpenAIBatchProviderConfig = {}, logger?: BatchLogger) {
-    const apiKey = config.apiKey || process.env.OPENAI_API_KEY;
-    if (!apiKey) {
-      throw new Error(
-        "OpenAI API key is required. Set OPENAI_API_KEY or pass apiKey in config.",
-      );
-    }
-    this.client = new OpenAI({ apiKey });
+    this.client = new OpenAI({
+      apiKey: resolveApiKey(config.apiKey, "OPENAI_API_KEY", "OpenAI"),
+    });
     this.logger = logger;
   }
 
@@ -49,13 +52,10 @@ export class OpenAIBatchProvider
     requests: OpenAIBatchRequest[],
     options?: BatchSubmitOptions,
   ): Promise<BatchHandle> {
-    if (requests.length === 0) {
-      throw new Error("Cannot submit empty batch");
-    }
+    assertNonEmptyBatch(requests);
 
     // Convert ModelKey to OpenAI-specific model ID
-    const modelKey = requests[0]?.model;
-    const model = resolveModelForProvider(modelKey, "openai");
+    const { modelKey, model } = resolveBatchModel(requests, "openai");
 
     this.logger?.log("INFO", "Submitting OpenAI batch", {
       requestCount: requests.length,
@@ -112,7 +112,7 @@ export class OpenAIBatchProvider
         }
 
         return JSON.stringify({
-          custom_id: req.customId || `request-${i}`,
+          custom_id: resolveCustomId(req.customId, i),
           method: "POST",
           url: "/v1/chat/completions",
           body: {
@@ -303,12 +303,7 @@ export class OpenAIBatchProvider
       },
     );
 
-    this.logger?.log("INFO", "OpenAI batch results retrieved", {
-      batchId: handle.id,
-      resultCount: results.length,
-      successCount: results.filter((r) => !r.error).length,
-      errorCount: results.filter((r) => r.error).length,
-    });
+    logBatchResultsSummary(this.logger, "OpenAI", handle.id, results);
 
     return results;
   }
