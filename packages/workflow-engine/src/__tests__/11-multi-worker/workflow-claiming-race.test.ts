@@ -105,7 +105,13 @@ describe("I want to prevent race conditions when claiming workflows", () => {
     });
 
     it("should claim workflows in FIFO order when same priority", async () => {
-      // Given: Multiple pending workflows with same priority
+      // Given: Multiple pending workflows with same priority, created
+      // back-to-back. No delay needed: claimNextPendingRun sorts priority
+      // DESC then createdAt ASC over `Array.from(this.runs.values())`,
+      // which iterates the backing Map in insertion order, and
+      // Array.prototype.sort is a stable sort -- so even if both runs
+      // land on the same createdAt millisecond, "first" still sorts
+      // ahead of "second".
       await persistence.createRun({
         id: "first",
         workflowId: "test-workflow",
@@ -114,9 +120,6 @@ describe("I want to prevent race conditions when claiming workflows", () => {
         input: {},
         priority: 5,
       });
-
-      // Small delay to ensure different timestamps
-      await new Promise((r) => setTimeout(r, 10));
 
       await persistence.createRun({
         id: "second",

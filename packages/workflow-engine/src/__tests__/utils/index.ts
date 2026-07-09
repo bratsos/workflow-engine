@@ -15,9 +15,16 @@
  * ```
  */
 
+// Re-exported from the public package so tests exercise the same
+// implementation consumers get -- do not fork a test-local copy here.
+export { InMemoryAICallLogger } from "../../testing/in-memory-ai-logger.js";
 export { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
 export { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
-export { InMemoryAICallLogger } from "./in-memory-ai-logger.js";
+// Shared kernel test harness
+export {
+  type CreateTestKernelOptions,
+  createTestKernel,
+} from "./create-test-kernel.js";
 // Mock AI helper
 export {
   createMockAIHelper,

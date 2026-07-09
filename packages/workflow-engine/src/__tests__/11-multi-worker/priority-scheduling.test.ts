@@ -48,7 +48,11 @@ describe("I want to schedule jobs by priority", () => {
     });
 
     it("should use FIFO for jobs with same priority", async () => {
-      // Given: Jobs with same priority
+      // Given: Jobs with same priority, enqueued back-to-back. No delay
+      // needed between enqueues: dequeue() sorts priority DESC then
+      // createdAt ASC, falling back to an explicit insertion-sequence
+      // counter (see InMemoryJobQueue.dequeue) when priority AND
+      // createdAt tie -- same-millisecond enqueues still come out FIFO.
       const job1Id = await jobQueue.enqueue({
         workflowRunId: "run-1",
         workflowId: "workflow-1",
@@ -56,17 +60,12 @@ describe("I want to schedule jobs by priority", () => {
         priority: 5,
       });
 
-      // Small delay to ensure different timestamps
-      await new Promise((r) => setTimeout(r, 1));
-
       const job2Id = await jobQueue.enqueue({
         workflowRunId: "run-2",
         workflowId: "workflow-1",
         stageId: "stage-1",
         priority: 5,
       });
-
-      await new Promise((r) => setTimeout(r, 1));
 
       const job3Id = await jobQueue.enqueue({
         workflowRunId: "run-3",
