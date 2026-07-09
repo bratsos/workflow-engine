@@ -238,8 +238,8 @@ interface CheckCompletionContext<TConfig> {
   stageId: string;           // Current stage ID
   stageRecordId: string;     // Database record ID (for LogContext)
   config: TConfig;           // Stage configuration
-  log: LogFunction;          // Async logging
-  onLog: LogFunction;        // Alias for log
+  onLog: LogFunction;        // Async logging
+  log: LogFunction;          // Alias for onLog
   storage: StageStorage;     // Artifact storage
 }
 ```

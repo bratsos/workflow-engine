@@ -15,7 +15,6 @@ import type {
   BlobStore,
   JobTransport,
   EventSink,
-  Scheduler,
   Clock,
 } from "@bratsos/workflow-engine/kernel";
 import {
@@ -39,9 +38,6 @@ const kernel = createKernel({
   // Required: async event publishing
   eventSink: myEventSink,
 
-  // Required: deferred command triggers
-  scheduler: myScheduler,
-
   // Required: injectable time source
   clock: { now: () => new Date() },
 
@@ -49,6 +45,11 @@ const kernel = createKernel({
   registry: {
     getWorkflow: (id) => workflowMap.get(id),
   },
+
+  // Optional: `Scheduler` port -- @deprecated and unused by the kernel today
+  // (zero schedule()/cancel() call sites). Omit it; the kernel supplies its
+  // own internal no-op. Will be removed at 1.0.
+  // scheduler: myScheduler,
 
   // Optional (v0.11+): how long an idempotency key may sit `in_progress`
   // before a subsequent dispatch can reclaim it (guards against a crashed
@@ -64,10 +65,10 @@ const kernel = createKernel({
 |------|-----------|---------|
 | `persistence` | `Persistence` | CRUD for runs, stages, logs, outbox events, idempotency keys |
 | `blobStore` | `BlobStore` | `put(key, data)`, `get(key)`, `has(key)`, `delete(key)`, `list(prefix)` |
-| `jobTransport` | `JobTransport` | `enqueue`, `enqueueParallel`, `dequeue`, `complete`, `suspend`, `fail`, `cancelByRun`, `touchJob` (v0.11+, lease heartbeat), `getJobsByWorkflowRun` (v0.11+) |
+| `jobTransport` | `JobTransport` | `enqueue` (deprecated, use `enqueueParallel`), `enqueueParallel`, `dequeue`, `complete`, `suspend`, `fail`, `cancelByRun`, `touchJob` (v0.11+, lease heartbeat), `getJobsByWorkflowRun` (v0.11+) |
 | `eventSink` | `EventSink` | `emit(event)` - async event publishing |
-| `scheduler` | `Scheduler` | `schedule(type, payload, runAt)`, `cancel(type, correlationId)` |
 | `clock` | `Clock` | `now()` - returns `Date` |
+| `scheduler` (optional) | `Scheduler` | `schedule(type, payload, runAt)`, `cancel(type, correlationId)` -- **@deprecated**, unused by the kernel (zero call sites); omit it, the kernel supplies its own no-op. Removal at 1.0 |
 
 ## Node Host
 
@@ -176,6 +177,30 @@ const tick = await host.runMaintenanceTick();
 ```
 
 Each maintenance step runs in its own error boundary — if one step fails, the others still execute. See [09-troubleshooting.md](09-troubleshooting.md) for details.
+
+## Building a Custom Host
+
+The Node and Serverless hosts are both thin process-model wrappers (polling loop vs. single stateless invocation) around the *same* command-dispatch sequences. That shared logic is exported directly from `@bratsos/workflow-engine/kernel` so a third host (a different queue product, a different runtime) doesn't have to hand-duplicate it:
+
+```typescript
+import {
+  executeJobWithHeartbeat,
+  runMaintenanceTick,
+  HOST_DEFAULTS,
+  toErrorMessage,
+} from "@bratsos/workflow-engine/kernel";
+```
+
+| Export | Purpose |
+|--------|---------|
+| `executeJobWithHeartbeat(kernel, options)` | Dispatches `job.execute` for one job, holding a lease heartbeat (`jobTransport.touchJob`) for its duration, then routes the outcome through the job transport (`complete`/`suspend`/`fail`) and `run.transition` when terminal. |
+| `runMaintenanceTick(kernel, options)` | Runs one bounded maintenance pass -- `run.claimPending`, `stage.pollSuspended` (transitioning any resumed runs), `lease.reapStale`, `outbox.flush`, `run.reapStuck`. Each command's error is caught and logged independently so one failure doesn't block the rest of the tick. |
+| `HOST_DEFAULTS` | The shared tuning defaults (`staleLeaseThresholdMs`, `maxClaimsPerTick`, `jobHeartbeatIntervalMs`, etc.) both built-in hosts fall back to. |
+| `toErrorMessage(error)` | Normalizes a caught `unknown` into a display-safe string (`Error#message`, or `String(error)`). |
+
+Both take an options bag (`ExecuteJobWithHeartbeatOptions` / `RunMaintenanceTickOptions`, also exported from `@bratsos/workflow-engine/kernel`) covering the job transport, tuning knobs, and a `logPrefix` for diagnostics. Read `packages/workflow-engine-host-node/src/host.ts` or `packages/workflow-engine-host-serverless/src/host.ts` for a complete reference implementation before writing your own -- both call these same two functions rather than reimplementing the dispatch sequence.
+
+Also exported from `@bratsos/workflow-engine/kernel` for host/plugin authors: `normalizeAnnotateArgs` (the same argument-normalization `ctx.annotate(...)` uses internally, for code building its own annotation-writing surface) and the `AnnotationCreatedEvent` type (the outbox event shape emitted when an annotation's `emitEvent: true` is set -- see [10-annotations.md](10-annotations.md)).
 
 ## Multi-Worker Setup
 

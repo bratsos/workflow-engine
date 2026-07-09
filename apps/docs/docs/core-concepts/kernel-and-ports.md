@@ -20,7 +20,7 @@ By decoupling execution logic from infrastructure, the core engine has:
 
 ## The 7 Core Ports
 
-When initializing a kernel with `createKernel`, you must inject implementations for these seven ports:
+When initializing a kernel with `createKernel`, you must inject implementations for six required ports — `persistence`, `blobStore`, `jobTransport`, `eventSink`, `clock`, and `registry`. A seventh, `scheduler`, is optional and currently unused (see below):
 
 | Port Name | Interface | Purpose |
 | :--- | :--- | :--- |
@@ -28,7 +28,7 @@ When initializing a kernel with `createKernel`, you must inject implementations 
 | **`blobStore`** | `BlobStore` | Handles storage for large input/output payloads and intermediate stage artifacts (using methods like `put`, `get`, `has`, `delete`, and `list`). |
 | **`jobTransport`** | `JobTransport` | Acts as the job queue (managing dequeue loops, claiming, and cancelling queued jobs). |
 | **`eventSink`** | `EventSink` | Dispatches internal system event notifications asynchronously (e.g., `workflow:completed`, `stage:started`). |
-| **`scheduler`** | `Scheduler` | Coordinates deferred command execution (such as resuming suspended async-batch stages). |
+| **`scheduler`** | `Scheduler` | Optional; currently unused/vestigial (reserved for a possible future phase). The kernel supplies an internal no-op automatically when omitted. Suspended async-batch stages are actually resumed via host-driven `stage.pollSuspended` polling — see [Command Dispatch](#command-dispatch) below. |
 | **`clock`** | `Clock` | Resolves the current system time. Can be mocked in tests (`FakeClock`) to control duration math. |
 | **`registry`** | `WorkflowRegistry` | Maps workflow IDs to their respective immutable `Workflow` objects compiled via `WorkflowBuilder`. |
 

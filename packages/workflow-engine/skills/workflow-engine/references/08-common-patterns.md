@@ -159,10 +159,12 @@ import { StaleVersionError } from "@bratsos/workflow-engine";
 A common pattern combining sequential and parallel stages:
 
 ```typescript
-const workflow = new WorkflowBuilder(
-  "doc-processor", "Document Processor", "Process documents",
-  InputSchema, OutputSchema,
-)
+const workflow = defineWorkflow({
+  id: "doc-processor",
+  name: "Document Processor",
+  description: "Process documents",
+  input: InputSchema,
+})
   .pipe(extractTextStage)              // Stage 1: Extract
   .parallel([
     sentimentAnalysisStage,            // Stage 2a: Analyze sentiment
@@ -243,6 +245,37 @@ async execute(ctx) {
   }
   return { output: { processedCount: items.length } };
 }
+```
+
+## Config Presets
+
+Reduce config-schema boilerplate with the built-in presets -- each merges standard fields onto whatever Zod object schema you pass in:
+
+```typescript
+import { withAIConfig, withConcurrency, withFeatureFlags, withStandardConfig } from "@bratsos/workflow-engine";
+import { z } from "zod";
+
+withAIConfig(schema);        // + model, temperature, maxTokens
+withConcurrency(schema);     // + concurrency, delayMs, maxRetries
+withFeatureFlags(schema);    // + featureFlags: Record<string, boolean>
+withStandardConfig(schema);  // AI + Concurrency + FeatureFlags combined -- the recommended default for most stages
+```
+
+Use one directly as a stage's `config` schema:
+
+```typescript
+const myStage = defineStage({
+  id: "my-stage",
+  name: "My Stage",
+  schemas: {
+    input: z.object({ data: z.string() }),
+    output: z.object({ result: z.string() }),
+    config: withAIConfig(z.object({ customField: z.string() })),
+  },
+  async execute(ctx) {
+    // ctx.config.model / ctx.config.temperature / ctx.config.maxTokens, plus ctx.config.customField
+  },
+});
 ```
 
 As of v0.11, `stageId`/`stageName` are optional on `onProgress()` — the engine auto-fills them from the current stage (as shown above). Pass them explicitly only if you need to override.

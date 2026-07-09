@@ -101,6 +101,66 @@ await host.start();
 npx tsx worker.ts
 ```
 
+## One-Shot Run Helper
+
+For scripts, tests, or request/response-style callers, `runAndWait` dispatches a run and resolves with its terminal result -- no hand-written poll loop, no manual host start/stop.
+
+### `runAndWait(options): Promise<RunAndWaitResult>`
+
+Dispatches `command` via `kernel.dispatch()`, starts `host` if it isn't already running, and polls until the run reaches a terminal status. If `runAndWait` started the host, it stops it again afterward; a host that was already running is left running.
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `kernel` | `Kernel` | required | Kernel instance to dispatch `command` to |
+| `persistence` | `RunAndWaitPersistence` | required | Minimal structural subset of `WorkflowPersistence` (`getRun`, `getStagesByRun`) used for polling |
+| `host` | `NodeHost` | required | Host to start (if needed) and poll against |
+| `command` | `RunCreateCommand` | required | The `run.create` command to dispatch |
+| `pollIntervalMs` | `number` | `3_000` | Interval between polls |
+| `onStageChange` | `(stages: StageStatus[]) => void` | none | Called when the stage-status snapshot changes |
+| `signal` | `AbortSignal` | none | Aborts the wait; throws `Error("runAndWait aborted")` |
+
+### `RunAndWaitResult`
+
+```typescript
+interface RunAndWaitResult {
+  runId: string;
+  status: "COMPLETED" | "FAILED" | "CANCELLED";
+  stages: StageStatus[];
+  totalCost: number;
+  totalTokens: number;
+  duration: number | null;
+  output: unknown | null;
+}
+
+interface StageStatus {
+  stageId: string;
+  stageName: string;
+  status: string;
+  duration: number | null;
+}
+```
+
+Dispatch a run and log the result once it finishes:
+
+```typescript
+import { runAndWait } from "@bratsos/workflow-engine-host-node";
+import crypto from "crypto";
+
+const result = await runAndWait({
+  kernel,
+  persistence,
+  host,
+  command: {
+    type: "run.create",
+    idempotencyKey: crypto.randomUUID(),
+    workflowId: "document-analysis",
+    input: { url: "https://example.com" },
+  },
+});
+
+console.log(result.status, result.output);
+```
+
 ## Multi-Worker
 
 Multiple workers can share the same database. Each needs a unique `workerId`:

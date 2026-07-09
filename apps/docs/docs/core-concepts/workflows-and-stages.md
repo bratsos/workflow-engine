@@ -30,7 +30,7 @@ export const extractTextStage = defineStage({
   schemas: {
     input: z.object({ url: z.string().url() }),
     output: z.object({ text: z.string(), wordCount: z.number() }),
-    config: z.object({ maxLength: z.number().default(10000) }),
+    config: z.object({ maxLength: z.number().default(50000) }),
   },
   async execute(ctx) {
     const response = await fetch(ctx.input.url);
@@ -45,13 +45,54 @@ export const extractTextStage = defineStage({
 });
 ```
 
+### Typed Context with the Curried Form
+
+The example above lets TypeScript infer everything from `schemas`, but `ctx.require()`/`ctx.optional()` stay untyped unless you also tell `defineStage` what the workflow **context** looks like. Call the **curried form** — `defineStage<TContext>()({ ... })` — supplying only the context type and letting TypeScript infer the stage's `id` (as a string literal), input, output, and config from the definition object itself:
+
+```typescript
+type MyContext = { "previous-stage": { value: string } };
+
+export const myStage = defineStage<MyContext>()({
+  id: "my-stage",              // TId inferred as the literal "my-stage"
+  name: "My Stage",
+  schemas: { input: InputSchema, output: OutputSchema, config: ConfigSchema },
+  async execute(ctx) {
+    const prev = ctx.require("previous-stage"); // typed via MyContext
+    return { output: { /* ... */ } };
+  },
+});
+```
+
+The older form that spells out all five generics positionally (`defineStage<TId, TInput, TOutput, TConfig, TContext>({...})`) still works but is deprecated in favor of the curried form above — spelling out all five by hand is verbose, and silently loses `TId` string-literal inference if any of them are mistyped.
+
 ---
 
 ## Defining a Workflow
 
-Workflows chain stages together. You can build a workflow using the classic `WorkflowBuilder` constructor or the newer `defineWorkflow` options-object API (introduced in v0.11).
+Workflows chain stages together. The recommended way to build a workflow is `defineWorkflow`, an options-object API; the positional `WorkflowBuilder` constructor still works but is deprecated in its favor.
 
-### Positional `WorkflowBuilder` API
+### `defineWorkflow` API (recommended)
+
+`defineWorkflow` returns the same `WorkflowBuilder` instance but accepts a cleaner options object instead of positional arguments. Since the final output schema is implicitly set by the output of the final stage in the pipeline, you can omit the output schema from the arguments.
+
+```typescript
+import { defineWorkflow } from "@bratsos/workflow-engine";
+import { z } from "zod";
+import { extractTextStage } from "./stages";
+
+export const myWorkflow = defineWorkflow({
+  id: "text-analyzer",
+  name: "Text Analyzer",
+  description: "Downloads and analyzes text",
+  input: z.object({ url: z.string().url() }),
+})
+  .pipe(extractTextStage)
+  .build();
+```
+
+### Positional `WorkflowBuilder` API (deprecated)
+
+**Deprecated:** `inputSchema` and the output schema are both plain `z.ZodTypeAny`, so positional arguments of the same type are easy to transpose by accident. Prefer `defineWorkflow` above instead.
 
 ```typescript
 import { WorkflowBuilder } from "@bratsos/workflow-engine";
@@ -65,25 +106,6 @@ export const myWorkflow = new WorkflowBuilder(
   z.object({ url: z.string().url() }), // Input Schema
   z.object({ wordCount: z.number() })  // Final Output Schema
 )
-  .pipe(extractTextStage)
-  .build();
-```
-
-### Options-Object `defineWorkflow` API (v0.11+)
-
-The `defineWorkflow` helper returns the same `WorkflowBuilder` instance but accepts a cleaner options object. Since the final output schema is implicitly set by the output of the final stage in the pipeline, you can omit the output schema from the arguments.
-
-```typescript
-import { defineWorkflow } from "@bratsos/workflow-engine";
-import { z } from "zod";
-import { extractTextStage } from "./stages";
-
-export const myWorkflow = defineWorkflow({
-  id: "text-analyzer",
-  name: "Text Analyzer",
-  description: "Downloads and analyzes text",
-  input: z.object({ url: z.string().url() }),
-})
   .pipe(extractTextStage)
   .build();
 ```

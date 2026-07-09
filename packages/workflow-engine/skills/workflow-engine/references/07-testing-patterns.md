@@ -19,7 +19,6 @@ import {
   FakeClock,
   InMemoryBlobStore,
   CollectingEventSink,
-  NoopScheduler,
 } from "@bratsos/workflow-engine/kernel/testing";
 ```
 
@@ -35,7 +34,6 @@ function createTestKernel(workflows: Map<string, Workflow>) {
   const jobQueue = new InMemoryJobQueue();
   const blobStore = new InMemoryBlobStore();
   const eventSink = new CollectingEventSink();
-  const scheduler = new NoopScheduler();
   const clock = new FakeClock();
 
   const kernel = createKernel({
@@ -43,12 +41,11 @@ function createTestKernel(workflows: Map<string, Workflow>) {
     blobStore,
     jobTransport: jobQueue,
     eventSink,
-    scheduler,
     clock,
     registry: { getWorkflow: (id) => workflows.get(id) },
   });
 
-  return { kernel, persistence, jobQueue, blobStore, eventSink, scheduler, clock };
+  return { kernel, persistence, jobQueue, blobStore, eventSink, clock };
 }
 ```
 
@@ -56,7 +53,7 @@ function createTestKernel(workflows: Map<string, Workflow>) {
 
 ```typescript
 import { describe, it, expect, beforeEach } from "vitest";
-import { defineStage, WorkflowBuilder } from "@bratsos/workflow-engine";
+import { defineStage, defineWorkflow } from "@bratsos/workflow-engine";
 import { z } from "zod";
 
 const echoStage = defineStage({
@@ -72,11 +69,12 @@ const echoStage = defineStage({
   },
 });
 
-const workflow = new WorkflowBuilder(
-  "echo-wf", "Echo WF", "Test",
-  z.object({ message: z.string() }),
-  z.object({ echoed: z.string() }),
-)
+const workflow = defineWorkflow({
+  id: "echo-wf",
+  name: "Echo WF",
+  description: "Test",
+  input: z.object({ message: z.string() }),
+})
   .pipe(echoStage)
   .build();
 
@@ -236,12 +234,32 @@ persistenceConformanceSuite("MyCustomPersistence", () => new MyCustomPersistence
 jobQueueConformanceSuite("MyCustomJobQueue", () => new MyCustomJobQueue());
 ```
 
-The factory type signatures:
+The factory type signatures -- note the `reset`/`clear` seam:
 
 ```typescript
-type PersistenceFactory = () => WorkflowPersistence & { clear?: () => void };
-type JobQueueFactory = () => JobQueue & { clear?: () => void };
-type AILoggerFactory = () => AICallLogger & { clear?: () => void };
+interface ResettableFixture {
+  clear?: () => void;        // synchronous reset (in-memory fakes)
+  reset?: () => Promise<void>;  // async reset (e.g. a real database's TRUNCATE)
+}
+
+type PersistenceFactory = () => WorkflowPersistence & ResettableFixture;
+type JobQueueFactory = () => JobQueue & ResettableFixture;
+type AILoggerFactory = () => AICallLogger & ResettableFixture;
 ```
 
-Run it like any other test file (`vitest run my-adapter.conformance.test.ts`). A failing case points at a specific behavior your adapter diverges on -- e.g. version-bump semantics, suspended-readiness ordering, or retry defaults -- the same semantics the built-in Prisma/in-memory adapters are held to.
+Each suite's `beforeEach` prefers the async `reset()` when the fixture provides one, falling back to synchronous `clear()` otherwise. For a real-database adapter, attach `reset` instead of `clear`:
+
+```typescript
+persistenceConformanceSuite("MyCustomPersistence (real database)", () => {
+  const adapter = new MyCustomPersistence(pool);
+  return Object.assign(adapter, {
+    reset: async () => {
+      await pool.query(`TRUNCATE TABLE workflow_runs, workflow_stages CASCADE`);
+    },
+  });
+});
+```
+
+**FK-safe seeding convention:** before creating any stage, log, artifact, or annotation row, the suite seeds a parent `WorkflowRun` row first if one doesn't already exist for the referenced run id. Real schemas (e.g. Postgres) enforce a mandatory foreign key from those child tables to their parent run, even though an in-memory fake might not care -- your adapter needs to actually support that FK relationship (accept the parent row the suite seeds) for the suite to pass cleanly.
+
+Run it like any other test file (`vitest run my-adapter.conformance.test.ts`). A failing case points at a specific behavior your adapter diverges on -- e.g. version-bump semantics, suspended-readiness ordering, or retry defaults -- the same semantics the built-in Prisma/in-memory adapters are held to. This isn't just a convenience for third-party adapter authors: `PrismaWorkflowPersistence`/`PrismaJobQueue`/`PrismaAICallLogger` are validated with the exact same suite against a real Postgres database in this repo's own CI (each factory attaching `reset` the same way as the example above), not just against the in-memory fakes.

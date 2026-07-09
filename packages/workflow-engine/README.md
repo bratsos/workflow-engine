@@ -349,18 +349,17 @@ export const extractTextStage = defineStage({
 ### 3. Build a Workflow
 
 ```typescript
-import { WorkflowBuilder } from "@bratsos/workflow-engine";
+import { defineWorkflow } from "@bratsos/workflow-engine";
 import { z } from "zod";
 import { extractTextStage } from "./stages/extract-text";
 import { summarizeStage } from "./stages/summarize";
 
-export const documentProcessorWorkflow = new WorkflowBuilder(
-  "document-processor",
-  "Document Processor",
-  "Extracts and summarizes documents",
-  z.object({ url: z.string().url() }),
-  z.object({ url: z.string().url() }),
-)
+export const documentProcessorWorkflow = defineWorkflow({
+  id: "document-processor",
+  name: "Document Processor",
+  description: "Extracts and summarizes documents",
+  input: z.object({ url: z.string().url() }),
+})
   .pipe(extractTextStage)
   .pipe(summarizeStage)
   .build();
@@ -386,7 +385,6 @@ const kernel = createKernel({
   blobStore: myBlobStore,         // BlobStore implementation
   jobTransport: createPrismaJobQueue(prisma),
   eventSink: myEventSink,         // EventSink implementation
-  scheduler: myScheduler,         // Scheduler implementation
   clock: { now: () => new Date() },
   registry: {
     getWorkflow: (id) =>
@@ -460,7 +458,7 @@ A stage is the atomic unit of work. Every stage has typed input, output, and con
 Workflows are built as a linear pipeline of **execution groups**. Each group contains one or more stages. Sequential stages (`.pipe()`) form single-stage groups. Parallel stages (`.parallel()`) form multi-stage groups where all stages run concurrently.
 
 ```typescript
-new WorkflowBuilder(id, name, description, inputSchema, outputSchema)
+defineWorkflow({ id, name, description, input })
   .pipe(stageA)              // Group 0: stageA runs first
   .pipe(stageB)              // Group 1: stageB runs after stageA
   .parallel([stageC, stageD]) // Group 2: stageC and stageD run concurrently
@@ -506,7 +504,7 @@ await kernel.dispatch({
 });
 ```
 
-The kernel depends on 7 port interfaces (injected at creation):
+The kernel depends on 6 required port interfaces, plus a now-optional, currently-unused `Scheduler` (injected at creation):
 
 | Port | Purpose |
 |------|---------|
@@ -514,7 +512,7 @@ The kernel depends on 7 port interfaces (injected at creation):
 | `BlobStore` | Large payload storage (put/get/has/delete/list) |
 | `JobTransport` | Job queue (enqueue/dequeue/complete/suspend/fail) |
 | `EventSink` | Async event publishing |
-| `Scheduler` | Deferred command triggers |
+| `Scheduler` | Deferred command triggers — optional; unused by the kernel today, which supplies its own no-op when omitted (deprecated, removal at 1.0) |
 | `Clock` | Injectable time source |
 | `WorkflowRegistry` | Workflow definition lookup |
 
@@ -570,7 +568,7 @@ export const analyzeStage = defineStage({
 Parallel stages run concurrently in the same execution group. Their outputs are keyed by stage ID in the workflow context:
 
 ```typescript
-const workflow = new WorkflowBuilder(/* ... */)
+const workflow = defineWorkflow({ /* ... */ })
   .pipe(extractStage)
   .parallel([
     sentimentAnalysisStage,   // id: "sentiment"
@@ -848,7 +846,7 @@ Cancellation semantics:
 import { defineStage, defineAsyncBatchStage } from "@bratsos/workflow-engine";
 
 // Workflow building
-import { WorkflowBuilder, Workflow } from "@bratsos/workflow-engine";
+import { defineWorkflow, WorkflowBuilder, Workflow } from "@bratsos/workflow-engine";
 
 // Kernel
 import { createKernel, type Kernel, type KernelConfig } from "@bratsos/workflow-engine/kernel";
@@ -873,7 +871,7 @@ import { createStageIds, defineStageIds, isValidStageId, assertValidStageId } fr
 
 // Testing
 import { InMemoryWorkflowPersistence, InMemoryJobQueue } from "@bratsos/workflow-engine/testing";
-import { FakeClock, InMemoryBlobStore, CollectingEventSink, NoopScheduler } from "@bratsos/workflow-engine/kernel/testing";
+import { FakeClock, InMemoryBlobStore, CollectingEventSink } from "@bratsos/workflow-engine/kernel/testing";
 ```
 
 ---

@@ -26,7 +26,6 @@ import {
   FakeClock,
   InMemoryBlobStore,
   CollectingEventSink,
-  NoopScheduler,
 } from "@bratsos/workflow-engine/kernel/testing";
 ```
 
@@ -44,7 +43,6 @@ function createTestKernel(workflows: Map<string, Workflow>) {
   const jobQueue = new InMemoryJobQueue();
   const blobStore = new InMemoryBlobStore();
   const eventSink = new CollectingEventSink();
-  const scheduler = new NoopScheduler();
   const clock = new FakeClock();
 
   const kernel = createKernel({
@@ -52,7 +50,6 @@ function createTestKernel(workflows: Map<string, Workflow>) {
     blobStore,
     jobTransport: jobQueue,
     eventSink,
-    scheduler,
     clock,
     registry: {
       getWorkflow: (id) => workflows.get(id),
@@ -65,7 +62,6 @@ function createTestKernel(workflows: Map<string, Workflow>) {
     jobQueue, 
     blobStore, 
     eventSink, 
-    scheduler, 
     clock 
   };
 }
@@ -79,7 +75,7 @@ Here is a complete Vitest example showing how to trigger, execute, and verify a 
 
 ```typescript
 import { describe, it, expect, beforeEach } from "vitest";
-import { defineStage, WorkflowBuilder } from "@bratsos/workflow-engine";
+import { defineStage, defineWorkflow } from "@bratsos/workflow-engine";
 import { z } from "zod";
 
 // Define a simple stage
@@ -97,13 +93,12 @@ const upperCaseStage = defineStage({
 });
 
 // Build the workflow
-const testWorkflow = new WorkflowBuilder(
-  "uppercase-workflow",
-  "Uppercase Workflow",
-  "Test description",
-  z.object({ value: z.string() }),
-  z.object({ result: z.string() })
-)
+const testWorkflow = defineWorkflow({
+  id: "uppercase-workflow",
+  name: "Uppercase Workflow",
+  description: "Test description",
+  input: z.object({ value: z.string() }),
+})
   .pipe(upperCaseStage)
   .build();
 

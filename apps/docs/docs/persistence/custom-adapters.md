@@ -7,6 +7,8 @@ title: Custom Adapters
 
 If your infrastructure cannot use PostgreSQL/SQLite or Prisma, you can write custom persistence adapters. **workflow-engine** exposes clean interfaces for the persistence layer, the job queue, and the AI logger.
 
+**Aside on the built-in Prisma adapters:** `PrismaWorkflowPersistence`, `PrismaJobQueue`, and `PrismaAICallLogger` (the ones you're opting out of by writing a custom adapter) no longer accept a `prisma: any` parameter — they require a structural type (`EnginePrismaClient`) that isn't exported from any public entry point, so you never reference it by name. Any real Prisma-generated client (6.x or 7.x) satisfies it automatically, since it only requires the delegates the adapters actually call (`workflowRun`, `workflowStage`, etc.) plus optional `$transaction`/`$queryRaw`/`$executeRaw`/`$Enums`. The only visible effect is on hand-written mocks: a fake `PrismaClient`-shaped object missing a delegate the adapter calls now fails to typecheck, where it previously compiled silently under `any`.
+
 ---
 
 ## Adapter Interfaces
@@ -126,6 +128,37 @@ aiCallLoggerConformanceSuite("MyCustomAICallLogger", () => {
   return logger;
 });
 ```
+
+### Resetting Fixtures Between Tests: `clear` vs `reset`
+
+Each suite's `beforeEach` resets the adapter to a clean slate before every test. The factory's return type allows either a synchronous `clear()` — what the in-memory examples above use — or an async `reset()`, and prefers `reset()` when the fixture provides one:
+
+```typescript
+export interface ResettableFixture {
+  clear?: () => void;
+  reset?: () => Promise<void>;
+}
+
+export type PersistenceFactory = () => WorkflowPersistence & ResettableFixture;
+// JobQueueFactory / AILoggerFactory follow the same &ResettableFixture pattern.
+```
+
+For a real-database adapter, attach an async `reset` that truncates the underlying tables instead of relying on `clear`:
+
+```typescript
+persistenceConformanceSuite("MyCustomPersistence (real database)", () => {
+  const adapter = new MyCustomPersistence(pool);
+  return Object.assign(adapter, {
+    reset: async () => {
+      await pool.query(`TRUNCATE TABLE workflow_runs, workflow_stages CASCADE`);
+    },
+  });
+});
+```
+
+**Foreign-key-safe seeding:** before creating any stage, log, artifact, or annotation row, the suite first seeds a parent `WorkflowRun` row if one doesn't already exist for the referenced run id. Real schemas (e.g. Postgres) enforce a mandatory foreign key from those child tables to their parent run, even though an in-memory fake might not care — so your adapter needs to actually support that FK relationship (accept the parent row the suite seeds, rather than rejecting or ignoring it) for the suite to pass cleanly.
+
+This isn't just a convenience for third-party adapter authors — the exact same suite is what proves this project's own Prisma+Postgres adapters are correct in CI, run against a real `postgres:16` service container.
 
 ### Execution
 Run the test file via your local package testing framework (e.g., `vitest`):

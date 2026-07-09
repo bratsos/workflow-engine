@@ -19,7 +19,7 @@ Topology: a single trusted orchestrator + a fleet of disposable workers.
 ```typescript
 import { defineRemoteStage } from "@bratsos/workflow-engine-host-remote";
 
-const workflow = new WorkflowBuilder(...)
+const workflow = defineWorkflow({ ... })
   .pipe(defineRemoteStage(heavyStage, oTransport, {
     pollIntervalMs: 5_000,
     maxWaitMs: 3_600_000,

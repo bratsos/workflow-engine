@@ -28,6 +28,30 @@ const myStage = defineStage({
 });
 ```
 
+### Typed Context: the Curried Form (Recommended)
+
+The call above lets TypeScript infer everything from the definition object, which is fine as long as you don't need `ctx.require()`/`ctx.optional()` to be typed against the workflow's accumulated context. When you do, use the **curried form** — supply only `TContext` and let TypeScript infer `TId` (as a string literal), `TInput`, `TOutput`, and `TConfig` from the definition object passed to the returned function:
+
+```typescript
+type MyContext = { "previous-stage": { value: string } };
+
+export const myStage = defineStage<MyContext>()({
+  id: "my-stage",              // TId inferred as the literal "my-stage"
+  name: "My Stage",
+  schemas: {
+    input: InputSchema,
+    output: OutputSchema,
+    config: ConfigSchema,
+  },
+  async execute(ctx) {
+    const prev = ctx.require("previous-stage"); // typed via MyContext
+    return { output: { /* ... */ } };
+  },
+});
+```
+
+This is the recommended way to fix `TContext` explicitly. The alternative — spelling out all five generics positionally, `defineStage<TId, TInput, TOutput, TConfig, TContext>({...})` — is `@deprecated`: it's verbose, and TypeScript can't infer a subset from the middle of a generic list, so it silently loses `TId` string-literal inference if any of the five are mistyped. The curried form only ever requires the one generic TypeScript truly can't infer on its own. (`defineAsyncBatchStage`, below, doesn't have a curried form — it already infers `TContext` from usage in most cases; if you need to fix it explicitly there, use `defineStage<TContext>()({ mode: "async-batch", ... })` instead, which supports both stage shapes.)
+
 ## defineAsyncBatchStage
 
 Creates an asynchronous stage that can suspend execution and resume later.
@@ -349,8 +373,8 @@ interface CheckCompletionContext<TConfig> {
   stageId: string;
   stageRecordId: string;           // For AI logging context
   config: TConfig;
-  log: LogFunction;
-  onLog: LogFunction;              // Alias for log
+  onLog: LogFunction;
+  log: LogFunction;                // Alias for onLog
   storage: StageStorage;
 }
 ```

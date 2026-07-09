@@ -28,7 +28,7 @@ import { Broker, InMemoryBrokerStore, InMemoryObjectStore,
          createInProcessTransport } from "@bratsos/workflow-engine-host-remote";
 import { createKernel } from "@bratsos/workflow-engine/kernel";
 import { FakeClock } from "@bratsos/workflow-engine/kernel/testing";
-import { WorkflowBuilder } from "@bratsos/workflow-engine";
+import { defineWorkflow } from "@bratsos/workflow-engine";
 
 const clock = new FakeClock(new Date(0));
 const objectStore = new InMemoryObjectStore(clock);
@@ -44,7 +44,7 @@ const { orchestrator: oTransport, worker: wTransport } =
   createInProcessTransport(broker, objectStore);
 
 // On the orchestrator: wrap the real stage in a proxy
-const workflow = new WorkflowBuilder(...)
+const workflow = defineWorkflow({ ... })
   .pipe(defineRemoteStage(myHeavyStage, oTransport))
   .build();
 
@@ -91,7 +91,7 @@ const server = createBrokerHttpServer({
 server.listen(3000);
 
 // Workflow uses the proxy stage — heavy work runs on remote workers
-const workflow = new WorkflowBuilder(...)
+const workflow = defineWorkflow({ ... })
   .pipe(defineRemoteStage(heavyStage, oTransport, { maxWaitMs: 300_000 }))
   .pipe(coreStage)
   .build();
@@ -191,6 +191,32 @@ pnpm dlx tsx examples/cross-process/orchestrator.ts
 ```
 
 The orchestrator spawns the worker via `spawn("pnpm", ["dlx", "tsx", "worker.ts", url, token])`. The worker connects over TCP, leases the "heavy" task, writes its artifact via a presigned `/blob` PUT to the broker's HTTP endpoint, and reports. The orchestrator reads the artifact from the shared `InMemoryObjectStore` and runs the downstream core stage in-process. Output: `doubled=8` (seed 4 → artifact of 4 items → doubled).
+
+## Hosting on other platforms
+
+`createBrokerHttpServer` is a thin `node:http` wrapper around `handleBrokerRequest`, the **platform-agnostic** handler underneath it — same `/lease`, `/report`, `/heartbeat`, `/presign`, `/blob` routing, no `node:http` dependency. To host the broker anywhere else — a Cloudflare Worker, Deno, Bun, an AWS Lambda function URL, or any `Request`/`Response` framework (Express, Fastify, Hono) — call `handleBrokerRequest` directly: adapt the platform's request into an `IncomingRequest`, and adapt the returned `HandlerResponse` back into the platform's response.
+
+For example, wiring it into a Cloudflare Worker `fetch` handler (reusing the `broker` and `objectStore` from the example above):
+
+```typescript
+import { handleBrokerRequest, type BrokerServerDeps } from "@bratsos/workflow-engine-host-remote";
+
+const deps: BrokerServerDeps = { broker, objectStore, authToken: process.env.BROKER_TOKEN };
+
+export default {
+  async fetch(req: Request): Promise<Response> {
+    const url = new URL(req.url);
+    const result = await handleBrokerRequest(deps, {
+      method: req.method,
+      path: url.pathname + url.search,
+      headers: Object.fromEntries(req.headers),
+      body: await req.json().catch(() => null), // binary /blob PUTs: populate rawBody instead
+    });
+    const body = result.binary ?? (result.status === 204 ? null : JSON.stringify(result.json ?? null));
+    return new Response(body, { status: result.status });
+  },
+};
+```
 
 ## API Reference
 

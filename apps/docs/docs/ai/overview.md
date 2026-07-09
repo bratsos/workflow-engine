@@ -170,3 +170,5 @@ For streaming calls, use `await result.getReasoning()` after the stream complete
 const stream = ai.streamText("anthropic/claude-3.7-sonnet", { prompt });
 const reasoning = await stream.getReasoning();
 ```
+
+`.stream` only carries the text/answer channel — for a reasoning-only response (nothing emitted as answer text), iterating `for await (const chunk of stream.stream)` yields **no chunks at all**. Use `await stream.getText()` if you need the final answer text: it reconciles against the AI SDK's buffered result independently of `.stream`, so it still returns the full text even when `.stream` was empty.

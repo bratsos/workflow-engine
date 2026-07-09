@@ -38,60 +38,52 @@ The workflow engine uses three persistence interfaces:
 
 ## WorkflowPersistence Interface
 
+`WorkflowPersistence` (41 methods) is split into two focused interfaces, both exported from `@bratsos/workflow-engine` (and `@bratsos/workflow-engine/persistence`) alongside `WorkflowPersistence` itself:
+
+- **`PersistenceCore`** (~26 methods) -- everything the kernel's handlers/helpers and the host packages actually call. The kernel's `Persistence` port (`@bratsos/workflow-engine/kernel`) derives from `PersistenceCore`, not the wider interface, so the kernel's real requirement is visible directly in the type graph.
+- **`ArtifactPersistence`** (7 methods) -- artifact/blob-adjacent methods. **The kernel does not call any of these** -- all artifact I/O goes through the `BlobStore` port instead (see [03-runtime-setup.md](03-runtime-setup.md)). `@deprecated` as a group, removal at 1.0.
+
+`WorkflowPersistence extends PersistenceCore, ArtifactPersistence`, plus 8 more legacy query methods with no kernel call site (also individually `@deprecated`, each JSDoc pointing at its `getRun`/`getStagesByRun`-based replacement). This split is purely additive -- existing implementers and consumers of the full `WorkflowPersistence` interface are unaffected. **New implementers generally only need `PersistenceCore`**; the wider interface exists for backward compatibility with `PrismaWorkflowPersistence`, `InMemoryWorkflowPersistence`, and existing third-party adapters.
+
+### PersistenceCore (what the kernel actually calls)
+
 ```typescript
-interface WorkflowPersistence {
-  withTransaction<T>(fn: (tx: WorkflowPersistence) => Promise<T>): Promise<T>;
+interface PersistenceCore {
+  withTransaction<T>(fn: (tx: PersistenceCore) => Promise<T>): Promise<T>;
 
   // WorkflowRun operations
   createRun(data: CreateRunInput): Promise<WorkflowRunRecord>;
-  updateRun(id: string, data: UpdateRunInput): Promise<void>;
+  updateRun(id: string, data: UpdateRunInput): Promise<void>;   // version increments on every call, regardless of expectedVersion
   getRun(id: string): Promise<WorkflowRunRecord | null>;
-  getRunStatus(id: string): Promise<WorkflowStatus | null>;
-  getRunsByStatus(status: WorkflowStatus): Promise<WorkflowRunRecord[]>;
+  getRunStatus(id: string): Promise<Status | null>;
   getStuckRuns(stuckSince: Date): Promise<WorkflowRunRecord[]>;
-  claimPendingRun(id: string): Promise<boolean>;
-  claimNextPendingRun(): Promise<WorkflowRunRecord | null>;
+  claimNextPendingRun(): Promise<WorkflowRunRecord | null>;     // atomic FOR UPDATE SKIP LOCKED claim
 
   // WorkflowStage operations
   createStage(data: CreateStageInput): Promise<WorkflowStageRecord>;
   upsertStage(data: UpsertStageInput): Promise<WorkflowStageRecord>;
   updateStage(id: string, data: UpdateStageInput): Promise<void>;
-  updateStageByRunAndStageId(runId, stageId, data): Promise<void>;
-  getStage(runId, stageId): Promise<WorkflowStageRecord | null>;
-  getStageById(id): Promise<WorkflowStageRecord | null>;
-  getStagesByRun(runId, options?): Promise<WorkflowStageRecord[]>;
-  getSuspendedStages(beforeDate): Promise<WorkflowStageRecord[]>;
-  getFirstSuspendedStageReadyToResume(runId): Promise<WorkflowStageRecord | null>;
-  getFirstFailedStage(runId): Promise<WorkflowStageRecord | null>;
-  getLastCompletedStage(runId): Promise<WorkflowStageRecord | null>;
-  getLastCompletedStageBefore(runId, executionGroup): Promise<WorkflowStageRecord | null>;
-  deleteStage(id): Promise<void>;
+  getStage(runId: string, stageId: string): Promise<WorkflowStageRecord | null>;
+  getStagesByRun(runId: string, options?: { status?: Status; orderBy?: "asc" | "desc" }): Promise<WorkflowStageRecord[]>;
+  getSuspendedStages(beforeDate: Date): Promise<WorkflowStageRecord[]>;
+  deleteStage(id: string): Promise<void>;
 
   // WorkflowLog operations
   createLog(data: CreateLogInput): Promise<void>;
-
-  // WorkflowArtifact operations
-  saveArtifact(data: SaveArtifactInput): Promise<void>;
-  loadArtifact(runId, key): Promise<unknown>;
-  hasArtifact(runId, key): Promise<boolean>;
-  deleteArtifact(runId, key): Promise<void>;
-  listArtifacts(runId): Promise<WorkflowArtifactRecord[]>;
-  getStageIdForArtifact(runId, stageId): Promise<string | null>;
 
   // WorkflowAnnotation operations
   appendAnnotations(inputs: CreateAnnotationInput[]): Promise<void>;
   listAnnotations(workflowRunId: string, filters?: AnnotationFilters): Promise<WorkflowAnnotationRecord[]>;
 
-  // Stage output convenience
-  saveStageOutput(runId, workflowType, stageId, output): Promise<string>;
+  // Outbox DLQ operations
+  incrementOutboxRetryCount(id: string): Promise<number>;
+  moveOutboxEventToDLQ(id: string): Promise<void>;
+  replayDLQEvents(maxEvents: number): Promise<number>;
 
   // Outbox operations
   appendOutboxEvents(events: CreateOutboxEventInput[]): Promise<void>;
   getUnpublishedOutboxEvents(limit?: number): Promise<OutboxRecord[]>;
   markOutboxEventsPublished(ids: string[]): Promise<void>;
-  incrementOutboxRetryCount(id: string): Promise<number>;
-  moveOutboxEventToDLQ(id: string): Promise<void>;
-  replayDLQEvents(maxEvents: number): Promise<number>;
 
   // Idempotency operations
   //
@@ -115,6 +107,63 @@ interface WorkflowPersistence {
 }
 ```
 
+### ArtifactPersistence (deprecated -- use BlobStore)
+
+None of these are on the kernel's call path. Stage artifacts and stage output are persisted through the `BlobStore` port, not through `WorkflowPersistence`. Kept on `WorkflowPersistence` for backward compatibility; removal at 1.0.
+
+```typescript
+interface ArtifactPersistence {
+  /** @deprecated Unused by the kernel -- use the BlobStore port instead. */
+  saveArtifact(data: SaveArtifactInput): Promise<void>;
+  /** @deprecated Unused by the kernel -- use the BlobStore port instead. */
+  loadArtifact(runId: string, key: string): Promise<unknown>;
+  /** @deprecated Unused by the kernel -- use the BlobStore port instead. */
+  hasArtifact(runId: string, key: string): Promise<boolean>;
+  /** @deprecated Unused by the kernel -- use the BlobStore port instead. */
+  deleteArtifact(runId: string, key: string): Promise<void>;
+  /** @deprecated Unused by the kernel -- use the BlobStore port instead. */
+  listArtifacts(runId: string): Promise<WorkflowArtifactRecord[]>;
+  /** @deprecated Unused by the kernel -- use the BlobStore port instead. */
+  getStageIdForArtifact(runId: string, stageId: string): Promise<string | null>;
+  /** @deprecated Unused by the kernel -- stage output is persisted through the BlobStore port. */
+  saveStageOutput(runId: string, workflowType: string, stageId: string, output: unknown): Promise<string>;
+}
+```
+
+### WorkflowPersistence (full contract: Core + Artifact + 8 legacy query methods)
+
+```typescript
+interface WorkflowPersistence extends PersistenceCore, ArtifactPersistence {
+  // Redeclared (not merely inherited from PersistenceCore) so the callback
+  // receives the full WorkflowPersistence surface, including artifact methods.
+  withTransaction<T>(fn: (tx: WorkflowPersistence) => Promise<T>): Promise<T>;
+
+  /** @deprecated Unused by the kernel. */
+  getRunsByStatus(status: Status): Promise<WorkflowRunRecord[]>;
+
+  /** @deprecated Unused by the kernel -- claimNextPendingRun (atomic FOR UPDATE SKIP LOCKED claim) is used instead. */
+  claimPendingRun(id: string): Promise<boolean>;
+
+  /** @deprecated Unused by the kernel -- resolve via getStage(runId, stageId) and call updateStage(stage.id, ...) instead. */
+  updateStageByRunAndStageId(workflowRunId: string, stageId: string, data: UpdateStageInput): Promise<void>;
+
+  /** @deprecated Unused by the kernel -- use getStage(runId, stageId) or getStagesByRun(runId) instead. */
+  getStageById(id: string): Promise<WorkflowStageRecord | null>;
+
+  /** @deprecated Unused by the kernel -- use getStagesByRun(runId, { status: "SUSPENDED" }) and filter by nextPollAt === null instead. */
+  getFirstSuspendedStageReadyToResume(runId: string): Promise<WorkflowStageRecord | null>;
+
+  /** @deprecated Unused by the kernel -- use getStagesByRun(runId, { status: "FAILED" }) instead. */
+  getFirstFailedStage(runId: string): Promise<WorkflowStageRecord | null>;
+
+  /** @deprecated Unused by the kernel -- use getStagesByRun(runId, { status: "COMPLETED", orderBy: "desc" }) instead. */
+  getLastCompletedStage(runId: string): Promise<WorkflowStageRecord | null>;
+
+  /** @deprecated Unused by the kernel -- use getStagesByRun(runId, { status: "COMPLETED", orderBy: "desc" }) and filter by executionGroup instead. */
+  getLastCompletedStageBefore(runId: string, executionGroup: number): Promise<WorkflowStageRecord | null>;
+}
+```
+
 ```typescript
 interface DequeueResult {
   jobId: string;
@@ -132,6 +181,7 @@ interface DequeueResult {
 
 ```typescript
 interface JobQueue {
+  /** @deprecated Unused by the kernel -- enqueueParallel is used even for single-job enqueues. */
   enqueue(options: EnqueueJobInput): Promise<string>;
   enqueueParallel(jobs: EnqueueJobInput[]): Promise<string[]>;
   dequeue(): Promise<DequeueResult | null>;
@@ -455,6 +505,8 @@ const jobQueue = createPrismaJobQueue(prisma, {
 });
 ```
 
+`PrismaWorkflowPersistence`, `PrismaJobQueue`, `PrismaAICallLogger`, and `createEnumHelper` no longer accept `prisma: any`. They now require a structural `EnginePrismaClient` shape (an internal type, not exported from any public entry point -- you never import or write it by name). Any real Prisma-generated client (6.x or 7.x) satisfies it automatically, since it only requires the delegates the adapters actually call (`workflowRun`, `workflowStage`, etc.) plus optional `$transaction`/`$queryRaw`/`$executeRaw`/`$Enums`. The only visible effect is on hand-written mocks/fakes: a `PrismaClient`-shaped test double missing a delegate the adapter actually calls now fails to typecheck, where it previously compiled silently under `any`. No runtime behavior change.
+
 ## Database Type Options
 
 The Prisma implementations support both PostgreSQL and SQLite:
@@ -627,12 +679,12 @@ interface UpdateStageInput {
 
 ## Custom Persistence Implementation
 
-For non-Prisma databases or testing:
+For non-Prisma databases or testing. Target `PersistenceCore` (not the full `WorkflowPersistence`) unless you specifically need the deprecated artifact methods for backward compatibility -- it's the ~26-method subset the kernel actually calls:
 
 ```typescript
-import type { WorkflowPersistence } from "@bratsos/workflow-engine";
+import type { PersistenceCore } from "@bratsos/workflow-engine";
 
-class CustomPersistence implements WorkflowPersistence {
+class CustomPersistence implements PersistenceCore {
   private runs = new Map<string, WorkflowRunRecord>();
   private stages = new Map<string, WorkflowStageRecord>();
 

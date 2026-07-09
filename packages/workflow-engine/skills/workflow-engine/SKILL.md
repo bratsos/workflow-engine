@@ -43,7 +43,7 @@ The **kernel** is a pure command dispatcher. All workflow operations are express
 ## Quick Start
 
 ```typescript
-import { defineStage, WorkflowBuilder } from "@bratsos/workflow-engine";
+import { defineStage, defineWorkflow } from "@bratsos/workflow-engine";
 import { createKernel } from "@bratsos/workflow-engine/kernel";
 import { createNodeHost } from "@bratsos/workflow-engine-host-node";
 import {
@@ -67,11 +67,12 @@ const processStage = defineStage({
 });
 
 // 2. Build a workflow
-const workflow = new WorkflowBuilder(
-  "my-workflow", "My Workflow", "Processes data",
-  z.object({ data: z.string() }),
-  z.object({ result: z.string() })
-)
+const workflow = defineWorkflow({
+  id: "my-workflow",
+  name: "My Workflow",
+  description: "Processes data",
+  input: z.object({ data: z.string() }),
+})
   .pipe(processStage)
   .build();
 
@@ -81,7 +82,6 @@ const kernel = createKernel({
   blobStore: myBlobStore,
   jobTransport: createPrismaJobQueue(prisma),
   eventSink: myEventSink,
-  scheduler: myScheduler,
   clock: { now: () => new Date() },
   registry: { getWorkflow: (id) => (id === "my-workflow" ? workflow : undefined) },
 });
@@ -107,10 +107,10 @@ await kernel.dispatch({
 
 | Export | Type | Import Path | Purpose |
 |--------|------|-------------|---------|
-| `defineStage` | Function | `@bratsos/workflow-engine` | Create sync stages |
+| `defineStage` | Function | `@bratsos/workflow-engine` | Create sync stages. Curried form `defineStage<TContext>()({...})` is recommended when you need typed `ctx.require()`/`ctx.optional()` — see 01-stage-definitions.md |
 | `defineAsyncBatchStage` | Function | `@bratsos/workflow-engine` | Create async/batch stages |
-| `WorkflowBuilder` | Class | `@bratsos/workflow-engine` | Chain stages into workflows |
-| `defineWorkflow` | Function | `@bratsos/workflow-engine` | Options-object alternative to `new WorkflowBuilder(...)` (v0.11+); returns the same builder to `.pipe()`/`.parallel()`/`.build()` |
+| `defineWorkflow` | Function | `@bratsos/workflow-engine` | **Recommended** way to build a workflow (options-object API, v0.11+); returns a `WorkflowBuilder` to `.pipe()`/`.parallel()`/`.build()` |
+| `WorkflowBuilder` | Class | `@bratsos/workflow-engine` | Chain stages into workflows. Its 5-positional-argument constructor (`new WorkflowBuilder(id, name, description, input, output)`) is `@deprecated` in favor of `defineWorkflow()` — the class itself (and `.pipe()`/`.parallel()`/`.build()`) is unaffected |
 | `createKernel` | Function | `@bratsos/workflow-engine/kernel` | Create command kernel |
 | `createNodeHost` | Function | `@bratsos/workflow-engine-host-node` | Create Node.js host |
 | `createServerlessHost` | Function | `@bratsos/workflow-engine-host-serverless` | Create serverless host |
@@ -216,15 +216,20 @@ const batchStage = defineAsyncBatchStage({
 });
 ```
 
-## WorkflowBuilder
+## WorkflowBuilder / defineWorkflow
 
 Workflows are linear pipelines of **execution groups**. `.pipe()` creates single-stage groups; `.parallel()` creates multi-stage groups. Parallel group outputs are keyed by stage ID in the workflow context.
 
+Build with `defineWorkflow({...})` (recommended) — the 5-positional-argument `new WorkflowBuilder(id, name, description, input, output)` constructor is `@deprecated` (same-typed positional args are easy to transpose by accident); both return the same builder for `.pipe()`/`.parallel()`/`.build()`.
+
 ```typescript
-const workflow = new WorkflowBuilder(
-  "workflow-id", "Workflow Name", "Description",
-  InputSchema, OutputSchema
-)
+const workflow = defineWorkflow({
+  id: "workflow-id",
+  name: "Workflow Name",
+  description: "Description",
+  input: InputSchema,
+  // output is optional -- decorative unless the workflow has zero piped stages
+})
   .pipe(stage1)                          // Group 0
   .pipe(stage2)                          // Group 1
   .parallel([stage3a, stage3b])          // Group 2 (concurrent, output: { "stage3a-id": ..., "stage3b-id": ... })
@@ -247,17 +252,17 @@ When a workflow completes, the final execution group's output is persisted in `W
 
 ```typescript
 import { createKernel } from "@bratsos/workflow-engine/kernel";
-import type { Kernel, KernelConfig, Persistence, BlobStore, JobTransport, EventSink, Scheduler, Clock } from "@bratsos/workflow-engine/kernel";
+import type { Kernel, KernelConfig, Persistence, BlobStore, JobTransport, EventSink, Clock } from "@bratsos/workflow-engine/kernel";
 
 const kernel = createKernel({
   persistence,   // Persistence port - runs, stages, logs, outbox, idempotency
   blobStore,     // BlobStore port - large payload storage
   jobTransport,  // JobTransport port - job queue
   eventSink,     // EventSink port - async event publishing
-  scheduler,     // Scheduler port - deferred command triggers
   clock,         // Clock port - injectable time source
   registry,      // WorkflowRegistry - { getWorkflow(id) }
   // executor,   // optional ActivityExecutor port - defaults to in-process; inject to run stages on remote workers (see 11-remote-activity-workers.md)
+  // scheduler,  // optional Scheduler port - @deprecated, unused by the kernel (zero schedule()/cancel() call sites); omit it, the kernel supplies its own no-op. Removal at 1.0
   // idempotencyStaleInProgressMs: 10 * 60 * 1000, // optional (v0.11+) - default 10 min; TTL before a stuck `in_progress` idempotency key can be reclaimed
 });
 
@@ -376,7 +381,7 @@ Two wiring models:
 import { defineRemoteStage } from "@bratsos/workflow-engine-host-remote";
 
 // Orchestrator: wrap a heavy stage so it runs on a remote worker
-const workflow = new WorkflowBuilder(...)
+const workflow = defineWorkflow({ ... })
   .pipe(defineRemoteStage(heavyStage, oTransport, { maxWaitMs: 3_600_000, stageCodeVersion: "v1" }))
   .pipe(coreStage)
   .build();
@@ -500,7 +505,6 @@ import {
   FakeClock,
   InMemoryBlobStore,
   CollectingEventSink,
-  NoopScheduler,
 } from "@bratsos/workflow-engine/kernel/testing";
 
 // Create kernel with all in-memory adapters
@@ -511,7 +515,6 @@ const kernel = createKernel({
   blobStore: new InMemoryBlobStore(),
   jobTransport: jobQueue,
   eventSink: new CollectingEventSink(),
-  scheduler: new NoopScheduler(),
   clock: new FakeClock(),
   registry: { getWorkflow: (id) => workflows.get(id) },
 });

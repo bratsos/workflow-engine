@@ -27,7 +27,6 @@ const kernel = createKernel({
   blobStore: myBlobStore,
   jobTransport,
   eventSink: myEventSink,
-  scheduler: myScheduler,
   clock: { now: () => new Date() },
   registry: myRegistry,
 });
@@ -107,4 +106,79 @@ console.log(stats);
 //   isRunning: true,
 //   uptimeMs: 1200000
 // }
+```
+
+---
+
+## One-Shot Run Helper: `runAndWait`
+
+Spinning up a host, dispatching a `run.create` command, and hand-rolling a poll loop is a lot of ceremony for a script, a test, or a request/response-style caller that just wants a run's final result. `runAndWait` collapses all of that into a single awaited call.
+
+Reach for `runAndWait` when the calling code needs a run's result inline -- a CLI script, a test, an API handler awaiting a workflow before responding. Reach for `host.start()` plus `kernel.dispatch()` directly when you're building a long-running worker that should keep polling for new runs indefinitely; `runAndWait` is scoped to a single run's lifecycle, not a daemon process.
+
+### How It Works
+
+1. Dispatches `command` via `kernel.dispatch()` to create the run.
+2. Checks `host.getStats().isRunning`. If the host isn't already running, `runAndWait` starts it.
+3. Polls `persistence.getRun()` and `persistence.getStagesByRun()` every `pollIntervalMs`, calling `onStageChange` whenever the stage-status snapshot actually changes.
+4. Returns once the run reaches a terminal status: `COMPLETED`, `FAILED`, or `CANCELLED`.
+5. Stops the host again in a `finally` block -- but only if this call was the one that started it. A host that was already running before `runAndWait` was called is left running afterward.
+6. Supports cooperative cancellation through `signal`: an aborted signal throws `Error("runAndWait aborted")`, both at the start of each poll iteration and while sleeping between polls.
+
+### Options
+
+| Option | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| **`kernel`** | `Kernel` | *Required* | The command kernel instance to dispatch `command` to. |
+| **`persistence`** | `RunAndWaitPersistence` | *Required* | A minimal structural subset of `WorkflowPersistence` -- just `getRun` and `getStagesByRun` -- used to poll run and stage status. |
+| **`host`** | `NodeHost` | *Required* | The host to start (if it isn't already running) and poll against while the run executes. |
+| **`command`** | `RunCreateCommand` | *Required* | The `run.create` command to dispatch. |
+| **`pollIntervalMs`** | `number` | `3000` (3s) | How often to re-check run and stage status. |
+| **`onStageChange`** | `(stages: StageStatus[]) => void` | *Optional* | Called whenever the stage-status snapshot changes during polling. |
+| **`signal`** | `AbortSignal` | *Optional* | Cooperatively aborts the wait; throws `Error("runAndWait aborted")`. |
+
+### Result Shape
+
+`runAndWait` resolves with the run's terminal state:
+
+```typescript
+interface RunAndWaitResult {
+  runId: string;
+  status: "COMPLETED" | "FAILED" | "CANCELLED";
+  stages: StageStatus[];
+  totalCost: number;
+  totalTokens: number;
+  duration: number | null;
+  output: unknown | null;
+}
+
+interface StageStatus {
+  stageId: string;
+  stageName: string;
+  status: string;
+  duration: number | null;
+}
+```
+
+### Example
+
+```typescript
+import { runAndWait } from "@bratsos/workflow-engine-host-node";
+import crypto from "crypto";
+
+const result = await runAndWait({
+  kernel,
+  persistence: createPrismaWorkflowPersistence(prisma),
+  host,
+  command: {
+    type: "run.create",
+    idempotencyKey: crypto.randomUUID(),
+    workflowId: "document-analysis",
+    input: { url: "https://example.com" },
+  },
+  onStageChange: (stages) => console.log("stages updated:", stages),
+});
+
+console.log(`Run ${result.runId} finished as ${result.status}`);
+console.log(result.output);
 ```

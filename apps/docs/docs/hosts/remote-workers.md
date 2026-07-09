@@ -39,9 +39,9 @@ Use `defineRemoteStage` to wrap your heavy stage definition. When reached, the o
 
 ```typescript
 import { defineRemoteStage } from "@bratsos/workflow-engine-host-remote";
-import { WorkflowBuilder } from "@bratsos/workflow-engine";
+import { defineWorkflow } from "@bratsos/workflow-engine";
 
-const workflow = new WorkflowBuilder(...)
+const workflow = defineWorkflow({ ... })
   .pipe(defineRemoteStage(heavyVideoStage, oTransport, {
     pollIntervalMs: 5_000,
     maxWaitMs: 3_600_000, // 1 hour timeout
@@ -128,6 +128,34 @@ const server = createBrokerHttpServer({
   authToken: process.env.BROKER_AUTH_TOKEN 
 });
 server.listen(3000);
+```
+
+---
+
+## Hosting on Other Platforms
+
+`createBrokerHttpServer` is a convenience wrapper around `handleBrokerRequest`, a **platform-agnostic** handler with no `node:http` dependency — it takes a plain `IncomingRequest` and returns a plain `HandlerResponse`. Call it directly to host the broker on any `Request`/`Response`-based platform — a Cloudflare Worker, Deno, Bun, an AWS Lambda function URL, or a framework like Express, Fastify, or Hono — by adapting that platform's request and response to and from the handler's shape.
+
+For example, wiring it into a Cloudflare Worker `fetch` handler (reusing `broker` and `presigner` from above):
+
+```typescript
+import { handleBrokerRequest, type BrokerServerDeps } from "@bratsos/workflow-engine-host-remote";
+
+const deps: BrokerServerDeps = { broker, objectStore: presigner, authToken: process.env.BROKER_AUTH_TOKEN };
+
+export default {
+  async fetch(req: Request): Promise<Response> {
+    const url = new URL(req.url);
+    const result = await handleBrokerRequest(deps, {
+      method: req.method,
+      path: url.pathname + url.search,
+      headers: Object.fromEntries(req.headers),
+      body: await req.json().catch(() => null), // binary /blob PUTs: populate rawBody instead
+    });
+    const body = result.binary ?? (result.status === 204 ? null : JSON.stringify(result.json ?? null));
+    return new Response(body, { status: result.status });
+  },
+};
 ```
 
 ---

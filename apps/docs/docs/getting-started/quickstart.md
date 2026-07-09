@@ -70,21 +70,20 @@ export const analyzeSentimentStage = defineStage({
 
 ## 2. Build Your Workflow
 
-Workflows chain stages together in sequence or parallel using the `WorkflowBuilder`.
+Workflows chain stages together in sequence or parallel using `defineWorkflow`.
 
 ```typescript
 // workflow.ts
-import { WorkflowBuilder } from "@bratsos/workflow-engine";
+import { defineWorkflow } from "@bratsos/workflow-engine";
 import { z } from "zod";
 import { extractTextStage, analyzeSentimentStage } from "./stages";
 
-export const documentAnalysisWorkflow = new WorkflowBuilder(
-  "document-analysis",          // Workflow ID
-  "Document Analysis Pipeline", // Display name
-  "Analyzes sentiment of text extracted from a URL", // Description
-  z.object({ url: z.string().url() }), // Workflow Input Schema
-  z.object({ sentiment: z.enum(["positive", "negative", "neutral"]) }) // Final Output Schema
-)
+export const documentAnalysisWorkflow = defineWorkflow({
+  id: "document-analysis",
+  name: "Document Analysis Pipeline",
+  description: "Analyzes sentiment of text extracted from a URL",
+  input: z.object({ url: z.string().url() }),
+})
   .pipe(extractTextStage)
   .pipe(analyzeSentimentStage)
   .build();
@@ -106,7 +105,7 @@ import {
 } from "@bratsos/workflow-engine/persistence/prisma";
 import { PrismaClient } from "@prisma/client";
 import { documentAnalysisWorkflow } from "./workflow";
-import { InMemoryBlobStore, CollectingEventSink, NoopScheduler } from "@bratsos/workflow-engine/kernel/testing";
+import { InMemoryBlobStore, CollectingEventSink } from "@bratsos/workflow-engine/kernel/testing";
 import crypto from "crypto";
 
 const prisma = new PrismaClient();
@@ -117,7 +116,6 @@ const kernel = createKernel({
   blobStore: new InMemoryBlobStore(), // Or use S3/GCS adapters in production
   jobTransport: createPrismaJobQueue(prisma),
   eventSink: new CollectingEventSink(),
-  scheduler: new NoopScheduler(),
   clock: { now: () => new Date() },
   registry: {
     getWorkflow: (id) => (id === "document-analysis" ? documentAnalysisWorkflow : undefined),

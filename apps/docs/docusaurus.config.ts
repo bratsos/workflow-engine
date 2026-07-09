@@ -14,6 +14,7 @@ const config: Config = {
 
   future: {
     v4: true,
+    faster: true,
   },
 
   url: 'https://workflow-engine.dev',
@@ -36,8 +37,17 @@ const config: Config = {
         docs: {
           sidebarPath: './sidebars.ts',
           routeBasePath: '/',
-          editUrl:
-            'https://github.com/bratsos/workflow-engine/tree/main/apps/docs/',
+          // Generated TypeDoc pages (docs/api/**) have no source markdown to
+          // edit on GitHub -- return undefined there so Docusaurus omits the
+          // "Edit this page" link instead of pointing at a 404. Everything
+          // else gets the same GitHub URL the previous plain-string
+          // `editUrl` produced (base + versionDocsDirPath + docPath).
+          editUrl: ({versionDocsDirPath, docPath}) => {
+            if (docPath.startsWith('api/')) {
+              return undefined;
+            }
+            return `https://github.com/bratsos/workflow-engine/tree/main/apps/docs/${versionDocsDirPath}/${docPath}`;
+          },
         },
         blog: false,
         theme: {
