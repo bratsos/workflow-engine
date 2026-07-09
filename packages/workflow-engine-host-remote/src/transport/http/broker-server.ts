@@ -1,5 +1,6 @@
 import { timingSafeEqual } from "node:crypto";
 import * as http from "node:http";
+import { toErrorMessage } from "@bratsos/workflow-engine/kernel";
 import type { Broker } from "../../broker/broker.js";
 import type { InMemoryObjectStore } from "../../object-store.js";
 import { ActivityReportSchema, LeaseRequestSchema } from "./schemas.js";
@@ -81,7 +82,7 @@ export async function handleBrokerRequest(
     } catch (err) {
       return {
         status: 409,
-        json: { error: err instanceof Error ? err.message : String(err) },
+        json: { error: toErrorMessage(err) },
       };
     }
   }
@@ -101,7 +102,7 @@ export async function handleBrokerRequest(
     } catch (err) {
       return {
         status: 409,
-        json: { error: err instanceof Error ? err.message : String(err) },
+        json: { error: toErrorMessage(err) },
       };
     }
   }
@@ -177,7 +178,7 @@ export async function handleBrokerRequest(
       // /report. A 500 is reserved for genuinely unexpected errors.
       return {
         status: 409,
-        json: { error: err instanceof Error ? err.message : String(err) },
+        json: { error: toErrorMessage(err) },
       };
     }
   }
@@ -197,7 +198,7 @@ export async function handleBrokerRequest(
     } catch (err) {
       return {
         status: 400,
-        json: { error: err instanceof Error ? err.message : String(err) },
+        json: { error: toErrorMessage(err) },
       };
     }
   }
@@ -215,7 +216,7 @@ export async function handleBrokerRequest(
     } catch (err) {
       return {
         status: 400,
-        json: { error: err instanceof Error ? err.message : String(err) },
+        json: { error: toErrorMessage(err) },
       };
     }
   }
@@ -317,7 +318,7 @@ async function handleRequest(
     res.end(payload);
   } catch (err) {
     const msg = JSON.stringify({
-      error: err instanceof Error ? err.message : String(err),
+      error: toErrorMessage(err),
     });
     res.writeHead(500, { "Content-Type": "application/json" });
     res.end(msg);

@@ -9,7 +9,13 @@
  * and loop pacing live here.
  */
 
-import type { JobTransport, Kernel } from "@bratsos/workflow-engine/kernel";
+import {
+  executeJobWithHeartbeat,
+  HOST_DEFAULTS,
+  type JobTransport,
+  type Kernel,
+  runMaintenanceTick as runMaintenanceTickCommands,
+} from "@bratsos/workflow-engine/kernel";
 
 // ============================================================================
 // Public interfaces
@@ -90,11 +96,17 @@ class NodeHostImpl implements NodeHost {
     this.workerId = config.workerId;
     this.orchestrationIntervalMs = config.orchestrationIntervalMs ?? 10_000;
     this.jobPollIntervalMs = config.jobPollIntervalMs ?? 1_000;
-    this.staleLeaseThresholdMs = config.staleLeaseThresholdMs ?? 300_000;
-    this.maxClaimsPerTick = config.maxClaimsPerTick ?? 10;
-    this.maxSuspendedChecksPerTick = config.maxSuspendedChecksPerTick ?? 10;
-    this.maxOutboxFlushPerTick = config.maxOutboxFlushPerTick ?? 100;
-    this.jobHeartbeatIntervalMs = config.jobHeartbeatIntervalMs ?? 60_000;
+    this.staleLeaseThresholdMs =
+      config.staleLeaseThresholdMs ?? HOST_DEFAULTS.staleLeaseThresholdMs;
+    this.maxClaimsPerTick =
+      config.maxClaimsPerTick ?? HOST_DEFAULTS.maxClaimsPerTick;
+    this.maxSuspendedChecksPerTick =
+      config.maxSuspendedChecksPerTick ??
+      HOST_DEFAULTS.maxSuspendedChecksPerTick;
+    this.maxOutboxFlushPerTick =
+      config.maxOutboxFlushPerTick ?? HOST_DEFAULTS.maxOutboxFlushPerTick;
+    this.jobHeartbeatIntervalMs =
+      config.jobHeartbeatIntervalMs ?? HOST_DEFAULTS.jobHeartbeatIntervalMs;
   }
 
   // --------------------------------------------------------------------------
@@ -164,62 +176,19 @@ class NodeHostImpl implements NodeHost {
   private async orchestrationTick(): Promise<void> {
     this.orchestrationTicks++;
 
-    // 1. Claim pending runs → enqueue first-stage jobs
-    try {
-      await this.kernel.dispatch({
-        type: "run.claimPending",
-        workerId: this.workerId,
-        maxClaims: this.maxClaimsPerTick,
-      });
-    } catch (error) {
-      console.error("[NodeHost] run.claimPending error:", error);
-    }
-
-    // 2. Poll suspended stages → resume if ready
-    try {
-      const pollResult = await this.kernel.dispatch({
-        type: "stage.pollSuspended",
-        maxChecks: this.maxSuspendedChecksPerTick,
-      });
-      for (const workflowRunId of pollResult.resumedWorkflowRunIds) {
-        await this.kernel.dispatch({
-          type: "run.transition",
-          workflowRunId,
-        });
-      }
-    } catch (error) {
-      console.error("[NodeHost] stage.pollSuspended error:", error);
-    }
-
-    // 3. Reap stale leases → release crashed worker locks
-    try {
-      await this.kernel.dispatch({
-        type: "lease.reapStale",
-        staleThresholdMs: this.staleLeaseThresholdMs,
-      });
-    } catch (error) {
-      console.error("[NodeHost] lease.reapStale error:", error);
-    }
-
-    // 4. Flush outbox → publish pending events through EventSink
-    try {
-      await this.kernel.dispatch({
-        type: "outbox.flush",
-        maxEvents: this.maxOutboxFlushPerTick,
-      });
-    } catch (error) {
-      console.error("[NodeHost] outbox.flush error:", error);
-    }
-
-    // 5. Reap stuck runs → fail runs with no activity past threshold
-    try {
-      await this.kernel.dispatch({
-        type: "run.reapStuck",
-        stuckThresholdMs: Math.max(this.staleLeaseThresholdMs * 3, 5 * 60_000),
-      });
-    } catch (error) {
-      console.error("[NodeHost] run.reapStuck error:", error);
-    }
+    // Claim pending runs, poll suspended stages, reap stale leases, flush
+    // the outbox, and reap stuck runs. The Node host fires this on a timer
+    // and doesn't need the per-command counts (unlike the serverless host,
+    // which returns them to its caller) — see runMaintenanceTick in
+    // @bratsos/workflow-engine/kernel for the shared command sequence.
+    await runMaintenanceTickCommands(this.kernel, {
+      workerId: this.workerId,
+      maxClaimsPerTick: this.maxClaimsPerTick,
+      maxSuspendedChecksPerTick: this.maxSuspendedChecksPerTick,
+      maxOutboxFlushPerTick: this.maxOutboxFlushPerTick,
+      staleLeaseThresholdMs: this.staleLeaseThresholdMs,
+      logPrefix: "[NodeHost]",
+    });
   }
 
   // --------------------------------------------------------------------------
@@ -236,76 +205,18 @@ class NodeHostImpl implements NodeHost {
           continue;
         }
 
-        const config =
-          (job.payload as { config?: Record<string, unknown> }).config || {};
-
-        // Heartbeat: periodically renew the job's lease while it executes
-        // so a long-running stage (> staleLeaseThresholdMs) isn't picked
-        // up as stale and duplicated by releaseStaleJobs.
-        const heartbeat = setInterval(
-          () => void this.jobTransport.touchJob(job.jobId).catch(() => {}),
-          this.jobHeartbeatIntervalMs,
-        );
-
-        let result;
-        try {
-          result = await this.kernel.dispatch({
-            type: "job.execute",
-            idempotencyKey: `job:${job.jobId}:attempt:${job.attempt}`,
-            workflowRunId: job.workflowRunId,
-            workflowId: job.workflowId,
-            stageId: job.stageId,
-            config,
-          });
-        } finally {
-          clearInterval(heartbeat);
-        }
+        // Dispatch job.execute under a lease heartbeat and route the
+        // outcome (complete/suspend/fail + terminal run.transition) — see
+        // executeJobWithHeartbeat in @bratsos/workflow-engine/kernel for
+        // the shared command sequence.
+        await executeJobWithHeartbeat(this.kernel, {
+          jobTransport: this.jobTransport,
+          job,
+          jobHeartbeatIntervalMs: this.jobHeartbeatIntervalMs,
+          logPrefix: "[NodeHost]",
+        });
 
         this.jobsProcessed++;
-
-        if (result.outcome === "completed") {
-          await this.jobTransport.complete(job.jobId);
-          await this.kernel.dispatch({
-            type: "run.transition",
-            workflowRunId: job.workflowRunId,
-          });
-        } else if (result.outcome === "suspended") {
-          const nextPollAt = result.nextPollAt ?? new Date(Date.now() + 60_000);
-          await this.jobTransport.suspend(job.jobId, nextPollAt);
-        } else if (result.outcome === "failed") {
-          // Ghost jobs (discarded by kernel because run is not RUNNING)
-          // should never be retried — they'll just fail again.
-          // A deterministic (non-retryable) stage error — e.g. Zod input
-          // validation — will fail identically on every attempt, so it
-          // is treated the same as an exhausted retry budget.
-          const canRetry =
-            !result.ghost &&
-            result.retryable !== false &&
-            job.attempt < (job.maxAttempts ?? 3);
-          await this.jobTransport.fail(
-            job.jobId,
-            result.error ?? "Unknown error",
-            canRetry,
-          );
-          // Terminal failure: without this, the run lingers RUNNING
-          // until run.reapStuck kills it minutes later with a generic
-          // "STUCK_RUN_REAPED" error, losing the real stage error.
-          // Dispatch run.transition so the run fails promptly with the
-          // actual error from the FAILED stage record.
-          if (!canRetry && !result.ghost) {
-            try {
-              await this.kernel.dispatch({
-                type: "run.transition",
-                workflowRunId: job.workflowRunId,
-              });
-            } catch (error) {
-              console.error(
-                "[NodeHost] run.transition (terminal failure) error:",
-                error,
-              );
-            }
-          }
-        }
       } catch (error) {
         // Job processing errors are non-fatal — back off and retry
         console.error("[NodeHost] Job processing error:", error);

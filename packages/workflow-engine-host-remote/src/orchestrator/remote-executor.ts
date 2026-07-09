@@ -10,14 +10,16 @@
  * Phase-1 proxy-stage pattern is the right tool there.
  */
 
-import type {
-  ActivityExecutor,
-  ActivityRunInput,
-  ActivityRunResult,
-  BufferedLog,
-  CreateAnnotationInput,
-  ExecutorDeps,
-  KernelEvent,
+import {
+  type ActivityExecutor,
+  type ActivityRunInput,
+  type ActivityRunResult,
+  type BufferedLog,
+  type CreateAnnotationInput,
+  type ExecutorDeps,
+  type KernelEvent,
+  normalizeAnnotateArgs,
+  toErrorMessage,
 } from "@bratsos/workflow-engine/kernel";
 import type { BufferedProgress } from "../protocol.js";
 import type { OrchestratorTransport } from "../transport.js";
@@ -32,77 +34,6 @@ export interface RemoteExecutorOptions {
 }
 
 const ZERO_METRICS = { startTime: 0, endTime: 0, duration: 0 };
-
-type NormalizedAnnotation = {
-  key: string;
-  value: unknown;
-  actor?: CreateAnnotationInput["actor"];
-  payload?: unknown;
-  idempotencyKey?: string | null;
-  emitEvent?: boolean;
-};
-
-/**
- * Inline normalization of raw ctx.annotate() arg-tuples from the worker.
- * Handles the two forms used in practice:
- *   - [key: string, value, opts?]
- *   - [{ attributes, actor?, payload?, idempotencyKey?, emitEvent? }]  (batch)
- */
-function normalizeAnnotateTuple(argTuple: unknown[]): NormalizedAnnotation[] {
-  const first = argTuple[0];
-  // string or TypedKey ({key: string, no attributes}) form
-  if (typeof first === "string") {
-    const opts = argTuple[2] as Record<string, unknown> | undefined;
-    return [
-      {
-        key: first,
-        value: argTuple[1],
-        actor: opts?.actor as CreateAnnotationInput["actor"],
-        payload: opts?.payload,
-        idempotencyKey: opts?.idempotencyKey as string | null | undefined,
-        emitEvent: opts?.emitEvent as boolean | undefined,
-      },
-    ];
-  }
-  if (
-    first !== null &&
-    typeof first === "object" &&
-    "key" in first &&
-    !("attributes" in first)
-  ) {
-    const opts = argTuple[2] as Record<string, unknown> | undefined;
-    return [
-      {
-        key: (first as { key: string }).key,
-        value: argTuple[1],
-        actor: opts?.actor as CreateAnnotationInput["actor"],
-        payload: opts?.payload,
-        idempotencyKey: opts?.idempotencyKey as string | null | undefined,
-        emitEvent: opts?.emitEvent as boolean | undefined,
-      },
-    ];
-  }
-  // batch form: { attributes, actor?, payload?, idempotencyKey?, emitEvent? }
-  const batch = first as
-    | {
-        attributes?: Record<string, unknown>;
-        actor?: CreateAnnotationInput["actor"];
-        payload?: unknown;
-        idempotencyKey?: string | null;
-        emitEvent?: boolean;
-      }
-    | null
-    | undefined;
-  const attributes = batch?.attributes ?? {};
-  return Object.entries(attributes).map(([key, value]) => ({
-    key,
-    value,
-    actor: batch?.actor,
-    payload: batch?.payload,
-    idempotencyKey: batch?.idempotencyKey,
-    emitEvent: batch?.emitEvent,
-  }));
-}
 
 export function createRemoteExecutor(
   transport: OrchestratorTransport,
@@ -147,8 +78,12 @@ export function createRemoteExecutor(
       try {
         validatedInput = stageDef.inputSchema.parse(input.rawInput);
       } catch (e) {
-        const error = e instanceof Error ? e.message : String(e);
-        return { error, progress: [], annotations: [], logs: [] };
+        return {
+          error: toErrorMessage(e),
+          progress: [],
+          annotations: [],
+          logs: [],
+        };
       }
 
       // Fix 5: use stageRecordId as a stable taskId so a re-dispatch after a
@@ -289,24 +224,16 @@ export function createRemoteExecutor(
       };
       const annotations: CreateAnnotationInput[] = [];
       for (const argTuple of poll.annotations) {
-        const normalized = normalizeAnnotateTuple(argTuple);
-        for (const {
-          key,
-          value,
-          actor,
-          payload,
-          idempotencyKey,
-          emitEvent,
-        } of normalized) {
+        for (const { key, value, opts } of normalizeAnnotateArgs(argTuple)) {
           if (value === undefined || value === null) continue;
           annotations.push({
             ...stageScopeFields,
-            actor,
+            actor: opts?.actor,
             key,
             value,
-            payload,
-            idempotencyKey,
-            emitEvent,
+            payload: opts?.payload,
+            idempotencyKey: opts?.idempotencyKey,
+            emitEvent: opts?.emitEvent,
           });
         }
       }
