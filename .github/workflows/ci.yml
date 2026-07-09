@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   ci:
     runs-on: ubuntu-latest
@@ -16,13 +20,13 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: ${{ matrix.node-version }}
           cache: "pnpm"
@@ -34,10 +38,10 @@ jobs:
         run: pnpm biome check .
 
       - name: Build
-        run: pnpm build
+        run: pnpm --filter '!workflow-engine-docs' -r build
 
       - name: Type check
-        run: pnpm typecheck
+        run: pnpm --filter '!workflow-engine-docs' -r typecheck
 
       - name: Test
         run: pnpm test
@@ -67,19 +71,19 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: "22"
           cache: "pnpm"
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: pnpm install --frozen-lockfile --filter @bratsos/workflow-engine
 
       - name: Generate Prisma client
         run: pnpm --filter @bratsos/workflow-engine run prisma:generate

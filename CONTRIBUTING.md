@@ -11,7 +11,7 @@ Requires Node.js >= 22.11 and pnpm (see `packageManager` in `package.json` for t
 ## Everyday commands
 
 ```bash
-pnpm ci          # lint + typecheck + test + build (what CI runs)
+pnpm verify          # lint + typecheck + test + build (what CI runs)
 pnpm build       # build all packages
 pnpm test        # test all packages
 pnpm typecheck   # typecheck all packages
@@ -40,7 +40,7 @@ This is a pnpm monorepo (`packages/*`):
 ## Making changes
 
 1. Create a branch, make your change, add/update tests.
-2. Run `pnpm ci` before opening a PR.
+2. Run `pnpm verify` before opening a PR.
 3. Add a changeset for any change that should ship in a release:
 
    ```bash
