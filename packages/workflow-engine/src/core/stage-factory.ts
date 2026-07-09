@@ -259,7 +259,66 @@ export interface AsyncBatchStageDefinition<
 // ============================================================================
 
 /**
+ * Curried form — supply only `TContext` and let TypeScript infer `TId` (as
+ * a string literal), `TInput`, `TOutput`, and `TConfig` from the definition
+ * object passed to the returned function.
+ *
+ * Prefer this over the 5-positional-generic overloads below whenever you
+ * need to fix `TContext` explicitly. Positional generics require spelling
+ * out all five by hand (`defineStage<TId, TInput, TOutput, TConfig,
+ * TContext>({...})`) since TypeScript can't infer a subset from the middle
+ * of a generic list — that duplicates the types already on `schemas` and
+ * silently loses `TId` literal inference if any of them are mistyped. The
+ * curried form only ever requires the one generic TypeScript truly can't
+ * infer on its own.
+ *
+ * @example
+ * ```typescript
+ * type MyContext = { "previous-stage": { value: string } };
+ *
+ * export const myStage = defineStage<MyContext>()({
+ *   id: "my-stage",              // TId inferred as the literal "my-stage"
+ *   name: "My Stage",
+ *   schemas: {
+ *     input: InputSchema,
+ *     output: OutputSchema,
+ *     config: ConfigSchema,
+ *   },
+ *   async execute(ctx) {
+ *     const prev = ctx.require("previous-stage"); // typed via MyContext
+ *     return { output: { ... } };
+ *   },
+ * });
+ * ```
+ */
+export function defineStage<
+  TContext extends Record<string, unknown> = Record<string, unknown>,
+>(): <
+  TId extends string,
+  TInput extends z.ZodTypeAny | "none",
+  TOutput extends z.ZodTypeAny,
+  TConfig extends z.ZodTypeAny,
+>(
+  definition:
+    | SyncStageDefinition<TInput, TOutput, TConfig, TContext, TId>
+    | AsyncBatchStageDefinition<TInput, TOutput, TConfig, TContext, TId>,
+) => Stage<
+  TInput extends "none" ? typeof NoInputSchema : TInput,
+  TOutput,
+  TConfig,
+  TContext,
+  TId
+>;
+
+/**
  * Define a sync stage with simplified API
+ *
+ * @deprecated Spelling out all five generics positionally is verbose and
+ * throws away `TId` literal inference if any of them are mistyped. Prefer
+ * the curried form when you need to fix `TContext` explicitly:
+ * `defineStage<TContext>()({ ... })`. (This overload isn't going anywhere
+ * — the curried form calls into it — this note is about the positional
+ * generics, not about calling `defineStage({ ... })` with inferred types.)
  */
 export function defineStage<
   TId extends string,
@@ -279,6 +338,11 @@ export function defineStage<
 
 /**
  * Define an async-batch stage with simplified API
+ *
+ * @deprecated Spelling out all five generics positionally is verbose and
+ * throws away `TId` literal inference if any of them are mistyped. Prefer
+ * the curried form when you need to fix `TContext` explicitly:
+ * `defineStage<TContext>()({ ... })`.
  */
 export function defineStage<
   TId extends string,
@@ -303,9 +367,36 @@ export function defineStage<
 >;
 
 /**
- * Implementation
+ * Implementation — dispatches on arity to handle both call shapes:
+ * - `defineStage(definition)` — the direct, non-curried overloads above.
+ * - `defineStage<TContext>()` — called with zero arguments; returns a
+ *   function that accepts `definition` (the curried overload above).
  */
-export function defineStage<
+export function defineStage(
+  definition?:
+    | SyncStageDefinition<any, any, any, any, any>
+    | AsyncBatchStageDefinition<any, any, any, any, any>,
+): any {
+  if (definition === undefined) {
+    // Curried form: `defineStage<TContext>()` was called with no args —
+    // return a function that builds the stage from the next call.
+    return (
+      curriedDefinition:
+        | SyncStageDefinition<any, any, any, any, any>
+        | AsyncBatchStageDefinition<any, any, any, any, any>,
+    ) => buildStage(curriedDefinition);
+  }
+
+  return buildStage(definition);
+}
+
+/**
+ * Shared implementation for both call shapes of `defineStage()`. Resolves
+ * `"none"` input, wraps `execute()` with the enhanced context
+ * (require/optional/onProgress) and auto-filled metrics/poll-config
+ * derivation, and attaches `checkCompletion` for async-batch stages.
+ */
+function buildStage<
   TId extends string,
   TInput extends z.ZodTypeAny | "none",
   TOutput extends z.ZodTypeAny,

@@ -39,6 +39,7 @@ export {
   type SyncStageDefinition,
 } from "./core/stage-factory";
 export type {
+  AnnotationCreatedEvent,
   KernelEvent,
   KernelEventType,
   StageCompletedEvent,

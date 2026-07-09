@@ -80,6 +80,59 @@ export type MergeParallelOutputSchema<
 }>;
 
 // ============================================================================
+// Config Defaults Extraction
+// ============================================================================
+
+/**
+ * Extract each top-level field's default value from an object config schema.
+ *
+ * Delegates to `z.toJSONSchema()` instead of reaching into Zod's internal
+ * `_def` representation (whose shape changed between Zod 3 and Zod 4, and
+ * previously required a manual `typeof defaultValue === "function"` branch
+ * for Zod-3-era function defaults). `z.toJSONSchema()` already resolves
+ * `.default()` — including function defaults — to a plain value on each
+ * property's `default` key, regardless of whether it's wrapped in
+ * `ZodOptional`/`ZodDefault` or in which order.
+ *
+ * `unrepresentable: "any"` degrades fields Zod can't express in JSON Schema
+ * (e.g. `z.date()`, `z.custom()`) to `{}` instead of throwing, so one
+ * exotic field doesn't prevent extracting defaults for the rest of the
+ * schema.
+ */
+function extractConfigDefaults(
+  configSchema: z.ZodTypeAny,
+): Record<string, unknown> {
+  if (!(configSchema instanceof z.ZodObject)) {
+    return {};
+  }
+
+  try {
+    const jsonSchema = z.toJSONSchema(configSchema, {
+      unrepresentable: "any",
+    });
+
+    const defaults: Record<string, unknown> = {};
+    for (const [key, fieldSchema] of Object.entries(
+      jsonSchema.properties ?? {},
+    )) {
+      if (
+        typeof fieldSchema === "object" &&
+        fieldSchema !== null &&
+        "default" in fieldSchema
+      ) {
+        defaults[key] = fieldSchema.default;
+      }
+    }
+    return defaults;
+  } catch {
+    // A field's schema couldn't be represented even with
+    // `unrepresentable: "any"` (e.g. a bigint default) — skip defaults for
+    // this stage rather than failing getStageConfigs() for every stage.
+    return {};
+  }
+}
+
+// ============================================================================
 // Workflow - Complete workflow definition
 // ============================================================================
 
@@ -137,6 +190,11 @@ export class Workflow<
 
   /**
    * Get a visual representation of the workflow execution order
+   *
+   * @deprecated Debug/inspection helper for ad-hoc logging; not a stable,
+   * structured API (returns freeform text). Prefer `getExecutionPlan()` or
+   * `getAllStages()` if you need to consume the execution order
+   * programmatically. Removal at 1.0.
    */
   getExecutionOrder(): string {
     const executionPlan = this.getExecutionPlan();
@@ -247,6 +305,11 @@ export class Workflow<
 
   /**
    * Estimate total cost for the workflow
+   *
+   * @deprecated Rough, pre-execution-only estimate: it always calls every
+   * stage's `estimateCost` with the workflow's original input rather than
+   * propagating each stage's actual (previous-stage) input, so it can't
+   * account for real inter-stage data flow. Removal at 1.0.
    */
   estimateCost(
     input: z.infer<TInput>,
@@ -293,33 +356,9 @@ export class Workflow<
     for (const node of this.stages) {
       const stage = node.stage;
 
-      // Extract defaults from schema
-      const defaults: Record<string, unknown> = {};
-
-      if (stage.configSchema instanceof z.ZodObject) {
-        const shape = stage.configSchema.shape as Record<string, z.ZodTypeAny>;
-        for (const [key, fieldSchema] of Object.entries(shape)) {
-          let unwrapped = fieldSchema;
-
-          // Unwrap ZodOptional if present
-          if (unwrapped instanceof z.ZodOptional) {
-            unwrapped = (unwrapped._def as any).innerType;
-          }
-
-          // Check for ZodDefault
-          if (unwrapped instanceof z.ZodDefault) {
-            const defaultValueFn = (unwrapped._def as any).defaultValue;
-            defaults[key] =
-              typeof defaultValueFn === "function"
-                ? defaultValueFn()
-                : defaultValueFn;
-          }
-        }
-      }
-
       configs[stage.id] = {
         schema: stage.configSchema,
-        defaults,
+        defaults: extractConfigDefaults(stage.configSchema),
         name: stage.name,
         description: stage.description,
       };
@@ -389,6 +428,21 @@ export class WorkflowBuilder<
   private stages: StageNode[] = [];
   private currentExecutionGroup = 0;
 
+  /**
+   * @deprecated Prefer {@link defineWorkflow}, an options-object API over
+   * this 5-positional-argument constructor — `inputSchema` and
+   * `currentOutputSchema` are both plain `z.ZodTypeAny`, so positional args
+   * of the same type are easy to transpose by accident. Removal at 1.0.
+   *
+   * @param id - Workflow ID
+   * @param name - Human-readable name
+   * @param description - Human-readable description
+   * @param inputSchema - Zod schema for the workflow's input
+   * @param currentOutputSchema - Initial output schema. @deprecated
+   *   Decorative for any workflow with at least one piped stage — silently
+   *   replaced by the last piped stage's `outputSchema` when `.build()` is
+   *   called. Only relevant for a zero-stage workflow. Removal at 1.0.
+   */
   constructor(
     private id: string,
     private name: string,
@@ -568,20 +622,6 @@ export class WorkflowBuilder<
       this.stages,
     );
   }
-
-  /**
-   * Get current stage count
-   */
-  getStageCount(): number {
-    return this.stages.length;
-  }
-
-  /**
-   * Get execution group count
-   */
-  getExecutionGroupCount(): number {
-    return this.currentExecutionGroup;
-  }
 }
 
 // ============================================================================
@@ -606,6 +646,10 @@ export interface DefineWorkflowOptions<
    * the 5th positional argument to `new WorkflowBuilder(...)`. It has no
    * effect on the final workflow's output schema, so most callers can omit
    * it and let `.pipe()`/`.parallel()` calls determine the output type.
+   *
+   * @deprecated Decorative for any workflow with at least one piped stage;
+   * only relevant for a zero-stage workflow. Most callers should omit
+   * this. Removal at 1.0.
    */
   output?: TOutput;
 }

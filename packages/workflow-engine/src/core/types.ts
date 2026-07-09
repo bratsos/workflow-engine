@@ -64,13 +64,47 @@ export interface StageResult<TOutput> {
 // Suspended State (for async-batch operations)
 // ============================================================================
 
+/**
+ * Suspended state for async-batch stages.
+ *
+ * Only `batchId` is required. `submittedAt`, `pollInterval`, and
+ * `maxWaitTime` are optional — poll timing is authoritatively derived by
+ * `defineStage()`'s async-batch handling into the sibling `pollConfig`
+ * object (see `SimpleSuspendedResult` in stage-factory.ts), and the kernel
+ * schedules polls from the stage's own DB columns (populated from
+ * `pollConfig`), not from this `state` blob.
+ */
 export const SuspendedStateSchema = z.object({
   batchId: z.string(),
   statusUrl: z.string().optional(),
   apiKey: z.string().optional(),
-  submittedAt: z.string(), // ISO date string
-  pollInterval: z.number(), // milliseconds
-  maxWaitTime: z.number(), // milliseconds
+  /**
+   * ISO date string.
+   * @deprecated Optional — kept for a deprecation window only.
+   * `defineStage()` still back-fills its resolved value here (in addition
+   * to `pollConfig`) because some `checkCompletion` implementations read
+   * `suspendedState.submittedAt` directly. New code should read timing
+   * from `pollConfig` instead. Removal at 1.0.
+   */
+  submittedAt: z.string().optional(),
+  /**
+   * Milliseconds.
+   * @deprecated Optional — kept for a deprecation window only.
+   * `defineStage()` still back-fills its resolved value here (in addition
+   * to `pollConfig`) because some `checkCompletion` implementations read
+   * `suspendedState.pollInterval` directly. Prefer `pollConfig.pollInterval`.
+   * Removal at 1.0.
+   */
+  pollInterval: z.number().optional(),
+  /**
+   * Milliseconds.
+   * @deprecated Optional — kept for a deprecation window only.
+   * `defineStage()` still back-fills its resolved value here (in addition
+   * to `pollConfig`) because some `checkCompletion` implementations read
+   * `suspendedState.maxWaitTime` directly. Prefer `pollConfig.maxWaitTime`.
+   * Removal at 1.0.
+   */
+  maxWaitTime: z.number().optional(),
   metadata: z.record(z.string(), z.unknown()).optional(),
 });
 

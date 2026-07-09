@@ -256,16 +256,3 @@ export interface Stage<
   // Optional: Cost estimation
   estimateCost?: (input: z.infer<TInput>, config: z.infer<TConfig>) => number;
 }
-
-// ============================================================================
-// Helper type to extract stage output type
-// ============================================================================
-
-export type StageOutputType<S> =
-  S extends Stage<any, infer TOutput, any, any> ? z.infer<TOutput> : never;
-
-export type StageInputType<S> =
-  S extends Stage<infer TInput, any, any, any> ? z.infer<TInput> : never;
-
-export type StageConfigType<S> =
-  S extends Stage<any, any, infer TConfig, any> ? z.infer<TConfig> : never;

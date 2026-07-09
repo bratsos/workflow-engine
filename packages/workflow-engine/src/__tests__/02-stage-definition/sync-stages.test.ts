@@ -4,7 +4,7 @@
  * Tests for defining and creating synchronous stages using defineStage().
  */
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, expectTypeOf, it } from "vitest";
 import { z } from "zod";
 import type { StageContext } from "../../core/stage.js";
 import { defineStage } from "../../core/stage-factory.js";
@@ -530,6 +530,155 @@ describe("I want to define synchronous stages", () => {
             ?.avgProcessTime,
         ).toBe(50);
       }
+    });
+  });
+
+  describe("curried defineStage<TContext>()", () => {
+    // The whole point of currying: fix TContext once, and let TId/TInput/
+    // TOutput/TConfig all infer from the definition object — no need to
+    // spell out all 5 generics positionally (compare to the `defineStage<
+    // "process", z.ZodObject<...>, ..., ExtractContext>({...})` pattern
+    // used elsewhere, e.g. in 05-data-flow/context-access.test.ts).
+    type UpstreamContext = {
+      "upstream-stage": { value: string; count: number };
+    };
+
+    it("infers TId as a string literal, not widened to `string`", () => {
+      // Given: defineStage<TContext>()({ id: "curried-stage", ... })
+      const stage = defineStage<UpstreamContext>()({
+        id: "curried-stage",
+        name: "Curried Stage",
+        schemas: {
+          input: z.object({}),
+          output: z.object({ result: z.string() }),
+          config: z.object({}),
+        },
+        async execute() {
+          return { output: { result: "done" } };
+        },
+      });
+
+      // Then: TId is the literal "curried-stage", not widened to `string`
+      // (widening would break WorkflowBuilder's per-stage context keying).
+      expectTypeOf(stage.id).toEqualTypeOf<"curried-stage">();
+      expectTypeOf(stage.id).not.toEqualTypeOf<string>();
+      expect(stage.id).toBe("curried-stage");
+    });
+
+    it("types ctx.require() from the supplied TContext generic", async () => {
+      // Given: A stage curried with an explicit upstream context type
+      let captured: { value: string; count: number } | undefined;
+
+      const stage = defineStage<UpstreamContext>()({
+        id: "consumer-stage",
+        name: "Consumer Stage",
+        schemas: {
+          input: z.object({}),
+          output: z.object({ echoed: z.string() }),
+          config: z.object({}),
+        },
+        async execute(ctx) {
+          const upstream = ctx.require("upstream-stage");
+
+          // Then: ctx.require()'s return type comes from UpstreamContext
+          // (not `unknown`/`any`) — this is a compile-time-only assertion.
+          expectTypeOf(upstream).toEqualTypeOf<{
+            value: string;
+            count: number;
+          }>();
+
+          captured = upstream;
+          return { output: { echoed: upstream.value } };
+        },
+      });
+
+      // When: Executed with the upstream stage's output present
+      const mockContext: StageContext<
+        Record<string, never>,
+        Record<string, never>,
+        UpstreamContext
+      > = {
+        workflowRunId: "run-1",
+        stageRecordId: "stage-record-1",
+        stageId: "consumer-stage",
+        stageName: "Consumer Stage",
+        stageNumber: 0,
+        input: {},
+        config: {},
+        workflowContext: { "upstream-stage": { value: "hi", count: 1 } },
+        onProgress: () => {},
+        onLog: () => {},
+        log: () => {},
+        annotate: () => {},
+        storage: {
+          save: async () => {},
+          load: async <T>(): Promise<T> => null as T,
+          exists: async () => false,
+          delete: async () => {},
+          getStageKey: () => "key",
+        },
+      };
+
+      const result = await stage.execute(mockContext);
+
+      // Then: The runtime value matches what the type predicted
+      expect(captured).toEqual({ value: "hi", count: 1 });
+      expect("output" in result).toBe(true);
+      if ("output" in result) {
+        expect(result.output).toEqual({ echoed: "hi" });
+      }
+    });
+
+    it("infers the output type from the output schema", () => {
+      // Given: A curried stage with a multi-field output schema
+      const stage = defineStage<UpstreamContext>()({
+        id: "output-stage",
+        name: "Output Stage",
+        schemas: {
+          input: z.object({}),
+          output: z.object({ total: z.number(), label: z.string() }),
+          config: z.object({}),
+        },
+        async execute() {
+          return { output: { total: 42, label: "answer" } };
+        },
+      });
+
+      // Then: z.infer<typeof stage.outputSchema> matches the declared shape
+      type Output = z.infer<typeof stage.outputSchema>;
+      expectTypeOf<Output>().toEqualTypeOf<{
+        total: number;
+        label: string;
+      }>();
+
+      // And: The schema actually validates data of that shape
+      expect(stage.outputSchema.parse({ total: 42, label: "answer" })).toEqual({
+        total: 42,
+        label: "answer",
+      });
+    });
+
+    it("still works with the default TContext when currying without pinning it", () => {
+      // Given: defineStage<TContext>() called with no type argument — the
+      // default `Record<string, unknown>` applies, same as calling
+      // defineStage({...}) directly.
+      const stage = defineStage()({
+        id: "no-context-stage",
+        name: "No Context Stage",
+        schemas: {
+          input: z.object({ value: z.number() }),
+          output: z.object({ doubled: z.number() }),
+          config: z.object({}),
+        },
+        async execute(ctx) {
+          return { output: { doubled: ctx.input.value * 2 } };
+        },
+      });
+
+      // Then: TId inference and stage construction still work as normal
+      expectTypeOf(stage.id).toEqualTypeOf<"no-context-stage">();
+      expect(stage.id).toBe("no-context-stage");
+      expect(stage.mode).toBe("sync");
     });
   });
 });

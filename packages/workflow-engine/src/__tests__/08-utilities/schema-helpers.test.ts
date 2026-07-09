@@ -1,12 +1,11 @@
 /**
  * Schema Helpers Tests
  *
- * Tests for requireStageOutput, getStageOutput, and NoInputSchema.
+ * Tests for requireStageOutput and NoInputSchema.
  */
 
 import { describe, expect, it } from "vitest";
 import {
-  getStageOutput,
   NoInputSchema,
   requireStageOutput,
 } from "../../core/schema-helpers.js";
@@ -135,131 +134,93 @@ describe("I want to use schema helpers to access stage outputs", () => {
         ).toThrow("output is not an object, cannot access field 'field'");
       });
 
-      it("should throw when accessing field on null output", () => {
+      it("should throw 'not an object' when accessing a field on null output", () => {
         // Given: A workflow context with null output
-        // Note: null is treated as falsy, so it throws "Missing output" not "not an object"
+        // Note: requireStageOutput only treats `undefined` as missing
+        // (matching ctx.require's semantics) — null is a defined-but-falsy
+        // value, so it reaches the field-access check instead, same as
+        // any other non-object output.
         const workflowContext: Record<string, unknown> = {
           "null-stage": null,
         };
 
-        // When/Then: Accessing field on null throws (null is falsy, so treated as missing)
+        // When/Then: Accessing a field on null throws "not an object"
         expect(() =>
           requireStageOutput(workflowContext, "null-stage", "field"),
-        ).toThrow("Missing output from required stage: null-stage");
+        ).toThrow("output is not an object, cannot access field 'field'");
       });
     });
-  });
 
-  describe("getStageOutput", () => {
-    describe("full output access", () => {
-      it("should return stage output when present", () => {
-        // Given: A workflow context with stage output
+    describe("falsy-but-defined outputs pass through (not treated as missing)", () => {
+      it("should return 0 as a legitimate stage output", () => {
+        // Given: A workflow context whose stage output is 0
         const workflowContext: Record<string, unknown> = {
-          "optional-stage": { data: "some data" },
+          "count-stage": 0,
         };
 
-        // When: I get the optional stage output
-        const output = getStageOutput<{ data: string }>(
+        // When: I require the stage output
+        const output = requireStageOutput<number>(
           workflowContext,
-          "optional-stage",
+          "count-stage",
         );
 
-        // Then: Returns the output
-        expect(output).toEqual({ data: "some data" });
+        // Then: Returns 0, does not throw
+        expect(output).toBe(0);
       });
 
-      it("should return undefined when stage output is missing", () => {
+      it("should return an empty string as a legitimate stage output", () => {
+        // Given: A workflow context whose stage output is ""
+        const workflowContext: Record<string, unknown> = {
+          "text-stage": "",
+        };
+
+        // When: I require the stage output
+        const output = requireStageOutput<string>(
+          workflowContext,
+          "text-stage",
+        );
+
+        // Then: Returns "", does not throw
+        expect(output).toBe("");
+      });
+
+      it("should return false as a legitimate stage output", () => {
+        // Given: A workflow context whose stage output is false
+        const workflowContext: Record<string, unknown> = {
+          "flag-stage": false,
+        };
+
+        // When: I require the stage output
+        const output = requireStageOutput<boolean>(
+          workflowContext,
+          "flag-stage",
+        );
+
+        // Then: Returns false, does not throw
+        expect(output).toBe(false);
+      });
+
+      it("should return null as a legitimate stage output", () => {
+        // Given: A workflow context whose stage output is null
+        const workflowContext: Record<string, unknown> = {
+          "null-stage": null,
+        };
+
+        // When: I require the stage output (no field access)
+        const output = requireStageOutput<null>(workflowContext, "null-stage");
+
+        // Then: Returns null, does not throw
+        expect(output).toBeNull();
+      });
+
+      it("should still throw only when output is actually undefined", () => {
         // Given: An empty workflow context
         const workflowContext: Record<string, unknown> = {};
 
-        // When: I get a missing stage output
-        const output = getStageOutput(workflowContext, "missing-stage");
-
-        // Then: Returns undefined
-        expect(output).toBeUndefined();
-      });
-
-      it("should return undefined when stage output is explicitly undefined", () => {
-        // Given: A workflow context with undefined output
-        const workflowContext: Record<string, unknown> = {
-          "undefined-stage": undefined,
-        };
-
-        // When: I get the output
-        const output = getStageOutput(workflowContext, "undefined-stage");
-
-        // Then: Returns undefined
-        expect(output).toBeUndefined();
-      });
-    });
-
-    describe("field access", () => {
-      it("should return specific field when present", () => {
-        // Given: A workflow context with stage output containing fields
-        const workflowContext: Record<string, unknown> = {
-          "multi-field-stage": {
-            items: [1, 2, 3],
-            count: 3,
-            metadata: { source: "test" },
-          },
-        };
-
-        // When: I get a specific field
-        const items = getStageOutput<number[]>(
-          workflowContext,
-          "multi-field-stage",
-          "items",
-        );
-
-        // Then: Returns just that field
-        expect(items).toEqual([1, 2, 3]);
-      });
-
-      it("should return undefined when field is missing", () => {
-        // Given: A workflow context with stage output
-        const workflowContext: Record<string, unknown> = {
-          "my-stage": { existingField: "value" },
-        };
-
-        // When: I get a missing field
-        const value = getStageOutput(
-          workflowContext,
-          "my-stage",
-          "missingField",
-        );
-
-        // Then: Returns undefined (not throw)
-        expect(value).toBeUndefined();
-      });
-
-      it("should return undefined when accessing field on non-object output", () => {
-        // Given: A workflow context with primitive output
-        const workflowContext: Record<string, unknown> = {
-          "primitive-stage": 42,
-        };
-
-        // When: I get a field from primitive output
-        const value = getStageOutput(
-          workflowContext,
-          "primitive-stage",
-          "field",
-        );
-
-        // Then: Returns undefined (not throw)
-        expect(value).toBeUndefined();
-      });
-
-      it("should return undefined when accessing field on null output", () => {
-        // Given: A workflow context with null output
-        const workflowContext: Record<string, unknown> = {
-          "null-stage": null,
-        };
-
-        // When: I get a field from null output
-        const value = getStageOutput(workflowContext, "null-stage", "field");
-
-        // Then: Returns undefined
-        expect(value).toBeUndefined();
+        // When/Then: Requiring a genuinely-missing stage still throws
+        expect(() =>
+          requireStageOutput(workflowContext, "missing-stage"),
+        ).toThrow("Missing output from required stage: missing-stage");
       });
     });
   });
@@ -306,32 +267,6 @@ describe("I want to use schema helpers to access stage outputs", () => {
       expect(extraction.metadata.pageCount).toBe(10);
       expect(guidelines).toHaveLength(2);
       expect(guidelines[0]?.priority).toBe(1);
-    });
-
-    it("should support conditional stage access", () => {
-      // Given: A workflow context where optional stage may not exist
-      const workflowContext: Record<string, unknown> = {
-        "required-stage": { value: "required data" },
-        // "optional-enrichment" not present
-      };
-
-      // When: I conditionally access stages
-      const required = requireStageOutput<{ value: string }>(
-        workflowContext,
-        "required-stage",
-      );
-      const optional = getStageOutput<{ enrichedValue: string }>(
-        workflowContext,
-        "optional-enrichment",
-      );
-
-      // Then: Required exists, optional is undefined
-      expect(required.value).toBe("required data");
-      expect(optional).toBeUndefined();
-
-      // And: I can use conditional logic
-      const finalValue = optional?.enrichedValue ?? required.value;
-      expect(finalValue).toBe("required data");
     });
   });
 });
