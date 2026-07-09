@@ -20,16 +20,55 @@ import type {
   EnqueueJobInput,
   JobQueue,
   JobRecord,
-  JobStatus,
+  Status,
 } from "../persistence/interface.js";
+
+/** Options accepted by `InMemoryJobQueue`'s constructor. */
+export interface InMemoryJobQueueOptions {
+  /** Unique worker identifier. Defaults to an auto-generated ID. */
+  workerId?: string;
+  /**
+   * Injectable clock, used for every timestamp this fake writes
+   * (`createdAt`/`updatedAt`/`lockedAt`/etc.). Defaults to
+   * `() => new Date()`. Inject a fixed/advancing clock in tests that need
+   * deterministic timestamps instead of relying on wall-clock time.
+   */
+  now?: () => Date;
+}
 
 export class InMemoryJobQueue implements JobQueue {
   private jobs = new Map<string, JobRecord>();
   private workerId: string;
   private defaultMaxAttempts = 3;
+  private readonly now: () => Date;
+  /**
+   * Monotonic insertion counter, keyed by job id. `dequeue`'s ordering is
+   * priority DESC, then `createdAt` ASC -- when two jobs share both
+   * (common with an injected/frozen clock, or same-millisecond real-time
+   * enqueues), this breaks the tie explicitly by enqueue order instead of
+   * leaning on `Array.prototype.sort`'s stability as an implicit,
+   * easy-to-accidentally-break contract.
+   */
+  private insertionSequence = new Map<string, number>();
+  private nextSequence = 0;
 
-  constructor(workerId?: string) {
-    this.workerId = workerId ?? `worker-${randomUUID().slice(0, 8)}`;
+  /**
+   * @param workerIdOrOpts - Either a worker id string (backwards
+   * compatible with the original single-argument constructor) or an
+   * options object.
+   * @param maybeOpts - Options, only consulted when the first argument is
+   * a worker id string.
+   */
+  constructor(
+    workerIdOrOpts?: string | InMemoryJobQueueOptions,
+    maybeOpts?: InMemoryJobQueueOptions,
+  ) {
+    const opts: InMemoryJobQueueOptions =
+      typeof workerIdOrOpts === "string"
+        ? { workerId: workerIdOrOpts, ...maybeOpts }
+        : (workerIdOrOpts ?? {});
+    this.workerId = opts.workerId ?? `worker-${randomUUID().slice(0, 8)}`;
+    this.now = opts.now ?? (() => new Date());
   }
 
   // ============================================================================
@@ -37,7 +76,7 @@ export class InMemoryJobQueue implements JobQueue {
   // ============================================================================
 
   async enqueue(options: EnqueueJobInput): Promise<string> {
-    const now = new Date();
+    const now = this.now();
     const id = randomUUID();
 
     const job: JobRecord = {
@@ -61,6 +100,7 @@ export class InMemoryJobQueue implements JobQueue {
     };
 
     this.jobs.set(id, job);
+    this.insertionSequence.set(id, this.nextSequence++);
     return id;
   }
 
@@ -75,7 +115,7 @@ export class InMemoryJobQueue implements JobQueue {
 
   async dequeue(): Promise<DequeueResult | null> {
     // Find the highest priority PENDING job
-    const now = new Date();
+    const now = this.now();
     const pendingJobs = Array.from(this.jobs.values())
       .filter(
         (j) =>
@@ -88,7 +128,14 @@ export class InMemoryJobQueue implements JobQueue {
           return b.priority - a.priority;
         }
         // Earlier creation first (FIFO for same priority)
-        return a.createdAt.getTime() - b.createdAt.getTime();
+        const timeDiff = a.createdAt.getTime() - b.createdAt.getTime();
+        if (timeDiff !== 0) return timeDiff;
+        // Equal priority AND equal timestamp (frozen/injected clock, or
+        // same-millisecond real-time enqueues) -- break the tie by
+        // explicit enqueue order.
+        const seqA = this.insertionSequence.get(a.id) ?? 0;
+        const seqB = this.insertionSequence.get(b.id) ?? 0;
+        return seqA - seqB;
       });
 
     if (pendingJobs.length === 0) {
@@ -128,7 +175,7 @@ export class InMemoryJobQueue implements JobQueue {
       throw new Error(`Job not found: ${jobId}`);
     }
 
-    const now = new Date();
+    const now = this.now();
     const updated: JobRecord = {
       ...job,
       status: "COMPLETED",
@@ -150,7 +197,7 @@ export class InMemoryJobQueue implements JobQueue {
       nextPollAt,
       workerId: null,
       lockedAt: null,
-      updatedAt: new Date(),
+      updatedAt: this.now(),
     };
     this.jobs.set(jobId, updated);
   }
@@ -165,7 +212,7 @@ export class InMemoryJobQueue implements JobQueue {
       throw new Error(`Job not found: ${jobId}`);
     }
 
-    const now = new Date();
+    const now = this.now();
 
     if (shouldRetry && job.attempt < job.maxAttempts) {
       // Retry: move back to PENDING (attempt was already incremented during dequeue)
@@ -192,7 +239,7 @@ export class InMemoryJobQueue implements JobQueue {
   }
 
   async releaseStaleJobs(staleThresholdMs: number = 300000): Promise<number> {
-    const now = new Date();
+    const now = this.now();
     const threshold = new Date(now.getTime() - staleThresholdMs);
     let released = 0;
 
@@ -227,15 +274,16 @@ export class InMemoryJobQueue implements JobQueue {
   async touchJob(jobId: string): Promise<void> {
     const job = this.jobs.get(jobId);
     if (!job || job.status !== "RUNNING") return;
+    const now = this.now();
     this.jobs.set(jobId, {
       ...job,
-      lockedAt: new Date(),
-      updatedAt: new Date(),
+      lockedAt: now,
+      updatedAt: now,
     });
   }
 
   async cancelByRun(workflowRunId: string): Promise<number> {
-    const now = new Date();
+    const now = this.now();
     let count = 0;
     for (const job of this.jobs.values()) {
       if (
@@ -264,6 +312,8 @@ export class InMemoryJobQueue implements JobQueue {
    */
   clear(): void {
     this.jobs.clear();
+    this.insertionSequence.clear();
+    this.nextSequence = 0;
   }
 
   /**
@@ -276,7 +326,7 @@ export class InMemoryJobQueue implements JobQueue {
   /**
    * Get jobs by status for inspection
    */
-  getJobsByStatus(status: JobStatus): JobRecord[] {
+  getJobsByStatus(status: Status): JobRecord[] {
     return Array.from(this.jobs.values())
       .filter((j) => j.status === status)
       .map((j) => ({ ...j }));
@@ -325,7 +375,7 @@ export class InMemoryJobQueue implements JobQueue {
         ...job,
         status: "PENDING",
         nextPollAt: null,
-        updatedAt: new Date(),
+        updatedAt: this.now(),
       };
       this.jobs.set(jobId, updated);
     }

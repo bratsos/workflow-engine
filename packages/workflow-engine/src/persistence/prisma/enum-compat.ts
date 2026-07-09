@@ -16,7 +16,13 @@
  * ```
  */
 
-type PrismaClient = any;
+import type { EnginePrismaClient } from "./prisma-client-type";
+
+// Structural client type -- see prisma-client-type.ts. Only `$Enums` is
+// used here, but the full structural type is accepted so callers (and
+// createEnumHelper's own callers, which share one `prisma` instance
+// across several adapters) don't need a second, narrower client type.
+type PrismaClient = EnginePrismaClient;
 
 export interface PrismaEnumHelper {
   /** Resolve Status enum value (unified enum for workflows, stages, and jobs) */

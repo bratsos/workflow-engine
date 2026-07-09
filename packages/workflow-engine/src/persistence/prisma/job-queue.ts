@@ -16,6 +16,7 @@ import type {
 } from "../interface";
 import { createEnumHelper, type PrismaEnumHelper } from "./enum-compat";
 import type { DatabaseType } from "./persistence";
+import type { EnginePrismaClient } from "./prisma-client-type";
 
 const logger = createLogger("JobQueue");
 
@@ -25,8 +26,8 @@ const logger = createLogger("JobQueue");
  */
 const MAX_DEQUEUE_ATTEMPTS = 10;
 
-// Type for prisma client - using any for flexibility
-type PrismaClient = any;
+// Structural client type -- see prisma-client-type.ts.
+type PrismaClient = EnginePrismaClient;
 
 export interface PrismaJobQueueOptions {
   /**
@@ -83,6 +84,17 @@ export class PrismaJobQueue implements JobQueue {
   async enqueueParallel(jobs: EnqueueJobInput[]): Promise<string[]> {
     if (jobs.length === 0) return [];
 
+    // NOTE: deliberately calling `this.prisma.$transaction` directly
+    // below rather than destructuring it into a local first -- Prisma's
+    // runtime reads internal state off `this` inside its own method
+    // bodies, so an unbound reference throws at call time ("Cannot read
+    // properties of undefined").
+    if (!this.prisma.$transaction) {
+      throw new Error(
+        "Prisma client does not support $transaction (required for enqueueParallel)",
+      );
+    }
+
     const results = await this.prisma.$transaction(
       jobs.map((job) =>
         this.prisma.jobQueue.create({
@@ -116,6 +128,16 @@ export class PrismaJobQueue implements JobQueue {
    */
   private async dequeuePostgres(): Promise<DequeueResult | null> {
     try {
+      // NOTE: deliberately calling `this.prisma.$queryRaw` directly below
+      // rather than destructuring it into a local first -- Prisma's
+      // runtime reads internal state off `this` inside its own method
+      // bodies, so an unbound reference throws at call time ("Cannot read
+      // properties of undefined").
+      if (!this.prisma.$queryRaw) {
+        throw new Error(
+          "Prisma client does not support $queryRaw (required for the Postgres dequeue path)",
+        );
+      }
       const result = await this.prisma.$queryRaw<
         Array<{
           id: string;

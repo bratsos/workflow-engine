@@ -14,6 +14,7 @@ import type {
   CreateStageInput,
   OutboxRecord,
   SaveArtifactInput,
+  Status,
   UpdateRunInput,
   UpdateStageInput,
   UpsertStageInput,
@@ -22,14 +23,15 @@ import type {
   WorkflowPersistence,
   WorkflowRunRecord,
   WorkflowStageRecord,
-  WorkflowStageStatus,
-  WorkflowStatus,
 } from "../interface";
 import { StaleVersionError } from "../interface";
 import { createEnumHelper, type PrismaEnumHelper } from "./enum-compat";
+import type { EnginePrismaClient } from "./prisma-client-type";
 
-// Type for prisma client - using any to avoid dependency on specific prisma client
-type PrismaClient = any;
+// Structural client type -- see prisma-client-type.ts. Kept as a local
+// alias so the rest of this file (and its many `PrismaClient`-typed
+// locals/params) doesn't need to change name.
+type PrismaClient = EnginePrismaClient;
 
 export type DatabaseType = "postgresql" | "sqlite";
 
@@ -153,7 +155,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     return run ? this.mapWorkflowRun(run) : null;
   }
 
-  async getRunStatus(id: string): Promise<WorkflowStatus | null> {
+  async getRunStatus(id: string): Promise<Status | null> {
     const run = await this.prisma.workflowRun.findUnique({
       where: { id },
       select: { status: true },
@@ -161,7 +163,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     return run?.status ?? null;
   }
 
-  async getRunsByStatus(status: WorkflowStatus): Promise<WorkflowRunRecord[]> {
+  async getRunsByStatus(status: Status): Promise<WorkflowRunRecord[]> {
     const runs = await this.prisma.workflowRun.findMany({
       where: { status: this.enums.status(status) },
       orderBy: { createdAt: "asc" },
@@ -223,6 +225,16 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
    * 4. Returns the claimed run
    */
   private async claimNextPendingRunPostgres(): Promise<WorkflowRunRecord | null> {
+    // NOTE: deliberately calling `this.prisma.$queryRaw` directly below
+    // rather than destructuring it into a local first -- Prisma's runtime
+    // reads internal state off `this` inside its own method bodies, so an
+    // unbound reference (`const f = this.prisma.$queryRaw; f\`...\``)
+    // throws at call time ("Cannot read properties of undefined").
+    if (!this.prisma.$queryRaw) {
+      throw new Error(
+        "Prisma client does not support $queryRaw (required for the Postgres claimNextPendingRun path)",
+      );
+    }
     // Note: Table name is "workflow_runs" (snake_case per Prisma @@map convention)
     // Column names are camelCase (e.g., "createdAt", "startedAt")
     const results = await this.prisma.$queryRaw<any[]>`
@@ -485,7 +497,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
 
   async getStagesByRun(
     runId: string,
-    options?: { status?: WorkflowStageStatus; orderBy?: "asc" | "desc" },
+    options?: { status?: Status; orderBy?: "asc" | "desc" },
   ): Promise<WorkflowStageRecord[]> {
     const stages = await this.prisma.workflowStage.findMany({
       where: {
@@ -522,7 +534,9 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
         status: this.enums.status("SUSPENDED"),
         nextPollAt: null, // Ready to resume (poll cleared by orchestrator)
       },
-      orderBy: { executionGroup: "asc" },
+      // stageNumber tiebreak matches getStagesByRun/InMemoryWorkflowPersistence
+      // so ties within an execution group resolve identically on both adapters.
+      orderBy: [{ executionGroup: "asc" }, { stageNumber: "asc" }],
     });
     return stage ? this.mapWorkflowStage(stage) : null;
   }
@@ -535,7 +549,10 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
         workflowRunId: runId,
         status: this.enums.status("FAILED"),
       },
-      orderBy: { executionGroup: "desc" },
+      // Ascending -- "first" means earliest in pipeline order (lowest
+      // executionGroup/stageNumber), matching InMemoryWorkflowPersistence's
+      // getStagesByRun(..., { status: "FAILED" })[0] (default ascending).
+      orderBy: [{ executionGroup: "asc" }, { stageNumber: "asc" }],
     });
     return stage ? this.mapWorkflowStage(stage) : null;
   }
@@ -548,7 +565,9 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
         workflowRunId: runId,
         status: this.enums.status("COMPLETED"),
       },
-      orderBy: { executionGroup: "desc" },
+      // stageNumber tiebreak matches getStagesByRun/InMemoryWorkflowPersistence
+      // so ties within an execution group resolve identically on both adapters.
+      orderBy: [{ executionGroup: "desc" }, { stageNumber: "desc" }],
     });
     return stage ? this.mapWorkflowStage(stage) : null;
   }
@@ -563,7 +582,9 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
         status: this.enums.status("COMPLETED"),
         executionGroup: { lt: executionGroup },
       },
-      orderBy: { executionGroup: "desc" },
+      // stageNumber tiebreak matches getStagesByRun/InMemoryWorkflowPersistence
+      // so ties within an execution group resolve identically on both adapters.
+      orderBy: [{ executionGroup: "desc" }, { stageNumber: "desc" }],
     });
     return stage ? this.mapWorkflowStage(stage) : null;
   }

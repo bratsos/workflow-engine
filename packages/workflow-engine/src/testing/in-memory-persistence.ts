@@ -26,6 +26,7 @@ import {
   type OutboxRecord,
   type SaveArtifactInput,
   StaleVersionError,
+  type Status,
   type UpdateRunInput,
   type UpdateStageInput,
   type UpsertStageInput,
@@ -35,8 +36,6 @@ import {
   type WorkflowPersistence,
   type WorkflowRunRecord,
   type WorkflowStageRecord,
-  type WorkflowStageStatus,
-  type WorkflowStatus,
 } from "../persistence/interface.js";
 
 /**
@@ -45,6 +44,18 @@ import {
  * the Prisma SQLite/Postgres claim-retry bound.
  */
 const MAX_CLAIM_ATTEMPTS = 10;
+
+/** Options accepted by `InMemoryWorkflowPersistence`'s constructor. */
+export interface InMemoryPersistenceOptions {
+  /**
+   * Injectable clock, used for every timestamp this fake writes
+   * (`createdAt`/`updatedAt`/`startedAt`/idempotency-key bookkeeping,
+   * etc.). Defaults to `() => new Date()`. Inject a fixed/advancing clock
+   * in tests that need deterministic timestamps instead of relying on
+   * wall-clock time.
+   */
+  now?: () => Date;
+}
 
 /**
  * Merges `rest` onto `base`, skipping keys whose value is `undefined`.
@@ -69,11 +80,27 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
   private logs = new Map<string, WorkflowLogRecord>();
   private artifacts = new Map<string, WorkflowArtifactRecord>();
   private annotations: WorkflowAnnotationRecord[] = [];
+  /**
+   * Monotonic insertion counter, keyed by annotation id. `listAnnotations`
+   * orders by `createdAt` ASC, then this sequence -- annotations appended
+   * in the same batch (or otherwise within the same clock tick) commonly
+   * share a `createdAt`, and `id` (a random UUID here, unlike the Prisma
+   * adapter's roughly-chronological CUIDs) has no relationship to
+   * insertion order, so it can't be reused as the tiebreak the way
+   * PrismaWorkflowPersistence uses `id`.
+   */
+  private annotationSequence = new Map<string, number>();
+  private nextAnnotationSequence = 0;
   private outbox: OutboxRecord[] = [];
   private idempotencyKeys = new Map<string, IdempotencyRecord>();
   /** Maps composite key -> the time the key was (re)acquired as in-progress. */
   private idempotencyInProgress = new Map<string, Date>();
   private outboxSequences = new Map<string, number>();
+  private readonly now: () => Date;
+
+  constructor(opts: InMemoryPersistenceOptions = {}) {
+    this.now = opts.now ?? (() => new Date());
+  }
 
   // Helper to generate composite keys for stages
   private stageKey(runId: string, stageId: string): string {
@@ -100,7 +127,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
   // ============================================================================
 
   async createRun(data: CreateRunInput): Promise<WorkflowRunRecord> {
-    const now = new Date();
+    const now = this.now();
     const record: WorkflowRunRecord = {
       id: data.id ?? randomUUID(),
       createdAt: now,
@@ -146,7 +173,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
     const { expectedVersion: _, ...rest } = data;
     const updated: WorkflowRunRecord = {
       ...mergeDefined(run, rest),
-      updatedAt: new Date(),
+      updatedAt: this.now(),
       version: run.version + 1,
     };
     this.runs.set(id, updated);
@@ -157,12 +184,12 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
     return run ? { ...run } : null;
   }
 
-  async getRunStatus(id: string): Promise<WorkflowStatus | null> {
+  async getRunStatus(id: string): Promise<Status | null> {
     const run = this.runs.get(id);
     return run?.status ?? null;
   }
 
-  async getRunsByStatus(status: WorkflowStatus): Promise<WorkflowRunRecord[]> {
+  async getRunsByStatus(status: Status): Promise<WorkflowRunRecord[]> {
     return Array.from(this.runs.values())
       .filter((run) => run.status === status)
       .map((run) => ({ ...run }));
@@ -199,8 +226,8 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
     const updated: WorkflowRunRecord = {
       ...run,
       status: "RUNNING",
-      startedAt: new Date(),
-      updatedAt: new Date(),
+      startedAt: this.now(),
+      updatedAt: this.now(),
       version: run.version + 1,
     };
     this.runs.set(id, updated);
@@ -244,8 +271,8 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
     const claimed: WorkflowRunRecord = {
       ...currentRun,
       status: "RUNNING",
-      startedAt: new Date(),
-      updatedAt: new Date(),
+      startedAt: this.now(),
+      updatedAt: this.now(),
       version: currentRun.version + 1,
     };
     this.runs.set(claimed.id, claimed);
@@ -258,7 +285,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
   // ============================================================================
 
   async createStage(data: CreateStageInput): Promise<WorkflowStageRecord> {
-    const now = new Date();
+    const now = this.now();
     const id = randomUUID();
     const record: WorkflowStageRecord = {
       id,
@@ -301,7 +328,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
     if (existing) {
       const updated: WorkflowStageRecord = {
         ...mergeDefined(existing, data.update),
-        updatedAt: new Date(),
+        updatedAt: this.now(),
         version: existing.version + 1,
       };
       this.stages.set(existing.id, updated);
@@ -333,7 +360,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
     const { expectedVersion: _, ...rest } = data;
     const updated: WorkflowStageRecord = {
       ...mergeDefined(stage, rest),
-      updatedAt: new Date(),
+      updatedAt: this.now(),
       version: stage.version + 1,
     };
     this.stages.set(id, updated);
@@ -366,7 +393,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
     const { expectedVersion: _, ...rest } = data;
     const updated: WorkflowStageRecord = {
       ...mergeDefined(stage, rest),
-      updatedAt: new Date(),
+      updatedAt: this.now(),
       version: stage.version + 1,
     };
     this.stages.set(stage.id, updated);
@@ -389,7 +416,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
 
   async getStagesByRun(
     runId: string,
-    options?: { status?: WorkflowStageStatus; orderBy?: "asc" | "desc" },
+    options?: { status?: Status; orderBy?: "asc" | "desc" },
   ): Promise<WorkflowStageRecord[]> {
     // Use a Set to track seen IDs and avoid duplicates from composite keys
     const seenIds = new Set<string>();
@@ -495,7 +522,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
   async createLog(data: CreateLogInput): Promise<void> {
     const record: WorkflowLogRecord = {
       id: randomUUID(),
-      createdAt: new Date(),
+      createdAt: this.now(),
       workflowRunId: data.workflowRunId ?? null,
       workflowStageId: data.workflowStageId ?? null,
       level: data.level,
@@ -548,7 +575,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
     const idSet = new Set(ids);
     for (const record of this.outbox) {
       if (idSet.has(record.id)) {
-        record.publishedAt = new Date();
+        record.publishedAt = this.now();
       }
     }
   }
@@ -563,7 +590,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
   async moveOutboxEventToDLQ(id: string): Promise<void> {
     const record = this.outbox.find((r) => r.id === id);
     if (!record) throw new Error(`Outbox event not found: ${id}`);
-    record.dlqAt = new Date();
+    record.dlqAt = this.now();
   }
 
   async replayDLQEvents(maxEvents: number): Promise<number> {
@@ -598,7 +625,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
     const inProgressSince = this.idempotencyInProgress.get(compositeKey);
     if (inProgressSince) {
       const staleAfterMs = options?.staleInProgressAfterMs;
-      const now = options?.now ?? new Date();
+      const now = options?.now ?? this.now();
       if (
         staleAfterMs !== undefined &&
         now.getTime() - inProgressSince.getTime() >= staleAfterMs
@@ -610,7 +637,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
       }
       return { status: "in_progress" };
     }
-    this.idempotencyInProgress.set(compositeKey, options?.now ?? new Date());
+    this.idempotencyInProgress.set(compositeKey, options?.now ?? this.now());
     return { status: "acquired" };
   }
 
@@ -625,7 +652,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
       key,
       commandType,
       result,
-      createdAt: new Date(),
+      createdAt: this.now(),
     });
   }
 
@@ -640,7 +667,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
   // ============================================================================
 
   async saveArtifact(data: SaveArtifactInput): Promise<void> {
-    const now = new Date();
+    const now = this.now();
     const key = this.artifactKey(data.workflowRunId, data.key);
     const existing = this.artifacts.get(key);
 
@@ -705,7 +732,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
 
       const record: WorkflowAnnotationRecord = {
         id: randomUUID(),
-        createdAt: new Date(),
+        createdAt: this.now(),
         workflowRunId: input.workflowRunId,
         workflowStageRecordId: input.workflowStageRecordId ?? null,
         attempt: input.attempt ?? 0,
@@ -720,6 +747,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
         idempotencyKey: input.idempotencyKey ?? null,
       };
       this.annotations.push(record);
+      this.annotationSequence.set(record.id, this.nextAnnotationSequence++);
     }
   }
 
@@ -762,12 +790,17 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
       rows = rows.filter((a) => a.createdAt <= until);
     }
 
-    // Sort by createdAt with id as tiebreaker (matches Prisma adapter,
-    // keeps batched-insert ordering deterministic).
+    // Sort by createdAt, then by insertion sequence -- explicit tiebreak
+    // for annotations that share a createdAt (e.g. one batched
+    // appendAnnotations call), since unlike the Prisma adapter's
+    // roughly-chronological CUIDs, this fake's random-UUID `id` carries
+    // no ordering information to fall back on.
     rows.sort((a, b) => {
       const cmp = a.createdAt.getTime() - b.createdAt.getTime();
       if (cmp !== 0) return cmp;
-      return a.id.localeCompare(b.id);
+      const seqA = this.annotationSequence.get(a.id) ?? 0;
+      const seqB = this.annotationSequence.get(b.id) ?? 0;
+      return seqA - seqB;
     });
 
     const limit = filters.limit ?? 1000;
@@ -812,6 +845,8 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
     this.logs.clear();
     this.artifacts.clear();
     this.annotations = [];
+    this.annotationSequence.clear();
+    this.nextAnnotationSequence = 0;
     this.outbox = [];
     this.idempotencyKeys.clear();
     this.idempotencyInProgress.clear();

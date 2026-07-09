@@ -37,11 +37,46 @@ import type {
 // Test Suite Factory Types
 // ============================================================================
 
-export type PersistenceFactory = () => WorkflowPersistence & {
+/**
+ * Reset/clear seam shared by all three factory contracts: implementations
+ * that can reset synchronously (the in-memory fakes) provide `clear`;
+ * implementations that must do async I/O to reset (e.g. a Postgres
+ * adapter issuing a `TRUNCATE`) provide `reset` instead. Each suite's
+ * `beforeEach` prefers `reset` when present, falling back to `clear`.
+ */
+export interface ResettableFixture {
   clear?: () => void;
-};
-export type AILoggerFactory = () => AICallLogger & { clear?: () => void };
-export type JobQueueFactory = () => JobQueue & { clear?: () => void };
+  reset?: () => Promise<void>;
+}
+
+export type PersistenceFactory = () => WorkflowPersistence & ResettableFixture;
+export type AILoggerFactory = () => AICallLogger & ResettableFixture;
+export type JobQueueFactory = () => JobQueue & ResettableFixture;
+
+/**
+ * Resets a fixture between tests: prefers the async `reset` seam (e.g.
+ * TRUNCATE against a real database) when the fixture provides one,
+ * otherwise falls back to the synchronous `clear`.
+ */
+async function resetFixture(fixture: ResettableFixture): Promise<void> {
+  if (fixture.reset) {
+    await fixture.reset();
+  } else {
+    fixture.clear?.();
+  }
+}
+
+/**
+ * Real-time delay, used sparingly where a suite has no other way to wait
+ * for adapter-async behavior to settle (neither `JobQueue` nor
+ * `AICallLogger` expose an injectable clock or a "flush pending writes"
+ * primitive) -- e.g. `AICallLogger.logCall` is documented fire-and-forget,
+ * so a real (non-fake) implementation logging to a database may not have
+ * committed the write by the time a `logCall` call returns.
+ */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 // ============================================================================
 // WorkflowPersistence Conformance Tests
@@ -54,9 +89,9 @@ export function persistenceConformanceSuite(
   describe(`I want ${name} to conform to WorkflowPersistence interface`, () => {
     let persistence: ReturnType<PersistenceFactory>;
 
-    beforeEach(() => {
+    beforeEach(async () => {
       persistence = factory();
-      persistence.clear?.();
+      await resetFixture(persistence);
     });
 
     // Helper functions
@@ -72,11 +107,30 @@ export function persistenceConformanceSuite(
       };
     }
 
-    function createStageData(
+    /**
+     * Seeds `id` (default: "run-1") as a real `WorkflowRun` row if one
+     * doesn't already exist. Real schemas (Postgres) enforce a mandatory
+     * FK from `WorkflowStage`/`WorkflowLog`/`WorkflowArtifact`/
+     * `WorkflowAnnotation` to their parent run, so any conformance test
+     * that creates a child row against a bare string id needs its parent
+     * seeded first -- `createStageData` does this automatically; tests
+     * that build stage/artifact/log/annotation input inline (not via
+     * `createStageData`) call this directly.
+     */
+    async function ensureRun(id: string): Promise<void> {
+      const existing = await persistence.getRun(id);
+      if (!existing) {
+        await persistence.createRun(createRunData({ id }));
+      }
+    }
+
+    async function createStageData(
       overrides: Partial<CreateStageInput> = {},
-    ): CreateStageInput {
+    ): Promise<CreateStageInput> {
+      const workflowRunId = overrides.workflowRunId ?? "run-1";
+      await ensureRun(workflowRunId);
       return {
-        workflowRunId: "run-1",
+        workflowRunId,
         stageId: `stage-${Date.now()}`,
         stageName: "Test Stage",
         stageNumber: 1,
@@ -296,7 +350,7 @@ export function persistenceConformanceSuite(
     describe("workflow stage CRUD operations", () => {
       it("should create a stage with all required fields", async () => {
         // Given: Valid stage data
-        const data = createStageData({ stageId: "create-stage-test" });
+        const data = await createStageData({ stageId: "create-stage-test" });
 
         // When: Creating a stage
         const stage = await persistence.createStage(data);
@@ -313,7 +367,7 @@ export function persistenceConformanceSuite(
 
       it("should retrieve a stage by run ID and stage ID", async () => {
         // Given: An existing stage
-        const data = createStageData({
+        const data = await createStageData({
           workflowRunId: "stage-get-run",
           stageId: "stage-get-test",
         });
@@ -341,7 +395,7 @@ export function persistenceConformanceSuite(
       it("should retrieve a stage by its database ID", async () => {
         // Given: An existing stage
         const created = await persistence.createStage(
-          createStageData({ stageId: "stage-by-id-test" }),
+          await createStageData({ stageId: "stage-by-id-test" }),
         );
 
         // When: Getting by database ID
@@ -355,7 +409,7 @@ export function persistenceConformanceSuite(
       it("should update a stage by database ID", async () => {
         // Given: An existing stage
         const created = await persistence.createStage(
-          createStageData({ stageId: "update-stage-test" }),
+          await createStageData({ stageId: "update-stage-test" }),
         );
 
         // When: Updating the stage
@@ -373,7 +427,7 @@ export function persistenceConformanceSuite(
       it("should update a stage by run ID and stage ID", async () => {
         // Given: An existing stage
         await persistence.createStage(
-          createStageData({
+          await createStageData({
             workflowRunId: "update-by-ids-run",
             stageId: "update-by-ids-stage",
           }),
@@ -396,7 +450,7 @@ export function persistenceConformanceSuite(
 
       it("should throw on stale stage expectedVersion", async () => {
         const created = await persistence.createStage(
-          createStageData({
+          await createStageData({
             workflowRunId: "stale-stage-run",
             stageId: "stale-stage",
           }),
@@ -412,6 +466,7 @@ export function persistenceConformanceSuite(
 
       it("should upsert a stage - create when not exists", async () => {
         // Given: Upsert data for new stage
+        await ensureRun("upsert-run");
         const result = await persistence.upsertStage({
           workflowRunId: "upsert-run",
           stageId: "upsert-create-stage",
@@ -436,7 +491,7 @@ export function persistenceConformanceSuite(
       it("should upsert a stage - update when exists, applying all update fields", async () => {
         // Given: An existing stage
         await persistence.createStage(
-          createStageData({
+          await createStageData({
             workflowRunId: "upsert-update-run",
             stageId: "upsert-update-stage",
             status: "PENDING",
@@ -473,21 +528,21 @@ export function persistenceConformanceSuite(
         // Given: Multiple stages for a run
         const runId = "stages-by-run-test";
         await persistence.createStage(
-          createStageData({
+          await createStageData({
             workflowRunId: runId,
             stageId: "stage-a",
             stageNumber: 1,
           }),
         );
         await persistence.createStage(
-          createStageData({
+          await createStageData({
             workflowRunId: runId,
             stageId: "stage-b",
             stageNumber: 2,
           }),
         );
         await persistence.createStage(
-          createStageData({
+          await createStageData({
             workflowRunId: "other-run",
             stageId: "stage-c",
             stageNumber: 1,
@@ -509,7 +564,7 @@ export function persistenceConformanceSuite(
         // Given: Stages with different statuses
         const runId = "filter-status-run";
         const stage1 = await persistence.createStage(
-          createStageData({
+          await createStageData({
             workflowRunId: runId,
             stageId: "completed-stage",
             stageNumber: 1,
@@ -517,7 +572,7 @@ export function persistenceConformanceSuite(
           }),
         );
         await persistence.createStage(
-          createStageData({
+          await createStageData({
             workflowRunId: runId,
             stageId: "pending-stage",
             stageNumber: 2,
@@ -543,7 +598,7 @@ export function persistenceConformanceSuite(
         // Given: Stages in random order
         const runId = `order-stages-run-${Date.now()}`;
         await persistence.createStage(
-          createStageData({
+          await createStageData({
             workflowRunId: runId,
             stageId: "third",
             stageName: "Third",
@@ -552,7 +607,7 @@ export function persistenceConformanceSuite(
           }),
         );
         await persistence.createStage(
-          createStageData({
+          await createStageData({
             workflowRunId: runId,
             stageId: "first",
             stageName: "First",
@@ -561,7 +616,7 @@ export function persistenceConformanceSuite(
           }),
         );
         await persistence.createStage(
-          createStageData({
+          await createStageData({
             workflowRunId: runId,
             stageId: "second",
             stageName: "Second",
@@ -594,7 +649,7 @@ export function persistenceConformanceSuite(
       it("should delete a stage", async () => {
         // Given: An existing stage
         const stage = await persistence.createStage(
-          createStageData({
+          await createStageData({
             workflowRunId: "delete-stage-run",
             stageId: "delete-me",
           }),
@@ -619,7 +674,7 @@ export function persistenceConformanceSuite(
         const past = new Date(Date.now() - 10000);
 
         const readyStage = await persistence.createStage(
-          createStageData({
+          await createStageData({
             workflowRunId: runId,
             stageId: "ready-stage",
             stageNumber: 1,
@@ -633,7 +688,7 @@ export function persistenceConformanceSuite(
         });
 
         const notReadyStage = await persistence.createStage(
-          createStageData({
+          await createStageData({
             workflowRunId: runId,
             stageId: "not-ready-stage",
             stageNumber: 2,
@@ -659,7 +714,7 @@ export function persistenceConformanceSuite(
         // Given: A failed stage
         const runId = "failed-stage-run";
         const stage = await persistence.createStage(
-          createStageData({
+          await createStageData({
             workflowRunId: runId,
             stageId: "failed-stage",
             status: "FAILED",
@@ -682,7 +737,7 @@ export function persistenceConformanceSuite(
         // Given: Multiple completed stages
         const runId = "last-completed-run";
         const stage1 = await persistence.createStage(
-          createStageData({
+          await createStageData({
             workflowRunId: runId,
             stageId: "completed-1",
             stageNumber: 1,
@@ -690,7 +745,7 @@ export function persistenceConformanceSuite(
           }),
         );
         const stage2 = await persistence.createStage(
-          createStageData({
+          await createStageData({
             workflowRunId: runId,
             stageId: "completed-2",
             stageNumber: 2,
@@ -713,7 +768,7 @@ export function persistenceConformanceSuite(
         // Given: Completed stages in different execution groups
         const runId = "completed-before-run";
         const stage1 = await persistence.createStage(
-          createStageData({
+          await createStageData({
             workflowRunId: runId,
             stageId: "group-1-stage",
             stageNumber: 1,
@@ -722,7 +777,7 @@ export function persistenceConformanceSuite(
           }),
         );
         const stage2 = await persistence.createStage(
-          createStageData({
+          await createStageData({
             workflowRunId: runId,
             stageId: "group-2-stage",
             stageNumber: 2,
@@ -752,6 +807,7 @@ export function persistenceConformanceSuite(
         const runId = "artifact-run";
         const key = "test-artifact.json";
         const data = { result: "test data", count: 42 };
+        await ensureRun(runId);
 
         // When: Saving and loading
         await persistence.saveArtifact({
@@ -781,6 +837,7 @@ export function persistenceConformanceSuite(
       it("should check if artifact exists", async () => {
         // Given: An artifact
         const runId = "exists-run";
+        await ensureRun(runId);
         await persistence.saveArtifact({
           workflowRunId: runId,
           key: "exists.json",
@@ -804,6 +861,7 @@ export function persistenceConformanceSuite(
       it("should delete an artifact", async () => {
         // Given: An artifact
         const runId = "delete-artifact-run";
+        await ensureRun(runId);
         await persistence.saveArtifact({
           workflowRunId: runId,
           key: "delete-me.json",
@@ -823,6 +881,8 @@ export function persistenceConformanceSuite(
       it("should list artifacts for a run", async () => {
         // Given: Multiple artifacts
         const runId = "list-artifacts-run";
+        await ensureRun(runId);
+        await ensureRun("other-run");
         await persistence.saveArtifact({
           workflowRunId: runId,
           key: "artifact-1.json",
@@ -861,7 +921,7 @@ export function persistenceConformanceSuite(
         const runId = "stage-output-run";
         const stageId = "output-stage";
         await persistence.createStage(
-          createStageData({
+          await createStageData({
             workflowRunId: runId,
             stageId,
           }),
@@ -887,6 +947,7 @@ export function persistenceConformanceSuite(
     describe("log operations", () => {
       it("should create a log without throwing", async () => {
         // Given: Log data
+        await ensureRun("log-run");
         // When: Creating a log
         // Then: No error is thrown
         await expect(
@@ -902,6 +963,7 @@ export function persistenceConformanceSuite(
       it("should support all log levels", async () => {
         // Given/When: Creating logs with different levels
         // Then: No errors are thrown
+        await ensureRun("log-levels-run");
         const levels = ["DEBUG", "INFO", "WARN", "ERROR"] as const;
         for (const level of levels) {
           await expect(
@@ -912,6 +974,338 @@ export function persistenceConformanceSuite(
             }),
           ).resolves.not.toThrow();
         }
+      });
+    });
+
+    describe("annotation operations", () => {
+      it("should append and list an annotation", async () => {
+        // Given: A run to attach the annotation to
+        const runId = "annotation-run";
+        await ensureRun(runId);
+
+        // When: Appending an annotation
+        await persistence.appendAnnotations([
+          {
+            workflowRunId: runId,
+            scope: "run",
+            key: "trigger.source",
+            value: "webhook:test",
+            payload: { requestId: "req-1" },
+          },
+        ]);
+
+        // Then: It comes back from listAnnotations with all fields set
+        const annotations = await persistence.listAnnotations(runId);
+        expect(annotations).toHaveLength(1);
+        expect(annotations[0]?.key).toBe("trigger.source");
+        expect(annotations[0]?.value).toBe("webhook:test");
+        expect(annotations[0]?.payload).toEqual({ requestId: "req-1" });
+        expect(annotations[0]?.scope).toBe("run");
+        expect(annotations[0]?.attempt).toBe(0);
+        expect(annotations[0]?.createdAt).toBeInstanceOf(Date);
+      });
+
+      it("should default actor and scopeId fields to null when omitted", async () => {
+        const runId = "annotation-actor-default-run";
+        await ensureRun(runId);
+
+        await persistence.appendAnnotations([
+          { workflowRunId: runId, scope: "run", key: "k", value: "v" },
+        ]);
+
+        const [annotation] = await persistence.listAnnotations(runId);
+        expect(annotation?.actorKind).toBeNull();
+        expect(annotation?.actorId).toBeNull();
+        expect(annotation?.actorVersion).toBeNull();
+        expect(annotation?.scopeId).toBeNull();
+      });
+
+      it("should record actor and scopeId fields when supplied", async () => {
+        const runId = "annotation-actor-run";
+        await ensureRun(runId);
+
+        await persistence.appendAnnotations([
+          {
+            workflowRunId: runId,
+            scope: "stage",
+            scopeId: "stage-1",
+            key: "decision",
+            value: "approved",
+            actor: { kind: "agent", id: "agent-42", version: "v3" },
+          },
+        ]);
+
+        const [annotation] = await persistence.listAnnotations(runId);
+        expect(annotation?.actorKind).toBe("agent");
+        expect(annotation?.actorId).toBe("agent-42");
+        expect(annotation?.actorVersion).toBe("v3");
+        expect(annotation?.scopeId).toBe("stage-1");
+      });
+
+      it("should list annotations ordered by createdAt ascending", async () => {
+        const runId = "annotation-order-run";
+        await ensureRun(runId);
+
+        // Given: Three annotations appended in one batch (same createdAt
+        // tick on some adapters) -- insertion order is the tiebreak,
+        // matching the id-ordering documented on listAnnotations.
+        await persistence.appendAnnotations([
+          { workflowRunId: runId, scope: "run", key: "first", value: 1 },
+          { workflowRunId: runId, scope: "run", key: "second", value: 2 },
+          { workflowRunId: runId, scope: "run", key: "third", value: 3 },
+        ]);
+
+        const annotations = await persistence.listAnnotations(runId);
+        expect(annotations.map((a) => a.key)).toEqual([
+          "first",
+          "second",
+          "third",
+        ]);
+      });
+
+      it("should dedupe rows with the same (workflowRunId, key, idempotencyKey)", async () => {
+        const runId = "annotation-idempotency-run";
+        await ensureRun(runId);
+
+        const input = {
+          workflowRunId: runId,
+          scope: "run",
+          key: "dedup-key",
+          value: "first-write",
+          idempotencyKey: "idem-1",
+        };
+
+        // When: Appending the same idempotency key twice (e.g. a retried
+        // stage-completion transaction)
+        await persistence.appendAnnotations([input]);
+        await persistence.appendAnnotations([
+          { ...input, value: "second-write-should-be-skipped" },
+        ]);
+
+        // Then: Only the first write is kept
+        const annotations = await persistence.listAnnotations(runId, {
+          key: "dedup-key",
+        });
+        expect(annotations).toHaveLength(1);
+        expect(annotations[0]?.value).toBe("first-write");
+      });
+
+      it("should NOT dedupe rows with a null idempotencyKey", async () => {
+        const runId = "annotation-null-idempotency-run";
+        await ensureRun(runId);
+
+        // Given/When: Two annotations with the same key but no
+        // idempotencyKey (the unique constraint does not apply to NULLs)
+        await persistence.appendAnnotations([
+          { workflowRunId: runId, scope: "run", key: "repeatable", value: 1 },
+          { workflowRunId: runId, scope: "run", key: "repeatable", value: 2 },
+        ]);
+
+        // Then: Both rows are kept
+        const annotations = await persistence.listAnnotations(runId, {
+          key: "repeatable",
+        });
+        expect(annotations).toHaveLength(2);
+      });
+
+      it("should filter by exact key", async () => {
+        const runId = "annotation-filter-key-run";
+        await ensureRun(runId);
+        await persistence.appendAnnotations([
+          { workflowRunId: runId, scope: "run", key: "a.b", value: 1 },
+          { workflowRunId: runId, scope: "run", key: "a.c", value: 2 },
+        ]);
+
+        const annotations = await persistence.listAnnotations(runId, {
+          key: "a.b",
+        });
+        expect(annotations).toHaveLength(1);
+        expect(annotations[0]?.key).toBe("a.b");
+      });
+
+      it("should filter by keyPrefix", async () => {
+        const runId = "annotation-filter-prefix-run";
+        await ensureRun(runId);
+        await persistence.appendAnnotations([
+          { workflowRunId: runId, scope: "run", key: "cost.input", value: 1 },
+          { workflowRunId: runId, scope: "run", key: "cost.output", value: 2 },
+          { workflowRunId: runId, scope: "run", key: "other", value: 3 },
+        ]);
+
+        const annotations = await persistence.listAnnotations(runId, {
+          keyPrefix: "cost.",
+        });
+        expect(annotations).toHaveLength(2);
+        expect(annotations.map((a) => a.key).sort()).toEqual([
+          "cost.input",
+          "cost.output",
+        ]);
+      });
+
+      it("should filter by scope and scopeId", async () => {
+        const runId = "annotation-filter-scope-run";
+        await ensureRun(runId);
+        await persistence.appendAnnotations([
+          { workflowRunId: runId, scope: "run", key: "k", value: 1 },
+          {
+            workflowRunId: runId,
+            scope: "stage",
+            scopeId: "stage-a",
+            key: "k",
+            value: 2,
+          },
+          {
+            workflowRunId: runId,
+            scope: "stage",
+            scopeId: "stage-b",
+            key: "k",
+            value: 3,
+          },
+        ]);
+
+        const stageAnnotations = await persistence.listAnnotations(runId, {
+          scope: "stage",
+        });
+        expect(stageAnnotations).toHaveLength(2);
+
+        const stageAOnly = await persistence.listAnnotations(runId, {
+          scope: "stage",
+          scopeId: "stage-a",
+        });
+        expect(stageAOnly).toHaveLength(1);
+        expect(stageAOnly[0]?.value).toBe(2);
+      });
+
+      it("should filter by actorId and actorKind", async () => {
+        const runId = "annotation-filter-actor-run";
+        await ensureRun(runId);
+        await persistence.appendAnnotations([
+          {
+            workflowRunId: runId,
+            scope: "run",
+            key: "k",
+            value: 1,
+            actor: { kind: "agent", id: "agent-1" },
+          },
+          {
+            workflowRunId: runId,
+            scope: "run",
+            key: "k",
+            value: 2,
+            actor: { kind: "user", id: "user-1" },
+          },
+        ]);
+
+        const byActorId = await persistence.listAnnotations(runId, {
+          actorId: "agent-1",
+        });
+        expect(byActorId).toHaveLength(1);
+        expect(byActorId[0]?.value).toBe(1);
+
+        const byActorKind = await persistence.listAnnotations(runId, {
+          actorKind: "user",
+        });
+        expect(byActorKind).toHaveLength(1);
+        expect(byActorKind[0]?.value).toBe(2);
+      });
+
+      it("should filter by attempt", async () => {
+        const runId = "annotation-filter-attempt-run";
+        await ensureRun(runId);
+        await persistence.appendAnnotations([
+          {
+            workflowRunId: runId,
+            scope: "run",
+            key: "k",
+            value: 1,
+            attempt: 0,
+          },
+          {
+            workflowRunId: runId,
+            scope: "run",
+            key: "k",
+            value: 2,
+            attempt: 1,
+          },
+        ]);
+
+        const attempt1 = await persistence.listAnnotations(runId, {
+          attempt: 1,
+        });
+        expect(attempt1).toHaveLength(1);
+        expect(attempt1[0]?.value).toBe(2);
+      });
+
+      it("should filter by since/until", async () => {
+        const runId = "annotation-filter-time-run";
+        await ensureRun(runId);
+        await persistence.appendAnnotations([
+          { workflowRunId: runId, scope: "run", key: "k", value: 1 },
+        ]);
+
+        const before = new Date(Date.now() - 60_000);
+        const after = new Date(Date.now() + 60_000);
+
+        const withinRange = await persistence.listAnnotations(runId, {
+          since: before,
+          until: after,
+        });
+        expect(withinRange).toHaveLength(1);
+
+        const outsideRange = await persistence.listAnnotations(runId, {
+          since: after,
+        });
+        expect(outsideRange).toHaveLength(0);
+      });
+
+      it("should respect the limit parameter", async () => {
+        const runId = "annotation-limit-run";
+        await ensureRun(runId);
+        await persistence.appendAnnotations(
+          Array.from({ length: 5 }, (_, i) => ({
+            workflowRunId: runId,
+            scope: "run",
+            key: `k${i}`,
+            value: i,
+          })),
+        );
+
+        const limited = await persistence.listAnnotations(runId, { limit: 2 });
+        expect(limited).toHaveLength(2);
+      });
+
+      it("should handle an empty array gracefully", async () => {
+        await expect(persistence.appendAnnotations([])).resolves.not.toThrow();
+      });
+
+      it("should clear workflowStageRecordId on the surviving annotation when its stage is deleted", async () => {
+        // Given: A stage and an annotation scoped to it. `deleteStage` is
+        // called by the kernel's run.rerunFrom handler, so this mirrors a
+        // rerun: prior annotations must survive with the FK cleared, not
+        // be deleted or orphaned with a dangling reference.
+        const runId = "annotation-stage-delete-run";
+        const stage = await persistence.createStage(
+          await createStageData({ workflowRunId: runId, stageId: "s1" }),
+        );
+        await persistence.appendAnnotations([
+          {
+            workflowRunId: runId,
+            workflowStageRecordId: stage.id,
+            scope: "stage",
+            scopeId: "s1",
+            key: "k",
+            value: 1,
+          },
+        ]);
+
+        // When: The stage is deleted
+        await persistence.deleteStage(stage.id);
+
+        // Then: The annotation survives with workflowStageRecordId cleared
+        // (mirrors the schema's onDelete: SetNull)
+        const annotations = await persistence.listAnnotations(runId);
+        expect(annotations).toHaveLength(1);
+        expect(annotations[0]?.workflowStageRecordId).toBeNull();
       });
     });
 
@@ -1288,9 +1682,9 @@ export function aiCallLoggerConformanceSuite(
   describe(`I want ${name} to conform to AICallLogger interface`, () => {
     let logger: ReturnType<AILoggerFactory>;
 
-    beforeEach(() => {
+    beforeEach(async () => {
       logger = factory();
-      logger.clear?.();
+      await resetFixture(logger);
     });
 
     function createCallInput(
@@ -1404,6 +1798,11 @@ export function aiCallLoggerConformanceSuite(
             cost: 0.02,
           }),
         );
+        // logCall is documented fire-and-forget (see AICallLogger.logCall)
+        // -- a real adapter logging to a database may not have committed
+        // the write yet when logCall() returns, so give it a moment
+        // before reading it back via getStats.
+        await sleep(100);
 
         // When: Getting stats
         const stats = await logger.getStats("workflow.stats");
@@ -1458,6 +1857,9 @@ export function aiCallLoggerConformanceSuite(
             cost: 0.05,
           }),
         );
+        // logCall is fire-and-forget -- see the equivalent wait in
+        // "should aggregate stats for matching topic prefix" above.
+        await sleep(100);
 
         // When: Getting stats
         const stats = await logger.getStats("workflow.model");
@@ -1491,9 +1893,9 @@ export function jobQueueConformanceSuite(
   describe(`I want ${name} to conform to JobQueue interface`, () => {
     let queue: ReturnType<JobQueueFactory>;
 
-    beforeEach(() => {
+    beforeEach(async () => {
       queue = factory();
-      queue.clear?.();
+      await resetFixture(queue);
     });
 
     function createJobInput(
@@ -1662,19 +2064,27 @@ export function jobQueueConformanceSuite(
 
       it("should retry a job when shouldRetry is true", async () => {
         // Given: A dequeued job
+        const runId = "retry-run";
         const jobId = await queue.enqueue(
-          createJobInput({ stageId: "retry-test" }),
+          createJobInput({ workflowRunId: runId, stageId: "retry-test" }),
         );
-        await queue.dequeue();
+        const dequeued = await queue.dequeue();
+        expect(dequeued?.attempt).toBe(1);
 
         // When: Failing with retry
         await queue.fail(jobId, "Recoverable error", true);
 
-        // Then: Job can be dequeued again
-        const retried = await queue.dequeue();
-        expect(retried).not.toBeNull();
-        expect(retried?.stageId).toBe("retry-test");
-        expect(retried?.attempt).toBeGreaterThan(1);
+        // Then: The job is back in a retryable (PENDING, not permanently
+        // FAILED) state with its error recorded. Checked via
+        // getJobsByWorkflowRun rather than an immediate re-dequeue --
+        // adapters may apply a backoff delay before a retried job becomes
+        // dequeueable again (PrismaJobQueue does: 2^attempt seconds;
+        // InMemoryJobQueue doesn't), so "immediately re-dequeueable" isn't
+        // a portable assertion across adapters.
+        const [job] = await queue.getJobsByWorkflowRun(runId);
+        expect(job?.status).toBe("PENDING");
+        expect(job?.attempt).toBe(1);
+        expect(job?.lastError).toBe("Recoverable error");
       });
     });
 
@@ -1687,6 +2097,92 @@ export function jobQueueConformanceSuite(
         // Then: Returns a number
         expect(typeof released).toBe("number");
         expect(released).toBeGreaterThanOrEqual(0);
+      });
+    });
+
+    describe("touchJob operation", () => {
+      it("should advance lockedAt without changing status", async () => {
+        // Given: A dequeued (RUNNING/locked) job
+        const runId = "touch-advances-run";
+        const jobId = await queue.enqueue(
+          createJobInput({ workflowRunId: runId, stageId: "touch-advances" }),
+        );
+        await queue.dequeue();
+        const [before] = await queue.getJobsByWorkflowRun(runId);
+        expect(before?.status).toBe("RUNNING");
+        expect(before?.lockedAt).not.toBeNull();
+
+        // When: Touching the job after some real time has passed
+        await sleep(30);
+        await queue.touchJob(jobId);
+
+        // Then: lockedAt moved forward and status is unchanged
+        const [after] = await queue.getJobsByWorkflowRun(runId);
+        expect(after?.status).toBe("RUNNING");
+        expect(after?.lockedAt).not.toBeNull();
+        expect(after?.lockedAt?.getTime() ?? 0).toBeGreaterThan(
+          before?.lockedAt?.getTime() ?? 0,
+        );
+      });
+
+      it("should not touch a job that isn't RUNNING", async () => {
+        // Given: A job that was never dequeued (still PENDING)
+        const runId = "touch-noop-run";
+        const jobId = await queue.enqueue(
+          createJobInput({ workflowRunId: runId, stageId: "touch-noop" }),
+        );
+
+        // When/Then: Touching it does not throw and leaves it PENDING
+        await expect(queue.touchJob(jobId)).resolves.not.toThrow();
+        const [job] = await queue.getJobsByWorkflowRun(runId);
+        expect(job?.status).toBe("PENDING");
+      });
+
+      it("a touched (heartbeating) job survives releaseStaleJobs while an untouched stale job is reclaimed", async () => {
+        // Given: Two jobs locked at roughly the same time (the
+        // heartbeat-vs-reaper race, at the queue level -- mirrors
+        // NodeHost's periodic touchJob heartbeat racing lease.reapStale)
+        const survivorRunId = "touch-survivor-run";
+        const victimRunId = "touch-victim-run";
+        const survivorId = await queue.enqueue(
+          createJobInput({
+            workflowRunId: survivorRunId,
+            stageId: "heartbeat-survivor",
+          }),
+        );
+        await queue.dequeue();
+        const victimId = await queue.enqueue(
+          createJobInput({
+            workflowRunId: victimRunId,
+            stageId: "heartbeat-victim",
+          }),
+        );
+        await queue.dequeue();
+
+        // When: Real time passes, then only the survivor is heartbeated
+        // (touched) right before the stale-lease reap runs. Margins are
+        // generous (well beyond typical DB round-trip / CI scheduling
+        // jitter) since this assertion depends on real elapsed time --
+        // neither JobQueue nor its factory expose an injectable clock.
+        await sleep(200);
+        await queue.touchJob(survivorId);
+        const released = await queue.releaseStaleJobs(100);
+
+        // Then: The untouched job was reclaimed (back to PENDING, lock
+        // cleared); the freshly-touched job is untouched by the reap and
+        // stays RUNNING with its worker lock intact
+        expect(released).toBeGreaterThanOrEqual(1);
+
+        const [victim] = await queue.getJobsByWorkflowRun(victimRunId);
+        expect(victim?.status).toBe("PENDING");
+        expect(victim?.lockedAt).toBeNull();
+        expect(victim?.workerId).toBeNull();
+
+        const [survivor] = await queue.getJobsByWorkflowRun(survivorRunId);
+        expect(survivor?.status).toBe("RUNNING");
+        expect(survivor?.lockedAt).not.toBeNull();
+        expect(survivor?.id).toBe(survivorId);
+        expect(victim?.id).toBe(victimId);
       });
     });
   });

@@ -74,7 +74,7 @@ export interface WorkflowRunRecord {
   workflowId: string;
   workflowName: string;
   workflowType: string;
-  status: WorkflowStatus;
+  status: Status;
   startedAt: Date | null;
   completedAt: Date | null;
   duration: number | null;
@@ -105,7 +105,7 @@ export interface WorkflowStageRecord {
    * of the same logical stage.
    */
   attempt: number;
-  status: WorkflowStageStatus;
+  status: Status;
   startedAt: Date | null;
   completedAt: Date | null;
   duration: number | null;
@@ -245,7 +245,7 @@ export interface JobRecord {
   workflowRunId: string;
   workflowId: string;
   stageId: string;
-  status: JobStatus;
+  status: Status;
   priority: number;
   workerId: string | null;
   lockedAt: Date | null;
@@ -275,7 +275,7 @@ export interface CreateRunInput {
 }
 
 export interface UpdateRunInput {
-  status?: WorkflowStatus;
+  status?: Status;
   startedAt?: Date;
   completedAt?: Date | null;
   duration?: number | null;
@@ -293,14 +293,14 @@ export interface CreateStageInput {
   executionGroup: number;
   /** Rerun generation. Defaults to 0. Set by `run.rerunFrom` for recreated stages. */
   attempt?: number;
-  status?: WorkflowStageStatus;
+  status?: Status;
   startedAt?: Date;
   config?: unknown;
   inputData?: unknown;
 }
 
 export interface UpdateStageInput {
-  status?: WorkflowStageStatus;
+  status?: Status;
   startedAt?: Date;
   completedAt?: Date;
   duration?: number;
@@ -426,12 +426,41 @@ export interface DequeueResult {
 }
 
 // ============================================================================
-// WorkflowPersistence Interface
+// PersistenceCore / ArtifactPersistence / WorkflowPersistence Interfaces
 // ============================================================================
+//
+// `WorkflowPersistence` (41 methods) is split into two focused interfaces:
+//
+//   - `PersistenceCore` (~26 methods) -- everything the kernel's handlers/
+//     helpers and the host packages actually call. `kernel/ports.ts`'s
+//     `Persistence` port derives from this instead of hand-duplicating
+//     signatures, so the kernel's real requirement is visible directly in
+//     the type graph.
+//   - `ArtifactPersistence` (7 methods) -- artifact/blob-adjacent methods.
+//     The kernel does NOT call any of these; all artifact I/O goes through
+//     the `BlobStore` port instead (see
+//     `kernel/helpers/create-storage-shim.ts`, which adapts `BlobStore` to
+//     the `StageStorage` surface stages see, and
+//     `kernel/helpers/save-stage-output.ts`). @deprecated as a group,
+//     removal at 1.0.
+//
+// `WorkflowPersistence` still `extends PersistenceCore, ArtifactPersistence`
+// (plus a handful of legacy query methods below with no kernel call site,
+// kept directly on `WorkflowPersistence` since they're neither "core" nor
+// artifact-related), so existing implementers and consumers of the full
+// interface are unaffected by this split -- it only adds two new named
+// subsets, it removes nothing.
 
-export interface WorkflowPersistence {
-  /** Execute operations within a transaction boundary. */
-  withTransaction<T>(fn: (tx: WorkflowPersistence) => Promise<T>): Promise<T>;
+export interface PersistenceCore {
+  /**
+   * Execute operations within a transaction boundary. The callback
+   * receives a `PersistenceCore`-scoped handle, which is all the kernel
+   * ever needs inside a transaction. (`WorkflowPersistence` redeclares
+   * this method with a `WorkflowPersistence`-scoped `tx` so existing
+   * callers that use artifact methods inside a transaction are
+   * unaffected -- see below.)
+   */
+  withTransaction<T>(fn: (tx: PersistenceCore) => Promise<T>): Promise<T>;
 
   // WorkflowRun operations
   createRun(data: CreateRunInput): Promise<WorkflowRunRecord>;
@@ -444,18 +473,8 @@ export interface WorkflowPersistence {
    */
   updateRun(id: string, data: UpdateRunInput): Promise<void>;
   getRun(id: string): Promise<WorkflowRunRecord | null>;
-  getRunStatus(id: string): Promise<WorkflowStatus | null>;
-  getRunsByStatus(status: WorkflowStatus): Promise<WorkflowRunRecord[]>;
+  getRunStatus(id: string): Promise<Status | null>;
   getStuckRuns(stuckSince: Date): Promise<WorkflowRunRecord[]>;
-
-  /**
-   * Atomically claim a pending workflow run for processing.
-   * Uses atomic update with WHERE status = 'PENDING' to prevent race conditions.
-   *
-   * @param id - The workflow run ID to claim
-   * @returns true if successfully claimed, false if already claimed by another worker
-   */
-  claimPendingRun(id: string): Promise<boolean>;
 
   /**
    * Atomically find and claim the next pending workflow run.
@@ -472,13 +491,7 @@ export interface WorkflowPersistence {
   createStage(data: CreateStageInput): Promise<WorkflowStageRecord>;
   upsertStage(data: UpsertStageInput): Promise<WorkflowStageRecord>;
   updateStage(id: string, data: UpdateStageInput): Promise<void>;
-  updateStageByRunAndStageId(
-    workflowRunId: string,
-    stageId: string,
-    data: UpdateStageInput,
-  ): Promise<void>;
   getStage(runId: string, stageId: string): Promise<WorkflowStageRecord | null>;
-  getStageById(id: string): Promise<WorkflowStageRecord | null>;
   /**
    * Ordered by `executionGroup` (actual execution/dependency order), with
    * `stageNumber` (definition order) as a tiebreaker for stages that share
@@ -486,50 +499,22 @@ export interface WorkflowPersistence {
    */
   getStagesByRun(
     runId: string,
-    options?: { status?: WorkflowStageStatus; orderBy?: "asc" | "desc" },
+    options?: { status?: Status; orderBy?: "asc" | "desc" },
   ): Promise<WorkflowStageRecord[]>;
   getSuspendedStages(beforeDate: Date): Promise<WorkflowStageRecord[]>;
-  /**
-   * Find the first SUSPENDED stage whose `nextPollAt` has been explicitly
-   * cleared (set to `null`) by the orchestrator -- i.e. "ready to resume"
-   * means the poll loop already determined the suspend condition is
-   * satisfied, not merely that a poll deadline has elapsed. Use
-   * `getSuspendedStages` to find stages whose poll deadline has passed.
-   */
-  getFirstSuspendedStageReadyToResume(
-    runId: string,
-  ): Promise<WorkflowStageRecord | null>;
-  getFirstFailedStage(runId: string): Promise<WorkflowStageRecord | null>;
-  getLastCompletedStage(runId: string): Promise<WorkflowStageRecord | null>;
-  getLastCompletedStageBefore(
-    runId: string,
-    executionGroup: number,
-  ): Promise<WorkflowStageRecord | null>;
   deleteStage(id: string): Promise<void>;
 
   // WorkflowLog operations
   createLog(data: CreateLogInput): Promise<void>;
-
-  // WorkflowArtifact operations (for StageStorage)
-  saveArtifact(data: SaveArtifactInput): Promise<void>;
-  /**
-   * Load an artifact's stored data. Returns `undefined` (not a throw) when
-   * no artifact exists for `(runId, key)` -- callers that need to
-   * distinguish "missing" from "present but empty" should check
-   * `hasArtifact` first.
-   */
-  loadArtifact(runId: string, key: string): Promise<unknown>;
-  hasArtifact(runId: string, key: string): Promise<boolean>;
-  deleteArtifact(runId: string, key: string): Promise<void>;
-  listArtifacts(runId: string): Promise<WorkflowArtifactRecord[]>;
-  getStageIdForArtifact(runId: string, stageId: string): Promise<string | null>;
 
   // WorkflowAnnotation operations
   /**
    * Append one or more annotations. Designed to be called both standalone
    * (fire-and-forget from external attach) and inside an existing
    * transaction (buffered during stage execution, flushed in the
-   * stage-completion transaction).
+   * stage-completion transaction) -- called from `run.create`, external
+   * attach, and the stage-completion transactions in `job-execute` and
+   * `stage-poll-suspended`.
    *
    * Rows with the same `(workflowRunId, key, idempotencyKey)` are deduped
    * via the unique constraint; duplicates are silently skipped.
@@ -544,14 +529,6 @@ export interface WorkflowPersistence {
     workflowRunId: string,
     filters?: AnnotationFilters,
   ): Promise<WorkflowAnnotationRecord[]>;
-
-  // Stage output convenience methods (replaces separate StageStorage)
-  saveStageOutput(
-    runId: string,
-    workflowType: string,
-    stageId: string,
-    output: unknown,
-  ): Promise<string>;
 
   // Outbox DLQ operations
   /** Increment retry count for a failed outbox event. Returns new count. */
@@ -609,6 +586,149 @@ export interface WorkflowPersistence {
 }
 
 // ============================================================================
+// ArtifactPersistence Interface
+// ============================================================================
+
+/**
+ * Artifact/blob-adjacent persistence methods (7 total).
+ *
+ * @deprecated The kernel does not call any of these -- all artifact I/O
+ * goes through the `BlobStore` port instead (see
+ * `kernel/helpers/create-storage-shim.ts`, `kernel/helpers/save-stage-output.ts`).
+ * Kept on `WorkflowPersistence` for backward compatibility with existing
+ * implementers/consumers. Removal at 1.0.
+ */
+export interface ArtifactPersistence {
+  /** @deprecated Unused by the kernel -- use the BlobStore port instead. Removal at 1.0. */
+  saveArtifact(data: SaveArtifactInput): Promise<void>;
+  /**
+   * Load an artifact's stored data. Returns `undefined` (not a throw) when
+   * no artifact exists for `(runId, key)` -- callers that need to
+   * distinguish "missing" from "present but empty" should check
+   * `hasArtifact` first.
+   *
+   * @deprecated Unused by the kernel -- use the BlobStore port instead. Removal at 1.0.
+   */
+  loadArtifact(runId: string, key: string): Promise<unknown>;
+  /** @deprecated Unused by the kernel -- use the BlobStore port instead. Removal at 1.0. */
+  hasArtifact(runId: string, key: string): Promise<boolean>;
+  /** @deprecated Unused by the kernel -- use the BlobStore port instead. Removal at 1.0. */
+  deleteArtifact(runId: string, key: string): Promise<void>;
+  /** @deprecated Unused by the kernel -- use the BlobStore port instead. Removal at 1.0. */
+  listArtifacts(runId: string): Promise<WorkflowArtifactRecord[]>;
+  /** @deprecated Unused by the kernel -- use the BlobStore port instead. Removal at 1.0. */
+  getStageIdForArtifact(runId: string, stageId: string): Promise<string | null>;
+
+  /**
+   * @deprecated Unused by the kernel -- stage output is persisted through
+   * the BlobStore port (see `kernel/helpers/save-stage-output.ts`).
+   * Removal at 1.0.
+   */
+  saveStageOutput(
+    runId: string,
+    workflowType: string,
+    stageId: string,
+    output: unknown,
+  ): Promise<string>;
+}
+
+// ============================================================================
+// WorkflowPersistence Interface
+// ============================================================================
+
+/**
+ * Full persistence contract (41 methods): `PersistenceCore` (what the
+ * kernel actually calls) + `ArtifactPersistence` (deprecated, `BlobStore`
+ * replaces it) + a handful of query methods below with no kernel call
+ * site that aren't artifact-related either. New implementers generally
+ * only need `PersistenceCore`; this wider interface exists for backward
+ * compatibility with existing implementers/consumers (`PrismaWorkflowPersistence`,
+ * `InMemoryWorkflowPersistence`, and any third-party adapter).
+ */
+export interface WorkflowPersistence
+  extends PersistenceCore,
+    ArtifactPersistence {
+  /**
+   * Execute operations within a transaction boundary. Redeclared (not
+   * merely inherited from `PersistenceCore`) so the callback receives the
+   * full `WorkflowPersistence` surface, including artifact methods --
+   * preserves this interface's pre-split behavior.
+   */
+  withTransaction<T>(fn: (tx: WorkflowPersistence) => Promise<T>): Promise<T>;
+
+  /** @deprecated Unused by the kernel. Removal at 1.0. */
+  getRunsByStatus(status: Status): Promise<WorkflowRunRecord[]>;
+
+  /**
+   * Atomically claim a pending workflow run for processing.
+   * Uses atomic update with WHERE status = 'PENDING' to prevent race conditions.
+   *
+   * @param id - The workflow run ID to claim
+   * @returns true if successfully claimed, false if already claimed by another worker
+   *
+   * @deprecated Unused by the kernel -- claimNextPendingRun (atomic
+   * FOR UPDATE SKIP LOCKED claim of the next pending run) is used instead.
+   * Removal at 1.0.
+   */
+  claimPendingRun(id: string): Promise<boolean>;
+
+  /**
+   * @deprecated Unused by the kernel -- resolve the stage via
+   * getStage(runId, stageId) and call updateStage(stage.id, ...) instead.
+   * Removal at 1.0.
+   */
+  updateStageByRunAndStageId(
+    workflowRunId: string,
+    stageId: string,
+    data: UpdateStageInput,
+  ): Promise<void>;
+
+  /**
+   * @deprecated Unused by the kernel -- use getStage(runId, stageId) or
+   * getStagesByRun(runId) instead. Removal at 1.0.
+   */
+  getStageById(id: string): Promise<WorkflowStageRecord | null>;
+
+  /**
+   * Find the first SUSPENDED stage whose `nextPollAt` has been explicitly
+   * cleared (set to `null`) by the orchestrator -- i.e. "ready to resume"
+   * means the poll loop already determined the suspend condition is
+   * satisfied, not merely that a poll deadline has elapsed. Use
+   * `getSuspendedStages` to find stages whose poll deadline has passed.
+   *
+   * @deprecated Unused by the kernel -- use
+   * getStagesByRun(runId, { status: "SUSPENDED" }) and filter by
+   * nextPollAt === null instead. Removal at 1.0.
+   */
+  getFirstSuspendedStageReadyToResume(
+    runId: string,
+  ): Promise<WorkflowStageRecord | null>;
+
+  /**
+   * @deprecated Unused by the kernel -- use
+   * getStagesByRun(runId, { status: "FAILED" }) instead. Removal at 1.0.
+   */
+  getFirstFailedStage(runId: string): Promise<WorkflowStageRecord | null>;
+
+  /**
+   * @deprecated Unused by the kernel -- use
+   * getStagesByRun(runId, { status: "COMPLETED", orderBy: "desc" })
+   * instead. Removal at 1.0.
+   */
+  getLastCompletedStage(runId: string): Promise<WorkflowStageRecord | null>;
+
+  /**
+   * @deprecated Unused by the kernel -- use
+   * getStagesByRun(runId, { status: "COMPLETED", orderBy: "desc" }) and
+   * filter by executionGroup instead. Removal at 1.0.
+   */
+  getLastCompletedStageBefore(
+    runId: string,
+    executionGroup: number,
+  ): Promise<WorkflowStageRecord | null>;
+}
+
+// ============================================================================
 // AICallLogger Interface
 // ============================================================================
 
@@ -651,7 +771,10 @@ export interface AICallLogger {
 
 export interface JobQueue {
   /**
-   * Add a new job to the queue
+   * Add a new job to the queue.
+   *
+   * @deprecated Unused by the kernel -- enqueueParallel is used even for
+   * single-job enqueues. Removal at 1.0.
    */
   enqueue(options: EnqueueJobInput): Promise<string>;
 

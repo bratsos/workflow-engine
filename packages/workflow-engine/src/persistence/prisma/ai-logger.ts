@@ -11,11 +11,12 @@ import type {
   AIHelperStats,
   CreateAICallInput,
 } from "../interface";
+import type { EnginePrismaClient } from "./prisma-client-type";
 
 const logger = createLogger("AICallLogger");
 
-// Type for prisma client - using any for flexibility
-type PrismaClient = any;
+// Structural client type -- see prisma-client-type.ts.
+type PrismaClient = EnginePrismaClient;
 
 export class PrismaAICallLogger implements AICallLogger {
   constructor(private readonly prisma: PrismaClient) {}
