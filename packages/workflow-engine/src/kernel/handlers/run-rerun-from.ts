@@ -11,6 +11,7 @@
 
 import type { RunRerunFromCommand, RunRerunFromResult } from "../commands";
 import type { KernelEvent } from "../events";
+import { prepareExecutionGroup } from "../helpers/index.js";
 import type { HandlerResult, KernelDeps } from "../kernel";
 
 export async function handleRunRerunFrom(
@@ -68,18 +69,6 @@ export async function handleRunRerunFrom(
   );
   const deletedStageIds = stagesToDelete.map((s) => s.stageId);
 
-  // Capture the highest attempt across the stages we're about to delete.
-  // New stage records will be created with attempt = (max prior + 1) so
-  // annotations from the new execution can be distinguished from those
-  // surviving the rerun (annotations have `onDelete: SetNull` on the
-  // stage relation, so their attempt value sticks even though their
-  // workflowStageRecordId is nulled).
-  const priorMaxAttempt = stagesToDelete.reduce(
-    (max, s) => (s.attempt > max ? s.attempt : max),
-    0,
-  );
-  const newAttempt = priorMaxAttempt + 1;
-
   // 9. Collect blob prefixes for stages being removed. Deletion is
   // deferred to _postCommit (see below) — deleting mid-transaction would
   // permanently lose the blobs even if the transaction later rolls back
@@ -106,20 +95,24 @@ export async function handleRunRerunFrom(
     totalTokens: 0,
   });
 
-  // 12. Create new stage records for the target execution group
-  const targetStages = workflow.getStagesInExecutionGroup(targetGroup);
-  for (const stage of targetStages) {
-    await deps.persistence.createStage({
-      workflowRunId,
-      stageId: stage.id,
-      stageName: stage.name,
-      stageNumber: workflow.getStageIndex(stage.id) + 1,
-      executionGroup: targetGroup,
-      attempt: newAttempt,
-      status: "PENDING",
-      config: (run.config as any)?.[stage.id] || {},
-    });
-  }
+  // 12. Create new stage records for the target execution group. `create`
+  // mode is safe (no upsert lookup needed): the target group's prior
+  // records were just deleted above, so every stage here is guaranteed
+  // fresh, and every one of them is enqueued unconditionally
+  // (filterPending: false) since none can already be RUNNING/COMPLETED.
+  // attemptMode "max+1" over the just-deleted `stagesToDelete` gives new
+  // stage records attempt = (max prior + 1), so annotations from the new
+  // execution can be distinguished from those surviving the rerun
+  // (annotations have `onDelete: SetNull` on the stage relation, so their
+  // attempt value sticks even though their workflowStageRecordId is
+  // nulled).
+  const enqueue = await prepareExecutionGroup(run, workflow, deps, {
+    groupIndex: targetGroup,
+    attemptMode: "max+1",
+    createMode: "create",
+    filterPending: false,
+    attemptSourceStages: stagesToDelete,
+  });
 
   // 13. Emit workflow:started event (restarted)
   events.push({
@@ -149,15 +142,7 @@ export async function handleRunRerunFrom(
         }
       }
 
-      await postDeps.jobTransport.enqueueParallel(
-        targetStages.map((stage) => ({
-          workflowRunId,
-          workflowId: run.workflowId,
-          stageId: stage.id,
-          priority: run.priority,
-          payload: { config: run.config || {} },
-        })),
-      );
+      await enqueue();
     },
   };
 }

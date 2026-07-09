@@ -1,17 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { defineStage } from "../../core/stage-factory.js";
-import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
-import { createKernel } from "../../kernel/kernel.js";
-import {
-  CollectingEventSink,
-  FakeClock,
-  InMemoryBlobStore,
-  NoopScheduler,
-} from "../../kernel/testing/index.js";
+import { WorkflowBuilder } from "../../core/workflow.js";
 import { StaleVersionError } from "../../persistence/interface.js";
-import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
-import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
+import {
+  createTestKernel,
+  InMemoryWorkflowPersistence,
+} from "../utils/index.js";
 
 function createPassthroughStage(id: string, schema: z.ZodTypeAny) {
   return defineStage({
@@ -40,43 +35,6 @@ function createTwoStageWorkflow(id: string = "test-workflow") {
     .pipe(stage1)
     .pipe(stage2)
     .build();
-}
-
-function createTestKernel(workflows: Workflow<any, any>[] = []) {
-  const persistence = new InMemoryWorkflowPersistence();
-  const blobStore = new InMemoryBlobStore();
-  const jobTransport = new InMemoryJobQueue("test-worker");
-  const eventSink = new CollectingEventSink();
-  const scheduler = new NoopScheduler();
-  const clock = new FakeClock();
-
-  const registry = new Map<string, Workflow<any, any>>();
-  for (const w of workflows) {
-    registry.set(w.id, w);
-  }
-
-  const kernel = createKernel({
-    persistence,
-    blobStore,
-    jobTransport,
-    eventSink,
-    scheduler,
-    clock,
-    registry: { getWorkflow: (id) => registry.get(id) },
-  });
-
-  const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
-  return {
-    kernel,
-    flush,
-    persistence,
-    blobStore,
-    jobTransport,
-    eventSink,
-    scheduler,
-    clock,
-    registry,
-  };
 }
 
 describe("kernel: run.transition", () => {
@@ -191,6 +149,49 @@ describe("kernel: run.transition", () => {
 
     // Verify job was enqueued
     expect(jobTransport.getAllJobs()).toHaveLength(1);
+  });
+
+  it("propagates the run's max existing stage attempt to a newly-created downstream group", async () => {
+    // Regression test: prepareExecutionGroup's attemptMode "max" for
+    // run.transition. Simulates group 1 having already been bumped to
+    // attempt 2 by a prior run.rerunFrom — the newly-created group-2 stage
+    // must inherit that same attempt (not reset to 0), so annotations from
+    // this rerun span share one attempt value.
+    const workflow = createTwoStageWorkflow();
+    const { kernel, persistence } = createTestKernel([workflow]);
+
+    const createResult = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "key-attempt-propagation",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+
+    await persistence.updateRun(createResult.workflowRunId, {
+      status: "RUNNING",
+    });
+
+    await persistence.createStage({
+      workflowRunId: createResult.workflowRunId,
+      stageId: "stage-1",
+      stageName: "Stage stage-1",
+      stageNumber: 1,
+      executionGroup: 1,
+      status: "COMPLETED",
+      attempt: 2,
+    });
+
+    const result = await kernel.dispatch({
+      type: "run.transition",
+      workflowRunId: createResult.workflowRunId,
+    });
+
+    expect(result.action).toBe("advanced");
+
+    const stages = await persistence.getStagesByRun(createResult.workflowRunId);
+    const stage2 = stages.find((s) => s.stageId === "stage-2");
+    expect(stage2).toBeDefined();
+    expect(stage2!.attempt).toBe(2);
   });
 
   it("completes the workflow when all stages are done", async () => {

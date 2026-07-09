@@ -16,6 +16,7 @@ import {
   createAnnotationBuffer,
   createStorageShim,
   normalizeAnnotateArgs,
+  toErrorMessage,
 } from "../helpers/index.js";
 import type {
   ActivityExecutor,
@@ -47,6 +48,23 @@ export function createLocalExecutor(): ActivityExecutor {
       const progressEvents: KernelEvent[] = [];
       const annotationBuffer = createAnnotationBuffer();
 
+      // Build log function — fire-and-forget, written live during execute
+      const logFn = async (
+        level: any,
+        message: string,
+        meta?: Record<string, unknown>,
+      ) => {
+        await deps.persistence
+          .createLog({
+            workflowRunId,
+            workflowStageId: stageRecordId,
+            level: level as any,
+            message,
+            metadata: meta,
+          })
+          .catch(() => {});
+      };
+
       try {
         // Validate input
         const validatedInput = stageDef.inputSchema.parse(rawInput);
@@ -57,26 +75,14 @@ export function createLocalExecutor(): ActivityExecutor {
           if (stageDef.configSchema) {
             stageConfig = stageDef.configSchema.parse(stageConfig);
           }
-        } catch {
+        } catch (configError) {
           // Fall back to raw config on parse failure
+          await logFn(
+            "WARN",
+            `Stage ${stageId} config failed schema validation; falling back to raw config`,
+            { error: toErrorMessage(configError) },
+          );
         }
-
-        // Build log function — fire-and-forget, written live during execute
-        const logFn = async (
-          level: any,
-          message: string,
-          meta?: Record<string, unknown>,
-        ) => {
-          await deps.persistence
-            .createLog({
-              workflowRunId,
-              workflowStageId: stageRecordId,
-              level: level as any,
-              message,
-              metadata: meta,
-            })
-            .catch(() => {});
-        };
 
         // Build annotate function — pushes to buffer
         const annotateFn = ((...args: unknown[]) => {
@@ -139,7 +145,7 @@ export function createLocalExecutor(): ActivityExecutor {
           logs: [],
         };
       } catch (e) {
-        const error = e instanceof Error ? e.message : String(e);
+        const error = toErrorMessage(e);
         // Zod input/config validation errors are deterministic — retrying
         // the same rawInput will fail identically, so mark non-retryable
         // rather than let hosts burn retry attempts on a doomed job.

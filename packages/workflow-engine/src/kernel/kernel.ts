@@ -30,18 +30,18 @@ import type {
 } from "../persistence/interface";
 import type {
   CommandResult,
-  JobExecuteCommand,
+  JobExecuteResult,
   KernelCommand,
-  LeaseReapStaleCommand,
-  OutboxFlushCommand,
-  PluginReplayDLQCommand,
-  RunCancelCommand,
-  RunClaimPendingCommand,
-  RunCreateCommand,
-  RunReapStuckCommand,
-  RunRerunFromCommand,
-  RunTransitionCommand,
-  StagePollSuspendedCommand,
+  LeaseReapStaleResult,
+  OutboxFlushResult,
+  PluginReplayDLQResult,
+  RunCancelResult,
+  RunClaimPendingResult,
+  RunCreateResult,
+  RunReapStuckResult,
+  RunRerunFromResult,
+  RunTransitionResult,
+  StagePollSuspendedResult,
 } from "./commands";
 import { IdempotencyInProgressError } from "./errors";
 import type { KernelEvent } from "./events";
@@ -85,7 +85,12 @@ export interface KernelConfig {
   blobStore: BlobStore;
   jobTransport: JobTransport;
   eventSink: EventSink;
-  scheduler: Scheduler;
+  /**
+   * @deprecated The Scheduler port is unused by the kernel (zero
+   * `schedule()`/`cancel()` call sites). Omit it — the kernel supplies an
+   * internal no-op. Will be removed at 1.0.
+   */
+  scheduler?: Scheduler;
   clock: Clock;
   registry: WorkflowRegistry;
   executor?: ActivityExecutor;
@@ -155,7 +160,7 @@ export interface KernelDeps {
   blobStore: BlobStore;
   jobTransport: JobTransport;
   eventSink: EventSink;
-  scheduler: Scheduler;
+  scheduler?: Scheduler;
   clock: Clock;
   registry: WorkflowRegistry;
   executor: ActivityExecutor;
@@ -171,7 +176,7 @@ export type HandlerResult<T> = T & {
    * Optional side effect to run only after the enclosing transaction has
    * committed — e.g. deleting blob artifacts that a rollback could not
    * bring back. Handlers routed through the kernel's generic transaction
-   * path (see the `switch` in `dispatch`) may set this instead of
+   * path (see the `switch` in `dispatchAny`) may set this instead of
    * performing the side effect inline mid-transaction.
    */
   _postCommit?: (deps: KernelDeps) => Promise<unknown>;
@@ -189,23 +194,50 @@ function getIdempotencyKey(command: KernelCommand): string | undefined {
   return undefined;
 }
 
+/** Union of every command's result type — `dispatchAny`'s return type. */
+type AnyCommandResult =
+  | RunCreateResult
+  | RunClaimPendingResult
+  | RunTransitionResult
+  | RunCancelResult
+  | RunRerunFromResult
+  | JobExecuteResult
+  | StagePollSuspendedResult
+  | LeaseReapStaleResult
+  | OutboxFlushResult
+  | PluginReplayDLQResult
+  | RunReapStuckResult;
+
+/** Strip the internal `_events`/`_postCommit` fields off a handler result. */
+function stripEvents<R>(result: HandlerResult<R>): R {
+  const { _events, _postCommit, ...rest } = result;
+  return rest as R;
+}
+
+/**
+ * No-op `Scheduler` supplied when `KernelConfig.scheduler` is omitted. The
+ * Scheduler port is unused by the kernel today — see the @deprecated note
+ * on `kernel/testing/noop-scheduler.ts`, which remains for existing test
+ * fixtures that still construct one explicitly.
+ */
+const internalNoopScheduler: Scheduler = {
+  async schedule() {},
+  async cancel() {},
+};
+
 // ============================================================================
 // Factory
 // ============================================================================
 
 export function createKernel(config: KernelConfig): Kernel {
-  const {
-    persistence,
-    blobStore,
-    jobTransport,
-    eventSink,
-    scheduler,
-    clock,
-    registry,
-  } = config;
+  const { persistence, blobStore, jobTransport, eventSink, clock, registry } =
+    config;
 
   // Default to LocalExecutor if none provided
   const executor = config.executor ?? createLocalExecutor();
+  // The Scheduler port is unused by the kernel (see internalNoopScheduler
+  // above) — default so callers aren't required to supply one.
+  const scheduler = config.scheduler ?? internalNoopScheduler;
   const idempotencyStaleInProgressMs =
     config.idempotencyStaleInProgressMs ??
     DEFAULT_IDEMPOTENCY_STALE_IN_PROGRESS_MS;
@@ -221,31 +253,65 @@ export function createKernel(config: KernelConfig): Kernel {
     executor,
   };
 
-  async function dispatch<T extends KernelCommand>(
-    command: T,
-  ): Promise<CommandResult<T>> {
+  /**
+   * Idempotency-key choreography shared by job.execute's own transaction
+   * phasing and the generic transactional path below: acquire → replay a
+   * cached result / reject an in-progress duplicate / run `fn` then cache
+   * its result on success, releasing the key on failure so a later
+   * dispatch may retry.
+   */
+  async function withIdempotency<R>(
+    key: string | undefined,
+    commandType: string,
+    fn: () => Promise<R>,
+  ): Promise<R> {
+    if (!key) return fn();
+
+    const acquired = await persistence.acquireIdempotencyKey(key, commandType, {
+      now: clock.now(),
+      staleInProgressAfterMs: idempotencyStaleInProgressMs,
+    });
+
+    if (acquired.status === "replay") {
+      return acquired.result as R;
+    }
+    if (acquired.status === "in_progress") {
+      throw new IdempotencyInProgressError(key, commandType);
+    }
+
+    try {
+      const result = await fn();
+      await persistence.completeIdempotencyKey(key, commandType, result);
+      return result;
+    } catch (error) {
+      await persistence.releaseIdempotencyKey(key, commandType).catch(() => {});
+      throw error;
+    }
+  }
+
+  /**
+   * Concrete-union-typed dispatch core. Unlike the public `dispatch<T>`,
+   * `command` here is `KernelCommand` (not a generic type parameter), so
+   * every `command.type === "..."` / `switch (command.type)` check below
+   * narrows `command` natively — no `command as XxxCommand` casts.
+   */
+  async function dispatchAny(
+    command: KernelCommand,
+  ): Promise<AnyCommandResult> {
     // -----------------------------------------------------------------
     // outbox.flush routes directly — no outbox write, no idempotency
     // -----------------------------------------------------------------
     if (command.type === "outbox.flush") {
-      const result = await handleOutboxFlush(
-        command as OutboxFlushCommand,
-        deps,
-      );
-      const { _events: _, ...publicResult } = result;
-      return publicResult as CommandResult<T>;
+      const result = await handleOutboxFlush(command, deps);
+      return stripEvents(result);
     }
 
     // -----------------------------------------------------------------
     // plugin.replayDLQ routes directly — no outbox write, no idempotency
     // -----------------------------------------------------------------
     if (command.type === "plugin.replayDLQ") {
-      const result = await handlePluginReplayDLQ(
-        command as PluginReplayDLQCommand,
-        deps,
-      );
-      const { _events: _, ...publicResult } = result;
-      return publicResult as CommandResult<T>;
+      const result = await handlePluginReplayDLQ(command, deps);
+      return stripEvents(result);
     }
 
     // -----------------------------------------------------------------
@@ -254,12 +320,8 @@ export function createKernel(config: KernelConfig): Kernel {
     // not hold a database transaction open.
     // -----------------------------------------------------------------
     if (command.type === "stage.pollSuspended") {
-      const result = await handleStagePollSuspended(
-        command as StagePollSuspendedCommand,
-        deps,
-      );
-      const { _events: _, ...publicResult } = result;
-      return publicResult as CommandResult<T>;
+      const result = await handleStagePollSuspended(command, deps);
+      return stripEvents(result);
     }
 
     // -----------------------------------------------------------------
@@ -268,122 +330,46 @@ export function createKernel(config: KernelConfig): Kernel {
     // execution does not hold a database transaction open.
     // -----------------------------------------------------------------
     if (command.type === "job.execute") {
-      const jobCommand = command as JobExecuteCommand;
-      const jobIdempotencyKey = jobCommand.idempotencyKey;
-      let jobIdempotencyAcquired = false;
-
-      if (jobIdempotencyKey) {
-        const acquired = await persistence.acquireIdempotencyKey(
-          jobIdempotencyKey,
-          command.type,
-          {
-            now: clock.now(),
-            staleInProgressAfterMs: idempotencyStaleInProgressMs,
-          },
-        );
-        if (acquired.status === "replay") {
-          return acquired.result as CommandResult<T>;
-        }
-        if (acquired.status === "in_progress") {
-          throw new IdempotencyInProgressError(jobIdempotencyKey, command.type);
-        }
-        jobIdempotencyAcquired = true;
-      }
-
-      try {
-        const result = await handleJobExecute(jobCommand, deps);
-        const { _events: _, ...publicResult } = result;
-
-        if (jobIdempotencyKey && jobIdempotencyAcquired) {
-          await persistence.completeIdempotencyKey(
-            jobIdempotencyKey,
-            command.type,
-            publicResult,
-          );
-        }
-
-        return publicResult as CommandResult<T>;
-      } catch (error) {
-        if (jobIdempotencyKey && jobIdempotencyAcquired) {
-          await persistence
-            .releaseIdempotencyKey(jobIdempotencyKey, command.type)
-            .catch(() => {});
-        }
-        throw error;
-      }
+      return withIdempotency(command.idempotencyKey, command.type, async () => {
+        const result = await handleJobExecute(command, deps);
+        return stripEvents(result);
+      });
     }
 
     // -----------------------------------------------------------------
-    // Idempotency acquisition
+    // Every remaining command shares one transactional path: route to
+    // handler + append outbox events in one transaction.
     // -----------------------------------------------------------------
     const idempotencyKey = getIdempotencyKey(command);
-    let idempotencyAcquired = false;
 
-    if (idempotencyKey) {
-      const acquired = await persistence.acquireIdempotencyKey(
-        idempotencyKey,
-        command.type,
-        {
-          now: clock.now(),
-          staleInProgressAfterMs: idempotencyStaleInProgressMs,
-        },
-      );
+    return withIdempotency(idempotencyKey, command.type, async () => {
+      let postCommit: ((deps: KernelDeps) => Promise<unknown>) | undefined;
 
-      if (acquired.status === "replay") {
-        return acquired.result as CommandResult<T>;
-      }
-      if (acquired.status === "in_progress") {
-        throw new IdempotencyInProgressError(idempotencyKey, command.type);
-      }
-      idempotencyAcquired = true;
-    }
-
-    let postCommit: ((deps: KernelDeps) => Promise<unknown>) | undefined;
-
-    try {
-      // ---------------------------------------------------------------
-      // Route to handler + append outbox events in one transaction
-      // ---------------------------------------------------------------
       const publicResult = await persistence.withTransaction(async (tx) => {
         const txDeps: KernelDeps = { ...deps, persistence: tx };
         let result: HandlerResult<any>;
 
         switch (command.type) {
           case "run.create":
-            result = await handleRunCreate(command as RunCreateCommand, txDeps);
+            result = await handleRunCreate(command, txDeps);
             break;
           case "run.claimPending":
-            result = await handleRunClaimPending(
-              command as RunClaimPendingCommand,
-              txDeps,
-            );
+            result = await handleRunClaimPending(command, txDeps);
             break;
           case "run.transition":
-            result = await handleRunTransition(
-              command as RunTransitionCommand,
-              txDeps,
-            );
+            result = await handleRunTransition(command, txDeps);
             break;
           case "run.cancel":
-            result = await handleRunCancel(command as RunCancelCommand, txDeps);
+            result = await handleRunCancel(command, txDeps);
             break;
           case "run.rerunFrom":
-            result = await handleRunRerunFrom(
-              command as RunRerunFromCommand,
-              txDeps,
-            );
+            result = await handleRunRerunFrom(command, txDeps);
             break;
           case "lease.reapStale":
-            result = await handleLeaseReapStale(
-              command as LeaseReapStaleCommand,
-              txDeps,
-            );
+            result = await handleLeaseReapStale(command, txDeps);
             break;
           case "run.reapStuck":
-            result = await handleRunReapStuck(
-              command as RunReapStuckCommand,
-              txDeps,
-            );
+            result = await handleRunReapStuck(command, txDeps);
             break;
           default: {
             const _exhaustive: never = command;
@@ -393,11 +379,11 @@ export function createKernel(config: KernelConfig): Kernel {
           }
         }
 
-        const events = result._events as KernelEvent[];
+        const events = result._events;
         if (events.length > 0) {
           const causationId = idempotencyKey ?? crypto.randomUUID();
           const outboxEvents: CreateOutboxEventInput[] = events.map(
-            (event) => ({
+            (event: KernelEvent) => ({
               workflowRunId: event.workflowRunId,
               eventType: event.type,
               payload: event,
@@ -409,8 +395,7 @@ export function createKernel(config: KernelConfig): Kernel {
         }
 
         postCommit = result._postCommit;
-        const { _events: _, _postCommit: __, ...stripped } = result;
-        return stripped as CommandResult<T>;
+        return stripEvents(result);
       });
 
       if (postCommit) {
@@ -420,23 +405,21 @@ export function createKernel(config: KernelConfig): Kernel {
         await postCommit(deps);
       }
 
-      if (idempotencyKey && idempotencyAcquired) {
-        await persistence.completeIdempotencyKey(
-          idempotencyKey,
-          command.type,
-          publicResult,
-        );
-      }
-
       return publicResult;
-    } catch (error) {
-      if (idempotencyKey && idempotencyAcquired) {
-        await persistence
-          .releaseIdempotencyKey(idempotencyKey, command.type)
-          .catch(() => {});
-      }
-      throw error;
-    }
+    });
+  }
+
+  /**
+   * Public dispatch: a thin generic wrapper around `dispatchAny`. `T` is
+   * a generic type parameter, so it can't narrow through the discriminant
+   * checks that give `dispatchAny` its native narrowing — this cast is
+   * the one place that bridges `KernelCommand`'s concrete result back to
+   * the caller's specific `CommandResult<T>`.
+   */
+  function dispatch<T extends KernelCommand>(
+    command: T,
+  ): Promise<CommandResult<T>> {
+    return dispatchAny(command) as Promise<CommandResult<T>>;
   }
 
   const annotations: KernelAnnotations = {

@@ -4,16 +4,9 @@ import {
   defineAsyncBatchStage,
   defineStage,
 } from "../../core/stage-factory.js";
-import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
-import { createKernel, type Kernel } from "../../kernel/kernel.js";
-import {
-  CollectingEventSink,
-  FakeClock,
-  InMemoryBlobStore,
-  NoopScheduler,
-} from "../../kernel/testing/index.js";
-import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
-import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
+import { WorkflowBuilder } from "../../core/workflow.js";
+import type { Kernel } from "../../kernel/kernel.js";
+import { createTestKernel } from "../utils/index.js";
 
 function createPassthroughStage(id: string, schema: z.ZodTypeAny) {
   return defineStage({
@@ -42,43 +35,6 @@ function createTwoStageWorkflow(id: string = "test-workflow") {
     .pipe(stage1)
     .pipe(stage2)
     .build();
-}
-
-function createTestKernel(workflows: Workflow<any, any>[] = []) {
-  const persistence = new InMemoryWorkflowPersistence();
-  const blobStore = new InMemoryBlobStore();
-  const jobTransport = new InMemoryJobQueue("test-worker");
-  const eventSink = new CollectingEventSink();
-  const scheduler = new NoopScheduler();
-  const clock = new FakeClock();
-
-  const registry = new Map<string, Workflow<any, any>>();
-  for (const w of workflows) {
-    registry.set(w.id, w);
-  }
-
-  const kernel = createKernel({
-    persistence,
-    blobStore,
-    jobTransport,
-    eventSink,
-    scheduler,
-    clock,
-    registry: { getWorkflow: (id) => registry.get(id) },
-  });
-
-  const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
-  return {
-    kernel,
-    flush,
-    persistence,
-    blobStore,
-    jobTransport,
-    eventSink,
-    scheduler,
-    clock,
-    registry,
-  };
 }
 
 describe("kernel: stage.pollSuspended", () => {
@@ -257,6 +213,94 @@ describe("kernel: stage.pollSuspended", () => {
     const updatedStage = await persistence.getStage(run.id, "batch-stage");
     expect(updatedStage?.status).toBe("COMPLETED");
     expect(updatedStage?.nextPollAt).toBeNull();
+  });
+
+  it("logs a WARN and persists the raw output when checkCompletion's output fails schema validation", async () => {
+    const schema = z.object({ data: z.string() });
+
+    const stage = defineAsyncBatchStage({
+      id: "batch-stage",
+      name: "Batch Stage",
+      mode: "async-batch",
+      schemas: {
+        input: schema,
+        output: z.object({ result: z.string() }),
+        config: z.object({}),
+      },
+      async execute() {
+        return {
+          suspended: true,
+          state: { batchId: "batch-1" },
+          pollConfig: {
+            pollInterval: 1000,
+            maxWaitTime: 60000,
+            nextPollAt: new Date(Date.now() + 1000),
+          },
+        };
+      },
+      // Returns an output shape that does not satisfy outputSchema
+      // (`result` is required, not present here) — the handler must fall
+      // back to persisting the raw output rather than throwing.
+      async checkCompletion() {
+        return { ready: true, output: { unexpectedField: 123 } as any };
+      },
+    });
+
+    const workflow = new WorkflowBuilder(
+      "test-workflow",
+      "Test",
+      "Test",
+      schema,
+      z.object({ result: z.string() }),
+    )
+      .pipe(stage)
+      .build();
+
+    const { kernel, persistence, blobStore, clock } = createTestKernel([
+      workflow,
+    ]);
+
+    const run = await persistence.createRun({
+      workflowId: "test-workflow",
+      workflowName: "Test",
+      workflowType: "test-workflow",
+      input: { data: "hello" },
+    });
+
+    await persistence.updateRun(run.id, { status: "RUNNING" });
+
+    await persistence.createStage({
+      workflowRunId: run.id,
+      stageId: "batch-stage",
+      stageName: "Batch Stage",
+      stageNumber: 1,
+      executionGroup: 1,
+      status: "SUSPENDED",
+      startedAt: clock.now(),
+    });
+
+    const stages = await persistence.getStagesByRun(run.id);
+    await persistence.updateStage(stages[0]!.id, {
+      suspendedState: { batchId: "batch-1" },
+      nextPollAt: new Date(clock.now().getTime() - 1000),
+      pollInterval: 1000,
+    });
+
+    const result = await kernel.dispatch({ type: "stage.pollSuspended" });
+
+    // No behavior change beyond the log: the stage still resumes/completes
+    // with the raw (unvalidated) output persisted.
+    expect(result.resumed).toBe(1);
+    const updatedStage = await persistence.getStage(run.id, "batch-stage");
+    expect(updatedStage?.status).toBe("COMPLETED");
+    expect(blobStore.size()).toBeGreaterThan(0);
+
+    const logs = persistence.getAllLogs();
+    const warnLog = logs.find(
+      (log) => log.level === "WARN" && /validation/i.test(log.message),
+    );
+    expect(warnLog).toBeDefined();
+    expect(warnLog?.message).toMatch(/batch-stage/);
   });
 
   it("reschedules when not ready", async () => {

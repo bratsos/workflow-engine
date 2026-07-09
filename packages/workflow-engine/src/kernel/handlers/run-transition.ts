@@ -5,12 +5,12 @@
  * completed/failed depending on the current state of its stages.
  */
 
-import type { Workflow } from "../../core/workflow";
 import { StaleVersionError } from "../../persistence/interface.js";
 import type { RunTransitionCommand, RunTransitionResult } from "../commands";
 import type { KernelEvent } from "../events";
 import {
   loadWorkflowContext,
+  prepareExecutionGroup,
   resolveExecutionGroupOutput,
 } from "../helpers/index.js";
 import type { HandlerResult, KernelDeps } from "../kernel";
@@ -30,7 +30,7 @@ const TERMINAL_STATUSES = new Set(["COMPLETED", "FAILED", "CANCELLED"]);
 const ACTIVE_STATUSES = new Set(["RUNNING", "PENDING", "SUSPENDED"]);
 
 // ---------------------------------------------------------------------------
-// Helper: enqueue an execution group
+// Helper: claim the run before mutating it
 // ---------------------------------------------------------------------------
 
 async function claimRunTransition(
@@ -48,71 +48,6 @@ async function claimRunTransition(
     }
     throw error;
   }
-}
-
-/**
- * Upserts stage records for an execution group (must run inside the
- * transaction) and returns a closure that enqueues jobs for the
- * newly-PENDING stages. The enqueue itself is NOT performed here — the
- * caller must invoke the returned closure from `_postCommit`, after the
- * transaction has committed. Enqueueing mid-transaction risks an orphan
- * job if the transaction later rolls back (jobTransport isn't part of
- * the DB transaction, so its writes can't be undone).
- */
-async function prepareExecutionGroup(
-  run: WorkflowRunRecord,
-  workflow: Workflow<any, any>,
-  groupIndex: number,
-  deps: KernelDeps,
-): Promise<() => Promise<string[]>> {
-  const stages = workflow.getStagesInExecutionGroup(groupIndex);
-
-  // Compute the current run-level attempt by taking the max attempt
-  // across all existing stages. After `run.rerunFrom` bumps the target
-  // group's stage records to a new attempt, this propagates the same
-  // attempt to downstream groups created here, so annotations from a
-  // single rerun span share one attempt value (and are distinguishable
-  // from prior-attempt annotations preserved via SetNull).
-  const existingStages = await deps.persistence.getStagesByRun(run.id);
-  const currentAttempt = existingStages.reduce(
-    (max, s) => (s.attempt > max ? s.attempt : max),
-    0,
-  );
-
-  const stagesToEnqueue: typeof stages = [];
-  for (const stage of stages) {
-    const record = await deps.persistence.upsertStage({
-      workflowRunId: run.id,
-      stageId: stage.id,
-      create: {
-        workflowRunId: run.id,
-        stageId: stage.id,
-        stageName: stage.name,
-        stageNumber: workflow.getStageIndex(stage.id) + 1,
-        executionGroup: groupIndex,
-        attempt: currentAttempt,
-        status: "PENDING",
-        config: (run.config as any)?.[stage.id] || {},
-      },
-      update: {},
-    });
-    if (record.status === "PENDING") {
-      stagesToEnqueue.push(stage);
-    }
-  }
-
-  return () => {
-    if (stagesToEnqueue.length === 0) return Promise.resolve([]);
-    return deps.jobTransport.enqueueParallel(
-      stagesToEnqueue.map((stage) => ({
-        workflowRunId: run.id,
-        workflowId: run.workflowId,
-        stageId: stage.id,
-        priority: run.priority,
-        payload: { config: run.config || {} },
-      })),
-    );
-  };
 }
 
 // ---------------------------------------------------------------------------
@@ -150,7 +85,11 @@ export async function handleRunTransition(
     if (!(await claimRunTransition(run, deps))) {
       return { action: "noop" as const, _events: [] };
     }
-    const enqueue = await prepareExecutionGroup(run, workflow, 1, deps);
+    const enqueue = await prepareExecutionGroup(run, workflow, deps, {
+      groupIndex: 1,
+      attemptMode: "max",
+      createMode: "upsert",
+    });
 
     events.push({
       type: "workflow:started",
@@ -241,12 +180,11 @@ export async function handleRunTransition(
     if (!(await claimRunTransition(run, deps))) {
       return { action: "noop" as const, _events: [] };
     }
-    const enqueue = await prepareExecutionGroup(
-      run,
-      workflow,
-      maxGroup + 1,
-      deps,
-    );
+    const enqueue = await prepareExecutionGroup(run, workflow, deps, {
+      groupIndex: maxGroup + 1,
+      attemptMode: "max",
+      createMode: "upsert",
+    });
     return {
       action: "advanced" as const,
       nextGroup: maxGroup + 1,

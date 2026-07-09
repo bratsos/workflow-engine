@@ -7,20 +7,13 @@
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { defineStage } from "../../core/stage-factory.js";
-import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
-import { createKernel } from "../../kernel/kernel.js";
+import { WorkflowBuilder } from "../../core/workflow.js";
 import {
   createPluginRunner,
   definePlugin,
   type PluginDefinition,
 } from "../../kernel/plugins.js";
-import {
-  FakeClock,
-  InMemoryBlobStore,
-  NoopScheduler,
-} from "../../kernel/testing/index.js";
-import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
-import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
+import { createTestKernel } from "../utils/index.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -42,12 +35,6 @@ function createSimpleWorkflow() {
 }
 
 function createTestKernelWithFailingPlugin(maxRetries = 1) {
-  const persistence = new InMemoryWorkflowPersistence();
-  const blobStore = new InMemoryBlobStore();
-  const jobTransport = new InMemoryJobQueue("test-worker");
-  const scheduler = new NoopScheduler();
-  const clock = new FakeClock();
-
   let shouldFail = true;
   const handler = async () => {
     if (shouldFail) throw new Error("plugin failure");
@@ -65,21 +52,10 @@ function createTestKernelWithFailingPlugin(maxRetries = 1) {
     maxRetries,
   });
 
-  const workflow = createSimpleWorkflow();
-  const registry = new Map<string, Workflow<any, any>>();
-  registry.set(workflow.id, workflow);
-
-  const kernel = createKernel({
-    persistence,
-    blobStore,
-    jobTransport,
-    eventSink,
-    scheduler,
-    clock,
-    registry: { getWorkflow: (id) => registry.get(id) },
-  });
-
-  const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
+  const { kernel, flush, persistence } = createTestKernel(
+    [createSimpleWorkflow()],
+    { eventSink },
+  );
 
   return {
     kernel,

@@ -25,9 +25,7 @@
 
 import { isSuspendedResult } from "../../core/types";
 import type { Workflow } from "../../core/workflow";
-import type { CreateOutboxEventInput } from "../../persistence/interface";
 import type { JobExecuteCommand, JobExecuteResult } from "../commands";
-import { RunNotRunningError } from "../errors";
 import type { KernelEvent } from "../events";
 import {
   buildAnnotationEvents,
@@ -35,6 +33,9 @@ import {
   resolveExecutionGroupOutput,
   saveStageArtifacts,
   saveStageOutput,
+  toErrorMessage,
+  toOutboxEvents,
+  withClaimedRun,
 } from "../helpers/index.js";
 import type { HandlerResult, KernelDeps } from "../kernel";
 import type { ActivityRunResult } from "../ports.js";
@@ -76,24 +77,6 @@ function resolveStageInput(
   }
 
   return prevOutput;
-}
-
-// ---------------------------------------------------------------------------
-// Helper: build outbox event inputs from kernel events
-// ---------------------------------------------------------------------------
-
-function toOutboxEvents(
-  workflowRunId: string,
-  causationId: string,
-  events: KernelEvent[],
-): CreateOutboxEventInput[] {
-  return events.map((event) => ({
-    workflowRunId,
-    eventType: event.type,
-    payload: event,
-    causationId,
-    occurredAt: event.timestamp,
-  }));
 }
 
 // ---------------------------------------------------------------------------
@@ -164,7 +147,10 @@ export async function handleJobExecute(
         executionGroup: workflow.getExecutionGroupIndex(stageId),
         status: "RUNNING",
         startedAt: deps.clock.now(),
-        config: config as any,
+        // Per-stage slice, matching every other stage-record-creation
+        // site (run.claimPending / run.transition / run.rerunFrom) —
+        // `config` here is the full run-wide config map keyed by stageId.
+        config: (config as any)?.[stageId] || {},
       },
       update: {
         status: "RUNNING",
@@ -173,16 +159,20 @@ export async function handleJobExecute(
     });
 
     await tx.appendOutboxEvents(
-      toOutboxEvents(workflowRunId, causationId, [
-        {
-          type: "stage:started",
-          timestamp: deps.clock.now(),
-          workflowRunId,
-          stageId,
-          stageName: stageDef.name,
-          stageNumber: record.stageNumber,
-        },
-      ]),
+      toOutboxEvents(
+        workflowRunId,
+        [
+          {
+            type: "stage:started",
+            timestamp: deps.clock.now(),
+            workflowRunId,
+            stageId,
+            stageName: stageDef.name,
+            stageNumber: record.stageNumber,
+          },
+        ],
+        causationId,
+      ),
     );
 
     return record;
@@ -208,8 +198,7 @@ export async function handleJobExecute(
     // Missing previous-group output past the first execution group.
     // Treat this the same as a stage-body failure below — do NOT call
     // executor.run() with corrupted input.
-    inputResolutionError =
-      inputError instanceof Error ? inputError.message : String(inputError);
+    inputResolutionError = toErrorMessage(inputError);
   }
 
   if (inputResolutionError !== undefined) {
@@ -220,30 +209,27 @@ export async function handleJobExecute(
       logs: [],
     };
   } else {
-    try {
-      run = await deps.executor.run(
-        {
-          stageDef,
-          workflowId,
-          workflowRunId,
-          workflowType: workflowRun.workflowType,
-          stageId,
-          stageName: stageDef.name,
-          stageNumber: stageRecord.stageNumber,
-          stageRecordId: stageRecord.id,
-          attempt: stageRecord.attempt,
-          rawInput,
-          config: config as Record<string, unknown>,
-          resumeState: stageRecord.suspendedState,
-          workflowContext,
-        },
-        deps,
-      );
-    } catch (infraError) {
-      // executor.run itself threw (infra / transport failure — not a stage-body
-      // error). Re-throw so the kernel releases the idempotency key.
-      throw infraError;
-    }
+    // A throw from executor.run() itself (infra / transport failure — not
+    // a stage-body error) propagates so the kernel releases the
+    // idempotency key.
+    run = await deps.executor.run(
+      {
+        stageDef,
+        workflowId,
+        workflowRunId,
+        workflowType: workflowRun.workflowType,
+        stageId,
+        stageName: stageDef.name,
+        stageNumber: stageRecord.stageNumber,
+        stageRecordId: stageRecord.id,
+        attempt: stageRecord.attempt,
+        rawInput,
+        config: config as Record<string, unknown>,
+        resumeState: stageRecord.suspendedState,
+        workflowContext,
+      },
+      deps,
+    );
   }
 
   // Write buffered logs (LocalExecutor returns [] — no-op for local path)
@@ -269,16 +255,18 @@ export async function handleJobExecute(
         : run.error;
     const duration = deps.clock.now().getTime() - startTime;
     const bufferedAnnotations = run.annotations;
-    try {
-      await deps.persistence.withTransaction(async (tx) => {
-        const currentStatus = await tx.getRunStatus(workflowRunId);
-        if (currentStatus !== "RUNNING") {
-          throw new RunNotRunningError(
-            workflowRunId,
-            currentStatus ?? "DELETED",
-          );
-        }
 
+    // expectedVersion omitted: Phase 3 never writes the run row here (only
+    // the stage row), so — unlike stage-poll-suspended's claim — parallel
+    // sibling stages completing concurrently must not contend on the run's
+    // version. Any persistence failure other than a genuine cancellation
+    // still propagates (Stage stays RUNNING; re-throwing releases the
+    // idempotency key so lease.reapStale can retry the job).
+    const claimResult = await withClaimedRun(
+      workflowRunId,
+      undefined,
+      deps,
+      async (tx) => {
         await tx.updateStage(stageRecord.id, {
           status: "FAILED",
           completedAt: deps.clock.now(),
@@ -300,26 +288,26 @@ export async function handleJobExecute(
         };
 
         await tx.appendOutboxEvents(
-          toOutboxEvents(workflowRunId, causationId, [
-            ...run.progress,
-            failedEvent,
-            ...buildAnnotationEvents(bufferedAnnotations, deps.clock.now()),
-          ]),
+          toOutboxEvents(
+            workflowRunId,
+            [
+              ...run.progress,
+              failedEvent,
+              ...buildAnnotationEvents(bufferedAnnotations, deps.clock.now()),
+            ],
+            causationId,
+          ),
         );
-      });
-    } catch (txError) {
-      if (txError instanceof RunNotRunningError) {
-        return {
-          outcome: "failed" as const,
-          ghost: true,
-          error: txError.message,
-          _events: [],
-        };
-      }
-      // Phase 3 itself failed for some other reason. Stage stays
-      // RUNNING. Re-throw so the idempotency key is released and
-      // lease.reapStale can retry the job.
-      throw txError;
+      },
+    );
+
+    if (claimResult.status === "cancelled") {
+      return {
+        outcome: "failed" as const,
+        ghost: true,
+        error: claimResult.message,
+        _events: [],
+      };
     }
 
     await deps.persistence
@@ -359,18 +347,13 @@ export async function handleJobExecute(
     );
 
     const bufferedAnnotations = run.annotations;
-    try {
-      await deps.persistence.withTransaction(async (tx) => {
-        // Status guard: if cancel committed between the ghost check
-        // and this transaction, abort to roll back atomically.
-        const currentStatus = await tx.getRunStatus(workflowRunId);
-        if (currentStatus !== "RUNNING") {
-          throw new RunNotRunningError(
-            workflowRunId,
-            currentStatus ?? "DELETED",
-          );
-        }
 
+    // expectedVersion omitted — see the comment on the Phase 3b claim above.
+    const claimResult = await withClaimedRun(
+      workflowRunId,
+      undefined,
+      deps,
+      async (tx) => {
         await tx.updateStage(stageRecord.id, {
           status: "SUSPENDED",
           suspendedState: state as any,
@@ -403,24 +386,27 @@ export async function handleJobExecute(
         };
 
         await tx.appendOutboxEvents(
-          toOutboxEvents(workflowRunId, causationId, [
-            ...run.progress,
-            suspendedEvent,
-            workflowSuspendedEvent,
-            ...buildAnnotationEvents(bufferedAnnotations, deps.clock.now()),
-          ]),
+          toOutboxEvents(
+            workflowRunId,
+            [
+              ...run.progress,
+              suspendedEvent,
+              workflowSuspendedEvent,
+              ...buildAnnotationEvents(bufferedAnnotations, deps.clock.now()),
+            ],
+            causationId,
+          ),
         );
-      });
-    } catch (txError) {
-      if (txError instanceof RunNotRunningError) {
-        return {
-          outcome: "failed" as const,
-          ghost: true,
-          error: txError.message,
-          _events: [],
-        };
-      }
-      throw txError;
+      },
+    );
+
+    if (claimResult.status === "cancelled") {
+      return {
+        outcome: "failed" as const,
+        ghost: true,
+        error: claimResult.message,
+        _events: [],
+      };
     }
 
     return { outcome: "suspended" as const, nextPollAt, _events: [] };
@@ -448,16 +434,13 @@ export async function handleJobExecute(
         : undefined;
 
     const bufferedAnnotations = run.annotations;
-    try {
-      await deps.persistence.withTransaction(async (tx) => {
-        const currentStatus = await tx.getRunStatus(workflowRunId);
-        if (currentStatus !== "RUNNING") {
-          throw new RunNotRunningError(
-            workflowRunId,
-            currentStatus ?? "DELETED",
-          );
-        }
 
+    // expectedVersion omitted — see the comment on the Phase 3b claim above.
+    const claimResult = await withClaimedRun(
+      workflowRunId,
+      undefined,
+      deps,
+      async (tx) => {
         await tx.updateStage(stageRecord.id, {
           status: "COMPLETED",
           completedAt: deps.clock.now(),
@@ -484,23 +467,26 @@ export async function handleJobExecute(
         };
 
         await tx.appendOutboxEvents(
-          toOutboxEvents(workflowRunId, causationId, [
-            ...run.progress,
-            completedEvent,
-            ...buildAnnotationEvents(bufferedAnnotations, deps.clock.now()),
-          ]),
+          toOutboxEvents(
+            workflowRunId,
+            [
+              ...run.progress,
+              completedEvent,
+              ...buildAnnotationEvents(bufferedAnnotations, deps.clock.now()),
+            ],
+            causationId,
+          ),
         );
-      });
-    } catch (txError) {
-      if (txError instanceof RunNotRunningError) {
-        return {
-          outcome: "failed" as const,
-          ghost: true,
-          error: txError.message,
-          _events: [],
-        };
-      }
-      throw txError;
+      },
+    );
+
+    if (claimResult.status === "cancelled") {
+      return {
+        outcome: "failed" as const,
+        ghost: true,
+        error: claimResult.message,
+        _events: [],
+      };
     }
 
     return {

@@ -10,6 +10,7 @@ import type {
   RunClaimPendingResult,
 } from "../commands";
 import type { KernelEvent } from "../events";
+import { prepareExecutionGroup, toErrorMessage } from "../helpers/index.js";
 import type { HandlerResult, KernelDeps } from "../kernel";
 
 export async function handleRunClaimPending(
@@ -23,13 +24,14 @@ export async function handleRunClaimPending(
     jobIds: string[];
   }> = [];
   const events: KernelEvent[] = [];
-  // NOTE: enqueueParallel here runs inside the enclosing DB transaction
-  // (unlike run.transition/run.rerunFrom, which defer enqueue to
-  // _postCommit — see prepareExecutionGroup in run-transition.ts) because
-  // this handler's public result includes the enqueued jobIds
-  // synchronously per claimed run. A crash between enqueue and commit can
-  // still orphan a job or lose one; run.reapStuck's PENDING-without-job
-  // recovery sweep (see there) covers the resulting stuck run either way.
+  // NOTE: the closure returned by prepareExecutionGroup is invoked
+  // immediately below — inside the enclosing DB transaction — unlike
+  // run.transition/run.rerunFrom, which defer it to _postCommit (see
+  // kernel/helpers/prepare-execution-group.ts). This handler's public
+  // result includes the enqueued jobIds synchronously per claimed run. A
+  // crash between enqueue and commit can still orphan a job or lose one;
+  // run.reapStuck's PENDING-without-job recovery sweep (see there) covers
+  // the resulting stuck run either way.
 
   for (let i = 0; i < maxClaims; i++) {
     const run = await deps.persistence.claimNextPendingRun();
@@ -106,41 +108,16 @@ export async function handleRunClaimPending(
         continue;
       }
 
-      // Upsert stage records (idempotent — handles orphaned stages from previous failed claims)
-      const stagesToEnqueue: typeof stages = [];
-      for (const stage of stages) {
-        const record = await deps.persistence.upsertStage({
-          workflowRunId: run.id,
-          stageId: stage.id,
-          create: {
-            workflowRunId: run.id,
-            stageId: stage.id,
-            stageName: stage.name,
-            stageNumber: workflow.getStageIndex(stage.id) + 1,
-            executionGroup: 1,
-            status: "PENDING",
-            config: (run.config as any)?.[stage.id] || {},
-          },
-          update: {},
-        });
-        if (record.status === "PENDING") {
-          stagesToEnqueue.push(stage);
-        }
-      }
-
-      // Enqueue jobs only for stages that are PENDING (skip RUNNING/COMPLETED/SUSPENDED)
-      const jobIds =
-        stagesToEnqueue.length > 0
-          ? await deps.jobTransport.enqueueParallel(
-              stagesToEnqueue.map((stage) => ({
-                workflowRunId: run.id,
-                workflowId: run.workflowId,
-                stageId: stage.id,
-                priority: run.priority,
-                payload: { config: run.config || {} },
-              })),
-            )
-          : [];
+      // Upsert stage records (idempotent — handles orphaned stages from
+      // previous failed claims) and enqueue jobs only for stages that are
+      // PENDING (skip RUNNING/COMPLETED/SUSPENDED) — invoked immediately,
+      // see the NOTE above.
+      const enqueue = await prepareExecutionGroup(run, workflow, deps, {
+        groupIndex: 1,
+        attemptMode: "none",
+        createMode: "upsert",
+      });
+      const jobIds = await enqueue();
 
       events.push({
         type: "workflow:started",
@@ -154,8 +131,7 @@ export async function handleRunClaimPending(
         jobIds,
       });
     } catch (err) {
-      const error =
-        err instanceof Error ? err.message : "Unknown error during claim";
+      const error = toErrorMessage(err);
       const failedAt = deps.clock.now();
       await deps.persistence
         .updateRun(run.id, {

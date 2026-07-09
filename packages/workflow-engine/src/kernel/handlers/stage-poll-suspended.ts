@@ -17,43 +17,26 @@
  */
 
 import type { CheckCompletionContext } from "../../core/stage";
-import {
-  type CreateAnnotationInput,
-  type CreateOutboxEventInput,
-  StaleVersionError,
-} from "../../persistence/interface";
+import type { CreateAnnotationInput } from "../../persistence/interface";
 import type {
   StagePollSuspendedCommand,
   StagePollSuspendedResult,
 } from "../commands";
-import { RunNotRunningError } from "../errors";
-import type { KernelEvent } from "../events";
 import {
   buildAnnotationEvents,
   createAnnotationBuffer,
   createStorageShim,
+  failStageAndRun,
+  handleClaimOutcome,
+  markStageCancelled,
   normalizeAnnotateArgs,
   saveStageOutput,
+  toErrorMessage,
+  toOutboxEvents,
+  withClaimedRun,
 } from "../helpers/index.js";
 import type { HandlerResult, KernelDeps } from "../kernel";
-
-// ---------------------------------------------------------------------------
-// Helper: build outbox event inputs from kernel events
-// ---------------------------------------------------------------------------
-
-function toOutboxEvents(
-  workflowRunId: string,
-  events: KernelEvent[],
-): CreateOutboxEventInput[] {
-  const causationId = crypto.randomUUID();
-  return events.map((event) => ({
-    workflowRunId,
-    eventType: event.type,
-    payload: event,
-    causationId,
-    occurredAt: event.timestamp,
-  }));
-}
+import type { WorkflowStageRecord } from "../ports.js";
 
 async function completeSuspendedJobRow(
   workflowRunId: string,
@@ -73,51 +56,37 @@ async function completeSuspendedJobRow(
   }
 }
 
-async function markStageCancelled(
-  stageId: string,
+/**
+ * Fails a suspended stage before checkCompletion ever runs (workflow
+ * missing from the registry, or the stage no longer supports
+ * checkCompletion) — the run itself isn't touched, unlike
+ * `failStageAndRun`, since these are pre-flight config problems rather
+ * than a checkCompletion outcome.
+ */
+async function failStageOnly(
+  stageRecord: WorkflowStageRecord,
+  errorMessage: string,
   deps: KernelDeps,
 ): Promise<void> {
-  await deps.persistence.updateStage(stageId, {
-    status: "CANCELLED",
-    completedAt: deps.clock.now(),
-    nextPollAt: null,
-  });
-}
-
-async function withClaimedRun<T>(
-  workflowRunId: string,
-  expectedVersion: number,
-  deps: KernelDeps,
-  fn: (tx: KernelDeps["persistence"]) => Promise<T>,
-): Promise<
-  | { status: "claimed"; value: T }
-  | { status: "stale" }
-  | { status: "cancelled"; runStatus: string }
-> {
-  try {
-    const value = await deps.persistence.withTransaction(async (tx) => {
-      // Status guard: if cancel committed between the outer
-      // status check and this transaction, abort to roll back the
-      // pending writes (stage update, annotations, outbox events).
-      const runStatus = await tx.getRunStatus(workflowRunId);
-      if (runStatus !== "RUNNING") {
-        throw new RunNotRunningError(workflowRunId, runStatus ?? "DELETED");
-      }
-      await tx.updateRun(workflowRunId, {
-        expectedVersion,
-      });
-      return fn(tx);
+  await deps.persistence.withTransaction(async (tx) => {
+    await tx.updateStage(stageRecord.id, {
+      status: "FAILED",
+      completedAt: deps.clock.now(),
+      errorMessage,
     });
-    return { status: "claimed", value };
-  } catch (error) {
-    if (error instanceof StaleVersionError) {
-      return { status: "stale" };
-    }
-    if (error instanceof RunNotRunningError) {
-      return { status: "cancelled", runStatus: error.currentStatus };
-    }
-    throw error;
-  }
+    await tx.appendOutboxEvents(
+      toOutboxEvents(stageRecord.workflowRunId, [
+        {
+          type: "stage:failed",
+          timestamp: deps.clock.now(),
+          workflowRunId: stageRecord.workflowRunId,
+          stageId: stageRecord.stageId,
+          stageName: stageRecord.stageName,
+          error: errorMessage,
+        },
+      ]),
+    );
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -160,25 +129,11 @@ export async function handleStagePollSuspended(
     // 3b. Get workflow from registry
     const workflow = deps.registry.getWorkflow(run.workflowId);
     if (!workflow) {
-      await deps.persistence.withTransaction(async (tx) => {
-        await tx.updateStage(stageRecord.id, {
-          status: "FAILED",
-          completedAt: deps.clock.now(),
-          errorMessage: `Workflow ${run.workflowId} not found in registry`,
-        });
-        await tx.appendOutboxEvents(
-          toOutboxEvents(stageRecord.workflowRunId, [
-            {
-              type: "stage:failed",
-              timestamp: deps.clock.now(),
-              workflowRunId: stageRecord.workflowRunId,
-              stageId: stageRecord.stageId,
-              stageName: stageRecord.stageName,
-              error: `Workflow ${run.workflowId} not found in registry`,
-            },
-          ]),
-        );
-      });
+      await failStageOnly(
+        stageRecord,
+        `Workflow ${run.workflowId} not found in registry`,
+        deps,
+      );
       failed++;
       continue;
     }
@@ -190,25 +145,7 @@ export async function handleStagePollSuspended(
         ? `Stage ${stageRecord.stageId} not found in workflow ${run.workflowId}`
         : `Stage ${stageRecord.stageId} does not support checkCompletion`;
 
-      await deps.persistence.withTransaction(async (tx) => {
-        await tx.updateStage(stageRecord.id, {
-          status: "FAILED",
-          completedAt: deps.clock.now(),
-          errorMessage: errorMsg,
-        });
-        await tx.appendOutboxEvents(
-          toOutboxEvents(stageRecord.workflowRunId, [
-            {
-              type: "stage:failed",
-              timestamp: deps.clock.now(),
-              workflowRunId: stageRecord.workflowRunId,
-              stageId: stageRecord.stageId,
-              stageName: stageRecord.stageName,
-              error: errorMsg,
-            },
-          ]),
-        );
-      });
+      await failStageOnly(stageRecord, errorMsg, deps);
       failed++;
       continue;
     }
@@ -286,67 +223,15 @@ export async function handleStagePollSuspended(
 
       // ── Phase 2: persist results (transaction) ─────────────────────
       if (checkResult.error) {
-        const bufferedAnnotations = annotationBuffer.flush();
-        const claimResult = await withClaimedRun(
-          stageRecord.workflowRunId,
-          run.version,
+        const claimResult = await failStageAndRun(
+          stageRecord,
+          run,
+          checkResult.error,
+          annotationBuffer.flush(),
           deps,
-          async (tx) => {
-            await tx.updateStage(stageRecord.id, {
-              status: "FAILED",
-              completedAt: deps.clock.now(),
-              errorMessage: checkResult.error,
-              nextPollAt: null,
-            });
-
-            await tx.updateRun(stageRecord.workflowRunId, {
-              status: "FAILED",
-              completedAt: deps.clock.now(),
-            });
-
-            if (bufferedAnnotations.length > 0) {
-              await tx.appendAnnotations(bufferedAnnotations);
-            }
-
-            await tx.appendOutboxEvents(
-              toOutboxEvents(stageRecord.workflowRunId, [
-                {
-                  type: "stage:failed",
-                  timestamp: deps.clock.now(),
-                  workflowRunId: stageRecord.workflowRunId,
-                  stageId: stageRecord.stageId,
-                  stageName: stageRecord.stageName,
-                  error: checkResult.error!,
-                },
-                {
-                  type: "workflow:failed",
-                  timestamp: deps.clock.now(),
-                  workflowRunId: stageRecord.workflowRunId,
-                  error: checkResult.error!,
-                },
-                ...buildAnnotationEvents(bufferedAnnotations, deps.clock.now()),
-              ]),
-            );
-          },
         );
 
-        if (claimResult.status === "stale") {
-          const latestStatus = await deps.persistence.getRunStatus(
-            stageRecord.workflowRunId,
-          );
-          if (latestStatus === "CANCELLED") {
-            await markStageCancelled(stageRecord.id, deps);
-          }
-          continue;
-        }
-        if (claimResult.status === "cancelled") {
-          // Run was cancelled between our outer status check and the
-          // Phase 2 transaction. Mark this suspended stage as cancelled
-          // and move on; the Phase 2 writes (stage update, annotations,
-          // outbox events) all rolled back atomically.
-          await markStageCancelled(stageRecord.id, deps);
-          continue;
-        }
+        if (await handleClaimOutcome(claimResult, stageRecord, deps)) continue;
 
         failed++;
       } else if (checkResult.ready) {
@@ -356,8 +241,13 @@ export async function handleStagePollSuspended(
           let validatedOutput = checkResult.output;
           try {
             validatedOutput = stageDef.outputSchema.parse(checkResult.output);
-          } catch {
+          } catch (validationError) {
             // Fall back to raw output on validation failure
+            await logFn(
+              "WARN",
+              `Stage ${stageRecord.stageId} checkCompletion output failed schema validation; persisting raw output`,
+              { error: toErrorMessage(validationError) },
+            );
           }
 
           const outputKey = await saveStageOutput(
@@ -410,23 +300,7 @@ export async function handleStagePollSuspended(
           },
         );
 
-        if (claimResult.status === "stale") {
-          const latestStatus = await deps.persistence.getRunStatus(
-            stageRecord.workflowRunId,
-          );
-          if (latestStatus === "CANCELLED") {
-            await markStageCancelled(stageRecord.id, deps);
-          }
-          continue;
-        }
-        if (claimResult.status === "cancelled") {
-          // Run was cancelled between our outer status check and the
-          // Phase 2 transaction. Mark this suspended stage as cancelled
-          // and move on; the Phase 2 writes (stage update, annotations,
-          // outbox events) all rolled back atomically.
-          await markStageCancelled(stageRecord.id, deps);
-          continue;
-        }
+        if (await handleClaimOutcome(claimResult, stageRecord, deps)) continue;
 
         resumed++;
         resumedWorkflowRunIds.add(stageRecord.workflowRunId);
@@ -452,63 +326,15 @@ export async function handleStagePollSuspended(
         // stage whose provider never reports readiness or an error
         // would reschedule via nextCheckIn forever.
         const timeoutError = `Stage ${stageRecord.stageId} exceeded maxWaitUntil (${stageRecord.maxWaitUntil.toISOString()}) while suspended`;
-        const bufferedAnnotations = annotationBuffer.flush();
-        const claimResult = await withClaimedRun(
-          stageRecord.workflowRunId,
-          run.version,
+        const claimResult = await failStageAndRun(
+          stageRecord,
+          run,
+          timeoutError,
+          annotationBuffer.flush(),
           deps,
-          async (tx) => {
-            await tx.updateStage(stageRecord.id, {
-              status: "FAILED",
-              completedAt: deps.clock.now(),
-              errorMessage: timeoutError,
-              nextPollAt: null,
-            });
-
-            await tx.updateRun(stageRecord.workflowRunId, {
-              status: "FAILED",
-              completedAt: deps.clock.now(),
-            });
-
-            if (bufferedAnnotations.length > 0) {
-              await tx.appendAnnotations(bufferedAnnotations);
-            }
-
-            await tx.appendOutboxEvents(
-              toOutboxEvents(stageRecord.workflowRunId, [
-                {
-                  type: "stage:failed",
-                  timestamp: deps.clock.now(),
-                  workflowRunId: stageRecord.workflowRunId,
-                  stageId: stageRecord.stageId,
-                  stageName: stageRecord.stageName,
-                  error: timeoutError,
-                },
-                {
-                  type: "workflow:failed",
-                  timestamp: deps.clock.now(),
-                  workflowRunId: stageRecord.workflowRunId,
-                  error: timeoutError,
-                },
-                ...buildAnnotationEvents(bufferedAnnotations, deps.clock.now()),
-              ]),
-            );
-          },
         );
 
-        if (claimResult.status === "stale") {
-          const latestStatus = await deps.persistence.getRunStatus(
-            stageRecord.workflowRunId,
-          );
-          if (latestStatus === "CANCELLED") {
-            await markStageCancelled(stageRecord.id, deps);
-          }
-          continue;
-        }
-        if (claimResult.status === "cancelled") {
-          await markStageCancelled(stageRecord.id, deps);
-          continue;
-        }
+        if (await handleClaimOutcome(claimResult, stageRecord, deps)) continue;
 
         failed++;
         continue;
@@ -535,88 +361,21 @@ export async function handleStagePollSuspended(
           },
         );
 
-        if (claimResult.status === "stale") {
-          const latestStatus = await deps.persistence.getRunStatus(
-            stageRecord.workflowRunId,
-          );
-          if (latestStatus === "CANCELLED") {
-            await markStageCancelled(stageRecord.id, deps);
-          }
-          continue;
-        }
-        if (claimResult.status === "cancelled") {
-          // Run was cancelled between our outer status check and the
-          // Phase 2 transaction. Mark this suspended stage as cancelled
-          // and move on; the Phase 2 writes (stage update, annotations,
-          // outbox events) all rolled back atomically.
-          await markStageCancelled(stageRecord.id, deps);
-          continue;
-        }
+        if (await handleClaimOutcome(claimResult, stageRecord, deps)) continue;
       }
     } catch (error) {
-      // Unexpected error during checkCompletion
-      const errorMessage =
-        error instanceof Error ? error.message : String(error);
-
-      // Flush any annotations recorded before the throw so they
-      // persist alongside the FAILED outcome.
-      const bufferedAnnotations = annotationBuffer.flush();
-      const claimResult = await withClaimedRun(
-        stageRecord.workflowRunId,
-        run.version,
+      // Unexpected error during checkCompletion. Flush any annotations
+      // recorded before the throw so they persist alongside the FAILED
+      // outcome.
+      const claimResult = await failStageAndRun(
+        stageRecord,
+        run,
+        toErrorMessage(error),
+        annotationBuffer.flush(),
         deps,
-        async (tx) => {
-          await tx.updateStage(stageRecord.id, {
-            status: "FAILED",
-            completedAt: deps.clock.now(),
-            errorMessage,
-            nextPollAt: null,
-          });
-
-          await tx.updateRun(stageRecord.workflowRunId, {
-            status: "FAILED",
-            completedAt: deps.clock.now(),
-          });
-
-          if (bufferedAnnotations.length > 0) {
-            await tx.appendAnnotations(bufferedAnnotations);
-          }
-
-          await tx.appendOutboxEvents(
-            toOutboxEvents(stageRecord.workflowRunId, [
-              {
-                type: "stage:failed",
-                timestamp: deps.clock.now(),
-                workflowRunId: stageRecord.workflowRunId,
-                stageId: stageRecord.stageId,
-                stageName: stageRecord.stageName,
-                error: errorMessage,
-              },
-              {
-                type: "workflow:failed",
-                timestamp: deps.clock.now(),
-                workflowRunId: stageRecord.workflowRunId,
-                error: errorMessage,
-              },
-              ...buildAnnotationEvents(bufferedAnnotations, deps.clock.now()),
-            ]),
-          );
-        },
       );
 
-      if (claimResult.status === "stale") {
-        const latestStatus = await deps.persistence.getRunStatus(
-          stageRecord.workflowRunId,
-        );
-        if (latestStatus === "CANCELLED") {
-          await markStageCancelled(stageRecord.id, deps);
-        }
-        continue;
-      }
-      if (claimResult.status === "cancelled") {
-        await markStageCancelled(stageRecord.id, deps);
-        continue;
-      }
+      if (await handleClaimOutcome(claimResult, stageRecord, deps)) continue;
 
       failed++;
     }

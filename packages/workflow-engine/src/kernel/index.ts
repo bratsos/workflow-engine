@@ -39,6 +39,7 @@ export { IdempotencyInProgressError } from "./errors.js";
 
 // Event types
 export type {
+  AnnotationCreatedEvent,
   KernelEvent,
   KernelEventType,
   StageCompletedEvent,
@@ -60,7 +61,20 @@ export {
   type RoutingExecutorOptions,
 } from "./executor/routing-executor.js";
 // Kernel helpers
-export { loadWorkflowContext, saveStageOutput } from "./helpers/index.js";
+export {
+  type ExecuteJobOutcome,
+  type ExecuteJobWithHeartbeatOptions,
+  executeJobWithHeartbeat,
+  HOST_DEFAULTS,
+  type HostJobMessage,
+  loadWorkflowContext,
+  type MaintenanceTickCounts,
+  normalizeAnnotateArgs,
+  type RunMaintenanceTickOptions,
+  runMaintenanceTick,
+  saveStageOutput,
+  toErrorMessage,
+} from "./helpers/index.js";
 // Kernel factory and core interfaces
 export {
   type AnnotateAttachInput,

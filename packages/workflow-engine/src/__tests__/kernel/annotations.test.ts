@@ -20,44 +20,8 @@ import {
   defineAsyncBatchStage,
   defineStage,
 } from "../../core/stage-factory.js";
-import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
-import { createKernel } from "../../kernel/kernel.js";
-import {
-  CollectingEventSink,
-  FakeClock,
-  InMemoryBlobStore,
-  NoopScheduler,
-} from "../../kernel/testing/index.js";
-import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
-import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
-
-// ============================================================================
-// Test scaffold
-// ============================================================================
-
-function createTestKernel(workflows: Workflow<any, any>[] = []) {
-  const persistence = new InMemoryWorkflowPersistence();
-  const blobStore = new InMemoryBlobStore();
-  const jobTransport = new InMemoryJobQueue("test-worker");
-  const eventSink = new CollectingEventSink();
-  const scheduler = new NoopScheduler();
-  const clock = new FakeClock();
-
-  const registry = new Map<string, Workflow<any, any>>();
-  for (const w of workflows) registry.set(w.id, w);
-
-  const kernel = createKernel({
-    persistence,
-    blobStore,
-    jobTransport,
-    eventSink,
-    scheduler,
-    clock,
-    registry: { getWorkflow: (id) => registry.get(id) },
-  });
-
-  return { kernel, persistence, blobStore, jobTransport, eventSink, clock };
-}
+import { WorkflowBuilder } from "../../core/workflow.js";
+import { createTestKernel } from "../utils/index.js";
 
 const simpleSchema = z.object({ data: z.string() });
 
@@ -74,7 +38,7 @@ function makeWorkflow(
 
 async function createRunningRun(
   kernel: ReturnType<typeof createTestKernel>["kernel"],
-  persistence: InMemoryWorkflowPersistence,
+  persistence: ReturnType<typeof createTestKernel>["persistence"],
   workflowId: string,
   idempotencyKey: string,
 ) {

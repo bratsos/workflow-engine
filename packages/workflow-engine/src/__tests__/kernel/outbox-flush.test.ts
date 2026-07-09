@@ -10,20 +10,12 @@ import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { defineStage } from "../../core/stage-factory.js";
 import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
-import { createKernel } from "../../kernel/kernel.js";
 import {
   createPluginRunner,
   definePlugin,
   type PluginDefinition,
 } from "../../kernel/plugins.js";
-import {
-  CollectingEventSink,
-  FakeClock,
-  InMemoryBlobStore,
-  NoopScheduler,
-} from "../../kernel/testing/index.js";
-import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
-import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
+import { createTestKernel } from "../utils/index.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -48,82 +40,14 @@ function createSimpleWorkflow(id: string = "test-workflow") {
     .build();
 }
 
-function createTestKernel(workflows: Workflow<any, any>[] = []) {
-  const persistence = new InMemoryWorkflowPersistence();
-  const blobStore = new InMemoryBlobStore();
-  const jobTransport = new InMemoryJobQueue("test-worker");
-  const eventSink = new CollectingEventSink();
-  const scheduler = new NoopScheduler();
-  const clock = new FakeClock();
-
-  const registry = new Map<string, Workflow<any, any>>();
-  for (const w of workflows) {
-    registry.set(w.id, w);
-  }
-
-  const kernel = createKernel({
-    persistence,
-    blobStore,
-    jobTransport,
-    eventSink,
-    scheduler,
-    clock,
-    registry: { getWorkflow: (id) => registry.get(id) },
-  });
-
-  const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
-  return {
-    kernel,
-    flush,
-    persistence,
-    blobStore,
-    jobTransport,
-    eventSink,
-    scheduler,
-    clock,
-    registry,
-  };
-}
-
 function createTestKernelWithPlugins(
   workflows: Workflow<any, any>[] = [],
   plugins: PluginDefinition[] = [],
   maxRetries = 3,
 ) {
-  const persistence = new InMemoryWorkflowPersistence();
-  const blobStore = new InMemoryBlobStore();
-  const jobTransport = new InMemoryJobQueue("test-worker");
-  const eventSink = createPluginRunner({ plugins, maxRetries });
-  const scheduler = new NoopScheduler();
-  const clock = new FakeClock();
-
-  const registry = new Map<string, Workflow<any, any>>();
-  for (const w of workflows) {
-    registry.set(w.id, w);
-  }
-
-  const kernel = createKernel({
-    persistence,
-    blobStore,
-    jobTransport,
-    eventSink,
-    scheduler,
-    clock,
-    registry: { getWorkflow: (id) => registry.get(id) },
+  return createTestKernel(workflows, {
+    eventSink: createPluginRunner({ plugins, maxRetries }),
   });
-
-  const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
-  return {
-    kernel,
-    flush,
-    persistence,
-    blobStore,
-    jobTransport,
-    eventSink,
-    scheduler,
-    clock,
-    registry,
-  };
 }
 
 // ---------------------------------------------------------------------------
@@ -362,14 +286,6 @@ describe("kernel: outbox.flush", () => {
 
   it("stops publishing a run's later events once an earlier one fails (fail-fast per run, order preserved)", async () => {
     const workflow = createSimpleWorkflow();
-    const persistence = new InMemoryWorkflowPersistence();
-    const blobStore = new InMemoryBlobStore();
-    const jobTransport = new InMemoryJobQueue("test-worker");
-    const scheduler = new NoopScheduler();
-    const clock = new FakeClock();
-    const registry = new Map<string, Workflow<any, any>>([
-      [workflow.id, workflow],
-    ]);
 
     const emitted: { workflowRunId: string; type: string }[] = [];
     let failingRunId: string | undefined;
@@ -386,15 +302,7 @@ describe("kernel: outbox.flush", () => {
       },
     };
 
-    const kernel = createKernel({
-      persistence,
-      blobStore,
-      jobTransport,
-      eventSink,
-      scheduler,
-      clock,
-      registry: { getWorkflow: (id) => registry.get(id) },
-    });
+    const { kernel } = createTestKernel([workflow], { eventSink });
 
     // Run A: two events (workflow:created, workflow:started).
     const runA = await kernel.dispatch({

@@ -1,16 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { defineStage } from "../../core/stage-factory.js";
-import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
-import { createKernel } from "../../kernel/kernel.js";
-import {
-  CollectingEventSink,
-  FakeClock,
-  InMemoryBlobStore,
-  NoopScheduler,
-} from "../../kernel/testing/index.js";
-import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
-import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
+import { WorkflowBuilder } from "../../core/workflow.js";
+import { createTestKernel } from "../utils/index.js";
 
 function createPassthroughStage(id: string, schema: z.ZodTypeAny) {
   return defineStage({
@@ -31,34 +23,17 @@ function createSimpleWorkflow(id: string = "test-workflow") {
     .build();
 }
 
-function createTestKernel(workflows: Workflow<any, any>[] = []) {
-  const persistence = new InMemoryWorkflowPersistence();
-  const blobStore = new InMemoryBlobStore();
-  const jobTransport = new InMemoryJobQueue("test-worker");
-  const eventSink = new CollectingEventSink();
-  const scheduler = new NoopScheduler();
-  // Use current real time so FakeClock aligns with new Date() used by persistence
-  const clock = new FakeClock(new Date());
-  const registry = new Map<string, Workflow<any, any>>();
-  for (const w of workflows) registry.set(w.id, w);
-
-  const kernel = createKernel({
-    persistence,
-    blobStore,
-    jobTransport,
-    eventSink,
-    scheduler,
-    clock,
-    registry: { getWorkflow: (id) => registry.get(id) },
-  });
-
-  return { kernel, persistence, jobTransport, eventSink, clock };
-}
+// Every kernel in this file is created with `clockStart: new Date()` so the
+// FakeClock aligns with the real `new Date()` timestamps InMemoryWorkflowPersistence
+// stamps on records -- otherwise `run.reapStuck`'s elapsed-time math would
+// compare a fixed 2025-01-01 clock against real "now" timestamps.
 
 describe("kernel: run.reapStuck", () => {
   it("marks stuck RUNNING run as FAILED when no activity past threshold", async () => {
     const workflow = createSimpleWorkflow();
-    const { kernel, persistence, clock } = createTestKernel([workflow]);
+    const { kernel, persistence, clock } = createTestKernel([workflow], {
+      clockStart: new Date(),
+    });
 
     await kernel.dispatch({
       type: "run.create",
@@ -85,7 +60,9 @@ describe("kernel: run.reapStuck", () => {
 
   it("does not reap runs with recent activity", async () => {
     const workflow = createSimpleWorkflow();
-    const { kernel, clock } = createTestKernel([workflow]);
+    const { kernel, clock } = createTestKernel([workflow], {
+      clockStart: new Date(),
+    });
 
     await kernel.dispatch({
       type: "run.create",
@@ -109,7 +86,9 @@ describe("kernel: run.reapStuck", () => {
 
   it("does not reap PENDING or COMPLETED runs", async () => {
     const workflow = createSimpleWorkflow();
-    const { kernel, clock } = createTestKernel([workflow]);
+    const { kernel, clock } = createTestKernel([workflow], {
+      clockStart: new Date(),
+    });
 
     // Create a run that stays PENDING (never claimed)
     await kernel.dispatch({
@@ -132,9 +111,10 @@ describe("kernel: run.reapStuck", () => {
 
   it("skips reaping a run that recovered between query and update", async () => {
     const workflow = createSimpleWorkflow();
-    const { kernel, persistence, jobTransport, clock } = createTestKernel([
-      workflow,
-    ]);
+    const { kernel, persistence, jobTransport, clock } = createTestKernel(
+      [workflow],
+      { clockStart: new Date() },
+    );
 
     const { workflowRunId } = await kernel.dispatch({
       type: "run.create",
@@ -173,7 +153,9 @@ describe("kernel: run.reapStuck", () => {
 
   it("reports transitioned equal to failed (the only transition it performs)", async () => {
     const workflow = createSimpleWorkflow();
-    const { kernel, clock } = createTestKernel([workflow]);
+    const { kernel, clock } = createTestKernel([workflow], {
+      clockStart: new Date(),
+    });
 
     await kernel.dispatch({
       type: "run.create",
@@ -196,7 +178,9 @@ describe("kernel: run.reapStuck", () => {
 
   it("does not double-reap when a concurrent updateRun changed the version first (version guard)", async () => {
     const workflow = createSimpleWorkflow();
-    const { kernel, persistence, clock } = createTestKernel([workflow]);
+    const { kernel, persistence, clock } = createTestKernel([workflow], {
+      clockStart: new Date(),
+    });
 
     const { workflowRunId } = await kernel.dispatch({
       type: "run.create",
@@ -230,9 +214,10 @@ describe("kernel: run.reapStuck", () => {
 
   it("re-enqueues a PENDING stage with no matching job instead of failing the run (enqueue-outside-tx recovery)", async () => {
     const workflow = createSimpleWorkflow();
-    const { kernel, persistence, jobTransport, clock } = createTestKernel([
-      workflow,
-    ]);
+    const { kernel, persistence, jobTransport, clock } = createTestKernel(
+      [workflow],
+      { clockStart: new Date() },
+    );
 
     const { workflowRunId } = await kernel.dispatch({
       type: "run.create",

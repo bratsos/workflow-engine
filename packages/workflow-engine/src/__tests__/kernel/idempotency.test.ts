@@ -10,17 +10,9 @@
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { defineStage } from "../../core/stage-factory.js";
-import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
+import { WorkflowBuilder } from "../../core/workflow.js";
 import { IdempotencyInProgressError } from "../../kernel/errors.js";
-import { createKernel } from "../../kernel/kernel.js";
-import {
-  CollectingEventSink,
-  FakeClock,
-  InMemoryBlobStore,
-  NoopScheduler,
-} from "../../kernel/testing/index.js";
-import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
-import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
+import { createTestKernel } from "../utils/index.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -43,43 +35,6 @@ function createSimpleWorkflow(id: string = "test-workflow") {
   return new WorkflowBuilder(id, "Test Workflow", "Test", schema, schema)
     .pipe(stage)
     .build();
-}
-
-function createTestKernel(workflows: Workflow<any, any>[] = []) {
-  const persistence = new InMemoryWorkflowPersistence();
-  const blobStore = new InMemoryBlobStore();
-  const jobTransport = new InMemoryJobQueue("test-worker");
-  const eventSink = new CollectingEventSink();
-  const scheduler = new NoopScheduler();
-  const clock = new FakeClock();
-
-  const registry = new Map<string, Workflow<any, any>>();
-  for (const w of workflows) {
-    registry.set(w.id, w);
-  }
-
-  const kernel = createKernel({
-    persistence,
-    blobStore,
-    jobTransport,
-    eventSink,
-    scheduler,
-    clock,
-    registry: { getWorkflow: (id) => registry.get(id) },
-  });
-
-  const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
-  return {
-    kernel,
-    flush,
-    persistence,
-    blobStore,
-    jobTransport,
-    eventSink,
-    scheduler,
-    clock,
-    registry,
-  };
 }
 
 // ---------------------------------------------------------------------------
@@ -414,24 +369,7 @@ describe("kernel: idempotency", () => {
 
   it("respects a custom idempotencyStaleInProgressMs", async () => {
     const workflow = createSimpleWorkflow();
-    const persistence = new InMemoryWorkflowPersistence();
-    const blobStore = new InMemoryBlobStore();
-    const jobTransport = new InMemoryJobQueue("test-worker");
-    const eventSink = new CollectingEventSink();
-    const scheduler = new NoopScheduler();
-    const clock = new FakeClock();
-    const registry = new Map<string, Workflow<any, any>>([
-      [workflow.id, workflow],
-    ]);
-
-    const kernel = createKernel({
-      persistence,
-      blobStore,
-      jobTransport,
-      eventSink,
-      scheduler,
-      clock,
-      registry: { getWorkflow: (id) => registry.get(id) },
+    const { kernel, persistence, clock } = createTestKernel([workflow], {
       idempotencyStaleInProgressMs: 60 * 1000,
     });
 
