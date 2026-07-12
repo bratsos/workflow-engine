@@ -6,7 +6,7 @@
  */
 
 import { google } from "@ai-sdk/google";
-import type { LanguageModelV3 } from "@ai-sdk/provider";
+import type { LanguageModelV4 } from "@ai-sdk/provider";
 import { openrouter } from "@openrouter/ai-sdk-provider";
 import { createLogger } from "../utils/logger";
 import {
@@ -18,7 +18,7 @@ import {
 
 export const logger = createLogger("AIHelper");
 
-export function getModelProvider(modelConfig: ModelConfig): LanguageModelV3 {
+export function getModelProvider(modelConfig: ModelConfig): LanguageModelV4 {
   if (modelConfig.provider === "openrouter") {
     // strict pricing: don't pay more than the model's defined cost
     // this effectively prevents routing to more expensive providers

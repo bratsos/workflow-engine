@@ -6,7 +6,8 @@
  * read from the AI SDK's buffered promises independently of iteration.
  */
 
-import type { SharedV3ProviderOptions } from "@ai-sdk/provider";
+import type { SharedV4ProviderOptions } from "@ai-sdk/provider";
+import type { GenerateTextEndEvent, ToolSet } from "ai";
 import { streamText as aiStreamText } from "ai";
 import { logFailure } from "./generate";
 import { getModel, type ModelKey } from "./model-helper";
@@ -55,7 +56,7 @@ export function streamText(
       metadata: {
         temperature: options.temperature,
         maxTokens: options.maxTokens,
-        ...(input.system ? { system: input.system } : {}),
+        ...(input.instructions ? { instructions: input.instructions } : {}),
       },
     });
   };
@@ -69,7 +70,7 @@ export function streamText(
     temperature: options.temperature ?? 0.7,
     maxTokens: options.maxTokens,
     hasTools,
-    hasSystem: !!input.system,
+    hasInstructions: !!input.instructions,
   });
 
   let fullText = "";
@@ -82,7 +83,7 @@ export function streamText(
   } | null = null;
 
   // Persist the call exactly once, whether triggered by the AI SDK's
-  // onFinish callback (so a call is always logged even if the consumer
+  // onEnd callback (so a call is always logged even if the consumer
   // never calls getUsage()) or by an explicit getUsage() call.
   const persistUsage = (
     inputTokens: number,
@@ -126,7 +127,7 @@ export function streamText(
         streamChunks: chunkCount,
         durationMs,
         ...(reasoning ? { hasReasoning: true } : {}),
-        ...(input.system ? { system: input.system } : {}),
+        ...(input.instructions ? { instructions: input.instructions } : {}),
       },
     });
 
@@ -142,18 +143,18 @@ export function streamText(
       maxRetries: options.maxRetries,
     }),
     ...(options.abortSignal && { abortSignal: options.abortSignal }),
-    ...(input.system ? { system: input.system } : {}),
+    ...(input.instructions ? { instructions: input.instructions } : {}),
     // Provider-specific options (e.g. reasoning control) passed through.
     // Cast: the public type uses `unknown` values for DX; the consumer is
     // responsible for passing JSON-serializable provider options.
     ...(options.providerOptions && {
-      providerOptions: options.providerOptions as SharedV3ProviderOptions,
+      providerOptions: options.providerOptions as SharedV4ProviderOptions,
     }),
     // Tool-related options (only included if tools are provided)
     ...(hasTools && {
       tools: options.tools,
       stopWhen: options.stopWhen,
-      onStepFinish: options.onStepFinish,
+      onStepEnd: options.onStepEnd,
     }),
     // Error callback to log streaming errors
     onError: ({ error }: { error: unknown }) => {
@@ -162,13 +163,11 @@ export function streamText(
     // Ensure the call is always logged once the stream finishes, even if
     // the consumer never calls getUsage(). Dedup'd against getUsage() via
     // the usageResolved flag in persistUsage.
-    onFinish: (event: {
-      totalUsage?: { inputTokens?: number; outputTokens?: number };
-      text?: string;
-      reasoningText?: string;
-    }) => {
-      const inputTokens = event.totalUsage?.inputTokens ?? 0;
-      const outputTokens = event.totalUsage?.outputTokens ?? 0;
+    onEnd: (event: GenerateTextEndEvent<ToolSet>) => {
+      const inputTokens =
+        event.usage?.inputTokens ?? event.totalUsage?.inputTokens ?? 0;
+      const outputTokens =
+        event.usage?.outputTokens ?? event.totalUsage?.outputTokens ?? 0;
       persistUsage(
         inputTokens,
         outputTokens,
@@ -220,10 +219,10 @@ export function streamText(
   // ReadableStream lock error).
 
   // Create usage getter that waits for stream completion and persists
-  // (or reuses the persistence already done by onFinish).
+  // (or reuses the persistence already done by onEnd).
   const getUsage = async () => {
     const usage = await result.usage;
-    const reasoning = await result.reasoningText;
+    const reasoning = await getReasoning();
     const responseText = (await result.text) || fullText;
     const inputTokens = usage?.inputTokens ?? 0;
     const outputTokens = usage?.outputTokens ?? 0;
@@ -236,8 +235,13 @@ export function streamText(
   const getText = async () => (await result.text) || fullText;
 
   // Reasoning/thinking text, when the model emitted any (separate channel
-  // from the answer). Undefined otherwise.
-  const getReasoning = async () => await result.reasoningText;
+  // from the answer). `finalStep.reasoningText` is the canonical v7 source;
+  // the top-level (deprecated) field is a fallback for safety. Undefined
+  // otherwise.
+  const getReasoning = async () => {
+    const finalStep = await result.finalStep;
+    return finalStep?.reasoningText ?? (await result.reasoningText);
+  };
 
   return {
     stream: streamIterable,

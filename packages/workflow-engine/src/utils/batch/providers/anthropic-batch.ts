@@ -74,7 +74,10 @@ export class AnthropicBatchProvider
         req.tools && Object.keys(req.tools).length > 0
           ? Object.entries(req.tools).map(([name, tool]) => ({
               name,
-              description: tool.description || "",
+              // Batch tool defs are static (no call-time options), so a v7
+              // dynamic (function) description can't be resolved here.
+              description:
+                typeof tool.description === "string" ? tool.description : "",
               input_schema: (tool.inputSchema
                 ? asSchema(tool.inputSchema).jsonSchema
                 : {

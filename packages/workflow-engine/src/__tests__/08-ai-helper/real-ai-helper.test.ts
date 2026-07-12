@@ -1,7 +1,7 @@
 /**
  * Regression tests for a set of verified AI-layer bugs, driving the REAL
- * AIHelperImpl (via createAIHelper) with a fake LanguageModelV3/
- * EmbeddingModelV3 injected through providerResolver / registerEmbeddingProvider,
+ * AIHelperImpl (via createAIHelper) with a fake LanguageModelV4/
+ * EmbeddingModelV4 injected through providerResolver / registerEmbeddingProvider,
  * so these exercise the actual implementation rather than MockAIHelper.
  *
  * Covers:
@@ -17,8 +17,8 @@
  *    request's schema, and must not cast failed results to `{} as T`.
  */
 
-import type { EmbeddingModelV3 } from "@ai-sdk/provider";
-import { MockEmbeddingModelV3, MockLanguageModelV3 } from "ai/test";
+import type { EmbeddingModelV4 } from "@ai-sdk/provider";
+import { MockEmbeddingModelV4, MockLanguageModelV4 } from "ai/test";
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 
@@ -89,7 +89,7 @@ const USAGE = {
 describe("tool-call cost is not double counted", () => {
   it("logs tool-execution records as zero-cost observability entries", async () => {
     let step = 0;
-    const model = new MockLanguageModelV3({
+    const model = new MockLanguageModelV4({
       doGenerate: async () => {
         step++;
         if (step === 1) {
@@ -131,7 +131,7 @@ describe("tool-call cost is not double counted", () => {
         },
       },
       stopWhen: stepCountIs(2),
-      onStepFinish: async () => {},
+      onStepEnd: async () => {},
     });
 
     const toolCallRecords = calls.filter((c) =>
@@ -156,7 +156,7 @@ describe("tool-call cost is not double counted", () => {
 
 describe("streamed calls are always logged once", () => {
   function simpleTextStreamModel() {
-    return new MockLanguageModelV3({
+    return new MockLanguageModelV4({
       doStream: async () => {
         const { simulateReadableStream } = await import("ai/test");
         return {
@@ -186,7 +186,7 @@ describe("streamed calls are always logged once", () => {
       // consume without ever calling getUsage()
     }
 
-    // onFinish runs as part of the AI SDK's internal stream consumption;
+    // onEnd runs as part of the AI SDK's internal stream consumption;
     // give any pending microtasks a chance to flush.
     await new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -243,15 +243,15 @@ describe("embed() uses embedMany() for multi-text input", () => {
       usage: { tokens: values.length * 2 },
       warnings: [],
     }));
-    const model = new MockEmbeddingModelV3({
+    const model = new MockEmbeddingModelV4({
       // A generous per-call limit so embedMany() batches all 3 texts into a
       // single provider call, distinguishing it from the old N-calls loop.
       maxEmbeddingsPerCall: 100,
-      doEmbed: doEmbed as unknown as EmbeddingModelV3["doEmbed"],
+      doEmbed: doEmbed as unknown as EmbeddingModelV4["doEmbed"],
     });
     registerEmbeddingProvider(
       "bugfix-mock-embed-provider",
-      () => model as unknown as EmbeddingModelV3,
+      () => model as unknown as EmbeddingModelV4,
     );
     registerModels({
       "bugfix-mock-embed-model": {
@@ -288,12 +288,12 @@ describe("embed() uses embedMany() for multi-text input", () => {
       usage: { tokens: 2 },
       warnings: [],
     }));
-    const model = new MockEmbeddingModelV3({
-      doEmbed: doEmbed as unknown as EmbeddingModelV3["doEmbed"],
+    const model = new MockEmbeddingModelV4({
+      doEmbed: doEmbed as unknown as EmbeddingModelV4["doEmbed"],
     });
     registerEmbeddingProvider(
       "bugfix-mock-embed-provider-single",
-      () => model as unknown as EmbeddingModelV3,
+      () => model as unknown as EmbeddingModelV4,
     );
     registerModels({
       "bugfix-mock-embed-model-single": {

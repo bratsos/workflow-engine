@@ -7,7 +7,7 @@
  * wires them together and re-exports the public surface from here.
  */
 
-import type { generateText, StepResult, streamText, ToolSet } from "ai";
+import type { generateText, streamText, ToolSet } from "ai";
 import type { z } from "zod";
 import type { AICallLogger } from "../persistence";
 import type { AIHelperStats } from "../persistence/interface";
@@ -19,7 +19,7 @@ import type { ModelConfig, ModelKey } from "./model-helper";
  */
 export type ProviderResolver = (
   modelConfig: ModelConfig,
-) => import("@ai-sdk/provider").LanguageModelV3 | null | undefined;
+) => import("@ai-sdk/provider").LanguageModelV4 | null | undefined;
 
 export type AICallType = "text" | "object" | "embed" | "stream" | "batch";
 
@@ -28,7 +28,7 @@ export interface AITextResult {
   inputTokens: number;
   outputTokens: number;
   cost: number;
-  /** Structured output when experimental_output is used */
+  /** Structured output when `output` is used */
   output?: any;
   /**
    * Reasoning/thinking text emitted by the model, when available. Reasoning
@@ -121,11 +121,9 @@ export interface TextOptions<TTools extends ToolSet = ToolSet> {
   /** Condition to stop tool execution (e.g., stepCountIs(3)) */
   stopWhen?: Parameters<typeof generateText>[0]["stopWhen"];
   /** Callback fired when each step completes (for collecting tool results) */
-  onStepFinish?: (stepResult: StepResult<TTools>) => Promise<void> | void;
-  /** Experimental structured output - use with tools for combined tool calling + structured output */
-  experimental_output?: Parameters<
-    typeof generateText
-  >[0]["experimental_output"];
+  onStepEnd?: Parameters<typeof generateText>[0]["onStepEnd"];
+  /** Structured output - use with tools for combined tool calling + structured output */
+  output?: Parameters<typeof generateText>[0]["output"];
   /**
    * Provider-specific options passed directly to the AI SDK call. Use this to
    * control reasoning per call, e.g.
@@ -147,7 +145,7 @@ export interface ObjectOptions<TTools extends ToolSet = ToolSet> {
   /** Condition to stop tool execution (e.g., stepCountIs(3)) */
   stopWhen?: Parameters<typeof generateText>[0]["stopWhen"];
   /** Callback fired when each step completes (for collecting tool results) */
-  onStepFinish?: (stepResult: StepResult<TTools>) => Promise<void> | void;
+  onStepEnd?: Parameters<typeof generateText>[0]["onStepEnd"];
   /**
    * Provider-specific options passed directly to the AI SDK call (e.g.
    * `{ anthropic: { thinking: { type: "disabled" } } }`).
@@ -176,7 +174,7 @@ export interface StreamOptions {
   /** Condition to stop tool execution (e.g., stepCountIs(3)) */
   stopWhen?: Parameters<typeof streamText>[0]["stopWhen"];
   /** Callback fired when each step completes (for collecting tool results) */
-  onStepFinish?: Parameters<typeof streamText>[0]["onStepFinish"];
+  onStepEnd?: Parameters<typeof streamText>[0]["onStepEnd"];
   /**
    * Provider-specific options passed directly to the AI SDK call. Use this to
    * control reasoning per call, e.g.
@@ -206,11 +204,11 @@ export type TextInput = string | ContentPart[];
 
 // Input types for streamText - mirrors AI SDK's flexible input
 export type StreamTextInput =
-  | { prompt: string; messages?: never; system?: string }
+  | { prompt: string; messages?: never; instructions?: string }
   | {
       messages: Parameters<typeof streamText>[0]["messages"];
       prompt?: never;
-      system?: string;
+      instructions?: string;
     };
 
 // =============================================================================

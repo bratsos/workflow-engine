@@ -5,7 +5,7 @@
  * in getEmbeddingModelProvider().
  */
 
-import type { EmbeddingModelV3 } from "@ai-sdk/provider";
+import type { EmbeddingModelV4 } from "@ai-sdk/provider";
 import { describe, expect, it, vi } from "vitest";
 
 // Mock optional peer dependencies that ai-helper.ts transitively imports
@@ -33,11 +33,11 @@ function makeModelConfig(provider: string, id: string): ModelConfig {
 }
 
 /**
- * Create a stub EmbeddingModelV3 for testing.
+ * Create a stub EmbeddingModelV4 for testing.
  */
-function createStubEmbeddingModel(modelId: string): EmbeddingModelV3 {
+function createStubEmbeddingModel(modelId: string): EmbeddingModelV4 {
   return {
-    specificationVersion: "v3",
+    specificationVersion: "v4",
     modelId,
     provider: "test-provider",
     maxEmbeddingsPerCall: 1,

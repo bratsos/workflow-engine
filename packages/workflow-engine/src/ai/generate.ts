@@ -6,7 +6,7 @@
  * logging shared with embeddings.ts and stream.ts.
  */
 
-import type { SharedV3ProviderOptions } from "@ai-sdk/provider";
+import type { SharedV4ProviderOptions } from "@ai-sdk/provider";
 import type { StepResult, ToolSet } from "ai";
 import { generateText as aiGenerateText, Output } from "ai";
 import type { z } from "zod";
@@ -114,7 +114,7 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
   // Determine if we have multimodal content
   const isMultimodal = Array.isArray(prompt);
   const hasTools = options.tools !== undefined;
-  const hasOutputSchema = options.experimental_output !== undefined;
+  const hasOutputSchema = options.output !== undefined;
 
   // Extract text prompt for logging (for multimodal, join text parts)
   const promptForLog = extractPromptForLog(prompt);
@@ -127,7 +127,7 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
   }
 
   // Create internal wrapper that logs tool usage and then calls user's callback
-  const wrappedOnStepFinish = options.onStepFinish
+  const wrappedOnStepEnd = options.onStepEnd
     ? async (stepResult: StepResult<TTools>) => {
         // Log each tool result to a child topic
         if (stepResult.toolResults && Array.isArray(stepResult.toolResults)) {
@@ -164,7 +164,7 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
           }
         }
         // Call user's callback
-        await options.onStepFinish?.(stepResult);
+        await options.onStepEnd?.(stepResult);
       }
     : undefined;
 
@@ -181,7 +181,7 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
     // Cast: the public type uses `unknown` values for DX; the consumer is
     // responsible for passing JSON-serializable provider options.
     ...(options.providerOptions && {
-      providerOptions: options.providerOptions as SharedV3ProviderOptions,
+      providerOptions: options.providerOptions as SharedV4ProviderOptions,
     }),
     // Tool-related options (only included if tools are provided)
     ...(hasTools && {
@@ -191,13 +191,13 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
         typeof aiGenerateText
       >[0]["toolChoice"],
       stopWhen: options.stopWhen,
-      onStepFinish: wrappedOnStepFinish as Parameters<
+      onStepEnd: wrappedOnStepEnd as Parameters<
         typeof aiGenerateText
-      >[0]["onStepFinish"],
+      >[0]["onStepEnd"],
     }),
-    // Experimental structured output (for tools + schema)
+    // Structured output (for tools + schema)
     ...(hasOutputSchema && {
-      experimental_output: options.experimental_output,
+      output: options.output,
     }),
   };
 
@@ -215,23 +215,24 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
   });
 
   try {
-    // Cast to 'as any' to bypass AI SDK's strict NoInfer<TTools> constraints
-    // Our TextOptions<TTools> provides proper typing at the interface level
+    // Cast to the SDK's own param type (not `any`) to bypass NoInfer<TTools>
+    // while still catching a future SDK shape change at compile time.
+    // Our TextOptions<TTools> provides proper typing at the interface level.
     const result = isMultimodal
       ? await aiGenerateText({
           ...baseOptions,
           messages: buildMultimodalMessages(prompt as ContentPart[]),
-        } as any)
+        } as Parameters<typeof aiGenerateText>[0])
       : await aiGenerateText({
           ...baseOptions,
           prompt,
-        } as any);
+        } as Parameters<typeof aiGenerateText>[0]);
 
     // Debug logging for result
     if (hasTools || hasOutputSchema) {
       const resultAny = result as { steps?: unknown[]; output?: unknown };
       // `.output` is a getter that throws AI_NoOutputGeneratedError unless
-      // experimental_output was configured - only probe it when relevant.
+      // `output` was configured - only probe it when relevant.
       let hasOutput = false;
       if (hasOutputSchema) {
         try {
@@ -298,7 +299,7 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
       outputTokens,
       cost,
       ...(reasoning ? { reasoning } : {}),
-      // Include structured output if experimental_output was used
+      // Include structured output if `output` was used
       ...(hasOutputSchema && {
         output: (result as { output?: unknown }).output,
       }),
@@ -362,13 +363,13 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
     // Cast: the public type uses `unknown` values for DX; the consumer is
     // responsible for passing JSON-serializable provider options.
     ...(options.providerOptions && {
-      providerOptions: options.providerOptions as SharedV3ProviderOptions,
+      providerOptions: options.providerOptions as SharedV4ProviderOptions,
     }),
     // Tool-related options (only included if tools are provided)
     ...(hasTools && {
       tools: options.tools,
       stopWhen: options.stopWhen,
-      onStepFinish: options.onStepFinish,
+      onStepEnd: options.onStepEnd,
     }),
   };
 

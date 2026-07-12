@@ -319,11 +319,11 @@ describe("I want to stream text using AIHelper", () => {
       expect(lastCall?.options).toHaveProperty("maxTokens", 500);
     });
 
-    it("should support system message in input", async () => {
-      // Given: Input with system message
+    it("should support instructions message in input", async () => {
+      // Given: Input with instructions message
       const result = ai.streamText("gemini-2.5-flash", {
         prompt: "Hello",
-        system: "You are a helpful assistant",
+        instructions: "You are a helpful assistant",
       });
 
       // Then: Stream is available
