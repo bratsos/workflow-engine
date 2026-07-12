@@ -37,7 +37,7 @@ A second wave folded into this same 0.11 release removes/relocates a handful of 
 
   Newly exported at root, no action needed: `ProviderResolver` (type), and the config-schema presets `withAIConfig`/`withConcurrency`/`withFeatureFlags`/`withStandardConfig` (see [08-common-patterns.md](../references/08-common-patterns.md#config-presets)).
 
-- [ ] **Update hand-written/mocked Prisma clients, if any.** `PrismaWorkflowPersistence`, `PrismaJobQueue`, `PrismaAICallLogger`, and `createEnumHelper` no longer accept `prisma: any`. They now require a structural shape (internally called `EnginePrismaClient`; it isn't exported, so you never reference it by name) that any real generated Prisma client (6.x or 7.x) satisfies automatically. Only a hand-written mock/fake missing a delegate the adapter actually calls (e.g. `workflowRun`, `$transaction`) would newly fail to typecheck, where it previously compiled silently under `any`. No runtime behavior change — this is compile-time only.
+- [ ] **Update hand-written/mocked Prisma clients, if any.** `PrismaWorkflowPersistence`, `PrismaJobQueue`, `PrismaAICallLogger`, and `createEnumHelper` no longer accept `prisma: any`. They now require a structural shape (`EnginePrismaClient`, exported along with `PrismaDelegate` from `@bratsos/workflow-engine/persistence/prisma`) that any real generated Prisma client (6.x or 7.x) satisfies automatically. Only a hand-written mock/fake missing a delegate the adapter actually calls (e.g. `workflowRun`, `$transaction`) would newly fail to typecheck, where it previously compiled silently under `any`. No runtime behavior change — this is compile-time only.
 
 ## New features
 

@@ -15,6 +15,9 @@ export {
   defineStage,
   type EnhancedStageContext,
   type InferInput,
+  type InferStageConfig,
+  type InferStageInput,
+  type InferStageOutput,
   type SimpleStageResult,
   type SyncStageDefinition,
 } from "./core/stage-factory";
@@ -31,6 +34,10 @@ export { type StageResult } from "./core/types";
 export {
   type DefineWorkflowOptions,
   defineWorkflow,
+  type InferStageOutputById,
+  type InferWorkflowContext,
+  type InferWorkflowInput,
+  type InferWorkflowOutput,
   type InferWorkflowStageIds,
   Workflow,
   WorkflowBuilder,
