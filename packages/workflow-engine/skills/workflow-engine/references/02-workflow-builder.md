@@ -4,6 +4,27 @@ Complete API for building type-safe workflows with sequential and parallel stage
 
 ## Creating a Workflow
 
+`defineWorkflow({...})` is the recommended way to build a workflow — an options-object API. `output` is optional: it's only the builder's *initial* output type before any stages are piped, and gets silently replaced by the last piped stage's output schema at `.build()`. Most callers can omit it.
+
+```typescript
+import { defineWorkflow } from "@bratsos/workflow-engine";
+import { z } from "zod";
+
+const workflow = defineWorkflow({
+  id: "workflow-id",
+  name: "Workflow Name",
+  description: "Description",
+  input: InputSchema,
+})
+  .pipe(stage1)
+  .pipe(stage2)
+  .build();
+```
+
+### `new WorkflowBuilder(...)` (deprecated, 5-positional-argument constructor)
+
+The original constructor form. `defineWorkflow` returns the same `WorkflowBuilder` instance with the same chaining, so this is purely a construction-syntax difference — but the positional form is `@deprecated` (removal at 1.0): `inputSchema` and `currentOutputSchema` are both plain `z.ZodTypeAny`, so positional args of the same type are easy to transpose by accident. Prefer `defineWorkflow` above for new code.
+
 ```typescript
 import { WorkflowBuilder } from "@bratsos/workflow-engine";
 import { z } from "zod";
@@ -27,7 +48,7 @@ const workflow = new WorkflowBuilder(
 Add a stage to execute sequentially after the previous stage.
 
 ```typescript
-const workflow = new WorkflowBuilder(...)
+const workflow = defineWorkflow({ ... })
   .pipe(extractionStage)     // Execution group 1
   .pipe(processingStage)     // Execution group 2
   .pipe(outputStage)         // Execution group 3
@@ -44,7 +65,7 @@ Each `.pipe()` call:
 Add multiple stages that execute concurrently in the same execution group.
 
 ```typescript
-const workflow = new WorkflowBuilder(...)
+const workflow = defineWorkflow({ ... })
   .pipe(extractionStage)                    // Group 1
   .parallel([classifyStage, summarizeStage]) // Group 2 (parallel)
   .pipe(mergeStage)                          // Group 3
@@ -118,6 +139,8 @@ if (workflow.hasStage("optional-stage")) {
 
 Get a human-readable visualization of execution order.
 
+**`@deprecated`** — Debug/inspection helper for ad-hoc logging; not a stable, structured API (returns freeform text). Prefer `getExecutionPlan()` or `getAllStages()` if you need to consume the execution order programmatically. Removal at 1.0.
+
 ```typescript
 console.log(workflow.getExecutionOrder());
 // Workflow: My Workflow (my-workflow)
@@ -186,6 +209,8 @@ if (!result.valid) {
 ### estimateCost(input, config)
 
 Estimate total workflow cost (if stages implement `estimateCost`).
+
+**`@deprecated`** — Rough, pre-execution-only estimate: it always calls every stage's `estimateCost` with the workflow's *original* input rather than propagating each stage's actual (previous-stage) input, so it can't account for real inter-stage data flow. Removal at 1.0.
 
 ```typescript
 const cost = workflow.estimateCost(
@@ -294,13 +319,13 @@ const stageA = defineStage({
 });
 
 // This will throw an error:
-new WorkflowBuilder(...)
+defineWorkflow({ ... })
   .pipe(stageA)  // Throws: "stage-a" has missing dependencies: stage-b
   .pipe(stageB)
   .build();
 
 // Correct order:
-new WorkflowBuilder(...)
+defineWorkflow({ ... })
   .pipe(stageB)  // Add dependency first
   .pipe(stageA)  // Now stage-a can depend on stage-b
   .build();
@@ -309,7 +334,7 @@ new WorkflowBuilder(...)
 ## Complete Example
 
 ```typescript
-import { WorkflowBuilder, defineStage } from "@bratsos/workflow-engine";
+import { defineWorkflow, defineStage } from "@bratsos/workflow-engine";
 import { z } from "zod";
 
 // Define stages
@@ -319,7 +344,7 @@ const extractStage = defineStage({
   schemas: {
     input: z.object({ url: z.string() }),
     output: z.object({ text: z.string(), metadata: z.any() }),
-    config: z.object({ maxLength: z.number().default(10000) }),
+    config: z.object({ maxLength: z.number().default(50000) }),
   },
   async execute(ctx) {
     const data = await fetch(ctx.input.url).then(r => r.text());
@@ -384,13 +409,12 @@ const mergeStage = defineStage({
 });
 
 // Build workflow
-const documentWorkflow = new WorkflowBuilder(
-  "document-analysis",
-  "Document Analysis",
-  "Analyzes documents: extracts, classifies, and summarizes",
-  z.object({ url: z.string().url() }),
-  z.object({ summary: z.string(), categories: z.array(z.string()) })
-)
+const documentWorkflow = defineWorkflow({
+  id: "document-analysis",
+  name: "Document Analysis",
+  description: "Analyzes documents: extracts, classifies, and summarizes",
+  input: z.object({ url: z.string().url() }),
+})
   .pipe(extractStage)
   .parallel([classifyStage, summarizeStage])
   .pipe(mergeStage)

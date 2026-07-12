@@ -4,16 +4,8 @@ import {
   defineAsyncBatchStage,
   defineStage,
 } from "../../core/stage-factory.js";
-import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
-import { createKernel } from "../../kernel/kernel.js";
-import {
-  CollectingEventSink,
-  FakeClock,
-  InMemoryBlobStore,
-  NoopScheduler,
-} from "../../kernel/testing/index.js";
-import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
-import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
+import { WorkflowBuilder } from "../../core/workflow.js";
+import { createTestKernel } from "../utils/index.js";
 
 function createPassthroughStage(id: string, schema: z.ZodTypeAny) {
   return defineStage({
@@ -42,43 +34,6 @@ function createTwoStageWorkflow(id: string = "test-workflow") {
     .pipe(stage1)
     .pipe(stage2)
     .build();
-}
-
-function createTestKernel(workflows: Workflow<any, any>[] = []) {
-  const persistence = new InMemoryWorkflowPersistence();
-  const blobStore = new InMemoryBlobStore();
-  const jobTransport = new InMemoryJobQueue("test-worker");
-  const eventSink = new CollectingEventSink();
-  const scheduler = new NoopScheduler();
-  const clock = new FakeClock();
-
-  const registry = new Map<string, Workflow<any, any>>();
-  for (const w of workflows) {
-    registry.set(w.id, w);
-  }
-
-  const kernel = createKernel({
-    persistence,
-    blobStore,
-    jobTransport,
-    eventSink,
-    scheduler,
-    clock,
-    registry: { getWorkflow: (id) => registry.get(id) },
-  });
-
-  const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
-  return {
-    kernel,
-    flush,
-    persistence,
-    blobStore,
-    jobTransport,
-    eventSink,
-    scheduler,
-    clock,
-    registry,
-  };
 }
 
 describe("kernel: job.execute", () => {
@@ -359,7 +314,7 @@ describe("kernel: job.execute", () => {
         stageId: "stage-1",
         config: {},
       }),
-    ).rejects.toThrow("not found in registry");
+    ).rejects.toThrow(/not found in registry/);
   });
 
   it("stage is visible as RUNNING during execution", async () => {
@@ -561,5 +516,214 @@ describe("kernel: job.execute", () => {
     });
 
     expect(result.outcome).toBe("failed");
+    // Deterministic Zod validation failures are marked non-retryable so
+    // hosts fail the job terminally instead of burning retry attempts.
+    expect(result.retryable).toBe(false);
+    expect(result.error).toContain("ZodError");
+  });
+
+  it("does not re-execute an already-COMPLETED stage (stale-lease duplicate guard)", async () => {
+    let executionCount = 0;
+    const schema = z.object({ data: z.string() });
+    const stage = defineStage({
+      id: "counted",
+      name: "Counted",
+      schemas: { input: schema, output: schema, config: z.object({}) },
+      async execute(ctx) {
+        executionCount++;
+        return { output: ctx.input };
+      },
+    });
+
+    const workflow = new WorkflowBuilder(
+      "test-workflow",
+      "Test",
+      "Test",
+      schema,
+      schema,
+    )
+      .pipe(stage)
+      .build();
+
+    const { kernel, persistence } = createTestKernel([workflow]);
+
+    const createResult = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "key-dup",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+    await persistence.updateRun(createResult.workflowRunId, {
+      status: "RUNNING",
+    });
+
+    const first = await kernel.dispatch({
+      type: "job.execute",
+      workflowRunId: createResult.workflowRunId,
+      workflowId: "test-workflow",
+      stageId: "counted",
+      config: {},
+    });
+    expect(first.outcome).toBe("completed");
+    expect(executionCount).toBe(1);
+
+    // Simulate a stale-lease duplicate delivery of the same job (e.g. a
+    // heartbeat gap caused releaseStaleJobs to re-enqueue it even though
+    // the stage already completed).
+    const duplicate = await kernel.dispatch({
+      type: "job.execute",
+      workflowRunId: createResult.workflowRunId,
+      workflowId: "test-workflow",
+      stageId: "counted",
+      config: {},
+    });
+
+    expect(duplicate.outcome).toBe("completed");
+    expect(duplicate.output).toEqual(first.output);
+    expect(executionCount).toBe(1);
+  });
+
+  it("fails loudly when a downstream stage's previous-group output is missing", async () => {
+    const schema = z.object({ data: z.string() });
+    const workflow = createTwoStageWorkflow();
+    const { kernel, persistence } = createTestKernel([workflow]);
+
+    const createResult = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "key-missing-output",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+    await persistence.updateRun(createResult.workflowRunId, {
+      status: "RUNNING",
+    });
+
+    // Execute stage-1 (group 1) normally so stage-2 (group 2) becomes
+    // eligible, but simulate the group-1 output blob going missing —
+    // e.g. corrupted/expired storage — by never actually persisting a
+    // COMPLETED stage-1 record. Instead, directly attempt stage-2, whose
+    // execution group is 2, so resolveStageInput must resolve group 1's
+    // output from workflowContext and find nothing.
+    const result = await kernel.dispatch({
+      type: "job.execute",
+      workflowRunId: createResult.workflowRunId,
+      workflowId: "test-workflow",
+      stageId: "stage-2",
+      config: {},
+    });
+
+    expect(result.outcome).toBe("failed");
+    expect(result.error).toMatch(/missing the output of execution group/);
+
+    // The workflow's original input must NOT have silently leaked into
+    // stage-2 as a fallback.
+    const stages = await persistence.getStagesByRun(createResult.workflowRunId);
+    const stage2 = stages.find((s) => s.stageId === "stage-2");
+    expect(stage2!.status).toBe("FAILED");
+  });
+
+  it("stores the per-stage config slice — not the full run-config map — when Phase 1 creates the stage record", async () => {
+    // Regression test: job-execute's Phase 1 upsertStage `create` branch
+    // used to store the entire run-config map (keyed by every stage id)
+    // verbatim in the stage record's `config` column, instead of slicing
+    // out just this stage's entry the way run.claimPending/run.transition/
+    // run.rerunFrom all do. The bug only surfaces when Phase 1 hits the
+    // `create` branch — i.e. no stage record exists yet — so dispatch
+    // job.execute directly without a prior run.claimPending/run.transition
+    // having created a PENDING record first.
+    const workflow = createSimpleWorkflow();
+    const { kernel, persistence } = createTestKernel([workflow]);
+
+    const createResult = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "key-config-slice",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+    await persistence.updateRun(createResult.workflowRunId, {
+      status: "RUNNING",
+    });
+
+    const fullRunConfigMap = {
+      "stage-1": { own: "value" },
+      "other-stage": { secret: "must-not-leak-into-stage-1" },
+    };
+
+    const result = await kernel.dispatch({
+      type: "job.execute",
+      workflowRunId: createResult.workflowRunId,
+      workflowId: "test-workflow",
+      stageId: "stage-1",
+      config: fullRunConfigMap,
+    });
+
+    expect(result.outcome).toBe("completed");
+
+    const stageRecord = await persistence.getStage(
+      createResult.workflowRunId,
+      "stage-1",
+    );
+    expect(stageRecord?.config).toEqual({ own: "value" });
+  });
+
+  it("logs a WARN and falls back to raw config when the stage config fails schema validation", async () => {
+    const schema = z.object({ data: z.string() });
+    const stage = defineStage({
+      id: "strict-config",
+      name: "Strict Config",
+      schemas: {
+        input: schema,
+        output: schema,
+        config: z.object({ requiredField: z.string() }),
+      },
+      async execute(ctx) {
+        return { output: ctx.input };
+      },
+    });
+
+    const workflow = new WorkflowBuilder(
+      "test-workflow",
+      "Test",
+      "Test",
+      schema,
+      schema,
+    )
+      .pipe(stage)
+      .build();
+
+    const { kernel, persistence } = createTestKernel([workflow]);
+
+    // Satisfy config validation at run-creation time...
+    const createResult = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "key-config-warn",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+      config: { "strict-config": { requiredField: "valid" } },
+    });
+    await persistence.updateRun(createResult.workflowRunId, {
+      status: "RUNNING",
+    });
+
+    // ...but dispatch job.execute directly with a config missing
+    // `requiredField` — configSchema.parse() throws inside LocalExecutor,
+    // which must fall back to the raw config AND log a WARN (no behavior
+    // change to the stage outcome itself).
+    const result = await kernel.dispatch({
+      type: "job.execute",
+      workflowRunId: createResult.workflowRunId,
+      workflowId: "test-workflow",
+      stageId: "strict-config",
+      config: { "strict-config": {} },
+    });
+
+    expect(result.outcome).toBe("completed");
+
+    const logs = persistence.getAllLogs();
+    const warnLog = logs.find(
+      (log) => log.level === "WARN" && /config/i.test(log.message),
+    );
+    expect(warnLog).toBeDefined();
+    expect(warnLog?.message).toMatch(/strict-config/);
   });
 });

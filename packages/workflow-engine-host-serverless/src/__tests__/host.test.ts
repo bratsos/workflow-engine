@@ -18,8 +18,10 @@ import {
   InMemoryBlobStore,
   NoopScheduler,
 } from "@bratsos/workflow-engine/kernel/testing";
-import { InMemoryWorkflowPersistence } from "@bratsos/workflow-engine/testing";
-import { InMemoryJobQueue } from "@bratsos/workflow-engine/testing";
+import {
+  InMemoryJobQueue,
+  InMemoryWorkflowPersistence,
+} from "@bratsos/workflow-engine/testing";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { createServerlessHost, type JobMessage } from "../host.js";

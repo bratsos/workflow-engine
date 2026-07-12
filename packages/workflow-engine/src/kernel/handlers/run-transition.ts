@@ -3,16 +3,14 @@
  *
  * Advances a workflow run to its next execution group, or marks it as
  * completed/failed depending on the current state of its stages.
- *
- * Extracted from WorkflowRuntime.transitionWorkflow() and completeWorkflow().
  */
 
-import type { Workflow } from "../../core/workflow";
 import { StaleVersionError } from "../../persistence/interface.js";
 import type { RunTransitionCommand, RunTransitionResult } from "../commands";
 import type { KernelEvent } from "../events";
 import {
   loadWorkflowContext,
+  prepareExecutionGroup,
   resolveExecutionGroupOutput,
 } from "../helpers/index.js";
 import type { HandlerResult, KernelDeps } from "../kernel";
@@ -32,7 +30,7 @@ const TERMINAL_STATUSES = new Set(["COMPLETED", "FAILED", "CANCELLED"]);
 const ACTIVE_STATUSES = new Set(["RUNNING", "PENDING", "SUSPENDED"]);
 
 // ---------------------------------------------------------------------------
-// Helper: enqueue an execution group
+// Helper: claim the run before mutating it
 // ---------------------------------------------------------------------------
 
 async function claimRunTransition(
@@ -50,61 +48,6 @@ async function claimRunTransition(
     }
     throw error;
   }
-}
-
-async function enqueueExecutionGroup(
-  run: WorkflowRunRecord,
-  workflow: Workflow<any, any>,
-  groupIndex: number,
-  deps: KernelDeps,
-): Promise<string[]> {
-  const stages = workflow.getStagesInExecutionGroup(groupIndex);
-
-  // Compute the current run-level attempt by taking the max attempt
-  // across all existing stages. After `run.rerunFrom` bumps the target
-  // group's stage records to a new attempt, this propagates the same
-  // attempt to downstream groups created here, so annotations from a
-  // single rerun span share one attempt value (and are distinguishable
-  // from prior-attempt annotations preserved via SetNull).
-  const existingStages = await deps.persistence.getStagesByRun(run.id);
-  const currentAttempt = existingStages.reduce(
-    (max, s) => (s.attempt > max ? s.attempt : max),
-    0,
-  );
-
-  const stagesToEnqueue: typeof stages = [];
-  for (const stage of stages) {
-    const record = await deps.persistence.upsertStage({
-      workflowRunId: run.id,
-      stageId: stage.id,
-      create: {
-        workflowRunId: run.id,
-        stageId: stage.id,
-        stageName: stage.name,
-        stageNumber: workflow.getStageIndex(stage.id) + 1,
-        executionGroup: groupIndex,
-        attempt: currentAttempt,
-        status: "PENDING",
-        config: (run.config as any)?.[stage.id] || {},
-      },
-      update: {},
-    });
-    if (record.status === "PENDING") {
-      stagesToEnqueue.push(stage);
-    }
-  }
-
-  if (stagesToEnqueue.length === 0) return [];
-
-  return deps.jobTransport.enqueueParallel(
-    stagesToEnqueue.map((stage) => ({
-      workflowRunId: run.id,
-      workflowId: run.workflowId,
-      stageId: stage.id,
-      priority: run.priority,
-      payload: { config: run.config || {} },
-    })),
-  );
 }
 
 // ---------------------------------------------------------------------------
@@ -142,7 +85,11 @@ export async function handleRunTransition(
     if (!(await claimRunTransition(run, deps))) {
       return { action: "noop" as const, _events: [] };
     }
-    await enqueueExecutionGroup(run, workflow, 1, deps);
+    const enqueue = await prepareExecutionGroup(run, workflow, deps, {
+      groupIndex: 1,
+      attemptMode: "max",
+      createMode: "upsert",
+    });
 
     events.push({
       type: "workflow:started",
@@ -150,7 +97,12 @@ export async function handleRunTransition(
       workflowRunId: run.id,
     });
 
-    return { action: "advanced" as const, nextGroup: 1, _events: events };
+    return {
+      action: "advanced" as const,
+      nextGroup: 1,
+      _events: events,
+      _postCommit: enqueue,
+    };
   }
 
   // 6. If any stage is still active, the run is in-flight -- noop
@@ -159,8 +111,42 @@ export async function handleRunTransition(
     return { action: "noop" as const, _events: [] };
   }
 
-  // 7. If any stage has failed, mark the entire run as failed
-  const failedStage = stages.find((s) => s.status === "FAILED");
+  // 7. If any stage has failed, mark the entire run as failed — unless a
+  // retry is still queued or in flight for it. A FAILED stage record does
+  // not necessarily mean the stage is done: job-execute flips the stage
+  // to FAILED on every throw, including ones the host will retry (job
+  // goes back to PENDING with backoff). If a sibling in the same
+  // execution group completes first, its run.transition dispatch must
+  // not race ahead and kill the run out from under the pending retry.
+  //
+  // A job is "still active" for a FAILED stage when it's RUNNING, or
+  // PENDING with attempt > 0 — the latter is the signature of a retry
+  // requeued by jobTransport.fail(..., shouldRetry: true) (dequeue()
+  // increments attempt before execution, and a retry-requeue preserves
+  // that count). A freshly-enqueued, never-dequeued job is PENDING with
+  // attempt === 0 and does not represent a retry in flight — it only
+  // occurs when a stage was enqueued but its job.execute was dispatched
+  // out-of-band (or hasn't run yet, in which case the stage wouldn't be
+  // FAILED in the first place).
+  const failedStages = stages.filter((s) => s.status === "FAILED");
+  let failedStage: (typeof failedStages)[number] | undefined;
+  if (failedStages.length > 0) {
+    const jobs = await deps.jobTransport.getJobsByWorkflowRun(run.id);
+    failedStage = failedStages.find(
+      (stage) =>
+        !jobs.some(
+          (job) =>
+            job.stageId === stage.stageId &&
+            (job.status === "RUNNING" ||
+              (job.status === "PENDING" && job.attempt > 0)),
+        ),
+    );
+    if (!failedStage) {
+      // Every FAILED stage still has a retry queued or in flight — the
+      // run is still active; wait for the retry's outcome.
+      return { action: "noop" as const, _events: [] };
+    }
+  }
   if (failedStage) {
     if (!(await claimRunTransition(run, deps))) {
       return { action: "noop" as const, _events: [] };
@@ -194,11 +180,16 @@ export async function handleRunTransition(
     if (!(await claimRunTransition(run, deps))) {
       return { action: "noop" as const, _events: [] };
     }
-    await enqueueExecutionGroup(run, workflow, maxGroup + 1, deps);
+    const enqueue = await prepareExecutionGroup(run, workflow, deps, {
+      groupIndex: maxGroup + 1,
+      attemptMode: "max",
+      createMode: "upsert",
+    });
     return {
       action: "advanced" as const,
       nextGroup: maxGroup + 1,
       _events: events,
+      _postCommit: enqueue,
     };
   }
 

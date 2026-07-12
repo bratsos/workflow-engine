@@ -1,0 +1,9 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "workflow-engine-docs",
+  "compatibility_date": "2026-07-04",
+  "assets": {
+    "directory": "./build",
+    "not_found_handling": "404-page"
+  }
+}

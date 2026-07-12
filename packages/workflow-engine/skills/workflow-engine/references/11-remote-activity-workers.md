@@ -19,7 +19,7 @@ Topology: a single trusted orchestrator + a fleet of disposable workers.
 ```typescript
 import { defineRemoteStage } from "@bratsos/workflow-engine-host-remote";
 
-const workflow = new WorkflowBuilder(...)
+const workflow = defineWorkflow({ ... })
   .pipe(defineRemoteStage(heavyStage, oTransport, {
     pollIntervalMs: 5_000,
     maxWaitMs: 3_600_000,
@@ -65,11 +65,22 @@ const worker = createActivityWorker({
   workerId: "worker-1",
   stageIds: ["heavy"],
   stageCodeVersion: "v1",
+
+  // Optional (v0.11+):
+  onError: (error, { consecutiveFailures }) => {
+    // Called whenever processOne() throws (e.g. a permanent lease/version
+    // mismatch). Defaults to console.error so failures are never silently
+    // swallowed.
+    logger.error("activity worker error", { error, consecutiveFailures });
+  },
+  maxBackoffMs: 30_000, // caps the exponential backoff applied between consecutive failures (default 30_000)
 });
 worker.start();
 ```
 
 The worker holds **zero standing credentials** — it receives a presigned URL from the broker for each artifact PUT/GET.
+
+**Cancellation (v0.11+):** the worker's heartbeat loop watches the broker's heartbeat response for a cancel signal (lease fenced/reaped). If it's set, the worker still lets the in-flight activity finish, but skips the presign/report round-trip afterward instead of attempting a doomed report against a lease that's gone.
 
 ## The orchestrator side
 
@@ -117,7 +128,7 @@ Workers PUT blobs directly to S3/R2 via the presigned URL — the broker server 
 | Export | Package | Purpose |
 |--------|---------|---------|
 | `defineRemoteStage(real, transport, opts?)` | host-remote | Proxy stage: suspends and resumes through the broker |
-| `createActivityWorker(cfg)` | host-remote | Worker loop: lease → run → report |
+| `createActivityWorker(cfg)` | host-remote | Worker loop: lease → run → report. `cfg.onError` (v0.11+) observes loop errors; `cfg.maxBackoffMs` (v0.11+, default 30s) caps retry backoff |
 | `createBrokerHttpServer(deps)` | host-remote | HTTP broker server (`/lease`, `/report`, `/heartbeat`, `/presign`, `/blob`) |
 | `createHttpWorkerTransport(cfg)` | host-remote | Worker transport over HTTP (bearer auth) |
 | `createInProcessTransport(broker, objectStore)` | host-remote | In-process transport for dev/tests |
@@ -128,7 +139,7 @@ Workers PUT blobs directly to S3/R2 via the presigned URL — the broker server 
 
 ## Limitations
 
-- No mid-activity cancellation — an in-flight `report()` is fenced; the run terminates correctly but the worker isn't interrupted.
+- No mid-activity cancellation — `execute()` itself is never interrupted; a fenced/reaped lease is only detected between heartbeats, so the worker finishes the activity and (as of v0.11) skips the doomed report rather than sending one, but it does not abort the run in progress.
 - Single-part PUT only — objects >5 GB need multipart.
 - Single-orchestrator — multi-instance HA needs a shared broker store (Prisma/Redis).
 - The S3 path is unit-tested against a permissive fake signer; add a real MinIO/LocalStack round-trip integration test before heavy production use.

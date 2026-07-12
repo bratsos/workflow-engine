@@ -101,190 +101,182 @@ describe("HTTP transport — broker server + worker client (real network)", () =
     teardowns = [];
   });
 
-  it(
-    "drives a workflow to COMPLETED over a real TCP connection: doubled === 6",
-    { timeout: 10_000 },
-    async () => {
-      const { orch, worker, os, serverClose } = setup();
-      teardowns.push(serverClose);
+  it("drives a workflow to COMPLETED over a real TCP connection: doubled === 6", {
+    timeout: 10_000,
+  }, async () => {
+    const { orch, worker, os, serverClose } = setup();
+    teardowns.push(serverClose);
 
-      // 1. Create + claim the workflow run.
-      const { workflowRunId } = await orch.kernel.dispatch({
-        type: "run.create",
-        idempotencyKey: "http-e2e-k1",
-        workflowId: orch.workflowId,
-        input: { seed: 3 },
-      });
-      await orch.kernel.dispatch({
-        type: "run.claimPending",
-        workerId: "orch",
-      });
+    // 1. Create + claim the workflow run.
+    const { workflowRunId } = await orch.kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "http-e2e-k1",
+      workflowId: orch.workflowId,
+      input: { seed: 3 },
+    });
+    await orch.kernel.dispatch({
+      type: "run.claimPending",
+      workerId: "orch",
+    });
 
-      // 2. Group 0: the remote (proxy) heavy stage — suspends until worker picks it up.
-      const job = await orch.jobQueue.dequeue();
-      expect(job).not.toBeNull();
+    // 2. Group 0: the remote (proxy) heavy stage — suspends until worker picks it up.
+    const job = await orch.jobQueue.dequeue();
+    expect(job).not.toBeNull();
 
-      const r1 = await orch.kernel.dispatch({
-        type: "job.execute",
-        workflowRunId,
-        workflowId: orch.workflowId,
-        stageId: job!.stageId,
-        config: {},
-      });
-      expect(r1.outcome).toBe("suspended");
-      await orch.jobQueue.suspend(
-        job!.jobId,
-        new Date(orch.clock.now().getTime() + 100),
-      );
+    const r1 = await orch.kernel.dispatch({
+      type: "job.execute",
+      workflowRunId,
+      workflowId: orch.workflowId,
+      stageId: job!.stageId,
+      config: {},
+    });
+    expect(r1.outcome).toBe("suspended");
+    await orch.jobQueue.suspend(
+      job!.jobId,
+      new Date(orch.clock.now().getTime() + 100),
+    );
 
-      // 3. Worker executes heavy stage over HTTP — lease + run + report + presign + blob PUT
-      //    all cross genuine TCP sockets with real JSON serialization.
-      const processed = await worker.processOne();
-      expect(processed).toBe(true);
+    // 3. Worker executes heavy stage over HTTP — lease + run + report + presign + blob PUT
+    //    all cross genuine TCP sockets with real JSON serialization.
+    const processed = await worker.processOne();
+    expect(processed).toBe(true);
 
-      // 4. Make the stage poll-eligible and poll.
-      await makeStageResumable(orch, workflowRunId);
-      const poll = await orch.kernel.dispatch({ type: "stage.pollSuspended" });
-      expect(poll.resumed).toBe(1);
+    // 4. Make the stage poll-eligible and poll.
+    await makeStageResumable(orch, workflowRunId);
+    const poll = await orch.kernel.dispatch({ type: "stage.pollSuspended" });
+    expect(poll.resumed).toBe(1);
 
-      // 5. Advance to group 1.
-      await orch.kernel.dispatch({ type: "run.transition", workflowRunId });
+    // 5. Advance to group 1.
+    await orch.kernel.dispatch({ type: "run.transition", workflowRunId });
 
-      // 6. Group 1: in-process core stage reads the artifact the worker wrote via HTTP.
-      const job2 = await orch.jobQueue.dequeue();
-      expect(job2).not.toBeNull();
+    // 6. Group 1: in-process core stage reads the artifact the worker wrote via HTTP.
+    const job2 = await orch.jobQueue.dequeue();
+    expect(job2).not.toBeNull();
 
-      const r2 = await orch.kernel.dispatch({
-        type: "job.execute",
-        workflowRunId,
-        workflowId: orch.workflowId,
-        stageId: job2!.stageId,
-        config: {},
-      });
-      expect(r2.outcome).toBe("completed");
-      await orch.jobQueue.complete(job2!.jobId);
+    const r2 = await orch.kernel.dispatch({
+      type: "job.execute",
+      workflowRunId,
+      workflowId: orch.workflowId,
+      stageId: job2!.stageId,
+      config: {},
+    });
+    expect(r2.outcome).toBe("completed");
+    await orch.jobQueue.complete(job2!.jobId);
 
-      const t = await orch.kernel.dispatch({
-        type: "run.transition",
-        workflowRunId,
-      });
-      expect(t.action).toBe("completed");
+    const t = await orch.kernel.dispatch({
+      type: "run.transition",
+      workflowRunId,
+    });
+    expect(t.action).toBe("completed");
 
-      // 7. Final assertions: run COMPLETED, output doubled === 6.
-      const run = await orch.persistence.getRun(workflowRunId);
-      expect(run?.status).toBe("COMPLETED");
-      expect((run?.output as { doubled: number }).doubled).toBe(6);
+    // 7. Final assertions: run COMPLETED, output doubled === 6.
+    const run = await orch.persistence.getRun(workflowRunId);
+    expect(run?.status).toBe("COMPLETED");
+    expect((run?.output as { doubled: number }).doubled).toBe(6);
 
-      // 8. Prove the artifact written by the worker over HTTP is readable by the
-      //    orchestrator's blobStore (same InMemoryObjectStore instance).
-      //    The heavy stage writes via ctx.storage (scoped storage backed by the
-      //    object store). We scan to find the blob the worker wrote over HTTP.
-      const allKeys = await os.list("workflow-v2/");
-      const blobKey = allKeys.find((k) => k.endsWith("blob.json"));
-      expect(blobKey).toBeDefined();
-      const blob = await os.get(blobKey!);
-      expect(blob).toEqual({ data: ["x", "x", "x"] });
-    },
-  );
+    // 8. Prove the artifact written by the worker over HTTP is readable by the
+    //    orchestrator's blobStore (same InMemoryObjectStore instance).
+    //    The heavy stage writes via ctx.storage (scoped storage backed by the
+    //    object store). We scan to find the blob the worker wrote over HTTP.
+    const allKeys = await os.list("workflow-v2/");
+    const blobKey = allKeys.find((k) => k.endsWith("blob.json"));
+    expect(blobKey).toBeDefined();
+    const blob = await os.get(blobKey!);
+    expect(blob).toEqual({ data: ["x", "x", "x"] });
+  });
 
-  it(
-    "rejects unauthenticated workers when auth is configured",
-    { timeout: 5_000 },
-    async () => {
-      // Spin up a server with a real token; connect with the wrong token.
-      const clock2 = new FakeClock(new Date(0));
-      const os2 = new InMemoryObjectStore(clock2);
-      const broker2 = new Broker({
-        store: new InMemoryBrokerStore(),
-        presigner: os2,
-        clock: clock2,
+  it("rejects unauthenticated workers when auth is configured", {
+    timeout: 5_000,
+  }, async () => {
+    // Spin up a server with a real token; connect with the wrong token.
+    const clock2 = new FakeClock(new Date(0));
+    const os2 = new InMemoryObjectStore(clock2);
+    const broker2 = new Broker({
+      store: new InMemoryBrokerStore(),
+      presigner: os2,
+      clock: clock2,
+      stageCodeVersion: "v1",
+    });
+    const srv = createBrokerHttpServer({
+      broker: broker2,
+      objectStore: os2,
+      authToken: "real-token",
+    });
+    srv.listen(0);
+    const p = (srv.address() as AddressInfo).port;
+    teardowns.push(
+      () =>
+        new Promise<void>((res, rej) => srv.close((e) => (e ? rej(e) : res()))),
+    );
+
+    const badTransport = createHttpWorkerTransport({
+      baseUrl: `http://127.0.0.1:${p}`,
+      authToken: "wrong-token",
+    });
+
+    // A lease attempt with a bad token must throw (server returns 401 → client throws).
+    await expect(
+      badTransport.lease({
+        workerId: "x",
+        stageIds: ["heavy"],
         stageCodeVersion: "v1",
-      });
-      const srv = createBrokerHttpServer({
-        broker: broker2,
-        objectStore: os2,
-        authToken: "real-token",
-      });
-      srv.listen(0);
-      const p = (srv.address() as AddressInfo).port;
-      teardowns.push(
-        () =>
-          new Promise<void>((res, rej) =>
-            srv.close((e) => (e ? rej(e) : res())),
-          ),
-      );
+      }),
+    ).rejects.toThrow();
+  });
 
-      const badTransport = createHttpWorkerTransport({
-        baseUrl: `http://127.0.0.1:${p}`,
-        authToken: "wrong-token",
-      });
+  it("uses bearer auth when configured and succeeds end-to-end", {
+    timeout: 10_000,
+  }, async () => {
+    const { orch, worker, serverClose } = setup({ useAuth: true });
+    teardowns.push(serverClose);
 
-      // A lease attempt with a bad token must throw (server returns 401 → client throws).
-      await expect(
-        badTransport.lease({
-          workerId: "x",
-          stageIds: ["heavy"],
-          stageCodeVersion: "v1",
-        }),
-      ).rejects.toThrow();
-    },
-  );
+    const { workflowRunId } = await orch.kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "http-e2e-auth-k1",
+      workflowId: orch.workflowId,
+      input: { seed: 2 },
+    });
+    await orch.kernel.dispatch({
+      type: "run.claimPending",
+      workerId: "orch",
+    });
 
-  it(
-    "uses bearer auth when configured and succeeds end-to-end",
-    { timeout: 10_000 },
-    async () => {
-      const { orch, worker, serverClose } = setup({ useAuth: true });
-      teardowns.push(serverClose);
+    const job = await orch.jobQueue.dequeue();
+    expect(job).not.toBeNull();
+    await orch.kernel.dispatch({
+      type: "job.execute",
+      workflowRunId,
+      workflowId: orch.workflowId,
+      stageId: job!.stageId,
+      config: {},
+    });
+    await orch.jobQueue.suspend(
+      job!.jobId,
+      new Date(orch.clock.now().getTime() + 100),
+    );
 
-      const { workflowRunId } = await orch.kernel.dispatch({
-        type: "run.create",
-        idempotencyKey: "http-e2e-auth-k1",
-        workflowId: orch.workflowId,
-        input: { seed: 2 },
-      });
-      await orch.kernel.dispatch({
-        type: "run.claimPending",
-        workerId: "orch",
-      });
+    // Worker with correct bearer token succeeds.
+    expect(await worker.processOne()).toBe(true);
 
-      const job = await orch.jobQueue.dequeue();
-      expect(job).not.toBeNull();
-      await orch.kernel.dispatch({
-        type: "job.execute",
-        workflowRunId,
-        workflowId: orch.workflowId,
-        stageId: job!.stageId,
-        config: {},
-      });
-      await orch.jobQueue.suspend(
-        job!.jobId,
-        new Date(orch.clock.now().getTime() + 100),
-      );
+    await makeStageResumable(orch, workflowRunId);
+    await orch.kernel.dispatch({ type: "stage.pollSuspended" });
+    await orch.kernel.dispatch({ type: "run.transition", workflowRunId });
 
-      // Worker with correct bearer token succeeds.
-      expect(await worker.processOne()).toBe(true);
+    const job2 = await orch.jobQueue.dequeue();
+    expect(job2).not.toBeNull();
+    await orch.kernel.dispatch({
+      type: "job.execute",
+      workflowRunId,
+      workflowId: orch.workflowId,
+      stageId: job2!.stageId,
+      config: {},
+    });
+    await orch.jobQueue.complete(job2!.jobId);
+    await orch.kernel.dispatch({ type: "run.transition", workflowRunId });
 
-      await makeStageResumable(orch, workflowRunId);
-      await orch.kernel.dispatch({ type: "stage.pollSuspended" });
-      await orch.kernel.dispatch({ type: "run.transition", workflowRunId });
-
-      const job2 = await orch.jobQueue.dequeue();
-      expect(job2).not.toBeNull();
-      await orch.kernel.dispatch({
-        type: "job.execute",
-        workflowRunId,
-        workflowId: orch.workflowId,
-        stageId: job2!.stageId,
-        config: {},
-      });
-      await orch.jobQueue.complete(job2!.jobId);
-      await orch.kernel.dispatch({ type: "run.transition", workflowRunId });
-
-      const run = await orch.persistence.getRun(workflowRunId);
-      expect(run?.status).toBe("COMPLETED");
-      // seed 2 → array of 2 items → doubled = 4
-      expect((run?.output as { doubled: number }).doubled).toBe(4);
-    },
-  );
+    const run = await orch.persistence.getRun(workflowRunId);
+    expect(run?.status).toBe("COMPLETED");
+    // seed 2 → array of 2 items → doubled = 4
+    expect((run?.output as { doubled: number }).doubled).toBe(4);
+  });
 });

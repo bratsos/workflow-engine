@@ -21,7 +21,7 @@ describe("I want to use InMemoryWorkflowPersistence in tests", () => {
         id: "run-1",
         workflowId: "workflow-1",
         workflowName: "Test Workflow",
-        status: "PENDING" as const,
+        workflowType: "workflow-1",
         input: { value: "test" },
       };
 
@@ -42,7 +42,7 @@ describe("I want to use InMemoryWorkflowPersistence in tests", () => {
       const runData = {
         workflowId: "workflow-1",
         workflowName: "Test Workflow",
-        status: "PENDING" as const,
+        workflowType: "workflow-1",
         input: {},
       };
 
@@ -60,7 +60,7 @@ describe("I want to use InMemoryWorkflowPersistence in tests", () => {
         id: "run-get",
         workflowId: "workflow-1",
         workflowName: "Test",
-        status: "PENDING" as const,
+        workflowType: "workflow-1",
         input: { data: "test" },
       });
 
@@ -87,7 +87,7 @@ describe("I want to use InMemoryWorkflowPersistence in tests", () => {
         id: "run-update",
         workflowId: "workflow-1",
         workflowName: "Test",
-        status: "PENDING" as const,
+        workflowType: "workflow-1",
         input: {},
       });
 
@@ -116,7 +116,7 @@ describe("I want to use InMemoryWorkflowPersistence in tests", () => {
         id: "run-status",
         workflowId: "workflow-1",
         workflowName: "Test",
-        status: "PENDING" as const,
+        workflowType: "workflow-1",
         input: {},
       });
 
@@ -135,21 +135,21 @@ describe("I want to use InMemoryWorkflowPersistence in tests", () => {
         id: "run-1",
         workflowId: "w1",
         workflowName: "Test",
-        status: "PENDING" as const,
+        workflowType: "w1",
         input: {},
       });
       await persistence.createRun({
         id: "run-2",
         workflowId: "w2",
         workflowName: "Test",
-        status: "PENDING" as const,
+        workflowType: "w2",
         input: {},
       });
       await persistence.createRun({
         id: "run-3",
         workflowId: "w3",
         workflowName: "Test",
-        status: "PENDING" as const,
+        workflowType: "w3",
         input: {},
       });
 
@@ -418,10 +418,13 @@ describe("I want to use InMemoryWorkflowPersistence in tests", () => {
     });
 
     it("should get suspended stages ready to resume", async () => {
-      // Given: Suspended stages with different poll times
+      // Given: Suspended stages -- one with nextPollAt explicitly cleared
+      // (ready), one still holding a poll deadline (not ready, even
+      // though that deadline is in the past -- matches
+      // PrismaWorkflowPersistence: "ready" means the orchestrator
+      // cleared nextPollAt, not that a deadline elapsed)
       const now = new Date();
       const past = new Date(now.getTime() - 10000);
-      const future = new Date(now.getTime() + 10000);
 
       const stage1 = await persistence.createStage({
         workflowRunId: "run-1",
@@ -433,7 +436,7 @@ describe("I want to use InMemoryWorkflowPersistence in tests", () => {
       });
       await persistence.updateStage(stage1.id, {
         status: "SUSPENDED",
-        nextPollAt: past,
+        nextPollAt: null,
         suspendedState: { batchId: "batch-1" },
       });
 
@@ -447,7 +450,7 @@ describe("I want to use InMemoryWorkflowPersistence in tests", () => {
       });
       await persistence.updateStage(stage2.id, {
         status: "SUSPENDED",
-        nextPollAt: future,
+        nextPollAt: past,
         suspendedState: { batchId: "batch-2" },
       });
 
@@ -679,7 +682,7 @@ describe("I want to use InMemoryWorkflowPersistence in tests", () => {
         id: "run-1",
         workflowId: "w1",
         workflowName: "Test",
-        status: "PENDING" as const,
+        workflowType: "w1",
         input: {},
       });
       await persistence.createStage({
@@ -718,14 +721,14 @@ describe("I want to use InMemoryWorkflowPersistence in tests", () => {
         id: "run-a",
         workflowId: "w1",
         workflowName: "A",
-        status: "PENDING" as const,
+        workflowType: "w1",
         input: {},
       });
       await persistence.createRun({
         id: "run-b",
         workflowId: "w2",
         workflowName: "B",
-        status: "PENDING" as const,
+        workflowType: "w2",
         input: {},
       });
 

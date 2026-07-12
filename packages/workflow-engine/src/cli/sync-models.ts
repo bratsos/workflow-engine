@@ -237,7 +237,11 @@ function generateTypeScript(models: Record<string, ModelConfig>): string {
         `  "${key}": {`,
         `    id: "${config.id}",`,
         `    name: "${config.name.replace(/"/g, '\\"')}",`,
-        `    description: "${config.description?.replace(/"/g, '\\"').replace(/\n/g, "\\n")}",`,
+        ...(config.description !== undefined
+          ? [
+              `    description: "${config.description.replace(/"/g, '\\"').replace(/\n/g, "\\n")}",`,
+            ]
+          : []),
         `    inputCostPerMillion: ${config.inputCostPerMillion},`,
         `    outputCostPerMillion: ${config.outputCostPerMillion},`,
         `    provider: "${config.provider}",`,
@@ -247,7 +251,9 @@ function generateTypeScript(models: Record<string, ModelConfig>): string {
         `    supportsAsyncBatch: ${config.supportsAsyncBatch || false},`,
         `    batchDiscountPercent: ${config.batchDiscountPercent || 0},`,
         `    contextLength: ${config.contextLength || 0},`,
-        `    maxCompletionTokens: ${config.maxCompletionTokens},`,
+        ...(config.maxCompletionTokens != null
+          ? [`    maxCompletionTokens: ${config.maxCompletionTokens},`]
+          : []),
         `  },`,
       ];
 

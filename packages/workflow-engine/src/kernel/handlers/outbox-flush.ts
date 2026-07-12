@@ -29,12 +29,21 @@ export async function handleOutboxFlush(
   const maxRetries = (deps.eventSink as Partial<PluginRunner>).maxRetries ?? 3;
 
   const publishedIds: string[] = [];
+  // Events are read ordered by (workflowRunId, sequence). Once a run's
+  // event N fails to publish, later events for that same run must not
+  // be published ahead of it — that would redeliver out of order on the
+  // next flush. Skip (not fail) the rest of that run's events this pass;
+  // other runs are unaffected.
+  const failedRunIds = new Set<string>();
 
   for (const outboxEvent of events) {
+    if (failedRunIds.has(outboxEvent.workflowRunId)) continue;
+
     try {
       await deps.eventSink.emit(outboxEvent.payload as KernelEvent);
       publishedIds.push(outboxEvent.id);
     } catch {
+      failedRunIds.add(outboxEvent.workflowRunId);
       const newCount = await deps.persistence.incrementOutboxRetryCount(
         outboxEvent.id,
       );

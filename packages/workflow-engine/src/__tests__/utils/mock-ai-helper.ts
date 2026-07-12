@@ -5,9 +5,14 @@
  * Supports configurable responses, call tracking, and simulated errors.
  */
 
+import type { ToolSet } from "ai";
 import type { z } from "zod";
 import type {
   AIBatch,
+  AIBatchHandle,
+  AIBatchProvider,
+  AIBatchRequest,
+  AIBatchResult,
   AICallType,
   AIEmbedResult,
   AIHelper,
@@ -15,10 +20,6 @@ import type {
   AIObjectResult,
   AIStreamResult,
   AITextResult,
-  BatchHandle,
-  BatchProvider,
-  BatchRequest,
-  BatchResult,
   EmbedOptions,
   ObjectOptions,
   RecordCallParams,
@@ -142,9 +143,7 @@ export class MockAIHelper implements AIHelper {
   // Core AI Methods
   // ============================================================================
 
-  async generateText<
-    TTools extends Record<string, unknown> = Record<string, unknown>,
-  >(
+  async generateText<TTools extends ToolSet = ToolSet>(
     modelKey: ModelKey,
     prompt: TextInput,
     options?: TextOptions<TTools>,
@@ -318,7 +317,10 @@ export class MockAIHelper implements AIHelper {
     };
   }
 
-  batch<T = string>(modelKey: ModelKey, _provider?: BatchProvider): AIBatch<T> {
+  batch<T = string>(
+    modelKey: ModelKey,
+    _provider?: AIBatchProvider,
+  ): AIBatch<T> {
     return new MockAIBatch<T>(this, modelKey);
   }
 
@@ -597,10 +599,10 @@ export class MockAIHelper implements AIHelper {
 // MockAIBatch Implementation
 // ============================================================================
 
-class MockAIBatch<T = string> implements AIBatch<T> {
-  private submittedBatches = new Map<string, BatchRequest[]>();
-  private batchResults = new Map<string, BatchResult<T>[]>();
-  private batchStatuses = new Map<string, BatchHandle["status"]>();
+export class MockAIBatch<T = string> implements AIBatch<T> {
+  private submittedBatches = new Map<string, AIBatchRequest[]>();
+  private batchResults = new Map<string, AIBatchResult<T>[]>();
+  private batchStatuses = new Map<string, AIBatchHandle["status"]>();
   private recordedBatches = new Set<string>();
 
   constructor(
@@ -608,13 +610,13 @@ class MockAIBatch<T = string> implements AIBatch<T> {
     private modelKey: ModelKey,
   ) {}
 
-  async submit(requests: BatchRequest[]): Promise<BatchHandle> {
+  async submit(requests: AIBatchRequest[]): Promise<AIBatchHandle> {
     const batchId = `mock-batch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     this.submittedBatches.set(batchId, requests);
     this.batchStatuses.set(batchId, "pending");
 
     // Generate mock results
-    const results: BatchResult<T>[] = requests.map((req) => ({
+    const results: AIBatchResult<T>[] = requests.map((req) => ({
       id: req.id,
       prompt: req.prompt,
       result: `mock result for ${req.id}` as unknown as T,
@@ -624,15 +626,10 @@ class MockAIBatch<T = string> implements AIBatch<T> {
     }));
     this.batchResults.set(batchId, results);
 
-    // Simulate processing
-    setTimeout(() => {
-      this.batchStatuses.set(batchId, "completed");
-    }, 100);
-
     return { id: batchId, status: "pending", provider: "google" };
   }
 
-  async getStatus(batchId: string): Promise<BatchHandle> {
+  async getStatus(batchId: string): Promise<AIBatchHandle> {
     const status = this.batchStatuses.get(batchId) ?? "pending";
     return { id: batchId, status, provider: "google" };
   }
@@ -640,7 +637,7 @@ class MockAIBatch<T = string> implements AIBatch<T> {
   async getResults(
     batchId: string,
     _metadata?: Record<string, unknown>,
-  ): Promise<BatchResult<T>[]> {
+  ): Promise<AIBatchResult<T>[]> {
     const results = this.batchResults.get(batchId);
     if (!results) {
       throw new Error(`Batch not found: ${batchId}`);
@@ -658,7 +655,7 @@ class MockAIBatch<T = string> implements AIBatch<T> {
 
   async recordResults(
     batchId: string,
-    results: BatchResult<T>[],
+    results: AIBatchResult<T>[],
   ): Promise<void> {
     if (this.recordedBatches.has(batchId)) {
       return;
@@ -673,9 +670,11 @@ class MockAIBatch<T = string> implements AIBatch<T> {
         callType: "batch",
         prompt: result.prompt,
         response:
-          typeof result.result === "string"
-            ? result.result
-            : JSON.stringify(result.result),
+          result.status === "succeeded"
+            ? typeof result.result === "string"
+              ? result.result
+              : JSON.stringify(result.result)
+            : "",
         inputTokens: result.inputTokens,
         outputTokens: result.outputTokens,
         metadata: { batchId, requestId: result.id },
@@ -689,15 +688,25 @@ class MockAIBatch<T = string> implements AIBatch<T> {
    * Set custom results for a batch
    */
   setResults(batchId: string, results: MockBatchResult<T>[]): void {
-    const fullResults: BatchResult<T>[] = results.map((r) => ({
-      id: r.id,
-      prompt: "",
-      result: r.result,
-      inputTokens: r.inputTokens ?? 10,
-      outputTokens: r.outputTokens ?? 20,
-      status: r.status ?? "succeeded",
-      error: r.error,
-    }));
+    const fullResults: AIBatchResult<T>[] = results.map((r) =>
+      (r.status ?? "succeeded") === "failed"
+        ? {
+            id: r.id,
+            prompt: "",
+            inputTokens: r.inputTokens ?? 10,
+            outputTokens: r.outputTokens ?? 20,
+            status: "failed" as const,
+            error: r.error ?? "Mock failure",
+          }
+        : {
+            id: r.id,
+            prompt: "",
+            result: r.result,
+            inputTokens: r.inputTokens ?? 10,
+            outputTokens: r.outputTokens ?? 20,
+            status: "succeeded" as const,
+          },
+    );
     this.batchResults.set(batchId, fullResults);
     this.batchStatuses.set(batchId, "completed");
   }
@@ -705,14 +714,14 @@ class MockAIBatch<T = string> implements AIBatch<T> {
   /**
    * Set batch status
    */
-  setStatus(batchId: string, status: BatchHandle["status"]): void {
+  setStatus(batchId: string, status: AIBatchHandle["status"]): void {
     this.batchStatuses.set(batchId, status);
   }
 
   /**
    * Get submitted requests for a batch
    */
-  getSubmittedRequests(batchId: string): BatchRequest[] | undefined {
+  getSubmittedRequests(batchId: string): AIBatchRequest[] | undefined {
     return this.submittedBatches.get(batchId);
   }
 }

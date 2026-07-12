@@ -22,9 +22,9 @@ import * as http from "node:http";
 import type { AddressInfo } from "node:net";
 import { WorkflowBuilder } from "@bratsos/workflow-engine";
 import { createKernel } from "@bratsos/workflow-engine/kernel";
-import { FakeClock } from "@bratsos/workflow-engine/kernel/testing";
 import {
   CollectingEventSink,
+  FakeClock,
   NoopScheduler,
 } from "@bratsos/workflow-engine/kernel/testing";
 import {
@@ -346,29 +346,27 @@ describe("createS3BlobStore round-trip (fake-S3)", () => {
     }
   });
 
-  it(
-    "list paginates across multiple pages (pageSize=2)",
-    { timeout: 10_000 },
-    async () => {
-      fakeS3 = await startFakeS3("my-bucket", { pageSize: 2 });
-      const store = createS3BlobStore(makeS3Config(fakeS3));
+  it("list paginates across multiple pages (pageSize=2)", {
+    timeout: 10_000,
+  }, async () => {
+    fakeS3 = await startFakeS3("my-bucket", { pageSize: 2 });
+    const store = createS3BlobStore(makeS3Config(fakeS3));
 
-      // Put 5 objects so we need 3 pages at pageSize=2.
-      for (const i of [1, 2, 3, 4, 5]) {
-        await store.put(`folder/key${i}.json`, { i });
-      }
+    // Put 5 objects so we need 3 pages at pageSize=2.
+    for (const i of [1, 2, 3, 4, 5]) {
+      await store.put(`folder/key${i}.json`, { i });
+    }
 
-      const keys = await store.list("folder/");
-      expect(keys).toHaveLength(5);
-      expect(keys.sort()).toEqual([
-        "folder/key1.json",
-        "folder/key2.json",
-        "folder/key3.json",
-        "folder/key4.json",
-        "folder/key5.json",
-      ]);
-    },
-  );
+    const keys = await store.list("folder/");
+    expect(keys).toHaveLength(5);
+    expect(keys.sort()).toEqual([
+      "folder/key1.json",
+      "folder/key2.json",
+      "folder/key3.json",
+      "folder/key4.json",
+      "folder/key5.json",
+    ]);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -385,193 +383,185 @@ describe("S3 object store — full workflow e2e (worker direct-to-bucket)", () =
     teardowns.length = 0;
   });
 
-  it(
-    "drives workflow to COMPLETED (doubled === 6) with artifact stored in fake-S3",
-    { timeout: 15_000 },
-    async () => {
-      // 1. Start fake-S3 server.
-      const fakeS3 = await startFakeS3("workflow-bucket");
-      teardowns.push(() => fakeS3.close());
+  it("drives workflow to COMPLETED (doubled === 6) with artifact stored in fake-S3", {
+    timeout: 15_000,
+  }, async () => {
+    // 1. Start fake-S3 server.
+    const fakeS3 = await startFakeS3("workflow-bucket");
+    teardowns.push(() => fakeS3.close());
 
-      const s3Cfg = makeS3Config(fakeS3);
-      const clock = new FakeClock(new Date(0));
+    const s3Cfg = makeS3Config(fakeS3);
+    const clock = new FakeClock(new Date(0));
 
-      // 2. Build S3 presigner + blob store.
-      const s3Presigner = createS3Presigner(s3Cfg);
-      const s3BlobStore = createS3BlobStore(s3Cfg);
+    // 2. Build S3 presigner + blob store.
+    const s3Presigner = createS3Presigner(s3Cfg);
+    const s3BlobStore = createS3BlobStore(s3Cfg);
 
-      // 3. Broker uses the S3 presigner (returns real http:// URLs → worker hits fake-S3 directly).
-      const broker = new Broker({
-        store: new InMemoryBrokerStore(),
-        presigner: s3Presigner,
-        clock,
-        stageCodeVersion: "v1",
-        staleLeaseMs: 60_000,
-      });
+    // 3. Broker uses the S3 presigner (returns real http:// URLs → worker hits fake-S3 directly).
+    const broker = new Broker({
+      store: new InMemoryBrokerStore(),
+      presigner: s3Presigner,
+      clock,
+      stageCodeVersion: "v1",
+      staleLeaseMs: 60_000,
+    });
 
-      // 4. Orchestrator transport (in-process, broker.submit/poll only).
-      //    We do NOT use the in-process worker path — the worker hits real HTTP.
-      const oTransport: OrchestratorTransport = {
-        submit: (req) => broker.submit(req),
-        poll: (taskId) => broker.poll(taskId),
-      };
+    // 4. Orchestrator transport (in-process, broker.submit/poll only).
+    //    We do NOT use the in-process worker path — the worker hits real HTTP.
+    const oTransport: OrchestratorTransport = {
+      submit: (req) => broker.submit(req),
+      poll: (taskId) => broker.poll(taskId),
+    };
 
-      // 5. Build orchestrator kernel using s3BlobStore.
-      const persistence = new InMemoryWorkflowPersistence();
-      const jobQueue = new InMemoryJobQueue();
-      const coreStage = makeCoreStage(s3BlobStore);
+    // 5. Build orchestrator kernel using s3BlobStore.
+    const persistence = new InMemoryWorkflowPersistence();
+    const jobQueue = new InMemoryJobQueue();
+    const coreStage = makeCoreStage(s3BlobStore);
 
-      const workflow = new WorkflowBuilder(
-        "media-s3",
-        "Media S3",
-        "remote heavy + core via S3",
-        z.object({ seed: z.number() }),
-        z.object({ doubled: z.number() }),
+    const workflow = new WorkflowBuilder(
+      "media-s3",
+      "Media S3",
+      "remote heavy + core via S3",
+      z.object({ seed: z.number() }),
+      z.object({ doubled: z.number() }),
+    )
+      .pipe(
+        defineRemoteStage(heavyStage, oTransport, {
+          pollIntervalMs: 100,
+          maxWaitMs: 60_000,
+        }),
       )
-        .pipe(
-          defineRemoteStage(heavyStage, oTransport, {
-            pollIntervalMs: 100,
-            maxWaitMs: 60_000,
-          }),
-        )
-        .pipe(coreStage)
-        .build();
+      .pipe(coreStage)
+      .build();
 
-      const kernel = createKernel({
-        persistence,
-        blobStore: s3BlobStore,
-        jobTransport: jobQueue,
-        eventSink: new CollectingEventSink(),
-        scheduler: new NoopScheduler(),
-        clock,
-        registry: {
-          getWorkflow: (id: string) =>
-            id === "media-s3" ? workflow : undefined,
-        },
-      });
+    const kernel = createKernel({
+      persistence,
+      blobStore: s3BlobStore,
+      jobTransport: jobQueue,
+      eventSink: new CollectingEventSink(),
+      scheduler: new NoopScheduler(),
+      clock,
+      registry: {
+        getWorkflow: (id: string) => (id === "media-s3" ? workflow : undefined),
+      },
+    });
 
-      const orch: Orchestrator = {
-        kernel,
-        persistence,
-        jobQueue,
-        clock,
-        workflowId: "media-s3",
-      };
+    const orch: Orchestrator = {
+      kernel,
+      persistence,
+      jobQueue,
+      clock,
+      workflowId: "media-s3",
+    };
 
-      // 6. Start a REAL broker HTTP server wrapping the broker.
-      //    The /blob shim is never invoked for S3 presigned URLs (absolute http://
-      //    URLs bypass the shim entirely). We provide a no-op InMemoryObjectStore
-      //    stub to satisfy the type while the presigner returns real S3 URLs.
-      const { InMemoryObjectStore: IOS } = await import("../object-store.js");
-      const noopObjectStore = new IOS(clock);
-      const brokerServer = createBrokerHttpServer({
-        broker,
-        objectStore: noopObjectStore,
-      });
-      await new Promise<void>((res) =>
-        brokerServer.listen(0, "127.0.0.1", res),
-      );
-      const brokerPort = (brokerServer.address() as AddressInfo).port;
-      const brokerBaseUrl = `http://127.0.0.1:${brokerPort}`;
-      teardowns.push(
-        () =>
-          new Promise<void>((res, rej) =>
-            brokerServer.close((e) => (e ? rej(e) : res())),
-          ),
-      );
+    // 6. Start a REAL broker HTTP server wrapping the broker.
+    //    The /blob shim is never invoked for S3 presigned URLs (absolute http://
+    //    URLs bypass the shim entirely). We provide a no-op InMemoryObjectStore
+    //    stub to satisfy the type while the presigner returns real S3 URLs.
+    const { InMemoryObjectStore: IOS } = await import("../object-store.js");
+    const noopObjectStore = new IOS(clock);
+    const brokerServer = createBrokerHttpServer({
+      broker,
+      objectStore: noopObjectStore,
+    });
+    await new Promise<void>((res) => brokerServer.listen(0, "127.0.0.1", res));
+    const brokerPort = (brokerServer.address() as AddressInfo).port;
+    const brokerBaseUrl = `http://127.0.0.1:${brokerPort}`;
+    teardowns.push(
+      () =>
+        new Promise<void>((res, rej) =>
+          brokerServer.close((e) => (e ? rej(e) : res())),
+        ),
+    );
 
-      // 7. Worker transport connects to the broker via HTTP; blob writes go to fake-S3.
-      //    We pass an authToken so that the fix for Fix 1 is load-bearing: the
-      //    worker must NOT forward this broker token to the presigned S3 URL.
-      const wTransport = createHttpWorkerTransport({
-        baseUrl: brokerBaseUrl,
-        authToken: "test-broker-token",
-      });
-      const worker = createActivityWorker({
-        registry: new Map([["heavy", heavyStage]]),
-        transport: wTransport,
-        workerId: "s3-worker-1",
-        stageIds: ["heavy"],
-        stageCodeVersion: "v1",
-      });
+    // 7. Worker transport connects to the broker via HTTP; blob writes go to fake-S3.
+    //    We pass an authToken so that the fix for Fix 1 is load-bearing: the
+    //    worker must NOT forward this broker token to the presigned S3 URL.
+    const wTransport = createHttpWorkerTransport({
+      baseUrl: brokerBaseUrl,
+      authToken: "test-broker-token",
+    });
+    const worker = createActivityWorker({
+      registry: new Map([["heavy", heavyStage]]),
+      transport: wTransport,
+      workerId: "s3-worker-1",
+      stageIds: ["heavy"],
+      stageCodeVersion: "v1",
+    });
 
-      // 8. Create + claim the workflow run.
-      const { workflowRunId } = await kernel.dispatch({
-        type: "run.create",
-        idempotencyKey: "s3-e2e-k1",
-        workflowId: "media-s3",
-        input: { seed: 3 },
-      });
-      await kernel.dispatch({ type: "run.claimPending", workerId: "orch" });
+    // 8. Create + claim the workflow run.
+    const { workflowRunId } = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "s3-e2e-k1",
+      workflowId: "media-s3",
+      input: { seed: 3 },
+    });
+    await kernel.dispatch({ type: "run.claimPending", workerId: "orch" });
 
-      // 9. Group 0: proxy heavy stage — suspends.
-      const job1 = await jobQueue.dequeue();
-      expect(job1).not.toBeNull();
+    // 9. Group 0: proxy heavy stage — suspends.
+    const job1 = await jobQueue.dequeue();
+    expect(job1).not.toBeNull();
 
-      const r1 = await kernel.dispatch({
-        type: "job.execute",
-        workflowRunId,
-        workflowId: "media-s3",
-        stageId: job1!.stageId,
-        config: {},
-      });
-      expect(r1.outcome).toBe("suspended");
-      await jobQueue.suspend(
-        job1!.jobId,
-        new Date(clock.now().getTime() + 100),
-      );
+    const r1 = await kernel.dispatch({
+      type: "job.execute",
+      workflowRunId,
+      workflowId: "media-s3",
+      stageId: job1!.stageId,
+      config: {},
+    });
+    expect(r1.outcome).toBe("suspended");
+    await jobQueue.suspend(job1!.jobId, new Date(clock.now().getTime() + 100));
 
-      // 10. Worker leases + executes heavy stage — the /presign route returns a real
-      //     http://127.0.0.1:<fakeS3port>/... URL (not /blob), so the worker
-      //     PUTs the artifact DIRECTLY to fake-S3.
-      const processed = await worker.processOne();
-      expect(processed).toBe(true);
+    // 10. Worker leases + executes heavy stage — the /presign route returns a real
+    //     http://127.0.0.1:<fakeS3port>/... URL (not /blob), so the worker
+    //     PUTs the artifact DIRECTLY to fake-S3.
+    const processed = await worker.processOne();
+    expect(processed).toBe(true);
 
-      // 11. Artifact must now be in fake-S3 (not the in-memory double-hop).
-      const fakeKeys = fakeS3.allKeys();
-      const artifactKey = fakeKeys.find((k) => k.endsWith("blob.json"));
-      expect(artifactKey).toBeDefined();
-      const rawBuf = fakeS3.getObject(artifactKey!);
-      expect(rawBuf).toBeDefined();
-      expect(JSON.parse(rawBuf!.toString())).toEqual({ data: ["x", "x", "x"] });
+    // 11. Artifact must now be in fake-S3 (not the in-memory double-hop).
+    const fakeKeys = fakeS3.allKeys();
+    const artifactKey = fakeKeys.find((k) => k.endsWith("blob.json"));
+    expect(artifactKey).toBeDefined();
+    const rawBuf = fakeS3.getObject(artifactKey!);
+    expect(rawBuf).toBeDefined();
+    expect(JSON.parse(rawBuf!.toString())).toEqual({ data: ["x", "x", "x"] });
 
-      // CRITICAL (Fix 1): the worker must NOT have sent the broker auth header
-      // to fake-S3. Real S3/R2 rejects requests that have both query-string
-      // SigV4 auth AND an Authorization header (400/403).
-      const headersAtS3 = fakeS3.getLastRequestHeaders(artifactKey!);
-      expect(headersAtS3).toBeDefined();
-      expect(headersAtS3!["authorization"]).toBeUndefined();
+    // CRITICAL (Fix 1): the worker must NOT have sent the broker auth header
+    // to fake-S3. Real S3/R2 rejects requests that have both query-string
+    // SigV4 auth AND an Authorization header (400/403).
+    const headersAtS3 = fakeS3.getLastRequestHeaders(artifactKey!);
+    expect(headersAtS3).toBeDefined();
+    expect(headersAtS3!["authorization"]).toBeUndefined();
 
-      // 12. Poll + transition.
-      await makeStageResumable(orch, workflowRunId);
-      const poll = await kernel.dispatch({ type: "stage.pollSuspended" });
-      expect(poll.resumed).toBe(1);
-      await kernel.dispatch({ type: "run.transition", workflowRunId });
+    // 12. Poll + transition.
+    await makeStageResumable(orch, workflowRunId);
+    const poll = await kernel.dispatch({ type: "stage.pollSuspended" });
+    expect(poll.resumed).toBe(1);
+    await kernel.dispatch({ type: "run.transition", workflowRunId });
 
-      // 13. Group 1: core stage reads the artifact from S3 via s3BlobStore.get().
-      const job2 = await jobQueue.dequeue();
-      expect(job2).not.toBeNull();
+    // 13. Group 1: core stage reads the artifact from S3 via s3BlobStore.get().
+    const job2 = await jobQueue.dequeue();
+    expect(job2).not.toBeNull();
 
-      const r2 = await kernel.dispatch({
-        type: "job.execute",
-        workflowRunId,
-        workflowId: "media-s3",
-        stageId: job2!.stageId,
-        config: {},
-      });
-      expect(r2.outcome).toBe("completed");
-      await jobQueue.complete(job2!.jobId);
+    const r2 = await kernel.dispatch({
+      type: "job.execute",
+      workflowRunId,
+      workflowId: "media-s3",
+      stageId: job2!.stageId,
+      config: {},
+    });
+    expect(r2.outcome).toBe("completed");
+    await jobQueue.complete(job2!.jobId);
 
-      const t = await kernel.dispatch({
-        type: "run.transition",
-        workflowRunId,
-      });
-      expect(t.action).toBe("completed");
+    const t = await kernel.dispatch({
+      type: "run.transition",
+      workflowRunId,
+    });
+    expect(t.action).toBe("completed");
 
-      // 14. Run COMPLETED, output doubled === 6.
-      const run = await persistence.getRun(workflowRunId);
-      expect(run?.status).toBe("COMPLETED");
-      expect((run?.output as { doubled: number }).doubled).toBe(6);
-    },
-  );
+    // 14. Run COMPLETED, output doubled === 6.
+    const run = await persistence.getRun(workflowRunId);
+    expect(run?.status).toBe("COMPLETED");
+    expect((run?.output as { doubled: number }).doubled).toBe(6);
+  });
 });

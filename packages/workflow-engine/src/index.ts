@@ -15,6 +15,9 @@ export {
   defineStage,
   type EnhancedStageContext,
   type InferInput,
+  type InferStageConfig,
+  type InferStageInput,
+  type InferStageOutput,
   type SimpleStageResult,
   type SyncStageDefinition,
 } from "./core/stage-factory";
@@ -24,12 +27,17 @@ export {
   createStageIds,
   defineStageIds,
   isValidStageId,
-  type ValidateStageIds,
   type WorkflowStageId,
 } from "./core/stage-ids";
 export { type StageResult } from "./core/types";
 // Core Workflow
 export {
+  type DefineWorkflowOptions,
+  defineWorkflow,
+  type InferStageOutputById,
+  type InferWorkflowContext,
+  type InferWorkflowInput,
+  type InferWorkflowOutput,
   type InferWorkflowStageIds,
   Workflow,
   WorkflowBuilder,
@@ -58,6 +66,7 @@ export {
   type EmbedOptions,
   type LogContext,
   type ObjectOptions,
+  type ProviderResolver,
   type RecordCallParams,
   registerEmbeddingProvider,
   type StreamOptions,
@@ -68,20 +77,25 @@ export {
   AVAILABLE_MODELS,
   calculateCost,
   DEFAULT_MODEL_KEY,
+  /** @deprecated Tests-only. Prefer configuring models via `registerModels()`. Removal at 1.0. */
   getDefaultModel,
   getModel,
   getModelById,
+  /** @deprecated Tests-only. Prefer configuring models via `registerModels()`. Removal at 1.0. */
   getRegisteredModel,
   listModels,
+  /** @deprecated Tests-only. Prefer configuring models via `registerModels()`. Removal at 1.0. */
   listRegisteredModels,
   type ModelConfig,
+  type ModelFilter,
   ModelKey,
   type ModelRegistry,
   type ModelStats,
+  /** @deprecated Tests-only. Removal at 1.0. */
   ModelStatsTracker,
   type ModelSyncConfig,
+  /** @deprecated Tests-only. Prefer checking `getModel(key)`'s config directly. Removal at 1.0. */
   modelSupportsBatch,
-  printAvailableModels,
   registerModels,
 } from "./ai/model-helper";
 export type {
@@ -105,6 +119,11 @@ export type {
   AICallLogger,
   AICallRecord,
   AIHelperStats,
+  // `WorkflowPersistence`'s two focused subsets: `PersistenceCore` (what the
+  // kernel actually calls) and `ArtifactPersistence` (deprecated artifact
+  // methods -- use BlobStore instead). Re-exported for export-surface
+  // consistency with `WorkflowPersistence` below.
+  ArtifactPersistence,
   ArtifactType,
   CreateAICallInput,
   CreateLogInput,
@@ -115,6 +134,7 @@ export type {
   JobQueue,
   JobRecord,
   LogLevel,
+  PersistenceCore,
   SaveArtifactInput,
   // Unified status type (preferred)
   Status,
@@ -152,20 +172,21 @@ export {
 } from "./utils/batch/providers";
 
 // Batch Types
+//
+// `BaseBatchRequest`, `BatchLogger`, `BatchState`, `BatchSubmitOptions`, and
+// `RawBatchResult` are intentionally NOT re-exported here — they're
+// provider-internal plumbing (used by the batch provider implementations
+// below and by ./utils/batch/types internally) with no documented public
+// surface. `BatchStatus` stays exported because it's the public return type
+// of `BatchProvider.checkStatus()`, implemented by the root-exported
+// provider classes.
 export type {
   AnthropicBatchRequest,
-  BaseBatchRequest,
-  BatchLogger,
-  BatchMetrics,
   BatchRequestText,
   BatchRequestWithSchema,
-  BatchState,
   BatchStatus,
-  BatchSubmitOptions,
   GoogleBatchRequest,
   OpenAIBatchRequest,
-  RawBatchResult,
-  SerializedBatch,
 } from "./utils/batch/types";
 
 // =============================================================================
@@ -177,7 +198,6 @@ export type {
   JobExecuteCommand,
   JobExecuteResult,
   KernelCommand,
-  KernelCommandType,
   LeaseReapStaleCommand,
   LeaseReapStaleResult,
   OutboxFlushCommand,
@@ -190,6 +210,8 @@ export type {
   RunClaimPendingResult,
   RunCreateCommand,
   RunCreateResult,
+  RunReapStuckCommand,
+  RunReapStuckResult,
   RunRerunFromCommand,
   RunRerunFromResult,
   RunTransitionCommand,
@@ -202,12 +224,7 @@ export type {
   KernelEvent,
   KernelEventType,
 } from "./kernel/events";
-export {
-  createKernel,
-  type Kernel,
-  type KernelConfig,
-  type WorkflowRegistry as KernelWorkflowRegistry,
-} from "./kernel/kernel";
+export { createKernel, type Kernel, type KernelConfig } from "./kernel/kernel";
 export {
   createPluginRunner,
   definePlugin,

@@ -11,6 +11,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { defineStage } from "../../core/stage-factory.js";
+import { isStageResult } from "../../core/types.js";
 import { createRoutingExecutor } from "../../kernel/executor/routing-executor.js";
 import type {
   ActivityExecutor,
@@ -230,7 +231,10 @@ describe("createRoutingExecutor", () => {
 
       // LocalExecutor ran successfully and returned the stage's actual output
       expect(result.error).toBeUndefined();
-      expect((result.result?.output as { value: string }).value).toBe(
+      if (!result.result || !isStageResult(result.result)) {
+        throw new Error("expected a stage result");
+      }
+      expect((result.result.output as { value: string }).value).toBe(
         "inline-ok",
       );
     });

@@ -7,56 +7,10 @@
 
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import {
-  getStageOutput,
-  requireStageOutput,
-} from "../../core/schema-helpers.js";
+import { requireStageOutput } from "../../core/schema-helpers.js";
 import { defineStage } from "../../core/stage-factory.js";
-import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
-import { createKernel } from "../../kernel/kernel.js";
-import {
-  CollectingEventSink,
-  FakeClock,
-  InMemoryBlobStore,
-  NoopScheduler,
-} from "../../kernel/testing/index.js";
-import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
-import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
-
-function createTestKernel(workflows: Workflow<any, any>[] = []) {
-  const persistence = new InMemoryWorkflowPersistence();
-  const blobStore = new InMemoryBlobStore();
-  const jobTransport = new InMemoryJobQueue("test-worker");
-  const eventSink = new CollectingEventSink();
-  const scheduler = new NoopScheduler();
-  const clock = new FakeClock();
-
-  const registry = new Map<string, Workflow<any, any>>();
-  for (const w of workflows) registry.set(w.id, w);
-
-  const kernel = createKernel({
-    persistence,
-    blobStore,
-    jobTransport,
-    eventSink,
-    scheduler,
-    clock,
-    registry: { getWorkflow: (id) => registry.get(id) },
-  });
-
-  const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
-  return {
-    kernel,
-    flush,
-    persistence,
-    blobStore,
-    jobTransport,
-    eventSink,
-    scheduler,
-    clock,
-    registry,
-  };
-}
+import { WorkflowBuilder } from "../../core/workflow.js";
+import { createTestKernel } from "../utils/index.js";
 
 describe("I want to access previous stage outputs", () => {
   describe("workflowContext accumulation", () => {
@@ -353,6 +307,7 @@ describe("I want to access previous stage outputs", () => {
       };
 
       const secondStage = defineStage<
+        "process",
         z.ZodObject<{ data: z.ZodString; count: z.ZodNumber }>,
         z.ZodObject<{ result: z.ZodString }>,
         z.ZodObject<{}>,
@@ -546,6 +501,7 @@ describe("I want to access previous stage outputs", () => {
       };
 
       const secondStage = defineStage<
+        "check",
         z.ZodObject<{ optional: z.ZodString }>,
         z.ZodObject<{ found: z.ZodBoolean; value: z.ZodString }>,
         z.ZodObject<{}>,
@@ -673,47 +629,20 @@ describe("I want to access previous stage outputs", () => {
         requireStageOutput(workflowContext, "myStage", "nonexistent"),
       ).toThrow(/Missing required field 'nonexistent'/);
     });
-  });
 
-  describe("getStageOutput helper function", () => {
-    it("should return undefined for missing stage", () => {
-      // Given: Empty context
-      const workflowContext = {};
-
-      // When: Using getStageOutput
-      const result = getStageOutput(workflowContext, "missing");
-
-      // Then: Returns undefined
-      expect(result).toBeUndefined();
-    });
-
-    it("should return undefined for missing field", () => {
-      // Given: Stage output without requested field
+    it("should treat falsy-but-defined outputs (0, '', false) as present, not missing", () => {
+      // Given: Stage outputs that are falsy but not undefined
+      // (matches ctx.require's `=== undefined` semantics)
       const workflowContext = {
-        myStage: { existing: "value" },
+        "count-stage": 0,
+        "text-stage": "",
+        "flag-stage": false,
       };
 
-      // When: Using getStageOutput with missing field
-      const result = getStageOutput(workflowContext, "myStage", "nonexistent");
-
-      // Then: Returns undefined
-      expect(result).toBeUndefined();
-    });
-
-    it("should return data when present", () => {
-      // Given: Complete context
-      const workflowContext = {
-        source: { data: [1, 2, 3] },
-      };
-
-      // When: Using getStageOutput
-      const result = getStageOutput<{ data: number[] }>(
-        workflowContext,
-        "source",
-      );
-
-      // Then: Returns the data
-      expect(result).toEqual({ data: [1, 2, 3] });
+      // When/Then: requireStageOutput returns the falsy value instead of throwing
+      expect(requireStageOutput(workflowContext, "count-stage")).toBe(0);
+      expect(requireStageOutput(workflowContext, "text-stage")).toBe("");
+      expect(requireStageOutput(workflowContext, "flag-stage")).toBe(false);
     });
   });
 

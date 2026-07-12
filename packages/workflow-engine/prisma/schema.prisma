@@ -1,0 +1,233 @@
+// Test-only Prisma schema fixture.
+//
+// This schema exists solely to generate a real `@prisma/client` for the
+// Postgres conformance suite (see
+// ../src/__tests__/12-persistence-adapters/prisma-postgres-conformance.test.ts).
+// It is NOT published -- "prisma/" is intentionally excluded from the
+// "files" field in package.json.
+//
+// Keep this in sync with the schema documented in ../README.md.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Status {
+  PENDING
+  RUNNING
+  SUSPENDED
+  COMPLETED
+  FAILED
+  CANCELLED
+  SKIPPED
+}
+
+model WorkflowRun {
+  id           String    @id @default(cuid())
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  version      Int       @default(1)
+  workflowId   String
+  workflowName String
+  workflowType String
+  status       Status    @default(PENDING)
+  startedAt    DateTime?
+  completedAt  DateTime?
+  duration     Int?
+  input        Json
+  output       Json?
+  config       Json      @default("{}")
+  totalCost    Float     @default(0)
+  totalTokens  Int       @default(0)
+  priority     Int       @default(5)
+  metadata     Json?
+
+  stages      WorkflowStage[]
+  logs        WorkflowLog[]
+  artifacts   WorkflowArtifact[]
+  annotations WorkflowAnnotation[]
+
+  @@index([status])
+  @@index([workflowId])
+  @@map("workflow_runs")
+}
+
+model WorkflowStage {
+  id             String    @id @default(cuid())
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  version        Int       @default(1)
+  workflowRunId  String
+  workflowRun    WorkflowRun @relation(fields: [workflowRunId], references: [id], onDelete: Cascade)
+  stageId        String
+  stageName      String
+  stageNumber    Int
+  executionGroup Int
+  attempt        Int       @default(0)
+  status         Status    @default(PENDING)
+  startedAt      DateTime?
+  completedAt    DateTime?
+  duration       Int?
+  inputData      Json?
+  outputData     Json?
+  config         Json?
+  suspendedState Json?
+  resumeData     Json?
+  nextPollAt     DateTime?
+  pollInterval   Int?
+  maxWaitUntil   DateTime?
+  metrics        Json?
+  embeddingInfo  Json?
+  errorMessage   String?
+
+  logs        WorkflowLog[]
+  artifacts   WorkflowArtifact[]
+  annotations WorkflowAnnotation[]
+
+  @@unique([workflowRunId, stageId])
+  @@index([status])
+  @@index([nextPollAt])
+  @@map("workflow_stages")
+}
+
+model WorkflowLog {
+  id              String         @id @default(cuid())
+  createdAt       DateTime       @default(now())
+  workflowRunId   String?
+  workflowRun     WorkflowRun?   @relation(fields: [workflowRunId], references: [id], onDelete: Cascade)
+  workflowStageId String?
+  workflowStage   WorkflowStage? @relation(fields: [workflowStageId], references: [id], onDelete: Cascade)
+  level           String
+  message         String
+  metadata        Json?
+
+  @@index([workflowRunId])
+  @@index([workflowStageId])
+  @@map("workflow_logs")
+}
+
+model WorkflowArtifact {
+  id              String         @id @default(cuid())
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+  workflowRunId   String
+  workflowRun     WorkflowRun    @relation(fields: [workflowRunId], references: [id], onDelete: Cascade)
+  workflowStageId String?
+  workflowStage   WorkflowStage? @relation(fields: [workflowStageId], references: [id], onDelete: SetNull)
+  key             String
+  type            String
+  data            Json
+  size            Int
+  metadata        Json?
+
+  @@unique([workflowRunId, key])
+  @@index([workflowRunId])
+  @@map("workflow_artifacts")
+}
+
+model AICall {
+  id           String   @id @default(cuid())
+  createdAt    DateTime @default(now())
+  topic        String
+  callType     String
+  modelKey     String
+  modelId      String
+  prompt       String   @db.Text
+  response     String   @db.Text
+  inputTokens  Int
+  outputTokens Int
+  cost         Float
+  metadata     Json?
+
+  @@index([topic])
+  @@map("ai_calls")
+}
+
+model WorkflowAnnotation {
+  id        String   @id @default(cuid())
+  createdAt DateTime @default(now())
+
+  workflowRunId String
+  workflowRun   WorkflowRun @relation(fields: [workflowRunId], references: [id], onDelete: Cascade)
+
+  workflowStageRecordId String?
+  workflowStage         WorkflowStage? @relation(fields: [workflowStageRecordId], references: [id], onDelete: SetNull)
+  attempt               Int            @default(0)
+
+  scope   String
+  scopeId String?
+
+  actorKind    String?
+  actorId      String?
+  actorVersion String?
+
+  key     String
+  value   Json
+  payload Json?
+
+  idempotencyKey String?
+
+  @@unique([workflowRunId, key, idempotencyKey])
+  @@index([workflowRunId, key])
+  @@index([workflowRunId, createdAt])
+  @@index([workflowRunId, scope])
+  @@index([workflowRunId, actorId])
+  @@map("workflow_annotations")
+}
+
+model JobQueue {
+  id            String    @id @default(cuid())
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  workflowRunId String
+  stageId       String
+  status        Status    @default(PENDING)
+  priority      Int       @default(5)
+  attempt       Int       @default(0)
+  maxAttempts   Int       @default(3)
+  workerId      String?
+  lockedAt      DateTime?
+  startedAt     DateTime?
+  completedAt   DateTime?
+  nextPollAt    DateTime?
+  payload       Json?
+  lastError     String?
+
+  @@index([status, priority])
+  @@index([nextPollAt])
+  @@map("job_queue")
+}
+
+model OutboxEvent {
+  id            String    @id @default(cuid())
+  createdAt     DateTime  @default(now())
+  workflowRunId String
+  sequence      Int
+  eventType     String
+  payload       Json
+  causationId   String
+  occurredAt    DateTime
+  publishedAt   DateTime?
+  retryCount    Int       @default(0)
+  dlqAt         DateTime?
+
+  @@unique([workflowRunId, sequence])
+  @@index([publishedAt])
+  @@map("outbox_events")
+}
+
+model IdempotencyKey {
+  id          String   @id @default(cuid())
+  createdAt   DateTime @default(now())
+  key         String
+  commandType String
+  result      Json
+
+  @@unique([key, commandType])
+  @@map("idempotency_keys")
+}

@@ -10,16 +10,12 @@ import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { defineStage } from "../../core/stage-factory.js";
 import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
-import { createKernel } from "../../kernel/kernel.js";
-import { createPluginRunner, definePlugin } from "../../kernel/plugins.js";
 import {
-  CollectingEventSink,
-  FakeClock,
-  InMemoryBlobStore,
-  NoopScheduler,
-} from "../../kernel/testing/index.js";
-import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
-import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
+  createPluginRunner,
+  definePlugin,
+  type PluginDefinition,
+} from "../../kernel/plugins.js";
+import { createTestKernel } from "../utils/index.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -44,82 +40,14 @@ function createSimpleWorkflow(id: string = "test-workflow") {
     .build();
 }
 
-function createTestKernel(workflows: Workflow<any, any>[] = []) {
-  const persistence = new InMemoryWorkflowPersistence();
-  const blobStore = new InMemoryBlobStore();
-  const jobTransport = new InMemoryJobQueue("test-worker");
-  const eventSink = new CollectingEventSink();
-  const scheduler = new NoopScheduler();
-  const clock = new FakeClock();
-
-  const registry = new Map<string, Workflow<any, any>>();
-  for (const w of workflows) {
-    registry.set(w.id, w);
-  }
-
-  const kernel = createKernel({
-    persistence,
-    blobStore,
-    jobTransport,
-    eventSink,
-    scheduler,
-    clock,
-    registry: { getWorkflow: (id) => registry.get(id) },
-  });
-
-  const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
-  return {
-    kernel,
-    flush,
-    persistence,
-    blobStore,
-    jobTransport,
-    eventSink,
-    scheduler,
-    clock,
-    registry,
-  };
-}
-
 function createTestKernelWithPlugins(
   workflows: Workflow<any, any>[] = [],
-  plugins: ReturnType<typeof definePlugin>[] = [],
+  plugins: PluginDefinition[] = [],
   maxRetries = 3,
 ) {
-  const persistence = new InMemoryWorkflowPersistence();
-  const blobStore = new InMemoryBlobStore();
-  const jobTransport = new InMemoryJobQueue("test-worker");
-  const eventSink = createPluginRunner({ plugins, maxRetries });
-  const scheduler = new NoopScheduler();
-  const clock = new FakeClock();
-
-  const registry = new Map<string, Workflow<any, any>>();
-  for (const w of workflows) {
-    registry.set(w.id, w);
-  }
-
-  const kernel = createKernel({
-    persistence,
-    blobStore,
-    jobTransport,
-    eventSink,
-    scheduler,
-    clock,
-    registry: { getWorkflow: (id) => registry.get(id) },
+  return createTestKernel(workflows, {
+    eventSink: createPluginRunner({ plugins, maxRetries }),
   });
-
-  const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
-  return {
-    kernel,
-    flush,
-    persistence,
-    blobStore,
-    jobTransport,
-    eventSink,
-    scheduler,
-    clock,
-    registry,
-  };
 }
 
 // ---------------------------------------------------------------------------
@@ -299,7 +227,10 @@ describe("kernel: outbox.flush", () => {
     });
 
     const workflow = createSimpleWorkflow();
-    const { kernel, flush } = createTestKernelWithPlugins([workflow], [plugin]);
+    const { kernel, flush } = createTestKernelWithPlugins(
+      [workflow],
+      [plugin as PluginDefinition],
+    );
 
     await kernel.dispatch({
       type: "run.create",
@@ -332,7 +263,7 @@ describe("kernel: outbox.flush", () => {
     const workflow = createSimpleWorkflow();
     const { kernel, flush } = createTestKernelWithPlugins(
       [workflow],
-      [plugin],
+      [plugin as PluginDefinition],
       2, // maxRetries = 2
     );
 
@@ -353,6 +284,80 @@ describe("kernel: outbox.flush", () => {
     expect(result3.published).toBe(0);
   });
 
+  it("stops publishing a run's later events once an earlier one fails (fail-fast per run, order preserved)", async () => {
+    const workflow = createSimpleWorkflow();
+
+    const emitted: { workflowRunId: string; type: string }[] = [];
+    let failingRunId: string | undefined;
+    const eventSink = {
+      async emit(event: { workflowRunId: string; type: string }) {
+        if (
+          failingRunId &&
+          event.workflowRunId === failingRunId &&
+          event.type === "workflow:created"
+        ) {
+          throw new Error("simulated transient failure");
+        }
+        emitted.push({ workflowRunId: event.workflowRunId, type: event.type });
+      },
+    };
+
+    const { kernel } = createTestKernel([workflow], { eventSink });
+
+    // Run A: two events (workflow:created, workflow:started).
+    const runA = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "fail-fast-a",
+      workflowId: "test-workflow",
+      input: { data: "a" },
+    });
+    await kernel.dispatch({ type: "run.claimPending", workerId: "w1" });
+
+    // Run B: one event (workflow:created), created after run A so it's
+    // not ordered ahead of run A's events, but is on a different run.
+    const runB = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "fail-fast-b",
+      workflowId: "test-workflow",
+      input: { data: "b" },
+    });
+
+    failingRunId = runA.workflowRunId;
+
+    const result = await kernel.dispatch({ type: "outbox.flush" as const });
+
+    // Run A's workflow:created failed; workflow:started for the same run
+    // must NOT have been attempted this pass (would redeliver out of
+    // order on the next flush otherwise).
+    expect(
+      emitted.some(
+        (e) =>
+          e.workflowRunId === runA.workflowRunId &&
+          e.type === "workflow:started",
+      ),
+    ).toBe(false);
+
+    // Run B's event, being on a different run, is unaffected.
+    expect(emitted.some((e) => e.workflowRunId === runB.workflowRunId)).toBe(
+      true,
+    );
+    expect(result.published).toBe(1);
+
+    // Next flush: run A's workflow:created retries first (now succeeds,
+    // since the once-off failure predicate no longer trips), THEN
+    // workflow:started — order preserved.
+    failingRunId = undefined;
+    const result2 = await kernel.dispatch({ type: "outbox.flush" as const });
+    expect(result2.published).toBe(2);
+    const runAEvents = emitted.filter(
+      (e) => e.workflowRunId === runA.workflowRunId,
+    );
+    expect(runAEvents.map((e) => e.type)).toEqual([
+      "workflow:created",
+      "workflow:started",
+    ]);
+  });
+
   it("published count reflects only successfully published events", async () => {
     const plugin = definePlugin({
       id: "always-fails",
@@ -364,7 +369,10 @@ describe("kernel: outbox.flush", () => {
     });
 
     const workflow = createSimpleWorkflow();
-    const { kernel, flush } = createTestKernelWithPlugins([workflow], [plugin]);
+    const { kernel, flush } = createTestKernelWithPlugins(
+      [workflow],
+      [plugin as PluginDefinition],
+    );
 
     await kernel.dispatch({
       type: "run.create",

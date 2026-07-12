@@ -70,14 +70,3 @@ export function createLogger(prefix: string): Logger {
     },
   };
 }
-
-/**
- * Silent logger that never outputs anything
- * Useful for testing or when you want to completely suppress logging
- */
-export const silentLogger: Logger = {
-  debug: () => {},
-  info: () => {},
-  warn: () => {},
-  error: () => {},
-};

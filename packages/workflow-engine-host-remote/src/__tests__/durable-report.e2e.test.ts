@@ -1,9 +1,8 @@
-import { defineStage } from "@bratsos/workflow-engine";
-import { WorkflowBuilder } from "@bratsos/workflow-engine";
+import { defineStage, WorkflowBuilder } from "@bratsos/workflow-engine";
 import { createKernel } from "@bratsos/workflow-engine/kernel";
-import { FakeClock } from "@bratsos/workflow-engine/kernel/testing";
 import {
   CollectingEventSink,
+  FakeClock,
   NoopScheduler,
 } from "@bratsos/workflow-engine/kernel/testing";
 import {

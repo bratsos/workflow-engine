@@ -5,6 +5,7 @@
  */
 
 import { beforeEach, describe, expect, it } from "vitest";
+import type { ModelKey } from "../../ai/model-helper.js";
 import { createMockAIHelper, MockAIHelper } from "../utils/mock-ai-helper.js";
 
 describe("I want to generate embeddings using AIHelper", () => {
@@ -18,7 +19,10 @@ describe("I want to generate embeddings using AIHelper", () => {
     it("should generate embedding for single text", async () => {
       // Given: A mock AI helper
       // When: I embed a single text
-      const result = await ai.embed("text-embedding-004", "Hello world");
+      const result = await ai.embed(
+        "text-embedding-004" as ModelKey,
+        "Hello world",
+      );
 
       // Then: Returns embedding array
       expect(result.embedding).toBeDefined();
@@ -29,7 +33,10 @@ describe("I want to generate embeddings using AIHelper", () => {
     it("should return embedding dimensions", async () => {
       // Given: A mock AI helper
       // When: I embed text
-      const result = await ai.embed("text-embedding-004", "Test text");
+      const result = await ai.embed(
+        "text-embedding-004" as ModelKey,
+        "Test text",
+      );
 
       // Then: Returns dimensions
       expect(result.dimensions).toBe(768); // Default dimensions
@@ -38,7 +45,10 @@ describe("I want to generate embeddings using AIHelper", () => {
     it("should return token count and cost", async () => {
       // Given: A mock AI helper
       // When: I embed text
-      const result = await ai.embed("text-embedding-004", "Some text to embed");
+      const result = await ai.embed(
+        "text-embedding-004" as ModelKey,
+        "Some text to embed",
+      );
 
       // Then: Returns token count and cost
       expect(result.inputTokens).toBeGreaterThan(0);
@@ -48,7 +58,7 @@ describe("I want to generate embeddings using AIHelper", () => {
     it("should work with different embedding models", async () => {
       // Given: A mock AI helper
       // When: I embed with a specific model
-      const result = await ai.embed("text-embedding-004", "Test");
+      const result = await ai.embed("text-embedding-004" as ModelKey, "Test");
 
       // Then: Returns valid embedding
       expect(result.embedding.length).toBeGreaterThan(0);
@@ -61,7 +71,7 @@ describe("I want to generate embeddings using AIHelper", () => {
       const texts = ["First text", "Second text", "Third text"];
 
       // When: I embed multiple texts
-      const result = await ai.embed("text-embedding-004", texts);
+      const result = await ai.embed("text-embedding-004" as ModelKey, texts);
 
       // Then: Returns embeddings for each text
       expect(result.embeddings).toHaveLength(3);
@@ -73,7 +83,7 @@ describe("I want to generate embeddings using AIHelper", () => {
       const texts = ["One", "Two", "Three"];
 
       // When: I embed them
-      const result = await ai.embed("text-embedding-004", texts);
+      const result = await ai.embed("text-embedding-004" as ModelKey, texts);
 
       // Then: All embeddings have same dimensions
       for (const emb of result.embeddings) {
@@ -83,9 +93,12 @@ describe("I want to generate embeddings using AIHelper", () => {
 
     it("should scale cost with number of texts", async () => {
       // Given: Different numbers of texts
-      const singleResult = await ai.embed("text-embedding-004", "One text");
+      const singleResult = await ai.embed(
+        "text-embedding-004" as ModelKey,
+        "One text",
+      );
       ai.clearCalls();
-      const multiResult = await ai.embed("text-embedding-004", [
+      const multiResult = await ai.embed("text-embedding-004" as ModelKey, [
         "Text 1",
         "Text 2",
         "Text 3",
@@ -101,7 +114,7 @@ describe("I want to generate embeddings using AIHelper", () => {
     it("should handle empty array", async () => {
       // Given: An empty array
       // When: I embed empty array
-      const result = await ai.embed("text-embedding-004", []);
+      const result = await ai.embed("text-embedding-004" as ModelKey, []);
 
       // Then: Returns empty embeddings array
       expect(result.embeddings).toHaveLength(0);
@@ -112,7 +125,7 @@ describe("I want to generate embeddings using AIHelper", () => {
     it("should support custom dimensions", async () => {
       // Given: Custom dimensions option
       // When: I embed with custom dimensions
-      const result = await ai.embed("text-embedding-004", "Test", {
+      const result = await ai.embed("text-embedding-004" as ModelKey, "Test", {
         dimensions: 256,
       });
 
@@ -123,7 +136,7 @@ describe("I want to generate embeddings using AIHelper", () => {
     it("should support taskType option", async () => {
       // Given: Task type options
       // When: I embed with different task types
-      await ai.embed("text-embedding-004", "Query text", {
+      await ai.embed("text-embedding-004" as ModelKey, "Query text", {
         taskType: "RETRIEVAL_QUERY",
       });
 
@@ -135,7 +148,7 @@ describe("I want to generate embeddings using AIHelper", () => {
     it("should support RETRIEVAL_DOCUMENT task type", async () => {
       // Given: Document task type
       // When: I embed a document
-      await ai.embed("text-embedding-004", "Document content", {
+      await ai.embed("text-embedding-004" as ModelKey, "Document content", {
         taskType: "RETRIEVAL_DOCUMENT",
       });
 
@@ -150,7 +163,7 @@ describe("I want to generate embeddings using AIHelper", () => {
     it("should support SEMANTIC_SIMILARITY task type", async () => {
       // Given: Semantic similarity task type
       // When: I embed for similarity
-      await ai.embed("text-embedding-004", "Similar text", {
+      await ai.embed("text-embedding-004" as ModelKey, "Similar text", {
         taskType: "SEMANTIC_SIMILARITY",
       });
 
@@ -167,7 +180,7 @@ describe("I want to generate embeddings using AIHelper", () => {
     it("should record call type as embed", async () => {
       // Given: A mock AI helper
       // When: I embed text
-      await ai.embed("text-embedding-004", "Test");
+      await ai.embed("text-embedding-004" as ModelKey, "Test");
 
       // Then: Call is recorded with type "embed"
       const calls = ai.getCallsByType("embed");
@@ -177,7 +190,7 @@ describe("I want to generate embeddings using AIHelper", () => {
     it("should record model key", async () => {
       // Given: A mock AI helper
       // When: I embed with specific model
-      await ai.embed("text-embedding-004", "Test");
+      await ai.embed("text-embedding-004" as ModelKey, "Test");
 
       // Then: Model key is recorded
       const lastCall = ai.getLastCall();
@@ -187,7 +200,7 @@ describe("I want to generate embeddings using AIHelper", () => {
     it("should record prompt as input text", async () => {
       // Given: A mock AI helper
       // When: I embed specific text
-      await ai.embed("text-embedding-004", "My input text");
+      await ai.embed("text-embedding-004" as ModelKey, "My input text");
 
       // Then: Text is recorded as prompt
       const lastCall = ai.getLastCall();
@@ -199,7 +212,7 @@ describe("I want to generate embeddings using AIHelper", () => {
       const texts = ["First", "Second"];
 
       // When: I embed them
-      await ai.embed("text-embedding-004", texts);
+      await ai.embed("text-embedding-004" as ModelKey, texts);
 
       // Then: Texts are joined in prompt
       const lastCall = ai.getLastCall();
@@ -210,7 +223,7 @@ describe("I want to generate embeddings using AIHelper", () => {
     it("should record response as embedding summary", async () => {
       // Given: A mock AI helper
       // When: I embed text
-      await ai.embed("text-embedding-004", "Test");
+      await ai.embed("text-embedding-004" as ModelKey, "Test");
 
       // Then: Response summarizes embeddings
       const lastCall = ai.getLastCall();
@@ -221,7 +234,7 @@ describe("I want to generate embeddings using AIHelper", () => {
     it("should record output tokens as 0", async () => {
       // Given: A mock AI helper (embeddings have no output tokens)
       // When: I embed text
-      await ai.embed("text-embedding-004", "Test");
+      await ai.embed("text-embedding-004" as ModelKey, "Test");
 
       // Then: Output tokens are 0
       const lastCall = ai.getLastCall();
@@ -235,9 +248,9 @@ describe("I want to generate embeddings using AIHelper", () => {
       ai.setError(true, "Embedding service unavailable");
 
       // When/Then: embed throws
-      await expect(ai.embed("text-embedding-004", "Test")).rejects.toThrow(
-        "Embedding service unavailable",
-      );
+      await expect(
+        ai.embed("text-embedding-004" as ModelKey, "Test"),
+      ).rejects.toThrow("Embedding service unavailable");
     });
 
     it("should not record failed calls", async () => {
@@ -245,7 +258,7 @@ describe("I want to generate embeddings using AIHelper", () => {
       ai.setError(true, "Error");
 
       // When: Call fails
-      await ai.embed("text-embedding-004", "Test").catch(() => {});
+      await ai.embed("text-embedding-004" as ModelKey, "Test").catch(() => {});
 
       // Then: No calls recorded
       expect(ai.getCalls()).toHaveLength(0);
@@ -259,7 +272,7 @@ describe("I want to generate embeddings using AIHelper", () => {
 
       // When: I measure call time
       const start = Date.now();
-      await ai.embed("text-embedding-004", "Test");
+      await ai.embed("text-embedding-004" as ModelKey, "Test");
       const duration = Date.now() - start;
 
       // Then: Takes at least latency time
@@ -270,8 +283,8 @@ describe("I want to generate embeddings using AIHelper", () => {
   describe("embedding statistics", () => {
     it("should include embed calls in stats", async () => {
       // Given: Multiple embed calls
-      await ai.embed("text-embedding-004", "First");
-      await ai.embed("text-embedding-004", ["Second", "Third"]);
+      await ai.embed("text-embedding-004" as ModelKey, "First");
+      await ai.embed("text-embedding-004" as ModelKey, ["Second", "Third"]);
 
       // When: I get stats
       const stats = await ai.getStats();
@@ -284,7 +297,7 @@ describe("I want to generate embeddings using AIHelper", () => {
 
     it("should track per-model stats for embeddings", async () => {
       // Given: Embed calls
-      await ai.embed("text-embedding-004", "Test");
+      await ai.embed("text-embedding-004" as ModelKey, "Test");
 
       // When: I get stats
       const stats = await ai.getStats();
@@ -299,7 +312,7 @@ describe("I want to generate embeddings using AIHelper", () => {
     it("should return numeric array", async () => {
       // Given: A mock AI helper
       // When: I embed text
-      const result = await ai.embed("text-embedding-004", "Test");
+      const result = await ai.embed("text-embedding-004" as ModelKey, "Test");
 
       // Then: All values are numbers
       for (const value of result.embedding) {
@@ -310,7 +323,7 @@ describe("I want to generate embeddings using AIHelper", () => {
     it("should return normalized-like values (mock)", async () => {
       // Given: A mock AI helper (mock generates random values)
       // When: I embed text
-      const result = await ai.embed("text-embedding-004", "Test");
+      const result = await ai.embed("text-embedding-004" as ModelKey, "Test");
 
       // Then: Values are reasonable (mock uses Math.random)
       for (const value of result.embedding) {
@@ -338,7 +351,10 @@ describe("I want to generate embeddings using AIHelper", () => {
     it("should accept Google embedding model keys", async () => {
       // Given: A mock AI helper
       // When: I embed with a Google model key
-      const result = await ai.embed("text-embedding-004", "Test text");
+      const result = await ai.embed(
+        "text-embedding-004" as ModelKey,
+        "Test text",
+      );
 
       // Then: Returns valid embedding and records the model key
       expect(result.embedding).toBeDefined();
@@ -365,7 +381,10 @@ describe("I want to generate embeddings using AIHelper", () => {
       const child = ai.createChild("child") as MockAIHelper;
 
       // When: I embed through child
-      const result = await child.embed("text-embedding-004", "Test");
+      const result = await child.embed(
+        "text-embedding-004" as ModelKey,
+        "Test",
+      );
 
       // Then: Returns valid embedding
       expect(result.embedding.length).toBeGreaterThan(0);
@@ -376,7 +395,7 @@ describe("I want to generate embeddings using AIHelper", () => {
       const child = ai.createChild("child") as MockAIHelper;
 
       // When: I embed through child
-      await child.embed("text-embedding-004", "Test");
+      await child.embed("text-embedding-004" as ModelKey, "Test");
 
       // Then: Child has the call
       const childCalls = child.getCallsByType("embed");

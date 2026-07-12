@@ -11,48 +11,8 @@
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { defineStage } from "../../core/stage-factory.js";
-import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
-import { createKernel } from "../../kernel/kernel.js";
-import {
-  CollectingEventSink,
-  FakeClock,
-  InMemoryBlobStore,
-  NoopScheduler,
-} from "../../kernel/testing/index.js";
-import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
-import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
-
-function createTestKernel(workflows: Workflow<any, any>[] = []) {
-  const persistence = new InMemoryWorkflowPersistence();
-  const blobStore = new InMemoryBlobStore();
-  const jobTransport = new InMemoryJobQueue("test-worker");
-  const eventSink = new CollectingEventSink();
-  const scheduler = new NoopScheduler();
-  const clock = new FakeClock();
-  const registry = new Map<string, Workflow<any, any>>();
-  for (const w of workflows) registry.set(w.id, w);
-  const kernel = createKernel({
-    persistence,
-    blobStore,
-    jobTransport,
-    eventSink,
-    scheduler,
-    clock,
-    registry: { getWorkflow: (id) => registry.get(id) },
-  });
-  const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
-  return {
-    kernel,
-    flush,
-    persistence,
-    blobStore,
-    jobTransport,
-    eventSink,
-    scheduler,
-    clock,
-    registry,
-  };
-}
+import { WorkflowBuilder } from "../../core/workflow.js";
+import { createTestKernel, InMemoryJobQueue } from "../utils/index.js";
 
 describe("I want to use production-ready patterns", () => {
   describe("graceful shutdown", () => {
@@ -63,9 +23,21 @@ describe("I want to use production-ready patterns", () => {
       const processedJobs: string[] = [];
 
       // Enqueue multiple jobs
-      await jobQueue.enqueue({ workflowRunId: "run-1", stageId: "stage-1" });
-      await jobQueue.enqueue({ workflowRunId: "run-2", stageId: "stage-2" });
-      await jobQueue.enqueue({ workflowRunId: "run-3", stageId: "stage-3" });
+      await jobQueue.enqueue({
+        workflowRunId: "run-1",
+        workflowId: "workflow-1",
+        stageId: "stage-1",
+      });
+      await jobQueue.enqueue({
+        workflowRunId: "run-2",
+        workflowId: "workflow-1",
+        stageId: "stage-2",
+      });
+      await jobQueue.enqueue({
+        workflowRunId: "run-3",
+        workflowId: "workflow-1",
+        stageId: "stage-3",
+      });
 
       // When: Worker processes with graceful shutdown
       const processJob = async (jobId: string, stageId: string) => {
@@ -102,6 +74,7 @@ describe("I want to use production-ready patterns", () => {
       const jobQueue = new InMemoryJobQueue("worker-1");
       const jobId = await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "interrupted",
       });
 
@@ -145,6 +118,7 @@ describe("I want to use production-ready patterns", () => {
       // Enqueue and lock a job manually
       const jobId = await jobTransport.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "process",
       });
       await jobTransport.dequeue(); // locks it
@@ -185,7 +159,11 @@ describe("I want to use production-ready patterns", () => {
       };
 
       // When: Worker processes a job successfully
-      await jobQueue.enqueue({ workflowRunId: "run-1", stageId: "stage-1" });
+      await jobQueue.enqueue({
+        workflowRunId: "run-1",
+        workflowId: "workflow-1",
+        stageId: "stage-1",
+      });
       const job = await jobQueue.dequeue();
       if (job) {
         await jobQueue.complete(job.jobId);
@@ -260,6 +238,7 @@ describe("I want to use production-ready patterns", () => {
 
       const jobId = await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "flaky-stage",
       });
 
@@ -427,6 +406,7 @@ describe("I want to use production-ready patterns", () => {
 
       const jobId = await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "problematic-stage",
       });
 

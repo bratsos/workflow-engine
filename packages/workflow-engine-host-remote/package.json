@@ -7,12 +7,13 @@
   "author": "Alex Bratsos",
   "repository": {
     "type": "git",
-    "url": "https://github.com/bratsos/workflow-engine",
+    "url": "git+https://github.com/bratsos/workflow-engine.git",
     "directory": "packages/workflow-engine-host-remote"
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
+    "./package.json": "./package.json",
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
@@ -22,6 +23,7 @@
   "publishConfig": {
     "access": "public"
   },
+  "sideEffects": false,
   "files": [
     "dist"
   ],
@@ -32,14 +34,17 @@
   },
   "dependencies": {
     "@bratsos/workflow-engine": "workspace:*",
-    "aws4fetch": "^1.0.20",
+    "aws4fetch": "^1.0.20"
+  },
+  "peerDependencies": {
     "zod": "^4.1.12"
   },
   "devDependencies": {
     "@types/node": "^22",
     "tsup": "^8.5.1",
     "typescript": "^5.8.3",
-    "vitest": "^3.2.4"
+    "vitest": "^3.2.4",
+    "zod": "^4.1.12"
   },
   "engines": {
     "node": ">=22.11.0"

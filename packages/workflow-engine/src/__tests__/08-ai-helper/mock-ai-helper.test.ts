@@ -6,6 +6,7 @@
 
 import { beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
+import type { ModelKey } from "../../ai/model-helper.js";
 import { createMockAIHelper, MockAIHelper } from "../utils/mock-ai-helper.js";
 
 describe("I want to use MockAIHelper in tests", () => {
@@ -135,7 +136,10 @@ describe("I want to use MockAIHelper in tests", () => {
     it("should return mock embeddings", async () => {
       // Given: A mock AI helper
       // When: I call embed
-      const result = await ai.embed("text-embedding-004", "Hello world");
+      const result = await ai.embed(
+        "text-embedding-004" as ModelKey,
+        "Hello world",
+      );
 
       // Then: Returns embedding array
       expect(result.embedding).toBeDefined();
@@ -146,7 +150,10 @@ describe("I want to use MockAIHelper in tests", () => {
     it("should handle multiple texts", async () => {
       // Given: A mock AI helper
       // When: I call embed with array of texts
-      const result = await ai.embed("text-embedding-004", ["Hello", "World"]);
+      const result = await ai.embed("text-embedding-004" as ModelKey, [
+        "Hello",
+        "World",
+      ]);
 
       // Then: Returns multiple embeddings
       expect(result.embeddings).toHaveLength(2);
@@ -156,7 +163,7 @@ describe("I want to use MockAIHelper in tests", () => {
     it("should record the call", async () => {
       // Given: A mock AI helper
       // When: I make an embed call
-      await ai.embed("text-embedding-004", "Test");
+      await ai.embed("text-embedding-004" as ModelKey, "Test");
 
       // Then: Call is recorded as type "embed"
       const calls = ai.getCallsByType("embed");
@@ -256,9 +263,9 @@ describe("I want to use MockAIHelper in tests", () => {
       ai.setError(true, "Embedding failed");
 
       // When/Then: embed throws
-      await expect(ai.embed("text-embedding-004", "test")).rejects.toThrow(
-        "Embedding failed",
-      );
+      await expect(
+        ai.embed("text-embedding-004" as ModelKey, "test"),
+      ).rejects.toThrow("Embedding failed");
     });
 
     it("should throw error during stream iteration", async () => {
@@ -296,8 +303,8 @@ describe("I want to use MockAIHelper in tests", () => {
       // Given: A mock AI helper
       // When: I make multiple calls
       await ai.generateText("gemini-2.5-flash", "First");
-      await ai.generateText("gemini-2.5-pro", "Second");
-      await ai.embed("text-embedding-004", "Third");
+      await ai.generateText("gemini-2.5-pro" as ModelKey, "Second");
+      await ai.embed("text-embedding-004" as ModelKey, "Third");
 
       // Then: All calls are tracked
       expect(ai.getCalls()).toHaveLength(3);
@@ -306,7 +313,7 @@ describe("I want to use MockAIHelper in tests", () => {
     it("should filter calls by type", async () => {
       // Given: Multiple calls of different types
       await ai.generateText("gemini-2.5-flash", "text");
-      await ai.embed("text-embedding-004", "embed");
+      await ai.embed("text-embedding-004" as ModelKey, "embed");
       await ai.generateText("gemini-2.5-flash", "text2");
 
       // When: I filter by type
@@ -321,12 +328,12 @@ describe("I want to use MockAIHelper in tests", () => {
     it("should filter calls by model", async () => {
       // Given: Calls with different models
       await ai.generateText("gemini-2.5-flash", "flash");
-      await ai.generateText("gemini-2.5-pro", "pro");
+      await ai.generateText("gemini-2.5-pro" as ModelKey, "pro");
       await ai.generateText("gemini-2.5-flash", "flash2");
 
       // When: I filter by model
       const flashCalls = ai.getCallsByModel("gemini-2.5-flash");
-      const proCalls = ai.getCallsByModel("gemini-2.5-pro");
+      const proCalls = ai.getCallsByModel("gemini-2.5-pro" as ModelKey);
 
       // Then: Returns filtered results
       expect(flashCalls).toHaveLength(2);
@@ -446,7 +453,7 @@ describe("I want to use MockAIHelper in tests", () => {
     it("should track per-model stats", async () => {
       // Given: Calls with different models
       await ai.generateText("gemini-2.5-flash", "flash");
-      await ai.generateText("gemini-2.5-pro", "pro");
+      await ai.generateText("gemini-2.5-pro" as ModelKey, "pro");
 
       // When: I get stats
       const stats = await ai.getStats();
@@ -483,9 +490,6 @@ describe("I want to use MockAIHelper in tests", () => {
         { id: "req-2", prompt: "Second" },
       ]);
 
-      // Wait for mock processing
-      await new Promise((resolve) => setTimeout(resolve, 150));
-
       // When: I get results
       const results = await batch.getResults(handle.id);
 
@@ -500,8 +504,7 @@ describe("I want to use MockAIHelper in tests", () => {
       const batch = ai.batch("gemini-2.5-flash");
       const handle = await batch.submit([{ id: "req-1", prompt: "Test" }]);
 
-      // Wait and get results to trigger recording
-      await new Promise((resolve) => setTimeout(resolve, 150));
+      // Get results to trigger recording
       await batch.getResults(handle.id);
 
       // Then: Batch calls are recorded

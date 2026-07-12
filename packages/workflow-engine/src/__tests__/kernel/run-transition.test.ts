@@ -1,17 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { defineStage } from "../../core/stage-factory.js";
-import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
-import { createKernel } from "../../kernel/kernel.js";
-import {
-  CollectingEventSink,
-  FakeClock,
-  InMemoryBlobStore,
-  NoopScheduler,
-} from "../../kernel/testing/index.js";
+import { WorkflowBuilder } from "../../core/workflow.js";
 import { StaleVersionError } from "../../persistence/interface.js";
-import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
-import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
+import {
+  createTestKernel,
+  InMemoryWorkflowPersistence,
+} from "../utils/index.js";
 
 function createPassthroughStage(id: string, schema: z.ZodTypeAny) {
   return defineStage({
@@ -40,43 +35,6 @@ function createTwoStageWorkflow(id: string = "test-workflow") {
     .pipe(stage1)
     .pipe(stage2)
     .build();
-}
-
-function createTestKernel(workflows: Workflow<any, any>[] = []) {
-  const persistence = new InMemoryWorkflowPersistence();
-  const blobStore = new InMemoryBlobStore();
-  const jobTransport = new InMemoryJobQueue("test-worker");
-  const eventSink = new CollectingEventSink();
-  const scheduler = new NoopScheduler();
-  const clock = new FakeClock();
-
-  const registry = new Map<string, Workflow<any, any>>();
-  for (const w of workflows) {
-    registry.set(w.id, w);
-  }
-
-  const kernel = createKernel({
-    persistence,
-    blobStore,
-    jobTransport,
-    eventSink,
-    scheduler,
-    clock,
-    registry: { getWorkflow: (id) => registry.get(id) },
-  });
-
-  const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
-  return {
-    kernel,
-    flush,
-    persistence,
-    blobStore,
-    jobTransport,
-    eventSink,
-    scheduler,
-    clock,
-    registry,
-  };
 }
 
 describe("kernel: run.transition", () => {
@@ -191,6 +149,49 @@ describe("kernel: run.transition", () => {
 
     // Verify job was enqueued
     expect(jobTransport.getAllJobs()).toHaveLength(1);
+  });
+
+  it("propagates the run's max existing stage attempt to a newly-created downstream group", async () => {
+    // Regression test: prepareExecutionGroup's attemptMode "max" for
+    // run.transition. Simulates group 1 having already been bumped to
+    // attempt 2 by a prior run.rerunFrom — the newly-created group-2 stage
+    // must inherit that same attempt (not reset to 0), so annotations from
+    // this rerun span share one attempt value.
+    const workflow = createTwoStageWorkflow();
+    const { kernel, persistence } = createTestKernel([workflow]);
+
+    const createResult = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "key-attempt-propagation",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+
+    await persistence.updateRun(createResult.workflowRunId, {
+      status: "RUNNING",
+    });
+
+    await persistence.createStage({
+      workflowRunId: createResult.workflowRunId,
+      stageId: "stage-1",
+      stageName: "Stage stage-1",
+      stageNumber: 1,
+      executionGroup: 1,
+      status: "COMPLETED",
+      attempt: 2,
+    });
+
+    const result = await kernel.dispatch({
+      type: "run.transition",
+      workflowRunId: createResult.workflowRunId,
+    });
+
+    expect(result.action).toBe("advanced");
+
+    const stages = await persistence.getStagesByRun(createResult.workflowRunId);
+    const stage2 = stages.find((s) => s.stageId === "stage-2");
+    expect(stage2).toBeDefined();
+    expect(stage2!.attempt).toBe(2);
   });
 
   it("completes the workflow when all stages are done", async () => {
@@ -394,5 +395,169 @@ describe("kernel: run.transition", () => {
 
     expect(result.action).toBe("noop");
     expect(jobTransport.getAllJobs()).toHaveLength(0);
+  });
+
+  describe("parallel-group retry race", () => {
+    it("does not kill the run when a sibling completes while a FAILED stage still has a retry queued", async () => {
+      const schema = z.object({ data: z.string() });
+      const stageA = createPassthroughStage("stage-a", schema);
+      const stageB = createPassthroughStage("stage-b", schema);
+      const workflow = new WorkflowBuilder(
+        "parallel-retry",
+        "Test",
+        "Test",
+        schema,
+        z.any(),
+      )
+        .parallel([stageA, stageB])
+        .build();
+
+      const { kernel, persistence, jobTransport } = createTestKernel([
+        workflow,
+      ]);
+
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-parallel-retry",
+        workflowId: "parallel-retry",
+        input: { data: "hello" },
+      });
+      await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
+
+      // Target "stage-a" specifically. dequeue() picks whichever PENDING
+      // job comes first, so drain the queue until we get stage-a's job
+      // (attempt is incremented as a side effect, as a real host's
+      // dequeue would do before reporting failure).
+      const targetStageId = "stage-a";
+      const otherStageId = "stage-b";
+      let dequeuedTarget = await jobTransport.dequeue();
+      if (dequeuedTarget!.stageId !== targetStageId) {
+        dequeuedTarget = await jobTransport.dequeue();
+      }
+      expect(dequeuedTarget!.stageId).toBe(targetStageId);
+      const targetJobId = dequeuedTarget!.jobId;
+
+      // Stage A's job fails and the host requeues it for retry (shouldRetry:
+      // true) — jobTransport.fail() puts it back to PENDING with attempt > 0.
+      // The stage record itself is FAILED — that's what job-execute always
+      // writes on a stage-body throw, retryable or not.
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "parallel-retry",
+        stageId: targetStageId,
+        config: {},
+      });
+      // Simulate a failure directly on the stage record + requeue the job,
+      // mirroring what job-execute + a retrying host would produce.
+      await persistence.updateStageByRunAndStageId(
+        workflowRunId,
+        targetStageId,
+        {
+          status: "FAILED",
+          errorMessage: "transient error",
+        },
+      );
+      await jobTransport.fail(targetJobId, "transient error", true);
+
+      // Sibling stage completes normally.
+      const execResult = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "parallel-retry",
+        stageId: otherStageId,
+        config: {},
+      });
+      expect(execResult.outcome).toBe("completed");
+
+      // The sibling's run.transition dispatch must NOT kill the run — the
+      // failed stage's retry is still queued (PENDING, attempt > 0).
+      const transitionAfterSiblingComplete = await kernel.dispatch({
+        type: "run.transition",
+        workflowRunId,
+      });
+      expect(transitionAfterSiblingComplete.action).toBe("noop");
+
+      const runAfterSibling = await persistence.getRun(workflowRunId);
+      expect(runAfterSibling!.status).toBe("RUNNING");
+
+      // Now the retry runs and succeeds.
+      const retryResult = await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "parallel-retry",
+        stageId: targetStageId,
+        config: {},
+      });
+      expect(retryResult.outcome).toBe("completed");
+      await jobTransport.complete(targetJobId);
+
+      const finalTransition = await kernel.dispatch({
+        type: "run.transition",
+        workflowRunId,
+      });
+      expect(finalTransition.action).toBe("completed");
+    });
+
+    it("fails the run once the FAILED stage's retry is exhausted (job itself FAILED)", async () => {
+      const schema = z.object({ data: z.string() });
+      const stageA = createPassthroughStage("stage-a", schema);
+      const stageB = createPassthroughStage("stage-b", schema);
+      const workflow = new WorkflowBuilder(
+        "parallel-retry-exhausted",
+        "Test",
+        "Test",
+        schema,
+        z.any(),
+      )
+        .parallel([stageA, stageB])
+        .build();
+
+      const { kernel, persistence, jobTransport } = createTestKernel([
+        workflow,
+      ]);
+
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "key-parallel-retry-2",
+        workflowId: "parallel-retry-exhausted",
+        input: { data: "hello" },
+      });
+      await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
+
+      const dequeuedA = await jobTransport.dequeue();
+      const targetStageId = dequeuedA!.stageId;
+      const otherStageId = targetStageId === "stage-a" ? "stage-b" : "stage-a";
+
+      await persistence.updateStageByRunAndStageId(
+        workflowRunId,
+        targetStageId,
+        {
+          status: "FAILED",
+          errorMessage: "permanent error",
+        },
+      );
+      // No retry — job fails terminally (shouldRetry: false, the default).
+      await jobTransport.fail(dequeuedA!.jobId, "permanent error");
+
+      const dequeuedOther = await jobTransport.dequeue();
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: "parallel-retry-exhausted",
+        stageId: otherStageId,
+        config: {},
+      });
+      await jobTransport.complete(dequeuedOther!.jobId);
+
+      const transition = await kernel.dispatch({
+        type: "run.transition",
+        workflowRunId,
+      });
+      expect(transition.action).toBe("failed");
+
+      const run = await persistence.getRun(workflowRunId);
+      expect(run!.status).toBe("FAILED");
+    });
   });
 });

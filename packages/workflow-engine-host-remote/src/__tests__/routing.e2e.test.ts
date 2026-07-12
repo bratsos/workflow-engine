@@ -12,8 +12,10 @@
  */
 
 import { WorkflowBuilder } from "@bratsos/workflow-engine";
-import { createKernel } from "@bratsos/workflow-engine/kernel";
-import { createRoutingExecutor } from "@bratsos/workflow-engine/kernel";
+import {
+  createKernel,
+  createRoutingExecutor,
+} from "@bratsos/workflow-engine/kernel";
 import {
   CollectingEventSink,
   FakeClock,

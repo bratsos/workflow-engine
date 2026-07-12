@@ -27,5 +27,11 @@ export default defineConfig({
     "@anthropic-ai/sdk",
     "@google/genai",
     "openai",
+    // Only referenced by src/testing/persistence-conformance.ts (the
+    // exported conformance suite factories). Left external so the main
+    // "./testing" bundle doesn't drag vitest's runtime into every
+    // consumer -- only callers that actually invoke the conformance
+    // suites need it resolvable, and they already depend on vitest.
+    "vitest",
   ],
 });

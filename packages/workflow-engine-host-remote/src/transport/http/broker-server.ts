@@ -1,5 +1,6 @@
 import { timingSafeEqual } from "node:crypto";
 import * as http from "node:http";
+import { toErrorMessage } from "@bratsos/workflow-engine/kernel";
 import type { Broker } from "../../broker/broker.js";
 import type { InMemoryObjectStore } from "../../object-store.js";
 import { ActivityReportSchema, LeaseRequestSchema } from "./schemas.js";
@@ -81,7 +82,7 @@ export async function handleBrokerRequest(
     } catch (err) {
       return {
         status: 409,
-        json: { error: err instanceof Error ? err.message : String(err) },
+        json: { error: toErrorMessage(err) },
       };
     }
   }
@@ -101,7 +102,7 @@ export async function handleBrokerRequest(
     } catch (err) {
       return {
         status: 409,
-        json: { error: err instanceof Error ? err.message : String(err) },
+        json: { error: toErrorMessage(err) },
       };
     }
   }
@@ -155,9 +156,20 @@ export async function handleBrokerRequest(
       let blobUrl: string;
       if (isAbsoluteHttpUrl(presignResp.url)) {
         blobUrl = presignResp.url;
+      } else if (deps.publicBaseUrl) {
+        blobUrl = `${deps.publicBaseUrl}/blob?u=${encodeURIComponent(presignResp.url)}`;
       } else {
-        const base = deps.publicBaseUrl ?? "http://127.0.0.1";
-        blobUrl = `${base}/blob?u=${encodeURIComponent(presignResp.url)}`;
+        // No publicBaseUrl was configured or derivable (e.g. handleBrokerRequest
+        // called directly, outside createBrokerHttpServer's Host-header
+        // derivation). Minting a portless "http://127.0.0.1" URL here would be
+        // silently unusable — fail loudly instead.
+        return {
+          status: 500,
+          json: {
+            error:
+              "publicBaseUrl is not configured; cannot construct a blob URL for a non-absolute presigned URL",
+          },
+        };
       }
       return { status: 200, json: { url: blobUrl } };
     } catch (err) {
@@ -166,7 +178,7 @@ export async function handleBrokerRequest(
       // /report. A 500 is reserved for genuinely unexpected errors.
       return {
         status: 409,
-        json: { error: err instanceof Error ? err.message : String(err) },
+        json: { error: toErrorMessage(err) },
       };
     }
   }
@@ -186,7 +198,7 @@ export async function handleBrokerRequest(
     } catch (err) {
       return {
         status: 400,
-        json: { error: err instanceof Error ? err.message : String(err) },
+        json: { error: toErrorMessage(err) },
       };
     }
   }
@@ -204,7 +216,7 @@ export async function handleBrokerRequest(
     } catch (err) {
       return {
         status: 400,
-        json: { error: err instanceof Error ? err.message : String(err) },
+        json: { error: toErrorMessage(err) },
       };
     }
   }
@@ -306,7 +318,7 @@ async function handleRequest(
     res.end(payload);
   } catch (err) {
     const msg = JSON.stringify({
-      error: err instanceof Error ? err.message : String(err),
+      error: toErrorMessage(err),
     });
     res.writeHead(500, { "Content-Type": "application/json" });
     res.end(msg);

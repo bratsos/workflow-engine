@@ -12,8 +12,8 @@ import {
   type InlinedRequest,
   JobState,
 } from "@google/genai";
-import { jsonSchema } from "ai";
-import { resolveModelForProvider } from "../model-mapping";
+import { asSchema } from "ai";
+import { z } from "zod";
 import type {
   BatchHandle,
   BatchLogger,
@@ -24,6 +24,12 @@ import type {
   GoogleBatchRequest,
   RawBatchResult,
 } from "../types";
+import {
+  assertNonEmptyBatch,
+  resolveApiKey,
+  resolveBatchModel,
+  resolveCustomId,
+} from "./shared";
 
 export interface GoogleBatchProviderConfig {
   apiKey?: string;
@@ -39,13 +45,13 @@ export class GoogleBatchProvider
   private logger?: BatchLogger;
 
   constructor(config: GoogleBatchProviderConfig = {}, logger?: BatchLogger) {
-    const apiKey = config.apiKey || process.env.GOOGLE_GENERATIVE_AI_API_KEY;
-    if (!apiKey) {
-      throw new Error(
-        "Google API key is required. Set GOOGLE_GENERATIVE_AI_API_KEY or pass apiKey in config.",
-      );
-    }
-    this.ai = new GoogleGenAI({ apiKey });
+    this.ai = new GoogleGenAI({
+      apiKey: resolveApiKey(
+        config.apiKey,
+        "GOOGLE_GENERATIVE_AI_API_KEY",
+        "Google",
+      ),
+    });
     this.logger = logger;
   }
 
@@ -53,18 +59,13 @@ export class GoogleBatchProvider
     requests: GoogleBatchRequest[],
     options?: BatchSubmitOptions,
   ): Promise<BatchHandle> {
-    if (requests.length === 0) {
-      throw new Error("Cannot submit empty batch");
-    }
+    assertNonEmptyBatch(requests);
 
     // Convert ModelKey to Google-specific model ID
-    const modelKey = requests[0]?.model;
-    const model = resolveModelForProvider(modelKey, "google");
+    const { modelKey, model } = resolveBatchModel(requests, "google");
 
     // Extract customIds from requests to store in handle metadata
-    const customIds = requests.map(
-      (req, idx) => (req as { id?: string }).id || `request-${idx}`,
-    );
+    const customIds = requests.map((req, idx) => resolveCustomId(req.id, idx));
 
     this.logger?.log("INFO", "Submitting Google batch", {
       requestCount: requests.length,
@@ -73,31 +74,11 @@ export class GoogleBatchProvider
     });
 
     // Transform requests into Google's inline format
-    const inlinedRequests: InlinedRequest[] = requests.map((req) => {
+    const inlinedRequests: InlinedRequest[] = requests.map((req, reqIndex) => {
       const parts: Array<{ text: string }> = [{ text: req.prompt }];
 
-      if (req.schema) {
-        // Use schema description since toJSONSchema may not be available in all Zod versions
-        parts.push({
-          text: `Please respond with a JSON object matching the expected schema structure.`,
-        });
-      }
-
-      if (req.maxTokens) {
-        parts.push({
-          text: `Limit your response to a maximum of ${req.maxTokens} tokens.`,
-        });
-      }
-
-      if (req.temperature !== undefined) {
-        parts.push({
-          text: `Use a temperature setting of ${req.temperature} for this response.`,
-        });
-      }
-
       // Get customId from request (via id field passed from ai-helper)
-      const customId =
-        (req as { id?: string }).id || `request-${requests.indexOf(req)}`;
+      const customId = resolveCustomId(req.id, reqIndex);
 
       // Build the response object with metadata for ID tracking
       const response: Record<string, unknown> = {
@@ -111,24 +92,44 @@ export class GoogleBatchProvider
         metadata: { customId },
       };
 
+      const config: Record<string, unknown> = {};
+
+      if (req.system) {
+        config.systemInstruction = req.system;
+      }
+
+      if (req.maxTokens) {
+        config.maxOutputTokens = req.maxTokens;
+      }
+
+      if (req.temperature !== undefined) {
+        config.temperature = req.temperature;
+      }
+
+      if (req.schema) {
+        // Native structured output: ask the model to emit JSON that
+        // conforms to the request's JSON Schema, rather than relying on
+        // prompt text.
+        config.responseMimeType = "application/json";
+        config.responseJsonSchema = z.toJSONSchema(req.schema);
+      }
+
       // Add tools configuration if provided
       if (req.tools && Object.keys(req.tools).length > 0) {
-        const config: Record<string, unknown> = {
-          tools: [
-            {
-              functionDeclarations: Object.entries(req.tools).map(
-                ([name, tool]) => ({
-                  name,
-                  description: tool.description,
-                  // AI SDK uses inputSchema, convert to JSON Schema for Google
-                  parameters: tool.inputSchema
-                    ? jsonSchema(tool.inputSchema)
-                    : undefined,
-                }),
-              ),
-            },
-          ],
-        };
+        config.tools = [
+          {
+            functionDeclarations: Object.entries(req.tools).map(
+              ([name, tool]) => ({
+                name,
+                description: tool.description,
+                // AI SDK uses inputSchema, convert to JSON Schema for Google
+                parameters: tool.inputSchema
+                  ? asSchema(tool.inputSchema).jsonSchema
+                  : undefined,
+              }),
+            ),
+          },
+        ];
 
         // Map toolChoice if provided
         if (req.toolChoice) {
@@ -153,7 +154,9 @@ export class GoogleBatchProvider
           }
           // 'auto' is the default, no config needed
         }
+      }
 
+      if (Object.keys(config).length > 0) {
         response.config = config;
       }
 
@@ -288,12 +291,6 @@ export class GoogleBatchProvider
     }
 
     const maybeInlinedResponses = batch.dest?.inlinedResponses;
-    if (!maybeInlinedResponses) {
-      throw new Error(
-        "Batch response format unexpected - could not find inlinedResponses array",
-      );
-    }
-
     if (!maybeInlinedResponses || !Array.isArray(maybeInlinedResponses)) {
       this.logger?.log("ERROR", "Unexpected batch response format", {
         batchId: handle.id,

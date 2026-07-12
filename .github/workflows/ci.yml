@@ -6,21 +6,29 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   ci:
     runs-on: ubuntu-latest
 
+    strategy:
+      matrix:
+        node-version: ["22", "24"]
+
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: "22"
+          node-version: ${{ matrix.node-version }}
           cache: "pnpm"
 
       - name: Install dependencies
@@ -30,12 +38,60 @@ jobs:
         run: pnpm biome check .
 
       - name: Build
-        run: pnpm build
+        run: pnpm --filter '!workflow-engine-docs' -r build
 
       - name: Type check
-        run: pnpm typecheck
+        run: pnpm --filter '!workflow-engine-docs' -r typecheck
 
       - name: Test
         run: pnpm test
+        env:
+          NODE_ENV: test
+
+  postgres-conformance:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: workflow_engine_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/workflow_engine_test
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --filter @bratsos/workflow-engine
+
+      - name: Generate Prisma client
+        run: pnpm --filter @bratsos/workflow-engine run prisma:generate
+
+      - name: Push Prisma schema to Postgres
+        run: pnpm --filter @bratsos/workflow-engine run prisma:db-push
+
+      - name: Run Postgres conformance tests
+        run: pnpm --filter @bratsos/workflow-engine run test:pg
         env:
           NODE_ENV: test

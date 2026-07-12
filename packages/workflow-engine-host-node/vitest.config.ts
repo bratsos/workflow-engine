@@ -1,18 +1,5 @@
-import path from "node:path";
-import { defineConfig } from "vitest/config";
+import { defineConfig, mergeConfig } from "vitest/config";
+import { hostPackageBaseConfig } from "../../vitest.shared";
 
-const coreSrc = path.resolve(__dirname, "../workflow-engine/src");
-
-export default defineConfig({
-  resolve: {
-    alias: {
-      "@bratsos/workflow-engine/kernel/testing": path.join(coreSrc, "kernel/testing/index.ts"),
-      "@bratsos/workflow-engine/kernel": path.join(coreSrc, "kernel/index.ts"),
-      "@bratsos/workflow-engine/testing": path.join(coreSrc, "testing/index.ts"),
-      "@bratsos/workflow-engine": path.join(coreSrc, "index.ts"),
-    },
-  },
-  test: {
-    globals: false,
-  },
-});
+// Package-specific overrides (none today) go in the second defineConfig().
+export default mergeConfig(hostPackageBaseConfig, defineConfig({}));

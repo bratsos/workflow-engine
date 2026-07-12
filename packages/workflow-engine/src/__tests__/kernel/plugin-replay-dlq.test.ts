@@ -7,16 +7,13 @@
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { defineStage } from "../../core/stage-factory.js";
-import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
-import { createKernel } from "../../kernel/kernel.js";
-import { createPluginRunner, definePlugin } from "../../kernel/plugins.js";
+import { WorkflowBuilder } from "../../core/workflow.js";
 import {
-  FakeClock,
-  InMemoryBlobStore,
-  NoopScheduler,
-} from "../../kernel/testing/index.js";
-import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
-import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
+  createPluginRunner,
+  definePlugin,
+  type PluginDefinition,
+} from "../../kernel/plugins.js";
+import { createTestKernel } from "../utils/index.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -38,12 +35,6 @@ function createSimpleWorkflow() {
 }
 
 function createTestKernelWithFailingPlugin(maxRetries = 1) {
-  const persistence = new InMemoryWorkflowPersistence();
-  const blobStore = new InMemoryBlobStore();
-  const jobTransport = new InMemoryJobQueue("test-worker");
-  const scheduler = new NoopScheduler();
-  const clock = new FakeClock();
-
   let shouldFail = true;
   const handler = async () => {
     if (shouldFail) throw new Error("plugin failure");
@@ -56,23 +47,15 @@ function createTestKernelWithFailingPlugin(maxRetries = 1) {
     handle: handler,
   });
 
-  const eventSink = createPluginRunner({ plugins: [plugin], maxRetries });
-
-  const workflow = createSimpleWorkflow();
-  const registry = new Map<string, Workflow<any, any>>();
-  registry.set(workflow.id, workflow);
-
-  const kernel = createKernel({
-    persistence,
-    blobStore,
-    jobTransport,
-    eventSink,
-    scheduler,
-    clock,
-    registry: { getWorkflow: (id) => registry.get(id) },
+  const eventSink = createPluginRunner({
+    plugins: [plugin as PluginDefinition],
+    maxRetries,
   });
 
-  const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
+  const { kernel, flush, persistence } = createTestKernel(
+    [createSimpleWorkflow()],
+    { eventSink },
+  );
 
   return {
     kernel,

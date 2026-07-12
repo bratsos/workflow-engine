@@ -5,60 +5,25 @@
  * Covers basic properties, input/config access, workflowContext helpers,
  * progress reporting, logging, and storage access.
  *
- * All tests use kernel dispatch (run.create + job.execute) instead of
- * the old WorkflowExecutor.
+ * Most tests use kernel dispatch (run.create + job.execute) instead of the
+ * old WorkflowExecutor. The "onProgress auto-fills" tests below are the
+ * exception — that's factory-level behavior (defineStage()'s
+ * EnhancedStageContext wrapper), orthogonal to kernel dispatch, so they
+ * call stage.execute() directly against a mock context.
  */
 
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
+import type { StageContext } from "../../core/stage.js";
 import { defineStage } from "../../core/stage-factory.js";
-import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
-import { createKernel } from "../../kernel/kernel.js";
-import {
-  CollectingEventSink,
-  FakeClock,
-  InMemoryBlobStore,
-  NoopScheduler,
-} from "../../kernel/testing/index.js";
-import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
-import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
-
-function createTestKernel(workflows: Workflow<any, any>[] = []) {
-  const persistence = new InMemoryWorkflowPersistence();
-  const blobStore = new InMemoryBlobStore();
-  const jobTransport = new InMemoryJobQueue("test-worker");
-  const eventSink = new CollectingEventSink();
-  const scheduler = new NoopScheduler();
-  const clock = new FakeClock();
-  const registry = new Map<string, Workflow<any, any>>();
-  for (const w of workflows) registry.set(w.id, w);
-  const kernel = createKernel({
-    persistence,
-    blobStore,
-    jobTransport,
-    eventSink,
-    scheduler,
-    clock,
-    registry: { getWorkflow: (id) => registry.get(id) },
-  });
-  const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
-  return {
-    kernel,
-    flush,
-    persistence,
-    blobStore,
-    jobTransport,
-    eventSink,
-    scheduler,
-    clock,
-    registry,
-  };
-}
+import type { ProgressUpdate } from "../../core/types.js";
+import { WorkflowBuilder } from "../../core/workflow.js";
+import { createTestKernel } from "../utils/index.js";
 
 /** Helper: create run, mark RUNNING, execute stage, return result */
 async function runSingleStageWorkflow(
   kernel: ReturnType<typeof createTestKernel>["kernel"],
-  persistence: InMemoryWorkflowPersistence,
+  persistence: ReturnType<typeof createTestKernel>["persistence"],
   flush: () => Promise<any>,
   workflowId: string,
   input: Record<string, unknown>,
@@ -462,6 +427,7 @@ describe("I want to use stage context", () => {
       };
 
       const processStage = defineStage<
+        "process",
         z.ZodObject<{ extracted: z.ZodString }>,
         z.ZodObject<{ processed: z.ZodString }>,
         z.ZodObject<{}>,
@@ -645,6 +611,7 @@ describe("I want to use stage context", () => {
       };
 
       const checkStage = defineStage<
+        "check",
         z.ZodObject<{ optional: z.ZodString }>,
         z.ZodObject<{ value: z.ZodString }>,
         z.ZodObject<{}>,
@@ -875,3 +842,112 @@ describe("I want to use stage context", () => {
     });
   });
 });
+
+describe("onProgress auto-fills stageId/stageName", () => {
+  it("forwards the stage's own stageId/stageName when only progress/message are passed", async () => {
+    const seen: ProgressUpdate[] = [];
+
+    const stage = defineStage({
+      id: "progress-stage",
+      name: "Progress Stage",
+      schemas: {
+        input: z.object({}),
+        output: z.object({}),
+        config: z.object({}),
+      },
+      async execute(ctx) {
+        ctx.onProgress({ progress: 50, message: "halfway" });
+        return { output: {} };
+      },
+    });
+
+    await stage.execute(
+      createMockContext({
+        stageId: "progress-stage",
+        stageName: "Progress Stage",
+        onProgress: (update) => seen.push(update),
+      }),
+    );
+
+    expect(seen).toEqual([
+      {
+        stageId: "progress-stage",
+        stageName: "Progress Stage",
+        progress: 50,
+        message: "halfway",
+      },
+    ]);
+  });
+
+  it("still allows callers to override the auto-filled stageId/stageName", async () => {
+    const seen: ProgressUpdate[] = [];
+
+    const stage = defineStage({
+      id: "override-stage",
+      name: "Override Stage",
+      schemas: {
+        input: z.object({}),
+        output: z.object({}),
+        config: z.object({}),
+      },
+      async execute(ctx) {
+        ctx.onProgress({
+          progress: 10,
+          message: "custom",
+          stageId: "custom-id",
+          stageName: "Custom Name",
+        });
+        return { output: {} };
+      },
+    });
+
+    await stage.execute(
+      createMockContext({
+        stageId: "override-stage",
+        stageName: "Override Stage",
+        onProgress: (update) => seen.push(update),
+      }),
+    );
+
+    expect(seen).toEqual([
+      {
+        stageId: "custom-id",
+        stageName: "Custom Name",
+        progress: 10,
+        message: "custom",
+      },
+    ]);
+  });
+});
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+function createMockContext(overrides: {
+  stageId: string;
+  stageName: string;
+  input?: unknown;
+  onProgress?: (update: ProgressUpdate) => void;
+}): StageContext<any, any, any> {
+  return {
+    workflowRunId: "run-1",
+    stageId: overrides.stageId,
+    stageName: overrides.stageName,
+    stageNumber: 0,
+    input: overrides.input ?? {},
+    config: {},
+    workflowContext: {},
+    onProgress: overrides.onProgress ?? (() => {}),
+    onLog: () => {},
+    log: () => {},
+    annotate: (() => {}) as StageContext<any, any, any>["annotate"],
+    storage: {
+      save: async () => {},
+      load: async <T>(): Promise<T> => null as T,
+      exists: async () => false,
+      delete: async () => {},
+      getStageKey: () => "key",
+    },
+  };
+}

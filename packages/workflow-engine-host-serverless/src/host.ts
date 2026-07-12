@@ -10,7 +10,13 @@
  * cron triggers) around these methods.
  */
 
-import type { JobTransport, Kernel } from "@bratsos/workflow-engine/kernel";
+import {
+  executeJobWithHeartbeat,
+  HOST_DEFAULTS,
+  type JobTransport,
+  type Kernel,
+  runMaintenanceTick as runMaintenanceTickCommands,
+} from "@bratsos/workflow-engine/kernel";
 
 // ============================================================================
 // Public interfaces
@@ -26,7 +32,7 @@ export interface ServerlessHostConfig {
   /** Unique worker identifier (e.g. function name, worker name). */
   workerId: string;
 
-  /** Stale lease threshold in milliseconds (default: 60_000). */
+  /** Stale lease threshold in milliseconds (default: 300_000). */
   staleLeaseThresholdMs?: number;
 
   /** Max pending runs to claim per maintenance tick (default: 10). */
@@ -37,6 +43,9 @@ export interface ServerlessHostConfig {
 
   /** Max outbox events to flush per tick (default: 100). */
   maxOutboxFlushPerTick?: number;
+
+  /** Job lease heartbeat interval in milliseconds (default: 60_000). */
+  jobHeartbeatIntervalMs?: number;
 }
 
 /** Message shape representing a job to execute. Matches DequeueResult fields. */
@@ -96,53 +105,36 @@ class ServerlessHostImpl implements ServerlessHost {
   private readonly maxClaimsPerTick: number;
   private readonly maxSuspendedChecksPerTick: number;
   private readonly maxOutboxFlushPerTick: number;
+  private readonly jobHeartbeatIntervalMs: number;
 
   constructor(config: ServerlessHostConfig) {
     this.kernel = config.kernel;
     this.jobTransport = config.jobTransport;
     this.workerId = config.workerId;
-    this.staleLeaseThresholdMs = config.staleLeaseThresholdMs ?? 60_000;
-    this.maxClaimsPerTick = config.maxClaimsPerTick ?? 10;
-    this.maxSuspendedChecksPerTick = config.maxSuspendedChecksPerTick ?? 10;
-    this.maxOutboxFlushPerTick = config.maxOutboxFlushPerTick ?? 100;
+    this.staleLeaseThresholdMs =
+      config.staleLeaseThresholdMs ?? HOST_DEFAULTS.staleLeaseThresholdMs;
+    this.maxClaimsPerTick =
+      config.maxClaimsPerTick ?? HOST_DEFAULTS.maxClaimsPerTick;
+    this.maxSuspendedChecksPerTick =
+      config.maxSuspendedChecksPerTick ??
+      HOST_DEFAULTS.maxSuspendedChecksPerTick;
+    this.maxOutboxFlushPerTick =
+      config.maxOutboxFlushPerTick ?? HOST_DEFAULTS.maxOutboxFlushPerTick;
+    this.jobHeartbeatIntervalMs =
+      config.jobHeartbeatIntervalMs ?? HOST_DEFAULTS.jobHeartbeatIntervalMs;
   }
 
   async handleJob(msg: JobMessage): Promise<JobResult> {
-    const config =
-      (msg.payload as { config?: Record<string, unknown> }).config || {};
-
-    const result = await this.kernel.dispatch({
-      type: "job.execute",
-      idempotencyKey: `job:${msg.jobId}:attempt:${msg.attempt}`,
-      workflowRunId: msg.workflowRunId,
-      workflowId: msg.workflowId,
-      stageId: msg.stageId,
-      config,
+    // Dispatch job.execute under a lease heartbeat and route the outcome
+    // (complete/suspend/fail + terminal run.transition) — see
+    // executeJobWithHeartbeat in @bratsos/workflow-engine/kernel for the
+    // shared command sequence.
+    return executeJobWithHeartbeat(this.kernel, {
+      jobTransport: this.jobTransport,
+      job: msg,
+      jobHeartbeatIntervalMs: this.jobHeartbeatIntervalMs,
+      logPrefix: "[ServerlessHost]",
     });
-
-    if (result.outcome === "completed") {
-      await this.jobTransport.complete(msg.jobId);
-      await this.kernel.dispatch({
-        type: "run.transition",
-        workflowRunId: msg.workflowRunId,
-      });
-      return { outcome: "completed" };
-    }
-
-    if (result.outcome === "suspended") {
-      const nextPollAt = result.nextPollAt ?? new Date(Date.now() + 60_000);
-      await this.jobTransport.suspend(msg.jobId, nextPollAt);
-      return { outcome: "suspended" };
-    }
-
-    // failed — ghost jobs should never be retried
-    const canRetry = !result.ghost && msg.attempt < (msg.maxAttempts ?? 3);
-    await this.jobTransport.fail(
-      msg.jobId,
-      result.error ?? "Unknown error",
-      canRetry,
-    );
-    return { outcome: "failed", error: result.error };
   }
 
   async processAvailableJobs(opts?: {
@@ -179,81 +171,19 @@ class ServerlessHostImpl implements ServerlessHost {
   }
 
   async runMaintenanceTick(): Promise<MaintenanceTickResult> {
-    let claimed = 0;
-    let suspendedChecked = 0;
-    let staleReleased = 0;
-    let eventsFlushed = 0;
-
-    // 1. Claim pending runs → enqueue first-stage jobs
-    try {
-      const claimResult = await this.kernel.dispatch({
-        type: "run.claimPending",
-        workerId: this.workerId,
-        maxClaims: this.maxClaimsPerTick,
-      });
-      claimed = claimResult.claimed.length;
-    } catch (error) {
-      console.error("[ServerlessHost] run.claimPending error:", error);
-    }
-
-    // 2. Poll suspended stages → resume if ready
-    try {
-      const pollResult = await this.kernel.dispatch({
-        type: "stage.pollSuspended",
-        maxChecks: this.maxSuspendedChecksPerTick,
-      });
-      suspendedChecked = pollResult.checked;
-      for (const workflowRunId of pollResult.resumedWorkflowRunIds) {
-        await this.kernel.dispatch({
-          type: "run.transition",
-          workflowRunId,
-        });
-      }
-    } catch (error) {
-      console.error("[ServerlessHost] stage.pollSuspended error:", error);
-    }
-
-    // 3. Reap stale leases → release crashed worker locks
-    try {
-      const reapResult = await this.kernel.dispatch({
-        type: "lease.reapStale",
-        staleThresholdMs: this.staleLeaseThresholdMs,
-      });
-      staleReleased = reapResult.released;
-    } catch (error) {
-      console.error("[ServerlessHost] lease.reapStale error:", error);
-    }
-
-    // 4. Flush outbox → publish pending events through EventSink
-    try {
-      const flushResult = await this.kernel.dispatch({
-        type: "outbox.flush",
-        maxEvents: this.maxOutboxFlushPerTick,
-      });
-      eventsFlushed = flushResult.published;
-    } catch (error) {
-      console.error("[ServerlessHost] outbox.flush error:", error);
-    }
-
-    // 5. Reap stuck runs → fail runs with no activity past threshold
-    let stuckReaped = 0;
-    try {
-      const reapStuckResult = await this.kernel.dispatch({
-        type: "run.reapStuck",
-        stuckThresholdMs: Math.max(this.staleLeaseThresholdMs * 3, 5 * 60_000),
-      });
-      stuckReaped = reapStuckResult.failed;
-    } catch (error) {
-      console.error("[ServerlessHost] run.reapStuck error:", error);
-    }
-
-    return {
-      claimed,
-      suspendedChecked,
-      staleReleased,
-      eventsFlushed,
-      stuckReaped,
-    };
+    // Claim pending runs, poll suspended stages, reap stale leases, flush
+    // the outbox, and reap stuck runs — see runMaintenanceTick in
+    // @bratsos/workflow-engine/kernel for the shared command sequence. The
+    // serverless host returns the per-command counts to its caller (unlike
+    // the Node host, which fires this on a timer and ignores them).
+    return runMaintenanceTickCommands(this.kernel, {
+      workerId: this.workerId,
+      maxClaimsPerTick: this.maxClaimsPerTick,
+      maxSuspendedChecksPerTick: this.maxSuspendedChecksPerTick,
+      maxOutboxFlushPerTick: this.maxOutboxFlushPerTick,
+      staleLeaseThresholdMs: this.staleLeaseThresholdMs,
+      logPrefix: "[ServerlessHost]",
+    });
   }
 }
 

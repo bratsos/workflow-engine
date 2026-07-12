@@ -5,6 +5,7 @@
   "description": "Type-safe, distributed workflow engine for AI-orchestrated processes",
   "scripts": {
     "test": "pnpm -r test",
+    "test:workspace": "vitest run",
     "build": "pnpm -r build",
     "typecheck": "pnpm -r typecheck",
     "check": "pnpm biome check .",
@@ -13,7 +14,7 @@
     "format:fix": "pnpm biome format --write .",
     "lint": "pnpm biome check .",
     "lint:fix": "pnpm biome check --write .",
-    "ci": "pnpm lint && pnpm typecheck && pnpm test && pnpm build",
+    "verify": "pnpm lint && pnpm typecheck && pnpm test && pnpm build",
     "changeset": "changeset",
     "version": "changeset version",
     "release": "pnpm build && pnpm -r publish"
@@ -25,12 +26,11 @@
     "node": ">=22.11.0"
   },
   "devDependencies": {
-    "@biomejs/biome": "2.0.0-beta.1",
+    "@biomejs/biome": "2.5.2",
     "@changesets/cli": "^2.29.8",
-    "@types/node": "^22"
-  },
-  "dependencies": {
-    "typescript": "^5.8.3"
+    "@types/node": "^22",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4"
   },
   "packageManager": "pnpm@9.6.0+sha1.65cd48c20dd329b7f455088b6dd17d4d5b6d02e3"
 }

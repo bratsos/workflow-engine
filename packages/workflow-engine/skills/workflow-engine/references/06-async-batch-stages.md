@@ -122,15 +122,15 @@ interface SimpleSuspendedResult {
   suspended: true;           // Required marker
 
   state: {
-    batchId: string;         // External batch job ID
-    submittedAt: string;     // ISO timestamp
-    pollInterval: number;    // Milliseconds between checks
-    maxWaitTime: number;     // Maximum wait before timeout
+    batchId: string;         // Required: external batch job ID -- the only field you must supply
+    submittedAt?: string;    // Optional: ISO timestamp; defaults to now
+    pollInterval?: number;   // Optional: ms between checks; defaults to pollConfig.pollInterval or 30s
+    maxWaitTime?: number;    // Optional: max wait before timeout; defaults to pollConfig.maxWaitTime or 24h
     metadata?: Record<string, unknown>;  // Custom data
     apiKey?: string;         // Optional: for provider auth
   };
 
-  pollConfig: {
+  pollConfig?: {             // Optional (v0.11+): derived automatically from `state` when omitted
     pollInterval: number;    // Milliseconds
     maxWaitTime: number;     // Milliseconds
     nextPollAt: Date;        // First poll time
@@ -139,6 +139,8 @@ interface SimpleSuspendedResult {
   customMetrics?: Record<string, number>;  // Optional metrics
 }
 ```
+
+As of v0.11, `pollConfig` is entirely optional and derived from `state` (falling back to a 30s poll interval / 24h max wait) -- `state.batchId` is the only field you must actually compute yourself.
 
 ## Check Completion Function
 
@@ -236,8 +238,8 @@ interface CheckCompletionContext<TConfig> {
   stageId: string;           // Current stage ID
   stageRecordId: string;     // Database record ID (for LogContext)
   config: TConfig;           // Stage configuration
-  log: LogFunction;          // Async logging
-  onLog: LogFunction;        // Alias for log
+  onLog: LogFunction;        // Async logging
+  log: LogFunction;          // Alias for onLog
   storage: StageStorage;     // Artifact storage
 }
 ```
@@ -417,7 +419,9 @@ pollConfig: {
 
 ### Timeout Handling
 
-The runtime automatically fails stages that exceed `maxWaitTime`:
+**As of v0.11, `maxWaitTime` is actually enforced** -- before v0.11 it was accepted but silently ignored, so a suspended stage would poll forever regardless of the value you set. If any of your stages relied on that (an implicit "poll forever"), they will now time out and fail once `maxWaitTime` elapses; audit values that were set low "because it didn't matter."
+
+The manual check below inside `checkCompletion` is now belt-and-suspenders (useful for provider-side cancellation) rather than the only enforcement:
 
 ```typescript
 // In checkCompletion, check for timeout

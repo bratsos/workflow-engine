@@ -35,10 +35,20 @@ import { NoInputSchema } from "./schema-helpers";
 import type { CheckCompletionContext, Stage, StageContext } from "./stage";
 import type {
   CompletionCheckResult,
+  ProgressUpdate,
   StageResult,
   SuspendedResult,
   SuspendedStateSchema,
 } from "./types";
+
+// ============================================================================
+// Poll Config Defaults
+// ============================================================================
+
+/** Default poll interval used when a suspended stage's state doesn't specify one. */
+const DEFAULT_POLL_INTERVAL_MS = 30_000;
+/** Default max wait time used when a suspended stage's state doesn't specify one. */
+const DEFAULT_MAX_WAIT_TIME_MS = 24 * 60 * 60 * 1000;
 
 // ============================================================================
 // Type Helper for TInput
@@ -65,7 +75,23 @@ export interface EnhancedStageContext<
   TInput,
   TConfig,
   TContext extends Record<string, unknown>,
-> extends StageContext<TInput, TConfig, TContext> {
+> extends Omit<StageContext<TInput, TConfig, TContext>, "onProgress"> {
+  /**
+   * Report progress for this stage.
+   *
+   * `stageId` and `stageName` are auto-filled from the current stage's
+   * context, so you only need to pass `{ progress, message }`. You may
+   * still pass explicit `stageId`/`stageName` to override the auto-filled
+   * values.
+   *
+   * @example
+   * ctx.onProgress({ progress: 50, message: "Halfway done" });
+   */
+  onProgress: (
+    update: Omit<ProgressUpdate, "stageId" | "stageName"> &
+      Partial<Pick<ProgressUpdate, "stageId" | "stageName">>,
+  ) => void;
+
   /**
    * Require output from a previous stage (throws if not found)
    *
@@ -107,18 +133,30 @@ export interface SimpleStageResult<TOutput> {
 
 /**
  * Simplified suspended result - metrics are auto-filled by the factory
+ *
+ * `pollConfig` (and `state.submittedAt` / `pollInterval` / `maxWaitTime`) are
+ * optional — when omitted, the factory derives `pollConfig` (including
+ * `nextPollAt`) from whatever is present on `state`, falling back to
+ * sensible defaults. Write the poll timing values once, either on `state`
+ * or on `pollConfig` (or both, if you want to override the derived value).
  */
 export interface SimpleSuspendedResult {
   suspended: true;
   state: {
     batchId: string;
-    submittedAt: string;
-    pollInterval: number;
-    maxWaitTime: number;
+    /** Defaults to the current time if omitted. */
+    submittedAt?: string;
+    /** Defaults to `pollConfig.pollInterval`, or 30s if neither is set. */
+    pollInterval?: number;
+    /** Defaults to `pollConfig.maxWaitTime`, or 24h if neither is set. */
+    maxWaitTime?: number;
     metadata?: Record<string, unknown>;
     apiKey?: string;
   };
-  pollConfig: {
+  /**
+   * Optional — derived automatically from `state` when omitted.
+   */
+  pollConfig?: {
     pollInterval: number;
     maxWaitTime: number;
     nextPollAt: Date;
@@ -221,7 +259,66 @@ export interface AsyncBatchStageDefinition<
 // ============================================================================
 
 /**
+ * Curried form — supply only `TContext` and let TypeScript infer `TId` (as
+ * a string literal), `TInput`, `TOutput`, and `TConfig` from the definition
+ * object passed to the returned function.
+ *
+ * Prefer this over the 5-positional-generic overloads below whenever you
+ * need to fix `TContext` explicitly. Positional generics require spelling
+ * out all five by hand (`defineStage<TId, TInput, TOutput, TConfig,
+ * TContext>({...})`) since TypeScript can't infer a subset from the middle
+ * of a generic list — that duplicates the types already on `schemas` and
+ * silently loses `TId` literal inference if any of them are mistyped. The
+ * curried form only ever requires the one generic TypeScript truly can't
+ * infer on its own.
+ *
+ * @example
+ * ```typescript
+ * type MyContext = { "previous-stage": { value: string } };
+ *
+ * export const myStage = defineStage<MyContext>()({
+ *   id: "my-stage",              // TId inferred as the literal "my-stage"
+ *   name: "My Stage",
+ *   schemas: {
+ *     input: InputSchema,
+ *     output: OutputSchema,
+ *     config: ConfigSchema,
+ *   },
+ *   async execute(ctx) {
+ *     const prev = ctx.require("previous-stage"); // typed via MyContext
+ *     return { output: { ... } };
+ *   },
+ * });
+ * ```
+ */
+export function defineStage<
+  TContext extends Record<string, unknown> = Record<string, unknown>,
+>(): <
+  TId extends string,
+  TInput extends z.ZodTypeAny | "none",
+  TOutput extends z.ZodTypeAny,
+  TConfig extends z.ZodTypeAny,
+>(
+  definition:
+    | SyncStageDefinition<TInput, TOutput, TConfig, TContext, TId>
+    | AsyncBatchStageDefinition<TInput, TOutput, TConfig, TContext, TId>,
+) => Stage<
+  TInput extends "none" ? typeof NoInputSchema : TInput,
+  TOutput,
+  TConfig,
+  TContext,
+  TId
+>;
+
+/**
  * Define a sync stage with simplified API
+ *
+ * @deprecated Spelling out all five generics positionally is verbose and
+ * throws away `TId` literal inference if any of them are mistyped. Prefer
+ * the curried form when you need to fix `TContext` explicitly:
+ * `defineStage<TContext>()({ ... })`. (This overload isn't going anywhere
+ * — the curried form calls into it — this note is about the positional
+ * generics, not about calling `defineStage({ ... })` with inferred types.)
  */
 export function defineStage<
   TId extends string,
@@ -241,6 +338,11 @@ export function defineStage<
 
 /**
  * Define an async-batch stage with simplified API
+ *
+ * @deprecated Spelling out all five generics positionally is verbose and
+ * throws away `TId` literal inference if any of them are mistyped. Prefer
+ * the curried form when you need to fix `TContext` explicitly:
+ * `defineStage<TContext>()({ ... })`.
  */
 export function defineStage<
   TId extends string,
@@ -265,9 +367,36 @@ export function defineStage<
 >;
 
 /**
- * Implementation
+ * Implementation — dispatches on arity to handle both call shapes:
+ * - `defineStage(definition)` — the direct, non-curried overloads above.
+ * - `defineStage<TContext>()` — called with zero arguments; returns a
+ *   function that accepts `definition` (the curried overload above).
  */
-export function defineStage<
+export function defineStage(
+  definition?:
+    | SyncStageDefinition<any, any, any, any, any>
+    | AsyncBatchStageDefinition<any, any, any, any, any>,
+): any {
+  if (definition === undefined) {
+    // Curried form: `defineStage<TContext>()` was called with no args —
+    // return a function that builds the stage from the next call.
+    return (
+      curriedDefinition:
+        | SyncStageDefinition<any, any, any, any, any>
+        | AsyncBatchStageDefinition<any, any, any, any, any>,
+    ) => buildStage(curriedDefinition);
+  }
+
+  return buildStage(definition);
+}
+
+/**
+ * Shared implementation for both call shapes of `defineStage()`. Resolves
+ * `"none"` input, wraps `execute()` with the enhanced context
+ * (require/optional/onProgress) and auto-filled metrics/poll-config
+ * derivation, and attaches `checkCompletion` for async-batch stages.
+ */
+function buildStage<
   TId extends string,
   TInput extends z.ZodTypeAny | "none",
   TOutput extends z.ZodTypeAny,
@@ -320,13 +449,37 @@ export function defineStage<
       // Call the user's execute function
       const result = await definition.execute(enhancedContext);
 
-      // If suspended, pass through with auto-filled metrics
+      // If suspended, pass through with auto-filled metrics and derived poll config
       if ("suspended" in result && result.suspended === true) {
         const suspendedResult = result as SimpleSuspendedResult;
+
+        const pollInterval =
+          suspendedResult.pollConfig?.pollInterval ??
+          suspendedResult.state.pollInterval ??
+          DEFAULT_POLL_INTERVAL_MS;
+        const maxWaitTime =
+          suspendedResult.pollConfig?.maxWaitTime ??
+          suspendedResult.state.maxWaitTime ??
+          DEFAULT_MAX_WAIT_TIME_MS;
+        const submittedAt =
+          suspendedResult.state.submittedAt ?? new Date().toISOString();
+        const nextPollAt =
+          suspendedResult.pollConfig?.nextPollAt ??
+          new Date(new Date(submittedAt).getTime() + pollInterval);
+
         return {
           suspended: true as const,
-          state: suspendedResult.state,
-          pollConfig: suspendedResult.pollConfig,
+          state: {
+            ...suspendedResult.state,
+            submittedAt,
+            pollInterval,
+            maxWaitTime,
+          },
+          pollConfig: {
+            pollInterval,
+            maxWaitTime,
+            nextPollAt,
+          },
           metrics: {
             startTime: 0,
             endTime: 0,
@@ -390,6 +543,14 @@ function createEnhancedContext<
   return {
     ...context,
 
+    onProgress(update) {
+      context.onProgress({
+        stageId: context.stageId,
+        stageName: context.stageName,
+        ...update,
+      });
+    },
+
     require<K extends keyof TContext>(stageId: K): TContext[K] {
       const output = context.workflowContext[stageId as string];
       if (output === undefined) {
@@ -417,38 +578,20 @@ function createEnhancedContext<
 /**
  * Extract the output type from a stage created with defineStage
  */
-export type InferStageOutput<T> = T extends Stage<
-  infer _I,
-  infer O,
-  infer _C,
-  infer _Ctx
->
-  ? z.infer<O>
-  : never;
+export type InferStageOutput<T> =
+  T extends Stage<infer _I, infer O, infer _C, infer _Ctx> ? z.infer<O> : never;
 
 /**
  * Extract the input type from a stage created with defineStage
  */
-export type InferStageInput<T> = T extends Stage<
-  infer I,
-  infer _O,
-  infer _C,
-  infer _Ctx
->
-  ? z.infer<I>
-  : never;
+export type InferStageInput<T> =
+  T extends Stage<infer I, infer _O, infer _C, infer _Ctx> ? z.infer<I> : never;
 
 /**
  * Extract the config type from a stage created with defineStage
  */
-export type InferStageConfig<T> = T extends Stage<
-  infer _I,
-  infer _O,
-  infer C,
-  infer _Ctx
->
-  ? z.infer<C>
-  : never;
+export type InferStageConfig<T> =
+  T extends Stage<infer _I, infer _O, infer C, infer _Ctx> ? z.infer<C> : never;
 
 // ============================================================================
 // Async Batch Stage Factory

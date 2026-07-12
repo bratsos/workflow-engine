@@ -270,7 +270,13 @@ export interface BatchMetrics {
 // =============================================================================
 
 export interface GoogleBatchRequest extends BaseBatchRequest {
-  // Google-specific extensions can go here
+  /**
+   * Custom ID used to correlate this request with its result. Google's
+   * inline batch API doesn't have a dedicated custom-ID field like
+   * Anthropic/OpenAI, so we thread it through request/response `metadata`
+   * instead (see GoogleBatchProvider).
+   */
+  id?: string;
 }
 
 export interface AnthropicBatchRequest extends BaseBatchRequest {

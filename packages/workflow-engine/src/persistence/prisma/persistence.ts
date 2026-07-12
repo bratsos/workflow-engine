@@ -14,6 +14,7 @@ import type {
   CreateStageInput,
   OutboxRecord,
   SaveArtifactInput,
+  Status,
   UpdateRunInput,
   UpdateStageInput,
   UpsertStageInput,
@@ -22,14 +23,15 @@ import type {
   WorkflowPersistence,
   WorkflowRunRecord,
   WorkflowStageRecord,
-  WorkflowStageStatus,
-  WorkflowStatus,
 } from "../interface";
 import { StaleVersionError } from "../interface";
 import { createEnumHelper, type PrismaEnumHelper } from "./enum-compat";
+import type { EnginePrismaClient } from "./prisma-client-type";
 
-// Type for prisma client - using any to avoid dependency on specific prisma client
-type PrismaClient = any;
+// Structural client type -- see prisma-client-type.ts. Kept as a local
+// alias so the rest of this file (and its many `PrismaClient`-typed
+// locals/params) doesn't need to change name.
+type PrismaClient = EnginePrismaClient;
 
 export type DatabaseType = "postgresql" | "sqlite";
 
@@ -49,6 +51,12 @@ export interface PrismaWorkflowPersistenceOptions {
 const IDEMPOTENCY_IN_PROGRESS_MARKER = {
   __workflowEngineState: "in_progress",
 };
+
+/**
+ * Bounds retry loops for optimistic-lock claim/dequeue paths so heavy
+ * contention degrades to "try again later" instead of unbounded recursion.
+ */
+const MAX_CLAIM_ATTEMPTS = 10;
 
 function isInProgressResult(result: unknown): boolean {
   if (!result || typeof result !== "object") return false;
@@ -115,7 +123,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     if (data.expectedVersion === undefined) {
       await this.prisma.workflowRun.update({
         where: { id },
-        data: updateData,
+        data: { ...updateData, version: { increment: 1 } },
       });
       return;
     }
@@ -147,7 +155,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     return run ? this.mapWorkflowRun(run) : null;
   }
 
-  async getRunStatus(id: string): Promise<WorkflowStatus | null> {
+  async getRunStatus(id: string): Promise<Status | null> {
     const run = await this.prisma.workflowRun.findUnique({
       where: { id },
       select: { status: true },
@@ -155,7 +163,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     return run?.status ?? null;
   }
 
-  async getRunsByStatus(status: WorkflowStatus): Promise<WorkflowRunRecord[]> {
+  async getRunsByStatus(status: Status): Promise<WorkflowRunRecord[]> {
     const runs = await this.prisma.workflowRun.findMany({
       where: { status: this.enums.status(status) },
       orderBy: { createdAt: "asc" },
@@ -193,6 +201,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       data: {
         status: this.enums.status("RUNNING"),
         startedAt: new Date(),
+        version: { increment: 1 },
       },
     });
 
@@ -216,21 +225,32 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
    * 4. Returns the claimed run
    */
   private async claimNextPendingRunPostgres(): Promise<WorkflowRunRecord | null> {
+    // NOTE: deliberately calling `this.prisma.$queryRaw` directly below
+    // rather than destructuring it into a local first -- Prisma's runtime
+    // reads internal state off `this` inside its own method bodies, so an
+    // unbound reference (`const f = this.prisma.$queryRaw; f\`...\``)
+    // throws at call time ("Cannot read properties of undefined").
+    if (!this.prisma.$queryRaw) {
+      throw new Error(
+        "Prisma client does not support $queryRaw (required for the Postgres claimNextPendingRun path)",
+      );
+    }
     // Note: Table name is "workflow_runs" (snake_case per Prisma @@map convention)
     // Column names are camelCase (e.g., "createdAt", "startedAt")
     const results = await this.prisma.$queryRaw<any[]>`
       WITH claimed AS (
         SELECT id
         FROM "workflow_runs"
-        WHERE status = ${this.enums.status("PENDING")}
+        WHERE status = ${this.enums.status("PENDING")}::"Status"
         ORDER BY priority DESC, "createdAt" ASC
         LIMIT 1
         FOR UPDATE SKIP LOCKED
       )
       UPDATE "workflow_runs"
-      SET status = ${this.enums.status("RUNNING")},
+      SET status = ${this.enums.status("RUNNING")}::"Status",
           "startedAt" = NOW(),
-          "updatedAt" = NOW()
+          "updatedAt" = NOW(),
+          version = version + 1
       FROM claimed
       WHERE "workflow_runs".id = claimed.id
       RETURNING "workflow_runs".*
@@ -250,7 +270,13 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
    * 2. Atomically update it (only succeeds if still PENDING)
    * 3. If another worker claimed it, retry
    */
-  private async claimNextPendingRunSqlite(): Promise<WorkflowRunRecord | null> {
+  private async claimNextPendingRunSqlite(
+    attempt = 0,
+  ): Promise<WorkflowRunRecord | null> {
+    if (attempt >= MAX_CLAIM_ATTEMPTS) {
+      return null;
+    }
+
     // Step 1: Find the next PENDING run
     const run = await this.prisma.workflowRun.findFirst({
       where: { status: this.enums.status("PENDING") },
@@ -271,12 +297,14 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
         status: this.enums.status("RUNNING"),
         startedAt: new Date(),
         updatedAt: new Date(),
+        version: { increment: 1 },
       },
     });
 
     if (result.count === 0) {
-      // Another worker claimed it, retry
-      return this.claimNextPendingRunSqlite();
+      // Another worker claimed it, retry (bounded to avoid unbounded
+      // recursion under heavy contention)
+      return this.claimNextPendingRunSqlite(attempt + 1);
     }
 
     // Fetch the updated record
@@ -334,10 +362,8 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
         inputData: data.create.inputData as unknown,
       },
       update: {
-        status: data.update.status
-          ? this.enums.status(data.update.status)
-          : undefined,
-        startedAt: data.update.startedAt,
+        ...this.buildStageUpdateData(data.update),
+        version: { increment: 1 },
       },
     });
     return this.mapWorkflowStage(stage);
@@ -349,7 +375,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     if (data.expectedVersion === undefined) {
       await this.prisma.workflowStage.update({
         where: { id },
-        data: updateData,
+        data: { ...updateData, version: { increment: 1 } },
       });
       return;
     }
@@ -388,7 +414,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
         where: {
           workflowRunId_stageId: { workflowRunId, stageId },
         },
-        data: updateData,
+        data: { ...updateData, version: { increment: 1 } },
       });
       return;
     }
@@ -471,14 +497,17 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
 
   async getStagesByRun(
     runId: string,
-    options?: { status?: WorkflowStageStatus; orderBy?: "asc" | "desc" },
+    options?: { status?: Status; orderBy?: "asc" | "desc" },
   ): Promise<WorkflowStageRecord[]> {
     const stages = await this.prisma.workflowStage.findMany({
       where: {
         workflowRunId: runId,
         ...(options?.status && { status: this.enums.status(options.status) }),
       },
-      orderBy: { executionGroup: options?.orderBy ?? "asc" },
+      orderBy: [
+        { executionGroup: options?.orderBy ?? "asc" },
+        { stageNumber: options?.orderBy ?? "asc" },
+      ],
     });
     return stages.map((s: Record<string, unknown>) => this.mapWorkflowStage(s));
   }
@@ -505,7 +534,9 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
         status: this.enums.status("SUSPENDED"),
         nextPollAt: null, // Ready to resume (poll cleared by orchestrator)
       },
-      orderBy: { executionGroup: "asc" },
+      // stageNumber tiebreak matches getStagesByRun/InMemoryWorkflowPersistence
+      // so ties within an execution group resolve identically on both adapters.
+      orderBy: [{ executionGroup: "asc" }, { stageNumber: "asc" }],
     });
     return stage ? this.mapWorkflowStage(stage) : null;
   }
@@ -518,7 +549,10 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
         workflowRunId: runId,
         status: this.enums.status("FAILED"),
       },
-      orderBy: { executionGroup: "desc" },
+      // Ascending -- "first" means earliest in pipeline order (lowest
+      // executionGroup/stageNumber), matching InMemoryWorkflowPersistence's
+      // getStagesByRun(..., { status: "FAILED" })[0] (default ascending).
+      orderBy: [{ executionGroup: "asc" }, { stageNumber: "asc" }],
     });
     return stage ? this.mapWorkflowStage(stage) : null;
   }
@@ -531,7 +565,9 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
         workflowRunId: runId,
         status: this.enums.status("COMPLETED"),
       },
-      orderBy: { executionGroup: "desc" },
+      // stageNumber tiebreak matches getStagesByRun/InMemoryWorkflowPersistence
+      // so ties within an execution group resolve identically on both adapters.
+      orderBy: [{ executionGroup: "desc" }, { stageNumber: "desc" }],
     });
     return stage ? this.mapWorkflowStage(stage) : null;
   }
@@ -546,7 +582,9 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
         status: this.enums.status("COMPLETED"),
         executionGroup: { lt: executionGroup },
       },
-      orderBy: { executionGroup: "desc" },
+      // stageNumber tiebreak matches getStagesByRun/InMemoryWorkflowPersistence
+      // so ties within an execution group resolve identically on both adapters.
+      orderBy: [{ executionGroup: "desc" }, { stageNumber: "desc" }],
     });
     return stage ? this.mapWorkflowStage(stage) : null;
   }
@@ -825,47 +863,70 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       byRun.set(event.workflowRunId, list);
     }
 
-    const rows: Array<{
-      workflowRunId: string;
-      sequence: number;
-      eventType: string;
-      payload: unknown;
-      causationId: string;
-      occurredAt: Date;
-    }> = [];
-
     for (const [workflowRunId, runEvents] of byRun) {
-      if (
-        this.databaseType === "postgresql" &&
-        typeof this.prisma.$executeRaw === "function"
-      ) {
-        // Serialize per-run sequence assignment inside the transaction.
-        await this.prisma.$executeRaw`
-          SELECT pg_advisory_xact_lock(hashtext(${workflowRunId}))
-        `;
-      }
+      await this.appendOutboxEventsForRun(workflowRunId, runEvents);
+    }
+  }
 
-      // Get the current max sequence for this run
-      const maxResult = await this.prisma.outboxEvent.aggregate({
-        where: { workflowRunId },
-        _max: { sequence: true },
-      });
-      let seq = maxResult._max.sequence ?? 0;
-
-      for (const event of runEvents) {
-        seq++;
-        rows.push({
-          workflowRunId: event.workflowRunId,
-          sequence: seq,
-          eventType: event.eventType,
-          payload: event.payload as any,
-          causationId: event.causationId,
-          occurredAt: event.occurredAt,
-        });
-      }
+  /**
+   * Assigns sequential `sequence` numbers for a single run's outbox events
+   * and inserts them.
+   *
+   * `pg_advisory_xact_lock` only serializes concurrent callers when this
+   * call is itself running inside a real database transaction (i.e. this
+   * instance was produced by `withTransaction`) — outside a transaction,
+   * Postgres releases the advisory lock the instant the statement's
+   * implicit autocommit transaction ends, making it a no-op safeguard.
+   * The `(workflowRunId, sequence)` unique constraint is the actual
+   * correctness backstop in both cases: on a conflict we recompute the
+   * max sequence and retry, bounded to avoid unbounded recursion under
+   * pathological contention.
+   */
+  private async appendOutboxEventsForRun(
+    workflowRunId: string,
+    runEvents: CreateOutboxEventInput[],
+    attempt = 0,
+  ): Promise<void> {
+    if (
+      this.databaseType === "postgresql" &&
+      typeof this.prisma.$executeRaw === "function"
+    ) {
+      // Best-effort serialization; only effective inside a transaction.
+      await this.prisma.$executeRaw`
+        SELECT pg_advisory_xact_lock(hashtext(${workflowRunId}))
+      `;
     }
 
-    await this.prisma.outboxEvent.createMany({ data: rows });
+    const maxResult = await this.prisma.outboxEvent.aggregate({
+      where: { workflowRunId },
+      _max: { sequence: true },
+    });
+    let seq = maxResult._max.sequence ?? 0;
+
+    const rows = runEvents.map((event) => ({
+      workflowRunId: event.workflowRunId,
+      sequence: ++seq,
+      eventType: event.eventType,
+      payload: event.payload as any,
+      causationId: event.causationId,
+      occurredAt: event.occurredAt,
+    }));
+
+    try {
+      await this.prisma.outboxEvent.createMany({ data: rows });
+    } catch (error: any) {
+      if (error?.code === "P2002" && attempt < MAX_CLAIM_ATTEMPTS) {
+        // Another writer assigned overlapping sequences between our read
+        // and write (only reachable outside a transaction, or on DBs
+        // without the advisory lock). Recompute and retry.
+        return this.appendOutboxEventsForRun(
+          workflowRunId,
+          runEvents,
+          attempt + 1,
+        );
+      }
+      throw error;
+    }
   }
 
   async getUnpublishedOutboxEvents(limit?: number): Promise<OutboxRecord[]> {
@@ -929,6 +990,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
   async acquireIdempotencyKey(
     key: string,
     commandType: string,
+    options?: { now?: Date; staleInProgressAfterMs?: number },
   ): Promise<
     | { status: "acquired" }
     | { status: "replay"; result: unknown }
@@ -940,6 +1002,11 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
           key,
           commandType,
           result: IDEMPOTENCY_IN_PROGRESS_MARKER as any,
+          // Explicit rather than relying on the schema's `@default(now())`
+          // so a caller-supplied `options.now` (e.g. a FakeClock in tests,
+          // or a kernel using an injected Clock) is authoritative for the
+          // staleness math below, not the DB's wall-clock time.
+          createdAt: options?.now ?? new Date(),
         },
       });
       return { status: "acquired" };
@@ -951,14 +1018,61 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
 
     const existing = await this.prisma.idempotencyKey.findUnique({
       where: { key_commandType: { key, commandType } },
-      select: { result: true },
+      select: { id: true, result: true, createdAt: true },
     });
 
-    if (!existing || isInProgressResult(existing.result)) {
+    if (!existing) {
+      // Raced with a concurrent release between our failed create and
+      // this read -- treat as still in progress; the caller can retry.
       return { status: "in_progress" };
     }
 
-    return { status: "replay", result: existing.result };
+    if (!isInProgressResult(existing.result)) {
+      return { status: "replay", result: existing.result };
+    }
+
+    // The key is stuck `in_progress` (e.g. a previous dispatcher crashed
+    // between committing its transaction and calling
+    // `completeIdempotencyKey`). Reclaim it if it's older than the
+    // configured threshold. The update is gated on `id` + the exact
+    // `createdAt` + `result` we just read, so if another dispatcher wins
+    // the race (reclaims or completes it first) this update matches zero
+    // rows and we fall back to re-reading the row.
+    const staleAfterMs = options?.staleInProgressAfterMs;
+    if (staleAfterMs !== undefined) {
+      const now = options?.now ?? new Date();
+      const ageMs = now.getTime() - existing.createdAt.getTime();
+      if (ageMs >= staleAfterMs) {
+        const reclaimed = await this.prisma.idempotencyKey.updateMany({
+          where: {
+            id: existing.id,
+            createdAt: existing.createdAt,
+            result: { equals: IDEMPOTENCY_IN_PROGRESS_MARKER as any },
+          },
+          data: {
+            createdAt: now,
+            result: IDEMPOTENCY_IN_PROGRESS_MARKER as any,
+          },
+        });
+
+        if (reclaimed.count > 0) {
+          return { status: "acquired" };
+        }
+
+        const after = await this.prisma.idempotencyKey.findUnique({
+          where: { key_commandType: { key, commandType } },
+          select: { result: true },
+        });
+
+        if (!after || isInProgressResult(after.result)) {
+          return { status: "in_progress" };
+        }
+
+        return { status: "replay", result: after.result };
+      }
+    }
+
+    return { status: "in_progress" };
   }
 
   async completeIdempotencyKey(

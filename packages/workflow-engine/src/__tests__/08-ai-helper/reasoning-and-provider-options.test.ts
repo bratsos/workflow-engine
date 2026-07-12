@@ -13,6 +13,7 @@
  *     getReasoning(), and the buffered text is reconciled via getText().
  */
 
+import type { LanguageModelV3GenerateResult } from "@ai-sdk/provider";
 import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
 import { describe, expect, it, vi } from "vitest";
 import { createAIHelper, type ProviderResolver } from "../../ai/ai-helper.js";
@@ -47,9 +48,9 @@ const USAGE = {
 
 function generateModel(content: Array<{ type: string; text: string }>) {
   return new MockLanguageModelV3({
-    doGenerate: async () => ({
+    doGenerate: async (): Promise<LanguageModelV3GenerateResult> => ({
       content: content as any,
-      finishReason: "stop",
+      finishReason: { unified: "stop", raw: undefined },
       usage: USAGE,
       warnings: [],
     }),

@@ -19,16 +19,19 @@ describe("I want to schedule jobs by priority", () => {
       // Given: Jobs with different priorities
       const lowPriorityId = await jobQueue.enqueue({
         workflowRunId: "run-low",
+        workflowId: "workflow-1",
         stageId: "stage-1",
         priority: 1,
       });
       const mediumPriorityId = await jobQueue.enqueue({
         workflowRunId: "run-medium",
+        workflowId: "workflow-1",
         stageId: "stage-1",
         priority: 5,
       });
       const highPriorityId = await jobQueue.enqueue({
         workflowRunId: "run-high",
+        workflowId: "workflow-1",
         stageId: "stage-1",
         priority: 10,
       });
@@ -45,26 +48,28 @@ describe("I want to schedule jobs by priority", () => {
     });
 
     it("should use FIFO for jobs with same priority", async () => {
-      // Given: Jobs with same priority
+      // Given: Jobs with same priority, enqueued back-to-back. No delay
+      // needed between enqueues: dequeue() sorts priority DESC then
+      // createdAt ASC, falling back to an explicit insertion-sequence
+      // counter (see InMemoryJobQueue.dequeue) when priority AND
+      // createdAt tie -- same-millisecond enqueues still come out FIFO.
       const job1Id = await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "stage-1",
         priority: 5,
       });
-
-      // Small delay to ensure different timestamps
-      await new Promise((r) => setTimeout(r, 1));
 
       const job2Id = await jobQueue.enqueue({
         workflowRunId: "run-2",
+        workflowId: "workflow-1",
         stageId: "stage-1",
         priority: 5,
       });
 
-      await new Promise((r) => setTimeout(r, 1));
-
       const job3Id = await jobQueue.enqueue({
         workflowRunId: "run-3",
+        workflowId: "workflow-1",
         stageId: "stage-1",
         priority: 5,
       });
@@ -84,6 +89,7 @@ describe("I want to schedule jobs by priority", () => {
       // Given: Low priority job enqueued first
       const lowId = await jobQueue.enqueue({
         workflowRunId: "run-low",
+        workflowId: "workflow-1",
         stageId: "stage-1",
         priority: 1,
       });
@@ -91,6 +97,7 @@ describe("I want to schedule jobs by priority", () => {
       // Then high priority job enqueued later
       const highId = await jobQueue.enqueue({
         workflowRunId: "run-high",
+        workflowId: "workflow-1",
         stageId: "stage-1",
         priority: 10,
       });
@@ -111,6 +118,7 @@ describe("I want to schedule jobs by priority", () => {
       for (let priority = 0; priority <= 10; priority++) {
         const id = await jobQueue.enqueue({
           workflowRunId: `run-${priority}`,
+          workflowId: "workflow-1",
           stageId: "stage-1",
           priority,
         });
@@ -132,11 +140,13 @@ describe("I want to schedule jobs by priority", () => {
       // Given: Jobs with extreme priorities
       const minId = await jobQueue.enqueue({
         workflowRunId: "run-min",
+        workflowId: "workflow-1",
         stageId: "stage-1",
         priority: 0,
       });
       const maxId = await jobQueue.enqueue({
         workflowRunId: "run-max",
+        workflowId: "workflow-1",
         stageId: "stage-1",
         priority: 100,
       });
@@ -157,6 +167,7 @@ describe("I want to schedule jobs by priority", () => {
       const future = new Date(Date.now() + 60000);
       await jobQueue.enqueue({
         workflowRunId: "run-high-future",
+        workflowId: "workflow-1",
         stageId: "stage-1",
         priority: 10,
         scheduledFor: future,
@@ -165,6 +176,7 @@ describe("I want to schedule jobs by priority", () => {
       // And a low priority job available now
       const lowNowId = await jobQueue.enqueue({
         workflowRunId: "run-low-now",
+        workflowId: "workflow-1",
         stageId: "stage-1",
         priority: 1,
       });
@@ -182,12 +194,14 @@ describe("I want to schedule jobs by priority", () => {
 
       await jobQueue.enqueue({
         workflowRunId: "run-low-now",
+        workflowId: "workflow-1",
         stageId: "stage-1",
         priority: 1,
       });
 
       await jobQueue.enqueue({
         workflowRunId: "run-high-future",
+        workflowId: "workflow-1",
         stageId: "stage-1",
         priority: 10,
         scheduledFor: future,
@@ -195,6 +209,7 @@ describe("I want to schedule jobs by priority", () => {
 
       const medNowId = await jobQueue.enqueue({
         workflowRunId: "run-med-now",
+        workflowId: "workflow-1",
         stageId: "stage-1",
         priority: 5,
       });
@@ -212,6 +227,7 @@ describe("I want to schedule jobs by priority", () => {
       // Given: A job with specific priority
       await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "stage-1",
         priority: 7,
       });
@@ -228,9 +244,24 @@ describe("I want to schedule jobs by priority", () => {
     it("should apply priority to parallel enqueued jobs", async () => {
       // Given: Parallel jobs with different priorities
       const ids = await jobQueue.enqueueParallel([
-        { workflowRunId: "run-1", stageId: "stage-a", priority: 3 },
-        { workflowRunId: "run-1", stageId: "stage-b", priority: 8 },
-        { workflowRunId: "run-1", stageId: "stage-c", priority: 5 },
+        {
+          workflowRunId: "run-1",
+          workflowId: "workflow-1",
+          stageId: "stage-a",
+          priority: 3,
+        },
+        {
+          workflowRunId: "run-1",
+          workflowId: "workflow-1",
+          stageId: "stage-b",
+          priority: 8,
+        },
+        {
+          workflowRunId: "run-1",
+          workflowId: "workflow-1",
+          stageId: "stage-c",
+          priority: 5,
+        },
       ]);
 
       // When: I dequeue all
@@ -250,6 +281,7 @@ describe("I want to schedule jobs by priority", () => {
       // Given: A low priority job
       const lowId = await jobQueue.enqueue({
         workflowRunId: "run-low",
+        workflowId: "workflow-1",
         stageId: "stage-1",
         priority: 1,
       });
@@ -258,6 +290,7 @@ describe("I want to schedule jobs by priority", () => {
       for (let i = 0; i < 5; i++) {
         await jobQueue.enqueue({
           workflowRunId: `run-high-${i}`,
+          workflowId: "workflow-1",
           stageId: "stage-1",
           priority: 10,
         });

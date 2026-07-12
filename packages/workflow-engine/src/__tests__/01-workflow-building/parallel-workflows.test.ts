@@ -4,9 +4,13 @@
  * Tests for creating workflows with parallel stage execution.
  */
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, expectTypeOf, it } from "vitest";
 import { z } from "zod";
-import { WorkflowBuilder } from "../../core/workflow.js";
+import { defineStage } from "../../core/stage-factory.js";
+import {
+  type InferWorkflowContext,
+  WorkflowBuilder,
+} from "../../core/workflow.js";
 import {
   createFixedOutputStage,
   createPassthroughStage,
@@ -291,6 +295,65 @@ describe("I want to create workflows with parallel stages", () => {
       expect(workflow.hasStage("stage-a")).toBe(true);
       expect(workflow.hasStage("stage-b")).toBe(true);
       expect(workflow.hasStage("nonexistent")).toBe(false);
+    });
+  });
+
+  describe("parallel() context type fidelity", () => {
+    const stageA = defineStage({
+      id: "type-a",
+      name: "Type A",
+      schemas: {
+        input: "none",
+        output: z.object({ a: z.string() }),
+        config: z.object({}),
+      },
+      async execute() {
+        return { output: { a: "x" } };
+      },
+    });
+
+    const stageB = defineStage({
+      id: "type-b",
+      name: "Type B",
+      schemas: {
+        input: "none",
+        output: z.object({ b: z.number() }),
+        config: z.object({}),
+      },
+      async execute() {
+        return { output: { b: 1 } };
+      },
+    });
+
+    const workflow = new WorkflowBuilder(
+      "type-fidelity",
+      "Type Fidelity",
+      "Test",
+      z.object({}),
+      z.object({}),
+    )
+      .parallel([stageA, stageB])
+      .build();
+
+    type Context = InferWorkflowContext<typeof workflow>;
+
+    it("maps each stage id to its own output type, not the union of all parallel outputs", () => {
+      // Type-level assertions: each key's type must be exactly that
+      // stage's own output — a naive union-based mapping would make
+      // both keys resolve to `{ a: string } | { b: number }`.
+      expectTypeOf<Context["type-a"]>().toEqualTypeOf<{ a: string }>();
+      expectTypeOf<Context["type-b"]>().toEqualTypeOf<{ b: number }>();
+      expectTypeOf<Context["type-a"]>().not.toEqualTypeOf<
+        { a: string } | { b: number }
+      >();
+      expectTypeOf<Context["type-b"]>().not.toEqualTypeOf<
+        { a: string } | { b: number }
+      >();
+    });
+
+    it("preserves runtime values matching the per-stage output types", async () => {
+      const plan = workflow.getExecutionPlan();
+      expect(plan[0]?.map((n) => n.stage.id)).toEqual(["type-a", "type-b"]);
     });
   });
 });

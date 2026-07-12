@@ -8,7 +8,9 @@
  *
  * Ports:
  *  - Clock          – injectable time source
- *  - Persistence    – metadata storage (runs, stages, logs, artifacts)
+ *  - Persistence    – metadata storage (runs, stages, logs, annotations,
+ *                     outbox, idempotency keys). Artifact payloads are
+ *                     handled by BlobStore, not this port.
  *  - BlobStore      – large payload storage
  *  - JobTransport   – job queue abstraction
  *  - EventSink      – event publishing
@@ -18,22 +20,11 @@
 import type { StageResult, SuspendedResult } from "../core/types";
 
 import type {
-  AnnotationFilters,
   CreateAnnotationInput,
-  CreateLogInput,
-  CreateOutboxEventInput,
-  CreateRunInput,
-  CreateStageInput,
   DequeueResult,
   EnqueueJobInput,
-  OutboxRecord,
-  Status,
-  UpdateRunInput,
-  UpdateStageInput,
-  UpsertStageInput,
-  WorkflowAnnotationRecord,
-  WorkflowRunRecord,
-  WorkflowStageRecord,
+  JobRecord,
+  PersistenceCore,
 } from "../persistence/interface";
 
 import type { KernelEvent } from "./events";
@@ -51,6 +42,7 @@ export type {
   DequeueResult,
   EnqueueJobInput,
   IdempotencyRecord,
+  JobRecord,
   OutboxRecord,
   Status,
   UpdateRunInput,
@@ -78,129 +70,28 @@ export interface Clock {
 // ============================================================================
 
 /**
- * Metadata storage port.
+ * Metadata storage port: run, stage, log, annotation, outbox, and
+ * idempotency-key operations. Artifact payloads are handled by the
+ * BlobStore port instead (see `kernel/helpers/create-storage-shim.ts`).
  *
- * Run, stage, and log CRUD operations. Artifact payloads are handled
- * by the BlobStore port.
+ * Derives from `PersistenceCore` (`persistence/interface.ts`) -- the ~26
+ * methods the kernel's handlers/helpers actually call -- instead of
+ * hand-duplicating signatures here. Keeping this as a distinct name (not
+ * just an alias) lets kernel code read `Persistence` while the rest of
+ * the package reasons about `PersistenceCore` directly; the two are
+ * structurally identical. `WorkflowPersistence` (the full 41-method
+ * contract implemented by `PrismaWorkflowPersistence` /
+ * `InMemoryWorkflowPersistence`) is a structural superset of
+ * `PersistenceCore`, so both satisfy this port with no adapter needed --
+ * narrowing the port's declared surface to what the kernel actually calls
+ * only loosens what `createKernel` demands, it doesn't break anything
+ * that already provided the full contract.
+ *
+ * Annotation append call sites (for context): `run.create`, external
+ * `kernel.annotations.attach`, and the stage-completion transactions in
+ * `job-execute` and `stage-poll-suspended`.
  */
-export interface Persistence {
-  /** Execute operations within a transaction boundary. */
-  withTransaction<T>(fn: (tx: Persistence) => Promise<T>): Promise<T>;
-
-  // -- Run operations --------------------------------------------------------
-
-  createRun(data: CreateRunInput): Promise<WorkflowRunRecord>;
-  updateRun(id: string, data: UpdateRunInput): Promise<void>;
-  getRun(id: string): Promise<WorkflowRunRecord | null>;
-  getRunStatus(id: string): Promise<Status | null>;
-  getRunsByStatus(status: Status): Promise<WorkflowRunRecord[]>;
-  getStuckRuns(stuckSince: Date): Promise<WorkflowRunRecord[]>;
-
-  /**
-   * Atomically claim a pending workflow run for processing.
-   * Uses atomic update with WHERE status = 'PENDING' to prevent race conditions.
-   */
-  claimPendingRun(id: string): Promise<boolean>;
-
-  /**
-   * Atomically find and claim the next pending workflow run.
-   * Uses FOR UPDATE SKIP LOCKED pattern (in Postgres) to prevent race conditions
-   * when multiple workers try to claim workflows simultaneously.
-   *
-   * Priority ordering: higher priority first, then oldest (FIFO within same priority).
-   */
-  claimNextPendingRun(): Promise<WorkflowRunRecord | null>;
-
-  // -- Stage operations ------------------------------------------------------
-
-  createStage(data: CreateStageInput): Promise<WorkflowStageRecord>;
-  upsertStage(data: UpsertStageInput): Promise<WorkflowStageRecord>;
-  updateStage(id: string, data: UpdateStageInput): Promise<void>;
-  updateStageByRunAndStageId(
-    workflowRunId: string,
-    stageId: string,
-    data: UpdateStageInput,
-  ): Promise<void>;
-  getStage(runId: string, stageId: string): Promise<WorkflowStageRecord | null>;
-  getStageById(id: string): Promise<WorkflowStageRecord | null>;
-  getStagesByRun(
-    runId: string,
-    options?: { status?: Status; orderBy?: "asc" | "desc" },
-  ): Promise<WorkflowStageRecord[]>;
-  getSuspendedStages(beforeDate: Date): Promise<WorkflowStageRecord[]>;
-  getFirstSuspendedStageReadyToResume(
-    runId: string,
-  ): Promise<WorkflowStageRecord | null>;
-  getFirstFailedStage(runId: string): Promise<WorkflowStageRecord | null>;
-  getLastCompletedStage(runId: string): Promise<WorkflowStageRecord | null>;
-  getLastCompletedStageBefore(
-    runId: string,
-    executionGroup: number,
-  ): Promise<WorkflowStageRecord | null>;
-  deleteStage(id: string): Promise<void>;
-
-  // -- Log operations --------------------------------------------------------
-
-  createLog(data: CreateLogInput): Promise<void>;
-
-  // -- Annotation operations -------------------------------------------------
-
-  /**
-   * Append annotations. Called both from outside transactions (run.create,
-   * external attach) and inside the stage-completion transactions in
-   * job-execute and stage-poll-suspended. Duplicates with the same
-   * `(workflowRunId, key, idempotencyKey)` are silently skipped.
-   */
-  appendAnnotations(inputs: CreateAnnotationInput[]): Promise<void>;
-
-  /** List annotations for a run, ordered by `createdAt` ascending. */
-  listAnnotations(
-    workflowRunId: string,
-    filters?: AnnotationFilters,
-  ): Promise<WorkflowAnnotationRecord[]>;
-
-  // -- Outbox operations ----------------------------------------------------
-
-  /** Write events to the outbox. Sequences are auto-assigned per workflowRunId. */
-  appendOutboxEvents(events: CreateOutboxEventInput[]): Promise<void>;
-
-  /** Read unpublished events ordered by (workflowRunId, sequence). */
-  getUnpublishedOutboxEvents(limit?: number): Promise<OutboxRecord[]>;
-
-  /** Mark events as published. */
-  markOutboxEventsPublished(ids: string[]): Promise<void>;
-
-  /** Increment retry count for a failed outbox event. Returns new count. */
-  incrementOutboxRetryCount(id: string): Promise<number>;
-
-  /** Move an outbox event to DLQ (sets dlqAt). */
-  moveOutboxEventToDLQ(id: string): Promise<void>;
-
-  /** Reset DLQ events so they can be reprocessed by outbox.flush. Returns count reset. */
-  replayDLQEvents(maxEvents: number): Promise<number>;
-
-  // -- Idempotency operations -----------------------------------------------
-
-  /** Atomically acquire an idempotency key for command execution. */
-  acquireIdempotencyKey(
-    key: string,
-    commandType: string,
-  ): Promise<
-    | { status: "acquired" }
-    | { status: "replay"; result: unknown }
-    | { status: "in_progress" }
-  >;
-
-  /** Mark an idempotency key as completed and cache the command result. */
-  completeIdempotencyKey(
-    key: string,
-    commandType: string,
-    result: unknown,
-  ): Promise<void>;
-
-  /** Release an in-progress idempotency key after command failure. */
-  releaseIdempotencyKey(key: string, commandType: string): Promise<void>;
-}
+export interface Persistence extends PersistenceCore {}
 
 // ============================================================================
 // BlobStore
@@ -227,7 +118,12 @@ export interface BlobStore {
  * this port without adapters.
  */
 export interface JobTransport {
-  /** Add a new job to the queue. */
+  /**
+   * Add a new job to the queue.
+   *
+   * @deprecated Unused by the kernel -- enqueueParallel is used even for
+   * single-job enqueues. Removal at 1.0.
+   */
   enqueue(options: EnqueueJobInput): Promise<string>;
 
   /** Enqueue multiple stages in parallel (same execution group). */
@@ -245,16 +141,20 @@ export interface JobTransport {
   /** Mark job as failed. */
   fail(jobId: string, error: string, shouldRetry?: boolean): Promise<void>;
 
-  /** Get suspended jobs that are ready to be checked. */
-  getSuspendedJobsReadyToPoll(): Promise<
-    Array<{ jobId: string; stageId: string; workflowRunId: string }>
-  >;
-
   /** Release stale locks (for crashed workers). */
   releaseStaleJobs(staleThresholdMs?: number): Promise<number>;
 
   /** Cancel all pending/suspended jobs for a workflow run. Returns count cancelled. */
   cancelByRun(workflowRunId: string): Promise<number>;
+
+  /**
+   * Get all job rows for a workflow run (any status). Used to detect
+   * pending/in-flight retries for a stage and to find orphaned job rows.
+   */
+  getJobsByWorkflowRun(workflowRunId: string): Promise<JobRecord[]>;
+
+  /** Refresh a running job's lease without changing status. */
+  touchJob(jobId: string): Promise<void>;
 }
 
 // ============================================================================
@@ -323,6 +223,18 @@ export interface ActivityRunInput {
 export interface ActivityRunResult {
   result?: StageResult<unknown> | SuspendedResult;
   error?: string;
+  /** Constructor name of the thrown error (e.g. "ZodError", "TypeError"), when known. */
+  errorName?: string;
+  /** Stack trace of the thrown error, when available — for diagnostics only. */
+  errorStack?: string;
+  /**
+   * Whether the failure is worth retrying. `false` marks a deterministic
+   * failure (e.g. Zod input/config validation) that will fail identically
+   * on every attempt — hosts should fail the job terminally instead of
+   * burning retry attempts. `undefined`/`true` preserves default retry
+   * behavior.
+   */
+  retryable?: boolean;
   progress: KernelEvent[];
   annotations: CreateAnnotationInput[];
   /**

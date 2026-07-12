@@ -1,4 +1,5 @@
 import type { EnhancedStageContext, Stage } from "@bratsos/workflow-engine";
+import { toErrorMessage } from "@bratsos/workflow-engine/kernel";
 import type { z } from "zod";
 import type {
   ActivityReport,
@@ -109,7 +110,7 @@ export async function runActivity(
       leaseToken: task.leaseToken,
       outcome: {
         kind: "failed",
-        error: error instanceof Error ? error.message : String(error),
+        error: toErrorMessage(error),
       },
       logs,
       annotations,

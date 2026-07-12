@@ -20,6 +20,7 @@ describe("I want to recover from worker crashes", () => {
       jobQueue.setDefaultMaxAttempts(3);
       const jobId = await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "stage-1",
       });
 
@@ -59,6 +60,7 @@ describe("I want to recover from worker crashes", () => {
       jobQueue.setDefaultMaxAttempts(3);
       const jobId = await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "stage-1",
       });
 
@@ -77,6 +79,7 @@ describe("I want to recover from worker crashes", () => {
       jobQueue.setDefaultMaxAttempts(3);
       const jobId = await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "stage-1",
         priority: 8,
         payload: { config: { model: "test" } },
@@ -99,6 +102,7 @@ describe("I want to recover from worker crashes", () => {
       jobQueue.setDefaultMaxAttempts(3);
       const jobId = await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "stage-1",
       });
 
@@ -124,6 +128,7 @@ describe("I want to recover from worker crashes", () => {
       // Given: A job locked by a worker that "crashes"
       const jobId = await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "stage-1",
       });
 
@@ -147,6 +152,7 @@ describe("I want to recover from worker crashes", () => {
       const worker1 = new InMemoryJobQueue("worker-1");
       const jobId = await worker1.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "stage-1",
       });
 
@@ -171,6 +177,7 @@ describe("I want to recover from worker crashes", () => {
       // Given: A job
       const jobId = await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "stage-1",
       });
 
@@ -193,6 +200,7 @@ describe("I want to recover from worker crashes", () => {
       jobQueue.setDefaultMaxAttempts(5);
       const jobId = await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "stage-1",
       });
 
@@ -209,61 +217,11 @@ describe("I want to recover from worker crashes", () => {
   });
 
   describe("suspended job resumption", () => {
-    it("should resume suspended jobs when ready", async () => {
-      // Given: A suspended job
-      const jobId = await jobQueue.enqueue({
-        workflowRunId: "run-1",
-        stageId: "stage-1",
-      });
-
-      await jobQueue.dequeue();
-
-      // Suspend until future time
-      const resumeAt = new Date(Date.now() + 60000);
-      await jobQueue.suspend(jobId, resumeAt);
-
-      // When: I check for suspended jobs ready to poll
-      const readyNow = await jobQueue.getSuspendedJobsReadyToPoll();
-
-      // Then: Job is not ready yet
-      expect(readyNow).toHaveLength(0);
-
-      // When: Resume time passes (simulate by setting nextPollAt to past)
-      jobQueue.setJobNextPollAt(jobId, new Date(Date.now() - 1000));
-
-      const readyLater = await jobQueue.getSuspendedJobsReadyToPoll();
-
-      // Then: Job is ready
-      expect(readyLater).toHaveLength(1);
-      expect(readyLater[0]?.jobId).toBe(jobId);
-    });
-
-    it("should return jobId, stageId, and workflowRunId for ready suspended jobs", async () => {
-      // Given: A suspended job ready to resume
-      const jobId = await jobQueue.enqueue({
-        workflowRunId: "run-123",
-        stageId: "batch-stage",
-      });
-
-      await jobQueue.dequeue();
-      await jobQueue.suspend(jobId, new Date(Date.now() - 1000)); // Already ready
-
-      // When: I get suspended jobs ready to poll
-      const ready = await jobQueue.getSuspendedJobsReadyToPoll();
-
-      // Then: All needed info is returned
-      expect(ready).toHaveLength(1);
-      expect(ready[0]).toEqual({
-        jobId,
-        stageId: "batch-stage",
-        workflowRunId: "run-123",
-      });
-    });
-
     it("should support manual resume for testing", async () => {
       // Given: A suspended job
       const jobId = await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "stage-1",
       });
 
@@ -286,6 +244,7 @@ describe("I want to recover from worker crashes", () => {
       jobQueue.setDefaultMaxAttempts(3);
       const jobId = await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "stage-1",
       });
 
@@ -308,6 +267,7 @@ describe("I want to recover from worker crashes", () => {
       jobQueue.setDefaultMaxAttempts(1);
       const jobId = await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "stage-1",
       });
 
@@ -327,6 +287,7 @@ describe("I want to recover from worker crashes", () => {
       jobQueue.setDefaultMaxAttempts(2);
       const jobId = await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "stage-1",
       });
 
@@ -348,6 +309,7 @@ describe("I want to recover from worker crashes", () => {
       jobQueue.setDefaultMaxAttempts(1);
       const jobId = await jobQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "stage-1",
       });
 
@@ -368,6 +330,7 @@ describe("I want to recover from worker crashes", () => {
 
       const jobId = await customQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "stage-1",
       });
 
@@ -384,6 +347,7 @@ describe("I want to recover from worker crashes", () => {
 
       const jobId = await autoQueue.enqueue({
         workflowRunId: "run-1",
+        workflowId: "workflow-1",
         stageId: "stage-1",
       });
 

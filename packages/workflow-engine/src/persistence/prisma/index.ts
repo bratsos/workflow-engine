@@ -18,3 +18,4 @@ export {
   PrismaWorkflowPersistence,
   type PrismaWorkflowPersistenceOptions,
 } from "./persistence";
+export type { EnginePrismaClient, PrismaDelegate } from "./prisma-client-type";

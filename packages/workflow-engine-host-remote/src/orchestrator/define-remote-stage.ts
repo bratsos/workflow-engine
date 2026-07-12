@@ -1,4 +1,5 @@
 import type { Stage } from "@bratsos/workflow-engine";
+import { toErrorMessage } from "@bratsos/workflow-engine/kernel";
 import type { z } from "zod";
 import type { ActivityReport } from "../protocol.js";
 import { ActivityReportSchema } from "../protocol.js";
@@ -311,7 +312,7 @@ export function defineRemoteStage(
           // distinguishable from one normally waiting.
           ctx.log("WARN", "remote recovery failed, will retry", {
             taskId,
-            error: err instanceof Error ? err.message : String(err),
+            error: toErrorMessage(err),
           });
           // Revision 3: transient errors (e.g. BlobStore blip) must keep the
           // stage SUSPENDED for a later retry — never throw, never fail.

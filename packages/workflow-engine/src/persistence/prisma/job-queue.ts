@@ -8,14 +8,26 @@
  */
 
 import { createLogger } from "../../utils/logger";
-import type { DequeueResult, EnqueueJobInput, JobQueue } from "../interface";
+import type {
+  DequeueResult,
+  EnqueueJobInput,
+  JobQueue,
+  JobRecord,
+} from "../interface";
 import { createEnumHelper, type PrismaEnumHelper } from "./enum-compat";
 import type { DatabaseType } from "./persistence";
+import type { EnginePrismaClient } from "./prisma-client-type";
 
 const logger = createLogger("JobQueue");
 
-// Type for prisma client - using any for flexibility
-type PrismaClient = any;
+/**
+ * Bounds retry loops for optimistic-lock dequeue paths so heavy contention
+ * degrades to "try again later" instead of unbounded recursion.
+ */
+const MAX_DEQUEUE_ATTEMPTS = 10;
+
+// Structural client type -- see prisma-client-type.ts.
+type PrismaClient = EnginePrismaClient;
 
 export interface PrismaJobQueueOptions {
   /**
@@ -72,6 +84,17 @@ export class PrismaJobQueue implements JobQueue {
   async enqueueParallel(jobs: EnqueueJobInput[]): Promise<string[]> {
     if (jobs.length === 0) return [];
 
+    // NOTE: deliberately calling `this.prisma.$transaction` directly
+    // below rather than destructuring it into a local first -- Prisma's
+    // runtime reads internal state off `this` inside its own method
+    // bodies, so an unbound reference throws at call time ("Cannot read
+    // properties of undefined").
+    if (!this.prisma.$transaction) {
+      throw new Error(
+        "Prisma client does not support $transaction (required for enqueueParallel)",
+      );
+    }
+
     const results = await this.prisma.$transaction(
       jobs.map((job) =>
         this.prisma.jobQueue.create({
@@ -105,6 +128,16 @@ export class PrismaJobQueue implements JobQueue {
    */
   private async dequeuePostgres(): Promise<DequeueResult | null> {
     try {
+      // NOTE: deliberately calling `this.prisma.$queryRaw` directly below
+      // rather than destructuring it into a local first -- Prisma's
+      // runtime reads internal state off `this` inside its own method
+      // bodies, so an unbound reference throws at call time ("Cannot read
+      // properties of undefined").
+      if (!this.prisma.$queryRaw) {
+        throw new Error(
+          "Prisma client does not support $queryRaw (required for the Postgres dequeue path)",
+        );
+      }
       const result = await this.prisma.$queryRaw<
         Array<{
           id: string;
@@ -157,7 +190,11 @@ export class PrismaJobQueue implements JobQueue {
       };
     } catch (error) {
       logger.error("Error dequeuing job:", error);
-      return null;
+      // Rethrow rather than swallowing: a dead database must surface as
+      // an error, not look like an indefinitely empty queue. Hosts
+      // already treat dequeue failure as a non-fatal, back-off-and-retry
+      // path (see NodeHost's job loop).
+      throw error;
     }
   }
 
@@ -168,8 +205,12 @@ export class PrismaJobQueue implements JobQueue {
    * 2. Atomically update it (only succeeds if still PENDING)
    * 3. If another worker claimed it, retry
    */
-  private async dequeueSqlite(): Promise<DequeueResult | null> {
+  private async dequeueSqlite(attempt = 0): Promise<DequeueResult | null> {
     try {
+      if (attempt >= MAX_DEQUEUE_ATTEMPTS) {
+        return null;
+      }
+
       const now = new Date();
 
       // Step 1: Find the next PENDING job
@@ -201,8 +242,9 @@ export class PrismaJobQueue implements JobQueue {
       });
 
       if (result.count === 0) {
-        // Another worker claimed it, retry
-        return this.dequeueSqlite();
+        // Another worker claimed it, retry (bounded to avoid unbounded
+        // recursion under heavy contention)
+        return this.dequeueSqlite(attempt + 1);
       }
 
       // Fetch the updated job to get the new attempt count
@@ -232,7 +274,7 @@ export class PrismaJobQueue implements JobQueue {
       };
     } catch (error) {
       logger.error("Error dequeuing job:", error);
-      return null;
+      throw error;
     }
   }
 
@@ -309,33 +351,6 @@ export class PrismaJobQueue implements JobQueue {
   }
 
   /**
-   * Get suspended jobs that are ready to be checked
-   */
-  async getSuspendedJobsReadyToPoll(): Promise<
-    Array<{ jobId: string; stageId: string; workflowRunId: string }>
-  > {
-    const jobs = await this.prisma.jobQueue.findMany({
-      where: {
-        status: this.enums.status("SUSPENDED"),
-        nextPollAt: { lte: new Date() },
-      },
-      select: {
-        id: true,
-        workflowRunId: true,
-        stageId: true,
-      },
-    });
-
-    return jobs.map(
-      (j: { id: string; workflowRunId: string; stageId: string }) => ({
-        jobId: j.id,
-        workflowRunId: j.workflowRunId,
-        stageId: j.stageId,
-      }),
-    );
-  }
-
-  /**
    * Cancel all pending/suspended jobs for a workflow run.
    */
   async cancelByRun(workflowRunId: string): Promise<number> {
@@ -352,6 +367,49 @@ export class PrismaJobQueue implements JobQueue {
       },
     });
     return result.count;
+  }
+
+  /**
+   * Get all job rows for a workflow run (any status).
+   */
+  async getJobsByWorkflowRun(workflowRunId: string): Promise<JobRecord[]> {
+    const jobs = await this.prisma.jobQueue.findMany({
+      where: { workflowRunId },
+    });
+
+    return jobs.map((job: any) => {
+      const payload = (job.payload ?? {}) as Record<string, unknown>;
+      const { _workflowId, ...rest } = payload;
+      return {
+        id: job.id,
+        createdAt: job.createdAt,
+        updatedAt: job.updatedAt,
+        workflowRunId: job.workflowRunId,
+        workflowId: (_workflowId as string) ?? "",
+        stageId: job.stageId,
+        status: job.status,
+        priority: job.priority,
+        workerId: job.workerId,
+        lockedAt: job.lockedAt,
+        startedAt: job.startedAt,
+        completedAt: job.completedAt,
+        attempt: job.attempt,
+        maxAttempts: job.maxAttempts,
+        lastError: job.lastError,
+        nextPollAt: job.nextPollAt,
+        payload: rest,
+      } satisfies JobRecord;
+    });
+  }
+
+  /**
+   * Refresh a running job's lease without changing status.
+   */
+  async touchJob(jobId: string): Promise<void> {
+    await this.prisma.jobQueue.updateMany({
+      where: { id: jobId, status: this.enums.status("RUNNING") },
+      data: { lockedAt: new Date() },
+    });
   }
 
   /**

@@ -2,13 +2,20 @@
  * Async-Batch Stage Definition Tests
  *
  * Tests for defining stages that suspend for long-running batch operations.
+ *
+ * The "derives pollConfig from state" describe block runs its stages
+ * through a full kernel dispatch (run.create + job.execute) rather than a
+ * direct stage.execute() call, because it asserts on the kernel's
+ * suspended-job scheduling (jobResult.nextPollAt), not just the stage's
+ * returned SuspendedResult shape.
  */
 
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import type { CheckCompletionContext, StageContext } from "../../core/stage.js";
 import { defineAsyncBatchStage } from "../../core/stage-factory.js";
-import { TestSchemas } from "../utils/index.js";
+import { WorkflowBuilder } from "../../core/workflow.js";
+import { createTestKernel, TestSchemas } from "../utils/index.js";
 
 describe("I want to define async-batch stages", () => {
   describe("stage creation", () => {
@@ -507,8 +514,8 @@ describe("I want to define async-batch stages", () => {
 
       // Then: Context includes workflowRunId and config
       expect(capturedContext).toBeDefined();
-      expect(capturedContext?.workflowRunId).toBe("run-abc-123");
-      expect(capturedContext?.config).toEqual({ apiKey: "secret-key" });
+      expect(capturedContext!.workflowRunId).toBe("run-abc-123");
+      expect(capturedContext!.config).toEqual({ apiKey: "secret-key" });
     });
   });
 
@@ -553,14 +560,135 @@ describe("I want to define async-batch stages", () => {
   });
 });
 
+describe("defineAsyncBatchStage derives pollConfig from state", () => {
+  it("suspends successfully when only state.batchId/pollInterval/maxWaitTime are provided (no pollConfig)", async () => {
+    const stage = defineAsyncBatchStage({
+      id: "derived-poll-stage",
+      name: "Derived Poll Stage",
+      mode: "async-batch",
+      schemas: {
+        input: z.object({}),
+        output: z.object({ result: z.string() }),
+        config: z.object({}),
+      },
+      async execute() {
+        return {
+          suspended: true,
+          state: {
+            batchId: "batch-1",
+            pollInterval: 5000,
+            maxWaitTime: 60000,
+          },
+        };
+      },
+      async checkCompletion() {
+        return { ready: true, output: { result: "done" } };
+      },
+    });
+
+    const workflow = new WorkflowBuilder(
+      "derived-poll",
+      "Test",
+      "Test",
+      z.object({}),
+      z.object({ result: z.string() }),
+    )
+      .pipe(stage)
+      .build();
+
+    const { kernel } = createTestKernel([workflow]);
+
+    const { workflowRunId } = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "key-1",
+      workflowId: "derived-poll",
+      input: {},
+    });
+    await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
+
+    const jobResult = await kernel.dispatch({
+      type: "job.execute",
+      workflowRunId,
+      workflowId: "derived-poll",
+      stageId: "derived-poll-stage",
+      config: {},
+    });
+
+    expect(jobResult.outcome).toBe("suspended");
+    expect(jobResult.nextPollAt).toBeInstanceOf(Date);
+    // nextPollAt should be ~pollInterval (5000ms) after submission.
+    expect(jobResult.nextPollAt!.getTime()).toBeGreaterThan(Date.now() - 1000);
+  });
+
+  it("still honors an explicit pollConfig when provided", async () => {
+    const explicitNextPollAt = new Date(Date.now() + 123456);
+
+    const stage = defineAsyncBatchStage({
+      id: "explicit-poll-stage",
+      name: "Explicit Poll Stage",
+      mode: "async-batch",
+      schemas: {
+        input: z.object({}),
+        output: z.object({ result: z.string() }),
+        config: z.object({}),
+      },
+      async execute() {
+        return {
+          suspended: true,
+          state: { batchId: "batch-2" },
+          pollConfig: {
+            pollInterval: 999,
+            maxWaitTime: 999999,
+            nextPollAt: explicitNextPollAt,
+          },
+        };
+      },
+      async checkCompletion() {
+        return { ready: true, output: { result: "done" } };
+      },
+    });
+
+    const workflow = new WorkflowBuilder(
+      "explicit-poll",
+      "Test",
+      "Test",
+      z.object({}),
+      z.object({ result: z.string() }),
+    )
+      .pipe(stage)
+      .build();
+
+    const { kernel } = createTestKernel([workflow]);
+
+    const { workflowRunId } = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "key-1",
+      workflowId: "explicit-poll",
+      input: {},
+    });
+    await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
+
+    const jobResult = await kernel.dispatch({
+      type: "job.execute",
+      workflowRunId,
+      workflowId: "explicit-poll",
+      stageId: "explicit-poll-stage",
+      config: {},
+    });
+
+    expect(jobResult.outcome).toBe("suspended");
+    expect(jobResult.nextPollAt?.getTime()).toBe(explicitNextPollAt.getTime());
+  });
+});
+
 // ============================================================================
 // Helper Functions
 // ============================================================================
 
-function createMockContext(options: {
+function createMockContext<TInput>(options: {
   stageId: string;
   stageName: string;
-  input: unknown;
+  input: TInput;
   resumeState?: {
     batchId: string;
     submittedAt: string;
@@ -568,7 +696,7 @@ function createMockContext(options: {
     maxWaitTime: number;
     metadata?: Record<string, unknown>;
   };
-}): StageContext<unknown, Record<string, never>, Record<string, unknown>> {
+}): StageContext<TInput, Record<string, never>, Record<string, unknown>> {
   return {
     workflowRunId: "run-1",
     stageRecordId: "stage-record-1",
@@ -580,10 +708,12 @@ function createMockContext(options: {
     workflowContext: {},
     resumeState: options.resumeState,
     onProgress: () => {},
+    onLog: () => {},
     log: () => {},
+    annotate: () => {},
     storage: {
       save: async () => {},
-      load: async () => null,
+      load: async <T>(): Promise<T> => null as T,
       exists: async () => false,
       delete: async () => {},
       getStageKey: () => "key",
@@ -591,19 +721,21 @@ function createMockContext(options: {
   };
 }
 
-function createCheckContext(options: {
+function createCheckContext<TConfig extends Record<string, unknown>>(options: {
   stageId: string;
-  config: Record<string, unknown>;
+  config: TConfig;
   workflowRunId?: string;
-}): CheckCompletionContext<Record<string, unknown>> {
+}): CheckCompletionContext<TConfig> {
   return {
     workflowRunId: options.workflowRunId ?? "run-1",
     stageId: options.stageId,
     config: options.config,
+    onLog: () => {},
     log: () => {},
+    annotate: () => {},
     storage: {
       save: async () => {},
-      load: async () => null,
+      load: async <T>(): Promise<T> => null as T,
       exists: async () => false,
       delete: async () => {},
       getStageKey: () => "key",

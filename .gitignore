@@ -38,7 +38,7 @@ client-generated
 dev.db
 
 # Documentation
-docs/
+/docs/
 
 # Conductor
 .context/
@@ -47,3 +47,6 @@ docs/
 # with agents do NOT belong in the repo — only READMEs and skills do)
 .superpowers/
 .claude/
+
+# Package-local scratch docs (RFCs/plans) are never committed
+/packages/workflow-engine/docs/

@@ -10,16 +10,8 @@
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { defineStage } from "../../core/stage-factory.js";
-import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
-import { createKernel } from "../../kernel/kernel.js";
-import {
-  CollectingEventSink,
-  FakeClock,
-  InMemoryBlobStore,
-  NoopScheduler,
-} from "../../kernel/testing/index.js";
-import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
-import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
+import { WorkflowBuilder } from "../../core/workflow.js";
+import { createTestKernel } from "../utils/index.js";
 
 // ---------------------------------------------------------------------------
 // Shared schema for all test stages
@@ -31,42 +23,16 @@ const valueSchema = z.object({ value: z.string() });
 // Helpers
 // ---------------------------------------------------------------------------
 
-function createTestKernel(workflows: Workflow<any, any>[]) {
-  const persistence = new InMemoryWorkflowPersistence();
-  const blobStore = new InMemoryBlobStore();
-  const jobTransport = new InMemoryJobQueue("test-worker");
-  const eventSink = new CollectingEventSink();
-  const scheduler = new NoopScheduler();
-  const clock = new FakeClock();
-
-  const registry = new Map<string, Workflow<any, any>>();
-  for (const w of workflows) {
-    registry.set(w.id, w);
-  }
-
-  const kernel = createKernel({
-    persistence,
-    blobStore,
-    jobTransport,
-    eventSink,
-    scheduler,
-    clock,
-    registry: { getWorkflow: (id) => registry.get(id) },
-  });
-
-  return { kernel, persistence, eventSink, clock };
-}
-
 /**
  * Creates a run, sets it to RUNNING, and executes the specified stage.
  * Returns the workflowRunId so callers can inspect persistence afterwards.
  */
 async function setupAndExecute(
   kernel: ReturnType<typeof createTestKernel>["kernel"],
-  persistence: InMemoryWorkflowPersistence,
+  persistence: ReturnType<typeof createTestKernel>["persistence"],
   workflowId: string,
   stageId: string,
-  input: unknown,
+  input: Record<string, unknown>,
 ): Promise<string> {
   const createResult = await kernel.dispatch({
     type: "run.create",

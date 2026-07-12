@@ -22,7 +22,6 @@ import { z } from "zod";
  * };
  */
 export const NoInputSchema = z.object({});
-export type NoInput = z.infer<typeof NoInputSchema>;
 
 /**
  * Access previous stage output with guaranteed type safety
@@ -49,6 +48,12 @@ export type NoInput = z.infer<typeof NoInputSchema>;
  *   "guidelines",
  *   "guidelines"
  * );
+ *
+ * @deprecated Prefer `ctx.require()` inside a stage's `execute()` — it's
+ * typed from the workflow's inferred `TContext` with no generic needed.
+ * This standalone helper remains for code that accesses `workflowContext`
+ * outside of a stage's `execute()` (e.g. shared utility functions). Removal
+ * at 1.0.
  */
 export function requireStageOutput<T>(
   workflowContext: Record<string, unknown>,
@@ -57,7 +62,10 @@ export function requireStageOutput<T>(
 ): T {
   const stageOutput = workflowContext[stageId];
 
-  if (!stageOutput) {
+  // NOTE: `=== undefined` (not a falsy check) so legitimate falsy outputs
+  // (0, "", false) pass through instead of being treated as missing —
+  // matches `ctx.require()`'s semantics.
+  if (stageOutput === undefined) {
     throw new Error(
       `Missing output from required stage: ${stageId}. ` +
         `Check that this stage has been executed before the current stage. ` +
@@ -78,48 +86,6 @@ export function requireStageOutput<T>(
         `Missing required field '${field}' in ${stageId} output. ` +
           `Available fields: ${availableFields.join(", ")}`,
       );
-    }
-    return (stageOutput as any)[field];
-  }
-
-  return stageOutput as T;
-}
-
-/**
- * Access previous stage output optionally
- *
- * Returns undefined if the stage output doesn't exist.
- * Use this for optional dependencies on previous stages.
- *
- * @param workflowContext - The workflow context containing all previous stage outputs
- * @param stageId - ID of the stage to access
- * @param field - Optional: specific field to extract from stage output
- * @returns The stage output (or field within it), or undefined if not present
- *
- * @example
- * const optionalData = getStageOutput<OptionalData>(
- *   context.workflowContext,
- *   "optional-stage"
- * );
- *
- * if (optionalData) {
- *   // Use the data
- * }
- */
-export function getStageOutput<T>(
-  workflowContext: Record<string, unknown>,
-  stageId: string,
-  field?: string,
-): T | undefined {
-  const stageOutput = workflowContext[stageId];
-
-  if (!stageOutput) {
-    return undefined;
-  }
-
-  if (field) {
-    if (typeof stageOutput !== "object" || stageOutput === null) {
-      return undefined;
     }
     return (stageOutput as any)[field];
   }

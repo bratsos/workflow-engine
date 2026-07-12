@@ -6,6 +6,7 @@
 
 import { beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
+import type { ModelKey } from "../../ai/model-helper.js";
 import { createMockAIHelper, MockAIHelper } from "../utils/mock-ai-helper.js";
 
 describe("I want to use tools with AIHelper", () => {
@@ -21,7 +22,7 @@ describe("I want to use tools with AIHelper", () => {
       const tools = {
         getWeather: {
           description: "Get weather for a location",
-          parameters: z.object({
+          inputSchema: z.object({
             location: z.string().describe("City name"),
           }),
         },
@@ -46,15 +47,15 @@ describe("I want to use tools with AIHelper", () => {
       const tools = {
         getWeather: {
           description: "Get weather",
-          parameters: z.object({ location: z.string() }),
+          inputSchema: z.object({ location: z.string() }),
         },
         getTime: {
           description: "Get current time",
-          parameters: z.object({ timezone: z.string() }),
+          inputSchema: z.object({ timezone: z.string() }),
         },
         translate: {
           description: "Translate text",
-          parameters: z.object({
+          inputSchema: z.object({
             text: z.string(),
             targetLanguage: z.string(),
           }),
@@ -75,7 +76,7 @@ describe("I want to use tools with AIHelper", () => {
       const tools = {
         searchProducts: {
           description: "Search products",
-          parameters: z.object({
+          inputSchema: z.object({
             query: z.string(),
             filters: z
               .object({
@@ -109,7 +110,7 @@ describe("I want to use tools with AIHelper", () => {
       const tools = {
         search: {
           description: "Search the web",
-          parameters: z.object({ query: z.string() }),
+          inputSchema: z.object({ query: z.string() }),
         },
       };
 
@@ -129,7 +130,7 @@ describe("I want to use tools with AIHelper", () => {
       const tools = {
         calculate: {
           description: "Perform calculation",
-          parameters: z.object({
+          inputSchema: z.object({
             expression: z.string(),
           }),
         },
@@ -151,7 +152,7 @@ describe("I want to use tools with AIHelper", () => {
       const tools = {
         unused: {
           description: "Unused tool",
-          parameters: z.object({}),
+          inputSchema: z.object({}),
         },
       };
 
@@ -171,11 +172,11 @@ describe("I want to use tools with AIHelper", () => {
       const tools = {
         toolA: {
           description: "Tool A",
-          parameters: z.object({ input: z.string() }),
+          inputSchema: z.object({ input: z.string() }),
         },
         toolB: {
           description: "Tool B",
-          parameters: z.object({ data: z.number() }),
+          inputSchema: z.object({ data: z.number() }),
         },
       };
 
@@ -197,7 +198,7 @@ describe("I want to use tools with AIHelper", () => {
       const tools = {
         step: {
           description: "Step tool",
-          parameters: z.object({ value: z.string() }),
+          inputSchema: z.object({ value: z.string() }),
         },
       };
 
@@ -222,7 +223,7 @@ describe("I want to use tools with AIHelper", () => {
       const tools = {
         test: {
           description: "Test",
-          parameters: z.object({}),
+          inputSchema: z.object({}),
         },
       };
 
@@ -244,7 +245,7 @@ describe("I want to use tools with AIHelper", () => {
       const tools = {
         iterate: {
           description: "Iterative tool",
-          parameters: z.object({ count: z.number() }),
+          inputSchema: z.object({ count: z.number() }),
         },
       };
 
@@ -266,7 +267,7 @@ describe("I want to use tools with AIHelper", () => {
       const tools = {
         stream: {
           description: "Stream tool",
-          parameters: z.object({ input: z.string() }),
+          inputSchema: z.object({ input: z.string() }),
         },
       };
 
@@ -292,7 +293,7 @@ describe("I want to use tools with AIHelper", () => {
       const tools = {
         test: {
           description: "Test",
-          parameters: z.object({}),
+          inputSchema: z.object({}),
         },
       };
 
@@ -318,7 +319,7 @@ describe("I want to use tools with AIHelper", () => {
       const tools = {
         test: {
           description: "Test",
-          parameters: z.object({}),
+          inputSchema: z.object({}),
         },
       };
 
@@ -346,7 +347,7 @@ describe("I want to use tools with AIHelper", () => {
       const tools = {
         fetch: {
           description: "Fetch data",
-          parameters: z.object({ url: z.string() }),
+          inputSchema: z.object({ url: z.string() }),
         },
       };
 
@@ -366,7 +367,7 @@ describe("I want to use tools with AIHelper", () => {
       const tools = {
         compute: {
           description: "Compute value",
-          parameters: z.object({ input: z.number() }),
+          inputSchema: z.object({ input: z.number() }),
         },
       };
 
@@ -387,7 +388,7 @@ describe("I want to use tools with AIHelper", () => {
       const tools = {
         process: {
           description: "Process data",
-          parameters: z.object({ raw: z.string() }),
+          inputSchema: z.object({ raw: z.string() }),
         },
       };
       const callback = () => {};
@@ -410,7 +411,7 @@ describe("I want to use tools with AIHelper", () => {
       const tools = {
         track: {
           description: "Track tool",
-          parameters: z.object({ id: z.string() }),
+          inputSchema: z.object({ id: z.string() }),
         },
       };
 
@@ -427,12 +428,14 @@ describe("I want to use tools with AIHelper", () => {
       const tools = {
         model: {
           description: "Model tool",
-          parameters: z.object({}),
+          inputSchema: z.object({}),
         },
       };
 
       // When: I make a call
-      await ai.generateText("gemini-2.5-pro", "Test model", { tools });
+      await ai.generateText("gemini-2.5-pro" as ModelKey, "Test model", {
+        tools,
+      });
 
       // Then: Model is recorded
       const lastCall = ai.getLastCall();
@@ -446,7 +449,7 @@ describe("I want to use tools with AIHelper", () => {
       const tools = {
         search: {
           description: "Search",
-          parameters: z.object({ query: z.string() }),
+          inputSchema: z.object({ query: z.string() }),
         },
       };
 
@@ -484,7 +487,7 @@ describe("I want to use tools with AIHelper", () => {
       const tools = {
         test: {
           description: "Test",
-          parameters: z.object({}),
+          inputSchema: z.object({}),
         },
       };
 
@@ -507,7 +510,7 @@ describe("I want to use tools with AIHelper", () => {
       const tools = {
         childTool: {
           description: "Child tool",
-          parameters: z.object({ value: z.string() }),
+          inputSchema: z.object({ value: z.string() }),
         },
       };
 
