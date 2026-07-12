@@ -37,6 +37,20 @@ export interface ModelConfig {
   supportsStructuredOutputs?: boolean; // true if model supports JSON schema outputs
   contextLength?: number; // Max context window from OpenRouter
   maxCompletionTokens?: number | null; // Max output tokens from OpenRouter
+  /**
+   * Cost in USD per 1M cached input tokens, when the provider bills cache
+   * reads separately from the base input rate. Optional - when unset, cached
+   * input tokens are billed at `inputCostPerMillion` like any other input
+   * token (today's behavior). Not populated by the sync-models CLI yet.
+   */
+  cachedInputCostPerMillion?: number;
+  /**
+   * Cost in USD per 1M reasoning tokens, when the provider bills reasoning
+   * output separately from the base output rate. Optional - when unset,
+   * reasoning tokens are billed at `outputCostPerMillion` like any other
+   * output token (today's behavior). Not populated by the sync-models CLI yet.
+   */
+  reasoningCostPerMillion?: number;
 }
 
 /**

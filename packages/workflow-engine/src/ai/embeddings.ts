@@ -112,6 +112,15 @@ export async function embed(
       ...options.providerOptions,
     };
 
+    const requestOptions = {
+      ...(options.maxRetries !== undefined && {
+        maxRetries: options.maxRetries,
+      }),
+      ...(options.abortSignal && { abortSignal: options.abortSignal }),
+      ...(options.headers && { headers: options.headers }),
+      ...(options.telemetry && { telemetry: options.telemetry }),
+    };
+
     let embeddings: number[][];
     let totalInputTokens: number;
 
@@ -120,6 +129,7 @@ export async function embed(
         model: embeddingModel,
         value: texts[0],
         providerOptions,
+        ...requestOptions,
       });
       embeddings = [result.embedding];
       totalInputTokens = result.usage?.tokens || 0;
@@ -128,6 +138,7 @@ export async function embed(
         model: embeddingModel,
         values: texts,
         providerOptions,
+        ...requestOptions,
       });
       embeddings = result.embeddings;
       totalInputTokens = result.usage?.tokens || 0;

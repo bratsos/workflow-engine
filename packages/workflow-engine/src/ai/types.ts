@@ -7,11 +7,24 @@
  * wires them together and re-exports the public surface from here.
  */
 
-import type { generateText, streamText, ToolSet } from "ai";
+import type { embed, generateText, streamText, ToolSet } from "ai";
 import type { z } from "zod";
 import type { AICallLogger } from "../persistence";
 import type { AIHelperStats } from "../persistence/interface";
 import type { ModelConfig, ModelKey } from "./model-helper";
+
+/** The AI SDK's `generateText` result shape, used to type result-richness fields. */
+export type AISDKGenerateTextResult = Awaited<ReturnType<typeof generateText>>;
+
+/** Optional per-call token counts beyond the basic input/output split (v0.12+). */
+export interface AIUsageDetail {
+  /** Total tokens reported by the provider (may include overhead beyond input+output). */
+  totalTokens?: number;
+  /** Input tokens served from a provider-side cache, when reported. */
+  cachedInputTokens?: number;
+  /** Output tokens spent on reasoning/thinking, when reported (already included in outputTokens). */
+  reasoningTokens?: number;
+}
 
 /**
  * Custom provider resolver. Given a ModelConfig, return an AI SDK
@@ -23,7 +36,7 @@ export type ProviderResolver = (
 
 export type AICallType = "text" | "object" | "embed" | "stream" | "batch";
 
-export interface AITextResult {
+export interface AITextResult extends AIUsageDetail {
   text: string;
   inputTokens: number;
   outputTokens: number;
@@ -37,13 +50,33 @@ export interface AITextResult {
    * of `text` (the answer). Undefined when the model produced no reasoning.
    */
   reasoning?: string;
+  /** The unified reason the generation finished (e.g. "stop", "tool-calls"). */
+  finishReason?: AISDKGenerateTextResult["finishReason"];
+  /** Warnings from the model provider (e.g. unsupported settings). */
+  warnings?: AISDKGenerateTextResult["warnings"];
+  /** Tool calls made across all steps. */
+  toolCalls?: AISDKGenerateTextResult["toolCalls"];
+  /** Tool results from all steps. */
+  toolResults?: AISDKGenerateTextResult["toolResults"];
+  /** Per-step detail (tool calls/results, usage, response metadata, ...). */
+  steps?: AISDKGenerateTextResult["steps"];
 }
 
-export interface AIObjectResult<T> {
+export interface AIObjectResult<T> extends AIUsageDetail {
   object: T;
   inputTokens: number;
   outputTokens: number;
   cost: number;
+  /** The unified reason the generation finished (e.g. "stop", "tool-calls"). */
+  finishReason?: AISDKGenerateTextResult["finishReason"];
+  /** Warnings from the model provider (e.g. unsupported settings). */
+  warnings?: AISDKGenerateTextResult["warnings"];
+  /** Tool calls made across all steps (when `tools` is used alongside structured output). */
+  toolCalls?: AISDKGenerateTextResult["toolCalls"];
+  /** Tool results from all steps. */
+  toolResults?: AISDKGenerateTextResult["toolResults"];
+  /** Per-step detail (tool calls/results, usage, response metadata, ...). */
+  steps?: AISDKGenerateTextResult["steps"];
 }
 
 export interface AIEmbedResult {
@@ -59,11 +92,13 @@ export type AISDKStreamResult = ReturnType<typeof streamText>;
 
 export interface AIStreamResult {
   stream: AsyncIterable<string>;
-  getUsage(): Promise<{
-    inputTokens: number;
-    outputTokens: number;
-    cost: number;
-  }>;
+  getUsage(): Promise<
+    {
+      inputTokens: number;
+      outputTokens: number;
+      cost: number;
+    } & AIUsageDetail
+  >;
   /**
    * The full answer text, after the stream completes. Consumes the stream if
    * not already consumed. When the model streamed nothing on the text channel
@@ -79,6 +114,16 @@ export interface AIStreamResult {
    * to `undefined` when the model produced no reasoning.
    */
   getReasoning(): Promise<string | undefined>;
+  /** The unified reason the generation finished (e.g. "stop", "tool-calls"). Resolves once the stream completes. */
+  getFinishReason(): Promise<Awaited<AISDKStreamResult["finishReason"]>>;
+  /** Warnings from the model provider (e.g. unsupported settings). Resolves once the stream completes. */
+  getWarnings(): Promise<Awaited<AISDKStreamResult["warnings"]>>;
+  /** Tool calls made across all steps. Resolves once the stream completes. */
+  getToolCalls(): Promise<Awaited<AISDKStreamResult["toolCalls"]>>;
+  /** Tool results from all steps. Resolves once the stream completes. */
+  getToolResults(): Promise<Awaited<AISDKStreamResult["toolResults"]>>;
+  /** Per-step detail (tool calls/results, usage, response metadata, ...). Resolves once the stream completes. */
+  getSteps(): Promise<Awaited<AISDKStreamResult["steps"]>>;
   /** The raw AI SDK result - use this for methods like toUIMessageStreamResponse */
   rawResult: AISDKStreamResult;
 }
@@ -107,7 +152,48 @@ export type BatchLogFn = (
   meta?: Record<string, unknown>,
 ) => void;
 
-export interface TextOptions<TTools extends ToolSet = ToolSet> {
+/**
+ * Sampling/request knobs shared by `TextOptions`, `ObjectOptions`, and
+ * `StreamOptions`. Each is a passthrough typed directly off the AI SDK's own
+ * `generateText` parameter type, so it tracks the SDK instead of drifting.
+ */
+interface CommonCallOptions {
+  /** Nucleus sampling (0-1). Recommended to set either `temperature` or `topP`, not both. */
+  topP?: Parameters<typeof generateText>[0]["topP"];
+  /** Only sample from the top K options for each token. Advanced use only. */
+  topK?: Parameters<typeof generateText>[0]["topK"];
+  /** Penalizes tokens that already appear in the prompt/response. */
+  frequencyPenalty?: Parameters<typeof generateText>[0]["frequencyPenalty"];
+  /** Penalizes tokens based on whether they already appear, regardless of frequency. */
+  presencePenalty?: Parameters<typeof generateText>[0]["presencePenalty"];
+  /** Integer seed for deterministic sampling, when supported by the model. */
+  seed?: Parameters<typeof generateText>[0]["seed"];
+  /** Sequences that stop generation when produced. */
+  stopSequences?: Parameters<typeof generateText>[0]["stopSequences"];
+  /** Additional HTTP headers to send with the request (HTTP-based providers only). */
+  headers?: Parameters<typeof generateText>[0]["headers"];
+  /**
+   * Portable reasoning-effort knob (`"none" | "low" | "medium" | "high" | ...`),
+   * mapped by each provider to its own reasoning controls. Prefer this over
+   * provider-specific `providerOptions` (e.g. `anthropic.thinking`,
+   * `openrouter.reasoning`) when a portable value suffices; `providerOptions`
+   * remains available for provider-specific knobs this doesn't cover.
+   */
+  reasoning?: Parameters<typeof generateText>[0]["reasoning"];
+  /**
+   * OpenTelemetry tracing configuration for this call. Requires the consumer
+   * to register `@ai-sdk/otel` (or another OTel SDK) themselves - this
+   * library does not depend on it.
+   */
+  telemetry?: Parameters<typeof generateText>[0]["telemetry"];
+  /** Restrict which of the provided `tools` the model may call this step. */
+  activeTools?: Parameters<typeof generateText>[0]["activeTools"];
+  /** Per-step hook to adjust model/tools/settings before each step runs. */
+  prepareStep?: Parameters<typeof generateText>[0]["prepareStep"];
+}
+
+export interface TextOptions<TTools extends ToolSet = ToolSet>
+  extends CommonCallOptions {
   temperature?: number;
   maxTokens?: number;
   /** Maximum number of retries for the AI SDK call (pass-through) */
@@ -128,12 +214,14 @@ export interface TextOptions<TTools extends ToolSet = ToolSet> {
    * Provider-specific options passed directly to the AI SDK call. Use this to
    * control reasoning per call, e.g.
    * `{ openrouter: { reasoning: { enabled: false } } }` or
-   * `{ anthropic: { thinking: { type: "disabled" } } }`.
+   * `{ anthropic: { thinking: { type: "disabled" } } }`. See also
+   * {@link CommonCallOptions.reasoning} for the portable equivalent.
    */
   providerOptions?: Record<string, Record<string, unknown>>;
 }
 
-export interface ObjectOptions<TTools extends ToolSet = ToolSet> {
+export interface ObjectOptions<TTools extends ToolSet = ToolSet>
+  extends CommonCallOptions {
   temperature?: number;
   maxTokens?: number;
   /** Maximum number of retries for the AI SDK call (pass-through) */
@@ -148,7 +236,8 @@ export interface ObjectOptions<TTools extends ToolSet = ToolSet> {
   onStepEnd?: Parameters<typeof generateText>[0]["onStepEnd"];
   /**
    * Provider-specific options passed directly to the AI SDK call (e.g.
-   * `{ anthropic: { thinking: { type: "disabled" } } }`).
+   * `{ anthropic: { thinking: { type: "disabled" } } }`). See also
+   * {@link CommonCallOptions.reasoning} for the portable equivalent.
    */
   providerOptions?: Record<string, Record<string, unknown>>;
 }
@@ -159,9 +248,21 @@ export interface EmbedOptions {
   dimensions?: number;
   /** Provider-specific options passed directly to the AI SDK's embed() call */
   providerOptions?: Record<string, Record<string, unknown>>;
+  /** Maximum number of retries for the AI SDK call (pass-through) */
+  maxRetries?: Parameters<typeof embed>[0]["maxRetries"];
+  /** Abort signal to cancel the AI SDK call (pass-through) */
+  abortSignal?: Parameters<typeof embed>[0]["abortSignal"];
+  /** Additional HTTP headers to send with the request (HTTP-based providers only). */
+  headers?: Parameters<typeof embed>[0]["headers"];
+  /**
+   * OpenTelemetry tracing configuration for this call. Requires the consumer
+   * to register `@ai-sdk/otel` (or another OTel SDK) themselves - this
+   * library does not depend on it.
+   */
+  telemetry?: Parameters<typeof embed>[0]["telemetry"];
 }
 
-export interface StreamOptions {
+export interface StreamOptions extends CommonCallOptions {
   temperature?: number;
   maxTokens?: number;
   /** Maximum number of retries for the AI SDK call (pass-through) */
@@ -176,10 +277,18 @@ export interface StreamOptions {
   /** Callback fired when each step completes (for collecting tool results) */
   onStepEnd?: Parameters<typeof streamText>[0]["onStepEnd"];
   /**
+   * Stream transform(s), e.g. `smoothStream()`. Applied in order before the
+   * stream reaches the consumer.
+   */
+  experimental_transform?: Parameters<
+    typeof streamText
+  >[0]["experimental_transform"];
+  /**
    * Provider-specific options passed directly to the AI SDK call. Use this to
    * control reasoning per call, e.g.
    * `{ openrouter: { reasoning: { enabled: false } } }` or
-   * `{ anthropic: { thinking: { type: "disabled" } } }`.
+   * `{ anthropic: { thinking: { type: "disabled" } } }`. See also
+   * {@link CommonCallOptions.reasoning} for the portable equivalent.
    */
   providerOptions?: Record<string, Record<string, unknown>>;
 }
@@ -199,8 +308,19 @@ export interface TextPart {
 
 export type ContentPart = TextPart | MediaPart;
 
-// Input types - can be string (simple) or array of parts (multimodal)
-export type TextInput = string | ContentPart[];
+/**
+ * Alternative to a plain `prompt`/multimodal `ContentPart[]` for
+ * generateText/generateObject: pass a full model-message array instead (e.g.
+ * multi-turn conversations, or messages with per-message roles). Mirrors
+ * `StreamTextInput`'s `messages` form.
+ */
+export interface MessagesInput {
+  messages: Parameters<typeof generateText>[0]["messages"];
+}
+
+// Input types - a string (simple), an array of parts (multimodal), or a
+// `{ messages }` object (full model-message array, an alternative to `prompt`).
+export type TextInput = string | ContentPart[] | MessagesInput;
 
 // Input types for streamText - mirrors AI SDK's flexible input
 export type StreamTextInput =
