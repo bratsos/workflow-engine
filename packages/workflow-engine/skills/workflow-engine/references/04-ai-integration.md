@@ -129,6 +129,26 @@ const ai = createAIHelper("workflow.run-123", aiCallLogger, logContext);
 const ai = runtime.createAIHelper(`workflow.${ctx.workflowRunId}.stage.${ctx.stageId}`);
 ```
 
+### Custom Provider Resolver (`LanguageModelV4`)
+
+Pass a `ProviderResolver` as `createAIHelper`'s 4th (optional) argument to override how a `ModelConfig` resolves to an AI SDK language model — useful for providers this library doesn't build in, or to inject a differently-configured client (custom base URL, API key rotation, etc.). The resolver returns an AI SDK v7 `LanguageModelV4` (from `@ai-sdk/provider`), or `null`/`undefined` to fall back to built-in resolution:
+
+```typescript
+import { createAIHelper, type ProviderResolver } from "@bratsos/workflow-engine";
+import { anthropic } from "@ai-sdk/anthropic";
+
+const myResolver: ProviderResolver = (modelConfig) => {
+  if (modelConfig.provider === "anthropic") {
+    return anthropic(modelConfig.id); // LanguageModelV4
+  }
+  return undefined; // fall back to built-in resolution
+};
+
+const ai = createAIHelper("workflow.abc123", aiCallLogger, undefined, myResolver);
+```
+
+> Upgrading from AI SDK v6 (0.11 and earlier)? `ProviderResolver` now returns `LanguageModelV4` instead of `LanguageModelV3` — see [migrate-0.11-to-0.12.md](../migrations/migrate-0.11-to-0.12.md#required-actions).
+
 ## AIHelper Interface
 
 ```typescript
