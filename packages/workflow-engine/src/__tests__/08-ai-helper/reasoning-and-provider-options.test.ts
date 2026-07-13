@@ -2,7 +2,7 @@
  * Reasoning models + providerOptions passthrough
  *
  * These tests drive the REAL AIHelperImpl (via createAIHelper) against a fake
- * LanguageModelV3 injected through the providerResolver hook, so they exercise
+ * LanguageModelV4 injected through the providerResolver hook, so they exercise
  * the actual AI SDK integration rather than the MockAIHelper.
  *
  * They cover two gaps:
@@ -13,8 +13,8 @@
  *     getReasoning(), and the buffered text is reconciled via getText().
  */
 
-import type { LanguageModelV3GenerateResult } from "@ai-sdk/provider";
-import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
+import type { LanguageModelV4GenerateResult } from "@ai-sdk/provider";
+import { MockLanguageModelV4, simulateReadableStream } from "ai/test";
 import { describe, expect, it, vi } from "vitest";
 import { createAIHelper, type ProviderResolver } from "../../ai/ai-helper.js";
 
@@ -47,8 +47,8 @@ const USAGE = {
 } as any;
 
 function generateModel(content: Array<{ type: string; text: string }>) {
-  return new MockLanguageModelV3({
-    doGenerate: async (): Promise<LanguageModelV3GenerateResult> => ({
+  return new MockLanguageModelV4({
+    doGenerate: async (): Promise<LanguageModelV4GenerateResult> => ({
       content: content as any,
       finishReason: { unified: "stop", raw: undefined },
       usage: USAGE,
@@ -58,7 +58,7 @@ function generateModel(content: Array<{ type: string; text: string }>) {
 }
 
 function reasoningOnlyStreamModel() {
-  return new MockLanguageModelV3({
+  return new MockLanguageModelV4({
     doStream: async () => ({
       stream: simulateReadableStream({
         chunks: [
@@ -79,7 +79,7 @@ function reasoningOnlyStreamModel() {
 // "No output generated. Check the stream for errors." — the exact symptom the
 // fix must not re-introduce while iterating .stream.
 function emptyStreamModel() {
-  return new MockLanguageModelV3({
+  return new MockLanguageModelV4({
     doStream: async () => ({
       stream: simulateReadableStream({
         chunks: [
@@ -92,7 +92,7 @@ function emptyStreamModel() {
 }
 
 function reasoningThenTextStreamModel(delayed = false) {
-  return new MockLanguageModelV3({
+  return new MockLanguageModelV4({
     doStream: async () => ({
       stream: simulateReadableStream({
         ...(delayed ? { initialDelayInMs: 5, chunkDelayInMs: 5 } : {}),

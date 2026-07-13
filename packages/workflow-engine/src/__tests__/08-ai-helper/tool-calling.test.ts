@@ -192,8 +192,8 @@ describe("I want to use tools with AIHelper", () => {
     });
   });
 
-  describe("onStepFinish callback", () => {
-    it("should accept onStepFinish callback", async () => {
+  describe("onStepEnd callback", () => {
+    it("should accept onStepEnd callback", async () => {
       // Given: Tools with callback
       const tools = {
         step: {
@@ -204,20 +204,20 @@ describe("I want to use tools with AIHelper", () => {
 
       const stepResults: unknown[] = [];
 
-      // When: I call with onStepFinish
+      // When: I call with onStepEnd
       await ai.generateText("gemini-2.5-flash", "Run steps", {
         tools,
-        onStepFinish: (result) => {
+        onStepEnd: (result) => {
           stepResults.push(result);
         },
       });
 
-      // Then: onStepFinish is captured in options
+      // Then: onStepEnd is captured in options
       const lastCall = ai.getLastCall();
-      expect(lastCall?.options).toHaveProperty("onStepFinish");
+      expect(lastCall?.options).toHaveProperty("onStepEnd");
     });
 
-    it("should pass onStepFinish as function", async () => {
+    it("should pass onStepEnd as function", async () => {
       // Given: Callback function
       const callback = () => {};
       const tools = {
@@ -230,12 +230,12 @@ describe("I want to use tools with AIHelper", () => {
       // When: I call with callback
       await ai.generateText("gemini-2.5-flash", "Test", {
         tools,
-        onStepFinish: callback,
+        onStepEnd: callback,
       });
 
       // Then: Function is captured
       const lastCall = ai.getLastCall();
-      expect(typeof lastCall?.options?.onStepFinish).toBe("function");
+      expect(typeof lastCall?.options?.onStepEnd).toBe("function");
     });
   });
 
@@ -313,7 +313,7 @@ describe("I want to use tools with AIHelper", () => {
       expect(lastCall?.options).toHaveProperty("stopWhen");
     });
 
-    it("should accept onStepFinish in streamText", async () => {
+    it("should accept onStepEnd in streamText", async () => {
       // Given: Callback
       const callback = () => {};
       const tools = {
@@ -327,7 +327,7 @@ describe("I want to use tools with AIHelper", () => {
       const result = ai.streamText(
         "gemini-2.5-flash",
         { prompt: "Test" },
-        { tools, onStepFinish: callback },
+        { tools, onStepEnd: callback },
       );
 
       for await (const _ of result.stream) {
@@ -336,7 +336,7 @@ describe("I want to use tools with AIHelper", () => {
 
       // Then: Callback is captured
       const lastCall = ai.getLastCall();
-      expect(lastCall?.options).toHaveProperty("onStepFinish");
+      expect(lastCall?.options).toHaveProperty("onStepEnd");
     });
   });
 
@@ -382,7 +382,7 @@ describe("I want to use tools with AIHelper", () => {
       expect(lastCall?.options).toHaveProperty("stopWhen");
     });
 
-    it("should accept onStepFinish in generateObject", async () => {
+    it("should accept onStepEnd in generateObject", async () => {
       // Given: Schema, tools, and callback
       const schema = z.object({ data: z.string() });
       const tools = {
@@ -396,12 +396,12 @@ describe("I want to use tools with AIHelper", () => {
       // When: I generate with callback
       await ai.generateObject("gemini-2.5-flash", "Process", schema, {
         tools,
-        onStepFinish: callback,
+        onStepEnd: callback,
       });
 
       // Then: Callback is captured
       const lastCall = ai.getLastCall();
-      expect(lastCall?.options).toHaveProperty("onStepFinish");
+      expect(lastCall?.options).toHaveProperty("onStepEnd");
     });
   });
 
@@ -443,8 +443,8 @@ describe("I want to use tools with AIHelper", () => {
     });
   });
 
-  describe("experimental_output option", () => {
-    it("should accept experimental_output for structured output with tools", async () => {
+  describe("output option", () => {
+    it("should accept output for structured output with tools", async () => {
       // Given: Tools and output schema
       const tools = {
         search: {
@@ -458,15 +458,15 @@ describe("I want to use tools with AIHelper", () => {
         sources: z.array(z.string()),
       });
 
-      // When: I call with experimental_output
+      // When: I call with output
       await ai.generateText("gemini-2.5-flash", "Search and summarize", {
         tools,
-        experimental_output: { schema: outputSchema } as any,
+        output: { schema: outputSchema } as any,
       });
 
-      // Then: experimental_output is captured
+      // Then: output is captured
       const lastCall = ai.getLastCall();
-      expect(lastCall?.options).toHaveProperty("experimental_output");
+      expect(lastCall?.options).toHaveProperty("output");
     });
   });
 

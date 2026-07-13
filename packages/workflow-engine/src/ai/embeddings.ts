@@ -7,7 +7,7 @@
  */
 
 import { google } from "@ai-sdk/google";
-import type { EmbeddingModelV3 } from "@ai-sdk/provider";
+import type { EmbeddingModelV4 } from "@ai-sdk/provider";
 import { openrouter } from "@openrouter/ai-sdk-provider";
 import { embed as aiEmbed, embedMany } from "ai";
 import { logFailure } from "./generate";
@@ -24,7 +24,7 @@ const DEFAULT_EMBEDDING_DIMENSIONS = 768;
 
 const embeddingProviderRegistry = new Map<
   string,
-  (modelId: string) => EmbeddingModelV3
+  (modelId: string) => EmbeddingModelV4
 >();
 
 /**
@@ -32,7 +32,7 @@ const embeddingProviderRegistry = new Map<
  *
  * Consumers can register any AI SDK community provider (Voyage, Cohere, Jina, etc.)
  * without modifying the workflow engine. The factory receives the model ID and must
- * return an EmbeddingModelV3 instance.
+ * return an EmbeddingModelV4 instance.
  *
  * @example
  * ```typescript
@@ -44,7 +44,7 @@ const embeddingProviderRegistry = new Map<
  */
 export function registerEmbeddingProvider(
   providerName: string,
-  factory: (modelId: string) => EmbeddingModelV3,
+  factory: (modelId: string) => EmbeddingModelV4,
 ): void {
   embeddingProviderRegistry.set(providerName, factory);
 }

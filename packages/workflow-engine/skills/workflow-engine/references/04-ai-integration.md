@@ -202,7 +202,7 @@ const result = await ai.generateText("gemini-2.5-flash", "What's the weather?", 
     }),
   },
   toolChoice: "auto",  // or "required", "none", { type: "tool", toolName: "getWeather" }
-  onStepFinish: async (step) => {
+  onStepEnd: async (step) => {
     console.log("Tool results:", step.toolResults);
   },
 });
@@ -347,7 +347,7 @@ const { embedding } = await ai.embed("voyage-4-large", "Hello world");
 ```
 
 **How it works:**
-- The factory receives the model's `id` from `ModelConfig` and must return an `EmbeddingModelV3` instance (from `@ai-sdk/provider`)
+- The factory receives the model's `id` from `ModelConfig` and must return an `EmbeddingModelV4` instance (from `@ai-sdk/provider`)
 - Custom providers are checked **before** built-in providers, so you can even override `"openrouter"` or `"google"` if needed
 - The workflow engine stays provider-agnostic — install your chosen provider package as your app's dependency, not the library's
 - Provider-specific options (like Google's `taskType`) are handled by each provider through the AI SDK's standard mechanism
@@ -383,7 +383,7 @@ const response = result.rawResult.toUIMessageStreamResponse();
 
 ```typescript
 const result = ai.streamText("gemini-2.5-flash", {
-  system: "You are a helpful assistant.",
+  instructions: "You are a helpful assistant.",
   messages: [
     { role: "user", content: "Hello!" },
     { role: "assistant", content: "Hi! How can I help?" },
@@ -662,7 +662,7 @@ interface AITextResult {
   inputTokens: number;
   outputTokens: number;
   cost: number;
-  output?: any;       // Present when experimental_output is used
+  output?: any;       // Present when `output` is used
   reasoning?: string; // Reasoning/thinking text, when the model emitted any
 }
 
