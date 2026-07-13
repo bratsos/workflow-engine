@@ -40,6 +40,27 @@ registerModels({
 
 ---
 
+## Cached Input & Reasoning Token Pricing (v0.12+)
+
+`ModelConfig` accepts two optional per-model rates for providers that bill cache reads or reasoning output separately from the base input/output rate:
+
+```typescript
+registerModels({
+  "my-caching-model": {
+    id: "provider/my-model",
+    provider: "openrouter",
+    inputCostPerMillion: 3,
+    outputCostPerMillion: 15,
+    cachedInputCostPerMillion: 0.3, // optional - price for cached-read input tokens
+    reasoningCostPerMillion: 60,    // optional - price for reasoning output tokens
+  },
+});
+```
+
+When an AI call reports `cachedInputTokens`/`reasoningTokens` (see [Usage Detail & Cost Refinement](./overview.md#usage-detail--cost-refinement-v012) in the AI Overview) **and** the model config sets the matching rate, that token slice is billed at the refined rate instead of the flat `inputCostPerMillion`/`outputCostPerMillion`. Leave both fields unset to keep byte-identical pre-0.12 cost behavior — the default for every built-in model today. The `sync-models` CLI does not populate these two fields yet; set them via `registerModels()` if you need refined pricing.
+
+---
+
 ## TypeScript Autocomplete via Module Augmentation
 
 By default, model key parameters in `AIHelper` methods (like `generateText`) accept any string. To enable autocomplete and compile-time verification, you can augment the `ModelRegistry` interface:

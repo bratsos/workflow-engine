@@ -11,7 +11,13 @@ import type { GenerateTextEndEvent, ToolSet } from "ai";
 import { streamText as aiStreamText } from "ai";
 import { logFailure } from "./generate";
 import { getModel, type ModelKey } from "./model-helper";
-import { calculateCostWithDiscount, getModelProvider, logger } from "./shared";
+import {
+  buildCommonCallOptions,
+  buildUsageDetailMetadata,
+  calculateCostWithDiscount,
+  getModelProvider,
+  logger,
+} from "./shared";
 import type {
   AIHelperContext,
   AIStreamResult,
@@ -80,6 +86,9 @@ export function streamText(
     inputTokens: number;
     outputTokens: number;
     cost: number;
+    totalTokens?: number;
+    cachedInputTokens?: number;
+    reasoningTokens?: number;
   } | null = null;
 
   // Persist the call exactly once, whether triggered by the AI SDK's
@@ -90,14 +99,38 @@ export function streamText(
     outputTokens: number,
     responseText: string,
     reasoning: string | undefined,
+    usageDetail: {
+      totalTokens?: number;
+      cachedInputTokens?: number;
+      reasoningTokens?: number;
+    } = {},
   ) => {
     if (usageResolved) return cachedUsage!;
 
-    const cost = calculateCostWithDiscount(modelKey, inputTokens, outputTokens);
+    const cost = calculateCostWithDiscount(
+      modelKey,
+      inputTokens,
+      outputTokens,
+      false,
+      usageDetail,
+    );
     const durationMs = Date.now() - startTime;
 
     usageResolved = true;
-    cachedUsage = { inputTokens, outputTokens, cost };
+    cachedUsage = {
+      inputTokens,
+      outputTokens,
+      cost,
+      ...(usageDetail.totalTokens !== undefined && {
+        totalTokens: usageDetail.totalTokens,
+      }),
+      ...(usageDetail.cachedInputTokens !== undefined && {
+        cachedInputTokens: usageDetail.cachedInputTokens,
+      }),
+      ...(usageDetail.reasoningTokens !== undefined && {
+        reasoningTokens: usageDetail.reasoningTokens,
+      }),
+    };
 
     logger.debug(`streamText response`, {
       model: modelKey,
@@ -128,6 +161,7 @@ export function streamText(
         durationMs,
         ...(reasoning ? { hasReasoning: true } : {}),
         ...(input.instructions ? { instructions: input.instructions } : {}),
+        ...buildUsageDetailMetadata(usageDetail),
       },
     });
 
@@ -144,6 +178,12 @@ export function streamText(
     }),
     ...(options.abortSignal && { abortSignal: options.abortSignal }),
     ...(input.instructions ? { instructions: input.instructions } : {}),
+    // Sampling params, headers, reasoning, telemetry, activeTools, prepareStep -
+    // all typed as passthroughs off Parameters<typeof generateText>[0] in StreamOptions.
+    ...buildCommonCallOptions(options),
+    ...(options.experimental_transform !== undefined && {
+      experimental_transform: options.experimental_transform,
+    }),
     // Provider-specific options (e.g. reasoning control) passed through.
     // Cast: the public type uses `unknown` values for DX; the consumer is
     // responsible for passing JSON-serializable provider options.
@@ -168,11 +208,20 @@ export function streamText(
         event.usage?.inputTokens ?? event.totalUsage?.inputTokens ?? 0;
       const outputTokens =
         event.usage?.outputTokens ?? event.totalUsage?.outputTokens ?? 0;
+      const totalTokens =
+        event.usage?.totalTokens ?? event.totalUsage?.totalTokens;
+      const cachedInputTokens =
+        event.usage?.inputTokenDetails?.cacheReadTokens ??
+        event.totalUsage?.inputTokenDetails?.cacheReadTokens;
+      const reasoningTokens =
+        event.usage?.outputTokenDetails?.reasoningTokens ??
+        event.totalUsage?.outputTokenDetails?.reasoningTokens;
       persistUsage(
         inputTokens,
         outputTokens,
         event.text || fullText,
         event.reasoningText,
+        { totalTokens, cachedInputTokens, reasoningTokens },
       );
     },
   };
@@ -226,8 +275,15 @@ export function streamText(
     const responseText = (await result.text) || fullText;
     const inputTokens = usage?.inputTokens ?? 0;
     const outputTokens = usage?.outputTokens ?? 0;
+    const totalTokens = usage?.totalTokens;
+    const cachedInputTokens = usage?.inputTokenDetails?.cacheReadTokens;
+    const reasoningTokens = usage?.outputTokenDetails?.reasoningTokens;
 
-    return persistUsage(inputTokens, outputTokens, responseText, reasoning);
+    return persistUsage(inputTokens, outputTokens, responseText, reasoning, {
+      totalTokens,
+      cachedInputTokens,
+      reasoningTokens,
+    });
   };
 
   // Full answer text, reconciled with the buffered result (handles models
@@ -243,11 +299,24 @@ export function streamText(
     return finalStep?.reasoningText ?? (await result.reasoningText);
   };
 
+  // Result-richness getters, mirroring getUsage/getText/getReasoning: they
+  // read the AI SDK's own buffered promises and never force eager resolution.
+  const getFinishReason = async () => await result.finishReason;
+  const getWarnings = async () => await result.warnings;
+  const getToolCalls = async () => await result.toolCalls;
+  const getToolResults = async () => await result.toolResults;
+  const getSteps = async () => await result.steps;
+
   return {
     stream: streamIterable,
     getUsage,
     getText,
     getReasoning,
+    getFinishReason,
+    getWarnings,
+    getToolCalls,
+    getToolResults,
+    getSteps,
     rawResult: result,
   };
 }

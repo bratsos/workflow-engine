@@ -312,6 +312,11 @@ export class MockAIHelper implements AIHelper {
       getUsage: async () => ({ inputTokens, outputTokens, cost }),
       getText: async () => response.text,
       getReasoning: async () => response.reasoning,
+      getFinishReason: async () => "stop",
+      getWarnings: async () => undefined,
+      getToolCalls: async () => [],
+      getToolResults: async () => [],
+      getSteps: async () => [],
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       rawResult: {} as any, // Mock raw result
     };
@@ -535,6 +540,9 @@ export class MockAIHelper implements AIHelper {
   private extractPromptString(prompt: TextInput): string {
     if (typeof prompt === "string") {
       return prompt;
+    }
+    if (!Array.isArray(prompt)) {
+      return JSON.stringify(prompt.messages);
     }
     return (
       prompt

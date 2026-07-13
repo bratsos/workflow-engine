@@ -89,6 +89,18 @@ const result = await ai.generateText("gemini-2.5-flash", [
 ]);
 ```
 
+#### Messages Input (v0.12+)
+As an alternative to a string/multimodal `prompt`, pass a full AI SDK model-message array via `{ messages: [...] }` — useful for multi-turn conversations or per-message roles:
+```typescript
+const result = await ai.generateText("gemini-2.5-flash", {
+  messages: [
+    { role: "user", content: "What's the capital of France?" },
+    { role: "assistant", content: "Paris." },
+    { role: "user", content: "And Germany?" },
+  ],
+});
+```
+
 ### 2. `generateObject`
 Generates structured JSON outputs validated against a Zod schema. Returns a type-safe object.
 
@@ -109,6 +121,8 @@ const result = await ai.generateObject(
 console.log(result.object.urgency);
 ```
 
+`generateObject` accepts every option `generateText` does — sampling params, `headers`, `telemetry`, `reasoning`, `activeTools`, `prepareStep`, `maxRetries`/`abortSignal` — and the same `{ messages: [...] }` alternative to `prompt` shown above. See [Sampling Params, Headers & Agentic Control](#sampling-params-headers--agentic-control-v012) below.
+
 ### 3. `streamText`
 Streams LLM text completions chunk-by-chunk. You can reconcile costs and tokens after the stream resolves.
 
@@ -125,6 +139,8 @@ const finalUsage = await result.getUsage();
 console.log(`Stream cost: $${finalUsage.cost}`);
 ```
 
+`getUsage()` also optionally carries `totalTokens`, `cachedInputTokens`, and `reasoningTokens` (v0.12+) — see [Usage Detail & Cost Refinement](#usage-detail--cost-refinement-v012) below.
+
 ### 4. `embed`
 Computes vector embeddings. In `v0.11`, passing an array of strings triggers the AI SDK's optimized `embedMany()` batch call, performing a single network round-trip.
 
@@ -138,11 +154,102 @@ const batchResult = await ai.embed("text-embedding-004", ["doc1", "doc2", "doc3"
 console.log(batchResult.embeddings); // number[][]
 ```
 
+#### Retries, Abort, Headers & Telemetry (v0.12+)
+`embed()` accepts the same `maxRetries`/`abortSignal` options `generateText`/`generateObject`/`streamText` already had, plus `headers` and `telemetry`:
+
+```typescript
+const controller = new AbortController();
+const result = await ai.embed("text-embedding-004", "Hello world", {
+  maxRetries: 5,
+  abortSignal: controller.signal,
+  headers: { "x-request-id": requestId },
+  telemetry: { isEnabled: true }, // requires your own @ai-sdk/otel registration
+});
+```
+
+---
+
+## Usage Detail & Cost Refinement (v0.12+)
+
+`generateText`, `generateObject`, and `streamText`'s `getUsage()` optionally return `totalTokens`, `cachedInputTokens`, and `reasoningTokens` when the provider reports them (`undefined` when it doesn't). The same detail is persisted into the `AICall` record's existing `metadata` field as `metadata.usageDetail` — no Prisma schema change.
+
+```typescript
+const { text, totalTokens, cachedInputTokens, reasoningTokens } =
+  await ai.generateText("anthropic/claude-opus-4.8", prompt);
+```
+
+By default this is informational only — cost still comes from the flat `inputCostPerMillion`/`outputCostPerMillion` rate. To bill cached-read or reasoning tokens at a separate rate, set the matching optional fields when registering a model — see [Cached Input & Reasoning Token Pricing](./model-registry.md) in the Model Registry guide. When those fields are unset (true for every built-in model today), cost is unchanged from pre-0.12 behavior.
+
+---
+
+## Result Richness (v0.12+)
+
+`generateText`/`generateObject` return additional optional fields, sourced directly from the AI SDK's own result shape so they can't drift: `finishReason`, `warnings`, `toolCalls`, `toolResults`, `steps`.
+
+```typescript
+const { text, finishReason, warnings, toolCalls, toolResults, steps } =
+  await ai.generateText("gemini-2.5-flash", prompt, { tools });
+```
+
+`streamText` exposes the same detail as async getters, matching the existing `getUsage()`/`getText()`/`getReasoning()` style — none of them force eager resolution of the stream:
+
+```typescript
+const result = ai.streamText("gemini-2.5-flash", { prompt: "Write a story" });
+for await (const chunk of result.stream) process.stdout.write(chunk);
+
+console.log(await result.getFinishReason()); // "stop" | "length" | "tool-calls" | ...
+console.log(await result.getWarnings());     // provider warnings, if any
+console.log(await result.getToolCalls());    // tool calls across all steps
+console.log(await result.getToolResults());  // tool results across all steps
+console.log(await result.getSteps());        // per-step detail
+```
+
+---
+
+## Sampling Params, Headers & Agentic Control (v0.12+)
+
+`generateText`, `generateObject`, and `streamText` options all accept the following, each typed as a direct passthrough to the underlying AI SDK call so they can't drift from the SDK:
+
+- **Sampling:** `topP`, `topK`, `frequencyPenalty`, `presencePenalty`, `seed`, `stopSequences`
+- **Transport:** `headers` — additional HTTP headers (HTTP-based providers only)
+- **Telemetry:** `telemetry` — OpenTelemetry tracing config for the call. workflow-engine does not depend on `@ai-sdk/otel`; install and register it yourself (once, at startup) to actually collect the spans.
+- **Agentic control:** `activeTools` (restrict which of the provided `tools` the model may call this step) and `prepareStep` (adjust model/tools/settings before each step)
+
+```typescript
+import "@ai-sdk/otel"; // your own dependency, registered once at startup
+
+await ai.generateText("gemini-2.5-flash", prompt, {
+  topP: 0.9,
+  stopSequences: ["\n\n"],
+  telemetry: { isEnabled: true, functionId: "extract-summary" },
+});
+```
+
+`streamText` additionally accepts `experimental_transform` (AI SDK v7's stable name for stream transforms, e.g. `smoothStream()`):
+
+```typescript
+import { smoothStream } from "ai";
+
+const result = ai.streamText("gemini-2.5-flash", { prompt: "Write a story" }, {
+  experimental_transform: smoothStream({ chunking: "word" }),
+});
+```
+
 ---
 
 ## Reasoning / Thinking Models
 
 When using reasoning models (like Claude 3.7 Sonnet or models routed through OpenRouter reasoning parameters), the final output (`text`) and the intermediate thinking process (`reasoning`) occupy different channels.
+
+### Unified `reasoning` Option (v0.12+)
+Instead of reaching for provider-specific `providerOptions`, prefer the portable `reasoning` knob — AI SDK v7's own effort scale — which each provider maps to its own controls:
+
+```typescript
+await ai.generateText("anthropic/claude-opus-4.8", prompt, { reasoning: "low" });
+await ai.generateText("some-openrouter-reasoning-model", prompt, { reasoning: "none" });
+```
+
+`reasoning` accepts `"none" | "low" | "medium" | "high" | ...` and works the same on `generateObject`/`streamText`. `providerOptions` remains available (and composes with `reasoning`) for provider-specific controls it doesn't cover.
 
 ### Suppressing Reasoning
 To prevent a model from using its thinking channel (e.g. to save output token budget), pass provider-specific thinking configurations inside the `providerOptions` argument:

@@ -129,6 +129,26 @@ const ai = createAIHelper("workflow.run-123", aiCallLogger, logContext);
 const ai = runtime.createAIHelper(`workflow.${ctx.workflowRunId}.stage.${ctx.stageId}`);
 ```
 
+### Custom Provider Resolver (`LanguageModelV4`)
+
+Pass a `ProviderResolver` as `createAIHelper`'s 4th (optional) argument to override how a `ModelConfig` resolves to an AI SDK language model — useful for providers this library doesn't build in, or to inject a differently-configured client (custom base URL, API key rotation, etc.). The resolver returns an AI SDK v7 `LanguageModelV4` (from `@ai-sdk/provider`), or `null`/`undefined` to fall back to built-in resolution:
+
+```typescript
+import { createAIHelper, type ProviderResolver } from "@bratsos/workflow-engine";
+import { anthropic } from "@ai-sdk/anthropic";
+
+const myResolver: ProviderResolver = (modelConfig) => {
+  if (modelConfig.provider === "anthropic") {
+    return anthropic(modelConfig.id); // LanguageModelV4
+  }
+  return undefined; // fall back to built-in resolution
+};
+
+const ai = createAIHelper("workflow.abc123", aiCallLogger, undefined, myResolver);
+```
+
+> Upgrading from AI SDK v6 (0.11 and earlier)? `ProviderResolver` now returns `LanguageModelV4` instead of `LanguageModelV3` — see [migrate-0.11-to-0.12.md](../migrations/migrate-0.11-to-0.12.md#required-actions).
+
 ## AIHelper Interface
 
 ```typescript
@@ -169,7 +189,50 @@ console.log(result.outputTokens);
 console.log(result.cost);           // Calculated cost
 ```
 
-`maxRetries` and `abortSignal` (v0.11+) are also available on `generateObject` and `streamText` options — see below. They are not available on `embed()` options.
+`maxRetries` and `abortSignal` (v0.11+) are also available on `generateObject` and `streamText` options — see below. `embed()` gained the same two options in v0.12 (see [embed](#embed) below).
+
+### Messages Input (v0.12+)
+
+`generateText`/`generateObject` accept `{ messages: [...] }` as an alternative to a string/multimodal `prompt` — the array is a full AI SDK model-message list (`Parameters<typeof generateText>[0]["messages"]`), useful for multi-turn conversations or per-message roles. The string/multimodal prompt path shown above is unchanged; pick whichever shape fits the call.
+
+```typescript
+const result = await ai.generateText("gemini-2.5-flash", {
+  messages: [
+    { role: "user", content: "What's the capital of France?" },
+    { role: "assistant", content: "Paris." },
+    { role: "user", content: "And Germany?" },
+  ],
+});
+```
+
+`generateObject` accepts the same `{ messages: [...] }` shape in place of its `prompt` argument.
+
+### Sampling Params, Headers, Telemetry & Agentic Control (v0.12+)
+
+`generateText`/`generateObject`/`streamText` options all accept the following, each typed as a passthrough sourced directly from the AI SDK's own parameter type (`Parameters<typeof generateText>[0]["<field>"]` or the `streamText` equivalent), so they track the SDK instead of drifting:
+
+- **Sampling:** `topP`, `topK`, `frequencyPenalty`, `presencePenalty`, `seed`, `stopSequences`
+- **Transport:** `headers` (additional HTTP headers, HTTP-based providers only)
+- **Telemetry:** `telemetry` — OpenTelemetry tracing config for the call. This library does **not** depend on `@ai-sdk/otel`; install and register it yourself (once, at startup) to actually collect the spans:
+  ```typescript
+  // consumer's own dependency, registered once at startup
+  import "@ai-sdk/otel";
+
+  await ai.generateText("gemini-2.5-flash", prompt, {
+    telemetry: { isEnabled: true, functionId: "extract-summary" },
+  });
+  ```
+- **Agentic control:** `activeTools` (restrict which of the provided `tools` the model may call this step) and `prepareStep` (hook to adjust model/tools/settings before each step)
+
+`StreamOptions` additionally accepts `experimental_transform` (AI SDK v7's stable name for stream transforms, e.g. `smoothStream()`):
+
+```typescript
+import { smoothStream } from "ai";
+
+const result = ai.streamText("gemini-2.5-flash", { prompt }, {
+  experimental_transform: smoothStream({ chunking: "word" }),
+});
+```
 
 ### Multimodal Input
 
@@ -233,6 +296,8 @@ console.log(result.object);  // Typed as z.infer<typeof OutputSchema>
 // { title: "...", tags: ["tech", "ai"], sentiment: "positive" }
 ```
 
+`generateObject` accepts every option `generateText` does (`maxRetries`, `abortSignal`, sampling params, `headers`, `telemetry`, `reasoning`, `activeTools`, `prepareStep`), and the same `{ messages: [...] }` alternative to a string/multimodal `prompt` — see [Messages Input](#messages-input-v012) and [Sampling Params, Headers, Telemetry & Agentic Control](#sampling-params-headers-telemetry--agentic-control-v012) above.
+
 ### Multimodal with Schema
 
 ```typescript
@@ -286,6 +351,20 @@ const result = await ai.embed("text-embedding-004", [
 
 console.log(result.embeddings);    // number[][] (3 embeddings)
 console.log(result.embedding);     // First embedding (convenience)
+```
+
+### Retries, Abort & Telemetry (v0.12+)
+
+`embed()` gained the same `maxRetries`/`abortSignal` options `generateText`/`generateObject`/`streamText` already had, plus `headers` and `telemetry`:
+
+```typescript
+const controller = new AbortController();
+const result = await ai.embed("text-embedding-004", "The quick brown fox", {
+  maxRetries: 5,
+  abortSignal: controller.signal,
+  headers: { "x-request-id": requestId },
+  telemetry: { isEnabled: true }, // requires your own @ai-sdk/otel registration - see Sampling Params section above
+});
 ```
 
 ### Provider Options Passthrough
@@ -392,6 +471,26 @@ const result = ai.streamText("gemini-2.5-flash", {
 });
 ```
 
+`streamText` also accepts the same sampling params, `headers`, `telemetry`, `reasoning`, `activeTools`, `prepareStep`, and `experimental_transform` options described in [Sampling Params, Headers, Telemetry & Agentic Control](#sampling-params-headers-telemetry--agentic-control-v012) above.
+
+### Result Richness (v0.12+)
+
+Beyond `getUsage()`/`getText()`/`getReasoning()`, `AIStreamResult` exposes async getters for the same result-richness fields `generateText`/`generateObject` return directly. Like `getUsage()`, none of them force eager resolution of the stream:
+
+```typescript
+const result = ai.streamText("gemini-2.5-flash", { prompt: "Write a story" });
+
+for await (const chunk of result.stream) {
+  process.stdout.write(chunk);
+}
+
+console.log(await result.getFinishReason());  // "stop" | "length" | "tool-calls" | ...
+console.log(await result.getWarnings());      // provider warnings, if any
+console.log(await result.getToolCalls());     // tool calls across all steps
+console.log(await result.getToolResults());   // tool results across all steps
+console.log(await result.getSteps());         // per-step detail
+```
+
 ## Reasoning Models & Provider Options
 
 Reasoning models (e.g. `anthropic/claude-opus-4.x`, OpenRouter reasoning models) emit
@@ -401,8 +500,23 @@ on a **separate reasoning channel**. Two facts drive how you use them here:
    *and* answer, or reason *instead of* answering. When it reasons instead of answering,
    the text channel — including the buffered `result.text` — is genuinely empty; the
    content is in the reasoning channel.
-2. **Control reasoning per call with `providerOptions`.** This is the standard lever and
-   is forwarded by `generateText`, `generateObject`, and `streamText` (just like `embed`).
+2. **Control reasoning per call with `reasoning` (v0.12+, preferred) or `providerOptions`.**
+   `reasoning` is AI SDK v7's portable reasoning-effort knob (`"none" | "low" | "medium" |
+   "high" | ...`), mapped by each provider to its own controls — prefer it when a portable
+   value is enough. `providerOptions` remains available (and composes with `reasoning`) for
+   provider-specific knobs it doesn't cover. Both are forwarded by `generateText`,
+   `generateObject`, and `streamText` (just like `embed`, for `providerOptions`).
+
+### Controlling reasoning (unified `reasoning` option, v0.12+)
+
+```typescript
+// Portable across providers - each maps "low"/"medium"/"high" to its own controls
+await ai.generateText("anthropic/claude-opus-4.8", prompt, { reasoning: "low" });
+await ai.generateText("some-openrouter-reasoning-model", prompt, { reasoning: "none" });
+
+// Works the same on streamText / generateObject
+const result = ai.streamText("anthropic/claude-opus-4.8", { prompt }, { reasoning: "high" });
+```
 
 ### Controlling reasoning (`providerOptions`)
 
@@ -654,7 +768,30 @@ const cost = calculateCost("gemini-2.5-flash", 1000, 500);
 // }
 ```
 
+`calculateCost` computes the flat (unrefined) cost from `inputCostPerMillion`/`outputCostPerMillion` only. The AI helper's internal `calculateCostWithDiscount` (used by `generateText`/`generateObject`/`streamText`/`embed`) additionally applies `ModelConfig.cachedInputCostPerMillion`/`reasoningCostPerMillion` when the model config sets them — see [Usage Detail & Cost Refinement](#usage-detail--cost-refinement-v012) below.
+
+### Usage Detail & Cost Refinement (v0.12+)
+
+`ModelConfig` accepts two optional per-model rates:
+
+```typescript
+registerModels({
+  "my-caching-model": {
+    id: "provider/my-model",
+    provider: "openrouter",
+    inputCostPerMillion: 3,
+    outputCostPerMillion: 15,
+    cachedInputCostPerMillion: 0.3,  // optional - price for cached-read input tokens
+    reasoningCostPerMillion: 60,     // optional - price for reasoning output tokens
+  },
+});
+```
+
+When a call reports `cachedInputTokens`/`reasoningTokens` (see `AITextResult` below) **and** the model config sets the matching rate, that token slice is billed at the refined rate instead of the flat `inputCostPerMillion`/`outputCostPerMillion`. When a model has neither field set — true for every built-in model today — cost is unchanged from pre-0.12 behavior. The `sync-models` CLI does not populate these two fields yet; set them via `registerModels()` if you need refined pricing today.
+
 ## Result Types
+
+`FinishReason`, `CallWarning`, `TypedToolCall`, `TypedToolResult`, and `StepResult` below are AI SDK types (from `"ai"`), not redefined by this library - the result-richness fields are typed directly off `generateText`'s own result shape so they can't drift from the SDK.
 
 ```typescript
 interface AITextResult {
@@ -664,6 +801,18 @@ interface AITextResult {
   cost: number;
   output?: any;       // Present when `output` is used
   reasoning?: string; // Reasoning/thinking text, when the model emitted any
+
+  // v0.12+: usage detail, present when the provider reports it
+  totalTokens?: number;
+  cachedInputTokens?: number;
+  reasoningTokens?: number;
+
+  // v0.12+: result richness
+  finishReason?: FinishReason;              // "stop" | "length" | "tool-calls" | ...
+  warnings?: CallWarning[];
+  toolCalls?: TypedToolCall<ToolSet>[];
+  toolResults?: TypedToolResult<ToolSet>[];
+  steps?: StepResult<ToolSet>[];
 }
 
 interface AIObjectResult<T> {
@@ -671,6 +820,16 @@ interface AIObjectResult<T> {
   inputTokens: number;
   outputTokens: number;
   cost: number;
+
+  // v0.12+: same usage-detail and result-richness fields as AITextResult
+  totalTokens?: number;
+  cachedInputTokens?: number;
+  reasoningTokens?: number;
+  finishReason?: FinishReason;
+  warnings?: CallWarning[];
+  toolCalls?: TypedToolCall<ToolSet>[];
+  toolResults?: TypedToolResult<ToolSet>[];
+  steps?: StepResult<ToolSet>[];
 }
 
 interface AIEmbedResult {
@@ -683,9 +842,18 @@ interface AIEmbedResult {
 
 interface AIStreamResult {
   stream: AsyncIterable<string>;
-  getUsage(): Promise<{ inputTokens, outputTokens, cost }>;
+  getUsage(): Promise<{ inputTokens, outputTokens, cost, totalTokens?, cachedInputTokens?, reasoningTokens? }>;
   getText(): Promise<string>;                  // Full answer text, reconciled with the buffered result
   getReasoning(): Promise<string | undefined>; // Reasoning/thinking text, when the model emitted any
+
+  // v0.12+: async getters mirroring generateText's result-richness fields.
+  // None force eager resolution of the stream.
+  getFinishReason(): Promise<FinishReason>;
+  getWarnings(): Promise<CallWarning[] | undefined>;
+  getToolCalls(): Promise<TypedToolCall<ToolSet>[]>;
+  getToolResults(): Promise<TypedToolResult<ToolSet>[]>;
+  getSteps(): Promise<StepResult<ToolSet>[]>;
+
   rawResult: AISDKStreamResult;
 }
 

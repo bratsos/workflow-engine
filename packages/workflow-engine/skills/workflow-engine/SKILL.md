@@ -450,8 +450,14 @@ const { text, cost } = await ai.generateText("gemini-2.5-flash", prompt);
 const { object } = await ai.generateObject("gemini-2.5-flash", prompt, schema);
 const { embedding } = await ai.embed("text-embedding-004", ["text1"], { dimensions: 768 });
 // generateText/generateObject/streamText options also accept maxRetries / abortSignal (v0.11+)
+// ...and (v0.12+) topP/topK/frequencyPenalty/presencePenalty/seed/stopSequences/headers,
+// telemetry (register @ai-sdk/otel yourself - not a dependency of this library), the portable
+// `reasoning` knob, activeTools/prepareStep, and { messages: [...] } as an alternative to `prompt`.
+// Results also carry v0.12+ usage detail (totalTokens/cachedInputTokens/reasoningTokens) and
+// result-richness fields (finishReason/warnings/toolCalls/toolResults/steps) - see references/04-ai-integration.md.
 // OpenRouter embedding models (OpenAI, Cohere, etc.)
 const { embedding } = await ai.embed("openai/text-embedding-3-small", ["text1"]);
+// embed() also accepts maxRetries/abortSignal/headers/telemetry (v0.12+)
 
 // Provider-specific options passthrough (Voyage, Cohere, etc.)
 const { embedding } = await ai.embed("voyage-4-large", ["text1"], {
