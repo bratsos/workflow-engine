@@ -255,3 +255,45 @@ describe("kernel: run.reapStuck", () => {
     expect(jobs[0]!.status).toBe("PENDING");
   });
 });
+
+describe("kernel: run.reapStuck dropped-transition heal", () => {
+  it("heals a wedged run (all stages terminal, transition dropped) instead of failing it", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, persistence, clock } = createTestKernel([workflow], {
+      clockStart: new Date(),
+    });
+
+    const { workflowRunId } = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "key-heal-1",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+    await kernel.dispatch({ type: "run.claimPending", workerId: "w1" });
+
+    // Execute the only stage, but never fire run.transition — the state a
+    // dead host (or a double stale-claim noop) leaves behind: every stage
+    // terminal, run still RUNNING.
+    await kernel.dispatch({
+      type: "job.execute",
+      workflowRunId,
+      workflowId: "test-workflow",
+      stageId: "stage-1",
+      config: {},
+    });
+
+    clock.advance(10 * 60 * 1000);
+
+    const result = await kernel.dispatch({
+      type: "run.reapStuck",
+      stuckThresholdMs: 5 * 60 * 1000,
+    });
+
+    expect(result.healed).toBe(1);
+    expect(result.failed).toBe(0);
+
+    const run = await persistence.getRun(workflowRunId);
+    expect(run!.status).toBe("COMPLETED");
+    expect(run!.output).toEqual({ data: "hello" });
+  });
+});

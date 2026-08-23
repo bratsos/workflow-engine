@@ -235,6 +235,12 @@ export interface RunReapStuckCommand {
 export interface RunReapStuckResult {
   readonly transitioned: number;
   readonly failed: number;
+  /**
+   * Wedged runs resolved by the dropped-transition heal: every stage was
+   * terminal while the run still said RUNNING, and firing the missing
+   * run.transition resolved the run instead of reaping finished work.
+   */
+  readonly healed: number;
 }
 
 // ---------------------------------------------------------------------------

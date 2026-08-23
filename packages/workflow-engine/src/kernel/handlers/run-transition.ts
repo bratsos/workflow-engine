@@ -24,10 +24,22 @@ const TERMINAL_STATUSES = new Set(["COMPLETED", "FAILED", "CANCELLED"]);
 
 // ---------------------------------------------------------------------------
 // Active statuses -- if any stage is in one of these states the run is still
-// in-flight and should not be transitioned yet.
+// in-flight and should not be transitioned yet. Exported for run.reapStuck's
+// dropped-transition heal, which must apply the same definition of "active".
 // ---------------------------------------------------------------------------
 
-const ACTIVE_STATUSES = new Set(["RUNNING", "PENDING", "SUSPENDED"]);
+export const ACTIVE_STAGE_STATUSES = new Set(["RUNNING", "PENDING", "SUSPENDED"]);
+
+const ACTIVE_STATUSES = ACTIVE_STAGE_STATUSES;
+
+// A stale claim means another writer bumped the run version between our read
+// and our claim. That writer is NOT guaranteed to have performed the
+// transition: it may itself have lost a claim race and nooped, or died before
+// acting — observed in production as runs wedged with every stage terminal
+// until the stuck-run reaper failed them. Re-reading and re-deciding from
+// fresh state is safe (the decision is recomputed from persistence each
+// attempt), so retry a bounded number of times before conceding.
+const MAX_TRANSITION_ATTEMPTS = 3;
 
 // ---------------------------------------------------------------------------
 // Helper: claim the run before mutating it
@@ -58,6 +70,17 @@ export async function handleRunTransition(
   command: RunTransitionCommand,
   deps: KernelDeps,
 ): Promise<HandlerResult<RunTransitionResult>> {
+  for (let attempt = 0; attempt < MAX_TRANSITION_ATTEMPTS; attempt++) {
+    const result = await attemptRunTransition(command, deps);
+    if (result !== "stale") return result;
+  }
+  return { action: "noop" as const, _events: [] };
+}
+
+async function attemptRunTransition(
+  command: RunTransitionCommand,
+  deps: KernelDeps,
+): Promise<HandlerResult<RunTransitionResult> | "stale"> {
   const events: KernelEvent[] = [];
 
   // 1. Get run from persistence
@@ -83,7 +106,7 @@ export async function handleRunTransition(
   // 5. If no stages exist, this is the first transition -- enqueue group 1
   if (stages.length === 0) {
     if (!(await claimRunTransition(run, deps))) {
-      return { action: "noop" as const, _events: [] };
+      return "stale";
     }
     const enqueue = await prepareExecutionGroup(run, workflow, deps, {
       groupIndex: 1,
@@ -149,7 +172,7 @@ export async function handleRunTransition(
   }
   if (failedStage) {
     if (!(await claimRunTransition(run, deps))) {
-      return { action: "noop" as const, _events: [] };
+      return "stale";
     }
     await deps.persistence.updateRun(command.workflowRunId, {
       status: "FAILED",
@@ -178,7 +201,7 @@ export async function handleRunTransition(
   // 10. If there are stages in the next group, enqueue them
   if (nextGroupStages.length > 0) {
     if (!(await claimRunTransition(run, deps))) {
-      return { action: "noop" as const, _events: [] };
+      return "stale";
     }
     const enqueue = await prepareExecutionGroup(run, workflow, deps, {
       groupIndex: maxGroup + 1,
@@ -219,7 +242,7 @@ export async function handleRunTransition(
   );
 
   if (!(await claimRunTransition(run, deps))) {
-    return { action: "noop" as const, _events: [] };
+    return "stale";
   }
 
   await deps.persistence.updateRun(command.workflowRunId, {

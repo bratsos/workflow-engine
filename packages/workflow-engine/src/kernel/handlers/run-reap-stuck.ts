@@ -2,18 +2,21 @@ import { StaleVersionError } from "../../persistence/interface.js";
 import type { RunReapStuckCommand, RunReapStuckResult } from "../commands";
 import type { KernelEvent } from "../events";
 import type { HandlerResult, KernelDeps } from "../kernel";
+import { ACTIVE_STAGE_STATUSES, handleRunTransition } from "./run-transition.js";
 
 export async function handleRunReapStuck(
   command: RunReapStuckCommand,
   deps: KernelDeps,
 ): Promise<HandlerResult<RunReapStuckResult>> {
   const events: KernelEvent[] = [];
+  const postCommits: Array<(deps: KernelDeps) => Promise<unknown>> = [];
   const stuckSince = new Date(
     deps.clock.now().getTime() - command.stuckThresholdMs,
   );
 
   const stuckRuns = await deps.persistence.getStuckRuns(stuckSince);
   let failed = 0;
+  let healed = 0;
 
   for (const run of stuckRuns) {
     const stages = await deps.persistence.getStagesByRun(run.id);
@@ -57,6 +60,29 @@ export async function handleRunReapStuck(
       }
     }
 
+    // Dropped-transition heal: every stage is terminal but the run still says
+    // RUNNING — the run.transition that should have advanced or resolved it
+    // was dropped (a stale-claim race where the competing writer also nooped,
+    // or the dispatching process died before firing it). The run is one
+    // transition away from resolving on its own merits; failing it here would
+    // discard finished work. Attempt the transition and only reap if it
+    // cannot resolve the run.
+    const hasActiveStage = stages.some((s) =>
+      ACTIVE_STAGE_STATUSES.has(s.status),
+    );
+    if (stages.length > 0 && !hasActiveStage) {
+      const transition = await handleRunTransition(
+        { type: "run.transition", workflowRunId: run.id },
+        deps,
+      );
+      if (transition.action !== "noop") {
+        events.push(...(transition._events ?? []));
+        if (transition._postCommit) postCommits.push(transition._postCommit);
+        healed++;
+        continue;
+      }
+    }
+
     // Version guard: two hosts racing to reap the same run would
     // otherwise both pass the status check above and both write
     // updateRun + emit workflow:failed. expectedVersion turns the second
@@ -94,7 +120,22 @@ export async function handleRunReapStuck(
     failed++;
   }
 
-  // `transitioned` reports the count of runs actually transitioned to
-  // FAILED by this call — the only transition run.reapStuck performs.
-  return { transitioned: failed, failed, _events: events };
+  // `transitioned` reports the count of runs this call moved to FAILED;
+  // `healed` counts wedged runs the dropped-transition heal resolved by
+  // firing the run.transition they were missing instead of reaping them.
+  return {
+    transitioned: failed,
+    failed,
+    healed,
+    _events: events,
+    ...(postCommits.length > 0
+      ? {
+          _postCommit: async (postDeps: KernelDeps) => {
+            for (const postCommit of postCommits) {
+              await postCommit(postDeps);
+            }
+          },
+        }
+      : {}),
+  };
 }

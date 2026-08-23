@@ -561,3 +561,54 @@ describe("kernel: run.transition", () => {
     });
   });
 });
+
+describe("kernel: run.transition stale-claim retry", () => {
+  it("re-decides from fresh state when the version claim is stale, instead of nooping", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, persistence } = createTestKernel([workflow]);
+
+    const { workflowRunId } = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "key-stale-1",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+    await kernel.dispatch({ type: "run.claimPending", workerId: "w1" });
+    await kernel.dispatch({
+      type: "job.execute",
+      workflowRunId,
+      workflowId: "test-workflow",
+      stageId: "stage-1",
+      config: {},
+    });
+
+    // The competing writer wins the version race once and then noops — the
+    // production wedge. The pure claim call carries ONLY expectedVersion;
+    // real status updates must pass through untouched.
+    const originalUpdateRun = persistence.updateRun.bind(persistence);
+    let staleThrown = false;
+    persistence.updateRun = async (id, updates) => {
+      const isPureClaim =
+        updates.expectedVersion !== undefined &&
+        Object.keys(updates).length === 1;
+      if (!staleThrown && isPureClaim) {
+        staleThrown = true;
+        // Simulate the version having moved on under us.
+        await originalUpdateRun(id, { expectedVersion: undefined } as never);
+        throw new StaleVersionError("WorkflowRun", id, 1, 2);
+      }
+      return originalUpdateRun(id, updates);
+    };
+
+    const result = await kernel.dispatch({
+      type: "run.transition",
+      workflowRunId,
+    });
+
+    expect(staleThrown).toBe(true);
+    expect(result.action).toBe("completed");
+
+    const run = await persistence.getRun(workflowRunId);
+    expect(run!.status).toBe("COMPLETED");
+  });
+});
