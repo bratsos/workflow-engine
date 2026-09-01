@@ -104,6 +104,7 @@
 
 ## Bug fixes
 
+- **A run whose stages had all completed could wedge in `RUNNING` forever, then get marked `FAILED`.** When `run.transition` lost the version-claim race to a writer that itself nooped or died before acting, nothing ever resolved the run, and `run.reapStuck` eventually failed it despite every stage having succeeded. `claimRunTransition` now retries the decision from fresh state (bounded at 3 attempts, recomputed from persistence each time), and `run.reapStuck` heals a stuck `RUNNING` run whose stages are all terminal by firing that transition rather than failing it. `RunReapStuckResult` gained a `healed` count. This landed upstream as #43 after 0.12.0 shipped, so 0.13 is its first published version — if you were carrying a local patch for it, drop the patch.
 - **The `./client` entry could not be bundled.** It transitively pulled in all three optional vendor SDKs, so anyone who honored "optional" got three unresolvable imports. The client bundle is now ~8 KB instead of ~610 KB, and a `check:bundle` script fails the build if it regresses.
 - **Batch cost was reported at ~25% of its true value.** OpenRouter publishes `:batch` variants with already-halved prices; those rows were emitted as their own registry keys and then discounted twice more. `:batch` and `:free` rows are no longer emitted, and the discount is applied in exactly one place.
 - **The flat 50% batch discount was wrong for 19 of 69 batch models** — real multipliers run from 0.25x to 4.05x, and `openai/gpt-oss-120b:batch` costs four times more than its base model.

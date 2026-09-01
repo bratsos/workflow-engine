@@ -17,6 +17,8 @@
 
   **Bug fixes:**
 
+  - **A run whose stages had all completed could wedge in `RUNNING` forever.** If `run.transition` lost the version-claim race to a writer that itself nooped (or died before acting), the run was never resolved, and `run.reapStuck` would eventually mark it `FAILED` even though every stage had succeeded. `claimRunTransition` now retries the whole decision from fresh state (bounded at 3 attempts, recomputed from persistence each time), and `run.reapStuck` heals a stuck `RUNNING` run whose stages are all terminal by firing that transition instead of failing the run. `RunReapStuckResult` gained a `healed` count. (Landed as #43 after the 0.12.0 release, so this is its first published version.)
+
   - **The `./client` entry could not be bundled.** `dist/client.js` transitively imported `@anthropic-ai/sdk`, `@google/genai`, and `openai` — all documented as _optional_ peers — so any consumer who skipped them got three unresolvable imports. The client bundle drops from ~610 KB to ~8 KB, and a new `check:bundle` script fails the build if it regresses.
   - **Batch cost was reported at roughly 25% of true cost.** OpenRouter publishes `:batch` model variants with already-halved prices; the sync CLI emitted them as their own registry keys and then applied a 50% discount to them twice more. `:batch` and `:free` variants are no longer emitted as model keys, and the discount is applied in exactly one place.
   - **The flat 50% batch discount was wrong for 19 of 69 batch models.** Real multipliers range from 0.25x to 4.05x — `openai/gpt-oss-120b:batch` costs four times more than its base model, not half. Batch prices are now read per model.
