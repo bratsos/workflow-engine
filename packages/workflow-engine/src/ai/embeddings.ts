@@ -12,7 +12,7 @@ import { openrouter } from "@openrouter/ai-sdk-provider";
 import { embed as aiEmbed, embedMany } from "ai";
 import { logFailure } from "./generate";
 import { getModel, type ModelConfig, type ModelKey } from "./model-helper";
-import { calculateCostWithDiscount, logger } from "./shared";
+import { logger, resolveCost } from "./shared";
 import type { AIEmbedResult, AIHelperContext, EmbedOptions } from "./types";
 
 // Default embedding dimensions (can be overridden via options)
@@ -59,7 +59,11 @@ export function getEmbeddingModelProvider(modelConfig: ModelConfig) {
 
   // Built-in providers
   if (modelConfig.provider === "openrouter") {
-    return openrouter.textEmbeddingModel(modelConfig.id);
+    return openrouter.textEmbeddingModel(modelConfig.id, {
+      extraBody: {
+        usage: { include: true },
+      },
+    });
   }
   if (modelConfig.provider === "google") {
     const googleModelId = modelConfig.id.replace(/^google\//, "");
@@ -114,6 +118,7 @@ export async function embed(
 
     let embeddings: number[][];
     let totalInputTokens: number;
+    let providerMetadata: unknown;
 
     if (texts.length === 1) {
       const result = await aiEmbed({
@@ -123,6 +128,7 @@ export async function embed(
       });
       embeddings = [result.embedding];
       totalInputTokens = result.usage?.tokens || 0;
+      providerMetadata = result.providerMetadata;
     } else {
       const result = await embedMany({
         model: embeddingModel,
@@ -131,13 +137,15 @@ export async function embed(
       });
       embeddings = result.embeddings;
       totalInputTokens = result.usage?.tokens || 0;
+      providerMetadata = result.providerMetadata;
     }
 
     const outputTokens = 0; // Embeddings have no output tokens
-    const cost = calculateCostWithDiscount(
+    const { cost, reportedCostUsd, costSource } = resolveCost(
       modelKey,
       totalInputTokens,
       outputTokens,
+      { providerMetadata },
     );
     const durationMs = Date.now() - startTime;
 
@@ -151,6 +159,8 @@ export async function embed(
       inputTokens: totalInputTokens,
       outputTokens,
       cost,
+      reportedCost: reportedCostUsd,
+      costSource,
       metadata: {
         taskType: options.taskType,
         textCount: texts.length,
@@ -176,6 +186,8 @@ export async function embed(
       dimensions, // Dimensionality used
       inputTokens: totalInputTokens,
       cost,
+      ...(reportedCostUsd !== undefined ? { reportedCostUsd } : {}),
+      costSource,
     };
   } catch (error) {
     const { errorMessage, durationMs } = logFailure(ctx.aiCallLogger, {

@@ -435,6 +435,12 @@ const extractionStage = defineStage({
 ### AI Classification Stage
 
 ```typescript
+const ClassificationOutputSchema = z.object({
+  categories: z.array(z.string()),
+  confidence: z.number(),
+  reasoning: z.string(),
+});
+
 const classificationStage = defineStage({
   id: "classification",
   name: "Content Classification",
@@ -442,11 +448,7 @@ const classificationStage = defineStage({
 
   schemas: {
     input: "none",
-    output: z.object({
-      categories: z.array(z.string()),
-      confidence: z.number(),
-      reasoning: z.string(),
-    }),
+    output: ClassificationOutputSchema,
     config: z.object({
       model: z.string().default("gemini-2.5-flash"),
       minConfidence: z.number().default(0.8),
@@ -460,7 +462,7 @@ const classificationStage = defineStage({
     const { object } = await ai.generateObject(
       ctx.config.model,
       `Classify this document:\n\n${extraction.sections.map(s => s.content).join("\n")}`,
-      ctx.schemas.output
+      ClassificationOutputSchema
     );
 
     return { output: object };
@@ -514,7 +516,10 @@ const batchEmbeddingStage = defineAsyncBatchStage({
         submittedAt: new Date().toISOString(),
         pollInterval: 30000,
         maxWaitTime: 1800000,
-        metadata: { sectionCount: texts.length },
+        metadata: {
+          sectionCount: texts.length,
+          batchRefs: handle.refs,
+        },
       },
       pollConfig: {
         pollInterval: 30000,
@@ -531,7 +536,7 @@ const batchEmbeddingStage = defineAsyncBatchStage({
     const status = await batch.getStatus(state.batchId);
 
     if (status.status === "completed") {
-      const results = await batch.getResults(state.batchId);
+      const results = await batch.getResults(state.batchId, state.metadata);
       const embeddings = results.map((r, i) => ({
         sectionId: i,
         vector: r.result as number[],

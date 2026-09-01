@@ -139,7 +139,7 @@ interface AIHelper {
   generateObject(modelKey, prompt, schema, options?): Promise<AIObjectResult>;
   embed(modelKey, text, options?): Promise<AIEmbedResult>;
   streamText(modelKey, input, options?): AIStreamResult;
-  batch(modelKey, provider?): AIBatch;
+  batch<T = string>(modelKey, provider?, options?): AIBatch<T>;
 
   createChild(segment, id?): AIHelper;
   recordCall(params): void;
@@ -455,63 +455,106 @@ const reasoning = await result.getReasoning(); // reasoning channel, if any
 
 ## batch
 
-Submit batch operations for 50% cost savings.
+Submit batch operations for asynchronous execution with model-specific batch discounts.
 
 ```typescript
 const batch = ai.batch<OutputType>("claude-sonnet-4-20250514", "anthropic");
+// Or using OpenRouter with injected credentials:
+// const batch = ai.batch<OutputType>("openai/gpt-4o", "openrouter", { apiKey: "..." });
 
-// Submit requests
+// Submit requests (AIBatchRequest accepts optional maxTokens, system, temperature, and schema)
 const handle = await batch.submit([
-  { id: "req-1", prompt: "Summarize: ..." },
-  { id: "req-2", prompt: "Summarize: ...", schema: SummarySchema },
+  { id: "req-1", prompt: "Summarize: ...", maxTokens: 2000 },
+  { id: "req-2", prompt: "Summarize: ...", schema: SummarySchema, system: "You are a concise summarizer." },
 ]);
 
-console.log(handle.id);       // Batch ID
+console.log(handle.id);       // Primary batch ID (string)
 console.log(handle.status);   // "pending"
 console.log(handle.provider); // "anthropic"
+console.log(handle.refs);     // EngineBatchRef[] (persist in suspendedState.metadata.batchRefs)
 
 // Check status
 const status = await batch.getStatus(handle.id);
-// { id: "...", status: "processing" | "completed" | "failed", provider: "anthropic" }
+// { id: "...", status: "pending" | "processing" | "completed" | "failed", provider: "anthropic", ... }
 
-// Get results (when completed) -- a request submitted with a `schema` has
-// its JSON output validated against it; a response that fails validation
-// comes back as status: "failed" rather than an unvalidated blob.
-const results = await batch.getResults(handle.id);
+// Get results (when completed)
+// Pass metadata with batchRefs for fan-in, and re-supply schemas to validate structured output
+const results = await batch.getResults(handle.id, {
+  batchRefs: handle.refs,
+  schemas: { "req-2": SummarySchema },
+});
 // [
-//   { id: "req-1", result: "...", inputTokens: 100, outputTokens: 50, status: "succeeded" },
-//   { id: "req-2", result: { parsed: "object" }, inputTokens: 100, outputTokens: 50, status: "succeeded" },
+//   { id: "req-1", result: "...", inputTokens: 100, outputTokens: 50, status: "succeeded", validated: false },
+//   { id: "req-2", result: { parsed: "object" }, inputTokens: 100, outputTokens: 50, status: "succeeded", validated: true },
 // ]
 
 // Check if already recorded (avoid duplicate logging)
 const recorded = await batch.isRecorded(handle.id);
 ```
 
-### Cross-process result checking: re-supplying `schema`s (v0.11+)
+### Batch Options & Injected Credentials
 
-A `z.ZodTypeAny` passed to `submit()` isn't serializable, so it only survives for the lifetime of the `AIBatch` instance that submitted the request. If you check results from a *different* process or a fresh `AIBatch` instance (the common case for async-batch stages resuming after a suspend), re-supply the schemas keyed by request id so validation still applies:
+`ai.batch()` accepts an optional `BatchOptions` configuration as its third argument:
 
 ```typescript
-// submit() -- process/instance A
+interface BatchOptions {
+  apiKey?: string;              // Injected API key (crucial for edge/serverless without process.env)
+  baseURL?: string;             // Custom endpoint base URL
+  fetch?: typeof globalThis.fetch;
+  endpoint?: "/v1/chat/completions" | "/v1/responses" | "/v1/messages" | "/v1/embeddings";
+  maxRequestsPerBatch?: number; // Request chunk size per upstream batch (default: 500)
+  maxPartitions?: number;       // Maximum allowed partition count (default: 20)
+}
+```
+
+### Batch Request Configuration (`AIBatchRequest`)
+
+```typescript
+interface AIBatchRequest {
+  id: string;
+  prompt: string;
+  schema?: z.ZodTypeAny;
+  maxTokens?: number;      // Output token ceiling (defaults to model's maxCompletionTokens)
+  system?: string;         // System prompt
+  temperature?: number;    // Sampling temperature
+}
+```
+
+`maxTokens` defaults to the model's `maxCompletionTokens` from the model registry.
+
+### Cross-Process Result Checking: Re-supplying `schema`s & `validated`
+
+Zod schemas are JavaScript objects and cannot round-trip JSON serialization across workflow suspend/resume. 
+
+When retrieving results from a resumed stage:
+- **With re-supplied schemas:** Pass `{ schemas: { [requestId]: schema } }` to `getResults(batchId, metadata)`. Responses are validated against the schema and returned with `validated: true`. If parsing or validation fails, the item returns `status: "failed"`.
+- **Without re-supplied schemas:** Results return the raw parsed JSON or text with `validated: false`. A `WARN` is logged indicating unvalidated results.
+
+```typescript
+// submit() -- initial execution
 const handle = await batch.submit([
   { id: "req-1", prompt: "...", schema: ItemSchema },
 ]);
 
-// getResults() -- process/instance B (e.g. checkCompletion() after resume)
+// getResults() -- after resume in checkCompletion()
 const results = await batch.getResults(handle.id, {
+  batchRefs: suspendedState.metadata?.batchRefs,
   schemas: { "req-1": ItemSchema },
 });
 ```
 
-Without `schemas`, results are still returned but without schema validation for requests whose schema wasn't re-supplied.
-
 ### Batch Providers
 
-| Provider | Models | Discount |
-|----------|--------|----------|
-| `anthropic` | Claude models | 50% |
-| `google` | Gemini models | 50% |
-| `openai` | GPT models | 50% |
+Batch processing runs through AI SDK batch providers or OpenRouter's Batch API:
+
+| Provider | Description | Required Dependencies |
+|----------|-------------|-----------------------|
+| `google` | Gemini models via AI SDK | `@ai-sdk/google` (included by default) |
+| `anthropic` | Claude models via AI SDK | `@ai-sdk/anthropic` (optional peer >=4.0.46) |
+| `openai` | OpenAI models via AI SDK | `@ai-sdk/openai` (optional peer >=4.0.53) |
+| `openrouter` | OpenRouter Batch API (HTTP) | None (uses direct fetch) |
+
+> **Pricing Note:** Batch pricing is per-model (read from `batchInputCostPerMillion` / `batchOutputCostPerMillion` in the catalog), not a flat 50% discount. Many models are discounted by 50% or 75%, while some may differ.
 
 ```typescript
 // Provider auto-detected based on model
@@ -519,7 +562,18 @@ const batch = ai.batch("claude-sonnet-4-20250514");  // Uses anthropic
 
 // Or specify explicitly
 const batch = ai.batch("gemini-2.5-flash", "google");
+const openrouterBatch = ai.batch("openai/gpt-4o", "openrouter", { apiKey: myKey });
 ```
+
+If no provider is specified and the model has no known batch-capable provider, `ai.batch()` **throws an error immediately** with an actionable message.
+
+### OpenRouter Batch Transport Caveats
+
+- **Text only:** Multimodal inputs (images, audio, video, files) are rejected.
+- **24-hour expiration without partial recovery:** OpenRouter returns `results: null` if a batch expires at 24 hours. No partial results are recoverable. Batches are automatically partitioned into chunks of `maxRequestsPerBatch` (default: 500) to bound risk.
+- **No cancel or list endpoint:** OpenRouter batch API does not support remote cancellation or listing batches.
+- **No idempotency key:** POST submissions are not auto-retried.
+- **Schema partitioning:** Google models require all requests in a single batch to share the exact same response schema; `submit()` handles this by partitioning requests by schema automatically.
 
 ## Child Helpers
 
@@ -597,7 +651,7 @@ const models = listModels();
 // ]
 
 // Filter models
-const flashModels = listModels({ provider: "google", capabilities: ["embedding"] });
+const flashModels = listModels({ isEmbeddingModel: true });
 ```
 
 ### Register Custom Models
@@ -608,12 +662,13 @@ import { registerModels } from "@bratsos/workflow-engine";
 registerModels({
   "my-custom-model": {
     id: "openrouter/my-model",
+    name: "My Custom Model",
     provider: "openrouter",
     inputCostPerMillion: 0.5,
     outputCostPerMillion: 1.0,
-    contextWindow: 128000,
-    maxOutput: 4096,
-    capabilities: ["text", "vision"],
+    contextLength: 128000,
+    maxCompletionTokens: 4096,
+    supportsTools: true,
   },
 });
 
@@ -691,15 +746,17 @@ interface AIStreamResult {
 
 // v0.11+: discriminated union -- `result` only exists on "succeeded",
 // `error` only exists on "failed". Check `status` before reading either.
+// v0.13+: `validated` indicates whether the result was validated against a re-supplied schema.
 type AIBatchResult<T = string> =
   | {
       id: string;
       prompt: string;
-      result: T;              // validated against the request's schema, if one was supplied
+      result: T;              // unvalidated parsed JSON/string unless a schema was re-supplied at retrieval time
       inputTokens: number;
       outputTokens: number;
       status: "succeeded";
       error?: undefined;
+      validated?: boolean;    // true only when schema was re-supplied and validated; false/undefined otherwise
     }
   | {
       id: string;
@@ -709,6 +766,7 @@ type AIBatchResult<T = string> =
       outputTokens: number;
       status: "failed";
       error: string;
+      validated?: boolean;    // always false on failed requests
     };
 ```
 
@@ -732,6 +790,7 @@ const ai = createAIHelper("document-processor", logger);
 registerModels({
   "fast-model": {
     id: "openrouter/fast-model",
+    name: "Fast Model",
     provider: "openrouter",
     inputCostPerMillion: 0.1,
     outputCostPerMillion: 0.2,

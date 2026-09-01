@@ -77,6 +77,9 @@ export interface StageResult<TOutput> {
 export const SuspendedStateSchema = z.object({
   batchId: z.string(),
   statusUrl: z.string().optional(),
+  /**
+   * @deprecated Unused — kept for deprecation window only. Persisting raw API keys in state is insecure. Removal at 1.0.
+   */
   apiKey: z.string().optional(),
   /**
    * ISO date string.

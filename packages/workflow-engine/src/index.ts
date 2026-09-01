@@ -62,6 +62,7 @@ export {
   type AIStreamResult,
   type AITextResult,
   type BatchLogFn,
+  type BatchOptions,
   createAIHelper,
   type EmbedOptions,
   type LogContext,
@@ -72,6 +73,12 @@ export {
   type StreamOptions,
   type TextOptions,
 } from "./ai/ai-helper";
+// Batch Engine & OpenRouter Direct Driver
+export {
+  createOpenRouterBatchModel,
+  type EngineBatchRef,
+  type OpenRouterBatchConfig,
+} from "./ai/batch";
 // Model Helper
 export {
   AVAILABLE_MODELS,
@@ -161,33 +168,6 @@ export {
   getBestProviderForModel,
   resolveModelForProvider,
 } from "./utils/batch/model-mapping";
-// Batch Providers
-export {
-  AnthropicBatchProvider,
-  type AnthropicBatchProviderConfig,
-  GoogleBatchProvider,
-  type GoogleBatchProviderConfig,
-  OpenAIBatchProvider,
-  type OpenAIBatchProviderConfig,
-} from "./utils/batch/providers";
-
-// Batch Types
-//
-// `BaseBatchRequest`, `BatchLogger`, `BatchState`, `BatchSubmitOptions`, and
-// `RawBatchResult` are intentionally NOT re-exported here — they're
-// provider-internal plumbing (used by the batch provider implementations
-// below and by ./utils/batch/types internally) with no documented public
-// surface. `BatchStatus` stays exported because it's the public return type
-// of `BatchProvider.checkStatus()`, implemented by the root-exported
-// provider classes.
-export type {
-  AnthropicBatchRequest,
-  BatchRequestText,
-  BatchRequestWithSchema,
-  BatchStatus,
-  GoogleBatchRequest,
-  OpenAIBatchRequest,
-} from "./utils/batch/types";
 
 // =============================================================================
 // Kernel API (Phase 1)

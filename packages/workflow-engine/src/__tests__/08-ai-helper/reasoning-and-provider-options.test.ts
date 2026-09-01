@@ -67,7 +67,11 @@ function reasoningOnlyStreamModel() {
           { type: "reasoning-delta", id: "r1", delta: "Let me think. " },
           { type: "reasoning-delta", id: "r1", delta: "The answer is 42." },
           { type: "reasoning-end", id: "r1" },
-          { type: "finish", finishReason: "stop", usage: USAGE },
+          {
+            type: "finish",
+            finishReason: { unified: "stop", raw: "stop" },
+            usage: USAGE,
+          },
         ] as any,
       }),
     }),
@@ -84,7 +88,11 @@ function emptyStreamModel() {
       stream: simulateReadableStream({
         chunks: [
           { type: "stream-start", warnings: [] },
-          { type: "finish", finishReason: "stop", usage: USAGE },
+          {
+            type: "finish",
+            finishReason: { unified: "stop", raw: "stop" },
+            usage: USAGE,
+          },
         ] as any,
       }),
     }),
@@ -105,7 +113,11 @@ function reasoningThenTextStreamModel(delayed = false) {
           { type: "text-delta", id: "t1", delta: "The answer " },
           { type: "text-delta", id: "t1", delta: "is 42." },
           { type: "text-end", id: "t1" },
-          { type: "finish", finishReason: "stop", usage: USAGE },
+          {
+            type: "finish",
+            finishReason: { unified: "stop", raw: "stop" },
+            usage: USAGE,
+          },
         ] as any,
       }),
     }),

@@ -5,10 +5,10 @@ Complete guide for creating stages that suspend and resume for long-running batc
 ## Overview
 
 Async batch stages allow workflows to:
-1. Submit work to external batch APIs (Anthropic, Google, OpenAI)
+1. Submit work to external batch APIs (Google, Anthropic, OpenAI, OpenRouter)
 2. Suspend while waiting for completion
 3. Resume automatically when results are ready
-4. Achieve 50% cost savings on large AI workloads
+4. Achieve significant cost savings on large AI workloads (discounted per-model batch pricing)
 
 ## Creating an Async Batch Stage
 
@@ -82,9 +82,11 @@ async execute(ctx) {
     schema: ItemResultSchema,
   }));
 
-  // Submit to batch API
+  // Submit to batch API (provider is auto-detected or explicitly specified)
   const ai = createAIHelper(`batch.${ctx.workflowRunId}`, aiLogger);
   const batch = ai.batch("claude-sonnet-4-20250514", "anthropic");
+  // Or via OpenRouter with injected credentials:
+  // const batch = ai.batch("openai/gpt-4o", "openrouter", { apiKey: ctx.config.openRouterApiKey });
   const handle = await batch.submit(requests);
 
   // Store metadata for resume
@@ -93,7 +95,7 @@ async execute(ctx) {
     requestIds: requests.map(r => r.id),
   });
 
-  // Return suspended result
+  // Return suspended result - persist handle.refs for multi-batch fan-in
   return {
     suspended: true,
     state: {
@@ -102,8 +104,9 @@ async execute(ctx) {
       pollInterval: 60000,      // Check every 60 seconds
       maxWaitTime: 3600000,     // Max 1 hour
       metadata: {
-        provider: "anthropic",
+        provider: handle.provider,
         requestCount: requests.length,
+        batchRefs: handle.refs,
       },
     },
     pollConfig: {
@@ -181,14 +184,21 @@ async checkCompletion(suspendedState, ctx) {
   // ===================
   // Completed
   // ===================
-  // Get results
-  const results = await batch.getResults(batchId, metadata);
+  // Get results (pass metadata containing batchRefs for fan-in, and re-supply schemas for validation)
+  const results = await batch.getResults(batchId, {
+    ...metadata,
+    schemas: {
+      // Re-supply schemas by requestId because Zod schemas cannot round-trip JSON persistence
+      ...Object.fromEntries(requests.map(r => [r.id, ItemResultSchema])),
+    },
+  });
 
-  // Process results
+  // Process results (res.validated is true when schema was re-supplied and validated)
   const processedResults = results.map(r => ({
     id: r.id,
     result: r.result,
     success: r.status === "succeeded",
+    validated: r.validated,
     error: r.error,
   }));
 
@@ -305,8 +315,10 @@ const batchEmbeddingStage = defineAsyncBatchStage({
         pollInterval: 30000,
         maxWaitTime: 1800000,  // 30 minutes
         metadata: {
+          provider: handle.provider,
           textCount: texts.length,
           customIds: texts.map(t => t.id),
+          batchRefs: handle.refs,
         },
       },
       pollConfig: {
@@ -331,7 +343,7 @@ const batchEmbeddingStage = defineAsyncBatchStage({
       return { ready: false, nextCheckIn: 30000 };
     }
 
-    // Get results with metadata for ID mapping
+    // Get results with metadata for ID mapping and batchRefs resolution
     const results = await batch.getResults(state.batchId, state.metadata);
 
     const embeddings = results
@@ -362,26 +374,71 @@ const batchEmbeddingStage = defineAsyncBatchStage({
 
 ## Batch Providers
 
-### Anthropic
+Batch processing runs through the AI SDK provider batch interfaces or directly through OpenRouter's Batch API. Supported providers are `"google"`, `"anthropic"`, `"openai"`, and `"openrouter"`.
 
-```typescript
-const batch = ai.batch("claude-sonnet-4-20250514", "anthropic");
-// 50% discount, results in ~24 hours
-```
+Batch pricing is model-specific (not a flat 50% discount) and is loaded into `batchInputCostPerMillion` / `batchOutputCostPerMillion` in the model catalog.
 
 ### Google
 
+Backed by `@ai-sdk/google` (included by default):
+
 ```typescript
 const batch = ai.batch("gemini-2.5-flash", "google");
-// 50% discount, results typically faster
+```
+
+### Anthropic
+
+Requires optional peer dependency `@ai-sdk/anthropic` (>=4.0.46):
+
+```typescript
+const batch = ai.batch("claude-sonnet-4-20250514", "anthropic");
 ```
 
 ### OpenAI
 
+Requires optional peer dependency `@ai-sdk/openai` (>=4.0.53):
+
 ```typescript
 const batch = ai.batch("gpt-4o", "openai");
-// 50% discount
 ```
+
+### OpenRouter
+
+Direct HTTP transport to OpenRouter Batch API. No vendor SDK required:
+
+```typescript
+const batch = ai.batch("openai/gpt-4o", "openrouter", {
+  apiKey: process.env.OPENROUTER_API_KEY, // or injected in serverless
+});
+```
+
+### Batch Options & Injected Credentials
+
+`ai.batch()` accepts an optional `BatchOptions` object as its third parameter:
+
+```typescript
+interface BatchOptions {
+  apiKey?: string;              // Injected API key (ideal for edge/serverless without process.env)
+  baseURL?: string;             // Custom endpoint base URL
+  fetch?: typeof globalThis.fetch;
+  endpoint?: "/v1/chat/completions" | "/v1/responses" | "/v1/messages" | "/v1/embeddings";
+  maxRequestsPerBatch?: number; // Request chunk size per upstream batch (default: 500)
+  maxPartitions?: number;       // Maximum allowed partition count (default: 20)
+}
+```
+
+### Provider Resolution & Auto-Detection
+
+If `provider` is omitted from `ai.batch(modelKey)`, the engine inspects the model key/ID to find a matching provider. If no known batch-capable provider exists for the model, `ai.batch()` **throws an error immediately** with an actionable message directing you to pass an explicit provider.
+
+### OpenRouter Batch Transport Caveats
+
+When using `"openrouter"` batch processing, keep these operational characteristics in mind:
+- **Text only:** Image, audio, video, and file multimodal parts are rejected.
+- **24-hour expiration without partial recovery:** OpenRouter sets a 24h completion window. If expired, `results` returns `null` and **no partial results are recoverable**. To bound risk, `workflow-engine` automatically caps each batch at `maxRequestsPerBatch` (default: 500).
+- **No cancel or list endpoint:** OpenRouter batch API does not support cancelling in-flight batches or listing batches.
+- **No idempotency key:** POST submissions are not auto-retried on network failures.
+- **Schema partitioning:** Google models require every request in a batch to share the same response schema. `batch.submit()` automatically partitions requests by `(endpoint, modelId, schema)` to satisfy this constraint.
 
 ## Polling Configuration
 
@@ -421,7 +478,7 @@ pollConfig: {
 
 **As of v0.11, `maxWaitTime` is actually enforced** -- before v0.11 it was accepted but silently ignored, so a suspended stage would poll forever regardless of the value you set. If any of your stages relied on that (an implicit "poll forever"), they will now time out and fail once `maxWaitTime` elapses; audit values that were set low "because it didn't matter."
 
-The manual check below inside `checkCompletion` is now belt-and-suspenders (useful for provider-side cancellation) rather than the only enforcement:
+The manual check below inside `checkCompletion` is now belt-and-suspenders rather than the only enforcement (note: OpenRouter batch does not support remote cancellation):
 
 ```typescript
 // In checkCompletion, check for timeout
@@ -429,9 +486,6 @@ const startTime = new Date(state.submittedAt).getTime();
 const elapsed = Date.now() - startTime;
 
 if (elapsed > state.maxWaitTime) {
-  // Cancel batch if possible
-  await cancelBatch(state.batchId);
-
   return {
     ready: false,
     error: `Batch timeout after ${elapsed}ms`,

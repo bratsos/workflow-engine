@@ -15,7 +15,7 @@ slug: /
 Unlike general-purpose workflow orchestrators, **workflow-engine** is tailored specifically for the ergonomics and economics of modern AI applications:
 
 ### 1. Batch-API Economics with Suspend/Resume
-AI LLM provider batch APIs (like OpenAI Batch or Google Batch) offer a **50% discount** compared to standard synchronous calls, but they run asynchronously and can take hours or days to complete. 
+AI LLM provider batch APIs (like Google Batch, Anthropic Batch, OpenAI Batch, or OpenRouter Batch) offer substantial discounts compared to standard synchronous calls, but they run asynchronously and can take hours or days to complete. 
 * **workflow-engine** natively supports workflow suspension and resumption. 
 * When a stage triggers an LLM batch, the engine releases the execution lease and suspends the workflow.
 * A background cron checks completion status and resumes the workflow where it left off, allowing you to build reliable, ultra-low-cost AI pipelines.

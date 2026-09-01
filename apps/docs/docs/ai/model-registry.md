@@ -20,12 +20,17 @@ registerModels({
   "custom-llama-3": {
     id: "meta-llama/llama-3-8b-instruct", // Provider ID (OpenRouter / Gemini)
     name: "Llama 3 8B",
-    provider: "openrouter", // "openrouter" or "google"
+    provider: "openrouter",
     inputCostPerMillion: 0.2, // USD per 1M input tokens
     outputCostPerMillion: 0.4, // USD per 1M output tokens
     contextLength: 8192,
     maxCompletionTokens: 2048,
-    capabilities: ["text"],
+    supportsTools: true,
+    supportsStructuredOutputs: true,
+    supportsAsyncBatch: true,
+    batchModelId: "meta-llama/llama-3-8b-instruct:batch",
+    batchInputCostPerMillion: 0.1,
+    batchOutputCostPerMillion: 0.2,
   },
   "custom-voyage-embed": {
     id: "voyage-large-2-instruct",
@@ -71,7 +76,7 @@ Create a configuration file in your project root named `workflow-engine.models.t
 
 ```typescript
 // workflow-engine.models.ts
-import { type ModelSyncConfig } from "@bratsos/workflow-engine/client";
+import { type ModelSyncConfig } from "@bratsos/workflow-engine";
 
 const config: ModelSyncConfig = {
   outputPath: "src/generated/models.ts",
@@ -99,9 +104,13 @@ export default config;
 ```
 
 ### 2. Execution
-Run the sync command. It requires an OpenRouter API key in the environment:
+Run the sync command. The OpenRouter catalog endpoint is public, so no API key is required (an optional `OPENROUTER_API_KEY` will be sent if present):
 
 ```bash
+# Run unauthenticated (default)
+npx workflow-engine-sync
+
+# Or optionally with your API key
 export OPENROUTER_API_KEY="your-openrouter-key"
 npx workflow-engine-sync
 ```

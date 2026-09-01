@@ -54,18 +54,17 @@ Install the host package that matches your operational environment:
 
 ## Optional Peer Dependencies
 
-If your workflows leverage AI models, you should install the SDKs of the providers you plan to use:
+If your workflows leverage AI models with Anthropic or OpenAI, install the corresponding AI SDK provider packages:
 
 ```bash
-# For Google Gemini
-npm install @google/genai
+# For Anthropic Claude (native or batch)
+npm install @ai-sdk/anthropic
 
-# For OpenAI Models
-npm install openai
-
-# For Anthropic Claude
-npm install @anthropic-ai/sdk
+# For OpenAI Models (native or batch)
+npm install @ai-sdk/openai
 
 # For Prisma-based database persistence (recommended)
 npm install @prisma/client
 ```
+
+> **Note:** `@ai-sdk/google` is included as a direct dependency of `@bratsos/workflow-engine`. OpenRouter models and batch processing communicate via direct HTTP transport and require no additional SDK.

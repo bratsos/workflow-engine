@@ -22,33 +22,69 @@ import { MockEmbeddingModelV4, MockLanguageModelV4 } from "ai/test";
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 
-// Mock optional peer dependencies that ai-helper.ts transitively imports via
-// the batch providers, so they can be constructed without real credentials.
-vi.mock("@anthropic-ai/sdk", () => ({ Anthropic: class {} }));
-vi.mock("openai", () => ({ default: class {} }));
+const { mockBatchModel, mockBatchResults, mockStart, mockStatus } = vi.hoisted(
+  () => {
+    const mockBatchResults: Array<{
+      id: string;
+      status: "succeeded" | "failed";
+      text?: string;
+      error?: string;
+      inputTokens?: number;
+      outputTokens?: number;
+    }> = [];
 
-const { googleGetResultsMock, googleSubmitMock, googleCheckStatusMock } =
-  vi.hoisted(() => ({
-    googleGetResultsMock: vi.fn(),
-    googleSubmitMock: vi.fn(async (requests: Array<{ id: string }>) => ({
+    const mockStart = vi.fn(async (requests: Array<{ id: string }>) => ({
+      version: 1 as const,
+      type: "text" as const,
       id: "google-batch-1",
-      provider: "google",
-      requestCount: requests.length,
-      createdAt: new Date(),
-    })),
-    googleCheckStatusMock: vi.fn(async () => ({
-      state: "completed",
-      processedCount: 1,
-      totalCount: 1,
-    })),
-  }));
+      provider: "google.generative-ai",
+      modelId: "gemini-2.5-flash",
+      status: "pending" as const,
+    }));
 
-vi.mock("../../utils/batch/providers/google-batch.js", () => ({
-  GoogleBatchProvider: class {
-    submit = googleSubmitMock;
-    checkStatus = googleCheckStatusMock;
-    getResults = googleGetResultsMock;
+    const mockStatus = vi.fn(async () => ({
+      status: "completed" as const,
+    }));
+
+    const mockResults = vi.fn(async function* () {
+      for (const item of mockBatchResults) {
+        if (item.status === "succeeded") {
+          yield {
+            id: item.id,
+            status: "succeeded" as const,
+            text: item.text ?? "",
+            inputTokens: item.inputTokens ?? 5,
+            outputTokens: item.outputTokens ?? 5,
+          };
+        } else {
+          yield {
+            id: item.id,
+            status: "failed" as const,
+            error: item.error,
+            inputTokens: item.inputTokens ?? 0,
+            outputTokens: item.outputTokens ?? 0,
+          };
+        }
+      }
+    });
+
+    return {
+      mockBatchResults,
+      mockStart,
+      mockStatus,
+      mockBatchModel: {
+        provider: "google.generative-ai",
+        modelId: "gemini-2.5-flash",
+        start: mockStart,
+        status: mockStatus,
+        results: mockResults,
+      },
+    };
   },
+);
+
+vi.mock("../../ai/batch/ai-sdk.js", () => ({
+  resolveAiSdkBatchModel: vi.fn(async () => mockBatchModel),
 }));
 
 import {
@@ -102,14 +138,17 @@ describe("tool-call cost is not double counted", () => {
                 input: JSON.stringify({ location: "Tokyo" }),
               },
             ],
-            finishReason: "tool-calls",
+            // LanguageModelV4 finish reasons are objects, not bare strings.
+            // A bare string makes `finishReason.unified` undefined, which makes
+            // the SDK skip tool execution entirely and exit the step loop.
+            finishReason: { unified: "tool-calls", raw: "tool_calls" },
             usage: USAGE,
             warnings: [],
           } as any;
         }
         return {
           content: [{ type: "text", text: "It is sunny in Tokyo." }],
-          finishReason: "stop",
+          finishReason: { unified: "stop", raw: "stop" },
           usage: USAGE,
           warnings: [],
         } as any;
@@ -167,7 +206,11 @@ describe("streamed calls are always logged once", () => {
               { type: "text-delta", id: "t1", delta: "Hello " },
               { type: "text-delta", id: "t1", delta: "world." },
               { type: "text-end", id: "t1" },
-              { type: "finish", finishReason: "stop", usage: USAGE },
+              {
+                type: "finish",
+                finishReason: { unified: "stop", raw: "stop" },
+                usage: USAGE,
+              },
             ] as any,
           }),
         };
@@ -323,29 +366,30 @@ describe("embed() uses embedMany() for multi-text input", () => {
 
 describe("batch getResults() validates structured output against the schema", () => {
   it("validates, rejects malformed JSON, and rejects schema mismatches instead of trusting the model blindly", async () => {
-    googleGetResultsMock.mockResolvedValue([
+    mockBatchResults.length = 0;
+    mockBatchResults.push(
       {
-        index: 0,
-        customId: "valid",
+        id: "valid",
+        status: "succeeded",
         text: JSON.stringify({ name: "Alice", age: 30 }),
         inputTokens: 5,
         outputTokens: 5,
       },
       {
-        index: 1,
-        customId: "wrong-shape",
+        id: "wrong-shape",
+        status: "succeeded",
         text: JSON.stringify({ name: "Bob" }), // missing required `age`
         inputTokens: 5,
         outputTokens: 5,
       },
       {
-        index: 2,
-        customId: "not-json",
+        id: "not-json",
+        status: "succeeded",
         text: "this is definitely not json",
         inputTokens: 5,
         outputTokens: 5,
       },
-    ]);
+    );
 
     const { logger } = makeLogger();
     const ai = createAIHelper("t", logger as any);
@@ -366,29 +410,28 @@ describe("batch getResults() validates structured output against the schema", ()
     const valid = results.find((r) => r.id === "valid")!;
     expect(valid.status).toBe("succeeded");
     expect(valid.result).toEqual({ name: "Alice", age: 30 });
+    expect(valid.validated).toBe(true);
 
     const wrongShape = results.find((r) => r.id === "wrong-shape")!;
     expect(wrongShape.status).toBe("failed");
     expect(wrongShape.result).toBeUndefined();
     expect(wrongShape.error).toBeTruthy();
+    expect(wrongShape.validated).toBe(false);
 
     const notJson = results.find((r) => r.id === "not-json")!;
     expect(notJson.status).toBe("failed");
     expect(notJson.result).toBeUndefined();
     expect(notJson.error).toBeTruthy();
+    expect(notJson.validated).toBe(false);
   });
 
   it("does not fabricate a {} result for provider-level failures", async () => {
-    googleGetResultsMock.mockResolvedValue([
-      {
-        index: 0,
-        customId: "provider-error",
-        text: "",
-        inputTokens: 0,
-        outputTokens: 0,
-        error: "Rate limit exceeded",
-      },
-    ]);
+    mockBatchResults.length = 0;
+    mockBatchResults.push({
+      id: "provider-error",
+      status: "failed",
+      error: "Rate limit exceeded",
+    });
 
     const { logger } = makeLogger();
     const ai = createAIHelper("t", logger as any);
@@ -400,18 +443,18 @@ describe("batch getResults() validates structured output against the schema", ()
     expect(results[0]?.status).toBe("failed");
     expect(results[0]?.result).toBeUndefined();
     expect(results[0]?.error).toBe("Rate limit exceeded");
+    expect(results[0]?.validated).toBe(false);
   });
 
   it("falls back to unvalidated parsing when no schema was supplied at submit time", async () => {
-    googleGetResultsMock.mockResolvedValue([
-      {
-        index: 0,
-        customId: "no-schema",
-        text: JSON.stringify({ anything: "goes" }),
-        inputTokens: 1,
-        outputTokens: 1,
-      },
-    ]);
+    mockBatchResults.length = 0;
+    mockBatchResults.push({
+      id: "no-schema",
+      status: "succeeded",
+      text: JSON.stringify({ anything: "goes" }),
+      inputTokens: 1,
+      outputTokens: 1,
+    });
 
     const { logger } = makeLogger();
     const ai = createAIHelper("t", logger as any);
@@ -421,5 +464,6 @@ describe("batch getResults() validates structured output against the schema", ()
     const results = await batch.getResults(handle.id);
     expect(results[0]?.status).toBe("succeeded");
     expect(results[0]?.result).toEqual({ anything: "goes" });
+    expect(results[0]?.validated).toBe(false);
   });
 });

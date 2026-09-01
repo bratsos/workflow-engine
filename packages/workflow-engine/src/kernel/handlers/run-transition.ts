@@ -28,7 +28,11 @@ const TERMINAL_STATUSES = new Set(["COMPLETED", "FAILED", "CANCELLED"]);
 // dropped-transition heal, which must apply the same definition of "active".
 // ---------------------------------------------------------------------------
 
-export const ACTIVE_STAGE_STATUSES = new Set(["RUNNING", "PENDING", "SUSPENDED"]);
+export const ACTIVE_STAGE_STATUSES = new Set([
+  "RUNNING",
+  "PENDING",
+  "SUSPENDED",
+]);
 
 const ACTIVE_STATUSES = ACTIVE_STAGE_STATUSES;
 

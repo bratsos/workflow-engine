@@ -4,9 +4,11 @@
  * Tests for the batch functionality of AIHelper.
  */
 
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
-import type { ModelKey } from "../../ai/model-helper.js";
+import { createAIHelper } from "../../ai/ai-helper.js";
+import { AIBatchImpl } from "../../ai/batch-helper.js";
+import { type ModelKey, registerModels } from "../../ai/model-helper.js";
 import {
   createMockAIHelper,
   MockAIBatch,
@@ -51,11 +53,13 @@ describe("I want to process AI requests in batches", () => {
         "anthropic",
       );
       const openaiBatch = ai.batch("gpt-4o" as ModelKey, "openai");
+      const openrouterBatch = ai.batch("gemini-2.5-flash", "openrouter");
 
       // Then: All batches are created
       expect(googleBatch).toBeDefined();
       expect(anthropicBatch).toBeDefined();
       expect(openaiBatch).toBeDefined();
+      expect(openrouterBatch).toBeDefined();
     });
   });
 
@@ -519,5 +523,245 @@ describe("I want to process AI requests in batches", () => {
       // Then: Error would be in metadata (implementation specific)
       expect(await batch.isRecorded(batchId)).toBe(true);
     });
+  });
+});
+
+describe("AIBatchImpl and AIHelper batch wiring", () => {
+  function makeFakeAICallLogger() {
+    const loggedBatchResults: Array<{ batchId: string; records: any[] }> = [];
+    return {
+      logger: {
+        logCall: vi.fn(),
+        getStats: vi.fn().mockResolvedValue({
+          totalCalls: 0,
+          totalInputTokens: 0,
+          totalOutputTokens: 0,
+          totalCost: 0,
+          perModel: {},
+        }),
+        isRecorded: vi.fn().mockResolvedValue(false),
+        logBatchResults: vi.fn(async (batchId: string, records: any[]) => {
+          loggedBatchResults.push({ batchId, records });
+        }),
+        getCalls: vi.fn().mockResolvedValue([]),
+      },
+      loggedBatchResults,
+    };
+  }
+
+  it("P6a: throws an actionable error when model has no batch-capable provider", () => {
+    registerModels({
+      "test-no-batch-model": {
+        id: "custom/no-batch-model",
+        name: "No Batch Model",
+        inputCostPerMillion: 1,
+        outputCostPerMillion: 2,
+        supportsAsyncBatch: false,
+        provider: "custom",
+      },
+    });
+
+    const { logger } = makeFakeAICallLogger();
+    const ai = createAIHelper("test", logger as any);
+
+    expect(() => ai.batch("test-no-batch-model" as any)).toThrowError(
+      /No known batch-capable provider found for model "test-no-batch-model"/,
+    );
+  });
+
+  it("P8 & P9: partitions by schema and respects maxRequestsPerBatch", async () => {
+    const startCalls: any[] = [];
+    const mockBatchModel = {
+      provider: "mock-openrouter",
+      modelId: "openai/gpt-4o",
+      start: vi.fn(async (requests: any[]) => {
+        startCalls.push(requests);
+        return {
+          version: 1 as const,
+          type: "text" as const,
+          id: `batch-${startCalls.length}`,
+          provider: "mock-openrouter",
+          modelId: "openai/gpt-4o",
+          status: "pending" as const,
+        };
+      }),
+      status: vi.fn(async () => ({ status: "completed" as const })),
+      results: vi.fn(async function* () {}),
+    };
+
+    const { logger } = makeFakeAICallLogger();
+    const ctx = {
+      topic: "test",
+      aiCallLogger: logger as any,
+    };
+
+    const schemaA = z.object({ a: z.string() });
+    const schemaB = z.object({ b: z.number() });
+
+    const batch = new AIBatchImpl(
+      ctx,
+      "gemini-2.5-flash",
+      "openrouter",
+      undefined,
+      {
+        apiKey: "test-key",
+        maxRequestsPerBatch: 2,
+      },
+    );
+
+    (batch as any).providerPromise = Promise.resolve(mockBatchModel);
+
+    // 3 requests with schemaA, 1 with schemaB, 1 without schema
+    const handle = await batch.submit([
+      { id: "a1", prompt: "p1", schema: schemaA },
+      { id: "a2", prompt: "p2", schema: schemaA },
+      { id: "a3", prompt: "p3", schema: schemaA },
+      { id: "b1", prompt: "p4", schema: schemaB },
+      { id: "c1", prompt: "p5" },
+    ]);
+
+    // schemaA has 3 requests -> chunked into [2, 1] due to maxRequestsPerBatch = 2
+    // schemaB has 1 request -> [1]
+    // none has 1 request -> [1]
+    // Total partitions: 4
+    expect(startCalls.length).toBe(4);
+    expect(handle.batchIds).toEqual([
+      "batch-1",
+      "batch-2",
+      "batch-3",
+      "batch-4",
+    ]);
+    expect(handle.id).toBe("batch-1");
+    expect(handle.refs?.length).toBe(4);
+  });
+
+  it("P9: throws when number of partitions exceeds maxPartitions", async () => {
+    const mockBatchModel = {
+      provider: "mock",
+      modelId: "m",
+      start: vi.fn(),
+      status: vi.fn(),
+      results: vi.fn(),
+    };
+
+    const { logger } = makeFakeAICallLogger();
+    const ctx = { topic: "test", aiCallLogger: logger as any };
+
+    const batch = new AIBatchImpl(
+      ctx,
+      "gemini-2.5-flash",
+      "openrouter",
+      undefined,
+      {
+        apiKey: "test-key",
+        maxRequestsPerBatch: 1,
+        maxPartitions: 2,
+      },
+    );
+    (batch as any).providerPromise = Promise.resolve(mockBatchModel);
+
+    await expect(
+      batch.submit([
+        { id: "r1", prompt: "p1" },
+        { id: "r2", prompt: "p2" },
+        { id: "r3", prompt: "p3" },
+      ]),
+    ).rejects.toThrowError(
+      /Batch submission produced 3 partitions, exceeding the maximum allowed limit of 2/,
+    );
+  });
+
+  it("P6e: rejects missing custom ID with failed result", async () => {
+    const mockBatchModel = {
+      provider: "mock",
+      modelId: "m",
+      start: vi.fn(),
+      status: vi.fn(),
+      results: vi.fn(async function* () {
+        yield {
+          id: "",
+          status: "succeeded" as const,
+          text: "output",
+          inputTokens: 5,
+          outputTokens: 5,
+        };
+      }),
+    };
+
+    const { logger } = makeFakeAICallLogger();
+    const ctx = { topic: "test", aiCallLogger: logger as any };
+    const batch = new AIBatchImpl(ctx, "gemini-2.5-flash", "openrouter");
+    (batch as any).providerPromise = Promise.resolve(mockBatchModel);
+
+    const results = await batch.getResults("batch-test");
+    expect(results.length).toBe(1);
+    expect(results[0]?.status).toBe("failed");
+    expect(results[0]?.error).toContain("Missing or empty custom ID");
+    expect(results[0]?.validated).toBe(false);
+  });
+
+  it("Fan-in: getStatus aggregates status across multiple batch refs", async () => {
+    const mockBatchModel = {
+      provider: "mock",
+      modelId: "m",
+      start: vi.fn(),
+      status: vi.fn(async (ref: { id: string }) => {
+        if (ref.id === "b1") {
+          return {
+            status: "completed" as const,
+            requestCounts: { total: 2, completed: 2, failed: 0, pending: 0 },
+          };
+        }
+        return {
+          status: "processing" as const,
+          requestCounts: { total: 2, completed: 1, failed: 0, pending: 1 },
+        };
+      }),
+      results: vi.fn(),
+    };
+
+    const { logger } = makeFakeAICallLogger();
+    const ctx = { topic: "test", aiCallLogger: logger as any };
+    const batch = new AIBatchImpl(ctx, "gemini-2.5-flash", "openrouter");
+    (batch as any).providerPromise = Promise.resolve(mockBatchModel);
+
+    (batch as any).refsByBatch.set("b1", [
+      { version: 1, type: "text", id: "b1", provider: "mock", modelId: "m" },
+      { version: 1, type: "text", id: "b2", provider: "mock", modelId: "m" },
+    ]);
+
+    const status = await batch.getStatus("b1");
+    expect(status.status).toBe("processing");
+    expect(status.requestCounts).toEqual({
+      total: 4,
+      completed: 3,
+      failed: 0,
+    });
+  });
+
+  it("isRecorded and recordResults work without provider credentials", async () => {
+    const { logger, loggedBatchResults } = makeFakeAICallLogger();
+    const ctx = { topic: "test-topic", aiCallLogger: logger as any };
+
+    // No API key provided!
+    const batch = new AIBatchImpl(ctx, "gemini-2.5-flash", "openrouter");
+
+    expect(await batch.isRecorded("b123")).toBe(false);
+
+    await batch.recordResults("b123", [
+      {
+        id: "r1",
+        prompt: "hello",
+        result: "world",
+        inputTokens: 100,
+        outputTokens: 200,
+        status: "succeeded",
+        validated: true,
+      },
+    ]);
+
+    expect(loggedBatchResults.length).toBe(1);
+    expect(loggedBatchResults[0]?.batchId).toBe("b123");
+    expect(loggedBatchResults[0]?.records[0]?.cost).toBeGreaterThan(0);
   });
 });

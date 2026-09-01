@@ -20,6 +20,7 @@ import type {
   AIObjectResult,
   AIStreamResult,
   AITextResult,
+  BatchOptions,
   EmbedOptions,
   ObjectOptions,
   RecordCallParams,
@@ -320,6 +321,7 @@ export class MockAIHelper implements AIHelper {
   batch<T = string>(
     modelKey: ModelKey,
     _provider?: AIBatchProvider,
+    _options?: BatchOptions,
   ): AIBatch<T> {
     return new MockAIBatch<T>(this, modelKey);
   }

@@ -59,18 +59,17 @@ A **type-safe, distributed workflow engine** for AI-orchestrated processes. Feat
 ### Optional Peer Dependencies
 
 ```bash
-# For Google AI
-npm install @google/genai
+# For Anthropic Claude (native or batch)
+npm install @ai-sdk/anthropic
 
-# For OpenAI
-npm install openai
-
-# For Anthropic
-npm install @anthropic-ai/sdk
+# For OpenAI Models (native or batch)
+npm install @ai-sdk/openai
 
 # For Prisma persistence (recommended)
 npm install @prisma/client
 ```
+
+> `@ai-sdk/google` is included as a direct dependency of `@bratsos/workflow-engine`. OpenRouter models and batch processing run via direct HTTP transport without extra vendor SDKs.
 
 ---
 
@@ -451,7 +450,7 @@ A stage is the atomic unit of work. Every stage has typed input, output, and con
 | Mode | Use Case |
 |------|----------|
 | `sync` (default) | Most stages - execute and return immediately |
-| `async-batch` | Long-running batch APIs (OpenAI Batch, Google Batch, etc.) |
+| `async-batch` | Long-running batch APIs (AI SDK batch for Google/Anthropic/OpenAI, or OpenRouter Batch) |
 
 ### Workflows
 
@@ -637,7 +636,7 @@ const { text, reasoning } = await ai.generateText("anthropic/claude-opus-4.8", p
 ### Long-Running Batch Jobs
 
 ```typescript
-import { defineAsyncBatchStage } from "@bratsos/workflow-engine";
+import { defineAsyncBatchStage, createAIHelper } from "@bratsos/workflow-engine";
 
 export const batchStage = defineAsyncBatchStage({
   id: "batch-process",
@@ -647,29 +646,39 @@ export const batchStage = defineAsyncBatchStage({
 
   async execute(ctx) {
     if (ctx.resumeState) {
-      return { output: await fetchBatchResults(ctx.resumeState.batchId) };
+      const cached = await ctx.storage.load("batch-result");
+      if (cached) return { output: cached };
     }
 
-    const batch = await submitBatch(ctx.input.prompts);
+    const ai = createAIHelper(`batch.${ctx.workflowRunId}`, aiCallLogger);
+    const batch = ai.batch(ctx.config.model, "google");
+    const handle = await batch.submit(
+      ctx.input.prompts.map((p, i) => ({ id: `req-${i}`, prompt: p }))
+    );
+
     return {
       suspended: true,
       state: {
-        batchId: batch.id,
+        batchId: handle.id,
         submittedAt: new Date().toISOString(),
         pollInterval: 3600000,
         maxWaitTime: 86400000,
+        metadata: { batchRefs: handle.refs },
       },
       pollConfig: { pollInterval: 3600000, maxWaitTime: 86400000, nextPollAt: new Date(Date.now() + 3600000) },
     };
   },
 
-  async checkCompletion(state) {
-    const status = await checkBatchStatus(state.batchId);
-    if (status === "completed") {
-      const output = await fetchBatchResults(state.batchId);
+  async checkCompletion(state, ctx) {
+    const ai = createAIHelper(`batch.${ctx.workflowRunId}`, aiCallLogger);
+    const batch = ai.batch(ctx.config?.model ?? "gemini-2.5-flash", "google");
+    const status = await batch.getStatus(state.batchId);
+    if (status.status === "completed") {
+      const results = await batch.getResults(state.batchId, state.metadata);
+      const output = { results: results.map(r => r.result) };
       return { ready: true, output };
     }
-    if (status === "failed") return { ready: false, error: "Batch failed" };
+    if (status.status === "failed") return { ready: false, error: "Batch failed" };
     return { ready: false };
   },
 });

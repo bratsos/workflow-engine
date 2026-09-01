@@ -235,6 +235,8 @@ export interface AICallRecord {
   inputTokens: number;
   outputTokens: number;
   cost: number;
+  reportedCost?: number;
+  costSource?: string;
   metadata: unknown | null;
 }
 
@@ -402,6 +404,8 @@ export interface CreateAICallInput {
   inputTokens: number;
   outputTokens: number;
   cost: number;
+  reportedCost?: number;
+  costSource?: string;
   metadata?: unknown;
 }
 

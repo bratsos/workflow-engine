@@ -24,9 +24,12 @@ export default defineConfig({
   external: [
     // Peer dependencies - don't bundle these
     "@prisma/client",
-    "@anthropic-ai/sdk",
-    "@google/genai",
-    "openai",
+    // Optional peers carrying the AI SDK batch transports. They are only ever
+    // reached through `await import(...)` in src/ai/batch/ai-sdk.ts, which is
+    // what keeps them out of the client entry's eager graph — see
+    // scripts/check-client-isolation.mjs for the guard that enforces it.
+    "@ai-sdk/anthropic",
+    "@ai-sdk/openai",
     // Only referenced by src/testing/persistence-conformance.ts (the
     // exported conformance suite factories). Left external so the main
     // "./testing" bundle doesn't drag vitest's runtime into every

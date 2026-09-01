@@ -19,6 +19,11 @@ import {
   modelSupportsBatch,
   registerModels,
 } from "../../ai/model-helper.js";
+import {
+  calculateBatchCost,
+  calculateCostWithDiscount,
+  getModelProvider,
+} from "../../ai/shared.js";
 
 describe("I want to use model helper utilities", () => {
   describe("getModel", () => {
@@ -320,6 +325,145 @@ describe("I want to use model helper utilities", () => {
     it("should be gemini-2.5-flash", () => {
       // Then: Default is correct
       expect(DEFAULT_MODEL_KEY).toBe("gemini-2.5-flash");
+    });
+  });
+
+  describe("calculateBatchCost and calculateCostWithDiscount", () => {
+    it("should calculate batch cost using absolute batch prices when available", () => {
+      const modelWithBatchPrices: ModelConfig = {
+        id: "anthropic/claude-sonnet-4.5",
+        name: "Claude Sonnet 4.5",
+        inputCostPerMillion: 3,
+        outputCostPerMillion: 15,
+        provider: "openrouter",
+        supportsAsyncBatch: true,
+        batchModelId: "anthropic/claude-sonnet-4.5:batch",
+        batchInputCostPerMillion: 1.5,
+        batchOutputCostPerMillion: 7.5,
+      };
+
+      // 1M input, 1M output with batch prices: 1.5 + 7.5 = 9.0
+      const cost = calculateBatchCost(
+        modelWithBatchPrices,
+        1_000_000,
+        1_000_000,
+      );
+      expect(cost).toBeCloseTo(9.0, 4);
+    });
+
+    it("should not apply batchDiscountPercent when absolute batch prices are present (avoid double discount)", () => {
+      const modelWithBoth: ModelConfig = {
+        id: "test/model",
+        name: "Test Model",
+        inputCostPerMillion: 10,
+        outputCostPerMillion: 20,
+        provider: "openrouter",
+        supportsAsyncBatch: true,
+        batchDiscountPercent: 50,
+        batchInputCostPerMillion: 2.5, // non-standard discount
+        batchOutputCostPerMillion: 5.0,
+      };
+
+      // 1M input, 1M output: 2.5 + 5.0 = 7.5 (NOT halved again to 3.75)
+      const cost = calculateBatchCost(modelWithBoth, 1_000_000, 1_000_000);
+      expect(cost).toBeCloseTo(7.5, 4);
+    });
+
+    it("should fall back to batchDiscountPercent when absolute batch prices are not set", () => {
+      const modelWithPercentOnly: ModelConfig = {
+        id: "google/gemini-2.5-flash",
+        name: "Gemini 2.5 Flash",
+        inputCostPerMillion: 0.3,
+        outputCostPerMillion: 2.5,
+        provider: "openrouter",
+        supportsAsyncBatch: true,
+        batchDiscountPercent: 50,
+      };
+
+      // 1M input ($0.30) + 1M output ($2.50) = $2.80 base; 50% off = $1.40
+      const cost = calculateBatchCost(
+        modelWithPercentOnly,
+        1_000_000,
+        1_000_000,
+      );
+      expect(cost).toBeCloseTo(1.4, 4);
+    });
+
+    it("should return undiscounted base cost when neither batch prices nor discount percent is set", () => {
+      const regularModel: ModelConfig = {
+        id: "some/model",
+        name: "Some Model",
+        inputCostPerMillion: 1.0,
+        outputCostPerMillion: 2.0,
+        provider: "openrouter",
+      };
+
+      const cost = calculateBatchCost(regularModel, 1_000_000, 1_000_000);
+      expect(cost).toBeCloseTo(3.0, 4);
+    });
+
+    it("calculateCostWithDiscount should respect isBatch flag", () => {
+      registerModels({
+        "batch-pricing-test-model": {
+          id: "test/batch-pricing",
+          name: "Test Batch Pricing",
+          inputCostPerMillion: 4,
+          outputCostPerMillion: 10,
+          provider: "openrouter",
+          batchInputCostPerMillion: 1,
+          batchOutputCostPerMillion: 2,
+        },
+      });
+
+      // Non-batch call
+      const regularCost = calculateCostWithDiscount(
+        "batch-pricing-test-model" as any,
+        1_000_000,
+        1_000_000,
+        false,
+      );
+      expect(regularCost).toBeCloseTo(14, 4);
+
+      // Batch call
+      const batchCost = calculateCostWithDiscount(
+        "batch-pricing-test-model" as any,
+        1_000_000,
+        1_000_000,
+        true,
+      );
+      expect(batchCost).toBeCloseTo(3, 4);
+    });
+  });
+
+  describe("getModelProvider OpenRouter routing options", () => {
+    it("should create provider with default routing options", () => {
+      const model: ModelConfig = {
+        id: "anthropic/claude-sonnet-4",
+        name: "Claude Sonnet 4",
+        inputCostPerMillion: 3,
+        outputCostPerMillion: 15,
+        provider: "openrouter",
+      };
+
+      const provider = getModelProvider(model);
+      expect(provider).toBeDefined();
+    });
+
+    it("should support custom routing options", () => {
+      const model: ModelConfig = {
+        id: "anthropic/claude-sonnet-4",
+        name: "Claude Sonnet 4",
+        inputCostPerMillion: 3,
+        outputCostPerMillion: 15,
+        provider: "openrouter",
+      };
+
+      const providerWithZeroHeadroom = getModelProvider(model, {
+        priceHeadroom: 0,
+        sort: "price",
+        requireParameters: false,
+      });
+      expect(providerWithZeroHeadroom).toBeDefined();
     });
   });
 });

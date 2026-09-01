@@ -1,22 +1,22 @@
 /**
  * AI Helper - Batch Implementation
  *
- * AIBatch<T> on top of the low-level provider classes in utils/batch/providers.
+ * AIBatch<T> implementation talking only to EngineBatchModel from ./batch/model.
  */
 
 import { z } from "zod";
-import { AnthropicBatchProvider } from "../utils/batch/providers/anthropic-batch";
-import { GoogleBatchProvider } from "../utils/batch/providers/google-batch";
-import { OpenAIBatchProvider } from "../utils/batch/providers/openai-batch";
-import type {
-  BaseBatchRequest,
-  BatchHandle,
-  BatchLogger,
-  BatchProvider,
-  RawBatchResult,
-} from "../utils/batch/types";
-import { calculateCost, getModel, type ModelKey } from "./model-helper";
-import { logger } from "./shared";
+import { resolveModelForProvider } from "../utils/batch/model-mapping";
+import { resolveAiSdkBatchModel } from "./batch/ai-sdk";
+import {
+  type EngineBatchItemResult,
+  type EngineBatchModel,
+  type EngineBatchRef,
+  EngineBatchRefSchema,
+  type EngineBatchRequest,
+} from "./batch/model";
+import { createOpenRouterBatchModel } from "./batch/openrouter";
+import { getModel, type ModelKey } from "./model-helper";
+import { calculateCostWithDiscount, logger } from "./shared";
 import type {
   AIBatch,
   AIBatchHandle,
@@ -25,86 +25,216 @@ import type {
   AIBatchResult,
   AIHelperContext,
   BatchLogFn,
+  BatchOptions,
 } from "./types";
 
-/**
- * Build a system prompt that communicates the exact expected output shape
- * to the model via its JSON Schema, rather than a vague "respond with JSON"
- * instruction. Used for batch providers (Anthropic, OpenAI) that don't have
- * native structured-output support in their batch APIs.
- */
-function buildJsonSchemaSystemPrompt(schema: z.ZodTypeAny): string {
-  const jsonSchema = z.toJSONSchema(schema);
-  return (
-    "You must respond with valid JSON only that conforms exactly to the " +
-    "following JSON Schema. No markdown, no explanation, just the JSON object.\n\n" +
-    `JSON Schema:\n${JSON.stringify(jsonSchema)}`
-  );
+function resolveCustomId(item: EngineBatchItemResult): string | null {
+  if (item.id && typeof item.id === "string" && item.id.trim().length > 0) {
+    return item.id;
+  }
+  return null;
 }
 
 export class AIBatchImpl<T = string> implements AIBatch<T> {
-  private readonly batchProvider: BatchProvider<
-    BaseBatchRequest,
-    RawBatchResult
-  >;
+  private providerPromise?: Promise<EngineBatchModel>;
 
   /**
-   * Schemas keyed by batchId -> customId, populated at submit() time so
-   * getResults() can validate responses against them. This only survives
-   * for the lifetime of this AIBatchImpl instance (i.e. the same process) -
-   * a fresh instance created after a workflow suspend/resume won't have it.
-   * Callers that need validation across a resume can re-supply schemas via
-   * getResults(batchId, { schemas }).
+   * Schemas keyed by batchId -> requestId, populated at submit() time.
    */
   private schemasByBatch = new Map<string, Map<string, z.ZodTypeAny>>();
 
-  /** Request counts keyed by batchId, populated at submit() time. */
+  /** Request counts keyed by batchId. */
   private requestCountsByBatch = new Map<string, number>();
+
+  /** Refs keyed by primary batchId, for fan-in in the same process. */
+  private refsByBatch = new Map<string, EngineBatchRef[]>();
+
+  /** In-flight recording promises by batchId to prevent check-then-act races. */
+  private recordingPromises = new Map<string, Promise<void>>();
+
+  /** Recorded batch IDs to prevent duplicate recording. */
+  private recordedBatchIds = new Set<string>();
 
   constructor(
     private ctx: AIHelperContext,
     private modelKey: ModelKey,
     private provider: AIBatchProvider,
     private batchLogFn?: BatchLogFn,
-  ) {
-    // Create a logger adapter for batch providers
-    // Uses provided log function (for persistence) or falls back to console
-    const batchLogger: BatchLogger = {
-      log: (
-        level: "DEBUG" | "INFO" | "WARN" | "ERROR",
-        message: string,
-        meta?: Record<string, unknown>,
-      ) => {
-        if (this.batchLogFn) {
-          this.batchLogFn(level, `[Batch:${provider}] ${message}`, meta);
-        } else {
-          logger.debug(
-            `[Batch:${provider}] [${level}] ${message}`,
-            meta ? JSON.stringify(meta) : "",
+    private options?: BatchOptions,
+  ) {}
+
+  /**
+   * Lazy memoized backend resolution. Never runs in the constructor.
+   */
+  private async provider$(): Promise<EngineBatchModel> {
+    return (this.providerPromise ??= (async () => {
+      if (
+        this.provider === "google" ||
+        this.provider === "anthropic" ||
+        this.provider === "openai"
+      ) {
+        const nativeModelId = resolveModelForProvider(
+          this.modelKey,
+          this.provider,
+        );
+        return resolveAiSdkBatchModel(this.provider, nativeModelId);
+      }
+
+      if (this.provider === "openrouter") {
+        const modelConfig = getModel(this.modelKey);
+        const apiKey =
+          this.options?.apiKey ??
+          (typeof process !== "undefined"
+            ? process.env?.OPENROUTER_API_KEY
+            : undefined);
+
+        if (!apiKey) {
+          throw new Error(
+            `OpenRouter batch processing requires an API key. ` +
+              `Pass apiKey in BatchOptions or set the OPENROUTER_API_KEY environment variable.`,
           );
         }
-      },
-    };
 
-    // Resolve the concrete provider once; submit/getStatus/getResults all
-    // dispatch through this single field instead of three nullable ones.
-    switch (provider) {
-      case "google":
-        this.batchProvider = new GoogleBatchProvider({}, batchLogger);
-        break;
-      case "anthropic":
-        this.batchProvider = new AnthropicBatchProvider({}, batchLogger);
-        break;
-      case "openai":
-        this.batchProvider = new OpenAIBatchProvider({}, batchLogger);
-        break;
-      default:
-        throw new Error(`Unsupported batch provider "${provider}".`);
+        return createOpenRouterBatchModel({
+          apiKey,
+          modelId: modelConfig.id,
+          baseURL: this.options?.baseURL,
+          fetch: this.options?.fetch,
+          endpoint: this.options?.endpoint,
+        });
+      }
+
+      const _exhaustive: never = this.provider;
+      throw new Error(`Unsupported batch provider "${_exhaustive}".`);
+    })());
+  }
+
+  private resolveRefs(
+    batchId: string,
+    metadata?: Record<string, unknown>,
+    batchModel?: EngineBatchModel,
+  ): EngineBatchRef[] {
+    let targetRefs: EngineBatchRef[] = [];
+
+    if (
+      metadata &&
+      "batchRefs" in metadata &&
+      metadata.batchRefs !== undefined
+    ) {
+      const rawBatchRefs = metadata.batchRefs;
+      if (!Array.isArray(rawBatchRefs)) {
+        throw new Error(
+          `Invalid metadata.batchRefs: expected an array of EngineBatchRef, got ${typeof rawBatchRefs}`,
+        );
+      }
+      if (rawBatchRefs.length === 0) {
+        throw new Error(
+          `Invalid metadata.batchRefs: batchRefs array cannot be empty`,
+        );
+      }
+      for (const item of rawBatchRefs) {
+        const parsed = EngineBatchRefSchema.safeParse(item);
+        if (!parsed.success) {
+          throw new Error(
+            `Corrupted batch ref in metadata.batchRefs: ${parsed.error.message}`,
+          );
+        }
+        if (batchModel && parsed.data.provider !== batchModel.provider) {
+          throw new Error(
+            `Batch ref provider "${parsed.data.provider}" does not match model provider "${batchModel.provider}"`,
+          );
+        }
+        targetRefs.push(parsed.data);
+      }
+      return targetRefs;
     }
+
+    const inMemoryRefs = this.refsByBatch.get(batchId);
+    if (inMemoryRefs && inMemoryRefs.length > 0) {
+      if (batchModel) {
+        for (const ref of inMemoryRefs) {
+          if (ref.provider !== batchModel.provider) {
+            throw new Error(
+              `Batch ref provider "${ref.provider}" does not match model provider "${batchModel.provider}"`,
+            );
+          }
+        }
+      }
+      return inMemoryRefs;
+    }
+
+    // Legacy / single-batch fallback: synthesize one ref from the batch id.
+    //
+    // This path is REQUIRED for suspended state written before fan-out existed
+    // (0.12 never partitioned, so one id was always the whole batch), which is
+    // why it cannot simply throw. But if a 0.13 submit DID fan out and the
+    // caller failed to persist `handle.refs`, this silently reduces the run to
+    // the first batch. Warn loudly — a short result set here would otherwise
+    // be auto-recorded to the cost ledger and marked complete.
+    const warning =
+      `[Batch] No batchRefs supplied for batch "${batchId}" and none in memory; ` +
+      `assuming a single batch. If this stage fanned out across multiple batches, ` +
+      `results from all but the first are MISSING. Persist handle.refs into ` +
+      `suspendedState.metadata.batchRefs at submit time and pass that metadata to ` +
+      `getStatus()/getResults().`;
+    if (this.batchLogFn) {
+      this.batchLogFn("WARN", warning, { batchId });
+    } else {
+      logger.warn(warning, { batchId });
+    }
+
+    const ref: EngineBatchRef = {
+      version: 1,
+      type: "text",
+      id: batchId,
+      provider: batchModel?.provider ?? this.provider,
+      modelId: batchModel?.modelId ?? getModel(this.modelKey).id,
+    };
+    return [ref];
   }
 
   async submit(requests: AIBatchRequest[]): Promise<AIBatchHandle> {
-    // Trace log before batch submission
+    const seenIds = new Set<string>();
+    for (const req of requests) {
+      if (!req.id || typeof req.id !== "string" || req.id.trim().length === 0) {
+        throw new Error("Batch request id must be a non-empty string");
+      }
+      if (seenIds.has(req.id)) {
+        throw new Error(
+          `Duplicate request id "${req.id}" in batch submission.`,
+        );
+      }
+      seenIds.add(req.id);
+    }
+
+    if (requests.length === 0) {
+      const modelConfig = getModel(this.modelKey);
+      const emptyBatchId = `batch-empty-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const ref: EngineBatchRef = {
+        version: 1,
+        type: "text",
+        id: emptyBatchId,
+        provider: this.provider,
+        modelId: modelConfig.id,
+      };
+      this.schemasByBatch.set(emptyBatchId, new Map());
+      this.requestCountsByBatch.set(emptyBatchId, 0);
+      this.refsByBatch.set(emptyBatchId, [ref]);
+
+      return {
+        id: emptyBatchId,
+        status: "completed",
+        provider: this.provider,
+        refs: [ref],
+        batchIds: [emptyBatchId],
+        requestCounts: { total: 0, completed: 0, failed: 0 },
+        totalRequests: 0,
+      };
+    }
+
+    const batchModel = await this.provider$();
+    const modelConfig = getModel(this.modelKey);
+
     logger.debug(`batch submit request`, {
       provider: this.provider,
       model: this.modelKey,
@@ -113,219 +243,430 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
       hasMoreRequests: requests.length > 10,
     });
 
-    // Register schemas for later validation in getResults(), keyed by the
-    // request id supplied by the caller (not the batchId, which we don't
-    // have yet).
-    const schemasById = new Map<string, z.ZodTypeAny>();
+    // Partition + Fan-Out (P9)
+    // Group requests by stable key: (endpoint, modelId, stableHashOf(schema))
+    // Requests with different schemas must not share a batch — Google rejects a batch whose requests disagree on response_format.
+    const endpoint = this.options?.endpoint ?? "/v1/chat/completions";
+    const partitionModelId = batchModel.modelId;
+
+    const groupedRequests = new Map<string, AIBatchRequest[]>();
     for (const req of requests) {
-      if (req.schema) schemasById.set(req.id, req.schema);
+      const schemaKey = req.schema
+        ? JSON.stringify(z.toJSONSchema(req.schema))
+        : "none";
+      const key = `${endpoint}:${partitionModelId}:${schemaKey}`;
+      let group = groupedRequests.get(key);
+      if (!group) {
+        group = [];
+        groupedRequests.set(key, group);
+      }
+      group.push(req);
     }
 
-    let handle: BatchHandle;
-    if (this.provider === "google") {
-      // Google gets native structured output (responseMimeType +
-      // responseJsonSchema in google-batch.ts), so we just pass the schema
-      // through rather than synthesizing prompt text for it.
-      const googleRequests = requests.map((req) => ({
-        id: req.id,
-        prompt: req.prompt,
-        model: this.modelKey,
-        ...(req.schema && { schema: req.schema }),
-      }));
-      handle = await this.batchProvider.submit(googleRequests);
-    } else {
-      // Anthropic and OpenAI both lack native batch structured-output, so
-      // the schema is synthesized into a system prompt for either.
-      const genericRequests = requests.map((req) => ({
-        customId: req.id,
-        prompt: req.prompt,
-        model: this.modelKey,
-        ...(req.schema && {
-          system: buildJsonSchemaSystemPrompt(req.schema),
-        }),
-      }));
-      handle = await this.batchProvider.submit(genericRequests);
+    // Cap each group at maxRequestsPerBatch (default 500) and split into chunks.
+    // OpenRouter returns results: null for an expired batch, so an uncapped 10k-request batch is a single bet you lose entirely at hour 24; capping bounds the loss.
+    const maxRequestsPerBatch = this.options?.maxRequestsPerBatch ?? 500;
+    const partitions: Array<{
+      requests: AIBatchRequest[];
+      engineRequests: EngineBatchRequest[];
+    }> = [];
+
+    for (const group of groupedRequests.values()) {
+      for (let i = 0; i < group.length; i += maxRequestsPerBatch) {
+        const chunk = group.slice(i, i + maxRequestsPerBatch);
+        const engineRequests: EngineBatchRequest[] = chunk.map((req) => ({
+          id: req.id,
+          prompt: req.prompt,
+          system: req.system,
+          // P6c: previously hardcoded to 1024 on two of three providers, which
+          // silently truncated structured output. Fall back to the model's own
+          // ceiling, and leave it unset if that is unknown rather than guessing.
+          maxOutputTokens:
+            req.maxTokens ?? modelConfig.maxCompletionTokens ?? undefined,
+          temperature: req.temperature,
+          schema: req.schema,
+        }));
+        partitions.push({ requests: chunk, engineRequests });
+      }
     }
 
-    this.schemasByBatch.set(handle.id, schemasById);
-    this.requestCountsByBatch.set(handle.id, requests.length);
+    // Hard cardinality cap check (default 20)
+    const maxPartitions = this.options?.maxPartitions ?? 20;
+    if (partitions.length > maxPartitions) {
+      throw new Error(
+        `Batch submission produced ${partitions.length} partitions, exceeding the maximum allowed limit of ${maxPartitions}. ` +
+          `Configure \`maxPartitions\` in BatchOptions to increase this limit.`,
+      );
+    }
+
+    // Submit partitions sequentially so a rate limit stops at partition k instead of firing all N
+    const createdRefs: EngineBatchRef[] = [];
+    for (let i = 0; i < partitions.length; i++) {
+      const partition = partitions[i]!;
+      try {
+        const res = await batchModel.start(partition.engineRequests);
+        const ref: EngineBatchRef = {
+          version: 1,
+          type: "text",
+          id: res.id,
+          provider: res.provider,
+          modelId: res.modelId,
+        };
+        createdRefs.push(ref);
+      } catch (err) {
+        const createdIds = createdRefs.map((r) => r.id).join(", ");
+        const errMsg = `Batch submission failed at partition ${i + 1}/${partitions.length}${
+          createdRefs.length > 0
+            ? `. Successfully created ${createdRefs.length} batch(es) before failure: [${createdIds}]`
+            : ""
+        }: ${err instanceof Error ? err.message : String(err)}`;
+        const batchError = new Error(errMsg) as Error & {
+          createdRefs?: EngineBatchRef[];
+        };
+        batchError.createdRefs = createdRefs;
+        if (err instanceof Error && err.stack) {
+          batchError.stack = `${batchError.stack}\nCaused by: ${err.stack}`;
+        }
+        throw batchError;
+      }
+    }
+
+    const refs = createdRefs;
+    const batchIds = refs.map((r) => r.id);
+    const primaryBatchId = batchIds[0] ?? "";
+
+    // Save schemas and request counts for each partition
+    const allSchemasById = new Map<string, z.ZodTypeAny>();
+    for (let i = 0; i < partitions.length; i++) {
+      const partition = partitions[i]!;
+      const ref = refs[i]!;
+      const partitionSchemasById = new Map<string, z.ZodTypeAny>();
+      for (const req of partition.requests) {
+        if (req.schema) {
+          partitionSchemasById.set(req.id, req.schema);
+          allSchemasById.set(req.id, req.schema);
+        }
+      }
+      this.schemasByBatch.set(ref.id, partitionSchemasById);
+      this.requestCountsByBatch.set(ref.id, partition.requests.length);
+    }
+
+    this.refsByBatch.set(primaryBatchId, refs);
+    this.schemasByBatch.set(primaryBatchId, allSchemasById);
+    this.requestCountsByBatch.set(primaryBatchId, requests.length);
+
     logger.debug(`batch submitted`, {
       provider: this.provider,
-      batchId: handle.id,
+      batchId: primaryBatchId,
+      batchIds,
       requestCount: requests.length,
+      partitionCount: partitions.length,
     });
-    return { id: handle.id, status: "pending", provider: this.provider };
+
+    return {
+      id: primaryBatchId,
+      status: "pending",
+      provider: this.provider,
+      refs,
+      batchIds,
+      requestCounts: {
+        total: requests.length,
+        completed: 0,
+        failed: 0,
+      },
+      totalRequests: requests.length,
+    };
   }
 
-  async getStatus(batchId: string): Promise<AIBatchHandle> {
-    const handle: BatchHandle = {
-      id: batchId,
-      provider: this.provider,
-      requestCount: this.requestCountsByBatch.get(batchId) ?? 0,
-      createdAt: new Date(),
-    };
-    const status = await this.batchProvider.checkStatus(handle);
-
-    let batchStatus: "pending" | "processing" | "completed" | "failed";
-    switch (status.state) {
-      case "completed":
-        batchStatus = "completed";
-        break;
-      case "failed":
-        batchStatus = "failed";
-        break;
-      case "processing":
-        batchStatus = "processing";
-        break;
-      default:
-        batchStatus = "pending";
+  async getStatus(
+    batchId: string,
+    metadata?: Record<string, unknown>,
+  ): Promise<AIBatchHandle> {
+    if (
+      this.requestCountsByBatch.get(batchId) === 0 ||
+      batchId.startsWith("batch-empty-")
+    ) {
+      const inMemoryRefs = this.refsByBatch.get(batchId);
+      const refs: EngineBatchRef[] = inMemoryRefs ?? [
+        {
+          version: 1,
+          type: "text",
+          id: batchId,
+          provider: this.provider,
+          modelId: getModel(this.modelKey).id,
+        },
+      ];
+      return {
+        id: batchId,
+        status: "completed",
+        provider: this.provider,
+        refs,
+        batchIds: refs.map((r) => r.id),
+        requestCounts: { total: 0, completed: 0, failed: 0 },
+        totalRequests: 0,
+      };
     }
 
-    return { id: batchId, status: batchStatus, provider: this.provider };
+    const batchModel = await this.provider$();
+    const refs = this.resolveRefs(batchId, metadata, batchModel);
+
+    const statuses = await Promise.all(
+      refs.map((ref) => batchModel.status(ref)),
+    );
+
+    // Aggregate status across refs: failed if any failed; completed only if all completed; else processing/pending
+    let aggregatedStatus: "pending" | "processing" | "completed" | "failed";
+    const hasFailed = statuses.some((s) => s.status === "failed");
+    const allCompleted =
+      statuses.length > 0 && statuses.every((s) => s.status === "completed");
+    const anyProcessing = statuses.some((s) => s.status === "processing");
+
+    if (hasFailed) {
+      aggregatedStatus = "failed";
+    } else if (allCompleted) {
+      aggregatedStatus = "completed";
+    } else if (anyProcessing) {
+      aggregatedStatus = "processing";
+    } else {
+      aggregatedStatus = "pending";
+    }
+
+    let totalCount = 0;
+    let completedCount = 0;
+    let failedCount = 0;
+    let hasCounts = false;
+
+    for (const s of statuses) {
+      if (s.requestCounts) {
+        hasCounts = true;
+        totalCount += s.requestCounts.total;
+        completedCount += s.requestCounts.completed;
+        failedCount += s.requestCounts.failed;
+      }
+    }
+
+    const errors = statuses
+      .map((s) => s.error)
+      .filter((e): e is string => typeof e === "string" && e.length > 0);
+    const aggregatedError = errors.length > 0 ? errors.join("; ") : undefined;
+
+    return {
+      id: batchId,
+      status: aggregatedStatus,
+      provider: this.provider,
+      refs,
+      batchIds: refs.map((r) => r.id),
+      requestCounts: hasCounts
+        ? { total: totalCount, completed: completedCount, failed: failedCount }
+        : undefined,
+      totalRequests: hasCounts ? totalCount : undefined,
+      error: aggregatedError,
+    };
   }
 
   async getResults(
     batchId: string,
     metadata?: Record<string, unknown>,
   ): Promise<AIBatchResult<T>[]> {
-    // Debug: Log received metadata to trace customIds flow
     if (this.batchLogFn) {
       this.batchLogFn("DEBUG", `[AIBatch:getResults] Received metadata`, {
         hasMetadata: !!metadata,
         metadataKeys: metadata ? Object.keys(metadata) : [],
-        hasCustomIds: !!metadata?.customIds,
-        customIdsCount: Array.isArray(metadata?.customIds)
-          ? metadata.customIds.length
-          : 0,
+        hasBatchRefs: !!metadata?.batchRefs,
       });
     }
 
-    const handle: BatchHandle = {
-      id: batchId,
-      provider: this.provider,
-      requestCount: this.requestCountsByBatch.get(batchId) ?? 0,
-      createdAt: new Date(),
-      metadata,
-    };
-    const rawResults = await this.batchProvider.getResults(handle);
+    if (
+      this.requestCountsByBatch.get(batchId) === 0 ||
+      batchId.startsWith("batch-empty-") ||
+      metadata?.requestCount === 0 ||
+      metadata?.totalRequests === 0
+    ) {
+      const emptyResults: AIBatchResult<T>[] = [];
+      await this.recordResults(batchId, emptyResults);
+      return emptyResults;
+    }
 
-    // Trace log after results retrieved
-    const totalInputTokens = rawResults.reduce(
-      (sum, r) => sum + (r.inputTokens || 0),
-      0,
-    );
-    const totalOutputTokens = rawResults.reduce(
-      (sum, r) => sum + (r.outputTokens || 0),
-      0,
-    );
-    const failedCount = rawResults.filter((r) => r.error).length;
-    logger.debug(`batch getResults response`, {
-      batchId,
-      provider: this.provider,
-      resultCount: rawResults.length,
-      failedCount,
-      totalInputTokens,
-      totalOutputTokens,
-    });
+    const batchModel = await this.provider$();
+    const targetRefs = this.resolveRefs(batchId, metadata, batchModel);
 
-    // Schemas for validation: prefer ones re-supplied explicitly via
-    // metadata.schemas (works across a suspend/resume, since the caller is
-    // responsible for keeping hold of the Zod schema object), falling back
-    // to the in-process map populated at submit() time.
+    const expectedTotal =
+      (typeof metadata?.totalRequests === "number"
+        ? metadata.totalRequests
+        : undefined) ??
+      (typeof metadata?.requestCount === "number"
+        ? metadata.requestCount
+        : undefined) ??
+      (typeof (metadata?.requestCounts as any)?.total === "number"
+        ? (metadata!.requestCounts as any).total
+        : undefined) ??
+      (typeof metadata?.expectedTotal === "number"
+        ? metadata.expectedTotal
+        : undefined) ??
+      this.requestCountsByBatch.get(batchId);
+
     const suppliedSchemas = metadata?.schemas as
-      | Record<string, z.ZodTypeAny>
+      | Record<string, unknown>
       | undefined;
     const inProcessSchemas = this.schemasByBatch.get(batchId);
 
-    // Transform RawBatchResult to AIBatchResult<T>
-    const results: AIBatchResult<T>[] = rawResults.map((raw, index) => {
-      const id = raw.customId || `result-${index}`;
-      const inputTokens = raw.inputTokens || 0;
-      const outputTokens = raw.outputTokens || 0;
+    let unvalidatedCount = 0;
+    let totalReceivedItems = 0;
+    const results: AIBatchResult<T>[] = [];
 
-      // Check if this request failed at the provider level
-      if (raw.error) {
-        return {
-          id,
-          prompt: "", // Not available from raw results
-          inputTokens,
-          outputTokens,
-          status: "failed" as const,
-          error: raw.error,
-        };
-      }
-
-      // Try to parse JSON if the result looks like JSON
-      let parsedJson: unknown;
-      let parseError: string | undefined;
-      try {
-        // Clean markdown code blocks before parsing
-        let cleaned = raw.text.trim();
-        if (cleaned.startsWith("```json")) {
-          cleaned = cleaned.slice(7);
-        } else if (cleaned.startsWith("```")) {
-          cleaned = cleaned.slice(3);
+    for (const ref of targetRefs) {
+      for await (const item of batchModel.results(ref)) {
+        totalReceivedItems++;
+        const customId = resolveCustomId(item);
+        if (!customId) {
+          results.push({
+            id: item.id || "unknown",
+            prompt: "",
+            inputTokens: item.inputTokens ?? 0,
+            outputTokens: item.outputTokens ?? 0,
+            status: "failed",
+            error:
+              "Missing or empty custom ID in batch item result; cannot correlate with original request.",
+            validated: false,
+          });
+          continue;
         }
-        if (cleaned.endsWith("```")) {
-          cleaned = cleaned.slice(0, -3);
-        }
-        cleaned = cleaned.trim();
-        parsedJson = JSON.parse(cleaned);
-      } catch (err) {
-        parseError = err instanceof Error ? err.message : String(err);
-      }
 
-      const schema = suppliedSchemas?.[id] ?? inProcessSchemas?.get(id);
+        const inputTokens = item.inputTokens ?? 0;
+        const outputTokens = item.outputTokens ?? 0;
 
-      if (schema) {
-        // A schema was supplied for this request - validate against it
-        // instead of blindly trusting the model's output.
-        if (parseError) {
-          return {
-            id,
+        if (item.status !== "succeeded") {
+          results.push({
+            id: customId,
             prompt: "",
             inputTokens,
             outputTokens,
-            status: "failed" as const,
-            error: `Failed to parse JSON response for schema validation: ${parseError}`,
-          };
+            status: "failed",
+            error:
+              item.error ?? `Batch item failed with status "${item.status}"`,
+            validated: false,
+          });
+          continue;
         }
 
-        const validation = schema.safeParse(parsedJson);
-        if (!validation.success) {
-          return {
-            id,
+        let parsedJson: unknown;
+        let parseError: string | undefined;
+        try {
+          let cleaned = item.text.trim();
+          if (cleaned.startsWith("```json")) {
+            cleaned = cleaned.slice(7);
+          } else if (cleaned.startsWith("```")) {
+            cleaned = cleaned.slice(3);
+          }
+          if (cleaned.endsWith("```")) {
+            cleaned = cleaned.slice(0, -3);
+          }
+          cleaned = cleaned.trim();
+          parsedJson = JSON.parse(cleaned);
+        } catch (err) {
+          parseError = err instanceof Error ? err.message : String(err);
+        }
+
+        const candidateSchema =
+          suppliedSchemas?.[customId] ?? inProcessSchemas?.get(customId);
+        const schema =
+          candidateSchema &&
+          typeof (candidateSchema as any).safeParse === "function"
+            ? (candidateSchema as z.ZodTypeAny)
+            : undefined;
+
+        if (schema) {
+          if (parseError) {
+            results.push({
+              id: customId,
+              prompt: "",
+              inputTokens,
+              outputTokens,
+              status: "failed",
+              error: `Failed to parse JSON response for schema validation: ${parseError}`,
+              validated: false,
+            });
+            continue;
+          }
+
+          let validation: ReturnType<z.ZodTypeAny["safeParse"]>;
+          try {
+            validation = schema.safeParse(parsedJson);
+          } catch (schemaErr) {
+            const errText =
+              schemaErr instanceof Error
+                ? schemaErr.message
+                : String(schemaErr);
+            results.push({
+              id: customId,
+              prompt: "",
+              inputTokens,
+              outputTokens,
+              status: "failed",
+              error: `Schema validation threw an error: ${errText}`,
+              validated: false,
+            });
+            continue;
+          }
+
+          if (!validation.success) {
+            results.push({
+              id: customId,
+              prompt: "",
+              inputTokens,
+              outputTokens,
+              status: "failed",
+              error: `Response did not match the request's schema: ${validation.error.message}`,
+              validated: false,
+            });
+            continue;
+          }
+
+          results.push({
+            id: customId,
             prompt: "",
+            result: validation.data as T,
             inputTokens,
             outputTokens,
-            status: "failed" as const,
-            error: `Response did not match the request's schema: ${validation.error.message}`,
-          };
+            status: "succeeded",
+            validated: true,
+          });
+        } else {
+          unvalidatedCount++;
+          const resultData = (
+            parseError === undefined ? parsedJson : item.text
+          ) as T;
+
+          results.push({
+            id: customId,
+            prompt: "",
+            result: resultData,
+            inputTokens,
+            outputTokens,
+            status: "succeeded",
+            validated: false,
+          });
         }
-
-        return {
-          id,
-          prompt: "",
-          result: validation.data as T,
-          inputTokens,
-          outputTokens,
-          status: "succeeded" as const,
-        };
       }
+    }
 
-      // No schema to validate against - fall back to best-effort parsing,
-      // same as before, but only for a genuinely successful response.
-      const result = (parseError === undefined ? parsedJson : raw.text) as T;
+    if (expectedTotal !== undefined && totalReceivedItems < expectedTotal) {
+      throw new Error(
+        `Batch result count (${totalReceivedItems}) is short of expected total (${expectedTotal}). Results were not recorded.`,
+      );
+    }
 
-      return {
-        id,
-        prompt: "", // Not available from raw results
-        result,
-        inputTokens,
-        outputTokens,
-        status: "succeeded" as const,
-      };
-    });
+    if (unvalidatedCount > 0) {
+      const warnMsg =
+        `[Batch] ${unvalidatedCount} result(s) returned without schema validation. ` +
+        `Zod schemas do not survive workflow serialization across suspend/resume. ` +
+        `Re-supply schemas via getResults(batchId, { schemas: { [requestId]: schema } }) to validate.`;
+      if (this.batchLogFn) {
+        this.batchLogFn("WARN", warnMsg, { unvalidatedCount, batchId });
+      } else {
+        logger.warn(warnMsg, { unvalidatedCount, batchId });
+      }
+    }
 
     // Auto-record results
     await this.recordResults(batchId, results);
@@ -334,58 +675,81 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
   }
 
   async isRecorded(batchId: string): Promise<boolean> {
+    if (this.recordedBatchIds.has(batchId)) {
+      return true;
+    }
     return this.ctx.aiCallLogger.isRecorded(batchId);
   }
 
-  /**
-   * Record batch results manually.
-   * Use this when batch provider integration is not yet implemented.
-   */
   async recordResults(
     batchId: string,
     results: AIBatchResult<T>[],
   ): Promise<void> {
-    // Check if already recorded
-    if (await this.isRecorded(batchId)) {
+    if (this.recordedBatchIds.has(batchId)) {
       logger.debug(`Batch ${batchId} already recorded, skipping.`);
       return;
     }
 
-    const modelConfig = getModel(this.modelKey);
-    const discountPercent = modelConfig.batchDiscountPercent ?? 0;
+    const inFlight = this.recordingPromises.get(batchId);
+    if (inFlight) {
+      return inFlight;
+    }
 
-    // Record all results via logger
-    await this.ctx.aiCallLogger.logBatchResults(
-      batchId,
-      results.map((r) => {
-        const baseCost = calculateCost(
-          this.modelKey,
-          r.inputTokens,
-          r.outputTokens,
+    const recordPromise = (async () => {
+      try {
+        if (await this.isRecorded(batchId)) {
+          logger.debug(`Batch ${batchId} already recorded, skipping.`);
+          this.recordedBatchIds.add(batchId);
+          return;
+        }
+
+        this.recordedBatchIds.add(batchId);
+
+        const modelConfig = getModel(this.modelKey);
+
+        await this.ctx.aiCallLogger.logBatchResults(
+          batchId,
+          results.map((r) => {
+            const cost = calculateCostWithDiscount(
+              this.modelKey,
+              r.inputTokens,
+              r.outputTokens,
+              true,
+            );
+
+            return {
+              topic: this.ctx.topic,
+              callType: "batch",
+              modelKey: this.modelKey,
+              modelId: modelConfig.id,
+              prompt: r.prompt,
+              response:
+                r.status === "succeeded"
+                  ? typeof r.result === "string"
+                    ? r.result
+                    : JSON.stringify(r.result)
+                  : "",
+              inputTokens: r.inputTokens,
+              outputTokens: r.outputTokens,
+              cost,
+              metadata:
+                r.status === "failed"
+                  ? {
+                      batchId,
+                      requestId: r.id,
+                      status: "failed",
+                      error: r.error,
+                    }
+                  : { batchId, requestId: r.id },
+            };
+          }),
         );
-        const cost = baseCost.totalCost * (1 - discountPercent / 100);
+      } finally {
+        this.recordingPromises.delete(batchId);
+      }
+    })();
 
-        return {
-          topic: this.ctx.topic,
-          callType: "batch",
-          modelKey: this.modelKey,
-          modelId: modelConfig.id,
-          prompt: r.prompt,
-          response:
-            r.status === "succeeded"
-              ? typeof r.result === "string"
-                ? r.result
-                : JSON.stringify(r.result)
-              : "",
-          inputTokens: r.inputTokens,
-          outputTokens: r.outputTokens,
-          cost,
-          metadata:
-            r.status === "failed"
-              ? { batchId, requestId: r.id, status: "failed", error: r.error }
-              : { batchId, requestId: r.id },
-        };
-      }),
-    );
+    this.recordingPromises.set(batchId, recordPromise);
+    return recordPromise;
   }
 }

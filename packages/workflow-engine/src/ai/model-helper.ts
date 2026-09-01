@@ -31,7 +31,20 @@ export interface ModelConfig {
   provider: string;
   description?: string;
   supportsAsyncBatch?: boolean;
+  /** @deprecated Use batchInputCostPerMillion/batchOutputCostPerMillion. Removal at 1.0. */
   batchDiscountPercent?: number; // e.g., 50 for Google Batch (50% off)
+  /** The ":batch" sibling slug in OpenRouter's catalog, when one exists. */
+  batchModelId?: string;
+  /** Absolute price of the ":batch" variant, per 1M input tokens. Authoritative; prefer over batchDiscountPercent. */
+  batchInputCostPerMillion?: number;
+  /** Absolute price of the ":batch" variant, per 1M output tokens. */
+  batchOutputCostPerMillion?: number;
+  /** Long-context pricing tier from OpenRouter `pricing.overrides`, when the override is keyed on prompt length. */
+  longContextTier?: {
+    minPromptTokens: number;
+    inputCostPerMillion: number;
+    outputCostPerMillion: number;
+  };
   isEmbeddingModel?: boolean; // true for embedding models
   supportsTools?: boolean; // true if model supports function calling
   supportsStructuredOutputs?: boolean; // true if model supports JSON schema outputs
@@ -342,8 +355,19 @@ export function calculateCost(
 } {
   const model = getModel(modelKey);
 
-  const inputCost = (inputTokens / 1_000_000) * model.inputCostPerMillion;
-  const outputCost = (outputTokens / 1_000_000) * model.outputCostPerMillion;
+  const tier = model.longContextTier;
+  const useLongContextTier =
+    tier !== undefined && inputTokens >= tier.minPromptTokens;
+
+  const inputRate = useLongContextTier
+    ? tier.inputCostPerMillion
+    : model.inputCostPerMillion;
+  const outputRate = useLongContextTier
+    ? tier.outputCostPerMillion
+    : model.outputCostPerMillion;
+
+  const inputCost = (inputTokens / 1_000_000) * inputRate;
+  const outputCost = (outputTokens / 1_000_000) * outputRate;
   const totalCost = inputCost + outputCost;
 
   return {

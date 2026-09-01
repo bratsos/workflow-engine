@@ -12,7 +12,7 @@ import { generateText as aiGenerateText, Output } from "ai";
 import type { z } from "zod";
 import type { AICallLogger } from "../persistence";
 import { getModel, type ModelKey } from "./model-helper";
-import { calculateCostWithDiscount, getModelProvider, logger } from "./shared";
+import { getModelProvider, logger, resolveCost } from "./shared";
 import type {
   AICallType,
   AIHelperContext,
@@ -126,8 +126,13 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
     );
   }
 
-  // Create internal wrapper that logs tool usage and then calls user's callback
-  const wrappedOnStepEnd = options.onStepEnd
+  // Logs tool usage, then calls the user's callback if they supplied one.
+  //
+  // This is attached whenever tools are in play, NOT only when the caller
+  // passes `onStepEnd`. It used to be conditional on the user's callback,
+  // which silently skipped all per-tool observability records for anyone who
+  // used tools without also wanting a step callback.
+  const wrappedOnStepEnd = hasTools
     ? async (stepResult: StepResult<TTools>) => {
         // Log each tool result to a child topic
         if (stepResult.toolResults && Array.isArray(stepResult.toolResults)) {
@@ -248,7 +253,12 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
 
     const inputTokens = result.usage?.inputTokens ?? 0;
     const outputTokens = result.usage?.outputTokens ?? 0;
-    const cost = calculateCostWithDiscount(modelKey, inputTokens, outputTokens);
+    const { cost, reportedCostUsd, costSource } = resolveCost(
+      modelKey,
+      inputTokens,
+      outputTokens,
+      result,
+    );
     const durationMs = Date.now() - startTime;
     // Reasoning models emit on a separate channel; surface it so a
     // reasoning-only response isn't seen as empty output.
@@ -265,6 +275,8 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
       inputTokens,
       outputTokens,
       cost,
+      reportedCost: reportedCostUsd,
+      costSource,
       metadata: {
         temperature: options.temperature,
         maxTokens: options.maxTokens,
@@ -298,6 +310,8 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
       inputTokens,
       outputTokens,
       cost,
+      ...(reportedCostUsd !== undefined ? { reportedCostUsd } : {}),
+      costSource,
       ...(reasoning ? { reasoning } : {}),
       // Include structured output if `output` was used
       ...(hasOutputSchema && {
@@ -398,7 +412,12 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
 
     const inputTokens = result.usage?.inputTokens ?? 0;
     const outputTokens = result.usage?.outputTokens ?? 0;
-    const cost = calculateCostWithDiscount(modelKey, inputTokens, outputTokens);
+    const { cost, reportedCostUsd, costSource } = resolveCost(
+      modelKey,
+      inputTokens,
+      outputTokens,
+      result,
+    );
     const durationMs = Date.now() - startTime;
 
     // Log the call (including error cases where finishReason is "error")
@@ -412,6 +431,8 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
       inputTokens,
       outputTokens,
       cost,
+      reportedCost: reportedCostUsd,
+      costSource,
       metadata: {
         temperature: options.temperature,
         maxTokens: options.maxTokens,
@@ -445,6 +466,8 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
       inputTokens,
       outputTokens,
       cost,
+      ...(reportedCostUsd !== undefined ? { reportedCostUsd } : {}),
+      costSource,
     };
   } catch (error) {
     const { errorMessage, durationMs } = logFailure(ctx.aiCallLogger, {

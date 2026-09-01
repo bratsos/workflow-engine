@@ -28,6 +28,10 @@ export interface AITextResult {
   inputTokens: number;
   outputTokens: number;
   cost: number;
+  /** Actual USD cost as reported by the provider, when available. Undefined on providers that do not report it. */
+  reportedCostUsd?: number;
+  /** Whether `cost` came from the provider or from the static price table. */
+  costSource?: "reported" | "estimated";
   /** Structured output when `output` is used */
   output?: any;
   /**
@@ -44,6 +48,10 @@ export interface AIObjectResult<T> {
   inputTokens: number;
   outputTokens: number;
   cost: number;
+  /** Actual USD cost as reported by the provider, when available. Undefined on providers that do not report it. */
+  reportedCostUsd?: number;
+  /** Whether `cost` came from the provider or from the static price table. */
+  costSource?: "reported" | "estimated";
 }
 
 export interface AIEmbedResult {
@@ -52,6 +60,10 @@ export interface AIEmbedResult {
   dimensions: number; // Dimensionality of embeddings
   inputTokens: number;
   cost: number;
+  /** Actual USD cost as reported by the provider, when available. Undefined on providers that do not report it. */
+  reportedCostUsd?: number;
+  /** Whether `cost` came from the provider or from the static price table. */
+  costSource?: "reported" | "estimated";
 }
 
 // Type for the raw AI SDK streamText result
@@ -63,6 +75,10 @@ export interface AIStreamResult {
     inputTokens: number;
     outputTokens: number;
     cost: number;
+    /** Actual USD cost as reported by the provider, when available. Undefined on providers that do not report it. */
+    reportedCostUsd?: number;
+    /** Whether `cost` came from the provider or from the static price table. */
+    costSource?: "reported" | "estimated";
   }>;
   /**
    * The full answer text, after the stream completes. Consumes the stream if
@@ -211,15 +227,28 @@ export type StreamTextInput =
       instructions?: string;
     };
 
+import type { EngineBatchRef } from "./batch/model";
+
 // =============================================================================
 // High-Level Batch Types (User-Facing API)
 // =============================================================================
-// These types are for the AIHelper.batch() API. They are distinct from the
-// low-level provider types in utils/batch/types.ts which have more fields
-// for internal provider communication.
+// These types are for the AIHelper.batch() API.
 
 /** Provider identifier for batch operations */
-export type AIBatchProvider = "google" | "anthropic" | "openai";
+export type AIBatchProvider = "google" | "anthropic" | "openai" | "openrouter";
+
+export interface BatchOptions {
+  apiKey?: string;
+  baseURL?: string;
+  fetch?: typeof globalThis.fetch;
+  endpoint?:
+    | "/v1/chat/completions"
+    | "/v1/responses"
+    | "/v1/messages"
+    | "/v1/embeddings";
+  maxRequestsPerBatch?: number;
+  maxPartitions?: number;
+}
 
 /** A request to be processed in a batch */
 export interface AIBatchRequest {
@@ -229,6 +258,10 @@ export interface AIBatchRequest {
   prompt: string;
   /** Optional Zod schema for structured JSON output */
   schema?: z.ZodTypeAny;
+  /** P6c: previously impossible to set; two of three old providers silently capped output at 1024. */
+  maxTokens?: number;
+  system?: string;
+  temperature?: number;
 }
 
 /** Result of a single request in a batch */
@@ -239,10 +272,10 @@ export type AIBatchResult<T = string> =
       /** Original prompt (may be empty if not available from provider) */
       prompt: string;
       /**
-       * The parsed result (JSON object if schema was provided, otherwise
-       * string). When a schema was provided at submit time, this has already
-       * been validated against it - a response that fails validation shows
-       * up as `status: "failed"` instead.
+       * The parsed result. When a schema was provided and validation succeeded,
+       * `validated` is `true`. When no schema was available at retrieval time
+       * (the default after suspend/resume), this is the unvalidated parsed JSON
+       * or string output, and `validated` is `false`.
        */
       result: T;
       /** Input tokens used */
@@ -251,17 +284,25 @@ export type AIBatchResult<T = string> =
       outputTokens: number;
       status: "succeeded";
       error?: undefined;
+      /**
+       * True only when a schema was available at retrieval time and the response
+       * was successfully parsed and validated against it. False/undefined when
+       * no schema was available (e.g. after a suspend/resume without re-supplying schemas).
+       */
+      validated?: boolean;
     }
   | {
       id: string;
       prompt: string;
-      /** No validated result is available for a failed request. */
+      /** No result is available for a failed request. */
       result?: undefined;
       inputTokens: number;
       outputTokens: number;
       status: "failed";
       /** Error message describing why the request failed. */
       error: string;
+      /** Always false on failed requests. */
+      validated?: boolean;
     };
 
 /** Handle for tracking a submitted batch */
@@ -272,6 +313,14 @@ export interface AIBatchHandle {
   status: "pending" | "processing" | "completed" | "failed";
   /** The provider used for this batch (for resume support) */
   provider?: AIBatchProvider;
+  /** Versioned serializable handle(s). Persist in suspendedState.metadata.batchRefs. */
+  refs?: EngineBatchRef[];
+  /** Every batch this submit fanned out into. Length 1 unless partitioned. */
+  batchIds?: string[];
+  requestCounts?: { total: number; completed: number; failed: number };
+  /** Total number of requests expected in the batch */
+  totalRequests?: number;
+  error?: string;
 }
 
 /** Interface for batch operations on an AI model */
@@ -279,7 +328,10 @@ export interface AIBatch<T = string> {
   /** Submit requests for batch processing */
   submit(requests: AIBatchRequest[]): Promise<AIBatchHandle>;
   /** Check the status of a batch */
-  getStatus(batchId: string): Promise<AIBatchHandle>;
+  getStatus(
+    batchId: string,
+    metadata?: Record<string, unknown>,
+  ): Promise<AIBatchHandle>;
   /** Retrieve results from a completed batch */
   getResults(
     batchId: string,
@@ -341,7 +393,11 @@ export interface AIHelper {
   ): AIStreamResult;
 
   // Batch Methods - provider is optional, will auto-detect based on model
-  batch<T = string>(modelKey: ModelKey, provider?: AIBatchProvider): AIBatch<T>;
+  batch<T = string>(
+    modelKey: ModelKey,
+    provider?: AIBatchProvider,
+    options?: BatchOptions,
+  ): AIBatch<T>;
 
   // Hierarchy Methods
   createChild(segment: string, id?: string): AIHelper;

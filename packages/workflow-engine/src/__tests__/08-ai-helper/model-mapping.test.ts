@@ -21,6 +21,7 @@ describe("I want to use batch model mapping utilities", () => {
       expect(BatchProviderName.parse("google")).toBe("google");
       expect(BatchProviderName.parse("anthropic")).toBe("anthropic");
       expect(BatchProviderName.parse("openai")).toBe("openai");
+      expect(BatchProviderName.parse("openrouter")).toBe("openrouter");
     });
 
     it("should reject invalid provider names", () => {
@@ -105,6 +106,23 @@ describe("I want to use batch model mapping utilities", () => {
 
       // Then: Returns google
       expect(provider).toBe("google");
+    });
+
+    it("should return openrouter for non-direct vendors supporting batch", async () => {
+      const { registerModels } = await import("../../ai/model-helper.js");
+      registerModels({
+        "test-deepseek-batch": {
+          id: "deepseek/deepseek-r1",
+          name: "DeepSeek R1",
+          inputCostPerMillion: 0.55,
+          outputCostPerMillion: 2.19,
+          supportsAsyncBatch: true,
+          provider: "openrouter",
+        },
+      });
+
+      const provider = getBestProviderForModel("test-deepseek-batch" as any);
+      expect(provider).toBe("openrouter");
     });
   });
 

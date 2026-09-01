@@ -45,6 +45,7 @@ import type {
   AIStreamResult,
   AITextResult,
   BatchLogFn,
+  BatchOptions,
   EmbedOptions,
   LogContext,
   ObjectOptions,
@@ -153,14 +154,22 @@ class AIHelperImpl implements AIHelper {
   batch<T = string>(
     modelKey: ModelKey,
     provider?: AIBatchProvider,
+    options?: BatchOptions,
   ): AIBatch<T> {
-    const resolvedProvider =
-      provider ?? getBestProviderForModel(modelKey) ?? "google";
+    const resolvedProvider = provider ?? getBestProviderForModel(modelKey);
+    if (!resolvedProvider) {
+      throw new Error(
+        `No known batch-capable provider found for model "${modelKey}". ` +
+          `Supported batch providers are: "google", "anthropic", "openai", "openrouter". ` +
+          `Pass an explicit provider to ai.batch(modelKey, provider).`,
+      );
+    }
     return new AIBatchImpl<T>(
       this.context(),
       modelKey,
       resolvedProvider,
       this.batchLogFn,
+      options,
     );
   }
 
@@ -319,6 +328,7 @@ export type {
   AIStreamResult,
   AITextResult,
   BatchLogFn,
+  BatchOptions,
   ContentPart,
   EmbedOptions,
   LogContext,
