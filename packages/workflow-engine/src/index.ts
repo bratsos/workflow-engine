@@ -79,6 +79,7 @@ export {
   type EngineBatchRef,
   type OpenRouterBatchConfig,
 } from "./ai/batch";
+export { BatchSubmitError } from "./ai/batch-helper";
 // Model Helper
 export {
   AVAILABLE_MODELS,

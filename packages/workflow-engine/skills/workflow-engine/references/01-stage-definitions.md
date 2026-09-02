@@ -533,7 +533,7 @@ const batchEmbeddingStage = defineAsyncBatchStage({
     const ai = createAIHelper(`batch.${ctx.workflowRunId}`, aiLogger);
     const batch = ai.batch(ctx.config.model, "google");
 
-    const status = await batch.getStatus(state.batchId);
+    const status = await batch.getStatus(state.batchId, state.metadata);
 
     if (status.status === "completed") {
       const results = await batch.getResults(state.batchId, state.metadata);

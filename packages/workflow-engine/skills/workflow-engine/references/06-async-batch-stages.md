@@ -159,7 +159,7 @@ async checkCompletion(suspendedState, ctx) {
   const batch = ai.batch(ctx.config.model, metadata?.provider as "anthropic");
 
   // Check batch status
-  const status = await batch.getStatus(batchId);
+  const status = await batch.getStatus(batchId, metadata);
 
   // ===================
   // Still Processing
@@ -333,7 +333,7 @@ const batchEmbeddingStage = defineAsyncBatchStage({
     const ai = createAIHelper(`batch.${ctx.workflowRunId}`, aiLogger);
     const batch = ai.batch<number[]>(ctx.config.model, "google");
 
-    const status = await batch.getStatus(state.batchId);
+    const status = await batch.getStatus(state.batchId, state.metadata);
     await ctx.log("DEBUG", `Batch status: ${status.status}`);
 
     if (status.status !== "completed") {
@@ -527,7 +527,7 @@ Implement custom retry for transient failures:
 ```typescript
 async checkCompletion(state, ctx) {
   try {
-    const status = await batch.getStatus(state.batchId);
+    const status = await batch.getStatus(state.batchId, state.metadata);
     // ... handle status
   } catch (error) {
     // Transient error - retry on next poll

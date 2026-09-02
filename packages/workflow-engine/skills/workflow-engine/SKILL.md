@@ -214,7 +214,7 @@ const batchStage = defineAsyncBatchStage({
   async checkCompletion(suspendedState, ctx) {
     const ai = createAIHelper(`batch.${ctx.workflowRunId}`, aiLogger);
     const batch = ai.batch("gemini-2.5-flash", "google");
-    const status = await batch.getStatus(suspendedState.batchId);
+    const status = await batch.getStatus(suspendedState.batchId, suspendedState.metadata);
     if (status.status === "completed") {
       const results = await batch.getResults(suspendedState.batchId, suspendedState.metadata);
       return { ready: true, output: { results } };

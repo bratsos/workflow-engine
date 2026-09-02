@@ -613,9 +613,27 @@ export class MockAIBatch<T = string> implements AIBatch<T> {
   ) {}
 
   async submit(requests: AIBatchRequest[]): Promise<AIBatchHandle> {
+    // Mirror the real AIBatchImpl contract so a stage tested against the mock
+    // cannot pass while forgetting things the real class rejects.
+    const seen = new Set<string>();
+    for (const req of requests) {
+      if (!req.id || typeof req.id !== "string" || req.id.trim().length === 0) {
+        throw new Error("Batch request id must be a non-empty string");
+      }
+      if (seen.has(req.id)) {
+        throw new Error(
+          `Duplicate request id "${req.id}" in batch submission.`,
+        );
+      }
+      seen.add(req.id);
+    }
+
     const batchId = `mock-batch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     this.submittedBatches.set(batchId, requests);
-    this.batchStatuses.set(batchId, "pending");
+    this.batchStatuses.set(
+      batchId,
+      requests.length === 0 ? "completed" : "pending",
+    );
 
     // Generate mock results
     const results: AIBatchResult<T>[] = requests.map((req) => ({
@@ -628,12 +646,35 @@ export class MockAIBatch<T = string> implements AIBatch<T> {
     }));
     this.batchResults.set(batchId, results);
 
-    return { id: batchId, status: "pending", provider: "google" };
+    return this.handleFor(batchId);
   }
 
-  async getStatus(batchId: string): Promise<AIBatchHandle> {
-    const status = this.batchStatuses.get(batchId) ?? "pending";
-    return { id: batchId, status, provider: "google" };
+  /** Same handle shape the real implementation returns, so tests can persist `refs`. */
+  private handleFor(batchId: string): AIBatchHandle {
+    const requests = this.submittedBatches.get(batchId) ?? [];
+    const ref = {
+      version: 1 as const,
+      type: "text" as const,
+      id: batchId,
+      provider: "google",
+      modelId: String(this.modelKey),
+    };
+    return {
+      id: batchId,
+      status: this.batchStatuses.get(batchId) ?? "pending",
+      provider: "google",
+      refs: [ref],
+      batchIds: [batchId],
+      totalRequests: requests.length,
+      requestCounts: { total: requests.length, completed: 0, failed: 0 },
+    };
+  }
+
+  async getStatus(
+    batchId: string,
+    _metadata?: Record<string, unknown>,
+  ): Promise<AIBatchHandle> {
+    return this.handleFor(batchId);
   }
 
   async getResults(

@@ -509,6 +509,69 @@ describe("Batch Subsystem - OpenRouter Fetch Client (createOpenRouterBatchModel)
     ).toBeDefined();
   });
 
+  it("maps an unrecognized upstream status to failed with a naming error, not to processing", async () => {
+    // A renamed or newly added OpenRouter status must not silently poll for
+    // 24h; it must fail loudly with the raw status preserved.
+    const mockFetch = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({ id: "batch-test", status: "quota_exceeded" }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+    );
+    const model = createOpenRouterBatchModel({
+      apiKey: "test-key",
+      modelId: "openai/gpt-4o",
+      fetch: mockFetch as any,
+    });
+    const status = await model.status({
+      version: 1,
+      type: "text",
+      id: "batch-test",
+      provider: "openrouter",
+      modelId: "openai/gpt-4o",
+    });
+    expect(status.status).toBe("failed");
+    expect(status.rawStatus).toBe("quota_exceeded");
+    expect(status.error).toMatch(
+      /Unrecognized OpenRouter batch status "quota_exceeded"/,
+    );
+  });
+
+  it("accepts null for optional fields and never synthesizes a zero total", async () => {
+    // OpenRouter sends `null`, not absence, for fields it has no value for.
+    const mockFetch = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({
+            id: "batch-test",
+            status: "in_progress",
+            request_counts: { completed: 2 },
+            usage: null,
+            created_at: null,
+            results: null,
+            error: null,
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+    );
+    const model = createOpenRouterBatchModel({
+      apiKey: "test-key",
+      modelId: "openai/gpt-4o",
+      fetch: mockFetch as any,
+    });
+    const status = await model.status({
+      version: 1,
+      type: "text",
+      id: "batch-test",
+      provider: "openrouter",
+      modelId: "openai/gpt-4o",
+    });
+    expect(status.status).toBe("processing");
+    // No `total` upstream -> no counts at all, rather than total: 0.
+    expect(status.requestCounts).toBeUndefined();
+  });
+
   it("maps all 8 upstream OpenRouter statuses correctly", async () => {
     const statuses = [
       { upstream: "validating", expected: "pending" },

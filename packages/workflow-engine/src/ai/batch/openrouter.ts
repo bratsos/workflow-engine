@@ -28,9 +28,9 @@ const OpenRouterBatchResultItemSchema = z.object({
     .object({
       status_code: z.number().optional(),
       request_id: z.string().optional(),
-      body: z.record(z.string(), z.unknown()).optional(),
+      body: z.record(z.string(), z.unknown()).nullish(),
     })
-    .optional(),
+    .nullish(),
   error: z
     .union([
       z.object({
@@ -39,13 +39,13 @@ const OpenRouterBatchResultItemSchema = z.object({
       }),
       z.string(),
     ])
-    .optional(),
+    .nullish(),
 });
 
 const OpenRouterBatchResponseSchema = z.object({
   id: z.string().min(1, "Batch id must be a non-empty string"),
   status: z.string().min(1, "Batch status must be a non-empty string"),
-  created_at: z.union([z.number(), z.string()]).optional(),
+  created_at: z.union([z.number(), z.string()]).nullish(),
   request_counts: z
     .object({
       total: z.number().optional(),
@@ -53,7 +53,7 @@ const OpenRouterBatchResponseSchema = z.object({
       failed: z.number().optional(),
       pending: z.number().optional(),
     })
-    .optional(),
+    .nullish(),
   usage: z
     .object({
       prompt_tokens: z.number().optional(),
@@ -62,7 +62,7 @@ const OpenRouterBatchResponseSchema = z.object({
       cost: z.number().optional(),
       is_byok: z.boolean().optional(),
     })
-    .optional(),
+    .nullish(),
   results: z.array(OpenRouterBatchResultItemSchema).nullable().optional(),
   error: z
     .union([
@@ -104,13 +104,10 @@ async function parseOpenRouterResponse(
 
   const parsed = OpenRouterBatchResponseSchema.safeParse(json);
   if (!parsed.success) {
-    if (site === "creation") {
-      throw new Error(
-        `OpenRouter batch creation returned no batch id (HTTP ${res.status}): ${bodyExcerpt}`,
-      );
-    }
     throw new Error(
-      `OpenRouter batch ${site} returned invalid batch response (HTTP ${res.status}): ${bodyExcerpt}`,
+      `OpenRouter batch ${site} returned an invalid batch object (HTTP ${res.status}): ` +
+        `${parsed.error.issues.map((i) => `${i.path.join(".") || "<root>"}: ${i.message}`).join("; ")}. ` +
+        `Body: ${bodyExcerpt}`,
     );
   }
 
@@ -193,8 +190,11 @@ async function fetchGetWithRetry(
         const parsedSeconds = Number.parseFloat(retryAfterHeader);
         if (!Number.isNaN(parsedSeconds)) {
           if (parsedSeconds > 60) {
-            throw new Error(
-              `OpenRouter rate limit Retry-After (${parsedSeconds}s) exceeds 60s ceiling for GET ${url}`,
+            throw Object.assign(
+              new Error(
+                `OpenRouter rate limit Retry-After (${parsedSeconds}s) exceeds 60s ceiling for GET ${url}`,
+              ),
+              { retryable: true, retryAfterSeconds: parsedSeconds },
             );
           }
           delayMs = Math.max(0, Math.min(60000, parsedSeconds * 1000));
@@ -378,20 +378,31 @@ export function createOpenRouterBatchModel(
       }
 
       const data = await parseOpenRouterResponse(res, "status check");
-      const total = data.request_counts?.total ?? 0;
-      const completed = data.request_counts?.completed ?? 0;
-      const failed = data.request_counts?.failed ?? 0;
-      const pending =
-        data.request_counts?.pending ?? Math.max(0, total - completed - failed);
+      const counts = data.request_counts;
+      // Never synthesize `total: 0` from a counts object that lacks a total:
+      // a caller that merges this handle into persisted metadata would then
+      // carry totalRequests = 0, which reads as "empty batch" downstream.
+      const requestCounts =
+        counts && typeof counts.total === "number"
+          ? {
+              total: counts.total,
+              completed: counts.completed ?? 0,
+              failed: counts.failed ?? 0,
+              pending:
+                counts.pending ??
+                Math.max(
+                  0,
+                  counts.total - (counts.completed ?? 0) - (counts.failed ?? 0),
+                ),
+            }
+          : undefined;
 
       const errorMessage = extractOpenRouterError(data);
 
       return {
         status: mapOpenRouterStatus(data.status),
         rawStatus: data.status,
-        requestCounts: data.request_counts
-          ? { total, pending, completed, failed }
-          : undefined,
+        requestCounts,
         error: errorMessage,
       };
     },

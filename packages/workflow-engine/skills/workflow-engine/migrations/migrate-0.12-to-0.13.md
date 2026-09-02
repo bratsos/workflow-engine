@@ -157,6 +157,9 @@ async execute(ctx) {
         batchRefs: handle.refs,
         provider: handle.provider,
         requestIds: requests.map((r) => r.id),
+        // Lets getResults() detect a short result set instead of recording it
+        // as complete. requestIds.length works too; this is explicit.
+        totalRequests: handle.totalRequests,
       },
     },
     pollConfig: { pollInterval: 60_000, maxWaitTime: 7_200_000 },

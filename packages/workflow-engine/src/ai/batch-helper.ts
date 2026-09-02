@@ -35,6 +35,22 @@ function resolveCustomId(item: EngineBatchItemResult): string | null {
   return null;
 }
 
+/**
+ * Thrown by `AIBatch.submit()` when a later partition fails after earlier
+ * ones were already created upstream. Those batches keep running and bill
+ * the account, so their refs are carried here for reconciliation:
+ * `getStatus(err.createdRefs[0].id, { batchRefs: err.createdRefs })`.
+ */
+export class BatchSubmitError extends Error {
+  readonly name = "BatchSubmitError";
+  constructor(
+    message: string,
+    public readonly createdRefs: EngineBatchRef[],
+  ) {
+    super(message);
+  }
+}
+
 export class AIBatchImpl<T = string> implements AIBatch<T> {
   private providerPromise?: Promise<EngineBatchModel>;
 
@@ -52,7 +68,13 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
   /** In-flight recording promises by batchId to prevent check-then-act races. */
   private recordingPromises = new Map<string, Promise<void>>();
 
-  /** Recorded batch IDs to prevent duplicate recording. */
+  /**
+   * Batch ids already written to the cost ledger BY THIS PROCESS. Together
+   * with `recordingPromises` this closes the in-process check-then-act race.
+   * It does not close the cross-process one: two workers can both observe
+   * `isRecorded() === false` and both write. Closing that needs a uniqueness
+   * guarantee in the AICallLogger store (e.g. a unique index on batchId).
+   */
   private recordedBatchIds = new Set<string>();
 
   constructor(
@@ -320,10 +342,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
             ? `. Successfully created ${createdRefs.length} batch(es) before failure: [${createdIds}]`
             : ""
         }: ${err instanceof Error ? err.message : String(err)}`;
-        const batchError = new Error(errMsg) as Error & {
-          createdRefs?: EngineBatchRef[];
-        };
-        batchError.createdRefs = createdRefs;
+        const batchError = new BatchSubmitError(errMsg, createdRefs);
         if (err instanceof Error && err.stack) {
           batchError.stack = `${batchError.stack}\nCaused by: ${err.stack}`;
         }
@@ -478,9 +497,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
 
     if (
       this.requestCountsByBatch.get(batchId) === 0 ||
-      batchId.startsWith("batch-empty-") ||
-      metadata?.requestCount === 0 ||
-      metadata?.totalRequests === 0
+      batchId.startsWith("batch-empty-")
     ) {
       const emptyResults: AIBatchResult<T>[] = [];
       await this.recordResults(batchId, emptyResults);
@@ -503,7 +520,12 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
       (typeof metadata?.expectedTotal === "number"
         ? metadata.expectedTotal
         : undefined) ??
-      this.requestCountsByBatch.get(batchId);
+      this.requestCountsByBatch.get(batchId) ??
+      // The documented flow persists `requestIds` for schema re-supply; it is
+      // also an exact expected count, so the truncation guard works there too.
+      (Array.isArray(metadata?.requestIds)
+        ? metadata.requestIds.length
+        : undefined);
 
     const suppliedSchemas = metadata?.schemas as
       | Record<string, unknown>
@@ -567,8 +589,13 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
           parseError = err instanceof Error ? err.message : String(err);
         }
 
+        // A supplied value that is not a Zod schema (e.g. one that round-
+        // tripped a JSON column) must not shadow a valid in-process schema.
+        const supplied = suppliedSchemas?.[customId];
         const candidateSchema =
-          suppliedSchemas?.[customId] ?? inProcessSchemas?.get(customId);
+          supplied && typeof (supplied as any).safeParse === "function"
+            ? supplied
+            : inProcessSchemas?.get(customId);
         const schema =
           candidateSchema &&
           typeof (candidateSchema as any).safeParse === "function"
@@ -703,8 +730,6 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
           return;
         }
 
-        this.recordedBatchIds.add(batchId);
-
         const modelConfig = getModel(this.modelKey);
 
         await this.ctx.aiCallLogger.logBatchResults(
@@ -745,6 +770,10 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
             };
           }),
         );
+        // Only after the ledger write succeeded. Marking before the await
+        // meant one transient DB error left the id in the set, and every
+        // later getResults() in this process skipped recording for good.
+        this.recordedBatchIds.add(batchId);
       } finally {
         this.recordingPromises.delete(batchId);
       }

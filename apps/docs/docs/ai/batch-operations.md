@@ -97,7 +97,7 @@ export const batchAnalysisStage = defineAsyncBatchStage({
       suspendedState.metadata?.provider as any
     );
 
-    const status = await batch.getStatus(suspendedState.batchId);
+    const status = await batch.getStatus(suspendedState.batchId, suspendedState.metadata);
     
     if (status.status === "processing" || status.status === "pending") {
       return { ready: false }; // Poll again on the next tick

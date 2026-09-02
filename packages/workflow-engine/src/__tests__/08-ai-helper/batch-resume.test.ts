@@ -343,3 +343,66 @@ describe("submit safety", () => {
     expect(results[0]?.id).toBe(" padded-id ");
   });
 });
+
+describe("cost ledger recording is retried after a transient failure", () => {
+  it("does not mark a batch recorded when the ledger write throws", async () => {
+    // Marking before the await meant a single transient DB error made every
+    // later getResults() in that process skip recording for good.
+    const { model } = makeFakeBackend();
+    const { logger, logged } = makeLogger();
+    logger.logBatchResults
+      .mockRejectedValueOnce(new Error("transient prisma error"))
+      .mockImplementation(async (batchId: string, records: unknown[]) => {
+        logged.push({ batchId, records });
+      });
+
+    const batch = newBatch(logger, model);
+    const handle = await batch.submit([{ id: "r1", prompt: "p" }]);
+    const meta = { batchRefs: JSON.parse(JSON.stringify(handle.refs)) };
+
+    await expect(batch.getResults(handle.id, meta)).rejects.toThrow(
+      /transient/,
+    );
+    expect(await batch.isRecorded(handle.id)).toBe(false);
+
+    const results = await batch.getResults(handle.id, meta);
+    expect(results).toHaveLength(1);
+    expect(logged).toHaveLength(1);
+  });
+});
+
+describe("a zero that arrives through metadata is not an empty batch", () => {
+  it("still fetches results when metadata says totalRequests: 0", async () => {
+    // A status handle from a provider that omitted `total` used to carry
+    // totalRequests = 0; merged into metadata it hit the empty-batch
+    // short-circuit and returned [] as a complete result set.
+    const { model } = makeFakeBackend();
+    const { logger } = makeLogger();
+    const batch = newBatch(logger, model);
+    const handle = await batch.submit([
+      { id: "r1", prompt: "p" },
+      { id: "r2", prompt: "p" },
+    ]);
+    const results = await batch.getResults(handle.id, {
+      batchRefs: JSON.parse(JSON.stringify(handle.refs)),
+      totalRequests: 0,
+      requestCount: 0,
+    });
+    expect(results.map((r) => r.id).sort()).toEqual(["r1", "r2"]);
+  });
+});
+
+describe("partial submit failure is a typed error", () => {
+  it("throws BatchSubmitError carrying the created refs", async () => {
+    const { BatchSubmitError } = await import("../../ai/batch-helper.js");
+    const { model } = makeFakeBackend({ failOnStart: 2 });
+    const { logger } = makeLogger();
+    const batch = newBatch(logger, model, { maxRequestsPerBatch: 1 });
+    await expect(
+      batch.submit([
+        { id: "r1", prompt: "p" },
+        { id: "r2", prompt: "p" },
+      ]),
+    ).rejects.toBeInstanceOf(BatchSubmitError);
+  });
+});

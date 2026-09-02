@@ -672,7 +672,7 @@ export const batchStage = defineAsyncBatchStage({
   async checkCompletion(state, ctx) {
     const ai = createAIHelper(`batch.${ctx.workflowRunId}`, aiCallLogger);
     const batch = ai.batch(ctx.config?.model ?? "gemini-2.5-flash", "google");
-    const status = await batch.getStatus(state.batchId);
+    const status = await batch.getStatus(state.batchId, state.metadata);
     if (status.status === "completed") {
       const results = await batch.getResults(state.batchId, state.metadata);
       const output = { results: results.map(r => r.result) };
