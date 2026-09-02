@@ -204,3 +204,40 @@ describe("batch pricing", () => {
     expect(cost).toBeCloseTo(30, 10);
   });
 });
+
+describe("batch pricing is transport-aware", () => {
+  // BATCH_MODEL: base $10/$20, OpenRouter :batch row $2.50/$40, native discount 50%.
+  it("bills the vendor discount on a native transport, not OpenRouter's :batch price", () => {
+    // Google/Anthropic/OpenAI bill their own documented 50% - OpenRouter's row
+    // describes a different transport and its multiplier is not uniform.
+    const cost = calculateCostWithDiscount(
+      BATCH_MODEL,
+      1_000_000,
+      1_000_000,
+      true,
+      "google",
+    );
+    expect(cost).toBeCloseTo(15, 10);
+  });
+
+  it("bills the absolute :batch price on the OpenRouter transport", () => {
+    const cost = calculateCostWithDiscount(
+      BATCH_MODEL,
+      1_000_000,
+      1_000_000,
+      true,
+      "openrouter",
+    );
+    expect(cost).toBeCloseTo(42.5, 10);
+  });
+
+  it("prefers absolute prices when the transport is unknown", () => {
+    const cost = calculateCostWithDiscount(
+      BATCH_MODEL,
+      1_000_000,
+      1_000_000,
+      true,
+    );
+    expect(cost).toBeCloseTo(42.5, 10);
+  });
+});

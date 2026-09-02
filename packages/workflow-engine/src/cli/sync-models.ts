@@ -18,42 +18,11 @@ import { dirname, join, resolve } from "path";
 import { pathToFileURL } from "url";
 import { type ModelConfig, type ModelSyncConfig } from "../ai/model-helper";
 
-interface OpenRouterPricingOverride {
-  min_prompt_tokens?: number;
-  prompt?: string;
-  completion?: string;
-  [key: string]: unknown;
-}
-
-interface OpenRouterModel {
-  id: string;
-  name: string;
-  description?: string;
-  context_length?: number;
-  architecture?: {
-    input_modalities?: string[];
-    output_modalities?: string[];
-  };
-  pricing?: {
-    prompt?: string;
-    completion?: string;
-    overrides?: OpenRouterPricingOverride[];
-  };
-  supported_parameters?: string[];
-  top_provider?: {
-    context_length?: number;
-    max_completion_tokens?: number;
-  };
-}
-
-interface OpenRouterResponse {
-  data: OpenRouterModel[];
-  total_count?: number;
-  links?: {
-    next?: string | null;
-    [key: string]: unknown;
-  };
-}
+import {
+  type OpenRouterModel,
+  type OpenRouterResponse,
+  toModelConfig,
+} from "./model-catalog";
 
 // Main
 async function main() {
@@ -169,85 +138,7 @@ async function main() {
   const models: Record<string, ModelConfig> = {};
 
   for (const model of filteredModels) {
-    // Convert per-token pricing to per-million
-    const promptPrice = parseFloat(model.pricing?.prompt || "0");
-    const completionPrice = parseFloat(model.pricing?.completion || "0");
-
-    // Check if model supports async batch via catalog lookup
-    const batchSibling = catalogMap.get(`${model.id}:batch`);
-    const supportsAsyncBatch = batchSibling !== undefined;
-
-    let batchModelId: string | undefined;
-    let batchInputCostPerMillion: number | undefined;
-    let batchOutputCostPerMillion: number | undefined;
-
-    if (batchSibling) {
-      batchModelId = `${model.id}:batch`;
-      const batchPromptPrice = parseFloat(batchSibling.pricing?.prompt || "0");
-      const batchCompletionPrice = parseFloat(
-        batchSibling.pricing?.completion || "0",
-      );
-      batchInputCostPerMillion =
-        Math.round(batchPromptPrice * 1_000_000 * 10000) / 10000;
-      batchOutputCostPerMillion =
-        Math.round(batchCompletionPrice * 1_000_000 * 10000) / 10000;
-    }
-
-    // Check if this is an embedding model via architecture.output_modalities
-    const isEmbedding = Boolean(
-      model.architecture?.output_modalities?.includes("embeddings") ||
-        model.architecture?.output_modalities?.includes("embedding"),
-    );
-
-    // Check for tool and structured output support from supported_parameters
-    const supportsTools =
-      model.supported_parameters?.includes("tools") || false;
-    const supportsStructuredOutputs =
-      model.supported_parameters?.includes("structured_outputs") || false;
-
-    // Check for long-context tier override in pricing.overrides
-    let longContextTier: ModelConfig["longContextTier"] | undefined;
-    const longContextOverride = model.pricing?.overrides?.find(
-      (o) => typeof o.min_prompt_tokens === "number",
-    );
-    if (
-      longContextOverride &&
-      typeof longContextOverride.min_prompt_tokens === "number"
-    ) {
-      const lcPromptPrice = parseFloat(longContextOverride.prompt || "0");
-      const lcCompletionPrice = parseFloat(
-        longContextOverride.completion || "0",
-      );
-      longContextTier = {
-        minPromptTokens: longContextOverride.min_prompt_tokens,
-        inputCostPerMillion:
-          Math.round(lcPromptPrice * 1_000_000 * 10000) / 10000,
-        outputCostPerMillion:
-          Math.round(lcCompletionPrice * 1_000_000 * 10000) / 10000,
-      };
-    }
-
-    models[model.id] = {
-      id: model.id,
-      name: model.name,
-      inputCostPerMillion: Math.round(promptPrice * 1_000_000 * 10000) / 10000,
-      outputCostPerMillion:
-        Math.round(completionPrice * 1_000_000 * 10000) / 10000,
-      provider: "openrouter",
-      description: model.description,
-      contextLength: model.top_provider?.context_length ?? model.context_length,
-      maxCompletionTokens: model.top_provider?.max_completion_tokens,
-      ...(isEmbedding && { isEmbeddingModel: true }),
-      ...(supportsTools && { supportsTools: true }),
-      ...(supportsStructuredOutputs && { supportsStructuredOutputs: true }),
-      ...(supportsAsyncBatch && {
-        supportsAsyncBatch: true,
-        batchModelId,
-        batchInputCostPerMillion,
-        batchOutputCostPerMillion,
-      }),
-      ...(longContextTier && { longContextTier }),
-    };
+    models[model.id] = toModelConfig(model, catalogMap);
   }
 
   // Merge custom models
@@ -309,6 +200,9 @@ function generateTypeScript(models: Record<string, ModelConfig>): string {
           ? [
               `    batchOutputCostPerMillion: ${config.batchOutputCostPerMillion},`,
             ]
+          : []),
+        ...(config.batchDiscountPercent !== undefined
+          ? [`    batchDiscountPercent: ${config.batchDiscountPercent},`]
           : []),
         ...(config.longContextTier !== undefined
           ? [

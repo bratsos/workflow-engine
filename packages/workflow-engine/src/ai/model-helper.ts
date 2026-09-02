@@ -31,8 +31,16 @@ export interface ModelConfig {
   provider: string;
   description?: string;
   supportsAsyncBatch?: boolean;
-  /** @deprecated Use batchInputCostPerMillion/batchOutputCostPerMillion. Removal at 1.0. */
-  batchDiscountPercent?: number; // e.g., 50 for Google Batch (50% off)
+  /**
+   * Vendor-documented batch discount for the NATIVE transports (OpenAI Batch,
+   * Anthropic Message Batches, Gemini Batch are all 50% off). Applied only
+   * when batching through one of those vendors, or when no absolute
+   * `batch*CostPerMillion` price is known. The OpenRouter transport always
+   * uses the absolute prices below instead - its multipliers are not uniform.
+   * Populated by `workflow-engine-sync` only for vendors with a documented
+   * discount; never guessed.
+   */
+  batchDiscountPercent?: number;
   /** The ":batch" sibling slug in OpenRouter's catalog, when one exists. */
   batchModelId?: string;
   /** Absolute price of the ":batch" variant, per 1M input tokens. Authoritative; prefer over batchDiscountPercent. */

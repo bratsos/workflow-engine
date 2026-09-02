@@ -182,15 +182,43 @@ export function resolveCost(
 /**
  * Calculate batch cost for a model config, preferring absolute batch prices if available.
  */
+/** Batch transports whose vendor bills its own documented batch discount. */
+const NATIVE_BATCH_TRANSPORTS: ReadonlySet<string> = new Set([
+  "google",
+  "anthropic",
+  "openai",
+]);
+
+/**
+ * Calculate batch cost for a model config.
+ *
+ * Which price applies depends on the TRANSPORT the batch actually ran on:
+ * - a native vendor transport (google/anthropic/openai via @ai-sdk/*) bills the
+ *   vendor's documented discount (`batchDiscountPercent`), which is what the
+ *   sync CLI records for those vendors;
+ * - the OpenRouter transport bills the absolute price of the `:batch` catalog
+ *   row (`batch*CostPerMillion`), which is NOT a uniform multiplier.
+ * When the transport is unknown, absolute prices win over the percentage.
+ */
 export function calculateBatchCost(
   modelConfig: ModelConfig,
   inputTokens: number,
   outputTokens: number,
+  transport?: string,
 ): number {
-  if (
+  const baseCost =
+    (inputTokens / 1_000_000) * modelConfig.inputCostPerMillion +
+    (outputTokens / 1_000_000) * modelConfig.outputCostPerMillion;
+  const hasAbsolute =
     modelConfig.batchInputCostPerMillion !== undefined ||
-    modelConfig.batchOutputCostPerMillion !== undefined
-  ) {
+    modelConfig.batchOutputCostPerMillion !== undefined;
+  const discount = modelConfig.batchDiscountPercent;
+
+  if (transport && NATIVE_BATCH_TRANSPORTS.has(transport) && discount) {
+    return baseCost * (1 - discount / 100);
+  }
+
+  if (hasAbsolute) {
     const inputRate =
       modelConfig.batchInputCostPerMillion ?? modelConfig.inputCostPerMillion;
     const outputRate =
@@ -201,12 +229,8 @@ export function calculateBatchCost(
     );
   }
 
-  const baseCost =
-    (inputTokens / 1_000_000) * modelConfig.inputCostPerMillion +
-    (outputTokens / 1_000_000) * modelConfig.outputCostPerMillion;
-
-  if (modelConfig.batchDiscountPercent) {
-    return baseCost * (1 - modelConfig.batchDiscountPercent / 100);
+  if (discount) {
+    return baseCost * (1 - discount / 100);
   }
 
   return baseCost;
@@ -217,11 +241,12 @@ export function calculateCostWithDiscount(
   inputTokens: number,
   outputTokens: number,
   isBatch: boolean = false,
+  batchTransport?: string,
 ): number {
   const model = getModel(modelKey);
 
   if (isBatch) {
-    return calculateBatchCost(model, inputTokens, outputTokens);
+    return calculateBatchCost(model, inputTokens, outputTokens, batchTransport);
   }
 
   const baseCost = calculateCost(modelKey, inputTokens, outputTokens);

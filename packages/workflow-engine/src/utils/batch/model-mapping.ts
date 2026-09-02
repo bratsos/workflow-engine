@@ -17,6 +17,12 @@ import {
 // Provider Types
 // =============================================================================
 
+const NATIVE_VENDORS: ReadonlySet<string> = new Set([
+  "google",
+  "anthropic",
+  "openai",
+]);
+
 export const BatchProviderName = z.enum([
   "google",
   "anthropic",
@@ -69,7 +75,10 @@ export function getProviderModelId(
 
   const { vendor, nativeId } = parseModelSlug(modelConfig.id);
   if (provider === "openrouter") {
-    return modelConfig.id;
+    // OpenRouter can only batch models it publishes batch pricing for. A
+    // native-vendor model that is batch-capable through @ai-sdk/* but has no
+    // ":batch" catalog row is NOT reachable through this transport.
+    return modelConfig.batchModelId ? modelConfig.id : undefined;
   }
   if (vendor !== provider) {
     return undefined;
@@ -90,7 +99,8 @@ function getDefaultModelForProvider(provider: BatchProviderName): string {
   for (const { config } of models) {
     const { vendor, nativeId } = parseModelSlug(config.id);
     if (provider === "openrouter") {
-      return config.id;
+      if (config.batchModelId) return config.id;
+      continue;
     }
     if (vendor === provider) {
       return nativeId;
@@ -134,6 +144,15 @@ export function resolveModelForProvider(
   const { vendor, nativeId } = parseModelSlug(modelConfig.id);
 
   if (provider === "openrouter") {
+    if (!modelConfig.batchModelId) {
+      const hint = NATIVE_VENDORS.has(vendor)
+        ? `Use the native "${vendor}" provider instead: ai.batch(modelKey, "${vendor}").`
+        : `Pick a model that has a ":batch" variant in OpenRouter's catalog.`;
+      throw new Error(
+        `OpenRouter has no batch pricing for "${modelKey}" (${modelConfig.id}) - ` +
+          `the catalog has no "${modelConfig.id}:batch" row. ${hint}`,
+      );
+    }
     return modelConfig.id;
   }
 

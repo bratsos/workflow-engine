@@ -715,6 +715,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
               r.inputTokens,
               r.outputTokens,
               true,
+              this.provider,
             );
 
             return {
