@@ -24,7 +24,6 @@ export {
   type ModelFilter,
   ModelKey,
   type ModelRegistry,
-  modelSupportsBatch,
   registerModels,
 } from "./ai/model-helper";
 export { NoInputSchema } from "./core/schema-helpers";

@@ -1,14 +1,52 @@
 /**
  * Schema Helpers Tests
  *
- * Tests for requireStageOutput and NoInputSchema.
+ * Tests for NoInputSchema and the `ctx.require()` / `ctx.optional()`
+ * context helpers that replaced the standalone `requireStageOutput()`.
  */
 
 import { describe, expect, it } from "vitest";
-import {
-  NoInputSchema,
-  requireStageOutput,
-} from "../../core/schema-helpers.js";
+import { z } from "zod";
+import { NoInputSchema } from "../../core/schema-helpers.js";
+import type { EnhancedStageContext } from "../../core/stage-factory.js";
+import { defineStage } from "../../core/stage-factory.js";
+
+/**
+ * Run `fn` inside a stage's `execute()` against a hand-built workflow
+ * context, without a kernel.
+ */
+async function withContext<TContext extends Record<string, unknown>>(
+  workflowContext: Partial<TContext>,
+  fn: (ctx: EnhancedStageContext<unknown, unknown, TContext>) => unknown,
+): Promise<unknown> {
+  let captured: unknown;
+  const stage = defineStage<TContext>()({
+    id: "probe",
+    name: "Probe",
+    schemas: { input: "none", output: z.unknown(), config: z.object({}) },
+    async execute(ctx) {
+      captured = fn(ctx);
+      return { output: captured };
+    },
+  });
+  await stage.execute({
+    workflowRunId: "run",
+    stageId: "probe",
+    stageNumber: 1,
+    stageName: "Probe",
+    input: {},
+    config: {},
+    onProgress() {},
+    onLog() {},
+    log() {},
+    annotate() {},
+    storage: {} as never,
+    ai: {} as never,
+    aiLogger: {} as never,
+    workflowContext,
+  });
+  return captured;
+}
 
 describe("I want to use schema helpers to access stage outputs", () => {
   describe("NoInputSchema", () => {
@@ -31,202 +69,98 @@ describe("I want to use schema helpers to access stage outputs", () => {
     });
   });
 
-  describe("requireStageOutput", () => {
-    describe("full output access", () => {
-      it("should return stage output when present", () => {
-        // Given: A workflow context with stage output
-        const workflowContext: Record<string, unknown> = {
-          "data-extraction": { text: "extracted content", pages: 5 },
-        };
+  describe("ctx.require", () => {
+    it("should return stage output when present", async () => {
+      // Given: A workflow context with stage output
+      type Ctx = { "data-extraction": { text: string; pages: number } };
+      const workflowContext: Ctx = {
+        "data-extraction": { text: "extracted content", pages: 5 },
+      };
 
-        // When: I require the stage output
-        const output = requireStageOutput<{ text: string; pages: number }>(
-          workflowContext,
-          "data-extraction",
-        );
+      // When: I require the stage output
+      const output = await withContext<Ctx>(workflowContext, (ctx) =>
+        ctx.require("data-extraction"),
+      );
 
-        // Then: Returns the full output
-        expect(output).toEqual({ text: "extracted content", pages: 5 });
-      });
-
-      it("should throw when stage output is missing", () => {
-        // Given: An empty workflow context
-        const workflowContext: Record<string, unknown> = {};
-
-        // When/Then: Requiring missing stage throws
-        expect(() =>
-          requireStageOutput(workflowContext, "missing-stage"),
-        ).toThrow("Missing output from required stage: missing-stage");
-      });
-
-      it("should include available stages in error message", () => {
-        // Given: A workflow context with some stages
-        const workflowContext: Record<string, unknown> = {
-          "stage-a": { value: 1 },
-          "stage-b": { value: 2 },
-        };
-
-        // When/Then: Error includes available stages
-        expect(() => requireStageOutput(workflowContext, "stage-c")).toThrow(
-          "Available stages: stage-a, stage-b",
-        );
-      });
+      // Then: Returns the full output
+      expect(output).toEqual({ text: "extracted content", pages: 5 });
     });
 
-    describe("field access", () => {
-      it("should return specific field when present", () => {
-        // Given: A workflow context with stage output containing fields
-        const workflowContext: Record<string, unknown> = {
-          guidelines: {
-            guidelines: [
-              { id: "g1", text: "Guideline 1" },
-              { id: "g2", text: "Guideline 2" },
-            ],
-            metadata: { count: 2 },
-          },
-        };
+    it("should throw when stage output is missing", async () => {
+      // Given: An empty workflow context
+      type Ctx = { "missing-stage": { value: number } };
 
-        // When: I require a specific field
-        const guidelines = requireStageOutput<
-          Array<{ id: string; text: string }>
-        >(workflowContext, "guidelines", "guidelines");
+      // When/Then: Requiring the missing stage throws
+      await expect(
+        withContext<Ctx>({}, (ctx) => ctx.require("missing-stage")),
+      ).rejects.toThrow('Missing required stage output: "missing-stage"');
+    });
 
-        // Then: Returns just that field
-        expect(guidelines).toEqual([
-          { id: "g1", text: "Guideline 1" },
-          { id: "g2", text: "Guideline 2" },
-        ]);
-      });
+    it("should include available stages in error message", async () => {
+      // Given: A workflow context with some stages
+      type Ctx = {
+        "stage-a": { value: number };
+        "stage-b": { value: number };
+        "stage-c": { value: number };
+      };
+      const workflowContext: Partial<Ctx> = {
+        "stage-a": { value: 1 },
+        "stage-b": { value: 2 },
+      };
 
-      it("should throw when field is missing", () => {
-        // Given: A workflow context with stage output
-        const workflowContext: Record<string, unknown> = {
-          "my-stage": { existingField: "value" },
-        };
-
-        // When/Then: Requiring missing field throws
-        expect(() =>
-          requireStageOutput(workflowContext, "my-stage", "missingField"),
-        ).toThrow("Missing required field 'missingField' in my-stage output");
-      });
-
-      it("should include available fields in error message", () => {
-        // Given: A workflow context with stage output
-        const workflowContext: Record<string, unknown> = {
-          "my-stage": { fieldA: 1, fieldB: 2 },
-        };
-
-        // When/Then: Error includes available fields
-        expect(() =>
-          requireStageOutput(workflowContext, "my-stage", "fieldC"),
-        ).toThrow("Available fields: fieldA, fieldB");
-      });
-
-      it("should throw when accessing field on non-object output", () => {
-        // Given: A workflow context with primitive output
-        const workflowContext: Record<string, unknown> = {
-          "primitive-stage": "just a string",
-        };
-
-        // When/Then: Accessing field on non-object throws
-        expect(() =>
-          requireStageOutput(workflowContext, "primitive-stage", "field"),
-        ).toThrow("output is not an object, cannot access field 'field'");
-      });
-
-      it("should throw 'not an object' when accessing a field on null output", () => {
-        // Given: A workflow context with null output
-        // Note: requireStageOutput only treats `undefined` as missing
-        // (matching ctx.require's semantics) — null is a defined-but-falsy
-        // value, so it reaches the field-access check instead, same as
-        // any other non-object output.
-        const workflowContext: Record<string, unknown> = {
-          "null-stage": null,
-        };
-
-        // When/Then: Accessing a field on null throws "not an object"
-        expect(() =>
-          requireStageOutput(workflowContext, "null-stage", "field"),
-        ).toThrow("output is not an object, cannot access field 'field'");
-      });
+      // When/Then: Error includes available stages
+      await expect(
+        withContext<Ctx>(workflowContext, (ctx) => ctx.require("stage-c")),
+      ).rejects.toThrow("Available stages: stage-a, stage-b");
     });
 
     describe("falsy-but-defined outputs pass through (not treated as missing)", () => {
-      it("should return 0 as a legitimate stage output", () => {
-        // Given: A workflow context whose stage output is 0
-        const workflowContext: Record<string, unknown> = {
+      it("should return 0, an empty string, false and null as legitimate outputs", async () => {
+        // Given: Stage outputs that are falsy but not undefined
+        type Ctx = {
+          "count-stage": number;
+          "text-stage": string;
+          "flag-stage": boolean;
+          "null-stage": null;
+        };
+        const workflowContext: Ctx = {
           "count-stage": 0,
-        };
-
-        // When: I require the stage output
-        const output = requireStageOutput<number>(
-          workflowContext,
-          "count-stage",
-        );
-
-        // Then: Returns 0, does not throw
-        expect(output).toBe(0);
-      });
-
-      it("should return an empty string as a legitimate stage output", () => {
-        // Given: A workflow context whose stage output is ""
-        const workflowContext: Record<string, unknown> = {
           "text-stage": "",
-        };
-
-        // When: I require the stage output
-        const output = requireStageOutput<string>(
-          workflowContext,
-          "text-stage",
-        );
-
-        // Then: Returns "", does not throw
-        expect(output).toBe("");
-      });
-
-      it("should return false as a legitimate stage output", () => {
-        // Given: A workflow context whose stage output is false
-        const workflowContext: Record<string, unknown> = {
           "flag-stage": false,
-        };
-
-        // When: I require the stage output
-        const output = requireStageOutput<boolean>(
-          workflowContext,
-          "flag-stage",
-        );
-
-        // Then: Returns false, does not throw
-        expect(output).toBe(false);
-      });
-
-      it("should return null as a legitimate stage output", () => {
-        // Given: A workflow context whose stage output is null
-        const workflowContext: Record<string, unknown> = {
           "null-stage": null,
         };
 
-        // When: I require the stage output (no field access)
-        const output = requireStageOutput<null>(workflowContext, "null-stage");
+        // When: I require each stage output
+        const output = await withContext<Ctx>(workflowContext, (ctx) => [
+          ctx.require("count-stage"),
+          ctx.require("text-stage"),
+          ctx.require("flag-stage"),
+          ctx.require("null-stage"),
+        ]);
 
-        // Then: Returns null, does not throw
-        expect(output).toBeNull();
-      });
-
-      it("should still throw only when output is actually undefined", () => {
-        // Given: An empty workflow context
-        const workflowContext: Record<string, unknown> = {};
-
-        // When/Then: Requiring a genuinely-missing stage still throws
-        expect(() =>
-          requireStageOutput(workflowContext, "missing-stage"),
-        ).toThrow("Missing output from required stage: missing-stage");
+        // Then: Each value is returned, nothing throws
+        expect(output).toEqual([0, "", false, null]);
       });
     });
   });
 
+  describe("ctx.optional", () => {
+    it("should return undefined instead of throwing for a missing stage", async () => {
+      // Given: An empty workflow context
+      type Ctx = { "maybe-stage": { value: number } };
+
+      // When: I optionally read the stage output
+      const output = await withContext<Ctx>({}, (ctx) =>
+        ctx.optional("maybe-stage"),
+      );
+
+      // Then: undefined, no throw
+      expect(output).toBeUndefined();
+    });
+  });
+
   describe("real-world usage patterns", () => {
-    it("should support typed extraction from workflow context", () => {
+    it("should support typed extraction from workflow context", async () => {
       // Given: A realistic workflow context
       interface ExtractionOutput {
         text: string;
@@ -238,7 +172,12 @@ describe("I want to use schema helpers to access stage outputs", () => {
         guidelines: Array<{ id: string; text: string; priority: number }>;
       }
 
-      const workflowContext: Record<string, unknown> = {
+      type Ctx = {
+        "pdf-extraction": ExtractionOutput;
+        guidelines: GuidelinesOutput;
+      };
+
+      const workflowContext: Ctx = {
         "pdf-extraction": {
           text: "Document content...",
           tables: [{ headers: ["Name", "Value"], rows: [["Item1", "100"]] }],
@@ -253,20 +192,18 @@ describe("I want to use schema helpers to access stage outputs", () => {
       };
 
       // When: I access multiple stages
-      const extraction = requireStageOutput<ExtractionOutput>(
-        workflowContext,
-        "pdf-extraction",
-      );
-      const guidelines = requireStageOutput<GuidelinesOutput["guidelines"]>(
-        workflowContext,
-        "guidelines",
-        "guidelines",
-      );
+      const output = (await withContext<Ctx>(workflowContext, (ctx) => ({
+        pageCount: ctx.require("pdf-extraction").metadata.pageCount,
+        guidelines: ctx.require("guidelines").guidelines,
+      }))) as {
+        pageCount: number;
+        guidelines: GuidelinesOutput["guidelines"];
+      };
 
       // Then: Data is correctly typed and accessible
-      expect(extraction.metadata.pageCount).toBe(10);
-      expect(guidelines).toHaveLength(2);
-      expect(guidelines[0]?.priority).toBe(1);
+      expect(output.pageCount).toBe(10);
+      expect(output.guidelines).toHaveLength(2);
+      expect(output.guidelines[0]?.priority).toBe(1);
     });
   });
 });

@@ -4,12 +4,18 @@ Complete API for building type-safe workflows with sequential and parallel stage
 
 ## Creating a Workflow
 
-`defineWorkflow({...})` is the recommended way to build a workflow — an options-object API. `output` is optional: it's only the builder's *initial* output type before any stages are piped, and gets silently replaced by the last piped stage's output schema at `.build()`. Most callers can omit it.
+`defineWorkflow` has two forms. The workflow's output schema is always the last stage's `outputSchema` (or the merged object of the last parallel group); there is no separate output option.
 
 ```typescript
 import { defineWorkflow } from "@bratsos/workflow-engine";
 import { z } from "zod";
 
+// id + options: name defaults to the id, input defaults to z.unknown()
+const workflow = defineWorkflow("workflow-id", { input: InputSchema })
+  .stage("first", { schemas: { ... }, execute })
+  .build();
+
+// options object
 const workflow = defineWorkflow({
   id: "workflow-id",
   name: "Workflow Name",
@@ -21,31 +27,35 @@ const workflow = defineWorkflow({
   .build();
 ```
 
-### `new WorkflowBuilder(...)` (deprecated, 5-positional-argument constructor)
-
-The original constructor form. `defineWorkflow` returns the same `WorkflowBuilder` instance with the same chaining, so this is purely a construction-syntax difference — but the positional form is `@deprecated` (removal at 1.0): `inputSchema` and `currentOutputSchema` are both plain `z.ZodTypeAny`, so positional args of the same type are easy to transpose by accident. Prefer `defineWorkflow` above for new code.
-
-```typescript
-import { WorkflowBuilder } from "@bratsos/workflow-engine";
-import { z } from "zod";
-
-const workflow = new WorkflowBuilder(
-  "workflow-id",       // Unique identifier
-  "Workflow Name",     // Display name
-  "Description",       // Description
-  InputSchema,         // Zod schema for workflow input
-  OutputSchema         // Zod schema for final output
-)
-  .pipe(stage1)
-  .pipe(stage2)
-  .build();
-```
+`new WorkflowBuilder(id, name, description, inputSchema, outputSchema)` is the low-level constructor both forms use; it is supported but easy to mistype because two positional arguments share the type `z.ZodTypeAny`.
 
 ## WorkflowBuilder Methods
 
+### stage(id, definition) / stage(prebuiltStage)
+
+Define and add a stage in one call. The definition is the shape `defineStage` accepts (sync or async-batch) minus `id`; `name` defaults to the id. Its context type is the context accumulated so far, so `ctx.require()` is typed and `dependencies` only accepts earlier stage ids. Reusing an id is a type error and a runtime error. See [12-durable-steps.md](12-durable-steps.md#the-builder) for the full walkthrough.
+
+```typescript
+const workflow = defineWorkflow("repository", { input: In })
+  .stage("chapter-index", {
+    schemas: { input: In, output: ChapterIndex, config: z.object({}) },
+    async execute(ctx) { /* ... */ },
+  })
+  .stage("unified-extract", {
+    dependencies: ["chapter-index"],          // type error if not an earlier id
+    schemas: { input: "none", output: Extract, config: z.object({}) },
+    async execute(ctx) {
+      const idx = ctx.require("chapter-index"); // z.infer<typeof ChapterIndex>
+      return { output: { count: idx.chapters.length } };
+    },
+  })
+  .stage(prebuiltStage)                        // defineStage() result; id/output read from its generics
+  .build();
+```
+
 ### pipe(stage)
 
-Add a stage to execute sequentially after the previous stage.
+Add a stage built with `defineStage` to execute sequentially after the previous stage. Same as `.stage(prebuiltStage)` without the duplicate-id check.
 
 ```typescript
 const workflow = defineWorkflow({ ... })
@@ -63,6 +73,28 @@ Each `.pipe()` call:
 ### parallel(stages)
 
 Add multiple stages that execute concurrently in the same execution group.
+
+Two forms. The array form takes stages built with `defineStage`; the callback form takes inline definitions with the same typed context as `.stage()`. Members see the context accumulated *before* the group (they cannot depend on each other) and every member output is available after it.
+
+```typescript
+defineWorkflow("fan-out", { input: In })
+  .stage("index", { /* ... */ })
+  .parallel((group) =>
+    group
+      .stage("left", { dependencies: ["index"], schemas: { /* ... */ }, execute })
+      .stage("right", { schemas: { /* ... */ }, execute })
+      .stage(prebuiltStage),
+  )
+  .stage("join", {
+    dependencies: ["left", "right"],
+    schemas: { /* ... */ },
+    async execute(ctx) {
+      ctx.require("left");  // typed
+      ctx.require("right"); // typed
+      /* ... */
+    },
+  });
+```
 
 ```typescript
 const workflow = defineWorkflow({ ... })
@@ -135,30 +167,6 @@ if (workflow.hasStage("optional-stage")) {
 }
 ```
 
-### getExecutionOrder()
-
-Get a human-readable visualization of execution order.
-
-**`@deprecated`** — Debug/inspection helper for ad-hoc logging; not a stable, structured API (returns freeform text). Prefer `getExecutionPlan()` or `getAllStages()` if you need to consume the execution order programmatically. Removal at 1.0.
-
-```typescript
-console.log(workflow.getExecutionOrder());
-// Workflow: My Workflow (my-workflow)
-// Total stages: 4
-// Execution groups: 3
-//
-// Execution Order:
-// ================
-// 1. Data Extraction (extraction)
-//    Extracts data from documents
-//
-// 2. [PARALLEL]
-//    - Classification (classify)
-//    - Summarization (summarize)
-//
-// 3. Merge Results (merge)
-```
-
 ### getStageConfigs()
 
 Get configuration metadata for all stages.
@@ -204,19 +212,6 @@ if (!result.valid) {
     console.log(`${error.stageId}: ${error.error}`);
   }
 }
-```
-
-### estimateCost(input, config)
-
-Estimate total workflow cost (if stages implement `estimateCost`).
-
-**`@deprecated`** — Rough, pre-execution-only estimate: it always calls every stage's `estimateCost` with the workflow's *original* input rather than propagating each stage's actual (previous-stage) input, so it can't account for real inter-stage data flow. Removal at 1.0.
-
-```typescript
-const cost = workflow.estimateCost(
-  { documentUrl: "..." },
-  workflow.getDefaultConfig()
-);
 ```
 
 ### getStagesInExecutionGroup(groupIndex)
@@ -421,7 +416,7 @@ const documentWorkflow = defineWorkflow({
   .build();
 
 // Use the workflow
-console.log(documentWorkflow.getExecutionOrder());
+console.log("Execution groups:", documentWorkflow.getExecutionPlan().length);
 console.log("Default config:", documentWorkflow.getDefaultConfig());
 
 // Validate custom config

@@ -78,10 +78,6 @@ export const SuspendedStateSchema = z.object({
   batchId: z.string(),
   statusUrl: z.string().optional(),
   /**
-   * @deprecated Unused — kept for deprecation window only. Persisting raw API keys in state is insecure. Removal at 1.0.
-   */
-  apiKey: z.string().optional(),
-  /**
    * ISO date string.
    * @deprecated Optional — kept for a deprecation window only.
    * `defineStage()` still back-fills its resolved value here (in addition

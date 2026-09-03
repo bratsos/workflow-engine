@@ -26,7 +26,13 @@
  */
 
 import { z } from "zod";
+import type { NoInputSchema } from "./schema-helpers";
 import type { Stage } from "./stage";
+import {
+  type AsyncBatchStageDefinition,
+  defineStage,
+  type SyncStageDefinition,
+} from "./stage-factory";
 
 // ============================================================================
 // Stage Node - Represents a stage in the execution plan
@@ -189,53 +195,6 @@ export class Workflow<
   }
 
   /**
-   * Get a visual representation of the workflow execution order
-   *
-   * @deprecated Debug/inspection helper for ad-hoc logging; not a stable,
-   * structured API (returns freeform text). Prefer `getExecutionPlan()` or
-   * `getAllStages()` if you need to consume the execution order
-   * programmatically. Removal at 1.0.
-   */
-  getExecutionOrder(): string {
-    const executionPlan = this.getExecutionPlan();
-    const lines: string[] = [];
-
-    lines.push(`Workflow: ${this.name} (${this.id})`);
-    lines.push(`Total stages: ${this.stages.length}`);
-    lines.push(`Execution groups: ${executionPlan.length}`);
-    lines.push("");
-    lines.push("Execution Order:");
-    lines.push("================");
-
-    for (let i = 0; i < executionPlan.length; i++) {
-      const group = executionPlan[i];
-      const groupNumber = i + 1;
-
-      if (group.length === 1) {
-        // Sequential stage
-        const stage = group[0].stage;
-        lines.push(`${groupNumber}. ${stage.name} (${stage.id})`);
-        if (stage.description) {
-          lines.push(`   ${stage.description}`);
-        }
-      } else {
-        // Parallel stages
-        lines.push(`${groupNumber}. [PARALLEL]`);
-        for (const node of group) {
-          const stage = node.stage;
-          lines.push(`   - ${stage.name} (${stage.id})`);
-          if (stage.description) {
-            lines.push(`     ${stage.description}`);
-          }
-        }
-      }
-      lines.push("");
-    }
-
-    return lines.join("\n");
-  }
-
-  /**
    * Get all stage IDs in execution order
    *
    * @returns Array of stage IDs
@@ -301,33 +260,6 @@ export class Workflow<
       valid: errors.length === 0,
       errors,
     };
-  }
-
-  /**
-   * Estimate total cost for the workflow
-   *
-   * @deprecated Rough, pre-execution-only estimate: it always calls every
-   * stage's `estimateCost` with the workflow's original input rather than
-   * propagating each stage's actual (previous-stage) input, so it can't
-   * account for real inter-stage data flow. Removal at 1.0.
-   */
-  estimateCost(
-    input: z.infer<TInput>,
-    config: Record<string, unknown>,
-  ): number {
-    let totalCost = 0;
-    const currentInput = input;
-
-    for (const node of this.stages) {
-      if (node.stage.estimateCost) {
-        const stageConfig = config[node.stage.id] || {};
-        totalCost += node.stage.estimateCost(currentInput, stageConfig);
-      }
-      // Note: We can't accurately propagate input for estimation without execution
-      // This is a rough estimate only
-    }
-
-    return totalCost;
   }
 
   /**
@@ -417,6 +349,154 @@ export class Workflow<
 }
 
 // ============================================================================
+// Builder-first stage definitions
+// ============================================================================
+
+/**
+ * Resolve the input schema type for a `"none"` input the same way
+ * `defineStage` does.
+ */
+type ResolveInput<TInput extends z.ZodTypeAny | "none"> = TInput extends "none"
+  ? typeof NoInputSchema
+  : TInput;
+
+/**
+ * Evaluates to `unknown` (the identity for intersection) when `TId` is not
+ * yet a stage id in `TContext`, and to `never` when it is — so
+ * `id: TId & UniqueStageId<TId, TContext>` rejects a duplicate id at the
+ * call site while still letting TypeScript infer `TId` as a literal.
+ */
+type UniqueStageId<
+  TId extends string,
+  TContext extends Record<string, unknown>,
+> = TId extends keyof TContext ? never : unknown;
+
+/**
+ * Fields the builder supplies or constrains on top of `defineStage`'s
+ * definition shape: `id` comes from the first argument, `name` defaults to
+ * the id, and `dependencies` may only name stages already in the workflow.
+ */
+interface BuilderStageMeta<TContext extends Record<string, unknown>> {
+  /** Human-readable name. Defaults to the stage id. */
+  name?: string;
+  /** Stage ids this stage depends on. Only earlier stage ids are accepted. */
+  dependencies?: Array<keyof TContext & string>;
+}
+
+/**
+ * A stage definition as accepted by {@link WorkflowBuilder.stage}: the same
+ * shape `defineStage` takes (sync or async-batch), minus `id`, with `name`
+ * optional, `dependencies` restricted to earlier stage ids, and `TContext`
+ * fixed to the context accumulated so far — so `ctx.require()` and
+ * `ctx.optional()` are typed without a cast.
+ */
+export type BuilderStageDefinition<
+  TId extends string,
+  TInput extends z.ZodTypeAny | "none",
+  TOutput extends z.ZodTypeAny,
+  TConfig extends z.ZodTypeAny,
+  TContext extends Record<string, unknown>,
+> =
+  | (Omit<
+      SyncStageDefinition<TInput, TOutput, TConfig, TContext, TId>,
+      "id" | "name" | "dependencies"
+    > &
+      BuilderStageMeta<TContext>)
+  | (Omit<
+      AsyncBatchStageDefinition<TInput, TOutput, TConfig, TContext, TId>,
+      "id" | "name" | "dependencies"
+    > &
+      BuilderStageMeta<TContext>);
+
+function buildInlineStage<
+  TId extends string,
+  TInput extends z.ZodTypeAny | "none",
+  TOutput extends z.ZodTypeAny,
+  TConfig extends z.ZodTypeAny,
+  TContext extends Record<string, unknown>,
+>(
+  id: TId,
+  definition: BuilderStageDefinition<TId, TInput, TOutput, TConfig, TContext>,
+): Stage<ResolveInput<TInput>, TOutput, TConfig, TContext, TId> {
+  const full = {
+    ...definition,
+    id,
+    name: definition.name ?? id,
+    dependencies: definition.dependencies as string[] | undefined,
+  } as
+    | SyncStageDefinition<TInput, TOutput, TConfig, TContext, TId>
+    | AsyncBatchStageDefinition<TInput, TOutput, TConfig, TContext, TId>;
+  return defineStage<TContext>()(full);
+}
+
+function isStage(value: unknown): value is Stage<any, any, any, any, string> {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "outputSchema" in value &&
+    "execute" in value
+  );
+}
+
+/**
+ * Collects the members of one parallel execution group. Obtained through
+ * {@link WorkflowBuilder.parallel}'s callback form; every member sees the
+ * context accumulated *before* the group (members cannot depend on each
+ * other), and all member outputs become available after it.
+ */
+export class ParallelGroupBuilder<
+  TContext extends Record<string, unknown>,
+  TSchemas extends Record<string, z.ZodTypeAny> = {},
+> {
+  /** @internal */
+  readonly members: Stage<any, any, any, any, string>[] = [];
+
+  /**
+   * Add an inline stage definition to the group. Same shape as
+   * {@link WorkflowBuilder.stage}.
+   */
+  stage<
+    TId extends string,
+    TInput extends z.ZodTypeAny | "none",
+    TOutput extends z.ZodTypeAny,
+    TConfig extends z.ZodTypeAny,
+  >(
+    id: TId & UniqueStageId<TId, TContext & TSchemas>,
+    definition: BuilderStageDefinition<TId, TInput, TOutput, TConfig, TContext>,
+  ): ParallelGroupBuilder<TContext, TSchemas & { [K in TId]: TOutput }>;
+  /** Add a stage built with `defineStage` to the group. */
+  stage<
+    TStageInput extends z.ZodTypeAny,
+    TStageOutput extends z.ZodTypeAny,
+    TStageConfig extends z.ZodTypeAny,
+    TStageContext extends Record<string, unknown>,
+    TStageId extends string,
+  >(
+    stage: Stage<
+      TStageInput,
+      TStageOutput,
+      TStageConfig,
+      TStageContext,
+      TStageId
+    > &
+      UniqueStageId<TStageId, TContext & TSchemas>,
+  ): ParallelGroupBuilder<
+    TContext,
+    TSchemas & { [K in TStageId]: TStageOutput }
+  >;
+  stage(
+    idOrStage: string | Stage<any, any, any, any, string>,
+    definition?: any,
+  ) {
+    const stage = isStage(idOrStage)
+      ? idOrStage
+      : buildInlineStage(idOrStage, definition);
+    this.members.push(stage);
+    return this as unknown as ParallelGroupBuilder<TContext, any>;
+  }
+}
+
+// ============================================================================
 // Workflow Builder - Fluent API with Context Accumulation
 // ============================================================================
 
@@ -429,19 +509,15 @@ export class WorkflowBuilder<
   private currentExecutionGroup = 0;
 
   /**
-   * @deprecated Prefer {@link defineWorkflow}, an options-object API over
-   * this 5-positional-argument constructor — `inputSchema` and
-   * `currentOutputSchema` are both plain `z.ZodTypeAny`, so positional args
-   * of the same type are easy to transpose by accident. Removal at 1.0.
+   * Low-level constructor. Prefer {@link defineWorkflow}, which takes the
+   * same values by name and defaults the ones that are optional.
    *
    * @param id - Workflow ID
    * @param name - Human-readable name
    * @param description - Human-readable description
    * @param inputSchema - Zod schema for the workflow's input
-   * @param currentOutputSchema - Initial output schema. @deprecated
-   *   Decorative for any workflow with at least one piped stage — silently
-   *   replaced by the last piped stage's `outputSchema` when `.build()` is
-   *   called. Only relevant for a zero-stage workflow. Removal at 1.0.
+   * @param currentOutputSchema - Output schema of a zero-stage workflow. It
+   *   is replaced by the last stage's `outputSchema` as soon as one is added.
    */
   constructor(
     private id: string,
@@ -450,6 +526,120 @@ export class WorkflowBuilder<
     private inputSchema: TInput,
     private currentOutputSchema: TCurrentOutput,
   ) {}
+
+  private assertUniqueStageId(stageId: string): void {
+    if (this.stages.some((node) => node.stage.id === stageId)) {
+      throw new Error(
+        `Stage "${stageId}" is already in workflow "${this.id}". Stage ids must be unique.`,
+      );
+    }
+  }
+
+  private assertDependencies(
+    stage: { id: string; dependencies?: string[] },
+    where: string,
+  ): void {
+    if (!stage.dependencies) return;
+    const existingStageIds = this.stages.map((s) => s.stage.id);
+    const missingDeps = stage.dependencies.filter(
+      (dep) => !existingStageIds.includes(dep),
+    );
+    if (missingDeps.length > 0) {
+      throw new Error(
+        `Stage "${stage.id}"${where} has missing dependencies: ${missingDeps.join(", ")}. ` +
+          `These stages must be added to the workflow before ${
+            where ? "this parallel group" : `"${stage.id}"`
+          }. ` +
+          `Current stages: ${
+            existingStageIds.length === 0
+              ? "(none)"
+              : existingStageIds.join(", ")
+          }`,
+      );
+    }
+  }
+
+  /**
+   * Define and add a stage in one call.
+   *
+   * The definition is the same shape `defineStage` accepts (sync or
+   * async-batch), but its `TContext` is the context accumulated by the
+   * builder so far: `ctx.require("earlier-stage")` returns that stage's
+   * output type, and `dependencies` only accepts earlier stage ids. Reusing
+   * an id already in the workflow is a type error.
+   *
+   * @example
+   * ```typescript
+   * const workflow = defineWorkflow("repository")
+   *   .stage("chapter-index", {
+   *     schemas: { input: In, output: ChapterIndex, config: z.object({}) },
+   *     async execute(ctx) { return { output: { chapters: [] } }; },
+   *   })
+   *   .stage("unified-extract", {
+   *     dependencies: ["chapter-index"],
+   *     schemas: { input: "none", output: Extract, config: z.object({}) },
+   *     async execute(ctx) {
+   *       const idx = ctx.require("chapter-index"); // typed
+   *       return { output: { count: idx.chapters.length } };
+   *     },
+   *   })
+   *   .build();
+   * ```
+   */
+  stage<
+    TId extends string,
+    TStageInput extends z.ZodTypeAny | "none",
+    TStageOutput extends z.ZodTypeAny,
+    TStageConfig extends z.ZodTypeAny,
+  >(
+    id: TId & UniqueStageId<TId, TContext>,
+    definition: BuilderStageDefinition<
+      TId,
+      TStageInput,
+      TStageOutput,
+      TStageConfig,
+      TContext
+    >,
+  ): WorkflowBuilder<
+    TInput,
+    TStageOutput,
+    TContext & { [K in TId]: z.infer<TStageOutput> }
+  >;
+  /**
+   * Add a stage built with `defineStage`. Its id and output type are read
+   * from the stage's generics, exactly like {@link WorkflowBuilder.pipe},
+   * plus a duplicate-id check.
+   */
+  stage<
+    TStageInput extends z.ZodTypeAny,
+    TStageOutput extends z.ZodTypeAny,
+    TStageConfig extends z.ZodTypeAny,
+    TStageContext extends Record<string, unknown>,
+    TStageId extends string,
+  >(
+    stage: Stage<
+      TStageInput,
+      TStageOutput,
+      TStageConfig,
+      TStageContext,
+      TStageId
+    > &
+      UniqueStageId<TStageId, TContext>,
+  ): WorkflowBuilder<
+    TInput,
+    TStageOutput,
+    TContext & { [K in TStageId]: z.infer<TStageOutput> }
+  >;
+  stage(
+    idOrStage: string | Stage<any, any, any, any, string>,
+    definition?: any,
+  ): WorkflowBuilder<TInput, any, any> {
+    const stage = isStage(idOrStage)
+      ? idOrStage
+      : buildInlineStage(idOrStage, definition);
+    this.assertUniqueStageId(stage.id);
+    return this.pipe(stage);
+  }
 
   /**
    * Add a stage to the workflow (sequential execution)
@@ -483,25 +673,7 @@ export class WorkflowBuilder<
     TStageOutput,
     TContext & { [K in TStageId]: z.infer<TStageOutput> }
   > {
-    // Validate stage dependencies
-    if (stage.dependencies) {
-      const existingStageIds = this.stages.map((s) => s.stage.id);
-      const missingDeps = stage.dependencies.filter(
-        (dep) => !existingStageIds.includes(dep),
-      );
-
-      if (missingDeps.length > 0) {
-        throw new Error(
-          `Stage "${stage.id}" has missing dependencies: ${missingDeps.join(", ")}. ` +
-            `These stages must be added to the workflow before "${stage.id}". ` +
-            `Current stages: ${
-              existingStageIds.length === 0
-                ? "(none)"
-                : existingStageIds.join(", ")
-            }`,
-        );
-      }
-    }
+    this.assertDependencies(stage, "");
 
     this.currentExecutionGroup++;
 
@@ -522,21 +694,19 @@ export class WorkflowBuilder<
   }
 
   /**
-   * Add a stage with strict input type checking
+   * Add multiple stages that execute in parallel.
    *
-   * Note: pipeStrict() and pipeLoose() have been removed as they were
-   * just aliases for pipe(). Use pipe() for all stage chaining.
-   */
-
-  /**
-   * Add multiple stages that execute in parallel
+   * Two forms:
    *
-   * All stages receive the same input (current output)
-   * Their outputs are merged into an object by stage ID and accumulated in context.
+   * - `parallel([stageA, stageB])` — stages built with `defineStage`.
+   * - `parallel((group) => group.stage("a", {...}).stage("b", {...}))` —
+   *   inline definitions with the same typed context as
+   *   {@link WorkflowBuilder.stage}. Members see the context accumulated
+   *   *before* the group.
    *
-   * Note: This accepts stages regardless of strict input type matching.
-   * This is necessary because stages using passthrough() can accept objects
-   * with additional fields. Runtime validation via Zod ensures type safety.
+   * All stages receive the same input (current output). Their outputs are
+   * merged into an object keyed by stage ID, which becomes the current
+   * output, and each output is accumulated in the context under its id.
    *
    * Validates that all declared dependencies exist in the workflow.
    */
@@ -552,30 +722,44 @@ export class WorkflowBuilder<
     TInput,
     MergeParallelOutputSchema<TStages>,
     TContext & MergeParallelContext<TStages>
-  > {
-    // Validate dependencies for all parallel stages
-    const existingStageIds = this.stages.map((s) => s.stage.id);
+  >;
+  parallel<TSchemas extends Record<string, z.ZodTypeAny>>(
+    build: (
+      group: ParallelGroupBuilder<TContext, {}>,
+    ) => ParallelGroupBuilder<TContext, TSchemas>,
+  ): WorkflowBuilder<
+    TInput,
+    z.ZodObject<TSchemas>,
+    TContext & { [K in keyof TSchemas]: z.infer<TSchemas[K]> }
+  >;
+  parallel(
+    stagesOrBuild:
+      | { id: string; outputSchema: z.ZodTypeAny; dependencies?: string[] }[]
+      | ((
+          group: ParallelGroupBuilder<TContext, {}>,
+        ) => ParallelGroupBuilder<TContext, any>),
+  ): WorkflowBuilder<TInput, any, any> {
+    const stages =
+      typeof stagesOrBuild === "function"
+        ? stagesOrBuild(new ParallelGroupBuilder<TContext>()).members
+        : stagesOrBuild;
 
-    for (const stage of stages) {
-      if (stage.dependencies) {
-        const missingDeps = stage.dependencies.filter(
-          (dep) => !existingStageIds.includes(dep),
-        );
-
-        if (missingDeps.length > 0) {
+    if (typeof stagesOrBuild === "function") {
+      const seen = new Set<string>();
+      for (const stage of stages) {
+        this.assertUniqueStageId(stage.id);
+        if (seen.has(stage.id)) {
           throw new Error(
-            `Stage "${stage.id}" (in parallel group) has missing dependencies: ${missingDeps.join(
-              ", ",
-            )}. ` +
-              `These stages must be added to the workflow before this parallel group. ` +
-              `Current stages: ${
-                existingStageIds.length === 0
-                  ? "(none)"
-                  : existingStageIds.join(", ")
-              }`,
+            `Stage "${stage.id}" appears twice in one parallel group. Stage ids must be unique.`,
           );
         }
+        seen.add(stage.id);
       }
+    }
+
+    // Validate dependencies for all parallel stages
+    for (const stage of stages) {
+      this.assertDependencies(stage, " (in parallel group)");
     }
 
     this.currentExecutionGroup++;
@@ -597,14 +781,10 @@ export class WorkflowBuilder<
         },
         {} as Record<string, z.ZodTypeAny>,
       ),
-    ) as unknown as MergeParallelOutputSchema<TStages>;
+    );
 
-    const builder = this as unknown as WorkflowBuilder<
-      TInput,
-      MergeParallelOutputSchema<TStages>,
-      TContext & MergeParallelContext<TStages>
-    >;
-    builder.currentOutputSchema = mergedSchema;
+    const builder = this as unknown as WorkflowBuilder<TInput, any, any>;
+    (builder as any).currentOutputSchema = mergedSchema;
 
     return builder;
   }
@@ -625,45 +805,48 @@ export class WorkflowBuilder<
 }
 
 // ============================================================================
-// defineWorkflow - Options-Object Alternative to `new WorkflowBuilder(...)`
+// defineWorkflow
 // ============================================================================
 
 /**
- * Options accepted by {@link defineWorkflow}.
+ * Options accepted by {@link defineWorkflow}'s object form.
  */
-export interface DefineWorkflowOptions<
-  TInput extends z.ZodTypeAny,
-  TOutput extends z.ZodTypeAny,
-> {
+export interface DefineWorkflowOptions<TInput extends z.ZodTypeAny> {
   id: string;
   name: string;
   description?: string;
   input: TInput;
-  /**
-   * Optional. This is only used as the builder's *initial* output type
-   * (before any stages are piped) — it is silently replaced by the last
-   * piped stage's `outputSchema` when `.build()` is called, exactly like
-   * the 5th positional argument to `new WorkflowBuilder(...)`. It has no
-   * effect on the final workflow's output schema, so most callers can omit
-   * it and let `.pipe()`/`.parallel()` calls determine the output type.
-   *
-   * @deprecated Decorative for any workflow with at least one piped stage;
-   * only relevant for a zero-stage workflow. Most callers should omit
-   * this. Removal at 1.0.
-   */
-  output?: TOutput;
 }
 
 /**
- * Create a {@link WorkflowBuilder} from an options object instead of the
- * 5-positional-argument constructor.
+ * Options accepted by {@link defineWorkflow}'s `(id, options?)` form.
+ */
+export interface WorkflowOptions<TInput extends z.ZodTypeAny> {
+  /** Human-readable name. Defaults to the id. */
+  name?: string;
+  description?: string;
+  /** Zod schema for the workflow's input. Defaults to `z.unknown()`. */
+  input?: TInput;
+}
+
+/**
+ * Create a {@link WorkflowBuilder}.
+ *
+ * The workflow's output schema is always the last stage's `outputSchema`
+ * (or the merged object of the last parallel group); there is no separate
+ * output option.
  *
  * @example
  * ```typescript
+ * // id + options
+ * const workflow = defineWorkflow("my-workflow", { input: InputSchema })
+ *   .stage("first", { schemas: { ... }, execute })
+ *   .build();
+ *
+ * // options object
  * const workflow = defineWorkflow({
  *   id: "my-workflow",
  *   name: "My Workflow",
- *   description: "Does something useful",
  *   input: InputSchema,
  * })
  *   .pipe(stage1)
@@ -671,18 +854,33 @@ export interface DefineWorkflowOptions<
  *   .build();
  * ```
  */
-export function defineWorkflow<
-  TInput extends z.ZodTypeAny,
-  TOutput extends z.ZodTypeAny = TInput,
->(
-  options: DefineWorkflowOptions<TInput, TOutput>,
-): WorkflowBuilder<TInput, TOutput> {
+export function defineWorkflow<TInput extends z.ZodTypeAny = z.ZodUnknown>(
+  id: string,
+  options?: WorkflowOptions<TInput>,
+): WorkflowBuilder<TInput, TInput>;
+export function defineWorkflow<TInput extends z.ZodTypeAny>(
+  options: DefineWorkflowOptions<TInput>,
+): WorkflowBuilder<TInput, TInput>;
+export function defineWorkflow(
+  idOrOptions: string | DefineWorkflowOptions<z.ZodTypeAny>,
+  options: WorkflowOptions<z.ZodTypeAny> = {},
+): WorkflowBuilder<z.ZodTypeAny, z.ZodTypeAny> {
+  if (typeof idOrOptions === "string") {
+    const input = options.input ?? z.unknown();
+    return new WorkflowBuilder(
+      idOrOptions,
+      options.name ?? idOrOptions,
+      options.description ?? "",
+      input,
+      input,
+    );
+  }
   return new WorkflowBuilder(
-    options.id,
-    options.name,
-    options.description ?? "",
-    options.input,
-    (options.output ?? options.input) as TOutput,
+    idOrOptions.id,
+    idOrOptions.name,
+    idOrOptions.description ?? "",
+    idOrOptions.input,
+    idOrOptions.input,
   );
 }
 

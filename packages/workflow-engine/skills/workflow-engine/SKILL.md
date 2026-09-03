@@ -110,7 +110,7 @@ await kernel.dispatch({
 | `defineStage` | Function | `@bratsos/workflow-engine` | Create sync stages. Curried form `defineStage<TContext>()({...})` is recommended when you need typed `ctx.require()`/`ctx.optional()` — see 01-stage-definitions.md |
 | `defineAsyncBatchStage` | Function | `@bratsos/workflow-engine` | Create async/batch stages |
 | `defineWorkflow` | Function | `@bratsos/workflow-engine` | **Recommended** way to build a workflow (options-object API, v0.11+); returns a `WorkflowBuilder` to `.pipe()`/`.parallel()`/`.build()` |
-| `WorkflowBuilder` | Class | `@bratsos/workflow-engine` | Chain stages into workflows. Its 5-positional-argument constructor (`new WorkflowBuilder(id, name, description, input, output)`) is `@deprecated` in favor of `defineWorkflow()` — the class itself (and `.pipe()`/`.parallel()`/`.build()`) is unaffected |
+| `WorkflowBuilder` | Class | `@bratsos/workflow-engine` | Chain stages into workflows: `.stage(id, def)` (typed `ctx.require`, dependency ids checked), `.stage(prebuilt)`, `.pipe()`, `.parallel([...])` / `.parallel((group) => ...)`, `.build()`. Create it with `defineWorkflow(id, options?)` or `defineWorkflow({...})` |
 | `createKernel` | Function | `@bratsos/workflow-engine/kernel` | Create command kernel |
 | `createNodeHost` | Function | `@bratsos/workflow-engine-host-node` | Create Node.js host |
 | `createServerlessHost` | Function | `@bratsos/workflow-engine-host-serverless` | Create serverless host |
@@ -229,7 +229,7 @@ const batchStage = defineAsyncBatchStage({
 
 Workflows are linear pipelines of **execution groups**. `.pipe()` creates single-stage groups; `.parallel()` creates multi-stage groups. Parallel group outputs are keyed by stage ID in the workflow context.
 
-Build with `defineWorkflow({...})` (recommended) — the 5-positional-argument `new WorkflowBuilder(id, name, description, input, output)` constructor is `@deprecated` (same-typed positional args are easy to transpose by accident); both return the same builder for `.pipe()`/`.parallel()`/`.build()`.
+Build with `defineWorkflow(id, { input })` or `defineWorkflow({ id, name, input })`. `.stage(id, definition)` defines and adds a stage whose `ctx.require()` is typed from the stages before it and whose `dependencies` must name earlier stage ids; `.pipe(stage)` / `.stage(stage)` add a `defineStage()` result. See [references/12-durable-steps.md](references/12-durable-steps.md#the-builder).
 
 ```typescript
 const workflow = defineWorkflow({
@@ -555,6 +555,7 @@ Implementing a custom `WorkflowPersistence`/`JobQueue`/`AICallLogger` adapter? V
 - [09-troubleshooting.md](references/09-troubleshooting.md) - Debugging stuck runs, P2002 errors, ghost jobs
 - [10-annotations.md](references/10-annotations.md) - First-class provenance surface: `ctx.annotate`, `kernel.annotations.*`, conventions catalog
 - [11-remote-activity-workers.md](references/11-remote-activity-workers.md) - Credential-free remote workers: `defineRemoteStage`, broker, worker SDK, HTTP transport, S3/R2 artifacts, `ActivityExecutor` port
+- [12-durable-steps.md](references/12-durable-steps.md) - Durable steps (`ctx.step.run/waitFor/waitForSignal/sleep`), determinism rules, `ctx.step.ai.*` and `ai.map` policies, `ctx.ai` injection, adapter seam and timeouts, the builder-first `defineWorkflow().stage()` API, migrating async-batch stages to steps
 
 ## Key Principles
 

@@ -36,7 +36,6 @@ import { streamText as streamTextImpl } from "./stream";
 import type {
   AIBatch,
   AIBatchProvider,
-  AICallType,
   AIEmbedResult,
   AIHelper,
   AIHelperContext,
@@ -194,58 +193,15 @@ class AIHelperImpl implements AIHelper {
     );
   }
 
-  // Overloaded recordCall to support both new object-based API and legacy positional API
-  recordCall(
-    paramsOrModelKey: RecordCallParams | ModelKey,
-    prompt?: string,
-    response?: string,
-    tokens?: { input: number; output: number },
-    options?: {
-      callType?: AICallType;
-      isBatch?: boolean;
-      metadata?: Record<string, unknown>;
-    },
-  ): void {
-    let modelKey: ModelKey;
-    let actualPrompt: string;
-    let actualResponse: string;
-    let inputTokens: number;
-    let outputTokens: number;
-    let callType: AICallType;
-    let isBatch: boolean;
-    let metadata: Record<string, unknown> | undefined;
-
-    // Check if first argument is the new object-based params or legacy modelKey string
-    if (
-      typeof paramsOrModelKey === "object" &&
-      "modelKey" in paramsOrModelKey
-    ) {
-      // New object-based API
-      const params = paramsOrModelKey as RecordCallParams;
-      modelKey = params.modelKey;
-      actualPrompt = params.prompt;
-      actualResponse = params.response;
-      inputTokens = params.inputTokens;
-      outputTokens = params.outputTokens;
-      callType = params.callType;
-      isBatch = callType === "batch";
-      metadata = params.metadata;
-    } else {
-      // Legacy positional API - see the @deprecated overload on AIHelper.recordCall.
-      if (!prompt || !response || !tokens) {
-        throw new Error(
-          "recordCall: legacy API requires prompt, response, and tokens",
-        );
-      }
-      modelKey = paramsOrModelKey;
-      actualPrompt = prompt;
-      actualResponse = response;
-      inputTokens = tokens.input;
-      outputTokens = tokens.output;
-      callType = options?.callType ?? "text";
-      isBatch = options?.isBatch ?? false;
-      metadata = options?.metadata;
-    }
+  recordCall(params: RecordCallParams): void {
+    const modelKey = params.modelKey;
+    const actualPrompt = params.prompt;
+    const actualResponse = params.response;
+    const inputTokens = params.inputTokens;
+    const outputTokens = params.outputTokens;
+    const callType = params.callType;
+    const isBatch = callType === "batch";
+    const metadata = params.metadata;
 
     const modelConfig = getModel(modelKey);
     const cost = calculateCostWithDiscount(

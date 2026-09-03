@@ -161,7 +161,6 @@ export interface SimpleSuspendedResult {
     /** Defaults to `pollConfig.maxWaitTime`, or 24h if neither is set. */
     maxWaitTime?: number;
     metadata?: Record<string, unknown>;
-    apiKey?: string;
   };
   /**
    * Optional — derived automatically from `state` when omitted.

@@ -1,7 +1,7 @@
 /**
  * Model Helper Tests
  *
- * Tests for the model helper utilities: getModel, calculateCost, ModelStatsTracker, etc.
+ * Tests for the model helper utilities: getModel, calculateCost, listModels, registerModels, etc.
  */
 
 import { describe, expect, it } from "vitest";
@@ -9,14 +9,9 @@ import {
   AVAILABLE_MODELS,
   calculateCost,
   DEFAULT_MODEL_KEY,
-  getDefaultModel,
   getModel,
-  getRegisteredModel,
   listModels,
-  listRegisteredModels,
   type ModelConfig,
-  ModelStatsTracker,
-  modelSupportsBatch,
   registerModels,
 } from "../../ai/model-helper.js";
 import {
@@ -43,10 +38,10 @@ describe("I want to use model helper utilities", () => {
     });
   });
 
-  describe("getDefaultModel", () => {
-    it("should return the default model config", () => {
+  describe("default model", () => {
+    it("should resolve DEFAULT_MODEL_KEY through getModel", () => {
       // When: I get the default model
-      const model = getDefaultModel();
+      const model = getModel(DEFAULT_MODEL_KEY);
 
       // Then: Returns the default model
       expect(model).toBeDefined();
@@ -87,145 +82,6 @@ describe("I want to use model helper utilities", () => {
       // Then: Cost is proportionally small
       expect(cost.totalCost).toBeLessThan(0.01);
       expect(cost.totalCost).toBeGreaterThan(0);
-    });
-  });
-
-  describe("ModelStatsTracker", () => {
-    describe("single model tracking", () => {
-      it("should track API calls", () => {
-        // Given: A tracker
-        const tracker = new ModelStatsTracker("gemini-2.5-flash");
-
-        // When: I record calls
-        tracker.recordCall(100, 50);
-        tracker.recordCall(200, 100);
-
-        // Then: Stats are aggregated
-        const stats = tracker.getStats();
-        expect(stats?.apiCalls).toBe(2);
-        expect(stats?.inputTokens).toBe(300);
-        expect(stats?.outputTokens).toBe(150);
-      });
-
-      it("should calculate costs from recorded calls", () => {
-        // Given: A tracker with calls
-        const tracker = new ModelStatsTracker("gemini-2.5-flash");
-        tracker.recordCall(1_000_000, 500_000);
-
-        // When: I get stats
-        const stats = tracker.getStats();
-
-        // Then: Cost is calculated
-        expect(stats?.totalCost).toBeGreaterThan(0);
-        expect(stats?.inputCost).toBeCloseTo(0.3, 2);
-      });
-
-      it("should return model info", () => {
-        // Given: A tracker
-        const tracker = new ModelStatsTracker("gemini-2.5-flash");
-
-        // When: I get stats
-        const stats = tracker.getStats();
-
-        // Then: Model info is included
-        expect(stats?.modelId).toContain("gemini");
-        expect(stats?.modelName).toContain("Gemini");
-      });
-
-      it("should reset stats", () => {
-        // Given: A tracker with calls
-        const tracker = new ModelStatsTracker("gemini-2.5-flash");
-        tracker.recordCall(100, 50);
-        expect(tracker.getStats()?.apiCalls).toBe(1);
-
-        // When: I reset
-        tracker.reset();
-
-        // Then: Stats are cleared
-        expect(tracker.getStats()?.apiCalls).toBe(0);
-        expect(tracker.getStats()?.inputTokens).toBe(0);
-      });
-    });
-
-    describe("aggregating tracker", () => {
-      it("should create aggregating tracker", () => {
-        // When: I create an aggregating tracker
-        const tracker = ModelStatsTracker.createAggregating();
-
-        // Then: getStats returns null (use getAggregatedStats instead)
-        expect(tracker.getStats()).toBeNull();
-      });
-
-      it("should track calls with model override", () => {
-        // Given: An aggregating tracker
-        const tracker = ModelStatsTracker.createAggregating();
-
-        // When: I record calls with model override
-        tracker.recordCall(100, 50, "gemini-2.5-flash");
-        tracker.recordCall(200, 100, "gemini-2.5-flash");
-
-        // Then: Stats are aggregated
-        const { totals } = tracker.getAggregatedStats();
-        expect(totals.totalApiCalls).toBe(2);
-        expect(totals.totalInputTokens).toBe(300);
-        expect(totals.totalOutputTokens).toBe(150);
-      });
-
-      it("should track per-model stats", () => {
-        // Given: An aggregating tracker with multiple model calls
-        const tracker = ModelStatsTracker.createAggregating();
-        tracker.recordCall(100, 50, "gemini-2.5-flash");
-        tracker.recordCall(100, 50, "gemini-2.5-flash");
-
-        // When: I get aggregated stats
-        const { perModel } = tracker.getAggregatedStats();
-
-        // Then: Per-model breakdown is available
-        expect(perModel).toHaveLength(1);
-        expect(perModel[0]?.apiCalls).toBe(2);
-      });
-
-      it("should reset aggregated stats", () => {
-        // Given: An aggregating tracker with calls
-        const tracker = ModelStatsTracker.createAggregating();
-        tracker.recordCall(100, 50, "gemini-2.5-flash");
-
-        // When: I reset
-        tracker.reset();
-
-        // Then: Stats are cleared
-        const { totals } = tracker.getAggregatedStats();
-        expect(totals.totalApiCalls).toBe(0);
-      });
-    });
-
-    describe("getModelById", () => {
-      it("should return model helper with bound recordCall", () => {
-        // Given: A tracker
-        const tracker = new ModelStatsTracker("gemini-2.5-flash");
-
-        // When: I get model by ID
-        const model = tracker.getModelById("gemini-2.5-flash");
-
-        // Then: Returns helper with id and name
-        expect(model.id).toContain("gemini");
-        expect(model.name).toContain("Gemini");
-        expect(typeof model.recordCall).toBe("function");
-      });
-
-      it("should record calls through bound function", () => {
-        // Given: A tracker with model helper
-        const tracker = new ModelStatsTracker("gemini-2.5-flash");
-        const model = tracker.getModelById("gemini-2.5-flash");
-
-        // When: I record via bound function
-        model.recordCall(100, 50);
-
-        // Then: Stats are updated
-        const stats = tracker.getStats();
-        expect(stats?.apiCalls).toBe(1);
-        expect(stats?.inputTokens).toBe(100);
-      });
     });
   });
 
@@ -270,13 +126,13 @@ describe("I want to use model helper utilities", () => {
     });
   });
 
-  describe("modelSupportsBatch", () => {
-    it("should return true for batch-compatible model", () => {
-      // When: I check a batch-compatible model
-      const supports = modelSupportsBatch("gemini-2.5-flash");
+  describe("batch capability", () => {
+    it("should expose supportsAsyncBatch on a batch-compatible model", () => {
+      // When: I read the model's config
+      const model = getModel("gemini-2.5-flash");
 
-      // Then: Returns true
-      expect(supports).toBe(true);
+      // Then: The flag is set
+      expect(model.supportsAsyncBatch).toBe(true);
     });
   });
 
@@ -299,18 +155,10 @@ describe("I want to use model helper utilities", () => {
       // When: I register the model
       registerModels(customModels);
 
-      // Then: Model is retrievable
-      const model = getRegisteredModel("test-custom-model");
-      expect(model?.name).toBe("Test Custom Model");
-    });
-
-    it("should list registered models", () => {
-      // Given: Some registered models (from previous test or setup)
-      // When: I list registered models
-      const models = listRegisteredModels();
-
-      // Then: Returns array
-      expect(Array.isArray(models)).toBe(true);
+      // Then: Model is retrievable through getModel and listed by listModels
+      const model = getModel("test-custom-model");
+      expect(model.name).toBe("Test Custom Model");
+      expect(listModels().map((m) => m.key)).toContain("test-custom-model");
     });
   });
 

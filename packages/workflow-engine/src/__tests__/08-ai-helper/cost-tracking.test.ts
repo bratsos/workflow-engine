@@ -394,17 +394,22 @@ describe("I want to track AI costs using AIHelper", () => {
       expect(calls[0]?.prompt).toBe("Manual prompt");
     });
 
-    it("should record call with legacy params", () => {
-      // Given: Legacy params
-      ai.recordCall("gemini-2.5-flash", "Legacy prompt", "Legacy response", {
-        input: 30,
-        output: 15,
+    it("should record a call with an explicit call type", () => {
+      // Given: An object-form record for a non-text call
+      ai.recordCall({
+        modelKey: "gemini-2.5-flash",
+        callType: "object",
+        prompt: "Object prompt",
+        response: "Object response",
+        inputTokens: 30,
+        outputTokens: 15,
       });
 
-      // Then: Call is recorded
+      // Then: Call is recorded with that call type
       const calls = ai.getCalls();
       expect(calls).toHaveLength(1);
-      expect(calls[0]?.prompt).toBe("Legacy prompt");
+      expect(calls[0]?.prompt).toBe("Object prompt");
+      expect(calls[0]?.type).toBe("object");
     });
 
     it("should include recorded calls in stats", async () => {

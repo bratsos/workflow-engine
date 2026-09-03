@@ -4,10 +4,7 @@
  * Export core workflow components for external use.
  */
 
-export {
-  NoInputSchema,
-  requireStageOutput,
-} from "./core/schema-helpers";
+export { NoInputSchema } from "./core/schema-helpers";
 export { type Stage } from "./core/stage";
 export {
   type AsyncBatchStageDefinition,
@@ -52,6 +49,7 @@ export {
 export { type StageResult } from "./core/types";
 // Core Workflow
 export {
+  type BuilderStageDefinition,
   type DefineWorkflowOptions,
   defineWorkflow,
   type InferStageOutputById,
@@ -59,8 +57,10 @@ export {
   type InferWorkflowInput,
   type InferWorkflowOutput,
   type InferWorkflowStageIds,
+  ParallelGroupBuilder,
   Workflow,
   WorkflowBuilder,
+  type WorkflowOptions,
 } from "./core/workflow";
 
 // =============================================================================
@@ -123,25 +123,14 @@ export {
   AVAILABLE_MODELS,
   calculateCost,
   DEFAULT_MODEL_KEY,
-  /** @deprecated Tests-only. Prefer configuring models via `registerModels()`. Removal at 1.0. */
-  getDefaultModel,
   getModel,
-  getModelById,
-  /** @deprecated Tests-only. Prefer configuring models via `registerModels()`. Removal at 1.0. */
-  getRegisteredModel,
   listModels,
-  /** @deprecated Tests-only. Prefer configuring models via `registerModels()`. Removal at 1.0. */
-  listRegisteredModels,
   type ModelConfig,
   type ModelFilter,
   ModelKey,
   type ModelRegistry,
   type ModelStats,
-  /** @deprecated Tests-only. Removal at 1.0. */
-  ModelStatsTracker,
   type ModelSyncConfig,
-  /** @deprecated Tests-only. Prefer checking `getModel(key)`'s config directly. Removal at 1.0. */
-  modelSupportsBatch,
   registerModels,
 } from "./ai/model-helper";
 export type {

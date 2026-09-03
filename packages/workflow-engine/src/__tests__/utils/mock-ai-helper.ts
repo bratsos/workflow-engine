@@ -359,46 +359,18 @@ export class MockAIHelper implements AIHelper {
   // Recording Methods
   // ============================================================================
 
-  recordCall(
-    paramsOrModelKey: RecordCallParams | ModelKey,
-    prompt?: string,
-    response?: string,
-    tokens?: { input: number; output: number },
-    options?: {
-      callType?: AICallType;
-      isBatch?: boolean;
-      metadata?: Record<string, unknown>;
-    },
-  ): void {
-    if (
-      typeof paramsOrModelKey === "object" &&
-      "modelKey" in paramsOrModelKey
-    ) {
-      const params = paramsOrModelKey as RecordCallParams;
-      this.recordCallInternal({
-        type: params.callType,
-        modelKey: params.modelKey,
-        prompt: params.prompt,
-        response: params.response,
-        inputTokens: params.inputTokens,
-        outputTokens: params.outputTokens,
-        cost: 0,
-        options: params.metadata,
-        timestamp: new Date(),
-      });
-    } else {
-      this.recordCallInternal({
-        type: options?.callType ?? "text",
-        modelKey: paramsOrModelKey,
-        prompt: prompt ?? "",
-        response: response ?? "",
-        inputTokens: tokens?.input ?? 0,
-        outputTokens: tokens?.output ?? 0,
-        cost: 0,
-        options: options?.metadata,
-        timestamp: new Date(),
-      });
-    }
+  recordCall(params: RecordCallParams): void {
+    this.recordCallInternal({
+      type: params.callType,
+      modelKey: params.modelKey,
+      prompt: params.prompt,
+      response: params.response,
+      inputTokens: params.inputTokens,
+      outputTokens: params.outputTokens,
+      cost: 0,
+      options: params.metadata,
+      timestamp: new Date(),
+    });
   }
 
   async getStats(): Promise<AIHelperStats> {

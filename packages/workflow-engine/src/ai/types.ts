@@ -510,21 +510,6 @@ export interface AIHelper {
   // Manual Recording (new object-based API)
   recordCall(params: RecordCallParams): void;
 
-  /**
-   * @deprecated Use the object-based `recordCall(params: RecordCallParams)`
-   * overload instead. Kept for backward compatibility with older workflow code.
-   */
-  recordCall(
-    modelKey: ModelKey,
-    prompt: string,
-    response: string,
-    tokens: { input: number; output: number },
-    options?: {
-      callType?: AICallType;
-      isBatch?: boolean;
-      metadata?: Record<string, unknown>;
-    },
-  ): void;
   // Stats (queries DB)
   getStats(): Promise<AIHelperStats>;
 }
