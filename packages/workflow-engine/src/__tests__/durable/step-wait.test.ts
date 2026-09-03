@@ -84,6 +84,9 @@ describe("durable waits", () => {
       seq: 0,
       kind: "signal",
       status: "completed",
+      attempt: 1,
+      leaseExpiresAt: null,
+      deadlineAt: null,
       result: { approved: true },
     });
     await expect(

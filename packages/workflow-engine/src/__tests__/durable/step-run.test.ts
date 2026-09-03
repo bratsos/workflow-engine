@@ -59,7 +59,7 @@ describe("StepApi.run", () => {
     await expect(
       api().run("work", async () => ({ value: BigInt(1) })),
     ).rejects.toBeInstanceOf(StepResultNotSerializable);
-    expect((await ledger.get("stage-1", "work"))?.status).toBe("failed");
+    expect((await ledger.get("stage-1", "work"))?.status).toBe("running");
   });
 
   it("rejects duplicate step ids within one invocation", async () => {

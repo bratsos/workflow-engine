@@ -1,4 +1,10 @@
-import type { StepLedger, StepRecord } from "../../kernel/ports.js";
+import { Prisma } from "@prisma/client";
+import type {
+  StepLedger,
+  StepRecord,
+  StepRecordExpectation,
+  StepRecordPatch,
+} from "../../kernel/ports.js";
 import type { EnginePrismaClient } from "./prisma-client-type.js";
 
 type PrismaClient = EnginePrismaClient;
@@ -19,12 +25,30 @@ function mapStep(record: any): StepRecord {
     seq: record.seq,
     kind: record.kind,
     status: record.status,
-    result: record.result ?? undefined,
-    error: record.error ?? undefined,
+    attempt: record.attempt,
+    leaseExpiresAt: record.leaseExpiresAt,
+    deadlineAt: record.deadlineAt,
+    result: record.result === null ? null : record.result,
+    error: record.error ?? null,
     waitState: record.waitState ?? undefined,
     createdAt: record.createdAt,
     updatedAt: record.updatedAt,
   };
+}
+
+function mapPatch(patch: StepRecordPatch): Record<string, unknown> {
+  const data: Record<string, unknown> = {};
+  if (patch.status !== undefined) data.status = patch.status;
+  if (patch.attempt !== undefined) data.attempt = patch.attempt;
+  if (patch.leaseExpiresAt !== undefined)
+    data.leaseExpiresAt = patch.leaseExpiresAt;
+  if (patch.deadlineAt !== undefined) data.deadlineAt = patch.deadlineAt;
+  if (Object.hasOwn(patch, "result")) {
+    data.result = patch.result === null ? Prisma.JsonNull : patch.result;
+  }
+  if (Object.hasOwn(patch, "error")) data.error = patch.error ?? null;
+  if (patch.waitState !== undefined) data.waitState = patch.waitState;
+  return data;
 }
 
 /** Prisma-backed durable step ledger. */
@@ -42,7 +66,15 @@ export class PrismaStepLedger implements StepLedger {
           seq: record.seq,
           kind: record.kind,
           status: record.status,
-          ...(record.result !== undefined ? { result: record.result } : {}),
+          attempt: record.attempt,
+          leaseExpiresAt: record.leaseExpiresAt,
+          deadlineAt: record.deadlineAt,
+          ...(record.result !== undefined
+            ? {
+                result:
+                  record.result === null ? Prisma.JsonNull : record.result,
+              }
+            : {}),
           ...(record.error !== undefined ? { error: record.error } : {}),
           ...(record.waitState !== undefined
             ? { waitState: record.waitState }
@@ -72,21 +104,32 @@ export class PrismaStepLedger implements StepLedger {
   async update(
     stageRecordId: string,
     stepId: string,
-    patch: Partial<
-      Pick<StepRecord, "status" | "result" | "error" | "waitState">
-    >,
+    patch: StepRecordPatch,
   ): Promise<StepRecord> {
-    const data: Record<string, unknown> = {};
-    if (patch.status !== undefined) data.status = patch.status;
-    if (patch.result !== undefined) data.result = patch.result;
-    if (patch.error !== undefined) data.error = patch.error;
-    if (patch.waitState !== undefined) data.waitState = patch.waitState;
-
     const updated = await this.prisma.workflowStep.update({
       where: { stageRecordId_stepId: { stageRecordId, stepId } },
-      data,
+      data: mapPatch(patch),
     });
     return mapStep(updated);
+  }
+
+  async compareAndSet(
+    stageRecordId: string,
+    stepId: string,
+    expected: StepRecordExpectation,
+    patch: StepRecordPatch,
+  ): Promise<{ applied: boolean; record: StepRecord | null }> {
+    const { count } = await this.prisma.workflowStep.updateMany({
+      where: {
+        stageRecordId,
+        stepId,
+        status: expected.status,
+        attempt: expected.attempt,
+      },
+      data: mapPatch(patch),
+    });
+    const record = await this.get(stageRecordId, stepId);
+    return { applied: count > 0 && record !== null, record };
   }
 
   async list(stageRecordId: string): Promise<StepRecord[]> {

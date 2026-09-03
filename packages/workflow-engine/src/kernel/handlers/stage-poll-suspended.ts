@@ -17,6 +17,7 @@
  */
 
 import type { CheckCompletionContext, Stage } from "../../core/stage";
+import { DURABLE_SUSPEND_MARKER, StepTimeoutError } from "../../core/steps.js";
 import {
   isSuspendedResult,
   type StageResult,
@@ -39,6 +40,7 @@ import {
   markStageCancelled,
   normalizeAnnotateArgs,
   resolveStageInput,
+  saveStageArtifacts,
   saveStageOutput,
   toErrorMessage,
   toOutboxEvents,
@@ -104,6 +106,35 @@ async function failStageOnly(
 
 type ReplayOutcome = "resumed" | "suspended" | "failed" | "skip";
 
+async function failExpiredDurableWait(
+  stageRecordId: string,
+  deps: KernelDeps,
+): Promise<void> {
+  if (!deps.stepLedger) return;
+  const now = deps.clock.now().getTime();
+  const expired = (await deps.stepLedger.list(stageRecordId)).find(
+    (record) =>
+      (record.kind === "wait" || record.kind === "signal") &&
+      record.status === "pending" &&
+      record.deadlineAt !== null &&
+      record.deadlineAt.getTime() <= now,
+  );
+  if (!expired) return;
+
+  const error = new StepTimeoutError(expired.stepId);
+  const failed = await deps.stepLedger.compareAndSet(
+    stageRecordId,
+    expired.stepId,
+    { status: expired.status, attempt: expired.attempt },
+    {
+      status: "failed",
+      error: error.message,
+      leaseExpiresAt: null,
+    },
+  );
+  if (failed.applied) throw error;
+}
+
 /** Replays a durable stage's full execute context outside a transaction. */
 async function replayStage(
   stageRecord: WorkflowStageRecord,
@@ -118,6 +149,7 @@ async function replayStage(
     if (!workflow) {
       throw new Error(`Workflow ${run.workflowId} not found in registry`);
     }
+    await failExpiredDurableWait(stageRecord.id, deps);
     const workflowContext = await loadWorkflowContext(run.id, deps);
     const rawInput = resolveStageInput(
       workflow,
@@ -213,16 +245,23 @@ async function replayStage(
       }
     }
 
-    const outputKey =
-      stageResult.output === undefined
-        ? undefined
-        : await saveStageOutput(
+    const outputKey = await saveStageOutput(
+      stageRecord.workflowRunId,
+      run.workflowType,
+      stageRecord.stageId,
+      validatedOutput,
+      deps,
+    );
+    const artifactKeys =
+      stageResult.artifacts && Object.keys(stageResult.artifacts).length > 0
+        ? await saveStageArtifacts(
             stageRecord.workflowRunId,
             run.workflowType,
             stageRecord.stageId,
-            validatedOutput,
+            stageResult.artifacts,
             deps,
-          );
+          )
+        : undefined;
     const duration =
       deps.clock.now().getTime() -
       (stageRecord.startedAt?.getTime() ?? deps.clock.now().getTime());
@@ -236,7 +275,10 @@ async function replayStage(
           status: "COMPLETED",
           completedAt: deps.clock.now(),
           duration,
-          outputData: outputKey ? { _artifactKey: outputKey } : undefined,
+          outputData: {
+            _artifactKey: outputKey,
+            ...(artifactKeys ? { _artifactKeys: artifactKeys } : {}),
+          },
           nextPollAt: null,
           metrics: stageResult.metrics as any,
           embeddingInfo: stageResult.embeddings as any,
@@ -332,10 +374,15 @@ export async function handleStagePollSuspended(
 
     // 3c. Get stage definition
     const stageDef = workflow.getStage(stageRecord.stageId);
-    if (
-      !stageDef ||
-      (stageDef.resumeStrategy !== "replay" && !stageDef.checkCompletion)
-    ) {
+    const suspendedMetadata = (
+      stageRecord.suspendedState as
+        | { metadata?: Record<string, unknown> }
+        | null
+        | undefined
+    )?.metadata;
+    const isDurableReplay =
+      suspendedMetadata?.[DURABLE_SUSPEND_MARKER] === true;
+    if (!stageDef || (!isDurableReplay && !stageDef.checkCompletion)) {
       const errorMsg = !stageDef
         ? `Stage ${stageRecord.stageId} not found in workflow ${run.workflowId}`
         : `Stage ${stageRecord.stageId} does not support checkCompletion`;
@@ -345,13 +392,7 @@ export async function handleStagePollSuspended(
       continue;
     }
 
-    // A stage that carries a checkCompletion() ALWAYS resumes through it —
-    // that path is the pre-durable-steps contract and must stay byte-for-byte.
-    // Replay is only for stages that have no checkCompletion (they suspended
-    // from inside a durable step). `resumeStrategy` is stamped at build time,
-    // and hosts such as the remote-activity proxy attach checkCompletion after
-    // building, so presence of the hook is the authoritative signal.
-    if (stageDef.resumeStrategy === "replay" && !stageDef.checkCompletion) {
+    if (isDurableReplay) {
       const outcome = await replayStage(stageRecord, run, stageDef, deps);
       if (outcome === "resumed") {
         resumed++;

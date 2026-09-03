@@ -38,7 +38,18 @@ export {
   type SimpleStageResult,
   type SyncStageDefinition,
 } from "./core/stage-factory";
-export type { StepApi } from "./core/steps";
+export {
+  isStepControlFlowError,
+  type StepApi,
+  StepInFlight,
+  StepLedgerNotConfiguredError,
+  StepLedgerWriteError,
+  StepResultNotSerializable,
+  type StepRunOptions,
+  StepSuspend,
+  StepTimeoutError,
+  type StepWaitOptions,
+} from "./core/steps";
 export type {
   AnnotationCreatedEvent,
   KernelEvent,

@@ -90,6 +90,9 @@ export async function handleJobExecute(
       _events: [],
     };
   }
+  if (existingStage?.status === "FAILED") {
+    await deps.stepLedger?.clear(existingStage.id);
+  }
 
   // ── Phase 1: Start transaction ───────────────────────────────────
   // Upsert stage to RUNNING and write stage:started outbox event.

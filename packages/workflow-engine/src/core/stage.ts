@@ -282,9 +282,6 @@ export interface Stage<
   // Execution mode
   mode?: StageMode;
 
-  /** How suspended stages are resumed. Factory-built durable stages use replay. */
-  resumeStrategy?: "replay" | "checkCompletion";
-
   // Optional: Cost estimation
   estimateCost?: (input: z.infer<TInput>, config: z.infer<TConfig>) => number;
 }

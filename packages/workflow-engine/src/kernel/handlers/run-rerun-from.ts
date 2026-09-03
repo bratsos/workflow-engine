@@ -80,9 +80,6 @@ export async function handleRunRerunFrom(
   );
 
   // 10. Delete stage records
-  // Durable steps are keyed by stageRecordId. This handler deletes the old
-  // record and prepareExecutionGroup creates a fresh record with a new id,
-  // so stale step results cannot be replayed and no ledger.clear is needed.
   for (const stage of stagesToDelete) {
     await deps.persistence.deleteStage(stage.id);
   }
@@ -136,6 +133,10 @@ export async function handleRunRerunFrom(
     // lost-job case is covered by run.reapStuck's PENDING-without-job
     // recovery sweep.
     _postCommit: async (postDeps) => {
+      for (const stage of stagesToDelete) {
+        await postDeps.stepLedger?.clear(stage.id);
+      }
+
       for (const prefix of blobPrefixesToDelete) {
         const keys = await postDeps.blobStore
           .list(prefix)

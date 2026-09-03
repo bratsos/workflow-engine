@@ -191,6 +191,8 @@ export interface StepSignalCommand {
 
 export interface StepSignalResult {
   readonly signalled: boolean;
+  readonly ok: true;
+  readonly alreadyCompleted: boolean;
 }
 
 // ---------------------------------------------------------------------------

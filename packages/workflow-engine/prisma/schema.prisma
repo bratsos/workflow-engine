@@ -102,6 +102,11 @@ model WorkflowStep {
   seq           Int
   kind          String
   status        String
+  // Migration SQL note: add "attempt" INT NOT NULL DEFAULT 1,
+  // "leaseExpiresAt" TIMESTAMP NULL, and "deadlineAt" TIMESTAMP NULL.
+  attempt        Int       @default(1)
+  leaseExpiresAt DateTime?
+  deadlineAt     DateTime?
   result        Json?
   error         String?
   waitState     Json?

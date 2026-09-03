@@ -1,4 +1,9 @@
-import type { StepLedger, StepRecord } from "../kernel/ports.js";
+import type {
+  StepLedger,
+  StepRecord,
+  StepRecordExpectation,
+  StepRecordPatch,
+} from "../kernel/ports.js";
 
 export interface InMemoryStepLedgerOptions {
   now?: () => Date;
@@ -14,6 +19,12 @@ function cloneRecord(record: StepRecord): StepRecord {
     ...record,
     result: cloneJson(record.result),
     waitState: record.waitState ? { ...record.waitState } : undefined,
+    leaseExpiresAt: record.leaseExpiresAt
+      ? new Date(record.leaseExpiresAt.getTime())
+      : null,
+    deadlineAt: record.deadlineAt
+      ? new Date(record.deadlineAt.getTime())
+      : null,
     createdAt: new Date(record.createdAt.getTime()),
     updatedAt: new Date(record.updatedAt.getTime()),
   };
@@ -42,6 +53,12 @@ export class InMemoryStepLedger implements StepLedger {
       updatedAt: now,
       result: cloneJson(record.result),
       waitState: record.waitState ? { ...record.waitState } : undefined,
+      leaseExpiresAt: record.leaseExpiresAt
+        ? new Date(record.leaseExpiresAt.getTime())
+        : null,
+      deadlineAt: record.deadlineAt
+        ? new Date(record.deadlineAt.getTime())
+        : null,
     };
     // The check and write are synchronous, so no other async caller can
     // interleave between them in this in-memory implementation.
@@ -57,9 +74,7 @@ export class InMemoryStepLedger implements StepLedger {
   async update(
     stageRecordId: string,
     stepId: string,
-    patch: Partial<
-      Pick<StepRecord, "status" | "result" | "error" | "waitState">
-    >,
+    patch: StepRecordPatch,
   ): Promise<StepRecord> {
     const key = this.key(stageRecordId, stepId);
     const existing = this.records.get(key);
@@ -78,10 +93,40 @@ export class InMemoryStepLedger implements StepLedger {
           ? { ...patch.waitState }
           : undefined
         : existing.waitState,
+      leaseExpiresAt: Object.hasOwn(patch, "leaseExpiresAt")
+        ? patch.leaseExpiresAt
+          ? new Date(patch.leaseExpiresAt.getTime())
+          : null
+        : existing.leaseExpiresAt,
+      deadlineAt: Object.hasOwn(patch, "deadlineAt")
+        ? patch.deadlineAt
+          ? new Date(patch.deadlineAt.getTime())
+          : null
+        : existing.deadlineAt,
       updatedAt: this.now(),
     };
     this.records.set(key, updated);
     return cloneRecord(updated);
+  }
+
+  async compareAndSet(
+    stageRecordId: string,
+    stepId: string,
+    expected: StepRecordExpectation,
+    patch: StepRecordPatch,
+  ): Promise<{ applied: boolean; record: StepRecord | null }> {
+    const existing = this.records.get(this.key(stageRecordId, stepId));
+    if (!existing) return { applied: false, record: null };
+    if (
+      existing.status !== expected.status ||
+      existing.attempt !== expected.attempt
+    ) {
+      return { applied: false, record: cloneRecord(existing) };
+    }
+    // The check and write are synchronous, so no other async caller can
+    // interleave between them in this in-memory implementation.
+    const record = await this.update(stageRecordId, stepId, patch);
+    return { applied: true, record };
   }
 
   async list(stageRecordId: string): Promise<StepRecord[]> {

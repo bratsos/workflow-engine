@@ -6,22 +6,64 @@
  * definitions do not depend on kernel internals.
  */
 
+/** Internal marker carried in suspended-state metadata for durable replay. */
+export const DURABLE_SUSPEND_MARKER = "__durable" as const;
+
+/** Cross-bundle brand for durable-step control-flow errors. */
+export const STEP_CONTROL_FLOW: unique symbol = Symbol.for(
+  "@bratsos/workflow-engine/step-control-flow",
+) as typeof STEP_CONTROL_FLOW;
+
+/** Internal accessor used by the stage factory to detect swallowed suspension. */
+export const STEP_API_PENDING_CONTROL_FLOW: unique symbol = Symbol.for(
+  "@bratsos/workflow-engine/step-api-pending-control-flow",
+) as typeof STEP_API_PENDING_CONTROL_FLOW;
+
+export interface StepRunOptions {
+  /** Lease held while `fn` executes. Defaults to five minutes. */
+  leaseMs?: number;
+  /** Number of retries after the first failed attempt. Defaults to zero. */
+  retries?: number;
+  /** Delay before retrying a failed attempt. Defaults to zero. */
+  retryDelayMs?: number;
+}
+
+export interface StepWaitOptions<T> {
+  poll: () => Promise<T>;
+  ready: (value: T) => boolean;
+  every: number | string;
+  timeout: number | string;
+  /** Backoff after `poll` throws. Defaults to `every`. */
+  pollBackoffMs?: number;
+}
+
+/**
+ * Durable operations available to a stage.
+ *
+ * Never catch errors thrown by `ctx.step.*` without rethrowing; use
+ * `isStepControlFlowError` when a catch boundary must distinguish suspension.
+ */
 export interface StepApi {
-  run<T>(id: string, fn: () => Promise<T>): Promise<T>;
-  waitFor<T>(
+  /**
+   * Memoize one side effect by id.
+   *
+   * Results round-trip through JSON: Dates become strings, `undefined` object
+   * fields disappear, and Maps/Sets lose their runtime types.
+   */
+  run<T>(
     id: string,
-    opts: {
-      poll: () => Promise<T>;
-      ready: (v: T) => boolean;
-      every: number | string;
-      timeout: number | string;
-    },
+    fn: () => Promise<T>,
+    options?: StepRunOptions,
   ): Promise<T>;
+  waitFor<T>(id: string, opts: StepWaitOptions<T>): Promise<T>;
   waitForSignal<T = unknown>(
     id: string,
     opts: { timeout: number | string },
   ): Promise<T>;
   sleep(id: string, duration: number | string): Promise<void>;
+  readonly [STEP_API_PENDING_CONTROL_FLOW]?: () =>
+    | StepControlFlowError
+    | undefined;
 }
 
 export interface StepSuspendOptions {
@@ -30,15 +72,19 @@ export interface StepSuspendOptions {
   nextPollAt: Date;
   maxWaitUntil: Date;
   pollInterval?: number;
+  kind?: "wait" | "retry";
 }
 
 /** Internal control-flow error used to suspend a durable stage. */
 export class StepSuspend extends Error {
+  readonly [STEP_CONTROL_FLOW] = true as const;
   readonly stepId: string;
   readonly nextPollAt: Date;
+  readonly resumeAt: Date;
   readonly maxWaitUntil: Date;
   readonly pollInterval?: number;
   readonly at: Date;
+  readonly kind: "wait" | "retry";
 
   constructor(options: StepSuspendOptions) {
     super(`Durable step "${options.stepId}" is waiting`);
@@ -46,13 +92,16 @@ export class StepSuspend extends Error {
     this.stepId = options.stepId;
     this.at = options.at ?? new Date();
     this.nextPollAt = options.nextPollAt;
+    this.resumeAt = options.nextPollAt;
     this.maxWaitUntil = options.maxWaitUntil;
     this.pollInterval = options.pollInterval;
+    this.kind = options.kind ?? "wait";
   }
 }
 
 /** Internal control-flow error used when another replay owns a run step. */
 export class StepInFlight extends Error {
+  readonly [STEP_CONTROL_FLOW] = true as const;
   readonly stepId: string;
   readonly at: Date;
 
@@ -61,6 +110,43 @@ export class StepInFlight extends Error {
     this.name = "StepInFlight";
     this.stepId = stepId;
     this.at = at;
+  }
+}
+
+export type StepControlFlowError = StepSuspend | StepInFlight;
+
+/** Detect durable-step suspension reliably across duplicated package bundles. */
+export function isStepControlFlowError(
+  error: unknown,
+): error is StepControlFlowError {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    (error as { [STEP_CONTROL_FLOW]?: unknown })[STEP_CONTROL_FLOW] === true
+  );
+}
+
+/** Thrown after a durable wait reaches its original, non-sliding deadline. */
+export class StepTimeoutError extends Error {
+  readonly stepId: string;
+
+  constructor(stepId: string) {
+    super(`Durable wait step "${stepId}" exceeded its timeout`);
+    this.name = "StepTimeoutError";
+    this.stepId = stepId;
+  }
+}
+
+/** Thrown when a completed step result cannot be committed to its ledger. */
+export class StepLedgerWriteError extends Error {
+  readonly stepId: string;
+  readonly originalError: unknown;
+
+  constructor(stepId: string, originalError: unknown) {
+    super(`Failed to persist completed durable step "${stepId}"`);
+    this.name = "StepLedgerWriteError";
+    this.stepId = stepId;
+    this.originalError = originalError;
   }
 }
 

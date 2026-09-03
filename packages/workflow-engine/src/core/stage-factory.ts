@@ -33,7 +33,14 @@
 import type { z } from "zod";
 import { NoInputSchema } from "./schema-helpers";
 import type { CheckCompletionContext, Stage, StageContext } from "./stage";
-import { type StepApi, StepInFlight, StepSuspend } from "./steps.js";
+import {
+  DURABLE_SUSPEND_MARKER,
+  isStepControlFlowError,
+  STEP_API_PENDING_CONTROL_FLOW,
+  type StepApi,
+  type StepInFlight,
+  type StepSuspend,
+} from "./steps.js";
 import type {
   CompletionCheckResult,
   ProgressUpdate,
@@ -437,11 +444,6 @@ function buildStage<
     name: definition.name,
     description: definition.description,
     mode: isAsyncBatch ? "async-batch" : "sync",
-    resumeStrategy:
-      typeof (definition as { checkCompletion?: unknown }).checkCompletion ===
-      "function"
-        ? "checkCompletion"
-        : "replay",
     dependencies: definition.dependencies,
 
     inputSchema: inputSchema as any,
@@ -460,13 +462,20 @@ function buildStage<
       try {
         result = await definition.execute(enhancedContext);
       } catch (error) {
-        if (error instanceof StepSuspend) {
-          return durableSuspendedResult(error);
-        }
-        if (error instanceof StepInFlight) {
-          return durableInFlightResult(error);
-        }
+        if (isStepControlFlowError(error))
+          return durableControlFlowResult(error);
         throw error;
+      }
+
+      const pendingSuspend = (enhancedContext.step as StepApi | undefined)?.[
+        STEP_API_PENDING_CONTROL_FLOW
+      ]?.();
+      if (pendingSuspend) {
+        enhancedContext.log(
+          "WARN",
+          "execute() returned after a durable step requested suspension; the return value was discarded",
+        );
+        return durableControlFlowResult(pendingSuspend);
       }
 
       // If suspended, pass through with auto-filled metrics and derived poll config
@@ -630,7 +639,7 @@ function durableSuspendedResult(error: StepSuspend): SuspendedResult {
       submittedAt: now.toISOString(),
       pollInterval,
       maxWaitTime,
-      metadata: { __durable: true, stepId: error.stepId },
+      metadata: { [DURABLE_SUSPEND_MARKER]: true, stepId: error.stepId },
     },
     pollConfig: {
       pollInterval,
@@ -657,7 +666,7 @@ function durableInFlightResult(error: StepInFlight): SuspendedResult {
       submittedAt: now.toISOString(),
       pollInterval: 5_000,
       maxWaitTime,
-      metadata: { __durable: true, stepId: error.stepId },
+      metadata: { [DURABLE_SUSPEND_MARKER]: true, stepId: error.stepId },
     },
     pollConfig: {
       pollInterval: 5_000,
@@ -670,6 +679,15 @@ function durableInFlightResult(error: StepInFlight): SuspendedResult {
       duration: 0,
     },
   };
+}
+
+function durableControlFlowResult(
+  error: StepSuspend | StepInFlight,
+): SuspendedResult {
+  if (error.name === "StepSuspend") {
+    return durableSuspendedResult(error as StepSuspend);
+  }
+  return durableInFlightResult(error as StepInFlight);
 }
 
 // ============================================================================

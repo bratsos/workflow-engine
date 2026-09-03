@@ -30,11 +30,17 @@ export {
   type WorkflowStageId,
 } from "./core/stage-ids";
 export {
+  DURABLE_SUSPEND_MARKER,
+  isStepControlFlowError,
   type StepApi,
   StepInFlight,
   StepLedgerNotConfiguredError,
+  StepLedgerWriteError,
   StepResultNotSerializable,
+  type StepRunOptions,
   StepSuspend,
+  StepTimeoutError,
+  type StepWaitOptions,
 } from "./core/steps";
 export { type StageResult } from "./core/types";
 // Core Workflow

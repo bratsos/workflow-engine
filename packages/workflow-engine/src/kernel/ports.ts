@@ -72,15 +72,37 @@ export interface StepRecord {
   seq: number;
   kind: "run" | "wait" | "signal" | "sleep";
   status: "running" | "pending" | "completed" | "failed";
+  attempt: number;
+  leaseExpiresAt: Date | null;
+  deadlineAt: Date | null;
   result?: unknown;
-  error?: string;
+  error?: string | null;
   waitState?: {
     everyMs?: number;
-    timeoutAt?: string;
     wakeAt?: string;
   };
   createdAt: Date;
   updatedAt: Date;
+}
+
+/** Fields a ledger write may change after a record has been claimed. */
+export type StepRecordPatch = Partial<
+  Pick<
+    StepRecord,
+    | "status"
+    | "attempt"
+    | "leaseExpiresAt"
+    | "deadlineAt"
+    | "result"
+    | "error"
+    | "waitState"
+  >
+>;
+
+/** The `(status, attempt)` pair a compare-and-set write must observe. */
+export interface StepRecordExpectation {
+  status: StepRecord["status"];
+  attempt: number;
 }
 
 export interface StepLedger {
@@ -92,10 +114,21 @@ export interface StepLedger {
   update(
     stageRecordId: string,
     stepId: string,
-    patch: Partial<
-      Pick<StepRecord, "status" | "result" | "error" | "waitState">
-    >,
+    patch: StepRecordPatch,
   ): Promise<StepRecord>;
+  /**
+   * Atomically apply `patch` only when the record's current `status` and
+   * `attempt` equal `expected`. Returns whether the write applied and the
+   * record as it stands afterwards (`null` when the step does not exist).
+   * Used to re-claim expired leases, retry failed attempts, time out waits
+   * and complete signals without two workers both winning.
+   */
+  compareAndSet(
+    stageRecordId: string,
+    stepId: string,
+    expected: StepRecordExpectation,
+    patch: StepRecordPatch,
+  ): Promise<{ applied: boolean; record: StepRecord | null }>;
   list(stageRecordId: string): Promise<StepRecord[]>;
   clear(stageRecordId: string): Promise<void>;
 }

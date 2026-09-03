@@ -229,6 +229,10 @@ async execute(ctx) {
 }
 ```
 
+### Durable Steps
+
+Results returned by `ctx.step.run()` round-trip through JSON, so Dates become strings, `undefined` fields disappear, and Maps/Sets lose their runtime types.
+
 ## SimpleStageResult
 
 Return type for successful execution:
