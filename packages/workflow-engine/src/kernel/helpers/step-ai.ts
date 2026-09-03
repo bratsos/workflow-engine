@@ -15,6 +15,7 @@ import { calculateCostWithDiscount } from "../../ai/shared";
 import type {
   AIBatchProvider,
   AIBatchRequest,
+  AIBatchResult,
   AIHelper,
   AIObjectResult,
   AITextResult,
@@ -103,6 +104,38 @@ interface StoredSubmit {
 
 interface Budget {
   reserve(): boolean;
+}
+
+/** A batch item the provider or the schema rejected (small: no output). */
+interface FailedItemSummary {
+  id: string;
+  error: string;
+  errorName: string;
+  inputTokens: number;
+  outputTokens: number;
+  cost: number;
+}
+
+/** What the repair pass needs to re-prompt an item (its prior attempt). */
+interface RepairItemSummary {
+  id: string;
+  attempts: number;
+  inputTokens: number;
+  outputTokens: number;
+  cost: number;
+  feedback: Feedback;
+}
+
+/**
+ * The `${id}:collect` step result: counts plus the items that failed or
+ * need repair. Per-item verdicts are on the item rows, so this stays
+ * small on a clean batch whatever its size.
+ */
+interface CollectSummary {
+  total: number;
+  succeeded: number;
+  failed: FailedItemSummary[];
+  repair: RepairItemSummary[];
 }
 
 /**
@@ -848,115 +881,232 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
       throw new AiMapBatchFailedError(id, submitted.handleId, reason);
     }
 
-    const collected = await deps.run(
-      `${id}:collect`,
-      async (): Promise<AiMapResult<TOut>[]> => {
-        const results = await batch.getResults(submitted.handleId, {
-          ...refsMetadata,
-          requestIds: submitted.requestIds,
-          totalRequests: submitted.totalRequests,
-          // Accounting rows: the item prompt and the batch wall time.
-          prompts: Object.fromEntries(
-            entries.map((e) => [e.id, e.prompt as string]),
-          ),
-          ...(submitted.submittedAt
-            ? { submittedAt: submitted.submittedAt }
-            : {}),
-          ...(spec.schema
-            ? {
-                schemas: Object.fromEntries(
-                  submitted.requestIds.map((rid) => [rid, spec.schema]),
-                ),
-              }
-            : {}),
-        });
-        const byId = new Map(results.map((r) => [r.id, r]));
-        return entries.map((e) => {
-          const r = byId.get(e.id);
-          if (!r) {
-            return {
-              id: e.id,
-              index: e.index,
-              status: "failed",
-              error: "batch returned no result for this request",
-              errorName: "AiMapBatchItemMissingError",
-              attempts: 1,
-              inputTokens: 0,
-              outputTokens: 0,
-              cost: 0,
-            };
+    // ---- Collect ----------------------------------------------------------
+    // The collect step memoizes the fetch (and therefore the accounting rows)
+    // and stores only a summary: counts, the failed items, and the feedback
+    // for the items the repair pass will re-prompt. Every item's verdict
+    // lives on its own `${id}:${itemId}` row, exactly as on the realtime
+    // path, so `workflow_steps.result` does not grow with the batch size.
+    const resultsMetadata = {
+      ...refsMetadata,
+      requestIds: submitted.requestIds,
+      totalRequests: submitted.totalRequests,
+      // Accounting rows: the item prompt and the batch wall time.
+      prompts: Object.fromEntries(
+        entries.map((e) => [e.id, e.prompt as string]),
+      ),
+      ...(submitted.submittedAt ? { submittedAt: submitted.submittedAt } : {}),
+      ...(spec.schema
+        ? {
+            schemas: Object.fromEntries(
+              submitted.requestIds.map((rid) => [rid, spec.schema]),
+            ),
           }
-          let cost = 0;
-          try {
-            cost = calculateCostWithDiscount(
-              spec.model,
-              r.inputTokens,
-              r.outputTokens,
-              true,
-              provider,
-            );
-          } catch {
-            cost = 0;
-          }
-          if (r.status === "failed") {
-            return {
-              id: e.id,
-              index: e.index,
-              status: "failed",
-              error: r.error,
-              errorName: "AiMapBatchItemFailedError",
-              attempts: 1,
-              inputTokens: r.inputTokens,
-              outputTokens: r.outputTokens,
-              cost,
-            };
-          }
-          return {
-            id: e.id,
-            index: e.index,
-            status: "succeeded",
-            result: r.result as TOut,
-            validated: r.validated === true,
-            attempts: 1,
-            inputTokens: r.inputTokens,
-            outputTokens: r.outputTokens,
-            cost,
-          };
-        });
-      },
-    );
+        : {}),
+    };
 
-    // ---- Repair pass (parity with realtime) --------------------------------
-
-    const needsRepair = collected.filter(
-      (r) =>
-        r.status === "failed" || (spec.schema !== undefined && !r.validated),
-    );
-    if (repairAttempts === 0 || needsRepair.length === 0) return collected;
-
-    const priors = new Map<string, PriorAttempt>();
-    const subset: ItemEntry<TIn>[] = [];
-    for (const r of needsRepair) {
-      priors.set(r.id, {
-        attempts: r.attempts,
+    const toVerdict = (
+      e: ItemEntry<TIn>,
+      r: AIBatchResult<unknown> | undefined,
+    ): AiMapResult<TOut> => {
+      if (!r) {
+        return {
+          id: e.id,
+          index: e.index,
+          status: "failed",
+          error: "batch returned no result for this request",
+          errorName: "AiMapBatchItemMissingError",
+          attempts: 1,
+          inputTokens: 0,
+          outputTokens: 0,
+          cost: 0,
+        };
+      }
+      let cost = 0;
+      try {
+        cost = calculateCostWithDiscount(
+          spec.model,
+          r.inputTokens,
+          r.outputTokens,
+          true,
+          provider,
+        );
+      } catch {
+        cost = 0;
+      }
+      if (r.status === "failed") {
+        return {
+          id: e.id,
+          index: e.index,
+          status: "failed",
+          error: r.error,
+          errorName: "AiMapBatchItemFailedError",
+          attempts: 1,
+          inputTokens: r.inputTokens,
+          outputTokens: r.outputTokens,
+          cost,
+        };
+      }
+      return {
+        id: e.id,
+        index: e.index,
+        status: "succeeded",
+        result: r.result as TOut,
+        validated: r.validated === true,
+        attempts: 1,
         inputTokens: r.inputTokens,
         outputTokens: r.outputTokens,
-        cost: r.cost,
-        feedback:
-          r.status === "failed"
-            ? { issues: r.error }
-            : {
-                output: stringify(r.result),
+        cost,
+      };
+    };
+
+    // The verdicts of this execution's fetch. Undefined on a replay whose
+    // collect step was memoized; an item row missing then (the process died
+    // between the collect and that row) re-fetches — an idempotent read, and
+    // the accounting rows are recorded once per batch id by the logger.
+    let fetched: Map<string, AiMapResult<TOut>> | undefined;
+    const fetchVerdicts = async (): Promise<Map<string, AiMapResult<TOut>>> => {
+      const results = await batch.getResults(
+        submitted.handleId,
+        resultsMetadata,
+      );
+      const byId = new Map(results.map((r) => [r.id, r]));
+      return new Map(entries.map((e) => [e.id, toVerdict(e, byId.get(e.id))]));
+    };
+
+    const summary = await deps.run(
+      `${id}:collect`,
+      async (): Promise<CollectSummary> => {
+        fetched = await fetchVerdicts();
+        let succeeded = 0;
+        const failed: FailedItemSummary[] = [];
+        const repair: RepairItemSummary[] = [];
+        for (const e of entries) {
+          const v = fetched.get(e.id)!;
+          if (v.status === "failed") {
+            failed.push({
+              id: v.id,
+              error: v.error,
+              errorName: v.errorName ?? "AiMapBatchItemFailedError",
+              inputTokens: v.inputTokens,
+              outputTokens: v.outputTokens,
+              cost: v.cost,
+            });
+            if (repairAttempts > 0) {
+              repair.push({
+                id: v.id,
+                attempts: v.attempts,
+                inputTokens: v.inputTokens,
+                outputTokens: v.outputTokens,
+                cost: v.cost,
+                feedback: { issues: v.error },
+              });
+            }
+            continue;
+          }
+          succeeded++;
+          if (repairAttempts > 0 && spec.schema !== undefined && !v.validated) {
+            repair.push({
+              id: v.id,
+              attempts: v.attempts,
+              inputTokens: v.inputTokens,
+              outputTokens: v.outputTokens,
+              cost: v.cost,
+              feedback: {
+                output: stringify(v.result),
                 issues:
                   "the response could not be validated against the schema",
               },
-      });
-      subset.push(entries[r.index]!);
+            });
+          }
+        }
+        return { total: entries.length, succeeded, failed, repair };
+      },
+    );
+
+    const repairIds = new Set(summary.repair.map((r) => r.id));
+    const failedById = new Map(summary.failed.map((f) => [f.id, f]));
+
+    /** Record a verdict the batch settled on its item row (memoized). */
+    async function recordBatchVerdict(
+      e: ItemEntry<TIn>,
+    ): Promise<AiMapResult<TOut>> {
+      const stepId = itemStepId(e.id);
+      try {
+        return await deps.run(stepId, async () => {
+          const failed = failedById.get(e.id);
+          if (failed) {
+            throw new AiMapItemFailedSignal({
+              id: e.id,
+              index: e.index,
+              status: "failed",
+              error: failed.error,
+              errorName: failed.errorName,
+              attempts: 1,
+              inputTokens: failed.inputTokens,
+              outputTokens: failed.outputTokens,
+              cost: failed.cost,
+            });
+          }
+          fetched ??= await fetchVerdicts();
+          const verdict = fetched.get(e.id);
+          if (!verdict || verdict.status !== "succeeded") {
+            throw new Error(
+              `AI map "${id}": batch "${submitted.handleId}" returned no result for item "${e.id}" when re-fetched`,
+            );
+          }
+          return verdict;
+        });
+      } catch (error) {
+        if (isStepControlFlowError(error)) throw error;
+        if (error instanceof AiMapItemFailedSignal) {
+          await deps.storeFailedVerdict(stepId, error.verdict);
+          return error.verdict as AiMapResult<TOut>;
+        }
+        const stored = (await deps.loadFailedVerdict(stepId)) as
+          | AiMapResult<TOut>
+          | undefined;
+        if (stored && stored.status === "failed" && stored.id === e.id) {
+          return stored;
+        }
+        throw error;
+      }
     }
-    const repaired = await runRealtime(subset, priors);
-    const merged = [...collected];
-    for (const r of repaired) merged[r.index] = r;
-    return merged;
+
+    // Items the batch settled get their rows first, in entry order (the
+    // seq must be the same on every replay); the repair subset follows.
+    const results: AiMapResult<TOut>[] = new Array(entries.length);
+    const finals = entries.filter((e) => !repairIds.has(e.id));
+    const settled = await runWithConcurrency(
+      finals.map((e) => async () => {
+        results[e.index] = await recordBatchVerdict(e);
+      }),
+      concurrency,
+    );
+    const reasons = settled
+      .filter((s): s is PromiseRejectedResult => s?.status === "rejected")
+      .map((s) => s.reason);
+    if (reasons.length > 0) throw pickError(reasons);
+
+    // ---- Repair pass (parity with realtime) --------------------------------
+    if (summary.repair.length > 0) {
+      const priors = new Map<string, PriorAttempt>(
+        summary.repair.map((r) => [
+          r.id,
+          {
+            attempts: r.attempts,
+            inputTokens: r.inputTokens,
+            outputTokens: r.outputTokens,
+            cost: r.cost,
+            feedback: r.feedback,
+          },
+        ]),
+      );
+      const subset = entries.filter((e) => repairIds.has(e.id));
+      const repaired = await runRealtime(subset, priors);
+      for (const r of repaired) results[r.index] = r;
+    }
+    return results;
   }
 
   return { generateText, generateObject, streamText, map };

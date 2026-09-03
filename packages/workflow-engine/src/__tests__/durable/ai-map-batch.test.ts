@@ -158,6 +158,45 @@ describe("step.ai.map batch policy", () => {
     });
   });
 
+  it("keeps the collect result to counts and stores each verdict on its item row, so the collect row does not grow with N", async () => {
+    const collectSize = async (n: number) => {
+      const h = await setup(`batch-collect-size-${n}`, n);
+      await h.execute();
+      await h.settle(60_000);
+      expect((await h.stage())?.status).toBe("COMPLETED");
+      const stageRecord = await h.stage();
+      const rows = await h.ledger.list(stageRecord!.id);
+      const collect = rows.find((r) => r.stepId === "extract:collect");
+      expect(collect?.result).toEqual({
+        total: n,
+        succeeded: n,
+        failed: [],
+        repair: [],
+      });
+      const items = rows.filter((r) => /^extract:\d+$/.test(r.stepId));
+      expect(items).toHaveLength(n);
+      for (const row of items) {
+        expect(row.status).toBe("completed");
+        expect(row.result).toMatchObject({
+          status: "succeeded",
+          validated: true,
+          result: { v: row.stepId.slice("extract:".length) },
+        });
+      }
+      // submit, poll, collect, then the items in entry order.
+      expect(rows.map((r) => r.seq)).toEqual(
+        Array.from({ length: n + 3 }, (_, i) => i + 1),
+      );
+      expect(h.mock.getCalls()).toHaveLength(0);
+      return JSON.stringify(collect?.result).length;
+    };
+
+    const small = await collectSize(25);
+    const large = await collectSize(120);
+    // Only the digits of the counts differ.
+    expect(large - small).toBeLessThanOrEqual(2);
+  });
+
   it("stores the item prompt and the batch wall time (not a per-item durationMs) on the accounting rows", async () => {
     const h = await setup("batch-accounting", 25);
 
