@@ -71,6 +71,8 @@ export interface EnginePrismaClient {
   jobQueue: PrismaDelegate;
   /** AICall delegate (ai-logger.ts). */
   aICall: PrismaDelegate;
+  /** WorkflowStep delegate (step-ledger.ts). */
+  workflowStep: PrismaDelegate;
 
   /**
    * Interactive ($transaction(fn)) and batch ($transaction([...])) forms.

@@ -5,6 +5,10 @@ export {
 } from "./annotation-buffer.js";
 export { buildAnnotationEvents } from "./annotation-events.js";
 export {
+  buildStageExecutionContext,
+  resolveStageInput,
+} from "./build-stage-execution-context.js";
+export {
   type ClaimOutcome,
   failStageAndRun,
   handleClaimOutcome,

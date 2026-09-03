@@ -10,6 +10,10 @@
 
 import type { z } from "zod";
 import type { AnnotationActor } from "../persistence/interface";
+import type { StepApi } from "./steps";
+
+export type { StepApi } from "./steps";
+
 import type {
   CompletionCheckResult,
   LogLevel,
@@ -129,6 +133,11 @@ export interface StageContext<
 
   // Resume support - if this stage was suspended and is now resuming
   resumeState?: z.infer<typeof SuspendedStateSchema>;
+
+  // Durable, replayable side effects and waits.
+  // Optional here keeps direct/manual StageContext fixtures source-compatible;
+  // factory-built stage callbacks expose it as required on EnhancedStageContext.
+  step?: StepApi;
 
   // Progress reporting
   onProgress: (update: ProgressUpdate) => void;
@@ -252,6 +261,9 @@ export interface Stage<
 
   // Execution mode
   mode?: StageMode;
+
+  /** How suspended stages are resumed. Factory-built durable stages use replay. */
+  resumeStrategy?: "replay" | "checkCompletion";
 
   // Optional: Cost estimation
   estimateCost?: (input: z.infer<TInput>, config: z.infer<TConfig>) => number;

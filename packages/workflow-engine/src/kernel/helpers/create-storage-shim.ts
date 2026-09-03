@@ -5,12 +5,12 @@
  */
 
 import type { StageStorage } from "../../core/stage.js";
-import type { KernelDeps } from "../kernel.js";
+import type { BlobStore } from "../ports.js";
 
 export function createStorageShim(
   workflowRunId: string,
   workflowType: string,
-  deps: KernelDeps,
+  deps: { blobStore: BlobStore },
 ): StageStorage {
   return {
     async save<T>(key: string, data: T): Promise<void> {

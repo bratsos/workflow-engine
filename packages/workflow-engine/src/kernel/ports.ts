@@ -57,6 +57,44 @@ export type {
 export type { KernelEvent } from "./events";
 
 // ============================================================================
+// Durable steps
+// ============================================================================
+
+export interface StepRecord {
+  stageRecordId: string;
+  stepId: string;
+  seq: number;
+  kind: "run" | "wait" | "signal" | "sleep";
+  status: "running" | "pending" | "completed" | "failed";
+  result?: unknown;
+  error?: string;
+  waitState?: {
+    everyMs?: number;
+    timeoutAt?: string;
+    wakeAt?: string;
+  };
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface StepLedger {
+  /** Insert-if-absent. Existing records win conflicts without throwing. */
+  claim(
+    record: Omit<StepRecord, "createdAt" | "updatedAt">,
+  ): Promise<{ created: boolean; record: StepRecord }>;
+  get(stageRecordId: string, stepId: string): Promise<StepRecord | null>;
+  update(
+    stageRecordId: string,
+    stepId: string,
+    patch: Partial<
+      Pick<StepRecord, "status" | "result" | "error" | "waitState">
+    >,
+  ): Promise<StepRecord>;
+  list(stageRecordId: string): Promise<StepRecord[]>;
+  clear(stageRecordId: string): Promise<void>;
+}
+
+// ============================================================================
 // Clock
 // ============================================================================
 
@@ -254,6 +292,7 @@ export interface ExecutorDeps {
   persistence: Persistence;
   blobStore: BlobStore;
   clock: Clock;
+  stepLedger?: StepLedger;
 }
 
 /**

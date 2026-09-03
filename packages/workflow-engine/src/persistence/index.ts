@@ -58,8 +58,10 @@ export type {
 export {
   createPrismaAICallLogger,
   createPrismaJobQueue,
+  createPrismaStepLedger,
   createPrismaWorkflowPersistence,
   PrismaAICallLogger,
   PrismaJobQueue,
+  PrismaStepLedger,
   PrismaWorkflowPersistence,
 } from "./prisma";

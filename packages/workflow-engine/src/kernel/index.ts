@@ -33,6 +33,8 @@ export type {
   RunTransitionResult,
   StagePollSuspendedCommand,
   StagePollSuspendedResult,
+  StepSignalCommand,
+  StepSignalResult,
 } from "./commands.js";
 // Kernel errors
 export { IdempotencyInProgressError } from "./errors.js";
@@ -47,6 +49,7 @@ export type {
   StageProgressEvent,
   StageStartedEvent,
   StageSuspendedEvent,
+  StepSignalledEvent,
   WorkflowCancelledEvent,
   WorkflowCompletedEvent,
   WorkflowCreatedEvent,
@@ -112,5 +115,7 @@ export type {
   OutboxRecord,
   Persistence,
   Scheduler,
+  StepLedger,
+  StepRecord,
   WorkflowAnnotationRecord,
 } from "./ports.js";

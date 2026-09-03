@@ -33,6 +33,7 @@
 import type { z } from "zod";
 import { NoInputSchema } from "./schema-helpers";
 import type { CheckCompletionContext, Stage, StageContext } from "./stage";
+import { type StepApi, StepInFlight, StepSuspend } from "./steps.js";
 import type {
   CompletionCheckResult,
   ProgressUpdate,
@@ -75,7 +76,9 @@ export interface EnhancedStageContext<
   TInput,
   TConfig,
   TContext extends Record<string, unknown>,
-> extends Omit<StageContext<TInput, TConfig, TContext>, "onProgress"> {
+> extends Omit<StageContext<TInput, TConfig, TContext>, "onProgress" | "step"> {
+  /** Durable, replayable side effects and waits. */
+  step: StepApi;
   /**
    * Report progress for this stage.
    *
@@ -202,7 +205,7 @@ export interface SyncStageDefinition<
    */
   execute: (
     ctx: EnhancedStageContext<InferInput<TInput>, z.infer<TConfig>, TContext>,
-  ) => Promise<SimpleStageResult<z.infer<TOutput>>>;
+  ) => Promise<SimpleStageResult<z.infer<TOutput>> | SimpleSuspendedResult>;
 
   /**
    * Optional: Estimate cost before execution
@@ -434,6 +437,11 @@ function buildStage<
     name: definition.name,
     description: definition.description,
     mode: isAsyncBatch ? "async-batch" : "sync",
+    resumeStrategy:
+      typeof (definition as { checkCompletion?: unknown }).checkCompletion ===
+      "function"
+        ? "checkCompletion"
+        : "replay",
     dependencies: definition.dependencies,
 
     inputSchema: inputSchema as any,
@@ -446,8 +454,20 @@ function buildStage<
         context as any,
       ) as EnhancedStageContext<InferInput<TInput>, z.infer<TConfig>, TContext>;
 
-      // Call the user's execute function
-      const result = await definition.execute(enhancedContext);
+      // Call the user's execute function. Durable waits use exceptions for
+      // control flow so user code has one linear entry point on every replay.
+      let result: SimpleStageResult<z.infer<TOutput>> | SimpleSuspendedResult;
+      try {
+        result = await definition.execute(enhancedContext);
+      } catch (error) {
+        if (error instanceof StepSuspend) {
+          return durableSuspendedResult(error);
+        }
+        if (error instanceof StepInFlight) {
+          return durableInFlightResult(error);
+        }
+        throw error;
+      }
 
       // If suspended, pass through with auto-filled metrics and derived poll config
       if ("suspended" in result && result.suspended === true) {
@@ -542,6 +562,7 @@ function createEnhancedContext<
 ): EnhancedStageContext<TInput, TConfig, TContext> {
   return {
     ...context,
+    step: context.step as StepApi,
 
     onProgress(update) {
       context.onProgress({
@@ -567,6 +588,62 @@ function createEnhancedContext<
       return context.workflowContext[stageId as string] as
         | TContext[K]
         | undefined;
+    },
+  };
+}
+
+function durableSuspendedResult(error: StepSuspend): SuspendedResult {
+  const now = error.at;
+  const nextPollAt = error.nextPollAt;
+  const maxWaitTime = Math.max(0, error.maxWaitUntil.getTime() - now.getTime());
+  const pollInterval =
+    error.pollInterval ?? Math.max(0, nextPollAt.getTime() - now.getTime());
+
+  return {
+    suspended: true,
+    state: {
+      batchId: `step:${error.stepId}`,
+      submittedAt: now.toISOString(),
+      pollInterval,
+      maxWaitTime,
+      metadata: { __durable: true, stepId: error.stepId },
+    },
+    pollConfig: {
+      pollInterval,
+      maxWaitTime,
+      nextPollAt,
+    },
+    metrics: {
+      startTime: 0,
+      endTime: 0,
+      duration: 0,
+    },
+  };
+}
+
+function durableInFlightResult(error: StepInFlight): SuspendedResult {
+  const now = error.at;
+  const nextPollAt = new Date(now.getTime() + 5_000);
+  const maxWaitTime = DEFAULT_MAX_WAIT_TIME_MS;
+
+  return {
+    suspended: true,
+    state: {
+      batchId: `step:${error.stepId}`,
+      submittedAt: now.toISOString(),
+      pollInterval: 5_000,
+      maxWaitTime,
+      metadata: { __durable: true, stepId: error.stepId },
+    },
+    pollConfig: {
+      pollInterval: 5_000,
+      maxWaitTime,
+      nextPollAt,
+    },
+    metrics: {
+      startTime: 0,
+      endTime: 0,
+      duration: 0,
     },
   };
 }

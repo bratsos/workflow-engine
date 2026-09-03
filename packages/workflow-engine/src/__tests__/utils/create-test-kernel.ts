@@ -26,7 +26,7 @@ import {
   createPluginRunner,
   type PluginDefinition,
 } from "../../kernel/plugins.js";
-import type { EventSink } from "../../kernel/ports.js";
+import type { EventSink, StepLedger } from "../../kernel/ports.js";
 import {
   CollectingEventSink,
   FakeClock,
@@ -75,6 +75,8 @@ export interface CreateTestKernelOptions<
   eventSink?: TEventSink;
   /** Forwarded to `createKernel`'s `idempotencyStaleInProgressMs`. */
   idempotencyStaleInProgressMs?: number;
+  /** Optional durable step ledger for stages that use ctx.step.*. */
+  stepLedger?: StepLedger;
 }
 
 export function createTestKernel<
@@ -118,6 +120,7 @@ export function createTestKernel<
     ...(opts.idempotencyStaleInProgressMs !== undefined
       ? { idempotencyStaleInProgressMs: opts.idempotencyStaleInProgressMs }
       : {}),
+    stepLedger: opts.stepLedger,
   });
 
   const flush = () => kernel.dispatch({ type: "outbox.flush" as const });

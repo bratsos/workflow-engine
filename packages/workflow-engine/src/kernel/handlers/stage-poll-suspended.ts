@@ -2,8 +2,8 @@
  * Handler: stage.pollSuspended
  *
  * Polls suspended stages whose nextPollAt has passed, calls each stage's
- * checkCompletion() method, and either resumes (completes) or re-schedules
- * them for a future poll.
+ * checkCompletion() method or replays durable execute() methods, and either
+ * resumes (completes) or re-schedules them for a future poll.
  *
  * Uses a multi-phase pattern per stage so that checkCompletion() — which
  * typically makes external HTTP calls to batch providers — runs outside
@@ -16,7 +16,12 @@
  * batch provider APIs are slow to respond.
  */
 
-import type { CheckCompletionContext } from "../../core/stage";
+import type { CheckCompletionContext, Stage } from "../../core/stage";
+import {
+  isSuspendedResult,
+  type StageResult,
+  type SuspendedResult,
+} from "../../core/types.js";
 import type { CreateAnnotationInput } from "../../persistence/interface";
 import type {
   StagePollSuspendedCommand,
@@ -24,19 +29,26 @@ import type {
 } from "../commands";
 import {
   buildAnnotationEvents,
+  buildStageExecutionContext,
   createAnnotationBuffer,
   createStorageShim,
   failStageAndRun,
   handleClaimOutcome,
+  loadWorkflowContext,
   markStageCancelled,
   normalizeAnnotateArgs,
+  resolveStageInput,
   saveStageOutput,
   toErrorMessage,
   toOutboxEvents,
   withClaimedRun,
 } from "../helpers/index.js";
 import type { HandlerResult, KernelDeps } from "../kernel";
-import type { WorkflowStageRecord } from "../ports.js";
+import type {
+  ActivityRunInput,
+  WorkflowRunRecord,
+  WorkflowStageRecord,
+} from "../ports.js";
 
 async function completeSuspendedJobRow(
   workflowRunId: string,
@@ -57,9 +69,9 @@ async function completeSuspendedJobRow(
 }
 
 /**
- * Fails a suspended stage before checkCompletion ever runs (workflow
- * missing from the registry, or the stage no longer supports
- * checkCompletion) — the run itself isn't touched, unlike
+ * Fails a suspended stage before its resume operation ever runs (workflow
+ * missing from the registry, or the stage no longer supports its configured
+ * resume strategy) — the run itself isn't touched, unlike
  * `failStageAndRun`, since these are pre-flight config problems rather
  * than a checkCompletion outcome.
  */
@@ -87,6 +99,185 @@ async function failStageOnly(
       ]),
     );
   });
+}
+
+type ReplayOutcome = "resumed" | "suspended" | "failed" | "skip";
+
+/** Replays a durable stage's full execute context outside a transaction. */
+async function replayStage(
+  stageRecord: WorkflowStageRecord,
+  run: WorkflowRunRecord,
+  stageDef: Stage<any, any, any, any, any>,
+  deps: KernelDeps,
+): Promise<ReplayOutcome> {
+  let built: ReturnType<typeof buildStageExecutionContext> | undefined;
+
+  try {
+    const workflow = deps.registry.getWorkflow(run.workflowId);
+    if (!workflow) {
+      throw new Error(`Workflow ${run.workflowId} not found in registry`);
+    }
+    const workflowContext = await loadWorkflowContext(run.id, deps);
+    const rawInput = resolveStageInput(
+      workflow,
+      stageRecord.stageId,
+      run,
+      workflowContext,
+    );
+    const input: ActivityRunInput = {
+      stageDef,
+      workflowId: run.workflowId,
+      workflowRunId: run.id,
+      workflowType: run.workflowType,
+      stageId: stageRecord.stageId,
+      stageName: stageDef.name,
+      stageNumber: stageRecord.stageNumber,
+      stageRecordId: stageRecord.id,
+      attempt: stageRecord.attempt,
+      rawInput,
+      config: {
+        [stageRecord.stageId]: stageRecord.config ?? {},
+      } as Record<string, unknown>,
+      resumeState: stageRecord.suspendedState,
+      workflowContext,
+    };
+    built = buildStageExecutionContext(input, deps);
+    const result = await stageDef.execute(built.context);
+
+    if (isSuspendedResult(result)) {
+      const suspended = result as SuspendedResult;
+      const nextPollAt = suspended.pollConfig.nextPollAt;
+      const bufferedAnnotations = built.annotationBuffer.flush();
+      const claimResult = await withClaimedRun(
+        stageRecord.workflowRunId,
+        run.version,
+        deps,
+        async (tx) => {
+          await tx.updateStage(stageRecord.id, {
+            status: "SUSPENDED",
+            suspendedState: suspended.state as any,
+            nextPollAt,
+            pollInterval: suspended.pollConfig.pollInterval,
+            maxWaitUntil: new Date(
+              deps.clock.now().getTime() + suspended.pollConfig.maxWaitTime,
+            ),
+            metrics: suspended.metrics as any,
+          });
+          if (bufferedAnnotations.length > 0) {
+            await tx.appendAnnotations(bufferedAnnotations);
+          }
+          const events = [
+            ...built!.progressEvents,
+            {
+              type: "stage:suspended" as const,
+              timestamp: deps.clock.now(),
+              workflowRunId: stageRecord.workflowRunId,
+              stageId: stageRecord.stageId,
+              stageName: stageRecord.stageName,
+              nextPollAt,
+            },
+            {
+              type: "workflow:suspended" as const,
+              timestamp: deps.clock.now(),
+              workflowRunId: stageRecord.workflowRunId,
+              stageId: stageRecord.stageId,
+            },
+            ...buildAnnotationEvents(bufferedAnnotations, deps.clock.now()),
+          ];
+          await tx.appendOutboxEvents(
+            toOutboxEvents(stageRecord.workflowRunId, events),
+          );
+        },
+      );
+      if (await handleClaimOutcome(claimResult, stageRecord, deps))
+        return "skip";
+      return "suspended";
+    }
+
+    const stageResult = result as StageResult<unknown>;
+    let validatedOutput = stageResult.output;
+    if (stageResult.output !== undefined) {
+      try {
+        validatedOutput = stageDef.outputSchema.parse(stageResult.output);
+      } catch (validationError) {
+        await deps.persistence
+          .createLog({
+            workflowRunId: stageRecord.workflowRunId,
+            workflowStageId: stageRecord.id,
+            level: "WARN",
+            message: `Stage ${stageRecord.stageId} execute output failed schema validation; persisting raw output`,
+            metadata: { error: toErrorMessage(validationError) },
+          })
+          .catch(() => {});
+      }
+    }
+
+    const outputKey =
+      stageResult.output === undefined
+        ? undefined
+        : await saveStageOutput(
+            stageRecord.workflowRunId,
+            run.workflowType,
+            stageRecord.stageId,
+            validatedOutput,
+            deps,
+          );
+    const duration =
+      deps.clock.now().getTime() -
+      (stageRecord.startedAt?.getTime() ?? deps.clock.now().getTime());
+    const bufferedAnnotations = built.annotationBuffer.flush();
+    const claimResult = await withClaimedRun(
+      stageRecord.workflowRunId,
+      run.version,
+      deps,
+      async (tx) => {
+        await tx.updateStage(stageRecord.id, {
+          status: "COMPLETED",
+          completedAt: deps.clock.now(),
+          duration,
+          outputData: outputKey ? { _artifactKey: outputKey } : undefined,
+          nextPollAt: null,
+          metrics: stageResult.metrics as any,
+          embeddingInfo: stageResult.embeddings as any,
+        });
+        if (bufferedAnnotations.length > 0) {
+          await tx.appendAnnotations(bufferedAnnotations);
+        }
+        const events = [
+          ...built!.progressEvents,
+          {
+            type: "stage:completed" as const,
+            timestamp: deps.clock.now(),
+            workflowRunId: stageRecord.workflowRunId,
+            stageId: stageRecord.stageId,
+            stageName: stageRecord.stageName,
+            duration,
+          },
+          ...buildAnnotationEvents(bufferedAnnotations, deps.clock.now()),
+        ];
+        await tx.appendOutboxEvents(
+          toOutboxEvents(stageRecord.workflowRunId, events),
+        );
+      },
+    );
+    if (await handleClaimOutcome(claimResult, stageRecord, deps)) return "skip";
+    await completeSuspendedJobRow(
+      stageRecord.workflowRunId,
+      stageRecord.stageId,
+      deps,
+    );
+    return "resumed";
+  } catch (error) {
+    const claimResult = await failStageAndRun(
+      stageRecord,
+      run,
+      toErrorMessage(error),
+      built?.annotationBuffer.flush() ?? [],
+      deps,
+    );
+    if (await handleClaimOutcome(claimResult, stageRecord, deps)) return "skip";
+    return "failed";
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -140,13 +331,27 @@ export async function handleStagePollSuspended(
 
     // 3c. Get stage definition
     const stageDef = workflow.getStage(stageRecord.stageId);
-    if (!stageDef || !stageDef.checkCompletion) {
+    if (
+      !stageDef ||
+      (stageDef.resumeStrategy !== "replay" && !stageDef.checkCompletion)
+    ) {
       const errorMsg = !stageDef
         ? `Stage ${stageRecord.stageId} not found in workflow ${run.workflowId}`
         : `Stage ${stageRecord.stageId} does not support checkCompletion`;
 
       await failStageOnly(stageRecord, errorMsg, deps);
       failed++;
+      continue;
+    }
+
+    if (stageDef.resumeStrategy === "replay") {
+      const outcome = await replayStage(stageRecord, run, stageDef, deps);
+      if (outcome === "resumed") {
+        resumed++;
+        resumedWorkflowRunIds.add(stageRecord.workflowRunId);
+      } else if (outcome === "failed") {
+        failed++;
+      }
       continue;
     }
 
@@ -216,7 +421,7 @@ export async function handleStagePollSuspended(
     try {
       // ── Phase 1: checkCompletion (no transaction) ──────────────────
       // External HTTP calls happen here — no DB connection held open.
-      const checkResult = await stageDef.checkCompletion(
+      const checkResult = await stageDef.checkCompletion!(
         stageRecord.suspendedState as any,
         checkContext,
       );

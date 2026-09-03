@@ -177,6 +177,23 @@ export interface StagePollSuspendedResult {
 }
 
 // ---------------------------------------------------------------------------
+// step.signal
+// ---------------------------------------------------------------------------
+
+/** Completes a durable signal step and nudges its stage for replay. */
+export interface StepSignalCommand {
+  readonly type: "step.signal";
+  readonly workflowRunId: string;
+  readonly stageId: string;
+  readonly stepId: string;
+  readonly payload: unknown;
+}
+
+export interface StepSignalResult {
+  readonly signalled: boolean;
+}
+
+// ---------------------------------------------------------------------------
 // lease.reapStale
 // ---------------------------------------------------------------------------
 
@@ -256,6 +273,7 @@ export type KernelCommand =
   | RunRerunFromCommand
   | JobExecuteCommand
   | StagePollSuspendedCommand
+  | StepSignalCommand
   | LeaseReapStaleCommand
   | OutboxFlushCommand
   | PluginReplayDLQCommand
@@ -279,12 +297,14 @@ export type CommandResult<T extends KernelCommand> = T extends RunCreateCommand
             ? JobExecuteResult
             : T extends StagePollSuspendedCommand
               ? StagePollSuspendedResult
-              : T extends LeaseReapStaleCommand
-                ? LeaseReapStaleResult
-                : T extends OutboxFlushCommand
-                  ? OutboxFlushResult
-                  : T extends PluginReplayDLQCommand
-                    ? PluginReplayDLQResult
-                    : T extends RunReapStuckCommand
-                      ? RunReapStuckResult
-                      : never;
+              : T extends StepSignalCommand
+                ? StepSignalResult
+                : T extends LeaseReapStaleCommand
+                  ? LeaseReapStaleResult
+                  : T extends OutboxFlushCommand
+                    ? OutboxFlushResult
+                    : T extends PluginReplayDLQCommand
+                      ? PluginReplayDLQResult
+                      : T extends RunReapStuckCommand
+                        ? RunReapStuckResult
+                        : never;

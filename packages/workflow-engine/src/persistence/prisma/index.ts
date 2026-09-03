@@ -19,3 +19,7 @@ export {
   type PrismaWorkflowPersistenceOptions,
 } from "./persistence";
 export type { EnginePrismaClient, PrismaDelegate } from "./prisma-client-type";
+export {
+  createPrismaStepLedger,
+  PrismaStepLedger,
+} from "./step-ledger";

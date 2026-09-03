@@ -80,6 +80,9 @@ export async function handleRunRerunFrom(
   );
 
   // 10. Delete stage records
+  // Durable steps are keyed by stageRecordId. This handler deletes the old
+  // record and prepareExecutionGroup creates a fresh record with a new id,
+  // so stale step results cannot be replayed and no ledger.clear is needed.
   for (const stage of stagesToDelete) {
     await deps.persistence.deleteStage(stage.id);
   }

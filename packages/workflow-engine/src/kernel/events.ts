@@ -117,6 +117,16 @@ export interface StageProgressEvent {
   readonly details?: Record<string, unknown>;
 }
 
+/** Emitted when an external caller completes a durable signal step. */
+export interface StepSignalledEvent {
+  readonly type: "step:signalled";
+  readonly timestamp: Date;
+  readonly workflowRunId: string;
+  readonly stageId: string;
+  readonly stepId: string;
+  readonly payload: unknown;
+}
+
 // ---------------------------------------------------------------------------
 // Annotation events (opt-in)
 // ---------------------------------------------------------------------------
@@ -161,6 +171,7 @@ export type KernelEvent =
   | StageSuspendedEvent
   | StageFailedEvent
   | StageProgressEvent
+  | StepSignalledEvent
   | AnnotationCreatedEvent;
 
 /** String literal union of all kernel event type discriminants. */

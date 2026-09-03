@@ -24,13 +24,12 @@
  */
 
 import { isSuspendedResult } from "../../core/types";
-import type { Workflow } from "../../core/workflow";
 import type { JobExecuteCommand, JobExecuteResult } from "../commands";
 import type { KernelEvent } from "../events";
 import {
   buildAnnotationEvents,
   loadWorkflowContext,
-  resolveExecutionGroupOutput,
+  resolveStageInput,
   saveStageArtifacts,
   saveStageOutput,
   toErrorMessage,
@@ -39,45 +38,6 @@ import {
 } from "../helpers/index.js";
 import type { HandlerResult, KernelDeps } from "../kernel";
 import type { ActivityRunResult } from "../ports.js";
-
-// ---------------------------------------------------------------------------
-// Helper: resolve stage input
-// ---------------------------------------------------------------------------
-
-function resolveStageInput(
-  workflow: Workflow<any, any>,
-  stageId: string,
-  workflowRun: { input: any },
-  workflowContext: Record<string, unknown>,
-): unknown {
-  const groupIndex = workflow.getExecutionGroupIndex(stageId);
-
-  // First execution group always uses workflow input
-  if (groupIndex <= 1) return workflowRun.input;
-
-  // Resolve the previous execution group's output.
-  // For single-stage groups this returns that stage's output directly.
-  // For parallel groups this returns an object keyed by stage ID.
-  const prevOutput = resolveExecutionGroupOutput(
-    workflow,
-    groupIndex - 1,
-    workflowContext,
-  );
-
-  // Only the first execution group may fall back to workflow input. A
-  // missing previous-group output past group 1 means a blob went
-  // missing (or context loading raced a stage completion) — silently
-  // feeding workflow input to a downstream stage would corrupt its
-  // result instead of surfacing the problem. Fail loudly instead.
-  if (prevOutput === undefined) {
-    throw new Error(
-      `Stage ${stageId} (execution group ${groupIndex}) is missing the ` +
-        `output of execution group ${groupIndex - 1} — cannot resolve input`,
-    );
-  }
-
-  return prevOutput;
-}
 
 // ---------------------------------------------------------------------------
 // Handler

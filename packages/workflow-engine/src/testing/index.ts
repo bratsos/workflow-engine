@@ -38,6 +38,7 @@
 export { InMemoryAICallLogger } from "./in-memory-ai-logger.js";
 export { InMemoryJobQueue } from "./in-memory-job-queue.js";
 export { InMemoryWorkflowPersistence } from "./in-memory-persistence.js";
+export { InMemoryStepLedger } from "./in-memory-step-ledger.js";
 export type {
   AILoggerFactory,
   JobQueueFactory,

@@ -29,6 +29,13 @@ export {
   isValidStageId,
   type WorkflowStageId,
 } from "./core/stage-ids";
+export {
+  type StepApi,
+  StepInFlight,
+  StepLedgerNotConfiguredError,
+  StepResultNotSerializable,
+  StepSuspend,
+} from "./core/steps";
 export { type StageResult } from "./core/types";
 // Core Workflow
 export {
@@ -159,9 +166,11 @@ export type {
 export {
   createPrismaAICallLogger,
   createPrismaJobQueue,
+  createPrismaStepLedger,
   createPrismaWorkflowPersistence,
   PrismaAICallLogger,
   PrismaJobQueue,
+  PrismaStepLedger,
   PrismaWorkflowPersistence,
 } from "./persistence";
 // Batch Model Mapping
@@ -199,11 +208,14 @@ export type {
   RunTransitionResult,
   StagePollSuspendedCommand,
   StagePollSuspendedResult,
+  StepSignalCommand,
+  StepSignalResult,
 } from "./kernel/commands";
 export { IdempotencyInProgressError } from "./kernel/errors";
 export type {
   KernelEvent,
   KernelEventType,
+  StepSignalledEvent,
 } from "./kernel/events";
 export { createKernel, type Kernel, type KernelConfig } from "./kernel/kernel";
 export {
@@ -220,6 +232,8 @@ export type {
   JobTransport,
   Persistence,
   Scheduler,
+  StepLedger,
+  StepRecord,
 } from "./kernel/ports";
 export type {
   CreateOutboxEventInput,

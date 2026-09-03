@@ -42,6 +42,7 @@ import type {
   RunRerunFromResult,
   RunTransitionResult,
   StagePollSuspendedResult,
+  StepSignalResult,
 } from "./commands";
 import { IdempotencyInProgressError } from "./errors";
 import type { KernelEvent } from "./events";
@@ -57,6 +58,7 @@ import { handleRunReapStuck } from "./handlers/run-reap-stuck";
 import { handleRunRerunFrom } from "./handlers/run-rerun-from";
 import { handleRunTransition } from "./handlers/run-transition";
 import { handleStagePollSuspended } from "./handlers/stage-poll-suspended";
+import { handleStepSignal } from "./handlers/step-signal.js";
 import {
   buildAnnotationEvents,
   filterCouldMatchLegacy,
@@ -70,6 +72,7 @@ import type {
   JobTransport,
   Persistence,
   Scheduler,
+  StepLedger,
 } from "./ports";
 
 // ============================================================================
@@ -94,6 +97,8 @@ export interface KernelConfig {
   clock: Clock;
   registry: WorkflowRegistry;
   executor?: ActivityExecutor;
+  /** Optional durable step storage. Stages without ctx.step need none. */
+  stepLedger?: StepLedger;
   /**
    * How long an idempotency key may sit `in_progress` before a subsequent
    * dispatch is allowed to reclaim it. Guards against a dispatcher that
@@ -164,6 +169,7 @@ export interface KernelDeps {
   clock: Clock;
   registry: WorkflowRegistry;
   executor: ActivityExecutor;
+  stepLedger?: StepLedger;
 }
 
 // ============================================================================
@@ -203,6 +209,7 @@ type AnyCommandResult =
   | RunRerunFromResult
   | JobExecuteResult
   | StagePollSuspendedResult
+  | StepSignalResult
   | LeaseReapStaleResult
   | OutboxFlushResult
   | PluginReplayDLQResult
@@ -251,6 +258,7 @@ export function createKernel(config: KernelConfig): Kernel {
     clock,
     registry,
     executor,
+    stepLedger: config.stepLedger,
   };
 
   /**
@@ -364,6 +372,9 @@ export function createKernel(config: KernelConfig): Kernel {
             break;
           case "run.rerunFrom":
             result = await handleRunRerunFrom(command, txDeps);
+            break;
+          case "step.signal":
+            result = await handleStepSignal(command, txDeps);
             break;
           case "lease.reapStale":
             result = await handleLeaseReapStale(command, txDeps);
