@@ -7,7 +7,6 @@ import {
   crashOnClaim,
   createAiMapHarness,
   REALTIME_MODEL,
-  withCallHook,
 } from "./ai-map-harness.js";
 
 const inputSchema = z.object({ count: z.number() });

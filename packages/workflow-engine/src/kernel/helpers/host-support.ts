@@ -10,6 +10,7 @@
  * isn't hand-maintained twice.
  */
 
+import { z } from "zod";
 import type { Kernel } from "../kernel.js";
 import type { JobTransport } from "../ports.js";
 
@@ -87,14 +88,48 @@ export interface ExecuteJobOutcome {
   error?: string;
   /**
    * The job referred to a run, workflow or stage that no longer exists (an
-   * orphan queue row). It was failed terminally and acknowledged; nothing
-   * was executed and no run was transitioned.
+   * orphan queue row), or the message itself was malformed. It was failed
+   * terminally and acknowledged; nothing was executed and no run was
+   * transitioned.
    */
   dead?: boolean;
+  /**
+   * The stage failed but the job has attempts left and the stage was left
+   * `PENDING`: the job must run again. The built-in transports re-enqueue
+   * it themselves from `fail(jobId, error, true)`; a push transport whose
+   * `fail()` cannot re-enqueue (a queue consumer that has to `retry()` the
+   * message) must retry the message after `retryDelayMs`, and acknowledge
+   * it when this is false.
+   */
+  willRetry?: boolean;
+  /** The job attempt that ran (1 on the first execution). */
+  attempt?: number;
+  /** The attempt budget the retry decision used. */
+  maxAttempts?: number;
+  /**
+   * Backoff before the retry, when `willRetry` is true: the exponential
+   * delay the built-in transports apply (`2^attempt` seconds).
+   */
+  retryDelayMs?: number;
 }
 
 const DEAD_JOB_PATTERN =
   /^(WorkflowRun .* not found|Workflow .* not found in registry|Stage .* not found in workflow)/;
+
+const JobMessageSchema = z.object({
+  jobId: z.string().min(1),
+  workflowRunId: z.string().min(1),
+  workflowId: z.string().min(1),
+  stageId: z.string().min(1),
+  attempt: z.number().int().nonnegative(),
+  maxAttempts: z.number().int().positive().optional(),
+  payload: z.record(z.string(), z.unknown()),
+});
+
+/** The backoff the built-in transports apply before redelivering a retry. */
+export function retryBackoffMs(attempt: number): number {
+  return 2 ** Math.max(0, attempt) * 1000;
+}
 
 /**
  * Dispatches `job.execute` for one job, holding a lease heartbeat for its
@@ -112,6 +147,27 @@ export async function executeJobWithHeartbeat(
     jobHeartbeatIntervalMs = HOST_DEFAULTS.jobHeartbeatIntervalMs,
     logPrefix = HOST_DEFAULTS.logPrefix,
   } = options;
+
+  // A malformed message (a bridge that dropped `payload` or `workflowId`)
+  // is a dead job: reject it up front with a clear message instead of
+  // throwing from inside job.execute, which a push consumer retries forever.
+  const parsed = JobMessageSchema.safeParse(job);
+  if (!parsed.success) {
+    const issues = parsed.error.issues
+      .map((issue) => `${issue.path.join(".") || "<root>"}: ${issue.message}`)
+      .join("; ");
+    const message = `Invalid job message: ${issues}`;
+    const jobId = typeof job?.jobId === "string" ? job.jobId : undefined;
+    console.error(`${logPrefix} dead job ${jobId ?? "<no jobId>"}: ${message}`);
+    if (jobId) {
+      try {
+        await jobTransport.fail(jobId, message, false);
+      } catch (failError) {
+        console.error(`${logPrefix} could not fail dead job:`, failError);
+      }
+    }
+    return { outcome: "failed", error: message, dead: true };
+  }
 
   const config =
     (job.payload as { config?: Record<string, unknown> }).config || {};
@@ -183,11 +239,11 @@ export async function executeJobWithHeartbeat(
   // The kernel decided from the same attempt/maxAttempts (`willRetry`) and
   // already left the stage PENDING for that case; the transport contract
   // is that `fail(jobId, error, true)` re-enqueues the job with backoff.
+  const maxAttempts = job.maxAttempts ?? HOST_DEFAULTS.maxAttempts;
   const canRetry =
     !result.ghost &&
     (result.willRetry ??
-      (result.retryable !== false &&
-        job.attempt < (job.maxAttempts ?? HOST_DEFAULTS.maxAttempts)));
+      (result.retryable !== false && job.attempt < maxAttempts));
   await jobTransport.fail(job.jobId, result.error ?? "Unknown error", canRetry);
   // Terminal failure: without this, the run lingers RUNNING until
   // run.reapStuck kills it minutes later with a generic "STUCK_RUN_REAPED"
@@ -206,7 +262,14 @@ export async function executeJobWithHeartbeat(
       );
     }
   }
-  return { outcome: "failed", error: result.error };
+  return {
+    outcome: "failed",
+    error: result.error,
+    willRetry: canRetry,
+    attempt: job.attempt,
+    maxAttempts,
+    ...(canRetry ? { retryDelayMs: retryBackoffMs(job.attempt) } : {}),
+  };
 }
 
 // ============================================================================

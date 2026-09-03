@@ -289,7 +289,17 @@ describe("kernel: job.execute", () => {
       "RUNNING",
     );
     await flush();
-    expect(eventSink.getByType("stage:failed")).toHaveLength(1);
+    // Not a failure of the stage row: announced as a retry, with the budget.
+    expect(eventSink.getByType("stage:failed")).toHaveLength(0);
+    expect(eventSink.getByType("stage:retrying")).toMatchObject([
+      {
+        stageId: "flaky",
+        attempt: 1,
+        maxAttempts: 3,
+        error: "transient failure",
+      },
+    ]);
+    expect(result).toMatchObject({ attempt: 1, maxAttempts: 3 });
   });
 
   it("records FAILED and no retry once the job's attempts are exhausted", async () => {

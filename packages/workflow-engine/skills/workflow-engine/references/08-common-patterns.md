@@ -113,6 +113,9 @@ const metricsPlugin = definePlugin({
     "workflow:completed": async (event) => {
       await recordMetric("workflow_completed", { workflowId: event.workflowId });
     },
+    "stage:retrying": async (event) => {
+      await recordMetric("stage_retry", { stageId: event.stageId, attempt: event.attempt });
+    },
     "stage:failed": async (event) => {
       await alertOnFailure(event);
     },
@@ -200,13 +203,12 @@ async execute(ctx) {
 }
 ```
 
-Failed stages trigger the `stage:failed` event. What happens next depends on the job's attempt budget (the transport's `maxAttempts`, default 3 — the `maxRetries` field of the config presets is *not* read by the kernel):
+A stage attempt that throws is either retried or terminal, depending on the job's attempt budget (the transport's `maxAttempts`, default 3 — the `maxRetries` field of the config presets is *not* read by the kernel):
 
-- **Attempts left** (and the error is not deterministic, e.g. not a Zod input failure): the kernel records the stage as `PENDING` with the error on `errorMessage`, keeps its step-ledger rows for the replay, and returns `willRetry: true`; the host calls `jobTransport.fail(jobId, error, true)`, which **must** put the job back in the queue with backoff (the Prisma and in-memory queues do; a custom transport that only acknowledges the message leaves the run `RUNNING` until `run.reapStuck` heals it). The run stays `RUNNING` — `run.transition` treats a `PENDING` stage as active.
-- **No attempts left**: the stage is `FAILED` and the host dispatches `run.transition` immediately (in the same `job.execute` completion, since v0.11), so the run fails with the real stage error right away rather than waiting for a later orchestration tick or `run.reapStuck` to notice. Both hosts behave the same; the serverless host does this inside `handleJob`.
+- **Attempts left** (and the error is not deterministic, e.g. not a Zod input failure): the kernel records the stage as `PENDING` with the error on `errorMessage`, keeps its step-ledger rows for the replay (re-opening the ones that failed), emits **`stage:retrying`** (`{ workflowRunId, stageId, stageName, attempt, maxAttempts, error }`) and returns `willRetry: true`; the host calls `jobTransport.fail(jobId, error, true)`, which **must** put the job back in the queue with backoff (the Prisma and in-memory queues do). A push transport whose `fail()` cannot re-enqueue reads `willRetry` / `retryDelayMs` off the host's job result and retries the message itself — acknowledging it without a retry leaves the run `RUNNING` until `run.reapStuck` heals it. The run stays `RUNNING` — `run.transition` treats a `PENDING` stage as active.
+- **No attempts left**: the stage is `FAILED`, **`stage:failed`** is emitted, and the host dispatches `run.transition` immediately (in the same `job.execute` completion, since v0.11), so the run fails with the real stage error right away rather than waiting for a later orchestration tick or `run.reapStuck` to notice. Both hosts behave the same; the serverless host does this inside `handleJob`. A stage that fails terminally from the poll path (a `ctx.step.run` retry that ran inside `stage.pollSuspended`, a `checkCompletion` error, a wait past its deadline) fails the run the same way and finalises its `job_queue` row.
 
-- **Attempts left** (and the error is not deterministic, e.g. not a Zod input failure): the kernel records the stage as `PENDING` with the error on `errorMessage`, keeps its step-ledger rows for the replay, and returns `willRetry: true`; the host calls `jobTransport.fail(jobId, error, true)`, which **must** put the job back in the queue with backoff (the Prisma and in-memory queues do; a custom transport that only acknowledges the message leaves the run `RUNNING` until `run.reapStuck` heals it). The run stays `RUNNING` — `run.transition` treats a `PENDING` stage as active.
-- **No attempts left**: the stage is `FAILED` and the host dispatches `run.transition` immediately (in the same `job.execute` completion, since v0.11), so the run fails with the real stage error right away rather than waiting for a later orchestration tick or `run.reapStuck` to notice. Both hosts behave the same; the serverless host does this inside `handleJob`.
+`stage:failed` therefore means the stage row is `FAILED`; a consumer that mirrors engine events into its own log sees one `stage:retrying` per retried attempt, not a failure the run never had.
 
 ## Reliability & Self-Healing
 

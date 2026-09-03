@@ -106,6 +106,24 @@ export interface StageFailedEvent {
   readonly error: string;
 }
 
+/**
+ * Emitted when a stage attempt threw but the job has attempts left: the
+ * stage row stays `PENDING` (with the error on `errorMessage`) and the host
+ * re-enqueues the job. `stage:failed` is reserved for the attempt that
+ * makes the stage row `FAILED`.
+ */
+export interface StageRetryingEvent {
+  readonly type: "stage:retrying";
+  readonly timestamp: Date;
+  readonly workflowRunId: string;
+  readonly stageId: string;
+  readonly stageName: string;
+  /** The job attempt that failed (1 on the first execution). */
+  readonly attempt: number;
+  readonly maxAttempts: number;
+  readonly error: string;
+}
+
 /** Emitted to report incremental progress within a stage. */
 export interface StageProgressEvent {
   readonly type: "stage:progress";
@@ -170,6 +188,7 @@ export type KernelEvent =
   | StageCompletedEvent
   | StageSuspendedEvent
   | StageFailedEvent
+  | StageRetryingEvent
   | StageProgressEvent
   | StepSignalledEvent
   | AnnotationCreatedEvent;

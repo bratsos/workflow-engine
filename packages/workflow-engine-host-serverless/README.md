@@ -78,8 +78,19 @@ interface JobMessage {
 interface JobResult {
   outcome: "completed" | "suspended" | "failed";
   error?: string;
+  /** The message was an orphan or malformed; it was failed and acknowledged. */
+  dead?: boolean;
+  /** The stage was left PENDING and the job must run again. */
+  willRetry?: boolean;
+  /** The job attempt that ran (1 on the first execution). */
+  attempt?: number;
+  maxAttempts?: number;
+  /** Backoff before the retry (2^attempt seconds), when `willRetry`. */
+  retryDelayMs?: number;
 }
 ```
+
+The consumer's ack/retry decision reads `willRetry`, not `outcome`: a failed attempt with attempts left is `outcome: "failed", willRetry: true`, and the stage row is `PENDING` waiting for the next delivery. A transport whose `fail()` re-enqueues (the built-in Prisma and in-memory queues) has already re-queued the job — acknowledge the message. A push transport whose `fail()` cannot re-enqueue (a Cloudflare Queue consumer has to call `msg.retry()` itself) retries the message after `retryDelayMs`; when `willRetry` is false (settled, or `dead`) acknowledge it. Acknowledging a `willRetry: true` result without retrying leaves the run `RUNNING` until `run.reapStuck` heals it. A message without `payload` or `workflowId` is rejected as a dead job (`dead: true`, failed and acknowledged) instead of throwing.
 
 ### `ProcessJobsResult`
 
@@ -117,10 +128,11 @@ export default {
     for (const msg of batch.messages) {
       const result = await host.handleJob(msg.body);
 
-      if (result.outcome === "failed") {
-        msg.retry();
+      if (result.willRetry) {
+        // The CF transport's fail() cannot re-enqueue: redeliver after the backoff.
+        msg.retry({ delaySeconds: Math.ceil((result.retryDelayMs ?? 0) / 1000) });
       } else {
-        msg.ack();
+        msg.ack(); // completed, suspended, terminally failed, or dead
       }
     }
   },
@@ -179,7 +191,7 @@ export async function GET() {
 
 Unlike the Node host, the serverless host has **no loops, timers, or signal handlers**. Every method is a single stateless invocation:
 
-- **`handleJob(msg)`** -- Dispatches `job.execute` to the kernel, then marks the job complete/suspended/failed via `jobTransport`. On completion, also dispatches `run.transition` to advance the workflow, and (unless `flushOutboxAfterJob: false`) runs one bounded `outbox.flush` so the run's events are published by this invocation instead of by the next maintenance tick — there is no process lifecycle to hook a final flush on. A failure with attempts left (`msg.attempt < msg.maxAttempts`, default 3) leaves the stage `PENDING` with the error and calls `jobTransport.fail(jobId, error, true)`: your transport **must** re-enqueue the message with backoff (acknowledging it without a retry strands the run as `RUNNING` until `run.reapStuck`). When no attempts remain the stage is `FAILED` and `run.transition` fails the run immediately with the stage error.
+- **`handleJob(msg)`** -- Dispatches `job.execute` to the kernel, then marks the job complete/suspended/failed via `jobTransport`. On completion, also dispatches `run.transition` to advance the workflow, and (unless `flushOutboxAfterJob: false`) runs one bounded `outbox.flush` so the run's events are published by this invocation instead of by the next maintenance tick — there is no process lifecycle to hook a final flush on. A failure with attempts left (`msg.attempt < msg.maxAttempts`, default 3) leaves the stage `PENDING` with the error, emits `stage:retrying`, calls `jobTransport.fail(jobId, error, true)` and returns `willRetry: true` with `retryDelayMs`: either your transport re-enqueues the message with backoff from `fail()`, or your consumer retries it from the result (acknowledging it without a retry strands the run as `RUNNING` until `run.reapStuck`). When no attempts remain the stage is `FAILED`, `stage:failed` is emitted, and `run.transition` fails the run immediately with the stage error. A malformed message is failed and acknowledged as a dead job (`dead: true`).
 
 - **`processAvailableJobs(opts?)`** -- Dequeues up to `maxJobs` (default: 1) from the job transport and processes each via `handleJob`. Safe for edge runtimes with CPU limits.
 

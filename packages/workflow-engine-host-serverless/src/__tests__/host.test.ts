@@ -15,6 +15,7 @@ import {
 } from "@bratsos/workflow-engine/kernel/testing";
 import {
   InMemoryJobQueue,
+  InMemoryStepLedger,
   InMemoryWorkflowPersistence,
 } from "@bratsos/workflow-engine/testing";
 import { describe, expect, it } from "vitest";
@@ -152,7 +153,10 @@ function createAsyncBatchWorkflow(): Workflow<any, any> {
     .build();
 }
 
-function createTestEnv(workflows: Workflow<any, any>[] = []) {
+function createTestEnv(
+  workflows: Workflow<any, any>[] = [],
+  extra: { stepLedger?: InMemoryStepLedger } = {},
+) {
   const persistence = new InMemoryWorkflowPersistence();
   const blobStore = new InMemoryBlobStore();
   const jobTransport = new InMemoryJobQueue("test-worker");
@@ -171,6 +175,7 @@ function createTestEnv(workflows: Workflow<any, any>[] = []) {
     eventSink,
     clock,
     registry: { getWorkflow: (id) => registry.get(id) },
+    ...extra,
   });
 
   return { kernel, persistence, blobStore, jobTransport, eventSink, clock };
@@ -366,6 +371,166 @@ describe("ServerlessHost", () => {
     expect(eventSink.events.some((e) => e.type === "workflow:completed")).toBe(
       true,
     );
+  });
+
+  it("reports the retry contract on the job result for a push transport to act on", async () => {
+    const workflow = createFailingWorkflow();
+    const { kernel, jobTransport } = createTestEnv([workflow]);
+    jobTransport.setDefaultMaxAttempts(3);
+    const host = createServerlessHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+    });
+    await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "retry-contract-1",
+      workflowId: "failing-workflow",
+      input: { data: "boom" },
+    });
+    await host.runMaintenanceTick();
+
+    const first = await host.handleJob((await dequeueAsMessage(jobTransport))!);
+    // Attempts left: the consumer must redeliver after the backoff.
+    expect(first).toEqual({
+      outcome: "failed",
+      error: "Stage exploded",
+      willRetry: true,
+      attempt: 1,
+      maxAttempts: 3,
+      retryDelayMs: 2_000,
+    });
+
+    const second = await host.handleJob(
+      (await dequeueAsMessage(jobTransport))!,
+    );
+    expect(second).toMatchObject({
+      willRetry: true,
+      attempt: 2,
+      retryDelayMs: 4_000,
+    });
+    const third = await host.handleJob((await dequeueAsMessage(jobTransport))!);
+    // Budget exhausted: settled, acknowledge.
+    expect(third).toEqual({
+      outcome: "failed",
+      error: "Stage exploded",
+      willRetry: false,
+      attempt: 3,
+      maxAttempts: 3,
+    });
+  });
+
+  it("rejects a malformed job message as a dead job instead of throwing", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, jobTransport, persistence } = createTestEnv([workflow]);
+    const host = createServerlessHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+    });
+    const created = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "malformed-1",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+    await host.runMaintenanceTick();
+    const msg = (await dequeueAsMessage(jobTransport))!;
+
+    // No payload: previously a TypeError from inside job.execute.
+    const noPayload = await host.handleJob({
+      ...msg,
+      payload: undefined as unknown as Record<string, unknown>,
+    });
+    expect(noPayload).toMatchObject({
+      outcome: "failed",
+      dead: true,
+      error: expect.stringContaining("Invalid job message: payload"),
+    });
+    // The job row was failed and acknowledged, the stage untouched.
+    expect(jobTransport.getJobsByStatus("FAILED")).toHaveLength(1);
+    const [stage] = await persistence.getStagesByRun(created.workflowRunId);
+    expect(stage?.status).toBe("PENDING");
+
+    // No workflowId: previously "Workflow undefined not found".
+    const noWorkflow = await host.handleJob({
+      ...msg,
+      workflowId: undefined as unknown as string,
+    });
+    expect(noWorkflow).toMatchObject({
+      outcome: "failed",
+      dead: true,
+      error: expect.stringContaining("workflowId"),
+    });
+  });
+
+  it("finalises the job row when a suspended stage fails for good from the poll path", async () => {
+    let attempts = 0;
+    const flaky = defineStage({
+      id: "flaky-step",
+      name: "Flaky Step",
+      schemas: { input: schema, output: outputSchema, config: z.object({}) },
+      async execute(ctx) {
+        const value = await ctx.step.run(
+          "call",
+          async () => {
+            attempts++;
+            throw new Error(`upstream down (${attempts})`);
+          },
+          { retries: 1, retryDelayMs: 1_000 },
+        );
+        return { output: { result: String(value) } };
+      },
+    });
+    const workflow = new WorkflowBuilder(
+      "flaky-step-wf",
+      "Flaky Step",
+      "Test",
+      schema,
+      outputSchema,
+    )
+      .pipe(flaky)
+      .build();
+    const { kernel, persistence, jobTransport, clock } = createTestEnv(
+      [workflow],
+      { stepLedger: new InMemoryStepLedger() },
+    );
+    const host = createServerlessHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+    });
+    const created = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "flaky-step-1",
+      workflowId: "flaky-step-wf",
+      input: { data: "x" },
+    });
+    await host.runMaintenanceTick();
+
+    // The step retry suspends the stage (and the job row).
+    const first = await host.handleJob((await dequeueAsMessage(jobTransport))!);
+    expect(first.outcome).toBe("suspended");
+    expect(jobTransport.getJobsByStatus("SUSPENDED")).toHaveLength(1);
+
+    // The retry runs inside stage.pollSuspended and fails for good.
+    clock.advance(2_000);
+    const tick = await host.runMaintenanceTick();
+    expect(tick.suspendedChecked).toBe(1);
+    expect(attempts).toBe(2);
+    expect((await persistence.getRun(created.workflowRunId))?.status).toBe(
+      "FAILED",
+    );
+    const [stage] = await persistence.getStagesByRun(created.workflowRunId);
+    expect(stage?.status).toBe("FAILED");
+    // The job row does not stay SUSPENDED with completedAt null.
+    expect(jobTransport.getJobsByStatus("SUSPENDED")).toHaveLength(0);
+    const [job] = jobTransport.getJobsByStatus("FAILED");
+    expect(job).toMatchObject({
+      stageId: "flaky-step",
+      lastError: "upstream down (2)",
+    });
+    expect(job?.completedAt).toBeInstanceOf(Date);
   });
 
   it("fails the run immediately with the stage error when no attempts remain", async () => {

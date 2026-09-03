@@ -14,6 +14,7 @@ import type { KernelDeps } from "../kernel.js";
 import type { WorkflowRunRecord, WorkflowStageRecord } from "../ports.js";
 import { buildAnnotationEvents } from "./annotation-events.js";
 import { toOutboxEvents } from "./outbox-events.js";
+import { rollUpRunTotals } from "./run-totals.js";
 
 export type ClaimOutcome<T> =
   | { status: "claimed"; value: T }
@@ -151,6 +152,12 @@ export async function failStageAndRun(
   bufferedAnnotations: CreateAnnotationInput[],
   deps: KernelDeps,
 ): Promise<ClaimOutcome<void>> {
+  // Spend so far, read outside the transaction (the logger is not part
+  // of it); the run row carries it on FAILED as it does on COMPLETED.
+  const stages = await deps.persistence.getStagesByRun(
+    stageRecord.workflowRunId,
+  );
+  const totals = await rollUpRunTotals(stageRecord.workflowRunId, stages, deps);
   return withClaimedRun(
     stageRecord.workflowRunId,
     run.version,
@@ -166,6 +173,7 @@ export async function failStageAndRun(
       await tx.updateRun(stageRecord.workflowRunId, {
         status: "FAILED",
         completedAt: deps.clock.now(),
+        ...totals,
       });
 
       if (bufferedAnnotations.length > 0) {

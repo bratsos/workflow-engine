@@ -40,6 +40,31 @@ import {
 import type { HandlerResult, KernelDeps } from "../kernel";
 import type { ActivityRunResult } from "../ports.js";
 
+/**
+ * Re-open the FAILED `run` steps of a stage record for a new job attempt:
+ * resetting `attempt` to 0 lets the replay's compare-and-set reclaim the
+ * row and execute the step again (a row whose attempt exceeds the step's
+ * `retries` would otherwise throw the stored error). Waits, signals and
+ * sleeps that failed (a deadline that passed) are terminal and stay so.
+ */
+async function reopenFailedSteps(
+  stageRecordId: string,
+  deps: KernelDeps,
+): Promise<void> {
+  const ledger = deps.stepLedger;
+  if (!ledger) return;
+  const rows = await ledger.list(stageRecordId);
+  for (const row of rows) {
+    if (row.status !== "failed" || row.kind !== "run") continue;
+    await ledger.compareAndSet(
+      stageRecordId,
+      row.stepId,
+      { status: "failed", attempt: row.attempt },
+      { attempt: 0, leaseExpiresAt: null },
+    );
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Handler
 // ---------------------------------------------------------------------------
@@ -95,6 +120,21 @@ export async function handleJobExecute(
     await deps.stepLedger?.clear(existingStage.id);
   }
 
+  // A job retry of a stage whose last attempt threw (recorded as PENDING
+  // with the error kept — see Phase 3b) is a NEW attempt: completed steps
+  // are still answered from the ledger, but every `run` step and every
+  // map item that FAILED is re-opened so the retry re-executes it instead
+  // of replaying the stored failure. A replay of the same attempt (a poll
+  // of a suspended stage) never comes through here.
+  const isRetryAttempt =
+    existingStage?.status === "PENDING" &&
+    existingStage.errorMessage != null &&
+    command.attempt !== undefined &&
+    command.attempt > 1;
+  if (isRetryAttempt && existingStage && deps.stepLedger) {
+    await reopenFailedSteps(existingStage.id, deps);
+  }
+
   // ── Phase 1: Start transaction ───────────────────────────────────
   // Upsert stage to RUNNING and write stage:started outbox event.
   // Commits immediately so RUNNING status is visible to observers.
@@ -119,6 +159,11 @@ export async function handleJobExecute(
       update: {
         status: "RUNNING",
         startedAt: deps.clock.now(),
+        // Each retry of the stage is one more attempt on its row, like a
+        // `run.rerunFrom` rerun; a same-attempt re-delivery does not bump.
+        ...(isRetryAttempt && existingStage
+          ? { attempt: existingStage.attempt + 1 }
+          : {}),
       },
     });
 
@@ -259,14 +304,27 @@ export async function handleJobExecute(
           await tx.appendAnnotations(bufferedAnnotations);
         }
 
-        const failedEvent: KernelEvent = {
-          type: "stage:failed",
-          timestamp: deps.clock.now(),
-          workflowRunId,
-          stageId,
-          stageName: stageDef.name,
-          error: errorMessage,
-        };
+        // `stage:failed` only when the row becomes FAILED; a retry that
+        // is about to run is announced as `stage:retrying`.
+        const failedEvent: KernelEvent = willRetry
+          ? {
+              type: "stage:retrying",
+              timestamp: deps.clock.now(),
+              workflowRunId,
+              stageId,
+              stageName: stageDef.name,
+              attempt: command.attempt!,
+              maxAttempts: command.maxAttempts ?? HOST_DEFAULTS.maxAttempts,
+              error: errorMessage,
+            }
+          : {
+              type: "stage:failed",
+              timestamp: deps.clock.now(),
+              workflowRunId,
+              stageId,
+              stageName: stageDef.name,
+              error: errorMessage,
+            };
 
         await tx.appendOutboxEvents(
           toOutboxEvents(
@@ -307,6 +365,12 @@ export async function handleJobExecute(
       error: errorMessage,
       retryable: run.retryable,
       willRetry,
+      ...(command.attempt !== undefined
+        ? {
+            attempt: command.attempt,
+            maxAttempts: command.maxAttempts ?? HOST_DEFAULTS.maxAttempts,
+          }
+        : {}),
       _events: [],
     };
   }

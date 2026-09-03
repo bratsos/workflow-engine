@@ -73,6 +73,32 @@ async function completeSuspendedJobRow(
 }
 
 /**
+ * A stage that ends terminally from the poll path (its retry ran here,
+ * `checkCompletion` reported an error, the wait timed out) never goes back
+ * through `jobTransport.fail`; its SUSPENDED job row would otherwise stay
+ * open with `completedAt null` and misreport the run. Best effort, like
+ * `completeSuspendedJobRow`.
+ */
+async function failSuspendedJobRow(
+  workflowRunId: string,
+  stageId: string,
+  error: string,
+  deps: KernelDeps,
+): Promise<void> {
+  try {
+    const jobs = await deps.jobTransport.getJobsByWorkflowRun(workflowRunId);
+    const job = jobs.find(
+      (j) => j.stageId === stageId && j.status === "SUSPENDED",
+    );
+    if (job) {
+      await deps.jobTransport.fail(job.id, error, false);
+    }
+  } catch {
+    // Best-effort cleanup — a failure here must not mask the stage failure.
+  }
+}
+
+/**
  * Fails a suspended stage before its resume operation ever runs (workflow
  * missing from the registry, or the stage no longer supports its configured
  * resume strategy) — the run itself isn't touched, unlike
@@ -103,6 +129,12 @@ async function failStageOnly(
       ]),
     );
   });
+  await failSuspendedJobRow(
+    stageRecord.workflowRunId,
+    stageRecord.stageId,
+    errorMessage,
+    deps,
+  );
 }
 
 type ReplayOutcome = "resumed" | "suspended" | "failed" | "skip";
@@ -185,21 +217,21 @@ async function replayStage(
       const maxWaitUntil = new Date(
         deps.clock.now().getTime() + suspended.pollConfig.maxWaitTime,
       );
-      // A replay that is still waiting on the same thing (same batch /
-      // durable step, same deadline) re-suspends silently: the run already
-      // announced this suspension, and a poll every few seconds must not
-      // re-emit `stage:suspended` / `workflow:suspended` each time.
+      // A replay that is still waiting on the same durable step re-suspends
+      // silently: the run already announced this suspension, and a poll
+      // every few seconds must not re-emit `stage:suspended` /
+      // `workflow:suspended` each time. The step id is the identity of the
+      // wait (`batchId` is `step:<id>` for a durable wait, a retry and an
+      // in-flight lease alike); the deadline is not part of it, so a stage
+      // waiting on a leased step after a crash (whose 5s in-flight polls
+      // each carry a fresh deadline) announces once too.
       const previous = stageRecord.suspendedState as
         | { batchId?: unknown }
         | null
         | undefined;
       const sameWait =
         previous?.batchId !== undefined &&
-        previous.batchId === suspended.state.batchId &&
-        stageRecord.maxWaitUntil !== null &&
-        stageRecord.maxWaitUntil !== undefined &&
-        Math.abs(stageRecord.maxWaitUntil.getTime() - maxWaitUntil.getTime()) <
-          1_000;
+        previous.batchId === suspended.state.batchId;
       const claimResult = await withClaimedRun(
         stageRecord.workflowRunId,
         run.version,
@@ -335,14 +367,21 @@ async function replayStage(
     );
     return "resumed";
   } catch (error) {
+    const message = toErrorMessage(error);
     const claimResult = await failStageAndRun(
       stageRecord,
       run,
-      toErrorMessage(error),
+      message,
       built?.annotationBuffer.flush() ?? [],
       deps,
     );
     if (await handleClaimOutcome(claimResult, stageRecord, deps)) return "skip";
+    await failSuspendedJobRow(
+      stageRecord.workflowRunId,
+      stageRecord.stageId,
+      message,
+      deps,
+    );
     return "failed";
   }
 }
@@ -526,6 +565,12 @@ export async function handleStagePollSuspended(
         );
 
         if (await handleClaimOutcome(claimResult, stageRecord, deps)) continue;
+        await failSuspendedJobRow(
+          stageRecord.workflowRunId,
+          stageRecord.stageId,
+          checkResult.error,
+          deps,
+        );
 
         failed++;
       } else if (checkResult.ready) {
@@ -629,6 +674,12 @@ export async function handleStagePollSuspended(
         );
 
         if (await handleClaimOutcome(claimResult, stageRecord, deps)) continue;
+        await failSuspendedJobRow(
+          stageRecord.workflowRunId,
+          stageRecord.stageId,
+          timeoutError,
+          deps,
+        );
 
         failed++;
         continue;
@@ -661,15 +712,22 @@ export async function handleStagePollSuspended(
       // Unexpected error during checkCompletion. Flush any annotations
       // recorded before the throw so they persist alongside the FAILED
       // outcome.
+      const message = toErrorMessage(error);
       const claimResult = await failStageAndRun(
         stageRecord,
         run,
-        toErrorMessage(error),
+        message,
         annotationBuffer.flush(),
         deps,
       );
 
       if (await handleClaimOutcome(claimResult, stageRecord, deps)) continue;
+      await failSuspendedJobRow(
+        stageRecord.workflowRunId,
+        stageRecord.stageId,
+        message,
+        deps,
+      );
 
       failed++;
     }

@@ -49,7 +49,6 @@ import type {
 export interface ConformanceTestApi {
   describe: (name: string, fn: () => void) => void;
   it: (name: string, fn: () => void | Promise<void>) => void;
-  // biome-ignore lint/suspicious/noExplicitAny: assertion chains are the caller's framework
   expect: (value: unknown) => any;
   beforeEach: (fn: () => void | Promise<void>) => void;
 }

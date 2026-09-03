@@ -11,7 +11,7 @@ import type { StepResult, ToolSet } from "ai";
 import { generateText as aiGenerateText, Output } from "ai";
 import type { z } from "zod";
 import type { AICallLogger } from "../persistence";
-import { getModel, type ModelKey } from "./model-helper";
+import { calculateCost, getModel, type ModelKey } from "./model-helper";
 import {
   explainRoutingError,
   getModelProvider,
@@ -62,6 +62,42 @@ export function buildMultimodalMessages(prompt: ContentPart[]) {
   ];
 }
 
+function tokenCount(value: unknown): number {
+  if (typeof value === "number") return value;
+  if (typeof value === "object" && value !== null) {
+    const total = (value as { total?: unknown }).total;
+    if (typeof total === "number") return total;
+  }
+  return 0;
+}
+
+/**
+ * Token usage carried by a thrown error: the AI SDK's
+ * `NoObjectGeneratedError` (and an adapter that throws it) reports the
+ * `usage` of the call that produced the unparseable output. Both the AI SDK
+ * 7 shape (`inputTokens: number`) and the provider shape
+ * (`inputTokens: { total }`) are read; flat `inputTokens`/`outputTokens`
+ * on the error itself are accepted for custom adapter errors.
+ */
+export function usageFromError(error: unknown): {
+  inputTokens: number;
+  outputTokens: number;
+} {
+  if (typeof error !== "object" || error === null) {
+    return { inputTokens: 0, outputTokens: 0 };
+  }
+  const source = error as {
+    usage?: { inputTokens?: unknown; outputTokens?: unknown };
+    inputTokens?: unknown;
+    outputTokens?: unknown;
+  };
+  const usage = source.usage;
+  return {
+    inputTokens: tokenCount(usage?.inputTokens ?? source.inputTokens),
+    outputTokens: tokenCount(usage?.outputTokens ?? source.outputTokens),
+  };
+}
+
 /**
  * Log a failed AI call (fire-and-forget persistence write) and return the
  * derived error fields. Shared by the catch blocks in generateText,
@@ -84,6 +120,21 @@ export function logFailure(
   const durationMs = Date.now() - params.startTime;
   const errorMessage =
     params.error instanceof Error ? params.error.message : String(params.error);
+  // A call that reached the model and failed afterwards (`NoObjectGeneratedError`
+  // and the like) still consumed tokens; the error carries the usage.
+  const { inputTokens, outputTokens } = usageFromError(params.error);
+  let cost = 0;
+  if (inputTokens > 0 || outputTokens > 0) {
+    try {
+      cost = calculateCost(
+        params.modelKey,
+        inputTokens,
+        outputTokens,
+      ).totalCost;
+    } catch {
+      cost = 0;
+    }
+  }
 
   aiCallLogger.logCall({
     topic: params.topic,
@@ -92,9 +143,9 @@ export function logFailure(
     modelId: params.modelId,
     prompt: params.prompt,
     response: "",
-    inputTokens: 0,
-    outputTokens: 0,
-    cost: 0,
+    inputTokens,
+    outputTokens,
+    cost,
     metadata: {
       ...params.metadata,
       durationMs,

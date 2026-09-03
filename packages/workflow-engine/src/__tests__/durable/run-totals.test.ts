@@ -60,3 +60,69 @@ describe("run cost and token totals", () => {
     expect(result.run.totalTokens).toBe(165);
   });
 });
+
+describe("run totals on a failed run", () => {
+  it("writes the roll-up onto a run failed by a stage throw", async () => {
+    const workflow = defineWorkflow("run-totals-failed", { input: In })
+      .stage("write", {
+        schemas: {
+          input: In,
+          output: z.object({ text: z.string() }),
+          config: z.object({}),
+        },
+        async execute(ctx) {
+          await ctx.step.ai.generateText("a", MODEL, "draft");
+          throw new Error("after the call");
+        },
+      })
+      .build();
+    const harness = createTestHarness({ workflows: [workflow] });
+    harness.mockAi.setTextResponse("draft", {
+      text: "d",
+      inputTokens: 100,
+      outputTokens: 50,
+      cost: 0.25,
+    });
+
+    const result = await harness.run("run-totals-failed", { topic: "x" });
+
+    expect(result.status).toBe("FAILED");
+    expect(result.run.totalCost).toBeCloseTo(0.25, 9);
+    expect(result.run.totalTokens).toBe(150);
+  });
+
+  it("writes the roll-up onto a run failed from the poll path", async () => {
+    const workflow = defineWorkflow("run-totals-poll-failed", { input: In })
+      .stage("write", {
+        schemas: {
+          input: In,
+          output: z.object({ text: z.string() }),
+          config: z.object({}),
+        },
+        async execute(ctx) {
+          await ctx.step.ai.generateText("a", MODEL, "draft");
+          await ctx.step.waitFor("never", {
+            poll: async () => false,
+            ready: (v) => v === true,
+            every: "1s",
+            timeout: "2s",
+          });
+          return { output: { text: "unreachable" } };
+        },
+      })
+      .build();
+    const harness = createTestHarness({ workflows: [workflow] });
+    harness.mockAi.setTextResponse("draft", {
+      text: "d",
+      inputTokens: 10,
+      outputTokens: 5,
+      cost: 0.05,
+    });
+
+    const result = await harness.run("run-totals-poll-failed", { topic: "x" });
+
+    expect(result.status).toBe("FAILED");
+    expect(result.run.totalCost).toBeCloseTo(0.05, 9);
+    expect(result.run.totalTokens).toBe(15);
+  });
+});

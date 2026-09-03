@@ -585,6 +585,28 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
       async noteAttempt(stepId, attempt) {
         await update(stepId, { attempt });
       },
+      async storeFailedVerdict(stepId, verdict) {
+        await update(stepId, {
+          status: "failed",
+          error:
+            typeof (verdict as { error?: unknown })?.error === "string"
+              ? (verdict as { error: string }).error
+              : "map item failed",
+          result: verdict,
+          leaseExpiresAt: null,
+        });
+      },
+      async loadFailedVerdict(stepId) {
+        const { stageRecordId, ledger } = requireLedger();
+        const record = await ledger.get(stageRecordId, stepId);
+        if (record?.status !== "failed") return undefined;
+        const result = record.result;
+        return typeof result === "object" &&
+          result !== null &&
+          (result as { status?: unknown }).status === "failed"
+          ? result
+          : undefined;
+      },
       assertReady: () => void requireLedger(),
       ai: () => {
         if (!options.ai) throw new AIServicesNotConfiguredError();

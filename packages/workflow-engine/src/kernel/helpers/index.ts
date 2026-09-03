@@ -39,6 +39,7 @@ export {
   prepareExecutionGroup,
 } from "./prepare-execution-group.js";
 export { resolveExecutionGroupOutput } from "./resolve-execution-group-output.js";
+export { rollUpRunTotals } from "./run-totals.js";
 export { saveStageArtifacts } from "./save-stage-artifacts.js";
 export { saveStageOutput } from "./save-stage-output.js";
 export {

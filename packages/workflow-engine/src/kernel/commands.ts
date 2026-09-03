@@ -166,6 +166,10 @@ export interface JobExecuteResult {
    * (`jobTransport.fail(jobId, error, true)`).
    */
   readonly willRetry?: boolean;
+  /** The job attempt that ran, echoed from the command when it carried one. */
+  readonly attempt?: number;
+  /** The attempt budget the retry decision used, when the command carried one. */
+  readonly maxAttempts?: number;
 }
 
 // ---------------------------------------------------------------------------

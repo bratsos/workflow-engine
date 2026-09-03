@@ -56,6 +56,14 @@ export interface StepAiDeps {
   isCompleted(stepId: string): Promise<boolean>;
   /** Record an in-process retry on a running step: bumps the row's `attempt`. */
   noteAttempt(stepId: string, attempt: number): Promise<void>;
+  /**
+   * Mark an item step `failed` and keep its verdict as the row's result, so
+   * a replay of the same attempt answers the verdict (with `errorName`,
+   * attempts and tokens intact) and a new job attempt can re-open the row.
+   */
+  storeFailedVerdict(stepId: string, verdict: unknown): Promise<void>;
+  /** The verdict stored by `storeFailedVerdict`, if the row is still failed. */
+  loadFailedVerdict(stepId: string): Promise<unknown | undefined>;
   /** Wait before an in-process retry. Defaults to a real timer. */
   delay?(ms: number): Promise<void>;
   /** Throws when durable steps are unavailable (no ledger / stage record). */
@@ -95,6 +103,19 @@ interface StoredSubmit {
 
 interface Budget {
   reserve(): boolean;
+}
+
+/**
+ * Thrown from inside an item's `run` step when the item ends in a failed
+ * verdict, so the ledger row is recorded as `failed` (not as a completed
+ * step whose result happens to be a failure) and a later job attempt
+ * re-executes it. The map catches it and returns the verdict.
+ */
+class AiMapItemFailedSignal<TOut> extends Error {
+  constructor(readonly verdict: AiMapResult<TOut> & { status: "failed" }) {
+    super(verdict.error);
+    this.name = "AiMapItemFailedSignal";
+  }
 }
 
 function pickTextResult(result: AITextResult): AITextResult {
@@ -659,17 +680,32 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
           }
         }
         try {
-          return await deps.run(stepId, () =>
-            executeItem(entry, prior, stepId),
-          );
+          return await deps.run(stepId, async () => {
+            const verdict = await executeItem(entry, prior, stepId);
+            if (verdict.status === "failed") {
+              throw new AiMapItemFailedSignal(verdict);
+            }
+            return verdict;
+          });
         } catch (error) {
           if (isStepControlFlowError(error)) throw error;
           if (error instanceof AiMapBudgetExceededError) throw error;
-          // The item step itself failed (a throw outside the model-call
-          // retry loop, or a stored failure from an earlier release).
-          // Memoize the verdict in its own step: the item step only stores
-          // the error *message*, so a later replay would otherwise lose
-          // `errorName` (the stored error is rebuilt as a plain `Error`).
+          // The item ended in a failed verdict (retries and repair
+          // exhausted, or a throw outside the model-call loop). The row is
+          // `failed`; its result carries the verdict so a replay of this
+          // attempt returns it unchanged (the row's error column alone
+          // would lose `errorName`, attempts and tokens), while a new job
+          // attempt re-opens the row and re-prompts the item.
+          if (error instanceof AiMapItemFailedSignal) {
+            await deps.storeFailedVerdict(stepId, error.verdict);
+            return error.verdict as AiMapResult<TOut>;
+          }
+          const stored = (await deps.loadFailedVerdict(stepId)) as
+            | AiMapResult<TOut>
+            | undefined;
+          if (stored && stored.status === "failed" && stored.id === entry.id) {
+            return stored;
+          }
           const verdict: AiMapResult<TOut> = {
             id: entry.id,
             index: entry.index,
@@ -681,7 +717,8 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
             outputTokens: prior?.outputTokens ?? 0,
             cost: prior?.cost ?? 0,
           };
-          return deps.run(`${stepId}:failed`, async () => verdict);
+          await deps.storeFailedVerdict(stepId, verdict);
+          return verdict;
         }
       });
 

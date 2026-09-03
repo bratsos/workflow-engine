@@ -31,12 +31,7 @@ import {
   HOST_DEFAULTS,
 } from "../kernel/helpers/host-support.js";
 import type { PluginDefinition } from "../kernel/plugins.js";
-import type {
-  BlobStore,
-  EventSink,
-  KernelServices,
-  StepLedger,
-} from "../kernel/ports.js";
+import type { EventSink, KernelServices, StepLedger } from "../kernel/ports.js";
 import type { FakeClock } from "../kernel/testing/fake-clock.js";
 import { FakeClock as FakeClockImpl } from "../kernel/testing/fake-clock.js";
 import type { InMemoryBlobStore } from "../kernel/testing/in-memory-blob-store.js";

@@ -71,9 +71,26 @@ export interface JobMessage {
   payload: Record<string, unknown>;
 }
 
+/**
+ * Outcome of `handleJob`. The consumer's ack/retry decision reads
+ * `willRetry`: when true the stage was left `PENDING` and the job must run
+ * again — a transport whose `fail()` re-enqueues (the built-in queues) has
+ * already done so and the message can be acknowledged; a push transport
+ * whose `fail()` cannot (a queue consumer that must `retry()` the message
+ * itself) retries the message after `retryDelayMs`. When false the job is
+ * settled: acknowledge it.
+ */
 export interface JobResult {
   outcome: "completed" | "suspended" | "failed";
   error?: string;
+  /** The message was an orphan or malformed; it was failed and acknowledged. */
+  dead?: boolean;
+  willRetry?: boolean;
+  /** The job attempt that ran (1 on the first execution). */
+  attempt?: number;
+  maxAttempts?: number;
+  /** Backoff before the retry (`2^attempt` seconds), when `willRetry`. */
+  retryDelayMs?: number;
 }
 
 export interface ProcessJobsResult {
