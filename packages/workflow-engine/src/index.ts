@@ -65,6 +65,7 @@ export {
   type AICallType,
   type AIEmbedResult,
   type AIHelper,
+  type AIHelperOptions,
   type AIObjectResult,
   type AIStreamResult,
   type AITextResult,
@@ -74,6 +75,7 @@ export {
   type EmbedOptions,
   type LogContext,
   type ObjectOptions,
+  type OpenRouterRoutingOptions,
   type ProviderResolver,
   type RecordCallParams,
   registerEmbeddingProvider,
@@ -83,8 +85,14 @@ export {
 // Batch Engine & OpenRouter Direct Driver
 export {
   createOpenRouterBatchModel,
+  type EngineBatchItemResult,
+  type EngineBatchModel,
   type EngineBatchRef,
+  type EngineBatchRequest,
+  type EngineBatchStatus,
+  fromAiSdk,
   type OpenRouterBatchConfig,
+  resolveAiSdkBatchModel,
 } from "./ai/batch";
 export { BatchSubmitError } from "./ai/batch-helper";
 // Model Helper

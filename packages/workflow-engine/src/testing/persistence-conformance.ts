@@ -1747,14 +1747,59 @@ export function aiCallLoggerConformanceSuite(
       });
 
       it("should mark batch as recorded", async () => {
-        // Given: A batch
-        await logger.logBatchResults("recorded-batch", [createCallInput()]);
+        // Given: An unrecorded batch
+        expect(await logger.isRecorded("recorded-batch")).toBe(false);
+
+        // When: Logging the batch
+        await logger.logBatchResults("recorded-batch", [
+          createCallInput({ requestId: "recorded-request" }),
+        ]);
 
         // When: Checking if recorded
         const isRecorded = await logger.isRecorded("recorded-batch");
 
         // Then: Returns true
         expect(isRecorded).toBe(true);
+      });
+
+      it("should write each repeated batch request only once", async () => {
+        const results = [
+          createCallInput({
+            topic: "workflow.batch.dedupe",
+            requestId: "request-1",
+          }),
+          createCallInput({
+            topic: "workflow.batch.dedupe",
+            requestId: "request-2",
+          }),
+        ];
+
+        await logger.logBatchResults("dedupe-batch", results);
+        await logger.logBatchResults("dedupe-batch", results);
+
+        const stats = await logger.getStats("workflow.batch.dedupe");
+        expect(stats.totalCalls).toBe(2);
+      });
+
+      it("should deduplicate concurrent writes for the same batch requests", async () => {
+        const results = [
+          createCallInput({
+            topic: "workflow.batch.concurrent",
+            requestId: "request-1",
+          }),
+          createCallInput({
+            topic: "workflow.batch.concurrent",
+            requestId: "request-2",
+          }),
+        ];
+
+        await Promise.all([
+          logger.logBatchResults("concurrent-batch", results),
+          logger.logBatchResults("concurrent-batch", results),
+        ]);
+
+        const stats = await logger.getStats("workflow.batch.concurrent");
+        expect(stats.totalCalls).toBe(2);
       });
     });
 
@@ -1776,6 +1821,17 @@ export function aiCallLoggerConformanceSuite(
 
         // Then: Returns true
         expect(isRecorded).toBe(true);
+      });
+
+      it("should recognize a batch ID stored only in legacy metadata", async () => {
+        logger.logCall(
+          createCallInput({
+            metadata: { batchId: "legacy-metadata-batch" },
+          }),
+        );
+        await sleep(100);
+
+        expect(await logger.isRecorded("legacy-metadata-batch")).toBe(true);
       });
     });
 

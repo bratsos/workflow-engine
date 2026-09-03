@@ -160,8 +160,12 @@ model AICall {
   inputTokens  Int
   outputTokens Int
   cost         Float
+  batchId      String?
+  requestId    String?
   metadata     Json?
 
+  @@unique([batchId, requestId], map: "ai_calls_batch_request_unique")
+  @@index([batchId])
   @@index([topic])
   @@map("ai_calls")
 }

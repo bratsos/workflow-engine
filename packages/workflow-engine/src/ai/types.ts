@@ -12,6 +12,13 @@ import type { z } from "zod";
 import type { AICallLogger } from "../persistence";
 import type { AIHelperStats } from "../persistence/interface";
 import type { ModelConfig, ModelKey } from "./model-helper";
+import type { OpenRouterRoutingOptions } from "./shared";
+
+export type { OpenRouterRoutingOptions };
+
+export interface AIHelperOptions {
+  routing?: OpenRouterRoutingOptions;
+}
 
 /**
  * Custom provider resolver. Given a ModelConfig, return an AI SDK
@@ -248,6 +255,11 @@ export interface BatchOptions {
     | "/v1/embeddings";
   maxRequestsPerBatch?: number;
   maxPartitions?: number;
+  /**
+   * Abort signal to cancel batch operations. Applies to every provider call
+   * this batch handle makes (submit, status polls, result fetches).
+   */
+  abortSignal?: AbortSignal;
 }
 
 /** A request to be processed in a batch */
@@ -438,4 +450,5 @@ export interface AIHelperContext {
   readonly topic: string;
   readonly aiCallLogger: AICallLogger;
   readonly providerResolver?: ProviderResolver;
+  readonly routing?: OpenRouterRoutingOptions;
 }

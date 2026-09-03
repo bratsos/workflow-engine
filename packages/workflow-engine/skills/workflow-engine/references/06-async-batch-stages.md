@@ -570,3 +570,26 @@ await ctx.storage.save("batch-metadata", {
 // Retrieve in checkCompletion
 const metadata = await ctx.storage.load("batch-metadata");
 ```
+
+## Inspecting a Batch Outside a Stage
+
+An admin page or a CLI can check a batch without going through `ai.batch()`, using the same engine models the batch helper uses. Persist `handle.refs` at submit time; each ref names its provider and model.
+
+```typescript
+import {
+  createOpenRouterBatchModel,
+  resolveAiSdkBatchModel,
+  type EngineBatchRef,
+} from "@bratsos/workflow-engine";
+
+async function inspect(ref: EngineBatchRef) {
+  const model =
+    ref.provider === "openrouter"
+      ? createOpenRouterBatchModel({ apiKey: process.env.OPENROUTER_API_KEY!, modelId: ref.modelId })
+      : await resolveAiSdkBatchModel(ref.provider as "google" | "anthropic" | "openai", ref.modelId);
+  return model.status(ref); // { status, rawStatus, requestCounts, error }
+}
+```
+
+This replaces hand-rolled status checks against the vendor SDKs — the status mapping is the engine's, so it cannot drift from what a running stage sees.
+

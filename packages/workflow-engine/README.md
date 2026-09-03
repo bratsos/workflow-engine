@@ -224,6 +224,11 @@ model AICall {
   cost          Float
   metadata      Json?
 
+  batchId      String?
+  requestId    String?
+
+  @@unique([batchId, requestId], map: "ai_calls_batch_request_unique")
+  @@index([batchId])
   @@index([topic])
   @@map("ai_calls")
 }
@@ -917,6 +922,16 @@ Verify all dependencies are included in the workflow:
 A worker likely crashed. The stale lease recovery (`lease.reapStale` command) automatically releases jobs. In Node host, this runs on each orchestration tick. For serverless, call `runMaintenanceTick()` from a cron trigger.
 
 ---
+
+## Upgrading
+
+Migration guides ship inside the package at `node_modules/@bratsos/workflow-engine/skills/workflow-engine/migrations/` (one per minor, `migrate-X.Y-to-A.B.md`) and on the docs site. A codemod applies the mechanical renames and lists every manual item with a file and line:
+
+```bash
+npx workflow-engine-codemod --from 0.11          # or --from 0.12; add --dry-run to preview
+```
+
+The 0.12 → 0.13 guide opens with a short "does this affect you?" triage — if you never call `ai.batch()`, only two of its required actions apply.
 
 ## License
 

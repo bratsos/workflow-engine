@@ -11,6 +11,7 @@ export default defineConfig({
     "kernel/testing/index": "src/kernel/testing/index.ts",
     "conventions/index": "src/conventions/index.ts",
     "cli/sync-models": "src/cli/sync-models.ts",
+    "cli/codemod": "src/cli/codemod.ts",
   },
   format: ["esm"],
   dts: true,
@@ -30,6 +31,7 @@ export default defineConfig({
     // scripts/check-client-isolation.mjs for the guard that enforces it.
     "@ai-sdk/anthropic",
     "@ai-sdk/openai",
+    "typescript",
     // Only referenced by src/testing/persistence-conformance.ts (the
     // exported conformance suite factories). Left external so the main
     // "./testing" bundle doesn't drag vitest's runtime into every

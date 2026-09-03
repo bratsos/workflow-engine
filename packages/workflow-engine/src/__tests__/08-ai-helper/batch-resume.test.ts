@@ -406,3 +406,31 @@ describe("partial submit failure is a typed error", () => {
     ).rejects.toBeInstanceOf(BatchSubmitError);
   });
 });
+
+describe("abortSignal plumbing", () => {
+  it("passes abortSignal from BatchOptions to start, status, and results", async () => {
+    const { model } = makeFakeBackend();
+    const { logger } = makeLogger();
+    const controller = new AbortController();
+
+    const batch = newBatch(logger, model, { abortSignal: controller.signal });
+    const handle = await batch.submit([{ id: "r1", prompt: "p" }]);
+
+    expect(model.start).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ abortSignal: controller.signal }),
+    );
+
+    await batch.getStatus(handle.id);
+    expect(model.status).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ abortSignal: controller.signal }),
+    );
+
+    await batch.getResults(handle.id);
+    expect(model.results).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ abortSignal: controller.signal }),
+    );
+  });
+});
