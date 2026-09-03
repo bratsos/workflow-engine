@@ -70,10 +70,9 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
 
   /**
    * Batch ids already written to the cost ledger BY THIS PROCESS. Together
-   * with `recordingPromises` this closes the in-process check-then-act race.
-   * It does not close the cross-process one: two workers can both observe
-   * `isRecorded() === false` and both write. Closing that needs a uniqueness
-   * guarantee in the AICallLogger store (e.g. a unique index on batchId).
+   * with `recordingPromises` this closes the in-process check-then-act race;
+   * the AICallLogger's unique (batchId, requestId) index closes the
+   * cross-process race.
    */
   private recordedBatchIds = new Set<string>();
 
@@ -326,7 +325,9 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
     for (let i = 0; i < partitions.length; i++) {
       const partition = partitions[i]!;
       try {
-        const res = await batchModel.start(partition.engineRequests);
+        const res = await batchModel.start(partition.engineRequests, {
+          abortSignal: this.options?.abortSignal,
+        });
         const ref: EngineBatchRef = {
           version: 1,
           type: "text",
@@ -430,7 +431,11 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
     const refs = this.resolveRefs(batchId, metadata, batchModel);
 
     const statuses = await Promise.all(
-      refs.map((ref) => batchModel.status(ref)),
+      refs.map((ref) =>
+        batchModel.status(ref, {
+          abortSignal: this.options?.abortSignal,
+        }),
+      ),
     );
 
     // Aggregate status across refs: failed if any failed; completed only if all completed; else processing/pending
@@ -537,7 +542,9 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
     const results: AIBatchResult<T>[] = [];
 
     for (const ref of targetRefs) {
-      for await (const item of batchModel.results(ref)) {
+      for await (const item of batchModel.results(ref, {
+        abortSignal: this.options?.abortSignal,
+      })) {
         totalReceivedItems++;
         const customId = resolveCustomId(item);
         if (!customId) {
@@ -758,6 +765,8 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
               inputTokens: r.inputTokens,
               outputTokens: r.outputTokens,
               cost,
+              batchId,
+              requestId: r.id,
               metadata:
                 r.status === "failed"
                   ? {

@@ -108,7 +108,8 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
 ): Promise<AITextResult> {
   const modelConfig = getModel(modelKey);
   const model =
-    ctx.providerResolver?.(modelConfig) ?? getModelProvider(modelConfig);
+    ctx.providerResolver?.(modelConfig) ??
+    getModelProvider(modelConfig, ctx.routing);
   const startTime = Date.now();
 
   // Determine if we have multimodal content
@@ -352,7 +353,8 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
 ): Promise<AIObjectResult<z.infer<TSchema>>> {
   const modelConfig = getModel(modelKey);
   const model =
-    ctx.providerResolver?.(modelConfig) ?? getModelProvider(modelConfig);
+    ctx.providerResolver?.(modelConfig) ??
+    getModelProvider(modelConfig, ctx.routing);
   const startTime = Date.now();
 
   // Determine if we have multimodal content

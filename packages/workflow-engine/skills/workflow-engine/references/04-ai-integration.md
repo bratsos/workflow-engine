@@ -129,6 +129,20 @@ const ai = createAIHelper("workflow.run-123", aiCallLogger, logContext);
 const ai = runtime.createAIHelper(`workflow.${ctx.workflowRunId}.stage.${ctx.stageId}`);
 ```
 
+### Routing options
+
+```typescript
+const ai = createAIHelper(topic, aiLogger, undefined, undefined, {
+  routing: {
+    priceHeadroom: 1.25,       // max_price = registry price × 1.25 (default). 0 omits max_price.
+    sort: "throughput",        // default
+    requireParameters: true,   // default; false lets OpenRouter route to providers that ignore e.g. response_format
+  },
+});
+```
+
+`max_price` is an exclusive filter on OpenRouter's side — a request whose price ceiling is below the live price fails outright rather than costing more — so the default headroom absorbs ordinary price drift between `workflow-engine-sync` runs. Child helpers inherit the options.
+
 ## AIHelper Interface
 
 ```typescript
@@ -575,6 +589,26 @@ If no provider is specified and the model has no known batch-capable provider, `
 - **No idempotency key:** POST submissions are not auto-retried.
 - **Schema partitioning:** Google models require all requests in a single batch to share the exact same response schema; `submit()` handles this by partitioning requests by schema automatically.
 
+### Partial submit failure
+
+A `submit()` may fan out into several upstream batches. If a later one fails after earlier ones were created, those batches keep running and bill the account, so the error carries their refs:
+
+```typescript
+import { BatchSubmitError } from "@bratsos/workflow-engine";
+
+try {
+  await batch.submit(requests);
+} catch (err) {
+  if (err instanceof BatchSubmitError) {
+    // Persist err.createdRefs so the surviving batches can be polled and drained:
+    await batch.getStatus(err.createdRefs[0].id, { batchRefs: err.createdRefs });
+  }
+  throw err;
+}
+```
+
+The POST is never retried automatically — there is no idempotency key on the batch APIs, so a retry would create and bill a second batch.
+
 ## Child Helpers
 
 Create child helpers for hierarchical topic tracking.
@@ -634,6 +668,23 @@ const stats = await ai.getStats();
 //   },
 // }
 ```
+
+## Provider-Reported Cost
+
+Every result carries two cost numbers since 0.13:
+
+```typescript
+const { text, cost, reportedCostUsd, costSource } = await ai.generateText(modelKey, prompt);
+// cost            - the best available number; what gets recorded
+// reportedCostUsd - the provider's own figure, when it reports one (OpenRouter does)
+// costSource      - "reported" | "estimated"
+```
+
+`cost` prefers the provider's figure and falls back to the static price table (`inputCostPerMillion` / `outputCostPerMillion`, plus `longContextTier` above its threshold). `AIObjectResult`, `AIEmbedResult`, and the stream's `getUsage()` carry the same fields.
+
+Under BYOK the provider's `cost` is only the routing fee and the inference spend arrives separately as `upstream_inference_cost`; the engine adds it in that case and not otherwise, so the recorded number is the real spend either way. When a call is estimated, `costSource === "estimated"` tells you the number came from the registry, not the bill.
+
+Batch cost follows the transport actually used: a native google/anthropic/openai batch bills the vendor's documented discount (`batchDiscountPercent`), the OpenRouter transport bills the absolute price of the `:batch` catalog row (`batchInputCostPerMillion` / `batchOutputCostPerMillion`).
 
 ## Model Configuration
 

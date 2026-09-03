@@ -149,6 +149,11 @@ model AICall {
   cost          Float
   metadata      Json?
 
+  batchId      String?
+  requestId    String?
+
+  @@unique([batchId, requestId], map: "ai_calls_batch_request_unique")
+  @@index([batchId])
   @@index([topic])
   @@map("ai_calls")
 }

@@ -22,9 +22,38 @@ import type {
   CreateAICallInput,
 } from "../persistence/interface.js";
 
+type MetadataRecord = Record<string, unknown>;
+
+function getMetadataRecord(metadata: unknown): MetadataRecord {
+  if (
+    metadata !== null &&
+    typeof metadata === "object" &&
+    !Array.isArray(metadata)
+  ) {
+    return metadata as MetadataRecord;
+  }
+  return {};
+}
+
+function getMetadataString(metadata: unknown, key: string): string | undefined {
+  const value = getMetadataRecord(metadata)[key];
+  return typeof value === "string" ? value : undefined;
+}
+
+function getBatchMetadata(
+  metadata: unknown,
+  batchId: string,
+  requestId: string | undefined,
+): MetadataRecord {
+  return {
+    ...getMetadataRecord(metadata),
+    batchId,
+    ...(requestId !== undefined ? { requestId } : {}),
+  };
+}
+
 export class InMemoryAICallLogger implements AICallLogger {
   private calls = new Map<string, AICallRecord>();
-  private recordedBatches = new Set<string>();
 
   // ============================================================================
   // Core Operations
@@ -47,6 +76,8 @@ export class InMemoryAICallLogger implements AICallLogger {
       inputTokens: call.inputTokens,
       outputTokens: call.outputTokens,
       cost: call.cost,
+      ...(call.batchId !== undefined ? { batchId: call.batchId } : {}),
+      ...(call.requestId !== undefined ? { requestId: call.requestId } : {}),
       metadata: call.metadata ?? null,
     };
     this.calls.set(id, record);
@@ -59,16 +90,25 @@ export class InMemoryAICallLogger implements AICallLogger {
     batchId: string,
     results: CreateAICallInput[],
   ): Promise<void> {
-    // Mark batch as recorded
-    this.recordedBatches.add(batchId);
-
-    // Log each result
     for (const result of results) {
+      const requestId =
+        result.requestId ?? getMetadataString(result.metadata, "requestId");
+
+      if (
+        requestId !== undefined &&
+        Array.from(this.calls.values()).some(
+          (call) => call.batchId === batchId && call.requestId === requestId,
+        )
+      ) {
+        continue;
+      }
+
       this.logCall({
         ...result,
+        batchId,
+        ...(requestId !== undefined ? { requestId } : {}),
         metadata: {
-          ...(result.metadata as Record<string, unknown> | undefined),
-          batchId,
+          ...getBatchMetadata(result.metadata, batchId, requestId),
         },
       });
     }
@@ -117,7 +157,11 @@ export class InMemoryAICallLogger implements AICallLogger {
    * Check if batch results are already recorded
    */
   async isRecorded(batchId: string): Promise<boolean> {
-    return this.recordedBatches.has(batchId);
+    return Array.from(this.calls.values()).some(
+      (call) =>
+        call.batchId === batchId ||
+        getMetadataString(call.metadata, "batchId") === batchId,
+    );
   }
 
   // ============================================================================
@@ -129,7 +173,6 @@ export class InMemoryAICallLogger implements AICallLogger {
    */
   clear(): void {
     this.calls.clear();
-    this.recordedBatches.clear();
   }
 
   /**
@@ -210,7 +253,17 @@ export class InMemoryAICallLogger implements AICallLogger {
    * Get all recorded batch IDs
    */
   getRecordedBatchIds(): string[] {
-    return Array.from(this.recordedBatches);
+    const batchIds = new Set<string>();
+    for (const call of this.calls.values()) {
+      if (call.batchId !== undefined) {
+        batchIds.add(call.batchId);
+      }
+      const metadataBatchId = getMetadataString(call.metadata, "batchId");
+      if (metadataBatchId !== undefined) {
+        batchIds.add(metadataBatchId);
+      }
+    }
+    return Array.from(batchIds);
   }
 
   /**

@@ -27,33 +27,49 @@ export interface OpenRouterRoutingOptions {
   requireParameters?: boolean;
 }
 
+export function buildOpenRouterRoutingProvider(
+  modelConfig: ModelConfig,
+  routing?: OpenRouterRoutingOptions,
+): {
+  sort: "throughput" | "price" | "latency";
+  require_parameters: boolean;
+  max_price?: {
+    prompt: number;
+    completion: number;
+  };
+} {
+  const priceHeadroom = routing?.priceHeadroom ?? 1.25;
+  const sort = routing?.sort ?? "throughput";
+  const requireParameters = routing?.requireParameters ?? true;
+
+  const provider: {
+    sort: "throughput" | "price" | "latency";
+    require_parameters: boolean;
+    max_price?: {
+      prompt: number;
+      completion: number;
+    };
+  } = {
+    sort,
+    require_parameters: requireParameters,
+  };
+
+  if (priceHeadroom > 0) {
+    provider.max_price = {
+      prompt: modelConfig.inputCostPerMillion * priceHeadroom,
+      completion: modelConfig.outputCostPerMillion * priceHeadroom,
+    };
+  }
+
+  return provider;
+}
+
 export function getModelProvider(
   modelConfig: ModelConfig,
   routing?: OpenRouterRoutingOptions,
 ): LanguageModelV4 {
   if (modelConfig.provider === "openrouter") {
-    const priceHeadroom = routing?.priceHeadroom ?? 1.25;
-    const sort = routing?.sort ?? "throughput";
-    const requireParameters = routing?.requireParameters ?? true;
-
-    const provider: {
-      sort: "throughput" | "price" | "latency";
-      require_parameters: boolean;
-      max_price?: {
-        prompt: number;
-        completion: number;
-      };
-    } = {
-      sort,
-      require_parameters: requireParameters,
-    };
-
-    if (priceHeadroom > 0) {
-      provider.max_price = {
-        prompt: modelConfig.inputCostPerMillion * priceHeadroom,
-        completion: modelConfig.outputCostPerMillion * priceHeadroom,
-      };
-    }
+    const provider = buildOpenRouterRoutingProvider(modelConfig, routing);
 
     return openrouter(modelConfig.id, {
       usage: { include: true },

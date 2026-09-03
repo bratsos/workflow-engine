@@ -12,7 +12,12 @@ import { openrouter } from "@openrouter/ai-sdk-provider";
 import { embed as aiEmbed, embedMany } from "ai";
 import { logFailure } from "./generate";
 import { getModel, type ModelConfig, type ModelKey } from "./model-helper";
-import { logger, resolveCost } from "./shared";
+import {
+  buildOpenRouterRoutingProvider,
+  logger,
+  type OpenRouterRoutingOptions,
+  resolveCost,
+} from "./shared";
 import type { AIEmbedResult, AIHelperContext, EmbedOptions } from "./types";
 
 // Default embedding dimensions (can be overridden via options)
@@ -50,7 +55,10 @@ export function registerEmbeddingProvider(
 }
 
 /** @internal Exported for testing only */
-export function getEmbeddingModelProvider(modelConfig: ModelConfig) {
+export function getEmbeddingModelProvider(
+  modelConfig: ModelConfig,
+  routing?: OpenRouterRoutingOptions,
+) {
   // Custom providers registered by consumer
   const customFactory = embeddingProviderRegistry.get(modelConfig.provider);
   if (customFactory) {
@@ -59,9 +67,11 @@ export function getEmbeddingModelProvider(modelConfig: ModelConfig) {
 
   // Built-in providers
   if (modelConfig.provider === "openrouter") {
+    const provider = buildOpenRouterRoutingProvider(modelConfig, routing);
     return openrouter.textEmbeddingModel(modelConfig.id, {
       extraBody: {
         usage: { include: true },
+        provider,
       },
     });
   }
@@ -105,7 +115,7 @@ export async function embed(
   });
 
   try {
-    const embeddingModel = getEmbeddingModelProvider(modelConfig);
+    const embeddingModel = getEmbeddingModelProvider(modelConfig, ctx.routing);
     const providerOptions = {
       ...(modelConfig.provider === "google" && {
         google: {

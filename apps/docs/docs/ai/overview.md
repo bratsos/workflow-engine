@@ -172,3 +172,8 @@ const reasoning = await stream.getReasoning();
 ```
 
 `.stream` only carries the text/answer channel — for a reasoning-only response (nothing emitted as answer text), iterating `for await (const chunk of stream.stream)` yields **no chunks at all**. Use `await stream.getText()` if you need the final answer text: it reconciles against the AI SDK's buffered result independently of `.stream`, so it still returns the full text even when `.stream` was empty.
+
+## Reported vs. estimated cost
+
+Since 0.13 every AI result exposes `reportedCostUsd` (the provider's own figure, when it reports one) and `costSource` (`"reported"` or `"estimated"`). `cost` prefers the reported figure and falls back to the model registry's prices, including long-context pricing tiers. BYOK is handled correctly: the upstream inference cost is added only when the provider bills it separately. Batch cost follows the transport actually used — a native vendor batch bills the vendor's documented discount, the OpenRouter transport bills the `:batch` catalog row's absolute price.
+

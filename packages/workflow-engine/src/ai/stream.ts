@@ -27,7 +27,8 @@ export function streamText(
 ): AIStreamResult {
   const modelConfig = getModel(modelKey);
   const model =
-    ctx.providerResolver?.(modelConfig) ?? getModelProvider(modelConfig);
+    ctx.providerResolver?.(modelConfig) ??
+    getModelProvider(modelConfig, ctx.routing);
   const startTime = Date.now();
   const hasTools = options.tools !== undefined;
 
