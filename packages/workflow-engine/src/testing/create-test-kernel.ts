@@ -14,30 +14,26 @@
  *
  * @example
  * ```typescript
- * import { createTestKernel } from "../utils/index.js";
+ * import { createTestKernel } from "@bratsos/workflow-engine/testing";
  *
  * const { kernel, flush, persistence } = createTestKernel([myWorkflow]);
  * ```
  */
 
-import type { Workflow } from "../../core/workflow.js";
-import { createKernel, type WorkflowRegistry } from "../../kernel/kernel.js";
+import type { Workflow } from "../core/workflow.js";
+import { createKernel, type WorkflowRegistry } from "../kernel/kernel.js";
 import {
   createPluginRunner,
   type PluginDefinition,
-} from "../../kernel/plugins.js";
-import type {
-  EventSink,
-  KernelServices,
-  StepLedger,
-} from "../../kernel/ports.js";
+} from "../kernel/plugins.js";
+import type { EventSink, KernelServices, StepLedger } from "../kernel/ports.js";
 import {
   CollectingEventSink,
   FakeClock,
   InMemoryBlobStore,
-} from "../../kernel/testing/index.js";
-import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
-import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
+} from "../kernel/testing/index.js";
+import { InMemoryJobQueue } from "./in-memory-job-queue.js";
+import { InMemoryWorkflowPersistence } from "./in-memory-persistence.js";
 
 export interface CreateTestKernelOptions<
   TEventSink extends EventSink = CollectingEventSink,

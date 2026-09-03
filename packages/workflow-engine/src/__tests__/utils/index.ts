@@ -20,11 +20,16 @@
 export { InMemoryAICallLogger } from "../../testing/in-memory-ai-logger.js";
 export { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
 export { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
-// Shared kernel test harness
+// Shared kernel test harness -- the single implementation lives under
+// src/testing so consumers get the same one from the public entry.
 export {
+  type CreateTestHarnessOptions,
   type CreateTestKernelOptions,
+  createTestHarness,
   createTestKernel,
-} from "./create-test-kernel.js";
+  type HarnessRunResult,
+  type TickReport,
+} from "../../testing/index.js";
 // Mock AI helper
 export {
   createMockAIHelper,

@@ -49,6 +49,16 @@ export {
   createMockAIHelperFactory,
   MockAIHelper,
 } from "../__tests__/utils/mock-ai-helper.js";
+export {
+  type CreateTestHarnessOptions,
+  createTestHarness,
+  type HarnessRunResult,
+  type TickReport,
+} from "./create-test-harness.js";
+export {
+  type CreateTestKernelOptions,
+  createTestKernel,
+} from "./create-test-kernel.js";
 export { InMemoryAICallLogger } from "./in-memory-ai-logger.js";
 export { InMemoryJobQueue } from "./in-memory-job-queue.js";
 export { InMemoryWorkflowPersistence } from "./in-memory-persistence.js";
