@@ -78,6 +78,13 @@ export {
   saveStageOutput,
   toErrorMessage,
 } from "./helpers/index.js";
+// Durable-step API constructor for hosts that build a stage context themselves
+// (e.g. remote activity workers). Without a ledger every ctx.step.* call throws
+// StepLedgerNotConfiguredError, which is the documented behaviour.
+export {
+  type CreateStepApiOptions,
+  createStepApi,
+} from "./helpers/step-api";
 // Kernel factory and core interfaces
 export {
   type AnnotateAttachInput,

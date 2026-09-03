@@ -344,7 +344,13 @@ export async function handleStagePollSuspended(
       continue;
     }
 
-    if (stageDef.resumeStrategy === "replay") {
+    // A stage that carries a checkCompletion() ALWAYS resumes through it —
+    // that path is the pre-durable-steps contract and must stay byte-for-byte.
+    // Replay is only for stages that have no checkCompletion (they suspended
+    // from inside a durable step). `resumeStrategy` is stamped at build time,
+    // and hosts such as the remote-activity proxy attach checkCompletion after
+    // building, so presence of the hook is the authoritative signal.
+    if (stageDef.resumeStrategy === "replay" && !stageDef.checkCompletion) {
       const outcome = await replayStage(stageRecord, run, stageDef, deps);
       if (outcome === "resumed") {
         resumed++;
