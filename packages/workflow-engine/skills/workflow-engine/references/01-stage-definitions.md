@@ -233,6 +233,29 @@ async execute(ctx) {
 
 Results returned by `ctx.step.run()` round-trip through JSON, so Dates become strings, `undefined` fields disappear, and Maps/Sets lose their runtime types.
 
+### Durable AI Steps
+
+`ctx.step.ai.generateText(id, model, prompt, options?)` and `ctx.step.ai.generateObject(id, model, prompt, schema, options?)` are `ctx.ai.*` wrapped in `step.run(id, ...)`: on replay a completed call returns its stored result without contacting the model. Stored results carry `text`/`object`, tokens, cost and reasoning but not the raw SDK object.
+
+`ctx.step.ai.map(id, items, spec)` runs one prompt per item under an execution policy and returns `AiMapResult[]` in input order:
+
+```typescript
+const results = await ctx.step.ai.map("extract", documents, {
+  model: "gemini-2.5-flash",
+  schema: ExtractionSchema,           // validated on both paths
+  prompt: (doc) => `Extract sections from:\n${doc.text}`,
+  itemId: (doc) => doc.id,            // default `${index}`; must be unique
+  repair: { attempts: 1 },            // re-prompt with the Zod issues appended
+  policy: "auto",                     // batch at >= auto.batchAbove (20) items on batch-capable models
+  batch: { pollEvery: "60s", timeout: "24h", onExpiry: "fail" },
+  realtime: { concurrency: 10, budget: 500 },
+});
+```
+
+- Realtime: one durable step `${id}:${itemId}` per item (`realtime.retries`, default 1, re-runs a thrown model call through the ledger); `budget` caps model calls per invocation and throws `AiMapBudgetExceededError`.
+- Batch: `${id}:submit` (exactly-once fan-out), `${id}:poll` (a `waitFor` with a stored deadline) and `${id}:collect` (re-supplies schemas so `validated` is true), then items that failed or did not validate go through the realtime repair pass. Nothing is threaded through `suspendedState.metadata`.
+- `itemId` values `submit`, `poll` and `collect` are reserved.
+
 ## SimpleStageResult
 
 Return type for successful execution:

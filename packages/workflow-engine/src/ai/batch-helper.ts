@@ -82,7 +82,11 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
     private provider: AIBatchProvider,
     private batchLogFn?: BatchLogFn,
     private options?: BatchOptions,
-  ) {}
+    /** Pre-resolved backend; skips provider resolution. Used by tests and adapters. */
+    backend?: EngineBatchModel,
+  ) {
+    if (backend) this.providerPromise = Promise.resolve(backend);
+  }
 
   /**
    * Lazy memoized backend resolution. Never runs in the constructor.

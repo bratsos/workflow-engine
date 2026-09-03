@@ -6,6 +6,8 @@
  * definitions do not depend on kernel internals.
  */
 
+import type { StepAiApi } from "./step-ai";
+
 /** Internal marker carried in suspended-state metadata for durable replay. */
 export const DURABLE_SUSPEND_MARKER = "__durable" as const;
 
@@ -61,6 +63,8 @@ export interface StepApi {
     opts: { timeout: number | string },
   ): Promise<T>;
   sleep(id: string, duration: number | string): Promise<void>;
+  /** Durable AI calls and the realtime/batch `map` primitive. */
+  readonly ai: StepAiApi;
   readonly [STEP_API_PENDING_CONTROL_FLOW]?: () =>
     | StepControlFlowError
     | undefined;

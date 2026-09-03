@@ -1,3 +1,4 @@
+import type { AIHelper } from "../../ai/types.js";
 import type {
   StepApi,
   StepControlFlowError,
@@ -14,7 +15,9 @@ import {
   StepSuspend,
   StepTimeoutError,
 } from "../../core/steps.js";
+import { AIServicesNotConfiguredError } from "../errors.js";
 import type { Clock, StepLedger, StepRecord } from "../ports.js";
+import { createStepAi } from "./step-ai.js";
 
 const DEFAULT_LEASE_MS = 5 * 60 * 1000;
 const SIGNAL_KEEPALIVE_MS = 30_000;
@@ -27,6 +30,8 @@ export interface CreateStepApiOptions {
   onLog?: (level: "WARN", message: string) => void;
   /** Default lease for `run()` calls. Defaults to five minutes. */
   defaultLeaseMs?: number;
+  /** Lazy accessor for the stage's AI helper, used by `step.ai.*`. */
+  ai?: () => AIHelper;
 }
 
 interface StepInvocation {
@@ -213,7 +218,7 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
     return new Date(Math.min(now.getTime() + delayMs, deadline.getTime()));
   }
 
-  const api: StepApi = {
+  const api = {
     async run<T>(id: string, fn: () => Promise<T>, opts: StepRunOptions = {}) {
       const invocation = begin(id);
       const leaseMs = positiveDuration(
@@ -486,7 +491,28 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
         }),
       );
     },
-  };
+  } as StepApi;
+
+  Object.defineProperty(api, "ai", {
+    configurable: false,
+    enumerable: true,
+    writable: false,
+    value: createStepAi({
+      run: (id, fn, opts) => api.run(id, fn, opts),
+      waitFor: (id, opts) => api.waitFor(id, opts),
+      async isCompleted(stepId) {
+        const { stageRecordId, ledger } = requireLedger();
+        const record = await ledger.get(stageRecordId, stepId);
+        return record?.status === "completed";
+      },
+      assertReady: () => void requireLedger(),
+      ai: () => {
+        if (!options.ai) throw new AIServicesNotConfiguredError();
+        return options.ai();
+      },
+      onLog: options.onLog,
+    }),
+  });
 
   Object.defineProperty(api, STEP_API_PENDING_CONTROL_FLOW, {
     configurable: false,

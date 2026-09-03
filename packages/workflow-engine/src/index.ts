@@ -30,6 +30,13 @@ export {
   type WorkflowStageId,
 } from "./core/stage-ids";
 export {
+  AiMapBatchFailedError,
+  AiMapBudgetExceededError,
+  type AiMapResult,
+  type AiMapSpec,
+  type StepAiApi,
+} from "./core/step-ai";
+export {
   DURABLE_SUSPEND_MARKER,
   isStepControlFlowError,
   type StepApi,
