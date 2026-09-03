@@ -201,8 +201,8 @@ function generateTypeScript(models: Record<string, ModelConfig>): string {
               `    batchOutputCostPerMillion: ${config.batchOutputCostPerMillion},`,
             ]
           : []),
-        ...(config.batchDiscountPercent !== undefined
-          ? [`    batchDiscountPercent: ${config.batchDiscountPercent},`]
+        ...(config.batchProvider !== undefined
+          ? [`    batchProvider: "${config.batchProvider}",`]
           : []),
         ...(config.longContextTier !== undefined
           ? [

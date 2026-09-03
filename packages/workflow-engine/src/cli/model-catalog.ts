@@ -98,7 +98,7 @@ export type BatchCapability = Pick<
   | "batchModelId"
   | "batchInputCostPerMillion"
   | "batchOutputCostPerMillion"
-  | "batchDiscountPercent"
+  | "batchProvider"
 >;
 
 /**
@@ -112,8 +112,16 @@ export type BatchCapability = Pick<
  *    OpenRouter batch pricing — never a multiplier.
  *
  * 2. **Native transport**: the vendor is one of {@link NATIVE_BATCH_VENDORS}
- *    and the model is a text (non-embedding) model. The vendor's documented
- *    discount is recorded as `batchDiscountPercent`.
+ *    and the model is a text (non-embedding) model. When the catalog has no
+ *    `:batch` sibling, the vendor's documented discount is applied to the
+ *    model's own prices and recorded as absolute batch prices — the
+ *    generated file never carries `batchDiscountPercent`, the 0.13 field
+ *    `workflow-engine-codemod` flags.
+ *
+ * A model only OpenRouter can batch (a `:batch` sibling on a non-native
+ * vendor) is stamped `batchProvider: "openrouter"`, so the generated entry
+ * says where its batches go. Native vendors are left to the default
+ * resolution (their own SDK, OpenRouter as the fallback).
  *
  * Deriving capability from the catalog sibling alone (what 0.13.0 first
  * shipped) under-reports the native transports: zertai's default batch model
@@ -144,8 +152,16 @@ export function deriveBatchCapability(
     );
   }
 
-  if (nativeCapable) {
-    capability.batchDiscountPercent = NATIVE_BATCH_DISCOUNT_PERCENT;
+  if (!sibling && nativeCapable) {
+    const factor = 1 - NATIVE_BATCH_DISCOUNT_PERCENT / 100;
+    capability.batchInputCostPerMillion =
+      perMillion(model.pricing?.prompt) * factor;
+    capability.batchOutputCostPerMillion =
+      perMillion(model.pricing?.completion) * factor;
+  }
+
+  if (sibling && !nativeCapable) {
+    capability.batchProvider = "openrouter";
   }
 
   return capability;
