@@ -185,10 +185,23 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
           const missingSdk =
             error instanceof Error &&
             /Package ".*" is required/.test(error.message);
-          const viaOpenRouter = getProviderModelId(this.modelKey, "openrouter");
+          // A catalog generated before `batchModelId` existed names no
+          // ":batch" sibling; derive it the way the sync CLI does
+          // (`<id>:batch`) rather than failing on the install instruction.
+          // OpenRouter answers "does not have a :batch endpoint" (explained
+          // at submit) when the derived row is not live.
+          const modelConfig = getModel(this.modelKey);
+          const viaOpenRouter =
+            getProviderModelId(this.modelKey, "openrouter") ??
+            (modelConfig.supportsAsyncBatch ? modelConfig.id : undefined);
           if (!missingSdk || !viaOpenRouter) throw error;
+          const derived = modelConfig.batchModelId === undefined;
           warn(
-            `${error.message} Falling back to the OpenRouter batch transport for "${this.modelKey}"; set batchProvider: "openrouter" on the model (or batch.provider) to make this explicit.`,
+            `${error.message} Falling back to the OpenRouter batch transport for "${this.modelKey}"${
+              derived
+                ? ` (assuming OpenRouter serves "${modelConfig.id}:batch"; the catalog entry has no batchModelId — regenerate it with workflow-engine-sync)`
+                : ""
+            }; set batchProvider: "openrouter" on the model (or batch.provider) to make this explicit.`,
           );
           this.provider = "openrouter";
           return this.createOpenRouterModel();

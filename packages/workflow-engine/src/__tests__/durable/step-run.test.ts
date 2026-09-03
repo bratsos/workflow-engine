@@ -4,7 +4,7 @@ import { createStepApi } from "../../kernel/helpers/step-api.js";
 import { FakeClock } from "../../kernel/testing/fake-clock.js";
 import { InMemoryStepLedger } from "../../testing/in-memory-step-ledger.js";
 
-function setup(onLog?: (level: "WARN", message: string) => void) {
+function setup(onLog?: (level: "DEBUG" | "WARN", message: string) => void) {
   const clock = new FakeClock();
   const ledger = new InMemoryStepLedger({ now: clock.now.bind(clock) });
   return {

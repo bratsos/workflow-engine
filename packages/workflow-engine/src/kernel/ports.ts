@@ -80,6 +80,8 @@ export interface StepRecord {
   waitState?: {
     everyMs?: number;
     wakeAt?: string;
+    /** Consecutive `poll` throws of a wait step (reset by a poll that returns). */
+    pollFailures?: number;
   };
   createdAt: Date;
   updatedAt: Date;

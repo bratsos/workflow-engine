@@ -27,6 +27,15 @@ registerModels({
     supportsAsyncBatch: true,
     batchModelId: "anthropic/claude-haiku-4.5:batch",
   },
+  // A catalog generated before `batchModelId` existed (2026-05 sync output).
+  "fallback-nano-no-batch-id": {
+    id: "openai/gpt-5-nano",
+    name: "Nano",
+    inputCostPerMillion: 1,
+    outputCostPerMillion: 5,
+    provider: "openrouter",
+    supportsAsyncBatch: true,
+  },
 });
 
 describe("vendor batch SDK missing", () => {
@@ -62,5 +71,38 @@ describe("vendor batch SDK missing", () => {
         (l) => l.startsWith("WARN") && /Falling back to the OpenRouter/.test(l),
       ),
     ).toBe(true);
+  });
+
+  it("derives the OpenRouter batch id when the catalog entry has no batchModelId", async () => {
+    const bodies: string[] = [];
+    const fetchFn = vi.fn(async (_url: string | URL | Request, init?: any) => {
+      bodies.push(String(init?.body ?? ""));
+      return new Response(
+        JSON.stringify({
+          id: "batch-or-2",
+          status: "validating",
+          request_counts: { total: 1, completed: 0, failed: 0 },
+        }),
+        { status: 202, headers: { "Content-Type": "application/json" } },
+      );
+    });
+    const logs: string[] = [];
+    const batch = new AIBatchImpl(
+      { topic: "t", aiCallLogger: new InMemoryAICallLogger() },
+      "fallback-nano-no-batch-id",
+      "openai",
+      (level, message) => logs.push(`${level}: ${message}`),
+      { apiKey: "sk-or-test", fetch: fetchFn as never },
+    );
+
+    const handle = await batch.submit([{ id: "r1", prompt: "hello" }]);
+
+    expect(handle.provider).toBe("openrouter");
+    expect(bodies[0]).toContain('"model":"openai/gpt-5-nano"');
+    expect(logs).toEqual([
+      expect.stringMatching(
+        /^WARN: .*Falling back to the OpenRouter batch transport.*assuming OpenRouter serves "openai\/gpt-5-nano:batch".*regenerate it with workflow-engine-sync/,
+      ),
+    ]);
   });
 });

@@ -23,12 +23,18 @@ import { createStepAi } from "./step-ai.js";
 const DEFAULT_LEASE_MS = 5 * 60 * 1000;
 const SIGNAL_KEEPALIVE_MS = 30_000;
 const SLEEP_GRACE_MS = 60 * 60 * 1000;
+/**
+ * Consecutive `poll` throws logged at DEBUG before the wait step escalates
+ * to WARN. A provider that is eventually consistent after a submit (an
+ * OpenRouter batch answers 404 to the first status check) is not a fault.
+ */
+const POLL_FAILURES_BEFORE_WARN = 3;
 
 export interface CreateStepApiOptions {
   stageRecordId?: string;
   stepLedger?: StepLedger;
   clock: Clock;
-  onLog?: (level: "WARN", message: string) => void;
+  onLog?: (level: "DEBUG" | "WARN", message: string) => void;
   /** Default lease for `run()` calls. Defaults to five minutes. */
   defaultLeaseMs?: number;
   /** Lazy accessor for the stage's AI helper, used by `step.ai.*`. */
@@ -394,12 +400,19 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
       try {
         value = await opts.poll();
       } catch (error) {
+        // The count lives on the row so it survives a replay in another
+        // process; the first few consecutive failures are DEBUG (eventual
+        // consistency right after a submit), then WARN.
+        const pollFailures = (record.waitState?.pollFailures ?? 0) + 1;
         options.onLog?.(
-          "WARN",
-          `Durable wait step "${id}" poll failed; retrying: ${
+          pollFailures <= POLL_FAILURES_BEFORE_WARN ? "DEBUG" : "WARN",
+          `Durable wait step "${id}" poll failed (${pollFailures} consecutive); retrying: ${
             error instanceof Error ? error.message : String(error)
           }`,
         );
+        await update(id, {
+          waitState: { ...record.waitState, pollFailures },
+        });
         const afterPoll = options.clock.now();
         if (afterPoll.getTime() >= record.deadlineAt.getTime()) {
           await timeout(id);
@@ -428,6 +441,11 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
       const afterPoll = options.clock.now();
       if (afterPoll.getTime() >= record.deadlineAt.getTime()) {
         await timeout(id);
+      }
+      if (record.waitState?.pollFailures) {
+        // The poll answered: a later failure starts a new streak.
+        const { pollFailures: _reset, ...rest } = record.waitState;
+        await update(id, { waitState: rest });
       }
       const savedEveryMs = record.waitState?.everyMs ?? everyMs;
       suspend(
