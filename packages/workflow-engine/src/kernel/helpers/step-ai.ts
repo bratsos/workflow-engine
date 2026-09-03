@@ -19,6 +19,8 @@ import type {
   AIObjectResult,
   AITextResult,
   ObjectOptions,
+  StreamOptions,
+  StreamTextInput,
   TextInput,
   TextOptions,
 } from "../../ai/types";
@@ -28,12 +30,14 @@ import {
   type AiMapResult,
   type AiMapSpec,
   type StepAiApi,
+  type StepStreamResult,
 } from "../../core/step-ai";
 import {
   isStepControlFlowError,
   parseStepDuration,
   type StepApi,
   type StepControlFlowError,
+  type StepRunOptions,
   StepSuspend,
   StepTimeoutError,
 } from "../../core/steps";
@@ -200,6 +204,7 @@ function createBudget(limit: number | undefined): Budget {
 async function runWithConcurrency<T>(
   tasks: ReadonlyArray<() => Promise<T>>,
   limit: number,
+  minDelayMs = 0,
 ): Promise<Array<PromiseSettledResult<T> | undefined>> {
   const results: Array<PromiseSettledResult<T> | undefined> = new Array(
     tasks.length,
@@ -216,6 +221,11 @@ async function runWithConcurrency<T>(
       } catch (reason) {
         results[index] = { status: "rejected", reason };
         halted = true;
+      }
+      // Per-slot pacing: this slot waits before taking its next item, so
+      // `concurrency` calls may still be in flight elsewhere.
+      if (!halted && minDelayMs > 0 && next < tasks.length) {
+        await new Promise((resolve) => setTimeout(resolve, minDelayMs));
       }
     }
   }
@@ -247,15 +257,52 @@ function pickError(reasons: unknown[]): unknown {
   return chosen ?? reasons[0];
 }
 
+/** `TextInput` as the AI SDK stream input shape. */
+function toStreamInput(prompt: TextInput): StreamTextInput {
+  if (typeof prompt === "string") return { prompt };
+  return {
+    messages: [{ role: "user", content: prompt }],
+  } as unknown as StreamTextInput;
+}
+
+/** Stream one call to completion and reduce it to what the ledger stores. */
+async function collectStream(
+  ai: AIHelper,
+  modelKey: ModelKey,
+  prompt: TextInput,
+  options?: StreamOptions,
+): Promise<StepStreamResult> {
+  const stream = ai.streamText(modelKey, toStreamInput(prompt), options);
+  // Drain the helper's tapped iterable: that tap is what forwards `onChunk`.
+  // `getText()` alone reads the buffered final text and would skip it.
+  for await (const _chunk of stream.stream) {
+    // The tap already handed the chunk to `options.onChunk`.
+  }
+  const text = await stream.getText();
+  const usage = await stream.getUsage();
+  const reasoning = await stream.getReasoning();
+  return {
+    text,
+    inputTokens: usage.inputTokens,
+    outputTokens: usage.outputTokens,
+    cost: usage.cost,
+    ...(reasoning !== undefined ? { reasoning } : {}),
+  };
+}
+
 export function createStepAi(deps: StepAiDeps): StepAiApi {
   async function generateText(
     id: string,
     modelKey: ModelKey,
     prompt: TextInput,
     options?: TextOptions,
+    stepOptions?: StepRunOptions,
   ): Promise<AITextResult> {
-    return deps.run(id, async () =>
-      pickTextResult(await deps.ai().generateText(modelKey, prompt, options)),
+    return deps.run(
+      id,
+      async () =>
+        pickTextResult(await deps.ai().generateText(modelKey, prompt, options)),
+      stepOptions,
     );
   }
 
@@ -265,12 +312,36 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
     prompt: TextInput,
     schema: S,
     options?: ObjectOptions,
+    stepOptions?: StepRunOptions,
   ): Promise<AIObjectResult<z.infer<S>>> {
-    return deps.run(id, async () =>
-      pickObjectResult(
-        await deps.ai().generateObject(modelKey, prompt, schema, options),
-      ),
+    return deps.run(
+      id,
+      async () =>
+        pickObjectResult(
+          await deps.ai().generateObject(modelKey, prompt, schema, options),
+        ),
+      stepOptions,
     );
+  }
+
+  async function streamText(
+    id: string,
+    modelKey: ModelKey,
+    prompt: TextInput,
+    options?: StreamOptions,
+    stepOptions?: StepRunOptions,
+  ): Promise<StepStreamResult> {
+    // Decided before `run`: a completed step returns its stored result
+    // without executing `fn`, so the incremental `onChunk` calls never
+    // happen and the consumer gets the whole text in one call instead.
+    const replayed = await deps.isCompleted(id);
+    const result = await deps.run(
+      id,
+      () => collectStream(deps.ai(), modelKey, prompt, options),
+      stepOptions,
+    );
+    if (replayed) options?.onChunk?.(result.text);
+    return result;
   }
 
   async function map<TIn, TOut = string>(
@@ -292,6 +363,7 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
     }
     const retries = spec.realtime?.retries ?? DEFAULT_REALTIME_RETRIES;
     const retryDelayMs = parseStepDuration(spec.realtime?.retryDelayMs ?? 0);
+    const minDelayMs = parseStepDuration(spec.realtime?.minDelayMs ?? 0);
     const callOptions = {
       ...(spec.maxTokens !== undefined ? { maxTokens: spec.maxTokens } : {}),
       ...(spec.temperature !== undefined
@@ -345,10 +417,14 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
       let repairsLeft = repairAttempts;
       const base = { id: entry.id, index: entry.index };
 
-      const failed = (error: string): AiMapResult<TOut> => ({
+      const failed = (
+        error: string,
+        errorName?: string,
+      ): AiMapResult<TOut> => ({
         ...base,
         status: "failed",
         error,
+        ...(errorName !== undefined ? { errorName } : {}),
         attempts,
         inputTokens,
         outputTokens,
@@ -369,6 +445,58 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
           feedback ? withRepair(entry.prompt, feedback) : entry.prompt,
         );
         attempts++;
+
+        if (spec.stream) {
+          const collected = await collectStream(
+            ai,
+            spec.model,
+            prompt,
+            callOptions,
+          );
+          inputTokens += collected.inputTokens;
+          outputTokens += collected.outputTokens;
+          cost += collected.cost;
+          if (!spec.schema) {
+            return {
+              ...base,
+              status: "succeeded",
+              result: collected.text as unknown as TOut,
+              validated: false,
+              attempts,
+              inputTokens,
+              outputTokens,
+              cost,
+            };
+          }
+          let streamed: unknown;
+          try {
+            streamed = JSON.parse(collected.text);
+          } catch {
+            feedback = {
+              output: collected.text,
+              issues: "the response was not valid JSON",
+            };
+            continue;
+          }
+          const validated = spec.schema.safeParse(streamed);
+          if (validated.success) {
+            return {
+              ...base,
+              status: "succeeded",
+              result: validated.data,
+              validated: true,
+              attempts,
+              inputTokens,
+              outputTokens,
+              cost,
+            };
+          }
+          feedback = {
+            output: collected.text,
+            issues: formatIssues(validated.error),
+          };
+          continue;
+        }
 
         if (!spec.schema) {
           const result = await ai.generateText(spec.model, prompt, callOptions);
@@ -447,22 +575,26 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
         } catch (error) {
           if (isStepControlFlowError(error)) throw error;
           if (error instanceof AiMapBudgetExceededError) throw error;
-          // The item's model calls failed on every durable attempt; the step
-          // holds the stored error and returns it on every replay.
-          return {
+          // The item's model calls failed on every durable attempt. Memoize
+          // the verdict in its own step: the item step only stores the error
+          // *message*, so a later replay would otherwise lose `errorName`
+          // (the stored error is rebuilt as a plain `Error`).
+          const verdict: AiMapResult<TOut> = {
             id: entry.id,
             index: entry.index,
             status: "failed",
             error: errorMessage(error),
+            ...(error instanceof Error ? { errorName: error.name } : {}),
             attempts: (prior?.attempts ?? 0) + retries + 1,
             inputTokens: prior?.inputTokens ?? 0,
             outputTokens: prior?.outputTokens ?? 0,
             cost: prior?.cost ?? 0,
-          } satisfies AiMapResult<TOut>;
+          };
+          return deps.run(`${stepId}:failed`, async () => verdict);
         }
       });
 
-      const settled = await runWithConcurrency(tasks, concurrency);
+      const settled = await runWithConcurrency(tasks, concurrency, minDelayMs);
       const reasons = settled
         .filter((s): s is PromiseRejectedResult => s?.status === "rejected")
         .map((s) => s.reason);
@@ -552,12 +684,13 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
       submitted.refs.length > 0 ? { batchRefs: submitted.refs } : {};
     const onExpiry = spec.batch?.onExpiry ?? "fail";
 
-    const allFailed = (error: string): AiMapResult<TOut>[] =>
+    const allFailed = (error: string, errorName: string): AiMapResult<TOut>[] =>
       entries.map((e) => ({
         id: e.id,
         index: e.index,
         status: "failed",
         error,
+        errorName,
         attempts: 1,
         inputTokens: 0,
         outputTokens: 0,
@@ -575,14 +708,16 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
     } catch (error) {
       if (isStepControlFlowError(error)) throw error;
       if (error instanceof StepTimeoutError && onExpiry === "partial") {
-        return allFailed(error.message);
+        return allFailed(error.message, error.name);
       }
       throw error;
     }
 
     if (status.status === "failed") {
       const reason = status.error ?? "batch reported failure";
-      if (onExpiry === "partial") return allFailed(reason);
+      if (onExpiry === "partial") {
+        return allFailed(reason, "AiMapBatchFailedError");
+      }
       throw new AiMapBatchFailedError(id, submitted.handleId, reason);
     }
 
@@ -610,6 +745,7 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
               index: e.index,
               status: "failed",
               error: "batch returned no result for this request",
+              errorName: "AiMapBatchItemMissingError",
               attempts: 1,
               inputTokens: 0,
               outputTokens: 0,
@@ -634,6 +770,7 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
               index: e.index,
               status: "failed",
               error: r.error,
+              errorName: "AiMapBatchItemFailedError",
               attempts: 1,
               inputTokens: r.inputTokens,
               outputTokens: r.outputTokens,
@@ -688,5 +825,5 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
     return merged;
   }
 
-  return { generateText, generateObject, map };
+  return { generateText, generateObject, streamText, map };
 }

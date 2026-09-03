@@ -36,11 +36,15 @@
  */
 
 export type {
+  CreateMockAIHelperFactoryOptions,
   MockAIHelperConfig,
   MockAIHelperFactory,
   MockBatchResult,
+  MockCallDescriptor,
+  MockCallMatcher,
   MockEmbedResponse,
   MockObjectResponse,
+  MockOneShotFailure,
   MockTextResponse,
   RecordedCall,
 } from "../__tests__/utils/mock-ai-helper.js";

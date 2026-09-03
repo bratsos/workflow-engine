@@ -71,6 +71,25 @@ export interface MockBatchResult<T = string> {
   error?: string;
 }
 
+/** How a `failOnce` script decides whether a call is the one that throws. */
+export type MockCallMatcher =
+  | string
+  | RegExp
+  | ((call: MockCallDescriptor) => boolean);
+
+/** The call a `failOnce` matcher is asked about. */
+export interface MockCallDescriptor {
+  modelKey: string;
+  prompt: string;
+  kind: "text" | "object" | "embed" | "stream";
+}
+
+/** One armed, not-yet-consumed `failOnce` script. */
+export interface MockOneShotFailure {
+  match: MockCallMatcher;
+  error: Error;
+}
+
 export interface MockAIHelperConfig {
   /** Default response for generateText calls */
   defaultTextResponse?: MockTextResponse;
@@ -88,6 +107,18 @@ export interface MockAIHelperConfig {
   errorMessage?: string;
   /** Delay in ms to simulate latency */
   latencyMs?: number;
+  /**
+   * Object responses keyed by Zod schema identity, consulted before the
+   * prompt patterns. Seeded through `mockObjectResponseForSchema`.
+   */
+  schemaResponses?: Map<z.ZodTypeAny, MockObjectResponse>;
+  /**
+   * Armed one-shot failures, seeded through `failOnce`. The array (and the
+   * schema map above) are shared by reference with every child helper, so a
+   * script armed on the root helper fires on the stage-scoped child the
+   * kernel actually hands to a stage.
+   */
+  failures?: MockOneShotFailure[];
 }
 
 export interface RecordedCall {
@@ -140,6 +171,11 @@ export class MockAIHelper implements AIHelper {
         inputTokens: 5,
         cost: 0.0001,
       },
+      // Shared-by-reference scripting state: `createAtTopic`/`createChild`
+      // hand `this.config` to the child, whose own spread copies these two
+      // references rather than cloning them.
+      schemaResponses: new Map(),
+      failures: [],
       ...config,
     };
     this.parent = parent;
@@ -159,6 +195,7 @@ export class MockAIHelper implements AIHelper {
     this.checkForError();
 
     const promptStr = this.extractPromptString(prompt);
+    this.consumeScriptedFailure({ modelKey, prompt: promptStr, kind: "text" });
     const response = this.findMatchingTextResponse(promptStr);
 
     const result: AITextResult = {
@@ -194,7 +231,12 @@ export class MockAIHelper implements AIHelper {
     this.checkForError();
 
     const promptStr = this.extractPromptString(prompt);
-    const response = this.findMatchingObjectResponse(promptStr);
+    this.consumeScriptedFailure({
+      modelKey,
+      prompt: promptStr,
+      kind: "object",
+    });
+    const response = this.findMatchingObjectResponse(promptStr, schema);
 
     const result: AIObjectResult<z.infer<TSchema>> = {
       object: response.object as z.infer<TSchema>,
@@ -227,6 +269,11 @@ export class MockAIHelper implements AIHelper {
     this.checkForError();
 
     const texts = Array.isArray(text) ? text : [text];
+    this.consumeScriptedFailure({
+      modelKey,
+      prompt: texts.join("\n"),
+      kind: "embed",
+    });
     const defaultResponse = this.config.defaultEmbedResponse!;
 
     const embeddings = texts.map(
@@ -268,6 +315,11 @@ export class MockAIHelper implements AIHelper {
         ? input.prompt
         : JSON.stringify(input.messages);
 
+    this.consumeScriptedFailure({
+      modelKey,
+      prompt: promptStr,
+      kind: "stream",
+    });
     const response = this.findMatchingTextResponse(promptStr);
     const chunks = response.text.split(" ");
     let chunkIndex = 0;
@@ -340,19 +392,19 @@ export class MockAIHelper implements AIHelper {
     const newTopic = id
       ? `${this.topic}.${segment}.${id}`
       : `${this.topic}.${segment}`;
-    const child = new MockAIHelper(
-      newTopic,
-      this.config,
-      this,
-      this.callLogger,
-    );
+    const child = this.createAtTopic(newTopic, this.callLogger);
     this.children.push(child);
     return child;
   }
 
-  /** Create a helper at an exact topic while sharing this mock's state. */
+  /**
+   * Create a helper at an exact topic while sharing this mock's state.
+   * Constructed through `this.constructor` so a subclass survives
+   * `createChild` and the kernel's per-stage factory call.
+   */
   createAtTopic(topic: string, callLogger?: AICallLogger): MockAIHelper {
-    return new MockAIHelper(topic, this.config, this, callLogger);
+    const Ctor = this.constructor as typeof MockAIHelper;
+    return new Ctor(topic, this.config, this, callLogger);
   }
 
   // ============================================================================
@@ -430,6 +482,53 @@ export class MockAIHelper implements AIHelper {
       this.config.objectResponses = new Map();
     }
     this.config.objectResponses.set(pattern, response);
+  }
+
+  /**
+   * Register an object response keyed by Zod schema identity rather than by
+   * prompt text. Consulted before the prompt patterns, so several
+   * `generateObject` calls over near-identical prompts can be dispatched on
+   * the schema they ask for.
+   *
+   * @example
+   * ```typescript
+   * mock.mockObjectResponseForSchema(SummarySchema, { summary: "ok" });
+   * mock.mockObjectResponseForSchema(FactsSchema, { facts: [] });
+   * ```
+   */
+  mockObjectResponseForSchema(
+    schema: z.ZodTypeAny,
+    value: unknown,
+    meta?: Omit<MockObjectResponse, "object">,
+  ): void {
+    if (!this.config.schemaResponses) {
+      this.config.schemaResponses = new Map();
+    }
+    this.config.schemaResponses.set(schema, { object: value, ...meta });
+  }
+
+  /**
+   * Arm a one-shot failure: the next call matching `match` throws `error`
+   * once, and every later call succeeds normally. This is how a
+   * replay-safety test says "make exactly one item throw once" without
+   * flipping `setError` on and off around the call.
+   *
+   * A string matches when the prompt contains it, a RegExp when it tests
+   * true against the prompt, and a predicate when it returns true for the
+   * call descriptor. Scripts are shared with child helpers, so arming one on
+   * the factory's root helper fires inside a stage.
+   *
+   * @example
+   * ```typescript
+   * mock.failOnce("item-2", new Error("subscription limit reached"));
+   * ```
+   */
+  failOnce(match: MockCallMatcher, error?: Error): void {
+    if (!this.config.failures) this.config.failures = [];
+    this.config.failures.push({
+      match,
+      error: error ?? new Error("Mock scripted failure"),
+    });
   }
 
   /**
@@ -516,6 +615,8 @@ export class MockAIHelper implements AIHelper {
     this.config.latencyMs = undefined;
     this.config.textResponses?.clear();
     this.config.objectResponses?.clear();
+    this.config.schemaResponses?.clear();
+    this.config.failures?.splice(0, this.config.failures.length);
   }
 
   // ============================================================================
@@ -548,7 +649,33 @@ export class MockAIHelper implements AIHelper {
     return this.config.defaultTextResponse!;
   }
 
-  private findMatchingObjectResponse(prompt: string): MockObjectResponse {
+  /**
+   * Throw and consume the first armed `failOnce` script matching this call.
+   */
+  private consumeScriptedFailure(call: MockCallDescriptor): void {
+    const failures = this.config.failures;
+    if (!failures || failures.length === 0) return;
+    const index = failures.findIndex((failure) => {
+      if (typeof failure.match === "string") {
+        return call.prompt.includes(failure.match);
+      }
+      if (failure.match instanceof RegExp)
+        return failure.match.test(call.prompt);
+      return failure.match(call);
+    });
+    if (index === -1) return;
+    const [failure] = failures.splice(index, 1);
+    throw failure!.error;
+  }
+
+  private findMatchingObjectResponse(
+    prompt: string,
+    schema?: z.ZodTypeAny,
+  ): MockObjectResponse {
+    if (schema && this.config.schemaResponses) {
+      const bySchema = this.config.schemaResponses.get(schema);
+      if (bySchema) return bySchema;
+    }
     if (this.config.objectResponses) {
       for (const [pattern, response] of this.config.objectResponses) {
         if (typeof pattern === "string" && prompt.includes(pattern)) {
@@ -810,29 +937,57 @@ export function createMockAIHelper(
   return new MockAIHelper(topic, config);
 }
 
-export type MockAIHelperFactory = AIHelperFactory & {
-  readonly helper: MockAIHelper;
-  setTextResponse: MockAIHelper["setTextResponse"];
-  setObjectResponse: MockAIHelper["setObjectResponse"];
-  setError: MockAIHelper["setError"];
-  setLatency: MockAIHelper["setLatency"];
-  getCalls: MockAIHelper["getCalls"];
-};
+export type MockAIHelperFactory<THelper extends MockAIHelper = MockAIHelper> =
+  AIHelperFactory & {
+    readonly helper: THelper;
+    setTextResponse: MockAIHelper["setTextResponse"];
+    setObjectResponse: MockAIHelper["setObjectResponse"];
+    mockObjectResponseForSchema: MockAIHelper["mockObjectResponseForSchema"];
+    failOnce: MockAIHelper["failOnce"];
+    setError: MockAIHelper["setError"];
+    setLatency: MockAIHelper["setLatency"];
+    getCalls: MockAIHelper["getCalls"];
+  };
+
+/** Options accepted by {@link createMockAIHelperFactory}. */
+export interface CreateMockAIHelperFactoryOptions<
+  THelper extends MockAIHelper = MockAIHelper,
+> {
+  /**
+   * The helper the factory hands out. Every per-stage helper is built from
+   * it through `createAtTopic`, which preserves the concrete class, so a
+   * `MockAIHelper` subclass reaches the stage intact.
+   */
+  helper?: THelper;
+}
 
 /**
  * Create a kernel-compatible factory backed by one shared mock. The helper
  * property and delegated test methods make it possible to seed responses and
  * inspect calls before/after a stage executes.
  */
-export function createMockAIHelperFactory(
-  helper: MockAIHelper = new MockAIHelper("test"),
-): MockAIHelperFactory {
+export function createMockAIHelperFactory<
+  THelper extends MockAIHelper = MockAIHelper,
+>(
+  optionsOrHelper?: CreateMockAIHelperFactoryOptions<THelper> | THelper,
+): MockAIHelperFactory<THelper> {
+  const helper = (
+    optionsOrHelper instanceof MockAIHelper
+      ? optionsOrHelper
+      : (optionsOrHelper?.helper ?? new MockAIHelper("test"))
+  ) as THelper;
   const factory = ((topic: string, callLogger: AICallLogger) =>
-    helper.createAtTopic(topic, callLogger)) as unknown as MockAIHelperFactory;
+    helper.createAtTopic(
+      topic,
+      callLogger,
+    )) as unknown as MockAIHelperFactory<THelper>;
   Object.assign(factory, {
     helper,
     setTextResponse: helper.setTextResponse.bind(helper),
     setObjectResponse: helper.setObjectResponse.bind(helper),
+    mockObjectResponseForSchema:
+      helper.mockObjectResponseForSchema.bind(helper),
+    failOnce: helper.failOnce.bind(helper),
     setError: helper.setError.bind(helper),
     setLatency: helper.setLatency.bind(helper),
     getCalls: helper.getCalls.bind(helper),

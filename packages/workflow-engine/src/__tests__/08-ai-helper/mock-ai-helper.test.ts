@@ -6,7 +6,12 @@
 
 import { beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
-import { createMockAIHelper, MockAIHelper } from "../utils/mock-ai-helper.js";
+import { InMemoryAICallLogger } from "../../testing/in-memory-ai-logger.js";
+import {
+  createMockAIHelper,
+  createMockAIHelperFactory,
+  MockAIHelper,
+} from "../utils/mock-ai-helper.js";
 
 describe("I want to use MockAIHelper in tests", () => {
   let ai: MockAIHelper;
@@ -526,6 +531,84 @@ describe("I want to use MockAIHelper in tests", () => {
       await expect(
         ai.generateText("gemini-2.5-flash", "test"),
       ).resolves.toBeDefined();
+    });
+  });
+  describe("scripting", () => {
+    it("fails exactly one matching call and then succeeds", async () => {
+      ai.failOnce("flaky", new Error("one bad call"));
+
+      await expect(
+        ai.generateText("gemini-2.5-flash", "flaky"),
+      ).rejects.toThrow("one bad call");
+      await expect(
+        ai.generateText("gemini-2.5-flash", "flaky"),
+      ).resolves.toBeDefined();
+    });
+
+    it("matches on a RegExp and on a call predicate", async () => {
+      ai.failOnce(/item-\d+/, new Error("regexp match"));
+      ai.failOnce((call) => call.kind === "embed", new Error("no embeddings"));
+
+      await expect(
+        ai.generateText("gemini-2.5-flash", "item-7 please"),
+      ).rejects.toThrow("regexp match");
+      await expect(ai.embed("gemini-2.5-flash", "hello")).rejects.toThrow(
+        "no embeddings",
+      );
+    });
+
+    it("shares armed failures with child helpers", async () => {
+      ai.failOnce("scoped", new Error("fires in the child"));
+      const child = ai.createAtTopic("workflow.run.stage.one");
+
+      await expect(
+        child.generateText("gemini-2.5-flash", "scoped"),
+      ).rejects.toThrow("fires in the child");
+    });
+
+    it("dispatches object responses on Zod schema identity", async () => {
+      const Summary = z.object({ summary: z.string() });
+      const Facts = z.object({ facts: z.array(z.string()) });
+      ai.mockObjectResponseForSchema(Summary, { summary: "short" });
+      ai.mockObjectResponseForSchema(Facts, { facts: ["a", "b"] });
+
+      const summary = await ai.generateObject(
+        "gemini-2.5-flash",
+        "analyse the document",
+        Summary,
+      );
+      const facts = await ai.generateObject(
+        "gemini-2.5-flash",
+        "analyse the document",
+        Facts,
+      );
+
+      expect(summary.object).toEqual({ summary: "short" });
+      expect(facts.object).toEqual({ facts: ["a", "b"] });
+    });
+  });
+
+  describe("createMockAIHelperFactory", () => {
+    it("hands out the caller's instance, subclasses included", () => {
+      class RecordingMock extends MockAIHelper {
+        readonly marker = "subclass";
+      }
+      const helper = new RecordingMock("root");
+      const factory = createMockAIHelperFactory({ helper });
+
+      expect(factory.helper).toBe(helper);
+      const scoped = factory(
+        "workflow.run-1.stage.a",
+        new InMemoryAICallLogger(),
+      );
+      expect(scoped).toBeInstanceOf(RecordingMock);
+      expect((scoped as RecordingMock).marker).toBe("subclass");
+      expect(scoped.topic).toBe("workflow.run-1.stage.a");
+    });
+
+    it("still accepts a bare helper argument", () => {
+      const helper = new MockAIHelper("root");
+      expect(createMockAIHelperFactory(helper).helper).toBe(helper);
     });
   });
 });

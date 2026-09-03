@@ -15,15 +15,24 @@ import type {
   AITextResult,
   BatchOptions,
   ObjectOptions,
+  StreamOptions,
   TextInput,
   TextOptions,
 } from "../ai/types";
+import type { StepRunOptions } from "./steps";
 
 export interface AiMapSpec<TIn, TOut> {
   model: ModelKey;
   prompt: (item: TIn, index: number) => TextInput;
   /** When set, each item is validated against this schema and repaired on failure. */
   schema?: z.ZodType<TOut>;
+  /**
+   * Run realtime items through `ctx.ai.streamText` instead of
+   * `generateText`/`generateObject`, collecting the streamed text. `schema`
+   * still applies: the collected text is parsed as JSON and validated, with
+   * the usual repair pass. The batch path ignores this flag.
+   */
+  stream?: boolean;
   system?: string;
   maxTokens?: number;
   temperature?: number;
@@ -62,6 +71,14 @@ export interface AiMapSpec<TIn, TOut> {
     retries?: number;
     /** Delay before a durable retry. Defaults to 0. */
     retryDelayMs?: number | string;
+    /**
+     * Minimum spacing between model calls on one concurrency slot: after a
+     * slot finishes an item it waits this long before taking the next one.
+     * Per slot, not global — with `concurrency: 4` and `minDelayMs: "1s"`
+     * the map makes up to four calls per second. Replaces hand-written
+     * cooldowns between items.
+     */
+    minDelayMs?: number | string;
   };
 }
 
@@ -85,6 +102,15 @@ export type AiMapResult<TOut> =
       index: number;
       status: "failed";
       error: string;
+      /**
+       * `Error.name` of the last failure, so a caller can tell a transport or
+       * quota error apart from a content failure without matching on the
+       * message. The batch path reports `StepTimeoutError`,
+       * `AiMapBatchFailedError`, `AiMapBatchItemFailedError` or
+       * `AiMapBatchItemMissingError`. Never carries the error `cause`: map
+       * results are stored in the step ledger and must stay JSON.
+       */
+      errorName?: string;
       attempts: number;
       inputTokens: number;
       outputTokens: number;
@@ -106,6 +132,7 @@ export interface StepAiApi {
     modelKey: ModelKey,
     prompt: TextInput,
     options?: TextOptions,
+    stepOptions?: StepRunOptions,
   ): Promise<AITextResult>;
   generateObject<S extends z.ZodTypeAny>(
     id: string,
@@ -113,7 +140,24 @@ export interface StepAiApi {
     prompt: TextInput,
     schema: S,
     options?: ObjectOptions,
+    stepOptions?: StepRunOptions,
   ): Promise<AIObjectResult<z.infer<S>>>;
+  /**
+   * Stream one call durably. The first execution streams through
+   * `ctx.ai.streamText` (forwarding `onChunk`) and stores the final text,
+   * tokens, cost and reasoning as a single `run` step; a replay returns the
+   * stored result without contacting the model and calls `onChunk` once with
+   * the whole text, so a consumer that renders incrementally still receives
+   * the content. Hosts with an idle-connection timeout (Cloudflare Workers)
+   * need this where a non-streaming call would trip the timeout.
+   */
+  streamText(
+    id: string,
+    modelKey: ModelKey,
+    prompt: TextInput,
+    options?: StreamOptions,
+    stepOptions?: StepRunOptions,
+  ): Promise<StepStreamResult>;
   /**
    * Run one prompt per item under an execution policy (realtime or batch),
    * with schema validation and repair applied identically on both paths.
@@ -124,6 +168,19 @@ export interface StepAiApi {
     items: readonly TIn[],
     spec: AiMapSpec<TIn, TOut>,
   ): Promise<AiMapResult<TOut>[]>;
+}
+
+/**
+ * What a durable `ctx.step.ai.streamText` stores and returns. It is
+ * `AIStreamResult` minus the live stream and `rawResult`: neither survives a
+ * replay, so neither is part of the durable contract.
+ */
+export interface StepStreamResult {
+  text: string;
+  inputTokens: number;
+  outputTokens: number;
+  cost: number;
+  reasoning?: string;
 }
 
 /** Thrown when a realtime map would exceed `realtime.budget` model calls. */

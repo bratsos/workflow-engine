@@ -32,6 +32,7 @@ export {
   type AiMapResult,
   type AiMapSpec,
   type StepAiApi,
+  type StepStreamResult,
 } from "./core/step-ai";
 export {
   DURABLE_SUSPEND_MARKER,
