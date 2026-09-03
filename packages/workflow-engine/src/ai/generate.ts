@@ -263,13 +263,19 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
 
     // Debug logging for result
     if (hasTools || hasOutputSchema) {
-      const resultAny = result as { steps?: unknown[]; output?: unknown };
+      const resultAny = result as {
+        steps?: unknown[];
+        output?: unknown;
+        object?: unknown;
+      };
       // `.output` is a getter that throws AI_NoOutputGeneratedError unless
-      // `output` was configured - only probe it when relevant.
+      // `output` was configured - only probe it when relevant. An adapter
+      // response carries the structured output as `object`.
       let hasOutput = false;
       if (hasOutputSchema) {
         try {
-          hasOutput = resultAny.output !== undefined;
+          hasOutput =
+            (isAdapter ? resultAny.object : resultAny.output) !== undefined;
         } catch {
           hasOutput = false;
         }
@@ -290,6 +296,7 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
       reasoningText?: string;
       reasoning?: string;
       output?: unknown;
+      object?: unknown;
     };
     const inputTokens =
       resultAny.inputTokens ?? resultAny.usage?.inputTokens ?? 0;
@@ -363,7 +370,7 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
       ...(reasoning ? { reasoning } : {}),
       // Include structured output if `output` was used
       ...(hasOutputSchema && {
-        output: resultAny.output,
+        output: isAdapter ? resultAny.object : resultAny.output,
       }),
     };
   } catch (error) {
@@ -483,6 +490,7 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
 
     const resultAny = result as unknown as {
       output: unknown;
+      object?: unknown;
       inputTokens?: number;
       outputTokens?: number;
       usage?: { inputTokens?: number; outputTokens?: number };
@@ -492,6 +500,9 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
       reasoningText?: string;
       reasoning?: string;
     };
+    // The AI SDK exposes the structured result as `output`; an
+    // AdapterObjectResponse carries it as `object`. Resolve once, use everywhere.
+    const object = isAdapter ? resultAny.object : resultAny.output;
 
     const inputTokens =
       resultAny.inputTokens ?? resultAny.usage?.inputTokens ?? 0;
@@ -518,7 +529,7 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
       modelKey,
       modelId: modelConfig.id,
       prompt: promptForLog,
-      response: JSON.stringify(resultAny.output, null, 2),
+      response: JSON.stringify(object, null, 2),
       inputTokens,
       outputTokens,
       cost,
@@ -541,7 +552,7 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
     });
 
     // Trace log after successful AI call
-    const responseStr = JSON.stringify(resultAny.output);
+    const responseStr = JSON.stringify(object);
     logger.debug(`generateObject response`, {
       model: modelKey,
       response:
@@ -554,7 +565,7 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
     });
 
     return {
-      object: resultAny.output as z.infer<TSchema>,
+      object: object as z.infer<TSchema>,
       inputTokens,
       outputTokens,
       cost,
