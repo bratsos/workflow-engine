@@ -44,6 +44,18 @@ export interface ServerlessHostConfig {
   /** Max outbox events to flush per tick (default: 100). */
   maxOutboxFlushPerTick?: number;
 
+  /**
+   * Publish this job's outbox events right after `handleJob` settles it
+   * (default: true). There is no process lifecycle to hook a final flush
+   * on, so without this a run completed by this invocation is announced by
+   * whichever invocation runs the next maintenance tick. Bounded by
+   * `outboxFlushTimeoutMs`; errors are logged, never thrown.
+   */
+  flushOutboxAfterJob?: boolean;
+
+  /** Upper bound (ms) on the post-job outbox flush (default: 5_000). */
+  outboxFlushTimeoutMs?: number;
+
   /** Job lease heartbeat interval in milliseconds (default: 60_000). */
   jobHeartbeatIntervalMs?: number;
 }
@@ -106,6 +118,8 @@ class ServerlessHostImpl implements ServerlessHost {
   private readonly maxSuspendedChecksPerTick: number;
   private readonly maxOutboxFlushPerTick: number;
   private readonly jobHeartbeatIntervalMs: number;
+  private readonly flushOutboxAfterJob: boolean;
+  private readonly outboxFlushTimeoutMs: number;
 
   constructor(config: ServerlessHostConfig) {
     this.kernel = config.kernel;
@@ -122,6 +136,8 @@ class ServerlessHostImpl implements ServerlessHost {
       config.maxOutboxFlushPerTick ?? HOST_DEFAULTS.maxOutboxFlushPerTick;
     this.jobHeartbeatIntervalMs =
       config.jobHeartbeatIntervalMs ?? HOST_DEFAULTS.jobHeartbeatIntervalMs;
+    this.flushOutboxAfterJob = config.flushOutboxAfterJob ?? true;
+    this.outboxFlushTimeoutMs = config.outboxFlushTimeoutMs ?? 5_000;
   }
 
   async handleJob(msg: JobMessage): Promise<JobResult> {
@@ -129,12 +145,42 @@ class ServerlessHostImpl implements ServerlessHost {
     // (complete/suspend/fail + terminal run.transition) — see
     // executeJobWithHeartbeat in @bratsos/workflow-engine/kernel for the
     // shared command sequence.
-    return executeJobWithHeartbeat(this.kernel, {
+    const result = await executeJobWithHeartbeat(this.kernel, {
       jobTransport: this.jobTransport,
       job: msg,
       jobHeartbeatIntervalMs: this.jobHeartbeatIntervalMs,
       logPrefix: "[ServerlessHost]",
     });
+    if (this.flushOutboxAfterJob) {
+      await this.flushOutbox();
+    }
+    return result;
+  }
+
+  /** Publish pending outbox events, bounded by `outboxFlushTimeoutMs`. */
+  private async flushOutbox(): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<"timeout">((resolve) => {
+      timer = setTimeout(() => resolve("timeout"), this.outboxFlushTimeoutMs);
+    });
+    try {
+      const outcome = await Promise.race([
+        this.kernel.dispatch({
+          type: "outbox.flush",
+          maxEvents: this.maxOutboxFlushPerTick,
+        }),
+        timeout,
+      ]);
+      if (outcome === "timeout") {
+        console.error(
+          "[ServerlessHost] outbox.flush after job: timed out; the next maintenance tick publishes the rest",
+        );
+      }
+    } catch (error) {
+      console.error("[ServerlessHost] outbox.flush after job error:", error);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   async processAvailableJobs(opts?: {

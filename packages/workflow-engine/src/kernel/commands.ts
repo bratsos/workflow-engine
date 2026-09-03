@@ -140,6 +140,14 @@ export interface JobExecuteCommand {
   readonly workflowId: string;
   readonly stageId: string;
   readonly config: Record<string, unknown>;
+  /**
+   * The job's attempt number (1 on the first execution, as the transport
+   * counts it) and its attempt budget. When both are known the kernel
+   * records a retryable stage failure as PENDING — the retry the host is
+   * about to enqueue — instead of FAILED, and reports `willRetry`.
+   */
+  readonly attempt?: number;
+  readonly maxAttempts?: number;
 }
 
 /** Result of a `job.execute` command. */
@@ -156,6 +164,14 @@ export interface JobExecuteResult {
    * `undefined`/`true` preserves default retry behavior.
    */
   readonly retryable?: boolean;
+  /**
+   * True when the failure was recorded as a pending retry (stage left
+   * PENDING with the error on `errorMessage`) because the command carried
+   * `attempt`/`maxAttempts` with attempts remaining and the error was not
+   * deterministic. The host must re-enqueue the job
+   * (`jobTransport.fail(jobId, error, true)`).
+   */
+  readonly willRetry?: boolean;
 }
 
 // ---------------------------------------------------------------------------

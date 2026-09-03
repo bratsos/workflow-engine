@@ -124,6 +124,10 @@ export async function executeJobWithHeartbeat(
       workflowId: job.workflowId,
       stageId: job.stageId,
       config,
+      // Lets the kernel record a retryable failure as a pending retry
+      // (stage PENDING, ledger kept) instead of FAILED.
+      attempt: job.attempt,
+      maxAttempts: job.maxAttempts ?? HOST_DEFAULTS.maxAttempts,
     });
   } finally {
     clearInterval(heartbeat);
@@ -151,10 +155,14 @@ export async function executeJobWithHeartbeat(
   // A deterministic (non-retryable) stage error — e.g. Zod input
   // validation — will fail identically on every attempt, so it is
   // treated the same as an exhausted retry budget.
+  // The kernel decided from the same attempt/maxAttempts (`willRetry`) and
+  // already left the stage PENDING for that case; the transport contract
+  // is that `fail(jobId, error, true)` re-enqueues the job with backoff.
   const canRetry =
     !result.ghost &&
-    result.retryable !== false &&
-    job.attempt < (job.maxAttempts ?? HOST_DEFAULTS.maxAttempts);
+    (result.willRetry ??
+      (result.retryable !== false &&
+        job.attempt < (job.maxAttempts ?? HOST_DEFAULTS.maxAttempts)));
   await jobTransport.fail(job.jobId, result.error ?? "Unknown error", canRetry);
   // Terminal failure: without this, the run lingers RUNNING until
   // run.reapStuck kills it minutes later with a generic "STUCK_RUN_REAPED"

@@ -230,7 +230,14 @@ export interface JobTransport {
   /** Mark job as suspended (for async-batch). */
   suspend(jobId: string, nextPollAt: Date): Promise<void>;
 
-  /** Mark job as failed. */
+  /**
+   * Mark job as failed. With `shouldRetry: true` the transport MUST put the
+   * job back in the queue (PENDING, with backoff, keeping its attempt
+   * count) — the kernel has already recorded the stage as PENDING on that
+   * promise, and a transport that only acknowledges the message leaves the
+   * run RUNNING until `run.reapStuck` heals it. With `false` the job is
+   * terminal and the host dispatches `run.transition` right away.
+   */
   fail(jobId: string, error: string, shouldRetry?: boolean): Promise<void>;
 
   /** Release stale locks (for crashed workers). */

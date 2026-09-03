@@ -46,13 +46,15 @@ Creates a new Node host instance.
 | `maxClaimsPerTick` | `number` | `10` | Max pending runs to claim per orchestration tick |
 | `maxSuspendedChecksPerTick` | `number` | `10` | Max suspended stages to poll per tick |
 | `maxOutboxFlushPerTick` | `number` | `100` | Max outbox events to flush per tick |
+| `shutdownTimeoutMs` | `number` | `10_000` | Bound on `stop()`: wait for the in-flight job, then for the final outbox flush |
+| `flushOutboxOnStop` | `boolean` | `true` | Run a final `outbox.flush` in `stop()` |
 
 ### `NodeHost`
 
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `start()` | `Promise<void>` | Start polling loops and register SIGTERM/SIGINT handlers |
-| `stop()` | `Promise<void>` | Graceful shutdown -- clears timers and signal handlers |
+| `stop()` | `Promise<void>` | Graceful shutdown -- clears timers and signal handlers, waits (bounded) for the in-flight job, then runs a final `outbox.flush` so a run this process finished is published before exit |
 | `getStats()` | `HostStats` | Runtime statistics |
 
 ### `HostStats`
@@ -85,7 +87,9 @@ The host runs two concurrent loops:
    - On failure: mark failed with retry flag
    - Sleep `jobPollIntervalMs` when queue is empty
 
-Signal handlers (`SIGTERM`, `SIGINT`) automatically call `stop()` for graceful shutdown.
+Signal handlers (`SIGTERM`, `SIGINT`) automatically call `stop()` for graceful shutdown. `stop()` lets the job in flight finish (up to `shutdownTimeoutMs`) and then flushes the outbox once more, bounded by the same timeout, so `workflow:completed` for a run this process finished reaches the `EventSink` (and your plugins) here rather than in whichever process ticks next. Flush errors are logged, not thrown. Set `flushOutboxOnStop: false` when another process owns event publication.
+
+On failure, the job loop marks the job failed with a retry flag while the job has attempts left (`maxAttempts` on the transport); the kernel has already left the stage `PENDING` with the error, and the queue re-delivers it with backoff. Once the attempts are exhausted the stage is `FAILED` and `run.transition` is dispatched immediately.
 
 ## Worker Process Pattern
 

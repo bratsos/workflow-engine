@@ -46,6 +46,8 @@ Creates a new serverless host instance.
 | `maxClaimsPerTick` | `number` | `10` | Max pending runs to claim per maintenance tick |
 | `maxSuspendedChecksPerTick` | `number` | `10` | Max suspended stages to poll per tick |
 | `maxOutboxFlushPerTick` | `number` | `100` | Max outbox events to flush per tick |
+| `flushOutboxAfterJob` | `boolean` | `true` | Publish the job's outbox events right after `handleJob` settles it |
+| `outboxFlushTimeoutMs` | `number` | `5_000` | Bound on that post-job flush; errors are logged, not thrown |
 
 ### `ServerlessHost`
 
@@ -177,7 +179,7 @@ export async function GET() {
 
 Unlike the Node host, the serverless host has **no loops, timers, or signal handlers**. Every method is a single stateless invocation:
 
-- **`handleJob(msg)`** -- Dispatches `job.execute` to the kernel, then marks the job complete/suspended/failed via `jobTransport`. On completion, also dispatches `run.transition` to advance the workflow.
+- **`handleJob(msg)`** -- Dispatches `job.execute` to the kernel, then marks the job complete/suspended/failed via `jobTransport`. On completion, also dispatches `run.transition` to advance the workflow, and (unless `flushOutboxAfterJob: false`) runs one bounded `outbox.flush` so the run's events are published by this invocation instead of by the next maintenance tick — there is no process lifecycle to hook a final flush on. A failure with attempts left (`msg.attempt < msg.maxAttempts`, default 3) leaves the stage `PENDING` with the error and calls `jobTransport.fail(jobId, error, true)`: your transport **must** re-enqueue the message with backoff (acknowledging it without a retry strands the run as `RUNNING` until `run.reapStuck`). When no attempts remain the stage is `FAILED` and `run.transition` fails the run immediately with the stage error.
 
 - **`processAvailableJobs(opts?)`** -- Dequeues up to `maxJobs` (default: 1) from the job transport and processes each via `handleJob`. Safe for edge runtimes with CPU limits.
 

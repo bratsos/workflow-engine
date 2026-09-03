@@ -230,6 +230,111 @@ describe("kernel: job.execute", () => {
     expect(failedEvents).toHaveLength(1);
   });
 
+  it("records a retryable failure as PENDING when the job has attempts left", async () => {
+    const schema = z.object({ data: z.string() });
+    const stage = defineStage({
+      id: "flaky",
+      name: "Flaky Stage",
+      schemas: { input: schema, output: schema, config: z.object({}) },
+      async execute() {
+        throw new Error("transient failure");
+      },
+    });
+    const workflow = new WorkflowBuilder("retry-wf", "T", "T", schema, schema)
+      .pipe(stage)
+      .build();
+    const { kernel, flush, persistence, eventSink } = createTestKernel([
+      workflow,
+    ]);
+    const created = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "retry-1",
+      workflowId: "retry-wf",
+      input: { data: "hello" },
+    });
+    await persistence.updateRun(created.workflowRunId, { status: "RUNNING" });
+    await flush();
+    eventSink.clear();
+
+    const result = await kernel.dispatch({
+      type: "job.execute",
+      workflowRunId: created.workflowRunId,
+      workflowId: "retry-wf",
+      stageId: "flaky",
+      config: {},
+      attempt: 1,
+      maxAttempts: 3,
+    });
+
+    expect(result).toMatchObject({
+      outcome: "failed",
+      error: "transient failure",
+      willRetry: true,
+    });
+    const [stageRecord] = await persistence.getStagesByRun(
+      created.workflowRunId,
+    );
+    expect(stageRecord).toMatchObject({
+      status: "PENDING",
+      errorMessage: "transient failure",
+    });
+    expect(stageRecord!.completedAt).toBeFalsy();
+    // The run is still active: a transition must not fail it.
+    const transition = await kernel.dispatch({
+      type: "run.transition",
+      workflowRunId: created.workflowRunId,
+    });
+    expect(transition.action).toBe("noop");
+    expect((await persistence.getRun(created.workflowRunId))?.status).toBe(
+      "RUNNING",
+    );
+    await flush();
+    expect(eventSink.getByType("stage:failed")).toHaveLength(1);
+  });
+
+  it("records FAILED and no retry once the job's attempts are exhausted", async () => {
+    const schema = z.object({ data: z.string() });
+    const stage = defineStage({
+      id: "doomed",
+      name: "Doomed Stage",
+      schemas: { input: schema, output: schema, config: z.object({}) },
+      async execute() {
+        throw new Error("still failing");
+      },
+    });
+    const workflow = new WorkflowBuilder("final-wf", "T", "T", schema, schema)
+      .pipe(stage)
+      .build();
+    const { kernel, flush, persistence } = createTestKernel([workflow]);
+    const created = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "final-1",
+      workflowId: "final-wf",
+      input: { data: "hello" },
+    });
+    await persistence.updateRun(created.workflowRunId, { status: "RUNNING" });
+    await flush();
+
+    const result = await kernel.dispatch({
+      type: "job.execute",
+      workflowRunId: created.workflowRunId,
+      workflowId: "final-wf",
+      stageId: "doomed",
+      config: {},
+      attempt: 3,
+      maxAttempts: 3,
+    });
+
+    expect(result).toMatchObject({ outcome: "failed", willRetry: false });
+    const [stageRecord] = await persistence.getStagesByRun(
+      created.workflowRunId,
+    );
+    expect(stageRecord).toMatchObject({
+      status: "FAILED",
+      errorMessage: "still failing",
+    });
+  });
+
   it("handles a suspended stage", async () => {
     const schema = z.object({ data: z.string() });
     const stage = defineAsyncBatchStage({

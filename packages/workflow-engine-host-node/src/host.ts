@@ -51,6 +51,16 @@ export interface NodeHostConfig {
 
   /** Job lease heartbeat interval in milliseconds (default: 60_000). */
   jobHeartbeatIntervalMs?: number;
+
+  /**
+   * Upper bound (ms) on `stop()`: how long to wait for the in-flight job
+   * to finish, and separately for the final `outbox.flush`, before giving
+   * up on each (default: 10_000). Errors are logged, never thrown.
+   */
+  shutdownTimeoutMs?: number;
+
+  /** Run a final `outbox.flush` in `stop()` (default: true). */
+  flushOutboxOnStop?: boolean;
 }
 
 export interface HostStats {
@@ -78,6 +88,7 @@ class NodeHostImpl implements NodeHost {
   private startTime = 0;
   private orchestrationTimer: ReturnType<typeof setInterval> | null = null;
   private signalHandlers: { signal: string; handler: () => void }[] = [];
+  private jobLoop: Promise<void> | null = null;
 
   private readonly kernel: Kernel;
   private readonly jobTransport: JobTransport;
@@ -89,6 +100,8 @@ class NodeHostImpl implements NodeHost {
   private readonly maxSuspendedChecksPerTick: number;
   private readonly maxOutboxFlushPerTick: number;
   private readonly jobHeartbeatIntervalMs: number;
+  private readonly shutdownTimeoutMs: number;
+  private readonly flushOutboxOnStop: boolean;
 
   constructor(config: NodeHostConfig) {
     this.kernel = config.kernel;
@@ -107,6 +120,8 @@ class NodeHostImpl implements NodeHost {
       config.maxOutboxFlushPerTick ?? HOST_DEFAULTS.maxOutboxFlushPerTick;
     this.jobHeartbeatIntervalMs =
       config.jobHeartbeatIntervalMs ?? HOST_DEFAULTS.jobHeartbeatIntervalMs;
+    this.shutdownTimeoutMs = config.shutdownTimeoutMs ?? 10_000;
+    this.flushOutboxOnStop = config.flushOutboxOnStop ?? true;
   }
 
   // --------------------------------------------------------------------------
@@ -129,7 +144,7 @@ class NodeHostImpl implements NodeHost {
     void this.orchestrationTick();
 
     // Start job processing loop (runs until stop())
-    void this.processJobs();
+    this.jobLoop = this.processJobs();
 
     // Signal handlers — use wrapper functions so we can remove them on stop
     const onSignal = () => void this.stop();
@@ -157,6 +172,51 @@ class NodeHostImpl implements NodeHost {
       process.removeListener(signal, handler);
     }
     this.signalHandlers = [];
+
+    // Let the job in flight finish (bounded) so its completion events are
+    // in the outbox, then publish them from this process. Without the
+    // flush, `workflow:completed` for a run this process finished sits in
+    // the outbox until whichever process ticks next.
+    if (this.jobLoop) {
+      await withTimeout(this.jobLoop, this.shutdownTimeoutMs);
+      this.jobLoop = null;
+    }
+    if (this.flushOutboxOnStop) {
+      await this.flushOutbox();
+    }
+  }
+
+  /** Publish pending outbox events, bounded by `shutdownTimeoutMs`. */
+  private async flushOutbox(): Promise<void> {
+    const deadline = Date.now() + this.shutdownTimeoutMs;
+    try {
+      // Drain in pages until a page comes back short or the deadline passes.
+      for (;;) {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) {
+          console.error(
+            "[NodeHost] outbox.flush on stop(): timed out before the outbox was empty",
+          );
+          return;
+        }
+        const flushed = await withTimeout(
+          this.kernel.dispatch({
+            type: "outbox.flush",
+            maxEvents: this.maxOutboxFlushPerTick,
+          }),
+          remaining,
+        );
+        if (flushed === undefined) {
+          console.error(
+            "[NodeHost] outbox.flush on stop(): timed out before the outbox was empty",
+          );
+          return;
+        }
+        if (flushed.published < this.maxOutboxFlushPerTick) return;
+      }
+    } catch (error) {
+      console.error("[NodeHost] outbox.flush on stop() error:", error);
+    }
   }
 
   getStats(): HostStats {
@@ -232,6 +292,20 @@ class NodeHostImpl implements NodeHost {
   private sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
+}
+
+/** Resolve with the promise's value, or `undefined` once `ms` elapses. */
+function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+): Promise<T | undefined> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<undefined>((resolve) => {
+    timer = setTimeout(() => resolve(undefined), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
 }
 
 // ============================================================================

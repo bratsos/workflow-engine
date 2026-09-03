@@ -26,6 +26,7 @@
 import { isSuspendedResult } from "../../core/types";
 import type { JobExecuteCommand, JobExecuteResult } from "../commands";
 import type { KernelEvent } from "../events";
+import { HOST_DEFAULTS } from "../helpers/host-support.js";
 import {
   buildAnnotationEvents,
   loadWorkflowContext,
@@ -219,6 +220,18 @@ export async function handleJobExecute(
     const duration = deps.clock.now().getTime() - startTime;
     const bufferedAnnotations = run.annotations;
 
+    // A retryable failure with attempts left is not terminal: the host is
+    // about to re-enqueue the job, so the stage goes back to PENDING (an
+    // active status for run.transition) carrying the last error, keeps its
+    // ledger rows for the replay, and the run keeps RUNNING. Only when the
+    // attempt budget is exhausted (or the error is deterministic) is the
+    // stage FAILED. A command without attempt information (a caller that
+    // dispatches job.execute directly) keeps the historical FAILED write.
+    const willRetry =
+      command.attempt !== undefined &&
+      run.retryable !== false &&
+      command.attempt < (command.maxAttempts ?? HOST_DEFAULTS.maxAttempts);
+
     // expectedVersion omitted: Phase 3 never writes the run row here (only
     // the stage row), so — unlike stage-poll-suspended's claim — parallel
     // sibling stages completing concurrently must not contend on the run's
@@ -230,12 +243,17 @@ export async function handleJobExecute(
       undefined,
       deps,
       async (tx) => {
-        await tx.updateStage(stageRecord.id, {
-          status: "FAILED",
-          completedAt: deps.clock.now(),
-          duration,
-          errorMessage,
-        });
+        await tx.updateStage(
+          stageRecord.id,
+          willRetry
+            ? { status: "PENDING", duration, errorMessage }
+            : {
+                status: "FAILED",
+                completedAt: deps.clock.now(),
+                duration,
+                errorMessage,
+              },
+        );
 
         if (bufferedAnnotations.length > 0) {
           await tx.appendAnnotations(bufferedAnnotations);
@@ -277,8 +295,10 @@ export async function handleJobExecute(
       .createLog({
         workflowRunId,
         workflowStageId: stageRecord.id,
-        level: "ERROR",
-        message: errorMessage,
+        level: willRetry ? "WARN" : "ERROR",
+        message: willRetry
+          ? `${errorMessage} (attempt ${command.attempt} of ${command.maxAttempts ?? HOST_DEFAULTS.maxAttempts}; retry pending)`
+          : errorMessage,
       })
       .catch(() => {});
 
@@ -286,6 +306,7 @@ export async function handleJobExecute(
       outcome: "failed" as const,
       error: errorMessage,
       retryable: run.retryable,
+      willRetry,
       _events: [],
     };
   }

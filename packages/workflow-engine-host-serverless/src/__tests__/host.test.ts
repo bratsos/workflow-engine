@@ -309,6 +309,138 @@ describe("ServerlessHost", () => {
     expect(tick.eventsFlushed).toBeGreaterThanOrEqual(0);
   });
 
+  it("re-enqueues a failed stage with attempts left and completes the run on the retry", async () => {
+    let calls = 0;
+    const flaky = defineStage({
+      id: "flaky",
+      name: "Flaky",
+      schemas: { input: schema, output: outputSchema, config: z.object({}) },
+      async execute(ctx) {
+        calls++;
+        if (calls === 1) throw new Error("transient failure");
+        return { output: { result: ctx.input.data.toUpperCase() } };
+      },
+    });
+    const workflow = new WorkflowBuilder(
+      "flaky-wf",
+      "Flaky",
+      "Test",
+      schema,
+      outputSchema,
+    )
+      .pipe(flaky)
+      .build();
+    const { kernel, persistence, jobTransport, eventSink } = createTestEnv([
+      workflow,
+    ]);
+    const host = createServerlessHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+    });
+    const created = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "flaky-1",
+      workflowId: "flaky-wf",
+      input: { data: "hello" },
+    });
+    await host.runMaintenanceTick();
+
+    const first = await host.handleJob((await dequeueAsMessage(jobTransport))!);
+    expect(first.outcome).toBe("failed");
+    // Retry pending: the stage is not FAILED and the run is still RUNNING.
+    const [afterFirst] = await persistence.getStagesByRun(
+      created.workflowRunId,
+    );
+    expect(afterFirst).toMatchObject({
+      status: "PENDING",
+      errorMessage: "transient failure",
+    });
+    expect((await persistence.getRun(created.workflowRunId))?.status).toBe(
+      "RUNNING",
+    );
+
+    // The transport re-queued the job (attempt 2) without any maintenance.
+    const retry = await dequeueAsMessage(jobTransport);
+    expect(retry).toMatchObject({ stageId: "flaky", attempt: 2 });
+    const second = await host.handleJob(retry!);
+    expect(second.outcome).toBe("completed");
+    expect(calls).toBe(2);
+    const run = await persistence.getRun(created.workflowRunId);
+    expect(run?.status).toBe("COMPLETED");
+    expect(run?.output).toEqual({ result: "HELLO" });
+    // Events for the completed run were published by handleJob itself.
+    expect(eventSink.events.some((e) => e.type === "workflow:completed")).toBe(
+      true,
+    );
+  });
+
+  it("fails the run immediately with the stage error when no attempts remain", async () => {
+    const workflow = createFailingWorkflow();
+    const { kernel, persistence, jobTransport, eventSink } = createTestEnv([
+      workflow,
+    ]);
+    jobTransport.setDefaultMaxAttempts(1);
+    const host = createServerlessHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+    });
+    const created = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "fail-terminal-1",
+      workflowId: "failing-workflow",
+      input: { data: "boom" },
+    });
+    await host.runMaintenanceTick();
+
+    const result = await host.handleJob(
+      (await dequeueAsMessage(jobTransport))!,
+    );
+
+    expect(result.outcome).toBe("failed");
+    // No maintenance tick, no reapStuck: the run is FAILED right away.
+    const run = await persistence.getRun(created.workflowRunId);
+    expect(run?.status).toBe("FAILED");
+    const [stageRecord] = await persistence.getStagesByRun(
+      created.workflowRunId,
+    );
+    expect(stageRecord).toMatchObject({
+      status: "FAILED",
+      errorMessage: "Stage exploded",
+    });
+    const failedEvent = eventSink.events.find(
+      (e) => e.type === "workflow:failed",
+    );
+    expect((failedEvent as { error?: string } | undefined)?.error).toBe(
+      "Stage exploded",
+    );
+  });
+
+  it("publishes a completed run's events from handleJob without a maintenance tick", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, jobTransport, eventSink } = createTestEnv([workflow]);
+    const host = createServerlessHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+    });
+    await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "flush-after-job-1",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+    await host.runMaintenanceTick();
+    eventSink.clear();
+
+    await host.handleJob((await dequeueAsMessage(jobTransport))!);
+
+    expect(eventSink.events.map((e) => e.type)).toEqual(
+      expect.arrayContaining(["stage:completed", "workflow:completed"]),
+    );
+  });
+
   it("returns failed outcome for a throwing stage", async () => {
     const workflow = createFailingWorkflow();
     const { kernel, jobTransport } = createTestEnv([workflow]);
@@ -496,9 +628,10 @@ describe("ServerlessHost", () => {
     const msg = await dequeueAsMessage(jobTransport);
     await host.handleJob(msg!);
 
-    // Tick 2: flush remaining events (stage + workflow completion)
+    // handleJob already flushed the completion events itself, so the next
+    // tick finds nothing left to publish.
     const tick2 = await host.runMaintenanceTick();
-    expect(tick2.eventsFlushed).toBeGreaterThan(0);
+    expect(tick2.eventsFlushed).toBe(0);
 
     // Verify events reached the sink
     const types = eventSink.events.map((e) => e.type);
