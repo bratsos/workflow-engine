@@ -147,7 +147,10 @@ export const ModelKeyEnum = z.enum(["gemini-2.5-flash"]);
  * Type representing all available model keys
  * Supports both built-in enum keys AND dynamically registered keys via ModelRegistry
  */
-export type ModelKey = z.infer<typeof ModelKeyEnum> | keyof ModelRegistry;
+export type ModelKey =
+  | z.infer<typeof ModelKeyEnum>
+  | keyof ModelRegistry
+  | (string & {});
 
 /**
  * Zod schema that validates model keys against both the static enum AND the runtime registry
@@ -169,7 +172,7 @@ export const ModelKey = z
         "Model not found. Make sure to import the generated models file or register the model.",
     },
   )
-  .transform((key) => key as ModelKey);
+  .transform((key) => key);
 
 /**
  * Available AI models with their configurations
@@ -200,13 +203,13 @@ export const DEFAULT_MODEL_KEY: ModelKey = "gemini-2.5-flash";
  */
 export function getModel(key: ModelKey): ModelConfig {
   // First check built-in models (for backward compatibility)
-  const builtInModel = AVAILABLE_MODELS[key as keyof typeof AVAILABLE_MODELS];
+  const builtInModel = AVAILABLE_MODELS[key];
   if (builtInModel) {
     return builtInModel;
   }
 
   // Then check runtime registry (for dynamically registered models)
-  const registeredModel = MODEL_REGISTRY[key as string];
+  const registeredModel = MODEL_REGISTRY[key];
   if (registeredModel) {
     return registeredModel;
   }

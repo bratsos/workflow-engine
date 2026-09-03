@@ -1,5 +1,9 @@
 import type { EnhancedStageContext, Stage } from "@bratsos/workflow-engine";
-import { createStepApi, toErrorMessage } from "@bratsos/workflow-engine/kernel";
+import {
+  AIServicesNotConfiguredError,
+  createStepApi,
+  toErrorMessage,
+} from "@bratsos/workflow-engine/kernel";
 import type { z } from "zod";
 import type {
   ActivityReport,
@@ -44,6 +48,12 @@ export async function runActivity(
     config: task.config,
     resumeState: task.resumeState as BaseContext["resumeState"],
     workflowContext: task.workflowContext,
+    get ai(): never {
+      throw new AIServicesNotConfiguredError();
+    },
+    get aiLogger(): never {
+      throw new AIServicesNotConfiguredError();
+    },
     // Remote activity workers have no step ledger in v1: the StepApi is present
     // (the context contract requires it) but every ctx.step.* call throws
     // StepLedgerNotConfiguredError naming the reason.

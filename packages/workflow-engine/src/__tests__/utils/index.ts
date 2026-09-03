@@ -28,8 +28,10 @@ export {
 // Mock AI helper
 export {
   createMockAIHelper,
+  createMockAIHelperFactory,
   MockAIHelper,
   type MockAIHelperConfig,
+  type MockAIHelperFactory,
   type MockBatchResult,
   type MockEmbedResponse,
   type MockObjectResponse,

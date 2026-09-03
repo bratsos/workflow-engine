@@ -18,6 +18,12 @@ export type { OpenRouterRoutingOptions };
 
 export interface AIHelperOptions {
   routing?: OpenRouterRoutingOptions;
+  /** Optional transport adapter used instead of the AI SDK for selected calls. */
+  adapter?: AIAdapter;
+  /** Default timeout applied to each non-batch AI call. */
+  timeout?: {
+    perCallMs?: number;
+  };
 }
 
 /**
@@ -29,6 +35,81 @@ export type ProviderResolver = (
 ) => import("@ai-sdk/provider").LanguageModelV4 | null | undefined;
 
 export type AICallType = "text" | "object" | "embed" | "stream" | "batch";
+
+/** Normalized request passed to an adapter for text generation. */
+export interface AdapterTextRequest {
+  model: ModelConfig;
+  prompt: TextInput;
+  options: TextOptions;
+}
+
+/** Normalized request passed to an adapter for structured generation. */
+export interface AdapterObjectRequest {
+  model: ModelConfig;
+  prompt: TextInput;
+  schema: z.ZodTypeAny;
+  options: ObjectOptions;
+}
+
+/** Normalized request passed to an adapter for embedding generation. */
+export interface AdapterEmbedRequest {
+  model: ModelConfig;
+  values: string[];
+  options: EmbedOptions;
+}
+
+/** Normalized request passed to an adapter for streaming generation. */
+export interface AdapterStreamRequest {
+  model: ModelConfig;
+  prompt?: string;
+  messages?: Parameters<typeof streamText>[0]["messages"];
+  instructions?: string;
+  options: StreamOptions;
+}
+
+export interface AdapterTextResponse {
+  text: string;
+  inputTokens: number;
+  outputTokens: number;
+  object?: unknown;
+  reasoning?: string;
+  providerMetadata?: Record<string, unknown>;
+}
+
+export interface AdapterObjectResponse {
+  object: unknown;
+  inputTokens: number;
+  outputTokens: number;
+  reasoning?: string;
+  providerMetadata?: Record<string, unknown>;
+}
+
+export interface AdapterEmbedResponse {
+  embeddings: number[][];
+  inputTokens: number;
+  outputTokens?: number;
+  providerMetadata?: Record<string, unknown>;
+}
+
+export interface AdapterStreamResponse {
+  stream: AsyncIterable<string>;
+  text?: string;
+  inputTokens?: number;
+  outputTokens?: number;
+  reasoning?: string;
+  providerMetadata?: Record<string, unknown>;
+}
+
+/**
+ * Optional AI transport seam. The helper retains topic, logging, cost, and
+ * error semantics around these normalized operations.
+ */
+export interface AIAdapter {
+  generateText?(req: AdapterTextRequest): Promise<AdapterTextResponse>;
+  generateObject?(req: AdapterObjectRequest): Promise<AdapterObjectResponse>;
+  embed?(req: AdapterEmbedRequest): Promise<AdapterEmbedResponse>;
+  streamText?(req: AdapterStreamRequest): AdapterStreamResponse;
+}
 
 export interface AITextResult {
   text: string;
@@ -59,6 +140,7 @@ export interface AIObjectResult<T> {
   reportedCostUsd?: number;
   /** Whether `cost` came from the provider or from the static price table. */
   costSource?: "reported" | "estimated";
+  reasoning?: string;
 }
 
 export interface AIEmbedResult {
@@ -103,7 +185,8 @@ export interface AIStreamResult {
    */
   getReasoning(): Promise<string | undefined>;
   /** The raw AI SDK result - use this for methods like toUIMessageStreamResponse */
-  rawResult: AISDKStreamResult;
+  /** Undefined when the stream was supplied by an AIAdapter. */
+  rawResult: AISDKStreamResult | undefined;
 }
 
 /**
@@ -137,6 +220,8 @@ export interface TextOptions<TTools extends ToolSet = ToolSet> {
   maxRetries?: number;
   /** Abort signal to cancel the AI SDK call (pass-through) */
   abortSignal?: AbortSignal;
+  /** Override the helper-level per-call timeout. */
+  timeoutMs?: number;
   /** Tool definitions for the model to use */
   tools?: TTools;
   /** Tool choice: 'auto' (default), 'required' (force tool use), 'none', or specific tool name */
@@ -163,6 +248,8 @@ export interface ObjectOptions<TTools extends ToolSet = ToolSet> {
   maxRetries?: number;
   /** Abort signal to cancel the AI SDK call (pass-through) */
   abortSignal?: AbortSignal;
+  /** Override the helper-level per-call timeout. */
+  timeoutMs?: number;
   /** Tool definitions for the model to use */
   tools?: TTools;
   /** Condition to stop tool execution (e.g., stepCountIs(3)) */
@@ -180,6 +267,10 @@ export interface EmbedOptions {
   taskType?: "RETRIEVAL_QUERY" | "RETRIEVAL_DOCUMENT" | "SEMANTIC_SIMILARITY";
   /** Override the default embedding dimensions (DEFAULT_EMBEDDING_DIMENSIONS in embeddings.ts) */
   dimensions?: number;
+  /** Abort signal to cancel the AI SDK call (pass-through) */
+  abortSignal?: AbortSignal;
+  /** Override the helper-level per-call timeout. */
+  timeoutMs?: number;
   /** Provider-specific options passed directly to the AI SDK's embed() call */
   providerOptions?: Record<string, Record<string, unknown>>;
 }
@@ -191,6 +282,8 @@ export interface StreamOptions {
   maxRetries?: number;
   /** Abort signal to cancel the AI SDK call (pass-through) */
   abortSignal?: AbortSignal;
+  /** Override the helper-level per-call timeout. */
+  timeoutMs?: number;
   onChunk?: (chunk: string) => void;
   /** Tool definitions for the model to use */
   tools?: Parameters<typeof streamText>[0]["tools"];
@@ -451,4 +544,6 @@ export interface AIHelperContext {
   readonly aiCallLogger: AICallLogger;
   readonly providerResolver?: ProviderResolver;
   readonly routing?: OpenRouterRoutingOptions;
+  readonly adapter?: AIAdapter;
+  readonly timeout?: AIHelperOptions["timeout"];
 }

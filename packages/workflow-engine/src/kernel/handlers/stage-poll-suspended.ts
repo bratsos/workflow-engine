@@ -32,6 +32,7 @@ import {
   buildStageExecutionContext,
   createAnnotationBuffer,
   createStorageShim,
+  defineLazyAIContext,
   failStageAndRun,
   handleClaimOutcome,
   loadWorkflowContext,
@@ -368,16 +369,16 @@ export async function handleStagePollSuspended(
       deps,
     );
 
-    const logFn = async (
-      level: any,
+    const logFn = (
+      level: "DEBUG" | "INFO" | "WARN" | "ERROR",
       message: string,
       meta?: Record<string, unknown>,
-    ) => {
-      await deps.persistence
+    ): void => {
+      void deps.persistence
         .createLog({
           workflowRunId: stageRecord.workflowRunId,
           workflowStageId: stageRecord.id,
-          level: level as any,
+          level,
           message,
           metadata: meta,
         })
@@ -413,16 +414,24 @@ export async function handleStagePollSuspended(
     }) as CheckCompletionContext<unknown>["annotate"];
 
     // 3e. Build check context
-    const checkContext = {
-      workflowRunId: run.id,
-      stageId: stageRecord.stageId,
-      stageRecordId: stageRecord.id,
-      config: stageRecord.config || {},
-      log: logFn,
-      onLog: logFn,
-      annotate: annotateFn,
-      storage,
-    };
+    const checkContext = defineLazyAIContext(
+      {
+        workflowRunId: run.id,
+        stageId: stageRecord.stageId,
+        stageRecordId: stageRecord.id,
+        config: stageRecord.config || {},
+        log: logFn,
+        onLog: logFn,
+        annotate: annotateFn,
+        storage,
+      },
+      {
+        workflowRunId: run.id,
+        stageId: stageRecord.stageId,
+        stageRecordId: stageRecord.id,
+      },
+      deps,
+    );
 
     try {
       // ── Phase 1: checkCompletion (no transaction) ──────────────────
@@ -454,7 +463,7 @@ export async function handleStagePollSuspended(
             validatedOutput = stageDef.outputSchema.parse(checkResult.output);
           } catch (validationError) {
             // Fall back to raw output on validation failure
-            await logFn(
+            logFn(
               "WARN",
               `Stage ${stageRecord.stageId} checkCompletion output failed schema validation; persisting raw output`,
               { error: toErrorMessage(validationError) },

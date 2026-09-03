@@ -13,7 +13,7 @@
  */
 
 import { beforeAll, describe, expect, it } from "vitest";
-import { type ModelKey, registerModels } from "../../ai/model-helper.js";
+import { registerModels } from "../../ai/model-helper.js";
 import {
   deriveBatchCapability,
   NATIVE_BATCH_DISCOUNT_PERCENT,
@@ -233,7 +233,7 @@ describe("transport resolution honours the two signals", () => {
   });
 
   it("a native-only model resolves to its vendor and is NOT reachable via OpenRouter", () => {
-    const key = NATIVE_ONLY as ModelKey;
+    const key = NATIVE_ONLY;
     expect(getBestProviderForModel(key)).toBe("google");
     expect(getProviderModelId(key, "google")).toBe(
       "gemini-3.1-flash-lite-preview",
@@ -248,7 +248,7 @@ describe("transport resolution honours the two signals", () => {
   });
 
   it("a native model with a sibling is reachable through both transports", () => {
-    const key = WITH_SIBLING as ModelKey;
+    const key = WITH_SIBLING;
     expect(getBestProviderForModel(key)).toBe("anthropic");
     expect(getProviderModelId(key, "anthropic")).toBe("claude-sonnet-4.5");
     expect(getProviderModelId(key, "openrouter")).toBe(
@@ -260,7 +260,7 @@ describe("transport resolution honours the two signals", () => {
   });
 
   it("a non-native model with a sibling resolves to OpenRouter", () => {
-    const key = OR_ONLY as ModelKey;
+    const key = OR_ONLY;
     expect(getBestProviderForModel(key)).toBe("openrouter");
     expect(resolveModelForProvider(key, "openrouter")).toBe(
       "deepseek/deepseek-v4",

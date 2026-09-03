@@ -11,11 +11,7 @@
  */
 
 import { beforeAll, describe, expect, it } from "vitest";
-import {
-  calculateCost,
-  type ModelKey,
-  registerModels,
-} from "../../ai/model-helper.js";
+import { calculateCost, registerModels } from "../../ai/model-helper.js";
 import {
   calculateCostWithDiscount,
   extractReportedCost,
@@ -23,15 +19,14 @@ import {
 } from "../../ai/shared.js";
 
 // Registry keys stay plain strings so the literals below remain distinct.
-// `ModelKey` only narrows to the built-in enum plus whatever a consumer
-// augments `ModelRegistry` with, so call sites need the cast.
+// Registry keys remain plain strings and are validated when a model is used.
 const MODEL_ID = "cost-test-model";
 const LONG_CTX_ID = "cost-test-long-context";
 const BATCH_ID = "cost-test-batch";
 
-const MODEL = MODEL_ID as ModelKey;
-const LONG_CTX_MODEL = LONG_CTX_ID as ModelKey;
-const BATCH_MODEL = BATCH_ID as ModelKey;
+const MODEL = MODEL_ID;
+const LONG_CTX_MODEL = LONG_CTX_ID;
+const BATCH_MODEL = BATCH_ID;
 
 beforeAll(() => {
   registerModels({

@@ -10,6 +10,16 @@ export class IdempotencyInProgressError extends Error {
   }
 }
 
+/** Thrown when a stage asks for AI without kernel AI services configured. */
+export class AIServicesNotConfiguredError extends Error {
+  constructor() {
+    super(
+      "AI services are not configured. Pass createKernel({ services: { aiLogger, ai } }) to configure ctx.ai and ctx.aiLogger.",
+    );
+    this.name = "AIServicesNotConfiguredError";
+  }
+}
+
 /**
  * Thrown inside a Phase 3 / Phase 2 transaction when the run status has
  * become non-RUNNING (typically because `run.cancel` committed between

@@ -56,12 +56,22 @@ export {
 
 // AI Helper
 export {
+  type AdapterEmbedRequest,
+  type AdapterEmbedResponse,
+  type AdapterObjectRequest,
+  type AdapterObjectResponse,
+  type AdapterStreamRequest,
+  type AdapterStreamResponse,
+  type AdapterTextRequest,
+  type AdapterTextResponse,
+  type AIAdapter,
   // High-level batch types (user-facing API)
   type AIBatch,
   type AIBatchHandle,
   type AIBatchProvider,
   type AIBatchRequest,
   type AIBatchResult,
+  AICallTimeoutError,
   type AICallType,
   type AIEmbedResult,
   type AIHelper,
@@ -219,7 +229,10 @@ export type {
   StepSignalCommand,
   StepSignalResult,
 } from "./kernel/commands";
-export { IdempotencyInProgressError } from "./kernel/errors";
+export {
+  AIServicesNotConfiguredError,
+  IdempotencyInProgressError,
+} from "./kernel/errors";
 export type {
   KernelEvent,
   KernelEventType,
@@ -234,10 +247,12 @@ export {
   type PluginRunnerConfig,
 } from "./kernel/plugins";
 export type {
+  AIHelperFactory,
   BlobStore,
   Clock,
   EventSink,
   JobTransport,
+  KernelServices,
   Persistence,
   Scheduler,
   StepLedger,

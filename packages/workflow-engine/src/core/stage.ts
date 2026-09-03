@@ -9,7 +9,9 @@
  */
 
 import type { z } from "zod";
+import type { AIHelper } from "../ai/types.js";
 import type { AnnotationActor } from "../persistence/interface";
+import type { AICallLogger } from "../persistence/interface.js";
 import type { StepApi } from "./steps";
 
 export type { StepApi } from "./steps";
@@ -143,11 +145,20 @@ export interface StageContext<
   onProgress: (update: ProgressUpdate) => void;
 
   // Logging
+  /**
+   * AI helper scoped to `workflow.${workflowRunId}.stage.${stageId}`.
+   * It is created lazily when first accessed.
+   */
+  readonly ai: AIHelper;
+  /** Logger used by the scoped AI helper for call-cost records. */
+  readonly aiLogger: AICallLogger;
+  /** Emit a log entry without waiting for persistence; returns void. */
   onLog: (
     level: LogLevel,
     message: string,
     meta?: Record<string, unknown>,
   ) => void;
+  /** Convenience alias for onLog; returns void. */
   log: (
     level: LogLevel,
     message: string,
@@ -196,11 +207,20 @@ export interface CheckCompletionContext<TConfig> {
   config: TConfig;
 
   // Logging
+  /**
+   * AI helper scoped to `workflow.${workflowRunId}.stage.${stageId}`.
+   * It is created lazily when first accessed.
+   */
+  readonly ai: AIHelper;
+  /** Logger used by the scoped AI helper for call-cost records. */
+  readonly aiLogger: AICallLogger;
+  /** Emit a log entry without waiting for persistence; returns void. */
   onLog: (
     level: LogLevel,
     message: string,
     meta?: Record<string, unknown>,
   ) => void;
+  /** Convenience alias for onLog; returns void. */
   log: (
     level: LogLevel,
     message: string,

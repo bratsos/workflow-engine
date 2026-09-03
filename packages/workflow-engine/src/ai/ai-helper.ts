@@ -114,6 +114,8 @@ class AIHelperImpl implements AIHelper {
       aiCallLogger: this.aiCallLogger,
       providerResolver: this.providerResolver,
       routing: this.options?.routing,
+      adapter: this.options?.adapter,
+      timeout: this.options?.timeout,
     };
   }
 
@@ -235,7 +237,7 @@ class AIHelperImpl implements AIHelper {
           "recordCall: legacy API requires prompt, response, and tokens",
         );
       }
-      modelKey = paramsOrModelKey as ModelKey;
+      modelKey = paramsOrModelKey;
       actualPrompt = prompt;
       actualResponse = response;
       inputTokens = tokens.input;
@@ -319,8 +321,18 @@ export {
   getEmbeddingModelProvider,
   registerEmbeddingProvider,
 } from "./embeddings";
+export { AICallTimeoutError } from "./errors.js";
 export type { ModelKey } from "./model-helper";
 export type {
+  AdapterEmbedRequest,
+  AdapterEmbedResponse,
+  AdapterObjectRequest,
+  AdapterObjectResponse,
+  AdapterStreamRequest,
+  AdapterStreamResponse,
+  AdapterTextRequest,
+  AdapterTextResponse,
+  AIAdapter,
   AIBatch,
   AIBatchHandle,
   AIBatchProvider,

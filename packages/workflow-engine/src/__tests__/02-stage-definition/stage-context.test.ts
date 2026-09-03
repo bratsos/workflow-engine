@@ -18,7 +18,11 @@ import type { StageContext } from "../../core/stage.js";
 import { defineStage } from "../../core/stage-factory.js";
 import type { ProgressUpdate } from "../../core/types.js";
 import { WorkflowBuilder } from "../../core/workflow.js";
-import { createTestKernel } from "../utils/index.js";
+import { InMemoryAICallLogger } from "../../testing/in-memory-ai-logger.js";
+import { createMockAIHelper, createTestKernel } from "../utils/index.js";
+
+const testAi = createMockAIHelper("test");
+const testAiLogger = new InMemoryAICallLogger();
 
 /** Helper: create run, mark RUNNING, execute stage, return result */
 async function runSingleStageWorkflow(
@@ -938,6 +942,8 @@ function createMockContext(overrides: {
     input: overrides.input ?? {},
     config: {},
     workflowContext: {},
+    ai: testAi,
+    aiLogger: testAiLogger,
     onProgress: overrides.onProgress ?? (() => {}),
     onLog: () => {},
     log: () => {},

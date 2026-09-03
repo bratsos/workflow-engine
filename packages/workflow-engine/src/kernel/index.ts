@@ -37,7 +37,10 @@ export type {
   StepSignalResult,
 } from "./commands.js";
 // Kernel errors
-export { IdempotencyInProgressError } from "./errors.js";
+export {
+  AIServicesNotConfiguredError,
+  IdempotencyInProgressError,
+} from "./errors.js";
 
 // Event types
 export type {
@@ -107,6 +110,7 @@ export type {
   ActivityExecutor,
   ActivityRunInput,
   ActivityRunResult,
+  AIHelperFactory,
   AnnotationActor,
   AnnotationFilters,
   AnnotationScope,
@@ -119,6 +123,7 @@ export type {
   ExecutorDeps,
   IdempotencyRecord,
   JobTransport,
+  KernelServices,
   OutboxRecord,
   Persistence,
   Scheduler,

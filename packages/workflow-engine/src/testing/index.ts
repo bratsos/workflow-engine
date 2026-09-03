@@ -35,6 +35,20 @@
  * ```
  */
 
+export type {
+  MockAIHelperConfig,
+  MockAIHelperFactory,
+  MockBatchResult,
+  MockEmbedResponse,
+  MockObjectResponse,
+  MockTextResponse,
+  RecordedCall,
+} from "../__tests__/utils/mock-ai-helper.js";
+export {
+  createMockAIHelper,
+  createMockAIHelperFactory,
+  MockAIHelper,
+} from "../__tests__/utils/mock-ai-helper.js";
 export { InMemoryAICallLogger } from "./in-memory-ai-logger.js";
 export { InMemoryJobQueue } from "./in-memory-job-queue.js";
 export { InMemoryWorkflowPersistence } from "./in-memory-persistence.js";

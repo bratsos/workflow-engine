@@ -8,7 +8,11 @@ import { describe, expect, expectTypeOf, it } from "vitest";
 import { z } from "zod";
 import type { StageContext } from "../../core/stage.js";
 import { defineStage } from "../../core/stage-factory.js";
-import { TestSchemas } from "../utils/index.js";
+import { InMemoryAICallLogger } from "../../testing/in-memory-ai-logger.js";
+import { createMockAIHelper, TestSchemas } from "../utils/index.js";
+
+const testAi = createMockAIHelper("test");
+const testAiLogger = new InMemoryAICallLogger();
 
 describe("I want to define synchronous stages", () => {
   describe("basic stage creation", () => {
@@ -102,6 +106,8 @@ describe("I want to define synchronous stages", () => {
         input: { value: 21 },
         config: {},
         workflowContext: {},
+        ai: testAi,
+        aiLogger: testAiLogger,
         onProgress: () => {},
         onLog: () => {},
         log: () => {},
@@ -199,6 +205,8 @@ describe("I want to define synchronous stages", () => {
         workflowContext: {
           "previous-stage": { someData: "value" },
         },
+        ai: testAi,
+        aiLogger: testAiLogger,
         onProgress: () => {},
         onLog: () => {},
         log: () => {},
@@ -350,6 +358,8 @@ describe("I want to define synchronous stages", () => {
         workflowContext: {
           "previous-stage": { important: "data" },
         },
+        ai: testAi,
+        aiLogger: testAiLogger,
         onProgress: () => {},
         onLog: () => {},
         log: () => {},
@@ -399,6 +409,8 @@ describe("I want to define synchronous stages", () => {
         input: {},
         config: {},
         workflowContext: {},
+        ai: testAi,
+        aiLogger: testAiLogger,
         onProgress: () => {},
         onLog: () => {},
         log: () => {},
@@ -448,6 +460,8 @@ describe("I want to define synchronous stages", () => {
         input: {},
         config: {},
         workflowContext: {},
+        ai: testAi,
+        aiLogger: testAiLogger,
         onProgress: () => {},
         onLog: () => {},
         log: () => {},
@@ -505,6 +519,8 @@ describe("I want to define synchronous stages", () => {
         input: { items: ["a", "b", "c"] },
         config: {},
         workflowContext: {},
+        ai: testAi,
+        aiLogger: testAiLogger,
         onProgress: () => {},
         onLog: () => {},
         log: () => {},
@@ -606,6 +622,8 @@ describe("I want to define synchronous stages", () => {
         input: {},
         config: {},
         workflowContext: { "upstream-stage": { value: "hi", count: 1 } },
+        ai: testAi,
+        aiLogger: testAiLogger,
         onProgress: () => {},
         onLog: () => {},
         log: () => {},

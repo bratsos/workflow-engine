@@ -30,6 +30,9 @@ import type {
   TextOptions,
 } from "../../ai/ai-helper.js";
 import type { ModelKey } from "../../ai/model-helper.js";
+import { getModel } from "../../ai/model-helper.js";
+import type { AIHelperFactory } from "../../kernel/ports.js";
+import type { AICallLogger } from "../../persistence/interface.js";
 
 // ============================================================================
 // Types
@@ -109,11 +112,13 @@ export class MockAIHelper implements AIHelper {
   private calls: RecordedCall[] = [];
   private children: MockAIHelper[] = [];
   private parent?: MockAIHelper;
+  private callLogger?: AICallLogger;
 
   constructor(
     topic: string,
     config: MockAIHelperConfig = {},
     parent?: MockAIHelper,
+    callLogger?: AICallLogger,
   ) {
     this.topic = topic;
     this.config = {
@@ -138,6 +143,7 @@ export class MockAIHelper implements AIHelper {
       ...config,
     };
     this.parent = parent;
+    this.callLogger = callLogger;
   }
 
   // ============================================================================
@@ -334,9 +340,19 @@ export class MockAIHelper implements AIHelper {
     const newTopic = id
       ? `${this.topic}.${segment}.${id}`
       : `${this.topic}.${segment}`;
-    const child = new MockAIHelper(newTopic, this.config, this);
+    const child = new MockAIHelper(
+      newTopic,
+      this.config,
+      this,
+      this.callLogger,
+    );
     this.children.push(child);
     return child;
+  }
+
+  /** Create a helper at an exact topic while sharing this mock's state. */
+  createAtTopic(topic: string, callLogger?: AICallLogger): MockAIHelper {
+    return new MockAIHelper(topic, this.config, this, callLogger);
   }
 
   // ============================================================================
@@ -373,7 +389,7 @@ export class MockAIHelper implements AIHelper {
     } else {
       this.recordCallInternal({
         type: options?.callType ?? "text",
-        modelKey: paramsOrModelKey as ModelKey,
+        modelKey: paramsOrModelKey,
         prompt: prompt ?? "",
         response: response ?? "",
         inputTokens: tokens?.input ?? 0,
@@ -588,11 +604,31 @@ export class MockAIHelper implements AIHelper {
     }
   }
 
-  private recordCallInternal(call: RecordedCall): void {
+  private recordCallInternal(call: RecordedCall, writeLog = true): void {
     this.calls.push(call);
+    if (writeLog && this.callLogger) {
+      let modelId = call.modelKey;
+      try {
+        modelId = getModel(call.modelKey).id;
+      } catch {
+        // Mock calls intentionally allow unregistered model keys.
+      }
+      this.callLogger.logCall({
+        topic: this.topic,
+        callType: call.type,
+        modelKey: call.modelKey,
+        modelId,
+        prompt: call.prompt,
+        response: call.response,
+        inputTokens: call.inputTokens,
+        outputTokens: call.outputTokens,
+        cost: call.cost,
+        metadata: call.options,
+      });
+    }
     // Also propagate to parent for aggregate stats
     if (this.parent) {
-      this.parent.recordCallInternal(call);
+      this.parent.recordCallInternal(call, false);
     }
   }
 }
@@ -800,4 +836,34 @@ export function createMockAIHelper(
   config: MockAIHelperConfig = {},
 ): MockAIHelper {
   return new MockAIHelper(topic, config);
+}
+
+export type MockAIHelperFactory = AIHelperFactory & {
+  readonly helper: MockAIHelper;
+  setTextResponse: MockAIHelper["setTextResponse"];
+  setObjectResponse: MockAIHelper["setObjectResponse"];
+  setError: MockAIHelper["setError"];
+  setLatency: MockAIHelper["setLatency"];
+  getCalls: MockAIHelper["getCalls"];
+};
+
+/**
+ * Create a kernel-compatible factory backed by one shared mock. The helper
+ * property and delegated test methods make it possible to seed responses and
+ * inspect calls before/after a stage executes.
+ */
+export function createMockAIHelperFactory(
+  helper: MockAIHelper = new MockAIHelper("test"),
+): MockAIHelperFactory {
+  const factory = ((topic: string, callLogger: AICallLogger) =>
+    helper.createAtTopic(topic, callLogger)) as unknown as MockAIHelperFactory;
+  Object.assign(factory, {
+    helper,
+    setTextResponse: helper.setTextResponse.bind(helper),
+    setObjectResponse: helper.setObjectResponse.bind(helper),
+    setError: helper.setError.bind(helper),
+    setLatency: helper.setLatency.bind(helper),
+    getCalls: helper.getCalls.bind(helper),
+  });
+  return factory;
 }

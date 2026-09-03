@@ -17,8 +17,13 @@
  *  - Scheduler      – deferred command triggers
  */
 
+import type {
+  AIHelper,
+  AIHelperOptions,
+  LogContext,
+  ProviderResolver,
+} from "../ai/types.js";
 import type { StageResult, SuspendedResult } from "../core/types";
-
 import type {
   CreateAnnotationInput,
   DequeueResult,
@@ -26,6 +31,7 @@ import type {
   JobRecord,
   PersistenceCore,
 } from "../persistence/interface";
+import type { AICallLogger } from "../persistence/interface.js";
 
 import type { KernelEvent } from "./events";
 
@@ -93,6 +99,21 @@ export interface StepLedger {
   list(stageRecordId: string): Promise<StepRecord[]>;
   clear(stageRecordId: string): Promise<void>;
 }
+
+/** Services made available lazily to stage execution contexts. */
+export interface KernelServices {
+  aiLogger?: AICallLogger;
+  ai?: AIHelperFactory;
+}
+
+/** Factory signature matching `createAIHelper`. */
+export type AIHelperFactory = (
+  topic: string,
+  logger: AICallLogger,
+  logContext?: LogContext,
+  providerResolver?: ProviderResolver,
+  options?: AIHelperOptions,
+) => AIHelper;
 
 // ============================================================================
 // Clock
@@ -293,6 +314,7 @@ export interface ExecutorDeps {
   blobStore: BlobStore;
   clock: Clock;
   stepLedger?: StepLedger;
+  services?: KernelServices;
 }
 
 /**

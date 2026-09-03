@@ -1,7 +1,12 @@
+import type { AIHelper, LogContext } from "../../ai/types.js";
 import type { StageContext } from "../../core/stage.js";
 import type { ProgressUpdate } from "../../core/types.js";
 import type { Workflow } from "../../core/workflow.js";
-import type { CreateAnnotationInput } from "../../persistence/interface.js";
+import type {
+  AICallLogger,
+  CreateAnnotationInput,
+} from "../../persistence/interface.js";
+import { AIServicesNotConfiguredError } from "../errors.js";
 import type { KernelEvent } from "../events.js";
 import type { ActivityRunInput, ExecutorDeps } from "../ports.js";
 import {
@@ -16,6 +21,68 @@ export interface BuiltStageExecutionContext {
   context: StageContext<any, any, any>;
   progressEvents: KernelEvent[];
   annotationBuffer: ReturnType<typeof createAnnotationBuffer>;
+}
+
+/** Define lazy AI accessors shared by execute and checkCompletion contexts. */
+export function defineLazyAIContext<T extends object>(
+  target: T,
+  params: {
+    workflowRunId: string;
+    stageId: string;
+    stageRecordId?: string;
+  },
+  deps: ExecutorDeps,
+): T & { readonly ai: AIHelper; readonly aiLogger: AICallLogger } {
+  let helper: AIHelper | undefined;
+  const topic = `workflow.${params.workflowRunId}.stage.${params.stageId}`;
+  const stageRecordId = params.stageRecordId ?? params.stageId;
+
+  const configured = () => {
+    const services = deps.services;
+    if (!services?.aiLogger || !services.ai) {
+      throw new AIServicesNotConfiguredError();
+    }
+    return {
+      ai: services.ai,
+      aiLogger: services.aiLogger,
+    };
+  };
+
+  const logContext: LogContext = {
+    workflowRunId: params.workflowRunId,
+    stageRecordId,
+    createLog: (data) => deps.persistence.createLog(data),
+  };
+
+  Object.defineProperties(target, {
+    ai: {
+      enumerable: true,
+      configurable: true,
+      get: () => {
+        if (!helper) {
+          const services = configured();
+          helper = services.ai(
+            topic,
+            services.aiLogger,
+            logContext,
+            undefined,
+            undefined,
+          );
+        }
+        return helper;
+      },
+    },
+    aiLogger: {
+      enumerable: true,
+      configurable: true,
+      get: () => configured().aiLogger,
+    },
+  });
+
+  return target as T & {
+    readonly ai: AIHelper;
+    readonly aiLogger: AICallLogger;
+  };
 }
 
 /**
@@ -44,12 +111,12 @@ export function buildStageExecutionContext(
   const progressEvents: KernelEvent[] = [];
   const annotationBuffer = createAnnotationBuffer();
 
-  const logFn = async (
+  const logFn = (
     level: "DEBUG" | "INFO" | "WARN" | "ERROR",
     message: string,
     meta?: Record<string, unknown>,
-  ) => {
-    await deps.persistence
+  ): void => {
+    void deps.persistence
       .createLog({
         workflowRunId,
         workflowStageId: stageRecordId,
@@ -98,7 +165,7 @@ export function buildStageExecutionContext(
     }
   }) as StageContext<any, any, any>["annotate"];
 
-  const context: StageContext<any, any, any> = {
+  const context = {
     workflowRunId,
     stageId,
     stageNumber,
@@ -129,7 +196,9 @@ export function buildStageExecutionContext(
     annotate: annotateFn,
     storage: createStorageShim(workflowRunId, workflowType, deps),
     workflowContext,
-  };
+  } as StageContext<any, any, any>;
+
+  defineLazyAIContext(context, { workflowRunId, stageId, stageRecordId }, deps);
 
   return { context, progressEvents, annotationBuffer };
 }

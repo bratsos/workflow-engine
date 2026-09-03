@@ -39,7 +39,7 @@ describe("I want to use model helper utilities", () => {
 
     it("should throw for invalid model key", () => {
       // When/Then: Getting invalid model throws
-      expect(() => getModel("invalid-model" as any)).toThrow(/not found/);
+      expect(() => getModel("invalid-model")).toThrow(/not found/);
     });
   });
 
@@ -417,7 +417,7 @@ describe("I want to use model helper utilities", () => {
 
       // Non-batch call
       const regularCost = calculateCostWithDiscount(
-        "batch-pricing-test-model" as any,
+        "batch-pricing-test-model",
         1_000_000,
         1_000_000,
         false,
@@ -426,7 +426,7 @@ describe("I want to use model helper utilities", () => {
 
       // Batch call
       const batchCost = calculateCostWithDiscount(
-        "batch-pricing-test-model" as any,
+        "batch-pricing-test-model",
         1_000_000,
         1_000_000,
         true,

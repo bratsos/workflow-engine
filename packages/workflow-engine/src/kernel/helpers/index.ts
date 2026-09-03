@@ -6,6 +6,7 @@ export {
 export { buildAnnotationEvents } from "./annotation-events.js";
 export {
   buildStageExecutionContext,
+  defineLazyAIContext,
   resolveStageInput,
 } from "./build-stage-execution-context.js";
 export {

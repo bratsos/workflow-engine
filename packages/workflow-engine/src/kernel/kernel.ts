@@ -19,6 +19,7 @@
  * cached result without re-executing the handler.
  */
 
+import { createAIHelper } from "../ai/ai-helper.js";
 import type { Workflow } from "../core/workflow";
 import type {
   AnnotationActor,
@@ -70,6 +71,7 @@ import type {
   Clock,
   EventSink,
   JobTransport,
+  KernelServices,
   Persistence,
   Scheduler,
   StepLedger,
@@ -99,6 +101,8 @@ export interface KernelConfig {
   executor?: ActivityExecutor;
   /** Optional durable step storage. Stages without ctx.step need none. */
   stepLedger?: StepLedger;
+  /** Optional services exposed lazily through stage contexts. */
+  services?: KernelServices;
   /**
    * How long an idempotency key may sit `in_progress` before a subsequent
    * dispatch is allowed to reclaim it. Guards against a dispatcher that
@@ -170,6 +174,7 @@ export interface KernelDeps {
   registry: WorkflowRegistry;
   executor: ActivityExecutor;
   stepLedger?: StepLedger;
+  services?: KernelServices;
 }
 
 // ============================================================================
@@ -248,6 +253,14 @@ export function createKernel(config: KernelConfig): Kernel {
   const idempotencyStaleInProgressMs =
     config.idempotencyStaleInProgressMs ??
     DEFAULT_IDEMPOTENCY_STALE_IN_PROGRESS_MS;
+  const services = config.services
+    ? {
+        ...config.services,
+        ...(config.services.aiLogger && !config.services.ai
+          ? { ai: createAIHelper }
+          : {}),
+      }
+    : undefined;
 
   const deps: KernelDeps = {
     persistence,
@@ -259,6 +272,7 @@ export function createKernel(config: KernelConfig): Kernel {
     registry,
     executor,
     stepLedger: config.stepLedger,
+    services,
   };
 
   /**

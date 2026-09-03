@@ -13,6 +13,7 @@ import type { z } from "zod";
 import type { AICallLogger } from "../persistence";
 import { getModel, type ModelKey } from "./model-helper";
 import { getModelProvider, logger, resolveCost } from "./shared";
+import { createCallTimeout, runWithCallTimeout } from "./timeouts.js";
 import type {
   AICallType,
   AIHelperContext,
@@ -107,10 +108,16 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
   options: TextOptions<TTools> = {} as TextOptions<TTools>,
 ): Promise<AITextResult> {
   const modelConfig = getModel(modelKey);
-  const model =
-    ctx.providerResolver?.(modelConfig) ??
-    getModelProvider(modelConfig, ctx.routing);
+  const model = ctx.adapter?.generateText
+    ? undefined
+    : (ctx.providerResolver?.(modelConfig) ??
+      getModelProvider(modelConfig, ctx.routing));
   const startTime = Date.now();
+  const timeout = createCallTimeout(
+    options.abortSignal,
+    options.timeoutMs ?? ctx.timeout?.perCallMs,
+    modelKey,
+  );
 
   // Determine if we have multimodal content
   const isMultimodal = Array.isArray(prompt);
@@ -182,7 +189,7 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
     ...(options.maxRetries !== undefined && {
       maxRetries: options.maxRetries,
     }),
-    ...(options.abortSignal && { abortSignal: options.abortSignal }),
+    ...(timeout.signal && { abortSignal: timeout.signal }),
     // Provider-specific options (e.g. reasoning control) passed through.
     // Cast: the public type uses `unknown` values for DX; the consumer is
     // responsible for passing JSON-serializable provider options.
@@ -224,15 +231,35 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
     // Cast to the SDK's own param type (not `any`) to bypass NoInfer<TTools>
     // while still catching a future SDK shape change at compile time.
     // Our TextOptions<TTools> provides proper typing at the interface level.
-    const result = isMultimodal
-      ? await aiGenerateText({
-          ...baseOptions,
-          messages: buildMultimodalMessages(prompt as ContentPart[]),
-        } as Parameters<typeof aiGenerateText>[0])
-      : await aiGenerateText({
-          ...baseOptions,
-          prompt,
-        } as Parameters<typeof aiGenerateText>[0]);
+    const isAdapter = ctx.adapter?.generateText !== undefined;
+    const result = isAdapter
+      ? await runWithCallTimeout(timeout, (signal) =>
+          ctx.adapter!.generateText!({
+            model: modelConfig,
+            prompt,
+            options: {
+              ...options,
+              abortSignal: signal,
+              ...(hasTools
+                ? {
+                    onStepEnd:
+                      wrappedOnStepEnd as TextOptions<TTools>["onStepEnd"],
+                  }
+                : {}),
+            } as TextOptions<TTools>,
+          }),
+        )
+      : await runWithCallTimeout(timeout, () =>
+          isMultimodal
+            ? aiGenerateText({
+                ...baseOptions,
+                messages: buildMultimodalMessages(prompt as ContentPart[]),
+              } as Parameters<typeof aiGenerateText>[0])
+            : aiGenerateText({
+                ...baseOptions,
+                prompt,
+              } as Parameters<typeof aiGenerateText>[0]),
+        );
 
     // Debug logging for result
     if (hasTools || hasOutputSchema) {
@@ -248,22 +275,35 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
         }
       }
       logger.debug(
-        `generateText result: stepsCount=${resultAny.steps?.length ?? 0}, hasOutput=${hasOutput}, finishReason=${result.finishReason}`,
+        `generateText result: stepsCount=${resultAny.steps?.length ?? 0}, hasOutput=${hasOutput}, finishReason=${(result as { finishReason?: unknown }).finishReason}`,
       );
     }
 
-    const inputTokens = result.usage?.inputTokens ?? 0;
-    const outputTokens = result.usage?.outputTokens ?? 0;
+    const resultAny = result as unknown as {
+      text: string;
+      inputTokens?: number;
+      outputTokens?: number;
+      usage?: { inputTokens?: number; outputTokens?: number };
+      providerMetadata?: Record<string, unknown>;
+      finishReason?: unknown;
+      reasoningText?: string;
+      reasoning?: string;
+      output?: unknown;
+    };
+    const inputTokens =
+      resultAny.inputTokens ?? resultAny.usage?.inputTokens ?? 0;
+    const outputTokens =
+      resultAny.outputTokens ?? resultAny.usage?.outputTokens ?? 0;
     const { cost, reportedCostUsd, costSource } = resolveCost(
       modelKey,
       inputTokens,
       outputTokens,
-      result,
+      isAdapter ? { providerMetadata: resultAny.providerMetadata } : result,
     );
     const durationMs = Date.now() - startTime;
     // Reasoning models emit on a separate channel; surface it so a
     // reasoning-only response isn't seen as empty output.
-    const reasoning = (result as { reasoningText?: string }).reasoningText;
+    const reasoning = resultAny.reasoningText ?? resultAny.reasoning;
 
     // Log the call (including error cases where finishReason is "error")
     ctx.aiCallLogger.logCall({
@@ -272,7 +312,7 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
       modelKey,
       modelId: modelConfig.id,
       prompt: promptForLog,
-      response: result.text,
+      response: resultAny.text,
       inputTokens,
       outputTokens,
       cost,
@@ -281,11 +321,11 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
       metadata: {
         temperature: options.temperature,
         maxTokens: options.maxTokens,
-        finishReason: result.finishReason,
+        finishReason: resultAny.finishReason,
         durationMs,
         isMultimodal,
         ...(reasoning ? { hasReasoning: true } : {}),
-        ...(result.finishReason === "error" && { status: "error" }),
+        ...(resultAny.finishReason === "error" && { status: "error" }),
         ...(isMultimodal && {
           mediaTypes: (prompt as ContentPart[])
             .filter((p): p is MediaPart => p.type === "file")
@@ -298,16 +338,17 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
     logger.debug(`generateText response`, {
       model: modelKey,
       response:
-        result.text.substring(0, 500) + (result.text.length > 500 ? "..." : ""),
+        resultAny.text.substring(0, 500) +
+        (resultAny.text.length > 500 ? "..." : ""),
       inputTokens,
       outputTokens,
       cost: cost.toFixed(6),
       durationMs,
-      finishReason: result.finishReason,
+      finishReason: resultAny.finishReason,
     });
 
     return {
-      text: result.text,
+      text: resultAny.text,
       inputTokens,
       outputTokens,
       cost,
@@ -316,7 +357,7 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
       ...(reasoning ? { reasoning } : {}),
       // Include structured output if `output` was used
       ...(hasOutputSchema && {
-        output: (result as { output?: unknown }).output,
+        output: resultAny.output,
       }),
     };
   } catch (error) {
@@ -341,6 +382,8 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
       durationMs,
     });
     throw error;
+  } finally {
+    timeout.cleanup();
   }
 }
 
@@ -352,10 +395,16 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
   options: ObjectOptions = {},
 ): Promise<AIObjectResult<z.infer<TSchema>>> {
   const modelConfig = getModel(modelKey);
-  const model =
-    ctx.providerResolver?.(modelConfig) ??
-    getModelProvider(modelConfig, ctx.routing);
+  const model = ctx.adapter?.generateObject
+    ? undefined
+    : (ctx.providerResolver?.(modelConfig) ??
+      getModelProvider(modelConfig, ctx.routing));
   const startTime = Date.now();
+  const timeout = createCallTimeout(
+    options.abortSignal,
+    options.timeoutMs ?? ctx.timeout?.perCallMs,
+    modelKey,
+  );
 
   // Determine if we have multimodal content
   const isMultimodal = Array.isArray(prompt);
@@ -374,7 +423,7 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
     ...(options.maxRetries !== undefined && {
       maxRetries: options.maxRetries,
     }),
-    ...(options.abortSignal && { abortSignal: options.abortSignal }),
+    ...(timeout.signal && { abortSignal: timeout.signal }),
     // Provider-specific options (e.g. reasoning control) passed through.
     // Cast: the public type uses `unknown` values for DX; the consumer is
     // responsible for passing JSON-serializable provider options.
@@ -402,34 +451,62 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
   });
 
   try {
-    const result = isMultimodal
-      ? await aiGenerateText({
-          ...baseOptions,
-          messages: buildMultimodalMessages(prompt as ContentPart[]),
-        })
-      : await aiGenerateText({
-          ...baseOptions,
-          prompt,
-        });
+    const isAdapter = ctx.adapter?.generateObject !== undefined;
+    const result = isAdapter
+      ? await runWithCallTimeout(timeout, (signal) =>
+          ctx.adapter!.generateObject!({
+            model: modelConfig,
+            prompt,
+            schema,
+            options: { ...options, abortSignal: signal },
+          }),
+        )
+      : await runWithCallTimeout(timeout, () =>
+          isMultimodal
+            ? aiGenerateText({
+                ...baseOptions,
+                model: model!,
+                messages: buildMultimodalMessages(prompt as ContentPart[]),
+              })
+            : aiGenerateText({
+                ...baseOptions,
+                model: model!,
+                prompt,
+              }),
+        );
 
-    const inputTokens = result.usage?.inputTokens ?? 0;
-    const outputTokens = result.usage?.outputTokens ?? 0;
+    const resultAny = result as unknown as {
+      output: unknown;
+      inputTokens?: number;
+      outputTokens?: number;
+      usage?: { inputTokens?: number; outputTokens?: number };
+      providerMetadata?: Record<string, unknown>;
+      finishReason?: unknown;
+      reasoningText?: string;
+      reasoning?: string;
+    };
+
+    const inputTokens =
+      resultAny.inputTokens ?? resultAny.usage?.inputTokens ?? 0;
+    const outputTokens =
+      resultAny.outputTokens ?? resultAny.usage?.outputTokens ?? 0;
     const { cost, reportedCostUsd, costSource } = resolveCost(
       modelKey,
       inputTokens,
       outputTokens,
-      result,
+      isAdapter ? { providerMetadata: resultAny.providerMetadata } : result,
     );
     const durationMs = Date.now() - startTime;
 
     // Log the call (including error cases where finishReason is "error")
+    const reasoning = resultAny.reasoningText ?? resultAny.reasoning;
     ctx.aiCallLogger.logCall({
       topic: ctx.topic,
       callType: "object",
       modelKey,
       modelId: modelConfig.id,
       prompt: promptForLog,
-      response: JSON.stringify(result.output, null, 2),
+      response: JSON.stringify(resultAny.output, null, 2),
       inputTokens,
       outputTokens,
       cost,
@@ -438,10 +515,11 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
       metadata: {
         temperature: options.temperature,
         maxTokens: options.maxTokens,
-        finishReason: result.finishReason,
+        finishReason: resultAny.finishReason,
         durationMs,
         isMultimodal,
-        ...(result.finishReason === "error" && { status: "error" }),
+        ...(resultAny.finishReason === "error" && { status: "error" }),
+        ...(reasoning ? { hasReasoning: true } : {}),
         ...(isMultimodal && {
           mediaTypes: (prompt as ContentPart[])
             .filter((p): p is MediaPart => p.type === "file")
@@ -451,7 +529,7 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
     });
 
     // Trace log after successful AI call
-    const responseStr = JSON.stringify(result.output);
+    const responseStr = JSON.stringify(resultAny.output);
     logger.debug(`generateObject response`, {
       model: modelKey,
       response:
@@ -460,16 +538,17 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
       outputTokens,
       cost: cost.toFixed(6),
       durationMs,
-      finishReason: result.finishReason,
+      finishReason: resultAny.finishReason,
     });
 
     return {
-      object: result.output as z.infer<TSchema>,
+      object: resultAny.output as z.infer<TSchema>,
       inputTokens,
       outputTokens,
       cost,
       ...(reportedCostUsd !== undefined ? { reportedCostUsd } : {}),
       costSource,
+      ...(reasoning ? { reasoning } : {}),
     };
   } catch (error) {
     const { errorMessage, durationMs } = logFailure(ctx.aiCallLogger, {
@@ -493,5 +572,7 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
       durationMs,
     });
     throw error;
+  } finally {
+    timeout.cleanup();
   }
 }

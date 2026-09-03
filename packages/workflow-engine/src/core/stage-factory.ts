@@ -560,36 +560,60 @@ function createEnhancedContext<
 >(
   context: StageContext<TInput, TConfig, TContext>,
 ): EnhancedStageContext<TInput, TConfig, TContext> {
-  return {
-    ...context,
-    step: context.step as StepApi,
+  const enhancedContext = Object.create(
+    Object.getPrototypeOf(context),
+  ) as EnhancedStageContext<TInput, TConfig, TContext>;
+  Object.defineProperties(
+    enhancedContext,
+    Object.getOwnPropertyDescriptors(context),
+  );
 
-    onProgress(update) {
-      context.onProgress({
-        stageId: context.stageId,
-        stageName: context.stageName,
-        ...update,
-      });
+  Object.defineProperties(enhancedContext, {
+    step: {
+      configurable: true,
+      value: context.step as StepApi,
     },
 
-    require<K extends keyof TContext>(stageId: K): TContext[K] {
-      const output = context.workflowContext[stageId as string];
-      if (output === undefined) {
-        const availableStages = Object.keys(context.workflowContext);
-        throw new Error(
-          `Missing required stage output: "${String(stageId)}". ` +
-            `Available stages: ${availableStages.length > 0 ? availableStages.join(", ") : "(none)"}`,
-        );
-      }
-      return output as TContext[K];
+    onProgress: {
+      configurable: true,
+      value(
+        update: Omit<ProgressUpdate, "stageId" | "stageName"> &
+          Partial<Pick<ProgressUpdate, "stageId" | "stageName">>,
+      ) {
+        context.onProgress({
+          stageId: context.stageId,
+          stageName: context.stageName,
+          ...update,
+        });
+      },
     },
 
-    optional<K extends keyof TContext>(stageId: K): TContext[K] | undefined {
-      return context.workflowContext[stageId as string] as
-        | TContext[K]
-        | undefined;
+    require: {
+      configurable: true,
+      value<K extends keyof TContext>(stageId: K): TContext[K] {
+        const output = context.workflowContext[stageId as string];
+        if (output === undefined) {
+          const availableStages = Object.keys(context.workflowContext);
+          throw new Error(
+            `Missing required stage output: "${String(stageId)}". ` +
+              `Available stages: ${availableStages.length > 0 ? availableStages.join(", ") : "(none)"}`,
+          );
+        }
+        return output as TContext[K];
+      },
     },
-  };
+
+    optional: {
+      configurable: true,
+      value<K extends keyof TContext>(stageId: K): TContext[K] | undefined {
+        return context.workflowContext[stageId as string] as
+          | TContext[K]
+          | undefined;
+      },
+    },
+  });
+
+  return enhancedContext;
 }
 
 function durableSuspendedResult(error: StepSuspend): SuspendedResult {
