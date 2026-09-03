@@ -14,9 +14,9 @@ import type { AICallLogger } from "../persistence";
 import { calculateCost, getModel, type ModelKey } from "./model-helper";
 import {
   explainRoutingError,
-  getModelProvider,
   logger,
   resolveCost,
+  resolveLanguageModel,
 } from "./shared";
 import { createCallTimeout, runWithCallTimeout } from "./timeouts.js";
 import type {
@@ -169,8 +169,7 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
   const modelConfig = getModel(modelKey);
   const model = ctx.adapter?.generateText
     ? undefined
-    : (ctx.providerResolver?.(modelConfig) ??
-      getModelProvider(modelConfig, ctx.routing));
+    : resolveLanguageModel(ctx, modelConfig);
   const startTime = Date.now();
   const timeout = createCallTimeout(
     options.abortSignal,
@@ -469,8 +468,7 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
   const modelConfig = getModel(modelKey);
   const model = ctx.adapter?.generateObject
     ? undefined
-    : (ctx.providerResolver?.(modelConfig) ??
-      getModelProvider(modelConfig, ctx.routing));
+    : resolveLanguageModel(ctx, modelConfig);
   const startTime = Date.now();
   const timeout = createCallTimeout(
     options.abortSignal,

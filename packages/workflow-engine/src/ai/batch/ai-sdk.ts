@@ -10,6 +10,7 @@ import type {
   LanguageModelV4Prompt,
   LanguageModelV4Text,
 } from "@ai-sdk/provider";
+import { toPortableJsonSchema } from "../schema-portability";
 import {
   createGoogleBatchFetch,
   type FetchLike,
@@ -149,9 +150,15 @@ export function fromAiSdk(
             | LanguageModelV4CallOptions["responseFormat"]
             | undefined;
           if (req.schema) {
+            // OpenAI's batch endpoint applies the same strict rules as its
+            // realtime one (no `oneOf`); Google's schema is substituted at
+            // the fetch boundary and Anthropic takes JSON Schema as is.
+            const jsonSchema = opts.provider.startsWith("openai")
+              ? toPortableJsonSchema(toJsonSchema(req.schema), "openai")
+              : toJsonSchema(req.schema);
             responseFormat = {
               type: "json",
-              schema: toJsonSchema(req.schema) as JSONSchema7,
+              schema: jsonSchema as JSONSchema7,
             };
           }
 

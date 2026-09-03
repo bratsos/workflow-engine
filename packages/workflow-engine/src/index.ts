@@ -142,6 +142,10 @@ export {
   type ModelSyncConfig,
   registerModels,
 } from "./ai/model-helper";
+export {
+  type SchemaTarget,
+  toPortableJsonSchema,
+} from "./ai/schema-portability";
 export type {
   AIConfig,
   ConcurrencyConfig,

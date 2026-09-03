@@ -15,6 +15,8 @@ import {
   type ModelConfig,
   type ModelKey,
 } from "./model-helper";
+import { schemaTargetForModel, withPortableSchema } from "./schema-portability";
+import type { AIHelperContext } from "./types";
 
 export const logger = createLogger("AIHelper");
 
@@ -89,6 +91,21 @@ export function getModelProvider(
     `Unsupported provider "${modelConfig.provider}" for model "${modelConfig.id}". ` +
       `Use a built-in provider ("openrouter", "google") or supply a providerResolver.`,
   );
+}
+
+/**
+ * The language model for a registry entry — the helper's `providerResolver`
+ * first, then the built-in providers — wrapped so structured-output
+ * requests carry a schema the target accepts (see schema-portability.ts).
+ */
+export function resolveLanguageModel(
+  ctx: Pick<AIHelperContext, "providerResolver" | "routing">,
+  modelConfig: ModelConfig,
+): LanguageModelV4 {
+  const model =
+    ctx.providerResolver?.(modelConfig) ??
+    getModelProvider(modelConfig, ctx.routing);
+  return withPortableSchema(model, schemaTargetForModel(modelConfig, model));
 }
 
 export interface ProviderResultLike {

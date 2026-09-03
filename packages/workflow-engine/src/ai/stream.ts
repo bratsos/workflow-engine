@@ -11,7 +11,7 @@ import type { GenerateTextEndEvent, ToolSet } from "ai";
 import { streamText as aiStreamText } from "ai";
 import { logFailure } from "./generate";
 import { getModel, type ModelKey } from "./model-helper";
-import { getModelProvider, logger, resolveCost } from "./shared";
+import { logger, resolveCost, resolveLanguageModel } from "./shared";
 import {
   createCallTimeout,
   runWithCallTimeout,
@@ -34,8 +34,7 @@ export function streamText(
   const modelConfig = getModel(modelKey);
   const model = ctx.adapter?.streamText
     ? undefined
-    : (ctx.providerResolver?.(modelConfig) ??
-      getModelProvider(modelConfig, ctx.routing));
+    : resolveLanguageModel(ctx, modelConfig);
   const startTime = Date.now();
   const timeout = createCallTimeout(
     options.abortSignal,

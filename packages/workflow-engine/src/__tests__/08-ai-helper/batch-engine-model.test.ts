@@ -364,6 +364,29 @@ describe("Batch Subsystem - AI SDK Adapter (fromAiSdk)", () => {
     });
   });
 
+  it("rewrites oneOf to anyOf for an OpenAI batch model and leaves other vendors' schemas as emitted", async () => {
+    const union = z.object({
+      item: z.discriminatedUnion("kind", [
+        z.object({ kind: z.literal("a") }),
+        z.object({ kind: z.literal("b") }),
+      ]),
+    });
+    for (const [provider, expectOneOf] of [
+      ["openai.responses", false],
+      ["anthropic.messages", true],
+    ] as const) {
+      const mock = new MockBatchLanguageModel();
+      const engineModel = fromAiSdk(mock, { provider, modelId: "m" });
+      await engineModel.start([{ id: "r1", prompt: "p", schema: union }]);
+      const sent = JSON.stringify(
+        (mock.startBatchCalls[0]!.requests[0]!.options.responseFormat as any)
+          .schema,
+      );
+      expect(sent.includes("oneOf")).toBe(expectOneOf);
+      expect(sent.includes("anyOf")).toBe(!expectOneOf);
+    }
+  });
+
   it("sends the engine's union-preserving responseSchema on Google batches", async () => {
     const bodies: string[] = [];
     const mockFetch = vi.fn(
@@ -697,6 +720,47 @@ describe("Batch Subsystem - OpenRouter Fetch Client (createOpenRouterBatchModel)
     expect(
       reqBody.response_format?.json_schema?.schema?.properties?.category,
     ).toBeDefined();
+  });
+
+  it("sends a discriminated union as anyOf (OpenAI strict mode rejects oneOf)", async () => {
+    let capturedBody = "";
+    const mockFetch = vi.fn(
+      async (_url: string | URL | Request, init?: RequestInit) => {
+        capturedBody = init?.body as string;
+        return new Response(
+          JSON.stringify({ id: "batch-or-union", status: "validating" }),
+          { status: 202, headers: { "Content-Type": "application/json" } },
+        );
+      },
+    );
+    const model = createOpenRouterBatchModel({
+      apiKey: "test-key",
+      modelId: "openai/gpt-5-nano",
+      fetch: mockFetch as any,
+    });
+    const schema = z.object({
+      sections: z.array(
+        z.discriminatedUnion("kind", [
+          z.object({ kind: z.literal("heading"), text: z.string() }),
+          z.object({ kind: z.literal("paragraph"), text: z.string() }),
+        ]),
+      ),
+    });
+
+    await model.start([{ id: "r1", prompt: "Structure this", schema }]);
+
+    const sent =
+      JSON.parse(capturedBody).requests[0].body.response_format.json_schema
+        .schema;
+    expect(JSON.stringify(sent)).not.toContain("oneOf");
+    expect(sent.$schema).toBeUndefined();
+    expect(sent.properties.sections.items.anyOf).toHaveLength(2);
+    expect(sent.properties.sections.items.anyOf[0].additionalProperties).toBe(
+      false,
+    );
+    expect(sent.properties.sections.items.anyOf[0].properties.kind.const).toBe(
+      "heading",
+    );
   });
 
   it("maps an unrecognized upstream status to failed with a naming error, not to processing", async () => {

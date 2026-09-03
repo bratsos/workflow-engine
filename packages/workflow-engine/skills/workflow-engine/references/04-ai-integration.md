@@ -247,6 +247,10 @@ console.log(result.object);  // Typed as z.infer<typeof OutputSchema>
 // { title: "...", tags: ["tech", "ai"], sentiment: "positive" }
 ```
 
+### Structured output portability
+
+The JSON Schema a Zod schema emits is not what every provider accepts: `z.discriminatedUnion` emits `oneOf`, which OpenAI's strict structured outputs (native, and through OpenRouter) reject with `'oneOf' is not permitted`, and which Gemini silently drops (the union comes back as a flat object). The helper rewrites the schema at the model boundary for every OpenAI, OpenRouter and Google model — `oneOf` → `anyOf`, plus `additionalProperties: false` on every object and no `$schema` for OpenAI — through an AI SDK middleware, so `generateObject`, `generateText` + `Output.object`, `streamText`, `ctx.step.ai.*` and the batch bodies all send a portable schema while validation still runs against your Zod schema. A model from a `providerResolver` is classified by its provider id (`openai…`, `openrouter…`, `google…`); anything else (Anthropic, a custom provider) is sent as emitted. `toPortableJsonSchema(jsonSchema, "openai" | "google")` is exported for a transport of your own.
+
 ### Multimodal with Schema
 
 ```typescript

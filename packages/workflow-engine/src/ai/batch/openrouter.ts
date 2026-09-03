@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { toPortableJsonSchema } from "../schema-portability";
 import {
   type EngineBatchItemResult,
   type EngineBatchModel,
@@ -273,12 +274,14 @@ export function createOpenRouterBatchModel(
           body.temperature = req.temperature;
         }
         if (req.schema !== undefined) {
+          // Strict structured outputs (OpenAI's rules, which OpenRouter
+          // forwards) reject `oneOf`; see schema-portability.ts.
           body.response_format = {
             type: "json_schema",
             json_schema: {
               name: "response",
               strict: true,
-              schema: toJsonSchema(req.schema),
+              schema: toPortableJsonSchema(toJsonSchema(req.schema), "openai"),
             },
           };
         }
