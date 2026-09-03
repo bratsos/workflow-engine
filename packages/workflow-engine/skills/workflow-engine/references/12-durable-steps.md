@@ -51,7 +51,7 @@ const result = await harness.run("my-workflow", { docId: "doc-1" });
 expect(result.status).toBe("COMPLETED");
 ```
 
-The Prisma ledger uses the `WorkflowStep` model from the package's `prisma/schema.prisma` (shipped in `node_modules/@bratsos/workflow-engine/prisma/`); consumers add it, with its `attempt`, `leaseExpiresAt` and `deadlineAt` columns, through a migration. The Prisma adapters also require every model the package schema defines, including `WorkflowAnnotation` (added in 0.8), so a consumer that skipped releases must add the missing models too. The adapters never import `@prisma/client` themselves; they work with any generator output, including Prisma 7's `prisma-client` generator with a custom `output`.
+The Prisma ledger uses the `WorkflowStep` model from the package's `prisma/schema.prisma` (shipped in `node_modules/@bratsos/workflow-engine/prisma/`); consumers add it, with its `attempt`, `leaseExpiresAt` and `deadlineAt` columns, through a migration. The Prisma adapters also require every model *and column* the package schema defines — `migrations/migrate-0.13-to-1.0.md` has the column-level checklist (the `workflow_steps` table, `ai_calls.batchId`/`requestId`, and the columns such as `workflow_stages.attempt`/`version` and `idempotency_keys.createdAt` that every dispatch writes) with SQL, so a consumer that skipped releases can apply them in one migration. The adapters never import `@prisma/client` themselves; they work with any generator output, including Prisma 7's `prisma-client` generator with a custom `output`.
 
 ## The step API
 
