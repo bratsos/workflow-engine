@@ -39,6 +39,11 @@ export interface PrismaJobQueueOptions {
    * Set to "sqlite" when using SQLite (uses optimistic locking instead of FOR UPDATE SKIP LOCKED).
    */
   databaseType?: DatabaseType;
+  /**
+   * Time source for the timestamps the raw dequeue statement writes.
+   * Defaults to `() => new Date()`; bound as a parameter, never `NOW()`.
+   */
+  now?: () => Date;
 }
 
 export class PrismaJobQueue implements JobQueue {
@@ -47,11 +52,14 @@ export class PrismaJobQueue implements JobQueue {
   private enums: PrismaEnumHelper;
   private databaseType: DatabaseType;
 
+  private readonly now: () => Date;
+
   constructor(prisma: PrismaClient, options: PrismaJobQueueOptions = {}) {
     this.prisma = prisma;
     this.workerId = options.workerId || `worker-${process.pid}-${Date.now()}`;
     this.enums = createEnumHelper(prisma);
     this.databaseType = options.databaseType ?? "postgresql";
+    this.now = options.now ?? (() => new Date());
   }
 
   /**
@@ -138,6 +146,7 @@ export class PrismaJobQueue implements JobQueue {
           "Prisma client does not support $queryRaw (required for the Postgres dequeue path)",
         );
       }
+      const now = this.now();
       const result = await this.prisma.$queryRaw<
         Array<{
           id: string;
@@ -153,13 +162,13 @@ export class PrismaJobQueue implements JobQueue {
         SET
           status = 'RUNNING',
           "workerId" = ${this.workerId},
-          "lockedAt" = NOW(),
-          "startedAt" = NOW(),
+          "lockedAt" = ${now},
+          "startedAt" = ${now},
           attempt = attempt + 1
         WHERE id = (
           SELECT id FROM "job_queue"
           WHERE status = 'PENDING'
-            AND ("nextPollAt" IS NULL OR "nextPollAt" <= NOW())
+            AND ("nextPollAt" IS NULL OR "nextPollAt" <= ${now})
           ORDER BY priority DESC, "createdAt" ASC
           LIMIT 1
           FOR UPDATE SKIP LOCKED

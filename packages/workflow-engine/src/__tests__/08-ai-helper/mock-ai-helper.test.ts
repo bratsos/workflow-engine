@@ -4,6 +4,7 @@
  * Tests for the MockAIHelper utility used in testing.
  */
 
+import { Output } from "ai";
 import { beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
 import { InMemoryAICallLogger } from "../../testing/in-memory-ai-logger.js";
@@ -18,6 +19,50 @@ describe("I want to use MockAIHelper in tests", () => {
 
   beforeEach(() => {
     ai = createMockAIHelper("test");
+  });
+
+  describe("generateText with options.output", () => {
+    const schema = z.object({ answer: z.number() });
+
+    it("parses the scripted text as the structured output and validates it", async () => {
+      ai.setTextResponse("extract", { text: '{"answer": 42}' });
+
+      const result = await ai.generateText("gemini-2.5-flash", "extract", {
+        output: Output.object({ schema }),
+      });
+
+      expect(result.text).toBe('{"answer": 42}');
+      expect(result.output).toEqual({ answer: 42 });
+    });
+
+    it("returns a scripted output value as-is", async () => {
+      ai.setTextResponse("extract", {
+        text: "irrelevant",
+        output: { answer: 7 },
+      });
+
+      const result = await ai.generateText("gemini-2.5-flash", "extract", {
+        output: Output.object({ schema }),
+      });
+
+      expect(result.output).toEqual({ answer: 7 });
+    });
+
+    it("rejects a scripted text that does not satisfy the output schema", async () => {
+      ai.setTextResponse("extract", { text: '{"answer": "no"}' });
+
+      await expect(
+        ai.generateText("gemini-2.5-flash", "extract", {
+          output: Output.object({ schema }),
+        }),
+      ).rejects.toMatchObject({ name: "AI_NoObjectGeneratedError" });
+    });
+
+    it("leaves output undefined when the call has no output spec", async () => {
+      ai.setTextResponse("extract", { text: '{"answer": 42}' });
+      const result = await ai.generateText("gemini-2.5-flash", "extract");
+      expect(result.output).toBeUndefined();
+    });
   });
 
   describe("generateText", () => {

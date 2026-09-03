@@ -40,10 +40,10 @@ const allStats = await aiLogger.getStats("workflow");
 
 ### Automatic Workflow Cost Tracking
 
-When a workflow completes, the executor automatically calculates total cost:
+When a run completes, `run.transition` rolls the run's cost up from the AI call logger configured on the kernel (`createKernel({ services: { aiLogger } })`), because every model call made under `workflow.<runId>` — stages, `ctx.step.ai`, batches — is logged there:
 
 ```typescript
-// Inside WorkflowExecutor (automatic)
+// Inside run.transition (automatic when services.aiLogger is set)
 const stats = await aiLogger.getStats(`workflow.${workflowRunId}`);
 await persistence.updateRun(workflowRunId, {
   totalCost: stats.totalCost,
@@ -51,7 +51,7 @@ await persistence.updateRun(workflowRunId, {
 });
 ```
 
-**Result:** `WorkflowRun.totalCost` and `WorkflowRun.totalTokens` are populated automatically.
+**Result:** `WorkflowRun.totalCost` and `WorkflowRun.totalTokens` are populated on completion (and carried on the `workflow:completed` event). Without `services.aiLogger` the kernel falls back to summing the stages' `metrics.totalCost` / `metrics.totalTokens`, which stay 0 unless a stage sets them — that is why runs on 0.x showed `totalCost: 0` while `ai_calls` carried the cost.
 
 ### Using Topics in Stages
 

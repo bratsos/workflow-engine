@@ -46,7 +46,22 @@ export interface PrismaWorkflowPersistenceOptions {
    * Set to true in single-process environments where transactions are not needed.
    */
   skipInteractiveTransactions?: boolean;
+  /**
+   * Name of the Prisma enum behind `status` columns. Defaults to `"Status"`.
+   * The Postgres claim path casts with `::"<name>"` (since 0.11); a schema
+   * that names the enum differently (`WorkflowStatus`) fails with
+   * `42704 type "Status" does not exist` without this.
+   */
+  statusEnumName?: string;
+  /**
+   * Time source for the timestamps the raw claim statement writes. Defaults
+   * to `() => new Date()`. Bound as a parameter rather than `NOW()` so the
+   * value is UTC like every Prisma write, and honours an injected clock.
+   */
+  now?: () => Date;
 }
+
+const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 const IDEMPOTENCY_IN_PROGRESS_MARKER = {
   __workflowEngineState: "in_progress",
@@ -69,14 +84,25 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
   private enums: PrismaEnumHelper;
   private databaseType: DatabaseType;
   private skipTransactions: boolean;
+  private statusEnumName: string;
+  private now: () => Date;
 
   constructor(
     private readonly prisma: PrismaClient,
     options: PrismaWorkflowPersistenceOptions = {},
   ) {
-    this.enums = createEnumHelper(prisma);
+    this.statusEnumName = options.statusEnumName ?? "Status";
+    if (!IDENTIFIER.test(this.statusEnumName)) {
+      throw new Error(
+        `statusEnumName must be a plain SQL identifier, got "${this.statusEnumName}"`,
+      );
+    }
+    this.enums = createEnumHelper(prisma, {
+      statusEnumName: this.statusEnumName,
+    });
     this.databaseType = options.databaseType ?? "postgresql";
     this.skipTransactions = options.skipInteractiveTransactions ?? false;
+    this.now = options.now ?? (() => new Date());
   }
 
   async withTransaction<T>(
@@ -209,11 +235,13 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     return result.count > 0;
   }
 
-  async claimNextPendingRun(): Promise<WorkflowRunRecord | null> {
+  async claimNextPendingRun(options?: {
+    now?: Date;
+  }): Promise<WorkflowRunRecord | null> {
     if (this.databaseType === "sqlite") {
       return this.claimNextPendingRunSqlite();
     }
-    return this.claimNextPendingRunPostgres();
+    return this.claimNextPendingRunPostgres(options?.now ?? this.now());
   }
 
   /**
@@ -224,37 +252,74 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
    * 3. Updates it to RUNNING
    * 4. Returns the claimed run
    */
-  private async claimNextPendingRunPostgres(): Promise<WorkflowRunRecord | null> {
-    // NOTE: deliberately calling `this.prisma.$queryRaw` directly below
-    // rather than destructuring it into a local first -- Prisma's runtime
-    // reads internal state off `this` inside its own method bodies, so an
-    // unbound reference (`const f = this.prisma.$queryRaw; f\`...\``)
-    // throws at call time ("Cannot read properties of undefined").
-    if (!this.prisma.$queryRaw) {
+  private async claimNextPendingRunPostgres(
+    now: Date,
+  ): Promise<WorkflowRunRecord | null> {
+    // NOTE: deliberately calling `this.prisma.$queryRawUnsafe` /
+    // `$queryRaw` directly below rather than destructuring into a local
+    // first -- Prisma's runtime reads internal state off `this` inside its
+    // own method bodies, so an unbound reference throws at call time.
+    //
+    // The enum type name is an identifier, which a tagged template cannot
+    // bind, so the statement is built as text with positional parameters
+    // for every value. Timestamps are bound JS Dates (UTC, and from the
+    // injected clock), never `NOW()`, which writes session-local time into
+    // naive TIMESTAMP columns.
+    const pending = this.enums.status("PENDING");
+    const running = this.enums.status("RUNNING");
+    let results: any[];
+    if (this.prisma.$queryRawUnsafe) {
+      const enumType = `"${this.statusEnumName}"`;
+      results = await this.prisma.$queryRawUnsafe<any[]>(
+        `WITH claimed AS (
+          SELECT id
+          FROM "workflow_runs"
+          WHERE status = $1::${enumType}
+          ORDER BY priority DESC, "createdAt" ASC
+          LIMIT 1
+          FOR UPDATE SKIP LOCKED
+        )
+        UPDATE "workflow_runs"
+        SET status = $2::${enumType},
+            "startedAt" = $3,
+            "updatedAt" = $3,
+            version = version + 1
+        FROM claimed
+        WHERE "workflow_runs".id = claimed.id
+        RETURNING "workflow_runs".*`,
+        pending,
+        running,
+        now,
+      );
+    } else if (this.prisma.$queryRaw) {
+      if (this.statusEnumName !== "Status") {
+        throw new Error(
+          "statusEnumName requires a Prisma client with $queryRawUnsafe (the Postgres claimNextPendingRun path)",
+        );
+      }
+      results = await this.prisma.$queryRaw<any[]>`
+        WITH claimed AS (
+          SELECT id
+          FROM "workflow_runs"
+          WHERE status = ${pending}::"Status"
+          ORDER BY priority DESC, "createdAt" ASC
+          LIMIT 1
+          FOR UPDATE SKIP LOCKED
+        )
+        UPDATE "workflow_runs"
+        SET status = ${running}::"Status",
+            "startedAt" = ${now},
+            "updatedAt" = ${now},
+            version = version + 1
+        FROM claimed
+        WHERE "workflow_runs".id = claimed.id
+        RETURNING "workflow_runs".*
+      `;
+    } else {
       throw new Error(
-        "Prisma client does not support $queryRaw (required for the Postgres claimNextPendingRun path)",
+        "Prisma client does not support $queryRawUnsafe or $queryRaw (required for the Postgres claimNextPendingRun path)",
       );
     }
-    // Note: Table name is "workflow_runs" (snake_case per Prisma @@map convention)
-    // Column names are camelCase (e.g., "createdAt", "startedAt")
-    const results = await this.prisma.$queryRaw<any[]>`
-      WITH claimed AS (
-        SELECT id
-        FROM "workflow_runs"
-        WHERE status = ${this.enums.status("PENDING")}::"Status"
-        ORDER BY priority DESC, "createdAt" ASC
-        LIMIT 1
-        FOR UPDATE SKIP LOCKED
-      )
-      UPDATE "workflow_runs"
-      SET status = ${this.enums.status("RUNNING")}::"Status",
-          "startedAt" = NOW(),
-          "updatedAt" = NOW(),
-          version = version + 1
-      FROM claimed
-      WHERE "workflow_runs".id = claimed.id
-      RETURNING "workflow_runs".*
-    `;
 
     if (results.length === 0) {
       return null;

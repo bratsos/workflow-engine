@@ -94,6 +94,12 @@ export interface EnginePrismaClient {
     ...values: any[]
   ): Promise<T>;
   /**
+   * Raw SQL with positional parameters. Optional; preferred by
+   * `claimNextPendingRunPostgres` because the status enum's type name is an
+   * identifier a tagged template cannot bind (`statusEnumName`).
+   */
+  $queryRawUnsafe?<T = unknown>(query: string, ...values: any[]): Promise<T>;
+  /**
    * Raw parameterized statement (tagged template). Optional -- already
    * guarded with a `typeof ... === "function"` check at its one call site
    * (the advisory-lock statement in `appendOutboxEventsForRun`).

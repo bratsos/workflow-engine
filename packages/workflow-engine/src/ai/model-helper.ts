@@ -24,6 +24,15 @@ export interface ModelConfig {
   batchDiscountPercent?: number;
   /** The ":batch" sibling slug in OpenRouter's catalog, when one exists. */
   batchModelId?: string;
+  /**
+   * Batch transport to prefer for this model when a call names none:
+   * `"openrouter"` routes `ctx.step.ai.map` / `ai.batch(key)` through the
+   * OpenRouter Batch API (the key you already use for realtime calls)
+   * instead of the vendor SDK the slug names. Resolution order is the
+   * call's `batch.provider`, then this, then the slug's native vendor
+   * (google/anthropic/openai), then OpenRouter.
+   */
+  batchProvider?: "google" | "anthropic" | "openai" | "openrouter";
   /** Absolute price of the ":batch" variant, per 1M input tokens. Authoritative; prefer over batchDiscountPercent. */
   batchInputCostPerMillion?: number;
   /** Absolute price of the ":batch" variant, per 1M output tokens. */

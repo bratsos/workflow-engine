@@ -317,8 +317,11 @@ export function createOpenRouterBatchModel(
         const errText = await res.text().catch(() => "");
         const excerpt =
           errText.length > 200 ? `${errText.slice(0, 200)}...` : errText;
+        const hint = /does not have a :batch endpoint/.test(errText)
+          ? ` OpenRouter's Batch API only serves models with a live ":batch" endpoint (the catalog row alone is not enough); pick a model that has one or batch through the vendor transport (ai.batch(modelKey, "<vendor>")).`
+          : "";
         throw new Error(
-          `OpenRouter batch creation failed (HTTP ${res.status}): ${excerpt}`,
+          `OpenRouter batch creation failed (HTTP ${res.status}): ${excerpt}${hint}`,
         );
       }
 

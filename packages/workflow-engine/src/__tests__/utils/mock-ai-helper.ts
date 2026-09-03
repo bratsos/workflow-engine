@@ -45,6 +45,14 @@ export interface MockTextResponse {
   cost?: number;
   /** Optional reasoning text, surfaced via AITextResult.reasoning / getReasoning() */
   reasoning?: string;
+  /**
+   * Structured output returned as `result.output` when the call passes
+   * `options.output` (`generateText` + `Output.object(...)`). When omitted,
+   * `text` is parsed as JSON and validated through the output spec exactly
+   * as the AI SDK does, so a scripted text that does not satisfy the
+   * schema throws `NoObjectGeneratedError` like the real helper.
+   */
+  output?: unknown;
 }
 
 export interface MockObjectResponse<T = unknown> {
@@ -137,6 +145,50 @@ export interface RecordedCall {
 // MockAIHelper Implementation
 // ============================================================================
 
+/**
+ * Structured output for a scripted text response. A scripted `output` is
+ * returned as-is; otherwise the text is parsed and validated through the
+ * AI SDK's own output spec (`Output.object({ schema })` exposes
+ * `parseCompleteOutput`), so the mock rejects a text that does not satisfy
+ * the schema with the same `NoObjectGeneratedError` the real helper throws.
+ */
+async function resolveMockOutput(
+  outputSpec: unknown,
+  response: MockTextResponse,
+  modelKey: string,
+  usage: { inputTokens: number; outputTokens: number },
+): Promise<unknown> {
+  if (response.output !== undefined) return response.output;
+  const spec = outputSpec as {
+    parseCompleteOutput?: (
+      result: { text: string },
+      context: {
+        response: { id: string; timestamp: Date; modelId: string };
+        usage: { inputTokens: number; outputTokens: number };
+        finishReason: string;
+      },
+    ) => Promise<unknown>;
+  };
+  if (typeof spec?.parseCompleteOutput === "function") {
+    return spec.parseCompleteOutput(
+      { text: response.text },
+      {
+        response: { id: "mock", timestamp: new Date(), modelId: modelKey },
+        usage,
+        finishReason: "stop",
+      },
+    );
+  }
+  // Not an AI SDK output spec (a hand-written `{ schema }` stand-in): parse
+  // the text when it is JSON, otherwise leave the output undefined like the
+  // mock always did.
+  try {
+    return JSON.parse(response.text);
+  } catch {
+    return undefined;
+  }
+}
+
 export class MockAIHelper implements AIHelper {
   readonly topic: string;
   private config: MockAIHelperConfig;
@@ -205,6 +257,14 @@ export class MockAIHelper implements AIHelper {
       cost: response.cost ?? 0.001,
       ...(response.reasoning ? { reasoning: response.reasoning } : {}),
     };
+    if (options?.output !== undefined) {
+      result.output = await resolveMockOutput(
+        options.output,
+        response,
+        modelKey,
+        result,
+      );
+    }
 
     this.recordCallInternal({
       type: "text",

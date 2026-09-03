@@ -101,6 +101,9 @@ export function logFailure(
   return { errorMessage, durationMs };
 }
 
+/** Default sampling temperature shared by every text and object call. */
+const DEFAULT_TEMPERATURE = 0.7;
+
 export async function generateText<TTools extends ToolSet = ToolSet>(
   ctx: AIHelperContext,
   modelKey: ModelKey,
@@ -184,7 +187,7 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
   // Build request based on input type
   const baseOptions = {
     model,
-    temperature: options.temperature ?? 0.7,
+    temperature: options.temperature ?? DEFAULT_TEMPERATURE,
     maxOutputTokens: options.maxTokens,
     ...(options.maxRetries !== undefined && {
       maxRetries: options.maxRetries,
@@ -220,7 +223,7 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
     modelId: modelConfig.id,
     prompt:
       promptForLog.substring(0, 500) + (promptForLog.length > 500 ? "..." : ""),
-    temperature: options.temperature ?? 0.7,
+    temperature: options.temperature ?? DEFAULT_TEMPERATURE,
     maxTokens: options.maxTokens,
     hasTools,
     hasOutputSchema,
@@ -428,10 +431,13 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
 
   // Build request using AI SDK v6 pattern: generateText with Output.object()
   // This replaces the deprecated generateObject() and has better provider compatibility
+  // Same request as `generateText` + `Output.object`: the only field that
+  // differed was the default temperature (0 here, 0.7 there), which is the
+  // one difference a consumer saw between the two routes on the same model.
   const baseOptions = {
     model,
     output: Output.object({ schema }),
-    temperature: options.temperature ?? 0,
+    temperature: options.temperature ?? DEFAULT_TEMPERATURE,
     maxOutputTokens: options.maxTokens,
     ...(options.maxRetries !== undefined && {
       maxRetries: options.maxRetries,
@@ -457,7 +463,7 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
     modelId: modelConfig.id,
     prompt:
       promptForLog.substring(0, 500) + (promptForLog.length > 500 ? "..." : ""),
-    temperature: options.temperature ?? 0,
+    temperature: options.temperature ?? DEFAULT_TEMPERATURE,
     maxTokens: options.maxTokens,
     hasTools,
     isMultimodal,

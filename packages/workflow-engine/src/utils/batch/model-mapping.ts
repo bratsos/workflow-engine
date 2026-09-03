@@ -144,7 +144,14 @@ export function resolveModelForProvider(
   const { vendor, nativeId } = parseModelSlug(modelConfig.id);
 
   if (provider === "openrouter") {
-    if (!modelConfig.batchModelId) {
+    // A model that names OpenRouter as its batch transport is batched there
+    // even without a catalog ":batch" row (the cost then falls back to the
+    // base price or `batchDiscountPercent`); the pricing check guards the
+    // models that were merely synced from the catalog.
+    if (
+      !modelConfig.batchModelId &&
+      modelConfig.batchProvider !== "openrouter"
+    ) {
       const hint = NATIVE_VENDORS.has(vendor)
         ? `Use the native "${vendor}" provider instead: ai.batch(modelKey, "${vendor}").`
         : `Pick a model that has a ":batch" variant in OpenRouter's catalog.`;
@@ -208,6 +215,12 @@ export function getBestProviderForModel(
 
   if (!modelConfig.supportsAsyncBatch) {
     return undefined;
+  }
+
+  // A registry-level preference wins over the slug heuristic (explicit
+  // `batch.provider` on the call wins over both).
+  if (modelConfig.batchProvider) {
+    return modelConfig.batchProvider;
   }
 
   const { vendor } = parseModelSlug(modelConfig.id);

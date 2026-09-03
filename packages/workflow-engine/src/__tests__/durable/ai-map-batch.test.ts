@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
+import { registerModels } from "../../ai/model-helper.js";
 import { defineStage } from "../../core/stage-factory.js";
 import type { AiMapResult } from "../../core/step-ai.js";
 import { createMockAIHelperFactory } from "../utils/index.js";
@@ -54,6 +55,67 @@ async function setup(
   });
   return { ...h, mock, backend, batchLogs, results: () => captured };
 }
+
+const OPENROUTER_REGISTERED = "ai-map-openrouter-registered-model";
+registerModels({
+  [OPENROUTER_REGISTERED]: {
+    id: "anthropic/claude-haiku-4.5",
+    name: "Haiku via OpenRouter",
+    inputCostPerMillion: 1,
+    outputCostPerMillion: 5,
+    provider: "openrouter",
+    supportsAsyncBatch: true,
+    batchProvider: "openrouter",
+  },
+});
+
+describe("step.ai.map batch provider resolution", () => {
+  it("batches a model whose registration names OpenRouter through OpenRouter, not the vendor SDK", async () => {
+    const mock = createMockAIHelperFactory();
+    const backend = makeFakeBackend();
+    const seen: { modelKey: string; provider: string }[] = [];
+    const stage = defineStage({
+      id: "batch-openrouter-registered",
+      name: "batch-openrouter-registered",
+      schemas: {
+        input: inputSchema,
+        output: outputSchema,
+        config: z.object({}),
+      },
+      async execute(ctx) {
+        const items = Array.from({ length: ctx.input.count }, (_, i) => i);
+        const results = await ctx.step.ai.map("extract", items, {
+          model: OPENROUTER_REGISTERED,
+          policy: "batch",
+          schema: itemSchema,
+          prompt: (item) => `Extract <<${item}>>`,
+          batch: { pollEvery: "60s", timeout: "24h" },
+        });
+        return { output: { done: results.length } };
+      },
+    });
+    const h = await createAiMapHarness({
+      stage,
+      inputSchema,
+      outputSchema,
+      input: { count: 3 },
+      mock,
+      aiFactory: createBatchAwareFactory(
+        mock,
+        backend.model,
+        undefined,
+        (modelKey, provider) => seen.push({ modelKey, provider }),
+      ),
+    });
+
+    await h.execute();
+    await h.settle(60_000);
+    expect((await h.stage())?.status).toBe("COMPLETED");
+    expect(seen).toEqual([
+      { modelKey: OPENROUTER_REGISTERED, provider: "openrouter" },
+    ]);
+  });
+});
 
 describe("step.ai.map batch policy", () => {
   it("submits once, stays suspended across replays, then returns validated results in order", async () => {

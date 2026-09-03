@@ -5,7 +5,10 @@
  */
 
 import { z } from "zod";
-import { resolveModelForProvider } from "../utils/batch/model-mapping";
+import {
+  getProviderModelId,
+  resolveModelForProvider,
+} from "../utils/batch/model-mapping";
 import { resolveAiSdkBatchModel } from "./batch/ai-sdk";
 import {
   type EngineBatchItemResult,
@@ -118,44 +121,66 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
           this.modelKey,
           this.provider,
         );
-        return resolveAiSdkBatchModel(this.provider, nativeModelId, {
-          apiKey: this.options?.apiKey,
-          baseURL: this.options?.baseURL,
-          fetch: this.options?.fetch,
-          onWarning: (message) => {
-            if (this.batchLogFn) this.batchLogFn("WARN", message);
-            else logger.warn(message);
-          },
-        });
+        const warn = (message: string) => {
+          if (this.batchLogFn) this.batchLogFn("WARN", message);
+          else logger.warn(message);
+        };
+        try {
+          return await resolveAiSdkBatchModel(this.provider, nativeModelId, {
+            apiKey: this.options?.apiKey,
+            baseURL: this.options?.baseURL,
+            fetch: this.options?.fetch,
+            onWarning: warn,
+          });
+        } catch (error) {
+          // The vendor SDK is an optional peer. When it is not installed but
+          // OpenRouter can batch the model (a ":batch" catalog row), use the
+          // transport the consumer already has a key for rather than failing
+          // the submit with an install instruction.
+          const missingSdk =
+            error instanceof Error &&
+            /Package ".*" is required/.test(error.message);
+          const viaOpenRouter = getProviderModelId(this.modelKey, "openrouter");
+          if (!missingSdk || !viaOpenRouter) throw error;
+          warn(
+            `${error.message} Falling back to the OpenRouter batch transport for "${this.modelKey}"; set batchProvider: "openrouter" on the model (or batch.provider) to make this explicit.`,
+          );
+          this.provider = "openrouter";
+          return this.createOpenRouterModel();
+        }
       }
 
       if (this.provider === "openrouter") {
-        const modelConfig = getModel(this.modelKey);
-        const apiKey =
-          this.options?.apiKey ??
-          (typeof process !== "undefined"
-            ? process.env?.OPENROUTER_API_KEY
-            : undefined);
-
-        if (!apiKey) {
-          throw new Error(
-            `OpenRouter batch processing requires an API key. ` +
-              `Pass apiKey in BatchOptions or set the OPENROUTER_API_KEY environment variable.`,
-          );
-        }
-
-        return createOpenRouterBatchModel({
-          apiKey,
-          modelId: modelConfig.id,
-          baseURL: this.options?.baseURL,
-          fetch: this.options?.fetch,
-          endpoint: this.options?.endpoint,
-        });
+        return this.createOpenRouterModel();
       }
 
       const _exhaustive: never = this.provider;
       throw new Error(`Unsupported batch provider "${_exhaustive}".`);
     })());
+  }
+
+  private createOpenRouterModel(): EngineBatchModel {
+    const modelConfig = getModel(this.modelKey);
+    const apiKey =
+      this.options?.apiKey ??
+      (typeof process !== "undefined"
+        ? process.env?.OPENROUTER_API_KEY
+        : undefined);
+
+    if (!apiKey) {
+      throw new Error(
+        `OpenRouter batch processing requires an API key. ` +
+          `Pass apiKey in BatchOptions or set the OPENROUTER_API_KEY environment variable.`,
+      );
+    }
+
+    return createOpenRouterBatchModel({
+      apiKey,
+      modelId: modelConfig.id,
+      baseURL: this.options?.baseURL,
+      fetch: this.options?.fetch,
+      endpoint: this.options?.endpoint,
+    });
   }
 
   private resolveRefs(

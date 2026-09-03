@@ -510,7 +510,16 @@ const jobQueue = createPrismaJobQueue(prisma, {
 });
 ```
 
-`PrismaWorkflowPersistence`, `PrismaJobQueue`, `PrismaAICallLogger`, and `createEnumHelper` no longer accept `prisma: any`. They now require a structural `EnginePrismaClient` shape (an internal type, not exported from any public entry point -- you never import or write it by name). Any real Prisma-generated client (6.x or 7.x) satisfies it automatically, since it only requires the delegates the adapters actually call (`workflowRun`, `workflowStage`, etc.) plus optional `$transaction`/`$queryRaw`/`$executeRaw`/`$Enums`. The only visible effect is on hand-written mocks/fakes: a `PrismaClient`-shaped test double missing a delegate the adapter actually calls now fails to typecheck, where it previously compiled silently under `any`. No runtime behavior change.
+`PrismaWorkflowPersistence`, `PrismaJobQueue`, `PrismaAICallLogger`, and `createEnumHelper` no longer accept `prisma: any`. They now require a structural `EnginePrismaClient` shape (an internal type, not exported from any public entry point -- you never import or write it by name). Any real Prisma-generated client (6.x or 7.x) satisfies it automatically, since it only requires the delegates the adapters actually call plus optional `$transaction`/`$queryRaw`/`$queryRawUnsafe`/`$executeRaw`/`$Enums`. The required delegates are exactly: `workflowRun`, `workflowStage`, `workflowStep`, `workflowLog`, `workflowArtifact`, `workflowAnnotation`, `outboxEvent`, `idempotencyKey`, `jobQueue`, `aICall`. **A wall of `PrismaClient is not assignable to EnginePrismaClient` errors means one of those models is missing from your schema** (after an upgrade to 1.0 it is almost always `WorkflowStep`): add the model, run `prisma generate`, and the error goes away.
+
+If your schema names the status enum differently (for example `WorkflowStatus`, with or without `@@map`), pass it: the Postgres claim path casts with `::"<name>"` (since 0.11) and fails with `42704 type "Status" does not exist` otherwise. The persistence and job queue also accept a `now` clock; the raw statements bind that JS `Date` (UTC) instead of `NOW()`.
+
+```typescript
+const persistence = createPrismaWorkflowPersistence(prisma, {
+  statusEnumName: "WorkflowStatus",   // default "Status"
+  now: () => clock.now(),             // default () => new Date()
+});
+``` The only visible effect is on hand-written mocks/fakes: a `PrismaClient`-shaped test double missing a delegate the adapter actually calls now fails to typecheck, where it previously compiled silently under `any`. No runtime behavior change.
 
 ## Database Type Options
 

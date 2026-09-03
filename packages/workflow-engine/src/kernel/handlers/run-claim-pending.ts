@@ -34,7 +34,9 @@ export async function handleRunClaimPending(
   // the resulting stuck run either way.
 
   for (let i = 0; i < maxClaims; i++) {
-    const run = await deps.persistence.claimNextPendingRun();
+    const run = await deps.persistence.claimNextPendingRun({
+      now: deps.clock.now(),
+    });
     if (!run) break;
 
     try {

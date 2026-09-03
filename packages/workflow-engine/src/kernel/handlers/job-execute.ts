@@ -429,6 +429,8 @@ export async function handleJobExecute(
           status: "COMPLETED",
           completedAt: deps.clock.now(),
           duration,
+          // A retried attempt succeeded: the earlier attempt's error is stale.
+          errorMessage: null,
           outputData: {
             _artifactKey: outputKey,
             ...(artifactKeys ? { _artifactKeys: artifactKeys } : {}),

@@ -318,7 +318,8 @@ export interface UpdateStageInput {
   metrics?: unknown;
   embeddingInfo?: unknown;
   artifacts?: unknown;
-  errorMessage?: string;
+  /** `null` clears the error of an earlier attempt. */
+  errorMessage?: string | null;
   expectedVersion?: number;
 }
 
@@ -493,7 +494,10 @@ export interface PersistenceCore {
    *
    * @returns The claimed workflow run (now with status RUNNING), or null if no pending runs
    */
-  claimNextPendingRun(): Promise<WorkflowRunRecord | null>;
+  claimNextPendingRun(options?: {
+    /** The kernel clock's time, written as `startedAt`/`updatedAt`. */
+    now?: Date;
+  }): Promise<WorkflowRunRecord | null>;
 
   // WorkflowStage operations
   createStage(data: CreateStageInput): Promise<WorkflowStageRecord>;

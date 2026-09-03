@@ -118,6 +118,7 @@ export function createBatchAwareFactory(
   mock: MockAIHelperFactory,
   backend: EngineBatchModel,
   batchLog?: (level: string, message: string) => void,
+  onBatch?: (modelKey: string, provider: string) => void,
 ): AIHelperFactory {
   return (topic, logger, logContext, providerResolver, options) => {
     const helper = mock(topic, logger, logContext, providerResolver, options);
@@ -128,8 +129,12 @@ export function createBatchAwareFactory(
             modelKey: string,
             provider?: string,
             batchOptions?: unknown,
-          ) =>
-            new AIBatchImpl(
+          ) => {
+            onBatch?.(
+              modelKey,
+              (provider ?? getBestProviderForModel(modelKey)) as string,
+            );
+            return new AIBatchImpl(
               { topic, aiCallLogger: logger },
               modelKey,
               (provider ?? getBestProviderForModel(modelKey)) as never,
@@ -140,6 +145,7 @@ export function createBatchAwareFactory(
               batchOptions as never,
               backend,
             );
+          };
         }
         const value = Reflect.get(target, prop, receiver);
         return typeof value === "function" ? value.bind(target) : value;

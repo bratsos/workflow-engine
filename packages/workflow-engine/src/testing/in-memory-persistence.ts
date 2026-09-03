@@ -234,7 +234,10 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
     return true;
   }
 
-  async claimNextPendingRun(attempt = 0): Promise<WorkflowRunRecord | null> {
+  async claimNextPendingRun(
+    options?: { now?: Date },
+    attempt = 0,
+  ): Promise<WorkflowRunRecord | null> {
     if (attempt >= MAX_CLAIM_ATTEMPTS) {
       return null;
     }
@@ -264,7 +267,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
       // In real FOR UPDATE SKIP LOCKED, this row would be skipped
       // Try the next one recursively (bounded to avoid unbounded
       // recursion under heavy contention)
-      return this.claimNextPendingRun(attempt + 1);
+      return this.claimNextPendingRun(options, attempt + 1);
     }
 
     // Atomically update status to RUNNING

@@ -466,21 +466,21 @@ function buildStage<
           // Steps may run concurrently under Promise.all. Let the siblings
           // still in flight finish and record before the stage suspends —
           // otherwise the replay meets their live leases as StepInFlight.
-          await enhancedContext.step[STEP_API_SETTLE_IN_FLIGHT]?.();
+          await enhancedContext.step?.[STEP_API_SETTLE_IN_FLIGHT]?.();
           return durableControlFlowResult(error);
         }
-        await enhancedContext.step[STEP_API_SETTLE_IN_FLIGHT]?.();
+        await enhancedContext.step?.[STEP_API_SETTLE_IN_FLIGHT]?.();
         throw error;
       }
 
       const pendingSuspend =
-        enhancedContext.step[STEP_API_PENDING_CONTROL_FLOW]?.();
+        enhancedContext.step?.[STEP_API_PENDING_CONTROL_FLOW]?.();
       if (pendingSuspend) {
         enhancedContext.log(
           "WARN",
           "execute() returned after a durable step requested suspension; the return value was discarded",
         );
-        await enhancedContext.step[STEP_API_SETTLE_IN_FLIGHT]?.();
+        await enhancedContext.step?.[STEP_API_SETTLE_IN_FLIGHT]?.();
         return durableControlFlowResult(pendingSuspend);
       }
 
