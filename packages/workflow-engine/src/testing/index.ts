@@ -69,6 +69,7 @@ export { InMemoryWorkflowPersistence } from "./in-memory-persistence.js";
 export { InMemoryStepLedger } from "./in-memory-step-ledger.js";
 export type {
   AILoggerFactory,
+  ConformanceTestApi,
   JobQueueFactory,
   PersistenceFactory,
 } from "./persistence-conformance.js";

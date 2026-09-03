@@ -723,10 +723,13 @@ export type InferStageConfig<T> =
 // ============================================================================
 
 /**
- * Define an async-batch stage with proper type inference for checkCompletion
+ * Define an async-batch stage with proper type inference for checkCompletion.
  *
- * This is a dedicated function (not an alias) to ensure TypeScript properly
- * infers callback parameter types without overload resolution ambiguity.
+ * @internal Not part of the public entry since 1.0: `ctx.step.waitFor` /
+ * `ctx.step.ai.map` replace the suspend + `checkCompletion` pattern (see
+ * 12-durable-steps.md, "Migrating an async-batch stage to steps"). Kept for
+ * the hosts' and the kernel's own async-batch mode tests;
+ * `defineStage({ mode: "async-batch", checkCompletion })` is the same thing.
  */
 export function defineAsyncBatchStage<
   TId extends string,

@@ -9,7 +9,7 @@ The first real-world runs of the 1.0 alphas also found and fixed behaviour that 
 ## Does this affect you?
 
 - **Every consumer** — apply the database checklist and update the peer dependencies. If you construct a `StageContext` by hand (custom host, unit tests calling `stage.execute(ctx)` directly) read "Hand-built contexts".
-- **You use `defineAsyncBatchStage` for AI batches** — it keeps working, but the replacement (`ctx.step.ai.map`) removes `checkCompletion`, the metadata threading and the un-validated results problem from the 0.13 guide. Migrate when convenient.
+- **You use `defineAsyncBatchStage`** — it is no longer exported. Migrate to `defineStage` with `ctx.step.waitFor` (a poll) or `ctx.step.ai.map` (an AI batch); the section below has the before/after. `npx workflow-engine-codemod --from 0.13` flags every use, with `checkCompletion`, `requireStageOutput`, `experimental_output` and the removed model helpers.
 - **You call any API in the removals table** — those are compile errors now; each has a one-line replacement.
 - **You implement `AIAdapter`** — `generateObject` results are now read from `object` (an alpha bug read `output`), and the repair loop expects `NoObjectGeneratedError` with `text` set. See "Adapters".
 
@@ -145,6 +145,13 @@ Verified against `git diff` of the package's `prisma/schema.prisma` between 0.13
   | `SuspendedStateSchema.apiKey` | `BatchOptions.apiKey` |
   | `defineWorkflow({ output })` | nothing — the workflow output is always the last stage's output schema (or the merged object of the last parallel group) |
   | `AnthropicBatchProvider` & co. (already gone in 0.13) | `ai.batch()` / `ctx.step.ai.map` |
+  | `defineAsyncBatchStage` (root and `/client` exports) | `defineStage` with `ctx.step.waitFor` / `ctx.step.ai.map`; the async-batch mode itself (`defineStage({ mode: "async-batch", checkCompletion })`) still runs for hosts that keep it |
+  | `KernelConfig.scheduler`, `NoopScheduler` | nothing — the kernel never scheduled anything; drop the option |
+  | `RunCreateCommand.metadata` | `annotations` on `run.create` |
+  | `ArtifactPersistence` (`saveArtifact`, `loadArtifact`, `hasArtifact`, `deleteArtifact`, `listArtifacts`, `getStageIdForArtifact`, `saveStageOutput`, `loadStageOutput`) on the `WorkflowPersistence` port | the `BlobStore` port (`createPrismaBlobStore`); the built-in adapters keep the methods as plain class methods |
+  | `getRunsByStatus`, `claimPendingRun`, `updateStageByRunAndStageId`, `getStageById`, `getFirstSuspendedStageReadyToResume`, `getFirstFailedStage`, `getLastCompletedStage`, `getLastCompletedStageBefore` on the port | `getStagesByRun(runId, { status, orderBy })`, `getStage(runId, stageId)`, `updateStage(stage.id, ...)`; the built-in adapters keep the methods |
+  | `JobQueue.enqueue` / `JobTransport.enqueue` on the ports | `enqueueParallel([job])`; the built-in queues keep `enqueue` |
+  | Conformance suites `persistenceConformanceSuite(name, factory)` | take a third argument `{ describe, it, expect, beforeEach }` (the `testing` entry no longer imports vitest) |
 
 - [ ] **Provide `step`, `ai` and `aiLogger` on hand-built stage contexts.** `StageContext.step` is required (it was optional), and `CheckCompletionContext` gained `step`, `ai` and `aiLogger` too. Code that builds a context by hand must supply them; a stage that never touches them still runs (the wrapper only probes `ctx.step` when present).
 
@@ -228,7 +235,7 @@ Verified against `git diff` of the package's `prisma/schema.prisma` between 0.13
 
 ## `defineAsyncBatchStage` → `ctx.step.ai.map`
 
-`defineAsyncBatchStage` still works. The replacement is one linear stage body; the full before/after is in `12-durable-steps.md` ("Migrating an async-batch stage to steps").
+`defineAsyncBatchStage` is not exported any more. The replacement is one linear stage body; the full before/after is in `12-durable-steps.md` ("Migrating an async-batch stage to steps").
 
 ```typescript
 // Before (0.13)

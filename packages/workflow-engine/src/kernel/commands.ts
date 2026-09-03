@@ -37,12 +37,6 @@ export interface RunCreateCommand {
   readonly config?: Record<string, unknown>;
   readonly priority?: number;
   /**
-   * @deprecated since 0.8.0. Use `annotations` instead — annotations are
-   * queryable, indexed, and follow stable conventions. `metadata` will be
-   * removed in 1.0.
-   */
-  readonly metadata?: Record<string, unknown>;
-  /**
    * Annotations to attach at run creation time. Each entry becomes one
    * row per attribute, sharing the supplied envelope (actor / payload /
    * idempotencyKey). Written inside the same transaction as the run.

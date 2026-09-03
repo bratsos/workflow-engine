@@ -85,22 +85,36 @@ if (!DATABASE_URL) {
     // the in-memory fakes' synchronous `clear()`.
     // ==========================================================================
 
-    persistenceConformanceSuite("PrismaWorkflowPersistence (Postgres)", () => {
-      const persistence = createPrismaWorkflowPersistence(prisma);
-      return Object.assign(persistence, { reset: truncateAll });
-    });
+    const api = { describe, it, expect, beforeEach };
 
-    jobQueueConformanceSuite("PrismaJobQueue (Postgres)", () => {
-      const queue = createPrismaJobQueue(prisma, {
-        workerId: "pg-conformance-worker",
-      });
-      return Object.assign(queue, { reset: truncateAll });
-    });
+    persistenceConformanceSuite(
+      "PrismaWorkflowPersistence (Postgres)",
+      () => {
+        const persistence = createPrismaWorkflowPersistence(prisma);
+        return Object.assign(persistence, { reset: truncateAll });
+      },
+      api,
+    );
 
-    aiCallLoggerConformanceSuite("PrismaAICallLogger (Postgres)", () => {
-      const logger = createPrismaAICallLogger(prisma);
-      return Object.assign(logger, { reset: truncateAll });
-    });
+    jobQueueConformanceSuite(
+      "PrismaJobQueue (Postgres)",
+      () => {
+        const queue = createPrismaJobQueue(prisma, {
+          workerId: "pg-conformance-worker",
+        });
+        return Object.assign(queue, { reset: truncateAll });
+      },
+      api,
+    );
+
+    aiCallLoggerConformanceSuite(
+      "PrismaAICallLogger (Postgres)",
+      () => {
+        const logger = createPrismaAICallLogger(prisma);
+        return Object.assign(logger, { reset: truncateAll });
+      },
+      api,
+    );
 
     // ==========================================================================
     // Postgres-only behavior: raw-SQL paths and real-database mechanics the
@@ -220,11 +234,13 @@ if (!DATABASE_URL) {
       });
 
       it("enqueues and dequeues a job atomically using FOR UPDATE SKIP LOCKED", async () => {
-        const jobId = await jobQueue.enqueue({
-          workflowRunId: "skip-locked-run",
-          workflowId: "skip-locked-workflow",
-          stageId: "skip-locked-stage",
-        });
+        const [jobId] = await jobQueue.enqueueParallel([
+          {
+            workflowRunId: "skip-locked-run",
+            workflowId: "skip-locked-workflow",
+            stageId: "skip-locked-stage",
+          },
+        ]);
         expect(jobId).toBeTruthy();
 
         const dequeued = await jobQueue.dequeue();

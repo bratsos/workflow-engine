@@ -433,4 +433,4 @@ const extract = defineStage({
 });
 ```
 
-What changes: no `checkCompletion`, no `suspendedState.metadata`, batch results are validated and repaired like realtime ones, a crash between submit and collect resumes from the ledger, and the same stage runs realtime for small inputs. `defineAsyncBatchStage` keeps working for stages that still want an explicit `checkCompletion`.
+What changes: no `checkCompletion`, no `suspendedState.metadata`, batch results are validated and repaired like realtime ones, a crash between submit and collect resumes from the ledger, and the same stage runs realtime for small inputs. `defineAsyncBatchStage` is not exported from 1.0; `npx workflow-engine-codemod --from 0.13` flags every remaining use (and `checkCompletion`, `requireStageOutput`, `experimental_output`, the removed model helpers) with a pointer to the 0.13→1.0 guide.

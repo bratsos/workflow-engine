@@ -11,7 +11,6 @@ export { NoInputSchema } from "./core/schema-helpers";
 export { type Stage } from "./core/stage";
 export {
   type AsyncBatchStageDefinition,
-  defineAsyncBatchStage,
   defineStage,
   type EnhancedStageContext,
   type InferInput,
@@ -164,11 +163,6 @@ export type {
   AICallLogger,
   AICallRecord,
   AIHelperStats,
-  // `WorkflowPersistence`'s two focused subsets: `PersistenceCore` (what the
-  // kernel actually calls) and `ArtifactPersistence` (deprecated artifact
-  // methods -- use BlobStore instead). Re-exported for export-surface
-  // consistency with `WorkflowPersistence` below.
-  ArtifactPersistence,
   ArtifactType,
   CreateAICallInput,
   CreateLogInput,

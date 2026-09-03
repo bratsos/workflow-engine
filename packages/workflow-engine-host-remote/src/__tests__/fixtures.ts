@@ -3,7 +3,6 @@ import { createKernel } from "@bratsos/workflow-engine/kernel";
 import {
   CollectingEventSink,
   FakeClock,
-  NoopScheduler,
 } from "@bratsos/workflow-engine/kernel/testing";
 import {
   InMemoryJobQueue,
@@ -92,7 +91,6 @@ export function buildOrchestrator(
     blobStore: objectStore, // same instance the worker writes to
     jobTransport: jobQueue,
     eventSink: new CollectingEventSink(),
-    scheduler: new NoopScheduler(),
     clock: resolvedClock,
     registry: {
       getWorkflow: (id: string) => (id === "media" ? workflow : undefined),

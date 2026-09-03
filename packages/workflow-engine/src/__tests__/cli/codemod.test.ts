@@ -244,3 +244,51 @@ describe("workflow-engine-codemod package.json checks", () => {
     expect(result.findings[0]?.suggestion).toContain("declared and imported");
   });
 });
+
+describe("workflow-engine-codemod 1.0 findings", () => {
+  const fixture = `
+import { defineAsyncBatchStage, requireStageOutput, getModelById } from "@bratsos/workflow-engine";
+import { defineStage } from "@bratsos/workflow-engine";
+
+export const extract = defineAsyncBatchStage({
+  id: "extract",
+  async execute(ctx) {
+    const prev = requireStageOutput(ctx, "load");
+    const result = await ai.generateText("m", "p", { experimental_output: schema });
+    return { suspended: true, state: { batchId: "b" } };
+  },
+  async checkCompletion(state, ctx) {
+    return { ready: true };
+  },
+});
+`;
+
+  it("flags the removed exports, checkCompletion and experimental_output from 0.13", () => {
+    const result = transformSource(fixture, { from: "0.13" });
+
+    expect(result.transformedSource).toBe(fixture);
+    const flagged = result.findings.filter((f) => f.rule === 7);
+    expect(flagged.map((f) => f.message)).toEqual(
+      flagged.map(() =>
+        expect.stringMatching(
+          /removed in 1\.0; see .*migrate-0\.13-to-1\.0\.md/,
+        ),
+      ),
+    );
+    const texts = flagged.map((f) => f.suggestion);
+    expect(texts.some((h) => /ctx\.step\.waitFor/.test(h))).toBe(true);
+    expect(texts.some((h) => /ctx\.require/.test(h))).toBe(true);
+    expect(texts.some((h) => /getModel\(key\)/.test(h))).toBe(true);
+    expect(texts.some((h) => /checkCompletion belongs/.test(h))).toBe(true);
+    expect(texts.some((h) => /option is `output`/.test(h))).toBe(true);
+    expect(flagged).toHaveLength(5);
+  });
+
+  it("still flags them from 0.11 while applying the safe renames", () => {
+    const result = transformSource(fixture, { from: "0.11" });
+    expect(result.transformedSource).toContain("output: schema");
+    // Findings are collected on the source as written, so the renamed
+    // experimental_output is still listed once for the reader.
+    expect(result.findings.filter((f) => f.rule === 7)).toHaveLength(5);
+  });
+});

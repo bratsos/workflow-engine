@@ -19,7 +19,6 @@ import {
 import {
   CollectingEventSink,
   FakeClock,
-  NoopScheduler,
 } from "@bratsos/workflow-engine/kernel/testing";
 import {
   InMemoryJobQueue,
@@ -100,7 +99,6 @@ describe("routing e2e — mixed routing (heavy=remote, core=in-process)", () => 
       blobStore: objectStore,
       jobTransport: jobQueue,
       eventSink: new CollectingEventSink(),
-      scheduler: new NoopScheduler(),
       clock,
       registry: {
         getWorkflow: (id: string) =>

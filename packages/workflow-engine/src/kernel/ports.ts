@@ -210,14 +210,6 @@ export interface BlobStore {
  * this port without adapters.
  */
 export interface JobTransport {
-  /**
-   * Add a new job to the queue.
-   *
-   * @deprecated Unused by the kernel -- enqueueParallel is used even for
-   * single-job enqueues. Removal at 1.0.
-   */
-  enqueue(options: EnqueueJobInput): Promise<string>;
-
   /** Enqueue multiple stages in parallel (same execution group). */
   enqueueParallel(jobs: EnqueueJobInput[]): Promise<string[]>;
 

@@ -79,29 +79,23 @@ export const SuspendedStateSchema = z.object({
   statusUrl: z.string().optional(),
   /**
    * ISO date string.
-   * @deprecated Optional — kept for a deprecation window only.
-   * `defineStage()` still back-fills its resolved value here (in addition
-   * to `pollConfig`) because some `checkCompletion` implementations read
-   * `suspendedState.submittedAt` directly. New code should read timing
-   * from `pollConfig` instead. Removal at 1.0.
+   * @deprecated Read timing from `pollConfig` instead. `defineStage()` still
+   * back-fills this for `checkCompletion` implementations of the async-batch
+   * mode; it goes away with that mode, not before.
    */
   submittedAt: z.string().optional(),
   /**
    * Milliseconds.
-   * @deprecated Optional — kept for a deprecation window only.
-   * `defineStage()` still back-fills its resolved value here (in addition
-   * to `pollConfig`) because some `checkCompletion` implementations read
-   * `suspendedState.pollInterval` directly. Prefer `pollConfig.pollInterval`.
-   * Removal at 1.0.
+   * @deprecated Prefer `pollConfig.pollInterval`. Back-filled by
+   * `defineStage()` for async-batch `checkCompletion`; goes away with that
+   * mode, not before.
    */
   pollInterval: z.number().optional(),
   /**
    * Milliseconds.
-   * @deprecated Optional — kept for a deprecation window only.
-   * `defineStage()` still back-fills its resolved value here (in addition
-   * to `pollConfig`) because some `checkCompletion` implementations read
-   * `suspendedState.maxWaitTime` directly. Prefer `pollConfig.maxWaitTime`.
-   * Removal at 1.0.
+   * @deprecated Prefer `pollConfig.maxWaitTime`. Back-filled by
+   * `defineStage()` for async-batch `checkCompletion`; goes away with that
+   * mode, not before.
    */
   maxWaitTime: z.number().optional(),
   metadata: z.record(z.string(), z.unknown()).optional(),

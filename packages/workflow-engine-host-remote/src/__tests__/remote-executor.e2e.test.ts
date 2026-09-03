@@ -15,7 +15,6 @@ import { createKernel } from "@bratsos/workflow-engine/kernel";
 import {
   CollectingEventSink,
   FakeClock,
-  NoopScheduler,
 } from "@bratsos/workflow-engine/kernel/testing";
 import {
   InMemoryJobQueue,
@@ -95,7 +94,6 @@ describe("remote-executor e2e — ActivityExecutor port (no proxy stage)", () =>
       blobStore: objectStore,
       jobTransport: jobQueue,
       eventSink: new CollectingEventSink(),
-      scheduler: new NoopScheduler(),
       clock,
       registry: {
         getWorkflow: (id: string) =>

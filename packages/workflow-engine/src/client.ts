@@ -37,7 +37,6 @@ export { NoInputSchema } from "./core/schema-helpers";
 // Stage definition (client-safe)
 export {
   type AsyncBatchStageDefinition,
-  defineAsyncBatchStage,
   defineStage,
   type EnhancedStageContext,
   type InferInput,

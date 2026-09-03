@@ -598,146 +598,25 @@ export interface PersistenceCore {
 }
 
 // ============================================================================
-// ArtifactPersistence Interface
-// ============================================================================
-
-/**
- * Artifact/blob-adjacent persistence methods (7 total).
- *
- * @deprecated The kernel does not call any of these -- all artifact I/O
- * goes through the `BlobStore` port instead (see
- * `kernel/helpers/create-storage-shim.ts`, `kernel/helpers/save-stage-output.ts`).
- * Kept on `WorkflowPersistence` for backward compatibility with existing
- * implementers/consumers. Removal at 1.0.
- */
-export interface ArtifactPersistence {
-  /** @deprecated Unused by the kernel -- use the BlobStore port instead. Removal at 1.0. */
-  saveArtifact(data: SaveArtifactInput): Promise<void>;
-  /**
-   * Load an artifact's stored data. Returns `undefined` (not a throw) when
-   * no artifact exists for `(runId, key)` -- callers that need to
-   * distinguish "missing" from "present but empty" should check
-   * `hasArtifact` first.
-   *
-   * @deprecated Unused by the kernel -- use the BlobStore port instead. Removal at 1.0.
-   */
-  loadArtifact(runId: string, key: string): Promise<unknown>;
-  /** @deprecated Unused by the kernel -- use the BlobStore port instead. Removal at 1.0. */
-  hasArtifact(runId: string, key: string): Promise<boolean>;
-  /** @deprecated Unused by the kernel -- use the BlobStore port instead. Removal at 1.0. */
-  deleteArtifact(runId: string, key: string): Promise<void>;
-  /** @deprecated Unused by the kernel -- use the BlobStore port instead. Removal at 1.0. */
-  listArtifacts(runId: string): Promise<WorkflowArtifactRecord[]>;
-  /** @deprecated Unused by the kernel -- use the BlobStore port instead. Removal at 1.0. */
-  getStageIdForArtifact(runId: string, stageId: string): Promise<string | null>;
-
-  /**
-   * @deprecated Unused by the kernel -- stage output is persisted through
-   * the BlobStore port (see `kernel/helpers/save-stage-output.ts`).
-   * Removal at 1.0.
-   */
-  saveStageOutput(
-    runId: string,
-    workflowType: string,
-    stageId: string,
-    output: unknown,
-  ): Promise<string>;
-}
-
-// ============================================================================
 // WorkflowPersistence Interface
 // ============================================================================
 
 /**
- * Full persistence contract (41 methods): `PersistenceCore` (what the
- * kernel actually calls) + `ArtifactPersistence` (deprecated, `BlobStore`
- * replaces it) + a handful of query methods below with no kernel call
- * site that aren't artifact-related either. New implementers generally
- * only need `PersistenceCore`; this wider interface exists for backward
- * compatibility with existing implementers/consumers (`PrismaWorkflowPersistence`,
- * `InMemoryWorkflowPersistence`, and any third-party adapter).
+ * Full persistence contract: `PersistenceCore` (what the kernel calls) plus
+ * a transaction boundary that hands the callback this same surface. The
+ * pre-1.0 artifact methods (`saveArtifact`, `loadArtifact`, ... — replaced
+ * by the `BlobStore` port) and query helpers (`getRunsByStatus`,
+ * `claimPendingRun`, `getStageById`, ...) are no longer part of the
+ * contract; the built-in adapters still implement them as plain class
+ * methods.
  */
-export interface WorkflowPersistence
-  extends PersistenceCore,
-    ArtifactPersistence {
+export interface WorkflowPersistence extends PersistenceCore {
   /**
    * Execute operations within a transaction boundary. Redeclared (not
    * merely inherited from `PersistenceCore`) so the callback receives the
-   * full `WorkflowPersistence` surface, including artifact methods --
-   * preserves this interface's pre-split behavior.
+   * full `WorkflowPersistence` surface.
    */
   withTransaction<T>(fn: (tx: WorkflowPersistence) => Promise<T>): Promise<T>;
-
-  /** @deprecated Unused by the kernel. Removal at 1.0. */
-  getRunsByStatus(status: Status): Promise<WorkflowRunRecord[]>;
-
-  /**
-   * Atomically claim a pending workflow run for processing.
-   * Uses atomic update with WHERE status = 'PENDING' to prevent race conditions.
-   *
-   * @param id - The workflow run ID to claim
-   * @returns true if successfully claimed, false if already claimed by another worker
-   *
-   * @deprecated Unused by the kernel -- claimNextPendingRun (atomic
-   * FOR UPDATE SKIP LOCKED claim of the next pending run) is used instead.
-   * Removal at 1.0.
-   */
-  claimPendingRun(id: string): Promise<boolean>;
-
-  /**
-   * @deprecated Unused by the kernel -- resolve the stage via
-   * getStage(runId, stageId) and call updateStage(stage.id, ...) instead.
-   * Removal at 1.0.
-   */
-  updateStageByRunAndStageId(
-    workflowRunId: string,
-    stageId: string,
-    data: UpdateStageInput,
-  ): Promise<void>;
-
-  /**
-   * @deprecated Unused by the kernel -- use getStage(runId, stageId) or
-   * getStagesByRun(runId) instead. Removal at 1.0.
-   */
-  getStageById(id: string): Promise<WorkflowStageRecord | null>;
-
-  /**
-   * Find the first SUSPENDED stage whose `nextPollAt` has been explicitly
-   * cleared (set to `null`) by the orchestrator -- i.e. "ready to resume"
-   * means the poll loop already determined the suspend condition is
-   * satisfied, not merely that a poll deadline has elapsed. Use
-   * `getSuspendedStages` to find stages whose poll deadline has passed.
-   *
-   * @deprecated Unused by the kernel -- use
-   * getStagesByRun(runId, { status: "SUSPENDED" }) and filter by
-   * nextPollAt === null instead. Removal at 1.0.
-   */
-  getFirstSuspendedStageReadyToResume(
-    runId: string,
-  ): Promise<WorkflowStageRecord | null>;
-
-  /**
-   * @deprecated Unused by the kernel -- use
-   * getStagesByRun(runId, { status: "FAILED" }) instead. Removal at 1.0.
-   */
-  getFirstFailedStage(runId: string): Promise<WorkflowStageRecord | null>;
-
-  /**
-   * @deprecated Unused by the kernel -- use
-   * getStagesByRun(runId, { status: "COMPLETED", orderBy: "desc" })
-   * instead. Removal at 1.0.
-   */
-  getLastCompletedStage(runId: string): Promise<WorkflowStageRecord | null>;
-
-  /**
-   * @deprecated Unused by the kernel -- use
-   * getStagesByRun(runId, { status: "COMPLETED", orderBy: "desc" }) and
-   * filter by executionGroup instead. Removal at 1.0.
-   */
-  getLastCompletedStageBefore(
-    runId: string,
-    executionGroup: number,
-  ): Promise<WorkflowStageRecord | null>;
 }
 
 // ============================================================================
@@ -782,14 +661,6 @@ export interface AICallLogger {
 // ============================================================================
 
 export interface JobQueue {
-  /**
-   * Add a new job to the queue.
-   *
-   * @deprecated Unused by the kernel -- enqueueParallel is used even for
-   * single-job enqueues. Removal at 1.0.
-   */
-  enqueue(options: EnqueueJobInput): Promise<string>;
-
   /**
    * Enqueue multiple stages in parallel (same execution group)
    */

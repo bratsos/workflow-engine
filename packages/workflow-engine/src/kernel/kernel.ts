@@ -73,7 +73,6 @@ import type {
   JobTransport,
   KernelServices,
   Persistence,
-  Scheduler,
   StepLedger,
 } from "./ports";
 
@@ -90,12 +89,6 @@ export interface KernelConfig {
   blobStore: BlobStore;
   jobTransport: JobTransport;
   eventSink: EventSink;
-  /**
-   * @deprecated The Scheduler port is unused by the kernel (zero
-   * `schedule()`/`cancel()` call sites). Omit it — the kernel supplies an
-   * internal no-op. Will be removed at 1.0.
-   */
-  scheduler?: Scheduler;
   clock: Clock;
   registry: WorkflowRegistry;
   executor?: ActivityExecutor;
@@ -169,7 +162,6 @@ export interface KernelDeps {
   blobStore: BlobStore;
   jobTransport: JobTransport;
   eventSink: EventSink;
-  scheduler?: Scheduler;
   clock: Clock;
   registry: WorkflowRegistry;
   executor: ActivityExecutor;
@@ -226,17 +218,6 @@ function stripEvents<R>(result: HandlerResult<R>): R {
   return rest as R;
 }
 
-/**
- * No-op `Scheduler` supplied when `KernelConfig.scheduler` is omitted. The
- * Scheduler port is unused by the kernel today — see the @deprecated note
- * on `kernel/testing/noop-scheduler.ts`, which remains for existing test
- * fixtures that still construct one explicitly.
- */
-const internalNoopScheduler: Scheduler = {
-  async schedule() {},
-  async cancel() {},
-};
-
 // ============================================================================
 // Factory
 // ============================================================================
@@ -247,9 +228,6 @@ export function createKernel(config: KernelConfig): Kernel {
 
   // Default to LocalExecutor if none provided
   const executor = config.executor ?? createLocalExecutor();
-  // The Scheduler port is unused by the kernel (see internalNoopScheduler
-  // above) — default so callers aren't required to supply one.
-  const scheduler = config.scheduler ?? internalNoopScheduler;
   const idempotencyStaleInProgressMs =
     config.idempotencyStaleInProgressMs ??
     DEFAULT_IDEMPOTENCY_STALE_IN_PROGRESS_MS;
@@ -267,7 +245,6 @@ export function createKernel(config: KernelConfig): Kernel {
     blobStore,
     jobTransport,
     eventSink,
-    scheduler,
     clock,
     registry,
     executor,

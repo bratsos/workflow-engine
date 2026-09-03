@@ -53,7 +53,6 @@ export async function handleRunCreate(
     input: command.input,
     config: mergedConfig,
     priority,
-    metadata: command.metadata,
   });
 
   // 7. Attach run-creation annotations, if any (atomic with createRun

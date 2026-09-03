@@ -22,7 +22,6 @@
  * file (directly, or transitively via an import at module scope).
  */
 
-import { beforeEach, describe, expect, it } from "vitest";
 import type {
   AICallLogger,
   CreateAICallInput,
@@ -30,8 +29,62 @@ import type {
   CreateStageInput,
   EnqueueJobInput,
   JobQueue,
+  SaveArtifactInput,
+  UpdateStageInput,
+  WorkflowArtifactRecord,
   WorkflowPersistence,
+  WorkflowRunRecord,
+  WorkflowStageRecord,
 } from "../persistence/interface.js";
+
+// ============================================================================
+// Test API injection
+// ============================================================================
+
+/**
+ * The four test primitives a suite needs, supplied by the caller (pass
+ * vitest's `{ describe, it, expect, beforeEach }`). The `testing` entry
+ * therefore imports nothing from vitest, so it loads from any script.
+ */
+export interface ConformanceTestApi {
+  describe: (name: string, fn: () => void) => void;
+  it: (name: string, fn: () => void | Promise<void>) => void;
+  // biome-ignore lint/suspicious/noExplicitAny: assertion chains are the caller's framework
+  expect: (value: unknown) => any;
+  beforeEach: (fn: () => void | Promise<void>) => void;
+}
+
+/** Pre-1.0 query/artifact methods the built-in adapters still ship. */
+type LegacyPersistence = WorkflowPersistence & {
+  getRunsByStatus(status: string): Promise<WorkflowRunRecord[]>;
+  claimPendingRun(id: string): Promise<boolean>;
+  updateStageByRunAndStageId(
+    workflowRunId: string,
+    stageId: string,
+    data: UpdateStageInput,
+  ): Promise<void>;
+  getStageById(id: string): Promise<WorkflowStageRecord | null>;
+  getFirstSuspendedStageReadyToResume(
+    runId: string,
+  ): Promise<WorkflowStageRecord | null>;
+  getFirstFailedStage(runId: string): Promise<WorkflowStageRecord | null>;
+  getLastCompletedStage(runId: string): Promise<WorkflowStageRecord | null>;
+  getLastCompletedStageBefore(
+    runId: string,
+    executionGroup: number,
+  ): Promise<WorkflowStageRecord | null>;
+  saveArtifact(data: SaveArtifactInput): Promise<void>;
+  loadArtifact(runId: string, key: string): Promise<unknown>;
+  hasArtifact(runId: string, key: string): Promise<boolean>;
+  deleteArtifact(runId: string, key: string): Promise<void>;
+  listArtifacts(runId: string): Promise<WorkflowArtifactRecord[]>;
+  getStageIdForArtifact(runId: string, stageId: string): Promise<string | null>;
+  saveStageOutput(...args: any[]): Promise<any>;
+  loadStageOutput(...args: any[]): Promise<any>;
+};
+type LegacyQueue = JobQueue & {
+  enqueue(options: EnqueueJobInput): Promise<string>;
+};
 
 // ============================================================================
 // Test Suite Factory Types
@@ -85,7 +138,9 @@ function sleep(ms: number): Promise<void> {
 export function persistenceConformanceSuite(
   name: string,
   factory: PersistenceFactory,
+  api: ConformanceTestApi,
 ) {
+  const { describe, it, expect, beforeEach } = api;
   describe(`I want ${name} to conform to WorkflowPersistence interface`, () => {
     let persistence: ReturnType<PersistenceFactory>;
 
@@ -306,8 +361,12 @@ export function persistenceConformanceSuite(
         // run3 stays PENDING
 
         // When: Getting runs by status
-        const running = await persistence.getRunsByStatus("RUNNING");
-        const completed = await persistence.getRunsByStatus("COMPLETED");
+        const running = await (
+          persistence as LegacyPersistence
+        ).getRunsByStatus("RUNNING");
+        const completed = await (
+          persistence as LegacyPersistence
+        ).getRunsByStatus("COMPLETED");
 
         // Then: Returns correct runs
         expect(running.some((r) => r.id === run1.id)).toBe(true);
@@ -323,7 +382,9 @@ export function persistenceConformanceSuite(
         );
 
         // When: Claiming it
-        const claimed = await persistence.claimPendingRun(run.id);
+        const claimed = await (
+          persistence as LegacyPersistence
+        ).claimPendingRun(run.id);
 
         // Then: version is incremented (so a concurrent optimistic write
         // against the pre-claim version is rejected)
@@ -399,7 +460,9 @@ export function persistenceConformanceSuite(
         );
 
         // When: Getting by database ID
-        const stage = await persistence.getStageById(created.id);
+        const stage = await (persistence as LegacyPersistence).getStageById(
+          created.id,
+        );
 
         // Then: Returns the stage
         expect(stage).not.toBeNull();
@@ -419,7 +482,9 @@ export function persistenceConformanceSuite(
         });
 
         // Then: Stage reflects updates
-        const updated = await persistence.getStageById(created.id);
+        const updated = await (persistence as LegacyPersistence).getStageById(
+          created.id,
+        );
         expect(updated?.status).toBe("RUNNING");
         expect(updated?.startedAt).toBeInstanceOf(Date);
       });
@@ -434,7 +499,7 @@ export function persistenceConformanceSuite(
         );
 
         // When: Updating by run/stage IDs
-        await persistence.updateStageByRunAndStageId(
+        await (persistence as LegacyPersistence).updateStageByRunAndStageId(
           "update-by-ids-run",
           "update-by-ids-stage",
           { status: "COMPLETED" },
@@ -702,8 +767,9 @@ export function persistenceConformanceSuite(
         });
 
         // When: Getting first suspended stage ready to resume
-        const ready =
-          await persistence.getFirstSuspendedStageReadyToResume(runId);
+        const ready = await (
+          persistence as LegacyPersistence
+        ).getFirstSuspendedStageReadyToResume(runId);
 
         // Then: Returns only the stage with nextPollAt cleared
         expect(ready).not.toBeNull();
@@ -726,7 +792,9 @@ export function persistenceConformanceSuite(
         });
 
         // When: Getting first failed stage
-        const failed = await persistence.getFirstFailedStage(runId);
+        const failed = await (
+          persistence as LegacyPersistence
+        ).getFirstFailedStage(runId);
 
         // Then: Returns the failed stage
         expect(failed).not.toBeNull();
@@ -757,7 +825,9 @@ export function persistenceConformanceSuite(
         await persistence.updateStage(stage2.id, { status: "COMPLETED" });
 
         // When: Getting last completed stage
-        const last = await persistence.getLastCompletedStage(runId);
+        const last = await (
+          persistence as LegacyPersistence
+        ).getLastCompletedStage(runId);
 
         // Then: Returns the highest stage number completed
         expect(last).not.toBeNull();
@@ -790,10 +860,9 @@ export function persistenceConformanceSuite(
         await persistence.updateStage(stage2.id, { status: "COMPLETED" });
 
         // When: Getting last completed before group 2
-        const lastBefore = await persistence.getLastCompletedStageBefore(
-          runId,
-          2,
-        );
+        const lastBefore = await (
+          persistence as LegacyPersistence
+        ).getLastCompletedStageBefore(runId, 2);
 
         // Then: Returns group 1 stage
         expect(lastBefore).not.toBeNull();
@@ -810,14 +879,17 @@ export function persistenceConformanceSuite(
         await ensureRun(runId);
 
         // When: Saving and loading
-        await persistence.saveArtifact({
+        await (persistence as LegacyPersistence).saveArtifact({
           workflowRunId: runId,
           key,
           type: "ARTIFACT",
           data,
           size: JSON.stringify(data).length,
         });
-        const loaded = await persistence.loadArtifact(runId, key);
+        const loaded = await (persistence as LegacyPersistence).loadArtifact(
+          runId,
+          key,
+        );
 
         // Then: Data is preserved
         expect(loaded).toEqual(data);
@@ -825,7 +897,7 @@ export function persistenceConformanceSuite(
 
       it("should return undefined (not throw) for a missing artifact", async () => {
         // When: Loading an artifact that was never saved
-        const loaded = await persistence.loadArtifact(
+        const loaded = await (persistence as LegacyPersistence).loadArtifact(
           "missing-artifact-run",
           "missing.json",
         );
@@ -838,7 +910,7 @@ export function persistenceConformanceSuite(
         // Given: An artifact
         const runId = "exists-run";
         await ensureRun(runId);
-        await persistence.saveArtifact({
+        await (persistence as LegacyPersistence).saveArtifact({
           workflowRunId: runId,
           key: "exists.json",
           type: "ARTIFACT",
@@ -847,8 +919,11 @@ export function persistenceConformanceSuite(
         });
 
         // When: Checking existence
-        const exists = await persistence.hasArtifact(runId, "exists.json");
-        const notExists = await persistence.hasArtifact(
+        const exists = await (persistence as LegacyPersistence).hasArtifact(
+          runId,
+          "exists.json",
+        );
+        const notExists = await (persistence as LegacyPersistence).hasArtifact(
           runId,
           "not-exists.json",
         );
@@ -862,7 +937,7 @@ export function persistenceConformanceSuite(
         // Given: An artifact
         const runId = "delete-artifact-run";
         await ensureRun(runId);
-        await persistence.saveArtifact({
+        await (persistence as LegacyPersistence).saveArtifact({
           workflowRunId: runId,
           key: "delete-me.json",
           type: "ARTIFACT",
@@ -871,10 +946,16 @@ export function persistenceConformanceSuite(
         });
 
         // When: Deleting
-        await persistence.deleteArtifact(runId, "delete-me.json");
+        await (persistence as LegacyPersistence).deleteArtifact(
+          runId,
+          "delete-me.json",
+        );
 
         // Then: Artifact no longer exists
-        const exists = await persistence.hasArtifact(runId, "delete-me.json");
+        const exists = await (persistence as LegacyPersistence).hasArtifact(
+          runId,
+          "delete-me.json",
+        );
         expect(exists).toBe(false);
       });
 
@@ -883,21 +964,21 @@ export function persistenceConformanceSuite(
         const runId = "list-artifacts-run";
         await ensureRun(runId);
         await ensureRun("other-run");
-        await persistence.saveArtifact({
+        await (persistence as LegacyPersistence).saveArtifact({
           workflowRunId: runId,
           key: "artifact-1.json",
           type: "ARTIFACT",
           data: {},
           size: 2,
         });
-        await persistence.saveArtifact({
+        await (persistence as LegacyPersistence).saveArtifact({
           workflowRunId: runId,
           key: "artifact-2.json",
           type: "ARTIFACT",
           data: {},
           size: 2,
         });
-        await persistence.saveArtifact({
+        await (persistence as LegacyPersistence).saveArtifact({
           workflowRunId: "other-run",
           key: "other.json",
           type: "ARTIFACT",
@@ -906,7 +987,9 @@ export function persistenceConformanceSuite(
         });
 
         // When: Listing artifacts
-        const artifacts = await persistence.listArtifacts(runId);
+        const artifacts = await (
+          persistence as LegacyPersistence
+        ).listArtifacts(runId);
 
         // Then: Returns only artifacts for that run
         expect(artifacts.length).toBe(2);
@@ -928,7 +1011,7 @@ export function persistenceConformanceSuite(
         );
 
         // When: Saving stage output
-        const key = await persistence.saveStageOutput(
+        const key = await (persistence as LegacyPersistence).saveStageOutput(
           runId,
           "test-workflow",
           stageId,
@@ -939,7 +1022,10 @@ export function persistenceConformanceSuite(
         expect(key).toContain(stageId);
         expect(key).toContain("output.json");
 
-        const loaded = await persistence.loadArtifact(runId, key);
+        const loaded = await (persistence as LegacyPersistence).loadArtifact(
+          runId,
+          key,
+        );
         expect(loaded).toEqual({ processed: true });
       });
     });
@@ -1678,7 +1764,9 @@ export function persistenceConformanceSuite(
 export function aiCallLoggerConformanceSuite(
   name: string,
   factory: AILoggerFactory,
+  api: ConformanceTestApi,
 ) {
+  const { describe, it, expect, beforeEach } = api;
   describe(`I want ${name} to conform to AICallLogger interface`, () => {
     let logger: ReturnType<AILoggerFactory>;
 
@@ -1945,7 +2033,9 @@ export function aiCallLoggerConformanceSuite(
 export function jobQueueConformanceSuite(
   name: string,
   factory: JobQueueFactory,
+  api: ConformanceTestApi,
 ) {
+  const { describe, it, expect, beforeEach } = api;
   describe(`I want ${name} to conform to JobQueue interface`, () => {
     let queue: ReturnType<JobQueueFactory>;
 
@@ -1972,7 +2062,7 @@ export function jobQueueConformanceSuite(
         const input = createJobInput({ stageId: "enqueue-test" });
 
         // When: Enqueueing
-        const jobId = await queue.enqueue(input);
+        const jobId = await (queue as LegacyQueue).enqueue(input);
 
         // Then: Returns a valid ID
         expect(jobId).toBeDefined();
@@ -1999,13 +2089,13 @@ export function jobQueueConformanceSuite(
     describe("dequeue operation", () => {
       it("should dequeue the highest priority job", async () => {
         // Given: Jobs with different priorities
-        await queue.enqueue(
+        await (queue as LegacyQueue).enqueue(
           createJobInput({ stageId: "low-priority", priority: 1 }),
         );
-        await queue.enqueue(
+        await (queue as LegacyQueue).enqueue(
           createJobInput({ stageId: "high-priority", priority: 10 }),
         );
-        await queue.enqueue(
+        await (queue as LegacyQueue).enqueue(
           createJobInput({ stageId: "medium-priority", priority: 5 }),
         );
 
@@ -2029,7 +2119,7 @@ export function jobQueueConformanceSuite(
 
       it("should return job details in dequeue result", async () => {
         // Given: A job
-        await queue.enqueue(
+        await (queue as LegacyQueue).enqueue(
           createJobInput({
             workflowRunId: "dequeue-run",
             stageId: "dequeue-stage",
@@ -2056,7 +2146,7 @@ export function jobQueueConformanceSuite(
     describe("complete operation", () => {
       it("should mark a job as completed", async () => {
         // Given: A dequeued job
-        const jobId = await queue.enqueue(
+        const jobId = await (queue as LegacyQueue).enqueue(
           createJobInput({ stageId: "complete-test" }),
         );
         await queue.dequeue();
@@ -2075,7 +2165,7 @@ export function jobQueueConformanceSuite(
     describe("suspend operation", () => {
       it("should suspend a job with next poll time", async () => {
         // Given: A dequeued job
-        const jobId = await queue.enqueue(
+        const jobId = await (queue as LegacyQueue).enqueue(
           createJobInput({ stageId: "suspend-test" }),
         );
         await queue.dequeue();
@@ -2091,7 +2181,7 @@ export function jobQueueConformanceSuite(
     describe("fail operation", () => {
       it("should mark a job as failed", async () => {
         // Given: A dequeued job
-        const jobId = await queue.enqueue(
+        const jobId = await (queue as LegacyQueue).enqueue(
           createJobInput({ stageId: "fail-test" }),
         );
         await queue.dequeue();
@@ -2105,7 +2195,7 @@ export function jobQueueConformanceSuite(
 
       it("should default shouldRetry to false when omitted", async () => {
         // Given: A dequeued job
-        const jobId = await queue.enqueue(
+        const jobId = await (queue as LegacyQueue).enqueue(
           createJobInput({ stageId: "fail-default-test" }),
         );
         await queue.dequeue();
@@ -2121,7 +2211,7 @@ export function jobQueueConformanceSuite(
       it("should retry a job when shouldRetry is true", async () => {
         // Given: A dequeued job
         const runId = "retry-run";
-        const jobId = await queue.enqueue(
+        const jobId = await (queue as LegacyQueue).enqueue(
           createJobInput({ workflowRunId: runId, stageId: "retry-test" }),
         );
         const dequeued = await queue.dequeue();
@@ -2160,7 +2250,7 @@ export function jobQueueConformanceSuite(
       it("should advance lockedAt without changing status", async () => {
         // Given: A dequeued (RUNNING/locked) job
         const runId = "touch-advances-run";
-        const jobId = await queue.enqueue(
+        const jobId = await (queue as LegacyQueue).enqueue(
           createJobInput({ workflowRunId: runId, stageId: "touch-advances" }),
         );
         await queue.dequeue();
@@ -2184,7 +2274,7 @@ export function jobQueueConformanceSuite(
       it("should not touch a job that isn't RUNNING", async () => {
         // Given: A job that was never dequeued (still PENDING)
         const runId = "touch-noop-run";
-        const jobId = await queue.enqueue(
+        const jobId = await (queue as LegacyQueue).enqueue(
           createJobInput({ workflowRunId: runId, stageId: "touch-noop" }),
         );
 
@@ -2200,14 +2290,14 @@ export function jobQueueConformanceSuite(
         // NodeHost's periodic touchJob heartbeat racing lease.reapStale)
         const survivorRunId = "touch-survivor-run";
         const victimRunId = "touch-victim-run";
-        const survivorId = await queue.enqueue(
+        const survivorId = await (queue as LegacyQueue).enqueue(
           createJobInput({
             workflowRunId: survivorRunId,
             stageId: "heartbeat-survivor",
           }),
         );
         await queue.dequeue();
-        const victimId = await queue.enqueue(
+        const victimId = await (queue as LegacyQueue).enqueue(
           createJobInput({
             workflowRunId: victimRunId,
             stageId: "heartbeat-victim",

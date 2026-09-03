@@ -6,17 +6,12 @@
  */
 
 import type { Workflow } from "@bratsos/workflow-engine";
-import {
-  defineAsyncBatchStage,
-  defineStage,
-  WorkflowBuilder,
-} from "@bratsos/workflow-engine";
+import { defineStage, WorkflowBuilder } from "@bratsos/workflow-engine";
 import { createKernel } from "@bratsos/workflow-engine/kernel";
 import {
   CollectingEventSink,
   FakeClock,
   InMemoryBlobStore,
-  NoopScheduler,
 } from "@bratsos/workflow-engine/kernel/testing";
 import {
   InMemoryJobQueue,
@@ -120,7 +115,7 @@ function createFailingWorkflow(): Workflow<any, any> {
 }
 
 function createAsyncBatchWorkflow(): Workflow<any, any> {
-  const stage = defineAsyncBatchStage({
+  const stage = defineStage({
     id: "batch-stage",
     name: "Batch Stage",
     mode: "async-batch",
@@ -162,7 +157,6 @@ function createTestEnv(workflows: Workflow<any, any>[] = []) {
   const blobStore = new InMemoryBlobStore();
   const jobTransport = new InMemoryJobQueue("test-worker");
   const eventSink = new CollectingEventSink();
-  const scheduler = new NoopScheduler();
   const clock = new FakeClock();
 
   const registry = new Map<string, Workflow<any, any>>();
@@ -175,7 +169,6 @@ function createTestEnv(workflows: Workflow<any, any>[] = []) {
     blobStore,
     jobTransport,
     eventSink,
-    scheduler,
     clock,
     registry: { getWorkflow: (id) => registry.get(id) },
   });

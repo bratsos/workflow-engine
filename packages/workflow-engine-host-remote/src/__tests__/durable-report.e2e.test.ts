@@ -3,7 +3,6 @@ import { createKernel } from "@bratsos/workflow-engine/kernel";
 import {
   CollectingEventSink,
   FakeClock,
-  NoopScheduler,
 } from "@bratsos/workflow-engine/kernel/testing";
 import {
   InMemoryJobQueue,
@@ -97,7 +96,6 @@ describe("durable reports — completed work survives an orchestrator restart", 
       blobStore: os,
       jobTransport: jobQueue,
       eventSink: new CollectingEventSink(),
-      scheduler: new NoopScheduler(),
       clock,
       registry: {
         getWorkflow: (id: string) => (id === "media" ? workflow : undefined),
@@ -416,7 +414,6 @@ describe("durable reports — completed work survives an orchestrator restart", 
       blobStore: os,
       jobTransport: jobQueue,
       eventSink: new CollectingEventSink(),
-      scheduler: new NoopScheduler(),
       clock,
       registry: {
         getWorkflow: (id: string) =>
@@ -522,7 +519,6 @@ describe("durable reports — completed work survives an orchestrator restart", 
       blobStore: os,
       jobTransport: jobQueue,
       eventSink: new CollectingEventSink(),
-      scheduler: new NoopScheduler(),
       clock,
       registry: {
         getWorkflow: (id: string) =>
@@ -632,7 +628,6 @@ describe("durable reports — completed work survives an orchestrator restart", 
       blobStore: os,
       jobTransport: jobQueue,
       eventSink: new CollectingEventSink(),
-      scheduler: new NoopScheduler(),
       clock,
       registry: {
         getWorkflow: (id: string) =>

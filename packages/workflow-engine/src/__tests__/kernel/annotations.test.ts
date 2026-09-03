@@ -675,14 +675,18 @@ describe("annotations: legacy metadata shim", () => {
       },
     });
     const workflow = makeWorkflow("wf-legacy", stage);
-    const { kernel } = createTestKernel([workflow]);
+    const { kernel, persistence } = createTestKernel([workflow]);
     const result = await kernel.dispatch({
       type: "run.create",
       idempotencyKey: `legacy-${Math.random()}`,
       workflowId: "wf-legacy",
       input: { data: "x" },
-      metadata: meta,
     });
+    // `run.create` no longer takes `metadata` (1.0); the shim serves runs
+    // whose rows were written with it before 0.8, so seed the column directly.
+    await persistence.updateRun(result.workflowRunId, {
+      metadata: meta,
+    } as never);
     return { kernel, runId: result.workflowRunId };
   }
 

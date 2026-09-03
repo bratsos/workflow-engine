@@ -27,7 +27,6 @@ export type {
   AICallLogger,
   AICallRecord,
   AIHelperStats,
-  ArtifactPersistence,
   ArtifactType,
   CreateAICallInput,
   CreateLogInput,
