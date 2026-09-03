@@ -37,6 +37,7 @@ import {
   DURABLE_SUSPEND_MARKER,
   isStepControlFlowError,
   STEP_API_PENDING_CONTROL_FLOW,
+  STEP_API_SETTLE_IN_FLIGHT,
   type StepApi,
   type StepInFlight,
   type StepSuspend,
@@ -461,8 +462,14 @@ function buildStage<
       try {
         result = await definition.execute(enhancedContext);
       } catch (error) {
-        if (isStepControlFlowError(error))
+        if (isStepControlFlowError(error)) {
+          // Steps may run concurrently under Promise.all. Let the siblings
+          // still in flight finish and record before the stage suspends —
+          // otherwise the replay meets their live leases as StepInFlight.
+          await enhancedContext.step[STEP_API_SETTLE_IN_FLIGHT]?.();
           return durableControlFlowResult(error);
+        }
+        await enhancedContext.step[STEP_API_SETTLE_IN_FLIGHT]?.();
         throw error;
       }
 
@@ -473,6 +480,7 @@ function buildStage<
           "WARN",
           "execute() returned after a durable step requested suspension; the return value was discarded",
         );
+        await enhancedContext.step[STEP_API_SETTLE_IN_FLIGHT]?.();
         return durableControlFlowResult(pendingSuspend);
       }
 

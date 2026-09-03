@@ -8,6 +8,7 @@ import type {
 import {
   parseStepDuration,
   STEP_API_PENDING_CONTROL_FLOW,
+  STEP_API_SETTLE_IN_FLIGHT,
   StepInFlight,
   StepLedgerNotConfiguredError,
   StepLedgerWriteError,
@@ -37,6 +38,14 @@ export interface CreateStepApiOptions {
 interface StepInvocation {
   id: string;
   seq: number;
+}
+
+/** A `run` step still executing in this invocation. */
+interface InFlightRun {
+  /** Settles once the step has recorded its outcome in the ledger. */
+  done: Promise<unknown>;
+  /** When this step's lease expires — the bound on waiting for it. */
+  leaseUntil: number;
 }
 
 function jsonRoundTrip(value: unknown, stepId: string): unknown {
@@ -218,7 +227,52 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
     return new Date(Math.min(now.getTime() + delayMs, deadline.getTime()));
   }
 
-  const api = {
+  const inFlight = new Set<InFlightRun>();
+
+  /**
+   * Let every in-flight `run` finish so its ledger row is written before the
+   * stage suspends. Bounded by the longest remaining lease: a step that
+   * outlives its lease belongs to the lease-expiry path, not to a suspension
+   * that would otherwise block forever. Failures need no handling here —
+   * `run` already recorded them as failed rows.
+   */
+  async function settleInFlight(): Promise<void> {
+    while (inFlight.size > 0) {
+      const pending = [...inFlight];
+      const boundMs = Math.max(
+        0,
+        Math.max(...pending.map((entry) => entry.leaseUntil)) -
+          options.clock.now().getTime(),
+      );
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const bounded = new Promise<"timeout">((resolve) => {
+        timer = setTimeout(() => resolve("timeout"), boundMs);
+        // Never hold the process open for a lease that outlives the run.
+        (timer as unknown as { unref?: () => void }).unref?.();
+      });
+      let outcome: "settled" | "timeout";
+      try {
+        outcome = await Promise.race([
+          Promise.allSettled(pending.map((entry) => entry.done)).then(
+            () => "settled" as const,
+          ),
+          bounded,
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+      for (const entry of pending) inFlight.delete(entry);
+      if (outcome === "timeout") {
+        options.onLog?.(
+          "WARN",
+          `${pending.length} durable run step(s) outlived their lease while the stage was suspending`,
+        );
+        return;
+      }
+    }
+  }
+
+  const impl = {
     async run<T>(id: string, fn: () => Promise<T>, opts: StepRunOptions = {}) {
       const invocation = begin(id);
       const leaseMs = positiveDuration(
@@ -441,7 +495,7 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
       );
     },
 
-    async sleep(id, duration) {
+    async sleep(id: string, duration: number | string): Promise<void> {
       const invocation = begin(id);
       const existing = await get(invocation, "sleep");
       if (existing?.status === "completed") return;
@@ -491,6 +545,28 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
         }),
       );
     },
+  };
+
+  const api = {
+    ...impl,
+    /**
+     * Steps may run concurrently under `Promise.all`. Each `run` is tracked
+     * while it executes so a suspension elsewhere can wait for it (see
+     * `settleInFlight`) instead of abandoning it mid-flight with a live
+     * lease, which the replay would meet as `StepInFlight`.
+     */
+    run<T>(id: string, fn: () => Promise<T>, opts: StepRunOptions = {}) {
+      const leaseUntil =
+        options.clock.now().getTime() +
+        positiveDuration(opts.leaseMs ?? defaultLeaseMs, "leaseMs");
+      const promise = impl.run(id, fn, opts);
+      const entry: InFlightRun = { done: promise, leaseUntil };
+      inFlight.add(entry);
+      // The caller owns `promise` and its rejection; this branch only
+      // removes the bookkeeping entry without creating a second rejection.
+      void promise.catch(() => {}).finally(() => inFlight.delete(entry));
+      return promise;
+    },
   } as StepApi;
 
   Object.defineProperty(api, "ai", {
@@ -518,6 +594,12 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
     configurable: false,
     enumerable: false,
     value: () => pendingControlFlow,
+  });
+
+  Object.defineProperty(api, STEP_API_SETTLE_IN_FLIGHT, {
+    configurable: false,
+    enumerable: false,
+    value: settleInFlight,
   });
 
   return api;

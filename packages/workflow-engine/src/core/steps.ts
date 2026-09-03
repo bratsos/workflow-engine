@@ -21,6 +21,14 @@ export const STEP_API_PENDING_CONTROL_FLOW: unique symbol = Symbol.for(
   "@bratsos/workflow-engine/step-api-pending-control-flow",
 ) as typeof STEP_API_PENDING_CONTROL_FLOW;
 
+/**
+ * Internal accessor used by the stage factory to let in-flight `run` steps
+ * finish (and record) before a suspension leaves `execute()`.
+ */
+export const STEP_API_SETTLE_IN_FLIGHT: unique symbol = Symbol.for(
+  "@bratsos/workflow-engine/step-api-settle-in-flight",
+) as typeof STEP_API_SETTLE_IN_FLIGHT;
+
 export interface StepRunOptions {
   /** Lease held while `fn` executes. Defaults to five minutes. */
   leaseMs?: number;
@@ -68,6 +76,14 @@ export interface StepApi {
   readonly [STEP_API_PENDING_CONTROL_FLOW]?: () =>
     | StepControlFlowError
     | undefined;
+  /**
+   * Wait for every `run` step still executing in this invocation to settle,
+   * bounded by the longest remaining lease. Steps may run concurrently under
+   * `Promise.all`; when one of them suspends, the siblings are given the
+   * chance to finish and record before the stage suspends, so the replay
+   * finds completed rows instead of live leases (`StepInFlight`).
+   */
+  readonly [STEP_API_SETTLE_IN_FLIGHT]?: () => Promise<void>;
 }
 
 export interface StepSuspendOptions {
