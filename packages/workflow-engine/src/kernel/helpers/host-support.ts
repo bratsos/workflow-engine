@@ -19,6 +19,10 @@ import type { JobTransport } from "../ports.js";
 
 /** Default tuning knobs shared by every host implementation. */
 export const HOST_DEFAULTS = {
+  /** Worker id used when a caller does not supply one. */
+  workerId: "worker",
+  /** `console.error` prefix used when a caller does not supply one. */
+  logPrefix: "[Host]",
   /** Stale lease threshold (ms) past which a job's lease is reclaimed. */
   staleLeaseThresholdMs: 300_000,
   /** Max pending runs to claim per maintenance tick. */
@@ -66,10 +70,16 @@ export interface ExecuteJobWithHeartbeatOptions {
   jobTransport: JobTransport;
   /** The dequeued job to execute. */
   job: HostJobMessage;
-  /** Job lease heartbeat interval in milliseconds. */
-  jobHeartbeatIntervalMs: number;
-  /** Prefix for this host's `console.error` diagnostics, e.g. "[NodeHost]". */
-  logPrefix: string;
+  /**
+   * Job lease heartbeat interval in milliseconds. Defaults to
+   * `HOST_DEFAULTS.jobHeartbeatIntervalMs`.
+   */
+  jobHeartbeatIntervalMs?: number;
+  /**
+   * Prefix for this host's `console.error` diagnostics, e.g. "[NodeHost]".
+   * Defaults to `HOST_DEFAULTS.logPrefix`.
+   */
+  logPrefix?: string;
 }
 
 export interface ExecuteJobOutcome {
@@ -87,7 +97,12 @@ export async function executeJobWithHeartbeat(
   kernel: Kernel,
   options: ExecuteJobWithHeartbeatOptions,
 ): Promise<ExecuteJobOutcome> {
-  const { jobTransport, job, jobHeartbeatIntervalMs, logPrefix } = options;
+  const {
+    jobTransport,
+    job,
+    jobHeartbeatIntervalMs = HOST_DEFAULTS.jobHeartbeatIntervalMs,
+    logPrefix = HOST_DEFAULTS.logPrefix,
+  } = options;
 
   const config =
     (job.payload as { config?: Record<string, unknown> }).config || {};
@@ -165,15 +180,31 @@ export async function executeJobWithHeartbeat(
 // runMaintenanceTick
 // ============================================================================
 
+/**
+ * Every field is optional; anything omitted falls back to `HOST_DEFAULTS`,
+ * so a caller can pass `{}` (or just the one knob it cares about) and still
+ * get the tuning the built-in hosts use.
+ */
 export interface RunMaintenanceTickOptions {
-  /** Unique worker identifier passed to `run.claimPending`. */
-  workerId: string;
-  maxClaimsPerTick: number;
-  maxSuspendedChecksPerTick: number;
-  maxOutboxFlushPerTick: number;
-  staleLeaseThresholdMs: number;
-  /** Prefix for this host's `console.error` diagnostics, e.g. "[NodeHost]". */
-  logPrefix: string;
+  /**
+   * Unique worker identifier passed to `run.claimPending`. Defaults to
+   * `HOST_DEFAULTS.workerId` — pass a distinct id when more than one
+   * process runs maintenance.
+   */
+  workerId?: string;
+  /** Defaults to `HOST_DEFAULTS.maxClaimsPerTick`. */
+  maxClaimsPerTick?: number;
+  /** Defaults to `HOST_DEFAULTS.maxSuspendedChecksPerTick`. */
+  maxSuspendedChecksPerTick?: number;
+  /** Defaults to `HOST_DEFAULTS.maxOutboxFlushPerTick`. */
+  maxOutboxFlushPerTick?: number;
+  /** Defaults to `HOST_DEFAULTS.staleLeaseThresholdMs`. */
+  staleLeaseThresholdMs?: number;
+  /**
+   * Prefix for this host's `console.error` diagnostics, e.g. "[NodeHost]".
+   * Defaults to `HOST_DEFAULTS.logPrefix`.
+   */
+  logPrefix?: string;
 }
 
 /**
@@ -197,15 +228,15 @@ export interface MaintenanceTickCounts {
  */
 export async function runMaintenanceTick(
   kernel: Kernel,
-  options: RunMaintenanceTickOptions,
+  options: RunMaintenanceTickOptions = {},
 ): Promise<MaintenanceTickCounts> {
   const {
-    workerId,
-    maxClaimsPerTick,
-    maxSuspendedChecksPerTick,
-    maxOutboxFlushPerTick,
-    staleLeaseThresholdMs,
-    logPrefix,
+    workerId = HOST_DEFAULTS.workerId,
+    maxClaimsPerTick = HOST_DEFAULTS.maxClaimsPerTick,
+    maxSuspendedChecksPerTick = HOST_DEFAULTS.maxSuspendedChecksPerTick,
+    maxOutboxFlushPerTick = HOST_DEFAULTS.maxOutboxFlushPerTick,
+    staleLeaseThresholdMs = HOST_DEFAULTS.staleLeaseThresholdMs,
+    logPrefix = HOST_DEFAULTS.logPrefix,
   } = options;
 
   let claimed = 0;

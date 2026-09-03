@@ -371,6 +371,45 @@ type UniqueStageId<
   TContext extends Record<string, unknown>,
 > = TId extends keyof TContext ? never : unknown;
 
+/** The keys of `T` that are not optional. */
+type RequiredContextKeys<T> = {
+  [K in keyof T]-?: Record<string, never> extends Pick<T, K> ? never : K;
+}[keyof T];
+
+/**
+ * Guard for the prebuilt-stage overloads (`.stage(prebuilt)` / `.pipe()`):
+ * a stage that declares a context must only require keys earlier stages
+ * already produce, with assignable values. Intersected with the parameter
+ * type the same way {@link UniqueStageId} is, so a mismatch shows up as a
+ * missing `__error` property naming the problem instead of a type error
+ * deep inside the stage's own generics.
+ *
+ * A stage built without an explicit `TContext` has the open
+ * `Record<string, unknown>` and is accepted anywhere, as before.
+ */
+type StageContextSatisfied<
+  TStageContext extends Record<string, unknown>,
+  TContext extends Record<string, unknown>,
+> = string extends keyof TStageContext
+  ? unknown
+  : keyof TStageContext extends never
+    ? unknown
+    : [Exclude<RequiredContextKeys<TStageContext>, keyof TContext>] extends [
+          never,
+        ]
+      ? TContext extends TStageContext
+        ? unknown
+        : {
+            __error: "stage requires context values that earlier stages do not produce with a compatible type";
+          }
+      : {
+          __error: `stage requires context keys not produced by earlier stages: ${Exclude<
+            RequiredContextKeys<TStageContext>,
+            keyof TContext
+          > &
+            string}`;
+        };
+
 /**
  * Fields the builder supplies or constrains on top of `defineStage`'s
  * definition shape: `id` comes from the first argument, `name` defaults to
@@ -624,7 +663,8 @@ export class WorkflowBuilder<
       TStageContext,
       TStageId
     > &
-      UniqueStageId<TStageId, TContext>,
+      UniqueStageId<TStageId, TContext> &
+      StageContextSatisfied<TStageContext, TContext>,
   ): WorkflowBuilder<
     TInput,
     TStageOutput,
@@ -667,7 +707,8 @@ export class WorkflowBuilder<
       TStageConfig,
       TStageContext,
       TStageId
-    >,
+    > &
+      StageContextSatisfied<TStageContext, TContext>,
   ): WorkflowBuilder<
     TInput,
     TStageOutput,

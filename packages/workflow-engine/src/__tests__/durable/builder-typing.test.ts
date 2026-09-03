@@ -319,4 +319,55 @@ describe("builder-first typed workflows (runtime)", () => {
       }),
     ).toThrow(/missing dependencies: missing/);
   });
+  describe("prebuilt stages are checked against the accumulated context", () => {
+    const Needs = defineStage<{ "chapter-index": { chapters: string[] } }>()({
+      id: "needs-index",
+      name: "Needs Index",
+      schemas: { input: "none", output: z.string(), config: Cfg },
+      async execute(ctx) {
+        return { output: `${ctx.require("chapter-index").chapters.length}` };
+      },
+    });
+
+    const indexStage = defineStage({
+      id: "chapter-index",
+      name: "Chapter Index",
+      schemas: { input: "none", output: ChapterIndex, config: Cfg },
+      async execute() {
+        return { output: { chapters: ["one"] } };
+      },
+    });
+
+    it("accepts a prebuilt stage whose context keys are already produced", () => {
+      const workflow = defineWorkflow("prebuilt-ok")
+        .stage(indexStage)
+        .stage(Needs)
+        .build();
+      expect(workflow.getStage("needs-index")).toBeDefined();
+    });
+
+    it("rejects a prebuilt stage requiring a key no earlier stage produces", () => {
+      const builder = defineWorkflow("prebuilt-missing");
+      // @ts-expect-error — "chapter-index" is not in the accumulated context
+      builder.stage(Needs);
+      // @ts-expect-error — .pipe() is checked identically
+      builder.pipe(Needs);
+    });
+
+    it("rejects a prebuilt stage whose context value type is incompatible", () => {
+      const wrongShape = defineStage<{
+        "chapter-index": { chapters: number };
+      }>()({
+        id: "wrong-shape",
+        name: "Wrong Shape",
+        schemas: { input: "none", output: z.string(), config: Cfg },
+        async execute(ctx) {
+          return { output: `${ctx.require("chapter-index").chapters}` };
+        },
+      });
+      const builder = defineWorkflow("prebuilt-mismatch").stage(indexStage);
+      // @ts-expect-error — chapters is string[] here, not number
+      builder.stage(wrongShape);
+    });
+  });
 });
