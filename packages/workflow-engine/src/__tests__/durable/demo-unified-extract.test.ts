@@ -10,9 +10,9 @@ import { z } from "zod";
 import { defineStage } from "../../core/stage-factory.js";
 import { createMockAIHelperFactory } from "../utils/index.js";
 import {
+  crashOnClaim,
   createAiMapHarness,
   REALTIME_MODEL,
-  withCallHook,
 } from "./ai-map-harness.js";
 
 const SectionSchema = z.object({
@@ -93,22 +93,18 @@ describe("unified extraction stage on step.ai.map", () => {
         object: { sections: [{ title: doc.id, body: `section of ${doc.id}` }] },
       });
     }
-    let calls = 0;
-    const crashing = withCallHook(mock, () => {
-      calls++;
-      if (calls === 10) throw new Error("worker lost");
-    });
     const h = await createAiMapHarness({
       stage: unifiedExtract,
       inputSchema,
       outputSchema,
       input: { documents },
       mock,
-      aiFactory: crashing,
+      // The worker is lost while claiming the tenth document.
+      wrapLedger: (ledger, now) => crashOnClaim(ledger, "extract:doc-9", now),
     });
 
     await expect(h.execute()).resolves.toMatchObject({ outcome: "suspended" });
-    await h.settle();
+    await h.settle(5_000);
     expect((await h.stage())?.status).toBe("COMPLETED");
 
     // Every document reached the model exactly once (the crashed call never did).

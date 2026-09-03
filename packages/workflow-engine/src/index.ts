@@ -4,6 +4,9 @@
  * Export core workflow components for external use.
  */
 
+// The AI SDK error an adapter should throw so `ctx.step.ai.map` repairs the
+// item instead of counting the call against `realtime.retries`.
+export { NoObjectGeneratedError } from "ai";
 export { NoInputSchema } from "./core/schema-helpers";
 export { type Stage } from "./core/stage";
 export {
@@ -26,6 +29,7 @@ export {
   isValidStageId,
   type WorkflowStageId,
 } from "./core/stage-ids";
+
 export {
   AiMapBatchFailedError,
   AiMapBudgetExceededError,

@@ -89,15 +89,16 @@ describe("ctx.step.ai.map — consumer feedback surfaces", () => {
     expect(b && "cause" in b).toBe(false);
   });
 
-  it("retries a scripted one-shot failure and succeeds on replay", async () => {
-    const workflow = mapWorkflow("map-fail-once", {
-      realtime: { retries: 1, concurrency: 2 },
+  it("retries a thrown item call in-process and completes in one execution", async () => {
+    const workflow = mapWorkflow("map-fail-twice", {
+      realtime: { retries: 2, concurrency: 2 },
     });
     const harness = createTestHarness({ workflows: [workflow] });
     harness.mockAi.setTextResponse("process", { text: "processed" });
-    harness.mockAi.failOnce("process b", new Error("one bad call"));
+    harness.mockAi.failOnce("process b", new Error("first bad call"));
+    harness.mockAi.failOnce("process b", new Error("second bad call"));
 
-    const result = await harness.run("map-fail-once", {
+    const result = await harness.run("map-fail-twice", {
       items: ["a", "b", "c"],
     });
 
@@ -107,12 +108,104 @@ describe("ctx.step.ai.map — consumer feedback surfaces", () => {
       "succeeded",
       "succeeded",
     ]);
-    // The failed attempt suspended the stage (and replayed) rather than
-    // failing the item.
-    expect(result.reports[0]?.outcomes[0]?.outcome).toBe("suspended");
-    expect(result.reports[0]?.suspendedChecked).toBeGreaterThan(0);
+    // No suspension: the stage completed on its first execution.
+    const executions = result.reports.flatMap((r) => r.outcomes);
+    expect(executions).toEqual([{ stageId: "map", outcome: "completed" }]);
+    // The mock records only calls that answered; the two scripted throws
+    // happened inside the same execution.
+    expect(harness.mockAi.getCalls()).toHaveLength(3);
+    expect(result.reports.every((r) => r.suspendedChecked === 0)).toBe(true);
+    const stage = await harness.persistence.getStage(
+      result.workflowRunId,
+      "map",
+    );
+    const row = await harness.stepLedger.get(stage!.id, "items:b");
+    expect(row).toMatchObject({ status: "completed", attempt: 3 });
+    const b = results(result.output)[1];
+    expect(b?.status === "succeeded" && b.attempts).toBe(3);
   });
 
+  it("repairs when the adapter throws an error carrying the model's text", async () => {
+    const workflow = mapWorkflow("map-repair-text-error", {
+      schema: z.object({ value: z.string() }),
+      realtime: { retries: 0, concurrency: 1 },
+      repair: { attempts: 1 },
+    });
+    const harness = createTestHarness({ workflows: [workflow] });
+    harness.mockAi.setObjectResponse("process", { object: { value: "ok" } });
+    const bad = new Error("could not parse the response") as Error & {
+      text: string;
+    };
+    bad.name = "AdapterParseError";
+    bad.text = "```json\n{ value: oops }\n```";
+    harness.mockAi.failOnce("process a", bad);
+
+    const result = await harness.run("map-repair-text-error", {
+      items: ["a"],
+    });
+
+    expect(result.status).toBe("COMPLETED");
+    const [a] = results(result.output);
+    expect(a).toMatchObject({ status: "succeeded", attempts: 2 });
+    // The repair prompt quoted the bad output back to the model.
+    const repairCall = harness.mockAi.getCalls().at(-1);
+    expect(String(repairCall?.prompt)).toContain("{ value: oops }");
+    expect(String(repairCall?.prompt)).toContain(
+      "could not parse the response",
+    );
+  });
+
+  it("treats a thrown ZodError as repairable output", async () => {
+    const workflow = mapWorkflow("map-repair-zod-error", {
+      schema: z.object({ value: z.string() }),
+      realtime: { retries: 0, concurrency: 1 },
+      repair: { attempts: 1 },
+    });
+    const harness = createTestHarness({ workflows: [workflow] });
+    harness.mockAi.setObjectResponse("process", { object: { value: "ok" } });
+    const zodError = z.object({ value: z.string() }).safeParse({ value: 1 });
+    harness.mockAi.failOnce(
+      "process a",
+      zodError.success ? new Error("unreachable") : zodError.error,
+    );
+
+    const result = await harness.run("map-repair-zod-error", { items: ["a"] });
+
+    expect(result.status).toBe("COMPLETED");
+    expect(results(result.output)[0]).toMatchObject({
+      status: "succeeded",
+      attempts: 2,
+    });
+    expect(String(harness.mockAi.getCalls().at(-1)?.prompt)).toContain(
+      "value:",
+    );
+  });
+
+  it("fails the item, not the stage, when in-process retries are exhausted", async () => {
+    const workflow = mapWorkflow("map-retries-exhausted", {
+      realtime: { retries: 1, concurrency: 1 },
+    });
+    const harness = createTestHarness({ workflows: [workflow] });
+    harness.mockAi.setTextResponse("process", { text: "processed" });
+    harness.mockAi.failOnce("process a", new SubscriptionLimitError());
+    harness.mockAi.failOnce("process a", new SubscriptionLimitError());
+
+    const result = await harness.run("map-retries-exhausted", {
+      items: ["a", "b"],
+    });
+
+    expect(result.status).toBe("COMPLETED");
+    const [a, b] = results(result.output);
+    expect(a).toMatchObject({
+      status: "failed",
+      errorName: "SubscriptionLimitError",
+      attempts: 2,
+    });
+    expect(b?.status).toBe("succeeded");
+    expect(result.reports.flatMap((r) => r.outcomes)).toEqual([
+      { stageId: "map", outcome: "completed" },
+    ]);
+  });
   it("paces each concurrency slot with realtime.minDelayMs", async () => {
     const workflow = mapWorkflow("map-min-delay", {
       realtime: { concurrency: 1, minDelayMs: 40, retries: 0 },

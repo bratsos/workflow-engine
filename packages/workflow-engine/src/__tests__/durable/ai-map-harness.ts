@@ -12,8 +12,9 @@ import { AIBatchImpl } from "../../ai/batch-helper.js";
 import { registerModels } from "../../ai/model-helper.js";
 import type { AIHelper } from "../../ai/types.js";
 import type { defineStage } from "../../core/stage-factory.js";
+import { StepInFlight } from "../../core/steps.js";
 import { WorkflowBuilder } from "../../core/workflow.js";
-import type { AIHelperFactory } from "../../kernel/ports.js";
+import type { AIHelperFactory, StepLedger } from "../../kernel/ports.js";
 import { FakeClock } from "../../kernel/testing/fake-clock.js";
 import { InMemoryAICallLogger } from "../../testing/in-memory-ai-logger.js";
 import { InMemoryStepLedger } from "../../testing/in-memory-step-ledger.js";
@@ -169,8 +170,40 @@ export function withCallHook(
   };
 }
 
+/**
+ * Emulate a worker dying the moment it claims `stepId`: the claim throws
+ * `StepInFlight` once (what a replay meets when the dead worker's row is
+ * still leased), so the stage suspends and the next poll replays it with
+ * every earlier step answered from the ledger.
+ */
+export function crashOnClaim(
+  inner: StepLedger,
+  stepId: string,
+  now: () => Date,
+): StepLedger {
+  let crashed = false;
+  return {
+    claim: (record) => {
+      if (record.stepId === stepId && !crashed) {
+        crashed = true;
+        throw new StepInFlight(stepId, now());
+      }
+      return inner.claim(record);
+    },
+    get: (stageRecordId, id) => inner.get(stageRecordId, id),
+    update: (stageRecordId, id, patch) =>
+      inner.update(stageRecordId, id, patch),
+    compareAndSet: (stageRecordId, id, expected, patch) =>
+      inner.compareAndSet(stageRecordId, id, expected, patch),
+    list: (stageRecordId) => inner.list(stageRecordId),
+    clear: (stageRecordId) => inner.clear(stageRecordId),
+  };
+}
+
 export interface HarnessOptions {
   stage: ReturnType<typeof defineStage>;
+  /** Wrap the harness ledger (e.g. `crashOnClaim`) before the kernel sees it. */
+  wrapLedger?: (ledger: StepLedger, now: () => Date) => StepLedger;
   inputSchema: z.ZodTypeAny;
   outputSchema: z.ZodTypeAny;
   input: Record<string, unknown>;
@@ -183,7 +216,10 @@ export async function createAiMapHarness(opts: HarnessOptions) {
   const mock = opts.mock ?? createMockAIHelperFactory();
   const aiLogger = new InMemoryAICallLogger();
   const clock = new FakeClock();
-  const ledger = new InMemoryStepLedger({ now: () => clock.now() });
+  const inner = new InMemoryStepLedger({ now: () => clock.now() });
+  const ledger = opts.wrapLedger
+    ? opts.wrapLedger(inner, () => clock.now())
+    : inner;
   const workflowId = `wf-${opts.stage.id}`;
   const workflow = new WorkflowBuilder(
     workflowId,
@@ -215,7 +251,7 @@ export async function createAiMapHarness(opts: HarnessOptions) {
     ...harness,
     mock,
     aiLogger,
-    ledger,
+    ledger: inner,
     workflowRunId,
     topic: `workflow.${workflowRunId}.stage.${opts.stage.id}`,
     execute: () =>

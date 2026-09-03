@@ -581,6 +581,9 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
         const record = await ledger.get(stageRecordId, stepId);
         return record?.status === "completed";
       },
+      async noteAttempt(stepId, attempt) {
+        await update(stepId, { attempt });
+      },
       assertReady: () => void requireLedger(),
       ai: () => {
         if (!options.ai) throw new AIServicesNotConfiguredError();

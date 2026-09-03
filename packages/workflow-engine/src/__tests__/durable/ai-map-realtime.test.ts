@@ -4,6 +4,7 @@ import { defineStage } from "../../core/stage-factory.js";
 import type { AiMapResult } from "../../core/step-ai.js";
 import { createMockAIHelperFactory } from "../utils/index.js";
 import {
+  crashOnClaim,
   createAiMapHarness,
   REALTIME_MODEL,
   withCallHook,
@@ -85,11 +86,6 @@ describe("step.ai.map realtime policy", () => {
   it("replays after a crash and only calls the model for the remaining items", async () => {
     const mock = createMockAIHelperFactory();
     seedValidResponses(mock, 5);
-    let calls = 0;
-    const crashing = withCallHook(mock, () => {
-      calls++;
-      if (calls === 4) throw new Error("simulated crash");
-    });
     let captured: AiMapResult<{ value: string }>[] = [];
     const stage = makeStage("rt-crash", {
       concurrency: 1,
@@ -103,18 +99,17 @@ describe("step.ai.map realtime policy", () => {
       outputSchema,
       input: { count: 5 },
       mock,
-      aiFactory: crashing,
+      wrapLedger: (ledger, now) => crashOnClaim(ledger, "extract:3", now),
     });
 
     await expect(h.execute()).resolves.toMatchObject({ outcome: "suspended" });
     expect(mock.getCalls()).toHaveLength(3);
     expect((await h.stage())?.status).toBe("SUSPENDED");
 
-    await h.tick();
+    await h.tick(5_000);
     expect((await h.stage())?.status).toBe("COMPLETED");
     // Three before the crash, two on replay; completed items came from the ledger.
     expect(mock.getCalls()).toHaveLength(5);
-    expect(calls).toBe(6);
     expect(captured.every((r) => r.status === "succeeded")).toBe(true);
   });
 

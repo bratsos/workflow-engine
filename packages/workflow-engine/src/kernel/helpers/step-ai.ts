@@ -54,6 +54,10 @@ export interface StepAiDeps {
   waitFor: StepApi["waitFor"];
   /** True when the step already holds a completed result (used to skip budget reservation). */
   isCompleted(stepId: string): Promise<boolean>;
+  /** Record an in-process retry on a running step: bumps the row's `attempt`. */
+  noteAttempt(stepId: string, attempt: number): Promise<void>;
+  /** Wait before an in-process retry. Defaults to a real timer. */
+  delay?(ms: number): Promise<void>;
   /** Throws when durable steps are unavailable (no ledger / stage record). */
   assertReady(): void;
   ai(): AIHelper;
@@ -159,26 +163,47 @@ function withRepair(prompt: TextInput, feedback: Feedback): TextInput {
 }
 
 /**
- * AI SDK `generateObject` throws `AI_NoObjectGeneratedError` when the model's
- * output cannot be parsed or validated. Treat that as repairable output
- * rather than a transient failure so it goes through the repair loop.
+ * Decide whether a thrown model call is repairable output rather than a
+ * transport failure. Repairable: the AI SDK's `AI_NoObjectGeneratedError`,
+ * any error that carries the model's raw text (`text`, or `cause.text`), a
+ * Zod error, or a JSON `SyntaxError` — i.e. the model answered and the
+ * answer could not be parsed or validated. Anything else counts against
+ * `realtime.retries`.
  */
 function asGenerationFailure(error: unknown): Feedback | undefined {
-  if (
-    typeof error === "object" &&
-    error !== null &&
-    (error as { name?: unknown }).name === "AI_NoObjectGeneratedError"
-  ) {
-    const e = error as { text?: unknown; cause?: unknown; message?: string };
-    return {
-      output: typeof e.text === "string" ? e.text : undefined,
-      issues:
-        e.cause instanceof Error
-          ? e.cause.message
-          : (e.message ?? "No object generated"),
-    };
-  }
-  return undefined;
+  if (typeof error !== "object" || error === null) return undefined;
+  const e = error as {
+    name?: unknown;
+    text?: unknown;
+    cause?: unknown;
+    message?: string;
+    issues?: unknown;
+  };
+  const cause =
+    typeof e.cause === "object" && e.cause !== null
+      ? (e.cause as { name?: unknown; text?: unknown; issues?: unknown })
+      : undefined;
+  const text =
+    typeof e.text === "string"
+      ? e.text
+      : typeof cause?.text === "string"
+        ? cause.text
+        : undefined;
+  const isZod = (x: { name?: unknown; issues?: unknown } | undefined) =>
+    x !== undefined && x.name === "ZodError" && Array.isArray(x.issues);
+  const repairable =
+    e.name === "AI_NoObjectGeneratedError" ||
+    text !== undefined ||
+    isZod(e) ||
+    error instanceof SyntaxError;
+  if (!repairable) return undefined;
+
+  let issues: string;
+  if (isZod(e)) issues = formatIssues(error as z.ZodError);
+  else if (isZod(cause)) issues = formatIssues(cause as z.ZodError);
+  else if (e.cause instanceof Error) issues = e.cause.message;
+  else issues = e.message || "No object generated";
+  return { output: text, issues };
 }
 
 function createBudget(limit: number | undefined): Budget {
@@ -364,6 +389,9 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
     const retries = spec.realtime?.retries ?? DEFAULT_REALTIME_RETRIES;
     const retryDelayMs = parseStepDuration(spec.realtime?.retryDelayMs ?? 0);
     const minDelayMs = parseStepDuration(spec.realtime?.minDelayMs ?? 0);
+    const wait =
+      deps.delay ??
+      ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
     const callOptions = {
       ...(spec.maxTokens !== undefined ? { maxTokens: spec.maxTokens } : {}),
       ...(spec.temperature !== undefined
@@ -403,10 +431,16 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
       return [{ type: "text", text: spec.system }, ...prompt];
     }
 
-    /** One item's attempt loop; runs inside `step.run`, so it is memoized. */
+    /**
+     * One item's attempt loop; runs inside `step.run`, so it is memoized.
+     * A thrown model call (transport, quota, ...) is retried IN-PROCESS up
+     * to `realtime.retries` times after `retryDelayMs`, bumping the ledger
+     * row's `attempt`; the stage never suspends for a map item.
+     */
     async function executeItem(
       entry: ItemEntry<TIn>,
       prior: PriorAttempt | undefined,
+      stepId: string,
     ): Promise<AiMapResult<TOut>> {
       const ai = deps.ai();
       let attempts = prior?.attempts ?? 0;
@@ -415,7 +449,36 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
       let cost = prior?.cost ?? 0;
       let feedback = prior?.feedback;
       let repairsLeft = repairAttempts;
+      let retriesLeft = retries;
+      let rowAttempt = 1;
       const base = { id: entry.id, index: entry.index };
+
+      /**
+       * Route a thrown model call: control flow propagates, repairable
+       * output becomes feedback, anything else consumes a retry or fails
+       * the item. Returns the failed verdict when no retry remains.
+       */
+      async function onThrown(
+        error: unknown,
+      ): Promise<"repair" | "retry" | AiMapResult<TOut>> {
+        if (isStepControlFlowError(error)) throw error;
+        const failure = asGenerationFailure(error);
+        if (failure) {
+          feedback = failure;
+          return "repair";
+        }
+        if (retriesLeft <= 0) {
+          return failed(
+            errorMessage(error),
+            error instanceof Error ? error.name : undefined,
+          );
+        }
+        retriesLeft--;
+        rowAttempt++;
+        await deps.noteAttempt(stepId, rowAttempt);
+        if (retryDelayMs > 0) await wait(retryDelayMs);
+        return "retry";
+      }
 
       const failed = (
         error: string,
@@ -447,12 +510,19 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
         attempts++;
 
         if (spec.stream) {
-          const collected = await collectStream(
-            ai,
-            spec.model,
-            prompt,
-            callOptions,
-          );
+          let collected: StepStreamResult;
+          try {
+            collected = await collectStream(
+              ai,
+              spec.model,
+              prompt,
+              callOptions,
+            );
+          } catch (error) {
+            const routed = await onThrown(error);
+            if (routed === "repair" || routed === "retry") continue;
+            return routed;
+          }
           inputTokens += collected.inputTokens;
           outputTokens += collected.outputTokens;
           cost += collected.cost;
@@ -499,7 +569,14 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
         }
 
         if (!spec.schema) {
-          const result = await ai.generateText(spec.model, prompt, callOptions);
+          let result: AITextResult;
+          try {
+            result = await ai.generateText(spec.model, prompt, callOptions);
+          } catch (error) {
+            const routed = await onThrown(error);
+            if (routed === "repair" || routed === "retry") continue;
+            return routed;
+          }
           inputTokens += result.inputTokens;
           outputTokens += result.outputTokens;
           cost += result.cost;
@@ -528,10 +605,9 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
           cost += result.cost;
           object = result.object;
         } catch (error) {
-          const failure = asGenerationFailure(error);
-          if (!failure) throw error;
-          feedback = failure;
-          continue;
+          const routed = await onThrown(error);
+          if (routed === "repair" || routed === "retry") continue;
+          return routed;
         }
 
         const parsed = spec.schema.safeParse(object);
@@ -559,33 +635,46 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
       subset: ItemEntry<TIn>[],
       priors: Map<string, PriorAttempt>,
     ): Promise<AiMapResult<TOut>[]> {
+      // Resolve which items the ledger already answers BEFORE any task
+      // starts: `deps.run` reserves the item's seq synchronously on entry,
+      // so no task may await ahead of it or the seq order would follow the
+      // ledger's response order and differ between replays.
+      const completed = new Set<string>();
+      await Promise.all(
+        subset.map(async (entry) => {
+          if (priors.has(entry.id)) return;
+          if (await deps.isCompleted(itemStepId(entry.id))) {
+            completed.add(entry.id);
+          }
+        }),
+      );
       const tasks = subset.map((entry) => async () => {
         const stepId = itemStepId(entry.id);
         const prior = priors.get(entry.id);
-        if (!prior && !(await deps.isCompleted(stepId))) {
+        if (!prior && !completed.has(entry.id)) {
           if (!budget.reserve()) {
             throw new AiMapBudgetExceededError(id, spec.realtime?.budget ?? 0);
           }
         }
         try {
-          return await deps.run(stepId, () => executeItem(entry, prior), {
-            retries,
-            retryDelayMs,
-          });
+          return await deps.run(stepId, () =>
+            executeItem(entry, prior, stepId),
+          );
         } catch (error) {
           if (isStepControlFlowError(error)) throw error;
           if (error instanceof AiMapBudgetExceededError) throw error;
-          // The item's model calls failed on every durable attempt. Memoize
-          // the verdict in its own step: the item step only stores the error
-          // *message*, so a later replay would otherwise lose `errorName`
-          // (the stored error is rebuilt as a plain `Error`).
+          // The item step itself failed (a throw outside the model-call
+          // retry loop, or a stored failure from an earlier release).
+          // Memoize the verdict in its own step: the item step only stores
+          // the error *message*, so a later replay would otherwise lose
+          // `errorName` (the stored error is rebuilt as a plain `Error`).
           const verdict: AiMapResult<TOut> = {
             id: entry.id,
             index: entry.index,
             status: "failed",
             error: errorMessage(error),
             ...(error instanceof Error ? { errorName: error.name } : {}),
-            attempts: (prior?.attempts ?? 0) + retries + 1,
+            attempts: (prior?.attempts ?? 0) + 1,
             inputTokens: prior?.inputTokens ?? 0,
             outputTokens: prior?.outputTokens ?? 0,
             cost: prior?.cost ?? 0,
