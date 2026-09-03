@@ -22,112 +22,155 @@ import {
 } from "@bratsos/workflow-engine/kernel/testing";
 ```
 
-## Test Kernel Setup
+## The test harness
 
-Create a fully in-memory kernel for testing:
+`createTestHarness` wires every in-memory port behind a real kernel *and*
+drives it: create a run, claim it, execute its jobs through the same
+`executeJobWithHeartbeat` the hosts use, poll suspended stages so durable
+stages replay, flush the outbox, and advance the fake clock to the next poll
+deadline when nothing else can run.
 
 ```typescript
-import { createKernel } from "@bratsos/workflow-engine/kernel";
+import { createTestHarness } from "@bratsos/workflow-engine/testing";
+import { defineWorkflow } from "@bratsos/workflow-engine";
+import { z } from "zod";
 
-function createTestKernel(workflows: Map<string, Workflow>) {
-  const persistence = new InMemoryWorkflowPersistence();
-  const jobQueue = new InMemoryJobQueue();
-  const blobStore = new InMemoryBlobStore();
-  const eventSink = new CollectingEventSink();
-  const clock = new FakeClock();
+const In = z.object({ message: z.string() });
 
-  const kernel = createKernel({
-    persistence,
-    blobStore,
-    jobTransport: jobQueue,
-    eventSink,
-    clock,
-    registry: { getWorkflow: (id) => workflows.get(id) },
+const workflow = defineWorkflow("echo-wf", { input: In })
+  .stage("echo", {
+    schemas: {
+      input: In,
+      output: z.object({ echoed: z.string() }),
+      config: z.object({ prefix: z.string().default("") }),
+    },
+    async execute(ctx) {
+      return { output: { echoed: `${ctx.config.prefix}${ctx.input.message}` } };
+    },
+  })
+  .build();
+
+const harness = createTestHarness({ workflows: [workflow] });
+```
+
+It returns the kernel and every port it built, plus the two driver methods:
+
+| Field | What it is |
+| --- | --- |
+| `kernel` | the real `Kernel`, for dispatching commands directly |
+| `persistence`, `jobQueue`, `blobStore`, `eventSink` | the in-memory ports |
+| `stepLedger` | `InMemoryStepLedger` on the harness clock — durable steps work out of the box |
+| `aiLogger`, `mockAi` | `InMemoryAICallLogger` and the mock AI factory wired into `services` |
+| `clock` | the `FakeClock` the kernel and ledger share |
+| `run(workflowId, input, config?)` | create a run and drive ticks until it is terminal |
+| `tick()` | do exactly one round and return a `TickReport` |
+
+Options: `workflows`, `services` (merged over the mock AI defaults), `clock`,
+`stepLedger`, `aiLogger`, `mockAi`, `workerId`, `eventSink`, `plugins`,
+`maxTicks` (default 100 — `run()` throws rather than hang) and
+`idleAdvanceMs`.
+
+## Full workflow lifecycle test
+
+```typescript
+import { describe, expect, it } from "vitest";
+
+describe("echo workflow", () => {
+  it("completes a single-stage workflow", async () => {
+    const harness = createTestHarness({ workflows: [workflow] });
+
+    const result = await harness.run("echo-wf", { message: "hello" });
+
+    expect(result.status).toBe("COMPLETED");
+    expect(result.output).toEqual({ echoed: "hello" });
   });
 
-  return { kernel, persistence, jobQueue, blobStore, eventSink, clock };
+  it("passes per-stage config", async () => {
+    const harness = createTestHarness({ workflows: [workflow] });
+
+    // Per-stage config travels in the job's payload as `job.payload.config`,
+    // keyed by stage id — `run.create`'s `config` is what puts it there.
+    const result = await harness.run(
+      "echo-wf",
+      { message: "hello" },
+      { echo: { prefix: "> " } },
+    );
+
+    expect(result.output).toEqual({ echoed: "> hello" });
+  });
+});
+```
+
+`run()` returns `{ workflowRunId, status, output, error?, ticks, reports, run }`.
+`reports` is one `TickReport` per round — `{ claimed, executed, outcomes,
+suspendedChecked, resumed, eventsFlushed, advancedMs, idle }` — which is how a
+test asserts that a stage *suspended* before it completed:
+
+```typescript
+const result = await harness.run("durable-wf", { docId: "doc-1" });
+expect(result.reports[0]?.outcomes[0]?.outcome).toBe("suspended");
+```
+
+### Seeding AI responses
+
+`harness.mockAi` is the mock AI factory the kernel hands to every stage:
+
+```typescript
+harness.mockAi.setTextResponse("summarize", { text: "the summary" });
+harness.mockAi.mockObjectResponseForSchema(FactsSchema, { facts: [] });
+// The next matching call throws once; later calls succeed.
+harness.mockAi.failOnce("summarize", new Error("transient upstream 503"));
+
+expect(harness.mockAi.helper.getAllCallsRecursive()).toHaveLength(2);
+```
+
+## Driving the kernel by hand
+
+The harness is the host loop in miniature; when a test needs one specific
+step, dispatch it directly. The two host helpers are exported, so a test can
+run the same loop a host runs:
+
+```typescript
+import {
+  executeJobWithHeartbeat,
+  runMaintenanceTick,
+} from "@bratsos/workflow-engine/kernel";
+
+// One bounded maintenance pass: claim pending runs, poll suspended stages,
+// reap stale leases, flush the outbox, reap stuck runs. Every option falls
+// back to HOST_DEFAULTS.
+const counts = await runMaintenanceTick(kernel, { workerId: "w-1" });
+
+// Execute one dequeued job under a lease heartbeat and route its outcome.
+const job = await jobQueue.dequeue();
+if (job) {
+  await executeJobWithHeartbeat(kernel, { jobTransport: jobQueue, job });
 }
 ```
 
-## Full Workflow Lifecycle Test
+`stage.pollSuspended` is what resumes a suspended stage: for a durable stage
+it replays `execute()` with completed steps answered from the ledger; for an
+async-batch stage it calls `checkCompletion`. A stage is only picked up once
+its `nextPollAt` has passed, so a test with a `FakeClock` advances the clock
+first:
 
 ```typescript
-import { describe, it, expect, beforeEach } from "vitest";
-import { defineStage, defineWorkflow } from "@bratsos/workflow-engine";
-import { z } from "zod";
+harness.clock.advance(60_000);
+const polled = await harness.kernel.dispatch({ type: "stage.pollSuspended" });
+expect(polled.checked).toBe(1);
+```
 
-const echoStage = defineStage({
-  id: "echo",
-  name: "Echo",
-  schemas: {
-    input: z.object({ message: z.string() }),
-    output: z.object({ echoed: z.string() }),
-    config: z.object({}),
-  },
-  async execute(ctx) {
-    return { output: { echoed: ctx.input.message } };
-  },
-});
+## Lower-level: createTestKernel
 
-const workflow = defineWorkflow({
-  id: "echo-wf",
-  name: "Echo WF",
-  description: "Test",
-  input: z.object({ message: z.string() }),
-})
-  .pipe(echoStage)
-  .build();
+`createTestKernel(workflows, opts?)` builds the same ports and kernel without
+the driver loop, for tests that dispatch commands one at a time:
 
-describe("echo workflow", () => {
-  let kernel, persistence, jobQueue;
+```typescript
+import { createTestKernel } from "@bratsos/workflow-engine/testing";
 
-  beforeEach(() => {
-    const t = createTestKernel(new Map([["echo-wf", workflow]]));
-    kernel = t.kernel;
-    persistence = t.persistence;
-    jobQueue = t.jobQueue;
-  });
-
-  it("completes a single-stage workflow", async () => {
-    // 1. Create the run
-    const { workflowRunId } = await kernel.dispatch({
-      type: "run.create",
-      idempotencyKey: "test-1",
-      workflowId: "echo-wf",
-      input: { message: "hello" },
-    });
-
-    // 2. Claim pending runs (enqueues first-stage job)
-    await kernel.dispatch({
-      type: "run.claimPending",
-      workerId: "test-worker",
-    });
-
-    // 3. Dequeue and execute the job
-    const job = await jobQueue.dequeue();
-    expect(job).not.toBeNull();
-
-    await kernel.dispatch({
-      type: "job.execute",
-      workflowRunId: job.workflowRunId,
-      workflowId: job.workflowId,
-      stageId: job.stageId,
-      config: {},
-    });
-    await jobQueue.complete(job.jobId);
-
-    // 4. Transition the workflow
-    const { action } = await kernel.dispatch({
-      type: "run.transition",
-      workflowRunId,
-    });
-    expect(action).toBe("completed");
-
-    // 5. Verify final state
-    const run = await persistence.getRun(workflowRunId);
-    expect(run.status).toBe("COMPLETED");
-  });
-});
+const { kernel, persistence, jobTransport, clock, flush } = createTestKernel([
+  workflow,
+]);
 ```
 
 ## FakeClock

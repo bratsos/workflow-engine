@@ -34,8 +34,11 @@ export interface StepRunOptions {
   leaseMs?: number;
   /** Number of retries after the first failed attempt. Defaults to zero. */
   retries?: number;
-  /** Delay before retrying a failed attempt. Defaults to zero. */
-  retryDelayMs?: number;
+  /**
+   * Delay before retrying a failed attempt. A number of milliseconds or a
+   * duration string (`"30s"`, `"5m"`). Defaults to zero.
+   */
+  retryDelayMs?: number | string;
 }
 
 export interface StepWaitOptions<T> {

@@ -7,17 +7,49 @@ Durable steps let a stage's `execute()` be a replayable script: side effects run
 The kernel needs a `StepLedger` for durable steps and, for `ctx.ai`, AI services:
 
 ```typescript
-import { createKernel, createPrismaAICallLogger } from "@bratsos/workflow-engine";
-import { PrismaStepLedger } from "@bratsos/workflow-engine";
+import {
+  createKernel,
+  createPrismaAICallLogger,
+  createPrismaJobQueue,
+  createPrismaStepLedger,
+  createPrismaWorkflowPersistence,
+} from "@bratsos/workflow-engine";
+
+const persistence = createPrismaWorkflowPersistence(prisma);
 
 const kernel = createKernel({
-  ...deps,
-  stepLedger: new PrismaStepLedger(prisma),
+  persistence,
+  jobTransport: createPrismaJobQueue(prisma),
+  blobStore,                       // your BlobStore implementation
+  eventSink: { publish: async (event) => { await bus.emit(event); } },
+  clock: { now: () => new Date() },
+  registry: { getWorkflow: (id) => workflows.get(id) },
+  stepLedger: createPrismaStepLedger(prisma),
   services: { aiLogger: createPrismaAICallLogger(prisma) },
 });
 ```
 
-In tests use `InMemoryStepLedger`, `InMemoryAICallLogger` and `createMockAIHelperFactory()` from `@bratsos/workflow-engine/testing`. A stage that never touches `ctx.step` or `ctx.ai` runs without either; touching them unconfigured throws `StepLedgerNotConfiguredError` or `AIServicesNotConfiguredError`.
+`eventSink` and `clock` are not optional: the kernel publishes every outbox
+event through the sink and reads *all* time from the clock, which is what
+makes a run reproducible under a `FakeClock` in tests.
+
+In tests, use `createTestHarness()` from `@bratsos/workflow-engine/testing` —
+it builds the whole thing (in-memory persistence, job queue, blob store,
+event sink, `FakeClock`, `InMemoryStepLedger`, `InMemoryAICallLogger` and the
+mock AI factory) and drives the run loop for you. See
+`07-testing-patterns.md`. A stage that never touches `ctx.step` or `ctx.ai`
+runs without either; touching them unconfigured throws
+`StepLedgerNotConfiguredError` or `AIServicesNotConfiguredError`.
+
+```typescript
+import { createTestHarness } from "@bratsos/workflow-engine/testing";
+
+const harness = createTestHarness({ workflows: [myWorkflow] });
+harness.mockAi.setTextResponse("summarize", { text: "the summary" });
+
+const result = await harness.run("my-workflow", { docId: "doc-1" });
+expect(result.status).toBe("COMPLETED");
+```
 
 The Prisma ledger uses the `WorkflowStep` model from the package's `prisma/schema.prisma` (shipped in `node_modules/@bratsos/workflow-engine/prisma/`); consumers add it, with its `attempt`, `leaseExpiresAt` and `deadlineAt` columns, through a migration. The Prisma adapters also require every model the package schema defines, including `WorkflowAnnotation` (added in 0.8), so a consumer that skipped releases must add the missing models too. The adapters never import `@prisma/client` themselves; they work with any generator output, including Prisma 7's `prisma-client` generator with a custom `output`.
 
@@ -29,13 +61,14 @@ interface StepApi {
   waitFor<T>(id: string, opts: StepWaitOptions<T>): Promise<T>;
   waitForSignal<T = unknown>(id: string, opts: { timeout: number | string }): Promise<T>;
   sleep(id: string, duration: number | string): Promise<void>;
+  /** generateText / generateObject / streamText / map — see below. */
   readonly ai: StepAiApi;
 }
 
 interface StepRunOptions {
   leaseMs?: number;       // lease held while fn runs; default 5 minutes
   retries?: number;       // retries after the first failed attempt; default 0
-  retryDelayMs?: number;  // delay before a retry; default 0
+  retryDelayMs?: number | string; // delay before a retry ("30s"); default 0
 }
 
 interface StepWaitOptions<T> {
@@ -86,6 +119,30 @@ Suspension is a thrown control-flow error (`StepSuspend`, or `StepInFlight` when
 - Signalling a step twice is a no-op; the result carries `alreadyCompleted: true`. Signalling a timed-out step is rejected.
 - If `fn` succeeded but the ledger write failed, `run` throws `StepLedgerWriteError` and does not record a failure, because the side effect already happened; the lease expiry path re-claims on the next replay.
 
+### Concurrency
+
+Steps may run concurrently under `Promise.all`; a suspension lets in-flight
+steps finish and record before the stage suspends.
+
+```typescript
+const [profile, , invoices] = await Promise.all([
+  ctx.step.run("profile", () => api.profile(id)),
+  ctx.step.waitFor("export", { poll, ready, every: "30s", timeout: "1h" }),
+  ctx.step.run("invoices", () => api.invoices(id)),
+]);
+```
+
+When `export` suspends, `profile` and `invoices` are still in flight. The
+stage factory waits for every in-flight `run` to settle — success or failure,
+each recorded in its own ledger row — before the suspension is persisted,
+bounded by the longest remaining lease. Without that the replay would meet
+their live leases as `StepInFlight` and spin until the leases expired.
+
+Ids must still be unique within the invocation, and the *order* the steps are
+requested in is not guaranteed under `Promise.all`; the engine logs an order
+warning rather than failing, but keep the array literal stable so replays
+line up.
+
 ### Determinism rules
 
 - **Side effects only inside steps.** Everything outside `ctx.step.*` runs again on every replay. Reading `ctx.input`, `ctx.require(...)` and building prompts is fine; calling an API outside a step is not.
@@ -104,6 +161,54 @@ const summary = await ctx.step.ai.generateText("summary", "gemini-2.5-flash", pr
 const facts = await ctx.step.ai.generateObject("facts", "gemini-2.5-flash", prompt, FactsSchema);
 ```
 
+### Retries on a single call
+
+Both take a trailing `stepOptions?: StepRunOptions`, forwarded to the
+underlying `step.run`, so one model call gets the same durable retry, delay
+and lease as any other step:
+
+```typescript
+const summary = await ctx.step.ai.generateText(
+  "summary",
+  "gemini-2.5-flash",
+  prompt,
+  { maxTokens: 2000 },          // TextOptions — tools, stopWhen, onStepEnd too
+  { retries: 2, retryDelayMs: "30s", leaseMs: 120_000 },
+);
+```
+
+A thrown model call with `retries: 1` records the failure, suspends the stage
+for `retryDelayMs`, and re-runs on the next replay — exactly like
+`ctx.step.run`. When the retries are exhausted the stored error is rethrown
+and the stage fails.
+
+`TextOptions` is passed through untouched, so `tools`, `stopWhen` and
+`onStepEnd` work on a durable call. Only the *final* result is stored: tool
+calls are re-executed if the step itself re-runs, so keep tool bodies
+idempotent.
+
+### `ctx.step.ai.streamText`
+
+```typescript
+const draft = await ctx.step.ai.streamText(
+  "draft",
+  "gemini-2.5-flash",
+  prompt,
+  { onChunk: (chunk) => sink.write(chunk) },
+  { retries: 1 },
+);
+// StepStreamResult: { text, inputTokens, outputTokens, cost, reasoning? }
+```
+
+The first execution streams through `ctx.ai.streamText`, forwarding
+`onChunk`, waits for completion, and stores the final text, tokens, cost and
+reasoning as one `run` step. A replay returns the stored result without
+contacting the model and calls `onChunk` once with the whole text, so a
+consumer that renders incrementally still receives the content. There is no
+`rawResult` and no live stream in the stored result — neither survives a
+replay. Hosts with an idle-connection timeout (Cloudflare Workers) need this
+where a single non-streaming call would trip the timeout.
+
 ### `ctx.step.ai.map`
 
 One prompt per item under an execution policy, with schema validation and repair applied identically on the realtime and batch paths. Results come back in input order.
@@ -118,20 +223,24 @@ const results = await ctx.step.ai.map("extract", documents, {
   policy: "auto",
   auto: { batchAbove: 20 },
   batch: { pollEvery: "60s", timeout: "24h", onExpiry: "fail" },
-  realtime: { concurrency: 10, budget: 500 },
+  realtime: { concurrency: 10, budget: 500, minDelayMs: "1s" },
 });
 
 for (const r of results) {
   if (r.status === "succeeded") use(r.result, r.validated, r.cost);
+  else if (r.errorName === "SubscriptionLimitError") stopEarly(r.id);
   else ctx.log("WARN", `item ${r.id} failed after ${r.attempts} attempts: ${r.error}`);
 }
 ```
 
-- **Policy.** `auto` (default) uses batch when there are at least `auto.batchAbove` items (default 20), the model's registry entry has `supportsAsyncBatch`, a batch provider resolves, and every prompt is a string; otherwise realtime. `realtime` and `batch` force a path; forcing batch on a model that cannot batch throws.
+- **Policy.** `auto` (default) uses batch when there are at least `auto.batchAbove` items (default 20), the model's registry entry has `supportsAsyncBatch`, a batch provider resolves, and every prompt is a string; otherwise realtime. `realtime` and `batch` force a path; forcing batch on a model that cannot batch throws. Policy resolution consults `getModel(spec.model)` on *every* path, `policy: "realtime"` included — an unregistered key is tolerated there (it only rules batch out), but the model call itself still resolves the key, so register the model.
 - **Realtime.** Each item is a durable step `${id}:${itemId}` (default `itemId` is the index) run under an in-process semaphore of `concurrency` (default 10). A thrown model call is retried durably (`realtime.retries`, default 1). `budget` caps model calls including repairs per stage invocation: exceeding it before an item's first call throws `AiMapBudgetExceededError`; a repair that would exceed it returns the item as failed.
+- **Pacing.** `realtime.minDelayMs` (number or `"1s"`) is the minimum spacing between model calls *on one concurrency slot*: after a slot finishes an item it waits that long before taking the next one. With `concurrency: 4` and `minDelayMs: "1s"` the map makes at most four calls per second. Use it instead of a hand-written cooldown between items — a cooldown outside a step re-runs on every replay, and one inside a step burns a ledger row per item.
+- **Failed items do not fail the stage.** An item whose durable retries are exhausted comes back as `status: "failed"` and the map still resolves; deciding what a failed item means is the stage's job. This is the opposite of a bare `ctx.step.run`, where an exhausted step rethrows its stored error and the stage fails. A failed item carries `errorName` — the `Error.name` of the last failure — so a caller can tell a quota or transport error apart from a content failure without matching on the message. The verdict (including `errorName`) is itself memoized in a `${id}:${itemId}:failed` step, so later replays report the same name. There is no `cause`: map results live in the step ledger and must stay JSON.
+- **Streaming.** `stream: true` sends realtime items through `ctx.ai.streamText` and collects the text instead of calling `generateText`/`generateObject` — the same reason `ctx.step.ai.streamText` exists, for hosts that kill an idle connection. `schema` still applies: the collected text is parsed as JSON, validated, and repaired the usual way. The batch path ignores the flag.
 - **Batch.** `${id}:submit` submits the fan-out exactly once and stores the handle, refs and request ids; `${id}:poll` is a `waitFor` with a stored deadline; `${id}:collect` fetches results with the schemas re-supplied so `validated` is true. Items that failed or did not validate then go through the realtime repair pass. Nothing is threaded through `suspendedState.metadata`.
 - **Repair.** On a schema failure the item is re-prompted with its previous output and the Zod issues appended, up to `repair.attempts` times (default 1). `attempts` on the result counts every model call for the item.
-- **Expiry.** `onExpiry: "fail"` (default) throws `AiMapBatchFailedError` when the batch fails or the wait times out; `"partial"` returns every item as failed with that error so the stage can decide.
+- **Expiry.** `onExpiry: "fail"` (default) throws `AiMapBatchFailedError` when the batch fails or the wait times out; `"partial"` returns every item as failed with that error so the stage can decide. Failed items from the batch path carry `errorName` too: `StepTimeoutError`, `AiMapBatchFailedError`, `AiMapBatchItemFailedError` (the provider reported the request as failed) or `AiMapBatchItemMissingError` (the batch returned no result for it).
 - `itemId` values `submit`, `poll` and `collect` are reserved.
 - `cost` per item is the recorded cost summed over its attempts; batch items use the transport-aware batch price.
 
@@ -181,7 +290,18 @@ Request shapes: `AdapterTextRequest { model, prompt, options }`, `AdapterObjectR
 
 ### Open model keys
 
-`ModelKey` accepts any string. Registered keys keep autocomplete; unknown keys fail at `getModel()` with the registered-key list in the message. Config that holds `z.string()` no longer needs `as ModelKey`.
+The **type** `ModelKey` accepts any string: registered keys keep autocomplete
+through the `ModelRegistry` interface, and config that holds a plain
+`z.string()` no longer needs `as ModelKey`.
+
+The **schema** `ModelKey` (the value exported under the same name) is
+`z.string().min(1)`. It does not check the registry, so a
+`schemas.config` field typed with it accepts a key the consumer registers
+later or resolves through a custom provider — `run.create` no longer rejects
+one with "Model not found".
+
+Validation happens where the model is actually resolved: `getModel(key)`
+throws with the registered-key list in the message.
 
 ## The builder
 
@@ -220,10 +340,40 @@ const repository = defineWorkflow("repository", { input: In })
 ```
 
 - `dependencies: ["nope"]` is a type error, as is `ctx.require("later-stage")` and reusing a stage id.
+- `.stage(prebuilt)` and `.pipe(prebuilt)` also check the *prebuilt stage's* context: a stage built with `defineStage<{ "chapter-index": ChapterIndex }>()({...})` is only accepted after a stage producing `chapter-index` with a compatible type. Otherwise the parameter resolves to an error type — `{ __error: "stage requires context keys not produced by earlier stages: chapter-index" }` — and the call does not compile. A stage built without an explicit context (the open `Record<string, unknown>`) is accepted anywhere, as before.
+- `ctx.require()` and `ctx.optional()` live on `EnhancedStageContext`, the context `defineStage`/`.stage()` hand to `execute`. The raw `StageContext` (what a custom host builds, and what `Stage.execute` declares) has only `ctx.workflowContext`; read it directly there.
 - `.parallel([a, b])` and `.parallel((group) => group.stage("a", {...}).stage("b", {...}))` add a parallel group; the outputs of all members are available to later stages.
 - `.stage(prebuilt)` and `.pipe(prebuilt)` accept a `defineStage()` result and add its output type to the context. The two styles mix freely.
 - `.build()` returns the same runtime `Workflow` the `.pipe()` style produces; the kernel, hosts and persistence are unchanged.
 - `InferWorkflowContext<typeof repository>` and `InferStageOutputById<typeof repository, "chapter-index">` expose the inferred types for code outside the stages.
+
+## Testing a durable stage
+
+`createTestHarness()` from `@bratsos/workflow-engine/testing` gives you the
+kernel, the ledger, the mock AI factory and a driver loop that keeps ticking
+(claim → execute → poll suspended → flush → advance the clock) until the run
+is terminal. `07-testing-patterns.md` covers it in full; the scripting
+methods that matter for durable AI stages are:
+
+```typescript
+const harness = createTestHarness({ workflows: [workflow] });
+
+harness.mockAi.setTextResponse("summarize", { text: "the summary" });
+// Dispatch on schema identity when several calls share a prompt shape.
+harness.mockAi.mockObjectResponseForSchema(FactsSchema, { facts: [] });
+// The next matching call throws exactly once; later calls succeed. This is
+// how a replay-safety test makes one item fail one time.
+harness.mockAi.failOnce("item-2", new Error("subscription limit reached"));
+
+const result = await harness.run("wf", { docs });
+expect(result.reports[0]?.outcomes[0]?.outcome).toBe("suspended");
+expect(result.status).toBe("COMPLETED");
+```
+
+`failOnce` matches a substring, a RegExp, or a predicate over
+`{ modelKey, prompt, kind }`, and the armed scripts are shared with every
+child helper — so arming one on the harness's root helper fires inside the
+stage-scoped helper the kernel actually injects.
 
 ## Migrating an async-batch stage to steps
 
