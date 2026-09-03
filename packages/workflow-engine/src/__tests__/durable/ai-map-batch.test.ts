@@ -25,6 +25,7 @@ async function setup(
   const mock = createMockAIHelperFactory();
   mock.setObjectResponse("Extract", { object: { v: "repaired" } });
   const backend = makeFakeBackend(backendOptions);
+  const batchLogs: { level: string; message: string }[] = [];
   let captured: AiMapResult<Item>[] = [];
   const stage = defineStage({
     id,
@@ -47,9 +48,11 @@ async function setup(
     outputSchema,
     input: { count },
     mock,
-    aiFactory: createBatchAwareFactory(mock, backend.model),
+    aiFactory: createBatchAwareFactory(mock, backend.model, (level, message) =>
+      batchLogs.push({ level, message }),
+    ),
   });
-  return { ...h, mock, backend, results: () => captured };
+  return { ...h, mock, backend, batchLogs, results: () => captured };
 }
 
 describe("step.ai.map batch policy", () => {
@@ -91,6 +94,47 @@ describe("step.ai.map batch policy", () => {
       handleId: "batch-1",
       totalRequests: 50,
     });
+  });
+
+  it("stores the item prompt and the batch duration on the accounting rows", async () => {
+    const h = await setup("batch-accounting", 25);
+
+    await h.execute();
+    await h.settle(60_000);
+    expect((await h.stage())?.status).toBe("COMPLETED");
+
+    const rows = h.aiLogger
+      .getCallsByTopic(h.topic)
+      .filter((c) => c.callType === "batch");
+    expect(rows).toHaveLength(25);
+    for (const row of rows) {
+      const requestId = (row.metadata as { requestId?: string }).requestId;
+      expect(row.prompt).toBe(`Extract <<${requestId}>>`);
+      expect(typeof (row.metadata as { durationMs?: unknown }).durationMs).toBe(
+        "number",
+      );
+    }
+    expect(h.batchLogs.filter((l) => l.level === "WARN")).toEqual([]);
+  });
+
+  it("warns when more than half of a batch fails schema validation", async () => {
+    const h = await setup("batch-mostly-invalid", 25, {
+      // 20 of 25 items come back with the wrong shape.
+      respond: (id) =>
+        Number(id) < 20 ? JSON.stringify({ v: 1 }) : JSON.stringify({ v: id }),
+    });
+
+    await h.execute();
+    await h.settle(60_000);
+    expect((await h.stage())?.status).toBe("COMPLETED");
+
+    const warns = h.batchLogs.filter((l) => l.level === "WARN");
+    expect(warns).toHaveLength(1);
+    expect(warns[0]!.message).toContain("20 of 25 results in batch batch-1");
+    expect(warns[0]!.message).toContain("first issue:");
+    // The repair pass still fixed every item realtime.
+    expect(h.mock.getCalls()).toHaveLength(20);
+    expect(h.results().every((r) => r.status === "succeeded")).toBe(true);
   });
 
   it("repairs invalid batch items on the realtime path", async () => {

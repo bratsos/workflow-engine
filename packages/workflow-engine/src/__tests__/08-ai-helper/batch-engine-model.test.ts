@@ -21,6 +21,7 @@ import {
   resolveAiSdkBatchModel,
   toJsonSchema,
 } from "../../ai/batch";
+import { rewriteGoogleBatchBody } from "../../ai/batch/google-json-schema.js";
 
 // Hand-rolled fake Experimental_BatchLanguageModelV4 for testing
 class MockBatchLanguageModel
@@ -356,6 +357,105 @@ describe("Batch Subsystem - AI SDK Adapter (fromAiSdk)", () => {
       id: "req-4",
       status: "expired",
       error: "Batch expired before processing",
+    });
+  });
+
+  it("sends the full JSON Schema (unions intact) as responseJsonSchema on Google batches", async () => {
+    const bodies: string[] = [];
+    const mockFetch = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const href = typeof url === "string" ? url : url.toString();
+        expect(href).toContain(":batchGenerateContent");
+        bodies.push(init?.body as string);
+        return new Response(
+          JSON.stringify({
+            name: "batches/abc123",
+            metadata: { state: "BATCH_STATE_PENDING" },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      },
+    );
+    const model = await resolveAiSdkBatchModel("google", "gemini-2.5-flash", {
+      apiKey: "test-key",
+      fetch: mockFetch as never,
+    });
+    const schema = z.object({
+      metadata: z.discriminatedUnion("kind", [
+        z.object({ kind: z.literal("article"), title: z.string() }),
+        z.object({ kind: z.literal("table"), rows: z.number() }),
+      ]),
+    });
+
+    const ref = await model.start([
+      { id: "node-1", prompt: "Describe this", schema },
+      { id: "node-2", prompt: "Plain text, no schema" },
+    ]);
+
+    expect(ref.id).toBe("batches/abc123");
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    const body = JSON.parse(bodies[0]!);
+    const requests = body.batch.inputConfig.requests.requests as Array<{
+      request: { generationConfig: Record<string, unknown> };
+      metadata: { key: string };
+    }>;
+    expect(requests.map((r) => r.metadata.key)).toEqual(["node-1", "node-2"]);
+    const config = requests[0]!.request.generationConfig;
+    expect(config.responseSchema).toBeUndefined();
+    expect(config.responseMimeType).toBe("application/json");
+    const jsonSchema = config.responseJsonSchema as {
+      properties: { metadata: { anyOf?: unknown[]; oneOf?: unknown[] } };
+    };
+    // The discriminated union survives as-is; the OpenAPI conversion the
+    // provider would have applied flattens it.
+    const branches =
+      jsonSchema.properties.metadata.anyOf ??
+      jsonSchema.properties.metadata.oneOf;
+    expect(branches).toHaveLength(2);
+    expect(JSON.stringify(branches)).toContain('"article"');
+    expect(JSON.stringify(branches)).toContain('"table"');
+    expect(config.responseJsonSchema).not.toHaveProperty("$schema");
+    // The request without a schema is untouched.
+    const plain = requests[1]!.request.generationConfig;
+    expect(plain.responseJsonSchema).toBeUndefined();
+    expect(plain.responseMimeType).toBeUndefined();
+  });
+
+  it("rewrites only the requests whose key it knows", () => {
+    const body = {
+      batch: {
+        inputConfig: {
+          requests: {
+            requests: [
+              {
+                request: {
+                  generationConfig: { responseSchema: { type: "OBJECT" } },
+                },
+                metadata: { key: "a" },
+              },
+              {
+                request: {
+                  generationConfig: { responseSchema: { type: "OBJECT" } },
+                },
+                metadata: { key: "b" },
+              },
+            ],
+          },
+        },
+      },
+    };
+    const rewritten = rewriteGoogleBatchBody(
+      body,
+      new Map([["a", { type: "object", anyOf: [] }]]),
+    );
+    expect(rewritten).toBe(1);
+    const [a, b] = body.batch.inputConfig.requests.requests;
+    expect(a!.request.generationConfig).toEqual({
+      responseMimeType: "application/json",
+      responseJsonSchema: { type: "object", anyOf: [] },
+    });
+    expect(b!.request.generationConfig).toEqual({
+      responseSchema: { type: "OBJECT" },
     });
   });
 

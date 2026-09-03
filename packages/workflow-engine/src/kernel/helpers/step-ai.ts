@@ -89,6 +89,8 @@ interface StoredSubmit {
   refs: EngineBatchRef[];
   requestIds: string[];
   totalRequests: number;
+  /** ISO time of the submit, for `durationMs` on the accounting rows. */
+  submittedAt?: string;
 }
 
 interface Budget {
@@ -765,6 +767,7 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
           refs: handle.refs ?? [],
           requestIds,
           totalRequests: handle.totalRequests ?? requests.length,
+          submittedAt: new Date().toISOString(),
         };
       },
     );
@@ -817,6 +820,13 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
           ...refsMetadata,
           requestIds: submitted.requestIds,
           totalRequests: submitted.totalRequests,
+          // Accounting rows: the item prompt and the batch wall time.
+          prompts: Object.fromEntries(
+            entries.map((e) => [e.id, e.prompt as string]),
+          ),
+          ...(submitted.submittedAt
+            ? { submittedAt: submitted.submittedAt }
+            : {}),
           ...(spec.schema
             ? {
                 schemas: Object.fromEntries(

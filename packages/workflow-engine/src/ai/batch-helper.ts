@@ -51,6 +51,16 @@ export class BatchSubmitError extends Error {
   }
 }
 
+/** Accept an ISO string or epoch number (what a JSON step result holds). */
+function toEpochMs(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string") {
+    const ms = Date.parse(value);
+    return Number.isNaN(ms) ? undefined : ms;
+  }
+  return undefined;
+}
+
 export class AIBatchImpl<T = string> implements AIBatch<T> {
   private providerPromise?: Promise<EngineBatchModel>;
 
@@ -61,6 +71,12 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
 
   /** Request counts keyed by batchId. */
   private requestCountsByBatch = new Map<string, number>();
+
+  /** Prompts keyed by batchId -> requestId, for the accounting rows. */
+  private promptsByBatch = new Map<string, Map<string, string>>();
+
+  /** Submission time keyed by batchId, for `durationMs` on accounting rows. */
+  private submittedAtByBatch = new Map<string, number>();
 
   /** Refs keyed by primary batchId, for fan-in in the same process. */
   private refsByBatch = new Map<string, EngineBatchRef[]>();
@@ -102,7 +118,15 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
           this.modelKey,
           this.provider,
         );
-        return resolveAiSdkBatchModel(this.provider, nativeModelId);
+        return resolveAiSdkBatchModel(this.provider, nativeModelId, {
+          apiKey: this.options?.apiKey,
+          baseURL: this.options?.baseURL,
+          fetch: this.options?.fetch,
+          onWarning: (message) => {
+            if (this.batchLogFn) this.batchLogFn("WARN", message);
+            else logger.warn(message);
+          },
+        });
       }
 
       if (this.provider === "openrouter") {
@@ -378,6 +402,11 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
     this.refsByBatch.set(primaryBatchId, refs);
     this.schemasByBatch.set(primaryBatchId, allSchemasById);
     this.requestCountsByBatch.set(primaryBatchId, requests.length);
+    this.promptsByBatch.set(
+      primaryBatchId,
+      new Map(requests.map((req) => [req.id, req.prompt])),
+    );
+    this.submittedAtByBatch.set(primaryBatchId, Date.now());
 
     logger.debug(`batch submitted`, {
       provider: this.provider,
@@ -540,6 +569,27 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
       | Record<string, unknown>
       | undefined;
     const inProcessSchemas = this.schemasByBatch.get(batchId);
+    // Prompts and the submission time are carried by the caller across a
+    // suspend/resume (`metadata.prompts`, `metadata.submittedAt`); the
+    // in-process maps cover the same-process case.
+    const suppliedPrompts =
+      metadata?.prompts && typeof metadata.prompts === "object"
+        ? (metadata.prompts as Record<string, unknown>)
+        : undefined;
+    const inProcessPrompts = this.promptsByBatch.get(batchId);
+    const promptFor = (id: string): string => {
+      const supplied = suppliedPrompts?.[id];
+      if (typeof supplied === "string") return supplied;
+      return inProcessPrompts?.get(id) ?? "";
+    };
+    const submittedAt =
+      toEpochMs(metadata?.submittedAt) ?? this.submittedAtByBatch.get(batchId);
+    const durationMs =
+      submittedAt !== undefined
+        ? Math.max(0, Date.now() - submittedAt)
+        : undefined;
+    let schemaFailures = 0;
+    let firstSchemaIssue: string | undefined;
 
     let unvalidatedCount = 0;
     let totalReceivedItems = 0;
@@ -571,7 +621,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
         if (item.status !== "succeeded") {
           results.push({
             id: customId,
-            prompt: "",
+            prompt: promptFor(customId),
             inputTokens,
             outputTokens,
             status: "failed",
@@ -615,9 +665,11 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
 
         if (schema) {
           if (parseError) {
+            schemaFailures++;
+            firstSchemaIssue ??= `Failed to parse JSON response for schema validation: ${parseError}`;
             results.push({
               id: customId,
-              prompt: "",
+              prompt: promptFor(customId),
               inputTokens,
               outputTokens,
               status: "failed",
@@ -637,7 +689,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
                 : String(schemaErr);
             results.push({
               id: customId,
-              prompt: "",
+              prompt: promptFor(customId),
               inputTokens,
               outputTokens,
               status: "failed",
@@ -648,9 +700,11 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
           }
 
           if (!validation.success) {
+            schemaFailures++;
+            firstSchemaIssue ??= validation.error.message;
             results.push({
               id: customId,
-              prompt: "",
+              prompt: promptFor(customId),
               inputTokens,
               outputTokens,
               status: "failed",
@@ -662,7 +716,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
 
           results.push({
             id: customId,
-            prompt: "",
+            prompt: promptFor(customId),
             result: validation.data as T,
             inputTokens,
             outputTokens,
@@ -677,7 +731,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
 
           results.push({
             id: customId,
-            prompt: "",
+            prompt: promptFor(customId),
             result: resultData,
             inputTokens,
             outputTokens,
@@ -706,8 +760,30 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
       }
     }
 
+    if (results.length > 0 && schemaFailures * 2 > results.length) {
+      // Usually a schema the provider's structured-output mode cannot
+      // express (nested unions); every failed item is re-run realtime by
+      // the map's repair pass, so the batch discount is lost twice over.
+      const warnMsg =
+        `[Batch] ${schemaFailures} of ${results.length} results in batch ${batchId} failed schema validation; ` +
+        `first issue: ${firstSchemaIssue ?? "unknown"}. Check that the provider's structured-output mode can express the schema.`;
+      if (this.batchLogFn) {
+        this.batchLogFn("WARN", warnMsg, {
+          batchId,
+          schemaFailures,
+          total: results.length,
+        });
+      } else {
+        logger.warn(warnMsg, {
+          batchId,
+          schemaFailures,
+          total: results.length,
+        });
+      }
+    }
+
     // Auto-record results
-    await this.recordResults(batchId, results);
+    await this.recordResults(batchId, results, { durationMs });
 
     return results;
   }
@@ -722,6 +798,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
   async recordResults(
     batchId: string,
     results: AIBatchResult<T>[],
+    extra: { durationMs?: number } = {},
   ): Promise<void> {
     if (this.recordedBatchIds.has(batchId)) {
       logger.debug(`Batch ${batchId} already recorded, skipping.`);
@@ -771,15 +848,16 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
               cost,
               batchId,
               requestId: r.id,
-              metadata:
-                r.status === "failed"
-                  ? {
-                      batchId,
-                      requestId: r.id,
-                      status: "failed",
-                      error: r.error,
-                    }
-                  : { batchId, requestId: r.id },
+              metadata: {
+                batchId,
+                requestId: r.id,
+                ...(extra.durationMs !== undefined
+                  ? { durationMs: extra.durationMs }
+                  : {}),
+                ...(r.status === "failed"
+                  ? { status: "failed", error: r.error }
+                  : {}),
+              },
             };
           }),
         );

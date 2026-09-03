@@ -117,6 +117,7 @@ export function makeFakeBackend(opts: FakeBackendOptions = {}) {
 export function createBatchAwareFactory(
   mock: MockAIHelperFactory,
   backend: EngineBatchModel,
+  batchLog?: (level: string, message: string) => void,
 ): AIHelperFactory {
   return (topic, logger, logContext, providerResolver, options) => {
     const helper = mock(topic, logger, logContext, providerResolver, options);
@@ -132,7 +133,10 @@ export function createBatchAwareFactory(
               { topic, aiCallLogger: logger },
               modelKey,
               (provider ?? getBestProviderForModel(modelKey)) as never,
-              undefined,
+              batchLog
+                ? (((level: string, message: string) =>
+                    batchLog(level, message)) as never)
+                : undefined,
               batchOptions as never,
               backend,
             );

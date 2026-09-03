@@ -11,6 +11,11 @@ import type {
   LanguageModelV4Text,
 } from "@ai-sdk/provider";
 import {
+  createGoogleBatchFetch,
+  type FetchLike,
+  toGoogleJsonSchema,
+} from "./google-json-schema";
+import {
   type EngineBatchItemResult,
   type EngineBatchModel,
   type EngineBatchRef,
@@ -257,30 +262,91 @@ export function fromAiSdk(
   };
 }
 
+/** Credentials and transport for a vendor batch model (from `BatchOptions`). */
+export interface AiSdkBatchModelOptions {
+  apiKey?: string;
+  baseURL?: string;
+  fetch?: FetchLike;
+  /** Receives a diagnostic the engine cannot act on (e.g. a lossy upload). */
+  onWarning?: (message: string) => void;
+}
+
+/**
+ * Google: send the full JSON Schema. The provider only knows Gemini's lossy
+ * OpenAPI `responseSchema`, so the engine's schemas are substituted into
+ * the inline batch body as `responseJsonSchema` at the fetch boundary —
+ * see google-json-schema.ts.
+ */
+async function resolveGoogleBatchModel(
+  modelId: string,
+  options: AiSdkBatchModelOptions,
+): Promise<EngineBatchModel> {
+  const { createGoogleGenerativeAI } = await import("@ai-sdk/google");
+  const schemasByKey = new Map<string, Record<string, unknown>>();
+  let warnedFileUpload = false;
+  const provider = createGoogleGenerativeAI({
+    ...(options.apiKey !== undefined ? { apiKey: options.apiKey } : {}),
+    ...(options.baseURL !== undefined ? { baseURL: options.baseURL } : {}),
+    fetch: createGoogleBatchFetch(options.fetch, schemasByKey, () => {
+      if (warnedFileUpload) return;
+      warnedFileUpload = true;
+      options.onWarning?.(
+        "Google batch was too large to submit inline and was uploaded as a file; " +
+          "the provider's OpenAPI responseSchema is used there, which cannot express " +
+          "nested unions. Lower maxRequestsPerBatch to keep submissions inline.",
+      );
+    }) as typeof fetch,
+  });
+  const model = provider(modelId);
+  const providerId = (model as any).provider ?? "google.generative-ai";
+  const inner = fromAiSdk(model, { provider: providerId, modelId });
+  return {
+    ...inner,
+    async start(requests, callOpts) {
+      const keys: string[] = [];
+      for (const req of requests) {
+        if (!req.schema) continue;
+        schemasByKey.set(req.id, toGoogleJsonSchema(req.schema));
+        keys.push(req.id);
+      }
+      try {
+        return await inner.start(requests, callOpts);
+      } finally {
+        for (const key of keys) schemasByKey.delete(key);
+      }
+    },
+  };
+}
+
 /**
  * Resolves an AI SDK batch model dynamically using lazy imports for optional peer dependencies.
  */
 export async function resolveAiSdkBatchModel(
   vendor: "google" | "anthropic" | "openai",
   modelId: string,
+  options: AiSdkBatchModelOptions = {},
 ): Promise<EngineBatchModel> {
+  const credentials = {
+    ...(options.apiKey !== undefined ? { apiKey: options.apiKey } : {}),
+    ...(options.baseURL !== undefined ? { baseURL: options.baseURL } : {}),
+    ...(options.fetch !== undefined
+      ? { fetch: options.fetch as typeof fetch }
+      : {}),
+  };
   try {
     if (vendor === "google") {
-      const { google } = await import("@ai-sdk/google");
-      const model = google(modelId);
-      const providerId = (model as any).provider ?? "google.generative-ai";
-      return fromAiSdk(model, { provider: providerId, modelId });
+      return await resolveGoogleBatchModel(modelId, options);
     }
     if (vendor === "anthropic") {
-      const { anthropic } = await import("@ai-sdk/anthropic");
-      const model = anthropic(modelId);
+      const { createAnthropic } = await import("@ai-sdk/anthropic");
+      const model = createAnthropic(credentials)(modelId);
       const providerId = (model as any).provider ?? "anthropic.messages";
       return fromAiSdk(model, { provider: providerId, modelId });
     }
     if (vendor === "openai") {
-      const { openai } = await import("@ai-sdk/openai");
+      const { createOpenAI } = await import("@ai-sdk/openai");
       // For OpenAI use the default callable / .responses(), NEVER .chat()
-      const model = openai(modelId);
+      const model = createOpenAI(credentials)(modelId);
       const providerId = (model as any).provider ?? "openai.responses";
       return fromAiSdk(model, { provider: providerId, modelId });
     }
