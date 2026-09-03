@@ -26,16 +26,16 @@ const OpenRouterBatchResultItemSchema = z.object({
   custom_id: z.string(),
   response: z
     .object({
-      status_code: z.number().optional(),
-      request_id: z.string().optional(),
+      status_code: z.number().nullish(),
+      request_id: z.string().nullish(),
       body: z.record(z.string(), z.unknown()).nullish(),
     })
     .nullish(),
   error: z
     .union([
       z.object({
-        message: z.string().optional(),
-        code: z.union([z.string(), z.number()]).optional(),
+        message: z.string().nullish(),
+        code: z.union([z.string(), z.number()]).nullish(),
       }),
       z.string(),
     ])
@@ -48,27 +48,27 @@ const OpenRouterBatchResponseSchema = z.object({
   created_at: z.union([z.number(), z.string()]).nullish(),
   request_counts: z
     .object({
-      total: z.number().optional(),
-      completed: z.number().optional(),
-      failed: z.number().optional(),
-      pending: z.number().optional(),
+      total: z.number().nullish(),
+      completed: z.number().nullish(),
+      failed: z.number().nullish(),
+      pending: z.number().nullish(),
     })
     .nullish(),
   usage: z
     .object({
-      prompt_tokens: z.number().optional(),
-      completion_tokens: z.number().optional(),
-      total_tokens: z.number().optional(),
-      cost: z.number().optional(),
-      is_byok: z.boolean().optional(),
+      prompt_tokens: z.number().nullish(),
+      completion_tokens: z.number().nullish(),
+      total_tokens: z.number().nullish(),
+      cost: z.number().nullish(),
+      is_byok: z.boolean().nullish(),
     })
     .nullish(),
   results: z.array(OpenRouterBatchResultItemSchema).nullable().optional(),
   error: z
     .union([
       z.object({
-        message: z.string().optional(),
-        code: z.union([z.string(), z.number()]).optional(),
+        message: z.string().nullish(),
+        code: z.union([z.string(), z.number()]).nullish(),
       }),
       z.string(),
     ])

@@ -762,6 +762,74 @@ describe("Batch Subsystem - OpenRouter Fetch Client (createOpenRouterBatchModel)
     expect(status.requestCounts).toBeUndefined();
   });
 
+  it("accepts request_id: null and status_code: null on a completed batch's results (upstream-dependent)", async () => {
+    const mockFetch = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({
+            id: "batch-null-rid",
+            status: "completed",
+            request_counts: { total: 1, completed: 1, failed: 0 },
+            usage: {
+              prompt_tokens: 451,
+              completion_tokens: 977,
+              total_tokens: 1428,
+              cost: 0.00041566,
+              is_byok: null,
+            },
+            results: [
+              {
+                custom_id: "r1",
+                response: {
+                  status_code: null,
+                  request_id: null,
+                  body: {
+                    choices: [{ message: { content: '{"ok":true}' } }],
+                    usage: { prompt_tokens: 451, completion_tokens: 977 },
+                  },
+                },
+                error: null,
+              },
+            ],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+    );
+
+    const model = createOpenRouterBatchModel({
+      apiKey: "test-key",
+      modelId: "openai/gpt-4o",
+      fetch: mockFetch as any,
+    });
+
+    const ref: EngineBatchRef = {
+      version: 1,
+      type: "text",
+      id: "batch-null-rid",
+      provider: "openrouter",
+      modelId: "openai/gpt-4o",
+    };
+
+    const status = await model.status(ref);
+    expect(status.status).toBe("completed");
+    expect(status.requestCounts?.total).toBe(1);
+
+    const items: EngineBatchItemResult[] = [];
+    for await (const item of model.results(ref)) {
+      items.push(item);
+    }
+
+    expect(items).toEqual([
+      {
+        id: "r1",
+        status: "succeeded",
+        text: '{"ok":true}',
+        inputTokens: 451,
+        outputTokens: 977,
+      },
+    ]);
+  });
+
   it("maps all 8 upstream OpenRouter statuses correctly", async () => {
     const statuses = [
       { upstream: "validating", expected: "pending" },

@@ -105,9 +105,53 @@ describe("failed steps across a job retry", () => {
     );
     expect(stage).toMatchObject({ status: "COMPLETED", attempt: 1 });
     const rows = await harness.stepLedger.list(stage!.id);
+    // The row's attempt is monotonic across job attempts: the 503 was
+    // attempt 1, the re-execution on the retry is attempt 2.
     expect(rows).toMatchObject([
-      { stepId: "extract:submit", status: "completed", attempt: 1 },
+      { stepId: "extract:submit", status: "completed", attempt: 2 },
     ]);
+  });
+
+  it("clears the stale errorMessage when the retried attempt completes through a suspension", async () => {
+    let executions = 0;
+    let polls = 0;
+    const workflow = defineWorkflow("job-retry-poll-path", { input: In })
+      .stage("extract", {
+        schemas: {
+          input: In,
+          output: z.object({ ready: z.boolean() }),
+          config: z.object({}),
+        },
+        async execute(ctx) {
+          executions++;
+          if (executions === 1) throw new Error("503 Service Unavailable");
+          // Not ready on the retry's first poll, so the stage suspends and
+          // completes through stage.pollSuspended, not job.execute.
+          const ready = await ctx.step.waitFor("extract:poll", {
+            poll: async () => ++polls >= 2,
+            ready: (v) => v === true,
+            every: "1s",
+            timeout: "1h",
+          });
+          return { output: { ready } };
+        },
+      })
+      .build();
+    const harness = createTestHarness({ workflows: [workflow] });
+
+    const result = await harness.run("job-retry-poll-path", { items: [] });
+
+    expect(result.status).toBe("COMPLETED");
+    expect(polls).toBe(2);
+    const stage = await harness.persistence.getStage(
+      result.workflowRunId,
+      "extract",
+    );
+    expect(stage).toMatchObject({
+      status: "COMPLETED",
+      attempt: 1,
+      errorMessage: null,
+    });
   });
 
   it("re-prompts a map item that exhausted its repair budget on the next job attempt, but not on a replay of the same attempt", async () => {

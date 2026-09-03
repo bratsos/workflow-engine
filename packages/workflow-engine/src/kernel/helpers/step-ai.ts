@@ -54,8 +54,8 @@ export interface StepAiDeps {
   waitFor: StepApi["waitFor"];
   /** True when the step already holds a completed result (used to skip budget reservation). */
   isCompleted(stepId: string): Promise<boolean>;
-  /** Record an in-process retry on a running step: bumps the row's `attempt`. */
-  noteAttempt(stepId: string, attempt: number): Promise<void>;
+  /** Record an in-process retry on a running step: bumps the row's `attempt` by one. */
+  noteAttempt(stepId: string): Promise<void>;
   /**
    * Mark an item step `failed` and keep its verdict as the row's result, so
    * a replay of the same attempt answers the verdict (with `errorName`,
@@ -473,7 +473,6 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
       let feedback = prior?.feedback;
       let repairsLeft = repairAttempts;
       let retriesLeft = retries;
-      let rowAttempt = 1;
       const base = { id: entry.id, index: entry.index };
 
       /**
@@ -497,8 +496,7 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
           );
         }
         retriesLeft--;
-        rowAttempt++;
-        await deps.noteAttempt(stepId, rowAttempt);
+        await deps.noteAttempt(stepId);
         if (retryDelayMs > 0) await wait(retryDelayMs);
         return "retry";
       }

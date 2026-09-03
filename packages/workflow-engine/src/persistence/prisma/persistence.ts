@@ -545,6 +545,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       metrics: data.metrics as unknown,
       embeddingInfo: data.embeddingInfo as unknown,
       errorMessage: data.errorMessage,
+      attempt: data.attempt,
     };
   }
 
@@ -1007,6 +1008,62 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       take: effectiveLimit,
     });
     return records.map((r: any) => this.mapOutboxEvent(r));
+  }
+
+  async claimUnpublishedOutboxEvents(limit?: number): Promise<OutboxRecord[]> {
+    const effectiveLimit = limit ?? 100;
+    const now = this.now();
+    if (this.databaseType === "postgresql" && this.prisma.$queryRawUnsafe) {
+      // One statement: lock the candidate rows (skipping rows another
+      // flush holds), stamp them, return them. A concurrent flush — even
+      // one inside a still-open transaction — cannot receive the same
+      // rows. `RETURNING` order is unspecified, so the rows are re-sorted.
+      const rows = await this.prisma.$queryRawUnsafe<any[]>(
+        `WITH claimed AS (
+          SELECT id
+          FROM "outbox_events"
+          WHERE "publishedAt" IS NULL AND "dlqAt" IS NULL
+          ORDER BY "workflowRunId" ASC, sequence ASC
+          LIMIT $1
+          FOR UPDATE SKIP LOCKED
+        )
+        UPDATE "outbox_events"
+        SET "publishedAt" = $2
+        FROM claimed
+        WHERE "outbox_events".id = claimed.id
+        RETURNING "outbox_events".*`,
+        effectiveLimit,
+        now,
+      );
+      return rows
+        .map((r: any) => this.mapOutboxEvent(r))
+        .sort(
+          (a, b) =>
+            a.workflowRunId.localeCompare(b.workflowRunId) ||
+            a.sequence - b.sequence,
+        );
+    }
+
+    // SQLite (or a client without raw queries): compare-and-set per row on
+    // `publishedAt IS NULL`; a row another flush claimed first is skipped.
+    const candidates = await this.getUnpublishedOutboxEvents(effectiveLimit);
+    const claimed: OutboxRecord[] = [];
+    for (const candidate of candidates) {
+      const result = await this.prisma.outboxEvent.updateMany({
+        where: { id: candidate.id, publishedAt: null, dlqAt: null },
+        data: { publishedAt: now },
+      });
+      if (result.count > 0) claimed.push({ ...candidate, publishedAt: now });
+    }
+    return claimed;
+  }
+
+  async releaseOutboxEvents(ids: string[]): Promise<void> {
+    if (ids.length === 0) return;
+    await this.prisma.outboxEvent.updateMany({
+      where: { id: { in: ids } },
+      data: { publishedAt: null },
+    });
   }
 
   async markOutboxEventsPublished(ids: string[]): Promise<void> {

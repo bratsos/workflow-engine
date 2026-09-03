@@ -320,6 +320,11 @@ export interface UpdateStageInput {
   artifacts?: unknown;
   /** `null` clears the error of an earlier attempt. */
   errorMessage?: string | null;
+  /**
+   * The attempt counter of the record: `run.rerunFrom` reruns and job
+   * retries both bump it (the kernel writes `existingStage.attempt + 1`).
+   */
+  attempt?: number;
   expectedVersion?: number;
 }
 
@@ -558,6 +563,21 @@ export interface PersistenceCore {
 
   /** Read unpublished events ordered by (workflowRunId, sequence). */
   getUnpublishedOutboxEvents(limit?: number): Promise<OutboxRecord[]>;
+
+  /**
+   * Atomically claim up to `limit` unpublished events for this caller by
+   * setting `publishedAt`, ordered by (workflowRunId, sequence). Two
+   * processes flushing the same outbox concurrently must never both
+   * receive the same event: on Postgres this is one
+   * `UPDATE ... FROM (SELECT ... FOR UPDATE SKIP LOCKED) RETURNING`; other
+   * stores use a compare-and-set on `publishedAt IS NULL` per row. Events
+   * whose publication then fails are handed back with
+   * `releaseOutboxEvents`.
+   */
+  claimUnpublishedOutboxEvents(limit?: number): Promise<OutboxRecord[]>;
+
+  /** Un-claim events (clear `publishedAt`) so a later flush retries them. */
+  releaseOutboxEvents(ids: string[]): Promise<void>;
 
   /** Mark events as published. */
   markOutboxEventsPublished(ids: string[]): Promise<void>;

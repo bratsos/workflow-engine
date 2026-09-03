@@ -582,8 +582,12 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
         const record = await ledger.get(stageRecordId, stepId);
         return record?.status === "completed";
       },
-      async noteAttempt(stepId, attempt) {
-        await update(stepId, { attempt });
+      async noteAttempt(stepId) {
+        // Increment, never assign: the row's attempt is monotonic across
+        // job attempts (a reopened row continues from where it stopped).
+        const { stageRecordId, ledger } = requireLedger();
+        const record = await ledger.get(stageRecordId, stepId);
+        await update(stepId, { attempt: (record?.attempt ?? 0) + 1 });
       },
       async storeFailedVerdict(stepId, verdict) {
         await update(stepId, {

@@ -29,6 +29,7 @@ import type {
   CreateStageInput,
   EnqueueJobInput,
   JobQueue,
+  OutboxRecord,
   SaveArtifactInput,
   UpdateStageInput,
   WorkflowArtifactRecord,
@@ -1519,6 +1520,81 @@ export function persistenceConformanceSuite(
         await expect(
           persistence.markOutboxEventsPublished([]),
         ).resolves.not.toThrow();
+        await expect(
+          persistence.releaseOutboxEvents([]),
+        ).resolves.not.toThrow();
+      });
+
+      it("should hand each unpublished event to exactly one claimant, in order", async () => {
+        // Given: Two events for one run
+        await persistence.appendOutboxEvents([
+          {
+            workflowRunId: "outbox-claim-run",
+            eventType: "run.created",
+            payload: { n: 1 },
+            causationId: "cmd-1",
+            occurredAt: new Date(),
+          },
+          {
+            workflowRunId: "outbox-claim-run",
+            eventType: "run.started",
+            payload: { n: 2 },
+            causationId: "cmd-1",
+            occurredAt: new Date(),
+          },
+        ]);
+
+        // When: Two flushes claim concurrently
+        const [first, second] = await Promise.all([
+          persistence.claimUnpublishedOutboxEvents(),
+          persistence.claimUnpublishedOutboxEvents(),
+        ]);
+        const forRun = (events: OutboxRecord[]) =>
+          events.filter((e) => e.workflowRunId === "outbox-claim-run");
+
+        // Then: Every event is claimed by exactly one of them, in
+        // sequence order, and is stamped as published
+        const claimed = [...forRun(first), ...forRun(second)];
+        expect(claimed).toHaveLength(2);
+        expect(new Set(claimed.map((e) => e.id)).size).toBe(2);
+        expect(claimed.every((e) => e.publishedAt !== null)).toBe(true);
+        const winner =
+          forRun(first).length > 0 ? forRun(first) : forRun(second);
+        expect(winner.map((e) => e.sequence)).toEqual([1, 2]);
+        const unpublished = await persistence.getUnpublishedOutboxEvents();
+        expect(forRun(unpublished)).toHaveLength(0);
+      });
+
+      it("should make released events claimable again", async () => {
+        // Given: A claimed event
+        await persistence.appendOutboxEvents([
+          {
+            workflowRunId: "outbox-release-run",
+            eventType: "run.created",
+            payload: {},
+            causationId: "cmd-1",
+            occurredAt: new Date(),
+          },
+        ]);
+        const claimed = (
+          await persistence.claimUnpublishedOutboxEvents()
+        ).filter((e) => e.workflowRunId === "outbox-release-run");
+        expect(claimed).toHaveLength(1);
+
+        // When: Releasing it
+        await persistence.releaseOutboxEvents([claimed[0]!.id]);
+
+        // Then: It is unpublished again and the next claim gets it
+        const unpublished = await persistence.getUnpublishedOutboxEvents();
+        expect(
+          unpublished.some(
+            (e) => e.id === claimed[0]!.id && e.publishedAt === null,
+          ),
+        ).toBe(true);
+        const again = (await persistence.claimUnpublishedOutboxEvents()).filter(
+          (e) => e.workflowRunId === "outbox-release-run",
+        );
+        expect(again.map((e) => e.id)).toEqual([claimed[0]!.id]);
       });
     });
 

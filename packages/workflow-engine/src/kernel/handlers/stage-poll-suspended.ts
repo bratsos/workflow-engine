@@ -338,6 +338,9 @@ async function replayStage(
           nextPollAt: null,
           metrics: stageResult.metrics as any,
           embeddingInfo: stageResult.embeddings as any,
+          // A retried attempt that finished through a suspension: the
+          // earlier attempt's error is stale, exactly as on direct completion.
+          errorMessage: null,
         });
         if (bufferedAnnotations.length > 0) {
           await tx.appendAnnotations(bufferedAnnotations);
@@ -617,6 +620,7 @@ export async function handleStagePollSuspended(
               nextPollAt: null,
               metrics: checkResult.metrics as any,
               embeddingInfo: checkResult.embeddings as any,
+              errorMessage: null,
             });
 
             if (bufferedAnnotations.length > 0) {

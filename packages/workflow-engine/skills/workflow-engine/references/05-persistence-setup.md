@@ -83,6 +83,8 @@ interface PersistenceCore {
   // Outbox operations
   appendOutboxEvents(events: CreateOutboxEventInput[]): Promise<void>;
   getUnpublishedOutboxEvents(limit?: number): Promise<OutboxRecord[]>;
+  claimUnpublishedOutboxEvents(limit?: number): Promise<OutboxRecord[]>;
+  releaseOutboxEvents(ids: string[]): Promise<void>;
   markOutboxEventsPublished(ids: string[]): Promise<void>;
 
   // Idempotency operations
@@ -437,7 +439,7 @@ model OutboxEvent {
 }
 ```
 
-Backs the kernel's transactional outbox: command handlers write events here in the same transaction as their state changes, and `outbox.flush` publishes them to the `EventSink` afterward. `dlqAt` marks events that exhausted their retry budget; `replayDLQEvents` resets them for reprocessing.
+Backs the kernel's transactional outbox: command handlers write events here in the same transaction as their state changes, and `outbox.flush` publishes them to the `EventSink` afterward. The flush **claims** rows before it emits them (`claimUnpublishedOutboxEvents` stamps `publishedAt` atomically — one `UPDATE ... FROM (SELECT ... FOR UPDATE SKIP LOCKED) RETURNING` on Postgres, a per-row compare-and-set on `publishedAt IS NULL` on SQLite), so two processes flushing the same outbox at once — a cron tick and a request-kicked tick, two workers — deliver each event once; an emit that throws hands the event (and the rest of its run, to keep order) back with `releaseOutboxEvents` for the next flush. A process that dies between the claim and the emit leaves that event stamped: the claim is what makes delivery once-only. A custom `WorkflowPersistence` must implement both methods; the conformance suite covers them. `dlqAt` marks events that exhausted their retry budget; `replayDLQEvents` resets them for reprocessing.
 
 ### IdempotencyKey Model
 

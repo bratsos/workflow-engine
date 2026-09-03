@@ -172,3 +172,87 @@ describe("PrismaJobQueue.dequeue on a row without a payload", () => {
     ).toBeInstanceOf(Date);
   });
 });
+
+describe("PrismaWorkflowPersistence.claimUnpublishedOutboxEvents raw SQL", () => {
+  it("claims with FOR UPDATE SKIP LOCKED and stamps publishedAt from the clock in one statement", async () => {
+    const now = new Date("2026-09-04T10:00:00.000Z");
+    const row = {
+      id: "evt-1",
+      workflowRunId: "run-1",
+      sequence: 1,
+      eventType: "workflow:created",
+      payload: { type: "workflow:created" },
+      causationId: "cmd-1",
+      occurredAt: now,
+      publishedAt: now,
+      retryCount: 0,
+      dlqAt: null,
+    };
+    const queryRawUnsafe = vi.fn(async () => [row]);
+    const prisma = {
+      $queryRawUnsafe: queryRawUnsafe,
+    } as unknown as EnginePrismaClient;
+    const persistence = new PrismaWorkflowPersistence(prisma, {
+      now: () => now,
+    });
+
+    const claimed = await persistence.claimUnpublishedOutboxEvents(25);
+
+    expect(claimed).toEqual([row]);
+    const [sql, ...params] = queryRawUnsafe.mock.calls[0] as unknown as [
+      string,
+      ...unknown[],
+    ];
+    expect(sql).toContain("FOR UPDATE SKIP LOCKED");
+    expect(sql).toContain('"publishedAt" IS NULL AND "dlqAt" IS NULL');
+    expect(sql).toContain('SET "publishedAt" = $2');
+    expect(sql).toContain("RETURNING");
+    expect(sql).not.toContain("NOW()");
+    expect(params).toEqual([25, now]);
+  });
+
+  it("falls back to a per-row compare-and-set on SQLite", async () => {
+    const now = new Date("2026-09-04T11:00:00.000Z");
+    const rows = [
+      {
+        id: "a",
+        workflowRunId: "run-1",
+        sequence: 1,
+        publishedAt: null,
+        dlqAt: null,
+        retryCount: 0,
+      },
+      {
+        id: "b",
+        workflowRunId: "run-1",
+        sequence: 2,
+        publishedAt: null,
+        dlqAt: null,
+        retryCount: 0,
+      },
+    ];
+    const findMany = vi.fn(async () => rows);
+    // "a" was claimed by another flush between the read and the update.
+    const updateMany = vi.fn(async (args: any) => ({
+      count: args.where.id === "a" ? 0 : 1,
+    }));
+    const prisma = {
+      outboxEvent: { findMany, updateMany },
+    } as unknown as EnginePrismaClient;
+    const persistence = new PrismaWorkflowPersistence(prisma, {
+      databaseType: "sqlite",
+      now: () => now,
+    });
+
+    const claimed = await persistence.claimUnpublishedOutboxEvents();
+
+    expect(claimed.map((e) => e.id)).toEqual(["b"]);
+    expect(claimed[0]!.publishedAt).toBe(now);
+    expect(updateMany).toHaveBeenCalledTimes(2);
+    expect(updateMany.mock.calls[0]![0].where).toEqual({
+      id: "a",
+      publishedAt: null,
+      dlqAt: null,
+    });
+  });
+});

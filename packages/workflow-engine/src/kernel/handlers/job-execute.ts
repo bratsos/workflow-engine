@@ -41,11 +41,15 @@ import type { HandlerResult, KernelDeps } from "../kernel";
 import type { ActivityRunResult } from "../ports.js";
 
 /**
- * Re-open the FAILED `run` steps of a stage record for a new job attempt:
- * resetting `attempt` to 0 lets the replay's compare-and-set reclaim the
- * row and execute the step again (a row whose attempt exceeds the step's
- * `retries` would otherwise throw the stored error). Waits, signals and
- * sleeps that failed (a deadline that passed) are terminal and stay so.
+ * Re-open the FAILED `run` steps of a stage record for a new job attempt.
+ * The row is put back to `running` with no lease — the state of a step
+ * whose worker died — so the replay's compare-and-set re-claims it, bumps
+ * `attempt` and executes the step again. `attempt` is never reset: it
+ * counts every execution of the step across job attempts (a row that read
+ * `failed attempt 3` re-runs as attempt 4), so the ledger keeps the
+ * per-step history. The failure text stays on `error` until the re-run
+ * overwrites it. Waits, signals and sleeps that failed (a deadline that
+ * passed) are terminal and stay so.
  */
 async function reopenFailedSteps(
   stageRecordId: string,
@@ -60,7 +64,7 @@ async function reopenFailedSteps(
       stageRecordId,
       row.stepId,
       { status: "failed", attempt: row.attempt },
-      { attempt: 0, leaseExpiresAt: null },
+      { status: "running", leaseExpiresAt: null },
     );
   }
 }

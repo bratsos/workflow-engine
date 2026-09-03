@@ -574,6 +574,30 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
       .map((r) => ({ ...r }));
   }
 
+  async claimUnpublishedOutboxEvents(limit?: number): Promise<OutboxRecord[]> {
+    const effectiveLimit = limit ?? 100;
+    const now = this.now();
+    // Filter and stamp are synchronous: a concurrent flush that awaits
+    // this call after us sees `publishedAt` set and claims nothing.
+    const claimed = this.outbox
+      .filter((r) => r.publishedAt === null && r.dlqAt === null)
+      .sort((a, b) => {
+        const runCmp = a.workflowRunId.localeCompare(b.workflowRunId);
+        if (runCmp !== 0) return runCmp;
+        return a.sequence - b.sequence;
+      })
+      .slice(0, effectiveLimit);
+    for (const record of claimed) record.publishedAt = now;
+    return claimed.map((r) => ({ ...r }));
+  }
+
+  async releaseOutboxEvents(ids: string[]): Promise<void> {
+    const idSet = new Set(ids);
+    for (const record of this.outbox) {
+      if (idSet.has(record.id)) record.publishedAt = null;
+    }
+  }
+
   async markOutboxEventsPublished(ids: string[]): Promise<void> {
     const idSet = new Set(ids);
     for (const record of this.outbox) {

@@ -96,6 +96,87 @@ describe("kernel: outbox.flush", () => {
     expect(result2.published).toBe(0);
   });
 
+  it("two concurrent flushes deliver each event once", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, eventSink } = createTestKernel([workflow]);
+
+    await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "outbox-concurrent-a",
+      workflowId: "test-workflow",
+      input: { data: "first" },
+    });
+    await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "outbox-concurrent-b",
+      workflowId: "test-workflow",
+      input: { data: "second" },
+    });
+
+    // Two hosts ticking the same outbox at once (a cron tick and a
+    // request-kicked tick): the rows are claimed before they are emitted,
+    // so the second flush finds nothing rather than re-emitting.
+    const [first, second] = await Promise.all([
+      kernel.dispatch({ type: "outbox.flush" as const }),
+      kernel.dispatch({ type: "outbox.flush" as const }),
+    ]);
+
+    expect(first.published + second.published).toBe(2);
+    expect(eventSink.events).toHaveLength(2);
+    expect(eventSink.events.map((e) => e.type)).toEqual([
+      "workflow:created",
+      "workflow:created",
+    ]);
+    expect(
+      new Set(eventSink.events.map((e) => (e as any).workflowRunId)).size,
+    ).toBe(2);
+  });
+
+  it("a failed emit releases the event and the rest of its run for the next flush", async () => {
+    const workflow = createSimpleWorkflow();
+    let failNext = true;
+    const plugin: PluginDefinition = {
+      id: "flaky",
+      name: "flaky",
+      on: ["workflow:created", "workflow:started"],
+      async handle() {
+        if (failNext) {
+          failNext = false;
+          throw new Error("sink down");
+        }
+      },
+    };
+    const { kernel, flush, persistence } = createTestKernelWithPlugins(
+      [workflow],
+      [plugin],
+    );
+
+    const created = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "outbox-release",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+    await kernel.dispatch({
+      type: "run.claimPending",
+      workerId: "w1",
+    });
+
+    const first = await flush();
+    expect(first.published).toBe(0);
+    // Every event of the run is unpublished again, in order.
+    const unpublished = await persistence.getUnpublishedOutboxEvents();
+    expect(
+      unpublished
+        .filter((e) => e.workflowRunId === created.workflowRunId)
+        .map((e) => e.sequence),
+    ).toEqual([1, 2]);
+    expect(unpublished[0]!.retryCount).toBe(1);
+
+    const second = await flush();
+    expect(second.published).toBe(2);
+  });
+
   it("flush respects maxEvents limit", async () => {
     const workflow = createSimpleWorkflow();
     const { kernel, eventSink } = createTestKernel([workflow]);
