@@ -38,3 +38,32 @@ describe("skipInteractiveTransactions", () => {
     expect(mockPrisma.$transaction).toHaveBeenCalled();
   });
 });
+
+describe("withTransaction keeps every option on the transactional clone", () => {
+  it("casts with the configured status enum name inside the transaction", async () => {
+    const queryRawUnsafe = vi.fn(async () => []);
+    const tx = {
+      $queryRawUnsafe: queryRawUnsafe,
+    } as unknown as EnginePrismaClient;
+    const mockPrisma = {
+      $queryRawUnsafe: vi.fn(async () => []),
+      $transaction: vi.fn(async (fn: any) => fn(tx)),
+    } as unknown as EnginePrismaClient;
+    const now = new Date("2026-09-04T10:00:00.000Z");
+    const persistence = new PrismaWorkflowPersistence(mockPrisma, {
+      statusEnumName: "WorkflowStatus",
+      now: () => now,
+    });
+
+    await persistence.withTransaction((inner) => inner.claimNextPendingRun());
+
+    expect(queryRawUnsafe).toHaveBeenCalledTimes(1);
+    const [sql, ...params] = queryRawUnsafe.mock.calls[0] as unknown as [
+      string,
+      ...unknown[],
+    ];
+    expect(sql).toContain('::"WorkflowStatus"');
+    expect(sql).not.toContain('"Status"');
+    expect(params[2]).toBe(now);
+  });
+});

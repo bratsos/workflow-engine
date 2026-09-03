@@ -135,6 +135,15 @@ export class PrismaJobQueue implements JobQueue {
    * PostgreSQL implementation using FOR UPDATE SKIP LOCKED for safe concurrency
    */
   private async dequeuePostgres(): Promise<DequeueResult | null> {
+    for (let i = 0; i < MAX_DEQUEUE_ATTEMPTS; i++) {
+      const job = await this.dequeuePostgresOnce();
+      if (job !== "dead") return job;
+    }
+    return null;
+  }
+
+  /** One claim; `"dead"` when the claimed row was failed as unexecutable. */
+  private async dequeuePostgresOnce(): Promise<DequeueResult | null | "dead"> {
     try {
       // NOTE: deliberately calling `this.prisma.$queryRaw` directly below
       // rather than destructuring it into a local first -- Prisma's
@@ -181,6 +190,27 @@ export class PrismaJobQueue implements JobQueue {
       }
 
       const job = result[0];
+
+      // A row whose payload is NULL or not an object (hand-inserted or
+      // migrated) can never execute: fail and acknowledge it as a dead job
+      // and take the next row, instead of throwing out of the dequeue and
+      // aborting the whole tick on that one row.
+      if (typeof job.payload !== "object" || job.payload === null) {
+        const error = `Job ${job.id} has no payload (got ${job.payload === null ? "null" : typeof job.payload}); failed as a dead job`;
+        logger.error(error);
+        await this.prisma.jobQueue.update({
+          where: { id: job.id },
+          data: {
+            status: this.enums.status("FAILED"),
+            completedAt: this.now(),
+            lastError: error,
+            workerId: null,
+            lockedAt: null,
+          },
+        });
+        return "dead";
+      }
+
       logger.debug(
         `Dequeued job ${job.id} (stage: ${job.stageId}, attempt: ${job.attempt})`,
       );

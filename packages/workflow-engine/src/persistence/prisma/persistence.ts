@@ -87,10 +87,14 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
   private statusEnumName: string;
   private now: () => Date;
 
+  /** The options as given, re-applied to every transactional clone. */
+  private readonly options: PrismaWorkflowPersistenceOptions;
+
   constructor(
     private readonly prisma: PrismaClient,
     options: PrismaWorkflowPersistenceOptions = {},
   ) {
+    this.options = options;
     this.statusEnumName = options.statusEnumName ?? "Status";
     if (!IDENTIFIER.test(this.statusEnumName)) {
       throw new Error(
@@ -115,10 +119,11 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       return fn(this);
     }
     return this.prisma.$transaction(async (tx: PrismaClient) => {
-      const txPersistence = new PrismaWorkflowPersistence(tx, {
-        databaseType: this.databaseType,
-        skipInteractiveTransactions: this.skipTransactions,
-      });
+      // The transactional clone must carry every option: a clone built
+      // without `statusEnumName` cast with `::"Status"` inside the
+      // transaction (`42704 type "Status" does not exist` on every
+      // `run.claimPending` for a schema that names the enum differently).
+      const txPersistence = new PrismaWorkflowPersistence(tx, this.options);
       return fn(txPersistence);
     });
   }

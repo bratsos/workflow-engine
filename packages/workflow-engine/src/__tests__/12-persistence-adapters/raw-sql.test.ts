@@ -115,3 +115,60 @@ describe("PrismaJobQueue.dequeue raw SQL", () => {
     expect(values.filter((v) => v === now)).toHaveLength(3);
   });
 });
+
+describe("PrismaJobQueue.dequeue on a row without a payload", () => {
+  it("fails the row as a dead job and dequeues the next one", async () => {
+    const rows = [
+      {
+        id: "job-null",
+        workflowRunId: "run-1",
+        stageId: "s1",
+        priority: 0,
+        attempt: 1,
+        maxAttempts: 3,
+        payload: null,
+      },
+      {
+        id: "job-ok",
+        workflowRunId: "run-1",
+        stageId: "s2",
+        priority: 0,
+        attempt: 1,
+        maxAttempts: 3,
+        payload: { _workflowId: "wf", config: {} },
+      },
+    ];
+    const queryRaw = vi.fn(async () => {
+      const next = rows.shift();
+      return next ? [next] : [];
+    });
+    const update = vi.fn(
+      async (_args: { where: unknown; data: unknown }) => ({}),
+    );
+    const prisma = {
+      $queryRaw: queryRaw,
+      jobQueue: { update },
+    } as unknown as EnginePrismaClient;
+    const queue = new PrismaJobQueue(prisma, { workerId: "w1" });
+
+    const job = await queue.dequeue();
+
+    expect(job).toMatchObject({
+      jobId: "job-ok",
+      workflowId: "wf",
+      stageId: "s2",
+    });
+    expect(queryRaw).toHaveBeenCalledTimes(2);
+    expect(update).toHaveBeenCalledTimes(1);
+    expect(update.mock.calls[0]![0]).toMatchObject({
+      where: { id: "job-null" },
+      data: {
+        status: "FAILED",
+        lastError: expect.stringContaining("Job job-null has no payload"),
+      },
+    });
+    expect(
+      (update.mock.calls[0]![0].data as { completedAt: unknown }).completedAt,
+    ).toBeInstanceOf(Date);
+  });
+});
