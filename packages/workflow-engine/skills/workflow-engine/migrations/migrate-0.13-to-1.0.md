@@ -103,6 +103,30 @@ Verified against `git diff` of the package's `prisma/schema.prisma` between 0.13
 
   The reliable check is a diff: `npx prisma migrate diff --from-schema-datasource prisma/schema.prisma --to-schema-datamodel node_modules/@bratsos/workflow-engine/prisma/schema.prisma --script` prints the SQL that separates your database from the package schema (ignore the differences on your own tables).
 
+- [ ] **Optional: add `workflow_blobs` if you want Prisma as the blob store.** Stage outputs and every replay's `ctx.input` are read from the `BlobStore` by *every* process that executes or polls a run (workers, cron ticks, a web process that kicks orchestration), so the store must be shared — an `InMemoryBlobStore` in one of them fails the next process with `Blob "<key>" ... is not in the blob store`. `createPrismaBlobStore(prisma)` keeps blobs in this table so no object storage is needed; it requires only the `workflowBlob` delegate, so consumers on S3/R2 do not add it.
+
+  ```prisma
+  model WorkflowBlob {
+    key       String   @id
+    data      Json
+    createdAt DateTime @default(now())
+    updatedAt DateTime @updatedAt
+
+    @@map("workflow_blobs")
+  }
+  ```
+
+  ```sql
+  CREATE TABLE IF NOT EXISTS "workflow_blobs" (
+    "key"       TEXT PRIMARY KEY,
+    "data"      JSONB NOT NULL,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL
+  );
+  ```
+
+- [ ] **Running the kernel inside one Prisma transaction per tick?** The 1.0 adapters no longer rely on a caught unique violation for any insert-if-absent on Postgres (`PrismaStepLedger.claim`, `acquireIdempotencyKey` use `createMany({ skipDuplicates: true })` + read-back), so a replay that re-claims completed steps no longer aborts the enclosing transaction with `25P02`. Pass `createPrismaStepLedger(prisma, { databaseType: "sqlite" })` on SQLite, which has no `skipDuplicates`. Raw statements bind a JS `Date` (UTC) instead of `NOW()`; pass `now: () => clock.now()` to the persistence and job queue to make them follow your clock.
+
 - [ ] **If your Prisma `Status` enum has another name**, pass it: `createPrismaWorkflowPersistence(prisma, { statusEnumName: "WorkflowStatus" })`. The raw-SQL claim paths cast with `::"Status"` (since 0.11) and fail with `42704 type "Status" does not exist` otherwise. See `05-persistence-setup.md`.
 
 - [ ] **Check the delegates on your `PrismaClient`.** `EnginePrismaClient` requires `workflowRun`, `workflowStage`, `workflowStep`, `workflowLog`, `workflowArtifact`, `workflowAnnotation`, `aICall`, `jobQueue`, `outboxEvent`, `idempotencyKey`, plus `$transaction`, `$queryRaw` and `$executeRaw`. A wall of `PrismaClient is not assignable to EnginePrismaClient` errors means one of them is missing from your schema (in 1.0 almost always `workflowStep`) — add the model and regenerate the client.

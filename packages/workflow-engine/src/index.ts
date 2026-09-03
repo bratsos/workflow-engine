@@ -195,10 +195,12 @@ export type {
 // Prisma implementations and factories
 export {
   createPrismaAICallLogger,
+  createPrismaBlobStore,
   createPrismaJobQueue,
   createPrismaStepLedger,
   createPrismaWorkflowPersistence,
   PrismaAICallLogger,
+  PrismaBlobStore,
   PrismaJobQueue,
   PrismaStepLedger,
   PrismaWorkflowPersistence,

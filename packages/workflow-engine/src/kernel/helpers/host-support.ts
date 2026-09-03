@@ -85,7 +85,16 @@ export interface ExecuteJobWithHeartbeatOptions {
 export interface ExecuteJobOutcome {
   outcome: "completed" | "suspended" | "failed";
   error?: string;
+  /**
+   * The job referred to a run, workflow or stage that no longer exists (an
+   * orphan queue row). It was failed terminally and acknowledged; nothing
+   * was executed and no run was transitioned.
+   */
+  dead?: boolean;
 }
+
+const DEAD_JOB_PATTERN =
+  /^(WorkflowRun .* not found|Workflow .* not found in registry|Stage .* not found in workflow)/;
 
 /**
  * Dispatches `job.execute` for one job, holding a lease heartbeat for its
@@ -129,6 +138,22 @@ export async function executeJobWithHeartbeat(
       attempt: job.attempt,
       maxAttempts: job.maxAttempts ?? HOST_DEFAULTS.maxAttempts,
     });
+  } catch (error) {
+    // A job whose run / workflow / stage no longer exists is an orphan
+    // queue row: fail and acknowledge it so it stops re-delivering, and
+    // return instead of throwing — for a consumer that runs a whole tick
+    // inside one transaction, a throw here aborted every other job.
+    const message = error instanceof Error ? error.message : String(error);
+    if (!DEAD_JOB_PATTERN.test(message)) throw error;
+    console.error(
+      `${logPrefix} dead job ${job.jobId} (run ${job.workflowRunId}, stage ${job.stageId}): ${message}`,
+    );
+    try {
+      await jobTransport.fail(job.jobId, message, false);
+    } catch (failError) {
+      console.error(`${logPrefix} could not fail dead job:`, failError);
+    }
+    return { outcome: "failed", error: message, dead: true };
   } finally {
     clearInterval(heartbeat);
   }

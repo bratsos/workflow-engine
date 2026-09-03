@@ -1061,23 +1061,32 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     | { status: "replay"; result: unknown }
     | { status: "in_progress" }
   > {
-    try {
-      await this.prisma.idempotencyKey.create({
-        data: {
-          key,
-          commandType,
-          result: IDEMPOTENCY_IN_PROGRESS_MARKER as any,
-          // Explicit rather than relying on the schema's `@default(now())`
-          // so a caller-supplied `options.now` (e.g. a FakeClock in tests,
-          // or a kernel using an injected Clock) is authoritative for the
-          // staleness math below, not the DB's wall-clock time.
-          createdAt: options?.now ?? new Date(),
-        },
+    const row = {
+      key,
+      commandType,
+      result: IDEMPOTENCY_IN_PROGRESS_MARKER as any,
+      // Explicit rather than relying on the schema's `@default(now())`
+      // so a caller-supplied `options.now` (e.g. a FakeClock in tests,
+      // or a kernel using an injected Clock) is authoritative for the
+      // staleness math below, not the DB's wall-clock time.
+      createdAt: options?.now ?? new Date(),
+    };
+    if (this.databaseType === "postgresql") {
+      // ON CONFLICT DO NOTHING: a caught unique violation would abort a
+      // consumer's enclosing transaction (25P02) on every replayed dispatch.
+      const { count } = await this.prisma.idempotencyKey.createMany({
+        data: [row],
+        skipDuplicates: true,
       });
-      return { status: "acquired" };
-    } catch (error: any) {
-      if (error?.code !== "P2002") {
-        throw error;
+      if (count > 0) return { status: "acquired" };
+    } else {
+      try {
+        await this.prisma.idempotencyKey.create({ data: row });
+        return { status: "acquired" };
+      } catch (error: any) {
+        if (error?.code !== "P2002") {
+          throw error;
+        }
       }
     }
 

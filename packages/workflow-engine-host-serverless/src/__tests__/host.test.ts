@@ -441,6 +441,31 @@ describe("ServerlessHost", () => {
     );
   });
 
+  it("treats a job for a run that no longer exists as dead without throwing", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, jobTransport } = createTestEnv([workflow]);
+    const host = createServerlessHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+    });
+    // An orphan queue row: its run was deleted.
+    await jobTransport.enqueueParallel([
+      {
+        workflowRunId: "run-that-does-not-exist",
+        workflowId: "test-workflow",
+        stageId: "stage-1",
+        payload: {},
+      },
+    ]);
+
+    const result = await host.processAvailableJobs({ maxJobs: 5 });
+
+    expect(result).toEqual({ processed: 1, succeeded: 0, failed: 1 });
+    // The dead job was acknowledged: nothing is left to dequeue.
+    expect(await jobTransport.dequeue()).toBeNull();
+  });
+
   it("returns failed outcome for a throwing stage", async () => {
     const workflow = createFailingWorkflow();
     const { kernel, jobTransport } = createTestEnv([workflow]);

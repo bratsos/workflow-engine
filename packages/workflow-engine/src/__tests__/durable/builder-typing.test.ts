@@ -371,3 +371,39 @@ describe("builder-first typed workflows (runtime)", () => {
     });
   });
 });
+
+describe("waitFor narrows through a type-guard ready", () => {
+  it("returns the guarded type", () => {
+    type Poll = { status: "pending" } | { status: "done"; value: number };
+    const isDone = (v: Poll): v is { status: "done"; value: number } =>
+      v.status === "done";
+    defineWorkflow("wait-narrow", { input: z.object({}) })
+      .stage("wait", {
+        schemas: {
+          input: z.object({}),
+          output: z.object({ value: z.number() }),
+          config: z.object({}),
+        },
+        async execute(ctx) {
+          const done = await ctx.step.waitFor("poll", {
+            poll: async (): Promise<Poll> => ({ status: "done", value: 1 }),
+            ready: isDone,
+            every: "1s",
+            timeout: "1h",
+          });
+          expectTypeOf(done).toEqualTypeOf<{ status: "done"; value: number }>();
+          const plain = await ctx.step.waitFor("poll-2", {
+            poll: async (): Promise<Poll> => ({ status: "pending" }),
+            // Not a predicate TS can infer: the boolean overload applies.
+            ready: (v) => v.status.length > 0,
+            every: "1s",
+            timeout: "1h",
+          });
+          expectTypeOf(plain).toEqualTypeOf<Poll>();
+          return { output: { value: done.value } };
+        },
+      })
+      .build();
+    expect(true).toBe(true);
+  });
+});

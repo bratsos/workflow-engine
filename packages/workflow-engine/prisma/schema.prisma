@@ -258,3 +258,16 @@ model IdempotencyKey {
   @@unique([key, commandType])
   @@map("idempotency_keys")
 }
+
+// Optional: only when using createPrismaBlobStore. Stage outputs and replay
+// inputs are read from the blob store by every process that executes or
+// polls a run, so the store must be shared; this table makes Prisma that
+// shared store without object storage.
+model WorkflowBlob {
+  key       String   @id
+  data      Json
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("workflow_blobs")
+}

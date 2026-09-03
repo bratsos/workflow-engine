@@ -575,7 +575,8 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
     writable: false,
     value: createStepAi({
       run: (id, fn, opts) => api.run(id, fn, opts),
-      waitFor: (id, opts) => api.waitFor(id, opts),
+      waitFor: <T>(id: string, opts: StepWaitOptions<T>) =>
+        api.waitFor(id, opts),
       async isCompleted(stepId) {
         const { stageRecordId, ledger } = requireLedger();
         const record = await ledger.get(stageRecordId, stepId);

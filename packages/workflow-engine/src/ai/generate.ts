@@ -12,7 +12,12 @@ import { generateText as aiGenerateText, Output } from "ai";
 import type { z } from "zod";
 import type { AICallLogger } from "../persistence";
 import { getModel, type ModelKey } from "./model-helper";
-import { getModelProvider, logger, resolveCost } from "./shared";
+import {
+  explainRoutingError,
+  getModelProvider,
+  logger,
+  resolveCost,
+} from "./shared";
 import { createCallTimeout, runWithCallTimeout } from "./timeouts.js";
 import type {
   AICallType,
@@ -397,7 +402,7 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
       error: errorMessage,
       durationMs,
     });
-    throw error;
+    throw explainRoutingError(error, ctx.routing, modelKey);
   } finally {
     timeout.cleanup();
   }
@@ -600,7 +605,7 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
       error: errorMessage,
       durationMs,
     });
-    throw error;
+    throw explainRoutingError(error, ctx.routing, modelKey);
   } finally {
     timeout.cleanup();
   }

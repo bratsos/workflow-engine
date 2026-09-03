@@ -182,6 +182,24 @@ async function replayStage(
       const suspended = result as SuspendedResult;
       const nextPollAt = suspended.pollConfig.nextPollAt;
       const bufferedAnnotations = built.annotationBuffer.flush();
+      const maxWaitUntil = new Date(
+        deps.clock.now().getTime() + suspended.pollConfig.maxWaitTime,
+      );
+      // A replay that is still waiting on the same thing (same batch /
+      // durable step, same deadline) re-suspends silently: the run already
+      // announced this suspension, and a poll every few seconds must not
+      // re-emit `stage:suspended` / `workflow:suspended` each time.
+      const previous = stageRecord.suspendedState as
+        | { batchId?: unknown }
+        | null
+        | undefined;
+      const sameWait =
+        previous?.batchId !== undefined &&
+        previous.batchId === suspended.state.batchId &&
+        stageRecord.maxWaitUntil !== null &&
+        stageRecord.maxWaitUntil !== undefined &&
+        Math.abs(stageRecord.maxWaitUntil.getTime() - maxWaitUntil.getTime()) <
+          1_000;
       const claimResult = await withClaimedRun(
         stageRecord.workflowRunId,
         run.version,
@@ -192,35 +210,40 @@ async function replayStage(
             suspendedState: suspended.state as any,
             nextPollAt,
             pollInterval: suspended.pollConfig.pollInterval,
-            maxWaitUntil: new Date(
-              deps.clock.now().getTime() + suspended.pollConfig.maxWaitTime,
-            ),
+            maxWaitUntil,
             metrics: suspended.metrics as any,
           });
           if (bufferedAnnotations.length > 0) {
             await tx.appendAnnotations(bufferedAnnotations);
           }
+          const suspensionEvents = sameWait
+            ? []
+            : [
+                {
+                  type: "stage:suspended" as const,
+                  timestamp: deps.clock.now(),
+                  workflowRunId: stageRecord.workflowRunId,
+                  stageId: stageRecord.stageId,
+                  stageName: stageRecord.stageName,
+                  nextPollAt,
+                },
+                {
+                  type: "workflow:suspended" as const,
+                  timestamp: deps.clock.now(),
+                  workflowRunId: stageRecord.workflowRunId,
+                  stageId: stageRecord.stageId,
+                },
+              ];
           const events = [
             ...built!.progressEvents,
-            {
-              type: "stage:suspended" as const,
-              timestamp: deps.clock.now(),
-              workflowRunId: stageRecord.workflowRunId,
-              stageId: stageRecord.stageId,
-              stageName: stageRecord.stageName,
-              nextPollAt,
-            },
-            {
-              type: "workflow:suspended" as const,
-              timestamp: deps.clock.now(),
-              workflowRunId: stageRecord.workflowRunId,
-              stageId: stageRecord.stageId,
-            },
+            ...suspensionEvents,
             ...buildAnnotationEvents(bufferedAnnotations, deps.clock.now()),
           ];
-          await tx.appendOutboxEvents(
-            toOutboxEvents(stageRecord.workflowRunId, events),
-          );
+          if (events.length > 0) {
+            await tx.appendOutboxEvents(
+              toOutboxEvents(stageRecord.workflowRunId, events),
+            );
+          }
         },
       );
       if (await handleClaimOutcome(claimResult, stageRecord, deps))

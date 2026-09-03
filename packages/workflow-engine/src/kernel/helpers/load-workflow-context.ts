@@ -21,9 +21,23 @@ export async function loadWorkflowContext(
   for (const stage of completedStages) {
     const outputData = stage.outputData as any;
     if (outputData?._artifactKey) {
-      context[stage.stageId] = await deps.blobStore.get(
-        outputData._artifactKey,
-      );
+      const key = outputData._artifactKey as string;
+      let blob: unknown;
+      try {
+        blob = await deps.blobStore.get(key);
+      } catch (error) {
+        throw new Error(
+          `Blob "${key}" (output of stage ${stage.stageId}, run ${workflowRunId}) is not in the blob store: ${
+            error instanceof Error ? error.message : String(error)
+          }. Every process that executes or polls a run must share one BlobStore (see createPrismaBlobStore).`,
+        );
+      }
+      if (blob === undefined || blob === null) {
+        throw new Error(
+          `Blob "${key}" (output of stage ${stage.stageId}, run ${workflowRunId}) is not in the blob store. Every process that executes or polls a run must share one BlobStore (see createPrismaBlobStore).`,
+        );
+      }
+      context[stage.stageId] = blob;
     } else if (outputData && typeof outputData === "object") {
       context[stage.stageId] = outputData;
     }

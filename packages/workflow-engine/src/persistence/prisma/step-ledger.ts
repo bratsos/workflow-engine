@@ -53,31 +53,67 @@ function mapPatch(patch: StepRecordPatch): Record<string, unknown> {
   return data;
 }
 
+export interface PrismaStepLedgerOptions {
+  /**
+   * Database type. Defaults to "postgresql". On Postgres `claim` is an
+   * insert-if-absent through `createMany({ skipDuplicates: true })` (an
+   * `ON CONFLICT DO NOTHING`) followed by a read-back, so a replay that
+   * re-claims completed steps never raises a unique violation — which would
+   * abort a consumer's enclosing transaction (`25P02`). SQLite has no
+   * `skipDuplicates`; it keeps the create-and-catch path, which is safe there
+   * because SQLite does not poison the transaction on a constraint error.
+   */
+  databaseType?: "postgresql" | "sqlite";
+}
+
 /** Prisma-backed durable step ledger. */
 export class PrismaStepLedger implements StepLedger {
-  constructor(private readonly prisma: PrismaClient) {}
+  private readonly databaseType: "postgresql" | "sqlite";
+
+  constructor(
+    private readonly prisma: PrismaClient,
+    options: PrismaStepLedgerOptions = {},
+  ) {
+    this.databaseType = options.databaseType ?? "postgresql";
+  }
 
   async claim(
     record: Omit<StepRecord, "createdAt" | "updatedAt">,
   ): Promise<{ created: boolean; record: StepRecord }> {
-    try {
-      const created = await this.prisma.workflowStep.create({
-        data: {
-          stageRecordId: record.stageRecordId,
-          stepId: record.stepId,
-          seq: record.seq,
-          kind: record.kind,
-          status: record.status,
-          attempt: record.attempt,
-          leaseExpiresAt: record.leaseExpiresAt,
-          deadlineAt: record.deadlineAt,
-          ...(record.result != null ? { result: record.result } : {}),
-          ...(record.error !== undefined ? { error: record.error } : {}),
-          ...(record.waitState !== undefined
-            ? { waitState: record.waitState }
-            : {}),
-        },
+    const data = {
+      stageRecordId: record.stageRecordId,
+      stepId: record.stepId,
+      seq: record.seq,
+      kind: record.kind,
+      status: record.status,
+      attempt: record.attempt,
+      leaseExpiresAt: record.leaseExpiresAt,
+      deadlineAt: record.deadlineAt,
+      ...(record.result != null ? { result: record.result } : {}),
+      ...(record.error !== undefined ? { error: record.error } : {}),
+      ...(record.waitState !== undefined
+        ? { waitState: record.waitState }
+        : {}),
+    };
+
+    if (this.databaseType === "postgresql") {
+      // ON CONFLICT DO NOTHING + read-back: no statement error inside the
+      // caller's transaction when the row already exists.
+      const { count } = await this.prisma.workflowStep.createMany({
+        data: [data],
+        skipDuplicates: true,
       });
+      const row = await this.get(record.stageRecordId, record.stepId);
+      if (!row) {
+        throw new Error(
+          `Durable step "${record.stepId}" could not be read back after claim`,
+        );
+      }
+      return { created: count > 0, record: row };
+    }
+
+    try {
+      const created = await this.prisma.workflowStep.create({ data });
       return { created: true, record: mapStep(created) };
     } catch (error) {
       if (!isUniqueViolation(error)) throw error;
@@ -142,6 +178,9 @@ export class PrismaStepLedger implements StepLedger {
   }
 }
 
-export function createPrismaStepLedger(prisma: PrismaClient): StepLedger {
-  return new PrismaStepLedger(prisma);
+export function createPrismaStepLedger(
+  prisma: PrismaClient,
+  options?: PrismaStepLedgerOptions,
+): StepLedger {
+  return new PrismaStepLedger(prisma, options);
 }

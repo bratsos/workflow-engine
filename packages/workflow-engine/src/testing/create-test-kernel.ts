@@ -77,6 +77,8 @@ export interface CreateTestKernelOptions<
   idempotencyStaleInProgressMs?: number;
   /** Optional durable step ledger for stages that use ctx.step.*. */
   stepLedger?: StepLedger;
+  /** Blob store. Defaults to a fresh `InMemoryBlobStore`. */
+  blobStore?: InMemoryBlobStore;
   /** Optional services exposed lazily through stage contexts. */
   services?: KernelServices;
 }
@@ -88,7 +90,7 @@ export function createTestKernel<
   opts: CreateTestKernelOptions<TEventSink> = {},
 ) {
   const persistence = new InMemoryWorkflowPersistence();
-  const blobStore = new InMemoryBlobStore();
+  const blobStore = opts.blobStore ?? new InMemoryBlobStore();
   const jobTransport = new InMemoryJobQueue(opts.workerId ?? "test-worker");
   const clock = opts.clock ?? new FakeClock(opts.clockStart);
 

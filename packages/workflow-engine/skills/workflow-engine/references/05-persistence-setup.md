@@ -500,6 +500,12 @@ const persistence = createPrismaWorkflowPersistence(prisma);
 const jobQueue = createPrismaJobQueue(prisma, { workerId: "my-worker-id" });
 const aiCallLogger = createPrismaAICallLogger(prisma);
 
+// Prisma-backed blob store (optional WorkflowBlob table): stage outputs are
+// read by every process that executes or polls a run, so the store must be
+// shared across them.
+const blobStore = createPrismaBlobStore(prisma);
+const stepLedger = createPrismaStepLedger(prisma);
+
 // SQLite - uses optimistic locking instead of FOR UPDATE SKIP LOCKED
 const persistence = createPrismaWorkflowPersistence(prisma, {
   databaseType: "sqlite"

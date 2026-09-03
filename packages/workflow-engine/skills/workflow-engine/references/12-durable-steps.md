@@ -21,7 +21,7 @@ const kernel = createKernel({
   persistence,
   jobTransport: createPrismaJobQueue(prisma),
   blobStore,                       // your BlobStore implementation
-  eventSink: { publish: async (event) => { await bus.emit(event); } },
+  eventSink: { emit: async (event) => { await bus.publish(event); } },
   clock: { now: () => new Date() },
   registry: { getWorkflow: (id) => workflows.get(id) },
   stepLedger: createPrismaStepLedger(prisma),
@@ -32,6 +32,14 @@ const kernel = createKernel({
 `eventSink` and `clock` are not optional: the kernel publishes every outbox
 event through the sink and reads *all* time from the clock, which is what
 makes a run reproducible under a `FakeClock` in tests.
+
+`blobStore` must be **shared by every process that executes or polls a
+run**: a replay resolves `ctx.input` and `ctx.require(...)` from the blob
+store on every poll, so a worker, a cron tick and a web process that kicks
+orchestration must all read the same store. `createPrismaBlobStore(prisma)`
+(optional `WorkflowBlob` table) makes the database that store; an
+`InMemoryBlobStore` is only for a single-process test. A missing blob fails
+the replay with the blob key and this requirement.
 
 In tests, use `createTestHarness()` from `@bratsos/workflow-engine/testing` —
 it builds the whole thing (in-memory persistence, job queue, blob store,
@@ -114,6 +122,8 @@ Suspension is a thrown control-flow error (`StepSuspend`, or `StepInFlight` when
 
 - A `run` step holds a lease while `fn` runs. If the worker dies, the next replay re-claims the step once the lease expires, increments `attempt`, and runs `fn` again. A live lease suspends the replay as `StepInFlight` instead of running `fn` twice.
 - `retries` makes a thrown `fn` retryable: the failure is recorded, the stage suspends for `retryDelayMs`, and the next replay re-runs `fn`. When retries are exhausted the stored error is thrown and the stage fails.
+- A stage that is still waiting on the same step re-suspends silently on every poll: `stage:suspended` / `workflow:suspended` are emitted when the wait starts and again only when the stage moves on to a different wait (or its deadline changes), not once per poll.
+- `waitFor`'s `ready` may be a type guard (`(v): v is Done => ...`); the awaited value then narrows to the guarded type. The boolean form is unchanged.
 - `waitFor`'s `timeout` is computed once, when the wait is first recorded, and stored on the step. Every replay compares against that stored deadline, so it never slides. Past the deadline the step is marked failed and the stage fails with `StepTimeoutError`.
 - A `poll` that throws does not fail the stage: the error is logged as a warning and the stage suspends for `pollBackoffMs`.
 - Signalling a step twice is a no-op; the result carries `alreadyCompleted: true`. Signalling a timed-out step is rejected.

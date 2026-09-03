@@ -498,6 +498,41 @@ describe("NodeHost", () => {
     );
   });
 
+  it("acknowledges a dead job and keeps processing the queue", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, persistence, jobTransport } = createTestEnv([workflow]);
+    await jobTransport.enqueueParallel([
+      {
+        workflowRunId: "run-that-does-not-exist",
+        workflowId: "test-workflow",
+        stageId: "stage-1",
+        payload: {},
+      },
+    ]);
+    const created = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "after-dead-1",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+
+    host = createNodeHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+      orchestrationIntervalMs: 50,
+      jobPollIntervalMs: 20,
+    });
+    await host.start();
+
+    await waitFor(async () => {
+      const run = await persistence.getRun(created.workflowRunId);
+      return run?.status === "COMPLETED";
+    }, 5_000);
+    expect(host.getStats().jobsProcessed).toBeGreaterThanOrEqual(2);
+    expect(await jobTransport.dequeue()).toBeNull();
+  });
+
   it("renews a job's lease while it executes (heartbeat)", async () => {
     let releaseExecute: (() => void) | undefined;
     const slowStage = defineStage({

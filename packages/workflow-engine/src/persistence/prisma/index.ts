@@ -6,6 +6,11 @@
  */
 
 export { createPrismaAICallLogger, PrismaAICallLogger } from "./ai-logger";
+export {
+  type BlobPrismaClient,
+  createPrismaBlobStore,
+  PrismaBlobStore,
+} from "./blob-store";
 export { createEnumHelper, type PrismaEnumHelper } from "./enum-compat";
 export {
   createPrismaJobQueue,
@@ -22,4 +27,5 @@ export type { EnginePrismaClient, PrismaDelegate } from "./prisma-client-type";
 export {
   createPrismaStepLedger,
   PrismaStepLedger,
+  type PrismaStepLedgerOptions,
 } from "./step-ledger";

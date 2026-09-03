@@ -50,6 +50,12 @@ export interface StepWaitOptions<T> {
   pollBackoffMs?: number;
 }
 
+/** `waitFor` options whose `ready` is a type guard: the result narrows to `U`. */
+export interface StepWaitOptionsNarrowing<T, U extends T>
+  extends Omit<StepWaitOptions<T>, "ready"> {
+  ready: (value: T) => value is U;
+}
+
 /**
  * Durable operations available to a stage.
  *
@@ -68,6 +74,10 @@ export interface StepApi {
     fn: () => Promise<T>,
     options?: StepRunOptions,
   ): Promise<T>;
+  waitFor<T, U extends T>(
+    id: string,
+    opts: StepWaitOptionsNarrowing<T, U>,
+  ): Promise<U>;
   waitFor<T>(id: string, opts: StepWaitOptions<T>): Promise<T>;
   waitForSignal<T = unknown>(
     id: string,

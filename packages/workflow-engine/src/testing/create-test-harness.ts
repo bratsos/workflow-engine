@@ -31,9 +31,15 @@ import {
   HOST_DEFAULTS,
 } from "../kernel/helpers/host-support.js";
 import type { PluginDefinition } from "../kernel/plugins.js";
-import type { EventSink, KernelServices, StepLedger } from "../kernel/ports.js";
+import type {
+  BlobStore,
+  EventSink,
+  KernelServices,
+  StepLedger,
+} from "../kernel/ports.js";
 import type { FakeClock } from "../kernel/testing/fake-clock.js";
 import { FakeClock as FakeClockImpl } from "../kernel/testing/fake-clock.js";
+import type { InMemoryBlobStore } from "../kernel/testing/in-memory-blob-store.js";
 import type { Status, WorkflowRunRecord } from "../persistence/interface.js";
 import { createTestKernel } from "./create-test-kernel.js";
 import { InMemoryAICallLogger } from "./in-memory-ai-logger.js";
@@ -88,6 +94,8 @@ export interface CreateTestHarnessOptions {
   clock?: FakeClock;
   /** Step ledger. Defaults to an `InMemoryStepLedger` on the harness clock. */
   stepLedger?: StepLedger;
+  /** Blob store. Defaults to an `InMemoryBlobStore`. */
+  blobStore?: InMemoryBlobStore;
   /** AI call logger. Defaults to a fresh `InMemoryAICallLogger`. */
   aiLogger?: InMemoryAICallLogger;
   /** Mock AI factory. Defaults to `createMockAIHelperFactory()`. */
@@ -127,6 +135,7 @@ export function createTestHarness(options: CreateTestHarnessOptions = {}) {
     clock,
     workerId,
     stepLedger,
+    ...(options.blobStore ? { blobStore: options.blobStore } : {}),
     services: {
       aiLogger,
       ai: mockAi,

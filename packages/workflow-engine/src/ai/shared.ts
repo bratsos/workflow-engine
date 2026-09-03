@@ -274,3 +274,31 @@ export function calculateCostWithDiscount(
   const baseCost = calculateCost(modelKey, inputTokens, outputTokens);
   return baseCost.totalCost;
 }
+
+const NO_ENDPOINTS =
+  /No endpoints found that can handle the requested parameters/;
+
+/**
+ * OpenRouter answers "No endpoints found that can handle the requested
+ * parameters" when `provider.require_parameters` (on by default) excludes
+ * every endpoint that does not honour one of the request's parameters —
+ * most often `maxTokens` on a model whose endpoints do not all accept it.
+ * The raw message reads like an outage; say what to change.
+ */
+export function explainRoutingError(
+  error: unknown,
+  routing: OpenRouterRoutingOptions | undefined,
+  modelKey: string,
+): unknown {
+  if (!(error instanceof Error) || !NO_ENDPOINTS.test(error.message)) {
+    return error;
+  }
+  if (routing?.requireParameters === false) return error;
+  const explained = new Error(
+    `OpenRouter found no endpoint honouring every requested parameter for "${modelKey}" (routing.requireParameters is true by default, so an endpoint that ignores e.g. maxTokens or temperature is excluded). ` +
+      `Set routing: { requireParameters: false } on createAIHelper / AIHelperOptions to accept such endpoints, or drop the parameter. Original: ${error.message}`,
+    { cause: error },
+  );
+  explained.name = error.name;
+  return explained;
+}
