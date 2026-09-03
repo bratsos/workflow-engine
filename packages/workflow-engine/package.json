@@ -82,7 +82,8 @@
     "LICENSE",
     "README.md",
     "dist",
-    "skills"
+    "skills",
+    "prisma"
   ],
   "scripts": {
     "typecheck": "tsc --noEmit",

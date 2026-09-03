@@ -1,4 +1,3 @@
-import { Prisma } from "@prisma/client";
 import type {
   StepLedger,
   StepRecord,
@@ -43,8 +42,11 @@ function mapPatch(patch: StepRecordPatch): Record<string, unknown> {
   if (patch.leaseExpiresAt !== undefined)
     data.leaseExpiresAt = patch.leaseExpiresAt;
   if (patch.deadlineAt !== undefined) data.deadlineAt = patch.deadlineAt;
-  if (Object.hasOwn(patch, "result")) {
-    data.result = patch.result === null ? Prisma.JsonNull : patch.result;
+  // A null result is left as SQL NULL (the column default): writing Prisma.JsonNull
+  // would require importing the consumer's generated client, which Prisma 7
+  // no longer exposes under a fixed path. `get` maps SQL NULL back to null.
+  if (Object.hasOwn(patch, "result") && patch.result != null) {
+    data.result = patch.result;
   }
   if (Object.hasOwn(patch, "error")) data.error = patch.error ?? null;
   if (patch.waitState !== undefined) data.waitState = patch.waitState;
@@ -69,12 +71,7 @@ export class PrismaStepLedger implements StepLedger {
           attempt: record.attempt,
           leaseExpiresAt: record.leaseExpiresAt,
           deadlineAt: record.deadlineAt,
-          ...(record.result !== undefined
-            ? {
-                result:
-                  record.result === null ? Prisma.JsonNull : record.result,
-              }
-            : {}),
+          ...(record.result != null ? { result: record.result } : {}),
           ...(record.error !== undefined ? { error: record.error } : {}),
           ...(record.waitState !== undefined
             ? { waitState: record.waitState }

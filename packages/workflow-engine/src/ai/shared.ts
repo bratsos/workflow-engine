@@ -89,6 +89,8 @@ export function getModelProvider(
 }
 
 export interface ProviderResultLike {
+  /** A cost the transport itself reported, in USD (adapters). */
+  costUsd?: number;
   providerMetadata?: Record<string, any>;
   usage?: {
     raw?: Record<string, any>;
@@ -114,6 +116,10 @@ export function extractReportedCost(
 ): number | undefined {
   if (!result || typeof result !== "object") {
     return undefined;
+  }
+
+  if (typeof result.costUsd === "number" && !Number.isNaN(result.costUsd)) {
+    return result.costUsd;
   }
 
   const openrouterMeta =

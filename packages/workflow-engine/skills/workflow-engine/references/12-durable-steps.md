@@ -19,7 +19,7 @@ const kernel = createKernel({
 
 In tests use `InMemoryStepLedger`, `InMemoryAICallLogger` and `createMockAIHelperFactory()` from `@bratsos/workflow-engine/testing`. A stage that never touches `ctx.step` or `ctx.ai` runs without either; touching them unconfigured throws `StepLedgerNotConfiguredError` or `AIServicesNotConfiguredError`.
 
-The Prisma ledger uses the `WorkflowStep` model in `prisma/schema.prisma`; consumers add it (and its `attempt`, `leaseExpiresAt`, `deadlineAt` columns) with a migration.
+The Prisma ledger uses the `WorkflowStep` model from the package's `prisma/schema.prisma` (shipped in `node_modules/@bratsos/workflow-engine/prisma/`); consumers add it, with its `attempt`, `leaseExpiresAt` and `deadlineAt` columns, through a migration. The Prisma adapters also require every model the package schema defines, including `WorkflowAnnotation` (added in 0.8), so a consumer that skipped releases must add the missing models too. The adapters never import `@prisma/client` themselves; they work with any generator output, including Prisma 7's `prisma-client` generator with a custom `output`.
 
 ## The step API
 
@@ -173,7 +173,7 @@ const localCli: AIAdapter = {
 const helper = createAIHelper("dev.local", logger, undefined, undefined, { adapter: localCli });
 ```
 
-Request shapes: `AdapterTextRequest { model, prompt, options }`, `AdapterObjectRequest { model, prompt, schema, options }`, `AdapterEmbedRequest { model, values, options }`, `AdapterStreamRequest { model, prompt?, messages?, instructions?, options }`. Responses return the text, object, embeddings or stream plus `inputTokens`, `outputTokens`, optional `reasoning` and optional `providerMetadata` (a reported cost in metadata is used instead of the estimate).
+Request shapes: `AdapterTextRequest { model, prompt, options }`, `AdapterObjectRequest { model, prompt, schema, options }`, `AdapterEmbedRequest { model, values, options }`, `AdapterStreamRequest { model, prompt?, messages?, instructions?, options }`. Responses return the text, object, embeddings or stream plus `inputTokens`, `outputTokens`, optional `reasoning`, optional `providerMetadata`, and optional `costUsd`. When `costUsd` is present it is recorded as the reported cost (`costSource: "reported"`) instead of the estimate from the model's price table; use it for transports whose price the registry does not know, such as subscription CLIs.
 
 ### Timeouts
 

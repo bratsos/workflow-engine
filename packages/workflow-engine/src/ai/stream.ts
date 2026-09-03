@@ -263,7 +263,10 @@ export function streamText(
                   adapterResponse.outputTokens ?? 0,
                   adapterResponse.text ?? fullText,
                   adapterResponse.reasoning,
-                  { providerMetadata: adapterResponse.providerMetadata },
+                  {
+                    providerMetadata: adapterResponse.providerMetadata,
+                    costUsd: adapterResponse.costUsd,
+                  },
                 );
               }
               return { done: true, value: undefined };

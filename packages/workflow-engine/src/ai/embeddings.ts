@@ -138,6 +138,7 @@ export async function embed(
     let embeddings: number[][];
     let totalInputTokens: number;
     let providerMetadata: unknown;
+    let adapterCostUsd: number | undefined;
 
     if (isAdapter) {
       const result = await runWithCallTimeout(timeout, (signal) =>
@@ -150,6 +151,7 @@ export async function embed(
       embeddings = result.embeddings;
       totalInputTokens = result.inputTokens;
       providerMetadata = result.providerMetadata;
+      adapterCostUsd = result.costUsd;
     } else if (texts.length === 1) {
       const result = await runWithCallTimeout(timeout, (signal) =>
         aiEmbed({
@@ -181,7 +183,7 @@ export async function embed(
       modelKey,
       totalInputTokens,
       outputTokens,
-      { providerMetadata },
+      { providerMetadata, costUsd: adapterCostUsd },
     );
     const durationMs = Date.now() - startTime;
 

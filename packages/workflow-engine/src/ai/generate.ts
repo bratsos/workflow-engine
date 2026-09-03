@@ -285,6 +285,7 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
       outputTokens?: number;
       usage?: { inputTokens?: number; outputTokens?: number };
       providerMetadata?: Record<string, unknown>;
+      costUsd?: number;
       finishReason?: unknown;
       reasoningText?: string;
       reasoning?: string;
@@ -298,7 +299,12 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
       modelKey,
       inputTokens,
       outputTokens,
-      isAdapter ? { providerMetadata: resultAny.providerMetadata } : result,
+      isAdapter
+        ? {
+            providerMetadata: resultAny.providerMetadata,
+            costUsd: resultAny.costUsd,
+          }
+        : result,
     );
     const durationMs = Date.now() - startTime;
     // Reasoning models emit on a separate channel; surface it so a
@@ -481,6 +487,7 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
       outputTokens?: number;
       usage?: { inputTokens?: number; outputTokens?: number };
       providerMetadata?: Record<string, unknown>;
+      costUsd?: number;
       finishReason?: unknown;
       reasoningText?: string;
       reasoning?: string;
@@ -494,7 +501,12 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
       modelKey,
       inputTokens,
       outputTokens,
-      isAdapter ? { providerMetadata: resultAny.providerMetadata } : result,
+      isAdapter
+        ? {
+            providerMetadata: resultAny.providerMetadata,
+            costUsd: resultAny.costUsd,
+          }
+        : result,
     );
     const durationMs = Date.now() - startTime;
 

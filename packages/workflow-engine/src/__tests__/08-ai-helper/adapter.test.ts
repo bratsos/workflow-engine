@@ -40,6 +40,28 @@ function logger() {
 }
 
 describe("AI adapter seam", () => {
+  it("records an adapter-reported cost as the reported cost", async () => {
+    const adapter: AIAdapter = {
+      generateText: async () => ({
+        text: "cli",
+        inputTokens: 4,
+        outputTokens: 3,
+        costUsd: 0.5,
+      }),
+    };
+    const aiLogger = logger();
+    const ai = createAIHelper("adapter.cost", aiLogger, undefined, undefined, {
+      adapter,
+    });
+
+    await expect(ai.generateText(MODEL, "hello")).resolves.toMatchObject({
+      cost: 0.5,
+      reportedCostUsd: 0.5,
+      costSource: "reported",
+    });
+    expect(aiLogger.getCallsByTopic("adapter.cost")[0]?.cost).toBe(0.5);
+  });
+
   it("uses the adapter below helper logging and preserves it in children", async () => {
     const adapter = new LocalCliLikeAdapter();
     const aiLogger = logger();

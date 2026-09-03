@@ -68,6 +68,8 @@ export interface AdapterStreamRequest {
 }
 
 export interface AdapterTextResponse {
+  /** Cost the adapter measured itself, in USD; recorded as a reported cost. */
+  costUsd?: number;
   text: string;
   inputTokens: number;
   outputTokens: number;
@@ -77,6 +79,8 @@ export interface AdapterTextResponse {
 }
 
 export interface AdapterObjectResponse {
+  /** Cost the adapter measured itself, in USD; recorded as a reported cost. */
+  costUsd?: number;
   object: unknown;
   inputTokens: number;
   outputTokens: number;
@@ -85,6 +89,8 @@ export interface AdapterObjectResponse {
 }
 
 export interface AdapterEmbedResponse {
+  /** Cost the adapter measured itself, in USD; recorded as a reported cost. */
+  costUsd?: number;
   embeddings: number[][];
   inputTokens: number;
   outputTokens?: number;
@@ -92,6 +98,8 @@ export interface AdapterEmbedResponse {
 }
 
 export interface AdapterStreamResponse {
+  /** Cost the adapter measured itself, in USD; recorded as a reported cost. */
+  costUsd?: number;
   stream: AsyncIterable<string>;
   text?: string;
   inputTokens?: number;
