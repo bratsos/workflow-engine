@@ -6,6 +6,7 @@ import {
   lstatSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   writeFileSync,
 } from "node:fs";
 import { createRequire } from "node:module";
@@ -1102,8 +1103,23 @@ function printHumanReport(report: CliReport, dryRun: boolean): void {
   );
 }
 
-const invokedFile = process.argv[1] ? resolve(process.argv[1]) : undefined;
-if (invokedFile && fileURLToPath(import.meta.url) === invokedFile) {
+function toRealPath(path: string): string {
+  const resolved = resolve(path);
+  try {
+    return realpathSync(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
+export function isInvokedAsBin(metaUrl: string): boolean {
+  const invokedFile = process.argv[1] ? toRealPath(process.argv[1]) : undefined;
+  return Boolean(
+    invokedFile && invokedFile === toRealPath(fileURLToPath(metaUrl)),
+  );
+}
+
+if (isInvokedAsBin(import.meta.url)) {
   void runCodemod().then((exitCode) => {
     process.exitCode = exitCode;
   });
