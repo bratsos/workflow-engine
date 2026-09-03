@@ -64,6 +64,21 @@ function toEpochMs(value: unknown): number | undefined {
   return undefined;
 }
 
+/**
+ * The engine batch provider behind a stored ref's provider id
+ * (`"openrouter"`, `"google.generative-ai"`, `"anthropic.messages"`,
+ * `"openai.responses"`, ...).
+ */
+export function batchProviderFromRefProvider(
+  providerId: string,
+): AIBatchProvider | undefined {
+  if (providerId === "openrouter") return "openrouter";
+  if (providerId.startsWith("google")) return "google";
+  if (providerId.startsWith("anthropic")) return "anthropic";
+  if (providerId.startsWith("openai")) return "openai";
+  return undefined;
+}
+
 export class AIBatchImpl<T = string> implements AIBatch<T> {
   private providerPromise?: Promise<EngineBatchModel>;
 
@@ -104,7 +119,37 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
     /** Pre-resolved backend; skips provider resolution. Used by tests and adapters. */
     backend?: EngineBatchModel,
   ) {
-    if (backend) this.providerPromise = Promise.resolve(backend);
+    if (backend) {
+      this.providerPromise = Promise.resolve(backend);
+      this.backendInjected = true;
+    }
+  }
+
+  private backendInjected = false;
+
+  /**
+   * A batch that was submitted elsewhere (a poll or collect after a
+   * suspend/resume, or in another process) must be read through the
+   * transport that created it, which the stored refs name — not through
+   * whatever the live registry resolves for the model key today. A
+   * `batchProvider` change between submit and poll would otherwise strand
+   * the run with "belongs to unknown provider".
+   */
+  private adoptProviderFromRefs(metadata?: Record<string, unknown>): void {
+    // An injected backend is authoritative (tests, adapters).
+    if (this.backendInjected) return;
+    const rawRefs = metadata?.batchRefs;
+    if (!Array.isArray(rawRefs) || rawRefs.length === 0) return;
+    const first = rawRefs[0];
+    const providerId =
+      typeof first === "object" && first !== null
+        ? (first as { provider?: unknown }).provider
+        : undefined;
+    if (typeof providerId !== "string") return;
+    const provider = batchProviderFromRefProvider(providerId);
+    if (provider === undefined || provider === this.provider) return;
+    this.provider = provider;
+    this.providerPromise = undefined;
   }
 
   /**
@@ -485,6 +530,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
       };
     }
 
+    this.adoptProviderFromRefs(metadata);
     const batchModel = await this.provider$();
     const refs = this.resolveRefs(batchId, metadata, batchModel);
 
@@ -532,6 +578,25 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
       .filter((e): e is string => typeof e === "string" && e.length > 0);
     const aggregatedError = errors.length > 0 ? errors.join("; ") : undefined;
 
+    // Per-item provider failures are visible in the counts as soon as the
+    // batch settles; say so at the poll, not only after collect.
+    if (aggregatedStatus === "completed" && hasCounts && failedCount > 0) {
+      const warnMsg = `[Batch] ${failedCount} of ${totalCount} requests in batch ${batchId} failed at the provider; getResults() reports each item's error.`;
+      if (this.batchLogFn) {
+        this.batchLogFn("WARN", warnMsg, {
+          batchId,
+          failed: failedCount,
+          total: totalCount,
+        });
+      } else {
+        logger.warn(warnMsg, {
+          batchId,
+          failed: failedCount,
+          total: totalCount,
+        });
+      }
+    }
+
     return {
       id: batchId,
       status: aggregatedStatus,
@@ -567,6 +632,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
       return emptyResults;
     }
 
+    this.adoptProviderFromRefs(metadata);
     const batchModel = await this.provider$();
     const targetRefs = this.resolveRefs(batchId, metadata, batchModel);
 
@@ -615,6 +681,8 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
         : undefined;
     let schemaFailures = 0;
     let firstSchemaIssue: string | undefined;
+    let providerFailures = 0;
+    let firstProviderError: string | undefined;
 
     let unvalidatedCount = 0;
     let totalReceivedItems = 0;
@@ -644,14 +712,17 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
         const outputTokens = item.outputTokens ?? 0;
 
         if (item.status !== "succeeded") {
+          const error =
+            item.error ?? `Batch item failed with status "${item.status}"`;
+          providerFailures++;
+          firstProviderError ??= error;
           results.push({
             id: customId,
             prompt: promptFor(customId),
             inputTokens,
             outputTokens,
             status: "failed",
-            error:
-              item.error ?? `Batch item failed with status "${item.status}"`,
+            error,
             validated: false,
           });
           continue;
@@ -700,6 +771,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
               status: "failed",
               error: `Failed to parse JSON response for schema validation: ${parseError}`,
               validated: false,
+              responseText: item.text,
             });
             continue;
           }
@@ -720,6 +792,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
               status: "failed",
               error: `Schema validation threw an error: ${errText}`,
               validated: false,
+              responseText: item.text,
             });
             continue;
           }
@@ -735,6 +808,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
               status: "failed",
               error: `Response did not match the request's schema: ${validation.error.message}`,
               validated: false,
+              responseText: item.text,
             });
             continue;
           }
@@ -785,30 +859,36 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
       }
     }
 
-    if (results.length > 0 && schemaFailures * 2 > results.length) {
-      // Usually a schema the provider's structured-output mode cannot
-      // express (nested unions); every failed item is re-run realtime by
-      // the map's repair pass, so the batch discount is lost twice over.
-      const warnMsg =
-        `[Batch] ${schemaFailures} of ${results.length} results in batch ${batchId} failed schema validation; ` +
-        `first issue: ${firstSchemaIssue ?? "unknown"}. Check that the provider's structured-output mode can express the schema.`;
+    const failures = schemaFailures + providerFailures;
+    if (results.length > 0 && failures * 2 > results.length) {
+      // Every failed item is re-run realtime by the map's repair pass, so
+      // the batch discount is lost twice over. Schema failures are usually
+      // a schema the provider's structured-output mode cannot express;
+      // provider failures are the endpoint rejecting the request itself.
+      const classes = [
+        schemaFailures > 0
+          ? `${schemaFailures} failed schema validation (first issue: ${firstSchemaIssue ?? "unknown"})`
+          : undefined,
+        providerFailures > 0
+          ? `${providerFailures} failed at the provider (first error: ${firstProviderError ?? "unknown"})`
+          : undefined,
+      ].filter((c): c is string => c !== undefined);
+      const warnMsg = `[Batch] ${failures} of ${results.length} results in batch ${batchId} failed: ${classes.join("; ")}.`;
+      const meta = {
+        batchId,
+        schemaFailures,
+        providerFailures,
+        total: results.length,
+      };
       if (this.batchLogFn) {
-        this.batchLogFn("WARN", warnMsg, {
-          batchId,
-          schemaFailures,
-          total: results.length,
-        });
+        this.batchLogFn("WARN", warnMsg, meta);
       } else {
-        logger.warn(warnMsg, {
-          batchId,
-          schemaFailures,
-          total: results.length,
-        });
+        logger.warn(warnMsg, meta);
       }
     }
 
     // Auto-record results
-    await this.recordResults(batchId, results, { durationMs });
+    await this.recordResults(batchId, results, { batchDurationMs: durationMs });
 
     return results;
   }
@@ -823,7 +903,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
   async recordResults(
     batchId: string,
     results: AIBatchResult<T>[],
-    extra: { durationMs?: number } = {},
+    extra: { batchDurationMs?: number } = {},
   ): Promise<void> {
     if (this.recordedBatchIds.has(batchId)) {
       logger.debug(`Batch ${batchId} already recorded, skipping.`);
@@ -862,12 +942,14 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
               modelKey: this.modelKey,
               modelId: modelConfig.id,
               prompt: r.prompt,
+              // The model's reply, or its raw text when the reply failed
+              // validation; empty only when the provider failed the item.
               response:
                 r.status === "succeeded"
                   ? typeof r.result === "string"
                     ? r.result
                     : JSON.stringify(r.result)
-                  : "",
+                  : (r.responseText ?? ""),
               inputTokens: r.inputTokens,
               outputTokens: r.outputTokens,
               cost,
@@ -876,8 +958,11 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
               metadata: {
                 batchId,
                 requestId: r.id,
-                ...(extra.durationMs !== undefined
-                  ? { durationMs: extra.durationMs }
+                // Providers report no per-item latency; the batch wall
+                // time is recorded under its own name rather than as a
+                // per-call `durationMs`.
+                ...(extra.batchDurationMs !== undefined
+                  ? { batchDurationMs: extra.batchDurationMs }
                   : {}),
                 ...(r.status === "failed"
                   ? { status: "failed", error: r.error }

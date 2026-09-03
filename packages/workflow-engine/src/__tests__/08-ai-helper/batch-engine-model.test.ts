@@ -21,7 +21,11 @@ import {
   resolveAiSdkBatchModel,
   toJsonSchema,
 } from "../../ai/batch";
-import { rewriteGoogleBatchBody } from "../../ai/batch/google-json-schema.js";
+import { isMissingPackageError } from "../../ai/batch/ai-sdk.js";
+import {
+  rewriteGoogleBatchBody,
+  toGeminiResponseSchema,
+} from "../../ai/batch/google-json-schema.js";
 
 // Hand-rolled fake Experimental_BatchLanguageModelV4 for testing
 class MockBatchLanguageModel
@@ -360,7 +364,7 @@ describe("Batch Subsystem - AI SDK Adapter (fromAiSdk)", () => {
     });
   });
 
-  it("sends the full JSON Schema (unions intact) as responseJsonSchema on Google batches", async () => {
+  it("sends the engine's union-preserving responseSchema on Google batches", async () => {
     const bodies: string[] = [];
     const mockFetch = vi.fn(
       async (url: string | URL | Request, init?: RequestInit) => {
@@ -401,24 +405,87 @@ describe("Batch Subsystem - AI SDK Adapter (fromAiSdk)", () => {
     }>;
     expect(requests.map((r) => r.metadata.key)).toEqual(["node-1", "node-2"]);
     const config = requests[0]!.request.generationConfig;
-    expect(config.responseSchema).toBeUndefined();
+    // The batch endpoint ignores/rejects responseJsonSchema; only the
+    // OpenAPI responseSchema is enforced there.
+    expect(config.responseJsonSchema).toBeUndefined();
     expect(config.responseMimeType).toBe("application/json");
-    const jsonSchema = config.responseJsonSchema as {
-      properties: { metadata: { anyOf?: unknown[]; oneOf?: unknown[] } };
+    const responseSchema = config.responseSchema as {
+      properties: {
+        metadata: { anyOf?: Array<Record<string, unknown>>; oneOf?: unknown };
+      };
     };
-    // The discriminated union survives as-is; the OpenAPI conversion the
-    // provider would have applied flattens it.
-    const branches =
-      jsonSchema.properties.metadata.anyOf ??
-      jsonSchema.properties.metadata.oneOf;
+    // The discriminated union survives as anyOf (Gemini has no oneOf, which
+    // is what the provider's own conversion would have sent).
+    expect(responseSchema.properties.metadata.oneOf).toBeUndefined();
+    const branches = responseSchema.properties.metadata.anyOf;
     expect(branches).toHaveLength(2);
-    expect(JSON.stringify(branches)).toContain('"article"');
-    expect(JSON.stringify(branches)).toContain('"table"');
-    expect(config.responseJsonSchema).not.toHaveProperty("$schema");
+    expect(branches![0]).toMatchObject({
+      type: "object",
+      properties: { kind: { type: "string", enum: ["article"] } },
+      required: ["kind", "title"],
+    });
+    expect(JSON.stringify(responseSchema)).not.toContain(
+      "additionalProperties",
+    );
     // The request without a schema is untouched.
     const plain = requests[1]!.request.generationConfig;
-    expect(plain.responseJsonSchema).toBeUndefined();
+    expect(plain.responseSchema).toBeUndefined();
     expect(plain.responseMimeType).toBeUndefined();
+  });
+
+  it("converts a JSON Schema into Gemini's Schema without losing unions, enums, nullability or bounds", () => {
+    const schema = z.object({
+      nodeId: z.string().describe("Echo the id"),
+      tags: z.array(z.string()).min(1).max(3),
+      note: z.string().nullable(),
+      metadata: z.discriminatedUnion("version", [
+        z.object({
+          version: z.literal(1),
+          data: z.union([
+            z.object({ contentType: z.literal("a"), n: z.number() }),
+            z.object({ contentType: z.literal("b"), s: z.string() }),
+          ]),
+          level: z.enum(["low", "high"]).optional(),
+        }),
+      ]),
+    });
+    const gemini = toGeminiResponseSchema(z.toJSONSchema(schema));
+    const text = JSON.stringify(gemini);
+    for (const keyword of [
+      "oneOf",
+      "additionalProperties",
+      "$schema",
+      "const",
+    ]) {
+      expect(text).not.toContain(`"${keyword}"`);
+    }
+    const props = gemini.properties as Record<string, Record<string, unknown>>;
+    expect(props.nodeId).toEqual({
+      type: "string",
+      description: "Echo the id",
+    });
+    expect(props.tags).toMatchObject({
+      type: "array",
+      minItems: 1,
+      maxItems: 3,
+    });
+    expect(props.note).toEqual({ type: "string", nullable: true });
+    // A single-branch oneOf collapses into the branch itself.
+    expect(props.metadata).toMatchObject({
+      type: "object",
+      properties: {
+        version: { type: "number", enum: ["1"], format: "enum" },
+        level: { type: "string", enum: ["low", "high"] },
+      },
+      required: ["version", "data"],
+    });
+    const data = (
+      props.metadata.properties as Record<string, { anyOf: unknown[] }>
+    ).data;
+    expect(data.anyOf).toHaveLength(2);
+    expect(data.anyOf[1]).toMatchObject({
+      properties: { contentType: { type: "string", enum: ["b"] } },
+    });
   });
 
   it("rewrites only the requests whose key it knows", () => {
@@ -429,7 +496,10 @@ describe("Batch Subsystem - AI SDK Adapter (fromAiSdk)", () => {
             requests: [
               {
                 request: {
-                  generationConfig: { responseSchema: { type: "OBJECT" } },
+                  generationConfig: {
+                    responseSchema: { type: "OBJECT" },
+                    responseJsonSchema: { type: "object" },
+                  },
                 },
                 metadata: { key: "a" },
               },
@@ -452,11 +522,31 @@ describe("Batch Subsystem - AI SDK Adapter (fromAiSdk)", () => {
     const [a, b] = body.batch.inputConfig.requests.requests;
     expect(a!.request.generationConfig).toEqual({
       responseMimeType: "application/json",
-      responseJsonSchema: { type: "object", anyOf: [] },
+      responseSchema: { type: "object", anyOf: [] },
     });
     expect(b!.request.generationConfig).toEqual({
       responseSchema: { type: "OBJECT" },
     });
+  });
+
+  it("treats every import failure that names the vendor package as a missing package", () => {
+    const withCode = Object.assign(
+      new Error("Cannot find package '@ai-sdk/openai'"),
+      {
+        code: "ERR_MODULE_NOT_FOUND",
+      },
+    );
+    expect(isMissingPackageError(withCode, "@ai-sdk/openai")).toBe(true);
+    // workerd (Cloudflare Workers): no code, its own wording.
+    expect(
+      isMissingPackageError(
+        new Error('No such module "@ai-sdk/openai".'),
+        "@ai-sdk/openai",
+      ),
+    ).toBe(true);
+    expect(isMissingPackageError(new Error("boom"), "@ai-sdk/openai")).toBe(
+      false,
+    );
   });
 
   it("resolves dynamic AI SDK batch models for supported vendors", async () => {

@@ -158,7 +158,7 @@ describe("step.ai.map batch policy", () => {
     });
   });
 
-  it("stores the item prompt and the batch duration on the accounting rows", async () => {
+  it("stores the item prompt and the batch wall time (not a per-item durationMs) on the accounting rows", async () => {
     const h = await setup("batch-accounting", 25);
 
     await h.execute();
@@ -172,9 +172,13 @@ describe("step.ai.map batch policy", () => {
     for (const row of rows) {
       const requestId = (row.metadata as { requestId?: string }).requestId;
       expect(row.prompt).toBe(`Extract <<${requestId}>>`);
-      expect(typeof (row.metadata as { durationMs?: unknown }).durationMs).toBe(
-        "number",
-      );
+      const meta = row.metadata as {
+        durationMs?: unknown;
+        batchDurationMs?: unknown;
+      };
+      expect(typeof meta.batchDurationMs).toBe("number");
+      expect(meta.durationMs).toBeUndefined();
+      expect(row.response).toBe(JSON.stringify({ v: requestId }));
     }
     expect(h.batchLogs.filter((l) => l.level === "WARN")).toEqual([]);
   });
@@ -193,8 +197,44 @@ describe("step.ai.map batch policy", () => {
     const warns = h.batchLogs.filter((l) => l.level === "WARN");
     expect(warns).toHaveLength(1);
     expect(warns[0]!.message).toContain("20 of 25 results in batch batch-1");
+    expect(warns[0]!.message).toContain("20 failed schema validation");
     expect(warns[0]!.message).toContain("first issue:");
     // The repair pass still fixed every item realtime.
+    expect(h.mock.getCalls()).toHaveLength(20);
+    expect(h.results().every((r) => r.status === "succeeded")).toBe(true);
+    // The accounting row of a rejected reply keeps the model's raw text.
+    const rejected = h.aiLogger
+      .getCallsByTopic(h.topic)
+      .filter((c) => c.callType === "batch" && c.response === '{"v":1}');
+    expect(rejected).toHaveLength(20);
+  });
+
+  it("warns at the poll and at collect when the provider fails most items, naming the class", async () => {
+    const failIds = new Set(
+      Array.from({ length: 25 }, (_, i) => String(i)).filter(
+        (id) => Number(id) < 20,
+      ),
+    );
+    const h = await setup("batch-provider-failed", 25, {
+      failIds,
+      failError: "Request contains an invalid argument.",
+    });
+
+    await h.execute();
+    await h.settle(60_000);
+    expect((await h.stage())?.status).toBe("COMPLETED");
+
+    const warns = h.batchLogs.filter((l) => l.level === "WARN");
+    // One WARN from getStatus when the batch settled, one from getResults.
+    expect(warns.map((w) => w.message)).toEqual([
+      expect.stringContaining(
+        "20 of 25 requests in batch batch-1 failed at the provider",
+      ),
+      expect.stringContaining(
+        "20 of 25 results in batch batch-1 failed: 20 failed at the provider (first error: Request contains an invalid argument.)",
+      ),
+    ]);
+    // Every provider-failed item was re-run realtime by the repair pass.
     expect(h.mock.getCalls()).toHaveLength(20);
     expect(h.results().every((r) => r.status === "succeeded")).toBe(true);
   });

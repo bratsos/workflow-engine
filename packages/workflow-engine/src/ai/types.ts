@@ -416,6 +416,12 @@ export type AIBatchResult<T = string> =
       error: string;
       /** Always false on failed requests. */
       validated?: boolean;
+      /**
+       * The model's raw reply when the request reached the model but its
+       * output could not be parsed or validated (absent when the provider
+       * itself failed the request). Stored on the accounting row.
+       */
+      responseText?: string;
     };
 
 /** Handle for tracking a submitted batch */

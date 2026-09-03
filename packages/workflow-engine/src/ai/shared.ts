@@ -79,7 +79,10 @@ export function getModelProvider(
     });
   }
   if (modelConfig.provider === "google") {
-    return google(modelConfig.id);
+    // A registry entry may carry the catalog slug (`google/gemini-...`) so
+    // the same key serves the Google batch path; the Google API itself
+    // wants the bare model id (the slug 404s).
+    return google(modelConfig.id.replace(/^google\//, ""));
   }
 
   throw new Error(

@@ -13,7 +13,7 @@ import type {
 import {
   createGoogleBatchFetch,
   type FetchLike,
-  toGoogleJsonSchema,
+  toGoogleResponseSchema,
 } from "./google-json-schema";
 import {
   type EngineBatchItemResult,
@@ -272,10 +272,10 @@ export interface AiSdkBatchModelOptions {
 }
 
 /**
- * Google: send the full JSON Schema. The provider only knows Gemini's lossy
- * OpenAPI `responseSchema`, so the engine's schemas are substituted into
- * the inline batch body as `responseJsonSchema` at the fetch boundary —
- * see google-json-schema.ts.
+ * Google: the batch endpoint only enforces the OpenAPI `responseSchema`,
+ * and the provider's conversion to it loses unions, so the engine's own
+ * union-preserving conversion is substituted into the inline batch body at
+ * the fetch boundary — see google-json-schema.ts.
  */
 async function resolveGoogleBatchModel(
   modelId: string,
@@ -306,7 +306,7 @@ async function resolveGoogleBatchModel(
       const keys: string[] = [];
       for (const req of requests) {
         if (!req.schema) continue;
-        schemasByKey.set(req.id, toGoogleJsonSchema(req.schema));
+        schemasByKey.set(req.id, toGoogleResponseSchema(req.schema));
         keys.push(req.id);
       }
       try {
@@ -316,6 +316,31 @@ async function resolveGoogleBatchModel(
       }
     },
   };
+}
+
+/**
+ * Whether a dynamic `import()` of `pkgName` failed because the package is
+ * not installed. Node reports `ERR_MODULE_NOT_FOUND` / "Cannot find
+ * package"; Vite reports "Failed to load url"; workerd (Cloudflare
+ * Workers) throws `No such module "<pkg>".` with no code. Any import
+ * failure that names the package counts, so the caller can fall back
+ * instead of failing the submit.
+ */
+export function isMissingPackageError(err: unknown, pkgName: string): boolean {
+  if (!(err instanceof Error)) return false;
+  if (
+    "code" in err &&
+    (err as { code?: unknown }).code === "ERR_MODULE_NOT_FOUND"
+  )
+    return true;
+  const message = err.message;
+  return (
+    message.includes("Cannot find package") ||
+    message.includes("Cannot find module") ||
+    message.includes("Failed to load url") ||
+    message.includes("No such module") ||
+    message.includes(pkgName)
+  );
 }
 
 /**
@@ -353,19 +378,13 @@ export async function resolveAiSdkBatchModel(
     const _exhaustive: never = vendor;
     throw new Error(`Unsupported vendor: ${_exhaustive}`);
   } catch (err: unknown) {
-    if (
-      err instanceof Error &&
-      (("code" in err && (err as any).code === "ERR_MODULE_NOT_FOUND") ||
-        err.message.includes("Cannot find package") ||
-        err.message.includes("Cannot find module") ||
-        err.message.includes("Failed to load url"))
-    ) {
-      const pkgName =
-        vendor === "google"
-          ? "@ai-sdk/google"
-          : vendor === "anthropic"
-            ? "@ai-sdk/anthropic"
-            : "@ai-sdk/openai";
+    const pkgName =
+      vendor === "google"
+        ? "@ai-sdk/google"
+        : vendor === "anthropic"
+          ? "@ai-sdk/anthropic"
+          : "@ai-sdk/openai";
+    if (isMissingPackageError(err, pkgName)) {
       const causeMsg = err instanceof Error ? `: ${err.message}` : "";
       throw new Error(
         `Package "${pkgName}" is required to use vendor "${vendor}". Please install ${pkgName}${causeMsg}.`,

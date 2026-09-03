@@ -54,6 +54,9 @@ export interface FakeBackendOptions {
   failWith?: string;
   /** Produce the text returned for a request id. */
   respond?: (id: string) => string;
+  /** Request ids the provider reports as failed (with this error). */
+  failIds?: ReadonlySet<string>;
+  failError?: string;
 }
 
 /** Adapted from batch-resume.test.ts: echoes what was submitted, per partition. */
@@ -87,15 +90,33 @@ export function makeFakeBackend(opts: FakeBackendOptions = {}) {
       if (opts.failWith) {
         return { status: "failed" as const, error: opts.failWith };
       }
+      const ids = byBatch.get(_ref.id) ?? [];
+      const failed = ids.filter((id) => opts.failIds?.has(id)).length;
+      const done = polls > (opts.pendingPolls ?? 0);
       return {
-        status:
-          polls <= (opts.pendingPolls ?? 0)
-            ? ("pending" as const)
-            : ("completed" as const),
+        status: done ? ("completed" as const) : ("pending" as const),
+        ...(opts.failIds
+          ? {
+              requestCounts: {
+                total: ids.length,
+                pending: done ? 0 : ids.length,
+                completed: done ? ids.length - failed : 0,
+                failed: done ? failed : 0,
+              },
+            }
+          : {}),
       };
     }),
     results: vi.fn(async function* (ref: EngineBatchRef) {
       for (const id of byBatch.get(ref.id) ?? []) {
+        if (opts.failIds?.has(id)) {
+          yield {
+            id,
+            status: "failed" as const,
+            error: opts.failError ?? "Request contains an invalid argument.",
+          };
+          continue;
+        }
         yield {
           id,
           status: "succeeded" as const,
