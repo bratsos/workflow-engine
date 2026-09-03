@@ -50,6 +50,7 @@ export {
   createSequentialWorkflow,
   // Async-batch stage factories
   createSuspendingStage,
+  createTestStepApi,
   createTrackedWorkflow,
   createTrackingStage,
   createTransformStage,

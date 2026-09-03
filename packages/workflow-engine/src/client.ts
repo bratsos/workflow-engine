@@ -13,7 +13,14 @@
  * import { ... } from "@bratsos/workflow-engine"
  */
 
-export { type AIHelper } from "./ai/ai-helper";
+export {
+  type AIHelper,
+  type ContentPart,
+  type MediaPart,
+  type StreamTextInput,
+  type TextInput,
+  type TextPart,
+} from "./ai/ai-helper";
 // Model configuration (client-safe)
 export {
   AVAILABLE_MODELS,

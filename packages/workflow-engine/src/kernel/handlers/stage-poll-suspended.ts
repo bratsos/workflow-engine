@@ -32,6 +32,7 @@ import {
   buildAnnotationEvents,
   buildStageExecutionContext,
   createAnnotationBuffer,
+  createStepApi,
   createStorageShim,
   defineLazyAIContext,
   failStageAndRun,
@@ -455,7 +456,7 @@ export async function handleStagePollSuspended(
     }) as CheckCompletionContext<unknown>["annotate"];
 
     // 3e. Build check context
-    const checkContext = defineLazyAIContext(
+    const checkContextBase = defineLazyAIContext(
       {
         workflowRunId: run.id,
         stageId: stageRecord.stageId,
@@ -473,6 +474,15 @@ export async function handleStagePollSuspended(
       },
       deps,
     );
+    const checkContext = Object.assign(checkContextBase, {
+      step: createStepApi({
+        stageRecordId: stageRecord.id,
+        stepLedger: deps.stepLedger,
+        clock: deps.clock,
+        onLog: (level, message) => void logFn(level, message),
+        ai: () => checkContextBase.ai,
+      }),
+    });
 
     try {
       // ── Phase 1: checkCompletion (no transaction) ──────────────────

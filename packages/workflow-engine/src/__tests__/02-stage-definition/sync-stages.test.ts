@@ -9,7 +9,11 @@ import { z } from "zod";
 import type { StageContext } from "../../core/stage.js";
 import { defineStage } from "../../core/stage-factory.js";
 import { InMemoryAICallLogger } from "../../testing/in-memory-ai-logger.js";
-import { createMockAIHelper, TestSchemas } from "../utils/index.js";
+import {
+  createMockAIHelper,
+  createTestStepApi,
+  TestSchemas,
+} from "../utils/index.js";
 
 const testAi = createMockAIHelper("test");
 const testAiLogger = new InMemoryAICallLogger();
@@ -109,6 +113,7 @@ describe("I want to define synchronous stages", () => {
         ai: testAi,
         aiLogger: testAiLogger,
         onProgress: () => {},
+        step: createTestStepApi(),
         onLog: () => {},
         log: () => {},
         annotate: () => {},
@@ -208,6 +213,7 @@ describe("I want to define synchronous stages", () => {
         ai: testAi,
         aiLogger: testAiLogger,
         onProgress: () => {},
+        step: createTestStepApi(),
         onLog: () => {},
         log: () => {},
         annotate: () => {},
@@ -361,6 +367,7 @@ describe("I want to define synchronous stages", () => {
         ai: testAi,
         aiLogger: testAiLogger,
         onProgress: () => {},
+        step: createTestStepApi(),
         onLog: () => {},
         log: () => {},
         annotate: () => {},
@@ -412,6 +419,7 @@ describe("I want to define synchronous stages", () => {
         ai: testAi,
         aiLogger: testAiLogger,
         onProgress: () => {},
+        step: createTestStepApi(),
         onLog: () => {},
         log: () => {},
         annotate: () => {},
@@ -463,6 +471,7 @@ describe("I want to define synchronous stages", () => {
         ai: testAi,
         aiLogger: testAiLogger,
         onProgress: () => {},
+        step: createTestStepApi(),
         onLog: () => {},
         log: () => {},
         annotate: () => {},
@@ -522,6 +531,7 @@ describe("I want to define synchronous stages", () => {
         ai: testAi,
         aiLogger: testAiLogger,
         onProgress: () => {},
+        step: createTestStepApi(),
         onLog: () => {},
         log: () => {},
         annotate: () => {},
@@ -625,6 +635,7 @@ describe("I want to define synchronous stages", () => {
         ai: testAi,
         aiLogger: testAiLogger,
         onProgress: () => {},
+        step: createTestStepApi(),
         onLog: () => {},
         log: () => {},
         annotate: () => {},

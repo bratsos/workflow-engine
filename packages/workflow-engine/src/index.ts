@@ -94,16 +94,21 @@ export {
   type AITextResult,
   type BatchLogFn,
   type BatchOptions,
+  type ContentPart,
   createAIHelper,
   type EmbedOptions,
   type LogContext,
+  type MediaPart,
   type ObjectOptions,
   type OpenRouterRoutingOptions,
   type ProviderResolver,
   type RecordCallParams,
   registerEmbeddingProvider,
   type StreamOptions,
+  type StreamTextInput,
+  type TextInput,
   type TextOptions,
+  type TextPart,
 } from "./ai/ai-helper";
 // Batch Engine & OpenRouter Direct Driver
 export {
@@ -240,7 +245,12 @@ export type {
   KernelEventType,
   StepSignalledEvent,
 } from "./kernel/events";
-export { createKernel, type Kernel, type KernelConfig } from "./kernel/kernel";
+export {
+  createKernel,
+  type Kernel,
+  type KernelConfig,
+  type WorkflowRegistry,
+} from "./kernel/kernel";
 export {
   createPluginRunner,
   definePlugin,

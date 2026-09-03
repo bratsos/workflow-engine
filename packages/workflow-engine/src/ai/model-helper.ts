@@ -114,26 +114,13 @@ export type ModelKey =
   | (string & {});
 
 /**
- * Zod schema that validates model keys against both the static enum AND the runtime registry
- * Use ModelKey.parse() to validate and type model key strings
+ * Zod schema for model keys. Deliberately open: it accepts any non-empty
+ * string, exactly like the `ModelKey` *type*. Registry membership is checked
+ * where a model is actually resolved (`getModel()`), not at config-parse
+ * time, so a `schemas.config` field typed with `ModelKey` does not reject a
+ * key the consumer registers later (or resolves through a custom provider).
  */
-export const ModelKey = z
-  .string()
-  .refine(
-    (key) => {
-      // Check built-in enum first
-      if (ModelKeyEnum.safeParse(key).success) {
-        return true;
-      }
-      // Then check runtime registry
-      return MODEL_REGISTRY[key] !== undefined;
-    },
-    {
-      message:
-        "Model not found. Make sure to import the generated models file or register the model.",
-    },
-  )
-  .transform((key) => key);
+export const ModelKey = z.string().min(1);
 
 /**
  * Available AI models with their configurations

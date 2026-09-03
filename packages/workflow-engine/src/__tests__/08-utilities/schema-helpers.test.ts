@@ -10,6 +10,7 @@ import { z } from "zod";
 import { NoInputSchema } from "../../core/schema-helpers.js";
 import type { EnhancedStageContext } from "../../core/stage-factory.js";
 import { defineStage } from "../../core/stage-factory.js";
+import { createTestStepApi } from "../utils/index.js";
 
 /**
  * Run `fn` inside a stage's `execute()` against a hand-built workflow
@@ -37,6 +38,7 @@ async function withContext<TContext extends Record<string, unknown>>(
     input: {},
     config: {},
     onProgress() {},
+    step: createTestStepApi(),
     onLog() {},
     log() {},
     annotate() {},

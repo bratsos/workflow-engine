@@ -136,10 +136,13 @@ export interface StageContext<
   // Resume support - if this stage was suspended and is now resuming
   resumeState?: z.infer<typeof SuspendedStateSchema>;
 
-  // Durable, replayable side effects and waits.
-  // Optional here keeps direct/manual StageContext fixtures source-compatible;
-  // factory-built stage callbacks expose it as required on EnhancedStageContext.
-  step?: StepApi;
+  /**
+   * Durable, replayable side effects and waits. Always provided: every
+   * kernel path builds it with `createStepApi`, and so does host-remote's
+   * activity worker. Without a configured ledger the individual calls throw
+   * `StepLedgerNotConfiguredError` rather than the property being absent.
+   */
+  step: StepApi;
 
   // Progress reporting
   onProgress: (update: ProgressUpdate) => void;
@@ -205,6 +208,12 @@ export interface CheckCompletionContext<TConfig> {
 
   // Config for this stage
   config: TConfig;
+
+  /**
+   * Durable, replayable side effects and waits, scoped to this stage record —
+   * the same ledger rows `execute()` writes.
+   */
+  step: StepApi;
 
   // Logging
   /**

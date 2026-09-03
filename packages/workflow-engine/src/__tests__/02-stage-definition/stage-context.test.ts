@@ -19,7 +19,11 @@ import { defineStage } from "../../core/stage-factory.js";
 import type { ProgressUpdate } from "../../core/types.js";
 import { WorkflowBuilder } from "../../core/workflow.js";
 import { InMemoryAICallLogger } from "../../testing/in-memory-ai-logger.js";
-import { createMockAIHelper, createTestKernel } from "../utils/index.js";
+import {
+  createMockAIHelper,
+  createTestKernel,
+  createTestStepApi,
+} from "../utils/index.js";
 
 const testAi = createMockAIHelper("test");
 const testAiLogger = new InMemoryAICallLogger();
@@ -945,6 +949,7 @@ function createMockContext(overrides: {
     ai: testAi,
     aiLogger: testAiLogger,
     onProgress: overrides.onProgress ?? (() => {}),
+    step: createTestStepApi(),
     onLog: () => {},
     log: () => {},
     annotate: (() => {}) as StageContext<any, any, any>["annotate"],

@@ -41,3 +41,7 @@ export {
 export { resolveExecutionGroupOutput } from "./resolve-execution-group-output.js";
 export { saveStageArtifacts } from "./save-stage-artifacts.js";
 export { saveStageOutput } from "./save-stage-output.js";
+export {
+  type CreateStepApiOptions,
+  createStepApi,
+} from "./step-api.js";

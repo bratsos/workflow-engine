@@ -19,6 +19,7 @@ import { InMemoryAICallLogger } from "../../testing/in-memory-ai-logger.js";
 import {
   createMockAIHelper,
   createTestKernel,
+  createTestStepApi,
   TestSchemas,
 } from "../utils/index.js";
 
@@ -718,6 +719,7 @@ function createMockContext<TInput>(options: {
     ai: testAi,
     aiLogger: testAiLogger,
     onProgress: () => {},
+    step: createTestStepApi(),
     onLog: () => {},
     log: () => {},
     annotate: () => {},
@@ -742,6 +744,7 @@ function createCheckContext<TConfig extends Record<string, unknown>>(options: {
     config: options.config,
     ai: testAi,
     aiLogger: testAiLogger,
+    step: createTestStepApi(),
     onLog: () => {},
     log: () => {},
     annotate: () => {},

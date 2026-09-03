@@ -466,9 +466,8 @@ function buildStage<
         throw error;
       }
 
-      const pendingSuspend = (enhancedContext.step as StepApi | undefined)?.[
-        STEP_API_PENDING_CONTROL_FLOW
-      ]?.();
+      const pendingSuspend =
+        enhancedContext.step[STEP_API_PENDING_CONTROL_FLOW]?.();
       if (pendingSuspend) {
         enhancedContext.log(
           "WARN",
@@ -579,7 +578,7 @@ function createEnhancedContext<
   Object.defineProperties(enhancedContext, {
     step: {
       configurable: true,
-      value: context.step as StepApi,
+      value: context.step,
     },
 
     onProgress: {
