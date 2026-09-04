@@ -259,13 +259,14 @@ beforeEach(() => {
 
 ## Conformance Suites for Custom Adapters (v0.11+)
 
-If you implement `WorkflowPersistence`, `JobQueue`, or `AICallLogger` yourself (a non-Prisma database, a queue product, etc.), validate it against the same behavior the built-in Prisma and in-memory adapters are tested with, instead of hand-rolling parity tests:
+If you implement `WorkflowPersistence`, `JobQueue`, `AICallLogger`, or `StepLedger` yourself (a non-Prisma database, a queue product, etc.), validate it against the same behavior the built-in Prisma and in-memory adapters are tested with, instead of hand-rolling parity tests:
 
 ```typescript
 import {
   persistenceConformanceSuite,
   jobQueueConformanceSuite,
   aiCallLoggerConformanceSuite,
+  stepLedgerConformanceSuite,
 } from "@bratsos/workflow-engine/testing";
 ```
 
@@ -292,6 +293,11 @@ interface ResettableFixture {
 type PersistenceFactory = () => WorkflowPersistence & ResettableFixture;
 type JobQueueFactory = () => JobQueue & ResettableFixture;
 type AILoggerFactory = () => AICallLogger & ResettableFixture;
+
+// `StepLedger` has a `clear(stageRecordId)` of its own, so its fixture
+// carries only the async seam rather than intersecting `ResettableFixture`.
+type StepLedgerFixture = StepLedger & { reset?: () => Promise<void> };
+type StepLedgerFactory = () => StepLedgerFixture;
 ```
 
 Each suite's `beforeEach` prefers the async `reset()` when the fixture provides one, falling back to synchronous `clear()` otherwise. For a real-database adapter, attach `reset` instead of `clear`:
@@ -309,4 +315,6 @@ persistenceConformanceSuite("MyCustomPersistence (real database)", () => {
 
 **FK-safe seeding convention:** before creating any stage, log, artifact, or annotation row, the suite seeds a parent `WorkflowRun` row first if one doesn't already exist for the referenced run id. Real schemas (e.g. Postgres) enforce a mandatory foreign key from those child tables to their parent run, even though an in-memory fake might not care -- your adapter needs to actually support that FK relationship (accept the parent row the suite seeds) for the suite to pass cleanly.
 
-Run it like any other test file (`vitest run my-adapter.conformance.test.ts`). A failing case points at a specific behavior your adapter diverges on -- e.g. version-bump semantics, suspended-readiness ordering, or retry defaults -- the same semantics the built-in Prisma/in-memory adapters are held to. This isn't just a convenience for third-party adapter authors: `PrismaWorkflowPersistence`/`PrismaJobQueue`/`PrismaAICallLogger` are validated with the exact same suite against a real Postgres database in this repo's own CI (each factory attaching `reset` the same way as the example above), not just against the in-memory fakes.
+**`StepLedger` patch semantics.** `stepLedgerConformanceSuite` pins the one rule every field of a `StepRecordPatch` follows: a key that is absent -- or present holding `undefined`, which is what a spread of an optional property produces -- leaves that column alone, and any other value, **`null` included**, is written. `{ result: null }` is how a step records "completed, with no value", so it has to overwrite whatever the row held; an adapter that skips the write leaves the previous attempt's result in place, and because a re-run can preserve a step row rather than delete it, every later replay reads that stale value back. The suite also covers insert-if-absent `claim` (a second claim returns the stored row, not the one passed in), `compareAndSet` with and without a pinned attempt (an omitted `expected.attempt` matches any attempt), seq-ordered `list`, and the optional `clearExcept`, which is skipped rather than failed when your implementation does not provide it.
+
+Run it like any other test file (`vitest run my-adapter.conformance.test.ts`). A failing case points at a specific behavior your adapter diverges on -- e.g. version-bump semantics, suspended-readiness ordering, or retry defaults -- the same semantics the built-in Prisma/in-memory adapters are held to. This isn't just a convenience for third-party adapter authors: `PrismaWorkflowPersistence`/`PrismaJobQueue`/`PrismaAICallLogger`/`PrismaStepLedger` are validated with the exact same suites against a real Postgres database in this repo's own CI (each factory attaching `reset` the same way as the example above), not just against the in-memory fakes.

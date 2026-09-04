@@ -387,8 +387,10 @@ export interface MaintenanceTickCounts {
   eventsFlushed: number;
   stuckReaped: number;
   /**
-   * Events the flush claimed but could not publish. They stay committed in
-   * the outbox and the next flush retries them.
+   * Events the flush claimed but could not publish and which the next
+   * flush will retry: the ones whose emit threw, plus the later events of
+   * those same runs, held back to keep per-run order. They stay committed
+   * in the outbox. Disjoint from `eventsDeadLettered`.
    */
   eventsFailed: number;
   /** Events the flush moved to the DLQ (retry budget exhausted). */

@@ -461,7 +461,7 @@ export async function shadowVersions(
     // An unpinned run has no recorded structure to compare against.
     if (row.definitionVersion === null) continue;
     if (!statuses.has(row.status)) continue;
-    const key = `${row.workflowId} ${row.definitionVersion}`;
+    const key = `${row.workflowId}\u0000${row.definitionVersion}`;
     const existing = groups.get(key);
     if (existing) {
       existing.runCount += row.count;

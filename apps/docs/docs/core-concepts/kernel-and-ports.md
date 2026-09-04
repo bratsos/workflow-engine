@@ -178,6 +178,8 @@ const result = await kernel.dispatch({ type: "outbox.flush" });
 //   published: 4,
 //   failed: 0,            // claimed but not published; retried next flush
 //   deadLettered: 0,      // retry budget exhausted; needs plugin.replayDLQ
+//                         // (disjoint from `failed` — a dead letter does
+//                         //  not retry, so it is not counted there too)
 //   eventSinkStatus: "healthy",  // or "degraded"
 //   eventSinkError: undefined    // first publish failure, when degraded
 // }

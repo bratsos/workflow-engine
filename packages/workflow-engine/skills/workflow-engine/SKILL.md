@@ -128,7 +128,7 @@ await kernel.dispatch({
 | `Trigger` / `Decision` / `Approval` / `Revision` | Constants | `@bratsos/workflow-engine/conventions` | Well-known annotation key namespaces (v0.8+) |
 | `RunReapStuckCommand` / `RunReapStuckResult` | Types | `@bratsos/workflow-engine` | `run.reapStuck` command/result shapes (export-drift fix, v0.11+) |
 | `ModelFilter` | Type | `@bratsos/workflow-engine` | Filter shape for `listModels({ filter })` (export-drift fix, v0.11+) |
-| `persistenceConformanceSuite` / `jobQueueConformanceSuite` / `aiCallLoggerConformanceSuite` | Function | `@bratsos/workflow-engine/testing` | Vitest conformance suites for validating custom adapters (v0.11+) |
+| `persistenceConformanceSuite` / `jobQueueConformanceSuite` / `aiCallLoggerConformanceSuite` / `stepLedgerConformanceSuite` | Function | `@bratsos/workflow-engine/testing` | Vitest conformance suites for validating custom adapters (v0.11+; `stepLedgerConformanceSuite` v1.0) |
 
 ## Kernel Commands
 
@@ -540,7 +540,7 @@ await kernel.dispatch({ type: "job.execute", workflowRunId: job.workflowRunId, w
 await kernel.dispatch({ type: "run.transition", workflowRunId: job.workflowRunId });
 ```
 
-Implementing a custom `WorkflowPersistence`/`JobQueue`/`AICallLogger` adapter? Validate it with the exported conformance suites (v0.11+) instead of hand-rolling parity tests — see [07-testing-patterns.md](references/07-testing-patterns.md#conformance-suites-for-custom-adapters-v011).
+Implementing a custom `WorkflowPersistence`/`JobQueue`/`AICallLogger`/`StepLedger` adapter? Validate it with the exported conformance suites (v0.11+) instead of hand-rolling parity tests — see [07-testing-patterns.md](references/07-testing-patterns.md#conformance-suites-for-custom-adapters-v011).
 
 ## Reference Files
 

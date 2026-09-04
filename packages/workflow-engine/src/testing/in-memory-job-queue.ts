@@ -323,7 +323,13 @@ export class InMemoryJobQueue implements JobQueue {
 
   async complete(jobId: string, fence?: JobAckFence): Promise<JobAckOutcome> {
     const job = this.jobs.get(jobId);
+    // A row deleted underneath the worker is superseded like any other stale
+    // ack: `JobAckOutcome` names deletion explicitly, and the Prisma adapter
+    // reports it that way because its fenced ack is an `updateMany` whose
+    // WHERE simply matches nothing. Unfenced, naming a job that does not
+    // exist stays an error.
     if (!job) {
+      if (fence) return "superseded";
       throw new Error(`Job not found: ${jobId}`);
     }
 
@@ -356,7 +362,13 @@ export class InMemoryJobQueue implements JobQueue {
     fence?: JobAckFence,
   ): Promise<JobAckOutcome> {
     const job = this.jobs.get(jobId);
+    // A row deleted underneath the worker is superseded like any other stale
+    // ack: `JobAckOutcome` names deletion explicitly, and the Prisma adapter
+    // reports it that way because its fenced ack is an `updateMany` whose
+    // WHERE simply matches nothing. Unfenced, naming a job that does not
+    // exist stays an error.
     if (!job) {
+      if (fence) return "superseded";
       throw new Error(`Job not found: ${jobId}`);
     }
 
@@ -391,7 +403,13 @@ export class InMemoryJobQueue implements JobQueue {
     fence?: JobAckFence,
   ): Promise<JobAckOutcome> {
     const job = this.jobs.get(jobId);
+    // A row deleted underneath the worker is superseded like any other stale
+    // ack: `JobAckOutcome` names deletion explicitly, and the Prisma adapter
+    // reports it that way because its fenced ack is an `updateMany` whose
+    // WHERE simply matches nothing. Unfenced, naming a job that does not
+    // exist stays an error.
     if (!job) {
+      if (fence) return "superseded";
       throw new Error(`Job not found: ${jobId}`);
     }
 

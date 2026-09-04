@@ -22,6 +22,7 @@
  * file (directly, or transitively via an import at module scope).
  */
 
+import type { StepLedger, StepRecord } from "../kernel/ports.js";
 import type {
   AICallLogger,
   CreateAICallInput,
@@ -2654,6 +2655,35 @@ export function jobQueueConformanceSuite(
         const [job] = await queue.getJobsByWorkflowRun("fence-fence-optional");
         expect(job?.status).toBe("COMPLETED");
       });
+
+      it("should report a fenced acknowledgement of a deleted job as superseded", async () => {
+        // A rerun deletes the retired stages' job rows underneath whatever
+        // worker still holds them (`deleteByRunAndStages`). `JobAckOutcome`
+        // names deletion as one of the things "superseded" covers, so the
+        // fenced write must report it, not throw: the worker's job is to
+        // surface a superseded ack, and an implementation that throws turns
+        // a benign no-op into a host-level error.
+        const jobId = await (queue as LegacyQueue).enqueue(
+          createJobInput({
+            workflowRunId: "fence-deleted",
+            stageId: "fence-deleted-stage",
+          }),
+        );
+        const claim = await queue.dequeue();
+        expect(claim?.jobId).toBe(jobId);
+
+        expect(
+          await queue.deleteByRunAndStages("fence-deleted", [
+            "fence-deleted-stage",
+          ]),
+        ).toBe(1);
+
+        const outcome = await queue.complete(jobId, {
+          startedAt: claim!.startedAt,
+          attempt: claim!.attempt,
+        });
+        expect(outcome).toBe("superseded");
+      });
     });
 
     describe("releaseStaleJobs operation", () => {
@@ -2817,6 +2847,592 @@ export function jobQueueConformanceSuite(
         expect(survivor?.lockedAt).not.toBeNull();
         expect(survivor?.id).toBe(survivorId);
         expect(victim?.id).toBe(victimId);
+      });
+    });
+  });
+}
+
+// ============================================================================
+// StepLedger Conformance Tests
+// ============================================================================
+
+/**
+ * A `StepLedger` under test, plus an optional async teardown seam.
+ *
+ * Deliberately NOT `ResettableFixture`: that interface's `clear()` takes no
+ * arguments and `StepLedger` already has a `clear(stageRecordId)` of its own,
+ * so intersecting the two would have the suite's reset call the ledger's
+ * stage-scoped delete with no stage. An adapter that needs real teardown (a
+ * Postgres `DELETE FROM workflow_steps`) attaches `reset`; an in-memory fake
+ * needs none, because the factory builds a fresh one for every test.
+ */
+export type StepLedgerFixture = StepLedger & { reset?: () => Promise<void> };
+
+export type StepLedgerFactory = () => StepLedgerFixture;
+
+/**
+ * Shared suite verifying that an implementation of `StepLedger` follows the
+ * contract documented on the interface: insert-if-absent `claim`, the patch
+ * rule that `undefined` leaves a field alone while any other value -- `null`
+ * included -- is written, `compareAndSet` with and without a pinned attempt,
+ * seq-ordered `list`, and stage-scoped `clear` / `clearExcept`.
+ *
+ * The null-result cases are here because an adapter that quietly drops a
+ * `{ result: null }` write leaves the previous attempt's value sitting in the
+ * row. That is invisible while a re-run deletes the row, and permanent once a
+ * re-run preserves one: the step completes with no value, the row still holds
+ * the old one, and every replay reads it back forever.
+ */
+export function stepLedgerConformanceSuite(
+  name: string,
+  factory: StepLedgerFactory,
+  api: ConformanceTestApi,
+) {
+  const { describe, it, expect, beforeEach } = api;
+  describe(`I want ${name} to conform to the StepLedger interface`, () => {
+    let ledger: StepLedgerFixture;
+
+    beforeEach(async () => {
+      ledger = factory();
+      await ledger.reset?.();
+    });
+
+    function claimRecord(
+      overrides: Partial<Omit<StepRecord, "createdAt" | "updatedAt">> = {},
+    ): Omit<StepRecord, "createdAt" | "updatedAt"> {
+      return {
+        stageRecordId: "stage-1",
+        stepId: "step-1",
+        seq: 1,
+        kind: "run",
+        status: "running",
+        attempt: 1,
+        leaseExpiresAt: null,
+        deadlineAt: null,
+        externalKey: null,
+        ...overrides,
+      };
+    }
+
+    describe("claim operation", () => {
+      it("should create a record and return it with every field it was given", async () => {
+        const recordData = claimRecord({
+          stageRecordId: "stage-1",
+          stepId: "step-1",
+          seq: 1,
+          kind: "run",
+          status: "running",
+          attempt: 1,
+          externalKey: "ext-key-1",
+        });
+        const result = await ledger.claim(recordData);
+        expect(result.created).toBe(true);
+        expect(result.record.stageRecordId).toBe("stage-1");
+        expect(result.record.stepId).toBe("step-1");
+        expect(result.record.seq).toBe(1);
+        expect(result.record.kind).toBe("run");
+        expect(result.record.status).toBe("running");
+        expect(result.record.attempt).toBe(1);
+        expect(result.record.externalKey).toBe("ext-key-1");
+        expect(result.record.createdAt).toBeInstanceOf(Date);
+        expect(result.record.updatedAt).toBeInstanceOf(Date);
+      });
+
+      it("should report created:false and return the stored row when the same step is claimed twice", async () => {
+        const first = await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-1",
+            status: "running",
+            attempt: 1,
+            externalKey: "ext-original",
+          }),
+        );
+        expect(first.created).toBe(true);
+
+        const second = await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-1",
+            status: "pending",
+            attempt: 9,
+            externalKey: "ext-different",
+          }),
+        );
+        expect(second.created).toBe(false);
+        expect(second.record.status).toBe("running");
+        expect(second.record.attempt).toBe(1);
+        expect(second.record.externalKey).toBe("ext-original");
+      });
+
+      it("should read back a record claimed without an external key as null", async () => {
+        const { externalKey: _omitted, ...withoutKey } = claimRecord({
+          stageRecordId: "stage-1",
+          stepId: "step-1",
+        });
+        const result = await ledger.claim(withoutKey);
+        expect(result.record.externalKey).toBeNull();
+
+        const fresh = await ledger.get("stage-1", "step-1");
+        expect(fresh?.externalKey).toBeNull();
+      });
+    });
+
+    describe("get operation", () => {
+      it("should return null for a step that was never claimed", async () => {
+        const result = await ledger.get("stage-1", "non-existent-step");
+        expect(result).toBeNull();
+      });
+    });
+
+    describe("update operation", () => {
+      it("should overwrite a previous result with null", async () => {
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-1",
+            kind: "run",
+            status: "running",
+            attempt: 1,
+          }),
+        );
+        await ledger.update("stage-1", "step-1", {
+          status: "completed",
+          result: { v: "attempt-1" },
+          error: null,
+          leaseExpiresAt: null,
+        });
+        const reopened = await ledger.compareAndSet(
+          "stage-1",
+          "step-1",
+          { status: "completed", attempt: 1 },
+          { status: "running", leaseExpiresAt: null },
+        );
+        expect(reopened.applied).toBe(true);
+
+        const updated = await ledger.update("stage-1", "step-1", {
+          status: "completed",
+          result: null,
+          error: null,
+          leaseExpiresAt: null,
+        });
+        expect(updated.result).toBeNull();
+
+        const fresh = await ledger.get("stage-1", "step-1");
+        expect(fresh?.result).toBeNull();
+      });
+
+      it("should leave a field alone when the patch omits it", async () => {
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-1",
+            status: "running",
+            result: { value: 42 },
+          }),
+        );
+        const updated = await ledger.update("stage-1", "step-1", {
+          status: "completed",
+        });
+        expect(updated.status).toBe("completed");
+        expect(updated.result).toEqual({ value: 42 });
+
+        const fresh = await ledger.get("stage-1", "step-1");
+        expect(fresh?.result).toEqual({ value: 42 });
+      });
+
+      it("should leave a field alone when the patch carries undefined", async () => {
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-1",
+            status: "running",
+            result: { value: 42 },
+          }),
+        );
+        const updated = await ledger.update("stage-1", "step-1", {
+          status: "completed",
+          result: undefined,
+        });
+        expect(updated.status).toBe("completed");
+        expect(updated.result).toEqual({ value: 42 });
+
+        const fresh = await ledger.get("stage-1", "step-1");
+        expect(fresh?.result).toEqual({ value: 42 });
+      });
+
+      it("should clear leaseExpiresAt and error when the patch names null for them", async () => {
+        const leaseDate = new Date(Date.now() + 60_000);
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-1",
+            leaseExpiresAt: leaseDate,
+            error: "something failed",
+          }),
+        );
+        const updated = await ledger.update("stage-1", "step-1", {
+          leaseExpiresAt: null,
+          error: null,
+        });
+        expect(updated.leaseExpiresAt).toBeNull();
+        expect(updated.error).toBeNull();
+
+        const fresh = await ledger.get("stage-1", "step-1");
+        expect(fresh?.leaseExpiresAt).toBeNull();
+        expect(fresh?.error).toBeNull();
+      });
+
+      it("should round-trip waitState", async () => {
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-1",
+            kind: "wait",
+            status: "pending",
+          }),
+        );
+        await ledger.update("stage-1", "step-1", {
+          waitState: { everyMs: 5000, pollFailures: 2 },
+        });
+        const fresh = await ledger.get("stage-1", "step-1");
+        expect(fresh?.waitState).toEqual({ everyMs: 5000, pollFailures: 2 });
+      });
+
+      it("should bump attempt and clear the error the way a lease re-claim does", async () => {
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-1",
+            status: "failed",
+            attempt: 1,
+            error: "lease timeout",
+          }),
+        );
+        const newLease = new Date(Date.now() + 30_000);
+        const updated = await ledger.update("stage-1", "step-1", {
+          status: "running",
+          attempt: 2,
+          error: null,
+          leaseExpiresAt: newLease,
+        });
+        expect(updated.status).toBe("running");
+        expect(updated.attempt).toBe(2);
+        expect(updated.error).toBeNull();
+        expect(updated.leaseExpiresAt).toBeInstanceOf(Date);
+        expect(updated.leaseExpiresAt?.getTime()).toBe(newLease.getTime());
+
+        const fresh = await ledger.get("stage-1", "step-1");
+        expect(fresh?.attempt).toBe(2);
+        expect(fresh?.error).toBeNull();
+        expect(fresh?.leaseExpiresAt?.getTime()).toBe(newLease.getTime());
+      });
+    });
+
+    describe("compareAndSet operation", () => {
+      it("should apply the patch when the status matches and no attempt is pinned", async () => {
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-1",
+            status: "running",
+            attempt: 1,
+          }),
+        );
+        const result = await ledger.compareAndSet(
+          "stage-1",
+          "step-1",
+          { status: "running" },
+          { status: "completed" },
+        );
+        expect(result.applied).toBe(true);
+        expect(result.record?.status).toBe("completed");
+
+        const fresh = await ledger.get("stage-1", "step-1");
+        expect(fresh?.status).toBe("completed");
+      });
+
+      it("should apply the patch when both the status and the pinned attempt match", async () => {
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-1",
+            status: "running",
+            attempt: 2,
+          }),
+        );
+        const result = await ledger.compareAndSet(
+          "stage-1",
+          "step-1",
+          { status: "running", attempt: 2 },
+          { status: "completed" },
+        );
+        expect(result.applied).toBe(true);
+        expect(result.record?.status).toBe("completed");
+
+        const fresh = await ledger.get("stage-1", "step-1");
+        expect(fresh?.status).toBe("completed");
+      });
+
+      it("should refuse and leave the row untouched when the pinned attempt differs", async () => {
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-1",
+            status: "running",
+            attempt: 1,
+          }),
+        );
+        const result = await ledger.compareAndSet(
+          "stage-1",
+          "step-1",
+          { status: "running", attempt: 2 },
+          { status: "completed" },
+        );
+        expect(result.applied).toBe(false);
+        expect(result.record?.status).toBe("running");
+        expect(result.record?.attempt).toBe(1);
+
+        const fresh = await ledger.get("stage-1", "step-1");
+        expect(fresh?.status).toBe("running");
+        expect(fresh?.attempt).toBe(1);
+      });
+
+      it("should refuse and leave the row untouched when the status differs", async () => {
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-1",
+            status: "running",
+            attempt: 1,
+          }),
+        );
+        const result = await ledger.compareAndSet(
+          "stage-1",
+          "step-1",
+          { status: "pending" },
+          { status: "completed" },
+        );
+        expect(result.applied).toBe(false);
+        expect(result.record?.status).toBe("running");
+
+        const fresh = await ledger.get("stage-1", "step-1");
+        expect(fresh?.status).toBe("running");
+      });
+
+      it("should match any attempt when none is pinned", async () => {
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-1",
+            status: "running",
+            attempt: 1,
+          }),
+        );
+        await ledger.update("stage-1", "step-1", { attempt: 3 });
+        const result = await ledger.compareAndSet(
+          "stage-1",
+          "step-1",
+          { status: "running" },
+          { status: "completed" },
+        );
+        expect(result.applied).toBe(true);
+        expect(result.record?.status).toBe("completed");
+        expect(result.record?.attempt).toBe(3);
+
+        const fresh = await ledger.get("stage-1", "step-1");
+        expect(fresh?.status).toBe("completed");
+        expect(fresh?.attempt).toBe(3);
+      });
+
+      it("should return applied:false and a null record for a step that does not exist", async () => {
+        const result = await ledger.compareAndSet(
+          "stage-1",
+          "non-existent-step",
+          { status: "running" },
+          { status: "completed" },
+        );
+        expect(result.applied).toBe(false);
+        expect(result.record).toBeNull();
+      });
+
+      it("should overwrite a previous result with null", async () => {
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-1",
+            kind: "run",
+            status: "running",
+            attempt: 1,
+            result: { v: "attempt-1" },
+          }),
+        );
+        const result = await ledger.compareAndSet(
+          "stage-1",
+          "step-1",
+          { status: "running" },
+          {
+            status: "completed",
+            result: null,
+            error: null,
+            leaseExpiresAt: null,
+          },
+        );
+        expect(result.applied).toBe(true);
+        expect(result.record?.result).toBeNull();
+
+        const fresh = await ledger.get("stage-1", "step-1");
+        expect(fresh?.result).toBeNull();
+      });
+    });
+
+    describe("list operation", () => {
+      it("should return the stage's steps ordered by seq", async () => {
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-c",
+            seq: 3,
+          }),
+        );
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-a",
+            seq: 1,
+          }),
+        );
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-b",
+            seq: 2,
+          }),
+        );
+        const steps = await ledger.list("stage-1");
+        expect(steps.map((r) => r.stepId)).toEqual([
+          "step-a",
+          "step-b",
+          "step-c",
+        ]);
+      });
+
+      it("should return only the requested stage's steps", async () => {
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-1",
+            seq: 1,
+          }),
+        );
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-2",
+            stepId: "step-2",
+            seq: 1,
+          }),
+        );
+        const list1 = await ledger.list("stage-1");
+        expect(list1.length).toBe(1);
+        expect(list1[0]?.stepId).toBe("step-1");
+        expect(list1[0]?.stageRecordId).toBe("stage-1");
+
+        const list2 = await ledger.list("stage-2");
+        expect(list2.length).toBe(1);
+        expect(list2[0]?.stepId).toBe("step-2");
+        expect(list2[0]?.stageRecordId).toBe("stage-2");
+      });
+
+      it("should return an empty array for a stage with no steps", async () => {
+        const steps = await ledger.list("stage-empty");
+        expect(steps).toEqual([]);
+      });
+    });
+
+    describe("clear and clearExcept operations", () => {
+      it("should delete every row of the stage and leave other stages alone", async () => {
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-1",
+          }),
+        );
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-2",
+          }),
+        );
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-2",
+            stepId: "step-3",
+          }),
+        );
+
+        await ledger.clear("stage-1");
+
+        const stage1Steps = await ledger.list("stage-1");
+        expect(stage1Steps).toEqual([]);
+
+        const stage2Steps = await ledger.list("stage-2");
+        expect(stage2Steps.length).toBe(1);
+        expect(stage2Steps[0]?.stepId).toBe("step-3");
+      });
+
+      it("should keep only the named steps and leave other stages alone", async () => {
+        if (!ledger.clearExcept) return;
+
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-keep",
+          }),
+        );
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-delete",
+          }),
+        );
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-2",
+            stepId: "step-other",
+          }),
+        );
+
+        await ledger.clearExcept("stage-1", ["step-keep"]);
+
+        const stage1Steps = await ledger.list("stage-1");
+        expect(stage1Steps.length).toBe(1);
+        expect(stage1Steps[0]?.stepId).toBe("step-keep");
+
+        const stage2Steps = await ledger.list("stage-2");
+        expect(stage2Steps.length).toBe(1);
+        expect(stage2Steps[0]?.stepId).toBe("step-other");
+      });
+
+      it("should clear everything when clearExcept is given an empty keep list", async () => {
+        if (!ledger.clearExcept) return;
+
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-1",
+          }),
+        );
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-2",
+          }),
+        );
+
+        await ledger.clearExcept("stage-1", []);
+
+        const stage1Steps = await ledger.list("stage-1");
+        expect(stage1Steps).toEqual([]);
       });
     });
   });

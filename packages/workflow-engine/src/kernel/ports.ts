@@ -111,7 +111,17 @@ export interface StepRecord {
   updatedAt: Date;
 }
 
-/** Fields a ledger write may change after a record has been claimed. */
+/**
+ * Fields a ledger write may change after a record has been claimed.
+ *
+ * One rule for every field: a key that is absent -- or present holding
+ * `undefined`, which is what a spread of an optional property produces --
+ * leaves that column alone; any other value, **`null` included**, is
+ * written. So `{ result: null }` records "this step completed with no
+ * value" and must overwrite whatever the row held, while `{}` and
+ * `{ result: undefined }` both mean "don't touch the result". Every
+ * implementation is held to this by `stepLedgerConformanceSuite`.
+ */
 export type StepRecordPatch = Partial<
   Pick<
     StepRecord,
