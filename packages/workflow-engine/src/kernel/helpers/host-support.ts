@@ -64,6 +64,12 @@ export interface HostJobMessage {
   attempt: number;
   maxAttempts?: number;
   payload: Record<string, unknown>;
+  /**
+   * The attempt stamp from `DequeueResult`, forwarded as the acknowledgement
+   * fence; a transport that cannot carry it (e.g. a JSON push bridge) simply
+   * omits it and gets today's unfenced behaviour.
+   */
+  startedAt?: Date;
 }
 
 export interface ExecuteJobWithHeartbeatOptions {
@@ -126,6 +132,7 @@ const JobMessageSchema = z.object({
   attempt: z.number().int().nonnegative(),
   maxAttempts: z.number().int().positive().optional(),
   payload: z.record(z.string(), z.unknown()),
+  startedAt: z.date().optional(),
 });
 
 /** The backoff the built-in transports apply before redelivering a retry. */
@@ -171,6 +178,10 @@ export async function executeJobWithHeartbeat(
     return { outcome: "failed", error: message, dead: true };
   }
 
+  const fence = job.startedAt
+    ? { startedAt: job.startedAt, attempt: job.attempt }
+    : undefined;
+
   const config =
     (job.payload as { config?: Record<string, unknown> }).config || {};
 
@@ -207,6 +218,7 @@ export async function executeJobWithHeartbeat(
       `${logPrefix} dead job ${job.jobId} (run ${job.workflowRunId}, stage ${job.stageId}): ${message}`,
     );
     try {
+      // Deliberately unfenced: an orphan queue row should acknowledge unconditionally.
       await jobTransport.fail(job.jobId, message, false);
     } catch (failError) {
       console.error(`${logPrefix} could not fail dead job:`, failError);
@@ -217,7 +229,13 @@ export async function executeJobWithHeartbeat(
   }
 
   if (result.outcome === "completed") {
-    await jobTransport.complete(job.jobId);
+    const outcome = await jobTransport.complete(job.jobId, fence);
+    if (outcome === "superseded") {
+      console.warn(
+        `${logPrefix} job ${job.jobId} acknowledgement superseded: the lease was rescued and re-claimed while this attempt ran; its result was discarded`,
+      );
+      return { outcome: "completed" };
+    }
     await kernel.dispatch({
       type: "run.transition",
       workflowRunId: job.workflowRunId,
@@ -229,7 +247,12 @@ export async function executeJobWithHeartbeat(
     const nextPollAt =
       result.nextPollAt ??
       new Date(Date.now() + HOST_DEFAULTS.suspendFallbackMs);
-    await jobTransport.suspend(job.jobId, nextPollAt);
+    const outcome = await jobTransport.suspend(job.jobId, nextPollAt, fence);
+    if (outcome === "superseded") {
+      console.warn(
+        `${logPrefix} job ${job.jobId} acknowledgement superseded: the lease was rescued and re-claimed while this attempt ran; its result was discarded`,
+      );
+    }
     return { outcome: "suspended" };
   }
 
@@ -255,7 +278,17 @@ export async function executeJobWithHeartbeat(
     ? raceGhost && job.attempt < maxAttempts
     : (result.willRetry ??
       (result.retryable !== false && job.attempt < maxAttempts));
-  await jobTransport.fail(job.jobId, result.error ?? "Unknown error", canRetry);
+  const outcome = await jobTransport.fail(
+    job.jobId,
+    result.error ?? "Unknown error",
+    canRetry,
+    fence,
+  );
+  if (outcome === "superseded") {
+    console.warn(
+      `${logPrefix} job ${job.jobId} acknowledgement superseded: the lease was rescued and re-claimed while this attempt ran; its result was discarded`,
+    );
+  }
   // Terminal failure: without this, the run lingers RUNNING until
   // run.reapStuck kills it minutes later with a generic "STUCK_RUN_REAPED"
   // error, losing the real stage error. Dispatch run.transition so the run

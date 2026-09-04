@@ -28,6 +28,8 @@ import type {
   CreateAnnotationInput,
   DequeueResult,
   EnqueueJobInput,
+  JobAckFence,
+  JobAckOutcome,
   JobRecord,
   PersistenceCore,
 } from "../persistence/interface";
@@ -48,6 +50,8 @@ export type {
   DequeueResult,
   EnqueueJobInput,
   IdempotencyRecord,
+  JobAckFence,
+  JobAckOutcome,
   JobRecord,
   OutboxRecord,
   Status,
@@ -241,11 +245,31 @@ export interface JobTransport {
   /** Atomically dequeue the next available job. */
   dequeue(): Promise<DequeueResult | null>;
 
-  /** Mark job as completed. */
-  complete(jobId: string): Promise<void>;
+  /**
+   * Mark job as completed.
+   *
+   * Passing a `fence` conditions the write on the job still being the RUNNING
+   * attempt with that `startedAt`; omitting it keeps the previous unconditional
+   * behaviour and always returns `"acknowledged"`. Note that the fenced form is
+   * the recommended one and that the unfenced form exists for transports that
+   * cannot carry the stamp.
+   */
+  complete(jobId: string, fence?: JobAckFence): Promise<JobAckOutcome>;
 
-  /** Mark job as suspended (for async-batch). */
-  suspend(jobId: string, nextPollAt: Date): Promise<void>;
+  /**
+   * Mark job as suspended (for async-batch).
+   *
+   * Passing a `fence` conditions the write on the job still being the RUNNING
+   * attempt with that `startedAt`; omitting it keeps the previous unconditional
+   * behaviour and always returns `"acknowledged"`. Note that the fenced form is
+   * the recommended one and that the unfenced form exists for transports that
+   * cannot carry the stamp.
+   */
+  suspend(
+    jobId: string,
+    nextPollAt: Date,
+    fence?: JobAckFence,
+  ): Promise<JobAckOutcome>;
 
   /**
    * Mark job as failed. With `shouldRetry: true` the transport MUST put the
@@ -254,8 +278,19 @@ export interface JobTransport {
    * promise, and a transport that only acknowledges the message leaves the
    * run RUNNING until `run.reapStuck` heals it. With `false` the job is
    * terminal and the host dispatches `run.transition` right away.
+   *
+   * Passing a `fence` conditions the write on the job still being the RUNNING
+   * attempt with that `startedAt`; omitting it keeps the previous unconditional
+   * behaviour and always returns `"acknowledged"`. Note that the fenced form is
+   * the recommended one and that the unfenced form exists for transports that
+   * cannot carry the stamp.
    */
-  fail(jobId: string, error: string, shouldRetry?: boolean): Promise<void>;
+  fail(
+    jobId: string,
+    error: string,
+    shouldRetry?: boolean,
+    fence?: JobAckFence,
+  ): Promise<JobAckOutcome>;
 
   /** Release stale locks (for crashed workers). */
   releaseStaleJobs(staleThresholdMs?: number): Promise<number>;

@@ -18,6 +18,8 @@ import { randomUUID } from "crypto";
 import type {
   DequeueResult,
   EnqueueJobInput,
+  JobAckFence,
+  JobAckOutcome,
   JobQueue,
   JobRecord,
   Status,
@@ -215,13 +217,26 @@ export class InMemoryJobQueue implements JobQueue {
       attempt: newAttempt,
       maxAttempts: job.maxAttempts,
       payload: job.payload,
+      startedAt: now,
     };
   }
 
-  async complete(jobId: string): Promise<void> {
+  async complete(jobId: string, fence?: JobAckFence): Promise<JobAckOutcome> {
     const job = this.jobs.get(jobId);
     if (!job) {
       throw new Error(`Job not found: ${jobId}`);
+    }
+
+    // A fenced acknowledgement only lands if the job is still RUNNING and
+    // still on the attempt that handed out fence.startedAt; otherwise it has
+    // been rescued/re-claimed or cancelled and this attempt's write is a no-op.
+    if (
+      fence &&
+      (job.status !== "RUNNING" ||
+        job.attempt !== fence.attempt ||
+        job.startedAt?.getTime() !== fence.startedAt.getTime())
+    ) {
+      return "superseded";
     }
 
     const now = this.now();
@@ -232,12 +247,29 @@ export class InMemoryJobQueue implements JobQueue {
       updatedAt: now,
     };
     this.jobs.set(jobId, updated);
+    return "acknowledged";
   }
 
-  async suspend(jobId: string, nextPollAt: Date): Promise<void> {
+  async suspend(
+    jobId: string,
+    nextPollAt: Date,
+    fence?: JobAckFence,
+  ): Promise<JobAckOutcome> {
     const job = this.jobs.get(jobId);
     if (!job) {
       throw new Error(`Job not found: ${jobId}`);
+    }
+
+    // A fenced acknowledgement only lands if the job is still RUNNING and
+    // still on the attempt that handed out fence.startedAt; otherwise it has
+    // been rescued/re-claimed or cancelled and this attempt's write is a no-op.
+    if (
+      fence &&
+      (job.status !== "RUNNING" ||
+        job.attempt !== fence.attempt ||
+        job.startedAt?.getTime() !== fence.startedAt.getTime())
+    ) {
+      return "superseded";
     }
 
     const updated: JobRecord = {
@@ -249,16 +281,30 @@ export class InMemoryJobQueue implements JobQueue {
       updatedAt: this.now(),
     };
     this.jobs.set(jobId, updated);
+    return "acknowledged";
   }
 
   async fail(
     jobId: string,
     error: string,
     shouldRetry: boolean = false,
-  ): Promise<void> {
+    fence?: JobAckFence,
+  ): Promise<JobAckOutcome> {
     const job = this.jobs.get(jobId);
     if (!job) {
       throw new Error(`Job not found: ${jobId}`);
+    }
+
+    // A fenced acknowledgement only lands if the job is still RUNNING and
+    // still on the attempt that handed out fence.startedAt; otherwise it has
+    // been rescued/re-claimed or cancelled and this attempt's write is a no-op.
+    if (
+      fence &&
+      (job.status !== "RUNNING" ||
+        job.attempt !== fence.attempt ||
+        job.startedAt?.getTime() !== fence.startedAt.getTime())
+    ) {
+      return "superseded";
     }
 
     const now = this.now();
@@ -285,6 +331,7 @@ export class InMemoryJobQueue implements JobQueue {
       };
       this.jobs.set(jobId, updated);
     }
+    return "acknowledged";
   }
 
   async releaseStaleJobs(staleThresholdMs: number = 300000): Promise<number> {

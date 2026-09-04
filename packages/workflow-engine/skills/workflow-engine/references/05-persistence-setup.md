@@ -188,9 +188,9 @@ interface JobQueue {
   enqueueParallel(jobs: EnqueueJobInput[]): Promise<string[]>;
   deleteByRunAndStages(workflowRunId: string, stageIds: string[]): Promise<number>;
   dequeue(): Promise<DequeueResult | null>;
-  complete(jobId: string): Promise<void>;
-  suspend(jobId: string, nextPollAt: Date): Promise<void>;
-  fail(jobId: string, error: string, shouldRetry?: boolean): Promise<void>;
+  complete(jobId: string, fence?: JobAckFence): Promise<JobAckOutcome>;
+  suspend(jobId: string, nextPollAt: Date, fence?: JobAckFence): Promise<JobAckOutcome>;
+  fail(jobId: string, error: string, shouldRetry?: boolean, fence?: JobAckFence): Promise<JobAckOutcome>;
   releaseStaleJobs(staleThresholdMs?: number): Promise<number>;
   cancelByRun(workflowRunId: string): Promise<number>;
   getJobsByWorkflowRun(workflowRunId: string): Promise<JobRecord[]>;
@@ -218,6 +218,32 @@ interface JobQueue {
 
 Both are covered by `jobQueueConformanceSuite`, so a custom `JobQueue` gets the
 same checks the built-in adapters do.
+
+### Fenced acknowledgements
+
+`dequeue()` hands back `startedAt` next to `attempt`. The pair is that claim's
+*attempt stamp*, and passing it back as a `JobAckFence` (`{ startedAt, attempt }`)
+on `complete`, `fail` or `suspend` conditions the write on the job still being
+the `RUNNING` attempt it describes:
+
+```sql
+UPDATE job_queue SET ... WHERE id = $1 AND status = 'RUNNING'
+                           AND "startedAt" = $2 AND attempt = $3
+```
+
+Without it, a worker that stalls past `staleLeaseThresholdMs` has its job
+rescued by `releaseStaleJobs` and re-claimed by someone else -- and then, on
+waking, marks the *new* attempt COMPLETED and discards the work that attempt is
+actually doing. With it, the stale write matches nothing, changes nothing and
+comes back as `"superseded"`, which the built-in hosts log (and, on the
+completed path, use to skip the `run.transition` the newer attempt owns). An
+unfenced call keeps the older unconditional behaviour and always returns
+`"acknowledged"`, so a transport that cannot carry the stamp still works.
+
+`touchJob` is deliberately unfenced: a stale heartbeat only refreshes whichever
+attempt currently owns the row, which costs the newer attempt nothing.
+
+`jobQueueConformanceSuite` covers both the fenced and unfenced paths.
 
 ## AICallLogger Interface
 

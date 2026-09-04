@@ -437,7 +437,46 @@ export interface DequeueResult {
   attempt: number;
   maxAttempts: number;
   payload: Record<string, unknown>;
+  /**
+   * The attempt stamp this claim wrote to `startedAt`. Hand it back as a
+   * `JobAckFence` on `complete`/`fail`/`suspend` so the acknowledgement
+   * only lands if this attempt is still the current one.
+   */
+  startedAt: Date;
 }
+
+/**
+ * Fencing token for a job acknowledgement.
+ *
+ * A worker that stalls past the lease threshold has its job released by
+ * `releaseStaleJobs` and re-claimed by someone else. Without a fence the
+ * stalled worker's eventual `complete()` marks the *new* attempt COMPLETED
+ * and the work it is actually doing is thrown away. Conditioning the write
+ * on the attempt stamp the claim handed out (Oban's `attempted_at`
+ * predicate, one extra WHERE clause and no extra column) turns that write
+ * into a no-op instead.
+ */
+export interface JobAckFence {
+  /** `DequeueResult.startedAt` from the claim being acknowledged. */
+  startedAt: Date;
+  /**
+   * `DequeueResult.attempt` from the same claim. The stamp alone is the
+   * Oban predicate, but our timestamps are `timestamp(3)` — two claims
+   * landing in the same millisecond would share a stamp. `attempt`
+   * strictly increases on every claim, so the pair identifies exactly one
+   * attempt at any resolution. It costs one more term in the same WHERE
+   * clause and still no extra column.
+   */
+  attempt: number;
+}
+
+/**
+ * Result of a fenced acknowledgement. `"superseded"` means nothing was
+ * written: the job is no longer the RUNNING attempt this fence describes
+ * (released and re-claimed, cancelled, or deleted). Callers must surface
+ * it rather than treating it as success.
+ */
+export type JobAckOutcome = "acknowledged" | "superseded";
 
 // ============================================================================
 // PersistenceCore / ArtifactPersistence / WorkflowPersistence Interfaces
@@ -714,21 +753,48 @@ export interface JobQueue {
   dequeue(): Promise<DequeueResult | null>;
 
   /**
-   * Mark job as completed
+   * Mark job as completed.
+   *
+   * Passing a `fence` conditions the write on the job still being the RUNNING
+   * attempt with that `startedAt`; omitting it keeps the previous unconditional
+   * behaviour and always returns `"acknowledged"`. Note that the fenced form is
+   * the recommended one and that the unfenced form exists for transports that
+   * cannot carry the stamp.
    */
-  complete(jobId: string): Promise<void>;
+  complete(jobId: string, fence?: JobAckFence): Promise<JobAckOutcome>;
 
   /**
-   * Mark job as suspended (for async-batch)
+   * Mark job as suspended (for async-batch).
+   *
+   * Passing a `fence` conditions the write on the job still being the RUNNING
+   * attempt with that `startedAt`; omitting it keeps the previous unconditional
+   * behaviour and always returns `"acknowledged"`. Note that the fenced form is
+   * the recommended one and that the unfenced form exists for transports that
+   * cannot carry the stamp.
    */
-  suspend(jobId: string, nextPollAt: Date): Promise<void>;
+  suspend(
+    jobId: string,
+    nextPollAt: Date,
+    fence?: JobAckFence,
+  ): Promise<JobAckOutcome>;
 
   /**
    * Mark job as failed. `shouldRetry` defaults to `false` -- callers must
    * opt in to a retry rather than risk an unbounded retry loop for
    * adapters/hosts that omit the argument.
+   *
+   * Passing a `fence` conditions the write on the job still being the RUNNING
+   * attempt with that `startedAt`; omitting it keeps the previous unconditional
+   * behaviour and always returns `"acknowledged"`. Note that the fenced form is
+   * the recommended one and that the unfenced form exists for transports that
+   * cannot carry the stamp.
    */
-  fail(jobId: string, error: string, shouldRetry?: boolean): Promise<void>;
+  fail(
+    jobId: string,
+    error: string,
+    shouldRetry?: boolean,
+    fence?: JobAckFence,
+  ): Promise<JobAckOutcome>;
 
   /**
    * Release stale locks (for crashed workers)

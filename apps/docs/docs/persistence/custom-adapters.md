@@ -54,21 +54,54 @@ class MyCustomPersistence implements WorkflowPersistence {
 Responsible for scheduling, claiming (dequeuing), heartbeating, and cancelling active background jobs.
 
 ```typescript
-import type { JobQueue, EnqueueJobInput, DequeueResult, JobRecord } from "@bratsos/workflow-engine";
+import type {
+  JobQueue,
+  EnqueueJobInput,
+  DequeueResult,
+  JobRecord,
+  JobAckFence,
+  JobAckOutcome,
+} from "@bratsos/workflow-engine";
 
 class MyCustomJobQueue implements JobQueue {
   async enqueue(options: EnqueueJobInput): Promise<string> { ... }
   async enqueueParallel(jobs: EnqueueJobInput[]): Promise<string[]> { ... }
   async dequeue(): Promise<DequeueResult | null> { ... }
-  async complete(jobId: string): Promise<void> { ... }
-  async suspend(jobId: string, nextPollAt: Date): Promise<void> { ... }
-  async fail(jobId: string, error: string, shouldRetry?: boolean): Promise<void> { ... }
+  async complete(jobId: string, fence?: JobAckFence): Promise<JobAckOutcome> { ... }
+  async suspend(jobId: string, nextPollAt: Date, fence?: JobAckFence): Promise<JobAckOutcome> { ... }
+  async fail(jobId: string, error: string, shouldRetry?: boolean, fence?: JobAckFence): Promise<JobAckOutcome> { ... }
   async releaseStaleJobs(staleThresholdMs?: number): Promise<number> { ... }
   async cancelByRun(workflowRunId: string): Promise<number> { ... }
   async getJobsByWorkflowRun(workflowRunId: string): Promise<JobRecord[]> { ... }
   async touchJob(jobId: string): Promise<void> { ... } // Heartbeat lock
 }
 ```
+
+#### Fenced acknowledgements
+
+`dequeue()` returns a `startedAt` alongside `attempt`: together they are the
+*attempt stamp* of that claim. A worker that stalls long enough for
+`releaseStaleJobs` to rescue its job — and for a second worker to claim it —
+must not be able to mark the newer attempt COMPLETED or FAILED when it
+finally wakes up. `complete`, `fail` and `suspend` therefore accept an
+optional `JobAckFence` (`{ startedAt, attempt }`, taken straight from the
+`DequeueResult`) and must condition the write on the job still being the
+`RUNNING` attempt that fence describes:
+
+```sql
+UPDATE jobs SET ... WHERE id = $1 AND status = 'RUNNING'
+                      AND "startedAt" = $2 AND attempt = $3
+```
+
+When nothing matches, write nothing and return `"superseded"`; a superseded
+acknowledgement is a real outcome the host logs, not an error to swallow and
+not a success to report. Called without a fence the methods keep their older
+unconditional behaviour and always return `"acknowledged"`, so a transport
+that cannot carry the stamp (a JSON push bridge, say) still works.
+
+`touchJob` is deliberately *not* fenced: a stale heartbeat only refreshes the
+lease of whichever attempt currently owns the row, which costs the newer
+attempt nothing.
 
 ### 3. `AICallLogger`
 Responsible for tracking LLM prompt/response pairs, token usage, and cost stats.

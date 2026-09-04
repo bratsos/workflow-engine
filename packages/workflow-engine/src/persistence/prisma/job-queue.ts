@@ -11,6 +11,8 @@ import { createLogger } from "../../utils/logger";
 import type {
   DequeueResult,
   EnqueueJobInput,
+  JobAckFence,
+  JobAckOutcome,
   JobQueue,
   JobRecord,
 } from "../interface";
@@ -301,6 +303,11 @@ export class PrismaJobQueue implements JobQueue {
         attempt: job.attempt,
         maxAttempts: job.maxAttempts,
         payload: rest,
+        // Return the JS Date we bound rather than reading the column back,
+        // because the column is a naive timestamp written through
+        // AT TIME ZONE 'UTC' and the bound value is exactly what the Prisma
+        // model API will compare against later.
+        startedAt: now,
       };
     } catch (error) {
       logger.error("Error dequeuing job:", error);
@@ -385,6 +392,7 @@ export class PrismaJobQueue implements JobQueue {
         attempt: claimedJob.attempt,
         maxAttempts: claimedJob.maxAttempts,
         payload: claimedRest,
+        startedAt: now,
       };
     } catch (error) {
       logger.error("Error dequeuing job:", error);
@@ -393,9 +401,46 @@ export class PrismaJobQueue implements JobQueue {
   }
 
   /**
+   * The fenced-acknowledgement predicate: this job, still RUNNING, still
+   * on the attempt whose claim handed out `fence.startedAt` and
+   * `fence.attempt`. `status` matters as much as the stamp —
+   * `releaseStaleJobs` puts a rescued job back to PENDING without clearing
+   * `startedAt`, so the stamp alone would still let a zombie worker
+   * complete a job that is waiting to be re-claimed.
+   */
+  private fenceWhere(jobId: string, fence: JobAckFence) {
+    return {
+      id: jobId,
+      status: this.enums.status("RUNNING"),
+      startedAt: fence.startedAt,
+      attempt: fence.attempt,
+    };
+  }
+
+  private ackOutcome(jobId: string, count: number, op: string): JobAckOutcome {
+    if (count === 0) {
+      logger.warn(
+        `Job ${jobId}: ${op} acknowledgement superseded — the job is no longer the RUNNING attempt this worker claimed`,
+      );
+      return "superseded";
+    }
+    return "acknowledged";
+  }
+
+  /**
    * Mark job as completed
    */
-  async complete(jobId: string): Promise<void> {
+  async complete(jobId: string, fence?: JobAckFence): Promise<JobAckOutcome> {
+    if (fence) {
+      const result = await this.prisma.jobQueue.updateMany({
+        where: this.fenceWhere(jobId, fence),
+        data: {
+          status: this.enums.status("COMPLETED"),
+          completedAt: new Date(),
+        },
+      });
+      return this.ackOutcome(jobId, result.count, "complete");
+    }
     await this.prisma.jobQueue.update({
       where: { id: jobId },
       data: {
@@ -404,12 +449,29 @@ export class PrismaJobQueue implements JobQueue {
       },
     });
     logger.debug(`Job ${jobId} completed`);
+    return "acknowledged";
   }
 
   /**
    * Mark job as suspended (for async-batch)
    */
-  async suspend(jobId: string, nextPollAt: Date): Promise<void> {
+  async suspend(
+    jobId: string,
+    nextPollAt: Date,
+    fence?: JobAckFence,
+  ): Promise<JobAckOutcome> {
+    if (fence) {
+      const result = await this.prisma.jobQueue.updateMany({
+        where: this.fenceWhere(jobId, fence),
+        data: {
+          status: this.enums.status("SUSPENDED"),
+          nextPollAt,
+          workerId: null,
+          lockedAt: null,
+        },
+      });
+      return this.ackOutcome(jobId, result.count, "suspend");
+    }
     await this.prisma.jobQueue.update({
       where: { id: jobId },
       data: {
@@ -420,6 +482,7 @@ export class PrismaJobQueue implements JobQueue {
       },
     });
     logger.debug(`Job ${jobId} suspended until ${nextPollAt.toISOString()}`);
+    return "acknowledged";
   }
 
   /**
@@ -429,7 +492,8 @@ export class PrismaJobQueue implements JobQueue {
     jobId: string,
     error: string,
     shouldRetry: boolean = false,
-  ): Promise<void> {
+    fence?: JobAckFence,
+  ): Promise<JobAckOutcome> {
     const job = await this.prisma.jobQueue.findUnique({
       where: { id: jobId },
       select: { attempt: true, maxAttempts: true },
@@ -439,6 +503,20 @@ export class PrismaJobQueue implements JobQueue {
       // Re-queue for retry with exponential backoff
       const backoffMs = 2 ** job.attempt * 1000; // 2s, 4s, 8s...
       const nextPollAt = new Date(Date.now() + backoffMs);
+
+      if (fence) {
+        const result = await this.prisma.jobQueue.updateMany({
+          where: this.fenceWhere(jobId, fence),
+          data: {
+            status: this.enums.status("PENDING"),
+            lastError: error,
+            workerId: null,
+            lockedAt: null,
+            nextPollAt: nextPollAt,
+          },
+        });
+        return this.ackOutcome(jobId, result.count, "fail");
+      }
 
       await this.prisma.jobQueue.update({
         where: { id: jobId },
@@ -451,7 +529,20 @@ export class PrismaJobQueue implements JobQueue {
         },
       });
       logger.debug(`Job ${jobId} failed, will retry in ${backoffMs}ms`);
+      return "acknowledged";
     } else {
+      if (fence) {
+        const result = await this.prisma.jobQueue.updateMany({
+          where: this.fenceWhere(jobId, fence),
+          data: {
+            status: this.enums.status("FAILED"),
+            completedAt: new Date(),
+            lastError: error,
+          },
+        });
+        return this.ackOutcome(jobId, result.count, "fail");
+      }
+
       await this.prisma.jobQueue.update({
         where: { id: jobId },
         data: {
@@ -461,6 +552,7 @@ export class PrismaJobQueue implements JobQueue {
         },
       });
       logger.debug(`Job ${jobId} failed permanently: ${error}`);
+      return "acknowledged";
     }
   }
 
