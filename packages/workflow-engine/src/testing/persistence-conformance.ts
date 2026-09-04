@@ -412,6 +412,127 @@ export function persistenceConformanceSuite(
       });
     });
 
+    describe("definition versioning", () => {
+      it("reports whether the schema behind the adapter carries it", () => {
+        // A database that has not been migrated answers false and the
+        // engine falls back to unpinned runs rather than failing to start.
+        expect(typeof persistence.supportsDefinitionVersioning()).toBe(
+          "boolean",
+        );
+      });
+
+      it("stores a definition snapshot once and returns the stored row on re-registration", async () => {
+        if (!persistence.supportsDefinitionVersioning()) return;
+        const input = {
+          workflowId: "defver-wf",
+          version: "sha256-defver0000000000000000000000000",
+          snapshot: { format: 1, workflowId: "defver-wf", stages: [] },
+          structureHash: "sha256-defver0000000000000000000000000",
+        };
+
+        const first = await persistence.insertDefinitionIfAbsent(input);
+        expect(first?.version).toBe(input.version);
+        expect(first?.structureHash).toBe(input.structureHash);
+
+        // Content-addressed: a second registration of the same version
+        // returns what is stored rather than overwriting it, so a caller
+        // can detect an explicit version reused for a different structure.
+        const second = await persistence.insertDefinitionIfAbsent({
+          ...input,
+          snapshot: { format: 1, workflowId: "defver-wf", stages: ["drift"] },
+          structureHash: "sha256-different000000000000000000000",
+        });
+        expect(second?.structureHash).toBe(input.structureHash);
+
+        const loaded = await persistence.getDefinition(
+          input.workflowId,
+          input.version,
+        );
+        expect(loaded?.structureHash).toBe(input.structureHash);
+      });
+
+      it("returns null for a definition that was never registered", async () => {
+        if (!persistence.supportsDefinitionVersioning()) return;
+        expect(await persistence.getDefinition("defver-wf", "nope")).toBeNull();
+      });
+
+      it("counts runs grouped by workflow, version and status", async () => {
+        if (!persistence.supportsDefinitionVersioning()) return;
+        const workflowId = `defver-count-${Date.now()}`;
+        await persistence.createRun(
+          createRunData({
+            id: `${workflowId}-a`,
+            workflowId,
+            definitionVersion: "v-count-1",
+          }),
+        );
+        await persistence.createRun(
+          createRunData({
+            id: `${workflowId}-b`,
+            workflowId,
+            definitionVersion: "v-count-1",
+          }),
+        );
+
+        const counts = await persistence.countRunsByDefinitionVersion({
+          workflowId,
+        });
+        const pending = counts.find(
+          (row) =>
+            row.definitionVersion === "v-count-1" && row.status === "PENDING",
+        );
+        expect(pending?.count).toBe(2);
+        expect(pending?.oldestCreatedAt).toBeInstanceOf(Date);
+      });
+
+      it("claims only runs pinned to a version the caller serves", async () => {
+        if (!persistence.supportsDefinitionVersioning()) return;
+        const workflowId = `defver-claim-${Date.now()}`;
+        const pinned = await persistence.createRun(
+          createRunData({
+            id: `${workflowId}-pinned`,
+            workflowId,
+            definitionVersion: "v-served",
+          }),
+        );
+
+        // A host that does not serve this version leaves it alone.
+        const missed = await persistence.claimNextPendingRun({
+          serves: [{ workflowId, version: "v-other" }],
+        });
+        expect(missed?.id).not.toBe(pinned.id);
+        if (missed) {
+          await persistence.updateRun(missed.id, { status: "COMPLETED" });
+        }
+
+        const claimed = await persistence.claimNextPendingRun({
+          serves: [{ workflowId, version: "v-served" }],
+        });
+        expect(claimed?.id).toBe(pinned.id);
+        expect(claimed?.definitionVersion).toBe("v-served");
+      });
+
+      it("claims a run created before versioning regardless of what the caller serves", async () => {
+        if (!persistence.supportsDefinitionVersioning()) return;
+        const workflowId = `defver-legacy-${Date.now()}`;
+        const legacy = await persistence.createRun(
+          createRunData({ id: `${workflowId}-legacy`, workflowId }),
+        );
+        expect(legacy.definitionVersion).toBeNull();
+
+        let claimed = await persistence.claimNextPendingRun({
+          serves: [{ workflowId, version: "irrelevant" }],
+        });
+        while (claimed && claimed.id !== legacy.id) {
+          await persistence.updateRun(claimed.id, { status: "COMPLETED" });
+          claimed = await persistence.claimNextPendingRun({
+            serves: [{ workflowId, version: "irrelevant" }],
+          });
+        }
+        expect(claimed?.id).toBe(legacy.id);
+      });
+    });
+
     describe("workflow stage CRUD operations", () => {
       it("should create a stage with all required fields", async () => {
         // Given: Valid stage data

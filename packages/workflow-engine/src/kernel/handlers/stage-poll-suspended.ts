@@ -35,6 +35,7 @@ import type {
   StagePollSuspendedCommand,
   StagePollSuspendedResult,
 } from "../commands";
+import { servesRun } from "../helpers/definition-pinning.js";
 import {
   buildAnnotationEvents,
   buildStageExecutionContext,
@@ -576,6 +577,13 @@ export async function handleStagePollSuspended(
       failed++;
       continue;
     }
+
+    // 3b.1 Definition pinning: a suspended stage belonging to a run this
+    //      build does not serve is left for a build that does, rather
+    //      than polled against a different pipeline shape. It is skipped,
+    //      not failed — the run is intact and another process (or
+    //      `run.redrive`) can carry it forward.
+    if (!servesRun(run, workflow)) continue;
 
     // 3c. Get stage definition
     const stageDef = workflow.getStage(stageRecord.stageId);

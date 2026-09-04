@@ -165,10 +165,9 @@ describe("kernel: run.claimPending", () => {
     expect(result.claimed).toHaveLength(2);
   });
 
-  it("handles missing workflow definition", async () => {
+  it("leaves a run whose workflow this host no longer has for a host that does", async () => {
     const workflow = createSimpleWorkflow();
-    const { kernel, flush, persistence, eventSink, registry } =
-      createTestKernel([workflow]);
+    const { kernel, persistence, registry } = createTestKernel([workflow]);
 
     // Create run then remove workflow from registry
     await kernel.dispatch({
@@ -184,10 +183,43 @@ describe("kernel: run.claimPending", () => {
       workerId: "worker-1",
     });
 
-    // It should claim the run but fail it
+    // An enumerating registry filters the claim on the definitions this
+    // host serves, so the run is not adopted at all -- and not destroyed
+    // either. It stays PENDING for a host that has the workflow.
+    expect(result.claimed).toHaveLength(0);
+    expect(await persistence.getRunsByStatus("FAILED")).toHaveLength(0);
+    expect(await persistence.getRunsByStatus("PENDING")).toHaveLength(1);
+
+    // ...and it is reported rather than silently stuck.
+    const versions = await kernel.dispatch({ type: "run.listVersions" });
+    expect(versions.unservedHere).toHaveLength(1);
+    expect(versions.unservedHere[0]?.workflowId).toBe("test-workflow");
+    expect(versions.unservedHere[0]?.active).toBe(1);
+  });
+
+  it("fails a claimed run whose workflow is missing when the registry cannot enumerate", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, flush, persistence, eventSink, registry } =
+      createTestKernel([workflow]);
+
+    await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "key-1",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+    registry.delete("test-workflow");
+
+    // `serves: "all"` is the pre-versioning claim predicate: adopt any
+    // pending run regardless of the definition version it is pinned to.
+    const result = await kernel.dispatch({
+      type: "run.claimPending",
+      workerId: "worker-1",
+      serves: "all",
+    });
+
     expect(result.claimed).toHaveLength(0);
 
-    // The run should be marked as FAILED
     const runs = await persistence.getRunsByStatus("FAILED");
     expect(runs).toHaveLength(1);
     expect(runs[0]?.output).toEqual({

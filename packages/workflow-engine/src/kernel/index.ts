@@ -8,6 +8,7 @@
 // Command types
 export type {
   CommandResult,
+  DefinitionVersionSummary,
   EventSinkStatus,
   JobExecuteCommand,
   JobExecuteResult,
@@ -26,8 +27,13 @@ export type {
   RunCreateAnnotation,
   RunCreateCommand,
   RunCreateResult,
+  RunListVersionsCommand,
+  RunListVersionsResult,
   RunReapStuckCommand,
   RunReapStuckResult,
+  RunRedriveCommand,
+  RunRedriveFrom,
+  RunRedriveResult,
   RunRerunFromCommand,
   RunRerunFromResult,
   RunTransitionCommand,
@@ -40,6 +46,8 @@ export type {
 // Kernel errors
 export {
   AIServicesNotConfiguredError,
+  DefinitionVersionConflictError,
+  DefinitionVersionMismatchError,
   IdempotencyInProgressError,
   SpilledPayloadUnavailableError,
 } from "./errors.js";
@@ -68,6 +76,15 @@ export {
   createRoutingExecutor,
   type RoutingExecutorOptions,
 } from "./executor/routing-executor.js";
+// Definition pinning helpers, for hosts that resolve definitions themselves.
+export { SUPERSEDED_ATTEMPT_KEY } from "./handlers/run-redrive.js";
+export {
+  assertServesRun,
+  recordDefinitionVersion,
+  resolvePinnedWorkflow,
+  servedDefinitions,
+  servesRun,
+} from "./helpers/definition-pinning.js";
 // Kernel helpers
 export {
   type CreateEventSinkMonitorOptions,
@@ -100,6 +117,7 @@ export {
 export {
   type AnnotateAttachInput,
   createKernel,
+  createWorkflowRegistry,
   type Kernel,
   type KernelAnnotations,
   type KernelConfig,
@@ -135,6 +153,7 @@ export type {
   OutboxRecord,
   Persistence,
   Scheduler,
+  ServedDefinition,
   StepLedger,
   StepRecord,
   WorkflowAnnotationRecord,

@@ -234,8 +234,23 @@ export {
 // Kernel API (Phase 1)
 // =============================================================================
 
+// Definition versioning: the structural contract a run is pinned to.
+export {
+  buildDefinitionSnapshot,
+  computeDefinitionVersion,
+  DEFINITION_SNAPSHOT_FORMAT,
+  DERIVED_VERSION_PREFIX,
+  type DefinitionDrift,
+  type DefinitionDriftCode,
+  type DefinitionSnapshot,
+  type DefinitionStageSnapshot,
+  diffDefinitionSnapshots,
+  hashDefinitionSnapshot,
+  isDerivedVersion,
+} from "./core/definition-version";
 export type {
   CommandResult,
+  DefinitionVersionSummary,
   JobExecuteCommand,
   JobExecuteResult,
   KernelCommand,
@@ -251,8 +266,13 @@ export type {
   RunClaimPendingResult,
   RunCreateCommand,
   RunCreateResult,
+  RunListVersionsCommand,
+  RunListVersionsResult,
   RunReapStuckCommand,
   RunReapStuckResult,
+  RunRedriveCommand,
+  RunRedriveFrom,
+  RunRedriveResult,
   RunRerunFromCommand,
   RunRerunFromResult,
   RunTransitionCommand,
@@ -264,6 +284,8 @@ export type {
 } from "./kernel/commands";
 export {
   AIServicesNotConfiguredError,
+  DefinitionVersionConflictError,
+  DefinitionVersionMismatchError,
   IdempotencyInProgressError,
   SpilledPayloadUnavailableError,
 } from "./kernel/errors";
@@ -274,6 +296,7 @@ export type {
 } from "./kernel/events";
 export {
   createKernel,
+  createWorkflowRegistry,
   type Kernel,
   type KernelConfig,
   type WorkflowRegistry,
@@ -309,9 +332,14 @@ export {
   withStepResultSpill,
 } from "./kernel/spill";
 export type {
+  CreateDefinitionInput,
   CreateOutboxEventInput,
+  DefinitionVersionCount,
+  DefinitionVersionCountFilter,
   IdempotencyRecord,
   OutboxRecord,
+  ServedDefinition,
+  WorkflowDefinitionRecord,
 } from "./persistence/interface";
 export {
   LEASE_ABSOLUTE_CAP,

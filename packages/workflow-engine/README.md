@@ -127,6 +127,11 @@ model WorkflowRun {
   priority      Int            @default(5)
   metadata      Json?
 
+  // Definition versioning. NULL means the run predates it and stays
+  // claimable by any host. See docs: Core Concepts > Definition Versioning.
+  definitionVersion String?
+  redriveCount      Int     @default(0)
+
   stages        WorkflowStage[]
   logs          WorkflowLog[]
   artifacts     WorkflowArtifact[]
@@ -134,7 +139,23 @@ model WorkflowRun {
 
   @@index([status])
   @@index([workflowId])
+  @@index([definitionVersion])
+  @@index([status, workflowId, definitionVersion])
   @@map("workflow_runs")
+}
+
+// Content-addressed definition snapshots. One row per distinct
+// (workflowId, version); every run pinned to that version references it.
+model WorkflowDefinition {
+  workflowId    String
+  version       String
+  createdAt     DateTime @default(now())
+  snapshot      Json
+  structureHash String
+
+  @@id([workflowId, version])
+  @@index([workflowId])
+  @@map("workflow_definitions")
 }
 
 model WorkflowStage {

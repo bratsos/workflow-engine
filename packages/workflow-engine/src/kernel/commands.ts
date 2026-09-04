@@ -8,7 +8,10 @@
  * This file contains ONLY types -- no runtime code.
  */
 
-import type { AnnotationActor } from "../persistence/interface";
+import type {
+  AnnotationActor,
+  ServedDefinition,
+} from "../persistence/interface";
 
 // ---------------------------------------------------------------------------
 // run.create
@@ -48,6 +51,11 @@ export interface RunCreateCommand {
 export interface RunCreateResult {
   readonly workflowRunId: string;
   readonly status: "PENDING";
+  /**
+   * The definition version the run is pinned to, or `null` on a database
+   * whose schema predates definition versioning.
+   */
+  readonly definitionVersion: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -59,6 +67,21 @@ export interface RunClaimPendingCommand {
   readonly type: "run.claimPending";
   readonly workerId: string;
   readonly maxClaims?: number;
+  /**
+   * Which definition versions this claim may adopt.
+   *
+   * Left unset, the kernel derives it from the registry's optional
+   * `listWorkflows()` — so a registry built with `createWorkflowRegistry`
+   * claims only runs this build can correctly execute, and a registry
+   * without enumeration claims anything, as before versioning existed.
+   *
+   * Pass `"all"` to claim regardless of version (the pre-1.0 behaviour),
+   * or an explicit list to claim on behalf of another build.
+   *
+   * Runs created before the consumer migrated carry no version and are
+   * always claimable.
+   */
+  readonly serves?: readonly ServedDefinition[] | "all";
 }
 
 /** Result of a `run.claimPending` command. */
@@ -106,7 +129,16 @@ export interface RunCancelResult {
 // run.rerunFrom
 // ---------------------------------------------------------------------------
 
-/** Reruns a workflow from a specific stage, deleting stages at/after that point. */
+/**
+ * Reruns a workflow from a specific stage, replacing the stage records at
+ * and after that point.
+ *
+ * @deprecated Use `run.redrive`, which covers this (`from: { kind: "stage" }`)
+ * plus retry-from-the-last-failure and restart-from-the-beginning, and can
+ * move the run onto a different definition version. `run.rerunFrom` is
+ * kept working and now shares `run.redrive`'s behaviour, including
+ * preserving the superseded attempt.
+ */
 export interface RunRerunFromCommand {
   readonly type: "run.rerunFrom";
   readonly workflowRunId: string;
@@ -161,8 +193,13 @@ export interface JobExecuteResult {
    *    committed when this job was dequeued. The job is valid and simply
    *    arrived early: it must be re-delivered, not discarded, or the run
    *    wedges RUNNING with no job until `run.reapStuck` sweeps it up.
+   *  - `"version"` — the run is pinned to a definition version this build
+   *    does not serve. The job is valid but belongs to another build: it
+   *    must be re-delivered so a process running that definition executes
+   *    it. `run.listVersions` reports these runs; `run.redrive` with
+   *    `definitionVersion: "latest"` moves them onto the current build.
    */
-  readonly ghostReason?: "orphan" | "race";
+  readonly ghostReason?: "orphan" | "race" | "version";
   /**
    * False marks a deterministic failure (e.g. Zod input/config validation)
    * that will not succeed on retry — hosts should fail the job terminally.
@@ -326,6 +363,122 @@ export interface RunReapStuckResult {
 }
 
 // ---------------------------------------------------------------------------
+// run.redrive
+// ---------------------------------------------------------------------------
+
+/** Where a `run.redrive` resumes from. */
+export type RunRedriveFrom =
+  /**
+   * Conductor's `retry`: resume at the earliest stage that is not
+   * COMPLETED — in practice the stage that failed — leaving completed
+   * stages untouched.
+   */
+  | { readonly kind: "lastFailure" }
+  /** Conductor's `restart`: re-run the whole pipeline from the first group. */
+  | { readonly kind: "start" }
+  /** Conductor's `rerun`: resume at a chosen stage. */
+  | { readonly kind: "stage"; readonly stageId: string };
+
+/**
+ * Re-drives a terminal run. Unlike the `run.rerunFrom` it replaces, the
+ * superseded attempt is preserved: every stage record it removes is first
+ * archived as a stage-scoped annotation carrying its status, error,
+ * timings and output, so the failed attempt survives the retry.
+ *
+ * Step Functions' model: the same run id, an incremented `redriveCount`,
+ * no branching into a new execution.
+ */
+export interface RunRedriveCommand {
+  readonly type: "run.redrive";
+  readonly workflowRunId: string;
+  /** Defaults to `{ kind: "lastFailure" }`. */
+  readonly from?: RunRedriveFrom;
+  /**
+   * Move the run onto a different definition version — DBOS's fork-onto-a-
+   * new-application-version, which is the answer to "we shipped a bug,
+   * patch it and re-run".
+   *
+   * - omitted: keep the run's pinned version (the default).
+   * - `"latest"`: re-pin to the version this process currently serves.
+   * - an explicit version string: re-pin to that version, which must
+   *   already be registered for this workflow.
+   */
+  readonly definitionVersion?: string | "latest";
+  /** Optional idempotency key — a replayed call returns the cached result. */
+  readonly idempotencyKey?: string;
+}
+
+/** Result of a `run.redrive` command. */
+export interface RunRedriveResult {
+  readonly workflowRunId: string;
+  /** The stage the run resumed from. */
+  readonly fromStageId: string;
+  /** Stage ids whose records were superseded and archived. */
+  readonly supersededStages: string[];
+  /** The run's `redriveCount` after this command. */
+  readonly redriveCount: number;
+  /** The definition version the run is pinned to after this command. */
+  readonly definitionVersion: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// run.listVersions
+// ---------------------------------------------------------------------------
+
+/**
+ * Answers "has this definition version drained?" — the query DBOS's
+ * workflow listing gives operators, so an old build can be retired
+ * knowingly rather than hopefully.
+ */
+export interface RunListVersionsCommand {
+  readonly type: "run.listVersions";
+  /** Restrict to one workflow. */
+  readonly workflowId?: string;
+  /** Restrict to one definition version. */
+  readonly definitionVersion?: string;
+}
+
+/** Per-version run accounting. */
+export interface DefinitionVersionSummary {
+  readonly workflowId: string;
+  /** `null` for runs created before the consumer migrated. */
+  readonly definitionVersion: string | null;
+  /** Run count per status. */
+  readonly counts: Readonly<Record<string, number>>;
+  /** Runs at this version in any status. */
+  readonly total: number;
+  /** PENDING + RUNNING + SUSPENDED — the runs still needing a host. */
+  readonly active: number;
+  /** True when nothing at this version still needs a host. */
+  readonly drained: boolean;
+  /**
+   * Whether this process's registry currently serves this version.
+   * `false` with `active > 0` is the state to act on: those runs have no
+   * host here, and either a peer on the old build must finish them or
+   * `run.redrive` must move them forward.
+   */
+  readonly servedHere: boolean;
+  /** Creation time of the oldest run at this version, in any status. */
+  readonly oldestCreatedAt: Date | null;
+}
+
+/** Result of a `run.listVersions` command. */
+export interface RunListVersionsResult {
+  /**
+   * False on a database whose schema predates definition versioning; the
+   * `versions` array is then empty rather than misleading.
+   */
+  readonly supported: boolean;
+  /** Newest-first by `oldestCreatedAt`, unpinned runs last. */
+  readonly versions: readonly DefinitionVersionSummary[];
+  /**
+   * Versions with active runs that this process does not serve — the
+   * runs that would otherwise sit pending with nobody to execute them.
+   */
+  readonly unservedHere: readonly DefinitionVersionSummary[];
+}
+
+// ---------------------------------------------------------------------------
 // Union & conditional result mapping
 // ---------------------------------------------------------------------------
 
@@ -336,6 +489,8 @@ export type KernelCommand =
   | RunTransitionCommand
   | RunCancelCommand
   | RunRerunFromCommand
+  | RunRedriveCommand
+  | RunListVersionsCommand
   | JobExecuteCommand
   | StagePollSuspendedCommand
   | StepSignalCommand
@@ -358,18 +513,22 @@ export type CommandResult<T extends KernelCommand> = T extends RunCreateCommand
         ? RunCancelResult
         : T extends RunRerunFromCommand
           ? RunRerunFromResult
-          : T extends JobExecuteCommand
-            ? JobExecuteResult
-            : T extends StagePollSuspendedCommand
-              ? StagePollSuspendedResult
-              : T extends StepSignalCommand
-                ? StepSignalResult
-                : T extends LeaseReapStaleCommand
-                  ? LeaseReapStaleResult
-                  : T extends OutboxFlushCommand
-                    ? OutboxFlushResult
-                    : T extends PluginReplayDLQCommand
-                      ? PluginReplayDLQResult
-                      : T extends RunReapStuckCommand
-                        ? RunReapStuckResult
-                        : never;
+          : T extends RunRedriveCommand
+            ? RunRedriveResult
+            : T extends RunListVersionsCommand
+              ? RunListVersionsResult
+              : T extends JobExecuteCommand
+                ? JobExecuteResult
+                : T extends StagePollSuspendedCommand
+                  ? StagePollSuspendedResult
+                  : T extends StepSignalCommand
+                    ? StepSignalResult
+                    : T extends LeaseReapStaleCommand
+                      ? LeaseReapStaleResult
+                      : T extends OutboxFlushCommand
+                        ? OutboxFlushResult
+                        : T extends PluginReplayDLQCommand
+                          ? PluginReplayDLQResult
+                          : T extends RunReapStuckCommand
+                            ? RunReapStuckResult
+                            : never;

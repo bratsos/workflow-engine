@@ -85,6 +85,15 @@ export interface WorkflowRunRecord {
   totalTokens: number;
   priority: number;
   metadata: unknown | null;
+  /**
+   * The definition version this run is pinned to, or `null` for a run
+   * created before the consumer migrated to definition versioning (or on a
+   * database whose schema predates it). A `null` version is claimable and
+   * executable by any host, exactly as before versioning existed.
+   */
+  definitionVersion: string | null;
+  /** How many times `run.redrive` has re-driven this run. */
+  redriveCount: number;
 }
 
 export interface WorkflowStageRecord {
@@ -276,6 +285,11 @@ export interface CreateRunInput {
   priority?: number;
   /** Optional metadata stored as JSON on the run record. NOT spread into Prisma fields. */
   metadata?: Record<string, unknown>;
+  /**
+   * The definition version to pin this run to. Adapters whose schema
+   * predates definition versioning ignore it and store `null`.
+   */
+  definitionVersion?: string | null;
 }
 
 export interface UpdateRunInput {
@@ -287,6 +301,57 @@ export interface UpdateRunInput {
   totalCost?: number;
   totalTokens?: number;
   expectedVersion?: number;
+  /** Re-pin the run to a different definition version (`run.redrive`). */
+  definitionVersion?: string | null;
+  /** Absolute redrive count to store. `run.redrive` sets `current + 1`. */
+  redriveCount?: number;
+}
+
+/** A stored workflow definition snapshot, keyed by (workflowId, version). */
+export interface WorkflowDefinitionRecord {
+  workflowId: string;
+  version: string;
+  createdAt: Date;
+  /** The `DefinitionSnapshot` as written by `run.create`. */
+  snapshot: unknown;
+  /** Hash of `snapshot`; equals `version` for derived versions. */
+  structureHash: string;
+}
+
+/** Input for {@link PersistenceCore.insertDefinitionIfAbsent}. */
+export interface CreateDefinitionInput {
+  workflowId: string;
+  version: string;
+  snapshot: unknown;
+  structureHash: string;
+}
+
+/** One (workflowId, definitionVersion, status) bucket with its run count. */
+export interface DefinitionVersionCount {
+  workflowId: string;
+  /** `null` for runs created before definition versioning. */
+  definitionVersion: string | null;
+  status: Status;
+  count: number;
+  /** Creation time of the oldest run in this bucket, for staleness reporting. */
+  oldestCreatedAt: Date | null;
+}
+
+/** Filter for {@link PersistenceCore.countRunsByDefinitionVersion}. */
+export interface DefinitionVersionCountFilter {
+  workflowId?: string;
+  definitionVersion?: string;
+  status?: readonly Status[];
+}
+
+/**
+ * One workflow definition a host is built to serve, as reported to
+ * `claimNextPendingRun`. Compared as a pair so two workflows that declare
+ * the same explicit version can never be confused for one another.
+ */
+export interface ServedDefinition {
+  workflowId: string;
+  version: string;
 }
 
 export interface CreateStageInput {
@@ -600,7 +665,50 @@ export interface PersistenceCore {
   claimNextPendingRun(options?: {
     /** The kernel clock's time, written as `startedAt`/`updatedAt`. */
     now?: Date;
+    /**
+     * The definitions the claiming host is built to serve. When supplied,
+     * only runs pinned to one of these (workflowId, version) pairs — plus
+     * runs with a `null` version, which predate versioning — are claimed.
+     * Omit it to claim any pending run, which is the pre-1.0 behaviour.
+     */
+    serves?: readonly ServedDefinition[];
   }): Promise<WorkflowRunRecord | null>;
+
+  // Definition versioning
+
+  /**
+   * Whether this adapter's schema carries the definition-versioning
+   * columns and table. `false` on a database that has not been migrated:
+   * the engine then behaves exactly as it did before versioning existed
+   * rather than failing to start.
+   */
+  supportsDefinitionVersioning(): boolean;
+
+  /**
+   * Stores a definition snapshot if `(workflowId, version)` is not already
+   * present, and returns the stored row either way — so a caller can tell
+   * whether an explicit version is being re-registered with a different
+   * structure. Returns `null` when
+   * {@link PersistenceCore.supportsDefinitionVersioning} is `false`.
+   */
+  insertDefinitionIfAbsent(
+    input: CreateDefinitionInput,
+  ): Promise<WorkflowDefinitionRecord | null>;
+
+  /** Loads one stored definition snapshot, or `null` when absent. */
+  getDefinition(
+    workflowId: string,
+    version: string,
+  ): Promise<WorkflowDefinitionRecord | null>;
+
+  /**
+   * Run counts grouped by (workflowId, definitionVersion, status) — the
+   * query behind "has this version drained?". Returns an empty array when
+   * {@link PersistenceCore.supportsDefinitionVersioning} is `false`.
+   */
+  countRunsByDefinitionVersion(
+    filter?: DefinitionVersionCountFilter,
+  ): Promise<DefinitionVersionCount[]>;
 
   // WorkflowStage operations
   createStage(data: CreateStageInput): Promise<WorkflowStageRecord>;

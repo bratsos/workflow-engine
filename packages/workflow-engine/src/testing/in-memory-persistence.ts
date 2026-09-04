@@ -18,13 +18,17 @@ import { randomUUID } from "crypto";
 import {
   type AnnotationFilters,
   type CreateAnnotationInput,
+  type CreateDefinitionInput,
   type CreateLogInput,
   type CreateOutboxEventInput,
   type CreateRunInput,
   type CreateStageInput,
+  type DefinitionVersionCount,
+  type DefinitionVersionCountFilter,
   type IdempotencyRecord,
   type OutboxRecord,
   type SaveArtifactInput,
+  type ServedDefinition,
   StaleVersionError,
   type Status,
   type UpdateRunInput,
@@ -32,6 +36,7 @@ import {
   type UpsertStageInput,
   type WorkflowAnnotationRecord,
   type WorkflowArtifactRecord,
+  type WorkflowDefinitionRecord,
   type WorkflowLogRecord,
   type WorkflowPersistence,
   type WorkflowRunRecord,
@@ -76,6 +81,7 @@ function mergeDefined<T extends object>(base: T, rest: Partial<T>): T {
 
 export class InMemoryWorkflowPersistence implements WorkflowPersistence {
   private runs = new Map<string, WorkflowRunRecord>();
+  private definitions = new Map<string, WorkflowDefinitionRecord>();
   private stages = new Map<string, WorkflowStageRecord>();
   private logs = new Map<string, WorkflowLogRecord>();
   private artifacts = new Map<string, WorkflowArtifactRecord>();
@@ -147,6 +153,8 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
       totalTokens: 0,
       priority: data.priority ?? 5,
       metadata: data.metadata ?? null,
+      definitionVersion: data.definitionVersion ?? null,
+      redriveCount: 0,
     };
     this.runs.set(record.id, record);
     return { ...record };
@@ -235,16 +243,30 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
   }
 
   async claimNextPendingRun(
-    options?: { now?: Date },
+    options?: { now?: Date; serves?: readonly ServedDefinition[] },
     attempt = 0,
   ): Promise<WorkflowRunRecord | null> {
     if (attempt >= MAX_CLAIM_ATTEMPTS) {
       return null;
     }
 
+    const serves = options?.serves;
+    // A run with a null version predates versioning and stays claimable
+    // by every host; a pinned run is only claimed by a host that reports
+    // serving that (workflowId, version) pair.
+    const canServe = (run: WorkflowRunRecord): boolean => {
+      if (serves === undefined) return true;
+      if (run.definitionVersion === null) return true;
+      return serves.some(
+        (s) =>
+          s.workflowId === run.workflowId &&
+          s.version === run.definitionVersion,
+      );
+    };
+
     // Find all pending runs
     const pendingRuns = Array.from(this.runs.values())
-      .filter((run) => run.status === "PENDING")
+      .filter((run) => run.status === "PENDING" && canServe(run))
       // Sort by priority (highest first), then by createdAt (oldest first - FIFO)
       .sort((a, b) => {
         if (a.priority !== b.priority) {
@@ -860,6 +882,81 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
   }
 
   // ============================================================================
+  // WorkflowDefinition Operations
+  // ============================================================================
+
+  supportsDefinitionVersioning(): boolean {
+    return true;
+  }
+
+  async insertDefinitionIfAbsent(
+    input: CreateDefinitionInput,
+  ): Promise<WorkflowDefinitionRecord | null> {
+    const key = `${input.workflowId}\u0000${input.version}`;
+    const existing = this.definitions.get(key);
+    if (existing) return { ...existing };
+    const record: WorkflowDefinitionRecord = {
+      workflowId: input.workflowId,
+      version: input.version,
+      createdAt: this.now(),
+      snapshot: input.snapshot,
+      structureHash: input.structureHash,
+    };
+    this.definitions.set(key, record);
+    return { ...record };
+  }
+
+  async getDefinition(
+    workflowId: string,
+    version: string,
+  ): Promise<WorkflowDefinitionRecord | null> {
+    const record = this.definitions.get(`${workflowId}\u0000${version}`);
+    return record ? { ...record } : null;
+  }
+
+  async countRunsByDefinitionVersion(
+    filter?: DefinitionVersionCountFilter,
+  ): Promise<DefinitionVersionCount[]> {
+    const buckets = new Map<string, DefinitionVersionCount>();
+    for (const run of this.runs.values()) {
+      if (filter?.workflowId && run.workflowId !== filter.workflowId) continue;
+      if (
+        filter?.definitionVersion !== undefined &&
+        run.definitionVersion !== filter.definitionVersion
+      ) {
+        continue;
+      }
+      if (
+        filter?.status &&
+        filter.status.length > 0 &&
+        !filter.status.includes(run.status)
+      ) {
+        continue;
+      }
+      const key = `${run.workflowId}\u0000${run.definitionVersion ?? ""}\u0000${run.status}`;
+      const bucket = buckets.get(key);
+      if (bucket) {
+        bucket.count += 1;
+        if (
+          bucket.oldestCreatedAt === null ||
+          run.createdAt < bucket.oldestCreatedAt
+        ) {
+          bucket.oldestCreatedAt = run.createdAt;
+        }
+      } else {
+        buckets.set(key, {
+          workflowId: run.workflowId,
+          definitionVersion: run.definitionVersion,
+          status: run.status,
+          count: 1,
+          oldestCreatedAt: run.createdAt,
+        });
+      }
+    }
+    return Array.from(buckets.values());
+  }
+
+  // ============================================================================
   // Test Helpers
   // ============================================================================
 
@@ -868,6 +965,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
    */
   clear(): void {
     this.runs.clear();
+    this.definitions.clear();
     this.stages.clear();
     this.logs.clear();
     this.artifacts.clear();

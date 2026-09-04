@@ -8,6 +8,7 @@
 import { StaleVersionError } from "../../persistence/interface.js";
 import type { RunTransitionCommand, RunTransitionResult } from "../commands";
 import type { KernelEvent } from "../events";
+import { servesRun } from "../helpers/definition-pinning.js";
 import {
   loadWorkflowContext,
   prepareExecutionGroup,
@@ -102,6 +103,14 @@ async function attemptRunTransition(
   // 3. Get workflow definition from registry
   const workflow = deps.registry.getWorkflow(run.workflowId);
   if (!workflow) {
+    return { action: "noop" as const, _events: [] };
+  }
+
+  // 3a. Definition pinning: never advance a run against a definition it
+  //     was not created under. A build that does not present the run's
+  //     pinned version leaves the run exactly where it is, for a process
+  //     that does. `run.listVersions` reports runs stranded this way.
+  if (!servesRun(run, workflow)) {
     return { action: "noop" as const, _events: [] };
   }
 
