@@ -89,6 +89,14 @@ await kernel.dispatch({ type: "run.transition", workflowRunId: runId });
 
 **Check your own schema:** the engine's timestamp columns must stay plain Prisma `DateTime` (naive `timestamp`), as the shipped `prisma/schema.prisma` declares them. Mapping them to `@db.Timestamptz` re-introduces the skew in the opposite direction.
 
+## Crash Resumption Waits Minutes On A Durable Step
+
+**Symptom:** a worker is SIGKILLed mid-stage; a fresh worker picks the run up quickly (its job lease is released after `staleLeaseThresholdMs`) but the resumed stage suspends again instead of finishing, and only completes minutes later. Only stages that use `ctx.step.*`.
+
+**Why:** the step the killed process was executing is still `running` in the ledger with a live lease, and a replay that meets a live lease raises `StepInFlight` and suspends rather than running the body a second time. A ledger row records no worker identity — the lease *is* the step's only liveness signal — so nothing can tell "the owner is dead" from "the owner is slow", and releasing it early would risk executing the step body twice, which is the one thing the ledger exists to prevent. This is deliberate, not a missing reaper: `lease.reapStale` releases *job* leases only.
+
+**The dial:** `StepRunOptions.leaseMs`, default **five minutes**. Set it per step to the longest you expect that body to take plus headroom — `ctx.step.run("submit", fn, { leaseMs: 30_000 })` recovers in about 30 s. Keep it generous for a step that legitimately runs for minutes; a lease shorter than the body means a replay re-runs work that was still in flight. See 12-durable-steps.md, "Leases, retries and deadlines".
+
 ## One Bad Run Blocks Everything
 
 **Symptom (old):** A single run with corrupt state would cause `run.claimPending` to throw, which blocked the entire orchestration tick — including outbox flush, stale lease reaping, and suspended stage polling.

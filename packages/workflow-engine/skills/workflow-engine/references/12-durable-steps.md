@@ -74,7 +74,8 @@ interface StepApi {
 }
 
 interface StepRunOptions {
-  leaseMs?: number;       // lease held while fn runs; default 5 minutes
+  leaseMs?: number;       // lease held while fn runs; default 5 minutes -- also
+                          // how long a crashed worker's step blocks a replay
   retries?: number;       // retries after the first failed attempt; default 0
   retryDelayMs?: number | string; // delay before a retry ("30s"); default 0
 }
@@ -121,6 +122,7 @@ Suspension is a thrown control-flow error (`StepSuspend`, or `StepInFlight` when
 ### Leases, retries and deadlines
 
 - A `run` step holds a lease while `fn` runs. If the worker dies, the next replay re-claims the step once the lease expires, increments `attempt`, and runs `fn` again. A live lease suspends the replay as `StepInFlight` instead of running `fn` twice.
+- **The lease is what a crash costs you in latency, and `leaseMs` is the dial.** `StepRunOptions.leaseMs` defaults to **five minutes**. A ledger row records no worker identity -- the lease *is* the only liveness signal a step has -- so a step left `running` by a SIGKILLed process is indistinguishable from one a healthy worker is still executing, and nothing (not `lease.reapStale`, which releases *job* leases only) may release it early without risking a second execution of `fn`, which is the one thing the ledger exists to prevent. So a resumed stage that meets a dead worker's step re-suspends until that lease expires: with the default, recovery of an interrupted step is up to five minutes behind the crash. Set `leaseMs` per step to the longest you expect `fn` to take plus headroom -- `ctx.step.run("submit", fn, { leaseMs: 30_000 })` recovers in about 30 s instead of 5 min, and 5 min stays the right default for a step that legitimately runs for minutes. The trade is only latency-to-recovery against the risk of re-running a step whose worker is merely slow; the work the ledger saves is unaffected either way.
 - `retries` makes a thrown `fn` retryable: the failure is recorded, the stage suspends for `retryDelayMs`, and the next replay re-runs `fn`. When retries are exhausted the stored error is thrown and the stage fails.
 - A stage that is still waiting on the same step re-suspends silently on every poll: `stage:suspended` / `workflow:suspended` are emitted when the wait starts and again only when the stage moves on to a different step, not once per poll. The step id is the identity of the wait — a `waitFor`, a `run` retry and the in-flight polls against a dead worker's live lease on the same step all count as one wait.
 - `waitFor`'s `ready` may be a type guard (`(v): v is Done => ...`); the awaited value then narrows to the guarded type. The boolean form is unchanged.
