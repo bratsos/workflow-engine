@@ -254,6 +254,56 @@ describe("kernel: run.reapStuck", () => {
     expect(jobs[0]!.workflowRunId).toBe(workflowRunId);
     expect(jobs[0]!.status).toBe("PENDING");
   });
+
+  it("enqueues the recovery job after the transaction commits, not inside it", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, persistence, jobTransport, clock } = createTestKernel(
+      [workflow],
+      { clockStart: new Date() },
+    );
+
+    await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "key-recovery-postcommit",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+    await kernel.dispatch({ type: "run.claimPending", workerId: "w1" });
+    jobTransport.clear();
+
+    // Observe whether the enqueue lands while the kernel transaction is
+    // still open. An enqueue inside the transaction publishes work that
+    // references state another worker cannot see yet (and that a
+    // rollback would erase) — the shape that wedged runs before alpha.8.
+    let inTransaction = false;
+    const enqueuedInTransaction: boolean[] = [];
+    const originalWithTransaction =
+      persistence.withTransaction.bind(persistence);
+    persistence.withTransaction = async (fn: any) => {
+      inTransaction = true;
+      try {
+        return await originalWithTransaction(fn);
+      } finally {
+        inTransaction = false;
+      }
+    };
+    const originalEnqueueParallel =
+      jobTransport.enqueueParallel.bind(jobTransport);
+    jobTransport.enqueueParallel = async (jobs: any) => {
+      enqueuedInTransaction.push(inTransaction);
+      return originalEnqueueParallel(jobs);
+    };
+
+    clock.advance(10 * 60 * 1000);
+
+    await kernel.dispatch({
+      type: "run.reapStuck",
+      stuckThresholdMs: 5 * 60 * 1000,
+    });
+
+    expect(enqueuedInTransaction).toEqual([false]);
+    expect(jobTransport.getAllJobs()).toHaveLength(1);
+  });
 });
 
 describe("kernel: run.reapStuck dropped-transition heal", () => {

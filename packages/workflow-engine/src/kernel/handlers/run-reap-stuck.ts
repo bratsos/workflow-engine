@@ -50,15 +50,30 @@ export async function handleRunReapStuck(
           ),
       );
       if (missingJobStages.length > 0) {
-        await deps.jobTransport.enqueueParallel(
-          missingJobStages.map((stage) => ({
-            workflowRunId: run.id,
-            workflowId: run.workflowId,
-            stageId: stage.stageId,
-            priority: run.priority,
-            payload: { config: run.config || {} },
-          })),
-        );
+        // INVARIANT: no handler enqueues a job from inside the kernel
+        // transaction. The handler body runs under
+        // `persistence.withTransaction`; a job enqueued there is visible
+        // to other workers the instant the queue's own connection
+        // commits, which is *before* this transaction commits — so a
+        // worker can dequeue the job and read stage rows that do not
+        // exist yet, and a rollback leaves a job pointing at state that
+        // was never written. That is the shape that wedged 62 runs in
+        // 100 before alpha.8. Every enqueue goes on `_postCommit`, which
+        // the kernel runs only after the transaction has committed
+        // (kernel.ts, "Runs only now that the transaction has
+        // committed"). Do not move this back inline just because the
+        // enqueue is idempotent and the run is already committed
+        // RUNNING.
+        const jobsToEnqueue = missingJobStages.map((stage) => ({
+          workflowRunId: run.id,
+          workflowId: run.workflowId,
+          stageId: stage.stageId,
+          priority: run.priority,
+          payload: { config: run.config || {} },
+        }));
+        postCommits.push(async (postDeps: KernelDeps) => {
+          await postDeps.jobTransport.enqueueParallel(jobsToEnqueue);
+        });
         continue;
       }
     }
