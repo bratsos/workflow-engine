@@ -268,8 +268,8 @@ export async function executeJobWithHeartbeat(
     return { outcome: "suspended" };
   }
 
-  // failed — a ghost job (the kernel did not execute it because the run
-  // isn't RUNNING) splits in two, on `ghostReason`:
+  // failed — a ghost job (the kernel did not execute it because it could
+  // not run the stage) splits three ways, on `ghostReason`:
   //  - "orphan": the run is CANCELLED/COMPLETED/FAILED. Retrying would
   //    fail identically forever, so the job is failed terminally.
   //  - "race": the run is still PENDING — this job was dequeued before
@@ -278,6 +278,16 @@ export async function executeJobWithHeartbeat(
   //    run.reapStuck sweeps it minutes later. Re-deliver it instead (the
   //    built-in transports re-queue it with their usual backoff), while
   //    the attempt budget lasts.
+  //  - "version": the run is pinned to a definition version this build
+  //    does not serve. The job is valid and belongs to another build, so
+  //    it is re-delivered on the same terms as "race" — a pinned run is
+  //    never failed for want of a host that can serve it. The attempt
+  //    budget still bounds the redelivery loop, and that is deliberate:
+  //    when it runs out the *job* row goes terminal but the stage is
+  //    still PENDING (a ghost executed nothing), so run.reapStuck's
+  //    PENDING-stage-without-job sweep re-enqueues it with a fresh
+  //    budget. A deploy that outlasts the budget therefore costs polling
+  //    latency, not the run.
   // A deterministic (non-retryable) stage error — e.g. Zod input
   // validation — will fail identically on every attempt, so it is
   // treated the same as an exhausted retry budget.
@@ -285,9 +295,11 @@ export async function executeJobWithHeartbeat(
   // already left the stage PENDING for that case; the transport contract
   // is that `fail(jobId, error, true)` re-enqueues the job with backoff.
   const maxAttempts = job.maxAttempts ?? HOST_DEFAULTS.maxAttempts;
-  const raceGhost = result.ghost === true && result.ghostReason === "race";
+  const redeliverableGhost =
+    result.ghost === true &&
+    (result.ghostReason === "race" || result.ghostReason === "version");
   const canRetry = result.ghost
-    ? raceGhost && job.attempt < maxAttempts
+    ? redeliverableGhost && job.attempt < maxAttempts
     : (result.willRetry ??
       (result.retryable !== false && job.attempt < maxAttempts));
   const outcome = await jobTransport.fail(

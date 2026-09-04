@@ -1,5 +1,5 @@
 /**
- * The two ghost-job outcomes, at the host seam.
+ * The ghost-job outcomes, at the host seam.
  *
  * `job.execute` returns `ghost: true` whenever the run it was handed is
  * not RUNNING, but the two reasons need opposite handling and used to be
@@ -12,12 +12,15 @@
  *    re-enqueues it, so discarding it wedged the run RUNNING with no job
  *    until `run.reapStuck` swept it minutes later. It must be
  *    re-delivered.
+ *  - `ghostReason: "version"` — the run is pinned to a definition version
+ *    this build does not serve. Also re-delivered: a pinned run is never
+ *    failed for want of a host that can serve it.
  */
 
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { defineStage } from "../../core/stage-factory.js";
-import { WorkflowBuilder } from "../../core/workflow.js";
+import { defineWorkflow, WorkflowBuilder } from "../../core/workflow.js";
 import { executeJobWithHeartbeat } from "../../kernel/helpers/host-support.js";
 import { createTestKernel } from "../utils/index.js";
 
@@ -122,6 +125,72 @@ describe("ghost jobs at the host seam", () => {
     // A cancelled run is not re-opened by the orphan path.
     const run = await persistence.getRun(created.workflowRunId);
     expect(run?.status).toBe("CANCELLED");
+  });
+
+  it("re-delivers a job whose run is pinned to a version this build does not serve", async () => {
+    // A rolling deploy: the run started under a one-stage pipeline and this
+    // process now presents a two-stage one. The job belongs to the other
+    // build, so it must go back on the queue — not fail the run, which is
+    // the whole point of pinning.
+    const stageSchema = z.object({ val: z.string() });
+    const makeStage = (id: string) =>
+      defineStage({
+        id,
+        name: `Stage ${id}`,
+        schemas: {
+          input: stageSchema,
+          output: stageSchema,
+          config: z.object({}),
+        },
+        async execute(ctx) {
+          return { output: ctx.input };
+        },
+      });
+    const v1 = defineWorkflow("ghost-version", { input: stageSchema })
+      .pipe(makeStage("a"))
+      .build();
+    const v2 = defineWorkflow("ghost-version", { input: stageSchema })
+      .pipe(makeStage("a"))
+      .pipe(makeStage("b"))
+      .build();
+
+    const { kernel, jobTransport, registry, persistence } = createTestKernel([
+      v1,
+    ]);
+    const created = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "version-1",
+      workflowId: v1.id,
+      input: { val: "hello" },
+    });
+    await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
+    const job = await jobTransport.dequeue();
+
+    // The build changes under the running run.
+    registry.set(v1.id, v2);
+
+    const outcome = await executeJobWithHeartbeat(kernel, {
+      jobTransport,
+      job: {
+        jobId: job!.jobId,
+        workflowRunId: job!.workflowRunId,
+        workflowId: job!.workflowId,
+        stageId: job!.stageId,
+        attempt: job!.attempt,
+        maxAttempts: job!.maxAttempts,
+        payload: job!.payload,
+      },
+    });
+
+    expect(outcome.outcome).toBe("failed");
+    expect(outcome.willRetry).toBe(true);
+    const [row] = await jobTransport.getJobsByWorkflowRun(
+      created.workflowRunId,
+    );
+    expect(row!.status).toBe("PENDING");
+    // The run is untouched: a host on the pinned build still has it.
+    const run = await persistence.getRun(created.workflowRunId);
+    expect(run?.status).toBe("RUNNING");
   });
 
   it("stops re-delivering a racing job once its attempt budget is spent", async () => {
