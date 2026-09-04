@@ -17,11 +17,14 @@
  * stamped as published: the claim is what makes delivery once-only.
  *
  * The result names the sink's state: `eventSinkStatus: "degraded"` when at
- * least one event could not be published this pass, plus how many were
- * released for retry (`failed`) and how many exhausted their retry budget
- * (`deadLettered`). A degraded sink never stalls a run — the poller, not
- * the sink, is what advances one — so hosts surface the state instead of
- * throwing (see `createEventSinkMonitor` in `helpers/host-support.ts`).
+ * least one event could not be published this pass, plus how many will be
+ * retried by the next flush (`failed`) and how many exhausted their retry
+ * budget (`deadLettered`). Those two populations are disjoint: a released
+ * event that was also dead-lettered will not retry on its own, so it is
+ * reported only as `deadLettered`. A degraded sink never stalls a run —
+ * the poller, not the sink, is what advances one — so hosts surface the
+ * state instead of throwing (see `createEventSinkMonitor` in
+ * `helpers/host-support.ts`).
  *
  * This handler returns _events: [] — it does NOT produce new outbox events.
  */
@@ -83,7 +86,14 @@ export async function handleOutboxFlush(
 
   return {
     published,
-    failed: releaseIds.length,
+    // Every released id minus the ones that were also dead-lettered. A
+    // dead letter is released so a replay can still find it in sequence,
+    // but it does not retry on its own and `deadLettered` already counts
+    // it — leaving it in here reported one event twice and contradicted
+    // what `failed` documents. The remainder is homogeneous: events whose
+    // emit threw, plus the later events of those same runs held back to
+    // keep per-run order. Both come round again on the next flush.
+    failed: releaseIds.length - deadLettered,
     deadLettered,
     eventSinkStatus: firstError === undefined ? "healthy" : "degraded",
     ...(firstError !== undefined ? { eventSinkError: firstError } : {}),

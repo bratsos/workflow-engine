@@ -308,9 +308,12 @@ export type EventSinkStatus = "healthy" | "degraded";
 export interface OutboxFlushResult {
   readonly published: number;
   /**
-   * Events this flush claimed but could not publish. They were released
-   * (their `publishedAt` cleared) and the next flush retries them, so this
-   * is a delivery-lag signal, not data loss.
+   * Events this flush claimed but could not publish **and which the next
+   * flush will retry** — the ones whose emit threw, plus the later events
+   * of those same runs, held back so nothing is redelivered out of order.
+   * They were released (their `publishedAt` cleared), so this is a
+   * delivery-lag signal, not data loss. Events that exhausted their retry
+   * budget in this same pass are not counted here; they are `deadLettered`.
    */
   readonly failed: number;
   /**

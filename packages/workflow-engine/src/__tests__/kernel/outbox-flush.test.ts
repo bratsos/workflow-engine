@@ -439,6 +439,52 @@ describe("kernel: outbox.flush", () => {
     ]);
   });
 
+  it("counts a dead-lettered event once, under deadLettered and not failed", async () => {
+    // The flush releases every event it could not publish, dead letters
+    // included, so `releaseIds` is not the set that will retry. With
+    // maxRetries = 1 a single pass produces one of each: the run's first
+    // event throws and is dead-lettered on the spot, and its second event
+    // is held back to keep per-run order and does retry.
+    const plugin = definePlugin({
+      id: "always-fails",
+      name: "Always Fails",
+      on: ["workflow:created"],
+      handle: async () => {
+        throw new Error("permanent failure");
+      },
+    });
+
+    const workflow = createSimpleWorkflow();
+    const { kernel, flush } = createTestKernelWithPlugins(
+      [workflow],
+      [plugin as PluginDefinition],
+      1, // maxRetries = 1: the first throw exhausts the budget
+    );
+
+    await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "counter-1",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+    // A second event on the same run, held back behind the failing first.
+    await kernel.dispatch({ type: "run.claimPending", workerId: "w1" });
+
+    const result = await flush();
+
+    expect(result.published).toBe(0);
+    expect(result.deadLettered).toBe(1);
+    // Only workflow:started retries; workflow:created is in the DLQ and is
+    // already reported by deadLettered.
+    expect(result.failed).toBe(1);
+
+    // And the count was honest: exactly that one event comes round again.
+    const next = await flush();
+    expect(next.published).toBe(1);
+    expect(next.failed).toBe(0);
+    expect(next.deadLettered).toBe(0);
+  });
+
   it("published count reflects only successfully published events", async () => {
     const plugin = definePlugin({
       id: "always-fails",
