@@ -176,6 +176,97 @@ Verified against `git diff` of the package's `prisma/schema.prisma` between 0.13
   constraint adds is the database refusing a duplicate a custom `JobQueue`
   implementation might still write.
 
+- [ ] **Pin runs to a definition version** (optional, but it is what makes a
+  rolling deploy safe — see the *Core Concepts → Definition Versioning* page
+  of the documentation site for what the version identifies and how a fleet
+  drains one).
+  Two nullable columns on `workflow_runs`, two indexes, and one new table.
+  Entirely additive with no backfill, and **skipping it is a supported
+  configuration**: the Prisma adapter detects that the generated client has no
+  `workflowDefinition` delegate, records no versions, leaves claiming
+  unfiltered, and answers `run.listVersions` with `{ supported: false }`. Runs
+  created before the migration keep a `NULL` version for life and stay
+  claimable by every host.
+
+  ```sql
+  ALTER TABLE "workflow_runs" ADD COLUMN IF NOT EXISTS "definitionVersion" TEXT;
+  ALTER TABLE "workflow_runs" ADD COLUMN IF NOT EXISTS "redriveCount" INTEGER NOT NULL DEFAULT 0;
+
+  CREATE TABLE IF NOT EXISTS "workflow_definitions" (
+    "workflowId"    TEXT NOT NULL,
+    "version"       TEXT NOT NULL,
+    "createdAt"     TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "snapshot"      JSONB NOT NULL,
+    "structureHash" TEXT NOT NULL,
+    CONSTRAINT "workflow_definitions_pkey" PRIMARY KEY ("workflowId", "version")
+  );
+  CREATE INDEX IF NOT EXISTS "workflow_definitions_workflowId_idx"
+    ON "workflow_definitions" ("workflowId");
+  ```
+
+  The indexes for these two columns are in the index block below, because
+  they belong to one `workflow_runs` index set rather than to two separate
+  migrations.
+
+- [ ] **Replace the `workflow_runs` and `job_queue` index sets.** 1.0 changes
+  which orderings are served, and the changes are stated together here
+  because they touch the same two tables and should go in one migration.
+  Nothing about them is required for correctness — every query still returns
+  the same rows without them — but two of the three replaced indexes were
+  serving sequential scans and sorts on the hottest paths in the system.
+
+  Build them `CONCURRENTLY` on a live database (outside a transaction), then
+  drop the ones they replace.
+
+  ```sql
+  -- workflow_runs: newest-first list orderings, keyset-paged on
+  -- (createdAt, id). Replaces the bare (status) and (workflowId) indexes:
+  -- a composite whose leading column is the same serves every lookup the
+  -- single-column index served. Measured at 500k runs: "recent runs first"
+  -- 244 ms -> 0.03 ms, filtered by status 94 ms -> 0.03 ms, filtered by
+  -- workflow 60 ms -> 0.03 ms. The engine's own hot paths are unchanged
+  -- within noise (claimNextPendingRun 18.4 -> 19.2 ms).
+  CREATE INDEX CONCURRENTLY IF NOT EXISTS "workflow_runs_createdAt_id_idx"
+    ON "workflow_runs" ("createdAt" DESC, "id" DESC);
+  CREATE INDEX CONCURRENTLY IF NOT EXISTS "workflow_runs_status_createdAt_id_idx"
+    ON "workflow_runs" ("status", "createdAt" DESC, "id" DESC);
+  CREATE INDEX CONCURRENTLY IF NOT EXISTS "workflow_runs_workflowId_createdAt_id_idx"
+    ON "workflow_runs" ("workflowId", "createdAt" DESC, "id" DESC);
+  DROP INDEX CONCURRENTLY IF EXISTS "workflow_runs_status_idx";
+  DROP INDEX CONCURRENTLY IF EXISTS "workflow_runs_workflowId_idx";
+
+  -- workflow_runs: definition versioning. Only if you took the columns above.
+  CREATE INDEX CONCURRENTLY IF NOT EXISTS "workflow_runs_definitionVersion_idx"
+    ON "workflow_runs" ("definitionVersion");
+  CREATE INDEX CONCURRENTLY IF NOT EXISTS "workflow_runs_status_workflowId_definitionVersion_idx"
+    ON "workflow_runs" ("status", "workflowId", "definitionVersion");
+
+  -- job_queue: cover the dequeue's createdAt tiebreak. Replaces
+  -- (status, priority), whose leading columns it repeats. Without the
+  -- tiebreak in the index a deep queue reads and sorts every PENDING row on
+  -- every claim: measured on Postgres 16 with flat priorities, 0.55 ms at
+  -- 1,000 ready rows and 26.7 ms at 50,000; with it, 0.03 ms and 0.04 ms,
+  -- flat with depth. It is the one index change here that costs real space —
+  -- (status, priority) is nearly all duplicate keys, which btree
+  -- deduplication collapses, and adding createdAt makes every key distinct:
+  -- 1 MB -> 10 MB at 150,000 rows.
+  CREATE INDEX CONCURRENTLY IF NOT EXISTS "job_queue_status_priority_createdAt_idx"
+    ON "job_queue" ("status", "priority" DESC, "createdAt" ASC);
+  DROP INDEX CONCURRENTLY IF EXISTS "job_queue_status_priority_idx";
+
+  -- job_queue: queue health reads MIN("createdAt") within a status, and
+  -- completed rows are retained rather than deleted.
+  CREATE INDEX CONCURRENTLY IF NOT EXISTS "job_queue_status_createdAt_idx"
+    ON "job_queue" ("status", "createdAt");
+
+  -- outbox_events: the dead-letter page. Prisma cannot express a partial
+  -- index; if you write migrations by hand, prefer one — dead letters are a
+  -- small subset of unpublished rows.
+  --   CREATE INDEX CONCURRENTLY ... ON "outbox_events" ("dlqAt") WHERE "dlqAt" IS NOT NULL;
+  CREATE INDEX CONCURRENTLY IF NOT EXISTS "outbox_events_dlqAt_idx"
+    ON "outbox_events" ("dlqAt");
+  ```
+
 - [ ] **Custom `JobQueue` / `JobTransport` implementation?** Two contract changes:
   `deleteByRunAndStages(workflowRunId, stageIds)` is a new required method
   (delete every row for those stages of that run, any status, return the count),
