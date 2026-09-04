@@ -95,12 +95,20 @@ export async function handleJobExecute(
   const workflowRun = await deps.persistence.getRun(workflowRunId);
   if (!workflowRun) throw new Error(`WorkflowRun ${workflowRunId} not found`);
 
-  // Guard against ghost jobs — only execute if run is actively RUNNING
+  // Guard against ghost jobs — only execute if run is actively RUNNING.
+  // A PENDING run is not an orphan: the claim that enqueued this job had
+  // not committed when the job loop dequeued it (or the claim rolled back
+  // and the run will be claimed again), so the job arrived early and must
+  // be re-delivered rather than thrown away.
   if (workflowRun.status !== "RUNNING") {
+    const race = workflowRun.status === "PENDING";
     return {
       outcome: "failed" as const,
       ghost: true,
-      error: `Run ${workflowRunId} is ${workflowRun.status}, expected RUNNING — ghost job discarded`,
+      ghostReason: race ? ("race" as const) : ("orphan" as const),
+      error: race
+        ? `Run ${workflowRunId} is still PENDING, expected RUNNING — job dequeued ahead of its claim; re-delivering`
+        : `Run ${workflowRunId} is ${workflowRun.status}, expected RUNNING — ghost job discarded`,
       _events: [],
     };
   }
@@ -348,6 +356,7 @@ export async function handleJobExecute(
       return {
         outcome: "failed" as const,
         ghost: true,
+        ghostReason: "orphan" as const,
         error: claimResult.message,
         _events: [],
       };
@@ -385,6 +394,7 @@ export async function handleJobExecute(
     return {
       outcome: "failed" as const,
       ghost: true,
+      ghostReason: "orphan" as const,
       error: `Run ${workflowRunId} was ${currentRunStatus} after stage execution — result discarded`,
       _events: [],
     };
@@ -456,6 +466,7 @@ export async function handleJobExecute(
       return {
         outcome: "failed" as const,
         ghost: true,
+        ghostReason: "orphan" as const,
         error: claimResult.message,
         _events: [],
       };
@@ -538,6 +549,7 @@ export async function handleJobExecute(
       return {
         outcome: "failed" as const,
         ghost: true,
+        ghostReason: "orphan" as const,
         error: claimResult.message,
         _events: [],
       };

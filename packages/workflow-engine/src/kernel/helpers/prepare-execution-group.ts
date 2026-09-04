@@ -1,13 +1,14 @@
 /**
  * Creates (or upserts) the stage records for one execution group and
  * returns a closure that enqueues jobs for the stages that ended up
- * PENDING. The enqueue itself is NOT performed here — most callers must
+ * PENDING. The enqueue itself is NOT performed here — every caller must
  * invoke the returned closure from `_postCommit`, after the transaction
  * that created these stage records has committed. Enqueueing
  * mid-transaction risks an orphan job if the transaction later rolls back
  * (jobTransport isn't part of the DB transaction, so its writes can't be
- * undone). `run.claimPending` is the one exception — see the note at its
- * call site.
+ * undone), and — worse — publishes a job whose run/stage rows are not yet
+ * visible to any other connection, so a fast job loop dequeues it before
+ * the claim commits and `job.execute` sees a still-PENDING run.
  *
  * Shared by three callers whose `attempt`/create semantics are each
  * intentionally different:

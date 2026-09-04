@@ -34,6 +34,7 @@ import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
 import { defineStage } from "../../core/stage-factory.js";
 import { WorkflowBuilder } from "../../core/workflow.js";
+import { executeJobWithHeartbeat } from "../../kernel/helpers/host-support.js";
 import { createKernel } from "../../kernel/kernel.js";
 import type { Clock } from "../../kernel/ports.js";
 import {
@@ -406,6 +407,118 @@ if (!DATABASE_URL) {
           runsForWorkflow.filter((r) => r.workflowId === workflow.id),
         ).toHaveLength(1);
       });
+    });
+
+    // ==========================================================================
+    // The claim/enqueue race, at the shape that exposed it: a job loop
+    // polling every 2ms against runs being claimed at the same time. The
+    // first-stage enqueue happens after the claim transaction commits, so a
+    // dequeued job's run is always already RUNNING; before that fix the
+    // majority of runs wedged RUNNING with a discarded ghost job.
+    // ==========================================================================
+
+    describe("claim/enqueue race under a fast job loop", () => {
+      beforeEach(async () => {
+        await truncateAll();
+      });
+
+      it("wedges no run when the job loop polls every 2ms", async () => {
+        const schema = z.object({ value: z.string() });
+        const stage = defineStage({
+          id: "race-stage",
+          name: "Race Stage",
+          schemas: { input: schema, output: schema, config: z.object({}) },
+          async execute(ctx) {
+            return { output: { value: `${ctx.input.value}!` } };
+          },
+        });
+        const workflow = new WorkflowBuilder(
+          "pg-claim-race",
+          "PG Claim Race",
+          "Claim/enqueue race",
+          schema,
+          schema,
+        )
+          .pipe(stage)
+          .build();
+
+        const persistence = createPrismaWorkflowPersistence(prisma);
+        const jobTransport = createPrismaJobQueue(prisma, {
+          workerId: "race-worker",
+        });
+        const kernel = createKernel({
+          persistence,
+          jobTransport,
+          blobStore: new InMemoryBlobStore(),
+          eventSink: new CollectingEventSink(),
+          clock: { now: () => new Date() } satisfies Clock,
+          registry: {
+            getWorkflow: (id) => (id === workflow.id ? workflow : undefined),
+          },
+        });
+
+        const RUNS = 12;
+        for (let i = 0; i < RUNS; i++) {
+          await kernel.dispatch({
+            type: "run.create",
+            idempotencyKey: `pg-race-${i}`,
+            workflowId: workflow.id,
+            input: { value: `v${i}` },
+          });
+        }
+
+        const sleep = (ms: number) =>
+          new Promise((resolve) => setTimeout(resolve, ms));
+        let looping = true;
+        // The two loops a NodeHost runs: dequeue-and-execute at a 2ms poll,
+        // and the orchestration tick's run.claimPending.
+        const jobLoop = (async () => {
+          while (looping) {
+            const job = await jobTransport.dequeue();
+            if (!job) {
+              await sleep(2);
+              continue;
+            }
+            await executeJobWithHeartbeat(kernel, {
+              jobTransport,
+              job,
+              logPrefix: "[pg-race]",
+            });
+          }
+        })();
+        const claimLoop = (async () => {
+          while (looping) {
+            await kernel.dispatch({
+              type: "run.claimPending",
+              workerId: "race-worker",
+              maxClaims: 10,
+            });
+            await sleep(5);
+          }
+        })();
+
+        const deadline = Date.now() + 20_000;
+        for (;;) {
+          const unfinished = (await persistence.getRunsByStatus("RUNNING"))
+            .length;
+          const pending = (await persistence.getRunsByStatus("PENDING")).length;
+          if (unfinished + pending === 0 || Date.now() > deadline) break;
+          await sleep(20);
+        }
+        looping = false;
+        await Promise.all([jobLoop, claimLoop]);
+
+        const completed = await persistence.getRunsByStatus("COMPLETED");
+        expect(completed).toHaveLength(RUNS);
+        expect(await persistence.getRunsByStatus("RUNNING")).toHaveLength(0);
+
+        // No job was thrown away as an orphan of a run that was merely
+        // waiting for its claim to commit.
+        const discarded = await prisma.jobQueue.count({
+          where: { lastError: { contains: "ghost job discarded" } },
+        });
+        expect(discarded).toBe(0);
+      }, 40_000);
     });
   });
 }

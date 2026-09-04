@@ -559,11 +559,12 @@ describe("kernel: job.execute", () => {
     expect(completedEvents).toHaveLength(1);
   });
 
-  it("discards ghost job when run is not RUNNING", async () => {
+  it("reports a job whose run is still PENDING as a re-deliverable race", async () => {
     const workflow = createSimpleWorkflow();
-    const { kernel, persistence } = createTestKernel([workflow]);
+    const { kernel } = createTestKernel([workflow]);
 
-    // Create a run but do NOT claim it (stays PENDING)
+    // Create a run but do NOT claim it (stays PENDING) — the shape a job
+    // loop sees when it dequeues faster than the claim transaction commits
     const createResult = await kernel.dispatch({
       type: "run.create",
       idempotencyKey: "key-1",
@@ -571,7 +572,6 @@ describe("kernel: job.execute", () => {
       input: { data: "hello" },
     });
 
-    // Attempt to execute a job against this PENDING run (ghost job scenario)
     const result = await kernel.dispatch({
       type: "job.execute",
       idempotencyKey: "ghost-job-1",
@@ -582,7 +582,40 @@ describe("kernel: job.execute", () => {
     });
 
     expect(result.outcome).toBe("failed");
+    expect(result.ghost).toBe(true);
+    expect(result.ghostReason).toBe("race");
     expect(result.error).toContain("expected RUNNING");
+  });
+
+  it("discards a job whose run reached a terminal status as an orphan", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel } = createTestKernel([workflow]);
+
+    const createResult = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "key-1",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+    await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
+    await kernel.dispatch({
+      type: "run.cancel",
+      workflowRunId: createResult.workflowRunId,
+    });
+
+    const result = await kernel.dispatch({
+      type: "job.execute",
+      idempotencyKey: "ghost-job-2",
+      workflowRunId: createResult.workflowRunId,
+      workflowId: "test-workflow",
+      stageId: "stage-1",
+      config: {},
+    });
+
+    expect(result.outcome).toBe("failed");
+    expect(result.ghost).toBe(true);
+    expect(result.ghostReason).toBe("orphan");
+    expect(result.error).toContain("ghost job discarded");
   });
 
   it("validates input against stage schema", async () => {

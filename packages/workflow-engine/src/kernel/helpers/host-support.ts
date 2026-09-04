@@ -94,9 +94,11 @@ export interface ExecuteJobOutcome {
    */
   dead?: boolean;
   /**
-   * The stage failed but the job has attempts left and the stage was left
-   * `PENDING`: the job must run again. The built-in transports re-enqueue
-   * it themselves from `fail(jobId, error, true)`; a push transport whose
+   * The job must run again — either the stage failed with attempts left
+   * and was left `PENDING`, or the job was dequeued ahead of the claim
+   * that enqueued it (a still-PENDING run; see `ghostReason: "race"` on
+   * `JobExecuteResult`). The built-in transports re-enqueue it
+   * themselves from `fail(jobId, error, true)`; a push transport whose
    * `fail()` cannot re-enqueue (a queue consumer that has to `retry()` the
    * message) must retry the message after `retryDelayMs`, and acknowledge
    * it when this is false.
@@ -231,8 +233,16 @@ export async function executeJobWithHeartbeat(
     return { outcome: "suspended" };
   }
 
-  // failed — ghost jobs (discarded by kernel because run is not RUNNING)
-  // should never be retried — they'll just fail again.
+  // failed — a ghost job (the kernel did not execute it because the run
+  // isn't RUNNING) splits in two, on `ghostReason`:
+  //  - "orphan": the run is CANCELLED/COMPLETED/FAILED. Retrying would
+  //    fail identically forever, so the job is failed terminally.
+  //  - "race": the run is still PENDING — this job was dequeued before
+  //    the claim that enqueued it committed. Nothing else will re-enqueue
+  //    it, so discarding it wedges the run RUNNING with no job until
+  //    run.reapStuck sweeps it minutes later. Re-deliver it instead (the
+  //    built-in transports re-queue it with their usual backoff), while
+  //    the attempt budget lasts.
   // A deterministic (non-retryable) stage error — e.g. Zod input
   // validation — will fail identically on every attempt, so it is
   // treated the same as an exhausted retry budget.
@@ -240,9 +250,10 @@ export async function executeJobWithHeartbeat(
   // already left the stage PENDING for that case; the transport contract
   // is that `fail(jobId, error, true)` re-enqueues the job with backoff.
   const maxAttempts = job.maxAttempts ?? HOST_DEFAULTS.maxAttempts;
-  const canRetry =
-    !result.ghost &&
-    (result.willRetry ??
+  const raceGhost = result.ghost === true && result.ghostReason === "race";
+  const canRetry = result.ghost
+    ? raceGhost && job.attempt < maxAttempts
+    : (result.willRetry ??
       (result.retryable !== false && job.attempt < maxAttempts));
   await jobTransport.fail(job.jobId, result.error ?? "Unknown error", canRetry);
   // Terminal failure: without this, the run lingers RUNNING until

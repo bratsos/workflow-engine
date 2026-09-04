@@ -9,7 +9,47 @@ import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { defineStage } from "../../core/stage-factory.js";
 import { WorkflowBuilder } from "../../core/workflow.js";
-import { createTestKernel } from "../utils/index.js";
+import { createKernel } from "../../kernel/kernel.js";
+import {
+  CollectingEventSink,
+  FakeClock,
+  InMemoryBlobStore,
+} from "../../kernel/testing/index.js";
+import type { WorkflowPersistence } from "../../persistence/interface.js";
+import {
+  createTestKernel,
+  InMemoryJobQueue,
+  InMemoryWorkflowPersistence,
+} from "../utils/index.js";
+
+/** Reports whether a transaction is open while a handler runs. */
+class TransactionTrackingPersistence extends InMemoryWorkflowPersistence {
+  insideTransaction = false;
+
+  override async withTransaction<T>(
+    fn: (tx: WorkflowPersistence) => Promise<T>,
+  ): Promise<T> {
+    this.insideTransaction = true;
+    try {
+      return await super.withTransaction(fn);
+    } finally {
+      this.insideTransaction = false;
+    }
+  }
+}
+
+/** Records, per enqueue, whether a transaction was open at the time. */
+class EnqueueWitnessJobQueue extends InMemoryJobQueue {
+  readonly enqueuedInsideTransaction: boolean[] = [];
+  witness: () => boolean = () => false;
+
+  override async enqueueParallel(
+    jobs: Parameters<InMemoryJobQueue["enqueueParallel"]>[0],
+  ): Promise<string[]> {
+    this.enqueuedInsideTransaction.push(this.witness());
+    return super.enqueueParallel(jobs);
+  }
+}
 
 // Helper: create a simple passthrough stage
 function createPassthroughStage(id: string, schema: z.ZodTypeAny) {
@@ -325,5 +365,47 @@ describe("kernel: run.claimPending", () => {
     // First run should be marked FAILED
     const failedRuns = await persistence.getRunsByStatus("FAILED");
     expect(failedRuns).toHaveLength(1);
+  });
+  it("enqueues the first-stage job only after the claim transaction commits", async () => {
+    // Regression: the enqueue used to run inside the claim transaction.
+    // The job transport is not part of that transaction, so a job loop
+    // polling faster than the commit dequeued a job whose run was still
+    // PENDING on every other connection; job.execute discarded it and the
+    // run wedged RUNNING with no job. The enqueue is now a post-commit
+    // step, so the run is committed RUNNING before its job exists.
+    const workflow = createSimpleWorkflow("claim-commit-order");
+    const persistence = new TransactionTrackingPersistence();
+    const jobTransport = new EnqueueWitnessJobQueue("worker-1");
+    jobTransport.witness = () => persistence.insideTransaction;
+
+    const kernel = createKernel({
+      persistence,
+      blobStore: new InMemoryBlobStore(),
+      jobTransport,
+      eventSink: new CollectingEventSink(),
+      clock: new FakeClock(),
+      registry: {
+        getWorkflow: (id) => (id === workflow.id ? workflow : undefined),
+      },
+    });
+
+    await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "commit-order-1",
+      workflowId: workflow.id,
+      input: { data: "hello" },
+    });
+
+    const result = await kernel.dispatch({
+      type: "run.claimPending",
+      workerId: "worker-1",
+    });
+
+    expect(jobTransport.enqueuedInsideTransaction).toEqual([false]);
+    // ...and the ids the post-commit enqueue produced still reach the caller
+    expect(result.claimed[0]!.jobIds).toHaveLength(1);
+    expect(jobTransport.getAllJobs().map((j) => j.id)).toEqual(
+      result.claimed[0]!.jobIds,
+    );
   });
 });

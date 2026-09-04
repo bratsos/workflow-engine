@@ -150,8 +150,19 @@ export interface JobExecuteResult {
   readonly output?: unknown;
   readonly error?: string;
   readonly nextPollAt?: Date;
-  /** True when the job was discarded because the run is no longer RUNNING. */
+  /** True when the job was not executed because the run is not RUNNING. */
   readonly ghost?: boolean;
+  /**
+   * Only set alongside `ghost`. Distinguishes the two reasons a job can
+   * find its run not RUNNING:
+   *  - `"orphan"` — the run is CANCELLED/COMPLETED/FAILED, or was made so
+   *    mid-execution. The job is meaningless and must be thrown away.
+   *  - `"race"` — the run is still PENDING, i.e. its claim had not
+   *    committed when this job was dequeued. The job is valid and simply
+   *    arrived early: it must be re-delivered, not discarded, or the run
+   *    wedges RUNNING with no job until `run.reapStuck` sweeps it up.
+   */
+  readonly ghostReason?: "orphan" | "race";
   /**
    * False marks a deterministic failure (e.g. Zod input/config validation)
    * that will not succeed on retry — hosts should fail the job terminally.

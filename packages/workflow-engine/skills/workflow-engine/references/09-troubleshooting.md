@@ -64,8 +64,20 @@ await kernel.dispatch({ type: "run.transition", workflowRunId: runId });
 
 **How it's fixed (three layers):**
 1. **Authoritative cancellation:** `run.cancel` cancels all queued/suspended jobs via `jobTransport.cancelByRun()`, preventing most ghost jobs before dequeue.
-2. **Kernel guard:** `job.execute` checks `workflowRun.status === "RUNNING"` both before AND after stage execution. Ghost jobs are discarded with `outcome: "failed"` and a typed `ghost: true` flag in the result.
-3. **Host no-retry:** Both Node and Serverless hosts detect ghost jobs via the `ghost: true` flag (not string matching) and set `canRetry = false`, preventing infinite retry loops.
+2. **Kernel guard:** `job.execute` checks `workflowRun.status === "RUNNING"` both before AND after stage execution. A job whose run is not RUNNING comes back with `outcome: "failed"` and a typed `ghost: true` flag, plus `ghostReason` saying which kind it is.
+3. **Host handling by reason:** both hosts read `ghostReason` (never the message text). `"orphan"` -- the run is `CANCELLED`/`COMPLETED`/`FAILED` -- is failed terminally, since a retry can only fail again. `"race"` -- the run is still `PENDING` -- is re-delivered while the job's attempt budget lasts; see below.
+
+## Runs Wedge `RUNNING` With No Job (Short Job Poll)
+
+**Symptom:** with a small `jobPollIntervalMs` (a caller chasing near-synchronous behaviour), a large share of freshly created runs sit `RUNNING` forever with no queued job, a `job_queue` row `FAILED` with "ghost job discarded", and nothing moves until `run.reapStuck` kills the run minutes later. Invisible at the 1000 ms default, and worse the shorter the poll gets.
+
+**What it was:** `run.claimPending` enqueued the claimed run's first-stage job *inside* the claim transaction. The job transport is a separate connection that takes no part in that transaction, so the job row was visible to every other connection while the run it named was still `PENDING`. A job loop polling faster than the claim committed dequeued it, the kernel's ghost guard discarded it as an orphan, and nothing ever re-enqueued it.
+
+**How it's fixed (two layers, either sufficient):**
+1. **Enqueue after commit:** `run.claimPending` defers the enqueue to the kernel's post-commit step, like `run.transition` and `run.rerunFrom` already did. The run is committed `RUNNING` before its job exists, so the window is gone. `claimed[].jobIds` still carries the enqueued ids.
+2. **A racing job is re-delivered, not discarded:** `job.execute` reports a still-`PENDING` run as `ghostReason: "race"` and the hosts re-enqueue the job (through `fail(jobId, error, true)`, so the transport's usual backoff applies) instead of throwing it away. A terminal run stays `ghostReason: "orphan"` and is still failed terminally.
+
+`run.reapStuck`'s PENDING-stage-without-job sweep remains the backstop for a job lost after the commit (a transport error, a process death); the enqueue is idempotent on `(workflowRunId, stageId)`, so the sweep cannot double-queue.
 
 ## One Bad Run Blocks Everything
 

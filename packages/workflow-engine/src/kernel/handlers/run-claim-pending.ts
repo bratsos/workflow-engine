@@ -24,14 +24,25 @@ export async function handleRunClaimPending(
     jobIds: string[];
   }> = [];
   const events: KernelEvent[] = [];
-  // NOTE: the closure returned by prepareExecutionGroup is invoked
-  // immediately below — inside the enclosing DB transaction — unlike
-  // run.transition/run.rerunFrom, which defer it to _postCommit (see
-  // kernel/helpers/prepare-execution-group.ts). This handler's public
-  // result includes the enqueued jobIds synchronously per claimed run. A
-  // crash between enqueue and commit can still orphan a job or lose one;
-  // run.reapStuck's PENDING-without-job recovery sweep (see there) covers
-  // the resulting stuck run either way.
+  // The closures returned by prepareExecutionGroup are deferred to
+  // _postCommit, exactly like run.transition/run.rerunFrom (see
+  // kernel/helpers/prepare-execution-group.ts). Enqueueing inside the
+  // claim transaction published a job for a run that was still PENDING on
+  // every other connection until the commit landed: a job loop polling
+  // faster than the transaction commits dequeued it, job.execute's guard
+  // saw PENDING and discarded it, and the run wedged RUNNING with no job
+  // until run.reapStuck fired minutes later. Deferring makes the run
+  // committed RUNNING before its job is visible to anyone.
+  //
+  // The trade: a jobTransport failure after the commit leaves a claimed
+  // run RUNNING with no job (the enqueue can no longer be rolled back with
+  // the claim). That is the exact shape run.reapStuck's
+  // PENDING-stage-without-job sweep heals, and the enqueue is idempotent
+  // on (workflowRunId, stageId), so the sweep cannot double-queue.
+  const pendingEnqueues: Array<{
+    entry: { workflowRunId: string; jobIds: string[] };
+    enqueue: () => Promise<string[]>;
+  }> = [];
 
   for (let i = 0; i < maxClaims; i++) {
     const run = await deps.persistence.claimNextPendingRun({
@@ -112,14 +123,13 @@ export async function handleRunClaimPending(
 
       // Upsert stage records (idempotent — handles orphaned stages from
       // previous failed claims) and enqueue jobs only for stages that are
-      // PENDING (skip RUNNING/COMPLETED/SUSPENDED) — invoked immediately,
-      // see the NOTE above.
+      // PENDING (skip RUNNING/COMPLETED/SUSPENDED) — deferred to
+      // _postCommit, see the NOTE above.
       const enqueue = await prepareExecutionGroup(run, workflow, deps, {
         groupIndex: 1,
         attemptMode: "none",
         createMode: "upsert",
       });
-      const jobIds = await enqueue();
 
       events.push({
         type: "workflow:started",
@@ -127,11 +137,16 @@ export async function handleRunClaimPending(
         workflowRunId: run.id,
       });
 
-      claimed.push({
+      // `jobIds` is filled in by _postCommit before the kernel returns
+      // this object to the caller — the array is the same reference the
+      // result carries, so the public result still reports the ids.
+      const entry = {
         workflowRunId: run.id,
         workflowId: run.workflowId,
-        jobIds,
-      });
+        jobIds: [] as string[],
+      };
+      claimed.push(entry);
+      pendingEnqueues.push({ entry, enqueue });
     } catch (err) {
       const error = toErrorMessage(err);
       const failedAt = deps.clock.now();
@@ -169,5 +184,29 @@ export async function handleRunClaimPending(
     }
   }
 
-  return { claimed, _events: events };
+  if (pendingEnqueues.length === 0) return { claimed, _events: events };
+
+  return {
+    claimed,
+    _events: events,
+    _postCommit: async () => {
+      // Every claimed run gets its enqueue attempted, even if an earlier
+      // one failed: a transport error on one run must not leave the rest
+      // of the batch jobless. Failures are reported together afterwards
+      // (the hosts log run.claimPending errors and carry on).
+      const failures: string[] = [];
+      for (const { entry, enqueue } of pendingEnqueues) {
+        try {
+          entry.jobIds.push(...(await enqueue()));
+        } catch (err) {
+          failures.push(`${entry.workflowRunId}: ${toErrorMessage(err)}`);
+        }
+      }
+      if (failures.length > 0) {
+        throw new Error(
+          `run.claimPending: could not enqueue the first-stage job of ${failures.length} claimed run(s) — run.reapStuck will recover them (${failures.join("; ")})`,
+        );
+      }
+    },
+  };
 }
