@@ -72,11 +72,14 @@ export type {
   ConformanceTestApi,
   JobQueueFactory,
   PersistenceFactory,
+  StepLedgerFactory,
+  StepLedgerFixture,
 } from "./persistence-conformance.js";
 export {
   aiCallLoggerConformanceSuite,
   jobQueueConformanceSuite,
   persistenceConformanceSuite,
+  stepLedgerConformanceSuite,
 } from "./persistence-conformance.js";
 // Shadowing: check a candidate pipeline against runs that already exist.
 export {

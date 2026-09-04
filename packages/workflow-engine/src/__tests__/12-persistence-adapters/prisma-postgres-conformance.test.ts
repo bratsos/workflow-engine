@@ -54,6 +54,7 @@ import {
   aiCallLoggerConformanceSuite,
   jobQueueConformanceSuite,
   persistenceConformanceSuite,
+  stepLedgerConformanceSuite,
 } from "../../testing/persistence-conformance.js";
 
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -73,7 +74,7 @@ if (!DATABASE_URL) {
 
     async function truncateAll() {
       await prisma.$executeRawUnsafe(
-        `TRUNCATE TABLE "job_queue", "workflow_annotations", "workflow_artifacts", "workflow_logs", "workflow_stages", "workflow_runs", "ai_calls", "outbox_events", "idempotency_keys" RESTART IDENTITY CASCADE`,
+        `TRUNCATE TABLE "job_queue", "workflow_annotations", "workflow_artifacts", "workflow_logs", "workflow_steps", "workflow_stages", "workflow_runs", "ai_calls", "outbox_events", "idempotency_keys" RESTART IDENTITY CASCADE`,
       );
     }
 
@@ -117,6 +118,15 @@ if (!DATABASE_URL) {
       () => {
         const logger = createPrismaAICallLogger(prisma);
         return Object.assign(logger, { reset: truncateAll });
+      },
+      api,
+    );
+
+    stepLedgerConformanceSuite(
+      "PrismaStepLedger (Postgres)",
+      () => {
+        const ledger = createPrismaStepLedger(prisma);
+        return Object.assign(ledger, { reset: truncateAll });
       },
       api,
     );
