@@ -122,7 +122,10 @@ applies at execution time. `job.execute` returns
 `{ ghost: true, ghostReason: "version" }` rather than running the wrong
 shape — the job is re-delivered for a host that can serve it, and the run is
 **not** failed. `run.transition` and `stage.pollSuspended` leave such a run
-untouched for the same reason.
+untouched for the same reason, and so does `run.reapStuck`: a run nobody on
+this build touches is not updated, so it crosses the stuck threshold looking
+exactly like a wedged run, and reaping it would fail a run that is perfectly
+healthy on the build that owns it.
 
 ## Has it drained?
 

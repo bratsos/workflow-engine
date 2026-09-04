@@ -1,6 +1,7 @@
 import { StaleVersionError } from "../../persistence/interface.js";
 import type { RunReapStuckCommand, RunReapStuckResult } from "../commands";
 import type { KernelEvent } from "../events";
+import { servesRun } from "../helpers/definition-pinning.js";
 import type { HandlerResult, KernelDeps } from "../kernel";
 import {
   ACTIVE_STAGE_STATUSES,
@@ -28,6 +29,19 @@ export async function handleRunReapStuck(
     // overwriting a run that recovered between query and update.
     const currentStatus = await deps.persistence.getRunStatus(run.id);
     if (currentStatus !== "RUNNING") {
+      continue;
+    }
+
+    // Definition pinning: a run pinned to a version this build does not
+    // present looks exactly like a stuck run from here — nothing on this
+    // host touches it, so neither the run nor its stages are updated and
+    // it crosses the threshold. Reaping it would fail a run that is
+    // perfectly healthy on the build that owns it, which is the one thing
+    // pinning promises never happens. Leave it, as `run.transition` and
+    // `stage.pollSuspended` do; `run.listVersions` reports it and
+    // `run.redrive({ definitionVersion: "latest" })` moves it forward.
+    const pinnedWorkflow = deps.registry.getWorkflow(run.workflowId);
+    if (pinnedWorkflow && !servesRun(run, pinnedWorkflow)) {
       continue;
     }
 
