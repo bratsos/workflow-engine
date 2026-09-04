@@ -232,7 +232,7 @@ const handler = createWorkflowConsole({
 
 Mutations never issue direct SQL updates against run records. Instead, writes dispatch standard engine commands through the kernel:
 - `run.cancel` dispatches `{ type: "run.cancel", workflowRunId, reason }`
-- `run.rerun` dispatches `{ type: "run.rerunFrom", workflowRunId, fromStageId }`
+- `run.rerun` dispatches `{ type: "run.redrive", workflowRunId, from, definitionVersion? }` — `fromStageId` in the request body still means "from this stage"; pass `from: { kind: "lastFailure" | "start" | "stage" }` and `definitionVersion: "latest"` to move a run stranded on a version nobody serves
 - `deadLetters.replay` dispatches `{ type: "plugin.replayDLQ", maxEvents }`
 
 Routing writes through the kernel ensures that execution leases, idempotency guarantees, transition invariants, and outbox publication events remain enforced by the authoritative state machine. The `onAction` hook provides an audit callback invoked immediately after each successful mutation.

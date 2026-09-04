@@ -104,9 +104,9 @@ describe("over node:http", () => {
     });
     expect(response.status).toBe(200);
     expect(dispatch).toHaveBeenCalledWith({
-      type: "run.rerunFrom",
+      type: "run.redrive",
       workflowRunId: "run-1",
-      fromStageId: "stage-2",
+      from: { kind: "stage", stageId: "stage-2" },
     });
   });
 

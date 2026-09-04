@@ -797,12 +797,32 @@ function RunDetailView({
 
   const handleRerunStage = async (stageId: string, stageName: string) => {
     if (!window.confirm(`Rerun workflow from stage "${stageName}"?`)) return;
+    await redrive({ from: { kind: "stage", stageId } });
+  };
+
+  // The rescue for a run pinned to a definition version no host serves any
+  // more: it cannot make progress on its own version, so redriving it is
+  // only useful together with a re-pin.
+  const handleRedriveOnLatest = async () => {
+    if (
+      !window.confirm(
+        "Redrive this run from its last failure on the version this deployment serves?",
+      )
+    )
+      return;
+    await redrive({
+      from: { kind: "lastFailure" },
+      definitionVersion: "latest",
+    });
+  };
+
+  const redrive = async (body: Record<string, unknown>) => {
     setActionLoading(true);
     setActionError(null);
     try {
       await api(config, `/runs/${encodeURIComponent(runId)}/rerun`, {
         method: "POST",
-        body: JSON.stringify({ fromStageId: stageId }),
+        body: JSON.stringify(body),
       });
       refresh();
     } catch (err) {
@@ -872,6 +892,16 @@ function RunDetailView({
               </div>
               {!config.readOnly && (
                 <div class="run-detail-actions">
+                  {data.run.definitionVersion && (
+                    <button
+                      type="button"
+                      disabled={actionLoading}
+                      onClick={handleRedriveOnLatest}
+                      title="Move this run onto the definition version this deployment serves, then redrive it from its last failure"
+                    >
+                      Redrive on latest version
+                    </button>
+                  )}
                   <button
                     type="button"
                     class="btn-danger"

@@ -171,17 +171,50 @@ describe("actions dispatch kernel commands, never SQL", () => {
     });
   });
 
-  it("maps rerun to run.rerunFrom and requires a stage", async () => {
+  it("maps rerun to run.redrive and still requires a stage by default", async () => {
     const { handler, dispatch } = withKernel();
     expect(
       (await handler(post("/console/api/runs/run-1/rerun", {}))).status,
     ).toBe(400);
     await handler(post("/console/api/runs/run-1/rerun", { fromStageId: "s2" }));
     expect(dispatch).toHaveBeenCalledWith({
-      type: "run.rerunFrom",
+      type: "run.redrive",
       workflowRunId: "run-1",
-      fromStageId: "s2",
+      from: { kind: "stage", stageId: "s2" },
     });
+  });
+
+  it("redrives a stranded run onto the latest definition version", async () => {
+    // The rescue path: a run pinned to a version no host serves is only
+    // reachable through `definitionVersion`, which `run.rerunFrom` had no
+    // way to express.
+    const { handler, dispatch } = withKernel();
+    await handler(
+      post("/console/api/runs/run-1/rerun", {
+        from: { kind: "lastFailure" },
+        definitionVersion: "latest",
+      }),
+    );
+    expect(dispatch).toHaveBeenCalledWith({
+      type: "run.redrive",
+      workflowRunId: "run-1",
+      from: { kind: "lastFailure" },
+      definitionVersion: "latest",
+    });
+  });
+
+  it("rejects a malformed redrive mode rather than falling back to the default", async () => {
+    const { handler } = withKernel();
+    for (const body of [
+      { from: { kind: "whenever" } },
+      { from: { kind: "stage" } },
+      { from: "start" },
+      { fromStageId: "s2", definitionVersion: "" },
+    ]) {
+      expect(
+        (await handler(post("/console/api/runs/run-1/rerun", body))).status,
+      ).toBe(400);
+    }
   });
 
   it("maps dead-letter replay to plugin.replayDLQ", async () => {

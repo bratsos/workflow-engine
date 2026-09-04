@@ -14,6 +14,16 @@ import {
 } from "./read-port";
 import { renderIndexHtml, UI_ASSETS } from "./ui-assets";
 
+/**
+ * The engine's `RunRedriveFrom`, restated rather than imported: the console
+ * types kernel commands structurally (`ConsoleKernel.dispatch`) so it can be
+ * mounted against any compatible kernel without a value dependency on one.
+ */
+type RunRedriveFrom =
+  | { readonly kind: "lastFailure" }
+  | { readonly kind: "start" }
+  | { readonly kind: "stage"; readonly stageId: string };
+
 export interface WorkflowConsoleOptions {
   /** Reads run on this. It is constructed from the caller's client or transaction; the console never opens one. */
   reader: ConsoleReadPort;
@@ -247,6 +257,35 @@ export function createWorkflowConsole(
     }
   }
 
+  /**
+   * Read the optional `from` of a redrive request.
+   *
+   * Returns `undefined` when the caller sent none, which the legacy
+   * `fromStageId` shape then covers. A malformed one is a bad request
+   * rather than a silent fall back to the default mode: an operator who
+   * asked to restart the whole run must not get a retry of one stage.
+   */
+  function parseRedriveFrom(value: unknown): RunRedriveFrom | undefined {
+    if (value === undefined) return undefined;
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      throw new ConsoleBadRequestError("`from` must be an object.");
+    }
+    const kind = (value as Record<string, unknown>).kind;
+    if (kind === "lastFailure" || kind === "start") return { kind };
+    if (kind === "stage") {
+      const stageId = (value as Record<string, unknown>).stageId;
+      if (typeof stageId !== "string" || stageId === "") {
+        throw new ConsoleBadRequestError(
+          '`from.stageId` is required for `from.kind` "stage".',
+        );
+      }
+      return { kind: "stage", stageId };
+    }
+    throw new ConsoleBadRequestError(
+      '`from.kind` must be "lastFailure", "start" or "stage".',
+    );
+  }
+
   async function guardedRead(
     request: Request,
     action: ConsoleAction,
@@ -422,16 +461,41 @@ export function createWorkflowConsole(
       if (rerun && method === "POST") {
         const runId = decodeURIComponent(rerun[1]!);
         const body = await readBody(request);
+
+        // Dispatches `run.redrive`, not the deprecated `run.rerunFrom` it
+        // used to: the narrower command refuses a CANCELLED run and cannot
+        // re-pin the definition version, so an operator had no way to move
+        // a run stranded at a version nothing serves -- the case redriving
+        // onto `"latest"` exists for. The request shape is a superset of
+        // the old one: `fromStageId` still means "rerun from this stage".
         const fromStageId = body.fromStageId;
-        if (typeof fromStageId !== "string" || fromStageId === "") {
+        const from = parseRedriveFrom(body.from);
+        if (from === undefined) {
+          if (typeof fromStageId !== "string" || fromStageId === "") {
+            throw new ConsoleBadRequestError(
+              "`fromStageId` is required and must be a non-empty string, or pass `from`.",
+            );
+          }
+        }
+        const definitionVersion = body.definitionVersion;
+        if (
+          definitionVersion !== undefined &&
+          (typeof definitionVersion !== "string" || definitionVersion === "")
+        ) {
           throw new ConsoleBadRequestError(
-            "`fromStageId` is required and must be a non-empty string.",
+            "`definitionVersion` must be a non-empty string or omitted.",
           );
         }
+
         return await dispatch(
           request,
           "run.rerun",
-          { type: "run.rerunFrom", workflowRunId: runId, fromStageId },
+          {
+            type: "run.redrive",
+            workflowRunId: runId,
+            from: from ?? { kind: "stage", stageId: fromStageId as string },
+            ...(definitionVersion !== undefined ? { definitionVersion } : {}),
+          },
           runId,
         );
       }

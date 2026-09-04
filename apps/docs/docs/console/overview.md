@@ -66,7 +66,7 @@ who forgot a line of configuration. It runs *after* your authentication —
 answer only "may this principal do this?".
 
 Writes are off by default. `actions: true` needs a `kernel`, and every
-write dispatches a kernel command (`run.cancel`, `run.rerunFrom`,
+write dispatches a kernel command (`run.cancel`, `run.redrive`,
 `plugin.replayDLQ`) rather than SQL, so the console gets the kernel's
 leases, idempotency and outbox events and there is still exactly one
 writer against run state.

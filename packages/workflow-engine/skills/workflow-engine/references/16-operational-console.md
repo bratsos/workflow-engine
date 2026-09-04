@@ -197,10 +197,12 @@ createWorkflowConsole: `actions: true` needs a `kernel` to dispatch to. Console 
 The console never executes direct `UPDATE` or `DELETE` SQL statements against database tables. All state modifications dispatch commands through the engine's kernel:
 
 - `"run.cancel"`: Dispatches `{ type: "run.cancel", workflowRunId, reason }`
-- `"run.rerun"`: Dispatches `{ type: "run.rerunFrom", workflowRunId, fromStageId }`
+- `"run.rerun"`: Dispatches `{ type: "run.redrive", workflowRunId, from, definitionVersion? }`
 - `"deadLetters.replay"`: Dispatches `{ type: "plugin.replayDLQ", maxEvents }`
 
-Currently, the console dispatches `run.rerunFrom` for stage reruns. The engine kernel marks `run.rerunFrom` as deprecated in favour of `run.redrive`, which provides unified redrive semantics across stages, versions, and failures (see [14-redrive.md](14-redrive.md)). The kernel's `run.rerunFrom` handler maps internally to the redrive engine, so the dispatch remains fully supported.
+`POST /runs/:id/rerun` takes `fromStageId` (which becomes `from: { kind: "stage", stageId }`), or a `from` of `{ kind: "lastFailure" | "start" | "stage" }`, and an optional `definitionVersion` — `"latest"` or a registered version. One of `fromStageId` or `from` is required, and a malformed `from` is a 400 rather than a fall back to the default mode: an operator who asked to restart a whole run must not silently get a retry of one stage.
+
+The `definitionVersion` argument is what makes a **stranded run** recoverable from the console. A run pinned to a version no deployment serves any more is claimed by nobody, and the only thing that moves it is a redrive that re-pins it — see [13-definition-versioning.md](13-definition-versioning.md). The UI exposes this as *Redrive on latest version* on any run that carries a pinned version. The console dispatched the deprecated `run.rerunFrom` until 1.0.0-alpha.11; that command refuses a `CANCELLED` run and has no way to express a re-pin, so neither was reachable from the console.
 
 Bypassing SQL updates ensures that execution leases, state machine transitions, idempotency checks, and outbox event emissions are preserved by the authoritative engine kernel.
 
