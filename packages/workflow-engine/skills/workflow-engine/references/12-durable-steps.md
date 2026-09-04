@@ -179,6 +179,25 @@ await ctx.step.run("wire-transfer", () => bank.send(order), { onReclaim: "fail" 
 
 The row is left `failed`, so a later replay meets the stored error rather than re-deciding. The default is `"rerun"` — the behaviour of every earlier version — so nothing changes for a step that is safe to retry. `onReclaim` governs the lease-expiry takeover only; it does not affect `retries`, because a body that *threw* has said its effect did not take.
 
+### When two workers reach the same step
+
+The lease and the reopen-on-retry path can both decide a step is takeable, so
+a wrong liveness verdict can put two workers inside one body. A step's outcome
+is therefore recorded with a compare-and-set against the row still being open:
+first write wins, and the loser **parks** on the outcome already recorded
+rather than overwriting it. Whichever worker returns first, both callers are
+answered the same recorded value — the row is the authority — and a body that
+threw cannot bury a success another execution already committed.
+
+When that happens the engine logs a WARN and writes a `step.outcome-conflict`
+annotation on the run, carrying the step id, its kind, the recorded status and
+attempt, and the step's `externalKey`. It is a report, not a failure: the
+ledger stayed consistent, so nothing is raised and no retry is spent. What it
+tells you is that the *body* ran more than once, which is the case where a
+duplicate external effect is possible — so treat the annotation as the cue to
+look for one under that external key, and, if the effect cannot be
+deduplicated, to give the step `onReclaim: "fail"`.
+
 ### Concurrency
 
 Steps may run concurrently under `Promise.all`; a suspension lets in-flight
@@ -198,21 +217,22 @@ each recorded in its own ledger row — before the suspension is persisted,
 bounded by the longest remaining lease. Without that the replay would meet
 their live leases as `StepInFlight` and spin until the leases expired.
 
-Ids must still be unique within the invocation, and the *order* the steps are
-requested in is not guaranteed under `Promise.all`; the engine logs an order
-warning rather than failing, but keep the array literal stable so replays
-line up.
+Ids must still be unique within the invocation — a repeat throws
+`DuplicateStepKeyError` even when the two calls are concurrent — and the
+*order* the steps are requested in is not guaranteed under `Promise.all`; the
+engine logs an order warning rather than failing, but keep the array literal
+stable so replays line up.
 
 ### Determinism rules
 
 - **Side effects only inside steps.** Everything outside `ctx.step.*` runs again on every replay. Reading `ctx.input`, `ctx.require(...)` and building prompts is fine; calling an API outside a step is not.
-- **Stable ids.** A step is keyed by `(stageRecordId, stepId)`. Ids must be the same string on every replay and unique within the stage. Derive ids from data (`item-${doc.id}`), never from `Math.random()` or the current time.
+- **Stable, unique ids.** A step is keyed by `(stageRecordId, stepId)`, not by ordinal position — which is what makes the ledger survive renaming and reordering the code around a step. Ids must be the same string on every replay. Derive ids from data (`item-${doc.id}`), never from `Math.random()` or the current time. Asking for the same key twice in one stage invocation throws `DuplicateStepKeyError` naming the key and the position and kind of both uses: without the guard the second call would never run and would silently return the first call's result. It is a programming error, so the stage fails terminally without consuming retry attempts, and `ctx.step.ai.map` rethrows it instead of turning it into a failed item verdict. Inside a loop, build the key from something unique to the iteration; if a loop can genuinely ask for the same key twice, de-duplicate before the loop rather than relying on the ledger to notice.
 - **Never swallow step errors.** A `try/catch` around `ctx.step.*` must rethrow, or check `isStepControlFlowError(error)` and rethrow those. If a catch swallows one anyway, the step API records the pending suspension and the stage factory discards the returned value and suspends, logging one warning.
 - **Results are JSON.** `run` results round-trip through JSON: Dates become strings, `undefined` fields disappear, Maps and Sets lose their runtime types. A result that cannot be serialized throws `StepResultNotSerializable`.
 - **Results are small.** A step result is stored in the ledger row (`workflow_steps.result`) and read back on every replay of the stage; it should be a small JSON value — an id, a handle, a count, a few fields. Large payloads (downloaded documents, extracted text, model output in bulk) go to the blob store or the stage's `artifacts`, and the step returns the key: `const key = await ctx.step.run("download", async () => { const text = await fetch(url); await ctx.storage.put(blobKey, text); return blobKey; })`. Storing 30 KB of source text per step makes every poll of the stage re-read it and bloats the ledger table.
 - **Order warnings.** Each step gets a sequence number when first created. A replay that reaches a known step at a different position logs a warning that the stage body is no longer deterministic; fix the body rather than the warning. `ctx.step.ai.map` consumes one sequence number per item on every replay, including items answered from the ledger, and assigns them in item order — so the item *list* must be the same on every replay: a stage that filters items through an outside-the-ledger cache before mapping them changes the step positions between replays and trips this warning for every step after the map.
 - **Job retries replay the ledger, and re-open what failed.** A stage body that throws after some steps completed is retried by the job queue (up to the transport's `maxAttempts`); the kernel records the failed attempt as `PENDING` with the error on `errorMessage` and emits `stage:retrying` (not `stage:failed`, which is reserved for the attempt that makes the row `FAILED`), keeps the stage's ledger rows, and the retry replays them — a map of N items followed by a throw costs no extra model calls on the retry. A **new job attempt** also re-opens every `run` step and every map item that ended `failed` (the row goes back to `running` with no lease, so the replay re-claims it), so a `${id}:submit` that got a 503 or an item whose repair budget ran out is executed again rather than replayed as a stored failure; completed steps are never re-run. The row's `attempt` is never reset: it counts every execution of that step across job attempts (a row that read `failed attempt 3` re-runs as attempt 4), so the ledger row is the per-step history — read it together with the `job_queue` row's `attempt` (deliveries) and the `stage:retrying` events (one per retried job attempt). A reopened `run` step gets one fresh execution per job attempt; its own `retries` budget was consumed before the stage failed. A **replay of the same attempt** (a poll of a suspended stage) answers failures from the ledger. Timed-out waits and signals are terminal either way. `WorkflowStage.attempt` counts every attempt of that stage's own record: `run.rerunFrom` reruns and job retries alike (0 on the first execution, 1 on the first retry; the `job_queue` row's `attempt` counts deliveries). A downstream stage created by `run.transition` starts at 0 whatever the stages before it retried; a completed retry clears `errorMessage`.
-- **Re-running a stage from scratch** (`run.rerunFrom`, or a stage whose attempts are exhausted and that is executed again) clears that stage's ledger rows so stale results do not replay.
+- **Re-running a stage from scratch** starts clean without destroying a live external effect. `run.rerunFrom` deletes the stage record itself, so its ledger rows go with it. Executing a stage whose attempts are exhausted keeps the record, and there the rows that name an external effect (every `run` row carrying an `externalKey`) are **re-opened** rather than deleted: the row goes back to `running` with no lease so the replay takes it over and executes the body again — exactly as a deleted row would have — but the row, its external key and its last result are still there and the body is told `isReclaim: true`, so a `${id}:submit` re-adopts the batch a provider is still processing instead of creating and billing a second one. Waits, signals and sleeps hold only timers, so they are cleared and re-derived. A stage that failed terminally while a batch was in flight used to lose the only record of that batch.
 
 ## `ctx.step.ai`
 

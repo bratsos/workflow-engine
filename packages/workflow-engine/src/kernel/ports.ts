@@ -113,7 +113,15 @@ export type StepRecordPatch = Partial<
 /** The `(status, attempt)` pair a compare-and-set write must observe. */
 export interface StepRecordExpectation {
   status: StepRecord["status"];
-  attempt: number;
+  /**
+   * Omit to match any attempt. A take-over pins the attempt so only one
+   * replay wins it; the write that records a step's *outcome* must not,
+   * because a step may legitimately bump its own attempt while it runs
+   * (an AI map item retrying its model call in-process). What that write
+   * needs is first-write-wins on the terminal outcome, which `status`
+   * alone expresses.
+   */
+  attempt?: number;
 }
 
 export interface StepLedger {
@@ -142,6 +150,19 @@ export interface StepLedger {
   ): Promise<{ applied: boolean; record: StepRecord | null }>;
   list(stageRecordId: string): Promise<StepRecord[]>;
   clear(stageRecordId: string): Promise<void>;
+  /**
+   * Delete every row of a stage record except the named steps.
+   *
+   * Optional so an existing implementation keeps compiling. Re-running a
+   * terminally failed stage needs it: the rows must go so nothing stale
+   * replays, but a row naming an external effect that may still be live —
+   * an AI map's batch submit, holding the handle and external key of a
+   * batch a provider is still processing and still billing — must survive,
+   * or the effect is orphaned with no record anywhere. A ledger that does
+   * not implement this falls back to `clear`, and the kernel logs the
+   * external keys it is about to drop so they remain findable.
+   */
+  clearExcept?(stageRecordId: string, keepStepIds: string[]): Promise<void>;
 }
 
 /** Services made available lazily to stage execution contexts. */

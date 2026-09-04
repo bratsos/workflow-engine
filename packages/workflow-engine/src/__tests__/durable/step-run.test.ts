@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { StepResultNotSerializable } from "../../core/steps.js";
+import {
+  DuplicateStepKeyError,
+  StepResultNotSerializable,
+} from "../../core/steps.js";
 import { createStepApi } from "../../kernel/helpers/step-api.js";
 import { FakeClock } from "../../kernel/testing/fake-clock.js";
 import { InMemoryStepLedger } from "../../testing/in-memory-step-ledger.js";
@@ -62,13 +65,28 @@ describe("StepApi.run", () => {
     expect((await ledger.get("stage-1", "work"))?.status).toBe("running");
   });
 
-  it("rejects duplicate step ids within one invocation", async () => {
+  it("rejects duplicate step keys within one invocation, naming both uses", async () => {
     const { api } = setup();
     const instance = api();
 
     await instance.run("work", async () => "done");
-    await expect(instance.run("work", async () => "again")).rejects.toThrow(
-      /Duplicate durable step id/,
+    await expect(
+      instance.run("work", async () => "again"),
+    ).rejects.toMatchObject({
+      name: "DuplicateStepKeyError",
+      stepId: "work",
+      first: { kind: "run", seq: 1 },
+      second: { kind: "run", seq: 2 },
+    });
+  });
+
+  it("names the duplicate across step kinds", async () => {
+    const { api } = setup();
+    const instance = api();
+
+    await instance.run("work", async () => "done");
+    await expect(instance.sleep("work", 1000)).rejects.toBeInstanceOf(
+      DuplicateStepKeyError,
     );
   });
 

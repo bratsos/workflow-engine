@@ -161,7 +161,11 @@ export class PrismaStepLedger implements StepLedger {
         stageRecordId,
         stepId,
         status: expected.status,
-        attempt: expected.attempt,
+        // Omitted, not `undefined`-as-any: an absent attempt means "any
+        // attempt", so the WHERE must not constrain the column at all.
+        ...(expected.attempt !== undefined
+          ? { attempt: expected.attempt }
+          : {}),
       },
       data: mapPatch(patch),
     });
@@ -179,6 +183,16 @@ export class PrismaStepLedger implements StepLedger {
 
   async clear(stageRecordId: string): Promise<void> {
     await this.prisma.workflowStep.deleteMany({ where: { stageRecordId } });
+  }
+
+  async clearExcept(
+    stageRecordId: string,
+    keepStepIds: string[],
+  ): Promise<void> {
+    if (keepStepIds.length === 0) return this.clear(stageRecordId);
+    await this.prisma.workflowStep.deleteMany({
+      where: { stageRecordId, stepId: { notIn: keepStepIds } },
+    });
   }
 }
 

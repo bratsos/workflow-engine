@@ -255,6 +255,71 @@ export class StepNotReplaySafeError extends Error {
   }
 }
 
+/** Cross-bundle brand for the duplicate-step-key programming error. */
+export const STEP_DUPLICATE_KEY: unique symbol = Symbol.for(
+  "@bratsos/workflow-engine/step-duplicate-key",
+) as typeof STEP_DUPLICATE_KEY;
+
+/** Where a step key was used, as the guard saw it. */
+export interface StepKeyUse {
+  readonly kind: "run" | "wait" | "signal" | "sleep";
+  /** Request position within the stage invocation, 1-based. */
+  readonly seq: number;
+}
+
+/**
+ * Thrown when one stage invocation asks for the same step key twice.
+ *
+ * Steps are keyed by name, not by ordinal position, which is what buys the
+ * refactoring tolerance an ordinal engine cannot offer: renaming or
+ * reordering surrounding code does not invalidate a run. The debt is that
+ * two steps sharing a key would silently answer each other's results — the
+ * second `run` would never execute and would return the first one's value
+ * with no error anywhere. The engine refuses rather than pay it.
+ *
+ * This is a programming error, not a runtime fault: it is deterministic, so
+ * the stage is failed without consuming retry attempts.
+ */
+export class DuplicateStepKeyError extends Error {
+  readonly [STEP_DUPLICATE_KEY] = true as const;
+  readonly stepId: string;
+  readonly first: StepKeyUse;
+  readonly second: StepKeyUse;
+
+  constructor(stepId: string, first: StepKeyUse, second: StepKeyUse) {
+    super(
+      `Duplicate durable step key "${stepId}" in one stage invocation: first requested ` +
+        `as a ${first.kind} step at position ${first.seq}, requested again as a ` +
+        `${second.kind} step at position ${second.seq}. Steps are keyed by name, so the ` +
+        `second call would silently return the first call's recorded result instead of ` +
+        `running. Give the two call sites different keys — inside a loop, build the key ` +
+        `from something unique to the iteration (\`${stepId}-\${item.id}\`) — or hoist the ` +
+        `repeated call out of the loop so it runs once.`,
+    );
+    this.name = "DuplicateStepKeyError";
+    this.stepId = stepId;
+    this.first = first;
+    this.second = second;
+  }
+}
+
+/**
+ * Detect a duplicate step key reliably across duplicated package bundles.
+ * Step machinery that turns a thrown body into a recorded failure (the AI
+ * map's per-item verdicts, most of all) must rethrow this instead: it names
+ * a bug in the stage definition, and burying it in an item's verdict is
+ * exactly the silence the guard exists to remove.
+ */
+export function isDuplicateStepKeyError(
+  error: unknown,
+): error is DuplicateStepKeyError {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    (error as { [STEP_DUPLICATE_KEY]?: unknown })[STEP_DUPLICATE_KEY] === true
+  );
+}
+
 /** Thrown when a stage uses durable steps without a configured ledger. */
 export class StepLedgerNotConfiguredError extends Error {
   constructor() {

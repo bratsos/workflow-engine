@@ -34,6 +34,7 @@ import {
   type StepStreamResult,
 } from "../../core/step-ai";
 import {
+  isDuplicateStepKeyError,
   isStepControlFlowError,
   parseStepDuration,
   type StepApi,
@@ -720,6 +721,10 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
           });
         } catch (error) {
           if (isStepControlFlowError(error)) throw error;
+          // A duplicate step key is a bug in the stage definition, not an
+          // item that failed: burying it in a verdict is exactly the
+          // silence the guard exists to remove.
+          if (isDuplicateStepKeyError(error)) throw error;
           if (error instanceof AiMapBudgetExceededError) throw error;
           // The item ended in a failed verdict (retries and repair
           // exhausted, or a throw outside the model-call loop). The row is
@@ -876,6 +881,10 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
       });
     } catch (error) {
       if (isStepControlFlowError(error)) throw error;
+      // A duplicate step key is a bug in the stage definition, not an
+      // item that failed: burying it in a verdict is exactly the
+      // silence the guard exists to remove.
+      if (isDuplicateStepKeyError(error)) throw error;
       if (error instanceof StepTimeoutError && onExpiry === "partial") {
         return allFailed(error.message, error.name);
       }
@@ -1073,6 +1082,10 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
         });
       } catch (error) {
         if (isStepControlFlowError(error)) throw error;
+        // A duplicate step key is a bug in the stage definition, not an
+        // item that failed: burying it in a verdict is exactly the
+        // silence the guard exists to remove.
+        if (isDuplicateStepKeyError(error)) throw error;
         if (error instanceof AiMapItemFailedSignal) {
           await deps.storeFailedVerdict(stepId, error.verdict);
           return error.verdict as AiMapResult<TOut>;

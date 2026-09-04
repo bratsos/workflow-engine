@@ -3,11 +3,13 @@ import { deriveStepExternalKey } from "../../core/step-external-key.js";
 import type {
   StepApi,
   StepControlFlowError,
+  StepKeyUse,
   StepRunContext,
   StepRunOptions,
   StepWaitOptions,
 } from "../../core/steps.js";
 import {
+  DuplicateStepKeyError,
   parseStepDuration,
   STEP_API_PENDING_CONTROL_FLOW,
   STEP_API_SETTLE_IN_FLIGHT,
@@ -38,6 +40,16 @@ export interface CreateStepApiOptions {
   stepLedger?: StepLedger;
   clock: Clock;
   onLog?: (level: "DEBUG" | "WARN", message: string) => void;
+  /**
+   * Records a ledger-integrity finding on the run itself, so it survives the
+   * log stream. Optional: a caller with no annotation sink still gets the
+   * WARN.
+   */
+  onAnnotate?: (
+    key: string,
+    value: string,
+    opts: { payload: Record<string, unknown>; idempotencyKey: string },
+  ) => void;
   /** Default lease for `run()` calls. Defaults to five minutes. */
   defaultLeaseMs?: number;
   /** Lazy accessor for the stage's AI helper, used by `step.ai.*`. */
@@ -68,6 +80,15 @@ function jsonRoundTrip(value: unknown, stepId: string): unknown {
   }
 }
 
+/**
+ * What a worker returns after parking on an outcome it did not write: the
+ * recorded one, exactly as a later replay would read it.
+ */
+function parkedResult<T>(record: StepRecord): T {
+  if (record.status === "failed") throw storedError(record);
+  return record.result as T;
+}
+
 function storedError(record: StepRecord): Error {
   const timeout = new StepTimeoutError(record.stepId);
   if (record.error === timeout.message) return timeout;
@@ -93,7 +114,14 @@ function nonNegativeInteger(value: number, name: string): number {
 /** Creates the StepApi attached to a single stage invocation. */
 export function createStepApi(options: CreateStepApiOptions): StepApi {
   let nextSeq = 0;
-  const requestedIds = new Set<string>();
+  /**
+   * Every step key this invocation has asked for, and where. Keeping the
+   * first use (not just the key) is what lets the duplicate error name both
+   * call sites: the stage body is a function we cannot inspect statically,
+   * so first use within one invocation is the only place the collision is
+   * visible.
+   */
+  const requestedIds = new Map<string, StepKeyUse>();
   let pendingControlFlow: StepControlFlowError | undefined;
   const defaultLeaseMs = positiveDuration(
     options.defaultLeaseMs ?? DEFAULT_LEASE_MS,
@@ -105,15 +133,13 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
     throw error;
   }
 
-  function begin(id: string): StepInvocation {
+  function begin(id: string, kind: StepRecord["kind"]): StepInvocation {
     if (!id) throw new Error("Durable step id must not be empty");
-    if (requestedIds.has(id)) {
-      throw new Error(
-        `Duplicate durable step id "${id}" requested in one stage invocation`,
-      );
-    }
-    requestedIds.add(id);
-    return { id, seq: ++nextSeq };
+    const seq = ++nextSeq;
+    const first = requestedIds.get(id);
+    if (first) throw new DuplicateStepKeyError(id, first, { kind, seq });
+    requestedIds.set(id, { kind, seq });
+    return { id, seq };
   }
 
   function requireLedger(): { stageRecordId: string; ledger: StepLedger } {
@@ -206,30 +232,110 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
     return outcome.record;
   }
 
-  async function complete(
+  /**
+   * Record a step's outcome under a first-write-wins constraint.
+   *
+   * An ordinal ledger gets drift detection for free — position is identity,
+   * so a second writer is a second position. A keyed ledger does not, and we
+   * now have two independent mechanisms that can decide a step is takeable
+   * (the lease, and the reclaim path), so a wrong liveness verdict can put
+   * two workers in the same body. The compare-and-set makes the *ledger*
+   * safe regardless: the write applies only while the row is still open, so
+   * whichever worker checkpoints first owns the outcome and the loser parks
+   * on what is recorded instead of overwriting it.
+   *
+   * `parked: true` therefore means "the body ran twice; the ledger kept the
+   * first answer". The run stays correct — only the recorded outcome is ever
+   * returned to a caller — but a duplicate external effect is possible, so
+   * it is reported rather than swallowed.
+   */
+  async function commitOutcome(
     stepId: string,
-    result?: unknown,
-  ): Promise<StepRecord> {
+    open: StepRecord["status"],
+    patch: Parameters<StepLedger["update"]>[2],
+  ): Promise<{ parked: boolean; record: StepRecord }> {
+    const { stageRecordId, ledger } = requireLedger();
+    let outcome: Awaited<ReturnType<StepLedger["compareAndSet"]>>;
     try {
-      return await update(stepId, {
-        status: "completed",
-        result,
-        error: null,
-        leaseExpiresAt: null,
-      });
+      outcome = await ledger.compareAndSet(
+        stageRecordId,
+        stepId,
+        { status: open },
+        patch,
+      );
     } catch (error) {
       throw new StepLedgerWriteError(stepId, error);
     }
+    if (outcome.applied && outcome.record) {
+      return { parked: false, record: outcome.record };
+    }
+    // The row is gone (a concurrent ledger reset) — nothing to park on.
+    if (!outcome.record) {
+      throw new StepLedgerWriteError(
+        stepId,
+        new Error(
+          `Durable step "${stepId}" disappeared from the ledger before its outcome was recorded`,
+        ),
+      );
+    }
+    reportDrift(stepId, open, outcome.record);
+    return { parked: true, record: outcome.record };
   }
 
-  async function timeout(stepId: string): Promise<never> {
+  function reportDrift(
+    stepId: string,
+    open: StepRecord["status"],
+    record: StepRecord,
+  ): void {
+    const message =
+      `durable step "${stepId}" was still ${open} for this worker but the ledger already ` +
+      `records it as ${record.status} at attempt ${record.attempt}: another execution of ` +
+      `the same step checkpointed first. Keeping the recorded outcome. The body ran more ` +
+      `than once, so an external effect may be duplicated — look for it under external ` +
+      `key "${record.externalKey ?? "(none recorded)"}".`;
+    options.onLog?.("WARN", message);
+    options.onAnnotate?.("step.outcome-conflict", record.status, {
+      payload: {
+        stepId,
+        kind: record.kind,
+        recordedStatus: record.status,
+        recordedAttempt: record.attempt,
+        externalKey: record.externalKey ?? null,
+      },
+      // Two workers reporting the same conflict describe one event.
+      idempotencyKey: `step-outcome-conflict:${options.stageRecordId}:${stepId}:${record.attempt}`,
+    });
+  }
+
+  async function complete(
+    stepId: string,
+    open: StepRecord["status"],
+    result?: unknown,
+  ): Promise<{ parked: boolean; record: StepRecord }> {
+    return commitOutcome(stepId, open, {
+      status: "completed",
+      result,
+      error: null,
+      leaseExpiresAt: null,
+    });
+  }
+
+  /**
+   * Fail a wait or signal step at its deadline — unless the thing it was
+   * waiting for landed first. A signal delivered, or another poller's ready
+   * verdict, is an outcome recorded out of band; the deadline write must
+   * lose to it rather than convert an answered step into a timed-out one.
+   * Returns the recorded outcome when it lost; otherwise it throws.
+   */
+  async function timeout(stepId: string): Promise<StepRecord> {
     const error = new StepTimeoutError(stepId);
-    await update(stepId, {
+    const outcome = await commitOutcome(stepId, "pending", {
       status: "failed",
       error: error.message,
       leaseExpiresAt: null,
     });
-    throw error;
+    if (!outcome.parked) throw error;
+    return outcome.record;
   }
 
   function boundedNextPoll(now: Date, delayMs: number, deadline: Date): Date {
@@ -287,7 +393,7 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
       fn: (step: StepRunContext) => Promise<T>,
       opts: StepRunOptions = {},
     ) {
-      const invocation = begin(id);
+      const invocation = begin(id, "run");
       const leaseMs = positiveDuration(
         opts.leaseMs ?? defaultLeaseMs,
         "leaseMs",
@@ -332,11 +438,16 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
           // rather than racing to the same decision again.
           const expiredAt = record.leaseExpiresAt ?? now;
           const error = new StepNotReplaySafeError(id, externalKey, expiredAt);
-          await update(id, {
+          // Under the same constraint as any other outcome write: the
+          // worker whose lease looked dead may have recorded its result
+          // between the read above and here, and refusing to replay must
+          // not overwrite an answer that exists.
+          const refused = await commitOutcome(id, "running", {
             status: "failed",
             error: error.message,
             leaseExpiresAt: null,
           });
+          if (refused.parked) return parkedResult<T>(refused.record);
           throw error;
         }
         record = await reclaim(id, record, leaseMs);
@@ -366,11 +477,14 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
         });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        await update(id, {
+        // Under the same constraint as the success write: a body that threw
+        // here must not bury an outcome another execution already recorded.
+        const failure = await commitOutcome(id, "running", {
           status: "failed",
           error: message,
           leaseExpiresAt: null,
         });
+        if (failure.parked) return parkedResult<T>(failure.record);
         if (record.attempt <= retries) {
           const retryAt = new Date(
             options.clock.now().getTime() + retryDelayMs,
@@ -390,12 +504,13 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
       }
 
       const encoded = jsonRoundTrip(value, id);
-      const completed = await complete(id, encoded);
-      return completed.result as T;
+      const completed = await complete(id, "running", encoded);
+      if (completed.parked) return parkedResult<T>(completed.record);
+      return completed.record.result as T;
     },
 
     async waitFor<T>(id: string, opts: StepWaitOptions<T>) {
-      const invocation = begin(id);
+      const invocation = begin(id, "wait");
       const existing = await get(invocation, "wait");
       if (existing?.status === "completed") return existing.result as T;
       if (existing?.status === "failed") throw storedError(existing);
@@ -428,7 +543,7 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
 
       const current = options.clock.now();
       if (current.getTime() >= record.deadlineAt.getTime()) {
-        await timeout(id);
+        return parkedResult<T>(await timeout(id));
       }
 
       let value: T;
@@ -450,7 +565,7 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
         });
         const afterPoll = options.clock.now();
         if (afterPoll.getTime() >= record.deadlineAt.getTime()) {
-          await timeout(id);
+          return parkedResult<T>(await timeout(id));
         }
         suspend(
           new StepSuspend({
@@ -469,13 +584,16 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
 
       if (opts.ready(value)) {
         const result = jsonRoundTrip(value, id);
-        const completed = await complete(id, result);
-        return completed.result as T;
+        // A wait row is open while `pending`: an out-of-band completion
+        // (a signal delivered, another poller ahead of this one) wins.
+        const completed = await complete(id, "pending", result);
+        if (completed.parked) return parkedResult<T>(completed.record);
+        return completed.record.result as T;
       }
 
       const afterPoll = options.clock.now();
       if (afterPoll.getTime() >= record.deadlineAt.getTime()) {
-        await timeout(id);
+        return parkedResult<T>(await timeout(id));
       }
       if (record.waitState?.pollFailures) {
         // The poll answered: a later failure starts a new streak.
@@ -502,7 +620,7 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
       id: string,
       opts: { timeout: number | string },
     ) {
-      const invocation = begin(id);
+      const invocation = begin(id, "signal");
       const existing = await get(invocation, "signal");
       if (existing?.status === "completed") return existing.result as T;
       if (existing?.status === "failed") throw storedError(existing);
@@ -531,7 +649,7 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
       }
       const current = options.clock.now();
       if (current.getTime() >= record.deadlineAt.getTime()) {
-        await timeout(id);
+        return parkedResult<T>(await timeout(id));
       }
       suspend(
         new StepSuspend({
@@ -549,7 +667,7 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
     },
 
     async sleep(id: string, duration: number | string): Promise<void> {
-      const invocation = begin(id);
+      const invocation = begin(id, "sleep");
       const existing = await get(invocation, "sleep");
       if (existing?.status === "completed") return;
       if (existing?.status === "failed") throw storedError(existing);
@@ -582,7 +700,7 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
       }
       const current = options.clock.now();
       if (current.getTime() >= storedWakeAt.getTime()) {
-        await complete(id, null);
+        await complete(id, "pending", null);
         return;
       }
 
@@ -647,15 +765,25 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
         await update(stepId, { attempt: (record?.attempt ?? 0) + 1 });
       },
       async storeFailedVerdict(stepId, verdict) {
-        await update(stepId, {
-          status: "failed",
-          error:
-            typeof (verdict as { error?: unknown })?.error === "string"
-              ? (verdict as { error: string }).error
-              : "map item failed",
-          result: verdict,
-          leaseExpiresAt: null,
-        });
+        // The item's `run` already recorded the row as `failed`; this write
+        // only attaches the verdict to it. Constrained to that state so a
+        // slow worker cannot drag a row a new job attempt has already
+        // re-opened back to `failed`.
+        const { stageRecordId, ledger } = requireLedger();
+        await ledger.compareAndSet(
+          stageRecordId,
+          stepId,
+          { status: "failed" },
+          {
+            status: "failed",
+            error:
+              typeof (verdict as { error?: unknown })?.error === "string"
+                ? (verdict as { error: string }).error
+                : "map item failed",
+            result: verdict,
+            leaseExpiresAt: null,
+          },
+        );
       },
       async loadFailedVerdict(stepId) {
         const { stageRecordId, ledger } = requireLedger();

@@ -40,17 +40,21 @@ function killWorkerOnSubmitCompletion(
   return {
     claim: (record) => inner.claim(record),
     get: (stageRecordId, id) => inner.get(stageRecordId, id),
-    update: (stageRecordId, id, patch) => {
+    update: (stageRecordId, id, patch) =>
+      inner.update(stageRecordId, id, patch),
+    // The step's outcome is recorded with a compare-and-set (first write
+    // wins), so that is the write the dying worker never returns from.
+    compareAndSet: (stageRecordId, id, expected, patch) => {
       if (id === stepId && patch.status === "completed" && !killed) {
         killed = true;
         return new Promise<never>(() => {});
       }
-      return inner.update(stageRecordId, id, patch);
+      return inner.compareAndSet(stageRecordId, id, expected, patch);
     },
-    compareAndSet: (stageRecordId, id, expected, patch) =>
-      inner.compareAndSet(stageRecordId, id, expected, patch),
     list: (stageRecordId) => inner.list(stageRecordId),
     clear: (stageRecordId) => inner.clear(stageRecordId),
+    clearExcept: (stageRecordId, keep) =>
+      inner.clearExcept?.(stageRecordId, keep) ?? inner.clear(stageRecordId),
   };
 }
 

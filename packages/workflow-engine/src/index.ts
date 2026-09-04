@@ -45,9 +45,12 @@ export {
 } from "./core/step-external-key";
 export {
   DURABLE_SUSPEND_MARKER,
+  DuplicateStepKeyError,
+  isDuplicateStepKeyError,
   isStepControlFlowError,
   type StepApi,
   StepInFlight,
+  type StepKeyUse,
   StepLedgerNotConfiguredError,
   StepLedgerWriteError,
   StepNotReplaySafeError,

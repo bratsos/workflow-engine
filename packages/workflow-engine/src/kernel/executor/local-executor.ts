@@ -8,6 +8,7 @@
  */
 
 import { ZodError } from "zod";
+import { isDuplicateStepKeyError } from "../../core/steps.js";
 import { buildStageExecutionContext } from "../helpers/build-stage-execution-context.js";
 import { toErrorMessage } from "../helpers/error-message.js";
 import type {
@@ -38,8 +39,14 @@ export function createLocalExecutor(): ActivityExecutor {
         const error = toErrorMessage(e);
         // Zod input/config validation errors are deterministic — retrying
         // the same rawInput will fail identically, so mark non-retryable
-        // rather than let hosts burn retry attempts on a doomed job.
-        const retryable = e instanceof ZodError ? false : undefined;
+        // rather than let hosts burn retry attempts on a doomed job. A
+        // duplicate durable step key is deterministic for the same reason:
+        // it is a collision between two call sites in the stage body, and
+        // no attempt will resolve it.
+        const retryable =
+          e instanceof ZodError || isDuplicateStepKeyError(e)
+            ? false
+            : undefined;
         return {
           error,
           errorName: e instanceof Error ? e.name : undefined,

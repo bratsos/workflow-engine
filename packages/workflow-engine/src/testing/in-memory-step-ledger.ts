@@ -121,7 +121,7 @@ export class InMemoryStepLedger implements StepLedger {
     if (!existing) return { applied: false, record: null };
     if (
       existing.status !== expected.status ||
-      existing.attempt !== expected.attempt
+      (expected.attempt !== undefined && existing.attempt !== expected.attempt)
     ) {
       return { applied: false, record: cloneRecord(existing) };
     }
@@ -141,6 +141,18 @@ export class InMemoryStepLedger implements StepLedger {
   async clear(stageRecordId: string): Promise<void> {
     for (const [key, record] of this.records) {
       if (record.stageRecordId === stageRecordId) this.records.delete(key);
+    }
+  }
+
+  async clearExcept(
+    stageRecordId: string,
+    keepStepIds: string[],
+  ): Promise<void> {
+    const keep = new Set(keepStepIds);
+    for (const [key, record] of this.records) {
+      if (record.stageRecordId !== stageRecordId) continue;
+      if (keep.has(record.stepId)) continue;
+      this.records.delete(key);
     }
   }
 

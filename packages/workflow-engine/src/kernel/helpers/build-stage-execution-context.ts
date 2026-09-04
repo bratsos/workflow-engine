@@ -179,6 +179,7 @@ export function buildStageExecutionContext(
       stepLedger: deps.stepLedger,
       clock: deps.clock,
       onLog: (level, message) => void logFn(level, message),
+      onAnnotate: (key, value, opts) => annotateFn(key, value, opts),
       ai: () => context.ai,
     }),
     onProgress: (update: ProgressUpdate) => {

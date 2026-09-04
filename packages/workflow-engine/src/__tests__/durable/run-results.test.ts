@@ -28,12 +28,14 @@ describe("durable run results", () => {
       get: (stageRecordId, stepId) => backing.get(stageRecordId, stepId),
       list: (stageRecordId) => backing.list(stageRecordId),
       clear: (stageRecordId) => backing.clear(stageRecordId),
-      compareAndSet: (stageRecordId, stepId, expected, patch) =>
-        backing.compareAndSet(stageRecordId, stepId, expected, patch),
-      update: async (stageRecordId, stepId, patch) => {
+      // The outcome write is a compare-and-set, not a blind update: that is
+      // where a ledger failure has to be caught.
+      compareAndSet: async (stageRecordId, stepId, expected, patch) => {
         if (patch.status === "completed") throw new Error("write failed");
-        return backing.update(stageRecordId, stepId, patch);
+        return backing.compareAndSet(stageRecordId, stepId, expected, patch);
       },
+      update: (stageRecordId, stepId, patch) =>
+        backing.update(stageRecordId, stepId, patch),
     };
     let calls = 0;
     const api = createStepApi({
