@@ -41,6 +41,7 @@ import type {
   RunCreateResult,
   RunListVersionsResult,
   RunReapStuckResult,
+  RunRedriveResult,
   RunRerunFromResult,
   RunTransitionResult,
   StagePollSuspendedResult,
@@ -58,6 +59,7 @@ import { handleRunClaimPending } from "./handlers/run-claim-pending";
 import { handleRunCreate } from "./handlers/run-create";
 import { handleRunListVersions } from "./handlers/run-list-versions";
 import { handleRunReapStuck } from "./handlers/run-reap-stuck";
+import { handleRunRedrive } from "./handlers/run-redrive";
 import { handleRunRerunFrom } from "./handlers/run-rerun-from";
 import { handleRunTransition } from "./handlers/run-transition";
 import { handleStagePollSuspended } from "./handlers/stage-poll-suspended";
@@ -240,6 +242,7 @@ function getIdempotencyKey(command: KernelCommand): string | undefined {
   if (command.type === "run.create") return command.idempotencyKey;
   if (command.type === "job.execute") return command.idempotencyKey;
   if (command.type === "run.rerunFrom") return command.idempotencyKey;
+  if (command.type === "run.redrive") return command.idempotencyKey;
   return undefined;
 }
 
@@ -250,6 +253,7 @@ type AnyCommandResult =
   | RunTransitionResult
   | RunCancelResult
   | RunRerunFromResult
+  | RunRedriveResult
   | RunListVersionsResult
   | JobExecuteResult
   | StagePollSuspendedResult
@@ -410,6 +414,9 @@ export function createKernel(config: KernelConfig): Kernel {
             break;
           case "run.rerunFrom":
             result = await handleRunRerunFrom(command, txDeps);
+            break;
+          case "run.redrive":
+            result = await handleRunRedrive(command, txDeps);
             break;
           case "run.listVersions":
             result = await handleRunListVersions(command, txDeps);

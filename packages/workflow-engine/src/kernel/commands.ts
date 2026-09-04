@@ -129,7 +129,16 @@ export interface RunCancelResult {
 // run.rerunFrom
 // ---------------------------------------------------------------------------
 
-/** Reruns a workflow from a specific stage, deleting stages at/after that point. */
+/**
+ * Reruns a workflow from a specific stage, replacing the stage records at
+ * and after that point.
+ *
+ * @deprecated Use `run.redrive`, which covers this (`from: { kind: "stage" }`)
+ * plus retry-from-the-last-failure and restart-from-the-beginning, and can
+ * move the run onto a different definition version. `run.rerunFrom` is
+ * kept working and now shares `run.redrive`'s behaviour, including
+ * preserving the superseded attempt.
+ */
 export interface RunRerunFromCommand {
   readonly type: "run.rerunFrom";
   readonly workflowRunId: string;
@@ -316,6 +325,65 @@ export interface RunReapStuckResult {
 }
 
 // ---------------------------------------------------------------------------
+// run.redrive
+// ---------------------------------------------------------------------------
+
+/** Where a `run.redrive` resumes from. */
+export type RunRedriveFrom =
+  /**
+   * Conductor's `retry`: resume at the earliest stage that is not
+   * COMPLETED — in practice the stage that failed — leaving completed
+   * stages untouched.
+   */
+  | { readonly kind: "lastFailure" }
+  /** Conductor's `restart`: re-run the whole pipeline from the first group. */
+  | { readonly kind: "start" }
+  /** Conductor's `rerun`: resume at a chosen stage. */
+  | { readonly kind: "stage"; readonly stageId: string };
+
+/**
+ * Re-drives a terminal run. Unlike the `run.rerunFrom` it replaces, the
+ * superseded attempt is preserved: every stage record it removes is first
+ * archived as a stage-scoped annotation carrying its status, error,
+ * timings and output, so the failed attempt survives the retry.
+ *
+ * Step Functions' model: the same run id, an incremented `redriveCount`,
+ * no branching into a new execution.
+ */
+export interface RunRedriveCommand {
+  readonly type: "run.redrive";
+  readonly workflowRunId: string;
+  /** Defaults to `{ kind: "lastFailure" }`. */
+  readonly from?: RunRedriveFrom;
+  /**
+   * Move the run onto a different definition version — DBOS's fork-onto-a-
+   * new-application-version, which is the answer to "we shipped a bug,
+   * patch it and re-run".
+   *
+   * - omitted: keep the run's pinned version (the default).
+   * - `"latest"`: re-pin to the version this process currently serves.
+   * - an explicit version string: re-pin to that version, which must
+   *   already be registered for this workflow.
+   */
+  readonly definitionVersion?: string | "latest";
+  /** Optional idempotency key — a replayed call returns the cached result. */
+  readonly idempotencyKey?: string;
+}
+
+/** Result of a `run.redrive` command. */
+export interface RunRedriveResult {
+  readonly workflowRunId: string;
+  /** The stage the run resumed from. */
+  readonly fromStageId: string;
+  /** Stage ids whose records were superseded and archived. */
+  readonly supersededStages: string[];
+  /** The run's `redriveCount` after this command. */
+  readonly redriveCount: number;
+  /** The definition version the run is pinned to after this command. */
+  readonly definitionVersion: string | null;
+}
+
+// ---------------------------------------------------------------------------
 // run.listVersions
 // ---------------------------------------------------------------------------
 
@@ -383,6 +451,7 @@ export type KernelCommand =
   | RunTransitionCommand
   | RunCancelCommand
   | RunRerunFromCommand
+  | RunRedriveCommand
   | RunListVersionsCommand
   | JobExecuteCommand
   | StagePollSuspendedCommand
@@ -406,20 +475,22 @@ export type CommandResult<T extends KernelCommand> = T extends RunCreateCommand
         ? RunCancelResult
         : T extends RunRerunFromCommand
           ? RunRerunFromResult
-          : T extends RunListVersionsCommand
-            ? RunListVersionsResult
-            : T extends JobExecuteCommand
-              ? JobExecuteResult
-              : T extends StagePollSuspendedCommand
-                ? StagePollSuspendedResult
-                : T extends StepSignalCommand
-                  ? StepSignalResult
-                  : T extends LeaseReapStaleCommand
-                    ? LeaseReapStaleResult
-                    : T extends OutboxFlushCommand
-                      ? OutboxFlushResult
-                      : T extends PluginReplayDLQCommand
-                        ? PluginReplayDLQResult
-                        : T extends RunReapStuckCommand
-                          ? RunReapStuckResult
-                          : never;
+          : T extends RunRedriveCommand
+            ? RunRedriveResult
+            : T extends RunListVersionsCommand
+              ? RunListVersionsResult
+              : T extends JobExecuteCommand
+                ? JobExecuteResult
+                : T extends StagePollSuspendedCommand
+                  ? StagePollSuspendedResult
+                  : T extends StepSignalCommand
+                    ? StepSignalResult
+                    : T extends LeaseReapStaleCommand
+                      ? LeaseReapStaleResult
+                      : T extends OutboxFlushCommand
+                        ? OutboxFlushResult
+                        : T extends PluginReplayDLQCommand
+                          ? PluginReplayDLQResult
+                          : T extends RunReapStuckCommand
+                            ? RunReapStuckResult
+                            : never;

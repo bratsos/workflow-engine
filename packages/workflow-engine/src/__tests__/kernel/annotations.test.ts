@@ -1002,7 +1002,12 @@ describe("annotations: attempt auto-increment on rerun", () => {
       config: {},
     });
 
-    const all = await kernel.annotations.list(runId);
+    // Exclude the engine's own superseded-attempt archive (written by
+    // run.redrive, which run.rerunFrom delegates to) so this asserts only
+    // the stage's own annotations.
+    const all = (await kernel.annotations.list(runId)).filter(
+      (a) => a.key !== "run.supersededAttempt",
+    );
     // First attempt annotation preserved with attempt=0; second
     // attempt's annotation carries attempt=1.
     const firstAttempt = all.filter((a) => a.attempt === 0);
@@ -1129,7 +1134,9 @@ describe("annotations: attempt is per stage row, not per rerun span", () => {
     const stage1Record = await persistence.getStage(runId, "stage1");
     expect(stage1Record?.attempt).toBe(1);
 
-    const all = await kernel.annotations.list(runId);
+    const all = (await kernel.annotations.list(runId)).filter(
+      (a) => a.key !== "run.supersededAttempt",
+    );
     const stage1Annotations = all.filter((a) => a.scopeId === "stage1");
     expect(stage1Annotations.map((a) => a.attempt).sort()).toEqual([0, 1]);
     const stage2Annotations = all.filter((a) => a.scopeId === "stage2");

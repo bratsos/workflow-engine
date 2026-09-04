@@ -30,6 +30,9 @@ export type {
   RunListVersionsResult,
   RunReapStuckCommand,
   RunReapStuckResult,
+  RunRedriveCommand,
+  RunRedriveFrom,
+  RunRedriveResult,
   RunRerunFromCommand,
   RunRerunFromResult,
   RunTransitionCommand,
@@ -72,6 +75,7 @@ export {
   type RoutingExecutorOptions,
 } from "./executor/routing-executor.js";
 // Definition pinning helpers, for hosts that resolve definitions themselves.
+export { SUPERSEDED_ATTEMPT_KEY } from "./handlers/run-redrive.js";
 export {
   assertServesRun,
   recordDefinitionVersion,

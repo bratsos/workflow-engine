@@ -170,6 +170,8 @@ await kernel.dispatch({
 
 `definitionVersion` accepts `"latest"` (re-pin to what this process serves)
 or an explicit version that has already been registered for the workflow.
+See [Retry, restart and rerun](./redriving-runs.md) for the full
+`run.redrive` contract.
 
 ## Migrating an existing database
 
