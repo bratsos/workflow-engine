@@ -28,6 +28,7 @@ export default defineConfig({
       "packages/workflow-engine-host-node",
       "packages/workflow-engine-host-remote",
       "packages/workflow-engine-host-serverless",
+      "packages/workflow-engine-console",
     ],
   },
 });
