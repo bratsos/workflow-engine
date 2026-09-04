@@ -1,6 +1,6 @@
 {
   "name": "@bratsos/workflow-engine-console",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Optional, embeddable operational console for @bratsos/workflow-engine: a fetch handler plus a prebuilt UI you mount in your own app",
   "type": "module",
   "license": "MIT",
