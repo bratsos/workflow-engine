@@ -319,8 +319,32 @@ async function runWithConcurrency<T>(
   return results;
 }
 
-/** Choose the error to surface: control flow first (earliest wake-up wins). */
+/**
+ * Choose the error to surface when several items of one map reject.
+ *
+ * A duplicate step key wins over everything. It is a bug in the stage
+ * definition, and unlike a suspension it cannot resolve itself: preferring
+ * the control-flow signal suspends the stage, the poll replays it, and the
+ * same duplicate key is raised again — a correct report, one replay late,
+ * after a poll cycle has been spent on a stage that could never finish.
+ *
+ * Raising it now loses no suspension. A control-flow error is thrown after
+ * its step's ledger row exists — `StepInFlight` after a claim found a live
+ * lease, `StepSuspend` after the row recorded its handle and deadline — so
+ * the row and everything it holds survive the stage failing. Once the key
+ * is fixed, the replay meets those rows exactly as a resumed poll would
+ * have, and answers them from the ledger.
+ *
+ * Otherwise control flow first, earliest wake-up wins: one item still
+ * waiting must suspend the stage rather than let a stray item failure
+ * decide the map's outcome.
+ */
 function pickError(reasons: unknown[]): unknown {
+  const duplicateKey = reasons.find((reason) =>
+    isDuplicateStepKeyError(reason),
+  );
+  if (duplicateKey) return duplicateKey;
+
   let chosen: StepControlFlowError | undefined;
   for (const reason of reasons) {
     if (!isStepControlFlowError(reason)) continue;

@@ -19,7 +19,11 @@ import { isDuplicateStepKeyError } from "../../core/steps.js";
 import { WorkflowBuilder } from "../../core/workflow.js";
 import { InMemoryStepLedger } from "../../testing/in-memory-step-ledger.js";
 import { createMockAIHelperFactory, createTestKernel } from "../utils/index.js";
-import { createAiMapHarness, REALTIME_MODEL } from "./ai-map-harness.js";
+import {
+  crashOnClaim,
+  createAiMapHarness,
+  REALTIME_MODEL,
+} from "./ai-map-harness.js";
 
 const inputSchema = z.object({ count: z.number() });
 const outputSchema = z.object({ done: z.number() });
@@ -131,6 +135,95 @@ describe("duplicate durable step keys", () => {
       status: "completed",
       result: 1,
     });
+  });
+
+  it("outranks a suspension raised by another item of the same map", async () => {
+    const mock = createMockAIHelperFactory();
+    mock.setObjectResponse("<<0>>", { object: { value: "v0" } });
+    mock.setObjectResponse("<<1>>", { object: { value: "v1" } });
+    const stage = defineStage({
+      id: "map-key-collision-race",
+      name: "map-key-collision-race",
+      schemas: {
+        input: inputSchema,
+        output: outputSchema,
+        config: z.object({}),
+      },
+      async execute(ctx) {
+        await ctx.step.run("extract:0", async () => "taken");
+        const items = Array.from({ length: ctx.input.count }, (_, i) => i);
+        const results = await ctx.step.ai.map("extract", items, {
+          model: REALTIME_MODEL,
+          policy: "realtime",
+          schema: itemSchema,
+          prompt: (item) => `Extract <<${item}>>`,
+          // Both items must be in flight together, or the first
+          // rejection stops the second from ever running.
+          realtime: { concurrency: 2 },
+        });
+        return { output: { done: results.length } };
+      },
+    });
+    // Item 0 collides with the key taken above; item 1 meets a live lease
+    // from a worker that died, which is a suspension. Both reject.
+    const h = await createAiMapHarness({
+      stage,
+      inputSchema,
+      outputSchema,
+      input: { count: 2 },
+      mock,
+      wrapLedger: (ledger, now) => crashOnClaim(ledger, "extract:1", now),
+    });
+
+    const result = await h.execute();
+
+    // The suspension would have been correct and useless: the next poll
+    // replays the stage and meets the same duplicate key.
+    expect(result).toMatchObject({ outcome: "failed" });
+    const record = await h.stage();
+    expect(record?.status).toBe("FAILED");
+    expect(record?.errorMessage).toContain("Duplicate durable step key");
+    expect(record?.errorMessage).toContain("extract:0");
+  });
+
+  it("still suspends when the only rejections are control flow", async () => {
+    const mock = createMockAIHelperFactory();
+    mock.setObjectResponse("<<0>>", { object: { value: "v0" } });
+    mock.setObjectResponse("<<1>>", { object: { value: "v1" } });
+    const stage = defineStage({
+      id: "map-inflight-only",
+      name: "map-inflight-only",
+      schemas: {
+        input: inputSchema,
+        output: outputSchema,
+        config: z.object({}),
+      },
+      async execute(ctx) {
+        const items = Array.from({ length: ctx.input.count }, (_, i) => i);
+        const results = await ctx.step.ai.map("extract", items, {
+          model: REALTIME_MODEL,
+          policy: "realtime",
+          schema: itemSchema,
+          prompt: (item) => `Extract <<${item}>>`,
+          realtime: { concurrency: 2 },
+        });
+        return { output: { done: results.length } };
+      },
+    });
+    const h = await createAiMapHarness({
+      stage,
+      inputSchema,
+      outputSchema,
+      input: { count: 2 },
+      mock,
+      wrapLedger: (ledger, now) => crashOnClaim(ledger, "extract:1", now),
+    });
+
+    // Nothing collides, so the in-flight item still decides the outcome and
+    // the stage waits rather than failing.
+    expect(await h.execute()).toMatchObject({ outcome: "suspended" });
+    await h.tick(5_000);
+    expect((await h.stage())?.status).toBe("COMPLETED");
   });
 
   it("brands the error so a catch boundary can recognise it across bundles", () => {
