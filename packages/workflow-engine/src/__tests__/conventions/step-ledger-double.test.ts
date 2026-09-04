@@ -101,7 +101,22 @@ describe("StepLedger test doubles", () => {
       // A `clear:` property in a test is the tell of a hand-forwarded
       // ledger literal — the shape that drops whatever the port gains
       // next. Nothing else in the suite has a reason to write one.
-      if (/^\s*clear:/m.test(source)) {
+      //
+      // Unless the literal is annotated `Required<StepLedger>`, which is
+      // the one shape that cannot drop a method: the compiler rejects it
+      // for the same omission this rule is looking for. A test of the
+      // forwarding itself needs such a literal — it has to record which
+      // method was called, so there is nothing to forward it to.
+      const lines = source.split("\n");
+      const offenders = lines.filter((line, index) => {
+        if (!/^\s*clear:/.test(line)) return false;
+        for (let i = index; i >= 0; i--) {
+          if (!/[={]\s*$|=\s*\{/.test(lines[i] ?? "")) continue;
+          return !/Required<StepLedger>/.test(lines[i] ?? "");
+        }
+        return true;
+      });
+      if (offenders.length > 0) {
         literals.push(file.slice(TESTS_DIR.length + 1));
       }
     }
