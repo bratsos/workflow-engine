@@ -16,6 +16,7 @@
 
 import { randomUUID } from "crypto";
 import {
+  type DequeueOptions,
   type DequeueResult,
   type EnqueueJobInput,
   type JobAckFence,
@@ -25,6 +26,7 @@ import {
   type JobRecord,
   LEASE_ABSOLUTE_CAP,
   LEASE_HEARTBEAT_LOST,
+  type ServedDefinition,
   type Status,
 } from "../persistence/interface.js";
 
@@ -200,6 +202,11 @@ export class InMemoryJobQueue implements JobQueue {
         ...(options.groupKey !== undefined
           ? { _groupKey: options.groupKey }
           : {}),
+        // Only when the run is pinned, matching the Prisma adapter: an
+        // unpinned job's payload is unchanged from every earlier release.
+        ...(options.definitionVersion != null
+          ? { _definitionVersion: options.definitionVersion }
+          : {}),
       },
     };
 
@@ -242,9 +249,26 @@ export class InMemoryJobQueue implements JobQueue {
     return removed;
   }
 
-  async dequeue(): Promise<DequeueResult | null> {
+  async dequeue(options?: DequeueOptions): Promise<DequeueResult | null> {
     // Find the highest priority PENDING job
     const now = this.now();
+    const serves = options?.serves;
+    // The same predicate the Prisma dequeue expresses in SQL: a pinned job
+    // needs an exact (workflowId, version) match; an unpinned one needs
+    // only the workflow; a row that names no workflow is malformed and is
+    // left claimable so the dead-job path can fail it. This fake keeps
+    // `workflowId` as a column where the Prisma row keeps it on the
+    // payload, so it reads the column and only the version from the body.
+    const canServe = (job: JobRecord): boolean => {
+      if (serves === undefined) return true;
+      if (!job.workflowId) return true;
+      const version = job.payload._definitionVersion;
+      return serves.some(
+        (s: ServedDefinition) =>
+          s.workflowId === job.workflowId &&
+          (typeof version !== "string" || s.version === version),
+      );
+    };
     const comparator = (a: JobRecord, b: JobRecord) => {
       // Higher priority first
       if (b.priority !== a.priority) {
@@ -265,7 +289,8 @@ export class InMemoryJobQueue implements JobQueue {
       .filter(
         (j) =>
           j.status === "PENDING" &&
-          (j.nextPollAt === null || j.nextPollAt <= now),
+          (j.nextPollAt === null || j.nextPollAt <= now) &&
+          canServe(j),
       )
       .sort(comparator);
 
@@ -307,7 +332,7 @@ export class InMemoryJobQueue implements JobQueue {
     };
     this.jobs.set(job.id, updated);
 
-    const { _groupKey, ...payload } = job.payload;
+    const { _groupKey, _definitionVersion, ...payload } = job.payload;
     return {
       jobId: job.id,
       workflowRunId: job.workflowRunId,
@@ -378,6 +403,45 @@ export class InMemoryJobQueue implements JobQueue {
       nextPollAt,
       workerId: null,
       lockedAt: null,
+      updatedAt: this.now(),
+    };
+    this.jobs.set(jobId, updated);
+    return "acknowledged";
+  }
+
+  /**
+   * Return a claimed job to PENDING with a later `nextPollAt` without
+   * counting the claim as an attempt. See `JobQueue.defer`.
+   */
+  async defer(
+    jobId: string,
+    nextPollAt: Date,
+    reason: string,
+    fence?: JobAckFence,
+  ): Promise<JobAckOutcome> {
+    const job = this.jobs.get(jobId);
+    if (!job) {
+      throw new Error(`Job not found: ${jobId}`);
+    }
+
+    if (
+      fence &&
+      (job.status !== "RUNNING" ||
+        job.attempt !== fence.attempt ||
+        job.startedAt?.getTime() !== fence.startedAt.getTime())
+    ) {
+      return "superseded";
+    }
+
+    const updated: JobRecord = {
+      ...job,
+      status: "PENDING",
+      nextPollAt,
+      workerId: null,
+      lockedAt: null,
+      lastError: reason,
+      // The dequeue incremented this; declining the work gives it back.
+      attempt: Math.max(0, job.attempt - 1),
       updatedAt: this.now(),
     };
     this.jobs.set(jobId, updated);
@@ -499,7 +563,7 @@ export class InMemoryJobQueue implements JobQueue {
     return Array.from(this.jobs.values())
       .filter((j) => j.workflowRunId === workflowRunId)
       .map((j) => {
-        const { _groupKey, ...payload } = j.payload;
+        const { _groupKey, _definitionVersion, ...payload } = j.payload;
         return { ...j, payload };
       });
   }

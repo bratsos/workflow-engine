@@ -2269,6 +2269,80 @@ export function jobQueueConformanceSuite(
         expect(jobId.length).toBeGreaterThan(0);
       });
 
+      it("dequeues only jobs whose definition version the caller serves", async () => {
+        // Given: three queued jobs — one pinned to a version this caller
+        // presents, one pinned to a version it does not, and one unpinned
+        await queue.enqueueParallel([
+          createJobInput({
+            workflowRunId: "serves-run",
+            workflowId: "wf-served",
+            stageId: "served",
+            definitionVersion: "v-1",
+          }),
+          createJobInput({
+            workflowRunId: "serves-run",
+            workflowId: "wf-served",
+            stageId: "foreign",
+            definitionVersion: "v-2",
+          }),
+          createJobInput({
+            workflowRunId: "serves-run",
+            workflowId: "wf-served",
+            stageId: "unpinned",
+          }),
+        ]);
+
+        // When: dequeuing as a host that presents only v-1
+        const serves = [{ workflowId: "wf-served", version: "v-1" }];
+        const claimed: string[] = [];
+        for (let i = 0; i < 3; i++) {
+          const job = await queue.dequeue({ serves });
+          if (!job) break;
+          claimed.push(job.stageId);
+        }
+
+        // Then: the foreign version is left for the host that presents it,
+        // and the unpinned job is claimable because the workflow matches
+        expect(claimed.sort()).toEqual(["served", "unpinned"]);
+
+        // And: the internal marker never reaches the stage payload
+        const rows = await queue.getJobsByWorkflowRun("serves-run");
+        for (const row of rows) {
+          expect(row.payload).not.toHaveProperty("_definitionVersion");
+        }
+      });
+
+      it("claims nothing for a caller that serves no workflow", async () => {
+        await queue.enqueueParallel([
+          createJobInput({ stageId: "any", definitionVersion: "v-1" }),
+        ]);
+        expect(await queue.dequeue({ serves: [] })).toBeNull();
+        expect(await queue.dequeue()).not.toBeNull();
+      });
+
+      it("defers a claimed job without spending its attempt", async () => {
+        if (!queue.defer) return;
+        await queue.enqueueParallel([
+          createJobInput({ workflowRunId: "defer-run", stageId: "defer" }),
+        ]);
+        const job = await queue.dequeue();
+        expect(job?.attempt).toBe(1);
+
+        const until = new Date(Date.now() + 30_000);
+        const outcome = await queue.defer(job!.jobId, until, "not my version", {
+          attempt: job!.attempt,
+          startedAt: job!.startedAt,
+        });
+        expect(outcome).toBe("acknowledged");
+
+        const [row] = await queue.getJobsByWorkflowRun("defer-run");
+        expect(row?.status).toBe("PENDING");
+        // The attempt the dequeue counted is handed back, so a host that
+        // keeps declining the job never exhausts its retry budget.
+        expect(row?.attempt).toBe(0);
+        expect(row?.nextPollAt?.getTime()).toBe(until.getTime());
+      });
+
       it("should enqueue multiple jobs in parallel", async () => {
         // Given: Multiple job inputs
         const inputs = [

@@ -92,6 +92,9 @@ const host = createNodeHost({
   maxClaimsPerTick: 10,               // Max pending runs to claim per tick
   maxSuspendedChecksPerTick: 10,      // Max suspended stages to poll per tick
   maxOutboxFlushPerTick: 100,         // Max outbox events to flush per tick
+  // serves: "all",                   // 1.0: turn definition-version filtering off.
+                                      // Omitted, the kernel derives it from the
+                                      // registry (claim, poll and dequeue alike).
 });
 
 // Start polling loops and register SIGTERM/SIGINT handlers
@@ -181,6 +184,7 @@ const host = createServerlessHost({
   maxClaimsPerTick: 10,
   maxSuspendedChecksPerTick: 10,
   maxOutboxFlushPerTick: 100,
+  // serves: "all",                   // 1.0: turn definition-version filtering off
 });
 ```
 

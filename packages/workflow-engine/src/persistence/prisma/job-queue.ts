@@ -9,6 +9,7 @@
 
 import { createLogger } from "../../utils/logger";
 import {
+  type DequeueOptions,
   type DequeueResult,
   type EnqueueJobInput,
   type JobAckFence,
@@ -18,6 +19,7 @@ import {
   type JobRecord,
   LEASE_ABSOLUTE_CAP,
   LEASE_HEARTBEAT_LOST,
+  type ServedDefinition,
 } from "../interface";
 import { createEnumHelper, type PrismaEnumHelper } from "./enum-compat";
 import type { DatabaseType } from "./persistence";
@@ -30,6 +32,14 @@ const logger = createLogger("JobQueue");
  * degrades to "try again later" instead of unbounded recursion.
  */
 const MAX_DEQUEUE_ATTEMPTS = 10;
+
+/**
+ * How many ready rows the SQLite dequeue reads when `serves` filtering is
+ * on. SQLite cannot filter on a JSON path through Prisma, so the filter is
+ * applied in JS over a bounded window in the same priority order the
+ * statement would have used.
+ */
+const SQLITE_SERVES_SCAN_LIMIT = 100;
 
 // Structural client type -- see prisma-client-type.ts.
 type PrismaClient = EnginePrismaClient;
@@ -115,6 +125,13 @@ export class PrismaJobQueue implements JobQueue {
   private readonly fairnessPath: string[] | null;
   private readonly fairnessLimit: number;
 
+  /**
+   * The dotted `groupBy` path this queue's fairness cap reads, or `null` when
+   * fairness is off. Read by `createSpillingJobTransport` so a spilled payload
+   * still carries its group key.
+   */
+  readonly fairnessGroupBy: string | null;
+
   private readonly now: () => Date;
 
   constructor(prisma: PrismaClient, options: PrismaJobQueueOptions = {}) {
@@ -124,14 +141,10 @@ export class PrismaJobQueue implements JobQueue {
     this.enums = createEnumHelper(prisma);
     this.databaseType = options.databaseType ?? "postgresql";
     this.now = options.now ?? (() => new Date());
+    this.fairnessGroupBy = options.fairness
+      ? (options.fairness.groupBy ?? "_groupKey")
+      : null;
     this.fairnessPath = options.fairness
-  /**
-   * The dotted `groupBy` path this queue's fairness cap reads, or `null` when
-   * fairness is off. Read by `createSpillingJobTransport` so a spilled payload
-   * still carries its group key.
-   */
-  readonly fairnessGroupBy: string | null;
-
       ? splitGroupPath(options.fairness.groupBy ?? "_groupKey")
       : null;
     this.fairnessLimit = options.fairness
@@ -141,9 +154,6 @@ export class PrismaJobQueue implements JobQueue {
       throw new Error(
         "JobQueueFairness is only implemented on the PostgreSQL dequeue path",
       );
-    this.fairnessGroupBy = options.fairness
-      ? (options.fairness.groupBy ?? "_groupKey")
-      : null;
     }
   }
 
@@ -157,6 +167,11 @@ export class PrismaJobQueue implements JobQueue {
         ...job.payload,
         _workflowId: job.workflowId,
         ...(job.groupKey !== undefined ? { _groupKey: job.groupKey } : {}),
+        // Only when the run is pinned: an unpinned job's payload is then
+        // byte-identical to what every earlier release wrote.
+        ...(job.definitionVersion != null
+          ? { _definitionVersion: job.definitionVersion }
+          : {}),
       } as unknown,
       status: this.enums.status("PENDING"),
       nextPollAt: job.scheduledFor ?? null,
@@ -270,26 +285,84 @@ export class PrismaJobQueue implements JobQueue {
    * Atomically dequeue the next available job
    * Uses FOR UPDATE SKIP LOCKED (PostgreSQL) or optimistic locking (SQLite)
    */
-  async dequeue(): Promise<DequeueResult | null> {
+  async dequeue(options?: DequeueOptions): Promise<DequeueResult | null> {
     if (this.databaseType === "sqlite") {
-      return this.dequeueSqlite();
+      return this.dequeueSqlite(0, options?.serves);
     }
-    return this.dequeuePostgres();
+    return this.dequeuePostgres(options?.serves);
+  }
+
+  /**
+   * The `serves` predicate, as the three values the dequeue statements
+   * bind. Kept as parameters rather than interpolated text so a workflow
+   * id or version can never reach the statement as SQL.
+   *
+   * `active` false (no `serves` given) makes the whole predicate a
+   * constant true, so the statement below is one shape whether or not
+   * version filtering is on.
+   */
+  private servesParams(serves?: readonly ServedDefinition[]): {
+    active: boolean;
+    workflowIds: string[];
+    versions: string[];
+  } {
+    if (serves === undefined) {
+      return { active: false, workflowIds: [], versions: [] };
+    }
+    return {
+      active: true,
+      workflowIds: serves.map((s) => s.workflowId),
+      versions: serves.map((s) => s.version),
+    };
+  }
+
+  /**
+   * True when this caller may claim `payload`. The JS twin of the SQL
+   * predicate below, used by the SQLite path and by the in-memory queue's
+   * conformance expectations.
+   */
+  private servesPayload(
+    payload: unknown,
+    serves?: readonly ServedDefinition[],
+  ): boolean {
+    if (serves === undefined) return true;
+    if (typeof payload !== "object" || payload === null) return true;
+    const row = payload as Record<string, unknown>;
+    const workflowId = row._workflowId;
+    // A row with no `_workflowId` is malformed (hand-inserted, or migrated
+    // from a schema that predates the field). Leave it claimable so the
+    // dead-job path can fail it, rather than stranding it PENDING forever.
+    if (typeof workflowId !== "string") return true;
+    const version = row._definitionVersion;
+    return serves.some(
+      (s) =>
+        s.workflowId === workflowId &&
+        (typeof version !== "string" || s.version === version),
+    );
   }
 
   /**
    * PostgreSQL implementation using FOR UPDATE SKIP LOCKED for safe concurrency
    */
-  private async dequeuePostgres(): Promise<DequeueResult | null> {
+  private async dequeuePostgres(
+    serves?: readonly ServedDefinition[],
+  ): Promise<DequeueResult | null> {
     for (let i = 0; i < MAX_DEQUEUE_ATTEMPTS; i++) {
-      const job = await this.dequeuePostgresOnce();
+      const job = await this.dequeuePostgresOnce(serves);
       if (job !== "dead") return job;
     }
     return null;
   }
 
   /** One claim; `"dead"` when the claimed row was failed as unexecutable. */
-  private async dequeuePostgresOnce(): Promise<DequeueResult | null | "dead"> {
+  private async dequeuePostgresOnce(
+    serves?: readonly ServedDefinition[],
+  ): Promise<DequeueResult | null | "dead"> {
+    const {
+      active: servesActive,
+      workflowIds: servesWorkflowIds,
+      versions: servesVersions,
+    } = this.servesParams(serves);
     try {
       // NOTE: deliberately calling `this.prisma.$queryRaw` directly below
       // rather than destructuring it into a local first -- Prisma's
@@ -327,14 +400,14 @@ export class PrismaJobQueue implements JobQueue {
       //   as the only candidate, which is what actually breaks the starvation.
       // - `FOR UPDATE OF j SKIP LOCKED` names the base table explicitly: a
       //   plain `FOR UPDATE` is rejected on the nullable side of the LEFT
+      //   JOIN against the per-group counts.
+      // - The payload path is a bound `text[]` for `#>>`, never interpolated,
+      //   so a `groupBy` from configuration cannot reach the statement as SQL.
       // - Fallback to `_groupKey`: a spilled payload is replaced by a claim-check
       //   reference, so the configured path is gone from the row; `_groupKey`
       //   is written outside the body by `enqueueData` and survives spilling,
       //   so it is the fallback. When `groupBy` is already `"_groupKey"` the
       //   fallback is a no-op.
-      //   JOIN against the per-group counts.
-      // - The payload path is a bound `text[]` for `#>>`, never interpolated,
-      //   so a `groupBy` from configuration cannot reach the statement as SQL.
       // - Cost: the CTE aggregates every RUNNING row per claim, where the
       //   default statement stops at the first index entry. That is why
       //   fairness is opt-in; the measured difference is in the release notes.
@@ -363,6 +436,29 @@ export class PrismaJobQueue implements JobQueue {
             AND (j."nextPollAt" IS NULL
                  OR j."nextPollAt" <= (now() AT TIME ZONE 'UTC'))
             AND COALESCE(g.running, 0) < ${this.fairnessLimit}::bigint
+            AND (
+              -- Definition pinning, decided in the query rather than after
+              -- the claim. An inactive filter collapses the whole predicate
+              -- to true, which is how one statement serves both the
+              -- filtered and the unfiltered dequeue. The unnest of two
+              -- bound arrays is the row-value IN list a tagged template
+              -- cannot express; the NULL-version arm inside it is what
+              -- keeps an unpinned job -- enqueued before the consumer
+              -- migrated, or by a release that did not stamp the version --
+              -- claimable by any host holding its workflow.
+              ${servesActive}::boolean = false
+              OR (j.payload ->> '_workflowId') IS NULL
+              OR EXISTS (
+                SELECT 1
+                FROM unnest(${servesWorkflowIds}::text[], ${servesVersions}::text[])
+                  AS s(wf, ver)
+                WHERE s.wf = j.payload ->> '_workflowId'
+                  AND (
+                    (j.payload ->> '_definitionVersion') IS NULL
+                    OR s.ver = j.payload ->> '_definitionVersion'
+                  )
+              )
+            )
           ORDER BY j.priority DESC, j."createdAt" ASC
           LIMIT 1
           FOR UPDATE OF j SKIP LOCKED
@@ -382,6 +478,29 @@ export class PrismaJobQueue implements JobQueue {
           WHERE status = 'PENDING'
             AND ("nextPollAt" IS NULL
                  OR "nextPollAt" <= (now() AT TIME ZONE 'UTC'))
+            AND (
+              -- Definition pinning, decided in the query rather than after
+              -- the claim. An inactive filter collapses the whole predicate
+              -- to true, which is how one statement serves both the
+              -- filtered and the unfiltered dequeue. The unnest of two
+              -- bound arrays is the row-value IN list a tagged template
+              -- cannot express; the NULL-version arm inside it is what
+              -- keeps an unpinned job -- enqueued before the consumer
+              -- migrated, or by a release that did not stamp the version --
+              -- claimable by any host holding its workflow.
+              ${servesActive}::boolean = false
+              OR (payload ->> '_workflowId') IS NULL
+              OR EXISTS (
+                SELECT 1
+                FROM unnest(${servesWorkflowIds}::text[], ${servesVersions}::text[])
+                  AS s(wf, ver)
+                WHERE s.wf = payload ->> '_workflowId'
+                  AND (
+                    (payload ->> '_definitionVersion') IS NULL
+                    OR s.ver = payload ->> '_definitionVersion'
+                  )
+              )
+            )
           ORDER BY priority DESC, "createdAt" ASC
           LIMIT 1
           FOR UPDATE SKIP LOCKED
@@ -420,7 +539,7 @@ export class PrismaJobQueue implements JobQueue {
       );
 
       const payload = job.payload as Record<string, unknown>;
-      const { _workflowId, _groupKey, ...rest } = payload;
+      const { _workflowId, _groupKey, _definitionVersion, ...rest } = payload;
       return {
         jobId: job.id,
         workflowRunId: job.workflowRunId,
@@ -449,7 +568,10 @@ export class PrismaJobQueue implements JobQueue {
    * 2. Atomically update it (only succeeds if still PENDING)
    * 3. If another worker claimed it, retry
    */
-  private async dequeueSqlite(attempt = 0): Promise<DequeueResult | null> {
+  private async dequeueSqlite(
+    attempt = 0,
+    serves?: readonly ServedDefinition[],
+  ): Promise<DequeueResult | null> {
     try {
       if (attempt >= MAX_DEQUEUE_ATTEMPTS) {
         return null;
@@ -457,14 +579,34 @@ export class PrismaJobQueue implements JobQueue {
 
       const now = new Date();
 
-      // Step 1: Find the next PENDING job
-      const job = await this.prisma.jobQueue.findFirst({
-        where: {
-          status: this.enums.status("PENDING"),
-          OR: [{ nextPollAt: null }, { nextPollAt: { lte: now } }],
-        },
-        orderBy: [{ priority: "desc" }, { createdAt: "asc" }],
-      });
+      // Step 1: Find the next PENDING job this caller may claim. The
+      // `serves` predicate is applied in JS rather than pushed into the
+      // query: Prisma's SQLite connector cannot filter on a JSON path, and
+      // SQLite is the single-process development path, where a fleet
+      // running two builds against one database cannot occur. Scanning a
+      // bounded window keeps the ordering honest without a JSON index.
+      const candidates =
+        serves === undefined
+          ? await this.prisma.jobQueue.findFirst({
+              where: {
+                status: this.enums.status("PENDING"),
+                OR: [{ nextPollAt: null }, { nextPollAt: { lte: now } }],
+              },
+              orderBy: [{ priority: "desc" }, { createdAt: "asc" }],
+            })
+          : (
+              await this.prisma.jobQueue.findMany({
+                where: {
+                  status: this.enums.status("PENDING"),
+                  OR: [{ nextPollAt: null }, { nextPollAt: { lte: now } }],
+                },
+                orderBy: [{ priority: "desc" }, { createdAt: "asc" }],
+                take: SQLITE_SERVES_SCAN_LIMIT,
+              })
+            ).find((row: { payload: unknown }) =>
+              this.servesPayload(row.payload, serves),
+            );
+      const job = candidates ?? null;
 
       if (!job) {
         return null;
@@ -488,7 +630,7 @@ export class PrismaJobQueue implements JobQueue {
       if (result.count === 0) {
         // Another worker claimed it, retry (bounded to avoid unbounded
         // recursion under heavy contention)
-        return this.dequeueSqlite(attempt + 1);
+        return this.dequeueSqlite(attempt + 1, serves);
       }
 
       // Fetch the updated job to get the new attempt count
@@ -508,6 +650,7 @@ export class PrismaJobQueue implements JobQueue {
       const {
         _workflowId: claimedWfId,
         _groupKey,
+        _definitionVersion,
         ...claimedRest
       } = claimedPayload;
       return {
@@ -613,6 +756,40 @@ export class PrismaJobQueue implements JobQueue {
   }
 
   /**
+   * Return a claimed job to PENDING with a later `nextPollAt`, *without*
+   * counting the claim as an attempt: the dequeue incremented `attempt`,
+   * so this decrements it back. See `JobQueue.defer` for why declining is
+   * not failing.
+   */
+  async defer(
+    jobId: string,
+    nextPollAt: Date,
+    reason: string,
+    fence?: JobAckFence,
+  ): Promise<JobAckOutcome> {
+    const data = {
+      status: this.enums.status("PENDING"),
+      nextPollAt,
+      workerId: null,
+      lockedAt: null,
+      lastError: reason,
+      attempt: { decrement: 1 },
+    };
+    if (fence) {
+      const result = await this.prisma.jobQueue.updateMany({
+        where: this.fenceWhere(jobId, fence),
+        data,
+      });
+      return this.ackOutcome(jobId, result.count, "defer");
+    }
+    await this.prisma.jobQueue.update({ where: { id: jobId }, data });
+    logger.debug(
+      `Job ${jobId} deferred until ${nextPollAt.toISOString()}: ${reason}`,
+    );
+    return "acknowledged";
+  }
+
+  /**
    * Mark job as failed
    */
   async fail(
@@ -712,7 +889,7 @@ export class PrismaJobQueue implements JobQueue {
 
     return jobs.map((job: any) => {
       const payload = (job.payload ?? {}) as Record<string, unknown>;
-      const { _workflowId, _groupKey, ...rest } = payload;
+      const { _workflowId, _groupKey, _definitionVersion, ...rest } = payload;
       return {
         id: job.id,
         createdAt: job.createdAt,

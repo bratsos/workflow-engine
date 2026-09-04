@@ -84,6 +84,9 @@ export async function handleRunReapStuck(
           stageId: stage.stageId,
           priority: run.priority,
           payload: { config: run.config || {} },
+          // See prepare-execution-group.ts: the version travels with the
+          // job so the dequeue can filter on it.
+          definitionVersion: run.definitionVersion,
         }));
         postCommits.push(async (postDeps: KernelDeps) => {
           await postDeps.jobTransport.enqueueParallel(jobsToEnqueue);

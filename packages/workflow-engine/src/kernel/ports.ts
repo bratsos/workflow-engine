@@ -26,6 +26,7 @@ import type {
 import type { StageResult, SuspendedResult } from "../core/types";
 import type {
   CreateAnnotationInput,
+  DequeueOptions,
   DequeueResult,
   EnqueueJobInput,
   JobAckFence,
@@ -50,6 +51,7 @@ export type {
   CreateStageInput,
   DefinitionVersionCount,
   DefinitionVersionCountFilter,
+  DequeueOptions,
   DequeueResult,
   EnqueueJobInput,
   IdempotencyRecord,
@@ -258,8 +260,6 @@ export interface BlobStore {
  */
 export interface JobTransport {
   /**
-   * Enqueue multiple stages in parallel (same execution group).
-  /**
    * The dotted `groupBy` path this transport's fairness cap reads, or `null`
    * when fairness is off (or undefined when unsupported). Read by
    * `createSpillingJobTransport` so a spilled payload still carries its group
@@ -267,6 +267,8 @@ export interface JobTransport {
    */
   readonly fairnessGroupBy?: string | null;
 
+  /**
+   * Enqueue multiple stages in parallel (same execution group).
    *
    * Idempotent on `(workflowRunId, stageId)`: at most one job row exists
    * per stage per run, so a transport MUST replace any row already queued
@@ -292,7 +294,7 @@ export interface JobTransport {
   ): Promise<number>;
 
   /** Atomically dequeue the next available job. */
-  dequeue(): Promise<DequeueResult | null>;
+  dequeue(options?: DequeueOptions): Promise<DequeueResult | null>;
 
   /**
    * Mark job as completed.
@@ -317,6 +319,25 @@ export interface JobTransport {
   suspend(
     jobId: string,
     nextPollAt: Date,
+    fence?: JobAckFence,
+  ): Promise<JobAckOutcome>;
+
+  /**
+   * Return a claimed job to PENDING with a later nextPollAt WITHOUT counting
+   * the claim as an attempt (the dequeue incremented attempt; this undoes it).
+   * `fail(id, err, true)` is the wrong shape for work a host declines rather
+   * than fails: declining is not a failed attempt, and a condition that lasts
+   * for a whole deploy — a run pinned to a version this build does not
+   * present — exhausts the three-attempt budget in about fifteen seconds and
+   * takes the job row terminal.
+   *
+   * Optional: a transport that does not implement it falls back to fail with
+   * retry, which is correct but bounded by the budget.
+   */
+  defer?(
+    jobId: string,
+    nextPollAt: Date,
+    reason: string,
     fence?: JobAckFence,
   ): Promise<JobAckOutcome>;
 

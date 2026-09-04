@@ -26,6 +26,11 @@ export async function handleRunListVersions(
   command: RunListVersionsCommand,
   deps: KernelDeps,
 ): Promise<HandlerResult<RunListVersionsResult>> {
+  // Confirm the capability against the database first: the Prisma
+  // adapter's sync answer comes from the generated client, which says
+  // "supported" from `prisma generate` onwards -- before the migration
+  // that would make the groupBy below possible.
+  await deps.persistence.ensureDefinitionVersioningDetected?.();
   if (!deps.persistence.supportsDefinitionVersioning()) {
     return { supported: false, versions: [], unservedHere: [], _events: [] };
   }
@@ -39,7 +44,13 @@ export async function handleRunListVersions(
   // answers per workflow id, which is enough to decide `servedHere`.
   const served = servedDefinitions(deps.registry);
   const servesPair = (workflowId: string, version: string | null): boolean => {
-    if (version === null) return true; // unpinned runs are served by everyone
+    // An unpinned run predates the migration and has no recorded
+    // structure to check, so any host holding the workflow serves it.
+    if (version === null) {
+      return served
+        ? served.some((s) => s.workflowId === workflowId)
+        : deps.registry.getWorkflow(workflowId) !== undefined;
+    }
     if (served) {
       return served.some(
         (s) => s.workflowId === workflowId && s.version === version,

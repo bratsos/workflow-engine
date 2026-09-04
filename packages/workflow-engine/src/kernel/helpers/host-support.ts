@@ -11,6 +11,7 @@
  */
 
 import { z } from "zod";
+import type { ServedDefinition } from "../../persistence/interface.js";
 import type { EventSinkStatus, OutboxFlushResult } from "../commands.js";
 import type { Kernel } from "../kernel.js";
 import type { JobTransport } from "../ports.js";
@@ -53,6 +54,13 @@ export const HOST_DEFAULTS = {
    * when the stage result didn't provide its own `nextPollAt`.
    */
   suspendFallbackMs: 60_000,
+  /**
+   * Delay (ms) before a job declined for a definition-version mismatch is
+   * offered again. A mismatch clears when a deploy finishes, not on the
+   * next tick, so re-delivering sooner is pure churn against a database
+   * every host in the fleet is polling.
+   */
+  versionDeferMs: 30_000,
   /**
    * Stuck-run threshold for `run.reapStuck`: at least 3x the stale-lease
    * threshold — so a run isn't reaped out from under a legitimately
@@ -131,6 +139,14 @@ export interface ExecuteJobOutcome {
    * delay the built-in transports apply (`2^attempt` seconds).
    */
   retryDelayMs?: number;
+  /**
+   * The job was returned to the queue *without* counting an attempt,
+   * because this host declined it rather than failing it — today only for
+   * a run pinned to a definition version this build does not present.
+   * A push-transport consumer should redeliver the message after
+   * `retryDelayMs` and must not count it against its own retry budget.
+   */
+  deferred?: boolean;
 }
 
 const DEAD_JOB_PATTERN =
@@ -280,14 +296,17 @@ export async function executeJobWithHeartbeat(
   //    the attempt budget lasts.
   //  - "version": the run is pinned to a definition version this build
   //    does not serve. The job is valid and belongs to another build, so
-  //    it is re-delivered on the same terms as "race" — a pinned run is
-  //    never failed for want of a host that can serve it. The attempt
-  //    budget still bounds the redelivery loop, and that is deliberate:
-  //    when it runs out the *job* row goes terminal but the stage is
-  //    still PENDING (a ghost executed nothing), so run.reapStuck's
-  //    PENDING-stage-without-job sweep re-enqueues it with a fresh
-  //    budget. A deploy that outlasts the budget therefore costs polling
-  //    latency, not the run.
+  //    it is *deferred*, not failed: put back PENDING with a delay and
+  //    with the attempt the dequeue counted given back
+  //    (`jobTransport.defer`). Retrying it through `fail(..., true)` like
+  //    "race" is wrong here — "race" clears in milliseconds when a claim
+  //    commits, while this clears only when a deploy finishes, so the
+  //    three-attempt budget was exhausted in about fifteen seconds and
+  //    the job row went terminal, leaving recovery to run.reapStuck's
+  //    stuck-run threshold minutes later. A transport with no `defer`
+  //    falls back to the bounded retry, which is still correct.
+  //    This is a backstop: the dequeue itself now filters on `serves`, so
+  //    a pull transport rarely hands this host such a job at all.
   // A deterministic (non-retryable) stage error — e.g. Zod input
   // validation — will fail identically on every attempt, so it is
   // treated the same as an exhausted retry budget.
@@ -295,6 +314,33 @@ export async function executeJobWithHeartbeat(
   // already left the stage PENDING for that case; the transport contract
   // is that `fail(jobId, error, true)` re-enqueues the job with backoff.
   const maxAttempts = job.maxAttempts ?? HOST_DEFAULTS.maxAttempts;
+  if (
+    result.ghost === true &&
+    result.ghostReason === "version" &&
+    jobTransport.defer
+  ) {
+    const error = result.error ?? "definition version not served here";
+    const outcome = await jobTransport.defer(
+      job.jobId,
+      new Date(Date.now() + HOST_DEFAULTS.versionDeferMs),
+      error,
+      fence,
+    );
+    if (outcome === "superseded") {
+      console.warn(
+        `${logPrefix} job ${job.jobId} acknowledgement superseded: the lease was rescued and re-claimed while this attempt ran; its result was discarded`,
+      );
+    }
+    return {
+      outcome: "failed",
+      error,
+      willRetry: true,
+      deferred: true,
+      attempt: job.attempt,
+      maxAttempts,
+      retryDelayMs: HOST_DEFAULTS.versionDeferMs,
+    };
+  }
   const redeliverableGhost =
     result.ghost === true &&
     (result.ghostReason === "race" || result.ghostReason === "version");
@@ -358,6 +404,17 @@ export interface RunMaintenanceTickOptions {
   workerId?: string;
   /** Defaults to `HOST_DEFAULTS.maxClaimsPerTick`. */
   maxClaimsPerTick?: number;
+  /**
+   * Which definition versions this host may adopt and poll, forwarded
+   * verbatim to `run.claimPending` and `stage.pollSuspended`.
+   *
+   * Left unset, the kernel derives it from the registry, which is the
+   * behaviour you want. Pass `"all"` to claim and poll regardless of
+   * version — the pre-1.0 behaviour, and the documented escape hatch for a
+   * fleet that is deliberately homogeneous. Pass an explicit list to run
+   * maintenance on behalf of another build.
+   */
+  serves?: readonly ServedDefinition[] | "all";
   /** Defaults to `HOST_DEFAULTS.maxSuspendedChecksPerTick`. */
   maxSuspendedChecksPerTick?: number;
   /** Defaults to `HOST_DEFAULTS.maxOutboxFlushPerTick`. */
@@ -421,6 +478,7 @@ export async function runMaintenanceTick(
     staleLeaseThresholdMs = HOST_DEFAULTS.staleLeaseThresholdMs,
     jobAbsoluteTimeoutMs = HOST_DEFAULTS.jobAbsoluteTimeoutMs,
     logPrefix = HOST_DEFAULTS.logPrefix,
+    serves,
   } = options;
 
   let claimed = 0;
@@ -440,6 +498,7 @@ export async function runMaintenanceTick(
       type: "run.claimPending",
       workerId,
       maxClaims: maxClaimsPerTick,
+      ...(serves !== undefined ? { serves } : {}),
     });
     claimed = claimResult.claimed.length;
   } catch (error) {
@@ -451,6 +510,7 @@ export async function runMaintenanceTick(
     const pollResult = await kernel.dispatch({
       type: "stage.pollSuspended",
       maxChecks: maxSuspendedChecksPerTick,
+      ...(serves !== undefined ? { serves } : {}),
     });
     suspendedChecked = pollResult.checked;
     for (const workflowRunId of pollResult.resumedWorkflowRunIds) {

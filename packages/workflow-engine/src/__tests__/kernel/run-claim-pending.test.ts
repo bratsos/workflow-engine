@@ -9,7 +9,7 @@ import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { defineStage } from "../../core/stage-factory.js";
 import { WorkflowBuilder } from "../../core/workflow.js";
-import { createKernel } from "../../kernel/kernel.js";
+import { createKernel, createWorkflowRegistry } from "../../kernel/kernel.js";
 import {
   CollectingEventSink,
   FakeClock,
@@ -233,6 +233,67 @@ describe("kernel: run.claimPending", () => {
     await flush();
     const failedEvents = eventSink.getByType("workflow:failed");
     expect(failedEvents).toHaveLength(1);
+  });
+
+  it("does not adopt an unpinned run whose workflow this host does not have", async () => {
+    const knownWorkflow = createSimpleWorkflow("known");
+    const persistence = new InMemoryWorkflowPersistence();
+    const kernel = createKernel({
+      persistence,
+      blobStore: new InMemoryBlobStore(),
+      jobTransport: new InMemoryJobQueue("worker-1"),
+      eventSink: new CollectingEventSink(),
+      clock: new FakeClock(),
+      registry: createWorkflowRegistry([knownWorkflow]),
+    });
+
+    const run = await persistence.createRun({
+      workflowId: "stranger",
+      workflowName: "Stranger",
+      workflowType: "stranger",
+      input: { data: "hello" },
+      definitionVersion: null,
+    });
+
+    const result = await kernel.dispatch({
+      type: "run.claimPending",
+      workerId: "worker-1",
+    });
+
+    expect(result.claimed).toHaveLength(0);
+    const persisted = await persistence.getRun(run.id);
+    expect(persisted?.status).toBe("PENDING");
+  });
+
+  it("still adopts an unpinned run whose workflow it does have", async () => {
+    const knownWorkflow = createSimpleWorkflow("known");
+    const persistence = new InMemoryWorkflowPersistence();
+    const kernel = createKernel({
+      persistence,
+      blobStore: new InMemoryBlobStore(),
+      jobTransport: new InMemoryJobQueue("worker-1"),
+      eventSink: new CollectingEventSink(),
+      clock: new FakeClock(),
+      registry: createWorkflowRegistry([knownWorkflow]),
+    });
+
+    const run = await persistence.createRun({
+      workflowId: "known",
+      workflowName: "Known",
+      workflowType: "known",
+      input: { data: "hello" },
+      definitionVersion: null,
+    });
+
+    const result = await kernel.dispatch({
+      type: "run.claimPending",
+      workerId: "worker-1",
+    });
+
+    expect(result.claimed).toHaveLength(1);
+    expect(result.claimed[0]!.workflowRunId).toBe(run.id);
+    const persisted = await persistence.getRun(run.id);
+    expect(persisted?.status).toBe("RUNNING");
   });
 
   it("claims and enqueues parallel stages", async () => {

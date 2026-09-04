@@ -33,6 +33,11 @@ const host = createServerlessHost({
   maxClaimsPerTick: 10,
   maxSuspendedChecksPerTick: 10,
   maxOutboxFlushPerTick: 100,
+
+  // Which definition versions this host may claim, poll and dequeue.
+  // Omit it and the kernel derives it from the registry, which is what
+  // makes a rolling deploy safe; "all" turns version filtering off.
+  // serves: "all",
 });
 ```
 

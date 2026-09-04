@@ -79,7 +79,7 @@ export interface RunClaimPendingCommand {
    * or an explicit list to claim on behalf of another build.
    *
    * Runs created before the consumer migrated carry no version and are
-   * always claimable.
+   * claimable by any host whose `serves` names their workflow.
    */
   readonly serves?: readonly ServedDefinition[] | "all";
 }
@@ -228,6 +228,16 @@ export interface JobExecuteResult {
 export interface StagePollSuspendedCommand {
   readonly type: "stage.pollSuspended";
   readonly maxChecks?: number;
+  /**
+   * Which definition versions this poll may service, in the same shape and
+   * with the same defaulting as {@link RunClaimPendingCommand.serves}.
+   *
+   * It has to be the same answer as the claim's: a host that adopts a run
+   * must also poll its suspended stages, and a host that declines to adopt
+   * must not hold them. The filter is applied in the query that lists ready
+   * stages, so an unserving host never claims a stage's poll lease at all.
+   */
+  readonly serves?: readonly ServedDefinition[] | "all";
 }
 
 /** Result of a `stage.pollSuspended` command. */

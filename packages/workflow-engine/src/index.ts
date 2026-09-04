@@ -190,6 +190,7 @@ export type {
   CreateLogInput,
   CreateRunInput,
   CreateStageInput,
+  DequeueOptions,
   DequeueResult,
   EnqueueJobInput,
   JobAckFence,

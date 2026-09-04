@@ -289,7 +289,15 @@ Verified against `git diff` of the package's `prisma/schema.prisma` between 0.13
     ON "outbox_events" ("dlqAt");
   ```
 
-- [ ] **Custom `JobQueue` / `JobTransport` implementation?** Two contract changes:
+- [ ] **Custom `JobQueue` / `JobTransport` implementation?** Four contract changes:
+  `dequeue` now takes an optional `{ serves }` naming the definition versions
+  the calling host presents — filter on the payload's `_definitionVersion` /
+  `_workflowId` if you can, and ignore it if your transport cannot select;
+  and an optional `defer(jobId, nextPollAt, reason, fence)` puts a claimed job
+  back `PENDING` *without* spending its attempt, which is how a host declines
+  a job pinned to a version it does not serve (without it the host falls back
+  to `fail(..., true)` and the deploy exhausts the retry budget). Plus the two
+  from 1.0 proper:
   `deleteByRunAndStages(workflowRunId, stageIds)` is a new required method
   (delete every row for those stages of that run, any status, return the count),
   and `enqueueParallel` must now be idempotent on `(workflowRunId, stageId)` —

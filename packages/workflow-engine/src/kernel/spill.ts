@@ -36,6 +36,7 @@
  */
 
 import type {
+  DequeueOptions,
   DequeueResult,
   EnqueueJobInput,
   JobAckFence,
@@ -422,9 +423,9 @@ export function createSpillingJobTransport(
   options: SpillingJobTransportOptions,
 ): JobTransport {
   const spill = createPayloadSpill(options);
-
   const groupByPath = options.groupBy ?? transport.fairnessGroupBy ?? null;
   const groupSegments = groupByPath ? splitGroupPath(groupByPath) : null;
+
   async function resolvePayload(
     payload: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
@@ -437,11 +438,11 @@ export function createSpillingJobTransport(
       const packed = await Promise.all(
         jobs.map(async (job) => {
           if (job.payload === undefined) return job;
-          const payload = await spill.pack(
           const originalGroupValue =
             groupSegments && job.groupKey === undefined
               ? extractGroupValue(job.payload, groupSegments)
               : undefined;
+          const payload = await spill.pack(
             jobSpillKey(job.workflowRunId, job.stageId),
             job.payload,
           );
@@ -480,8 +481,8 @@ export function createSpillingJobTransport(
       return removed;
     },
 
-    async dequeue(): Promise<DequeueResult | null> {
-      const job = await transport.dequeue();
+    async dequeue(options?: DequeueOptions): Promise<DequeueResult | null> {
+      const job = await transport.dequeue(options);
       if (!job) return null;
       return { ...job, payload: await resolvePayload(job.payload) };
     },
@@ -534,5 +535,22 @@ export function createSpillingJobTransport(
             transport.adoptWorkerId?.(workerId) ?? workerId,
         }
       : {}),
+    ...(transport.defer
+      ? {
+          defer: (
+            jobId: string,
+            nextPollAt: Date,
+            reason: string,
+            fence?: JobAckFence,
+          ) =>
+            transport.defer?.(jobId, nextPollAt, reason, fence) ??
+            Promise.resolve("acknowledged" as const),
+        }
+      : {}),
+    ...(groupByPath !== null
+      ? { fairnessGroupBy: groupByPath }
+      : transport.fairnessGroupBy !== undefined
+        ? { fairnessGroupBy: transport.fairnessGroupBy }
+        : {}),
   };
 }

@@ -316,3 +316,69 @@ describe("PrismaWorkflowPersistence.claimUnpublishedOutboxEvents raw SQL", () =>
     });
   });
 });
+
+describe("PrismaWorkflowPersistence definition-versioning capability", () => {
+  /**
+   * The state every consumer passes through, and what a rolling deploy
+   * produces when code ships ahead of `migrate deploy`: the generated
+   * client advertises `workflowDefinition`, the database has neither the
+   * table nor the column. The structural check alone says "supported" and
+   * then every claim dies on a raw 42703.
+   */
+  function clientWithoutSchema(rows: Array<Record<string, unknown>>) {
+    const queryRawUnsafe = vi.fn(async () => rows);
+    return {
+      prisma: {
+        $queryRawUnsafe: queryRawUnsafe,
+        workflowDefinition: {
+          findUnique: vi.fn(),
+          create: vi.fn(),
+        },
+      } as unknown as EnginePrismaClient,
+      queryRawUnsafe,
+    };
+  }
+
+  it("turns versioning off when the database has not been migrated", async () => {
+    const { prisma, queryRawUnsafe } = clientWithoutSchema([
+      { has_table: false, has_column: false },
+    ]);
+    const persistence = new PrismaWorkflowPersistence(prisma);
+
+    // The structural guess, before anything has asked the database.
+    expect(persistence.supportsDefinitionVersioning()).toBe(true);
+
+    expect(await persistence.ensureDefinitionVersioningDetected()).toBe(false);
+    expect(persistence.supportsDefinitionVersioning()).toBe(false);
+
+    // A catalogue read, so it cannot raise and cannot abort a caller's
+    // transaction.
+    const [sql] = queryRawUnsafe.mock.calls[0] as unknown as [string];
+    expect(sql).toContain("to_regclass");
+    expect(sql).not.toContain("SELECT id");
+  });
+
+  it("keeps versioning on when the database has the schema, and probes once", async () => {
+    const { prisma, queryRawUnsafe } = clientWithoutSchema([
+      { has_table: true, has_column: true },
+    ]);
+    const persistence = new PrismaWorkflowPersistence(prisma);
+
+    expect(await persistence.ensureDefinitionVersioningDetected()).toBe(true);
+    expect(await persistence.ensureDefinitionVersioningDetected()).toBe(true);
+    expect(persistence.supportsDefinitionVersioning()).toBe(true);
+    expect(queryRawUnsafe).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not probe at all when the capability is configured explicitly", async () => {
+    const { prisma, queryRawUnsafe } = clientWithoutSchema([
+      { has_table: false, has_column: false },
+    ]);
+    const persistence = new PrismaWorkflowPersistence(prisma, {
+      definitionVersioning: true,
+    });
+
+    expect(await persistence.ensureDefinitionVersioningDetected()).toBe(true);
+    expect(queryRawUnsafe).not.toHaveBeenCalled();
+  });
+});
