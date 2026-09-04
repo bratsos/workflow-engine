@@ -39,6 +39,53 @@ export interface StepRunOptions {
    * duration string (`"30s"`, `"5m"`). Defaults to zero.
    */
   retryDelayMs?: number | string;
+  /**
+   * What to do when this step's lease expired and another worker takes it
+   * over — the one case where the engine cannot know whether the body's side
+   * effect already happened, because the worker died between the effect and
+   * the ledger write.
+   *
+   * - `"rerun"` (default, and the behaviour of every earlier version):
+   *   execute the body again. Correct for a body that is safe to repeat, and
+   *   for one that uses `step.externalKey` to make the repeat a no-op.
+   * - `"fail"`: refuse, and fail the step with {@link StepNotReplaySafeError}
+   *   naming the step. Choose this for a body whose external call cannot be
+   *   deduplicated or recovered, where a duplicate costs money or is visible
+   *   to a third party.
+   *
+   * This does not affect `retries`: a body that *threw* has said its effect
+   * did not take, and asking for retries is asking for it to be repeated.
+   */
+  onReclaim?: "rerun" | "fail";
+}
+
+/**
+ * What a `ctx.step.run` body is told about its own execution.
+ *
+ * Bodies that ignore it behave exactly as before; it exists so a body making
+ * a non-idempotent external call can name that call in a way that survives a
+ * replay.
+ */
+export interface StepRunContext {
+  /** This step's id, as passed to `run`. */
+  readonly stepId: string;
+  /**
+   * A stable, deterministic key for whatever external effect this body
+   * creates. Identical on every replay of this step, so it can be sent as a
+   * provider idempotency key, stamped into provider-side metadata, or used to
+   * search for an effect a dead worker already created.
+   *
+   * Recorded on the step row before the body runs, never after it returns.
+   */
+  readonly externalKey: string;
+  /** 1 on the first execution; incremented each time the step is taken over. */
+  readonly attempt: number;
+  /**
+   * True when this execution took over an expired lease or a failed attempt,
+   * i.e. when an earlier execution of this body may already have run. A body
+   * that can recover its external effect should look for it when this is set.
+   */
+  readonly isReclaim: boolean;
 }
 
 export interface StepWaitOptions<T> {
@@ -71,7 +118,7 @@ export interface StepApi {
    */
   run<T>(
     id: string,
-    fn: () => Promise<T>,
+    fn: (step: StepRunContext) => Promise<T>,
     options?: StepRunOptions,
   ): Promise<T>;
   waitFor<T, U extends T>(
@@ -180,6 +227,31 @@ export class StepLedgerWriteError extends Error {
     this.name = "StepLedgerWriteError";
     this.stepId = stepId;
     this.originalError = originalError;
+  }
+}
+
+/**
+ * Thrown instead of re-executing a `run` step declared `onReclaim: "fail"`
+ * whose lease expired. The body may or may not have completed its external
+ * effect; the engine refuses to guess, and says so with the key the effect
+ * would carry so an operator can go and look.
+ */
+export class StepNotReplaySafeError extends Error {
+  readonly stepId: string;
+  readonly externalKey: string;
+
+  constructor(stepId: string, externalKey: string, leaseExpiredAt: Date) {
+    super(
+      `Durable step "${stepId}" is declared onReclaim: "fail" and its lease expired at ` +
+        `${leaseExpiredAt.toISOString()}. A worker was executing this step and did not ` +
+        `record an outcome, so its external effect may already have happened; the engine ` +
+        `will not re-execute it. Look for the effect under external key "${externalKey}", ` +
+        `then either complete the run by hand or re-run the stage with ` +
+        `onReclaim: "rerun" once you know the effect is absent.`,
+    );
+    this.name = "StepNotReplaySafeError";
+    this.stepId = stepId;
+    this.externalKey = externalKey;
   }
 }
 

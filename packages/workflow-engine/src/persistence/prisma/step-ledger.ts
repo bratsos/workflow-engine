@@ -27,6 +27,7 @@ function mapStep(record: any): StepRecord {
     attempt: record.attempt,
     leaseExpiresAt: record.leaseExpiresAt,
     deadlineAt: record.deadlineAt,
+    externalKey: record.externalKey ?? null,
     result: record.result === null ? null : record.result,
     error: record.error ?? null,
     waitState: record.waitState ?? undefined,
@@ -89,6 +90,9 @@ export class PrismaStepLedger implements StepLedger {
       attempt: record.attempt,
       leaseExpiresAt: record.leaseExpiresAt,
       deadlineAt: record.deadlineAt,
+      ...(record.externalKey != null
+        ? { externalKey: record.externalKey }
+        : {}),
       ...(record.result != null ? { result: record.result } : {}),
       ...(record.error !== undefined ? { error: record.error } : {}),
       ...(record.waitState !== undefined

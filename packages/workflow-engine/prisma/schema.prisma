@@ -107,6 +107,11 @@ model WorkflowStep {
   attempt        Int       @default(1)
   leaseExpiresAt DateTime?
   deadlineAt     DateTime?
+  // Migration SQL note: add "externalKey" TEXT NULL.
+  // Deterministic name for the external effect a `run` step body creates,
+  // written before the body runs so an orphaned provider-side effect can be
+  // found from the row after a crash.
+  externalKey    String?
   result        Json?
   error         String?
   waitState     Json?

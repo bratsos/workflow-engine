@@ -35,6 +35,7 @@ import { createRequire } from "node:module";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
 import { defineStage } from "../../core/stage-factory.js";
+import { deriveStepExternalKey } from "../../core/step-external-key.js";
 import { WorkflowBuilder } from "../../core/workflow.js";
 import { executeJobWithHeartbeat } from "../../kernel/helpers/host-support.js";
 import { createKernel } from "../../kernel/kernel.js";
@@ -46,6 +47,7 @@ import {
 import {
   createPrismaAICallLogger,
   createPrismaJobQueue,
+  createPrismaStepLedger,
   createPrismaWorkflowPersistence,
 } from "../../persistence/prisma/index.js";
 import {
@@ -128,6 +130,76 @@ if (!DATABASE_URL) {
     // now covered -- against this same real database -- by the shared
     // suites above, so it isn't duplicated here.
     // ==========================================================================
+
+    describe("PrismaStepLedger (Postgres)", () => {
+      const ledger = createPrismaStepLedger(prisma);
+      const stageRecordId = "pg-step-ledger-stage";
+
+      beforeEach(async () => {
+        await prisma.workflowStep.deleteMany({ where: { stageRecordId } });
+      });
+
+      it("round-trips the external key written before the body runs", async () => {
+        const externalKey = deriveStepExternalKey(stageRecordId, "submit");
+        const claimed = await ledger.claim({
+          stageRecordId,
+          stepId: "submit",
+          seq: 1,
+          kind: "run",
+          status: "running",
+          attempt: 1,
+          leaseExpiresAt: new Date(Date.now() + 60_000),
+          deadlineAt: null,
+          externalKey,
+        });
+
+        expect(claimed.created).toBe(true);
+        expect(claimed.record.externalKey).toBe(externalKey);
+        expect((await ledger.get(stageRecordId, "submit"))?.externalKey).toBe(
+          externalKey,
+        );
+
+        // A replay re-claims the same row and reads back the same key.
+        const replayed = await ledger.claim({
+          stageRecordId,
+          stepId: "submit",
+          seq: 1,
+          kind: "run",
+          status: "running",
+          attempt: 1,
+          leaseExpiresAt: new Date(Date.now() + 60_000),
+          deadlineAt: null,
+          externalKey,
+        });
+        expect(replayed.created).toBe(false);
+        expect(replayed.record.externalKey).toBe(externalKey);
+
+        // A completion never disturbs it: the key is how an orphaned
+        // provider-side effect is found later.
+        const completed = await ledger.update(stageRecordId, "submit", {
+          status: "completed",
+          result: { ok: true },
+          leaseExpiresAt: null,
+        });
+        expect(completed.externalKey).toBe(externalKey);
+      });
+
+      it("reads a row written without a key as null", async () => {
+        await ledger.claim({
+          stageRecordId,
+          stepId: "wait",
+          seq: 2,
+          kind: "wait",
+          status: "pending",
+          attempt: 1,
+          leaseExpiresAt: null,
+          deadlineAt: new Date(Date.now() + 60_000),
+        });
+        expect(
+          (await ledger.get(stageRecordId, "wait"))?.externalKey,
+        ).toBeNull();
+      });
+    });
 
     describe("Postgres-only behavior", () => {
       const persistence = createPrismaWorkflowPersistence(prisma);

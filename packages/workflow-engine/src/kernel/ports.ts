@@ -75,6 +75,15 @@ export interface StepRecord {
   attempt: number;
   leaseExpiresAt: Date | null;
   deadlineAt: Date | null;
+  /**
+   * Deterministic name for the external effect this step's body creates,
+   * written when the row is claimed — before the body runs. Derived from
+   * `(stageRecordId, stepId)`, so it is identical on every replay; stored so
+   * an operator can search a provider for an orphaned effect straight from
+   * the row. `null` for kinds with no body (`wait`, `signal`, `sleep`) and
+   * for rows written before 1.0.0-alpha.9.
+   */
+  externalKey?: string | null;
   result?: unknown;
   error?: string | null;
   waitState?: {

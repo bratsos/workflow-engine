@@ -17,6 +17,7 @@ function cloneJson(value: unknown): unknown {
 function cloneRecord(record: StepRecord): StepRecord {
   return {
     ...record,
+    externalKey: record.externalKey ?? null,
     result: cloneJson(record.result),
     waitState: record.waitState ? { ...record.waitState } : undefined,
     leaseExpiresAt: record.leaseExpiresAt
@@ -49,6 +50,7 @@ export class InMemoryStepLedger implements StepLedger {
     const now = this.now();
     const created: StepRecord = {
       ...record,
+      externalKey: record.externalKey ?? null,
       createdAt: now,
       updatedAt: now,
       result: cloneJson(record.result),

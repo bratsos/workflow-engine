@@ -60,6 +60,44 @@ describe("PrismaStepLedger.claim on Postgres", () => {
     });
   });
 
+  it("persists the external key with the row and reads it back", async () => {
+    const createMany = vi.fn(async () => ({ count: 1 }));
+    const findUnique = vi.fn(async () => ({
+      ...row,
+      status: "running",
+      externalKey: "wfe-0123456789abcdef0123456789abcdef",
+    }));
+    const prisma = {
+      workflowStep: { create: vi.fn(), createMany, findUnique },
+    } as unknown as EnginePrismaClient;
+    const ledger = new PrismaStepLedger(prisma);
+
+    const result = await ledger.claim({
+      stageRecordId: "stage-1",
+      stepId: "items:0",
+      seq: 1,
+      kind: "run",
+      status: "running",
+      attempt: 1,
+      leaseExpiresAt: null,
+      deadlineAt: null,
+      externalKey: "wfe-0123456789abcdef0123456789abcdef",
+    });
+
+    expect(createMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: [
+          expect.objectContaining({
+            externalKey: "wfe-0123456789abcdef0123456789abcdef",
+          }),
+        ],
+      }),
+    );
+    expect(result.record.externalKey).toBe(
+      "wfe-0123456789abcdef0123456789abcdef",
+    );
+  });
+
   it("reports created when the insert landed", async () => {
     const createMany = vi.fn(async () => ({ count: 1 }));
     const findUnique = vi.fn(async () => ({ ...row, status: "running" }));

@@ -38,13 +38,21 @@ export {
   type StepStreamResult,
 } from "./core/step-ai";
 export {
+  deriveStepExternalKey,
+  isStepExternalKey,
+  STEP_EXTERNAL_KEY_PREFIX,
+  stepExternalKeyPart,
+} from "./core/step-external-key";
+export {
   DURABLE_SUSPEND_MARKER,
   isStepControlFlowError,
   type StepApi,
   StepInFlight,
   StepLedgerNotConfiguredError,
   StepLedgerWriteError,
+  StepNotReplaySafeError,
   StepResultNotSerializable,
+  type StepRunContext,
   type StepRunOptions,
   StepSuspend,
   StepTimeoutError,
@@ -88,6 +96,7 @@ export {
   type AIBatchProvider,
   type AIBatchRequest,
   type AIBatchResult,
+  type AIBatchSubmitOptions,
   AICallTimeoutError,
   type AICallType,
   type AIEmbedResult,
@@ -98,6 +107,7 @@ export {
   type AITextResult,
   type BatchLogFn,
   type BatchOptions,
+  type BatchReclaimPolicy,
   type ContentPart,
   createAIHelper,
   type EmbedOptions,
@@ -119,14 +129,16 @@ export {
   createOpenRouterBatchModel,
   type EngineBatchItemResult,
   type EngineBatchModel,
+  type EngineBatchRecovery,
   type EngineBatchRef,
   type EngineBatchRequest,
+  type EngineBatchStartOptions,
   type EngineBatchStatus,
   fromAiSdk,
   type OpenRouterBatchConfig,
   resolveAiSdkBatchModel,
 } from "./ai/batch";
-export { BatchSubmitError } from "./ai/batch-helper";
+export { BatchNotAdoptableError, BatchSubmitError } from "./ai/batch-helper";
 // Model Helper
 export {
   AVAILABLE_MODELS,

@@ -1,7 +1,9 @@
 import type { AIHelper } from "../../ai/types.js";
+import { deriveStepExternalKey } from "../../core/step-external-key.js";
 import type {
   StepApi,
   StepControlFlowError,
+  StepRunContext,
   StepRunOptions,
   StepWaitOptions,
 } from "../../core/steps.js";
@@ -12,6 +14,7 @@ import {
   StepInFlight,
   StepLedgerNotConfiguredError,
   StepLedgerWriteError,
+  StepNotReplaySafeError,
   StepResultNotSerializable,
   StepSuspend,
   StepTimeoutError,
@@ -279,7 +282,11 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
   }
 
   const impl = {
-    async run<T>(id: string, fn: () => Promise<T>, opts: StepRunOptions = {}) {
+    async run<T>(
+      id: string,
+      fn: (step: StepRunContext) => Promise<T>,
+      opts: StepRunOptions = {},
+    ) {
       const invocation = begin(id);
       const leaseMs = positiveDuration(
         opts.leaseMs ?? defaultLeaseMs,
@@ -287,9 +294,15 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
       );
       const retries = nonNegativeInteger(opts.retries ?? 0, "retries");
       const retryDelayMs = parseStepDuration(opts.retryDelayMs ?? 0);
+      const onReclaim = opts.onReclaim ?? "rerun";
       const now = options.clock.now();
+      const { stageRecordId } = requireLedger();
+      // Derived, not generated: the same (stage record, step) pair yields the
+      // same key in every process and on every replay, so the body can name
+      // its external effect before making it.
+      const externalKey = deriveStepExternalKey(stageRecordId, id);
       const claimResult = await claim(invocation, {
-        stageRecordId: requireLedger().stageRecordId,
+        stageRecordId,
         stepId: id,
         seq: invocation.seq,
         kind: "run",
@@ -297,9 +310,11 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
         attempt: 1,
         leaseExpiresAt: new Date(now.getTime() + leaseMs),
         deadlineAt: null,
+        externalKey,
       });
       let record = claimResult.record;
       let shouldExecute = claimResult.created;
+      let isReclaim = false;
 
       if (!claimResult.created && record.status === "completed") {
         return record.result as T;
@@ -311,13 +326,28 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
         ) {
           suspend(new StepInFlight(id, now));
         }
+        if (onReclaim === "fail") {
+          // The dead worker may have completed the body's external effect.
+          // Fail the row so the replay after this one meets a stored error
+          // rather than racing to the same decision again.
+          const expiredAt = record.leaseExpiresAt ?? now;
+          const error = new StepNotReplaySafeError(id, externalKey, expiredAt);
+          await update(id, {
+            status: "failed",
+            error: error.message,
+            leaseExpiresAt: null,
+          });
+          throw error;
+        }
         record = await reclaim(id, record, leaseMs);
         shouldExecute = true;
+        isReclaim = true;
       }
       if (!claimResult.created && record.status === "failed") {
         if (record.attempt > retries) throw storedError(record);
         record = await reclaim(id, record, leaseMs);
         shouldExecute = true;
+        isReclaim = true;
       }
 
       if (!shouldExecute) {
@@ -328,7 +358,12 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
 
       let value: T;
       try {
-        value = await fn();
+        value = await fn({
+          stepId: id,
+          externalKey: record.externalKey ?? externalKey,
+          attempt: record.attempt,
+          isReclaim,
+        });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         await update(id, {
@@ -573,7 +608,11 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
      * `settleInFlight`) instead of abandoning it mid-flight with a live
      * lease, which the replay would meet as `StepInFlight`.
      */
-    run<T>(id: string, fn: () => Promise<T>, opts: StepRunOptions = {}) {
+    run<T>(
+      id: string,
+      fn: (step: StepRunContext) => Promise<T>,
+      opts: StepRunOptions = {},
+    ) {
       const leaseUntil =
         options.clock.now().getTime() +
         positiveDuration(opts.leaseMs ?? defaultLeaseMs, "leaseMs");
