@@ -981,18 +981,23 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
         let succeeded = 0;
         const failed: FailedItemSummary[] = [];
         const repair: RepairItemSummary[] = [];
+        // Each item is listed once, so its batch-phase tokens and cost are
+        // attributed once: under `repair` (as the prior attempt the repair
+        // pass continues from) when it will be re-prompted, under `failed`
+        // when the batch verdict is final.
         for (const e of entries) {
           const v = fetched.get(e.id)!;
           if (v.status === "failed") {
-            failed.push({
-              id: v.id,
-              error: v.error,
-              errorName: v.errorName ?? "AiMapBatchItemFailedError",
-              inputTokens: v.inputTokens,
-              outputTokens: v.outputTokens,
-              cost: v.cost,
-            });
-            if (repairAttempts > 0) {
+            if (repairAttempts === 0) {
+              failed.push({
+                id: v.id,
+                error: v.error,
+                errorName: v.errorName ?? "AiMapBatchItemFailedError",
+                inputTokens: v.inputTokens,
+                outputTokens: v.outputTokens,
+                cost: v.cost,
+              });
+            } else {
               repair.push({
                 id: v.id,
                 attempts: v.attempts,

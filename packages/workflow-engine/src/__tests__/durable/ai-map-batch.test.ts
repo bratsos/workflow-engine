@@ -305,6 +305,105 @@ describe("step.ai.map batch policy", () => {
     }
   });
 
+  it("lists a repaired item once in the collect summary, so its batch cost is attributed once", async () => {
+    const h = await setup("batch-repair-summary", 25, {
+      respond: (id) =>
+        id === "3" ? JSON.stringify({ v: 1 }) : JSON.stringify({ v: id }),
+    });
+
+    await h.execute();
+    await h.settle(60_000);
+    expect((await h.stage())?.status).toBe("COMPLETED");
+
+    const stageRecord = await h.stage();
+    const collect = await h.ledger.get(stageRecord!.id, "extract:collect");
+    const summary = collect?.result as {
+      total: number;
+      succeeded: number;
+      failed: { id: string; cost: number }[];
+      repair: { id: string; cost: number; attempts: number }[];
+    };
+    expect(summary.total).toBe(25);
+    expect(summary.succeeded).toBe(24);
+    // The item the repair pass re-prompts is under `repair` only, with
+    // its batch-phase cost as the prior attempt; `failed` is for verdicts
+    // the batch settled.
+    expect(summary.failed).toEqual([]);
+    expect(summary.repair).toHaveLength(1);
+    const batchCostOfOneItem = h.results()[0]!.cost;
+    expect(summary.repair[0]).toMatchObject({
+      id: "3",
+      attempts: 1,
+      cost: batchCostOfOneItem,
+    });
+    // The repaired verdict continues from that prior: batch cost plus the
+    // one realtime repair call.
+    const repaired = h.results().find((r) => r.id === "3")!;
+    expect(h.mock.getCalls()).toHaveLength(1);
+    const repairCallCost = h.mock.getCalls()[0]!.cost;
+    expect(repaired.attempts).toBe(2);
+    expect(repaired.cost).toBeCloseTo(batchCostOfOneItem + repairCallCost, 9);
+  });
+
+  it("lists a batch failure under `failed` when no repair attempt remains", async () => {
+    const mock = createMockAIHelperFactory();
+    const backend = makeFakeBackend({
+      respond: (id) =>
+        id === "3" ? JSON.stringify({ v: 1 }) : JSON.stringify({ v: id }),
+    });
+    let captured: AiMapResult<Item>[] = [];
+    const stage = defineStage({
+      id: "batch-no-repair-summary",
+      name: "batch-no-repair-summary",
+      schemas: {
+        input: inputSchema,
+        output: outputSchema,
+        config: z.object({}),
+      },
+      async execute(ctx) {
+        const items = Array.from({ length: ctx.input.count }, (_, i) => i);
+        captured = await ctx.step.ai.map("extract", items, {
+          model: BATCH_MODEL,
+          schema: itemSchema,
+          prompt: (item) => `Extract <<${item}>>`,
+          repair: { attempts: 0 },
+          batch: { pollEvery: "60s", timeout: "24h" },
+        });
+        return { output: { done: captured.length } };
+      },
+    });
+    const h = await createAiMapHarness({
+      stage,
+      inputSchema,
+      outputSchema,
+      input: { count: 25 },
+      mock,
+      aiFactory: createBatchAwareFactory(mock, backend.model),
+    });
+
+    await h.execute();
+    await h.settle(60_000);
+    expect((await h.stage())?.status).toBe("COMPLETED");
+
+    const stageRecord = await h.stage();
+    const collect = await h.ledger.get(stageRecord!.id, "extract:collect");
+    const summary = collect?.result as {
+      failed: { id: string; cost: number }[];
+      repair: unknown[];
+    };
+    expect(summary.repair).toEqual([]);
+    expect(summary.failed).toHaveLength(1);
+    expect(summary.failed[0]).toMatchObject({
+      id: "3",
+      cost: captured[0]!.cost,
+    });
+    expect(mock.getCalls()).toHaveLength(0);
+    expect(captured.find((r) => r.id === "3")).toMatchObject({
+      status: "failed",
+      cost: captured[0]!.cost,
+    });
+  });
+
   it("returns every item as failed with onExpiry: partial", async () => {
     const h = await setup(
       "batch-partial",
