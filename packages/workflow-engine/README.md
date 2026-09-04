@@ -319,7 +319,20 @@ model JobQueue {
   // One job row per stage per run: run.rerunFrom retires the rows of the
   // stages it deletes and every enqueue path is idempotent on this pair.
   @@unique([workflowRunId, stageId])
-  @@index([status, priority])
+  // The dequeue: status = 'PENDING' ORDER BY priority DESC, "createdAt" ASC
+  // LIMIT 1 FOR UPDATE SKIP LOCKED. This replaces the bare
+  // @@index([status, priority]) -- a composite whose leading columns are
+  // the same serves every lookup that one served. Carrying the createdAt
+  // tiebreak is what removes the sort node: without it a deep queue reads
+  // and sorts every PENDING row on every claim (measured on Postgres 16,
+  // flat priorities: 0.55 ms at 1,000 ready rows, 26.7 ms at 50,000; with
+  // it, 0.03 ms and 0.04 ms -- flat with depth).
+  //
+  // It costs more on disk than the index it replaces, and the reason is
+  // worth knowing: (status, priority) is almost entirely duplicate keys,
+  // which btree deduplication collapses, while adding createdAt makes
+  // every key distinct. Measured at 150,000 rows: 1 MB -> 10 MB.
+  @@index([status, priority(sort: Desc), createdAt])
   // Queue health reports the age of the oldest waiting job as
   // MIN("createdAt") within a status. Completed rows are retained rather
   // than deleted, so [status, priority] would have to scan every row of
