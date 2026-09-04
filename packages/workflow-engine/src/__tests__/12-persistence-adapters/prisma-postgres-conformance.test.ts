@@ -495,8 +495,8 @@ if (!DATABASE_URL) {
         await queue.dequeue();
         const [before] = await queue.getJobsByWorkflowRun(runId);
 
-        // touchJob writes through the Prisma model API; the dequeue wrote
-        // its lease with a raw statement. They must agree.
+        // Both the dequeue and touchJob stamp the lease from the database
+        // clock. They must agree, and both must move forward.
         await new Promise((resolve) => setTimeout(resolve, 30));
         await queue.touchJob(jobId!);
 
@@ -504,6 +504,46 @@ if (!DATABASE_URL) {
         expect(after?.lockedAt?.getTime() ?? 0).toBeGreaterThan(
           before?.lockedAt?.getTime() ?? 0,
         );
+      });
+
+      it("stamps the lease from the database clock even when the host's clock is an hour out", async () => {
+        // The failure this guards: a host whose system clock runs an hour
+        // behind used to write `lockedAt` an hour in the past, so the very
+        // next sweep -- on any host -- reclaimed a job that had only just
+        // been claimed and ran it twice. With the stamp taken from the
+        // database, a drifting host cannot shorten (or extend) a lease.
+        const skewed = createPrismaJobQueue(tzPrisma, {
+          workerId: "skewed-worker",
+          now: () => new Date(Date.now() - 60 * 60 * 1000),
+        });
+        const runId = "skewed-clock-run";
+        await skewed.enqueueParallel([
+          {
+            workflowRunId: runId,
+            workflowId: "tz-workflow",
+            stageId: "tz-stage",
+            payload: {},
+          },
+        ]);
+        const claimed = await skewed.dequeue();
+        expect(claimed).not.toBeNull();
+
+        const [job] = await skewed.getJobsByWorkflowRun(runId);
+        expect(
+          Math.abs((job?.lockedAt?.getTime() ?? 0) - Date.now()),
+        ).toBeLessThan(60_000);
+        // The attempt stamp handed to the worker is the stored one, so the
+        // acknowledgement fence still matches.
+        expect(
+          Math.abs(
+            claimed!.startedAt.getTime() - (job?.startedAt?.getTime() ?? 0),
+          ),
+        ).toBeLessThan(1);
+
+        // A one-minute lease is nowhere near stale.
+        expect(await skewed.releaseStaleJobs(60_000)).toBe(0);
+        const [stillHeld] = await skewed.getJobsByWorkflowRun(runId);
+        expect(stillHeld?.status).toBe("RUNNING");
       });
 
       it("claims a pending run with a UTC startedAt on a non-UTC session", async () => {

@@ -106,6 +106,17 @@ const stats = host.getStats();
 
 `staleLeaseThresholdMs` is how long a killed worker's *job* stays unavailable. A killed worker's in-flight **durable step** is a separate dial: `StepRunOptions.leaseMs`, default five minutes, is how long a resumed stage waits before it re-runs that step (see 12-durable-steps.md, "Leases, retries and deadlines"). Both bound how fast a crash recovers; neither is set by the other.
 
+**The job lease runs on the database clock (Postgres).** `PrismaJobQueue` stamps
+`lockedAt`/`startedAt` with `now() AT TIME ZONE 'UTC'` at claim time, renews it
+the same way from `touchJob`, and `releaseStaleJobs` derives the deadline in the
+same statement (`"lockedAt" < now() AT TIME ZONE 'UTC' - <threshold> * interval
+'1 millisecond'`). No expiry is computed in application code and none is stored,
+which is the shape pg-boss, Graphile Worker, River and Oban all use: a host whose
+system clock drifts can neither shorten nor extend a lease, and two hosts can
+never disagree about when one expires. `staleLeaseThresholdMs` is therefore a
+*duration*, measured by the database, not a deadline your process computes. On
+SQLite the comparison stays in application code -- one process, one clock.
+
 An interval firing that lands while the previous tick is still running is skipped (`orchestrationTicks` counts ticks that ran), and `stop()` waits for an in-flight tick, bounded by `shutdownTimeoutMs`, before its final outbox flush. Several hosts may run against one database: suspended stages are claimed per poll, so a stage body runs once across processes (see 08-common-patterns.md, "Suspended-Stage Claims").
 
 ### Worker Process Pattern

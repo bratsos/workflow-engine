@@ -42,10 +42,13 @@ export interface PrismaJobQueueOptions {
    */
   databaseType?: DatabaseType;
   /**
-   * Time source for the timestamps the raw dequeue statement writes.
-   * Defaults to `() => new Date()`; bound as a parameter and converted
-   * with `AT TIME ZONE 'UTC'`, never `NOW()` and never session-local
-   * (see utc-timestamps.ts).
+   * Time source for deterministic tests.
+   *
+   * Does not affect PostgreSQL lease timestamps (`lockedAt`, `startedAt`),
+   * which are derived directly from the database clock. It remains the time
+   * source for the SQLite dequeue path and for timestamps written outside the
+   * raw statement (such as dead-job acknowledgements). Defaults to
+   * `() => new Date()`.
    */
   now?: () => Date;
 }
@@ -226,12 +229,19 @@ export class PrismaJobQueue implements JobQueue {
           "Prisma client does not support $queryRaw (required for the Postgres dequeue path)",
         );
       }
-      const now = this.now();
-      // `AT TIME ZONE 'UTC'` on every bound Date: without it Postgres
-      // converts the timestamptz parameter into the naive `timestamp`
-      // columns through the *session* timezone, so on a non-UTC session
-      // `lockedAt` lands in the future and its lease never goes stale
-      // (see utc-timestamps.ts).
+      // `now() AT TIME ZONE 'UTC'` renders the transaction's instant as the
+      // naive UTC wall clock these `timestamp(3)` columns store, so it is
+      // correct on any session timezone -- unlike a bare `NOW()`, which
+      // converts through the session's zone (see utc-timestamps.ts).
+      //
+      // Using the database clock rather than a bound `Date` means the writer
+      // of a lease and the sweeper that expires it are the same clock, so a
+      // host whose system clock drifts can neither shorten nor extend a
+      // lease. This is what pg-boss, Graphile Worker, River and Oban all do.
+      //
+      // `startedAt` comes back through `RETURNING` because it is the fence a
+      // worker hands to `complete`/`fail`/`suspend`; the application no
+      // longer knows the value it wrote.
       const result = await this.prisma.$queryRaw<
         Array<{
           id: string;
@@ -241,25 +251,26 @@ export class PrismaJobQueue implements JobQueue {
           attempt: number;
           maxAttempts: number;
           payload: unknown;
+          startedAt: Date;
         }>
       >`
         UPDATE "job_queue"
         SET
           status = 'RUNNING',
           "workerId" = ${this.workerId},
-          "lockedAt" = ${now}::timestamptz AT TIME ZONE 'UTC',
-          "startedAt" = ${now}::timestamptz AT TIME ZONE 'UTC',
+          "lockedAt" = (now() AT TIME ZONE 'UTC'),
+          "startedAt" = (now() AT TIME ZONE 'UTC'),
           attempt = attempt + 1
         WHERE id = (
           SELECT id FROM "job_queue"
           WHERE status = 'PENDING'
             AND ("nextPollAt" IS NULL
-                 OR "nextPollAt" <= ${now}::timestamptz AT TIME ZONE 'UTC')
+                 OR "nextPollAt" <= (now() AT TIME ZONE 'UTC'))
           ORDER BY priority DESC, "createdAt" ASC
           LIMIT 1
           FOR UPDATE SKIP LOCKED
         )
-        RETURNING id, "workflowRunId", "stageId", priority, attempt, "maxAttempts", payload
+        RETURNING id, "workflowRunId", "stageId", priority, attempt, "maxAttempts", payload, "startedAt"
       `;
 
       if (result.length === 0) {
@@ -303,11 +314,7 @@ export class PrismaJobQueue implements JobQueue {
         attempt: job.attempt,
         maxAttempts: job.maxAttempts,
         payload: rest,
-        // Return the JS Date we bound rather than reading the column back,
-        // because the column is a naive timestamp written through
-        // AT TIME ZONE 'UTC' and the bound value is exactly what the Prisma
-        // model API will compare against later.
-        startedAt: now,
+        startedAt: job.startedAt,
       };
     } catch (error) {
       logger.error("Error dequeuing job:", error);
@@ -612,6 +619,18 @@ export class PrismaJobQueue implements JobQueue {
    * Refresh a running job's lease without changing status.
    */
   async touchJob(jobId: string): Promise<void> {
+    if (this.databaseType !== "sqlite" && this.prisma.$queryRaw) {
+      // Renew the lease from the database clock: a heartbeat written from
+      // the application clock while the sweeper reads the database clock
+      // would reintroduce exactly the drift this change removes.
+      await this.prisma.$queryRaw`
+        UPDATE "job_queue"
+        SET "lockedAt" = (now() AT TIME ZONE 'UTC'),
+            "updatedAt" = (now() AT TIME ZONE 'UTC')
+        WHERE id = ${jobId} AND status = 'RUNNING'
+      `;
+      return;
+    }
     await this.prisma.jobQueue.updateMany({
       where: { id: jobId, status: this.enums.status("RUNNING") },
       data: { lockedAt: new Date() },
@@ -619,9 +638,44 @@ export class PrismaJobQueue implements JobQueue {
   }
 
   /**
-   * Release stale locks (for crashed workers)
+   * Release stale locks (for crashed workers).
+   *
+   * On PostgreSQL, the deadline is derived in-database from the same `now()`
+   * the claim stamped, so the sweep does not depend on the sweeping host's
+   * system clock. `"updatedAt"` is set explicitly because a raw `UPDATE`
+   * does not trigger Prisma's `@updatedAt`.
+   *
+   * SQLite has no `now() AT TIME ZONE`, so it keeps the application-clock
+   * comparison (single-process by nature, where the two clocks are the
+   * same clock anyway).
    */
   async releaseStaleJobs(staleThresholdMs: number = 300000): Promise<number> {
+    if (this.databaseType !== "sqlite" && this.prisma.$queryRaw) {
+      // NOTE: deliberately calling `this.prisma.$queryRaw` directly rather
+      // than destructuring it into a local first -- Prisma's runtime reads
+      // internal state off `this` inside its own method bodies.
+      const released = await this.prisma.$queryRaw<Array<{ id: string }>>`
+        UPDATE "job_queue"
+        SET
+          status = 'PENDING',
+          "workerId" = NULL,
+          "lockedAt" = NULL,
+          "updatedAt" = (now() AT TIME ZONE 'UTC')
+        WHERE status = 'RUNNING'
+          AND "lockedAt" IS NOT NULL
+          AND "lockedAt" <
+              (now() AT TIME ZONE 'UTC')
+              - ${staleThresholdMs}::double precision * interval '1 millisecond'
+        RETURNING id
+      `;
+      if (released.length > 0) {
+        logger.debug(
+          `Released ${released.length} stale job(s) (lease older than ${staleThresholdMs}ms by the database clock)`,
+        );
+      }
+      return released.length;
+    }
+
     const thresholdDate = new Date(Date.now() - staleThresholdMs);
 
     const result = await this.prisma.jobQueue.updateMany({
