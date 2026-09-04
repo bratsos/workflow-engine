@@ -144,6 +144,18 @@ export class InMemoryStepLedger implements StepLedger {
     }
   }
 
+  async clearExcept(
+    stageRecordId: string,
+    keepStepIds: string[],
+  ): Promise<void> {
+    const keep = new Set(keepStepIds);
+    for (const [key, record] of this.records) {
+      if (record.stageRecordId !== stageRecordId) continue;
+      if (keep.has(record.stepId)) continue;
+      this.records.delete(key);
+    }
+  }
+
   private key(stageRecordId: string, stepId: string): string {
     return `${stageRecordId}\u0000${stepId}`;
   }

@@ -53,6 +53,8 @@ function killWorkerOnSubmitCompletion(
     },
     list: (stageRecordId) => inner.list(stageRecordId),
     clear: (stageRecordId) => inner.clear(stageRecordId),
+    clearExcept: (stageRecordId, keep) =>
+      inner.clearExcept?.(stageRecordId, keep) ?? inner.clear(stageRecordId),
   };
 }
 

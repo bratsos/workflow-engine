@@ -184,6 +184,16 @@ export class PrismaStepLedger implements StepLedger {
   async clear(stageRecordId: string): Promise<void> {
     await this.prisma.workflowStep.deleteMany({ where: { stageRecordId } });
   }
+
+  async clearExcept(
+    stageRecordId: string,
+    keepStepIds: string[],
+  ): Promise<void> {
+    if (keepStepIds.length === 0) return this.clear(stageRecordId);
+    await this.prisma.workflowStep.deleteMany({
+      where: { stageRecordId, stepId: { notIn: keepStepIds } },
+    });
+  }
 }
 
 export function createPrismaStepLedger(
