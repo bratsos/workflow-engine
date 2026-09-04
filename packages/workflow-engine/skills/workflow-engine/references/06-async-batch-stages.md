@@ -378,6 +378,8 @@ Batch processing runs through the AI SDK provider batch interfaces or directly t
 
 Batch pricing is model-specific (not a flat 50% discount) and is loaded into `batchInputCostPerMillion` / `batchOutputCostPerMillion` in the model catalog.
 
+**Batch discounts do not compound with cache discounts, and the engine never treats them as if they did.** `calculateBatchCost` applies exactly one adjustment to the base price — the vendor's documented percentage on a native transport (`batchDiscountPercent`), or the absolute `":batch"` catalog price on the OpenRouter transport — never both, and the engine models no cached-token bucket at all. That matters because two providers document the opposite of the naive model: Vertex states that "the discounts for cache and batch don't stack; the 90% cache hit discount takes precedence over the batch discount", and the Gemini Developer API bills a `cached_content` hit at context-caching rates rather than batch rates. The engine has no Vertex transport, so the Vertex rule does not apply to it directly; on Google batches that do hit the implicit cache the engine's flat 50% **overstates** cost for the cached tokens (the provider charges 10% of base for them, not 50%). OpenRouter documents a second asymmetry: non-token components — web search, prompt caching — are not discounted at all. Treat the engine's batch figure as an estimate; where a provider reports a cost, `resolveCost` prefers the reported number.
+
 ### Google
 
 Backed by `@ai-sdk/google` (included by default):
@@ -426,6 +428,33 @@ interface BatchOptions {
   maxPartitions?: number;       // Maximum allowed partition count (default: 20)
 }
 ```
+
+### Crash recovery: what happens when a worker dies mid-submit
+
+Creating a batch is a non-idempotent external call. If the worker dies after the provider accepted the creation but before the engine recorded it, a naive replay submits the whole batch again: the first batch is orphaned, still processed, still billed, and never read. Google documents the failure mode explicitly — "if you send the same creation request twice, two separate batch jobs will be created" — and none of the four transports dedupes by content.
+
+`ctx.step.ai.map` therefore submits under the durable step's `externalKey` (see *Non-idempotent external calls* in `12-durable-steps.md`), with one sub-key per partition (`<key>-p0`, `-p1`, ...). Each adapter stamps that key into whatever field the provider exposes at creation, and on a replay of a crashed submit the engine searches for it before creating anything:
+
+| Transport | Field the key is stamped into | Recovery |
+|---|---|---|
+| `openai` | batch `metadata.workflow_engine_external_key` (`POST /v1/batches` takes 16 key-value pairs; `GET /v1/batches` returns them) | Adopted from the batch list |
+| `google` | batch `displayName` (overwriting the AI SDK's generated one; `GET /v1beta/batches` lists it) | Adopted from the batch list |
+| `anthropic` | — Message Batches carry no metadata field | **Not recoverable** |
+| `openrouter` | — the beta batch body takes only `endpoint`, `model`, `requests` | **Not recoverable** |
+
+On the two recoverable transports the replay adopts the existing batch and continues polling it; nothing is submitted twice. A partition the crashed worker never reached is simply created, so a crash halfway through a fan-out costs nothing.
+
+On the two that are not recoverable the engine **stops** rather than paying twice: `batch.submit` throws `BatchNotAdoptableError`, naming the transport and the external key so you can look for the batch the dead worker created. This is a deliberate behaviour change in 1.0.0-alpha.9 — earlier versions silently created and billed a second batch. To restore the old behaviour for a specific map, say so:
+
+```typescript
+await ctx.step.ai.map("extract", items, {
+  model: "gemini-2.5-flash",
+  prompt: (item) => `Extract ${item}`,
+  batch: { onReclaim: "resubmit" },  // default is "adopt"
+});
+```
+
+The adoption search itself is a plain list call over the provider's HTTP API using the same credentials as the submit; it scans up to five pages of 100 batches, newest first. If the lookup fails (a 500, a bad key), the submit fails rather than reporting "no batch found" and duplicating.
 
 ### Provider Resolution & Auto-Detection
 

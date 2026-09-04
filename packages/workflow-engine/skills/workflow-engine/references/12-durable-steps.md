@@ -59,13 +59,13 @@ const result = await harness.run("my-workflow", { docId: "doc-1" });
 expect(result.status).toBe("COMPLETED");
 ```
 
-The Prisma ledger uses the `WorkflowStep` model from the package's `prisma/schema.prisma` (shipped in `node_modules/@bratsos/workflow-engine/prisma/`); consumers add it, with its `attempt`, `leaseExpiresAt` and `deadlineAt` columns, through a migration. The Prisma adapters also require every model *and column* the package schema defines — `migrations/migrate-0.13-to-1.0.md` has the column-level checklist (the `workflow_steps` table, `ai_calls.batchId`/`requestId`, and the columns such as `workflow_stages.attempt`/`version` and `idempotency_keys.createdAt` that every dispatch writes) with SQL, so a consumer that skipped releases can apply them in one migration. The adapters never import `@prisma/client` themselves; they work with any generator output, including Prisma 7's `prisma-client` generator with a custom `output`.
+The Prisma ledger uses the `WorkflowStep` model from the package's `prisma/schema.prisma` (shipped in `node_modules/@bratsos/workflow-engine/prisma/`); consumers add it, with its `attempt`, `leaseExpiresAt`, `deadlineAt` and `externalKey` columns, through a migration. The Prisma adapters also require every model *and column* the package schema defines — `migrations/migrate-0.13-to-1.0.md` has the column-level checklist (the `workflow_steps` table, `ai_calls.batchId`/`requestId`, and the columns such as `workflow_stages.attempt`/`version` and `idempotency_keys.createdAt` that every dispatch writes) with SQL, so a consumer that skipped releases can apply them in one migration. The adapters never import `@prisma/client` themselves; they work with any generator output, including Prisma 7's `prisma-client` generator with a custom `output`.
 
 ## The step API
 
 ```typescript
 interface StepApi {
-  run<T>(id: string, fn: () => Promise<T>, options?: StepRunOptions): Promise<T>;
+  run<T>(id: string, fn: (step: StepRunContext) => Promise<T>, options?: StepRunOptions): Promise<T>;
   waitFor<T>(id: string, opts: StepWaitOptions<T>): Promise<T>;
   waitForSignal<T = unknown>(id: string, opts: { timeout: number | string }): Promise<T>;
   sleep(id: string, duration: number | string): Promise<void>;
@@ -78,6 +78,14 @@ interface StepRunOptions {
                           // how long a crashed worker's step blocks a replay
   retries?: number;       // retries after the first failed attempt; default 0
   retryDelayMs?: number | string; // delay before a retry ("30s"); default 0
+  onReclaim?: "rerun" | "fail";   // taking over an expired lease; default "rerun"
+}
+
+interface StepRunContext {
+  readonly stepId: string;
+  readonly externalKey: string;  // stable name for this body's external effect
+  readonly attempt: number;      // 1 on the first execution
+  readonly isReclaim: boolean;   // an earlier execution of this body may have run
 }
 
 interface StepWaitOptions<T> {
@@ -130,6 +138,46 @@ Suspension is a thrown control-flow error (`StepSuspend`, or `StepInFlight` when
 - A `poll` that throws does not fail the stage: the stage suspends for `pollBackoffMs`. The first three consecutive failures are logged at DEBUG — a batch provider is eventually consistent right after a submit (OpenRouter answers 404 to the first status check) — and the streak escalates to WARN from the fourth on; the count lives on the row (`waitState.pollFailures`) so it survives a replay in another process, and a poll that returns resets it.
 - Signalling a step twice is a no-op; the result carries `alreadyCompleted: true`. Signalling a timed-out step is rejected.
 - If `fn` succeeded but the ledger write failed, `run` throws `StepLedgerWriteError` and does not record a failure, because the side effect already happened; the lease expiry path re-claims on the next replay.
+
+### Non-idempotent external calls: `step.externalKey` and `onReclaim`
+
+Re-running `fn` is safe when `fn` is safe to repeat. It is not safe when `fn` creates something the provider bills or a third party can see — a provider batch, a charge, an outbound message. The dangerous window is narrow and unavoidable: the worker dies *after* the external call took effect and *before* the ledger recorded it. The lease expires, the replay re-claims, and `fn` runs a second time.
+
+The engine cannot make a provider's API idempotent, but it gives the body a name for its effect that survives the crash.
+
+**`step.externalKey`** is derived from the stage record id and the step id (`wfe-` plus a 128-bit hash, 36 characters of `[a-z0-9-]`), so it is identical in every process and on every replay, and it is written to `workflow_steps.externalKey` *before* the body runs. Use it three ways:
+
+```typescript
+const charge = await ctx.step.run("charge", async (step) => {
+  // 1. Send it where the provider dedupes on it.
+  return stripe.charges.create(
+    { amount, currency: "usd" },
+    { idempotencyKey: step.externalKey },
+  );
+});
+
+const job = await ctx.step.run("submit", async (step) => {
+  // 2. On a replay after a crash, look for the effect before making it.
+  if (step.isReclaim) {
+    const existing = await renderApi.findByTag(step.externalKey);
+    if (existing) return existing;
+  }
+  // 3. Stamp it so the search above can work.
+  return renderApi.submit({ ...input, tag: step.externalKey });
+});
+```
+
+`step.isReclaim` is true only when an earlier execution of this body may already have run (an expired lease taken over, or a failed attempt retried); `step.attempt` is that execution count. On the first, clean execution both are `1` / `false`, so the recovery branch costs nothing in the normal case.
+
+Because the key is derived, an operator does not need the running process to find an orphan: `SELECT "externalKey" FROM workflow_steps WHERE "stageRecordId" = ? AND "stepId" = ?` gives the key to search the provider for.
+
+**`onReclaim: "fail"`** is for a body whose effect can be neither deduplicated nor found. Instead of re-running it, the engine fails the step with `StepNotReplaySafeError`, naming the step, the time its lease expired and its external key:
+
+```typescript
+await ctx.step.run("wire-transfer", () => bank.send(order), { onReclaim: "fail" });
+```
+
+The row is left `failed`, so a later replay meets the stored error rather than re-deciding. The default is `"rerun"` — the behaviour of every earlier version — so nothing changes for a step that is safe to retry. `onReclaim` governs the lease-expiry takeover only; it does not affect `retries`, because a body that *threw* has said its effect did not take.
 
 ### Concurrency
 
@@ -252,7 +300,7 @@ for (const r of results) {
 - **Pacing.** `realtime.minDelayMs` (number or `"1s"`) is the minimum spacing between model calls *on one concurrency slot*: after a slot finishes an item it waits that long before taking the next one. With `concurrency: 4` and `minDelayMs: "1s"` the map makes at most four calls per second. Use it instead of a hand-written cooldown between items — a cooldown outside a step re-runs on every replay, and one inside a step burns a ledger row per item.
 - **Failed items do not fail the stage.** An item whose in-process retries are exhausted comes back as `status: "failed"` and the map still resolves; deciding what a failed item means is the stage's job. This is the opposite of a bare `ctx.step.run`, where an exhausted step rethrows its stored error and the stage fails. A failed item carries `errorName` — the `Error.name` of the last failure — so a caller can tell a quota or transport error apart from a content failure without matching on the message. The item's ledger row is recorded as `failed` with the verdict (including `errorName`, `attempts` and tokens) as its result, so a replay of the same attempt reports the same verdict without a model call, while a new job attempt of the stage (the body threw after the map, or the stage is retried for any other reason) re-opens the row and re-prompts the item — `realtime.retries` and `repair.attempts` bound one attempt, job retries bound how many attempts there are. There is no `cause`: map results live in the step ledger and must stay JSON.
 - **Streaming.** `stream: true` sends realtime items through `ctx.ai.streamText` and collects the text instead of calling `generateText`/`generateObject` — the same reason `ctx.step.ai.streamText` exists, for hosts that kill an idle connection. `schema` still applies: the collected text is parsed as JSON, validated, and repaired the usual way. The batch path ignores the flag.
-- **Batch.** `${id}:submit` submits the fan-out exactly once and stores the handle, refs and request ids; `${id}:poll` is a `waitFor` with a stored deadline; `${id}:collect` fetches results with the schemas re-supplied so `validated` is true, and stores only a summary — `total`, `succeeded`, the `failed` items (id, error, tokens, cost) and the `repair` list (the feedback the repair pass will quote back, with the item's batch tokens and cost as the prior attempt). An item appears in exactly one list — `repair` when it will be re-prompted, `failed` only when the batch verdict is final (`repair.attempts: 0`) — so its batch-phase cost is attributed once; a repaired item's verdict continues from that prior (batch cost plus the repair call). Each item's verdict is written to its own `${id}:${itemId}` row, completed or failed, exactly as on the realtime path, so `workflow_steps.result` stays small on a clean batch whatever its size (27 verdicts used to make a 92 KB collect row); the rows follow the collect in item order. Items that failed or did not validate then go through the realtime repair pass, which writes their rows. Nothing is threaded through `suspendedState.metadata`. On Google the engine sends its own conversion of the JSON Schema as the OpenAPI `responseSchema` for inline submissions — Gemini's batch endpoint ignores or rejects `responseJsonSchema`, and the provider's own conversion forwards `oneOf`, which Gemini does not have, so discriminated unions came back flat; the engine's conversion keeps unions (`anyOf`), enums, nullability and array bounds, verified live against a schema with nested discriminated unions. OpenAI's strict structured outputs — native, and through OpenRouter's `:batch` endpoint — reject `oneOf` outright (`'oneOf' is not permitted`), so those batch bodies carry the same rewrite (`oneOf` → `anyOf`, `additionalProperties: false` on every object, every property in `required` with optional ones nullable — and the reply's optional-property nulls removed before validation); the realtime path applies it at the model boundary for every OpenAI, OpenRouter and Google model (see *Structured output portability* in 04-ai-integration.md), so a repair call sends the same portable schema as the batch. When the batch settles with provider-side item failures the poll logs a WARN with the counts, and when more than half of a batch fails — at the provider or in schema validation — `getResults` logs a WARN naming the batch id, the failure class and the first error; that is the signal that every item is being paid for twice. Batch accounting rows carry the item prompt, the model's reply (its raw text when the reply failed validation), and `metadata.batchDurationMs` (the batch wall time; providers report no per-item latency, so there is no per-row `durationMs`).
+- **Batch.** `${id}:submit` submits the fan-out exactly once and stores the handle, refs and request ids — and, because a crashed worker's submit is the one replay that costs real money, it submits under the step's `externalKey` (one sub-key per partition) and on a reclaim adopts the batch already carrying that key instead of creating a second one. On a transport with no field to stamp and search (Anthropic Message Batches, OpenRouter) it throws `BatchNotAdoptableError` rather than duplicating; `batch: { onReclaim: "resubmit" }` restores the older, duplicating behaviour. See *Crash recovery* in 06-async-batch-stages.md for the per-provider table. `${id}:poll` is a `waitFor` with a stored deadline; `${id}:collect` fetches results with the schemas re-supplied so `validated` is true, and stores only a summary — `total`, `succeeded`, the `failed` items (id, error, tokens, cost) and the `repair` list (the feedback the repair pass will quote back, with the item's batch tokens and cost as the prior attempt). An item appears in exactly one list — `repair` when it will be re-prompted, `failed` only when the batch verdict is final (`repair.attempts: 0`) — so its batch-phase cost is attributed once; a repaired item's verdict continues from that prior (batch cost plus the repair call). Each item's verdict is written to its own `${id}:${itemId}` row, completed or failed, exactly as on the realtime path, so `workflow_steps.result` stays small on a clean batch whatever its size (27 verdicts used to make a 92 KB collect row); the rows follow the collect in item order. Items that failed or did not validate then go through the realtime repair pass, which writes their rows. Nothing is threaded through `suspendedState.metadata`. On Google the engine sends its own conversion of the JSON Schema as the OpenAPI `responseSchema` for inline submissions — Gemini's batch endpoint ignores or rejects `responseJsonSchema`, and the provider's own conversion forwards `oneOf`, which Gemini does not have, so discriminated unions came back flat; the engine's conversion keeps unions (`anyOf`), enums, nullability and array bounds, verified live against a schema with nested discriminated unions. OpenAI's strict structured outputs — native, and through OpenRouter's `:batch` endpoint — reject `oneOf` outright (`'oneOf' is not permitted`), so those batch bodies carry the same rewrite (`oneOf` → `anyOf`, `additionalProperties: false` on every object, every property in `required` with optional ones nullable — and the reply's optional-property nulls removed before validation); the realtime path applies it at the model boundary for every OpenAI, OpenRouter and Google model (see *Structured output portability* in 04-ai-integration.md), so a repair call sends the same portable schema as the batch. When the batch settles with provider-side item failures the poll logs a WARN with the counts, and when more than half of a batch fails — at the provider or in schema validation — `getResults` logs a WARN naming the batch id, the failure class and the first error; that is the signal that every item is being paid for twice. Batch accounting rows carry the item prompt, the model's reply (its raw text when the reply failed validation), and `metadata.batchDurationMs` (the batch wall time; providers report no per-item latency, so there is no per-row `durationMs`).
 - **Repair.** On a schema failure the item is re-prompted with its previous output and the Zod issues appended, up to `repair.attempts` times (default 1). `attempts` on the result counts every model call for the item. The repair loop engages when the model *answered* but the answer was unusable: the returned object fails the schema, or the call threw a repairable error — the AI SDK's `NoObjectGeneratedError` (re-exported from the root entry), any error carrying the model's raw text as `text` (or `cause.text`), a `ZodError`, or a JSON `SyntaxError`. An `AIAdapter` that parses model output itself should therefore throw `NoObjectGeneratedError` from `ai` with `text` set to the raw output (and `cause` set to the parse/validation error) so the loop can quote the bad output back to the model; any other thrown error counts against `realtime.retries`, not `repair`.
 - **Expiry.** `onExpiry: "fail"` (default) throws `AiMapBatchFailedError` when the batch fails or the wait times out; `"partial"` returns every item as failed with that error so the stage can decide. Failed items from the batch path carry `errorName` too: `StepTimeoutError`, `AiMapBatchFailedError`, `AiMapBatchItemFailedError` (the provider reported the request as failed) or `AiMapBatchItemMissingError` (the batch returned no result for it).
 - `itemId` values `submit`, `poll` and `collect` are reserved.

@@ -30,6 +30,7 @@ Verified against `git diff` of the package's `prisma/schema.prisma` between 0.13
     attempt        Int       @default(1)
     leaseExpiresAt DateTime?
     deadlineAt     DateTime?
+    externalKey    String?
     result         Json?
     error          String?
     waitState      Json?
@@ -53,6 +54,7 @@ Verified against `git diff` of the package's `prisma/schema.prisma` between 0.13
     "attempt"        INTEGER NOT NULL DEFAULT 1,
     "leaseExpiresAt" TIMESTAMP(3),
     "deadlineAt"     TIMESTAMP(3),
+    "externalKey"    TEXT,
     "result"         JSONB,
     "error"          TEXT,
     "waitState"      JSONB,
@@ -65,7 +67,11 @@ Verified against `git diff` of the package's `prisma/schema.prisma` between 0.13
     ON "workflow_steps"("stageRecordId");
   ```
 
-  `stageRecordId` is the `WorkflowStage.id` of the stage execution; there is deliberately no foreign key, so the ledger can be cleared and re-filled independently of the stage row. `result` holds the JSON the step returned (a `download` step that returns the whole document stores the whole document — return a key or a summary when the payload is large).
+  `stageRecordId` is the `WorkflowStage.id` of the stage execution; there is deliberately no foreign key, so the ledger can be cleared and re-filled independently of the stage row. `result` holds the JSON the step returned (a `download` step that returns the whole document stores the whole document — return a key or a summary when the payload is large). `externalKey` (added in 1.0.0-alpha.9) is the deterministic name of the external effect a `run` body creates, written before the body runs; it is what lets an operator find a provider-side effect orphaned by a crash. **If you created `workflow_steps` from an earlier 1.0 alpha, add the column:**
+
+  ```sql
+  ALTER TABLE "workflow_steps" ADD COLUMN IF NOT EXISTS "externalKey" TEXT;
+  ```
 
 - [ ] **Add `batchId` and `requestId` to `ai_calls`.** The 0.12→0.13 guide asked for these, but the package's own `prisma/schema.prisma` did not carry them until 1.0, so a consumer who copied the package schema is missing them. Both nullable; the unique index is what deduplicates batch cost rows.
 
@@ -336,6 +342,8 @@ What changes: submit happens exactly once (`${id}:submit` step), polling is a st
 - `AdapterTextResponse.object` is what `generateText` with `output` returns as `result.output`.
 
 ## Behaviour changes
+
+- **A reclaimed batch submit no longer creates a second provider batch (1.0.0-alpha.9).** A worker that died between the provider accepting a `ctx.step.ai.map` batch and the ledger recording it left the step `running`; the replay after the lease expired submitted the whole batch again, and the first was orphaned and still billed. Every `run` step now carries a deterministic external key (`workflow_steps.externalKey`, written before the body runs), `ctx.step.run(id, fn)` passes it to the body as `fn({ stepId, externalKey, attempt, isReclaim })`, and the OpenAI and Google batch adapters stamp it into the provider fields they can search (`metadata` and `displayName`) so a reclaimed submit adopts the existing batch. **Add the column** (`ALTER TABLE "workflow_steps" ADD COLUMN IF NOT EXISTS "externalKey" TEXT;`). **One behaviour change:** on Anthropic and OpenRouter, which offer no searchable field, a reclaimed submit now throws `BatchNotAdoptableError` instead of duplicating — pass `batch: { onReclaim: "resubmit" }` on the map to accept the duplicate cost. A step whose body cannot be recovered at all can declare `ctx.step.run(id, fn, { onReclaim: "fail" })`, which fails with `StepNotReplaySafeError` rather than re-executing; the default stays `"rerun"`.
 
 - **Timestamps written by raw statements are explicitly UTC (1.0.0-alpha.8).** The `FOR UPDATE SKIP LOCKED` claim and dequeue and the outbox claim now write `$n::timestamptz AT TIME ZONE 'UTC'` instead of a bare bound `Date`, which Postgres converted through the *session* timezone on the way into the naive `timestamp` columns. On a non-UTC session that put `job_queue.lockedAt` hours in the future and stale-lease recovery never fired — a crashed worker's job stayed `RUNNING` forever, in 0.13 and in the 1.0 alphas alike. **No schema change is required**, but check that you did not map any engine timestamp column to `@db.Timestamptz`: the engine's columns must stay plain Prisma `DateTime` (naive `timestamp` holding UTC), as `prisma/schema.prisma` declares them. If you did map one, revert it with `ALTER TABLE "job_queue" ALTER COLUMN "lockedAt" TYPE timestamp(3) USING "lockedAt" AT TIME ZONE 'UTC';` (same shape for the other columns).
 - **A racing job is re-delivered instead of discarded (1.0.0-alpha.8).** `run.claimPending` enqueues a claimed run's first-stage job *after* the claim transaction commits, so a job loop can no longer dequeue a job whose run is still `PENDING` — a race that wedged the majority of runs at a short `jobPollIntervalMs` in 0.13 and in the 1.0 alphas alike. `JobExecuteResult` gains `ghostReason` (`"race"` | `"orphan"`) next to `ghost: true`; the built-in hosts re-deliver a `"race"` and still fail an `"orphan"` terminally. Nothing to change unless you wrote your own host loop against `ghost`: it keeps working, but read `ghostReason` to pick the recovery up.
