@@ -14,11 +14,12 @@
  *  - `run.claimPending` (`attemptMode: "none"`, `createMode: "upsert"`):
  *    first execution group of a fresh run; upsert tolerates orphaned
  *    stage rows from a previously-interrupted claim.
- *  - `run.transition` (`attemptMode: "max"`, `createMode: "upsert"`):
- *    propagates the run's current max stage attempt to newly-created
- *    downstream groups, so annotations from a single rerun span share one
- *    attempt value (distinguishable from prior-attempt annotations
- *    preserved via SetNull). Upsert tolerates a re-dispatched transition.
+ *  - `run.transition` (`attemptMode: "none"`, `createMode: "upsert"`):
+ *    a downstream stage that has never executed starts at attempt 0.
+ *    `WorkflowStage.attempt` counts the executions of that stage's own
+ *    row (job retries and `run.rerunFrom` reruns), so an upstream stage's
+ *    retries must not be copied onto it. Upsert tolerates a re-dispatched
+ *    transition.
  *  - `run.rerunFrom` (`attemptMode: "max+1"`, `createMode: "create"`,
  *    `filterPending: false`): the target group's prior stage records were
  *    just deleted, so every record here is guaranteed fresh — `create`
@@ -39,10 +40,9 @@ export interface PrepareExecutionGroupOptions {
   /**
    * How to compute the `attempt` stamped on each new stage record:
    *  - `"none"` — omit `attempt` entirely (persistence defaults to 0).
-   *  - `"max"` — the max `attempt` across the run's existing stage records.
    *  - `"max+1"` — one past the max `attempt` among `attemptSourceStages`.
    */
-  attemptMode: "none" | "max" | "max+1";
+  attemptMode: "none" | "max+1";
   /**
    * `"upsert"` — idempotent create-or-update, safe to call repeatedly
    * (e.g. from a re-dispatched command or an orphaned stage row left by a
@@ -73,13 +73,7 @@ export async function prepareExecutionGroup(
   const stages = workflow.getStagesInExecutionGroup(groupIndex);
 
   let attempt: number | undefined;
-  if (attemptMode === "max") {
-    const existingStages = await deps.persistence.getStagesByRun(run.id);
-    attempt = existingStages.reduce(
-      (max, s) => (s.attempt > max ? s.attempt : max),
-      0,
-    );
-  } else if (attemptMode === "max+1") {
+  if (attemptMode === "max+1") {
     const source = options.attemptSourceStages ?? [];
     attempt =
       source.reduce((max, s) => (s.attempt > max ? s.attempt : max), 0) + 1;

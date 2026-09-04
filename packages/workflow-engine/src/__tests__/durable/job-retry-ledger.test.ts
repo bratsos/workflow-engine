@@ -112,6 +112,56 @@ describe("failed steps across a job retry", () => {
     ]);
   });
 
+  it("leaves the next stage at attempt 0 after an upstream stage retried", async () => {
+    let executions = 0;
+    const workflow = defineWorkflow("job-retry-downstream-attempt", {
+      input: In,
+    })
+      .stage("first", {
+        schemas: {
+          input: In,
+          output: z.object({ n: z.number() }),
+          config: z.object({}),
+        },
+        async execute() {
+          executions++;
+          if (executions === 1) throw new Error("503 Service Unavailable");
+          return { output: { n: executions } };
+        },
+      })
+      .stage("second", {
+        schemas: {
+          input: z.object({ n: z.number() }),
+          output: z.object({ n: z.number() }),
+          config: z.object({}),
+        },
+        async execute(ctx) {
+          return { output: { n: ctx.input.n + 1 } };
+        },
+      })
+      .build();
+    const harness = createTestHarness({ workflows: [workflow] });
+
+    const result = await harness.run("job-retry-downstream-attempt", {
+      items: [],
+    });
+
+    expect(result.status).toBe("COMPLETED");
+    expect(result.output).toEqual({ n: 3 });
+    const first = await harness.persistence.getStage(
+      result.workflowRunId,
+      "first",
+    );
+    expect(first).toMatchObject({ status: "COMPLETED", attempt: 1 });
+    // A stage that never retried starts at 0; the retry count of `first`
+    // is not copied onto it.
+    const second = await harness.persistence.getStage(
+      result.workflowRunId,
+      "second",
+    );
+    expect(second).toMatchObject({ status: "COMPLETED", attempt: 0 });
+  });
+
   it("clears the stale errorMessage when the retried attempt completes through a suspension", async () => {
     let executions = 0;
     let polls = 0;

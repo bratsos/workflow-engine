@@ -115,7 +115,7 @@ async function attemptRunTransition(
     }
     const enqueue = await prepareExecutionGroup(run, workflow, deps, {
       groupIndex: 1,
-      attemptMode: "max",
+      attemptMode: "none",
       createMode: "upsert",
     });
 
@@ -212,7 +212,7 @@ async function attemptRunTransition(
     }
     const enqueue = await prepareExecutionGroup(run, workflow, deps, {
       groupIndex: maxGroup + 1,
-      attemptMode: "max",
+      attemptMode: "none",
       createMode: "upsert",
     });
     return {

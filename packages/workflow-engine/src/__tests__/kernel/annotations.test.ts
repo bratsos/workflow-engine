@@ -1019,10 +1019,12 @@ describe("annotations: attempt auto-increment on rerun", () => {
   });
 });
 
-describe("annotations: attempt propagates to downstream stages after rerun", () => {
-  it("downstream stages enqueued via run.transition inherit the rerun attempt", async () => {
+describe("annotations: attempt is per stage row, not per rerun span", () => {
+  it("downstream stages recreated via run.transition after a rerun start at attempt 0", async () => {
     // Two-stage pipeline. After rerunFrom from stage1, run.transition
-    // enqueues stage2 with the new attempt (not the default 0).
+    // recreates stage2 as a fresh row: its attempt is 0 (the rerun bumped
+    // stage1's row, not stage2's), so annotations from both executions of
+    // stage2 carry attempt 0 while stage1's carry 0 then 1.
     const stage1 = defineStage({
       id: "stage1",
       name: "Stage 1",
@@ -1109,8 +1111,7 @@ describe("annotations: attempt propagates to downstream stages after rerun", () 
       stageId: "stage1",
       config: {},
     });
-    // run.transition enqueues stage2 — this is the key fix: stage2's
-    // new record must inherit attempt=1 from the run-level rerun.
+    // run.transition recreates stage2 as a fresh row at attempt 0.
     await kernel.dispatch({
       type: "run.transition",
       workflowRunId: runId,
@@ -1123,12 +1124,17 @@ describe("annotations: attempt propagates to downstream stages after rerun", () 
       config: {},
     });
 
+    const stage2Record = await persistence.getStage(runId, "stage2");
+    expect(stage2Record?.attempt).toBe(0);
+    const stage1Record = await persistence.getStage(runId, "stage1");
+    expect(stage1Record?.attempt).toBe(1);
+
     const all = await kernel.annotations.list(runId);
+    const stage1Annotations = all.filter((a) => a.scopeId === "stage1");
+    expect(stage1Annotations.map((a) => a.attempt).sort()).toEqual([0, 1]);
     const stage2Annotations = all.filter((a) => a.scopeId === "stage2");
-    // Should have one annotation per attempt for stage2.
     expect(stage2Annotations).toHaveLength(2);
-    const attempts = stage2Annotations.map((a) => a.attempt).sort();
-    expect(attempts).toEqual([0, 1]);
+    expect(stage2Annotations.map((a) => a.attempt)).toEqual([0, 0]);
   });
 });
 
