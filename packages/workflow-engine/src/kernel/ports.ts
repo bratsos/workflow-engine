@@ -259,6 +259,14 @@ export interface BlobStore {
 export interface JobTransport {
   /**
    * Enqueue multiple stages in parallel (same execution group).
+  /**
+   * The dotted `groupBy` path this transport's fairness cap reads, or `null`
+   * when fairness is off (or undefined when unsupported). Read by
+   * `createSpillingJobTransport` so a spilled payload still carries its group
+   * key.
+   */
+  readonly fairnessGroupBy?: string | null;
+
    *
    * Idempotent on `(workflowRunId, stageId)`: at most one job row exists
    * per stage per run, so a transport MUST replace any row already queued

@@ -346,7 +346,55 @@ export function withStepResultSpill(
 // JobTransport decorator
 // ============================================================================
 
-export interface SpillingJobTransportOptions extends PayloadSpillOptions {}
+export interface SpillingJobTransportOptions extends PayloadSpillOptions {
+  /**
+   * Dotted path into the job payload naming the fairness group. Defaults to
+   * the wrapped transport's own `fairnessGroupBy` when it exposes one (the
+   * Prisma job queue does), so a queue with fairness configured needs no extra
+   * configuration here. When set (or discovered) and a payload is about to
+   * spill, the value at that path is hoisted onto `EnqueueJobInput.groupKey`
+   * before the body is packed, so the queue row still carries the group and
+   * starvation protection survives spilling.
+   */
+  groupBy?: string;
+}
+
+/**
+ * Splits a dotted payload path into segments matching the convention used by
+ * PrismaJobQueue. Kept local rather than exported from job-queue.ts to avoid
+ * coupling kernel spilling to the Prisma persistence module.
+ */
+function splitGroupPath(groupBy: string): string[] {
+  const segments = groupBy.split(".").filter((s) => s.length > 0);
+  if (segments.length === 0) {
+    throw new Error(
+      `JobQueueFairness.groupBy must name at least one payload field, got ${JSON.stringify(groupBy)}`,
+    );
+  }
+  return segments;
+}
+
+/**
+ * Resolves a nested property from a payload object along the given key path.
+ * Returns undefined if any intermediate property is not an object or if the
+ * final value is absent. Values that are objects, arrays, null, or undefined
+ * are ignored because they cannot serve as a sensible group key.
+ */
+function extractGroupValue(payload: unknown, segments: string[]): unknown {
+  let current: unknown = payload;
+  for (const segment of segments) {
+    if (
+      current === null ||
+      current === undefined ||
+      typeof current !== "object" ||
+      Array.isArray(current)
+    ) {
+      return undefined;
+    }
+    current = (current as Record<string, unknown>)[segment];
+  }
+  return current;
+}
 
 /**
  * Wraps a `JobTransport` so job payloads above the threshold live in the
@@ -375,6 +423,8 @@ export function createSpillingJobTransport(
 ): JobTransport {
   const spill = createPayloadSpill(options);
 
+  const groupByPath = options.groupBy ?? transport.fairnessGroupBy ?? null;
+  const groupSegments = groupByPath ? splitGroupPath(groupByPath) : null;
   async function resolvePayload(
     payload: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
@@ -388,10 +438,32 @@ export function createSpillingJobTransport(
         jobs.map(async (job) => {
           if (job.payload === undefined) return job;
           const payload = await spill.pack(
+          const originalGroupValue =
+            groupSegments && job.groupKey === undefined
+              ? extractGroupValue(job.payload, groupSegments)
+              : undefined;
             jobSpillKey(job.workflowRunId, job.stageId),
             job.payload,
           );
-          return { ...job, payload: payload as Record<string, unknown> };
+          // Only hoist the group value to `groupKey` when the payload actually
+          // spilled. Inline rows retain their full payload in the database row,
+          // so Postgres can read the group key directly from the configured
+          // path; hoisting for inline rows is unnecessary and would alter
+          // grouping semantics for existing inline consumers.
+          const shouldHoistGroupKey =
+            isSpillRef(payload) &&
+            job.groupKey === undefined &&
+            (typeof originalGroupValue === "string" ||
+              (typeof originalGroupValue === "number" &&
+                Number.isFinite(originalGroupValue)));
+
+          return {
+            ...job,
+            ...(shouldHoistGroupKey
+              ? { groupKey: String(originalGroupValue) }
+              : {}),
+            payload: payload as Record<string, unknown>,
+          };
         }),
       );
       return transport.enqueueParallel(packed);

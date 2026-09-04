@@ -957,6 +957,14 @@ export interface JobQueue {
    * cannot carry the stamp.
    */
   fail(
+  /**
+   * The dotted `groupBy` path this queue's fairness cap reads, or `null` when
+   * fairness is off (or undefined when unsupported). Read by
+   * `createSpillingJobTransport` so a spilled payload still carries its group
+   * key.
+   */
+  readonly fairnessGroupBy?: string | null;
+
     jobId: string,
     error: string,
     shouldRetry?: boolean,

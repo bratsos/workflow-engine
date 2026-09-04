@@ -125,6 +125,13 @@ export class PrismaJobQueue implements JobQueue {
     this.databaseType = options.databaseType ?? "postgresql";
     this.now = options.now ?? (() => new Date());
     this.fairnessPath = options.fairness
+  /**
+   * The dotted `groupBy` path this queue's fairness cap reads, or `null` when
+   * fairness is off. Read by `createSpillingJobTransport` so a spilled payload
+   * still carries its group key.
+   */
+  readonly fairnessGroupBy: string | null;
+
       ? splitGroupPath(options.fairness.groupBy ?? "_groupKey")
       : null;
     this.fairnessLimit = options.fairness
@@ -134,6 +141,9 @@ export class PrismaJobQueue implements JobQueue {
       throw new Error(
         "JobQueueFairness is only implemented on the PostgreSQL dequeue path",
       );
+    this.fairnessGroupBy = options.fairness
+      ? (options.fairness.groupBy ?? "_groupKey")
+      : null;
     }
   }
 
@@ -317,6 +327,11 @@ export class PrismaJobQueue implements JobQueue {
       //   as the only candidate, which is what actually breaks the starvation.
       // - `FOR UPDATE OF j SKIP LOCKED` names the base table explicitly: a
       //   plain `FOR UPDATE` is rejected on the nullable side of the LEFT
+      // - Fallback to `_groupKey`: a spilled payload is replaced by a claim-check
+      //   reference, so the configured path is gone from the row; `_groupKey`
+      //   is written outside the body by `enqueueData` and survives spilling,
+      //   so it is the fallback. When `groupBy` is already `"_groupKey"` the
+      //   fallback is a no-op.
       //   JOIN against the per-group counts.
       // - The payload path is a bound `text[]` for `#>>`, never interpolated,
       //   so a `groupBy` from configuration cannot reach the statement as SQL.
@@ -326,7 +341,7 @@ export class PrismaJobQueue implements JobQueue {
       const result = this.fairnessPath
         ? await this.prisma.$queryRaw<DequeuedJobRow[]>`
         WITH "group_load" AS (
-          SELECT COALESCE(payload #>> ${this.fairnessPath}::text[], '') AS grp,
+          SELECT COALESCE(payload #>> ${this.fairnessPath}::text[], payload ->> '_groupKey', '') AS grp,
                  count(*) AS running
           FROM "job_queue"
           WHERE status = 'RUNNING'
@@ -343,7 +358,7 @@ export class PrismaJobQueue implements JobQueue {
           SELECT j.id
           FROM "job_queue" j
           LEFT JOIN "group_load" g
-            ON g.grp = COALESCE(j.payload #>> ${this.fairnessPath}::text[], '')
+            ON g.grp = COALESCE(j.payload #>> ${this.fairnessPath}::text[], j.payload ->> '_groupKey', '')
           WHERE j.status = 'PENDING'
             AND (j."nextPollAt" IS NULL
                  OR j."nextPollAt" <= (now() AT TIME ZONE 'UTC'))
