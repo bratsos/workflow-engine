@@ -188,10 +188,11 @@ interface JobQueue {
   enqueueParallel(jobs: EnqueueJobInput[]): Promise<string[]>;
   deleteByRunAndStages(workflowRunId: string, stageIds: string[]): Promise<number>;
   dequeue(): Promise<DequeueResult | null>;
-  complete(jobId: string): Promise<void>;
-  suspend(jobId: string, nextPollAt: Date): Promise<void>;
-  fail(jobId: string, error: string, shouldRetry?: boolean): Promise<void>;
+  complete(jobId: string, fence?: JobAckFence): Promise<JobAckOutcome>;
+  suspend(jobId: string, nextPollAt: Date, fence?: JobAckFence): Promise<JobAckOutcome>;
+  fail(jobId: string, error: string, shouldRetry?: boolean, fence?: JobAckFence): Promise<JobAckOutcome>;
   releaseStaleJobs(staleThresholdMs?: number): Promise<number>;
+  expireRunawayJobs?(absoluteTimeoutMs: number): Promise<number>;
   cancelByRun(workflowRunId: string): Promise<number>;
   getJobsByWorkflowRun(workflowRunId: string): Promise<JobRecord[]>;
   touchJob(jobId: string): Promise<void>;
@@ -218,6 +219,100 @@ interface JobQueue {
 
 Both are covered by `jobQueueConformanceSuite`, so a custom `JobQueue` gets the
 same checks the built-in adapters do.
+
+### Fenced acknowledgements
+
+`dequeue()` hands back `startedAt` next to `attempt`. The pair is that claim's
+*attempt stamp*, and passing it back as a `JobAckFence` (`{ startedAt, attempt }`)
+on `complete`, `fail` or `suspend` conditions the write on the job still being
+the `RUNNING` attempt it describes:
+
+```sql
+UPDATE job_queue SET ... WHERE id = $1 AND status = 'RUNNING'
+                           AND "startedAt" = $2 AND attempt = $3
+```
+
+Without it, a worker that stalls past `staleLeaseThresholdMs` has its job
+rescued by `releaseStaleJobs` and re-claimed by someone else -- and then, on
+waking, marks the *new* attempt COMPLETED and discards the work that attempt is
+actually doing. With it, the stale write matches nothing, changes nothing and
+comes back as `"superseded"`, which the built-in hosts log (and, on the
+completed path, use to skip the `run.transition` the newer attempt owns). An
+unfenced call keeps the older unconditional behaviour and always returns
+`"acknowledged"`, so a transport that cannot carry the stamp still works.
+
+`touchJob` is deliberately unfenced: a stale heartbeat only refreshes whichever
+attempt currently owns the row, which costs the newer attempt nothing.
+
+`jobQueueConformanceSuite` covers both the fenced and unfenced paths.
+
+### Per-group fairness (opt-in, PostgreSQL)
+
+By default the dequeue orders by `priority DESC, "createdAt" ASC` and nothing
+else, so a tenant that enqueues 100k jobs puts every later arrival from every
+other tenant behind all 100k. `JobQueueFairness` fixes that:
+
+```typescript
+const jobQueue = createPrismaJobQueue(prisma, {
+  fairness: {
+    // How many jobs one group may hold RUNNING at once. No default -- size it
+    // to your pool, roughly `workers / groups active at once`, never below 1.
+    maxConcurrentPerGroup: 4,
+    // Where the group key lives in the job payload. Defaults to "_groupKey",
+    // which is what EnqueueJobInput.groupKey writes.
+    groupBy: "config.tenantId",
+  },
+});
+```
+
+**It is a concurrency cap, not a reordering.** A group already holding
+`maxConcurrentPerGroup` RUNNING jobs is excluded from the claim entirely, which
+leaves a quiet group's job as the only candidate. Reordering cannot fix
+starvation: whatever rule ranks the pending rows, the flooding group's next row
+is re-ranked to the front the moment its previous one is claimed. This is
+pg-boss v12's group-concurrency mechanism.
+
+**Which key to use.** The kernel's own enqueue paths (`run.claimPending`,
+`run.transition`, `run.reapStuck`) enqueue from the run record and do not set
+`groupKey`, but they do copy the run's `config` into the job payload -- so for
+kernel-driven workflows point `groupBy` at a field of the run config, e.g.
+`"config.tenantId"`. `EnqueueJobInput.groupKey` (stored as `payload._groupKey`,
+and stripped again before the payload reaches a stage) is for callers that
+enqueue jobs directly. Jobs with no value at the path share one anonymous
+group, which is capped like any other.
+
+**Cost.** Measured on Postgres 16, one connection, flat priorities, 200
+sequential claims per run:
+
+| Ready jobs / groups | Default claim | Fair claim | Ratio |
+| --- | --- | --- | --- |
+| 1,000 / 5 | 1.65 ms mean | 1.55 ms | 0.94x |
+| 10,000 / 10 | 2.66 ms mean | 4.37 ms | 1.64x |
+| 50,000 / 100 | 7.90 ms mean | 17.30 ms | 2.19x |
+
+Fairness is materially more expensive on a deep queue -- the claim joins the
+candidate rows against a per-group count of everything RUNNING, where the
+default statement stops at the first index entry -- which is why it is opt-in
+and off by default. On a shallow queue it is free. It is PostgreSQL only;
+constructing a SQLite queue with `fairness` throws at wiring time rather than
+silently ignoring it.
+
+### Two-tier lease expiry
+
+`releaseStaleJobs` is the fine-grained tier: it compares `lockedAt`, which
+`touchJob` refreshes on every heartbeat, so it catches a worker that *stopped*.
+It cannot catch a worker that is alive but wedged, because that worker keeps
+heartbeating. `expireRunawayJobs(absoluteTimeoutMs)` -- optional on the port, so
+an older adapter still compiles -- is the coarse backstop: it compares
+`startedAt`, stamped once per claim and refreshed by nothing, and fails the job
+terminally.
+
+Both stamp `lastError` with an exported prefix so the two are distinguishable
+after the fact: `LEASE_HEARTBEAT_LOST` (requeued `PENDING`) and
+`LEASE_ABSOLUTE_CAP` (`FAILED`). A custom adapter should write the same prefixes.
+The kernel sweeps the heartbeat tier first, so a dead worker's job is retried
+rather than dead-lettered. Defaults and the host knobs live in
+03-runtime-setup.md.
 
 ## AICallLogger Interface
 

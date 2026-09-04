@@ -192,7 +192,10 @@ export type {
   CreateStageInput,
   DequeueResult,
   EnqueueJobInput,
+  JobAckFence,
+  JobAckOutcome,
   JobQueue,
+  JobQueueFairness,
   JobRecord,
   LogLevel,
   PersistenceCore,
@@ -298,4 +301,8 @@ export type {
   IdempotencyRecord,
   OutboxRecord,
 } from "./persistence/interface";
-export { StaleVersionError } from "./persistence/interface";
+export {
+  LEASE_ABSOLUTE_CAP,
+  LEASE_HEARTBEAT_LOST,
+  StaleVersionError,
+} from "./persistence/interface";

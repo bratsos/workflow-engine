@@ -228,11 +228,22 @@ export interface StepSignalResult {
 export interface LeaseReapStaleCommand {
   readonly type: "lease.reapStale";
   readonly staleThresholdMs: number;
+  /**
+   * Absolute cap (ms) on how long one claim may hold its lease, measured
+   * from `startedAt` and therefore unaffected by heartbeating. Jobs past it
+   * are failed terminally with the `LEASE_ABSOLUTE_CAP` reason. Omit, or
+   * pass 0, to run the heartbeat tier alone (the pre-1.0.0-alpha.9
+   * behaviour). Ignored by a transport with no `expireRunawayJobs`.
+   */
+  readonly absoluteTimeoutMs?: number;
 }
 
 /** Result of a `lease.reapStale` command. */
 export interface LeaseReapStaleResult {
+  /** Jobs the heartbeat tier requeued for another worker. */
   readonly released: number;
+  /** Jobs the absolute tier failed as runaways. */
+  readonly expired: number;
 }
 
 // ---------------------------------------------------------------------------

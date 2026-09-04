@@ -8,11 +8,16 @@
  */
 
 import { createLogger } from "../../utils/logger";
-import type {
-  DequeueResult,
-  EnqueueJobInput,
-  JobQueue,
-  JobRecord,
+import {
+  type DequeueResult,
+  type EnqueueJobInput,
+  type JobAckFence,
+  type JobAckOutcome,
+  type JobQueue,
+  type JobQueueFairness,
+  type JobRecord,
+  LEASE_ABSOLUTE_CAP,
+  LEASE_HEARTBEAT_LOST,
 } from "../interface";
 import { createEnumHelper, type PrismaEnumHelper } from "./enum-compat";
 import type { DatabaseType } from "./persistence";
@@ -29,6 +34,44 @@ const MAX_DEQUEUE_ATTEMPTS = 10;
 // Structural client type -- see prisma-client-type.ts.
 type PrismaClient = EnginePrismaClient;
 
+/**
+ * Row shape returned by the raw dequeue claim UPDATE statement.
+ */
+type DequeuedJobRow = {
+  id: string;
+  workflowRunId: string;
+  stageId: string;
+  priority: number;
+  attempt: number;
+  maxAttempts: number;
+  payload: unknown;
+  startedAt: Date;
+};
+
+/**
+ * Splits a dotted payload path into the segments Postgres's `#>>` operator
+ * takes as a `text[]`. Bound as a parameter, never interpolated, so a path
+ * from configuration cannot reach the statement as SQL.
+ */
+function requireGroupLimit(maxConcurrentPerGroup: number): number {
+  if (!Number.isInteger(maxConcurrentPerGroup) || maxConcurrentPerGroup < 1) {
+    throw new Error(
+      `JobQueueFairness.maxConcurrentPerGroup must be an integer of at least 1, got ${maxConcurrentPerGroup}`,
+    );
+  }
+  return maxConcurrentPerGroup;
+}
+
+function splitGroupPath(groupBy: string): string[] {
+  const segments = groupBy.split(".").filter((s) => s.length > 0);
+  if (segments.length === 0) {
+    throw new Error(
+      `JobQueueFairness.groupBy must name at least one payload field, got ${JSON.stringify(groupBy)}`,
+    );
+  }
+  return segments;
+}
+
 export interface PrismaJobQueueOptions {
   /**
    * Unique worker identifier. Defaults to auto-generated ID.
@@ -40,12 +83,22 @@ export interface PrismaJobQueueOptions {
    */
   databaseType?: DatabaseType;
   /**
-   * Time source for the timestamps the raw dequeue statement writes.
-   * Defaults to `() => new Date()`; bound as a parameter and converted
-   * with `AT TIME ZONE 'UTC'`, never `NOW()` and never session-local
-   * (see utc-timestamps.ts).
+   * Time source for deterministic tests.
+   *
+   * Does not affect PostgreSQL lease timestamps (`lockedAt`, `startedAt`),
+   * which are derived directly from the database clock. It remains the time
+   * source for the SQLite dequeue path and for timestamps written outside the
+   * raw statement (such as dead-job acknowledgements). Defaults to
+   * `() => new Date()`.
    */
   now?: () => Date;
+  /**
+   * Per-group fairness for the dequeue. Omit (the default) and the claim
+   * statement is exactly the one shipped before 1.0.0-alpha.9: index scan,
+   * first row, no per-group accounting. See `JobQueueFairness`; PostgreSQL
+   * only.
+   */
+  fairness?: JobQueueFairness;
 }
 
 export class PrismaJobQueue implements JobQueue {
@@ -59,6 +112,8 @@ export class PrismaJobQueue implements JobQueue {
   private prisma: PrismaClient;
   private enums: PrismaEnumHelper;
   private databaseType: DatabaseType;
+  private readonly fairnessPath: string[] | null;
+  private readonly fairnessLimit: number;
 
   private readonly now: () => Date;
 
@@ -69,6 +124,17 @@ export class PrismaJobQueue implements JobQueue {
     this.enums = createEnumHelper(prisma);
     this.databaseType = options.databaseType ?? "postgresql";
     this.now = options.now ?? (() => new Date());
+    this.fairnessPath = options.fairness
+      ? splitGroupPath(options.fairness.groupBy ?? "_groupKey")
+      : null;
+    this.fairnessLimit = options.fairness
+      ? requireGroupLimit(options.fairness.maxConcurrentPerGroup)
+      : 0;
+    if (this.fairnessPath && this.databaseType === "sqlite") {
+      throw new Error(
+        "JobQueueFairness is only implemented on the PostgreSQL dequeue path",
+      );
+    }
   }
 
   /** The `create` args for one enqueued job. */
@@ -80,6 +146,7 @@ export class PrismaJobQueue implements JobQueue {
       payload: {
         ...job.payload,
         _workflowId: job.workflowId,
+        ...(job.groupKey !== undefined ? { _groupKey: job.groupKey } : {}),
       } as unknown,
       status: this.enums.status("PENDING"),
       nextPollAt: job.scheduledFor ?? null,
@@ -224,40 +291,87 @@ export class PrismaJobQueue implements JobQueue {
           "Prisma client does not support $queryRaw (required for the Postgres dequeue path)",
         );
       }
-      const now = this.now();
-      // `AT TIME ZONE 'UTC'` on every bound Date: without it Postgres
-      // converts the timestamptz parameter into the naive `timestamp`
-      // columns through the *session* timezone, so on a non-UTC session
-      // `lockedAt` lands in the future and its lease never goes stale
-      // (see utc-timestamps.ts).
-      const result = await this.prisma.$queryRaw<
-        Array<{
-          id: string;
-          workflowRunId: string;
-          stageId: string;
-          priority: number;
-          attempt: number;
-          maxAttempts: number;
-          payload: unknown;
-        }>
-      >`
+      // `now() AT TIME ZONE 'UTC'` renders the transaction's instant as the
+      // naive UTC wall clock these `timestamp(3)` columns store, so it is
+      // correct on any session timezone -- unlike a bare `NOW()`, which
+      // converts through the session's zone (see utc-timestamps.ts).
+      //
+      // Using the database clock rather than a bound `Date` means the writer
+      // of a lease and the sweeper that expires it are the same clock, so a
+      // host whose system clock drifts can neither shorten nor extend a
+      // lease. This is what pg-boss, Graphile Worker, River and Oban all do.
+      //
+      // `startedAt` comes back through `RETURNING` because it is the fence a
+      // worker hands to `complete`/`fail`/`suspend`; the application no
+      // longer knows the value it wrote.
+      //
+      // The fair variant below excludes any group that already holds
+      // `maxConcurrentPerGroup` RUNNING jobs, which is pg-boss v12's
+      // group-concurrency mechanism.
+      //
+      // - It has to be a *cap*, not an ordering. Any ordering rule loses to a
+      //   flood: whatever ranks the pending rows, the flooding group's next
+      //   row is re-ranked to the front the instant its previous one is
+      //   claimed, so a quiet group still waits behind the whole flood.
+      //   Excluding a group already at its share leaves the quiet group's job
+      //   as the only candidate, which is what actually breaks the starvation.
+      // - `FOR UPDATE OF j SKIP LOCKED` names the base table explicitly: a
+      //   plain `FOR UPDATE` is rejected on the nullable side of the LEFT
+      //   JOIN against the per-group counts.
+      // - The payload path is a bound `text[]` for `#>>`, never interpolated,
+      //   so a `groupBy` from configuration cannot reach the statement as SQL.
+      // - Cost: the CTE aggregates every RUNNING row per claim, where the
+      //   default statement stops at the first index entry. That is why
+      //   fairness is opt-in; the measured difference is in the release notes.
+      const result = this.fairnessPath
+        ? await this.prisma.$queryRaw<DequeuedJobRow[]>`
+        WITH "group_load" AS (
+          SELECT COALESCE(payload #>> ${this.fairnessPath}::text[], '') AS grp,
+                 count(*) AS running
+          FROM "job_queue"
+          WHERE status = 'RUNNING'
+          GROUP BY 1
+        )
         UPDATE "job_queue"
         SET
           status = 'RUNNING',
           "workerId" = ${this.workerId},
-          "lockedAt" = ${now}::timestamptz AT TIME ZONE 'UTC',
-          "startedAt" = ${now}::timestamptz AT TIME ZONE 'UTC',
+          "lockedAt" = (now() AT TIME ZONE 'UTC'),
+          "startedAt" = (now() AT TIME ZONE 'UTC'),
+          attempt = attempt + 1
+        WHERE id = (
+          SELECT j.id
+          FROM "job_queue" j
+          LEFT JOIN "group_load" g
+            ON g.grp = COALESCE(j.payload #>> ${this.fairnessPath}::text[], '')
+          WHERE j.status = 'PENDING'
+            AND (j."nextPollAt" IS NULL
+                 OR j."nextPollAt" <= (now() AT TIME ZONE 'UTC'))
+            AND COALESCE(g.running, 0) < ${this.fairnessLimit}::bigint
+          ORDER BY j.priority DESC, j."createdAt" ASC
+          LIMIT 1
+          FOR UPDATE OF j SKIP LOCKED
+        )
+        RETURNING id, "workflowRunId", "stageId", priority, attempt, "maxAttempts", payload, "startedAt"
+      `
+        : await this.prisma.$queryRaw<DequeuedJobRow[]>`
+        UPDATE "job_queue"
+        SET
+          status = 'RUNNING',
+          "workerId" = ${this.workerId},
+          "lockedAt" = (now() AT TIME ZONE 'UTC'),
+          "startedAt" = (now() AT TIME ZONE 'UTC'),
           attempt = attempt + 1
         WHERE id = (
           SELECT id FROM "job_queue"
           WHERE status = 'PENDING'
             AND ("nextPollAt" IS NULL
-                 OR "nextPollAt" <= ${now}::timestamptz AT TIME ZONE 'UTC')
+                 OR "nextPollAt" <= (now() AT TIME ZONE 'UTC'))
           ORDER BY priority DESC, "createdAt" ASC
           LIMIT 1
           FOR UPDATE SKIP LOCKED
         )
-        RETURNING id, "workflowRunId", "stageId", priority, attempt, "maxAttempts", payload
+        RETURNING id, "workflowRunId", "stageId", priority, attempt, "maxAttempts", payload, "startedAt"
       `;
 
       if (result.length === 0) {
@@ -291,7 +405,7 @@ export class PrismaJobQueue implements JobQueue {
       );
 
       const payload = job.payload as Record<string, unknown>;
-      const { _workflowId, ...rest } = payload;
+      const { _workflowId, _groupKey, ...rest } = payload;
       return {
         jobId: job.id,
         workflowRunId: job.workflowRunId,
@@ -301,6 +415,7 @@ export class PrismaJobQueue implements JobQueue {
         attempt: job.attempt,
         maxAttempts: job.maxAttempts,
         payload: rest,
+        startedAt: job.startedAt,
       };
     } catch (error) {
       logger.error("Error dequeuing job:", error);
@@ -375,7 +490,11 @@ export class PrismaJobQueue implements JobQueue {
       );
 
       const claimedPayload = claimedJob.payload as Record<string, unknown>;
-      const { _workflowId: claimedWfId, ...claimedRest } = claimedPayload;
+      const {
+        _workflowId: claimedWfId,
+        _groupKey,
+        ...claimedRest
+      } = claimedPayload;
       return {
         jobId: claimedJob.id,
         workflowRunId: claimedJob.workflowRunId,
@@ -385,6 +504,7 @@ export class PrismaJobQueue implements JobQueue {
         attempt: claimedJob.attempt,
         maxAttempts: claimedJob.maxAttempts,
         payload: claimedRest,
+        startedAt: now,
       };
     } catch (error) {
       logger.error("Error dequeuing job:", error);
@@ -393,9 +513,46 @@ export class PrismaJobQueue implements JobQueue {
   }
 
   /**
+   * The fenced-acknowledgement predicate: this job, still RUNNING, still
+   * on the attempt whose claim handed out `fence.startedAt` and
+   * `fence.attempt`. `status` matters as much as the stamp —
+   * `releaseStaleJobs` puts a rescued job back to PENDING without clearing
+   * `startedAt`, so the stamp alone would still let a zombie worker
+   * complete a job that is waiting to be re-claimed.
+   */
+  private fenceWhere(jobId: string, fence: JobAckFence) {
+    return {
+      id: jobId,
+      status: this.enums.status("RUNNING"),
+      startedAt: fence.startedAt,
+      attempt: fence.attempt,
+    };
+  }
+
+  private ackOutcome(jobId: string, count: number, op: string): JobAckOutcome {
+    if (count === 0) {
+      logger.warn(
+        `Job ${jobId}: ${op} acknowledgement superseded — the job is no longer the RUNNING attempt this worker claimed`,
+      );
+      return "superseded";
+    }
+    return "acknowledged";
+  }
+
+  /**
    * Mark job as completed
    */
-  async complete(jobId: string): Promise<void> {
+  async complete(jobId: string, fence?: JobAckFence): Promise<JobAckOutcome> {
+    if (fence) {
+      const result = await this.prisma.jobQueue.updateMany({
+        where: this.fenceWhere(jobId, fence),
+        data: {
+          status: this.enums.status("COMPLETED"),
+          completedAt: new Date(),
+        },
+      });
+      return this.ackOutcome(jobId, result.count, "complete");
+    }
     await this.prisma.jobQueue.update({
       where: { id: jobId },
       data: {
@@ -404,12 +561,29 @@ export class PrismaJobQueue implements JobQueue {
       },
     });
     logger.debug(`Job ${jobId} completed`);
+    return "acknowledged";
   }
 
   /**
    * Mark job as suspended (for async-batch)
    */
-  async suspend(jobId: string, nextPollAt: Date): Promise<void> {
+  async suspend(
+    jobId: string,
+    nextPollAt: Date,
+    fence?: JobAckFence,
+  ): Promise<JobAckOutcome> {
+    if (fence) {
+      const result = await this.prisma.jobQueue.updateMany({
+        where: this.fenceWhere(jobId, fence),
+        data: {
+          status: this.enums.status("SUSPENDED"),
+          nextPollAt,
+          workerId: null,
+          lockedAt: null,
+        },
+      });
+      return this.ackOutcome(jobId, result.count, "suspend");
+    }
     await this.prisma.jobQueue.update({
       where: { id: jobId },
       data: {
@@ -420,6 +594,7 @@ export class PrismaJobQueue implements JobQueue {
       },
     });
     logger.debug(`Job ${jobId} suspended until ${nextPollAt.toISOString()}`);
+    return "acknowledged";
   }
 
   /**
@@ -429,7 +604,8 @@ export class PrismaJobQueue implements JobQueue {
     jobId: string,
     error: string,
     shouldRetry: boolean = false,
-  ): Promise<void> {
+    fence?: JobAckFence,
+  ): Promise<JobAckOutcome> {
     const job = await this.prisma.jobQueue.findUnique({
       where: { id: jobId },
       select: { attempt: true, maxAttempts: true },
@@ -439,6 +615,20 @@ export class PrismaJobQueue implements JobQueue {
       // Re-queue for retry with exponential backoff
       const backoffMs = 2 ** job.attempt * 1000; // 2s, 4s, 8s...
       const nextPollAt = new Date(Date.now() + backoffMs);
+
+      if (fence) {
+        const result = await this.prisma.jobQueue.updateMany({
+          where: this.fenceWhere(jobId, fence),
+          data: {
+            status: this.enums.status("PENDING"),
+            lastError: error,
+            workerId: null,
+            lockedAt: null,
+            nextPollAt: nextPollAt,
+          },
+        });
+        return this.ackOutcome(jobId, result.count, "fail");
+      }
 
       await this.prisma.jobQueue.update({
         where: { id: jobId },
@@ -451,7 +641,20 @@ export class PrismaJobQueue implements JobQueue {
         },
       });
       logger.debug(`Job ${jobId} failed, will retry in ${backoffMs}ms`);
+      return "acknowledged";
     } else {
+      if (fence) {
+        const result = await this.prisma.jobQueue.updateMany({
+          where: this.fenceWhere(jobId, fence),
+          data: {
+            status: this.enums.status("FAILED"),
+            completedAt: new Date(),
+            lastError: error,
+          },
+        });
+        return this.ackOutcome(jobId, result.count, "fail");
+      }
+
       await this.prisma.jobQueue.update({
         where: { id: jobId },
         data: {
@@ -461,6 +664,7 @@ export class PrismaJobQueue implements JobQueue {
         },
       });
       logger.debug(`Job ${jobId} failed permanently: ${error}`);
+      return "acknowledged";
     }
   }
 
@@ -493,7 +697,7 @@ export class PrismaJobQueue implements JobQueue {
 
     return jobs.map((job: any) => {
       const payload = (job.payload ?? {}) as Record<string, unknown>;
-      const { _workflowId, ...rest } = payload;
+      const { _workflowId, _groupKey, ...rest } = payload;
       return {
         id: job.id,
         createdAt: job.createdAt,
@@ -520,6 +724,18 @@ export class PrismaJobQueue implements JobQueue {
    * Refresh a running job's lease without changing status.
    */
   async touchJob(jobId: string): Promise<void> {
+    if (this.databaseType !== "sqlite" && this.prisma.$queryRaw) {
+      // Renew the lease from the database clock: a heartbeat written from
+      // the application clock while the sweeper reads the database clock
+      // would reintroduce exactly the drift this change removes.
+      await this.prisma.$queryRaw`
+        UPDATE "job_queue"
+        SET "lockedAt" = (now() AT TIME ZONE 'UTC'),
+            "updatedAt" = (now() AT TIME ZONE 'UTC')
+        WHERE id = ${jobId} AND status = 'RUNNING'
+      `;
+      return;
+    }
     await this.prisma.jobQueue.updateMany({
       where: { id: jobId, status: this.enums.status("RUNNING") },
       data: { lockedAt: new Date() },
@@ -527,9 +743,50 @@ export class PrismaJobQueue implements JobQueue {
   }
 
   /**
-   * Release stale locks (for crashed workers)
+   * Release stale locks (for crashed workers). Stamps `lastError` with
+   * the `LEASE_HEARTBEAT_LOST` prefix so an operator can tell a reclaimed
+   * lease from a stage-level failure. The fine-grained tier of a two-tier
+   * expiry whose coarse tier is `expireRunawayJobs`.
+   *
+   * On PostgreSQL, the deadline is derived in-database from the same `now()`
+   * the claim stamped, so the sweep does not depend on the sweeping host's
+   * system clock. `"updatedAt"` is set explicitly because a raw `UPDATE`
+   * does not trigger Prisma's `@updatedAt`.
+   *
+   * SQLite has no `now() AT TIME ZONE`, so it keeps the application-clock
+   * comparison (single-process by nature, where the two clocks are the
+   * same clock anyway).
    */
   async releaseStaleJobs(staleThresholdMs: number = 300000): Promise<number> {
+    const reason = `${LEASE_HEARTBEAT_LOST}: no heartbeat for more than ${staleThresholdMs}ms; lease released for another worker`;
+
+    if (this.databaseType !== "sqlite" && this.prisma.$queryRaw) {
+      // NOTE: deliberately calling `this.prisma.$queryRaw` directly rather
+      // than destructuring it into a local first -- Prisma's runtime reads
+      // internal state off `this` inside its own method bodies.
+      const released = await this.prisma.$queryRaw<Array<{ id: string }>>`
+        UPDATE "job_queue"
+        SET
+          status = 'PENDING',
+          "workerId" = NULL,
+          "lockedAt" = NULL,
+          "updatedAt" = (now() AT TIME ZONE 'UTC'),
+          "lastError" = ${reason}
+        WHERE status = 'RUNNING'
+          AND "lockedAt" IS NOT NULL
+          AND "lockedAt" <
+              (now() AT TIME ZONE 'UTC')
+              - ${staleThresholdMs}::double precision * interval '1 millisecond'
+        RETURNING id
+      `;
+      if (released.length > 0) {
+        logger.debug(
+          `Released ${released.length} stale job(s) (lease older than ${staleThresholdMs}ms by the database clock)`,
+        );
+      }
+      return released.length;
+    }
+
     const thresholdDate = new Date(Date.now() - staleThresholdMs);
 
     const result = await this.prisma.jobQueue.updateMany({
@@ -541,6 +798,7 @@ export class PrismaJobQueue implements JobQueue {
         status: this.enums.status("PENDING"),
         workerId: null,
         lockedAt: null,
+        lastError: reason,
       },
     });
 
@@ -550,6 +808,68 @@ export class PrismaJobQueue implements JobQueue {
       );
     }
 
+    return result.count;
+  }
+
+  /**
+   * Fail every RUNNING job whose claim has exceeded the coarse absolute cap.
+   *
+   * The coarse tier of a two-tier expiry: `releaseStaleJobs` handles the
+   * fine-grained heartbeat signal and requeues for another worker when a
+   * worker dies, but is defeated by a worker that is alive but wedged
+   * (e.g. infinite loop or hung network call) because it keeps heartbeating.
+   *
+   * `startedAt` is the per-claim stamp that the heartbeat never touches
+   * (a suspended job that resumes is re-claimed and gets a fresh `startedAt`,
+   * so this measures one attempt's wall time, not the run's). A job past
+   * this cap is failed terminally with `LEASE_ABSOLUTE_CAP` rather than
+   * requeued, as a job that hung for the full cap will hang again.
+   *
+   * On PostgreSQL, the deadline is derived in-database for the same single-clock
+   * reason the heartbeat sweep is. The run itself is resolved afterwards by
+   * `run.reapStuck` on its next pass.
+   */
+  async expireRunawayJobs(absoluteTimeoutMs: number): Promise<number> {
+    const reason = `${LEASE_ABSOLUTE_CAP}: held its lease for more than ${absoluteTimeoutMs}ms while still heartbeating; failed as a runaway`;
+
+    if (this.databaseType !== "sqlite" && this.prisma.$queryRaw) {
+      // NOTE: deliberately calling `this.prisma.$queryRaw` directly rather
+      // than destructuring it into a local first -- Prisma's runtime reads
+      // internal state off `this` inside its own method bodies.
+      const expired = await this.prisma.$queryRaw<Array<{ id: string }>>`
+        UPDATE "job_queue"
+        SET
+          status = 'FAILED',
+          "completedAt" = (now() AT TIME ZONE 'UTC'),
+          "updatedAt" = (now() AT TIME ZONE 'UTC'),
+          "lastError" = ${reason}
+        WHERE status = 'RUNNING'
+          AND "startedAt" IS NOT NULL
+          AND "startedAt" <
+              (now() AT TIME ZONE 'UTC')
+              - ${absoluteTimeoutMs}::double precision * interval '1 millisecond'
+        RETURNING id
+      `;
+      if (expired.length > 0) {
+        logger.warn(
+          `Expired ${expired.length} runaway job(s) past the ${absoluteTimeoutMs}ms absolute lease cap`,
+        );
+      }
+      return expired.length;
+    }
+
+    const cutoff = new Date(this.now().getTime() - absoluteTimeoutMs);
+    const result = await this.prisma.jobQueue.updateMany({
+      where: {
+        status: this.enums.status("RUNNING"),
+        startedAt: { not: null, lt: cutoff },
+      },
+      data: {
+        status: this.enums.status("FAILED"),
+        completedAt: this.now(),
+        lastError: reason,
+      },
+    });
     return result.count;
   }
 }

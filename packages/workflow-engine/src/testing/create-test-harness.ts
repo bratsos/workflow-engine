@@ -199,6 +199,9 @@ export function createTestHarness(options: CreateTestHarnessOptions = {}) {
           attempt: job.attempt,
           maxAttempts: job.maxAttempts,
           payload: job.payload,
+          // Forwarded so the harness acknowledges through the same fenced
+          // path the real hosts use.
+          startedAt: job.startedAt,
         },
         jobHeartbeatIntervalMs: HOST_DEFAULTS.jobHeartbeatIntervalMs,
         logPrefix: "[TestHarness]",

@@ -26,6 +26,16 @@ export const HOST_DEFAULTS = {
   logPrefix: "[Host]",
   /** Stale lease threshold (ms) past which a job's lease is reclaimed. */
   staleLeaseThresholdMs: 300_000,
+  /**
+   * Absolute cap (ms) on one job claim, measured from the claim itself and
+   * so unaffected by heartbeating: twelve times the default stale-lease
+   * threshold, i.e. one hour. The heartbeat tier alone cannot recover a
+   * worker that is alive but wedged, because such a worker keeps
+   * heartbeating; this is the backstop that always fires. A stage that
+   * legitimately runs longer than an hour must raise it; 0 disables the
+   * tier entirely and restores the heartbeat-only behaviour.
+   */
+  jobAbsoluteTimeoutMs: 3_600_000,
   /** Max pending runs to claim per maintenance tick. */
   maxClaimsPerTick: 10,
   /** Max suspended stages to check per maintenance tick. */
@@ -64,6 +74,12 @@ export interface HostJobMessage {
   attempt: number;
   maxAttempts?: number;
   payload: Record<string, unknown>;
+  /**
+   * The attempt stamp from `DequeueResult`, forwarded as the acknowledgement
+   * fence; a transport that cannot carry it (e.g. a JSON push bridge) simply
+   * omits it and gets today's unfenced behaviour.
+   */
+  startedAt?: Date;
 }
 
 export interface ExecuteJobWithHeartbeatOptions {
@@ -126,6 +142,7 @@ const JobMessageSchema = z.object({
   attempt: z.number().int().nonnegative(),
   maxAttempts: z.number().int().positive().optional(),
   payload: z.record(z.string(), z.unknown()),
+  startedAt: z.date().optional(),
 });
 
 /** The backoff the built-in transports apply before redelivering a retry. */
@@ -171,6 +188,10 @@ export async function executeJobWithHeartbeat(
     return { outcome: "failed", error: message, dead: true };
   }
 
+  const fence = job.startedAt
+    ? { startedAt: job.startedAt, attempt: job.attempt }
+    : undefined;
+
   const config =
     (job.payload as { config?: Record<string, unknown> }).config || {};
 
@@ -207,6 +228,7 @@ export async function executeJobWithHeartbeat(
       `${logPrefix} dead job ${job.jobId} (run ${job.workflowRunId}, stage ${job.stageId}): ${message}`,
     );
     try {
+      // Deliberately unfenced: an orphan queue row should acknowledge unconditionally.
       await jobTransport.fail(job.jobId, message, false);
     } catch (failError) {
       console.error(`${logPrefix} could not fail dead job:`, failError);
@@ -217,7 +239,13 @@ export async function executeJobWithHeartbeat(
   }
 
   if (result.outcome === "completed") {
-    await jobTransport.complete(job.jobId);
+    const outcome = await jobTransport.complete(job.jobId, fence);
+    if (outcome === "superseded") {
+      console.warn(
+        `${logPrefix} job ${job.jobId} acknowledgement superseded: the lease was rescued and re-claimed while this attempt ran; its result was discarded`,
+      );
+      return { outcome: "completed" };
+    }
     await kernel.dispatch({
       type: "run.transition",
       workflowRunId: job.workflowRunId,
@@ -229,7 +257,12 @@ export async function executeJobWithHeartbeat(
     const nextPollAt =
       result.nextPollAt ??
       new Date(Date.now() + HOST_DEFAULTS.suspendFallbackMs);
-    await jobTransport.suspend(job.jobId, nextPollAt);
+    const outcome = await jobTransport.suspend(job.jobId, nextPollAt, fence);
+    if (outcome === "superseded") {
+      console.warn(
+        `${logPrefix} job ${job.jobId} acknowledgement superseded: the lease was rescued and re-claimed while this attempt ran; its result was discarded`,
+      );
+    }
     return { outcome: "suspended" };
   }
 
@@ -255,7 +288,17 @@ export async function executeJobWithHeartbeat(
     ? raceGhost && job.attempt < maxAttempts
     : (result.willRetry ??
       (result.retryable !== false && job.attempt < maxAttempts));
-  await jobTransport.fail(job.jobId, result.error ?? "Unknown error", canRetry);
+  const outcome = await jobTransport.fail(
+    job.jobId,
+    result.error ?? "Unknown error",
+    canRetry,
+    fence,
+  );
+  if (outcome === "superseded") {
+    console.warn(
+      `${logPrefix} job ${job.jobId} acknowledgement superseded: the lease was rescued and re-claimed while this attempt ran; its result was discarded`,
+    );
+  }
   // Terminal failure: without this, the run lingers RUNNING until
   // run.reapStuck kills it minutes later with a generic "STUCK_RUN_REAPED"
   // error, losing the real stage error. Dispatch run.transition so the run
@@ -307,6 +350,8 @@ export interface RunMaintenanceTickOptions {
   maxOutboxFlushPerTick?: number;
   /** Defaults to `HOST_DEFAULTS.staleLeaseThresholdMs`. */
   staleLeaseThresholdMs?: number;
+  /** Defaults to `HOST_DEFAULTS.jobAbsoluteTimeoutMs`. Pass 0 to disable the absolute tier. */
+  jobAbsoluteTimeoutMs?: number;
   /**
    * Prefix for this host's `console.error` diagnostics, e.g. "[NodeHost]".
    * Defaults to `HOST_DEFAULTS.logPrefix`.
@@ -323,6 +368,8 @@ export interface MaintenanceTickCounts {
   claimed: number;
   suspendedChecked: number;
   staleReleased: number;
+  /** Jobs the absolute cap failed as runaways. */
+  staleExpired: number;
   eventsFlushed: number;
   stuckReaped: number;
 }
@@ -343,12 +390,14 @@ export async function runMaintenanceTick(
     maxSuspendedChecksPerTick = HOST_DEFAULTS.maxSuspendedChecksPerTick,
     maxOutboxFlushPerTick = HOST_DEFAULTS.maxOutboxFlushPerTick,
     staleLeaseThresholdMs = HOST_DEFAULTS.staleLeaseThresholdMs,
+    jobAbsoluteTimeoutMs = HOST_DEFAULTS.jobAbsoluteTimeoutMs,
     logPrefix = HOST_DEFAULTS.logPrefix,
   } = options;
 
   let claimed = 0;
   let suspendedChecked = 0;
   let staleReleased = 0;
+  let staleExpired = 0;
   let eventsFlushed = 0;
   let stuckReaped = 0;
 
@@ -386,8 +435,10 @@ export async function runMaintenanceTick(
     const reapResult = await kernel.dispatch({
       type: "lease.reapStale",
       staleThresholdMs: staleLeaseThresholdMs,
+      absoluteTimeoutMs: jobAbsoluteTimeoutMs,
     });
     staleReleased = reapResult.released;
+    staleExpired = reapResult.expired;
   } catch (error) {
     console.error(`${logPrefix} lease.reapStale error:`, error);
   }
@@ -420,6 +471,7 @@ export async function runMaintenanceTick(
     claimed,
     suspendedChecked,
     staleReleased,
+    staleExpired,
     eventsFlushed,
     stuckReaped,
   };

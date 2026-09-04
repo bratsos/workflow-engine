@@ -54,21 +54,88 @@ class MyCustomPersistence implements WorkflowPersistence {
 Responsible for scheduling, claiming (dequeuing), heartbeating, and cancelling active background jobs.
 
 ```typescript
-import type { JobQueue, EnqueueJobInput, DequeueResult, JobRecord } from "@bratsos/workflow-engine";
+import type {
+  JobQueue,
+  EnqueueJobInput,
+  DequeueResult,
+  JobRecord,
+  JobAckFence,
+  JobAckOutcome,
+} from "@bratsos/workflow-engine";
 
 class MyCustomJobQueue implements JobQueue {
   async enqueue(options: EnqueueJobInput): Promise<string> { ... }
   async enqueueParallel(jobs: EnqueueJobInput[]): Promise<string[]> { ... }
   async dequeue(): Promise<DequeueResult | null> { ... }
-  async complete(jobId: string): Promise<void> { ... }
-  async suspend(jobId: string, nextPollAt: Date): Promise<void> { ... }
-  async fail(jobId: string, error: string, shouldRetry?: boolean): Promise<void> { ... }
+  async complete(jobId: string, fence?: JobAckFence): Promise<JobAckOutcome> { ... }
+  async suspend(jobId: string, nextPollAt: Date, fence?: JobAckFence): Promise<JobAckOutcome> { ... }
+  async fail(jobId: string, error: string, shouldRetry?: boolean, fence?: JobAckFence): Promise<JobAckOutcome> { ... }
   async releaseStaleJobs(staleThresholdMs?: number): Promise<number> { ... }
+  async expireRunawayJobs(absoluteTimeoutMs: number): Promise<number> { ... } // optional, absolute lease tier
   async cancelByRun(workflowRunId: string): Promise<number> { ... }
   async getJobsByWorkflowRun(workflowRunId: string): Promise<JobRecord[]> { ... }
   async touchJob(jobId: string): Promise<void> { ... } // Heartbeat lock
 }
 ```
+
+#### Fenced acknowledgements
+
+`dequeue()` returns a `startedAt` alongside `attempt`: together they are the
+*attempt stamp* of that claim. A worker that stalls long enough for
+`releaseStaleJobs` to rescue its job — and for a second worker to claim it —
+must not be able to mark the newer attempt COMPLETED or FAILED when it
+finally wakes up. `complete`, `fail` and `suspend` therefore accept an
+optional `JobAckFence` (`{ startedAt, attempt }`, taken straight from the
+`DequeueResult`) and must condition the write on the job still being the
+`RUNNING` attempt that fence describes:
+
+```sql
+UPDATE jobs SET ... WHERE id = $1 AND status = 'RUNNING'
+                      AND "startedAt" = $2 AND attempt = $3
+```
+
+When nothing matches, write nothing and return `"superseded"`; a superseded
+acknowledgement is a real outcome the host logs, not an error to swallow and
+not a success to report. Called without a fence the methods keep their older
+unconditional behaviour and always return `"acknowledged"`, so a transport
+that cannot carry the stamp (a JSON push bridge, say) still works.
+
+`touchJob` is deliberately *not* fenced: a stale heartbeat only refreshes the
+lease of whichever attempt currently owns the row, which costs the newer
+attempt nothing.
+
+#### Per-group fairness
+
+`EnqueueJobInput.groupKey` names the fairness group a job belongs to — usually a
+tenant. A transport that supports fairness stores it (the built-in adapters put
+it on the payload as `_groupKey`, and strip it again before the payload reaches
+a stage) and, when configured with a `JobQueueFairness`, excludes from the claim
+any group already holding `maxConcurrentPerGroup` jobs in `RUNNING`.
+
+It has to be a cap rather than a reordering: whatever rule ranks the pending
+rows, a flooding group's next row is re-ranked to the front the instant its
+previous one is claimed, so a quiet group still waits behind the whole flood.
+Excluding a group already at its share is what actually breaks the starvation.
+
+Fairness is opt-in and off by default because it costs materially more on a deep
+queue than the default claim — see the measured numbers in the engine's
+persistence reference.
+
+#### Two-tier lease expiry
+
+`releaseStaleJobs` compares `lockedAt`, which `touchJob` refreshes, so it detects
+a worker that *stopped*. It cannot detect a worker that is alive but wedged — a
+hung request with no timeout, an infinite loop — because that worker keeps
+heartbeating and holds the job forever. `expireRunawayJobs(absoluteTimeoutMs)` is
+the coarse backstop: it compares `startedAt`, stamped once per claim and
+refreshed by nothing, and fails the job terminally rather than requeueing it (a
+job that hung for the whole cap will hang again). The method is optional on the
+port — an adapter without it simply has no absolute tier.
+
+Write the two outcomes so they can be told apart afterwards: stamp `lastError`
+with the exported `LEASE_HEARTBEAT_LOST` prefix when reclaiming a lease and
+`LEASE_ABSOLUTE_CAP` when expiring a runaway. `jobQueueConformanceSuite` checks
+both, skipping the absolute tier when the method is absent.
 
 ### 3. `AICallLogger`
 Responsible for tracking LLM prompt/response pairs, token usage, and cost stats.

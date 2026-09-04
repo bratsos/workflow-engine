@@ -426,6 +426,14 @@ export interface EnqueueJobInput {
   priority?: number;
   payload?: Record<string, unknown>;
   scheduledFor?: Date;
+  /**
+   * Fairness group this job belongs to — typically a tenant id. Stored on
+   * the payload as `_groupKey`; a transport with fairness enabled presents
+   * only the head of each group as a dequeue candidate, so one group cannot
+   * starve another. Ignored when the transport has no fairness configured,
+   * which is the default.
+   */
+  groupKey?: string;
 }
 
 export interface DequeueResult {
@@ -437,7 +445,97 @@ export interface DequeueResult {
   attempt: number;
   maxAttempts: number;
   payload: Record<string, unknown>;
+  /**
+   * The attempt stamp this claim wrote to `startedAt`. Hand it back as a
+   * `JobAckFence` on `complete`/`fail`/`suspend` so the acknowledgement
+   * only lands if this attempt is still the current one.
+   */
+  startedAt: Date;
 }
+
+/**
+ * Fencing token for a job acknowledgement.
+ *
+ * A worker that stalls past the lease threshold has its job released by
+ * `releaseStaleJobs` and re-claimed by someone else. Without a fence the
+ * stalled worker's eventual `complete()` marks the *new* attempt COMPLETED
+ * and the work it is actually doing is thrown away. Conditioning the write
+ * on the attempt stamp the claim handed out (Oban's `attempted_at`
+ * predicate, one extra WHERE clause and no extra column) turns that write
+ * into a no-op instead.
+ */
+export interface JobAckFence {
+  /** `DequeueResult.startedAt` from the claim being acknowledged. */
+  startedAt: Date;
+  /**
+   * `DequeueResult.attempt` from the same claim. The stamp alone is the
+   * Oban predicate, but our timestamps are `timestamp(3)` — two claims
+   * landing in the same millisecond would share a stamp. `attempt`
+   * strictly increases on every claim, so the pair identifies exactly one
+   * attempt at any resolution. It costs one more term in the same WHERE
+   * clause and still no extra column.
+   */
+  attempt: number;
+}
+
+/**
+ * Fairness configuration for a job transport's dequeue.
+ *
+ * Off by default: the dequeue is the hottest query the engine runs, and a
+ * fair claim costs more than taking the first row of an index. Turn it on
+ * only where one group really can flood the queue.
+ *
+ * Fairness here is a *concurrency cap per group*, the mechanism pg-boss v12
+ * uses, not a reordering. Reordering cannot fix starvation: whatever rule
+ * ranks the pending rows, the flooding group's next row is re-ranked to the
+ * front the moment its previous one is claimed. Excluding a group that is
+ * already at its share of the running pool does fix it — the flood is
+ * skipped and a newly arrived job from a quiet group is the only candidate
+ * left.
+ */
+export interface JobQueueFairness {
+  /**
+   * How many jobs one group may hold `RUNNING` at once. A group at its cap
+   * is skipped by the dequeue entirely, so this is the whole fairness
+   * mechanism and it has no default — size it to your worker pool, roughly
+   * `workers / groups you expect to be active at once`, and never below 1.
+   * Too low and a single active group cannot use the pool it has to itself;
+   * too high and it can still crowd the others out.
+   */
+  maxConcurrentPerGroup: number;
+  /**
+   * Dotted path into the job payload naming the group. Defaults to
+   * `"_groupKey"`, which is where `EnqueueJobInput.groupKey` is stored.
+   * Point it at a field your jobs already carry — `"config.tenantId"`, say
+   * — to group existing rows without re-enqueueing them. Jobs with no value
+   * at the path share one anonymous group, which is then capped as a group
+   * like any other.
+   */
+  groupBy?: string;
+}
+
+/**
+ * Result of a fenced acknowledgement. `"superseded"` means nothing was
+ * written: the job is no longer the RUNNING attempt this fence describes
+ * (released and re-claimed, cancelled, or deleted). Callers must surface
+ * it rather than treating it as success.
+ */
+export type JobAckOutcome = "acknowledged" | "superseded";
+
+/**
+ * `lastError` prefix written when the heartbeat tier reclaims a job: the
+ * worker holding the lease stopped calling `touchJob`. The job goes back
+ * to PENDING for another worker.
+ */
+export const LEASE_HEARTBEAT_LOST = "LEASE_HEARTBEAT_LOST";
+
+/**
+ * `lastError` prefix written when the absolute tier expires a job: it held
+ * its lease past the coarse cap regardless of heartbeating, which means a
+ * worker that is alive but wedged. Terminal — a job that hung for the whole
+ * cap will hang again, so it is dead-lettered rather than requeued.
+ */
+export const LEASE_ABSOLUTE_CAP = "LEASE_ABSOLUTE_CAP";
 
 // ============================================================================
 // PersistenceCore / ArtifactPersistence / WorkflowPersistence Interfaces
@@ -714,26 +812,67 @@ export interface JobQueue {
   dequeue(): Promise<DequeueResult | null>;
 
   /**
-   * Mark job as completed
+   * Mark job as completed.
+   *
+   * Passing a `fence` conditions the write on the job still being the RUNNING
+   * attempt with that `startedAt`; omitting it keeps the previous unconditional
+   * behaviour and always returns `"acknowledged"`. Note that the fenced form is
+   * the recommended one and that the unfenced form exists for transports that
+   * cannot carry the stamp.
    */
-  complete(jobId: string): Promise<void>;
+  complete(jobId: string, fence?: JobAckFence): Promise<JobAckOutcome>;
 
   /**
-   * Mark job as suspended (for async-batch)
+   * Mark job as suspended (for async-batch).
+   *
+   * Passing a `fence` conditions the write on the job still being the RUNNING
+   * attempt with that `startedAt`; omitting it keeps the previous unconditional
+   * behaviour and always returns `"acknowledged"`. Note that the fenced form is
+   * the recommended one and that the unfenced form exists for transports that
+   * cannot carry the stamp.
    */
-  suspend(jobId: string, nextPollAt: Date): Promise<void>;
+  suspend(
+    jobId: string,
+    nextPollAt: Date,
+    fence?: JobAckFence,
+  ): Promise<JobAckOutcome>;
 
   /**
    * Mark job as failed. `shouldRetry` defaults to `false` -- callers must
    * opt in to a retry rather than risk an unbounded retry loop for
    * adapters/hosts that omit the argument.
+   *
+   * Passing a `fence` conditions the write on the job still being the RUNNING
+   * attempt with that `startedAt`; omitting it keeps the previous unconditional
+   * behaviour and always returns `"acknowledged"`. Note that the fenced form is
+   * the recommended one and that the unfenced form exists for transports that
+   * cannot carry the stamp.
    */
-  fail(jobId: string, error: string, shouldRetry?: boolean): Promise<void>;
+  fail(
+    jobId: string,
+    error: string,
+    shouldRetry?: boolean,
+    fence?: JobAckFence,
+  ): Promise<JobAckOutcome>;
 
   /**
-   * Release stale locks (for crashed workers)
+   * Release stale locks (for crashed workers). Stamps `lastError` with
+   * the `LEASE_HEARTBEAT_LOST` prefix so an operator can tell a reclaimed
+   * lease from a stage-level failure. The fine-grained tier of a two-tier
+   * expiry whose coarse tier is `expireRunawayJobs`.
    */
   releaseStaleJobs(staleThresholdMs?: number): Promise<number>;
+
+  /**
+   * Fail every RUNNING job whose claim (`startedAt`, stamped once and never
+   * refreshed) is older than `absoluteTimeoutMs`, stamping `lastError` with
+   * the `LEASE_ABSOLUTE_CAP` prefix; returns how many. The coarse tier of a
+   * two-tier expiry: `releaseStaleJobs` is the fine-grained heartbeat
+   * signal and is defeated by a worker that is alive but wedged, because
+   * such a worker keeps calling `touchJob`. Optional — a transport that
+   * does not implement it simply has no absolute cap.
+   */
+  expireRunawayJobs?(absoluteTimeoutMs: number): Promise<number>;
 
   /**
    * Cancel all pending/suspended jobs for a workflow run.

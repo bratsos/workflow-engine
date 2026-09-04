@@ -37,6 +37,10 @@ import type {
   WorkflowRunRecord,
   WorkflowStageRecord,
 } from "../persistence/interface.js";
+import {
+  LEASE_ABSOLUTE_CAP,
+  LEASE_HEARTBEAT_LOST,
+} from "../persistence/interface.js";
 
 // ============================================================================
 // Test API injection
@@ -2423,6 +2427,114 @@ export function jobQueueConformanceSuite(
       });
     });
 
+    describe("fenced acknowledgement", () => {
+      // A negative threshold makes every held lease look stale straight
+      // away, which is how these tests force the rescue deterministically
+      // instead of sleeping past a real threshold.
+      const RESCUE_EVERYTHING_MS = -1000;
+
+      /**
+       * Claim a job, have it rescued by the sweeper, and let a second
+       * worker claim it — the exact sequence a stalled worker's
+       * acknowledgement has to survive. Returns both fences.
+       */
+      async function rescueAndReclaim(stageId: string) {
+        const jobId = await (queue as LegacyQueue).enqueue(
+          createJobInput({ workflowRunId: `fence-${stageId}`, stageId }),
+        );
+        const first = await queue.dequeue();
+        expect(first?.jobId).toBe(jobId);
+        expect(await queue.releaseStaleJobs(RESCUE_EVERYTHING_MS)).toBe(1);
+        const second = await queue.dequeue();
+        expect(second?.jobId).toBe(jobId);
+        return { jobId, first: first!, second: second! };
+      }
+
+      it("should acknowledge a completion carrying the fence from its own claim", async () => {
+        await (queue as LegacyQueue).enqueue(
+          createJobInput({ stageId: "fence-happy" }),
+        );
+        const job = await queue.dequeue();
+        expect(job?.startedAt).toBeInstanceOf(Date);
+
+        const outcome = await queue.complete(job!.jobId, {
+          startedAt: job!.startedAt,
+          attempt: job!.attempt,
+        });
+        expect(outcome).toBe("acknowledged");
+      });
+
+      it("should report a completion from a superseded attempt instead of clobbering the newer one", async () => {
+        const { jobId, first, second } =
+          await rescueAndReclaim("fence-complete");
+
+        // The stalled worker finally finishes and acknowledges.
+        const stale = await queue.complete(jobId, {
+          startedAt: first.startedAt,
+          attempt: first.attempt,
+        });
+        expect(stale).toBe("superseded");
+
+        // Nothing was written: the newer attempt is still RUNNING.
+        const [afterStale] = await queue.getJobsByWorkflowRun(
+          "fence-fence-complete",
+        );
+        expect(afterStale?.status).toBe("RUNNING");
+
+        // The current owner's acknowledgement still lands.
+        const live = await queue.complete(jobId, {
+          startedAt: second.startedAt,
+          attempt: second.attempt,
+        });
+        expect(live).toBe("acknowledged");
+        const [afterLive] = await queue.getJobsByWorkflowRun(
+          "fence-fence-complete",
+        );
+        expect(afterLive?.status).toBe("COMPLETED");
+      });
+
+      it("should report a failure from a superseded attempt instead of clobbering the newer one", async () => {
+        const { jobId, first } = await rescueAndReclaim("fence-fail");
+
+        const stale = await queue.fail(jobId, "stalled worker error", false, {
+          startedAt: first.startedAt,
+          attempt: first.attempt,
+        });
+        expect(stale).toBe("superseded");
+
+        const [job] = await queue.getJobsByWorkflowRun("fence-fence-fail");
+        expect(job?.status).toBe("RUNNING");
+        // The stalled worker's error was not recorded; the only error on the
+        // row is the sweeper's note that it reclaimed the lease.
+        expect(job?.lastError).not.toContain("stalled worker error");
+      });
+
+      it("should report a suspend from a superseded attempt instead of releasing the newer one's lease", async () => {
+        const { jobId, first } = await rescueAndReclaim("fence-suspend");
+
+        const stale = await queue.suspend(
+          jobId,
+          new Date(Date.now() + 60_000),
+          { startedAt: first.startedAt, attempt: first.attempt },
+        );
+        expect(stale).toBe("superseded");
+
+        const [job] = await queue.getJobsByWorkflowRun("fence-fence-suspend");
+        expect(job?.status).toBe("RUNNING");
+        expect(job?.workerId).not.toBeNull();
+      });
+
+      it("should keep acknowledging unconditionally when no fence is passed", async () => {
+        const { jobId } = await rescueAndReclaim("fence-optional");
+
+        // No fence: the previous, unconditional contract — the write lands
+        // whichever attempt the caller is on.
+        expect(await queue.complete(jobId)).toBe("acknowledged");
+        const [job] = await queue.getJobsByWorkflowRun("fence-fence-optional");
+        expect(job?.status).toBe("COMPLETED");
+      });
+    });
+
     describe("releaseStaleJobs operation", () => {
       it("should return number of released jobs", async () => {
         // Given: No stale jobs
@@ -2432,6 +2544,72 @@ export function jobQueueConformanceSuite(
         // Then: Returns a number
         expect(typeof released).toBe("number");
         expect(released).toBeGreaterThanOrEqual(0);
+      });
+
+      it("should name the heartbeat tier in lastError when it reclaims a lease", async () => {
+        await (queue as LegacyQueue).enqueue(
+          createJobInput({
+            workflowRunId: "tier-heartbeat",
+            stageId: "tier-stage",
+          }),
+        );
+        await queue.dequeue();
+
+        // A negative threshold makes the held lease look stale straight away.
+        expect(await queue.releaseStaleJobs(-1000)).toBe(1);
+
+        const [job] = await queue.getJobsByWorkflowRun("tier-heartbeat");
+        expect(job?.status).toBe("PENDING");
+        // Distinguishable from the absolute tier, and from a stage error.
+        expect(job?.lastError).toContain(LEASE_HEARTBEAT_LOST);
+        expect(job?.lastError).not.toContain(LEASE_ABSOLUTE_CAP);
+      });
+    });
+
+    describe("expireRunawayJobs operation (absolute lease tier)", () => {
+      it("should fail a job that held its lease past the absolute cap, even while heartbeating", async () => {
+        const expire = queue.expireRunawayJobs?.bind(queue);
+        if (!expire) return; // optional port method
+
+        await (queue as LegacyQueue).enqueue(
+          createJobInput({
+            workflowRunId: "tier-absolute",
+            stageId: "tier-stage",
+          }),
+        );
+        const claimed = await queue.dequeue();
+        expect(claimed).not.toBeNull();
+
+        // The wedged-but-alive worker the heartbeat tier cannot catch: its
+        // lease is fresh, so the heartbeat sweep skips it...
+        await queue.touchJob(claimed!.jobId);
+        expect(await queue.releaseStaleJobs(60_000)).toBe(0);
+
+        // ...but the absolute cap is measured from the claim, which no
+        // heartbeat refreshes, so it fires anyway.
+        expect(await expire(-1000)).toBe(1);
+
+        const [job] = await queue.getJobsByWorkflowRun("tier-absolute");
+        expect(job?.status).toBe("FAILED");
+        expect(job?.lastError).toContain(LEASE_ABSOLUTE_CAP);
+        expect(job?.lastError).not.toContain(LEASE_HEARTBEAT_LOST);
+      });
+
+      it("should leave a job inside the cap alone", async () => {
+        const expire = queue.expireRunawayJobs?.bind(queue);
+        if (!expire) return;
+
+        await (queue as LegacyQueue).enqueue(
+          createJobInput({
+            workflowRunId: "tier-within",
+            stageId: "tier-stage",
+          }),
+        );
+        await queue.dequeue();
+
+        expect(await expire(60 * 60_000)).toBe(0);
+        const [job] = await queue.getJobsByWorkflowRun("tier-within");
+        expect(job?.status).toBe("RUNNING");
       });
     });
 

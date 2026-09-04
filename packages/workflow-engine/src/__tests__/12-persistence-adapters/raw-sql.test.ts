@@ -1,10 +1,15 @@
 /**
- * The Prisma adapters' raw Postgres statements: the status enum's type name
- * is configurable (`statusEnumName`), and every timestamp is a bound JS Date
- * from the injected clock converted with `AT TIME ZONE 'UTC'` -- never
- * `NOW()` and never a bare parameter, both of which write session-local time
- * into the naive TIMESTAMP columns Prisma fills with UTC (see
- * persistence/prisma/utc-timestamps.ts).
+ * The Prisma adapters' raw Postgres statements.
+ *
+ * Two invariants, checked against the SQL a mocked client receives:
+ *  - The status enum's type name is configurable (`statusEnumName`), and
+ *    `claimNextPendingRun` binds a JS Date from the injected clock converted
+ *    with `AT TIME ZONE 'UTC'` -- never a bare parameter and never `NOW()`,
+ *    both of which write session-local time into the naive TIMESTAMP columns
+ *    Prisma fills with UTC (see persistence/prisma/utc-timestamps.ts).
+ *  - The *job lease* binds no timestamp at all: claim, heartbeat and stale
+ *    sweep all read `now() AT TIME ZONE 'UTC'`, so the lease has exactly one
+ *    clock and a host whose system clock drifts cannot shorten or extend it.
  */
 
 import { describe, expect, it, vi } from "vitest";
@@ -99,29 +104,73 @@ describe("PrismaWorkflowPersistence.claimNextPendingRun raw SQL", () => {
   });
 });
 
-describe("PrismaJobQueue.dequeue raw SQL", () => {
-  it("binds the clock time instead of NOW()", async () => {
+describe("PrismaJobQueue lease statements", () => {
+  /** A client whose raw calls record their SQL and bound values. */
+  function recordingClient() {
     const queryRaw = vi.fn(async () => []);
-    const prisma = { $queryRaw: queryRaw } as unknown as EnginePrismaClient;
-    const now = new Date("2026-09-03T12:00:00.000Z");
-    const queue = new PrismaJobQueue(prisma, {
+    return {
+      queryRaw,
+      prisma: { $queryRaw: queryRaw } as unknown as EnginePrismaClient,
+      sqlAndValues(call = 0) {
+        const [strings, ...values] = queryRaw.mock.calls[call] as unknown as [
+          TemplateStringsArray,
+          ...unknown[],
+        ];
+        return { sql: strings.join("?"), values };
+      },
+    };
+  }
+
+  it("takes the claim's lease stamps from the database clock, never the application clock", async () => {
+    const client = recordingClient();
+    const appClock = new Date("2026-09-03T12:00:00.000Z");
+    const queue = new PrismaJobQueue(client.prisma, {
       workerId: "w",
-      now: () => now,
+      now: () => appClock,
     });
 
     await expect(queue.dequeue()).resolves.toBeNull();
 
-    const [strings, ...values] = queryRaw.mock.calls[0] as unknown as [
-      TemplateStringsArray,
-      ...unknown[],
-    ];
-    const sql = strings.join("?");
-    expect(sql).not.toContain("NOW()");
-    // Both lease columns and the nextPollAt comparison go through the
-    // explicit UTC conversion, so they mean the same thing as the values
-    // Prisma's model API writes on any session timezone.
-    expect(sql.match(/AT TIME ZONE 'UTC'/g)).toHaveLength(3);
-    expect(values.filter((v) => v === now)).toHaveLength(3);
+    const { sql, values } = client.sqlAndValues();
+    // `now() AT TIME ZONE 'UTC'` -- never a bare NOW(), which converts
+    // through the session's timezone into these naive `timestamp` columns
+    // (see utc-timestamps.ts).
+    expect(sql).not.toMatch(/now\(\)(?! AT TIME ZONE 'UTC')/i);
+    // Both lease columns plus the nextPollAt comparison.
+    expect(sql.match(/now\(\) AT TIME ZONE 'UTC'/g)).toHaveLength(3);
+    // Nothing time-shaped is bound any more: the lease has one clock, and
+    // it is the database's, so two hosts cannot disagree about when a
+    // lease expires. The attempt stamp comes back out through RETURNING.
+    expect(values.some((v) => v instanceof Date)).toBe(false);
+    expect(sql).toContain('RETURNING id, "workflowRunId"');
+    expect(sql).toContain('"startedAt"');
+  });
+
+  it("derives the stale-lease deadline in the database", async () => {
+    const client = recordingClient();
+    const queue = new PrismaJobQueue(client.prisma, { workerId: "w" });
+
+    await expect(queue.releaseStaleJobs(300_000)).resolves.toBe(0);
+
+    const { sql, values } = client.sqlAndValues();
+    expect(sql).toContain("now() AT TIME ZONE 'UTC'");
+    expect(sql).toContain("interval '1 millisecond'");
+    // The "now" the threshold is subtracted from is never bound: it is the
+    // same database clock the claim stamped. Only the threshold and the
+    // dead-letter reason travel as parameters.
+    expect(values).toContain(300_000);
+    expect(values.some((v) => v instanceof Date)).toBe(false);
+  });
+
+  it("renews the heartbeat from the database clock too", async () => {
+    const client = recordingClient();
+    const queue = new PrismaJobQueue(client.prisma, { workerId: "w" });
+
+    await queue.touchJob("job-1");
+
+    const { sql, values } = client.sqlAndValues();
+    expect(sql).toContain(`"lockedAt" = (now() AT TIME ZONE 'UTC')`);
+    expect(values).toEqual(["job-1"]);
   });
 });
 

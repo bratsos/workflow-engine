@@ -23,6 +23,13 @@
  * model writes agree on any session timezone with nothing for the
  * consumer to configure.
  *
+ * Scope note (1.0.0-alpha.9): the *job lease* no longer binds a Date at
+ * all. `PrismaJobQueue`'s claim, heartbeat and stale sweep all read
+ * `now() AT TIME ZONE 'UTC'` instead, so the lease has exactly one clock —
+ * the database's — and a host with a drifting system clock cannot shorten
+ * or extend it. What follows still applies to every other raw statement
+ * (`claimNextPendingRun`, the outbox publish sweep), which do bind Dates.
+ *
  * Scope: only the raw statements need this. Every other timestamp the
  * engine writes or compares — `leaseExpiresAt`, `deadlineAt`,
  * `maxWaitUntil`, `nextPollAt` on the poll path, and the `completedAt` of

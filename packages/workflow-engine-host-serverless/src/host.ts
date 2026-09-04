@@ -35,6 +35,9 @@ export interface ServerlessHostConfig {
   /** Stale lease threshold in milliseconds (default: 300_000). */
   staleLeaseThresholdMs?: number;
 
+  /** Absolute cap (ms) on one job claim (default: HOST_DEFAULTS.jobAbsoluteTimeoutMs). */
+  jobAbsoluteTimeoutMs?: number;
+
   /** Max pending runs to claim per maintenance tick (default: 10). */
   maxClaimsPerTick?: number;
 
@@ -131,6 +134,7 @@ class ServerlessHostImpl implements ServerlessHost {
   private readonly jobTransport: JobTransport;
   private readonly workerId: string;
   private readonly staleLeaseThresholdMs: number;
+  private readonly jobAbsoluteTimeoutMs: number;
   private readonly maxClaimsPerTick: number;
   private readonly maxSuspendedChecksPerTick: number;
   private readonly maxOutboxFlushPerTick: number;
@@ -144,6 +148,8 @@ class ServerlessHostImpl implements ServerlessHost {
     this.workerId = config.workerId;
     this.staleLeaseThresholdMs =
       config.staleLeaseThresholdMs ?? HOST_DEFAULTS.staleLeaseThresholdMs;
+    this.jobAbsoluteTimeoutMs =
+      config.jobAbsoluteTimeoutMs ?? HOST_DEFAULTS.jobAbsoluteTimeoutMs;
     this.maxClaimsPerTick =
       config.maxClaimsPerTick ?? HOST_DEFAULTS.maxClaimsPerTick;
     this.maxSuspendedChecksPerTick =
@@ -245,6 +251,7 @@ class ServerlessHostImpl implements ServerlessHost {
       maxSuspendedChecksPerTick: this.maxSuspendedChecksPerTick,
       maxOutboxFlushPerTick: this.maxOutboxFlushPerTick,
       staleLeaseThresholdMs: this.staleLeaseThresholdMs,
+      jobAbsoluteTimeoutMs: this.jobAbsoluteTimeoutMs,
       logPrefix: "[ServerlessHost]",
     });
   }

@@ -65,7 +65,7 @@ const kernel = createKernel({
 |------|-----------|---------|
 | `persistence` | `Persistence` | CRUD for runs, stages, logs, outbox events, idempotency keys |
 | `blobStore` | `BlobStore` | `put(key, data)`, `get(key)`, `has(key)`, `delete(key)`, `list(prefix)` |
-| `jobTransport` | `JobTransport` | `enqueue` (deprecated, use `enqueueParallel`), `enqueueParallel` (idempotent on `(workflowRunId, stageId)`), `deleteByRunAndStages` (1.0.0-alpha.7+, used by `run.rerunFrom`), `dequeue`, `complete`, `suspend`, `fail`, `cancelByRun`, `touchJob` (v0.11+, lease heartbeat), `getJobsByWorkflowRun` (v0.11+), `adoptWorkerId` (optional, 1.0.0-alpha.7+) |
+| `jobTransport` | `JobTransport` | `enqueue` (deprecated, use `enqueueParallel`), `enqueueParallel` (idempotent on `(workflowRunId, stageId)`), `deleteByRunAndStages` (1.0.0-alpha.7+, used by `run.rerunFrom`), `dequeue`, `complete`, `suspend`, `fail` (all three take an optional acknowledgement fence, 1.0.0-alpha.9+), `releaseStaleJobs`, `expireRunawayJobs` (optional, 1.0.0-alpha.9+, absolute lease tier), `cancelByRun`, `touchJob` (v0.11+, lease heartbeat), `getJobsByWorkflowRun` (v0.11+), `adoptWorkerId` (optional, 1.0.0-alpha.7+) |
 | `eventSink` | `EventSink` | `emit(event)` - async event publishing |
 | `clock` | `Clock` | `now()` - returns `Date` |
 | `scheduler` (optional) | `Scheduler` | `schedule(type, payload, runAt)`, `cancel(type, correlationId)` -- **@deprecated**, unused by the kernel (zero call sites); omit it, the kernel supplies its own no-op. Removal at 1.0 |
@@ -87,6 +87,7 @@ const host = createNodeHost({
   jobPollIntervalMs: 1_000,           // Dequeue and execute jobs
   postJobYieldMs: 1_000,              // v0.4.4+: randomised pause after a completed job (default: jobPollIntervalMs)
   staleLeaseThresholdMs: 300_000,     // Release stale job leases (default 300_000 as of v0.11, was 60_000)
+  jobAbsoluteTimeoutMs: 3_600_000,    // 1.0.0-alpha.9+: absolute cap on one claim, fires even while heartbeating (0 disables)
   jobHeartbeatIntervalMs: 60_000,     // v0.11+: heartbeat a job's lease while it executes
   maxClaimsPerTick: 10,               // Max pending runs to claim per tick
   maxSuspendedChecksPerTick: 10,      // Max suspended stages to poll per tick
@@ -105,6 +106,46 @@ const stats = host.getStats();
 ```
 
 `staleLeaseThresholdMs` is how long a killed worker's *job* stays unavailable. A killed worker's in-flight **durable step** is a separate dial: `StepRunOptions.leaseMs`, default five minutes, is how long a resumed stage waits before it re-runs that step (see 12-durable-steps.md, "Leases, retries and deadlines"). Both bound how fast a crash recovers; neither is set by the other.
+
+**Two tiers of job-lease expiry.** `staleLeaseThresholdMs` is the fine-grained
+tier: it is measured from `lockedAt`, which `touchJob` refreshes on every
+heartbeat, so it detects a worker that *stopped*. It cannot detect a worker that
+is alive but wedged — a hung HTTP call with no timeout, an infinite loop in a
+stage — because such a worker keeps heartbeating and holds the job forever.
+Shipping only a heartbeat is the configuration pg-boss's design treats as
+dangerous, so there is a second, coarse tier: `jobAbsoluteTimeoutMs` (default
+**one hour**, twelve times the default stale threshold) is measured from
+`startedAt`, which is stamped once per claim and which no heartbeat refreshes,
+so it always fires. Set it to `0` to disable it and get the pre-1.0.0-alpha.9
+heartbeat-only behaviour; raise it above the longest stage you legitimately run.
+
+The two outcomes are told apart by the `lastError` the sweep writes, prefixed
+with an exported constant so an operator (or an alert) can match on it:
+
+| Tier | Measured from | Outcome | `lastError` prefix |
+| --- | --- | --- | --- |
+| `staleLeaseThresholdMs` | `lockedAt` (heartbeat refreshes it) | requeued `PENDING` for another worker | `LEASE_HEARTBEAT_LOST` |
+| `jobAbsoluteTimeoutMs` | `startedAt` (never refreshed) | `FAILED` — dead-lettered | `LEASE_ABSOLUTE_CAP` |
+
+The heartbeat tier sweeps first, so a *dead* worker's job is retried rather than
+dead-lettered; only a job whose worker is still heartbeating reaches the cap.
+The absolute tier is deliberately terminal — a job that hung for a whole hour
+will hang again — and the run it belonged to is resolved by `run.reapStuck` on a
+later pass. `lease.reapStale` returns both counts (`{ released, expired }`), and
+`runMaintenanceTick` surfaces them as `staleReleased` / `staleExpired`. A custom
+`JobTransport` that does not implement the optional `expireRunawayJobs` simply
+has no absolute tier.
+
+**The job lease runs on the database clock (Postgres).** `PrismaJobQueue` stamps
+`lockedAt`/`startedAt` with `now() AT TIME ZONE 'UTC'` at claim time, renews it
+the same way from `touchJob`, and `releaseStaleJobs` derives the deadline in the
+same statement (`"lockedAt" < now() AT TIME ZONE 'UTC' - <threshold> * interval
+'1 millisecond'`). No expiry is computed in application code and none is stored,
+which is the shape pg-boss, Graphile Worker, River and Oban all use: a host whose
+system clock drifts can neither shorten nor extend a lease, and two hosts can
+never disagree about when one expires. `staleLeaseThresholdMs` is therefore a
+*duration*, measured by the database, not a deadline your process computes. On
+SQLite the comparison stays in application code -- one process, one clock.
 
 An interval firing that lands while the previous tick is still running is skipped (`orchestrationTicks` counts ticks that ran), and `stop()` waits for an in-flight tick, bounded by `shutdownTimeoutMs`, before its final outbox flush. Several hosts may run against one database: suspended stages are claimed per poll, so a stage body runs once across processes (see 08-common-patterns.md, "Suspended-Stage Claims").
 
@@ -135,6 +176,7 @@ const host = createServerlessHost({
 
   // Optional tuning (same as Node host)
   staleLeaseThresholdMs: 300_000,     // default as of v0.11 (was 60_000)
+  jobAbsoluteTimeoutMs: 3_600_000,    // 1.0.0-alpha.9+ (0 disables the absolute tier)
   jobHeartbeatIntervalMs: 60_000,     // v0.11+
   maxClaimsPerTick: 10,
   maxSuspendedChecksPerTick: 10,
@@ -177,7 +219,7 @@ Run from a cron trigger (Cloudflare Cron, EventBridge, etc.):
 
 ```typescript
 const tick = await host.runMaintenanceTick();
-// { claimed, suspendedChecked, staleReleased, eventsFlushed, stuckReaped }
+// { claimed, suspendedChecked, staleReleased, staleExpired, eventsFlushed, stuckReaped }
 // Resumed suspended stages are automatically followed by run.transition.
 ```
 
@@ -199,8 +241,8 @@ import {
 | Export | Purpose |
 |--------|---------|
 | `executeJobWithHeartbeat(kernel, options)` | Dispatches `job.execute` for one job, holding a lease heartbeat (`jobTransport.touchJob`) for its duration, then routes the outcome through the job transport (`complete`/`suspend`/`fail`) and `run.transition` when terminal. |
-| `runMaintenanceTick(kernel, options)` | Runs one bounded maintenance pass -- `run.claimPending`, `stage.pollSuspended` (transitioning any resumed runs), `lease.reapStale`, `outbox.flush`, `run.reapStuck`. Each command's error is caught and logged independently so one failure doesn't block the rest of the tick. |
-| `HOST_DEFAULTS` | The shared tuning defaults (`staleLeaseThresholdMs`, `maxClaimsPerTick`, `jobHeartbeatIntervalMs`, etc.) both built-in hosts fall back to. |
+| `runMaintenanceTick(kernel, options)` | Runs one bounded maintenance pass -- `run.claimPending`, `stage.pollSuspended` (transitioning any resumed runs), `lease.reapStale` (both lease tiers), `outbox.flush`, `run.reapStuck`. Each command's error is caught and logged independently so one failure doesn't block the rest of the tick. |
+| `HOST_DEFAULTS` | The shared tuning defaults (`staleLeaseThresholdMs`, `jobAbsoluteTimeoutMs`, `maxClaimsPerTick`, `jobHeartbeatIntervalMs`, etc.) both built-in hosts fall back to. |
 | `toErrorMessage(error)` | Normalizes a caught `unknown` into a display-safe string (`Error#message`, or `String(error)`). |
 
 Both take an options bag (`ExecuteJobWithHeartbeatOptions` / `RunMaintenanceTickOptions`, also exported from `@bratsos/workflow-engine/kernel`) covering the job transport, tuning knobs, and a `logPrefix` for diagnostics. Read `packages/workflow-engine-host-node/src/host.ts` or `packages/workflow-engine-host-serverless/src/host.ts` for a complete reference implementation before writing your own -- both call these same two functions rather than reimplementing the dispatch sequence.
