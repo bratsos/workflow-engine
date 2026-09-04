@@ -57,6 +57,7 @@ export {
   type CreateTestHarnessOptions,
   createTestHarness,
   type HarnessRunResult,
+  type HarnessStartResult,
   type TickReport,
 } from "./create-test-harness.js";
 export {
@@ -67,6 +68,14 @@ export { InMemoryAICallLogger } from "./in-memory-ai-logger.js";
 export { InMemoryJobQueue } from "./in-memory-job-queue.js";
 export { InMemoryWorkflowPersistence } from "./in-memory-persistence.js";
 export { InMemoryStepLedger } from "./in-memory-step-ledger.js";
+// Mocking a durable step is seeding its ledger row, so the seeding surface
+// ships with the ledger that carries it.
+export {
+  createMockStepLedger,
+  MOCKED_FAILURE_ATTEMPT,
+  type MockStepLedger,
+  type StepMockApi,
+} from "./mock-step-ledger.js";
 export type {
   AILoggerFactory,
   ConformanceTestApi,
