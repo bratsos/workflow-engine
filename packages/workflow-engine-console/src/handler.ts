@@ -140,6 +140,8 @@ function parseFilters(params: URLSearchParams): RunListFilters {
   if (workflowId) filters.workflowId = workflowId;
   const workflowType = params.get("workflowType");
   if (workflowType) filters.workflowType = workflowType;
+  const definitionVersion = params.get("definitionVersion");
+  if (definitionVersion) filters.definitionVersion = definitionVersion;
   const after = parseDate(params.get("from"), "from");
   if (after) filters.createdAfter = after;
   const before = parseDate(params.get("to"), "to");

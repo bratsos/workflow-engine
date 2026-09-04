@@ -99,6 +99,27 @@ you an output existed and where it lived, not what it contained. And the
 durable step ledger is cleared rather than archived — its rows are keyed by
 the deleted stage record's id, so nothing would ever read them again.
 
+### What the redrive abandons
+
+Clearing the ledger can strand an effect that is still live: a durable step
+that submitted a provider batch holds its handle and its
+[external key](../api/index/functions/deriveStepExternalKey.md), and the
+provider keeps processing and keeps billing it whether or not you redrove
+the run. Those rows cannot be kept, so what they name is recorded before
+they go — as `abandonedSteps` on the superseded-attempt annotation, and as a
+`WARN` log on the run:
+
+```ts
+attempts[0].payload.abandonedSteps;
+// [{ stepId: "extract:submit", status: "completed", externalKey: "wfe-…" }]
+```
+
+The key is the actionable part: it is what you search the provider with to
+find, and cancel, a batch nothing will collect any more. The field is absent
+when the redrive abandoned nothing that named an external effect, which is
+the normal case. The annotation is there as well as the log because logs
+rotate and the annotation stays on the run.
+
 ## Redriving onto a different definition version
 
 With [definition versioning](./definition-versioning.md) in place, a redrive

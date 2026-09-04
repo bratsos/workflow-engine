@@ -4,6 +4,7 @@ import { createStepApi } from "../../kernel/helpers/step-api.js";
 import type { StepLedger } from "../../kernel/ports.js";
 import { FakeClock } from "../../kernel/testing/fake-clock.js";
 import { InMemoryStepLedger } from "../../testing/in-memory-step-ledger.js";
+import { wrapStepLedger } from "../utils/step-ledger-double.js";
 
 describe("durable run results", () => {
   it("replays undefined and null as completed JSON null results", async () => {
@@ -23,20 +24,14 @@ describe("durable run results", () => {
   it("leaves a running row when committing the completed result fails", async () => {
     const clock = new FakeClock();
     const backing = new InMemoryStepLedger({ now: clock.now.bind(clock) });
-    const ledger: StepLedger = {
-      claim: (record) => backing.claim(record),
-      get: (stageRecordId, stepId) => backing.get(stageRecordId, stepId),
-      list: (stageRecordId) => backing.list(stageRecordId),
-      clear: (stageRecordId) => backing.clear(stageRecordId),
-      // The outcome write is a compare-and-set, not a blind update: that is
-      // where a ledger failure has to be caught.
+    // The outcome write is a compare-and-set, not a blind update: that is
+    // where a ledger failure has to be caught.
+    const ledger: StepLedger = wrapStepLedger(backing, {
       compareAndSet: async (stageRecordId, stepId, expected, patch) => {
         if (patch.status === "completed") throw new Error("write failed");
         return backing.compareAndSet(stageRecordId, stepId, expected, patch);
       },
-      update: (stageRecordId, stepId, patch) =>
-        backing.update(stageRecordId, stepId, patch),
-    };
+    });
     let calls = 0;
     const api = createStepApi({
       stageRecordId: "stage",

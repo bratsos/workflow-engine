@@ -59,6 +59,8 @@ export interface RunSummary {
   totalCost: number;
   totalTokens: number;
   priority: number;
+  definitionVersion: string | null;
+  redriveCount: number;
 }
 
 export interface StageSummary {
@@ -161,6 +163,7 @@ export interface RunListFilters {
   workflowType?: string;
   createdAfter?: Date;
   createdBefore?: Date;
+  definitionVersion?: string;
 }
 
 export interface RunListQuery {

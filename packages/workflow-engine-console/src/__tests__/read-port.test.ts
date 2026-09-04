@@ -80,8 +80,8 @@ describe("in-memory read port: listRuns", () => {
       run("run-1", 0),
       run("run-2", 10, { status: "FAILED" }),
       run("run-3", 20, { workflowId: "wf-b" }),
-      run("run-4", 30, { status: "RUNNING" }),
-      run("run-5", 40),
+      run("run-4", 30, { status: "RUNNING", definitionVersion: "v-old" }),
+      run("run-5", 40, { definitionVersion: "v-old", redriveCount: 2 }),
     ],
   };
 
@@ -137,6 +137,36 @@ describe("in-memory read port: listRuns", () => {
     ).toEqual(["run-3", "run-2"]);
   });
 
+  it("carries the definition version and redrive count of every run", async () => {
+    const reader = createInMemoryConsoleReadPort(fixtures);
+    const page = await reader.listRuns({});
+    expect(
+      page.runs.map((entry) => [
+        entry.id,
+        entry.definitionVersion,
+        entry.redriveCount,
+      ]),
+    ).toEqual([
+      ["run-5", "v-old", 2],
+      ["run-4", "v-old", 0],
+      ["run-3", null, 0],
+      ["run-2", null, 0],
+      ["run-1", null, 0],
+    ]);
+  });
+
+  it("filters by definition version, which is how a stranded run is found", async () => {
+    const reader = createInMemoryConsoleReadPort(fixtures);
+    expect(
+      (
+        await reader.listRuns({ filters: { definitionVersion: "v-old" } })
+      ).runs.map((entry) => entry.id),
+    ).toEqual(["run-5", "run-4"]);
+    expect(
+      (await reader.listRuns({ filters: { definitionVersion: "v-new" } })).runs,
+    ).toEqual([]);
+  });
+
   it("rejects a cursor it did not issue rather than silently returning page one", async () => {
     const reader = createInMemoryConsoleReadPort(fixtures);
     await expect(reader.listRuns({ cursor: "!!!" })).rejects.toBeInstanceOf(
@@ -147,7 +177,14 @@ describe("in-memory read port: listRuns", () => {
 
 describe("in-memory read port: run detail", () => {
   const fixtures: ConsoleFixtures = {
-    runs: [run("run-1", 0, { input: { a: 1 }, output: { b: 2 } })],
+    runs: [
+      run("run-1", 0, {
+        input: { a: 1 },
+        output: { b: 2 },
+        definitionVersion: "sha256-abcdef",
+        redriveCount: 3,
+      }),
+    ],
     stages: [
       {
         id: "stage-rec-2",
@@ -217,6 +254,13 @@ describe("in-memory read port: run detail", () => {
     ]);
     expect(detail?.events.map((event) => event.sequence)).toEqual([1, 2]);
     expect(detail?.run.input).toEqual({ a: 1 });
+  });
+
+  it("carries the version and redrive count a stranded run is diagnosed with", async () => {
+    const reader = createInMemoryConsoleReadPort(fixtures);
+    const detail = await reader.getRunDetail("run-1");
+    expect(detail?.run.definitionVersion).toBe("sha256-abcdef");
+    expect(detail?.run.redriveCount).toBe(3);
   });
 
   it("reports truncation instead of implying it showed everything", async () => {

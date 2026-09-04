@@ -11,6 +11,7 @@ import type { StepLedger } from "../../kernel/ports.js";
 import type { CollectingEventSink } from "../../kernel/testing/collecting-event-sink.js";
 import { FakeClock } from "../../kernel/testing/fake-clock.js";
 import { createTestHarness, InMemoryStepLedger } from "../../testing/index.js";
+import { wrapStepLedger } from "../utils/step-ledger-double.js";
 
 const In = z.object({});
 
@@ -108,7 +109,7 @@ describe("suspension events across polls", () => {
     let seeded = false;
     const clock = new FakeClock();
     const inner = new InMemoryStepLedger({ now: () => clock.now() });
-    const ledger: StepLedger = {
+    const ledger: StepLedger = wrapStepLedger(inner, {
       claim: async (record) => {
         if (record.stepId === "slow" && !seeded) {
           seeded = true;
@@ -120,12 +121,7 @@ describe("suspension events across polls", () => {
         }
         return inner.claim(record);
       },
-      get: (a, b) => inner.get(a, b),
-      update: (a, b, c) => inner.update(a, b, c),
-      compareAndSet: (a, b, c, d) => inner.compareAndSet(a, b, c, d),
-      list: (a) => inner.list(a),
-      clear: (a) => inner.clear(a),
-    };
+    });
     const harness = createTestHarness({
       workflows: [workflow],
       clock,

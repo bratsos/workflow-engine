@@ -13,6 +13,7 @@ import type { StepLedger } from "../../kernel/ports.js";
 import { FakeClock } from "../../kernel/testing/fake-clock.js";
 import { InMemoryStepLedger } from "../../testing/in-memory-step-ledger.js";
 import { createTestHarness } from "../../testing/index.js";
+import { wrapStepLedger } from "../utils/step-ledger-double.js";
 import { crashOnClaim } from "./ai-map-harness.js";
 
 const MODEL = "ai-map-seq-model";
@@ -53,8 +54,7 @@ function slowGet(
   inner: StepLedger,
   getDelayMs: (stepId: string) => number,
 ): StepLedger {
-  return {
-    claim: (record) => inner.claim(record),
+  return wrapStepLedger(inner, {
     get: async (stageRecordId, stepId) => {
       const delay = getDelayMs(stepId);
       if (delay > 0) {
@@ -62,13 +62,7 @@ function slowGet(
       }
       return inner.get(stageRecordId, stepId);
     },
-    update: (stageRecordId, id, patch) =>
-      inner.update(stageRecordId, id, patch),
-    compareAndSet: (stageRecordId, id, expected, patch) =>
-      inner.compareAndSet(stageRecordId, id, expected, patch),
-    list: (stageRecordId) => inner.list(stageRecordId),
-    clear: (stageRecordId) => inner.clear(stageRecordId),
-  };
+  });
 }
 
 describe("step.ai.map seq stability across replays", () => {

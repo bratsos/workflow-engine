@@ -29,7 +29,9 @@ import {
 /** Mutable fixture store. Every array defaults to empty. */
 export interface ConsoleFixtures {
   runs?: Array<
-    RunSummary & {
+    Omit<RunSummary, "definitionVersion" | "redriveCount"> & {
+      definitionVersion?: string | null;
+      redriveCount?: number;
       input?: unknown;
       output?: unknown;
       config?: unknown;
@@ -76,6 +78,8 @@ function toRunSummary(run: FixtureRun): RunSummary {
     totalCost: run.totalCost ?? 0,
     totalTokens: run.totalTokens ?? 0,
     priority: run.priority ?? 0,
+    definitionVersion: run.definitionVersion ?? null,
+    redriveCount: run.redriveCount ?? 0,
   };
 }
 
@@ -122,6 +126,7 @@ export class InMemoryConsoleReadPort implements ConsoleReadPort {
     const statuses = query.filters?.status;
     const workflowId = query.filters?.workflowId;
     const workflowType = query.filters?.workflowType;
+    const definitionVersion = query.filters?.definitionVersion;
     const createdAfter = query.filters?.createdAfter;
     const createdBefore = query.filters?.createdBefore;
 
@@ -145,6 +150,12 @@ export class InMemoryConsoleReadPort implements ConsoleReadPort {
         return false;
       }
       if (workflowType !== undefined && run.workflowType !== workflowType) {
+        return false;
+      }
+      if (
+        definitionVersion !== undefined &&
+        run.definitionVersion !== definitionVersion
+      ) {
         return false;
       }
       if (

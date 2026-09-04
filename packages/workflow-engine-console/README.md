@@ -293,8 +293,8 @@ The `--allow-direct-connection` flag requires explicit acknowledgement that conn
 ## What it shows
 
 The console provides seven operational views:
-- **Runs list**: Keyset-paginated list filtered by execution status, workflow ID, workflow type, and date ranges.
-- **Run detail**: Complete execution hierarchy including stage timelines, durable step ledger entries, annotations, execution logs, and outbox event streams.
+- **Runs list**: Keyset-paginated list filtered by execution status, workflow ID, workflow type, definition version, and date ranges. Each row carries the run's definition version (shortened, full value on hover) with its redrive count as a `+N` suffix — filtering by version is how "show me everything still pinned to the old version" is answered.
+- **Run detail**: Definition version and redrive count alongside the run's timings and cost, plus the complete execution hierarchy including stage timelines, durable step ledger entries, annotations, execution logs, and outbox event streams.
 - **Queue health**: Job distribution by status, enqueue timestamp of the oldest pending job, oldest active lock duration, and overdue polling stages.
 - **Suspended stages**: Stages awaiting external event resumption or deferred polling schedules.
 - **Workers**: Active worker instances derived from heartbeat locks on `job_queue`, reporting active execution count, oldest active lock, and last heartbeat age.
@@ -343,7 +343,7 @@ The frontend catches this error and renders an inline warning banner while maint
 
 The frontend is a single-page application built with Preact, compiled at package build time directly into string literals within the distribution bundle. Consumers run no frontend build pipelines, install no client dependencies, introduce no additional packages into their dependency tree, and load no assets from external CDNs.
 
-- **Bundle size**: Approximately 39 kB of JavaScript and 13 kB of CSS uncompressed (roughly 15 kB combined under gzip).
+- **Bundle size**: Approximately 40 kB of JavaScript and 13 kB of CSS uncompressed (roughly 15 kB combined under gzip).
 - **Path-agnostic routing**: Navigation routes entirely via the URL fragment (`#/runs`, `#/runs/:id`). The server handler serves identical assets regardless of the mount path without requiring URL rewriting configuration.
 - **Adaptive polling**: Refreshes data automatically every 5 seconds by default (`pollIntervalMs`). Polling suspends when browser tabs lose focus. Polling rates can be fixed via `forcePollInterval: true`.
 - **Styling isolation**: All stylesheet rules are scoped beneath the `#workflow-console-root` container selector to prevent interference with host application layouts. Both dark and light colour schemes are supported.

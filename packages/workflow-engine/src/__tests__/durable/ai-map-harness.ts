@@ -23,6 +23,7 @@ import {
   createMockAIHelperFactory,
   createTestKernel,
   type MockAIHelperFactory,
+  wrapStepLedger,
 } from "../utils/index.js";
 
 export const REALTIME_MODEL = "ai-map-realtime-model";
@@ -260,7 +261,7 @@ export function crashOnClaim(
   now: () => Date,
 ): StepLedger {
   let crashed = false;
-  return {
+  return wrapStepLedger(inner, {
     claim: (record) => {
       if (record.stepId === stepId && !crashed) {
         crashed = true;
@@ -268,14 +269,7 @@ export function crashOnClaim(
       }
       return inner.claim(record);
     },
-    get: (stageRecordId, id) => inner.get(stageRecordId, id),
-    update: (stageRecordId, id, patch) =>
-      inner.update(stageRecordId, id, patch),
-    compareAndSet: (stageRecordId, id, expected, patch) =>
-      inner.compareAndSet(stageRecordId, id, expected, patch),
-    list: (stageRecordId) => inner.list(stageRecordId),
-    clear: (stageRecordId) => inner.clear(stageRecordId),
-  };
+  });
 }
 
 export interface HarnessOptions {

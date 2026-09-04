@@ -59,7 +59,11 @@ if (!DATABASE_URL) {
         data: [
           mkRun("run-1", at(0), "COMPLETED", "wf-a"),
           mkRun("run-2", at(10), "FAILED", "wf-a"),
-          mkRun("run-3", at(20), "RUNNING", "wf-b"),
+          {
+            ...mkRun("run-3", at(20), "RUNNING", "wf-b"),
+            definitionVersion: "sha256-old",
+            redriveCount: 2,
+          },
           mkRun("run-4", at(30), "SUSPENDED", "wf-b"),
           mkRun("run-5", at(40), "PENDING", "wf-a"),
         ],
@@ -318,6 +322,27 @@ if (!DATABASE_URL) {
         filters: { createdAfter: at(10), createdBefore: at(30) },
       });
       expect(page.runs.map((entry) => entry.id)).toEqual(["run-3", "run-2"]);
+    });
+
+    it("selects and filters on the versioning columns", async () => {
+      const page = await reader().listRuns({
+        filters: { definitionVersion: "sha256-old" },
+      });
+      expect(page.runs.map((entry) => entry.id)).toEqual(["run-3"]);
+      expect(page.runs[0]).toMatchObject({
+        definitionVersion: "sha256-old",
+        redriveCount: 2,
+      });
+      // A run that never recorded a version is not silently a version.
+      const all = await reader().listRuns({});
+      expect(all.runs.find((entry) => entry.id === "run-1")).toMatchObject({
+        definitionVersion: null,
+        redriveCount: 0,
+      });
+      expect((await reader().getRunDetail("run-3"))?.run).toMatchObject({
+        definitionVersion: "sha256-old",
+        redriveCount: 2,
+      });
     });
 
     it("assembles a run detail from six statements in one transaction", async () => {

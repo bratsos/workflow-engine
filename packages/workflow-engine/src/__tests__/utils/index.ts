@@ -43,6 +43,8 @@ export {
   type MockTextResponse,
   type RecordedCall,
 } from "./mock-ai-helper.js";
+// StepLedger test double
+export { wrapStepLedger } from "./step-ledger-double.js";
 // Test factories
 export {
   createConfigurableStage,

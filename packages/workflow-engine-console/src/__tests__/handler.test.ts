@@ -331,6 +331,16 @@ describe("query parameters", () => {
     ]);
   });
 
+  it("passes a definition version filter through to the reader", async () => {
+    const reader = fixtureReader();
+    const spy = vi.spyOn(reader, "listRuns");
+    const handler = createWorkflowConsole({ reader, authorize: () => true });
+    await handler(get("/console/api/runs?definitionVersion=sha256-abcdef"));
+    expect(spy.mock.calls[0]?.[0].filters?.definitionVersion).toBe(
+      "sha256-abcdef",
+    );
+  });
+
   it("rejects an unparseable date", async () => {
     expect((await build()(get("/console/api/runs?from=soon"))).status).toBe(
       400,

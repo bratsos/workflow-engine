@@ -12,7 +12,7 @@ import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { defineStage } from "../../core/stage-factory.js";
 import type { StepLedger } from "../../kernel/ports.js";
-import { createMockAIHelperFactory } from "../utils/index.js";
+import { createMockAIHelperFactory, wrapStepLedger } from "../utils/index.js";
 import {
   BATCH_MODEL,
   createAiMapHarness,
@@ -37,11 +37,7 @@ function killWorkerOnSubmitCompletion(
   stepId: string,
 ): StepLedger {
   let killed = false;
-  return {
-    claim: (record) => inner.claim(record),
-    get: (stageRecordId, id) => inner.get(stageRecordId, id),
-    update: (stageRecordId, id, patch) =>
-      inner.update(stageRecordId, id, patch),
+  return wrapStepLedger(inner, {
     // The step's outcome is recorded with a compare-and-set (first write
     // wins), so that is the write the dying worker never returns from.
     compareAndSet: (stageRecordId, id, expected, patch) => {
@@ -51,11 +47,7 @@ function killWorkerOnSubmitCompletion(
       }
       return inner.compareAndSet(stageRecordId, id, expected, patch);
     },
-    list: (stageRecordId) => inner.list(stageRecordId),
-    clear: (stageRecordId) => inner.clear(stageRecordId),
-    clearExcept: (stageRecordId, keep) =>
-      inner.clearExcept?.(stageRecordId, keep) ?? inner.clear(stageRecordId),
-  };
+  });
 }
 
 async function setup(id: string, onReclaim?: "adopt" | "resubmit") {
