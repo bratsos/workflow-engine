@@ -66,6 +66,9 @@ export interface NodeHostConfig {
   /** Stale lease threshold in milliseconds (default: 300_000). */
   staleLeaseThresholdMs?: number;
 
+  /** Absolute cap (ms) on one job claim (default: HOST_DEFAULTS.jobAbsoluteTimeoutMs). */
+  jobAbsoluteTimeoutMs?: number;
+
   /** Max pending runs to claim per orchestration tick (default: 10). */
   maxClaimsPerTick?: number;
 
@@ -125,6 +128,7 @@ class NodeHostImpl implements NodeHost {
   private readonly jobPollIntervalMs: number;
   private readonly postJobYieldMs: number;
   private readonly staleLeaseThresholdMs: number;
+  private readonly jobAbsoluteTimeoutMs: number;
   private readonly maxClaimsPerTick: number;
   private readonly maxSuspendedChecksPerTick: number;
   private readonly maxOutboxFlushPerTick: number;
@@ -141,6 +145,8 @@ class NodeHostImpl implements NodeHost {
     this.postJobYieldMs = config.postJobYieldMs ?? this.jobPollIntervalMs;
     this.staleLeaseThresholdMs =
       config.staleLeaseThresholdMs ?? HOST_DEFAULTS.staleLeaseThresholdMs;
+    this.jobAbsoluteTimeoutMs =
+      config.jobAbsoluteTimeoutMs ?? HOST_DEFAULTS.jobAbsoluteTimeoutMs;
     this.maxClaimsPerTick =
       config.maxClaimsPerTick ?? HOST_DEFAULTS.maxClaimsPerTick;
     this.maxSuspendedChecksPerTick =
@@ -315,6 +321,7 @@ class NodeHostImpl implements NodeHost {
       maxSuspendedChecksPerTick: this.maxSuspendedChecksPerTick,
       maxOutboxFlushPerTick: this.maxOutboxFlushPerTick,
       staleLeaseThresholdMs: this.staleLeaseThresholdMs,
+      jobAbsoluteTimeoutMs: this.jobAbsoluteTimeoutMs,
       logPrefix: "[NodeHost]",
     });
   }

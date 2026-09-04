@@ -34,6 +34,8 @@ export type {
   CreateStageInput,
   DequeueResult,
   EnqueueJobInput,
+  JobAckFence,
+  JobAckOutcome,
   JobQueue,
   JobRecord,
   JobStatus,

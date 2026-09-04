@@ -8,13 +8,15 @@
  */
 
 import { createLogger } from "../../utils/logger";
-import type {
-  DequeueResult,
-  EnqueueJobInput,
-  JobAckFence,
-  JobAckOutcome,
-  JobQueue,
-  JobRecord,
+import {
+  type DequeueResult,
+  type EnqueueJobInput,
+  type JobAckFence,
+  type JobAckOutcome,
+  type JobQueue,
+  type JobRecord,
+  LEASE_ABSOLUTE_CAP,
+  LEASE_HEARTBEAT_LOST,
 } from "../interface";
 import { createEnumHelper, type PrismaEnumHelper } from "./enum-compat";
 import type { DatabaseType } from "./persistence";
@@ -638,7 +640,10 @@ export class PrismaJobQueue implements JobQueue {
   }
 
   /**
-   * Release stale locks (for crashed workers).
+   * Release stale locks (for crashed workers). Stamps `lastError` with
+   * the `LEASE_HEARTBEAT_LOST` prefix so an operator can tell a reclaimed
+   * lease from a stage-level failure. The fine-grained tier of a two-tier
+   * expiry whose coarse tier is `expireRunawayJobs`.
    *
    * On PostgreSQL, the deadline is derived in-database from the same `now()`
    * the claim stamped, so the sweep does not depend on the sweeping host's
@@ -650,6 +655,8 @@ export class PrismaJobQueue implements JobQueue {
    * same clock anyway).
    */
   async releaseStaleJobs(staleThresholdMs: number = 300000): Promise<number> {
+    const reason = `${LEASE_HEARTBEAT_LOST}: no heartbeat for more than ${staleThresholdMs}ms; lease released for another worker`;
+
     if (this.databaseType !== "sqlite" && this.prisma.$queryRaw) {
       // NOTE: deliberately calling `this.prisma.$queryRaw` directly rather
       // than destructuring it into a local first -- Prisma's runtime reads
@@ -660,7 +667,8 @@ export class PrismaJobQueue implements JobQueue {
           status = 'PENDING',
           "workerId" = NULL,
           "lockedAt" = NULL,
-          "updatedAt" = (now() AT TIME ZONE 'UTC')
+          "updatedAt" = (now() AT TIME ZONE 'UTC'),
+          "lastError" = ${reason}
         WHERE status = 'RUNNING'
           AND "lockedAt" IS NOT NULL
           AND "lockedAt" <
@@ -687,6 +695,7 @@ export class PrismaJobQueue implements JobQueue {
         status: this.enums.status("PENDING"),
         workerId: null,
         lockedAt: null,
+        lastError: reason,
       },
     });
 
@@ -696,6 +705,68 @@ export class PrismaJobQueue implements JobQueue {
       );
     }
 
+    return result.count;
+  }
+
+  /**
+   * Fail every RUNNING job whose claim has exceeded the coarse absolute cap.
+   *
+   * The coarse tier of a two-tier expiry: `releaseStaleJobs` handles the
+   * fine-grained heartbeat signal and requeues for another worker when a
+   * worker dies, but is defeated by a worker that is alive but wedged
+   * (e.g. infinite loop or hung network call) because it keeps heartbeating.
+   *
+   * `startedAt` is the per-claim stamp that the heartbeat never touches
+   * (a suspended job that resumes is re-claimed and gets a fresh `startedAt`,
+   * so this measures one attempt's wall time, not the run's). A job past
+   * this cap is failed terminally with `LEASE_ABSOLUTE_CAP` rather than
+   * requeued, as a job that hung for the full cap will hang again.
+   *
+   * On PostgreSQL, the deadline is derived in-database for the same single-clock
+   * reason the heartbeat sweep is. The run itself is resolved afterwards by
+   * `run.reapStuck` on its next pass.
+   */
+  async expireRunawayJobs(absoluteTimeoutMs: number): Promise<number> {
+    const reason = `${LEASE_ABSOLUTE_CAP}: held its lease for more than ${absoluteTimeoutMs}ms while still heartbeating; failed as a runaway`;
+
+    if (this.databaseType !== "sqlite" && this.prisma.$queryRaw) {
+      // NOTE: deliberately calling `this.prisma.$queryRaw` directly rather
+      // than destructuring it into a local first -- Prisma's runtime reads
+      // internal state off `this` inside its own method bodies.
+      const expired = await this.prisma.$queryRaw<Array<{ id: string }>>`
+        UPDATE "job_queue"
+        SET
+          status = 'FAILED',
+          "completedAt" = (now() AT TIME ZONE 'UTC'),
+          "updatedAt" = (now() AT TIME ZONE 'UTC'),
+          "lastError" = ${reason}
+        WHERE status = 'RUNNING'
+          AND "startedAt" IS NOT NULL
+          AND "startedAt" <
+              (now() AT TIME ZONE 'UTC')
+              - ${absoluteTimeoutMs}::double precision * interval '1 millisecond'
+        RETURNING id
+      `;
+      if (expired.length > 0) {
+        logger.warn(
+          `Expired ${expired.length} runaway job(s) past the ${absoluteTimeoutMs}ms absolute lease cap`,
+        );
+      }
+      return expired.length;
+    }
+
+    const cutoff = new Date(this.now().getTime() - absoluteTimeoutMs);
+    const result = await this.prisma.jobQueue.updateMany({
+      where: {
+        status: this.enums.status("RUNNING"),
+        startedAt: { not: null, lt: cutoff },
+      },
+      data: {
+        status: this.enums.status("FAILED"),
+        completedAt: this.now(),
+        lastError: reason,
+      },
+    });
     return result.count;
   }
 }

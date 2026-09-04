@@ -26,6 +26,16 @@ export const HOST_DEFAULTS = {
   logPrefix: "[Host]",
   /** Stale lease threshold (ms) past which a job's lease is reclaimed. */
   staleLeaseThresholdMs: 300_000,
+  /**
+   * Absolute cap (ms) on one job claim, measured from the claim itself and
+   * so unaffected by heartbeating: twelve times the default stale-lease
+   * threshold, i.e. one hour. The heartbeat tier alone cannot recover a
+   * worker that is alive but wedged, because such a worker keeps
+   * heartbeating; this is the backstop that always fires. A stage that
+   * legitimately runs longer than an hour must raise it; 0 disables the
+   * tier entirely and restores the heartbeat-only behaviour.
+   */
+  jobAbsoluteTimeoutMs: 3_600_000,
   /** Max pending runs to claim per maintenance tick. */
   maxClaimsPerTick: 10,
   /** Max suspended stages to check per maintenance tick. */
@@ -340,6 +350,8 @@ export interface RunMaintenanceTickOptions {
   maxOutboxFlushPerTick?: number;
   /** Defaults to `HOST_DEFAULTS.staleLeaseThresholdMs`. */
   staleLeaseThresholdMs?: number;
+  /** Defaults to `HOST_DEFAULTS.jobAbsoluteTimeoutMs`. Pass 0 to disable the absolute tier. */
+  jobAbsoluteTimeoutMs?: number;
   /**
    * Prefix for this host's `console.error` diagnostics, e.g. "[NodeHost]".
    * Defaults to `HOST_DEFAULTS.logPrefix`.
@@ -356,6 +368,8 @@ export interface MaintenanceTickCounts {
   claimed: number;
   suspendedChecked: number;
   staleReleased: number;
+  /** Jobs the absolute cap failed as runaways. */
+  staleExpired: number;
   eventsFlushed: number;
   stuckReaped: number;
 }
@@ -376,12 +390,14 @@ export async function runMaintenanceTick(
     maxSuspendedChecksPerTick = HOST_DEFAULTS.maxSuspendedChecksPerTick,
     maxOutboxFlushPerTick = HOST_DEFAULTS.maxOutboxFlushPerTick,
     staleLeaseThresholdMs = HOST_DEFAULTS.staleLeaseThresholdMs,
+    jobAbsoluteTimeoutMs = HOST_DEFAULTS.jobAbsoluteTimeoutMs,
     logPrefix = HOST_DEFAULTS.logPrefix,
   } = options;
 
   let claimed = 0;
   let suspendedChecked = 0;
   let staleReleased = 0;
+  let staleExpired = 0;
   let eventsFlushed = 0;
   let stuckReaped = 0;
 
@@ -419,8 +435,10 @@ export async function runMaintenanceTick(
     const reapResult = await kernel.dispatch({
       type: "lease.reapStale",
       staleThresholdMs: staleLeaseThresholdMs,
+      absoluteTimeoutMs: jobAbsoluteTimeoutMs,
     });
     staleReleased = reapResult.released;
+    staleExpired = reapResult.expired;
   } catch (error) {
     console.error(`${logPrefix} lease.reapStale error:`, error);
   }
@@ -453,6 +471,7 @@ export async function runMaintenanceTick(
     claimed,
     suspendedChecked,
     staleReleased,
+    staleExpired,
     eventsFlushed,
     stuckReaped,
   };

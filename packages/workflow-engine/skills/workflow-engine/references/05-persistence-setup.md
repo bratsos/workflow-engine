@@ -192,6 +192,7 @@ interface JobQueue {
   suspend(jobId: string, nextPollAt: Date, fence?: JobAckFence): Promise<JobAckOutcome>;
   fail(jobId: string, error: string, shouldRetry?: boolean, fence?: JobAckFence): Promise<JobAckOutcome>;
   releaseStaleJobs(staleThresholdMs?: number): Promise<number>;
+  expireRunawayJobs?(absoluteTimeoutMs: number): Promise<number>;
   cancelByRun(workflowRunId: string): Promise<number>;
   getJobsByWorkflowRun(workflowRunId: string): Promise<JobRecord[]>;
   touchJob(jobId: string): Promise<void>;
@@ -244,6 +245,23 @@ unfenced call keeps the older unconditional behaviour and always returns
 attempt currently owns the row, which costs the newer attempt nothing.
 
 `jobQueueConformanceSuite` covers both the fenced and unfenced paths.
+
+### Two-tier lease expiry
+
+`releaseStaleJobs` is the fine-grained tier: it compares `lockedAt`, which
+`touchJob` refreshes on every heartbeat, so it catches a worker that *stopped*.
+It cannot catch a worker that is alive but wedged, because that worker keeps
+heartbeating. `expireRunawayJobs(absoluteTimeoutMs)` -- optional on the port, so
+an older adapter still compiles -- is the coarse backstop: it compares
+`startedAt`, stamped once per claim and refreshed by nothing, and fails the job
+terminally.
+
+Both stamp `lastError` with an exported prefix so the two are distinguishable
+after the fact: `LEASE_HEARTBEAT_LOST` (requeued `PENDING`) and
+`LEASE_ABSOLUTE_CAP` (`FAILED`). A custom adapter should write the same prefixes.
+The kernel sweeps the heartbeat tier first, so a dead worker's job is retried
+rather than dead-lettered. Defaults and the host knobs live in
+03-runtime-setup.md.
 
 ## AICallLogger Interface
 

@@ -8,6 +8,7 @@ import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { defineStage } from "../../core/stage-factory.js";
 import { WorkflowBuilder } from "../../core/workflow.js";
+import { LEASE_ABSOLUTE_CAP } from "../../persistence/interface.js";
 import { createTestKernel } from "../utils/index.js";
 
 // Helper: create a simple passthrough stage
@@ -79,5 +80,61 @@ describe("kernel: lease.reapStale", () => {
     });
 
     expect(result.released).toBe(0);
+    expect(result.expired).toBe(0);
+  });
+});
+
+describe("kernel: lease.reapStale absolute cap", () => {
+  /**
+   * A worker that is alive but wedged: it keeps heartbeating, so `lockedAt`
+   * stays fresh and the heartbeat tier can never reclaim its job, but the
+   * claim itself (`startedAt`) is hours old.
+   */
+  async function wedgedButHeartbeating() {
+    const workflow = createSimpleWorkflow();
+    const harness = createTestKernel([workflow]);
+    await harness.jobTransport.enqueue({
+      workflowRunId: "run-1",
+      workflowId: "test-workflow",
+      stageId: "stage-1",
+      priority: 5,
+    });
+    const claimed = await harness.jobTransport.dequeue();
+    harness.jobTransport.setJobStartedAt(
+      claimed!.jobId,
+      new Date(Date.now() - 2 * 60 * 60_000),
+    );
+    return { ...harness, jobId: claimed!.jobId };
+  }
+
+  it("fails a job that outran the cap while its heartbeat kept the lease fresh", async () => {
+    const { kernel, jobTransport, jobId } = await wedgedButHeartbeating();
+
+    const result = await kernel.dispatch({
+      type: "lease.reapStale",
+      staleThresholdMs: 60_000,
+      absoluteTimeoutMs: 60 * 60_000,
+    });
+
+    // The heartbeat tier saw nothing to reclaim; the cap fired anyway.
+    expect(result.released).toBe(0);
+    expect(result.expired).toBe(1);
+
+    const job = jobTransport.getJob(jobId);
+    expect(job?.status).toBe("FAILED");
+    expect(job?.lastError).toContain(LEASE_ABSOLUTE_CAP);
+  });
+
+  it("runs the heartbeat tier alone when no cap is given", async () => {
+    const { kernel, jobTransport, jobId } = await wedgedButHeartbeating();
+
+    const result = await kernel.dispatch({
+      type: "lease.reapStale",
+      staleThresholdMs: 60_000,
+    });
+
+    expect(result.released).toBe(0);
+    expect(result.expired).toBe(0);
+    expect(jobTransport.getJob(jobId)?.status).toBe("RUNNING");
   });
 });

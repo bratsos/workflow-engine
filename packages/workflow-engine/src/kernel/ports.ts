@@ -64,6 +64,11 @@ export type {
   WorkflowStageRecord,
 } from "../persistence/interface";
 
+export {
+  LEASE_ABSOLUTE_CAP,
+  LEASE_HEARTBEAT_LOST,
+} from "../persistence/interface.js";
+
 export type { KernelEvent } from "./events";
 
 // ============================================================================
@@ -292,8 +297,24 @@ export interface JobTransport {
     fence?: JobAckFence,
   ): Promise<JobAckOutcome>;
 
-  /** Release stale locks (for crashed workers). */
+  /**
+   * Release stale locks (for crashed workers). Stamps `lastError` with
+   * the `LEASE_HEARTBEAT_LOST` prefix so an operator can tell a reclaimed
+   * lease from a stage-level failure. The fine-grained tier of a two-tier
+   * expiry whose coarse tier is `expireRunawayJobs`.
+   */
   releaseStaleJobs(staleThresholdMs?: number): Promise<number>;
+
+  /**
+   * Fail every RUNNING job whose claim (`startedAt`, stamped once and never
+   * refreshed) is older than `absoluteTimeoutMs`, stamping `lastError` with
+   * the `LEASE_ABSOLUTE_CAP` prefix; returns how many. The coarse tier of a
+   * two-tier expiry: `releaseStaleJobs` is the fine-grained heartbeat
+   * signal and is defeated by a worker that is alive but wedged, because
+   * such a worker keeps calling `touchJob`. Optional — a transport that
+   * does not implement it simply has no absolute cap.
+   */
+  expireRunawayJobs?(absoluteTimeoutMs: number): Promise<number>;
 
   /** Cancel all pending/suspended jobs for a workflow run. Returns count cancelled. */
   cancelByRun(workflowRunId: string): Promise<number>;

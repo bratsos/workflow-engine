@@ -37,6 +37,10 @@ import type {
   WorkflowRunRecord,
   WorkflowStageRecord,
 } from "../persistence/interface.js";
+import {
+  LEASE_ABSOLUTE_CAP,
+  LEASE_HEARTBEAT_LOST,
+} from "../persistence/interface.js";
 
 // ============================================================================
 // Test API injection
@@ -2500,7 +2504,9 @@ export function jobQueueConformanceSuite(
 
         const [job] = await queue.getJobsByWorkflowRun("fence-fence-fail");
         expect(job?.status).toBe("RUNNING");
-        expect(job?.lastError).toBeNull();
+        // The stalled worker's error was not recorded; the only error on the
+        // row is the sweeper's note that it reclaimed the lease.
+        expect(job?.lastError).not.toContain("stalled worker error");
       });
 
       it("should report a suspend from a superseded attempt instead of releasing the newer one's lease", async () => {
@@ -2538,6 +2544,72 @@ export function jobQueueConformanceSuite(
         // Then: Returns a number
         expect(typeof released).toBe("number");
         expect(released).toBeGreaterThanOrEqual(0);
+      });
+
+      it("should name the heartbeat tier in lastError when it reclaims a lease", async () => {
+        await (queue as LegacyQueue).enqueue(
+          createJobInput({
+            workflowRunId: "tier-heartbeat",
+            stageId: "tier-stage",
+          }),
+        );
+        await queue.dequeue();
+
+        // A negative threshold makes the held lease look stale straight away.
+        expect(await queue.releaseStaleJobs(-1000)).toBe(1);
+
+        const [job] = await queue.getJobsByWorkflowRun("tier-heartbeat");
+        expect(job?.status).toBe("PENDING");
+        // Distinguishable from the absolute tier, and from a stage error.
+        expect(job?.lastError).toContain(LEASE_HEARTBEAT_LOST);
+        expect(job?.lastError).not.toContain(LEASE_ABSOLUTE_CAP);
+      });
+    });
+
+    describe("expireRunawayJobs operation (absolute lease tier)", () => {
+      it("should fail a job that held its lease past the absolute cap, even while heartbeating", async () => {
+        const expire = queue.expireRunawayJobs?.bind(queue);
+        if (!expire) return; // optional port method
+
+        await (queue as LegacyQueue).enqueue(
+          createJobInput({
+            workflowRunId: "tier-absolute",
+            stageId: "tier-stage",
+          }),
+        );
+        const claimed = await queue.dequeue();
+        expect(claimed).not.toBeNull();
+
+        // The wedged-but-alive worker the heartbeat tier cannot catch: its
+        // lease is fresh, so the heartbeat sweep skips it...
+        await queue.touchJob(claimed!.jobId);
+        expect(await queue.releaseStaleJobs(60_000)).toBe(0);
+
+        // ...but the absolute cap is measured from the claim, which no
+        // heartbeat refreshes, so it fires anyway.
+        expect(await expire(-1000)).toBe(1);
+
+        const [job] = await queue.getJobsByWorkflowRun("tier-absolute");
+        expect(job?.status).toBe("FAILED");
+        expect(job?.lastError).toContain(LEASE_ABSOLUTE_CAP);
+        expect(job?.lastError).not.toContain(LEASE_HEARTBEAT_LOST);
+      });
+
+      it("should leave a job inside the cap alone", async () => {
+        const expire = queue.expireRunawayJobs?.bind(queue);
+        if (!expire) return;
+
+        await (queue as LegacyQueue).enqueue(
+          createJobInput({
+            workflowRunId: "tier-within",
+            stageId: "tier-stage",
+          }),
+        );
+        await queue.dequeue();
+
+        expect(await expire(60 * 60_000)).toBe(0);
+        const [job] = await queue.getJobsByWorkflowRun("tier-within");
+        expect(job?.status).toBe("RUNNING");
       });
     });
 

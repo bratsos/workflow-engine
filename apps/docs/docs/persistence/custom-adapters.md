@@ -71,6 +71,7 @@ class MyCustomJobQueue implements JobQueue {
   async suspend(jobId: string, nextPollAt: Date, fence?: JobAckFence): Promise<JobAckOutcome> { ... }
   async fail(jobId: string, error: string, shouldRetry?: boolean, fence?: JobAckFence): Promise<JobAckOutcome> { ... }
   async releaseStaleJobs(staleThresholdMs?: number): Promise<number> { ... }
+  async expireRunawayJobs(absoluteTimeoutMs: number): Promise<number> { ... } // optional, absolute lease tier
   async cancelByRun(workflowRunId: string): Promise<number> { ... }
   async getJobsByWorkflowRun(workflowRunId: string): Promise<JobRecord[]> { ... }
   async touchJob(jobId: string): Promise<void> { ... } // Heartbeat lock
@@ -102,6 +103,22 @@ that cannot carry the stamp (a JSON push bridge, say) still works.
 `touchJob` is deliberately *not* fenced: a stale heartbeat only refreshes the
 lease of whichever attempt currently owns the row, which costs the newer
 attempt nothing.
+
+#### Two-tier lease expiry
+
+`releaseStaleJobs` compares `lockedAt`, which `touchJob` refreshes, so it detects
+a worker that *stopped*. It cannot detect a worker that is alive but wedged — a
+hung request with no timeout, an infinite loop — because that worker keeps
+heartbeating and holds the job forever. `expireRunawayJobs(absoluteTimeoutMs)` is
+the coarse backstop: it compares `startedAt`, stamped once per claim and
+refreshed by nothing, and fails the job terminally rather than requeueing it (a
+job that hung for the whole cap will hang again). The method is optional on the
+port — an adapter without it simply has no absolute tier.
+
+Write the two outcomes so they can be told apart afterwards: stamp `lastError`
+with the exported `LEASE_HEARTBEAT_LOST` prefix when reclaiming a lease and
+`LEASE_ABSOLUTE_CAP` when expiring a runaway. `jobQueueConformanceSuite` checks
+both, skipping the absolute tier when the method is absent.
 
 ### 3. `AICallLogger`
 Responsible for tracking LLM prompt/response pairs, token usage, and cost stats.

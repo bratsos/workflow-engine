@@ -15,14 +15,16 @@
  */
 
 import { randomUUID } from "crypto";
-import type {
-  DequeueResult,
-  EnqueueJobInput,
-  JobAckFence,
-  JobAckOutcome,
-  JobQueue,
-  JobRecord,
-  Status,
+import {
+  type DequeueResult,
+  type EnqueueJobInput,
+  type JobAckFence,
+  type JobAckOutcome,
+  type JobQueue,
+  type JobRecord,
+  LEASE_ABSOLUTE_CAP,
+  LEASE_HEARTBEAT_LOST,
+  type Status,
 } from "../persistence/interface.js";
 
 /** Options accepted by `InMemoryJobQueue`'s constructor. */
@@ -337,6 +339,7 @@ export class InMemoryJobQueue implements JobQueue {
   async releaseStaleJobs(staleThresholdMs: number = 300000): Promise<number> {
     const now = this.now();
     const threshold = new Date(now.getTime() - staleThresholdMs);
+    const reason = `${LEASE_HEARTBEAT_LOST}: no heartbeat for more than ${staleThresholdMs}ms; lease released for another worker`;
     let released = 0;
 
     for (const job of this.jobs.values()) {
@@ -349,6 +352,7 @@ export class InMemoryJobQueue implements JobQueue {
         const updated: JobRecord = {
           ...job,
           status: "PENDING",
+          lastError: reason,
           workerId: null,
           lockedAt: null,
           updatedAt: now,
@@ -359,6 +363,38 @@ export class InMemoryJobQueue implements JobQueue {
     }
 
     return released;
+  }
+
+  /**
+   * The coarse tier of the two-tier expiry — see `JobQueue.expireRunawayJobs`.
+   * Keyed on `startedAt`, which the heartbeat never refreshes, so it fires on
+   * a worker that is alive but wedged as readily as on one that died.
+   */
+  async expireRunawayJobs(absoluteTimeoutMs: number): Promise<number> {
+    const now = this.now();
+    const cutoff = new Date(now.getTime() - absoluteTimeoutMs);
+    const reason = `${LEASE_ABSOLUTE_CAP}: held its lease for more than ${absoluteTimeoutMs}ms while still heartbeating; failed as a runaway`;
+    let expired = 0;
+
+    for (const job of this.jobs.values()) {
+      if (
+        job.status === "RUNNING" &&
+        job.startedAt !== null &&
+        job.startedAt < cutoff
+      ) {
+        const updated: JobRecord = {
+          ...job,
+          status: "FAILED",
+          completedAt: now,
+          updatedAt: now,
+          lastError: reason,
+        };
+        this.jobs.set(job.id, updated);
+        expired++;
+      }
+    }
+
+    return expired;
   }
 
   async getJobsByWorkflowRun(workflowRunId: string): Promise<JobRecord[]> {
@@ -488,6 +524,18 @@ export class InMemoryJobQueue implements JobQueue {
         lockedAt,
       };
       this.jobs.set(jobId, updated);
+    }
+  }
+
+  /**
+   * Set startedAt for testing the absolute lease cap. Unlike `lockedAt`,
+   * `startedAt` is stamped once per claim and no heartbeat refreshes it, so
+   * this is the dial for "a worker that is alive but wedged".
+   */
+  setJobStartedAt(jobId: string, startedAt: Date): void {
+    const job = this.jobs.get(jobId);
+    if (job) {
+      this.jobs.set(jobId, { ...job, startedAt });
     }
   }
 

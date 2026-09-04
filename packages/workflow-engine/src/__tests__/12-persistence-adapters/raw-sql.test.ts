@@ -1,10 +1,15 @@
 /**
- * The Prisma adapters' raw Postgres statements: the status enum's type name
- * is configurable (`statusEnumName`), and every timestamp is a bound JS Date
- * from the injected clock converted with `AT TIME ZONE 'UTC'` -- never
- * `NOW()` and never a bare parameter, both of which write session-local time
- * into the naive TIMESTAMP columns Prisma fills with UTC (see
- * persistence/prisma/utc-timestamps.ts).
+ * The Prisma adapters' raw Postgres statements.
+ *
+ * Two invariants, checked against the SQL a mocked client receives:
+ *  - The status enum's type name is configurable (`statusEnumName`), and
+ *    `claimNextPendingRun` binds a JS Date from the injected clock converted
+ *    with `AT TIME ZONE 'UTC'` -- never a bare parameter and never `NOW()`,
+ *    both of which write session-local time into the naive TIMESTAMP columns
+ *    Prisma fills with UTC (see persistence/prisma/utc-timestamps.ts).
+ *  - The *job lease* binds no timestamp at all: claim, heartbeat and stale
+ *    sweep all read `now() AT TIME ZONE 'UTC'`, so the lease has exactly one
+ *    clock and a host whose system clock drifts cannot shorten or extend it.
  */
 
 import { describe, expect, it, vi } from "vitest";
@@ -150,9 +155,11 @@ describe("PrismaJobQueue lease statements", () => {
     const { sql, values } = client.sqlAndValues();
     expect(sql).toContain("now() AT TIME ZONE 'UTC'");
     expect(sql).toContain("interval '1 millisecond'");
-    // Only the threshold is bound; the "now" it is subtracted from is the
-    // same database clock the claim stamped.
-    expect(values).toEqual([300_000]);
+    // The "now" the threshold is subtracted from is never bound: it is the
+    // same database clock the claim stamped. Only the threshold and the
+    // dead-letter reason travel as parameters.
+    expect(values).toContain(300_000);
+    expect(values.some((v) => v instanceof Date)).toBe(false);
   });
 
   it("renews the heartbeat from the database clock too", async () => {
