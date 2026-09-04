@@ -11,8 +11,10 @@
  */
 
 import { z } from "zod";
+import type { EventSinkStatus, OutboxFlushResult } from "../commands.js";
 import type { Kernel } from "../kernel.js";
 import type { JobTransport } from "../ports.js";
+import { toErrorMessage } from "./error-message.js";
 
 // ============================================================================
 // Shared defaults
@@ -325,6 +327,21 @@ export interface MaintenanceTickCounts {
   staleReleased: number;
   eventsFlushed: number;
   stuckReaped: number;
+  /**
+   * Events the flush claimed but could not publish. They stay committed in
+   * the outbox and the next flush retries them.
+   */
+  eventsFailed: number;
+  /** Events the flush moved to the DLQ (retry budget exhausted). */
+  eventsDeadLettered: number;
+  /**
+   * `"degraded"` when the sink refused at least one event this tick. Runs
+   * keep progressing regardless — the poller, not the sink, advances a run.
+   * A tick whose `outbox.flush` itself threw also reports `"degraded"`.
+   */
+  eventSinkStatus: EventSinkStatus;
+  /** First publish failure of this tick, when degraded. */
+  eventSinkError?: string;
 }
 
 /**
@@ -351,6 +368,10 @@ export async function runMaintenanceTick(
   let staleReleased = 0;
   let eventsFlushed = 0;
   let stuckReaped = 0;
+  let eventsFailed = 0;
+  let eventsDeadLettered = 0;
+  let eventSinkStatus: EventSinkStatus = "healthy";
+  let eventSinkError: string | undefined;
 
   // 1. Claim pending runs → enqueue first-stage jobs
   try {
@@ -399,8 +420,17 @@ export async function runMaintenanceTick(
       maxEvents: maxOutboxFlushPerTick,
     });
     eventsFlushed = flushResult.published;
+    eventsFailed = flushResult.failed;
+    eventsDeadLettered = flushResult.deadLettered;
+    eventSinkStatus = flushResult.eventSinkStatus;
+    eventSinkError = flushResult.eventSinkError;
   } catch (error) {
+    // The flush itself failed (the outbox query, not an individual emit).
+    // Nothing was delivered this tick either, so the sink is degraded from
+    // an observer's point of view.
     console.error(`${logPrefix} outbox.flush error:`, error);
+    eventSinkStatus = "degraded";
+    eventSinkError = toErrorMessage(error);
   }
 
   // 5. Reap stuck runs → fail runs with no activity past threshold
@@ -422,5 +452,155 @@ export async function runMaintenanceTick(
     staleReleased,
     eventsFlushed,
     stuckReaped,
+    eventsFailed,
+    eventsDeadLettered,
+    eventSinkStatus,
+    ...(eventSinkError !== undefined ? { eventSinkError } : {}),
+  };
+}
+
+// ============================================================================
+// Event-sink health
+// ============================================================================
+
+/**
+ * The event sink's state as a host reports it.
+ *
+ * `"degraded"` is the named state for "the sink is refusing events". It is
+ * deliberately not an error: an event sink is a *notification* channel, and
+ * the committed poller is the truth that advances a run, so a degraded sink
+ * costs delivery latency and nothing else. What it must not do is stay
+ * invisible until the dead-letter queue fills, which is what this report is
+ * for — surface it from wherever the host reports its status, alert on
+ * `status === "degraded"` and on `deadLettered` growing.
+ */
+export interface EventSinkHealth {
+  status: EventSinkStatus;
+  /**
+   * When the current `status` began (epoch ms), or `null` before the first
+   * flush this process observed.
+   */
+  since: number | null;
+  /** Consecutive observed flushes that failed to publish at least one event. */
+  consecutiveFailures: number;
+  /**
+   * Events this process has watched exhaust their retry budget and move to
+   * the dead-letter queue. These stop retrying on their own — replay them
+   * with the `plugin.replayDLQ` command.
+   */
+  deadLettered: number;
+  /** Message of the most recent publish failure, or `null` while healthy. */
+  lastError: string | null;
+}
+
+/** What `EventSinkMonitor.observe` needs from one flush. */
+export interface EventSinkObservation {
+  failed: number;
+  deadLettered: number;
+  eventSinkStatus: EventSinkStatus;
+  eventSinkError?: string;
+}
+
+/**
+ * Tracks event-sink health across flushes for a long-lived host.
+ *
+ * Logs only on a state *transition* (healthy → degraded and back), so a sink
+ * that is down for an hour produces two lines rather than one per tick, and
+ * unconditionally whenever events were dead-lettered — that is the point at
+ * which delivery genuinely cannot proceed on its own and needs a human or a
+ * `plugin.replayDLQ`.
+ */
+export interface EventSinkMonitor {
+  observe(flush: EventSinkObservation): void;
+  /** Record that a flush attempt threw outright. */
+  observeError(error: unknown): void;
+  report(): EventSinkHealth;
+}
+
+export interface CreateEventSinkMonitorOptions {
+  /** `console.error` prefix, e.g. "[NodeHost]". */
+  logPrefix?: string;
+  /** Injectable clock for tests. Defaults to `Date.now`. */
+  now?: () => number;
+  /** Sink for the transition lines. Defaults to `console.error`. */
+  log?: (message: string) => void;
+}
+
+export function createEventSinkMonitor(
+  options: CreateEventSinkMonitorOptions = {},
+): EventSinkMonitor {
+  const logPrefix = options.logPrefix ?? HOST_DEFAULTS.logPrefix;
+  const now = options.now ?? (() => Date.now());
+  const log = options.log ?? ((message: string) => console.error(message));
+
+  let status: EventSinkStatus = "healthy";
+  let since: number | null = null;
+  let consecutiveFailures = 0;
+  let deadLettered = 0;
+  let lastError: string | null = null;
+
+  function transition(next: EventSinkStatus): void {
+    if (next === status && since !== null) return;
+    status = next;
+    since = now();
+    if (next === "degraded") {
+      log(
+        `${logPrefix} event sink DEGRADED: events are staying in the outbox and will be retried; runs keep progressing through the poller. Last error: ${
+          lastError ?? "unknown"
+        }`,
+      );
+    } else if (consecutiveFailures > 0 || lastError !== null) {
+      log(`${logPrefix} event sink recovered: publishing again`);
+    }
+  }
+
+  return {
+    observe(flush) {
+      if (flush.eventSinkStatus === "degraded") {
+        consecutiveFailures++;
+        lastError = flush.eventSinkError ?? lastError ?? "unknown";
+        transition("degraded");
+      } else {
+        consecutiveFailures = 0;
+        const wasDegraded = status === "degraded";
+        transition("healthy");
+        if (wasDegraded) lastError = null;
+      }
+      if (flush.deadLettered > 0) {
+        deadLettered += flush.deadLettered;
+        // Always loud: a dead-lettered event no longer retries by itself.
+        log(
+          `${logPrefix} event sink DEAD-LETTERED ${flush.deadLettered} event(s) (${deadLettered} total in this process): they will not be delivered until replayed with the plugin.replayDLQ command`,
+        );
+      }
+    },
+    observeError(error) {
+      consecutiveFailures++;
+      lastError = toErrorMessage(error);
+      transition("degraded");
+    },
+    report() {
+      return {
+        status,
+        since,
+        consecutiveFailures,
+        deadLettered,
+        lastError,
+      };
+    },
+  };
+}
+
+/** Narrow an `outbox.flush` result to what the monitor observes. */
+export function toEventSinkObservation(
+  result: OutboxFlushResult,
+): EventSinkObservation {
+  return {
+    failed: result.failed,
+    deadLettered: result.deadLettered,
+    eventSinkStatus: result.eventSinkStatus,
+    ...(result.eventSinkError !== undefined
+      ? { eventSinkError: result.eventSinkError }
+      : {}),
   };
 }

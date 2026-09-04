@@ -11,6 +11,7 @@
  */
 
 import {
+  type EventSinkStatus,
   executeJobWithHeartbeat,
   HOST_DEFAULTS,
   type JobTransport,
@@ -105,6 +106,19 @@ export interface MaintenanceTickResult {
   staleReleased: number;
   eventsFlushed: number;
   stuckReaped: number;
+  /** Events claimed but not published this tick; the next flush retries them. */
+  eventsFailed: number;
+  /** Events that exhausted their retry budget and moved to the DLQ. */
+  eventsDeadLettered: number;
+  /**
+   * `"degraded"` when the event sink refused at least one event this tick.
+   * There is no process to carry the state across invocations, so a
+   * serverless caller reports this per tick (and alerts on a run of them);
+   * runs keep progressing either way.
+   */
+  eventSinkStatus: EventSinkStatus;
+  /** First publish failure of this tick, when degraded. */
+  eventSinkError?: string;
 }
 
 export interface ServerlessHost {
@@ -192,6 +206,18 @@ class ServerlessHostImpl implements ServerlessHost {
         console.error(
           "[ServerlessHost] outbox.flush after job: timed out; the next maintenance tick publishes the rest",
         );
+      } else if (outcome.eventSinkStatus === "degraded") {
+        // Stateless: no transition to detect, so say it every time.
+        console.error(
+          `[ServerlessHost] event sink DEGRADED: ${outcome.failed} event(s) stayed in the outbox for a later flush; runs keep progressing. Last error: ${
+            outcome.eventSinkError ?? "unknown"
+          }`,
+        );
+      }
+      if (outcome !== "timeout" && outcome.deadLettered > 0) {
+        console.error(
+          `[ServerlessHost] event sink DEAD-LETTERED ${outcome.deadLettered} event(s): they will not be delivered until replayed with the plugin.replayDLQ command`,
+        );
       }
     } catch (error) {
       console.error("[ServerlessHost] outbox.flush after job error:", error);
@@ -239,7 +265,7 @@ class ServerlessHostImpl implements ServerlessHost {
     // @bratsos/workflow-engine/kernel for the shared command sequence. The
     // serverless host returns the per-command counts to its caller (unlike
     // the Node host, which fires this on a timer and ignores them).
-    return runMaintenanceTickCommands(this.kernel, {
+    const counts = await runMaintenanceTickCommands(this.kernel, {
       workerId: this.workerId,
       maxClaimsPerTick: this.maxClaimsPerTick,
       maxSuspendedChecksPerTick: this.maxSuspendedChecksPerTick,
@@ -247,6 +273,19 @@ class ServerlessHostImpl implements ServerlessHost {
       staleLeaseThresholdMs: this.staleLeaseThresholdMs,
       logPrefix: "[ServerlessHost]",
     });
+    if (counts.eventSinkStatus === "degraded") {
+      console.error(
+        `[ServerlessHost] event sink DEGRADED: ${counts.eventsFailed} event(s) stayed in the outbox for a later flush; runs keep progressing. Last error: ${
+          counts.eventSinkError ?? "unknown"
+        }`,
+      );
+    }
+    if (counts.eventsDeadLettered > 0) {
+      console.error(
+        `[ServerlessHost] event sink DEAD-LETTERED ${counts.eventsDeadLettered} event(s): they will not be delivered until replayed with the plugin.replayDLQ command`,
+      );
+    }
+    return counts;
   }
 }
 

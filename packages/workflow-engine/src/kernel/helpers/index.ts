@@ -19,6 +19,11 @@ export {
 export { createStorageShim } from "./create-storage-shim.js";
 export { toErrorMessage } from "./error-message.js";
 export {
+  type CreateEventSinkMonitorOptions,
+  createEventSinkMonitor,
+  type EventSinkHealth,
+  type EventSinkMonitor,
+  type EventSinkObservation,
   type ExecuteJobOutcome,
   type ExecuteJobWithHeartbeatOptions,
   executeJobWithHeartbeat,
@@ -27,6 +32,7 @@ export {
   type MaintenanceTickCounts,
   type RunMaintenanceTickOptions,
   runMaintenanceTick,
+  toEventSinkObservation,
 } from "./host-support.js";
 export {
   filterCouldMatchLegacy,

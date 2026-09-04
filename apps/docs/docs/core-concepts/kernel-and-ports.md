@@ -73,6 +73,32 @@ To ensure system notifications are reliable, **workflow-engine** implements the 
 * The host then dispatches the **`outbox.flush`** command, which reads these events, publishes them to the `EventSink`, and updates their status in the database.
 * This guarantees **at-least-once delivery** of all system events and eliminates "phantom" events (e.g. notifications sent for a transaction that was rolled back).
 
+### Degraded delivery
+
+`outbox.flush` returns the sink's state alongside the publish count:
+
+```typescript
+const result = await kernel.dispatch({ type: "outbox.flush" });
+// {
+//   published: 4,
+//   failed: 0,            // claimed but not published; retried next flush
+//   deadLettered: 0,      // retry budget exhausted; needs plugin.replayDLQ
+//   eventSinkStatus: "healthy",  // or "degraded"
+//   eventSinkError: undefined    // first publish failure, when degraded
+// }
+```
+
+**`degraded`** is the named state for "the sink is refusing events". It is
+deliberately not an error, because an event sink is a notification channel
+and the committed poller is what advances a run: a degraded sink costs
+delivery latency and nothing else. What it must not do is stay invisible
+until the dead-letter queue fills, so both built-in hosts surface it from
+wherever they report status (`host.getStats().eventSink` on the Node host,
+`eventSinkStatus` in the serverless maintenance tick result). Consumers who
+run their own loop can use `createEventSinkMonitor()` from
+`@bratsos/workflow-engine/kernel` to get the same transition-only logging and
+`EventSinkHealth` report.
+
 ---
 
 ## Idempotency Engine

@@ -209,6 +209,61 @@ describe("NodeHost", () => {
     const stats = host.getStats();
     expect(stats.jobsProcessed).toBe(1);
     expect(stats.isRunning).toBe(true);
+    expect(stats.eventSink.status).toBe("healthy");
+  });
+
+  it("names the event sink degraded and still runs the workflow to completion", async () => {
+    const workflow = createSimpleWorkflow();
+    // Built by hand rather than through createTestEnv: this is the one test
+    // whose sink is not a CollectingEventSink.
+    const persistence = new InMemoryWorkflowPersistence();
+    const jobTransport = new InMemoryJobQueue("test-worker");
+    const kernel = createKernel({
+      persistence,
+      blobStore: new InMemoryBlobStore(),
+      jobTransport,
+      eventSink: {
+        async emit() {
+          throw new Error("sink down");
+        },
+      },
+      clock: new FakeClock(),
+      registry: {
+        getWorkflow: (id) => (id === workflow.id ? workflow : undefined),
+      },
+    });
+
+    await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "sink-down-1",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+
+    host = createNodeHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+      orchestrationIntervalMs: 50,
+      jobPollIntervalMs: 20,
+      staleLeaseThresholdMs: 60_000,
+      flushOutboxOnStop: false,
+    });
+    await host.start();
+
+    // The poller, not the sink, is what advances a run: it completes.
+    await waitFor(async () => {
+      const runs = await persistence.getRunsByStatus("COMPLETED");
+      return runs.length > 0;
+    });
+    // ...and the state is named and readable from the host's status.
+    await waitFor(async () => host!.getStats().eventSink.status === "degraded");
+
+    const stats = host.getStats();
+    expect(stats.eventSink.status).toBe("degraded");
+    expect(stats.eventSink.consecutiveFailures).toBeGreaterThan(0);
+    expect(stats.eventSink.lastError).toContain("sink down");
+    expect(stats.eventSink.since).not.toBeNull();
   });
 
   it("processes a two-stage workflow end-to-end", async () => {

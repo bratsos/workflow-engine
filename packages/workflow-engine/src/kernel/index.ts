@@ -8,6 +8,7 @@
 // Command types
 export type {
   CommandResult,
+  EventSinkStatus,
   JobExecuteCommand,
   JobExecuteResult,
   KernelCommand,
@@ -68,6 +69,11 @@ export {
 } from "./executor/routing-executor.js";
 // Kernel helpers
 export {
+  type CreateEventSinkMonitorOptions,
+  createEventSinkMonitor,
+  type EventSinkHealth,
+  type EventSinkMonitor,
+  type EventSinkObservation,
   type ExecuteJobOutcome,
   type ExecuteJobWithHeartbeatOptions,
   executeJobWithHeartbeat,
@@ -80,6 +86,7 @@ export {
   runMaintenanceTick,
   saveStageOutput,
   toErrorMessage,
+  toEventSinkObservation,
 } from "./helpers/index.js";
 // Durable-step API constructor for hosts that build a stage context themselves
 // (e.g. remote activity workers). Without a ledger every ctx.step.* call throws
