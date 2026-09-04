@@ -161,7 +161,11 @@ export class PrismaStepLedger implements StepLedger {
         stageRecordId,
         stepId,
         status: expected.status,
-        attempt: expected.attempt,
+        // Omitted, not `undefined`-as-any: an absent attempt means "any
+        // attempt", so the WHERE must not constrain the column at all.
+        ...(expected.attempt !== undefined
+          ? { attempt: expected.attempt }
+          : {}),
       },
       data: mapPatch(patch),
     });

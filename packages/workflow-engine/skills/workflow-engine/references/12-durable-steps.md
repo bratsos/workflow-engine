@@ -179,6 +179,25 @@ await ctx.step.run("wire-transfer", () => bank.send(order), { onReclaim: "fail" 
 
 The row is left `failed`, so a later replay meets the stored error rather than re-deciding. The default is `"rerun"` — the behaviour of every earlier version — so nothing changes for a step that is safe to retry. `onReclaim` governs the lease-expiry takeover only; it does not affect `retries`, because a body that *threw* has said its effect did not take.
 
+### When two workers reach the same step
+
+The lease and the reopen-on-retry path can both decide a step is takeable, so
+a wrong liveness verdict can put two workers inside one body. A step's outcome
+is therefore recorded with a compare-and-set against the row still being open:
+first write wins, and the loser **parks** on the outcome already recorded
+rather than overwriting it. Whichever worker returns first, both callers are
+answered the same recorded value — the row is the authority — and a body that
+threw cannot bury a success another execution already committed.
+
+When that happens the engine logs a WARN and writes a `step.outcome-conflict`
+annotation on the run, carrying the step id, its kind, the recorded status and
+attempt, and the step's `externalKey`. It is a report, not a failure: the
+ledger stayed consistent, so nothing is raised and no retry is spent. What it
+tells you is that the *body* ran more than once, which is the case where a
+duplicate external effect is possible — so treat the annotation as the cue to
+look for one under that external key, and, if the effect cannot be
+deduplicated, to give the step `onReclaim: "fail"`.
+
 ### Concurrency
 
 Steps may run concurrently under `Promise.all`; a suspension lets in-flight

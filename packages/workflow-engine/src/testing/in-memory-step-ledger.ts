@@ -121,7 +121,7 @@ export class InMemoryStepLedger implements StepLedger {
     if (!existing) return { applied: false, record: null };
     if (
       existing.status !== expected.status ||
-      existing.attempt !== expected.attempt
+      (expected.attempt !== undefined && existing.attempt !== expected.attempt)
     ) {
       return { applied: false, record: cloneRecord(existing) };
     }

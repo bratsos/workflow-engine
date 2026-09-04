@@ -113,7 +113,15 @@ export type StepRecordPatch = Partial<
 /** The `(status, attempt)` pair a compare-and-set write must observe. */
 export interface StepRecordExpectation {
   status: StepRecord["status"];
-  attempt: number;
+  /**
+   * Omit to match any attempt. A take-over pins the attempt so only one
+   * replay wins it; the write that records a step's *outcome* must not,
+   * because a step may legitimately bump its own attempt while it runs
+   * (an AI map item retrying its model call in-process). What that write
+   * needs is first-write-wins on the terminal outcome, which `status`
+   * alone expresses.
+   */
+  attempt?: number;
 }
 
 export interface StepLedger {
