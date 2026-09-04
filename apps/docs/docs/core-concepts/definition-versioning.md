@@ -263,5 +263,5 @@ unfiltered claiming, keep passing `serves: "all"` on `run.claimPending`.
 Pinning stops an incompatible change from corrupting a run, but it does not
 tell you *before* you deploy that a change is incompatible — it just leaves
 old runs stranded. To catch that in CI, replay recent runs' recorded ledgers
-against your candidate pipeline with `shadowRuns` from
-`@bratsos/workflow-engine/testing`.
+against your candidate pipeline; see
+[Shadowing a definition change](../testing/shadowing.md).

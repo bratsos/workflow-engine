@@ -78,3 +78,17 @@ export {
   jobQueueConformanceSuite,
   persistenceConformanceSuite,
 } from "./persistence-conformance.js";
+// Shadowing: check a candidate pipeline against runs that already exist.
+export {
+  assertShadowCompatible,
+  type ShadowIssue,
+  type ShadowIssueCode,
+  type ShadowReport,
+  type ShadowRunResult,
+  type ShadowRunsOptions,
+  type ShadowVersionResult,
+  type ShadowVersionsOptions,
+  type ShadowVersionsReport,
+  shadowRuns,
+  shadowVersions,
+} from "./shadow-runs.js";
