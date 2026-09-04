@@ -87,6 +87,24 @@ no authentication — it is a development tool. Connecting it directly with
 which acknowledges that the connection is a second session and will not be
 scoped by your policies.
 
+## Finding a run stranded on an old definition version
+
+[Definition versioning](../core-concepts/definition-versioning.md) pins a
+run to the structure it started under, and a run pinned to a version no
+build serves any more sits there until someone redrives it. The runs list
+carries each run's definition version — shortened, with the full value on
+hover — and its redrive count as a `+N` suffix, and the filter bar takes a
+version, so "show me everything still pinned to the old version" is one
+query:
+
+```
+GET /api/runs?definitionVersion=sha256-…
+```
+
+The run detail shows the same two fields next to the run's timings, which
+is what an operator needs before deciding whether to redrive onto
+`"latest"`.
+
 ## The indexes it needs
 
 The console's list views are "newest first, optionally narrowed", paged on

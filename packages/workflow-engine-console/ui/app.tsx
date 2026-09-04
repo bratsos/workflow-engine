@@ -34,6 +34,8 @@ interface RunSummary {
   totalCost: number;
   totalTokens: number;
   priority: number;
+  definitionVersion: string | null;
+  redriveCount: number;
 }
 
 interface RunListPage {
@@ -259,6 +261,11 @@ function formatAbsolute(iso: string | null): string {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return "—";
   return d.toLocaleString();
+}
+
+function formatVersion(version: string | null): string {
+  if (!version) return "—";
+  return version.length > 8 ? `…${version.slice(-8)}` : version;
 }
 
 async function api<T>(config: ConsoleConfig, path: string, init?: RequestInit): Promise<T> {
@@ -499,6 +506,16 @@ const RUN_STATUSES = [
   "SKIPPED",
 ] as const;
 
+/** A text filter, settled, so typing does not fire a request per keystroke. */
+function useDebounced(value: string, delayMs = 300): string {
+  const [settled, setSettled] = useState(value);
+  useEffect(() => {
+    const timer = setTimeout(() => setSettled(value), delayMs);
+    return () => clearTimeout(timer);
+  }, [value, delayMs]);
+  return settled;
+}
+
 function RunsView({
   config,
   pollInterval,
@@ -512,25 +529,26 @@ function RunsView({
 }) {
   const [selectedStatuses, setSelectedStatuses] = useState<string[]>([]);
   const [workflowIdInput, setWorkflowIdInput] = useState<string>("");
-  const [debouncedWorkflowId, setDebouncedWorkflowId] = useState<string>("");
+  const [definitionVersionInput, setDefinitionVersionInput] = useState<string>("");
   const [fromInput, setFromInput] = useState<string>("");
   const [toInput, setToInput] = useState<string>("");
+  const debouncedWorkflowId = useDebounced(workflowIdInput);
+  const debouncedDefinitionVersion = useDebounced(definitionVersionInput);
 
   const [cursor, setCursor] = useState<string | undefined>(undefined);
   const [cursorStack, setCursorStack] = useState<string[]>([]);
   const [dismissedError, setDismissedError] = useState<Error | null>(null);
 
   useEffect(() => {
-    const timer = setTimeout(() => {
-      setDebouncedWorkflowId(workflowIdInput);
-    }, 300);
-    return () => clearTimeout(timer);
-  }, [workflowIdInput]);
-
-  useEffect(() => {
     setCursor(undefined);
     setCursorStack([]);
-  }, [selectedStatuses, debouncedWorkflowId, fromInput, toInput]);
+  }, [
+    selectedStatuses,
+    debouncedWorkflowId,
+    debouncedDefinitionVersion,
+    fromInput,
+    toInput,
+  ]);
 
   const toggleStatus = (st: string) => {
     setSelectedStatuses((prev) =>
@@ -546,6 +564,9 @@ function RunsView({
     if (debouncedWorkflowId.trim()) {
       params.set("workflowId", debouncedWorkflowId.trim());
     }
+    if (debouncedDefinitionVersion.trim()) {
+      params.set("definitionVersion", debouncedDefinitionVersion.trim());
+    }
     if (fromInput) {
       const d = new Date(fromInput);
       if (!Number.isNaN(d.getTime())) params.set("from", d.toISOString());
@@ -559,7 +580,15 @@ function RunsView({
     }
     const qs = params.toString();
     return await api<RunListPage>(config, `/runs${qs ? `?${qs}` : ""}`);
-  }, [config, selectedStatuses, debouncedWorkflowId, fromInput, toInput, cursor]);
+  }, [
+    config,
+    selectedStatuses,
+    debouncedWorkflowId,
+    debouncedDefinitionVersion,
+    fromInput,
+    toInput,
+    cursor,
+  ]);
 
   const { data, error, loading } = usePolled(
     fetchRuns,
@@ -614,6 +643,14 @@ function RunsView({
             value={workflowIdInput}
             onInput={(e) => setWorkflowIdInput((e.target as HTMLInputElement).value)}
           />
+          <label class="sr-only" for="wc-filter-version">Definition version</label>
+          <input
+            id="wc-filter-version"
+            type="text"
+            placeholder="Filter definition version..."
+            value={definitionVersionInput}
+            onInput={(e) => setDefinitionVersionInput((e.target as HTMLInputElement).value)}
+          />
           <label class="sr-only" for="wc-filter-from">From</label>
           <input
             id="wc-filter-from"
@@ -645,6 +682,7 @@ function RunsView({
                   <th scope="col">Status</th>
                   <th scope="col">Run ID</th>
                   <th scope="col">Workflow</th>
+                  <th scope="col">Version</th>
                   <th scope="col">Started</th>
                   <th scope="col">Duration</th>
                   <th scope="col">Cost</th>
@@ -663,6 +701,14 @@ function RunsView({
                       </a>
                     </td>
                     <td>{run.workflowName || run.workflowId}</td>
+                    <td title={run.definitionVersion ?? undefined}>
+                      {formatVersion(run.definitionVersion)}
+                      {run.redriveCount > 0 && (
+                        <span title={`${run.redriveCount} redrives`}>
+                          {` +${run.redriveCount}`}
+                        </span>
+                      )}
+                    </td>
                     <td>{formatRelative(run.startedAt)}</td>
                     <td>{formatDuration(run.duration)}</td>
                     <td>{formatCost(run.totalCost)}</td>
@@ -671,7 +717,7 @@ function RunsView({
                 ))}
                 {data && data.runs.length === 0 && (
                   <tr>
-                    <td colspan={7} class="empty-state">No workflow runs found.</td>
+                    <td colspan={8} class="empty-state">No workflow runs found.</td>
                   </tr>
                 )}
               </tbody>
@@ -842,6 +888,16 @@ function RunDetailView({
               <div class="meta-item">
                 <span class="meta-label">Workflow</span>
                 <span class="meta-value">{data.run.workflowName || data.run.workflowId}</span>
+              </div>
+              <div class="meta-item">
+                <span class="meta-label">Version</span>
+                <span class="meta-value" title={data.run.definitionVersion ?? undefined}>
+                  {formatVersion(data.run.definitionVersion)}
+                </span>
+              </div>
+              <div class="meta-item">
+                <span class="meta-label">Redrives</span>
+                <span class="meta-value">{data.run.redriveCount}</span>
               </div>
               <div class="meta-item">
                 <span class="meta-label">Started</span>

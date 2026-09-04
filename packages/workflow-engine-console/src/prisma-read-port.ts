@@ -103,6 +103,8 @@ interface RawRunRow {
   totalCost: number | null;
   totalTokens: number | bigint | null;
   priority: number | bigint | null;
+  definitionVersion?: string | null;
+  redriveCount?: number | bigint | null;
 }
 
 interface RawRunDetailRow extends RawRunRow {
@@ -233,6 +235,11 @@ function mapRunSummary(row: RawRunRow): RunSummary {
     totalCost: toNumber(row.totalCost),
     totalTokens: toNumber(row.totalTokens),
     priority: toNumber(row.priority),
+    definitionVersion:
+      row.definitionVersion !== null && row.definitionVersion !== undefined
+        ? String(row.definitionVersion)
+        : null,
+    redriveCount: toNumber(row.redriveCount),
   };
 }
 
@@ -548,6 +555,12 @@ export class PrismaConsoleReadPort implements ConsoleReadPort {
       paramIdx += 1;
     }
 
+    if (query.filters?.definitionVersion !== undefined) {
+      where.push(`"definitionVersion" = $${paramIdx}`);
+      params.push(query.filters.definitionVersion);
+      paramIdx += 1;
+    }
+
     if (query.filters?.createdAfter !== undefined) {
       where.push(`"createdAt" >= ${utcParam(paramIdx)}`);
       params.push(query.filters.createdAfter);
@@ -563,7 +576,8 @@ export class PrismaConsoleReadPort implements ConsoleReadPort {
     const whereClause =
       where.length > 0 ? `\nWHERE ${where.join(" AND ")}` : "";
     const sql = `SELECT id, "createdAt", "updatedAt", "workflowId", "workflowName", "workflowType",
-       status, "startedAt", "completedAt", duration, "totalCost", "totalTokens", priority
+       status, "startedAt", "completedAt", duration, "totalCost", "totalTokens", priority,
+       "definitionVersion", "redriveCount"
 FROM "workflow_runs"${whereClause}
 ORDER BY "createdAt" DESC, id DESC
 LIMIT ${limit + 1}`;
@@ -599,6 +613,7 @@ LIMIT ${limit + 1}`;
         client,
         `SELECT id, "createdAt", "updatedAt", "workflowId", "workflowName", "workflowType",
        status, "startedAt", "completedAt", duration, "totalCost", "totalTokens", priority,
+       "definitionVersion", "redriveCount",
        input, output, config, metadata
 FROM "workflow_runs" WHERE id = $1`,
         [runId],
