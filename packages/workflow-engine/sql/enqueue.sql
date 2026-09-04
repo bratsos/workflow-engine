@@ -43,7 +43,11 @@
 --    `workflow_definitions` row was never inserted would be pinned to
 --    nothing. So the default is to create the run UNPINNED
 --    (`definitionVersion` NULL) — the same state as a deployment that has
---    not adopted definition versioning, and claimable by any host. Pass
+--    not adopted definition versioning. An unpinned run is claimable by
+--    any host that holds the workflow -- `run.claimPending` matches an
+--    unpinned run on `workflowId` against the host's served definitions,
+--    so a host whose build has no such workflow leaves it alone rather
+--    than claiming it and failing it with WORKFLOW_NOT_FOUND. Pass
 --    `p_definition_version` when the caller does know the version (a
 --    TypeScript service reaching for a transactional enqueue can read
 --    `workflow.definitionVersion`); the function then REFUSES unless the
