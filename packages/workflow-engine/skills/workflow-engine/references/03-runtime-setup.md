@@ -56,6 +56,17 @@ const kernel = createKernel({
   // dispatcher leaving a key stuck forever). Default: 10 minutes.
   // Set to `Infinity` to disable reclaiming.
   idempotencyStaleInProgressMs: 10 * 60 * 1000,
+
+  // Optional (1.0): soft threshold, in bytes of serialised JSON, above which
+  // a durable step result is written to `blobStore` and the ledger row keeps
+  // only a reference. Default `DEFAULT_SPILL_THRESHOLD_BYTES` (64 KiB).
+  // There is no hard ceiling above it -- a larger payload is spilled, never
+  // rejected -- and reads resolve the reference before the value reaches the
+  // stage. `Number.POSITIVE_INFINITY` keeps every result inline; values
+  // already spilled still resolve. Job payloads use the same mechanism but
+  // are opt-in at wiring time (`createSpillingJobTransport`).
+  // See 15-large-payloads.md.
+  // spillThresholdBytes: 65_536,
 });
 ```
 
@@ -102,8 +113,13 @@ await host.stop();
 
 // Runtime stats
 const stats = host.getStats();
-// { workerId, jobsProcessed, orchestrationTicks, isRunning, uptimeMs }
+// { workerId, jobsProcessed, orchestrationTicks, isRunning, uptimeMs, eventSink }
 ```
+
+`stats.eventSink` is an `EventSinkHealth` as of this host's last outbox flush:
+`{ status: "healthy" | "degraded", since: number | null, consecutiveFailures:
+number, deadLettered: number, lastError: string | null }`. See "Degraded event
+sink" below.
 
 `staleLeaseThresholdMs` is how long a killed worker's *job* stays unavailable. A killed worker's in-flight **durable step** is a separate dial: `StepRunOptions.leaseMs`, default five minutes, is how long a resumed stage waits before it re-runs that step (see 12-durable-steps.md, "Leases, retries and deadlines"). Both bound how fast a crash recovers; neither is set by the other.
 
@@ -219,11 +235,49 @@ Run from a cron trigger (Cloudflare Cron, EventBridge, etc.):
 
 ```typescript
 const tick = await host.runMaintenanceTick();
-// { claimed, suspendedChecked, staleReleased, staleExpired, eventsFlushed, stuckReaped }
+// { claimed, suspendedChecked, staleReleased, staleExpired, eventsFlushed,
+//   stuckReaped, eventsFailed, eventsDeadLettered, eventSinkStatus, eventSinkError? }
 // Resumed suspended stages are automatically followed by run.transition.
 ```
 
+The serverless host has no process to carry health across invocations, so it
+reports `eventSinkStatus` per tick and you alert on a run of them. See
+"Degraded event sink" below.
+
 Each maintenance step runs in its own error boundary — if one step fails, the others still execute. See [09-troubleshooting.md](09-troubleshooting.md) for details.
+
+## Degraded event sink
+
+The outbox is the durable record; the `EventSink` is a delivery attempt. When
+publishing fails, `outbox.flush` releases the events it had claimed so the next
+flush retries them, and reports `eventSinkStatus: "degraded"` with
+`eventSinkError` set to the first failure of that flush. Nothing about a run
+stalls: the poller advances runs, not the sink. `OutboxFlushResult` carries
+`published`, `failed`, `deadLettered`, `eventSinkStatus` and `eventSinkError?`,
+and the same fields reach `MaintenanceTickCounts`.
+
+An event that exhausts its retry budget moves to the dead-letter queue and
+counts in `deadLettered`. Those stop retrying on their own — replay them with
+the `plugin.replayDLQ` command.
+
+The Node host holds the state across flushes through `createEventSinkMonitor`
+and logs only on a transition (into degraded, and again on recovery), so a sink
+that is down for an hour does not produce an hour of log lines; it logs
+unconditionally when `deadLettered > 0`, because that one needs an operator.
+`host.getStats().eventSink` is the same state as a value:
+
+```typescript
+const { status, since, consecutiveFailures, deadLettered, lastError } =
+  host.getStats().eventSink;
+
+if (status === "degraded" && Date.now() - (since ?? 0) > 5 * 60_000) {
+  alert(`workflow event sink degraded for 5m: ${lastError}`);
+}
+```
+
+The serverless host has no process to hold that state, so it reports
+`eventSinkStatus` on each `runMaintenanceTick()` result and the caller alerts
+on a run of degraded ticks.
 
 ## Building a Custom Host
 

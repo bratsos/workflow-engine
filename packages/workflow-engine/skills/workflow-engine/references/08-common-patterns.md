@@ -83,22 +83,42 @@ await kernel.dispatch({
 
 In the Node host, this runs automatically on each orchestration tick. For serverless, include it in your maintenance cron.
 
-## Rerun From Stage
+## Redrive: Retry, Restart, Rerun
 
-Rerun a workflow from a specific stage, keeping outputs from earlier stages:
+`run.redrive` is one command with three resume points. See
+[14-redrive.md](14-redrive.md) for the full contract.
 
 ```typescript
-const { deletedStages } = await kernel.dispatch({
-  type: "run.rerunFrom",
+// Retry: resume at the earliest stage that is not COMPLETED (the default).
+await kernel.dispatch({ type: "run.redrive", workflowRunId: "run-123" });
+
+// Restart: run the whole pipeline again from the first group.
+await kernel.dispatch({
+  type: "run.redrive",
   workflowRunId: "run-123",
-  fromStageId: "summarize",
-  idempotencyKey: "rerun-run-123-summarize-1", // optional (v0.11+); replay returns the cached result
+  from: { kind: "start" },
 });
 
-// Stages from "summarize" onward are deleted and re-queued
-// Earlier stages (e.g., "extract") keep their outputs
-// Blob artifacts for deleted stages are cleaned up by key prefix (after commit, as of v0.11)
+// Rerun: resume at a stage you choose, optionally on a newer definition.
+const { supersededStages, redriveCount } = await kernel.dispatch({
+  type: "run.redrive",
+  workflowRunId: "run-123",
+  from: { kind: "stage", stageId: "summarize" },
+  definitionVersion: "latest",                 // optional re-pin
+  idempotencyKey: "redrive-run-123-summarize-1", // optional; replay returns the cached result
+});
+
+// Stages at and after the resume point are superseded and re-queued.
+// Earlier stages keep their outputs.
+// Each superseded stage is archived as a `run.supersededAttempt` annotation
+// in the same transaction, so the failed attempt is not lost.
+// Blob artifacts for superseded stages are cleaned up by key prefix, after commit.
+// The run keeps its id; `workflow_runs.redriveCount` increments and never resets.
 ```
+
+`run.rerunFrom` is deprecated. It still works and its result shape is
+unchanged (`deletedStages` now reports the superseded stages), but it cannot
+change the definition version and it still refuses a `CANCELLED` run.
 
 ## Plugin System
 
@@ -238,6 +258,27 @@ Each step of the orchestration tick (claim pending, poll suspended, reap stale, 
 Any number of processes may run the orchestration tick against the same database. `stage.pollSuspended` claims each suspended stage before working on it: a version-guarded `updateStage(id, { nextPollAt: now + lease, expectedVersion })` outside the per-stage transaction, where the lease is `max(pollInterval, 60s)` bounded by `maxWaitUntil`. A poller whose claim fails (`StaleVersionError`) skips the stage — the body of a durable stage, or `checkCompletion`, runs once per poll across all processes. Every outcome then writes `nextPollAt` explicitly (re-suspend, `now + pollInterval` when not ready, `null` on completion/failure/cancel, back to `now` when the run-level claim was lost), so the lease only matters when a process dies mid-replay: that stage is polled again once the lease elapses. A poller that comes back to a run another process has since finished leaves the stage row alone; only a run that is `CANCELLED` cancels the stage.
 
 The Node host additionally skips an interval firing while a tick is still in flight, so a long replay never overlaps the next tick in the same process.
+
+**Why not a Postgres advisory lock.** A session-scoped `pg_try_advisory_lock`
+looks like the stronger primitive — it releases the instant the connection
+dies, so there is no stale-lock window and no reaper to tune — and it was
+evaluated and rejected for four reasons. It belongs to the *connection*, not
+the task, and is re-entrant, so a pool that hands one connection to two
+pollers grants both the "lock" and single flight is gone. Under PgBouncer in
+transaction mode consecutive statements land on different server connections,
+so the lock is taken and never released. A serverless host has no long-lived
+connection to own one at all. And advisory locks live in one global 64-bit
+integer namespace with no schema and no row-level-security boundary: a lock
+taken inside a tenant's transaction outlives the `COMMIT` on the pooled
+connection, and tenant B can be blocked by tenant A's hashed stage id. The
+version-guarded `nextPollAt` lease is a row, so it is scoped by the same RLS
+policies as everything else and works on SQLite too.
+
+Since a build that cannot serve a run's definition version must not hold the
+claim either, `stage.pollSuspended` releases the claim immediately when
+`servesRun` is false, rather than sitting on the lease for its duration — an
+unserving host re-claiming every tick would otherwise starve the serving one
+during a rolling deploy. See [13-definition-versioning.md](13-definition-versioning.md).
 
 ### Stuck Run Detection
 

@@ -57,7 +57,19 @@ interface PersistenceCore {
   getRun(id: string): Promise<WorkflowRunRecord | null>;
   getRunStatus(id: string): Promise<Status | null>;
   getStuckRuns(stuckSince: Date): Promise<WorkflowRunRecord[]>;
-  claimNextPendingRun(): Promise<WorkflowRunRecord | null>;     // atomic FOR UPDATE SKIP LOCKED claim
+  claimNextPendingRun(options?: {
+    now?: Date;                                                 // the kernel clock's time, written as startedAt/updatedAt
+    serves?: readonly ServedDefinition[];                       // definition versions this build serves; omit to claim any run
+  }): Promise<WorkflowRunRecord | null>;                        // atomic FOR UPDATE SKIP LOCKED claim
+
+  // Definition versioning (1.0). An adapter with no versioning tables
+  // returns false / null / [] here and ignores `serves`; the engine then
+  // behaves exactly as it did before versioning existed. See
+  // 13-definition-versioning.md.
+  supportsDefinitionVersioning(): boolean;
+  insertDefinitionIfAbsent(input: CreateDefinitionInput): Promise<WorkflowDefinitionRecord | null>;
+  getDefinition(workflowId: string, version: string): Promise<WorkflowDefinitionRecord | null>;
+  countRunsByDefinitionVersion(filter?: DefinitionVersionCountFilter): Promise<DefinitionVersionCount[]>;
 
   // WorkflowStage operations
   createStage(data: CreateStageInput): Promise<WorkflowStageRecord>;

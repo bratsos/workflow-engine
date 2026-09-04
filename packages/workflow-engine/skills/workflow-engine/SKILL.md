@@ -546,7 +546,7 @@ Implementing a custom `WorkflowPersistence`/`JobQueue`/`AICallLogger` adapter? V
 
 - [01-stage-definitions.md](references/01-stage-definitions.md) - Complete stage API
 - [02-workflow-builder.md](references/02-workflow-builder.md) - WorkflowBuilder patterns
-- [03-kernel-host-setup.md](references/03-runtime-setup.md) - Kernel & host configuration
+- [03-runtime-setup.md](references/03-runtime-setup.md) - Kernel & host configuration, job-lease tiers, degraded event sink
 - [04-ai-integration.md](references/04-ai-integration.md) - AI helper methods
 - [05-persistence-setup.md](references/05-persistence-setup.md) - Database setup
 - [06-async-batch-stages.md](references/06-async-batch-stages.md) - Async operations
@@ -555,7 +555,11 @@ Implementing a custom `WorkflowPersistence`/`JobQueue`/`AICallLogger` adapter? V
 - [09-troubleshooting.md](references/09-troubleshooting.md) - Debugging stuck runs, P2002 errors, ghost jobs
 - [10-annotations.md](references/10-annotations.md) - First-class provenance surface: `ctx.annotate`, `kernel.annotations.*`, conventions catalog
 - [11-remote-activity-workers.md](references/11-remote-activity-workers.md) - Credential-free remote workers: `defineRemoteStage`, broker, worker SDK, HTTP transport, S3/R2 artifacts, `ActivityExecutor` port
-- [12-durable-steps.md](references/12-durable-steps.md) - Durable steps (`ctx.step.run/waitFor/waitForSignal/sleep`), determinism rules, `ctx.step.ai.*` and `ai.map` policies, `ctx.ai` injection, adapter seam and timeouts, the builder-first `defineWorkflow().stage()` API, migrating async-batch stages to steps
+- [12-durable-steps.md](references/12-durable-steps.md) - Durable steps (`ctx.step.run/waitFor/waitForSignal/sleep`), determinism rules, `DuplicateStepKeyError`, `step.externalKey`/`onReclaim`, `ctx.step.ai.*` and `ai.map` policies, `ctx.ai` injection, adapter seam and timeouts, the builder-first `defineWorkflow().stage()` API, migrating async-batch stages to steps
+- [13-definition-versioning.md](references/13-definition-versioning.md) - `.version()` and the derived structural hash, the `workflow_definitions` snapshot, version-filtered claiming (`serves`, `ghostReason: "version"`), `run.listVersions`, and shadowing a candidate build against live runs
+- [14-redrive.md](references/14-redrive.md) - `run.redrive`'s retry / restart / rerun modes, re-pinning onto another definition version, the preserved `run.supersededAttempt`, and migrating off the deprecated `run.rerunFrom`
+- [15-large-payloads.md](references/15-large-payloads.md) - The claim check: automatic step-result spilling, opt-in job-payload spilling, `spillThresholdBytes`, and what is deliberately not spilled
+- [16-operational-console.md](references/16-operational-console.md) - `@bratsos/workflow-engine-console`: mounting the handler, the deny-by-default action vocabulary, `ConsoleReadPort`, query timeouts, and the dev CLI
 
 ## Key Principles
 
@@ -564,10 +568,11 @@ Implementing a custom `WorkflowPersistence`/`JobQueue`/`AICallLogger` adapter? V
 3. **Environment-Agnostic**: Kernel has no timers, no signals, no global state
 4. **Context Access**: Use `ctx.require()` and `ctx.optional()` for type-safe stage output access
 5. **Transactional Outbox**: Events written to outbox, published via `outbox.flush` command. `job.execute` and `stage.pollSuspended` use multi-phase transactions to avoid holding connections during external I/O; `stage.pollSuspended` claims each suspended stage (version-guarded `nextPollAt` lease) before polling it, so several orchestrating processes replay a stage once
-6. **Idempotency**: `run.create`, `job.execute`, and `run.rerunFrom` (v0.11+) replay cached results by key; concurrent same-key dispatch throws `IdempotencyInProgressError`; a key stuck `in_progress` past `KernelConfig.idempotencyStaleInProgressMs` (default 10 min, v0.11+) can be reclaimed
+6. **Idempotency**: `run.create`, `job.execute`, `run.redrive` and `run.rerunFrom` replay cached results by key; concurrent same-key dispatch throws `IdempotencyInProgressError`; a key stuck `in_progress` past `KernelConfig.idempotencyStaleInProgressMs` (default 10 min, v0.11+) can be reclaimed
 7. **Authoritative Cancellation**: `run.cancel` cascades to stages + jobs. Ghost jobs (running against non-RUNNING runs) are detected via `ghost: true` flag and not retried
 8. **Self-Healing**: Stage creation is idempotent (upsert), orchestration steps are isolated, stuck runs are automatically reaped
 9. **Cost Tracking**: All AI calls automatically track tokens and costs
-10. **BlobStore-Only Artifacts**: All artifact storage goes through the BlobStore port. `run.rerunFrom` cleans up artifacts by key prefix
+10. **BlobStore-Only Artifacts**: All artifact storage goes through the BlobStore port. `run.redrive` cleans up superseded artifacts by key prefix after commit. A durable step result over `spillThresholdBytes` (64 KiB) is written there too, with the ledger row keeping a reference — see [15-large-payloads.md](references/15-large-payloads.md)
 11. **Durable Provenance**: `ctx.annotate(...)` writes are buffered and flushed inside the stage-completion transaction. Annotations are atomic with the stage outcome — a stage's annotations either all persist or all roll back together with the stage update and outbox events.
 12. **Pluggable Execution**: stage execution goes through an injectable `ActivityExecutor` port (default in-process `LocalExecutor`). Inject a remote executor — or wrap a stage with `defineRemoteStage` — to run `execute()` on a separate credential-free machine without changing kernel internals.
+13. **Definition Pinning**: a run records the definition version it was created under, and a host built with `createWorkflowRegistry` claims only runs pinned to a version it serves. A run at a version this build does not serve is left alone — `PENDING` runs stay pending, a `RUNNING` job comes back with `ghostReason: "version"` — never failed, because a host cannot tell a decommissioned fleet from a peer mid-deploy. See [13-definition-versioning.md](references/13-definition-versioning.md).
