@@ -932,4 +932,31 @@ describe("kernel: stage.pollSuspended claims a stage before working on it", () =
       "COMPLETED",
     );
   });
+
+  it("leaves a COMPLETED stage alone when the loser arrives after the winner completed the run", async () => {
+    const gate = gatedPoll();
+    const env = await suspendDurableWait(gate.poll);
+    env.clock.advance(1_000);
+
+    // The loser claims first and stalls past its lease; the winner then
+    // claims, completes the stage and the run transitions to COMPLETED.
+    const loser = env.kernel.dispatch({ type: "stage.pollSuspended" });
+    await settle();
+    env.clock.advance(60_000);
+    const winner = await env.kernel.dispatch({ type: "stage.pollSuspended" });
+    expect(winner.resumed).toBe(1);
+    await env.kernel.dispatch({
+      type: "run.transition",
+      workflowRunId: env.runId,
+    });
+    expect((await env.persistence.getRun(env.runId))?.status).toBe("COMPLETED");
+
+    // The loser's replay returns into a run that is no longer RUNNING.
+    gate.release({ done: true });
+    expect((await loser).resumed).toBe(0);
+    const stage = await env.persistence.getStage(env.runId, "wait");
+    expect(stage?.status).toBe("COMPLETED");
+    expect(stage?.nextPollAt).toBeNull();
+    expect((await env.persistence.getRun(env.runId))?.status).toBe("COMPLETED");
+  });
 });
