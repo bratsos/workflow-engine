@@ -18,6 +18,7 @@ import { createStepApi } from "../../kernel/helpers/step-api.js";
 import type { StepLedger } from "../../kernel/ports.js";
 import { FakeClock } from "../../kernel/testing/fake-clock.js";
 import { InMemoryStepLedger } from "../../testing/in-memory-step-ledger.js";
+import { wrapStepLedger } from "../utils/step-ledger-double.js";
 
 const LEASE_MS = 5 * 60 * 1000;
 
@@ -127,8 +128,7 @@ describe("durable step outcome conflicts", () => {
     // the deadline write reaches the ledger — the interleaving a signal
     // arriving at the deadline actually produces.
     let stale: Awaited<ReturnType<InMemoryStepLedger["get"]>> = null;
-    const ledger: StepLedger = {
-      claim: (record) => backing.claim(record),
+    const ledger: StepLedger = wrapStepLedger(backing, {
       get: async (stageRecordId, stepId) => {
         const record = await backing.get(stageRecordId, stepId);
         if (stale) {
@@ -138,13 +138,7 @@ describe("durable step outcome conflicts", () => {
         }
         return record;
       },
-      update: (stageRecordId, stepId, patch) =>
-        backing.update(stageRecordId, stepId, patch),
-      compareAndSet: (stageRecordId, stepId, expected, patch) =>
-        backing.compareAndSet(stageRecordId, stepId, expected, patch),
-      list: (stageRecordId) => backing.list(stageRecordId),
-      clear: (stageRecordId) => backing.clear(stageRecordId),
-    };
+    });
     const api = () =>
       createStepApi({ stageRecordId: "stage", stepLedger: ledger, clock });
 
