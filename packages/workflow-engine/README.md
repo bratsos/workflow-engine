@@ -1,6 +1,14 @@
 # @bratsos/workflow-engine
 
-A **type-safe, distributed workflow engine** for AI-orchestrated processes. Features long-running job support, suspend/resume semantics, parallel execution, and integrated AI cost tracking.
+A TypeScript library that runs durable, multi-stage workflows in **your own
+Postgres**. No server, no vendor: hand it a Prisma client and run it from a
+Node process, a serverless function or a cron trigger. Built for pipelines
+whose expensive steps are model calls — suspend and resume across hours,
+per-call cost accounting, and provider batch endpoints as durable steps.
+
+The kernel is a pure command dispatcher with no connection, timers or global
+state of its own, so it can run inside a transaction you opened, on your
+session, under your row-level security policies.
 
 ---
 
@@ -40,13 +48,13 @@ A **type-safe, distributed workflow engine** for AI-orchestrated processes. Feat
 | Feature | Description |
 |---------|-------------|
 | **Type-Safe** | Full TypeScript inference from input to output across all stages |
-| **Async-First** | Native support for long-running operations (batch jobs that take hours/days) |
-| **AI-Native** | Built-in tracking of prompts, responses, tokens, and costs |
-| **Event-Driven** | Transactional outbox pattern for reliable event delivery |
-| **Parallel Execution** | Run independent stages concurrently |
-| **Resume Capability** | Automatic state persistence and recovery from failures |
-| **Distributed** | Job queue with priority support and stale lock recovery |
-| **Environment-Agnostic** | Pure command kernel runs on Node.js, serverless, edge, or any runtime |
+| **Async-First** | Long-running operations: a stage submits a provider batch, releases its lease, and resumes hours later from the step ledger |
+| **AI cost as data** | Tokens and cost on `WorkflowRun.totalCost` in the stage's own transaction, priced from the endpoint actually dispatched to — batch prices for a batch call |
+| **Event-Driven** | Transactional outbox: system events reach your `EventSink` at least once, with no events for a rolled-back transaction |
+| **Parallel Execution** | Independent stages in one execution group run concurrently. Pipelines are linear -- there is no arbitrary DAG and no child workflows |
+| **Durable steps** | `ctx.step.*` results are keyed by name in a step ledger: exactly-once *recording*, at-least-once *execution*, with a derived `externalKey` so a reclaim adopts an external effect rather than repeating it |
+| **Definition versioning** | A run is pinned to the structural version it was created under, and a host claims only runs it serves, so a rolling deploy cannot change a run's shape mid-flight |
+| **Environment-Agnostic** | Pure command kernel: no timers, no signals, no global state, no connection of its own. Node.js, serverless, edge, or inside your transaction |
 
 ---
 

@@ -67,6 +67,17 @@ await kernel.dispatch({ type: "run.transition", workflowRunId: runId });
 2. **Kernel guard:** `job.execute` checks `workflowRun.status === "RUNNING"` both before AND after stage execution. A job whose run is not RUNNING comes back with `outcome: "failed"` and a typed `ghost: true` flag, plus `ghostReason` saying which kind it is.
 3. **Host handling by reason:** both hosts read `ghostReason` (never the message text). `"orphan"` -- the run is `CANCELLED`/`COMPLETED`/`FAILED` -- is failed terminally, since a retry can only fail again. `"race"` -- the run is still `PENDING` -- is re-delivered while the job's attempt budget lasts; see below.
 
+**A third reason: `"version"`.** With definition versioning on, a job can
+reach a build that does not serve the run's pinned definition version. That is
+not a ghost in the rollback sense -- the run is legitimately `RUNNING`, just
+not here. `job.execute` returns `{ ghost: true, ghostReason: "version" }`, the
+job goes back on the queue for a host that does serve the version, and the run
+stays `RUNNING`. Nothing fails and no attempt is spent. If it never clears,
+the version has no host left: `run.listVersions` reports it under
+`unservedHere`, and `run.redrive` with `definitionVersion: "latest"` moves the
+run onto a version you do serve. See
+[13-definition-versioning.md](13-definition-versioning.md).
+
 ## Runs Wedge `RUNNING` With No Job (Short Job Poll)
 
 **Symptom:** with a small `jobPollIntervalMs` (a caller chasing near-synchronous behaviour), a large share of freshly created runs sit `RUNNING` forever with no queued job, a `job_queue` row `FAILED` with "ghost job discarded", and nothing moves until `run.reapStuck` kills the run minutes later. Invisible at the 1000 ms default, and worse the shorter the poll gets.

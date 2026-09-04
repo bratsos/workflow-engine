@@ -1,6 +1,37 @@
 # workflow-engine
 
-Type-safe, distributed workflow engine for AI-orchestrated processes with suspend/resume, parallel execution, and cost tracking.
+A TypeScript library that runs durable, multi-stage workflows in **your own
+Postgres**. No server to deploy, no vendor: install it, hand it a Prisma
+client, and run it from a Node process, a serverless function or a cron
+trigger. Workflow state lives in tables beside your application's tables.
+
+Built for pipelines whose expensive steps are model calls, so what it takes
+seriously is suspending across hours, per-call cost, and provider batch
+endpoints:
+
+- **The kernel can run inside your transaction.** It is a pure command
+  dispatcher with no connection of its own, so building its persistence port
+  over a Prisma transaction client puts the whole tick on your session — where
+  a `SET LOCAL` for your tenant and your row-level security policies apply.
+- **Provider batch APIs are durable steps.** `ctx.step.ai.map` submits to
+  OpenAI Batch, Anthropic Message Batches, Google/Vertex batch or OpenRouter
+  `:batch`, suspends and releases its lease, and resumes from the step ledger —
+  adopting an in-flight batch rather than paying for a second one after a
+  crash.
+- **Cost is a column, not a trace.** Tokens and cost land on
+  `WorkflowRun.totalCost` in the same transaction as the stage that spent
+  them, priced from the endpoint actually used (batch prices for a batch call,
+  not a flat 50% off), so the next stage can gate on spend.
+- **Schema problems fail before submit.** A schema no provider dialect can
+  express raises `UnportableSchemaError` naming the path and the keyword,
+  rather than a provider 400 — or, on Anthropic, a batch that reports its
+  validation errors a day later.
+
+It is alpha, TypeScript-only, and the pipeline shape is linear execution
+groups rather than an arbitrary DAG. The
+[introduction](https://github.com/bratsos/workflow-engine/blob/main/apps/docs/docs/getting-started/intro.md)
+says what it deliberately does not do, and where another project is the better
+choice.
 
 ## Packages
 

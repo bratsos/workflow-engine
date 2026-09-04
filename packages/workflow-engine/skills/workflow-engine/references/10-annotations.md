@@ -155,6 +155,50 @@ This run as a revision of a prior run.
 | `revision.previous_run_id` | `string` | Run ID this revision supersedes |
 | `revision.reason` | `string` | Why this revision was created |
 
+## Annotations the engine writes itself
+
+Two keys are written by the kernel, not by your code. They are ordinary
+annotation rows, so they come back from `kernel.annotations.list(runId, ...)`
+like any other, and they are the reason a run's history survives operations
+that delete stage records.
+
+### `run.supersededAttempt`
+
+Written by `run.redrive` (and therefore by the deprecated `run.rerunFrom`)
+for every stage record the redrive replaces, in the same transaction as the
+replacement — so a rollback takes the archive with it. Exported as
+`SUPERSEDED_ATTEMPT_KEY`. Scope `"stage"`, `scopeId` the stage id, `attempt`
+the superseded record's attempt, actor `{ kind: "engine", id: "run.redrive" }`,
+value the superseded record's status, idempotency key
+`run.supersededAttempt:${stageRecordId}:${attempt}`.
+
+Payload: `redriveCount`, `stageRecordId`, `stageNumber`, `executionGroup`,
+`attempt`, `status`, `errorMessage`, `startedAt`, `completedAt` (both ISO
+strings or `null`), `duration`, `metrics`, `outputData` and
+`definitionVersion`. `outputData` is the blob key the attempt wrote, not a
+copy of the blob: the next attempt writes to the same key, so the annotation
+records that an output existed and where, not its bytes.
+
+```ts
+const attempts = await kernel.annotations.list(runId, {
+  key: "run.supersededAttempt",
+});
+```
+
+See [14-redrive.md](14-redrive.md).
+
+### `step.outcome-conflict`
+
+Written when a durable step's outcome compare-and-set finds the row already
+committed by another execution of the same body — the first write won and the
+loser parked on the recorded outcome. Payload: `stepId`, `kind`,
+`recordedStatus`, `recordedAttempt`, `externalKey` (or `null`).
+
+It is a report, not a failure: the ledger stayed consistent and no retry is
+spent. What it tells you is that the body ran more than once, so a duplicate
+external effect is possible under that `externalKey`. See
+[12-durable-steps.md](12-durable-steps.md).
+
 ## Naming rules for custom keys
 
 - Lowercase, dot-delimited segments, underscores within a segment OK.
@@ -416,7 +460,7 @@ The buffer-and-flush model makes stage-scope writes inherently atomic. Idempoten
 
 ## Reruns and the `attempt` axis
 
-`run.rerunFrom` recreates stage records at and after the target group. The engine assigns the new stage records a fresh `attempt` value (one higher than the max attempt across the deleted stages), and `ctx.annotate(...)` inherits that value for the new annotations. Annotations from the prior attempt survive (the FK to the deleted stage record is `SetNull`, preserving the row with its original `attempt` value).
+`run.redrive` (and the deprecated `run.rerunFrom`, which delegates to it) recreates stage records at and after the resume point. The engine assigns the new stage records a fresh `attempt` value (one higher than the max attempt across the superseded stages), and `ctx.annotate(...)` inherits that value for the new annotations. Annotations from the prior attempt survive (the FK to the deleted stage record is `SetNull`, preserving the row with its original `attempt` value).
 
 This means a single run's annotations can carry multiple `attempt` values, distinguishing decisions made on different runs of the same logical stage. Filter by `attempt` to look at just one attempt:
 
