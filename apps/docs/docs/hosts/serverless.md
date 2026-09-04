@@ -119,6 +119,73 @@ export default {
 };
 ```
 
+## Running a workflow inside a request: `runToCompletion`
+
+Running a workflow synchronously in one request handler is a real pattern,
+and until now every caller wrote the same drain loop by hand: create the run,
+claim it, dequeue and execute jobs until none remain. `runToCompletion` is
+that loop, once.
+
+```typescript
+import { runToCompletion } from "@bratsos/workflow-engine-host-serverless";
+
+const result = await runToCompletion({
+  kernel,
+  jobTransport,
+  persistence,
+  command: {
+    type: "run.create",
+    idempotencyKey: `checkout:${orderId}`,
+    workflowId: "checkout",
+    input: { orderId },
+  },
+});
+
+if (result.outcome === "completed") return Response.json(result.output);
+if (result.outcome === "suspended") return new Response(null, { status: 202 });
+return new Response(result.reason ?? "run failed", { status: 500 });
+```
+
+It returns `{ workflowRunId, status, outcome, output?, reason?, jobsProcessed,
+foreignJobsProcessed, suspendedStageId? }`. `outcome` is `"completed"`,
+`"failed"` or `"cancelled"` when the run reached a terminal state, and
+`"suspended"` or `"incomplete"` when it did not — those two are not errors,
+they say the run is alive and something else has to carry it.
+
+### Three things to know before you use it
+
+**1. It shares the queue, so it can execute another caller's job.** The
+kernel's queue is global: `run.claimPending` claims whichever runs are
+pending, and `dequeue()` returns whichever job is next. Neither can be
+narrowed to one run, so this call may start other callers' runs and execute
+their jobs — inside your request's latency and error budget.
+`foreignJobsProcessed` reports how many jobs it ran that belonged to someone
+else. If that matters, give the call a kernel wired to its own
+`jobTransport`, so the only jobs it can see are the ones it created.
+
+**2. It cannot complete a workflow that suspends.** A durable sleep, wait or
+signal parks the stage until a later poll, and that poll is not this request.
+Rather than spin, it returns immediately with `outcome: "suspended"` and the
+stage that parked; a background host or a scheduled `runMaintenanceTick()`
+resumes the run. Workflows you intend to run this way should have no durable
+waits.
+
+**3. It is bounded, never an unbounded loop.** `maxJobs` (default 50) caps
+the jobs one call executes and `maxClaimRounds` (default 5) caps the search
+for this run's first job. Hitting either returns `outcome: "incomplete"` with
+a `reason`; it never throws and never keeps going. The same applies when a
+stage fails and is re-enqueued with a retry backoff: the job is not due yet,
+the queue is empty, and the call returns rather than waiting for it.
+
+It deliberately does not poll suspended stages or reap stale leases — that is
+maintenance, it is exactly what would make it spin, and
+`host.runMaintenanceTick()` already owns it.
+
+Options: `kernel`, `jobTransport`, `persistence`, `command`, plus `workerId`,
+`maxJobs`, `maxClaimRounds`, `claimsPerRound`, `jobHeartbeatIntervalMs`,
+`flushOutbox` (default true — publish the run's events before returning),
+`maxOutboxFlush` and `logPrefix`.
+
 ### Degraded event sink
 
 `eventSinkStatus` is `"degraded"` when the flush in this tick could not

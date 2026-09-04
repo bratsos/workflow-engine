@@ -62,13 +62,139 @@ It returns the kernel and every port it built, plus the two driver methods:
 | `stepLedger` | `InMemoryStepLedger` on the harness clock — durable steps work out of the box |
 | `aiLogger`, `mockAi` | `InMemoryAICallLogger` and the mock AI factory wired into `services` |
 | `clock` | the `FakeClock` the kernel and ledger share |
+| `steps` | seed a durable step's outcome, and read back what was recorded |
 | `run(workflowId, input, config?)` | create a run and drive ticks until it is terminal |
+| `start(workflowId, input, config?)` | create a run without driving it |
 | `tick()` | do exactly one round and return a `TickReport` |
+| `tickUntil(predicate, { maxTicks? })` | tick until `predicate` holds, then return the reports |
 
 Options: `workflows`, `services` (merged over the mock AI defaults), `clock`,
 `stepLedger`, `aiLogger`, `mockAi`, `workerId`, `eventSink`, `plugins`,
 `maxTicks` (default 100 — `run()` throws rather than hang) and
 `idleAdvanceMs`.
+
+## Mocking durable steps
+
+A mocked step is not an interception layer: it is a pre-seeded step ledger
+row. The engine already decides what to do with a step by reading its row —
+`completed` short-circuits and returns the stored result, `failed` rethrows
+the stored error, a wait whose `deadlineAt` has passed times out — so a mock
+only writes the row the engine was about to write with a different outcome
+in it. Everything `harness.steps` asserts on is therefore the real ledger,
+and a mocked step is indistinguishable from one that produced that outcome
+for real.
+
+```typescript
+const harness = createTestHarness({ workflows: [workflow] });
+
+harness.steps.mockResult("fetch-document", { title: "Q3 report" });
+harness.steps.mockError("charge-card", new Error("card declined"));
+harness.steps.mockTimeout("await-approval");
+harness.steps.skipSleeps();
+
+const result = await harness.run("billing-wf", { customerId: "cus_1" });
+
+expect(await harness.steps.status("fetch-document")).toBe("completed");
+expect(await harness.steps.result("fetch-document")).toEqual({
+  title: "Q3 report",
+});
+expect(await harness.steps.error("charge-card")).toBe("card declined");
+```
+
+| Seed | What it does |
+| --- | --- |
+| `mockResult(stepId, value)` | the step records `completed` with `value`; its body never runs. `step.run`, `step.waitFor`, `step.waitForSignal` |
+| `mockError(stepId, error, { attempt? })` | the step records `failed`; the step throws the stored error instead of running its body |
+| `mockTimeout(stepId)` | the step's deadline is already past, so it fails with `StepTimeoutError` through the engine's own timeout path. `step.waitFor` and `step.waitForSignal` only |
+| `skipSleep(stepId)` / `skipSleeps()` | `step.sleep` returns immediately instead of suspending |
+| `clearMocks()` | drop every seed; recorded rows are untouched |
+
+| Assertion | What it returns |
+| --- | --- |
+| `record(stepId)` | the `StepRecord`, or `null` when the step never ran |
+| `records()` | every row this ledger holds |
+| `status(stepId)` | `"completed" \| "failed" \| "pending" \| "running"`, or `undefined` |
+| `result(stepId)` / `error(stepId)` | the recorded result or error message |
+| `wasMocked(stepId)` | whether a seed decided this step's outcome |
+
+All five assertions are async — they read the ledger.
+
+### Caveats
+
+- **Seeds match by step id across every stage.** A step id is unique within
+  a stage, so this only matters when two stages deliberately reuse one; then
+  the seed applies to whichever stage claims it first, and `record(stepId)`
+  returns the most recently updated row.
+- **A seed answers for the whole run, not just the first stage attempt.**
+  When the engine retries a failed stage it reopens the stage's `run` step
+  rows rather than deleting the ones that named an external effect; the seed
+  is re-asserted on that fresh claim, so a mocked step never falls back to
+  its real body mid-run. Call `clearMocks()` to hand it back.
+- **A mocked error is terminal by default.** `step.run` rethrows a stored
+  failure only once the row's `attempt` has passed the step's own `retries`
+  budget, so `mockError` records `MOCKED_FAILURE_ATTEMPT`
+  (`Number.MAX_SAFE_INTEGER`) to sit above any budget. Pass
+  `mockError(id, err, { attempt: 1 })` when the retry path is what you are
+  testing, and do not assert on `attempt` for a mocked failure.
+- **`mockTimeout` needs a deadline.** Only `waitFor` and `waitForSignal`
+  have one. Seeding it for a `run` or `sleep` step throws a message saying
+  so rather than silently doing nothing.
+
+### Testing a stage that suspends
+
+This is the case that used to need a real clock. A durable sleep suspends
+the stage; the harness advances its `FakeClock` to `nextPollAt`, so the run
+still completes, but it takes several ticks:
+
+```typescript
+const baseline = await harness.run("cooldown-wf", { id: "1" });
+expect(baseline.reports[0]?.outcomes[0]?.outcome).toBe("suspended");
+expect(baseline.ticks).toBeGreaterThan(1);
+```
+
+`skipSleeps()` removes the suspension entirely, so the stage runs straight
+through:
+
+```typescript
+const harness = createTestHarness({ workflows: [workflow] });
+harness.steps.skipSleeps();
+
+const result = await harness.run("cooldown-wf", { id: "1" });
+expect(result.status).toBe("COMPLETED");
+expect(result.ticks).toBe(1);
+```
+
+### Asserting part-way through a run
+
+`start()` creates a run without driving it and `tickUntil()` drives until a
+condition holds, which is how a test waits for one named step's result:
+
+```typescript
+const harness = createTestHarness({ workflows: [workflow] });
+await harness.start("review-wf", { docId: "doc-1" });
+
+await harness.tickUntil(
+  async () => (await harness.steps.status("draft")) === "completed",
+);
+
+expect(await harness.steps.result("draft")).toEqual({ words: 400 });
+// The stage is parked on its sleep; the next stage has not been reached.
+expect(await harness.steps.status("publish")).toBeUndefined();
+```
+
+`tickUntil` throws when `maxTicks` rounds pass without the condition
+holding — a condition that never arrives is a test failure, not a silent
+pass.
+
+### Using it with your own StepLedger
+
+The harness wraps whatever `stepLedger` it was given, so seeding works
+against a consumer's own ledger implementation too. The wrapper mirrors the
+port exactly, including whether the wrapped ledger implements the optional
+`clearExcept`: a wrapper that always claimed it could clear selectively
+would make a ledger that cannot lie to the kernel.
+`createMockStepLedger(inner, clock)` is exported if you want the wrapper
+without the harness.
 
 ## Full workflow lifecycle test
 

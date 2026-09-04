@@ -19,6 +19,20 @@
  * expect(result.status).toBe("COMPLETED");
  * expect(result.output).toEqual({ summary: "ok" });
  * ```
+ *
+ * Durable steps are mocked and asserted through `h.steps`, which seeds and
+ * reads the step ledger rather than intercepting the step API:
+ *
+ * @example
+ * ```typescript
+ * const h = createTestHarness({ workflows: [myWorkflow] });
+ * h.steps.mockResult("fetch-document", { title: "Report" });
+ * h.steps.mockError("charge-card", new Error("card declined"));
+ * h.steps.skipSleeps();
+ *
+ * const result = await h.run("my-workflow", { docId: "doc-1" });
+ * expect(await h.steps.status("fetch-document")).toBe("completed");
+ * ```
  */
 
 import {
@@ -39,6 +53,7 @@ import type { Status, WorkflowRunRecord } from "../persistence/interface.js";
 import { createTestKernel } from "./create-test-kernel.js";
 import { InMemoryAICallLogger } from "./in-memory-ai-logger.js";
 import { InMemoryStepLedger } from "./in-memory-step-ledger.js";
+import { createMockStepLedger } from "./mock-step-ledger.js";
 
 /** What one `tick()` did. Every count is for that round only. */
 export interface TickReport {
@@ -62,6 +77,11 @@ export interface TickReport {
   advancedMs: number;
   /** True when the round did no work at all and advanced no time. */
   idle: boolean;
+}
+
+/** A run created by `harness.start()` but not yet driven to a terminal state. */
+export interface HarnessStartResult {
+  workflowRunId: string;
 }
 
 /** Terminal state of a run driven by `harness.run()`. */
@@ -122,8 +142,13 @@ export function createTestHarness(options: CreateTestHarnessOptions = {}) {
   const clock = options.clock ?? new FakeClockImpl();
   const aiLogger = options.aiLogger ?? new InMemoryAICallLogger();
   const mockAi = options.mockAi ?? createMockAIHelperFactory();
-  const stepLedger =
-    options.stepLedger ?? new InMemoryStepLedger({ now: () => clock.now() });
+  // Wrapped, not replaced: seeding a step is writing the ledger row the
+  // engine was about to write, so a mocked step behaves like any other
+  // recorded one — including against a consumer's own StepLedger.
+  const stepLedger = createMockStepLedger(
+    options.stepLedger ?? new InMemoryStepLedger({ now: () => clock.now() }),
+    clock,
+  );
   const workerId = options.workerId ?? "test-worker";
   const maxTicks = options.maxTicks ?? 100;
   const idleAdvanceMs = options.idleAdvanceMs ?? 1_000;
@@ -147,6 +172,8 @@ export function createTestHarness(options: CreateTestHarnessOptions = {}) {
 
   const { kernel, persistence, jobTransport: jobQueue } = base;
   let runCounter = 0;
+  /** Runs this harness created, so `tick()` knows whose clock to advance. */
+  const startedRunIds: string[] = [];
 
   /** Earliest `nextPollAt` across every suspended stage of the given runs. */
   async function earliestNextPollAt(
@@ -273,6 +300,47 @@ export function createTestHarness(options: CreateTestHarnessOptions = {}) {
   }
 
   /**
+   * Create a run without driving it. Pair with `tickUntil` to assert on a
+   * step's recorded outcome part-way through a run.
+   */
+  async function start(
+    workflowId: string,
+    input: Record<string, unknown>,
+    config?: Record<string, unknown>,
+  ): Promise<HarnessStartResult> {
+    const created = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: `harness:${workflowId}:${runCounter++}`,
+      workflowId,
+      input,
+      ...(config ? { config } : {}),
+    });
+    startedRunIds.push(created.workflowRunId);
+    return { workflowRunId: created.workflowRunId };
+  }
+
+  /**
+   * Tick until `predicate` holds, watching every run this harness started.
+   * Throws when `maxTicks` rounds pass without it holding — a condition that
+   * never arrives is a test failure, not a silent pass.
+   */
+  async function tickUntil(
+    predicate: () => boolean | Promise<boolean>,
+    opts: { maxTicks?: number } = {},
+  ): Promise<TickReport[]> {
+    const bound = opts.maxTicks ?? maxTicks;
+    const reports: TickReport[] = [];
+    if (await predicate()) return reports;
+    for (let i = 0; i < bound; i++) {
+      reports.push(await tick(startedRunIds));
+      if (await predicate()) return reports;
+    }
+    throw new Error(
+      `createTestHarness: tickUntil did not observe its condition within ${bound} ticks.`,
+    );
+  }
+
+  /**
    * Create a run and drive ticks until it is terminal (or `maxTicks` trips,
    * which throws — a wedged run is a test failure, not a silent pass).
    */
@@ -281,14 +349,7 @@ export function createTestHarness(options: CreateTestHarnessOptions = {}) {
     input: Record<string, unknown>,
     config?: Record<string, unknown>,
   ): Promise<HarnessRunResult<TOutput>> {
-    const created = await kernel.dispatch({
-      type: "run.create",
-      idempotencyKey: `harness:${workflowId}:${runCounter++}`,
-      workflowId,
-      input,
-      ...(config ? { config } : {}),
-    });
-    const workflowRunId = created.workflowRunId;
+    const { workflowRunId } = await start(workflowId, input, config);
     const reports: TickReport[] = [];
 
     for (let i = 0; i < maxTicks; i++) {
@@ -320,10 +381,14 @@ export function createTestHarness(options: CreateTestHarnessOptions = {}) {
     /** Alias matching the port name consumers use in assertions. */
     jobQueue,
     stepLedger,
+    /** Seed a durable step's outcome, and read back what was recorded. */
+    steps: stepLedger.steps,
     aiLogger,
     mockAi,
     clock,
     tick,
+    tickUntil,
+    start,
     run,
   };
 }

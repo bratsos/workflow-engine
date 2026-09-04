@@ -192,6 +192,59 @@ expect(reapResult.staleReleased).toBe(1);
 
 ---
 
+## Mocking Durable Steps
+
+`createTestHarness` wires the in-memory ports behind a real kernel and drives
+the host loop for you. It also lets you decide a durable step's outcome
+before the run starts:
+
+```typescript
+import { createTestHarness } from "@bratsos/workflow-engine/testing";
+
+const harness = createTestHarness({ workflows: [billingWorkflow] });
+
+harness.steps.mockResult("fetch-document", { title: "Q3 report" });
+harness.steps.mockError("charge-card", new Error("card declined"));
+harness.steps.mockTimeout("await-approval"); // waitFor / waitForSignal only
+harness.steps.skipSleeps();                  // no clock advance needed
+
+const result = await harness.run("billing-wf", { customerId: "cus_1" });
+
+expect(await harness.steps.status("fetch-document")).toBe("completed");
+expect(await harness.steps.error("charge-card")).toBe("card declined");
+```
+
+A mocked step is a pre-seeded step ledger row, not an interception layer: the
+engine already short-circuits a `completed` row, rethrows a `failed` one, and
+times out a wait whose deadline has passed, so a seed only writes the row the
+engine was about to write. Assertions (`record`, `records`, `status`,
+`result`, `error`) read that same ledger.
+
+To assert part-way through a run, create it with `start()` and drive it with
+`tickUntil()`:
+
+```typescript
+await harness.start("review-wf", { docId: "doc-1" });
+await harness.tickUntil(
+  async () => (await harness.steps.status("draft")) === "completed",
+);
+expect(await harness.steps.status("publish")).toBeUndefined();
+```
+
+Caveats worth knowing before you rely on this:
+
+- Seeds match by step id across every stage.
+- A seed answers for the whole run: when the engine retries a failed stage it
+  reopens that stage's step rows, and the seed is re-asserted rather than
+  falling back to the real body. `clearMocks()` hands the step back.
+- `mockError` records the failure above any `retries` budget the step
+  declares, so it is terminal. Pass `{ attempt: 1 }` to test the retry path,
+  and do not assert on a mocked failure's `attempt`.
+- `mockTimeout` throws for a step that has no deadline (`step.run`,
+  `step.sleep`) rather than silently doing nothing.
+
+---
+
 ## Mocking AI Calls
 
 To test stages that interact with AI providers without making actual network requests:

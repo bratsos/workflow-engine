@@ -326,6 +326,103 @@ npx prisma generate
 
 ---
 
+## Transactional Enqueue from SQL (PostgreSQL)
+
+The whole kernel already runs in the caller's transaction. `workflow_engine_enqueue`
+exposes the enqueue half of that to callers who are not TypeScript — a database
+trigger, a stored procedure, a service in another language — so they can schedule
+work atomically with the rows that justify it:
+
+```sql
+INSERT INTO orders (...) VALUES (...) RETURNING id INTO v_order_id;
+
+PERFORM workflow_engine_enqueue(
+  'order:' || v_order_id,          -- idempotency key
+  'fulfil-order',                  -- workflow id
+  'Fulfil Order',                  -- workflow name
+  jsonb_build_object('orderId', v_order_id)
+);
+```
+
+The function ships as SQL in the package (`node_modules/@bratsos/workflow-engine/sql/enqueue.sql`),
+not as something the engine creates at runtime, so your migration owns it. Apply
+it after the engine's tables exist. It is `CREATE OR REPLACE`, so re-running is safe.
+
+```bash
+psql "$DATABASE_URL" -f node_modules/@bratsos/workflow-engine/sql/enqueue.sql
+```
+
+Or, with Prisma, paste it into a migration:
+
+```bash
+npx prisma migrate dev --create-only --name workflow-engine-enqueue-function
+cat node_modules/@bratsos/workflow-engine/sql/enqueue.sql \
+  >> prisma/migrations/*_workflow_engine_enqueue_function/migration.sql
+npx prisma migrate dev
+```
+
+Requires PostgreSQL 13 or newer (for the built-in `gen_random_uuid()`).
+
+### Signature
+
+```sql
+workflow_engine_enqueue(
+  p_idempotency_key    text,
+  p_workflow_id        text,
+  p_workflow_name      text,
+  p_input              jsonb,
+  p_config             jsonb   DEFAULT '{}'::jsonb,
+  p_priority           integer DEFAULT 5,
+  p_definition_version text    DEFAULT NULL
+) RETURNS text   -- the workflow run id
+```
+
+It writes exactly the rows `run.create` writes, in the same order: the
+idempotency key, the run, and the `workflow:created` outbox event. The run is
+left `PENDING` for `run.claimPending`, exactly as `run.create` leaves it — no
+job is enqueued here, so a host picks it up like any other run. Calling twice
+with one idempotency key returns the same run id and creates nothing the second
+time.
+
+A test in the engine's suite (`sql-enqueue.test.ts`, gated on `DATABASE_URL`)
+creates one run each way and asserts the two `workflow_runs` rows, the two
+`idempotency_keys` results and the two outbox events agree column by column,
+and that both runs execute to the same output. That test is what keeps the two
+paths from drifting.
+
+### What SQL cannot do, and what the function does about it
+
+**It cannot validate the input.** `run.create` parses the input against the
+workflow's Zod input schema and refuses a bad one. Bad input passed here fails
+at the first stage instead, as a failed run. If the caller is a trigger on your
+own table that is usually fine; if it is an untrusted boundary, validate before
+calling.
+
+**It cannot compute the definition version.** A run's `definitionVersion` is a
+SHA-256 of the workflow's structural snapshot, computed in TypeScript from the
+built definition. So the default is to create the run **unpinned**
+(`definitionVersion` NULL) — the same state as a deployment that has not adopted
+definition versioning, and claimable by any host. Pass `p_definition_version`
+when the caller does know it (a TypeScript service reaching for a transactional
+enqueue can read `workflow.definitionVersion`); the function then refuses unless
+the matching `workflow_definitions` row already exists, because pinning a run to
+an unregistered version would strand it where no host will serve it.
+
+**It cannot merge stage config defaults.** `run.create` merges
+`workflow.getDefaultConfig()` under the caller's config before storing it; this
+function stores `p_config` verbatim. Behaviour is unaffected — every stage
+re-parses its slice of the config through its own schema when it executes, which
+applies the same defaults — but the stored `config` column differs in what it
+shows a reader. Pass the merged config if you want the column to match.
+
+Two smaller differences: run ids are `gen_random_uuid()::text` rather than
+Prisma's cuid (both opaque), and the in-progress idempotency marker never becomes
+visible, because the claim and the result live in one transaction here — a
+concurrent caller with the same key blocks on the unique index and then reads the
+finished result.
+
+---
+
 ## Database Configuration
 
 ### 1. PostgreSQL Setup (Recommended)
