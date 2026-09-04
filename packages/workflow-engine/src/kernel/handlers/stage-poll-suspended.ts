@@ -179,6 +179,39 @@ const MIN_CLAIM_LEASE_MS = 60_000;
  * lease value therefore only survives when the process dies mid-replay —
  * in which case the stage is picked up again by whichever poller runs
  * after the lease elapses.
+ *
+ * Why not a Postgres advisory lock (evaluated, rejected)
+ * ------------------------------------------------------
+ * A session-level advisory lock releases the instant the connection dies,
+ * which would close the stale-lock window this lease leaves behind. It is
+ * the wrong tool here, for four independent reasons — any one of them
+ * fatal:
+ *
+ *  1. An advisory lock belongs to the *connection*, not to the task. The
+ *     lock has to span `checkCompletion()`'s HTTP call and the per-stage
+ *     transaction that follows it, so it cannot be `pg_advisory_xact_lock`
+ *     (released at COMMIT, mid-replay) and must be a session lock. Session
+ *     locks are re-entrant within a session: two pollers handed the same
+ *     pooled connection both win `pg_try_advisory_lock` on the same key, so
+ *     single flight fails exactly where concurrency is highest.
+ *  2. PgBouncer in transaction mode does not support session-level advisory
+ *     locks — statements land on different server connections and the lock
+ *     leaks with nothing to release it.
+ *  3. The serverless host has no long-lived connection to own a session
+ *     lock, so it would need this lease as a fallback regardless.
+ *  4. It cannot coexist with a consumer running the kernel inside their own
+ *     transaction under row-level security — the property nothing may
+ *     compromise. A session lock taken inside their transaction is *not*
+ *     released at their COMMIT: it leaks into their pooled connection.
+ *     Worse, the advisory namespace is one 64-bit integer space, global to
+ *     the database and invisible to RLS: a tenant blocked on another
+ *     tenant's key sees that key in `pg_locks` and waits on it, with no
+ *     policy able to intervene. Row-level security cannot scope a lock it
+ *     cannot see.
+ *
+ * On top of that, `Persistence` has no raw-SQL escape hatch and SQLite has
+ * no advisory locks, so the port would grow a Postgres-only optional method
+ * whose fallback is this lease anyway. The `nextPollAt` claim stays.
  */
 async function claimSuspendedStage(
   stageRecord: WorkflowStageRecord,
