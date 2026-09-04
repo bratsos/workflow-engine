@@ -133,6 +133,23 @@ export async function handleRunRerunFrom(
     // lost-job case is covered by run.reapStuck's PENDING-without-job
     // recovery sweep.
     _postCommit: async (postDeps) => {
+      // Retire the job rows of every stage record deleted above, in the
+      // same pass that clears their step ledgers. Not inside the
+      // transaction: `jobTransport` is a separate port with no part in
+      // the DB transaction, so a delete issued there could not be rolled
+      // back with the stage deletion. If this process dies between the
+      // commit and here, the stale rows are harmless — `enqueueParallel`
+      // is idempotent on `(workflowRunId, stageId)`, so both the enqueue
+      // below and `run.reapStuck`'s PENDING-without-job sweep replace
+      // them rather than colliding with them. What this delete adds is
+      // the stages at execution groups *after* the target: they are
+      // deleted without being recreated, so nothing would ever enqueue
+      // over their job rows.
+      await postDeps.jobTransport.deleteByRunAndStages(
+        workflowRunId,
+        deletedStageIds,
+      );
+
       for (const stage of stagesToDelete) {
         await postDeps.stepLedger?.clear(stage.id);
       }

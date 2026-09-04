@@ -62,32 +62,61 @@ export class PrismaJobQueue implements JobQueue {
     this.now = options.now ?? (() => new Date());
   }
 
-  /**
-   * Add a new job to the queue
-   */
-  async enqueue(options: EnqueueJobInput): Promise<string> {
-    const job = await this.prisma.jobQueue.create({
-      data: {
-        workflowRunId: options.workflowRunId,
-        stageId: options.stageId,
-        priority: options.priority ?? 5,
-        payload: {
-          ...options.payload,
-          _workflowId: options.workflowId,
-        } as unknown,
-        status: this.enums.status("PENDING"),
-        nextPollAt: options.scheduledFor,
-      },
-    });
-
-    logger.debug(
-      `Enqueued job ${job.id} for stage ${options.stageId} (run: ${options.workflowRunId})`,
-    );
-    return job.id;
+  /** The `create` args for one enqueued job. */
+  private enqueueData(job: EnqueueJobInput) {
+    return {
+      workflowRunId: job.workflowRunId,
+      stageId: job.stageId,
+      priority: job.priority ?? 5,
+      payload: {
+        ...job.payload,
+        _workflowId: job.workflowId,
+      } as unknown,
+      status: this.enums.status("PENDING"),
+      nextPollAt: job.scheduledFor ?? null,
+    };
   }
 
   /**
-   * Enqueue multiple stages in parallel (same execution group)
+   * `deleteMany` filter matching every existing row for the
+   * `(workflowRunId, stageId)` pairs being enqueued. Delete-then-insert
+   * (rather than a Prisma `upsert` on a compound unique) is what makes
+   * the enqueue idempotent on *any* schema: a consumer whose `job_queue`
+   * predates the `@@unique([workflowRunId, stageId])` this package's
+   * reference schema now declares has no `workflowRunId_stageId`
+   * selector for `upsert` to target, and may already carry duplicate
+   * rows for a stage — which this collapses to exactly one. The new row
+   * gets a new `id`; nothing outside an in-flight host holds a job id.
+   */
+  private enqueueDeleteFilter(jobs: EnqueueJobInput[]) {
+    return {
+      where: {
+        OR: jobs.map((job) => ({
+          workflowRunId: job.workflowRunId,
+          stageId: job.stageId,
+        })),
+      },
+    };
+  }
+
+  /**
+   * Add a job to the queue, replacing any row already queued for the same
+   * `(workflowRunId, stageId)` — see the `JobQueue.enqueueParallel`
+   * contract.
+   */
+  async enqueue(options: EnqueueJobInput): Promise<string> {
+    const [id] = await this.enqueueParallel([options]);
+    return id!;
+  }
+
+  /**
+   * Enqueue multiple stages in parallel (same execution group).
+   *
+   * Idempotent on `(workflowRunId, stageId)`: rows already queued for
+   * those pairs are removed in the same transaction as the insert, so a
+   * `run.rerunFrom` re-enqueue or a `run.reapStuck` recovery sweep over a
+   * stage that still carries its previous (terminal) job row leaves
+   * exactly one PENDING row with `attempt` back at 0.
    */
   async enqueueParallel(jobs: EnqueueJobInput[]): Promise<string[]> {
     if (jobs.length === 0) return [];
@@ -103,21 +132,38 @@ export class PrismaJobQueue implements JobQueue {
       );
     }
 
-    const results = await this.prisma.$transaction(
-      jobs.map((job) =>
-        this.prisma.jobQueue.create({
-          data: {
-            workflowRunId: job.workflowRunId,
-            stageId: job.stageId,
-            priority: job.priority ?? 5,
-            payload: { ...job.payload, _workflowId: job.workflowId } as unknown,
-            status: this.enums.status("PENDING"),
-          },
-        }),
+    const results = await this.prisma.$transaction([
+      this.prisma.jobQueue.deleteMany(this.enqueueDeleteFilter(jobs)),
+      ...jobs.map((job) =>
+        this.prisma.jobQueue.create({ data: this.enqueueData(job) }),
       ),
-    );
+    ]);
 
-    return results.map((r: { id: string }) => r.id);
+    // results[0] is the deleteMany BatchPayload; the creates follow in order.
+    const created = (results as Array<{ id: string }>).slice(1);
+    return created.map((r) => r.id);
+  }
+
+  /**
+   * Remove every job row for the given stages of a run, whatever their
+   * status.
+   */
+  async deleteByRunAndStages(
+    workflowRunId: string,
+    stageIds: string[],
+  ): Promise<number> {
+    if (stageIds.length === 0) return 0;
+
+    const result = await this.prisma.jobQueue.deleteMany({
+      where: { workflowRunId, stageId: { in: stageIds } },
+    });
+
+    if (result.count > 0) {
+      logger.debug(
+        `Deleted ${result.count} job row(s) for run ${workflowRunId} stages [${stageIds.join(", ")}]`,
+      );
+    }
+    return result.count;
   }
 
   /**

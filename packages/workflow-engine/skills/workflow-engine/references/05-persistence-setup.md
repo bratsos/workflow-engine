@@ -186,6 +186,7 @@ interface JobQueue {
   /** @deprecated Unused by the kernel -- enqueueParallel is used even for single-job enqueues. */
   enqueue(options: EnqueueJobInput): Promise<string>;
   enqueueParallel(jobs: EnqueueJobInput[]): Promise<string[]>;
+  deleteByRunAndStages(workflowRunId: string, stageIds: string[]): Promise<number>;
   dequeue(): Promise<DequeueResult | null>;
   complete(jobId: string): Promise<void>;
   suspend(jobId: string, nextPollAt: Date): Promise<void>;
@@ -196,6 +197,27 @@ interface JobQueue {
   touchJob(jobId: string): Promise<void>;
 }
 ```
+
+### One job row per stage per run
+
+`job_queue` carries at most one row per `(workflowRunId, stageId)`, declared as
+`@@unique([workflowRunId, stageId])` in the reference schema. Two rules keep it:
+
+- **`enqueueParallel` is idempotent on that pair.** A custom implementation MUST
+  replace any row already queued for a pair it is asked to enqueue, resetting
+  `attempt`, `status`, `workerId`, `lockedAt`, `lastError` and `nextPollAt`. Both
+  built-in queues do it by deleting the existing rows in the same transaction as
+  the insert (which also collapses duplicates a pre-1.0 schema may already hold);
+  the new row therefore has a new `id`. `run.rerunFrom` and `run.reapStuck`'s
+  PENDING-without-job recovery sweep both re-enqueue stages that still carry a
+  terminal job row from a previous execution, so an implementation that inserts
+  unconditionally either accumulates duplicates or fails against the unique.
+- **`deleteByRunAndStages` retires rows outright.** `run.rerunFrom` calls it for
+  every stage record it deletes -- including the downstream stages it deletes
+  without recreating, whose rows nothing would ever enqueue over.
+
+Both are covered by `jobQueueConformanceSuite`, so a custom `JobQueue` gets the
+same checks the built-in adapters do.
 
 ## AICallLogger Interface
 
@@ -411,11 +433,17 @@ model JobQueue {
   payload       Json?
   lastError     String?
 
+  // One job row per stage per run -- see "One job row per stage per run" above.
+  @@unique([workflowRunId, stageId])
   @@index([status, priority])
   @@index([nextPollAt])
   @@map("job_queue")
 }
 ```
+
+`@@unique([workflowRunId, stageId])` is required as of 1.0.0-alpha.7. Adding it to
+an existing database fails while duplicate rows are present; collapse them first
+(keep the newest row per pair) -- the [0.13 -> 1.0 guide](../migrations/migrate-0.13-to-1.0.md#database-checklist) has the SQL.
 
 ### OutboxEvent Model
 

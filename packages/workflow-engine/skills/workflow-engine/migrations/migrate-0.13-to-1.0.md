@@ -125,6 +125,59 @@ Verified against `git diff` of the package's `prisma/schema.prisma` between 0.13
   );
   ```
 
+- [ ] **`job_queue` gains a unique on `(workflowRunId, stageId)`.** Required as of
+  1.0.0-alpha.7. `run.rerunFrom` now retires the job rows of the stages it deletes,
+  and every enqueue path replaces the row already queued for a pair instead of
+  inserting another one — "one job row per stage per run" is the invariant those
+  paths rely on, so declare it.
+
+  ```prisma
+  model JobQueue {
+    // ...unchanged columns...
+    @@unique([workflowRunId, stageId])
+    @@index([status, priority])
+    @@index([nextPollAt])
+    @@map("job_queue")
+  }
+  ```
+
+  **Collapse duplicate rows first** — the index build fails while any pair has more
+  than one row. Runs before the upgrade may have accumulated duplicates (each
+  `run.rerunFrom` added one per rerun stage). Keep the newest row per pair; the
+  older ones are finished history of stages that have since been re-enqueued, and
+  nothing reads a job row by id except the host currently holding it:
+
+  ```sql
+  -- 1. Look before you delete.
+  SELECT "workflowRunId", "stageId", count(*)
+    FROM "job_queue" GROUP BY 1, 2 HAVING count(*) > 1;
+
+  -- 2. Keep the newest row per (run, stage). Run it when no worker is mid-job:
+  --    a RUNNING row that loses is a job whose host will fail its `complete`.
+  DELETE FROM "job_queue" a
+    USING "job_queue" b
+   WHERE a."workflowRunId" = b."workflowRunId"
+     AND a."stageId"       = b."stageId"
+     AND (a."createdAt", a.id) < (b."createdAt", b.id);
+
+  -- 3. Then add the constraint.
+  CREATE UNIQUE INDEX IF NOT EXISTS "job_queue_workflowRunId_stageId_key"
+    ON "job_queue" ("workflowRunId", "stageId");
+  ```
+
+  A deployment that cannot take the constraint yet still gets the fix: the enqueue
+  paths are idempotent regardless, so reruns stop accumulating rows. What the
+  constraint adds is the database refusing a duplicate a custom `JobQueue`
+  implementation might still write.
+
+- [ ] **Custom `JobQueue` / `JobTransport` implementation?** Two contract changes:
+  `deleteByRunAndStages(workflowRunId, stageIds)` is a new required method
+  (delete every row for those stages of that run, any status, return the count),
+  and `enqueueParallel` must now be idempotent on `(workflowRunId, stageId)` —
+  replace any row already queued for a pair, resetting `attempt`, `status`,
+  `workerId`, `lockedAt`, `lastError` and `nextPollAt`. `jobQueueConformanceSuite`
+  covers both.
+
 - [ ] **Running the kernel inside one Prisma transaction per tick?** The 1.0 adapters no longer rely on a caught unique violation for any insert-if-absent on Postgres (`PrismaStepLedger.claim`, `acquireIdempotencyKey` use `createMany({ skipDuplicates: true })` + read-back), so a replay that re-claims completed steps no longer aborts the enclosing transaction with `25P02`. Pass `createPrismaStepLedger(prisma, { databaseType: "sqlite" })` on SQLite, which has no `skipDuplicates`. Raw statements bind a JS `Date` (UTC) instead of `NOW()`; pass `now: () => clock.now()` to the persistence and job queue to make them follow your clock.
 
 - [ ] **If your Prisma `Status` enum has another name**, pass it: `createPrismaWorkflowPersistence(prisma, { statusEnumName: "WorkflowStatus" })`. The raw-SQL claim paths cast with `::"Status"` (since 0.11) and fail with `42704 type "Status" does not exist` otherwise. See `05-persistence-setup.md`.

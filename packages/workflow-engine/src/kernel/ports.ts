@@ -212,8 +212,31 @@ export interface BlobStore {
  * this port without adapters.
  */
 export interface JobTransport {
-  /** Enqueue multiple stages in parallel (same execution group). */
+  /**
+   * Enqueue multiple stages in parallel (same execution group).
+   *
+   * Idempotent on `(workflowRunId, stageId)`: at most one job row exists
+   * per stage per run, so a transport MUST replace any row already queued
+   * for a pair it is asked to enqueue, resetting `attempt`, `status`,
+   * `workerId`, `lockedAt`, `lastError` and `nextPollAt`. `run.rerunFrom`
+   * and `run.reapStuck`'s PENDING-without-job sweep both re-enqueue a
+   * stage that may still carry a terminal job row from a previous
+   * execution; a transport that inserts unconditionally either
+   * accumulates duplicate rows or (on a schema declaring the
+   * `@@unique([workflowRunId, stageId])` the reference schema ships)
+   * fails the insert.
+   */
   enqueueParallel(jobs: EnqueueJobInput[]): Promise<string[]>;
+
+  /**
+   * Remove every job row for the given stages of a run, whatever their
+   * status; returns how many were removed. `run.rerunFrom` calls it for
+   * the stage records it deletes. An empty `stageIds` is a no-op.
+   */
+  deleteByRunAndStages(
+    workflowRunId: string,
+    stageIds: string[],
+  ): Promise<number>;
 
   /** Atomically dequeue the next available job. */
   dequeue(): Promise<DequeueResult | null>;

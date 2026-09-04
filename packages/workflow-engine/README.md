@@ -283,6 +283,9 @@ model JobQueue {
   payload       Json?
   lastError     String?
 
+  // One job row per stage per run: run.rerunFrom retires the rows of the
+  // stages it deletes and every enqueue path is idempotent on this pair.
+  @@unique([workflowRunId, stageId])
   @@index([status, priority])
   @@index([nextPollAt])
   @@map("job_queue")

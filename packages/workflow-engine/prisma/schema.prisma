@@ -225,6 +225,12 @@ model JobQueue {
   payload       Json?
   lastError     String?
 
+  // One job row per stage per run. `run.rerunFrom` retires the rows of the
+  // stages it deletes and every enqueue path is idempotent on this pair, so
+  // the invariant is declared here rather than left implicit. Adding it to
+  // an existing database requires collapsing any duplicate rows first --
+  // see the 0.13 -> 1.0 migration guide.
+  @@unique([workflowRunId, stageId])
   @@index([status, priority])
   @@index([nextPollAt])
   @@map("job_queue")

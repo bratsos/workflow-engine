@@ -682,9 +682,31 @@ export interface AICallLogger {
 
 export interface JobQueue {
   /**
-   * Enqueue multiple stages in parallel (same execution group)
+   * Enqueue multiple stages in parallel (same execution group).
+   *
+   * Idempotent on `(workflowRunId, stageId)`: at most one job row may
+   * exist per stage per run, so an implementation MUST replace any row(s)
+   * already queued for a pair it is asked to enqueue, resetting `attempt`,
+   * `status`, `workerId`, `lockedAt`, `lastError` and `nextPollAt`. That
+   * makes `run.rerunFrom`'s re-enqueue and `run.reapStuck`'s
+   * PENDING-without-job recovery sweep safe to run over a stage that
+   * still carries a terminal job row from a previous execution.
    */
   enqueueParallel(jobs: EnqueueJobInput[]): Promise<string[]>;
+
+  /**
+   * Remove every job row for the given stages of a run, whatever their
+   * status. Returns the number of rows removed.
+   *
+   * Called by `run.rerunFrom` for the stage records it deletes, so a
+   * rerun does not leave the retired stages' job rows behind (including
+   * the downstream stages it deletes without recreating, which nothing
+   * would ever re-enqueue). An empty `stageIds` is a no-op.
+   */
+  deleteByRunAndStages(
+    workflowRunId: string,
+    stageIds: string[],
+  ): Promise<number>;
 
   /**
    * Atomically dequeue the next available job

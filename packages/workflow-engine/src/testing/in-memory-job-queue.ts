@@ -75,9 +75,21 @@ export class InMemoryJobQueue implements JobQueue {
   // Core Operations
   // ============================================================================
 
+  /**
+   * Add a job to the queue.
+   *
+   * Idempotent on `(workflowRunId, stageId)` per the `JobQueue` contract:
+   * any row already queued for that pair is removed first, so exactly one
+   * job row exists per stage per run with `attempt` back at 0 — matching
+   * the `@@unique([workflowRunId, stageId])` the reference Prisma schema
+   * declares, so `run.rerunFrom` and `run.reapStuck` behave here exactly
+   * as they do against a real database.
+   */
   async enqueue(options: EnqueueJobInput): Promise<string> {
     const now = this.now();
     const id = randomUUID();
+
+    this.removeByRunAndStage(options.workflowRunId, options.stageId);
 
     const job: JobRecord = {
       id,
@@ -111,6 +123,31 @@ export class InMemoryJobQueue implements JobQueue {
       ids.push(id);
     }
     return ids;
+  }
+
+  async deleteByRunAndStages(
+    workflowRunId: string,
+    stageIds: string[],
+  ): Promise<number> {
+    let removed = 0;
+    for (const stageId of stageIds) {
+      removed += this.removeByRunAndStage(workflowRunId, stageId);
+    }
+    return removed;
+  }
+
+  /** Drops every row for one `(run, stage)` pair; returns how many. */
+  private removeByRunAndStage(workflowRunId: string, stageId: string): number {
+    let removed = 0;
+    for (const job of Array.from(this.jobs.values())) {
+      if (job.workflowRunId !== workflowRunId || job.stageId !== stageId) {
+        continue;
+      }
+      this.jobs.delete(job.id);
+      this.insertionSequence.delete(job.id);
+      removed++;
+    }
+    return removed;
   }
 
   async dequeue(): Promise<DequeueResult | null> {

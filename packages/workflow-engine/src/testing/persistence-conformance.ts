@@ -2159,6 +2159,120 @@ export function jobQueueConformanceSuite(
         expect(ids).toHaveLength(3);
         expect(new Set(ids).size).toBe(3); // All unique
       });
+
+      it("keeps one job row per (workflowRunId, stageId), replacing the row already queued", async () => {
+        // Given: A stage whose job row already ran and failed (what
+        // `run.rerunFrom` and `run.reapStuck`'s PENDING-without-job sweep
+        // both find when they re-enqueue a stage that has executed)
+        const runId = "reenqueue-run";
+        await queue.enqueueParallel([
+          createJobInput({ workflowRunId: runId, stageId: "reenqueue-stage" }),
+        ]);
+        const first = await queue.dequeue();
+        expect(first).not.toBeNull();
+        await queue.fail(first!.jobId, "boom", false);
+        const [failed] = await queue.getJobsByWorkflowRun(runId);
+        expect(failed?.status).toBe("FAILED");
+        expect(failed?.attempt).toBe(1);
+
+        // When: The same (run, stage) is enqueued again
+        const ids = await queue.enqueueParallel([
+          createJobInput({
+            workflowRunId: runId,
+            stageId: "reenqueue-stage",
+            priority: 7,
+          }),
+        ]);
+
+        // Then: Exactly one row remains, PENDING and reset — not a second
+        // row, and not a unique-constraint violation
+        expect(ids).toHaveLength(1);
+        const rows = await queue.getJobsByWorkflowRun(runId);
+        expect(rows).toHaveLength(1);
+        expect(rows[0]?.status).toBe("PENDING");
+        expect(rows[0]?.attempt).toBe(0);
+        expect(rows[0]?.priority).toBe(7);
+        expect(rows[0]?.workerId).toBeNull();
+        expect(rows[0]?.lockedAt).toBeNull();
+        expect(rows[0]?.nextPollAt).toBeNull();
+      });
+
+      it("re-enqueueing twice in a row still leaves one row per stage", async () => {
+        // Given/When: Two consecutive reruns of the same two stages
+        const runId = "double-rerun-run";
+        const stages = ["double-a", "double-b"];
+        for (let round = 0; round < 3; round++) {
+          await queue.enqueueParallel(
+            stages.map((stageId) =>
+              createJobInput({ workflowRunId: runId, stageId }),
+            ),
+          );
+        }
+
+        // Then: One row per stage, all PENDING at attempt 0
+        const rows = await queue.getJobsByWorkflowRun(runId);
+        expect(rows).toHaveLength(2);
+        expect(new Set(rows.map((r) => r.stageId))).toEqual(new Set(stages));
+        for (const row of rows) {
+          expect(row.status).toBe("PENDING");
+          expect(row.attempt).toBe(0);
+        }
+      });
+    });
+
+    describe("deleteByRunAndStages operation", () => {
+      it("removes the named stages' rows whatever their status and leaves the rest", async () => {
+        // Given: Three stages of one run, one of them already RUNNING,
+        // plus a stage of an unrelated run
+        const runId = "delete-run";
+        await queue.enqueueParallel([
+          createJobInput({ workflowRunId: runId, stageId: "delete-keep" }),
+          createJobInput({
+            workflowRunId: runId,
+            stageId: "delete-a",
+            priority: 9,
+          }),
+          createJobInput({ workflowRunId: runId, stageId: "delete-b" }),
+        ]);
+        await queue.enqueueParallel([
+          createJobInput({
+            workflowRunId: "delete-other-run",
+            stageId: "delete-a",
+          }),
+        ]);
+        // Highest priority wins the dequeue, so `delete-a` is the RUNNING one.
+        const locked = await queue.dequeue();
+        expect(locked?.stageId).toBe("delete-a");
+
+        // When: Deleting two of the stages
+        const deleted = await queue.deleteByRunAndStages(runId, [
+          "delete-a",
+          "delete-b",
+        ]);
+
+        // Then: Both rows are gone regardless of status; the run's other
+        // stage and the other run's same-named stage are untouched
+        expect(deleted).toBe(2);
+        const rows = await queue.getJobsByWorkflowRun(runId);
+        expect(rows.map((r) => r.stageId)).toEqual(["delete-keep"]);
+        const other = await queue.getJobsByWorkflowRun("delete-other-run");
+        expect(other).toHaveLength(1);
+      });
+
+      it("is a no-op for an empty stage list or unknown stages", async () => {
+        // Given: A run with one queued job
+        const runId = "delete-noop-run";
+        await queue.enqueueParallel([
+          createJobInput({ workflowRunId: runId, stageId: "delete-noop" }),
+        ]);
+
+        // When/Then: Neither call removes anything
+        expect(await queue.deleteByRunAndStages(runId, [])).toBe(0);
+        expect(await queue.deleteByRunAndStages(runId, ["not-a-stage"])).toBe(
+          0,
+        );
+        expect(await queue.getJobsByWorkflowRun(runId)).toHaveLength(1);
+      });
     });
 
     describe("dequeue operation", () => {
