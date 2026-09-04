@@ -48,14 +48,58 @@ model WorkflowRun {
   priority      Int                  @default(5)
   metadata      Json?
 
+  // The definition version this run is pinned to. NULL means the run was
+  // created before the consumer migrated to definition versioning: it is
+  // claimable and executable by any host, exactly as before. See
+  // `workflow_definitions` for the structure the version identifies.
+  definitionVersion String?
+  // How many times `run.redrive` has re-driven this run (Step Functions'
+  // redrive count). Never reset -- it counts the whole life of the run.
+  redriveCount      Int     @default(0)
+
   stages        WorkflowStage[]
   logs          WorkflowLog[]
   artifacts     WorkflowArtifact[]
   annotations   WorkflowAnnotation[]
 
-  @@index([status])
-  @@index([workflowId])
+  // List orderings. Every "recent runs" view -- the console's included --
+  // is newest-first, optionally narrowed by status or workflow, and pages
+  // on the keyset (createdAt, id), so the tiebreaker travels in the index
+  // and a page is one index range scan with no sort node. These replace
+  // the bare @@index([status]) / @@index([workflowId]): a composite whose
+  // leading column is the same serves every lookup the single-column
+  // index served.
+  @@index([createdAt(sort: Desc), id(sort: Desc)])
+  @@index([status, createdAt(sort: Desc), id(sort: Desc)])
+  @@index([workflowId, createdAt(sort: Desc), id(sort: Desc)])
+  // Definition versioning. The first serves a lookup narrowed to one
+  // version with no workflow; the second covers `run.listVersions`, whose
+  // groupBy is (workflowId, definitionVersion, status) under a status
+  // filter, so the grouping runs off the index rather than the heap.
+  @@index([definitionVersion])
+  @@index([status, workflowId, definitionVersion])
   @@map("workflow_runs")
+}
+
+// Content-addressed workflow definition snapshots. One row per distinct
+// (workflowId, version); every run pinned to that version references it,
+// so the storage cost is per definition rather than per run.
+model WorkflowDefinition {
+  workflowId String
+  version    String
+  createdAt  DateTime @default(now())
+  // The structure the version identifies: stage ids, execution groups,
+  // definition order, dependencies, modes and normalised JSON Schemas.
+  // See `core/definition-version.ts` for the exact shape.
+  snapshot   Json
+  // Hash of `snapshot`. Equal to `version` for derived versions; for an
+  // explicit version it is what lets the engine reject re-registering the
+  // same version with a different structure.
+  structureHash String
+
+  @@id([workflowId, version])
+  @@index([workflowId])
+  @@map("workflow_definitions")
 }
 
 // 3. Individual stage execution model
@@ -205,6 +249,11 @@ model JobQueue {
   lastError     String?
 
   @@index([status, priority])
+  // Queue health reports the age of the oldest waiting job as
+  // MIN("createdAt") within a status. Completed rows are retained rather
+  // than deleted, so [status, priority] would have to scan every row of
+  // the status to find it.
+  @@index([status, createdAt])
   @@index([nextPollAt])
   @@map("job_queue")
 }
@@ -225,6 +274,13 @@ model OutboxEvent {
 
   @@unique([workflowRunId, sequence])
   @@index([publishedAt])
+  // Dead letters are a subset of the unpublished rows, so without this the
+  // dead-letter view has to walk every unpublished event and fetch its heap
+  // tuple -- which is slowest exactly when a backlog has built up and you
+  // most want to read it. Postgres users writing migrations by hand should
+  // prefer a partial index (WHERE "dlqAt" IS NOT NULL); Prisma cannot
+  // express one, and this is the closest it gets.
+  @@index([dlqAt])
   @@map("outbox_events")
 }
 

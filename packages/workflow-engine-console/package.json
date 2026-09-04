@@ -1,0 +1,64 @@
+{
+  "name": "@bratsos/workflow-engine-console",
+  "version": "0.1.0",
+  "description": "Optional, embeddable operational console for @bratsos/workflow-engine: a fetch handler plus a prebuilt UI you mount in your own app",
+  "type": "module",
+  "license": "MIT",
+  "author": "Alex Bratsos",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bratsos/workflow-engine.git",
+    "directory": "packages/workflow-engine-console"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "workflow-console": "./dist/cli.js"
+  },
+  "exports": {
+    "./package.json": "./package.json",
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./node": {
+      "types": "./dist/node.d.ts",
+      "import": "./dist/node.js",
+      "default": "./dist/node.js"
+    },
+    "./testing": {
+      "types": "./dist/testing.d.ts",
+      "import": "./dist/testing.js",
+      "default": "./dist/testing.js"
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "sideEffects": false,
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build:ui": "node scripts/build-ui.mjs",
+    "build": "node scripts/build-ui.mjs && tsup",
+    "test": "node scripts/build-ui.mjs && vitest run",
+    "typecheck": "node scripts/build-ui.mjs && tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@bratsos/workflow-engine": "workspace:*"
+  },
+  "devDependencies": {
+    "@bratsos/workflow-engine": "workspace:*",
+    "@types/node": "^22",
+    "esbuild": "^0.25.0",
+    "preact": "^10.27.2",
+    "tsup": "^8.5.1",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4"
+  },
+  "engines": {
+    "node": ">=22.11.0"
+  }
+}

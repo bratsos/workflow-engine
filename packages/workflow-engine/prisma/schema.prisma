@@ -61,8 +61,20 @@ model WorkflowRun {
   artifacts   WorkflowArtifact[]
   annotations WorkflowAnnotation[]
 
-  @@index([status])
-  @@index([workflowId])
+  // List orderings. Every "recent runs" view -- the console's included --
+  // is newest-first, optionally narrowed by status or workflow, and pages
+  // on the keyset (createdAt, id), so the tiebreaker travels in the index
+  // and a page is one index range scan with no sort node. These replace
+  // the bare @@index([status]) / @@index([workflowId]): a composite whose
+  // leading column is the same serves every lookup the single-column
+  // index served.
+  @@index([createdAt(sort: Desc), id(sort: Desc)])
+  @@index([status, createdAt(sort: Desc), id(sort: Desc)])
+  @@index([workflowId, createdAt(sort: Desc), id(sort: Desc)])
+  // Definition versioning. The first serves a lookup narrowed to one
+  // version with no workflow; the second covers `run.listVersions`, whose
+  // groupBy is (workflowId, definitionVersion, status) under a status
+  // filter, so the grouping runs off the index rather than the heap.
   @@index([definitionVersion])
   @@index([status, workflowId, definitionVersion])
   @@map("workflow_runs")
@@ -269,6 +281,11 @@ model JobQueue {
   // see the 0.13 -> 1.0 migration guide.
   @@unique([workflowRunId, stageId])
   @@index([status, priority])
+  // Queue health reports the age of the oldest waiting job as
+  // MIN("createdAt") within a status. Completed rows are retained rather
+  // than deleted, so [status, priority] would have to scan every row of
+  // the status to find it.
+  @@index([status, createdAt])
   @@index([nextPollAt])
   @@map("job_queue")
 }
@@ -288,6 +305,13 @@ model OutboxEvent {
 
   @@unique([workflowRunId, sequence])
   @@index([publishedAt])
+  // Dead letters are a subset of the unpublished rows, so without this the
+  // dead-letter view has to walk every unpublished event and fetch its heap
+  // tuple -- which is slowest exactly when a backlog has built up and you
+  // most want to read it. Postgres users writing migrations by hand should
+  // prefer a partial index (WHERE "dlqAt" IS NOT NULL); Prisma cannot
+  // express one, and this is the closest it gets.
+  @@index([dlqAt])
   @@map("outbox_events")
 }
 
