@@ -198,15 +198,16 @@ each recorded in its own ledger row — before the suspension is persisted,
 bounded by the longest remaining lease. Without that the replay would meet
 their live leases as `StepInFlight` and spin until the leases expired.
 
-Ids must still be unique within the invocation, and the *order* the steps are
-requested in is not guaranteed under `Promise.all`; the engine logs an order
-warning rather than failing, but keep the array literal stable so replays
-line up.
+Ids must still be unique within the invocation — a repeat throws
+`DuplicateStepKeyError` even when the two calls are concurrent — and the
+*order* the steps are requested in is not guaranteed under `Promise.all`; the
+engine logs an order warning rather than failing, but keep the array literal
+stable so replays line up.
 
 ### Determinism rules
 
 - **Side effects only inside steps.** Everything outside `ctx.step.*` runs again on every replay. Reading `ctx.input`, `ctx.require(...)` and building prompts is fine; calling an API outside a step is not.
-- **Stable ids.** A step is keyed by `(stageRecordId, stepId)`. Ids must be the same string on every replay and unique within the stage. Derive ids from data (`item-${doc.id}`), never from `Math.random()` or the current time.
+- **Stable, unique ids.** A step is keyed by `(stageRecordId, stepId)`, not by ordinal position — which is what makes the ledger survive renaming and reordering the code around a step. Ids must be the same string on every replay. Derive ids from data (`item-${doc.id}`), never from `Math.random()` or the current time. Asking for the same key twice in one stage invocation throws `DuplicateStepKeyError` naming the key and the position and kind of both uses: without the guard the second call would never run and would silently return the first call's result. It is a programming error, so the stage fails terminally without consuming retry attempts, and `ctx.step.ai.map` rethrows it instead of turning it into a failed item verdict. Inside a loop, build the key from something unique to the iteration; if a loop can genuinely ask for the same key twice, de-duplicate before the loop rather than relying on the ledger to notice.
 - **Never swallow step errors.** A `try/catch` around `ctx.step.*` must rethrow, or check `isStepControlFlowError(error)` and rethrow those. If a catch swallows one anyway, the step API records the pending suspension and the stage factory discards the returned value and suspends, logging one warning.
 - **Results are JSON.** `run` results round-trip through JSON: Dates become strings, `undefined` fields disappear, Maps and Sets lose their runtime types. A result that cannot be serialized throws `StepResultNotSerializable`.
 - **Results are small.** A step result is stored in the ledger row (`workflow_steps.result`) and read back on every replay of the stage; it should be a small JSON value — an id, a handle, a count, a few fields. Large payloads (downloaded documents, extracted text, model output in bulk) go to the blob store or the stage's `artifacts`, and the step returns the key: `const key = await ctx.step.run("download", async () => { const text = await fetch(url); await ctx.storage.put(blobKey, text); return blobKey; })`. Storing 30 KB of source text per step makes every poll of the stage re-read it and bloats the ledger table.

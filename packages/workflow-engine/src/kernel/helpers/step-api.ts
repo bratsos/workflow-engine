@@ -3,11 +3,13 @@ import { deriveStepExternalKey } from "../../core/step-external-key.js";
 import type {
   StepApi,
   StepControlFlowError,
+  StepKeyUse,
   StepRunContext,
   StepRunOptions,
   StepWaitOptions,
 } from "../../core/steps.js";
 import {
+  DuplicateStepKeyError,
   parseStepDuration,
   STEP_API_PENDING_CONTROL_FLOW,
   STEP_API_SETTLE_IN_FLIGHT,
@@ -93,7 +95,14 @@ function nonNegativeInteger(value: number, name: string): number {
 /** Creates the StepApi attached to a single stage invocation. */
 export function createStepApi(options: CreateStepApiOptions): StepApi {
   let nextSeq = 0;
-  const requestedIds = new Set<string>();
+  /**
+   * Every step key this invocation has asked for, and where. Keeping the
+   * first use (not just the key) is what lets the duplicate error name both
+   * call sites: the stage body is a function we cannot inspect statically,
+   * so first use within one invocation is the only place the collision is
+   * visible.
+   */
+  const requestedIds = new Map<string, StepKeyUse>();
   let pendingControlFlow: StepControlFlowError | undefined;
   const defaultLeaseMs = positiveDuration(
     options.defaultLeaseMs ?? DEFAULT_LEASE_MS,
@@ -105,15 +114,13 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
     throw error;
   }
 
-  function begin(id: string): StepInvocation {
+  function begin(id: string, kind: StepRecord["kind"]): StepInvocation {
     if (!id) throw new Error("Durable step id must not be empty");
-    if (requestedIds.has(id)) {
-      throw new Error(
-        `Duplicate durable step id "${id}" requested in one stage invocation`,
-      );
-    }
-    requestedIds.add(id);
-    return { id, seq: ++nextSeq };
+    const seq = ++nextSeq;
+    const first = requestedIds.get(id);
+    if (first) throw new DuplicateStepKeyError(id, first, { kind, seq });
+    requestedIds.set(id, { kind, seq });
+    return { id, seq };
   }
 
   function requireLedger(): { stageRecordId: string; ledger: StepLedger } {
@@ -287,7 +294,7 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
       fn: (step: StepRunContext) => Promise<T>,
       opts: StepRunOptions = {},
     ) {
-      const invocation = begin(id);
+      const invocation = begin(id, "run");
       const leaseMs = positiveDuration(
         opts.leaseMs ?? defaultLeaseMs,
         "leaseMs",
@@ -395,7 +402,7 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
     },
 
     async waitFor<T>(id: string, opts: StepWaitOptions<T>) {
-      const invocation = begin(id);
+      const invocation = begin(id, "wait");
       const existing = await get(invocation, "wait");
       if (existing?.status === "completed") return existing.result as T;
       if (existing?.status === "failed") throw storedError(existing);
@@ -502,7 +509,7 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
       id: string,
       opts: { timeout: number | string },
     ) {
-      const invocation = begin(id);
+      const invocation = begin(id, "signal");
       const existing = await get(invocation, "signal");
       if (existing?.status === "completed") return existing.result as T;
       if (existing?.status === "failed") throw storedError(existing);
@@ -549,7 +556,7 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
     },
 
     async sleep(id: string, duration: number | string): Promise<void> {
-      const invocation = begin(id);
+      const invocation = begin(id, "sleep");
       const existing = await get(invocation, "sleep");
       if (existing?.status === "completed") return;
       if (existing?.status === "failed") throw storedError(existing);
