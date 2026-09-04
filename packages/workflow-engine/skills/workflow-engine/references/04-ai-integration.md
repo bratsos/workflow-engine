@@ -170,7 +170,7 @@ const result = await ai.generateText(
   "gemini-2.5-flash",  // Model key
   "Explain quantum computing in simple terms",
   {
-    temperature: 0.7,   // 0-2, default 0.7
+    temperature: 0.7,   // 0-2; sent only when set, else the provider default
     maxTokens: 1000,    // Max output tokens
     maxRetries: 2,       // v0.11+: forwarded to the AI SDK call
     abortSignal: controller.signal, // v0.11+: forwarded to the AI SDK call
@@ -249,7 +249,7 @@ console.log(result.object);  // Typed as z.infer<typeof OutputSchema>
 
 ### Structured output portability
 
-The JSON Schema a Zod schema emits is not what every provider accepts: `z.discriminatedUnion` emits `oneOf`, which OpenAI's strict structured outputs (native, and through OpenRouter) reject with `'oneOf' is not permitted`, and which Gemini silently drops (the union comes back as a flat object). The helper rewrites the schema at the model boundary for every OpenAI, OpenRouter and Google model — `oneOf` → `anyOf`, plus `additionalProperties: false` on every object and no `$schema` for OpenAI — through an AI SDK middleware, so `generateObject`, `generateText` + `Output.object`, `streamText`, `ctx.step.ai.*` and the batch bodies all send a portable schema while validation still runs against your Zod schema. A model from a `providerResolver` is classified by its provider id (`openai…`, `openrouter…`, `google…`); anything else (Anthropic, a custom provider) is sent as emitted. `toPortableJsonSchema(jsonSchema, "openai" | "google")` is exported for a transport of your own.
+The JSON Schema a Zod schema emits is not what every provider accepts: `z.discriminatedUnion` emits `oneOf`, which OpenAI's strict structured outputs (native, and through OpenRouter) reject with `'oneOf' is not permitted`, and which Gemini silently drops (the union comes back as a flat object). The helper rewrites the schema at the model boundary for every OpenAI, OpenRouter and Google model — `oneOf` → `anyOf`, plus, for OpenAI, `additionalProperties: false` on every object, no `$schema`, and every property listed in `required` (OpenAI strict rejects a `required` that omits a key; an optional, non-nullable property is sent as `anyOf: [<original>, { type: "null" }]`) — through an AI SDK middleware, so `generateObject`, `generateText` + `Output.object`, `streamText`, `ctx.step.ai.*` and the batch bodies all send a portable schema while validation still runs against your Zod schema. On OpenAI targets the reply's `null` for a property that is `.optional()` and not `.nullable()` in your schema is removed before validation (nested objects, arrays and union members included), so `z.string().optional()` stays `string | undefined` on your side; a `null` your schema admits is kept. `stripOptionalNulls(value, jsonSchema)` is exported alongside `toPortableJsonSchema`. A model from a `providerResolver` is classified by its provider id (`openai…`, `openrouter…`, `google…`); anything else (Anthropic, a custom provider) is sent as emitted. `toPortableJsonSchema(jsonSchema, "openai" | "google")` is exported for a transport of your own.
 
 ### Multimodal with Schema
 

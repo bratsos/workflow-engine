@@ -622,7 +622,7 @@ interface WorkflowStageRecord {
   stageName: string;
   stageNumber: number;
   executionGroup: number;
-  attempt: number;   // rerun generation; 0 for the original execution
+  attempt: number;   // executions of this stage row: reruns and job retries; 0 for the original execution
   status: WorkflowStageStatus;
   startedAt: Date | null;
   completedAt: Date | null;
@@ -672,7 +672,7 @@ interface CreateStageInput {
   stageName: string;
   stageNumber: number;
   executionGroup: number;
-  attempt?: number;  // rerun generation; defaults to 0
+  attempt?: number;  // executions of this stage row; defaults to 0
   status?: WorkflowStageStatus;
   startedAt?: Date;
   config?: unknown;
