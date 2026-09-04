@@ -563,7 +563,7 @@ Implementing a custom `WorkflowPersistence`/`JobQueue`/`AICallLogger` adapter? V
 2. **Command Kernel**: All operations are typed commands dispatched through `kernel.dispatch()`
 3. **Environment-Agnostic**: Kernel has no timers, no signals, no global state
 4. **Context Access**: Use `ctx.require()` and `ctx.optional()` for type-safe stage output access
-5. **Transactional Outbox**: Events written to outbox, published via `outbox.flush` command. `job.execute` and `stage.pollSuspended` use multi-phase transactions to avoid holding connections during external I/O
+5. **Transactional Outbox**: Events written to outbox, published via `outbox.flush` command. `job.execute` and `stage.pollSuspended` use multi-phase transactions to avoid holding connections during external I/O; `stage.pollSuspended` claims each suspended stage (version-guarded `nextPollAt` lease) before polling it, so several orchestrating processes replay a stage once
 6. **Idempotency**: `run.create`, `job.execute`, and `run.rerunFrom` (v0.11+) replay cached results by key; concurrent same-key dispatch throws `IdempotencyInProgressError`; a key stuck `in_progress` past `KernelConfig.idempotencyStaleInProgressMs` (default 10 min, v0.11+) can be reclaimed
 7. **Authoritative Cancellation**: `run.cancel` cascades to stages + jobs. Ghost jobs (running against non-RUNNING runs) are detected via `ghost: true` flag and not retried
 8. **Self-Healing**: Stage creation is idempotent (upsert), orchestration steps are isolated, stuck runs are automatically reaped

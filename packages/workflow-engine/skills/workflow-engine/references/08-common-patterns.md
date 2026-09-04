@@ -233,6 +233,12 @@ If claiming a specific run fails (e.g., workflow not found, database error), tha
 
 Each step of the orchestration tick (claim pending, poll suspended, reap stale, flush outbox, reap stuck) runs in its own error boundary. If one step fails, the others still execute. This prevents a single error from starving unrelated maintenance work.
 
+### Suspended-Stage Claims (Multiple Orchestrators)
+
+Any number of processes may run the orchestration tick against the same database. `stage.pollSuspended` claims each suspended stage before working on it: a version-guarded `updateStage(id, { nextPollAt: now + lease, expectedVersion })` outside the per-stage transaction, where the lease is `max(pollInterval, 60s)` bounded by `maxWaitUntil`. A poller whose claim fails (`StaleVersionError`) skips the stage — the body of a durable stage, or `checkCompletion`, runs once per poll across all processes. Every outcome then writes `nextPollAt` explicitly (re-suspend, `now + pollInterval` when not ready, `null` on completion/failure/cancel, back to `now` when the run-level claim was lost), so the lease only matters when a process dies mid-replay: that stage is polled again once the lease elapses. A poller that comes back to a run another process has since finished leaves the stage row alone; only a run that is `CANCELLED` cancels the stage.
+
+The Node host additionally skips an interval firing while a tick is still in flight, so a long replay never overlaps the next tick in the same process.
+
 ### Stuck Run Detection
 
 The `run.reapStuck` command finds RUNNING runs with no recent activity (no updates to run or stage records within the threshold). These runs are marked `FAILED` with error code `STUCK_RUN_REAPED`. The threshold defaults to `max(3 * staleLeaseThresholdMs, 5 minutes)`.

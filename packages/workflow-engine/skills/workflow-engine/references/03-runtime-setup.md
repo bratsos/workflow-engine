@@ -103,6 +103,8 @@ const stats = host.getStats();
 // { workerId, jobsProcessed, orchestrationTicks, isRunning, uptimeMs }
 ```
 
+An interval firing that lands while the previous tick is still running is skipped (`orchestrationTicks` counts ticks that ran), and `stop()` waits for an in-flight tick, bounded by `shutdownTimeoutMs`, before its final outbox flush. Several hosts may run against one database: suspended stages are claimed per poll, so a stage body runs once across processes (see 08-common-patterns.md, "Suspended-Stage Claims").
+
 ### Worker Process Pattern
 
 ```typescript

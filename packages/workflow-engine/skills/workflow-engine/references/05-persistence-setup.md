@@ -62,10 +62,10 @@ interface PersistenceCore {
   // WorkflowStage operations
   createStage(data: CreateStageInput): Promise<WorkflowStageRecord>;
   upsertStage(data: UpsertStageInput): Promise<WorkflowStageRecord>;
-  updateStage(id: string, data: UpdateStageInput): Promise<void>;
+  updateStage(id: string, data: UpdateStageInput): Promise<void>;     // must throw StaleVersionError on expectedVersion mismatch: the poll claims stages with it
   getStage(runId: string, stageId: string): Promise<WorkflowStageRecord | null>;
   getStagesByRun(runId: string, options?: { status?: Status; orderBy?: "asc" | "desc" }): Promise<WorkflowStageRecord[]>;
-  getSuspendedStages(beforeDate: Date): Promise<WorkflowStageRecord[]>;
+  getSuspendedStages(beforeDate: Date): Promise<WorkflowStageRecord[]>;   // plain read: SUSPENDED and nextPollAt <= beforeDate; the claim happens in updateStage
   deleteStage(id: string): Promise<void>;
 
   // WorkflowLog operations
@@ -770,7 +770,7 @@ npx prisma generate
 
 The schema includes indexes for common query patterns:
 - `status` - for polling pending/running workflows
-- `nextPollAt` - for suspended stage polling
+- `nextPollAt` - for suspended stage polling (`stage.pollSuspended` reads `SUSPENDED` rows with `nextPollAt <= now`, then claims each by moving `nextPollAt` forward with `expectedVersion`; a custom adapter needs the version guard on `updateStage` for two orchestrators to poll safely)
 - `workflowRunId` - for stage/log lookups
 - `createdAt` - for ordering
 

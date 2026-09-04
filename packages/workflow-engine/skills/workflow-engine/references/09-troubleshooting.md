@@ -87,8 +87,10 @@ The orchestration tick runs these steps in order, each independently:
 | 4 | `outbox.flush` | Publish pending events through EventSink |
 | 5 | `run.reapStuck` | Fail RUNNING runs with no recent activity |
 
-**Node host:** Runs automatically on `orchestrationIntervalMs` (default: 10s).
+**Node host:** Runs automatically on `orchestrationIntervalMs` (default: 10s). A firing that lands while the previous tick is still running is skipped, not queued; `getStats().orchestrationTicks` counts only ticks that ran.
 **Serverless host:** Must be triggered externally via `host.runMaintenanceTick()`.
+
+Several processes may tick against the same database: `stage.pollSuspended` claims each suspended stage (a version-guarded bump of `nextPollAt`) before polling or replaying it, so a stage body runs once per poll across processes. A suspended stage whose `nextPollAt` sits up to 60s (or one `pollInterval`) in the future while nothing is polling it was claimed by a process that died mid-replay; it is picked up again when that lease elapses. See "Suspended-Stage Claims" in [08-common-patterns.md](08-common-patterns.md).
 
 ## Error Codes Reference
 

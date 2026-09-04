@@ -78,6 +78,9 @@ The host runs two concurrent loops:
    - `stage.pollSuspended` -- check if suspended stages are ready to resume
    - `lease.reapStale` -- release stale job leases from crashed workers
    - `outbox.flush` -- publish pending events through EventSink
+   - `run.reapStuck` -- fail RUNNING runs with no recent activity
+
+   A firing that lands while the previous tick is still running is skipped, not queued, so a suspended-stage replay longer than the interval never overlaps the next tick in this process; `orchestrationTicks` counts only ticks that ran. Several hosts may tick against one database: the kernel claims each suspended stage before polling it.
 
 2. **Job processing loop** (continuous):
    - Dequeue next job from `jobTransport`
@@ -87,7 +90,7 @@ The host runs two concurrent loops:
    - On failure: mark failed with retry flag
    - Sleep `jobPollIntervalMs` when queue is empty
 
-Signal handlers (`SIGTERM`, `SIGINT`) automatically call `stop()` for graceful shutdown. `stop()` lets the job in flight finish (up to `shutdownTimeoutMs`) and then flushes the outbox once more, bounded by the same timeout, so `workflow:completed` for a run this process finished reaches the `EventSink` (and your plugins) here rather than in whichever process ticks next. Flush errors are logged, not thrown. Set `flushOutboxOnStop: false` when another process owns event publication.
+Signal handlers (`SIGTERM`, `SIGINT`) automatically call `stop()` for graceful shutdown. `stop()` lets the in-flight orchestration tick and the job in flight finish (each up to `shutdownTimeoutMs`) and then flushes the outbox once more, bounded by the same timeout, so `workflow:completed` for a run this process finished reaches the `EventSink` (and your plugins) here rather than in whichever process ticks next. Flush errors are logged, not thrown. Set `flushOutboxOnStop: false` when another process owns event publication.
 
 On failure, the job loop marks the job failed with a retry flag while the job has attempts left (`maxAttempts` on the transport); the kernel has already left the stage `PENDING` with the error, and the queue re-delivers it with backoff. Once the attempts are exhausted the stage is `FAILED` and `run.transition` is dispatched immediately.
 

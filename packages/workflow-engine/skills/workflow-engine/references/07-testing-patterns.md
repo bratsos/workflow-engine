@@ -152,7 +152,11 @@ if (job) {
 it replays `execute()` with completed steps answered from the ledger; for an
 async-batch stage it calls `checkCompletion`. A stage is only picked up once
 its `nextPollAt` has passed, so a test with a `FakeClock` advances the clock
-first:
+first. The poll claims the stage by moving `nextPollAt` forward (a lease,
+version-guarded) before running anything, exactly as against Prisma, so two
+polls dispatched concurrently run the body once; every outcome then writes
+`nextPollAt` again (`null` on completion, the step's next poll time on a
+re-suspend):
 
 ```typescript
 harness.clock.advance(60_000);
