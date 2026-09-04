@@ -187,10 +187,13 @@ interface JobQueue {
   enqueue(options: EnqueueJobInput): Promise<string>;
   enqueueParallel(jobs: EnqueueJobInput[]): Promise<string[]>;
   deleteByRunAndStages(workflowRunId: string, stageIds: string[]): Promise<number>;
-  dequeue(): Promise<DequeueResult | null>;
+  /** `serves` narrows the claim to the definition versions this host presents. */
+  dequeue(options?: { serves?: readonly ServedDefinition[] }): Promise<DequeueResult | null>;
   complete(jobId: string, fence?: JobAckFence): Promise<JobAckOutcome>;
   suspend(jobId: string, nextPollAt: Date, fence?: JobAckFence): Promise<JobAckOutcome>;
   fail(jobId: string, error: string, shouldRetry?: boolean, fence?: JobAckFence): Promise<JobAckOutcome>;
+  /** Put a claimed job back PENDING without spending its attempt. Optional. */
+  defer?(jobId: string, nextPollAt: Date, reason: string, fence?: JobAckFence): Promise<JobAckOutcome>;
   releaseStaleJobs(staleThresholdMs?: number): Promise<number>;
   expireRunawayJobs?(absoluteTimeoutMs: number): Promise<number>;
   cancelByRun(workflowRunId: string): Promise<number>;
@@ -405,10 +408,22 @@ model WorkflowRun {
   @@index([createdAt(sort: Desc), id(sort: Desc)])
   @@index([status, createdAt(sort: Desc), id(sort: Desc)])
   @@index([workflowId, createdAt(sort: Desc), id(sort: Desc)])
+  // The claim: status = 'PENDING' ORDER BY priority DESC, "createdAt" ASC
+  // LIMIT 1 FOR UPDATE SKIP LOCKED, run maxClaimsPerTick times per tick
+  // per host. The same shape job_queue already indexes, and it needs its
+  // own: the (status, createdAt DESC, id DESC) index above cannot serve it
+  // because priority is not in it, so the claim reads every PENDING row
+  // and top-N sorts it. Measured on Postgres 16, 300k runs / 60k pending:
+  // 11.8-15.1 ms before, 0.008-0.022 ms after, for 9 MB of index.
+  @@index([status, priority(sort: Desc), createdAt])
   // Definition versioning. The first serves a lookup narrowed to one
-  // version with no workflow; the second covers `run.listVersions`, whose
-  // groupBy is (workflowId, definitionVersion, status) under a status
-  // filter, so the grouping runs off the index rather than the heap.
+  // version with no workflow. The second is the narrow stand-in for the
+  // @@index([status]) the list orderings above replaced -- a status count
+  // runs index-only off it (3.3 ms at 60k rows, against a heap scan) --
+  // and it also narrows the version-filtered claim. It does NOT cover
+  // `run.listVersions`: that handler passes no status filter and its
+  // aggregate asks for a MIN(createdAt) the index does not carry, so all
+  // three of its shapes plan a parallel sequential scan whatever is here.
   @@index([definitionVersion])
   @@index([status, workflowId, definitionVersion])
   @@map("workflow_runs")
@@ -430,8 +445,11 @@ model WorkflowDefinition {
   // same version with a different structure.
   structureHash String
 
+  // No @@index([workflowId]): the compound primary key already leads with
+  // it, so a lookup by workflow alone plans identically with and without
+  // one (measured: 0.188 ms vs 0.187 ms at 20k rows) -- and no query in
+  // the engine reads this table by workflow alone anyway.
   @@id([workflowId, version])
-  @@index([workflowId])
   @@map("workflow_definitions")
 }
 ```
