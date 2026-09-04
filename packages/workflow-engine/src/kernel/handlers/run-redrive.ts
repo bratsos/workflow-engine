@@ -45,6 +45,18 @@ import {
 } from "../helpers/definition-pinning.js";
 import { prepareExecutionGroup } from "../helpers/index.js";
 import type { HandlerResult, KernelDeps } from "../kernel";
+import type { StepRecord } from "../ports";
+
+/**
+ * A durable step row a redrive is about to drop that named an external
+ * effect. The external key is the actionable part: it is what an operator
+ * searches the provider with.
+ */
+interface AbandonedStep {
+  stepId: string;
+  status: StepRecord["status"];
+  externalKey: string | null;
+}
 
 /** Annotation key under which a superseded stage attempt is archived. */
 export const SUPERSEDED_ATTEMPT_KEY = "run.supersededAttempt";
@@ -170,6 +182,33 @@ export async function handleRunRedrive(
   );
   const supersededStageIds = stagesToSupersede.map((s) => s.stageId);
 
+  // ── What the redrive abandons ──────────────────────────────────────
+  // The step ledger cannot survive a redrive: its rows are keyed by a
+  // stage record id that is about to be deleted, so `_postCommit` clears
+  // them. But a row naming an external effect may still hold the handle
+  // of a batch a provider is processing and billing, and dropping it
+  // silently leaves that effect with no record anywhere. So the rows are
+  // read before the delete and what they name is written down, in the
+  // same shape `job.execute` uses when a ledger cannot clear selectively:
+  // step id, status and external key. Both a log and an annotation, since
+  // logs rotate and the annotation stays on the run.
+  const abandonedByStage = new Map<string, AbandonedStep[]>();
+  if (deps.stepLedger) {
+    for (const stage of stagesToSupersede) {
+      const rows = await deps.stepLedger
+        .list(stage.id)
+        .catch(() => [] as StepRecord[]);
+      const abandoned = rows
+        .filter((row) => row.externalKey != null)
+        .map((row) => ({
+          stepId: row.stepId,
+          status: row.status,
+          externalKey: row.externalKey ?? null,
+        }));
+      if (abandoned.length > 0) abandonedByStage.set(stage.id, abandoned);
+    }
+  }
+
   // ── Preserve the attempt being superseded ──────────────────────────
   // Written before the stage rows are deleted, in the same transaction,
   // so a rollback takes the archive with it.
@@ -200,10 +239,30 @@ export async function handleRunRedrive(
         // copy of it.
         outputData: stage.outputData,
         definitionVersion: run.definitionVersion,
+        // Only present when the redrive drops a durable step row that
+        // named an external effect. Absent is the normal case.
+        ...(abandonedByStage.has(stage.id)
+          ? { abandonedSteps: abandonedByStage.get(stage.id) }
+          : {}),
       },
       idempotencyKey: `${SUPERSEDED_ATTEMPT_KEY}:${stage.id}:${stage.attempt}`,
     }));
     await deps.persistence.appendAnnotations(archive);
+  }
+
+  if (abandonedByStage.size > 0) {
+    const steps = [...abandonedByStage.values()].flat();
+    await deps.persistence
+      .createLog({
+        workflowRunId,
+        level: "WARN",
+        message:
+          `Redriving this run abandoned ${steps.length} durable step row(s) that named an ` +
+          `external effect; their ledger rows are keyed by stage records this redrive deletes ` +
+          `and cannot be kept. Any effect still in flight must be found by its external key.`,
+        metadata: { steps },
+      })
+      .catch(() => {});
   }
 
   // Blob deletion is deferred to _postCommit: blob deletes are not part of
