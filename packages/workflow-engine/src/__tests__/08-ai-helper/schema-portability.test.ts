@@ -15,9 +15,11 @@ import { createAIHelper } from "../../ai/ai-helper.js";
 import { AIBatchImpl } from "../../ai/batch-helper.js";
 import { registerModels } from "../../ai/model-helper.js";
 import {
+  restorePortableValue,
   schemaTargetForModel,
   stripOptionalNulls,
   toPortableJsonSchema,
+  UnportableSchemaError,
   withPortableSchema,
 } from "../../ai/schema-portability.js";
 import type { ProviderResolver } from "../../ai/types.js";
@@ -519,7 +521,7 @@ describe("OpenAI middleware: required-everywhere request, nulls stripped before 
     }
   });
 
-  it("streamText sends the same portable schema", async () => {
+  it("streamText sends the same portable schema and restores the streamed reply", async () => {
     const captured: LanguageModelV4CallOptions[] = [];
     const model = withPortableSchema(
       personModel("openrouter.chat", captured) as never,
@@ -532,7 +534,8 @@ describe("OpenAI middleware: required-everywhere request, nulls stripped before 
     });
     let text = "";
     for await (const chunk of result.textStream) text += chunk;
-    expect(JSON.parse(text)).toEqual(PERSON_REPLY);
+    expect(JSON.parse(text)).toEqual(PERSON_PARSED);
+    expect(await result.output).toEqual(PERSON_PARSED);
     expect(captured).toHaveLength(1);
     const schema =
       captured[0]!.responseFormat?.type === "json"
@@ -591,6 +594,342 @@ describe("OpenAI/OpenRouter batch: nulls stripped before schema validation", () 
       status: "succeeded",
       validated: true,
       result: PERSON_PARSED,
+    });
+  });
+});
+
+// ---- Records under OpenAI strict: `{ key, value }` pairs ---------------------
+
+const Gloss = z.record(z.string(), z.string());
+const Chapter = z.object({
+  title: z.string(),
+  translatedGloss: Gloss.optional(),
+  scores: z.record(z.enum(["de", "en"]), z.number()),
+  people: z.record(z.string(), Person),
+});
+const Block = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("text"), body: z.string() }),
+  z.object({
+    kind: z.literal("table"),
+    cells: z.record(z.string(), z.string()),
+  }),
+]);
+const Page = z.object({ blocks: z.array(Block), meta: Gloss.nullable() });
+
+const PAIRS_OF_STRINGS = {
+  type: "array",
+  items: {
+    type: "object",
+    properties: { key: { type: "string" }, value: { type: "string" } },
+    required: ["key", "value"],
+    additionalProperties: false,
+  },
+};
+
+describe("toPortableJsonSchema for OpenAI: records become key/value pairs", () => {
+  it("emits propertyNames + additionalProperties for a record on zod v4 (the premise)", () => {
+    const json = z.toJSONSchema(Gloss) as any;
+    expect(json.type).toBe("object");
+    expect(json.propertyNames).toEqual({ type: "string" });
+    expect(json.additionalProperties).toEqual({ type: "string" });
+  });
+
+  it("rewrites a top-level record to an array of pairs", () => {
+    expect(toPortableJsonSchema(z.toJSONSchema(Gloss), "openai")).toEqual(
+      PAIRS_OF_STRINGS,
+    );
+  });
+
+  it("rewrites an optional record inside an object (nullable), an enum-keyed record and a record of objects", () => {
+    const out = toPortableJsonSchema(
+      z.toJSONSchema(Chapter, { io: "input" }),
+      "openai",
+    ) as any;
+    expect(keywords(out).has("propertyNames")).toBe(false);
+    expect(out.required).toEqual([
+      "title",
+      "translatedGloss",
+      "scores",
+      "people",
+    ]);
+    // Optional record: pairs widened with the alpha.4 null branch.
+    expect(out.properties.translatedGloss).toEqual({
+      anyOf: [PAIRS_OF_STRINGS, { type: "null" }],
+    });
+    // Enum-keyed record keeps the key constraint on `key`; zod's `required`
+    // (the enum keys) has no array counterpart and is dropped.
+    expect(out.properties.scores).toEqual({
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          key: { type: "string", enum: ["de", "en"] },
+          value: { type: "number" },
+        },
+        required: ["key", "value"],
+        additionalProperties: false,
+      },
+    });
+    // Record of objects: the value schema is itself made portable.
+    const person = out.properties.people.items.properties.value;
+    expect(person.required).toEqual(Object.keys(person.properties));
+    expect(person.properties.nickname).toEqual({
+      anyOf: [{ type: "string" }, { type: "null" }],
+    });
+    expect(person.additionalProperties).toBe(false);
+    expect(requiredEverywhere(out)).toBe(true);
+  });
+
+  it("rewrites a record inside a discriminated-union branch and inside $defs", () => {
+    const out = toPortableJsonSchema(
+      z.toJSONSchema(Page, { io: "input" }),
+      "openai",
+    ) as any;
+    const [_text, table] = out.properties.blocks.items.anyOf;
+    expect(table.properties.cells).toEqual(PAIRS_OF_STRINGS);
+    expect(out.properties.meta.anyOf).toEqual([
+      PAIRS_OF_STRINGS,
+      { type: "null" },
+    ]);
+
+    const Shared = z.object({ id: z.string(), labels: Gloss });
+    const Tree = z.object({ a: Shared, b: Shared.optional() });
+    const ref = toPortableJsonSchema(
+      z.toJSONSchema(Tree, { io: "input", reused: "ref" }),
+      "openai",
+    ) as any;
+    const def = Object.values(ref.$defs ?? ref.definitions)[0] as any;
+    expect(def.properties.labels).toEqual(PAIRS_OF_STRINGS);
+    expect(keywords(ref).has("propertyNames")).toBe(false);
+  });
+
+  it("drops a catchall so every object carries additionalProperties: false", () => {
+    const out = toPortableJsonSchema(
+      z.toJSONSchema(z.object({ a: z.string() }).catchall(z.number())),
+      "openai",
+    );
+    expect(out.additionalProperties).toBe(false);
+  });
+
+  it("leaves records untouched for Google", () => {
+    const out = toPortableJsonSchema(
+      z.toJSONSchema(Chapter, { io: "input" }),
+      "google",
+    ) as any;
+    const { $schema: _dialect, ...gloss } = z.toJSONSchema(Gloss, {
+      io: "input",
+    });
+    expect(out.properties.translatedGloss).toEqual(gloss);
+  });
+
+  it("rejects a keyword OpenAI strict cannot express, naming the path and keyword, before any request", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        sections: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: { extra: { type: "object", patternProperties: {} } },
+          },
+        },
+      },
+    };
+    expect(() => toPortableJsonSchema(schema, "openai")).toThrow(
+      UnportableSchemaError,
+    );
+    expect(() => toPortableJsonSchema(schema, "openai")).toThrow(
+      /"patternProperties" at \/properties\/sections\/items\/properties\/extra/,
+    );
+    // Only the OpenAI target has the constraint.
+    expect(() => toPortableJsonSchema(schema, "google")).not.toThrow();
+  });
+});
+
+describe("restorePortableValue: pairs back to objects", () => {
+  const json = z.toJSONSchema(Chapter, { io: "input" });
+
+  it("rebuilds every record from its pairs, recursing into values, last duplicate key wins", () => {
+    const reply = {
+      title: "t",
+      translatedGloss: [
+        { key: "de", value: "Hallo" },
+        { key: "en", value: "Hi" },
+        { key: "de", value: "Servus" },
+      ],
+      scores: [
+        { key: "de", value: 1 },
+        { key: "en", value: 2 },
+      ],
+      people: [{ key: "ada", value: { ...PERSON_REPLY } }],
+    };
+    expect(Chapter.safeParse(reply).success).toBe(false);
+    const restored = restorePortableValue(reply, json);
+    expect(restored).toEqual({
+      title: "t",
+      translatedGloss: { de: "Servus", en: "Hi" },
+      scores: { de: 1, en: 2 },
+      people: { ada: PERSON_PARSED },
+    });
+    expect(Chapter.safeParse(restored).success).toBe(true);
+    // Never mutates its input.
+    expect(Array.isArray(reply.translatedGloss)).toBe(true);
+    // The alias still compiles and behaves the same.
+    expect(stripOptionalNulls(reply, json)).toEqual(restored);
+  });
+
+  it("removes a null optional record and keeps an admitted null, in union branches too", () => {
+    const sectionReply = {
+      title: "t",
+      translatedGloss: null,
+      scores: [],
+      people: [],
+    };
+    expect(restorePortableValue(sectionReply, json)).toEqual({
+      title: "t",
+      scores: {},
+      people: {},
+    });
+    const page = {
+      blocks: [
+        { kind: "text", body: "b" },
+        { kind: "table", cells: [{ key: "a1", value: "x" }] },
+      ],
+      meta: null,
+    };
+    const restored = restorePortableValue(
+      page,
+      z.toJSONSchema(Page, { io: "input" }),
+    );
+    expect(restored).toEqual({
+      blocks: [
+        { kind: "text", body: "b" },
+        { kind: "table", cells: { a1: "x" } },
+      ],
+      meta: null,
+    });
+    expect(Page.safeParse(restored).success).toBe(true);
+    // A nullable record answered as pairs (the union's one record branch).
+    expect(
+      restorePortableValue(
+        { blocks: [], meta: [{ key: "k", value: "v" }] },
+        z.toJSONSchema(Page, { io: "input" }),
+      ),
+    ).toEqual({ blocks: [], meta: { k: "v" } });
+  });
+
+  it("leaves a record that already came back as an object alone (other targets)", () => {
+    const reply = {
+      title: "t",
+      translatedGloss: { de: "x" },
+      scores: { de: 1, en: 2 },
+      people: {},
+    };
+    expect(restorePortableValue(reply, json)).toEqual(reply);
+  });
+});
+
+const CHAPTER_REPLY = {
+  title: "t",
+  translatedGloss: [{ key: "de", value: "Hallo" }],
+  scores: [
+    { key: "de", value: 1 },
+    { key: "en", value: 2 },
+  ],
+  people: [],
+};
+const CHAPTER_PARSED = {
+  title: "t",
+  translatedGloss: { de: "Hallo" },
+  scores: { de: 1, en: 2 },
+  people: {},
+};
+
+describe("records end to end: realtime middleware and batch getResults", () => {
+  it("generateObject and generateText + Output.object send pairs and return the object", async () => {
+    const captured: LanguageModelV4CallOptions[] = [];
+    const model = new MockLanguageModelV4({
+      provider: "openrouter.chat",
+      doGenerate: async (options) => {
+        captured.push(options);
+        return {
+          content: [{ type: "text", text: JSON.stringify(CHAPTER_REPLY) }],
+          finishReason: { unified: "stop", raw: "stop" },
+          usage: { inputTokens: { total: 1 }, outputTokens: { total: 1 } },
+          warnings: [],
+        } as never;
+      },
+    });
+    const ai = createAIHelper(
+      "portability",
+      new InMemoryAICallLogger(),
+      undefined,
+      () => model as never,
+    );
+    const viaObject = await ai.generateObject(OPENROUTER_MODEL, "q", Chapter);
+    const viaText = await ai.generateText(OPENROUTER_MODEL, "q", {
+      output: Output.object({ schema: Chapter }),
+    });
+    expect(viaObject.object).toEqual(CHAPTER_PARSED);
+    expect(viaText.output).toEqual(CHAPTER_PARSED);
+    for (const call of captured) {
+      const schema =
+        call.responseFormat?.type === "json"
+          ? (call.responseFormat.schema as any)
+          : undefined;
+      expect(keywords(schema).has("propertyNames")).toBe(false);
+      expect(schema.properties.translatedGloss.anyOf[0]).toEqual(
+        PAIRS_OF_STRINGS,
+      );
+    }
+  });
+
+  it("fails an unportable schema at the boundary, before the model is called", async () => {
+    const captured: LanguageModelV4CallOptions[] = [];
+    const ai = createAIHelper(
+      "portability",
+      new InMemoryAICallLogger(),
+      undefined,
+      () => personModel("openrouter.chat", captured) as never,
+    );
+    const Odd = z.object({
+      a: z.string().refine(() => true),
+      b: z.object({ x: z.string() }).and(z.object({ y: z.string() })),
+    });
+    // `z.intersection` emits `allOf`, which is passed through; a guard hit
+    // needs a keyword the engine rejects — inject one via `.meta()`.
+    const Bad = z.object({
+      names: z.array(z.string()).meta({ uniqueItems: true } as never),
+    });
+    await expect(ai.generateObject(OPENROUTER_MODEL, "q", Bad)).rejects.toThrow(
+      /"uniqueItems" at \/properties\/names/,
+    );
+    expect(captured).toHaveLength(0);
+    void Odd;
+  });
+
+  it("batch getResults rebuilds the pairs the OpenRouter batch answered", async () => {
+    const backend = makeFakeBackend({
+      respond: () => JSON.stringify(CHAPTER_REPLY),
+    });
+    const batch = new AIBatchImpl(
+      { topic: "portability", aiCallLogger: new InMemoryAICallLogger() },
+      OPENROUTER_MODEL,
+      "openrouter",
+      undefined,
+      undefined,
+      backend.model,
+    );
+    const handle = await batch.submit([
+      { id: "r1", prompt: "q", schema: Chapter },
+    ]);
+    const results = await batch.getResults(handle.id);
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({
+      id: "r1",
+      status: "succeeded",
+      validated: true,
+      result: CHAPTER_PARSED,
     });
   });
 });

@@ -143,9 +143,11 @@ export {
   registerModels,
 } from "./ai/model-helper";
 export {
+  restorePortableValue,
   type SchemaTarget,
   stripOptionalNulls,
   toPortableJsonSchema,
+  UnportableSchemaError,
 } from "./ai/schema-portability";
 export type {
   AIConfig,

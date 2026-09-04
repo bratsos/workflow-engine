@@ -12,16 +12,28 @@
  *   optional property is sent as required-but-nullable
  *   (`anyOf: [<original>, { type: "null" }]`), the way OpenAI documents
  *   it. The model then answers `null` where the caller's Zod schema has
- *   `.optional()`, so before validation `stripOptionalNulls` removes the
+ *   `.optional()`, so before validation `restorePortableValue` removes the
  *   `null` values of properties that were optional and not nullable in the
  *   ORIGINAL schema (recursively: nested objects, arrays, union members).
+ *   They have no map type either: `z.record` emits `{ type: "object",
+ *   propertyNames, additionalProperties: <schema> }`, and strict mode
+ *   permits neither `propertyNames` nor a non-`false` `additionalProperties`
+ *   (`'propertyNames' is not permitted`). A record is therefore sent as an
+ *   array of `{ key, value }` pairs (an enum key constraint is kept on
+ *   `key`), and `restorePortableValue` rebuilds the object from the pairs
+ *   before validation (last duplicate key wins). Whatever strict mode still
+ *   cannot express (`patternProperties`, `if`/`then`/`else`, ...) is
+ *   rejected here with `UnportableSchemaError`, naming the JSON path and the
+ *   keyword, before any request is sent.
  * - Gemini's `responseSchema` has no `oneOf` either; `@ai-sdk/google`
  *   forwards it verbatim and the API drops the union, so a discriminated
  *   union comes back flat. It handles `anyOf` (including `null` branches),
  *   `const`, `enum` and `$ref` itself, so only the union keyword needs
- *   rewriting on the realtime path. (The Google *batch* path substitutes
- *   the engine's full OpenAPI conversion at the fetch boundary instead —
- *   see batch/google-json-schema.ts.)
+ *   rewriting on the realtime path. Records are untouched for Google: the
+ *   provider's OpenAPI converter expresses `additionalProperties` natively
+ *   (verified live in the third consumer round). (The Google *batch* path
+ *   substitutes the engine's full OpenAPI conversion at the fetch boundary
+ *   instead — see batch/google-json-schema.ts.)
  *
  * The rewrite is applied at the model boundary as an AI SDK middleware, so
  * `generateObject`, `generateText` + `Output.object` and `streamText` all
@@ -34,6 +46,7 @@ import type {
   LanguageModelV4,
   LanguageModelV4CallOptions,
   LanguageModelV4Content,
+  LanguageModelV4StreamPart,
 } from "@ai-sdk/provider";
 import { wrapLanguageModel } from "ai";
 import type { ModelConfig } from "./model-helper";
@@ -99,20 +112,145 @@ function nullable(converted: unknown): JsonNode {
   return { anyOf: [converted, { type: "null" }] };
 }
 
-function convert(node: unknown, target: SchemaTarget, root: JsonNode): unknown {
+/**
+ * Thrown by `toPortableJsonSchema(…, "openai")` — and so by every
+ * structured-output call and batch submit bound for an OpenAI or OpenRouter
+ * model — when the schema uses a keyword OpenAI's strict structured outputs
+ * cannot express and the engine has no rewrite for. Raised at the engine
+ * boundary, before any request is sent, instead of a provider 400 per item.
+ */
+export class UnportableSchemaError extends Error {
+  readonly name = "UnportableSchemaError";
+  constructor(
+    readonly target: SchemaTarget,
+    /** JSON pointer to the schema node carrying the keyword (`""` = root). */
+    readonly path: string,
+    readonly keyword: string,
+  ) {
+    super(
+      `Schema keyword "${keyword}" at ${path || "the root"} cannot be expressed ` +
+        `for the "${target}" structured-output target (OpenAI strict mode); ` +
+        `rewrite that part of the schema before calling the model.`,
+    );
+  }
+}
+
+/**
+ * Keywords OpenAI strict structured outputs reject and the engine does not
+ * rewrite. `propertyNames` and a schema-valued `additionalProperties` are
+ * rewritten (records → pairs) and `oneOf` → `anyOf`, so they are not here.
+ */
+const OPENAI_UNSUPPORTED_KEYWORDS = new Set([
+  "patternProperties",
+  "unevaluatedProperties",
+  "minProperties",
+  "maxProperties",
+  "unevaluatedItems",
+  "contains",
+  "minContains",
+  "maxContains",
+  "uniqueItems",
+  "not",
+  "if",
+  "then",
+  "else",
+  "dependentRequired",
+  "dependentSchemas",
+]);
+
+/** Keys whose values are data, not sub-schemas: copied verbatim. */
+const LITERAL_KEYS = new Set([
+  "const",
+  "enum",
+  "default",
+  "examples",
+  "description",
+  "title",
+]);
+
+/**
+ * Whether `node` is what `z.record` (or `z.partialRecord`) emits: an object
+ * schema with no `properties` whose members are described by
+ * `additionalProperties` and/or `propertyNames`.
+ */
+function isRecordSchema(node: JsonNode): boolean {
+  return (
+    node.type === "object" &&
+    !isObject(node.properties) &&
+    (isObject(node.additionalProperties) || isObject(node.propertyNames))
+  );
+}
+
+function escapePointer(segment: string): string {
+  return segment.replace(/~/g, "~0").replace(/\//g, "~1");
+}
+
+/**
+ * OpenAI strict has no map type: a record becomes an array of `{ key, value }`
+ * objects. An `enum` on `propertyNames` is kept on `key`; a `required` list
+ * (a full record over an enum key) has no array counterpart and is dropped —
+ * the caller's Zod schema still enforces it after the inverse transform.
+ */
+function recordToPairs(node: JsonNode, root: JsonNode, path: string): JsonNode {
+  const names = isObject(node.propertyNames) ? node.propertyNames : {};
+  const key: JsonNode = { type: "string" };
+  if (Array.isArray(names.enum)) key.enum = names.enum;
+  const valueSchema = isObject(node.additionalProperties)
+    ? node.additionalProperties
+    : {};
+  const out: JsonNode = {};
+  if (typeof node.description === "string") out.description = node.description;
+  out.type = "array";
+  out.items = {
+    type: "object",
+    properties: {
+      key,
+      value: convert(
+        valueSchema,
+        "openai",
+        root,
+        `${path}/additionalProperties`,
+      ),
+    },
+    required: ["key", "value"],
+    additionalProperties: false,
+  };
+  return out;
+}
+
+function convert(
+  node: unknown,
+  target: SchemaTarget,
+  root: JsonNode,
+  path = "",
+): unknown {
   if (Array.isArray(node))
-    return node.map((item) => convert(item, target, root));
+    return node.map((item, i) => convert(item, target, root, `${path}/${i}`));
   if (!isObject(node)) return node;
+  if (target === "openai") {
+    for (const key of Object.keys(node)) {
+      if (OPENAI_UNSUPPORTED_KEYWORDS.has(key)) {
+        throw new UnportableSchemaError(target, path, key);
+      }
+    }
+    if (isRecordSchema(node)) return recordToPairs(node, root, path);
+  }
   const out: JsonNode = {};
   for (const [key, value] of Object.entries(node)) {
     if (key === "oneOf") continue;
-    if (key === "properties" && target === "openai" && isObject(value))
-      continue;
-    out[key] = convert(value, target, root);
+    if (target === "openai") {
+      if (key === "properties" && isObject(value)) continue;
+      // Dropped everywhere: strict mode has no key constraints, and the
+      // record case that carries them was rewritten above.
+      if (key === "propertyNames") continue;
+    }
+    out[key] = LITERAL_KEYS.has(key)
+      ? value
+      : convert(value, target, root, `${path}/${escapePointer(key)}`);
   }
   if (Array.isArray(node.oneOf)) {
-    const branches = (node.oneOf as unknown[]).map((b) =>
-      convert(b, target, root),
+    const branches = (node.oneOf as unknown[]).map((b, i) =>
+      convert(b, target, root, `${path}/oneOf/${i}`),
     );
     out.anyOf = Array.isArray(out.anyOf)
       ? [...(out.anyOf as unknown[]), ...branches]
@@ -126,7 +264,12 @@ function convert(node: unknown, target: SchemaTarget, root: JsonNode): unknown {
     );
     const properties: JsonNode = {};
     for (const [name, prop] of Object.entries(node.properties)) {
-      const converted = convert(prop, target, root);
+      const converted = convert(
+        prop,
+        target,
+        root,
+        `${path}/properties/${escapePointer(name)}`,
+      );
       properties[name] =
         required.has(name) || acceptsNull(prop, root)
           ? converted
@@ -134,16 +277,18 @@ function convert(node: unknown, target: SchemaTarget, root: JsonNode): unknown {
     }
     out.properties = properties;
     out.required = Object.keys(properties);
-    if (out.additionalProperties === undefined) {
-      out.additionalProperties = false;
-    }
+    // Strict mode admits only `false` here; a catchall schema
+    // (`z.looseObject`, `.catchall()`) cannot be expressed and is dropped —
+    // the caller's Zod schema still accepts whatever the model adds.
+    out.additionalProperties = false;
   }
   return out;
 }
 
 /**
  * A JSON Schema (as `z.toJSONSchema` emits it) rewritten for `target`.
- * Never mutates its input.
+ * Never mutates its input. Throws `UnportableSchemaError` for the `openai`
+ * target when the schema uses a keyword strict mode cannot express.
  */
 export function toPortableJsonSchema(
   jsonSchema: unknown,
@@ -196,6 +341,32 @@ function stripNode(value: unknown, node: unknown, root: JsonNode): unknown {
   }
   const schema = resolveRef(node, root);
 
+  // A record: the OpenAI target sent it as `{ key, value }` pairs, so an
+  // array reply is rebuilt into the object (last duplicate key wins); an
+  // object reply (another target, or a lenient model) keeps its shape.
+  // Values are restored either way.
+  if (isRecordSchema(schema)) {
+    const valueSchema = schema.additionalProperties;
+    const restore = (entry: unknown) =>
+      isObject(valueSchema) ? stripNode(entry, valueSchema, root) : entry;
+    if (Array.isArray(value)) {
+      const pairs = value.every(
+        (item) => isObject(item) && typeof item.key === "string",
+      );
+      if (!pairs) return value;
+      const out: JsonNode = {};
+      for (const item of value as JsonNode[]) {
+        out[item.key as string] = restore(item.value);
+      }
+      return out;
+    }
+    const out: JsonNode = {};
+    for (const [key, entry] of Object.entries(value as JsonNode)) {
+      out[key] = restore(entry);
+    }
+    return out;
+  }
+
   if (Array.isArray(value)) {
     const items = schema.items;
     if (Array.isArray(items)) {
@@ -204,10 +375,16 @@ function stripNode(value: unknown, node: unknown, root: JsonNode): unknown {
     if (isObject(items)) {
       return value.map((item) => stripNode(item, items, root));
     }
+    // A union: the one branch that describes an array — or a record, which
+    // the OpenAI target sent as an array of pairs.
     const branches = [
       ...(Array.isArray(schema.anyOf) ? schema.anyOf : []),
       ...(Array.isArray(schema.oneOf) ? schema.oneOf : []),
-    ].filter((b) => isObject(b) && resolveRef(b, root).type === "array");
+    ].filter((b) => {
+      if (!isObject(b)) return false;
+      const resolved = resolveRef(b, root);
+      return resolved.type === "array" || isRecordSchema(resolved);
+    });
     return branches.length === 1 ? stripNode(value, branches[0], root) : value;
   }
 
@@ -274,20 +451,25 @@ function stripNode(value: unknown, node: unknown, root: JsonNode): unknown {
 }
 
 /**
- * `value` (a model's parsed JSON reply) with every `null` removed where the
+ * `value` (a model's parsed JSON reply) brought back to the shape of the
  * ORIGINAL schema — the one `toPortableJsonSchema(…, "openai")` was fed —
- * has an optional, non-nullable property, so the caller's Zod schema
- * parses it. Nested objects, arrays and union members are covered; a `null`
+ * so the caller's Zod schema parses it: every `null` is removed where the
+ * schema has an optional, non-nullable property, and every record the
+ * target received as `{ key, value }` pairs is rebuilt into an object.
+ * Nested objects, arrays, union members and `$defs` are covered; a `null`
  * the original schema admits (required or `.nullable()`) is kept. Never
  * mutates its input.
  */
-export function stripOptionalNulls(
+export function restorePortableValue(
   value: unknown,
   jsonSchema: unknown,
 ): unknown {
   if (!isObject(jsonSchema)) return value;
   return stripNode(value, jsonSchema, jsonSchema);
 }
+
+/** The 1.0.0-alpha.4 name of `restorePortableValue`; same function. */
+export const stripOptionalNulls = restorePortableValue;
 
 /**
  * Which rewrite a model needs, from its registry entry first (the engine's
@@ -309,25 +491,29 @@ export function schemaTargetForModel(
   return undefined;
 }
 
-/** A JSON text with the optional-property nulls of `original` removed. */
-function stripJsonText(text: string, original: unknown): string {
+/** A JSON text restored to the shape of `original` (see restorePortableValue). */
+function restoreJsonText(text: string, original: unknown): string {
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
   } catch {
     return text;
   }
-  const stripped = stripOptionalNulls(parsed, original);
-  return stripped === parsed ? text : JSON.stringify(stripped);
+  const restored = restorePortableValue(parsed, original);
+  return restored === parsed ? text : JSON.stringify(restored);
 }
 
 /**
  * Wrap a language model so every JSON `responseFormat` it receives carries
- * the portable schema for `target`, and (OpenAI) so a generated reply has
- * the nulls of optional properties removed before the AI SDK validates it
- * against the original schema. Returns the model unchanged when no rewrite
- * applies. A streamed reply is sent the portable schema too; its text is
- * not rewritten (the engine's `streamText` has no structured output).
+ * the portable schema for `target`, and (OpenAI) so a generated reply is
+ * restored to the original schema's shape — optional-property nulls
+ * removed, record pairs rebuilt — before the AI SDK validates it against
+ * the original schema. Returns the model unchanged when no rewrite applies.
+ * A streamed JSON reply is restored too: its text deltas are buffered per
+ * text part and emitted as one delta at `text-end`, since the rewrite needs
+ * the whole document (the engine's own `streamText` has no structured
+ * output, so only a direct `streamText` + `Output.object` on the wrapped
+ * model sees this).
  */
 export function withPortableSchema(
   model: LanguageModelV4,
@@ -364,13 +550,52 @@ export function withPortableSchema(
         if (target !== "openai" || original === undefined) return result;
         const content: LanguageModelV4Content[] = result.content.map((part) =>
           part.type === "text"
-            ? { ...part, text: stripJsonText(part.text, original) }
+            ? { ...part, text: restoreJsonText(part.text, original) }
             : part,
         );
         return { ...result, content };
       },
       async wrapStream({ params, model: inner }) {
-        return inner.doStream(prepare(params).params);
+        const { params: sent, original } = prepare(params);
+        const result = await inner.doStream(sent);
+        if (target !== "openai" || original === undefined) return result;
+        const buffered = new Map<string, string>();
+        const emit = (
+          controller: TransformStreamDefaultController<LanguageModelV4StreamPart>,
+          id: string,
+        ) => {
+          const text = buffered.get(id);
+          buffered.delete(id);
+          if (text !== undefined) {
+            controller.enqueue({
+              type: "text-delta",
+              id,
+              delta: restoreJsonText(text, original),
+            });
+          }
+        };
+        const stream = result.stream.pipeThrough(
+          new TransformStream<
+            LanguageModelV4StreamPart,
+            LanguageModelV4StreamPart
+          >({
+            transform(part, controller) {
+              if (part.type === "text-delta") {
+                buffered.set(
+                  part.id,
+                  (buffered.get(part.id) ?? "") + part.delta,
+                );
+                return;
+              }
+              if (part.type === "text-end") emit(controller, part.id);
+              controller.enqueue(part);
+            },
+            flush(controller) {
+              for (const id of [...buffered.keys()]) emit(controller, id);
+            },
+          }),
+        );
+        return { ...result, stream };
       },
     },
   });
