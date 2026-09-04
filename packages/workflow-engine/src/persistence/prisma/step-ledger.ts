@@ -36,6 +36,23 @@ function mapStep(record: any): StepRecord {
   };
 }
 
+/**
+ * Translate a `StepRecordPatch` into Prisma `data`.
+ *
+ * One rule for every field, matching the contract documented on
+ * `StepRecordPatch` and implemented identically by `InMemoryStepLedger`:
+ * a key that is absent -- or present holding `undefined` -- leaves the
+ * column alone; any other value, `null` included, is written.
+ *
+ * `result` and `waitState` are `Json?` columns, and Prisma maps a plain
+ * `null` on one of those to a JSON `null` that reads back as `null`
+ * through `mapStep` -- the same value the in-memory ledger stores. SQL
+ * NULL would need `Prisma.DbNull`, a sentinel that only exists on the
+ * consumer's generated client (its identity is checked against that
+ * client's own runtime), and this package deliberately does not import
+ * one -- see `prisma-client-type.ts`. The distinction is invisible
+ * through the port: both come back as `null`.
+ */
 function mapPatch(patch: StepRecordPatch): Record<string, unknown> {
   const data: Record<string, unknown> = {};
   if (patch.status !== undefined) data.status = patch.status;
@@ -43,13 +60,12 @@ function mapPatch(patch: StepRecordPatch): Record<string, unknown> {
   if (patch.leaseExpiresAt !== undefined)
     data.leaseExpiresAt = patch.leaseExpiresAt;
   if (patch.deadlineAt !== undefined) data.deadlineAt = patch.deadlineAt;
-  // A null result is left as SQL NULL (the column default): writing Prisma.JsonNull
-  // would require importing the consumer's generated client, which Prisma 7
-  // no longer exposes under a fixed path. `get` maps SQL NULL back to null.
-  if (Object.hasOwn(patch, "result") && patch.result != null) {
-    data.result = patch.result;
-  }
-  if (Object.hasOwn(patch, "error")) data.error = patch.error ?? null;
+  // Was `Object.hasOwn(patch, "result") && patch.result != null`, which
+  // dropped the write for a step that completed with no value: on an
+  // UPDATE that leaves the *previous* attempt's result in the row, and a
+  // re-run that preserved the row then replays it forever.
+  if (patch.result !== undefined) data.result = patch.result;
+  if (patch.error !== undefined) data.error = patch.error;
   if (patch.waitState !== undefined) data.waitState = patch.waitState;
   return data;
 }
@@ -93,7 +109,7 @@ export class PrismaStepLedger implements StepLedger {
       ...(record.externalKey != null
         ? { externalKey: record.externalKey }
         : {}),
-      ...(record.result != null ? { result: record.result } : {}),
+      ...(record.result !== undefined ? { result: record.result } : {}),
       ...(record.error !== undefined ? { error: record.error } : {}),
       ...(record.waitState !== undefined
         ? { waitState: record.waitState }

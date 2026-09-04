@@ -14,6 +14,12 @@ function cloneJson(value: unknown): unknown {
   return JSON.parse(JSON.stringify(value));
 }
 
+/** `undefined` keeps `current`; `null` clears; a date is copied. */
+function patchDate(patched: Date | null | undefined, current: Date | null) {
+  if (patched === undefined) return current;
+  return patched === null ? null : new Date(patched.getTime());
+}
+
 function cloneRecord(record: StepRecord): StepRecord {
   return {
     ...record,
@@ -84,27 +90,23 @@ export class InMemoryStepLedger implements StepLedger {
       throw new Error(`Step record not found: ${stageRecordId}/${stepId}`);
     }
 
+    // One rule for every field, matching `StepRecordPatch` and the Prisma
+    // adapter's `mapPatch`: `undefined` (however it got there -- absent, or
+    // spread in from an optional property) leaves the field alone; any
+    // other value, `null` included, is written.
     const updated: StepRecord = {
       ...existing,
-      ...patch,
-      result: Object.hasOwn(patch, "result")
-        ? cloneJson(patch.result)
-        : existing.result,
-      waitState: Object.hasOwn(patch, "waitState")
-        ? patch.waitState
+      ...(patch.status !== undefined ? { status: patch.status } : {}),
+      ...(patch.attempt !== undefined ? { attempt: patch.attempt } : {}),
+      ...(patch.error !== undefined ? { error: patch.error } : {}),
+      result:
+        patch.result !== undefined ? cloneJson(patch.result) : existing.result,
+      waitState:
+        patch.waitState !== undefined
           ? { ...patch.waitState }
-          : undefined
-        : existing.waitState,
-      leaseExpiresAt: Object.hasOwn(patch, "leaseExpiresAt")
-        ? patch.leaseExpiresAt
-          ? new Date(patch.leaseExpiresAt.getTime())
-          : null
-        : existing.leaseExpiresAt,
-      deadlineAt: Object.hasOwn(patch, "deadlineAt")
-        ? patch.deadlineAt
-          ? new Date(patch.deadlineAt.getTime())
-          : null
-        : existing.deadlineAt,
+          : existing.waitState,
+      leaseExpiresAt: patchDate(patch.leaseExpiresAt, existing.leaseExpiresAt),
+      deadlineAt: patchDate(patch.deadlineAt, existing.deadlineAt),
       updatedAt: this.now(),
     };
     this.records.set(key, updated);
