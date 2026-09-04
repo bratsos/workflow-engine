@@ -9,6 +9,10 @@
  * typically makes external HTTP calls to batch providers — runs outside
  * any database transaction:
  *
+ *   Phase 0 (no transaction): Claim the stage — a version-guarded bump of
+ *                             `nextPollAt` so a concurrent poller (another
+ *                             process, or an overlapping tick in this one)
+ *                             skips it instead of running the same work.
  *   Phase 1 (no transaction): Call checkCompletion() — external I/O
  *   Phase 2 (transaction):    Persist results + append outbox events
  *
@@ -23,7 +27,10 @@ import {
   type StageResult,
   type SuspendedResult,
 } from "../../core/types.js";
-import type { CreateAnnotationInput } from "../../persistence/interface";
+import {
+  type CreateAnnotationInput,
+  StaleVersionError,
+} from "../../persistence/interface.js";
 import type {
   StagePollSuspendedCommand,
   StagePollSuspendedResult,
@@ -31,6 +38,7 @@ import type {
 import {
   buildAnnotationEvents,
   buildStageExecutionContext,
+  type ClaimOutcome,
   createAnnotationBuffer,
   createStepApi,
   createStorageShim,
@@ -115,6 +123,7 @@ async function failStageOnly(
       status: "FAILED",
       completedAt: deps.clock.now(),
       errorMessage,
+      nextPollAt: null,
     });
     await tx.appendOutboxEvents(
       toOutboxEvents(stageRecord.workflowRunId, [
@@ -138,6 +147,84 @@ async function failStageOnly(
 }
 
 type ReplayOutcome = "resumed" | "suspended" | "failed" | "skip";
+
+/**
+ * Shortest lease a poller takes on a suspended stage when it claims it
+ * (Phase 0). A stage's own `pollInterval` wins when longer.
+ */
+const MIN_CLAIM_LEASE_MS = 60_000;
+
+/**
+ * Phase 0: claims a suspended stage for this poller before any work is
+ * done on it. The claim is a compare-and-set on the stage row — bump
+ * `nextPollAt` to `now + lease`, guarded by the row's `version` — issued
+ * outside the per-stage transaction so a second poller reading the same
+ * stage sees the bump (or, on Postgres, blocks on the row and then sees
+ * its own guarded update touch zero rows).
+ *
+ * Returns the claimed record with `version` advanced by one (any later
+ * version-guarded write on the stage still matches), or `null` when another
+ * poller already holds the stage (`StaleVersionError`): the caller skips it.
+ *
+ * The lease is `max(pollInterval, MIN_CLAIM_LEASE_MS)` but never later than
+ * `maxWaitUntil` when that deadline is still ahead, so a wait that times out
+ * during the lease is noticed at the deadline rather than after the lease.
+ * A deadline that has already passed is about to be handled by this very
+ * pass (it fails the stage), so it does not shorten the lease.
+ *
+ * Every outcome branch of the handler ends by writing `nextPollAt`
+ * explicitly (a re-suspend writes `pollConfig.nextPollAt`, not-ready writes
+ * `now + pollInterval`, completed/failed/cancelled write `null`, a skipped
+ * claim outcome hands the stage back through `releaseStageClaim`). The
+ * lease value therefore only survives when the process dies mid-replay —
+ * in which case the stage is picked up again by whichever poller runs
+ * after the lease elapses.
+ */
+async function claimSuspendedStage(
+  stageRecord: WorkflowStageRecord,
+  deps: KernelDeps,
+): Promise<WorkflowStageRecord | null> {
+  const now = deps.clock.now().getTime();
+  let leaseUntil =
+    now + Math.max(stageRecord.pollInterval ?? 0, MIN_CLAIM_LEASE_MS);
+  const deadline = stageRecord.maxWaitUntil?.getTime();
+  if (deadline !== undefined && deadline > now && deadline < leaseUntil) {
+    leaseUntil = deadline;
+  }
+  const nextPollAt = new Date(leaseUntil);
+  try {
+    await deps.persistence.updateStage(stageRecord.id, {
+      nextPollAt,
+      expectedVersion: stageRecord.version,
+    });
+  } catch (error) {
+    if (error instanceof StaleVersionError) return null;
+    throw error;
+  }
+  return { ...stageRecord, nextPollAt, version: stageRecord.version + 1 };
+}
+
+/**
+ * Hands a claimed stage back after a skipped Phase-2 outcome (the run was
+ * claimed by another writer, or is no longer RUNNING) so the next tick
+ * retries it instead of waiting out the claim lease. Version-guarded: when
+ * the row was written since the claim (the cancel cascade, a later
+ * claimant after the lease elapsed), that writer's `nextPollAt` stands.
+ */
+async function releaseStageClaim(
+  stageRecord: WorkflowStageRecord,
+  deps: KernelDeps,
+): Promise<void> {
+  try {
+    await deps.persistence.updateStage(stageRecord.id, {
+      nextPollAt: deps.clock.now(),
+      expectedVersion: stageRecord.version,
+    });
+  } catch (error) {
+    if (error instanceof StaleVersionError) return;
+    throw error;
+  }
+}
 
 async function failExpiredDurableWait(
   stageRecordId: string,
@@ -413,11 +500,30 @@ export async function handleStagePollSuspended(
   const resumedWorkflowRunIds = new Set<string>();
 
   // 3. Process each suspended stage
-  for (const stageRecord of stagesToCheck) {
+  for (const candidate of stagesToCheck) {
     checked++;
+
+    // ── Phase 0: claim the stage (no transaction) ──────────────────────
+    // Another poller holds it → skip; nothing below runs for this stage.
+    const stageRecord = await claimSuspendedStage(candidate, deps);
+    if (!stageRecord) continue;
+
+    // Resolves a Phase-2 claim outcome and, when the stage is to be
+    // skipped, hands the claim back so the next tick retries it.
+    const skipAfterClaim = async (
+      claimResult: ClaimOutcome<unknown>,
+    ): Promise<boolean> => {
+      if (!(await handleClaimOutcome(claimResult, stageRecord, deps))) {
+        return false;
+      }
+      await releaseStageClaim(stageRecord, deps);
+      return true;
+    };
 
     // 3a. Get workflow run (no transaction — read-only lookup)
     const run = await deps.persistence.getRun(stageRecord.workflowRunId);
+    // A run that no longer exists leaves the lease in place: there is
+    // nothing to resume, and the stage is revisited after the lease.
     if (!run) continue;
 
     // 3a.1 Skip cancelled runs — mark the suspended stage as cancelled
@@ -465,6 +571,8 @@ export async function handleStagePollSuspended(
         resumedWorkflowRunIds.add(stageRecord.workflowRunId);
       } else if (outcome === "failed") {
         failed++;
+      } else if (outcome === "skip") {
+        await releaseStageClaim(stageRecord, deps);
       }
       continue;
     }
@@ -567,7 +675,7 @@ export async function handleStagePollSuspended(
           deps,
         );
 
-        if (await handleClaimOutcome(claimResult, stageRecord, deps)) continue;
+        if (await skipAfterClaim(claimResult)) continue;
         await failSuspendedJobRow(
           stageRecord.workflowRunId,
           stageRecord.stageId,
@@ -643,7 +751,7 @@ export async function handleStagePollSuspended(
           },
         );
 
-        if (await handleClaimOutcome(claimResult, stageRecord, deps)) continue;
+        if (await skipAfterClaim(claimResult)) continue;
 
         resumed++;
         resumedWorkflowRunIds.add(stageRecord.workflowRunId);
@@ -677,7 +785,7 @@ export async function handleStagePollSuspended(
           deps,
         );
 
-        if (await handleClaimOutcome(claimResult, stageRecord, deps)) continue;
+        if (await skipAfterClaim(claimResult)) continue;
         await failSuspendedJobRow(
           stageRecord.workflowRunId,
           stageRecord.stageId,
@@ -710,7 +818,7 @@ export async function handleStagePollSuspended(
           },
         );
 
-        if (await handleClaimOutcome(claimResult, stageRecord, deps)) continue;
+        if (await skipAfterClaim(claimResult)) continue;
       }
     } catch (error) {
       // Unexpected error during checkCompletion. Flush any annotations
@@ -725,7 +833,7 @@ export async function handleStagePollSuspended(
         deps,
       );
 
-      if (await handleClaimOutcome(claimResult, stageRecord, deps)) continue;
+      if (await skipAfterClaim(claimResult)) continue;
       await failSuspendedJobRow(
         stageRecord.workflowRunId,
         stageRecord.stageId,

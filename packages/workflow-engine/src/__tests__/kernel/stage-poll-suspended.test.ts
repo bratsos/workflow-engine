@@ -6,6 +6,8 @@ import {
 } from "../../core/stage-factory.js";
 import { WorkflowBuilder } from "../../core/workflow.js";
 import type { Kernel } from "../../kernel/kernel.js";
+import { FakeClock } from "../../kernel/testing/fake-clock.js";
+import { InMemoryStepLedger } from "../../testing/in-memory-step-ledger.js";
 import { createTestKernel } from "../utils/index.js";
 
 function createPassthroughStage(id: string, schema: z.ZodTypeAny) {
@@ -746,5 +748,188 @@ describe("kernel: stage.pollSuspended", () => {
 
     const updatedStage = await persistence.getStage(run.id, "batch-stage");
     expect(updatedStage?.status).toBe("CANCELLED");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 0: a poller claims a suspended stage before doing any work on it
+// ---------------------------------------------------------------------------
+
+/**
+ * Runs a durable stage up to its first suspension: the body calls
+ * `ctx.step.waitFor` whose `poll` is supplied by the test, so a replay can
+ * be made to complete, or to hang until the test releases it.
+ */
+async function suspendDurableWait(
+  poll: () => Promise<{ done: boolean }>,
+  timeoutMs = 60 * 60 * 1000,
+) {
+  let executions = 0;
+  const stage = defineStage({
+    id: "wait",
+    name: "Wait",
+    schemas: {
+      input: z.object({}),
+      output: z.object({ done: z.boolean() }),
+      config: z.object({}),
+    },
+    async execute(ctx) {
+      executions++;
+      const value = await ctx.step.waitFor("external", {
+        poll,
+        ready: (result) => result.done,
+        every: 1_000,
+        timeout: timeoutMs,
+      });
+      return { output: value };
+    },
+  });
+  const workflow = new WorkflowBuilder(
+    "claimed",
+    "Claimed",
+    "test",
+    z.object({}),
+    z.object({ done: z.boolean() }),
+  )
+    .pipe(stage)
+    .build();
+  const clock = new FakeClock();
+  const env = createTestKernel([workflow], {
+    clock,
+    stepLedger: new InMemoryStepLedger({ now: () => clock.now() }),
+  });
+  const created = await env.kernel.dispatch({
+    type: "run.create",
+    idempotencyKey: "claimed",
+    workflowId: workflow.id,
+    input: {},
+  });
+  await env.kernel.dispatch({ type: "run.claimPending", workerId: "worker" });
+  await env.kernel.dispatch({
+    type: "job.execute",
+    workflowRunId: created.workflowRunId,
+    workflowId: workflow.id,
+    stageId: stage.id,
+    config: {},
+  });
+  env.eventSink.clear();
+  return {
+    ...env,
+    runId: created.workflowRunId,
+    /** Replays so far: executions beyond the first (suspending) one. */
+    replays: () => executions - 1,
+  };
+}
+
+/**
+ * A `poll` that suspends the first execution (not ready), holds the first
+ * replay until the test releases it, and answers ready to any later one.
+ */
+function gatedPoll() {
+  let calls = 0;
+  let release!: (value: { done: boolean }) => void;
+  const gate = new Promise<{ done: boolean }>((resolve) => {
+    release = resolve;
+  });
+  return {
+    poll: async () => {
+      calls++;
+      if (calls === 1) return { done: false };
+      if (calls === 2) return gate;
+      return { done: true };
+    },
+    release,
+  };
+}
+
+/** Lets a dispatched-but-unawaited poll run up to its first real wait. */
+const settle = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+describe("kernel: stage.pollSuspended claims a stage before working on it", () => {
+  it("runs the body once when two polls race for the same suspended stage", async () => {
+    let ready = false;
+    const env = await suspendDurableWait(async () => ({ done: ready }));
+    ready = true;
+    env.clock.advance(1_000);
+
+    const [first, second] = await Promise.all([
+      env.kernel.dispatch({ type: "stage.pollSuspended" }),
+      env.kernel.dispatch({ type: "stage.pollSuspended" }),
+    ]);
+
+    expect(env.replays()).toBe(1);
+    expect(first.resumed + second.resumed).toBe(1);
+    const stage = await env.persistence.getStage(env.runId, "wait");
+    expect(stage?.status).toBe("COMPLETED");
+    expect(stage?.nextPollAt).toBeNull();
+
+    await env.kernel.dispatch({
+      type: "run.transition",
+      workflowRunId: env.runId,
+    });
+    expect((await env.persistence.getRun(env.runId))?.status).toBe("COMPLETED");
+    await env.flush();
+    expect(env.eventSink.getByType("stage:completed")).toHaveLength(1);
+  });
+
+  it("bounds the claim lease by maxWaitUntil so a timeout is still noticed", async () => {
+    const gate = gatedPoll();
+    const env = await suspendDurableWait(gate.poll, 10_000);
+    const before = await env.persistence.getStage(env.runId, "wait");
+    expect(before?.maxWaitUntil).toEqual(
+      new Date(env.clock.now().getTime() + 10_000),
+    );
+    env.clock.advance(1_000);
+
+    const inFlight = env.kernel.dispatch({ type: "stage.pollSuspended" });
+    await settle();
+
+    // Held by this poller: nextPollAt is the deadline, not now + 60s.
+    const held = await env.persistence.getStage(env.runId, "wait");
+    expect(held?.status).toBe("SUSPENDED");
+    expect(held?.nextPollAt).toEqual(before?.maxWaitUntil);
+    expect(held?.version).toBe(before!.version + 1);
+
+    gate.release({ done: true });
+    expect((await inFlight).resumed).toBe(1);
+    expect(
+      (await env.persistence.getStage(env.runId, "wait"))?.nextPollAt,
+    ).toBeNull();
+  });
+
+  it("re-polls a stage whose claimant died once the lease elapses", async () => {
+    const gate = gatedPoll();
+    const env = await suspendDurableWait(gate.poll);
+    env.clock.advance(1_000);
+    const claimedAt = env.clock.now().getTime();
+
+    // First poller claims and then "dies" mid-replay (its body never
+    // returns within the lease).
+    const dead = env.kernel.dispatch({ type: "stage.pollSuspended" });
+    await settle();
+    const held = await env.persistence.getStage(env.runId, "wait");
+    expect(held?.nextPollAt).toEqual(new Date(claimedAt + 60_000));
+
+    // Before the lease elapses nobody else touches it.
+    env.clock.advance(59_000);
+    const early = await env.kernel.dispatch({ type: "stage.pollSuspended" });
+    expect(early.checked).toBe(0);
+    expect(env.replays()).toBe(1);
+
+    // After the lease elapses the next poll picks it up and finishes it.
+    env.clock.advance(1_000);
+    const late = await env.kernel.dispatch({ type: "stage.pollSuspended" });
+    expect(late.resumed).toBe(1);
+    expect(env.replays()).toBe(2);
+    expect((await env.persistence.getStage(env.runId, "wait"))?.status).toBe(
+      "COMPLETED",
+    );
+
+    // The dead poller's replay, if it ever returns, must not undo that.
+    gate.release({ done: true });
+    await dead;
+    expect((await env.persistence.getStage(env.runId, "wait"))?.status).toBe(
+      "COMPLETED",
+    );
   });
 });
