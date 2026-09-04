@@ -85,6 +85,7 @@ const host = createNodeHost({
   // Optional tuning
   orchestrationIntervalMs: 10_000,    // Claim pending, poll suspended, reap stale, flush outbox
   jobPollIntervalMs: 1_000,           // Dequeue and execute jobs
+  postJobYieldMs: 1_000,              // v0.4.4+: randomised pause after a completed job (default: jobPollIntervalMs)
   staleLeaseThresholdMs: 300_000,     // Release stale job leases (default 300_000 as of v0.11, was 60_000)
   jobHeartbeatIntervalMs: 60_000,     // v0.11+: heartbeat a job's lease while it executes
   maxClaimsPerTick: 10,               // Max pending runs to claim per tick
@@ -217,3 +218,14 @@ createNodeHost({ kernel, jobTransport, workerId: "worker-2" });
 ```
 
 The `claimPendingRun` operation uses `FOR UPDATE SKIP LOCKED` in PostgreSQL to prevent race conditions.
+
+### Spreading one run across workers (`postJobYieldMs`)
+
+The host that completes a job is also the one that dispatches `run.transition`, so it enqueues the next execution group from its own process. Before host-node 0.4.4 it then went straight back to `dequeue()` while every other worker was still parked in its `jobPollIntervalMs` timer, and won the stage it had just created essentially every time: a sequential pipeline ran end-to-end on a single worker no matter how many were alive (correct, but "add more workers" did not shorten one pipeline).
+
+The job loop now pauses for a uniform draw over `[0, postJobYieldMs)` after a **completed** job, which gives this worker the same phase every other worker has. Only completed jobs pause: a retry re-queues itself with backoff, a suspension waits on a poll deadline, and a terminal failure enqueues nothing.
+
+- **Default** is `jobPollIntervalMs`, so the pause matches the window competitors wake up in.
+- **The pause is skipped while the loop is draining a backlog** — as soon as `dequeue()` hands it a job from a run other than the one it just completed, it stops pausing until the queue next comes back empty. A worker chewing through unrelated queued work pays at most one pause.
+- **`postJobYieldMs: 0`** disables it: lowest latency for a single-worker deployment, and multi-worker deployments go back to pinning each run to one worker.
+- Suspended/async-batch stages are unaffected — they resume through `stage.pollSuspended` on the orchestration tick, which any worker may run.

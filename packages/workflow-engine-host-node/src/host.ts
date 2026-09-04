@@ -37,6 +37,32 @@ export interface NodeHostConfig {
   /** Job dequeue poll interval when queue is empty (default: 1_000). */
   jobPollIntervalMs?: number;
 
+  /**
+   * Upper bound (ms) on the randomised pause this worker takes after
+   * completing a job, before asking for the next one (default:
+   * `jobPollIntervalMs`). The actual pause is uniform in
+   * `[0, postJobYieldMs)`.
+   *
+   * Why it exists: the host that completes a job is the one that
+   * dispatches `run.transition`, so it enqueues the next stage of that
+   * run in-process and would otherwise be back at `dequeue()` microseconds
+   * later while every other worker is still parked in its
+   * `jobPollIntervalMs` timer. It won the stage it had just created
+   * essentially every time, and a sequential pipeline ran end-to-end on
+   * one worker no matter how many were alive. Pausing for a uniform draw
+   * over the same window gives this worker the same phase every other
+   * worker has, so the next stage goes to whichever asks first.
+   *
+   * It costs latency only while the worker is following a run it just
+   * advanced: the pause is skipped as soon as the loop sees work from
+   * another run (a backlog), and resumes when the queue next runs dry.
+   *
+   * Set to `0` to disable it entirely and restore the pre-0.4.4 behaviour
+   * (lowest latency for a single-worker deployment; a multi-worker one
+   * goes back to pinning each run to one worker).
+   */
+  postJobYieldMs?: number;
+
   /** Stale lease threshold in milliseconds (default: 300_000). */
   staleLeaseThresholdMs?: number;
 
@@ -97,6 +123,7 @@ class NodeHostImpl implements NodeHost {
   private readonly workerId: string;
   private readonly orchestrationIntervalMs: number;
   private readonly jobPollIntervalMs: number;
+  private readonly postJobYieldMs: number;
   private readonly staleLeaseThresholdMs: number;
   private readonly maxClaimsPerTick: number;
   private readonly maxSuspendedChecksPerTick: number;
@@ -111,6 +138,7 @@ class NodeHostImpl implements NodeHost {
     this.workerId = config.workerId;
     this.orchestrationIntervalMs = config.orchestrationIntervalMs ?? 10_000;
     this.jobPollIntervalMs = config.jobPollIntervalMs ?? 1_000;
+    this.postJobYieldMs = config.postJobYieldMs ?? this.jobPollIntervalMs;
     this.staleLeaseThresholdMs =
       config.staleLeaseThresholdMs ?? HOST_DEFAULTS.staleLeaseThresholdMs;
     this.maxClaimsPerTick =
@@ -280,20 +308,35 @@ class NodeHostImpl implements NodeHost {
   // --------------------------------------------------------------------------
 
   private async processJobs(): Promise<void> {
+    // Run of the job this loop completed last, and whether the queue has
+    // since handed it work from a different run. Together they separate
+    // "I am following the run I just advanced" (yield, so another worker
+    // gets a fair shot at the stage this process enqueued) from "I am
+    // draining a backlog" (don't — the queue has work of its own and the
+    // pause would be pure latency). Both reset when the queue runs dry.
+    let lastRunId: string | null = null;
+    let drainingBacklog = false;
+
     while (this.running) {
       try {
         const job = await this.jobTransport.dequeue();
 
         if (!job) {
+          lastRunId = null;
+          drainingBacklog = false;
           await this.sleep(this.jobPollIntervalMs);
           continue;
+        }
+
+        if (lastRunId !== null && job.workflowRunId !== lastRunId) {
+          drainingBacklog = true;
         }
 
         // Dispatch job.execute under a lease heartbeat and route the
         // outcome (complete/suspend/fail + terminal run.transition) — see
         // executeJobWithHeartbeat in @bratsos/workflow-engine/kernel for
         // the shared command sequence.
-        await executeJobWithHeartbeat(this.kernel, {
+        const outcome = await executeJobWithHeartbeat(this.kernel, {
           jobTransport: this.jobTransport,
           job,
           jobHeartbeatIntervalMs: this.jobHeartbeatIntervalMs,
@@ -301,9 +344,24 @@ class NodeHostImpl implements NodeHost {
         });
 
         this.jobsProcessed++;
+        lastRunId = job.workflowRunId;
+
+        // Only a completed job enqueues its successor from this process
+        // (a retry re-queues itself with backoff, a suspension waits on a
+        // poll deadline, a terminal failure enqueues nothing), so that is
+        // the only outcome worth yielding after.
+        if (
+          outcome.outcome === "completed" &&
+          !drainingBacklog &&
+          this.postJobYieldMs > 0
+        ) {
+          await this.sleep(Math.random() * this.postJobYieldMs);
+        }
       } catch (error) {
         // Job processing errors are non-fatal — back off and retry
         console.error("[NodeHost] Job processing error:", error);
+        lastRunId = null;
+        drainingBacklog = false;
         await this.sleep(5_000);
       }
     }

@@ -42,6 +42,7 @@ Creates a new Node host instance.
 | `workerId` | `string` | required | Unique worker identifier |
 | `orchestrationIntervalMs` | `number` | `10_000` | Interval for claim/poll/reap/flush orchestration tick |
 | `jobPollIntervalMs` | `number` | `1_000` | Interval for polling job queue when empty |
+| `postJobYieldMs` | `number` | `jobPollIntervalMs` | Upper bound on the randomised pause after a completed job (`0` disables it) |
 | `staleLeaseThresholdMs` | `number` | `60_000` | Time before a job lease is considered stale |
 | `maxClaimsPerTick` | `number` | `10` | Max pending runs to claim per orchestration tick |
 | `maxSuspendedChecksPerTick` | `number` | `10` | Max suspended stages to poll per tick |
@@ -89,8 +90,17 @@ The host runs two concurrent loops:
    - On suspension: mark suspended with next poll time
    - On failure: mark failed with retry flag
    - Sleep `jobPollIntervalMs` when queue is empty
+   - After a completed job, pause for a uniform draw over `[0, postJobYieldMs)` — unless draining a backlog
 
 Signal handlers (`SIGTERM`, `SIGINT`) automatically call `stop()` for graceful shutdown. `stop()` lets the in-flight orchestration tick and the job in flight finish (each up to `shutdownTimeoutMs`) and then flushes the outbox once more, bounded by the same timeout, so `workflow:completed` for a run this process finished reaches the `EventSink` (and your plugins) here rather than in whichever process ticks next. Flush errors are logged, not thrown. Set `flushOutboxOnStop: false` when another process owns event publication.
+
+### Spreading one run across workers
+
+The host that completes a job is the one that dispatches `run.transition`, so it enqueues the next execution group from its own process. Before 0.4.4 it then went straight back to `dequeue()` while every other worker was still parked in its `jobPollIntervalMs` timer, and won the stage it had just created almost every time — a sequential pipeline ran end-to-end on a single worker however many were alive.
+
+The loop now pauses for a uniform draw over `[0, postJobYieldMs)` after a **completed** job (the only outcome that enqueues a successor from this process), giving this worker the same phase as every competitor. `postJobYieldMs` defaults to `jobPollIntervalMs`; set it to `0` to turn the pause off (lowest latency for a single-worker deployment, at the cost of pinning each run to one worker again).
+
+The pause is skipped while the loop is draining a backlog: once `dequeue()` hands it a job from a run other than the one it just completed, it stops pausing until the queue comes back empty, so a queue with real work in it costs at most one pause rather than one per job.
 
 On failure, the job loop marks the job failed with a retry flag while the job has attempts left (`maxAttempts` on the transport); the kernel has already left the stage `PENDING` with the error, and the queue re-delivers it with backoff. Once the attempts are exhausted the stage is `FAILED` and `run.transition` is dispatched immediately.
 
