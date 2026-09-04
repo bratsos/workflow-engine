@@ -992,6 +992,53 @@ npx prisma migrate deploy
 npx prisma generate
 ```
 
+## Transactional enqueue from SQL (PostgreSQL)
+
+`workflow_engine_enqueue` creates a workflow run from SQL, inside the caller's
+own transaction, so a database trigger or a non-TypeScript service can schedule
+work atomically with the rows that justify it. It ships as SQL in the package
+(`sql/enqueue.sql`), not as something the engine creates at runtime, so the
+consumer's migration owns it.
+
+```bash
+psql "$DATABASE_URL" -f node_modules/@bratsos/workflow-engine/sql/enqueue.sql
+```
+
+```sql
+workflow_engine_enqueue(
+  p_idempotency_key    text,
+  p_workflow_id        text,
+  p_workflow_name      text,
+  p_input              jsonb,
+  p_config             jsonb   DEFAULT '{}'::jsonb,
+  p_priority           integer DEFAULT 5,
+  p_definition_version text    DEFAULT NULL
+) RETURNS text
+```
+
+It writes exactly what `run.create` writes, in the same order — the idempotency
+key, the run, the `workflow:created` outbox event — and leaves the run `PENDING`
+for `run.claimPending`. Replaying one key returns the same run id.
+`sql-enqueue.test.ts` (gated on `DATABASE_URL`) creates one run each way and
+asserts the rows, idempotency results and outbox events agree, and that both
+execute to the same output; that is what stops the two paths drifting.
+
+Three things it cannot do:
+
+- **Validate the input.** No Zod in SQL. Bad input fails at the first stage as
+  a failed run rather than at enqueue.
+- **Stamp the definition version.** It is a SHA-256 of the TypeScript
+  definition snapshot. The default is an unpinned run (`definitionVersion`
+  NULL), claimable by any host. Pass `p_definition_version` when the caller
+  knows it; the function refuses unless the `workflow_definitions` row already
+  exists, because pinning to an unregistered version strands the run.
+- **Merge stage config defaults.** It stores `p_config` verbatim. Behaviour is
+  unaffected because each stage re-parses its config slice through its own
+  schema at execution, applying the same defaults; only the stored column
+  differs.
+
+Requires PostgreSQL 13+ (built-in `gen_random_uuid()`).
+
 ## Performance Considerations
 
 ### Indexes
