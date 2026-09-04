@@ -19,7 +19,14 @@ pnpm lint        # biome check
 pnpm lint:fix     # biome check --write
 ```
 
-Postgres-backed persistence tests (`packages/workflow-engine/src/__tests__/12-persistence-adapters/prisma-postgres-conformance.test.ts`) are skipped unless `DATABASE_URL` is set. To run them locally:
+Postgres-backed persistence tests (`prisma-postgres-conformance.test.ts` and
+`sql-enqueue.test.ts`, both under
+`packages/workflow-engine/src/__tests__/12-persistence-adapters/`) are skipped
+unless `DATABASE_URL` is set. They share one database and each truncates the
+tables between cases, so `test:pg` runs them with `--no-file-parallelism`; run
+any new Postgres-backed file through that script rather than on its own, or the
+suites will delete each other's rows and fail in ways that look like adapter
+bugs. To run them locally:
 
 ```bash
 export DATABASE_URL=postgresql://postgres:postgres@localhost:5432/workflow_engine_test
