@@ -143,4 +143,4 @@ To protect against unexpected charges, **workflow-engine** enforces strict **`ma
     }
   }
   ```
-* If OpenRouter tries to route your call to a host provider that charges more than your model configuration defines, the call is rejected. This prevents silent billing increases and guarantees predictable AI spending.
+* If OpenRouter tries to route your call to a host provider that charges more than your model configuration defines, OpenRouter rejects the call rather than serving it at the higher price. That bounds the per-token price of a routed call to what the registry says; it is not a spend cap, and it does not apply to non-token charges, which OpenRouter documents as not discounted and not covered by `max_price`.
