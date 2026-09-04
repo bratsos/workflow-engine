@@ -81,7 +81,7 @@ export function streamText(
     modelId: modelConfig.id,
     prompt:
       promptForLog.substring(0, 500) + (promptForLog.length > 500 ? "..." : ""),
-    temperature: options.temperature ?? 0.7,
+    temperature: options.temperature,
     maxTokens: options.maxTokens,
     hasTools,
     hasInstructions: !!input.instructions,
@@ -169,7 +169,10 @@ export function streamText(
   // Build the streamText params based on input type
   const baseParams = {
     model,
-    temperature: options.temperature ?? 0.7,
+    // Sent only when the caller sets it (see generate.ts).
+    ...(options.temperature !== undefined && {
+      temperature: options.temperature,
+    }),
     maxOutputTokens: options.maxTokens,
     ...(options.maxRetries !== undefined && {
       maxRetries: options.maxRetries,
