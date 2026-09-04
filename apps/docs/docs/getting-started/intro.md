@@ -144,13 +144,14 @@ boundary, not only the realtime one.
 - **No per-tenant concurrency, throttle, rate limit, debounce or priority
   key.** The Postgres queue has priority and an opt-in per-group concurrency
   cap; it has nothing like Inngest's or Hatchet's CEL-keyed flow control.
-- **No step-mocking test utilities** in the shape of Cloudflare's
-  `mockStepResult()` / `mockStepError()` / `forceStepTimeout()`. The clock is
-  an injected port, so `FakeClock.advance(ms)` skips a sleep or a poll
-  interval, and `createTestHarness` runs a whole workflow in memory; what is
-  missing is per-step stubbing and a replay-against-recorded-history harness.
-  `shadowRuns` / `shadowVersions` check a candidate build against runs that
-  already exist, which is the nearer equivalent.
+- **No replay-against-recorded-history test harness.** Per-step stubbing does
+  exist, in the shape of Cloudflare's: `harness.steps.mockResult(id, value)`,
+  `.mockError(id, error)` and `.mockTimeout(id)`, plus `.skipSleeps()`. The
+  clock is an injected port, so `FakeClock.advance(ms)` skips a sleep or a
+  poll interval, and `createTestHarness` runs a whole workflow in memory.
+  What is missing is replaying a build against the recorded history of runs
+  that already happened; `shadowRuns` / `shadowVersions` check a candidate
+  build against existing runs, which is the nearer equivalent.
 - **TypeScript only**, and alpha.
 
 ---
