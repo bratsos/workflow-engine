@@ -251,6 +251,18 @@ enum Status {
 
 `LogLevel` and `ArtifactType` are **not** enums -- `WorkflowLog.level` and `WorkflowArtifact.type` are plain `String` columns (the engine validates the values at the TypeScript layer).
 
+### Timestamps
+
+Every `DateTime` below is a plain Prisma `DateTime` -- on Postgres a naive
+`timestamp(3)` holding UTC. Keep it that way: **do not** map these columns to
+`@db.Timestamptz`. The adapters' raw statements (the `FOR UPDATE SKIP LOCKED`
+claim and dequeue, the outbox claim) convert their bound timestamps with
+`AT TIME ZONE 'UTC'` so they agree with what the Prisma model API writes to
+the same columns, which is what makes lease expiry and the stale-job sweep
+work on a session in *any* timezone without the consumer setting anything. A
+`@db.Timestamptz` mapping puts the two writers back out of step and crash
+recovery stops happening -- see [Troubleshooting](09-troubleshooting.md#crash-recovery-never-happens-non-utc-postgres-session).
+
 ### WorkflowRun Model
 
 ```prisma

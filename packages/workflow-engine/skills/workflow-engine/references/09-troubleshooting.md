@@ -79,6 +79,16 @@ await kernel.dispatch({ type: "run.transition", workflowRunId: runId });
 
 `run.reapStuck`'s PENDING-stage-without-job sweep remains the backstop for a job lost after the commit (a transport error, a process death); the enqueue is idempotent on `(workflowRunId, stageId)`, so the sweep cannot double-queue.
 
+## Crash Recovery Never Happens (Non-UTC Postgres Session)
+
+**Symptom:** a killed worker's job stays `RUNNING` forever. `lease.reapStale` / `releaseStaleJobs` report 0 released no matter how long you wait, `job_queue.lockedAt` reads hours ahead of `createdAt` on the same row, and a `touchJob` heartbeat appears to move the lease *backwards*. Only on a database or session whose `TimeZone` is not UTC.
+
+**What it was:** the raw `FOR UPDATE SKIP LOCKED` statements bound a JS `Date`, which Prisma sends as a `timestamptz`. Assigning that to the naive `timestamp` columns the schema declares -- or comparing the two -- converts it through the *session's* timezone, while everything Prisma's model API writes to the same columns is UTC. On `Europe/Zurich` every raw-written timestamp landed two hours in the future, so a lease could never look stale. (`NOW()` is wrong the same way.)
+
+**How it's fixed:** every raw statement converts its bound timestamps explicitly -- `$n::timestamptz AT TIME ZONE 'UTC'` -- so `job_queue.lockedAt`/`startedAt`, `workflow_runs.startedAt`/`updatedAt` and `outbox_events.publishedAt` mean the same thing as the columns Prisma writes, on any session timezone, with nothing for you to set. The Postgres conformance suite runs the lease sweep on a session pinned to `Pacific/Kiritimati` to keep it that way.
+
+**Check your own schema:** the engine's timestamp columns must stay plain Prisma `DateTime` (naive `timestamp`), as the shipped `prisma/schema.prisma` declares them. Mapping them to `@db.Timestamptz` re-introduces the skew in the opposite direction.
+
 ## One Bad Run Blocks Everything
 
 **Symptom (old):** A single run with corrupt state would cause `run.claimPending` to throw, which blocked the entire orchestration tick — including outbox flush, stale lease reaping, and suspended stage polling.

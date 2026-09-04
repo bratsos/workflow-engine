@@ -41,7 +41,9 @@ export interface PrismaJobQueueOptions {
   databaseType?: DatabaseType;
   /**
    * Time source for the timestamps the raw dequeue statement writes.
-   * Defaults to `() => new Date()`; bound as a parameter, never `NOW()`.
+   * Defaults to `() => new Date()`; bound as a parameter and converted
+   * with `AT TIME ZONE 'UTC'`, never `NOW()` and never session-local
+   * (see utc-timestamps.ts).
    */
   now?: () => Date;
 }
@@ -223,6 +225,11 @@ export class PrismaJobQueue implements JobQueue {
         );
       }
       const now = this.now();
+      // `AT TIME ZONE 'UTC'` on every bound Date: without it Postgres
+      // converts the timestamptz parameter into the naive `timestamp`
+      // columns through the *session* timezone, so on a non-UTC session
+      // `lockedAt` lands in the future and its lease never goes stale
+      // (see utc-timestamps.ts).
       const result = await this.prisma.$queryRaw<
         Array<{
           id: string;
@@ -238,13 +245,14 @@ export class PrismaJobQueue implements JobQueue {
         SET
           status = 'RUNNING',
           "workerId" = ${this.workerId},
-          "lockedAt" = ${now},
-          "startedAt" = ${now},
+          "lockedAt" = ${now}::timestamptz AT TIME ZONE 'UTC',
+          "startedAt" = ${now}::timestamptz AT TIME ZONE 'UTC',
           attempt = attempt + 1
         WHERE id = (
           SELECT id FROM "job_queue"
           WHERE status = 'PENDING'
-            AND ("nextPollAt" IS NULL OR "nextPollAt" <= ${now})
+            AND ("nextPollAt" IS NULL
+                 OR "nextPollAt" <= ${now}::timestamptz AT TIME ZONE 'UTC')
           ORDER BY priority DESC, "createdAt" ASC
           LIMIT 1
           FOR UPDATE SKIP LOCKED

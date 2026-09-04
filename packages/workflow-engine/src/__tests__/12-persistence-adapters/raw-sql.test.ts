@@ -1,8 +1,10 @@
 /**
  * The Prisma adapters' raw Postgres statements: the status enum's type name
- * is configurable (`statusEnumName`) and every timestamp is a bound JS Date
- * from the injected clock, never `NOW()` (which writes session-local time
- * into naive TIMESTAMP columns while Prisma writes UTC).
+ * is configurable (`statusEnumName`), and every timestamp is a bound JS Date
+ * from the injected clock converted with `AT TIME ZONE 'UTC'` -- never
+ * `NOW()` and never a bare parameter, both of which write session-local time
+ * into the naive TIMESTAMP columns Prisma fills with UTC (see
+ * persistence/prisma/utc-timestamps.ts).
  */
 
 import { describe, expect, it, vi } from "vitest";
@@ -33,6 +35,8 @@ describe("PrismaWorkflowPersistence.claimNextPendingRun raw SQL", () => {
     expect(sql).toContain('$2::"WorkflowStatus"');
     expect(sql).not.toContain('"Status"');
     expect(sql).not.toContain("NOW()");
+    expect(sql).toContain(`"startedAt" = ($3::timestamptz AT TIME ZONE 'UTC')`);
+    expect(sql).toContain(`"updatedAt" = ($3::timestamptz AT TIME ZONE 'UTC')`);
     expect(params).toEqual(["PENDING", "RUNNING", now]);
   });
 
@@ -68,6 +72,7 @@ describe("PrismaWorkflowPersistence.claimNextPendingRun raw SQL", () => {
     const sql = strings.join("?");
     expect(sql).toContain('::"Status"');
     expect(sql).not.toContain("NOW()");
+    expect(sql).toContain("AT TIME ZONE 'UTC'");
     expect(values.filter((v) => v instanceof Date)).toHaveLength(2);
   });
 
@@ -112,6 +117,10 @@ describe("PrismaJobQueue.dequeue raw SQL", () => {
     ];
     const sql = strings.join("?");
     expect(sql).not.toContain("NOW()");
+    // Both lease columns and the nextPollAt comparison go through the
+    // explicit UTC conversion, so they mean the same thing as the values
+    // Prisma's model API writes on any session timezone.
+    expect(sql.match(/AT TIME ZONE 'UTC'/g)).toHaveLength(3);
     expect(values.filter((v) => v === now)).toHaveLength(3);
   });
 });
@@ -205,7 +214,9 @@ describe("PrismaWorkflowPersistence.claimUnpublishedOutboxEvents raw SQL", () =>
     ];
     expect(sql).toContain("FOR UPDATE SKIP LOCKED");
     expect(sql).toContain('"publishedAt" IS NULL AND "dlqAt" IS NULL');
-    expect(sql).toContain('SET "publishedAt" = $2');
+    expect(sql).toContain(
+      `SET "publishedAt" = ($2::timestamptz AT TIME ZONE 'UTC')`,
+    );
     expect(sql).toContain("RETURNING");
     expect(sql).not.toContain("NOW()");
     expect(params).toEqual([25, now]);

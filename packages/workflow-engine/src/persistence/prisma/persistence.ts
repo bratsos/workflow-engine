@@ -27,6 +27,7 @@ import type {
 import { StaleVersionError } from "../interface";
 import { createEnumHelper, type PrismaEnumHelper } from "./enum-compat";
 import type { EnginePrismaClient } from "./prisma-client-type";
+import { utcTimestampParam } from "./utc-timestamps";
 
 // Structural client type -- see prisma-client-type.ts. Kept as a local
 // alias so the rest of this file (and its many `PrismaClient`-typed
@@ -267,9 +268,11 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     //
     // The enum type name is an identifier, which a tagged template cannot
     // bind, so the statement is built as text with positional parameters
-    // for every value. Timestamps are bound JS Dates (UTC, and from the
-    // injected clock), never `NOW()`, which writes session-local time into
-    // naive TIMESTAMP columns.
+    // for every value. Timestamps are bound JS Dates from the injected
+    // clock and converted with `AT TIME ZONE 'UTC'` -- never `NOW()`, and
+    // never a bare parameter, both of which write session-local time into
+    // the naive TIMESTAMP columns Prisma fills with UTC (see
+    // utc-timestamps.ts).
     const pending = this.enums.status("PENDING");
     const running = this.enums.status("RUNNING");
     let results: any[];
@@ -286,8 +289,8 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
         )
         UPDATE "workflow_runs"
         SET status = $2::${enumType},
-            "startedAt" = $3,
-            "updatedAt" = $3,
+            "startedAt" = ${utcTimestampParam(3)},
+            "updatedAt" = ${utcTimestampParam(3)},
             version = version + 1
         FROM claimed
         WHERE "workflow_runs".id = claimed.id
@@ -313,8 +316,8 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
         )
         UPDATE "workflow_runs"
         SET status = ${running}::"Status",
-            "startedAt" = ${now},
-            "updatedAt" = ${now},
+            "startedAt" = ${now}::timestamptz AT TIME ZONE 'UTC',
+            "updatedAt" = ${now}::timestamptz AT TIME ZONE 'UTC',
             version = version + 1
         FROM claimed
         WHERE "workflow_runs".id = claimed.id
@@ -1028,7 +1031,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
           FOR UPDATE SKIP LOCKED
         )
         UPDATE "outbox_events"
-        SET "publishedAt" = $2
+        SET "publishedAt" = ${utcTimestampParam(2)}
         FROM claimed
         WHERE "outbox_events".id = claimed.id
         RETURNING "outbox_events".*`,

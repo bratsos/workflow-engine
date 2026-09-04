@@ -14,10 +14,12 @@
  * PG-only extras kept here (not portable to the in-memory fake, so not
  * part of the shared suite): the raw `FOR UPDATE SKIP LOCKED` claim/dequeue
  * queries, an outbox sequence race under real concurrent connections, a
- * real optimistic-lock `UPDATE ... WHERE version = ?`, and a `Status`
- * enum round-trip through the actual Postgres enum column -- plus one
- * kernel-level end-to-end smoke test wiring `createKernel` to these same
- * Prisma adapters and driving it the way a host does.
+ * real optimistic-lock `UPDATE ... WHERE version = ?`, a `Status` enum
+ * round-trip through the actual Postgres enum column, the lease sweep on a
+ * session deliberately not on UTC, and the claim/enqueue race under a fast
+ * job loop (both need real transactions and a real session timezone) --
+ * plus one kernel-level end-to-end smoke test wiring `createKernel` to
+ * these same Prisma adapters and driving it the way a host does.
  *
  * Requires:
  *   - DATABASE_URL pointing at a Postgres database
@@ -406,6 +408,123 @@ if (!DATABASE_URL) {
         expect(
           runsForWorkflow.filter((r) => r.workflowId === workflow.id),
         ).toHaveLength(1);
+      });
+    });
+
+    // ==========================================================================
+    // Session timezone independence (PG-only): every timestamp a raw
+    // statement writes or compares must mean the same thing as one written
+    // through the Prisma model API, whatever `TimeZone` the session is set
+    // to. Prisma binds a JS Date as a `timestamptz`; assigning that to the
+    // naive `timestamp` columns the schema declares converts it through the
+    // session timezone, so on a non-UTC session `lockedAt` landed in the
+    // future, no lease ever went stale, and a crashed worker's job was
+    // never released -- crash recovery silently did not work.
+    // ==========================================================================
+
+    describe("session timezone independence", () => {
+      // UTC+14, no DST: a session-timezone slip shows up as a 14-hour jump,
+      // and the case still proves its point on a database whose own default
+      // timezone is already something other than UTC.
+      const tzUrl = new URL(DATABASE_URL);
+      tzUrl.searchParams.set("options", "-c timezone=Pacific/Kiritimati");
+      tzUrl.searchParams.set("connection_limit", "1");
+      const tzPrisma = new PrismaClient({ datasourceUrl: tzUrl.toString() });
+
+      beforeEach(async () => {
+        await truncateAll();
+      });
+
+      afterAll(async () => {
+        await tzPrisma.$disconnect();
+      });
+
+      it("runs its statements on a session that is not on UTC", async () => {
+        const rows = (await tzPrisma.$queryRawUnsafe(
+          `SELECT current_setting('TimeZone') AS tz`,
+        )) as Array<{ tz: string }>;
+        expect(rows[0]?.tz).toBe("Pacific/Kiritimati");
+      });
+
+      it("releases a crashed worker's lease on a non-UTC session", async () => {
+        const queue = createPrismaJobQueue(tzPrisma, { workerId: "tz-worker" });
+        const runId = "tz-stale-run";
+        await queue.enqueueParallel([
+          {
+            workflowRunId: runId,
+            workflowId: "tz-workflow",
+            stageId: "tz-stage",
+            payload: {},
+          },
+        ]);
+
+        const before = Date.now();
+        const dequeued = await queue.dequeue();
+        expect(dequeued).not.toBeNull();
+
+        // The lease the raw dequeue wrote must be *now*, not now shifted by
+        // the session's offset.
+        const [locked] = await queue.getJobsByWorkflowRun(runId);
+        expect(locked?.status).toBe("RUNNING");
+        expect(
+          Math.abs((locked?.lockedAt?.getTime() ?? 0) - before),
+        ).toBeLessThan(60_000);
+
+        // ...so the sweep that recovers a dead worker's job actually sees it.
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        const released = await queue.releaseStaleJobs(100);
+        expect(released).toBeGreaterThanOrEqual(1);
+
+        const [after] = await queue.getJobsByWorkflowRun(runId);
+        expect(after?.status).toBe("PENDING");
+        expect(after?.lockedAt).toBeNull();
+        expect(after?.workerId).toBeNull();
+      });
+
+      it("keeps a touched lease ahead of the lease it replaced on a non-UTC session", async () => {
+        const queue = createPrismaJobQueue(tzPrisma, { workerId: "tz-worker" });
+        const runId = "tz-touch-run";
+        const [jobId] = await queue.enqueueParallel([
+          {
+            workflowRunId: runId,
+            workflowId: "tz-workflow",
+            stageId: "tz-stage",
+            payload: {},
+          },
+        ]);
+        await queue.dequeue();
+        const [before] = await queue.getJobsByWorkflowRun(runId);
+
+        // touchJob writes through the Prisma model API; the dequeue wrote
+        // its lease with a raw statement. They must agree.
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        await queue.touchJob(jobId!);
+
+        const [after] = await queue.getJobsByWorkflowRun(runId);
+        expect(after?.lockedAt?.getTime() ?? 0).toBeGreaterThan(
+          before?.lockedAt?.getTime() ?? 0,
+        );
+      });
+
+      it("claims a pending run with a UTC startedAt on a non-UTC session", async () => {
+        const persistence = createPrismaWorkflowPersistence(tzPrisma);
+        const run = await persistence.createRun({
+          workflowId: "tz-claim-workflow",
+          workflowName: "TZ Claim",
+          workflowType: "tz",
+          input: { value: "x" },
+        });
+
+        const claimed = await persistence.claimNextPendingRun();
+        expect(claimed?.id).toBe(run.id);
+        // `createdAt` is Postgres' own default; `startedAt`/`updatedAt` come
+        // from the raw claim statement. They must be on the same clock.
+        expect(
+          (claimed?.startedAt?.getTime() ?? 0) - run.createdAt.getTime(),
+        ).toBeLessThan(60_000);
+        expect(
+          (claimed?.startedAt?.getTime() ?? 0) - run.createdAt.getTime(),
+        ).toBeGreaterThanOrEqual(0);
       });
     });
 
