@@ -297,6 +297,14 @@ export function createGoogleBatchFetch(
   base: FetchLike | undefined,
   schemasByKey: ReadonlyMap<string, Record<string, unknown>>,
   onFileUpload?: () => void,
+  /**
+   * Rewrites the creation body in place (the engine stamps the durable
+   * step's external key over the SDK's generated `batch.displayName`, which
+   * is what makes a crashed Google submit recoverable) and reports whether
+   * it changed anything. Applies to both the inline and the file-upload
+   * creation, which send the same `batch` envelope.
+   */
+  stampBody?: (body: unknown) => boolean,
 ): FetchLike {
   const underlying: FetchLike = base ?? ((input, init) => fetch(input, init));
   return async (input, init) => {
@@ -308,7 +316,7 @@ export function createGoogleBatchFetch(
           : input.url;
     if (
       !url.includes(":batchGenerateContent") ||
-      schemasByKey.size === 0 ||
+      (schemasByKey.size === 0 && stampBody === undefined) ||
       typeof init?.body !== "string"
     ) {
       return underlying(input, init);
@@ -319,16 +327,19 @@ export function createGoogleBatchFetch(
     } catch {
       return underlying(input, init);
     }
+    let changed = stampBody?.(parsed) === true;
     const body = parsed as {
       batch?: { inputConfig?: { fileName?: string } };
     };
     if (body?.batch?.inputConfig?.fileName !== undefined) {
       onFileUpload?.();
-      return underlying(input, init);
+    } else if (
+      schemasByKey.size > 0 &&
+      rewriteGoogleBatchBody(parsed, schemasByKey) > 0
+    ) {
+      changed = true;
     }
-    if (rewriteGoogleBatchBody(parsed, schemasByKey) === 0) {
-      return underlying(input, init);
-    }
+    if (!changed) return underlying(input, init);
     return underlying(input, { ...init, body: JSON.stringify(parsed) });
   };
 }

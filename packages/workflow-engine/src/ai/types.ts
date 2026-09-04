@@ -442,10 +442,39 @@ export interface AIBatchHandle {
   error?: string;
 }
 
+/** How a replayed submit behaves after a worker crashed mid-submission. */
+export type BatchReclaimPolicy = "adopt" | "resubmit";
+
+/** Crash-recovery inputs for one `AIBatch.submit` call. */
+export interface AIBatchSubmitOptions {
+  /**
+   * Deterministic key naming this submission, from a durable step's
+   * `StepRunContext.externalKey`. Stamped into provider-side metadata (one
+   * sub-key per partition) so a replay can find what was already created.
+   */
+  externalKey?: string;
+  /**
+   * True when this call is a replay of a submit whose outcome was never
+   * recorded — a worker died with the lease held. Only then does the engine
+   * search the provider before creating anything.
+   */
+  recovering?: boolean;
+  /**
+   * `"adopt"` (default): on a recovering submit, adopt the batch already
+   * carrying the external key, and fail with `BatchNotAdoptableError` when
+   * the transport has no searchable field. `"resubmit"`: create a new batch
+   * regardless, accepting that the earlier one is orphaned and still billed.
+   */
+  onReclaim?: BatchReclaimPolicy;
+}
+
 /** Interface for batch operations on an AI model */
 export interface AIBatch<T = string> {
   /** Submit requests for batch processing */
-  submit(requests: AIBatchRequest[]): Promise<AIBatchHandle>;
+  submit(
+    requests: AIBatchRequest[],
+    options?: AIBatchSubmitOptions,
+  ): Promise<AIBatchHandle>;
   /** Check the status of a batch */
   getStatus(
     batchId: string,

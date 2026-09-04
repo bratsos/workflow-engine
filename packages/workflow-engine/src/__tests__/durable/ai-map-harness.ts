@@ -48,6 +48,13 @@ registerModels({
 });
 
 export interface FakeBackendOptions {
+  /**
+   * Whether the transport can find a batch it already created from the
+   * engine's external key. `true` (default) models OpenAI/Gemini, which
+   * carry the key in `metadata`/`displayName`; `false` models Anthropic
+   * Message Batches and OpenRouter, which carry nothing searchable.
+   */
+  adoptable?: boolean;
   /** How many status polls report "pending" before "completed". */
   pendingPolls?: number;
   /** Report the batch as failed with this error. */
@@ -62,6 +69,10 @@ export interface FakeBackendOptions {
 /** Adapted from batch-resume.test.ts: echoes what was submitted, per partition. */
 export function makeFakeBackend(opts: FakeBackendOptions = {}) {
   const byBatch = new Map<string, string[]>();
+  /** Batch id per external key, i.e. what the provider would let us search. */
+  const byExternalKey = new Map<string, string>();
+  const adoptedKeys: string[] = [];
+  let adoptable = opts.adoptable ?? true;
   let n = 0;
   let polls = 0;
   const respond = opts.respond ?? ((id) => JSON.stringify({ v: id }));
@@ -69,13 +80,38 @@ export function makeFakeBackend(opts: FakeBackendOptions = {}) {
   const model: EngineBatchModel = {
     provider: "openrouter",
     modelId: "openai/gpt-4o",
-    start: vi.fn(async (requests: Array<{ id: string }>) => {
-      n += 1;
-      const id = `batch-${n}`;
-      byBatch.set(
-        id,
-        requests.map((r) => r.id),
-      );
+    get recovery() {
+      return adoptable ? ("metadata" as const) : ("none" as const);
+    },
+    start: vi.fn(
+      async (
+        requests: Array<{ id: string }>,
+        startOpts?: { externalKey?: string },
+      ) => {
+        n += 1;
+        const id = `batch-${n}`;
+        byBatch.set(
+          id,
+          requests.map((r) => r.id),
+        );
+        // Stand-in for the provider-side field the real adapters stamp.
+        if (startOpts?.externalKey)
+          byExternalKey.set(startOpts.externalKey, id);
+        return {
+          version: 1 as const,
+          type: "text" as const,
+          id,
+          provider: "openrouter",
+          modelId: "openai/gpt-4o",
+          status: "pending" as const,
+        };
+      },
+    ),
+    adopt: vi.fn(async (externalKey: string) => {
+      if (!adoptable) return null;
+      const id = byExternalKey.get(externalKey);
+      if (!id) return null;
+      adoptedKeys.push(externalKey);
       return {
         version: 1 as const,
         type: "text" as const,
@@ -127,7 +163,18 @@ export function makeFakeBackend(opts: FakeBackendOptions = {}) {
       }
     }),
   };
-  return { model, byBatch, polls: () => polls };
+  return {
+    model,
+    byBatch,
+    polls: () => polls,
+    /** External keys the replay adopted instead of creating a second batch. */
+    adopted: () => [...adoptedKeys],
+    /** Batch ids by the external key their creation carried. */
+    byExternalKey,
+    setAdoptable: (value: boolean) => {
+      adoptable = value;
+    },
+  };
 }
 
 /**

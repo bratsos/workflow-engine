@@ -14,6 +14,7 @@ import type {
   AIObjectResult,
   AITextResult,
   BatchOptions,
+  BatchReclaimPolicy,
   ObjectOptions,
   StreamOptions,
   TextInput,
@@ -57,6 +58,18 @@ export interface AiMapSpec<TIn, TOut> {
      * item as failed with that error.
      */
     onExpiry?: "fail" | "partial";
+    /**
+     * What a replayed submit does when the worker that submitted died before
+     * the ledger recorded it.
+     *
+     * `"adopt"` (default) searches the provider for the batch carrying this
+     * step's external key and continues from it; when the transport has no
+     * field the engine can stamp and search (Anthropic Message Batches,
+     * OpenRouter) it throws `BatchNotAdoptableError` rather than paying for a
+     * second batch. `"resubmit"` restores the pre-1.0.0-alpha.9 behaviour:
+     * submit again and leave the first batch orphaned and billed.
+     */
+    onReclaim?: BatchReclaimPolicy;
   };
   realtime?: {
     /** In-process concurrency for realtime calls. Defaults to 10. */

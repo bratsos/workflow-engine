@@ -48,16 +48,51 @@ export type EngineBatchItemResult =
       outputTokens?: number;
     };
 
+/**
+ * Whether a transport can find a batch it already created after the worker
+ * that created it died.
+ *
+ * - `"metadata"`: the creation carries the engine's external key in a
+ *   provider-side field the engine can search — OpenAI's batch `metadata`,
+ *   Gemini's batch `displayName`. `adopt()` is implemented.
+ * - `"none"`: the provider offers neither request idempotency the engine can
+ *   rely on nor a searchable field. A re-submit would create and bill a
+ *   second batch, so the engine refuses instead (Anthropic Message Batches
+ *   carry no metadata; OpenRouter's beta batch body takes only `endpoint`,
+ *   `model` and `requests`).
+ */
+export type EngineBatchRecovery = "metadata" | "none";
+
+export interface EngineBatchStartOptions {
+  abortSignal?: AbortSignal;
+  headers?: Record<string, string>;
+  /**
+   * Deterministic key naming this batch, from `StepRunContext.externalKey`.
+   * Adapters stamp it into whatever provider-side field survives creation so
+   * `adopt()` can find the batch again after a crash.
+   */
+  externalKey?: string;
+}
+
 export interface EngineBatchModel {
   readonly provider: string;
   readonly modelId: string;
+  /** How, if at all, a crashed submit can be recovered on this transport. */
+  readonly recovery?: EngineBatchRecovery;
   start(
     requests: EngineBatchRequest[],
-    opts?: {
-      abortSignal?: AbortSignal;
-      headers?: Record<string, string>;
-    },
+    opts?: EngineBatchStartOptions,
   ): Promise<EngineBatchRef & EngineBatchStatus>;
+  /**
+   * Find a batch this engine already created under `externalKey`, if one
+   * exists. Implemented only when `recovery` is `"metadata"`. Returns `null`
+   * when the provider has no such batch — which, on a reclaim, means the
+   * crashed worker died before the provider accepted the creation.
+   */
+  adopt?(
+    externalKey: string,
+    opts?: { abortSignal?: AbortSignal; headers?: Record<string, string> },
+  ): Promise<(EngineBatchRef & EngineBatchStatus) | null>;
   status(
     ref: EngineBatchRef,
     opts?: {

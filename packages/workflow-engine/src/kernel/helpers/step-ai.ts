@@ -816,7 +816,7 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
 
     const submitted = await deps.run(
       `${id}:submit`,
-      async (): Promise<StoredSubmit> => {
+      async (step): Promise<StoredSubmit> => {
         const requests: AIBatchRequest[] = entries.map((e) => ({
           id: e.id,
           prompt: e.prompt as string,
@@ -829,7 +829,16 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
             ? { temperature: spec.temperature }
             : {}),
         }));
-        const handle = await batch.submit(requests);
+        // The provider bills a batch the moment it is created, so a replay
+        // of this step must find what a dead worker already created rather
+        // than create a second one. `step.externalKey` is the same on every
+        // replay; `step.isReclaim` is true only when an earlier execution of
+        // this body may have run.
+        const handle = await batch.submit(requests, {
+          externalKey: step.externalKey,
+          recovering: step.isReclaim,
+          ...(spec.batch?.onReclaim ? { onReclaim: spec.batch.onReclaim } : {}),
+        });
         return {
           handleId: handle.id,
           refs: handle.refs ?? [],

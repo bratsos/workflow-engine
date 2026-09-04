@@ -5,6 +5,7 @@
  */
 
 import { z } from "zod";
+import { stepExternalKeyPart } from "../core/step-external-key";
 import {
   getProviderModelId,
   resolveModelForProvider,
@@ -27,6 +28,7 @@ import type {
   AIBatchProvider,
   AIBatchRequest,
   AIBatchResult,
+  AIBatchSubmitOptions,
   AIHelperContext,
   BatchLogFn,
   BatchOptions,
@@ -52,6 +54,29 @@ export class BatchSubmitError extends Error {
     public readonly createdRefs: EngineBatchRef[],
   ) {
     super(message);
+  }
+}
+
+/**
+ * Thrown instead of re-creating a batch when a submit is replayed after a
+ * worker crash on a transport that cannot find what the crashed worker
+ * created. Re-submitting would create and bill a second batch nobody reads,
+ * so the engine stops and names the batch that may be running.
+ */
+export class BatchNotAdoptableError extends Error {
+  readonly name = "BatchNotAdoptableError";
+  constructor(
+    readonly provider: string,
+    readonly externalKey: string,
+  ) {
+    super(
+      `A batch submitted through "${provider}" cannot be recovered after a worker crash: ` +
+        `the transport offers neither a request-idempotency key nor a searchable metadata ` +
+        `field, so the engine cannot tell whether the batch under external key ` +
+        `"${externalKey}" already exists. Re-submitting would create and bill a second ` +
+        `batch. Check the provider for a batch created around the crash, then either ` +
+        `resume from it or set batch.onReclaim: "resubmit" to accept the duplicate cost.`,
+    );
   }
 }
 
@@ -326,7 +351,10 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
     return [ref];
   }
 
-  async submit(requests: AIBatchRequest[]): Promise<AIBatchHandle> {
+  async submit(
+    requests: AIBatchRequest[],
+    submitOptions: AIBatchSubmitOptions = {},
+  ): Promise<AIBatchHandle> {
     const seenIds = new Set<string>();
     for (const req of requests) {
       if (!req.id || typeof req.id !== "string" || req.id.trim().length === 0) {
@@ -434,11 +462,53 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
 
     // Submit partitions sequentially so a rate limit stops at partition k instead of firing all N
     const createdRefs: EngineBatchRef[] = [];
+    // A replay of a crashed submit must find what the crashed worker created
+    // before creating anything: the provider bills a batch nobody reads.
+    // Each partition gets its own sub-key, because the partitioning is
+    // deterministic and one step can fan out into several batches.
+    const externalKey = submitOptions.externalKey;
+    const onReclaim = submitOptions.onReclaim ?? "adopt";
+    const recovering =
+      submitOptions.recovering === true && externalKey !== undefined;
+    if (
+      recovering &&
+      onReclaim === "adopt" &&
+      batchModel.recovery !== "metadata"
+    ) {
+      throw new BatchNotAdoptableError(this.provider, externalKey);
+    }
     for (let i = 0; i < partitions.length; i++) {
       const partition = partitions[i]!;
+      const partitionKey =
+        externalKey !== undefined
+          ? stepExternalKeyPart(externalKey, i)
+          : undefined;
       try {
+        if (recovering && partitionKey !== undefined && batchModel.adopt) {
+          const adopted = await batchModel.adopt(partitionKey, {
+            ...(this.options?.abortSignal
+              ? { abortSignal: this.options.abortSignal }
+              : {}),
+          });
+          if (adopted) {
+            logger.debug(`adopted batch created before the worker crashed`, {
+              provider: this.provider,
+              batchId: adopted.id,
+              externalKey: partitionKey,
+            });
+            createdRefs.push({
+              version: 1,
+              type: "text",
+              id: adopted.id,
+              provider: adopted.provider,
+              modelId: adopted.modelId,
+            });
+            continue;
+          }
+        }
         const res = await batchModel.start(partition.engineRequests, {
           abortSignal: this.options?.abortSignal,
+          ...(partitionKey !== undefined ? { externalKey: partitionKey } : {}),
         });
         const ref: EngineBatchRef = {
           version: 1,
@@ -449,6 +519,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
         };
         createdRefs.push(ref);
       } catch (err) {
+        if (err instanceof BatchNotAdoptableError) throw err;
         const createdIds = createdRefs.map((r) => r.id).join(", ");
         const errMsg = `Batch submission failed at partition ${i + 1}/${partitions.length}${
           createdRefs.length > 0

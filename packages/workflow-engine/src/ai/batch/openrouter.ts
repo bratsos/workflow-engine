@@ -5,6 +5,7 @@ import {
   type EngineBatchModel,
   type EngineBatchRef,
   type EngineBatchRequest,
+  type EngineBatchStartOptions,
   type EngineBatchStatus,
   toJsonSchema,
 } from "./model";
@@ -250,13 +251,16 @@ export function createOpenRouterBatchModel(
   return {
     provider: "openrouter",
     modelId: cfg.modelId,
+    // The beta batch body takes only `endpoint`, `model` and `requests` --
+    // no metadata field the engine could stamp and search -- and there is no
+    // documented idempotency header. A crashed submit is therefore not
+    // recoverable here; `AIBatchImpl` refuses to re-create rather than pay
+    // for a second batch nobody reads.
+    recovery: "none" as const,
 
     async start(
       requests: EngineBatchRequest[],
-      opts?: {
-        abortSignal?: AbortSignal;
-        headers?: Record<string, string>;
-      },
+      opts?: EngineBatchStartOptions,
     ): Promise<EngineBatchRef & EngineBatchStatus> {
       const items = requests.map((req) => {
         const body: Record<string, unknown> = {

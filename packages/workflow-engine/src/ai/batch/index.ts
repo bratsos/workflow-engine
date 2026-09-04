@@ -5,9 +5,11 @@ export {
 export {
   type EngineBatchItemResult,
   type EngineBatchModel,
+  type EngineBatchRecovery,
   type EngineBatchRef,
   EngineBatchRefSchema,
   type EngineBatchRequest,
+  type EngineBatchStartOptions,
   type EngineBatchStatus,
   isEngineBatchRef,
   toJsonSchema,
