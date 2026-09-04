@@ -14,6 +14,7 @@ import {
   type JobAckFence,
   type JobAckOutcome,
   type JobQueue,
+  type JobQueueFairness,
   type JobRecord,
   LEASE_ABSOLUTE_CAP,
   LEASE_HEARTBEAT_LOST,
@@ -32,6 +33,44 @@ const MAX_DEQUEUE_ATTEMPTS = 10;
 
 // Structural client type -- see prisma-client-type.ts.
 type PrismaClient = EnginePrismaClient;
+
+/**
+ * Row shape returned by the raw dequeue claim UPDATE statement.
+ */
+type DequeuedJobRow = {
+  id: string;
+  workflowRunId: string;
+  stageId: string;
+  priority: number;
+  attempt: number;
+  maxAttempts: number;
+  payload: unknown;
+  startedAt: Date;
+};
+
+/**
+ * Splits a dotted payload path into the segments Postgres's `#>>` operator
+ * takes as a `text[]`. Bound as a parameter, never interpolated, so a path
+ * from configuration cannot reach the statement as SQL.
+ */
+function requireGroupLimit(maxConcurrentPerGroup: number): number {
+  if (!Number.isInteger(maxConcurrentPerGroup) || maxConcurrentPerGroup < 1) {
+    throw new Error(
+      `JobQueueFairness.maxConcurrentPerGroup must be an integer of at least 1, got ${maxConcurrentPerGroup}`,
+    );
+  }
+  return maxConcurrentPerGroup;
+}
+
+function splitGroupPath(groupBy: string): string[] {
+  const segments = groupBy.split(".").filter((s) => s.length > 0);
+  if (segments.length === 0) {
+    throw new Error(
+      `JobQueueFairness.groupBy must name at least one payload field, got ${JSON.stringify(groupBy)}`,
+    );
+  }
+  return segments;
+}
 
 export interface PrismaJobQueueOptions {
   /**
@@ -53,6 +92,13 @@ export interface PrismaJobQueueOptions {
    * `() => new Date()`.
    */
   now?: () => Date;
+  /**
+   * Per-group fairness for the dequeue. Omit (the default) and the claim
+   * statement is exactly the one shipped before 1.0.0-alpha.9: index scan,
+   * first row, no per-group accounting. See `JobQueueFairness`; PostgreSQL
+   * only.
+   */
+  fairness?: JobQueueFairness;
 }
 
 export class PrismaJobQueue implements JobQueue {
@@ -66,6 +112,8 @@ export class PrismaJobQueue implements JobQueue {
   private prisma: PrismaClient;
   private enums: PrismaEnumHelper;
   private databaseType: DatabaseType;
+  private readonly fairnessPath: string[] | null;
+  private readonly fairnessLimit: number;
 
   private readonly now: () => Date;
 
@@ -76,6 +124,17 @@ export class PrismaJobQueue implements JobQueue {
     this.enums = createEnumHelper(prisma);
     this.databaseType = options.databaseType ?? "postgresql";
     this.now = options.now ?? (() => new Date());
+    this.fairnessPath = options.fairness
+      ? splitGroupPath(options.fairness.groupBy ?? "_groupKey")
+      : null;
+    this.fairnessLimit = options.fairness
+      ? requireGroupLimit(options.fairness.maxConcurrentPerGroup)
+      : 0;
+    if (this.fairnessPath && this.databaseType === "sqlite") {
+      throw new Error(
+        "JobQueueFairness is only implemented on the PostgreSQL dequeue path",
+      );
+    }
   }
 
   /** The `create` args for one enqueued job. */
@@ -87,6 +146,7 @@ export class PrismaJobQueue implements JobQueue {
       payload: {
         ...job.payload,
         _workflowId: job.workflowId,
+        ...(job.groupKey !== undefined ? { _groupKey: job.groupKey } : {}),
       } as unknown,
       status: this.enums.status("PENDING"),
       nextPollAt: job.scheduledFor ?? null,
@@ -244,18 +304,57 @@ export class PrismaJobQueue implements JobQueue {
       // `startedAt` comes back through `RETURNING` because it is the fence a
       // worker hands to `complete`/`fail`/`suspend`; the application no
       // longer knows the value it wrote.
-      const result = await this.prisma.$queryRaw<
-        Array<{
-          id: string;
-          workflowRunId: string;
-          stageId: string;
-          priority: number;
-          attempt: number;
-          maxAttempts: number;
-          payload: unknown;
-          startedAt: Date;
-        }>
-      >`
+      //
+      // The fair variant below excludes any group that already holds
+      // `maxConcurrentPerGroup` RUNNING jobs, which is pg-boss v12's
+      // group-concurrency mechanism.
+      //
+      // - It has to be a *cap*, not an ordering. Any ordering rule loses to a
+      //   flood: whatever ranks the pending rows, the flooding group's next
+      //   row is re-ranked to the front the instant its previous one is
+      //   claimed, so a quiet group still waits behind the whole flood.
+      //   Excluding a group already at its share leaves the quiet group's job
+      //   as the only candidate, which is what actually breaks the starvation.
+      // - `FOR UPDATE OF j SKIP LOCKED` names the base table explicitly: a
+      //   plain `FOR UPDATE` is rejected on the nullable side of the LEFT
+      //   JOIN against the per-group counts.
+      // - The payload path is a bound `text[]` for `#>>`, never interpolated,
+      //   so a `groupBy` from configuration cannot reach the statement as SQL.
+      // - Cost: the CTE aggregates every RUNNING row per claim, where the
+      //   default statement stops at the first index entry. That is why
+      //   fairness is opt-in; the measured difference is in the release notes.
+      const result = this.fairnessPath
+        ? await this.prisma.$queryRaw<DequeuedJobRow[]>`
+        WITH "group_load" AS (
+          SELECT COALESCE(payload #>> ${this.fairnessPath}::text[], '') AS grp,
+                 count(*) AS running
+          FROM "job_queue"
+          WHERE status = 'RUNNING'
+          GROUP BY 1
+        )
+        UPDATE "job_queue"
+        SET
+          status = 'RUNNING',
+          "workerId" = ${this.workerId},
+          "lockedAt" = (now() AT TIME ZONE 'UTC'),
+          "startedAt" = (now() AT TIME ZONE 'UTC'),
+          attempt = attempt + 1
+        WHERE id = (
+          SELECT j.id
+          FROM "job_queue" j
+          LEFT JOIN "group_load" g
+            ON g.grp = COALESCE(j.payload #>> ${this.fairnessPath}::text[], '')
+          WHERE j.status = 'PENDING'
+            AND (j."nextPollAt" IS NULL
+                 OR j."nextPollAt" <= (now() AT TIME ZONE 'UTC'))
+            AND COALESCE(g.running, 0) < ${this.fairnessLimit}::bigint
+          ORDER BY j.priority DESC, j."createdAt" ASC
+          LIMIT 1
+          FOR UPDATE OF j SKIP LOCKED
+        )
+        RETURNING id, "workflowRunId", "stageId", priority, attempt, "maxAttempts", payload, "startedAt"
+      `
+        : await this.prisma.$queryRaw<DequeuedJobRow[]>`
         UPDATE "job_queue"
         SET
           status = 'RUNNING',
@@ -306,7 +405,7 @@ export class PrismaJobQueue implements JobQueue {
       );
 
       const payload = job.payload as Record<string, unknown>;
-      const { _workflowId, ...rest } = payload;
+      const { _workflowId, _groupKey, ...rest } = payload;
       return {
         jobId: job.id,
         workflowRunId: job.workflowRunId,
@@ -391,7 +490,11 @@ export class PrismaJobQueue implements JobQueue {
       );
 
       const claimedPayload = claimedJob.payload as Record<string, unknown>;
-      const { _workflowId: claimedWfId, ...claimedRest } = claimedPayload;
+      const {
+        _workflowId: claimedWfId,
+        _groupKey,
+        ...claimedRest
+      } = claimedPayload;
       return {
         jobId: claimedJob.id,
         workflowRunId: claimedJob.workflowRunId,
@@ -594,7 +697,7 @@ export class PrismaJobQueue implements JobQueue {
 
     return jobs.map((job: any) => {
       const payload = (job.payload ?? {}) as Record<string, unknown>;
-      const { _workflowId, ...rest } = payload;
+      const { _workflowId, _groupKey, ...rest } = payload;
       return {
         id: job.id,
         createdAt: job.createdAt,

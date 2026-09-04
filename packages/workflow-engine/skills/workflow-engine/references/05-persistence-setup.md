@@ -246,6 +246,57 @@ attempt currently owns the row, which costs the newer attempt nothing.
 
 `jobQueueConformanceSuite` covers both the fenced and unfenced paths.
 
+### Per-group fairness (opt-in, PostgreSQL)
+
+By default the dequeue orders by `priority DESC, "createdAt" ASC` and nothing
+else, so a tenant that enqueues 100k jobs puts every later arrival from every
+other tenant behind all 100k. `JobQueueFairness` fixes that:
+
+```typescript
+const jobQueue = createPrismaJobQueue(prisma, {
+  fairness: {
+    // How many jobs one group may hold RUNNING at once. No default -- size it
+    // to your pool, roughly `workers / groups active at once`, never below 1.
+    maxConcurrentPerGroup: 4,
+    // Where the group key lives in the job payload. Defaults to "_groupKey",
+    // which is what EnqueueJobInput.groupKey writes.
+    groupBy: "config.tenantId",
+  },
+});
+```
+
+**It is a concurrency cap, not a reordering.** A group already holding
+`maxConcurrentPerGroup` RUNNING jobs is excluded from the claim entirely, which
+leaves a quiet group's job as the only candidate. Reordering cannot fix
+starvation: whatever rule ranks the pending rows, the flooding group's next row
+is re-ranked to the front the moment its previous one is claimed. This is
+pg-boss v12's group-concurrency mechanism.
+
+**Which key to use.** The kernel's own enqueue paths (`run.claimPending`,
+`run.transition`, `run.reapStuck`) enqueue from the run record and do not set
+`groupKey`, but they do copy the run's `config` into the job payload -- so for
+kernel-driven workflows point `groupBy` at a field of the run config, e.g.
+`"config.tenantId"`. `EnqueueJobInput.groupKey` (stored as `payload._groupKey`,
+and stripped again before the payload reaches a stage) is for callers that
+enqueue jobs directly. Jobs with no value at the path share one anonymous
+group, which is capped like any other.
+
+**Cost.** Measured on Postgres 16, one connection, flat priorities, 200
+sequential claims per run:
+
+| Ready jobs / groups | Default claim | Fair claim | Ratio |
+| --- | --- | --- | --- |
+| 1,000 / 5 | 1.65 ms mean | 1.55 ms | 0.94x |
+| 10,000 / 10 | 2.66 ms mean | 4.37 ms | 1.64x |
+| 50,000 / 100 | 7.90 ms mean | 17.30 ms | 2.19x |
+
+Fairness is materially more expensive on a deep queue -- the claim joins the
+candidate rows against a per-group count of everything RUNNING, where the
+default statement stops at the first index entry -- which is why it is opt-in
+and off by default. On a shallow queue it is free. It is PostgreSQL only;
+constructing a SQLite queue with `fairness` throws at wiring time rather than
+silently ignoring it.
+
 ### Two-tier lease expiry
 
 `releaseStaleJobs` is the fine-grained tier: it compares `lockedAt`, which

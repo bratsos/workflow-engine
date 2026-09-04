@@ -37,6 +37,7 @@ export type {
   JobAckFence,
   JobAckOutcome,
   JobQueue,
+  JobQueueFairness,
   JobRecord,
   JobStatus,
   LogLevel,

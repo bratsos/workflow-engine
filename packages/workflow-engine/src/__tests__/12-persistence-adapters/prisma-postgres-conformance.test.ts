@@ -422,6 +422,119 @@ if (!DATABASE_URL) {
     // never released -- crash recovery silently did not work.
     // ==========================================================================
 
+    describe("per-group fairness (PG-only)", () => {
+      beforeEach(async () => {
+        await truncateAll();
+      });
+
+      /** 50 jobs from one tenant, then a single job from another. */
+      async function floodThenOne(
+        queue: ReturnType<typeof createPrismaJobQueue>,
+      ) {
+        await queue.enqueueParallel(
+          Array.from({ length: 50 }, (_, i) => ({
+            workflowRunId: `flood-${i}`,
+            workflowId: "wf",
+            stageId: "stage-1",
+            groupKey: "noisy-tenant",
+            payload: {},
+          })),
+        );
+        await queue.enqueueParallel([
+          {
+            workflowRunId: "quiet-run",
+            workflowId: "wf",
+            stageId: "stage-1",
+            groupKey: "quiet-tenant",
+            payload: {},
+          },
+        ]);
+      }
+
+      it("puts the quiet tenant behind the whole flood without fairness", async () => {
+        const queue = createPrismaJobQueue(prisma, { workerId: "plain" });
+        await floodThenOne(queue);
+
+        // The flood shares one `createdAt` (one enqueueParallel transaction),
+        // so which of its rows comes out is not defined — only that the quiet
+        // tenant's later job is not among the first two.
+        expect((await queue.dequeue())?.workflowRunId).toMatch(/^flood-/);
+        expect((await queue.dequeue())?.workflowRunId).toMatch(/^flood-/);
+      });
+
+      it("skips a tenant already at its concurrency cap", async () => {
+        const queue = createPrismaJobQueue(prisma, {
+          workerId: "fair",
+          fairness: { maxConcurrentPerGroup: 1 },
+        });
+        await floodThenOne(queue);
+
+        const first = await queue.dequeue();
+        expect(first?.workflowRunId).toMatch(/^flood-/);
+        // The noisy tenant holds its one slot, so the quiet tenant's job is
+        // second out instead of fifty-first.
+        expect((await queue.dequeue())?.workflowRunId).toBe("quiet-run");
+        // Both tenants are now at their cap.
+        expect(await queue.dequeue()).toBeNull();
+
+        // Freeing a slot lets that tenant back in.
+        await queue.complete(first!.jobId, {
+          startedAt: first!.startedAt,
+          attempt: first!.attempt,
+        });
+        const third = await queue.dequeue();
+        expect(third?.workflowRunId).toMatch(/^flood-/);
+        expect(third?.workflowRunId).not.toBe(first?.workflowRunId);
+      });
+
+      it("groups on an existing payload field when groupBy names one", async () => {
+        const queue = createPrismaJobQueue(prisma, {
+          workerId: "fair-path",
+          fairness: { maxConcurrentPerGroup: 1, groupBy: "config.tenantId" },
+        });
+        await queue.enqueueParallel(
+          Array.from({ length: 5 }, (_, i) => ({
+            workflowRunId: `acme-${i}`,
+            workflowId: "wf",
+            stageId: "stage-1",
+            payload: { config: { tenantId: "acme" } },
+          })),
+        );
+        await queue.enqueueParallel([
+          {
+            workflowRunId: "globex-1",
+            workflowId: "wf",
+            stageId: "stage-1",
+            payload: { config: { tenantId: "globex" } },
+          },
+        ]);
+
+        await queue.dequeue();
+        expect((await queue.dequeue())?.workflowRunId).toBe("globex-1");
+      });
+
+      it("keeps the group key out of the payload handed to the stage", async () => {
+        const queue = createPrismaJobQueue(prisma, {
+          workerId: "fair-payload",
+          fairness: { maxConcurrentPerGroup: 2 },
+        });
+        await queue.enqueueParallel([
+          {
+            workflowRunId: "run-1",
+            workflowId: "wf",
+            stageId: "stage-1",
+            groupKey: "tenant-a",
+            payload: { config: { x: 1 } },
+          },
+        ]);
+
+        const claimed = await queue.dequeue();
+        expect(claimed?.payload).toEqual({ config: { x: 1 } });
+        const [record] = await queue.getJobsByWorkflowRun("run-1");
+        expect(record?.payload).toEqual({ config: { x: 1 } });
+      });
+    });
+
     describe("session timezone independence", () => {
       // UTC+14, no DST: a session-timezone slip shows up as a 14-hour jump,
       // and the case still proves its point on a database whose own default

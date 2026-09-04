@@ -21,6 +21,7 @@ import {
   type JobAckFence,
   type JobAckOutcome,
   type JobQueue,
+  type JobQueueFairness,
   type JobRecord,
   LEASE_ABSOLUTE_CAP,
   LEASE_HEARTBEAT_LOST,
@@ -38,6 +39,68 @@ export interface InMemoryJobQueueOptions {
    * deterministic timestamps instead of relying on wall-clock time.
    */
   now?: () => Date;
+  /**
+   * Per-group fairness for the dequeue. Omit (the default) to preserve
+   * plain priority-then-FIFO ordering. See `JobQueueFairness`.
+   */
+  fairness?: JobQueueFairness;
+}
+
+/**
+ * Splits a dotted payload path into segments.
+ */
+function requireGroupLimit(maxConcurrentPerGroup: number): number {
+  if (!Number.isInteger(maxConcurrentPerGroup) || maxConcurrentPerGroup < 1) {
+    throw new Error(
+      `JobQueueFairness.maxConcurrentPerGroup must be an integer of at least 1, got ${maxConcurrentPerGroup}`,
+    );
+  }
+  return maxConcurrentPerGroup;
+}
+
+function splitGroupPath(groupBy: string): string[] {
+  const segments = groupBy.split(".").filter((s) => s.length > 0);
+  if (segments.length === 0) {
+    throw new Error(
+      `JobQueueFairness.groupBy must name at least one payload field, got ${JSON.stringify(groupBy)}`,
+    );
+  }
+  return segments;
+}
+
+/**
+ * Resolves the group key for a job from its payload along the fairness path.
+ * Absent or non-string values resolve to "" (the anonymous group).
+ */
+function resolveGroupKey(
+  payload: Record<string, unknown> | undefined,
+  path: string[],
+): string {
+  let current: unknown = payload;
+  for (const segment of path) {
+    if (
+      current === null ||
+      current === undefined ||
+      typeof current !== "object"
+    ) {
+      return "";
+    }
+    current = (current as Record<string, unknown>)[segment];
+  }
+  if (current === null || current === undefined) {
+    return "";
+  }
+  if (typeof current === "string") {
+    return current;
+  }
+  if (
+    typeof current === "number" ||
+    typeof current === "boolean" ||
+    typeof current === "bigint"
+  ) {
+    return String(current);
+  }
+  return "";
 }
 
 export class InMemoryJobQueue implements JobQueue {
@@ -47,6 +110,8 @@ export class InMemoryJobQueue implements JobQueue {
   private readonly workerIdWasConfigured: boolean;
   private defaultMaxAttempts = 3;
   private readonly now: () => Date;
+  private readonly fairnessPath: string[] | null;
+  private readonly fairnessLimit: number;
   /**
    * Monotonic insertion counter, keyed by job id. `dequeue`'s ordering is
    * priority DESC, then `createdAt` ASC -- when two jobs share both
@@ -76,6 +141,12 @@ export class InMemoryJobQueue implements JobQueue {
     this.workerIdWasConfigured = opts.workerId !== undefined;
     this.workerId = opts.workerId ?? `worker-${randomUUID().slice(0, 8)}`;
     this.now = opts.now ?? (() => new Date());
+    this.fairnessPath = opts.fairness
+      ? splitGroupPath(opts.fairness.groupBy ?? "_groupKey")
+      : null;
+    this.fairnessLimit = opts.fairness
+      ? requireGroupLimit(opts.fairness.maxConcurrentPerGroup)
+      : 0;
   }
 
   /**
@@ -124,7 +195,12 @@ export class InMemoryJobQueue implements JobQueue {
       maxAttempts: this.defaultMaxAttempts,
       lastError: null,
       nextPollAt: options.scheduledFor ?? null,
-      payload: options.payload ?? {},
+      payload: {
+        ...options.payload,
+        ...(options.groupKey !== undefined
+          ? { _groupKey: options.groupKey }
+          : {}),
+      },
     };
 
     this.jobs.set(id, job);
@@ -169,33 +245,54 @@ export class InMemoryJobQueue implements JobQueue {
   async dequeue(): Promise<DequeueResult | null> {
     // Find the highest priority PENDING job
     const now = this.now();
+    const comparator = (a: JobRecord, b: JobRecord) => {
+      // Higher priority first
+      if (b.priority !== a.priority) {
+        return b.priority - a.priority;
+      }
+      // Earlier creation first (FIFO for same priority)
+      const timeDiff = a.createdAt.getTime() - b.createdAt.getTime();
+      if (timeDiff !== 0) return timeDiff;
+      // Equal priority AND equal timestamp (frozen/injected clock, or
+      // same-millisecond real-time enqueues) -- break the tie by
+      // explicit enqueue order.
+      const seqA = this.insertionSequence.get(a.id) ?? 0;
+      const seqB = this.insertionSequence.get(b.id) ?? 0;
+      return seqA - seqB;
+    };
+
     const pendingJobs = Array.from(this.jobs.values())
       .filter(
         (j) =>
           j.status === "PENDING" &&
           (j.nextPollAt === null || j.nextPollAt <= now),
       )
-      .sort((a, b) => {
-        // Higher priority first
-        if (b.priority !== a.priority) {
-          return b.priority - a.priority;
-        }
-        // Earlier creation first (FIFO for same priority)
-        const timeDiff = a.createdAt.getTime() - b.createdAt.getTime();
-        if (timeDiff !== 0) return timeDiff;
-        // Equal priority AND equal timestamp (frozen/injected clock, or
-        // same-millisecond real-time enqueues) -- break the tie by
-        // explicit enqueue order.
-        const seqA = this.insertionSequence.get(a.id) ?? 0;
-        const seqB = this.insertionSequence.get(b.id) ?? 0;
-        return seqA - seqB;
-      });
+      .sort(comparator);
 
-    if (pendingJobs.length === 0) {
+    let candidates = pendingJobs;
+    if (this.fairnessPath) {
+      // Skip any group already holding its share of the RUNNING pool — the
+      // same cap the Prisma adapter applies in SQL, and the only rule that
+      // actually stops a flood (see `JobQueueFairness`).
+      const path = this.fairnessPath;
+      const running = new Map<string, number>();
+      for (const job of this.jobs.values()) {
+        if (job.status !== "RUNNING") continue;
+        const group = resolveGroupKey(job.payload, path);
+        running.set(group, (running.get(group) ?? 0) + 1);
+      }
+      candidates = pendingJobs.filter(
+        (job) =>
+          (running.get(resolveGroupKey(job.payload, path)) ?? 0) <
+          this.fairnessLimit,
+      );
+    }
+
+    if (candidates.length === 0) {
       return null;
     }
 
-    const job = pendingJobs[0]!;
+    const job = candidates[0]!;
 
     // Lock the job and increment attempt (matches Prisma dequeue semantics)
     const newAttempt = job.attempt + 1;
@@ -210,6 +307,7 @@ export class InMemoryJobQueue implements JobQueue {
     };
     this.jobs.set(job.id, updated);
 
+    const { _groupKey, ...payload } = job.payload;
     return {
       jobId: job.id,
       workflowRunId: job.workflowRunId,
@@ -218,7 +316,7 @@ export class InMemoryJobQueue implements JobQueue {
       priority: job.priority,
       attempt: newAttempt,
       maxAttempts: job.maxAttempts,
-      payload: job.payload,
+      payload,
       startedAt: now,
     };
   }
@@ -400,7 +498,10 @@ export class InMemoryJobQueue implements JobQueue {
   async getJobsByWorkflowRun(workflowRunId: string): Promise<JobRecord[]> {
     return Array.from(this.jobs.values())
       .filter((j) => j.workflowRunId === workflowRunId)
-      .map((j) => ({ ...j }));
+      .map((j) => {
+        const { _groupKey, ...payload } = j.payload;
+        return { ...j, payload };
+      });
   }
 
   async touchJob(jobId: string): Promise<void> {

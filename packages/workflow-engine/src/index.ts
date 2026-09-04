@@ -180,6 +180,7 @@ export type {
   JobAckFence,
   JobAckOutcome,
   JobQueue,
+  JobQueueFairness,
   JobRecord,
   LogLevel,
   PersistenceCore,

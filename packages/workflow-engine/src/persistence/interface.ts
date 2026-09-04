@@ -426,6 +426,14 @@ export interface EnqueueJobInput {
   priority?: number;
   payload?: Record<string, unknown>;
   scheduledFor?: Date;
+  /**
+   * Fairness group this job belongs to — typically a tenant id. Stored on
+   * the payload as `_groupKey`; a transport with fairness enabled presents
+   * only the head of each group as a dequeue candidate, so one group cannot
+   * starve another. Ignored when the transport has no fairness configured,
+   * which is the default.
+   */
+  groupKey?: string;
 }
 
 export interface DequeueResult {
@@ -468,6 +476,42 @@ export interface JobAckFence {
    * clause and still no extra column.
    */
   attempt: number;
+}
+
+/**
+ * Fairness configuration for a job transport's dequeue.
+ *
+ * Off by default: the dequeue is the hottest query the engine runs, and a
+ * fair claim costs more than taking the first row of an index. Turn it on
+ * only where one group really can flood the queue.
+ *
+ * Fairness here is a *concurrency cap per group*, the mechanism pg-boss v12
+ * uses, not a reordering. Reordering cannot fix starvation: whatever rule
+ * ranks the pending rows, the flooding group's next row is re-ranked to the
+ * front the moment its previous one is claimed. Excluding a group that is
+ * already at its share of the running pool does fix it — the flood is
+ * skipped and a newly arrived job from a quiet group is the only candidate
+ * left.
+ */
+export interface JobQueueFairness {
+  /**
+   * How many jobs one group may hold `RUNNING` at once. A group at its cap
+   * is skipped by the dequeue entirely, so this is the whole fairness
+   * mechanism and it has no default — size it to your worker pool, roughly
+   * `workers / groups you expect to be active at once`, and never below 1.
+   * Too low and a single active group cannot use the pool it has to itself;
+   * too high and it can still crowd the others out.
+   */
+  maxConcurrentPerGroup: number;
+  /**
+   * Dotted path into the job payload naming the group. Defaults to
+   * `"_groupKey"`, which is where `EnqueueJobInput.groupKey` is stored.
+   * Point it at a field your jobs already carry — `"config.tenantId"`, say
+   * — to group existing rows without re-enqueueing them. Jobs with no value
+   * at the path share one anonymous group, which is then capped as a group
+   * like any other.
+   */
+  groupBy?: string;
 }
 
 /**

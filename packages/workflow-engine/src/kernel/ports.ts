@@ -52,6 +52,7 @@ export type {
   IdempotencyRecord,
   JobAckFence,
   JobAckOutcome,
+  JobQueueFairness,
   JobRecord,
   OutboxRecord,
   Status,

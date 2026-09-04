@@ -104,6 +104,23 @@ that cannot carry the stamp (a JSON push bridge, say) still works.
 lease of whichever attempt currently owns the row, which costs the newer
 attempt nothing.
 
+#### Per-group fairness
+
+`EnqueueJobInput.groupKey` names the fairness group a job belongs to — usually a
+tenant. A transport that supports fairness stores it (the built-in adapters put
+it on the payload as `_groupKey`, and strip it again before the payload reaches
+a stage) and, when configured with a `JobQueueFairness`, excludes from the claim
+any group already holding `maxConcurrentPerGroup` jobs in `RUNNING`.
+
+It has to be a cap rather than a reordering: whatever rule ranks the pending
+rows, a flooding group's next row is re-ranked to the front the instant its
+previous one is claimed, so a quiet group still waits behind the whole flood.
+Excluding a group already at its share is what actually breaks the starvation.
+
+Fairness is opt-in and off by default because it costs materially more on a deep
+queue than the default claim — see the measured numbers in the engine's
+persistence reference.
+
 #### Two-tier lease expiry
 
 `releaseStaleJobs` compares `lockedAt`, which `touchJob` refreshes, so it detects
