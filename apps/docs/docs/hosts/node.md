@@ -60,6 +60,7 @@ You can tune the host's polling frequency, lease times, and execution limits:
 | **`maxClaimsPerTick`** | `number` | `10` | Maximum number of pending workflow runs to claim in a single orchestration tick. |
 | **`maxSuspendedChecksPerTick`**| `number` | `10` | Maximum number of suspended stage completion checks to perform in a single tick. |
 | **`maxOutboxFlushPerTick`** | `number` | `100` | Maximum number of outbox events to publish in a single tick. |
+| **`serves`** | `ServedDefinition[] \| "all"` | derived from the registry | Which definition versions this host may claim, poll and dequeue. Left unset, the kernel derives it from the registry, which is what makes a rolling deploy safe. `"all"` turns version filtering off entirely — the pre-1.0 behaviour. See [Definition versioning](../core-concepts/definition-versioning.md). |
 
 ---
 

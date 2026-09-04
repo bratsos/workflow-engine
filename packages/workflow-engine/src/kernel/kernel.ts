@@ -27,6 +27,7 @@ import type {
   AnnotationScope,
   CreateAnnotationInput,
   CreateOutboxEventInput,
+  ServedDefinition,
   WorkflowAnnotationRecord,
 } from "../persistence/interface";
 import type {
@@ -64,6 +65,7 @@ import { handleRunRerunFrom } from "./handlers/run-rerun-from";
 import { handleRunTransition } from "./handlers/run-transition";
 import { handleStagePollSuspended } from "./handlers/stage-poll-suspended";
 import { handleStepSignal } from "./handlers/step-signal.js";
+import { servedDefinitions } from "./helpers/definition-pinning.js";
 import {
   buildAnnotationEvents,
   filterCouldMatchLegacy,
@@ -216,6 +218,16 @@ export interface KernelAnnotations {
 export interface Kernel {
   dispatch<T extends KernelCommand>(command: T): Promise<CommandResult<T>>;
   annotations: KernelAnnotations;
+  /**
+   * The `(workflowId, version)` pairs this kernel's registry presents, or
+   * `undefined` when the registry cannot enumerate (in which case nothing
+   * is filtered, the pre-1.0 behaviour).
+   *
+   * Hosts read it to narrow their job dequeue the same way
+   * `run.claimPending` narrows claiming, so the decision "can this process
+   * do this work" is made once and applied in every query that takes work.
+   */
+  servedDefinitions(): readonly ServedDefinition[] | undefined;
 }
 
 // ============================================================================
@@ -601,5 +613,9 @@ export function createKernel(config: KernelConfig): Kernel {
     },
   };
 
-  return { dispatch, annotations };
+  return {
+    dispatch,
+    annotations,
+    servedDefinitions: () => servedDefinitions(config.registry),
+  };
 }

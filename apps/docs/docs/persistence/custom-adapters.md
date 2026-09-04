@@ -66,10 +66,11 @@ import type {
 class MyCustomJobQueue implements JobQueue {
   async enqueue(options: EnqueueJobInput): Promise<string> { ... }
   async enqueueParallel(jobs: EnqueueJobInput[]): Promise<string[]> { ... }
-  async dequeue(): Promise<DequeueResult | null> { ... }
+  async dequeue(options?: DequeueOptions): Promise<DequeueResult | null> { ... }
   async complete(jobId: string, fence?: JobAckFence): Promise<JobAckOutcome> { ... }
   async suspend(jobId: string, nextPollAt: Date, fence?: JobAckFence): Promise<JobAckOutcome> { ... }
   async fail(jobId: string, error: string, shouldRetry?: boolean, fence?: JobAckFence): Promise<JobAckOutcome> { ... }
+  async defer(jobId: string, nextPollAt: Date, reason: string, fence?: JobAckFence): Promise<JobAckOutcome> { ... } // optional, see below
   async releaseStaleJobs(staleThresholdMs?: number): Promise<number> { ... }
   async expireRunawayJobs(absoluteTimeoutMs: number): Promise<number> { ... } // optional, absolute lease tier
   async cancelByRun(workflowRunId: string): Promise<number> { ... }
@@ -77,6 +78,26 @@ class MyCustomJobQueue implements JobQueue {
   async touchJob(jobId: string): Promise<void> { ... } // Heartbeat lock
 }
 ```
+
+#### Declining a job: `dequeue(options)` and `defer`
+
+`dequeue` takes an optional `{ serves }` — the `(workflowId, version)` pairs
+the calling host presents. A job carries its run's definition version on its
+payload as `_definitionVersion` (and its workflow as `_workflowId`), so the
+filter is expressible without joining anything: claim a job when its version
+is in `serves`, or when it has no version and `serves` names its workflow.
+Claim nothing for an empty `serves`.
+
+A transport that cannot select — a push queue you do not control the
+ordering of — may ignore `serves` entirely. The kernel's backstop then
+applies: `job.execute` returns a ghost with `ghostReason: "version"`, and
+the host calls `defer(jobId, nextPollAt, reason, fence)` instead of `fail`.
+`defer` puts the job back `PENDING` with a later `nextPollAt` **and gives
+back the attempt the dequeue counted**. That distinction matters: a version
+mismatch lasts for a whole deploy, so re-delivering it through the retry
+budget takes the job row terminal in about fifteen seconds. Declining work
+is not failing it. `defer` is optional; without it the host falls back to
+`fail(..., true)`, which is correct but bounded by the budget.
 
 #### Fenced acknowledgements
 

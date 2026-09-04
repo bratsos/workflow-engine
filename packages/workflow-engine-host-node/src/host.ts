@@ -18,6 +18,7 @@ import {
   type JobTransport,
   type Kernel,
   runMaintenanceTick as runMaintenanceTickCommands,
+  type ServedDefinition,
   toEventSinkObservation,
 } from "@bratsos/workflow-engine/kernel";
 
@@ -75,6 +76,19 @@ export interface NodeHostConfig {
 
   /** Max pending runs to claim per orchestration tick (default: 10). */
   maxClaimsPerTick?: number;
+
+  /**
+   * Which definition versions this host may adopt and poll. Forwarded to
+   * `run.claimPending` and `stage.pollSuspended`.
+   *
+   * Left unset — the right default — the kernel derives it from the
+   * registry: a registry built with `createWorkflowRegistry` claims only
+   * runs this build can execute, which is what makes a rolling deploy safe.
+   * Pass `"all"` to claim and poll regardless of version (the pre-1.0
+   * behaviour), or an explicit list to run maintenance on behalf of
+   * another build.
+   */
+  serves?: readonly ServedDefinition[] | "all";
 
   /** Max suspended stages to check per tick (default: 10). */
   maxSuspendedChecksPerTick?: number;
@@ -141,6 +155,8 @@ class NodeHostImpl implements NodeHost {
   private readonly staleLeaseThresholdMs: number;
   private readonly jobAbsoluteTimeoutMs: number;
   private readonly maxClaimsPerTick: number;
+  /** See `HostConfig.serves`; `undefined` means "derive from the registry". */
+  private readonly serves: readonly ServedDefinition[] | "all" | undefined;
   private readonly maxSuspendedChecksPerTick: number;
   private readonly maxOutboxFlushPerTick: number;
   private readonly jobHeartbeatIntervalMs: number;
@@ -161,6 +177,7 @@ class NodeHostImpl implements NodeHost {
       config.jobAbsoluteTimeoutMs ?? HOST_DEFAULTS.jobAbsoluteTimeoutMs;
     this.maxClaimsPerTick =
       config.maxClaimsPerTick ?? HOST_DEFAULTS.maxClaimsPerTick;
+    this.serves = config.serves;
     this.maxSuspendedChecksPerTick =
       config.maxSuspendedChecksPerTick ??
       HOST_DEFAULTS.maxSuspendedChecksPerTick;
@@ -323,6 +340,17 @@ class NodeHostImpl implements NodeHost {
       });
   }
 
+  /**
+   * What to pass to `jobTransport.dequeue`. `"all"` means claim regardless
+   * of version, which is expressed by passing nothing; otherwise the
+   * kernel's registry answers, so the dequeue narrows on exactly what
+   * `run.claimPending` narrows on.
+   */
+  private dequeueServes(): readonly ServedDefinition[] | undefined {
+    if (this.serves === "all") return undefined;
+    return this.serves ?? this.kernel.servedDefinitions?.();
+  }
+
   private async orchestrationTick(): Promise<void> {
     this.orchestrationTicks++;
 
@@ -334,6 +362,7 @@ class NodeHostImpl implements NodeHost {
     const counts = await runMaintenanceTickCommands(this.kernel, {
       workerId: this.workerId,
       maxClaimsPerTick: this.maxClaimsPerTick,
+      ...(this.serves !== undefined ? { serves: this.serves } : {}),
       maxSuspendedChecksPerTick: this.maxSuspendedChecksPerTick,
       maxOutboxFlushPerTick: this.maxOutboxFlushPerTick,
       staleLeaseThresholdMs: this.staleLeaseThresholdMs,
@@ -366,7 +395,10 @@ class NodeHostImpl implements NodeHost {
 
     while (this.running) {
       try {
-        const job = await this.jobTransport.dequeue();
+        const serves = this.dequeueServes();
+        const job = await this.jobTransport.dequeue(
+          serves !== undefined ? { serves } : undefined,
+        );
 
         if (!job) {
           lastRunId = null;

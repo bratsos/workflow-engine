@@ -7,8 +7,10 @@
  */
 
 import { describe, expect, it } from "vitest";
+import type { JobTransport } from "../../kernel/ports.js";
 import { createSpillingJobTransport, isSpillRef } from "../../kernel/spill.js";
 import { InMemoryBlobStore } from "../../kernel/testing/in-memory-blob-store.js";
+import type { EnqueueJobInput } from "../../persistence/interface.js";
 import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
 
 function setup(thresholdBytes = 1000) {
@@ -144,5 +146,140 @@ describe("payload spill: job transport", () => {
     ]);
     await transport.dequeue();
     expect(await transport.expireRunawayJobs?.(-1000)).toBe(1);
+  });
+
+  it("hoists the fairness group key out of a payload that spills", async () => {
+    const recorded: EnqueueJobInput[] = [];
+    const fakeTransport: JobTransport = {
+      fairnessGroupBy: "config.tenantId",
+      async enqueueParallel(jobs) {
+        recorded.push(...jobs);
+        return jobs.map((_, i) => `job-${i}`);
+      },
+      async deleteByRunAndStages() {
+        return 0;
+      },
+      async dequeue() {
+        return null;
+      },
+      async complete() {
+        return "acknowledged";
+      },
+      async suspend() {
+        return "acknowledged";
+      },
+      async fail() {
+        return "acknowledged";
+      },
+      async releaseStaleJobs() {
+        return 0;
+      },
+      async cancelByRun() {
+        return 0;
+      },
+      async getJobsByWorkflowRun() {
+        return [];
+      },
+      async touchJob() {},
+    };
+    const blobStore = new InMemoryBlobStore();
+    const thresholdBytes = 100;
+    const transport = createSpillingJobTransport(fakeTransport, {
+      blobStore,
+      thresholdBytes,
+    });
+
+    const smallPayload = { config: { tenantId: "acme" } };
+    const largePayload = {
+      config: { tenantId: "globex" },
+      blob: "x".repeat(200),
+    };
+
+    await transport.enqueueParallel([
+      {
+        workflowRunId: "run-small",
+        workflowId: "wf-1",
+        stageId: "stage-1",
+        payload: smallPayload,
+      },
+      {
+        workflowRunId: "run-large",
+        workflowId: "wf-1",
+        stageId: "stage-2",
+        payload: largePayload,
+      },
+    ]);
+
+    expect(recorded).toHaveLength(2);
+    const [smallJob, spilledJob] = recorded;
+
+    expect(spilledJob?.groupKey).toBe("globex");
+    expect(isSpillRef(spilledJob?.payload)).toBe(true);
+
+    expect(smallJob?.groupKey).toBeUndefined();
+    expect(smallJob?.payload).toEqual(smallPayload);
+  });
+
+  it("leaves an explicit groupKey alone", async () => {
+    const recorded: EnqueueJobInput[] = [];
+    const fakeTransport: JobTransport = {
+      fairnessGroupBy: "config.tenantId",
+      async enqueueParallel(jobs) {
+        recorded.push(...jobs);
+        return jobs.map((_, i) => `job-${i}`);
+      },
+      async deleteByRunAndStages() {
+        return 0;
+      },
+      async dequeue() {
+        return null;
+      },
+      async complete() {
+        return "acknowledged";
+      },
+      async suspend() {
+        return "acknowledged";
+      },
+      async fail() {
+        return "acknowledged";
+      },
+      async releaseStaleJobs() {
+        return 0;
+      },
+      async cancelByRun() {
+        return 0;
+      },
+      async getJobsByWorkflowRun() {
+        return [];
+      },
+      async touchJob() {},
+    };
+    const blobStore = new InMemoryBlobStore();
+    const thresholdBytes = 100;
+    const transport = createSpillingJobTransport(fakeTransport, {
+      blobStore,
+      thresholdBytes,
+    });
+
+    const largePayload = {
+      config: { tenantId: "globex" },
+      blob: "x".repeat(200),
+    };
+
+    await transport.enqueueParallel([
+      {
+        workflowRunId: "run-explicit",
+        workflowId: "wf-1",
+        stageId: "stage-1",
+        payload: largePayload,
+        groupKey: "explicit",
+      },
+    ]);
+
+    expect(recorded).toHaveLength(1);
+    const [job] = recorded;
+
+    expect(job?.groupKey).toBe("explicit");
+    expect(isSpillRef(job?.payload)).toBe(true);
   });
 });

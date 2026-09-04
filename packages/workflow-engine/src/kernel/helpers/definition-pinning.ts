@@ -46,7 +46,21 @@ export async function recordDefinitionVersion(
   workflow: Workflow<any, any>,
   deps: KernelDeps,
 ): Promise<string | null> {
-  if (!deps.persistence.supportsDefinitionVersioning()) return null;
+  // Confirm the adapter's capability answer against the database before
+  // writing anything that depends on it. On the Prisma adapter the answer
+  // comes from the generated client, which is true the moment `prisma
+  // generate` runs — before `migrate deploy` on every first migration —
+  // and an unconfirmed `true` means `insertDefinitionIfAbsent` fails
+  // `P2021` and `createRun` fails `P2022` on a database that is simply not
+  // migrated yet. The confirmation is a catalogue read, so it is safe
+  // inside a consumer's transaction and it runs once per client.
+  if (deps.persistence.ensureDefinitionVersioningDetected) {
+    if (!(await deps.persistence.ensureDefinitionVersioningDetected())) {
+      return null;
+    }
+  } else if (!deps.persistence.supportsDefinitionVersioning()) {
+    return null;
+  }
 
   const version = workflow.definitionVersion;
   const snapshot = workflow.getDefinitionSnapshot();

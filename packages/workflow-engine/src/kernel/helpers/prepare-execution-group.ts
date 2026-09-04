@@ -117,6 +117,9 @@ export async function prepareExecutionGroup(
         stageId: stage.id,
         priority: run.priority,
         payload: { config: run.config || {} },
+        // Carried on the payload so the dequeue can decline a job whose
+        // run this build cannot serve, without joining to workflow_runs.
+        definitionVersion: run.definitionVersion,
       })),
     );
   };

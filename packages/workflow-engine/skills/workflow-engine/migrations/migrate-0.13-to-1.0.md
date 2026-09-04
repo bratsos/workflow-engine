@@ -200,9 +200,14 @@ Verified against `git diff` of the package's `prisma/schema.prisma` between 0.13
     "structureHash" TEXT NOT NULL,
     CONSTRAINT "workflow_definitions_pkey" PRIMARY KEY ("workflowId", "version")
   );
-  CREATE INDEX IF NOT EXISTS "workflow_definitions_workflowId_idx"
-    ON "workflow_definitions" ("workflowId");
   ```
+
+  There is deliberately no `workflow_definitions (workflowId)` index: the
+  compound primary key already leads with that column, so a lookup by
+  workflow alone plans identically with and without one (measured: 0.188 ms
+  vs 0.187 ms at 20k rows). An earlier draft of this guide created one — if
+  you already ran it, `DROP INDEX CONCURRENTLY IF EXISTS
+  "workflow_definitions_workflowId_idx";` is safe.
 
   The indexes for these two columns are in the index block below, because
   they belong to one `workflow_runs` index set rather than to two separate
@@ -235,7 +240,24 @@ Verified against `git diff` of the package's `prisma/schema.prisma` between 0.13
   DROP INDEX CONCURRENTLY IF EXISTS "workflow_runs_status_idx";
   DROP INDEX CONCURRENTLY IF EXISTS "workflow_runs_workflowId_idx";
 
-  -- workflow_runs: definition versioning. Only if you took the columns above.
+  -- workflow_runs: the claim. `claimNextPendingRun` issues the same shape
+  -- against workflow_runs that the dequeue issues against job_queue --
+  -- status = 'PENDING' ORDER BY priority DESC, "createdAt" ASC LIMIT 1 --
+  -- maxClaimsPerTick times per tick per host, and none of the indexes
+  -- above can serve it, because priority is in none of them. Measured on
+  -- Postgres 16 at 300k runs / 60k pending: 11.8-15.1 ms before (top-N
+  -- sort over every PENDING row), 0.008-0.022 ms after, for 9 MB.
+  CREATE INDEX CONCURRENTLY IF NOT EXISTS "workflow_runs_status_priority_createdAt_idx"
+    ON "workflow_runs" ("status", "priority" DESC, "createdAt" ASC);
+
+  -- workflow_runs: definition versioning. Only if you took the columns
+  -- above. The first serves a lookup narrowed to one version with no
+  -- workflow; the second is the narrow stand-in for the (status) index the
+  -- list orderings replaced (a status count runs index-only off it) and
+  -- narrows the version-filtered claim. Neither covers `run.listVersions`,
+  -- which plans a parallel sequential scan regardless: it passes no status
+  -- filter, and its aggregate asks for a MIN("createdAt") no index here
+  -- carries.
   CREATE INDEX CONCURRENTLY IF NOT EXISTS "workflow_runs_definitionVersion_idx"
     ON "workflow_runs" ("definitionVersion");
   CREATE INDEX CONCURRENTLY IF NOT EXISTS "workflow_runs_status_workflowId_definitionVersion_idx"
@@ -267,7 +289,15 @@ Verified against `git diff` of the package's `prisma/schema.prisma` between 0.13
     ON "outbox_events" ("dlqAt");
   ```
 
-- [ ] **Custom `JobQueue` / `JobTransport` implementation?** Two contract changes:
+- [ ] **Custom `JobQueue` / `JobTransport` implementation?** Four contract changes:
+  `dequeue` now takes an optional `{ serves }` naming the definition versions
+  the calling host presents — filter on the payload's `_definitionVersion` /
+  `_workflowId` if you can, and ignore it if your transport cannot select;
+  and an optional `defer(jobId, nextPollAt, reason, fence)` puts a claimed job
+  back `PENDING` *without* spending its attempt, which is how a host declines
+  a job pinned to a version it does not serve (without it the host falls back
+  to `fail(..., true)` and the deploy exhausts the retry budget). Plus the two
+  from 1.0 proper:
   `deleteByRunAndStages(workflowRunId, stageIds)` is a new required method
   (delete every row for those stages of that run, any status, return the count),
   and `enqueueParallel` must now be idempotent on `(workflowRunId, stageId)` —

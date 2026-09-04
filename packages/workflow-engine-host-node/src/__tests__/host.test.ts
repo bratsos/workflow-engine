@@ -139,7 +139,10 @@ function createTestEnv(workflows: Workflow<any, any>[] = []) {
     jobTransport,
     eventSink,
     clock,
-    registry: { getWorkflow: (id) => registry.get(id) },
+    registry: {
+      getWorkflow: (id) => registry.get(id),
+      listWorkflows: () => Array.from(registry.values()),
+    },
   });
 
   return { kernel, persistence, blobStore, jobTransport, eventSink, clock };
@@ -734,5 +737,85 @@ describe("NodeHost", () => {
     expect(types).toContain("workflow:created");
     expect(types).toContain("workflow:started");
     expect(types).toContain("workflow:completed");
+  });
+
+  it('serves: "all" claims a run pinned to a version this build does not present', async () => {
+    const stage = createPassthroughStage("stage-1");
+    const workflow = new WorkflowBuilder(
+      "wf",
+      "Test Workflow",
+      "Test",
+      schema,
+      outputSchema,
+    )
+      .pipe(stage)
+      .build();
+    const { kernel, persistence, jobTransport } = createTestEnv([workflow]);
+
+    const run = await persistence.createRun({
+      workflowId: "wf",
+      workflowName: "Test Workflow",
+      workflowType: "test",
+      input: { data: "hello" },
+      definitionVersion: "v-from-another-build",
+    });
+
+    host = createNodeHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+      serves: "all",
+      orchestrationIntervalMs: 50,
+      jobPollIntervalMs: 20,
+    });
+    await host.start();
+
+    await waitFor(async () => {
+      const persisted = await persistence.getRun(run.id);
+      return persisted?.status === "RUNNING";
+    });
+    await host.stop();
+    host = null;
+
+    const persisted = await persistence.getRun(run.id);
+    expect(persisted?.status).toBe("RUNNING");
+  });
+
+  it("without serves the same run is left for the build that presents it", async () => {
+    const stage = createPassthroughStage("stage-1");
+    const workflow = new WorkflowBuilder(
+      "wf",
+      "Test Workflow",
+      "Test",
+      schema,
+      outputSchema,
+    )
+      .pipe(stage)
+      .build();
+    const { kernel, persistence, jobTransport } = createTestEnv([workflow]);
+
+    const run = await persistence.createRun({
+      workflowId: "wf",
+      workflowName: "Test Workflow",
+      workflowType: "test",
+      input: { data: "hello" },
+      definitionVersion: "v-from-another-build",
+    });
+
+    host = createNodeHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+      orchestrationIntervalMs: 20,
+      jobPollIntervalMs: 20,
+    });
+    await host.start();
+
+    await waitFor(async () => host!.getStats().orchestrationTicks >= 1);
+    await host.stop();
+    host = null;
+
+    const persisted = await persistence.getRun(run.id);
+    expect(persisted?.status).toBe("PENDING");
   });
 });

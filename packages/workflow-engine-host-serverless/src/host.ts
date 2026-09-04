@@ -17,6 +17,7 @@ import {
   type JobTransport,
   type Kernel,
   runMaintenanceTick as runMaintenanceTickCommands,
+  type ServedDefinition,
 } from "@bratsos/workflow-engine/kernel";
 
 // ============================================================================
@@ -41,6 +42,19 @@ export interface ServerlessHostConfig {
 
   /** Max pending runs to claim per maintenance tick (default: 10). */
   maxClaimsPerTick?: number;
+
+  /**
+   * Which definition versions this host may adopt and poll. Forwarded to
+   * `run.claimPending` and `stage.pollSuspended`.
+   *
+   * Left unset — the right default — the kernel derives it from the
+   * registry: a registry built with `createWorkflowRegistry` claims only
+   * runs this build can execute, which is what makes a rolling deploy safe.
+   * Pass `"all"` to claim and poll regardless of version (the pre-1.0
+   * behaviour), or an explicit list to run maintenance on behalf of
+   * another build.
+   */
+  serves?: readonly ServedDefinition[] | "all";
 
   /** Max suspended stages to check per tick (default: 10). */
   maxSuspendedChecksPerTick?: number;
@@ -150,6 +164,8 @@ class ServerlessHostImpl implements ServerlessHost {
   private readonly staleLeaseThresholdMs: number;
   private readonly jobAbsoluteTimeoutMs: number;
   private readonly maxClaimsPerTick: number;
+  /** See `HostConfig.serves`; `undefined` means "derive from the registry". */
+  private readonly serves: readonly ServedDefinition[] | "all" | undefined;
   private readonly maxSuspendedChecksPerTick: number;
   private readonly maxOutboxFlushPerTick: number;
   private readonly jobHeartbeatIntervalMs: number;
@@ -166,6 +182,7 @@ class ServerlessHostImpl implements ServerlessHost {
       config.jobAbsoluteTimeoutMs ?? HOST_DEFAULTS.jobAbsoluteTimeoutMs;
     this.maxClaimsPerTick =
       config.maxClaimsPerTick ?? HOST_DEFAULTS.maxClaimsPerTick;
+    this.serves = config.serves;
     this.maxSuspendedChecksPerTick =
       config.maxSuspendedChecksPerTick ??
       HOST_DEFAULTS.maxSuspendedChecksPerTick;
@@ -241,7 +258,10 @@ class ServerlessHostImpl implements ServerlessHost {
     let failed = 0;
 
     while (processed < maxJobs) {
-      const job = await this.jobTransport.dequeue();
+      const serves = this.dequeueServes();
+      const job = await this.jobTransport.dequeue(
+        serves !== undefined ? { serves } : undefined,
+      );
       if (!job) break;
 
       const result = await this.handleJob({
@@ -265,6 +285,17 @@ class ServerlessHostImpl implements ServerlessHost {
     return { processed, succeeded, failed };
   }
 
+  /**
+   * What to pass to `jobTransport.dequeue`. `"all"` means claim regardless
+   * of version, which is expressed by passing nothing; otherwise the
+   * kernel's registry answers, so the dequeue narrows on exactly what
+   * `run.claimPending` narrows on.
+   */
+  private dequeueServes(): readonly ServedDefinition[] | undefined {
+    if (this.serves === "all") return undefined;
+    return this.serves ?? this.kernel.servedDefinitions?.();
+  }
+
   async runMaintenanceTick(): Promise<MaintenanceTickResult> {
     // Claim pending runs, poll suspended stages, reap stale leases, flush
     // the outbox, and reap stuck runs — see runMaintenanceTick in
@@ -274,6 +305,7 @@ class ServerlessHostImpl implements ServerlessHost {
     const counts = await runMaintenanceTickCommands(this.kernel, {
       workerId: this.workerId,
       maxClaimsPerTick: this.maxClaimsPerTick,
+      ...(this.serves !== undefined ? { serves: this.serves } : {}),
       maxSuspendedChecksPerTick: this.maxSuspendedChecksPerTick,
       maxOutboxFlushPerTick: this.maxOutboxFlushPerTick,
       staleLeaseThresholdMs: this.staleLeaseThresholdMs,

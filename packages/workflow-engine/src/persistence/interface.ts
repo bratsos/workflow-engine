@@ -499,6 +499,13 @@ export interface EnqueueJobInput {
    * which is the default.
    */
   groupKey?: string;
+  /**
+   * The definition version of the run this job belongs to (null for a run
+   * created before the consumer migrated); stored on the payload as
+   * `_definitionVersion` so a dequeue can decline a job whose run this build
+   * cannot serve, without joining to workflow_runs.
+   */
+  definitionVersion?: string | null;
 }
 
 export interface DequeueResult {
@@ -516,6 +523,18 @@ export interface DequeueResult {
    * only lands if this attempt is still the current one.
    */
   startedAt: Date;
+}
+
+export interface DequeueOptions {
+  /**
+   * When supplied, only jobs whose run this caller can serve are claimed.
+   * A job whose payload carries a `_definitionVersion` not in `serves` is left
+   * for a host that presents that version; a job with no `_definitionVersion`
+   * is claimable when `serves` names its `_workflowId`. A transport that
+   * cannot express the filter MAY ignore it, because the kernel's
+   * version-ghost deferral is the backstop.
+   */
+  serves?: readonly ServedDefinition[];
 }
 
 /**
@@ -667,8 +686,18 @@ export interface PersistenceCore {
     now?: Date;
     /**
      * The definitions the claiming host is built to serve. When supplied,
-     * only runs pinned to one of these (workflowId, version) pairs — plus
-     * runs with a `null` version, which predate versioning — are claimed.
+     * a run is claimable only if it is pinned to one of these
+     * (workflowId, version) pairs, or is unpinned (`definitionVersion` is
+     * `null`, i.e. it predates the consumer's migration) *and* one of the
+     * pairs names its workflow. An empty array claims nothing: a host
+     * that serves no workflow has no work.
+     *
+     * The workflow-id restriction on the unpinned arm matters in a fleet:
+     * without it every host claims the whole pre-migration population,
+     * and one whose registry lacks the workflow adopts a run only to
+     * fail it with `WORKFLOW_NOT_FOUND`. Deciding it in the query is what
+     * keeps a host from taking work it cannot do.
+     *
      * Omit it to claim any pending run, which is the pre-1.0 behaviour.
      */
     serves?: readonly ServedDefinition[];
@@ -683,6 +712,26 @@ export interface PersistenceCore {
    * rather than failing to start.
    */
   supportsDefinitionVersioning(): boolean;
+
+  /**
+   * Optional. Confirms {@link PersistenceCore.supportsDefinitionVersioning}
+   * against the live database, once, and resolves to the answer every
+   * later call will give.
+   *
+   * An adapter whose capability answer is derived from something other
+   * than the database — the Prisma adapter reads the *generated client*,
+   * which is regenerated before the migration is applied on every first
+   * migration and on any rolling deploy that ships code first — implements
+   * this so the disagreement is found before it becomes a `42703` on every
+   * claim. The kernel awaits it on the paths that would otherwise touch
+   * the versioning columns; an adapter that does not need it (the
+   * in-memory one, whose answer is its own configuration) omits it.
+   *
+   * MUST be safe to call inside a caller's transaction, so it may not
+   * issue a statement that can fail — a failed statement aborts the whole
+   * transaction, including work the caller did before it.
+   */
+  ensureDefinitionVersioningDetected?(): Promise<boolean>;
 
   /**
    * Stores a definition snapshot if `(workflowId, version)` is not already
@@ -724,7 +773,28 @@ export interface PersistenceCore {
     runId: string,
     options?: { status?: Status; orderBy?: "asc" | "desc" },
   ): Promise<WorkflowStageRecord[]>;
-  getSuspendedStages(beforeDate: Date): Promise<WorkflowStageRecord[]>;
+  /**
+   * Suspended stages whose `nextPollAt` has come due, oldest deadline
+   * first, capped at `limit`.
+   *
+   * Both narrowings belong here rather than in the caller. Without the
+   * ordering and the cap the adapter returns *every* ready row and the
+   * handler slices in JS, so a row that keeps coming back — a stage this
+   * build cannot serve, released for another host to take — permanently
+   * occupies a candidate slot and pushes servable stages out of the
+   * window. `serves` is the same filter `claimNextPendingRun` applies to
+   * runs, evaluated against the stage's run, so an unserving host does not
+   * even claim the poll lease of a stage that is not its work. An adapter
+   * whose schema has no `definitionVersion` column ignores `serves`; such
+   * a database has no pinned runs, so ignoring it is exact.
+   */
+  getSuspendedStages(
+    beforeDate: Date,
+    options?: {
+      limit?: number;
+      serves?: readonly ServedDefinition[];
+    },
+  ): Promise<WorkflowStageRecord[]>;
   deleteStage(id: string): Promise<void>;
 
   // WorkflowLog operations
@@ -888,6 +958,14 @@ export interface AICallLogger {
 
 export interface JobQueue {
   /**
+   * The dotted `groupBy` path this queue's fairness cap reads, or `null` when
+   * fairness is off (or undefined when unsupported). Read by
+   * `createSpillingJobTransport` so a spilled payload still carries its group
+   * key.
+   */
+  readonly fairnessGroupBy?: string | null;
+
+  /**
    * Enqueue multiple stages in parallel (same execution group).
    *
    * Idempotent on `(workflowRunId, stageId)`: at most one job row may
@@ -917,7 +995,7 @@ export interface JobQueue {
   /**
    * Atomically dequeue the next available job
    */
-  dequeue(): Promise<DequeueResult | null>;
+  dequeue(options?: DequeueOptions): Promise<DequeueResult | null>;
 
   /**
    * Mark job as completed.
@@ -942,6 +1020,25 @@ export interface JobQueue {
   suspend(
     jobId: string,
     nextPollAt: Date,
+    fence?: JobAckFence,
+  ): Promise<JobAckOutcome>;
+
+  /**
+   * Return a claimed job to PENDING with a later nextPollAt WITHOUT counting
+   * the claim as an attempt (the dequeue incremented attempt; this undoes it).
+   * `fail(id, err, true)` is the wrong shape for work a host declines rather
+   * than fails: declining is not a failed attempt, and a condition that lasts
+   * for a whole deploy — a run pinned to a version this build does not
+   * present — exhausts the three-attempt budget in about fifteen seconds and
+   * takes the job row terminal.
+   *
+   * Optional: a transport that does not implement it falls back to fail with
+   * retry, which is correct but bounded by the budget.
+   */
+  defer?(
+    jobId: string,
+    nextPollAt: Date,
+    reason: string,
     fence?: JobAckFence,
   ): Promise<JobAckOutcome>;
 

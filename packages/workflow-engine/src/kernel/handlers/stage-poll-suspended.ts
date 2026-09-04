@@ -35,7 +35,7 @@ import type {
   StagePollSuspendedCommand,
   StagePollSuspendedResult,
 } from "../commands";
-import { servesRun } from "../helpers/definition-pinning.js";
+import { servedDefinitions, servesRun } from "../helpers/definition-pinning.js";
 import {
   buildAnnotationEvents,
   buildStageExecutionContext,
@@ -239,19 +239,30 @@ async function claimSuspendedStage(
 }
 
 /**
- * Hands a claimed stage back after a skipped Phase-2 outcome (the run was
- * claimed by another writer, or is no longer RUNNING) so the next tick
- * retries it instead of waiting out the claim lease. Version-guarded: when
- * the row was written since the claim (the cancel cascade, a later
- * claimant after the lease elapsed), that writer's `nextPollAt` stands.
+ * Hands a claimed stage back so it is polled again instead of waiting out
+ * the claim lease. Version-guarded: when the row was written since the
+ * claim (the cancel cascade, a later claimant after the lease elapsed),
+ * that writer's `nextPollAt` stands.
+ *
+ * `nextPollAt` defaults to now, which is right for a *transient* skip (the
+ * run was claimed by another writer, or is no longer RUNNING): the
+ * condition clears next tick, so making the stage immediately eligible
+ * again costs one extra visit. It is wrong for a condition that persists,
+ * and callers whose reason lasts for a whole deploy — a run this build
+ * cannot serve — must pass the deadline the row already carried instead.
+ * Released to now, such a stage is re-claimed and re-released every tick
+ * forever, two version-bumping writes each time, and because it never
+ * leaves the ready set it permanently occupies one of the tick's candidate
+ * slots and pushes servable stages out of the window.
  */
 async function releaseStageClaim(
   stageRecord: WorkflowStageRecord,
   deps: KernelDeps,
+  nextPollAt?: Date,
 ): Promise<void> {
   try {
     await deps.persistence.updateStage(stageRecord.id, {
-      nextPollAt: deps.clock.now(),
+      nextPollAt: nextPollAt ?? deps.clock.now(),
       expectedVersion: stageRecord.version,
     });
   } catch (error) {
@@ -519,14 +530,23 @@ export async function handleStagePollSuspended(
   deps: KernelDeps,
 ): Promise<HandlerResult<StagePollSuspendedResult>> {
   const maxChecks = command.maxChecks ?? 50;
+  // The same answer `run.claimPending` derives, for the same reason: a
+  // host must poll the suspended stages of the runs it would adopt, and
+  // must not touch the ones it would not.
+  const serves =
+    command.serves === "all"
+      ? undefined
+      : (command.serves ?? servedDefinitions(deps.registry));
+  await deps.persistence.ensureDefinitionVersioningDetected?.();
 
-  // 1. Get suspended stages that are ready to be polled (no transaction)
-  const suspendedStages = await deps.persistence.getSuspendedStages(
+  // 1. Get the ready stages this build can serve, oldest deadline first
+  //    and already capped (no transaction). Both narrowings are in the
+  //    query: slicing an unfiltered, unordered result in JS let a stage
+  //    this host cannot serve hold a candidate slot forever.
+  const stagesToCheck = await deps.persistence.getSuspendedStages(
     deps.clock.now(),
+    { limit: maxChecks, ...(serves !== undefined ? { serves } : {}) },
   );
-
-  // 2. Limit to maxChecks
-  const stagesToCheck = suspendedStages.slice(0, maxChecks);
 
   let checked = 0;
   let resumed = 0;
@@ -591,8 +611,25 @@ export async function handleStagePollSuspended(
     //      during a rolling deploy the old and new builds poll the same
     //      table, so an unserving host re-claiming every tick can starve
     //      the serving one indefinitely.
+    //
+    //      It is handed back to the deadline the row *already had*, not to
+    //      now. This condition lasts for the whole deploy, so releasing to
+    //      now would make the stage permanently ready and permanently
+    //      re-claimed — see `releaseStageClaim`. Restoring the original
+    //      deadline leaves the row exactly as it was found, which is what
+    //      "this is not my work" should cost.
+    //
+    //      This is a backstop, not the mechanism: `getSuspendedStages`
+    //      already filters on `serves`, so an unserving host normally
+    //      never sees the row. It still fires for an adapter that cannot
+    //      apply the filter, and for a run whose version changed between
+    //      the query and the claim.
     if (!servesRun(run, workflow)) {
-      await releaseStageClaim(stageRecord, deps);
+      await releaseStageClaim(
+        stageRecord,
+        deps,
+        candidate.nextPollAt ?? undefined,
+      );
       continue;
     }
 

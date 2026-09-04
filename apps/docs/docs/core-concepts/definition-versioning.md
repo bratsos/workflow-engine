@@ -182,10 +182,37 @@ See [Retry, restart and rerun](./redriving-runs.md) for the full
 ## Migrating an existing database
 
 Definition versioning adds two columns and one table. **A database that has
-not been migrated keeps working**: the Prisma adapter detects that the
-generated client has no `workflowDefinition` model, stores no versions, and
-behaves exactly as it did before — runs are unpinned, claiming is
+not been migrated keeps working** — runs are unpinned, claiming is
 unfiltered, and `run.listVersions` reports `supported: false`.
+
+The Prisma adapter establishes that in two steps, and it is worth knowing
+which is which. First it reads the *generated client*: no `workflowDefinition`
+delegate means no versioning, full stop. That check alone is not enough,
+because `prisma generate` runs before `migrate deploy` — on your first
+migration, and on any rolling deploy that ships code ahead of its migration
+— and a regenerated client against an unmigrated database would advertise
+columns the database does not have. So the adapter also asks the database
+once, lazily, the first time a versioning-sensitive path runs, and turns
+versioning off if the schema is not there yet. That question is a catalogue
+read (`to_regclass` / `pragma_table_info`), never a query against your
+tables, so it cannot fail and therefore cannot abort a transaction you are
+running the kernel inside.
+
+If you would rather not have the probe at all, answer it yourself:
+
+```ts
+createPrismaWorkflowPersistence(prisma, { definitionVersioning: false })
+```
+
+An explicit `definitionVersioning` skips both checks — `false` for a client
+whose schema carries the models against a database you deliberately leave
+unmigrated, `true` for a client whose model surface the structural check
+cannot see (a hand-written wrapper or proxy).
+
+Still, prefer migrating before you deploy the code that uses it. The probe
+makes the unmigrated state survivable, not desirable: until the migration
+lands, nothing is pinned, so a rolling deploy in that window has no version
+filtering to protect it.
 
 Add to your `schema.prisma`:
 
@@ -207,10 +234,12 @@ model WorkflowDefinition {
   structureHash String
 
   @@id([workflowId, version])
-  @@index([workflowId])
   @@map("workflow_definitions")
 }
 ```
+
+(No `@@index([workflowId])`: the compound primary key already leads with
+that column, so a lookup by workflow alone plans identically either way.)
 
 Then:
 
@@ -237,8 +266,6 @@ CREATE TABLE "workflow_definitions" (
   "structureHash" TEXT NOT NULL,
   CONSTRAINT "workflow_definitions_pkey" PRIMARY KEY ("workflowId", "version")
 );
-CREATE INDEX "workflow_definitions_workflowId_idx"
-  ON "workflow_definitions" ("workflowId");
 ```
 
 Both changes are additive: `definitionVersion` is nullable and
@@ -254,17 +281,41 @@ their lives; every run created after it is pinned.
   anything else with `listWorkflows`). Until then, nothing changes.
 - **A run whose workflow this host does not have is no longer failed at
   claim time.** Previously `run.claimPending` adopted it and marked it
-  `FAILED` with `WORKFLOW_NOT_FOUND`; with an enumerating registry it is
-  left `PENDING` for a host that has the workflow, and reported by
-  `run.listVersions`. The old behaviour is still what you get from a
-  non-enumerating registry, or with `serves: "all"`.
+  `FAILED` with `WORKFLOW_NOT_FOUND`; with an enumerating registry the
+  claim query does not return it at all, so it is left `PENDING` for a host
+  that has the workflow, and reported by `run.listVersions`. That holds for
+  the pre-migration population too: an unpinned run is claimable by any
+  host whose registry has its workflow, and by no other. The old behaviour
+  is still what you get from a non-enumerating registry, or with
+  `serves: "all"`.
+- **Jobs are filtered the same way.** The job dequeue narrows on the run's
+  version as well, so a host does not claim a job it would only hand back.
+  When one slips through anyway — a push transport that cannot select, or a
+  version that changed after the job was enqueued — the job is *deferred*:
+  returned to the queue with a delay and with the attempt given back, never
+  counted against its retry budget. Declining is not failing.
+- **Suspended stages are filtered the same way.** `stage.pollSuspended`
+  lists only stages of runs this build serves, ordered by poll deadline and
+  capped by `maxChecks` in the query.
 
 ### Opting out
 
-There is no global "off" switch, because there is nothing to switch off:
-pinning is only ever as strict as the versions actually recorded. If you do
-not migrate the schema, runs are never pinned. If you migrate but want
-unfiltered claiming, keep passing `serves: "all"` on `run.claimPending`.
+There is no global "off" switch for pinning, because there is nothing to
+switch off: pinning is only ever as strict as the versions actually
+recorded. If you do not migrate the schema, runs are never pinned.
+
+What you can turn off is the *filtering*. Pass `serves: "all"` and claiming,
+polling and dequeuing all go back to the pre-1.0, version-blind behaviour.
+Both shipped hosts take it as configuration:
+
+```ts
+const host = new NodeHost({ kernel, jobTransport, serves: "all" });
+```
+
+`runMaintenanceTick` takes the same option for a hand-rolled host, and
+`run.claimPending` / `stage.pollSuspended` take it per dispatch. Use it when
+your fleet is homogeneous by construction and you would rather one build
+picked up everything than have work wait for the build that pins it.
 
 ## Checking a change before you ship it
 

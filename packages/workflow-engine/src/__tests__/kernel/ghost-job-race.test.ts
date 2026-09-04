@@ -193,6 +193,70 @@ describe("ghost jobs at the host seam", () => {
     expect(run?.status).toBe("RUNNING");
   });
 
+  it("defers a job whose run this build does not serve instead of spending an attempt", async () => {
+    const stageSchema = z.object({ val: z.string() });
+    const makeStage = (id: string) =>
+      defineStage({
+        id,
+        name: `Stage ${id}`,
+        schemas: {
+          input: stageSchema,
+          output: stageSchema,
+          config: z.object({}),
+        },
+        async execute(ctx) {
+          return { output: ctx.input };
+        },
+      });
+    const v1 = defineWorkflow("ghost-version-defer", { input: stageSchema })
+      .pipe(makeStage("a"))
+      .build();
+    const v2 = defineWorkflow("ghost-version-defer", { input: stageSchema })
+      .pipe(makeStage("a"))
+      .pipe(makeStage("b"))
+      .build();
+
+    const { kernel, jobTransport, registry } = createTestKernel([v1]);
+    const created = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "version-defer-1",
+      workflowId: v1.id,
+      input: { val: "hello" },
+    });
+    await kernel.dispatch({ type: "run.claimPending", workerId: "worker-1" });
+
+    const job = await jobTransport.dequeue();
+    expect(job).not.toBeNull();
+    expect(job!.attempt).toBe(1);
+
+    // The build changes under the running run.
+    registry.set(v1.id, v2);
+
+    const outcome = await executeJobWithHeartbeat(kernel, {
+      jobTransport,
+      job: {
+        jobId: job!.jobId,
+        workflowRunId: job!.workflowRunId,
+        workflowId: job!.workflowId,
+        stageId: job!.stageId,
+        attempt: job!.attempt,
+        maxAttempts: job!.maxAttempts,
+        payload: job!.payload,
+      },
+    });
+
+    expect(outcome.deferred).toBe(true);
+    expect(outcome.willRetry).toBe(true);
+
+    const [row] = await jobTransport.getJobsByWorkflowRun(
+      created.workflowRunId,
+    );
+    expect(row!.status).toBe("PENDING");
+    expect(row!.nextPollAt).not.toBeNull();
+    expect(row!.nextPollAt!.getTime()).toBeGreaterThan(Date.now());
+    expect(row!.attempt).toBe(0);
+  });
+
   it("stops re-delivering a racing job once its attempt budget is spent", async () => {
     const workflow = createWorkflow("ghost-race-budget");
     const { kernel, jobTransport } = createTestKernel([workflow]);

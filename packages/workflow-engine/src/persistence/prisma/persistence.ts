@@ -70,11 +70,21 @@ export interface PrismaWorkflowPersistenceOptions {
    * (`workflow_runs.definitionVersion`, `workflow_runs.redriveCount` and
    * the `workflow_definitions` table).
    *
-   * Left unset, it is detected from the generated client: versioning is on
-   * only when the client exposes a `workflowDefinition` model. A database
-   * that has not been migrated therefore keeps working unchanged instead
-   * of failing to start — runs are simply not pinned. Set it explicitly
-   * only for a client whose model surface the detection cannot see.
+   * Left unset, it is detected in two stages. The generated client is
+   * checked synchronously (versioning is off unless the client exposes a
+   * `workflowDefinition` model), and the *database* is checked once,
+   * lazily, the first time a versioning-sensitive path runs — see
+   * {@link PrismaWorkflowPersistence.ensureDefinitionVersioningDetected}.
+   * The client check alone is not enough: `prisma generate` after editing
+   * the schema but before `migrate deploy` (every consumer passes through
+   * that state, and so does any rolling deploy that ships code first)
+   * leaves a client that advertises the models against a database that
+   * has neither, and every claim then dies with a raw `42703`.
+   *
+   * Set it explicitly to skip both checks: `false` on a client whose
+   * schema carries the models but whose database is deliberately left
+   * unmigrated, `true` on a client whose model surface the structural
+   * detection cannot see (a hand-written wrapper, a proxy).
    */
   definitionVersioning?: boolean;
 }
@@ -88,6 +98,83 @@ function detectDefinitionVersioning(prisma: PrismaClient): boolean {
     typeof model?.findUnique === "function" &&
     typeof model?.create === "function"
   );
+}
+
+/**
+ * Capability state, shared by reference between a persistence and every
+ * transactional clone of it, so the database probe below runs once per
+ * client and a downgrade one of them discovers is visible to all of them.
+ */
+interface DefinitionVersioningState {
+  /** Current best knowledge: whether versioning columns may be touched. */
+  enabled: boolean;
+  /** True when the caller configured the answer, so nothing may probe. */
+  pinned: boolean;
+  /** The in-flight or settled probe, memoised. */
+  probe: Promise<boolean> | null;
+}
+
+/**
+ * Asks the *database* whether the definition-versioning schema is present.
+ *
+ * Deliberately a catalogue read and nothing else. A probe that touched the
+ * real tables (`SELECT "definitionVersion" FROM "workflow_runs" LIMIT 0`)
+ * would raise `42703` on an unmigrated database, and an error inside a
+ * consumer's interactive transaction aborts *their* transaction — the one
+ * thing this adapter must never do. `to_regclass` and `pragma_table_info`
+ * return "absent" rather than raising, so this is safe to run anywhere,
+ * including inside someone else's transaction.
+ *
+ * Returns `null` when the answer cannot be established (no raw-query
+ * escape hatch, an unrecognised database, or an unexpected failure), in
+ * which case the caller keeps the structural answer it already had.
+ */
+async function probeDefinitionVersioningSchema(
+  prisma: PrismaClient,
+  databaseType: DatabaseType,
+): Promise<boolean | null> {
+  // Called through `prisma.` rather than a destructured local: Prisma's
+  // runtime reads internal state off `this` inside its own method bodies.
+  if (typeof prisma.$queryRawUnsafe !== "function") return null;
+  const sql =
+    databaseType === "postgresql"
+      ? `SELECT
+           (to_regclass('"workflow_definitions"') IS NOT NULL) AS has_table,
+           EXISTS (
+             SELECT 1 FROM pg_catalog.pg_attribute
+             WHERE attrelid = to_regclass('"workflow_runs"')
+               AND attname = 'definitionVersion'
+               AND NOT attisdropped
+           ) AS has_column`
+      : databaseType === "sqlite"
+        ? `SELECT
+             (SELECT COUNT(*) FROM sqlite_master
+               WHERE type = 'table' AND name = 'workflow_definitions') AS has_table,
+             (SELECT COUNT(*) FROM pragma_table_info('workflow_runs')
+               WHERE name = 'definitionVersion') AS has_column`
+        : null;
+  if (sql === null) return null;
+  try {
+    const rows =
+      await prisma.$queryRawUnsafe<
+        Array<{ has_table: unknown; has_column: unknown }>
+      >(sql);
+    const row = rows[0];
+    if (!row) return null;
+    return truthy(row.has_table) && truthy(row.has_column);
+  } catch {
+    // A catalogue read should not fail; if it does, the safe answer is
+    // "no new information" rather than turning a working process off.
+    return null;
+  }
+}
+
+/** Postgres returns booleans, SQLite returns 0/1 (as number or bigint). */
+function truthy(value: unknown): boolean {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "bigint") return value !== 0n;
+  if (typeof value === "number") return value !== 0;
+  return false;
 }
 
 const IDEMPOTENCY_IN_PROGRESS_MARKER = {
@@ -113,7 +200,11 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
   private skipTransactions: boolean;
   private statusEnumName: string;
   private now: () => Date;
-  private definitionVersioning: boolean;
+  /**
+   * Shared with every transactional clone (see `withTransaction`), so the
+   * database probe runs once per client rather than once per transaction.
+   */
+  private versioning: DefinitionVersioningState;
 
   /** The options as given, re-applied to every transactional clone. */
   private readonly options: PrismaWorkflowPersistenceOptions;
@@ -135,12 +226,52 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     this.databaseType = options.databaseType ?? "postgresql";
     this.skipTransactions = options.skipInteractiveTransactions ?? false;
     this.now = options.now ?? (() => new Date());
-    this.definitionVersioning =
-      options.definitionVersioning ?? detectDefinitionVersioning(prisma);
+    this.versioning = {
+      enabled:
+        options.definitionVersioning ?? detectDefinitionVersioning(prisma),
+      pinned: options.definitionVersioning !== undefined,
+      probe: null,
+    };
   }
 
   supportsDefinitionVersioning(): boolean {
-    return this.definitionVersioning;
+    return this.versioning.enabled;
+  }
+
+  /**
+   * Confirms the synchronous capability guess against the database, once
+   * per client, and returns the answer every later
+   * `supportsDefinitionVersioning()` will give.
+   *
+   * The guess is structural: it reads the *generated client*, so it is
+   * true the moment `prisma generate` runs, which is before `migrate
+   * deploy` on every first migration and on any rolling deploy that ships
+   * code ahead of its migration. Left unconfirmed, `run.create` fails
+   * `P2022`, `insertDefinitionIfAbsent` fails `P2021` and every claim dies
+   * on a raw `42703` — the process cannot serve a single run.
+   *
+   * The confirmation only ever turns versioning *off*: a client with no
+   * `workflowDefinition` delegate cannot use the tables however migrated
+   * the database is. It is a catalogue read (see
+   * `probeDefinitionVersioningSchema`), so it cannot abort a caller's
+   * transaction, and it is skipped entirely when `definitionVersioning`
+   * was configured explicitly.
+   *
+   * Called by the kernel from the paths that would otherwise touch the
+   * columns — `run.create`'s snapshot recording, `run.claimPending` and
+   * `run.listVersions` — so consumers do not have to call it themselves.
+   */
+  async ensureDefinitionVersioningDetected(): Promise<boolean> {
+    const state = this.versioning;
+    if (state.pinned || !state.enabled) return state.enabled;
+    state.probe ??= probeDefinitionVersioningSchema(
+      this.prisma,
+      this.databaseType,
+    ).then((result) => {
+      if (result === false) state.enabled = false;
+      return state.enabled;
+    });
+    return state.probe;
   }
 
   async withTransaction<T>(
@@ -158,6 +289,10 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       // transaction (`42704 type "Status" does not exist` on every
       // `run.claimPending` for a schema that names the enum differently).
       const txPersistence = new PrismaWorkflowPersistence(tx, this.options);
+      // Share the capability state by reference: the clone must not
+      // re-probe on every transaction, and a downgrade either side
+      // discovers has to be visible to the other.
+      txPersistence.versioning = this.versioning;
       return fn(txPersistence);
     });
   }
@@ -180,7 +315,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
         // Only written when the schema has the column: on an unmigrated
         // database Prisma would reject the unknown argument and every
         // run.create would fail.
-        ...(this.definitionVersioning
+        ...(this.versioning.enabled
           ? { definitionVersion: data.definitionVersion ?? null }
           : {}),
       },
@@ -286,7 +421,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
   }): Promise<WorkflowRunRecord | null> {
     // A schema without the column cannot be filtered on it; such a
     // database has no pinned runs either, so ignoring `serves` is exact.
-    const serves = this.definitionVersioning ? options?.serves : undefined;
+    const serves = this.versioning.enabled ? options?.serves : undefined;
     if (this.databaseType === "sqlite") {
       return this.claimNextPendingRunOptimistic(0, serves);
     }
@@ -301,15 +436,31 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
 
   /**
    * Prisma `where` clause restricting a claim to the definitions a host
-   * serves. Runs with a `null` version predate versioning and stay
-   * claimable by everyone.
+   * serves: a run pinned to a version in `serves`, or an unpinned run —
+   * one created before the consumer migrated — of a workflow this host
+   * *has*.
+   *
+   * The workflow-id restriction on the unpinned arm is the point. Left off,
+   * the pre-migration population is claimable by every host in the fleet
+   * including one whose registry has never heard of the workflow, and
+   * `run.claimPending` then adopts it and marks it FAILED with
+   * `WORKFLOW_NOT_FOUND` — destroying, at claim time, exactly the runs
+   * versioning exists to protect. Deciding it here rather than after
+   * adopting the row means the host never takes work it cannot do.
+   *
+   * `serves` empty means the registry enumerated no workflows: this host
+   * serves nothing, and the honest predicate is "no row".
    */
   private servesFilter(
     serves: readonly ServedDefinition[],
   ): Record<string, unknown> {
+    // `id IN ()` rather than `OR: []`: unambiguously "no row" on every
+    // Prisma version, where an empty `OR` has changed meaning between them.
+    if (serves.length === 0) return { id: { in: [] as string[] } };
+    const workflowIds = [...new Set(serves.map((s) => s.workflowId))];
     return {
       OR: [
-        { definitionVersion: null },
+        { definitionVersion: null, workflowId: { in: workflowIds } },
         ...serves.map((s) => ({
           workflowId: s.workflowId,
           definitionVersion: s.version,
@@ -353,14 +504,30 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       let servesClause = "";
       if (serves !== undefined) {
         if (serves.length === 0) {
-          servesClause = `AND "definitionVersion" IS NULL`;
+          // The registry enumerated nothing: this host serves no workflow,
+          // so it claims no run. Claiming the unpinned population here
+          // (the pre-1.0 predicate) hands it runs it will immediately fail
+          // with WORKFLOW_NOT_FOUND.
+          servesClause = `AND false`;
         } else {
           const rows = serves.map((s) => {
             const base = 4 + extraParams.length;
             extraParams.push(s.workflowId, s.version);
             return `($${base}, $${base + 1})`;
           });
-          servesClause = `AND ("definitionVersion" IS NULL OR ("workflowId", "definitionVersion") IN (${rows.join(", ")}))`;
+          const ids = [...new Set(serves.map((s) => s.workflowId))].map(
+            (workflowId) => {
+              extraParams.push(workflowId);
+              return `$${3 + extraParams.length}`;
+            },
+          );
+          // Two arms, and the second one's workflow-id restriction is the
+          // point: an unpinned run (created before the consumer migrated)
+          // is claimable by any host that *has* the workflow, but not by a
+          // host whose registry has never heard of it — which would adopt
+          // it and mark it FAILED with WORKFLOW_NOT_FOUND.
+          servesClause = `AND (("workflowId", "definitionVersion") IN (${rows.join(", ")})
+            OR ("definitionVersion" IS NULL AND "workflowId" IN (${ids.join(", ")})))`;
         }
       }
       results = await this.prisma.$queryRawUnsafe<any[]>(
@@ -487,7 +654,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     input: CreateDefinitionInput,
   ): Promise<WorkflowDefinitionRecord | null> {
     const model = this.prisma.workflowDefinition;
-    if (!this.definitionVersioning || !model) return null;
+    if (!this.versioning.enabled || !model) return null;
     const existing = await model.findUnique({
       where: {
         workflowId_version: {
@@ -533,7 +700,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     version: string,
   ): Promise<WorkflowDefinitionRecord | null> {
     const model = this.prisma.workflowDefinition;
-    if (!this.definitionVersioning || !model) return null;
+    if (!this.versioning.enabled || !model) return null;
     const row = await model.findUnique({
       where: { workflowId_version: { workflowId, version } },
     });
@@ -543,7 +710,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
   async countRunsByDefinitionVersion(
     filter?: DefinitionVersionCountFilter,
   ): Promise<DefinitionVersionCount[]> {
-    if (!this.definitionVersioning) return [];
+    if (!this.versioning.enabled) return [];
     const groupBy = this.prisma.workflowRun.groupBy;
     if (typeof groupBy !== "function") {
       throw new Error(
@@ -724,7 +891,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       output: data.output as unknown,
       totalCost: data.totalCost,
       totalTokens: data.totalTokens,
-      ...(this.definitionVersioning
+      ...(this.versioning.enabled
         ? {
             definitionVersion: data.definitionVersion,
             redriveCount: data.redriveCount,
@@ -789,15 +956,28 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     return stages.map((s: Record<string, unknown>) => this.mapWorkflowStage(s));
   }
 
-  async getSuspendedStages(beforeDate: Date): Promise<WorkflowStageRecord[]> {
+  async getSuspendedStages(
+    beforeDate: Date,
+    options?: { limit?: number; serves?: readonly ServedDefinition[] },
+  ): Promise<WorkflowStageRecord[]> {
+    // `serves` filters through the relation to `workflow_runs`, so it can
+    // only be applied on a schema that has the column at all.
+    const serves = this.versioning.enabled ? options?.serves : undefined;
     const stages = await this.prisma.workflowStage.findMany({
       where: {
         status: this.enums.status("SUSPENDED"),
         nextPollAt: { lte: beforeDate },
+        ...(serves !== undefined
+          ? { workflowRun: this.servesFilter(serves) }
+          : {}),
       },
       include: {
         workflowRun: { select: { workflowType: true } },
       },
+      // Oldest deadline first, so the cap below takes the stages that have
+      // been waiting longest rather than whatever the heap hands back.
+      orderBy: [{ nextPollAt: "asc" }],
+      ...(options?.limit !== undefined ? { take: options.limit } : {}),
     });
     return stages.map((s: Record<string, unknown>) => this.mapWorkflowStage(s));
   }

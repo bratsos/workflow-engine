@@ -28,6 +28,11 @@ export async function handleRunClaimPending(
     command.serves === "all"
       ? undefined
       : (command.serves ?? servedDefinitions(deps.registry));
+  // Confirm the adapter's versioning capability against the database
+  // before the first claim: on the Prisma adapter the sync answer comes
+  // from the generated client, and an unmigrated database behind a
+  // regenerated client fails every claim with a raw `42703`.
+  await deps.persistence.ensureDefinitionVersioningDetected?.();
   const claimed: Array<{
     workflowRunId: string;
     workflowId: string;

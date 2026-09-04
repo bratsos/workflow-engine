@@ -251,12 +251,16 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
     }
 
     const serves = options?.serves;
-    // A run with a null version predates versioning and stays claimable
-    // by every host; a pinned run is only claimed by a host that reports
-    // serving that (workflowId, version) pair.
+    // A pinned run is only claimed by a host that reports serving that
+    // (workflowId, version) pair. A run with a null version predates
+    // versioning and is claimable by any host that *has* the workflow —
+    // not by every host: one whose registry has never heard of it would
+    // adopt the run and immediately fail it with WORKFLOW_NOT_FOUND.
     const canServe = (run: WorkflowRunRecord): boolean => {
       if (serves === undefined) return true;
-      if (run.definitionVersion === null) return true;
+      if (run.definitionVersion === null) {
+        return serves.some((s) => s.workflowId === run.workflowId);
+      }
       return serves.some(
         (s) =>
           s.workflowId === run.workflowId &&
@@ -468,19 +472,47 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
     return stages.map((s) => ({ ...s }));
   }
 
-  async getSuspendedStages(beforeDate: Date): Promise<WorkflowStageRecord[]> {
+  async getSuspendedStages(
+    beforeDate: Date,
+    options?: { limit?: number; serves?: readonly ServedDefinition[] },
+  ): Promise<WorkflowStageRecord[]> {
+    const serves = options?.serves;
+    // Same predicate `claimNextPendingRun` applies, read through the
+    // stage's run: a pinned run needs an exact (workflowId, version)
+    // match, an unpinned one needs only the workflow.
+    const runServed = (workflowRunId: string): boolean => {
+      if (serves === undefined) return true;
+      const run = this.runs.get(workflowRunId);
+      if (!run) return false;
+      if (run.definitionVersion === null) {
+        return serves.some((s) => s.workflowId === run.workflowId);
+      }
+      return serves.some(
+        (s) =>
+          s.workflowId === run.workflowId &&
+          s.version === run.definitionVersion,
+      );
+    };
     const seenIds = new Set<string>();
-    return Array.from(this.stages.values())
+    const ready = Array.from(this.stages.values())
       .filter((s) => {
         if (seenIds.has(s.id)) return false;
         seenIds.add(s.id);
         return (
           s.status === "SUSPENDED" &&
           s.nextPollAt !== null &&
-          s.nextPollAt <= beforeDate
+          s.nextPollAt <= beforeDate &&
+          runServed(s.workflowRunId)
         );
       })
+      // Oldest deadline first, matching the Prisma adapter, so the cap
+      // takes the stages that have been waiting longest.
+      .sort(
+        (a, b) =>
+          (a.nextPollAt?.getTime() ?? 0) - (b.nextPollAt?.getTime() ?? 0),
+      )
       .map((s) => ({ ...s }));
+    return options?.limit !== undefined ? ready.slice(0, options.limit) : ready;
   }
 
   async getFirstSuspendedStageReadyToResume(
