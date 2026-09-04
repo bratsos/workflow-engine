@@ -41,6 +41,7 @@ export type {
 export {
   AIServicesNotConfiguredError,
   IdempotencyInProgressError,
+  SpilledPayloadUnavailableError,
 } from "./errors.js";
 
 // Event types
@@ -138,3 +139,17 @@ export type {
   StepRecord,
   WorkflowAnnotationRecord,
 } from "./ports.js";
+// Claim-check spilling for unbounded payloads
+export {
+  createPayloadSpill,
+  createSpillingJobTransport,
+  DEFAULT_SPILL_THRESHOLD_BYTES,
+  isSpillRef,
+  type PayloadSpill,
+  type PayloadSpillOptions,
+  SPILL_REF_MARKER,
+  type SpillingJobTransportOptions,
+  type SpillRef,
+  stepSpillPrefix,
+  withStepResultSpill,
+} from "./spill.js";

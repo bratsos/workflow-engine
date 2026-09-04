@@ -75,6 +75,7 @@ import type {
   Persistence,
   StepLedger,
 } from "./ports";
+import { createPayloadSpill, withStepResultSpill } from "./spill.js";
 
 // ============================================================================
 // Public interfaces
@@ -106,6 +107,22 @@ export interface KernelConfig {
    * `Infinity` to disable reclaiming.
    */
   idempotencyStaleInProgressMs?: number;
+  /**
+   * Soft threshold, in bytes of serialised JSON, above which a durable step
+   * result is written to `blobStore` and the ledger row keeps only a
+   * reference. Defaults to `DEFAULT_SPILL_THRESHOLD_BYTES` (64 KiB).
+   *
+   * There is no hard ceiling above it — a payload larger than the threshold
+   * is spilled, never rejected. Reads resolve the reference before the
+   * value reaches the stage, so `ctx.step.run(...)` returns what it stored
+   * either way. Set to `Number.POSITIVE_INFINITY` to keep every result
+   * inline; already-spilled results still resolve on read.
+   *
+   * Job payloads use the same mechanism but are opt-in at wiring time,
+   * because the transport is shared with the host: see
+   * `createSpillingJobTransport`.
+   */
+  spillThresholdBytes?: number;
 }
 
 /** Default TTL after which a stuck `in_progress` idempotency key can be reclaimed. */
@@ -240,6 +257,23 @@ export function createKernel(config: KernelConfig): Kernel {
       }
     : undefined;
 
+  // Durable step results are the largest thing the engine writes per row
+  // and are read back in full on every replay, so the ledger is spilled
+  // through the blob store above a soft threshold. The kernel owns every
+  // read and write of this port, so wrapping it here is invisible to
+  // callers — see kernel/spill.ts.
+  const stepLedger = config.stepLedger
+    ? withStepResultSpill(
+        config.stepLedger,
+        createPayloadSpill({
+          blobStore,
+          ...(config.spillThresholdBytes !== undefined
+            ? { thresholdBytes: config.spillThresholdBytes }
+            : {}),
+        }),
+      )
+    : undefined;
+
   const deps: KernelDeps = {
     persistence,
     blobStore,
@@ -248,7 +282,7 @@ export function createKernel(config: KernelConfig): Kernel {
     clock,
     registry,
     executor,
-    stepLedger: config.stepLedger,
+    stepLedger,
     services,
   };
 
