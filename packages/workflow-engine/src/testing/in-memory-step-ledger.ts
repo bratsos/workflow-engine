@@ -59,7 +59,12 @@ export class InMemoryStepLedger implements StepLedger {
       externalKey: record.externalKey ?? null,
       createdAt: now,
       updatedAt: now,
-      result: cloneJson(record.result),
+      // Normalised the way `PrismaStepLedger.mapStep` normalises a freshly
+      // inserted row, so a claim that carries neither reads back the same
+      // through both adapters: `null`, not `undefined`. `waitState` is the
+      // exception in both -- a NULL column maps back to `undefined`.
+      result: record.result === undefined ? null : cloneJson(record.result),
+      error: record.error ?? null,
       waitState: record.waitState ? { ...record.waitState } : undefined,
       leaseExpiresAt: record.leaseExpiresAt
         ? new Date(record.leaseExpiresAt.getTime())

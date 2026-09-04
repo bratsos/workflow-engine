@@ -51,6 +51,8 @@ describe("durable run results", () => {
     expect(calls).toBe(1);
     const record = await backing.get("stage", "write");
     expect(record?.status).toBe("running");
-    expect(record?.error).toBeUndefined();
+    // A claimed row carries no outcome yet, and both ledgers normalise that
+    // to null (`stepLedgerConformanceSuite` holds them to it).
+    expect(record?.error).toBeNull();
   });
 });

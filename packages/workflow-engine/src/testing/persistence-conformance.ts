@@ -2976,6 +2976,28 @@ export function stepLedgerConformanceSuite(
         const fresh = await ledger.get("stage-1", "step-1");
         expect(fresh?.externalKey).toBeNull();
       });
+
+      it("should read back a record claimed with no result or error as null on both", async () => {
+        // A claim is written before the body runs, so it never carries an
+        // outcome. The two must agree on how the absence reads back, or a
+        // caller that works against one adapter sees `undefined` on the
+        // other -- the same undefined-versus-null divergence that let a
+        // dropped null result survive in the patch mapper.
+        const result = await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-1",
+            kind: "run",
+            status: "running",
+          }),
+        );
+        expect(result.record.result).toBeNull();
+        expect(result.record.error).toBeNull();
+
+        const fresh = await ledger.get("stage-1", "step-1");
+        expect(fresh?.result).toBeNull();
+        expect(fresh?.error).toBeNull();
+      });
     });
 
     describe("get operation", () => {
