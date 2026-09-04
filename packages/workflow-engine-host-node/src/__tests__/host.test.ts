@@ -7,7 +7,7 @@
 
 import type { Workflow } from "@bratsos/workflow-engine";
 import { defineStage, WorkflowBuilder } from "@bratsos/workflow-engine";
-import { createKernel } from "@bratsos/workflow-engine/kernel";
+import { createKernel, type Kernel } from "@bratsos/workflow-engine/kernel";
 import {
   CollectingEventSink,
   FakeClock,
@@ -313,6 +313,59 @@ describe("NodeHost", () => {
     // Should have at least the immediate first tick plus a few more
     expect(stats.orchestrationTicks).toBeGreaterThanOrEqual(2);
     expect(stats.workerId).toBe("test-worker");
+  });
+
+  it("skips interval firings while a tick is in flight and waits for it on stop()", async () => {
+    const { kernel, jobTransport } = createTestEnv([]);
+
+    // Hold the first tick inside stage.pollSuspended until released, as a
+    // replay that outlasts the interval would.
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let held = false;
+    let tickFinished = false;
+    const slowKernel = {
+      dispatch: async (command: Parameters<Kernel["dispatch"]>[0]) => {
+        if (command.type === "stage.pollSuspended" && !held) {
+          held = true;
+          await gate;
+        }
+        const result = await kernel.dispatch(command as never);
+        // run.reapStuck is the last command of a maintenance tick.
+        if (command.type === "run.reapStuck") tickFinished = true;
+        return result;
+      },
+    } as unknown as Kernel;
+
+    host = createNodeHost({
+      kernel: slowKernel,
+      jobTransport,
+      workerId: "test-worker",
+      orchestrationIntervalMs: 10,
+      jobPollIntervalMs: 20,
+    });
+
+    await host.start();
+    // Many interval firings elapse while the first tick is still held.
+    await new Promise((r) => setTimeout(r, 100));
+    expect(held).toBe(true);
+    expect(host.getStats().orchestrationTicks).toBe(1);
+
+    // stop() does not resolve until the in-flight tick has finished.
+    let stopped = false;
+    const stopping = host.stop().then(() => {
+      stopped = true;
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(stopped).toBe(false);
+    expect(tickFinished).toBe(false);
+
+    release();
+    await stopping;
+    expect(tickFinished).toBe(true);
+    expect(host.getStats().orchestrationTicks).toBe(1);
   });
 
   it("calling start() twice is safe", async () => {

@@ -89,6 +89,8 @@ class NodeHostImpl implements NodeHost {
   private orchestrationTimer: ReturnType<typeof setInterval> | null = null;
   private signalHandlers: { signal: string; handler: () => void }[] = [];
   private jobLoop: Promise<void> | null = null;
+  /** The orchestration tick currently running, if any. */
+  private tickInFlight: Promise<void> | null = null;
 
   private readonly kernel: Kernel;
   private readonly jobTransport: JobTransport;
@@ -136,12 +138,12 @@ class NodeHostImpl implements NodeHost {
 
     // Start orchestration timer
     this.orchestrationTimer = setInterval(
-      () => void this.orchestrationTick(),
+      () => this.startOrchestrationTick(),
       this.orchestrationIntervalMs,
     );
 
     // Immediate first tick
-    void this.orchestrationTick();
+    this.startOrchestrationTick();
 
     // Start job processing loop (runs until stop())
     this.jobLoop = this.processJobs();
@@ -173,10 +175,15 @@ class NodeHostImpl implements NodeHost {
     }
     this.signalHandlers = [];
 
-    // Let the job in flight finish (bounded) so its completion events are
-    // in the outbox, then publish them from this process. Without the
-    // flush, `workflow:completed` for a run this process finished sits in
-    // the outbox until whichever process ticks next.
+    // Let the tick and the job in flight finish (each bounded) so their
+    // completion events are in the outbox, then publish them from this
+    // process. Without the flush, `workflow:completed` for a run this
+    // process finished sits in the outbox until whichever process ticks
+    // next. A tick cut short here leaves its claimed suspended stages on
+    // their poll lease; the next poller picks them up when it elapses.
+    if (this.tickInFlight) {
+      await withTimeout(this.tickInFlight, this.shutdownTimeoutMs);
+    }
     if (this.jobLoop) {
       await withTimeout(this.jobLoop, this.shutdownTimeoutMs);
       this.jobLoop = null;
@@ -232,6 +239,23 @@ class NodeHostImpl implements NodeHost {
   // --------------------------------------------------------------------------
   // Orchestration timer
   // --------------------------------------------------------------------------
+
+  /**
+   * Runs a tick unless one is still in flight, in which case this firing
+   * is skipped (not queued): a replay that outlasts the interval must not
+   * overlap the next tick in the same process. `orchestrationTicks` counts
+   * only ticks that ran.
+   */
+  private startOrchestrationTick(): void {
+    if (this.tickInFlight) return;
+    this.tickInFlight = this.orchestrationTick()
+      .catch((error) => {
+        console.error("[NodeHost] orchestration tick error:", error);
+      })
+      .finally(() => {
+        this.tickInFlight = null;
+      });
+  }
 
   private async orchestrationTick(): Promise<void> {
     this.orchestrationTicks++;
