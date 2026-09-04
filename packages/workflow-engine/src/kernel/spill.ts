@@ -38,6 +38,7 @@
 import type {
   DequeueResult,
   EnqueueJobInput,
+  JobAckFence,
   JobRecord,
 } from "../persistence/interface.js";
 import { SpilledPayloadUnavailableError } from "./errors.js";
@@ -131,8 +132,12 @@ export interface PayloadSpill {
   pack(key: string, value: unknown): Promise<unknown>;
   /** Resolve a `SpillRef` back to its value; pass anything else through. */
   unpack(value: unknown): Promise<unknown>;
-  /** Best-effort delete of every spilled value under a key prefix. */
-  deleteUnder(prefix: string): Promise<void>;
+  /**
+   * Best-effort delete of every spilled value under a key prefix, except
+   * any key listed in `keep`. The exception exists for a partial ledger
+   * clear, which must leave the results of the rows it preserves readable.
+   */
+  deleteUnder(prefix: string, keep?: Iterable<string>): Promise<void>;
 }
 
 /**
@@ -194,9 +199,11 @@ export function createPayloadSpill(options: PayloadSpillOptions): PayloadSpill {
       return blob;
     },
 
-    async deleteUnder(prefix) {
+    async deleteUnder(prefix, keep) {
+      const kept = new Set(keep ?? []);
       const keys = await blobStore.list(prefix).catch(() => [] as string[]);
       for (const key of keys) {
+        if (kept.has(key)) continue;
         await blobStore.delete(key).catch(() => {});
       }
     },
@@ -311,6 +318,27 @@ export function withStepResultSpill(
       await ledger.clear(stageRecordId);
       await spill.deleteUnder(stepSpillPrefix(stageRecordId));
     },
+
+    // `clearExcept` is optional on the port and the kernel branches on its
+    // presence: a ledger without it gets the whole-ledger clear that
+    // destroys the external keys of effects still in flight. So the
+    // decorator must expose it exactly when the wrapped ledger does —
+    // wrapping an implementation that has it and not forwarding would
+    // silently downgrade every kernel to the fallback path.
+    ...(ledger.clearExcept
+      ? {
+          async clearExcept(stageRecordId: string, keepStepIds: string[]) {
+            await ledger.clearExcept?.(stageRecordId, keepStepIds);
+            // Only the blobs of the rows that actually went. A preserved
+            // row is re-opened, not deleted, and its last result must stay
+            // readable, so its spilled value has to stay too.
+            await spill.deleteUnder(
+              stepSpillPrefix(stageRecordId),
+              keepStepIds.map((stepId) => stepSpillKey(stageRecordId, stepId)),
+            );
+          },
+        }
+      : {}),
   };
 }
 
@@ -396,16 +424,38 @@ export function createSpillingJobTransport(
       );
     },
 
-    complete: (jobId: string) => transport.complete(jobId),
-    suspend: (jobId: string, nextPollAt: Date) =>
-      transport.suspend(jobId, nextPollAt),
-    fail: (jobId: string, error: string, shouldRetry?: boolean) =>
-      transport.fail(jobId, error, shouldRetry),
+    // The acknowledgement methods carry a `fence` the host builds from the
+    // claim it is acknowledging. Forward it verbatim: a decorator that drops
+    // it silently turns every fenced acknowledgement back into an
+    // unconditional write, which is exactly the stale-worker overwrite the
+    // fence exists to stop — and TypeScript cannot catch the omission,
+    // because a function taking fewer parameters is assignable to one taking
+    // more.
+    complete: (jobId: string, fence?: JobAckFence) =>
+      transport.complete(jobId, fence),
+    suspend: (jobId: string, nextPollAt: Date, fence?: JobAckFence) =>
+      transport.suspend(jobId, nextPollAt, fence),
+    fail: (
+      jobId: string,
+      error: string,
+      shouldRetry?: boolean,
+      fence?: JobAckFence,
+    ) => transport.fail(jobId, error, shouldRetry, fence),
     releaseStaleJobs: (staleThresholdMs?: number) =>
       transport.releaseStaleJobs(staleThresholdMs),
     cancelByRun: (workflowRunId: string) =>
       transport.cancelByRun(workflowRunId),
     touchJob: (jobId: string) => transport.touchJob(jobId),
+    // Both optional methods are forwarded only when the wrapped transport
+    // has them, so wrapping never claims a capability the inner transport
+    // lacks — and never hides one it has.
+    ...(transport.expireRunawayJobs
+      ? {
+          expireRunawayJobs: (absoluteTimeoutMs: number) =>
+            transport.expireRunawayJobs?.(absoluteTimeoutMs) ??
+            Promise.resolve(0),
+        }
+      : {}),
     ...(transport.adoptWorkerId
       ? {
           adoptWorkerId: (workerId: string) =>

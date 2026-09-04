@@ -174,6 +174,33 @@ describe("payload spill: step ledger", () => {
     expect(await ledger.list("stage-1")).toEqual([]);
     expect(await blobStore.list(stepSpillPrefix("stage-1"))).toEqual([]);
   });
+
+  it("clearExcept keeps the spilled blob of a preserved row and drops the rest", async () => {
+    // Re-running a terminally failed stage preserves the rows naming an
+    // external effect and re-opens them, so a preserved row's last result
+    // must stay readable — including when it was spilled.
+    const { blobStore, ledger, spilled } = ledgerSetup();
+    expect(spilled.clearExcept).toBeTypeOf("function");
+    for (const stepId of ["keep", "drop"]) {
+      await spilled.claim({ ...RUNNING_RUN_STEP, stepId });
+      await spilled.update("stage-1", stepId, {
+        status: "completed",
+        result: { text: `${stepId}-${"y".repeat(5000)}` },
+        leaseExpiresAt: null,
+      });
+    }
+    expect(await blobStore.list(stepSpillPrefix("stage-1"))).toHaveLength(2);
+
+    await spilled.clearExcept?.("stage-1", ["keep"]);
+
+    expect((await ledger.list("stage-1")).map((r) => r.stepId)).toEqual([
+      "keep",
+    ]);
+    expect(await blobStore.list(stepSpillPrefix("stage-1"))).toHaveLength(1);
+    expect(await spilled.get("stage-1", "keep")).toMatchObject({
+      result: { text: `keep-${"y".repeat(5000)}` },
+    });
+  });
 });
 
 describe("payload spill: end to end through the kernel", () => {

@@ -89,4 +89,60 @@ describe("payload spill: job transport", () => {
     const { transport } = setup();
     expect(transport.adoptWorkerId?.("host-1")).toBe("test-worker");
   });
+
+  it("forwards the acknowledgement fence, so wrapping does not un-fence a stale worker", async () => {
+    // The decorator sits between the host and the real transport. A
+    // delegation that drops the optional `fence` parameter still typechecks
+    // (fewer parameters is assignable to more), so the only thing that can
+    // catch it is a test that rescues a claim and acknowledges the old one.
+    const { queue, transport } = setup();
+    await transport.enqueueParallel([
+      {
+        workflowRunId: "run-fence",
+        workflowId: "wf-1",
+        stageId: "stage-1",
+        payload: { config: {} },
+      },
+    ]);
+
+    const first = await transport.dequeue();
+    expect(first?.startedAt).toBeInstanceOf(Date);
+    // A negative threshold makes the held lease stale immediately.
+    expect(await transport.releaseStaleJobs(-1000)).toBe(1);
+    const second = await transport.dequeue();
+    expect(second?.jobId).toBe(first?.jobId);
+
+    const stale = await transport.complete(first!.jobId, {
+      startedAt: first!.startedAt,
+      attempt: first!.attempt,
+    });
+    expect(stale).toBe("superseded");
+    expect((await queue.getJobsByWorkflowRun("run-fence"))[0]?.status).toBe(
+      "RUNNING",
+    );
+
+    const live = await transport.complete(second!.jobId, {
+      startedAt: second!.startedAt,
+      attempt: second!.attempt,
+    });
+    expect(live).toBe("acknowledged");
+    expect((await queue.getJobsByWorkflowRun("run-fence"))[0]?.status).toBe(
+      "COMPLETED",
+    );
+  });
+
+  it("forwards expireRunawayJobs, so wrapping does not remove the absolute-timeout tier", async () => {
+    const { transport } = setup();
+    expect(typeof transport.expireRunawayJobs).toBe("function");
+    await transport.enqueueParallel([
+      {
+        workflowRunId: "run-runaway",
+        workflowId: "wf-1",
+        stageId: "stage-1",
+        payload: { config: {} },
+      },
+    ]);
+    await transport.dequeue();
+    expect(await transport.expireRunawayJobs?.(-1000)).toBe(1);
+  });
 });
