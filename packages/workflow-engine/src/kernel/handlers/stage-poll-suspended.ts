@@ -583,7 +583,18 @@ export async function handleStagePollSuspended(
     //      than polled against a different pipeline shape. It is skipped,
     //      not failed — the run is intact and another process (or
     //      `run.redrive`) can carry it forward.
-    if (!servesRun(run, workflow)) continue;
+    //
+    //      The claim is handed back rather than simply skipped. Phase 0
+    //      has already pushed `nextPollAt` out by the claim lease
+    //      (`MIN_CLAIM_LEASE_MS`, 60s), and holding it here would mean a
+    //      host that *cannot* serve the run locks out the host that can:
+    //      during a rolling deploy the old and new builds poll the same
+    //      table, so an unserving host re-claiming every tick can starve
+    //      the serving one indefinitely.
+    if (!servesRun(run, workflow)) {
+      await releaseStageClaim(stageRecord, deps);
+      continue;
+    }
 
     // 3c. Get stage definition
     const stageDef = workflow.getStage(stageRecord.stageId);

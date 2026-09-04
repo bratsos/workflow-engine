@@ -125,7 +125,10 @@ shape — the job is re-delivered for a host that can serve it, and the run is
 untouched for the same reason, and so does `run.reapStuck`: a run nobody on
 this build touches is not updated, so it crosses the stuck threshold looking
 exactly like a wedged run, and reaping it would fail a run that is perfectly
-healthy on the build that owns it.
+healthy on the build that owns it. `stage.pollSuspended` additionally hands
+back the poll claim it took before it discovered the mismatch — otherwise,
+during a rolling deploy, a host that cannot serve the run would hold the
+60-second claim lease and starve the host that can.
 
 ## Has it drained?
 

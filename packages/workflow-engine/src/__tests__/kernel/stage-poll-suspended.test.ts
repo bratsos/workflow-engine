@@ -960,3 +960,96 @@ describe("kernel: stage.pollSuspended claims a stage before working on it", () =
     expect((await env.persistence.getRun(env.runId))?.status).toBe("COMPLETED");
   });
 });
+
+describe("kernel: stage.pollSuspended and definition pinning", () => {
+  it("skips a suspended stage this build cannot serve and hands the claim back", async () => {
+    // A rolling deploy has both builds polling the same table. The build
+    // that cannot serve the run must not poll it — and must not hold the
+    // 60s claim lease either, or it starves the build that can.
+    const schema = z.object({ data: z.string() });
+    let polls = 0;
+    const batchStage = defineAsyncBatchStage({
+      id: "batch-stage",
+      name: "Batch Stage",
+      mode: "async-batch",
+      schemas: {
+        input: schema,
+        output: z.object({ result: z.string() }),
+        config: z.object({}),
+      },
+      async execute() {
+        return {
+          suspended: true,
+          state: {
+            batchId: "batch-1",
+            submittedAt: new Date().toISOString(),
+            pollInterval: 1000,
+            maxWaitTime: 60_000,
+          },
+          pollConfig: {
+            pollInterval: 1000,
+            maxWaitTime: 60_000,
+            nextPollAt: new Date(),
+          },
+        };
+      },
+      async checkCompletion() {
+        polls++;
+        return { ready: true, output: { result: "done" } };
+      },
+    });
+    const build = (extra: boolean) => {
+      const b = new WorkflowBuilder(
+        "pinned-poll-wf",
+        "Pinned",
+        "Test",
+        schema,
+        z.object({ result: z.string() }),
+      ).pipe(batchStage);
+      return (
+        extra ? b.pipe(createPassthroughStage("stage-2", schema)) : b
+      ).build();
+    };
+    const v1 = build(false);
+    const v2 = build(true);
+
+    const { kernel, persistence, registry, clock } = createTestKernel([v1]);
+    const created = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "pinned-poll-1",
+      workflowId: v1.id,
+      input: { data: "hello" },
+    });
+    await kernel.dispatch({ type: "run.claimPending", workerId: "w1" });
+    await kernel.dispatch({
+      type: "job.execute",
+      workflowRunId: created.workflowRunId,
+      workflowId: v1.id,
+      stageId: "batch-stage",
+      config: {},
+    });
+
+    const [suspended] = await persistence.getStagesByRun(created.workflowRunId);
+    expect(suspended!.status).toBe("SUSPENDED");
+    await persistence.updateStage(suspended!.id, {
+      nextPollAt: new Date(clock.now().getTime() - 1000),
+    });
+
+    // The deploy lands under the suspended run.
+    registry.set(v1.id, v2);
+
+    const result = await kernel.dispatch({ type: "stage.pollSuspended" });
+
+    expect(result.resumed).toBe(0);
+    expect(result.failed).toBe(0);
+    expect(polls).toBe(0);
+
+    const [after] = await persistence.getStagesByRun(created.workflowRunId);
+    expect(after!.status).toBe("SUSPENDED");
+    // The claim was handed back: nextPollAt is not parked a lease into the
+    // future, so a host that can serve the run picks it up on its next tick.
+    expect(after!.nextPollAt!.getTime()).toBeLessThanOrEqual(
+      clock.now().getTime(),
+    );
+  });
+});
