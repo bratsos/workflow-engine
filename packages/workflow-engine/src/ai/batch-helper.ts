@@ -19,6 +19,7 @@ import {
 } from "./batch/model";
 import { createOpenRouterBatchModel } from "./batch/openrouter";
 import { getModel, type ModelKey } from "./model-helper";
+import { stripOptionalNulls } from "./schema-portability";
 import { calculateCostWithDiscount, logger } from "./shared";
 import type {
   AIBatch,
@@ -791,7 +792,14 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
 
           let validation: ReturnType<z.ZodTypeAny["safeParse"]>;
           try {
-            validation = schema.safeParse(parsedJson);
+            // OpenAI strict outputs were sent every property as required
+            // (optional ones nullable); drop the nulls the original schema
+            // does not admit before validating — see schema-portability.ts.
+            const candidate =
+              this.provider === "openai" || this.provider === "openrouter"
+                ? stripOptionalNulls(parsedJson, z.toJSONSchema(schema))
+                : parsedJson;
+            validation = schema.safeParse(candidate);
           } catch (schemaErr) {
             const errText =
               schemaErr instanceof Error

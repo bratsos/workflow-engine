@@ -144,6 +144,7 @@ export {
 } from "./ai/model-helper";
 export {
   type SchemaTarget,
+  stripOptionalNulls,
   toPortableJsonSchema,
 } from "./ai/schema-portability";
 export type {
