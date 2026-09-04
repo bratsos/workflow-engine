@@ -8,6 +8,7 @@
 // Command types
 export type {
   CommandResult,
+  DefinitionVersionSummary,
   JobExecuteCommand,
   JobExecuteResult,
   KernelCommand,
@@ -25,6 +26,8 @@ export type {
   RunCreateAnnotation,
   RunCreateCommand,
   RunCreateResult,
+  RunListVersionsCommand,
+  RunListVersionsResult,
   RunReapStuckCommand,
   RunReapStuckResult,
   RunRerunFromCommand,
@@ -39,6 +42,8 @@ export type {
 // Kernel errors
 export {
   AIServicesNotConfiguredError,
+  DefinitionVersionConflictError,
+  DefinitionVersionMismatchError,
   IdempotencyInProgressError,
 } from "./errors.js";
 
@@ -66,6 +71,14 @@ export {
   createRoutingExecutor,
   type RoutingExecutorOptions,
 } from "./executor/routing-executor.js";
+// Definition pinning helpers, for hosts that resolve definitions themselves.
+export {
+  assertServesRun,
+  recordDefinitionVersion,
+  resolvePinnedWorkflow,
+  servedDefinitions,
+  servesRun,
+} from "./helpers/definition-pinning.js";
 // Kernel helpers
 export {
   type ExecuteJobOutcome,
@@ -92,6 +105,7 @@ export {
 export {
   type AnnotateAttachInput,
   createKernel,
+  createWorkflowRegistry,
   type Kernel,
   type KernelAnnotations,
   type KernelConfig,
@@ -127,6 +141,7 @@ export type {
   OutboxRecord,
   Persistence,
   Scheduler,
+  ServedDefinition,
   StepLedger,
   StepRecord,
   WorkflowAnnotationRecord,

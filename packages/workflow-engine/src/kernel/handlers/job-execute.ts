@@ -25,7 +25,9 @@
 
 import { isSuspendedResult } from "../../core/types";
 import type { JobExecuteCommand, JobExecuteResult } from "../commands";
+import { DefinitionVersionMismatchError } from "../errors.js";
 import type { KernelEvent } from "../events";
+import { assertServesRun } from "../helpers/definition-pinning.js";
 import { HOST_DEFAULTS } from "../helpers/host-support.js";
 import {
   buildAnnotationEvents,
@@ -94,6 +96,25 @@ export async function handleJobExecute(
 
   const workflowRun = await deps.persistence.getRun(workflowRunId);
   if (!workflowRun) throw new Error(`WorkflowRun ${workflowRunId} not found`);
+
+  // Definition pinning: a run resolves against the definition it started
+  // under. This build presenting a different structure means the job
+  // belongs to another build — re-deliver it rather than executing the
+  // wrong shape or failing the run. `run.claimPending` already keeps a
+  // host from adopting such a run; this catches the case where the
+  // pipeline changed under a run that was already RUNNING.
+  try {
+    assertServesRun(workflowRun, workflow);
+  } catch (error) {
+    if (!(error instanceof DefinitionVersionMismatchError)) throw error;
+    return {
+      outcome: "failed" as const,
+      ghost: true,
+      ghostReason: "version" as const,
+      error: error.message,
+      _events: [],
+    };
+  }
 
   // Guard against ghost jobs — only execute if run is actively RUNNING.
   // A PENDING run is not an orphan: the claim that enqueued this job had

@@ -9,6 +9,7 @@
 import type { CreateAnnotationInput } from "../../persistence/interface";
 import type { RunCreateCommand, RunCreateResult } from "../commands";
 import type { KernelEvent } from "../events";
+import { recordDefinitionVersion } from "../helpers/definition-pinning.js";
 import { buildAnnotationEvents } from "../helpers/index.js";
 import type { HandlerResult, KernelDeps } from "../kernel";
 
@@ -45,7 +46,13 @@ export async function handleRunCreate(
   // 5. Calculate priority
   const priority = command.priority ?? 5;
 
-  // 6. Create the run record
+  // 6. Record the definition version this run is pinned to, and the
+  //    structural snapshot it identifies. The snapshot row is
+  //    content-addressed on (workflowId, version), so N runs at one
+  //    version share one row rather than each carrying a copy.
+  const definitionVersion = await recordDefinitionVersion(workflow, deps);
+
+  // 7. Create the run record
   const run = await deps.persistence.createRun({
     workflowId: command.workflowId,
     workflowName: workflow.name,
@@ -53,9 +60,10 @@ export async function handleRunCreate(
     input: command.input,
     config: mergedConfig,
     priority,
+    definitionVersion,
   });
 
-  // 7. Attach run-creation annotations, if any (atomic with createRun
+  // 8. Attach run-creation annotations, if any (atomic with createRun
   //    since this handler runs inside kernel.dispatch's withTransaction).
   const annotationEvents: KernelEvent[] = [];
   if (command.annotations && command.annotations.length > 0) {
@@ -89,6 +97,7 @@ export async function handleRunCreate(
   return {
     workflowRunId: run.id,
     status: "PENDING" as const,
+    definitionVersion,
     _events: [
       {
         type: "workflow:created",

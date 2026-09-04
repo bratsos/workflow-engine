@@ -108,10 +108,15 @@ export function createTestKernel<
         })
       : new CollectingEventSink())) as TEventSink;
 
+  // The returned `registry` Map stays mutable so fixtures can swap a
+  // workflow mid-test. `listWorkflows` reads through it, which is what
+  // enables version-filtered claiming — so fixtures exercise the same
+  // claim predicate production does, including after a swap.
   const registry = new Map<string, Workflow<any, any>>();
   for (const w of workflows) registry.set(w.id, w);
   const workflowRegistry: WorkflowRegistry = {
     getWorkflow: (id) => registry.get(id),
+    listWorkflows: () => Array.from(registry.values()),
   };
 
   const kernel = createKernel({

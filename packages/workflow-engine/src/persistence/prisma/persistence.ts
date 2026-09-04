@@ -8,18 +8,23 @@
 import type {
   AnnotationFilters,
   CreateAnnotationInput,
+  CreateDefinitionInput,
   CreateLogInput,
   CreateOutboxEventInput,
   CreateRunInput,
   CreateStageInput,
+  DefinitionVersionCount,
+  DefinitionVersionCountFilter,
   OutboxRecord,
   SaveArtifactInput,
+  ServedDefinition,
   Status,
   UpdateRunInput,
   UpdateStageInput,
   UpsertStageInput,
   WorkflowAnnotationRecord,
   WorkflowArtifactRecord,
+  WorkflowDefinitionRecord,
   WorkflowPersistence,
   WorkflowRunRecord,
   WorkflowStageRecord,
@@ -60,9 +65,30 @@ export interface PrismaWorkflowPersistenceOptions {
    * value is UTC like every Prisma write, and honours an injected clock.
    */
   now?: () => Date;
+  /**
+   * Whether the schema behind this client carries definition versioning
+   * (`workflow_runs.definitionVersion`, `workflow_runs.redriveCount` and
+   * the `workflow_definitions` table).
+   *
+   * Left unset, it is detected from the generated client: versioning is on
+   * only when the client exposes a `workflowDefinition` model. A database
+   * that has not been migrated therefore keeps working unchanged instead
+   * of failing to start — runs are simply not pinned. Set it explicitly
+   * only for a client whose model surface the detection cannot see.
+   */
+  definitionVersioning?: boolean;
 }
 
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/** True when the generated client exposes the `workflow_definitions` model. */
+function detectDefinitionVersioning(prisma: PrismaClient): boolean {
+  const model = prisma.workflowDefinition;
+  return (
+    typeof model?.findUnique === "function" &&
+    typeof model?.create === "function"
+  );
+}
 
 const IDEMPOTENCY_IN_PROGRESS_MARKER = {
   __workflowEngineState: "in_progress",
@@ -87,6 +113,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
   private skipTransactions: boolean;
   private statusEnumName: string;
   private now: () => Date;
+  private definitionVersioning: boolean;
 
   /** The options as given, re-applied to every transactional clone. */
   private readonly options: PrismaWorkflowPersistenceOptions;
@@ -108,6 +135,12 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     this.databaseType = options.databaseType ?? "postgresql";
     this.skipTransactions = options.skipInteractiveTransactions ?? false;
     this.now = options.now ?? (() => new Date());
+    this.definitionVersioning =
+      options.definitionVersioning ?? detectDefinitionVersioning(prisma);
+  }
+
+  supportsDefinitionVersioning(): boolean {
+    return this.definitionVersioning;
   }
 
   async withTransaction<T>(
@@ -144,6 +177,12 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
         config: (data.config ?? {}) as unknown,
         priority: data.priority ?? 5,
         metadata: (data.metadata ?? null) as unknown,
+        // Only written when the schema has the column: on an unmigrated
+        // database Prisma would reject the unknown argument and every
+        // run.create would fail.
+        ...(this.definitionVersioning
+          ? { definitionVersion: data.definitionVersion ?? null }
+          : {}),
       },
     });
     return this.mapWorkflowRun(run);
@@ -243,11 +282,40 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
 
   async claimNextPendingRun(options?: {
     now?: Date;
+    serves?: readonly ServedDefinition[];
   }): Promise<WorkflowRunRecord | null> {
+    // A schema without the column cannot be filtered on it; such a
+    // database has no pinned runs either, so ignoring `serves` is exact.
+    const serves = this.definitionVersioning ? options?.serves : undefined;
     if (this.databaseType === "sqlite") {
-      return this.claimNextPendingRunSqlite();
+      return this.claimNextPendingRunOptimistic(0, serves);
     }
-    return this.claimNextPendingRunPostgres(options?.now ?? this.now());
+    // The tagged-template path cannot bind a variadic row-value IN list,
+    // so a version-filtered claim on a client without $queryRawUnsafe
+    // falls back to the optimistic loop rather than dropping the filter.
+    if (serves !== undefined && !this.prisma.$queryRawUnsafe) {
+      return this.claimNextPendingRunOptimistic(0, serves);
+    }
+    return this.claimNextPendingRunPostgres(options?.now ?? this.now(), serves);
+  }
+
+  /**
+   * Prisma `where` clause restricting a claim to the definitions a host
+   * serves. Runs with a `null` version predate versioning and stay
+   * claimable by everyone.
+   */
+  private servesFilter(
+    serves: readonly ServedDefinition[],
+  ): Record<string, unknown> {
+    return {
+      OR: [
+        { definitionVersion: null },
+        ...serves.map((s) => ({
+          workflowId: s.workflowId,
+          definitionVersion: s.version,
+        })),
+      ],
+    };
   }
 
   /**
@@ -260,6 +328,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
    */
   private async claimNextPendingRunPostgres(
     now: Date,
+    serves?: readonly ServedDefinition[],
   ): Promise<WorkflowRunRecord | null> {
     // NOTE: deliberately calling `this.prisma.$queryRawUnsafe` /
     // `$queryRaw` directly below rather than destructuring into a local
@@ -278,11 +347,28 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     let results: any[];
     if (this.prisma.$queryRawUnsafe) {
       const enumType = `"${this.statusEnumName}"`;
+      // $1 = PENDING, $2 = RUNNING, $3 = now; the served (workflowId,
+      // version) pairs, if any, are bound from $4 onwards as row values.
+      const extraParams: unknown[] = [];
+      let servesClause = "";
+      if (serves !== undefined) {
+        if (serves.length === 0) {
+          servesClause = `AND "definitionVersion" IS NULL`;
+        } else {
+          const rows = serves.map((s) => {
+            const base = 4 + extraParams.length;
+            extraParams.push(s.workflowId, s.version);
+            return `($${base}, $${base + 1})`;
+          });
+          servesClause = `AND ("definitionVersion" IS NULL OR ("workflowId", "definitionVersion") IN (${rows.join(", ")}))`;
+        }
+      }
       results = await this.prisma.$queryRawUnsafe<any[]>(
         `WITH claimed AS (
           SELECT id
           FROM "workflow_runs"
           WHERE status = $1::${enumType}
+          ${servesClause}
           ORDER BY priority DESC, "createdAt" ASC
           LIMIT 1
           FOR UPDATE SKIP LOCKED
@@ -298,6 +384,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
         pending,
         running,
         now,
+        ...extraParams,
       );
     } else if (this.prisma.$queryRaw) {
       if (this.statusEnumName !== "Status") {
@@ -343,16 +430,20 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
    * 2. Atomically update it (only succeeds if still PENDING)
    * 3. If another worker claimed it, retry
    */
-  private async claimNextPendingRunSqlite(
+  private async claimNextPendingRunOptimistic(
     attempt = 0,
+    serves?: readonly ServedDefinition[],
   ): Promise<WorkflowRunRecord | null> {
     if (attempt >= MAX_CLAIM_ATTEMPTS) {
       return null;
     }
 
-    // Step 1: Find the next PENDING run
+    // Step 1: Find the next PENDING run this host can serve
     const run = await this.prisma.workflowRun.findFirst({
-      where: { status: this.enums.status("PENDING") },
+      where: {
+        status: this.enums.status("PENDING"),
+        ...(serves !== undefined ? this.servesFilter(serves) : {}),
+      },
       orderBy: [{ priority: "desc" }, { createdAt: "asc" }],
     });
 
@@ -377,7 +468,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     if (result.count === 0) {
       // Another worker claimed it, retry (bounded to avoid unbounded
       // recursion under heavy contention)
-      return this.claimNextPendingRunSqlite(attempt + 1);
+      return this.claimNextPendingRunOptimistic(attempt + 1, serves);
     }
 
     // Fetch the updated record
@@ -386,6 +477,112 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     });
 
     return claimedRun ? this.mapWorkflowRun(claimedRun) : null;
+  }
+
+  // ============================================================================
+  // WorkflowDefinition Operations
+  // ============================================================================
+
+  async insertDefinitionIfAbsent(
+    input: CreateDefinitionInput,
+  ): Promise<WorkflowDefinitionRecord | null> {
+    const model = this.prisma.workflowDefinition;
+    if (!this.definitionVersioning || !model) return null;
+    const existing = await model.findUnique({
+      where: {
+        workflowId_version: {
+          workflowId: input.workflowId,
+          version: input.version,
+        },
+      },
+    });
+    if (existing) return this.mapDefinition(existing);
+
+    try {
+      const created = await model.create({
+        data: {
+          workflowId: input.workflowId,
+          version: input.version,
+          snapshot: input.snapshot as unknown,
+          structureHash: input.structureHash,
+        },
+      });
+      return this.mapDefinition(created);
+    } catch {
+      // Lost the insert race with a concurrent run.create for the same
+      // version -- the row is content-addressed, so the winner's row is
+      // the answer either way.
+      const raced = await model.findUnique({
+        where: {
+          workflowId_version: {
+            workflowId: input.workflowId,
+            version: input.version,
+          },
+        },
+      });
+      if (!raced)
+        throw new Error(
+          `Could not store definition snapshot for workflow "${input.workflowId}" version "${input.version}".`,
+        );
+      return this.mapDefinition(raced);
+    }
+  }
+
+  async getDefinition(
+    workflowId: string,
+    version: string,
+  ): Promise<WorkflowDefinitionRecord | null> {
+    const model = this.prisma.workflowDefinition;
+    if (!this.definitionVersioning || !model) return null;
+    const row = await model.findUnique({
+      where: { workflowId_version: { workflowId, version } },
+    });
+    return row ? this.mapDefinition(row) : null;
+  }
+
+  async countRunsByDefinitionVersion(
+    filter?: DefinitionVersionCountFilter,
+  ): Promise<DefinitionVersionCount[]> {
+    if (!this.definitionVersioning) return [];
+    const groupBy = this.prisma.workflowRun.groupBy;
+    if (typeof groupBy !== "function") {
+      throw new Error(
+        "countRunsByDefinitionVersion requires a Prisma client whose workflowRun delegate supports groupBy.",
+      );
+    }
+    const where: Record<string, unknown> = {};
+    if (filter?.workflowId) where.workflowId = filter.workflowId;
+    if (filter?.definitionVersion !== undefined) {
+      where.definitionVersion = filter.definitionVersion;
+    }
+    if (filter?.status && filter.status.length > 0) {
+      where.status = { in: filter.status.map((v) => this.enums.status(v)) };
+    }
+
+    const grouped = await groupBy.call(this.prisma.workflowRun, {
+      by: ["workflowId", "definitionVersion", "status"],
+      where,
+      _count: { _all: true },
+      _min: { createdAt: true },
+    });
+
+    return (grouped as any[]).map((row) => ({
+      workflowId: row.workflowId,
+      definitionVersion: row.definitionVersion ?? null,
+      status: row.status as Status,
+      count: row._count?._all ?? 0,
+      oldestCreatedAt: row._min?.createdAt ?? null,
+    }));
+  }
+
+  private mapDefinition(row: any): WorkflowDefinitionRecord {
+    return {
+      workflowId: row.workflowId,
+      version: row.version,
+      createdAt: row.createdAt,
+      snapshot: row.snapshot,
+      structureHash: row.structureHash,
+    };
   }
 
   // ============================================================================
@@ -527,6 +724,12 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       output: data.output as unknown,
       totalCost: data.totalCost,
       totalTokens: data.totalTokens,
+      ...(this.definitionVersioning
+        ? {
+            definitionVersion: data.definitionVersion,
+            redriveCount: data.redriveCount,
+          }
+        : {}),
     };
   }
 
@@ -1255,6 +1458,8 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       priority: run.priority,
       metadata: run.metadata ?? null,
       version: run.version ?? 0,
+      definitionVersion: run.definitionVersion ?? null,
+      redriveCount: run.redriveCount ?? 0,
     };
   }
 

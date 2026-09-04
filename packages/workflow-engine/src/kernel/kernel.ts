@@ -39,6 +39,7 @@ import type {
   RunCancelResult,
   RunClaimPendingResult,
   RunCreateResult,
+  RunListVersionsResult,
   RunReapStuckResult,
   RunRerunFromResult,
   RunTransitionResult,
@@ -55,6 +56,7 @@ import { handlePluginReplayDLQ } from "./handlers/plugin-replay-dlq";
 import { handleRunCancel } from "./handlers/run-cancel";
 import { handleRunClaimPending } from "./handlers/run-claim-pending";
 import { handleRunCreate } from "./handlers/run-create";
+import { handleRunListVersions } from "./handlers/run-list-versions";
 import { handleRunReapStuck } from "./handlers/run-reap-stuck";
 import { handleRunRerunFrom } from "./handlers/run-rerun-from";
 import { handleRunTransition } from "./handlers/run-transition";
@@ -82,6 +84,50 @@ import type {
 
 export interface WorkflowRegistry {
   getWorkflow(id: string): Workflow<any, any> | undefined;
+  /**
+   * Every workflow this process can execute. Optional for backwards
+   * compatibility — but supplying it is what turns version-filtered
+   * claiming on: `run.claimPending` uses it to claim only runs pinned to a
+   * definition version this build actually serves, which is what makes a
+   * rolling deploy safe by construction. Without it, claiming is
+   * unfiltered, as it was before definition versioning.
+   *
+   * `createWorkflowRegistry(workflows)` implements this for you.
+   */
+  listWorkflows?(): ReadonlyArray<Workflow<any, any>>;
+}
+
+/**
+ * Builds a {@link WorkflowRegistry} from a list of built workflows,
+ * including the `listWorkflows` enumeration that enables version-filtered
+ * claiming.
+ *
+ * @example
+ * ```typescript
+ * const kernel = createKernel({
+ *   registry: createWorkflowRegistry([invoiceWorkflow, reportWorkflow]),
+ *   // ...
+ * });
+ * ```
+ */
+export function createWorkflowRegistry(
+  workflows: ReadonlyArray<Workflow<any, any>>,
+): WorkflowRegistry {
+  const byId = new Map<string, Workflow<any, any>>();
+  for (const workflow of workflows) {
+    const existing = byId.get(workflow.id);
+    if (existing && existing !== workflow) {
+      throw new Error(
+        `Two different workflows share the id "${workflow.id}". Workflow ids must be unique within a registry.`,
+      );
+    }
+    byId.set(workflow.id, workflow);
+  }
+  const all = Array.from(byId.values());
+  return {
+    getWorkflow: (id) => byId.get(id),
+    listWorkflows: () => all,
+  };
 }
 
 export interface KernelConfig {
@@ -204,6 +250,7 @@ type AnyCommandResult =
   | RunTransitionResult
   | RunCancelResult
   | RunRerunFromResult
+  | RunListVersionsResult
   | JobExecuteResult
   | StagePollSuspendedResult
   | StepSignalResult
@@ -363,6 +410,9 @@ export function createKernel(config: KernelConfig): Kernel {
             break;
           case "run.rerunFrom":
             result = await handleRunRerunFrom(command, txDeps);
+            break;
+          case "run.listVersions":
+            result = await handleRunListVersions(command, txDeps);
             break;
           case "step.signal":
             result = await handleStepSignal(command, txDeps);

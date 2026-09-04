@@ -26,6 +26,11 @@
  */
 
 import { z } from "zod";
+import {
+  buildDefinitionSnapshot,
+  computeDefinitionVersion,
+  type DefinitionSnapshot,
+} from "./definition-version.js";
 import type { NoInputSchema } from "./schema-helpers";
 import type { Stage } from "./stage";
 import {
@@ -142,6 +147,19 @@ function extractConfigDefaults(
 // Workflow - Complete workflow definition
 // ============================================================================
 
+/** Options carried from the builder onto a built {@link Workflow}. */
+export interface WorkflowDefinitionOptions {
+  /**
+   * An explicit definition version, declared with
+   * `defineWorkflow(...).version("2")`. When set it replaces the derived
+   * structural hash, so the pipeline's compatibility contract becomes
+   * whatever the author says it is. The engine still records the derived
+   * structure alongside it and refuses to re-register the same explicit
+   * version with a different structure.
+   */
+  readonly version?: string;
+}
+
 export class Workflow<
   TInput extends z.ZodTypeAny,
   TOutput extends z.ZodTypeAny,
@@ -155,7 +173,41 @@ export class Workflow<
     public readonly outputSchema: TOutput,
     private readonly stages: StageNode[],
     public readonly contextType?: TContext, // Type-only, for inference
+    private readonly options?: WorkflowDefinitionOptions,
   ) {}
+
+  private cachedSnapshot?: DefinitionSnapshot;
+  private cachedVersion?: string;
+
+  /**
+   * The structural contract this definition presents to runs pinned to it:
+   * stage ids, execution groups, definition order, dependencies, modes and
+   * the normalised JSON Schema of every schema involved. See
+   * `core/definition-version.ts` for what is deliberately excluded.
+   */
+  getDefinitionSnapshot(): DefinitionSnapshot {
+    if (!this.cachedSnapshot) {
+      this.cachedSnapshot = buildDefinitionSnapshot(this);
+    }
+    return this.cachedSnapshot;
+  }
+
+  /**
+   * The version a run created against this definition is pinned to.
+   *
+   * Derived from {@link getDefinitionSnapshot} unless the builder declared
+   * one with `.version(...)`, in which case that string is used verbatim
+   * (Conductor-style manual versioning). Editing a stage body, a stage
+   * name or a comment does not change a derived version; adding,
+   * removing, reordering or re-typing a stage does.
+   */
+  get definitionVersion(): string {
+    if (this.options?.version !== undefined) return this.options.version;
+    if (this.cachedVersion === undefined) {
+      this.cachedVersion = computeDefinitionVersion(this);
+    }
+    return this.cachedVersion;
+  }
 
   /**
    * Get execution plan as groups of stages
@@ -546,6 +598,36 @@ export class WorkflowBuilder<
 > {
   private stages: StageNode[] = [];
   private currentExecutionGroup = 0;
+  private explicitVersion?: string;
+
+  /**
+   * Declare an explicit definition version instead of letting the engine
+   * derive one from the pipeline's structure.
+   *
+   * Use this when you want to control forking by hand — a run created
+   * after this call is pinned to `version`, and only a host whose build
+   * declares the same version claims it. The version must be unique per
+   * workflow id: re-registering it with a different structure is rejected
+   * at `run.create`.
+   *
+   * @example
+   * ```typescript
+   * const workflow = defineWorkflow("invoice")
+   *   .pipe(extract)
+   *   .pipe(summarise)
+   *   .version("2026-09-04.1")
+   *   .build();
+   * ```
+   */
+  version(version: string): this {
+    if (version.trim().length === 0) {
+      throw new Error(
+        `Workflow "${this.id}": an explicit definition version must not be empty.`,
+      );
+    }
+    this.explicitVersion = version;
+    return this;
+  }
 
   /**
    * Low-level constructor. Prefer {@link defineWorkflow}, which takes the
@@ -841,6 +923,10 @@ export class WorkflowBuilder<
       this.inputSchema,
       this.currentOutputSchema,
       this.stages,
+      undefined as TContext | undefined,
+      this.explicitVersion !== undefined
+        ? { version: this.explicitVersion }
+        : undefined,
     );
   }
 }

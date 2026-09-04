@@ -216,8 +216,23 @@ export {
 // Kernel API (Phase 1)
 // =============================================================================
 
+// Definition versioning: the structural contract a run is pinned to.
+export {
+  buildDefinitionSnapshot,
+  computeDefinitionVersion,
+  DEFINITION_SNAPSHOT_FORMAT,
+  DERIVED_VERSION_PREFIX,
+  type DefinitionDrift,
+  type DefinitionDriftCode,
+  type DefinitionSnapshot,
+  type DefinitionStageSnapshot,
+  diffDefinitionSnapshots,
+  hashDefinitionSnapshot,
+  isDerivedVersion,
+} from "./core/definition-version";
 export type {
   CommandResult,
+  DefinitionVersionSummary,
   JobExecuteCommand,
   JobExecuteResult,
   KernelCommand,
@@ -233,6 +248,8 @@ export type {
   RunClaimPendingResult,
   RunCreateCommand,
   RunCreateResult,
+  RunListVersionsCommand,
+  RunListVersionsResult,
   RunReapStuckCommand,
   RunReapStuckResult,
   RunRerunFromCommand,
@@ -246,6 +263,8 @@ export type {
 } from "./kernel/commands";
 export {
   AIServicesNotConfiguredError,
+  DefinitionVersionConflictError,
+  DefinitionVersionMismatchError,
   IdempotencyInProgressError,
 } from "./kernel/errors";
 export type {
@@ -255,6 +274,7 @@ export type {
 } from "./kernel/events";
 export {
   createKernel,
+  createWorkflowRegistry,
   type Kernel,
   type KernelConfig,
   type WorkflowRegistry,
@@ -279,8 +299,13 @@ export type {
   StepRecord,
 } from "./kernel/ports";
 export type {
+  CreateDefinitionInput,
   CreateOutboxEventInput,
+  DefinitionVersionCount,
+  DefinitionVersionCountFilter,
   IdempotencyRecord,
   OutboxRecord,
+  ServedDefinition,
+  WorkflowDefinitionRecord,
 } from "./persistence/interface";
 export { StaleVersionError } from "./persistence/interface";
