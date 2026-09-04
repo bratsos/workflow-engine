@@ -14,3 +14,10 @@ export {
   type ServerlessHost,
   type ServerlessHostConfig,
 } from "./host.js";
+export {
+  type RunToCompletionOptions,
+  type RunToCompletionOutcome,
+  type RunToCompletionPersistence,
+  type RunToCompletionResult,
+  runToCompletion,
+} from "./run-to-completion.js";

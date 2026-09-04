@@ -213,6 +213,51 @@ const result = await host.processAvailableJobs({ maxJobs: 5 });
 // { processed, succeeded, failed }
 ```
 
+### Run a workflow inside one request
+
+`runToCompletion` is the drain loop callers used to hand-roll — create the
+run, claim it, dequeue and execute jobs until none remain — exported once:
+
+```typescript
+import { runToCompletion } from "@bratsos/workflow-engine-host-serverless";
+
+const result = await runToCompletion({
+  kernel,
+  jobTransport,
+  persistence,
+  command: {
+    type: "run.create",
+    idempotencyKey: `checkout:${orderId}`,
+    workflowId: "checkout",
+    input: { orderId },
+  },
+});
+// { workflowRunId, status, outcome, output?, reason?, jobsProcessed,
+//   foreignJobsProcessed, suspendedStageId? }
+```
+
+`outcome` is `"completed" | "failed" | "cancelled"` when the run finished,
+and `"suspended" | "incomplete"` when it did not — neither is an error, both
+mean the run is alive and something else has to carry it.
+
+Three caveats, all of them structural:
+
+- **It shares the queue, so it can execute another caller's job.**
+  `run.claimPending` claims whichever runs are pending and `dequeue()`
+  returns whichever job is next; neither narrows to one run. Other callers'
+  work lands inside this request's latency budget, and
+  `foreignJobsProcessed` counts it. Give the call its own `jobTransport` if
+  that is unacceptable.
+- **It cannot complete a workflow that suspends.** A durable sleep, wait or
+  signal resumes on a later poll, not in this request, so the call returns
+  `outcome: "suspended"` and names the stage instead of spinning. Use it for
+  workflows with no durable waits.
+- **It is bounded.** `maxJobs` (default 50) and `maxClaimRounds` (default 5)
+  cap it; hitting either returns `outcome: "incomplete"` with a `reason`
+  rather than throwing or looping. It does not poll suspended stages or reap
+  leases — that is `runMaintenanceTick()`'s job, and doing it here is what
+  would make it spin.
+
 ### Maintenance Tick
 
 Run from a cron trigger (Cloudflare Cron, EventBridge, etc.):
