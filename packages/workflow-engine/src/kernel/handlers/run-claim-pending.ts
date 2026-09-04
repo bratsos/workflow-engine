@@ -10,6 +10,7 @@ import type {
   RunClaimPendingResult,
 } from "../commands";
 import type { KernelEvent } from "../events";
+import { servedDefinitions } from "../helpers/definition-pinning.js";
 import { prepareExecutionGroup, toErrorMessage } from "../helpers/index.js";
 import type { HandlerResult, KernelDeps } from "../kernel";
 
@@ -18,6 +19,15 @@ export async function handleRunClaimPending(
   deps: KernelDeps,
 ): Promise<HandlerResult<RunClaimPendingResult>> {
   const maxClaims = command.maxClaims ?? 10;
+  // Which definition versions this claim may adopt. An explicit `serves`
+  // wins; otherwise the registry's enumeration decides, and a registry
+  // that cannot enumerate claims everything (pre-versioning behaviour).
+  // This is what makes a rolling deploy safe by construction: an old host
+  // finishes its own work and a new host never adopts an incompatible run.
+  const serves =
+    command.serves === "all"
+      ? undefined
+      : (command.serves ?? servedDefinitions(deps.registry));
   const claimed: Array<{
     workflowRunId: string;
     workflowId: string;
@@ -47,6 +57,7 @@ export async function handleRunClaimPending(
   for (let i = 0; i < maxClaims; i++) {
     const run = await deps.persistence.claimNextPendingRun({
       now: deps.clock.now(),
+      serves,
     });
     if (!run) break;
 
