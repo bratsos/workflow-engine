@@ -8,6 +8,7 @@
 // Command types
 export type {
   CommandResult,
+  EventSinkStatus,
   JobExecuteCommand,
   JobExecuteResult,
   KernelCommand,
@@ -40,6 +41,7 @@ export type {
 export {
   AIServicesNotConfiguredError,
   IdempotencyInProgressError,
+  SpilledPayloadUnavailableError,
 } from "./errors.js";
 
 // Event types
@@ -68,6 +70,11 @@ export {
 } from "./executor/routing-executor.js";
 // Kernel helpers
 export {
+  type CreateEventSinkMonitorOptions,
+  createEventSinkMonitor,
+  type EventSinkHealth,
+  type EventSinkMonitor,
+  type EventSinkObservation,
   type ExecuteJobOutcome,
   type ExecuteJobWithHeartbeatOptions,
   executeJobWithHeartbeat,
@@ -80,6 +87,7 @@ export {
   runMaintenanceTick,
   saveStageOutput,
   toErrorMessage,
+  toEventSinkObservation,
 } from "./helpers/index.js";
 // Durable-step API constructor for hosts that build a stage context themselves
 // (e.g. remote activity workers). Without a ledger every ctx.step.* call throws
@@ -131,3 +139,17 @@ export type {
   StepRecord,
   WorkflowAnnotationRecord,
 } from "./ports.js";
+// Claim-check spilling for unbounded payloads
+export {
+  createPayloadSpill,
+  createSpillingJobTransport,
+  DEFAULT_SPILL_THRESHOLD_BYTES,
+  isSpillRef,
+  type PayloadSpill,
+  type PayloadSpillOptions,
+  SPILL_REF_MARKER,
+  type SpillingJobTransportOptions,
+  type SpillRef,
+  stepSpillPrefix,
+  withStepResultSpill,
+} from "./spill.js";

@@ -104,9 +104,45 @@ console.log(stats);
 //   jobsProcessed: 1420,
 //   orchestrationTicks: 120,
 //   isRunning: true,
-//   uptimeMs: 1200000
+//   uptimeMs: 1200000,
+//   eventSink: {
+//     status: "healthy",        // or "degraded"
+//     since: 1735689600000,     // when this status began (epoch ms)
+//     consecutiveFailures: 0,
+//     deadLettered: 0,
+//     lastError: null
+//   }
 // }
 ```
+
+### Degraded event sink
+
+`stats.eventSink` is the named state of the event sink as of this host's last
+outbox flush.
+
+* **`healthy`** -- the last flush published everything it claimed.
+* **`degraded`** -- the last flush could not publish at least one event.
+
+A degraded sink is a *delivery-latency* problem, never a progress problem.
+Events live in the transactional outbox, the poller (not the sink) is what
+advances a run, and the events left behind are retried on the next flush. A
+run started while the sink is down still reaches `COMPLETED`.
+
+The host logs a single line on each transition (`event sink DEGRADED ...` and
+`event sink recovered ...`), rather than one per tick, so a sink that is down
+for an hour does not drown the log. It logs unconditionally whenever events
+were dead-lettered:
+
+```
+[NodeHost] event sink DEAD-LETTERED 3 event(s) (3 total in this process):
+they will not be delivered until replayed with the plugin.replayDLQ command
+```
+
+Dead-lettering is the point at which delivery genuinely cannot proceed on its
+own: those events have exhausted their retry budget and stop retrying. Alert
+on `eventSink.status === "degraded"` to see the problem before the queue
+fills, and on `eventSink.deadLettered` growing to see that it already has.
+Replay them with the `plugin.replayDLQ` command once the sink is back.
 
 ---
 

@@ -1,0 +1,416 @@
+/**
+ * Claim-check spilling for payloads that can grow without bound.
+ *
+ * The engine has no payload ceiling, which is the right default for AI
+ * workloads — a stage that returns a 4 MB extraction should not have to
+ * think about it. The cost of having no ceiling is that a very large value
+ * simply becomes a very large row, read back in full on every replay.
+ *
+ * Stage outputs have never had that problem: they are written to the
+ * `BlobStore` and the row keeps only a key (`outputData._artifactKey`).
+ * This module generalises that to the two ports the kernel fully owns and
+ * whose rows are engine plumbing rather than part of a consumer's read
+ * model:
+ *
+ *  - **durable step results** (`workflow_steps.result`) — an AI step's
+ *    result is the single largest thing the engine stores per row, and a
+ *    replay reads every step of the stage.
+ *  - **job payloads** (`job_queue.payload`) — carries the run's config, and
+ *    a transport that puts the row on a real queue is bound by that queue's
+ *    message size.
+ *
+ * The spill is *soft*: values at or below the threshold are stored inline
+ * exactly as before, so nothing changes for the overwhelming majority of
+ * runs, and there is no hard ceiling above it. Reads are transparent — a
+ * spilled value is resolved back before it reaches the caller, so no
+ * consumer code changes.
+ *
+ * Requires a `BlobStore` every process that executes or replays a run can
+ * read, which is the same requirement stage outputs already impose (see
+ * `createPrismaBlobStore`). Without one, spilling cannot be enabled: the
+ * kernel's `blobStore` port is mandatory, and `createSpillingJobTransport`
+ * takes one as an argument, so there is no configuration in which a value
+ * is spilled with nowhere to put it. Reading a spilled value back through
+ * a *different* blob store than the one that wrote it throws
+ * `SpilledPayloadUnavailableError` naming the key.
+ */
+
+import type {
+  DequeueResult,
+  EnqueueJobInput,
+  JobRecord,
+} from "../persistence/interface.js";
+import { SpilledPayloadUnavailableError } from "./errors.js";
+import type {
+  BlobStore,
+  JobTransport,
+  StepLedger,
+  StepRecord,
+  StepRecordExpectation,
+  StepRecordPatch,
+} from "./ports.js";
+
+// ============================================================================
+// Threshold
+// ============================================================================
+
+/**
+ * Default soft threshold, in bytes of serialised JSON, above which a
+ * payload is written to the blob store instead of inline.
+ *
+ * 64 KiB. The number is chosen from the smallest ceiling downstream of a
+ * payload rather than from the database: a job payload is what a real queue
+ * transport puts in a message, and the tightest common limit is Cloudflare
+ * Queues at 128 KiB (Amazon SQS is 256 KiB). 64 KiB is the largest round
+ * value that leaves a whole message envelope of headroom under that.
+ *
+ * It is also two orders of magnitude above Postgres's ~2 KiB TOAST
+ * threshold, so an ordinary payload — a config object, a small extraction,
+ * a handful of ids — never spills and never pays the extra round trip.
+ * Everything that does spill was going to be read back in full on every
+ * replay, which is the cost the claim check removes.
+ *
+ * Raise it when your blob store is slow relative to your database; set the
+ * threshold to `Number.POSITIVE_INFINITY` to stop spilling new values
+ * entirely (already-spilled values still resolve on read).
+ */
+export const DEFAULT_SPILL_THRESHOLD_BYTES = 65_536;
+
+// ============================================================================
+// The reference (claim check)
+// ============================================================================
+
+/** Discriminant field of a spilled-payload reference. */
+export const SPILL_REF_MARKER = "$wfSpill" as const;
+
+/** What is stored inline in place of a spilled value. */
+export interface SpillRef {
+  /** Format version of the reference. */
+  readonly $wfSpill: 1;
+  /** Blob store key holding the real value. */
+  readonly key: string;
+  /** Size of the spilled value in bytes of serialised JSON. */
+  readonly bytes: number;
+}
+
+/** Whether a stored value is a claim check rather than the value itself. */
+export function isSpillRef(value: unknown): value is SpillRef {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    !Array.isArray(value) &&
+    (value as { [SPILL_REF_MARKER]?: unknown })[SPILL_REF_MARKER] === 1 &&
+    typeof (value as { key?: unknown }).key === "string"
+  );
+}
+
+// ============================================================================
+// Codec
+// ============================================================================
+
+export interface PayloadSpillOptions {
+  /** Where spilled values are written. Required — see the module comment. */
+  blobStore: BlobStore;
+  /**
+   * Soft threshold in bytes of serialised JSON. Defaults to
+   * `DEFAULT_SPILL_THRESHOLD_BYTES`. `Number.POSITIVE_INFINITY` stops new
+   * values from spilling without breaking reads of old ones.
+   */
+  thresholdBytes?: number;
+}
+
+export interface PayloadSpill {
+  /** Threshold in effect, for diagnostics. */
+  readonly thresholdBytes: number;
+  /**
+   * Store `value` under `key` and return a `SpillRef` when it exceeds the
+   * threshold; return `value` untouched otherwise. Values that are not
+   * JSON-serialisable are returned untouched — the ledger's own
+   * serialisation contract, not this one, decides what happens to them.
+   */
+  pack(key: string, value: unknown): Promise<unknown>;
+  /** Resolve a `SpillRef` back to its value; pass anything else through. */
+  unpack(value: unknown): Promise<unknown>;
+  /** Best-effort delete of every spilled value under a key prefix. */
+  deleteUnder(prefix: string): Promise<void>;
+}
+
+/**
+ * Number of UTF-8 bytes `json` occupies. Skips the encode entirely when the
+ * string is short enough that it cannot exceed `limit` at the worst case of
+ * 3 bytes per UTF-16 code unit, which is the common path.
+ */
+function jsonByteLength(json: string, limit: number): number {
+  if (json.length * 3 <= limit) return json.length;
+  return new TextEncoder().encode(json).length;
+}
+
+export function createPayloadSpill(options: PayloadSpillOptions): PayloadSpill {
+  const { blobStore } = options;
+  const thresholdBytes =
+    options.thresholdBytes ?? DEFAULT_SPILL_THRESHOLD_BYTES;
+  if (thresholdBytes < 0 || Number.isNaN(thresholdBytes)) {
+    throw new Error(
+      `spillThresholdBytes must be a non-negative number, got ${thresholdBytes}`,
+    );
+  }
+
+  return {
+    thresholdBytes,
+
+    async pack(key, value) {
+      if (value === undefined || value === null) return value;
+      if (!Number.isFinite(thresholdBytes)) return value;
+      // Never spill a reference again: re-packing an already-packed value
+      // (two decorators applied to one port) must be a no-op.
+      if (isSpillRef(value)) return value;
+
+      let json: string | undefined;
+      try {
+        json = JSON.stringify(value);
+      } catch {
+        return value;
+      }
+      if (json === undefined) return value;
+
+      const bytes = jsonByteLength(json, thresholdBytes);
+      if (bytes <= thresholdBytes) return value;
+
+      await blobStore.put(key, value);
+      return { [SPILL_REF_MARKER]: 1, key, bytes } satisfies SpillRef;
+    },
+
+    async unpack(value) {
+      if (!isSpillRef(value)) return value;
+      let blob: unknown;
+      try {
+        blob = await blobStore.get(value.key);
+      } catch (error) {
+        throw new SpilledPayloadUnavailableError(value.key, error);
+      }
+      if (blob === undefined || blob === null) {
+        throw new SpilledPayloadUnavailableError(value.key);
+      }
+      return blob;
+    },
+
+    async deleteUnder(prefix) {
+      const keys = await blobStore.list(prefix).catch(() => [] as string[]);
+      for (const key of keys) {
+        await blobStore.delete(key).catch(() => {});
+      }
+    },
+  };
+}
+
+// ============================================================================
+// Key layout
+// ============================================================================
+
+/** Prefix holding every spilled result of one stage record's steps. */
+export function stepSpillPrefix(stageRecordId: string): string {
+  return `workflow-v2/spill/steps/${encodeURIComponent(stageRecordId)}/`;
+}
+
+function stepSpillKey(stageRecordId: string, stepId: string): string {
+  return `${stepSpillPrefix(stageRecordId)}${encodeURIComponent(stepId)}.json`;
+}
+
+function jobSpillKey(workflowRunId: string, stageId: string): string {
+  return `workflow-v2/spill/jobs/${encodeURIComponent(workflowRunId)}/${encodeURIComponent(stageId)}.json`;
+}
+
+// ============================================================================
+// StepLedger decorator
+// ============================================================================
+
+/**
+ * Wraps a `StepLedger` so results above the threshold live in the blob
+ * store. Every write path packs and every read path resolves, so callers
+ * see the value they stored — `createKernel` applies this to the ledger it
+ * is given, so a consumer does not wire it themselves.
+ *
+ * `clear()` removes the stage's spilled blobs after the rows, so a failure
+ * between the two leaks a blob rather than orphaning a reference.
+ */
+export function withStepResultSpill(
+  ledger: StepLedger,
+  spill: PayloadSpill,
+): StepLedger {
+  async function resolve(record: StepRecord): Promise<StepRecord> {
+    if (!isSpillRef(record.result)) return record;
+    return { ...record, result: await spill.unpack(record.result) };
+  }
+
+  async function packPatch(
+    stageRecordId: string,
+    stepId: string,
+    patch: StepRecordPatch,
+  ): Promise<StepRecordPatch> {
+    if (!Object.hasOwn(patch, "result")) return patch;
+    return {
+      ...patch,
+      result: await spill.pack(
+        stepSpillKey(stageRecordId, stepId),
+        patch.result,
+      ),
+    };
+  }
+
+  return {
+    async claim(record) {
+      const result = await spill.pack(
+        stepSpillKey(record.stageRecordId, record.stepId),
+        record.result,
+      );
+      const outcome = await ledger.claim({ ...record, result });
+      return {
+        created: outcome.created,
+        record: await resolve(outcome.record),
+      };
+    },
+
+    async get(stageRecordId, stepId) {
+      const record = await ledger.get(stageRecordId, stepId);
+      return record ? resolve(record) : null;
+    },
+
+    async update(stageRecordId, stepId, patch) {
+      const updated = await ledger.update(
+        stageRecordId,
+        stepId,
+        await packPatch(stageRecordId, stepId, patch),
+      );
+      return resolve(updated);
+    },
+
+    async compareAndSet(
+      stageRecordId: string,
+      stepId: string,
+      expected: StepRecordExpectation,
+      patch: StepRecordPatch,
+    ) {
+      const outcome = await ledger.compareAndSet(
+        stageRecordId,
+        stepId,
+        expected,
+        await packPatch(stageRecordId, stepId, patch),
+      );
+      return {
+        applied: outcome.applied,
+        record: outcome.record ? await resolve(outcome.record) : null,
+      };
+    },
+
+    async list(stageRecordId) {
+      const records = await ledger.list(stageRecordId);
+      return Promise.all(records.map(resolve));
+    },
+
+    async clear(stageRecordId) {
+      await ledger.clear(stageRecordId);
+      await spill.deleteUnder(stepSpillPrefix(stageRecordId));
+    },
+  };
+}
+
+// ============================================================================
+// JobTransport decorator
+// ============================================================================
+
+export interface SpillingJobTransportOptions extends PayloadSpillOptions {}
+
+/**
+ * Wraps a `JobTransport` so job payloads above the threshold live in the
+ * blob store and the queue row (or message) carries only a claim check.
+ *
+ * Pass the wrapped transport to **both** `createKernel` and the host, so
+ * the enqueue that packs and the dequeue that resolves are the same object.
+ *
+ * One caveat, for push transports only: a consumer who delivers job
+ * messages through their own queue (Cloudflare Queues, SQS) and calls
+ * `host.handleJob(msg)` with a message they built themselves bypasses
+ * `dequeue()`, and so bypasses the resolve. Those consumers should resolve
+ * the payload first with a `createPayloadSpill(...)` of their own:
+ *
+ * ```ts
+ * const spill = createPayloadSpill({ blobStore });
+ * await host.handleJob({
+ *   ...msg,
+ *   payload: (await spill.unpack(msg.payload)) as Record<string, unknown>,
+ * });
+ * ```
+ */
+export function createSpillingJobTransport(
+  transport: JobTransport,
+  options: SpillingJobTransportOptions,
+): JobTransport {
+  const spill = createPayloadSpill(options);
+
+  async function resolvePayload(
+    payload: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    if (!isSpillRef(payload)) return payload;
+    return (await spill.unpack(payload)) as Record<string, unknown>;
+  }
+
+  return {
+    async enqueueParallel(jobs: EnqueueJobInput[]) {
+      const packed = await Promise.all(
+        jobs.map(async (job) => {
+          if (job.payload === undefined) return job;
+          const payload = await spill.pack(
+            jobSpillKey(job.workflowRunId, job.stageId),
+            job.payload,
+          );
+          return { ...job, payload: payload as Record<string, unknown> };
+        }),
+      );
+      return transport.enqueueParallel(packed);
+    },
+
+    async deleteByRunAndStages(workflowRunId: string, stageIds: string[]) {
+      const removed = await transport.deleteByRunAndStages(
+        workflowRunId,
+        stageIds,
+      );
+      for (const stageId of stageIds) {
+        await spill.deleteUnder(jobSpillKey(workflowRunId, stageId));
+      }
+      return removed;
+    },
+
+    async dequeue(): Promise<DequeueResult | null> {
+      const job = await transport.dequeue();
+      if (!job) return null;
+      return { ...job, payload: await resolvePayload(job.payload) };
+    },
+
+    async getJobsByWorkflowRun(workflowRunId: string): Promise<JobRecord[]> {
+      const jobs = await transport.getJobsByWorkflowRun(workflowRunId);
+      return Promise.all(
+        jobs.map(async (job) => ({
+          ...job,
+          payload: await resolvePayload(job.payload),
+        })),
+      );
+    },
+
+    complete: (jobId: string) => transport.complete(jobId),
+    suspend: (jobId: string, nextPollAt: Date) =>
+      transport.suspend(jobId, nextPollAt),
+    fail: (jobId: string, error: string, shouldRetry?: boolean) =>
+      transport.fail(jobId, error, shouldRetry),
+    releaseStaleJobs: (staleThresholdMs?: number) =>
+      transport.releaseStaleJobs(staleThresholdMs),
+    cancelByRun: (workflowRunId: string) =>
+      transport.cancelByRun(workflowRunId),
+    touchJob: (jobId: string) => transport.touchJob(jobId),
+    ...(transport.adoptWorkerId
+      ? {
+          adoptWorkerId: (workerId: string) =>
+            transport.adoptWorkerId?.(workerId) ?? workerId,
+        }
+      : {}),
+  };
+}

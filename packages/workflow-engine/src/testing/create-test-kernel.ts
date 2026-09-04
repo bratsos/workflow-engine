@@ -75,6 +75,12 @@ export interface CreateTestKernelOptions<
   eventSink?: TEventSink;
   /** Forwarded to `createKernel`'s `idempotencyStaleInProgressMs`. */
   idempotencyStaleInProgressMs?: number;
+  /**
+   * Forwarded to `createKernel`'s `spillThresholdBytes`. Pass a small value
+   * to exercise the claim check without building a 64 KiB fixture, or
+   * `Number.POSITIVE_INFINITY` to keep every step result inline.
+   */
+  spillThresholdBytes?: number;
   /** Optional durable step ledger for stages that use ctx.step.*. */
   stepLedger?: StepLedger;
   /** Blob store. Defaults to a fresh `InMemoryBlobStore`. */
@@ -123,6 +129,9 @@ export function createTestKernel<
     registry: workflowRegistry,
     ...(opts.idempotencyStaleInProgressMs !== undefined
       ? { idempotencyStaleInProgressMs: opts.idempotencyStaleInProgressMs }
+      : {}),
+    ...(opts.spillThresholdBytes !== undefined
+      ? { spillThresholdBytes: opts.spillThresholdBytes }
       : {}),
     stepLedger: opts.stepLedger,
     services: opts.services,

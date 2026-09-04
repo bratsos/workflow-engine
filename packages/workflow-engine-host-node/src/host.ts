@@ -10,11 +10,15 @@
  */
 
 import {
+  createEventSinkMonitor,
+  type EventSinkHealth,
+  type EventSinkMonitor,
   executeJobWithHeartbeat,
   HOST_DEFAULTS,
   type JobTransport,
   type Kernel,
   runMaintenanceTick as runMaintenanceTickCommands,
+  toEventSinkObservation,
 } from "@bratsos/workflow-engine/kernel";
 
 // ============================================================================
@@ -98,6 +102,13 @@ export interface HostStats {
   orchestrationTicks: number;
   isRunning: boolean;
   uptimeMs: number;
+  /**
+   * State of the event sink as of this host's last outbox flush. A
+   * `"degraded"` sink does not stall runs — the poller advances them and
+   * events stay committed in the outbox — but it is worth alerting on
+   * before `deadLettered` starts climbing.
+   */
+  eventSink: EventSinkHealth;
 }
 
 export interface NodeHost {
@@ -135,6 +146,7 @@ class NodeHostImpl implements NodeHost {
   private readonly jobHeartbeatIntervalMs: number;
   private readonly shutdownTimeoutMs: number;
   private readonly flushOutboxOnStop: boolean;
+  private readonly eventSinkMonitor: EventSinkMonitor;
 
   constructor(config: NodeHostConfig) {
     this.kernel = config.kernel;
@@ -158,6 +170,7 @@ class NodeHostImpl implements NodeHost {
       config.jobHeartbeatIntervalMs ?? HOST_DEFAULTS.jobHeartbeatIntervalMs;
     this.shutdownTimeoutMs = config.shutdownTimeoutMs ?? 10_000;
     this.flushOutboxOnStop = config.flushOutboxOnStop ?? true;
+    this.eventSinkMonitor = createEventSinkMonitor({ logPrefix: "[NodeHost]" });
   }
 
   // --------------------------------------------------------------------------
@@ -269,10 +282,12 @@ class NodeHostImpl implements NodeHost {
           );
           return;
         }
+        this.eventSinkMonitor.observe(toEventSinkObservation(flushed));
         if (flushed.published < this.maxOutboxFlushPerTick) return;
       }
     } catch (error) {
       console.error("[NodeHost] outbox.flush on stop() error:", error);
+      this.eventSinkMonitor.observeError(error);
     }
   }
 
@@ -283,6 +298,7 @@ class NodeHostImpl implements NodeHost {
       orchestrationTicks: this.orchestrationTicks,
       isRunning: this.running,
       uptimeMs: this.running ? Date.now() - this.startTime : 0,
+      eventSink: this.eventSinkMonitor.report(),
     };
   }
 
@@ -315,7 +331,7 @@ class NodeHostImpl implements NodeHost {
     // and doesn't need the per-command counts (unlike the serverless host,
     // which returns them to its caller) — see runMaintenanceTick in
     // @bratsos/workflow-engine/kernel for the shared command sequence.
-    await runMaintenanceTickCommands(this.kernel, {
+    const counts = await runMaintenanceTickCommands(this.kernel, {
       workerId: this.workerId,
       maxClaimsPerTick: this.maxClaimsPerTick,
       maxSuspendedChecksPerTick: this.maxSuspendedChecksPerTick,
@@ -323,6 +339,14 @@ class NodeHostImpl implements NodeHost {
       staleLeaseThresholdMs: this.staleLeaseThresholdMs,
       jobAbsoluteTimeoutMs: this.jobAbsoluteTimeoutMs,
       logPrefix: "[NodeHost]",
+    });
+    this.eventSinkMonitor.observe({
+      failed: counts.eventsFailed,
+      deadLettered: counts.eventsDeadLettered,
+      eventSinkStatus: counts.eventSinkStatus,
+      ...(counts.eventSinkError !== undefined
+        ? { eventSinkError: counts.eventSinkError }
+        : {}),
     });
   }
 

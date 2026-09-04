@@ -103,6 +103,8 @@ export interface CreateTestHarnessOptions {
   plugins?: PluginDefinition[];
   /** Guard for `run()`. Defaults to 100. */
   maxTicks?: number;
+  /** Forwarded to `createKernel`'s `spillThresholdBytes`. */
+  spillThresholdBytes?: number;
   /**
    * How far to advance the clock when nothing is runnable and no suspended
    * stage declares a `nextPollAt`. Defaults to one second.
@@ -138,6 +140,9 @@ export function createTestHarness(options: CreateTestHarnessOptions = {}) {
     } as KernelServices,
     ...(options.eventSink ? { eventSink: options.eventSink } : {}),
     ...(options.plugins ? { plugins: options.plugins } : {}),
+    ...(options.spillThresholdBytes !== undefined
+      ? { spillThresholdBytes: options.spillThresholdBytes }
+      : {}),
   });
 
   const { kernel, persistence, jobTransport: jobQueue } = base;

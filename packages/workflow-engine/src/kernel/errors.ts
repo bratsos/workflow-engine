@@ -42,3 +42,23 @@ export class RunNotRunningError extends Error {
     this.name = "RunNotRunningError";
   }
 }
+
+/**
+ * Thrown when a payload that was spilled to the blob store cannot be read
+ * back. Almost always means the process reading it is pointed at a
+ * different `BlobStore` than the one that wrote it: every process that
+ * executes or replays a run must share one (see `createPrismaBlobStore`).
+ */
+export class SpilledPayloadUnavailableError extends Error {
+  constructor(
+    public readonly key: string,
+    public readonly cause?: unknown,
+  ) {
+    super(
+      `Spilled payload "${key}" is not in the blob store${
+        cause instanceof Error ? `: ${cause.message}` : ""
+      }. Every process that executes or polls a run must share one BlobStore (see createPrismaBlobStore).`,
+    );
+    this.name = "SpilledPayloadUnavailableError";
+  }
+}

@@ -256,9 +256,36 @@ export interface OutboxFlushCommand {
   readonly maxEvents?: number;
 }
 
+/**
+ * Health of the event sink as of the last flush.
+ *
+ * `"degraded"` is the named state for "the sink is refusing events": the
+ * run keeps progressing (the poller, not the sink, is what advances a
+ * run), events stay committed in the outbox, and delivery is retried on
+ * the next flush. It is not an error — it is a state a host reports so it
+ * is visible *before* the dead-letter queue fills.
+ */
+export type EventSinkStatus = "healthy" | "degraded";
+
 /** Result of an `outbox.flush` command. */
 export interface OutboxFlushResult {
   readonly published: number;
+  /**
+   * Events this flush claimed but could not publish. They were released
+   * (their `publishedAt` cleared) and the next flush retries them, so this
+   * is a delivery-lag signal, not data loss.
+   */
+  readonly failed: number;
+  /**
+   * Events this flush moved to the dead-letter queue because their retry
+   * budget ran out. These no longer retry on their own: replay them with
+   * `plugin.replayDLQ`.
+   */
+  readonly deadLettered: number;
+  /** `"degraded"` when at least one event could not be published. */
+  readonly eventSinkStatus: EventSinkStatus;
+  /** Message of the first publish failure of this flush, when degraded. */
+  readonly eventSinkError?: string;
 }
 
 // ---------------------------------------------------------------------------

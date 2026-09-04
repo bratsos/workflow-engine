@@ -265,6 +265,7 @@ export type {
 export {
   AIServicesNotConfiguredError,
   IdempotencyInProgressError,
+  SpilledPayloadUnavailableError,
 } from "./kernel/errors";
 export type {
   KernelEvent,
@@ -296,6 +297,17 @@ export type {
   StepLedger,
   StepRecord,
 } from "./kernel/ports";
+export {
+  createPayloadSpill,
+  createSpillingJobTransport,
+  DEFAULT_SPILL_THRESHOLD_BYTES,
+  isSpillRef,
+  type PayloadSpill,
+  type PayloadSpillOptions,
+  type SpillingJobTransportOptions,
+  type SpillRef,
+  withStepResultSpill,
+} from "./kernel/spill";
 export type {
   CreateOutboxEventInput,
   IdempotencyRecord,

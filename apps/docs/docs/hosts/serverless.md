@@ -110,8 +110,24 @@ export default {
     //   suspendedChecked: 1,
     //   staleReleased: 0,
     //   eventsFlushed: 4,
-    //   stuckReaped: 0
+    //   stuckReaped: 0,
+    //   eventsFailed: 0,
+    //   eventsDeadLettered: 0,
+    //   eventSinkStatus: "healthy"   // or "degraded", with eventSinkError
     // }
   }
 };
 ```
+
+### Degraded event sink
+
+`eventSinkStatus` is `"degraded"` when the flush in this tick could not
+publish at least one event. Those events stay committed in the outbox and the
+next flush retries them; the run keeps progressing regardless, because the
+poller -- not the sink -- is what advances it.
+
+There is no process to carry the state between invocations here, so the
+serverless host reports it per tick (and logs it per tick) rather than on a
+transition; alert on a *run* of degraded ticks. `eventsDeadLettered` counts
+events that exhausted their retry budget in this tick: those stop retrying on
+their own and need a `plugin.replayDLQ` dispatch once the sink is back.

@@ -43,6 +43,19 @@ To prevent jobs from hanging indefinitely when a worker crashes mid-execution:
 * **Heartbeating (v0.11+)**: While a worker is executing a job, the host periodically heartbeats the job to extend its lease. The default stale lease threshold in `v0.11` is **300,000 ms (5 minutes)** (increased from 60 seconds in `v0.10` to prevent premature lease timeouts during heavy local CPU execution).
 * **Lease Reaping**: The `lease.reapStale` command periodically searches the `JobQueue` for active leases that haven't been updated within the threshold, releases them, and marks them for retry. This runs automatically on each host orchestration tick.
 
+### Suspended-stage single flight
+
+A suspended stage is claimed by a different mechanism: the poller bumps the stage's `nextPollAt` to `now + max(pollInterval, 60s)` under a version-guarded compare-and-set. A second poller's guarded write touches zero rows and it skips the stage. Every outcome branch writes `nextPollAt` explicitly afterwards, so the lease value survives only when the process dies mid-replay -- in which case the stage waits out the lease and the next poller takes it.
+
+**Why not a Postgres advisory lock?** A session-level advisory lock would release the moment the connection died, closing that window with no lease to tune. It was evaluated and rejected, for four independent reasons:
+
+1. **Connection pooling.** The lock must span the `checkCompletion()` HTTP call and the transaction after it, so it has to be a *session* lock (`pg_advisory_xact_lock` releases at `COMMIT`, mid-replay). Session locks are re-entrant within a session, so two pollers handed the same pooled connection both win `pg_try_advisory_lock` on the same key -- single flight fails exactly where concurrency is highest.
+2. **PgBouncer in transaction mode** does not support session-level advisory locks. Statements land on different server connections and the lock leaks with nothing to release it.
+3. **The serverless host** has no long-lived connection to own a session lock, so it would need the `nextPollAt` lease as a fallback anyway.
+4. **Row-level security.** This is the decisive one. If you run the kernel inside your own transaction (`skipInteractiveTransactions`, your `tx` client, `SET LOCAL` for your tenant), a session lock taken inside that transaction is *not* released at your `COMMIT` -- it leaks into your pooled connection. And the advisory namespace is one 64-bit integer space, global to the database and invisible to RLS: a tenant blocked on another tenant's key sees that key in `pg_locks` and waits on it, with no policy able to intervene. Row-level security cannot scope a lock it cannot see.
+
+`Persistence` also has no raw-SQL escape hatch and SQLite has no advisory locks, so the port would have grown a Postgres-only optional method whose fallback was the lease regardless.
+
 ---
 
 ## Retries & Error Taxonomy
