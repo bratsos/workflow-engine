@@ -164,6 +164,22 @@ class NodeHostImpl implements NodeHost {
     this.running = true;
     this.startTime = Date.now();
 
+    // Hand this host's id to the job transport, so `job_queue.workerId`
+    // names the same worker `run.claimPending` does. A transport built
+    // with its own explicit `workerId` keeps it and reports it back —
+    // then say so once, rather than silently labelling every job row with
+    // an id that does not match any host.
+    const transportWorkerId = this.jobTransport.adoptWorkerId?.(this.workerId);
+    if (
+      transportWorkerId !== undefined &&
+      transportWorkerId !== this.workerId
+    ) {
+      console.error(
+        `[NodeHost] workerId mismatch: this host is "${this.workerId}" but its job transport stamps "${transportWorkerId}" on the jobs it claims. ` +
+          "Drop the workerId option from the transport (e.g. createPrismaJobQueue(prisma)) to let the host supply it.",
+      );
+    }
+
     // Start orchestration timer
     this.orchestrationTimer = setInterval(
       () => this.startOrchestrationTick(),

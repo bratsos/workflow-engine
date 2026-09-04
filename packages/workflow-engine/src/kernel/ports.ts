@@ -271,6 +271,19 @@ export interface JobTransport {
 
   /** Refresh a running job's lease without changing status. */
   touchJob(jobId: string): Promise<void>;
+
+  /**
+   * Optional. Offer the host's `workerId` to the transport, so the id
+   * stamped on `job_queue.workerId` is the one that identifies the
+   * process — transports are usually constructed before the host and
+   * would otherwise invent their own (`worker-<pid>-<ts>`), leaving
+   * "which worker ran this stage" unanswerable from the job row.
+   *
+   * A transport that was explicitly configured with a worker id MUST keep
+   * it (the caller said what it wanted). Either way it returns the id it
+   * will actually stamp, so the host can warn when the two disagree.
+   */
+  adoptWorkerId?(workerId: string): string;
 }
 
 // ============================================================================

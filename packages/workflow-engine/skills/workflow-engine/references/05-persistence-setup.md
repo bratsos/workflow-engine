@@ -527,7 +527,9 @@ const prisma = new PrismaClient();
 
 // PostgreSQL (default)
 const persistence = createPrismaWorkflowPersistence(prisma);
-const jobQueue = createPrismaJobQueue(prisma, { workerId: "my-worker-id" });
+// Omit workerId under a host: createNodeHost stamps its own on the queue,
+// so job_queue.workerId names the same worker run.claimPending does.
+const jobQueue = createPrismaJobQueue(prisma);
 const aiCallLogger = createPrismaAICallLogger(prisma);
 
 // Prisma-backed blob store (optional WorkflowBlob table): stage outputs are
@@ -574,10 +576,32 @@ interface PrismaWorkflowPersistenceOptions {
 }
 
 interface PrismaJobQueueOptions {
-  workerId?: string;            // Default: auto-generated
+  workerId?: string;            // Default: auto-generated, or the host's (see below)
   databaseType?: DatabaseType;  // Default: "postgresql"
 }
 ```
+
+### `workerId`: let the host supply it
+
+`job_queue.workerId` is written by the queue, not by the host, and the queue is
+normally constructed first. Left to itself it generates `worker-<pid>-<timestamp>`,
+which matches no `NodeHostConfig.workerId` and makes "which worker ran this stage"
+unanswerable from the job row.
+
+As of 1.0.0-alpha.7 / host-node 0.4.4, `createNodeHost(...).start()` offers its
+`workerId` to the transport (`JobTransport.adoptWorkerId`, optional on the port).
+So:
+
+- **`createPrismaJobQueue(prisma)`** -- the queue adopts the host's id. This is
+  what you want under a host.
+- **`createPrismaJobQueue(prisma, { workerId: "..." })`** -- the queue keeps yours
+  (you asked for it), and the host logs a one-line `workerId mismatch` warning
+  naming both ids if they differ. Pass one only where there is no host to take it
+  from, e.g. a script enqueueing jobs directly.
+
+A custom `JobTransport` may implement `adoptWorkerId(workerId): string` -- take the
+id unless one was explicitly configured, and return the id you will actually stamp.
+Omitting the method is fine; the host then leaves the transport alone.
 
 **Important:** When using SQLite, pass `{ databaseType: "sqlite" }` to both `createPrismaWorkflowPersistence` and `createPrismaJobQueue`. Otherwise, you'll get SQL syntax errors from PostgreSQL-specific queries.
 

@@ -39,7 +39,7 @@ Creates a new Node host instance.
 |--------|------|---------|-------------|
 | `kernel` | `Kernel` | required | Kernel instance to dispatch commands to |
 | `jobTransport` | `JobTransport` | required | Job transport for dequeue/complete/suspend/fail |
-| `workerId` | `string` | required | Unique worker identifier |
+| `workerId` | `string` | required | Unique worker identifier; `start()` also stamps it on the job transport (see below) |
 | `orchestrationIntervalMs` | `number` | `10_000` | Interval for claim/poll/reap/flush orchestration tick |
 | `jobPollIntervalMs` | `number` | `1_000` | Interval for polling job queue when empty |
 | `postJobYieldMs` | `number` | `jobPollIntervalMs` | Upper bound on the randomised pause after a completed job (`0` disables it) |
@@ -93,6 +93,10 @@ The host runs two concurrent loops:
    - After a completed job, pause for a uniform draw over `[0, postJobYieldMs)` — unless draining a backlog
 
 Signal handlers (`SIGTERM`, `SIGINT`) automatically call `stop()` for graceful shutdown. `stop()` lets the in-flight orchestration tick and the job in flight finish (each up to `shutdownTimeoutMs`) and then flushes the outbox once more, bounded by the same timeout, so `workflow:completed` for a run this process finished reaches the `EventSink` (and your plugins) here rather than in whichever process ticks next. Flush errors are logged, not thrown. Set `flushOutboxOnStop: false` when another process owns event publication.
+
+### `workerId` and the job transport
+
+`job_queue.workerId` is written by the transport, not the host, and the transport is built first — left alone, `createPrismaJobQueue(prisma)` generated `worker-<pid>-<timestamp>`, an id no host answered to. As of 0.4.4 `start()` offers this host's `workerId` to the transport (`JobTransport.adoptWorkerId`, optional on the port): a transport with no `workerId` of its own adopts it, one built with an explicit id keeps it and the host logs a single `workerId mismatch` line naming both. Build the queue as `createPrismaJobQueue(prisma)` under a host.
 
 ### Spreading one run across workers
 

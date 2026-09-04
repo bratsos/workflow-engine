@@ -48,6 +48,12 @@ export interface PrismaJobQueueOptions {
 
 export class PrismaJobQueue implements JobQueue {
   private workerId: string;
+  /**
+   * Whether `workerId` came from the caller. A generated id is a
+   * placeholder the host is allowed to replace through `adoptWorkerId`;
+   * one the caller chose is not.
+   */
+  private readonly workerIdWasConfigured: boolean;
   private prisma: PrismaClient;
   private enums: PrismaEnumHelper;
   private databaseType: DatabaseType;
@@ -56,6 +62,7 @@ export class PrismaJobQueue implements JobQueue {
 
   constructor(prisma: PrismaClient, options: PrismaJobQueueOptions = {}) {
     this.prisma = prisma;
+    this.workerIdWasConfigured = Boolean(options.workerId);
     this.workerId = options.workerId || `worker-${process.pid}-${Date.now()}`;
     this.enums = createEnumHelper(prisma);
     this.databaseType = options.databaseType ?? "postgresql";
@@ -97,6 +104,20 @@ export class PrismaJobQueue implements JobQueue {
         })),
       },
     };
+  }
+
+  /**
+   * Take the host's worker id unless this queue was constructed with one
+   * of its own; returns the id it will stamp on `job_queue.workerId`.
+   */
+  adoptWorkerId(workerId: string): string {
+    if (!this.workerIdWasConfigured) this.workerId = workerId;
+    return this.workerId;
+  }
+
+  /** The id this queue stamps on the jobs it claims. */
+  getWorkerId(): string {
+    return this.workerId;
   }
 
   /**

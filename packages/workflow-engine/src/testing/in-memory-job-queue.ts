@@ -39,6 +39,8 @@ export interface InMemoryJobQueueOptions {
 export class InMemoryJobQueue implements JobQueue {
   private jobs = new Map<string, JobRecord>();
   private workerId: string;
+  /** Whether `workerId` came from the caller (see `adoptWorkerId`). */
+  private readonly workerIdWasConfigured: boolean;
   private defaultMaxAttempts = 3;
   private readonly now: () => Date;
   /**
@@ -67,8 +69,18 @@ export class InMemoryJobQueue implements JobQueue {
       typeof workerIdOrOpts === "string"
         ? { workerId: workerIdOrOpts, ...maybeOpts }
         : (workerIdOrOpts ?? {});
+    this.workerIdWasConfigured = opts.workerId !== undefined;
     this.workerId = opts.workerId ?? `worker-${randomUUID().slice(0, 8)}`;
     this.now = opts.now ?? (() => new Date());
+  }
+
+  /**
+   * Take the host's worker id unless this queue was constructed with one
+   * of its own; returns the id it will stamp on claimed jobs.
+   */
+  adoptWorkerId(workerId: string): string {
+    if (!this.workerIdWasConfigured) this.workerId = workerId;
+    return this.workerId;
   }
 
   // ============================================================================

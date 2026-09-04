@@ -755,6 +755,14 @@ export interface JobQueue {
    * `releaseStaleJobs` doesn't duplicate work still in-flight.
    */
   touchJob(jobId: string): Promise<void>;
+
+  /**
+   * Optional. Offer a host's `workerId` to the queue so it is the id
+   * written to `job_queue.workerId`. A queue explicitly configured with
+   * its own worker id keeps it. Returns the id the queue will stamp,
+   * whichever way it went, so the caller can warn on a mismatch.
+   */
+  adoptWorkerId?(workerId: string): string;
 }
 
 // ============================================================================
