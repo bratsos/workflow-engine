@@ -177,6 +177,53 @@ describe("I want to use model helper utilities", () => {
   });
 
   describe("calculateBatchCost and calculateCostWithDiscount", () => {
+    /**
+     * Vertex documents that "the discounts for cache and batch don't stack.
+     * The 90% cache hit discount takes precedence over the batch discount",
+     * and the Gemini Developer API bills a `cached_content` hit at
+     * context-caching rates rather than batch rates. A cost model that
+     * multiplied a batch discount by a cache discount would be wrong on both.
+     *
+     * This engine cannot make that mistake: it has no cached-token bucket and
+     * no Vertex transport, and `calculateBatchCost` applies exactly one
+     * adjustment to the base price -- the vendor percentage on a native
+     * transport, or the absolute ":batch" catalog price -- never both. This
+     * test pins that, so a later cache-aware price cannot quietly compound.
+     */
+    it("applies exactly one batch adjustment, never two compounded", () => {
+      const bothPricingSignals: ModelConfig = {
+        id: "google/gemini-2.5-flash",
+        name: "Both signals",
+        inputCostPerMillion: 10,
+        outputCostPerMillion: 20,
+        provider: "openrouter",
+        supportsAsyncBatch: true,
+        batchDiscountPercent: 50,
+        batchInputCostPerMillion: 5,
+        batchOutputCostPerMillion: 10,
+      };
+      const base = 10 + 20;
+
+      // Native vendor transport: the documented percentage, applied once.
+      expect(
+        calculateBatchCost(bothPricingSignals, 1_000_000, 1_000_000, "google"),
+      ).toBeCloseTo(base * 0.5, 10);
+      // OpenRouter transport: the absolute ":batch" price, applied once --
+      // not the absolute price discounted again.
+      expect(
+        calculateBatchCost(
+          bothPricingSignals,
+          1_000_000,
+          1_000_000,
+          "openrouter",
+        ),
+      ).toBeCloseTo(15, 10);
+      // Neither result is the compounded 0.5 * 0.5 a stacking model produces.
+      expect(
+        calculateBatchCost(bothPricingSignals, 1_000_000, 1_000_000, "google"),
+      ).not.toBeCloseTo(base * 0.25, 10);
+    });
+
     it("should calculate batch cost using absolute batch prices when available", () => {
       const modelWithBatchPrices: ModelConfig = {
         id: "anthropic/claude-sonnet-4.5",
