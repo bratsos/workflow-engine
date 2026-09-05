@@ -55,6 +55,7 @@ export {
   StepLedgerWriteError,
   StepNotReplaySafeError,
   StepResultNotSerializable,
+  type StepRetryBackoff,
   type StepRunContext,
   type StepRunOptions,
   type StepSignalOptions,

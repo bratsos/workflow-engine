@@ -60,6 +60,11 @@ export interface CreateStepApiOptions {
   defaultLeaseMs?: number;
   /** Lazy accessor for the stage's AI helper, used by `step.ai.*`. */
   ai?: () => AIHelper;
+  /**
+   * Uniform source in [0, 1) for `retryBackoff.jitter`. Defaults to
+   * `Math.random`; injectable so a test can pin the drawn delay.
+   */
+  random?: () => number;
 }
 
 interface StepInvocation {
@@ -127,6 +132,31 @@ function resolveLeaseMs(opts: StepRunOptions, defaultLeaseMs: number): number {
     requested === undefined ? defaultLeaseMs : parseStepDuration(requested),
     "lease",
   );
+}
+
+/**
+ * The wait before re-running a step whose attempt `failedAttempt` just
+ * failed. Reads the attempt off the row, not a counter: the retry suspends
+ * the stage and replays in whichever process picks it up next.
+ */
+function retryDelayFor(
+  opts: StepRunOptions,
+  failedAttempt: number,
+  random: () => number,
+): number {
+  const base = parseStepDuration(opts.retryDelay ?? opts.retryDelayMs ?? 0);
+  const backoff = opts.retryBackoff;
+  if (!backoff) return base;
+  const factor = backoff.factor ?? 1;
+  if (!Number.isFinite(factor) || factor < 1) {
+    throw new Error("retryBackoff.factor must be a finite number >= 1");
+  }
+  const maxDelay =
+    backoff.maxDelay === undefined
+      ? Number.POSITIVE_INFINITY
+      : parseStepDuration(backoff.maxDelay);
+  const delay = Math.min(base * factor ** (failedAttempt - 1), maxDelay);
+  return backoff.jitter ? Math.floor(random() * delay) : delay;
 }
 
 /** Creates the StepApi attached to a single stage invocation. */
@@ -414,9 +444,8 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
       const invocation = begin(id, "run");
       const leaseMs = resolveLeaseMs(opts, defaultLeaseMs);
       const retries = nonNegativeInteger(opts.retries ?? 0, "retries");
-      const retryDelayMs = parseStepDuration(
-        opts.retryDelay ?? opts.retryDelayMs ?? 0,
-      );
+      // Validate the delay options up front, before the body runs.
+      retryDelayFor(opts, 1, () => 0);
       const onReclaim = opts.onReclaim ?? "rerun";
       const now = options.clock.now();
       const { stageRecordId } = requireLedger();
@@ -503,6 +532,11 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
         });
         if (failure.parked) return parkedResult<T>(failure.record);
         if (record.attempt <= retries) {
+          const retryDelayMs = retryDelayFor(
+            opts,
+            record.attempt,
+            options.random ?? Math.random,
+          );
           const retryAt = new Date(
             options.clock.now().getTime() + retryDelayMs,
           );

@@ -48,6 +48,15 @@ export interface StepRunOptions {
   /** @deprecated Use `retryDelay`. Ignored when `retryDelay` is also given. */
   retryDelayMs?: number | string;
   /**
+   * Grow `retryDelay` with each failed attempt. The delay before retrying
+   * after attempt *n* is `retryDelay * factor^(n-1)`, capped at `maxDelay`;
+   * with `jitter` the wait is a uniform random fraction of that ("full
+   * jitter"). Computed from the attempt recorded on the step row, so it is
+   * correct when the retry replays in another process. Defaults to a factor
+   * of 1 — a fixed `retryDelay`.
+   */
+  retryBackoff?: StepRetryBackoff;
+  /**
    * What to do when this step's lease expired and another worker takes it
    * over — the one case where the engine cannot know whether the body's side
    * effect already happened, because the worker died between the effect and
@@ -65,6 +74,16 @@ export interface StepRunOptions {
    * did not take, and asking for retries is asking for it to be repeated.
    */
   onReclaim?: "rerun" | "fail";
+}
+
+/** Exponential growth of a `run` step's retry delay. */
+export interface StepRetryBackoff {
+  /** Multiplier applied per failed attempt. At least 1; defaults to 1. */
+  factor?: number;
+  /** Upper bound on the computed delay. Milliseconds or a duration string. */
+  maxDelay?: number | string;
+  /** Wait a uniform random fraction of the computed delay. Defaults to false. */
+  jitter?: boolean;
 }
 
 /**
