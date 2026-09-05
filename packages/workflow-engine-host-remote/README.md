@@ -248,7 +248,8 @@ export default {
 
 ### Limitations
 
-- **No mid-activity cancellation**: if a run is cancelled while the worker is executing, the worker's in-flight activity finishes; its `report()` is fenced by the broker (stale-token rejection) and the stage outcome is not persisted. The run terminates correctly but the worker cannot be interrupted mid-run.
+- **No durable steps or injected AI on the worker**: the worker builds the stage context by hand. `ctx.step` is present (the context contract requires it) but is the ledger-less `createStepApi()`, so every `ctx.step.*` call throws `StepLedgerNotConfiguredError`; `ctx.ai` / `ctx.aiLogger` throw `AIServicesNotConfiguredError`. A stage that returns `{ suspended: true }` on the worker is reported as failed. Keep durable waits and `ctx.step.ai.*` calls in stages that run on the orchestrator.
+- **No mid-activity cancellation**: if a run is cancelled while the worker is executing, the worker's in-flight activity finishes; its `report()` is fenced by the broker (stale-token rejection) and the stage outcome is not persisted. The run terminates correctly but the worker cannot be interrupted mid-run. The kernel's heartbeat-driven `ctx.abortSignal` does not cross the worker boundary: the signal is present on the worker's context and never fires.
 - **Single-part PUT only**: artifact writes use a single presigned PUT. Objects larger than 5 GB require multipart upload — not yet implemented.
 - **Single-orchestrator HA**: the in-memory broker is per-process. Running multiple orchestrator instances requires a shared broker store (a small Prisma table, Redis, or DB-backed `claimNext`). Multi-instance HA is deferred.
 - **Real-S3 integration tests**: the S3 presigner path (`createS3Presigner`) is unit-tested with a mock signer. A full round-trip integration test against a real MinIO / LocalStack endpoint is not included and should be added before relying on it in production.

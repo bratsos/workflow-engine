@@ -43,10 +43,14 @@ Creates a new Node host instance.
 | `orchestrationIntervalMs` | `number` | `10_000` | Interval for claim/poll/reap/flush orchestration tick |
 | `jobPollIntervalMs` | `number` | `1_000` | Interval for polling job queue when empty |
 | `postJobYieldMs` | `number` | `jobPollIntervalMs` | Upper bound on the randomised pause after a completed job (`0` disables it) |
-| `staleLeaseThresholdMs` | `number` | `60_000` | Time before a job lease is considered stale |
+| `staleLeaseThresholdMs` | `number` | `300_000` | Heartbeat tier: a job whose lease (measured from `lockedAt`, on the database clock for Postgres) is older is re-queued with `lastError` prefixed `LEASE_HEARTBEAT_LOST` |
+| `jobAbsoluteTimeoutMs` | `number` | `3_600_000` | Absolute tier: a job claimed longer ago than this (from `startedAt`, which no heartbeat refreshes) is failed terminally with `LEASE_ABSOLUTE_CAP`; `0` disables |
+| `jobHeartbeatIntervalMs` | `number` | `60_000` | How often the job in flight dispatches `job.heartbeat`, which renews its lease and aborts the stage's `ctx.abortSignal` when the run is cancelled or the lease is lost |
 | `maxClaimsPerTick` | `number` | `10` | Max pending runs to claim per orchestration tick |
+| `serves` | `ServedDefinition[] \| "all"` | derived from registry | Which definition versions this host claims, dequeues and polls; `"all"` restores the pre-1.0 predicate |
 | `maxSuspendedChecksPerTick` | `number` | `10` | Max suspended stages to poll per tick |
 | `maxOutboxFlushPerTick` | `number` | `100` | Max outbox events to flush per tick |
+| `retention` | `RetentionOptions` | off | `{ olderThanMs, statuses?, limit? }`: delete terminal runs older than this through `run.purge` at the end of every tick |
 | `shutdownTimeoutMs` | `number` | `10_000` | Bound on `stop()`: wait for the in-flight job, then for the final outbox flush |
 | `flushOutboxOnStop` | `boolean` | `true` | Run a final `outbox.flush` in `stop()` |
 
@@ -67,28 +71,35 @@ interface HostStats {
   orchestrationTicks: number;
   isRunning: boolean;
   uptimeMs: number;
+  /** Event sink state as of the last flush: { status, since, consecutiveFailures, deadLettered, lastError } */
+  eventSink: EventSinkHealth;
 }
 ```
+
+A `"degraded"` event sink never stalls a run — the poller advances runs and events stay committed in the outbox — but it is worth alerting on before `deadLettered` climbs. The host logs one line per transition rather than one per tick, and unconditionally when events were dead-lettered (recover them with `plugin.replayDLQ`).
 
 ## How It Works
 
 The host runs two concurrent loops:
 
 1. **Orchestration timer** (every `orchestrationIntervalMs`):
-   - `run.claimPending` -- claim pending runs, enqueue first-stage jobs
-   - `stage.pollSuspended` -- check if suspended stages are ready to resume
-   - `lease.reapStale` -- release stale job leases from crashed workers
+   - `run.claimPending` -- claim pending runs this build serves (`serves`), enqueue first-stage jobs
+   - `stage.pollSuspended` -- check if suspended stages are ready to resume (durable-step waits, signals, batch polls)
+   - `lease.reapStale` -- re-queue jobs whose heartbeat stopped; fail jobs past `jobAbsoluteTimeoutMs`
    - `outbox.flush` -- publish pending events through EventSink
-   - `run.reapStuck` -- fail RUNNING runs with no recent activity
+   - `run.reapStuck` -- fail RUNNING runs with no recent activity; re-enqueue a PENDING stage that lost its job
+   - `run.purge` -- only when `retention` is set: delete terminal runs older than `olderThanMs`
 
-   A firing that lands while the previous tick is still running is skipped, not queued, so a suspended-stage replay longer than the interval never overlaps the next tick in this process; `orchestrationTicks` counts only ticks that ran. Several hosts may tick against one database: the kernel claims each suspended stage before polling it.
+   A firing that lands while the previous tick is still running is skipped, not queued, so a suspended-stage replay longer than the interval never overlaps the next tick in this process; `orchestrationTicks` counts only ticks that ran. Several hosts may tick against one database: the kernel claims each suspended stage before polling it, and a run pinned to a definition version this build does not serve is left for a host that does.
 
 2. **Job processing loop** (continuous):
-   - Dequeue next job from `jobTransport`
-   - Dispatch `job.execute` to the kernel
+   - Dequeue next job from `jobTransport` (filtered by `serves`)
+   - Dispatch `job.execute` to the kernel, dispatching `job.heartbeat` every `jobHeartbeatIntervalMs` while it runs; a cancelled run or a lost lease aborts the stage's `ctx.abortSignal`
    - On completion: mark complete, dispatch `run.transition`
    - On suspension: mark suspended with next poll time
    - On failure: mark failed with retry flag
+   - Every acknowledgement carries a fence (`{ startedAt, attempt }`): a stale worker whose job was re-claimed writes nothing, logs `superseded`, and skips the `run.transition` the newer attempt owns
+   - A job whose run is still `PENDING` (`ghostReason: "race"`) is re-delivered; one this build cannot serve (`"version"`) is deferred without spending its attempt; an orphan whose run, workflow or stage no longer exists is failed and acknowledged as dead
    - Sleep `jobPollIntervalMs` when queue is empty
    - After a completed job, pause for a uniform draw over `[0, postJobYieldMs)` — unless draining a backlog
 
@@ -195,6 +206,10 @@ createNodeHost({ kernel, jobTransport, workerId: "worker-2" });
 ```
 
 Run claiming uses `FOR UPDATE SKIP LOCKED` in PostgreSQL to prevent race conditions.
+
+### Rolling deploys
+
+Build the kernel's registry with `createWorkflowRegistry(workflows)`. A run is pinned to the structural version of its workflow at `run.create`, and a host only claims, dequeues and polls runs whose `(workflowId, version)` it serves — old workers finish their own runs, new workers never adopt an incompatible one. Leave `serves` unset to derive it from the registry; `serves: "all"` restores the pre-1.0 behaviour. `run.listVersions` shows which versions still have runs and whether this build serves them; `run.redrive` with `definitionVersion: "latest"` moves a stranded run forward.
 
 ## License
 
