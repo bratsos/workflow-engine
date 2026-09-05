@@ -11,7 +11,10 @@
  */
 
 import { z } from "zod";
-import type { ServedDefinition } from "../../persistence/interface.js";
+import type {
+  PurgeableRunStatus,
+  ServedDefinition,
+} from "../../persistence/interface.js";
 import type { EventSinkStatus, OutboxFlushResult } from "../commands.js";
 import type { Kernel } from "../kernel.js";
 import type { JobTransport } from "../ports.js";
@@ -395,6 +398,24 @@ export async function executeJobWithHeartbeat(
  * so a caller can pass `{}` (or just the one knob it cares about) and still
  * get the tuning the built-in hosts use.
  */
+/**
+ * Retention for finished runs, applied by `run.purge` on every maintenance
+ * tick when set. Off unless a host is given one: nothing is deleted by
+ * default.
+ */
+export interface RetentionOptions {
+  /**
+   * Age (ms) past which a terminal run is deleted, measured from its
+   * `completedAt` (or `updatedAt` when it has none) against the wall clock
+   * at the time of the tick.
+   */
+  olderThanMs: number;
+  /** Defaults to `COMPLETED`, `FAILED` and `CANCELLED`. */
+  statuses?: readonly PurgeableRunStatus[];
+  /** Runs deleted per tick (default: 100). */
+  limit?: number;
+}
+
 export interface RunMaintenanceTickOptions {
   /**
    * Unique worker identifier passed to `run.claimPending`. Defaults to
@@ -424,6 +445,11 @@ export interface RunMaintenanceTickOptions {
   /** Defaults to `HOST_DEFAULTS.jobAbsoluteTimeoutMs`. Pass 0 to disable the absolute tier. */
   jobAbsoluteTimeoutMs?: number;
   /**
+   * Delete terminal runs older than `retention.olderThanMs` through
+   * `run.purge` at the end of every tick. Omitted, nothing is deleted.
+   */
+  retention?: RetentionOptions;
+  /**
    * Prefix for this host's `console.error` diagnostics, e.g. "[NodeHost]".
    * Defaults to `HOST_DEFAULTS.logPrefix`.
    */
@@ -443,6 +469,8 @@ export interface MaintenanceTickCounts {
   staleExpired: number;
   eventsFlushed: number;
   stuckReaped: number;
+  /** Terminal runs `run.purge` deleted this tick; 0 unless `retention` is set. */
+  purged: number;
   /**
    * Events the flush claimed but could not publish and which the next
    * flush will retry: the ones whose emit threw, plus the later events of
@@ -465,8 +493,10 @@ export interface MaintenanceTickCounts {
 /**
  * Runs one bounded maintenance pass: claim pending runs, poll suspended
  * stages (transitioning any that resumed), reap stale leases, flush the
- * outbox, and reap stuck runs. Each command's error is caught and logged
- * independently so a failure in one doesn't block the rest of the tick.
+ * outbox, reap stuck runs, and — only when `retention` is set — purge
+ * terminal runs past their retention age. Each command's error is caught
+ * and logged independently so a failure in one doesn't block the rest of
+ * the tick.
  */
 export async function runMaintenanceTick(
   kernel: Kernel,
@@ -481,6 +511,7 @@ export async function runMaintenanceTick(
     jobAbsoluteTimeoutMs = HOST_DEFAULTS.jobAbsoluteTimeoutMs,
     logPrefix = HOST_DEFAULTS.logPrefix,
     serves,
+    retention,
   } = options;
 
   let claimed = 0;
@@ -489,6 +520,7 @@ export async function runMaintenanceTick(
   let staleExpired = 0;
   let eventsFlushed = 0;
   let stuckReaped = 0;
+  let purged = 0;
   let eventsFailed = 0;
   let eventsDeadLettered = 0;
   let eventSinkStatus: EventSinkStatus = "healthy";
@@ -571,6 +603,23 @@ export async function runMaintenanceTick(
     console.error(`${logPrefix} run.reapStuck error:`, error);
   }
 
+  // 6. Retention → delete terminal runs past their age. Opt-in only.
+  if (retention) {
+    try {
+      const purgeResult = await kernel.dispatch({
+        type: "run.purge",
+        olderThan: new Date(Date.now() - retention.olderThanMs),
+        ...(retention.statuses !== undefined
+          ? { statuses: retention.statuses }
+          : {}),
+        ...(retention.limit !== undefined ? { limit: retention.limit } : {}),
+      });
+      purged = purgeResult.purged;
+    } catch (error) {
+      console.error(`${logPrefix} run.purge error:`, error);
+    }
+  }
+
   return {
     claimed,
     suspendedChecked,
@@ -578,6 +627,7 @@ export async function runMaintenanceTick(
     staleExpired,
     eventsFlushed,
     stuckReaped,
+    purged,
     eventsFailed,
     eventsDeadLettered,
     eventSinkStatus,

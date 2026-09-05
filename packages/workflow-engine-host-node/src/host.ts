@@ -17,6 +17,7 @@ import {
   HOST_DEFAULTS,
   type JobTransport,
   type Kernel,
+  type RetentionOptions,
   runMaintenanceTick as runMaintenanceTickCommands,
   type ServedDefinition,
   toEventSinkObservation,
@@ -96,6 +97,14 @@ export interface NodeHostConfig {
   /** Max outbox events to flush per tick (default: 100). */
   maxOutboxFlushPerTick?: number;
 
+  /**
+   * Delete finished runs older than `retention.olderThanMs` (with their
+   * stages, logs, artifacts, annotations, step ledger, job rows and blobs)
+   * through `run.purge` at the end of every maintenance tick. Off by
+   * default: nothing is deleted unless this is set.
+   */
+  retention?: RetentionOptions;
+
   /** Job lease heartbeat interval in milliseconds (default: 60_000). */
   jobHeartbeatIntervalMs?: number;
 
@@ -159,6 +168,7 @@ class NodeHostImpl implements NodeHost {
   private readonly serves: readonly ServedDefinition[] | "all" | undefined;
   private readonly maxSuspendedChecksPerTick: number;
   private readonly maxOutboxFlushPerTick: number;
+  private readonly retention: RetentionOptions | undefined;
   private readonly jobHeartbeatIntervalMs: number;
   private readonly shutdownTimeoutMs: number;
   private readonly flushOutboxOnStop: boolean;
@@ -183,6 +193,7 @@ class NodeHostImpl implements NodeHost {
       HOST_DEFAULTS.maxSuspendedChecksPerTick;
     this.maxOutboxFlushPerTick =
       config.maxOutboxFlushPerTick ?? HOST_DEFAULTS.maxOutboxFlushPerTick;
+    this.retention = config.retention;
     this.jobHeartbeatIntervalMs =
       config.jobHeartbeatIntervalMs ?? HOST_DEFAULTS.jobHeartbeatIntervalMs;
     this.shutdownTimeoutMs = config.shutdownTimeoutMs ?? 10_000;
@@ -367,6 +378,7 @@ class NodeHostImpl implements NodeHost {
       maxOutboxFlushPerTick: this.maxOutboxFlushPerTick,
       staleLeaseThresholdMs: this.staleLeaseThresholdMs,
       jobAbsoluteTimeoutMs: this.jobAbsoluteTimeoutMs,
+      ...(this.retention !== undefined ? { retention: this.retention } : {}),
       logPrefix: "[NodeHost]",
     });
     this.eventSinkMonitor.observe({

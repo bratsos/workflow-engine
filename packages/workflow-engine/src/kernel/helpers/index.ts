@@ -30,6 +30,7 @@ export {
   HOST_DEFAULTS,
   type HostJobMessage,
   type MaintenanceTickCounts,
+  type RetentionOptions,
   type RunMaintenanceTickOptions,
   runMaintenanceTick,
   toEventSinkObservation,

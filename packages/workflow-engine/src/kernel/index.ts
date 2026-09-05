@@ -102,6 +102,7 @@ export {
   loadWorkflowContext,
   type MaintenanceTickCounts,
   normalizeAnnotateArgs,
+  type RetentionOptions,
   type RunMaintenanceTickOptions,
   runMaintenanceTick,
   saveStageOutput,
