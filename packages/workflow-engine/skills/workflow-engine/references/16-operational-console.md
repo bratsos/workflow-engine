@@ -13,7 +13,7 @@ To maintain tenant boundaries, the console never opens its own database connecti
 The order in the host's own request pipeline is therefore: authenticate the
 request, open the tenant transaction (or set the session variables) you
 already open for the rest of the application, then hand the `Request` to the
-console handler. The handler evaluates `authorize({ action, request, runId })`,
+console handler. The handler evaluates `authorize({ action, request, runId, stageId, stepId })`,
 runs its reads on the client you gave it, and dispatches any write as a kernel
 command.
 
@@ -219,6 +219,8 @@ When an action succeeds, the optional `onAction` callback is invoked for audit l
 export interface ConsoleActionEvent {
   action: ConsoleAction;
   runId?: string;
+  stageId?: string; // "step.signal" only
+  stepId?: string;  // "step.signal" only
   request: Request;
   result: unknown;
   at: Date;
@@ -253,6 +255,8 @@ export interface ConsoleCapabilities {
   costs: boolean;
 }
 ```
+
+`RunSummary` carries `definitionVersion` and `redriveCount`, so the runs list and the run detail both show them (the runs table has a Version column with the redrive count as a `+N` suffix), and `RunListFilters.definitionVersion` — `GET /api/runs?definitionVersion=…` — answers the question versioning creates: show me everything still pinned to the old version. The other list filters are `status` (repeatable), `workflowId`, `workflowType`, `from` and `to`. `StepSummary` carries `externalKey` next to `kind`, `status` and `deadlineAt`.
 
 The `capabilities` object indicates which features the underlying storage adapter supports. If a capability is `false`, the UI hides the corresponding navigation tabs and panels rather than displaying empty states or errors:
 - If `runs` is `false`, the runs view tab is hidden.
@@ -312,6 +316,7 @@ To support console queries efficiently, ensure the following composite indexes f
 - `workflow_runs(createdAt DESC, id DESC)`
 - `workflow_runs(status, createdAt DESC, id DESC)`
 - `workflow_runs(workflowId, createdAt DESC, id DESC)`
+- `workflow_runs(definitionVersion)` (the version filter)
 - `job_queue(status, createdAt)`
 - `outbox_events(dlqAt)`
 
