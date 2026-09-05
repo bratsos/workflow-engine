@@ -133,8 +133,20 @@ if (!DATABASE_URL) {
             seq: 1,
             kind: "run",
             status: "completed",
+            externalKey: "wf-a:run-1:second:1:write",
             createdAt: at(1),
             updatedAt: at(1),
+          },
+          {
+            id: "step-3",
+            stageRecordId: "stage-3",
+            stepId: "approval",
+            seq: 1,
+            kind: "signal",
+            status: "pending",
+            deadlineAt: at(90),
+            createdAt: at(30),
+            updatedAt: at(30),
           },
         ],
       });
@@ -365,6 +377,28 @@ if (!DATABASE_URL) {
 
     it("returns null for a run that does not exist", async () => {
       expect(await reader().getRunDetail("nope")).toBeNull();
+    });
+
+    it("selects the step columns the UI needs to offer a signal", async () => {
+      const completed = await reader().getRunDetail("run-1");
+      expect(
+        completed?.steps.find((step) => step.stepId === "write"),
+      ).toMatchObject({
+        kind: "run",
+        status: "completed",
+        deadlineAt: null,
+        externalKey: "wf-a:run-1:second:1:write",
+      });
+      const suspended = await reader().getRunDetail("run-4");
+      expect(suspended?.steps).toHaveLength(1);
+      expect(suspended?.steps[0]).toMatchObject({
+        kind: "signal",
+        status: "pending",
+        externalKey: null,
+      });
+      expect(suspended?.steps[0]?.deadlineAt?.toISOString()).toBe(
+        at(90).toISOString(),
+      );
     });
 
     it("tails a run timeline from a sequence cursor", async () => {
