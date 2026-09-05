@@ -186,6 +186,69 @@ describe("duplicate durable step keys", () => {
     expect(record?.errorMessage).toContain("extract:0");
   });
 
+  it("outranks a suspension already raised by another step of the same invocation", async () => {
+    const ledger = new InMemoryStepLedger();
+    const stage = defineStage({
+      id: "dup-after-suspend",
+      name: "Dup after suspend",
+      schemas: {
+        input: z.object({}),
+        output: z.object({ ok: z.boolean() }),
+        config: z.object({}),
+      },
+      async execute(ctx) {
+        await ctx.step.run("work", async () => 1);
+        // The sleep has asked to suspend - its control-flow error is
+        // pending on the invocation - when the key is used again.
+        await Promise.allSettled([ctx.step.sleep("nap", 60_000)]);
+        await ctx.step.run("work", async () => 2);
+        return { output: { ok: true } };
+      },
+    });
+    const workflow = new WorkflowBuilder(
+      "dup-suspend-wf",
+      "Dup suspend",
+      "test",
+      z.object({}),
+      z.object({ ok: z.boolean() }),
+    )
+      .pipe(stage)
+      .build();
+    const { kernel, persistence } = createTestKernel([workflow], {
+      stepLedger: ledger,
+    });
+    const created = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "dup-suspend-run",
+      workflowId: workflow.id,
+      input: {},
+    });
+    await kernel.dispatch({ type: "run.claimPending", workerId: "worker" });
+
+    const result = await kernel.dispatch({
+      type: "job.execute",
+      workflowRunId: created.workflowRunId,
+      workflowId: workflow.id,
+      stageId: stage.id,
+      config: {},
+      attempt: 1,
+      maxAttempts: 3,
+    });
+
+    // Suspending would have been correct and useless: the next poll replays
+    // the stage and meets the same duplicate key. The deterministic error
+    // wins, and the stage is terminal.
+    expect(result).toMatchObject({ outcome: "failed", willRetry: false });
+    const record = await persistence.getStage(created.workflowRunId, stage.id);
+    expect(record?.status).toBe("FAILED");
+    expect(record?.errorMessage).toContain("DuplicateStepKeyError");
+    expect(record?.errorMessage).toContain('Duplicate durable step key "work"');
+    expect(await ledger.get(record!.id, "nap")).toMatchObject({
+      kind: "sleep",
+      status: "pending",
+    });
+  });
+
   it("still suspends when the only rejections are control flow", async () => {
     const mock = createMockAIHelperFactory();
     mock.setObjectResponse("<<0>>", { object: { value: "v0" } });

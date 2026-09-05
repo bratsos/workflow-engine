@@ -426,7 +426,10 @@ export interface RunRedriveResult {
   readonly workflowRunId: string;
   /** The stage the run resumed from. */
   readonly fromStageId: string;
-  /** Stage ids whose records were superseded and archived. */
+  /**
+   * Stage ids whose records were superseded and archived: the resumed
+   * group's records, reopened in place, and every later record, deleted.
+   */
   readonly supersededStages: string[];
   /** The run's `redriveCount` after this command. */
   readonly redriveCount: number;

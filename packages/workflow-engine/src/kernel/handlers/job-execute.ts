@@ -32,6 +32,7 @@ import { HOST_DEFAULTS } from "../helpers/host-support.js";
 import {
   buildAnnotationEvents,
   loadWorkflowContext,
+  resetStageStepsForFreshAttempt,
   resolveStageInput,
   saveStageArtifacts,
   saveStageOutput,
@@ -66,93 +67,6 @@ async function reopenFailedSteps(
       stageRecordId,
       row.stepId,
       { status: "failed", attempt: row.attempt },
-      { status: "running", leaseExpiresAt: null },
-    );
-  }
-}
-
-/**
- * Put a terminally FAILED stage's step ledger back to the state a stage that
- * has never run is in, without destroying it.
- *
- * The intent this replaces is sound: executing a stage whose attempts are
- * exhausted must start clean, or the replay answers every step from the last
- * attempt's rows and nothing actually re-runs. It used to be met by deleting
- * the rows — which also deleted the row holding a live batch's handle and,
- * since 1.0.0-alpha.9, its external key. A stage that failed terminally while
- * a batch was still being processed (and still being billed) lost the only
- * record of that batch. Nobody could find it afterwards.
- *
- * Re-opening reaches the same place without the loss. Every `run` row goes
- * back to `running` with no lease — the state of a step whose worker died —
- * so the replay's compare-and-set takes it over, bumps `attempt` and executes
- * the body again, exactly as a deleted row would have been executed fresh.
- * The difference is that the row, its `externalKey` and its last result are
- * still there, and the body is told `isReclaim: true`, so a body that names
- * an external effect (an AI map's batch submit, above all) re-adopts the
- * effect an earlier attempt created instead of creating and billing a second
- * one. `attempt` is never reset: it counts every execution across attempts.
- *
- * Rows with no external effect to preserve are deleted as before: waits,
- * signals and sleeps hold only timers and deadlines, which a fresh attempt
- * must re-derive rather than inherit, and pre-alpha.9 `run` rows carry no
- * external key, so there is nothing in them worth keeping.
- */
-async function resetStageStepsForFreshAttempt(
-  workflowRunId: string,
-  stageRecordId: string,
-  deps: KernelDeps,
-): Promise<void> {
-  const ledger = deps.stepLedger;
-  if (!ledger) return;
-  const rows = await ledger.list(stageRecordId);
-  if (rows.length === 0) return;
-  const preserved = rows.filter(
-    (row) => row.kind === "run" && row.externalKey != null,
-  );
-
-  if (preserved.length === 0) {
-    await ledger.clear(stageRecordId);
-    return;
-  }
-  if (!ledger.clearExcept) {
-    // A third-party ledger with no partial clear. The rows go, as they
-    // always did, but not silently: what is being dropped is written to
-    // the run's log so an operator can still find the effects.
-    await deps.persistence
-      .createLog({
-        workflowRunId,
-        workflowStageId: stageRecordId,
-        level: "WARN" as any,
-        message:
-          `Re-running a failed stage cleared ${preserved.length} durable step row(s) that named an ` +
-          `external effect; this StepLedger cannot clear selectively. Any effect still in flight ` +
-          `must be found by its external key.`,
-        metadata: {
-          steps: preserved.map((row) => ({
-            stepId: row.stepId,
-            status: row.status,
-            externalKey: row.externalKey,
-          })),
-        },
-      })
-      .catch(() => {});
-    await ledger.clear(stageRecordId);
-    return;
-  }
-
-  if (preserved.length < rows.length) {
-    await ledger.clearExcept(
-      stageRecordId,
-      preserved.map((row) => row.stepId),
-    );
-  }
-  for (const row of preserved) {
-    if (row.status === "running" && row.leaseExpiresAt === null) continue;
-    await ledger.compareAndSet(
-      stageRecordId,
-      row.stepId,
-      { status: row.status, attempt: row.attempt },
       { status: "running", leaseExpiresAt: null },
     );
   }
