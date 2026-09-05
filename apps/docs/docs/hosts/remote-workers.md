@@ -171,3 +171,9 @@ When a workflow is cancelled on the orchestrator, active jobs are marked as canc
 
 ### Version-Lock Safety
 Bumping `stageCodeVersion` acts as a deploy barrier. If a task was suspended using version `v1` but a worker attempts to fetch it with version `v2`, the broker rejects the lease, preventing code mismatch errors.
+
+### What the worker's stage context carries
+The activity worker builds the stage context by hand, so a stage that runs remotely gets the full `StageContext` contract with these limits:
+* **`ctx.step`** is present but has no ledger: every `ctx.step.*` call throws `StepLedgerNotConfiguredError`. [Durable steps](../core-concepts/durable-steps.md) run on the orchestrator's stages, not on remote workers.
+* **`ctx.ai`** and **`ctx.aiLogger`** throw `AIServicesNotConfiguredError` until the remote host wires services; create an `AIHelper` directly in the stage if it needs one.
+* **`ctx.abortSignal`** never fires — the kernel's heartbeat-driven abort does not cross the worker boundary. Cancellation reaches the worker through the broker's lease fencing described above.
