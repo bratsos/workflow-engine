@@ -1,6 +1,6 @@
 # Stage Definitions
 
-Complete API reference for `defineStage` and `defineAsyncBatchStage`.
+Complete API reference for `defineStage` — sync stages and the legacy `mode: "async-batch"` shape. (`defineAsyncBatchStage` was removed from the root entry at 1.0; see below.)
 
 ## defineStage
 
@@ -50,16 +50,18 @@ export const myStage = defineStage<MyContext>()({
 });
 ```
 
-This is the recommended way to fix `TContext` explicitly. The alternative — spelling out all five generics positionally, `defineStage<TId, TInput, TOutput, TConfig, TContext>({...})` — is `@deprecated`: it's verbose, and TypeScript can't infer a subset from the middle of a generic list, so it silently loses `TId` string-literal inference if any of the five are mistyped. The curried form only ever requires the one generic TypeScript truly can't infer on its own. (`defineAsyncBatchStage`, below, doesn't have a curried form — it already infers `TContext` from usage in most cases; if you need to fix it explicitly there, use `defineStage<TContext>()({ mode: "async-batch", ... })` instead, which supports both stage shapes.)
+This is the recommended way to fix `TContext` explicitly. The alternative — spelling out all five generics positionally, `defineStage<TId, TInput, TOutput, TConfig, TContext>({...})` — is `@deprecated`: it's verbose, and TypeScript can't infer a subset from the middle of a generic list, so it silently loses `TId` string-literal inference if any of the five are mistyped. The curried form only ever requires the one generic TypeScript truly can't infer on its own, and it accepts both stage shapes (`defineStage<TContext>()({ mode: "async-batch", ... })` works too).
 
-## defineAsyncBatchStage
+When you build the workflow with `defineWorkflow(id, { input }).stage(id, definition)`, the context is inferred from the earlier stages and no generic is needed at all — see [02-workflow-builder.md](02-workflow-builder.md) and [12-durable-steps.md](12-durable-steps.md#the-builder).
 
-Creates an asynchronous stage that can suspend execution and resume later.
+## Async-batch mode (legacy)
+
+A stage with `mode: "async-batch"` can suspend execution and resume later through `checkCompletion`. **For new code prefer durable steps** — `ctx.step.waitFor` / `ctx.step.ai.map(id, items, { policy: "batch" })` inside a plain sync stage — which keep the batch bookkeeping in the step ledger (see [12-durable-steps.md](12-durable-steps.md)). The `defineAsyncBatchStage` export was removed from the root and `/client` entries at 1.0; the mode itself still runs, written as `defineStage({ mode: "async-batch", ... })`:
 
 ```typescript
-import { defineAsyncBatchStage } from "@bratsos/workflow-engine";
+import { defineStage } from "@bratsos/workflow-engine";
 
-const batchStage = defineAsyncBatchStage({
+const batchStage = defineStage({
   id: "batch-process",
   name: "Batch Process",
   mode: "async-batch",    // Required marker
@@ -152,10 +154,19 @@ interface EnhancedStageContext<TInput, TConfig, TContext> {
   // Workflow metadata
   workflowRunId: string;           // Current run ID
   stageId: string;                 // Current stage ID
+  stageNumber: number;             // Definition order (1-based)
+  stageName: string;
+  stageRecordId?: string;          // WorkflowStage row id (the stage's attempt counter lives on that row)
 
   // Services
-  log: LogFunction;                // Async logging
+  log: LogFunction;                // Logging; returns void (fire-and-forget, do not await)
+  onLog: LogFunction;              // Same as log
   storage: StageStorage;           // Artifact storage
+  annotate: AnnotateFn;            // Durable provenance (see 10-annotations.md)
+  step: StepApi;                   // Durable steps: run / waitFor / waitForSignal / sleep / ai.* (see 12-durable-steps.md)
+  ai: AIHelper;                    // AIHelper scoped to workflow.<runId>.stage.<stageId>; lazy; needs createKernel({ services })
+  aiLogger: AICallLogger;          // The logger behind ctx.ai
+  abortSignal: AbortSignal;        // Aborted on run.cancel or a lost job lease; reason is a StageAbortedError
   onProgress: (update: {           // Progress reporting; stageId/stageName
     stageId?: string;              // auto-fill from the current stage as of
     stageName?: string;            // v0.11 (pass them to override)
@@ -172,6 +183,8 @@ interface EnhancedStageContext<TInput, TConfig, TContext> {
   optional<K>(stageId: K): TContext[K] | undefined;  // Get optional output
 }
 ```
+
+`step`, `ai`, `aiLogger` and `abortSignal` are always present as of 1.0 (a hand-built context must supply them; `createStepApi()` from `@bratsos/workflow-engine/kernel` builds a ledger-less `step`, and `new AbortController().signal` is a signal that never fires). Without `createKernel({ stepLedger })` every `ctx.step.*` call throws `StepLedgerNotConfiguredError`; without `createKernel({ services: { aiLogger } })` touching `ctx.ai` throws `AIServicesNotConfiguredError`. There is no `ctx.attempt`: read `WorkflowStage.attempt` through `ctx.stageRecordId` if you need it.
 
 ### Using require() and optional()
 
@@ -194,16 +207,18 @@ async execute(ctx) {
 
 ### Logging
 
+`ctx.log` / `ctx.onLog` return `void` (1.0): the entry is handed to persistence without waiting. Awaiting them still compiles but does nothing.
+
 ```typescript
 async execute(ctx) {
-  await ctx.log("INFO", "Starting processing");
-  await ctx.log("DEBUG", "Input received", { count: ctx.input.items.length });
+  ctx.log("INFO", "Starting processing");
+  ctx.log("DEBUG", "Input received", { count: ctx.input.items.length });
 
   try {
     // ... processing
-    await ctx.log("INFO", "Processing complete");
+    ctx.log("INFO", "Processing complete");
   } catch (error) {
-    await ctx.log("ERROR", "Processing failed", { error: error.message });
+    ctx.log("ERROR", "Processing failed", { error: error.message });
     throw error;
   }
 }
@@ -231,7 +246,7 @@ async execute(ctx) {
 
 ### Durable Steps and `ctx.step.ai`
 
-`ctx.step.run/waitFor/waitForSignal/sleep`, `ctx.step.ai.generateText/generateObject/map`, `ctx.ai` injection, the adapter seam, timeouts and the builder-first `defineWorkflow(...).stage(...)` API are documented in [12-durable-steps.md](12-durable-steps.md).
+`ctx.step.run/waitFor/waitForSignal/sleep` (with `lease`, `retries`, `retryDelay`, `retryBackoff`, `heartbeat`, `onReclaim`, `keepalive`), `ctx.step.ai.generateText/generateObject/streamText/map`, `ctx.ai` injection, `ctx.abortSignal`, the adapter seam, timeouts and the builder-first `defineWorkflow(...).stage(...)` API are documented in [12-durable-steps.md](12-durable-steps.md).
 
 ## SimpleStageResult
 
@@ -279,11 +294,11 @@ interface SimpleSuspendedResult {
   suspended: true;                  // Required marker
   state: {
     batchId: string;               // Required: external job ID
-    submittedAt?: string;          // Optional: ISO timestamp; defaults to now
-    pollInterval?: number;         // Optional: ms between checks; defaults to pollConfig.pollInterval or 30s
-    maxWaitTime?: number;          // Optional: max wait ms; defaults to pollConfig.maxWaitTime or 24h
-    metadata?: Record<string, unknown>;  // Optional: custom data
-    apiKey?: string;               // Optional: for resumption
+    submittedAt?: string;          // Optional: ISO timestamp; defaults to now (deprecated in favour of pollConfig; back-filled for checkCompletion)
+    pollInterval?: number;         // Optional: ms between checks; defaults to pollConfig.pollInterval or 30s (deprecated, same)
+    maxWaitTime?: number;          // Optional: max wait ms; defaults to pollConfig.maxWaitTime or 24h (deprecated, same)
+    metadata?: Record<string, unknown>;  // Optional: custom data (e.g. batchRefs)
+    // `apiKey` was removed from the suspended state at 1.0 -- inject credentials through BatchOptions / providerResolver instead
   };
   pollConfig?: {                    // Optional (v0.11+): derived from `state` when omitted
     pollInterval: number;          // ms between polls
@@ -375,13 +390,19 @@ Context passed to `checkCompletion`:
 interface CheckCompletionContext<TConfig> {
   workflowRunId: string;
   stageId: string;
-  stageRecordId: string;           // For AI logging context
+  stageRecordId?: string;          // For AI logging context
   config: TConfig;
-  onLog: LogFunction;
+  step: StepApi;                   // 1.0: same ledger rows execute() writes (scoped to this stage record)
+  ai: AIHelper;                    // 1.0: scoped AIHelper, lazy
+  aiLogger: AICallLogger;
+  onLog: LogFunction;              // returns void
   log: LogFunction;                // Alias for onLog
+  annotate: AnnotateFn;            // buffered, flushed with the completion transaction
   storage: StageStorage;
 }
 ```
+
+`step`, `ai` and `aiLogger` are required on a hand-built `CheckCompletionContext` as of 1.0, exactly as on `StageContext`.
 
 ## Complete Examples
 
@@ -416,7 +437,7 @@ const extractionStage = defineStage({
   },
 
   async execute(ctx) {
-    await ctx.log("INFO", `Extracting from ${ctx.input.documentUrl}`);
+    ctx.log("INFO", `Extracting from ${ctx.input.documentUrl}`);
 
     const document = await fetchDocument(ctx.input.documentUrl);
     const extracted = await extractContent(document, {
@@ -462,8 +483,9 @@ const classificationStage = defineStage({
   async execute(ctx) {
     const extraction = ctx.require("data-extraction");
 
-    const ai = createAIHelper("classification", aiLogger);
-    const { object } = await ai.generateObject(
+    // ctx.ai is scoped to workflow.<runId>.stage.classification; ctx.step.ai.generateObject
+    // is the durable (replay-safe) form of the same call — see 12-durable-steps.md
+    const { object } = await ctx.ai.generateObject(
       ctx.config.model,
       `Classify this document:\n\n${extraction.sections.map(s => s.content).join("\n")}`,
       ClassificationOutputSchema
@@ -474,10 +496,10 @@ const classificationStage = defineStage({
 });
 ```
 
-### Batch Processing Stage
+### Batch Processing Stage (legacy async-batch mode)
 
 ```typescript
-const batchEmbeddingStage = defineAsyncBatchStage({
+const batchEmbeddingStage = defineStage({
   id: "batch-embeddings",
   name: "Batch Embeddings",
   mode: "async-batch",
@@ -507,8 +529,7 @@ const batchEmbeddingStage = defineAsyncBatchStage({
     const texts = extraction.sections.map(s => s.content);
 
     // Submit batch
-    const ai = createAIHelper(`batch.${ctx.workflowRunId}`, aiLogger);
-    const batch = ai.batch(ctx.config.model, "google");
+    const batch = ctx.ai.batch(ctx.config.model, "google");
     const handle = await batch.submit(
       texts.map((text, i) => ({ id: `section-${i}`, prompt: text }))
     );
@@ -534,8 +555,7 @@ const batchEmbeddingStage = defineAsyncBatchStage({
   },
 
   async checkCompletion(state, ctx) {
-    const ai = createAIHelper(`batch.${ctx.workflowRunId}`, aiLogger);
-    const batch = ai.batch(ctx.config.model, "google");
+    const batch = ctx.ai.batch(ctx.config.model, "google");
 
     const status = await batch.getStatus(state.batchId, state.metadata);
 

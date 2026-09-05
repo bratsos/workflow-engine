@@ -60,13 +60,10 @@ const extractStage = defineStage({
   id: "extraction",
   // ...
   async execute(ctx) {
-    // Create AI helper with proper topic convention
-    const ai = runtime.createAIHelper(
-      `workflow.${ctx.workflowRunId}.stage.${ctx.stageId}`
-    );
-
-    // All AI calls are now tracked under this topic
-    const { text } = await ai.generateText("gemini-2.5-flash", prompt);
+    // ctx.ai is an AIHelper already scoped to
+    // `workflow.${ctx.workflowRunId}.stage.${ctx.stageId}` (built lazily from
+    // createKernel({ services: { aiLogger } })). ctx.step.ai.* is the durable form.
+    const { text } = await ctx.ai.generateText("gemini-2.5-flash", prompt);
 
     return { output: { extracted: text } };
   },
@@ -125,11 +122,13 @@ const logContext = {
 };
 const ai = createAIHelper("workflow.run-123", aiCallLogger, logContext);
 
-// From runtime (preferred in stages)
-const ai = runtime.createAIHelper(`workflow.${ctx.workflowRunId}.stage.${ctx.stageId}`);
+// Inside a stage (preferred): ctx.ai, already scoped to this run and stage
+const { text } = await ctx.ai.generateText("gemini-2.5-flash", prompt);
 ```
 
-### Routing options
+Inside a stage, `ctx.ai` / `ctx.aiLogger` come from `createKernel({ services: { aiLogger, ai? } })`; `services.ai` is an `AIHelperFactory` with `createAIHelper`'s signature, which is where a `providerResolver` or `AIHelperOptions` for every stage helper goes. Accessing `ctx.ai` without services throws `AIServicesNotConfiguredError`.
+
+### Helper options: routing, adapter, timeout
 
 ```typescript
 const ai = createAIHelper(topic, aiLogger, undefined, undefined, {
@@ -138,10 +137,16 @@ const ai = createAIHelper(topic, aiLogger, undefined, undefined, {
     sort: "throughput",        // default
     requireParameters: true,   // default; false lets OpenRouter route to providers that ignore e.g. response_format
   },
+  adapter: myAdapter,          // optional AIAdapter: swaps the transport for any subset of generateText/generateObject/embed/streamText, below logging and cost
+  timeout: { perCallMs: 60_000 }, // optional default per-call timeout; expiry throws AICallTimeoutError and still logs the failure row
 });
 ```
 
-`max_price` is an exclusive filter on OpenRouter's side — a request whose price ceiling is below the live price fails outright rather than costing more — so the default headroom absorbs ordinary price drift between `workflow-engine-sync` runs. Child helpers inherit the options.
+Per-call `timeoutMs` on text, object, embed and stream options overrides `timeout.perCallMs`. An adapter response may carry `costUsd`, recorded as the reported cost; `AIStreamResult.rawResult` is `undefined` when the stream came from an adapter. Child helpers inherit all three options.
+
+OpenRouter's "No endpoints found that can handle the requested parameters" is the outcome of `requireParameters: true` excluding endpoints that ignore a requested parameter (typically `maxTokens`); the error names `routing: { requireParameters: false }` as the change to make.
+
+`max_price` is an exclusive filter on OpenRouter's side — a request whose price ceiling is below the live price fails outright rather than costing more — so the default headroom absorbs ordinary price drift between `workflow-engine-sync` runs. It bounds the per-token price of a routed call, not spend, and not the non-token charges OpenRouter documents as uncovered.
 
 ## AIHelper Interface
 
@@ -173,7 +178,8 @@ const result = await ai.generateText(
     temperature: 0.7,   // 0-2; sent only when set, else the provider default
     maxTokens: 1000,    // Max output tokens
     maxRetries: 2,       // v0.11+: forwarded to the AI SDK call
-    abortSignal: controller.signal, // v0.11+: forwarded to the AI SDK call
+    abortSignal: ctx.abortSignal, // v0.11+: forwarded to the AI SDK call; inside a stage pass ctx.abortSignal so run.cancel interrupts the call
+    timeoutMs: 30_000,   // 1.0: per-call timeout, overrides AIHelperOptions.timeout.perCallMs; throws AICallTimeoutError
   }
 );
 
@@ -183,7 +189,9 @@ console.log(result.outputTokens);
 console.log(result.cost);           // Calculated cost
 ```
 
-`maxRetries` and `abortSignal` (v0.11+) are also available on `generateObject` and `streamText` options — see below. They are not available on `embed()` options.
+`maxRetries` and `abortSignal` (v0.11+) are also available on `generateObject` and `streamText` options — see below. `embed()` options take `abortSignal` and `timeoutMs` but not `maxRetries`.
+
+No default `temperature` is sent by any call (`generateText`, `generateObject`, `streamText`, `ctx.step.ai.*`, `map`, the batch bodies): the provider's own default applies unless you set one. `generateObject` and `generateText` + `Output.object` send identical requests.
 
 ### Multimodal Input
 
@@ -393,9 +401,11 @@ for await (const chunk of result.stream) {
 const usage = await result.getUsage();
 console.log(usage.cost);
 
-// Or use raw AI SDK result for UI streaming
-const response = result.rawResult.toUIMessageStreamResponse();
+// Or use raw AI SDK result for UI streaming (undefined when an AIAdapter supplied the stream)
+const response = result.rawResult?.toUIMessageStreamResponse();
 ```
+
+Inside a stage, `ctx.step.ai.streamText(id, model, prompt, options?, stepOptions?)` is the durable form: it streams on the first execution and a replay returns the stored text without contacting the model (see 12-durable-steps.md).
 
 ### With Messages
 
@@ -491,8 +501,9 @@ console.log(handle.status);   // "pending"
 console.log(handle.provider); // "anthropic"
 console.log(handle.refs);     // EngineBatchRef[] (persist in suspendedState.metadata.batchRefs)
 
-// Check status
-const status = await batch.getStatus(handle.id);
+// Check status -- pass the same metadata (batchRefs) getResults takes, so a partitioned
+// submit is polled across every upstream batch it fanned out into
+const status = await batch.getStatus(handle.id, { batchRefs: handle.refs });
 // { id: "...", status: "pending" | "processing" | "completed" | "failed", provider: "anthropic", ... }
 
 // Get results (when completed)
@@ -522,8 +533,11 @@ interface BatchOptions {
   endpoint?: "/v1/chat/completions" | "/v1/responses" | "/v1/messages" | "/v1/embeddings";
   maxRequestsPerBatch?: number; // Request chunk size per upstream batch (default: 500)
   maxPartitions?: number;       // Maximum allowed partition count (default: 20)
+  abortSignal?: AbortSignal;    // Cancels every provider call this handle makes (submit, status polls, result fetches)
 }
 ```
+
+`apiKey`, `baseURL` and `fetch` are honoured by every vendor transport (`resolveAiSdkBatchModel` takes them), not only OpenRouter.
 
 ### Batch Request Configuration (`AIBatchRequest`)
 
@@ -583,7 +597,9 @@ const batch = ai.batch("gemini-2.5-flash", "google");
 const openrouterBatch = ai.batch("openai/gpt-4o", "openrouter", { apiKey: myKey });
 ```
 
-If no provider is specified and the model has no known batch-capable provider, `ai.batch()` **throws an error immediately** with an actionable message.
+Resolution order: the call's explicit provider, then the model's registry field `batchProvider` (`"openrouter" | "google" | "anthropic" | "openai"`), then the slug's native vendor, then OpenRouter. A model whose `batchProvider` is `"openrouter"` is batched there even without a catalog `:batch` row. If none of those yields a provider, `ai.batch()` **throws an error immediately** with an actionable message. When the vendor SDK is not installed (`@ai-sdk/anthropic` / `@ai-sdk/openai` are optional peers) and OpenRouter can batch the model, the helper falls back to the OpenRouter transport with a WARN instead of failing the submit. A batch is polled and collected through the transport its stored refs name, so changing `batchProvider` while a batch is in flight does not strand it.
+
+**Idempotent submits.** A `submit()` replayed after a crash (a durable `run` step whose lease expired) can create and bill a second batch. Inside `ctx.step.ai.map` the OpenAI and Google adapters stamp the step's external key into the batch (`metadata` / `displayName`) and a reclaimed submit adopts the batch it finds; Anthropic and OpenRouter carry no such field, so a reclaimed submit there throws `BatchNotAdoptableError` unless `batch: { onReclaim: "resubmit" }` accepts the duplicate cost. See 12-durable-steps.md.
 
 ### OpenRouter Batch Transport Caveats
 
@@ -631,10 +647,9 @@ const toolAI = stageAI.createChild("tool", "search");
 
 ## Manual Recording
 
-Record AI calls made outside the helper (e.g., direct SDK usage).
+Record AI calls made outside the helper (e.g., direct SDK usage). Only the object form exists; the positional `recordCall(modelKey, prompt, response, tokens, options)` overload was removed at 1.0.
 
 ```typescript
-// Object-based API
 ai.recordCall({
   modelKey: "gemini-2.5-flash",
   callType: "text",
@@ -644,15 +659,6 @@ ai.recordCall({
   outputTokens: 50,
   metadata: { custom: "data" },
 });
-
-// Legacy positional API
-ai.recordCall(
-  "gemini-2.5-flash",
-  "prompt text",
-  "response text",
-  { input: 100, output: 50 },
-  { callType: "text", isBatch: false }
-);
 ```
 
 ## Statistics
@@ -688,26 +694,33 @@ const { text, cost, reportedCostUsd, costSource } = await ai.generateText(modelK
 
 Under BYOK the provider's `cost` is only the routing fee and the inference spend arrives separately as `upstream_inference_cost`; the engine adds it in that case and not otherwise, so the recorded number is the real spend either way. When a call is estimated, `costSource === "estimated"` tells you the number came from the registry, not the bill.
 
-Batch cost follows the transport actually used: a native google/anthropic/openai batch bills the vendor's documented discount (`batchDiscountPercent`), the OpenRouter transport bills the absolute price of the `:batch` catalog row (`batchInputCostPerMillion` / `batchOutputCostPerMillion`).
+Batch cost follows the transport actually used: a native google/anthropic/openai batch bills the vendor's documented discount (`batchDiscountPercent`), the OpenRouter transport bills the absolute price of the `:batch` catalog row (`batchInputCostPerMillion` / `batchOutputCostPerMillion`). Exactly one adjustment is applied, never both, and there is no cached-token bucket: on a Google batch that hits the implicit cache the flat discount *overstates* the cost of the cached tokens (see 06-async-batch-stages.md). `workflow-engine-sync` now emits absolute batch prices rather than `batchDiscountPercent`.
 
 ## Model Configuration
 
 ### Available Models
 
 ```typescript
-import { AVAILABLE_MODELS, listModels } from "@bratsos/workflow-engine";
+import { AVAILABLE_MODELS, getModel, listModels } from "@bratsos/workflow-engine";
 
 // List all models
 const models = listModels();
 // [
-//   { key: "gemini-2.5-flash", id: "google/gemini-2.5-flash-preview-05-20", ... },
-//   { key: "claude-sonnet-4-20250514", id: "anthropic/claude-sonnet-4-20250514", ... },
+//   { key: "gemini-2.5-flash", config: { id: "google/gemini-2.5-flash-preview-05-20", ... } },
+//   { key: "claude-sonnet-4-20250514", config: { id: "anthropic/claude-sonnet-4-20250514", ... } },
 //   ...
 // ]
 
-// Filter models
-const flashModels = listModels({ isEmbeddingModel: true });
+// Filter models (`ModelFilter`: isEmbeddingModel, supportsTools, supportsStructuredOutputs, supportsAsyncBatch)
+const embeddingModels = listModels({ isEmbeddingModel: true });
+
+// One model; throws for an unregistered key. `getModel(key).supportsAsyncBatch` is the batch-capability check
+// (`getModelById`, `getRegisteredModel`, `listRegisteredModels`, `getDefaultModel`, `modelSupportsBatch`,
+// `printAvailableModels`, `ModelStatsTracker` and `ModelWithRecorder` were removed at 1.0).
+const model = getModel("gemini-2.5-flash");
 ```
+
+`ModelKey` is open: the type accepts any string and the exported zod schema is `z.string().min(1)`, so a `schemas.config` field typed with it no longer rejects an unregistered key at `run.create`. Validation happens at `getModel()` / the first call.
 
 ### Register Custom Models
 
@@ -724,6 +737,8 @@ registerModels({
     contextLength: 128000,
     maxCompletionTokens: 4096,
     supportsTools: true,
+    // Batch: supportsAsyncBatch, batchProvider ("openrouter" | "google" | "anthropic" | "openai"),
+    // batchInputCostPerMillion / batchOutputCostPerMillion (absolute, preferred) or batchDiscountPercent
   },
 });
 
@@ -772,6 +787,8 @@ interface AITextResult {
   inputTokens: number;
   outputTokens: number;
   cost: number;
+  reportedCostUsd?: number;             // provider-reported figure, when any
+  costSource?: "reported" | "estimated";
   output?: any;       // Present when `output` is used
   reasoning?: string; // Reasoning/thinking text, when the model emitted any
 }
@@ -781,6 +798,9 @@ interface AIObjectResult<T> {
   inputTokens: number;
   outputTokens: number;
   cost: number;
+  reportedCostUsd?: number;
+  costSource?: "reported" | "estimated";
+  reasoning?: string;
 }
 
 interface AIEmbedResult {
@@ -789,14 +809,16 @@ interface AIEmbedResult {
   dimensions: number;
   inputTokens: number;
   cost: number;
+  reportedCostUsd?: number;
+  costSource?: "reported" | "estimated";
 }
 
 interface AIStreamResult {
   stream: AsyncIterable<string>;
-  getUsage(): Promise<{ inputTokens, outputTokens, cost }>;
+  getUsage(): Promise<{ inputTokens, outputTokens, cost, reportedCostUsd?, costSource? }>;
   getText(): Promise<string>;                  // Full answer text, reconciled with the buffered result
   getReasoning(): Promise<string | undefined>; // Reasoning/thinking text, when the model emitted any
-  rawResult: AISDKStreamResult;
+  rawResult: AISDKStreamResult | undefined;    // undefined when an AIAdapter supplied the stream
 }
 
 // v0.11+: discriminated union -- `result` only exists on "succeeded",

@@ -58,7 +58,7 @@ It returns the kernel and every port it built, plus the two driver methods:
 | Field | What it is |
 | --- | --- |
 | `kernel` | the real `Kernel`, for dispatching commands directly |
-| `persistence`, `jobQueue`, `blobStore`, `eventSink` | the in-memory ports |
+| `persistence`, `jobTransport` (aliased as `jobQueue`), `blobStore`, `eventSink`, `registry` | the in-memory ports |
 | `stepLedger` | `InMemoryStepLedger` on the harness clock — durable steps work out of the box |
 | `aiLogger`, `mockAi` | `InMemoryAICallLogger` and the mock AI factory wired into `services` |
 | `clock` | the `FakeClock` the kernel and ledger share |
@@ -70,10 +70,28 @@ It returns the kernel and every port it built, plus the two driver methods:
 | `cancel(workflowRunId, reason?)` | dispatch `run.cancel`; a body executing under `tick()` sees `ctx.abortSignal` abort on the next heartbeat |
 
 Options: `workflows`, `services` (merged over the mock AI defaults), `clock`,
-`stepLedger`, `aiLogger`, `mockAi`, `workerId`, `eventSink`, `plugins`,
-`maxTicks` (default 100 — `run()` throws rather than hang), `idleAdvanceMs`,
+`stepLedger`, `blobStore`, `aiLogger`, `mockAi`, `workerId`, `eventSink`,
+`plugins` (ignored when `eventSink` is set), `maxTicks` (default 100 —
+`run()` throws rather than hang), `idleAdvanceMs` (default one second),
 `spillThresholdBytes` and `jobHeartbeatIntervalMs` (wall-clock, default
 10 ms — the heartbeat is what aborts `ctx.abortSignal` after `cancel()`).
+
+### Cancelling a run mid-body
+
+`cancel()` dispatches `run.cancel`; the body executing under `tick()` sees
+`ctx.abortSignal` abort with a `StageAbortedError` whose `reason` is
+`"cancelled"` on the next heartbeat, so a body that awaits its own abort
+can be tested without a real host:
+
+```typescript
+const harness = createTestHarness({ workflows: [workflow] });
+const { workflowRunId } = await harness.start("slow-wf", { id: "1" });
+const first = harness.tick(); // executes the job; the body awaits abort
+await new Promise((resolve) => setTimeout(resolve, 20)); // let the job start
+await harness.cancel(workflowRunId, "operator");
+await first;
+expect((await harness.persistence.getRun(workflowRunId))?.status).toBe("CANCELLED");
+```
 
 ## Mocking durable steps
 
@@ -106,7 +124,7 @@ expect(await harness.steps.error("charge-card")).toBe("card declined");
 | Seed | What it does |
 | --- | --- |
 | `mockResult(stepId, value)` | the step records `completed` with `value`; its body never runs. `step.run`, `step.waitFor`, `step.waitForSignal` |
-| `mockError(stepId, error, { attempt? })` | the step records `failed`; the step throws the stored error instead of running its body |
+| `mockError(stepId, error, { attempt? })` | the step records `failed` (at `MOCKED_FAILURE_ATTEMPT` unless `attempt` is given); the step throws the stored error instead of running its body |
 | `mockTimeout(stepId)` | the step's deadline is already past, so it fails with `StepTimeoutError` through the engine's own timeout path. `step.waitFor` and `step.waitForSignal` only |
 | `skipSleep(stepId)` / `skipSleeps()` | `step.sleep` returns immediately instead of suspending |
 | `clearMocks()` | drop every seed; recorded rows are untouched |
@@ -114,12 +132,14 @@ expect(await harness.steps.error("charge-card")).toBe("card declined");
 | Assertion | What it returns |
 | --- | --- |
 | `record(stepId)` | the `StepRecord`, or `null` when the step never ran |
-| `records()` | every row this ledger holds |
+| `records()` | every row this ledger holds, in `(stage, seq)` order |
 | `status(stepId)` | `"completed" \| "failed" \| "pending" \| "running"`, or `undefined` |
 | `result(stepId)` / `error(stepId)` | the recorded result or error message |
 | `wasMocked(stepId)` | whether a seed decided this step's outcome |
 
-All five assertions are async — they read the ledger.
+All but `wasMocked` are async — they read the ledger. `MOCKED_FAILURE_ATTEMPT`
+is exported from `@bratsos/workflow-engine/testing` alongside
+`createMockStepLedger`.
 
 ### Caveats
 
@@ -246,11 +266,29 @@ expect(result.reports[0]?.outcomes[0]?.outcome).toBe("suspended");
 ```typescript
 harness.mockAi.setTextResponse("summarize", { text: "the summary" });
 harness.mockAi.mockObjectResponseForSchema(FactsSchema, { facts: [] });
-// The next matching call throws once; later calls succeed.
+// The next matching call throws once; later calls succeed. `match` is a
+// substring, a RegExp, or a predicate over `{ modelKey, prompt, kind }`.
 harness.mockAi.failOnce("summarize", new Error("transient upstream 503"));
 
 expect(harness.mockAi.helper.getAllCallsRecursive()).toHaveLength(2);
 ```
+
+`MockTextResponse.output` seeds the structured value returned by
+`generateText` + `Output.object(...)`; when omitted the scripted `text` is
+parsed and validated through the output spec exactly as the AI SDK does, so
+a text that does not satisfy the schema throws `NoObjectGeneratedError`.
+`createMockAIHelperFactory({ helper })` hands out a caller-built instance
+(a `MockAIHelper` subclass survives `createAtTopic`/`createChild`).
+
+### Hand-built contexts
+
+A test that calls `stage.execute(ctx)` directly must build the whole
+`StageContext`: `step`, `ai`, `aiLogger` and `abortSignal` are required.
+`createStepApi()` from `@bratsos/workflow-engine/kernel` builds a ledger-less
+step API whose calls throw `StepLedgerNotConfiguredError`, and
+`neverAbortingSignal()` (root entry) is a signal that never fires. Reaching
+`ctx.ai` without services throws `AIServicesNotConfiguredError`; hand it
+`createMockAIHelper()` from `/testing` instead.
 
 ## Driving the kernel by hand
 
@@ -300,10 +338,15 @@ the driver loop, for tests that dispatch commands one at a time:
 ```typescript
 import { createTestKernel } from "@bratsos/workflow-engine/testing";
 
-const { kernel, persistence, jobTransport, clock, flush } = createTestKernel([
-  workflow,
-]);
+const { kernel, persistence, jobTransport, blobStore, eventSink, clock, registry, flush } =
+  createTestKernel([workflow]);
 ```
+
+Options: `workerId`, `clockStart` / `clock`, `plugins` / `pluginMaxRetries`,
+`eventSink`, `idempotencyStaleInProgressMs`, `spillThresholdBytes`,
+`stepLedger`, `blobStore` and `services`. Without `stepLedger` every
+`ctx.step.*` call throws `StepLedgerNotConfiguredError`; without `services`
+`ctx.ai` throws `AIServicesNotConfiguredError`.
 
 ## FakeClock
 
@@ -398,16 +441,25 @@ import {
 } from "@bratsos/workflow-engine/testing";
 ```
 
-Each suite is a vitest side-effect registrar: calling it registers `describe`/`it` blocks, so it must be invoked at module scope inside a `*.test.ts` file, passing a factory that returns a fresh adapter instance per test:
+Each suite registers `describe`/`it` blocks as a side effect when called, so it must be invoked at module scope inside a `*.test.ts` file, passing a factory that returns a fresh adapter instance per test and, as the third argument, the test primitives it should register with (`ConformanceTestApi`: `{ describe, it, expect, beforeEach }`). The `/testing` entry imports nothing from vitest, so the same call works from any runner that offers those four:
 
 ```typescript
 // my-adapter.conformance.test.ts
-import { persistenceConformanceSuite, jobQueueConformanceSuite } from "@bratsos/workflow-engine/testing";
+import { beforeEach, describe, expect, it } from "vitest";
+import {
+  persistenceConformanceSuite,
+  jobQueueConformanceSuite,
+  stepLedgerConformanceSuite,
+} from "@bratsos/workflow-engine/testing";
 import { MyCustomPersistence } from "./my-custom-persistence";
 import { MyCustomJobQueue } from "./my-custom-job-queue";
+import { MyCustomStepLedger } from "./my-custom-step-ledger";
 
-persistenceConformanceSuite("MyCustomPersistence", () => new MyCustomPersistence());
-jobQueueConformanceSuite("MyCustomJobQueue", () => new MyCustomJobQueue());
+const api = { describe, it, expect, beforeEach };
+
+persistenceConformanceSuite("MyCustomPersistence", () => new MyCustomPersistence(), api);
+jobQueueConformanceSuite("MyCustomJobQueue", () => new MyCustomJobQueue(), api);
+stepLedgerConformanceSuite("MyCustomStepLedger", () => new MyCustomStepLedger(), api);
 ```
 
 The factory type signatures -- note the `reset`/`clear` seam:
@@ -438,11 +490,11 @@ persistenceConformanceSuite("MyCustomPersistence (real database)", () => {
       await pool.query(`TRUNCATE TABLE workflow_runs, workflow_stages CASCADE`);
     },
   });
-});
+}, api);
 ```
 
 **FK-safe seeding convention:** before creating any stage, log, artifact, or annotation row, the suite seeds a parent `WorkflowRun` row first if one doesn't already exist for the referenced run id. Real schemas (e.g. Postgres) enforce a mandatory foreign key from those child tables to their parent run, even though an in-memory fake might not care -- your adapter needs to actually support that FK relationship (accept the parent row the suite seeds) for the suite to pass cleanly.
 
-**`StepLedger` patch semantics.** `stepLedgerConformanceSuite` pins the one rule every field of a `StepRecordPatch` follows: a key that is absent -- or present holding `undefined`, which is what a spread of an optional property produces -- leaves that column alone, and any other value, **`null` included**, is written. `{ result: null }` is how a step records "completed, with no value", so it has to overwrite whatever the row held; an adapter that skips the write leaves the previous attempt's result in place, and because a re-run can preserve a step row rather than delete it, every later replay reads that stale value back. The suite also covers insert-if-absent `claim` (a second claim returns the stored row, not the one passed in), `compareAndSet` with and without a pinned attempt (an omitted `expected.attempt` matches any attempt), seq-ordered `list`, and the optional `clearExcept`, which is skipped rather than failed when your implementation does not provide it.
+**`StepLedger` patch semantics.** `stepLedgerConformanceSuite` pins the one rule every field of a `StepRecordPatch` follows: a key that is absent -- or present holding `undefined`, which is what a spread of an optional property produces -- leaves that column alone, and any other value, **`null` included**, is written. `{ result: null }` is how a step records "completed, with no value", so it has to overwrite whatever the row held; an adapter that skips the write leaves the previous attempt's result in place, and because a re-run can preserve a step row rather than delete it, every later replay reads that stale value back. The suite also covers insert-if-absent `claim` (a second claim returns the stored row, not the one passed in), `compareAndSet` with and without a pinned attempt (an omitted `expected.attempt` matches any attempt), seq-ordered `list`, and the optional `clearExcept`, which is skipped rather than failed when your implementation does not provide it. `WorkflowPersistence` gained `listRunsForPurge` and `deleteRun` (for `run.purge`) and the four definition-versioning methods; `JobQueue` gained fenced acknowledgements, `deleteByRunAndStages`, idempotent `enqueueParallel` and the optional `defer` / `expireRunawayJobs` — all in the suites.
 
 Run it like any other test file (`vitest run my-adapter.conformance.test.ts`). A failing case points at a specific behavior your adapter diverges on -- e.g. version-bump semantics, suspended-readiness ordering, or retry defaults -- the same semantics the built-in Prisma/in-memory adapters are held to. This isn't just a convenience for third-party adapter authors: `PrismaWorkflowPersistence`/`PrismaJobQueue`/`PrismaAICallLogger`/`PrismaStepLedger` are validated with the exact same suites against a real Postgres database in this repo's own CI (each factory attaching `reset` the same way as the example above), not just against the in-memory fakes.

@@ -10,10 +10,23 @@ Common issues, how the engine handles them, and how to debug.
 
 **Check:**
 1. Is the host running? Check `host.getStats()` — `orchestrationTicks` should be incrementing.
-2. Is the workflow registered? `run.claimPending` marks runs `FAILED` with `WORKFLOW_NOT_FOUND` if the workflow ID isn't in the registry.
-3. Check logs for `run.claimPending error:` — each orchestration step logs errors independently.
+2. Is the workflow registered? With a registry built by `createWorkflowRegistry` (or an explicit host `serves` list), `run.claimPending` claims only runs pinned to a `(workflowId, version)` this build presents, and an unpinned run only when `serves` names its workflow — everything else stays `PENDING` for a host that has it. A hand-written `{ getWorkflow }` registry, or `serves: "all"`, adopts any run and marks one whose workflow it lacks `FAILED` with `WORKFLOW_NOT_FOUND`.
+3. Is the run pinned to a version nobody serves any more? `run.listVersions` reports it under `unservedHere`; `run.redrive` with `definitionVersion: "latest"` moves it onto the current build. See [13-definition-versioning.md](13-definition-versioning.md).
+4. Check logs for `run.claimPending error:` — each orchestration step logs errors independently.
 
 **Fix:** Ensure the host is started and all workflows are registered before runs are created.
+
+## `42703` on Every Claim After Upgrading
+
+**Symptom:** the host cannot claim a single run; every `run.claimPending` fails with a raw Postgres `42703` (undefined column) naming `definitionVersion`, or a `workflow_definitions` relation error.
+
+**Why:** the generated Prisma client carries the definition-versioning models (`prisma generate` ran) but the database has not been migrated yet — a first migration, or a rolling deploy that ships code ahead of schema. The Prisma adapter now confirms the client's answer against the database once, lazily, with a catalogue read that returns "absent" instead of raising, so this should only appear on an adapter or wrapper the structural check cannot see through.
+
+**Fix:** apply the migration (`migrations/migrate-0.13-to-1.0.md`), or set `createPrismaWorkflowPersistence(prisma, { definitionVersioning: false })` for a client whose schema carries the models against a database deliberately left unmigrated (`true` forces it on for a proxy the detection cannot inspect). Runs created before the migration carry a `null` version and stay claimable by any host whose registry holds their workflow.
+
+## `PrismaClient is not assignable to EnginePrismaClient`
+
+A wall of these at `createPrismaWorkflowPersistence` / `createPrismaJobQueue` / `createPrismaStepLedger` means one of the delegates the adapters require is missing from your generated client: `workflowRun`, `workflowStage`, `workflowStep`, `workflowLog`, `workflowArtifact`, `workflowAnnotation`, `outboxEvent`, `idempotencyKey`, `jobQueue`, `aICall`. After an upgrade to 1.0 it is almost always `WorkflowStep`. Add the model from `prisma/schema.prisma`, run `prisma generate`, and the error goes away. See [05-persistence-setup.md](05-persistence-setup.md).
 
 ## Runs Stuck in RUNNING
 
@@ -24,7 +37,7 @@ Common issues, how the engine handles them, and how to debug.
 - A stage is stuck `RUNNING` with no active job (worker crashed during execution)
 - All stages in a group completed but the next group was never enqueued
 
-**Self-healing:** The `run.reapStuck` command runs on every orchestration tick. It finds `RUNNING` runs with no recent activity (no updates to run or any stage record within the threshold) and marks them `FAILED` with error code `STUCK_RUN_REAPED`. The output includes `stageStatuses` showing each stage's status at reap time. A status guard re-checks `status === "RUNNING"` before updating, preventing race conditions where a run recovers between the query and the update.
+**Self-healing:** The `run.reapStuck` command runs on every orchestration tick. A run whose every stage is terminal while the run still says `RUNNING` (a dropped `run.transition`) is healed by firing the missing transition (`healed` in the result). Otherwise it finds `RUNNING` runs with no recent activity (no updates to run or any stage record within the threshold) and marks them `FAILED` with error code `STUCK_RUN_REAPED`. A run pinned to a definition version this build does not serve is left alone — it only looks stuck from here. The output includes `stageStatuses` showing each stage's status at reap time. A status guard re-checks `status === "RUNNING"` before updating, preventing race conditions where a run recovers between the query and the update.
 
 **Manual investigation:**
 ```typescript
@@ -100,6 +113,37 @@ run onto a version you do serve. See
 
 **Check your own schema:** the engine's timestamp columns must stay plain Prisma `DateTime` (naive `timestamp`), as the shipped `prisma/schema.prisma` declares them. Mapping them to `@db.Timestamptz` re-introduces the skew in the opposite direction.
 
+## A Job Was Requeued Or Failed With `LEASE_HEARTBEAT_LOST` / `LEASE_ABSOLUTE_CAP`
+
+Both are `lastError` prefixes the lease sweep stamps on `job_queue`, so an operator can tell a reclaimed lease from a stage-level failure.
+
+- **`LEASE_HEARTBEAT_LOST`** — the worker stopped calling `touchJob` for longer than `staleLeaseThresholdMs` (measured from `lockedAt`): it died, or a single body ran longer than the heartbeat could cover. The job went back to `PENDING` for another worker. On Postgres the lease runs on the database clock, so a host with a skewed system clock is not the cause.
+- **`LEASE_ABSOLUTE_CAP`** — the claim held its lease past `jobAbsoluteTimeoutMs` (default one hour, measured from `startedAt`, which no heartbeat refreshes): a worker that was alive but wedged. The job is failed terminally, because a job that hung for the whole cap will hang again. Raise the cap for a stage that legitimately runs longer; `0` disables the tier.
+
+The body that lost its lease learns of it through `ctx.abortSignal` (a `StageAbortedError` with `reason: "lease-lost"`) on the next heartbeat; its outcome, if it finishes anyway, is discarded as `"superseded"` by the fenced acknowledgement. A `run.cancel` aborts the same signal with `reason: "cancelled"`. Use `stageAbortReason(signal)` to read it.
+
+## Errors A Durable Stage Can Throw
+
+| Error | Thrown when | What to do |
+|-------|-------------|------------|
+| `StepLedgerNotConfiguredError` | `ctx.step.*` called with no `stepLedger` on `createKernel` / `createTestKernel` | pass a `StepLedger` (`InMemoryStepLedger`, `createPrismaStepLedger`) |
+| `AIServicesNotConfiguredError` | `ctx.ai` / `ctx.aiLogger` read with no `services` on `createKernel` | pass `services: { aiLogger, ai? }` (`createMockAIHelperFactory()` in tests) |
+| `DuplicateStepKeyError` | one stage invocation asks for the same step key twice (a `ctx.step.ai.map` item key colliding with another step included); names both uses | give the call sites distinct keys — inside a loop, build the key from the iteration. Deterministic, so the stage fails without spending retries |
+| `StepTimeoutError` | a `waitFor` / `waitForSignal` passed its non-sliding deadline | raise `timeout`, or deliver the signal sooner |
+| `StepLeaseLostError` | `step.heartbeat()` found the row no longer `running` at this execution's attempt — the lease expired and a replay took the step over | stop: this execution's outcome will not be recorded either |
+| `StepNotReplaySafeError` | a step declared `onReclaim: "fail"` whose lease expired; names the step and its `externalKey` | look for the effect under that key, then complete by hand or re-run with `onReclaim: "rerun"` |
+| `BatchNotAdoptableError` | a reclaimed `ctx.step.ai.map` submit on a transport with nothing to search (Anthropic, OpenRouter) | `batch: { onReclaim: "resubmit" }` to accept a possible duplicate batch |
+| `AiMapBudgetExceededError` / `AiMapBatchFailedError` | the map's `realtime.budget` ran out before an item's first call / the batch failed or timed out with `onExpiry: "fail"` | raise the budget; use `onExpiry: "partial"` to get per-item failures instead |
+| `UnportableSchemaError` | a Zod schema uses a keyword OpenAI strict outputs cannot express (`patternProperties`, `not`, `if`/`then`, …); carries `path`, `keyword`, `target` | reshape the schema before any request is sent |
+| `SpilledPayloadUnavailableError` | a step result or job payload above `spillThresholdBytes` was read through a blob store other than the one that wrote it | every process that executes or polls a run must share the `blobStore` (see [15-large-payloads.md](15-large-payloads.md)) |
+| `StageAbortedError` | the `reason` on `ctx.abortSignal` after a cancel or a lost lease | honour the signal; the outcome is discarded either way |
+
+A `step.outcome-conflict` annotation (see [10-annotations.md](10-annotations.md)) is not an error: two executions reached the same step's outcome write, the first won, and the body ran more than once — check for a duplicate external effect under the recorded `externalKey`.
+
+## OpenRouter: "No endpoints found that can handle the requested parameters"
+
+`routing.requireParameters` defaults to `true`, so OpenRouter excludes any endpoint that would silently ignore a parameter you sent — typically `maxTokens` or `temperature` on a model whose endpoints do not honour it (GPT-5 through OpenRouter). The engine wraps the error naming the fix: drop the parameter, or pass `routing: { requireParameters: false }` on the call to let such an endpoint serve it. No default `temperature` is sent by the engine; set it explicitly where a fixed value is relied upon.
+
 ## Crash Resumption Waits Minutes On A Durable Step
 
 **Symptom:** a worker is SIGKILLed mid-stage; a fresh worker picks the run up quickly (its job lease is released after `staleLeaseThresholdMs`) but the resumed stage suspends again instead of finishing, and only completes minutes later. Only stages that use `ctx.step.*`.
@@ -124,8 +168,8 @@ The orchestration tick runs these steps in order, each independently:
 |------|---------|---------|
 | 1 | `run.claimPending` | Find PENDING runs, create stages, enqueue jobs |
 | 2 | `stage.pollSuspended` | Check suspended stages for readiness, trigger transitions |
-| 3 | `lease.reapStale` | Release job leases from crashed workers |
-| 4 | `outbox.flush` | Publish pending events through EventSink |
+| 3 | `lease.reapStale` | Release job leases from crashed workers (heartbeat tier) and fail runaway jobs past `jobAbsoluteTimeoutMs` (absolute tier) |
+| 4 | `outbox.flush` | Publish pending events through EventSink; reports `eventSinkStatus: "degraded"` when the sink refused an event |
 | 5 | `run.reapStuck` | Fail RUNNING runs with no recent activity |
 | 6 | `run.purge` | Opt-in (`retention` host option): delete terminal runs past their retention age — see "Run Retention" below |
 
@@ -181,7 +225,7 @@ Run it in batches (the `LIMIT`) and drop the run's blob prefixes above from your
 
 | Code | Where | Meaning |
 |------|-------|---------|
-| `WORKFLOW_NOT_FOUND` | `run.claimPending` | Workflow ID not in registry when run was claimed |
+| `WORKFLOW_NOT_FOUND` | `run.claimPending` | Workflow ID not in registry when run was claimed (only with a non-enumerating registry or `serves: "all"`; an enumerating registry never claims such a run) |
 | `EMPTY_STAGE_GRAPH` | `run.claimPending` | Workflow has no stages in execution group 1 |
 | `CLAIM_FAILED` | `run.claimPending` | Unexpected error during claim (DB error, etc.) |
 | `STUCK_RUN_REAPED` | `run.reapStuck` | Run had no activity past the stuck threshold |

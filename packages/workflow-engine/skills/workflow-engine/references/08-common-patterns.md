@@ -83,6 +83,10 @@ await kernel.dispatch({
 
 In the Node host, this runs automatically on each orchestration tick. For serverless, include it in your maintenance cron.
 
+The lease has two tiers. The heartbeat tier (`staleLeaseThresholdMs`, measured from `lockedAt`, which `touchJob` refreshes) requeues a job whose worker stopped, stamping `lastError` with the `LEASE_HEARTBEAT_LOST` prefix. A worker that is alive but wedged keeps heartbeating, so `absoluteTimeoutMs` (host option `jobAbsoluteTimeoutMs`, default one hour, `0` disables) is measured from `startedAt`, which nothing refreshes, and fails the job terminally with the `LEASE_ABSOLUTE_CAP` prefix. The result is `{ released, expired }`. On Postgres both stamps come from the database clock, so a host with a skewed system clock cannot make a fresh lease look stale. Job leases only: a durable step's lease is `StepRunOptions.lease` (see [12-durable-steps.md](12-durable-steps.md)).
+
+A running body learns that its lease is gone, or that the run was cancelled, through `ctx.abortSignal`: the host's heartbeat dispatches `job.heartbeat`, which renews the lease and aborts the signal with a `StageAbortedError` (`reason: "cancelled"` or `"lease-lost"`) when the work is no longer wanted.
+
 ## Redrive: Retry, Restart, Rerun
 
 `run.redrive` is one command with three resume points. See
@@ -110,15 +114,63 @@ const { supersededStages, redriveCount } = await kernel.dispatch({
 
 // Stages at and after the resume point are superseded and re-queued.
 // Earlier stages keep their outputs.
+// For `lastFailure` and `stage` the resumed stage record is reopened in
+// place (back to PENDING, `attempt` + 1, error/output/timings cleared), so
+// its step ledger survives: completed `ctx.step.run` rows are answered from
+// the ledger and only the unfinished steps run again. Stages after it are
+// deleted and recreated; `start` replaces everything.
 // Each superseded stage is archived as a `run.supersededAttempt` annotation
 // in the same transaction, so the failed attempt is not lost.
-// Blob artifacts for superseded stages are cleaned up by key prefix, after commit.
+// Blob artifacts for deleted stages are cleaned up by key prefix, after commit.
 // The run keeps its id; `workflow_runs.redriveCount` increments and never resets.
 ```
 
 `run.rerunFrom` is deprecated. It still works and its result shape is
-unchanged (`deletedStages` now reports the superseded stages), but it cannot
-change the definition version and it still refuses a `CANCELLED` run.
+unchanged (`deletedStages` now reports the superseded stages), and it now
+delegates to `run.redrive` (same reopen-in-place, same archive), but it
+cannot change the definition version and it still refuses a `CANCELLED` run.
+
+## Run Retention
+
+Nothing deletes a terminal run on its own. `run.purge` (`{ olderThan,
+statuses?, limit? }` → `{ purged, workflowRunIds }`) clears each run's step
+ledger, job rows and blobs and deletes the run with everything under it;
+both hosts run it at the end of the maintenance tick once `retention:
+{ olderThanMs, statuses?, limit? }` is set (off by default). See "Run
+Retention" in [09-troubleshooting.md](09-troubleshooting.md).
+
+## Near-synchronous runs: `runToCompletion`
+
+`runToCompletion({ kernel, jobTransport, persistence, command })` from
+`@bratsos/workflow-engine-host-serverless` creates a run and drives it to a
+terminal state inside the calling request, returning `{ workflowRunId,
+status, outcome, output?, reason?, jobsProcessed, foreignJobsProcessed,
+suspendedStageId? }`. Three limits: it shares the queue, so it may execute
+another caller's job (`foreignJobsProcessed` says how many; give it its own
+`jobTransport` when that is unacceptable); it cannot finish a workflow that
+suspends and returns `outcome: "suspended"` naming the stage; and it is
+bounded by `maxJobs` (default 50) and `maxClaimRounds` (default 5),
+returning `outcome: "incomplete"` with a `reason` rather than throwing.
+
+## Enqueue from SQL
+
+`sql/enqueue.sql` (shipped in the package, applied by your own migration
+after the engine's tables exist) defines `workflow_engine_enqueue(...)`, so a
+trigger or a non-TypeScript service creates a run inside its own
+transaction:
+
+```sql
+PERFORM workflow_engine_enqueue(
+  'order:' || v_order_id, 'fulfil-order', 'Fulfil Order',
+  jsonb_build_object('orderId', v_order_id));
+```
+
+It writes exactly the rows `run.create` writes (idempotency key, run,
+`workflow:created` outbox event) and leaves the run `PENDING` for
+`run.claimPending`. It cannot validate input against the Zod schema, cannot
+compute the definition version (the run is created unpinned unless
+`p_definition_version` names an existing `workflow_definitions` row) and
+stores `p_config` verbatim. See [05-persistence-setup.md](05-persistence-setup.md).
 
 ## Plugin System
 
@@ -128,27 +180,24 @@ Plugins react to kernel events published through the outbox:
 import { definePlugin, createPluginRunner } from "@bratsos/workflow-engine/kernel";
 
 const metricsPlugin = definePlugin({
-  name: "metrics",
-  handlers: {
-    "workflow:completed": async (event) => {
-      await recordMetric("workflow_completed", { workflowId: event.workflowId });
-    },
-    "stage:retrying": async (event) => {
-      await recordMetric("stage_retry", { stageId: event.stageId, attempt: event.attempt });
-    },
-    "stage:failed": async (event) => {
-      await alertOnFailure(event);
-    },
+  id: "metrics",
+  name: "Metrics",
+  on: ["workflow:completed", "stage:retrying", "stage:failed"],
+  async handle(event) {
+    switch (event.type) {
+      case "workflow:completed":
+        return recordMetric("workflow_completed", { workflowId: event.workflowId });
+      case "stage:retrying":
+        return recordMetric("stage_retry", { stageId: event.stageId, attempt: event.attempt });
+      case "stage:failed":
+        return alertOnFailure(event);
+    }
   },
 });
 
-const runner = createPluginRunner({
-  plugins: [metricsPlugin],
-  eventSink: myEventSink,
-});
-
-// Process events from the outbox
-await runner.processEvents(events);
+// The runner is an EventSink: hand it to createKernel and `outbox.flush`
+// delivers each event to every plugin whose `on` names its type.
+const eventSink = createPluginRunner({ plugins: [metricsPlugin] });
 ```
 
 ## Multi-Worker Coordination
@@ -225,7 +274,7 @@ async execute(ctx) {
 
 A stage attempt that throws is either retried or terminal, depending on the job's attempt budget (the transport's `maxAttempts`, default 3 — the `maxRetries` field of the config presets is *not* read by the kernel):
 
-- **Attempts left** (and the error is not deterministic, e.g. not a Zod input failure): the kernel records the stage as `PENDING` with the error on `errorMessage`, keeps its step-ledger rows for the replay (re-opening the ones that failed), emits **`stage:retrying`** (`{ workflowRunId, stageId, stageName, attempt, maxAttempts, error }`) and returns `willRetry: true`; the host calls `jobTransport.fail(jobId, error, true)`, which **must** put the job back in the queue with backoff (the Prisma and in-memory queues do). A push transport whose `fail()` cannot re-enqueue reads `willRetry` / `retryDelayMs` off the host's job result and retries the message itself — acknowledging it without a retry leaves the run `RUNNING` until `run.reapStuck` heals it. The run stays `RUNNING` — `run.transition` treats a `PENDING` stage as active.
+- **Attempts left** (and the error is not deterministic, e.g. not a Zod input failure or a `DuplicateStepKeyError`): the kernel records the stage as `PENDING` with the error on `errorMessage`, keeps its step-ledger rows for the replay (completed steps are answered from the ledger; a `run` step or map item that ended `failed` is re-opened and runs again, keeping its `attempt` count), emits **`stage:retrying`** (`{ workflowRunId, stageId, stageName, attempt, maxAttempts, error }`) and returns `willRetry: true`; the host calls `jobTransport.fail(jobId, error, true)`, which **must** put the job back in the queue with backoff (the Prisma and in-memory queues do). A push transport whose `fail()` cannot re-enqueue reads `willRetry` / `retryDelayMs` off the host's job result and retries the message itself — acknowledging it without a retry leaves the run `RUNNING` until `run.reapStuck` heals it. The run stays `RUNNING` — `run.transition` treats a `PENDING` stage as active.
 - **No attempts left**: the stage is `FAILED`, **`stage:failed`** is emitted, and the host dispatches `run.transition` immediately (in the same `job.execute` completion, since v0.11), so the run fails with the real stage error right away rather than waiting for a later orchestration tick or `run.reapStuck` to notice. Both hosts behave the same; the serverless host does this inside `handleJob`. A stage that fails terminally from the poll path (a `ctx.step.run` retry that ran inside `stage.pollSuspended`, a `checkCompletion` error, a wait past its deadline) fails the run the same way and finalises its `job_queue` row.
 
 `stage:failed` therefore means the stage row is `FAILED`; a consumer that mirrors engine events into its own log sees one `stage:retrying` per retried attempt, not a failure the run never had.
@@ -243,15 +292,15 @@ Both `run.claimPending` and `run.transition` use `upsertStage` instead of `creat
 
 ### Per-Run Error Isolation
 
-If claiming a specific run fails (e.g., workflow not found, database error), that run is marked `FAILED` with error code `CLAIM_FAILED` and processing continues to the next run. One bad run never blocks the entire claim batch.
+If claiming a specific run fails (e.g., workflow not found, database error), that run is marked `FAILED` with error code `CLAIM_FAILED` and processing continues to the next run. One bad run never blocks the entire claim batch. With a registry built by `createWorkflowRegistry`, a run whose workflow this build does not hold is never claimed in the first place (the `serves` filter leaves it `PENDING` for a host that has it); only a hand-written `{ getWorkflow }` registry, or `serves: "all"`, still adopts it and fails it with `WORKFLOW_NOT_FOUND`.
 
 ### Ghost Job Guard
 
-`job.execute` verifies the run is in `RUNNING` status both before and after executing the stage. Jobs for non-`RUNNING` runs are discarded with `outcome: "failed"` and a `ghost: true` flag in the result. Hosts check this flag to disable retries (`canRetry = false`). This prevents ghost jobs from rolled-back transactions or concurrent cancellations from resurrecting invalid state.
+`job.execute` verifies the run is in `RUNNING` status both before and after executing the stage. A job for a run that is not `RUNNING` comes back with `outcome: "failed"`, `ghost: true` and a `ghostReason`: `"orphan"` (the run is terminal — the hosts fail the job without retry), `"race"` (the run is still `PENDING`, its claim had not committed — re-delivered while the attempt budget lasts) or `"version"` (the run is pinned to a definition version this build does not serve — deferred for a host that serves it, no attempt spent). This prevents ghost jobs from rolled-back transactions or concurrent cancellations from resurrecting invalid state.
 
 ### Orchestration Tick Isolation
 
-Each step of the orchestration tick (claim pending, poll suspended, reap stale, flush outbox, reap stuck) runs in its own error boundary. If one step fails, the others still execute. This prevents a single error from starving unrelated maintenance work.
+Each step of the orchestration tick (claim pending, poll suspended, reap stale, flush outbox, reap stuck, purge) runs in its own error boundary. If one step fails, the others still execute. This prevents a single error from starving unrelated maintenance work.
 
 ### Suspended-Stage Claims (Multiple Orchestrators)
 

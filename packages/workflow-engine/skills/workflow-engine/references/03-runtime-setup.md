@@ -7,7 +7,7 @@ Complete guide for configuring the command kernel and choosing a host.
 The kernel is the core command dispatcher. It's environment-agnostic -- no timers, no signals, no global state.
 
 ```typescript
-import { createKernel } from "@bratsos/workflow-engine/kernel";
+import { createKernel, createWorkflowRegistry } from "@bratsos/workflow-engine/kernel";
 import type {
   Kernel,
   KernelConfig,
@@ -16,10 +16,14 @@ import type {
   JobTransport,
   EventSink,
   Clock,
+  StepLedger,
+  KernelServices,
 } from "@bratsos/workflow-engine/kernel";
 import {
   createPrismaWorkflowPersistence,
   createPrismaJobQueue,
+  createPrismaStepLedger,
+  createPrismaAICallLogger,
 } from "@bratsos/workflow-engine/persistence/prisma";
 import { PrismaClient } from "@prisma/client";
 
@@ -41,15 +45,24 @@ const kernel = createKernel({
   // Required: injectable time source
   clock: { now: () => new Date() },
 
-  // Required: workflow definition lookup
-  registry: {
-    getWorkflow: (id) => workflowMap.get(id),
-  },
+  // Required: workflow definition lookup. `createWorkflowRegistry` implements the
+  // optional `listWorkflows()` the definition-version filter derives from; a
+  // hand-written `{ getWorkflow: (id) => ... }` still works but cannot enumerate,
+  // so claiming stays unfiltered (see 13-definition-versioning.md).
+  registry: createWorkflowRegistry(workflows),
 
-  // Optional: `Scheduler` port -- @deprecated and unused by the kernel today
-  // (zero schedule()/cancel() call sites). Omit it; the kernel supplies its
-  // own internal no-op. Will be removed at 1.0.
-  // scheduler: myScheduler,
+  // Optional: durable step storage. Required for any stage that calls
+  // `ctx.step.*`; without it those calls throw `StepLedgerNotConfiguredError`.
+  stepLedger: createPrismaStepLedger(prisma),
+
+  // Optional: services exposed lazily through `ctx.ai` / `ctx.aiLogger` and
+  // used for the run's cost roll-up. `ai` defaults to `createAIHelper`;
+  // without `aiLogger`, touching `ctx.ai` throws `AIServicesNotConfiguredError`.
+  services: { aiLogger: createPrismaAICallLogger(prisma) },
+
+  // Optional: `ActivityExecutor` port -- defaults to in-process; see
+  // 11-remote-activity-workers.md.
+  // executor: createRoutingExecutor({ ... }),
 
   // Optional (v0.11+): how long an idempotency key may sit `in_progress`
   // before a subsequent dispatch can reclaim it (guards against a crashed
@@ -76,10 +89,15 @@ const kernel = createKernel({
 |------|-----------|---------|
 | `persistence` | `Persistence` | CRUD for runs, stages, logs, outbox events, idempotency keys |
 | `blobStore` | `BlobStore` | `put(key, data)`, `get(key)`, `has(key)`, `delete(key)`, `list(prefix)` |
-| `jobTransport` | `JobTransport` | `enqueue` (deprecated, use `enqueueParallel`), `enqueueParallel` (idempotent on `(workflowRunId, stageId)`), `deleteByRunAndStages` (1.0.0-alpha.7+, used by `run.rerunFrom`), `dequeue`, `complete`, `suspend`, `fail` (all three take an optional acknowledgement fence, 1.0.0-alpha.9+), `releaseStaleJobs`, `expireRunawayJobs` (optional, 1.0.0-alpha.9+, absolute lease tier), `cancelByRun`, `touchJob` (v0.11+, lease heartbeat), `getJobsByWorkflowRun` (v0.11+), `adoptWorkerId` (optional, 1.0.0-alpha.7+) |
+| `jobTransport` | `JobTransport` | `enqueueParallel` (idempotent on `(workflowRunId, stageId)`; the legacy `enqueue` left the port at 1.0), `deleteByRunAndStages` (used by `run.redrive` / `run.rerunFrom`), `dequeue(options?)` (`options.serves` filters by definition version; returns `startedAt`), `complete`, `suspend(jobId, nextPollAt, fence?)`, `fail(jobId, error, shouldRetry?, fence?)` (all three take an optional `JobAckFence` and return `"acknowledged" \| "superseded"`), `defer` (optional: decline a job without spending an attempt), `releaseStaleJobs`, `expireRunawayJobs` (optional, absolute lease tier), `cancelByRun`, `touchJob` (lease heartbeat), `getJobsByWorkflowRun`, `adoptWorkerId` (optional), `fairnessGroupBy` (optional readonly property, read by `createSpillingJobTransport`) |
 | `eventSink` | `EventSink` | `emit(event)` - async event publishing |
 | `clock` | `Clock` | `now()` - returns `Date` |
-| `scheduler` (optional) | `Scheduler` | `schedule(type, payload, runAt)`, `cancel(type, correlationId)` -- **@deprecated**, unused by the kernel (zero call sites); omit it, the kernel supplies its own no-op. Removal at 1.0 |
+| `registry` | `WorkflowRegistry` | `getWorkflow(id)`, plus optional `listWorkflows()` (implemented by `createWorkflowRegistry`) that enables definition-version filtering |
+| `stepLedger` (optional) | `StepLedger` | `claim`, `get`, `update`, `compareAndSet`, `list`, `clear`, optional `clearExcept` -- durable step rows; `InMemoryStepLedger` / `createPrismaStepLedger`. `createKernel` wraps it with the step-result spill (15-large-payloads.md) |
+| `services` (optional) | `KernelServices` | `{ aiLogger?: AICallLogger, ai?: AIHelperFactory }` -- backs `ctx.ai` / `ctx.aiLogger` |
+| `executor` (optional) | `ActivityExecutor` | Where a stage body runs; defaults to `createLocalExecutor()` |
+
+The `Scheduler` port and `KernelConfig.scheduler` were removed at 1.0 (the type is still exported; the kernel never called it).
 
 ## Node Host
 
@@ -103,7 +121,9 @@ const host = createNodeHost({
   maxClaimsPerTick: 10,               // Max pending runs to claim per tick
   maxSuspendedChecksPerTick: 10,      // Max suspended stages to poll per tick
   maxOutboxFlushPerTick: 100,         // Max outbox events to flush per tick
-  // retention: { olderThanMs: 30 * 24 * 60 * 60 * 1000 }, // Opt-in: run.purge on every tick (see 09-troubleshooting.md, "Run Retention")
+  shutdownTimeoutMs: 10_000,          // 1.0: bound on stop() waiting for the in-flight job / tick and the final flush
+  flushOutboxOnStop: true,            // 1.0: run a final outbox.flush in stop() so this process publishes its own workflow:completed
+  // retention: { olderThanMs: 30 * 24 * 60 * 60 * 1000, statuses?, limit? }, // Opt-in: run.purge on every tick (see 09-troubleshooting.md, "Run Retention")
   // serves: "all",                   // 1.0: turn definition-version filtering off.
                                       // Omitted, the kernel derives it from the
                                       // registry (claim, poll and dequeue alike).
@@ -124,6 +144,8 @@ const stats = host.getStats();
 `{ status: "healthy" | "degraded", since: number | null, consecutiveFailures:
 number, deadLettered: number, lastError: string | null }`. See "Degraded event
 sink" below.
+
+`jobHeartbeatIntervalMs` is also what feeds `ctx.abortSignal`: each beat dispatches `job.heartbeat`, which renews the lease and reports the run's status and whether this worker still holds the job, and the host aborts the executing body with a `StageAbortedError` whose `reason` is `"cancelled"` or `"lease-lost"` (see 12-durable-steps.md, "Cancellation").
 
 `staleLeaseThresholdMs` is how long a killed worker's *job* stays unavailable. A killed worker's in-flight **durable step** is a separate dial: `StepRunOptions.lease`, default five minutes, is how long a resumed stage waits before it re-runs that step (see 12-durable-steps.md, "Leases, retries and deadlines"). Both bound how fast a crash recovers; neither is set by the other.
 
@@ -201,6 +223,8 @@ const host = createServerlessHost({
   maxClaimsPerTick: 10,
   maxSuspendedChecksPerTick: 10,
   maxOutboxFlushPerTick: 100,
+  flushOutboxAfterJob: true,          // 1.0: publish outbox events right after handleJob settles (no process lifecycle to hook)
+  outboxFlushTimeoutMs: 5_000,        // 1.0: bound on that post-job flush
   // retention: { olderThanMs: 30 * 24 * 60 * 60 * 1000 }, // Opt-in: run.purge on every tick
   // serves: "all",                   // 1.0: turn definition-version filtering off
 });
@@ -221,10 +245,16 @@ const result = await host.handleJob({
   payload: msg.body.payload,
 });
 
-if (result.outcome === "completed") msg.ack();
-else if (result.outcome === "suspended") msg.ack();
-else msg.retry();
+// `JobResult` carries the retry contract: `willRetry`, `attempt`, `maxAttempts`,
+// `retryDelayMs` (2^attempt seconds) and `dead` (orphan or malformed message,
+// failed and acknowledged). The built-in transports re-enqueue a retry from
+// `fail(jobId, error, true)` themselves, so the message can always be acked;
+// a push transport whose fail() cannot re-enqueue retries the message itself.
+if (result.willRetry) msg.retry({ delaySeconds: (result.retryDelayMs ?? 0) / 1000 });
+else msg.ack();
 ```
+
+A message whose payload was spilled by `createSpillingJobTransport` and delivered through your own push queue must be resolved first: `createPayloadSpill({ blobStore }).unpack(msg.payload)` (see 15-large-payloads.md).
 
 ### Dequeue and Process Jobs
 
@@ -346,9 +376,10 @@ import {
 
 | Export | Purpose |
 |--------|---------|
-| `executeJobWithHeartbeat(kernel, options)` | Dispatches `job.execute` for one job, holding a lease heartbeat (`jobTransport.touchJob`) for its duration, then routes the outcome through the job transport (`complete`/`suspend`/`fail`) and `run.transition` when terminal. |
+| `executeJobWithHeartbeat(kernel, options)` | Dispatches `job.execute` for one job (passing the job's `attempt`/`maxAttempts` and an `abortSignal`), dispatching `job.heartbeat` on `jobHeartbeatIntervalMs` for its duration (renews the lease, aborts the body on cancel or a lost lease), then routes the outcome through the job transport (`complete`/`suspend`/`fail`/`defer`, fenced with the job's `startedAt`) and `run.transition` when terminal. Returns an `ExecuteJobOutcome` (`outcome`, `error?`, `dead?`, `willRetry?`, `attempt?`, `maxAttempts?`, `retryDelayMs?`, `deferred?`). |
 | `runMaintenanceTick(kernel, options)` | Runs one bounded maintenance pass -- `run.claimPending`, `stage.pollSuspended` (transitioning any resumed runs), `lease.reapStale` (both lease tiers), `outbox.flush`, `run.reapStuck`, and `run.purge` when `retention` is set. Each command's error is caught and logged independently so one failure doesn't block the rest of the tick. |
-| `HOST_DEFAULTS` | The shared tuning defaults (`staleLeaseThresholdMs`, `jobAbsoluteTimeoutMs`, `maxClaimsPerTick`, `jobHeartbeatIntervalMs`, etc.) both built-in hosts fall back to. |
+| `HOST_DEFAULTS` | The shared tuning defaults (`workerId`, `logPrefix`, `staleLeaseThresholdMs` 300s, `jobAbsoluteTimeoutMs` 1h, `maxClaimsPerTick` 10, `maxSuspendedChecksPerTick` 10, `maxOutboxFlushPerTick` 100, `jobHeartbeatIntervalMs` 60s, `maxAttempts` 3, `versionDeferMs` 30s, `computeStuckThresholdMs()`) both built-in hosts fall back to. Every field of both option bags is optional, so `runMaintenanceTick(kernel)` and `executeJobWithHeartbeat(kernel, { jobTransport, job })` work as-is. |
+| `createEventSinkMonitor()` / `EventSinkHealth` | The degraded-sink state machine the Node host uses, for a custom loop (see "Degraded event sink"). |
 | `toErrorMessage(error)` | Normalizes a caught `unknown` into a display-safe string (`Error#message`, or `String(error)`). |
 
 Both take an options bag (`ExecuteJobWithHeartbeatOptions` / `RunMaintenanceTickOptions`, also exported from `@bratsos/workflow-engine/kernel`) covering the job transport, tuning knobs, and a `logPrefix` for diagnostics. Read `packages/workflow-engine-host-node/src/host.ts` or `packages/workflow-engine-host-serverless/src/host.ts` for a complete reference implementation before writing your own -- both call these same two functions rather than reimplementing the dispatch sequence.
@@ -367,7 +398,7 @@ createNodeHost({ kernel, jobTransport, workerId: "worker-1" });
 createNodeHost({ kernel, jobTransport, workerId: "worker-2" });
 ```
 
-The `claimPendingRun` operation uses `FOR UPDATE SKIP LOCKED` in PostgreSQL to prevent race conditions.
+The `claimNextPendingRun` operation uses `FOR UPDATE SKIP LOCKED` in PostgreSQL to prevent race conditions. Its enqueue of the first-stage job is deferred to the kernel's post-commit step, so a fast job loop can never dequeue a job whose run is still `PENDING` elsewhere; a job that still arrives early is reported as `ghostReason: "race"` and re-delivered.
 
 `start()` also hands the host's `workerId` to the job transport (`JobTransport.adoptWorkerId`, optional on the port), so `job_queue.workerId` names the same worker `run.claimPending` does. Build the transport without a `workerId` of its own — `createPrismaJobQueue(prisma)` — and it adopts the host's; pass one explicitly and the transport keeps it while the host logs a one-line `workerId mismatch` warning naming both. See 05-persistence-setup.md.
 

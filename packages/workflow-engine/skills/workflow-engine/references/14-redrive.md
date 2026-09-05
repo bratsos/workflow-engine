@@ -204,7 +204,7 @@ await kernel.dispatch({
 
 The `definitionVersion` property controls re-pinning:
 
-- **Omitted**: Keeps the run's existing `pinnedVersion`. The executing host must serve this pinned version; if the host serves a different definition, `assertServesRun` throws `DefinitionVersionMismatchError`. Planning a redrive against a different pipeline graph than the host that executes it is invalid.
+- **Omitted**: Keeps the run's existing `definitionVersion`. The host dispatching the redrive must serve this pinned version; if the host serves a different definition, `assertServesRun` throws `DefinitionVersionMismatchError`. Planning a redrive against a different pipeline graph than the host that executes it is invalid.
 - `"latest"`: Re-pins the run to the definition version currently served by the local host build. If this version's snapshot has not yet been persisted, `recordDefinitionVersion` registers it in `workflow_definitions`. This mode rescues runs stranded at versions no longer served by any active worker.
 - **Explicit version string**: Re-pins the run to a specific version (e.g., `"2026-09-04.1"`). The explicit version must already exist in `workflow_definitions` for that `workflowId`; if absent, the command throws an error.
 
@@ -247,7 +247,7 @@ Because it delegates to `run.redrive` with `from: { kind: "stage" }`, `run.rerun
 
 ### Operational tooling notice
 
-As a current implementation detail, the UI action `run.rerun` in `@bratsos/workflow-engine-console` dispatches `run.rerunFrom`.
+The console's `run.rerun` action (`POST /runs/:id/rerun` in `@bratsos/workflow-engine-console`) dispatches `run.redrive`, not `run.rerunFrom`: the request takes `fromStageId` (which becomes `from: { kind: "stage", stageId }`) or a `from` of `{ kind: "lastFailure" | "start" | "stage" }`, plus an optional `definitionVersion` (`"latest"` or a registered version), so a `CANCELLED` run and a run stranded at a version nothing serves are both recoverable from the console. The action name is unchanged, so an existing `authorize` or `onAction` still matches; a custom `ConsoleKernel` that implemented only `run.rerunFrom` must now also accept `run.redrive`. See [16-operational-console.md](./16-operational-console.md).
 
 ### Migration snippet
 

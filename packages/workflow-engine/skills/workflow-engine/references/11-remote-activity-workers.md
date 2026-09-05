@@ -80,6 +80,8 @@ worker.start();
 
 The worker holds **zero standing credentials** — it receives a presigned URL from the broker for each artifact PUT/GET.
 
+**What the stage context looks like on the worker.** `StageContext` requires `step`, `ai`, `aiLogger` and `abortSignal`, and the worker builds all four itself: `step` is `createStepApi()` from `@bratsos/workflow-engine/kernel` with no ledger, so every `ctx.step.*` call throws `StepLedgerNotConfiguredError` (no durable steps on a remote worker in v1); `ctx.ai` and `ctx.aiLogger` throw `AIServicesNotConfiguredError` (bring your own AI client); and `abortSignal` is a fresh `AbortController().signal` that never fires — the kernel's heartbeat-driven abort does not cross the worker boundary, and `ActivityRunInput.abortSignal` is not serialisable, so a remote executor drops it. Stages that use `ctx.step.*`, `ctx.ai` or `ctx.abortSignal` must run in-process.
+
 **Cancellation (v0.11+):** the worker's heartbeat loop watches the broker's heartbeat response for a cancel signal (lease fenced/reaped). If it's set, the worker still lets the in-flight activity finish, but skips the presign/report round-trip afterward instead of attempting a doomed report against a lease that's gone.
 
 ## The orchestrator side
@@ -139,7 +141,8 @@ Workers PUT blobs directly to S3/R2 via the presigned URL — the broker server 
 
 ## Limitations
 
-- No mid-activity cancellation — `execute()` itself is never interrupted; a fenced/reaped lease is only detected between heartbeats, so the worker finishes the activity and (as of v0.11) skips the doomed report rather than sending one, but it does not abort the run in progress.
+- No mid-activity cancellation — `execute()` itself is never interrupted; a fenced/reaped lease is only detected between heartbeats, so the worker finishes the activity and (as of v0.11) skips the doomed report rather than sending one, but it does not abort the run in progress. `ctx.abortSignal` is present on the worker but never fires.
+- No durable steps or injected AI services on the worker — `ctx.step.*` throws `StepLedgerNotConfiguredError` and `ctx.ai` throws `AIServicesNotConfiguredError` (see above).
 - Single-part PUT only — objects >5 GB need multipart.
 - Single-orchestrator — multi-instance HA needs a shared broker store (Prisma/Redis).
 - The S3 path is unit-tested against a permissive fake signer; add a real MinIO/LocalStack round-trip integration test before heavy production use.

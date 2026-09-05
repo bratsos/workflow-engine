@@ -29,6 +29,20 @@ const workflow = defineWorkflow({
 
 `new WorkflowBuilder(id, name, description, inputSchema, outputSchema)` is the low-level constructor both forms use; it is supported but easy to mistype because two positional arguments share the type `z.ZodTypeAny`.
 
+### version(version)
+
+Every built workflow carries a definition version — by default a `sha256-…` hash of its structure (stage ids and order, execution groups, dependencies, modes and every schema; not stage names or bodies). `.version("2026-09-04.1")` declares one explicitly instead; re-registering the same explicit version with a different structure throws `DefinitionVersionConflictError`. Runs are pinned to the version they were created under. See [13-definition-versioning.md](13-definition-versioning.md).
+
+```typescript
+const workflow = defineWorkflow("repository", { input: In })
+  .stage("index", { /* ... */ })
+  .version("2026-09-04.1")
+  .build();
+
+workflow.definitionVersion;      // "2026-09-04.1" (or "sha256-…" when derived)
+workflow.getDefinitionSnapshot(); // the structure the version identifies
+```
+
 ## WorkflowBuilder Methods
 
 ### stage(id, definition) / stage(prebuiltStage)
@@ -55,7 +69,7 @@ const workflow = defineWorkflow("repository", { input: In })
 
 ### pipe(stage)
 
-Add a stage built with `defineStage` to execute sequentially after the previous stage. Same as `.stage(prebuiltStage)` without the duplicate-id check.
+Add a stage built with `defineStage` to execute sequentially after the previous stage. Same as `.stage(prebuiltStage)` without the duplicate-id check. Both forms check a prebuilt stage's declared context (the `TContext` of `defineStage<TContext>()`) against the context accumulated so far: a stage that requires a key no earlier stage produces, or produces with an incompatible type, no longer compiles — the parameter resolves to `{ __error: "stage requires context keys not produced by earlier stages: ..." }`. Stages built without an explicit context are unaffected.
 
 ```typescript
 const workflow = defineWorkflow({ ... })
@@ -136,6 +150,10 @@ const plan = workflow.getExecutionPlan();
 //   [{ stage: mergeStage, executionGroup: 3 }]
 // ]
 ```
+
+### getAllStages()
+
+Returns every `StageNode` (`{ stage, executionGroup }`) flat, in execution order.
 
 ### getStageIds()
 

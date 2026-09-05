@@ -167,17 +167,23 @@ that delete stage records.
 Written by `run.redrive` (and therefore by the deprecated `run.rerunFrom`)
 for every stage record the redrive replaces, in the same transaction as the
 replacement — so a rollback takes the archive with it. Exported as
-`SUPERSEDED_ATTEMPT_KEY`. Scope `"stage"`, `scopeId` the stage id, `attempt`
+`SUPERSEDED_ATTEMPT_KEY` from `@bratsos/workflow-engine/kernel`. Scope `"stage"`, `scopeId` the stage id, `attempt`
 the superseded record's attempt, actor `{ kind: "engine", id: "run.redrive" }`,
 value the superseded record's status, idempotency key
 `run.supersededAttempt:${stageRecordId}:${attempt}`.
 
 Payload: `redriveCount`, `stageRecordId`, `stageNumber`, `executionGroup`,
 `attempt`, `status`, `errorMessage`, `startedAt`, `completedAt` (both ISO
-strings or `null`), `duration`, `metrics`, `outputData` and
-`definitionVersion`. `outputData` is the blob key the attempt wrote, not a
-copy of the blob: the next attempt writes to the same key, so the annotation
-records that an output existed and where, not its bytes.
+strings or `null`), `duration`, `metrics`, `outputData`,
+`definitionVersion` and `reopened` (`true` when the record was reopened in
+place and its ledger kept — the stage a `lastFailure` / `stage` redrive
+resumes from; `false` when it was deleted). `outputData` is the blob key the
+attempt wrote, not a copy of the blob: the next attempt writes to the same
+key, so the annotation records that an output existed and where, not its
+bytes. `abandonedSteps` (`{ stepId, status, externalKey }[]`) is present
+only when the redrive dropped a `run` step row that named an external
+effect — a provider batch that may still be processing and billing — so the
+key survives to be searched for; it is absent, not empty, in the normal case.
 
 ```ts
 const attempts = await kernel.annotations.list(runId, {
@@ -191,8 +197,11 @@ See [14-redrive.md](14-redrive.md).
 
 Written when a durable step's outcome compare-and-set finds the row already
 committed by another execution of the same body — the first write won and the
-loser parked on the recorded outcome. Payload: `stepId`, `kind`,
-`recordedStatus`, `recordedAttempt`, `externalKey` (or `null`).
+loser parked on the recorded outcome. Value: the recorded status. Payload:
+`stepId`, `kind`, `recordedStatus`, `recordedAttempt`, `externalKey` (or
+`null`). Idempotency key
+`step-outcome-conflict:${stageRecordId}:${stepId}:${attempt}`, so two workers
+reporting the same conflict write one row. A WARN log accompanies it.
 
 It is a report, not a failure: the ledger stayed consistent and no retry is
 spent. What it tells you is that the body ran more than once, so a duplicate
@@ -208,7 +217,7 @@ external effect is possible under that `externalKey`. See
 
 ## Migration from `WorkflowRun.metadata`
 
-The `metadata` parameter on `RunCreateCommand` is `@deprecated` in 0.8 and will be removed in 1.0. Existing rows with `WorkflowRun.metadata` populated are automatically projected as virtual `legacy.metadata.*` annotations when you call `kernel.annotations.list(runId)`:
+The `metadata` parameter on `RunCreateCommand` was deprecated in 0.8 and is **removed in 1.0** — pass `annotations` instead (see "At run creation" above). Existing rows with `WorkflowRun.metadata` populated are still projected as virtual `legacy.metadata.*` annotations when you call `kernel.annotations.list(runId)`:
 
 ```ts
 // Run was created with:
@@ -460,7 +469,7 @@ The buffer-and-flush model makes stage-scope writes inherently atomic. Idempoten
 
 ## Reruns and the `attempt` axis
 
-`run.redrive` (and the deprecated `run.rerunFrom`, which delegates to it) reopens the stage records of the resumed execution group in place, bumping each record's `attempt` by one, and deletes the records after it; `from: { kind: "start" }` recreates the first group at one past the max attempt across the superseded stages. `ctx.annotate(...)` inherits the new `attempt` for the new annotations. Annotations from the prior attempt survive with their original `attempt` value: on a reopened record they still point at the same stage record id, and on a deleted one the FK is `SetNull`.
+`run.redrive` (and the deprecated `run.rerunFrom`, which delegates to it) reopens the stage records of the resumed execution group in place, bumping each record's `attempt` by one, and deletes the records after it; `from: { kind: "start" }` recreates the first group at one past the max attempt across the superseded stages. A downstream stage recreated by the next `run.transition` starts at attempt 0 again — a stage's `attempt` counts executions of its own row (job retries bump it too), and is never copied from an earlier group. `ctx.annotate(...)` inherits the record's `attempt` for the new annotations. Annotations from the prior attempt survive with their original `attempt` value: on a reopened record they still point at the same stage record id, and on a deleted one the FK is `SetNull`.
 
 This means a single run's annotations can carry multiple `attempt` values, distinguishing decisions made on different runs of the same logical stage. Filter by `attempt` to look at just one attempt:
 

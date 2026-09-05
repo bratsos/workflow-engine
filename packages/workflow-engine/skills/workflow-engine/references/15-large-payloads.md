@@ -82,7 +82,7 @@ Blob keys for durable steps are structured predictably:
 - Step prefix: `workflow-v2/spill/steps/${encodeURIComponent(stageRecordId)}/`
 - Step key: `${stepSpillPrefix(stageRecordId)}${encodeURIComponent(stepId)}.json`
 
-Because the kernel owns all reads and writes to `StepLedger`, `ctx.step.run(...)` transparently receives the original value on both initial execution and replay without developer intervention.
+Because the kernel owns all reads and writes to `StepLedger`, `ctx.step.run(...)` transparently receives the original value on both initial execution and replay without developer intervention. Every step outcome write spills the same way — `run` and `waitFor` results, `ctx.step.ai.*` results and a map item's failed verdict — and every read resolves, including a replay answered from the ledger and a worker parked on another worker's outcome. Spilled blobs go with their rows: clearing a stage's ledger (a redrive, a fresh attempt of a terminally failed stage) deletes them, a partial `clearExcept` keeps the blobs of the rows it keeps, and `run.purge` deletes both spill prefixes of a run along with its stage outputs and artifacts. Measured on one stage with two large step results: 520,022 inline bytes before spilling, 224 after; a 300,036-byte job payload becomes a 79-byte queue row.
 
 ## Job payloads (opt-in at wiring)
 
@@ -123,17 +123,24 @@ const host = createNodeHost({
 });
 ```
 
-`SpillingJobTransportOptions` mirrors `PayloadSpillOptions`:
+`SpillingJobTransportOptions` is `PayloadSpillOptions` plus the fairness path:
 
 ```typescript
-export interface SpillingJobTransportOptions extends PayloadSpillOptions {}
+export interface SpillingJobTransportOptions extends PayloadSpillOptions {
+  /** Dotted payload path naming the fairness group; defaults to the wrapped transport's `fairnessGroupBy`. */
+  groupBy?: string;
+}
 ```
 
 The decorator intercepts specific transport methods:
 - **Packs on**: `enqueueParallel(jobs)`. For each job whose `payload` is defined, it packs the payload under `workflow-v2/spill/jobs/${encodeURIComponent(job.workflowRunId)}/${encodeURIComponent(job.stageId)}.json`.
 - **Unpacks on**: `dequeue()` and `getJobsByWorkflowRun(workflowRunId)`. Each returned job record has its `payload` resolved through `spill.unpack` before being handed to the host.
 - **Deletes on**: `deleteByRunAndStages(workflowRunId, stageIds)`. Calls the underlying transport method and removes spilled blobs under `jobSpillKey(workflowRunId, stageId)` for each designated stage.
-- **Passes through**: `complete`, `suspend`, and `fail` forward all arguments including `fence` intact (preserving optimistic concurrency fencing); `releaseStaleJobs`, `cancelByRun`, and `touchJob` delegate directly. Optional methods `expireRunawayJobs` and `adoptWorkerId` are forwarded only when present on the wrapped transport.
+- **Passes through**: `complete`, `suspend`, and `fail` forward all arguments including `fence` intact (preserving optimistic concurrency fencing); `releaseStaleJobs`, `cancelByRun`, and `touchJob` delegate directly. Optional methods `expireRunawayJobs`, `adoptWorkerId` and `defer` are forwarded only when present on the wrapped transport, so the wrapper never claims a capability the inner transport lacks — and, like any decorator around a transport, it must forward `fence` explicitly, because a delegation that drops the optional parameter still typechecks and silently turns every fenced acknowledgement back into an unconditional write.
+
+### Spilling and per-group fairness
+
+A queue with fairness on (`createPrismaJobQueue(prisma, { fairness: { maxConcurrentPerGroup, groupBy: "config.tenantId" } })`, see 05-persistence-setup.md) reads the group off the payload row. Replacing that payload with a claim check would hide the configured path and collapse every spilled job into one anonymous group — losing starvation protection for exactly the tenants whose payloads are largest. So the decorator discovers the wrapped queue's `fairnessGroupBy` (or takes an explicit `groupBy` of its own), and when a payload is about to spill it hoists the string or number at that path onto `EnqueueJobInput.groupKey` before packing, so the row still carries `_groupKey`; the fairness statement falls back to `_groupKey` when the configured path is absent from the row. Inline payloads are not touched, and a job that already carries `groupKey` keeps it. The wrapper re-exposes the path as its own `fairnessGroupBy`.
 
 ## The threshold and how to change it
 
@@ -179,8 +186,8 @@ Only two locations in the database schema participate in claim-check spilling:
 The engine deliberately **does not spill** the following columns:
 - `workflow_runs.input`, `workflow_runs.output`, and `workflow_runs.config`
 - `workflow_stages.suspendedState`
-- `workflow_annotations.value`
-- `workflow_logs.message`
+- `workflow_annotations.value` and `payload`
+- `workflow_logs.metadata`
 
 The reason is architectural: the run, stage, annotation, and log tables constitute the consumer-facing read model. External SQL dashboards, business intelligence pipelines, operational queries, and reporting views query these tables directly. Replacing values with JSON pointer references in those tables would break external queries and require consumers to implement custom resolution logic.
 
