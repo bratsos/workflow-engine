@@ -1,6 +1,6 @@
 {
   "name": "@bratsos/workflow-engine",
-  "version": "0.13.0",
+  "version": "1.0.0-alpha.12",
   "description": "Type-safe, distributed workflow engine for AI-orchestrated processes with suspend/resume, parallel execution, and cost tracking",
   "type": "module",
   "license": "MIT",
@@ -82,7 +82,9 @@
     "LICENSE",
     "README.md",
     "dist",
-    "skills"
+    "skills",
+    "prisma",
+    "sql"
   ],
   "scripts": {
     "typecheck": "tsc --noEmit",
@@ -91,7 +93,7 @@
     "sync-models": "tsx src/cli/sync-models.ts",
     "prisma:generate": "prisma generate --schema ./prisma/schema.prisma",
     "prisma:db-push": "prisma db push --schema ./prisma/schema.prisma --skip-generate",
-    "test:pg": "vitest run src/__tests__/12-persistence-adapters/prisma-postgres-conformance.test.ts",
+    "test:pg": "vitest run --no-file-parallelism src/__tests__/12-persistence-adapters/prisma-postgres-conformance.test.ts src/__tests__/12-persistence-adapters/sql-enqueue.test.ts",
     "check:bundle": "node scripts/check-client-isolation.mjs",
     "verify": "pnpm build && pnpm check:bundle && pnpm typecheck && pnpm test"
   },

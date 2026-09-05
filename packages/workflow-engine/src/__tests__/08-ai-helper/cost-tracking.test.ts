@@ -6,7 +6,6 @@
 
 import { beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
-import type { ModelKey } from "../../ai/model-helper.js";
 import { createMockAIHelper, MockAIHelper } from "../utils/mock-ai-helper.js";
 
 describe("I want to track AI costs using AIHelper", () => {
@@ -57,10 +56,7 @@ describe("I want to track AI costs using AIHelper", () => {
     it("should return cost with embed result", async () => {
       // Given: A mock AI helper (default embed has cost)
       // When: I embed
-      const result = await ai.embed(
-        "text-embedding-004" as ModelKey,
-        "Test text",
-      );
+      const result = await ai.embed("text-embedding-004", "Test text");
 
       // Then: Cost is included
       expect(result.cost).toBeGreaterThan(0);
@@ -123,10 +119,7 @@ describe("I want to track AI costs using AIHelper", () => {
     it("should track embedding tokens (input only)", async () => {
       // Given: A mock AI helper
       // When: I embed
-      const result = await ai.embed(
-        "text-embedding-004" as ModelKey,
-        "Some text",
-      );
+      const result = await ai.embed("text-embedding-004", "Some text");
 
       // Then: Only input tokens (no output for embeddings)
       expect(result.inputTokens).toBeGreaterThan(0);
@@ -241,7 +234,7 @@ describe("I want to track AI costs using AIHelper", () => {
     it("should track stats per model", async () => {
       // Given: Calls with different models
       await ai.generateText("gemini-2.5-flash", "Flash call");
-      await ai.generateText("gemini-2.5-pro" as ModelKey, "Pro call");
+      await ai.generateText("gemini-2.5-pro", "Pro call");
 
       // When: I get stats
       const stats = await ai.getStats();
@@ -255,7 +248,7 @@ describe("I want to track AI costs using AIHelper", () => {
       // Given: Multiple calls per model
       await ai.generateText("gemini-2.5-flash", "Flash 1");
       await ai.generateText("gemini-2.5-flash", "Flash 2");
-      await ai.generateText("gemini-2.5-pro" as ModelKey, "Pro 1");
+      await ai.generateText("gemini-2.5-pro", "Pro 1");
 
       // When: I get stats
       const stats = await ai.getStats();
@@ -281,7 +274,7 @@ describe("I want to track AI costs using AIHelper", () => {
       });
 
       await ai.generateText("gemini-2.5-flash", "flash");
-      await ai.generateText("gemini-2.5-pro" as ModelKey, "pro");
+      await ai.generateText("gemini-2.5-pro", "pro");
 
       // When: I get stats
       const stats = await ai.getStats();
@@ -309,7 +302,7 @@ describe("I want to track AI costs using AIHelper", () => {
       });
 
       await ai.generateText("gemini-2.5-flash", "flash");
-      await ai.generateText("gemini-2.5-pro" as ModelKey, "pro");
+      await ai.generateText("gemini-2.5-pro", "pro");
 
       // When: I get stats
       const stats = await ai.getStats();
@@ -341,7 +334,7 @@ describe("I want to track AI costs using AIHelper", () => {
 
       await ai.generateText("gemini-2.5-flash", "Text");
       await ai.generateObject("gemini-2.5-flash", "Object", schema);
-      await ai.embed("text-embedding-004" as ModelKey, "Embed");
+      await ai.embed("text-embedding-004", "Embed");
 
       const stream = ai.streamText("gemini-2.5-flash", { prompt: "Stream" });
       for await (const _ of stream.stream) {
@@ -401,17 +394,22 @@ describe("I want to track AI costs using AIHelper", () => {
       expect(calls[0]?.prompt).toBe("Manual prompt");
     });
 
-    it("should record call with legacy params", () => {
-      // Given: Legacy params
-      ai.recordCall("gemini-2.5-flash", "Legacy prompt", "Legacy response", {
-        input: 30,
-        output: 15,
+    it("should record a call with an explicit call type", () => {
+      // Given: An object-form record for a non-text call
+      ai.recordCall({
+        modelKey: "gemini-2.5-flash",
+        callType: "object",
+        prompt: "Object prompt",
+        response: "Object response",
+        inputTokens: 30,
+        outputTokens: 15,
       });
 
-      // Then: Call is recorded
+      // Then: Call is recorded with that call type
       const calls = ai.getCalls();
       expect(calls).toHaveLength(1);
-      expect(calls[0]?.prompt).toBe("Legacy prompt");
+      expect(calls[0]?.prompt).toBe("Object prompt");
+      expect(calls[0]?.type).toBe("object");
     });
 
     it("should include recorded calls in stats", async () => {

@@ -97,35 +97,42 @@ The **Kernel** manages the command dispatch loop, database interactions, and sta
 
 ```typescript
 // index.ts
-import { createKernel } from "@bratsos/workflow-engine/kernel";
+import { createKernel, createWorkflowRegistry } from "@bratsos/workflow-engine/kernel";
 import { createNodeHost } from "@bratsos/workflow-engine-host-node";
 import {
   createPrismaWorkflowPersistence,
   createPrismaJobQueue,
+  createPrismaBlobStore,
+  createPrismaStepLedger,
+  createPrismaAICallLogger,
 } from "@bratsos/workflow-engine/persistence/prisma";
 import { PrismaClient } from "@prisma/client";
 import { documentAnalysisWorkflow } from "./workflow";
-import { InMemoryBlobStore, CollectingEventSink } from "@bratsos/workflow-engine/kernel/testing";
 import crypto from "crypto";
 
 const prisma = new PrismaClient();
+const jobTransport = createPrismaJobQueue(prisma);
 
 // 1. Setup the pure command kernel
 const kernel = createKernel({
   persistence: createPrismaWorkflowPersistence(prisma),
-  blobStore: new InMemoryBlobStore(), // Or use S3/GCS adapters in production
-  jobTransport: createPrismaJobQueue(prisma),
-  eventSink: new CollectingEventSink(),
+  blobStore: createPrismaBlobStore(prisma), // the `workflow_blobs` table; or an S3/R2-backed store
+  jobTransport,
+  eventSink: { emit: async (event) => console.log(event.type, event.workflowRunId) },
   clock: { now: () => new Date() },
-  registry: {
-    getWorkflow: (id) => (id === "document-analysis" ? documentAnalysisWorkflow : undefined),
-  },
+  // An enumerating registry is what makes a rolling deploy safe: hosts only
+  // claim runs pinned to a definition version this build can execute.
+  registry: createWorkflowRegistry([documentAnalysisWorkflow]),
+  // Durable steps (`ctx.step.*`) and injected AI (`ctx.ai`). Neither is
+  // needed by the stages above, but every real pipeline ends up using them.
+  stepLedger: createPrismaStepLedger(prisma),
+  services: { aiLogger: createPrismaAICallLogger(prisma) },
 });
 
-// 2. Wrap it with a Node.js Host process
+// 2. Wrap it with a Node.js Host process (pass the same jobTransport instance)
 const host = createNodeHost({
   kernel,
-  jobTransport: createPrismaJobQueue(prisma),
+  jobTransport,
   workerId: "worker-1",
 });
 
@@ -147,3 +154,5 @@ async function main() {
 
 main().catch(console.error);
 ```
+
+The `stepLedger` and `services` lines are what turn on the two things most pipelines reach for next: [durable steps](../core-concepts/durable-steps.md) (`ctx.step.run`, `waitFor`, `waitForSignal`, `sleep`) and injected AI (`ctx.ai`, `ctx.step.ai.map`). The tables they need are in [Prisma Setup](../persistence/prisma-setup.md).

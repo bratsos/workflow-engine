@@ -9,7 +9,13 @@
  */
 
 import type { z } from "zod";
+import type { AIHelper } from "../ai/types.js";
 import type { AnnotationActor } from "../persistence/interface";
+import type { AICallLogger } from "../persistence/interface.js";
+import type { StepApi } from "./steps";
+
+export type { StepApi } from "./steps";
+
 import type {
   CompletionCheckResult,
   LogLevel,
@@ -130,15 +136,44 @@ export interface StageContext<
   // Resume support - if this stage was suspended and is now resuming
   resumeState?: z.infer<typeof SuspendedStateSchema>;
 
+  /**
+   * Durable, replayable side effects and waits. Always provided: every
+   * kernel path builds it with `createStepApi`, and so does host-remote's
+   * activity worker. Without a configured ledger the individual calls throw
+   * `StepLedgerNotConfiguredError` rather than the property being absent.
+   */
+  step: StepApi;
+
+  /**
+   * Aborted when the run is cancelled while this invocation executes, or
+   * when the worker's job lease is lost. Named `abortSignal` (not `signal`)
+   * so it is not confused with `step.waitForSignal`. Pass it to `fetch`,
+   * `ctx.ai.*`, or anything else that can be interrupted; the engine
+   * discards the outcome of a cancelled invocation either way, so honouring
+   * it only saves the work. `abortSignal.reason` is a `StageAbortedError`
+   * whose `reason` is `"cancelled"` or `"lease-lost"`. Never fires for a
+   * context built without a host loop (a direct `job.execute` dispatch).
+   */
+  abortSignal: AbortSignal;
+
   // Progress reporting
   onProgress: (update: ProgressUpdate) => void;
 
   // Logging
+  /**
+   * AI helper scoped to `workflow.${workflowRunId}.stage.${stageId}`.
+   * It is created lazily when first accessed.
+   */
+  readonly ai: AIHelper;
+  /** Logger used by the scoped AI helper for call-cost records. */
+  readonly aiLogger: AICallLogger;
+  /** Emit a log entry without waiting for persistence; returns void. */
   onLog: (
     level: LogLevel,
     message: string,
     meta?: Record<string, unknown>,
   ) => void;
+  /** Convenience alias for onLog; returns void. */
   log: (
     level: LogLevel,
     message: string,
@@ -186,12 +221,27 @@ export interface CheckCompletionContext<TConfig> {
   // Config for this stage
   config: TConfig;
 
+  /**
+   * Durable, replayable side effects and waits, scoped to this stage record —
+   * the same ledger rows `execute()` writes.
+   */
+  step: StepApi;
+
   // Logging
+  /**
+   * AI helper scoped to `workflow.${workflowRunId}.stage.${stageId}`.
+   * It is created lazily when first accessed.
+   */
+  readonly ai: AIHelper;
+  /** Logger used by the scoped AI helper for call-cost records. */
+  readonly aiLogger: AICallLogger;
+  /** Emit a log entry without waiting for persistence; returns void. */
   onLog: (
     level: LogLevel,
     message: string,
     meta?: Record<string, unknown>,
   ) => void;
+  /** Convenience alias for onLog; returns void. */
   log: (
     level: LogLevel,
     message: string,

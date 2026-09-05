@@ -13,7 +13,14 @@
  * import { ... } from "@bratsos/workflow-engine"
  */
 
-export { type AIHelper } from "./ai/ai-helper";
+export {
+  type AIHelper,
+  type ContentPart,
+  type MediaPart,
+  type StreamTextInput,
+  type TextInput,
+  type TextPart,
+} from "./ai/ai-helper";
 // Model configuration (client-safe)
 export {
   AVAILABLE_MODELS,
@@ -24,20 +31,30 @@ export {
   type ModelFilter,
   ModelKey,
   type ModelRegistry,
-  modelSupportsBatch,
   registerModels,
 } from "./ai/model-helper";
 export { NoInputSchema } from "./core/schema-helpers";
 // Stage definition (client-safe)
 export {
   type AsyncBatchStageDefinition,
-  defineAsyncBatchStage,
   defineStage,
   type EnhancedStageContext,
   type InferInput,
   type SimpleStageResult,
   type SyncStageDefinition,
 } from "./core/stage-factory";
+export {
+  isStepControlFlowError,
+  type StepApi,
+  StepInFlight,
+  StepLedgerNotConfiguredError,
+  StepLedgerWriteError,
+  StepResultNotSerializable,
+  type StepRunOptions,
+  StepSuspend,
+  StepTimeoutError,
+  type StepWaitOptions,
+} from "./core/steps";
 export type {
   AnnotationCreatedEvent,
   KernelEvent,

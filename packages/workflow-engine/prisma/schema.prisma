@@ -1,12 +1,13 @@
-// Test-only Prisma schema fixture.
+// Reference Prisma schema for the engine's tables.
 //
-// This schema exists solely to generate a real `@prisma/client` for the
-// Postgres conformance suite (see
+// Shipped in the package ("prisma/" is in the "files" field) so a consumer
+// can copy the models into their own schema or diff theirs against it. It
+// also generates the real `@prisma/client` used by the Postgres conformance
+// suite (see
 // ../src/__tests__/12-persistence-adapters/prisma-postgres-conformance.test.ts).
-// It is NOT published -- "prisma/" is intentionally excluded from the
-// "files" field in package.json.
 //
-// Keep this in sync with the schema documented in ../README.md.
+// The migration guides under ../skills/workflow-engine/migrations/ derive
+// their SQL from this file; keep them in step when a model changes.
 
 generator client {
   provider = "prisma-client-js"
@@ -47,14 +48,73 @@ model WorkflowRun {
   priority     Int       @default(5)
   metadata     Json?
 
+  // The definition version this run is pinned to. NULL means the run was
+  // created before the consumer migrated to definition versioning: it is
+  // claimable and executable by any host, exactly as before. See
+  // `workflow_definitions` for the structure the version identifies.
+  definitionVersion String?
+  // How many times `run.redrive` has re-driven this run (Step Functions'
+  // redrive count). Never reset -- it counts the whole life of the run.
+  redriveCount      Int     @default(0)
+
   stages      WorkflowStage[]
   logs        WorkflowLog[]
   artifacts   WorkflowArtifact[]
   annotations WorkflowAnnotation[]
 
-  @@index([status])
-  @@index([workflowId])
+  // List orderings. Every "recent runs" view -- the console's included --
+  // is newest-first, optionally narrowed by status or workflow, and pages
+  // on the keyset (createdAt, id), so the tiebreaker travels in the index
+  // and a page is one index range scan with no sort node. These replace
+  // the bare @@index([status]) / @@index([workflowId]): a composite whose
+  // leading column is the same serves every lookup the single-column
+  // index served.
+  @@index([createdAt(sort: Desc), id(sort: Desc)])
+  @@index([status, createdAt(sort: Desc), id(sort: Desc)])
+  @@index([workflowId, createdAt(sort: Desc), id(sort: Desc)])
+  // The claim: status = 'PENDING' ORDER BY priority DESC, "createdAt" ASC
+  // LIMIT 1 FOR UPDATE SKIP LOCKED, run maxClaimsPerTick times per tick
+  // per host. The same shape job_queue already indexes, and it needs its
+  // own: the (status, createdAt DESC, id DESC) index above cannot serve it
+  // because priority is not in it, so the claim reads every PENDING row
+  // and top-N sorts it. Measured on Postgres 16, 300k runs / 60k pending:
+  // 11.8-15.1 ms before, 0.008-0.022 ms after, for 9 MB of index.
+  @@index([status, priority(sort: Desc), createdAt])
+  // Definition versioning. The first serves a lookup narrowed to one
+  // version with no workflow. The second is the narrow stand-in for the
+  // @@index([status]) the list orderings above replaced -- a status count
+  // runs index-only off it (3.3 ms at 60k rows, against a heap scan) --
+  // and it also narrows the version-filtered claim. It does NOT cover
+  // `run.listVersions`: that handler passes no status filter and its
+  // aggregate asks for a MIN(createdAt) the index does not carry, so all
+  // three of its shapes plan a parallel sequential scan whatever is here.
+  @@index([definitionVersion])
+  @@index([status, workflowId, definitionVersion])
   @@map("workflow_runs")
+}
+
+// Content-addressed workflow definition snapshots. One row per distinct
+// (workflowId, version); every run pinned to that version references it,
+// so the storage cost is per definition rather than per run.
+model WorkflowDefinition {
+  workflowId String
+  version    String
+  createdAt  DateTime @default(now())
+  // The structure the version identifies: stage ids, execution groups,
+  // definition order, dependencies, modes and normalised JSON Schemas.
+  // See `core/definition-version.ts` for the exact shape.
+  snapshot   Json
+  // Hash of `snapshot`. Equal to `version` for derived versions; for an
+  // explicit version it is what lets the engine reject re-registering the
+  // same version with a different structure.
+  structureHash String
+
+  // No @@index([workflowId]): the compound primary key already leads with
+  // it, so a lookup by workflow alone plans identically with and without
+  // one (measured: 0.188 ms vs 0.187 ms at 20k rows) -- and no query in
+  // the engine reads this table by workflow alone anyway.
+  @@id([workflowId, version])
+  @@map("workflow_definitions")
 }
 
 model WorkflowStage {
@@ -88,11 +148,45 @@ model WorkflowStage {
   logs        WorkflowLog[]
   artifacts   WorkflowArtifact[]
   annotations WorkflowAnnotation[]
+  steps       WorkflowStep[]
 
   @@unique([workflowRunId, stageId])
   @@index([status])
   @@index([nextPollAt])
   @@map("workflow_stages")
+}
+
+model WorkflowStep {
+  id            String   @id @default(cuid())
+  stageRecordId String
+  // Migration SQL note: add the foreign key
+  // "workflow_steps_stageRecordId_fkey" (stageRecordId -> workflow_stages.id
+  // ON DELETE CASCADE) so deleting a stage record, or the run above it,
+  // removes its ledger rows instead of orphaning them.
+  stage         WorkflowStage @relation(fields: [stageRecordId], references: [id], onDelete: Cascade)
+  stepId        String
+  seq           Int
+  kind          String
+  status        String
+  // Migration SQL note: add "attempt" INT NOT NULL DEFAULT 1,
+  // "leaseExpiresAt" TIMESTAMP NULL, and "deadlineAt" TIMESTAMP NULL.
+  attempt        Int       @default(1)
+  leaseExpiresAt DateTime?
+  deadlineAt     DateTime?
+  // Migration SQL note: add "externalKey" TEXT NULL.
+  // Deterministic name for the external effect a `run` step body creates,
+  // written before the body runs so an orphaned provider-side effect can be
+  // found from the row after a crash.
+  externalKey    String?
+  result        Json?
+  error         String?
+  waitState     Json?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@unique([stageRecordId, stepId])
+  @@index([stageRecordId])
+  @@map("workflow_steps")
 }
 
 model WorkflowLog {
@@ -202,7 +296,32 @@ model JobQueue {
   payload       Json?
   lastError     String?
 
-  @@index([status, priority])
+  // One job row per stage per run. `run.redrive` retires the rows of the
+  // stages it replaces or reopens, and every enqueue path is idempotent on
+  // this pair, so
+  // the invariant is declared here rather than left implicit. Adding it to
+  // an existing database requires collapsing any duplicate rows first --
+  // see the 0.13 -> 1.0 migration guide.
+  @@unique([workflowRunId, stageId])
+  // The dequeue: status = 'PENDING' ORDER BY priority DESC, "createdAt" ASC
+  // LIMIT 1 FOR UPDATE SKIP LOCKED. This replaces the bare
+  // @@index([status, priority]) -- a composite whose leading columns are
+  // the same serves every lookup that one served. Carrying the createdAt
+  // tiebreak is what removes the sort node: without it a deep queue reads
+  // and sorts every PENDING row on every claim (measured on Postgres 16,
+  // flat priorities: 0.55 ms at 1,000 ready rows, 26.7 ms at 50,000; with
+  // it, 0.03 ms and 0.04 ms -- flat with depth).
+  //
+  // It costs more on disk than the index it replaces, and the reason is
+  // worth knowing: (status, priority) is almost entirely duplicate keys,
+  // which btree deduplication collapses, while adding createdAt makes
+  // every key distinct. Measured at 150,000 rows: 1 MB -> 10 MB.
+  @@index([status, priority(sort: Desc), createdAt])
+  // Queue health reports the age of the oldest waiting job as
+  // MIN("createdAt") within a status. Completed rows are retained rather
+  // than deleted, so [status, priority] would have to scan every row of
+  // the status to find it.
+  @@index([status, createdAt])
   @@index([nextPollAt])
   @@map("job_queue")
 }
@@ -222,6 +341,13 @@ model OutboxEvent {
 
   @@unique([workflowRunId, sequence])
   @@index([publishedAt])
+  // Dead letters are a subset of the unpublished rows, so without this the
+  // dead-letter view has to walk every unpublished event and fetch its heap
+  // tuple -- which is slowest exactly when a backlog has built up and you
+  // most want to read it. Postgres users writing migrations by hand should
+  // prefer a partial index (WHERE "dlqAt" IS NOT NULL); Prisma cannot
+  // express one, and this is the closest it gets.
+  @@index([dlqAt])
   @@map("outbox_events")
 }
 
@@ -234,4 +360,17 @@ model IdempotencyKey {
 
   @@unique([key, commandType])
   @@map("idempotency_keys")
+}
+
+// Optional: only when using createPrismaBlobStore. Stage outputs and replay
+// inputs are read from the blob store by every process that executes or
+// polls a run, so the store must be shared; this table makes Prisma that
+// shared store without object storage.
+model WorkflowBlob {
+  key       String   @id
+  data      Json
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("workflow_blobs")
 }

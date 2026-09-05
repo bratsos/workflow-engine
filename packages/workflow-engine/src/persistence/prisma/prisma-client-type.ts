@@ -44,6 +44,12 @@ export interface PrismaDelegate {
   deleteMany(args: any): Promise<any>;
   count(args?: any): Promise<any>;
   aggregate(args: any): Promise<any>;
+  /**
+   * Optional: only `countRunsByDefinitionVersion` uses it, and it guards
+   * with a `typeof` check so a hand-rolled test double without `groupBy`
+   * still satisfies this type.
+   */
+  groupBy?(args: any): Promise<any>;
 }
 
 /**
@@ -71,6 +77,16 @@ export interface EnginePrismaClient {
   jobQueue: PrismaDelegate;
   /** AICall delegate (ai-logger.ts). */
   aICall: PrismaDelegate;
+  /** WorkflowStep delegate (step-ledger.ts). */
+  workflowStep: PrismaDelegate;
+  /**
+   * WorkflowDefinition delegate (persistence.ts: definition snapshots).
+   * Optional on purpose: a consumer who has not yet added the
+   * `workflow_definitions` model still satisfies this type, and the
+   * adapter detects its absence and runs without definition versioning
+   * rather than failing to start.
+   */
+  workflowDefinition?: PrismaDelegate;
 
   /**
    * Interactive ($transaction(fn)) and batch ($transaction([...])) forms.
@@ -91,6 +107,12 @@ export interface EnginePrismaClient {
     strings: TemplateStringsArray,
     ...values: any[]
   ): Promise<T>;
+  /**
+   * Raw SQL with positional parameters. Optional; preferred by
+   * `claimNextPendingRunPostgres` because the status enum's type name is an
+   * identifier a tagged template cannot bind (`statusEnumName`).
+   */
+  $queryRawUnsafe?<T = unknown>(query: string, ...values: any[]): Promise<T>;
   /**
    * Raw parameterized statement (tagged template). Optional -- already
    * guarded with a `typeof ... === "function"` check at its one call site

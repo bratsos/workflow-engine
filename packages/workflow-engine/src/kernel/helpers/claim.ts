@@ -14,6 +14,7 @@ import type { KernelDeps } from "../kernel.js";
 import type { WorkflowRunRecord, WorkflowStageRecord } from "../ports.js";
 import { buildAnnotationEvents } from "./annotation-events.js";
 import { toOutboxEvents } from "./outbox-events.js";
+import { rollUpRunTotals } from "./run-totals.js";
 
 export type ClaimOutcome<T> =
   | { status: "claimed"; value: T }
@@ -100,8 +101,16 @@ export async function markStageCancelled(
  * Resolves the "stale" / "cancelled" branches of a `withClaimedRun` call
  * the same way at every call site: a stale claim re-checks for
  * cancellation (a sibling claim may have raced ahead), a cancelled claim
- * marks the stage cancelled outright. Both signal the caller to move on
- * to the next suspended stage without further processing.
+ * marks the stage cancelled when the run really is CANCELLED. Both signal
+ * the caller to move on to the next suspended stage without further
+ * processing.
+ *
+ * A run that is COMPLETED, FAILED or gone is a different story: another
+ * orchestrator finished it (its lease on the stage elapsed while this one
+ * was still replaying, or it held the run when this one read it). The
+ * stage row already carries that outcome and is left untouched — writing
+ * CANCELLED over a COMPLETED stage under a COMPLETED run was the
+ * "cancelled stage in a completed run" seen with two orchestrators.
  *
  * Returns `true` when the caller should `continue` to its next iteration
  * (the intended call-site idiom is
@@ -126,11 +135,14 @@ export async function handleClaimOutcome<T>(
     return true;
   }
   if (claimResult.status === "cancelled") {
-    // Run was cancelled between the outer status check and the Phase-2
-    // transaction. Mark this suspended stage as cancelled and move on;
-    // the Phase-2 writes (stage update, annotations, outbox events) all
-    // rolled back atomically.
-    await markStageCancelled(stageRecord.id, deps);
+    // The run stopped being RUNNING between the outer status check and
+    // the Phase-2 transaction; the Phase-2 writes (stage update,
+    // annotations, outbox events) all rolled back atomically. Only a
+    // genuine cancel marks this stage cancelled — any other terminal
+    // status means another orchestrator finished the stage and the run.
+    if (claimResult.runStatus === "CANCELLED") {
+      await markStageCancelled(stageRecord.id, deps);
+    }
     return true;
   }
   return false;
@@ -151,6 +163,12 @@ export async function failStageAndRun(
   bufferedAnnotations: CreateAnnotationInput[],
   deps: KernelDeps,
 ): Promise<ClaimOutcome<void>> {
+  // Spend so far, read outside the transaction (the logger is not part
+  // of it); the run row carries it on FAILED as it does on COMPLETED.
+  const stages = await deps.persistence.getStagesByRun(
+    stageRecord.workflowRunId,
+  );
+  const totals = await rollUpRunTotals(stageRecord.workflowRunId, stages, deps);
   return withClaimedRun(
     stageRecord.workflowRunId,
     run.version,
@@ -166,6 +184,7 @@ export async function failStageAndRun(
       await tx.updateRun(stageRecord.workflowRunId, {
         status: "FAILED",
         completedAt: deps.clock.now(),
+        ...totals,
       });
 
       if (bufferedAnnotations.length > 0) {

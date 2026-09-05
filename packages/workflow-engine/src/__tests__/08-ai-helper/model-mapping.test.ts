@@ -121,7 +121,7 @@ describe("I want to use batch model mapping utilities", () => {
         },
       });
 
-      const provider = getBestProviderForModel("test-deepseek-batch" as any);
+      const provider = getBestProviderForModel("test-deepseek-batch");
       expect(provider).toBe("openrouter");
     });
   });

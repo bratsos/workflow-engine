@@ -1,6 +1,7 @@
 import { StaleVersionError } from "../../persistence/interface.js";
 import type { RunReapStuckCommand, RunReapStuckResult } from "../commands";
 import type { KernelEvent } from "../events";
+import { servesRun } from "../helpers/definition-pinning.js";
 import type { HandlerResult, KernelDeps } from "../kernel";
 import {
   ACTIVE_STAGE_STATUSES,
@@ -31,6 +32,19 @@ export async function handleRunReapStuck(
       continue;
     }
 
+    // Definition pinning: a run pinned to a version this build does not
+    // present looks exactly like a stuck run from here — nothing on this
+    // host touches it, so neither the run nor its stages are updated and
+    // it crosses the threshold. Reaping it would fail a run that is
+    // perfectly healthy on the build that owns it, which is the one thing
+    // pinning promises never happens. Leave it, as `run.transition` and
+    // `stage.pollSuspended` do; `run.listVersions` reports it and
+    // `run.redrive({ definitionVersion: "latest" })` moves it forward.
+    const pinnedWorkflow = deps.registry.getWorkflow(run.workflowId);
+    if (pinnedWorkflow && !servesRun(run, pinnedWorkflow)) {
+      continue;
+    }
+
     // Recovery sweep: a PENDING stage with no queued job means the run
     // isn't actually dead, it's just missing the job that job.execute
     // needs to pick it up — the classic symptom of the enqueue-outside-
@@ -50,15 +64,33 @@ export async function handleRunReapStuck(
           ),
       );
       if (missingJobStages.length > 0) {
-        await deps.jobTransport.enqueueParallel(
-          missingJobStages.map((stage) => ({
-            workflowRunId: run.id,
-            workflowId: run.workflowId,
-            stageId: stage.stageId,
-            priority: run.priority,
-            payload: { config: run.config || {} },
-          })),
-        );
+        // INVARIANT: no handler enqueues a job from inside the kernel
+        // transaction. The handler body runs under
+        // `persistence.withTransaction`; a job enqueued there is visible
+        // to other workers the instant the queue's own connection
+        // commits, which is *before* this transaction commits — so a
+        // worker can dequeue the job and read stage rows that do not
+        // exist yet, and a rollback leaves a job pointing at state that
+        // was never written. That is the shape that wedged 62 runs in
+        // 100 before alpha.8. Every enqueue goes on `_postCommit`, which
+        // the kernel runs only after the transaction has committed
+        // (kernel.ts, "Runs only now that the transaction has
+        // committed"). Do not move this back inline just because the
+        // enqueue is idempotent and the run is already committed
+        // RUNNING.
+        const jobsToEnqueue = missingJobStages.map((stage) => ({
+          workflowRunId: run.id,
+          workflowId: run.workflowId,
+          stageId: stage.stageId,
+          priority: run.priority,
+          payload: { config: run.config || {} },
+          // See prepare-execution-group.ts: the version travels with the
+          // job so the dequeue can filter on it.
+          definitionVersion: run.definitionVersion,
+        }));
+        postCommits.push(async (postDeps: KernelDeps) => {
+          await postDeps.jobTransport.enqueueParallel(jobsToEnqueue);
+        });
         continue;
       }
     }

@@ -26,7 +26,6 @@ import { createKernel } from "@bratsos/workflow-engine/kernel";
 import {
   CollectingEventSink,
   FakeClock,
-  NoopScheduler,
 } from "@bratsos/workflow-engine/kernel/testing";
 import {
   InMemoryJobQueue,
@@ -94,7 +93,6 @@ async function main(): Promise<void> {
     blobStore: objectStore,
     jobTransport: jobQueue,
     eventSink: new CollectingEventSink(),
-    scheduler: new NoopScheduler(),
     clock,
     registry: {
       getWorkflow: (id: string) => (id === WORKFLOW_ID ? workflow : undefined),

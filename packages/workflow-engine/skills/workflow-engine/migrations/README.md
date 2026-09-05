@@ -170,15 +170,25 @@ Look in the installed package's skill directory:
 node_modules/@bratsos/workflow-engine/skills/workflow-engine/migrations/
 ```
 
-Files are named `migrate-X.Y-to-A.B.md` (semver-tagged). Each one is a self-contained guide for one version step.
+Files are named `migrate-X.Y-to-A.B.md` (semver-tagged). Each one is a self-contained guide for one version step. The chain currently shipped:
+
+| Guide | Hop |
+|---|---|
+| `migrate-0.7-to-0.8.md` | 0.7 → 0.8 |
+| `migrate-0.8-to-0.9.md` | 0.8 → 0.9 |
+| `migrate-0.9-to-0.10.md` | 0.9 → 0.10 |
+| `migrate-0.10-to-0.11.md` | 0.10 → 0.11 |
+| `migrate-0.11-to-0.12.md` | 0.11 → 0.12 |
+| `migrate-0.12-to-0.13.md` | 0.12 → 0.13 |
+| `migrate-0.13-to-1.0.md` | 0.13 → 1.0 (**major**; the 1.0.0 alphas and the 1.0.0 release share it) |
 
 ## Step 4 — Build the ordered migration chain
 
-If the user upgraded `0.6.0 → 0.8.0`, you need to apply migrations in order:
-1. `migrate-0.6-to-0.7.md`
-2. `migrate-0.7-to-0.8.md`
+If the user upgraded `0.7.0 → 0.9.0`, you need to apply migrations in order:
+1. `migrate-0.7-to-0.8.md`
+2. `migrate-0.8-to-0.9.md`
 
-Sort migration files by their source version (the `X.Y` part), filter to those whose source version is `>= previousVersion` and target version is `<= installedVersion`. Apply in ascending order.
+Sort migration files by their source version (the `X.Y` part), filter to those whose source version is `>= previousVersion` and target version is `<= installedVersion`. Apply in ascending order. Compare versions numerically per segment, not as strings: `0.13` sorts after `0.9`, and `1.0` after `0.13`. A prerelease such as `1.0.0-alpha.12` counts as `1.0` — every alpha applies the same `migrate-0.13-to-1.0.md`, and a user moving between two 1.0 alphas re-reads it for the database checklist (the columns and indexes it lists were added across the alphas; every statement is idempotent, so re-running the checklist is safe).
 
 ### Skipping over patch releases
 
@@ -191,7 +201,7 @@ For each migration file, in order:
 1. Read the full migration doc.
 2. Surface the **Required actions** section to the user — these are non-optional.
 3. Apply schema changes if the migration includes them (Prisma migrations, etc.) — confirm with the user before running `prisma migrate dev` or equivalent.
-4. Apply code changes — usually with grep + edit, occasionally manual review.
+4. Apply code changes — usually with grep + edit, occasionally manual review. For the 0.11, 0.12 and 0.13 hops the package ships a codemod: `npx workflow-engine-codemod --from 0.11|0.12|0.13 [--dry-run]` rewrites what it can and flags the rest with a pointer into the guide.
 5. Note any **Deprecations** — these don't break the current version but the user should plan to address them.
 6. Verify by running the project's tests if available.
 

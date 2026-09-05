@@ -11,8 +11,14 @@ import type { GenerateTextEndEvent, ToolSet } from "ai";
 import { streamText as aiStreamText } from "ai";
 import { logFailure } from "./generate";
 import { getModel, type ModelKey } from "./model-helper";
-import { getModelProvider, logger, resolveCost } from "./shared";
+import { logger, resolveCost, resolveLanguageModel } from "./shared";
+import {
+  createCallTimeout,
+  runWithCallTimeout,
+  timeoutErrorIfExpired,
+} from "./timeouts.js";
 import type {
+  AdapterStreamResponse,
   AIHelperContext,
   AIStreamResult,
   StreamOptions,
@@ -26,10 +32,15 @@ export function streamText(
   options: StreamOptions = {},
 ): AIStreamResult {
   const modelConfig = getModel(modelKey);
-  const model =
-    ctx.providerResolver?.(modelConfig) ??
-    getModelProvider(modelConfig, ctx.routing);
+  const model = ctx.adapter?.streamText
+    ? undefined
+    : resolveLanguageModel(ctx, modelConfig);
   const startTime = Date.now();
+  const timeout = createCallTimeout(
+    options.abortSignal,
+    options.timeoutMs ?? ctx.timeout?.perCallMs,
+    modelKey,
+  );
   const hasTools = options.tools !== undefined;
 
   // For logging, extract prompt string
@@ -45,6 +56,7 @@ export function streamText(
   const logError = (error: unknown) => {
     if (errorLogged) return;
     errorLogged = true;
+    const callError = timeoutErrorIfExpired(timeout, error);
 
     logFailure(ctx.aiCallLogger, {
       topic: ctx.topic,
@@ -53,13 +65,14 @@ export function streamText(
       modelId: modelConfig.id,
       prompt: promptForLog,
       startTime,
-      error,
+      error: callError,
       metadata: {
         temperature: options.temperature,
         maxTokens: options.maxTokens,
         ...(input.instructions ? { instructions: input.instructions } : {}),
       },
     });
+    timeout.cleanup();
   };
 
   // Trace log before stream starts
@@ -68,7 +81,7 @@ export function streamText(
     modelId: modelConfig.id,
     prompt:
       promptForLog.substring(0, 500) + (promptForLog.length > 500 ? "..." : ""),
-    temperature: options.temperature ?? 0.7,
+    temperature: options.temperature,
     maxTokens: options.maxTokens,
     hasTools,
     hasInstructions: !!input.instructions,
@@ -148,18 +161,23 @@ export function streamText(
       },
     });
 
+    timeout.cleanup();
+
     return cachedUsage;
   };
 
   // Build the streamText params based on input type
   const baseParams = {
     model,
-    temperature: options.temperature ?? 0.7,
+    // Sent only when the caller sets it (see generate.ts).
+    ...(options.temperature !== undefined && {
+      temperature: options.temperature,
+    }),
     maxOutputTokens: options.maxTokens,
     ...(options.maxRetries !== undefined && {
       maxRetries: options.maxRetries,
     }),
-    ...(options.abortSignal && { abortSignal: options.abortSignal }),
+    ...(timeout.signal && { abortSignal: timeout.signal }),
     ...(input.instructions ? { instructions: input.instructions } : {}),
     // Provider-specific options (e.g. reasoning control) passed through.
     // Cast: the public type uses `unknown` values for DX; the consumer is
@@ -195,25 +213,64 @@ export function streamText(
     },
   };
 
-  const result =
-    "messages" in input && input.messages
-      ? aiStreamText({ ...baseParams, messages: input.messages })
-      : aiStreamText({
-          ...baseParams,
-          prompt: (input as { prompt: string }).prompt,
-        });
+  let adapterResponse: AdapterStreamResponse | undefined;
+  let result: ReturnType<typeof aiStreamText> | undefined;
+  try {
+    if (ctx.adapter?.streamText) {
+      adapterResponse = ctx.adapter.streamText({
+        model: modelConfig,
+        ...("messages" in input && input.messages
+          ? { messages: input.messages }
+          : { prompt: (input as { prompt: string }).prompt }),
+        ...(input.instructions ? { instructions: input.instructions } : {}),
+        options: { ...options, abortSignal: timeout.signal },
+      });
+    } else {
+      result =
+        "messages" in input && input.messages
+          ? aiStreamText({
+              ...baseParams,
+              model: model!,
+              messages: input.messages,
+            })
+          : aiStreamText({
+              ...baseParams,
+              model: model!,
+              prompt: (input as { prompt: string }).prompt,
+            });
+    }
+  } catch (error) {
+    logError(error);
+    throw timeoutErrorIfExpired(timeout, error);
+  }
 
   // Create async iterable that collects text and calls onChunk. This is a
   // thin tap over the AI SDK's own textStream - getUsage/getText/getReasoning
   // (below) reconcile against the buffered result independently.
   const streamIterable: AsyncIterable<string> = {
     [Symbol.asyncIterator]: () => {
-      const reader = result.textStream[Symbol.asyncIterator]();
+      const reader = adapterResponse
+        ? adapterResponse.stream[Symbol.asyncIterator]()
+        : result!.textStream[Symbol.asyncIterator]();
       return {
         async next() {
           try {
-            const { done, value } = await reader.next();
+            const { done, value } = await runWithCallTimeout(timeout, () =>
+              reader.next(),
+            );
             if (done) {
+              if (adapterResponse) {
+                persistUsage(
+                  adapterResponse.inputTokens ?? 0,
+                  adapterResponse.outputTokens ?? 0,
+                  adapterResponse.text ?? fullText,
+                  adapterResponse.reasoning,
+                  {
+                    providerMetadata: adapterResponse.providerMetadata,
+                    costUsd: adapterResponse.costUsd,
+                  },
+                );
+              }
               return { done: true, value: undefined };
             }
             fullText += value;
@@ -223,7 +280,7 @@ export function streamText(
           } catch (error) {
             // Log streaming error before re-throwing
             logError(error);
-            throw error;
+            throw timeoutErrorIfExpired(timeout, error);
           }
         },
       };
@@ -239,33 +296,77 @@ export function streamText(
   // Create usage getter that waits for stream completion and persists
   // (or reuses the persistence already done by onEnd).
   const getUsage = async () => {
-    const usage = await result.usage;
-    const reasoning = await getReasoning();
-    const responseText = (await result.text) || fullText;
-    const inputTokens = usage?.inputTokens ?? 0;
-    const outputTokens = usage?.outputTokens ?? 0;
-    const finalStep = await result.finalStep;
-    const providerMetadata =
-      (await result.providerMetadata) ?? finalStep?.providerMetadata;
+    try {
+      if (timeout.timedOut() && timeout.error) throw timeout.error;
+      if (adapterResponse) {
+        return persistUsage(
+          adapterResponse.inputTokens ?? 0,
+          adapterResponse.outputTokens ?? 0,
+          adapterResponse.text ?? fullText,
+          adapterResponse.reasoning,
+          { providerMetadata: adapterResponse.providerMetadata },
+        );
+      }
+      const sdkResult = result!;
+      const usage = await runWithCallTimeout(timeout, () => sdkResult.usage);
+      const reasoning = await getReasoning();
+      const responseText =
+        (await runWithCallTimeout(timeout, () => sdkResult.text)) || fullText;
+      const inputTokens = usage?.inputTokens ?? 0;
+      const outputTokens = usage?.outputTokens ?? 0;
+      const finalStep = await runWithCallTimeout(
+        timeout,
+        () => sdkResult.finalStep,
+      );
+      const providerMetadata =
+        (await runWithCallTimeout(timeout, () => sdkResult.providerMetadata)) ??
+        finalStep?.providerMetadata;
 
-    return persistUsage(inputTokens, outputTokens, responseText, reasoning, {
-      usage,
-      providerMetadata,
-      finalStep,
-    });
+      return persistUsage(inputTokens, outputTokens, responseText, reasoning, {
+        usage,
+        providerMetadata,
+        finalStep,
+      });
+    } catch (error) {
+      logError(error);
+      throw timeoutErrorIfExpired(timeout, error);
+    }
   };
 
   // Full answer text, reconciled with the buffered result (handles models
   // that don't stream text incrementally). Empty for reasoning-only output.
-  const getText = async () => (await result.text) || fullText;
+  const getText = async () => {
+    try {
+      if (timeout.timedOut() && timeout.error) throw timeout.error;
+      return adapterResponse
+        ? (adapterResponse.text ?? fullText)
+        : (await runWithCallTimeout(timeout, () => result!.text)) || fullText;
+    } catch (error) {
+      logError(error);
+      throw timeoutErrorIfExpired(timeout, error);
+    }
+  };
 
   // Reasoning/thinking text, when the model emitted any (separate channel
   // from the answer). `finalStep.reasoningText` is the canonical v7 source;
   // the top-level (deprecated) field is a fallback for safety. Undefined
   // otherwise.
   const getReasoning = async () => {
-    const finalStep = await result.finalStep;
-    return finalStep?.reasoningText ?? (await result.reasoningText);
+    try {
+      if (timeout.timedOut() && timeout.error) throw timeout.error;
+      if (adapterResponse) return adapterResponse.reasoning;
+      const finalStep = await runWithCallTimeout(
+        timeout,
+        () => result!.finalStep,
+      );
+      return (
+        finalStep?.reasoningText ??
+        (await runWithCallTimeout(timeout, () => result!.reasoningText))
+      );
+    } catch (error) {
+      logError(error);
+      throw timeoutErrorIfExpired(timeout, error);
+    }
   };
 
   return {

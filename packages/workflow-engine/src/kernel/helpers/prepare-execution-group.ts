@@ -1,24 +1,26 @@
 /**
  * Creates (or upserts) the stage records for one execution group and
  * returns a closure that enqueues jobs for the stages that ended up
- * PENDING. The enqueue itself is NOT performed here — most callers must
+ * PENDING. The enqueue itself is NOT performed here — every caller must
  * invoke the returned closure from `_postCommit`, after the transaction
  * that created these stage records has committed. Enqueueing
  * mid-transaction risks an orphan job if the transaction later rolls back
  * (jobTransport isn't part of the DB transaction, so its writes can't be
- * undone). `run.claimPending` is the one exception — see the note at its
- * call site.
+ * undone), and — worse — publishes a job whose run/stage rows are not yet
+ * visible to any other connection, so a fast job loop dequeues it before
+ * the claim commits and `job.execute` sees a still-PENDING run.
  *
  * Shared by three callers whose `attempt`/create semantics are each
  * intentionally different:
  *  - `run.claimPending` (`attemptMode: "none"`, `createMode: "upsert"`):
  *    first execution group of a fresh run; upsert tolerates orphaned
  *    stage rows from a previously-interrupted claim.
- *  - `run.transition` (`attemptMode: "max"`, `createMode: "upsert"`):
- *    propagates the run's current max stage attempt to newly-created
- *    downstream groups, so annotations from a single rerun span share one
- *    attempt value (distinguishable from prior-attempt annotations
- *    preserved via SetNull). Upsert tolerates a re-dispatched transition.
+ *  - `run.transition` (`attemptMode: "none"`, `createMode: "upsert"`):
+ *    a downstream stage that has never executed starts at attempt 0.
+ *    `WorkflowStage.attempt` counts the executions of that stage's own
+ *    row (job retries and `run.rerunFrom` reruns), so an upstream stage's
+ *    retries must not be copied onto it. Upsert tolerates a re-dispatched
+ *    transition.
  *  - `run.rerunFrom` (`attemptMode: "max+1"`, `createMode: "create"`,
  *    `filterPending: false`): the target group's prior stage records were
  *    just deleted, so every record here is guaranteed fresh — `create`
@@ -39,10 +41,9 @@ export interface PrepareExecutionGroupOptions {
   /**
    * How to compute the `attempt` stamped on each new stage record:
    *  - `"none"` — omit `attempt` entirely (persistence defaults to 0).
-   *  - `"max"` — the max `attempt` across the run's existing stage records.
    *  - `"max+1"` — one past the max `attempt` among `attemptSourceStages`.
    */
-  attemptMode: "none" | "max" | "max+1";
+  attemptMode: "none" | "max+1";
   /**
    * `"upsert"` — idempotent create-or-update, safe to call repeatedly
    * (e.g. from a re-dispatched command or an orphaned stage row left by a
@@ -73,13 +74,7 @@ export async function prepareExecutionGroup(
   const stages = workflow.getStagesInExecutionGroup(groupIndex);
 
   let attempt: number | undefined;
-  if (attemptMode === "max") {
-    const existingStages = await deps.persistence.getStagesByRun(run.id);
-    attempt = existingStages.reduce(
-      (max, s) => (s.attempt > max ? s.attempt : max),
-      0,
-    );
-  } else if (attemptMode === "max+1") {
+  if (attemptMode === "max+1") {
     const source = options.attemptSourceStages ?? [];
     attempt =
       source.reduce((max, s) => (s.attempt > max ? s.attempt : max), 0) + 1;
@@ -122,6 +117,9 @@ export async function prepareExecutionGroup(
         stageId: stage.id,
         priority: run.priority,
         payload: { config: run.config || {} },
+        // Carried on the payload so the dequeue can decline a job whose
+        // run this build cannot serve, without joining to workflow_runs.
+        definitionVersion: run.definitionVersion,
       })),
     );
   };

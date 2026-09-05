@@ -7,7 +7,6 @@
 
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { requireStageOutput } from "../../core/schema-helpers.js";
 import { defineStage } from "../../core/stage-factory.js";
 import { WorkflowBuilder } from "../../core/workflow.js";
 import { createTestKernel } from "../utils/index.js";
@@ -570,79 +569,6 @@ describe("I want to access previous stage outputs", () => {
       // Then: ctx.optional returned the data
       expect(optionalResult).toEqual({ optional: "present" });
       expect(r2.output).toEqual({ found: true, value: "present" });
-    });
-  });
-
-  describe("requireStageOutput helper function", () => {
-    it("should get entire stage output", () => {
-      // Given: A workflow context with stage outputs
-      const workflowContext = {
-        "data-extraction": { items: ["a", "b", "c"], count: 3 },
-        validation: { valid: true },
-      };
-
-      // When: Using requireStageOutput
-      const result = requireStageOutput<{ items: string[]; count: number }>(
-        workflowContext,
-        "data-extraction",
-      );
-
-      // Then: Returns the full output
-      expect(result).toEqual({ items: ["a", "b", "c"], count: 3 });
-    });
-
-    it("should get specific field from stage output", () => {
-      // Given: A workflow context with nested data
-      const workflowContext = {
-        guidelines: { guidelines: ["rule1", "rule2"], version: 1 },
-      };
-
-      // When: Using requireStageOutput with field
-      const guidelines = requireStageOutput<string[]>(
-        workflowContext,
-        "guidelines",
-        "guidelines",
-      );
-
-      // Then: Returns just the field
-      expect(guidelines).toEqual(["rule1", "rule2"]);
-    });
-
-    it("should throw for missing stage", () => {
-      // Given: Empty context
-      const workflowContext = {};
-
-      // When/Then: Throws with helpful error
-      expect(() => requireStageOutput(workflowContext, "nonexistent")).toThrow(
-        /Missing output from required stage: nonexistent/,
-      );
-    });
-
-    it("should throw for missing field", () => {
-      // Given: Stage output without requested field
-      const workflowContext = {
-        myStage: { existing: "value" },
-      };
-
-      // When/Then: Throws with available fields
-      expect(() =>
-        requireStageOutput(workflowContext, "myStage", "nonexistent"),
-      ).toThrow(/Missing required field 'nonexistent'/);
-    });
-
-    it("should treat falsy-but-defined outputs (0, '', false) as present, not missing", () => {
-      // Given: Stage outputs that are falsy but not undefined
-      // (matches ctx.require's `=== undefined` semantics)
-      const workflowContext = {
-        "count-stage": 0,
-        "text-stage": "",
-        "flag-stage": false,
-      };
-
-      // When/Then: requireStageOutput returns the falsy value instead of throwing
-      expect(requireStageOutput(workflowContext, "count-stage")).toBe(0);
-      expect(requireStageOutput(workflowContext, "text-stage")).toBe("");
-      expect(requireStageOutput(workflowContext, "flag-stage")).toBe(false);
     });
   });
 

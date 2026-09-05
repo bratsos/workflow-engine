@@ -33,6 +33,15 @@
 import type { z } from "zod";
 import { NoInputSchema } from "./schema-helpers";
 import type { CheckCompletionContext, Stage, StageContext } from "./stage";
+import {
+  DURABLE_SUSPEND_MARKER,
+  isStepControlFlowError,
+  STEP_API_PENDING_CONTROL_FLOW,
+  STEP_API_SETTLE_IN_FLIGHT,
+  type StepApi,
+  type StepInFlight,
+  type StepSuspend,
+} from "./steps.js";
 import type {
   CompletionCheckResult,
   ProgressUpdate,
@@ -75,7 +84,9 @@ export interface EnhancedStageContext<
   TInput,
   TConfig,
   TContext extends Record<string, unknown>,
-> extends Omit<StageContext<TInput, TConfig, TContext>, "onProgress"> {
+> extends Omit<StageContext<TInput, TConfig, TContext>, "onProgress" | "step"> {
+  /** Durable, replayable side effects and waits. */
+  step: StepApi;
   /**
    * Report progress for this stage.
    *
@@ -151,7 +162,6 @@ export interface SimpleSuspendedResult {
     /** Defaults to `pollConfig.maxWaitTime`, or 24h if neither is set. */
     maxWaitTime?: number;
     metadata?: Record<string, unknown>;
-    apiKey?: string;
   };
   /**
    * Optional — derived automatically from `state` when omitted.
@@ -202,7 +212,7 @@ export interface SyncStageDefinition<
    */
   execute: (
     ctx: EnhancedStageContext<InferInput<TInput>, z.infer<TConfig>, TContext>,
-  ) => Promise<SimpleStageResult<z.infer<TOutput>>>;
+  ) => Promise<SimpleStageResult<z.infer<TOutput>> | SimpleSuspendedResult>;
 
   /**
    * Optional: Estimate cost before execution
@@ -446,8 +456,33 @@ function buildStage<
         context as any,
       ) as EnhancedStageContext<InferInput<TInput>, z.infer<TConfig>, TContext>;
 
-      // Call the user's execute function
-      const result = await definition.execute(enhancedContext);
+      // Call the user's execute function. Durable waits use exceptions for
+      // control flow so user code has one linear entry point on every replay.
+      let result: SimpleStageResult<z.infer<TOutput>> | SimpleSuspendedResult;
+      try {
+        result = await definition.execute(enhancedContext);
+      } catch (error) {
+        if (isStepControlFlowError(error)) {
+          // Steps may run concurrently under Promise.all. Let the siblings
+          // still in flight finish and record before the stage suspends —
+          // otherwise the replay meets their live leases as StepInFlight.
+          await enhancedContext.step?.[STEP_API_SETTLE_IN_FLIGHT]?.();
+          return durableControlFlowResult(error);
+        }
+        await enhancedContext.step?.[STEP_API_SETTLE_IN_FLIGHT]?.();
+        throw error;
+      }
+
+      const pendingSuspend =
+        enhancedContext.step?.[STEP_API_PENDING_CONTROL_FLOW]?.();
+      if (pendingSuspend) {
+        enhancedContext.log(
+          "WARN",
+          "execute() returned after a durable step requested suspension; the return value was discarded",
+        );
+        await enhancedContext.step?.[STEP_API_SETTLE_IN_FLIGHT]?.();
+        return durableControlFlowResult(pendingSuspend);
+      }
 
       // If suspended, pass through with auto-filled metrics and derived poll config
       if ("suspended" in result && result.suspended === true) {
@@ -540,35 +575,125 @@ function createEnhancedContext<
 >(
   context: StageContext<TInput, TConfig, TContext>,
 ): EnhancedStageContext<TInput, TConfig, TContext> {
+  const enhancedContext = Object.create(
+    Object.getPrototypeOf(context),
+  ) as EnhancedStageContext<TInput, TConfig, TContext>;
+  Object.defineProperties(
+    enhancedContext,
+    Object.getOwnPropertyDescriptors(context),
+  );
+
+  Object.defineProperties(enhancedContext, {
+    step: {
+      configurable: true,
+      value: context.step,
+    },
+
+    onProgress: {
+      configurable: true,
+      value(
+        update: Omit<ProgressUpdate, "stageId" | "stageName"> &
+          Partial<Pick<ProgressUpdate, "stageId" | "stageName">>,
+      ) {
+        context.onProgress({
+          stageId: context.stageId,
+          stageName: context.stageName,
+          ...update,
+        });
+      },
+    },
+
+    require: {
+      configurable: true,
+      value<K extends keyof TContext>(stageId: K): TContext[K] {
+        const output = context.workflowContext[stageId as string];
+        if (output === undefined) {
+          const availableStages = Object.keys(context.workflowContext);
+          throw new Error(
+            `Missing required stage output: "${String(stageId)}". ` +
+              `Available stages: ${availableStages.length > 0 ? availableStages.join(", ") : "(none)"}`,
+          );
+        }
+        return output as TContext[K];
+      },
+    },
+
+    optional: {
+      configurable: true,
+      value<K extends keyof TContext>(stageId: K): TContext[K] | undefined {
+        return context.workflowContext[stageId as string] as
+          | TContext[K]
+          | undefined;
+      },
+    },
+  });
+
+  return enhancedContext;
+}
+
+function durableSuspendedResult(error: StepSuspend): SuspendedResult {
+  const now = error.at;
+  const nextPollAt = error.nextPollAt;
+  const maxWaitTime = Math.max(0, error.maxWaitUntil.getTime() - now.getTime());
+  const pollInterval =
+    error.pollInterval ?? Math.max(0, nextPollAt.getTime() - now.getTime());
+
   return {
-    ...context,
-
-    onProgress(update) {
-      context.onProgress({
-        stageId: context.stageId,
-        stageName: context.stageName,
-        ...update,
-      });
+    suspended: true,
+    state: {
+      batchId: `step:${error.stepId}`,
+      submittedAt: now.toISOString(),
+      pollInterval,
+      maxWaitTime,
+      metadata: { [DURABLE_SUSPEND_MARKER]: true, stepId: error.stepId },
     },
-
-    require<K extends keyof TContext>(stageId: K): TContext[K] {
-      const output = context.workflowContext[stageId as string];
-      if (output === undefined) {
-        const availableStages = Object.keys(context.workflowContext);
-        throw new Error(
-          `Missing required stage output: "${String(stageId)}". ` +
-            `Available stages: ${availableStages.length > 0 ? availableStages.join(", ") : "(none)"}`,
-        );
-      }
-      return output as TContext[K];
+    pollConfig: {
+      pollInterval,
+      maxWaitTime,
+      nextPollAt,
     },
-
-    optional<K extends keyof TContext>(stageId: K): TContext[K] | undefined {
-      return context.workflowContext[stageId as string] as
-        | TContext[K]
-        | undefined;
+    metrics: {
+      startTime: 0,
+      endTime: 0,
+      duration: 0,
     },
   };
+}
+
+function durableInFlightResult(error: StepInFlight): SuspendedResult {
+  const now = error.at;
+  const nextPollAt = new Date(now.getTime() + 5_000);
+  const maxWaitTime = DEFAULT_MAX_WAIT_TIME_MS;
+
+  return {
+    suspended: true,
+    state: {
+      batchId: `step:${error.stepId}`,
+      submittedAt: now.toISOString(),
+      pollInterval: 5_000,
+      maxWaitTime,
+      metadata: { [DURABLE_SUSPEND_MARKER]: true, stepId: error.stepId },
+    },
+    pollConfig: {
+      pollInterval: 5_000,
+      maxWaitTime,
+      nextPollAt,
+    },
+    metrics: {
+      startTime: 0,
+      endTime: 0,
+      duration: 0,
+    },
+  };
+}
+
+function durableControlFlowResult(
+  error: StepSuspend | StepInFlight,
+): SuspendedResult {
+  if (error.name === "StepSuspend") {
+    return durableSuspendedResult(error as StepSuspend);
+  }
+  return durableInFlightResult(error as StepInFlight);
 }
 
 // ============================================================================
@@ -598,10 +723,13 @@ export type InferStageConfig<T> =
 // ============================================================================
 
 /**
- * Define an async-batch stage with proper type inference for checkCompletion
+ * Define an async-batch stage with proper type inference for checkCompletion.
  *
- * This is a dedicated function (not an alias) to ensure TypeScript properly
- * infers callback parameter types without overload resolution ambiguity.
+ * @internal Not part of the public entry since 1.0: `ctx.step.waitFor` /
+ * `ctx.step.ai.map` replace the suspend + `checkCompletion` pattern (see
+ * 12-durable-steps.md, "Migrating an async-batch stage to steps"). Kept for
+ * the hosts' and the kernel's own async-batch mode tests;
+ * `defineStage({ mode: "async-batch", checkCompletion })` is the same thing.
  */
 export function defineAsyncBatchStage<
   TId extends string,

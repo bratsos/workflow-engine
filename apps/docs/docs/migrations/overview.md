@@ -15,8 +15,10 @@ When upgrading the packages, follow this process to check for breaking changes, 
 
 ### Step 1: Detect Your Version Delta
 Compare your currently installed version (check `package.json` in your node modules or use `npm list @bratsos/workflow-engine`) with the target upgrade version.
-* Migration guides are published for **minor and major version bumps** (e.g. `0.7` to `0.8`).
+* Migration guides are published for **minor and major version bumps** (e.g. `0.7` to `0.8`, `0.13` to `1.0`).
 * Patch releases (e.g. `0.10.1` to `0.10.2`) only contain bug fixes and do not require code changes or database migrations.
+* The 1.0 alphas are one guide: `1.0.0-alpha.x` → `1.0.0-alpha.y` upgrades are covered by the database checklist in the 0.13 → 1.0 guide, which is kept current with every alpha (each statement is idempotent, so re-running it is safe).
+* `npx workflow-engine-codemod --from <version>` flags the removed APIs in your code with a pointer to the relevant guide.
 
 ### Step 2: Build the Ordered Migration Chain
 If you are upgrading across multiple minor versions (e.g., `0.7.0` to `0.10.0`), you must apply the migration guides **sequentially**:
@@ -42,7 +44,8 @@ If a version bump introduces a database schema change (like adding a table or mo
 
 Follow the guides below to migrate your code:
 
-* [Migrating from 0.12 to 0.13](./migrate-0.12-to-0.13.md) (Latest)
+* [Migrating from 0.13 to 1.0](./migrate-0.13-to-1.0.md) (Latest — the `1.0.0-alpha.x` line, installed with the `@alpha` tag)
+* [Migrating from 0.12 to 0.13](./migrate-0.12-to-0.13.md)
 * [Migrating from 0.11 to 0.12](./migrate-0.11-to-0.12.md)
 * [Migrating from 0.10 to 0.11](./migrate-0.10-to-0.11.md)
 * [Migrating from 0.9 to 0.10](./migrate-0.9-to-0.10.md)

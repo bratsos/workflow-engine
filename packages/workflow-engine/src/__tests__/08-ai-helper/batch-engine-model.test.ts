@@ -21,6 +21,11 @@ import {
   resolveAiSdkBatchModel,
   toJsonSchema,
 } from "../../ai/batch";
+import { isMissingPackageError } from "../../ai/batch/ai-sdk.js";
+import {
+  rewriteGoogleBatchBody,
+  toGeminiResponseSchema,
+} from "../../ai/batch/google-json-schema.js";
 
 // Hand-rolled fake Experimental_BatchLanguageModelV4 for testing
 class MockBatchLanguageModel
@@ -359,6 +364,214 @@ describe("Batch Subsystem - AI SDK Adapter (fromAiSdk)", () => {
     });
   });
 
+  it("rewrites oneOf to anyOf for an OpenAI batch model and leaves other vendors' schemas as emitted", async () => {
+    const union = z.object({
+      item: z.discriminatedUnion("kind", [
+        z.object({ kind: z.literal("a") }),
+        z.object({ kind: z.literal("b") }),
+      ]),
+    });
+    for (const [provider, expectOneOf] of [
+      ["openai.responses", false],
+      ["anthropic.messages", true],
+    ] as const) {
+      const mock = new MockBatchLanguageModel();
+      const engineModel = fromAiSdk(mock, { provider, modelId: "m" });
+      await engineModel.start([{ id: "r1", prompt: "p", schema: union }]);
+      const sent = JSON.stringify(
+        (mock.startBatchCalls[0]!.requests[0]!.options.responseFormat as any)
+          .schema,
+      );
+      expect(sent.includes("oneOf")).toBe(expectOneOf);
+      expect(sent.includes("anyOf")).toBe(!expectOneOf);
+    }
+  });
+
+  it("sends the engine's union-preserving responseSchema on Google batches", async () => {
+    const bodies: string[] = [];
+    const mockFetch = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const href = typeof url === "string" ? url : url.toString();
+        expect(href).toContain(":batchGenerateContent");
+        bodies.push(init?.body as string);
+        return new Response(
+          JSON.stringify({
+            name: "batches/abc123",
+            metadata: { state: "BATCH_STATE_PENDING" },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      },
+    );
+    const model = await resolveAiSdkBatchModel("google", "gemini-2.5-flash", {
+      apiKey: "test-key",
+      fetch: mockFetch as never,
+    });
+    const schema = z.object({
+      metadata: z.discriminatedUnion("kind", [
+        z.object({ kind: z.literal("article"), title: z.string() }),
+        z.object({ kind: z.literal("table"), rows: z.number() }),
+      ]),
+    });
+
+    const ref = await model.start([
+      { id: "node-1", prompt: "Describe this", schema },
+      { id: "node-2", prompt: "Plain text, no schema" },
+    ]);
+
+    expect(ref.id).toBe("batches/abc123");
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    const body = JSON.parse(bodies[0]!);
+    const requests = body.batch.inputConfig.requests.requests as Array<{
+      request: { generationConfig: Record<string, unknown> };
+      metadata: { key: string };
+    }>;
+    expect(requests.map((r) => r.metadata.key)).toEqual(["node-1", "node-2"]);
+    const config = requests[0]!.request.generationConfig;
+    // The batch endpoint ignores/rejects responseJsonSchema; only the
+    // OpenAPI responseSchema is enforced there.
+    expect(config.responseJsonSchema).toBeUndefined();
+    expect(config.responseMimeType).toBe("application/json");
+    const responseSchema = config.responseSchema as {
+      properties: {
+        metadata: { anyOf?: Array<Record<string, unknown>>; oneOf?: unknown };
+      };
+    };
+    // The discriminated union survives as anyOf (Gemini has no oneOf, which
+    // is what the provider's own conversion would have sent).
+    expect(responseSchema.properties.metadata.oneOf).toBeUndefined();
+    const branches = responseSchema.properties.metadata.anyOf;
+    expect(branches).toHaveLength(2);
+    expect(branches![0]).toMatchObject({
+      type: "object",
+      properties: { kind: { type: "string", enum: ["article"] } },
+      required: ["kind", "title"],
+    });
+    expect(JSON.stringify(responseSchema)).not.toContain(
+      "additionalProperties",
+    );
+    // The request without a schema is untouched.
+    const plain = requests[1]!.request.generationConfig;
+    expect(plain.responseSchema).toBeUndefined();
+    expect(plain.responseMimeType).toBeUndefined();
+  });
+
+  it("converts a JSON Schema into Gemini's Schema without losing unions, enums, nullability or bounds", () => {
+    const schema = z.object({
+      nodeId: z.string().describe("Echo the id"),
+      tags: z.array(z.string()).min(1).max(3),
+      note: z.string().nullable(),
+      metadata: z.discriminatedUnion("version", [
+        z.object({
+          version: z.literal(1),
+          data: z.union([
+            z.object({ contentType: z.literal("a"), n: z.number() }),
+            z.object({ contentType: z.literal("b"), s: z.string() }),
+          ]),
+          level: z.enum(["low", "high"]).optional(),
+        }),
+      ]),
+    });
+    const gemini = toGeminiResponseSchema(z.toJSONSchema(schema));
+    const text = JSON.stringify(gemini);
+    for (const keyword of [
+      "oneOf",
+      "additionalProperties",
+      "$schema",
+      "const",
+    ]) {
+      expect(text).not.toContain(`"${keyword}"`);
+    }
+    const props = gemini.properties as Record<string, Record<string, unknown>>;
+    expect(props.nodeId).toEqual({
+      type: "string",
+      description: "Echo the id",
+    });
+    expect(props.tags).toMatchObject({
+      type: "array",
+      minItems: 1,
+      maxItems: 3,
+    });
+    expect(props.note).toEqual({ type: "string", nullable: true });
+    // A single-branch oneOf collapses into the branch itself.
+    expect(props.metadata).toMatchObject({
+      type: "object",
+      properties: {
+        version: { type: "number", enum: ["1"], format: "enum" },
+        level: { type: "string", enum: ["low", "high"] },
+      },
+      required: ["version", "data"],
+    });
+    const data = (
+      props.metadata.properties as Record<string, { anyOf: unknown[] }>
+    ).data;
+    expect(data.anyOf).toHaveLength(2);
+    expect(data.anyOf[1]).toMatchObject({
+      properties: { contentType: { type: "string", enum: ["b"] } },
+    });
+  });
+
+  it("rewrites only the requests whose key it knows", () => {
+    const body = {
+      batch: {
+        inputConfig: {
+          requests: {
+            requests: [
+              {
+                request: {
+                  generationConfig: {
+                    responseSchema: { type: "OBJECT" },
+                    responseJsonSchema: { type: "object" },
+                  },
+                },
+                metadata: { key: "a" },
+              },
+              {
+                request: {
+                  generationConfig: { responseSchema: { type: "OBJECT" } },
+                },
+                metadata: { key: "b" },
+              },
+            ],
+          },
+        },
+      },
+    };
+    const rewritten = rewriteGoogleBatchBody(
+      body,
+      new Map([["a", { type: "object", anyOf: [] }]]),
+    );
+    expect(rewritten).toBe(1);
+    const [a, b] = body.batch.inputConfig.requests.requests;
+    expect(a!.request.generationConfig).toEqual({
+      responseMimeType: "application/json",
+      responseSchema: { type: "object", anyOf: [] },
+    });
+    expect(b!.request.generationConfig).toEqual({
+      responseSchema: { type: "OBJECT" },
+    });
+  });
+
+  it("treats every import failure that names the vendor package as a missing package", () => {
+    const withCode = Object.assign(
+      new Error("Cannot find package '@ai-sdk/openai'"),
+      {
+        code: "ERR_MODULE_NOT_FOUND",
+      },
+    );
+    expect(isMissingPackageError(withCode, "@ai-sdk/openai")).toBe(true);
+    // workerd (Cloudflare Workers): no code, its own wording.
+    expect(
+      isMissingPackageError(
+        new Error('No such module "@ai-sdk/openai".'),
+        "@ai-sdk/openai",
+      ),
+    ).toBe(true);
+    expect(isMissingPackageError(new Error("boom"), "@ai-sdk/openai")).toBe(
+      false,
+    );
+  });
+
   it("resolves dynamic AI SDK batch models for supported vendors", async () => {
     const googleModel = await resolveAiSdkBatchModel(
       "google",
@@ -509,6 +722,47 @@ describe("Batch Subsystem - OpenRouter Fetch Client (createOpenRouterBatchModel)
     ).toBeDefined();
   });
 
+  it("sends a discriminated union as anyOf (OpenAI strict mode rejects oneOf)", async () => {
+    let capturedBody = "";
+    const mockFetch = vi.fn(
+      async (_url: string | URL | Request, init?: RequestInit) => {
+        capturedBody = init?.body as string;
+        return new Response(
+          JSON.stringify({ id: "batch-or-union", status: "validating" }),
+          { status: 202, headers: { "Content-Type": "application/json" } },
+        );
+      },
+    );
+    const model = createOpenRouterBatchModel({
+      apiKey: "test-key",
+      modelId: "openai/gpt-5-nano",
+      fetch: mockFetch as any,
+    });
+    const schema = z.object({
+      sections: z.array(
+        z.discriminatedUnion("kind", [
+          z.object({ kind: z.literal("heading"), text: z.string() }),
+          z.object({ kind: z.literal("paragraph"), text: z.string() }),
+        ]),
+      ),
+    });
+
+    await model.start([{ id: "r1", prompt: "Structure this", schema }]);
+
+    const sent =
+      JSON.parse(capturedBody).requests[0].body.response_format.json_schema
+        .schema;
+    expect(JSON.stringify(sent)).not.toContain("oneOf");
+    expect(sent.$schema).toBeUndefined();
+    expect(sent.properties.sections.items.anyOf).toHaveLength(2);
+    expect(sent.properties.sections.items.anyOf[0].additionalProperties).toBe(
+      false,
+    );
+    expect(sent.properties.sections.items.anyOf[0].properties.kind.const).toBe(
+      "heading",
+    );
+  });
+
   it("maps an unrecognized upstream status to failed with a naming error, not to processing", async () => {
     // A renamed or newly added OpenRouter status must not silently poll for
     // 24h; it must fail loudly with the raw status preserved.
@@ -570,6 +824,74 @@ describe("Batch Subsystem - OpenRouter Fetch Client (createOpenRouterBatchModel)
     expect(status.status).toBe("processing");
     // No `total` upstream -> no counts at all, rather than total: 0.
     expect(status.requestCounts).toBeUndefined();
+  });
+
+  it("accepts request_id: null and status_code: null on a completed batch's results (upstream-dependent)", async () => {
+    const mockFetch = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({
+            id: "batch-null-rid",
+            status: "completed",
+            request_counts: { total: 1, completed: 1, failed: 0 },
+            usage: {
+              prompt_tokens: 451,
+              completion_tokens: 977,
+              total_tokens: 1428,
+              cost: 0.00041566,
+              is_byok: null,
+            },
+            results: [
+              {
+                custom_id: "r1",
+                response: {
+                  status_code: null,
+                  request_id: null,
+                  body: {
+                    choices: [{ message: { content: '{"ok":true}' } }],
+                    usage: { prompt_tokens: 451, completion_tokens: 977 },
+                  },
+                },
+                error: null,
+              },
+            ],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+    );
+
+    const model = createOpenRouterBatchModel({
+      apiKey: "test-key",
+      modelId: "openai/gpt-4o",
+      fetch: mockFetch as any,
+    });
+
+    const ref: EngineBatchRef = {
+      version: 1,
+      type: "text",
+      id: "batch-null-rid",
+      provider: "openrouter",
+      modelId: "openai/gpt-4o",
+    };
+
+    const status = await model.status(ref);
+    expect(status.status).toBe("completed");
+    expect(status.requestCounts?.total).toBe(1);
+
+    const items: EngineBatchItemResult[] = [];
+    for await (const item of model.results(ref)) {
+      items.push(item);
+    }
+
+    expect(items).toEqual([
+      {
+        id: "r1",
+        status: "succeeded",
+        text: '{"ok":true}',
+        inputTokens: 451,
+        outputTokens: 977,
+      },
+    ]);
   });
 
   it("maps all 8 upstream OpenRouter statuses correctly", async () => {

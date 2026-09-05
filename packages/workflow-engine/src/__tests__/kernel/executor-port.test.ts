@@ -8,7 +8,6 @@ import {
   CollectingEventSink,
   FakeClock,
   InMemoryBlobStore,
-  NoopScheduler,
 } from "../../kernel/testing/index.js";
 import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
 import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
@@ -22,9 +21,8 @@ function makeInfra() {
   const blobStore = new InMemoryBlobStore();
   const jobTransport = new InMemoryJobQueue("test-worker");
   const eventSink = new CollectingEventSink();
-  const scheduler = new NoopScheduler();
   const clock = new FakeClock();
-  return { persistence, blobStore, jobTransport, eventSink, scheduler, clock };
+  return { persistence, blobStore, jobTransport, eventSink, clock };
 }
 
 function makeSimpleWorkflow() {

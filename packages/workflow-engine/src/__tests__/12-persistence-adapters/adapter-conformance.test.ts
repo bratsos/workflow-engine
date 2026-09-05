@@ -14,23 +14,36 @@
  * - JobQueue interface
  */
 
+import { beforeEach, describe, expect, it } from "vitest";
 import { InMemoryAICallLogger } from "../../testing/in-memory-ai-logger.js";
 import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
 import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
+import { InMemoryStepLedger } from "../../testing/in-memory-step-ledger.js";
 import {
   aiCallLoggerConformanceSuite,
   jobQueueConformanceSuite,
   persistenceConformanceSuite,
+  stepLedgerConformanceSuite,
 } from "../../testing/persistence-conformance.js";
+
+const api = { describe, it, expect, beforeEach };
 
 persistenceConformanceSuite(
   "InMemoryWorkflowPersistence",
   () => new InMemoryWorkflowPersistence(),
+  api,
 );
 
 aiCallLoggerConformanceSuite(
   "InMemoryAICallLogger",
   () => new InMemoryAICallLogger(),
+  api,
 );
 
-jobQueueConformanceSuite("InMemoryJobQueue", () => new InMemoryJobQueue());
+jobQueueConformanceSuite("InMemoryJobQueue", () => new InMemoryJobQueue(), api);
+
+stepLedgerConformanceSuite(
+  "InMemoryStepLedger",
+  () => new InMemoryStepLedger(),
+  api,
+);

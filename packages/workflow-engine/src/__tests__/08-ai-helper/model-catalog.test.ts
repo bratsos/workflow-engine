@@ -13,7 +13,7 @@
  */
 
 import { beforeAll, describe, expect, it } from "vitest";
-import { type ModelKey, registerModels } from "../../ai/model-helper.js";
+import { registerModels } from "../../ai/model-helper.js";
 import {
   deriveBatchCapability,
   NATIVE_BATCH_DISCOUNT_PERCENT,
@@ -51,12 +51,21 @@ function catalogOf(...rows: OpenRouterModel[]) {
 describe("deriveBatchCapability", () => {
   it("native vendor text model with NO catalog sibling is batch-capable via the vendor discount", () => {
     // zertai's default batch model. No ":batch" row exists for it.
-    const m = row("google/gemini-3.1-flash-lite-preview");
+    const m = row("google/gemini-3.1-flash-lite-preview", {
+      prompt: "0.000001",
+      completion: "0.000004",
+    });
     const cap = deriveBatchCapability(m, catalogOf(m));
     expect(cap.supportsAsyncBatch).toBe(true);
-    expect(cap.batchDiscountPercent).toBe(NATIVE_BATCH_DISCOUNT_PERCENT);
     expect(cap.batchModelId).toBeUndefined();
-    expect(cap.batchInputCostPerMillion).toBeUndefined();
+    // The vendor discount is applied to the model's own prices and recorded
+    // as absolute batch prices; the generated file carries no
+    // `batchDiscountPercent` (the 0.13 field the codemod flags).
+    const factor = 1 - NATIVE_BATCH_DISCOUNT_PERCENT / 100;
+    expect(cap.batchInputCostPerMillion).toBe(1 * factor);
+    expect(cap.batchOutputCostPerMillion).toBe(4 * factor);
+    expect(cap).not.toHaveProperty("batchDiscountPercent");
+    expect(cap.batchProvider).toBeUndefined();
   });
 
   it("catalog sibling supplies absolute prices, rounded exactly like base prices", () => {
@@ -73,11 +82,11 @@ describe("deriveBatchCapability", () => {
     expect(cap.batchModelId).toBe("deepseek/deepseek-v4:batch");
     expect(cap.batchInputCostPerMillion).toBe(perMillion("0.0000015"));
     expect(cap.batchOutputCostPerMillion).toBe(perMillion("0.0000075"));
-    // Non-native vendor: no documented discount to fall back on.
-    expect(cap.batchDiscountPercent).toBeUndefined();
+    // Only OpenRouter can batch it: the entry names its transport.
+    expect(cap.batchProvider).toBe("openrouter");
   });
 
-  it("native vendor WITH a sibling carries both: absolute prices for OpenRouter, discount for native", () => {
+  it("native vendor WITH a sibling records the sibling's absolute prices and leaves the transport to the default", () => {
     const m = row("anthropic/claude-sonnet-4.5", {
       prompt: "0.000003",
       completion: "0.000015",
@@ -89,7 +98,8 @@ describe("deriveBatchCapability", () => {
     const cap = deriveBatchCapability(m, catalogOf(m, sib));
     expect(cap.batchModelId).toBe("anthropic/claude-sonnet-4.5:batch");
     expect(cap.batchInputCostPerMillion).toBe(1.5);
-    expect(cap.batchDiscountPercent).toBe(50);
+    expect(cap).not.toHaveProperty("batchDiscountPercent");
+    expect(cap.batchProvider).toBeUndefined();
   });
 
   it("non-native vendor with no sibling is not batch-capable", () => {
@@ -124,7 +134,7 @@ describe("deriveBatchCapability", () => {
     const cap = deriveBatchCapability(emb, catalogOf(emb, sib));
     expect(cap.supportsAsyncBatch).toBe(true);
     expect(cap.batchModelId).toBe("openai/text-embedding-3-small:batch");
-    expect(cap.batchDiscountPercent).toBeUndefined();
+    expect(cap).not.toHaveProperty("batchDiscountPercent");
   });
 
   it("treats a row with no architecture block as a text model (inclusion over exclusion)", () => {
@@ -179,7 +189,6 @@ describe("toModelConfig", () => {
       batchModelId: "google/gemini-2.5-flash:batch",
       batchInputCostPerMillion: 0.15,
       batchOutputCostPerMillion: 1.25,
-      batchDiscountPercent: 50,
       longContextTier: {
         minPromptTokens: 200_000,
         inputCostPerMillion: 0.6,
@@ -233,7 +242,7 @@ describe("transport resolution honours the two signals", () => {
   });
 
   it("a native-only model resolves to its vendor and is NOT reachable via OpenRouter", () => {
-    const key = NATIVE_ONLY as ModelKey;
+    const key = NATIVE_ONLY;
     expect(getBestProviderForModel(key)).toBe("google");
     expect(getProviderModelId(key, "google")).toBe(
       "gemini-3.1-flash-lite-preview",
@@ -248,7 +257,7 @@ describe("transport resolution honours the two signals", () => {
   });
 
   it("a native model with a sibling is reachable through both transports", () => {
-    const key = WITH_SIBLING as ModelKey;
+    const key = WITH_SIBLING;
     expect(getBestProviderForModel(key)).toBe("anthropic");
     expect(getProviderModelId(key, "anthropic")).toBe("claude-sonnet-4.5");
     expect(getProviderModelId(key, "openrouter")).toBe(
@@ -260,7 +269,7 @@ describe("transport resolution honours the two signals", () => {
   });
 
   it("a non-native model with a sibling resolves to OpenRouter", () => {
-    const key = OR_ONLY as ModelKey;
+    const key = OR_ONLY;
     expect(getBestProviderForModel(key)).toBe("openrouter");
     expect(resolveModelForProvider(key, "openrouter")).toBe(
       "deepseek/deepseek-v4",

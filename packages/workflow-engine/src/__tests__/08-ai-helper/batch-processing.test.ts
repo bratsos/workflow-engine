@@ -8,7 +8,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { createAIHelper } from "../../ai/ai-helper.js";
 import { AIBatchImpl } from "../../ai/batch-helper.js";
-import { type ModelKey, registerModels } from "../../ai/model-helper.js";
+import { registerModels } from "../../ai/model-helper.js";
 import {
   createMockAIHelper,
   MockAIBatch,
@@ -48,11 +48,8 @@ describe("I want to process AI requests in batches", () => {
       // Given: Different providers
       // When: I create batches
       const googleBatch = ai.batch("gemini-2.5-flash", "google");
-      const anthropicBatch = ai.batch(
-        "claude-3-5-sonnet" as ModelKey,
-        "anthropic",
-      );
-      const openaiBatch = ai.batch("gpt-4o" as ModelKey, "openai");
+      const anthropicBatch = ai.batch("claude-3-5-sonnet", "anthropic");
+      const openaiBatch = ai.batch("gpt-4o", "openai");
       const openrouterBatch = ai.batch("gemini-2.5-flash", "openrouter");
 
       // Then: All batches are created
@@ -564,7 +561,7 @@ describe("AIBatchImpl and AIHelper batch wiring", () => {
     const { logger } = makeFakeAICallLogger();
     const ai = createAIHelper("test", logger as any);
 
-    expect(() => ai.batch("test-no-batch-model" as any)).toThrowError(
+    expect(() => ai.batch("test-no-batch-model")).toThrowError(
       /No known batch-capable provider found for model "test-no-batch-model"/,
     );
   });

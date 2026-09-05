@@ -145,24 +145,4 @@ describe("kernel: run.create", () => {
     const run = await persistence.getRun(result.workflowRunId);
     expect(run!.priority).toBe(5);
   });
-
-  it("passes metadata through", async () => {
-    const workflow = createSimpleWorkflow();
-    const { kernel, persistence } = createTestKernel([workflow]);
-
-    const result = await kernel.dispatch({
-      type: "run.create",
-      idempotencyKey: "key-1",
-      workflowId: "test-workflow",
-      input: { data: "hello" },
-      metadata: { requestedBy: "user-123" },
-    });
-
-    expect(result.workflowRunId).toBeDefined();
-
-    // Verify metadata is stored as a JSON field on the record (not spread as flat fields)
-    const run = await persistence.getRun(result.workflowRunId);
-    expect(run).not.toBeNull();
-    expect(run!.metadata).toEqual({ requestedBy: "user-123" });
-  });
 });

@@ -11,7 +11,9 @@ import {
   defineAsyncBatchStage,
   defineStage,
 } from "../../core/stage-factory.js";
+import type { StepApi } from "../../core/steps.js";
 import { Workflow, WorkflowBuilder } from "../../core/workflow.js";
+import { createStepApi } from "../../kernel/helpers/step-api.js";
 
 // ============================================================================
 // Simple Stage Factories
@@ -496,3 +498,18 @@ export const TestConfigSchemas = {
     verbose: z.boolean().default(false),
   }),
 };
+
+// ============================================================================
+// Durable step API for hand-built StageContext fixtures
+// ============================================================================
+
+/**
+ * A `StepApi` for tests that build a `StageContext` / `CheckCompletionContext`
+ * by hand. No ledger is wired, so every `ctx.step.*` call throws
+ * `StepLedgerNotConfiguredError` — the documented behaviour for a kernel
+ * without a `stepLedger`. Tests that exercise durable steps go through the
+ * real kernel (see `createTestHarness`) instead.
+ */
+export function createTestStepApi(): StepApi {
+  return createStepApi({ clock: { now: () => new Date() } });
+}

@@ -19,6 +19,7 @@
  * cached result without re-executing the handler.
  */
 
+import { createAIHelper } from "../ai/ai-helper.js";
 import type { Workflow } from "../core/workflow";
 import type {
   AnnotationActor,
@@ -26,11 +27,13 @@ import type {
   AnnotationScope,
   CreateAnnotationInput,
   CreateOutboxEventInput,
+  ServedDefinition,
   WorkflowAnnotationRecord,
 } from "../persistence/interface";
 import type {
   CommandResult,
   JobExecuteResult,
+  JobHeartbeatResult,
   KernelCommand,
   LeaseReapStaleResult,
   OutboxFlushResult,
@@ -38,25 +41,35 @@ import type {
   RunCancelResult,
   RunClaimPendingResult,
   RunCreateResult,
+  RunListVersionsResult,
+  RunPurgeResult,
   RunReapStuckResult,
+  RunRedriveResult,
   RunRerunFromResult,
   RunTransitionResult,
   StagePollSuspendedResult,
+  StepSignalResult,
 } from "./commands";
 import { IdempotencyInProgressError } from "./errors";
 import type { KernelEvent } from "./events";
 import { createLocalExecutor } from "./executor/local-executor.js";
 import { handleJobExecute } from "./handlers/job-execute";
+import { handleJobHeartbeat } from "./handlers/job-heartbeat";
 import { handleLeaseReapStale } from "./handlers/lease-reap-stale";
 import { handleOutboxFlush } from "./handlers/outbox-flush";
 import { handlePluginReplayDLQ } from "./handlers/plugin-replay-dlq";
 import { handleRunCancel } from "./handlers/run-cancel";
 import { handleRunClaimPending } from "./handlers/run-claim-pending";
 import { handleRunCreate } from "./handlers/run-create";
+import { handleRunListVersions } from "./handlers/run-list-versions";
+import { handleRunPurge } from "./handlers/run-purge";
 import { handleRunReapStuck } from "./handlers/run-reap-stuck";
+import { handleRunRedrive } from "./handlers/run-redrive";
 import { handleRunRerunFrom } from "./handlers/run-rerun-from";
 import { handleRunTransition } from "./handlers/run-transition";
 import { handleStagePollSuspended } from "./handlers/stage-poll-suspended";
+import { handleStepSignal } from "./handlers/step-signal.js";
+import { servedDefinitions } from "./helpers/definition-pinning.js";
 import {
   buildAnnotationEvents,
   filterCouldMatchLegacy,
@@ -68,9 +81,11 @@ import type {
   Clock,
   EventSink,
   JobTransport,
+  KernelServices,
   Persistence,
-  Scheduler,
+  StepLedger,
 } from "./ports";
+import { createPayloadSpill, withStepResultSpill } from "./spill.js";
 
 // ============================================================================
 // Public interfaces
@@ -78,6 +93,50 @@ import type {
 
 export interface WorkflowRegistry {
   getWorkflow(id: string): Workflow<any, any> | undefined;
+  /**
+   * Every workflow this process can execute. Optional for backwards
+   * compatibility — but supplying it is what turns version-filtered
+   * claiming on: `run.claimPending` uses it to claim only runs pinned to a
+   * definition version this build actually serves, which is what makes a
+   * rolling deploy safe by construction. Without it, claiming is
+   * unfiltered, as it was before definition versioning.
+   *
+   * `createWorkflowRegistry(workflows)` implements this for you.
+   */
+  listWorkflows?(): ReadonlyArray<Workflow<any, any>>;
+}
+
+/**
+ * Builds a {@link WorkflowRegistry} from a list of built workflows,
+ * including the `listWorkflows` enumeration that enables version-filtered
+ * claiming.
+ *
+ * @example
+ * ```typescript
+ * const kernel = createKernel({
+ *   registry: createWorkflowRegistry([invoiceWorkflow, reportWorkflow]),
+ *   // ...
+ * });
+ * ```
+ */
+export function createWorkflowRegistry(
+  workflows: ReadonlyArray<Workflow<any, any>>,
+): WorkflowRegistry {
+  const byId = new Map<string, Workflow<any, any>>();
+  for (const workflow of workflows) {
+    const existing = byId.get(workflow.id);
+    if (existing && existing !== workflow) {
+      throw new Error(
+        `Two different workflows share the id "${workflow.id}". Workflow ids must be unique within a registry.`,
+      );
+    }
+    byId.set(workflow.id, workflow);
+  }
+  const all = Array.from(byId.values());
+  return {
+    getWorkflow: (id) => byId.get(id),
+    listWorkflows: () => all,
+  };
 }
 
 export interface KernelConfig {
@@ -85,15 +144,13 @@ export interface KernelConfig {
   blobStore: BlobStore;
   jobTransport: JobTransport;
   eventSink: EventSink;
-  /**
-   * @deprecated The Scheduler port is unused by the kernel (zero
-   * `schedule()`/`cancel()` call sites). Omit it — the kernel supplies an
-   * internal no-op. Will be removed at 1.0.
-   */
-  scheduler?: Scheduler;
   clock: Clock;
   registry: WorkflowRegistry;
   executor?: ActivityExecutor;
+  /** Optional durable step storage. Stages without ctx.step need none. */
+  stepLedger?: StepLedger;
+  /** Optional services exposed lazily through stage contexts. */
+  services?: KernelServices;
   /**
    * How long an idempotency key may sit `in_progress` before a subsequent
    * dispatch is allowed to reclaim it. Guards against a dispatcher that
@@ -104,6 +161,22 @@ export interface KernelConfig {
    * `Infinity` to disable reclaiming.
    */
   idempotencyStaleInProgressMs?: number;
+  /**
+   * Soft threshold, in bytes of serialised JSON, above which a durable step
+   * result is written to `blobStore` and the ledger row keeps only a
+   * reference. Defaults to `DEFAULT_SPILL_THRESHOLD_BYTES` (64 KiB).
+   *
+   * There is no hard ceiling above it — a payload larger than the threshold
+   * is spilled, never rejected. Reads resolve the reference before the
+   * value reaches the stage, so `ctx.step.run(...)` returns what it stored
+   * either way. Set to `Number.POSITIVE_INFINITY` to keep every result
+   * inline; already-spilled results still resolve on read.
+   *
+   * Job payloads use the same mechanism but are opt-in at wiring time,
+   * because the transport is shared with the host: see
+   * `createSpillingJobTransport`.
+   */
+  spillThresholdBytes?: number;
 }
 
 /** Default TTL after which a stuck `in_progress` idempotency key can be reclaimed. */
@@ -149,6 +222,16 @@ export interface KernelAnnotations {
 export interface Kernel {
   dispatch<T extends KernelCommand>(command: T): Promise<CommandResult<T>>;
   annotations: KernelAnnotations;
+  /**
+   * The `(workflowId, version)` pairs this kernel's registry presents, or
+   * `undefined` when the registry cannot enumerate (in which case nothing
+   * is filtered, the pre-1.0 behaviour).
+   *
+   * Hosts read it to narrow their job dequeue the same way
+   * `run.claimPending` narrows claiming, so the decision "can this process
+   * do this work" is made once and applied in every query that takes work.
+   */
+  servedDefinitions(): readonly ServedDefinition[] | undefined;
 }
 
 // ============================================================================
@@ -160,10 +243,11 @@ export interface KernelDeps {
   blobStore: BlobStore;
   jobTransport: JobTransport;
   eventSink: EventSink;
-  scheduler?: Scheduler;
   clock: Clock;
   registry: WorkflowRegistry;
   executor: ActivityExecutor;
+  stepLedger?: StepLedger;
+  services?: KernelServices;
 }
 
 // ============================================================================
@@ -191,6 +275,7 @@ function getIdempotencyKey(command: KernelCommand): string | undefined {
   if (command.type === "run.create") return command.idempotencyKey;
   if (command.type === "job.execute") return command.idempotencyKey;
   if (command.type === "run.rerunFrom") return command.idempotencyKey;
+  if (command.type === "run.redrive") return command.idempotencyKey;
   return undefined;
 }
 
@@ -201,29 +286,23 @@ type AnyCommandResult =
   | RunTransitionResult
   | RunCancelResult
   | RunRerunFromResult
+  | RunRedriveResult
+  | RunListVersionsResult
   | JobExecuteResult
+  | JobHeartbeatResult
   | StagePollSuspendedResult
+  | StepSignalResult
   | LeaseReapStaleResult
   | OutboxFlushResult
   | PluginReplayDLQResult
-  | RunReapStuckResult;
+  | RunReapStuckResult
+  | RunPurgeResult;
 
 /** Strip the internal `_events`/`_postCommit` fields off a handler result. */
 function stripEvents<R>(result: HandlerResult<R>): R {
   const { _events, _postCommit, ...rest } = result;
   return rest as R;
 }
-
-/**
- * No-op `Scheduler` supplied when `KernelConfig.scheduler` is omitted. The
- * Scheduler port is unused by the kernel today — see the @deprecated note
- * on `kernel/testing/noop-scheduler.ts`, which remains for existing test
- * fixtures that still construct one explicitly.
- */
-const internalNoopScheduler: Scheduler = {
-  async schedule() {},
-  async cancel() {},
-};
 
 // ============================================================================
 // Factory
@@ -235,22 +314,45 @@ export function createKernel(config: KernelConfig): Kernel {
 
   // Default to LocalExecutor if none provided
   const executor = config.executor ?? createLocalExecutor();
-  // The Scheduler port is unused by the kernel (see internalNoopScheduler
-  // above) — default so callers aren't required to supply one.
-  const scheduler = config.scheduler ?? internalNoopScheduler;
   const idempotencyStaleInProgressMs =
     config.idempotencyStaleInProgressMs ??
     DEFAULT_IDEMPOTENCY_STALE_IN_PROGRESS_MS;
+  const services = config.services
+    ? {
+        ...config.services,
+        ...(config.services.aiLogger && !config.services.ai
+          ? { ai: createAIHelper }
+          : {}),
+      }
+    : undefined;
+
+  // Durable step results are the largest thing the engine writes per row
+  // and are read back in full on every replay, so the ledger is spilled
+  // through the blob store above a soft threshold. The kernel owns every
+  // read and write of this port, so wrapping it here is invisible to
+  // callers — see kernel/spill.ts.
+  const stepLedger = config.stepLedger
+    ? withStepResultSpill(
+        config.stepLedger,
+        createPayloadSpill({
+          blobStore,
+          ...(config.spillThresholdBytes !== undefined
+            ? { thresholdBytes: config.spillThresholdBytes }
+            : {}),
+        }),
+      )
+    : undefined;
 
   const deps: KernelDeps = {
     persistence,
     blobStore,
     jobTransport,
     eventSink,
-    scheduler,
     clock,
     registry,
     executor,
+    stepLedger,
+    services,
   };
 
   /**
@@ -325,6 +427,15 @@ export function createKernel(config: KernelConfig): Kernel {
     }
 
     // -----------------------------------------------------------------
+    // job.heartbeat routes directly — a lease touch and two reads, no
+    // outbox write, no idempotency, no transaction.
+    // -----------------------------------------------------------------
+    if (command.type === "job.heartbeat") {
+      const result = await handleJobHeartbeat(command, deps);
+      return stripEvents(result);
+    }
+
+    // -----------------------------------------------------------------
     // job.execute manages its own multi-phase transactions so that
     // RUNNING status is visible immediately and long-running stage
     // execution does not hold a database transaction open.
@@ -365,11 +476,23 @@ export function createKernel(config: KernelConfig): Kernel {
           case "run.rerunFrom":
             result = await handleRunRerunFrom(command, txDeps);
             break;
+          case "run.redrive":
+            result = await handleRunRedrive(command, txDeps);
+            break;
+          case "run.listVersions":
+            result = await handleRunListVersions(command, txDeps);
+            break;
+          case "step.signal":
+            result = await handleStepSignal(command, txDeps);
+            break;
           case "lease.reapStale":
             result = await handleLeaseReapStale(command, txDeps);
             break;
           case "run.reapStuck":
             result = await handleRunReapStuck(command, txDeps);
+            break;
+          case "run.purge":
+            result = await handleRunPurge(command, txDeps);
             break;
           default: {
             const _exhaustive: never = command;
@@ -508,5 +631,9 @@ export function createKernel(config: KernelConfig): Kernel {
     },
   };
 
-  return { dispatch, annotations };
+  return {
+    dispatch,
+    annotations,
+    servedDefinitions: () => servedDefinitions(config.registry),
+  };
 }

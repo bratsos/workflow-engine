@@ -6,17 +6,12 @@
  */
 
 import type { Workflow } from "@bratsos/workflow-engine";
-import {
-  defineAsyncBatchStage,
-  defineStage,
-  WorkflowBuilder,
-} from "@bratsos/workflow-engine";
-import { createKernel } from "@bratsos/workflow-engine/kernel";
+import { defineStage, WorkflowBuilder } from "@bratsos/workflow-engine";
+import { createKernel, type Kernel } from "@bratsos/workflow-engine/kernel";
 import {
   CollectingEventSink,
   FakeClock,
   InMemoryBlobStore,
-  NoopScheduler,
 } from "@bratsos/workflow-engine/kernel/testing";
 import {
   InMemoryJobQueue,
@@ -89,7 +84,7 @@ function createTwoStageWorkflow(): Workflow<any, any> {
 }
 
 function createAsyncBatchWorkflow(): Workflow<any, any> {
-  const stage = defineAsyncBatchStage({
+  const stage = defineStage({
     id: "batch-stage",
     name: "Batch Stage",
     mode: "async-batch",
@@ -131,7 +126,6 @@ function createTestEnv(workflows: Workflow<any, any>[] = []) {
   const blobStore = new InMemoryBlobStore();
   const jobTransport = new InMemoryJobQueue("test-worker");
   const eventSink = new CollectingEventSink();
-  const scheduler = new NoopScheduler();
   const clock = new FakeClock();
 
   const registry = new Map<string, Workflow<any, any>>();
@@ -144,9 +138,11 @@ function createTestEnv(workflows: Workflow<any, any>[] = []) {
     blobStore,
     jobTransport,
     eventSink,
-    scheduler,
     clock,
-    registry: { getWorkflow: (id) => registry.get(id) },
+    registry: {
+      getWorkflow: (id) => registry.get(id),
+      listWorkflows: () => Array.from(registry.values()),
+    },
   });
 
   return { kernel, persistence, blobStore, jobTransport, eventSink, clock };
@@ -216,6 +212,93 @@ describe("NodeHost", () => {
     const stats = host.getStats();
     expect(stats.jobsProcessed).toBe(1);
     expect(stats.isRunning).toBe(true);
+    expect(stats.eventSink.status).toBe("healthy");
+  });
+
+  it("purges finished runs past the retention age when retention is set", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, persistence, jobTransport } = createTestEnv([workflow]);
+
+    const { workflowRunId } = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "retention-1",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+
+    host = createNodeHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+      orchestrationIntervalMs: 50,
+      jobPollIntervalMs: 20,
+      staleLeaseThresholdMs: 60_000,
+      retention: { olderThanMs: 0 },
+    });
+    await host.start();
+
+    // The run completes on the job loop; the next orchestration tick's
+    // run.purge deletes it, since it is past a zero retention age.
+    await waitFor(
+      async () => (await persistence.getRun(workflowRunId)) === null,
+    );
+
+    expect(host.getStats().jobsProcessed).toBe(1);
+    expect(await persistence.getStagesByRun(workflowRunId)).toEqual([]);
+  });
+
+  it("names the event sink degraded and still runs the workflow to completion", async () => {
+    const workflow = createSimpleWorkflow();
+    // Built by hand rather than through createTestEnv: this is the one test
+    // whose sink is not a CollectingEventSink.
+    const persistence = new InMemoryWorkflowPersistence();
+    const jobTransport = new InMemoryJobQueue("test-worker");
+    const kernel = createKernel({
+      persistence,
+      blobStore: new InMemoryBlobStore(),
+      jobTransport,
+      eventSink: {
+        async emit() {
+          throw new Error("sink down");
+        },
+      },
+      clock: new FakeClock(),
+      registry: {
+        getWorkflow: (id) => (id === workflow.id ? workflow : undefined),
+      },
+    });
+
+    await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "sink-down-1",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+
+    host = createNodeHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+      orchestrationIntervalMs: 50,
+      jobPollIntervalMs: 20,
+      staleLeaseThresholdMs: 60_000,
+      flushOutboxOnStop: false,
+    });
+    await host.start();
+
+    // The poller, not the sink, is what advances a run: it completes.
+    await waitFor(async () => {
+      const runs = await persistence.getRunsByStatus("COMPLETED");
+      return runs.length > 0;
+    });
+    // ...and the state is named and readable from the host's status.
+    await waitFor(async () => host!.getStats().eventSink.status === "degraded");
+
+    const stats = host.getStats();
+    expect(stats.eventSink.status).toBe("degraded");
+    expect(stats.eventSink.consecutiveFailures).toBeGreaterThan(0);
+    expect(stats.eventSink.lastError).toContain("sink down");
+    expect(stats.eventSink.since).not.toBeNull();
   });
 
   it("processes a two-stage workflow end-to-end", async () => {
@@ -322,6 +405,59 @@ describe("NodeHost", () => {
     expect(stats.workerId).toBe("test-worker");
   });
 
+  it("skips interval firings while a tick is in flight and waits for it on stop()", async () => {
+    const { kernel, jobTransport } = createTestEnv([]);
+
+    // Hold the first tick inside stage.pollSuspended until released, as a
+    // replay that outlasts the interval would.
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let held = false;
+    let tickFinished = false;
+    const slowKernel = {
+      dispatch: async (command: Parameters<Kernel["dispatch"]>[0]) => {
+        if (command.type === "stage.pollSuspended" && !held) {
+          held = true;
+          await gate;
+        }
+        const result = await kernel.dispatch(command as never);
+        // run.reapStuck is the last command of a maintenance tick.
+        if (command.type === "run.reapStuck") tickFinished = true;
+        return result;
+      },
+    } as unknown as Kernel;
+
+    host = createNodeHost({
+      kernel: slowKernel,
+      jobTransport,
+      workerId: "test-worker",
+      orchestrationIntervalMs: 10,
+      jobPollIntervalMs: 20,
+    });
+
+    await host.start();
+    // Many interval firings elapse while the first tick is still held.
+    await new Promise((r) => setTimeout(r, 100));
+    expect(held).toBe(true);
+    expect(host.getStats().orchestrationTicks).toBe(1);
+
+    // stop() does not resolve until the in-flight tick has finished.
+    let stopped = false;
+    const stopping = host.stop().then(() => {
+      stopped = true;
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(stopped).toBe(false);
+    expect(tickFinished).toBe(false);
+
+    release();
+    await stopping;
+    expect(tickFinished).toBe(true);
+    expect(host.getStats().orchestrationTicks).toBe(1);
+  });
+
   it("calling start() twice is safe", async () => {
     const { kernel, jobTransport } = createTestEnv([]);
 
@@ -404,6 +540,133 @@ describe("NodeHost", () => {
     );
     expect(failedEvents.length).toBeGreaterThan(0);
     expect((failedEvents[0] as any).error).toContain("deterministic failure");
+  });
+
+  it("retries a failed stage through the queue and never marks it FAILED", async () => {
+    let calls = 0;
+    const seen: string[] = [];
+    const flaky = defineStage({
+      id: "flaky",
+      name: "Flaky",
+      schemas: { input: schema, output: outputSchema, config: z.object({}) },
+      async execute(ctx) {
+        calls++;
+        if (calls === 1) throw new Error("transient failure");
+        return { output: { result: ctx.input.data.toUpperCase() } };
+      },
+    });
+    const workflow = new WorkflowBuilder(
+      "flaky-wf",
+      "Flaky",
+      "Test",
+      schema,
+      outputSchema,
+    )
+      .pipe(flaky)
+      .build();
+    const { kernel, persistence, jobTransport } = createTestEnv([workflow]);
+    const created = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "flaky-1",
+      workflowId: "flaky-wf",
+      input: { data: "hello" },
+    });
+    // Sample the stage status while the host works.
+    const sampler = setInterval(() => {
+      void persistence.getStagesByRun(created.workflowRunId).then((stages) => {
+        for (const s of stages) seen.push(s.status);
+      });
+    }, 5);
+
+    host = createNodeHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+      orchestrationIntervalMs: 50,
+      jobPollIntervalMs: 20,
+    });
+    await host.start();
+    await waitFor(async () => {
+      const run = await persistence.getRun(created.workflowRunId);
+      return run?.status === "COMPLETED";
+    }, 5_000);
+    clearInterval(sampler);
+
+    expect(calls).toBe(2);
+    expect(seen).not.toContain("FAILED");
+    const run = await persistence.getRun(created.workflowRunId);
+    expect(run?.output).toEqual({ result: "HELLO" });
+  });
+
+  it("flushes the outbox on stop() so a run finished by this process is published", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, persistence, jobTransport, eventSink } = createTestEnv([
+      workflow,
+    ]);
+    const created = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "stop-flush-1",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+
+    host = createNodeHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+      // One immediate tick claims the run; no further tick will flush.
+      orchestrationIntervalMs: 60_000,
+      jobPollIntervalMs: 20,
+    });
+    await host.start();
+    await waitFor(async () => {
+      const run = await persistence.getRun(created.workflowRunId);
+      return run?.status === "COMPLETED";
+    }, 5_000);
+    expect(eventSink.events.some((e) => e.type === "workflow:completed")).toBe(
+      false,
+    );
+
+    await host.stop();
+
+    expect(eventSink.events.some((e) => e.type === "workflow:completed")).toBe(
+      true,
+    );
+  });
+
+  it("acknowledges a dead job and keeps processing the queue", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, persistence, jobTransport } = createTestEnv([workflow]);
+    await jobTransport.enqueueParallel([
+      {
+        workflowRunId: "run-that-does-not-exist",
+        workflowId: "test-workflow",
+        stageId: "stage-1",
+        payload: {},
+      },
+    ]);
+    const created = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "after-dead-1",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+
+    host = createNodeHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+      orchestrationIntervalMs: 50,
+      jobPollIntervalMs: 20,
+    });
+    await host.start();
+
+    await waitFor(async () => {
+      const run = await persistence.getRun(created.workflowRunId);
+      return run?.status === "COMPLETED";
+    }, 5_000);
+    expect(host.getStats().jobsProcessed).toBeGreaterThanOrEqual(2);
+    expect(await jobTransport.dequeue()).toBeNull();
   });
 
   it("renews a job's lease while it executes (heartbeat)", async () => {
@@ -506,5 +769,85 @@ describe("NodeHost", () => {
     expect(types).toContain("workflow:created");
     expect(types).toContain("workflow:started");
     expect(types).toContain("workflow:completed");
+  });
+
+  it('serves: "all" claims a run pinned to a version this build does not present', async () => {
+    const stage = createPassthroughStage("stage-1");
+    const workflow = new WorkflowBuilder(
+      "wf",
+      "Test Workflow",
+      "Test",
+      schema,
+      outputSchema,
+    )
+      .pipe(stage)
+      .build();
+    const { kernel, persistence, jobTransport } = createTestEnv([workflow]);
+
+    const run = await persistence.createRun({
+      workflowId: "wf",
+      workflowName: "Test Workflow",
+      workflowType: "test",
+      input: { data: "hello" },
+      definitionVersion: "v-from-another-build",
+    });
+
+    host = createNodeHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+      serves: "all",
+      orchestrationIntervalMs: 50,
+      jobPollIntervalMs: 20,
+    });
+    await host.start();
+
+    await waitFor(async () => {
+      const persisted = await persistence.getRun(run.id);
+      return persisted?.status === "RUNNING";
+    });
+    await host.stop();
+    host = null;
+
+    const persisted = await persistence.getRun(run.id);
+    expect(persisted?.status).toBe("RUNNING");
+  });
+
+  it("without serves the same run is left for the build that presents it", async () => {
+    const stage = createPassthroughStage("stage-1");
+    const workflow = new WorkflowBuilder(
+      "wf",
+      "Test Workflow",
+      "Test",
+      schema,
+      outputSchema,
+    )
+      .pipe(stage)
+      .build();
+    const { kernel, persistence, jobTransport } = createTestEnv([workflow]);
+
+    const run = await persistence.createRun({
+      workflowId: "wf",
+      workflowName: "Test Workflow",
+      workflowType: "test",
+      input: { data: "hello" },
+      definitionVersion: "v-from-another-build",
+    });
+
+    host = createNodeHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+      orchestrationIntervalMs: 20,
+      jobPollIntervalMs: 20,
+    });
+    await host.start();
+
+    await waitFor(async () => host!.getStats().orchestrationTicks >= 1);
+    await host.stop();
+    host = null;
+
+    const persisted = await persistence.getRun(run.id);
+    expect(persisted?.status).toBe("PENDING");
   });
 });

@@ -1,0 +1,77 @@
+/**
+ * Deterministic external-effect keys for durable steps.
+ *
+ * A `ctx.step.run` body that calls a non-idempotent external API has a window
+ * in which the call has taken effect but the ledger has not recorded it: the
+ * worker dies, the lease expires, and the replay re-executes the body. The
+ * engine cannot make that call idempotent, but it can hand the body a name for
+ * the effect that is identical on every replay, so the body can either ask the
+ * provider to dedupe on it or search for the effect it already created.
+ *
+ * The key is derived from the stage record id and the step id — the pair that
+ * identifies the step across every replay — so it needs no storage to be
+ * stable. It is nonetheless written to the step row before the body runs, so
+ * an operator holding a run can read the key straight out of the database and
+ * search a provider for the orphaned effect.
+ *
+ * Shape: `wfe-<32 lowercase hex>` (36 characters, `[a-z0-9-]` only), which
+ * fits every field the batch adapters stamp it into — Anthropic's
+ * `^[a-zA-Z0-9_-]{1,64}$` custom ids, OpenAI's 512-character metadata values
+ * and Gemini's free-text `displayName`.
+ */
+
+const FNV_OFFSET_128 = 0x6c62272e07bb014262b821756295c58dn;
+const FNV_PRIME_128 = 0x0000000001000000000000000000013bn;
+const MASK_128 = (1n << 128n) - 1n;
+
+/**
+ * FNV-1a, 128-bit. Pure BigInt arithmetic: no `node:crypto` (which the
+ * serverless hosts cannot import synchronously) and no async digest, because
+ * the key must be derivable inside the claim that precedes the body.
+ */
+function fnv1a128Hex(input: string): string {
+  const bytes = new TextEncoder().encode(input);
+  let hash = FNV_OFFSET_128;
+  for (const byte of bytes) {
+    hash ^= BigInt(byte);
+    hash = (hash * FNV_PRIME_128) & MASK_128;
+  }
+  return hash.toString(16).padStart(32, "0");
+}
+
+/** Prefix every engine-issued external key carries. */
+export const STEP_EXTERNAL_KEY_PREFIX = "wfe";
+
+/**
+ * The external-effect key for a step. Identical for the same
+ * `(stageRecordId, stepId)` pair on every replay, in every process.
+ */
+export function deriveStepExternalKey(
+  stageRecordId: string,
+  stepId: string,
+): string {
+  const digest = fnv1a128Hex(`${stageRecordId}\u0000${stepId}`);
+  return `${STEP_EXTERNAL_KEY_PREFIX}-${digest}`;
+}
+
+/**
+ * Sub-key for one of several effects a single step creates — a batch submit
+ * that fans out across partitions needs one key per partition, and the
+ * partitioning is deterministic, so `index` is stable across replays too.
+ */
+export function stepExternalKeyPart(
+  externalKey: string,
+  index: number,
+): string {
+  return `${externalKey}-p${index}`;
+}
+
+/** Whether `value` looks like a key this engine issued. */
+export function isStepExternalKey(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    new RegExp(`^${STEP_EXTERNAL_KEY_PREFIX}-[0-9a-f]{32}(-p\\d+)?$`).test(
+      value,
+    )
+  );
+}

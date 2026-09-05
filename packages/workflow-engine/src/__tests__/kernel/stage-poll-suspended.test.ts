@@ -6,6 +6,8 @@ import {
 } from "../../core/stage-factory.js";
 import { WorkflowBuilder } from "../../core/workflow.js";
 import type { Kernel } from "../../kernel/kernel.js";
+import { FakeClock } from "../../kernel/testing/fake-clock.js";
+import { InMemoryStepLedger } from "../../testing/in-memory-step-ledger.js";
 import { createTestKernel } from "../utils/index.js";
 
 function createPassthroughStage(id: string, schema: z.ZodTypeAny) {
@@ -746,5 +748,489 @@ describe("kernel: stage.pollSuspended", () => {
 
     const updatedStage = await persistence.getStage(run.id, "batch-stage");
     expect(updatedStage?.status).toBe("CANCELLED");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 0: a poller claims a suspended stage before doing any work on it
+// ---------------------------------------------------------------------------
+
+/**
+ * Runs a durable stage up to its first suspension: the body calls
+ * `ctx.step.waitFor` whose `poll` is supplied by the test, so a replay can
+ * be made to complete, or to hang until the test releases it.
+ */
+async function suspendDurableWait(
+  poll: () => Promise<{ done: boolean }>,
+  timeoutMs = 60 * 60 * 1000,
+) {
+  let executions = 0;
+  const stage = defineStage({
+    id: "wait",
+    name: "Wait",
+    schemas: {
+      input: z.object({}),
+      output: z.object({ done: z.boolean() }),
+      config: z.object({}),
+    },
+    async execute(ctx) {
+      executions++;
+      const value = await ctx.step.waitFor("external", {
+        poll,
+        ready: (result) => result.done,
+        every: 1_000,
+        timeout: timeoutMs,
+      });
+      return { output: value };
+    },
+  });
+  const workflow = new WorkflowBuilder(
+    "claimed",
+    "Claimed",
+    "test",
+    z.object({}),
+    z.object({ done: z.boolean() }),
+  )
+    .pipe(stage)
+    .build();
+  const clock = new FakeClock();
+  const env = createTestKernel([workflow], {
+    clock,
+    stepLedger: new InMemoryStepLedger({ now: () => clock.now() }),
+  });
+  const created = await env.kernel.dispatch({
+    type: "run.create",
+    idempotencyKey: "claimed",
+    workflowId: workflow.id,
+    input: {},
+  });
+  await env.kernel.dispatch({ type: "run.claimPending", workerId: "worker" });
+  await env.kernel.dispatch({
+    type: "job.execute",
+    workflowRunId: created.workflowRunId,
+    workflowId: workflow.id,
+    stageId: stage.id,
+    config: {},
+  });
+  env.eventSink.clear();
+  return {
+    ...env,
+    runId: created.workflowRunId,
+    /** Replays so far: executions beyond the first (suspending) one. */
+    replays: () => executions - 1,
+  };
+}
+
+/**
+ * A `poll` that suspends the first execution (not ready), holds the first
+ * replay until the test releases it, and answers ready to any later one.
+ */
+function gatedPoll() {
+  let calls = 0;
+  let release!: (value: { done: boolean }) => void;
+  const gate = new Promise<{ done: boolean }>((resolve) => {
+    release = resolve;
+  });
+  return {
+    poll: async () => {
+      calls++;
+      if (calls === 1) return { done: false };
+      if (calls === 2) return gate;
+      return { done: true };
+    },
+    release,
+  };
+}
+
+/** Lets a dispatched-but-unawaited poll run up to its first real wait. */
+const settle = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+describe("kernel: stage.pollSuspended claims a stage before working on it", () => {
+  it("runs the body once when two polls race for the same suspended stage", async () => {
+    let ready = false;
+    const env = await suspendDurableWait(async () => ({ done: ready }));
+    ready = true;
+    env.clock.advance(1_000);
+
+    const [first, second] = await Promise.all([
+      env.kernel.dispatch({ type: "stage.pollSuspended" }),
+      env.kernel.dispatch({ type: "stage.pollSuspended" }),
+    ]);
+
+    expect(env.replays()).toBe(1);
+    expect(first.resumed + second.resumed).toBe(1);
+    const stage = await env.persistence.getStage(env.runId, "wait");
+    expect(stage?.status).toBe("COMPLETED");
+    expect(stage?.nextPollAt).toBeNull();
+
+    await env.kernel.dispatch({
+      type: "run.transition",
+      workflowRunId: env.runId,
+    });
+    expect((await env.persistence.getRun(env.runId))?.status).toBe("COMPLETED");
+    await env.flush();
+    expect(env.eventSink.getByType("stage:completed")).toHaveLength(1);
+  });
+
+  it("bounds the claim lease by maxWaitUntil so a timeout is still noticed", async () => {
+    const gate = gatedPoll();
+    const env = await suspendDurableWait(gate.poll, 10_000);
+    const before = await env.persistence.getStage(env.runId, "wait");
+    expect(before?.maxWaitUntil).toEqual(
+      new Date(env.clock.now().getTime() + 10_000),
+    );
+    env.clock.advance(1_000);
+
+    const inFlight = env.kernel.dispatch({ type: "stage.pollSuspended" });
+    await settle();
+
+    // Held by this poller: nextPollAt is the deadline, not now + 60s.
+    const held = await env.persistence.getStage(env.runId, "wait");
+    expect(held?.status).toBe("SUSPENDED");
+    expect(held?.nextPollAt).toEqual(before?.maxWaitUntil);
+    expect(held?.version).toBe(before!.version + 1);
+
+    gate.release({ done: true });
+    expect((await inFlight).resumed).toBe(1);
+    expect(
+      (await env.persistence.getStage(env.runId, "wait"))?.nextPollAt,
+    ).toBeNull();
+  });
+
+  it("re-polls a stage whose claimant died once the lease elapses", async () => {
+    const gate = gatedPoll();
+    const env = await suspendDurableWait(gate.poll);
+    env.clock.advance(1_000);
+    const claimedAt = env.clock.now().getTime();
+
+    // First poller claims and then "dies" mid-replay (its body never
+    // returns within the lease).
+    const dead = env.kernel.dispatch({ type: "stage.pollSuspended" });
+    await settle();
+    const held = await env.persistence.getStage(env.runId, "wait");
+    expect(held?.nextPollAt).toEqual(new Date(claimedAt + 60_000));
+
+    // Before the lease elapses nobody else touches it.
+    env.clock.advance(59_000);
+    const early = await env.kernel.dispatch({ type: "stage.pollSuspended" });
+    expect(early.checked).toBe(0);
+    expect(env.replays()).toBe(1);
+
+    // After the lease elapses the next poll picks it up and finishes it.
+    env.clock.advance(1_000);
+    const late = await env.kernel.dispatch({ type: "stage.pollSuspended" });
+    expect(late.resumed).toBe(1);
+    expect(env.replays()).toBe(2);
+    expect((await env.persistence.getStage(env.runId, "wait"))?.status).toBe(
+      "COMPLETED",
+    );
+
+    // The dead poller's replay, if it ever returns, must not undo that.
+    gate.release({ done: true });
+    await dead;
+    expect((await env.persistence.getStage(env.runId, "wait"))?.status).toBe(
+      "COMPLETED",
+    );
+  });
+
+  it("leaves a COMPLETED stage alone when the loser arrives after the winner completed the run", async () => {
+    const gate = gatedPoll();
+    const env = await suspendDurableWait(gate.poll);
+    env.clock.advance(1_000);
+
+    // The loser claims first and stalls past its lease; the winner then
+    // claims, completes the stage and the run transitions to COMPLETED.
+    const loser = env.kernel.dispatch({ type: "stage.pollSuspended" });
+    await settle();
+    env.clock.advance(60_000);
+    const winner = await env.kernel.dispatch({ type: "stage.pollSuspended" });
+    expect(winner.resumed).toBe(1);
+    await env.kernel.dispatch({
+      type: "run.transition",
+      workflowRunId: env.runId,
+    });
+    expect((await env.persistence.getRun(env.runId))?.status).toBe("COMPLETED");
+
+    // The loser's replay returns into a run that is no longer RUNNING.
+    gate.release({ done: true });
+    expect((await loser).resumed).toBe(0);
+    const stage = await env.persistence.getStage(env.runId, "wait");
+    expect(stage?.status).toBe("COMPLETED");
+    expect(stage?.nextPollAt).toBeNull();
+    expect((await env.persistence.getRun(env.runId))?.status).toBe("COMPLETED");
+  });
+});
+
+describe("kernel: stage.pollSuspended and definition pinning", () => {
+  it("skips a suspended stage this build cannot serve and hands the claim back", async () => {
+    // A rolling deploy has both builds polling the same table. The build
+    // that cannot serve the run must not poll it — and must not hold the
+    // 60s claim lease either, or it starves the build that can.
+    const schema = z.object({ data: z.string() });
+    let polls = 0;
+    const batchStage = defineAsyncBatchStage({
+      id: "batch-stage",
+      name: "Batch Stage",
+      mode: "async-batch",
+      schemas: {
+        input: schema,
+        output: z.object({ result: z.string() }),
+        config: z.object({}),
+      },
+      async execute() {
+        return {
+          suspended: true,
+          state: {
+            batchId: "batch-1",
+            submittedAt: new Date().toISOString(),
+            pollInterval: 1000,
+            maxWaitTime: 60_000,
+          },
+          pollConfig: {
+            pollInterval: 1000,
+            maxWaitTime: 60_000,
+            nextPollAt: new Date(),
+          },
+        };
+      },
+      async checkCompletion() {
+        polls++;
+        return { ready: true, output: { result: "done" } };
+      },
+    });
+    const build = (extra: boolean) => {
+      const b = new WorkflowBuilder(
+        "pinned-poll-wf",
+        "Pinned",
+        "Test",
+        schema,
+        z.object({ result: z.string() }),
+      ).pipe(batchStage);
+      return (
+        extra ? b.pipe(createPassthroughStage("stage-2", schema)) : b
+      ).build();
+    };
+    const v1 = build(false);
+    const v2 = build(true);
+
+    const { kernel, persistence, registry, clock } = createTestKernel([v1]);
+    const created = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "pinned-poll-1",
+      workflowId: v1.id,
+      input: { data: "hello" },
+    });
+    await kernel.dispatch({ type: "run.claimPending", workerId: "w1" });
+    await kernel.dispatch({
+      type: "job.execute",
+      workflowRunId: created.workflowRunId,
+      workflowId: v1.id,
+      stageId: "batch-stage",
+      config: {},
+    });
+
+    const [suspended] = await persistence.getStagesByRun(created.workflowRunId);
+    expect(suspended!.status).toBe("SUSPENDED");
+    await persistence.updateStage(suspended!.id, {
+      nextPollAt: new Date(clock.now().getTime() - 1000),
+    });
+
+    // The deploy lands under the suspended run.
+    registry.set(v1.id, v2);
+
+    const result = await kernel.dispatch({ type: "stage.pollSuspended" });
+
+    expect(result.resumed).toBe(0);
+    expect(result.failed).toBe(0);
+    expect(polls).toBe(0);
+
+    const [after] = await persistence.getStagesByRun(created.workflowRunId);
+    expect(after!.status).toBe("SUSPENDED");
+    // The claim was handed back: nextPollAt is not parked a lease into the
+    // future, so a host that can serve the run picks it up on its next tick.
+    expect(after!.nextPollAt!.getTime()).toBeLessThanOrEqual(
+      clock.now().getTime(),
+    );
+  });
+
+  it("leaves a suspended stage of a run this build does not serve at the deadline it already had", async () => {
+    const schema = z.object({ data: z.string() });
+    const batchStage = defineAsyncBatchStage({
+      id: "batch-stage",
+      name: "Batch Stage",
+      mode: "async-batch",
+      schemas: {
+        input: schema,
+        output: z.object({ result: z.string() }),
+        config: z.object({}),
+      },
+      async execute() {
+        return {
+          suspended: true,
+          state: { batchId: "batch-1" },
+          pollConfig: {
+            pollInterval: 1000,
+            maxWaitTime: 60_000,
+            nextPollAt: new Date(),
+          },
+        };
+      },
+      async checkCompletion() {
+        return { ready: true, output: { result: "done" } };
+      },
+    });
+
+    const workflow = new WorkflowBuilder(
+      "pinned-poll-wf",
+      "Pinned",
+      "Test",
+      schema,
+      z.object({ result: z.string() }),
+    )
+      .pipe(batchStage)
+      .build();
+
+    const { kernel, persistence, clock } = createTestKernel([workflow]);
+
+    const run = await persistence.createRun({
+      workflowId: workflow.id,
+      workflowName: workflow.name,
+      workflowType: workflow.id,
+      input: { data: "hello" },
+      definitionVersion: "v-old",
+    });
+    await persistence.updateRun(run.id, { status: "RUNNING" });
+
+    const pastDate = new Date(clock.now().getTime() - 1000);
+    const created = await persistence.createStage({
+      workflowRunId: run.id,
+      stageId: "batch-stage",
+      stageName: "Batch Stage",
+      stageNumber: 1,
+      executionGroup: 1,
+      status: "SUSPENDED",
+      startedAt: clock.now(),
+    });
+    await persistence.updateStage(created.id, {
+      suspendedState: { batchId: "batch-1" },
+      nextPollAt: pastDate,
+      pollInterval: 1000,
+    });
+
+    const beforeStage = await persistence.getStage(run.id, "batch-stage");
+    const beforeNextPollAt = beforeStage!.nextPollAt;
+    const beforeVersion = beforeStage!.version;
+
+    await kernel.dispatch({ type: "stage.pollSuspended" });
+
+    const afterStage = await persistence.getStage(run.id, "batch-stage");
+    expect(afterStage!.nextPollAt).toEqual(beforeNextPollAt);
+    expect(afterStage!.version).toBe(beforeVersion);
+  });
+
+  it("caps and orders the suspended-stage query rather than slicing in JS", async () => {
+    const schema = z.object({ data: z.string() });
+    const stage = defineAsyncBatchStage({
+      id: "batch-stage",
+      name: "Batch Stage",
+      mode: "async-batch",
+      schemas: {
+        input: schema,
+        output: z.object({ result: z.string() }),
+        config: z.object({}),
+      },
+      async execute() {
+        return {
+          suspended: true,
+          state: { batchId: "batch-1" },
+          pollConfig: {
+            pollInterval: 1000,
+            maxWaitTime: 60_000,
+            nextPollAt: new Date(),
+          },
+        };
+      },
+      async checkCompletion() {
+        return { ready: false, nextCheckIn: 10_000 };
+      },
+    });
+
+    const workflow = new WorkflowBuilder(
+      "test-workflow",
+      "Test",
+      "Test",
+      schema,
+      z.object({ result: z.string() }),
+    )
+      .pipe(stage)
+      .build();
+
+    const { kernel, persistence, clock } = createTestKernel([workflow]);
+
+    const createSuspendedRunAndStage = async (id: string, nextPollAt: Date) => {
+      const run = await persistence.createRun({
+        id,
+        workflowId: workflow.id,
+        workflowName: workflow.name,
+        workflowType: workflow.id,
+        input: { data: "hello" },
+      });
+      await persistence.updateRun(run.id, { status: "RUNNING" });
+      const created = await persistence.createStage({
+        workflowRunId: run.id,
+        stageId: "batch-stage",
+        stageName: "Batch Stage",
+        stageNumber: 1,
+        executionGroup: 1,
+        status: "SUSPENDED",
+        startedAt: clock.now(),
+      });
+      await persistence.updateStage(created.id, {
+        suspendedState: { batchId: "batch-1" },
+        nextPollAt,
+        pollInterval: 1000,
+      });
+      const stageRecord = (await persistence.getStage(run.id, "batch-stage"))!;
+      return { run, stageRecord };
+    };
+
+    const oldestTime = new Date(clock.now().getTime() - 3000);
+    const middleTime = new Date(clock.now().getTime() - 2000);
+    const newestTime = new Date(clock.now().getTime() - 1000);
+
+    const middle = await createSuspendedRunAndStage("run-middle", middleTime);
+    const newest = await createSuspendedRunAndStage("run-newest", newestTime);
+    const oldest = await createSuspendedRunAndStage("run-oldest", oldestTime);
+
+    const result = await kernel.dispatch({
+      type: "stage.pollSuspended",
+      maxChecks: 1,
+    });
+
+    expect(result.checked).toBe(1);
+
+    const oldestAfter = await persistence.getStage(
+      oldest.run.id,
+      "batch-stage",
+    );
+    const middleAfter = await persistence.getStage(
+      middle.run.id,
+      "batch-stage",
+    );
+    const newestAfter = await persistence.getStage(
+      newest.run.id,
+      "batch-stage",
+    );
+
+    expect(oldestAfter!.version).toBeGreaterThan(oldest.stageRecord.version);
+    expect(oldestAfter!.nextPollAt!.getTime()).toBeGreaterThan(
+      oldestTime.getTime(),
+    );
+
+    expect(middleAfter!.version).toBe(middle.stageRecord.version);
+    expect(middleAfter!.nextPollAt).toEqual(middleTime);
+
+    expect(newestAfter!.version).toBe(newest.stageRecord.version);
+    expect(newestAfter!.nextPollAt).toEqual(newestTime);
   });
 });

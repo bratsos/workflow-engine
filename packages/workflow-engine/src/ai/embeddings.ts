@@ -18,6 +18,7 @@ import {
   type OpenRouterRoutingOptions,
   resolveCost,
 } from "./shared";
+import { createCallTimeout, runWithCallTimeout } from "./timeouts.js";
 import type { AIEmbedResult, AIHelperContext, EmbedOptions } from "./types";
 
 // Default embedding dimensions (can be overridden via options)
@@ -95,6 +96,11 @@ export async function embed(
   const modelConfig = getModel(modelKey);
   const texts = Array.isArray(text) ? text : [text];
   const startTime = Date.now();
+  const timeout = createCallTimeout(
+    options.abortSignal,
+    options.timeoutMs ?? ctx.timeout?.perCallMs,
+    modelKey,
+  );
 
   // Use dimensions from options, or fall back to active config
   const dimensions = options.dimensions ?? DEFAULT_EMBEDDING_DIMENSIONS;
@@ -115,7 +121,10 @@ export async function embed(
   });
 
   try {
-    const embeddingModel = getEmbeddingModelProvider(modelConfig, ctx.routing);
+    const isAdapter = ctx.adapter?.embed !== undefined;
+    const embeddingModel = isAdapter
+      ? undefined
+      : getEmbeddingModelProvider(modelConfig, ctx.routing);
     const providerOptions = {
       ...(modelConfig.provider === "google" && {
         google: {
@@ -129,22 +138,41 @@ export async function embed(
     let embeddings: number[][];
     let totalInputTokens: number;
     let providerMetadata: unknown;
+    let adapterCostUsd: number | undefined;
 
-    if (texts.length === 1) {
-      const result = await aiEmbed({
-        model: embeddingModel,
-        value: texts[0],
-        providerOptions,
-      });
+    if (isAdapter) {
+      const result = await runWithCallTimeout(timeout, (signal) =>
+        ctx.adapter!.embed!({
+          model: modelConfig,
+          values: texts,
+          options: { ...options, abortSignal: signal },
+        }),
+      );
+      embeddings = result.embeddings;
+      totalInputTokens = result.inputTokens;
+      providerMetadata = result.providerMetadata;
+      adapterCostUsd = result.costUsd;
+    } else if (texts.length === 1) {
+      const result = await runWithCallTimeout(timeout, (signal) =>
+        aiEmbed({
+          model: embeddingModel!,
+          value: texts[0],
+          providerOptions,
+          abortSignal: signal,
+        }),
+      );
       embeddings = [result.embedding];
       totalInputTokens = result.usage?.tokens || 0;
       providerMetadata = result.providerMetadata;
     } else {
-      const result = await embedMany({
-        model: embeddingModel,
-        values: texts,
-        providerOptions,
-      });
+      const result = await runWithCallTimeout(timeout, (signal) =>
+        embedMany({
+          model: embeddingModel!,
+          values: texts,
+          providerOptions,
+          abortSignal: signal,
+        }),
+      );
       embeddings = result.embeddings;
       totalInputTokens = result.usage?.tokens || 0;
       providerMetadata = result.providerMetadata;
@@ -155,7 +183,7 @@ export async function embed(
       modelKey,
       totalInputTokens,
       outputTokens,
-      { providerMetadata },
+      { providerMetadata, costUsd: adapterCostUsd },
     );
     const durationMs = Date.now() - startTime;
 
@@ -220,5 +248,7 @@ export async function embed(
       durationMs,
     });
     throw error;
+  } finally {
+    timeout.cleanup();
   }
 }

@@ -18,6 +18,12 @@ export type { OpenRouterRoutingOptions };
 
 export interface AIHelperOptions {
   routing?: OpenRouterRoutingOptions;
+  /** Optional transport adapter used instead of the AI SDK for selected calls. */
+  adapter?: AIAdapter;
+  /** Default timeout applied to each non-batch AI call. */
+  timeout?: {
+    perCallMs?: number;
+  };
 }
 
 /**
@@ -29,6 +35,89 @@ export type ProviderResolver = (
 ) => import("@ai-sdk/provider").LanguageModelV4 | null | undefined;
 
 export type AICallType = "text" | "object" | "embed" | "stream" | "batch";
+
+/** Normalized request passed to an adapter for text generation. */
+export interface AdapterTextRequest {
+  model: ModelConfig;
+  prompt: TextInput;
+  options: TextOptions;
+}
+
+/** Normalized request passed to an adapter for structured generation. */
+export interface AdapterObjectRequest {
+  model: ModelConfig;
+  prompt: TextInput;
+  schema: z.ZodTypeAny;
+  options: ObjectOptions;
+}
+
+/** Normalized request passed to an adapter for embedding generation. */
+export interface AdapterEmbedRequest {
+  model: ModelConfig;
+  values: string[];
+  options: EmbedOptions;
+}
+
+/** Normalized request passed to an adapter for streaming generation. */
+export interface AdapterStreamRequest {
+  model: ModelConfig;
+  prompt?: string;
+  messages?: Parameters<typeof streamText>[0]["messages"];
+  instructions?: string;
+  options: StreamOptions;
+}
+
+export interface AdapterTextResponse {
+  /** Cost the adapter measured itself, in USD; recorded as a reported cost. */
+  costUsd?: number;
+  text: string;
+  inputTokens: number;
+  outputTokens: number;
+  object?: unknown;
+  reasoning?: string;
+  providerMetadata?: Record<string, unknown>;
+}
+
+export interface AdapterObjectResponse {
+  /** Cost the adapter measured itself, in USD; recorded as a reported cost. */
+  costUsd?: number;
+  object: unknown;
+  inputTokens: number;
+  outputTokens: number;
+  reasoning?: string;
+  providerMetadata?: Record<string, unknown>;
+}
+
+export interface AdapterEmbedResponse {
+  /** Cost the adapter measured itself, in USD; recorded as a reported cost. */
+  costUsd?: number;
+  embeddings: number[][];
+  inputTokens: number;
+  outputTokens?: number;
+  providerMetadata?: Record<string, unknown>;
+}
+
+export interface AdapterStreamResponse {
+  /** Cost the adapter measured itself, in USD; recorded as a reported cost. */
+  costUsd?: number;
+  stream: AsyncIterable<string>;
+  text?: string;
+  inputTokens?: number;
+  outputTokens?: number;
+  reasoning?: string;
+  providerMetadata?: Record<string, unknown>;
+}
+
+/**
+ * Optional AI transport seam. The helper retains topic, logging, cost, and
+ * error semantics around these normalized operations.
+ */
+export interface AIAdapter {
+  generateText?(req: AdapterTextRequest): Promise<AdapterTextResponse>;
+  generateObject?(req: AdapterObjectRequest): Promise<AdapterObjectResponse>;
+  embed?(req: AdapterEmbedRequest): Promise<AdapterEmbedResponse>;
+  streamText?(req: AdapterStreamRequest): AdapterStreamResponse;
+}
 
 export interface AITextResult {
   text: string;
@@ -59,6 +148,7 @@ export interface AIObjectResult<T> {
   reportedCostUsd?: number;
   /** Whether `cost` came from the provider or from the static price table. */
   costSource?: "reported" | "estimated";
+  reasoning?: string;
 }
 
 export interface AIEmbedResult {
@@ -103,7 +193,8 @@ export interface AIStreamResult {
    */
   getReasoning(): Promise<string | undefined>;
   /** The raw AI SDK result - use this for methods like toUIMessageStreamResponse */
-  rawResult: AISDKStreamResult;
+  /** Undefined when the stream was supplied by an AIAdapter. */
+  rawResult: AISDKStreamResult | undefined;
 }
 
 /**
@@ -137,6 +228,8 @@ export interface TextOptions<TTools extends ToolSet = ToolSet> {
   maxRetries?: number;
   /** Abort signal to cancel the AI SDK call (pass-through) */
   abortSignal?: AbortSignal;
+  /** Override the helper-level per-call timeout. */
+  timeoutMs?: number;
   /** Tool definitions for the model to use */
   tools?: TTools;
   /** Tool choice: 'auto' (default), 'required' (force tool use), 'none', or specific tool name */
@@ -163,6 +256,8 @@ export interface ObjectOptions<TTools extends ToolSet = ToolSet> {
   maxRetries?: number;
   /** Abort signal to cancel the AI SDK call (pass-through) */
   abortSignal?: AbortSignal;
+  /** Override the helper-level per-call timeout. */
+  timeoutMs?: number;
   /** Tool definitions for the model to use */
   tools?: TTools;
   /** Condition to stop tool execution (e.g., stepCountIs(3)) */
@@ -180,6 +275,10 @@ export interface EmbedOptions {
   taskType?: "RETRIEVAL_QUERY" | "RETRIEVAL_DOCUMENT" | "SEMANTIC_SIMILARITY";
   /** Override the default embedding dimensions (DEFAULT_EMBEDDING_DIMENSIONS in embeddings.ts) */
   dimensions?: number;
+  /** Abort signal to cancel the AI SDK call (pass-through) */
+  abortSignal?: AbortSignal;
+  /** Override the helper-level per-call timeout. */
+  timeoutMs?: number;
   /** Provider-specific options passed directly to the AI SDK's embed() call */
   providerOptions?: Record<string, Record<string, unknown>>;
 }
@@ -191,6 +290,8 @@ export interface StreamOptions {
   maxRetries?: number;
   /** Abort signal to cancel the AI SDK call (pass-through) */
   abortSignal?: AbortSignal;
+  /** Override the helper-level per-call timeout. */
+  timeoutMs?: number;
   onChunk?: (chunk: string) => void;
   /** Tool definitions for the model to use */
   tools?: Parameters<typeof streamText>[0]["tools"];
@@ -315,6 +416,12 @@ export type AIBatchResult<T = string> =
       error: string;
       /** Always false on failed requests. */
       validated?: boolean;
+      /**
+       * The model's raw reply when the request reached the model but its
+       * output could not be parsed or validated (absent when the provider
+       * itself failed the request). Stored on the accounting row.
+       */
+      responseText?: string;
     };
 
 /** Handle for tracking a submitted batch */
@@ -335,10 +442,39 @@ export interface AIBatchHandle {
   error?: string;
 }
 
+/** How a replayed submit behaves after a worker crashed mid-submission. */
+export type BatchReclaimPolicy = "adopt" | "resubmit";
+
+/** Crash-recovery inputs for one `AIBatch.submit` call. */
+export interface AIBatchSubmitOptions {
+  /**
+   * Deterministic key naming this submission, from a durable step's
+   * `StepRunContext.externalKey`. Stamped into provider-side metadata (one
+   * sub-key per partition) so a replay can find what was already created.
+   */
+  externalKey?: string;
+  /**
+   * True when this call is a replay of a submit whose outcome was never
+   * recorded — a worker died with the lease held. Only then does the engine
+   * search the provider before creating anything.
+   */
+  recovering?: boolean;
+  /**
+   * `"adopt"` (default): on a recovering submit, adopt the batch already
+   * carrying the external key, and fail with `BatchNotAdoptableError` when
+   * the transport has no searchable field. `"resubmit"`: create a new batch
+   * regardless, accepting that the earlier one is orphaned and still billed.
+   */
+  onReclaim?: BatchReclaimPolicy;
+}
+
 /** Interface for batch operations on an AI model */
 export interface AIBatch<T = string> {
   /** Submit requests for batch processing */
-  submit(requests: AIBatchRequest[]): Promise<AIBatchHandle>;
+  submit(
+    requests: AIBatchRequest[],
+    options?: AIBatchSubmitOptions,
+  ): Promise<AIBatchHandle>;
   /** Check the status of a batch */
   getStatus(
     batchId: string,
@@ -417,21 +553,6 @@ export interface AIHelper {
   // Manual Recording (new object-based API)
   recordCall(params: RecordCallParams): void;
 
-  /**
-   * @deprecated Use the object-based `recordCall(params: RecordCallParams)`
-   * overload instead. Kept for backward compatibility with older workflow code.
-   */
-  recordCall(
-    modelKey: ModelKey,
-    prompt: string,
-    response: string,
-    tokens: { input: number; output: number },
-    options?: {
-      callType?: AICallType;
-      isBatch?: boolean;
-      metadata?: Record<string, unknown>;
-    },
-  ): void;
   // Stats (queries DB)
   getStats(): Promise<AIHelperStats>;
 }
@@ -451,4 +572,6 @@ export interface AIHelperContext {
   readonly aiCallLogger: AICallLogger;
   readonly providerResolver?: ProviderResolver;
   readonly routing?: OpenRouterRoutingOptions;
+  readonly adapter?: AIAdapter;
+  readonly timeout?: AIHelperOptions["timeout"];
 }

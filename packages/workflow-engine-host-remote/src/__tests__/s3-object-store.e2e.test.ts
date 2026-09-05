@@ -25,7 +25,6 @@ import { createKernel } from "@bratsos/workflow-engine/kernel";
 import {
   CollectingEventSink,
   FakeClock,
-  NoopScheduler,
 } from "@bratsos/workflow-engine/kernel/testing";
 import {
   InMemoryJobQueue,
@@ -439,7 +438,6 @@ describe("S3 object store — full workflow e2e (worker direct-to-bucket)", () =
       blobStore: s3BlobStore,
       jobTransport: jobQueue,
       eventSink: new CollectingEventSink(),
-      scheduler: new NoopScheduler(),
       clock,
       registry: {
         getWorkflow: (id: string) => (id === "media-s3" ? workflow : undefined),

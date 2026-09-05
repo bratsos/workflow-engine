@@ -1,5 +1,5 @@
 ---
-sidebar_position: 4
+sidebar_position: 5
 title: Annotations
 ---
 
@@ -154,6 +154,13 @@ The core conventions:
 
 > [!NOTE]
 > All standard keys inside these namespaces are marked as **stable** and will not undergo breaking signature changes without a major engine version bump.
+
+### Annotations the engine writes
+
+Two keys are written by the engine itself, so operators and dashboards can rely on them:
+
+* **`run.supersededAttempt`** (scope `stage`) — written by `run.redrive` (and the deprecated `run.rerunFrom`) for every stage record it reopens or deletes, carrying the attempt's status, error, timings, metrics, output pointer, whether it was `reopened`, and — when the redrive dropped step rows that named an external effect — `abandonedSteps` with their external keys. See [Retry, Restart and Rerun](./redriving-runs.md#the-failed-attempt-is-preserved).
+* **`step.outcome-conflict`** — written when two workers recorded an outcome for the same durable step and the second write lost the compare-and-set: the step id, kind, recorded status, attempt and `externalKey`. It reports that the step body ran more than once. See [Durable Steps](./durable-steps.md#when-two-workers-reach-the-same-step).
 
 ---
 

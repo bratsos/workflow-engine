@@ -8,11 +8,13 @@
 import { StaleVersionError } from "../../persistence/interface.js";
 import type { RunTransitionCommand, RunTransitionResult } from "../commands";
 import type { KernelEvent } from "../events";
+import { servesRun } from "../helpers/definition-pinning.js";
 import {
   loadWorkflowContext,
   prepareExecutionGroup,
   resolveExecutionGroupOutput,
 } from "../helpers/index.js";
+import { rollUpRunTotals } from "../helpers/run-totals.js";
 import type { HandlerResult, KernelDeps } from "../kernel";
 import type { WorkflowRunRecord } from "../ports";
 
@@ -104,6 +106,14 @@ async function attemptRunTransition(
     return { action: "noop" as const, _events: [] };
   }
 
+  // 3a. Definition pinning: never advance a run against a definition it
+  //     was not created under. A build that does not present the run's
+  //     pinned version leaves the run exactly where it is, for a process
+  //     that does. `run.listVersions` reports runs stranded this way.
+  if (!servesRun(run, workflow)) {
+    return { action: "noop" as const, _events: [] };
+  }
+
   // 4. Get all stages for this run
   const stages = await deps.persistence.getStagesByRun(command.workflowRunId);
 
@@ -114,7 +124,7 @@ async function attemptRunTransition(
     }
     const enqueue = await prepareExecutionGroup(run, workflow, deps, {
       groupIndex: 1,
-      attemptMode: "max",
+      attemptMode: "none",
       createMode: "upsert",
     });
 
@@ -178,9 +188,11 @@ async function attemptRunTransition(
     if (!(await claimRunTransition(run, deps))) {
       return "stale";
     }
+    const totals = await rollUpRunTotals(command.workflowRunId, stages, deps);
     await deps.persistence.updateRun(command.workflowRunId, {
       status: "FAILED",
       completedAt: deps.clock.now(),
+      ...totals,
     });
 
     events.push({
@@ -209,7 +221,7 @@ async function attemptRunTransition(
     }
     const enqueue = await prepareExecutionGroup(run, workflow, deps, {
       groupIndex: maxGroup + 1,
-      attemptMode: "max",
+      attemptMode: "none",
       createMode: "upsert",
     });
     return {
@@ -221,16 +233,11 @@ async function attemptRunTransition(
   }
 
   // 11. No next group -- the workflow is complete
-  let totalCost = 0;
-  let totalTokens = 0;
-
-  for (const stage of stages) {
-    const metrics = stage.metrics as any;
-    if (metrics) {
-      totalCost += metrics.totalCost ?? 0;
-      totalTokens += metrics.totalTokens ?? 0;
-    }
-  }
+  const { totalCost, totalTokens } = await rollUpRunTotals(
+    command.workflowRunId,
+    stages,
+    deps,
+  );
 
   const duration = deps.clock.now().getTime() - run.createdAt.getTime();
 

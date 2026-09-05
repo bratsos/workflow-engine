@@ -14,26 +14,26 @@
  *
  * @example
  * ```typescript
- * import { createTestKernel } from "../utils/index.js";
+ * import { createTestKernel } from "@bratsos/workflow-engine/testing";
  *
  * const { kernel, flush, persistence } = createTestKernel([myWorkflow]);
  * ```
  */
 
-import type { Workflow } from "../../core/workflow.js";
-import { createKernel, type WorkflowRegistry } from "../../kernel/kernel.js";
+import type { Workflow } from "../core/workflow.js";
+import { createKernel, type WorkflowRegistry } from "../kernel/kernel.js";
 import {
   createPluginRunner,
   type PluginDefinition,
-} from "../../kernel/plugins.js";
-import type { EventSink } from "../../kernel/ports.js";
+} from "../kernel/plugins.js";
+import type { EventSink, KernelServices, StepLedger } from "../kernel/ports.js";
 import {
   CollectingEventSink,
   FakeClock,
   InMemoryBlobStore,
-} from "../../kernel/testing/index.js";
-import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
-import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
+} from "../kernel/testing/index.js";
+import { InMemoryJobQueue } from "./in-memory-job-queue.js";
+import { InMemoryWorkflowPersistence } from "./in-memory-persistence.js";
 
 export interface CreateTestKernelOptions<
   TEventSink extends EventSink = CollectingEventSink,
@@ -75,6 +75,18 @@ export interface CreateTestKernelOptions<
   eventSink?: TEventSink;
   /** Forwarded to `createKernel`'s `idempotencyStaleInProgressMs`. */
   idempotencyStaleInProgressMs?: number;
+  /**
+   * Forwarded to `createKernel`'s `spillThresholdBytes`. Pass a small value
+   * to exercise the claim check without building a 64 KiB fixture, or
+   * `Number.POSITIVE_INFINITY` to keep every step result inline.
+   */
+  spillThresholdBytes?: number;
+  /** Optional durable step ledger for stages that use ctx.step.*. */
+  stepLedger?: StepLedger;
+  /** Blob store. Defaults to a fresh `InMemoryBlobStore`. */
+  blobStore?: InMemoryBlobStore;
+  /** Optional services exposed lazily through stage contexts. */
+  services?: KernelServices;
 }
 
 export function createTestKernel<
@@ -84,7 +96,7 @@ export function createTestKernel<
   opts: CreateTestKernelOptions<TEventSink> = {},
 ) {
   const persistence = new InMemoryWorkflowPersistence();
-  const blobStore = new InMemoryBlobStore();
+  const blobStore = opts.blobStore ?? new InMemoryBlobStore();
   const jobTransport = new InMemoryJobQueue(opts.workerId ?? "test-worker");
   const clock = opts.clock ?? new FakeClock(opts.clockStart);
 
@@ -102,10 +114,15 @@ export function createTestKernel<
         })
       : new CollectingEventSink())) as TEventSink;
 
+  // The returned `registry` Map stays mutable so fixtures can swap a
+  // workflow mid-test. `listWorkflows` reads through it, which is what
+  // enables version-filtered claiming — so fixtures exercise the same
+  // claim predicate production does, including after a swap.
   const registry = new Map<string, Workflow<any, any>>();
   for (const w of workflows) registry.set(w.id, w);
   const workflowRegistry: WorkflowRegistry = {
     getWorkflow: (id) => registry.get(id),
+    listWorkflows: () => Array.from(registry.values()),
   };
 
   const kernel = createKernel({
@@ -118,6 +135,11 @@ export function createTestKernel<
     ...(opts.idempotencyStaleInProgressMs !== undefined
       ? { idempotencyStaleInProgressMs: opts.idempotencyStaleInProgressMs }
       : {}),
+    ...(opts.spillThresholdBytes !== undefined
+      ? { spillThresholdBytes: opts.spillThresholdBytes }
+      : {}),
+    stepLedger: opts.stepLedger,
+    services: opts.services,
   });
 
   const flush = () => kernel.dispatch({ type: "outbox.flush" as const });

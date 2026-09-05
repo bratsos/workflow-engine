@@ -11,11 +11,14 @@
  */
 
 import {
+  type EventSinkStatus,
   executeJobWithHeartbeat,
   HOST_DEFAULTS,
   type JobTransport,
   type Kernel,
+  type RetentionOptions,
   runMaintenanceTick as runMaintenanceTickCommands,
+  type ServedDefinition,
 } from "@bratsos/workflow-engine/kernel";
 
 // ============================================================================
@@ -35,14 +38,50 @@ export interface ServerlessHostConfig {
   /** Stale lease threshold in milliseconds (default: 300_000). */
   staleLeaseThresholdMs?: number;
 
+  /** Absolute cap (ms) on one job claim (default: HOST_DEFAULTS.jobAbsoluteTimeoutMs). */
+  jobAbsoluteTimeoutMs?: number;
+
   /** Max pending runs to claim per maintenance tick (default: 10). */
   maxClaimsPerTick?: number;
+
+  /**
+   * Which definition versions this host may adopt and poll. Forwarded to
+   * `run.claimPending` and `stage.pollSuspended`.
+   *
+   * Left unset — the right default — the kernel derives it from the
+   * registry: a registry built with `createWorkflowRegistry` claims only
+   * runs this build can execute, which is what makes a rolling deploy safe.
+   * Pass `"all"` to claim and poll regardless of version (the pre-1.0
+   * behaviour), or an explicit list to run maintenance on behalf of
+   * another build.
+   */
+  serves?: readonly ServedDefinition[] | "all";
 
   /** Max suspended stages to check per tick (default: 10). */
   maxSuspendedChecksPerTick?: number;
 
   /** Max outbox events to flush per tick (default: 100). */
   maxOutboxFlushPerTick?: number;
+
+  /**
+   * Delete finished runs older than `retention.olderThanMs` (with their
+   * stages, logs, artifacts, annotations, step ledger, job rows and blobs)
+   * through `run.purge` at the end of every maintenance tick. Off by
+   * default: nothing is deleted unless this is set.
+   */
+  retention?: RetentionOptions;
+
+  /**
+   * Publish this job's outbox events right after `handleJob` settles it
+   * (default: true). There is no process lifecycle to hook a final flush
+   * on, so without this a run completed by this invocation is announced by
+   * whichever invocation runs the next maintenance tick. Bounded by
+   * `outboxFlushTimeoutMs`; errors are logged, never thrown.
+   */
+  flushOutboxAfterJob?: boolean;
+
+  /** Upper bound (ms) on the post-job outbox flush (default: 5_000). */
+  outboxFlushTimeoutMs?: number;
 
   /** Job lease heartbeat interval in milliseconds (default: 60_000). */
   jobHeartbeatIntervalMs?: number;
@@ -59,9 +98,26 @@ export interface JobMessage {
   payload: Record<string, unknown>;
 }
 
+/**
+ * Outcome of `handleJob`. The consumer's ack/retry decision reads
+ * `willRetry`: when true the stage was left `PENDING` and the job must run
+ * again — a transport whose `fail()` re-enqueues (the built-in queues) has
+ * already done so and the message can be acknowledged; a push transport
+ * whose `fail()` cannot (a queue consumer that must `retry()` the message
+ * itself) retries the message after `retryDelayMs`. When false the job is
+ * settled: acknowledge it.
+ */
 export interface JobResult {
   outcome: "completed" | "suspended" | "failed";
   error?: string;
+  /** The message was an orphan or malformed; it was failed and acknowledged. */
+  dead?: boolean;
+  willRetry?: boolean;
+  /** The job attempt that ran (1 on the first execution). */
+  attempt?: number;
+  maxAttempts?: number;
+  /** Backoff before the retry (`2^attempt` seconds), when `willRetry`. */
+  retryDelayMs?: number;
 }
 
 export interface ProcessJobsResult {
@@ -76,6 +132,21 @@ export interface MaintenanceTickResult {
   staleReleased: number;
   eventsFlushed: number;
   stuckReaped: number;
+  /** Terminal runs deleted by `run.purge`; 0 unless `retention` is configured. */
+  purged: number;
+  /** Events claimed but not published this tick; the next flush retries them. */
+  eventsFailed: number;
+  /** Events that exhausted their retry budget and moved to the DLQ. */
+  eventsDeadLettered: number;
+  /**
+   * `"degraded"` when the event sink refused at least one event this tick.
+   * There is no process to carry the state across invocations, so a
+   * serverless caller reports this per tick (and alerts on a run of them);
+   * runs keep progressing either way.
+   */
+  eventSinkStatus: EventSinkStatus;
+  /** First publish failure of this tick, when degraded. */
+  eventSinkError?: string;
 }
 
 export interface ServerlessHost {
@@ -102,10 +173,16 @@ class ServerlessHostImpl implements ServerlessHost {
   private readonly jobTransport: JobTransport;
   private readonly workerId: string;
   private readonly staleLeaseThresholdMs: number;
+  private readonly jobAbsoluteTimeoutMs: number;
   private readonly maxClaimsPerTick: number;
+  /** See `HostConfig.serves`; `undefined` means "derive from the registry". */
+  private readonly serves: readonly ServedDefinition[] | "all" | undefined;
   private readonly maxSuspendedChecksPerTick: number;
   private readonly maxOutboxFlushPerTick: number;
+  private readonly retention: RetentionOptions | undefined;
   private readonly jobHeartbeatIntervalMs: number;
+  private readonly flushOutboxAfterJob: boolean;
+  private readonly outboxFlushTimeoutMs: number;
 
   constructor(config: ServerlessHostConfig) {
     this.kernel = config.kernel;
@@ -113,15 +190,21 @@ class ServerlessHostImpl implements ServerlessHost {
     this.workerId = config.workerId;
     this.staleLeaseThresholdMs =
       config.staleLeaseThresholdMs ?? HOST_DEFAULTS.staleLeaseThresholdMs;
+    this.jobAbsoluteTimeoutMs =
+      config.jobAbsoluteTimeoutMs ?? HOST_DEFAULTS.jobAbsoluteTimeoutMs;
     this.maxClaimsPerTick =
       config.maxClaimsPerTick ?? HOST_DEFAULTS.maxClaimsPerTick;
+    this.serves = config.serves;
     this.maxSuspendedChecksPerTick =
       config.maxSuspendedChecksPerTick ??
       HOST_DEFAULTS.maxSuspendedChecksPerTick;
     this.maxOutboxFlushPerTick =
       config.maxOutboxFlushPerTick ?? HOST_DEFAULTS.maxOutboxFlushPerTick;
+    this.retention = config.retention;
     this.jobHeartbeatIntervalMs =
       config.jobHeartbeatIntervalMs ?? HOST_DEFAULTS.jobHeartbeatIntervalMs;
+    this.flushOutboxAfterJob = config.flushOutboxAfterJob ?? true;
+    this.outboxFlushTimeoutMs = config.outboxFlushTimeoutMs ?? 5_000;
   }
 
   async handleJob(msg: JobMessage): Promise<JobResult> {
@@ -129,12 +212,54 @@ class ServerlessHostImpl implements ServerlessHost {
     // (complete/suspend/fail + terminal run.transition) — see
     // executeJobWithHeartbeat in @bratsos/workflow-engine/kernel for the
     // shared command sequence.
-    return executeJobWithHeartbeat(this.kernel, {
+    const result = await executeJobWithHeartbeat(this.kernel, {
       jobTransport: this.jobTransport,
       job: msg,
       jobHeartbeatIntervalMs: this.jobHeartbeatIntervalMs,
       logPrefix: "[ServerlessHost]",
     });
+    if (this.flushOutboxAfterJob) {
+      await this.flushOutbox();
+    }
+    return result;
+  }
+
+  /** Publish pending outbox events, bounded by `outboxFlushTimeoutMs`. */
+  private async flushOutbox(): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<"timeout">((resolve) => {
+      timer = setTimeout(() => resolve("timeout"), this.outboxFlushTimeoutMs);
+    });
+    try {
+      const outcome = await Promise.race([
+        this.kernel.dispatch({
+          type: "outbox.flush",
+          maxEvents: this.maxOutboxFlushPerTick,
+        }),
+        timeout,
+      ]);
+      if (outcome === "timeout") {
+        console.error(
+          "[ServerlessHost] outbox.flush after job: timed out; the next maintenance tick publishes the rest",
+        );
+      } else if (outcome.eventSinkStatus === "degraded") {
+        // Stateless: no transition to detect, so say it every time.
+        console.error(
+          `[ServerlessHost] event sink DEGRADED: ${outcome.failed} event(s) stayed in the outbox for a later flush; runs keep progressing. Last error: ${
+            outcome.eventSinkError ?? "unknown"
+          }`,
+        );
+      }
+      if (outcome !== "timeout" && outcome.deadLettered > 0) {
+        console.error(
+          `[ServerlessHost] event sink DEAD-LETTERED ${outcome.deadLettered} event(s): they will not be delivered until replayed with the plugin.replayDLQ command`,
+        );
+      }
+    } catch (error) {
+      console.error("[ServerlessHost] outbox.flush after job error:", error);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   async processAvailableJobs(opts?: {
@@ -146,7 +271,10 @@ class ServerlessHostImpl implements ServerlessHost {
     let failed = 0;
 
     while (processed < maxJobs) {
-      const job = await this.jobTransport.dequeue();
+      const serves = this.dequeueServes();
+      const job = await this.jobTransport.dequeue(
+        serves !== undefined ? { serves } : undefined,
+      );
       if (!job) break;
 
       const result = await this.handleJob({
@@ -170,20 +298,47 @@ class ServerlessHostImpl implements ServerlessHost {
     return { processed, succeeded, failed };
   }
 
+  /**
+   * What to pass to `jobTransport.dequeue`. `"all"` means claim regardless
+   * of version, which is expressed by passing nothing; otherwise the
+   * kernel's registry answers, so the dequeue narrows on exactly what
+   * `run.claimPending` narrows on.
+   */
+  private dequeueServes(): readonly ServedDefinition[] | undefined {
+    if (this.serves === "all") return undefined;
+    return this.serves ?? this.kernel.servedDefinitions?.();
+  }
+
   async runMaintenanceTick(): Promise<MaintenanceTickResult> {
     // Claim pending runs, poll suspended stages, reap stale leases, flush
     // the outbox, and reap stuck runs — see runMaintenanceTick in
     // @bratsos/workflow-engine/kernel for the shared command sequence. The
     // serverless host returns the per-command counts to its caller (unlike
     // the Node host, which fires this on a timer and ignores them).
-    return runMaintenanceTickCommands(this.kernel, {
+    const counts = await runMaintenanceTickCommands(this.kernel, {
       workerId: this.workerId,
       maxClaimsPerTick: this.maxClaimsPerTick,
+      ...(this.serves !== undefined ? { serves: this.serves } : {}),
       maxSuspendedChecksPerTick: this.maxSuspendedChecksPerTick,
       maxOutboxFlushPerTick: this.maxOutboxFlushPerTick,
       staleLeaseThresholdMs: this.staleLeaseThresholdMs,
+      jobAbsoluteTimeoutMs: this.jobAbsoluteTimeoutMs,
+      ...(this.retention !== undefined ? { retention: this.retention } : {}),
       logPrefix: "[ServerlessHost]",
     });
+    if (counts.eventSinkStatus === "degraded") {
+      console.error(
+        `[ServerlessHost] event sink DEGRADED: ${counts.eventsFailed} event(s) stayed in the outbox for a later flush; runs keep progressing. Last error: ${
+          counts.eventSinkError ?? "unknown"
+        }`,
+      );
+    }
+    if (counts.eventsDeadLettered > 0) {
+      console.error(
+        `[ServerlessHost] event sink DEAD-LETTERED ${counts.eventsDeadLettered} event(s): they will not be delivered until replayed with the plugin.replayDLQ command`,
+      );
+    }
+    return counts;
   }
 }
 

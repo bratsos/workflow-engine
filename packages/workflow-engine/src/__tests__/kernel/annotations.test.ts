@@ -675,14 +675,18 @@ describe("annotations: legacy metadata shim", () => {
       },
     });
     const workflow = makeWorkflow("wf-legacy", stage);
-    const { kernel } = createTestKernel([workflow]);
+    const { kernel, persistence } = createTestKernel([workflow]);
     const result = await kernel.dispatch({
       type: "run.create",
       idempotencyKey: `legacy-${Math.random()}`,
       workflowId: "wf-legacy",
       input: { data: "x" },
-      metadata: meta,
     });
+    // `run.create` no longer takes `metadata` (1.0); the shim serves runs
+    // whose rows were written with it before 0.8, so seed the column directly.
+    await persistence.updateRun(result.workflowRunId, {
+      metadata: meta,
+    } as never);
     return { kernel, runId: result.workflowRunId };
   }
 
@@ -998,7 +1002,12 @@ describe("annotations: attempt auto-increment on rerun", () => {
       config: {},
     });
 
-    const all = await kernel.annotations.list(runId);
+    // Exclude the engine's own superseded-attempt archive (written by
+    // run.redrive, which run.rerunFrom delegates to) so this asserts only
+    // the stage's own annotations.
+    const all = (await kernel.annotations.list(runId)).filter(
+      (a) => a.key !== "run.supersededAttempt",
+    );
     // First attempt annotation preserved with attempt=0; second
     // attempt's annotation carries attempt=1.
     const firstAttempt = all.filter((a) => a.attempt === 0);
@@ -1008,17 +1017,22 @@ describe("annotations: attempt auto-increment on rerun", () => {
     expect(firstAttempt[0].value).toBe("first");
     expect(secondAttempt).toHaveLength(1);
     expect(secondAttempt[0].value).toBe("first");
-    // Old stage record deleted (SetNull on the FK) but value lives on.
-    expect(firstAttempt[0].workflowStageRecordId).toBeNull();
-    // New stage record is the active one.
-    expect(secondAttempt[0].workflowStageRecordId).not.toBeNull();
+    // The rerun reopened the stage record in place rather than deleting
+    // it, so both attempts' annotations point at the same row; the
+    // `attempt` column is what tells them apart.
+    const record = await persistence.getStage(runId, "decide");
+    expect(record?.attempt).toBe(1);
+    expect(firstAttempt[0].workflowStageRecordId).toBe(record?.id);
+    expect(secondAttempt[0].workflowStageRecordId).toBe(record?.id);
   });
 });
 
-describe("annotations: attempt propagates to downstream stages after rerun", () => {
-  it("downstream stages enqueued via run.transition inherit the rerun attempt", async () => {
+describe("annotations: attempt is per stage row, not per rerun span", () => {
+  it("downstream stages recreated via run.transition after a rerun start at attempt 0", async () => {
     // Two-stage pipeline. After rerunFrom from stage1, run.transition
-    // enqueues stage2 with the new attempt (not the default 0).
+    // recreates stage2 as a fresh row: its attempt is 0 (the rerun bumped
+    // stage1's row, not stage2's), so annotations from both executions of
+    // stage2 carry attempt 0 while stage1's carry 0 then 1.
     const stage1 = defineStage({
       id: "stage1",
       name: "Stage 1",
@@ -1105,8 +1119,7 @@ describe("annotations: attempt propagates to downstream stages after rerun", () 
       stageId: "stage1",
       config: {},
     });
-    // run.transition enqueues stage2 — this is the key fix: stage2's
-    // new record must inherit attempt=1 from the run-level rerun.
+    // run.transition recreates stage2 as a fresh row at attempt 0.
     await kernel.dispatch({
       type: "run.transition",
       workflowRunId: runId,
@@ -1119,12 +1132,19 @@ describe("annotations: attempt propagates to downstream stages after rerun", () 
       config: {},
     });
 
-    const all = await kernel.annotations.list(runId);
+    const stage2Record = await persistence.getStage(runId, "stage2");
+    expect(stage2Record?.attempt).toBe(0);
+    const stage1Record = await persistence.getStage(runId, "stage1");
+    expect(stage1Record?.attempt).toBe(1);
+
+    const all = (await kernel.annotations.list(runId)).filter(
+      (a) => a.key !== "run.supersededAttempt",
+    );
+    const stage1Annotations = all.filter((a) => a.scopeId === "stage1");
+    expect(stage1Annotations.map((a) => a.attempt).sort()).toEqual([0, 1]);
     const stage2Annotations = all.filter((a) => a.scopeId === "stage2");
-    // Should have one annotation per attempt for stage2.
     expect(stage2Annotations).toHaveLength(2);
-    const attempts = stage2Annotations.map((a) => a.attempt).sort();
-    expect(attempts).toEqual([0, 1]);
+    expect(stage2Annotations.map((a) => a.attempt)).toEqual([0, 0]);
   });
 });
 

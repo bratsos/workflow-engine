@@ -11,7 +11,7 @@ title: Prisma Setup
 
 ## Authoritative Prisma Schema
 
-To configure persistence, copy these definitions directly into your `prisma/schema.prisma` file. Ensure that all model names map to their plural database equivalents using `@@map`.
+The package ships this schema at `node_modules/@bratsos/workflow-engine/prisma/schema.prisma`; copy the definitions into your own `prisma/schema.prisma`. Ensure that all model names map to their plural database equivalents using `@@map`. The Prisma adapters require every model *and column* below — a wall of `PrismaClient is not assignable to EnginePrismaClient` errors means a delegate is missing (after 1.0, almost always `workflowStep` or `workflowDefinition`). Upgrading an existing database? The [0.13 → 1.0 guide](../migrations/migrate-0.13-to-1.0.md) has the column-level checklist as idempotent SQL.
 
 ```prisma
 // schema.prisma
@@ -48,14 +48,73 @@ model WorkflowRun {
   priority      Int                  @default(5)
   metadata      Json?
 
+  // The definition version this run is pinned to. NULL means the run was
+  // created before the consumer migrated to definition versioning: it is
+  // claimable and executable by any host, exactly as before. See
+  // `workflow_definitions` for the structure the version identifies.
+  definitionVersion String?
+  // How many times `run.redrive` has re-driven this run (Step Functions'
+  // redrive count). Never reset -- it counts the whole life of the run.
+  redriveCount      Int     @default(0)
+
   stages        WorkflowStage[]
   logs          WorkflowLog[]
   artifacts     WorkflowArtifact[]
   annotations   WorkflowAnnotation[]
 
-  @@index([status])
-  @@index([workflowId])
+  // List orderings. Every "recent runs" view -- the console's included --
+  // is newest-first, optionally narrowed by status or workflow, and pages
+  // on the keyset (createdAt, id), so the tiebreaker travels in the index
+  // and a page is one index range scan with no sort node. These replace
+  // the bare @@index([status]) / @@index([workflowId]): a composite whose
+  // leading column is the same serves every lookup the single-column
+  // index served.
+  @@index([createdAt(sort: Desc), id(sort: Desc)])
+  @@index([status, createdAt(sort: Desc), id(sort: Desc)])
+  @@index([workflowId, createdAt(sort: Desc), id(sort: Desc)])
+  // The claim: status = 'PENDING' ORDER BY priority DESC, "createdAt" ASC
+  // LIMIT 1 FOR UPDATE SKIP LOCKED, run maxClaimsPerTick times per tick
+  // per host. The same shape job_queue already indexes, and it needs its
+  // own: the (status, createdAt DESC, id DESC) index above cannot serve it
+  // because priority is not in it, so the claim reads every PENDING row
+  // and top-N sorts it. Measured on Postgres 16, 300k runs / 60k pending:
+  // 11.8-15.1 ms before, 0.008-0.022 ms after, for 9 MB of index.
+  @@index([status, priority(sort: Desc), createdAt])
+  // Definition versioning. The first serves a lookup narrowed to one
+  // version with no workflow. The second is the narrow stand-in for the
+  // @@index([status]) the list orderings above replaced -- a status count
+  // runs index-only off it (3.3 ms at 60k rows, against a heap scan) --
+  // and it also narrows the version-filtered claim. It does NOT cover
+  // `run.listVersions`: that handler passes no status filter and its
+  // aggregate asks for a MIN(createdAt) the index does not carry, so all
+  // three of its shapes plan a parallel sequential scan whatever is here.
+  @@index([definitionVersion])
+  @@index([status, workflowId, definitionVersion])
   @@map("workflow_runs")
+}
+
+// Content-addressed workflow definition snapshots. One row per distinct
+// (workflowId, version); every run pinned to that version references it,
+// so the storage cost is per definition rather than per run.
+model WorkflowDefinition {
+  workflowId String
+  version    String
+  createdAt  DateTime @default(now())
+  // The structure the version identifies: stage ids, execution groups,
+  // definition order, dependencies, modes and normalised JSON Schemas.
+  // See `core/definition-version.ts` for the exact shape.
+  snapshot   Json
+  // Hash of `snapshot`. Equal to `version` for derived versions; for an
+  // explicit version it is what lets the engine reject re-registering the
+  // same version with a different structure.
+  structureHash String
+
+  // No @@index([workflowId]): the compound primary key already leads with
+  // it, so a lookup by workflow alone plans identically with and without
+  // one (measured: 0.188 ms vs 0.187 ms at 20k rows) -- and no query in
+  // the engine reads this table by workflow alone anyway.
+  @@id([workflowId, version])
+  @@map("workflow_definitions")
 }
 
 // 3. Individual stage execution model
@@ -90,11 +149,42 @@ model WorkflowStage {
   logs            WorkflowLog[]
   artifacts       WorkflowArtifact[]
   annotations     WorkflowAnnotation[]
+  steps           WorkflowStep[]
 
   @@unique([workflowRunId, stageId])
   @@index([status])
   @@index([nextPollAt])
   @@map("workflow_stages")
+}
+
+// 3b. Durable step ledger (drives ctx.step.*; used by createPrismaStepLedger)
+model WorkflowStep {
+  id            String   @id @default(cuid())
+  stageRecordId String
+  // Cascade from the stage record, so deleting a stage (or the run above it)
+  // removes its ledger rows instead of orphaning them. Constraint name:
+  // workflow_steps_stageRecordId_fkey.
+  stage         WorkflowStage @relation(fields: [stageRecordId], references: [id], onDelete: Cascade)
+  stepId        String
+  seq           Int
+  kind          String        // "run" | "wait" | "signal" | "sleep"
+  status        String
+  attempt        Int       @default(1)
+  leaseExpiresAt DateTime?
+  deadlineAt     DateTime?
+  // Deterministic name for the external effect a `run` step body creates,
+  // written before the body runs so an orphaned provider-side effect can be
+  // found from the row after a crash.
+  externalKey    String?
+  result        Json?
+  error         String?
+  waitState     Json?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@unique([stageRecordId, stepId])
+  @@index([stageRecordId])
+  @@map("workflow_steps")
 }
 
 // 4. Execution log lines (drives ctx.log)
@@ -204,7 +294,25 @@ model JobQueue {
   payload       Json?
   lastError     String?
 
-  @@index([status, priority])
+  // The dequeue: status = 'PENDING' ORDER BY priority DESC, "createdAt" ASC
+  // LIMIT 1 FOR UPDATE SKIP LOCKED. This replaces the bare
+  // @@index([status, priority]) -- a composite whose leading columns are
+  // the same serves every lookup that one served. Carrying the createdAt
+  // tiebreak is what removes the sort node: without it a deep queue reads
+  // and sorts every PENDING row on every claim (measured on Postgres 16,
+  // flat priorities: 0.55 ms at 1,000 ready rows, 26.7 ms at 50,000; with
+  // it, 0.03 ms and 0.04 ms -- flat with depth).
+  //
+  // It costs more on disk than the index it replaces, and the reason is
+  // worth knowing: (status, priority) is almost entirely duplicate keys,
+  // which btree deduplication collapses, while adding createdAt makes
+  // every key distinct. Measured at 150,000 rows: 1 MB -> 10 MB.
+  @@index([status, priority(sort: Desc), createdAt])
+  // Queue health reports the age of the oldest waiting job as
+  // MIN("createdAt") within a status. Completed rows are retained rather
+  // than deleted, so [status, priority] would have to scan every row of
+  // the status to find it.
+  @@index([status, createdAt])
   @@index([nextPollAt])
   @@map("job_queue")
 }
@@ -225,6 +333,13 @@ model OutboxEvent {
 
   @@unique([workflowRunId, sequence])
   @@index([publishedAt])
+  // Dead letters are a subset of the unpublished rows, so without this the
+  // dead-letter view has to walk every unpublished event and fetch its heap
+  // tuple -- which is slowest exactly when a backlog has built up and you
+  // most want to read it. Postgres users writing migrations by hand should
+  // prefer a partial index (WHERE "dlqAt" IS NOT NULL); Prisma cannot
+  // express one, and this is the closest it gets.
+  @@index([dlqAt])
   @@map("outbox_events")
 }
 
@@ -238,6 +353,19 @@ model IdempotencyKey {
 
   @@unique([key, commandType])
   @@map("idempotency_keys")
+}
+
+// 11. Optional: a blob store in the database (createPrismaBlobStore).
+// Every process that executes or polls a run must read the same blob store;
+// this makes the database that store without object storage. Requires only
+// the workflowBlob delegate, not a change to the persistence client.
+model WorkflowBlob {
+  key       String   @id
+  data      Json
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("workflow_blobs")
 }
 ```
 
@@ -257,6 +385,103 @@ npx prisma generate
 
 ---
 
+## Transactional Enqueue from SQL (PostgreSQL)
+
+The whole kernel already runs in the caller's transaction. `workflow_engine_enqueue`
+exposes the enqueue half of that to callers who are not TypeScript — a database
+trigger, a stored procedure, a service in another language — so they can schedule
+work atomically with the rows that justify it:
+
+```sql
+INSERT INTO orders (...) VALUES (...) RETURNING id INTO v_order_id;
+
+PERFORM workflow_engine_enqueue(
+  'order:' || v_order_id,          -- idempotency key
+  'fulfil-order',                  -- workflow id
+  'Fulfil Order',                  -- workflow name
+  jsonb_build_object('orderId', v_order_id)
+);
+```
+
+The function ships as SQL in the package (`node_modules/@bratsos/workflow-engine/sql/enqueue.sql`),
+not as something the engine creates at runtime, so your migration owns it. Apply
+it after the engine's tables exist. It is `CREATE OR REPLACE`, so re-running is safe.
+
+```bash
+psql "$DATABASE_URL" -f node_modules/@bratsos/workflow-engine/sql/enqueue.sql
+```
+
+Or, with Prisma, paste it into a migration:
+
+```bash
+npx prisma migrate dev --create-only --name workflow-engine-enqueue-function
+cat node_modules/@bratsos/workflow-engine/sql/enqueue.sql \
+  >> prisma/migrations/*_workflow_engine_enqueue_function/migration.sql
+npx prisma migrate dev
+```
+
+Requires PostgreSQL 13 or newer (for the built-in `gen_random_uuid()`).
+
+### Signature
+
+```sql
+workflow_engine_enqueue(
+  p_idempotency_key    text,
+  p_workflow_id        text,
+  p_workflow_name      text,
+  p_input              jsonb,
+  p_config             jsonb   DEFAULT '{}'::jsonb,
+  p_priority           integer DEFAULT 5,
+  p_definition_version text    DEFAULT NULL
+) RETURNS text   -- the workflow run id
+```
+
+It writes exactly the rows `run.create` writes, in the same order: the
+idempotency key, the run, and the `workflow:created` outbox event. The run is
+left `PENDING` for `run.claimPending`, exactly as `run.create` leaves it — no
+job is enqueued here, so a host picks it up like any other run. Calling twice
+with one idempotency key returns the same run id and creates nothing the second
+time.
+
+A test in the engine's suite (`sql-enqueue.test.ts`, gated on `DATABASE_URL`)
+creates one run each way and asserts the two `workflow_runs` rows, the two
+`idempotency_keys` results and the two outbox events agree column by column,
+and that both runs execute to the same output. That test is what keeps the two
+paths from drifting.
+
+### What SQL cannot do, and what the function does about it
+
+**It cannot validate the input.** `run.create` parses the input against the
+workflow's Zod input schema and refuses a bad one. Bad input passed here fails
+at the first stage instead, as a failed run. If the caller is a trigger on your
+own table that is usually fine; if it is an untrusted boundary, validate before
+calling.
+
+**It cannot compute the definition version.** A run's `definitionVersion` is a
+SHA-256 of the workflow's structural snapshot, computed in TypeScript from the
+built definition. So the default is to create the run **unpinned**
+(`definitionVersion` NULL) — the same state as a deployment that has not adopted
+definition versioning, and claimable by any host. Pass `p_definition_version`
+when the caller does know it (a TypeScript service reaching for a transactional
+enqueue can read `workflow.definitionVersion`); the function then refuses unless
+the matching `workflow_definitions` row already exists, because pinning a run to
+an unregistered version would strand it where no host will serve it.
+
+**It cannot merge stage config defaults.** `run.create` merges
+`workflow.getDefaultConfig()` under the caller's config before storing it; this
+function stores `p_config` verbatim. Behaviour is unaffected — every stage
+re-parses its slice of the config through its own schema when it executes, which
+applies the same defaults — but the stored `config` column differs in what it
+shows a reader. Pass the merged config if you want the column to match.
+
+Two smaller differences: run ids are `gen_random_uuid()::text` rather than
+Prisma's cuid (both opaque), and the in-progress idempotency marker never becomes
+visible, because the claim and the result live in one transaction here — a
+concurrent caller with the same key blocks on the unique index and then reads the
+finished result.
+
+---
+
 ## Database Configuration
 
 ### 1. PostgreSQL Setup (Recommended)
@@ -267,15 +492,28 @@ import {
   createPrismaWorkflowPersistence,
   createPrismaJobQueue,
   createPrismaAICallLogger,
+  createPrismaStepLedger,
+  createPrismaBlobStore,
 } from "@bratsos/workflow-engine/persistence/prisma";
-import { PrismaClient } from "@prisma/client";
+import { PrismaClient } from "@prisma/client"; // or your Prisma 7 generator's output path
 
 const prisma = new PrismaClient();
 
 const persistence = createPrismaWorkflowPersistence(prisma);
-const jobQueue = createPrismaJobQueue(prisma);
+const jobQueue = createPrismaJobQueue(prisma);   // adopts the host's workerId on start()
 const aiCallLogger = createPrismaAICallLogger(prisma);
+const stepLedger = createPrismaStepLedger(prisma);
+const blobStore = createPrismaBlobStore(prisma); // needs the WorkflowBlob model
 ```
+
+The adapters take a structural client type and never import `@prisma/client`, so any generated client — Prisma 6 or 7, default or custom `output` — satisfies them as long as it has the delegates. A transaction client works too: build the ports over the `tx` inside your own `$transaction` and the whole kernel tick runs in that transaction, under your `SET LOCAL` and row-level security. (The Prisma step ledger and idempotency-key inserts use `createMany({ skipDuplicates: true })` on Postgres precisely so a conflict does not abort an enclosing transaction.)
+
+Options worth knowing:
+
+* `createPrismaWorkflowPersistence(prisma, { statusEnumName })` names the Prisma enum the Postgres claim statement casts with (default `"Status"`).
+* `createPrismaWorkflowPersistence(prisma, { definitionVersioning })` skips the adapter's own check for the `workflow_definitions` table: `false` for a client whose schema has the model against a database deliberately left unmigrated, `true` for a client wrapper the structural check cannot see. Left unset, the adapter confirms the generated client's answer against the database once, lazily, with a catalogue read that returns "absent" rather than raising — so an unmigrated database still starts, with versioning off.
+* `createPrismaJobQueue(prisma, { fairness: { maxConcurrentPerGroup, groupBy: "config.tenantId" } })` turns on the opt-in per-group concurrency cap in the PostgreSQL dequeue (off by default; it costs more on a deep queue).
+* On PostgreSQL the job lease runs on the database clock; `PrismaJobQueueOptions.now` only affects SQLite.
 
 ### 2. SQLite Setup
 SQLite lacks native lock features like `FOR UPDATE SKIP LOCKED`. If you are running locally or inside a testing context on SQLite:
@@ -290,12 +528,21 @@ const sqlitePersistence = createPrismaWorkflowPersistence(prisma, {
 const sqliteJobQueue = createPrismaJobQueue(prisma, {
   databaseType: "sqlite",
 });
+
+const sqliteStepLedger = createPrismaStepLedger(prisma, {
+  databaseType: "sqlite", // keeps the create-and-catch path; SQLite has no skipDuplicates
+});
 ```
 
 ---
 
 ## Database Indexes
 
-Verify that your index declarations (`@@index`) are preserved:
-* `job_queue`: Indexes on `[status, priority]` and `[nextPollAt]` ensure that workers can query and claim jobs with negligible overhead.
-* `workflow_annotations`: Indexes on `[workflowRunId, key]` enable efficient range queries (e.g. `keyPrefix: "decision."`) when using PostgreSQL index-range scans.
+Verify that your index declarations (`@@index`) are preserved. The ones that matter operationally:
+* `workflow_runs`: `[status, priority DESC, createdAt]` serves the run claim; the three `(…, createdAt DESC, id DESC)` composites serve every "newest first" listing (the console's included) as one index range scan; `[definitionVersion]` and `[status, workflowId, definitionVersion]` serve the version-filtered claim and `run.listVersions`.
+* `job_queue`: `[status, priority DESC, createdAt]` serves the dequeue without a sort node whatever the queue depth; `[status, createdAt]` serves queue health; `[nextPollAt]` serves retries. `@@unique([workflowRunId, stageId])` is what makes the enqueue idempotent on a redrive.
+* `workflow_steps`: `@@unique([stageRecordId, stepId])` is the step ledger's claim; the foreign key to `workflow_stages` with `ON DELETE CASCADE` is what lets `run.purge` (and a hand-written `DELETE FROM workflow_runs`) take the ledger with the run.
+* `outbox_events`: `[dlqAt]` serves the dead-letter view; on Postgres prefer a partial index (`WHERE "dlqAt" IS NOT NULL`) if you write the migration by hand.
+* `workflow_annotations`: `[workflowRunId, key]` enables efficient range queries (e.g. `keyPrefix: "decision."`).
+
+`workflow_definitions` deliberately has no `(workflowId)` index: the compound primary key already leads with it. If an earlier draft of your migration created one, `DROP INDEX CONCURRENTLY IF EXISTS "workflow_definitions_workflowId_idx";` is safe.

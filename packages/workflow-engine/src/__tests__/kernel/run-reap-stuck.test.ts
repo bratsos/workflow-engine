@@ -254,6 +254,107 @@ describe("kernel: run.reapStuck", () => {
     expect(jobs[0]!.workflowRunId).toBe(workflowRunId);
     expect(jobs[0]!.status).toBe("PENDING");
   });
+
+  it("enqueues the recovery job after the transaction commits, not inside it", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, persistence, jobTransport, clock } = createTestKernel(
+      [workflow],
+      { clockStart: new Date() },
+    );
+
+    await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "key-recovery-postcommit",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+    await kernel.dispatch({ type: "run.claimPending", workerId: "w1" });
+    jobTransport.clear();
+
+    // Observe whether the enqueue lands while the kernel transaction is
+    // still open. An enqueue inside the transaction publishes work that
+    // references state another worker cannot see yet (and that a
+    // rollback would erase) — the shape that wedged runs before alpha.8.
+    let inTransaction = false;
+    const enqueuedInTransaction: boolean[] = [];
+    const originalWithTransaction =
+      persistence.withTransaction.bind(persistence);
+    persistence.withTransaction = async (fn: any) => {
+      inTransaction = true;
+      try {
+        return await originalWithTransaction(fn);
+      } finally {
+        inTransaction = false;
+      }
+    };
+    const originalEnqueueParallel =
+      jobTransport.enqueueParallel.bind(jobTransport);
+    jobTransport.enqueueParallel = async (jobs: any) => {
+      enqueuedInTransaction.push(inTransaction);
+      return originalEnqueueParallel(jobs);
+    };
+
+    clock.advance(10 * 60 * 1000);
+
+    await kernel.dispatch({
+      type: "run.reapStuck",
+      stuckThresholdMs: 5 * 60 * 1000,
+    });
+
+    expect(enqueuedInTransaction).toEqual([false]);
+    expect(jobTransport.getAllJobs()).toHaveLength(1);
+  });
+
+  it("leaves a run pinned to a version this build does not serve", async () => {
+    // A run stranded by a rolling deploy looks exactly like a stuck run
+    // from a host that cannot serve it: nothing here touches the run or
+    // its stages, so it crosses the threshold untouched. Reaping it would
+    // fail a run that is healthy on the build that owns it.
+    const schema = z.object({ data: z.string() });
+    const v1 = new WorkflowBuilder(
+      "pinned-wf",
+      "Pinned",
+      "Test",
+      schema,
+      schema,
+    )
+      .pipe(createPassthroughStage("stage-1", schema))
+      .build();
+    const v2 = new WorkflowBuilder(
+      "pinned-wf",
+      "Pinned",
+      "Test",
+      schema,
+      schema,
+    )
+      .pipe(createPassthroughStage("stage-1", schema))
+      .pipe(createPassthroughStage("stage-2", schema))
+      .build();
+
+    const { kernel, persistence, registry, clock } = createTestKernel([v1], {
+      clockStart: new Date(),
+    });
+    const created = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "pinned-1",
+      workflowId: v1.id,
+      input: { data: "hello" },
+    });
+    await kernel.dispatch({ type: "run.claimPending", workerId: "w1" });
+
+    // The deploy lands: this process now presents a different structure.
+    registry.set(v1.id, v2);
+    clock.advance(10 * 60 * 1000);
+
+    const result = await kernel.dispatch({
+      type: "run.reapStuck",
+      stuckThresholdMs: 5 * 60 * 1000,
+    });
+
+    expect(result.failed).toBe(0);
+    const run = await persistence.getRun(created.workflowRunId);
+    expect(run!.status).toBe("RUNNING");
+  });
 });
 
 describe("kernel: run.reapStuck dropped-transition heal", () => {

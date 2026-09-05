@@ -8,11 +8,18 @@
  */
 
 import { createLogger } from "../../utils/logger";
-import type {
-  DequeueResult,
-  EnqueueJobInput,
-  JobQueue,
-  JobRecord,
+import {
+  type DequeueOptions,
+  type DequeueResult,
+  type EnqueueJobInput,
+  type JobAckFence,
+  type JobAckOutcome,
+  type JobQueue,
+  type JobQueueFairness,
+  type JobRecord,
+  LEASE_ABSOLUTE_CAP,
+  LEASE_HEARTBEAT_LOST,
+  type ServedDefinition,
 } from "../interface";
 import { createEnumHelper, type PrismaEnumHelper } from "./enum-compat";
 import type { DatabaseType } from "./persistence";
@@ -26,8 +33,54 @@ const logger = createLogger("JobQueue");
  */
 const MAX_DEQUEUE_ATTEMPTS = 10;
 
+/**
+ * How many ready rows the SQLite dequeue reads when `serves` filtering is
+ * on. SQLite cannot filter on a JSON path through Prisma, so the filter is
+ * applied in JS over a bounded window in the same priority order the
+ * statement would have used.
+ */
+const SQLITE_SERVES_SCAN_LIMIT = 100;
+
 // Structural client type -- see prisma-client-type.ts.
 type PrismaClient = EnginePrismaClient;
+
+/**
+ * Row shape returned by the raw dequeue claim UPDATE statement.
+ */
+type DequeuedJobRow = {
+  id: string;
+  workflowRunId: string;
+  stageId: string;
+  priority: number;
+  attempt: number;
+  maxAttempts: number;
+  payload: unknown;
+  startedAt: Date;
+};
+
+/**
+ * Splits a dotted payload path into the segments Postgres's `#>>` operator
+ * takes as a `text[]`. Bound as a parameter, never interpolated, so a path
+ * from configuration cannot reach the statement as SQL.
+ */
+function requireGroupLimit(maxConcurrentPerGroup: number): number {
+  if (!Number.isInteger(maxConcurrentPerGroup) || maxConcurrentPerGroup < 1) {
+    throw new Error(
+      `JobQueueFairness.maxConcurrentPerGroup must be an integer of at least 1, got ${maxConcurrentPerGroup}`,
+    );
+  }
+  return maxConcurrentPerGroup;
+}
+
+function splitGroupPath(groupBy: string): string[] {
+  const segments = groupBy.split(".").filter((s) => s.length > 0);
+  if (segments.length === 0) {
+    throw new Error(
+      `JobQueueFairness.groupBy must name at least one payload field, got ${JSON.stringify(groupBy)}`,
+    );
+  }
+  return segments;
+}
 
 export interface PrismaJobQueueOptions {
   /**
@@ -39,47 +92,146 @@ export interface PrismaJobQueueOptions {
    * Set to "sqlite" when using SQLite (uses optimistic locking instead of FOR UPDATE SKIP LOCKED).
    */
   databaseType?: DatabaseType;
+  /**
+   * Time source for deterministic tests.
+   *
+   * Does not affect PostgreSQL lease timestamps (`lockedAt`, `startedAt`),
+   * which are derived directly from the database clock. It remains the time
+   * source for the SQLite dequeue path and for timestamps written outside the
+   * raw statement (such as dead-job acknowledgements). Defaults to
+   * `() => new Date()`.
+   */
+  now?: () => Date;
+  /**
+   * Per-group fairness for the dequeue. Omit (the default) and the claim
+   * statement is exactly the one shipped before 1.0.0-alpha.9: index scan,
+   * first row, no per-group accounting. See `JobQueueFairness`; PostgreSQL
+   * only.
+   */
+  fairness?: JobQueueFairness;
 }
 
 export class PrismaJobQueue implements JobQueue {
   private workerId: string;
+  /**
+   * Whether `workerId` came from the caller. A generated id is a
+   * placeholder the host is allowed to replace through `adoptWorkerId`;
+   * one the caller chose is not.
+   */
+  private readonly workerIdWasConfigured: boolean;
   private prisma: PrismaClient;
   private enums: PrismaEnumHelper;
   private databaseType: DatabaseType;
+  private readonly fairnessPath: string[] | null;
+  private readonly fairnessLimit: number;
+
+  /**
+   * The dotted `groupBy` path this queue's fairness cap reads, or `null` when
+   * fairness is off. Read by `createSpillingJobTransport` so a spilled payload
+   * still carries its group key.
+   */
+  readonly fairnessGroupBy: string | null;
+
+  private readonly now: () => Date;
 
   constructor(prisma: PrismaClient, options: PrismaJobQueueOptions = {}) {
     this.prisma = prisma;
+    this.workerIdWasConfigured = Boolean(options.workerId);
     this.workerId = options.workerId || `worker-${process.pid}-${Date.now()}`;
     this.enums = createEnumHelper(prisma);
     this.databaseType = options.databaseType ?? "postgresql";
+    this.now = options.now ?? (() => new Date());
+    this.fairnessGroupBy = options.fairness
+      ? (options.fairness.groupBy ?? "_groupKey")
+      : null;
+    this.fairnessPath = options.fairness
+      ? splitGroupPath(options.fairness.groupBy ?? "_groupKey")
+      : null;
+    this.fairnessLimit = options.fairness
+      ? requireGroupLimit(options.fairness.maxConcurrentPerGroup)
+      : 0;
+    if (this.fairnessPath && this.databaseType === "sqlite") {
+      throw new Error(
+        "JobQueueFairness is only implemented on the PostgreSQL dequeue path",
+      );
+    }
+  }
+
+  /** The `create` args for one enqueued job. */
+  private enqueueData(job: EnqueueJobInput) {
+    return {
+      workflowRunId: job.workflowRunId,
+      stageId: job.stageId,
+      priority: job.priority ?? 5,
+      payload: {
+        ...job.payload,
+        _workflowId: job.workflowId,
+        ...(job.groupKey !== undefined ? { _groupKey: job.groupKey } : {}),
+        // Only when the run is pinned: an unpinned job's payload is then
+        // byte-identical to what every earlier release wrote.
+        ...(job.definitionVersion != null
+          ? { _definitionVersion: job.definitionVersion }
+          : {}),
+      } as unknown,
+      status: this.enums.status("PENDING"),
+      nextPollAt: job.scheduledFor ?? null,
+    };
   }
 
   /**
-   * Add a new job to the queue
+   * `deleteMany` filter matching every existing row for the
+   * `(workflowRunId, stageId)` pairs being enqueued. Delete-then-insert
+   * (rather than a Prisma `upsert` on a compound unique) is what makes
+   * the enqueue idempotent on *any* schema: a consumer whose `job_queue`
+   * predates the `@@unique([workflowRunId, stageId])` this package's
+   * reference schema now declares has no `workflowRunId_stageId`
+   * selector for `upsert` to target, and may already carry duplicate
+   * rows for a stage — which this collapses to exactly one. The new row
+   * gets a new `id`; nothing outside an in-flight host holds a job id.
+   */
+  private enqueueDeleteFilter(jobs: EnqueueJobInput[]) {
+    return {
+      where: {
+        OR: jobs.map((job) => ({
+          workflowRunId: job.workflowRunId,
+          stageId: job.stageId,
+        })),
+      },
+    };
+  }
+
+  /**
+   * Take the host's worker id unless this queue was constructed with one
+   * of its own; returns the id it will stamp on `job_queue.workerId`.
+   */
+  adoptWorkerId(workerId: string): string {
+    if (!this.workerIdWasConfigured) this.workerId = workerId;
+    return this.workerId;
+  }
+
+  /** The id this queue stamps on the jobs it claims. */
+  getWorkerId(): string {
+    return this.workerId;
+  }
+
+  /**
+   * Add a job to the queue, replacing any row already queued for the same
+   * `(workflowRunId, stageId)` — see the `JobQueue.enqueueParallel`
+   * contract.
    */
   async enqueue(options: EnqueueJobInput): Promise<string> {
-    const job = await this.prisma.jobQueue.create({
-      data: {
-        workflowRunId: options.workflowRunId,
-        stageId: options.stageId,
-        priority: options.priority ?? 5,
-        payload: {
-          ...options.payload,
-          _workflowId: options.workflowId,
-        } as unknown,
-        status: this.enums.status("PENDING"),
-        nextPollAt: options.scheduledFor,
-      },
-    });
-
-    logger.debug(
-      `Enqueued job ${job.id} for stage ${options.stageId} (run: ${options.workflowRunId})`,
-    );
-    return job.id;
+    const [id] = await this.enqueueParallel([options]);
+    return id!;
   }
 
   /**
-   * Enqueue multiple stages in parallel (same execution group)
+   * Enqueue multiple stages in parallel (same execution group).
+   *
+   * Idempotent on `(workflowRunId, stageId)`: rows already queued for
+   * those pairs are removed in the same transaction as the insert, so a
+   * `run.rerunFrom` re-enqueue or a `run.reapStuck` recovery sweep over a
+   * stage that still carries its previous (terminal) job row leaves
+   * exactly one PENDING row with `attempt` back at 0.
    */
   async enqueueParallel(jobs: EnqueueJobInput[]): Promise<string[]> {
     if (jobs.length === 0) return [];
@@ -95,38 +247,122 @@ export class PrismaJobQueue implements JobQueue {
       );
     }
 
-    const results = await this.prisma.$transaction(
-      jobs.map((job) =>
-        this.prisma.jobQueue.create({
-          data: {
-            workflowRunId: job.workflowRunId,
-            stageId: job.stageId,
-            priority: job.priority ?? 5,
-            payload: { ...job.payload, _workflowId: job.workflowId } as unknown,
-            status: this.enums.status("PENDING"),
-          },
-        }),
+    const results = await this.prisma.$transaction([
+      this.prisma.jobQueue.deleteMany(this.enqueueDeleteFilter(jobs)),
+      ...jobs.map((job) =>
+        this.prisma.jobQueue.create({ data: this.enqueueData(job) }),
       ),
-    );
+    ]);
 
-    return results.map((r: { id: string }) => r.id);
+    // results[0] is the deleteMany BatchPayload; the creates follow in order.
+    const created = (results as Array<{ id: string }>).slice(1);
+    return created.map((r) => r.id);
+  }
+
+  /**
+   * Remove every job row for the given stages of a run, whatever their
+   * status.
+   */
+  async deleteByRunAndStages(
+    workflowRunId: string,
+    stageIds: string[],
+  ): Promise<number> {
+    if (stageIds.length === 0) return 0;
+
+    const result = await this.prisma.jobQueue.deleteMany({
+      where: { workflowRunId, stageId: { in: stageIds } },
+    });
+
+    if (result.count > 0) {
+      logger.debug(
+        `Deleted ${result.count} job row(s) for run ${workflowRunId} stages [${stageIds.join(", ")}]`,
+      );
+    }
+    return result.count;
   }
 
   /**
    * Atomically dequeue the next available job
    * Uses FOR UPDATE SKIP LOCKED (PostgreSQL) or optimistic locking (SQLite)
    */
-  async dequeue(): Promise<DequeueResult | null> {
+  async dequeue(options?: DequeueOptions): Promise<DequeueResult | null> {
     if (this.databaseType === "sqlite") {
-      return this.dequeueSqlite();
+      return this.dequeueSqlite(0, options?.serves);
     }
-    return this.dequeuePostgres();
+    return this.dequeuePostgres(options?.serves);
+  }
+
+  /**
+   * The `serves` predicate, as the three values the dequeue statements
+   * bind. Kept as parameters rather than interpolated text so a workflow
+   * id or version can never reach the statement as SQL.
+   *
+   * `active` false (no `serves` given) makes the whole predicate a
+   * constant true, so the statement below is one shape whether or not
+   * version filtering is on.
+   */
+  private servesParams(serves?: readonly ServedDefinition[]): {
+    active: boolean;
+    workflowIds: string[];
+    versions: string[];
+  } {
+    if (serves === undefined) {
+      return { active: false, workflowIds: [], versions: [] };
+    }
+    return {
+      active: true,
+      workflowIds: serves.map((s) => s.workflowId),
+      versions: serves.map((s) => s.version),
+    };
+  }
+
+  /**
+   * True when this caller may claim `payload`. The JS twin of the SQL
+   * predicate below, used by the SQLite path and by the in-memory queue's
+   * conformance expectations.
+   */
+  private servesPayload(
+    payload: unknown,
+    serves?: readonly ServedDefinition[],
+  ): boolean {
+    if (serves === undefined) return true;
+    if (typeof payload !== "object" || payload === null) return true;
+    const row = payload as Record<string, unknown>;
+    const workflowId = row._workflowId;
+    // A row with no `_workflowId` is malformed (hand-inserted, or migrated
+    // from a schema that predates the field). Leave it claimable so the
+    // dead-job path can fail it, rather than stranding it PENDING forever.
+    if (typeof workflowId !== "string") return true;
+    const version = row._definitionVersion;
+    return serves.some(
+      (s) =>
+        s.workflowId === workflowId &&
+        (typeof version !== "string" || s.version === version),
+    );
   }
 
   /**
    * PostgreSQL implementation using FOR UPDATE SKIP LOCKED for safe concurrency
    */
-  private async dequeuePostgres(): Promise<DequeueResult | null> {
+  private async dequeuePostgres(
+    serves?: readonly ServedDefinition[],
+  ): Promise<DequeueResult | null> {
+    for (let i = 0; i < MAX_DEQUEUE_ATTEMPTS; i++) {
+      const job = await this.dequeuePostgresOnce(serves);
+      if (job !== "dead") return job;
+    }
+    return null;
+  }
+
+  /** One claim; `"dead"` when the claimed row was failed as unexecutable. */
+  private async dequeuePostgresOnce(
+    serves?: readonly ServedDefinition[],
+  ): Promise<DequeueResult | null | "dead"> {
+    const {
+      active: servesActive,
+      workflowIds: servesWorkflowIds,
+      versions: servesVersions,
+    } = this.servesParams(serves);
     try {
       // NOTE: deliberately calling `this.prisma.$queryRaw` directly below
       // rather than destructuring it into a local first -- Prisma's
@@ -138,33 +374,138 @@ export class PrismaJobQueue implements JobQueue {
           "Prisma client does not support $queryRaw (required for the Postgres dequeue path)",
         );
       }
-      const result = await this.prisma.$queryRaw<
-        Array<{
-          id: string;
-          workflowRunId: string;
-          stageId: string;
-          priority: number;
-          attempt: number;
-          maxAttempts: number;
-          payload: unknown;
-        }>
-      >`
+      // `now() AT TIME ZONE 'UTC'` renders the transaction's instant as the
+      // naive UTC wall clock these `timestamp(3)` columns store, so it is
+      // correct on any session timezone -- unlike a bare `NOW()`, which
+      // converts through the session's zone (see utc-timestamps.ts).
+      //
+      // Using the database clock rather than a bound `Date` means the writer
+      // of a lease and the sweeper that expires it are the same clock, so a
+      // host whose system clock drifts can neither shorten nor extend a
+      // lease. This is what pg-boss, Graphile Worker, River and Oban all do.
+      //
+      // `startedAt` comes back through `RETURNING` because it is the fence a
+      // worker hands to `complete`/`fail`/`suspend`; the application no
+      // longer knows the value it wrote.
+      //
+      // The fair variant below excludes any group that already holds
+      // `maxConcurrentPerGroup` RUNNING jobs, which is pg-boss v12's
+      // group-concurrency mechanism.
+      //
+      // - It has to be a *cap*, not an ordering. Any ordering rule loses to a
+      //   flood: whatever ranks the pending rows, the flooding group's next
+      //   row is re-ranked to the front the instant its previous one is
+      //   claimed, so a quiet group still waits behind the whole flood.
+      //   Excluding a group already at its share leaves the quiet group's job
+      //   as the only candidate, which is what actually breaks the starvation.
+      // - `FOR UPDATE OF j SKIP LOCKED` names the base table explicitly: a
+      //   plain `FOR UPDATE` is rejected on the nullable side of the LEFT
+      //   JOIN against the per-group counts.
+      // - The payload path is a bound `text[]` for `#>>`, never interpolated,
+      //   so a `groupBy` from configuration cannot reach the statement as SQL.
+      // - Fallback to `_groupKey`: a spilled payload is replaced by a claim-check
+      //   reference, so the configured path is gone from the row; `_groupKey`
+      //   is written outside the body by `enqueueData` and survives spilling,
+      //   so it is the fallback. When `groupBy` is already `"_groupKey"` the
+      //   fallback is a no-op.
+      // - Cost: the CTE aggregates every RUNNING row per claim, where the
+      //   default statement stops at the first index entry. That is why
+      //   fairness is opt-in; the measured difference is in the release notes.
+      const result = this.fairnessPath
+        ? await this.prisma.$queryRaw<DequeuedJobRow[]>`
+        WITH "group_load" AS (
+          SELECT COALESCE(payload #>> ${this.fairnessPath}::text[], payload ->> '_groupKey', '') AS grp,
+                 count(*) AS running
+          FROM "job_queue"
+          WHERE status = 'RUNNING'
+          GROUP BY 1
+        )
         UPDATE "job_queue"
         SET
           status = 'RUNNING',
           "workerId" = ${this.workerId},
-          "lockedAt" = NOW(),
-          "startedAt" = NOW(),
+          "lockedAt" = (now() AT TIME ZONE 'UTC'),
+          "startedAt" = (now() AT TIME ZONE 'UTC'),
+          attempt = attempt + 1
+        WHERE id = (
+          SELECT j.id
+          FROM "job_queue" j
+          LEFT JOIN "group_load" g
+            ON g.grp = COALESCE(j.payload #>> ${this.fairnessPath}::text[], j.payload ->> '_groupKey', '')
+          WHERE j.status = 'PENDING'
+            AND (j."nextPollAt" IS NULL
+                 OR j."nextPollAt" <= (now() AT TIME ZONE 'UTC'))
+            AND COALESCE(g.running, 0) < ${this.fairnessLimit}::bigint
+            AND (
+              -- Definition pinning, decided in the query rather than after
+              -- the claim. An inactive filter collapses the whole predicate
+              -- to true, which is how one statement serves both the
+              -- filtered and the unfiltered dequeue. The unnest of two
+              -- bound arrays is the row-value IN list a tagged template
+              -- cannot express; the NULL-version arm inside it is what
+              -- keeps an unpinned job -- enqueued before the consumer
+              -- migrated, or by a release that did not stamp the version --
+              -- claimable by any host holding its workflow.
+              ${servesActive}::boolean = false
+              OR (j.payload ->> '_workflowId') IS NULL
+              OR EXISTS (
+                SELECT 1
+                FROM unnest(${servesWorkflowIds}::text[], ${servesVersions}::text[])
+                  AS s(wf, ver)
+                WHERE s.wf = j.payload ->> '_workflowId'
+                  AND (
+                    (j.payload ->> '_definitionVersion') IS NULL
+                    OR s.ver = j.payload ->> '_definitionVersion'
+                  )
+              )
+            )
+          ORDER BY j.priority DESC, j."createdAt" ASC
+          LIMIT 1
+          FOR UPDATE OF j SKIP LOCKED
+        )
+        RETURNING id, "workflowRunId", "stageId", priority, attempt, "maxAttempts", payload, "startedAt"
+      `
+        : await this.prisma.$queryRaw<DequeuedJobRow[]>`
+        UPDATE "job_queue"
+        SET
+          status = 'RUNNING',
+          "workerId" = ${this.workerId},
+          "lockedAt" = (now() AT TIME ZONE 'UTC'),
+          "startedAt" = (now() AT TIME ZONE 'UTC'),
           attempt = attempt + 1
         WHERE id = (
           SELECT id FROM "job_queue"
           WHERE status = 'PENDING'
-            AND ("nextPollAt" IS NULL OR "nextPollAt" <= NOW())
+            AND ("nextPollAt" IS NULL
+                 OR "nextPollAt" <= (now() AT TIME ZONE 'UTC'))
+            AND (
+              -- Definition pinning, decided in the query rather than after
+              -- the claim. An inactive filter collapses the whole predicate
+              -- to true, which is how one statement serves both the
+              -- filtered and the unfiltered dequeue. The unnest of two
+              -- bound arrays is the row-value IN list a tagged template
+              -- cannot express; the NULL-version arm inside it is what
+              -- keeps an unpinned job -- enqueued before the consumer
+              -- migrated, or by a release that did not stamp the version --
+              -- claimable by any host holding its workflow.
+              ${servesActive}::boolean = false
+              OR (payload ->> '_workflowId') IS NULL
+              OR EXISTS (
+                SELECT 1
+                FROM unnest(${servesWorkflowIds}::text[], ${servesVersions}::text[])
+                  AS s(wf, ver)
+                WHERE s.wf = payload ->> '_workflowId'
+                  AND (
+                    (payload ->> '_definitionVersion') IS NULL
+                    OR s.ver = payload ->> '_definitionVersion'
+                  )
+              )
+            )
           ORDER BY priority DESC, "createdAt" ASC
           LIMIT 1
           FOR UPDATE SKIP LOCKED
         )
-        RETURNING id, "workflowRunId", "stageId", priority, attempt, "maxAttempts", payload
+        RETURNING id, "workflowRunId", "stageId", priority, attempt, "maxAttempts", payload, "startedAt"
       `;
 
       if (result.length === 0) {
@@ -172,12 +513,33 @@ export class PrismaJobQueue implements JobQueue {
       }
 
       const job = result[0];
+
+      // A row whose payload is NULL or not an object (hand-inserted or
+      // migrated) can never execute: fail and acknowledge it as a dead job
+      // and take the next row, instead of throwing out of the dequeue and
+      // aborting the whole tick on that one row.
+      if (typeof job.payload !== "object" || job.payload === null) {
+        const error = `Job ${job.id} has no payload (got ${job.payload === null ? "null" : typeof job.payload}); failed as a dead job`;
+        logger.error(error);
+        await this.prisma.jobQueue.update({
+          where: { id: job.id },
+          data: {
+            status: this.enums.status("FAILED"),
+            completedAt: this.now(),
+            lastError: error,
+            workerId: null,
+            lockedAt: null,
+          },
+        });
+        return "dead";
+      }
+
       logger.debug(
         `Dequeued job ${job.id} (stage: ${job.stageId}, attempt: ${job.attempt})`,
       );
 
       const payload = job.payload as Record<string, unknown>;
-      const { _workflowId, ...rest } = payload;
+      const { _workflowId, _groupKey, _definitionVersion, ...rest } = payload;
       return {
         jobId: job.id,
         workflowRunId: job.workflowRunId,
@@ -187,6 +549,7 @@ export class PrismaJobQueue implements JobQueue {
         attempt: job.attempt,
         maxAttempts: job.maxAttempts,
         payload: rest,
+        startedAt: job.startedAt,
       };
     } catch (error) {
       logger.error("Error dequeuing job:", error);
@@ -205,7 +568,10 @@ export class PrismaJobQueue implements JobQueue {
    * 2. Atomically update it (only succeeds if still PENDING)
    * 3. If another worker claimed it, retry
    */
-  private async dequeueSqlite(attempt = 0): Promise<DequeueResult | null> {
+  private async dequeueSqlite(
+    attempt = 0,
+    serves?: readonly ServedDefinition[],
+  ): Promise<DequeueResult | null> {
     try {
       if (attempt >= MAX_DEQUEUE_ATTEMPTS) {
         return null;
@@ -213,14 +579,34 @@ export class PrismaJobQueue implements JobQueue {
 
       const now = new Date();
 
-      // Step 1: Find the next PENDING job
-      const job = await this.prisma.jobQueue.findFirst({
-        where: {
-          status: this.enums.status("PENDING"),
-          OR: [{ nextPollAt: null }, { nextPollAt: { lte: now } }],
-        },
-        orderBy: [{ priority: "desc" }, { createdAt: "asc" }],
-      });
+      // Step 1: Find the next PENDING job this caller may claim. The
+      // `serves` predicate is applied in JS rather than pushed into the
+      // query: Prisma's SQLite connector cannot filter on a JSON path, and
+      // SQLite is the single-process development path, where a fleet
+      // running two builds against one database cannot occur. Scanning a
+      // bounded window keeps the ordering honest without a JSON index.
+      const candidates =
+        serves === undefined
+          ? await this.prisma.jobQueue.findFirst({
+              where: {
+                status: this.enums.status("PENDING"),
+                OR: [{ nextPollAt: null }, { nextPollAt: { lte: now } }],
+              },
+              orderBy: [{ priority: "desc" }, { createdAt: "asc" }],
+            })
+          : (
+              await this.prisma.jobQueue.findMany({
+                where: {
+                  status: this.enums.status("PENDING"),
+                  OR: [{ nextPollAt: null }, { nextPollAt: { lte: now } }],
+                },
+                orderBy: [{ priority: "desc" }, { createdAt: "asc" }],
+                take: SQLITE_SERVES_SCAN_LIMIT,
+              })
+            ).find((row: { payload: unknown }) =>
+              this.servesPayload(row.payload, serves),
+            );
+      const job = candidates ?? null;
 
       if (!job) {
         return null;
@@ -244,7 +630,7 @@ export class PrismaJobQueue implements JobQueue {
       if (result.count === 0) {
         // Another worker claimed it, retry (bounded to avoid unbounded
         // recursion under heavy contention)
-        return this.dequeueSqlite(attempt + 1);
+        return this.dequeueSqlite(attempt + 1, serves);
       }
 
       // Fetch the updated job to get the new attempt count
@@ -261,7 +647,12 @@ export class PrismaJobQueue implements JobQueue {
       );
 
       const claimedPayload = claimedJob.payload as Record<string, unknown>;
-      const { _workflowId: claimedWfId, ...claimedRest } = claimedPayload;
+      const {
+        _workflowId: claimedWfId,
+        _groupKey,
+        _definitionVersion,
+        ...claimedRest
+      } = claimedPayload;
       return {
         jobId: claimedJob.id,
         workflowRunId: claimedJob.workflowRunId,
@@ -271,6 +662,7 @@ export class PrismaJobQueue implements JobQueue {
         attempt: claimedJob.attempt,
         maxAttempts: claimedJob.maxAttempts,
         payload: claimedRest,
+        startedAt: now,
       };
     } catch (error) {
       logger.error("Error dequeuing job:", error);
@@ -279,9 +671,46 @@ export class PrismaJobQueue implements JobQueue {
   }
 
   /**
+   * The fenced-acknowledgement predicate: this job, still RUNNING, still
+   * on the attempt whose claim handed out `fence.startedAt` and
+   * `fence.attempt`. `status` matters as much as the stamp —
+   * `releaseStaleJobs` puts a rescued job back to PENDING without clearing
+   * `startedAt`, so the stamp alone would still let a zombie worker
+   * complete a job that is waiting to be re-claimed.
+   */
+  private fenceWhere(jobId: string, fence: JobAckFence) {
+    return {
+      id: jobId,
+      status: this.enums.status("RUNNING"),
+      startedAt: fence.startedAt,
+      attempt: fence.attempt,
+    };
+  }
+
+  private ackOutcome(jobId: string, count: number, op: string): JobAckOutcome {
+    if (count === 0) {
+      logger.warn(
+        `Job ${jobId}: ${op} acknowledgement superseded — the job is no longer the RUNNING attempt this worker claimed`,
+      );
+      return "superseded";
+    }
+    return "acknowledged";
+  }
+
+  /**
    * Mark job as completed
    */
-  async complete(jobId: string): Promise<void> {
+  async complete(jobId: string, fence?: JobAckFence): Promise<JobAckOutcome> {
+    if (fence) {
+      const result = await this.prisma.jobQueue.updateMany({
+        where: this.fenceWhere(jobId, fence),
+        data: {
+          status: this.enums.status("COMPLETED"),
+          completedAt: new Date(),
+        },
+      });
+      return this.ackOutcome(jobId, result.count, "complete");
+    }
     await this.prisma.jobQueue.update({
       where: { id: jobId },
       data: {
@@ -290,12 +719,29 @@ export class PrismaJobQueue implements JobQueue {
       },
     });
     logger.debug(`Job ${jobId} completed`);
+    return "acknowledged";
   }
 
   /**
    * Mark job as suspended (for async-batch)
    */
-  async suspend(jobId: string, nextPollAt: Date): Promise<void> {
+  async suspend(
+    jobId: string,
+    nextPollAt: Date,
+    fence?: JobAckFence,
+  ): Promise<JobAckOutcome> {
+    if (fence) {
+      const result = await this.prisma.jobQueue.updateMany({
+        where: this.fenceWhere(jobId, fence),
+        data: {
+          status: this.enums.status("SUSPENDED"),
+          nextPollAt,
+          workerId: null,
+          lockedAt: null,
+        },
+      });
+      return this.ackOutcome(jobId, result.count, "suspend");
+    }
     await this.prisma.jobQueue.update({
       where: { id: jobId },
       data: {
@@ -306,6 +752,41 @@ export class PrismaJobQueue implements JobQueue {
       },
     });
     logger.debug(`Job ${jobId} suspended until ${nextPollAt.toISOString()}`);
+    return "acknowledged";
+  }
+
+  /**
+   * Return a claimed job to PENDING with a later `nextPollAt`, *without*
+   * counting the claim as an attempt: the dequeue incremented `attempt`,
+   * so this decrements it back. See `JobQueue.defer` for why declining is
+   * not failing.
+   */
+  async defer(
+    jobId: string,
+    nextPollAt: Date,
+    reason: string,
+    fence?: JobAckFence,
+  ): Promise<JobAckOutcome> {
+    const data = {
+      status: this.enums.status("PENDING"),
+      nextPollAt,
+      workerId: null,
+      lockedAt: null,
+      lastError: reason,
+      attempt: { decrement: 1 },
+    };
+    if (fence) {
+      const result = await this.prisma.jobQueue.updateMany({
+        where: this.fenceWhere(jobId, fence),
+        data,
+      });
+      return this.ackOutcome(jobId, result.count, "defer");
+    }
+    await this.prisma.jobQueue.update({ where: { id: jobId }, data });
+    logger.debug(
+      `Job ${jobId} deferred until ${nextPollAt.toISOString()}: ${reason}`,
+    );
+    return "acknowledged";
   }
 
   /**
@@ -315,7 +796,8 @@ export class PrismaJobQueue implements JobQueue {
     jobId: string,
     error: string,
     shouldRetry: boolean = false,
-  ): Promise<void> {
+    fence?: JobAckFence,
+  ): Promise<JobAckOutcome> {
     const job = await this.prisma.jobQueue.findUnique({
       where: { id: jobId },
       select: { attempt: true, maxAttempts: true },
@@ -325,6 +807,20 @@ export class PrismaJobQueue implements JobQueue {
       // Re-queue for retry with exponential backoff
       const backoffMs = 2 ** job.attempt * 1000; // 2s, 4s, 8s...
       const nextPollAt = new Date(Date.now() + backoffMs);
+
+      if (fence) {
+        const result = await this.prisma.jobQueue.updateMany({
+          where: this.fenceWhere(jobId, fence),
+          data: {
+            status: this.enums.status("PENDING"),
+            lastError: error,
+            workerId: null,
+            lockedAt: null,
+            nextPollAt: nextPollAt,
+          },
+        });
+        return this.ackOutcome(jobId, result.count, "fail");
+      }
 
       await this.prisma.jobQueue.update({
         where: { id: jobId },
@@ -337,7 +833,20 @@ export class PrismaJobQueue implements JobQueue {
         },
       });
       logger.debug(`Job ${jobId} failed, will retry in ${backoffMs}ms`);
+      return "acknowledged";
     } else {
+      if (fence) {
+        const result = await this.prisma.jobQueue.updateMany({
+          where: this.fenceWhere(jobId, fence),
+          data: {
+            status: this.enums.status("FAILED"),
+            completedAt: new Date(),
+            lastError: error,
+          },
+        });
+        return this.ackOutcome(jobId, result.count, "fail");
+      }
+
       await this.prisma.jobQueue.update({
         where: { id: jobId },
         data: {
@@ -347,6 +856,7 @@ export class PrismaJobQueue implements JobQueue {
         },
       });
       logger.debug(`Job ${jobId} failed permanently: ${error}`);
+      return "acknowledged";
     }
   }
 
@@ -379,7 +889,7 @@ export class PrismaJobQueue implements JobQueue {
 
     return jobs.map((job: any) => {
       const payload = (job.payload ?? {}) as Record<string, unknown>;
-      const { _workflowId, ...rest } = payload;
+      const { _workflowId, _groupKey, _definitionVersion, ...rest } = payload;
       return {
         id: job.id,
         createdAt: job.createdAt,
@@ -406,6 +916,18 @@ export class PrismaJobQueue implements JobQueue {
    * Refresh a running job's lease without changing status.
    */
   async touchJob(jobId: string): Promise<void> {
+    if (this.databaseType !== "sqlite" && this.prisma.$queryRaw) {
+      // Renew the lease from the database clock: a heartbeat written from
+      // the application clock while the sweeper reads the database clock
+      // would reintroduce exactly the drift this change removes.
+      await this.prisma.$queryRaw`
+        UPDATE "job_queue"
+        SET "lockedAt" = (now() AT TIME ZONE 'UTC'),
+            "updatedAt" = (now() AT TIME ZONE 'UTC')
+        WHERE id = ${jobId} AND status = 'RUNNING'
+      `;
+      return;
+    }
     await this.prisma.jobQueue.updateMany({
       where: { id: jobId, status: this.enums.status("RUNNING") },
       data: { lockedAt: new Date() },
@@ -413,9 +935,50 @@ export class PrismaJobQueue implements JobQueue {
   }
 
   /**
-   * Release stale locks (for crashed workers)
+   * Release stale locks (for crashed workers). Stamps `lastError` with
+   * the `LEASE_HEARTBEAT_LOST` prefix so an operator can tell a reclaimed
+   * lease from a stage-level failure. The fine-grained tier of a two-tier
+   * expiry whose coarse tier is `expireRunawayJobs`.
+   *
+   * On PostgreSQL, the deadline is derived in-database from the same `now()`
+   * the claim stamped, so the sweep does not depend on the sweeping host's
+   * system clock. `"updatedAt"` is set explicitly because a raw `UPDATE`
+   * does not trigger Prisma's `@updatedAt`.
+   *
+   * SQLite has no `now() AT TIME ZONE`, so it keeps the application-clock
+   * comparison (single-process by nature, where the two clocks are the
+   * same clock anyway).
    */
   async releaseStaleJobs(staleThresholdMs: number = 300000): Promise<number> {
+    const reason = `${LEASE_HEARTBEAT_LOST}: no heartbeat for more than ${staleThresholdMs}ms; lease released for another worker`;
+
+    if (this.databaseType !== "sqlite" && this.prisma.$queryRaw) {
+      // NOTE: deliberately calling `this.prisma.$queryRaw` directly rather
+      // than destructuring it into a local first -- Prisma's runtime reads
+      // internal state off `this` inside its own method bodies.
+      const released = await this.prisma.$queryRaw<Array<{ id: string }>>`
+        UPDATE "job_queue"
+        SET
+          status = 'PENDING',
+          "workerId" = NULL,
+          "lockedAt" = NULL,
+          "updatedAt" = (now() AT TIME ZONE 'UTC'),
+          "lastError" = ${reason}
+        WHERE status = 'RUNNING'
+          AND "lockedAt" IS NOT NULL
+          AND "lockedAt" <
+              (now() AT TIME ZONE 'UTC')
+              - ${staleThresholdMs}::double precision * interval '1 millisecond'
+        RETURNING id
+      `;
+      if (released.length > 0) {
+        logger.debug(
+          `Released ${released.length} stale job(s) (lease older than ${staleThresholdMs}ms by the database clock)`,
+        );
+      }
+      return released.length;
+    }
+
     const thresholdDate = new Date(Date.now() - staleThresholdMs);
 
     const result = await this.prisma.jobQueue.updateMany({
@@ -427,6 +990,7 @@ export class PrismaJobQueue implements JobQueue {
         status: this.enums.status("PENDING"),
         workerId: null,
         lockedAt: null,
+        lastError: reason,
       },
     });
 
@@ -436,6 +1000,68 @@ export class PrismaJobQueue implements JobQueue {
       );
     }
 
+    return result.count;
+  }
+
+  /**
+   * Fail every RUNNING job whose claim has exceeded the coarse absolute cap.
+   *
+   * The coarse tier of a two-tier expiry: `releaseStaleJobs` handles the
+   * fine-grained heartbeat signal and requeues for another worker when a
+   * worker dies, but is defeated by a worker that is alive but wedged
+   * (e.g. infinite loop or hung network call) because it keeps heartbeating.
+   *
+   * `startedAt` is the per-claim stamp that the heartbeat never touches
+   * (a suspended job that resumes is re-claimed and gets a fresh `startedAt`,
+   * so this measures one attempt's wall time, not the run's). A job past
+   * this cap is failed terminally with `LEASE_ABSOLUTE_CAP` rather than
+   * requeued, as a job that hung for the full cap will hang again.
+   *
+   * On PostgreSQL, the deadline is derived in-database for the same single-clock
+   * reason the heartbeat sweep is. The run itself is resolved afterwards by
+   * `run.reapStuck` on its next pass.
+   */
+  async expireRunawayJobs(absoluteTimeoutMs: number): Promise<number> {
+    const reason = `${LEASE_ABSOLUTE_CAP}: held its lease for more than ${absoluteTimeoutMs}ms while still heartbeating; failed as a runaway`;
+
+    if (this.databaseType !== "sqlite" && this.prisma.$queryRaw) {
+      // NOTE: deliberately calling `this.prisma.$queryRaw` directly rather
+      // than destructuring it into a local first -- Prisma's runtime reads
+      // internal state off `this` inside its own method bodies.
+      const expired = await this.prisma.$queryRaw<Array<{ id: string }>>`
+        UPDATE "job_queue"
+        SET
+          status = 'FAILED',
+          "completedAt" = (now() AT TIME ZONE 'UTC'),
+          "updatedAt" = (now() AT TIME ZONE 'UTC'),
+          "lastError" = ${reason}
+        WHERE status = 'RUNNING'
+          AND "startedAt" IS NOT NULL
+          AND "startedAt" <
+              (now() AT TIME ZONE 'UTC')
+              - ${absoluteTimeoutMs}::double precision * interval '1 millisecond'
+        RETURNING id
+      `;
+      if (expired.length > 0) {
+        logger.warn(
+          `Expired ${expired.length} runaway job(s) past the ${absoluteTimeoutMs}ms absolute lease cap`,
+        );
+      }
+      return expired.length;
+    }
+
+    const cutoff = new Date(this.now().getTime() - absoluteTimeoutMs);
+    const result = await this.prisma.jobQueue.updateMany({
+      where: {
+        status: this.enums.status("RUNNING"),
+        startedAt: { not: null, lt: cutoff },
+      },
+      data: {
+        status: this.enums.status("FAILED"),
+        completedAt: this.now(),
+        lastError: reason,
+      },
+    });
     return result.count;
   }
 }

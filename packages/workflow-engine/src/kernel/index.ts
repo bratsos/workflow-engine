@@ -8,8 +8,12 @@
 // Command types
 export type {
   CommandResult,
+  DefinitionVersionSummary,
+  EventSinkStatus,
   JobExecuteCommand,
   JobExecuteResult,
+  JobHeartbeatCommand,
+  JobHeartbeatResult,
   KernelCommand,
   KernelCommandType,
   LeaseReapStaleCommand,
@@ -25,17 +29,32 @@ export type {
   RunCreateAnnotation,
   RunCreateCommand,
   RunCreateResult,
+  RunListVersionsCommand,
+  RunListVersionsResult,
+  RunPurgeCommand,
+  RunPurgeResult,
   RunReapStuckCommand,
   RunReapStuckResult,
+  RunRedriveCommand,
+  RunRedriveFrom,
+  RunRedriveResult,
   RunRerunFromCommand,
   RunRerunFromResult,
   RunTransitionCommand,
   RunTransitionResult,
   StagePollSuspendedCommand,
   StagePollSuspendedResult,
+  StepSignalCommand,
+  StepSignalResult,
 } from "./commands.js";
 // Kernel errors
-export { IdempotencyInProgressError } from "./errors.js";
+export {
+  AIServicesNotConfiguredError,
+  DefinitionVersionConflictError,
+  DefinitionVersionMismatchError,
+  IdempotencyInProgressError,
+  SpilledPayloadUnavailableError,
+} from "./errors.js";
 
 // Event types
 export type {
@@ -47,6 +66,7 @@ export type {
   StageProgressEvent,
   StageStartedEvent,
   StageSuspendedEvent,
+  StepSignalledEvent,
   WorkflowCancelledEvent,
   WorkflowCompletedEvent,
   WorkflowCreatedEvent,
@@ -60,8 +80,22 @@ export {
   createRoutingExecutor,
   type RoutingExecutorOptions,
 } from "./executor/routing-executor.js";
+// Definition pinning helpers, for hosts that resolve definitions themselves.
+export { SUPERSEDED_ATTEMPT_KEY } from "./handlers/run-redrive.js";
+export {
+  assertServesRun,
+  recordDefinitionVersion,
+  resolvePinnedWorkflow,
+  servedDefinitions,
+  servesRun,
+} from "./helpers/definition-pinning.js";
 // Kernel helpers
 export {
+  type CreateEventSinkMonitorOptions,
+  createEventSinkMonitor,
+  type EventSinkHealth,
+  type EventSinkMonitor,
+  type EventSinkObservation,
   type ExecuteJobOutcome,
   type ExecuteJobWithHeartbeatOptions,
   executeJobWithHeartbeat,
@@ -70,15 +104,25 @@ export {
   loadWorkflowContext,
   type MaintenanceTickCounts,
   normalizeAnnotateArgs,
+  type RetentionOptions,
   type RunMaintenanceTickOptions,
   runMaintenanceTick,
   saveStageOutput,
   toErrorMessage,
+  toEventSinkObservation,
 } from "./helpers/index.js";
+// Durable-step API constructor for hosts that build a stage context themselves
+// (e.g. remote activity workers). Without a ledger every ctx.step.* call throws
+// StepLedgerNotConfiguredError, which is the documented behaviour.
+export {
+  type CreateStepApiOptions,
+  createStepApi,
+} from "./helpers/step-api";
 // Kernel factory and core interfaces
 export {
   type AnnotateAttachInput,
   createKernel,
+  createWorkflowRegistry,
   type Kernel,
   type KernelAnnotations,
   type KernelConfig,
@@ -97,6 +141,7 @@ export type {
   ActivityExecutor,
   ActivityRunInput,
   ActivityRunResult,
+  AIHelperFactory,
   AnnotationActor,
   AnnotationFilters,
   AnnotationScope,
@@ -109,8 +154,26 @@ export type {
   ExecutorDeps,
   IdempotencyRecord,
   JobTransport,
+  KernelServices,
   OutboxRecord,
   Persistence,
   Scheduler,
+  ServedDefinition,
+  StepLedger,
+  StepRecord,
   WorkflowAnnotationRecord,
 } from "./ports.js";
+// Claim-check spilling for unbounded payloads
+export {
+  createPayloadSpill,
+  createSpillingJobTransport,
+  DEFAULT_SPILL_THRESHOLD_BYTES,
+  isSpillRef,
+  type PayloadSpill,
+  type PayloadSpillOptions,
+  SPILL_REF_MARKER,
+  type SpillingJobTransportOptions,
+  type SpillRef,
+  stepSpillPrefix,
+  withStepResultSpill,
+} from "./spill.js";

@@ -6,7 +6,6 @@
 
 import { beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
-import type { ModelKey } from "../../ai/model-helper.js";
 import { createMockAIHelper, MockAIHelper } from "../utils/mock-ai-helper.js";
 
 describe("I want to use tools with AIHelper", () => {
@@ -433,7 +432,7 @@ describe("I want to use tools with AIHelper", () => {
       };
 
       // When: I make a call
-      await ai.generateText("gemini-2.5-pro" as ModelKey, "Test model", {
+      await ai.generateText("gemini-2.5-pro", "Test model", {
         tools,
       });
 

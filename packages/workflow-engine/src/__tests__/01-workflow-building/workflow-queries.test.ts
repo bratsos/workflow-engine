@@ -38,16 +38,15 @@ describe("I want to query my workflow", () => {
         .pipe(stageC)
         .build();
 
-      // When: I call getExecutionOrder()
-      const order = workflow.getExecutionOrder();
+      // When: I call getExecutionPlan()
+      const plan = workflow.getExecutionPlan();
 
-      // Then: Returns human-readable execution order
-      expect(order).toContain("Query Workflow");
-      expect(order).toContain("Total stages: 3");
-      expect(order).toContain("Stage A");
-      expect(order).toContain("Stage B");
-      expect(order).toContain("Stage C");
-      expect(order).toContain("First stage"); // Description
+      // Then: Returns one group per sequential stage, in order
+      expect(plan).toHaveLength(3);
+      expect(plan.map((group) => group.map((node) => node.stage.name))).toEqual(
+        [["Stage A"], ["Stage B"], ["Stage C"]],
+      );
+      expect(plan[0]?.[0]?.stage.description).toBe("First stage");
     });
 
     it("should show parallel stages in execution order", () => {
@@ -69,11 +68,16 @@ describe("I want to query my workflow", () => {
         .parallel([stageA, stageB])
         .build();
 
-      // When: I call getExecutionOrder()
-      const order = workflow.getExecutionOrder();
+      // When: I call getExecutionPlan()
+      const plan = workflow.getExecutionPlan();
 
-      // Then: Shows parallel indicator
-      expect(order).toContain("[PARALLEL]");
+      // Then: Both stages share one execution group
+      expect(plan).toHaveLength(1);
+      expect(plan[0]?.map((node) => node.stage.id)).toEqual([
+        "stage-a",
+        "stage-b",
+      ]);
+      expect(new Set(plan[0]?.map((node) => node.executionGroup)).size).toBe(1);
     });
   });
 

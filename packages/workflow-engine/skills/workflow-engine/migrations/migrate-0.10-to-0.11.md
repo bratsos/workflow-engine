@@ -8,6 +8,8 @@ A second wave folded into this same 0.11 release removes/relocates a handful of 
 
 ## Required actions
 
+- [ ] **Check the name of your `status` enum.** 0.11's Postgres `claimNextPendingRun` is a raw `FOR UPDATE SKIP LOCKED` statement that casts with `::"Status"` (0.10 issued no cast). A schema whose enum is named differently fails on the first orchestration tick with `42704 type "Status" does not exist`. From 1.0 pass `createPrismaWorkflowPersistence(prisma, { statusEnumName: "WorkflowStatus" })`; on 0.11–0.13 rename the enum (`@@map("Status")` plus `ALTER TYPE ... RENAME`).
+
 - [ ] **Install `zod` explicitly.** `@bratsos/workflow-engine` and `@bratsos/workflow-engine-host-remote` moved `zod` from a regular dependency to a `peerDependency` (`^4.1.12`). If your project doesn't already depend on `zod` directly, add it:
   ```bash
   pnpm add zod

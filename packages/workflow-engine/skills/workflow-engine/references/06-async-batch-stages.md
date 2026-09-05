@@ -10,13 +10,15 @@ Async batch stages allow workflows to:
 3. Resume automatically when results are ready
 4. Achieve significant cost savings on large AI workloads (discounted per-model batch pricing)
 
+**Since 1.0 the preferred way to run an AI batch is `ctx.step.ai.map(id, items, { policy: "batch" | "auto" })` inside an ordinary `defineStage`** -- one primitive with the same schema validation and repair on the realtime and batch paths, crash-safe submits, and no `checkCompletion` to write. See [12-durable-steps.md](12-durable-steps.md) ("`ctx.step.ai`" and "Migrating an async-batch stage to steps"). This reference covers the lower-level `ai.batch()` API and the async-batch *stage mode*, which still runs: `defineAsyncBatchStage` is no longer exported from the root or `/client` entries, and `defineStage({ mode: "async-batch", checkCompletion })` is the same thing. `npx workflow-engine-codemod --from 0.13` flags every remaining use.
+
 ## Creating an Async Batch Stage
 
 ```typescript
-import { defineAsyncBatchStage } from "@bratsos/workflow-engine";
+import { defineStage } from "@bratsos/workflow-engine";
 import { z } from "zod";
 
-const batchStage = defineAsyncBatchStage({
+const batchStage = defineStage({
   id: "batch-process",
   name: "Batch Process",
   mode: "async-batch",  // Required marker
@@ -82,11 +84,12 @@ async execute(ctx) {
     schema: ItemResultSchema,
   }));
 
-  // Submit to batch API (provider is auto-detected or explicitly specified)
-  const ai = createAIHelper(`batch.${ctx.workflowRunId}`, aiLogger);
-  const batch = ai.batch("claude-sonnet-4-20250514", "anthropic");
+  // Submit to batch API (provider is auto-detected or explicitly specified).
+  // ctx.ai is the stage-scoped helper the kernel builds from
+  // createKernel({ services }); its calls log under workflow.<runId>.stage.<stageId>.
+  const batch = ctx.ai.batch("claude-sonnet-4-20250514", "anthropic");
   // Or via OpenRouter with injected credentials:
-  // const batch = ai.batch("openai/gpt-4o", "openrouter", { apiKey: ctx.config.openRouterApiKey });
+  // const batch = ctx.ai.batch("openai/gpt-4o", "openrouter", { apiKey: ctx.config.openRouterApiKey });
   const handle = await batch.submit(requests);
 
   // Store metadata for resume
@@ -130,7 +133,6 @@ interface SimpleSuspendedResult {
     pollInterval?: number;   // Optional: ms between checks; defaults to pollConfig.pollInterval or 30s
     maxWaitTime?: number;    // Optional: max wait before timeout; defaults to pollConfig.maxWaitTime or 24h
     metadata?: Record<string, unknown>;  // Custom data
-    apiKey?: string;         // Optional: for provider auth
   };
 
   pollConfig?: {             // Optional (v0.11+): derived automatically from `state` when omitted
@@ -143,7 +145,7 @@ interface SimpleSuspendedResult {
 }
 ```
 
-As of v0.11, `pollConfig` is entirely optional and derived from `state` (falling back to a 30s poll interval / 24h max wait) -- `state.batchId` is the only field you must actually compute yourself.
+As of v0.11, `pollConfig` is entirely optional and derived from `state` (falling back to a 30s poll interval / 24h max wait) -- `state.batchId` is the only field you must actually compute yourself. `state.submittedAt` / `pollInterval` / `maxWaitTime` are deprecated in favour of `pollConfig`; `defineStage()` still back-fills them for an async-batch `checkCompletion`, so they go away with that mode, not before. The pre-1.0 `state.apiKey` field is gone: inject credentials through `BatchOptions.apiKey` or a `providerResolver` instead of persisting them in the stage row.
 
 ## Check Completion Function
 
@@ -154,9 +156,8 @@ async checkCompletion(suspendedState, ctx) {
   // suspendedState contains the state from SimpleSuspendedResult
   const { batchId, metadata } = suspendedState;
 
-  // Create AI helper for batch operations
-  const ai = createAIHelper(`batch.${ctx.workflowRunId}`, aiLogger);
-  const batch = ai.batch(ctx.config.model, metadata?.provider as "anthropic");
+  // ctx.ai is the same stage-scoped helper execute() saw
+  const batch = ctx.ai.batch(ctx.config.model, metadata?.provider as "anthropic");
 
   // Check batch status
   const status = await batch.getStatus(batchId, metadata);
@@ -231,8 +232,8 @@ interface CompletionCheckResult<TOutput> {
 
   // If ready === true
   output?: TOutput;          // Stage output
-  metrics?: Record<string, number>;
-  embeddings?: unknown;      // Optional embedding info
+  metrics?: StageMetrics;
+  embeddings?: EmbeddingInfo; // Optional embedding info
 
   // If ready === false
   error?: string;            // Failure reason (stops workflow)
@@ -246,18 +247,24 @@ interface CompletionCheckResult<TOutput> {
 interface CheckCompletionContext<TConfig> {
   workflowRunId: string;     // Current workflow run
   stageId: string;           // Current stage ID
-  stageRecordId: string;     // Database record ID (for LogContext)
+  stageRecordId?: string;    // Database record ID (for LogContext)
   config: TConfig;           // Stage configuration
-  onLog: LogFunction;        // Async logging
+  step: StepApi;             // Durable steps, scoped to the same stage record execute() wrote
+  ai: AIHelper;              // Stage-scoped AI helper (workflow.<runId>.stage.<stageId>), built lazily
+  aiLogger: AICallLogger;    // Logger the scoped helper records into
+  onLog: LogFunction;        // Fire-and-forget logging; returns void
   log: LogFunction;          // Alias for onLog
+  annotate: AnnotateFn;      // Buffered, flushed in the completion transaction
   storage: StageStorage;     // Artifact storage
 }
 ```
 
+`step`, `ai` and `aiLogger` are **required** since 1.0. A hand-built context (a custom host, a unit test calling `stage.checkCompletion(state, ctx)` directly) must provide them: `createStepApi()` from `@bratsos/workflow-engine/kernel` builds a ledger-less step API, and `createMockAIHelperFactory()` from `/testing` supplies the mock helper. Accessing `ctx.ai` on a kernel built without `services` throws `AIServicesNotConfiguredError`.
+
 ## Complete Example: Batch Embedding Stage
 
 ```typescript
-const batchEmbeddingStage = defineAsyncBatchStage({
+const batchEmbeddingStage = defineStage({
   id: "batch-embeddings",
   name: "Generate Embeddings",
   mode: "async-batch",
@@ -295,8 +302,7 @@ const batchEmbeddingStage = defineAsyncBatchStage({
     }));
 
     // Submit batch
-    const ai = createAIHelper(`batch.${ctx.workflowRunId}`, aiLogger);
-    const batch = ai.batch<number[]>(ctx.config.model, "google");
+    const batch = ctx.ai.batch<number[]>(ctx.config.model, "google");
 
     const requests = texts.map(t => ({
       id: t.id,
@@ -330,8 +336,7 @@ const batchEmbeddingStage = defineAsyncBatchStage({
   },
 
   async checkCompletion(state, ctx) {
-    const ai = createAIHelper(`batch.${ctx.workflowRunId}`, aiLogger);
-    const batch = ai.batch<number[]>(ctx.config.model, "google");
+    const batch = ctx.ai.batch<number[]>(ctx.config.model, "google");
 
     const status = await batch.getStatus(state.batchId, state.metadata);
     await ctx.log("DEBUG", `Batch status: ${status.status}`);
@@ -376,7 +381,11 @@ const batchEmbeddingStage = defineAsyncBatchStage({
 
 Batch processing runs through the AI SDK provider batch interfaces or directly through OpenRouter's Batch API. Supported providers are `"google"`, `"anthropic"`, `"openai"`, and `"openrouter"`.
 
-Batch pricing is model-specific (not a flat 50% discount) and is loaded into `batchInputCostPerMillion` / `batchOutputCostPerMillion` in the model catalog.
+Check batch capability with `getModel(key).supportsAsyncBatch` (the 0.13 `modelSupportsBatch` helper is gone). Batch pricing is model-specific (not a flat 50% discount) and is loaded into `batchInputCostPerMillion` / `batchOutputCostPerMillion` in the model catalog; `workflow-engine-sync` now emits those absolute prices (applying the native vendor discount to the model's own prices when the catalog has no `:batch` sibling) instead of the 0.13 `batchDiscountPercent` field, which the codemod flags. A hand-written `batchDiscountPercent` is still honoured on a native transport.
+
+**Which transport a batch runs on** is resolved in this order: the call's `batch.provider` first, then the model's registry field `batchProvider` (`"openrouter" | "google" | "anthropic" | "openai"`), then the slug's native vendor, then OpenRouter. A model that names `batchProvider: "openrouter"` is batched there even without a catalog `:batch` row. When the vendor SDK is not installed (`@ai-sdk/anthropic` / `@ai-sdk/openai` are optional peers) and OpenRouter can batch the model, the helper falls back to the OpenRouter transport with a WARN instead of failing the submit with `Package "@ai-sdk/anthropic" is required`. A batch is polled and collected through the transport its stored refs name, so changing `batchProvider` while a batch is in flight does not strand the run.
+
+**Batch discounts do not compound with cache discounts, and the engine never treats them as if they did.** `calculateBatchCost` applies exactly one adjustment to the base price — the vendor's documented percentage on a native transport (`batchDiscountPercent`, when present), or the absolute `":batch"` catalog price on the OpenRouter transport — never both, and the engine models no cached-token bucket at all. That matters because two providers document the opposite of the naive model: Vertex states that "the discounts for cache and batch don't stack; the 90% cache hit discount takes precedence over the batch discount", and the Gemini Developer API bills a `cached_content` hit at context-caching rates rather than batch rates. The engine has no Vertex transport, so the Vertex rule does not apply to it directly; on Google batches that do hit the implicit cache the engine's flat 50% **overstates** cost for the cached tokens (the provider charges 10% of base for them, not 50%). OpenRouter documents a second asymmetry: non-token components — web search, prompt caching — are not discounted at all. Treat the engine's batch figure as an estimate; where a provider reports a cost, `resolveCost` prefers the reported number.
 
 ### Google
 
@@ -424,12 +433,44 @@ interface BatchOptions {
   endpoint?: "/v1/chat/completions" | "/v1/responses" | "/v1/messages" | "/v1/embeddings";
   maxRequestsPerBatch?: number; // Request chunk size per upstream batch (default: 500)
   maxPartitions?: number;       // Maximum allowed partition count (default: 20)
+  abortSignal?: AbortSignal;    // Cancels every provider call this handle makes (submit, polls, result fetches)
 }
 ```
 
+`apiKey`, `baseURL` and `fetch` reach every vendor's batch model (`resolveAiSdkBatchModel` accepts them), not only OpenRouter's. Inside a stage, pass `ctx.abortSignal` so a cancelled run stops polling.
+
+Through `ctx.step.ai.map` the same options travel as `batch.options`, next to `batch.provider`, `batch.pollEvery` (default `"60s"`), `batch.timeout` (a non-sliding deadline, default `"24h"`), `batch.onExpiry` (`"fail"`, the default, throws `AiMapBatchFailedError`; `"partial"` returns every item as failed with that error) and `batch.onReclaim` (below).
+
+### Crash recovery: what happens when a worker dies mid-submit
+
+Creating a batch is a non-idempotent external call. If the worker dies after the provider accepted the creation but before the engine recorded it, a naive replay submits the whole batch again: the first batch is orphaned, still processed, still billed, and never read. Google documents the failure mode explicitly — "if you send the same creation request twice, two separate batch jobs will be created" — and none of the four transports dedupes by content.
+
+`ctx.step.ai.map` therefore submits under the durable step's `externalKey` (see *Non-idempotent external calls* in `12-durable-steps.md`), with one sub-key per partition (`<key>-p0`, `-p1`, ...). Each adapter stamps that key into whatever field the provider exposes at creation, and on a replay of a crashed submit the engine searches for it before creating anything:
+
+| Transport | Field the key is stamped into | Recovery |
+|---|---|---|
+| `openai` | batch `metadata.workflow_engine_external_key` (`POST /v1/batches` takes 16 key-value pairs; `GET /v1/batches` returns them) | Adopted from the batch list |
+| `google` | batch `displayName` (overwriting the AI SDK's generated one; `GET /v1beta/batches` lists it) | Adopted from the batch list |
+| `anthropic` | — Message Batches carry no metadata field | **Not recoverable** |
+| `openrouter` | — the beta batch body takes only `endpoint`, `model`, `requests` | **Not recoverable** |
+
+On the two recoverable transports the replay adopts the existing batch and continues polling it; nothing is submitted twice. A partition the crashed worker never reached is simply created, so a crash halfway through a fan-out costs nothing.
+
+On the two that are not recoverable the engine **stops** rather than paying twice: the reclaimed submit throws `BatchNotAdoptableError` (exported from the root entry), naming the transport and the external key so you can look for the batch the dead worker created. This is a deliberate behaviour change in 1.0.0-alpha.9 — earlier versions silently created and billed a second batch. To restore the old behaviour for a specific map, say so:
+
+```typescript
+await ctx.step.ai.map("extract", items, {
+  model: "gemini-2.5-flash",
+  prompt: (item) => `Extract ${item}`,
+  batch: { onReclaim: "resubmit" },  // default is "adopt"
+});
+```
+
+The adoption search itself is a plain list call over the provider's HTTP API using the same credentials as the submit; it scans up to five pages of 100 batches, newest first. If the lookup fails (a 500, a bad key), the submit fails rather than reporting "no batch found" and duplicating.
+
 ### Provider Resolution & Auto-Detection
 
-If `provider` is omitted from `ai.batch(modelKey)`, the engine inspects the model key/ID to find a matching provider. If no known batch-capable provider exists for the model, `ai.batch()` **throws an error immediately** with an actionable message directing you to pass an explicit provider.
+If `provider` is omitted from `ai.batch(modelKey)`, the engine resolves it as described under "Batch Providers": the model's `batchProvider` field, then the slug's native vendor (`ModelConfig.provider` decides the vendor whether `id` is the bare model id or the catalog slug), then OpenRouter. If no batch-capable transport exists for the model, `ai.batch()` **throws an error immediately** with an actionable message directing you to pass an explicit provider. An OpenRouter creation error `does not have a :batch endpoint` means the catalog row exists but the endpoint is not live for that model.
 
 ### OpenRouter Batch Transport Caveats
 
@@ -437,8 +478,9 @@ When using `"openrouter"` batch processing, keep these operational characteristi
 - **Text only:** Image, audio, video, and file multimodal parts are rejected.
 - **24-hour expiration without partial recovery:** OpenRouter sets a 24h completion window. If expired, `results` returns `null` and **no partial results are recoverable**. To bound risk, `workflow-engine` automatically caps each batch at `maxRequestsPerBatch` (default: 500).
 - **No cancel or list endpoint:** OpenRouter batch API does not support cancelling in-flight batches or listing batches.
-- **No idempotency key:** POST submissions are not auto-retried on network failures.
+- **No idempotency key:** POST submissions are not auto-retried on network failures, and a reclaimed submit cannot adopt the batch a dead worker created (see "Crash recovery" above).
 - **Schema partitioning:** Google models require every request in a batch to share the same response schema. `batch.submit()` automatically partitions requests by `(endpoint, modelId, schema)` to satisfy this constraint.
+- **Structured outputs:** every JSON `responseFormat` sent to an OpenAI, OpenRouter or Google model is rewritten at the model boundary into a shape the target accepts (`oneOf` to `anyOf`, every property `required` with optional ones nullable, `z.record` as `{ key, value }` pairs for OpenAI strict mode, Gemini's own schema dialect for Google batches) and the reply is restored before validation against the original Zod schema. A keyword the target cannot express (`patternProperties`, `not`, `if`/`then`, ...) fails the submit with `UnportableSchemaError` before any request is sent.
 
 ## Polling Configuration
 
@@ -478,7 +520,7 @@ pollConfig: {
 
 **As of v0.11, `maxWaitTime` is actually enforced** -- before v0.11 it was accepted but silently ignored, so a suspended stage would poll forever regardless of the value you set. If any of your stages relied on that (an implicit "poll forever"), they will now time out and fail once `maxWaitTime` elapses; audit values that were set low "because it didn't matter."
 
-The manual check below inside `checkCompletion` is now belt-and-suspenders rather than the only enforcement (note: OpenRouter batch does not support remote cancellation):
+The manual check below inside `checkCompletion` is now belt-and-suspenders rather than the only enforcement (note: OpenRouter batch does not support remote cancellation). A stage that fails terminally from the poll path (a `checkCompletion` error, a wait past its deadline) also finalises its `job_queue` row as `FAILED` rather than leaving it `SUSPENDED`:
 
 ```typescript
 // In checkCompletion, check for timeout

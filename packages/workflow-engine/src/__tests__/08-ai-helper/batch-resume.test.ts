@@ -113,7 +113,7 @@ function newBatch(
 ) {
   const batch = new AIBatchImpl(
     { topic: "resume-test", aiCallLogger: logger as never },
-    MODEL_ID as never,
+    MODEL_ID,
     "openrouter",
     logFn as never,
     { apiKey: "k", ...options } as never,

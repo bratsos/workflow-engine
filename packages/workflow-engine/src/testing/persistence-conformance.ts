@@ -1,28 +1,33 @@
 /**
  * Persistence Conformance Suite
  *
- * Shared vitest suites that verify any implementation of
- * `WorkflowPersistence`, `AICallLogger`, or `JobQueue` follows the
- * contract documented on those interfaces. Used internally to pin the
- * in-memory implementations (see
+ * Shared test suites that verify any implementation of
+ * `WorkflowPersistence`, `AICallLogger`, `JobQueue` or `StepLedger` follows
+ * the contract documented on those interfaces. Used internally to pin the
+ * in-memory and Prisma implementations (see
  * `src/__tests__/12-persistence-adapters/adapter-conformance.test.ts`),
- * and exported here so third-party adapters (custom `WorkflowPersistence`
- * / `JobQueue` implementations) can run the exact same spec against their
- * own implementation:
+ * and exported so third-party adapters can run the exact same spec against
+ * their own implementation:
  *
  * @example
  * ```typescript
- * import { persistenceConformanceSuite } from '@bratsos/workflow-engine/testing';
+ * import { describe, it, expect, beforeEach } from "vitest";
+ * import { persistenceConformanceSuite } from "@bratsos/workflow-engine/testing";
  *
- * persistenceConformanceSuite('MyCustomPersistence', () => new MyCustomPersistence());
+ * persistenceConformanceSuite(
+ *   "MyCustomPersistence",
+ *   () => new MyCustomPersistence(),
+ *   { describe, it, expect, beforeEach },
+ * );
  * ```
  *
- * Each suite factory registers vitest `describe`/`it` blocks as a side
- * effect when called, so it must be invoked from within a vitest test
- * file (directly, or transitively via an import at module scope).
+ * This module imports nothing from vitest: each suite factory takes the
+ * test primitives as its last argument (`ConformanceTestApi`) and registers
+ * `describe`/`it` blocks through them when called, so it must be invoked
+ * from a test file of whichever runner supplies those primitives.
  */
 
-import { beforeEach, describe, expect, it } from "vitest";
+import type { StepLedger, StepRecord } from "../kernel/ports.js";
 import type {
   AICallLogger,
   CreateAICallInput,
@@ -30,8 +35,66 @@ import type {
   CreateStageInput,
   EnqueueJobInput,
   JobQueue,
+  OutboxRecord,
+  SaveArtifactInput,
+  UpdateStageInput,
+  WorkflowArtifactRecord,
   WorkflowPersistence,
+  WorkflowRunRecord,
+  WorkflowStageRecord,
 } from "../persistence/interface.js";
+import {
+  LEASE_ABSOLUTE_CAP,
+  LEASE_HEARTBEAT_LOST,
+} from "../persistence/interface.js";
+
+// ============================================================================
+// Test API injection
+// ============================================================================
+
+/**
+ * The four test primitives a suite needs, supplied by the caller (pass
+ * vitest's `{ describe, it, expect, beforeEach }`). The `testing` entry
+ * therefore imports nothing from vitest, so it loads from any script.
+ */
+export interface ConformanceTestApi {
+  describe: (name: string, fn: () => void) => void;
+  it: (name: string, fn: () => void | Promise<void>) => void;
+  expect: (value: unknown) => any;
+  beforeEach: (fn: () => void | Promise<void>) => void;
+}
+
+/** Pre-1.0 query/artifact methods the built-in adapters still ship. */
+type LegacyPersistence = WorkflowPersistence & {
+  getRunsByStatus(status: string): Promise<WorkflowRunRecord[]>;
+  claimPendingRun(id: string): Promise<boolean>;
+  updateStageByRunAndStageId(
+    workflowRunId: string,
+    stageId: string,
+    data: UpdateStageInput,
+  ): Promise<void>;
+  getStageById(id: string): Promise<WorkflowStageRecord | null>;
+  getFirstSuspendedStageReadyToResume(
+    runId: string,
+  ): Promise<WorkflowStageRecord | null>;
+  getFirstFailedStage(runId: string): Promise<WorkflowStageRecord | null>;
+  getLastCompletedStage(runId: string): Promise<WorkflowStageRecord | null>;
+  getLastCompletedStageBefore(
+    runId: string,
+    executionGroup: number,
+  ): Promise<WorkflowStageRecord | null>;
+  saveArtifact(data: SaveArtifactInput): Promise<void>;
+  loadArtifact(runId: string, key: string): Promise<unknown>;
+  hasArtifact(runId: string, key: string): Promise<boolean>;
+  deleteArtifact(runId: string, key: string): Promise<void>;
+  listArtifacts(runId: string): Promise<WorkflowArtifactRecord[]>;
+  getStageIdForArtifact(runId: string, stageId: string): Promise<string | null>;
+  saveStageOutput(...args: any[]): Promise<any>;
+  loadStageOutput(...args: any[]): Promise<any>;
+};
+type LegacyQueue = JobQueue & {
+  enqueue(options: EnqueueJobInput): Promise<string>;
+};
 
 // ============================================================================
 // Test Suite Factory Types
@@ -85,7 +148,9 @@ function sleep(ms: number): Promise<void> {
 export function persistenceConformanceSuite(
   name: string,
   factory: PersistenceFactory,
+  api: ConformanceTestApi,
 ) {
+  const { describe, it, expect, beforeEach } = api;
   describe(`I want ${name} to conform to WorkflowPersistence interface`, () => {
     let persistence: ReturnType<PersistenceFactory>;
 
@@ -306,8 +371,12 @@ export function persistenceConformanceSuite(
         // run3 stays PENDING
 
         // When: Getting runs by status
-        const running = await persistence.getRunsByStatus("RUNNING");
-        const completed = await persistence.getRunsByStatus("COMPLETED");
+        const running = await (
+          persistence as LegacyPersistence
+        ).getRunsByStatus("RUNNING");
+        const completed = await (
+          persistence as LegacyPersistence
+        ).getRunsByStatus("COMPLETED");
 
         // Then: Returns correct runs
         expect(running.some((r) => r.id === run1.id)).toBe(true);
@@ -323,7 +392,9 @@ export function persistenceConformanceSuite(
         );
 
         // When: Claiming it
-        const claimed = await persistence.claimPendingRun(run.id);
+        const claimed = await (
+          persistence as LegacyPersistence
+        ).claimPendingRun(run.id);
 
         // Then: version is incremented (so a concurrent optimistic write
         // against the pre-claim version is rejected)
@@ -344,6 +415,244 @@ export function persistenceConformanceSuite(
         // Then: version is incremented
         expect(claimed?.id).toBe(run.id);
         expect(claimed?.version).toBe(run.version + 1);
+      });
+    });
+
+    describe("retention operations", () => {
+      const old = new Date("2024-01-01T00:00:00Z");
+      const cutoff = new Date("2024-06-01T00:00:00Z");
+      const recent = new Date("2024-12-01T00:00:00Z");
+
+      async function finishedRun(
+        id: string,
+        status: "COMPLETED" | "FAILED" | "CANCELLED",
+        completedAt: Date,
+      ) {
+        await persistence.createRun(createRunData({ id }));
+        await persistence.updateRun(id, { status, completedAt });
+      }
+
+      it("should list terminal runs that finished at or before the cutoff, oldest first", async () => {
+        // Given: two old terminal runs, one recent one, and one still running
+        await finishedRun(
+          "purge-old-b",
+          "FAILED",
+          new Date("2024-02-01T00:00:00Z"),
+        );
+        await finishedRun("purge-old-a", "COMPLETED", old);
+        await finishedRun("purge-recent", "COMPLETED", recent);
+        await persistence.createRun(createRunData({ id: "purge-running" }));
+        await persistence.updateRun("purge-running", { status: "RUNNING" });
+
+        // When: listing with every terminal status
+        const runs = await persistence.listRunsForPurge(
+          cutoff,
+          ["COMPLETED", "FAILED", "CANCELLED"],
+          10,
+        );
+
+        // Then: only the two old terminal runs, oldest first
+        expect(runs.map((r) => r.id)).toEqual(["purge-old-a", "purge-old-b"]);
+        expect(runs[0]?.status).toBe("COMPLETED");
+        expect(runs[0]?.workflowType).toBe("test-workflow");
+      });
+
+      it("should honour the status filter and the limit", async () => {
+        await finishedRun("purge-completed", "COMPLETED", old);
+        await finishedRun("purge-failed", "FAILED", old);
+        await finishedRun("purge-cancelled", "CANCELLED", old);
+
+        const failedOnly = await persistence.listRunsForPurge(
+          cutoff,
+          ["FAILED"],
+          10,
+        );
+        expect(failedOnly.map((r) => r.id)).toEqual(["purge-failed"]);
+
+        const limited = await persistence.listRunsForPurge(
+          cutoff,
+          ["COMPLETED", "FAILED", "CANCELLED"],
+          2,
+        );
+        expect(limited).toHaveLength(2);
+      });
+
+      it("should return each run's stage record ids", async () => {
+        await finishedRun("purge-with-stages", "COMPLETED", old);
+        const stageA = await persistence.createStage(
+          await createStageData({
+            workflowRunId: "purge-with-stages",
+            stageId: "a",
+          }),
+        );
+        const stageB = await persistence.createStage(
+          await createStageData({
+            workflowRunId: "purge-with-stages",
+            stageId: "b",
+            stageNumber: 2,
+            executionGroup: 2,
+          }),
+        );
+
+        const [run] = await persistence.listRunsForPurge(
+          cutoff,
+          ["COMPLETED"],
+          10,
+        );
+
+        expect(run?.id).toBe("purge-with-stages");
+        expect([...(run?.stageRecordIds ?? [])].sort()).toEqual(
+          [stageA.id, stageB.id].sort(),
+        );
+      });
+
+      it("should delete a run with its stages and logs, and ignore a missing id", async () => {
+        // Given: a finished run with a stage and a log
+        await finishedRun("purge-delete-me", "COMPLETED", old);
+        const stage = await persistence.createStage(
+          await createStageData({ workflowRunId: "purge-delete-me" }),
+        );
+        await persistence.createLog({
+          workflowRunId: "purge-delete-me",
+          workflowStageId: stage.id,
+          level: "INFO",
+          message: "about to be purged",
+        });
+        // And: an unrelated run that must survive
+        await finishedRun("purge-keep-me", "COMPLETED", old);
+
+        // When: deleting the run (twice: the second is a no-op)
+        await persistence.deleteRun("purge-delete-me");
+        await persistence.deleteRun("purge-delete-me");
+
+        // Then: the run and its stage are gone, the other run is not
+        expect(await persistence.getRun("purge-delete-me")).toBeNull();
+        expect(await persistence.getStagesByRun("purge-delete-me")).toEqual([]);
+        expect(await persistence.getRun("purge-keep-me")).not.toBeNull();
+        expect(
+          await persistence.listRunsForPurge(cutoff, ["COMPLETED"], 10),
+        ).toHaveLength(1);
+      });
+    });
+
+    describe("definition versioning", () => {
+      it("reports whether the schema behind the adapter carries it", () => {
+        // A database that has not been migrated answers false and the
+        // engine falls back to unpinned runs rather than failing to start.
+        expect(typeof persistence.supportsDefinitionVersioning()).toBe(
+          "boolean",
+        );
+      });
+
+      it("stores a definition snapshot once and returns the stored row on re-registration", async () => {
+        if (!persistence.supportsDefinitionVersioning()) return;
+        const input = {
+          workflowId: "defver-wf",
+          version: "sha256-defver0000000000000000000000000",
+          snapshot: { format: 1, workflowId: "defver-wf", stages: [] },
+          structureHash: "sha256-defver0000000000000000000000000",
+        };
+
+        const first = await persistence.insertDefinitionIfAbsent(input);
+        expect(first?.version).toBe(input.version);
+        expect(first?.structureHash).toBe(input.structureHash);
+
+        // Content-addressed: a second registration of the same version
+        // returns what is stored rather than overwriting it, so a caller
+        // can detect an explicit version reused for a different structure.
+        const second = await persistence.insertDefinitionIfAbsent({
+          ...input,
+          snapshot: { format: 1, workflowId: "defver-wf", stages: ["drift"] },
+          structureHash: "sha256-different000000000000000000000",
+        });
+        expect(second?.structureHash).toBe(input.structureHash);
+
+        const loaded = await persistence.getDefinition(
+          input.workflowId,
+          input.version,
+        );
+        expect(loaded?.structureHash).toBe(input.structureHash);
+      });
+
+      it("returns null for a definition that was never registered", async () => {
+        if (!persistence.supportsDefinitionVersioning()) return;
+        expect(await persistence.getDefinition("defver-wf", "nope")).toBeNull();
+      });
+
+      it("counts runs grouped by workflow, version and status", async () => {
+        if (!persistence.supportsDefinitionVersioning()) return;
+        const workflowId = `defver-count-${Date.now()}`;
+        await persistence.createRun(
+          createRunData({
+            id: `${workflowId}-a`,
+            workflowId,
+            definitionVersion: "v-count-1",
+          }),
+        );
+        await persistence.createRun(
+          createRunData({
+            id: `${workflowId}-b`,
+            workflowId,
+            definitionVersion: "v-count-1",
+          }),
+        );
+
+        const counts = await persistence.countRunsByDefinitionVersion({
+          workflowId,
+        });
+        const pending = counts.find(
+          (row) =>
+            row.definitionVersion === "v-count-1" && row.status === "PENDING",
+        );
+        expect(pending?.count).toBe(2);
+        expect(pending?.oldestCreatedAt).toBeInstanceOf(Date);
+      });
+
+      it("claims only runs pinned to a version the caller serves", async () => {
+        if (!persistence.supportsDefinitionVersioning()) return;
+        const workflowId = `defver-claim-${Date.now()}`;
+        const pinned = await persistence.createRun(
+          createRunData({
+            id: `${workflowId}-pinned`,
+            workflowId,
+            definitionVersion: "v-served",
+          }),
+        );
+
+        // A host that does not serve this version leaves it alone.
+        const missed = await persistence.claimNextPendingRun({
+          serves: [{ workflowId, version: "v-other" }],
+        });
+        expect(missed?.id).not.toBe(pinned.id);
+        if (missed) {
+          await persistence.updateRun(missed.id, { status: "COMPLETED" });
+        }
+
+        const claimed = await persistence.claimNextPendingRun({
+          serves: [{ workflowId, version: "v-served" }],
+        });
+        expect(claimed?.id).toBe(pinned.id);
+        expect(claimed?.definitionVersion).toBe("v-served");
+      });
+
+      it("claims a run created before versioning regardless of what the caller serves", async () => {
+        if (!persistence.supportsDefinitionVersioning()) return;
+        const workflowId = `defver-legacy-${Date.now()}`;
+        const legacy = await persistence.createRun(
+          createRunData({ id: `${workflowId}-legacy`, workflowId }),
+        );
+        expect(legacy.definitionVersion).toBeNull();
+
+        let claimed = await persistence.claimNextPendingRun({
+          serves: [{ workflowId, version: "irrelevant" }],
+        });
+        while (claimed && claimed.id !== legacy.id) {
+          await persistence.updateRun(claimed.id, { status: "COMPLETED" });
+          claimed = await persistence.claimNextPendingRun({
+            serves: [{ workflowId, version: "irrelevant" }],
+          });
+        }
+        expect(claimed?.id).toBe(legacy.id);
       });
     });
 
@@ -399,7 +708,9 @@ export function persistenceConformanceSuite(
         );
 
         // When: Getting by database ID
-        const stage = await persistence.getStageById(created.id);
+        const stage = await (persistence as LegacyPersistence).getStageById(
+          created.id,
+        );
 
         // Then: Returns the stage
         expect(stage).not.toBeNull();
@@ -419,7 +730,9 @@ export function persistenceConformanceSuite(
         });
 
         // Then: Stage reflects updates
-        const updated = await persistence.getStageById(created.id);
+        const updated = await (persistence as LegacyPersistence).getStageById(
+          created.id,
+        );
         expect(updated?.status).toBe("RUNNING");
         expect(updated?.startedAt).toBeInstanceOf(Date);
       });
@@ -434,7 +747,7 @@ export function persistenceConformanceSuite(
         );
 
         // When: Updating by run/stage IDs
-        await persistence.updateStageByRunAndStageId(
+        await (persistence as LegacyPersistence).updateStageByRunAndStageId(
           "update-by-ids-run",
           "update-by-ids-stage",
           { status: "COMPLETED" },
@@ -702,8 +1015,9 @@ export function persistenceConformanceSuite(
         });
 
         // When: Getting first suspended stage ready to resume
-        const ready =
-          await persistence.getFirstSuspendedStageReadyToResume(runId);
+        const ready = await (
+          persistence as LegacyPersistence
+        ).getFirstSuspendedStageReadyToResume(runId);
 
         // Then: Returns only the stage with nextPollAt cleared
         expect(ready).not.toBeNull();
@@ -726,7 +1040,9 @@ export function persistenceConformanceSuite(
         });
 
         // When: Getting first failed stage
-        const failed = await persistence.getFirstFailedStage(runId);
+        const failed = await (
+          persistence as LegacyPersistence
+        ).getFirstFailedStage(runId);
 
         // Then: Returns the failed stage
         expect(failed).not.toBeNull();
@@ -757,7 +1073,9 @@ export function persistenceConformanceSuite(
         await persistence.updateStage(stage2.id, { status: "COMPLETED" });
 
         // When: Getting last completed stage
-        const last = await persistence.getLastCompletedStage(runId);
+        const last = await (
+          persistence as LegacyPersistence
+        ).getLastCompletedStage(runId);
 
         // Then: Returns the highest stage number completed
         expect(last).not.toBeNull();
@@ -790,10 +1108,9 @@ export function persistenceConformanceSuite(
         await persistence.updateStage(stage2.id, { status: "COMPLETED" });
 
         // When: Getting last completed before group 2
-        const lastBefore = await persistence.getLastCompletedStageBefore(
-          runId,
-          2,
-        );
+        const lastBefore = await (
+          persistence as LegacyPersistence
+        ).getLastCompletedStageBefore(runId, 2);
 
         // Then: Returns group 1 stage
         expect(lastBefore).not.toBeNull();
@@ -810,14 +1127,17 @@ export function persistenceConformanceSuite(
         await ensureRun(runId);
 
         // When: Saving and loading
-        await persistence.saveArtifact({
+        await (persistence as LegacyPersistence).saveArtifact({
           workflowRunId: runId,
           key,
           type: "ARTIFACT",
           data,
           size: JSON.stringify(data).length,
         });
-        const loaded = await persistence.loadArtifact(runId, key);
+        const loaded = await (persistence as LegacyPersistence).loadArtifact(
+          runId,
+          key,
+        );
 
         // Then: Data is preserved
         expect(loaded).toEqual(data);
@@ -825,7 +1145,7 @@ export function persistenceConformanceSuite(
 
       it("should return undefined (not throw) for a missing artifact", async () => {
         // When: Loading an artifact that was never saved
-        const loaded = await persistence.loadArtifact(
+        const loaded = await (persistence as LegacyPersistence).loadArtifact(
           "missing-artifact-run",
           "missing.json",
         );
@@ -838,7 +1158,7 @@ export function persistenceConformanceSuite(
         // Given: An artifact
         const runId = "exists-run";
         await ensureRun(runId);
-        await persistence.saveArtifact({
+        await (persistence as LegacyPersistence).saveArtifact({
           workflowRunId: runId,
           key: "exists.json",
           type: "ARTIFACT",
@@ -847,8 +1167,11 @@ export function persistenceConformanceSuite(
         });
 
         // When: Checking existence
-        const exists = await persistence.hasArtifact(runId, "exists.json");
-        const notExists = await persistence.hasArtifact(
+        const exists = await (persistence as LegacyPersistence).hasArtifact(
+          runId,
+          "exists.json",
+        );
+        const notExists = await (persistence as LegacyPersistence).hasArtifact(
           runId,
           "not-exists.json",
         );
@@ -862,7 +1185,7 @@ export function persistenceConformanceSuite(
         // Given: An artifact
         const runId = "delete-artifact-run";
         await ensureRun(runId);
-        await persistence.saveArtifact({
+        await (persistence as LegacyPersistence).saveArtifact({
           workflowRunId: runId,
           key: "delete-me.json",
           type: "ARTIFACT",
@@ -871,10 +1194,16 @@ export function persistenceConformanceSuite(
         });
 
         // When: Deleting
-        await persistence.deleteArtifact(runId, "delete-me.json");
+        await (persistence as LegacyPersistence).deleteArtifact(
+          runId,
+          "delete-me.json",
+        );
 
         // Then: Artifact no longer exists
-        const exists = await persistence.hasArtifact(runId, "delete-me.json");
+        const exists = await (persistence as LegacyPersistence).hasArtifact(
+          runId,
+          "delete-me.json",
+        );
         expect(exists).toBe(false);
       });
 
@@ -883,21 +1212,21 @@ export function persistenceConformanceSuite(
         const runId = "list-artifacts-run";
         await ensureRun(runId);
         await ensureRun("other-run");
-        await persistence.saveArtifact({
+        await (persistence as LegacyPersistence).saveArtifact({
           workflowRunId: runId,
           key: "artifact-1.json",
           type: "ARTIFACT",
           data: {},
           size: 2,
         });
-        await persistence.saveArtifact({
+        await (persistence as LegacyPersistence).saveArtifact({
           workflowRunId: runId,
           key: "artifact-2.json",
           type: "ARTIFACT",
           data: {},
           size: 2,
         });
-        await persistence.saveArtifact({
+        await (persistence as LegacyPersistence).saveArtifact({
           workflowRunId: "other-run",
           key: "other.json",
           type: "ARTIFACT",
@@ -906,7 +1235,9 @@ export function persistenceConformanceSuite(
         });
 
         // When: Listing artifacts
-        const artifacts = await persistence.listArtifacts(runId);
+        const artifacts = await (
+          persistence as LegacyPersistence
+        ).listArtifacts(runId);
 
         // Then: Returns only artifacts for that run
         expect(artifacts.length).toBe(2);
@@ -928,7 +1259,7 @@ export function persistenceConformanceSuite(
         );
 
         // When: Saving stage output
-        const key = await persistence.saveStageOutput(
+        const key = await (persistence as LegacyPersistence).saveStageOutput(
           runId,
           "test-workflow",
           stageId,
@@ -939,7 +1270,10 @@ export function persistenceConformanceSuite(
         expect(key).toContain(stageId);
         expect(key).toContain("output.json");
 
-        const loaded = await persistence.loadArtifact(runId, key);
+        const loaded = await (persistence as LegacyPersistence).loadArtifact(
+          runId,
+          key,
+        );
         expect(loaded).toEqual({ processed: true });
       });
     });
@@ -1434,6 +1768,81 @@ export function persistenceConformanceSuite(
         await expect(
           persistence.markOutboxEventsPublished([]),
         ).resolves.not.toThrow();
+        await expect(
+          persistence.releaseOutboxEvents([]),
+        ).resolves.not.toThrow();
+      });
+
+      it("should hand each unpublished event to exactly one claimant, in order", async () => {
+        // Given: Two events for one run
+        await persistence.appendOutboxEvents([
+          {
+            workflowRunId: "outbox-claim-run",
+            eventType: "run.created",
+            payload: { n: 1 },
+            causationId: "cmd-1",
+            occurredAt: new Date(),
+          },
+          {
+            workflowRunId: "outbox-claim-run",
+            eventType: "run.started",
+            payload: { n: 2 },
+            causationId: "cmd-1",
+            occurredAt: new Date(),
+          },
+        ]);
+
+        // When: Two flushes claim concurrently
+        const [first, second] = await Promise.all([
+          persistence.claimUnpublishedOutboxEvents(),
+          persistence.claimUnpublishedOutboxEvents(),
+        ]);
+        const forRun = (events: OutboxRecord[]) =>
+          events.filter((e) => e.workflowRunId === "outbox-claim-run");
+
+        // Then: Every event is claimed by exactly one of them, in
+        // sequence order, and is stamped as published
+        const claimed = [...forRun(first), ...forRun(second)];
+        expect(claimed).toHaveLength(2);
+        expect(new Set(claimed.map((e) => e.id)).size).toBe(2);
+        expect(claimed.every((e) => e.publishedAt !== null)).toBe(true);
+        const winner =
+          forRun(first).length > 0 ? forRun(first) : forRun(second);
+        expect(winner.map((e) => e.sequence)).toEqual([1, 2]);
+        const unpublished = await persistence.getUnpublishedOutboxEvents();
+        expect(forRun(unpublished)).toHaveLength(0);
+      });
+
+      it("should make released events claimable again", async () => {
+        // Given: A claimed event
+        await persistence.appendOutboxEvents([
+          {
+            workflowRunId: "outbox-release-run",
+            eventType: "run.created",
+            payload: {},
+            causationId: "cmd-1",
+            occurredAt: new Date(),
+          },
+        ]);
+        const claimed = (
+          await persistence.claimUnpublishedOutboxEvents()
+        ).filter((e) => e.workflowRunId === "outbox-release-run");
+        expect(claimed).toHaveLength(1);
+
+        // When: Releasing it
+        await persistence.releaseOutboxEvents([claimed[0]!.id]);
+
+        // Then: It is unpublished again and the next claim gets it
+        const unpublished = await persistence.getUnpublishedOutboxEvents();
+        expect(
+          unpublished.some(
+            (e) => e.id === claimed[0]!.id && e.publishedAt === null,
+          ),
+        ).toBe(true);
+        const again = (await persistence.claimUnpublishedOutboxEvents()).filter(
+          (e) => e.workflowRunId === "outbox-release-run",
+        );
+        expect(again.map((e) => e.id)).toEqual([claimed[0]!.id]);
       });
     });
 
@@ -1678,7 +2087,9 @@ export function persistenceConformanceSuite(
 export function aiCallLoggerConformanceSuite(
   name: string,
   factory: AILoggerFactory,
+  api: ConformanceTestApi,
 ) {
+  const { describe, it, expect, beforeEach } = api;
   describe(`I want ${name} to conform to AICallLogger interface`, () => {
     let logger: ReturnType<AILoggerFactory>;
 
@@ -1945,7 +2356,9 @@ export function aiCallLoggerConformanceSuite(
 export function jobQueueConformanceSuite(
   name: string,
   factory: JobQueueFactory,
+  api: ConformanceTestApi,
 ) {
+  const { describe, it, expect, beforeEach } = api;
   describe(`I want ${name} to conform to JobQueue interface`, () => {
     let queue: ReturnType<JobQueueFactory>;
 
@@ -1972,11 +2385,85 @@ export function jobQueueConformanceSuite(
         const input = createJobInput({ stageId: "enqueue-test" });
 
         // When: Enqueueing
-        const jobId = await queue.enqueue(input);
+        const jobId = await (queue as LegacyQueue).enqueue(input);
 
         // Then: Returns a valid ID
         expect(jobId).toBeDefined();
         expect(jobId.length).toBeGreaterThan(0);
+      });
+
+      it("dequeues only jobs whose definition version the caller serves", async () => {
+        // Given: three queued jobs — one pinned to a version this caller
+        // presents, one pinned to a version it does not, and one unpinned
+        await queue.enqueueParallel([
+          createJobInput({
+            workflowRunId: "serves-run",
+            workflowId: "wf-served",
+            stageId: "served",
+            definitionVersion: "v-1",
+          }),
+          createJobInput({
+            workflowRunId: "serves-run",
+            workflowId: "wf-served",
+            stageId: "foreign",
+            definitionVersion: "v-2",
+          }),
+          createJobInput({
+            workflowRunId: "serves-run",
+            workflowId: "wf-served",
+            stageId: "unpinned",
+          }),
+        ]);
+
+        // When: dequeuing as a host that presents only v-1
+        const serves = [{ workflowId: "wf-served", version: "v-1" }];
+        const claimed: string[] = [];
+        for (let i = 0; i < 3; i++) {
+          const job = await queue.dequeue({ serves });
+          if (!job) break;
+          claimed.push(job.stageId);
+        }
+
+        // Then: the foreign version is left for the host that presents it,
+        // and the unpinned job is claimable because the workflow matches
+        expect(claimed.sort()).toEqual(["served", "unpinned"]);
+
+        // And: the internal marker never reaches the stage payload
+        const rows = await queue.getJobsByWorkflowRun("serves-run");
+        for (const row of rows) {
+          expect(row.payload).not.toHaveProperty("_definitionVersion");
+        }
+      });
+
+      it("claims nothing for a caller that serves no workflow", async () => {
+        await queue.enqueueParallel([
+          createJobInput({ stageId: "any", definitionVersion: "v-1" }),
+        ]);
+        expect(await queue.dequeue({ serves: [] })).toBeNull();
+        expect(await queue.dequeue()).not.toBeNull();
+      });
+
+      it("defers a claimed job without spending its attempt", async () => {
+        if (!queue.defer) return;
+        await queue.enqueueParallel([
+          createJobInput({ workflowRunId: "defer-run", stageId: "defer" }),
+        ]);
+        const job = await queue.dequeue();
+        expect(job?.attempt).toBe(1);
+
+        const until = new Date(Date.now() + 30_000);
+        const outcome = await queue.defer(job!.jobId, until, "not my version", {
+          attempt: job!.attempt,
+          startedAt: job!.startedAt,
+        });
+        expect(outcome).toBe("acknowledged");
+
+        const [row] = await queue.getJobsByWorkflowRun("defer-run");
+        expect(row?.status).toBe("PENDING");
+        // The attempt the dequeue counted is handed back, so a host that
+        // keeps declining the job never exhausts its retry budget.
+        expect(row?.attempt).toBe(0);
+        expect(row?.nextPollAt?.getTime()).toBe(until.getTime());
       });
 
       it("should enqueue multiple jobs in parallel", async () => {
@@ -1994,18 +2481,132 @@ export function jobQueueConformanceSuite(
         expect(ids).toHaveLength(3);
         expect(new Set(ids).size).toBe(3); // All unique
       });
+
+      it("keeps one job row per (workflowRunId, stageId), replacing the row already queued", async () => {
+        // Given: A stage whose job row already ran and failed (what
+        // `run.rerunFrom` and `run.reapStuck`'s PENDING-without-job sweep
+        // both find when they re-enqueue a stage that has executed)
+        const runId = "reenqueue-run";
+        await queue.enqueueParallel([
+          createJobInput({ workflowRunId: runId, stageId: "reenqueue-stage" }),
+        ]);
+        const first = await queue.dequeue();
+        expect(first).not.toBeNull();
+        await queue.fail(first!.jobId, "boom", false);
+        const [failed] = await queue.getJobsByWorkflowRun(runId);
+        expect(failed?.status).toBe("FAILED");
+        expect(failed?.attempt).toBe(1);
+
+        // When: The same (run, stage) is enqueued again
+        const ids = await queue.enqueueParallel([
+          createJobInput({
+            workflowRunId: runId,
+            stageId: "reenqueue-stage",
+            priority: 7,
+          }),
+        ]);
+
+        // Then: Exactly one row remains, PENDING and reset — not a second
+        // row, and not a unique-constraint violation
+        expect(ids).toHaveLength(1);
+        const rows = await queue.getJobsByWorkflowRun(runId);
+        expect(rows).toHaveLength(1);
+        expect(rows[0]?.status).toBe("PENDING");
+        expect(rows[0]?.attempt).toBe(0);
+        expect(rows[0]?.priority).toBe(7);
+        expect(rows[0]?.workerId).toBeNull();
+        expect(rows[0]?.lockedAt).toBeNull();
+        expect(rows[0]?.nextPollAt).toBeNull();
+      });
+
+      it("re-enqueueing twice in a row still leaves one row per stage", async () => {
+        // Given/When: Two consecutive reruns of the same two stages
+        const runId = "double-rerun-run";
+        const stages = ["double-a", "double-b"];
+        for (let round = 0; round < 3; round++) {
+          await queue.enqueueParallel(
+            stages.map((stageId) =>
+              createJobInput({ workflowRunId: runId, stageId }),
+            ),
+          );
+        }
+
+        // Then: One row per stage, all PENDING at attempt 0
+        const rows = await queue.getJobsByWorkflowRun(runId);
+        expect(rows).toHaveLength(2);
+        expect(new Set(rows.map((r) => r.stageId))).toEqual(new Set(stages));
+        for (const row of rows) {
+          expect(row.status).toBe("PENDING");
+          expect(row.attempt).toBe(0);
+        }
+      });
+    });
+
+    describe("deleteByRunAndStages operation", () => {
+      it("removes the named stages' rows whatever their status and leaves the rest", async () => {
+        // Given: Three stages of one run, one of them already RUNNING,
+        // plus a stage of an unrelated run
+        const runId = "delete-run";
+        await queue.enqueueParallel([
+          createJobInput({ workflowRunId: runId, stageId: "delete-keep" }),
+          createJobInput({
+            workflowRunId: runId,
+            stageId: "delete-a",
+            priority: 9,
+          }),
+          createJobInput({ workflowRunId: runId, stageId: "delete-b" }),
+        ]);
+        await queue.enqueueParallel([
+          createJobInput({
+            workflowRunId: "delete-other-run",
+            stageId: "delete-a",
+          }),
+        ]);
+        // Highest priority wins the dequeue, so `delete-a` is the RUNNING one.
+        const locked = await queue.dequeue();
+        expect(locked?.stageId).toBe("delete-a");
+
+        // When: Deleting two of the stages
+        const deleted = await queue.deleteByRunAndStages(runId, [
+          "delete-a",
+          "delete-b",
+        ]);
+
+        // Then: Both rows are gone regardless of status; the run's other
+        // stage and the other run's same-named stage are untouched
+        expect(deleted).toBe(2);
+        const rows = await queue.getJobsByWorkflowRun(runId);
+        expect(rows.map((r) => r.stageId)).toEqual(["delete-keep"]);
+        const other = await queue.getJobsByWorkflowRun("delete-other-run");
+        expect(other).toHaveLength(1);
+      });
+
+      it("is a no-op for an empty stage list or unknown stages", async () => {
+        // Given: A run with one queued job
+        const runId = "delete-noop-run";
+        await queue.enqueueParallel([
+          createJobInput({ workflowRunId: runId, stageId: "delete-noop" }),
+        ]);
+
+        // When/Then: Neither call removes anything
+        expect(await queue.deleteByRunAndStages(runId, [])).toBe(0);
+        expect(await queue.deleteByRunAndStages(runId, ["not-a-stage"])).toBe(
+          0,
+        );
+        expect(await queue.getJobsByWorkflowRun(runId)).toHaveLength(1);
+      });
     });
 
     describe("dequeue operation", () => {
       it("should dequeue the highest priority job", async () => {
         // Given: Jobs with different priorities
-        await queue.enqueue(
+        await (queue as LegacyQueue).enqueue(
           createJobInput({ stageId: "low-priority", priority: 1 }),
         );
-        await queue.enqueue(
+        await (queue as LegacyQueue).enqueue(
           createJobInput({ stageId: "high-priority", priority: 10 }),
         );
-        await queue.enqueue(
+        await (queue as LegacyQueue).enqueue(
           createJobInput({ stageId: "medium-priority", priority: 5 }),
         );
 
@@ -2029,7 +2630,7 @@ export function jobQueueConformanceSuite(
 
       it("should return job details in dequeue result", async () => {
         // Given: A job
-        await queue.enqueue(
+        await (queue as LegacyQueue).enqueue(
           createJobInput({
             workflowRunId: "dequeue-run",
             stageId: "dequeue-stage",
@@ -2056,7 +2657,7 @@ export function jobQueueConformanceSuite(
     describe("complete operation", () => {
       it("should mark a job as completed", async () => {
         // Given: A dequeued job
-        const jobId = await queue.enqueue(
+        const jobId = await (queue as LegacyQueue).enqueue(
           createJobInput({ stageId: "complete-test" }),
         );
         await queue.dequeue();
@@ -2075,7 +2676,7 @@ export function jobQueueConformanceSuite(
     describe("suspend operation", () => {
       it("should suspend a job with next poll time", async () => {
         // Given: A dequeued job
-        const jobId = await queue.enqueue(
+        const jobId = await (queue as LegacyQueue).enqueue(
           createJobInput({ stageId: "suspend-test" }),
         );
         await queue.dequeue();
@@ -2091,7 +2692,7 @@ export function jobQueueConformanceSuite(
     describe("fail operation", () => {
       it("should mark a job as failed", async () => {
         // Given: A dequeued job
-        const jobId = await queue.enqueue(
+        const jobId = await (queue as LegacyQueue).enqueue(
           createJobInput({ stageId: "fail-test" }),
         );
         await queue.dequeue();
@@ -2105,7 +2706,7 @@ export function jobQueueConformanceSuite(
 
       it("should default shouldRetry to false when omitted", async () => {
         // Given: A dequeued job
-        const jobId = await queue.enqueue(
+        const jobId = await (queue as LegacyQueue).enqueue(
           createJobInput({ stageId: "fail-default-test" }),
         );
         await queue.dequeue();
@@ -2121,7 +2722,7 @@ export function jobQueueConformanceSuite(
       it("should retry a job when shouldRetry is true", async () => {
         // Given: A dequeued job
         const runId = "retry-run";
-        const jobId = await queue.enqueue(
+        const jobId = await (queue as LegacyQueue).enqueue(
           createJobInput({ workflowRunId: runId, stageId: "retry-test" }),
         );
         const dequeued = await queue.dequeue();
@@ -2144,6 +2745,143 @@ export function jobQueueConformanceSuite(
       });
     });
 
+    describe("fenced acknowledgement", () => {
+      // A negative threshold makes every held lease look stale straight
+      // away, which is how these tests force the rescue deterministically
+      // instead of sleeping past a real threshold.
+      const RESCUE_EVERYTHING_MS = -1000;
+
+      /**
+       * Claim a job, have it rescued by the sweeper, and let a second
+       * worker claim it — the exact sequence a stalled worker's
+       * acknowledgement has to survive. Returns both fences.
+       */
+      async function rescueAndReclaim(stageId: string) {
+        const jobId = await (queue as LegacyQueue).enqueue(
+          createJobInput({ workflowRunId: `fence-${stageId}`, stageId }),
+        );
+        const first = await queue.dequeue();
+        expect(first?.jobId).toBe(jobId);
+        expect(await queue.releaseStaleJobs(RESCUE_EVERYTHING_MS)).toBe(1);
+        const second = await queue.dequeue();
+        expect(second?.jobId).toBe(jobId);
+        return { jobId, first: first!, second: second! };
+      }
+
+      it("should acknowledge a completion carrying the fence from its own claim", async () => {
+        await (queue as LegacyQueue).enqueue(
+          createJobInput({ stageId: "fence-happy" }),
+        );
+        const job = await queue.dequeue();
+        expect(job?.startedAt).toBeInstanceOf(Date);
+
+        const outcome = await queue.complete(job!.jobId, {
+          startedAt: job!.startedAt,
+          attempt: job!.attempt,
+        });
+        expect(outcome).toBe("acknowledged");
+      });
+
+      it("should report a completion from a superseded attempt instead of clobbering the newer one", async () => {
+        const { jobId, first, second } =
+          await rescueAndReclaim("fence-complete");
+
+        // The stalled worker finally finishes and acknowledges.
+        const stale = await queue.complete(jobId, {
+          startedAt: first.startedAt,
+          attempt: first.attempt,
+        });
+        expect(stale).toBe("superseded");
+
+        // Nothing was written: the newer attempt is still RUNNING.
+        const [afterStale] = await queue.getJobsByWorkflowRun(
+          "fence-fence-complete",
+        );
+        expect(afterStale?.status).toBe("RUNNING");
+
+        // The current owner's acknowledgement still lands.
+        const live = await queue.complete(jobId, {
+          startedAt: second.startedAt,
+          attempt: second.attempt,
+        });
+        expect(live).toBe("acknowledged");
+        const [afterLive] = await queue.getJobsByWorkflowRun(
+          "fence-fence-complete",
+        );
+        expect(afterLive?.status).toBe("COMPLETED");
+      });
+
+      it("should report a failure from a superseded attempt instead of clobbering the newer one", async () => {
+        const { jobId, first } = await rescueAndReclaim("fence-fail");
+
+        const stale = await queue.fail(jobId, "stalled worker error", false, {
+          startedAt: first.startedAt,
+          attempt: first.attempt,
+        });
+        expect(stale).toBe("superseded");
+
+        const [job] = await queue.getJobsByWorkflowRun("fence-fence-fail");
+        expect(job?.status).toBe("RUNNING");
+        // The stalled worker's error was not recorded; the only error on the
+        // row is the sweeper's note that it reclaimed the lease.
+        expect(job?.lastError).not.toContain("stalled worker error");
+      });
+
+      it("should report a suspend from a superseded attempt instead of releasing the newer one's lease", async () => {
+        const { jobId, first } = await rescueAndReclaim("fence-suspend");
+
+        const stale = await queue.suspend(
+          jobId,
+          new Date(Date.now() + 60_000),
+          { startedAt: first.startedAt, attempt: first.attempt },
+        );
+        expect(stale).toBe("superseded");
+
+        const [job] = await queue.getJobsByWorkflowRun("fence-fence-suspend");
+        expect(job?.status).toBe("RUNNING");
+        expect(job?.workerId).not.toBeNull();
+      });
+
+      it("should keep acknowledging unconditionally when no fence is passed", async () => {
+        const { jobId } = await rescueAndReclaim("fence-optional");
+
+        // No fence: the previous, unconditional contract — the write lands
+        // whichever attempt the caller is on.
+        expect(await queue.complete(jobId)).toBe("acknowledged");
+        const [job] = await queue.getJobsByWorkflowRun("fence-fence-optional");
+        expect(job?.status).toBe("COMPLETED");
+      });
+
+      it("should report a fenced acknowledgement of a deleted job as superseded", async () => {
+        // A rerun deletes the retired stages' job rows underneath whatever
+        // worker still holds them (`deleteByRunAndStages`). `JobAckOutcome`
+        // names deletion as one of the things "superseded" covers, so the
+        // fenced write must report it, not throw: the worker's job is to
+        // surface a superseded ack, and an implementation that throws turns
+        // a benign no-op into a host-level error.
+        const jobId = await (queue as LegacyQueue).enqueue(
+          createJobInput({
+            workflowRunId: "fence-deleted",
+            stageId: "fence-deleted-stage",
+          }),
+        );
+        const claim = await queue.dequeue();
+        expect(claim?.jobId).toBe(jobId);
+
+        expect(
+          await queue.deleteByRunAndStages("fence-deleted", [
+            "fence-deleted-stage",
+          ]),
+        ).toBe(1);
+
+        const outcome = await queue.complete(jobId, {
+          startedAt: claim!.startedAt,
+          attempt: claim!.attempt,
+        });
+        expect(outcome).toBe("superseded");
+      });
+    });
+
     describe("releaseStaleJobs operation", () => {
       it("should return number of released jobs", async () => {
         // Given: No stale jobs
@@ -2154,13 +2892,79 @@ export function jobQueueConformanceSuite(
         expect(typeof released).toBe("number");
         expect(released).toBeGreaterThanOrEqual(0);
       });
+
+      it("should name the heartbeat tier in lastError when it reclaims a lease", async () => {
+        await (queue as LegacyQueue).enqueue(
+          createJobInput({
+            workflowRunId: "tier-heartbeat",
+            stageId: "tier-stage",
+          }),
+        );
+        await queue.dequeue();
+
+        // A negative threshold makes the held lease look stale straight away.
+        expect(await queue.releaseStaleJobs(-1000)).toBe(1);
+
+        const [job] = await queue.getJobsByWorkflowRun("tier-heartbeat");
+        expect(job?.status).toBe("PENDING");
+        // Distinguishable from the absolute tier, and from a stage error.
+        expect(job?.lastError).toContain(LEASE_HEARTBEAT_LOST);
+        expect(job?.lastError).not.toContain(LEASE_ABSOLUTE_CAP);
+      });
+    });
+
+    describe("expireRunawayJobs operation (absolute lease tier)", () => {
+      it("should fail a job that held its lease past the absolute cap, even while heartbeating", async () => {
+        const expire = queue.expireRunawayJobs?.bind(queue);
+        if (!expire) return; // optional port method
+
+        await (queue as LegacyQueue).enqueue(
+          createJobInput({
+            workflowRunId: "tier-absolute",
+            stageId: "tier-stage",
+          }),
+        );
+        const claimed = await queue.dequeue();
+        expect(claimed).not.toBeNull();
+
+        // The wedged-but-alive worker the heartbeat tier cannot catch: its
+        // lease is fresh, so the heartbeat sweep skips it...
+        await queue.touchJob(claimed!.jobId);
+        expect(await queue.releaseStaleJobs(60_000)).toBe(0);
+
+        // ...but the absolute cap is measured from the claim, which no
+        // heartbeat refreshes, so it fires anyway.
+        expect(await expire(-1000)).toBe(1);
+
+        const [job] = await queue.getJobsByWorkflowRun("tier-absolute");
+        expect(job?.status).toBe("FAILED");
+        expect(job?.lastError).toContain(LEASE_ABSOLUTE_CAP);
+        expect(job?.lastError).not.toContain(LEASE_HEARTBEAT_LOST);
+      });
+
+      it("should leave a job inside the cap alone", async () => {
+        const expire = queue.expireRunawayJobs?.bind(queue);
+        if (!expire) return;
+
+        await (queue as LegacyQueue).enqueue(
+          createJobInput({
+            workflowRunId: "tier-within",
+            stageId: "tier-stage",
+          }),
+        );
+        await queue.dequeue();
+
+        expect(await expire(60 * 60_000)).toBe(0);
+        const [job] = await queue.getJobsByWorkflowRun("tier-within");
+        expect(job?.status).toBe("RUNNING");
+      });
     });
 
     describe("touchJob operation", () => {
       it("should advance lockedAt without changing status", async () => {
         // Given: A dequeued (RUNNING/locked) job
         const runId = "touch-advances-run";
-        const jobId = await queue.enqueue(
+        const jobId = await (queue as LegacyQueue).enqueue(
           createJobInput({ workflowRunId: runId, stageId: "touch-advances" }),
         );
         await queue.dequeue();
@@ -2184,7 +2988,7 @@ export function jobQueueConformanceSuite(
       it("should not touch a job that isn't RUNNING", async () => {
         // Given: A job that was never dequeued (still PENDING)
         const runId = "touch-noop-run";
-        const jobId = await queue.enqueue(
+        const jobId = await (queue as LegacyQueue).enqueue(
           createJobInput({ workflowRunId: runId, stageId: "touch-noop" }),
         );
 
@@ -2200,14 +3004,14 @@ export function jobQueueConformanceSuite(
         // NodeHost's periodic touchJob heartbeat racing lease.reapStale)
         const survivorRunId = "touch-survivor-run";
         const victimRunId = "touch-victim-run";
-        const survivorId = await queue.enqueue(
+        const survivorId = await (queue as LegacyQueue).enqueue(
           createJobInput({
             workflowRunId: survivorRunId,
             stageId: "heartbeat-survivor",
           }),
         );
         await queue.dequeue();
-        const victimId = await queue.enqueue(
+        const victimId = await (queue as LegacyQueue).enqueue(
           createJobInput({
             workflowRunId: victimRunId,
             stageId: "heartbeat-victim",
@@ -2239,6 +3043,614 @@ export function jobQueueConformanceSuite(
         expect(survivor?.lockedAt).not.toBeNull();
         expect(survivor?.id).toBe(survivorId);
         expect(victim?.id).toBe(victimId);
+      });
+    });
+  });
+}
+
+// ============================================================================
+// StepLedger Conformance Tests
+// ============================================================================
+
+/**
+ * A `StepLedger` under test, plus an optional async teardown seam.
+ *
+ * Deliberately NOT `ResettableFixture`: that interface's `clear()` takes no
+ * arguments and `StepLedger` already has a `clear(stageRecordId)` of its own,
+ * so intersecting the two would have the suite's reset call the ledger's
+ * stage-scoped delete with no stage. An adapter that needs real teardown (a
+ * Postgres `DELETE FROM workflow_steps`) attaches `reset`; an in-memory fake
+ * needs none, because the factory builds a fresh one for every test.
+ */
+export type StepLedgerFixture = StepLedger & { reset?: () => Promise<void> };
+
+export type StepLedgerFactory = () => StepLedgerFixture;
+
+/**
+ * Shared suite verifying that an implementation of `StepLedger` follows the
+ * contract documented on the interface: insert-if-absent `claim`, the patch
+ * rule that `undefined` leaves a field alone while any other value -- `null`
+ * included -- is written, `compareAndSet` with and without a pinned attempt,
+ * seq-ordered `list`, and stage-scoped `clear` / `clearExcept`.
+ *
+ * The null-result cases are here because an adapter that quietly drops a
+ * `{ result: null }` write leaves the previous attempt's value sitting in the
+ * row. That is invisible while a re-run deletes the row, and permanent once a
+ * re-run preserves one: the step completes with no value, the row still holds
+ * the old one, and every replay reads it back forever.
+ */
+export function stepLedgerConformanceSuite(
+  name: string,
+  factory: StepLedgerFactory,
+  api: ConformanceTestApi,
+) {
+  const { describe, it, expect, beforeEach } = api;
+  describe(`I want ${name} to conform to the StepLedger interface`, () => {
+    let ledger: StepLedgerFixture;
+
+    beforeEach(async () => {
+      ledger = factory();
+      await ledger.reset?.();
+    });
+
+    function claimRecord(
+      overrides: Partial<Omit<StepRecord, "createdAt" | "updatedAt">> = {},
+    ): Omit<StepRecord, "createdAt" | "updatedAt"> {
+      return {
+        stageRecordId: "stage-1",
+        stepId: "step-1",
+        seq: 1,
+        kind: "run",
+        status: "running",
+        attempt: 1,
+        leaseExpiresAt: null,
+        deadlineAt: null,
+        externalKey: null,
+        ...overrides,
+      };
+    }
+
+    describe("claim operation", () => {
+      it("should create a record and return it with every field it was given", async () => {
+        const recordData = claimRecord({
+          stageRecordId: "stage-1",
+          stepId: "step-1",
+          seq: 1,
+          kind: "run",
+          status: "running",
+          attempt: 1,
+          externalKey: "ext-key-1",
+        });
+        const result = await ledger.claim(recordData);
+        expect(result.created).toBe(true);
+        expect(result.record.stageRecordId).toBe("stage-1");
+        expect(result.record.stepId).toBe("step-1");
+        expect(result.record.seq).toBe(1);
+        expect(result.record.kind).toBe("run");
+        expect(result.record.status).toBe("running");
+        expect(result.record.attempt).toBe(1);
+        expect(result.record.externalKey).toBe("ext-key-1");
+        expect(result.record.createdAt).toBeInstanceOf(Date);
+        expect(result.record.updatedAt).toBeInstanceOf(Date);
+      });
+
+      it("should report created:false and return the stored row when the same step is claimed twice", async () => {
+        const first = await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-1",
+            status: "running",
+            attempt: 1,
+            externalKey: "ext-original",
+          }),
+        );
+        expect(first.created).toBe(true);
+
+        const second = await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-1",
+            status: "pending",
+            attempt: 9,
+            externalKey: "ext-different",
+          }),
+        );
+        expect(second.created).toBe(false);
+        expect(second.record.status).toBe("running");
+        expect(second.record.attempt).toBe(1);
+        expect(second.record.externalKey).toBe("ext-original");
+      });
+
+      it("should read back a record claimed without an external key as null", async () => {
+        const { externalKey: _omitted, ...withoutKey } = claimRecord({
+          stageRecordId: "stage-1",
+          stepId: "step-1",
+        });
+        const result = await ledger.claim(withoutKey);
+        expect(result.record.externalKey).toBeNull();
+
+        const fresh = await ledger.get("stage-1", "step-1");
+        expect(fresh?.externalKey).toBeNull();
+      });
+
+      it("should read back a record claimed with no result or error as null on both", async () => {
+        // A claim is written before the body runs, so it never carries an
+        // outcome. The two must agree on how the absence reads back, or a
+        // caller that works against one adapter sees `undefined` on the
+        // other -- the same undefined-versus-null divergence that let a
+        // dropped null result survive in the patch mapper.
+        const result = await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-1",
+            kind: "run",
+            status: "running",
+          }),
+        );
+        expect(result.record.result).toBeNull();
+        expect(result.record.error).toBeNull();
+
+        const fresh = await ledger.get("stage-1", "step-1");
+        expect(fresh?.result).toBeNull();
+        expect(fresh?.error).toBeNull();
+      });
+    });
+
+    describe("get operation", () => {
+      it("should return null for a step that was never claimed", async () => {
+        const result = await ledger.get("stage-1", "non-existent-step");
+        expect(result).toBeNull();
+      });
+    });
+
+    describe("update operation", () => {
+      it("should overwrite a previous result with null", async () => {
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-1",
+            kind: "run",
+            status: "running",
+            attempt: 1,
+          }),
+        );
+        await ledger.update("stage-1", "step-1", {
+          status: "completed",
+          result: { v: "attempt-1" },
+          error: null,
+          leaseExpiresAt: null,
+        });
+        const reopened = await ledger.compareAndSet(
+          "stage-1",
+          "step-1",
+          { status: "completed", attempt: 1 },
+          { status: "running", leaseExpiresAt: null },
+        );
+        expect(reopened.applied).toBe(true);
+
+        const updated = await ledger.update("stage-1", "step-1", {
+          status: "completed",
+          result: null,
+          error: null,
+          leaseExpiresAt: null,
+        });
+        expect(updated.result).toBeNull();
+
+        const fresh = await ledger.get("stage-1", "step-1");
+        expect(fresh?.result).toBeNull();
+      });
+
+      it("should leave a field alone when the patch omits it", async () => {
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-1",
+            status: "running",
+            result: { value: 42 },
+          }),
+        );
+        const updated = await ledger.update("stage-1", "step-1", {
+          status: "completed",
+        });
+        expect(updated.status).toBe("completed");
+        expect(updated.result).toEqual({ value: 42 });
+
+        const fresh = await ledger.get("stage-1", "step-1");
+        expect(fresh?.result).toEqual({ value: 42 });
+      });
+
+      it("should leave a field alone when the patch carries undefined", async () => {
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-1",
+            status: "running",
+            result: { value: 42 },
+          }),
+        );
+        const updated = await ledger.update("stage-1", "step-1", {
+          status: "completed",
+          result: undefined,
+        });
+        expect(updated.status).toBe("completed");
+        expect(updated.result).toEqual({ value: 42 });
+
+        const fresh = await ledger.get("stage-1", "step-1");
+        expect(fresh?.result).toEqual({ value: 42 });
+      });
+
+      it("should clear leaseExpiresAt and error when the patch names null for them", async () => {
+        const leaseDate = new Date(Date.now() + 60_000);
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-1",
+            leaseExpiresAt: leaseDate,
+            error: "something failed",
+          }),
+        );
+        const updated = await ledger.update("stage-1", "step-1", {
+          leaseExpiresAt: null,
+          error: null,
+        });
+        expect(updated.leaseExpiresAt).toBeNull();
+        expect(updated.error).toBeNull();
+
+        const fresh = await ledger.get("stage-1", "step-1");
+        expect(fresh?.leaseExpiresAt).toBeNull();
+        expect(fresh?.error).toBeNull();
+      });
+
+      it("should round-trip waitState", async () => {
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-1",
+            kind: "wait",
+            status: "pending",
+          }),
+        );
+        await ledger.update("stage-1", "step-1", {
+          waitState: { everyMs: 5000, pollFailures: 2 },
+        });
+        const fresh = await ledger.get("stage-1", "step-1");
+        expect(fresh?.waitState).toEqual({ everyMs: 5000, pollFailures: 2 });
+      });
+
+      it("should bump attempt and clear the error the way a lease re-claim does", async () => {
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-1",
+            status: "failed",
+            attempt: 1,
+            error: "lease timeout",
+          }),
+        );
+        const newLease = new Date(Date.now() + 30_000);
+        const updated = await ledger.update("stage-1", "step-1", {
+          status: "running",
+          attempt: 2,
+          error: null,
+          leaseExpiresAt: newLease,
+        });
+        expect(updated.status).toBe("running");
+        expect(updated.attempt).toBe(2);
+        expect(updated.error).toBeNull();
+        expect(updated.leaseExpiresAt).toBeInstanceOf(Date);
+        expect(updated.leaseExpiresAt?.getTime()).toBe(newLease.getTime());
+
+        const fresh = await ledger.get("stage-1", "step-1");
+        expect(fresh?.attempt).toBe(2);
+        expect(fresh?.error).toBeNull();
+        expect(fresh?.leaseExpiresAt?.getTime()).toBe(newLease.getTime());
+      });
+    });
+
+    describe("compareAndSet operation", () => {
+      it("should apply the patch when the status matches and no attempt is pinned", async () => {
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-1",
+            status: "running",
+            attempt: 1,
+          }),
+        );
+        const result = await ledger.compareAndSet(
+          "stage-1",
+          "step-1",
+          { status: "running" },
+          { status: "completed" },
+        );
+        expect(result.applied).toBe(true);
+        expect(result.record?.status).toBe("completed");
+
+        const fresh = await ledger.get("stage-1", "step-1");
+        expect(fresh?.status).toBe("completed");
+      });
+
+      it("should apply the patch when both the status and the pinned attempt match", async () => {
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-1",
+            status: "running",
+            attempt: 2,
+          }),
+        );
+        const result = await ledger.compareAndSet(
+          "stage-1",
+          "step-1",
+          { status: "running", attempt: 2 },
+          { status: "completed" },
+        );
+        expect(result.applied).toBe(true);
+        expect(result.record?.status).toBe("completed");
+
+        const fresh = await ledger.get("stage-1", "step-1");
+        expect(fresh?.status).toBe("completed");
+      });
+
+      it("should refuse and leave the row untouched when the pinned attempt differs", async () => {
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-1",
+            status: "running",
+            attempt: 1,
+          }),
+        );
+        const result = await ledger.compareAndSet(
+          "stage-1",
+          "step-1",
+          { status: "running", attempt: 2 },
+          { status: "completed" },
+        );
+        expect(result.applied).toBe(false);
+        expect(result.record?.status).toBe("running");
+        expect(result.record?.attempt).toBe(1);
+
+        const fresh = await ledger.get("stage-1", "step-1");
+        expect(fresh?.status).toBe("running");
+        expect(fresh?.attempt).toBe(1);
+      });
+
+      it("should refuse and leave the row untouched when the status differs", async () => {
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-1",
+            status: "running",
+            attempt: 1,
+          }),
+        );
+        const result = await ledger.compareAndSet(
+          "stage-1",
+          "step-1",
+          { status: "pending" },
+          { status: "completed" },
+        );
+        expect(result.applied).toBe(false);
+        expect(result.record?.status).toBe("running");
+
+        const fresh = await ledger.get("stage-1", "step-1");
+        expect(fresh?.status).toBe("running");
+      });
+
+      it("should match any attempt when none is pinned", async () => {
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-1",
+            status: "running",
+            attempt: 1,
+          }),
+        );
+        await ledger.update("stage-1", "step-1", { attempt: 3 });
+        const result = await ledger.compareAndSet(
+          "stage-1",
+          "step-1",
+          { status: "running" },
+          { status: "completed" },
+        );
+        expect(result.applied).toBe(true);
+        expect(result.record?.status).toBe("completed");
+        expect(result.record?.attempt).toBe(3);
+
+        const fresh = await ledger.get("stage-1", "step-1");
+        expect(fresh?.status).toBe("completed");
+        expect(fresh?.attempt).toBe(3);
+      });
+
+      it("should return applied:false and a null record for a step that does not exist", async () => {
+        const result = await ledger.compareAndSet(
+          "stage-1",
+          "non-existent-step",
+          { status: "running" },
+          { status: "completed" },
+        );
+        expect(result.applied).toBe(false);
+        expect(result.record).toBeNull();
+      });
+
+      it("should overwrite a previous result with null", async () => {
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-1",
+            kind: "run",
+            status: "running",
+            attempt: 1,
+            result: { v: "attempt-1" },
+          }),
+        );
+        const result = await ledger.compareAndSet(
+          "stage-1",
+          "step-1",
+          { status: "running" },
+          {
+            status: "completed",
+            result: null,
+            error: null,
+            leaseExpiresAt: null,
+          },
+        );
+        expect(result.applied).toBe(true);
+        expect(result.record?.result).toBeNull();
+
+        const fresh = await ledger.get("stage-1", "step-1");
+        expect(fresh?.result).toBeNull();
+      });
+    });
+
+    describe("list operation", () => {
+      it("should return the stage's steps ordered by seq", async () => {
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-c",
+            seq: 3,
+          }),
+        );
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-a",
+            seq: 1,
+          }),
+        );
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-b",
+            seq: 2,
+          }),
+        );
+        const steps = await ledger.list("stage-1");
+        expect(steps.map((r) => r.stepId)).toEqual([
+          "step-a",
+          "step-b",
+          "step-c",
+        ]);
+      });
+
+      it("should return only the requested stage's steps", async () => {
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-1",
+            seq: 1,
+          }),
+        );
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-2",
+            stepId: "step-2",
+            seq: 1,
+          }),
+        );
+        const list1 = await ledger.list("stage-1");
+        expect(list1.length).toBe(1);
+        expect(list1[0]?.stepId).toBe("step-1");
+        expect(list1[0]?.stageRecordId).toBe("stage-1");
+
+        const list2 = await ledger.list("stage-2");
+        expect(list2.length).toBe(1);
+        expect(list2[0]?.stepId).toBe("step-2");
+        expect(list2[0]?.stageRecordId).toBe("stage-2");
+      });
+
+      it("should return an empty array for a stage with no steps", async () => {
+        const steps = await ledger.list("stage-empty");
+        expect(steps).toEqual([]);
+      });
+    });
+
+    describe("clear and clearExcept operations", () => {
+      it("should delete every row of the stage and leave other stages alone", async () => {
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-1",
+          }),
+        );
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-2",
+          }),
+        );
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-2",
+            stepId: "step-3",
+          }),
+        );
+
+        await ledger.clear("stage-1");
+
+        const stage1Steps = await ledger.list("stage-1");
+        expect(stage1Steps).toEqual([]);
+
+        const stage2Steps = await ledger.list("stage-2");
+        expect(stage2Steps.length).toBe(1);
+        expect(stage2Steps[0]?.stepId).toBe("step-3");
+      });
+
+      it("should keep only the named steps and leave other stages alone", async () => {
+        if (!ledger.clearExcept) return;
+
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-keep",
+          }),
+        );
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-delete",
+          }),
+        );
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-2",
+            stepId: "step-other",
+          }),
+        );
+
+        await ledger.clearExcept("stage-1", ["step-keep"]);
+
+        const stage1Steps = await ledger.list("stage-1");
+        expect(stage1Steps.length).toBe(1);
+        expect(stage1Steps[0]?.stepId).toBe("step-keep");
+
+        const stage2Steps = await ledger.list("stage-2");
+        expect(stage2Steps.length).toBe(1);
+        expect(stage2Steps[0]?.stepId).toBe("step-other");
+      });
+
+      it("should clear everything when clearExcept is given an empty keep list", async () => {
+        if (!ledger.clearExcept) return;
+
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-1",
+          }),
+        );
+        await ledger.claim(
+          claimRecord({
+            stageRecordId: "stage-1",
+            stepId: "step-2",
+          }),
+        );
+
+        await ledger.clearExcept("stage-1", []);
+
+        const stage1Steps = await ledger.list("stage-1");
+        expect(stage1Steps).toEqual([]);
       });
     });
   });

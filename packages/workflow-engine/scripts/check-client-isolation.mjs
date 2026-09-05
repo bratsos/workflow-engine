@@ -39,7 +39,10 @@ const FORBIDDEN = [
 ];
 
 /** Entry points that must stay free of the forbidden set. */
-const GUARDED_ENTRIES = ["client.js"];
+// `testing/index.js` is imported by plain scripts (tsx seeds, smoke checks)
+// as well as test files, so it must not pull vitest in: "Vitest failed to
+// access its internal state" is what a consumer sees otherwise.
+const GUARDED_ENTRIES = ["client.js", "testing/index.js"];
 
 /** Matches `from "x"` in import/export statements and `import("x")`. */
 const STATIC_FROM = /\bfrom\s*["']([^"']+)["']/g;

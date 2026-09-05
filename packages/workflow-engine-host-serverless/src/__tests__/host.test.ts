@@ -6,20 +6,16 @@
  */
 
 import type { Workflow } from "@bratsos/workflow-engine";
-import {
-  defineAsyncBatchStage,
-  defineStage,
-  WorkflowBuilder,
-} from "@bratsos/workflow-engine";
+import { defineStage, WorkflowBuilder } from "@bratsos/workflow-engine";
 import { createKernel } from "@bratsos/workflow-engine/kernel";
 import {
   CollectingEventSink,
   FakeClock,
   InMemoryBlobStore,
-  NoopScheduler,
 } from "@bratsos/workflow-engine/kernel/testing";
 import {
   InMemoryJobQueue,
+  InMemoryStepLedger,
   InMemoryWorkflowPersistence,
 } from "@bratsos/workflow-engine/testing";
 import { describe, expect, it } from "vitest";
@@ -120,7 +116,7 @@ function createFailingWorkflow(): Workflow<any, any> {
 }
 
 function createAsyncBatchWorkflow(): Workflow<any, any> {
-  const stage = defineAsyncBatchStage({
+  const stage = defineStage({
     id: "batch-stage",
     name: "Batch Stage",
     mode: "async-batch",
@@ -157,12 +153,14 @@ function createAsyncBatchWorkflow(): Workflow<any, any> {
     .build();
 }
 
-function createTestEnv(workflows: Workflow<any, any>[] = []) {
+function createTestEnv(
+  workflows: Workflow<any, any>[] = [],
+  extra: { stepLedger?: InMemoryStepLedger } = {},
+) {
   const persistence = new InMemoryWorkflowPersistence();
   const blobStore = new InMemoryBlobStore();
   const jobTransport = new InMemoryJobQueue("test-worker");
   const eventSink = new CollectingEventSink();
-  const scheduler = new NoopScheduler();
   const clock = new FakeClock();
 
   const registry = new Map<string, Workflow<any, any>>();
@@ -175,9 +173,9 @@ function createTestEnv(workflows: Workflow<any, any>[] = []) {
     blobStore,
     jobTransport,
     eventSink,
-    scheduler,
     clock,
     registry: { getWorkflow: (id) => registry.get(id) },
+    ...extra,
   });
 
   return { kernel, persistence, blobStore, jobTransport, eventSink, clock };
@@ -307,6 +305,361 @@ describe("ServerlessHost", () => {
     expect(tick.suspendedChecked).toBe(0);
     expect(tick.staleReleased).toBe(0);
     expect(tick.eventsFlushed).toBeGreaterThanOrEqual(0);
+  });
+
+  it("purges finished runs past the retention age only when retention is set", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, persistence, jobTransport } = createTestEnv([workflow]);
+    const hostWithoutRetention = createServerlessHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+    });
+    const host = createServerlessHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+      retention: { olderThanMs: 0 },
+    });
+
+    const { workflowRunId } = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "retention-1",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+    await hostWithoutRetention.runMaintenanceTick();
+    const msg = await dequeueAsMessage(jobTransport);
+    await host.handleJob(msg!);
+    expect((await persistence.getRun(workflowRunId))?.status).toBe("COMPLETED");
+
+    // Off by default: the finished run survives a tick without retention.
+    const untouched = await hostWithoutRetention.runMaintenanceTick();
+    expect(untouched.purged).toBe(0);
+    expect(await persistence.getRun(workflowRunId)).not.toBeNull();
+
+    // Opted in: the same tick deletes it and reports the count.
+    const tick = await host.runMaintenanceTick();
+    expect(tick.purged).toBe(1);
+    expect(await persistence.getRun(workflowRunId)).toBeNull();
+    expect(await persistence.getStagesByRun(workflowRunId)).toEqual([]);
+  });
+
+  it("re-enqueues a failed stage with attempts left and completes the run on the retry", async () => {
+    let calls = 0;
+    const flaky = defineStage({
+      id: "flaky",
+      name: "Flaky",
+      schemas: { input: schema, output: outputSchema, config: z.object({}) },
+      async execute(ctx) {
+        calls++;
+        if (calls === 1) throw new Error("transient failure");
+        return { output: { result: ctx.input.data.toUpperCase() } };
+      },
+    });
+    const workflow = new WorkflowBuilder(
+      "flaky-wf",
+      "Flaky",
+      "Test",
+      schema,
+      outputSchema,
+    )
+      .pipe(flaky)
+      .build();
+    const { kernel, persistence, jobTransport, eventSink } = createTestEnv([
+      workflow,
+    ]);
+    const host = createServerlessHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+    });
+    const created = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "flaky-1",
+      workflowId: "flaky-wf",
+      input: { data: "hello" },
+    });
+    await host.runMaintenanceTick();
+
+    const first = await host.handleJob((await dequeueAsMessage(jobTransport))!);
+    expect(first.outcome).toBe("failed");
+    // Retry pending: the stage is not FAILED and the run is still RUNNING.
+    const [afterFirst] = await persistence.getStagesByRun(
+      created.workflowRunId,
+    );
+    expect(afterFirst).toMatchObject({
+      status: "PENDING",
+      errorMessage: "transient failure",
+    });
+    expect((await persistence.getRun(created.workflowRunId))?.status).toBe(
+      "RUNNING",
+    );
+
+    // The transport re-queued the job (attempt 2) without any maintenance.
+    const retry = await dequeueAsMessage(jobTransport);
+    expect(retry).toMatchObject({ stageId: "flaky", attempt: 2 });
+    const second = await host.handleJob(retry!);
+    expect(second.outcome).toBe("completed");
+    expect(calls).toBe(2);
+    const run = await persistence.getRun(created.workflowRunId);
+    expect(run?.status).toBe("COMPLETED");
+    expect(run?.output).toEqual({ result: "HELLO" });
+    // Events for the completed run were published by handleJob itself.
+    expect(eventSink.events.some((e) => e.type === "workflow:completed")).toBe(
+      true,
+    );
+  });
+
+  it("reports the retry contract on the job result for a push transport to act on", async () => {
+    const workflow = createFailingWorkflow();
+    const { kernel, jobTransport } = createTestEnv([workflow]);
+    jobTransport.setDefaultMaxAttempts(3);
+    const host = createServerlessHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+    });
+    await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "retry-contract-1",
+      workflowId: "failing-workflow",
+      input: { data: "boom" },
+    });
+    await host.runMaintenanceTick();
+
+    const first = await host.handleJob((await dequeueAsMessage(jobTransport))!);
+    // Attempts left: the consumer must redeliver after the backoff.
+    expect(first).toEqual({
+      outcome: "failed",
+      error: "Stage exploded",
+      willRetry: true,
+      attempt: 1,
+      maxAttempts: 3,
+      retryDelayMs: 2_000,
+    });
+
+    const second = await host.handleJob(
+      (await dequeueAsMessage(jobTransport))!,
+    );
+    expect(second).toMatchObject({
+      willRetry: true,
+      attempt: 2,
+      retryDelayMs: 4_000,
+    });
+    const third = await host.handleJob((await dequeueAsMessage(jobTransport))!);
+    // Budget exhausted: settled, acknowledge.
+    expect(third).toEqual({
+      outcome: "failed",
+      error: "Stage exploded",
+      willRetry: false,
+      attempt: 3,
+      maxAttempts: 3,
+    });
+  });
+
+  it("rejects a malformed job message as a dead job instead of throwing", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, jobTransport, persistence } = createTestEnv([workflow]);
+    const host = createServerlessHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+    });
+    const created = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "malformed-1",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+    await host.runMaintenanceTick();
+    const msg = (await dequeueAsMessage(jobTransport))!;
+
+    // No payload: previously a TypeError from inside job.execute.
+    const noPayload = await host.handleJob({
+      ...msg,
+      payload: undefined as unknown as Record<string, unknown>,
+    });
+    expect(noPayload).toMatchObject({
+      outcome: "failed",
+      dead: true,
+      error: expect.stringContaining("Invalid job message: payload"),
+    });
+    // The job row was failed and acknowledged, the stage untouched.
+    expect(jobTransport.getJobsByStatus("FAILED")).toHaveLength(1);
+    const [stage] = await persistence.getStagesByRun(created.workflowRunId);
+    expect(stage?.status).toBe("PENDING");
+
+    // No workflowId: previously "Workflow undefined not found".
+    const noWorkflow = await host.handleJob({
+      ...msg,
+      workflowId: undefined as unknown as string,
+    });
+    expect(noWorkflow).toMatchObject({
+      outcome: "failed",
+      dead: true,
+      error: expect.stringContaining("workflowId"),
+    });
+  });
+
+  it("finalises the job row when a suspended stage fails for good from the poll path", async () => {
+    let attempts = 0;
+    const flaky = defineStage({
+      id: "flaky-step",
+      name: "Flaky Step",
+      schemas: { input: schema, output: outputSchema, config: z.object({}) },
+      async execute(ctx) {
+        const value = await ctx.step.run(
+          "call",
+          async () => {
+            attempts++;
+            throw new Error(`upstream down (${attempts})`);
+          },
+          { retries: 1, retryDelayMs: 1_000 },
+        );
+        return { output: { result: String(value) } };
+      },
+    });
+    const workflow = new WorkflowBuilder(
+      "flaky-step-wf",
+      "Flaky Step",
+      "Test",
+      schema,
+      outputSchema,
+    )
+      .pipe(flaky)
+      .build();
+    const { kernel, persistence, jobTransport, clock } = createTestEnv(
+      [workflow],
+      { stepLedger: new InMemoryStepLedger() },
+    );
+    const host = createServerlessHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+    });
+    const created = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "flaky-step-1",
+      workflowId: "flaky-step-wf",
+      input: { data: "x" },
+    });
+    await host.runMaintenanceTick();
+
+    // The step retry suspends the stage (and the job row).
+    const first = await host.handleJob((await dequeueAsMessage(jobTransport))!);
+    expect(first.outcome).toBe("suspended");
+    expect(jobTransport.getJobsByStatus("SUSPENDED")).toHaveLength(1);
+
+    // The retry runs inside stage.pollSuspended and fails for good.
+    clock.advance(2_000);
+    const tick = await host.runMaintenanceTick();
+    expect(tick.suspendedChecked).toBe(1);
+    expect(attempts).toBe(2);
+    expect((await persistence.getRun(created.workflowRunId))?.status).toBe(
+      "FAILED",
+    );
+    const [stage] = await persistence.getStagesByRun(created.workflowRunId);
+    expect(stage?.status).toBe("FAILED");
+    // The job row does not stay SUSPENDED with completedAt null.
+    expect(jobTransport.getJobsByStatus("SUSPENDED")).toHaveLength(0);
+    const [job] = jobTransport.getJobsByStatus("FAILED");
+    expect(job).toMatchObject({
+      stageId: "flaky-step",
+      lastError: "upstream down (2)",
+    });
+    expect(job?.completedAt).toBeInstanceOf(Date);
+  });
+
+  it("fails the run immediately with the stage error when no attempts remain", async () => {
+    const workflow = createFailingWorkflow();
+    const { kernel, persistence, jobTransport, eventSink } = createTestEnv([
+      workflow,
+    ]);
+    jobTransport.setDefaultMaxAttempts(1);
+    const host = createServerlessHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+    });
+    const created = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "fail-terminal-1",
+      workflowId: "failing-workflow",
+      input: { data: "boom" },
+    });
+    await host.runMaintenanceTick();
+
+    const result = await host.handleJob(
+      (await dequeueAsMessage(jobTransport))!,
+    );
+
+    expect(result.outcome).toBe("failed");
+    // No maintenance tick, no reapStuck: the run is FAILED right away.
+    const run = await persistence.getRun(created.workflowRunId);
+    expect(run?.status).toBe("FAILED");
+    const [stageRecord] = await persistence.getStagesByRun(
+      created.workflowRunId,
+    );
+    expect(stageRecord).toMatchObject({
+      status: "FAILED",
+      errorMessage: "Stage exploded",
+    });
+    const failedEvent = eventSink.events.find(
+      (e) => e.type === "workflow:failed",
+    );
+    expect((failedEvent as { error?: string } | undefined)?.error).toBe(
+      "Stage exploded",
+    );
+  });
+
+  it("publishes a completed run's events from handleJob without a maintenance tick", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, jobTransport, eventSink } = createTestEnv([workflow]);
+    const host = createServerlessHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+    });
+    await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "flush-after-job-1",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+    await host.runMaintenanceTick();
+    eventSink.clear();
+
+    await host.handleJob((await dequeueAsMessage(jobTransport))!);
+
+    expect(eventSink.events.map((e) => e.type)).toEqual(
+      expect.arrayContaining(["stage:completed", "workflow:completed"]),
+    );
+  });
+
+  it("treats a job for a run that no longer exists as dead without throwing", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, jobTransport } = createTestEnv([workflow]);
+    const host = createServerlessHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+    });
+    // An orphan queue row: its run was deleted.
+    await jobTransport.enqueueParallel([
+      {
+        workflowRunId: "run-that-does-not-exist",
+        workflowId: "test-workflow",
+        stageId: "stage-1",
+        payload: {},
+      },
+    ]);
+
+    const result = await host.processAvailableJobs({ maxJobs: 5 });
+
+    expect(result).toEqual({ processed: 1, succeeded: 0, failed: 1 });
+    // The dead job was acknowledged: nothing is left to dequeue.
+    expect(await jobTransport.dequeue()).toBeNull();
   });
 
   it("returns failed outcome for a throwing stage", async () => {
@@ -496,9 +849,10 @@ describe("ServerlessHost", () => {
     const msg = await dequeueAsMessage(jobTransport);
     await host.handleJob(msg!);
 
-    // Tick 2: flush remaining events (stage + workflow completion)
+    // handleJob already flushed the completion events itself, so the next
+    // tick finds nothing left to publish.
     const tick2 = await host.runMaintenanceTick();
-    expect(tick2.eventsFlushed).toBeGreaterThan(0);
+    expect(tick2.eventsFlushed).toBe(0);
 
     // Verify events reached the sink
     const types = eventSink.events.map((e) => e.type);

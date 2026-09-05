@@ -4,16 +4,65 @@
  * Tests for the MockAIHelper utility used in testing.
  */
 
+import { Output } from "ai";
 import { beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
-import type { ModelKey } from "../../ai/model-helper.js";
-import { createMockAIHelper, MockAIHelper } from "../utils/mock-ai-helper.js";
+import { InMemoryAICallLogger } from "../../testing/in-memory-ai-logger.js";
+import {
+  createMockAIHelper,
+  createMockAIHelperFactory,
+  MockAIHelper,
+} from "../utils/mock-ai-helper.js";
 
 describe("I want to use MockAIHelper in tests", () => {
   let ai: MockAIHelper;
 
   beforeEach(() => {
     ai = createMockAIHelper("test");
+  });
+
+  describe("generateText with options.output", () => {
+    const schema = z.object({ answer: z.number() });
+
+    it("parses the scripted text as the structured output and validates it", async () => {
+      ai.setTextResponse("extract", { text: '{"answer": 42}' });
+
+      const result = await ai.generateText("gemini-2.5-flash", "extract", {
+        output: Output.object({ schema }),
+      });
+
+      expect(result.text).toBe('{"answer": 42}');
+      expect(result.output).toEqual({ answer: 42 });
+    });
+
+    it("returns a scripted output value as-is", async () => {
+      ai.setTextResponse("extract", {
+        text: "irrelevant",
+        output: { answer: 7 },
+      });
+
+      const result = await ai.generateText("gemini-2.5-flash", "extract", {
+        output: Output.object({ schema }),
+      });
+
+      expect(result.output).toEqual({ answer: 7 });
+    });
+
+    it("rejects a scripted text that does not satisfy the output schema", async () => {
+      ai.setTextResponse("extract", { text: '{"answer": "no"}' });
+
+      await expect(
+        ai.generateText("gemini-2.5-flash", "extract", {
+          output: Output.object({ schema }),
+        }),
+      ).rejects.toMatchObject({ name: "AI_NoObjectGeneratedError" });
+    });
+
+    it("leaves output undefined when the call has no output spec", async () => {
+      ai.setTextResponse("extract", { text: '{"answer": 42}' });
+      const result = await ai.generateText("gemini-2.5-flash", "extract");
+      expect(result.output).toBeUndefined();
+    });
   });
 
   describe("generateText", () => {
@@ -136,10 +185,7 @@ describe("I want to use MockAIHelper in tests", () => {
     it("should return mock embeddings", async () => {
       // Given: A mock AI helper
       // When: I call embed
-      const result = await ai.embed(
-        "text-embedding-004" as ModelKey,
-        "Hello world",
-      );
+      const result = await ai.embed("text-embedding-004", "Hello world");
 
       // Then: Returns embedding array
       expect(result.embedding).toBeDefined();
@@ -150,10 +196,7 @@ describe("I want to use MockAIHelper in tests", () => {
     it("should handle multiple texts", async () => {
       // Given: A mock AI helper
       // When: I call embed with array of texts
-      const result = await ai.embed("text-embedding-004" as ModelKey, [
-        "Hello",
-        "World",
-      ]);
+      const result = await ai.embed("text-embedding-004", ["Hello", "World"]);
 
       // Then: Returns multiple embeddings
       expect(result.embeddings).toHaveLength(2);
@@ -163,7 +206,7 @@ describe("I want to use MockAIHelper in tests", () => {
     it("should record the call", async () => {
       // Given: A mock AI helper
       // When: I make an embed call
-      await ai.embed("text-embedding-004" as ModelKey, "Test");
+      await ai.embed("text-embedding-004", "Test");
 
       // Then: Call is recorded as type "embed"
       const calls = ai.getCallsByType("embed");
@@ -263,9 +306,9 @@ describe("I want to use MockAIHelper in tests", () => {
       ai.setError(true, "Embedding failed");
 
       // When/Then: embed throws
-      await expect(
-        ai.embed("text-embedding-004" as ModelKey, "test"),
-      ).rejects.toThrow("Embedding failed");
+      await expect(ai.embed("text-embedding-004", "test")).rejects.toThrow(
+        "Embedding failed",
+      );
     });
 
     it("should throw error during stream iteration", async () => {
@@ -303,8 +346,8 @@ describe("I want to use MockAIHelper in tests", () => {
       // Given: A mock AI helper
       // When: I make multiple calls
       await ai.generateText("gemini-2.5-flash", "First");
-      await ai.generateText("gemini-2.5-pro" as ModelKey, "Second");
-      await ai.embed("text-embedding-004" as ModelKey, "Third");
+      await ai.generateText("gemini-2.5-pro", "Second");
+      await ai.embed("text-embedding-004", "Third");
 
       // Then: All calls are tracked
       expect(ai.getCalls()).toHaveLength(3);
@@ -313,7 +356,7 @@ describe("I want to use MockAIHelper in tests", () => {
     it("should filter calls by type", async () => {
       // Given: Multiple calls of different types
       await ai.generateText("gemini-2.5-flash", "text");
-      await ai.embed("text-embedding-004" as ModelKey, "embed");
+      await ai.embed("text-embedding-004", "embed");
       await ai.generateText("gemini-2.5-flash", "text2");
 
       // When: I filter by type
@@ -328,12 +371,12 @@ describe("I want to use MockAIHelper in tests", () => {
     it("should filter calls by model", async () => {
       // Given: Calls with different models
       await ai.generateText("gemini-2.5-flash", "flash");
-      await ai.generateText("gemini-2.5-pro" as ModelKey, "pro");
+      await ai.generateText("gemini-2.5-pro", "pro");
       await ai.generateText("gemini-2.5-flash", "flash2");
 
       // When: I filter by model
       const flashCalls = ai.getCallsByModel("gemini-2.5-flash");
-      const proCalls = ai.getCallsByModel("gemini-2.5-pro" as ModelKey);
+      const proCalls = ai.getCallsByModel("gemini-2.5-pro");
 
       // Then: Returns filtered results
       expect(flashCalls).toHaveLength(2);
@@ -453,7 +496,7 @@ describe("I want to use MockAIHelper in tests", () => {
     it("should track per-model stats", async () => {
       // Given: Calls with different models
       await ai.generateText("gemini-2.5-flash", "flash");
-      await ai.generateText("gemini-2.5-pro" as ModelKey, "pro");
+      await ai.generateText("gemini-2.5-pro", "pro");
 
       // When: I get stats
       const stats = await ai.getStats();
@@ -533,6 +576,84 @@ describe("I want to use MockAIHelper in tests", () => {
       await expect(
         ai.generateText("gemini-2.5-flash", "test"),
       ).resolves.toBeDefined();
+    });
+  });
+  describe("scripting", () => {
+    it("fails exactly one matching call and then succeeds", async () => {
+      ai.failOnce("flaky", new Error("one bad call"));
+
+      await expect(
+        ai.generateText("gemini-2.5-flash", "flaky"),
+      ).rejects.toThrow("one bad call");
+      await expect(
+        ai.generateText("gemini-2.5-flash", "flaky"),
+      ).resolves.toBeDefined();
+    });
+
+    it("matches on a RegExp and on a call predicate", async () => {
+      ai.failOnce(/item-\d+/, new Error("regexp match"));
+      ai.failOnce((call) => call.kind === "embed", new Error("no embeddings"));
+
+      await expect(
+        ai.generateText("gemini-2.5-flash", "item-7 please"),
+      ).rejects.toThrow("regexp match");
+      await expect(ai.embed("gemini-2.5-flash", "hello")).rejects.toThrow(
+        "no embeddings",
+      );
+    });
+
+    it("shares armed failures with child helpers", async () => {
+      ai.failOnce("scoped", new Error("fires in the child"));
+      const child = ai.createAtTopic("workflow.run.stage.one");
+
+      await expect(
+        child.generateText("gemini-2.5-flash", "scoped"),
+      ).rejects.toThrow("fires in the child");
+    });
+
+    it("dispatches object responses on Zod schema identity", async () => {
+      const Summary = z.object({ summary: z.string() });
+      const Facts = z.object({ facts: z.array(z.string()) });
+      ai.mockObjectResponseForSchema(Summary, { summary: "short" });
+      ai.mockObjectResponseForSchema(Facts, { facts: ["a", "b"] });
+
+      const summary = await ai.generateObject(
+        "gemini-2.5-flash",
+        "analyse the document",
+        Summary,
+      );
+      const facts = await ai.generateObject(
+        "gemini-2.5-flash",
+        "analyse the document",
+        Facts,
+      );
+
+      expect(summary.object).toEqual({ summary: "short" });
+      expect(facts.object).toEqual({ facts: ["a", "b"] });
+    });
+  });
+
+  describe("createMockAIHelperFactory", () => {
+    it("hands out the caller's instance, subclasses included", () => {
+      class RecordingMock extends MockAIHelper {
+        readonly marker = "subclass";
+      }
+      const helper = new RecordingMock("root");
+      const factory = createMockAIHelperFactory({ helper });
+
+      expect(factory.helper).toBe(helper);
+      const scoped = factory(
+        "workflow.run-1.stage.a",
+        new InMemoryAICallLogger(),
+      );
+      expect(scoped).toBeInstanceOf(RecordingMock);
+      expect((scoped as RecordingMock).marker).toBe("subclass");
+      expect(scoped.topic).toBe("workflow.run-1.stage.a");
+    });
+
+    it("still accepts a bare helper argument", () => {
+      const helper = new MockAIHelper("root");
+      expect(createMockAIHelperFactory(helper).helper).toBe(helper);
     });
   });
 });

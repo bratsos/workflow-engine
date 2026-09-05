@@ -15,6 +15,8 @@ import {
   type ModelConfig,
   type ModelKey,
 } from "./model-helper";
+import { schemaTargetForModel, withPortableSchema } from "./schema-portability";
+import type { AIHelperContext } from "./types";
 
 export const logger = createLogger("AIHelper");
 
@@ -79,7 +81,10 @@ export function getModelProvider(
     });
   }
   if (modelConfig.provider === "google") {
-    return google(modelConfig.id);
+    // A registry entry may carry the catalog slug (`google/gemini-...`) so
+    // the same key serves the Google batch path; the Google API itself
+    // wants the bare model id (the slug 404s).
+    return google(modelConfig.id.replace(/^google\//, ""));
   }
 
   throw new Error(
@@ -88,7 +93,24 @@ export function getModelProvider(
   );
 }
 
+/**
+ * The language model for a registry entry — the helper's `providerResolver`
+ * first, then the built-in providers — wrapped so structured-output
+ * requests carry a schema the target accepts (see schema-portability.ts).
+ */
+export function resolveLanguageModel(
+  ctx: Pick<AIHelperContext, "providerResolver" | "routing">,
+  modelConfig: ModelConfig,
+): LanguageModelV4 {
+  const model =
+    ctx.providerResolver?.(modelConfig) ??
+    getModelProvider(modelConfig, ctx.routing);
+  return withPortableSchema(model, schemaTargetForModel(modelConfig, model));
+}
+
 export interface ProviderResultLike {
+  /** A cost the transport itself reported, in USD (adapters). */
+  costUsd?: number;
   providerMetadata?: Record<string, any>;
   usage?: {
     raw?: Record<string, any>;
@@ -114,6 +136,10 @@ export function extractReportedCost(
 ): number | undefined {
   if (!result || typeof result !== "object") {
     return undefined;
+  }
+
+  if (typeof result.costUsd === "number" && !Number.isNaN(result.costUsd)) {
+    return result.costUsd;
   }
 
   const openrouterMeta =
@@ -267,4 +293,32 @@ export function calculateCostWithDiscount(
 
   const baseCost = calculateCost(modelKey, inputTokens, outputTokens);
   return baseCost.totalCost;
+}
+
+const NO_ENDPOINTS =
+  /No endpoints found that can handle the requested parameters/;
+
+/**
+ * OpenRouter answers "No endpoints found that can handle the requested
+ * parameters" when `provider.require_parameters` (on by default) excludes
+ * every endpoint that does not honour one of the request's parameters —
+ * most often `maxTokens` on a model whose endpoints do not all accept it.
+ * The raw message reads like an outage; say what to change.
+ */
+export function explainRoutingError(
+  error: unknown,
+  routing: OpenRouterRoutingOptions | undefined,
+  modelKey: string,
+): unknown {
+  if (!(error instanceof Error) || !NO_ENDPOINTS.test(error.message)) {
+    return error;
+  }
+  if (routing?.requireParameters === false) return error;
+  const explained = new Error(
+    `OpenRouter found no endpoint honouring every requested parameter for "${modelKey}" (routing.requireParameters is true by default, so an endpoint that ignores e.g. maxTokens or temperature is excluded). ` +
+      `Set routing: { requireParameters: false } on createAIHelper / AIHelperOptions to accept such endpoints, or drop the parameter. Original: ${error.message}`,
+    { cause: error },
+  );
+  explained.name = error.name;
+  return explained;
 }

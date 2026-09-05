@@ -8,7 +8,12 @@
  * This file contains ONLY types -- no runtime code.
  */
 
-import type { AnnotationActor } from "../persistence/interface";
+import type {
+  AnnotationActor,
+  PurgeableRunStatus,
+  ServedDefinition,
+  Status,
+} from "../persistence/interface";
 
 // ---------------------------------------------------------------------------
 // run.create
@@ -37,12 +42,6 @@ export interface RunCreateCommand {
   readonly config?: Record<string, unknown>;
   readonly priority?: number;
   /**
-   * @deprecated since 0.8.0. Use `annotations` instead — annotations are
-   * queryable, indexed, and follow stable conventions. `metadata` will be
-   * removed in 1.0.
-   */
-  readonly metadata?: Record<string, unknown>;
-  /**
    * Annotations to attach at run creation time. Each entry becomes one
    * row per attribute, sharing the supplied envelope (actor / payload /
    * idempotencyKey). Written inside the same transaction as the run.
@@ -54,6 +53,11 @@ export interface RunCreateCommand {
 export interface RunCreateResult {
   readonly workflowRunId: string;
   readonly status: "PENDING";
+  /**
+   * The definition version the run is pinned to, or `null` on a database
+   * whose schema predates definition versioning.
+   */
+  readonly definitionVersion: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -65,6 +69,21 @@ export interface RunClaimPendingCommand {
   readonly type: "run.claimPending";
   readonly workerId: string;
   readonly maxClaims?: number;
+  /**
+   * Which definition versions this claim may adopt.
+   *
+   * Left unset, the kernel derives it from the registry's optional
+   * `listWorkflows()` — so a registry built with `createWorkflowRegistry`
+   * claims only runs this build can correctly execute, and a registry
+   * without enumeration claims anything, as before versioning existed.
+   *
+   * Pass `"all"` to claim regardless of version (the pre-1.0 behaviour),
+   * or an explicit list to claim on behalf of another build.
+   *
+   * Runs created before the consumer migrated carry no version and are
+   * claimable by any host whose `serves` names their workflow.
+   */
+  readonly serves?: readonly ServedDefinition[] | "all";
 }
 
 /** Result of a `run.claimPending` command. */
@@ -112,7 +131,16 @@ export interface RunCancelResult {
 // run.rerunFrom
 // ---------------------------------------------------------------------------
 
-/** Reruns a workflow from a specific stage, deleting stages at/after that point. */
+/**
+ * Reruns a workflow from a specific stage, replacing the stage records at
+ * and after that point.
+ *
+ * @deprecated Use `run.redrive`, which covers this (`from: { kind: "stage" }`)
+ * plus retry-from-the-last-failure and restart-from-the-beginning, and can
+ * move the run onto a different definition version. `run.rerunFrom` is
+ * kept working and now shares `run.redrive`'s behaviour, including
+ * preserving the superseded attempt.
+ */
 export interface RunRerunFromCommand {
   readonly type: "run.rerunFrom";
   readonly workflowRunId: string;
@@ -140,6 +168,21 @@ export interface JobExecuteCommand {
   readonly workflowId: string;
   readonly stageId: string;
   readonly config: Record<string, unknown>;
+  /**
+   * The job's attempt number (1 on the first execution, as the transport
+   * counts it) and its attempt budget. When both are known the kernel
+   * records a retryable stage failure as PENDING — the retry the host is
+   * about to enqueue — instead of FAILED, and reports `willRetry`.
+   */
+  readonly attempt?: number;
+  readonly maxAttempts?: number;
+  /**
+   * Becomes `ctx.abortSignal` for the stage invocation. The host loop
+   * aborts it from its lease heartbeat when the run is cancelled or the
+   * job lease is lost (`job.heartbeat`). Optional and never persisted: a
+   * dispatch without one gives the stage a signal that never fires.
+   */
+  readonly abortSignal?: AbortSignal;
 }
 
 /** Result of a `job.execute` command. */
@@ -148,14 +191,42 @@ export interface JobExecuteResult {
   readonly output?: unknown;
   readonly error?: string;
   readonly nextPollAt?: Date;
-  /** True when the job was discarded because the run is no longer RUNNING. */
+  /** True when the job was not executed because the run is not RUNNING. */
   readonly ghost?: boolean;
+  /**
+   * Only set alongside `ghost`. Distinguishes the two reasons a job can
+   * find its run not RUNNING:
+   *  - `"orphan"` — the run is CANCELLED/COMPLETED/FAILED, or was made so
+   *    mid-execution. The job is meaningless and must be thrown away.
+   *  - `"race"` — the run is still PENDING, i.e. its claim had not
+   *    committed when this job was dequeued. The job is valid and simply
+   *    arrived early: it must be re-delivered, not discarded, or the run
+   *    wedges RUNNING with no job until `run.reapStuck` sweeps it up.
+   *  - `"version"` — the run is pinned to a definition version this build
+   *    does not serve. The job is valid but belongs to another build: it
+   *    must be re-delivered so a process running that definition executes
+   *    it. `run.listVersions` reports these runs; `run.redrive` with
+   *    `definitionVersion: "latest"` moves them onto the current build.
+   */
+  readonly ghostReason?: "orphan" | "race" | "version";
   /**
    * False marks a deterministic failure (e.g. Zod input/config validation)
    * that will not succeed on retry — hosts should fail the job terminally.
    * `undefined`/`true` preserves default retry behavior.
    */
   readonly retryable?: boolean;
+  /**
+   * True when the failure was recorded as a pending retry (stage left
+   * PENDING with the error on `errorMessage`) because the command carried
+   * `attempt`/`maxAttempts` with attempts remaining and the error was not
+   * deterministic. The host must re-enqueue the job
+   * (`jobTransport.fail(jobId, error, true)`).
+   */
+  readonly willRetry?: boolean;
+  /** The job attempt that ran, echoed from the command when it carried one. */
+  readonly attempt?: number;
+  /** The attempt budget the retry decision used, when the command carried one. */
+  readonly maxAttempts?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -166,6 +237,16 @@ export interface JobExecuteResult {
 export interface StagePollSuspendedCommand {
   readonly type: "stage.pollSuspended";
   readonly maxChecks?: number;
+  /**
+   * Which definition versions this poll may service, in the same shape and
+   * with the same defaulting as {@link RunClaimPendingCommand.serves}.
+   *
+   * It has to be the same answer as the claim's: a host that adopts a run
+   * must also poll its suspended stages, and a host that declines to adopt
+   * must not hold them. The filter is applied in the query that lists ready
+   * stages, so an unserving host never claims a stage's poll lease at all.
+   */
+  readonly serves?: readonly ServedDefinition[] | "all";
 }
 
 /** Result of a `stage.pollSuspended` command. */
@@ -177,6 +258,60 @@ export interface StagePollSuspendedResult {
 }
 
 // ---------------------------------------------------------------------------
+// step.signal
+// ---------------------------------------------------------------------------
+
+/** Completes a durable signal step and nudges its stage for replay. */
+export interface StepSignalCommand {
+  readonly type: "step.signal";
+  readonly workflowRunId: string;
+  readonly stageId: string;
+  readonly stepId: string;
+  readonly payload: unknown;
+}
+
+export interface StepSignalResult {
+  readonly signalled: boolean;
+  readonly ok: true;
+  readonly alreadyCompleted: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// job.heartbeat
+// ---------------------------------------------------------------------------
+
+/**
+ * One beat of a host's job lease heartbeat: renews the lease and reports
+ * whether the work is still wanted. Dispatched by `executeJobWithHeartbeat`
+ * on its heartbeat interval while `job.execute` runs; a custom host that
+ * drives `job.execute` itself can dispatch it to feed the stage's
+ * `abortSignal`. No idempotency, no transaction, no outbox events.
+ */
+export interface JobHeartbeatCommand {
+  readonly type: "job.heartbeat";
+  readonly jobId: string;
+  readonly workflowRunId: string;
+  /**
+   * The attempt this worker dequeued. When given, a job row carrying a
+   * different attempt is reported as a lost lease even though it is
+   * RUNNING: another worker re-claimed it after a stale-lease release.
+   */
+  readonly attempt?: number;
+}
+
+/** Result of a `job.heartbeat` command. */
+export interface JobHeartbeatResult {
+  /** The run's status as of this beat, or `null` when the run is gone. */
+  readonly runStatus: Status | null;
+  /**
+   * False when the job row is no longer RUNNING under this worker's attempt
+   * — released as stale, expired by the absolute cap, cancelled, or
+   * re-claimed by another worker. `touchJob` was a no-op in that case.
+   */
+  readonly leaseHeld: boolean;
+}
+
+// ---------------------------------------------------------------------------
 // lease.reapStale
 // ---------------------------------------------------------------------------
 
@@ -184,11 +319,22 @@ export interface StagePollSuspendedResult {
 export interface LeaseReapStaleCommand {
   readonly type: "lease.reapStale";
   readonly staleThresholdMs: number;
+  /**
+   * Absolute cap (ms) on how long one claim may hold its lease, measured
+   * from `startedAt` and therefore unaffected by heartbeating. Jobs past it
+   * are failed terminally with the `LEASE_ABSOLUTE_CAP` reason. Omit, or
+   * pass 0, to run the heartbeat tier alone (the pre-1.0.0-alpha.9
+   * behaviour). Ignored by a transport with no `expireRunawayJobs`.
+   */
+  readonly absoluteTimeoutMs?: number;
 }
 
 /** Result of a `lease.reapStale` command. */
 export interface LeaseReapStaleResult {
+  /** Jobs the heartbeat tier requeued for another worker. */
   readonly released: number;
+  /** Jobs the absolute tier failed as runaways. */
+  readonly expired: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -201,9 +347,39 @@ export interface OutboxFlushCommand {
   readonly maxEvents?: number;
 }
 
+/**
+ * Health of the event sink as of the last flush.
+ *
+ * `"degraded"` is the named state for "the sink is refusing events": the
+ * run keeps progressing (the poller, not the sink, is what advances a
+ * run), events stay committed in the outbox, and delivery is retried on
+ * the next flush. It is not an error — it is a state a host reports so it
+ * is visible *before* the dead-letter queue fills.
+ */
+export type EventSinkStatus = "healthy" | "degraded";
+
 /** Result of an `outbox.flush` command. */
 export interface OutboxFlushResult {
   readonly published: number;
+  /**
+   * Events this flush claimed but could not publish **and which the next
+   * flush will retry** — the ones whose emit threw, plus the later events
+   * of those same runs, held back so nothing is redelivered out of order.
+   * They were released (their `publishedAt` cleared), so this is a
+   * delivery-lag signal, not data loss. Events that exhausted their retry
+   * budget in this same pass are not counted here; they are `deadLettered`.
+   */
+  readonly failed: number;
+  /**
+   * Events this flush moved to the dead-letter queue because their retry
+   * budget ran out. These no longer retry on their own: replay them with
+   * `plugin.replayDLQ`.
+   */
+  readonly deadLettered: number;
+  /** `"degraded"` when at least one event could not be published. */
+  readonly eventSinkStatus: EventSinkStatus;
+  /** Message of the first publish failure of this flush, when degraded. */
+  readonly eventSinkError?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -244,6 +420,155 @@ export interface RunReapStuckResult {
 }
 
 // ---------------------------------------------------------------------------
+// run.purge
+// ---------------------------------------------------------------------------
+
+/**
+ * Retention: deletes terminal runs that finished at or before `olderThan`.
+ *
+ * For each run the kernel clears the `StepLedger` for every stage record,
+ * deletes the run's blobs (stage outputs, artifacts, spilled job payloads
+ * and step results under the engine's own key prefixes), removes its job
+ * rows, and then deletes the run through `PersistenceCore.deleteRun`, which
+ * takes stages, logs, artifacts and annotations with it. Emits no events.
+ * Bounded by `limit` so a tick stays short; repeat until `purged` is 0.
+ */
+export interface RunPurgeCommand {
+  readonly type: "run.purge";
+  /** Runs whose `completedAt` (or, lacking one, `updatedAt`) is at or before this are eligible. */
+  readonly olderThan: Date;
+  /** Defaults to all three terminal statuses. */
+  readonly statuses?: readonly PurgeableRunStatus[];
+  /** Maximum runs deleted per call. Defaults to 100. */
+  readonly limit?: number;
+}
+
+/** Result of a `run.purge` command. */
+export interface RunPurgeResult {
+  readonly purged: number;
+  readonly workflowRunIds: string[];
+}
+
+// ---------------------------------------------------------------------------
+// run.redrive
+// ---------------------------------------------------------------------------
+
+/** Where a `run.redrive` resumes from. */
+export type RunRedriveFrom =
+  /**
+   * Conductor's `retry`: resume at the earliest stage that is not
+   * COMPLETED — in practice the stage that failed — leaving completed
+   * stages untouched.
+   */
+  | { readonly kind: "lastFailure" }
+  /** Conductor's `restart`: re-run the whole pipeline from the first group. */
+  | { readonly kind: "start" }
+  /** Conductor's `rerun`: resume at a chosen stage. */
+  | { readonly kind: "stage"; readonly stageId: string };
+
+/**
+ * Re-drives a terminal run. Unlike the `run.rerunFrom` it replaces, the
+ * superseded attempt is preserved: every stage record it removes is first
+ * archived as a stage-scoped annotation carrying its status, error,
+ * timings and output, so the failed attempt survives the retry.
+ *
+ * Step Functions' model: the same run id, an incremented `redriveCount`,
+ * no branching into a new execution.
+ */
+export interface RunRedriveCommand {
+  readonly type: "run.redrive";
+  readonly workflowRunId: string;
+  /** Defaults to `{ kind: "lastFailure" }`. */
+  readonly from?: RunRedriveFrom;
+  /**
+   * Move the run onto a different definition version — DBOS's fork-onto-a-
+   * new-application-version, which is the answer to "we shipped a bug,
+   * patch it and re-run".
+   *
+   * - omitted: keep the run's pinned version (the default).
+   * - `"latest"`: re-pin to the version this process currently serves.
+   * - an explicit version string: re-pin to that version, which must
+   *   already be registered for this workflow.
+   */
+  readonly definitionVersion?: string | "latest";
+  /** Optional idempotency key — a replayed call returns the cached result. */
+  readonly idempotencyKey?: string;
+}
+
+/** Result of a `run.redrive` command. */
+export interface RunRedriveResult {
+  readonly workflowRunId: string;
+  /** The stage the run resumed from. */
+  readonly fromStageId: string;
+  /**
+   * Stage ids whose records were superseded and archived: the resumed
+   * group's records, reopened in place, and every later record, deleted.
+   */
+  readonly supersededStages: string[];
+  /** The run's `redriveCount` after this command. */
+  readonly redriveCount: number;
+  /** The definition version the run is pinned to after this command. */
+  readonly definitionVersion: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// run.listVersions
+// ---------------------------------------------------------------------------
+
+/**
+ * Answers "has this definition version drained?" — the query DBOS's
+ * workflow listing gives operators, so an old build can be retired
+ * knowingly rather than hopefully.
+ */
+export interface RunListVersionsCommand {
+  readonly type: "run.listVersions";
+  /** Restrict to one workflow. */
+  readonly workflowId?: string;
+  /** Restrict to one definition version. */
+  readonly definitionVersion?: string;
+}
+
+/** Per-version run accounting. */
+export interface DefinitionVersionSummary {
+  readonly workflowId: string;
+  /** `null` for runs created before the consumer migrated. */
+  readonly definitionVersion: string | null;
+  /** Run count per status. */
+  readonly counts: Readonly<Record<string, number>>;
+  /** Runs at this version in any status. */
+  readonly total: number;
+  /** PENDING + RUNNING + SUSPENDED — the runs still needing a host. */
+  readonly active: number;
+  /** True when nothing at this version still needs a host. */
+  readonly drained: boolean;
+  /**
+   * Whether this process's registry currently serves this version.
+   * `false` with `active > 0` is the state to act on: those runs have no
+   * host here, and either a peer on the old build must finish them or
+   * `run.redrive` must move them forward.
+   */
+  readonly servedHere: boolean;
+  /** Creation time of the oldest run at this version, in any status. */
+  readonly oldestCreatedAt: Date | null;
+}
+
+/** Result of a `run.listVersions` command. */
+export interface RunListVersionsResult {
+  /**
+   * False on a database whose schema predates definition versioning; the
+   * `versions` array is then empty rather than misleading.
+   */
+  readonly supported: boolean;
+  /** Newest-first by `oldestCreatedAt`, unpinned runs last. */
+  readonly versions: readonly DefinitionVersionSummary[];
+  /**
+   * Versions with active runs that this process does not serve — the
+   * runs that would otherwise sit pending with nobody to execute them.
+   */
+  readonly unservedHere: readonly DefinitionVersionSummary[];
+}
+
+// ---------------------------------------------------------------------------
 // Union & conditional result mapping
 // ---------------------------------------------------------------------------
 
@@ -254,12 +579,17 @@ export type KernelCommand =
   | RunTransitionCommand
   | RunCancelCommand
   | RunRerunFromCommand
+  | RunRedriveCommand
+  | RunListVersionsCommand
   | JobExecuteCommand
+  | JobHeartbeatCommand
   | StagePollSuspendedCommand
+  | StepSignalCommand
   | LeaseReapStaleCommand
   | OutboxFlushCommand
   | PluginReplayDLQCommand
-  | RunReapStuckCommand;
+  | RunReapStuckCommand
+  | RunPurgeCommand;
 
 /** String literal union of all kernel command type discriminants. */
 export type KernelCommandType = KernelCommand["type"];
@@ -275,16 +605,26 @@ export type CommandResult<T extends KernelCommand> = T extends RunCreateCommand
         ? RunCancelResult
         : T extends RunRerunFromCommand
           ? RunRerunFromResult
-          : T extends JobExecuteCommand
-            ? JobExecuteResult
-            : T extends StagePollSuspendedCommand
-              ? StagePollSuspendedResult
-              : T extends LeaseReapStaleCommand
-                ? LeaseReapStaleResult
-                : T extends OutboxFlushCommand
-                  ? OutboxFlushResult
-                  : T extends PluginReplayDLQCommand
-                    ? PluginReplayDLQResult
-                    : T extends RunReapStuckCommand
-                      ? RunReapStuckResult
-                      : never;
+          : T extends RunRedriveCommand
+            ? RunRedriveResult
+            : T extends RunListVersionsCommand
+              ? RunListVersionsResult
+              : T extends JobExecuteCommand
+                ? JobExecuteResult
+                : T extends JobHeartbeatCommand
+                  ? JobHeartbeatResult
+                  : T extends StagePollSuspendedCommand
+                    ? StagePollSuspendedResult
+                    : T extends StepSignalCommand
+                      ? StepSignalResult
+                      : T extends LeaseReapStaleCommand
+                        ? LeaseReapStaleResult
+                        : T extends OutboxFlushCommand
+                          ? OutboxFlushResult
+                          : T extends PluginReplayDLQCommand
+                            ? PluginReplayDLQResult
+                            : T extends RunReapStuckCommand
+                              ? RunReapStuckResult
+                              : T extends RunPurgeCommand
+                                ? RunPurgeResult
+                                : never;

@@ -38,7 +38,11 @@ export interface PrismaEnumHelper {
  *
  * Supports both Prisma 6.x (returns string) and Prisma 7.x (returns typed enum).
  */
-export function createEnumHelper(prisma: PrismaClient): PrismaEnumHelper {
+export function createEnumHelper(
+  prisma: PrismaClient,
+  options: { statusEnumName?: string } = {},
+): PrismaEnumHelper {
+  const statusEnumName = options.statusEnumName ?? "Status";
   const resolveEnum = (enumName: string, value: string): unknown => {
     try {
       // Prisma 7.x exposes enums via $Enums
@@ -54,7 +58,7 @@ export function createEnumHelper(prisma: PrismaClient): PrismaEnumHelper {
   };
 
   return {
-    status: (value: string) => resolveEnum("Status", value),
+    status: (value: string) => resolveEnum(statusEnumName, value),
     artifactType: (value: string) => resolveEnum("ArtifactType", value),
     logLevel: (value: string) => resolveEnum("LogLevel", value),
   };

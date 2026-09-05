@@ -274,7 +274,7 @@ describe("getModelProvider throws for unknown providers", () => {
     const ai = createAIHelper("t", logger as any); // no providerResolver
 
     await expect(
-      ai.generateText("bugfix-unknown-provider-model" as never, "hello"),
+      ai.generateText("bugfix-unknown-provider-model", "hello"),
     ).rejects.toThrow(/Unsupported provider "totally-unknown"/);
   });
 });
@@ -309,7 +309,7 @@ describe("embed() uses embedMany() for multi-text input", () => {
     const { logger } = makeLogger();
     const ai = createAIHelper("t", logger as any);
 
-    const result = await ai.embed("bugfix-mock-embed-model" as never, [
+    const result = await ai.embed("bugfix-mock-embed-model", [
       "alpha",
       "beta",
       "gamma",
@@ -350,10 +350,7 @@ describe("embed() uses embedMany() for multi-text input", () => {
 
     const { logger } = makeLogger();
     const ai = createAIHelper("t", logger as any);
-    const result = await ai.embed(
-      "bugfix-mock-embed-model-single" as never,
-      "alpha",
-    );
+    const result = await ai.embed("bugfix-mock-embed-model-single", "alpha");
 
     expect(doEmbed).toHaveBeenCalledTimes(1);
     expect(result.embeddings).toHaveLength(1);

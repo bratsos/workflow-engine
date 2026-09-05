@@ -15,7 +15,16 @@ import { z } from "zod";
 import type { CheckCompletionContext, StageContext } from "../../core/stage.js";
 import { defineAsyncBatchStage } from "../../core/stage-factory.js";
 import { WorkflowBuilder } from "../../core/workflow.js";
-import { createTestKernel, TestSchemas } from "../utils/index.js";
+import { InMemoryAICallLogger } from "../../testing/in-memory-ai-logger.js";
+import {
+  createMockAIHelper,
+  createTestKernel,
+  createTestStepApi,
+  TestSchemas,
+} from "../utils/index.js";
+
+const testAi = createMockAIHelper("test");
+const testAiLogger = new InMemoryAICallLogger();
 
 describe("I want to define async-batch stages", () => {
   describe("stage creation", () => {
@@ -707,7 +716,11 @@ function createMockContext<TInput>(options: {
     config: {},
     workflowContext: {},
     resumeState: options.resumeState,
+    ai: testAi,
+    aiLogger: testAiLogger,
     onProgress: () => {},
+    step: createTestStepApi(),
+    abortSignal: new AbortController().signal,
     onLog: () => {},
     log: () => {},
     annotate: () => {},
@@ -730,6 +743,9 @@ function createCheckContext<TConfig extends Record<string, unknown>>(options: {
     workflowRunId: options.workflowRunId ?? "run-1",
     stageId: options.stageId,
     config: options.config,
+    ai: testAi,
+    aiLogger: testAiLogger,
+    step: createTestStepApi(),
     onLog: () => {},
     log: () => {},
     annotate: () => {},

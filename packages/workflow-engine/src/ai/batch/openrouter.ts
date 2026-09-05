@@ -1,9 +1,11 @@
 import { z } from "zod";
+import { toPortableJsonSchema } from "../schema-portability";
 import {
   type EngineBatchItemResult,
   type EngineBatchModel,
   type EngineBatchRef,
   type EngineBatchRequest,
+  type EngineBatchStartOptions,
   type EngineBatchStatus,
   toJsonSchema,
 } from "./model";
@@ -26,16 +28,16 @@ const OpenRouterBatchResultItemSchema = z.object({
   custom_id: z.string(),
   response: z
     .object({
-      status_code: z.number().optional(),
-      request_id: z.string().optional(),
+      status_code: z.number().nullish(),
+      request_id: z.string().nullish(),
       body: z.record(z.string(), z.unknown()).nullish(),
     })
     .nullish(),
   error: z
     .union([
       z.object({
-        message: z.string().optional(),
-        code: z.union([z.string(), z.number()]).optional(),
+        message: z.string().nullish(),
+        code: z.union([z.string(), z.number()]).nullish(),
       }),
       z.string(),
     ])
@@ -48,27 +50,27 @@ const OpenRouterBatchResponseSchema = z.object({
   created_at: z.union([z.number(), z.string()]).nullish(),
   request_counts: z
     .object({
-      total: z.number().optional(),
-      completed: z.number().optional(),
-      failed: z.number().optional(),
-      pending: z.number().optional(),
+      total: z.number().nullish(),
+      completed: z.number().nullish(),
+      failed: z.number().nullish(),
+      pending: z.number().nullish(),
     })
     .nullish(),
   usage: z
     .object({
-      prompt_tokens: z.number().optional(),
-      completion_tokens: z.number().optional(),
-      total_tokens: z.number().optional(),
-      cost: z.number().optional(),
-      is_byok: z.boolean().optional(),
+      prompt_tokens: z.number().nullish(),
+      completion_tokens: z.number().nullish(),
+      total_tokens: z.number().nullish(),
+      cost: z.number().nullish(),
+      is_byok: z.boolean().nullish(),
     })
     .nullish(),
   results: z.array(OpenRouterBatchResultItemSchema).nullable().optional(),
   error: z
     .union([
       z.object({
-        message: z.string().optional(),
-        code: z.union([z.string(), z.number()]).optional(),
+        message: z.string().nullish(),
+        code: z.union([z.string(), z.number()]).nullish(),
       }),
       z.string(),
     ])
@@ -249,13 +251,16 @@ export function createOpenRouterBatchModel(
   return {
     provider: "openrouter",
     modelId: cfg.modelId,
+    // The beta batch body takes only `endpoint`, `model` and `requests` --
+    // no metadata field the engine could stamp and search -- and there is no
+    // documented idempotency header. A crashed submit is therefore not
+    // recoverable here; `AIBatchImpl` refuses to re-create rather than pay
+    // for a second batch nobody reads.
+    recovery: "none" as const,
 
     async start(
       requests: EngineBatchRequest[],
-      opts?: {
-        abortSignal?: AbortSignal;
-        headers?: Record<string, string>;
-      },
+      opts?: EngineBatchStartOptions,
     ): Promise<EngineBatchRef & EngineBatchStatus> {
       const items = requests.map((req) => {
         const body: Record<string, unknown> = {
@@ -273,12 +278,14 @@ export function createOpenRouterBatchModel(
           body.temperature = req.temperature;
         }
         if (req.schema !== undefined) {
+          // Strict structured outputs (OpenAI's rules, which OpenRouter
+          // forwards) reject `oneOf`; see schema-portability.ts.
           body.response_format = {
             type: "json_schema",
             json_schema: {
               name: "response",
               strict: true,
-              schema: toJsonSchema(req.schema),
+              schema: toPortableJsonSchema(toJsonSchema(req.schema), "openai"),
             },
           };
         }
@@ -317,8 +324,11 @@ export function createOpenRouterBatchModel(
         const errText = await res.text().catch(() => "");
         const excerpt =
           errText.length > 200 ? `${errText.slice(0, 200)}...` : errText;
+        const hint = /does not have a :batch endpoint/.test(errText)
+          ? ` OpenRouter's Batch API only serves models with a live ":batch" endpoint (the catalog row alone is not enough); pick a model that has one or batch through the vendor transport (ai.batch(modelKey, "<vendor>")).`
+          : "";
         throw new Error(
-          `OpenRouter batch creation failed (HTTP ${res.status}): ${excerpt}`,
+          `OpenRouter batch creation failed (HTTP ${res.status}): ${excerpt}${hint}`,
         );
       }
 

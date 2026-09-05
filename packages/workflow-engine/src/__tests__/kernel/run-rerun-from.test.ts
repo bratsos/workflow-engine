@@ -73,7 +73,9 @@ describe("kernel: run.rerunFrom", () => {
 
     const runBefore = await persistence.getRun(workflowRunId);
     expect(runBefore!.status).toBe("COMPLETED");
-    const jobCountBefore = jobTransport.getAllJobs().length;
+    const jobIdsBefore = new Map(
+      jobTransport.getAllJobs().map((j: any) => [j.stageId, j.id]),
+    );
 
     const result = await kernel.dispatch({
       type: "run.rerunFrom",
@@ -93,8 +95,14 @@ describe("kernel: run.rerunFrom", () => {
     const stage1 = await persistence.getStage(workflowRunId, "stage-1");
     expect(stage1?.status).toBe("COMPLETED");
 
-    // Exactly one new job was enqueued for the rerun.
-    expect(jobTransport.getAllJobs().length).toBe(jobCountBefore + 1);
+    // The rerun target's old job row (enqueued by the run.transition that
+    // reached stage-2) was retired and replaced rather than added to:
+    // still exactly one row for the stage, and it is a new PENDING one.
+    const jobsAfter = jobTransport.getAllJobs();
+    expect(jobsAfter.map((j: any) => j.stageId)).toEqual(["stage-2"]);
+    expect(jobsAfter[0]?.status).toBe("PENDING");
+    expect(jobsAfter[0]?.attempt).toBe(0);
+    expect(jobsAfter[0]?.id).not.toBe(jobIdsBefore.get("stage-2"));
   });
 
   it("stamps the new stage record with attempt = priorMaxAttempt + 1 (attemptMode max+1)", async () => {

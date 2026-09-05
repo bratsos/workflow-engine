@@ -6,7 +6,6 @@
 
 import { beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
-import type { ModelKey } from "../../ai/model-helper.js";
 import { createMockAIHelper, MockAIHelper } from "../utils/mock-ai-helper.js";
 
 describe("I want to generate text using AIHelper", () => {
@@ -51,7 +50,7 @@ describe("I want to generate text using AIHelper", () => {
       // Given: A mock AI helper
       // When: I call with different models
       await ai.generateText("gemini-2.5-flash", "test");
-      await ai.generateText("gemini-2.5-pro" as ModelKey, "test");
+      await ai.generateText("gemini-2.5-pro", "test");
 
       // Then: Both calls are recorded with correct models
       const calls = ai.getCalls();

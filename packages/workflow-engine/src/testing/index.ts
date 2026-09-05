@@ -35,16 +35,72 @@
  * ```
  */
 
+export type {
+  CreateMockAIHelperFactoryOptions,
+  MockAIHelperConfig,
+  MockAIHelperFactory,
+  MockBatchResult,
+  MockCallDescriptor,
+  MockCallMatcher,
+  MockEmbedResponse,
+  MockObjectResponse,
+  MockOneShotFailure,
+  MockTextResponse,
+  RecordedCall,
+} from "../__tests__/utils/mock-ai-helper.js";
+export {
+  createMockAIHelper,
+  createMockAIHelperFactory,
+  MockAIHelper,
+} from "../__tests__/utils/mock-ai-helper.js";
+export {
+  type CreateTestHarnessOptions,
+  createTestHarness,
+  type HarnessRunResult,
+  type HarnessStartResult,
+  type TickReport,
+} from "./create-test-harness.js";
+export {
+  type CreateTestKernelOptions,
+  createTestKernel,
+} from "./create-test-kernel.js";
 export { InMemoryAICallLogger } from "./in-memory-ai-logger.js";
 export { InMemoryJobQueue } from "./in-memory-job-queue.js";
 export { InMemoryWorkflowPersistence } from "./in-memory-persistence.js";
+export { InMemoryStepLedger } from "./in-memory-step-ledger.js";
+// Mocking a durable step is seeding its ledger row, so the seeding surface
+// ships with the ledger that carries it.
+export {
+  createMockStepLedger,
+  MOCKED_FAILURE_ATTEMPT,
+  type MockStepLedger,
+  type StepMockApi,
+} from "./mock-step-ledger.js";
 export type {
   AILoggerFactory,
+  ConformanceTestApi,
   JobQueueFactory,
   PersistenceFactory,
+  StepLedgerFactory,
+  StepLedgerFixture,
 } from "./persistence-conformance.js";
 export {
   aiCallLoggerConformanceSuite,
   jobQueueConformanceSuite,
   persistenceConformanceSuite,
+  stepLedgerConformanceSuite,
 } from "./persistence-conformance.js";
+// Shadowing: check a candidate pipeline against runs that already exist.
+export {
+  assertShadowCompatible,
+  type ShadowIssue,
+  type ShadowIssueCode,
+  type ShadowReport,
+  type ShadowRunResult,
+  type ShadowRunsOptions,
+  type ShadowVersionResult,
+  type ShadowVersionsOptions,
+  type ShadowVersionsReport,
+  shadowRuns,
+  shadowVersions,
+} from "./shadow-runs.js";

@@ -1,0 +1,225 @@
+/**
+ * Durable AI step types.
+ *
+ * `ctx.step.ai.*` wraps the stage's `ctx.ai` helper in durable steps so a
+ * stage with AI calls is replay-safe. The implementation lives in the kernel
+ * layer (kernel/helpers/step-ai.ts); these types stay in core so stage
+ * definitions do not depend on kernel internals.
+ */
+
+import type { z } from "zod";
+import type { ModelKey } from "../ai/model-helper";
+import type {
+  AIBatchProvider,
+  AIObjectResult,
+  AITextResult,
+  BatchOptions,
+  BatchReclaimPolicy,
+  ObjectOptions,
+  StreamOptions,
+  TextInput,
+  TextOptions,
+} from "../ai/types";
+import type { StepRunOptions } from "./steps";
+
+export interface AiMapSpec<TIn, TOut> {
+  model: ModelKey;
+  prompt: (item: TIn, index: number) => TextInput;
+  /** When set, each item is validated against this schema and repaired on failure. */
+  schema?: z.ZodType<TOut>;
+  /**
+   * Run realtime items through `ctx.ai.streamText` instead of
+   * `generateText`/`generateObject`, collecting the streamed text. `schema`
+   * still applies: the collected text is parsed as JSON and validated, with
+   * the usual repair pass. The batch path ignores this flag.
+   */
+  stream?: boolean;
+  system?: string;
+  maxTokens?: number;
+  temperature?: number;
+  /** Stable per-item id used to key the durable step. Defaults to `${index}`; must be unique. */
+  itemId?: (item: TIn, index: number) => string;
+  /** Repair passes after a schema failure. Defaults to `{ attempts: 1 }`. */
+  repair?: { attempts: number };
+  /** Execution policy. Defaults to `"auto"`. */
+  policy?: "auto" | "realtime" | "batch";
+  /** `auto` uses batch at or above this item count (default 20) when the model supports it. */
+  auto?: { batchAbove?: number };
+  batch?: {
+    provider?: AIBatchProvider;
+    options?: BatchOptions;
+    /** Poll cadence for the batch status wait. Defaults to `"60s"`. */
+    pollEvery?: number | string;
+    /** Non-sliding deadline for the batch wait. Defaults to `"24h"`. */
+    timeout?: number | string;
+    /**
+     * What to do when the batch fails or the wait times out: `"fail"`
+     * (default) throws `AiMapBatchFailedError`; `"partial"` returns every
+     * item as failed with that error.
+     */
+    onExpiry?: "fail" | "partial";
+    /**
+     * What a replayed submit does when the worker that submitted died before
+     * the ledger recorded it.
+     *
+     * `"adopt"` (default) searches the provider for the batch carrying this
+     * step's external key and continues from it; when the transport has no
+     * field the engine can stamp and search (Anthropic Message Batches,
+     * OpenRouter) it throws `BatchNotAdoptableError` rather than paying for a
+     * second batch. `"resubmit"` restores the pre-1.0.0-alpha.9 behaviour:
+     * submit again and leave the first batch orphaned and billed.
+     */
+    onReclaim?: BatchReclaimPolicy;
+  };
+  realtime?: {
+    /** In-process concurrency for realtime calls. Defaults to 10. */
+    concurrency?: number;
+    /**
+     * Maximum model calls (including repairs) per stage invocation. Exceeding
+     * it before an item's first call throws `AiMapBudgetExceededError`; a
+     * repair that would exceed it returns the item as failed instead.
+     */
+    budget?: number;
+    /** Durable retries after a thrown model call (step.run `retries`). Defaults to 1. */
+    retries?: number;
+    /** Delay before a durable retry. Defaults to 0. */
+    retryDelayMs?: number | string;
+    /**
+     * Minimum spacing between model calls on one concurrency slot: after a
+     * slot finishes an item it waits this long before taking the next one.
+     * Per slot, not global — with `concurrency: 4` and `minDelayMs: "1s"`
+     * the map makes up to four calls per second. Replaces hand-written
+     * cooldowns between items.
+     */
+    minDelayMs?: number | string;
+  };
+}
+
+export type AiMapResult<TOut> =
+  | {
+      id: string;
+      index: number;
+      status: "succeeded";
+      result: TOut;
+      /** True when a schema was given and the result passed it. */
+      validated: boolean;
+      /** Model calls made for this item across batch and realtime attempts. */
+      attempts: number;
+      inputTokens: number;
+      outputTokens: number;
+      /** Sum of the recorded cost of every attempt for this item. */
+      cost: number;
+    }
+  | {
+      id: string;
+      index: number;
+      status: "failed";
+      error: string;
+      /**
+       * `Error.name` of the last failure, so a caller can tell a transport or
+       * quota error apart from a content failure without matching on the
+       * message. The batch path reports `StepTimeoutError`,
+       * `AiMapBatchFailedError`, `AiMapBatchItemFailedError` or
+       * `AiMapBatchItemMissingError`. Never carries the error `cause`: map
+       * results are stored in the step ledger and must stay JSON.
+       */
+      errorName?: string;
+      attempts: number;
+      inputTokens: number;
+      outputTokens: number;
+      cost: number;
+    };
+
+/**
+ * Durable AI operations. Every method is memoized through the step ledger:
+ * on replay a completed call returns its stored result without contacting
+ * the model.
+ *
+ * Stored results carry `text`/`object`, tokens, cost and reasoning but not
+ * the raw SDK object, so anything on the raw result is unavailable after a
+ * replay.
+ */
+export interface StepAiApi {
+  generateText(
+    id: string,
+    modelKey: ModelKey,
+    prompt: TextInput,
+    options?: TextOptions,
+    stepOptions?: StepRunOptions,
+  ): Promise<AITextResult>;
+  generateObject<S extends z.ZodTypeAny>(
+    id: string,
+    modelKey: ModelKey,
+    prompt: TextInput,
+    schema: S,
+    options?: ObjectOptions,
+    stepOptions?: StepRunOptions,
+  ): Promise<AIObjectResult<z.infer<S>>>;
+  /**
+   * Stream one call durably. The first execution streams through
+   * `ctx.ai.streamText` (forwarding `onChunk`) and stores the final text,
+   * tokens, cost and reasoning as a single `run` step; a replay returns the
+   * stored result without contacting the model and calls `onChunk` once with
+   * the whole text, so a consumer that renders incrementally still receives
+   * the content. Hosts with an idle-connection timeout (Cloudflare Workers)
+   * need this where a non-streaming call would trip the timeout.
+   */
+  streamText(
+    id: string,
+    modelKey: ModelKey,
+    prompt: TextInput,
+    options?: StreamOptions,
+    stepOptions?: StepRunOptions,
+  ): Promise<StepStreamResult>;
+  /**
+   * Run one prompt per item under an execution policy (realtime or batch),
+   * with schema validation and repair applied identically on both paths.
+   * Results are returned in input order.
+   */
+  map<TIn, TOut = string>(
+    id: string,
+    items: readonly TIn[],
+    spec: AiMapSpec<TIn, TOut>,
+  ): Promise<AiMapResult<TOut>[]>;
+}
+
+/**
+ * What a durable `ctx.step.ai.streamText` stores and returns. It is
+ * `AIStreamResult` minus the live stream and `rawResult`: neither survives a
+ * replay, so neither is part of the durable contract.
+ */
+export interface StepStreamResult {
+  text: string;
+  inputTokens: number;
+  outputTokens: number;
+  cost: number;
+  reasoning?: string;
+}
+
+/** Thrown when a realtime map would exceed `realtime.budget` model calls. */
+export class AiMapBudgetExceededError extends Error {
+  readonly mapId: string;
+  readonly budget: number;
+
+  constructor(mapId: string, budget: number) {
+    super(
+      `AI map "${mapId}" exceeded its realtime budget of ${budget} model call(s)`,
+    );
+    this.name = "AiMapBudgetExceededError";
+    this.mapId = mapId;
+    this.budget = budget;
+  }
+}
+
+/** Thrown when a batch map's submission fails upstream and `onExpiry` is `"fail"`. */
+export class AiMapBatchFailedError extends Error {
+  readonly mapId: string;
+  readonly batchId: string;
+
+  constructor(mapId: string, batchId: string, reason: string) {
+    super(`AI map "${mapId}" batch "${batchId}" failed: ${reason}`);
+    this.name = "AiMapBatchFailedError";
+    this.mapId = mapId;
+    this.batchId = batchId;
+  }
+}

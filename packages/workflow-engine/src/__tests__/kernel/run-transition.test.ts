@@ -151,12 +151,11 @@ describe("kernel: run.transition", () => {
     expect(jobTransport.getAllJobs()).toHaveLength(1);
   });
 
-  it("propagates the run's max existing stage attempt to a newly-created downstream group", async () => {
-    // Regression test: prepareExecutionGroup's attemptMode "max" for
-    // run.transition. Simulates group 1 having already been bumped to
-    // attempt 2 by a prior run.rerunFrom — the newly-created group-2 stage
-    // must inherit that same attempt (not reset to 0), so annotations from
-    // this rerun span share one attempt value.
+  it("starts a newly-created downstream group at attempt 0 whatever upstream stages retried", async () => {
+    // Regression test: run.transition used to copy the run's max stage
+    // attempt onto the next group, so after a retried stage 1 (attempt 2)
+    // a stage 2 that had never executed read `attempt 2`. A stage's attempt
+    // counts the executions of its own row.
     const workflow = createTwoStageWorkflow();
     const { kernel, persistence } = createTestKernel([workflow]);
 
@@ -191,7 +190,7 @@ describe("kernel: run.transition", () => {
     const stages = await persistence.getStagesByRun(createResult.workflowRunId);
     const stage2 = stages.find((s) => s.stageId === "stage-2");
     expect(stage2).toBeDefined();
-    expect(stage2!.attempt).toBe(2);
+    expect(stage2!.attempt).toBe(0);
   });
 
   it("completes the workflow when all stages are done", async () => {

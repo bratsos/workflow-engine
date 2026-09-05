@@ -24,13 +24,16 @@
  */
 
 import { isSuspendedResult } from "../../core/types";
-import type { Workflow } from "../../core/workflow";
 import type { JobExecuteCommand, JobExecuteResult } from "../commands";
+import { DefinitionVersionMismatchError } from "../errors.js";
 import type { KernelEvent } from "../events";
+import { assertServesRun } from "../helpers/definition-pinning.js";
+import { HOST_DEFAULTS } from "../helpers/host-support.js";
 import {
   buildAnnotationEvents,
   loadWorkflowContext,
-  resolveExecutionGroupOutput,
+  resetStageStepsForFreshAttempt,
+  resolveStageInput,
   saveStageArtifacts,
   saveStageOutput,
   toErrorMessage,
@@ -40,43 +43,33 @@ import {
 import type { HandlerResult, KernelDeps } from "../kernel";
 import type { ActivityRunResult } from "../ports.js";
 
-// ---------------------------------------------------------------------------
-// Helper: resolve stage input
-// ---------------------------------------------------------------------------
-
-function resolveStageInput(
-  workflow: Workflow<any, any>,
-  stageId: string,
-  workflowRun: { input: any },
-  workflowContext: Record<string, unknown>,
-): unknown {
-  const groupIndex = workflow.getExecutionGroupIndex(stageId);
-
-  // First execution group always uses workflow input
-  if (groupIndex <= 1) return workflowRun.input;
-
-  // Resolve the previous execution group's output.
-  // For single-stage groups this returns that stage's output directly.
-  // For parallel groups this returns an object keyed by stage ID.
-  const prevOutput = resolveExecutionGroupOutput(
-    workflow,
-    groupIndex - 1,
-    workflowContext,
-  );
-
-  // Only the first execution group may fall back to workflow input. A
-  // missing previous-group output past group 1 means a blob went
-  // missing (or context loading raced a stage completion) — silently
-  // feeding workflow input to a downstream stage would corrupt its
-  // result instead of surfacing the problem. Fail loudly instead.
-  if (prevOutput === undefined) {
-    throw new Error(
-      `Stage ${stageId} (execution group ${groupIndex}) is missing the ` +
-        `output of execution group ${groupIndex - 1} — cannot resolve input`,
+/**
+ * Re-open the FAILED `run` steps of a stage record for a new job attempt.
+ * The row is put back to `running` with no lease — the state of a step
+ * whose worker died — so the replay's compare-and-set re-claims it, bumps
+ * `attempt` and executes the step again. `attempt` is never reset: it
+ * counts every execution of the step across job attempts (a row that read
+ * `failed attempt 3` re-runs as attempt 4), so the ledger keeps the
+ * per-step history. The failure text stays on `error` until the re-run
+ * overwrites it. Waits, signals and sleeps that failed (a deadline that
+ * passed) are terminal and stay so.
+ */
+async function reopenFailedSteps(
+  stageRecordId: string,
+  deps: KernelDeps,
+): Promise<void> {
+  const ledger = deps.stepLedger;
+  if (!ledger) return;
+  const rows = await ledger.list(stageRecordId);
+  for (const row of rows) {
+    if (row.status !== "failed" || row.kind !== "run") continue;
+    await ledger.compareAndSet(
+      stageRecordId,
+      row.stepId,
+      { status: "failed", attempt: row.attempt },
+      { status: "running", leaseExpiresAt: null },
     );
   }
-
-  return prevOutput;
 }
 
 // ---------------------------------------------------------------------------
@@ -105,12 +98,39 @@ export async function handleJobExecute(
   const workflowRun = await deps.persistence.getRun(workflowRunId);
   if (!workflowRun) throw new Error(`WorkflowRun ${workflowRunId} not found`);
 
-  // Guard against ghost jobs — only execute if run is actively RUNNING
-  if (workflowRun.status !== "RUNNING") {
+  // Definition pinning: a run resolves against the definition it started
+  // under. This build presenting a different structure means the job
+  // belongs to another build — re-deliver it rather than executing the
+  // wrong shape or failing the run. `run.claimPending` already keeps a
+  // host from adopting such a run; this catches the case where the
+  // pipeline changed under a run that was already RUNNING.
+  try {
+    assertServesRun(workflowRun, workflow);
+  } catch (error) {
+    if (!(error instanceof DefinitionVersionMismatchError)) throw error;
     return {
       outcome: "failed" as const,
       ghost: true,
-      error: `Run ${workflowRunId} is ${workflowRun.status}, expected RUNNING — ghost job discarded`,
+      ghostReason: "version" as const,
+      error: error.message,
+      _events: [],
+    };
+  }
+
+  // Guard against ghost jobs — only execute if run is actively RUNNING.
+  // A PENDING run is not an orphan: the claim that enqueued this job had
+  // not committed when the job loop dequeued it (or the claim rolled back
+  // and the run will be claimed again), so the job arrived early and must
+  // be re-delivered rather than thrown away.
+  if (workflowRun.status !== "RUNNING") {
+    const race = workflowRun.status === "PENDING";
+    return {
+      outcome: "failed" as const,
+      ghost: true,
+      ghostReason: race ? ("race" as const) : ("orphan" as const),
+      error: race
+        ? `Run ${workflowRunId} is still PENDING, expected RUNNING — job dequeued ahead of its claim; re-delivering`
+        : `Run ${workflowRunId} is ${workflowRun.status}, expected RUNNING — ghost job discarded`,
       _events: [],
     };
   }
@@ -129,6 +149,24 @@ export async function handleJobExecute(
       output: workflowContext[stageId],
       _events: [],
     };
+  }
+  if (existingStage?.status === "FAILED") {
+    await resetStageStepsForFreshAttempt(workflowRunId, existingStage.id, deps);
+  }
+
+  // A job retry of a stage whose last attempt threw (recorded as PENDING
+  // with the error kept — see Phase 3b) is a NEW attempt: completed steps
+  // are still answered from the ledger, but every `run` step and every
+  // map item that FAILED is re-opened so the retry re-executes it instead
+  // of replaying the stored failure. A replay of the same attempt (a poll
+  // of a suspended stage) never comes through here.
+  const isRetryAttempt =
+    existingStage?.status === "PENDING" &&
+    existingStage.errorMessage != null &&
+    command.attempt !== undefined &&
+    command.attempt > 1;
+  if (isRetryAttempt && existingStage && deps.stepLedger) {
+    await reopenFailedSteps(existingStage.id, deps);
   }
 
   // ── Phase 1: Start transaction ───────────────────────────────────
@@ -155,6 +193,11 @@ export async function handleJobExecute(
       update: {
         status: "RUNNING",
         startedAt: deps.clock.now(),
+        // Each retry of the stage is one more attempt on its row, like a
+        // `run.rerunFrom` rerun; a same-attempt re-delivery does not bump.
+        ...(isRetryAttempt && existingStage
+          ? { attempt: existingStage.attempt + 1 }
+          : {}),
       },
     });
 
@@ -227,6 +270,7 @@ export async function handleJobExecute(
         config: config as Record<string, unknown>,
         resumeState: stageRecord.suspendedState,
         workflowContext,
+        ...(command.abortSignal ? { abortSignal: command.abortSignal } : {}),
       },
       deps,
     );
@@ -256,6 +300,18 @@ export async function handleJobExecute(
     const duration = deps.clock.now().getTime() - startTime;
     const bufferedAnnotations = run.annotations;
 
+    // A retryable failure with attempts left is not terminal: the host is
+    // about to re-enqueue the job, so the stage goes back to PENDING (an
+    // active status for run.transition) carrying the last error, keeps its
+    // ledger rows for the replay, and the run keeps RUNNING. Only when the
+    // attempt budget is exhausted (or the error is deterministic) is the
+    // stage FAILED. A command without attempt information (a caller that
+    // dispatches job.execute directly) keeps the historical FAILED write.
+    const willRetry =
+      command.attempt !== undefined &&
+      run.retryable !== false &&
+      command.attempt < (command.maxAttempts ?? HOST_DEFAULTS.maxAttempts);
+
     // expectedVersion omitted: Phase 3 never writes the run row here (only
     // the stage row), so — unlike stage-poll-suspended's claim — parallel
     // sibling stages completing concurrently must not contend on the run's
@@ -267,25 +323,43 @@ export async function handleJobExecute(
       undefined,
       deps,
       async (tx) => {
-        await tx.updateStage(stageRecord.id, {
-          status: "FAILED",
-          completedAt: deps.clock.now(),
-          duration,
-          errorMessage,
-        });
+        await tx.updateStage(
+          stageRecord.id,
+          willRetry
+            ? { status: "PENDING", duration, errorMessage }
+            : {
+                status: "FAILED",
+                completedAt: deps.clock.now(),
+                duration,
+                errorMessage,
+              },
+        );
 
         if (bufferedAnnotations.length > 0) {
           await tx.appendAnnotations(bufferedAnnotations);
         }
 
-        const failedEvent: KernelEvent = {
-          type: "stage:failed",
-          timestamp: deps.clock.now(),
-          workflowRunId,
-          stageId,
-          stageName: stageDef.name,
-          error: errorMessage,
-        };
+        // `stage:failed` only when the row becomes FAILED; a retry that
+        // is about to run is announced as `stage:retrying`.
+        const failedEvent: KernelEvent = willRetry
+          ? {
+              type: "stage:retrying",
+              timestamp: deps.clock.now(),
+              workflowRunId,
+              stageId,
+              stageName: stageDef.name,
+              attempt: command.attempt!,
+              maxAttempts: command.maxAttempts ?? HOST_DEFAULTS.maxAttempts,
+              error: errorMessage,
+            }
+          : {
+              type: "stage:failed",
+              timestamp: deps.clock.now(),
+              workflowRunId,
+              stageId,
+              stageName: stageDef.name,
+              error: errorMessage,
+            };
 
         await tx.appendOutboxEvents(
           toOutboxEvents(
@@ -305,6 +379,7 @@ export async function handleJobExecute(
       return {
         outcome: "failed" as const,
         ghost: true,
+        ghostReason: "orphan" as const,
         error: claimResult.message,
         _events: [],
       };
@@ -314,8 +389,10 @@ export async function handleJobExecute(
       .createLog({
         workflowRunId,
         workflowStageId: stageRecord.id,
-        level: "ERROR",
-        message: errorMessage,
+        level: willRetry ? "WARN" : "ERROR",
+        message: willRetry
+          ? `${errorMessage} (attempt ${command.attempt} of ${command.maxAttempts ?? HOST_DEFAULTS.maxAttempts}; retry pending)`
+          : errorMessage,
       })
       .catch(() => {});
 
@@ -323,6 +400,13 @@ export async function handleJobExecute(
       outcome: "failed" as const,
       error: errorMessage,
       retryable: run.retryable,
+      willRetry,
+      ...(command.attempt !== undefined
+        ? {
+            attempt: command.attempt,
+            maxAttempts: command.maxAttempts ?? HOST_DEFAULTS.maxAttempts,
+          }
+        : {}),
       _events: [],
     };
   }
@@ -333,6 +417,7 @@ export async function handleJobExecute(
     return {
       outcome: "failed" as const,
       ghost: true,
+      ghostReason: "orphan" as const,
       error: `Run ${workflowRunId} was ${currentRunStatus} after stage execution — result discarded`,
       _events: [],
     };
@@ -404,6 +489,7 @@ export async function handleJobExecute(
       return {
         outcome: "failed" as const,
         ghost: true,
+        ghostReason: "orphan" as const,
         error: claimResult.message,
         _events: [],
       };
@@ -445,6 +531,8 @@ export async function handleJobExecute(
           status: "COMPLETED",
           completedAt: deps.clock.now(),
           duration,
+          // A retried attempt succeeded: the earlier attempt's error is stale.
+          errorMessage: null,
           outputData: {
             _artifactKey: outputKey,
             ...(artifactKeys ? { _artifactKeys: artifactKeys } : {}),
@@ -484,6 +572,7 @@ export async function handleJobExecute(
       return {
         outcome: "failed" as const,
         ghost: true,
+        ghostReason: "orphan" as const,
         error: claimResult.message,
         _events: [],
       };

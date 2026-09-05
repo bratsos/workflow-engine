@@ -17,15 +17,24 @@
  *  - Scheduler      – deferred command triggers
  */
 
+import type {
+  AIHelper,
+  AIHelperOptions,
+  LogContext,
+  ProviderResolver,
+} from "../ai/types.js";
 import type { StageResult, SuspendedResult } from "../core/types";
-
 import type {
   CreateAnnotationInput,
+  DequeueOptions,
   DequeueResult,
   EnqueueJobInput,
+  JobAckFence,
+  JobAckOutcome,
   JobRecord,
   PersistenceCore,
 } from "../persistence/interface";
+import type { AICallLogger } from "../persistence/interface.js";
 
 import type { KernelEvent } from "./events";
 
@@ -35,26 +44,169 @@ export type {
   AnnotationFilters,
   AnnotationScope,
   CreateAnnotationInput,
+  CreateDefinitionInput,
   CreateLogInput,
   CreateOutboxEventInput,
   CreateRunInput,
   CreateStageInput,
+  DefinitionVersionCount,
+  DefinitionVersionCountFilter,
+  DequeueOptions,
   DequeueResult,
   EnqueueJobInput,
   IdempotencyRecord,
+  JobAckFence,
+  JobAckOutcome,
+  JobQueueFairness,
   JobRecord,
   OutboxRecord,
+  ServedDefinition,
   Status,
   UpdateRunInput,
   UpdateStageInput,
   UpsertStageInput,
   WorkflowAnnotationRecord,
+  WorkflowDefinitionRecord,
   WorkflowLogRecord,
   WorkflowRunRecord,
   WorkflowStageRecord,
 } from "../persistence/interface";
 
+export {
+  LEASE_ABSOLUTE_CAP,
+  LEASE_HEARTBEAT_LOST,
+} from "../persistence/interface.js";
+
 export type { KernelEvent } from "./events";
+
+// ============================================================================
+// Durable steps
+// ============================================================================
+
+export interface StepRecord {
+  stageRecordId: string;
+  stepId: string;
+  seq: number;
+  kind: "run" | "wait" | "signal" | "sleep";
+  status: "running" | "pending" | "completed" | "failed";
+  attempt: number;
+  leaseExpiresAt: Date | null;
+  deadlineAt: Date | null;
+  /**
+   * Deterministic name for the external effect this step's body creates,
+   * written when the row is claimed — before the body runs. Derived from
+   * `(stageRecordId, stepId)`, so it is identical on every replay; stored so
+   * an operator can search a provider for an orphaned effect straight from
+   * the row. `null` for kinds with no body (`wait`, `signal`, `sleep`) and
+   * for rows written before 1.0.0-alpha.9.
+   */
+  externalKey?: string | null;
+  result?: unknown;
+  error?: string | null;
+  waitState?: {
+    everyMs?: number;
+    wakeAt?: string;
+    /** Consecutive `poll` throws of a wait step (reset by a poll that returns). */
+    pollFailures?: number;
+  };
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+/**
+ * Fields a ledger write may change after a record has been claimed.
+ *
+ * One rule for every field: a key that is absent -- or present holding
+ * `undefined`, which is what a spread of an optional property produces --
+ * leaves that column alone; any other value, **`null` included**, is
+ * written. So `{ result: null }` records "this step completed with no
+ * value" and must overwrite whatever the row held, while `{}` and
+ * `{ result: undefined }` both mean "don't touch the result". Every
+ * implementation is held to this by `stepLedgerConformanceSuite`.
+ */
+export type StepRecordPatch = Partial<
+  Pick<
+    StepRecord,
+    | "status"
+    | "attempt"
+    | "leaseExpiresAt"
+    | "deadlineAt"
+    | "result"
+    | "error"
+    | "waitState"
+  >
+>;
+
+/** The `(status, attempt)` pair a compare-and-set write must observe. */
+export interface StepRecordExpectation {
+  status: StepRecord["status"];
+  /**
+   * Omit to match any attempt. A take-over pins the attempt so only one
+   * replay wins it; the write that records a step's *outcome* must not,
+   * because a step may legitimately bump its own attempt while it runs
+   * (an AI map item retrying its model call in-process). What that write
+   * needs is first-write-wins on the terminal outcome, which `status`
+   * alone expresses.
+   */
+  attempt?: number;
+}
+
+export interface StepLedger {
+  /** Insert-if-absent. Existing records win conflicts without throwing. */
+  claim(
+    record: Omit<StepRecord, "createdAt" | "updatedAt">,
+  ): Promise<{ created: boolean; record: StepRecord }>;
+  get(stageRecordId: string, stepId: string): Promise<StepRecord | null>;
+  update(
+    stageRecordId: string,
+    stepId: string,
+    patch: StepRecordPatch,
+  ): Promise<StepRecord>;
+  /**
+   * Atomically apply `patch` only when the record's current `status` and
+   * `attempt` equal `expected`. Returns whether the write applied and the
+   * record as it stands afterwards (`null` when the step does not exist).
+   * Used to re-claim expired leases, retry failed attempts, time out waits
+   * and complete signals without two workers both winning.
+   */
+  compareAndSet(
+    stageRecordId: string,
+    stepId: string,
+    expected: StepRecordExpectation,
+    patch: StepRecordPatch,
+  ): Promise<{ applied: boolean; record: StepRecord | null }>;
+  list(stageRecordId: string): Promise<StepRecord[]>;
+  clear(stageRecordId: string): Promise<void>;
+  /**
+   * Delete every row of a stage record except the named steps.
+   *
+   * Optional so an existing implementation keeps compiling. Re-running a
+   * terminally failed stage needs it, and so does a `run.redrive` that
+   * resumes a stage and keeps its completed steps: the rows must go so nothing stale
+   * replays, but a row naming an external effect that may still be live —
+   * an AI map's batch submit, holding the handle and external key of a
+   * batch a provider is still processing and still billing — must survive,
+   * or the effect is orphaned with no record anywhere. A ledger that does
+   * not implement this falls back to `clear`, and the kernel logs the
+   * external keys it is about to drop so they remain findable.
+   */
+  clearExcept?(stageRecordId: string, keepStepIds: string[]): Promise<void>;
+}
+
+/** Services made available lazily to stage execution contexts. */
+export interface KernelServices {
+  aiLogger?: AICallLogger;
+  ai?: AIHelperFactory;
+}
+
+/** Factory signature matching `createAIHelper`. */
+export type AIHelperFactory = (
+  topic: string,
+  logger: AICallLogger,
+  logContext?: LogContext,
+  providerResolver?: ProviderResolver,
+  options?: AIHelperOptions,
+) => AIHelper;
 
 // ============================================================================
 // Clock
@@ -119,30 +271,126 @@ export interface BlobStore {
  */
 export interface JobTransport {
   /**
-   * Add a new job to the queue.
-   *
-   * @deprecated Unused by the kernel -- enqueueParallel is used even for
-   * single-job enqueues. Removal at 1.0.
+   * The dotted `groupBy` path this transport's fairness cap reads, or `null`
+   * when fairness is off (or undefined when unsupported). Read by
+   * `createSpillingJobTransport` so a spilled payload still carries its group
+   * key.
    */
-  enqueue(options: EnqueueJobInput): Promise<string>;
+  readonly fairnessGroupBy?: string | null;
 
-  /** Enqueue multiple stages in parallel (same execution group). */
+  /**
+   * Enqueue multiple stages in parallel (same execution group).
+   *
+   * Idempotent on `(workflowRunId, stageId)`: at most one job row exists
+   * per stage per run, so a transport MUST replace any row already queued
+   * for a pair it is asked to enqueue, resetting `attempt`, `status`,
+   * `workerId`, `lockedAt`, `lastError` and `nextPollAt`. `run.rerunFrom`
+   * and `run.reapStuck`'s PENDING-without-job sweep both re-enqueue a
+   * stage that may still carry a terminal job row from a previous
+   * execution; a transport that inserts unconditionally either
+   * accumulates duplicate rows or (on a schema declaring the
+   * `@@unique([workflowRunId, stageId])` the reference schema ships)
+   * fails the insert.
+   */
   enqueueParallel(jobs: EnqueueJobInput[]): Promise<string[]>;
 
+  /**
+   * Remove every job row for the given stages of a run, whatever their
+   * status; returns how many were removed. `run.rerunFrom` calls it for
+   * the stage records it deletes. An empty `stageIds` is a no-op.
+   */
+  deleteByRunAndStages(
+    workflowRunId: string,
+    stageIds: string[],
+  ): Promise<number>;
+
   /** Atomically dequeue the next available job. */
-  dequeue(): Promise<DequeueResult | null>;
+  dequeue(options?: DequeueOptions): Promise<DequeueResult | null>;
 
-  /** Mark job as completed. */
-  complete(jobId: string): Promise<void>;
+  /**
+   * Mark job as completed.
+   *
+   * Passing a `fence` conditions the write on the job still being the RUNNING
+   * attempt with that `startedAt`; omitting it keeps the previous unconditional
+   * behaviour and always returns `"acknowledged"`. Note that the fenced form is
+   * the recommended one and that the unfenced form exists for transports that
+   * cannot carry the stamp.
+   */
+  complete(jobId: string, fence?: JobAckFence): Promise<JobAckOutcome>;
 
-  /** Mark job as suspended (for async-batch). */
-  suspend(jobId: string, nextPollAt: Date): Promise<void>;
+  /**
+   * Mark job as suspended (for async-batch).
+   *
+   * Passing a `fence` conditions the write on the job still being the RUNNING
+   * attempt with that `startedAt`; omitting it keeps the previous unconditional
+   * behaviour and always returns `"acknowledged"`. Note that the fenced form is
+   * the recommended one and that the unfenced form exists for transports that
+   * cannot carry the stamp.
+   */
+  suspend(
+    jobId: string,
+    nextPollAt: Date,
+    fence?: JobAckFence,
+  ): Promise<JobAckOutcome>;
 
-  /** Mark job as failed. */
-  fail(jobId: string, error: string, shouldRetry?: boolean): Promise<void>;
+  /**
+   * Return a claimed job to PENDING with a later nextPollAt WITHOUT counting
+   * the claim as an attempt (the dequeue incremented attempt; this undoes it).
+   * `fail(id, err, true)` is the wrong shape for work a host declines rather
+   * than fails: declining is not a failed attempt, and a condition that lasts
+   * for a whole deploy — a run pinned to a version this build does not
+   * present — exhausts the three-attempt budget in about fifteen seconds and
+   * takes the job row terminal.
+   *
+   * Optional: a transport that does not implement it falls back to fail with
+   * retry, which is correct but bounded by the budget.
+   */
+  defer?(
+    jobId: string,
+    nextPollAt: Date,
+    reason: string,
+    fence?: JobAckFence,
+  ): Promise<JobAckOutcome>;
 
-  /** Release stale locks (for crashed workers). */
+  /**
+   * Mark job as failed. With `shouldRetry: true` the transport MUST put the
+   * job back in the queue (PENDING, with backoff, keeping its attempt
+   * count) — the kernel has already recorded the stage as PENDING on that
+   * promise, and a transport that only acknowledges the message leaves the
+   * run RUNNING until `run.reapStuck` heals it. With `false` the job is
+   * terminal and the host dispatches `run.transition` right away.
+   *
+   * Passing a `fence` conditions the write on the job still being the RUNNING
+   * attempt with that `startedAt`; omitting it keeps the previous unconditional
+   * behaviour and always returns `"acknowledged"`. Note that the fenced form is
+   * the recommended one and that the unfenced form exists for transports that
+   * cannot carry the stamp.
+   */
+  fail(
+    jobId: string,
+    error: string,
+    shouldRetry?: boolean,
+    fence?: JobAckFence,
+  ): Promise<JobAckOutcome>;
+
+  /**
+   * Release stale locks (for crashed workers). Stamps `lastError` with
+   * the `LEASE_HEARTBEAT_LOST` prefix so an operator can tell a reclaimed
+   * lease from a stage-level failure. The fine-grained tier of a two-tier
+   * expiry whose coarse tier is `expireRunawayJobs`.
+   */
   releaseStaleJobs(staleThresholdMs?: number): Promise<number>;
+
+  /**
+   * Fail every RUNNING job whose claim (`startedAt`, stamped once and never
+   * refreshed) is older than `absoluteTimeoutMs`, stamping `lastError` with
+   * the `LEASE_ABSOLUTE_CAP` prefix; returns how many. The coarse tier of a
+   * two-tier expiry: `releaseStaleJobs` is the fine-grained heartbeat
+   * signal and is defeated by a worker that is alive but wedged, because
+   * such a worker keeps calling `touchJob`. Optional — a transport that
+   * does not implement it simply has no absolute cap.
+   */
+  expireRunawayJobs?(absoluteTimeoutMs: number): Promise<number>;
 
   /** Cancel all pending/suspended jobs for a workflow run. Returns count cancelled. */
   cancelByRun(workflowRunId: string): Promise<number>;
@@ -155,6 +403,19 @@ export interface JobTransport {
 
   /** Refresh a running job's lease without changing status. */
   touchJob(jobId: string): Promise<void>;
+
+  /**
+   * Optional. Offer the host's `workerId` to the transport, so the id
+   * stamped on `job_queue.workerId` is the one that identifies the
+   * process — transports are usually constructed before the host and
+   * would otherwise invent their own (`worker-<pid>-<ts>`), leaving
+   * "which worker ran this stage" unanswerable from the job row.
+   *
+   * A transport that was explicitly configured with a worker id MUST keep
+   * it (the caller said what it wanted). Either way it returns the id it
+   * will actually stamp, so the host can warn when the two disagree.
+   */
+  adoptWorkerId?(workerId: string): string;
 }
 
 // ============================================================================
@@ -217,6 +478,14 @@ export interface ActivityRunInput {
   config: Record<string, unknown>;
   resumeState?: unknown;
   workflowContext: Record<string, unknown>;
+  /**
+   * Aborted when the run is cancelled or the job lease is lost while the
+   * stage executes; becomes `ctx.abortSignal`. Optional: a caller with no
+   * host loop (a direct `job.execute` dispatch, a replay from
+   * `stage.pollSuspended`) gets a signal that never fires. Not serialisable
+   * — a remote executor must drop it and build its own on the worker.
+   */
+  abortSignal?: AbortSignal;
 }
 
 /** Result from ActivityExecutor.run(). Exactly one of result / error is set. */
@@ -254,6 +523,8 @@ export interface ExecutorDeps {
   persistence: Persistence;
   blobStore: BlobStore;
   clock: Clock;
+  stepLedger?: StepLedger;
+  services?: KernelServices;
 }
 
 /**

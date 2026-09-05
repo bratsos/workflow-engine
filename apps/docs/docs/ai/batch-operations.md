@@ -5,141 +5,105 @@ title: Batch Operations
 
 # Batch Operations
 
-AI batch APIs (such as Google Batch, Anthropic Batch, OpenAI Batch, or OpenRouter Batch) offer substantial cost discounts for non-realtime workloads. However, these jobs run asynchronously, taking anywhere from minutes to 24 hours to execute.
+AI batch APIs (Google Batch, Anthropic Message Batches, OpenAI Batch, OpenRouter's `:batch` endpoint) offer substantial per-model discounts for non-realtime workloads. They are asynchronous: a batch takes anywhere from minutes to 24 hours.
 
-**workflow-engine** includes first-class support for asynchronously running batch operations. By leveraging the engine's native **suspend/resume** architecture, a workflow stage can submit an AI batch job, release its database lease to suspend the process, and wake up once the provider indicates completion.
+In **workflow-engine** a batch is a [durable step](../core-concepts/durable-steps.md). `ctx.step.ai.map` submits the fan-out once, records the handle in the step ledger, suspends the stage while the provider works, polls from the host's maintenance tick, and collects the results with your schema re-applied. A crash between submit and collect resumes from the ledger rather than resubmitting. The same call runs realtime for small inputs, so one stage serves both.
 
----
-
-## The Batch Lifecycle
-
-A typical batch stage is defined using `defineAsyncBatchStage`:
-1. **`execute` (First Run)**: Submits a list of prompts via `ai.batch(model).submit([...])` and returns `suspended: true` along with the primary batch ID and versioned batch refs in `metadata.batchRefs`.
-2. **Suspension**: The engine marks the stage as `SUSPENDED` and deletes the active job queue record. No server resources are consumed.
-3. **Polling**: The host runtime calls `stage.pollSuspended` (triggered via orchestration ticks). This runs `checkCompletion()`, which checks the provider's batch status.
-4. **`checkCompletion` (Ready)**: When the provider completes the batch, `checkCompletion` retrieves results via `getResults(batchId, metadata)` (with schemas re-supplied for validation) and returns `ready: true`.
-5. **Resume**: The kernel restores the workflow run to `RUNNING` status and schedules downstream stages.
+The 0.x `defineAsyncBatchStage` with a hand-written `checkCompletion` is not exported from 1.0; see [Migrating from 0.13 to 1.0](../migrations/migrate-0.13-to-1.0.md) for the before/after.
 
 ---
 
-## Code Implementation
+## `ctx.step.ai.map`
+
+One prompt per item under an execution policy, with schema validation and repair applied identically on the realtime and batch paths. Results come back in input order.
 
 ```typescript
-import { defineAsyncBatchStage, createAIHelper } from "@bratsos/workflow-engine";
+import { defineStage } from "@bratsos/workflow-engine";
 import { z } from "zod";
-
-const FeedbackItemSchema = z.object({
-  id: z.string(),
-  feedback: z.string()
-});
 
 const AnalysisResultSchema = z.object({
   sentiment: z.enum(["positive", "negative"]),
-  topics: z.array(z.string())
+  topics: z.array(z.string()),
 });
 
-export const batchAnalysisStage = defineAsyncBatchStage({
+export const batchAnalysisStage = defineStage({
   id: "batch-analysis",
   name: "Batch Analysis",
-  mode: "async-batch",
   schemas: {
-    input: z.object({ items: z.array(FeedbackItemSchema) }),
-    output: z.array(
-      z.object({
-        id: z.string(),
-        analysis: AnalysisResultSchema
-      })
-    ),
+    input: z.object({ items: z.array(z.object({ id: z.string(), feedback: z.string() })) }),
+    output: z.object({ analysed: z.number(), failed: z.array(z.string()) }),
     config: z.object({}),
   },
-
   async execute(ctx) {
-    // If we already have the cached output, return immediately
-    if (ctx.resumeState) {
-      return { output: await ctx.storage.load("batch-result") };
-    }
+    const results = await ctx.step.ai.map("analyse", ctx.input.items, {
+      model: "gemini-2.5-flash",
+      schema: AnalysisResultSchema,
+      prompt: (item) => `Analyze sentiment and extract topics: ${item.feedback}`,
+      itemId: (item) => item.id,           // stable per-item step id; defaults to the index
+      repair: { attempts: 1 },             // re-prompt once on a schema failure
+      policy: "auto",                      // batch at or above `auto.batchAbove` items
+      auto: { batchAbove: 20 },
+      batch: { pollEvery: "60s", timeout: "24h", onExpiry: "fail" },
+      realtime: { concurrency: 10, budget: 500, minDelayMs: "1s" },
+    });
 
-    const ai = createAIHelper(`workflow.${ctx.workflowRunId}.stage.${ctx.stageId}`, aiCallLogger);
-    const batch = ai.batch("gemini-2.5-flash", "google");
-
-    // Submit batch requests to the provider
-    const handle = await batch.submit(
-      ctx.input.items.map(item => ({
-        id: item.id,
-        prompt: `Analyze sentiment and extract topics: ${item.feedback}`,
-        schema: AnalysisResultSchema // Passes native json_schema to the provider
-      }))
-    );
-
-    // Suspend stage execution and save the batch handle state
-    return {
-      suspended: true,
-      state: {
-        batchId: handle.id,
-        metadata: {
-          provider: handle.provider,
-          modelKey: "gemini-2.5-flash",
-          batchRefs: handle.refs,
-          requestIds: ctx.input.items.map(item => item.id),
-        },
-      },
-      pollConfig: {
-        pollInterval: 60_000,      // Check status every 60s
-        maxWaitTime: 3600_000 * 2, // Timeout after 2 hours
-      }
-    };
+    const failed = results.filter((r) => r.status === "failed").map((r) => r.id);
+    return { output: { analysed: results.length - failed.length, failed } };
   },
-
-  async checkCompletion(suspendedState, ctx) {
-    const ai = createAIHelper(`workflow.${ctx.workflowRunId}.stage.${ctx.stageId}`, aiCallLogger);
-    const batch = ai.batch(
-      suspendedState.metadata?.modelKey as string,
-      suspendedState.metadata?.provider as any
-    );
-
-    const status = await batch.getStatus(suspendedState.batchId, suspendedState.metadata);
-    
-    if (status.status === "processing" || status.status === "pending") {
-      return { ready: false }; // Poll again on the next tick
-    }
-
-    if (status.status === "failed") {
-      return { ready: false, error: "AI provider batch processing failed." };
-    }
-
-    // Batch is complete. Retrieve and validate outputs.
-    // NOTE: Re-supply the schemas here because Zod schemas do not round-trip DB JSON state
-    const requestIds = (suspendedState.metadata?.requestIds as string[]) ?? [];
-    const results = await batch.getResults(suspendedState.batchId, {
-      ...suspendedState.metadata,
-      schemas: Object.fromEntries(
-        requestIds.map(id => [id, AnalysisResultSchema])
-      )
-    });
-
-    const parsedOutput = results.map(res => {
-      if (res.status === "failed") {
-        throw new Error(`Item ${res.id} failed: ${res.error}`);
-      }
-      return {
-        id: res.id,
-        analysis: res.result // Validated and typed as z.infer<typeof AnalysisResultSchema>
-      };
-    });
-
-    return {
-      ready: true,
-      output: parsedOutput
-    };
-  }
 });
 ```
+
+### The spec
+
+| Field | Meaning |
+| :--- | :--- |
+| `model` | Registry key of the model to call. |
+| `prompt(item, index)` | Builds the prompt for one item (string or content parts). |
+| `schema?` | Zod schema each result is validated against and repaired towards. |
+| `itemId?(item, index)` | Stable id used to key the item's durable step (`${id}:${itemId}`). Must be unique; `submit`, `poll` and `collect` are reserved. |
+| `repair?` | `{ attempts }` re-prompts after a schema failure with the previous output and the Zod issues appended. Default `{ attempts: 1 }`. |
+| `policy?` | `"auto"` (default), `"realtime"` or `"batch"`. Forcing batch on a model that cannot batch throws. |
+| `auto?` | `{ batchAbove }` — item count at or above which `auto` uses batch (default 20). |
+| `batch?` | `provider`, `options` (`BatchOptions`), `pollEvery` (default `"60s"`), `timeout` (default `"24h"`, non-sliding), `onExpiry: "fail" \| "partial"`, `onReclaim: "adopt" \| "resubmit"`. |
+| `realtime?` | `concurrency` (default 10), `budget` (max model calls per stage invocation), `retries` (default 1), `retryDelayMs`, `minDelayMs`. |
+| `stream?` | Run realtime items through `ctx.ai.streamText` and collect the text (for hosts that kill an idle connection). Ignored by the batch path. |
+| `system?`, `maxTokens?`, `temperature?` | Forwarded to the model call. No default `temperature` is sent. |
+
+### Policy resolution
+
+`auto` uses batch when there are at least `auto.batchAbove` items, the model's registry entry has `supportsAsyncBatch`, a batch provider resolves, and every prompt is a string; otherwise realtime. The provider resolves in this order: `batch.provider` on the call, the model's `batchProvider` registry field, the native vendor (the entry's `provider` when it is `"google"`, `"anthropic"` or `"openai"`, else the vendor named by the slug), then OpenRouter. Register `batchProvider: "openrouter"` on a model you call through OpenRouter to batch it there. When a vendor SDK is not installed and OpenRouter can batch the model, the helper falls back to OpenRouter with a WARN.
+
+Once a batch is submitted, its polls and collect go through the transport recorded in the stored refs, whatever the registry resolves later.
+
+### Realtime path
+
+Each item is a durable step `${id}:${itemId}` run under an in-process semaphore of `concurrency`. A thrown model call (transport, quota, timeout) is retried **in-process** — wait `retryDelayMs`, bump the ledger row's `attempt`, call again — up to `realtime.retries` times; the stage never suspends for a map item. `budget` caps model calls including repairs per stage invocation: exceeding it before an item's first call throws `AiMapBudgetExceededError`; a repair that would exceed it returns the item as failed. `minDelayMs` is the minimum spacing between calls *on one concurrency slot* (with `concurrency: 4` and `minDelayMs: "1s"`, at most four calls per second) and replaces hand-written cooldowns.
+
+### Batch path
+
+- **`${id}:submit`** submits the fan-out exactly once and stores the handle, refs and request ids. Because a crashed worker's re-run of a submit is the one replay that costs real money, the submit is stamped with the step's `externalKey` (OpenAI batch `metadata`, Google `displayName`), and a reclaimed submit adopts the batch already carrying that key instead of creating a second one. Anthropic Message Batches and OpenRouter have no field the engine can stamp and search, so a reclaimed submit there throws `BatchNotAdoptableError` rather than silently paying twice; `batch: { onReclaim: "resubmit" }` accepts the duplicate cost.
+- **`${id}:poll`** is a `waitFor` with a stored, non-sliding deadline (`batch.timeout`).
+- **`${id}:collect`** fetches results with the schemas re-supplied (so `validated` is true), stores a summary on the collect row, and writes each item's verdict to its own `${id}:${itemId}` row. Items that failed or did not validate then go through the realtime repair pass.
+- Requests are partitioned per response schema (Google requires one schema per batch) and into chunks of `maxRequestsPerBatch` (OpenRouter, default 500). Structured-output schemas are rewritten per target at the model boundary (`oneOf` → `anyOf`, `additionalProperties: false` and every property `required` for OpenAI strict mode, records as `{ key, value }` arrays, Gemini's OpenAPI dialect) and the reply is transformed back before validation; a schema keyword no rewrite can express fails at submit with `UnportableSchemaError` rather than a provider error per item.
+- When the batch settles with provider-side item failures the poll logs a WARN, and when more than half of a batch fails validation `getResults` logs a WARN naming the batch id and the first issue — the signal that every item is being paid for twice.
+
+### Results
+
+```typescript
+type AiMapResult<TOut> =
+  | { id: string; index: number; status: "succeeded"; result: TOut; validated: boolean;
+      attempts: number; inputTokens: number; outputTokens: number; cost: number }
+  | { id: string; index: number; status: "failed"; error: string; errorName?: string;
+      attempts: number; inputTokens: number; outputTokens: number; cost: number };
+```
+
+**Failed items do not fail the stage.** An item whose retries and repairs are exhausted comes back as `status: "failed"` and the map still resolves; deciding what that means is the stage's job. `errorName` is the `Error.name` of the last failure (`StepTimeoutError`, `AiMapBatchFailedError`, `AiMapBatchItemFailedError`, `AiMapBatchItemMissingError`, or a transport error's name), so a caller can tell a quota error from a content failure without matching on the message. `onExpiry: "fail"` (default) throws `AiMapBatchFailedError` when the batch fails or the wait times out; `"partial"` returns every item as failed with that error instead. `cost` per item is the recorded cost summed over its attempts; batch items use the transport-aware batch price.
+
+A new job attempt of the stage re-opens failed item rows and re-prompts them; a replay of the same attempt reports the stored verdict without a model call.
 
 ---
 
 ## Batch Providers & Options
-
-Batch execution supports four providers:
 
 | Provider | Description | Required Dependencies |
 |----------|-------------|-----------------------|
@@ -148,65 +112,35 @@ Batch execution supports four providers:
 | `openai` | OpenAI models via AI SDK | `@ai-sdk/openai` (optional peer >=4.0.53) |
 | `openrouter` | OpenRouter Batch API (HTTP) | None (direct fetch) |
 
-> **Pricing:** Batch pricing is per-model (stored in `batchInputCostPerMillion` and `batchOutputCostPerMillion` in the catalog), not a flat 50% discount. Many models offer 50% to 75% discounts, while some variants may differ.
+> **Pricing:** Batch pricing is per-model (`batchInputCostPerMillion` / `batchOutputCostPerMillion` in the registry, or the OpenRouter `:batch` catalog row), not a flat 50% discount. Exactly one adjustment is applied — the batch discount never compounds with a cache discount — so on a Google batch that hits the implicit cache the flat figure *overstates* cost for the cached tokens, and OpenRouter does not discount non-token components at all.
 
 ### Injected Options (`BatchOptions`)
 
-When running in edge or serverless environments where `process.env` may not exist, pass `BatchOptions` as the third parameter to `ai.batch()`:
+In edge or serverless environments where `process.env` may not exist, pass `BatchOptions` through `batch.options` (or as the third argument of `ai.batch()` when using the lower-level API):
 
 ```typescript
-const batch = ai.batch("openai/gpt-4o", "openrouter", {
-  apiKey: ctx.config.openRouterApiKey,
-  baseURL: "https://openrouter.ai/api/beta",
-  maxRequestsPerBatch: 500,
-});
+batch: {
+  provider: "openrouter",
+  options: {
+    apiKey: ctx.config.openRouterApiKey,
+    baseURL: "https://openrouter.ai/api/beta",
+    maxRequestsPerBatch: 500,
+  },
+}
 ```
+
+`apiKey`, `baseURL` and `fetch` are honoured by every vendor transport.
 
 ### OpenRouter Batch Transport Caveats
 
 - **Text only:** Multimodal inputs (images, audio, video, files) are rejected.
-- **24-hour expiration without partial recovery:** OpenRouter returns `results: null` if a batch expires at 24 hours. No partial results are recoverable. Batches are automatically partitioned into chunks of `maxRequestsPerBatch` (default: 500) to bound risk.
-- **No cancel or list endpoint:** OpenRouter batch API does not support remote cancellation or listing batches.
+- **24-hour expiration without partial recovery:** OpenRouter returns `results: null` if a batch expires at 24 hours. Batches are partitioned into chunks of `maxRequestsPerBatch` (default: 500) to bound risk.
+- **No cancel or list endpoint:** the OpenRouter batch API does not support remote cancellation or listing batches, which is why a reclaimed submit cannot adopt an existing batch there.
 - **No idempotency key:** POST submissions are not auto-retried.
-- **Schema partitioning:** Google models require all requests in a single batch to share the same response schema; `submit()` handles this by partitioning requests by schema automatically.
+- A creation error `does not have a :batch endpoint` means the catalog row exists but the endpoint is not live for that model.
 
 ---
 
-## Discriminated Union Result Types
+## The lower-level `ai.batch()` API
 
-`AIBatchResult` is a strict **discriminated union**:
-
-```typescript
-type AIBatchResult<T = string> =
-  | {
-      id: string;
-      prompt: string;
-      result: T;            // Present ONLY on success (unvalidated unless schema was re-supplied)
-      inputTokens: number;
-      outputTokens: number;
-      status: "succeeded";
-      error?: undefined;
-      validated?: boolean;  // True when validated against re-supplied schema; false otherwise
-    }
-  | {
-      id: string;
-      prompt: string;
-      result?: undefined;   // Undefined on failure
-      inputTokens: number;
-      outputTokens: number;
-      status: "failed";
-      error: string;        // Error message describing failure
-      validated?: boolean;  // Always false on failure
-    };
-```
-
----
-
-## Schema Re-Supply Across Process Boundaries
-
-Zod schemas contain JavaScript functions and regular expressions, which makes them **non-serializable**:
-* When you submit a batch, the Zod schemas are converted to JSON Schema specs for the LLM providers.
-* When the stage suspends, only JSON-serializable `suspendedState` is stored in the database.
-* When a host process wakes up to resume the stage and calls `batch.getResults()`, it has lost the original Zod schema objects.
-* To apply schema parsing and validation during recovery, you must **re-supply the schemas** map via `batch.getResults(batchId, { schemas: { [requestId]: schema } })`.
-* If schemas are omitted at retrieval time, results return with `validated: false` and a `WARN` is logged. Re-supplying schemas ensures `validated: true` and validates outputs against your Zod types.
+`ctx.step.ai.map` is built on `ctx.ai.batch(modelKey, provider?, options?)`, which is still public: `submit(requests)` returns a handle (`id`, `provider`, `refs`), `getStatus(batchId, metadata)` reports `pending | processing | completed | failed`, and `getResults(batchId, { ...metadata, schemas })` returns `AIBatchResult[]` — a discriminated union on `status: "succeeded" | "failed"` with `validated: true` only when the schema for that request id was re-supplied. Zod schemas do not survive a suspend/resume (they contain functions), which is why `map` re-supplies them for you; if you drive `ai.batch()` yourself from inside `ctx.step.run` / `waitFor`, you must do the same at collect time or results come back `validated: false` with a WARN.

@@ -30,7 +30,7 @@ The **kernel** is a pure command dispatcher. All workflow operations are express
 ## When to Apply
 
 - User wants to create workflow stages or pipelines
-- User mentions `defineStage`, `defineAsyncBatchStage`, `WorkflowBuilder`
+- User mentions `defineStage`, `defineWorkflow`, `WorkflowBuilder`, `ctx.step`
 - User is implementing workflow persistence with Prisma
 - User needs AI integration (generateText, generateObject, embeddings, batch)
 - User is building multi-stage data processing pipelines
@@ -44,11 +44,13 @@ The **kernel** is a pure command dispatcher. All workflow operations are express
 
 ```typescript
 import { defineStage, defineWorkflow } from "@bratsos/workflow-engine";
-import { createKernel } from "@bratsos/workflow-engine/kernel";
+import { createKernel, createWorkflowRegistry } from "@bratsos/workflow-engine/kernel";
 import { createNodeHost } from "@bratsos/workflow-engine-host-node";
 import {
   createPrismaWorkflowPersistence,
   createPrismaJobQueue,
+  createPrismaStepLedger,
+  createPrismaAICallLogger,
 } from "@bratsos/workflow-engine";
 import { z } from "zod";
 
@@ -83,7 +85,9 @@ const kernel = createKernel({
   jobTransport: createPrismaJobQueue(prisma),
   eventSink: myEventSink,
   clock: { now: () => new Date() },
-  registry: { getWorkflow: (id) => (id === "my-workflow" ? workflow : undefined) },
+  registry: createWorkflowRegistry([workflow]), // enumerable, so definition-version filtering works (see 13-definition-versioning.md)
+  stepLedger: createPrismaStepLedger(prisma), // needed for ctx.step.* (durable steps)
+  services: { aiLogger: createPrismaAICallLogger(prisma) }, // ctx.ai / ctx.step.ai
 });
 
 // 4. Start a Node host
@@ -108,9 +112,9 @@ await kernel.dispatch({
 | Export | Type | Import Path | Purpose |
 |--------|------|-------------|---------|
 | `defineStage` | Function | `@bratsos/workflow-engine` | Create sync stages. Curried form `defineStage<TContext>()({...})` is recommended when you need typed `ctx.require()`/`ctx.optional()` — see 01-stage-definitions.md |
-| `defineAsyncBatchStage` | Function | `@bratsos/workflow-engine` | Create async/batch stages |
+| `createWorkflowRegistry` | Function | `@bratsos/workflow-engine/kernel` | Build an enumerable `WorkflowRegistry` from a list of workflows; required for definition-version filtering (a hand-written `{ getWorkflow }` cannot enumerate) |
 | `defineWorkflow` | Function | `@bratsos/workflow-engine` | **Recommended** way to build a workflow (options-object API, v0.11+); returns a `WorkflowBuilder` to `.pipe()`/`.parallel()`/`.build()` |
-| `WorkflowBuilder` | Class | `@bratsos/workflow-engine` | Chain stages into workflows. Its 5-positional-argument constructor (`new WorkflowBuilder(id, name, description, input, output)`) is `@deprecated` in favor of `defineWorkflow()` — the class itself (and `.pipe()`/`.parallel()`/`.build()`) is unaffected |
+| `WorkflowBuilder` | Class | `@bratsos/workflow-engine` | Chain stages into workflows: `.stage(id, def)` (typed `ctx.require`, dependency ids checked), `.stage(prebuilt)`, `.pipe()`, `.parallel([...])` / `.parallel((group) => ...)`, `.build()`. Create it with `defineWorkflow(id, options?)` or `defineWorkflow({...})` |
 | `createKernel` | Function | `@bratsos/workflow-engine/kernel` | Create command kernel |
 | `createNodeHost` | Function | `@bratsos/workflow-engine-host-node` | Create Node.js host |
 | `createServerlessHost` | Function | `@bratsos/workflow-engine-host-serverless` | Create serverless host |
@@ -128,7 +132,7 @@ await kernel.dispatch({
 | `Trigger` / `Decision` / `Approval` / `Revision` | Constants | `@bratsos/workflow-engine/conventions` | Well-known annotation key namespaces (v0.8+) |
 | `RunReapStuckCommand` / `RunReapStuckResult` | Types | `@bratsos/workflow-engine` | `run.reapStuck` command/result shapes (export-drift fix, v0.11+) |
 | `ModelFilter` | Type | `@bratsos/workflow-engine` | Filter shape for `listModels({ filter })` (export-drift fix, v0.11+) |
-| `persistenceConformanceSuite` / `jobQueueConformanceSuite` / `aiCallLoggerConformanceSuite` | Function | `@bratsos/workflow-engine/testing` | Vitest conformance suites for validating custom adapters (v0.11+) |
+| `persistenceConformanceSuite` / `jobQueueConformanceSuite` / `aiCallLoggerConformanceSuite` / `stepLedgerConformanceSuite` | Function | `@bratsos/workflow-engine/testing` | Vitest conformance suites for validating custom adapters (v0.11+; `stepLedgerConformanceSuite` v1.0) |
 
 ## Kernel Commands
 
@@ -140,12 +144,17 @@ All operations go through `kernel.dispatch(command)`:
 | `run.claimPending` | Claim pending runs, enqueue first-stage jobs |
 | `run.transition` | Advance to next stage group or complete |
 | `run.cancel` | Cancel a running workflow (authoritative: cascades to stages + jobs) |
-| `run.rerunFrom` | Rerun from a specific stage (cleans up blob artifacts by prefix; accepts an optional `idempotencyKey`, v0.11+) |
-| `job.execute` | Execute a single stage (uses multi-phase transactions; see 08-common-patterns.md) |
-| `stage.pollSuspended` | Poll suspended stages for readiness (skips cancelled runs; per-stage transactions) |
-| `lease.reapStale` | Release stale job leases |
-| `run.reapStuck` | Detect and fail RUNNING runs with no recent activity |
-| `outbox.flush` | Publish pending outbox events |
+| `run.redrive` | Retry (`from: { kind: "lastFailure" }`, default), restart (`"start"`) or rerun from a stage (`"stage"`) on the same run id; optionally re-pin with `definitionVersion: "latest"`. The superseded attempt is archived under `run.supersededAttempt` (see 14-redrive.md) |
+| `run.rerunFrom` | **Deprecated** — use `run.redrive`. Rerun from a specific stage; delegates to `run.redrive` (accepts an optional `idempotencyKey`) |
+| `run.listVersions` | Per-definition-version run counts: has a version drained, and which versions have active runs nobody here serves (see 13-definition-versioning.md) |
+| `run.purge` | Retention: delete terminal runs finished before `olderThan` (`{ olderThan, statuses?, limit? }` → `{ purged, workflowRunIds }`), clearing the step ledger, job rows and blobs with them |
+| `job.execute` | Execute a single stage (uses multi-phase transactions; see 08-common-patterns.md). Takes the job's `attempt`/`maxAttempts` and an optional `abortSignal` |
+| `job.heartbeat` | One beat of a host's job-lease heartbeat: renews the lease, reports `{ runStatus, leaseHeld }`, and is what aborts `ctx.abortSignal` |
+| `stage.pollSuspended` | Poll suspended stages for readiness (claims each stage first; skips cancelled runs; per-stage transactions) |
+| `step.signal` | Complete a durable `ctx.step.waitForSignal` step with a payload (idempotent) |
+| `lease.reapStale` | Release stale job leases (`{ staleThresholdMs, absoluteTimeoutMs? }` → `{ released, expired }`) |
+| `run.reapStuck` | Detect and fail RUNNING runs with no recent activity (heals wedged runs whose stages all finished) |
+| `outbox.flush` | Publish pending outbox events; reports `eventSinkStatus: "healthy" \| "degraded"` |
 | `plugin.replayDLQ` | Replay dead-letter queue events |
 
 ## Stage Definition
@@ -170,7 +179,10 @@ const myStage = defineStage({
     const prevOutput = ctx.require("prev");
     const optOutput = ctx.optional("other");
 
-    await ctx.log("INFO", "Processing...");
+    ctx.log("INFO", "Processing..."); // returns void
+
+    // Durable side effects and AI calls: ctx.step.run / ctx.step.ai.* (see 12-durable-steps.md)
+    const summary = await ctx.step.ai.generateText("summary", "gemini-2.5-flash", prompt);
 
     return {
       output: { ... },
@@ -180,10 +192,14 @@ const myStage = defineStage({
 });
 ```
 
-### Async Batch Stage
+`ctx.step`, `ctx.ai`, `ctx.aiLogger` and `ctx.abortSignal` are always present on the context (1.0). `ctx.step.*` needs `createKernel({ stepLedger })`; `ctx.ai` needs `createKernel({ services: { aiLogger } })`.
+
+### Async Batch Stage (legacy mode)
+
+Prefer `ctx.step.ai.map(id, items, { policy: "batch" })` inside a plain `defineStage` for new code — the batch bookkeeping then lives in the step ledger (12-durable-steps.md). The `mode: "async-batch"` / `checkCompletion` shape still runs; `defineAsyncBatchStage` was removed from the root entry at 1.0, so write it as `defineStage({ mode: "async-batch", ... })`:
 
 ```typescript
-const batchStage = defineAsyncBatchStage({
+const batchStage = defineStage({
   id: "batch-process",
   name: "Batch Process",
   mode: "async-batch",
@@ -194,8 +210,7 @@ const batchStage = defineAsyncBatchStage({
       return { output: await ctx.storage.load("batch-result") };
     }
 
-    const ai = createAIHelper(`batch.${ctx.workflowRunId}`, aiLogger);
-    const batch = ai.batch("gemini-2.5-flash", "google");
+    const batch = ctx.ai.batch("gemini-2.5-flash", "google"); // ctx.ai is scoped to workflow.<runId>.stage.<stageId>
     const handle = await batch.submit(requests);
 
     return {
@@ -212,8 +227,7 @@ const batchStage = defineAsyncBatchStage({
   },
 
   async checkCompletion(suspendedState, ctx) {
-    const ai = createAIHelper(`batch.${ctx.workflowRunId}`, aiLogger);
-    const batch = ai.batch("gemini-2.5-flash", "google");
+    const batch = ctx.ai.batch("gemini-2.5-flash", "google");
     const status = await batch.getStatus(suspendedState.batchId, suspendedState.metadata);
     if (status.status === "completed") {
       const results = await batch.getResults(suspendedState.batchId, suspendedState.metadata);
@@ -229,7 +243,7 @@ const batchStage = defineAsyncBatchStage({
 
 Workflows are linear pipelines of **execution groups**. `.pipe()` creates single-stage groups; `.parallel()` creates multi-stage groups. Parallel group outputs are keyed by stage ID in the workflow context.
 
-Build with `defineWorkflow({...})` (recommended) — the 5-positional-argument `new WorkflowBuilder(id, name, description, input, output)` constructor is `@deprecated` (same-typed positional args are easy to transpose by accident); both return the same builder for `.pipe()`/`.parallel()`/`.build()`.
+Build with `defineWorkflow(id, { input })` or `defineWorkflow({ id, name, input })`. `.stage(id, definition)` defines and adds a stage whose `ctx.require()` is typed from the stages before it and whose `dependencies` must name earlier stage ids; `.pipe(stage)` / `.stage(stage)` add a `defineStage()` result. See [references/12-durable-steps.md](references/12-durable-steps.md#the-builder).
 
 ```typescript
 const workflow = defineWorkflow({
@@ -237,7 +251,7 @@ const workflow = defineWorkflow({
   name: "Workflow Name",
   description: "Description",
   input: InputSchema,
-  // output is optional -- decorative unless the workflow has zero piped stages
+  // no `output` option (removed at 1.0): the workflow output schema is always the last stage's
 })
   .pipe(stage1)                          // Group 0
   .pipe(stage2)                          // Group 1
@@ -269,10 +283,12 @@ const kernel = createKernel({
   jobTransport,  // JobTransport port - job queue
   eventSink,     // EventSink port - async event publishing
   clock,         // Clock port - injectable time source
-  registry,      // WorkflowRegistry - { getWorkflow(id) }
+  registry,      // WorkflowRegistry - createWorkflowRegistry(workflows), or a hand-written { getWorkflow(id) } (no version filtering)
+  // stepLedger,  // optional StepLedger port - required for ctx.step.* (InMemoryStepLedger / createPrismaStepLedger)
+  // services: { aiLogger, ai? }, // optional - backs ctx.ai / ctx.aiLogger and the run's cost roll-up
   // executor,   // optional ActivityExecutor port - defaults to in-process; inject to run stages on remote workers (see 11-remote-activity-workers.md)
-  // scheduler,  // optional Scheduler port - @deprecated, unused by the kernel (zero schedule()/cancel() call sites); omit it, the kernel supplies its own no-op. Removal at 1.0
   // idempotencyStaleInProgressMs: 10 * 60 * 1000, // optional (v0.11+) - default 10 min; TTL before a stuck `in_progress` idempotency key can be reclaimed
+  // spillThresholdBytes: 65_536, // optional (1.0) - step results above it go to blobStore (see 15-large-payloads.md)
 });
 
 // Dispatch typed commands
@@ -296,12 +312,15 @@ const host = createNodeHost({
   orchestrationIntervalMs: 10_000,
   jobPollIntervalMs: 1_000,
   staleLeaseThresholdMs: 300_000,   // default as of v0.11 (was 60_000)
-  jobHeartbeatIntervalMs: 60_000,   // v0.11+: heartbeat a job's lease while it executes
+  jobAbsoluteTimeoutMs: 3_600_000,  // 1.0: absolute cap on one job claim (default 1h, 0 disables)
+  jobHeartbeatIntervalMs: 60_000,   // v0.11+: heartbeat a job's lease while it executes; 1.0: also feeds ctx.abortSignal
+  // retention: { olderThanMs: 30 * 24 * 60 * 60 * 1000 }, // 1.0: run.purge on every tick (off by default)
+  // serves: "all",                 // 1.0: disable definition-version filtering (default: derived from the registry)
 });
 
 await host.start();   // Starts polling loops + signal handlers
-await host.stop();    // Graceful shutdown
-host.getStats();      // { workerId, jobsProcessed, orchestrationTicks, isRunning, uptimeMs }
+await host.stop();    // Graceful shutdown (waits for the in-flight job, then a final outbox.flush)
+host.getStats();      // { workerId, jobsProcessed, orchestrationTicks, isRunning, uptimeMs, eventSink }
 ```
 
 ### Serverless Host
@@ -323,10 +342,13 @@ const host = createServerlessHost({
   workerId: "my-worker",
   // Optional tuning (same defaults as Node host)
   staleLeaseThresholdMs: 300_000,   // default as of v0.11 (was 60_000)
+  jobAbsoluteTimeoutMs: 3_600_000,  // 1.0: absolute cap on one job claim (default 1h, 0 disables)
   jobHeartbeatIntervalMs: 60_000,   // v0.11+
   maxClaimsPerTick: 10,
   maxSuspendedChecksPerTick: 10,
   maxOutboxFlushPerTick: 100,
+  flushOutboxAfterJob: true,        // 1.0: publish outbox events right after handleJob settles (bounded by outboxFlushTimeoutMs, 5_000)
+  // retention: { olderThanMs: ... }, serves: "all" — as on the Node host
 });
 ```
 
@@ -350,12 +372,18 @@ interface JobMessage {
 interface JobResult {
   outcome: "completed" | "suspended" | "failed";
   error?: string;
+  dead?: boolean;          // orphan or malformed message: failed and acknowledged, nothing ran
+  willRetry?: boolean;     // stage left PENDING with attempts remaining — the job must run again
+  attempt?: number;
+  maxAttempts?: number;
+  retryDelayMs?: number;   // backoff before the retry (2^attempt seconds) when willRetry
 }
 
 const result = await host.handleJob(msg);
-if (result.outcome === "completed") msg.ack();
-else if (result.outcome === "suspended") msg.ack();
-else msg.retry();
+// Built-in transports re-enqueue a retry from fail(jobId, error, true) themselves, so ack;
+// a push transport whose fail() cannot re-enqueue retries the message itself after retryDelayMs.
+if (result.willRetry) msg.retry({ delaySeconds: result.retryDelayMs! / 1000 });
+else msg.ack();
 ```
 
 #### `processAvailableJobs(opts?): Promise<ProcessJobsResult>`
@@ -369,11 +397,12 @@ const result = await host.processAvailableJobs({ maxJobs: 5 });
 
 #### `runMaintenanceTick(): Promise<MaintenanceTickResult>`
 
-Run one bounded maintenance cycle: claim pending, poll suspended, reap stale, flush outbox, reap stuck runs.
+Run one bounded maintenance cycle: claim pending, poll suspended, reap stale (both lease tiers), flush outbox, reap stuck runs, and purge when `retention` is set.
 
 ```typescript
 const tick = await host.runMaintenanceTick();
-// { claimed, suspendedChecked, staleReleased, eventsFlushed, stuckReaped }
+// { claimed, suspendedChecked, staleReleased, staleExpired, eventsFlushed, stuckReaped, purged,
+//   eventsFailed, eventsDeadLettered, eventSinkStatus, eventSinkError? }
 // Note: resumed suspended stages are automatically followed by run.transition.
 ```
 
@@ -449,6 +478,8 @@ Annotations replace the deprecated `WorkflowRun.metadata` column. Existing `meta
 
 ## AI Integration & Cost Tracking
 
+Inside a stage use `ctx.ai` (an `AIHelper` scoped to `workflow.<runId>.stage.<stageId>`, built from `createKernel({ services: { aiLogger } })`) or the durable `ctx.step.ai.*`. Outside a stage, build one yourself:
+
 ```typescript
 const ai = createAIHelper(
   `workflow.${ctx.workflowRunId}.stage.${ctx.stageId}`,
@@ -482,8 +513,8 @@ const handle = await batch.submit([{ id: "1", prompt: "Summarize..." }]);
 
 ### Required Prisma Models (ALL are required)
 
-Copy the complete schema from the [package README](../../README.md#1-database-setup). This includes:
-WorkflowRun, WorkflowStage, WorkflowLog, WorkflowArtifact, AICall, JobQueue, OutboxEvent, IdempotencyKey.
+Copy the complete schema from the package's `prisma/schema.prisma` (also in the [package README](../../README.md#1-database-setup)). This includes:
+WorkflowRun, WorkflowDefinition, WorkflowStage, WorkflowStep, WorkflowLog, WorkflowArtifact, AICall, WorkflowAnnotation, JobQueue, OutboxEvent, IdempotencyKey. `WorkflowBlob` is optional (only for `createPrismaBlobStore`). `sql/enqueue.sql` (the `workflow_engine_enqueue` function) is optional and applied by your own migration.
 
 ### Create Persistence
 
@@ -497,6 +528,7 @@ import {
 const persistence = createPrismaWorkflowPersistence(prisma);
 const jobQueue = createPrismaJobQueue(prisma);
 const aiCallLogger = createPrismaAICallLogger(prisma);
+const stepLedger = createPrismaStepLedger(prisma); // durable steps (workflow_steps)
 
 // SQLite - MUST pass databaseType option
 const persistence = createPrismaWorkflowPersistence(prisma, { databaseType: "sqlite" });
@@ -504,6 +536,8 @@ const jobQueue = createPrismaJobQueue(prisma, { databaseType: "sqlite" });
 ```
 
 ## Testing
+
+The quickest path is `createTestHarness` (1.0): an in-memory kernel plus the drive loop, with `harness.run(workflowId, input)`, `harness.mockAi`, `harness.steps.mockResult/mockError/mockTimeout/skipSleeps` and `harness.cancel` — see [07-testing-patterns.md](references/07-testing-patterns.md). The hand-wired form:
 
 ```typescript
 // In-memory persistence and job queue
@@ -540,21 +574,26 @@ await kernel.dispatch({ type: "job.execute", workflowRunId: job.workflowRunId, w
 await kernel.dispatch({ type: "run.transition", workflowRunId: job.workflowRunId });
 ```
 
-Implementing a custom `WorkflowPersistence`/`JobQueue`/`AICallLogger` adapter? Validate it with the exported conformance suites (v0.11+) instead of hand-rolling parity tests — see [07-testing-patterns.md](references/07-testing-patterns.md#conformance-suites-for-custom-adapters-v011).
+Implementing a custom `WorkflowPersistence`/`JobQueue`/`AICallLogger`/`StepLedger` adapter? Validate it with the exported conformance suites (v0.11+) instead of hand-rolling parity tests — see [07-testing-patterns.md](references/07-testing-patterns.md#conformance-suites-for-custom-adapters-v011).
 
 ## Reference Files
 
-- [01-stage-definitions.md](references/01-stage-definitions.md) - Complete stage API
-- [02-workflow-builder.md](references/02-workflow-builder.md) - WorkflowBuilder patterns
-- [03-kernel-host-setup.md](references/03-runtime-setup.md) - Kernel & host configuration
+- [01-stage-definitions.md](references/01-stage-definitions.md) - Complete stage API (`defineStage`, the stage context, result shapes, the legacy async-batch mode)
+- [02-workflow-builder.md](references/02-workflow-builder.md) - `defineWorkflow` / WorkflowBuilder patterns, `.version()`, type inference
+- [03-runtime-setup.md](references/03-runtime-setup.md) - Kernel & host configuration, job-lease tiers, degraded event sink
 - [04-ai-integration.md](references/04-ai-integration.md) - AI helper methods
 - [05-persistence-setup.md](references/05-persistence-setup.md) - Database setup
-- [06-async-batch-stages.md](references/06-async-batch-stages.md) - Async operations
-- [07-testing-patterns.md](references/07-testing-patterns.md) - Testing with kernel
+- [06-async-batch-stages.md](references/06-async-batch-stages.md) - Batch AI operations and the legacy async-batch stage mode
+- [07-testing-patterns.md](references/07-testing-patterns.md) - `createTestHarness`, step mocks, conformance suites, testing with the kernel
 - [08-common-patterns.md](references/08-common-patterns.md) - Kernel patterns & best practices
 - [09-troubleshooting.md](references/09-troubleshooting.md) - Debugging stuck runs, P2002 errors, ghost jobs
 - [10-annotations.md](references/10-annotations.md) - First-class provenance surface: `ctx.annotate`, `kernel.annotations.*`, conventions catalog
 - [11-remote-activity-workers.md](references/11-remote-activity-workers.md) - Credential-free remote workers: `defineRemoteStage`, broker, worker SDK, HTTP transport, S3/R2 artifacts, `ActivityExecutor` port
+- [12-durable-steps.md](references/12-durable-steps.md) - Durable steps (`ctx.step.run/waitFor/waitForSignal/sleep`), determinism rules, `DuplicateStepKeyError`, `step.externalKey`/`onReclaim`, `ctx.step.ai.*` and `ai.map` policies, `ctx.ai` injection, adapter seam and timeouts, the builder-first `defineWorkflow().stage()` API, migrating async-batch stages to steps
+- [13-definition-versioning.md](references/13-definition-versioning.md) - `.version()` and the derived structural hash, the `workflow_definitions` snapshot, version-filtered claiming (`serves`, `ghostReason: "version"`), `run.listVersions`, and shadowing a candidate build against live runs
+- [14-redrive.md](references/14-redrive.md) - `run.redrive`'s retry / restart / rerun modes, re-pinning onto another definition version, the preserved `run.supersededAttempt`, and migrating off the deprecated `run.rerunFrom`
+- [15-large-payloads.md](references/15-large-payloads.md) - The claim check: automatic step-result spilling, opt-in job-payload spilling, `spillThresholdBytes`, and what is deliberately not spilled
+- [16-operational-console.md](references/16-operational-console.md) - `@bratsos/workflow-engine-console`: mounting the handler, the deny-by-default action vocabulary, `ConsoleReadPort`, query timeouts, and the dev CLI
 
 ## Key Principles
 
@@ -562,11 +601,12 @@ Implementing a custom `WorkflowPersistence`/`JobQueue`/`AICallLogger` adapter? V
 2. **Command Kernel**: All operations are typed commands dispatched through `kernel.dispatch()`
 3. **Environment-Agnostic**: Kernel has no timers, no signals, no global state
 4. **Context Access**: Use `ctx.require()` and `ctx.optional()` for type-safe stage output access
-5. **Transactional Outbox**: Events written to outbox, published via `outbox.flush` command. `job.execute` and `stage.pollSuspended` use multi-phase transactions to avoid holding connections during external I/O
-6. **Idempotency**: `run.create`, `job.execute`, and `run.rerunFrom` (v0.11+) replay cached results by key; concurrent same-key dispatch throws `IdempotencyInProgressError`; a key stuck `in_progress` past `KernelConfig.idempotencyStaleInProgressMs` (default 10 min, v0.11+) can be reclaimed
-7. **Authoritative Cancellation**: `run.cancel` cascades to stages + jobs. Ghost jobs (running against non-RUNNING runs) are detected via `ghost: true` flag and not retried
+5. **Transactional Outbox**: Events written to outbox, published via `outbox.flush` command. `job.execute` and `stage.pollSuspended` use multi-phase transactions to avoid holding connections during external I/O; `stage.pollSuspended` claims each suspended stage (version-guarded `nextPollAt` lease) before polling it, so several orchestrating processes replay a stage once
+6. **Idempotency**: `run.create`, `job.execute`, `run.redrive` and `run.rerunFrom` replay cached results by key; concurrent same-key dispatch throws `IdempotencyInProgressError`; a key stuck `in_progress` past `KernelConfig.idempotencyStaleInProgressMs` (default 10 min, v0.11+) can be reclaimed
+7. **Authoritative Cancellation**: `run.cancel` cascades to stages + jobs and aborts `ctx.abortSignal` in the executing body (via the host's `job.heartbeat`). Ghost jobs (running against non-RUNNING runs) are reported with `ghost: true` and a `ghostReason`: `"orphan"` is discarded, `"race"` and `"version"` are re-delivered
 8. **Self-Healing**: Stage creation is idempotent (upsert), orchestration steps are isolated, stuck runs are automatically reaped
 9. **Cost Tracking**: All AI calls automatically track tokens and costs
-10. **BlobStore-Only Artifacts**: All artifact storage goes through the BlobStore port. `run.rerunFrom` cleans up artifacts by key prefix
+10. **BlobStore-Only Artifacts**: All artifact storage goes through the BlobStore port. `run.redrive` cleans up the artifacts of the stage records it deletes by key prefix after commit (a reopened stage keeps its storage). A durable step result over `spillThresholdBytes` (64 KiB) is written there too, with the ledger row keeping a reference — see [15-large-payloads.md](references/15-large-payloads.md)
 11. **Durable Provenance**: `ctx.annotate(...)` writes are buffered and flushed inside the stage-completion transaction. Annotations are atomic with the stage outcome — a stage's annotations either all persist or all roll back together with the stage update and outbox events.
 12. **Pluggable Execution**: stage execution goes through an injectable `ActivityExecutor` port (default in-process `LocalExecutor`). Inject a remote executor — or wrap a stage with `defineRemoteStage` — to run `execute()` on a separate credential-free machine without changing kernel internals.
+13. **Definition Pinning**: a run records the definition version it was created under, and a host built with `createWorkflowRegistry` claims only runs pinned to a version it serves. A run at a version this build does not serve is left alone — `PENDING` runs stay pending, a `RUNNING` job comes back with `ghostReason: "version"` — never failed, because a host cannot tell a decommissioned fleet from a peer mid-deploy. See [13-definition-versioning.md](references/13-definition-versioning.md).

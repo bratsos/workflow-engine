@@ -1,7 +1,7 @@
 import { defineConfig } from "vitest/config";
 
 /**
- * Root Vitest entry point: boots all four packages' suites in a single
+ * Root Vitest entry point: boots all five packages' suites in a single
  * `vitest` process (`vitest run` from the repo root) instead of the N
  * separate processes `pnpm -r test` spins up.
  *
@@ -12,7 +12,7 @@ import { defineConfig } from "vitest/config";
  * root itself.
  *
  * Explicit paths rather than a `packages/*` glob: keeps this list an
- * intentional statement of "the four packages with tests" rather than
+ * intentional statement of "the packages with tests" rather than
  * silently picking up every future `packages/*` entry (e.g. a
  * config-only package that isn't meant to run under Vitest).
  *
@@ -28,6 +28,7 @@ export default defineConfig({
       "packages/workflow-engine-host-node",
       "packages/workflow-engine-host-remote",
       "packages/workflow-engine-host-serverless",
+      "packages/workflow-engine-console",
     ],
   },
 });

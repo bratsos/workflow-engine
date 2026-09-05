@@ -18,13 +18,19 @@ import { randomUUID } from "crypto";
 import {
   type AnnotationFilters,
   type CreateAnnotationInput,
+  type CreateDefinitionInput,
   type CreateLogInput,
   type CreateOutboxEventInput,
   type CreateRunInput,
   type CreateStageInput,
+  type DefinitionVersionCount,
+  type DefinitionVersionCountFilter,
   type IdempotencyRecord,
   type OutboxRecord,
+  type PurgeableRun,
+  type PurgeableRunStatus,
   type SaveArtifactInput,
+  type ServedDefinition,
   StaleVersionError,
   type Status,
   type UpdateRunInput,
@@ -32,6 +38,7 @@ import {
   type UpsertStageInput,
   type WorkflowAnnotationRecord,
   type WorkflowArtifactRecord,
+  type WorkflowDefinitionRecord,
   type WorkflowLogRecord,
   type WorkflowPersistence,
   type WorkflowRunRecord,
@@ -76,6 +83,7 @@ function mergeDefined<T extends object>(base: T, rest: Partial<T>): T {
 
 export class InMemoryWorkflowPersistence implements WorkflowPersistence {
   private runs = new Map<string, WorkflowRunRecord>();
+  private definitions = new Map<string, WorkflowDefinitionRecord>();
   private stages = new Map<string, WorkflowStageRecord>();
   private logs = new Map<string, WorkflowLogRecord>();
   private artifacts = new Map<string, WorkflowArtifactRecord>();
@@ -147,6 +155,8 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
       totalTokens: 0,
       priority: data.priority ?? 5,
       metadata: data.metadata ?? null,
+      definitionVersion: data.definitionVersion ?? null,
+      redriveCount: 0,
     };
     this.runs.set(record.id, record);
     return { ...record };
@@ -195,6 +205,53 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
       .map((run) => ({ ...run }));
   }
 
+  async listRunsForPurge(
+    cutoff: Date,
+    statuses: readonly PurgeableRunStatus[],
+    limit: number,
+  ): Promise<PurgeableRun[]> {
+    const wanted = new Set<Status>(statuses);
+    const finishedAt = (run: WorkflowRunRecord) =>
+      run.completedAt ?? run.updatedAt;
+    return Array.from(this.runs.values())
+      .filter((run) => wanted.has(run.status) && finishedAt(run) <= cutoff)
+      .sort((a, b) => finishedAt(a).getTime() - finishedAt(b).getTime())
+      .slice(0, limit)
+      .map((run) => ({
+        id: run.id,
+        workflowType: run.workflowType,
+        status: run.status as PurgeableRunStatus,
+        stageRecordIds: this.stageRecordsOf(run.id).map((s) => s.id),
+      }));
+  }
+
+  async deleteRun(id: string): Promise<void> {
+    if (!this.runs.delete(id)) return;
+    for (const stage of this.stageRecordsOf(id)) {
+      this.stages.delete(stage.id);
+      this.stages.delete(this.stageKey(id, stage.stageId));
+    }
+    for (const [key, log] of this.logs) {
+      if (log.workflowRunId === id) this.logs.delete(key);
+    }
+    for (const [key, artifact] of this.artifacts) {
+      if (artifact.workflowRunId === id) this.artifacts.delete(key);
+    }
+    this.annotations = this.annotations.filter((a) => a.workflowRunId !== id);
+  }
+
+  /** Stage records of a run, deduplicated (stages are stored under two keys). */
+  private stageRecordsOf(runId: string): WorkflowStageRecord[] {
+    const seen = new Set<string>();
+    const out: WorkflowStageRecord[] = [];
+    for (const stage of this.stages.values()) {
+      if (stage.workflowRunId !== runId || seen.has(stage.id)) continue;
+      seen.add(stage.id);
+      out.push(stage);
+    }
+    return out;
+  }
+
   async getStuckRuns(stuckSince: Date): Promise<WorkflowRunRecord[]> {
     const runningRuns = await this.getRunsByStatus("RUNNING");
     return runningRuns.filter((run) => {
@@ -234,14 +291,35 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
     return true;
   }
 
-  async claimNextPendingRun(attempt = 0): Promise<WorkflowRunRecord | null> {
+  async claimNextPendingRun(
+    options?: { now?: Date; serves?: readonly ServedDefinition[] },
+    attempt = 0,
+  ): Promise<WorkflowRunRecord | null> {
     if (attempt >= MAX_CLAIM_ATTEMPTS) {
       return null;
     }
 
+    const serves = options?.serves;
+    // A pinned run is only claimed by a host that reports serving that
+    // (workflowId, version) pair. A run with a null version predates
+    // versioning and is claimable by any host that *has* the workflow —
+    // not by every host: one whose registry has never heard of it would
+    // adopt the run and immediately fail it with WORKFLOW_NOT_FOUND.
+    const canServe = (run: WorkflowRunRecord): boolean => {
+      if (serves === undefined) return true;
+      if (run.definitionVersion === null) {
+        return serves.some((s) => s.workflowId === run.workflowId);
+      }
+      return serves.some(
+        (s) =>
+          s.workflowId === run.workflowId &&
+          s.version === run.definitionVersion,
+      );
+    };
+
     // Find all pending runs
     const pendingRuns = Array.from(this.runs.values())
-      .filter((run) => run.status === "PENDING")
+      .filter((run) => run.status === "PENDING" && canServe(run))
       // Sort by priority (highest first), then by createdAt (oldest first - FIFO)
       .sort((a, b) => {
         if (a.priority !== b.priority) {
@@ -264,7 +342,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
       // In real FOR UPDATE SKIP LOCKED, this row would be skipped
       // Try the next one recursively (bounded to avoid unbounded
       // recursion under heavy contention)
-      return this.claimNextPendingRun(attempt + 1);
+      return this.claimNextPendingRun(options, attempt + 1);
     }
 
     // Atomically update status to RUNNING
@@ -443,19 +521,47 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
     return stages.map((s) => ({ ...s }));
   }
 
-  async getSuspendedStages(beforeDate: Date): Promise<WorkflowStageRecord[]> {
+  async getSuspendedStages(
+    beforeDate: Date,
+    options?: { limit?: number; serves?: readonly ServedDefinition[] },
+  ): Promise<WorkflowStageRecord[]> {
+    const serves = options?.serves;
+    // Same predicate `claimNextPendingRun` applies, read through the
+    // stage's run: a pinned run needs an exact (workflowId, version)
+    // match, an unpinned one needs only the workflow.
+    const runServed = (workflowRunId: string): boolean => {
+      if (serves === undefined) return true;
+      const run = this.runs.get(workflowRunId);
+      if (!run) return false;
+      if (run.definitionVersion === null) {
+        return serves.some((s) => s.workflowId === run.workflowId);
+      }
+      return serves.some(
+        (s) =>
+          s.workflowId === run.workflowId &&
+          s.version === run.definitionVersion,
+      );
+    };
     const seenIds = new Set<string>();
-    return Array.from(this.stages.values())
+    const ready = Array.from(this.stages.values())
       .filter((s) => {
         if (seenIds.has(s.id)) return false;
         seenIds.add(s.id);
         return (
           s.status === "SUSPENDED" &&
           s.nextPollAt !== null &&
-          s.nextPollAt <= beforeDate
+          s.nextPollAt <= beforeDate &&
+          runServed(s.workflowRunId)
         );
       })
+      // Oldest deadline first, matching the Prisma adapter, so the cap
+      // takes the stages that have been waiting longest.
+      .sort(
+        (a, b) =>
+          (a.nextPollAt?.getTime() ?? 0) - (b.nextPollAt?.getTime() ?? 0),
+      )
       .map((s) => ({ ...s }));
+    return options?.limit !== undefined ? ready.slice(0, options.limit) : ready;
   }
 
   async getFirstSuspendedStageReadyToResume(
@@ -569,6 +675,30 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
       })
       .slice(0, effectiveLimit)
       .map((r) => ({ ...r }));
+  }
+
+  async claimUnpublishedOutboxEvents(limit?: number): Promise<OutboxRecord[]> {
+    const effectiveLimit = limit ?? 100;
+    const now = this.now();
+    // Filter and stamp are synchronous: a concurrent flush that awaits
+    // this call after us sees `publishedAt` set and claims nothing.
+    const claimed = this.outbox
+      .filter((r) => r.publishedAt === null && r.dlqAt === null)
+      .sort((a, b) => {
+        const runCmp = a.workflowRunId.localeCompare(b.workflowRunId);
+        if (runCmp !== 0) return runCmp;
+        return a.sequence - b.sequence;
+      })
+      .slice(0, effectiveLimit);
+    for (const record of claimed) record.publishedAt = now;
+    return claimed.map((r) => ({ ...r }));
+  }
+
+  async releaseOutboxEvents(ids: string[]): Promise<void> {
+    const idSet = new Set(ids);
+    for (const record of this.outbox) {
+      if (idSet.has(record.id)) record.publishedAt = null;
+    }
   }
 
   async markOutboxEventsPublished(ids: string[]): Promise<void> {
@@ -833,6 +963,81 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
   }
 
   // ============================================================================
+  // WorkflowDefinition Operations
+  // ============================================================================
+
+  supportsDefinitionVersioning(): boolean {
+    return true;
+  }
+
+  async insertDefinitionIfAbsent(
+    input: CreateDefinitionInput,
+  ): Promise<WorkflowDefinitionRecord | null> {
+    const key = `${input.workflowId}\u0000${input.version}`;
+    const existing = this.definitions.get(key);
+    if (existing) return { ...existing };
+    const record: WorkflowDefinitionRecord = {
+      workflowId: input.workflowId,
+      version: input.version,
+      createdAt: this.now(),
+      snapshot: input.snapshot,
+      structureHash: input.structureHash,
+    };
+    this.definitions.set(key, record);
+    return { ...record };
+  }
+
+  async getDefinition(
+    workflowId: string,
+    version: string,
+  ): Promise<WorkflowDefinitionRecord | null> {
+    const record = this.definitions.get(`${workflowId}\u0000${version}`);
+    return record ? { ...record } : null;
+  }
+
+  async countRunsByDefinitionVersion(
+    filter?: DefinitionVersionCountFilter,
+  ): Promise<DefinitionVersionCount[]> {
+    const buckets = new Map<string, DefinitionVersionCount>();
+    for (const run of this.runs.values()) {
+      if (filter?.workflowId && run.workflowId !== filter.workflowId) continue;
+      if (
+        filter?.definitionVersion !== undefined &&
+        run.definitionVersion !== filter.definitionVersion
+      ) {
+        continue;
+      }
+      if (
+        filter?.status &&
+        filter.status.length > 0 &&
+        !filter.status.includes(run.status)
+      ) {
+        continue;
+      }
+      const key = `${run.workflowId}\u0000${run.definitionVersion ?? ""}\u0000${run.status}`;
+      const bucket = buckets.get(key);
+      if (bucket) {
+        bucket.count += 1;
+        if (
+          bucket.oldestCreatedAt === null ||
+          run.createdAt < bucket.oldestCreatedAt
+        ) {
+          bucket.oldestCreatedAt = run.createdAt;
+        }
+      } else {
+        buckets.set(key, {
+          workflowId: run.workflowId,
+          definitionVersion: run.definitionVersion,
+          status: run.status,
+          count: 1,
+          oldestCreatedAt: run.createdAt,
+        });
+      }
+    }
+    return Array.from(buckets.values());
+  }
+
+  // ============================================================================
   // Test Helpers
   // ============================================================================
 
@@ -841,6 +1046,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
    */
   clear(): void {
     this.runs.clear();
+    this.definitions.clear();
     this.stages.clear();
     this.logs.clear();
     this.artifacts.clear();

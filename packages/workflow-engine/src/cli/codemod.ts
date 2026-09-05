@@ -6,6 +6,7 @@ import {
   lstatSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   writeFileSync,
 } from "node:fs";
 import { createRequire } from "node:module";
@@ -29,7 +30,7 @@ function loadTypeScript(): TypeScriptApi {
 
 const ts: TypeScriptApi = loadTypeScript();
 
-export type CodemodVersion = "0.11" | "0.12";
+export type CodemodVersion = "0.11" | "0.12" | "0.13";
 
 export interface CodemodOptions {
   from?: CodemodVersion;
@@ -81,6 +82,36 @@ export interface PackageJsonCodemodResult {
   parseErrors: ParseError[];
 }
 
+const MIGRATION_1_0 =
+  "skills/workflow-engine/migrations/migrate-0.13-to-1.0.md";
+const MESSAGE_REMOVED_1_0 = `removed in 1.0; see ${MIGRATION_1_0}`;
+/** Root/client exports that 1.0 removed, with the one-line replacement. */
+const REMOVED_1_0_IMPORTS = new Map<string, string>([
+  [
+    "defineAsyncBatchStage",
+    "Replace the suspend + checkCompletion pair with ctx.step.waitFor / ctx.step.ai.map inside defineStage.",
+  ],
+  ["requireStageOutput", 'Use ctx.require("stageId").'],
+  [
+    "ModelStatsTracker",
+    "Read call stats from the AICallLogger (createPrismaAICallLogger).",
+  ],
+  [
+    "ModelWithRecorder",
+    "Read call stats from the AICallLogger (createPrismaAICallLogger).",
+  ],
+  ["getModelById", "Use getModel(key)."],
+  ["getRegisteredModel", "Use getModel(key)."],
+  [
+    "listRegisteredModels",
+    "Keep your own list of registered keys; the registry only exposes getModel().",
+  ],
+  ["getDefaultModel", "Name the model key explicitly."],
+  ["printAvailableModels", "Removed; list your registered keys yourself."],
+  ["modelSupportsBatch", "Use getModel(key).supportsAsyncBatch."],
+  ["NoopScheduler", "Drop it: createKernel no longer takes a scheduler."],
+  ["ArtifactPersistence", "Use the BlobStore port (createPrismaBlobStore)."],
+]);
 const REMOVED_BATCH_IMPORTS = new Set([
   "AnthropicBatchProvider",
   "GoogleBatchProvider",
@@ -387,6 +418,19 @@ function addManualFindings(
       ) {
         for (const element of node.importClause.namedBindings.elements) {
           const imported = element.propertyName ?? element.name;
+          if (ts.isIdentifier(imported)) {
+            const replacement = REMOVED_1_0_IMPORTS.get(imported.text);
+            if (replacement !== undefined) {
+              addFinding(
+                findings,
+                sourceFile,
+                imported,
+                7,
+                MESSAGE_REMOVED_1_0,
+                replacement,
+              );
+            }
+          }
           if (
             ts.isIdentifier(imported) &&
             REMOVED_BATCH_IMPORTS.has(imported.text)
@@ -400,6 +444,38 @@ function addManualFindings(
               "Replace direct provider usage with ai.batch().",
             );
           }
+        }
+      }
+    }
+
+    if (ts.isObjectLiteralExpression(node)) {
+      for (const member of node.properties) {
+        // `checkCompletion` is usually a method (`async checkCompletion() {}`),
+        // not a property assignment.
+        const name =
+          identifierPropertyAssignment(member) ??
+          (ts.isMethodDeclaration(member) && ts.isIdentifier(member.name)
+            ? member.name
+            : undefined);
+        if (name?.text === "checkCompletion") {
+          addFinding(
+            findings,
+            sourceFile,
+            name,
+            7,
+            MESSAGE_REMOVED_1_0,
+            "checkCompletion belongs to the removed async-batch pattern: poll inside execute() with ctx.step.waitFor, or fan out with ctx.step.ai.map.",
+          );
+        }
+        if (name?.text === "experimental_output") {
+          addFinding(
+            findings,
+            sourceFile,
+            name,
+            7,
+            MESSAGE_REMOVED_1_0,
+            "The option is `output` (AI SDK Output.object(...)); --from 0.11 renames it, on --from 0.13 rename it by hand.",
+          );
         }
       }
     }
@@ -510,7 +586,9 @@ export function transformSource(
   const edits: CodemodEdit[] = [];
   const findings: CodemodFinding[] = [];
 
-  if (options.from !== "0.12") addSafeRenames(sourceFile, edits);
+  // The 0.11 → 0.12 renames only; from 0.12 or 0.13 the source already uses
+  // the new names and anything left is reported, not rewritten.
+  if (options.from === "0.11") addSafeRenames(sourceFile, edits);
   addManualFindings(sourceFile, findings);
 
   edits.sort((left, right) => left.start - right.start);
@@ -727,7 +805,7 @@ interface CliReport {
 }
 
 const USAGE =
-  "Usage: npx workflow-engine-codemod [--from 0.11|0.12] [--dry-run] [--json] [paths...]";
+  "Usage: npx workflow-engine-codemod [--from 0.11|0.12|0.13] [--dry-run] [--json] [paths...]";
 
 function parseArguments(argv: readonly string[], cwd: string): CliOptions {
   let from: CodemodVersion = "0.11";
@@ -754,7 +832,7 @@ function parseArguments(argv: readonly string[], cwd: string): CliOptions {
         argument === "--from"
           ? argv[++index]
           : argument.slice("--from=".length);
-      if (value !== "0.11" && value !== "0.12") {
+      if (value !== "0.11" && value !== "0.12" && value !== "0.13") {
         throw new Error(
           `${USAGE}\nInvalid --from value: ${value ?? "(missing)"}`,
         );
@@ -1025,8 +1103,23 @@ function printHumanReport(report: CliReport, dryRun: boolean): void {
   );
 }
 
-const invokedFile = process.argv[1] ? resolve(process.argv[1]) : undefined;
-if (invokedFile && fileURLToPath(import.meta.url) === invokedFile) {
+function toRealPath(path: string): string {
+  const resolved = resolve(path);
+  try {
+    return realpathSync(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
+export function isInvokedAsBin(metaUrl: string): boolean {
+  const invokedFile = process.argv[1] ? toRealPath(process.argv[1]) : undefined;
+  return Boolean(
+    invokedFile && invokedFile === toRealPath(fileURLToPath(metaUrl)),
+  );
+}
+
+if (isInvokedAsBin(import.meta.url)) {
   void runCodemod().then((exitCode) => {
     process.exitCode = exitCode;
   });
