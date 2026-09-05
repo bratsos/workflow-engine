@@ -43,6 +43,8 @@ export type {
   JobStatus,
   LogLevel,
   PersistenceCore,
+  PurgeableRun,
+  PurgeableRunStatus,
   SaveArtifactInput,
   Status,
   UpdateRunInput,

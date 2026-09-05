@@ -34,6 +34,10 @@ const host = createServerlessHost({
   maxSuspendedChecksPerTick: 10,
   maxOutboxFlushPerTick: 100,
 
+  // Opt-in retention: run.purge deletes terminal runs older than this on
+  // every maintenance tick. Off unless set.
+  // retention: { olderThanMs: 30 * 24 * 60 * 60 * 1000 },
+
   // Which definition versions this host may claim, poll and dequeue.
   // Omit it and the kernel derives it from the registry, which is what
   // makes a rolling deploy safe; "all" turns version filtering off.
@@ -116,6 +120,7 @@ export default {
     //   staleReleased: 0,
     //   eventsFlushed: 4,
     //   stuckReaped: 0,
+    //   purged: 0,          // > 0 only with `retention` configured
     //   eventsFailed: 0,
     //   eventsDeadLettered: 0,
     //   eventSinkStatus: "healthy"   // or "degraded", with eventSinkError

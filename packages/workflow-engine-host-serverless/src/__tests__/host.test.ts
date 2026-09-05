@@ -307,6 +307,44 @@ describe("ServerlessHost", () => {
     expect(tick.eventsFlushed).toBeGreaterThanOrEqual(0);
   });
 
+  it("purges finished runs past the retention age only when retention is set", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, persistence, jobTransport } = createTestEnv([workflow]);
+    const hostWithoutRetention = createServerlessHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+    });
+    const host = createServerlessHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+      retention: { olderThanMs: 0 },
+    });
+
+    const { workflowRunId } = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "retention-1",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+    await hostWithoutRetention.runMaintenanceTick();
+    const msg = await dequeueAsMessage(jobTransport);
+    await host.handleJob(msg!);
+    expect((await persistence.getRun(workflowRunId))?.status).toBe("COMPLETED");
+
+    // Off by default: the finished run survives a tick without retention.
+    const untouched = await hostWithoutRetention.runMaintenanceTick();
+    expect(untouched.purged).toBe(0);
+    expect(await persistence.getRun(workflowRunId)).not.toBeNull();
+
+    // Opted in: the same tick deletes it and reports the count.
+    const tick = await host.runMaintenanceTick();
+    expect(tick.purged).toBe(1);
+    expect(await persistence.getRun(workflowRunId)).toBeNull();
+    expect(await persistence.getStagesByRun(workflowRunId)).toEqual([]);
+  });
+
   it("re-enqueues a failed stage with attempts left and completes the run on the retry", async () => {
     let calls = 0;
     const flaky = defineStage({

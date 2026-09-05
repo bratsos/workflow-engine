@@ -16,6 +16,8 @@ import type {
   DefinitionVersionCount,
   DefinitionVersionCountFilter,
   OutboxRecord,
+  PurgeableRun,
+  PurgeableRunStatus,
   SaveArtifactInput,
   ServedDefinition,
   Status,
@@ -375,6 +377,46 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       orderBy: { createdAt: "asc" },
     });
     return runs.map((run: any) => this.mapWorkflowRun(run));
+  }
+
+  async listRunsForPurge(
+    cutoff: Date,
+    statuses: readonly PurgeableRunStatus[],
+    limit: number,
+  ): Promise<PurgeableRun[]> {
+    if (statuses.length === 0 || limit <= 0) return [];
+    const runs = await this.prisma.workflowRun.findMany({
+      where: {
+        status: { in: statuses.map((status) => this.enums.status(status)) },
+        OR: [
+          { completedAt: { lte: cutoff } },
+          { completedAt: null, updatedAt: { lte: cutoff } },
+        ],
+      },
+      // Oldest first, on the same "finished at" the filter reads: a run
+      // with no completedAt sorts by its last write.
+      orderBy: [{ completedAt: "asc" }, { updatedAt: "asc" }],
+      take: limit,
+      select: {
+        id: true,
+        workflowType: true,
+        status: true,
+        stages: { select: { id: true } },
+      },
+    });
+    return runs.map((run: any) => ({
+      id: run.id,
+      workflowType: run.workflowType,
+      status: run.status as PurgeableRunStatus,
+      stageRecordIds: run.stages.map((stage: any) => stage.id),
+    }));
+  }
+
+  async deleteRun(id: string): Promise<void> {
+    // deleteMany rather than delete: a missing row is a no-op, not P2025.
+    // Stages, logs, artifacts, annotations and (via workflow_stages) the
+    // workflow_steps ledger go with it through the schema's cascades.
+    await this.prisma.workflowRun.deleteMany({ where: { id } });
   }
 
   async getStuckRuns(stuckSince: Date): Promise<WorkflowRunRecord[]> {

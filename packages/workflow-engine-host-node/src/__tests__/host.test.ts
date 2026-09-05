@@ -215,6 +215,38 @@ describe("NodeHost", () => {
     expect(stats.eventSink.status).toBe("healthy");
   });
 
+  it("purges finished runs past the retention age when retention is set", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, persistence, jobTransport } = createTestEnv([workflow]);
+
+    const { workflowRunId } = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "retention-1",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+
+    host = createNodeHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+      orchestrationIntervalMs: 50,
+      jobPollIntervalMs: 20,
+      staleLeaseThresholdMs: 60_000,
+      retention: { olderThanMs: 0 },
+    });
+    await host.start();
+
+    // The run completes on the job loop; the next orchestration tick's
+    // run.purge deletes it, since it is past a zero retention age.
+    await waitFor(
+      async () => (await persistence.getRun(workflowRunId)) === null,
+    );
+
+    expect(host.getStats().jobsProcessed).toBe(1);
+    expect(await persistence.getStagesByRun(workflowRunId)).toEqual([]);
+  });
+
   it("names the event sink degraded and still runs the workflow to completion", async () => {
     const workflow = createSimpleWorkflow();
     // Built by hand rather than through createTestEnv: this is the one test

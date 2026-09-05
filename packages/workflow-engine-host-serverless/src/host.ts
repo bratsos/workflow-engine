@@ -16,6 +16,7 @@ import {
   HOST_DEFAULTS,
   type JobTransport,
   type Kernel,
+  type RetentionOptions,
   runMaintenanceTick as runMaintenanceTickCommands,
   type ServedDefinition,
 } from "@bratsos/workflow-engine/kernel";
@@ -61,6 +62,14 @@ export interface ServerlessHostConfig {
 
   /** Max outbox events to flush per tick (default: 100). */
   maxOutboxFlushPerTick?: number;
+
+  /**
+   * Delete finished runs older than `retention.olderThanMs` (with their
+   * stages, logs, artifacts, annotations, step ledger, job rows and blobs)
+   * through `run.purge` at the end of every maintenance tick. Off by
+   * default: nothing is deleted unless this is set.
+   */
+  retention?: RetentionOptions;
 
   /**
    * Publish this job's outbox events right after `handleJob` settles it
@@ -123,6 +132,8 @@ export interface MaintenanceTickResult {
   staleReleased: number;
   eventsFlushed: number;
   stuckReaped: number;
+  /** Terminal runs deleted by `run.purge`; 0 unless `retention` is configured. */
+  purged: number;
   /** Events claimed but not published this tick; the next flush retries them. */
   eventsFailed: number;
   /** Events that exhausted their retry budget and moved to the DLQ. */
@@ -168,6 +179,7 @@ class ServerlessHostImpl implements ServerlessHost {
   private readonly serves: readonly ServedDefinition[] | "all" | undefined;
   private readonly maxSuspendedChecksPerTick: number;
   private readonly maxOutboxFlushPerTick: number;
+  private readonly retention: RetentionOptions | undefined;
   private readonly jobHeartbeatIntervalMs: number;
   private readonly flushOutboxAfterJob: boolean;
   private readonly outboxFlushTimeoutMs: number;
@@ -188,6 +200,7 @@ class ServerlessHostImpl implements ServerlessHost {
       HOST_DEFAULTS.maxSuspendedChecksPerTick;
     this.maxOutboxFlushPerTick =
       config.maxOutboxFlushPerTick ?? HOST_DEFAULTS.maxOutboxFlushPerTick;
+    this.retention = config.retention;
     this.jobHeartbeatIntervalMs =
       config.jobHeartbeatIntervalMs ?? HOST_DEFAULTS.jobHeartbeatIntervalMs;
     this.flushOutboxAfterJob = config.flushOutboxAfterJob ?? true;
@@ -310,6 +323,7 @@ class ServerlessHostImpl implements ServerlessHost {
       maxOutboxFlushPerTick: this.maxOutboxFlushPerTick,
       staleLeaseThresholdMs: this.staleLeaseThresholdMs,
       jobAbsoluteTimeoutMs: this.jobAbsoluteTimeoutMs,
+      ...(this.retention !== undefined ? { retention: this.retention } : {}),
       logPrefix: "[ServerlessHost]",
     });
     if (counts.eventSinkStatus === "degraded") {

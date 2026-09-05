@@ -57,6 +57,8 @@ interface PersistenceCore {
   getRun(id: string): Promise<WorkflowRunRecord | null>;
   getRunStatus(id: string): Promise<Status | null>;
   getStuckRuns(stuckSince: Date): Promise<WorkflowRunRecord[]>;
+  listRunsForPurge(cutoff: Date, statuses: readonly PurgeableRunStatus[], limit: number): Promise<PurgeableRun[]>;   // run.purge: terminal runs finished at or before cutoff, oldest first, with their stage record ids
+  deleteRun(id: string): Promise<void>;   // run.purge: the run and everything under it (stages, logs, artifacts, annotations); missing id is a no-op
   claimNextPendingRun(options?: {
     now?: Date;                                                 // the kernel clock's time, written as startedAt/updatedAt
     serves?: readonly ServedDefinition[];                       // definition versions this build serves; omit to claim any run

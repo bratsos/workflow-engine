@@ -127,11 +127,55 @@ The orchestration tick runs these steps in order, each independently:
 | 3 | `lease.reapStale` | Release job leases from crashed workers |
 | 4 | `outbox.flush` | Publish pending events through EventSink |
 | 5 | `run.reapStuck` | Fail RUNNING runs with no recent activity |
+| 6 | `run.purge` | Opt-in (`retention` host option): delete terminal runs past their retention age — see "Run Retention" below |
 
 **Node host:** Runs automatically on `orchestrationIntervalMs` (default: 10s). A firing that lands while the previous tick is still running is skipped, not queued; `getStats().orchestrationTicks` counts only ticks that ran.
 **Serverless host:** Must be triggered externally via `host.runMaintenanceTick()`.
 
 Several processes may tick against the same database: `stage.pollSuspended` claims each suspended stage (a version-guarded bump of `nextPollAt`) before polling or replaying it, so a stage body runs once per poll across processes. A suspended stage whose `nextPollAt` sits up to 60s (or one `pollInterval`) in the future while nothing is polling it was claimed by a process that died mid-replay; it is picked up again when that lease elapses. See "Suspended-Stage Claims" in [08-common-patterns.md](08-common-patterns.md).
+
+## Run Retention
+
+Nothing in the engine deletes a run on its own: `COMPLETED`, `FAILED` and `CANCELLED` rows accumulate, with their stages, logs, artifacts, annotations, `workflow_steps` ledger rows, job rows and blobs, until something removes them. Two supported ways to do that:
+
+**`run.purge` (kernel command).** Deletes terminal runs that finished at or before a cutoff, bounded per call:
+
+```typescript
+const { purged, workflowRunIds } = await kernel.dispatch({
+  type: "run.purge",
+  olderThan: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000), // finished 30+ days ago
+  statuses: ["COMPLETED", "FAILED", "CANCELLED"],             // default: all three
+  limit: 100,                                                  // default: 100 runs per call
+});
+```
+
+A run is eligible when its `status` is in `statuses` and its `completedAt` (or `updatedAt`, for a terminal run with no `completedAt`) is at or before `olderThan`; oldest first. For each run the kernel clears the `StepLedger` for every stage record through the port (before the row goes — the port is pluggable, so the reference schema's cascade is not relied on), deletes the run's job rows through the `JobTransport`, deletes the run through `PersistenceCore.deleteRun` (stages, logs, artifacts and annotations go with it), and after the transaction commits deletes the run's blobs under the engine's own key prefixes (`workflow-v2/<workflowType>/<runId>/`, `workflow-v2/spill/jobs/<runId>/`, `workflow-v2/spill/steps/<stageRecordId>/`). It emits no events. Loop until `purged` is `0` to drain a backlog; `ai_calls` rows are accounting and are left alone.
+
+**Host option.** Both hosts run `run.purge` at the end of every maintenance tick once `retention` is set; it is off by default:
+
+```typescript
+createNodeHost({ ..., retention: { olderThanMs: 30 * 24 * 60 * 60 * 1000, statuses: ["COMPLETED"], limit: 100 } });
+createServerlessHost({ ..., retention: { olderThanMs: 30 * 24 * 60 * 60 * 1000 } });
+// The tick result / MaintenanceTickCounts gains `purged`.
+```
+
+**Deleting by hand.** With the reference schema, one statement per run does the same job for the rows — the cascades from `workflow_runs` take `workflow_stages`, `workflow_logs`, `workflow_artifacts` and `workflow_annotations`, and `workflow_stages` takes `workflow_steps` **only once the `workflow_steps_stageRecordId_fkey` foreign key exists** (in the package schema from the release that added `run.purge`; a table created from an earlier 1.0 alpha needs the `ADD CONSTRAINT` in `migrations/migrate-0.13-to-1.0.md`). `job_queue` has no foreign key to the run, so delete it explicitly; blobs in the `BlobStore` are outside the database:
+
+```sql
+-- Terminal runs that finished 30+ days ago
+WITH doomed AS (
+  SELECT "id" FROM "workflow_runs"
+  WHERE "status" IN ('COMPLETED', 'FAILED', 'CANCELLED')
+    AND COALESCE("completedAt", "updatedAt") <= now() - interval '30 days'
+  LIMIT 1000
+),
+jobs AS (
+  DELETE FROM "job_queue" WHERE "workflowRunId" IN (SELECT "id" FROM doomed)
+)
+DELETE FROM "workflow_runs" WHERE "id" IN (SELECT "id" FROM doomed);
+```
+
+Run it in batches (the `LIMIT`) and drop the run's blob prefixes above from your object store afterwards. Without the foreign key on `workflow_steps`, add `DELETE FROM "workflow_steps" WHERE "stageRecordId" IN (SELECT "id" FROM "workflow_stages" WHERE "workflowRunId" IN (SELECT "id" FROM doomed))` before the run delete, or the ledger rows are orphaned.
 
 ## Error Codes Reference
 

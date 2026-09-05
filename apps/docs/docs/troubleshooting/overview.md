@@ -77,13 +77,26 @@ This guide covers common issues encountered when running **workflow-engine**, ho
 
 ## Orchestration Tick Flow
 
-The host orchestration tick executes these five operations sequentially. Each operation runs inside its own try/catch block, preventing a single failure (e.g. one bad database query) from starving unrelated operations:
+The host orchestration tick executes these operations sequentially. Each operation runs inside its own try/catch block, preventing a single failure (e.g. one bad database query) from starving unrelated operations:
 
 1. **`run.claimPending`**: Discovers new runs, creates stage rows, and enqueues jobs.
 2. **`stage.pollSuspended`**: Interrogates batch providers for suspended async-batch stages.
 3. **`lease.reapStale`**: Recovers job locks from crashed worker processes.
 4. **`outbox.flush`**: Emits events to the `EventSink`.
 5. **`run.reapStuck`**: Cleans up zombie runs that have lost database activity.
+6. **`run.purge`** (only when the host is given `retention`): Deletes terminal runs past their retention age.
+
+---
+
+## Run Retention
+
+Nothing deletes a finished run by itself. Opt in per host with `retention: { olderThanMs, statuses?, limit? }` (off by default) and the maintenance tick dispatches `run.purge`, which deletes `COMPLETED`/`FAILED`/`CANCELLED` runs that finished at or before the cutoff, `limit` (default 100) per tick, oldest first: the step ledger is cleared through the `StepLedger` port, job rows go through the `JobTransport`, the run through `PersistenceCore.deleteRun` (stages, logs, artifacts, annotations cascade), and the run's blobs (`workflow-v2/<workflowType>/<runId>/`, `workflow-v2/spill/jobs/<runId>/`, `workflow-v2/spill/steps/<stageRecordId>/`) are removed after commit. No events are emitted. The command can also be dispatched directly:
+
+```typescript
+await kernel.dispatch({ type: "run.purge", olderThan: new Date(Date.now() - 30 * 86_400_000) });
+```
+
+Deleting by SQL instead: with the reference schema, `DELETE FROM "workflow_runs" WHERE ...` cascades to stages, logs, artifacts and annotations, and from `workflow_stages` to `workflow_steps` **only once the `workflow_steps_stageRecordId_fkey` foreign key exists** (package schema from the release that added `run.purge`; earlier 1.0 alphas need the `ADD CONSTRAINT` in the 0.13 → 1.0 migration guide). `job_queue` has no foreign key to the run and must be deleted explicitly, and blobs live outside the database. The reference (`09-troubleshooting.md`, "Run Retention") has the batched statement.
 
 ---
 

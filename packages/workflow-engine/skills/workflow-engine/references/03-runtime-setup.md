@@ -103,6 +103,7 @@ const host = createNodeHost({
   maxClaimsPerTick: 10,               // Max pending runs to claim per tick
   maxSuspendedChecksPerTick: 10,      // Max suspended stages to poll per tick
   maxOutboxFlushPerTick: 100,         // Max outbox events to flush per tick
+  // retention: { olderThanMs: 30 * 24 * 60 * 60 * 1000 }, // Opt-in: run.purge on every tick (see 09-troubleshooting.md, "Run Retention")
   // serves: "all",                   // 1.0: turn definition-version filtering off.
                                       // Omitted, the kernel derives it from the
                                       // registry (claim, poll and dequeue alike).
@@ -200,6 +201,7 @@ const host = createServerlessHost({
   maxClaimsPerTick: 10,
   maxSuspendedChecksPerTick: 10,
   maxOutboxFlushPerTick: 100,
+  // retention: { olderThanMs: 30 * 24 * 60 * 60 * 1000 }, // Opt-in: run.purge on every tick
   // serves: "all",                   // 1.0: turn definition-version filtering off
 });
 ```
@@ -285,7 +287,8 @@ Run from a cron trigger (Cloudflare Cron, EventBridge, etc.):
 ```typescript
 const tick = await host.runMaintenanceTick();
 // { claimed, suspendedChecked, staleReleased, staleExpired, eventsFlushed,
-//   stuckReaped, eventsFailed, eventsDeadLettered, eventSinkStatus, eventSinkError? }
+//   stuckReaped, purged, eventsFailed, eventsDeadLettered, eventSinkStatus, eventSinkError? }
+// `purged` stays 0 unless the host was given `retention`.
 // Resumed suspended stages are automatically followed by run.transition.
 ```
 
@@ -344,7 +347,7 @@ import {
 | Export | Purpose |
 |--------|---------|
 | `executeJobWithHeartbeat(kernel, options)` | Dispatches `job.execute` for one job, holding a lease heartbeat (`jobTransport.touchJob`) for its duration, then routes the outcome through the job transport (`complete`/`suspend`/`fail`) and `run.transition` when terminal. |
-| `runMaintenanceTick(kernel, options)` | Runs one bounded maintenance pass -- `run.claimPending`, `stage.pollSuspended` (transitioning any resumed runs), `lease.reapStale` (both lease tiers), `outbox.flush`, `run.reapStuck`. Each command's error is caught and logged independently so one failure doesn't block the rest of the tick. |
+| `runMaintenanceTick(kernel, options)` | Runs one bounded maintenance pass -- `run.claimPending`, `stage.pollSuspended` (transitioning any resumed runs), `lease.reapStale` (both lease tiers), `outbox.flush`, `run.reapStuck`, and `run.purge` when `retention` is set. Each command's error is caught and logged independently so one failure doesn't block the rest of the tick. |
 | `HOST_DEFAULTS` | The shared tuning defaults (`staleLeaseThresholdMs`, `jobAbsoluteTimeoutMs`, `maxClaimsPerTick`, `jobHeartbeatIntervalMs`, etc.) both built-in hosts fall back to. |
 | `toErrorMessage(error)` | Normalizes a caught `unknown` into a display-safe string (`Error#message`, or `String(error)`). |
 

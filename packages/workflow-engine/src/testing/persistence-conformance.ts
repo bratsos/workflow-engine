@@ -413,6 +413,123 @@ export function persistenceConformanceSuite(
       });
     });
 
+    describe("retention operations", () => {
+      const old = new Date("2024-01-01T00:00:00Z");
+      const cutoff = new Date("2024-06-01T00:00:00Z");
+      const recent = new Date("2024-12-01T00:00:00Z");
+
+      async function finishedRun(
+        id: string,
+        status: "COMPLETED" | "FAILED" | "CANCELLED",
+        completedAt: Date,
+      ) {
+        await persistence.createRun(createRunData({ id }));
+        await persistence.updateRun(id, { status, completedAt });
+      }
+
+      it("should list terminal runs that finished at or before the cutoff, oldest first", async () => {
+        // Given: two old terminal runs, one recent one, and one still running
+        await finishedRun(
+          "purge-old-b",
+          "FAILED",
+          new Date("2024-02-01T00:00:00Z"),
+        );
+        await finishedRun("purge-old-a", "COMPLETED", old);
+        await finishedRun("purge-recent", "COMPLETED", recent);
+        await persistence.createRun(createRunData({ id: "purge-running" }));
+        await persistence.updateRun("purge-running", { status: "RUNNING" });
+
+        // When: listing with every terminal status
+        const runs = await persistence.listRunsForPurge(
+          cutoff,
+          ["COMPLETED", "FAILED", "CANCELLED"],
+          10,
+        );
+
+        // Then: only the two old terminal runs, oldest first
+        expect(runs.map((r) => r.id)).toEqual(["purge-old-a", "purge-old-b"]);
+        expect(runs[0]?.status).toBe("COMPLETED");
+        expect(runs[0]?.workflowType).toBe("test-workflow");
+      });
+
+      it("should honour the status filter and the limit", async () => {
+        await finishedRun("purge-completed", "COMPLETED", old);
+        await finishedRun("purge-failed", "FAILED", old);
+        await finishedRun("purge-cancelled", "CANCELLED", old);
+
+        const failedOnly = await persistence.listRunsForPurge(
+          cutoff,
+          ["FAILED"],
+          10,
+        );
+        expect(failedOnly.map((r) => r.id)).toEqual(["purge-failed"]);
+
+        const limited = await persistence.listRunsForPurge(
+          cutoff,
+          ["COMPLETED", "FAILED", "CANCELLED"],
+          2,
+        );
+        expect(limited).toHaveLength(2);
+      });
+
+      it("should return each run's stage record ids", async () => {
+        await finishedRun("purge-with-stages", "COMPLETED", old);
+        const stageA = await persistence.createStage(
+          await createStageData({
+            workflowRunId: "purge-with-stages",
+            stageId: "a",
+          }),
+        );
+        const stageB = await persistence.createStage(
+          await createStageData({
+            workflowRunId: "purge-with-stages",
+            stageId: "b",
+            stageNumber: 2,
+            executionGroup: 2,
+          }),
+        );
+
+        const [run] = await persistence.listRunsForPurge(
+          cutoff,
+          ["COMPLETED"],
+          10,
+        );
+
+        expect(run?.id).toBe("purge-with-stages");
+        expect([...(run?.stageRecordIds ?? [])].sort()).toEqual(
+          [stageA.id, stageB.id].sort(),
+        );
+      });
+
+      it("should delete a run with its stages and logs, and ignore a missing id", async () => {
+        // Given: a finished run with a stage and a log
+        await finishedRun("purge-delete-me", "COMPLETED", old);
+        const stage = await persistence.createStage(
+          await createStageData({ workflowRunId: "purge-delete-me" }),
+        );
+        await persistence.createLog({
+          workflowRunId: "purge-delete-me",
+          workflowStageId: stage.id,
+          level: "INFO",
+          message: "about to be purged",
+        });
+        // And: an unrelated run that must survive
+        await finishedRun("purge-keep-me", "COMPLETED", old);
+
+        // When: deleting the run (twice: the second is a no-op)
+        await persistence.deleteRun("purge-delete-me");
+        await persistence.deleteRun("purge-delete-me");
+
+        // Then: the run and its stage are gone, the other run is not
+        expect(await persistence.getRun("purge-delete-me")).toBeNull();
+        expect(await persistence.getStagesByRun("purge-delete-me")).toEqual([]);
+        expect(await persistence.getRun("purge-keep-me")).not.toBeNull();
+        expect(
+          await persistence.listRunsForPurge(cutoff, ["COMPLETED"], 10),
+        ).toHaveLength(1);
+      });
+    });
+
     describe("definition versioning", () => {
       it("reports whether the schema behind the adapter carries it", () => {
         // A database that has not been migrated answers false and the
