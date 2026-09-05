@@ -9,5 +9,7 @@
     "@bratsos/workflow-engine-host-remote": "0.2.2",
     "@bratsos/workflow-engine-host-serverless": "0.3.2"
   },
-  "changesets": []
+  "changesets": [
+    "durable-steps-v1"
+  ]
 }
