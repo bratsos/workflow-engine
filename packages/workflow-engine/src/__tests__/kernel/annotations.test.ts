@@ -1017,10 +1017,13 @@ describe("annotations: attempt auto-increment on rerun", () => {
     expect(firstAttempt[0].value).toBe("first");
     expect(secondAttempt).toHaveLength(1);
     expect(secondAttempt[0].value).toBe("first");
-    // Old stage record deleted (SetNull on the FK) but value lives on.
-    expect(firstAttempt[0].workflowStageRecordId).toBeNull();
-    // New stage record is the active one.
-    expect(secondAttempt[0].workflowStageRecordId).not.toBeNull();
+    // The rerun reopened the stage record in place rather than deleting
+    // it, so both attempts' annotations point at the same row; the
+    // `attempt` column is what tells them apart.
+    const record = await persistence.getStage(runId, "decide");
+    expect(record?.attempt).toBe(1);
+    expect(firstAttempt[0].workflowStageRecordId).toBe(record?.id);
+    expect(secondAttempt[0].workflowStageRecordId).toBe(record?.id);
   });
 });
 

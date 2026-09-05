@@ -52,3 +52,11 @@ export {
   type CreateStepApiOptions,
   createStepApi,
 } from "./step-api.js";
+export {
+  applyStepLedgerReset,
+  namesExternalEffect,
+  planStepLedgerReset,
+  resetStageStepsForFreshAttempt,
+  type StepLedgerResetMode,
+  type StepLedgerResetPlan,
+} from "./step-ledger-reset.js";

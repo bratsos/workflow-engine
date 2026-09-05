@@ -371,8 +371,10 @@ export interface CreateStageInput {
 export interface UpdateStageInput {
   status?: Status;
   startedAt?: Date;
-  completedAt?: Date;
-  duration?: number;
+  /** `null` clears the completion of an earlier attempt (`run.redrive`). */
+  completedAt?: Date | null;
+  /** `null` clears the duration of an earlier attempt (`run.redrive`). */
+  duration?: number | null;
   outputData?: unknown;
   config?: unknown;
   suspendedState?: unknown;

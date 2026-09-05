@@ -5,8 +5,13 @@ import { WorkflowBuilder } from "../../core/workflow.js";
 import { InMemoryStepLedger } from "../../testing/in-memory-step-ledger.js";
 import { createTestKernel } from "../utils/index.js";
 
+/**
+ * `from: { kind: "start" }` is the one redrive that replaces every stage
+ * record, so it is the one that clears every ledger: a restart is asked
+ * for precisely to run everything again, completed steps included.
+ */
 describe("durable ledger reset", () => {
-  it("clears old step records when run.rerunFrom starts from scratch", async () => {
+  it("clears old step records when run.redrive starts from the beginning", async () => {
     let calls = 0;
     const ledger = new InMemoryStepLedger();
     const stage = defineStage({
@@ -59,10 +64,10 @@ describe("durable ledger reset", () => {
     expect(await ledger.list(oldStage!.id)).toHaveLength(1);
 
     await kernel.dispatch({
-      type: "run.rerunFrom",
+      type: "run.redrive",
       idempotencyKey: "rerun-clear-again",
       workflowRunId: created.workflowRunId,
-      fromStageId: stage.id,
+      from: { kind: "start" },
     });
 
     expect(await ledger.list(oldStage!.id)).toEqual([]);
@@ -71,5 +76,16 @@ describe("durable ledger reset", () => {
       stage.id,
     );
     expect(newStage?.id).not.toBe(oldStage?.id);
+    expect(newStage?.status).toBe("PENDING");
+
+    // The step runs again on the new record.
+    await kernel.dispatch({
+      type: "job.execute",
+      workflowRunId: created.workflowRunId,
+      workflowId: workflow.id,
+      stageId: stage.id,
+      config: {},
+    });
+    expect(calls).toBe(2);
   });
 });
