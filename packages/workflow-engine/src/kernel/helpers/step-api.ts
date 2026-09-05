@@ -111,6 +111,18 @@ function nonNegativeInteger(value: number, name: string): number {
   return value;
 }
 
+/**
+ * The lease a `run` step asked for, in milliseconds. `lease` is canonical;
+ * `leaseMs` is the deprecated alias and yields to it when both are given.
+ */
+function resolveLeaseMs(opts: StepRunOptions, defaultLeaseMs: number): number {
+  const requested = opts.lease ?? opts.leaseMs;
+  return positiveDuration(
+    requested === undefined ? defaultLeaseMs : parseStepDuration(requested),
+    "lease",
+  );
+}
+
 /** Creates the StepApi attached to a single stage invocation. */
 export function createStepApi(options: CreateStepApiOptions): StepApi {
   let nextSeq = 0;
@@ -394,12 +406,11 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
       opts: StepRunOptions = {},
     ) {
       const invocation = begin(id, "run");
-      const leaseMs = positiveDuration(
-        opts.leaseMs ?? defaultLeaseMs,
-        "leaseMs",
-      );
+      const leaseMs = resolveLeaseMs(opts, defaultLeaseMs);
       const retries = nonNegativeInteger(opts.retries ?? 0, "retries");
-      const retryDelayMs = parseStepDuration(opts.retryDelayMs ?? 0);
+      const retryDelayMs = parseStepDuration(
+        opts.retryDelay ?? opts.retryDelayMs ?? 0,
+      );
       const onReclaim = opts.onReclaim ?? "rerun";
       const now = options.clock.now();
       const { stageRecordId } = requireLedger();
@@ -732,8 +743,7 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
       opts: StepRunOptions = {},
     ) {
       const leaseUntil =
-        options.clock.now().getTime() +
-        positiveDuration(opts.leaseMs ?? defaultLeaseMs, "leaseMs");
+        options.clock.now().getTime() + resolveLeaseMs(opts, defaultLeaseMs);
       const promise = impl.run(id, fn, opts);
       const entry: InFlightRun = { done: promise, leaseUntil };
       inFlight.add(entry);

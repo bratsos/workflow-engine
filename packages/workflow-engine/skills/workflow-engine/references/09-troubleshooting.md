@@ -106,7 +106,7 @@ run onto a version you do serve. See
 
 **Why:** the step the killed process was executing is still `running` in the ledger with a live lease, and a replay that meets a live lease raises `StepInFlight` and suspends rather than running the body a second time. A ledger row records no worker identity — the lease *is* the step's only liveness signal — so nothing can tell "the owner is dead" from "the owner is slow", and releasing it early would risk executing the step body twice, which is the one thing the ledger exists to prevent. This is deliberate, not a missing reaper: `lease.reapStale` releases *job* leases only.
 
-**The dial:** `StepRunOptions.leaseMs`, default **five minutes**. Set it per step to the longest you expect that body to take plus headroom — `ctx.step.run("submit", fn, { leaseMs: 30_000 })` recovers in about 30 s. Keep it generous for a step that legitimately runs for minutes; a lease shorter than the body means a replay re-runs work that was still in flight. See 12-durable-steps.md, "Leases, retries and deadlines".
+**The dial:** `StepRunOptions.lease`, default **five minutes**. Set it per step to the longest you expect that body to take plus headroom — `ctx.step.run("submit", fn, { lease: "30s" })` recovers in about 30 s. Keep it generous for a step that legitimately runs for minutes; a lease shorter than the body means a replay re-runs work that was still in flight. See 12-durable-steps.md, "Leases, retries and deadlines".
 
 ## One Bad Run Blocks Everything
 

@@ -30,7 +30,13 @@ export const STEP_API_SETTLE_IN_FLIGHT: unique symbol = Symbol.for(
 ) as typeof STEP_API_SETTLE_IN_FLIGHT;
 
 export interface StepRunOptions {
-  /** Lease held while `fn` executes. Defaults to five minutes. */
+  /**
+   * Lease held while `fn` executes. A number of milliseconds or a duration
+   * string (`"30s"`, `"5m"`). Defaults to five minutes. Also how long a
+   * crashed worker's step blocks a replay.
+   */
+  lease?: number | string;
+  /** @deprecated Use `lease`. Ignored when `lease` is also given. */
   leaseMs?: number;
   /** Number of retries after the first failed attempt. Defaults to zero. */
   retries?: number;
@@ -38,6 +44,8 @@ export interface StepRunOptions {
    * Delay before retrying a failed attempt. A number of milliseconds or a
    * duration string (`"30s"`, `"5m"`). Defaults to zero.
    */
+  retryDelay?: number | string;
+  /** @deprecated Use `retryDelay`. Ignored when `retryDelay` is also given. */
   retryDelayMs?: number | string;
   /**
    * What to do when this step's lease expired and another worker takes it
