@@ -1,0 +1,13 @@
+{
+  "mode": "pre",
+  "tag": "alpha",
+  "initialVersions": {
+    "workflow-engine-docs": "0.0.0",
+    "@bratsos/workflow-engine": "1.0.0-alpha.12",
+    "@bratsos/workflow-engine-console": "0.0.0",
+    "@bratsos/workflow-engine-host-node": "0.4.2",
+    "@bratsos/workflow-engine-host-remote": "0.2.2",
+    "@bratsos/workflow-engine-host-serverless": "0.3.2"
+  },
+  "changesets": []
+}
