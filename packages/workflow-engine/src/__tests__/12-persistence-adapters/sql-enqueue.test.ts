@@ -1,6 +1,5 @@
 import { readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
-import type { PrismaClient as PrismaClientType } from "@prisma/client";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
 import { defineStage } from "../../core/stage-factory.js";
@@ -8,6 +7,7 @@ import { defineWorkflow } from "../../core/workflow.js";
 import { executeJobWithHeartbeat } from "../../kernel/helpers/host-support.js";
 import { createKernel } from "../../kernel/kernel.js";
 import type { Clock } from "../../kernel/ports.js";
+import type { EnginePrismaClient } from "../../persistence/prisma/prisma-client-type.js";
 import {
   CollectingEventSink,
   InMemoryBlobStore,
@@ -16,6 +16,16 @@ import {
   createPrismaJobQueue,
   createPrismaWorkflowPersistence,
 } from "../../persistence/prisma/index.js";
+
+/**
+ * Typed structurally, like the adapters themselves, so this file typechecks
+ * without a generated `@prisma/client` (CI typechecks before generating one).
+ */
+type TestClient = EnginePrismaClient & {
+  $queryRawUnsafe<T = unknown>(query: string, ...values: unknown[]): Promise<T>;
+  $executeRawUnsafe(query: string, ...values: unknown[]): Promise<number>;
+  $disconnect(): Promise<void>;
+};
 
 const DATABASE_URL = process.env.DATABASE_URL;
 
@@ -27,7 +37,7 @@ if (!DATABASE_URL) {
   describe("I want SQL enqueue to agree with run.create", () => {
     const require = createRequire(import.meta.url);
     const { PrismaClient } = require("@prisma/client");
-    const prisma: PrismaClientType = new PrismaClient({
+    const prisma: TestClient = new PrismaClient({
       datasourceUrl: DATABASE_URL,
     });
 
@@ -207,7 +217,7 @@ if (!DATABASE_URL) {
         definitionVersion: workflow.definitionVersion,
       });
 
-      const outboxEvents = await prisma.outboxEvent.findMany();
+      const outboxEvents = await prisma.outboxEvent.findMany({});
       expect(outboxEvents).toHaveLength(2);
 
       const tsEvent = outboxEvents.find(
