@@ -240,4 +240,126 @@ describe("payload spill: end to end through the kernel", () => {
       await harness.blobStore.list("workflow-v2/spill/steps/"),
     ).toHaveLength(1);
   });
+
+  it("a replay reads a spilled run result and a spilled waitFor result back from the ledger", async () => {
+    const In = z.object({});
+    let bodyRuns = 0;
+    let polls = 0;
+    const workflow = defineWorkflow("step-spill-replay", { input: In })
+      .stage("stage-1", {
+        schemas: {
+          input: In,
+          output: z.object({ runLength: z.number(), waitLength: z.number() }),
+          config: z.object({}),
+        },
+        async execute(ctx) {
+          const big = await ctx.step.run("big", async () => {
+            bodyRuns++;
+            return { text: "r".repeat(2_000) };
+          });
+          // Not ready on the first poll, so the stage suspends and the
+          // replay must answer `big` from the ledger — through the
+          // reference, not the body.
+          const status = await ctx.step.waitFor("poll", {
+            poll: async () => ({ ready: ++polls > 1, text: "w".repeat(2_000) }),
+            ready: (value) => value.ready,
+            every: "1s",
+            timeout: "1m",
+          });
+          return {
+            output: {
+              runLength: big.text.length,
+              waitLength: status.text.length,
+            },
+          };
+        },
+      })
+      .build();
+
+    const harness = createTestHarness({
+      workflows: [workflow],
+      spillThresholdBytes: 1_000,
+    });
+    const result = await harness.run<{ runLength: number; waitLength: number }>(
+      "step-spill-replay",
+      {},
+    );
+
+    expect(result.status).toBe("COMPLETED");
+    expect(bodyRuns).toBe(1);
+    expect(polls).toBe(2);
+    expect(result.output).toEqual({ runLength: 2_000, waitLength: 2_000 });
+    const [stage] = await harness.persistence.getStagesByRun(
+      result.workflowRunId,
+    );
+    expect(
+      isSpillRef((await harness.stepLedger.get(stage!.id, "big"))?.result),
+    ).toBe(true);
+    expect(
+      isSpillRef((await harness.stepLedger.get(stage!.id, "poll"))?.result),
+    ).toBe(true);
+    // Two rows, two blobs, under one prefix per stage record.
+    expect(
+      await harness.blobStore.list(stepSpillPrefix(stage!.id)),
+    ).toHaveLength(2);
+  });
+
+  it("a redrive that clears the ledger removes the spilled blobs of the dropped rows", async () => {
+    const In = z.object({});
+    let failing = true;
+    const workflow = defineWorkflow("step-spill-redrive", { input: In })
+      .stage("stage-1", {
+        schemas: {
+          input: In,
+          output: z.object({ length: z.number() }),
+          config: z.object({}),
+        },
+        async execute(ctx) {
+          const big = await ctx.step.run("big", async () => ({
+            text: "z".repeat(2_000),
+          }));
+          if (failing) throw new Error("not yet");
+          return { output: { length: big.text.length } };
+        },
+      })
+      .build();
+
+    const harness = createTestHarness({
+      workflows: [workflow],
+      spillThresholdBytes: 1_000,
+    });
+    // Every job attempt replays `big` from the spilled blob; the run fails
+    // once the transport's attempt budget is spent.
+    const failed = await harness.run("step-spill-redrive", {});
+    expect(failed.status).toBe("FAILED");
+    const [before] = await harness.persistence.getStagesByRun(
+      failed.workflowRunId,
+    );
+    expect(
+      await harness.blobStore.list(stepSpillPrefix(before!.id)),
+    ).toHaveLength(1);
+
+    failing = false;
+    await harness.kernel.dispatch({
+      type: "run.redrive",
+      workflowRunId: failed.workflowRunId,
+      from: { kind: "start" },
+    });
+    // The superseded stage record's rows are cleared, and its blobs with them.
+    expect(
+      await harness.blobStore.list(stepSpillPrefix(before!.id)),
+    ).toHaveLength(0);
+
+    await harness.tickUntil(async () => {
+      const run = await harness.persistence.getRun(failed.workflowRunId);
+      return run?.status === "COMPLETED";
+    });
+    const [second] = await harness.persistence.getStagesByRun(
+      failed.workflowRunId,
+    );
+    expect(second!.id).not.toBe(before!.id);
+    expect(
+      await harness.blobStore.list(stepSpillPrefix(second!.id)),
+    ).toHaveLength(1);
+  });
 });

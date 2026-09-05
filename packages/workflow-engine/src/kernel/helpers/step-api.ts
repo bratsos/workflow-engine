@@ -11,6 +11,7 @@ import type {
 } from "../../core/steps.js";
 import {
   DuplicateStepKeyError,
+  neverAbortingSignal,
   parseStepDuration,
   STEP_API_PENDING_CONTROL_FLOW,
   STEP_API_SETTLE_IN_FLIGHT,
@@ -22,6 +23,7 @@ import {
   StepResultNotSerializable,
   StepSuspend,
   StepTimeoutError,
+  stageAbortReason,
 } from "../../core/steps.js";
 import { AIServicesNotConfiguredError } from "../errors.js";
 import type { Clock, StepLedger, StepRecord } from "../ports.js";
@@ -59,6 +61,12 @@ export interface CreateStepApiOptions {
   ) => void;
   /** Default lease for `run()` calls. Defaults to five minutes. */
   defaultLeaseMs?: number;
+  /**
+   * The stage invocation's abort signal (`ctx.abortSignal`), handed to every
+   * `run` body as `step.abortSignal` and checked by `waitFor` before it
+   * polls. Defaults to a signal that never fires.
+   */
+  abortSignal?: AbortSignal;
   /** Lazy accessor for the stage's AI helper, used by `step.ai.*`. */
   ai?: () => AIHelper;
   /**
@@ -195,6 +203,14 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
     options.defaultLeaseMs ?? DEFAULT_LEASE_MS,
     "defaultLeaseMs",
   );
+  const abortSignal = options.abortSignal ?? neverAbortingSignal();
+
+  /** The engine's abort reason as an error to throw, when there is one. */
+  function abortError(): Error | undefined {
+    if (!abortSignal.aborted) return undefined;
+    const reason: unknown = abortSignal.reason;
+    return reason instanceof Error ? reason : new Error(String(reason));
+  }
 
   function suspend(error: StepControlFlowError): never {
     pendingControlFlow ??= error;
@@ -581,6 +597,7 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
           attempt,
           isReclaim,
           heartbeat: extendLease,
+          abortSignal,
         });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -615,6 +632,23 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
         throw error;
       } finally {
         if (heartbeatTimer) clearInterval(heartbeatTimer);
+      }
+
+      // A body that finished after the run was cancelled produced a result
+      // nobody will keep: the job's outcome is discarded as a ghost. Record
+      // the attempt as failed with the cancellation as its error rather
+      // than as completed, and do not spend a retry on it — there is no
+      // replay coming. A lost job lease is different: the ledger row has
+      // its own lease and compare-and-set, so the outcome is still valid.
+      if (stageAbortReason(abortSignal) === "cancelled") {
+        const cancellation = abortError()!;
+        const cancelled = await commitOutcome(id, "running", {
+          status: "failed",
+          error: cancellation.message,
+          leaseExpiresAt: null,
+        });
+        if (cancelled.parked) return parkedResult<T>(cancelled.record);
+        throw cancellation;
       }
 
       const encoded = jsonRoundTrip(value, id);
@@ -659,6 +693,11 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
       if (current.getTime() >= record.deadlineAt.getTime()) {
         return parkedResult<T>(await timeout(id));
       }
+      // Nothing this poll could learn will be kept: the run is cancelled or
+      // another worker owns the job. The row stays pending for whoever
+      // replays it next.
+      const aborted = abortError();
+      if (aborted) throw aborted;
 
       let value: T;
       try {

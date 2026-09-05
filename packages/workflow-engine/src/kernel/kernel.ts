@@ -33,6 +33,7 @@ import type {
 import type {
   CommandResult,
   JobExecuteResult,
+  JobHeartbeatResult,
   KernelCommand,
   LeaseReapStaleResult,
   OutboxFlushResult,
@@ -52,6 +53,7 @@ import { IdempotencyInProgressError } from "./errors";
 import type { KernelEvent } from "./events";
 import { createLocalExecutor } from "./executor/local-executor.js";
 import { handleJobExecute } from "./handlers/job-execute";
+import { handleJobHeartbeat } from "./handlers/job-heartbeat";
 import { handleLeaseReapStale } from "./handlers/lease-reap-stale";
 import { handleOutboxFlush } from "./handlers/outbox-flush";
 import { handlePluginReplayDLQ } from "./handlers/plugin-replay-dlq";
@@ -285,6 +287,7 @@ type AnyCommandResult =
   | RunRedriveResult
   | RunListVersionsResult
   | JobExecuteResult
+  | JobHeartbeatResult
   | StagePollSuspendedResult
   | StepSignalResult
   | LeaseReapStaleResult
@@ -417,6 +420,15 @@ export function createKernel(config: KernelConfig): Kernel {
     // -----------------------------------------------------------------
     if (command.type === "stage.pollSuspended") {
       const result = await handleStagePollSuspended(command, deps);
+      return stripEvents(result);
+    }
+
+    // -----------------------------------------------------------------
+    // job.heartbeat routes directly — a lease touch and two reads, no
+    // outbox write, no idempotency, no transaction.
+    // -----------------------------------------------------------------
+    if (command.type === "job.heartbeat") {
+      const result = await handleJobHeartbeat(command, deps);
       return stripEvents(result);
     }
 

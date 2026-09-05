@@ -950,6 +950,7 @@ function createMockContext(overrides: {
     aiLogger: testAiLogger,
     onProgress: overrides.onProgress ?? (() => {}),
     step: createTestStepApi(),
+    abortSignal: new AbortController().signal,
     onLog: () => {},
     log: () => {},
     annotate: (() => {}) as StageContext<any, any, any>["annotate"],

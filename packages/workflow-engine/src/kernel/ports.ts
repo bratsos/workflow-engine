@@ -478,6 +478,14 @@ export interface ActivityRunInput {
   config: Record<string, unknown>;
   resumeState?: unknown;
   workflowContext: Record<string, unknown>;
+  /**
+   * Aborted when the run is cancelled or the job lease is lost while the
+   * stage executes; becomes `ctx.abortSignal`. Optional: a caller with no
+   * host loop (a direct `job.execute` dispatch, a replay from
+   * `stage.pollSuspended`) gets a signal that never fires. Not serialisable
+   * — a remote executor must drop it and build its own on the worker.
+   */
+  abortSignal?: AbortSignal;
 }
 
 /** Result from ActivityExecutor.run(). Exactly one of result / error is set. */

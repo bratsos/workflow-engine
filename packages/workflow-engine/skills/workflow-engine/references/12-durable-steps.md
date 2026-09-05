@@ -95,6 +95,7 @@ interface StepRunContext {
   readonly attempt: number;      // 1 on the first execution
   readonly isReclaim: boolean;   // an earlier execution of this body may have run
   heartbeat(): Promise<void>;    // extend the lease by `lease` from now; StepLeaseLostError if taken over
+  readonly abortSignal: AbortSignal; // same as ctx.abortSignal; see "Cancellation"
 }
 
 interface StepSignalOptions {
@@ -216,6 +217,54 @@ duplicate external effect is possible — so treat the annotation as the cue to
 look for one under that external key, and, if the effect cannot be
 deduplicated, to give the step `onReclaim: "fail"`.
 
+### Cancellation and lost leases: `ctx.abortSignal`
+
+`run.cancel` marks the run and its open stages `CANCELLED` and purges the
+queue, and the job that is executing at that moment has its outcome discarded
+by the ghost-job guard when it finishes. Without a signal that is *all* that
+happens: a body in the middle of a ten-minute model call, or a `waitFor`
+about to poll, runs to completion for nothing. `ctx.abortSignal` is that
+signal — an `AbortSignal` on the stage context, and the same object as
+`step.abortSignal` inside every `run` body (named `abortSignal`, not
+`signal`, so it is not confused with `waitForSignal`).
+
+```typescript
+async execute(ctx) {
+  const draft = await ctx.step.run("draft", (step) =>
+    ctx.ai.generateText("gpt", prompt, { abortSignal: step.abortSignal }),
+  );
+  const res = await fetch(url, { signal: ctx.abortSignal });
+  ...
+}
+```
+
+It is aborted from the host's **job lease heartbeat**: `executeJobWithHeartbeat`
+dispatches `job.heartbeat` on `jobHeartbeatIntervalMs` (default 60 s), which
+renews the lease and reports the run's status and whether this worker still
+holds the job. That beat is the only point in the host loop that touches
+persistence while a body runs, so it is where the body learns to stop; the
+latency is one heartbeat interval. `abortSignal.reason` is a
+`StageAbortedError` whose `reason` is:
+
+- `"cancelled"` — the run is `CANCELLED`. A `run` body that finishes after
+  this is **not** recorded as completed: the step row is written `failed`
+  with the cancellation as its error, no retry is spent (no replay is
+  coming), and the cancellation is thrown. `waitFor` checks the signal
+  before it calls `poll` and throws without polling; the wait row stays
+  `pending`.
+- `"lease-lost"` — the job lease was released (a stale-lease reap, the
+  absolute cap) or re-claimed by another worker. Another worker may already
+  be executing the same stage, and this job's outcome will be discarded as
+  superseded. A `run` body that finishes after this *is* still recorded —
+  the step row has its own lease and compare-and-set, so whichever worker
+  checkpoints first owns the outcome, as in the section above.
+
+`stageAbortReason(signal)` returns the reason or `undefined`. A context
+built without a host loop — a direct `job.execute` dispatch, a replay from
+`stage.pollSuspended`, a remote activity worker — carries a signal that never
+fires. Honouring it is optional: the engine discards a cancelled invocation's
+result either way, so the signal only saves the work.
+
 ### Concurrency
 
 Steps may run concurrently under `Promise.all`; a suspension lets in-flight
@@ -247,7 +296,7 @@ stable so replays line up.
 - **Stable, unique ids.** A step is keyed by `(stageRecordId, stepId)`, not by ordinal position — which is what makes the ledger survive renaming and reordering the code around a step. Ids must be the same string on every replay. Derive ids from data (`item-${doc.id}`), never from `Math.random()` or the current time. Asking for the same key twice in one stage invocation throws `DuplicateStepKeyError` naming the key and the position and kind of both uses: without the guard the second call would never run and would silently return the first call's result. `isDuplicateStepKeyError(error)` is exported alongside it, so a bundle boundary that breaks `instanceof` can still recognise it. It is a programming error, so the stage fails terminally without consuming retry attempts, and `ctx.step.ai.map` rethrows it instead of turning it into a failed item verdict — and rethrows it *in preference to* a suspension raised by another item of the same map, since a suspension recurs on the next replay while a duplicate key cannot fix itself, so preferring the control-flow signal would report the bug one replay late for nothing. The suspended item loses nothing: its ledger row is written before the control-flow error is thrown, so the replay after the fix answers it from the ledger. Inside a loop, build the key from something unique to the iteration; if a loop can genuinely ask for the same key twice, de-duplicate before the loop rather than relying on the ledger to notice.
 - **Never swallow step errors.** A `try/catch` around `ctx.step.*` must rethrow, or check `isStepControlFlowError(error)` and rethrow those. If a catch swallows one anyway, the step API records the pending suspension and the stage factory discards the returned value and suspends, logging one warning.
 - **Results are JSON.** `run` results round-trip through JSON: Dates become strings, `undefined` fields disappear, Maps and Sets lose their runtime types. A result that cannot be serialized throws `StepResultNotSerializable`.
-- **Results are small.** A step result is stored in the ledger row (`workflow_steps.result`) and read back on every replay of the stage; it should be a small JSON value — an id, a handle, a count, a few fields. Large payloads (downloaded documents, extracted text, model output in bulk) go to the blob store or the stage's `artifacts`, and the step returns the key: `const key = await ctx.step.run("download", async () => { const text = await fetch(url); await ctx.storage.put(blobKey, text); return blobKey; })`. Storing 30 KB of source text per step makes every poll of the stage re-read it and bloats the ledger table.
+- **Results are small, and large ones spill.** A step result is stored in the ledger row (`workflow_steps.result`) and read back on every replay of the stage; keep it a small JSON value — an id, a handle, a count, a few fields — because every poll re-reads it. A result whose JSON exceeds `spillThresholdBytes` (a `createKernel` option, default 64 KiB) is not rejected: the kernel writes it to the `blobStore` under `workflow-v2/spill/steps/<stageRecordId>/<stepId>.json` and the row keeps a `{ "$wfSpill": 1, key, bytes }` reference, resolved before the value reaches the stage, so `run`, `waitFor` and `ctx.step.ai.*` results (and a map item's failed verdict) read back the same on replay. Clearing a stage's ledger deletes its blobs; a partial clear (`clearExcept`) keeps the blobs of the rows it keeps. See [15-large-payloads.md](15-large-payloads.md). Spilling is a safety net, not a design: a body that downloads a document should still write it with `ctx.storage` or return it as an artifact and have the step return the key.
 - **Order warnings.** Each step gets a sequence number when first created. A replay that reaches a known step at a different position logs a warning that the stage body is no longer deterministic; fix the body rather than the warning. `ctx.step.ai.map` consumes one sequence number per item on every replay, including items answered from the ledger, and assigns them in item order — so the item *list* must be the same on every replay: a stage that filters items through an outside-the-ledger cache before mapping them changes the step positions between replays and trips this warning for every step after the map.
 - **Job retries replay the ledger, and re-open what failed.** A stage body that throws after some steps completed is retried by the job queue (up to the transport's `maxAttempts`); the kernel records the failed attempt as `PENDING` with the error on `errorMessage` and emits `stage:retrying` (not `stage:failed`, which is reserved for the attempt that makes the row `FAILED`), keeps the stage's ledger rows, and the retry replays them — a map of N items followed by a throw costs no extra model calls on the retry. A **new job attempt** also re-opens every `run` step and every map item that ended `failed` (the row goes back to `running` with no lease, so the replay re-claims it), so a `${id}:submit` that got a 503 or an item whose repair budget ran out is executed again rather than replayed as a stored failure; completed steps are never re-run. The row's `attempt` is never reset: it counts every execution of that step across job attempts (a row that read `failed attempt 3` re-runs as attempt 4), so the ledger row is the per-step history — read it together with the `job_queue` row's `attempt` (deliveries) and the `stage:retrying` events (one per retried job attempt). A reopened `run` step gets one fresh execution per job attempt; its own `retries` budget was consumed before the stage failed. A **replay of the same attempt** (a poll of a suspended stage) answers failures from the ledger. Timed-out waits and signals are terminal either way. `WorkflowStage.attempt` counts every attempt of that stage's own record: `run.rerunFrom` reruns and job retries alike (0 on the first execution, 1 on the first retry; the `job_queue` row's `attempt` counts deliveries). A downstream stage created by `run.transition` starts at 0 whatever the stages before it retried; a completed retry clears `errorMessage`.
 - **A redrive keeps the resumed stage's progress.** `run.redrive` with `from: { kind: "lastFailure" }` or `{ kind: "stage" }` (and the deprecated `run.rerunFrom`) reopens the resumed stage record in place rather than deleting it — see [14-redrive.md](14-redrive.md) — so its ledger, keyed by that record's id, survives: every `completed` row is kept and answered from the ledger (a stage that completed 9 of 10 steps re-runs only the tenth, and a kept step's external key is unchanged), every `run` row naming an external effect that did not complete is re-opened as described next, and the rest are dropped with `StepLedger.clearExcept`. Only `from: { kind: "start" }`, and the stages in groups after the resumed one, still delete the record and clear its ledger — not silently: every row carrying an `externalKey` that is actually dropped is recorded as `abandonedSteps` (step id, status, external key) on the `run.supersededAttempt` annotation, and as a `WARN` log on the run, so a batch a provider is still billing is still findable after the rows are gone. A ledger without `clearExcept` drops a reopened stage's rows too, with the same record of what was lost.
@@ -475,6 +524,12 @@ expect(result.status).toBe("COMPLETED");
 `{ modelKey, prompt, kind }`, and the armed scripts are shared with every
 child helper — so arming one on the harness's root helper fires inside the
 stage-scoped helper the kernel actually injects.
+
+`harness.cancel(workflowRunId, reason?)` dispatches `run.cancel`. The
+harness's `tick()` runs jobs under the real heartbeat on a short wall-clock
+interval (`jobHeartbeatIntervalMs`, default 10 ms), so a body can call
+`cancel` and then `await` its own `step.abortSignal` to test the cancellation
+path.
 
 ## Migrating an async-batch stage to steps
 

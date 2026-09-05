@@ -231,6 +231,11 @@ await harness.tickUntil(
 expect(await harness.steps.status("publish")).toBeUndefined();
 ```
 
+`harness.cancel(workflowRunId, reason?)` dispatches `run.cancel`. Jobs run
+under the real lease heartbeat on a short wall-clock interval
+(`jobHeartbeatIntervalMs`, default 10 ms), so a stage body can cancel its own
+run and `await` `step.abortSignal` to exercise the cancellation path.
+
 Caveats worth knowing before you rely on this:
 
 - Seeds match by step id across every stage.

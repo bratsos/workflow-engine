@@ -62,6 +62,10 @@ export async function runActivity(
       clock: { now: () => new Date() },
       onLog: (level, message) => log(level, message),
     }),
+    // The kernel's heartbeat-driven abort does not cross the worker
+    // boundary in v1: the signal is present (the context contract requires
+    // it) and never fires.
+    abortSignal: new AbortController().signal,
     onProgress: (u) =>
       progress.push({
         progress: u.progress,

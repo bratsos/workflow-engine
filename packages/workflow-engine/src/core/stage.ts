@@ -144,6 +144,18 @@ export interface StageContext<
    */
   step: StepApi;
 
+  /**
+   * Aborted when the run is cancelled while this invocation executes, or
+   * when the worker's job lease is lost. Named `abortSignal` (not `signal`)
+   * so it is not confused with `step.waitForSignal`. Pass it to `fetch`,
+   * `ctx.ai.*`, or anything else that can be interrupted; the engine
+   * discards the outcome of a cancelled invocation either way, so honouring
+   * it only saves the work. `abortSignal.reason` is a `StageAbortedError`
+   * whose `reason` is `"cancelled"` or `"lease-lost"`. Never fires for a
+   * context built without a host loop (a direct `job.execute` dispatch).
+   */
+  abortSignal: AbortSignal;
+
   // Progress reporting
   onProgress: (update: ProgressUpdate) => void;
 

@@ -11,6 +11,7 @@
  */
 
 import { z } from "zod";
+import { StageAbortedError } from "../../core/steps.js";
 import type { ServedDefinition } from "../../persistence/interface.js";
 import type { EventSinkStatus, OutboxFlushResult } from "../commands.js";
 import type { Kernel } from "../kernel.js";
@@ -215,9 +216,29 @@ export async function executeJobWithHeartbeat(
 
   // Heartbeat: periodically renew the job's lease while it executes so a
   // long-running stage (> staleLeaseThresholdMs) isn't picked up as stale
-  // and duplicated by releaseStaleJobs.
+  // and duplicated by releaseStaleJobs. The same beat is the only point in
+  // the host loop that touches persistence while a body runs, so it is
+  // also where the stage learns it should stop: a run cancelled under it,
+  // or a lease it no longer holds, aborts `ctx.abortSignal` with the
+  // reason — otherwise a long body runs to completion and only its outcome
+  // write is rejected.
+  const abort = new AbortController();
+  const beat = async (): Promise<void> => {
+    const status = await kernel.dispatch({
+      type: "job.heartbeat",
+      jobId: job.jobId,
+      workflowRunId: job.workflowRunId,
+      attempt: job.attempt,
+    });
+    if (abort.signal.aborted) return;
+    if (status.runStatus === "CANCELLED") {
+      abort.abort(new StageAbortedError("cancelled", job.workflowRunId));
+    } else if (!status.leaseHeld) {
+      abort.abort(new StageAbortedError("lease-lost", job.workflowRunId));
+    }
+  };
   const heartbeat = setInterval(
-    () => void jobTransport.touchJob(job.jobId).catch(() => {}),
+    () => void beat().catch(() => {}),
     jobHeartbeatIntervalMs,
   );
 
@@ -234,6 +255,7 @@ export async function executeJobWithHeartbeat(
       // (stage PENDING, ledger kept) instead of FAILED.
       attempt: job.attempt,
       maxAttempts: job.maxAttempts ?? HOST_DEFAULTS.maxAttempts,
+      abortSignal: abort.signal,
     });
   } catch (error) {
     // A job whose run / workflow / stage no longer exists is an orphan

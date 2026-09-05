@@ -40,10 +40,7 @@ import {
   type MockAIHelperFactory,
 } from "../__tests__/utils/mock-ai-helper.js";
 import type { Workflow } from "../core/workflow.js";
-import {
-  executeJobWithHeartbeat,
-  HOST_DEFAULTS,
-} from "../kernel/helpers/host-support.js";
+import { executeJobWithHeartbeat } from "../kernel/helpers/host-support.js";
 import type { PluginDefinition } from "../kernel/plugins.js";
 import type { EventSink, KernelServices, StepLedger } from "../kernel/ports.js";
 import type { FakeClock } from "../kernel/testing/fake-clock.js";
@@ -126,6 +123,14 @@ export interface CreateTestHarnessOptions {
   /** Forwarded to `createKernel`'s `spillThresholdBytes`. */
   spillThresholdBytes?: number;
   /**
+   * Real-time interval of the job lease heartbeat `tick()` runs under, in
+   * milliseconds. The heartbeat is what aborts `ctx.abortSignal` after
+   * `cancel()`, and it runs on the wall clock (not the fake one), so the
+   * default is short — 10 ms — so a body can `await` the abort. Raise it
+   * for a test that must not see heartbeat dispatches.
+   */
+  jobHeartbeatIntervalMs?: number;
+  /**
    * How far to advance the clock when nothing is runnable and no suspended
    * stage declares a `nextPollAt`. Defaults to one second.
    */
@@ -152,6 +157,7 @@ export function createTestHarness(options: CreateTestHarnessOptions = {}) {
   const workerId = options.workerId ?? "test-worker";
   const maxTicks = options.maxTicks ?? 100;
   const idleAdvanceMs = options.idleAdvanceMs ?? 1_000;
+  const jobHeartbeatIntervalMs = options.jobHeartbeatIntervalMs ?? 10;
 
   const base = createTestKernel(options.workflows ?? [], {
     clock,
@@ -235,7 +241,7 @@ export function createTestHarness(options: CreateTestHarnessOptions = {}) {
           // path the real hosts use.
           startedAt: job.startedAt,
         },
-        jobHeartbeatIntervalMs: HOST_DEFAULTS.jobHeartbeatIntervalMs,
+        jobHeartbeatIntervalMs,
         logPrefix: "[TestHarness]",
       });
       report.executed++;
@@ -297,6 +303,18 @@ export function createTestHarness(options: CreateTestHarnessOptions = {}) {
       status: "FAILED",
     });
     return failed[0]?.errorMessage ?? undefined;
+  }
+
+  /**
+   * Cancel a run through `run.cancel`. A body executing under `tick()` sees
+   * `ctx.abortSignal` abort with reason `"cancelled"` on the next heartbeat.
+   */
+  async function cancel(workflowRunId: string, reason?: string) {
+    return kernel.dispatch({
+      type: "run.cancel",
+      workflowRunId,
+      ...(reason !== undefined ? { reason } : {}),
+    });
   }
 
   /**
@@ -390,5 +408,6 @@ export function createTestHarness(options: CreateTestHarnessOptions = {}) {
     tickUntil,
     start,
     run,
+    cancel,
   };
 }

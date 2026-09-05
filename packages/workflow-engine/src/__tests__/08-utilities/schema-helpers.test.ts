@@ -39,6 +39,7 @@ async function withContext<TContext extends Record<string, unknown>>(
     config: {},
     onProgress() {},
     step: createTestStepApi(),
+    abortSignal: new AbortController().signal,
     onLog() {},
     log() {},
     annotate() {},

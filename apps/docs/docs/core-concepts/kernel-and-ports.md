@@ -55,7 +55,8 @@ const result = await kernel.dispatch({
 The key kernel commands are:
 * **`run.create`**: Creates a pending run record.
 * **`run.claimPending`**: Scans for and claims pending runs, then enqueues their first-stage jobs.
-* **`job.execute`**: Executes a single stage (runs `execute()`).
+* **`job.execute`**: Executes a single stage (runs `execute()`). Takes an optional `abortSignal` that becomes `ctx.abortSignal`.
+* **`job.heartbeat`**: One beat of a host's job lease heartbeat: renews the lease and reports the run's status and whether the worker still holds the job, which is what the host aborts `ctx.abortSignal` from.
 * **`run.transition`**: Evaluates completed stage outputs and transitions the workflow run to the next execution group or completes the run.
 * **`run.cancel`**: Authority that marks a run cancelled, sets open stages to cancelled, and purges the job queue.
 * **`run.rerunFrom`**: Deletes downstream stages and queues them for execution from a specific point.

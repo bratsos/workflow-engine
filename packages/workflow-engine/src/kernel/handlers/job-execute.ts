@@ -270,6 +270,7 @@ export async function handleJobExecute(
         config: config as Record<string, unknown>,
         resumeState: stageRecord.suspendedState,
         workflowContext,
+        ...(command.abortSignal ? { abortSignal: command.abortSignal } : {}),
       },
       deps,
     );
