@@ -137,12 +137,18 @@ expect(result.run.totalCost).toBe(stats.totalCost);
 `harness.cancel(workflowRunId, reason?)` dispatches `run.cancel`. Jobs run under the real job lease heartbeat on a short wall-clock interval (`jobHeartbeatIntervalMs`, default 10 ms), so a stage body can cancel its own run and `await` `step.abortSignal` to exercise the cancellation path:
 
 ```typescript
-const { workflowRunId } = await harness.start("long-wf", {});
-const first = harness.tick();            // starts executing the stage body
-await harness.cancel(workflowRunId, "operator");
-const report = await first;
-expect(report.outcomes[0]?.outcome).toBe("failed");
-expect((await harness.persistence.getRun(workflowRunId))?.status).toBe("CANCELLED");
+// inside the stage under test
+await ctx.step.run("slow", async (step) => {
+  await harness.cancel(ctx.workflowRunId, "operator");
+  await new Promise((resolve) => step.abortSignal.addEventListener("abort", resolve));
+  expect(stageAbortReason(step.abortSignal)).toBe("cancelled");
+  return "never recorded as completed";
+});
+
+// in the test
+const result = await harness.run("long-wf", {});
+expect(result.status).toBe("CANCELLED");
+expect(await harness.steps.status("slow")).toBe("failed");
 ```
 
 ---
