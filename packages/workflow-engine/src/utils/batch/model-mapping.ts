@@ -2,68 +2,52 @@
  * Model Mapping for Batch Providers
  *
  * Dynamically maps models from the registry to provider-specific batch API identifiers.
- * Uses the `supportsAsyncBatch` flag and OpenRouter ID prefix to determine compatibility.
+ * Uses the `supportsAsyncBatch` flag and catalog slug parsing.
  */
 
 import z from "zod";
 import {
   getModel,
   listModels,
-  ModelConfig,
-  ModelKey,
+  type ModelConfig,
+  type ModelKey,
 } from "../../ai/model-helper";
 
 // =============================================================================
 // Provider Types
 // =============================================================================
 
-export const BatchProviderName = z.enum(["google", "anthropic", "openai"]);
+const NATIVE_VENDORS: ReadonlySet<string> = new Set([
+  "google",
+  "anthropic",
+  "openai",
+]);
+
+export const BatchProviderName = z.enum([
+  "google",
+  "anthropic",
+  "openai",
+  "openrouter",
+]);
 export type BatchProviderName = z.infer<typeof BatchProviderName>;
 
 // =============================================================================
-// Dynamic Model Resolution
+// Slug Parsing Helpers
 // =============================================================================
 
 /**
- * Extract the native batch API model ID from an OpenRouter model ID
- *
- * OpenRouter IDs are typically: "provider/model-name"
- * Native batch APIs just need: "model-name"
+ * Parses an OpenRouter slug into a vendor and native model id.
+ * Splits on the first "/" and strips any trailing ":variant" suffix.
  */
-function extractNativeModelId(
-  openRouterId: string,
-  provider: BatchProviderName,
-): string {
-  const prefix = `${provider}/`;
-  if (openRouterId.startsWith(prefix)) {
-    return openRouterId.slice(prefix.length);
+function parseModelSlug(slug: string): { vendor: string; nativeId: string } {
+  const slashIndex = slug.indexOf("/");
+  const vendor = slashIndex !== -1 ? slug.slice(0, slashIndex) : "";
+  let nativeId = slashIndex !== -1 ? slug.slice(slashIndex + 1) : slug;
+  const colonIndex = nativeId.indexOf(":");
+  if (colonIndex !== -1) {
+    nativeId = nativeId.slice(0, colonIndex);
   }
-  // Handle Google's special case (google/ prefix but also gemini in ID)
-  if (provider === "google" && openRouterId.startsWith("google/")) {
-    return openRouterId.slice("google/".length);
-  }
-  return openRouterId;
-}
-
-/**
- * Get the provider from an OpenRouter model ID
- */
-function getProviderFromOpenRouterId(
-  openRouterId: string,
-): BatchProviderName | undefined {
-  if (openRouterId.startsWith("google/") || openRouterId.includes("gemini")) {
-    return "google";
-  }
-  if (
-    openRouterId.startsWith("anthropic/") ||
-    openRouterId.includes("claude")
-  ) {
-    return "anthropic";
-  }
-  if (openRouterId.startsWith("openai/") || openRouterId.includes("gpt")) {
-    return "openai";
-  }
-  return undefined;
+  return { vendor, nativeId };
 }
 
 // =============================================================================
@@ -89,14 +73,18 @@ export function getProviderModelId(
     return undefined;
   }
 
-  // Check if model belongs to this provider
-  const modelProvider = getProviderFromOpenRouterId(modelConfig.id);
-  if (modelProvider !== provider) {
+  const { vendor, nativeId } = parseModelSlug(modelConfig.id);
+  if (provider === "openrouter") {
+    // OpenRouter can only batch models it publishes batch pricing for. A
+    // native-vendor model that is batch-capable through @ai-sdk/* but has no
+    // ":batch" catalog row is NOT reachable through this transport.
+    return modelConfig.batchModelId ? modelConfig.id : undefined;
+  }
+  if (vendor !== provider) {
     return undefined;
   }
 
-  // Extract native model ID
-  return extractNativeModelId(modelConfig.id, provider);
+  return nativeId;
 }
 
 /**
@@ -109,9 +97,13 @@ function getDefaultModelForProvider(provider: BatchProviderName): string {
   });
 
   for (const { config } of models) {
-    const modelProvider = getProviderFromOpenRouterId(config.id);
-    if (modelProvider === provider) {
-      return extractNativeModelId(config.id, provider);
+    const { vendor, nativeId } = parseModelSlug(config.id);
+    if (provider === "openrouter") {
+      if (config.batchModelId) return config.id;
+      continue;
+    }
+    if (vendor === provider) {
+      return nativeId;
     }
   }
 
@@ -149,16 +141,29 @@ export function resolveModelForProvider(
     );
   }
 
-  // Check if model is compatible with requested provider
-  const modelProvider = getProviderFromOpenRouterId(modelConfig.id);
-  if (modelProvider !== provider) {
+  const { vendor, nativeId } = parseModelSlug(modelConfig.id);
+
+  if (provider === "openrouter") {
+    if (!modelConfig.batchModelId) {
+      const hint = NATIVE_VENDORS.has(vendor)
+        ? `Use the native "${vendor}" provider instead: ai.batch(modelKey, "${vendor}").`
+        : `Pick a model that has a ":batch" variant in OpenRouter's catalog.`;
+      throw new Error(
+        `OpenRouter has no batch pricing for "${modelKey}" (${modelConfig.id}) - ` +
+          `the catalog has no "${modelConfig.id}:batch" row. ${hint}`,
+      );
+    }
+    return modelConfig.id;
+  }
+
+  if (vendor !== provider) {
     throw new Error(
-      `Model "${modelKey}" belongs to ${modelProvider || "unknown"} provider, ` +
+      `Model "${modelKey}" belongs to ${vendor || "unknown"} provider, ` +
         `not ${provider}. Use a ${provider} model or change the batch provider.`,
     );
   }
 
-  return extractNativeModelId(modelConfig.id, provider);
+  return nativeId;
 }
 
 /**
@@ -172,7 +177,13 @@ export function getSupportedModels(provider: BatchProviderName): string[] {
   });
 
   return models
-    .filter(({ config }) => getProviderFromOpenRouterId(config.id) === provider)
+    .filter(({ config }) => {
+      const { vendor } = parseModelSlug(config.id);
+      if (provider === "openrouter") {
+        return true;
+      }
+      return vendor === provider;
+    })
     .map(({ config }) => config.id);
 }
 
@@ -199,7 +210,12 @@ export function getBestProviderForModel(
     return undefined;
   }
 
-  return getProviderFromOpenRouterId(modelConfig.id);
+  const { vendor } = parseModelSlug(modelConfig.id);
+  if (vendor === "google" || vendor === "anthropic" || vendor === "openai") {
+    return vendor;
+  }
+
+  return "openrouter";
 }
 
 /**

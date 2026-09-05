@@ -5,27 +5,27 @@ title: Batch Operations
 
 # Batch Operations
 
-AI batch APIs (such as OpenAI Batch, Anthropic Batch, or Google Batch) offer a **50% discount** on API costs. However, these jobs run asynchronously, often taking anywhere from 10 minutes to 24 hours to execute. 
+AI batch APIs (such as Google Batch, Anthropic Batch, OpenAI Batch, or OpenRouter Batch) offer substantial cost discounts for non-realtime workloads. However, these jobs run asynchronously, taking anywhere from minutes to 24 hours to execute.
 
 **workflow-engine** includes first-class support for asynchronously running batch operations. By leveraging the engine's native **suspend/resume** architecture, a workflow stage can submit an AI batch job, release its database lease to suspend the process, and wake up once the provider indicates completion.
 
 ---
 
-## The Batch lifecycle
+## The Batch Lifecycle
 
 A typical batch stage is defined using `defineAsyncBatchStage`:
-1. **`execute` (First Run)**: Submits a list of prompts via `ai.batch(model).submit([...])` and returns `suspended: true` along with the batch ID.
-2. **Suspension**: The engine marks the stage as `SUSPENDED` and deletes the active job queue record. No resources are consumed.
+1. **`execute` (First Run)**: Submits a list of prompts via `ai.batch(model).submit([...])` and returns `suspended: true` along with the primary batch ID and versioned batch refs in `metadata.batchRefs`.
+2. **Suspension**: The engine marks the stage as `SUSPENDED` and deletes the active job queue record. No server resources are consumed.
 3. **Polling**: The host runtime calls `stage.pollSuspended` (triggered via orchestration ticks). This runs `checkCompletion()`, which checks the provider's batch status.
-4. **`checkCompletion` (Ready)**: When the provider completes the batch, `checkCompletion` retrieves the results, validates them, and returns `ready: true`.
-5. **Resume**: The kernel restores the workflow run to `RUNNING` status and schedules the next downstream stage.
+4. **`checkCompletion` (Ready)**: When the provider completes the batch, `checkCompletion` retrieves results via `getResults(batchId, metadata)` (with schemas re-supplied for validation) and returns `ready: true`.
+5. **Resume**: The kernel restores the workflow run to `RUNNING` status and schedules downstream stages.
 
 ---
 
 ## Code Implementation
 
 ```typescript
-import { defineAsyncBatchStage } from "@bratsos/workflow-engine";
+import { defineAsyncBatchStage, createAIHelper } from "@bratsos/workflow-engine";
 import { z } from "zod";
 
 const FeedbackItemSchema = z.object({
@@ -55,11 +55,11 @@ export const batchAnalysisStage = defineAsyncBatchStage({
 
   async execute(ctx) {
     // If we already have the cached output, return immediately
-    if (ctx.resumeState?.cachedResult) {
-      return { output: ctx.resumeState.cachedResult };
+    if (ctx.resumeState) {
+      return { output: await ctx.storage.load("batch-result") };
     }
 
-    const ai = ctx.createAIHelper(`workflow.${ctx.workflowRunId}.stage.${ctx.stageId}`);
+    const ai = createAIHelper(`workflow.${ctx.workflowRunId}.stage.${ctx.stageId}`, aiCallLogger);
     const batch = ai.batch("gemini-2.5-flash", "google");
 
     // Submit batch requests to the provider
@@ -71,13 +71,17 @@ export const batchAnalysisStage = defineAsyncBatchStage({
       }))
     );
 
-    // Suspend the stage execution and save the batch handler state
+    // Suspend stage execution and save the batch handle state
     return {
       suspended: true,
       state: {
         batchId: handle.id,
-        provider: handle.provider,
-        modelKey: "gemini-2.5-flash"
+        metadata: {
+          provider: handle.provider,
+          modelKey: "gemini-2.5-flash",
+          batchRefs: handle.refs,
+          requestIds: ctx.input.items.map(item => item.id),
+        },
       },
       pollConfig: {
         pollInterval: 60_000,      // Check status every 60s
@@ -87,10 +91,13 @@ export const batchAnalysisStage = defineAsyncBatchStage({
   },
 
   async checkCompletion(suspendedState, ctx) {
-    const ai = ctx.createAIHelper(`workflow.${ctx.workflowRunId}.stage.${ctx.stageId}`);
-    const batch = ai.batch(suspendedState.modelKey, suspendedState.provider);
+    const ai = createAIHelper(`workflow.${ctx.workflowRunId}.stage.${ctx.stageId}`, aiCallLogger);
+    const batch = ai.batch(
+      suspendedState.metadata?.modelKey as string,
+      suspendedState.metadata?.provider as any
+    );
 
-    const status = await batch.getStatus(suspendedState.batchId);
+    const status = await batch.getStatus(suspendedState.batchId, suspendedState.metadata);
     
     if (status.status === "processing" || status.status === "pending") {
       return { ready: false }; // Poll again on the next tick
@@ -101,20 +108,22 @@ export const batchAnalysisStage = defineAsyncBatchStage({
     }
 
     // Batch is complete. Retrieve and validate outputs.
-    // NOTE: Re-supply the schemas here because the Zod object is not serialized in DB state
+    // NOTE: Re-supply the schemas here because Zod schemas do not round-trip DB JSON state
+    const requestIds = (suspendedState.metadata?.requestIds as string[]) ?? [];
     const results = await batch.getResults(suspendedState.batchId, {
+      ...suspendedState.metadata,
       schemas: Object.fromEntries(
-        ctx.input.items.map(item => [item.id, AnalysisResultSchema])
+        requestIds.map(id => [id, AnalysisResultSchema])
       )
     });
 
     const parsedOutput = results.map(res => {
       if (res.status === "failed") {
-        throw new Error(`Item ${res.id} failed validation: ${res.error}`);
+        throw new Error(`Item ${res.id} failed: ${res.error}`);
       }
       return {
         id: res.id,
-        analysis: res.result // Fully typed as z.infer<typeof AnalysisResultSchema>
+        analysis: res.result // Validated and typed as z.infer<typeof AnalysisResultSchema>
       };
     });
 
@@ -128,41 +137,76 @@ export const batchAnalysisStage = defineAsyncBatchStage({
 
 ---
 
-## Discriminated Union Result Types (v0.11+)
+## Batch Providers & Options
 
-In `v0.11`, `AIBatchResult` was updated to a strict **discriminated union** to prevent silent evaluation errors.
+Batch execution supports four providers:
+
+| Provider | Description | Required Dependencies |
+|----------|-------------|-----------------------|
+| `google` | Gemini models via AI SDK | `@ai-sdk/google` (included by default) |
+| `anthropic` | Claude models via AI SDK | `@ai-sdk/anthropic` (optional peer >=4.0.46) |
+| `openai` | OpenAI models via AI SDK | `@ai-sdk/openai` (optional peer >=4.0.53) |
+| `openrouter` | OpenRouter Batch API (HTTP) | None (direct fetch) |
+
+> **Pricing:** Batch pricing is per-model (stored in `batchInputCostPerMillion` and `batchOutputCostPerMillion` in the catalog), not a flat 50% discount. Many models offer 50% to 75% discounts, while some variants may differ.
+
+### Injected Options (`BatchOptions`)
+
+When running in edge or serverless environments where `process.env` may not exist, pass `BatchOptions` as the third parameter to `ai.batch()`:
 
 ```typescript
-type AIBatchResult<T> =
+const batch = ai.batch("openai/gpt-4o", "openrouter", {
+  apiKey: ctx.config.openRouterApiKey,
+  baseURL: "https://openrouter.ai/api/beta",
+  maxRequestsPerBatch: 500,
+});
+```
+
+### OpenRouter Batch Transport Caveats
+
+- **Text only:** Multimodal inputs (images, audio, video, files) are rejected.
+- **24-hour expiration without partial recovery:** OpenRouter returns `results: null` if a batch expires at 24 hours. No partial results are recoverable. Batches are automatically partitioned into chunks of `maxRequestsPerBatch` (default: 500) to bound risk.
+- **No cancel or list endpoint:** OpenRouter batch API does not support remote cancellation or listing batches.
+- **No idempotency key:** POST submissions are not auto-retried.
+- **Schema partitioning:** Google models require all requests in a single batch to share the same response schema; `submit()` handles this by partitioning requests by schema automatically.
+
+---
+
+## Discriminated Union Result Types
+
+`AIBatchResult` is a strict **discriminated union**:
+
+```typescript
+type AIBatchResult<T = string> =
   | {
       id: string;
       prompt: string;
-      result: T;            // Present ONLY on success
+      result: T;            // Present ONLY on success (unvalidated unless schema was re-supplied)
       inputTokens: number;
       outputTokens: number;
       status: "succeeded";
       error?: undefined;
+      validated?: boolean;  // True when validated against re-supplied schema; false otherwise
     }
   | {
       id: string;
       prompt: string;
-      result?: undefined;   // Under v0.11, this is undefined on failure (not a placeholder object)
+      result?: undefined;   // Undefined on failure
       inputTokens: number;
       outputTokens: number;
       status: "failed";
-      error: string;        // Present ONLY on failure
+      error: string;        // Error message describing failure
+      validated?: boolean;  // Always false on failure
     };
 ```
-
-> [!WARNING]
-> Prior to `v0.11`, failed batch results returned an empty placeholder object (`{} as T`) inside the `.result` property. Ensure your code verifies that `res.status === "succeeded"` before accessing `res.result`.
 
 ---
 
 ## Schema Re-Supply Across Process Boundaries
 
-Zod schemas contain JavaScript functions and regular expressions, which makes them **non-serializable**. 
+Zod schemas contain JavaScript functions and regular expressions, which makes them **non-serializable**:
 * When you submit a batch, the Zod schemas are converted to JSON Schema specs for the LLM providers.
-* When the stage suspends, only the `suspendedState` JSON is stored in the database.
+* When the stage suspends, only JSON-serializable `suspendedState` is stored in the database.
 * When a host process wakes up to resume the stage and calls `batch.getResults()`, it has lost the original Zod schema objects.
-* To apply schema parsing and validation during recovery, you must **re-supply the schemas** map (mapping request IDs to their respective Zod schemas) as an option to `batch.getResults(batchId, { schemas })`. If schemas are omitted, the results are returned as unvalidated JSON strings.
+* To apply schema parsing and validation during recovery, you must **re-supply the schemas** map via `batch.getResults(batchId, { schemas: { [requestId]: schema } })`.
+* If schemas are omitted at retrieval time, results return with `validated: false` and a `WARN` is logged. Re-supplying schemas ensures `validated: true` and validates outputs against your Zod types.

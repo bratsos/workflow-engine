@@ -42,7 +42,9 @@ If a version bump introduces a database schema change (like adding a table or mo
 
 Follow the guides below to migrate your code:
 
-* [Migrating from 0.10 to 0.11](./migrate-0.10-to-0.11.md) (Latest)
+* [Migrating from 0.12 to 0.13](./migrate-0.12-to-0.13.md) (Latest)
+* [Migrating from 0.11 to 0.12](./migrate-0.11-to-0.12.md)
+* [Migrating from 0.10 to 0.11](./migrate-0.10-to-0.11.md)
 * [Migrating from 0.9 to 0.10](./migrate-0.9-to-0.10.md)
 * [Migrating from 0.8 to 0.9](./migrate-0.8-to-0.9.md)
 * [Migrating from 0.7 to 0.8](./migrate-0.7-to-0.8.md)

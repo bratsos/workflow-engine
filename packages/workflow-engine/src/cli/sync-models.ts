@@ -18,32 +18,17 @@ import { dirname, join, resolve } from "path";
 import { pathToFileURL } from "url";
 import { type ModelConfig, type ModelSyncConfig } from "../ai/model-helper";
 
-interface OpenRouterModel {
-  id: string;
-  name: string;
-  description?: string;
-  context_length?: number;
-  pricing?: {
-    prompt?: string;
-    completion?: string;
-  };
-  supported_parameters: string[];
-  top_provider?: {
-    context_length?: number;
-    max_completion_tokens?: number;
-  };
-}
-
-interface OpenRouterResponse {
-  data: OpenRouterModel[];
-}
+import {
+  type OpenRouterModel,
+  type OpenRouterResponse,
+  toModelConfig,
+} from "./model-catalog";
 
 // Main
 async function main() {
   const apiKey = process.env.OPENROUTER_API_KEY;
   if (!apiKey) {
-    console.error("❌ OPENROUTER_API_KEY environment variable is required");
-    process.exit(1);
+    console.log("ℹ️  Running unauthenticated (OPENROUTER_API_KEY not set)");
   }
 
   const cwd = process.cwd();
@@ -70,60 +55,51 @@ async function main() {
   const excludePatterns = config.exclude || [];
   const customModels = config.customModels || {};
 
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+  };
+
   // Fetch models from OpenRouter
   console.log("🔄 Fetching models from OpenRouter API...");
-  const response = await fetch("https://openrouter.ai/api/v1/models", {
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-  });
+  const allModels: OpenRouterModel[] = [];
+  let nextUrl: string | null =
+    "https://openrouter.ai/api/v1/models?output_modalities=all";
 
-  if (!response.ok) {
-    console.error(
-      `❌ OpenRouter API error: ${response.status} ${response.statusText}`,
-    );
-    process.exit(1);
+  while (nextUrl) {
+    const url: string = nextUrl.startsWith("http")
+      ? nextUrl
+      : `https://openrouter.ai${nextUrl.startsWith("/") ? "" : "/"}${nextUrl}`;
+    const response = await fetch(url, { headers });
+
+    if (!response.ok) {
+      console.error(
+        `❌ OpenRouter API error: ${response.status} ${response.statusText}`,
+      );
+      process.exit(1);
+    }
+
+    const pageData = (await response.json()) as OpenRouterResponse;
+    if (Array.isArray(pageData.data)) {
+      allModels.push(...pageData.data);
+    }
+    nextUrl = pageData.links?.next ?? null;
   }
 
-  const data = (await response.json()) as OpenRouterResponse;
-  console.log(`✅ Fetched ${data.data.length} models from OpenRouter`);
+  console.log(`✅ Fetched ${allModels.length} models from OpenRouter`);
 
-  // Fetch embedding models from OpenRouter
-  console.log("🔄 Fetching embedding models from OpenRouter API...");
-  const embeddingResponse = await fetch(
-    "https://openrouter.ai/api/v1/embeddings/models",
-    {
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-    },
+  // Build a Map of all models in the catalog (including :batch and :free variants)
+  const catalogMap = new Map<string, OpenRouterModel>(
+    allModels.map((m) => [m.id, m]),
   );
 
-  let embeddingModelIds = new Set<string>();
-  if (embeddingResponse.ok) {
-    const embeddingData =
-      (await embeddingResponse.json()) as OpenRouterResponse;
-    console.log(
-      `✅ Fetched ${embeddingData.data.length} embedding models from OpenRouter`,
-    );
-    // Track embedding model IDs for later marking
-    embeddingModelIds = new Set(embeddingData.data.map((m) => m.id));
-    // Add embedding models that might not be in the main list
-    for (const model of embeddingData.data) {
-      if (!data.data.find((m) => m.id === model.id)) {
-        data.data.push(model);
-      }
+  // Filter models - exclude :batch and :free variants, apply include patterns first, then exclude
+  const filteredModels = allModels.filter((model) => {
+    // Exclude variant suffixes from becoming top-level registry keys
+    if (model.id.includes(":batch") || model.id.includes(":free")) {
+      return false;
     }
-  } else {
-    console.warn(
-      `⚠️  Could not fetch embedding models: ${embeddingResponse.status}`,
-    );
-  }
 
-  // Filter models - include patterns first, then exclude
-  const filteredModels = data.data.filter((model) => {
     // If include patterns are specified, model must match at least one
     if (includePatterns.length > 0) {
       let matchesInclude = false;
@@ -155,51 +131,14 @@ async function main() {
   });
 
   console.log(
-    `📊 After filtering: ${filteredModels.length} models (excluded ${data.data.length - filteredModels.length})`,
+    `📊 After filtering: ${filteredModels.length} models (excluded ${allModels.length - filteredModels.length})`,
   );
 
   // Transform to ModelConfig
   const models: Record<string, ModelConfig> = {};
 
   for (const model of filteredModels) {
-    // Convert per-token pricing to per-million
-    const promptPrice = parseFloat(model.pricing?.prompt || "0");
-    const completionPrice = parseFloat(model.pricing?.completion || "0");
-
-    // Check if model supports async batch (Anthropic, OpenAI, or Google Gemini)
-    const supportsBatch =
-      model.id.startsWith("anthropic/") ||
-      (model.id.startsWith("openai/") && !model.id.includes("gpt-oss")) ||
-      (model.id.startsWith("google/") && model.id.includes("gemini"));
-
-    // Check if this is an embedding model
-    const isEmbedding = embeddingModelIds.has(model.id);
-
-    // Check for tool and structured output support from supported_parameters
-    const supportsTools =
-      model.supported_parameters?.includes("tools") || false;
-    const supportsStructuredOutputs =
-      model.supported_parameters?.includes("structured_outputs") || false;
-
-    models[model.id] = {
-      id: model.id,
-      name: model.name,
-      inputCostPerMillion: Math.round(promptPrice * 1_000_000 * 10000) / 10000,
-      outputCostPerMillion:
-        Math.round(completionPrice * 1_000_000 * 10000) / 10000,
-      provider: "openrouter",
-      description: model.description,
-      contextLength: model.top_provider?.context_length || model.context_length,
-      maxCompletionTokens: model.top_provider?.max_completion_tokens,
-      ...(isEmbedding && { isEmbeddingModel: true }),
-      ...(supportsTools && { supportsTools: true }),
-      ...(supportsStructuredOutputs && { supportsStructuredOutputs: true }),
-      ...(supportsBatch &&
-        !isEmbedding && {
-          supportsAsyncBatch: true,
-          batchDiscountPercent: 50,
-        }),
-    };
+    models[model.id] = toModelConfig(model, catalogMap);
   }
 
   // Merge custom models
@@ -249,8 +188,32 @@ function generateTypeScript(models: Record<string, ModelConfig>): string {
         `    supportsTools: ${config.supportsTools || false},`,
         `    supportsStructuredOutputs: ${config.supportsStructuredOutputs || false},`,
         `    supportsAsyncBatch: ${config.supportsAsyncBatch || false},`,
-        `    batchDiscountPercent: ${config.batchDiscountPercent || 0},`,
-        `    contextLength: ${config.contextLength || 0},`,
+        ...(config.batchModelId !== undefined
+          ? [`    batchModelId: "${config.batchModelId}",`]
+          : []),
+        ...(config.batchInputCostPerMillion !== undefined
+          ? [
+              `    batchInputCostPerMillion: ${config.batchInputCostPerMillion},`,
+            ]
+          : []),
+        ...(config.batchOutputCostPerMillion !== undefined
+          ? [
+              `    batchOutputCostPerMillion: ${config.batchOutputCostPerMillion},`,
+            ]
+          : []),
+        ...(config.batchDiscountPercent !== undefined
+          ? [`    batchDiscountPercent: ${config.batchDiscountPercent},`]
+          : []),
+        ...(config.longContextTier !== undefined
+          ? [
+              `    longContextTier: {`,
+              `      minPromptTokens: ${config.longContextTier.minPromptTokens},`,
+              `      inputCostPerMillion: ${config.longContextTier.inputCostPerMillion},`,
+              `      outputCostPerMillion: ${config.longContextTier.outputCostPerMillion},`,
+              `    },`,
+            ]
+          : []),
+        `    contextLength: ${config.contextLength ?? 0},`,
         ...(config.maxCompletionTokens != null
           ? [`    maxCompletionTokens: ${config.maxCompletionTokens},`]
           : []),

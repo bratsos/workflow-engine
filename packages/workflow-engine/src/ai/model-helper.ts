@@ -31,7 +31,28 @@ export interface ModelConfig {
   provider: string;
   description?: string;
   supportsAsyncBatch?: boolean;
-  batchDiscountPercent?: number; // e.g., 50 for Google Batch (50% off)
+  /**
+   * Vendor-documented batch discount for the NATIVE transports (OpenAI Batch,
+   * Anthropic Message Batches, Gemini Batch are all 50% off). Applied only
+   * when batching through one of those vendors, or when no absolute
+   * `batch*CostPerMillion` price is known. The OpenRouter transport always
+   * uses the absolute prices below instead - its multipliers are not uniform.
+   * Populated by `workflow-engine-sync` only for vendors with a documented
+   * discount; never guessed.
+   */
+  batchDiscountPercent?: number;
+  /** The ":batch" sibling slug in OpenRouter's catalog, when one exists. */
+  batchModelId?: string;
+  /** Absolute price of the ":batch" variant, per 1M input tokens. Authoritative; prefer over batchDiscountPercent. */
+  batchInputCostPerMillion?: number;
+  /** Absolute price of the ":batch" variant, per 1M output tokens. */
+  batchOutputCostPerMillion?: number;
+  /** Long-context pricing tier from OpenRouter `pricing.overrides`, when the override is keyed on prompt length. */
+  longContextTier?: {
+    minPromptTokens: number;
+    inputCostPerMillion: number;
+    outputCostPerMillion: number;
+  };
   isEmbeddingModel?: boolean; // true for embedding models
   supportsTools?: boolean; // true if model supports function calling
   supportsStructuredOutputs?: boolean; // true if model supports JSON schema outputs
@@ -342,8 +363,19 @@ export function calculateCost(
 } {
   const model = getModel(modelKey);
 
-  const inputCost = (inputTokens / 1_000_000) * model.inputCostPerMillion;
-  const outputCost = (outputTokens / 1_000_000) * model.outputCostPerMillion;
+  const tier = model.longContextTier;
+  const useLongContextTier =
+    tier !== undefined && inputTokens >= tier.minPromptTokens;
+
+  const inputRate = useLongContextTier
+    ? tier.inputCostPerMillion
+    : model.inputCostPerMillion;
+  const outputRate = useLongContextTier
+    ? tier.outputCostPerMillion
+    : model.outputCostPerMillion;
+
+  const inputCost = (inputTokens / 1_000_000) * inputRate;
+  const outputCost = (outputTokens / 1_000_000) * outputRate;
   const totalCost = inputCost + outputCost;
 
   return {

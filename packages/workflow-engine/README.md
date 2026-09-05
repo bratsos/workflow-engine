@@ -59,18 +59,17 @@ A **type-safe, distributed workflow engine** for AI-orchestrated processes. Feat
 ### Optional Peer Dependencies
 
 ```bash
-# For Google AI
-npm install @google/genai
+# For Anthropic Claude (native or batch)
+npm install @ai-sdk/anthropic
 
-# For OpenAI
-npm install openai
-
-# For Anthropic
-npm install @anthropic-ai/sdk
+# For OpenAI Models (native or batch)
+npm install @ai-sdk/openai
 
 # For Prisma persistence (recommended)
 npm install @prisma/client
 ```
+
+> `@ai-sdk/google` is included as a direct dependency of `@bratsos/workflow-engine`. OpenRouter models and batch processing run via direct HTTP transport without extra vendor SDKs.
 
 ---
 
@@ -225,6 +224,11 @@ model AICall {
   cost          Float
   metadata      Json?
 
+  batchId      String?
+  requestId    String?
+
+  @@unique([batchId, requestId], map: "ai_calls_batch_request_unique")
+  @@index([batchId])
   @@index([topic])
   @@map("ai_calls")
 }
@@ -451,7 +455,7 @@ A stage is the atomic unit of work. Every stage has typed input, output, and con
 | Mode | Use Case |
 |------|----------|
 | `sync` (default) | Most stages - execute and return immediately |
-| `async-batch` | Long-running batch APIs (OpenAI Batch, Google Batch, etc.) |
+| `async-batch` | Long-running batch APIs (AI SDK batch for Google/Anthropic/OpenAI, or OpenRouter Batch) |
 
 ### Workflows
 
@@ -637,7 +641,7 @@ const { text, reasoning } = await ai.generateText("anthropic/claude-opus-4.8", p
 ### Long-Running Batch Jobs
 
 ```typescript
-import { defineAsyncBatchStage } from "@bratsos/workflow-engine";
+import { defineAsyncBatchStage, createAIHelper } from "@bratsos/workflow-engine";
 
 export const batchStage = defineAsyncBatchStage({
   id: "batch-process",
@@ -647,29 +651,39 @@ export const batchStage = defineAsyncBatchStage({
 
   async execute(ctx) {
     if (ctx.resumeState) {
-      return { output: await fetchBatchResults(ctx.resumeState.batchId) };
+      const cached = await ctx.storage.load("batch-result");
+      if (cached) return { output: cached };
     }
 
-    const batch = await submitBatch(ctx.input.prompts);
+    const ai = createAIHelper(`batch.${ctx.workflowRunId}`, aiCallLogger);
+    const batch = ai.batch(ctx.config.model, "google");
+    const handle = await batch.submit(
+      ctx.input.prompts.map((p, i) => ({ id: `req-${i}`, prompt: p }))
+    );
+
     return {
       suspended: true,
       state: {
-        batchId: batch.id,
+        batchId: handle.id,
         submittedAt: new Date().toISOString(),
         pollInterval: 3600000,
         maxWaitTime: 86400000,
+        metadata: { batchRefs: handle.refs },
       },
       pollConfig: { pollInterval: 3600000, maxWaitTime: 86400000, nextPollAt: new Date(Date.now() + 3600000) },
     };
   },
 
-  async checkCompletion(state) {
-    const status = await checkBatchStatus(state.batchId);
-    if (status === "completed") {
-      const output = await fetchBatchResults(state.batchId);
+  async checkCompletion(state, ctx) {
+    const ai = createAIHelper(`batch.${ctx.workflowRunId}`, aiCallLogger);
+    const batch = ai.batch(ctx.config?.model ?? "gemini-2.5-flash", "google");
+    const status = await batch.getStatus(state.batchId, state.metadata);
+    if (status.status === "completed") {
+      const results = await batch.getResults(state.batchId, state.metadata);
+      const output = { results: results.map(r => r.result) };
       return { ready: true, output };
     }
-    if (status === "failed") return { ready: false, error: "Batch failed" };
+    if (status.status === "failed") return { ready: false, error: "Batch failed" };
     return { ready: false };
   },
 });
@@ -908,6 +922,16 @@ Verify all dependencies are included in the workflow:
 A worker likely crashed. The stale lease recovery (`lease.reapStale` command) automatically releases jobs. In Node host, this runs on each orchestration tick. For serverless, call `runMaintenanceTick()` from a cron trigger.
 
 ---
+
+## Upgrading
+
+Migration guides ship inside the package at `node_modules/@bratsos/workflow-engine/skills/workflow-engine/migrations/` (one per minor, `migrate-X.Y-to-A.B.md`) and on the docs site. A codemod applies the mechanical renames and lists every manual item with a file and line:
+
+```bash
+npx workflow-engine-codemod --from 0.11          # or --from 0.12; add --dry-run to preview
+```
+
+The 0.12 → 0.13 guide opens with a short "does this affect you?" triage — if you never call `ai.batch()`, only two of its required actions apply.
 
 ## License
 

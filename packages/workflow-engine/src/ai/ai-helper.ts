@@ -40,11 +40,13 @@ import type {
   AIEmbedResult,
   AIHelper,
   AIHelperContext,
+  AIHelperOptions,
   AIHelperStats,
   AIObjectResult,
   AIStreamResult,
   AITextResult,
   BatchLogFn,
+  BatchOptions,
   EmbedOptions,
   LogContext,
   ObjectOptions,
@@ -66,12 +68,14 @@ class AIHelperImpl implements AIHelper {
   private readonly logContext?: LogContext;
   private readonly batchLogFn?: BatchLogFn;
   private readonly providerResolver?: ProviderResolver;
+  private readonly options?: AIHelperOptions;
 
   constructor(
     topic: string,
     aiCallLogger: AICallLogger,
     logContext?: LogContext,
     providerResolver?: ProviderResolver,
+    options?: AIHelperOptions,
   ) {
     if (!aiCallLogger) {
       throw new Error(
@@ -82,6 +86,7 @@ class AIHelperImpl implements AIHelper {
     this.aiCallLogger = aiCallLogger;
     this.logContext = logContext;
     this.providerResolver = providerResolver;
+    this.options = options;
 
     // Create batch log function if logContext is provided
     if (logContext) {
@@ -108,6 +113,7 @@ class AIHelperImpl implements AIHelper {
       topic: this.topic,
       aiCallLogger: this.aiCallLogger,
       providerResolver: this.providerResolver,
+      routing: this.options?.routing,
     };
   }
 
@@ -153,14 +159,22 @@ class AIHelperImpl implements AIHelper {
   batch<T = string>(
     modelKey: ModelKey,
     provider?: AIBatchProvider,
+    options?: BatchOptions,
   ): AIBatch<T> {
-    const resolvedProvider =
-      provider ?? getBestProviderForModel(modelKey) ?? "google";
+    const resolvedProvider = provider ?? getBestProviderForModel(modelKey);
+    if (!resolvedProvider) {
+      throw new Error(
+        `No known batch-capable provider found for model "${modelKey}". ` +
+          `Supported batch providers are: "google", "anthropic", "openai", "openrouter". ` +
+          `Pass an explicit provider to ai.batch(modelKey, provider).`,
+      );
+    }
     return new AIBatchImpl<T>(
       this.context(),
       modelKey,
       resolvedProvider,
       this.batchLogFn,
+      options,
     );
   }
 
@@ -168,12 +182,13 @@ class AIHelperImpl implements AIHelper {
     const newTopic = id
       ? `${this.topic}.${segment}.${id}`
       : `${this.topic}.${segment}`;
-    // Preserve logContext and providerResolver for child helpers (same workflow context)
+    // Preserve logContext, providerResolver, and options for child helpers (same workflow context)
     return new AIHelperImpl(
       newTopic,
       this.aiCallLogger,
       this.logContext,
       this.providerResolver,
+      this.options,
     );
   }
 
@@ -287,8 +302,9 @@ export function createAIHelper(
   logger: AICallLogger,
   logContext?: LogContext,
   providerResolver?: ProviderResolver,
+  options?: AIHelperOptions,
 ): AIHelper {
-  return new AIHelperImpl(topic, logger, logContext, providerResolver);
+  return new AIHelperImpl(topic, logger, logContext, providerResolver, options);
 }
 
 // ============================================================================
@@ -313,17 +329,20 @@ export type {
   AICallType,
   AIEmbedResult,
   AIHelper,
+  AIHelperOptions,
   AIHelperStats,
   AIObjectResult,
   AISDKStreamResult,
   AIStreamResult,
   AITextResult,
   BatchLogFn,
+  BatchOptions,
   ContentPart,
   EmbedOptions,
   LogContext,
   MediaPart,
   ObjectOptions,
+  OpenRouterRoutingOptions,
   ProviderResolver,
   RecordCallParams,
   StreamOptions,

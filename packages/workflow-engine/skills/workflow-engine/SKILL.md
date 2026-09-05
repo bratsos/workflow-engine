@@ -116,7 +116,7 @@ await kernel.dispatch({
 | `createServerlessHost` | Function | `@bratsos/workflow-engine-host-serverless` | Create serverless host |
 | `defineRemoteStage` / `createActivityWorker` | Function | `@bratsos/workflow-engine-host-remote` | Run a stage on a credential-free remote worker (see 11-remote-activity-workers.md) |
 | `createRoutingExecutor` / `createLocalExecutor` | Function | `@bratsos/workflow-engine/kernel` | `ActivityExecutor` port: route specific stages to a remote executor / default in-process executor |
-| `createAIHelper` | Function | `@bratsos/workflow-engine` | AI operations (text, object, embed, batch) |
+| `createAIHelper` | Function | `@bratsos/workflow-engine` | AI operations (text, object, embed, batch) with AI SDK & OpenRouter batch support |
 | `registerEmbeddingProvider` | Function | `@bratsos/workflow-engine` | Register custom embedding providers (Voyage, Cohere, etc.) |
 | `createStageIds` | Function | `@bratsos/workflow-engine` | Create stage ID constants from a workflow |
 | `defineStageIds` | Function | `@bratsos/workflow-engine` | Define stage ID constants from a tuple |
@@ -191,26 +191,35 @@ const batchStage = defineAsyncBatchStage({
 
   async execute(ctx) {
     if (ctx.resumeState) {
-      return { output: ctx.resumeState.cachedResult };
+      return { output: await ctx.storage.load("batch-result") };
     }
 
-    const batchId = await submitBatchJob(ctx.input);
+    const ai = createAIHelper(`batch.${ctx.workflowRunId}`, aiLogger);
+    const batch = ai.batch("gemini-2.5-flash", "google");
+    const handle = await batch.submit(requests);
+
     return {
       suspended: true,
       state: {
-        batchId,
+        batchId: handle.id,
         submittedAt: new Date().toISOString(),
         pollInterval: 60000,
         maxWaitTime: 3600000,
+        metadata: { batchRefs: handle.refs },
       },
       pollConfig: { pollInterval: 60000, maxWaitTime: 3600000, nextPollAt: new Date(Date.now() + 60000) },
     };
   },
 
   async checkCompletion(suspendedState, ctx) {
-    const status = await checkBatchStatus(suspendedState.batchId);
-    if (status === "completed") return { ready: true, output: { results } };
-    if (status === "failed") return { ready: false, error: "Batch failed" };
+    const ai = createAIHelper(`batch.${ctx.workflowRunId}`, aiLogger);
+    const batch = ai.batch("gemini-2.5-flash", "google");
+    const status = await batch.getStatus(suspendedState.batchId, suspendedState.metadata);
+    if (status.status === "completed") {
+      const results = await batch.getResults(suspendedState.batchId, suspendedState.metadata);
+      return { ready: true, output: { results } };
+    }
+    if (status.status === "failed") return { ready: false, error: "Batch failed" };
     return { ready: false, nextCheckIn: 60000 };
   },
 });
@@ -463,6 +472,10 @@ import { registerEmbeddingProvider } from "@bratsos/workflow-engine";
 import { voyage } from "voyage-ai-provider";
 registerEmbeddingProvider("voyage", (modelId) => voyage.embeddingModel(modelId));
 // Then register models with provider: "voyage" and use ai.embed() as usual
+
+// Batch operations (Google, Anthropic, OpenAI, OpenRouter)
+const batch = ai.batch("gemini-2.5-flash", "google");
+const handle = await batch.submit([{ id: "1", prompt: "Summarize..." }]);
 ```
 
 ## Persistence Setup

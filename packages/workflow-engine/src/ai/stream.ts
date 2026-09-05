@@ -11,7 +11,7 @@ import type { GenerateTextEndEvent, ToolSet } from "ai";
 import { streamText as aiStreamText } from "ai";
 import { logFailure } from "./generate";
 import { getModel, type ModelKey } from "./model-helper";
-import { calculateCostWithDiscount, getModelProvider, logger } from "./shared";
+import { getModelProvider, logger, resolveCost } from "./shared";
 import type {
   AIHelperContext,
   AIStreamResult,
@@ -27,7 +27,8 @@ export function streamText(
 ): AIStreamResult {
   const modelConfig = getModel(modelKey);
   const model =
-    ctx.providerResolver?.(modelConfig) ?? getModelProvider(modelConfig);
+    ctx.providerResolver?.(modelConfig) ??
+    getModelProvider(modelConfig, ctx.routing);
   const startTime = Date.now();
   const hasTools = options.tools !== undefined;
 
@@ -80,6 +81,8 @@ export function streamText(
     inputTokens: number;
     outputTokens: number;
     cost: number;
+    reportedCostUsd?: number;
+    costSource?: "reported" | "estimated";
   } | null = null;
 
   // Persist the call exactly once, whether triggered by the AI SDK's
@@ -90,14 +93,26 @@ export function streamText(
     outputTokens: number,
     responseText: string,
     reasoning: string | undefined,
+    resultLike?: unknown,
   ) => {
     if (usageResolved) return cachedUsage!;
 
-    const cost = calculateCostWithDiscount(modelKey, inputTokens, outputTokens);
+    const { cost, reportedCostUsd, costSource } = resolveCost(
+      modelKey,
+      inputTokens,
+      outputTokens,
+      resultLike,
+    );
     const durationMs = Date.now() - startTime;
 
     usageResolved = true;
-    cachedUsage = { inputTokens, outputTokens, cost };
+    cachedUsage = {
+      inputTokens,
+      outputTokens,
+      cost,
+      ...(reportedCostUsd !== undefined ? { reportedCostUsd } : {}),
+      costSource,
+    };
 
     logger.debug(`streamText response`, {
       model: modelKey,
@@ -121,6 +136,8 @@ export function streamText(
       inputTokens,
       outputTokens,
       cost,
+      reportedCost: reportedCostUsd,
+      costSource,
       metadata: {
         temperature: options.temperature,
         maxTokens: options.maxTokens,
@@ -173,6 +190,7 @@ export function streamText(
         outputTokens,
         event.text || fullText,
         event.reasoningText,
+        event,
       );
     },
   };
@@ -226,8 +244,15 @@ export function streamText(
     const responseText = (await result.text) || fullText;
     const inputTokens = usage?.inputTokens ?? 0;
     const outputTokens = usage?.outputTokens ?? 0;
+    const finalStep = await result.finalStep;
+    const providerMetadata =
+      (await result.providerMetadata) ?? finalStep?.providerMetadata;
 
-    return persistUsage(inputTokens, outputTokens, responseText, reasoning);
+    return persistUsage(inputTokens, outputTokens, responseText, reasoning, {
+      usage,
+      providerMetadata,
+      finalStep,
+    });
   };
 
   // Full answer text, reconciled with the buffered result (handles models

@@ -2,7 +2,10 @@ import { StaleVersionError } from "../../persistence/interface.js";
 import type { RunReapStuckCommand, RunReapStuckResult } from "../commands";
 import type { KernelEvent } from "../events";
 import type { HandlerResult, KernelDeps } from "../kernel";
-import { ACTIVE_STAGE_STATUSES, handleRunTransition } from "./run-transition.js";
+import {
+  ACTIVE_STAGE_STATUSES,
+  handleRunTransition,
+} from "./run-transition.js";
 
 export async function handleRunReapStuck(
   command: RunReapStuckCommand,

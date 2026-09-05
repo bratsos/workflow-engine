@@ -8,11 +8,6 @@
 import type { EmbeddingModelV4 } from "@ai-sdk/provider";
 import { describe, expect, it, vi } from "vitest";
 
-// Mock optional peer dependencies that ai-helper.ts transitively imports
-vi.mock("@anthropic-ai/sdk", () => ({ Anthropic: class {} }));
-vi.mock("@google/genai", () => ({ GoogleGenAI: class {} }));
-vi.mock("openai", () => ({ default: class {} }));
-
 import {
   getEmbeddingModelProvider,
   registerEmbeddingProvider,

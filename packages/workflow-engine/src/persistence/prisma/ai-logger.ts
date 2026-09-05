@@ -18,6 +18,36 @@ const logger = createLogger("AICallLogger");
 // Structural client type -- see prisma-client-type.ts.
 type PrismaClient = EnginePrismaClient;
 
+type MetadataRecord = Record<string, unknown>;
+
+function getMetadataRecord(metadata: unknown): MetadataRecord {
+  if (
+    metadata !== null &&
+    typeof metadata === "object" &&
+    !Array.isArray(metadata)
+  ) {
+    return metadata as MetadataRecord;
+  }
+  return {};
+}
+
+function getMetadataString(metadata: unknown, key: string): string | undefined {
+  const value = getMetadataRecord(metadata)[key];
+  return typeof value === "string" ? value : undefined;
+}
+
+function getBatchMetadata(
+  metadata: unknown,
+  batchId: string,
+  requestId: string | undefined,
+): MetadataRecord {
+  return {
+    ...getMetadataRecord(metadata),
+    batchId,
+    ...(requestId !== undefined ? { requestId } : {}),
+  };
+}
+
 export class PrismaAICallLogger implements AICallLogger {
   constructor(private readonly prisma: PrismaClient) {}
 
@@ -39,6 +69,10 @@ export class PrismaAICallLogger implements AICallLogger {
           outputTokens: call.outputTokens,
           cost: call.cost,
           metadata: call.metadata as unknown,
+          ...(call.batchId !== undefined ? { batchId: call.batchId } : {}),
+          ...(call.requestId !== undefined
+            ? { requestId: call.requestId }
+            : {}),
         },
       })
       .catch((error: unknown) =>
@@ -54,21 +88,33 @@ export class PrismaAICallLogger implements AICallLogger {
     results: CreateAICallInput[],
   ): Promise<void> {
     await this.prisma.aICall.createMany({
-      data: results.map((call) => ({
-        topic: call.topic,
-        callType: call.callType,
-        modelKey: call.modelKey,
-        modelId: call.modelId,
-        prompt: call.prompt,
-        response: call.response,
-        inputTokens: call.inputTokens,
-        outputTokens: call.outputTokens,
-        cost: call.cost,
-        metadata: {
-          ...(call.metadata as object),
+      data: results.map((call) => {
+        const requestId =
+          call.requestId ?? getMetadataString(call.metadata, "requestId");
+
+        if (requestId === undefined) {
+          logger.warn(
+            "Batch result has no requestId; duplicate protection cannot be enforced for this row.",
+            { batchId },
+          );
+        }
+
+        return {
+          topic: call.topic,
+          callType: call.callType,
+          modelKey: call.modelKey,
+          modelId: call.modelId,
+          prompt: call.prompt,
+          response: call.response,
+          inputTokens: call.inputTokens,
+          outputTokens: call.outputTokens,
+          cost: call.cost,
           batchId,
-        } as unknown,
-      })),
+          ...(requestId !== undefined ? { requestId } : {}),
+          metadata: getBatchMetadata(call.metadata, batchId, requestId),
+        };
+      }),
+      skipDuplicates: true,
     });
   }
 
@@ -127,16 +173,20 @@ export class PrismaAICallLogger implements AICallLogger {
    * Check if batch results are already recorded
    */
   async isRecorded(batchId: string): Promise<boolean> {
-    const existing = await this.prisma.aICall.findFirst({
+    const count = await this.prisma.aICall.count({
       where: {
-        metadata: {
-          path: ["batchId"],
-          equals: batchId,
-        },
+        OR: [
+          { batchId },
+          {
+            metadata: {
+              path: ["batchId"],
+              equals: batchId,
+            },
+          },
+        ],
       },
-      select: { id: true },
     });
-    return existing !== null;
+    return count > 0;
   }
 }
 
