@@ -134,8 +134,14 @@ CREATE TABLE "workflow_definitions" (
   "structureHash" TEXT NOT NULL,
   CONSTRAINT "workflow_definitions_pkey" PRIMARY KEY ("workflowId", "version")
 );
-CREATE INDEX "workflow_definitions_workflowId_idx" ON "workflow_definitions" ("workflowId");
 ```
+
+The table deliberately has no `(workflowId)` index: the compound primary key
+already leads with that column, so a lookup by workflow alone plans
+identically either way, and no query in the engine reads the table by
+workflow alone. An earlier draft of the hand-written migration created one;
+if you ran it, `DROP INDEX CONCURRENTLY IF EXISTS
+"workflow_definitions_workflowId_idx";` is safe.
 
 On `workflow_runs`, two columns support versioning:
 
@@ -235,9 +241,8 @@ WITH claimed AS (
   SELECT id
   FROM "workflow_runs"
   WHERE status = $1::"Status"
-    AND ("definitionVersion" IS NULL OR ("workflowId", "definitionVersion") IN (
-      ($4, $5), ($6, $7)
-    ))
+    AND (("workflowId", "definitionVersion") IN (($4, $5), ($6, $7))
+      OR ("definitionVersion" IS NULL AND "workflowId" IN ($8, $9)))
   ORDER BY priority DESC, "createdAt" ASC
   LIMIT 1
   FOR UPDATE SKIP LOCKED
@@ -252,26 +257,34 @@ WHERE "workflow_runs".id = claimed.id
 RETURNING "workflow_runs".*
 ```
 
-The served pairs are bound as row values from `$4` onwards; a build that
-serves nothing gets `AND "definitionVersion" IS NULL` instead, so it claims
-only unpinned runs rather than everything.
-
-Runs created before database migration have `definitionVersion = null`. These
-unpinned runs are matched by `"definitionVersion" IS NULL` and remain
-claimable by any host.
+The served pairs are bound as row values from `$4` onwards, followed by the
+distinct workflow ids they name. The predicate has two arms, and the second
+arm's workflow-id restriction is the point: a run created before the
+consumer migrated has `definitionVersion = NULL` and is claimable by any
+host that *has* the workflow, but not by a host whose registry has never
+heard of it — which would adopt the run only to fail it with
+`WORKFLOW_NOT_FOUND`. An empty `serves` (a registry that enumerated no
+workflows) gets `AND false` and claims nothing: a host that serves no
+workflow has no work. Omit `serves` — or pass `serves: "all"` at the host —
+for the pre-1.0 predicate, which claims any pending run.
 
 `run.claimPending` takes `serves` directly as well: pass `"all"` to claim
 regardless of version (the pre-1.0 behaviour), or an explicit
 `readonly ServedDefinition[]` to claim on behalf of another build. Left
-unset, the kernel derives it from the registry.
+unset, the kernel derives it from the registry. `stage.pollSuspended` takes
+the same option with the same defaulting, both shipped hosts expose it as
+`serves` in their config and forward it to both commands, and
+`Kernel.servedDefinitions()` returns the pairs a host passes to its job
+dequeue when it has no configuration of its own.
 
 ### Handling unserved runs across handlers
 
 During rolling deployments or when workloads are partitioned across dedicated worker pools, a host will encounter runs it does not serve:
 
 - **Pending runs**: A `PENDING` run at a version the claiming host does not serve is ignored by the SQL claim query. It is left `PENDING` in the database, waiting for a host that serves its version. It is never marked `FAILED` with `WORKFLOW_NOT_FOUND`.
-- **Running jobs (`job.execute`)**: If a job is dequeued by a worker whose build does not serve the run's pinned version, `handleJobExecute` catches the mismatch via `assertServesRun`. Instead of failing the stage or run, it returns `{ outcome: "failed", ghost: true, ghostReason: "version", error: ... }`. The host re-delivers the job to the transport queue, and the run remains `RUNNING`. The complete set of `ghostReason` values is `"orphan" | "race" | "version"`.
-- **Transitions and polling**: `run.transition` and `stage.pollSuspended` verify `servesRun(run, workflow)`. If the current host does not serve the run, the handlers no-op. Crucially, `stage.pollSuspended` releases its poll claim lease immediately so that the mismatched host does not hold the 60-second claim lock and starve the host that can execute the run.
+- **The job dequeue**: A job carries its run's version on the payload as `_definitionVersion`, and `dequeue({ serves })` filters on it, so in a fleet a host rarely claims a job it cannot execute. A transport that cannot express the filter may ignore it; the kernel's version-ghost handling below is the backstop.
+- **Running jobs (`job.execute`)**: If a job is dequeued by a worker whose build does not serve the run's pinned version, `handleJobExecute` catches the mismatch via `assertServesRun`. Instead of failing the stage or run, it returns `{ outcome: "failed", ghost: true, ghostReason: "version", error: ... }`. The host re-delivers the job, and the run remains `RUNNING`. When the transport implements the optional `JobQueue.defer(jobId, nextPollAt, reason, fence?)`, `executeJobWithHeartbeat` returns the job to `PENDING` through it with `deferred: true`, offered again after `HOST_DEFAULTS.versionDeferMs` (30 s) and **without** spending an attempt — a mismatch clears when a deploy finishes, not on the next tick, and re-delivering through the failure path would exhaust a three-attempt budget in about fifteen seconds. A transport without `defer` falls back to `fail(jobId, error, true)`, which is correct but bounded by the budget. The complete set of `ghostReason` values is `"orphan" | "race" | "version"`.
+- **Transitions and polling**: `run.transition` and `stage.pollSuspended` verify `servesRun(run, workflow)`. If the current host does not serve the run, the handlers no-op. `getSuspendedStages(beforeDate, { limit, serves })` applies the filter in the query that lists ready stages, so an unserving host normally never claims a stage's poll lease at all; a stage that slips through (a run whose version changed between the query and the claim) is handed back to the deadline the row already had rather than released to `now`, so it neither churns two version-bumping writes per tick nor permanently occupies a candidate slot in the `maxChecks` window.
 - **Stuck run reaper (`run.reapStuck`)**: When sweeping for wedged runs, `run.reapStuck` skips runs whose pinned version is not served by the local host. An unserved run receives no local updates and quickly exceeds the stuck timeout threshold; reaping it would fail a run that is executing normally on a peer worker.
 
 ### Why there is no automatic reaper for unserved runs
@@ -370,6 +383,9 @@ interface DefinitionVersionCountFilter {
 interface PersistenceCore {
   supportsDefinitionVersioning(): boolean;
 
+  /** Optional: confirm the answer above against the live database, once. */
+  ensureDefinitionVersioningDetected?(): Promise<boolean>;
+
   insertDefinitionIfAbsent(
     input: CreateDefinitionInput,
   ): Promise<WorkflowDefinitionRecord | null>;
@@ -387,18 +403,25 @@ interface PersistenceCore {
     now?: Date;
     serves?: readonly ServedDefinition[];
   }): Promise<WorkflowRunRecord | null>;
+
+  getSuspendedStages(
+    beforeDate: Date,
+    options?: { limit?: number; serves?: readonly ServedDefinition[] },
+  ): Promise<WorkflowStageRecord[]>;
 }
 ```
 
 - `supportsDefinitionVersioning()`: Returns `false` on an unmigrated database. When `false`, the engine bypasses all version checks, treats runs as unpinned, and executes in legacy mode.
+- `ensureDefinitionVersioningDetected()`: Optional. An adapter whose capability answer comes from something other than the database (the Prisma adapter reads the generated client) implements it to confirm that answer against the live schema once, lazily; the kernel awaits it before any path that would write the versioning columns. It must be safe inside a caller's transaction, so it may not issue a statement that can fail.
 - `insertDefinitionIfAbsent(input)`: Inserts the definition snapshot if `(workflowId, version)` does not exist, and returns the persisted record in both insert and conflict cases. Returns `null` if versioning is unsupported.
 - `getDefinition(workflowId, version)`: Fetches a definition snapshot by compound key, or returns `null` if not found.
 - `countRunsByDefinitionVersion(filter)`: Aggregates run counts grouped by `(workflowId, definitionVersion, status)`. Returns an empty array if versioning is unsupported.
-- `ServedDefinition`: Evaluated as a compound pair `(workflowId, version)` to ensure workflows declaring matching explicit versions (such as `"1.0.0"`) do not collide.
+- `ServedDefinition`: Evaluated as a compound pair `(workflowId, version)` to ensure workflows declaring matching explicit versions (such as `"1.0.0"`) do not collide. `claimNextPendingRun({ serves })` must claim a pinned run only when the pair is listed, an unpinned run only when a listed pair names its workflow, and nothing at all for an empty list; omitted, it claims any pending run.
+- `getSuspendedStages(beforeDate, { limit, serves })`: Owns both narrowings — rows oldest `nextPollAt` first, capped at `limit`, and filtered by `serves` evaluated against the stage's run. An adapter with no `definitionVersion` column may ignore `serves`, because such a database has no pinned runs; it must not ignore `limit`.
 
-### Structural feature detection in Prisma
+### Feature detection in Prisma
 
-The built-in Prisma adapter detects definition versioning capability **structurally** by inspecting whether `prisma.workflowDefinition` exists on the generated client object:
+The built-in Prisma adapter detects definition versioning capability in two stages. First, **structurally** and synchronously, by inspecting whether `prisma.workflowDefinition` exists on the generated client object:
 
 ```typescript
 function detectDefinitionVersioning(prisma: PrismaClient): boolean {
@@ -410,11 +433,13 @@ function detectDefinitionVersioning(prisma: PrismaClient): boolean {
 }
 ```
 
-It does not run a probe query (`SELECT 1 FROM workflow_definitions LIMIT 1`, say). A statement that fails inside a Postgres transaction aborts the whole transaction, so every later statement in it fails too — a probe that answers "not migrated" would take the surrounding kernel transaction down with it. Inspecting the client's model surface costs nothing and cannot fail.
+The client check alone is not enough: `prisma generate` after editing the schema but before `migrate deploy` — every consumer passes through that state on a first migration, and so does any rolling deploy that ships code ahead of schema — leaves a client that advertises the models against a database that has neither, and every claim then dies with a raw `42703`. So the *database* is confirmed once, lazily, the first time a versioning-sensitive path runs (`ensureDefinitionVersioningDetected`), through a catalogue read that answers "absent" instead of raising: `to_regclass` and `pg_catalog.pg_attribute` on Postgres, `sqlite_master` and `pragma_table_info` on SQLite. It is not `SELECT 1 FROM workflow_definitions LIMIT 1`: a statement that fails inside a Postgres transaction aborts the whole transaction, so a probe that answered "not migrated" by failing would take the surrounding kernel transaction down with it. The capability state is shared by reference with every transactional clone, so the probe runs once per client and a downgrade one clone discovers is visible to all of them. Either "no" runs with versioning off; runs created meanwhile carry a null version and stay claimable, for life, by any host whose registry holds their workflow.
 
 `createPrismaWorkflowPersistence` accepts `definitionVersioning?: boolean` to
-override the detection, for a client whose model surface the detection cannot
-see. Left unset, detection decides.
+skip both checks: `false` for a client whose schema carries the models
+against a database deliberately left unmigrated, `true` for a model surface
+the structural detection cannot see (a hand-written wrapper, a proxy). Left
+unset, detection decides.
 
 ## Shadowing: checking compatibility before deployment
 
