@@ -41,6 +41,7 @@ import type {
   RunClaimPendingResult,
   RunCreateResult,
   RunListVersionsResult,
+  RunPurgeResult,
   RunReapStuckResult,
   RunRedriveResult,
   RunRerunFromResult,
@@ -59,6 +60,7 @@ import { handleRunCancel } from "./handlers/run-cancel";
 import { handleRunClaimPending } from "./handlers/run-claim-pending";
 import { handleRunCreate } from "./handlers/run-create";
 import { handleRunListVersions } from "./handlers/run-list-versions";
+import { handleRunPurge } from "./handlers/run-purge";
 import { handleRunReapStuck } from "./handlers/run-reap-stuck";
 import { handleRunRedrive } from "./handlers/run-redrive";
 import { handleRunRerunFrom } from "./handlers/run-rerun-from";
@@ -290,7 +292,8 @@ type AnyCommandResult =
   | LeaseReapStaleResult
   | OutboxFlushResult
   | PluginReplayDLQResult
-  | RunReapStuckResult;
+  | RunReapStuckResult
+  | RunPurgeResult;
 
 /** Strip the internal `_events`/`_postCommit` fields off a handler result. */
 function stripEvents<R>(result: HandlerResult<R>): R {
@@ -475,6 +478,9 @@ export function createKernel(config: KernelConfig): Kernel {
             break;
           case "run.reapStuck":
             result = await handleRunReapStuck(command, txDeps);
+            break;
+          case "run.purge":
+            result = await handleRunPurge(command, txDeps);
             break;
           default: {
             const _exhaustive: never = command;

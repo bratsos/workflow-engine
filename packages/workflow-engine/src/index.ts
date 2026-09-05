@@ -200,6 +200,8 @@ export type {
   JobRecord,
   LogLevel,
   PersistenceCore,
+  PurgeableRun,
+  PurgeableRunStatus,
   SaveArtifactInput,
   // Unified status type (preferred)
   Status,
@@ -269,6 +271,8 @@ export type {
   RunCreateResult,
   RunListVersionsCommand,
   RunListVersionsResult,
+  RunPurgeCommand,
+  RunPurgeResult,
   RunReapStuckCommand,
   RunReapStuckResult,
   RunRedriveCommand,

@@ -27,6 +27,8 @@ import {
   type DefinitionVersionCountFilter,
   type IdempotencyRecord,
   type OutboxRecord,
+  type PurgeableRun,
+  type PurgeableRunStatus,
   type SaveArtifactInput,
   type ServedDefinition,
   StaleVersionError,
@@ -201,6 +203,53 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
     return Array.from(this.runs.values())
       .filter((run) => run.status === status)
       .map((run) => ({ ...run }));
+  }
+
+  async listRunsForPurge(
+    cutoff: Date,
+    statuses: readonly PurgeableRunStatus[],
+    limit: number,
+  ): Promise<PurgeableRun[]> {
+    const wanted = new Set<Status>(statuses);
+    const finishedAt = (run: WorkflowRunRecord) =>
+      run.completedAt ?? run.updatedAt;
+    return Array.from(this.runs.values())
+      .filter((run) => wanted.has(run.status) && finishedAt(run) <= cutoff)
+      .sort((a, b) => finishedAt(a).getTime() - finishedAt(b).getTime())
+      .slice(0, limit)
+      .map((run) => ({
+        id: run.id,
+        workflowType: run.workflowType,
+        status: run.status as PurgeableRunStatus,
+        stageRecordIds: this.stageRecordsOf(run.id).map((s) => s.id),
+      }));
+  }
+
+  async deleteRun(id: string): Promise<void> {
+    if (!this.runs.delete(id)) return;
+    for (const stage of this.stageRecordsOf(id)) {
+      this.stages.delete(stage.id);
+      this.stages.delete(this.stageKey(id, stage.stageId));
+    }
+    for (const [key, log] of this.logs) {
+      if (log.workflowRunId === id) this.logs.delete(key);
+    }
+    for (const [key, artifact] of this.artifacts) {
+      if (artifact.workflowRunId === id) this.artifacts.delete(key);
+    }
+    this.annotations = this.annotations.filter((a) => a.workflowRunId !== id);
+  }
+
+  /** Stage records of a run, deduplicated (stages are stored under two keys). */
+  private stageRecordsOf(runId: string): WorkflowStageRecord[] {
+    const seen = new Set<string>();
+    const out: WorkflowStageRecord[] = [];
+    for (const stage of this.stages.values()) {
+      if (stage.workflowRunId !== runId || seen.has(stage.id)) continue;
+      seen.add(stage.id);
+      out.push(stage);
+    }
+    return out;
   }
 
   async getStuckRuns(stuckSince: Date): Promise<WorkflowRunRecord[]> {

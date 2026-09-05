@@ -66,6 +66,18 @@ export class StaleVersionError extends Error {
 // Record Types (minimal fields needed by the workflow engine)
 // ============================================================================
 
+/** The run statuses `run.purge` may delete. */
+export type PurgeableRunStatus = "COMPLETED" | "FAILED" | "CANCELLED";
+
+/** One run `listRunsForPurge` found eligible for deletion. */
+export interface PurgeableRun {
+  id: string;
+  workflowType: string;
+  status: PurgeableRunStatus;
+  /** `WorkflowStage.id` of every stage record the run owns. */
+  stageRecordIds: string[];
+}
+
 export interface WorkflowRunRecord {
   id: string;
   createdAt: Date;
@@ -671,6 +683,29 @@ export interface PersistenceCore {
   getRun(id: string): Promise<WorkflowRunRecord | null>;
   getRunStatus(id: string): Promise<Status | null>;
   getStuckRuns(stuckSince: Date): Promise<WorkflowRunRecord[]>;
+
+  /**
+   * Terminal runs eligible for retention deletion, oldest first: runs whose
+   * `status` is one of `statuses` and which finished at or before `cutoff`
+   * (`completedAt <= cutoff`, or `updatedAt <= cutoff` for a terminal run
+   * with no `completedAt`). Returns at most `limit` runs, each with the ids
+   * of its stage records so the caller can clear a pluggable `StepLedger`
+   * before the row goes. Called by `run.purge`.
+   */
+  listRunsForPurge(
+    cutoff: Date,
+    statuses: readonly PurgeableRunStatus[],
+    limit: number,
+  ): Promise<PurgeableRun[]>;
+
+  /**
+   * Delete a run and everything the persistence owns under it: stage
+   * records, logs, artifacts, annotations, and (on the reference schema,
+   * through the cascade) `workflow_steps`. A missing id is a no-op. Never
+   * emits an outbox event; the kernel clears the step ledger and the blob
+   * store before calling it.
+   */
+  deleteRun(id: string): Promise<void>;
 
   /**
    * Atomically find and claim the next pending workflow run.

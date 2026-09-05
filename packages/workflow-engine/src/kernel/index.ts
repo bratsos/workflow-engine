@@ -29,6 +29,8 @@ export type {
   RunCreateResult,
   RunListVersionsCommand,
   RunListVersionsResult,
+  RunPurgeCommand,
+  RunPurgeResult,
   RunReapStuckCommand,
   RunReapStuckResult,
   RunRedriveCommand,

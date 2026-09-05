@@ -10,6 +10,7 @@
 
 import type {
   AnnotationActor,
+  PurgeableRunStatus,
   ServedDefinition,
 } from "../persistence/interface";
 
@@ -376,6 +377,36 @@ export interface RunReapStuckResult {
 }
 
 // ---------------------------------------------------------------------------
+// run.purge
+// ---------------------------------------------------------------------------
+
+/**
+ * Retention: deletes terminal runs that finished at or before `olderThan`.
+ *
+ * For each run the kernel clears the `StepLedger` for every stage record,
+ * deletes the run's blobs (stage outputs, artifacts, spilled job payloads
+ * and step results under the engine's own key prefixes), removes its job
+ * rows, and then deletes the run through `PersistenceCore.deleteRun`, which
+ * takes stages, logs, artifacts and annotations with it. Emits no events.
+ * Bounded by `limit` so a tick stays short; repeat until `purged` is 0.
+ */
+export interface RunPurgeCommand {
+  readonly type: "run.purge";
+  /** Runs whose `completedAt` (or, lacking one, `updatedAt`) is at or before this are eligible. */
+  readonly olderThan: Date;
+  /** Defaults to all three terminal statuses. */
+  readonly statuses?: readonly PurgeableRunStatus[];
+  /** Maximum runs deleted per call. Defaults to 100. */
+  readonly limit?: number;
+}
+
+/** Result of a `run.purge` command. */
+export interface RunPurgeResult {
+  readonly purged: number;
+  readonly workflowRunIds: string[];
+}
+
+// ---------------------------------------------------------------------------
 // run.redrive
 // ---------------------------------------------------------------------------
 
@@ -510,7 +541,8 @@ export type KernelCommand =
   | LeaseReapStaleCommand
   | OutboxFlushCommand
   | PluginReplayDLQCommand
-  | RunReapStuckCommand;
+  | RunReapStuckCommand
+  | RunPurgeCommand;
 
 /** String literal union of all kernel command type discriminants. */
 export type KernelCommandType = KernelCommand["type"];
@@ -544,4 +576,6 @@ export type CommandResult<T extends KernelCommand> = T extends RunCreateCommand
                           ? PluginReplayDLQResult
                           : T extends RunReapStuckCommand
                             ? RunReapStuckResult
-                            : never;
+                            : T extends RunPurgeCommand
+                              ? RunPurgeResult
+                              : never;

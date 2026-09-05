@@ -224,8 +224,13 @@ function stepSpillKey(stageRecordId: string, stepId: string): string {
   return `${stepSpillPrefix(stageRecordId)}${encodeURIComponent(stepId)}.json`;
 }
 
+/** Blob key prefix under which a run's spilled job payloads live. */
+export function jobSpillPrefix(workflowRunId: string): string {
+  return `workflow-v2/spill/jobs/${encodeURIComponent(workflowRunId)}/`;
+}
+
 function jobSpillKey(workflowRunId: string, stageId: string): string {
-  return `workflow-v2/spill/jobs/${encodeURIComponent(workflowRunId)}/${encodeURIComponent(stageId)}.json`;
+  return `${jobSpillPrefix(workflowRunId)}${encodeURIComponent(stageId)}.json`;
 }
 
 // ============================================================================
