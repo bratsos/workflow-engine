@@ -142,6 +142,7 @@ interface RawStepRow {
   attempt: number | bigint;
   leaseExpiresAt: Date | string | null;
   deadlineAt: Date | string | null;
+  externalKey: string | null;
   error: string | null;
   createdAt: Date | string;
   updatedAt: Date | string;
@@ -283,6 +284,10 @@ function mapStepSummary(row: RawStepRow): StepSummary {
     attempt: toNumber(row.attempt),
     leaseExpiresAt: toDate(row.leaseExpiresAt),
     deadlineAt: toDate(row.deadlineAt),
+    externalKey:
+      row.externalKey !== null && row.externalKey !== undefined
+        ? String(row.externalKey)
+        : null,
     error:
       row.error !== null && row.error !== undefined ? String(row.error) : null,
     createdAt: toDate(row.createdAt) ?? new Date(0),
@@ -636,7 +641,7 @@ ORDER BY "stageNumber" ASC, "stageId" ASC`,
       const stepRows = await this.select<RawStepRow>(
         client,
         `SELECT s.id, s."stageRecordId", s."stepId", s.seq, s.kind, s.status, s.attempt,
-       s."leaseExpiresAt", s."deadlineAt", s.error, s."createdAt", s."updatedAt"
+       s."leaseExpiresAt", s."deadlineAt", s."externalKey", s.error, s."createdAt", s."updatedAt"
 FROM "workflow_steps" s
 JOIN "workflow_stages" st ON st.id = s."stageRecordId"
 WHERE st."workflowRunId" = $1

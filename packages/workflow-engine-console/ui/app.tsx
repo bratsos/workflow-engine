@@ -71,6 +71,7 @@ interface StepSummary {
   attempt: number;
   leaseExpiresAt: string | null;
   deadlineAt: string | null;
+  externalKey: string | null;
   error: string | null;
   createdAt: string;
   updatedAt: string;
@@ -746,6 +747,122 @@ function RunsView({
   );
 }
 
+/**
+ * One durable-step row. A pending `signal` step in a writable console gets
+ * a "Deliver signal" control: a JSON payload, validated before it leaves
+ * the browser, defaulting to `null` for the bare-approval case.
+ */
+function StepRow({
+  step,
+  canSignal,
+  busy,
+  onSignal,
+}: {
+  step: StepSummary;
+  canSignal: boolean;
+  busy: boolean;
+  onSignal?: (payload: unknown) => Promise<void>;
+}) {
+  const [open, setOpen] = useState(false);
+  const [text, setText] = useState("null");
+  const [parseError, setParseError] = useState<string | null>(null);
+
+  const awaitingSignal = step.kind === "signal" && step.status === "pending";
+  const offerSignal = canSignal && awaitingSignal && onSignal !== undefined;
+
+  const submit = async () => {
+    let payload: unknown;
+    try {
+      payload = text.trim() === "" ? null : JSON.parse(text);
+    } catch (err) {
+      setParseError(err instanceof Error ? err.message : "Payload must be valid JSON.");
+      return;
+    }
+    setParseError(null);
+    await onSignal?.(payload);
+    setOpen(false);
+  };
+
+  return (
+    <>
+      <tr>
+        <td style={{ width: "50px" }}>{step.seq}</td>
+        <td>{step.stepId}</td>
+        <td>{step.kind}</td>
+        <td>
+          <StatusPill status={step.status} />
+          {offerSignal && (
+            <button
+              type="button"
+              class="btn-sm step-signal-toggle"
+              disabled={busy}
+              aria-expanded={open}
+              onClick={() => setOpen((value) => !value)}
+            >
+              Deliver signal
+            </button>
+          )}
+        </td>
+        <td>{step.attempt}</td>
+        <td>{formatAbsolute(step.leaseExpiresAt)}</td>
+        <td>{formatAbsolute(step.deadlineAt)}</td>
+        <td title={step.externalKey ?? undefined}>
+          {step.kind === "run" && step.externalKey ? <code>{step.externalKey}</code> : "—"}
+        </td>
+        <td>{step.error || "—"}</td>
+      </tr>
+      {offerSignal && open && (
+        <tr class="step-signal-row">
+          <td colspan={9}>
+            <form
+              class="step-signal-form"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void submit();
+              }}
+            >
+              <label class="step-signal-label" for={`signal-${step.id}`}>
+                Payload (JSON) for <code>{step.stepId}</code>
+              </label>
+              <textarea
+                id={`signal-${step.id}`}
+                rows={3}
+                spellcheck={false}
+                value={text}
+                onInput={(event) => {
+                  setText((event.currentTarget as HTMLTextAreaElement).value);
+                  if (parseError) setParseError(null);
+                }}
+              />
+              {parseError && (
+                <div class="step-signal-error" role="alert">
+                  Invalid JSON: {parseError}
+                </div>
+              )}
+              <div class="step-signal-actions">
+                <button type="submit" class="btn-sm btn-primary" disabled={busy}>
+                  Send signal
+                </button>
+                <button
+                  type="button"
+                  class="btn-sm"
+                  disabled={busy}
+                  onClick={() => {
+                    setOpen(false);
+                    setParseError(null);
+                  }}
+                >
+                  Cancel
+                </button>
+              </div>
+            </form>
+          </td>
+        </tr>
+      )}
+    </>
+  );
+}
+
 function RunDetailView({
   config,
   runId,
@@ -814,6 +931,25 @@ function RunDetailView({
       from: { kind: "lastFailure" },
       definitionVersion: "latest",
     });
+  };
+
+  // Completes a `waitForSignal` step from the console: the human-approval
+  // case, where the thing the stage is waiting on is an operator.
+  const signalStep = async (stageId: string, stepId: string, payload: unknown) => {
+    setActionLoading(true);
+    setActionError(null);
+    try {
+      await api(
+        config,
+        `/runs/${encodeURIComponent(runId)}/stages/${encodeURIComponent(stageId)}/steps/${encodeURIComponent(stepId)}/signal`,
+        { method: "POST", body: JSON.stringify({ payload }) },
+      );
+      refresh();
+    } catch (err) {
+      setActionError(err instanceof Error ? err : new Error(String(err)));
+    } finally {
+      setActionLoading(false);
+    }
   };
 
   const redrive = async (body: Record<string, unknown>) => {
@@ -1024,6 +1160,7 @@ function RunDetailView({
                   <th scope="col">Attempt</th>
                   <th scope="col">Lease expires</th>
                   <th scope="col">Deadline</th>
+                  <th scope="col">External key</th>
                   <th scope="col">Error</th>
                 </tr>
               </thead>
@@ -1033,27 +1170,24 @@ function RunDetailView({
                   if (steps.length === 0) return null;
                   return (
                     <tr key={`group-${stage.id}`}>
-                      <td colspan={8} style={{ padding: 0 }}>
+                      <td colspan={9} style={{ padding: 0 }}>
                         <table style={{ width: "100%", margin: 0 }}>
                           <thead>
                             <tr class="table-group-header">
-                              <th scope="colgroup" colspan={8}>
+                              <th scope="colgroup" colspan={9}>
                                 Stage #{stage.stageNumber}: {stage.stageName}
                               </th>
                             </tr>
                           </thead>
                           <tbody>
                             {steps.map((step) => (
-                              <tr key={step.id}>
-                                <td style={{ width: "50px" }}>{step.seq}</td>
-                                <td>{step.stepId}</td>
-                                <td>{step.kind}</td>
-                                <td><StatusPill status={step.status} /></td>
-                                <td>{step.attempt}</td>
-                                <td>{formatAbsolute(step.leaseExpiresAt)}</td>
-                                <td>{formatAbsolute(step.deadlineAt)}</td>
-                                <td>{step.error || "—"}</td>
-                              </tr>
+                              <StepRow
+                                key={step.id}
+                                step={step}
+                                canSignal={!config.readOnly}
+                                busy={actionLoading}
+                                onSignal={(payload) => signalStep(stage.stageId, step.stepId, payload)}
+                              />
                             ))}
                           </tbody>
                         </table>
@@ -1063,27 +1197,18 @@ function RunDetailView({
                 })}
                 {unassignedSteps.length > 0 && (
                   <tr>
-                    <td colspan={8} style={{ padding: 0 }}>
+                    <td colspan={9} style={{ padding: 0 }}>
                       <table style={{ width: "100%", margin: 0 }}>
                         <thead>
                           <tr class="table-group-header">
-                            <th scope="colgroup" colspan={8}>
+                            <th scope="colgroup" colspan={9}>
                               Other steps
                             </th>
                           </tr>
                         </thead>
                         <tbody>
                           {unassignedSteps.map((step) => (
-                            <tr key={step.id}>
-                              <td style={{ width: "50px" }}>{step.seq}</td>
-                              <td>{step.stepId}</td>
-                              <td>{step.kind}</td>
-                              <td><StatusPill status={step.status} /></td>
-                              <td>{step.attempt}</td>
-                              <td>{formatAbsolute(step.leaseExpiresAt)}</td>
-                              <td>{formatAbsolute(step.deadlineAt)}</td>
-                              <td>{step.error || "—"}</td>
-                            </tr>
+                            <StepRow key={step.id} step={step} canSignal={false} busy={actionLoading} />
                           ))}
                         </tbody>
                       </table>
@@ -1092,7 +1217,7 @@ function RunDetailView({
                 )}
                 {data.steps.length === 0 && (
                   <tr>
-                    <td colspan={8} class="empty-state">No steps recorded.</td>
+                    <td colspan={9} class="empty-state">No steps recorded.</td>
                   </tr>
                 )}
               </tbody>

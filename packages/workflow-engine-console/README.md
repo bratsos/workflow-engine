@@ -45,6 +45,7 @@ const handler = createWorkflowConsole({
     if (
       action === "run.cancel" ||
       action === "run.rerun" ||
+      action === "step.signal" ||
       action === "deadLetters.replay"
     ) {
       return session.user.role === "admin";
@@ -199,6 +200,7 @@ The action vocabulary uses discrete verbs rather than HTTP methods, enabling fin
 | `costs.read` | Read | View aggregate execution costs and token usage by workflow or by day |
 | `run.cancel` | Write | Cancel an active workflow run |
 | `run.rerun` | Write | Rerun a workflow run from a designated stage |
+| `step.signal` | Write | Complete a pending `waitForSignal` durable step with a payload |
 | `deadLetters.replay` | Write | Replay failed outbox events from the dead-letter queue |
 
 ## Actions
@@ -233,6 +235,7 @@ const handler = createWorkflowConsole({
 Mutations never issue direct SQL updates against run records. Instead, writes dispatch standard engine commands through the kernel:
 - `run.cancel` dispatches `{ type: "run.cancel", workflowRunId, reason }`
 - `run.rerun` dispatches `{ type: "run.redrive", workflowRunId, from, definitionVersion? }` — `fromStageId` in the request body still means "from this stage"; pass `from: { kind: "lastFailure" | "start" | "stage" }` and `definitionVersion: "latest"` to move a run stranded on a version nobody serves
+- `step.signal` dispatches `{ type: "step.signal", workflowRunId, stageId, stepId, payload }` — `POST /api/runs/:runId/stages/:stageId/steps/:stepId/signal` with `{ payload }` (optional, defaults to `null`); an unknown run or stage is a 404 and a step that is not a pending signal is a 409, both carrying the kernel's message
 - `deadLetters.replay` dispatches `{ type: "plugin.replayDLQ", maxEvents }`
 
 Routing writes through the kernel ensures that execution leases, idempotency guarantees, transition invariants, and outbox publication events remain enforced by the authoritative state machine. The `onAction` hook provides an audit callback invoked immediately after each successful mutation.
@@ -371,6 +374,7 @@ The operational console separates storage queries, API serialization, and UI pre
 - `GET /api/costs`: Token and financial cost aggregations
 - `POST /api/runs/:id/cancel`: Cancel an execution
 - `POST /api/runs/:id/rerun`: Rerun execution from a stage
+- `POST /api/runs/:id/stages/:stageId/steps/:stepId/signal`: Deliver a payload to a pending signal step
 - `POST /api/dead-letters/replay`: Replay failed events
 
 ## Custom adapters

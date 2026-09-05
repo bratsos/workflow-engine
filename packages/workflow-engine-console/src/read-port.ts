@@ -92,6 +92,8 @@ export interface StepSummary {
   attempt: number;
   leaseExpiresAt: Date | null;
   deadlineAt: Date | null;
+  /** Deterministic name of the external effect a `run` step creates; null for other kinds. */
+  externalKey: string | null;
   error: string | null;
   createdAt: Date;
   updatedAt: Date;

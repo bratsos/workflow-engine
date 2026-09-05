@@ -73,7 +73,7 @@ const handler = createWorkflowConsole({
     const session = await getSession(request);
     if (!session) return false;
 
-    if (action === "run.cancel" || action === "run.rerun" || action === "deadLetters.replay") {
+    if (action === "run.cancel" || action === "run.rerun" || action === "step.signal" || action === "deadLetters.replay") {
       return session.user.role === "admin";
     }
     return session.user.role === "admin" || session.user.role === "operator";
@@ -164,6 +164,7 @@ export const CONSOLE_ACTIONS = [
   "costs.read",
   "run.cancel",
   "run.rerun",
+  "step.signal",
   "deadLetters.replay",
 ] as const;
 
@@ -172,6 +173,7 @@ export type ConsoleAction = (typeof CONSOLE_ACTIONS)[number];
 export const WRITE_ACTIONS: readonly ConsoleAction[] = [
   "run.cancel",
   "run.rerun",
+  "step.signal",
   "deadLetters.replay",
 ] as const;
 ```
@@ -182,7 +184,9 @@ The callback receives a `ConsoleAuthorizeContext`:
 export interface ConsoleAuthorizeContext {
   action: ConsoleAction;
   request: Request;
-  runId?: string; // Defined for run-scoped actions: "run.read", "run.cancel", "run.rerun"
+  runId?: string; // Defined for run-scoped actions: "run.read", "run.cancel", "run.rerun", "step.signal"
+  stageId?: string; // Defined for "step.signal"
+  stepId?: string; // Defined for "step.signal"
 }
 ```
 
@@ -198,11 +202,14 @@ The console never executes direct `UPDATE` or `DELETE` SQL statements against da
 
 - `"run.cancel"`: Dispatches `{ type: "run.cancel", workflowRunId, reason }`
 - `"run.rerun"`: Dispatches `{ type: "run.redrive", workflowRunId, from, definitionVersion? }`
+- `"step.signal"`: Dispatches `{ type: "step.signal", workflowRunId, stageId, stepId, payload }`
 - `"deadLetters.replay"`: Dispatches `{ type: "plugin.replayDLQ", maxEvents }`
 
 `POST /runs/:id/rerun` takes `fromStageId` (which becomes `from: { kind: "stage", stageId }`), or a `from` of `{ kind: "lastFailure" | "start" | "stage" }`, and an optional `definitionVersion` — `"latest"` or a registered version. One of `fromStageId` or `from` is required, and a malformed `from` is a 400 rather than a fall back to the default mode: an operator who asked to restart a whole run must not silently get a retry of one stage.
 
 The `definitionVersion` argument is what makes a **stranded run** recoverable from the console. A run pinned to a version no deployment serves any more is claimed by nobody, and the only thing that moves it is a redrive that re-pins it — see [13-definition-versioning.md](13-definition-versioning.md). The UI exposes this as *Redrive on latest version* on any run that carries a pinned version. The console dispatched the deprecated `run.rerunFrom` until 1.0.0-alpha.11; that command refuses a `CANCELLED` run and has no way to express a re-pin, so neither was reachable from the console.
+
+`POST /runs/:runId/stages/:stageId/steps/:stepId/signal` completes a `waitForSignal` durable step from the console — the human-approval case, where the thing a stage is waiting on is an operator. The body is `{ payload: <json> }`; `payload` is optional and defaults to `null`. The kernel's refusals map to HTTP statuses rather than a 500: an unknown run or stage is a 404, and a step that is not a pending signal (previously used as a `run` step, or already failed) is a 409 carrying the kernel's message. Signalling an already-completed step is idempotent and returns `alreadyCompleted: true`. `StepSummary` carries `kind`, `status`, `deadlineAt` and `externalKey`, so the UI offers *Deliver signal* only on a step with `kind === "signal"` and `status === "pending"`, and shows the external key on `run` steps. A custom `ConsoleKernel` must accept `step.signal`.
 
 Bypassing SQL updates ensures that execution leases, state machine transitions, idempotency checks, and outbox event emissions are preserved by the authoritative engine kernel.
 

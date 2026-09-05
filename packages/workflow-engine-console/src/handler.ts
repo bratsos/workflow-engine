@@ -24,6 +24,36 @@ type RunRedriveFrom =
   | { readonly kind: "start" }
   | { readonly kind: "stage"; readonly stageId: string };
 
+/** The engine's `StepSignalCommand`, restated for the same reason. */
+type StepSignalCommand = {
+  readonly type: "step.signal";
+  readonly workflowRunId: string;
+  readonly stageId: string;
+  readonly stepId: string;
+  readonly payload: unknown;
+};
+
+/**
+ * The kernel reports a signal that cannot land as a thrown `Error` whose
+ * message says why. The console answers with the status the reason
+ * deserves rather than a 500: an unknown stage is a 404, and a step that
+ * is not a pending signal is a 409, because the request was well-formed
+ * and the ledger is what refused it.
+ */
+function signalErrorStatus(error: unknown): number | undefined {
+  if (!(error instanceof Error)) return undefined;
+  const message = error.message;
+  if (/ not found$/.test(message)) return 404;
+  if (
+    message.includes("was previously used as") ||
+    message.includes("has failed and cannot receive a signal") ||
+    message.endsWith("changed state")
+  ) {
+    return 409;
+  }
+  return undefined;
+}
+
 export interface WorkflowConsoleOptions {
   /** Reads run on this. It is constructed from the caller's client or transaction; the console never opens one. */
   reader: ConsoleReadPort;
@@ -204,10 +234,11 @@ export function createWorkflowConsole(
     action: ConsoleAction,
     request: Request,
     runId?: string,
+    scope?: { stageId: string; stepId: string },
   ): Promise<boolean> {
     if (authorize === undefined) return false;
     try {
-      return (await authorize({ action, request, runId })) === true;
+      return (await authorize({ action, request, runId, ...scope })) === true;
     } catch {
       // A throw in the host's own authorisation code denies the call rather
       // than allowing it.
@@ -220,6 +251,7 @@ export function createWorkflowConsole(
     action: ConsoleAction,
     command: { readonly type: string; readonly [key: string]: unknown },
     runId?: string,
+    scope?: { stageId: string; stepId: string },
   ): Promise<Response> {
     if (readOnly) {
       return errorResponse(
@@ -228,12 +260,19 @@ export function createWorkflowConsole(
         405,
       );
     }
-    if (!(await allowed(action, request, runId))) {
+    if (!(await allowed(action, request, runId, scope))) {
       return errorResponse("forbidden", "Not permitted.", 403);
     }
     const result = await kernel!.dispatch(command);
     if (onAction) {
-      await onAction({ action, runId, request, result, at: new Date() });
+      await onAction({
+        action,
+        runId,
+        ...scope,
+        request,
+        result,
+        at: new Date(),
+      });
     }
     return json({ result });
   }
@@ -498,6 +537,39 @@ export function createWorkflowConsole(
           },
           runId,
         );
+      }
+
+      const signal =
+        /^\/runs\/([^/]+)\/stages\/([^/]+)\/steps\/([^/]+)\/signal$/.exec(api);
+      if (signal && method === "POST") {
+        const runId = decodeURIComponent(signal[1]!);
+        const stageId = decodeURIComponent(signal[2]!);
+        const stepId = decodeURIComponent(signal[3]!);
+        const body = await readBody(request);
+        // Any JSON value is a payload; an absent one is `null`, which is
+        // what a bare approval carries. `undefined` cannot arrive over JSON.
+        const payload = "payload" in body ? body.payload : null;
+        const command: StepSignalCommand = {
+          type: "step.signal",
+          workflowRunId: runId,
+          stageId,
+          stepId,
+          payload,
+        };
+        try {
+          return await dispatch(request, "step.signal", command, runId, {
+            stageId,
+            stepId,
+          });
+        } catch (error) {
+          const status = signalErrorStatus(error);
+          if (status === undefined) throw error;
+          return errorResponse(
+            status === 404 ? "not_found" : "conflict",
+            (error as Error).message,
+            status,
+          );
+        }
       }
 
       if (api === "/dead-letters/replay" && method === "POST") {

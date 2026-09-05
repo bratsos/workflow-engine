@@ -221,6 +221,38 @@ describe("in-memory read port: run detail", () => {
         errorMessage: null,
       },
     ],
+    steps: [
+      {
+        id: "step-rec-1",
+        stageRecordId: "stage-rec-2",
+        stepId: "approval",
+        seq: 2,
+        kind: "signal",
+        status: "pending",
+        attempt: 1,
+        leaseExpiresAt: null,
+        deadlineAt: at(60),
+        externalKey: null,
+        error: null,
+        createdAt: at(1),
+        updatedAt: at(1),
+      },
+      {
+        id: "step-rec-0",
+        stageRecordId: "stage-rec-1",
+        stepId: "charge",
+        seq: 1,
+        kind: "run",
+        status: "completed",
+        attempt: 1,
+        leaseExpiresAt: null,
+        deadlineAt: null,
+        externalKey: "wf:run-1:first:1:charge",
+        error: null,
+        createdAt: at(0),
+        updatedAt: at(0),
+      },
+    ],
     events: [
       {
         id: "e2",
@@ -254,6 +286,27 @@ describe("in-memory read port: run detail", () => {
     ]);
     expect(detail?.events.map((event) => event.sequence)).toEqual([1, 2]);
     expect(detail?.run.input).toEqual({ a: 1 });
+  });
+
+  it("carries what the UI needs to offer a signal on a step", async () => {
+    const reader = createInMemoryConsoleReadPort(fixtures);
+    const detail = await reader.getRunDetail("run-1");
+    expect(detail?.steps.map((step) => step.stepId)).toEqual([
+      "charge",
+      "approval",
+    ]);
+    expect(detail?.steps[0]).toMatchObject({
+      kind: "run",
+      status: "completed",
+      deadlineAt: null,
+      externalKey: "wf:run-1:first:1:charge",
+    });
+    expect(detail?.steps[1]).toMatchObject({
+      kind: "signal",
+      status: "pending",
+      deadlineAt: at(60),
+      externalKey: null,
+    });
   });
 
   it("carries the version and redrive count a stranded run is diagnosed with", async () => {
