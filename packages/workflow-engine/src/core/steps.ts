@@ -57,6 +57,15 @@ export interface StepRunOptions {
    */
   retryBackoff?: StepRetryBackoff;
   /**
+   * Extend the lease automatically while `fn` runs: every `heartbeat`
+   * (milliseconds or a duration string, shorter than `lease`) the engine
+   * pushes `leaseExpiresAt` out by `lease` from now, exactly as a body
+   * calling `step.heartbeat()` would. Defaults to `false`: the lease chosen
+   * up front is the whole budget, and a body that outlives it is taken over
+   * on the next replay.
+   */
+  heartbeat?: number | string | false;
+  /**
    * What to do when this step's lease expired and another worker takes it
    * over — the one case where the engine cannot know whether the body's side
    * effect already happened, because the worker died between the effect and
@@ -113,6 +122,16 @@ export interface StepRunContext {
    * that can recover its external effect should look for it when this is set.
    */
   readonly isReclaim: boolean;
+  /**
+   * Extend this execution's lease by the step's `lease` from now. Call it
+   * from a body that legitimately outlives its lease (between pages of a
+   * long export, say) so a replay does not take the step over mid-flight.
+   * Rejects with {@link StepLeaseLostError} when the row is no longer this
+   * execution's — the lease already expired and another worker took the
+   * step over — in which case the body's outcome will not be recorded
+   * either, and it should stop.
+   */
+  heartbeat(): Promise<void>;
 }
 
 export interface StepWaitOptions<T> {
@@ -293,6 +312,30 @@ export class StepNotReplaySafeError extends Error {
     this.name = "StepNotReplaySafeError";
     this.stepId = stepId;
     this.externalKey = externalKey;
+  }
+}
+
+/**
+ * Thrown by `step.heartbeat()` when the lease it tried to extend no longer
+ * belongs to the calling execution: the row is not `running` at this
+ * execution's attempt, because the lease expired and a replay took the step
+ * over (or recorded an outcome). The calling body has lost the
+ * compare-and-set on its own result too, so it should stop rather than
+ * finish work whose outcome will be discarded.
+ */
+export class StepLeaseLostError extends Error {
+  readonly stepId: string;
+  readonly attempt: number;
+
+  constructor(stepId: string, attempt: number) {
+    super(
+      `Durable step "${stepId}" lost its lease: attempt ${attempt} is no longer the ` +
+        `running execution of this step. Its lease expired and another replay took the ` +
+        `step over, so this execution's outcome will not be recorded.`,
+    );
+    this.name = "StepLeaseLostError";
+    this.stepId = stepId;
+    this.attempt = attempt;
   }
 }
 

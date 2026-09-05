@@ -51,6 +51,7 @@ export {
   type StepApi,
   StepInFlight,
   type StepKeyUse,
+  StepLeaseLostError,
   StepLedgerNotConfiguredError,
   StepLedgerWriteError,
   StepNotReplaySafeError,

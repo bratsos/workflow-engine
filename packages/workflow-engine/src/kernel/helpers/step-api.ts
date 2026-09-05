@@ -15,6 +15,7 @@ import {
   STEP_API_PENDING_CONTROL_FLOW,
   STEP_API_SETTLE_IN_FLIGHT,
   StepInFlight,
+  StepLeaseLostError,
   StepLedgerNotConfiguredError,
   StepLedgerWriteError,
   StepNotReplaySafeError,
@@ -157,6 +158,25 @@ function retryDelayFor(
       : parseStepDuration(backoff.maxDelay);
   const delay = Math.min(base * factor ** (failedAttempt - 1), maxDelay);
   return backoff.jitter ? Math.floor(random() * delay) : delay;
+}
+
+/** The automatic heartbeat interval of a `run` step, or undefined for none. */
+function resolveHeartbeatMs(
+  opts: StepRunOptions,
+  leaseMs: number,
+): number | undefined {
+  if (opts.heartbeat === undefined || opts.heartbeat === false)
+    return undefined;
+  const heartbeatMs = positiveDuration(
+    parseStepDuration(opts.heartbeat),
+    "heartbeat",
+  );
+  if (heartbeatMs >= leaseMs) {
+    throw new Error(
+      `heartbeat (${heartbeatMs}ms) must be shorter than the lease (${leaseMs}ms) it extends`,
+    );
+  }
+  return heartbeatMs;
 }
 
 /** Creates the StepApi attached to a single stage invocation. */
@@ -440,9 +460,11 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
       id: string,
       fn: (step: StepRunContext) => Promise<T>,
       opts: StepRunOptions = {},
+      onLeaseExtended?: (leaseUntil: number) => void,
     ) {
       const invocation = begin(id, "run");
       const leaseMs = resolveLeaseMs(opts, defaultLeaseMs);
+      const heartbeatMs = resolveHeartbeatMs(opts, leaseMs);
       const retries = nonNegativeInteger(opts.retries ?? 0, "retries");
       // Validate the delay options up front, before the body runs.
       retryDelayFor(opts, 1, () => 0);
@@ -513,13 +535,52 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
         );
       }
 
+      /**
+       * Push this execution's lease out by `leaseMs` from now. Pinned to
+       * (running, this attempt): a body whose row was already taken over
+       * cannot revive its lease, and learns so through the rejection.
+       */
+      const attempt = record.attempt;
+      const extendLease = async (): Promise<void> => {
+        const { stageRecordId, ledger } = requireLedger();
+        const leaseUntil = options.clock.now().getTime() + leaseMs;
+        const outcome = await ledger.compareAndSet(
+          stageRecordId,
+          id,
+          { status: "running", attempt },
+          { leaseExpiresAt: new Date(leaseUntil) },
+        );
+        if (!outcome.applied) throw new StepLeaseLostError(id, attempt);
+        onLeaseExtended?.(leaseUntil);
+      };
+      let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+      if (heartbeatMs !== undefined) {
+        heartbeatTimer = setInterval(() => {
+          extendLease().catch((error: unknown) => {
+            // The outcome write below will lose the same compare-and-set
+            // and report the conflict; here, stop trying.
+            if (heartbeatTimer) clearInterval(heartbeatTimer);
+            heartbeatTimer = undefined;
+            options.onLog?.(
+              "WARN",
+              `durable step "${id}" heartbeat stopped: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+          });
+        }, heartbeatMs);
+        // Never hold the process open for a body the run has abandoned.
+        (heartbeatTimer as unknown as { unref?: () => void }).unref?.();
+      }
+
       let value: T;
       try {
         value = await fn({
           stepId: id,
           externalKey: record.externalKey ?? externalKey,
-          attempt: record.attempt,
+          attempt,
           isReclaim,
+          heartbeat: extendLease,
         });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -552,6 +613,8 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
           );
         }
         throw error;
+      } finally {
+        if (heartbeatTimer) clearInterval(heartbeatTimer);
       }
 
       const encoded = jsonRoundTrip(value, id);
@@ -781,8 +844,13 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
     ) {
       const leaseUntil =
         options.clock.now().getTime() + resolveLeaseMs(opts, defaultLeaseMs);
-      const promise = impl.run(id, fn, opts);
-      const entry: InFlightRun = { done: promise, leaseUntil };
+      const entry: InFlightRun = { done: Promise.resolve(), leaseUntil };
+      // A heartbeat (manual or automatic) moves the bound `settleInFlight`
+      // waits under, so the entry tracks the extended lease.
+      const promise = impl.run(id, fn, opts, (extendedUntil) => {
+        entry.leaseUntil = extendedUntil;
+      });
+      entry.done = promise;
       inFlight.add(entry);
       // The caller owns `promise` and its rejection; this branch only
       // removes the bookkeeping entry without creating a second rejection.
