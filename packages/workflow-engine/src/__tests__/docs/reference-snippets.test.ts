@@ -89,6 +89,38 @@ describe("07-testing-patterns snippets", () => {
     });
     expect(polled.checked).toBe(0);
   });
+
+  it("cancels a run mid-body through ctx.abortSignal", async () => {
+    const slow = defineWorkflow("slow-wf", {
+      input: z.object({ id: z.string() }),
+    })
+      .stage("wait", {
+        schemas: {
+          input: z.object({ id: z.string() }),
+          output: z.object({ done: z.boolean() }),
+          config: z.object({}),
+        },
+        async execute(ctx) {
+          await new Promise<void>((resolve) =>
+            ctx.abortSignal.addEventListener("abort", () => resolve(), {
+              once: true,
+            }),
+          );
+          return { output: { done: true } };
+        },
+      })
+      .build();
+
+    const harness = createTestHarness({ workflows: [slow] });
+    const { workflowRunId } = await harness.start("slow-wf", { id: "1" });
+    const first = harness.tick(); // executes the job; the body awaits abort
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await harness.cancel(workflowRunId, "operator");
+    await first;
+    expect((await harness.persistence.getRun(workflowRunId))?.status).toBe(
+      "CANCELLED",
+    );
+  });
 });
 
 describe("12-durable-steps snippets", () => {
