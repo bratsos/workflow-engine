@@ -6,6 +6,7 @@ import type {
   StepKeyUse,
   StepRunContext,
   StepRunOptions,
+  StepSignalOptions,
   StepWaitOptions,
 } from "../../core/steps.js";
 import {
@@ -26,7 +27,12 @@ import type { Clock, StepLedger, StepRecord } from "../ports.js";
 import { createStepAi } from "./step-ai.js";
 
 const DEFAULT_LEASE_MS = 5 * 60 * 1000;
-const SIGNAL_KEEPALIVE_MS = 30_000;
+/**
+ * Default re-suspend interval of a signal wait. A landed signal wakes the
+ * stage through `step.signal`'s nextPollAt reset, so this only bounds the
+ * delay after a lost nudge; short values replay the stage body for nothing.
+ */
+const SIGNAL_KEEPALIVE_MS = 5 * 60 * 1000;
 const SLEEP_GRACE_MS = 60 * 60 * 1000;
 /**
  * Consecutive `poll` throws logged at DEBUG before the wait step escalates
@@ -627,16 +633,17 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
       );
     },
 
-    async waitForSignal<T = unknown>(
-      id: string,
-      opts: { timeout: number | string },
-    ) {
+    async waitForSignal<T = unknown>(id: string, opts: StepSignalOptions) {
       const invocation = begin(id, "signal");
       const existing = await get(invocation, "signal");
       if (existing?.status === "completed") return existing.result as T;
       if (existing?.status === "failed") throw storedError(existing);
 
       const timeoutMs = parseStepDuration(opts.timeout);
+      const keepaliveMs = positiveDuration(
+        parseStepDuration(opts.keepalive ?? SIGNAL_KEEPALIVE_MS),
+        "keepalive",
+      );
       const now = options.clock.now();
       const record =
         existing ??
@@ -666,13 +673,9 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
         new StepSuspend({
           stepId: id,
           at: current,
-          nextPollAt: boundedNextPoll(
-            current,
-            SIGNAL_KEEPALIVE_MS,
-            record.deadlineAt,
-          ),
+          nextPollAt: boundedNextPoll(current, keepaliveMs, record.deadlineAt),
           maxWaitUntil: record.deadlineAt,
-          pollInterval: SIGNAL_KEEPALIVE_MS,
+          pollInterval: keepaliveMs,
         }),
       );
     },

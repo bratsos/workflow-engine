@@ -57,6 +57,7 @@ export {
   StepResultNotSerializable,
   type StepRunContext,
   type StepRunOptions,
+  type StepSignalOptions,
   StepSuspend,
   StepTimeoutError,
   type StepWaitOptions,

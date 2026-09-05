@@ -105,6 +105,23 @@ export interface StepWaitOptions<T> {
   pollBackoffMs?: number;
 }
 
+export interface StepSignalOptions {
+  /** Non-sliding deadline from the first wait. Milliseconds or a duration string. */
+  timeout: number | string;
+  /**
+   * How often the suspended stage re-suspends while no signal has arrived.
+   * Milliseconds or a duration string; defaults to five minutes, and is
+   * never later than `timeout`.
+   *
+   * Signal latency is not governed by this: `step.signal` sets the stage's
+   * next poll to now, so the stage wakes on the host's next tick. The
+   * keepalive only bounds how long a *lost* nudge (a host that was down when
+   * the signal landed) can delay the wake, at the cost of one replay of the
+   * stage body per interval.
+   */
+  keepalive?: number | string;
+}
+
 /** `waitFor` options whose `ready` is a type guard: the result narrows to `U`. */
 export interface StepWaitOptionsNarrowing<T, U extends T>
   extends Omit<StepWaitOptions<T>, "ready"> {
@@ -134,10 +151,7 @@ export interface StepApi {
     opts: StepWaitOptionsNarrowing<T, U>,
   ): Promise<U>;
   waitFor<T>(id: string, opts: StepWaitOptions<T>): Promise<T>;
-  waitForSignal<T = unknown>(
-    id: string,
-    opts: { timeout: number | string },
-  ): Promise<T>;
+  waitForSignal<T = unknown>(id: string, opts: StepSignalOptions): Promise<T>;
   sleep(id: string, duration: number | string): Promise<void>;
   /** Durable AI calls and the realtime/batch `map` primitive. */
   readonly ai: StepAiApi;

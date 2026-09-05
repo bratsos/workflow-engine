@@ -67,7 +67,7 @@ The Prisma ledger uses the `WorkflowStep` model from the package's `prisma/schem
 interface StepApi {
   run<T>(id: string, fn: (step: StepRunContext) => Promise<T>, options?: StepRunOptions): Promise<T>;
   waitFor<T>(id: string, opts: StepWaitOptions<T>): Promise<T>;
-  waitForSignal<T = unknown>(id: string, opts: { timeout: number | string }): Promise<T>;
+  waitForSignal<T = unknown>(id: string, opts: StepSignalOptions): Promise<T>;
   sleep(id: string, duration: number | string): Promise<void>;
   /** generateText / generateObject / streamText / map — see below. */
   readonly ai: StepAiApi;
@@ -88,6 +88,11 @@ interface StepRunContext {
   readonly externalKey: string;  // stable name for this body's external effect
   readonly attempt: number;      // 1 on the first execution
   readonly isReclaim: boolean;   // an earlier execution of this body may have run
+}
+
+interface StepSignalOptions {
+  timeout: number | string;    // non-sliding deadline from the first wait
+  keepalive?: number | string; // re-suspend interval while no signal; default 5m
 }
 
 interface StepWaitOptions<T> {
@@ -126,6 +131,8 @@ const submit = defineStage({
 ```
 
 `run` executes `fn` once and stores its result. `waitFor` calls `poll` and, when `ready` is false, suspends the stage; the kernel polls again after `every`. `waitForSignal` suspends until `kernel.execute({ type: "step.signal", workflowRunId, stageId, stepId, payload })` completes the step. `sleep` suspends for the duration.
+
+A signal wait re-suspends every `keepalive` (default **five minutes**, never later than `timeout`) while nothing has arrived. That interval does not set signal latency: `step.signal` moves the stage's `nextPollAt` to now, so the stage wakes on the host's next orchestration tick whatever the keepalive is. What the keepalive bounds is how long a *lost* nudge — a host that was down when the signal landed — can delay the wake; and each keepalive costs one replay of the stage body up to the wait, so a shorter value buys nothing for a stage whose host is healthy. Raise it for a wait measured in days (`keepalive: "1h"`); lower it only when the host that would receive the nudge is unreliable.
 
 Suspension is a thrown control-flow error (`StepSuspend`, or `StepInFlight` when another worker holds a lease). The stage factory turns it into a suspended stage record marked as durable, and the kernel's poll handler replays `execute()` instead of calling `checkCompletion`. A stage may define both: the marker decides.
 
