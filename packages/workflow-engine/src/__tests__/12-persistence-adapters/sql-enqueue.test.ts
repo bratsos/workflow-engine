@@ -7,7 +7,6 @@ import { defineWorkflow } from "../../core/workflow.js";
 import { executeJobWithHeartbeat } from "../../kernel/helpers/host-support.js";
 import { createKernel } from "../../kernel/kernel.js";
 import type { Clock } from "../../kernel/ports.js";
-import type { EnginePrismaClient } from "../../persistence/prisma/prisma-client-type.js";
 import {
   CollectingEventSink,
   InMemoryBlobStore,
@@ -16,6 +15,7 @@ import {
   createPrismaJobQueue,
   createPrismaWorkflowPersistence,
 } from "../../persistence/prisma/index.js";
+import type { EnginePrismaClient } from "../../persistence/prisma/prisma-client-type.js";
 
 /**
  * Typed structurally, like the adapters themselves, so this file typechecks
