@@ -39,14 +39,16 @@ choice.
 - [`@bratsos/workflow-engine-host-node`](./packages/workflow-engine-host-node) - Node.js host with process loops, signal handling, and continuous job polling
 - [`@bratsos/workflow-engine-host-serverless`](./packages/workflow-engine-host-serverless) - Serverless host for Cloudflare Workers, AWS Lambda, Vercel Edge, etc.
 - [`@bratsos/workflow-engine-host-remote`](./packages/workflow-engine-host-remote) - Credential-free remote activity workers -- run a stage on a separate machine that never sees your database or provider credentials
+- [`@bratsos/workflow-engine-console`](./packages/workflow-engine-console) - Optional embeddable operational console: a `(Request) => Promise<Response>` handler plus a prebuilt UI you mount in your own app, reading through your own Prisma client or transaction (runs, step ledger, signals, redrive, dead letters, costs)
 
 ## Architecture
 
 The engine follows a **kernel + host** pattern:
 
-- **Core library** provides the command kernel, stage/workflow definitions, and persistence adapters.
-- **Host packages** wrap the kernel with environment-specific process management (polling loops, signal handling, request lifecycles).
+- **Core library** provides the command kernel, stage/workflow definitions, durable steps (`ctx.step.*`, backed by a step ledger), and persistence adapters.
+- **Host packages** wrap the kernel with environment-specific process management (polling loops, signal handling, request lifecycles, job lease heartbeats that abort a cancelled stage).
 - The **kernel** is a pure command dispatcher -- no timers, no signals, no global state -- making it portable across any runtime.
+- The **console** is optional and nothing in the engine depends on it.
 
 ## Development
 
@@ -58,7 +60,7 @@ pnpm test
 
 ## Documentation
 
-See the [package README](./packages/workflow-engine/README.md) for full API documentation and usage examples.
+See the [package README](./packages/workflow-engine/README.md) for full API documentation and usage examples. The agent skill under `packages/workflow-engine/skills/workflow-engine/` carries the reference (durable steps, definition versioning, redrive, large payloads, the console) and the `migrate-0.13-to-1.0.md` upgrade guide.
 
 ## License
 
