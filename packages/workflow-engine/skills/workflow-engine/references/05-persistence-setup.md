@@ -11,7 +11,10 @@ Before creating persistence instances, verify your Prisma schema:
 - [ ] `WorkflowLog` model exists (required for `ctx.log()`)
 - [ ] `WorkflowArtifact` model exists (required for stage outputs)
 - [ ] `WorkflowAnnotation` model exists (required for `kernel.annotations` / `ctx.annotate()`)
-- [ ] `JobQueue` model exists (required for job processing)
+- [ ] `WorkflowStep` model exists (required by `createPrismaStepLedger` / `ctx.step.*`; part of `EnginePrismaClient` since 1.0)
+- [ ] `WorkflowDefinition` model exists, and `WorkflowRun` carries `definitionVersion` / `redriveCount` (optional: the adapter runs without definition versioning when they are absent)
+- [ ] `WorkflowBlob` model exists (only when using `createPrismaBlobStore`)
+- [ ] `JobQueue` model exists (required for job processing) with `@@unique([workflowRunId, stageId])`
 - [ ] `OutboxEvent` model exists (required for the transactional outbox / `outbox.flush`)
 - [ ] `IdempotencyKey` model exists (required for command idempotency keys)
 - [ ] `Status` enum exists with all values: PENDING, RUNNING, SUSPENDED, COMPLETED, FAILED, CANCELLED, SKIPPED
@@ -24,26 +27,29 @@ Before creating persistence instances, verify your Prisma schema:
 | `Cannot read properties of undefined (reading 'create')` | Missing `WorkflowLog` model | Add `WorkflowLog` to schema |
 | `Cannot read properties of undefined (reading 'upsert')` | Missing `WorkflowArtifact` model | Add `WorkflowArtifact` to schema |
 | `Unknown argument 'duration'. Did you mean 'durationMs'?` | Wrong field name | Rename `durationMs` to `duration` |
+| `PrismaClient is not assignable to EnginePrismaClient` (a wall of them) | A required delegate is missing, after 1.0 almost always `workflowStep` | Add the model, run `prisma generate` |
 | `near "FOR": syntax error` | Using SQLite without `databaseType: "sqlite"` | Pass `{ databaseType: "sqlite" }` to factory functions |
 
 ## Interfaces Overview
 
-The workflow engine uses three persistence interfaces:
+The workflow engine uses five persistence ports:
 
 | Interface | Purpose |
 |-----------|---------|
-| `WorkflowPersistence` | Workflow runs, stages, logs, artifacts |
-| `JobQueue` | Job scheduling and processing |
+| `WorkflowPersistence` / `PersistenceCore` | Workflow runs, stages, definitions, logs, annotations, outbox, idempotency keys |
+| `JobQueue` (the kernel's `JobTransport` port) | Job scheduling and processing |
+| `StepLedger` | Durable step rows (`ctx.step.*`) |
+| `BlobStore` | Stage outputs, artifacts and spilled payloads |
 | `AICallLogger` | AI call tracking and stats |
 
 ## WorkflowPersistence Interface
 
-`WorkflowPersistence` (41 methods) is split into two focused interfaces, both exported from `@bratsos/workflow-engine` (and `@bratsos/workflow-engine/persistence`) alongside `WorkflowPersistence` itself:
+`PersistenceCore` and `WorkflowPersistence` are both exported from `@bratsos/workflow-engine` (and `@bratsos/workflow-engine/persistence`):
 
-- **`PersistenceCore`** (~26 methods) -- everything the kernel's handlers/helpers and the host packages actually call. The kernel's `Persistence` port (`@bratsos/workflow-engine/kernel`) derives from `PersistenceCore`, not the wider interface, so the kernel's real requirement is visible directly in the type graph.
-- **`ArtifactPersistence`** (7 methods) -- artifact/blob-adjacent methods. **The kernel does not call any of these** -- all artifact I/O goes through the `BlobStore` port instead (see [03-runtime-setup.md](03-runtime-setup.md)). `@deprecated` as a group, removal at 1.0.
+- **`PersistenceCore`** -- everything the kernel's handlers/helpers and the host packages actually call. The kernel's `Persistence` port (`@bratsos/workflow-engine/kernel`) derives from `PersistenceCore`, so the kernel's real requirement is visible directly in the type graph.
+- **`WorkflowPersistence`** -- `PersistenceCore` plus a `withTransaction` whose callback receives the full `WorkflowPersistence` surface. Since 1.0 it is nothing more than that: the pre-1.0 `ArtifactPersistence` methods (`saveArtifact`, `loadArtifact`, `saveStageOutput`, ... -- replaced by the `BlobStore` port, see [03-runtime-setup.md](03-runtime-setup.md)) and the eight legacy query methods (`getRunsByStatus`, `claimPendingRun`, `getStageById`, ...) are no longer part of the contract. The built-in adapters still carry them as plain class methods.
 
-`WorkflowPersistence extends PersistenceCore, ArtifactPersistence`, plus 8 more legacy query methods with no kernel call site (also individually `@deprecated`, each JSDoc pointing at its `getRun`/`getStagesByRun`-based replacement). This split is purely additive -- existing implementers and consumers of the full `WorkflowPersistence` interface are unaffected. **New implementers generally only need `PersistenceCore`**; the wider interface exists for backward compatibility with `PrismaWorkflowPersistence`, `InMemoryWorkflowPersistence`, and existing third-party adapters.
+**New implementers only need `PersistenceCore`**; a custom adapter is checked by `persistenceConformanceSuite` (see "Conformance suites" below).
 
 ### PersistenceCore (what the kernel actually calls)
 
@@ -58,7 +64,7 @@ interface PersistenceCore {
   getRunStatus(id: string): Promise<Status | null>;
   getStuckRuns(stuckSince: Date): Promise<WorkflowRunRecord[]>;
   listRunsForPurge(cutoff: Date, statuses: readonly PurgeableRunStatus[], limit: number): Promise<PurgeableRun[]>;   // run.purge: terminal runs finished at or before cutoff, oldest first, with their stage record ids
-  deleteRun(id: string): Promise<void>;   // run.purge: the run and everything under it (stages, logs, artifacts, annotations); missing id is a no-op
+  deleteRun(id: string): Promise<void>;   // run.purge: the run and everything under it (stages, logs, artifacts, annotations, and workflow_steps through the cascade); missing id is a no-op
   claimNextPendingRun(options?: {
     now?: Date;                                                 // the kernel clock's time, written as startedAt/updatedAt
     serves?: readonly ServedDefinition[];                       // definition versions this build serves; omit to claim any run
@@ -69,6 +75,7 @@ interface PersistenceCore {
   // behaves exactly as it did before versioning existed. See
   // 13-definition-versioning.md.
   supportsDefinitionVersioning(): boolean;
+  ensureDefinitionVersioningDetected?(): Promise<boolean>;   // optional: confirm the answer against the live database once, without a statement that can fail inside a caller's transaction
   insertDefinitionIfAbsent(input: CreateDefinitionInput): Promise<WorkflowDefinitionRecord | null>;
   getDefinition(workflowId: string, version: string): Promise<WorkflowDefinitionRecord | null>;
   countRunsByDefinitionVersion(filter?: DefinitionVersionCountFilter): Promise<DefinitionVersionCount[]>;
@@ -79,7 +86,10 @@ interface PersistenceCore {
   updateStage(id: string, data: UpdateStageInput): Promise<void>;     // must throw StaleVersionError on expectedVersion mismatch: the poll claims stages with it
   getStage(runId: string, stageId: string): Promise<WorkflowStageRecord | null>;
   getStagesByRun(runId: string, options?: { status?: Status; orderBy?: "asc" | "desc" }): Promise<WorkflowStageRecord[]>;
-  getSuspendedStages(beforeDate: Date): Promise<WorkflowStageRecord[]>;   // plain read: SUSPENDED and nextPollAt <= beforeDate; the claim happens in updateStage
+  getSuspendedStages(beforeDate: Date, options?: {
+    limit?: number;                                             // cap, oldest nextPollAt first -- the adapter owns the ordering and the cap
+    serves?: readonly ServedDefinition[];                       // same filter as claimNextPendingRun, evaluated against the stage's run
+  }): Promise<WorkflowStageRecord[]>;                           // plain read: SUSPENDED and nextPollAt <= beforeDate; the claim happens in updateStage
   deleteStage(id: string): Promise<void>;
 
   // WorkflowLog operations
@@ -123,60 +133,13 @@ interface PersistenceCore {
 }
 ```
 
-### ArtifactPersistence (deprecated -- use BlobStore)
-
-None of these are on the kernel's call path. Stage artifacts and stage output are persisted through the `BlobStore` port, not through `WorkflowPersistence`. Kept on `WorkflowPersistence` for backward compatibility; removal at 1.0.
+### WorkflowPersistence (full contract)
 
 ```typescript
-interface ArtifactPersistence {
-  /** @deprecated Unused by the kernel -- use the BlobStore port instead. */
-  saveArtifact(data: SaveArtifactInput): Promise<void>;
-  /** @deprecated Unused by the kernel -- use the BlobStore port instead. */
-  loadArtifact(runId: string, key: string): Promise<unknown>;
-  /** @deprecated Unused by the kernel -- use the BlobStore port instead. */
-  hasArtifact(runId: string, key: string): Promise<boolean>;
-  /** @deprecated Unused by the kernel -- use the BlobStore port instead. */
-  deleteArtifact(runId: string, key: string): Promise<void>;
-  /** @deprecated Unused by the kernel -- use the BlobStore port instead. */
-  listArtifacts(runId: string): Promise<WorkflowArtifactRecord[]>;
-  /** @deprecated Unused by the kernel -- use the BlobStore port instead. */
-  getStageIdForArtifact(runId: string, stageId: string): Promise<string | null>;
-  /** @deprecated Unused by the kernel -- stage output is persisted through the BlobStore port. */
-  saveStageOutput(runId: string, workflowType: string, stageId: string, output: unknown): Promise<string>;
-}
-```
-
-### WorkflowPersistence (full contract: Core + Artifact + 8 legacy query methods)
-
-```typescript
-interface WorkflowPersistence extends PersistenceCore, ArtifactPersistence {
+interface WorkflowPersistence extends PersistenceCore {
   // Redeclared (not merely inherited from PersistenceCore) so the callback
-  // receives the full WorkflowPersistence surface, including artifact methods.
+  // receives the full WorkflowPersistence surface.
   withTransaction<T>(fn: (tx: WorkflowPersistence) => Promise<T>): Promise<T>;
-
-  /** @deprecated Unused by the kernel. */
-  getRunsByStatus(status: Status): Promise<WorkflowRunRecord[]>;
-
-  /** @deprecated Unused by the kernel -- claimNextPendingRun (atomic FOR UPDATE SKIP LOCKED claim) is used instead. */
-  claimPendingRun(id: string): Promise<boolean>;
-
-  /** @deprecated Unused by the kernel -- resolve via getStage(runId, stageId) and call updateStage(stage.id, ...) instead. */
-  updateStageByRunAndStageId(workflowRunId: string, stageId: string, data: UpdateStageInput): Promise<void>;
-
-  /** @deprecated Unused by the kernel -- use getStage(runId, stageId) or getStagesByRun(runId) instead. */
-  getStageById(id: string): Promise<WorkflowStageRecord | null>;
-
-  /** @deprecated Unused by the kernel -- use getStagesByRun(runId, { status: "SUSPENDED" }) and filter by nextPollAt === null instead. */
-  getFirstSuspendedStageReadyToResume(runId: string): Promise<WorkflowStageRecord | null>;
-
-  /** @deprecated Unused by the kernel -- use getStagesByRun(runId, { status: "FAILED" }) instead. */
-  getFirstFailedStage(runId: string): Promise<WorkflowStageRecord | null>;
-
-  /** @deprecated Unused by the kernel -- use getStagesByRun(runId, { status: "COMPLETED", orderBy: "desc" }) instead. */
-  getLastCompletedStage(runId: string): Promise<WorkflowStageRecord | null>;
-
-  /** @deprecated Unused by the kernel -- use getStagesByRun(runId, { status: "COMPLETED", orderBy: "desc" }) and filter by executionGroup instead. */
-  getLastCompletedStageBefore(runId: string, executionGroup: number): Promise<WorkflowStageRecord | null>;
 }
 ```
 
@@ -190,15 +153,20 @@ interface DequeueResult {
   attempt: number;
   maxAttempts: number;
   payload: Record<string, unknown>;
+  startedAt: Date;   // this claim's attempt stamp; hand it back as the JobAckFence
 }
 ```
 
 ## JobQueue Interface
 
+`JobQueue` is the same shape as the kernel's `JobTransport` port; the built-in
+adapters satisfy both. The single-job `enqueue` is no longer on the port
+(`enqueueParallel([job])`); the built-in adapters keep it as a plain method.
+
 ```typescript
 interface JobQueue {
-  /** @deprecated Unused by the kernel -- enqueueParallel is used even for single-job enqueues. */
-  enqueue(options: EnqueueJobInput): Promise<string>;
+  /** Dotted `groupBy` path the fairness cap reads; null when fairness is off. Read by createSpillingJobTransport. */
+  readonly fairnessGroupBy?: string | null;
   enqueueParallel(jobs: EnqueueJobInput[]): Promise<string[]>;
   deleteByRunAndStages(workflowRunId: string, stageIds: string[]): Promise<number>;
   /** `serves` narrows the claim to the definition versions this host presents. */
@@ -213,8 +181,22 @@ interface JobQueue {
   cancelByRun(workflowRunId: string): Promise<number>;
   getJobsByWorkflowRun(workflowRunId: string): Promise<JobRecord[]>;
   touchJob(jobId: string): Promise<void>;
+  /** Optional: take the host's workerId unless one was configured; return the id actually stamped. */
+  adoptWorkerId?(workerId: string): string;
 }
+
+type JobAckOutcome = "acknowledged" | "superseded";
+interface JobAckFence { startedAt: Date; attempt: number; }
 ```
+
+`fail(jobId, error, true)` MUST put the job back in the queue (`PENDING`, with
+backoff, keeping its attempt count): the kernel has already recorded the stage
+as `PENDING` on that promise. A **decorator** around a transport must forward
+the optional `fence` explicitly -- a delegation that drops the trailing
+parameter still typechecks, and silently turns every fenced acknowledgement
+back into an unconditional write. A fenced `complete`/`fail`/`suspend` naming a
+job row that no longer exists must return `"superseded"` rather than throw;
+unfenced, it stays an error.
 
 ### One job row per stage per run
 
@@ -341,6 +323,70 @@ interface AICallLogger {
   isRecorded(batchId: string): Promise<boolean>;
 }
 ```
+
+## StepLedger Interface
+
+Backs `ctx.step.*` (see [12-durable-steps.md](12-durable-steps.md)). Exported
+from `@bratsos/workflow-engine` and `@bratsos/workflow-engine/kernel`; the
+bundled implementations are `InMemoryStepLedger` (`/testing`) and
+`PrismaStepLedger` (`createPrismaStepLedger`).
+
+```typescript
+interface StepLedger {
+  /** Insert-if-absent. Existing records win conflicts without throwing. */
+  claim(record: Omit<StepRecord, "createdAt" | "updatedAt">): Promise<{ created: boolean; record: StepRecord }>;
+  get(stageRecordId: string, stepId: string): Promise<StepRecord | null>;
+  update(stageRecordId: string, stepId: string, patch: StepRecordPatch): Promise<StepRecord>;
+  /** Apply `patch` only when the row's current status (and attempt, when given) equals `expected`. */
+  compareAndSet(
+    stageRecordId: string,
+    stepId: string,
+    expected: { status: StepRecord["status"]; attempt?: number },   // omit attempt to match any attempt
+    patch: StepRecordPatch,
+  ): Promise<{ applied: boolean; record: StepRecord | null }>;
+  list(stageRecordId: string): Promise<StepRecord[]>;
+  clear(stageRecordId: string): Promise<void>;
+  /** Optional: delete every row of the stage record except `keepStepIds`. A ledger without it falls back to `clear`. */
+  clearExcept?(stageRecordId: string, keepStepIds: string[]): Promise<void>;
+}
+```
+
+`StepRecordPatch` (`status`, `attempt`, `leaseExpiresAt`, `deadlineAt`, `result`,
+`error`, `waitState`) follows one rule for every field: a key that is absent, or
+present holding `undefined`, leaves that column alone; any other value,
+**`null` included**, is written. `{ result: null }` therefore records "completed
+with no value" and must overwrite whatever the row held. A ledger that skips
+nullish values replays the previous attempt's result forever, which is exactly
+what the bundled Prisma ledger did before 1.0.0-alpha.10;
+`stepLedgerConformanceSuite` holds any implementation to the rule, and to
+`compareAndSet` with and without a pinned `attempt`. `claim` on Postgres must
+not raise a unique violation on a replay (it aborts a consumer's enclosing
+transaction); `PrismaStepLedger` inserts through
+`createMany({ skipDuplicates: true })` and reads the row back.
+
+The kernel wraps whatever ledger it is given with the claim-check spill
+(`spillThresholdBytes`, see [15-large-payloads.md](15-large-payloads.md)), so
+the port itself never sees a result above the threshold.
+
+## BlobStore Interface
+
+```typescript
+interface BlobStore {
+  put(key: string, data: unknown): Promise<void>;
+  get(key: string): Promise<unknown>;
+  has(key: string): Promise<boolean>;
+  delete(key: string): Promise<void>;
+  list(prefix: string): Promise<string[]>;
+}
+```
+
+Stage outputs and replay inputs are read from the blob store by **every process
+that executes or polls a run**, so the store must be shared across them.
+`createPrismaBlobStore(prisma)` makes Prisma that shared store without object
+storage (the optional `WorkflowBlob` model below); it needs only the
+`workflowBlob` delegate, not a change to `EnginePrismaClient`. A replay whose
+blob store lacks a completed stage's output fails naming the blob key and the
+shared-store requirement.
 
 ## Prisma Schema
 
@@ -504,6 +550,7 @@ model WorkflowStage {
   logs            WorkflowLog[]
   artifacts       WorkflowArtifact[]
   annotations     WorkflowAnnotation[]
+  steps           WorkflowStep[]
 
   @@unique([workflowRunId, stageId])
   @@index([status])
@@ -512,7 +559,58 @@ model WorkflowStage {
 }
 ```
 
-`attempt` is the rerun generation: 0 for the original execution, incremented each time `run.rerunFrom` recreates the stage. Annotations written by `ctx.annotate(...)` during a stage inherit its `attempt` value so a later query can distinguish decisions made on different attempts of the same logical stage.
+`attempt` counts the executions of this stage row: 0 for the original execution, incremented by each job retry and by each `run.redrive` / `run.rerunFrom` that reopens or recreates the stage. Annotations written by `ctx.annotate(...)` during a stage inherit its `attempt` value so a later query can distinguish decisions made on different attempts of the same logical stage.
+
+### WorkflowStep Model
+
+```prisma
+model WorkflowStep {
+  id            String   @id @default(cuid())
+  stageRecordId String
+  // Foreign key "workflow_steps_stageRecordId_fkey" ON DELETE CASCADE, so
+  // deleting a stage record, or the run above it, removes its ledger rows
+  // instead of orphaning them. A table created from an earlier 1.0 alpha
+  // lacks it -- the 0.13 -> 1.0 guide has the guarded ADD CONSTRAINT.
+  stage         WorkflowStage @relation(fields: [stageRecordId], references: [id], onDelete: Cascade)
+  stepId        String
+  seq           Int
+  kind          String        // "run" | "wait" | "signal" | "sleep"
+  status        String        // "running" | "pending" | "completed" | "failed"
+  attempt        Int       @default(1)
+  leaseExpiresAt DateTime?
+  deadlineAt     DateTime?
+  // Deterministic name for the external effect a `run` step body creates,
+  // written before the body runs so an orphaned provider-side effect can be
+  // found from the row after a crash. NULL for wait/signal/sleep rows and
+  // for rows written before 1.0.0-alpha.9.
+  externalKey    String?
+  result        Json?
+  error         String?
+  waitState     Json?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@unique([stageRecordId, stepId])
+  @@index([stageRecordId])
+  @@map("workflow_steps")
+}
+```
+
+Backs `PrismaStepLedger`. Rows are keyed by the stage *record* id, so a `run.redrive` that reopens a stage in place keeps its completed rows, while one that deletes the record takes the rows with it through the cascade. `result` above `spillThresholdBytes` holds a `{ "$wfSpill": 1, key, bytes }` reference into the blob store rather than the value.
+
+### WorkflowBlob Model (optional)
+
+```prisma
+// Only when using createPrismaBlobStore.
+model WorkflowBlob {
+  key       String   @id
+  data      Json
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("workflow_blobs")
+}
+```
 
 ### WorkflowLog Model
 
@@ -728,7 +826,9 @@ import {
   createPrismaWorkflowPersistence,
   createPrismaJobQueue,
   createPrismaAICallLogger,
-} from "@bratsos/workflow-engine/persistence/prisma";
+  createPrismaBlobStore,
+  createPrismaStepLedger,
+} from "@bratsos/workflow-engine";   // also re-exported from "@bratsos/workflow-engine/persistence/prisma"
 import { PrismaClient } from "@prisma/client";
 
 const prisma = new PrismaClient();
@@ -756,16 +856,19 @@ const jobQueue = createPrismaJobQueue(prisma, {
 });
 ```
 
-`PrismaWorkflowPersistence`, `PrismaJobQueue`, `PrismaAICallLogger`, and `createEnumHelper` no longer accept `prisma: any`. They now require a structural `EnginePrismaClient` shape (an internal type, not exported from any public entry point -- you never import or write it by name). Any real Prisma-generated client (6.x or 7.x) satisfies it automatically, since it only requires the delegates the adapters actually call plus optional `$transaction`/`$queryRaw`/`$queryRawUnsafe`/`$executeRaw`/`$Enums`. The required delegates are exactly: `workflowRun`, `workflowStage`, `workflowStep`, `workflowLog`, `workflowArtifact`, `workflowAnnotation`, `outboxEvent`, `idempotencyKey`, `jobQueue`, `aICall`. **A wall of `PrismaClient is not assignable to EnginePrismaClient` errors means one of those models is missing from your schema** (after an upgrade to 1.0 it is almost always `WorkflowStep`): add the model, run `prisma generate`, and the error goes away.
+`PrismaWorkflowPersistence`, `PrismaJobQueue`, `PrismaAICallLogger`, `PrismaStepLedger` and `createEnumHelper` do not accept `prisma: any`. They require a structural `EnginePrismaClient` shape (an internal type, not exported from any public entry point -- you never import or write it by name). Any real Prisma-generated client (6.x or 7.x) satisfies it automatically, since it only requires the delegates the adapters actually call plus optional `$transaction`/`$queryRaw`/`$queryRawUnsafe`/`$executeRaw`/`$Enums`. The required delegates are exactly: `workflowRun`, `workflowStage`, `workflowStep`, `workflowLog`, `workflowArtifact`, `workflowAnnotation`, `outboxEvent`, `idempotencyKey`, `jobQueue`, `aICall`; `workflowDefinition` is optional (its absence turns definition versioning off rather than failing to start), and `createPrismaBlobStore` needs only `workflowBlob`. **A wall of `PrismaClient is not assignable to EnginePrismaClient` errors means one of those models is missing from your schema** (after an upgrade to 1.0 it is almost always `WorkflowStep`): add the model, run `prisma generate`, and the error goes away. The only other visible effect is on hand-written mocks/fakes: a `PrismaClient`-shaped test double missing a delegate the adapter actually calls fails to typecheck, where it previously compiled silently under `any`. No runtime behavior change.
 
-If your schema names the status enum differently (for example `WorkflowStatus`, with or without `@@map`), pass it: the Postgres claim path casts with `::"<name>"` (since 0.11) and fails with `42704 type "Status" does not exist` otherwise. The persistence and job queue also accept a `now` clock; the raw statements bind that JS `Date` (UTC) instead of `NOW()`.
+If your schema names the status enum differently (for example `WorkflowStatus`, with or without `@@map`), pass it: the Postgres claim path casts with `::"<name>"` (since 0.11) and fails with `42704 type "Status" does not exist` otherwise. The persistence also accepts a `now` clock; the raw claim statement binds that JS `Date` (converted with `AT TIME ZONE 'UTC'`) instead of `NOW()`. The job queue accepts `now` too, but on PostgreSQL the lease stamps (`lockedAt`, `startedAt`) come from the database clock and `staleLeaseThresholdMs` is measured there; `now` only feeds the SQLite dequeue and the timestamps written outside the raw statement.
 
 ```typescript
 const persistence = createPrismaWorkflowPersistence(prisma, {
   statusEnumName: "WorkflowStatus",   // default "Status"
   now: () => clock.now(),             // default () => new Date()
+  definitionVersioning: undefined,    // unset: detect from the generated client, then confirm against the database once
 });
-``` The only visible effect is on hand-written mocks/fakes: a `PrismaClient`-shaped test double missing a delegate the adapter actually calls now fails to typecheck, where it previously compiled silently under `any`. No runtime behavior change.
+```
+
+`definitionVersioning` is the escape hatch that skips both checks: `false` for a client whose schema carries the models against a database deliberately left unmigrated, `true` for a model surface the structural detection cannot see (a hand-written wrapper, a proxy). Left unset, the client is checked synchronously for a `workflowDefinition` delegate and the database is confirmed once, lazily, through a catalogue read (`to_regclass` / `pg_attribute` on Postgres, `sqlite_master` / `pragma_table_info` on SQLite) that answers "absent" instead of raising, so it cannot abort a transaction the kernel is running inside.
 
 ## Database Type Options
 
@@ -780,12 +883,22 @@ The Prisma implementations support both PostgreSQL and SQLite:
 type DatabaseType = "postgresql" | "sqlite";
 
 interface PrismaWorkflowPersistenceOptions {
-  databaseType?: DatabaseType;  // Default: "postgresql"
+  databaseType?: DatabaseType;          // Default: "postgresql"
+  skipInteractiveTransactions?: boolean; // Default: false
+  statusEnumName?: string;              // Default: "Status"
+  now?: () => Date;                     // Default: () => new Date()
+  definitionVersioning?: boolean;       // Default: detected (see above)
 }
 
 interface PrismaJobQueueOptions {
   workerId?: string;            // Default: auto-generated, or the host's (see below)
   databaseType?: DatabaseType;  // Default: "postgresql"
+  now?: () => Date;             // SQLite dequeue and non-raw writes only; Postgres lease stamps use the database clock
+  fairness?: JobQueueFairness;  // Postgres only; see "Per-group fairness"
+}
+
+interface PrismaStepLedgerOptions {
+  databaseType?: DatabaseType;  // "sqlite" keeps the create-and-catch claim; Postgres uses createMany({ skipDuplicates: true })
 }
 ```
 
@@ -811,7 +924,7 @@ A custom `JobTransport` may implement `adoptWorkerId(workerId): string` -- take 
 id unless one was explicitly configured, and return the id you will actually stamp.
 Omitting the method is fine; the host then leaves the transport alone.
 
-**Important:** When using SQLite, pass `{ databaseType: "sqlite" }` to both `createPrismaWorkflowPersistence` and `createPrismaJobQueue`. Otherwise, you'll get SQL syntax errors from PostgreSQL-specific queries.
+**Important:** When using SQLite, pass `{ databaseType: "sqlite" }` to `createPrismaWorkflowPersistence`, `createPrismaJobQueue` and `createPrismaStepLedger`. Otherwise, you'll get SQL syntax errors from PostgreSQL-specific queries (or, for the step ledger, a `skipDuplicates` the driver does not support).
 
 ## Prisma Version Compatibility
 
@@ -870,6 +983,8 @@ interface WorkflowRunRecord {
   totalTokens: number;
   priority: number;
   metadata: unknown | null;
+  definitionVersion: string | null;   // null for a run created before the migration; claimable by any host that holds its workflow
+  redriveCount: number;               // times run.redrive has re-driven this run; never reset
 }
 
 interface WorkflowStageRecord {
@@ -913,6 +1028,7 @@ interface CreateRunInput {
   config?: unknown;
   priority?: number;
   metadata?: Record<string, unknown>;  // Domain-specific fields
+  definitionVersion?: string | null;   // adapters without the column ignore it and store null
 }
 
 interface UpdateRunInput {
@@ -924,6 +1040,8 @@ interface UpdateRunInput {
   totalCost?: number;
   totalTokens?: number;
   expectedVersion?: number;  // optimistic concurrency; version always bumps regardless
+  definitionVersion?: string | null;  // re-pin (run.redrive)
+  redriveCount?: number;              // absolute value; run.redrive writes current + 1
 }
 
 interface CreateStageInput {
@@ -942,8 +1060,8 @@ interface CreateStageInput {
 interface UpdateStageInput {
   status?: WorkflowStageStatus;
   startedAt?: Date;
-  completedAt?: Date;
-  duration?: number;
+  completedAt?: Date | null;   // null clears an earlier attempt's completion (run.redrive reopen)
+  duration?: number | null;
   outputData?: unknown;
   config?: unknown;
   suspendedState?: unknown;
@@ -954,14 +1072,15 @@ interface UpdateStageInput {
   metrics?: unknown;
   embeddingInfo?: unknown;
   artifacts?: unknown;
-  errorMessage?: string;
+  errorMessage?: string | null;   // null clears the stale error of an earlier attempt
+  attempt?: number;               // job retries and redrives write existingStage.attempt + 1
   expectedVersion?: number;
 }
 ```
 
 ## Custom Persistence Implementation
 
-For non-Prisma databases or testing. Target `PersistenceCore` (not the full `WorkflowPersistence`) unless you specifically need the deprecated artifact methods for backward compatibility -- it's the ~26-method subset the kernel actually calls:
+For non-Prisma databases or testing. Target `PersistenceCore` -- it is what the kernel actually calls. Since 1.0 that includes `listRunsForPurge` / `deleteRun` (`run.purge`), the four definition-versioning methods (an adapter without the schema returns `false` / `null` / `[]` and ignores `serves`), `claimNextPendingRun`'s `serves` option, and `getSuspendedStages`'s `{ limit, serves }` -- the adapter must order oldest `nextPollAt` first and cap at `limit`, or the poller's `maxChecks` window fills with rows it cannot act on:
 
 ```typescript
 import type { PersistenceCore } from "@bratsos/workflow-engine";
@@ -990,6 +1109,8 @@ class CustomPersistence implements PersistenceCore {
       totalTokens: 0,
       priority: data.priority ?? 5,
       metadata: data.metadata ?? null,
+      definitionVersion: data.definitionVersion ?? null,
+      redriveCount: 0,
     };
     this.runs.set(run.id, run);
     return run;
@@ -1008,6 +1129,39 @@ class CustomPersistence implements PersistenceCore {
   // ... implement other methods
 }
 ```
+
+### Conformance suites
+
+`@bratsos/workflow-engine/testing` exports one shared suite per port, and each
+takes the test primitives as its third argument (`ConformanceTestApi`:
+`{ describe, it, expect, beforeEach }`) so the entry imports nothing from
+vitest:
+
+```typescript
+import { describe, it, expect, beforeEach } from "vitest";
+import {
+  persistenceConformanceSuite,
+  jobQueueConformanceSuite,
+  aiCallLoggerConformanceSuite,
+  stepLedgerConformanceSuite,
+} from "@bratsos/workflow-engine/testing";
+
+const api = { describe, it, expect, beforeEach };
+persistenceConformanceSuite("my-persistence", () => createMyPersistence(), api);
+jobQueueConformanceSuite("my-queue", () => createMyQueue(), api);
+aiCallLoggerConformanceSuite("my-logger", () => createMyLogger(), api);
+stepLedgerConformanceSuite("my-ledger", () => createMyLedger(), api);
+```
+
+The first three take a factory returning the adapter plus an optional
+argument-less `clear()` (`ResettableFixture`); `stepLedgerConformanceSuite`
+takes a `StepLedgerFactory` returning a `StepLedgerFixture`
+(`StepLedger & { reset?: () => Promise<void> }`) instead, because `StepLedger`
+has a `clear(stageRecordId)` of its own. The suites cover `listRunsForPurge` /
+`deleteRun`, the outbox claim/release pair, the fenced and unfenced job
+acknowledgements, `enqueueParallel`'s idempotency, `deleteByRunAndStages`,
+`clearExcept`, `compareAndSet` with and without a pinned attempt, and the
+`StepRecordPatch` null rule.
 
 ## Database Migrations
 
@@ -1076,10 +1230,14 @@ Requires PostgreSQL 13+ (built-in `gen_random_uuid()`).
 ### Indexes
 
 The schema includes indexes for common query patterns:
-- `status` - for polling pending/running workflows
+- `(status, priority DESC, createdAt)` on `workflow_runs` and `job_queue` - the run claim and the dequeue, `FOR UPDATE SKIP LOCKED`, flat with depth
+- `(createdAt DESC, id DESC)` and its `status` / `workflowId` prefixes on `workflow_runs` - newest-first listings, keyset paginated
+- `(definitionVersion)` and `(status, workflowId, definitionVersion)` on `workflow_runs` - version lookups and the version-filtered claim
 - `nextPollAt` - for suspended stage polling (`stage.pollSuspended` reads `SUSPENDED` rows with `nextPollAt <= now`, then claims each by moving `nextPollAt` forward with `expectedVersion`; a custom adapter needs the version guard on `updateStage` for two orchestrators to poll safely)
-- `workflowRunId` - for stage/log lookups
-- `createdAt` - for ordering
+- `workflowRunId` / `stageRecordId` - for stage/log/step lookups
+- `dlqAt` on `outbox_events` - the dead-letter view (a partial `WHERE "dlqAt" IS NOT NULL` index is better where you write the migration by hand)
+
+The 0.13 -> 1.0 guide has the `CREATE INDEX CONCURRENTLY` statements and the measurements behind them.
 
 ### Job Queue Atomicity
 
@@ -1087,17 +1245,25 @@ The schema includes indexes for common query patterns:
 
 ```sql
 UPDATE job_queue
-SET status = 'RUNNING', workerId = $1, lockedAt = NOW()
+SET status = 'RUNNING', "workerId" = $1,
+    "lockedAt" = now() AT TIME ZONE 'UTC', "startedAt" = now() AT TIME ZONE 'UTC',
+    attempt = attempt + 1
 WHERE id = (
   SELECT id FROM job_queue
   WHERE status = 'PENDING'
-    AND (nextPollAt IS NULL OR nextPollAt <= NOW())
-  ORDER BY priority DESC, createdAt ASC
+    AND ("nextPollAt" IS NULL OR "nextPollAt" <= now() AT TIME ZONE 'UTC')
+    -- plus the `serves` predicate on payload._workflowId / _definitionVersion
+  ORDER BY priority DESC, "createdAt" ASC
   LIMIT 1
   FOR UPDATE SKIP LOCKED
 )
-RETURNING *;
+RETURNING id, "workflowRunId", "stageId", priority, attempt, "maxAttempts", payload, "startedAt";
 ```
+
+The lease stamps come from the database clock, rendered as naive UTC (so
+`staleLeaseThresholdMs` is a duration measured there, immune to a host whose
+system clock is skewed), and `startedAt` is returned because it is the fence
+the worker hands back -- see "Timestamps" and "Fenced acknowledgements" above.
 
 **SQLite** uses optimistic locking with retry:
 
