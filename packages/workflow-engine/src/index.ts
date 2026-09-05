@@ -48,6 +48,9 @@ export {
   DuplicateStepKeyError,
   isDuplicateStepKeyError,
   isStepControlFlowError,
+  neverAbortingSignal,
+  StageAbortedError,
+  type StageAbortReason,
   type StepApi,
   StepInFlight,
   type StepKeyUse,
@@ -60,6 +63,7 @@ export {
   StepSuspend,
   StepTimeoutError,
   type StepWaitOptions,
+  stageAbortReason,
 } from "./core/steps";
 export { type StageResult } from "./core/types";
 // Core Workflow
@@ -254,6 +258,8 @@ export type {
   DefinitionVersionSummary,
   JobExecuteCommand,
   JobExecuteResult,
+  JobHeartbeatCommand,
+  JobHeartbeatResult,
   KernelCommand,
   LeaseReapStaleCommand,
   LeaseReapStaleResult,

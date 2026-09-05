@@ -86,6 +86,7 @@ interface StepRunContext {
   readonly externalKey: string;  // stable name for this body's external effect
   readonly attempt: number;      // 1 on the first execution
   readonly isReclaim: boolean;   // an earlier execution of this body may have run
+  readonly abortSignal: AbortSignal; // same as ctx.abortSignal; see "Cancellation"
 }
 
 interface StepWaitOptions<T> {
@@ -198,6 +199,54 @@ tells you is that the *body* ran more than once, which is the case where a
 duplicate external effect is possible — so treat the annotation as the cue to
 look for one under that external key, and, if the effect cannot be
 deduplicated, to give the step `onReclaim: "fail"`.
+
+### Cancellation and lost leases: `ctx.abortSignal`
+
+`run.cancel` marks the run and its open stages `CANCELLED` and purges the
+queue, and the job that is executing at that moment has its outcome discarded
+by the ghost-job guard when it finishes. Without a signal that is *all* that
+happens: a body in the middle of a ten-minute model call, or a `waitFor`
+about to poll, runs to completion for nothing. `ctx.abortSignal` is that
+signal — an `AbortSignal` on the stage context, and the same object as
+`step.abortSignal` inside every `run` body (named `abortSignal`, not
+`signal`, so it is not confused with `waitForSignal`).
+
+```typescript
+async execute(ctx) {
+  const draft = await ctx.step.run("draft", (step) =>
+    ctx.ai.generateText("gpt", prompt, { abortSignal: step.abortSignal }),
+  );
+  const res = await fetch(url, { signal: ctx.abortSignal });
+  ...
+}
+```
+
+It is aborted from the host's **job lease heartbeat**: `executeJobWithHeartbeat`
+dispatches `job.heartbeat` on `jobHeartbeatIntervalMs` (default 60 s), which
+renews the lease and reports the run's status and whether this worker still
+holds the job. That beat is the only point in the host loop that touches
+persistence while a body runs, so it is where the body learns to stop; the
+latency is one heartbeat interval. `abortSignal.reason` is a
+`StageAbortedError` whose `reason` is:
+
+- `"cancelled"` — the run is `CANCELLED`. A `run` body that finishes after
+  this is **not** recorded as completed: the step row is written `failed`
+  with the cancellation as its error, no retry is spent (no replay is
+  coming), and the cancellation is thrown. `waitFor` checks the signal
+  before it calls `poll` and throws without polling; the wait row stays
+  `pending`.
+- `"lease-lost"` — the job lease was released (a stale-lease reap, the
+  absolute cap) or re-claimed by another worker. Another worker may already
+  be executing the same stage, and this job's outcome will be discarded as
+  superseded. A `run` body that finishes after this *is* still recorded —
+  the step row has its own lease and compare-and-set, so whichever worker
+  checkpoints first owns the outcome, as in the section above.
+
+`stageAbortReason(signal)` returns the reason or `undefined`. A context
+built without a host loop — a direct `job.execute` dispatch, a replay from
+`stage.pollSuspended`, a remote activity worker — carries a signal that never
+fires. Honouring it is optional: the engine discards a cancelled invocation's
+result either way, so the signal only saves the work.
 
 ### Concurrency
 
@@ -457,6 +506,12 @@ expect(result.status).toBe("COMPLETED");
 `{ modelKey, prompt, kind }`, and the armed scripts are shared with every
 child helper — so arming one on the harness's root helper fires inside the
 stage-scoped helper the kernel actually injects.
+
+`harness.cancel(workflowRunId, reason?)` dispatches `run.cancel`. The
+harness's `tick()` runs jobs under the real heartbeat on a short wall-clock
+interval (`jobHeartbeatIntervalMs`, default 10 ms), so a body can call
+`cancel` and then `await` its own `step.abortSignal` to test the cancellation
+path.
 
 ## Migrating an async-batch stage to steps
 

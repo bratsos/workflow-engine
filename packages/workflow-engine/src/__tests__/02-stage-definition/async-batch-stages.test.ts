@@ -720,6 +720,7 @@ function createMockContext<TInput>(options: {
     aiLogger: testAiLogger,
     onProgress: () => {},
     step: createTestStepApi(),
+    abortSignal: new AbortController().signal,
     onLog: () => {},
     log: () => {},
     annotate: () => {},

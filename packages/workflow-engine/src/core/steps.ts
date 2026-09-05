@@ -86,6 +86,59 @@ export interface StepRunContext {
    * that can recover its external effect should look for it when this is set.
    */
   readonly isReclaim: boolean;
+  /**
+   * The same signal as `ctx.abortSignal`: aborted when the run is cancelled
+   * while this body executes, or when the job lease this worker holds is
+   * lost. Pass it to `fetch`, the AI helper, or anything else that can be
+   * interrupted. `abortSignal.reason` is a {@link StageAbortedError}.
+   */
+  readonly abortSignal: AbortSignal;
+}
+
+/** Why a stage invocation was told to stop. */
+export type StageAbortReason = "cancelled" | "lease-lost";
+
+/**
+ * The `reason` a stage's `abortSignal` carries.
+ *
+ * - `"cancelled"`: `run.cancel` marked the run CANCELLED while a job of it
+ *   was executing. Nothing the body produces will be kept.
+ * - `"lease-lost"`: the job lease this worker held was released or taken
+ *   over (a stale-lease reap, the absolute cap, or a re-claim by another
+ *   worker). Another worker may already be executing the same stage; the
+ *   job's outcome will be discarded as superseded.
+ */
+export class StageAbortedError extends Error {
+  readonly reason: StageAbortReason;
+  readonly workflowRunId: string;
+
+  constructor(reason: StageAbortReason, workflowRunId: string) {
+    super(
+      reason === "cancelled"
+        ? `Run ${workflowRunId} was cancelled while the stage was executing`
+        : `The job lease for run ${workflowRunId} was lost while the stage was executing`,
+    );
+    this.name = "StageAbortedError";
+    this.reason = reason;
+    this.workflowRunId = workflowRunId;
+  }
+}
+
+/**
+ * The reason a stage abort signal carries, or `undefined` when the signal is
+ * not aborted or was aborted by something other than the engine.
+ */
+export function stageAbortReason(
+  signal: AbortSignal,
+): StageAbortReason | undefined {
+  if (!signal.aborted) return undefined;
+  const reason: unknown = signal.reason;
+  return reason instanceof StageAbortedError ? reason.reason : undefined;
+}
+
+/** A signal that never fires, for contexts built without a host loop. */
+export function neverAbortingSignal(): AbortSignal {
+  return new AbortController().signal;
 }
 
 export interface StepWaitOptions<T> {

@@ -67,11 +67,13 @@ It returns the kernel and every port it built, plus the two driver methods:
 | `start(workflowId, input, config?)` | create a run without driving it |
 | `tick()` | do exactly one round and return a `TickReport` |
 | `tickUntil(predicate, { maxTicks? })` | tick until `predicate` holds, then return the reports |
+| `cancel(workflowRunId, reason?)` | dispatch `run.cancel`; a body executing under `tick()` sees `ctx.abortSignal` abort on the next heartbeat |
 
 Options: `workflows`, `services` (merged over the mock AI defaults), `clock`,
 `stepLedger`, `aiLogger`, `mockAi`, `workerId`, `eventSink`, `plugins`,
-`maxTicks` (default 100 — `run()` throws rather than hang) and
-`idleAdvanceMs`.
+`maxTicks` (default 100 — `run()` throws rather than hang), `idleAdvanceMs`,
+`spillThresholdBytes` and `jobHeartbeatIntervalMs` (wall-clock, default
+10 ms — the heartbeat is what aborts `ctx.abortSignal` after `cancel()`).
 
 ## Mocking durable steps
 

@@ -1,5 +1,6 @@
 import type { AIHelper, LogContext } from "../../ai/types.js";
 import type { StageContext } from "../../core/stage.js";
+import { neverAbortingSignal } from "../../core/steps.js";
 import type { ProgressUpdate } from "../../core/types.js";
 import type { Workflow } from "../../core/workflow.js";
 import type {
@@ -107,6 +108,7 @@ export function buildStageExecutionContext(
     resumeState,
     workflowContext,
   } = input;
+  const abortSignal = input.abortSignal ?? neverAbortingSignal();
 
   const progressEvents: KernelEvent[] = [];
   const annotationBuffer = createAnnotationBuffer();
@@ -178,10 +180,12 @@ export function buildStageExecutionContext(
       stageRecordId,
       stepLedger: deps.stepLedger,
       clock: deps.clock,
+      abortSignal,
       onLog: (level, message) => void logFn(level, message),
       onAnnotate: (key, value, opts) => annotateFn(key, value, opts),
       ai: () => context.ai,
     }),
+    abortSignal,
     onProgress: (update: ProgressUpdate) => {
       progressEvents.push({
         type: "stage:progress",

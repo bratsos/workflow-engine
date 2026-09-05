@@ -11,6 +11,7 @@
 import type {
   AnnotationActor,
   ServedDefinition,
+  Status,
 } from "../persistence/interface";
 
 // ---------------------------------------------------------------------------
@@ -174,6 +175,13 @@ export interface JobExecuteCommand {
    */
   readonly attempt?: number;
   readonly maxAttempts?: number;
+  /**
+   * Becomes `ctx.abortSignal` for the stage invocation. The host loop
+   * aborts it from its lease heartbeat when the run is cancelled or the
+   * job lease is lost (`job.heartbeat`). Optional and never persisted: a
+   * dispatch without one gives the stage a signal that never fires.
+   */
+  readonly abortSignal?: AbortSignal;
 }
 
 /** Result of a `job.execute` command. */
@@ -265,6 +273,41 @@ export interface StepSignalResult {
   readonly signalled: boolean;
   readonly ok: true;
   readonly alreadyCompleted: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// job.heartbeat
+// ---------------------------------------------------------------------------
+
+/**
+ * One beat of a host's job lease heartbeat: renews the lease and reports
+ * whether the work is still wanted. Dispatched by `executeJobWithHeartbeat`
+ * on its heartbeat interval while `job.execute` runs; a custom host that
+ * drives `job.execute` itself can dispatch it to feed the stage's
+ * `abortSignal`. No idempotency, no transaction, no outbox events.
+ */
+export interface JobHeartbeatCommand {
+  readonly type: "job.heartbeat";
+  readonly jobId: string;
+  readonly workflowRunId: string;
+  /**
+   * The attempt this worker dequeued. When given, a job row carrying a
+   * different attempt is reported as a lost lease even though it is
+   * RUNNING: another worker re-claimed it after a stale-lease release.
+   */
+  readonly attempt?: number;
+}
+
+/** Result of a `job.heartbeat` command. */
+export interface JobHeartbeatResult {
+  /** The run's status as of this beat, or `null` when the run is gone. */
+  readonly runStatus: Status | null;
+  /**
+   * False when the job row is no longer RUNNING under this worker's attempt
+   * — released as stale, expired by the absolute cap, cancelled, or
+   * re-claimed by another worker. `touchJob` was a no-op in that case.
+   */
+  readonly leaseHeld: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -505,6 +548,7 @@ export type KernelCommand =
   | RunRedriveCommand
   | RunListVersionsCommand
   | JobExecuteCommand
+  | JobHeartbeatCommand
   | StagePollSuspendedCommand
   | StepSignalCommand
   | LeaseReapStaleCommand
@@ -532,16 +576,18 @@ export type CommandResult<T extends KernelCommand> = T extends RunCreateCommand
               ? RunListVersionsResult
               : T extends JobExecuteCommand
                 ? JobExecuteResult
-                : T extends StagePollSuspendedCommand
-                  ? StagePollSuspendedResult
-                  : T extends StepSignalCommand
-                    ? StepSignalResult
-                    : T extends LeaseReapStaleCommand
-                      ? LeaseReapStaleResult
-                      : T extends OutboxFlushCommand
-                        ? OutboxFlushResult
-                        : T extends PluginReplayDLQCommand
-                          ? PluginReplayDLQResult
-                          : T extends RunReapStuckCommand
-                            ? RunReapStuckResult
-                            : never;
+                : T extends JobHeartbeatCommand
+                  ? JobHeartbeatResult
+                  : T extends StagePollSuspendedCommand
+                    ? StagePollSuspendedResult
+                    : T extends StepSignalCommand
+                      ? StepSignalResult
+                      : T extends LeaseReapStaleCommand
+                        ? LeaseReapStaleResult
+                        : T extends OutboxFlushCommand
+                          ? OutboxFlushResult
+                          : T extends PluginReplayDLQCommand
+                            ? PluginReplayDLQResult
+                            : T extends RunReapStuckCommand
+                              ? RunReapStuckResult
+                              : never;

@@ -12,6 +12,8 @@ export type {
   EventSinkStatus,
   JobExecuteCommand,
   JobExecuteResult,
+  JobHeartbeatCommand,
+  JobHeartbeatResult,
   KernelCommand,
   KernelCommandType,
   LeaseReapStaleCommand,
