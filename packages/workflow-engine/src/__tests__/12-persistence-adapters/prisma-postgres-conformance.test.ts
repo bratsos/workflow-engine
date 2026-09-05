@@ -122,11 +122,43 @@ if (!DATABASE_URL) {
       api,
     );
 
+    /**
+     * `workflow_steps.stageRecordId` is a cascading foreign key to
+     * `workflow_stages.id`, so the ledger suites -- which claim rows against
+     * bare stage ids -- need those stage records (and a parent run) to exist
+     * on a real schema. The in-memory fake has no such constraint.
+     */
+    async function seedStageRecords(stageRecordIds: string[]): Promise<void> {
+      const run = await prisma.workflowRun.create({
+        data: {
+          workflowId: "pg-step-ledger-workflow",
+          workflowName: "PG Step Ledger Workflow",
+          workflowType: "pg-step-ledger",
+          input: {},
+        },
+      });
+      await prisma.workflowStage.createMany({
+        data: stageRecordIds.map((id, index) => ({
+          id,
+          workflowRunId: run.id,
+          stageId: id,
+          stageName: id,
+          stageNumber: index + 1,
+          executionGroup: index + 1,
+        })),
+      });
+    }
+
     stepLedgerConformanceSuite(
       "PrismaStepLedger (Postgres)",
       () => {
         const ledger = createPrismaStepLedger(prisma);
-        return Object.assign(ledger, { reset: truncateAll });
+        return Object.assign(ledger, {
+          reset: async () => {
+            await truncateAll();
+            await seedStageRecords(["stage-1", "stage-2"]);
+          },
+        });
       },
       api,
     );
@@ -146,7 +178,8 @@ if (!DATABASE_URL) {
       const stageRecordId = "pg-step-ledger-stage";
 
       beforeEach(async () => {
-        await prisma.workflowStep.deleteMany({ where: { stageRecordId } });
+        await truncateAll();
+        await seedStageRecords([stageRecordId]);
       });
 
       it("round-trips the external key written before the body runs", async () => {

@@ -147,6 +147,7 @@ model WorkflowStage {
   logs        WorkflowLog[]
   artifacts   WorkflowArtifact[]
   annotations WorkflowAnnotation[]
+  steps       WorkflowStep[]
 
   @@unique([workflowRunId, stageId])
   @@index([status])
@@ -157,6 +158,11 @@ model WorkflowStage {
 model WorkflowStep {
   id            String   @id @default(cuid())
   stageRecordId String
+  // Migration SQL note: add the foreign key
+  // "workflow_steps_stageRecordId_fkey" (stageRecordId -> workflow_stages.id
+  // ON DELETE CASCADE) so deleting a stage record, or the run above it,
+  // removes its ledger rows instead of orphaning them.
+  stage         WorkflowStage @relation(fields: [stageRecordId], references: [id], onDelete: Cascade)
   stepId        String
   seq           Int
   kind          String

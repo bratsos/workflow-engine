@@ -23,6 +23,7 @@ Verified against `git diff` of the package's `prisma/schema.prisma` between 0.13
   model WorkflowStep {
     id             String    @id @default(cuid())
     stageRecordId  String
+    stage          WorkflowStage @relation(fields: [stageRecordId], references: [id], onDelete: Cascade)
     stepId         String
     seq            Int
     kind           String
@@ -43,6 +44,8 @@ Verified against `git diff` of the package's `prisma/schema.prisma` between 0.13
   }
   ```
 
+  Add the back-relation `steps WorkflowStep[]` to your `WorkflowStage` model.
+
   ```sql
   CREATE TABLE IF NOT EXISTS "workflow_steps" (
     "id"             TEXT PRIMARY KEY,
@@ -59,7 +62,10 @@ Verified against `git diff` of the package's `prisma/schema.prisma` between 0.13
     "error"          TEXT,
     "waitState"      JSONB,
     "createdAt"      TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "updatedAt"      TIMESTAMP(3) NOT NULL
+    "updatedAt"      TIMESTAMP(3) NOT NULL,
+    CONSTRAINT "workflow_steps_stageRecordId_fkey"
+      FOREIGN KEY ("stageRecordId") REFERENCES "workflow_stages"("id")
+      ON DELETE CASCADE ON UPDATE CASCADE
   );
   CREATE UNIQUE INDEX IF NOT EXISTS "workflow_steps_stageRecordId_stepId_key"
     ON "workflow_steps"("stageRecordId", "stepId");
@@ -67,7 +73,25 @@ Verified against `git diff` of the package's `prisma/schema.prisma` between 0.13
     ON "workflow_steps"("stageRecordId");
   ```
 
-  `stageRecordId` is the `WorkflowStage.id` of the stage execution; there is deliberately no foreign key, so the ledger can be cleared and re-filled independently of the stage row. `result` holds the JSON the step returned (a `download` step that returns the whole document stores the whole document — return a key or a summary when the payload is large). `externalKey` (added in 1.0.0-alpha.9) is the deterministic name of the external effect a `run` body creates, written before the body runs; it is what lets an operator find a provider-side effect orphaned by a crash. **If you created `workflow_steps` from an earlier 1.0 alpha, add the column:**
+  `stageRecordId` is the `WorkflowStage.id` of the stage execution. The foreign key cascades: deleting a stage record — or the run above it, through `workflow_stages`' own cascade — removes its ledger rows with it, so a run deleted by hand or by `run.purge` leaves no orphans in `workflow_steps`. The kernel still clears the ledger explicitly (`StepLedger.clear` / `clearExcept` on a rerun, and `run.purge` before it deletes the run) because the `StepLedger` port is pluggable and a non-Prisma ledger has no cascade to rely on. **If you created `workflow_steps` from an earlier 1.0 alpha, add the constraint** (rows whose stage record no longer exists must be deleted first, or the `ADD CONSTRAINT` fails its validation):
+
+  ```sql
+  DELETE FROM "workflow_steps" s
+    WHERE NOT EXISTS (SELECT 1 FROM "workflow_stages" st WHERE st."id" = s."stageRecordId");
+  DO $$
+  BEGIN
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_constraint WHERE conname = 'workflow_steps_stageRecordId_fkey'
+    ) THEN
+      ALTER TABLE "workflow_steps"
+        ADD CONSTRAINT "workflow_steps_stageRecordId_fkey"
+        FOREIGN KEY ("stageRecordId") REFERENCES "workflow_stages"("id")
+        ON DELETE CASCADE ON UPDATE CASCADE;
+    END IF;
+  END $$;
+  ```
+
+  `result` holds the JSON the step returned (a `download` step that returns the whole document stores the whole document — return a key or a summary when the payload is large). `externalKey` (added in 1.0.0-alpha.9) is the deterministic name of the external effect a `run` body creates, written before the body runs; it is what lets an operator find a provider-side effect orphaned by a crash. **If you created `workflow_steps` from an earlier 1.0 alpha, add the column:**
 
   ```sql
   ALTER TABLE "workflow_steps" ADD COLUMN IF NOT EXISTS "externalKey" TEXT;
