@@ -8,4 +8,10 @@ describe("root entry exports", () => {
     expect(typeof root.createPrismaAICallLogger).toBe("function");
     expect(typeof root.NoObjectGeneratedError).toBe("function");
   });
+
+  it("exports the step errors a stage body can meet", () => {
+    expect(typeof root.StepTimeoutError).toBe("function");
+    expect(typeof root.StepNotReplaySafeError).toBe("function");
+    expect(typeof root.StepLeaseLostError).toBe("function");
+  });
 });

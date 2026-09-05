@@ -67,18 +67,26 @@ The Prisma ledger uses the `WorkflowStep` model from the package's `prisma/schem
 interface StepApi {
   run<T>(id: string, fn: (step: StepRunContext) => Promise<T>, options?: StepRunOptions): Promise<T>;
   waitFor<T>(id: string, opts: StepWaitOptions<T>): Promise<T>;
-  waitForSignal<T = unknown>(id: string, opts: { timeout: number | string }): Promise<T>;
+  waitForSignal<T = unknown>(id: string, opts: StepSignalOptions): Promise<T>;
   sleep(id: string, duration: number | string): Promise<void>;
   /** generateText / generateObject / streamText / map — see below. */
   readonly ai: StepAiApi;
 }
 
 interface StepRunOptions {
-  leaseMs?: number;       // lease held while fn runs; default 5 minutes -- also
-                          // how long a crashed worker's step blocks a replay
-  retries?: number;       // retries after the first failed attempt; default 0
-  retryDelayMs?: number | string; // delay before a retry ("30s"); default 0
+  lease?: number | string;      // lease held while fn runs ("2m"); default 5 minutes --
+                                // also how long a crashed worker's step blocks a replay
+  retries?: number;             // retries after the first failed attempt; default 0
+  retryDelay?: number | string; // delay before a retry ("30s"); default 0
+  retryBackoff?: {              // grow retryDelay per failed attempt
+    factor?: number;            //   delay(n) = retryDelay * factor^(n-1); default 1
+    maxDelay?: number | string; //   cap on the computed delay
+    jitter?: boolean;           //   wait a random fraction of it (full jitter)
+  };
+  leaseMs?: number;             // deprecated alias of `lease`
+  retryDelayMs?: number | string; // deprecated alias of `retryDelay`
   onReclaim?: "rerun" | "fail";   // taking over an expired lease; default "rerun"
+  heartbeat?: number | string | false; // auto-extend the lease on this interval; default false
 }
 
 interface StepRunContext {
@@ -86,6 +94,12 @@ interface StepRunContext {
   readonly externalKey: string;  // stable name for this body's external effect
   readonly attempt: number;      // 1 on the first execution
   readonly isReclaim: boolean;   // an earlier execution of this body may have run
+  heartbeat(): Promise<void>;    // extend the lease by `lease` from now; StepLeaseLostError if taken over
+}
+
+interface StepSignalOptions {
+  timeout: number | string;    // non-sliding deadline from the first wait
+  keepalive?: number | string; // re-suspend interval while no signal; default 5m
 }
 
 interface StepWaitOptions<T> {
@@ -125,20 +139,23 @@ const submit = defineStage({
 
 `run` executes `fn` once and stores its result. `waitFor` calls `poll` and, when `ready` is false, suspends the stage; the kernel polls again after `every`. `waitForSignal` suspends until `kernel.execute({ type: "step.signal", workflowRunId, stageId, stepId, payload })` completes the step. `sleep` suspends for the duration.
 
+A signal wait re-suspends every `keepalive` (default **five minutes**, never later than `timeout`) while nothing has arrived. That interval does not set signal latency: `step.signal` moves the stage's `nextPollAt` to now, so the stage wakes on the host's next orchestration tick whatever the keepalive is. What the keepalive bounds is how long a *lost* nudge — a host that was down when the signal landed — can delay the wake; and each keepalive costs one replay of the stage body up to the wait, so a shorter value buys nothing for a stage whose host is healthy. Raise it for a wait measured in days (`keepalive: "1h"`); lower it only when the host that would receive the nudge is unreliable.
+
 Suspension is a thrown control-flow error (`StepSuspend`, or `StepInFlight` when another worker holds a lease). The stage factory turns it into a suspended stage record marked as durable, and the kernel's poll handler replays `execute()` instead of calling `checkCompletion`. A stage may define both: the marker decides.
 
 ### Leases, retries and deadlines
 
 - A `run` step holds a lease while `fn` runs. If the worker dies, the next replay re-claims the step once the lease expires, increments `attempt`, and runs `fn` again. A live lease suspends the replay as `StepInFlight` instead of running `fn` twice.
-- **The lease is what a crash costs you in latency, and `leaseMs` is the dial.** `StepRunOptions.leaseMs` defaults to **five minutes**. A ledger row records no worker identity -- the lease *is* the only liveness signal a step has -- so a step left `running` by a SIGKILLed process is indistinguishable from one a healthy worker is still executing, and nothing (not `lease.reapStale`, which releases *job* leases only) may release it early without risking a second execution of `fn`, which is the one thing the ledger exists to prevent. So a resumed stage that meets a dead worker's step re-suspends until that lease expires: with the default, recovery of an interrupted step is up to five minutes behind the crash. Set `leaseMs` per step to the longest you expect `fn` to take plus headroom -- `ctx.step.run("submit", fn, { leaseMs: 30_000 })` recovers in about 30 s instead of 5 min, and 5 min stays the right default for a step that legitimately runs for minutes. The trade is only latency-to-recovery against the risk of re-running a step whose worker is merely slow; the work the ledger saves is unaffected either way.
-- `retries` makes a thrown `fn` retryable: the failure is recorded, the stage suspends for `retryDelayMs`, and the next replay re-runs `fn`. When retries are exhausted the stored error is thrown and the stage fails.
+- **The lease is what a crash costs you in latency, and `lease` is the dial.** `StepRunOptions.lease` (milliseconds or a duration string; `leaseMs` is the deprecated alias) defaults to **five minutes**. A ledger row records no worker identity -- the lease *is* the only liveness signal a step has -- so a step left `running` by a SIGKILLed process is indistinguishable from one a healthy worker is still executing, and nothing (not `lease.reapStale`, which releases *job* leases only) may release it early without risking a second execution of `fn`, which is the one thing the ledger exists to prevent. So a resumed stage that meets a dead worker's step re-suspends until that lease expires: with the default, recovery of an interrupted step is up to five minutes behind the crash. Set `lease` per step to the longest you expect `fn` to take plus headroom -- `ctx.step.run("submit", fn, { lease: "30s" })` recovers in about 30 s instead of 5 min, and 5 min stays the right default for a step that legitimately runs for minutes. The trade is only latency-to-recovery against the risk of re-running a step whose worker is merely slow; the work the ledger saves is unaffected either way.
+- **A body that outlives its lease can extend it.** `step.heartbeat()` pushes `leaseExpiresAt` out by `lease` from now, under a compare-and-set pinned to `running` at this execution's `attempt`; call it between units of work whose total length you cannot bound up front (pages of an export, files of an upload). `heartbeat: "30s"` in the options does the same on a timer while `fn` is pending (`unref`'d, cleared when the body settles), so the lease stays short for crash recovery without the body ever timing itself; the interval must be shorter than the lease. When the row is no longer this execution's — its lease lapsed unattended and a replay took the step over — `heartbeat()` rejects with `StepLeaseLostError` (`stepId`, `attempt`): the body's own outcome would lose the same compare-and-set, so it should stop. The automatic mode logs the loss at WARN and stops heartbeating; the outcome write then reports the conflict as it always has.
+- `retries` makes a thrown `fn` retryable: the failure is recorded, the stage suspends for `retryDelay` (`retryDelayMs` is the deprecated alias), and the next replay re-runs `fn`. When retries are exhausted the stored error is thrown and the stage fails. `retryBackoff` grows that delay: after failed attempt *n* the wait is `retryDelay * factor^(n-1)`, capped at `maxDelay`, and `jitter: true` waits a uniform random fraction of it instead (full jitter) — `{ retries: 3, retryDelay: "10s", retryBackoff: { factor: 2, maxDelay: "30s" } }` waits 10 s, 20 s, 30 s. The delay is computed from the `attempt` stored on the row, not from anything in memory, because each retry suspends the stage and may replay in another process.
 - A stage that is still waiting on the same step re-suspends silently on every poll: `stage:suspended` / `workflow:suspended` are emitted when the wait starts and again only when the stage moves on to a different step, not once per poll. The step id is the identity of the wait — a `waitFor`, a `run` retry and the in-flight polls against a dead worker's live lease on the same step all count as one wait.
 - `waitFor`'s `ready` may be a type guard (`(v): v is Done => ...`); the awaited value then narrows to the guarded type. The boolean form is unchanged.
 - `waitFor`'s `timeout` is computed once, when the wait is first recorded, and stored on the step. Every replay compares against that stored deadline, so it never slides. Past the deadline the step is marked failed and the stage fails with `StepTimeoutError`.
 - A `poll` that throws does not fail the stage: the stage suspends for `pollBackoffMs`. The first three consecutive failures are logged at DEBUG — a batch provider is eventually consistent right after a submit (OpenRouter answers 404 to the first status check) — and the streak escalates to WARN from the fourth on; the count lives on the row (`waitState.pollFailures`) so it survives a replay in another process, and a poll that returns resets it.
 - Signalling a step twice is a no-op; the result carries `alreadyCompleted: true`. Signalling a timed-out step is rejected.
 - If `fn` succeeded but the ledger write failed, `run` throws `StepLedgerWriteError` and does not record a failure, because the side effect already happened; the lease expiry path re-claims on the next replay.
-- **The step lease stores an absolute deadline, unlike the job lease.** `workflow_steps.leaseExpiresAt` is written as `clock.now() + leaseMs` by the host that claims the step and compared against `clock.now()` by whichever host replays the stage next — both through the Prisma model API, so it is immune to the session-timezone skew raw statements have, but not to two hosts' system clocks disagreeing. The *job* lease avoids that by storing only the lock time and deriving the deadline in-database (see 03-runtime-setup.md); the step lease cannot follow without either a raw predicate the portable `StepLedger` port has no place for, or splitting the column into a lock time plus a duration — a schema migration. Until then, keep host clocks in NTP sync if you rely on short `leaseMs` values; the exposure is bounded by the skew, and with the five-minute default a second or two of drift is immaterial.
+- **The step lease stores an absolute deadline, unlike the job lease.** `workflow_steps.leaseExpiresAt` is written as `clock.now() + lease` by the host that claims the step and compared against `clock.now()` by whichever host replays the stage next — both through the Prisma model API, so it is immune to the session-timezone skew raw statements have, but not to two hosts' system clocks disagreeing. The *job* lease avoids that by storing only the lock time and deriving the deadline in-database (see 03-runtime-setup.md); the step lease cannot follow without either a raw predicate the portable `StepLedger` port has no place for, or splitting the column into a lock time plus a duration — a schema migration. Until then, keep host clocks in NTP sync if you rely on short `lease` values; the exposure is bounded by the skew, and with the five-minute default a second or two of drift is immaterial.
 
 ### Non-idempotent external calls: `step.externalKey` and `onReclaim`
 
@@ -256,12 +273,12 @@ const summary = await ctx.step.ai.generateText(
   "gemini-2.5-flash",
   prompt,
   { maxTokens: 2000 },          // TextOptions — tools, stopWhen, onStepEnd too
-  { retries: 2, retryDelayMs: "30s", leaseMs: 120_000 },
+  { retries: 2, retryDelay: "30s", lease: "2m" },
 );
 ```
 
 A thrown model call with `retries: 1` records the failure, suspends the stage
-for `retryDelayMs`, and re-runs on the next replay — exactly like
+for `retryDelay`, and re-runs on the next replay — exactly like
 `ctx.step.run`. When the retries are exhausted the stored error is rethrown
 and the stage fails.
 

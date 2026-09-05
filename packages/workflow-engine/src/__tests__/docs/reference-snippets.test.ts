@@ -128,7 +128,7 @@ describe("12-durable-steps snippets", () => {
             DOC_MODEL,
             "summarize the document",
             { maxTokens: 2000 },
-            { retries: 2, retryDelayMs: "30s", leaseMs: 120_000 },
+            { retries: 2, retryDelay: "30s", lease: "2m" },
           );
           expect(summary.text).toBeTypeOf("string");
 

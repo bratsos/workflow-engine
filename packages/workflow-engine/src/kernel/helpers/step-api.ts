@@ -6,6 +6,7 @@ import type {
   StepKeyUse,
   StepRunContext,
   StepRunOptions,
+  StepSignalOptions,
   StepWaitOptions,
 } from "../../core/steps.js";
 import {
@@ -14,6 +15,7 @@ import {
   STEP_API_PENDING_CONTROL_FLOW,
   STEP_API_SETTLE_IN_FLIGHT,
   StepInFlight,
+  StepLeaseLostError,
   StepLedgerNotConfiguredError,
   StepLedgerWriteError,
   StepNotReplaySafeError,
@@ -26,7 +28,12 @@ import type { Clock, StepLedger, StepRecord } from "../ports.js";
 import { createStepAi } from "./step-ai.js";
 
 const DEFAULT_LEASE_MS = 5 * 60 * 1000;
-const SIGNAL_KEEPALIVE_MS = 30_000;
+/**
+ * Default re-suspend interval of a signal wait. A landed signal wakes the
+ * stage through `step.signal`'s nextPollAt reset, so this only bounds the
+ * delay after a lost nudge; short values replay the stage body for nothing.
+ */
+const SIGNAL_KEEPALIVE_MS = 5 * 60 * 1000;
 const SLEEP_GRACE_MS = 60 * 60 * 1000;
 /**
  * Consecutive `poll` throws logged at DEBUG before the wait step escalates
@@ -54,6 +61,11 @@ export interface CreateStepApiOptions {
   defaultLeaseMs?: number;
   /** Lazy accessor for the stage's AI helper, used by `step.ai.*`. */
   ai?: () => AIHelper;
+  /**
+   * Uniform source in [0, 1) for `retryBackoff.jitter`. Defaults to
+   * `Math.random`; injectable so a test can pin the drawn delay.
+   */
+  random?: () => number;
 }
 
 interface StepInvocation {
@@ -109,6 +121,62 @@ function nonNegativeInteger(value: number, name: string): number {
     throw new Error(`${name} must be a non-negative integer`);
   }
   return value;
+}
+
+/**
+ * The lease a `run` step asked for, in milliseconds. `lease` is canonical;
+ * `leaseMs` is the deprecated alias and yields to it when both are given.
+ */
+function resolveLeaseMs(opts: StepRunOptions, defaultLeaseMs: number): number {
+  const requested = opts.lease ?? opts.leaseMs;
+  return positiveDuration(
+    requested === undefined ? defaultLeaseMs : parseStepDuration(requested),
+    "lease",
+  );
+}
+
+/**
+ * The wait before re-running a step whose attempt `failedAttempt` just
+ * failed. Reads the attempt off the row, not a counter: the retry suspends
+ * the stage and replays in whichever process picks it up next.
+ */
+function retryDelayFor(
+  opts: StepRunOptions,
+  failedAttempt: number,
+  random: () => number,
+): number {
+  const base = parseStepDuration(opts.retryDelay ?? opts.retryDelayMs ?? 0);
+  const backoff = opts.retryBackoff;
+  if (!backoff) return base;
+  const factor = backoff.factor ?? 1;
+  if (!Number.isFinite(factor) || factor < 1) {
+    throw new Error("retryBackoff.factor must be a finite number >= 1");
+  }
+  const maxDelay =
+    backoff.maxDelay === undefined
+      ? Number.POSITIVE_INFINITY
+      : parseStepDuration(backoff.maxDelay);
+  const delay = Math.min(base * factor ** (failedAttempt - 1), maxDelay);
+  return backoff.jitter ? Math.floor(random() * delay) : delay;
+}
+
+/** The automatic heartbeat interval of a `run` step, or undefined for none. */
+function resolveHeartbeatMs(
+  opts: StepRunOptions,
+  leaseMs: number,
+): number | undefined {
+  if (opts.heartbeat === undefined || opts.heartbeat === false)
+    return undefined;
+  const heartbeatMs = positiveDuration(
+    parseStepDuration(opts.heartbeat),
+    "heartbeat",
+  );
+  if (heartbeatMs >= leaseMs) {
+    throw new Error(
+      `heartbeat (${heartbeatMs}ms) must be shorter than the lease (${leaseMs}ms) it extends`,
+    );
+  }
+  return heartbeatMs;
 }
 
 /** Creates the StepApi attached to a single stage invocation. */
@@ -392,14 +460,14 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
       id: string,
       fn: (step: StepRunContext) => Promise<T>,
       opts: StepRunOptions = {},
+      onLeaseExtended?: (leaseUntil: number) => void,
     ) {
       const invocation = begin(id, "run");
-      const leaseMs = positiveDuration(
-        opts.leaseMs ?? defaultLeaseMs,
-        "leaseMs",
-      );
+      const leaseMs = resolveLeaseMs(opts, defaultLeaseMs);
+      const heartbeatMs = resolveHeartbeatMs(opts, leaseMs);
       const retries = nonNegativeInteger(opts.retries ?? 0, "retries");
-      const retryDelayMs = parseStepDuration(opts.retryDelayMs ?? 0);
+      // Validate the delay options up front, before the body runs.
+      retryDelayFor(opts, 1, () => 0);
       const onReclaim = opts.onReclaim ?? "rerun";
       const now = options.clock.now();
       const { stageRecordId } = requireLedger();
@@ -467,13 +535,52 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
         );
       }
 
+      /**
+       * Push this execution's lease out by `leaseMs` from now. Pinned to
+       * (running, this attempt): a body whose row was already taken over
+       * cannot revive its lease, and learns so through the rejection.
+       */
+      const attempt = record.attempt;
+      const extendLease = async (): Promise<void> => {
+        const { stageRecordId, ledger } = requireLedger();
+        const leaseUntil = options.clock.now().getTime() + leaseMs;
+        const outcome = await ledger.compareAndSet(
+          stageRecordId,
+          id,
+          { status: "running", attempt },
+          { leaseExpiresAt: new Date(leaseUntil) },
+        );
+        if (!outcome.applied) throw new StepLeaseLostError(id, attempt);
+        onLeaseExtended?.(leaseUntil);
+      };
+      let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+      if (heartbeatMs !== undefined) {
+        heartbeatTimer = setInterval(() => {
+          extendLease().catch((error: unknown) => {
+            // The outcome write below will lose the same compare-and-set
+            // and report the conflict; here, stop trying.
+            if (heartbeatTimer) clearInterval(heartbeatTimer);
+            heartbeatTimer = undefined;
+            options.onLog?.(
+              "WARN",
+              `durable step "${id}" heartbeat stopped: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+          });
+        }, heartbeatMs);
+        // Never hold the process open for a body the run has abandoned.
+        (heartbeatTimer as unknown as { unref?: () => void }).unref?.();
+      }
+
       let value: T;
       try {
         value = await fn({
           stepId: id,
           externalKey: record.externalKey ?? externalKey,
-          attempt: record.attempt,
+          attempt,
           isReclaim,
+          heartbeat: extendLease,
         });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -486,6 +593,11 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
         });
         if (failure.parked) return parkedResult<T>(failure.record);
         if (record.attempt <= retries) {
+          const retryDelayMs = retryDelayFor(
+            opts,
+            record.attempt,
+            options.random ?? Math.random,
+          );
           const retryAt = new Date(
             options.clock.now().getTime() + retryDelayMs,
           );
@@ -501,6 +613,8 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
           );
         }
         throw error;
+      } finally {
+        if (heartbeatTimer) clearInterval(heartbeatTimer);
       }
 
       const encoded = jsonRoundTrip(value, id);
@@ -616,16 +730,17 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
       );
     },
 
-    async waitForSignal<T = unknown>(
-      id: string,
-      opts: { timeout: number | string },
-    ) {
+    async waitForSignal<T = unknown>(id: string, opts: StepSignalOptions) {
       const invocation = begin(id, "signal");
       const existing = await get(invocation, "signal");
       if (existing?.status === "completed") return existing.result as T;
       if (existing?.status === "failed") throw storedError(existing);
 
       const timeoutMs = parseStepDuration(opts.timeout);
+      const keepaliveMs = positiveDuration(
+        parseStepDuration(opts.keepalive ?? SIGNAL_KEEPALIVE_MS),
+        "keepalive",
+      );
       const now = options.clock.now();
       const record =
         existing ??
@@ -655,13 +770,9 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
         new StepSuspend({
           stepId: id,
           at: current,
-          nextPollAt: boundedNextPoll(
-            current,
-            SIGNAL_KEEPALIVE_MS,
-            record.deadlineAt,
-          ),
+          nextPollAt: boundedNextPoll(current, keepaliveMs, record.deadlineAt),
           maxWaitUntil: record.deadlineAt,
-          pollInterval: SIGNAL_KEEPALIVE_MS,
+          pollInterval: keepaliveMs,
         }),
       );
     },
@@ -732,10 +843,14 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
       opts: StepRunOptions = {},
     ) {
       const leaseUntil =
-        options.clock.now().getTime() +
-        positiveDuration(opts.leaseMs ?? defaultLeaseMs, "leaseMs");
-      const promise = impl.run(id, fn, opts);
-      const entry: InFlightRun = { done: promise, leaseUntil };
+        options.clock.now().getTime() + resolveLeaseMs(opts, defaultLeaseMs);
+      const entry: InFlightRun = { done: Promise.resolve(), leaseUntil };
+      // A heartbeat (manual or automatic) moves the bound `settleInFlight`
+      // waits under, so the entry tracks the extended lease.
+      const promise = impl.run(id, fn, opts, (extendedUntil) => {
+        entry.leaseUntil = extendedUntil;
+      });
+      entry.done = promise;
       inFlight.add(entry);
       // The caller owns `promise` and its rejection; this branch only
       // removes the bookkeeping entry without creating a second rejection.

@@ -124,7 +124,7 @@ const stats = host.getStats();
 number, deadLettered: number, lastError: string | null }`. See "Degraded event
 sink" below.
 
-`staleLeaseThresholdMs` is how long a killed worker's *job* stays unavailable. A killed worker's in-flight **durable step** is a separate dial: `StepRunOptions.leaseMs`, default five minutes, is how long a resumed stage waits before it re-runs that step (see 12-durable-steps.md, "Leases, retries and deadlines"). Both bound how fast a crash recovers; neither is set by the other.
+`staleLeaseThresholdMs` is how long a killed worker's *job* stays unavailable. A killed worker's in-flight **durable step** is a separate dial: `StepRunOptions.lease`, default five minutes, is how long a resumed stage waits before it re-runs that step (see 12-durable-steps.md, "Leases, retries and deadlines"). Both bound how fast a crash recovers; neither is set by the other.
 
 **Two tiers of job-lease expiry.** `staleLeaseThresholdMs` is the fine-grained
 tier: it is measured from `lockedAt`, which `touchJob` refreshes on every

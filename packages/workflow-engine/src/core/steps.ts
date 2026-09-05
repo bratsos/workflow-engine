@@ -30,7 +30,13 @@ export const STEP_API_SETTLE_IN_FLIGHT: unique symbol = Symbol.for(
 ) as typeof STEP_API_SETTLE_IN_FLIGHT;
 
 export interface StepRunOptions {
-  /** Lease held while `fn` executes. Defaults to five minutes. */
+  /**
+   * Lease held while `fn` executes. A number of milliseconds or a duration
+   * string (`"30s"`, `"5m"`). Defaults to five minutes. Also how long a
+   * crashed worker's step blocks a replay.
+   */
+  lease?: number | string;
+  /** @deprecated Use `lease`. Ignored when `lease` is also given. */
   leaseMs?: number;
   /** Number of retries after the first failed attempt. Defaults to zero. */
   retries?: number;
@@ -38,7 +44,27 @@ export interface StepRunOptions {
    * Delay before retrying a failed attempt. A number of milliseconds or a
    * duration string (`"30s"`, `"5m"`). Defaults to zero.
    */
+  retryDelay?: number | string;
+  /** @deprecated Use `retryDelay`. Ignored when `retryDelay` is also given. */
   retryDelayMs?: number | string;
+  /**
+   * Grow `retryDelay` with each failed attempt. The delay before retrying
+   * after attempt *n* is `retryDelay * factor^(n-1)`, capped at `maxDelay`;
+   * with `jitter` the wait is a uniform random fraction of that ("full
+   * jitter"). Computed from the attempt recorded on the step row, so it is
+   * correct when the retry replays in another process. Defaults to a factor
+   * of 1 — a fixed `retryDelay`.
+   */
+  retryBackoff?: StepRetryBackoff;
+  /**
+   * Extend the lease automatically while `fn` runs: every `heartbeat`
+   * (milliseconds or a duration string, shorter than `lease`) the engine
+   * pushes `leaseExpiresAt` out by `lease` from now, exactly as a body
+   * calling `step.heartbeat()` would. Defaults to `false`: the lease chosen
+   * up front is the whole budget, and a body that outlives it is taken over
+   * on the next replay.
+   */
+  heartbeat?: number | string | false;
   /**
    * What to do when this step's lease expired and another worker takes it
    * over — the one case where the engine cannot know whether the body's side
@@ -57,6 +83,16 @@ export interface StepRunOptions {
    * did not take, and asking for retries is asking for it to be repeated.
    */
   onReclaim?: "rerun" | "fail";
+}
+
+/** Exponential growth of a `run` step's retry delay. */
+export interface StepRetryBackoff {
+  /** Multiplier applied per failed attempt. At least 1; defaults to 1. */
+  factor?: number;
+  /** Upper bound on the computed delay. Milliseconds or a duration string. */
+  maxDelay?: number | string;
+  /** Wait a uniform random fraction of the computed delay. Defaults to false. */
+  jitter?: boolean;
 }
 
 /**
@@ -86,6 +122,16 @@ export interface StepRunContext {
    * that can recover its external effect should look for it when this is set.
    */
   readonly isReclaim: boolean;
+  /**
+   * Extend this execution's lease by the step's `lease` from now. Call it
+   * from a body that legitimately outlives its lease (between pages of a
+   * long export, say) so a replay does not take the step over mid-flight.
+   * Rejects with {@link StepLeaseLostError} when the row is no longer this
+   * execution's — the lease already expired and another worker took the
+   * step over — in which case the body's outcome will not be recorded
+   * either, and it should stop.
+   */
+  heartbeat(): Promise<void>;
 }
 
 export interface StepWaitOptions<T> {
@@ -95,6 +141,23 @@ export interface StepWaitOptions<T> {
   timeout: number | string;
   /** Backoff after `poll` throws. Defaults to `every`. */
   pollBackoffMs?: number;
+}
+
+export interface StepSignalOptions {
+  /** Non-sliding deadline from the first wait. Milliseconds or a duration string. */
+  timeout: number | string;
+  /**
+   * How often the suspended stage re-suspends while no signal has arrived.
+   * Milliseconds or a duration string; defaults to five minutes, and is
+   * never later than `timeout`.
+   *
+   * Signal latency is not governed by this: `step.signal` sets the stage's
+   * next poll to now, so the stage wakes on the host's next tick. The
+   * keepalive only bounds how long a *lost* nudge (a host that was down when
+   * the signal landed) can delay the wake, at the cost of one replay of the
+   * stage body per interval.
+   */
+  keepalive?: number | string;
 }
 
 /** `waitFor` options whose `ready` is a type guard: the result narrows to `U`. */
@@ -126,10 +189,7 @@ export interface StepApi {
     opts: StepWaitOptionsNarrowing<T, U>,
   ): Promise<U>;
   waitFor<T>(id: string, opts: StepWaitOptions<T>): Promise<T>;
-  waitForSignal<T = unknown>(
-    id: string,
-    opts: { timeout: number | string },
-  ): Promise<T>;
+  waitForSignal<T = unknown>(id: string, opts: StepSignalOptions): Promise<T>;
   sleep(id: string, duration: number | string): Promise<void>;
   /** Durable AI calls and the realtime/batch `map` primitive. */
   readonly ai: StepAiApi;
@@ -252,6 +312,30 @@ export class StepNotReplaySafeError extends Error {
     this.name = "StepNotReplaySafeError";
     this.stepId = stepId;
     this.externalKey = externalKey;
+  }
+}
+
+/**
+ * Thrown by `step.heartbeat()` when the lease it tried to extend no longer
+ * belongs to the calling execution: the row is not `running` at this
+ * execution's attempt, because the lease expired and a replay took the step
+ * over (or recorded an outcome). The calling body has lost the
+ * compare-and-set on its own result too, so it should stop rather than
+ * finish work whose outcome will be discarded.
+ */
+export class StepLeaseLostError extends Error {
+  readonly stepId: string;
+  readonly attempt: number;
+
+  constructor(stepId: string, attempt: number) {
+    super(
+      `Durable step "${stepId}" lost its lease: attempt ${attempt} is no longer the ` +
+        `running execution of this step. Its lease expired and another replay took the ` +
+        `step over, so this execution's outcome will not be recorded.`,
+    );
+    this.name = "StepLeaseLostError";
+    this.stepId = stepId;
+    this.attempt = attempt;
   }
 }
 
