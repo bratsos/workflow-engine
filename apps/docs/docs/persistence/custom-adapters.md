@@ -5,9 +5,9 @@ title: Custom Adapters
 
 # Custom Adapters
 
-If your infrastructure cannot use PostgreSQL/SQLite or Prisma, you can write custom persistence adapters. **workflow-engine** exposes clean interfaces for the persistence layer, the job queue, and the AI logger.
+If your infrastructure cannot use PostgreSQL/SQLite or Prisma, you can write custom persistence adapters. **workflow-engine** exposes clean interfaces for the persistence layer, the job queue, the step ledger, and the AI logger.
 
-**Aside on the built-in Prisma adapters:** `PrismaWorkflowPersistence`, `PrismaJobQueue`, and `PrismaAICallLogger` (the ones you're opting out of by writing a custom adapter) no longer accept a `prisma: any` parameter — they require a structural type (`EnginePrismaClient`) that isn't exported from any public entry point, so you never reference it by name. Any real Prisma-generated client (6.x or 7.x) satisfies it automatically, since it only requires the delegates the adapters actually call (`workflowRun`, `workflowStage`, etc.) plus optional `$transaction`/`$queryRaw`/`$executeRaw`/`$Enums`. The only visible effect is on hand-written mocks: a fake `PrismaClient`-shaped object missing a delegate the adapter calls now fails to typecheck, where it previously compiled silently under `any`.
+**Aside on the built-in Prisma adapters:** `PrismaWorkflowPersistence`, `PrismaJobQueue`, `PrismaStepLedger` and `PrismaAICallLogger` (the ones you're opting out of by writing a custom adapter) require a structural type (`EnginePrismaClient`) that isn't exported from any public entry point, so you never reference it by name. Any real Prisma-generated client (6.x or 7.x) satisfies it automatically, since it only requires the delegates the adapters actually call — `workflowRun`, `workflowStage`, `workflowStep`, `workflowLog`, `workflowArtifact`, `workflowAnnotation`, `outboxEvent`, `idempotencyKey`, `jobQueue`, `aICall`, and `workflowDefinition` for definition versioning — plus optional `$transaction`/`$queryRaw`/`$executeRaw`/`$Enums`. The only visible effect is on hand-written mocks: a fake `PrismaClient`-shaped object missing a delegate the adapter calls fails to typecheck.
 
 ---
 
@@ -46,9 +46,39 @@ class MyCustomPersistence implements WorkflowPersistence {
   async createRun(data: CreateRunInput): Promise<WorkflowRunRecord> { ... }
   async updateRun(id: string, data: UpdateRunInput): Promise<void> { ... }
   async getRun(id: string): Promise<WorkflowRunRecord | null> { ... }
-  ...
+  async getRunStatus(id: string): Promise<Status | null> { ... }
+  async getStuckRuns(stuckSince: Date): Promise<WorkflowRunRecord[]> { ... }
+  async claimNextPendingRun(options?: { now?: Date; serves?: readonly ServedDefinition[] }): Promise<WorkflowRunRecord | null> { ... }
+  // Retention (run.purge)
+  async listRunsForPurge(cutoff: Date, statuses: readonly Status[], limit: number): Promise<...> { ... }
+  async deleteRun(id: string): Promise<void> { ... }
+  // Definition versioning
+  supportsDefinitionVersioning(): boolean { ... }
+  async insertDefinitionIfAbsent(...): Promise<...> { ... }
+  async getDefinition(workflowId: string, version: string): Promise<... | null> { ... }
+  async countRunsByDefinitionVersion(...): Promise<...> { ... }
+
+  // Stages
+  async createStage / upsertStage / updateStage / getStage / getStagesByRun / deleteStage
+  async getSuspendedStages(beforeDate: Date, options?: { limit?, serves? }): Promise<WorkflowStageRecord[]> { ... }
+
+  // Logs, annotations, outbox, idempotency
+  async createLog / appendAnnotations / listAnnotations
+  async appendOutboxEvents / getUnpublishedOutboxEvents / claimUnpublishedOutboxEvents / releaseOutboxEvents
+  async markOutboxEventsPublished / incrementOutboxRetryCount / moveOutboxEventToDLQ / replayDLQEvents
+  async acquireIdempotencyKey / completeIdempotencyKey / releaseIdempotencyKey
 }
 ```
+
+Points that are easy to get wrong, all covered by the conformance suite:
+
+* **`claimNextPendingRun({ serves })`**: a pinned run is claimable only by a caller presenting its `(workflowId, version)` pair; an *unpinned* run (`definitionVersion` null) only by a caller whose `serves` names its workflow; an empty `serves` claims nothing. Omit `serves` (or pass `"all"`) for the version-blind predicate. Bind the `now` the kernel passes rather than the database's `NOW()`.
+* **`getSuspendedStages(beforeDate, { limit, serves })`** owns both narrowings: oldest `nextPollAt` first, capped at `limit`, and only stages of runs the caller serves. An adapter without a `definitionVersion` column may ignore `serves`.
+* **`claimUnpublishedOutboxEvents(limit)`** must stamp `publishedAt` atomically (`FOR UPDATE SKIP LOCKED` on Postgres, a per-row compare-and-set elsewhere) so two hosts flushing the same outbox do not both deliver an event; `releaseOutboxEvents(ids)` hands back the events of a run whose emit threw.
+* **`listRunsForPurge` / `deleteRun`** back `run.purge`; `deleteRun` must take stages, logs, artifacts and annotations with the run.
+* **`UpdateStageInput`** accepts `null` for `errorMessage`, `completedAt` and `duration` (a redrive clears them when it reopens a stage) and carries `attempt`.
+* An adapter without the versioning schema returns `false` / `null` / `[]` from the four definition methods and ignores `serves`; runs then stay unpinned.
+* The eight legacy query methods and the `ArtifactPersistence` methods were removed from the port in 1.0; the built-in adapters keep them as plain class methods.
 
 ### 2. `JobQueue`
 Responsible for scheduling, claiming (dequeuing), heartbeating, and cancelling active background jobs.
@@ -64,8 +94,8 @@ import type {
 } from "@bratsos/workflow-engine";
 
 class MyCustomJobQueue implements JobQueue {
-  async enqueue(options: EnqueueJobInput): Promise<string> { ... }
-  async enqueueParallel(jobs: EnqueueJobInput[]): Promise<string[]> { ... }
+  async enqueueParallel(jobs: EnqueueJobInput[]): Promise<string[]> { ... } // idempotent on (workflowRunId, stageId)
+  async deleteByRunAndStages(workflowRunId: string, stageIds: string[]): Promise<number> { ... }
   async dequeue(options?: DequeueOptions): Promise<DequeueResult | null> { ... }
   async complete(jobId: string, fence?: JobAckFence): Promise<JobAckOutcome> { ... }
   async suspend(jobId: string, nextPollAt: Date, fence?: JobAckFence): Promise<JobAckOutcome> { ... }
@@ -76,8 +106,12 @@ class MyCustomJobQueue implements JobQueue {
   async cancelByRun(workflowRunId: string): Promise<number> { ... }
   async getJobsByWorkflowRun(workflowRunId: string): Promise<JobRecord[]> { ... }
   async touchJob(jobId: string): Promise<void> { ... } // Heartbeat lock
+  adoptWorkerId(workerId: string): string { ... } // optional: take the host's workerId on start()
+  readonly fairnessGroupBy?: string | null;         // optional: read by createSpillingJobTransport
 }
 ```
+
+The single-job `enqueue` was removed from the port in 1.0 (`enqueueParallel([job])` is the replacement). `enqueueParallel` must be idempotent on `(workflowRunId, stageId)` — replace any row already queued for the pair and reset its attempt, status, worker, lock and error — and `deleteByRunAndStages` retires the rows of stage records a redrive deletes. Both are in the conformance suite.
 
 #### Declining a job: `dequeue(options)` and `defer`
 
@@ -158,7 +192,30 @@ with the exported `LEASE_HEARTBEAT_LOST` prefix when reclaiming a lease and
 `LEASE_ABSOLUTE_CAP` when expiring a runaway. `jobQueueConformanceSuite` checks
 both, skipping the absolute tier when the method is absent.
 
-### 3. `AICallLogger`
+### 3. `StepLedger`
+Responsible for the durable step rows behind `ctx.step.*` — one row per `(stageRecordId, stepId)`.
+
+```typescript
+import type { StepLedger, StepRecord, StepRecordPatch, StepRecordExpectation } from "@bratsos/workflow-engine";
+
+class MyCustomStepLedger implements StepLedger {
+  async claim(record: Omit<StepRecord, "createdAt" | "updatedAt">): Promise<{ created: boolean; record: StepRecord }> { ... } // insert-if-absent; existing rows win without throwing
+  async get(stageRecordId: string, stepId: string): Promise<StepRecord | null> { ... }
+  async update(stageRecordId: string, stepId: string, patch: StepRecordPatch): Promise<StepRecord> { ... }
+  async compareAndSet(stageRecordId: string, stepId: string, expected: StepRecordExpectation, patch: StepRecordPatch): Promise<{ applied: boolean; record: StepRecord | null }> { ... }
+  async list(stageRecordId: string): Promise<StepRecord[]> { ... }
+  async clear(stageRecordId: string): Promise<void> { ... }
+  async clearExcept(stageRecordId: string, keepStepIds: string[]): Promise<void> { ... } // optional, see below
+}
+```
+
+* **`claim` must not throw on a conflict.** A replay re-claims every completed step; on Postgres a caught unique violation aborts a consumer's enclosing transaction, so insert with `ON CONFLICT DO NOTHING` (or the equivalent) and read the row back.
+* **`StepRecordPatch` has one rule.** A key that is absent, or present holding `undefined`, leaves that column alone; any other value — **`null` included** — is written. A ledger that skips nullish values records "completed with no value" as "unchanged", and the previous attempt's result then replays forever.
+* **`compareAndSet`** conditions the write on the row still matching `expected` (`status`, and `attempt` when given — `attempt` is optional and must match any attempt when omitted). It is what makes a step's outcome first-write-wins when two workers reach the same body.
+* **`clearExcept`** is optional. It is what lets a redrive, or a fresh attempt of a terminally failed stage, keep the rows that name an external effect while dropping the rest; a ledger without it falls back to `clear`, and the kernel logs every external key it is about to drop.
+* The kernel wraps whatever ledger it is given for [claim-check spilling](../core-concepts/kernel-and-ports.md#durable-step-results-automatic) of large results; the port sees plain JSON either way.
+
+### 4. `AICallLogger`
 Responsible for tracking LLM prompt/response pairs, token usage, and cost stats.
 
 ```typescript
@@ -174,15 +231,16 @@ class MyCustomAICallLogger implements AICallLogger {
 
 ---
 
-## Conformance Testing (v0.11+)
+## Conformance Testing
 
-To ensure that your custom adapter behaves exactly like the built-in Prisma and in-memory implementations (with identical lock mechanics, retry defaults, status mutations, and concurrency version-increment behaviors), **workflow-engine** exports test suite runners:
+To ensure that your custom adapter behaves exactly like the built-in Prisma and in-memory implementations (with identical lock mechanics, retry defaults, status mutations, fenced acknowledgements, and concurrency version-increment behaviors), **workflow-engine** exports test suite runners:
 
 * **`persistenceConformanceSuite`**
 * **`jobQueueConformanceSuite`**
+* **`stepLedgerConformanceSuite`**
 * **`aiCallLoggerConformanceSuite`**
 
-These are Vitest suite runners that register test specs dynamically inside your test suite.
+They register test specs dynamically inside your test suite. `@bratsos/workflow-engine/testing` imports nothing from vitest, so each suite takes the test primitives as a third argument (`ConformanceTestApi`: `{ describe, it, expect, beforeEach }`) — pass vitest's, Jest's, or `node:test`'s.
 
 ### Writing a Conformance Test File
 
@@ -190,32 +248,29 @@ Create a `my-adapter.conformance.test.ts` file in your workspace:
 
 ```typescript
 // my-adapter.conformance.test.ts
-import { 
-  persistenceConformanceSuite, 
+import { describe, it, expect, beforeEach } from "vitest";
+import {
+  persistenceConformanceSuite,
   jobQueueConformanceSuite,
-  aiCallLoggerConformanceSuite
+  stepLedgerConformanceSuite,
+  aiCallLoggerConformanceSuite,
 } from "@bratsos/workflow-engine/testing";
 import { MyCustomPersistence } from "./my-custom-persistence";
 import { MyCustomJobQueue } from "./my-custom-job-queue";
+import { MyCustomStepLedger } from "./my-custom-step-ledger";
 import { MyCustomAICallLogger } from "./my-custom-ai-logger";
+
+const api = { describe, it, expect, beforeEach };
 
 // Call each suite at the top-level.
 // The second argument is a factory function returning a fresh adapter instance.
-persistenceConformanceSuite("MyCustomPersistence", () => {
-  const adapter = new MyCustomPersistence();
-  return adapter;
-});
-
-jobQueueConformanceSuite("MyCustomJobQueue", () => {
-  const queue = new MyCustomJobQueue();
-  return queue;
-});
-
-aiCallLoggerConformanceSuite("MyCustomAICallLogger", () => {
-  const logger = new MyCustomAICallLogger();
-  return logger;
-});
+persistenceConformanceSuite("MyCustomPersistence", () => new MyCustomPersistence(), api);
+jobQueueConformanceSuite("MyCustomJobQueue", () => new MyCustomJobQueue(), api);
+stepLedgerConformanceSuite("MyCustomStepLedger", () => new MyCustomStepLedger(), api);
+aiCallLoggerConformanceSuite("MyCustomAICallLogger", () => new MyCustomAICallLogger(), api);
 ```
+
+`stepLedgerConformanceSuite` takes a `StepLedgerFixture` (`StepLedger & { reset?: () => Promise<void> }`) rather than the `ResettableFixture` below, because `StepLedger` has a `clear(stageRecordId)` of its own. It covers `clearExcept` (skipped when absent), `compareAndSet` with and without a pinned attempt, and result nulling.
 
 ### Resetting Fixtures Between Tests: `clear` vs `reset`
 

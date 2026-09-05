@@ -55,13 +55,19 @@ You can tune the host's polling frequency, lease times, and execution limits:
 | **`workerId`** | `string` | *Required* | Unique name identifying this host worker in execution logs. |
 | **`orchestrationIntervalMs`**| `number` | `10000` (10s) | How often to run orchestration tasks (claim pending, poll suspended, reap leases, flush outbox). |
 | **`jobPollIntervalMs`** | `number` | `1000` (1s) | How often to poll the job queue for new execution jobs. |
-| **`staleLeaseThresholdMs`** | `number` | `300000` (5m) | The duration a lease is locked before it is considered stale. (Default changed from 60s to 5m in `v0.11` to prevent premature lease timeouts). |
-| **`jobHeartbeatIntervalMs`**| `number` | `60000` (60s) | *New in v0.11*: How frequently to heartbeat active stage leases while executing them. |
+| **`postJobYieldMs`** | `number` | `jobPollIntervalMs` | Upper bound on the randomised pause this worker takes after *completing* a job before asking for the next one, so a multi-stage run is not pinned to the worker that advanced it. Skipped while draining a backlog; `0` disables it. |
+| **`staleLeaseThresholdMs`** | `number` | `300000` (5m) | How long a job lease may go without a heartbeat before `lease.reapStale` releases it for retry (measured on the database clock on PostgreSQL). |
+| **`jobAbsoluteTimeoutMs`** | `number` | `3600000` (1h) | Absolute cap on one job claim, measured from `startedAt`, which no heartbeat refreshes. A job past it is failed terminally (`LEASE_ABSOLUTE_CAP`); a stage that legitimately runs longer must raise it. `0` disables the tier. |
+| **`jobHeartbeatIntervalMs`**| `number` | `60000` (60s) | How often to dispatch `job.heartbeat` while executing a job: renews the lease and aborts `ctx.abortSignal` when the run was cancelled or the lease lost. |
 | **`maxClaimsPerTick`** | `number` | `10` | Maximum number of pending workflow runs to claim in a single orchestration tick. |
 | **`maxSuspendedChecksPerTick`**| `number` | `10` | Maximum number of suspended stage completion checks to perform in a single tick. |
 | **`maxOutboxFlushPerTick`** | `number` | `100` | Maximum number of outbox events to publish in a single tick. |
 | **`retention`** | `{ olderThanMs, statuses?, limit? }` | off | Delete terminal runs older than `olderThanMs` (with their stages, logs, artifacts, annotations, step ledger, job rows and blobs) through `run.purge` at the end of every tick. Nothing is deleted unless set. See [Run Retention](../troubleshooting/overview.md#run-retention). |
 | **`serves`** | `ServedDefinition[] \| "all"` | derived from the registry | Which definition versions this host may claim, poll and dequeue. Left unset, the kernel derives it from the registry, which is what makes a rolling deploy safe. `"all"` turns version filtering off entirely — the pre-1.0 behaviour. See [Definition versioning](../core-concepts/definition-versioning.md). |
+| **`shutdownTimeoutMs`** | `number` | `10000` (10s) | Upper bound on `stop()`: how long to wait for the in-flight job (and the in-flight orchestration tick) to finish, and separately for the final outbox flush. |
+| **`flushOutboxOnStop`** | `boolean` | `true` | Run a final `outbox.flush` in `stop()`, so `workflow:completed` for a run this process finished is published before it exits rather than by whichever process ticks next. |
+
+`workerId` also reaches `job_queue.workerId`: a `createPrismaJobQueue(prisma)` built without a `workerId` of its own adopts the host's on `start()`, so the job row says which worker ran the stage.
 
 ---
 
@@ -70,11 +76,11 @@ You can tune the host's polling frequency, lease times, and execution limits:
 The Node.js host automatically hooks into the Node process handlers. Calling `await host.start()` registers listeners for `SIGTERM` and `SIGINT` to perform a **graceful shutdown**.
 
 ### Graceful Shutdown
-During a graceful shutdown (when `SIGTERM` is received):
-1. The host stops accepting new jobs from the queue.
-2. Active jobs that are currently running are allowed to finish execution.
-3. The host releases any claims on pending runs.
-4. The database connections are safely released, and the `host.start()` promise resolves.
+During a graceful shutdown (when `SIGTERM` is received, or `host.stop()` is called):
+1. The host stops accepting new jobs from the queue and skips further orchestration ticks.
+2. The job currently running, and any orchestration tick in flight, are allowed to finish (bounded by `shutdownTimeoutMs`).
+3. A final `outbox.flush` publishes the events this process committed (unless `flushOutboxOnStop: false`).
+4. The `host.start()` promise resolves. Errors during shutdown are logged, never thrown.
 
 If your process manager (e.g. PM2, Kubernetes) manages process lifecycles, you can manually trigger a stop:
 

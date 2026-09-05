@@ -11,7 +11,7 @@ title: Prisma Setup
 
 ## Authoritative Prisma Schema
 
-To configure persistence, copy these definitions directly into your `prisma/schema.prisma` file. Ensure that all model names map to their plural database equivalents using `@@map`.
+The package ships this schema at `node_modules/@bratsos/workflow-engine/prisma/schema.prisma`; copy the definitions into your own `prisma/schema.prisma`. Ensure that all model names map to their plural database equivalents using `@@map`. The Prisma adapters require every model *and column* below — a wall of `PrismaClient is not assignable to EnginePrismaClient` errors means a delegate is missing (after 1.0, almost always `workflowStep` or `workflowDefinition`). Upgrading an existing database? The [0.13 → 1.0 guide](../migrations/migrate-0.13-to-1.0.md) has the column-level checklist as idempotent SQL.
 
 ```prisma
 // schema.prisma
@@ -149,11 +149,42 @@ model WorkflowStage {
   logs            WorkflowLog[]
   artifacts       WorkflowArtifact[]
   annotations     WorkflowAnnotation[]
+  steps           WorkflowStep[]
 
   @@unique([workflowRunId, stageId])
   @@index([status])
   @@index([nextPollAt])
   @@map("workflow_stages")
+}
+
+// 3b. Durable step ledger (drives ctx.step.*; used by createPrismaStepLedger)
+model WorkflowStep {
+  id            String   @id @default(cuid())
+  stageRecordId String
+  // Cascade from the stage record, so deleting a stage (or the run above it)
+  // removes its ledger rows instead of orphaning them. Constraint name:
+  // workflow_steps_stageRecordId_fkey.
+  stage         WorkflowStage @relation(fields: [stageRecordId], references: [id], onDelete: Cascade)
+  stepId        String
+  seq           Int
+  kind          String        // "run" | "wait" | "signal" | "sleep"
+  status        String
+  attempt        Int       @default(1)
+  leaseExpiresAt DateTime?
+  deadlineAt     DateTime?
+  // Deterministic name for the external effect a `run` step body creates,
+  // written before the body runs so an orphaned provider-side effect can be
+  // found from the row after a crash.
+  externalKey    String?
+  result        Json?
+  error         String?
+  waitState     Json?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@unique([stageRecordId, stepId])
+  @@index([stageRecordId])
+  @@map("workflow_steps")
 }
 
 // 4. Execution log lines (drives ctx.log)
@@ -323,6 +354,19 @@ model IdempotencyKey {
   @@unique([key, commandType])
   @@map("idempotency_keys")
 }
+
+// 11. Optional: a blob store in the database (createPrismaBlobStore).
+// Every process that executes or polls a run must read the same blob store;
+// this makes the database that store without object storage. Requires only
+// the workflowBlob delegate, not a change to the persistence client.
+model WorkflowBlob {
+  key       String   @id
+  data      Json
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("workflow_blobs")
+}
 ```
 
 ---
@@ -448,15 +492,28 @@ import {
   createPrismaWorkflowPersistence,
   createPrismaJobQueue,
   createPrismaAICallLogger,
+  createPrismaStepLedger,
+  createPrismaBlobStore,
 } from "@bratsos/workflow-engine/persistence/prisma";
-import { PrismaClient } from "@prisma/client";
+import { PrismaClient } from "@prisma/client"; // or your Prisma 7 generator's output path
 
 const prisma = new PrismaClient();
 
 const persistence = createPrismaWorkflowPersistence(prisma);
-const jobQueue = createPrismaJobQueue(prisma);
+const jobQueue = createPrismaJobQueue(prisma);   // adopts the host's workerId on start()
 const aiCallLogger = createPrismaAICallLogger(prisma);
+const stepLedger = createPrismaStepLedger(prisma);
+const blobStore = createPrismaBlobStore(prisma); // needs the WorkflowBlob model
 ```
+
+The adapters take a structural client type and never import `@prisma/client`, so any generated client — Prisma 6 or 7, default or custom `output` — satisfies them as long as it has the delegates. A transaction client works too: build the ports over the `tx` inside your own `$transaction` and the whole kernel tick runs in that transaction, under your `SET LOCAL` and row-level security. (The Prisma step ledger and idempotency-key inserts use `createMany({ skipDuplicates: true })` on Postgres precisely so a conflict does not abort an enclosing transaction.)
+
+Options worth knowing:
+
+* `createPrismaWorkflowPersistence(prisma, { statusEnumName })` names the Prisma enum the Postgres claim statement casts with (default `"Status"`).
+* `createPrismaWorkflowPersistence(prisma, { definitionVersioning })` skips the adapter's own check for the `workflow_definitions` table: `false` for a client whose schema has the model against a database deliberately left unmigrated, `true` for a client wrapper the structural check cannot see. Left unset, the adapter confirms the generated client's answer against the database once, lazily, with a catalogue read that returns "absent" rather than raising — so an unmigrated database still starts, with versioning off.
+* `createPrismaJobQueue(prisma, { fairness: { maxConcurrentPerGroup, groupBy: "config.tenantId" } })` turns on the opt-in per-group concurrency cap in the PostgreSQL dequeue (off by default; it costs more on a deep queue).
+* On PostgreSQL the job lease runs on the database clock; `PrismaJobQueueOptions.now` only affects SQLite.
 
 ### 2. SQLite Setup
 SQLite lacks native lock features like `FOR UPDATE SKIP LOCKED`. If you are running locally or inside a testing context on SQLite:
@@ -471,12 +528,21 @@ const sqlitePersistence = createPrismaWorkflowPersistence(prisma, {
 const sqliteJobQueue = createPrismaJobQueue(prisma, {
   databaseType: "sqlite",
 });
+
+const sqliteStepLedger = createPrismaStepLedger(prisma, {
+  databaseType: "sqlite", // keeps the create-and-catch path; SQLite has no skipDuplicates
+});
 ```
 
 ---
 
 ## Database Indexes
 
-Verify that your index declarations (`@@index`) are preserved:
-* `job_queue`: Indexes on `[status, priority]` and `[nextPollAt]` ensure that workers can query and claim jobs with negligible overhead.
-* `workflow_annotations`: Indexes on `[workflowRunId, key]` enable efficient range queries (e.g. `keyPrefix: "decision."`) when using PostgreSQL index-range scans.
+Verify that your index declarations (`@@index`) are preserved. The ones that matter operationally:
+* `workflow_runs`: `[status, priority DESC, createdAt]` serves the run claim; the three `(…, createdAt DESC, id DESC)` composites serve every "newest first" listing (the console's included) as one index range scan; `[definitionVersion]` and `[status, workflowId, definitionVersion]` serve the version-filtered claim and `run.listVersions`.
+* `job_queue`: `[status, priority DESC, createdAt]` serves the dequeue without a sort node whatever the queue depth; `[status, createdAt]` serves queue health; `[nextPollAt]` serves retries. `@@unique([workflowRunId, stageId])` is what makes the enqueue idempotent on a redrive.
+* `workflow_steps`: `@@unique([stageRecordId, stepId])` is the step ledger's claim; the foreign key to `workflow_stages` with `ON DELETE CASCADE` is what lets `run.purge` (and a hand-written `DELETE FROM workflow_runs`) take the ledger with the run.
+* `outbox_events`: `[dlqAt]` serves the dead-letter view; on Postgres prefer a partial index (`WHERE "dlqAt" IS NOT NULL`) if you write the migration by hand.
+* `workflow_annotations`: `[workflowRunId, key]` enables efficient range queries (e.g. `keyPrefix: "decision."`).
+
+`workflow_definitions` deliberately has no `(workflowId)` index: the compound primary key already leads with it. If an earlier draft of your migration created one, `DROP INDEX CONCURRENTLY IF EXISTS "workflow_definitions_workflowId_idx";` is safe.

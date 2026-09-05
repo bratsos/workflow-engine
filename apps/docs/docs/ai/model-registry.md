@@ -28,6 +28,7 @@ registerModels({
     supportsTools: true,
     supportsStructuredOutputs: true,
     supportsAsyncBatch: true,
+    batchProvider: "openrouter", // where ctx.step.ai.map batches it; defaults to the native vendor
     batchModelId: "meta-llama/llama-3-8b-instruct:batch",
     batchInputCostPerMillion: 0.1,
     batchOutputCostPerMillion: 0.2,
@@ -62,6 +63,8 @@ declare module "@bratsos/workflow-engine/client" {
 ```
 
 Once augmented, calling `ai.generateText("custom-llama-3", ...)` is verified by the compiler, and typos will throw TypeScript build errors.
+
+The `ModelKey` *type* stays open (any string is accepted, augmentation only adds autocomplete), and the exported `ModelKey` zod schema is `z.string().min(1)` — a `schemas.config` field typed with it no longer rejects an unregistered key at `run.create`. Validation happens where the model is resolved: `getModel(key)` throws with the registered keys in the message. Check batch capability with `getModel(key).supportsAsyncBatch`; the 0.x helpers (`getModelById`, `getRegisteredModel`, `listRegisteredModels`, `getDefaultModel`, `modelSupportsBatch`, `printAvailableModels`) were removed in 1.0.
 
 ---
 

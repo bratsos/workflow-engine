@@ -28,11 +28,14 @@ const host = createServerlessHost({
   workerId: "edge-worker-1",
   
   // Optional tuning
-  staleLeaseThresholdMs: 300_000, // default 5m
-  jobHeartbeatIntervalMs: 60_000, // default 1m
+  staleLeaseThresholdMs: 300_000, // default 5m: heartbeat tier of the job lease
+  jobAbsoluteTimeoutMs: 3_600_000, // default 1h: absolute cap, 0 disables
+  jobHeartbeatIntervalMs: 60_000, // default 1m: renews the lease, feeds ctx.abortSignal
   maxClaimsPerTick: 10,
   maxSuspendedChecksPerTick: 10,
   maxOutboxFlushPerTick: 100,
+  flushOutboxAfterJob: true,      // default: publish this job's events before returning
+  outboxFlushTimeoutMs: 10_000,   // bound on that flush; errors are logged, never thrown
 
   // Opt-in retention: run.purge deletes terminal runs older than this on
   // every maintenance tick. Off unless set.
@@ -70,14 +73,21 @@ export default {
 
       if (result.outcome === "completed" || result.outcome === "suspended") {
         msg.ack();
+      } else if (result.willRetry && !result.dead) {
+        // failed with attempts left: the kernel left the stage PENDING and
+        // expects the transport to re-deliver with backoff
+        msg.retry({ delaySeconds: Math.ceil((result.retryDelayMs ?? 0) / 1000) });
       } else {
-        // failed: instruct queue to retry
-        msg.retry();
+        // terminal (attempts exhausted), or a dead job (orphan, malformed
+        // message, run/stage no longer exists): already failed and acknowledged
+        msg.ack();
       }
     }
   }
 };
 ```
+
+`handleJob` returns `{ outcome, error?, dead?, willRetry?, attempt?, maxAttempts?, retryDelayMs? }`. A push transport whose `fail()` cannot re-enqueue (a Cloudflare Queue consumer) uses `willRetry` and `retryDelayMs` (the built-in transports' `2^attempt` seconds) to retry the message itself; `dead: true` means the message was failed and acknowledged up front and must not be retried. The transport's `maxAttempts` is the retry budget; a job whose run was cancelled, or whose run is pinned to a definition version this build does not serve, is handled the same way as on the Node host (see [Execution Model](../core-concepts/execution-model.md#ghost-job-guard)). If you deliver job messages through your own queue and built the message yourself, resolve a spilled payload first with `createPayloadSpill({ blobStore }).unpack(msg.payload)` (see [Kernel and Ports](../core-concepts/kernel-and-ports.md#job-payloads-opt-in-at-wiring)).
 
 ---
 
@@ -101,11 +111,12 @@ console.log(result);
 Because serverless functions are ephemeral, they cannot run continuous background loops. You must trigger a maintenance tick periodically (e.g. once per minute) using a scheduler or cron job (like Cloudflare Crons or AWS EventBridge).
 
 The maintenance tick performs one cycle of:
-1. **Claiming**: Finds runs in `PENDING` status and enqueues their first stages.
-2. **Polling**: Checks completion status of `SUSPENDED` batch stages (e.g. OpenAI/Google Batch jobs).
-3. **Lease Reaping**: Releases locks from crashed worker nodes.
+1. **Claiming**: Finds runs in `PENDING` status this build serves and enqueues their first stages.
+2. **Polling**: Replays `SUSPENDED` durable stages whose `nextPollAt` has passed — a `ctx.step.waitFor` poll, a batch status check, a sleep or signal keepalive.
+3. **Lease Reaping**: Releases job locks from crashed worker nodes and fails jobs past `jobAbsoluteTimeoutMs`.
 4. **Outbox Flushing**: Dispatches pending transactional outbox events to the `EventSink`.
 5. **Stuck Run Detection**: Automatically fails runs that have ceased updates.
+6. **Retention** (only with `retention` configured): `run.purge` deletes terminal runs past their age. See [Run Retention](../troubleshooting/overview.md#run-retention).
 
 ```typescript
 // Example: Cron schedule trigger

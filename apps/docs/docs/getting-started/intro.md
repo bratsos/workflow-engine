@@ -114,6 +114,10 @@ boundary, not only the realtime one.
   detection for free the way an ordinal ledger does, which is why
   `DuplicateStepKeyError` exists.
 - **Restart from a step.** `run.redrive` gives you retry, restart and rerun.
+  A retry or a rerun reopens the resumed stage in place and keeps its
+  completed step rows and their external keys, so a stage that finished 9 of
+  10 steps re-runs only the tenth; only a restart replaces everything (see
+  [Retry, Restart and Rerun](../core-concepts/redriving-runs.md)).
   Inngest, Cloudflare Workflows, Hatchet, DBOS, Restate, Conductor, Temporal,
   Step Functions and Mastra all ship a form of this. The factoring here is
   borrowed: the three verbs are Conductor's, the same-run-id, append-not-branch

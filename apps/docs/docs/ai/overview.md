@@ -9,25 +9,49 @@ title: AI Overview
 
 ---
 
-## Creating the AIHelper
+## `ctx.ai`: the helper every stage gets
 
-You initialize an `AIHelper` by passing a hierarchical cost-tracking topic and an `AICallLogger` implementation.
+Give the kernel an `AICallLogger` once, and every stage and `checkCompletion` context carries `ctx.ai` — an `AIHelper` built lazily on first access under the topic `workflow.<workflowRunId>.stage.<stageId>` — and `ctx.aiLogger`, the logger itself. Call logs land in the run's log table.
 
 ```typescript
-import { createAIHelper } from "@bratsos/workflow-engine";
+import { createKernel } from "@bratsos/workflow-engine/kernel";
 import { createPrismaAICallLogger } from "@bratsos/workflow-engine/persistence/prisma";
 
-const aiCallLogger = createPrismaAICallLogger(prisma);
+const kernel = createKernel({
+  // ...ports
+  services: {
+    aiLogger: createPrismaAICallLogger(prisma),
+    // optional: a factory with createAIHelper's signature, to set routing
+    // options, an adapter or timeouts for every stage in one place
+    ai: (topic, logger, logContext, providerResolver, options) =>
+      createAIHelper(topic, logger, logContext, providerResolver, {
+        ...options,
+        timeout: { perCallMs: 8 * 60 * 1000 },
+      }),
+  },
+});
 
 // Inside a stage's execute() function
 async execute(ctx) {
-  const ai = createAIHelper(
-    `workflow.${ctx.workflowRunId}.stage.${ctx.stageId}`,
-    aiCallLogger
-  );
-  
-  // Now all AI calls will automatically log tokens and calculate cost
+  const result = await ctx.ai.generateText("gemini-2.5-flash", prompt, {
+    abortSignal: ctx.abortSignal,
+  });
+  // tokens and cost are logged under this run and stage
 }
+```
+
+Accessing `ctx.ai` on a kernel built without `services` throws `AIServicesNotConfiguredError`. In tests, `createTestHarness()` wires an `InMemoryAICallLogger` and a scriptable mock helper for you (see [Testing Workflows](../testing/testing-workflows.md)).
+
+For a call that must survive a replay — memoized through the step ledger so it is not paid for twice — use `ctx.step.ai.generateText` / `generateObject` / `streamText`, and `ctx.step.ai.map` for one prompt per item under a realtime or batch policy. See [Durable Steps](../core-concepts/durable-steps.md#ctxstepai) and [Batch Operations](./batch-operations.md).
+
+### Creating a helper outside a stage
+
+Outside the kernel — a script, a request handler — create one directly from a topic and a logger:
+
+```typescript
+import { createAIHelper } from "@bratsos/workflow-engine";
+
+const ai = createAIHelper("cli.reindex", createPrismaAICallLogger(prisma));
 ```
 
 ---
@@ -54,7 +78,7 @@ const totalSystemStats = await aiCallLogger.getStats("workflow");
 ```
 
 ### Automatic Run Cost Aggregation
-When a workflow run completes, the kernel automatically queries stats for `workflow.${runId}`, aggregates the total cost and tokens, and updates the `totalCost` and `totalTokens` columns in the `WorkflowRun` table.
+When a workflow run completes or fails, the kernel queries `services.aiLogger.getStats("workflow.${runId}")` (falling back to the sum of the stages' `metrics` when no services are configured), and writes `totalCost` and `totalTokens` onto the `WorkflowRun` row in the same transaction; `workflow:completed` carries them too. Because it is a column and not a trace, a later stage can read it and gate on spend.
 
 ---
 
@@ -68,10 +92,11 @@ const result = await ai.generateText(
   "gemini-2.5-flash", 
   "Summarize this input text: ...",
   {
-    temperature: 0.5,
+    temperature: 0.5,              // no default is sent; the provider's own applies
     maxTokens: 1000,
-    maxRetries: 3,                 // v0.11+: passes retries directly to provider SDK
-    abortSignal: controller.signal // v0.11+: abort support
+    maxRetries: 3,                 // passed to the provider SDK
+    abortSignal: ctx.abortSignal,  // cancellation / lost lease reaches the call
+    timeoutMs: 120_000,            // per-call deadline; AICallTimeoutError on expiry
   }
 );
 
@@ -126,17 +151,23 @@ console.log(`Stream cost: $${finalUsage.cost}`);
 ```
 
 ### 4. `embed`
-Computes vector embeddings. In `v0.11`, passing an array of strings triggers the AI SDK's optimized `embedMany()` batch call, performing a single network round-trip.
+Computes vector embeddings. Passing an array of strings triggers the AI SDK's optimized `embedMany()` batch call, performing a single network round-trip.
 
 ```typescript
 // Single text
 const singleResult = await ai.embed("text-embedding-004", "Hello world");
 console.log(singleResult.embedding); // number[]
 
-// Batch text (v0.11+)
+// Batch text
 const batchResult = await ai.embed("text-embedding-004", ["doc1", "doc2", "doc3"]);
 console.log(batchResult.embeddings); // number[][]
 ```
+
+### Timeouts and adapters
+
+`AIHelperOptions.timeout.perCallMs` applies a deadline to every non-batch call, and `timeoutMs` on the text, object, embed and stream options overrides it per call. On expiry the call throws `AICallTimeoutError` (with `timeoutMs` and `modelKey`) and the failure is still logged as a cost row.
+
+`AIHelperOptions.adapter: AIAdapter` swaps the transport below logging and cost for any subset of `generateText`, `generateObject`, `embed` and `streamText` (a local model, a subscription CLI); missing operations fall through to the AI SDK, and child helpers inherit it. An adapter response may carry `costUsd`, recorded as the reported cost. An adapter that parses model output itself should throw `NoObjectGeneratedError` (re-exported from the root entry) with `text` set so the `map` repair loop can quote the bad output back to the model.
 
 ---
 
@@ -175,5 +206,5 @@ const reasoning = await stream.getReasoning();
 
 ## Reported vs. estimated cost
 
-Since 0.13 every AI result exposes `reportedCostUsd` (the provider's own figure, when it reports one) and `costSource` (`"reported"` or `"estimated"`). `cost` prefers the reported figure and falls back to the model registry's prices, including long-context pricing tiers. BYOK is handled correctly: the upstream inference cost is added only when the provider bills it separately. Batch cost follows the transport actually used — a native vendor batch bills the vendor's documented discount, the OpenRouter transport bills the `:batch` catalog row's absolute price.
+Every AI result exposes `reportedCostUsd` (the provider's own figure, when it reports one) and `costSource` (`"reported"` or `"estimated"`). `cost` prefers the reported figure and falls back to the model registry's prices, including long-context pricing tiers. BYOK is handled correctly: the upstream inference cost is added only when the provider bills it separately. Batch cost follows the transport actually used — a native vendor batch bills the vendor's documented discount, the OpenRouter transport bills the `:batch` catalog row's absolute price.
 
