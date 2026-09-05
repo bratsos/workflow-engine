@@ -33,13 +33,21 @@ session, under your row-level security policies.
   - [Accessing Previous Stage Output](#accessing-previous-stage-output)
   - [Parallel Execution](#parallel-execution)
   - [Stage ID Utilities](#stage-id-utilities)
+  - [Durable Steps](#durable-steps)
   - [AI Integration](#ai-integration)
-  - [Long-Running Batch Jobs](#long-running-batch-jobs)
+  - [Batch AI Calls (`ctx.step.ai.map`)](#batch-ai-calls-ctxstepaimap)
   - [Annotations (Provenance)](#annotations-provenance)
   - [Config Presets](#config-presets)
+- [Operations](#operations)
+  - [Redrive](#redrive)
+  - [Retention](#retention)
+  - [Definition Versioning](#definition-versioning)
+  - [Enqueue from SQL](#enqueue-from-sql)
+- [Testing](#testing)
 - [Best Practices](#best-practices)
 - [API Reference](#api-reference)
 - [Troubleshooting](#troubleshooting)
+- [Upgrading](#upgrading)
 
 ---
 
@@ -56,13 +64,16 @@ session, under your row-level security policies.
 | **Definition versioning** | A run is pinned to the structural version it was created under, and a host claims only runs it serves, so a rolling deploy cannot change a run's shape mid-flight |
 | **Environment-Agnostic** | Pure command kernel: no timers, no signals, no global state, no connection of its own. Node.js, serverless, edge, or inside your transaction |
 
+What it does not do: no arbitrary DAG or child workflows (pipelines are linear execution groups); no exactly-once *execution* of a step body (exactly-once recording, at-least-once execution, with a derived `externalKey` so a repeat is recoverable); no per-tenant throttle, rate limit or debounce (the Postgres queue has priority and an opt-in per-group concurrency cap); TypeScript only. The [introduction](https://github.com/bratsos/workflow-engine/blob/main/apps/docs/docs/getting-started/intro.md) says where another project is the better choice.
+
 ---
 
 ## Requirements
 
+- **Node.js** >= 22.11
 - **TypeScript** >= 5.0.0
-- **Zod** >= 4.0.0
-- **PostgreSQL** >= 14 (for Prisma persistence)
+- **Zod** ^4.1.12
+- **PostgreSQL** >= 14 (for Prisma persistence; `sql/enqueue.sql` needs 13+)
 
 ### Optional Peer Dependencies
 
@@ -77,7 +88,7 @@ npm install @ai-sdk/openai
 npm install @prisma/client
 ```
 
-> `@ai-sdk/google` is included as a direct dependency of `@bratsos/workflow-engine`. OpenRouter models and batch processing run via direct HTTP transport without extra vendor SDKs.
+> `@ai-sdk/google` and `@openrouter/ai-sdk-provider` are direct dependencies of `@bratsos/workflow-engine`. OpenRouter models and OpenRouter `:batch` processing need no extra vendor SDK; when `@ai-sdk/anthropic` / `@ai-sdk/openai` is not installed and OpenRouter can batch the model, the batch falls back to OpenRouter with a WARN.
 
 ---
 
@@ -92,6 +103,9 @@ npm install @bratsos/workflow-engine-host-node
 
 # Serverless host (Cloudflare Workers, AWS Lambda, Vercel Edge, etc.)
 npm install @bratsos/workflow-engine-host-serverless
+
+# Optional: embeddable operational console (a fetch handler + UI you mount in your app)
+npm install @bratsos/workflow-engine-console
 ```
 
 ---
@@ -100,7 +114,7 @@ npm install @bratsos/workflow-engine-host-serverless
 
 ### 1. Database Setup
 
-The engine requires persistence tables. Add these to your Prisma schema:
+The engine requires persistence tables. The package ships the reference schema at `node_modules/@bratsos/workflow-engine/prisma/schema.prisma`; add these models to your Prisma schema:
 
 ```prisma
 // schema.prisma
@@ -224,11 +238,39 @@ model WorkflowStage {
   logs            WorkflowLog[]
   artifacts       WorkflowArtifact[]
   annotations     WorkflowAnnotation[]
+  steps           WorkflowStep[]
 
   @@unique([workflowRunId, stageId])
   @@index([status])
   @@index([nextPollAt])
   @@map("workflow_stages")
+}
+
+// Durable step ledger (ctx.step.*). One row per step per stage record.
+model WorkflowStep {
+  id             String        @id @default(cuid())
+  stageRecordId  String
+  stage          WorkflowStage @relation(fields: [stageRecordId], references: [id], onDelete: Cascade)
+  stepId         String
+  seq            Int
+  kind           String
+  status         String
+  attempt        Int           @default(1)
+  leaseExpiresAt DateTime?
+  deadlineAt     DateTime?
+  // Deterministic name for the external effect a `run` step body creates,
+  // written before the body runs so an orphaned provider-side effect can be
+  // found from the row after a crash.
+  externalKey    String?
+  result         Json?
+  error          String?
+  waitState      Json?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  @@unique([stageRecordId, stepId])
+  @@index([stageRecordId])
+  @@map("workflow_steps")
 }
 
 model WorkflowLog {
@@ -339,8 +381,8 @@ model JobQueue {
   payload       Json?
   lastError     String?
 
-  // One job row per stage per run: run.rerunFrom retires the rows of the
-  // stages it deletes and every enqueue path is idempotent on this pair.
+  // One job row per stage per run: run.redrive retires the rows of the
+  // stages it supersedes and every enqueue path is idempotent on this pair.
   @@unique([workflowRunId, stageId])
   // The dequeue: status = 'PENDING' ORDER BY priority DESC, "createdAt" ASC
   // LIMIT 1 FOR UPDATE SKIP LOCKED. This replaces the bare
@@ -400,6 +442,19 @@ model IdempotencyKey {
   @@unique([key, commandType])
   @@map("idempotency_keys")
 }
+
+// Optional: only when using createPrismaBlobStore. Stage outputs, spilled
+// step results and replay inputs are read from the blob store by every
+// process that executes or polls a run, so the store must be shared; this
+// table makes Prisma that shared store without object storage.
+model WorkflowBlob {
+  key       String   @id
+  data      Json
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("workflow_blobs")
+}
 ```
 
 Run the migration:
@@ -408,6 +463,8 @@ Run the migration:
 npx prisma migrate dev --name add-workflow-tables
 npx prisma generate
 ```
+
+Upgrading from 0.13? The database checklist in `skills/workflow-engine/migrations/migrate-0.13-to-1.0.md` has the exact SQL (`workflow_steps`, the two `workflow_runs` columns, `workflow_definitions`, the index set above), `CONCURRENTLY` where it matters.
 
 ### 2. Define Your First Stage
 
@@ -453,15 +510,51 @@ export const documentProcessorWorkflow = defineWorkflow({
   .build();
 ```
 
+The builder checks each prebuilt stage's declared context against what earlier stages produce, so a stage that requires a key nothing before it emits does not compile. You can also define stages inline with `defineWorkflow(id, { input }).stage(id, definition)`, which infers the context for `ctx.require()` from the stages before it:
+
+```typescript
+const Input = z.object({ url: z.string().url() });
+
+export const inlineWorkflow = defineWorkflow("document-processor", { input: Input })
+  .stage("extract-text", {
+    schemas: {
+      input: Input,
+      output: z.object({ text: z.string() }),
+      config: z.object({}),
+    },
+    async execute(ctx) {
+      return { output: { text: await (await fetch(ctx.input.url)).text() } };
+    },
+  })
+  .stage("summarize", {
+    schemas: {
+      input: "none",
+      output: z.object({ summary: z.string() }),
+      config: z.object({}),
+    },
+    async execute(ctx) {
+      const { text } = ctx.require("extract-text"); // typed from the stage above
+      return { output: { summary: text.slice(0, 200) } };
+    },
+  })
+  .version("2026-09-04.1") // optional; otherwise a structural hash is derived
+  .build();
+```
+
+`InferWorkflowInput`, `InferWorkflowOutput`, `InferWorkflowContext` and `InferStageOutputById` expose the inferred types. The workflow's output schema is always the last stage's output (or the merged object of the last parallel group).
+
 ### 4. Create the Kernel
 
 The kernel is the core command dispatcher. It's environment-agnostic -- no timers, no signals, no global state.
 
 ```typescript
-import { createKernel } from "@bratsos/workflow-engine/kernel";
+import { createKernel, createWorkflowRegistry } from "@bratsos/workflow-engine/kernel";
 import {
-  createPrismaWorkflowPersistence,
+  createPrismaAICallLogger,
+  createPrismaBlobStore,
   createPrismaJobQueue,
+  createPrismaStepLedger,
+  createPrismaWorkflowPersistence,
 } from "@bratsos/workflow-engine";
 import { PrismaClient } from "@prisma/client";
 import { documentProcessorWorkflow } from "./workflows/document-processor";
@@ -470,16 +563,17 @@ const prisma = new PrismaClient();
 
 const kernel = createKernel({
   persistence: createPrismaWorkflowPersistence(prisma),
-  blobStore: myBlobStore,         // BlobStore implementation
+  blobStore: createPrismaBlobStore(prisma), // any BlobStore shared by every process
   jobTransport: createPrismaJobQueue(prisma),
-  eventSink: myEventSink,         // EventSink implementation
+  stepLedger: createPrismaStepLedger(prisma), // durable steps (ctx.step.*)
+  services: { aiLogger: createPrismaAICallLogger(prisma) }, // ctx.ai / ctx.step.ai
+  eventSink: myEventSink,                   // EventSink implementation: { emit }
   clock: { now: () => new Date() },
-  registry: {
-    getWorkflow: (id) =>
-      id === "document-processor" ? documentProcessorWorkflow : undefined,
-  },
+  registry: createWorkflowRegistry([documentProcessorWorkflow]),
 });
 ```
+
+`createWorkflowRegistry` is what makes definition versioning effective: it can enumerate the workflows this build serves, so a host only claims runs it can execute. A hand-written `{ getWorkflow }` registry still works but claims regardless of version. Without `stepLedger` every `ctx.step.*` call throws `StepLedgerNotConfiguredError`; without `services` accessing `ctx.ai` throws `AIServicesNotConfiguredError`. `spillThresholdBytes` (default 64 KiB) moves oversized step results to the blob store behind a claim check.
 
 ### 5. Choose a Host
 
@@ -526,6 +620,8 @@ const result = await host.handleJob(msg);
 const tick = await host.runMaintenanceTick();
 ```
 
+For a request that needs the run's result before it returns, the serverless package also exports `runToCompletion({ kernel, jobTransport, persistence, command })`, a bounded drain loop that creates the run and drives it to a terminal state inside the calling request (see that package's README for its limits).
+
 ---
 
 ## Core Concepts
@@ -534,12 +630,7 @@ const tick = await host.runMaintenanceTick();
 
 A stage is the atomic unit of work. Every stage has typed input, output, and config schemas.
 
-**Stage Modes:**
-
-| Mode | Use Case |
-|------|----------|
-| `sync` (default) | Most stages - execute and return immediately |
-| `async-batch` | Long-running batch APIs (AI SDK batch for Google/Anthropic/OpenAI, or OpenRouter Batch) |
+Every stage context carries `ctx.step` (durable steps, including `ctx.step.ai` for memoized and batched model calls), `ctx.ai` / `ctx.aiLogger` (the injected AI services), `ctx.abortSignal` (fires when the run is cancelled or the job lease is lost while the stage executes), `ctx.annotate`, `ctx.storage`, `ctx.log` and `ctx.onProgress`. A stage that needs to wait hours — for a provider batch, a webhook, a human — does so with a durable step and suspends; the engine resumes it by replaying `execute()` with completed steps answered from the step ledger. The 0.x `defineAsyncBatchStage` / `checkCompletion` mode is gone from the public entry; use `ctx.step.ai.map` or `ctx.step.waitFor` instead.
 
 ### Workflows
 
@@ -584,25 +675,36 @@ await kernel.dispatch({
   reason: "User requested",
 });
 
-// Rerun from a specific stage
+// Redrive a failed run: retry from the last failure, restart, or resume at a stage
 await kernel.dispatch({
-  type: "run.rerunFrom",
+  type: "run.redrive",
   workflowRunId,
-  fromStageId: "extract-text",
+  from: { kind: "lastFailure" }, // | { kind: "start" } | { kind: "stage", stageId: "extract-text" }
+});
+
+// Deliver a signal to a stage waiting on ctx.step.waitForSignal
+await kernel.dispatch({
+  type: "step.signal",
+  workflowRunId,
+  stageId: "review",
+  stepId: "approval",
+  payload: { approved: true },
 });
 ```
 
-The kernel depends on 6 required port interfaces, plus a now-optional, currently-unused `Scheduler` (injected at creation):
+The kernel depends on six required ports, injected at creation, plus the optional ones below:
 
 | Port | Purpose |
 |------|---------|
-| `Persistence` | Runs, stages, logs, outbox, idempotency CRUD |
-| `BlobStore` | Large payload storage (put/get/has/delete/list) |
-| `JobTransport` | Job queue (enqueue/dequeue/complete/suspend/fail) |
-| `EventSink` | Async event publishing |
-| `Scheduler` | Deferred command triggers — optional; unused by the kernel today, which supplies its own no-op when omitted (deprecated, removal at 1.0) |
+| `Persistence` | Runs, stages, definitions, logs, outbox, idempotency CRUD |
+| `BlobStore` | Large payload storage (put/get/has/delete/list); must be shared by every process that executes or polls a run |
+| `JobTransport` | Job queue (enqueueParallel/dequeue/complete/suspend/fail, fenced acknowledgements) |
+| `EventSink` | Async event publishing (`{ emit }`) |
 | `Clock` | Injectable time source |
-| `WorkflowRegistry` | Workflow definition lookup |
+| `WorkflowRegistry` | Workflow definition lookup; `createWorkflowRegistry()` adds enumeration for version-filtered claiming |
+| `StepLedger` (optional) | Durable step records for `ctx.step.*` (`InMemoryStepLedger`, `PrismaStepLedger`) |
+| `KernelServices` (optional) | `{ aiLogger, ai? }` behind `ctx.ai` and `ctx.step.ai` |
+| `ActivityExecutor` (optional) | Runs a stage body elsewhere (see `@bratsos/workflow-engine-host-remote`) |
 
 ### Hosts
 
@@ -616,15 +718,21 @@ Hosts wrap the kernel with environment-specific process management:
 
 | Interface | Purpose |
 |-----------|---------|
-| `Persistence` | Workflow runs, stages, logs, outbox, idempotency |
-| `JobTransport` | Distributed job queue with priority and retries |
+| `Persistence` | Workflow runs, stages, definitions, logs, outbox, idempotency, purge |
+| `JobTransport` | Distributed job queue with priority, retries, fenced acknowledgements and an opt-in per-group concurrency cap |
 | `BlobStore` | Large payload storage |
+| `StepLedger` | Durable step records |
 | `AICallLogger` | AI call tracking with cost aggregation |
 
 **Built-in implementations:**
-- `createPrismaWorkflowPersistence(prisma)` - PostgreSQL via Prisma
-- `createPrismaJobQueue(prisma)` - PostgreSQL with `FOR UPDATE SKIP LOCKED`
+- `createPrismaWorkflowPersistence(prisma, { statusEnumName?, now?, definitionVersioning? })` - PostgreSQL via Prisma
+- `createPrismaJobQueue(prisma, { fairness?: { maxConcurrentPerGroup, groupBy } })` - PostgreSQL with `FOR UPDATE SKIP LOCKED`; the lease runs on the database clock
+- `createPrismaStepLedger(prisma)` - PostgreSQL (`workflow_steps`)
+- `createPrismaBlobStore(prisma)` - PostgreSQL (`workflow_blobs`), a shared blob store without object storage
 - `createPrismaAICallLogger(prisma)` - PostgreSQL
+- `InMemoryWorkflowPersistence`, `InMemoryJobQueue`, `InMemoryStepLedger`, `InMemoryAICallLogger` from `@bratsos/workflow-engine/testing`; `InMemoryBlobStore`, `FakeClock`, `CollectingEventSink` from `@bratsos/workflow-engine/kernel/testing`
+
+A custom adapter is held to the same contract as the bundled ones by `persistenceConformanceSuite`, `jobQueueConformanceSuite`, `stepLedgerConformanceSuite` and `aiCallLoggerConformanceSuite` (all from `/testing`, each taking your test primitives as a third argument).
 
 ---
 
@@ -691,87 +799,143 @@ STAGES.SUMMARIZE       // "summarize"
 const STAGES = defineStageIds(["extract-text", "summarize"] as const);
 ```
 
-### AI Integration
+### Durable Steps
+
+`ctx.step.*` records side effects and waits in the step ledger, keyed by step id. A stage that suspends is resumed by replaying `execute()` from the top with completed steps answered from the ledger, so a body must be deterministic around its steps. Never catch a `ctx.step.*` error without rethrowing (`isStepControlFlowError` tells a suspension apart); a body that swallows one still suspends.
 
 ```typescript
-import { createAIHelper } from "@bratsos/workflow-engine";
+import { StageAbortedError } from "@bratsos/workflow-engine";
 
 async execute(ctx) {
-  const ai = createAIHelper(
-    `workflow.${ctx.workflowRunId}.stage.${ctx.stageId}`,
-    aiCallLogger,
+  // run: memoize one side effect. `lease` bounds how long a crashed worker
+  // holds it before another one takes over (default 5 minutes — this is the
+  // crash-recovery latency); `retries`/`retryDelay` re-run a thrown body.
+  const invoice = await ctx.step.run(
+    "create-invoice",
+    async (step) => {
+      // step.externalKey is derived from the stage record + step id and written
+      // before the body runs: pass it as the provider's idempotency key, or
+      // search for the effect when step.isReclaim is true.
+      return billing.createInvoice({ idempotencyKey: step.externalKey, ...ctx.input });
+    },
+    {
+      lease: "10m",
+      retries: 3,
+      retryDelay: "30s",
+      retryBackoff: { factor: 2, maxDelay: "5m", jitter: true },
+      heartbeat: "1m",     // extend the lease automatically while the body runs
+      onReclaim: "fail",   // refuse a lease-expiry takeover: StepNotReplaySafeError
+    },
   );
 
-  const { text, cost } = await ai.generateText("gemini-2.5-flash", "Summarize: " + ctx.input.text);
+  // waitFor: poll until ready. The deadline is stored once and never slides;
+  // expiry throws StepTimeoutError. A throwing poll backs off, not fails.
+  const paid = await ctx.step.waitFor("paid", {
+    poll: () => billing.getInvoice(invoice.id),
+    ready: (inv): inv is PaidInvoice => inv.status === "paid", // type guard narrows
+    every: "1m",
+    timeout: "3d",
+  });
 
-  const { object: analysis } = await ai.generateObject(
+  // waitForSignal: suspend until `step.signal` is dispatched (kernel command,
+  // console button, or your own endpoint). `keepalive` bounds how often the
+  // stage replays while nothing arrives (default 5 minutes).
+  const approval = await ctx.step.waitForSignal<{ approved: boolean }>("approval", {
+    timeout: "7d",
+    keepalive: "1h",
+  });
+
+  await ctx.step.sleep("cool-down", "30s");
+
+  // Cancellation reaches a running body: ctx.abortSignal (also step.abortSignal
+  // inside run) fires with a StageAbortedError whose reason is "cancelled" or
+  // "lease-lost".
+  ctx.abortSignal.throwIfAborted();
+
+  return { output: { invoiceId: invoice.id, paid, approved: approval.approved } };
+}
+```
+
+- `lease` and `retryDelay` take milliseconds or a duration string (`"30s"`, `"5m"`); `leaseMs` / `retryDelayMs` still work as deprecated aliases.
+- Concurrent steps under `Promise.all` are fine: when one suspends, the in-flight siblings are allowed to finish and record first.
+- Two steps sharing a key in one stage invocation throw `DuplicateStepKeyError`.
+- A step's outcome is recorded first-write-wins under a compare-and-set; if two workers ever ran the same body, a `step.outcome-conflict` annotation says so.
+- Step results must be JSON and should be small; a result above `spillThresholdBytes` is moved to the blob store automatically.
+
+### AI Integration
+
+`ctx.ai` is an `AIHelper` built lazily from `createKernel({ services })` under the topic `workflow.<runId>.stage.<stageId>`, with every call logged (prompt, tokens, cost) to the run's log table and rolled up onto `WorkflowRun.totalCost` / `totalTokens` on completion. `ctx.step.ai.*` are the same calls memoized through the step ledger, so a replay does not pay for them again:
+
+```typescript
+import { z } from "zod";
+
+async execute(ctx) {
+  // Durable: recorded in the ledger, replayed for free, retried like any step
+  const { text } = await ctx.step.ai.generateText(
+    "summary",
+    "gemini-2.5-flash",
+    "Summarize: " + ctx.input.text,
+    { maxTokens: 400 },
+    { retries: 2, retryDelay: "10s" },
+  );
+
+  const { object: analysis } = await ctx.step.ai.generateObject(
+    "analysis",
     "gemini-2.5-flash",
     "Analyze: " + ctx.input.text,
-    z.object({ sentiment: z.enum(["positive", "negative", "neutral"]) })
+    z.object({ sentiment: z.enum(["positive", "negative", "neutral"]) }),
   );
 
-  return { output: { text, analysis } };
+  // Streaming, durably: streams on the first execution, replays the stored text
+  const draft = await ctx.step.ai.streamText("draft", "gemini-2.5-flash", "Draft a reply", {
+    onChunk: (chunk) => ctx.log("DEBUG", chunk),
+  });
+
+  // Non-durable: plain call through the same logger (no memoization)
+  const { embedding } = await ctx.ai.embed("text-embedding-3-small", text);
+
+  return { output: { text, analysis, draft: draft.text, embedding } };
 }
 ```
 
 Reasoning models work too — control reasoning per call with `providerOptions` and read the reasoning channel via `result.reasoning` (or `getReasoning()` when streaming):
 
 ```typescript
-const { text, reasoning } = await ai.generateText("anthropic/claude-opus-4.8", prompt, {
+const { text, reasoning } = await ctx.ai.generateText("anthropic/claude-opus-4.8", prompt, {
   providerOptions: { anthropic: { thinking: { type: "disabled" } } }, // or { openrouter: { reasoning: { enabled: false } } }
 });
 ```
 
-### Long-Running Batch Jobs
+Models are configured with `registerModels()` and resolved with `getModel(key)` (`supportsAsyncBatch` says whether a batch transport exists). `AIHelperOptions.adapter` swaps the transport below logging and cost; `timeout.perCallMs` / per-call `timeoutMs` throw `AICallTimeoutError`. Schemas that no provider dialect can express fail before submit with `UnportableSchemaError`. Outside a stage, `createAIHelper(topic, logger)` builds the same helper by hand.
+
+### Batch AI Calls (`ctx.step.ai.map`)
+
+`map` runs one prompt per item under a policy: `"realtime"` (in-process concurrency), `"batch"` (OpenAI Batch, Anthropic Message Batches, Google batch or OpenRouter `:batch`, submitted as a durable step that suspends the stage and resumes from the ledger), or `"auto"` (batch at or above `auto.batchAbove`, default 20, when the model supports it). Schema validation and repair apply identically on both paths, and every item's tokens and cost are recorded.
 
 ```typescript
-import { defineAsyncBatchStage, createAIHelper } from "@bratsos/workflow-engine";
+import { z } from "zod";
 
-export const batchStage = defineAsyncBatchStage({
-  id: "batch-process",
-  name: "Batch Processing",
-  mode: "async-batch",
-  schemas: { input: InputSchema, output: OutputSchema, config: ConfigSchema },
+const Verdict = z.object({ sentiment: z.enum(["positive", "negative", "neutral"]) });
 
-  async execute(ctx) {
-    if (ctx.resumeState) {
-      const cached = await ctx.storage.load("batch-result");
-      if (cached) return { output: cached };
-    }
+async execute(ctx) {
+  const results = await ctx.step.ai.map("classify", ctx.input.reviews, {
+    model: "gemini-2.5-flash",
+    prompt: (review) => `Classify: ${review.text}`,
+    schema: Verdict,
+    itemId: (review) => review.id,        // stable per-item step id
+    policy: "auto",
+    repair: { attempts: 1 },
+    realtime: { concurrency: 8, budget: 500, minDelayMs: "100ms" },
+    batch: { pollEvery: "60s", timeout: "24h", onExpiry: "partial" },
+  });
 
-    const ai = createAIHelper(`batch.${ctx.workflowRunId}`, aiCallLogger);
-    const batch = ai.batch(ctx.config.model, "google");
-    const handle = await batch.submit(
-      ctx.input.prompts.map((p, i) => ({ id: `req-${i}`, prompt: p }))
-    );
-
-    return {
-      suspended: true,
-      state: {
-        batchId: handle.id,
-        submittedAt: new Date().toISOString(),
-        pollInterval: 3600000,
-        maxWaitTime: 86400000,
-        metadata: { batchRefs: handle.refs },
-      },
-      pollConfig: { pollInterval: 3600000, maxWaitTime: 86400000, nextPollAt: new Date(Date.now() + 3600000) },
-    };
-  },
-
-  async checkCompletion(state, ctx) {
-    const ai = createAIHelper(`batch.${ctx.workflowRunId}`, aiCallLogger);
-    const batch = ai.batch(ctx.config?.model ?? "gemini-2.5-flash", "google");
-    const status = await batch.getStatus(state.batchId, state.metadata);
-    if (status.status === "completed") {
-      const results = await batch.getResults(state.batchId, state.metadata);
-      const output = { results: results.map(r => r.result) };
-      return { ready: true, output };
-    }
-    if (status.status === "failed") return { ready: false, error: "Batch failed" };
-    return { ready: false };
-  },
-});
+  const failed = results.filter((r) => r.status === "failed");
+  ctx.log("INFO", "classified", { ok: results.length - failed.length, failed: failed.length });
+  return { output: { results } };
+}
 ```
+
+A worker that dies between the provider accepting a batch and the ledger recording it is the expensive failure. On a replay the submit step adopts the batch carrying its `externalKey` (OpenAI metadata, Google `displayName`); on transports with nothing to search (Anthropic, OpenRouter) it throws `BatchNotAdoptableError` rather than pay twice — `batch: { onReclaim: "resubmit" }` opts back into resubmitting. Batch capability comes from the model registry: `getModel(key).supportsAsyncBatch`, with `batchProvider` naming the transport.
 
 ### Annotations (Provenance)
 
@@ -826,7 +990,7 @@ await kernel.annotations.list(runId, { keyPrefix: "decision." });  // by namespa
 await kernel.annotations.list(runId, { actorId: "triage-v3" });    // by actor
 ```
 
-**Migration from `WorkflowRun.metadata`**: the `metadata` parameter on `run.create` is `@deprecated` in 0.8 and removed in 1.0. Existing rows are automatically projected as virtual `legacy.metadata.*` annotations when you call `kernel.annotations.list(...)` — no dual-write required.
+**Migration from `WorkflowRun.metadata`**: the `metadata` parameter on `run.create` was removed in 1.0 — pass `annotations` instead. Existing rows are still projected as virtual `legacy.metadata.*` annotations when you call `kernel.annotations.list(...)`. The engine writes annotations of its own: `run.supersededAttempt` archives every stage record a redrive replaces, and `step.outcome-conflict` records a step body that ran more than once.
 
 Well-known conventions live in `@bratsos/workflow-engine/conventions`: `Trigger.*`, `Decision.*`, `Approval.*`, `Revision.*`. Custom org keys keep working with the string form. See the [v0.8 migration guide](skills/workflow-engine/migrations/migrate-0.7-to-0.8.md) and the [annotations skill reference](skills/workflow-engine/references/10-annotations.md) for details.
 
@@ -838,6 +1002,86 @@ import { z } from "zod";
 
 const MyConfigSchema = withAIConfig(z.object({ customField: z.string() }));
 ```
+
+The `maxRetries` field of the presets is not read by the kernel; the job transport's `maxAttempts` is the retry budget.
+
+---
+
+## Operations
+
+### Redrive
+
+`run.redrive` retries, restarts or reruns a terminal run under the same run id, incrementing `redriveCount`. Every stage record it supersedes is archived first as a `run.supersededAttempt` annotation, so the failed attempt survives:
+
+```typescript
+await kernel.dispatch({
+  type: "run.redrive",
+  workflowRunId,
+  from: { kind: "lastFailure" },  // default; or { kind: "start" } / { kind: "stage", stageId }
+  definitionVersion: "latest",     // optional: re-pin a run stranded on a version nothing serves
+});
+```
+
+The resumed stage keeps its step ledger: completed steps are answered from it, so a stage that finished 9 of 10 steps re-runs only the tenth, and external keys stay the same. `run.rerunFrom` still works (it delegates to the same code) but is deprecated.
+
+### Retention
+
+Nothing deletes runs unless you ask. `run.purge` — `{ olderThan, statuses?, limit? }` → `{ purged, workflowRunIds }` — clears a terminal run's step ledger, job rows and blobs and deletes the run with everything under it. Both hosts run it on the maintenance tick when given `retention: { olderThanMs, statuses?, limit? }`:
+
+```typescript
+createNodeHost({
+  kernel,
+  jobTransport,
+  workerId: "worker-1",
+  retention: { olderThanMs: 30 * 24 * 60 * 60 * 1000, limit: 100 },
+});
+```
+
+### Definition Versioning
+
+`run.create` pins a run to a version of the workflow's *structural contract* — stage ids and order, execution groups, dependencies, modes, and the JSON Schema of every input/output/config schema — and stores that structure in `workflow_definitions`. Stage names, descriptions and bodies are excluded, so editing what a stage does never forks a run in flight. The version is a derived `sha256-…` hash unless you declare one with `defineWorkflow(...).version("2026-09-04.1")`; re-registering a declared version with a different structure throws `DefinitionVersionConflictError`.
+
+With a registry built by `createWorkflowRegistry`, a host claims and polls only runs whose `(workflowId, version)` it serves, so a rolling deploy cannot change a run's shape mid-flight; a job for a version this build cannot serve is deferred, not failed (`ghostReason: "version"`). `serves: "all"` on the host restores the pre-1.0 predicate. `run.listVersions` reports which versions still have runs and which of them nobody here serves (`unservedHere`); `run.redrive` with `definitionVersion` moves those forward. In CI, `shadowVersions` / `shadowRuns` / `assertShadowCompatible` from `/testing` diff a candidate build against the versions with live runs. A database without the `workflow_definitions` table still starts, with versioning off.
+
+### Enqueue from SQL
+
+`sql/enqueue.sql` (shipped in the package; apply it in your own migration after the engine's tables exist) defines `workflow_engine_enqueue(idempotency_key, workflow_id, workflow_name, input, config?, priority?, definition_version?)`, so a trigger or a non-TypeScript service creates a run inside its own transaction:
+
+```sql
+PERFORM workflow_engine_enqueue(
+  'order:' || v_order_id, 'fulfil-order', 'Fulfil Order',
+  jsonb_build_object('orderId', v_order_id));
+```
+
+It writes exactly the rows `run.create` writes and leaves the run `PENDING`. It cannot validate input against the Zod schema, creates the run unpinned unless you pass a registered `definition_version`, and stores `config` verbatim. PostgreSQL 13+.
+
+---
+
+## Testing
+
+`createTestHarness` from `@bratsos/workflow-engine/testing` wires the kernel over every in-memory port with a fake clock and a mock AI factory, and drives a run to completion:
+
+```typescript
+import { createTestHarness } from "@bratsos/workflow-engine/testing";
+import { expect, it } from "vitest";
+
+it("completes", async () => {
+  const harness = createTestHarness({ workflows: [documentProcessorWorkflow] });
+
+  // Mock a durable step's outcome before the run: a pre-seeded ledger row
+  harness.steps.mockResult("create-invoice", { id: "inv_1" });
+  harness.steps.mockError("flaky", new Error("boom"), { attempt: 1 }); // exercise retries
+  harness.steps.mockTimeout("paid");                                     // waitFor / waitForSignal only
+  harness.steps.skipSleeps();
+
+  const result = await harness.run("document-processor", { url: "https://example.com" });
+  expect(result.status).toBe("COMPLETED");
+  expect(await harness.steps.status("create-invoice")).toBe("completed");
+  expect(harness.steps.wasMocked("create-invoice")).toBe(true);
+});
+```
+
+`harness.start()` creates a run without driving it; `harness.tick()` runs one round (claim → execute → poll → flush → advance) and returns a `TickReport`; `harness.tickUntil(predicate)` waits for a condition; `harness.cancel(runId)` exercises `ctx.abortSignal`. `harness.mockAi` scripts model responses (`setTextResponse`, `setObjectResponse`, `mockObjectResponseForSchema`, `failOnce`), and `harness.steps.record/records/result/error` read back what the ledger recorded. `createTestKernel([workflows])` gives the bare kernel for dispatch-level tests; the module imports nothing from vitest, so it loads from a plain script too.
 
 ---
 
@@ -861,7 +1105,7 @@ async execute(ctx) {
 
   for (const [index, item] of items.entries()) {
     ctx.onProgress({
-      progress: (index + 1) / items.length,
+      progress: Math.round(((index + 1) / items.length) * 100), // 0-100
       message: `Processing item ${index + 1}/${items.length}`,
     });
   }
@@ -892,16 +1136,21 @@ async execute(ctx) {
 
 | Command | Description | Key Fields |
 |---------|-------------|------------|
-| `run.create` | Create a new workflow run | `idempotencyKey`, `workflowId`, `input`, `config?`, `priority?` |
-| `run.claimPending` | Claim pending runs for processing | `workerId`, `maxClaims?` |
+| `run.create` | Create a new workflow run (pinned to the definition version) | `idempotencyKey`, `workflowId`, `input`, `config?`, `priority?`, `annotations?` |
+| `run.claimPending` | Claim pending runs this build serves and enqueue first-stage jobs | `workerId`, `maxClaims?`, `serves?` |
 | `run.transition` | Advance to next stage group | `workflowRunId` |
-| `run.cancel` | Cancel a running workflow (cascades to stages + jobs) | `workflowRunId`, `reason?` |
-| `run.rerunFrom` | Rerun from a specific stage (cleans up artifacts) | `workflowRunId`, `fromStageId` |
-| `job.execute` | Execute a single stage (multi-phase transactions) | `idempotencyKey?`, `workflowRunId`, `workflowId`, `stageId`, `config` |
-| `stage.pollSuspended` | Poll suspended stages (per-stage transactions) | `maxChecks?` (returns `resumedWorkflowRunIds`) |
-| `lease.reapStale` | Release stale job leases | `staleThresholdMs` |
-| `run.reapStuck` | Fail runs stuck RUNNING with no activity | `stuckThresholdMs?` |
-| `outbox.flush` | Publish pending events | `maxEvents?` |
+| `run.cancel` | Cancel a running workflow (cascades to stages + jobs, aborts the running body) | `workflowRunId`, `reason?` |
+| `run.redrive` | Retry from the last failure, restart, or resume at a stage; archives the superseded attempt | `workflowRunId`, `from?`, `definitionVersion?` |
+| `run.rerunFrom` | **Deprecated** — use `run.redrive` | `workflowRunId`, `fromStageId` |
+| `run.purge` | Delete terminal runs older than a cutoff with everything under them | `olderThan`, `statuses?`, `limit?` |
+| `run.listVersions` | Per-version run counts: which versions have drained, which nobody here serves | `workflowId?`, `definitionVersion?` |
+| `job.execute` | Execute a single stage (multi-phase transactions) | `idempotencyKey?`, `workflowRunId`, `workflowId`, `stageId`, `config`, `attempt?`, `maxAttempts?`, `abortSignal?` |
+| `job.heartbeat` | Renew a job lease and report whether the work is still wanted (feeds `abortSignal`) | `jobId`, `workflowRunId`, `attempt?` |
+| `stage.pollSuspended` | Poll suspended stages (per-stage transactions) | `maxChecks?`, `serves?` (returns `resumedWorkflowRunIds`) |
+| `step.signal` | Complete a `waitForSignal` step and wake its stage; idempotent | `workflowRunId`, `stageId`, `stepId`, `payload` |
+| `lease.reapStale` | Release stale job leases; expire jobs past the absolute cap | `staleThresholdMs`, `absoluteTimeoutMs?` |
+| `run.reapStuck` | Fail runs stuck RUNNING with no activity; re-enqueue PENDING stages with no job | `stuckThresholdMs` |
+| `outbox.flush` | Publish pending events; reports `eventSinkStatus` | `maxEvents?` |
 | `plugin.replayDLQ` | Replay dead-letter queue events | `maxEvents?` |
 
 Idempotency behavior:
@@ -909,16 +1158,19 @@ Idempotency behavior:
 - If the same key is already executing, dispatch throws `IdempotencyInProgressError`.
 
 Transaction behavior:
-- Most commands execute inside a single database transaction (handler + outbox events).
-- `job.execute` uses multi-phase transactions: Phase 1 commits `RUNNING` status immediately, Phase 2 runs `stageDef.execute()` outside any transaction, Phase 3 commits the final status. This avoids holding a database connection during long-running stage execution.
-- `stage.pollSuspended` uses per-stage transactions: `checkCompletion()` runs outside any transaction (external HTTP calls to batch providers), then DB updates + outbox events are committed in a short transaction per stage. This prevents P2028 timeout errors when batch APIs are slow.
+- Most commands execute inside a single database transaction (handler + outbox events). Enqueues happen post-commit, so a job never names a run that is not yet visible.
+- `job.execute` uses multi-phase transactions: Phase 1 commits `RUNNING` status immediately, Phase 2 runs `stageDef.execute()` outside any transaction, Phase 3 commits the final status. This avoids holding a database connection during long-running stage execution. A failure with job attempts left leaves the stage `PENDING` with the error and returns `willRetry: true`; the stage becomes `FAILED` only when the transport's `maxAttempts` is exhausted.
+- `stage.pollSuspended` claims each stage (a version-guarded `nextPollAt` lease) before replaying it, so two orchestrators never replay the same stage; the replay runs outside any transaction and the outcome commits in a short per-stage transaction.
 
 Cancellation semantics:
 - `run.cancel` is **authoritative**: it marks the run as `CANCELLED`, cascades to all non-terminal stages (setting them to `CANCELLED` and clearing `nextPollAt`), and cancels all queued/suspended jobs via `jobTransport.cancelByRun()`.
+- The running body sees it: the host's job heartbeat (`job.heartbeat`) aborts `ctx.abortSignal` with a `StageAbortedError` (`reason: "cancelled"`, or `"lease-lost"` when another worker took the job). `waitFor` checks the signal before it polls; a `run` body that finishes after a cancel is recorded as failed with the cancellation as its error.
 - `stage.pollSuspended` skips stages whose run has been cancelled.
-- `job.execute` re-checks run status after stage execution. If the run was cancelled during execution, the result is discarded and a `ghost: true` flag is returned. Hosts use this flag to prevent retries.
+- `job.execute` re-checks run status after stage execution. If the run was cancelled during execution, the result is discarded and `ghost: true` is returned with `ghostReason: "orphan"`; `"race"` (the run was still `PENDING`) and `"version"` (this build does not serve the run) are re-delivered by the hosts rather than dropped.
 
 ### Node Host Config
+
+The full table is in the [host-node README](../workflow-engine-host-node/README.md). The options a reader most often needs:
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
@@ -927,48 +1179,74 @@ Cancellation semantics:
 | `workerId` | `string` | required | Unique worker ID |
 | `orchestrationIntervalMs` | `number` | 10000 | Orchestration poll interval |
 | `jobPollIntervalMs` | `number` | 1000 | Job dequeue interval |
-| `staleLeaseThresholdMs` | `number` | 60000 | Stale lease timeout |
+| `staleLeaseThresholdMs` | `number` | 300000 | Heartbeat lease threshold: a job whose lease is older is re-queued |
+| `jobAbsoluteTimeoutMs` | `number` | 3600000 | Absolute cap on one job claim; `0` disables |
+| `serves` | `ServedDefinition[] \| "all"` | from registry | Which definition versions this host claims and polls |
+| `retention` | `RetentionOptions` | off | `run.purge` on every tick |
 
 ### Serverless Host
 
 | Method | Description |
 |--------|-------------|
-| `handleJob(msg)` | Execute a single pre-dequeued job. Returns `{ outcome, error? }` |
+| `handleJob(msg)` | Execute a single pre-dequeued job. Returns `{ outcome, error?, willRetry?, attempt?, maxAttempts?, retryDelayMs?, dead? }` |
 | `processAvailableJobs(opts?)` | Dequeue and process jobs. Returns `{ processed, succeeded, failed }` |
-| `runMaintenanceTick()` | Claim, poll, reap, flush in one call. Returns structured result |
+| `runMaintenanceTick()` | Claim, poll, reap, flush, purge in one call. Returns structured result |
+| `runToCompletion(options)` | Standalone export: create a run and drive it to a terminal state inside the calling request, bounded by `maxJobs` / `maxClaimRounds` |
 
 ### Core Exports
 
 ```typescript
 // Stage definition
-import { defineStage, defineAsyncBatchStage } from "@bratsos/workflow-engine";
+import { defineStage } from "@bratsos/workflow-engine";
 
 // Workflow building
 import { defineWorkflow, WorkflowBuilder, Workflow } from "@bratsos/workflow-engine";
+import type { InferWorkflowInput, InferWorkflowOutput, InferWorkflowContext } from "@bratsos/workflow-engine";
+
+// Durable steps
+import type { StepApi, StepRunOptions, StepRunContext, StepWaitOptions, StepSignalOptions } from "@bratsos/workflow-engine";
+import {
+  StepTimeoutError, StepLeaseLostError, StepNotReplaySafeError, DuplicateStepKeyError,
+  StageAbortedError, stageAbortReason, isStepControlFlowError, deriveStepExternalKey,
+} from "@bratsos/workflow-engine";
+import { AiMapBatchFailedError, AiMapBudgetExceededError, BatchNotAdoptableError } from "@bratsos/workflow-engine";
 
 // Kernel
-import { createKernel, type Kernel, type KernelConfig } from "@bratsos/workflow-engine/kernel";
+import { createKernel, createWorkflowRegistry, type Kernel, type KernelConfig } from "@bratsos/workflow-engine/kernel";
+import { createStepApi } from "@bratsos/workflow-engine/kernel"; // ledger-less step API for hand-built contexts
 
 // Kernel types
 import type { KernelCommand, CommandResult, KernelEvent } from "@bratsos/workflow-engine/kernel";
 
 // Port interfaces
-import type { Persistence, BlobStore, JobTransport, EventSink, Scheduler, Clock } from "@bratsos/workflow-engine/kernel";
+import type { Persistence, BlobStore, JobTransport, EventSink, Clock, StepLedger, KernelServices } from "@bratsos/workflow-engine/kernel";
+
+// Host helpers (what the host packages are built from)
+import { runMaintenanceTick, executeJobWithHeartbeat, HOST_DEFAULTS, createSpillingJobTransport } from "@bratsos/workflow-engine/kernel";
 
 // Plugins
 import { definePlugin, createPluginRunner } from "@bratsos/workflow-engine/kernel";
 
 // Persistence (Prisma)
-import { createPrismaWorkflowPersistence, createPrismaJobQueue, createPrismaAICallLogger } from "@bratsos/workflow-engine";
+import {
+  createPrismaWorkflowPersistence, createPrismaJobQueue, createPrismaStepLedger,
+  createPrismaBlobStore, createPrismaAICallLogger,
+} from "@bratsos/workflow-engine";
 
-// AI Helper
-import { createAIHelper, type AIHelper } from "@bratsos/workflow-engine";
+// AI Helper and models
+import { createAIHelper, registerModels, getModel, type AIHelper, type AIAdapter } from "@bratsos/workflow-engine";
+import { UnportableSchemaError, AICallTimeoutError } from "@bratsos/workflow-engine";
 
 // Stage ID utilities
 import { createStageIds, defineStageIds, isValidStageId, assertValidStageId } from "@bratsos/workflow-engine";
 
 // Testing
-import { InMemoryWorkflowPersistence, InMemoryJobQueue } from "@bratsos/workflow-engine/testing";
+import {
+  createTestHarness, createTestKernel, createMockAIHelperFactory, createMockStepLedger,
+  InMemoryWorkflowPersistence, InMemoryJobQueue, InMemoryStepLedger, InMemoryAICallLogger,
+  persistenceConformanceSuite, jobQueueConformanceSuite, stepLedgerConformanceSuite, aiCallLoggerConformanceSuite,
+  shadowRuns, shadowVersions, assertShadowCompatible,
+} from "@bratsos/workflow-engine/testing";
 import { FakeClock, InMemoryBlobStore, CollectingEventSink } from "@bratsos/workflow-engine/kernel/testing";
 ```
 
@@ -981,16 +1259,15 @@ import { FakeClock, InMemoryBlobStore, CollectingEventSink } from "@bratsos/work
 Ensure the workflow is registered in the `registry` passed to `createKernel`:
 
 ```typescript
+import { createKernel, createWorkflowRegistry } from "@bratsos/workflow-engine/kernel";
+
 const kernel = createKernel({
   // ...
-  registry: {
-    getWorkflow(id) {
-      const workflows = { "my-workflow": myWorkflow };
-      return workflows[id];
-    },
-  },
+  registry: createWorkflowRegistry([myWorkflow]),
 });
 ```
+
+With `createWorkflowRegistry`, a pending run whose workflow this build does not have is left `PENDING` for a host that has it (and reported by `run.listVersions`) rather than failed.
 
 ### "Stage X depends on Y which was not found"
 
@@ -1003,19 +1280,27 @@ Verify all dependencies are included in the workflow:
 
 ### Jobs stuck in "RUNNING"
 
-A worker likely crashed. The stale lease recovery (`lease.reapStale` command) automatically releases jobs. In Node host, this runs on each orchestration tick. For serverless, call `runMaintenanceTick()` from a cron trigger.
+A worker likely crashed. The stale lease recovery (`lease.reapStale` command) re-queues a job whose heartbeat stopped (`staleLeaseThresholdMs`, `lastError` prefixed `LEASE_HEARTBEAT_LOST`) and fails one that ran past the absolute cap (`jobAbsoluteTimeoutMs`, `LEASE_ABSOLUTE_CAP`). In Node host, this runs on each orchestration tick. For serverless, call `runMaintenanceTick()` from a cron trigger.
+
+### Crash resumption waits minutes
+
+A `ctx.step.run` left `running` by a killed process is held by its step lease until it expires (default five minutes): the ledger row carries no worker identity, so the lease is the only liveness signal, and releasing it early would execute the body twice. `StepRunOptions.lease` is the knob; size it to the body's expected duration, and use `heartbeat` for a long body rather than a long lease.
+
+### `PrismaClient is not assignable to EnginePrismaClient`
+
+One of the delegates the adapter needs is missing from your generated client — after 1.0, almost always `workflowStep` (and `workflowDefinition`). Add the models from the schema above and re-run `prisma generate`.
 
 ---
 
 ## Upgrading
 
-Migration guides ship inside the package at `node_modules/@bratsos/workflow-engine/skills/workflow-engine/migrations/` (one per minor, `migrate-X.Y-to-A.B.md`) and on the docs site. A codemod applies the mechanical renames and lists every manual item with a file and line:
+Migration guides ship inside the package at `node_modules/@bratsos/workflow-engine/skills/workflow-engine/migrations/` (one per release, `migrate-X.Y-to-A.B.md`) and on the docs site. A codemod applies the mechanical renames and lists every manual item with a file and line:
 
 ```bash
-npx workflow-engine-codemod --from 0.11          # or --from 0.12; add --dry-run to preview
+npx workflow-engine-codemod --from 0.13          # or --from 0.11 / 0.12; add --dry-run to preview
 ```
 
-The 0.12 → 0.13 guide opens with a short "does this affect you?" triage — if you never call `ai.batch()`, only two of its required actions apply.
+The 0.13 → 1.0 guide (`migrate-0.13-to-1.0.md`) has the column-level database checklist with SQL, the API removals with replacements, the `defineAsyncBatchStage` → `ctx.step.ai.map` migration, `createKernel({ services, stepLedger })`, the AI SDK peer ranges and the behaviour changes. The codemod flags `defineAsyncBatchStage`, `checkCompletion`, `requireStageOutput`, `experimental_output` and the removed model helpers with the guide pointer.
 
 ## License
 
