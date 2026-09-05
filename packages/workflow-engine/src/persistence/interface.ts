@@ -119,11 +119,15 @@ export interface WorkflowStageRecord {
   stageNumber: number;
   executionGroup: number;
   /**
-   * Rerun generation. 0 for the original execution; incremented each
-   * time `run.rerunFrom` recreates this stage. Annotations written by
-   * `ctx.annotate(...)` during this stage inherit this value so a
-   * future agent can distinguish decisions made on different attempts
-   * of the same logical stage.
+   * Attempt generation of this stage record. 0 for the original execution;
+   * incremented each time the record is executed again: a job retry of a
+   * thrown stage, or a `run.redrive` that reopens the stage in place
+   * (`lastFailure` / `stage`). A redrive from `start`, or of a stage after
+   * the resumed one, deletes the record and the replacement starts at 0
+   * again, with the old attempt archived as a `run.supersededAttempt`
+   * annotation. Annotations written by `ctx.annotate(...)` during this
+   * stage inherit this value so a future agent can distinguish decisions
+   * made on different attempts of the same logical stage.
    */
   attempt: number;
   status: Status;

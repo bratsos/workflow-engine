@@ -1,12 +1,13 @@
-// Test-only Prisma schema fixture.
+// Reference Prisma schema for the engine's tables.
 //
-// This schema exists solely to generate a real `@prisma/client` for the
-// Postgres conformance suite (see
+// Shipped in the package ("prisma/" is in the "files" field) so a consumer
+// can copy the models into their own schema or diff theirs against it. It
+// also generates the real `@prisma/client` used by the Postgres conformance
+// suite (see
 // ../src/__tests__/12-persistence-adapters/prisma-postgres-conformance.test.ts).
-// It is NOT published -- "prisma/" is intentionally excluded from the
-// "files" field in package.json.
 //
-// Keep this in sync with the schema documented in ../README.md.
+// The migration guides under ../skills/workflow-engine/migrations/ derive
+// their SQL from this file; keep them in step when a model changes.
 
 generator client {
   provider = "prisma-client-js"

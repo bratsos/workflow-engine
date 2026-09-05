@@ -1,25 +1,30 @@
 /**
  * Persistence Conformance Suite
  *
- * Shared vitest suites that verify any implementation of
- * `WorkflowPersistence`, `AICallLogger`, or `JobQueue` follows the
- * contract documented on those interfaces. Used internally to pin the
- * in-memory implementations (see
+ * Shared test suites that verify any implementation of
+ * `WorkflowPersistence`, `AICallLogger`, `JobQueue` or `StepLedger` follows
+ * the contract documented on those interfaces. Used internally to pin the
+ * in-memory and Prisma implementations (see
  * `src/__tests__/12-persistence-adapters/adapter-conformance.test.ts`),
- * and exported here so third-party adapters (custom `WorkflowPersistence`
- * / `JobQueue` implementations) can run the exact same spec against their
- * own implementation:
+ * and exported so third-party adapters can run the exact same spec against
+ * their own implementation:
  *
  * @example
  * ```typescript
- * import { persistenceConformanceSuite } from '@bratsos/workflow-engine/testing';
+ * import { describe, it, expect, beforeEach } from "vitest";
+ * import { persistenceConformanceSuite } from "@bratsos/workflow-engine/testing";
  *
- * persistenceConformanceSuite('MyCustomPersistence', () => new MyCustomPersistence());
+ * persistenceConformanceSuite(
+ *   "MyCustomPersistence",
+ *   () => new MyCustomPersistence(),
+ *   { describe, it, expect, beforeEach },
+ * );
  * ```
  *
- * Each suite factory registers vitest `describe`/`it` blocks as a side
- * effect when called, so it must be invoked from within a vitest test
- * file (directly, or transitively via an import at module scope).
+ * This module imports nothing from vitest: each suite factory takes the
+ * test primitives as its last argument (`ConformanceTestApi`) and registers
+ * `describe`/`it` blocks through them when called, so it must be invoked
+ * from a test file of whichever runner supplies those primitives.
  */
 
 import type { StepLedger, StepRecord } from "../kernel/ports.js";
