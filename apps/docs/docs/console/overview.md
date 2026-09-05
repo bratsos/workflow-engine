@@ -67,9 +67,53 @@ answer only "may this principal do this?".
 
 Writes are off by default. `actions: true` needs a `kernel`, and every
 write dispatches a kernel command (`run.cancel`, `run.redrive`,
-`plugin.replayDLQ`) rather than SQL, so the console gets the kernel's
-leases, idempotency and outbox events and there is still exactly one
-writer against run state.
+`step.signal`, `plugin.replayDLQ`) rather than SQL, so the console gets the
+kernel's leases, idempotency and outbox events and there is still exactly
+one writer against run state. `authorize` is asked per action — the
+vocabulary is `runs.read`, `run.read`, `queue.read`, `suspended.read`,
+`deadLetters.read`, `workers.read`, `costs.read`, `run.cancel`, `run.rerun`,
+`step.signal` and `deadLetters.replay` — and `onAction` is told afterwards,
+which is your audit trail. A custom `ConsoleKernel` must accept `run.redrive`
+and `step.signal`.
+
+## What the run detail shows
+
+The run detail is the stage timeline plus, per stage, its **step ledger**:
+every durable step with its `kind` (`run`, `wait`, `signal`, `sleep`),
+`status`, `attempt`, lease and deadline (`leaseExpiresAt`, `deadlineAt`),
+its error, and — on `run` steps — the `externalKey` the body was given, so
+an operator can search a provider for an orphaned batch or charge without
+the process that made it. Below that: the run's annotations (including the
+engine-written `run.supersededAttempt` and `step.outcome-conflict`), logs
+and the outbox event timeline.
+
+## Delivering a signal
+
+A stage suspended on `ctx.step.waitForSignal` — the human-approval case —
+is finished from the run detail: a step with `kind === "signal"` and
+`status === "pending"` offers *Deliver signal* with a validated JSON payload
+box. It dispatches `step.signal` through the kernel:
+
+```
+POST /api/runs/:runId/stages/:stageId/steps/:stepId/signal
+{ "payload": { "approved": true } }   // optional; defaults to null
+```
+
+It is gated by `authorize` like every write (the context carries `stageId`
+and `stepId` alongside `runId`), and the kernel's refusals become statuses:
+an unknown run or stage is a 404, a step that is not a pending signal is a
+409, both with the kernel's message.
+
+## Redriving a run
+
+*Rerun* dispatches `run.redrive`, not the deprecated `run.rerunFrom`, so a
+`CANCELLED` run can be redriven and the superseded attempt is archived
+rather than deleted. The request takes `from: { kind: "lastFailure" |
+"start" | "stage" }` (`fromStageId` still means "from this stage"), and
+`definitionVersion: "latest"` or a registered version; a malformed `from` is
+a 400 rather than a silent fall back to one mode. The UI offers *Redrive on
+latest version* on any run carrying a pinned version. The action name is
+still `run.rerun`, so an existing `authorize` keeps matching.
 
 ## Without a web application
 
