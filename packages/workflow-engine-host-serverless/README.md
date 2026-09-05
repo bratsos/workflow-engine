@@ -42,10 +42,14 @@ Creates a new serverless host instance.
 | `kernel` | `Kernel` | required | Kernel instance to dispatch commands to |
 | `jobTransport` | `JobTransport` | required | Job transport for complete/suspend/fail lifecycle |
 | `workerId` | `string` | required | Unique worker identifier (e.g. function name) |
-| `staleLeaseThresholdMs` | `number` | `60_000` | Time before a job lease is considered stale |
+| `staleLeaseThresholdMs` | `number` | `300_000` | Heartbeat tier: a job whose lease is older is re-queued (`LEASE_HEARTBEAT_LOST`) |
+| `jobAbsoluteTimeoutMs` | `number` | `3_600_000` | Absolute tier: a job claimed longer ago than this is failed terminally (`LEASE_ABSOLUTE_CAP`); `0` disables |
+| `jobHeartbeatIntervalMs` | `number` | `60_000` | How often `handleJob` dispatches `job.heartbeat` while the stage runs; it renews the lease and aborts `ctx.abortSignal` on cancel or lease loss |
 | `maxClaimsPerTick` | `number` | `10` | Max pending runs to claim per maintenance tick |
+| `serves` | `ServedDefinition[] \| "all"` | derived from registry | Which definition versions this host claims, dequeues and polls; `"all"` restores the pre-1.0 predicate |
 | `maxSuspendedChecksPerTick` | `number` | `10` | Max suspended stages to poll per tick |
 | `maxOutboxFlushPerTick` | `number` | `100` | Max outbox events to flush per tick |
+| `retention` | `RetentionOptions` | off | `{ olderThanMs, statuses?, limit? }`: delete terminal runs through `run.purge` at the end of every tick |
 | `flushOutboxAfterJob` | `boolean` | `true` | Publish the job's outbox events right after `handleJob` settles it |
 | `outboxFlushTimeoutMs` | `number` | `5_000` | Bound on that post-job flush; errors are logged, not thrown |
 
@@ -68,9 +72,12 @@ interface JobMessage {
   workflowId: string;
   stageId: string;
   attempt: number;
+  maxAttempts?: number; // retry budget; defaults to 3
   payload: Record<string, unknown>;
 }
 ```
+
+A message delivered through your own push queue may carry a spilled payload if you wrapped the transport with `createSpillingJobTransport`; resolve it first with `createPayloadSpill({ blobStore }).unpack(msg.payload)` (both from `@bratsos/workflow-engine/kernel`).
 
 ### `JobResult`
 
@@ -106,12 +113,47 @@ interface ProcessJobsResult {
 
 ```typescript
 interface MaintenanceTickResult {
-  claimed: number;          // Pending runs claimed
-  suspendedChecked: number; // Suspended stages polled
-  staleReleased: number;    // Stale leases released
-  eventsFlushed: number;    // Outbox events published
+  claimed: number;            // Pending runs claimed
+  suspendedChecked: number;   // Suspended stages polled
+  staleReleased: number;      // Stale leases re-queued (heartbeat tier)
+  eventsFlushed: number;      // Outbox events published
+  stuckReaped: number;        // RUNNING runs failed for inactivity
+  purged: number;             // Terminal runs deleted; 0 unless `retention` is set
+  eventsFailed: number;       // Events the next flush will retry
+  eventsDeadLettered: number; // Events that exhausted their retries (disjoint from eventsFailed)
+  eventSinkStatus: "healthy" | "degraded";
+  eventSinkError?: string;    // First publish failure of this tick, when degraded
 }
 ```
+
+There is no process to carry event-sink state across invocations, so a serverless caller reads `eventSinkStatus` per tick and alerts on a run of `"degraded"` results; runs keep progressing either way.
+
+### `runToCompletion(options)`
+
+A supported synchronous drain loop for callers who need the run's result inside the request that created it:
+
+```typescript
+import { runToCompletion } from "@bratsos/workflow-engine-host-serverless";
+
+const result = await runToCompletion({
+  kernel,
+  jobTransport,
+  persistence,       // { getRun } — the WorkflowPersistence you gave the kernel works
+  command: {
+    type: "run.create",
+    idempotencyKey: crypto.randomUUID(),
+    workflowId: "document-processor",
+    input: { url: "https://example.com" },
+  },
+  maxJobs: 50,       // default
+  maxClaimRounds: 5, // default
+});
+
+// { workflowRunId, status, outcome, output?, reason?, jobsProcessed, foreignJobsProcessed, suspendedStageId? }
+if (result.outcome === "completed") return Response.json(result.output);
+```
+
+Its three limits: it shares the queue, so it may execute another caller's job (`foreignJobsProcessed` says how many; give it its own `jobTransport` when that is unacceptable); it cannot finish a workflow that suspends, and returns `outcome: "suspended"` naming the stage instead of spinning; and it is bounded by `maxJobs` and `maxClaimRounds`, returning `outcome: "incomplete"` with a `reason` rather than looping or throwing. It does not poll suspended stages or reap leases — that is `runMaintenanceTick()`.
 
 ## Platform Integration Examples
 
@@ -195,7 +237,9 @@ Unlike the Node host, the serverless host has **no loops, timers, or signal hand
 
 - **`processAvailableJobs(opts?)`** -- Dequeues up to `maxJobs` (default: 1) from the job transport and processes each via `handleJob`. Safe for edge runtimes with CPU limits.
 
-- **`runMaintenanceTick()`** -- Runs one bounded pass of all orchestration duties: `run.claimPending`, `stage.pollSuspended`, `lease.reapStale`, `outbox.flush`.
+- **`runMaintenanceTick()`** -- Runs one bounded pass of all orchestration duties: `run.claimPending` (filtered by `serves`), `stage.pollSuspended`, `lease.reapStale` (both tiers), `outbox.flush`, `run.reapStuck`, and `run.purge` when `retention` is set. A run pinned to a definition version this build does not serve is left untouched for a host that does.
+
+- **Cancellation** -- `handleJob` dispatches `job.heartbeat` every `jobHeartbeatIntervalMs` while the stage runs; when the run is cancelled or the job lease is lost, the stage's `ctx.abortSignal` aborts with a `StageAbortedError` (`reason: "cancelled" | "lease-lost"`). Acknowledgements are fenced on `{ startedAt, attempt }`, so an invocation that outlived its lease writes nothing and reports `superseded`.
 
 Consumers wire platform-specific glue (queue ack/retry, `waitUntil`, cron triggers) around these methods.
 
