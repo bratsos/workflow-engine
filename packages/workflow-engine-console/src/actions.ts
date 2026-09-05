@@ -22,6 +22,7 @@ export const CONSOLE_ACTIONS = [
   "costs.read",
   "run.cancel",
   "run.rerun",
+  "step.signal",
   "deadLetters.replay",
 ] as const;
 
@@ -31,6 +32,7 @@ export type ConsoleAction = (typeof CONSOLE_ACTIONS)[number];
 export const WRITE_ACTIONS: readonly ConsoleAction[] = [
   "run.cancel",
   "run.rerun",
+  "step.signal",
   "deadLetters.replay",
 ] as const;
 
@@ -58,11 +60,16 @@ export interface ConsoleAuthorizeContext {
   request: Request;
   /** Present for the actions scoped to one run. */
   runId?: string;
+  /** Present for the actions scoped to one durable step (`step.signal`). */
+  stageId?: string;
+  stepId?: string;
 }
 
 export interface ConsoleActionEvent {
   action: ConsoleAction;
   runId?: string;
+  stageId?: string;
+  stepId?: string;
   request: Request;
   result: unknown;
   at: Date;

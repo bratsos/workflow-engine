@@ -118,6 +118,7 @@ describe("read-only by default", () => {
     for (const request of [
       post("/console/api/runs/run-1/cancel"),
       post("/console/api/runs/run-1/rerun", { fromStageId: "s1" }),
+      post("/console/api/runs/run-1/stages/approve/steps/wait/signal"),
       post("/console/api/dead-letters/replay"),
     ]) {
       const response = await handler(request);
@@ -254,6 +255,169 @@ describe("actions dispatch kernel commands, never SQL", () => {
     );
     expect(dispatch).not.toHaveBeenCalled();
     expect(events).toHaveLength(0);
+  });
+});
+
+describe("delivering a durable-step signal", () => {
+  const SIGNAL_PATH =
+    "/console/api/runs/run-1/stages/approve/steps/wait/signal";
+
+  function withKernel(
+    options: {
+      authorize?: WorkflowConsoleOptions["authorize"];
+      dispatch?: (command: { type: string }) => Promise<unknown>;
+    } = {},
+  ) {
+    const dispatch = vi.fn(
+      options.dispatch ??
+        (async () => ({ signalled: true, ok: true, alreadyCompleted: false })),
+    );
+    const events: ConsoleActionEvent[] = [];
+    const handler = createWorkflowConsole({
+      reader: fixtureReader(),
+      kernel: { dispatch },
+      actions: true,
+      authorize: options.authorize ?? (() => true),
+      onAction: (event) => {
+        events.push(event);
+      },
+    });
+    return { handler, dispatch, events };
+  }
+
+  it("dispatches step.signal with the payload and returns the kernel result", async () => {
+    const { handler, dispatch } = withKernel();
+    const response = await handler(
+      post(SIGNAL_PATH, { payload: { approved: true, by: "ops" } }),
+    );
+    expect(response.status).toBe(200);
+    expect((await body(response)).result).toEqual({
+      signalled: true,
+      ok: true,
+      alreadyCompleted: false,
+    });
+    expect(dispatch).toHaveBeenCalledWith({
+      type: "step.signal",
+      workflowRunId: "run-1",
+      stageId: "approve",
+      stepId: "wait",
+      payload: { approved: true, by: "ops" },
+    });
+  });
+
+  it("defaults the payload to null when none is sent", async () => {
+    const { handler, dispatch } = withKernel();
+    await handler(post(SIGNAL_PATH));
+    await handler(post(SIGNAL_PATH, {}));
+    expect(dispatch).toHaveBeenCalledTimes(2);
+    for (const call of dispatch.mock.calls) {
+      expect(call[0]).toMatchObject({ type: "step.signal", payload: null });
+    }
+  });
+
+  it("decodes the run, stage and step ids from the path", async () => {
+    const { handler, dispatch } = withKernel();
+    await handler(
+      post(
+        "/console/api/runs/run%2F1/stages/approve%20it/steps/wait%3Aok/signal",
+      ),
+    );
+    expect(dispatch).toHaveBeenCalledWith(
+      expect.objectContaining({
+        workflowRunId: "run/1",
+        stageId: "approve it",
+        stepId: "wait:ok",
+      }),
+    );
+  });
+
+  it("is gated on its own action verb, scoped to the run, stage and step", async () => {
+    const seen: Array<{
+      action: ConsoleAction;
+      runId?: string;
+      stageId?: string;
+      stepId?: string;
+    }> = [];
+    const { handler, dispatch } = withKernel({
+      authorize: ({ action, runId, stageId, stepId }) => {
+        seen.push({ action, runId, stageId, stepId });
+        return action === "run.cancel";
+      },
+    });
+    expect((await handler(post(SIGNAL_PATH))).status).toBe(403);
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(seen).toEqual([
+      {
+        action: "step.signal",
+        runId: "run-1",
+        stageId: "approve",
+        stepId: "wait",
+      },
+    ]);
+  });
+
+  it("rejects a body that is not JSON before reaching the kernel", async () => {
+    const { handler, dispatch } = withKernel();
+    const response = await handler(
+      new Request(`https://app.example.com${SIGNAL_PATH}`, {
+        method: "POST",
+        body: "{not json",
+      }),
+    );
+    expect(response.status).toBe(400);
+    expect((await body(response)).error.code).toBe("bad_request");
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+
+  it("answers 404 when the kernel cannot find the run or stage", async () => {
+    const { handler, events } = withKernel({
+      dispatch: async () => {
+        throw new Error("Workflow stage run-1/approve not found");
+      },
+    });
+    const response = await handler(post(SIGNAL_PATH));
+    expect(response.status).toBe(404);
+    expect((await body(response)).error).toEqual({
+      code: "not_found",
+      message: "Workflow stage run-1/approve not found",
+    });
+    expect(events).toHaveLength(0);
+  });
+
+  it.each([
+    'Durable step "wait" was previously used as run and cannot receive a signal',
+    'Durable signal step "wait" has failed and cannot receive a signal',
+  ])("answers 409 when the ledger refuses the signal: %s", async (message) => {
+    const { handler } = withKernel({
+      dispatch: async () => {
+        throw new Error(message);
+      },
+    });
+    const response = await handler(post(SIGNAL_PATH));
+    expect(response.status).toBe(409);
+    expect((await body(response)).error).toEqual({ code: "conflict", message });
+  });
+
+  it("leaves any other kernel failure as a 500", async () => {
+    const { handler } = withKernel({
+      dispatch: async () => {
+        throw new Error("step.signal requires a configured StepLedger");
+      },
+    });
+    expect((await handler(post(SIGNAL_PATH))).status).toBe(500);
+  });
+
+  it("reports the delivered signal to onAction with its step scope", async () => {
+    const { handler, events } = withKernel();
+    await handler(post(SIGNAL_PATH, { payload: 42 }));
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      action: "step.signal",
+      runId: "run-1",
+      stageId: "approve",
+      stepId: "wait",
+      result: { signalled: true, ok: true, alreadyCompleted: false },
+    });
   });
 });
 
