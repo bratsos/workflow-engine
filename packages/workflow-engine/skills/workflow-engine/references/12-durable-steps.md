@@ -13,6 +13,7 @@ import {
   createPrismaJobQueue,
   createPrismaStepLedger,
   createPrismaWorkflowPersistence,
+  createWorkflowRegistry,
 } from "@bratsos/workflow-engine";
 
 const persistence = createPrismaWorkflowPersistence(prisma);
@@ -23,7 +24,7 @@ const kernel = createKernel({
   blobStore,                       // your BlobStore implementation
   eventSink: { emit: async (event) => { await bus.publish(event); } },
   clock: { now: () => new Date() },
-  registry: { getWorkflow: (id) => workflows.get(id) },
+  registry: createWorkflowRegistry(workflows), // enumerable, so claiming is version-filtered (13-definition-versioning.md)
   stepLedger: createPrismaStepLedger(prisma),
   services: { aiLogger: createPrismaAICallLogger(prisma) },
 });
@@ -66,6 +67,7 @@ The Prisma ledger uses the `WorkflowStep` model from the package's `prisma/schem
 ```typescript
 interface StepApi {
   run<T>(id: string, fn: (step: StepRunContext) => Promise<T>, options?: StepRunOptions): Promise<T>;
+  waitFor<T, U extends T>(id: string, opts: StepWaitOptionsNarrowing<T, U>): Promise<U>; // `ready` is a type guard
   waitFor<T>(id: string, opts: StepWaitOptions<T>): Promise<T>;
   waitForSignal<T = unknown>(id: string, opts: StepSignalOptions): Promise<T>;
   sleep(id: string, duration: number | string): Promise<void>;
@@ -83,8 +85,8 @@ interface StepRunOptions {
     maxDelay?: number | string; //   cap on the computed delay
     jitter?: boolean;           //   wait a random fraction of it (full jitter)
   };
-  leaseMs?: number;             // deprecated alias of `lease`
-  retryDelayMs?: number | string; // deprecated alias of `retryDelay`
+  leaseMs?: number;             // deprecated alias of `lease`; ignored when `lease` is given
+  retryDelayMs?: number | string; // deprecated alias of `retryDelay`; ignored when `retryDelay` is given
   onReclaim?: "rerun" | "fail";   // taking over an expired lease; default "rerun"
   heartbeat?: number | string | false; // auto-extend the lease on this interval; default false
 }
@@ -109,6 +111,11 @@ interface StepWaitOptions<T> {
   every: number | string;    // "30s", "5m", or milliseconds
   timeout: number | string;  // non-sliding deadline from the first wait
   pollBackoffMs?: number;    // backoff after poll() throws; default = every
+}
+
+/** `waitFor` options whose `ready` is a type guard: the result narrows to `U`. */
+interface StepWaitOptionsNarrowing<T, U extends T> extends Omit<StepWaitOptions<T>, "ready"> {
+  ready: (value: T) => value is U;
 }
 ```
 
@@ -138,7 +145,7 @@ const submit = defineStage({
 });
 ```
 
-`run` executes `fn` once and stores its result. `waitFor` calls `poll` and, when `ready` is false, suspends the stage; the kernel polls again after `every`. `waitForSignal` suspends until `kernel.execute({ type: "step.signal", workflowRunId, stageId, stepId, payload })` completes the step. `sleep` suspends for the duration.
+`run` executes `fn` once and stores its result. `waitFor` calls `poll` and, when `ready` is false, suspends the stage; the kernel polls again after `every`. `waitForSignal` suspends until `kernel.dispatch({ type: "step.signal", workflowRunId, stageId, stepId, payload })` completes the step; the command returns `{ signalled: true, ok: true, alreadyCompleted }` and is idempotent (the console's *Deliver signal* action dispatches the same command, see 16-operational-console.md). `sleep` suspends for the duration.
 
 A signal wait re-suspends every `keepalive` (default **five minutes**, never later than `timeout`) while nothing has arrived. That interval does not set signal latency: `step.signal` moves the stage's `nextPollAt` to now, so the stage wakes on the host's next orchestration tick whatever the keepalive is. What the keepalive bounds is how long a *lost* nudge — a host that was down when the signal landed — can delay the wake; and each keepalive costs one replay of the stage body up to the wait, so a shorter value buys nothing for a stage whose host is healthy. Raise it for a wait measured in days (`keepalive: "1h"`); lower it only when the host that would receive the nudge is unreliable.
 
@@ -154,7 +161,7 @@ Suspension is a thrown control-flow error (`StepSuspend`, or `StepInFlight` when
 - `waitFor`'s `ready` may be a type guard (`(v): v is Done => ...`); the awaited value then narrows to the guarded type. The boolean form is unchanged.
 - `waitFor`'s `timeout` is computed once, when the wait is first recorded, and stored on the step. Every replay compares against that stored deadline, so it never slides. Past the deadline the step is marked failed and the stage fails with `StepTimeoutError`.
 - A `poll` that throws does not fail the stage: the stage suspends for `pollBackoffMs`. The first three consecutive failures are logged at DEBUG — a batch provider is eventually consistent right after a submit (OpenRouter answers 404 to the first status check) — and the streak escalates to WARN from the fourth on; the count lives on the row (`waitState.pollFailures`) so it survives a replay in another process, and a poll that returns resets it.
-- Signalling a step twice is a no-op; the result carries `alreadyCompleted: true`. Signalling a timed-out step is rejected.
+- Signalling a step twice is a no-op; the result carries `alreadyCompleted: true`. Signalling a timed-out step (its row is `failed`), or a step id that was used as a `run`, `wait` or `sleep`, is rejected with an error naming the step. A signal that lands before the stage has reached the wait is stored and answered when the stage gets there; a signal delivered while a timeout is about to be written wins the compare-and-set, so a delivered signal beats the timeout that would have failed it.
 - If `fn` succeeded but the ledger write failed, `run` throws `StepLedgerWriteError` and does not record a failure, because the side effect already happened; the lease expiry path re-claims on the next replay.
 - **The step lease stores an absolute deadline, unlike the job lease.** `workflow_steps.leaseExpiresAt` is written as `clock.now() + lease` by the host that claims the step and compared against `clock.now()` by whichever host replays the stage next — both through the Prisma model API, so it is immune to the session-timezone skew raw statements have, but not to two hosts' system clocks disagreeing. The *job* lease avoids that by storing only the lock time and deriving the deadline in-database (see 03-runtime-setup.md); the step lease cannot follow without either a raw predicate the portable `StepLedger` port has no place for, or splitting the column into a lock time plus a duration — a schema migration. Until then, keep host clocks in NTP sync if you rely on short `lease` values; the exposure is bounded by the skew, and with the five-minute default a second or two of drift is immaterial.
 
