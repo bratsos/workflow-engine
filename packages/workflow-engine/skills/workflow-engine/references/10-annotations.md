@@ -460,7 +460,7 @@ The buffer-and-flush model makes stage-scope writes inherently atomic. Idempoten
 
 ## Reruns and the `attempt` axis
 
-`run.redrive` (and the deprecated `run.rerunFrom`, which delegates to it) recreates stage records at and after the resume point. The engine assigns the new stage records a fresh `attempt` value (one higher than the max attempt across the superseded stages), and `ctx.annotate(...)` inherits that value for the new annotations. Annotations from the prior attempt survive (the FK to the deleted stage record is `SetNull`, preserving the row with its original `attempt` value).
+`run.redrive` (and the deprecated `run.rerunFrom`, which delegates to it) reopens the stage records of the resumed execution group in place, bumping each record's `attempt` by one, and deletes the records after it; `from: { kind: "start" }` recreates the first group at one past the max attempt across the superseded stages. `ctx.annotate(...)` inherits the new `attempt` for the new annotations. Annotations from the prior attempt survive with their original `attempt` value: on a reopened record they still point at the same stage record id, and on a deleted one the FK is `SetNull`.
 
 This means a single run's annotations can carry multiple `attempt` values, distinguishing decisions made on different runs of the same logical stage. Filter by `attempt` to look at just one attempt:
 

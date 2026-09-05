@@ -181,7 +181,8 @@ export interface StepLedger {
    * Delete every row of a stage record except the named steps.
    *
    * Optional so an existing implementation keeps compiling. Re-running a
-   * terminally failed stage needs it: the rows must go so nothing stale
+   * terminally failed stage needs it, and so does a `run.redrive` that
+   * resumes a stage and keeps its completed steps: the rows must go so nothing stale
    * replays, but a row naming an external effect that may still be live —
    * an AI map's batch submit, holding the handle and external key of a
    * batch a provider is still processing and still billing — must survive,

@@ -1,6 +1,6 @@
 # Retry, Restart and Rerun: `run.redrive`
 
-When a workflow run terminates unsuccessfully, recovery requires resuming execution from an appropriate point without destroying the diagnostic evidence of what failed. Rather than exposing disjoint commands for different restart patterns, `run.redrive` unifies retry, restart, and stage-specific rerun into a single transactional operation while supporting definition version migration. This reference covers the redrive command contract, execution lifecycle, attempt preservation via run annotations, durable step ledger cleanup, definition re-pinning, and migration from the deprecated `run.rerunFrom` command.
+When a workflow run terminates unsuccessfully, recovery requires resuming execution from an appropriate point without destroying the diagnostic evidence of what failed. Rather than exposing disjoint commands for different restart patterns, `run.redrive` unifies retry, restart, and stage-specific rerun into a single transactional operation while supporting definition version migration. This reference covers the redrive command contract, execution lifecycle, attempt preservation via run annotations, what happens to the durable step ledger, definition re-pinning, and migration from the deprecated `run.rerunFrom` command.
 
 ## Command modes: retry, restart and rerun
 
@@ -59,7 +59,7 @@ interface RunRedriveResult {
 
 - `workflowRunId`: The identifier of the redriven run.
 - `fromStageId`: The stage identifier where execution resumed.
-- `supersededStages`: Array of stage identifiers whose records were deleted and archived.
+- `supersededStages`: Array of stage identifiers whose records were superseded and archived: the resumed execution group's records, which are reopened in place, and every record in a later group, which is deleted. A restart (`from: { kind: "start" }`) deletes them all.
 - `redriveCount`: The updated total redrive count for this run.
 - `definitionVersion`: The definition version pinned to the run following the redrive.
 
@@ -69,9 +69,10 @@ The engine implements AWS Step Functions' redrive model: the run retains its ori
 
 - `workflow_runs.redriveCount` increments by 1 on each redrive. This counter tracks the total number of redrives over the entire lifetime of the run and is never reset.
 - The run record transitions to `RUNNING`: `startedAt` is updated to the current clock time, and `completedAt`, `duration`, `output`, `totalCost`, and `totalTokens` are reset to clean initial states.
-- Downstream stage records (those belonging to execution groups greater than or equal to the target stage's execution group) are removed from `workflow_stages`.
-- In-flight or pending jobs associated with superseded stages are deleted from `job_queue` via `jobTransport.deleteByRunAndStages`.
-- Stage records for the resumed execution group are recreated with an incremented attempt generation (`attemptMode: "max+1"`).
+- For `lastFailure` and `stage`, the stage records of the target execution group are **reopened in place**: status back to `PENDING`, `attempt` incremented, `errorMessage`, `completedAt`, `duration`, `outputData`, `suspendedState`, `resumeData`, `nextPollAt`, `metrics` and `embeddingInfo` cleared, `version` bumped (the write is fenced on the version the handler read). The record id does not change, so the stage's durable step ledger — keyed by that id — survives; see [Step ledger reclamation](#step-ledger-reclamation). A stage the target definition version added, with no record yet, is created `PENDING` at the same attempt generation.
+- For `start`, every stage record is removed from `workflow_stages` and the first execution group is recreated with an incremented attempt generation (`attemptMode: "max+1"`).
+- Stage records in execution groups after the target are removed from `workflow_stages` in every mode; `run.transition` recreates them as the redriven run reaches them.
+- In-flight or pending jobs associated with superseded stages are deleted from `job_queue` via `jobTransport.deleteByRunAndStages`, and the target group is enqueued again.
 
 ```typescript
 import { createKernel } from "@bratsos/workflow-engine";
@@ -91,7 +92,7 @@ console.log(result.supersededStages);  // ["summarise", "publish"]
 
 Older recovery implementations (`run.rerunFrom`) deleted failed stage records outright, erasing the error messages, metrics, and timings of the failure being retried.
 
-`run.redrive` archives every stage record it removes as a stage-scoped annotation before deletion. The archival write occurs in the exact same database transaction as the stage deletion, ensuring that if the transaction rolls back, the archive rolls back with it.
+`run.redrive` archives every stage record it supersedes — reopened or deleted — as a stage-scoped annotation before touching it. The archival write occurs in the exact same database transaction as the stage update or deletion, ensuring that if the transaction rolls back, the archive rolls back with it.
 
 ### Archive structure
 
@@ -127,6 +128,10 @@ interface SupersededAttemptPayload {
   readonly metrics: unknown | null;
   readonly outputData: unknown | null; // Blob key pointer
   readonly definitionVersion: string | null;
+  /** `true` when the record was reopened in place (its ledger kept), `false` when it was deleted. */
+  readonly reopened: boolean;
+  /** Only present when the redrive dropped a step row that named an external effect. */
+  readonly abandonedSteps?: Array<{ stepId: string; status: string; externalKey: string | null }>;
 }
 ```
 
@@ -162,23 +167,23 @@ Two alternative storage strategies were considered and rejected:
 
 ## Step ledger reclamation
 
-When a stage record is superseded during a redrive, its associated durable step ledger entries are deleted via `stepLedger.clear(stage.id)`.
+Durable step rows in `workflow_steps` are keyed by `stageRecordId` — the primary key of the stage record, not a foreign key to it — and a step's external key is derived from that same id. What a redrive does to a stage's ledger therefore follows from what it does to the record.
 
-This cleanup occurs inside the `_postCommit` phase of `handleRunRedrive`:
+### A reopened record keeps its progress
 
-```typescript
-for (const stage of stagesToSupersede) {
-  await postDeps.stepLedger?.clear(stage.id);
-}
-```
+For `lastFailure` and `stage`, the resumed group's records are reopened in place, and their ledgers go through the same reset an exhausted stage gets before `job.execute` runs it again (the helper is shared, `kernel/helpers/step-ledger-reset.ts`), in its `"resume"` mode:
 
-### Rationale
+- Every `completed` row stays exactly as it is. The replay answers it from the ledger, so the step's body does not run again — a stage that completed 9 of 10 steps re-runs only the tenth — and the row keeps the external key it was given, so a provider deduping on that key still recognises the effect.
+- Every `run` row naming an external effect (`externalKey` set) that did not complete is **re-opened**: put back to `running` with no lease, so the replay takes it over, bumps `attempt` and executes the body with `isReclaim: true`, letting a `${id}:submit` re-adopt the batch a provider is still processing instead of creating and billing a second one.
+- Everything else is dropped through `StepLedger.clearExcept`: waits, signals and sleeps hold only timers and deadlines that a new attempt must re-derive, and a failed `run` row with no external key has nothing worth keeping.
 
-Durable step rows in `workflow_steps` are foreign-keyed to `stageRecordId`—the specific primary key of the stage record. When a redrive occurs, the old stage record is deleted and a fresh stage record with a new primary key is created for the next attempt.
+A ledger without `clearExcept` cannot keep some rows and drop others. When anything has to go, everything goes — completed rows included — exactly as `job.execute` falls back on the same ledger, and the rows naming an external effect are recorded as `abandonedSteps` before they are lost. Redriving onto a different definition version may leave rows the new code never requests; they are harmless and not detected.
 
-If the old step rows were preserved in the database, no future replay could ever read them because no stage record references that `stageRecordId`. Leaving orphaned step records in `workflow_steps` would cause unbounded table growth.
+### A deleted record loses its ledger
 
-This behavior is distinct from an **in-flight job retry** on a running stage: during job retries, the stage record is preserved, and steps with external keys are reopened and reclaimed. During a **redrive**, the entire stage record is replaced, and the historical record is preserved in `run.supersededAttempt` annotations.
+For `start`, and for every record in a group after the target, the record is deleted and its ledger is cleared via `stepLedger.clear(stage.id)` in the `_postCommit` phase of `handleRunRedrive`. If those rows were preserved, no future replay could ever read them, because the id they are keyed by names a record that no longer exists; leaving them would only grow `workflow_steps`. Before the delete, every row naming an external effect is recorded as `abandonedSteps` on the stage's `run.supersededAttempt` annotation and in a `WARN` log on the run, so a batch a provider is still billing stays findable by its key.
+
+The ledger writes happen after the commit in every case, because the ledger takes no part in the database transaction; the decision of what to keep is made before it, so the archive and the log describe exactly what the post-commit step drops.
 
 ## Redriving onto a different definition version
 
@@ -231,7 +236,7 @@ return {
 };
 ```
 
-Because it delegates to `run.redrive`, `run.rerunFrom` inherits attempt preservation via annotations, step ledger cleanup, and `redriveCount` tracking. Its return property `deletedStages` returns the exact stage IDs reported by `supersededStages`.
+Because it delegates to `run.redrive` with `from: { kind: "stage" }`, `run.rerunFrom` inherits attempt preservation via annotations, the reopened target stage with its kept step ledger, and `redriveCount` tracking. Its return property `deletedStages` returns the exact stage IDs reported by `supersededStages`.
 
 ### Differences and restrictions
 

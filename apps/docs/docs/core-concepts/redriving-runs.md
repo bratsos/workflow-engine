@@ -51,16 +51,21 @@ The result reports what happened:
 ```
 
 Like Step Functions' redrive, this is the **same run**: the same id, an
-incremented `redriveCount`, no branching into a second execution. Stages at
-and after the resume point are replaced; their job rows and durable step
-ledgers are cleared so the new attempt starts clean.
+incremented `redriveCount`, no branching into a second execution. For
+`lastFailure` and `stage`, the stage you resume from is **reopened in
+place** — back to `PENDING`, its attempt incremented, the old outcome
+cleared — so the progress its durable steps made is kept: completed steps
+are answered from the ledger rather than run again, and their external keys
+are unchanged. Stages after it are replaced. `start` replaces everything.
+Job rows of every superseded stage are cleared and the resumed group is
+enqueued again.
 
 ## The failed attempt is preserved
 
 `run.rerunFrom` used to delete the failed stage row and everything after
 it, which destroyed the evidence of the failure you were retrying.
-`run.redrive` archives every stage record it removes as a stage-scoped
-annotation first, in the same transaction:
+`run.redrive` archives every stage record it supersedes — reopened or
+removed — as a stage-scoped annotation first, in the same transaction:
 
 ```ts
 const attempts = await kernel.annotations.list(workflowRunId, {
@@ -84,30 +89,45 @@ attempts[0];
 //     metrics: { … },
 //     outputData: { _artifactKey: "…" },
 //     definitionVersion: "sha256-…",
+//     reopened: true,
 //   },
 // }
 ```
+
+`reopened` says whether the record was reopened in place (its step ledger
+kept) or deleted (its ledger cleared).
 
 Annotations already survive stage deletion (`onDelete: SetNull` on the stage
 relation), already carry `attempt`, and are already queryable — so the
 superseded attempt lands on the surface built for exactly this, rather than
 in a new table.
 
-Two things it records rather than copies: `outputData` keeps the blob key,
+One thing it records rather than copies: `outputData` keeps the blob key,
 not the blob. The new attempt writes to the same key, so the archive tells
-you an output existed and where it lived, not what it contained. And the
-durable step ledger is cleared rather than archived — its rows are keyed by
-the deleted stage record's id, so nothing would ever read them again.
+you an output existed and where it lived, not what it contained.
+
+### What happens to the step ledger
+
+A reopened stage keeps its durable step ledger, through the same reset the
+engine gives an exhausted stage before its next attempt: every `completed`
+row stays as it is, so a stage that completed 9 of 10 steps re-runs only the
+tenth; every `run` row that named an external effect but did not complete
+is re-opened, so its body runs again with `isReclaim: true` and re-adopts
+the batch it already submitted; waits, signals, sleeps and failed rows with
+nothing to keep are dropped. A deleted stage's ledger is cleared — its rows
+are keyed by a stage record id nothing will ever look up again.
 
 ### What the redrive abandons
 
-Clearing the ledger can strand an effect that is still live: a durable step
-that submitted a provider batch holds its handle and its
+Dropping a row can strand an effect that is still live: a durable step that
+submitted a provider batch holds its handle and its
 [external key](../api/index/functions/deriveStepExternalKey.md), and the
 provider keeps processing and keeps billing it whether or not you redrove
-the run. Those rows cannot be kept, so what they name is recorded before
-they go — as `abandonedSteps` on the superseded-attempt annotation, and as a
-`WARN` log on the run:
+the run. That happens on a restart, for the stages after the resumed one,
+and on a `StepLedger` without `clearExcept`, which cannot keep some of a
+reopened stage's rows and drop the rest, so it drops them all. Whatever is
+actually dropped is recorded before it goes — as `abandonedSteps` on the
+superseded-attempt annotation, and as a `WARN` log on the run:
 
 ```ts
 attempts[0].payload.abandonedSteps;
@@ -117,7 +137,7 @@ attempts[0].payload.abandonedSteps;
 The key is the actionable part: it is what you search the provider with to
 find, and cancel, a batch nothing will collect any more. The field is absent
 when the redrive abandoned nothing that named an external effect, which is
-the normal case. The annotation is there as well as the log because logs
+the normal case — a resumed stage keeps those rows. The annotation is there as well as the log because logs
 rotate and the annotation stays on the run.
 
 ## Redriving onto a different definition version
