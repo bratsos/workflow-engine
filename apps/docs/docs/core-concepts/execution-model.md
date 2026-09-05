@@ -1,5 +1,5 @@
 ---
-sidebar_position: 2
+sidebar_position: 3
 title: Execution Model
 ---
 
@@ -16,6 +16,8 @@ Instead of continuously recording execution state at the CPU/instruction level (
 * When a stage completes, its output is validated against its Zod output schema and written to the database (in the `WorkflowStage` record) as a single transaction.
 * If a worker crashes or a stage fails, the workflow does not need to restart from the beginning. It resumes from the last completed stage.
 * This makes it easy to run heavy, multi-stage pipelines on cheap, ephemeral instances (like spot instances or serverless functions).
+
+Inside a stage, [durable steps](./durable-steps.md) add a finer checkpoint: each `ctx.step.*` call records its outcome in the step ledger (`workflow_steps`), and a crashed or suspended stage resumes by replaying `execute()` with completed steps answered from the ledger rather than re-running the whole stage body.
 
 ---
 
@@ -41,7 +43,9 @@ Jobs are queued in the `JobQueue` table. Polling is coordinated directly through
 To prevent jobs from hanging indefinitely when a worker crashes mid-execution:
 * **Job Leases**: When a worker claims a job, it locks it with a lease (`lockedAt`).
 * **Heartbeating (v0.11+)**: While a worker is executing a job, the host periodically heartbeats the job to extend its lease. The default stale lease threshold in `v0.11` is **300,000 ms (5 minutes)** (increased from 60 seconds in `v0.10` to prevent premature lease timeouts during heavy local CPU execution).
-* **Lease Reaping**: The `lease.reapStale` command periodically searches the `JobQueue` for active leases that haven't been updated within the threshold, releases them, and marks them for retry. This runs automatically on each host orchestration tick.
+* **Lease Reaping**: The `lease.reapStale` command periodically searches the `JobQueue` for active leases that haven't been updated within the threshold, releases them, and marks them for retry. This runs automatically on each host orchestration tick. On PostgreSQL the lease runs on the database clock (`now()` at claim, heartbeat and sweep), so a host whose system clock is skewed cannot reclaim a job that was only just claimed.
+* **Absolute cap**: The heartbeat only detects a worker that *stopped*; a worker that is alive but wedged keeps heartbeating forever. `jobAbsoluteTimeoutMs` (host option, default one hour, `0` disables) is measured from `startedAt`, which no heartbeat refreshes, and fails such a job terminally rather than requeueing it. Both sweeps stamp `lastError` with a distinguishable prefix: `LEASE_HEARTBEAT_LOST` (requeued) or `LEASE_ABSOLUTE_CAP` (failed).
+* **Durable step leases** are separate from job leases and are deliberately *not* reaped: a `ctx.step.run` body holds a `lease` (default five minutes) that only its own expiry releases, because a ledger row carries no worker identity. See [Durable Steps](./durable-steps.md#leases-retries-and-deadlines).
 
 ### Suspended-stage single flight
 
@@ -63,18 +67,18 @@ A suspended stage is claimed by a different mechanism: the poller bumps the stag
 When a stage fails (by throwing an error), the engine increments the attempt count.
 
 ### Retry Mechanics
-* The job is returned to the queue if `attempt < maxAttempts`.
+* The job is returned to the queue if `attempt < maxAttempts` (the transport's `maxAttempts` is the retry budget; the built-in transports back off `2^attempt` seconds). The stage row stays `PENDING` with the error on `errorMessage`, `stage:retrying` is emitted, and the stage's durable step ledger is kept: the retry replays completed steps and re-opens failed ones.
 * The backoff strategy is managed by the host.
 
 ### Terminal Failures
-Once a stage exhausts its `maxAttempts`, it is marked as `FAILED`.
-* In `v0.11+`, a terminal stage failure triggers `run.transition` **immediately** within the same database transaction. The parent workflow run is failed with the stage's error right away, rather than waiting for the next orchestration poll.
+Once a stage exhausts its `maxAttempts`, it is marked as `FAILED` and `stage:failed` is emitted.
+* A terminal stage failure triggers `run.transition` **immediately** within the same database transaction. The parent workflow run is failed with the stage's error right away, rather than waiting for the next orchestration poll.
 
 ### Ghost Job Guard
-A **ghost job** occurs when a worker processes a job whose parent workflow run is no longer in the `RUNNING` status (e.g., the run was cancelled or marked failed by another process).
-* `job.execute` checks the parent run status before and after stage execution.
-* If the run is not `RUNNING`, the result is discarded, and a `ghost: true` flag is returned.
-* Hosts check for this flag and **immediately disable retries** to prevent zombie execution loops.
+A **ghost job** occurs when a worker dequeues a job it must not execute. `job.execute` checks the parent run before and after stage execution and, when it is not something this worker should run, discards the result and returns `{ ghost: true, ghostReason }`:
+* **`"orphan"`** — the run is no longer `RUNNING` (cancelled, or failed by another process). Hosts fail the job terminally without a retry, so no zombie loop.
+* **`"race"`** — the run is still `PENDING`: the job became visible before the claim that created it committed. Hosts re-deliver it through the transport's normal backoff.
+* **`"version"`** — the run is pinned to a definition version this build does not serve (see [Definition Versioning](./definition-versioning.md)). Hosts *defer* the job — back to `PENDING` with a delay and its attempt given back — for a host that can serve it. The run is not failed.
 
 ### Stuck Run Detection
 If a run becomes stuck in `RUNNING` status (e.g., due to an unhandled worker crash and queue loss), the `run.reapStuck` command detects it.

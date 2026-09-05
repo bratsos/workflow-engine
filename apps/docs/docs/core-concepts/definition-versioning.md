@@ -1,5 +1,5 @@
 ---
-sidebar_position: 5
+sidebar_position: 6
 title: Definition Versioning
 ---
 
@@ -309,7 +309,7 @@ polling and dequeuing all go back to the pre-1.0, version-blind behaviour.
 Both shipped hosts take it as configuration:
 
 ```ts
-const host = new NodeHost({ kernel, jobTransport, serves: "all" });
+const host = createNodeHost({ kernel, jobTransport, workerId, serves: "all" });
 ```
 
 `runMaintenanceTick` takes the same option for a hand-rolled host, and

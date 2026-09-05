@@ -11,7 +11,7 @@ Workflows in **workflow-engine** are built as a sequence of **execution groups**
 
 ## Defining a Stage
 
-A stage is an atomic, retryable step of execution. You define a stage using either `defineStage` (for standard execution) or `defineAsyncBatchStage` (for long-running, suspendable processes). Every stage must define:
+A stage is an atomic, retryable unit of execution, defined with `defineStage`. A stage that has to wait — for a provider batch, a polled job, a human — does so from inside its `execute()` with [durable steps](./durable-steps.md) (`ctx.step.waitFor`, `waitForSignal`, `sleep`, `ctx.step.ai.map`); the separate `defineAsyncBatchStage` of 0.x is no longer exported. Every stage must define:
 1. **`id`**: Unique string identifier.
 2. **`name`**: A human-friendly display name.
 3. **`schemas`**: Zod schemas defining its validated `input`, `output`, and `config`.
@@ -69,11 +69,11 @@ The older form that spells out all five generics positionally (`defineStage<TId,
 
 ## Defining a Workflow
 
-Workflows chain stages together. The recommended way to build a workflow is `defineWorkflow`, an options-object API; the positional `WorkflowBuilder` constructor still works but is deprecated in its favor.
+Workflows chain stages together. The recommended way to build a workflow is `defineWorkflow`; the positional `WorkflowBuilder` constructor still works but is deprecated in its favor.
 
 ### `defineWorkflow` API (recommended)
 
-`defineWorkflow` returns the same `WorkflowBuilder` instance but accepts a cleaner options object instead of positional arguments. Since the final output schema is implicitly set by the output of the final stage in the pipeline, you can omit the output schema from the arguments.
+`defineWorkflow` returns a `WorkflowBuilder`. It takes either an options object or `(id, { input?, name?, description? })`. The workflow's output schema is always the last stage's output schema (or the merged object of the last parallel group); there is no `output` option.
 
 ```typescript
 import { defineWorkflow } from "@bratsos/workflow-engine";
@@ -89,6 +89,38 @@ export const myWorkflow = defineWorkflow({
   .pipe(extractTextStage)
   .build();
 ```
+
+### Inline stages with `.stage()`
+
+`.stage(id, definition)` defines a stage and adds it in one call, and the builder infers the stage's context from every earlier stage — so `ctx.require()` is typed without a hand-written context type, and `dependencies` only accepts earlier ids:
+
+```typescript
+const In = z.object({ repo: z.string() });
+
+export const repository = defineWorkflow("repository", { input: In })
+  .stage("chapter-index", {
+    schemas: { input: In, output: z.object({ chapters: z.array(z.string()) }), config: z.object({}) },
+    async execute(ctx) {
+      const chapters = await ctx.step.run("list", () => listChapters(ctx.input.repo));
+      return { output: { chapters } };
+    },
+  })
+  .stage("extract", {
+    dependencies: ["chapter-index"],          // "nope" is a type error
+    schemas: { input: "none", output: z.object({ count: z.number() }), config: z.object({}) },
+    async execute(ctx) {
+      const idx = ctx.require("chapter-index"); // typed: { chapters: string[] }
+      return { output: { count: idx.chapters.length } };
+    },
+  })
+  .build();
+```
+
+`.stage(prebuilt)` and `.pipe(prebuilt)` accept a `defineStage()` result and check its declared context against what earlier stages produce: a stage that requires a key no earlier stage produces does not compile (the parameter resolves to `{ __error: "stage requires context keys not produced by earlier stages: ..." }`). A stage built without an explicit context is accepted anywhere. `.parallel([...])` and `.parallel((group) => group.stage("a", {...}).stage("b", {...}))` carry the same inference, and `InferWorkflowContext`, `InferWorkflowInput`, `InferWorkflowOutput`, `InferWorkflowStageIds` and `InferStageOutputById` expose the inferred types to code outside the stages.
+
+### Declaring a version
+
+`defineWorkflow(...).version("2026-09-04.1")` declares the definition version yourself; otherwise the engine derives one from the pipeline's structure. See [Definition Versioning](./definition-versioning.md).
 
 ### Positional `WorkflowBuilder` API (deprecated)
 
@@ -152,7 +184,18 @@ Within a stage's `execute` function, you can retrieve outputs of preceding stage
 * **`ctx.require(stageId)`**: Gets the output of a preceding stage. Throws a compile-time and runtime error if the stage did not run or is not declared in dependencies.
 * **`ctx.optional(stageId)`**: Gets the output of a preceding stage, returning `undefined` if it was not run.
 
-For stages executing after a `.parallel()` block, the outputs are keyed by their respective stage IDs:
+For stages executing after a `.parallel()` block, the outputs are keyed by their respective stage IDs.
+
+### What else is on `ctx`
+
+Beyond `input`, `config`, `require`/`optional`, `log`, `annotate` and `storage`, every stage context carries:
+
+* **`ctx.step`** — the durable step API (`run`, `waitFor`, `waitForSignal`, `sleep`, `ai`). See [Durable Steps](./durable-steps.md).
+* **`ctx.ai`** and **`ctx.aiLogger`** — an `AIHelper` scoped to this run and stage, built lazily from the kernel's `services`. See [AI Overview](../ai/overview.md).
+* **`ctx.abortSignal`** — aborted with a `StageAbortedError` when the run is cancelled or this worker's job lease is lost while the stage executes. Pass it to `fetch` and to `ctx.ai.*`.
+* **`ctx.stageRecordId`**, **`ctx.workflowRunId`**, **`ctx.stageId`** — the identity of this execution; the stage row's `attempt` (via `stageRecordId`) is the retry count.
+
+`ctx.log` and `ctx.onLog` return `void`; awaiting them still compiles but is unnecessary.
 
 ```typescript
 // Inside generateReportStage's execute(ctx)

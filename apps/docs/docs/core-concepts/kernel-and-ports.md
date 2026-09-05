@@ -1,5 +1,5 @@
 ---
-sidebar_position: 3
+sidebar_position: 4
 title: Kernel and Ports
 ---
 
@@ -18,21 +18,30 @@ By decoupling execution logic from infrastructure, the core engine has:
 
 ---
 
-## The 7 Core Ports
+## The Core Ports
 
-When initializing a kernel with `createKernel`, you must inject implementations for six required ports — `persistence`, `blobStore`, `jobTransport`, `eventSink`, `clock`, and `registry`. A seventh, `scheduler`, is optional and currently unused (see below):
+When initializing a kernel with `createKernel`, you must inject implementations for six required ports — `persistence`, `blobStore`, `jobTransport`, `eventSink`, `clock`, and `registry`:
 
 | Port Name | Interface | Purpose |
 | :--- | :--- | :--- |
-| **`persistence`** | `Persistence` | Manages metadata storage for runs, stages, execution logs, transaction outboxes, and idempotency records. |
-| **`blobStore`** | `BlobStore` | Handles storage for large input/output payloads and intermediate stage artifacts (using methods like `put`, `get`, `has`, `delete`, and `list`). |
+| **`persistence`** | `Persistence` | Manages metadata storage for runs, stages, execution logs, transaction outboxes, definition snapshots and idempotency records. |
+| **`blobStore`** | `BlobStore` | Handles storage for large input/output payloads, intermediate stage artifacts and spilled step results (using methods like `put`, `get`, `has`, `delete`, and `list`). Must be shared by every process that executes or polls a run. |
 | **`jobTransport`** | `JobTransport` | Acts as the job queue (managing dequeue loops, claiming, and cancelling queued jobs). |
-| **`eventSink`** | `EventSink` | Dispatches internal system event notifications asynchronously (e.g., `workflow:completed`, `stage:started`). |
-| **`scheduler`** | `Scheduler` | Optional; currently unused/vestigial (reserved for a possible future phase). The kernel supplies an internal no-op automatically when omitted. Suspended async-batch stages are actually resumed via host-driven `stage.pollSuspended` polling — see [Command Dispatch](#command-dispatch) below. |
+| **`eventSink`** | `EventSink` | `{ emit(event) }` — receives system events (e.g., `workflow:completed`, `stage:started`) when the outbox is flushed. |
 | **`clock`** | `Clock` | Resolves the current system time. Can be mocked in tests (`FakeClock`) to control duration math. |
-| **`registry`** | `WorkflowRegistry` | Maps workflow IDs to their respective immutable `Workflow` objects compiled via `WorkflowBuilder`. |
+| **`registry`** | `WorkflowRegistry` | Maps workflow IDs to their respective immutable `Workflow` objects. Build it with `createWorkflowRegistry([...])`: that implements the optional `listWorkflows()`, which is what lets a host claim only runs pinned to a definition version it can execute (see [Definition Versioning](./definition-versioning.md)). A hand-written `{ getWorkflow }` works but claims unfiltered. |
 
-An optional 8th port, **`executor`** (`ActivityExecutor`), can be injected to delegate stage executions to separate processes or remote activity workers (see [Remote Workers](../hosts/remote-workers.md)).
+The optional ports and settings:
+
+| Option | Type | Purpose |
+| :--- | :--- | :--- |
+| **`stepLedger`** | `StepLedger` | Storage for [durable steps](./durable-steps.md) (`InMemoryStepLedger`, `createPrismaStepLedger`). A stage that never touches `ctx.step` needs none; touching it unconfigured throws `StepLedgerNotConfiguredError`. |
+| **`services`** | `{ aiLogger, ai? }` | Provides `ctx.ai` (an `AIHelper` built lazily per stage under the topic `workflow.<runId>.stage.<stageId>`) and `ctx.aiLogger`. `ai` is an optional factory with the signature of `createAIHelper`, for routing options, an adapter or timeouts in one place. Accessing `ctx.ai` without services throws `AIServicesNotConfiguredError`. |
+| **`executor`** | `ActivityExecutor` | Delegates stage executions to separate processes or remote activity workers (see [Remote Workers](../hosts/remote-workers.md)). Defaults to the local executor. |
+| **`spillThresholdBytes`** | `number` | Soft threshold above which a step result is written to the blob store behind a claim check (default 64 KiB); see below. |
+| **`idempotencyStaleInProgressMs`** | `number` | How long an idempotency key may sit `in_progress` before a later dispatch may reclaim it (default 10 minutes). |
+
+There is no `scheduler` port: `KernelConfig.scheduler` and `NoopScheduler` were removed in 1.0. Suspended stages are resumed by host-driven `stage.pollSuspended` polling — see [Command Dispatch](#command-dispatch) below.
 
 ---
 
@@ -53,16 +62,21 @@ const result = await kernel.dispatch({
 ```
 
 The key kernel commands are:
-* **`run.create`**: Creates a pending run record.
-* **`run.claimPending`**: Scans for and claims pending runs, then enqueues their first-stage jobs.
-* **`job.execute`**: Executes a single stage (runs `execute()`). Takes an optional `abortSignal` that becomes `ctx.abortSignal`.
+* **`run.create`**: Creates a pending run record, pinned to the workflow's current definition version.
+* **`run.claimPending`**: Scans for and claims pending runs this build serves, then enqueues their first-stage jobs (after the claim commits).
+* **`job.execute`**: Executes a single stage (runs `execute()`). Takes the job's `attempt`/`maxAttempts` to decide `willRetry`, and an optional `abortSignal` that becomes `ctx.abortSignal`.
 * **`job.heartbeat`**: One beat of a host's job lease heartbeat: renews the lease and reports the run's status and whether the worker still holds the job, which is what the host aborts `ctx.abortSignal` from.
 * **`run.transition`**: Evaluates completed stage outputs and transitions the workflow run to the next execution group or completes the run.
 * **`run.cancel`**: Authority that marks a run cancelled, sets open stages to cancelled, and purges the job queue.
-* **`run.rerunFrom`**: Deletes downstream stages and queues them for execution from a specific point.
-* **`stage.pollSuspended`**: Triggers completion checks for stages currently waiting for asynchronous processes.
-* **`lease.reapStale`**: Recovers jobs held by crashed workers.
+* **`run.redrive`**: Retry, restart or rerun a terminal run — `from: { kind: "lastFailure" | "start" | "stage" }` — keeping the resumed stage's step ledger and archiving every superseded attempt; optionally re-pins the run to another definition version. See [Retry, Restart and Rerun](./redriving-runs.md). `run.rerunFrom` still works but is deprecated and delegates to it.
+* **`stage.pollSuspended`**: Replays suspended durable stages whose `nextPollAt` has passed (and runs `checkCompletion` for the internal async-batch mode).
+* **`step.signal`**: Completes a `ctx.step.waitForSignal` step with a payload and nudges its stage for replay. Idempotent: a second signal reports `alreadyCompleted: true`.
+* **`lease.reapStale`**: Recovers jobs held by crashed workers (heartbeat tier) and fails jobs past the absolute cap.
+* **`outbox.flush`**: Publishes committed outbox events to the `EventSink` and reports the sink's health.
+* **`plugin.replayDLQ`**: Re-queues dead-lettered outbox events once the sink is back.
 * **`run.reapStuck`**: Automatically fails workflow runs that have ceased database updates.
+* **`run.purge`**: Deletes terminal runs older than a cutoff with everything under them (stages, logs, artifacts, annotations, step ledger, job rows, blobs). Off unless a host is given `retention`; see [Run Retention](../troubleshooting/overview.md#run-retention).
+* **`run.listVersions`**: Reports which definition versions still have runs and whether this build serves them.
 
 ---
 
@@ -74,8 +88,8 @@ to be an escape hatch: without one, a very large value is simply a very large
 row, read back in full on every replay.
 
 Stage outputs have never had that problem -- they go to the `blobStore` and
-the row keeps only `outputData._artifactKey`. From `1.0.0-alpha.9` the same
-claim check covers the two other places a payload can grow without bound.
+the row keeps only `outputData._artifactKey`. Since 1.0 the same claim check
+covers the two other places a payload can grow without bound.
 
 ### Durable step results (automatic)
 
@@ -201,8 +215,8 @@ run their own loop can use `createEventSinkMonitor()` from
 
 ## Idempotency Engine
 
-To support safe retries in distributed networks, commands like `run.create`, `job.execute`, and `run.rerunFrom` accept an optional `idempotencyKey`.
+To support safe retries in distributed networks, commands like `run.create`, `job.execute`, `run.redrive` and `run.rerunFrom` accept an optional `idempotencyKey`.
 
 * **Duplicate Prevention**: If a key has already completed execution, re-submitting the command immediately returns the previously cached output from the `IdempotencyKey` table without running it again.
 * **In-Progress Guard**: If the command is currently running, subsequent dispatches throw an `IdempotencyInProgressError`.
-* **Stuck-Key Reclamation (v0.11+)**: If a dispatcher process crashes midway, the key could stay in the `in_progress` state forever. In `v0.11`, you can configure **`idempotencyStaleInProgressMs`** (default: 10 minutes). If a key has been in progress longer than this threshold, it is automatically reclaimed and allowed to run again.
+* **Stuck-Key Reclamation**: If a dispatcher process crashes midway, the key could stay in the `in_progress` state forever. **`idempotencyStaleInProgressMs`** (default: 10 minutes) bounds that: a key that has been in progress longer than the threshold is reclaimed and allowed to run again.
