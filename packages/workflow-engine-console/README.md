@@ -297,7 +297,7 @@ The `--allow-direct-connection` flag requires explicit acknowledgement that conn
 
 The console provides seven operational views:
 - **Runs list**: Keyset-paginated list filtered by execution status, workflow ID, workflow type, definition version, and date ranges. Each row carries the run's definition version (shortened, full value on hover) with its redrive count as a `+N` suffix — filtering by version is how "show me everything still pinned to the old version" is answered.
-- **Run detail**: Definition version and redrive count alongside the run's timings and cost, plus the complete execution hierarchy including stage timelines, durable step ledger entries, annotations, execution logs, and outbox event streams.
+- **Run detail**: Definition version and redrive count alongside the run's timings and cost, plus the complete execution hierarchy including stage timelines, durable step ledger entries (kind, status, attempt, deadline, and the `externalKey` of `run` steps, so an orphaned provider-side effect can be searched for), annotations, execution logs, and outbox event streams. With actions enabled, a step with `kind === "signal"` and `status === "pending"` offers *Deliver signal* with a validated JSON payload box, and a run carrying a pinned version offers *Redrive on latest version*.
 - **Queue health**: Job distribution by status, enqueue timestamp of the oldest pending job, oldest active lock duration, and overdue polling stages.
 - **Suspended stages**: Stages awaiting external event resumption or deferred polling schedules.
 - **Workers**: Active worker instances derived from heartbeat locks on `job_queue`, reporting active execution count, oldest active lock, and last heartbeat age.
@@ -310,6 +310,7 @@ To maintain performant queries against operational tables without degraded index
 - `workflow_runs(createdAt DESC, id DESC)`
 - `workflow_runs(status, createdAt DESC, id DESC)`
 - `workflow_runs(workflowId, createdAt DESC, id DESC)`
+- `workflow_runs(definitionVersion)` and `workflow_runs(status, workflowId, definitionVersion)` for the version filter
 - `job_queue(status, createdAt)`
 - `outbox_events(dlqAt)`
 
