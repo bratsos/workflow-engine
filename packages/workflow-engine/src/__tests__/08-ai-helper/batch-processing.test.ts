@@ -761,4 +761,53 @@ describe("AIBatchImpl and AIHelper batch wiring", () => {
     expect(loggedBatchResults[0]?.batchId).toBe("b123");
     expect(loggedBatchResults[0]?.records[0]?.cost).toBeGreaterThan(0);
   });
+
+  it("records a transport-reported per-request cost as the row's cost", async () => {
+    // getResults() carries OpenRouter's per-request usage.cost on the
+    // result; the ledger row must bill that figure, not the batch rate.
+    const { logger, loggedBatchResults } = makeFakeAICallLogger();
+    const ctx = { topic: "test-topic", aiCallLogger: logger as any };
+    const batch = new AIBatchImpl(ctx, "gemini-2.5-flash", "openrouter");
+
+    await batch.recordResults("b-reported", [
+      {
+        id: "r1",
+        prompt: "hello",
+        result: "world",
+        inputTokens: 100,
+        outputTokens: 200,
+        status: "succeeded",
+        validated: true,
+        reportedCostUsd: 0.0123,
+      } as any,
+    ]);
+
+    const row = loggedBatchResults[0]?.records[0];
+    expect(row?.cost).toBe(0.0123);
+    expect(row?.reportedCost).toBe(0.0123);
+    expect(row?.costSource).toBe("reported");
+  });
+
+  it("falls back to the batch estimate when no per-request cost was reported", async () => {
+    const { logger, loggedBatchResults } = makeFakeAICallLogger();
+    const ctx = { topic: "test-topic", aiCallLogger: logger as any };
+    const batch = new AIBatchImpl(ctx, "gemini-2.5-flash", "openrouter");
+
+    await batch.recordResults("b-estimated", [
+      {
+        id: "r1",
+        prompt: "hello",
+        result: "world",
+        inputTokens: 100,
+        outputTokens: 200,
+        status: "succeeded",
+        validated: true,
+      },
+    ]);
+
+    const row = loggedBatchResults[0]?.records[0];
+    expect(row?.cost).toBeGreaterThan(0);
+    expect(row?.reportedCost).toBeUndefined();
+    expect(row?.costSource).toBe("estimated");
+  });
 });

@@ -39,6 +39,12 @@ export type EngineBatchItemResult =
       text: string;
       inputTokens: number;
       outputTokens: number;
+      /**
+       * USD cost the transport itself reported for this request, when it
+       * reports one per request (OpenRouter with usage accounting). Absent
+       * on the vendor transports, whose batch results carry tokens only.
+       */
+      reportedCostUsd?: number;
     }
   | {
       id: string;

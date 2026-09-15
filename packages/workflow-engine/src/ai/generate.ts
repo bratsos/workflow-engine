@@ -18,6 +18,7 @@ import {
   resolveCost,
   resolveLanguageModel,
 } from "./shared";
+import { costResultLikeForSteps } from "./step-cost";
 import { createCallTimeout, runWithCallTimeout } from "./timeouts.js";
 import type {
   AICallType,
@@ -379,7 +380,7 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
             providerMetadata: resultAny.providerMetadata,
             costUsd: resultAny.costUsd,
           }
-        : result,
+        : costResultLikeForSteps(result),
     );
     const durationMs = Date.now() - startTime;
     // Reasoning models emit on a separate channel; surface it so a
@@ -603,7 +604,7 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
             providerMetadata: resultAny.providerMetadata,
             costUsd: resultAny.costUsd,
           }
-        : result,
+        : costResultLikeForSteps(result),
     );
     const durationMs = Date.now() - startTime;
 

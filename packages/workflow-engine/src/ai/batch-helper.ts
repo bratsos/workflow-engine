@@ -34,6 +34,26 @@ import type {
   BatchOptions,
 } from "./types";
 
+/**
+ * The per-request cost a transport reported, carried on the result object
+ * so it survives the trip through `getResults()` to `recordResults()`.
+ * `AIBatchResult` does not declare the field; it is read structurally.
+ */
+function reportedCostOf(result: unknown): number | undefined {
+  const value = (result as { reportedCostUsd?: unknown } | undefined)
+    ?.reportedCostUsd;
+  return typeof value === "number" && Number.isFinite(value)
+    ? value
+    : undefined;
+}
+
+function reportedCostField(
+  item: EngineBatchItemResult,
+): { reportedCostUsd: number } | Record<string, never> {
+  const value = item.status === "succeeded" ? item.reportedCostUsd : undefined;
+  return value !== undefined ? { reportedCostUsd: value } : {};
+}
+
 function resolveCustomId(item: EngineBatchItemResult): string | null {
   if (item.id && typeof item.id === "string" && item.id.trim().length > 0) {
     return item.id;
@@ -914,6 +934,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
             outputTokens,
             status: "succeeded",
             validated: true,
+            ...reportedCostField(item),
           });
         } else {
           unvalidatedCount++;
@@ -929,6 +950,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
             outputTokens,
             status: "succeeded",
             validated: false,
+            ...reportedCostField(item),
           });
         }
       }
@@ -1021,13 +1043,19 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
         await this.ctx.aiCallLogger.logBatchResults(
           batchId,
           results.map((r) => {
-            const cost = calculateCostWithDiscount(
+            const estimatedCost = calculateCostWithDiscount(
               this.modelKey,
               r.inputTokens,
               r.outputTokens,
               true,
               this.provider,
             );
+            // A transport that bills per request (OpenRouter) is the
+            // authority on that request's cost; otherwise the batch rate.
+            const reportedCost = reportedCostOf(r);
+            const cost = reportedCost ?? estimatedCost;
+            const costSource: "reported" | "estimated" =
+              reportedCost !== undefined ? "reported" : "estimated";
 
             return {
               topic: this.ctx.topic,
@@ -1046,6 +1074,9 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
               inputTokens: r.inputTokens,
               outputTokens: r.outputTokens,
               cost,
+              estimatedCost,
+              reportedCost,
+              costSource,
               batchId,
               requestId: r.id,
               metadata: {

@@ -12,6 +12,7 @@ import { streamText as aiStreamText } from "ai";
 import { logFailure } from "./generate";
 import { getModel, type ModelKey } from "./model-helper";
 import { logger, resolveCost, resolveLanguageModel } from "./shared";
+import { costResultLikeForSteps } from "./step-cost";
 import {
   createCallTimeout,
   runWithCallTimeout,
@@ -118,7 +119,12 @@ export function streamText(
       servedBy,
       cachedInputTokens,
       reasoningTokens,
-    } = resolveCost(modelKey, inputTokens, outputTokens, resultLike);
+    } = resolveCost(
+      modelKey,
+      inputTokens,
+      outputTokens,
+      costResultLikeForSteps(resultLike),
+    );
     const durationMs = Date.now() - startTime;
 
     usageResolved = true;
@@ -328,11 +334,15 @@ export function streamText(
       const providerMetadata =
         (await runWithCallTimeout(timeout, () => sdkResult.providerMetadata)) ??
         finalStep?.providerMetadata;
+      // Every step, so a tool-calling call is billed as the sum of its
+      // steps rather than the final step alone (see step-cost.ts).
+      const steps = await runWithCallTimeout(timeout, () => sdkResult.steps);
 
       return persistUsage(inputTokens, outputTokens, responseText, reasoning, {
         usage,
         providerMetadata,
         finalStep,
+        steps,
       });
     } catch (error) {
       logError(error);

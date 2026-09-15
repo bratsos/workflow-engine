@@ -1133,3 +1133,127 @@ describe("Batch Subsystem - OpenRouter Fetch Client (createOpenRouterBatchModel)
     expect(getCallCount).toBe(2);
   });
 });
+
+describe("Batch Subsystem - OpenRouter per-request reported cost", () => {
+  const ref: EngineBatchRef = {
+    version: 1,
+    type: "text",
+    id: "batch-cost",
+    provider: "openrouter",
+    modelId: "openai/gpt-4o",
+  };
+
+  function completedBatch(items: unknown[]) {
+    return new Response(
+      JSON.stringify({
+        id: "batch-cost",
+        status: "completed",
+        request_counts: { total: items.length, completed: items.length },
+        usage: { prompt_tokens: 20, completion_tokens: 40, cost: 0.03 },
+        results: items,
+      }),
+      { status: 200, headers: { "Content-Type": "application/json" } },
+    );
+  }
+
+  it("asks for usage accounting on every request body", async () => {
+    let capturedBody = "";
+    const mockFetch = vi.fn(async (_url: unknown, init?: RequestInit) => {
+      capturedBody = init?.body as string;
+      return new Response(
+        JSON.stringify({ id: "batch-cost", status: "validating" }),
+        { status: 202, headers: { "Content-Type": "application/json" } },
+      );
+    });
+    const model = createOpenRouterBatchModel({
+      apiKey: "test-key",
+      modelId: "openai/gpt-4o",
+      fetch: mockFetch as any,
+    });
+
+    await model.start([{ id: "r1", prompt: "hi" }]);
+
+    const body = JSON.parse(capturedBody);
+    expect(body.requests[0].body.usage).toEqual({ include: true });
+  });
+
+  it("carries a per-request usage.cost as the item's reported cost", async () => {
+    const mockFetch = vi.fn(async () =>
+      completedBatch([
+        {
+          custom_id: "r1",
+          response: {
+            status_code: 200,
+            body: {
+              choices: [{ message: { content: "one" } }],
+              usage: { prompt_tokens: 10, completion_tokens: 20, cost: 0.01 },
+            },
+          },
+        },
+        {
+          custom_id: "r2",
+          response: {
+            status_code: 200,
+            body: {
+              choices: [{ message: { content: "two" } }],
+              // BYOK: `cost` is the routing fee; inference billed upstream.
+              usage: {
+                prompt_tokens: 10,
+                completion_tokens: 20,
+                cost: 0.001,
+                is_byok: true,
+                cost_details: { upstream_inference_cost: 0.019 },
+              },
+            },
+          },
+        },
+      ]),
+    );
+    const model = createOpenRouterBatchModel({
+      apiKey: "test-key",
+      modelId: "openai/gpt-4o",
+      fetch: mockFetch as any,
+    });
+
+    const items: EngineBatchItemResult[] = [];
+    for await (const item of model.results(ref)) items.push(item);
+
+    expect(items[0]).toMatchObject({
+      id: "r1",
+      status: "succeeded",
+      reportedCostUsd: 0.01,
+    });
+    expect(items[1]?.status).toBe("succeeded");
+    expect(
+      (items[1] as { reportedCostUsd?: number }).reportedCostUsd,
+    ).toBeCloseTo(0.02, 10);
+  });
+
+  it("omits the reported cost when a request's usage has no cost", async () => {
+    const mockFetch = vi.fn(async () =>
+      completedBatch([
+        {
+          custom_id: "r1",
+          response: {
+            status_code: 200,
+            body: {
+              choices: [{ message: { content: "one" } }],
+              usage: { prompt_tokens: 10, completion_tokens: 20 },
+            },
+          },
+        },
+      ]),
+    );
+    const model = createOpenRouterBatchModel({
+      apiKey: "test-key",
+      modelId: "openai/gpt-4o",
+      fetch: mockFetch as any,
+    });
+
+    const items: EngineBatchItemResult[] = [];
+    for await (const item of model.results(ref)) items.push(item);
+
+    expect(items[0]?.status).toBe("succeeded");
+    expect(items[0]).not.toHaveProperty("reportedCostUsd");
+  });
+});
