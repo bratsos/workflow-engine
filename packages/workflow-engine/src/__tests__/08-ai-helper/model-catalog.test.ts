@@ -150,6 +150,24 @@ describe("deriveBatchCapability", () => {
 });
 
 describe("toModelConfig", () => {
+  it("emits the cached-input rate only when the catalogue publishes input_cache_read", () => {
+    const cached = row("vendor/cached", {
+      pricing: {
+        prompt: "0.000001",
+        completion: "0.000002",
+        input_cache_read: "0.0000001",
+      },
+    });
+    expect(
+      toModelConfig(cached, catalogOf(cached)).cachedInputCostPerMillion,
+    ).toBe(0.1);
+
+    const plain = row("vendor/plain");
+    expect(
+      toModelConfig(plain, catalogOf(plain)).cachedInputCostPerMillion,
+    ).toBeUndefined();
+  });
+
   it("assembles a full registry entry from a catalog row", () => {
     const m = row("google/gemini-2.5-flash", {
       description: "d",

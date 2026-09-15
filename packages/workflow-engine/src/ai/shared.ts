@@ -116,12 +116,73 @@ export interface ProviderResultLike {
     raw?: Record<string, any>;
     [key: string]: any;
   };
+  /** Multi-step aggregate usage (streamText's onEnd event). */
+  totalUsage?: {
+    raw?: Record<string, any>;
+    [key: string]: any;
+  };
   finalStep?: {
     providerMetadata?: Record<string, any>;
     usage?: {
       raw?: Record<string, any>;
       [key: string]: any;
     };
+  };
+}
+
+export interface UsageDetails {
+  /** Input tokens served from the prompt cache; part of `inputTokens`. */
+  cachedInputTokens?: number;
+  /** Reasoning tokens the model emitted; part of `outputTokens`. */
+  reasoningTokens?: number;
+}
+
+function tokenCountOrUndefined(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? value
+    : undefined;
+}
+
+/**
+ * Cached-input and reasoning token counts, from the AI SDK 7 usage shape
+ * (`usage.inputTokenDetails.cacheReadTokens`,
+ * `usage.outputTokenDetails.reasoningTokens`) first, then OpenRouter's own
+ * accounting (`providerMetadata.openrouter.usage.promptTokensDetails.cachedTokens`,
+ * `...completionTokensDetails.reasoningTokens`) and the raw
+ * `prompt_tokens_details` / `completion_tokens_details` fields. Both sources
+ * report these as breakdowns of the prompt and completion totals, not in
+ * addition to them, so nothing here changes `inputTokens` or `outputTokens`.
+ * Never throws; a count that is absent everywhere stays undefined.
+ */
+export function extractUsageDetails(
+  result: ProviderResultLike | undefined | null,
+): UsageDetails {
+  if (!result || typeof result !== "object") {
+    return {};
+  }
+  const usage = result.usage ?? result.totalUsage ?? result.finalStep?.usage;
+  const openrouterUsage = (
+    result.providerMetadata?.openrouter ??
+    result.finalStep?.providerMetadata?.openrouter
+  )?.usage;
+  const raw = usage?.raw ?? result.finalStep?.usage?.raw;
+
+  const cachedInputTokens =
+    tokenCountOrUndefined(usage?.inputTokenDetails?.cacheReadTokens) ??
+    tokenCountOrUndefined(usage?.cachedInputTokens) ??
+    tokenCountOrUndefined(openrouterUsage?.promptTokensDetails?.cachedTokens) ??
+    tokenCountOrUndefined(raw?.prompt_tokens_details?.cached_tokens);
+  const reasoningTokens =
+    tokenCountOrUndefined(usage?.outputTokenDetails?.reasoningTokens) ??
+    tokenCountOrUndefined(usage?.reasoningTokens) ??
+    tokenCountOrUndefined(
+      openrouterUsage?.completionTokensDetails?.reasoningTokens,
+    ) ??
+    tokenCountOrUndefined(raw?.completion_tokens_details?.reasoning_tokens);
+
+  return {
+    ...(cachedInputTokens !== undefined ? { cachedInputTokens } : {}),
+    ...(reasoningTokens !== undefined ? { reasoningTokens } : {}),
   };
 }
 
@@ -179,10 +240,37 @@ export function extractReportedCost(
   return total;
 }
 
+/**
+ * The endpoint that served the request: OpenRouter's `provider` metadata
+ * (the upstream it routed to, e.g. "Google", "DeepInfra"). Undefined for
+ * providers that do not say.
+ */
+export function extractServedBy(
+  result: ProviderResultLike | undefined | null,
+): string | undefined {
+  if (!result || typeof result !== "object") {
+    return undefined;
+  }
+  const openrouterMeta =
+    result.providerMetadata?.openrouter ??
+    result.finalStep?.providerMetadata?.openrouter;
+  const served = openrouterMeta?.provider;
+  return typeof served === "string" && served.length > 0 ? served : undefined;
+}
+
 export interface CostResolution {
+  /** Authoritative figure: reported when available, else estimated. */
   cost: number;
+  /** The catalogue estimate, always computed. */
+  estimatedCostUsd: number;
   reportedCostUsd?: number;
   costSource: "reported" | "estimated";
+  /** The endpoint that served the request, when the provider names it. */
+  servedBy?: string;
+  /** Input tokens served from the prompt cache (part of `inputTokens`), when reported. */
+  cachedInputTokens?: number;
+  /** Reasoning tokens (part of `outputTokens`), when reported. */
+  reasoningTokens?: number;
 }
 
 /**
@@ -196,28 +284,39 @@ export function resolveCost(
   resultLike?: ProviderResultLike | unknown,
   isBatch: boolean = false,
 ): CostResolution {
+  const providerResult = resultLike as ProviderResultLike | undefined;
+  const usageDetails = extractUsageDetails(providerResult);
   const estimatedCost = calculateCostWithDiscount(
     modelKey,
     inputTokens,
     outputTokens,
     isBatch,
+    undefined,
+    usageDetails.cachedInputTokens,
   );
-  const reportedCostUsd = extractReportedCost(
-    resultLike as ProviderResultLike | undefined,
-  );
+  const reportedCostUsd = extractReportedCost(providerResult);
+  const servedBy = extractServedBy(providerResult);
+  const extras = {
+    ...(servedBy !== undefined ? { servedBy } : {}),
+    ...usageDetails,
+  };
 
   if (reportedCostUsd !== undefined) {
     return {
       cost: reportedCostUsd,
+      estimatedCostUsd: estimatedCost,
       reportedCostUsd,
       costSource: "reported",
+      ...extras,
     };
   }
 
   return {
     cost: estimatedCost,
+    estimatedCostUsd: estimatedCost,
     reportedCostUsd: undefined,
     costSource: "estimated",
+    ...extras,
   };
 }
 
@@ -278,12 +377,19 @@ export function calculateBatchCost(
   return baseCost;
 }
 
+/**
+ * The catalogue estimate for a call. `cachedInputTokens` (part of
+ * `inputTokens`) is billed at the model's cached-input rate on the realtime
+ * path; batch prices are absolute per-row figures with no published cache
+ * tier, so a batch estimate bills every input token at the batch rate.
+ */
 export function calculateCostWithDiscount(
   modelKey: ModelKey,
   inputTokens: number,
   outputTokens: number,
   isBatch: boolean = false,
   batchTransport?: string,
+  cachedInputTokens?: number,
 ): number {
   const model = getModel(modelKey);
 
@@ -291,7 +397,12 @@ export function calculateCostWithDiscount(
     return calculateBatchCost(model, inputTokens, outputTokens, batchTransport);
   }
 
-  const baseCost = calculateCost(modelKey, inputTokens, outputTokens);
+  const baseCost = calculateCost(
+    modelKey,
+    inputTokens,
+    outputTokens,
+    cachedInputTokens,
+  );
   return baseCost.totalCost;
 }
 

@@ -11,6 +11,7 @@ export interface OpenRouterPricingOverride {
   min_prompt_tokens?: number;
   prompt?: string;
   completion?: string;
+  input_cache_read?: string;
   [key: string]: unknown;
 }
 
@@ -26,6 +27,8 @@ export interface OpenRouterModel {
   pricing?: {
     prompt?: string;
     completion?: string;
+    /** Per-token price of a prompt-cache read; present only for models that publish cache pricing. */
+    input_cache_read?: string;
     overrides?: OpenRouterPricingOverride[];
   };
   supported_parameters?: string[];
@@ -180,7 +183,22 @@ export function deriveLongContextTier(
     minPromptTokens: override.min_prompt_tokens,
     inputCostPerMillion: perMillion(override.prompt),
     outputCostPerMillion: perMillion(override.completion),
+    ...(override.input_cache_read !== undefined && {
+      cachedInputCostPerMillion: perMillion(override.input_cache_read),
+    }),
   };
+}
+
+/**
+ * The cached-input rate, when the catalogue publishes one. OpenRouter omits
+ * `input_cache_read` for models without prompt caching, so absence means
+ * "bill every input token at the full rate", never zero.
+ */
+export function deriveCachedInputCost(
+  model: OpenRouterModel,
+): number | undefined {
+  const raw = model.pricing?.input_cache_read;
+  return raw === undefined ? undefined : perMillion(raw);
 }
 
 /** Build the registry entry for one catalog row. Pure. */
@@ -193,12 +211,16 @@ export function toModelConfig(
   const supportsStructuredOutputs =
     model.supported_parameters?.includes("structured_outputs") ?? false;
   const longContextTier = deriveLongContextTier(model);
+  const cachedInputCostPerMillion = deriveCachedInputCost(model);
 
   return {
     id: model.id,
     name: model.name,
     inputCostPerMillion: perMillion(model.pricing?.prompt),
     outputCostPerMillion: perMillion(model.pricing?.completion),
+    ...(cachedInputCostPerMillion !== undefined && {
+      cachedInputCostPerMillion,
+    }),
     provider: "openrouter",
     description: model.description,
     contextLength: model.top_provider?.context_length ?? model.context_length,

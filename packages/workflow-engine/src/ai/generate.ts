@@ -362,7 +362,15 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
       resultAny.inputTokens ?? resultAny.usage?.inputTokens ?? 0;
     const outputTokens =
       resultAny.outputTokens ?? resultAny.usage?.outputTokens ?? 0;
-    const { cost, reportedCostUsd, costSource } = resolveCost(
+    const {
+      cost,
+      estimatedCostUsd,
+      reportedCostUsd,
+      costSource,
+      servedBy,
+      cachedInputTokens,
+      reasoningTokens,
+    } = resolveCost(
       modelKey,
       inputTokens,
       outputTokens,
@@ -389,8 +397,12 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
       inputTokens,
       outputTokens,
       cost,
+      estimatedCost: estimatedCostUsd,
       reportedCost: reportedCostUsd,
       costSource,
+      servedBy,
+      cachedInputTokens,
+      reasoningTokens,
       metadata: {
         temperature: options.temperature,
         maxTokens: options.maxTokens,
@@ -574,7 +586,15 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
       resultAny.inputTokens ?? resultAny.usage?.inputTokens ?? 0;
     const outputTokens =
       resultAny.outputTokens ?? resultAny.usage?.outputTokens ?? 0;
-    const { cost, reportedCostUsd, costSource } = resolveCost(
+    const {
+      cost,
+      estimatedCostUsd,
+      reportedCostUsd,
+      costSource,
+      servedBy,
+      cachedInputTokens,
+      reasoningTokens,
+    } = resolveCost(
       modelKey,
       inputTokens,
       outputTokens,
@@ -599,8 +619,12 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
       inputTokens,
       outputTokens,
       cost,
+      estimatedCost: estimatedCostUsd,
       reportedCost: reportedCostUsd,
       costSource,
+      servedBy,
+      cachedInputTokens,
+      reasoningTokens,
       metadata: {
         temperature: options.temperature,
         maxTokens: options.maxTokens,

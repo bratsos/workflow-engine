@@ -694,7 +694,25 @@ const { text, cost, reportedCostUsd, costSource } = await ai.generateText(modelK
 
 Under BYOK the provider's `cost` is only the routing fee and the inference spend arrives separately as `upstream_inference_cost`; the engine adds it in that case and not otherwise, so the recorded number is the real spend either way. When a call is estimated, `costSource === "estimated"` tells you the number came from the registry, not the bill.
 
-Batch cost follows the transport actually used: a native google/anthropic/openai batch bills the vendor's documented discount (`batchDiscountPercent`), the OpenRouter transport bills the absolute price of the `:batch` catalog row (`batchInputCostPerMillion` / `batchOutputCostPerMillion`). Exactly one adjustment is applied, never both, and there is no cached-token bucket: on a Google batch that hits the implicit cache the flat discount *overstates* the cost of the cached tokens (see 06-async-batch-stages.md). `workflow-engine-sync` now emits absolute batch prices rather than `batchDiscountPercent`.
+### What the `ai_calls` row records
+
+Every call row (`AICallRecord`, read back with `aiLogger.listCalls(topicPrefix)`) carries the accounting behind that one number, so a consumer can compare the registry against the bill after the fact:
+
+| Field | Meaning |
+|---|---|
+| `cost` | The authoritative figure — `reportedCost` when the provider gave one, else `estimatedCost`. This is what `getStats` sums and what `WorkflowRun.totalCost` rolls up. |
+| `estimatedCost` | The registry figure, always computed: `inputCostPerMillion` / `outputCostPerMillion` (or the long-context tier), with cached input tokens priced at `cachedInputCostPerMillion` when the registry has one. |
+| `reportedCost` | The provider's own USD figure (OpenRouter's `usage.cost`, BYOK-adjusted; an adapter's `costUsd`). Absent when the provider reports none. |
+| `costSource` | `"reported"` or `"estimated"` — which of the two `cost` is. |
+| `servedBy` | The endpoint that served the request — OpenRouter's `provider` metadata (`"Google"`, `"DeepInfra"`, ...). Absent for providers that do not name one. |
+| `cachedInputTokens` | Input tokens served from the prompt cache. Part of `inputTokens`, not in addition to it. |
+| `reasoningTokens` | Reasoning tokens the model emitted. Part of `outputTokens` and billed as output; no separate charge. |
+
+The estimate bills `cachedInputTokens` at the model's `cachedInputCostPerMillion` (from OpenRouter's `pricing.input_cache_read`, which `workflow-engine-sync` emits when the catalogue publishes it) and the remaining input at the full rate; a registry entry without a cached rate bills every input token at the full rate. The token counts come from the AI SDK's `usage.inputTokenDetails.cacheReadTokens` / `usage.outputTokenDetails.reasoningTokens`, with OpenRouter's `promptTokensDetails.cachedTokens` / `completionTokensDetails.reasoningTokens` as the fallback. `AIHelper.recordCall` (an adapter recording its own call) writes `estimatedCost === cost` and `costSource: "estimated"`.
+
+A related figure that is *not* a cost: OpenRouter's `max_price` routing guard is the registry price times `routing.priceHeadroom` (default 1.25), so the estimate and the guard read the same price table. A `reportedCost` above `estimatedCost × priceHeadroom` on a row means the routed endpoint charged for something the per-token ceiling does not cover.
+
+Batch cost follows the transport actually used: a native google/anthropic/openai batch bills the vendor's documented discount (`batchDiscountPercent`), the OpenRouter transport bills the absolute price of the `:batch` catalog row (`batchInputCostPerMillion` / `batchOutputCostPerMillion`). Exactly one adjustment is applied, never both, and there is no cached-token bucket on the batch path: on a Google batch that hits the implicit cache the flat discount *overstates* the cost of the cached tokens (see 06-async-batch-stages.md). `workflow-engine-sync` now emits absolute batch prices rather than `batchDiscountPercent`.
 
 ## Model Configuration
 

@@ -78,9 +78,33 @@ export class InMemoryAICallLogger implements AICallLogger {
       cost: call.cost,
       ...(call.batchId !== undefined ? { batchId: call.batchId } : {}),
       ...(call.requestId !== undefined ? { requestId: call.requestId } : {}),
+      ...(call.estimatedCost !== undefined
+        ? { estimatedCost: call.estimatedCost }
+        : {}),
+      ...(call.reportedCost !== undefined
+        ? { reportedCost: call.reportedCost }
+        : {}),
+      ...(call.costSource !== undefined ? { costSource: call.costSource } : {}),
+      ...(call.servedBy !== undefined ? { servedBy: call.servedBy } : {}),
+      ...(call.cachedInputTokens !== undefined
+        ? { cachedInputTokens: call.cachedInputTokens }
+        : {}),
+      ...(call.reasoningTokens !== undefined
+        ? { reasoningTokens: call.reasoningTokens }
+        : {}),
       metadata: call.metadata ?? null,
     };
     this.calls.set(id, record);
+  }
+
+  /**
+   * List the calls under a topic prefix, in insertion order, with every
+   * cost figure as recorded.
+   */
+  async listCalls(topicPrefix: string): Promise<AICallRecord[]> {
+    return Array.from(this.calls.values())
+      .filter((call) => call.topic.startsWith(topicPrefix))
+      .map((c) => ({ ...c }));
   }
 
   /**

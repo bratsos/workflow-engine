@@ -15,6 +15,7 @@ import { calculateCost, registerModels } from "../../ai/model-helper.js";
 import {
   calculateCostWithDiscount,
   extractReportedCost,
+  extractUsageDetails,
   resolveCost,
 } from "../../ai/shared.js";
 
@@ -23,10 +24,12 @@ import {
 const MODEL_ID = "cost-test-model";
 const LONG_CTX_ID = "cost-test-long-context";
 const BATCH_ID = "cost-test-batch";
+const CACHED_ID = "cost-test-cached";
 
 const MODEL = MODEL_ID;
 const LONG_CTX_MODEL = LONG_CTX_ID;
 const BATCH_MODEL = BATCH_ID;
+const CACHED_MODEL = CACHED_ID;
 
 beforeAll(() => {
   registerModels({
@@ -66,6 +69,118 @@ beforeAll(() => {
       // prices above. Applying both is the triple-discount bug from 0.12.
       batchDiscountPercent: 50,
     },
+    [CACHED_ID]: {
+      id: "vendor/cached-test",
+      name: "Cached Test",
+      // $1/M in, $0.10/M cached in, $2/M out.
+      inputCostPerMillion: 1,
+      cachedInputCostPerMillion: 0.1,
+      outputCostPerMillion: 2,
+      provider: "openrouter",
+    },
+  });
+});
+
+describe("extractUsageDetails", () => {
+  it("returns nothing when no source reports a breakdown", () => {
+    expect(extractUsageDetails(undefined)).toEqual({});
+    expect(extractUsageDetails({ usage: { inputTokens: 10 } })).toEqual({});
+  });
+
+  it("reads the AI SDK 7 token details first", () => {
+    const details = extractUsageDetails({
+      usage: {
+        inputTokens: 100,
+        inputTokenDetails: { cacheReadTokens: 60 },
+        outputTokens: 50,
+        outputTokenDetails: { reasoningTokens: 20 },
+      },
+      providerMetadata: {
+        openrouter: {
+          usage: {
+            promptTokensDetails: { cachedTokens: 1 },
+            completionTokensDetails: { reasoningTokens: 1 },
+          },
+        },
+      },
+    });
+    expect(details).toEqual({ cachedInputTokens: 60, reasoningTokens: 20 });
+  });
+
+  it("falls back to OpenRouter's accounting, then the raw fields", () => {
+    expect(
+      extractUsageDetails({
+        usage: { inputTokens: 100, outputTokens: 50 },
+        providerMetadata: {
+          openrouter: {
+            usage: {
+              promptTokensDetails: { cachedTokens: 30 },
+              completionTokensDetails: { reasoningTokens: 5 },
+            },
+          },
+        },
+      }),
+    ).toEqual({ cachedInputTokens: 30, reasoningTokens: 5 });
+
+    expect(
+      extractUsageDetails({
+        usage: {
+          raw: {
+            prompt_tokens_details: { cached_tokens: 7 },
+            completion_tokens_details: { reasoning_tokens: 3 },
+          },
+        },
+      }),
+    ).toEqual({ cachedInputTokens: 7, reasoningTokens: 3 });
+  });
+
+  it("ignores malformed counts instead of propagating them", () => {
+    expect(
+      extractUsageDetails({
+        usage: {
+          inputTokenDetails: { cacheReadTokens: "lots" },
+          outputTokenDetails: { reasoningTokens: Number.NaN },
+        },
+      }),
+    ).toEqual({});
+  });
+});
+
+describe("cached input pricing", () => {
+  it("bills cached input tokens at the cached rate and the rest at the full rate", () => {
+    // 1M prompt tokens of which 600k came from the cache:
+    // 400k @ $1 + 600k @ $0.10 = $0.46, plus 1M out @ $2 = $2.46.
+    const { totalCost } = calculateCost(
+      CACHED_MODEL,
+      1_000_000,
+      1_000_000,
+      600_000,
+    );
+    expect(totalCost).toBeCloseTo(2.46, 10);
+  });
+
+  it("bills every input token at the full rate when the catalogue has no cached rate", () => {
+    const { totalCost } = calculateCost(MODEL, 1_000_000, 0, 600_000);
+    expect(totalCost).toBeCloseTo(1, 10);
+  });
+
+  it("never bills more cached tokens than there were input tokens", () => {
+    const { totalCost } = calculateCost(CACHED_MODEL, 100, 0, 1_000);
+    expect(totalCost).toBeCloseTo((100 / 1_000_000) * 0.1, 15);
+  });
+
+  it("resolveCost prices the cached tokens the result reports and carries the counts", () => {
+    const r = resolveCost(CACHED_MODEL, 1_000_000, 1_000_000, {
+      usage: {
+        inputTokenDetails: { cacheReadTokens: 600_000 },
+        outputTokenDetails: { reasoningTokens: 250_000 },
+      },
+    });
+    expect(r.costSource).toBe("estimated");
+    // Reasoning tokens are already inside outputTokens: no extra output charge.
+    expect(r.cost).toBeCloseTo(2.46, 10);
+    expect(r.cachedInputTokens).toBe(600_000);
+    expect(r.reasoningTokens).toBe(250_000);
   });
 });
 
@@ -159,6 +274,23 @@ describe("resolveCost", () => {
     expect(r.costSource).toBe("reported");
     expect(r.reportedCostUsd).toBe(0.42);
     expect(r.cost).toBe(0.42);
+  });
+
+  it("keeps the estimate beside a reported cost and names the serving endpoint", () => {
+    // A consumer comparing the catalogue against what the provider billed
+    // needs both figures on the same row, and which upstream served it.
+    const r = resolveCost(MODEL, 1_000_000, 1_000_000, {
+      providerMetadata: {
+        openrouter: { provider: "DeepInfra", usage: { cost: 0.42 } },
+      },
+    });
+    expect(r.cost).toBe(0.42);
+    expect(r.estimatedCostUsd).toBeCloseTo(3, 10);
+    expect(r.servedBy).toBe("DeepInfra");
+
+    const estimated = resolveCost(MODEL, 1_000_000, 1_000_000, undefined);
+    expect(estimated.estimatedCostUsd).toBeCloseTo(3, 10);
+    expect(estimated.servedBy).toBeUndefined();
   });
 });
 
