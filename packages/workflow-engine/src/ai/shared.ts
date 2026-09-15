@@ -179,10 +179,33 @@ export function extractReportedCost(
   return total;
 }
 
+/**
+ * The endpoint that served the request: OpenRouter's `provider` metadata
+ * (the upstream it routed to, e.g. "Google", "DeepInfra"). Undefined for
+ * providers that do not say.
+ */
+export function extractServedBy(
+  result: ProviderResultLike | undefined | null,
+): string | undefined {
+  if (!result || typeof result !== "object") {
+    return undefined;
+  }
+  const openrouterMeta =
+    result.providerMetadata?.openrouter ??
+    result.finalStep?.providerMetadata?.openrouter;
+  const served = openrouterMeta?.provider;
+  return typeof served === "string" && served.length > 0 ? served : undefined;
+}
+
 export interface CostResolution {
+  /** Authoritative figure: reported when available, else estimated. */
   cost: number;
+  /** The catalogue estimate, always computed. */
+  estimatedCostUsd: number;
   reportedCostUsd?: number;
   costSource: "reported" | "estimated";
+  /** The endpoint that served the request, when the provider names it. */
+  servedBy?: string;
 }
 
 /**
@@ -202,22 +225,26 @@ export function resolveCost(
     outputTokens,
     isBatch,
   );
-  const reportedCostUsd = extractReportedCost(
-    resultLike as ProviderResultLike | undefined,
-  );
+  const providerResult = resultLike as ProviderResultLike | undefined;
+  const reportedCostUsd = extractReportedCost(providerResult);
+  const servedBy = extractServedBy(providerResult);
 
   if (reportedCostUsd !== undefined) {
     return {
       cost: reportedCostUsd,
+      estimatedCostUsd: estimatedCost,
       reportedCostUsd,
       costSource: "reported",
+      ...(servedBy !== undefined ? { servedBy } : {}),
     };
   }
 
   return {
     cost: estimatedCost,
+    estimatedCostUsd: estimatedCost,
     reportedCostUsd: undefined,
     costSource: "estimated",
+    ...(servedBy !== undefined ? { servedBy } : {}),
   };
 }
 

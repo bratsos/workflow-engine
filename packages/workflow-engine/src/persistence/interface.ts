@@ -259,11 +259,18 @@ export interface AICallRecord {
   response: string;
   inputTokens: number;
   outputTokens: number;
+  /** Authoritative USD cost: the provider's figure when it reported one, else the catalogue estimate. */
   cost: number;
   batchId?: string;
   requestId?: string;
+  /** The catalogue estimate for this call, always computed even when the provider reported a cost. */
+  estimatedCost?: number;
+  /** The provider's own USD figure, when it reported one. */
   reportedCost?: number;
+  /** `"reported"` or `"estimated"` — which figure `cost` is. */
   costSource?: string;
+  /** The endpoint that served the request (OpenRouter's `provider` metadata), when known. */
+  servedBy?: string;
   metadata: unknown | null;
 }
 
@@ -494,11 +501,18 @@ export interface CreateAICallInput {
   response: string;
   inputTokens: number;
   outputTokens: number;
+  /** Authoritative USD cost: reported when the provider gave one, else estimated. Feeds the run cost rollup. */
   cost: number;
   batchId?: string;
   requestId?: string;
+  /** The catalogue estimate, always computed by the helper even when the provider reported a cost. */
+  estimatedCost?: number;
+  /** The provider's own USD figure, when it reported one. */
   reportedCost?: number;
+  /** `"reported"` or `"estimated"` — which figure `cost` is. */
   costSource?: string;
+  /** The endpoint that served the request (OpenRouter's `provider` metadata), when known. */
+  servedBy?: string;
   metadata?: unknown;
 }
 
@@ -991,6 +1005,15 @@ export interface AICallLogger {
    * Check if batch results are already recorded
    */
   isRecorded(batchId: string): Promise<boolean>;
+
+  /**
+   * List the calls recorded under a topic prefix, oldest first, with every
+   * cost figure (`cost`, `estimatedCost`, `reportedCost`, `costSource`,
+   * `servedBy`) as recorded. Optional so an adapter written before 1.0
+   * keeps compiling; the built-in adapters implement it and the
+   * conformance suite exercises it when present.
+   */
+  listCalls?(topicPrefix: string): Promise<AICallRecord[]>;
 }
 
 // ============================================================================

@@ -160,6 +160,23 @@ describe("resolveCost", () => {
     expect(r.reportedCostUsd).toBe(0.42);
     expect(r.cost).toBe(0.42);
   });
+
+  it("keeps the estimate beside a reported cost and names the serving endpoint", () => {
+    // A consumer comparing the catalogue against what the provider billed
+    // needs both figures on the same row, and which upstream served it.
+    const r = resolveCost(MODEL, 1_000_000, 1_000_000, {
+      providerMetadata: {
+        openrouter: { provider: "DeepInfra", usage: { cost: 0.42 } },
+      },
+    });
+    expect(r.cost).toBe(0.42);
+    expect(r.estimatedCostUsd).toBeCloseTo(3, 10);
+    expect(r.servedBy).toBe("DeepInfra");
+
+    const estimated = resolveCost(MODEL, 1_000_000, 1_000_000, undefined);
+    expect(estimated.estimatedCostUsd).toBeCloseTo(3, 10);
+    expect(estimated.servedBy).toBeUndefined();
+  });
 });
 
 describe("long-context pricing tier", () => {

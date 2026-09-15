@@ -179,12 +179,11 @@ export async function embed(
     }
 
     const outputTokens = 0; // Embeddings have no output tokens
-    const { cost, reportedCostUsd, costSource } = resolveCost(
-      modelKey,
-      totalInputTokens,
-      outputTokens,
-      { providerMetadata, costUsd: adapterCostUsd },
-    );
+    const { cost, estimatedCostUsd, reportedCostUsd, costSource, servedBy } =
+      resolveCost(modelKey, totalInputTokens, outputTokens, {
+        providerMetadata,
+        costUsd: adapterCostUsd,
+      });
     const durationMs = Date.now() - startTime;
 
     ctx.aiCallLogger.logCall({
@@ -197,8 +196,10 @@ export async function embed(
       inputTokens: totalInputTokens,
       outputTokens,
       cost,
+      estimatedCost: estimatedCostUsd,
       reportedCost: reportedCostUsd,
       costSource,
+      servedBy,
       metadata: {
         taskType: options.taskType,
         textCount: texts.length,

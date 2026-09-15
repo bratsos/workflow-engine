@@ -8,6 +8,7 @@
 import { createLogger } from "../../utils/logger";
 import type {
   AICallLogger,
+  AICallRecord,
   AIHelperStats,
   CreateAICallInput,
 } from "../interface";
@@ -48,6 +49,68 @@ function getBatchMetadata(
   };
 }
 
+/**
+ * The cost-accounting columns every write carries. All nullable in the
+ * schema; an input that omits one writes NULL, never a guessed figure.
+ */
+function costColumns(call: CreateAICallInput): {
+  estimatedCost: number | null;
+  reportedCost: number | null;
+  costSource: string | null;
+  servedBy: string | null;
+} {
+  return {
+    estimatedCost: call.estimatedCost ?? null,
+    reportedCost: call.reportedCost ?? null,
+    costSource: call.costSource ?? null,
+    servedBy: call.servedBy ?? null,
+  };
+}
+
+interface AICallRow {
+  id: string;
+  createdAt: Date;
+  topic: string;
+  callType: string;
+  modelKey: string;
+  modelId: string;
+  prompt: string;
+  response: string;
+  inputTokens: number;
+  outputTokens: number;
+  cost: number;
+  estimatedCost: number | null;
+  reportedCost: number | null;
+  costSource: string | null;
+  servedBy: string | null;
+  batchId: string | null;
+  requestId: string | null;
+  metadata: unknown;
+}
+
+function toRecord(row: AICallRow): AICallRecord {
+  return {
+    id: row.id,
+    createdAt: row.createdAt,
+    topic: row.topic,
+    callType: row.callType,
+    modelKey: row.modelKey,
+    modelId: row.modelId,
+    prompt: row.prompt,
+    response: row.response,
+    inputTokens: row.inputTokens,
+    outputTokens: row.outputTokens,
+    cost: row.cost,
+    ...(row.batchId !== null ? { batchId: row.batchId } : {}),
+    ...(row.requestId !== null ? { requestId: row.requestId } : {}),
+    ...(row.estimatedCost !== null ? { estimatedCost: row.estimatedCost } : {}),
+    ...(row.reportedCost !== null ? { reportedCost: row.reportedCost } : {}),
+    ...(row.costSource !== null ? { costSource: row.costSource } : {}),
+    ...(row.servedBy !== null ? { servedBy: row.servedBy } : {}),
+    metadata: row.metadata ?? null,
+  };
+}
+
 export class PrismaAICallLogger implements AICallLogger {
   constructor(private readonly prisma: PrismaClient) {}
 
@@ -68,6 +131,7 @@ export class PrismaAICallLogger implements AICallLogger {
           inputTokens: call.inputTokens,
           outputTokens: call.outputTokens,
           cost: call.cost,
+          ...costColumns(call),
           metadata: call.metadata as unknown,
           ...(call.batchId !== undefined ? { batchId: call.batchId } : {}),
           ...(call.requestId !== undefined
@@ -109,6 +173,7 @@ export class PrismaAICallLogger implements AICallLogger {
           inputTokens: call.inputTokens,
           outputTokens: call.outputTokens,
           cost: call.cost,
+          ...costColumns(call),
           batchId,
           ...(requestId !== undefined ? { requestId } : {}),
           metadata: getBatchMetadata(call.metadata, batchId, requestId),
@@ -187,6 +252,18 @@ export class PrismaAICallLogger implements AICallLogger {
       },
     });
     return count > 0;
+  }
+
+  /**
+   * List the calls under a topic prefix, oldest first, with every cost
+   * figure as recorded.
+   */
+  async listCalls(topicPrefix: string): Promise<AICallRecord[]> {
+    const rows = (await this.prisma.aICall.findMany({
+      where: { topic: { startsWith: topicPrefix } },
+      orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+    })) as AICallRow[];
+    return rows.map(toRecord);
   }
 }
 

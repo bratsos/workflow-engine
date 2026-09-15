@@ -2214,6 +2214,68 @@ export function aiCallLoggerConformanceSuite(
       });
     });
 
+    describe("cost accounting", () => {
+      // `listCalls` is optional on the port so an adapter written before
+      // 1.0 keeps compiling; the built-in adapters implement it, and an
+      // adapter that omits it only proves here that the fields are accepted.
+      async function listCalls(prefix: string) {
+        return logger.listCalls ? await logger.listCalls(prefix) : undefined;
+      }
+
+      it("records a reported call with both figures, the source and the serving endpoint", async () => {
+        // Given: a call the provider priced itself, alongside the catalogue estimate
+        logger.logCall(
+          createCallInput({
+            topic: "workflow.cost.reported",
+            cost: 0.0021,
+            estimatedCost: 0.0015,
+            reportedCost: 0.0021,
+            costSource: "reported",
+            servedBy: "Google",
+          }),
+        );
+        await sleep(100);
+
+        // When: reading the call back
+        const calls = await listCalls("workflow.cost.reported");
+        if (calls === undefined) return;
+
+        // Then: `cost` is the reported figure and the estimate survives beside it
+        expect(calls).toHaveLength(1);
+        expect(calls[0]!.cost).toBe(0.0021);
+        expect(calls[0]!.estimatedCost).toBe(0.0015);
+        expect(calls[0]!.reportedCost).toBe(0.0021);
+        expect(calls[0]!.costSource).toBe("reported");
+        expect(calls[0]!.servedBy).toBe("Google");
+      });
+
+      it("records an estimated call with no reported figure, through the batch path too", async () => {
+        // Given: a batch result the provider did not price
+        await logger.logBatchResults("cost-batch", [
+          createCallInput({
+            topic: "workflow.cost.estimated",
+            requestId: "request-1",
+            cost: 0.0015,
+            estimatedCost: 0.0015,
+            costSource: "estimated",
+          }),
+        ]);
+
+        // When: reading the call back
+        const calls = await listCalls("workflow.cost.estimated");
+        if (calls === undefined) return;
+
+        // Then: `cost` is the estimate, and nothing was invented for the reported figure
+        expect(calls).toHaveLength(1);
+        expect(calls[0]!.cost).toBe(0.0015);
+        expect(calls[0]!.estimatedCost).toBe(0.0015);
+        expect(calls[0]!.reportedCost).toBeUndefined();
+        expect(calls[0]!.costSource).toBe("estimated");
+        expect(calls[0]!.servedBy).toBeUndefined();
+        expect(calls[0]!.batchId).toBe("cost-batch");
+      });
+    });
+
     describe("isRecorded operation", () => {
       it("should return false for unrecorded batch", async () => {
         // When: Checking unrecorded batch

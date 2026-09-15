@@ -225,20 +225,24 @@ model WorkflowArtifact {
 }
 
 model AICall {
-  id           String   @id @default(cuid())
-  createdAt    DateTime @default(now())
-  topic        String
-  callType     String
-  modelKey     String
-  modelId      String
-  prompt       String   @db.Text
-  response     String   @db.Text
-  inputTokens  Int
-  outputTokens Int
-  cost         Float
-  batchId      String?
-  requestId    String?
-  metadata     Json?
+  id            String   @id @default(cuid())
+  createdAt     DateTime @default(now())
+  topic         String
+  callType      String
+  modelKey      String
+  modelId       String
+  prompt        String   @db.Text
+  response      String   @db.Text
+  inputTokens   Int
+  outputTokens  Int
+  cost          Float
+  estimatedCost Float?
+  reportedCost  Float?
+  costSource    String?
+  servedBy      String?
+  batchId       String?
+  requestId     String?
+  metadata      Json?
 
   @@unique([batchId, requestId], map: "ai_calls_batch_request_unique")
   @@index([batchId])
