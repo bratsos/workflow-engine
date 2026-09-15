@@ -694,6 +694,10 @@ const { text, cost, reportedCostUsd, costSource } = await ai.generateText(modelK
 
 Under BYOK the provider's `cost` is only the routing fee and the inference spend arrives separately as `upstream_inference_cost`; the engine adds it in that case and not otherwise, so the recorded number is the real spend either way. When a call is estimated, `costSource === "estimated"` tells you the number came from the registry, not the bill.
 
+A tool-calling call runs several model steps and the provider reports a cost per step. `generateText`, `generateObject` and the stream's `getUsage()` sum those per-step figures into the call's `reportedCostUsd` (each step read with the same BYOK rule). The sum is used only when every step that consumed tokens reported a cost; if any such step did not, the whole call is estimated from the registry (`costSource === "estimated"`) rather than recorded as a partial bill, and the step that lacked a figure is logged at DEBUG.
+
+Batch rows follow the same two-number rule per request. The OpenRouter transport asks for usage accounting on every request and, when a request's result carries `usage.cost`, records it as that row's `reportedCost` with `costSource: "reported"`; a request without it falls back to the batch estimate. The vendor transports (google/anthropic/openai through `@ai-sdk/*`) return tokens only in their batch results, so every row on those transports is `costSource: "estimated"`.
+
 Batch cost follows the transport actually used: a native google/anthropic/openai batch bills the vendor's documented discount (`batchDiscountPercent`), the OpenRouter transport bills the absolute price of the `:batch` catalog row (`batchInputCostPerMillion` / `batchOutputCostPerMillion`). Exactly one adjustment is applied, never both, and there is no cached-token bucket: on a Google batch that hits the implicit cache the flat discount *overstates* the cost of the cached tokens (see 06-async-batch-stages.md). `workflow-engine-sync` now emits absolute batch prices rather than `batchDiscountPercent`.
 
 ## Model Configuration
