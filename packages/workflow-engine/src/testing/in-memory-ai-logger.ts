@@ -86,6 +86,12 @@ export class InMemoryAICallLogger implements AICallLogger {
         : {}),
       ...(call.costSource !== undefined ? { costSource: call.costSource } : {}),
       ...(call.servedBy !== undefined ? { servedBy: call.servedBy } : {}),
+      ...(call.cachedInputTokens !== undefined
+        ? { cachedInputTokens: call.cachedInputTokens }
+        : {}),
+      ...(call.reasoningTokens !== undefined
+        ? { reasoningTokens: call.reasoningTokens }
+        : {}),
       metadata: call.metadata ?? null,
     };
     this.calls.set(id, record);

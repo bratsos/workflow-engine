@@ -362,18 +362,25 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
       resultAny.inputTokens ?? resultAny.usage?.inputTokens ?? 0;
     const outputTokens =
       resultAny.outputTokens ?? resultAny.usage?.outputTokens ?? 0;
-    const { cost, estimatedCostUsd, reportedCostUsd, costSource, servedBy } =
-      resolveCost(
-        modelKey,
-        inputTokens,
-        outputTokens,
-        isAdapter
-          ? {
-              providerMetadata: resultAny.providerMetadata,
-              costUsd: resultAny.costUsd,
-            }
-          : result,
-      );
+    const {
+      cost,
+      estimatedCostUsd,
+      reportedCostUsd,
+      costSource,
+      servedBy,
+      cachedInputTokens,
+      reasoningTokens,
+    } = resolveCost(
+      modelKey,
+      inputTokens,
+      outputTokens,
+      isAdapter
+        ? {
+            providerMetadata: resultAny.providerMetadata,
+            costUsd: resultAny.costUsd,
+          }
+        : result,
+    );
     const durationMs = Date.now() - startTime;
     // Reasoning models emit on a separate channel; surface it so a
     // reasoning-only response isn't seen as empty output.
@@ -394,6 +401,8 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
       reportedCost: reportedCostUsd,
       costSource,
       servedBy,
+      cachedInputTokens,
+      reasoningTokens,
       metadata: {
         temperature: options.temperature,
         maxTokens: options.maxTokens,
@@ -577,18 +586,25 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
       resultAny.inputTokens ?? resultAny.usage?.inputTokens ?? 0;
     const outputTokens =
       resultAny.outputTokens ?? resultAny.usage?.outputTokens ?? 0;
-    const { cost, estimatedCostUsd, reportedCostUsd, costSource, servedBy } =
-      resolveCost(
-        modelKey,
-        inputTokens,
-        outputTokens,
-        isAdapter
-          ? {
-              providerMetadata: resultAny.providerMetadata,
-              costUsd: resultAny.costUsd,
-            }
-          : result,
-      );
+    const {
+      cost,
+      estimatedCostUsd,
+      reportedCostUsd,
+      costSource,
+      servedBy,
+      cachedInputTokens,
+      reasoningTokens,
+    } = resolveCost(
+      modelKey,
+      inputTokens,
+      outputTokens,
+      isAdapter
+        ? {
+            providerMetadata: resultAny.providerMetadata,
+            costUsd: resultAny.costUsd,
+          }
+        : result,
+    );
     const durationMs = Date.now() - startTime;
 
     // Log the call (including error cases where finishReason is "error")
@@ -607,6 +623,8 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
       reportedCost: reportedCostUsd,
       costSource,
       servedBy,
+      cachedInputTokens,
+      reasoningTokens,
       metadata: {
         temperature: options.temperature,
         maxTokens: options.maxTokens,

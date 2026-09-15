@@ -2232,6 +2232,8 @@ export function aiCallLoggerConformanceSuite(
             reportedCost: 0.0021,
             costSource: "reported",
             servedBy: "Google",
+            cachedInputTokens: 40,
+            reasoningTokens: 10,
           }),
         );
         await sleep(100);
@@ -2247,6 +2249,8 @@ export function aiCallLoggerConformanceSuite(
         expect(calls[0]!.reportedCost).toBe(0.0021);
         expect(calls[0]!.costSource).toBe("reported");
         expect(calls[0]!.servedBy).toBe("Google");
+        expect(calls[0]!.cachedInputTokens).toBe(40);
+        expect(calls[0]!.reasoningTokens).toBe(10);
       });
 
       it("records an estimated call with no reported figure, through the batch path too", async () => {
@@ -2272,6 +2276,8 @@ export function aiCallLoggerConformanceSuite(
         expect(calls[0]!.reportedCost).toBeUndefined();
         expect(calls[0]!.costSource).toBe("estimated");
         expect(calls[0]!.servedBy).toBeUndefined();
+        expect(calls[0]!.cachedInputTokens).toBeUndefined();
+        expect(calls[0]!.reasoningTokens).toBeUndefined();
         expect(calls[0]!.batchId).toBe("cost-batch");
       });
     });

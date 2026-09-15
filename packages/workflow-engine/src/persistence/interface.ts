@@ -271,6 +271,10 @@ export interface AICallRecord {
   costSource?: string;
   /** The endpoint that served the request (OpenRouter's `provider` metadata), when known. */
   servedBy?: string;
+  /** Input tokens served from the prompt cache (part of `inputTokens`, not in addition to it). */
+  cachedInputTokens?: number;
+  /** Reasoning tokens the model emitted (part of `outputTokens`, billed as output). */
+  reasoningTokens?: number;
   metadata: unknown | null;
 }
 
@@ -513,6 +517,10 @@ export interface CreateAICallInput {
   costSource?: string;
   /** The endpoint that served the request (OpenRouter's `provider` metadata), when known. */
   servedBy?: string;
+  /** Input tokens served from the prompt cache (part of `inputTokens`, not in addition to it). */
+  cachedInputTokens?: number;
+  /** Reasoning tokens the model emitted (part of `outputTokens`, billed as output). */
+  reasoningTokens?: number;
   metadata?: unknown;
 }
 

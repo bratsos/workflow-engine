@@ -110,8 +110,15 @@ export function streamText(
   ) => {
     if (usageResolved) return cachedUsage!;
 
-    const { cost, estimatedCostUsd, reportedCostUsd, costSource, servedBy } =
-      resolveCost(modelKey, inputTokens, outputTokens, resultLike);
+    const {
+      cost,
+      estimatedCostUsd,
+      reportedCostUsd,
+      costSource,
+      servedBy,
+      cachedInputTokens,
+      reasoningTokens,
+    } = resolveCost(modelKey, inputTokens, outputTokens, resultLike);
     const durationMs = Date.now() - startTime;
 
     usageResolved = true;
@@ -149,6 +156,8 @@ export function streamText(
       reportedCost: reportedCostUsd,
       costSource,
       servedBy,
+      cachedInputTokens,
+      reasoningTokens,
       metadata: {
         temperature: options.temperature,
         maxTokens: options.maxTokens,

@@ -240,6 +240,8 @@ model AICall {
   reportedCost  Float?
   costSource    String?
   servedBy      String?
+  cachedInputTokens Int?
+  reasoningTokens   Int?
   batchId       String?
   requestId     String?
   metadata      Json?

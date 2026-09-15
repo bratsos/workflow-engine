@@ -58,12 +58,16 @@ function costColumns(call: CreateAICallInput): {
   reportedCost: number | null;
   costSource: string | null;
   servedBy: string | null;
+  cachedInputTokens: number | null;
+  reasoningTokens: number | null;
 } {
   return {
     estimatedCost: call.estimatedCost ?? null,
     reportedCost: call.reportedCost ?? null,
     costSource: call.costSource ?? null,
     servedBy: call.servedBy ?? null,
+    cachedInputTokens: call.cachedInputTokens ?? null,
+    reasoningTokens: call.reasoningTokens ?? null,
   };
 }
 
@@ -83,6 +87,8 @@ interface AICallRow {
   reportedCost: number | null;
   costSource: string | null;
   servedBy: string | null;
+  cachedInputTokens: number | null;
+  reasoningTokens: number | null;
   batchId: string | null;
   requestId: string | null;
   metadata: unknown;
@@ -107,6 +113,12 @@ function toRecord(row: AICallRow): AICallRecord {
     ...(row.reportedCost !== null ? { reportedCost: row.reportedCost } : {}),
     ...(row.costSource !== null ? { costSource: row.costSource } : {}),
     ...(row.servedBy !== null ? { servedBy: row.servedBy } : {}),
+    ...(row.cachedInputTokens !== null
+      ? { cachedInputTokens: row.cachedInputTokens }
+      : {}),
+    ...(row.reasoningTokens !== null
+      ? { reasoningTokens: row.reasoningTokens }
+      : {}),
     metadata: row.metadata ?? null,
   };
 }
