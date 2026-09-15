@@ -37,16 +37,20 @@ import type {
 /**
  * The per-request cost a transport reported, carried on the result object
  * so it survives the trip through `getResults()` to `recordResults()`.
- * `AIBatchResult` does not declare the field; it is read structurally.
  */
-function reportedCostOf(result: unknown): number | undefined {
-  const value = (result as { reportedCostUsd?: unknown } | undefined)
-    ?.reportedCostUsd;
+function reportedCostOf(result: AIBatchResult<unknown>): number | undefined {
+  const value = result.reportedCostUsd;
   return typeof value === "number" && Number.isFinite(value)
     ? value
     : undefined;
 }
 
+/**
+ * The accounting the transport attached to a provider-successful item.
+ * Independent of local validation: a response that fails JSON parsing or
+ * the request's schema was still billed by the provider, so the figure
+ * travels with the failed result too.
+ */
 function reportedCostField(
   item: EngineBatchItemResult,
 ): { reportedCostUsd: number } | Record<string, never> {
@@ -877,6 +881,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
               error: `Failed to parse JSON response for schema validation: ${parseError}`,
               validated: false,
               responseText: item.text,
+              ...reportedCostField(item),
             });
             continue;
           }
@@ -906,6 +911,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
               error: `Schema validation threw an error: ${errText}`,
               validated: false,
               responseText: item.text,
+              ...reportedCostField(item),
             });
             continue;
           }
@@ -922,6 +928,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
               error: `Response did not match the request's schema: ${validation.error.message}`,
               validated: false,
               responseText: item.text,
+              ...reportedCostField(item),
             });
             continue;
           }

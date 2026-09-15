@@ -403,6 +403,12 @@ export type AIBatchResult<T = string> =
        * no schema was available (e.g. after a suspend/resume without re-supplying schemas).
        */
       validated?: boolean;
+      /**
+       * USD cost the transport reported for this request (OpenRouter with
+       * usage accounting), when it reports one. Absent on the vendor
+       * transports; `recordResults` then bills the batch estimate.
+       */
+      reportedCostUsd?: number;
     }
   | {
       id: string;
@@ -422,6 +428,13 @@ export type AIBatchResult<T = string> =
        * itself failed the request). Stored on the accounting row.
        */
       responseText?: string;
+      /**
+       * USD cost the transport reported for this request. A response the
+       * provider served but that failed local JSON parsing or schema
+       * validation was still billed, so the figure is kept here for
+       * `recordResults`. Absent when the provider itself failed the request.
+       */
+      reportedCostUsd?: number;
     };
 
 /** Handle for tracking a submitted batch */

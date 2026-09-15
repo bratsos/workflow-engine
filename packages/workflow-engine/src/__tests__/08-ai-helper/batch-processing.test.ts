@@ -779,13 +779,71 @@ describe("AIBatchImpl and AIHelper batch wiring", () => {
         status: "succeeded",
         validated: true,
         reportedCostUsd: 0.0123,
-      } as any,
+      },
     ]);
 
     const row = loggedBatchResults[0]?.records[0];
     expect(row?.cost).toBe(0.0123);
     expect(row?.reportedCost).toBe(0.0123);
     expect(row?.costSource).toBe("reported");
+  });
+
+  it("keeps the provider's reported cost on a result that fails schema validation", async () => {
+    // The provider served (and billed) the response; only the local JSON
+    // parse / schema check failed. The ledger row must still carry the
+    // reported charge, not a token estimate of it.
+    const mockBatchModel = {
+      provider: "openrouter",
+      modelId: "openai/gpt-4o",
+      start: vi.fn(),
+      status: vi.fn(async () => ({ status: "completed" as const })),
+      results: vi.fn(async function* () {
+        yield {
+          id: "r-bad-json",
+          status: "succeeded" as const,
+          text: "not json at all",
+          inputTokens: 100,
+          outputTokens: 20,
+          reportedCostUsd: 0.12,
+        };
+        yield {
+          id: "r-wrong-shape",
+          status: "succeeded" as const,
+          text: JSON.stringify({ a: 1 }),
+          inputTokens: 100,
+          outputTokens: 20,
+          reportedCostUsd: 0.05,
+        };
+      }),
+    };
+    const { logger, loggedBatchResults } = makeFakeAICallLogger();
+    const ctx = { topic: "test", aiCallLogger: logger as any };
+    const batch = new AIBatchImpl(ctx, "gemini-2.5-flash", "openrouter");
+    (batch as any).providerPromise = Promise.resolve(mockBatchModel);
+
+    const schema = z.object({ a: z.string() });
+    const results = await batch.getResults("b-validation", {
+      schemas: { "r-bad-json": schema, "r-wrong-shape": schema },
+    });
+
+    expect(results.map((r) => r.status)).toEqual(["failed", "failed"]);
+    expect(results.map((r) => r.reportedCostUsd)).toEqual([0.12, 0.05]);
+
+    const rows = loggedBatchResults[0]?.records ?? [];
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toMatchObject({
+      requestId: "r-bad-json",
+      cost: 0.12,
+      reportedCost: 0.12,
+      costSource: "reported",
+      metadata: expect.objectContaining({ status: "failed" }),
+    });
+    expect(rows[1]).toMatchObject({
+      requestId: "r-wrong-shape",
+      cost: 0.05,
+      reportedCost: 0.05,
+      costSource: "reported",
+    });
   });
 
   it("falls back to the batch estimate when no per-request cost was reported", async () => {
