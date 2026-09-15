@@ -321,8 +321,14 @@ interface AICallLogger {
   logBatchResults(batchId: string, results: CreateAICallInput[]): Promise<void>;
   getStats(topicPrefix: string): Promise<AIHelperStats>;
   isRecorded(batchId: string): Promise<boolean>;
+  // Optional: the rows under a prefix, oldest first, with every cost figure
+  // (cost, estimatedCost, reportedCost, costSource, servedBy, cachedInputTokens,
+  // reasoningTokens) as recorded. The built-in adapters implement it.
+  listCalls?(topicPrefix: string): Promise<AICallRecord[]>;
 }
 ```
+
+`CreateAICallInput` carries `estimatedCost`, `reportedCost`, `costSource`, `servedBy`, `cachedInputTokens` and `reasoningTokens` alongside `cost`; all optional, so an adapter that stores only `cost` keeps compiling and keeps the run cost rollup correct, but cannot answer "what did the registry think this call would cost" afterwards. See 04-ai-integration.md for what each field means.
 
 ## StepLedger Interface
 
