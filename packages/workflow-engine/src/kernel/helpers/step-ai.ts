@@ -1,5 +1,5 @@
 /**
- * Durable AI steps: `ctx.step.ai.generateText/generateObject/map`.
+ * Durable AI steps: `ctx.step.ai.generateText/generateObject/streamText/evaluate/map`.
  *
  * Every model call is memoized through `step.run`. `map` chooses between a
  * realtime path (one durable step per item, in-process concurrency, budget)
@@ -16,9 +16,13 @@ import type {
   AIBatchProvider,
   AIBatchRequest,
   AIBatchResult,
+  AIEvaluateResult,
   AIHelper,
   AIObjectResult,
   AITextResult,
+  EvaluateOptions,
+  EvaluationQuestions,
+  EvaluationSpec,
   ObjectOptions,
   StreamOptions,
   StreamTextInput,
@@ -182,6 +186,24 @@ function pickObjectResult<T>(result: AIObjectResult<T>): AIObjectResult<T> {
       ? { costSource: result.costSource }
       : {}),
     ...(result.reasoning !== undefined ? { reasoning: result.reasoning } : {}),
+  };
+}
+
+/** What a durable evaluate step stores: the result without undefined fields. */
+function pickEvaluateResult<Q extends EvaluationQuestions>(
+  result: AIEvaluateResult<Q>,
+): AIEvaluateResult<Q> {
+  return {
+    answers: result.answers,
+    inputTokens: result.inputTokens,
+    outputTokens: result.outputTokens,
+    cost: result.cost,
+    ...(result.reportedCostUsd !== undefined
+      ? { reportedCostUsd: result.reportedCostUsd }
+      : {}),
+    ...(result.costSource !== undefined
+      ? { costSource: result.costSource }
+      : {}),
   };
 }
 
@@ -448,6 +470,21 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
     );
     if (replayed) options?.onChunk?.(result.text);
     return result;
+  }
+
+  async function evaluate<const Q extends EvaluationQuestions>(
+    id: string,
+    modelKey: ModelKey,
+    spec: EvaluationSpec<Q>,
+    options?: EvaluateOptions,
+    stepOptions?: StepRunOptions,
+  ): Promise<AIEvaluateResult<Q>> {
+    return deps.run(
+      id,
+      async () =>
+        pickEvaluateResult(await deps.ai().evaluate(modelKey, spec, options)),
+      stepOptions,
+    );
   }
 
   async function map<TIn, TOut = string>(
@@ -1160,5 +1197,5 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
     return results;
   }
 
-  return { generateText, generateObject, streamText, map };
+  return { generateText, generateObject, streamText, evaluate, map };
 }

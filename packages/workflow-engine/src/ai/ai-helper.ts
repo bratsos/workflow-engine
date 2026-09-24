@@ -26,6 +26,7 @@ import type { AICallLogger } from "../persistence";
 import { getBestProviderForModel } from "../utils/batch/model-mapping";
 import { AIBatchImpl } from "./batch-helper";
 import { embed as embedImpl } from "./embeddings";
+import { evaluate as evaluateImpl } from "./evaluate";
 import {
   generateObject as generateObjectImpl,
   generateText as generateTextImpl,
@@ -37,6 +38,7 @@ import type {
   AIBatch,
   AIBatchProvider,
   AIEmbedResult,
+  AIEvaluateResult,
   AIHelper,
   AIHelperContext,
   AIHelperOptions,
@@ -47,6 +49,9 @@ import type {
   BatchLogFn,
   BatchOptions,
   EmbedOptions,
+  EvaluateOptions,
+  EvaluationQuestions,
+  EvaluationSpec,
   LogContext,
   ObjectOptions,
   ProviderResolver,
@@ -155,6 +160,14 @@ class AIHelperImpl implements AIHelper {
     options?: StreamOptions,
   ): AIStreamResult {
     return streamTextImpl(this.context(), modelKey, input, options);
+  }
+
+  evaluate<const Q extends EvaluationQuestions>(
+    modelKey: ModelKey,
+    spec: EvaluationSpec<Q>,
+    options?: EvaluateOptions,
+  ): Promise<AIEvaluateResult<Q>> {
+    return evaluateImpl(this.context(), modelKey, spec, options);
   }
 
   batch<T = string>(
@@ -278,6 +291,10 @@ export {
   registerEmbeddingProvider,
 } from "./embeddings";
 export { AICallTimeoutError } from "./errors.js";
+export {
+  getEvaluationModelProvider,
+  registerEvaluationProvider,
+} from "./evaluate";
 export type { ModelKey } from "./model-helper";
 export type {
   AdapterEmbedRequest,
@@ -297,6 +314,7 @@ export type {
   AIBatchSubmitOptions,
   AICallType,
   AIEmbedResult,
+  AIEvaluateResult,
   AIHelper,
   AIHelperOptions,
   AIHelperStats,
@@ -309,6 +327,12 @@ export type {
   BatchReclaimPolicy,
   ContentPart,
   EmbedOptions,
+  EvaluateOptions,
+  EvaluationAnswer,
+  EvaluationInput,
+  EvaluationQuestion,
+  EvaluationQuestions,
+  EvaluationSpec,
   LogContext,
   MediaPart,
   ObjectOptions,

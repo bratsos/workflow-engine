@@ -34,7 +34,13 @@ export type ProviderResolver = (
   modelConfig: ModelConfig,
 ) => import("@ai-sdk/provider").LanguageModelV4 | null | undefined;
 
-export type AICallType = "text" | "object" | "embed" | "stream" | "batch";
+export type AICallType =
+  | "text"
+  | "object"
+  | "embed"
+  | "stream"
+  | "batch"
+  | "evaluate";
 
 /** Normalized request passed to an adapter for text generation. */
 export interface AdapterTextRequest {
@@ -149,6 +155,120 @@ export interface AIObjectResult<T> {
   /** Whether `cost` came from the provider or from the static price table. */
   costSource?: "reported" | "estimated";
   reasoning?: string;
+}
+
+// ============================================================================
+// Evaluation (decision models such as TypeSafe's Jev)
+// ============================================================================
+
+/**
+ * Shared state, instructions, or a criterion description for an evaluation:
+ * plain text, a JSON object, or a JSON array.
+ */
+export type EvaluationInput =
+  | string
+  | Readonly<import("@ai-sdk/provider").JSONObject>
+  | readonly import("@ai-sdk/provider").JSONValue[];
+
+/**
+ * One judgment to make about the shared state.
+ *
+ * - `choice`: pick one of the named options in `criteria`.
+ * - `score`: place the state on an ordered scale; `criteria` lists the
+ *   levels from lowest to highest (at least two).
+ * - `boolean`: the probability that the statement in `instructions` is true.
+ *   `criteria` is optional; when given, both `true` and `false` must be.
+ */
+export type EvaluationQuestion =
+  | {
+      readonly type: "choice";
+      readonly instructions: EvaluationInput;
+      /** Option name to description. At least one option. */
+      readonly criteria: Readonly<Record<string, EvaluationInput | null>>;
+    }
+  | {
+      readonly type: "score";
+      readonly instructions: EvaluationInput;
+      /** Ordered levels, lowest first, indexed from zero. */
+      readonly criteria: readonly (EvaluationInput | null)[];
+    }
+  | {
+      readonly type: "boolean";
+      readonly instructions: EvaluationInput;
+      readonly criteria?: {
+        readonly true?: EvaluationInput | null;
+        readonly false?: EvaluationInput | null;
+      };
+    };
+
+/** The questions of one evaluation, keyed by the id each answer comes back under. */
+export type EvaluationQuestions = Readonly<Record<string, EvaluationQuestion>>;
+
+/**
+ * The typed answer to one question, derived from that question:
+ * a `choice` answer's `choice` is the union of its criteria keys.
+ */
+export type EvaluationAnswer<Q extends EvaluationQuestion> = Q extends {
+  type: "choice";
+  criteria: infer C;
+}
+  ? {
+      type: "choice";
+      /** The selected option: the most probable one when a distribution exists. */
+      choice: Extract<keyof C, string>;
+      /** Probability per option, when the model reports a distribution. */
+      probabilities?: Record<Extract<keyof C, string>, number>;
+      /** Provider-reported confidence in the selection, when available. */
+      confidence?: number;
+    }
+  : Q extends { type: "score" }
+    ? {
+        type: "score";
+        /** Fractional position in [0, levels - 1]; the probability-weighted mean when a distribution exists. */
+        score: number;
+        /** Probability per level, keyed by the zero-based level index. */
+        probabilities?: Record<string, number>;
+        /** Provider-reported confidence, when available. */
+        confidence?: number;
+        /** Level index to its description, as the provider echoed it. */
+        legend?: Record<string, string>;
+      }
+    : {
+        type: "boolean";
+        /** Estimated probability that the statement is true, in [0, 1]. Not a confidence. */
+        probability: number;
+      };
+
+/** The state and questions of one evaluation. */
+export interface EvaluationSpec<Q extends EvaluationQuestions> {
+  /** One shared state every question is answered against. */
+  state: EvaluationInput;
+  questions: Q;
+}
+
+export interface EvaluateOptions {
+  /** Abort signal to cancel the call (pass-through) */
+  abortSignal?: AbortSignal;
+  /** Override the helper-level per-call timeout. */
+  timeoutMs?: number;
+  /** Retries for transient provider failures. Defaults to the AI SDK's 2. */
+  maxRetries?: number;
+  /** Extra HTTP headers for the request. */
+  headers?: Record<string, string>;
+  /** Provider-specific options passed through to the AI SDK. */
+  providerOptions?: Record<string, Record<string, unknown>>;
+}
+
+export interface AIEvaluateResult<Q extends EvaluationQuestions> {
+  /** Exactly one answer per question, under the question's id. */
+  answers: { [K in keyof Q]: EvaluationAnswer<Q[K]> };
+  inputTokens: number;
+  outputTokens: number;
+  cost: number;
+  /** Actual USD cost as reported by the provider, when available. */
+  reportedCostUsd?: number;
+  /** Whether `cost` came from the provider or from the static price table. */
+  costSource?: "reported" | "estimated";
 }
 
 export interface AIEmbedResult {
@@ -539,6 +659,18 @@ export interface AIHelper {
     input: StreamTextInput,
     options?: StreamOptions,
   ): AIStreamResult;
+
+  /**
+   * Answer typed questions about one shared state with a decision model
+   * (`isEvaluationModel` in the registry, e.g. TypeSafe's Jev). Each
+   * answer's type follows from its question, so a `choice` answer is the
+   * union of that question's criteria keys.
+   */
+  evaluate<const Q extends EvaluationQuestions>(
+    modelKey: ModelKey,
+    spec: EvaluationSpec<Q>,
+    options?: EvaluateOptions,
+  ): Promise<AIEvaluateResult<Q>>;
 
   // Batch Methods - provider is optional, will auto-detect based on model
   batch<T = string>(

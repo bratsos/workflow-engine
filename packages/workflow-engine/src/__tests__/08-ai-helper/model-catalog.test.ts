@@ -196,6 +196,29 @@ describe("toModelConfig", () => {
       },
     });
     expect(cfg.isEmbeddingModel).toBeUndefined();
+    expect(cfg.isEvaluationModel).toBeUndefined();
+  });
+
+  it("flags a decisions-modality model as an evaluation model, priced on input only", () => {
+    // TypeSafe's Jev as OpenRouter's catalogue lists it.
+    const jev = row("typesafe/jev-1.13", {
+      architecture: {
+        input_modalities: ["text"],
+        output_modalities: ["decisions"],
+      },
+      prompt: "0.000000042",
+      completion: "0",
+      context_length: 32_000,
+    });
+    const cfg = toModelConfig(jev, catalogOf(jev));
+    expect(cfg).toMatchObject({
+      id: "typesafe/jev-1.13",
+      isEvaluationModel: true,
+      inputCostPerMillion: 0.042,
+      outputCostPerMillion: 0,
+      contextLength: 32_000,
+    });
+    expect(cfg.supportsAsyncBatch).toBeUndefined();
   });
 });
 

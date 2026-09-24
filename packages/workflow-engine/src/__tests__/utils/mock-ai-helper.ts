@@ -15,6 +15,7 @@ import type {
   AIBatchResult,
   AICallType,
   AIEmbedResult,
+  AIEvaluateResult,
   AIHelper,
   AIHelperStats,
   AIObjectResult,
@@ -22,6 +23,10 @@ import type {
   AITextResult,
   BatchOptions,
   EmbedOptions,
+  EvaluateOptions,
+  EvaluationQuestion,
+  EvaluationQuestions,
+  EvaluationSpec,
   ObjectOptions,
   RecordCallParams,
   StreamOptions,
@@ -89,7 +94,7 @@ export type MockCallMatcher =
 export interface MockCallDescriptor {
   modelKey: string;
   prompt: string;
-  kind: "text" | "object" | "embed" | "stream";
+  kind: "text" | "object" | "embed" | "stream" | "evaluate";
 }
 
 /** One armed, not-yet-consumed `failOnce` script. */
@@ -127,6 +132,12 @@ export interface MockAIHelperConfig {
    * kernel actually hands to a stage.
    */
   failures?: MockOneShotFailure[];
+  /**
+   * Scripted `evaluate` answers by question id, seeded through
+   * `setEvaluateAnswer`. Shared by reference with child helpers, like the
+   * schema responses and failures above.
+   */
+  evaluateAnswers?: Map<string, unknown>;
 }
 
 export interface RecordedCall {
@@ -189,6 +200,20 @@ async function resolveMockOutput(
   }
 }
 
+/** The neutral answer an unscripted `evaluate` question gets. */
+function defaultEvaluateAnswer(question: EvaluationQuestion): unknown {
+  switch (question.type) {
+    case "choice": {
+      const choice = Object.keys(question.criteria)[0] ?? "";
+      return { type: "choice", choice, probabilities: { [choice]: 1 } };
+    }
+    case "score":
+      return { type: "score", score: 0, probabilities: { "0": 1 } };
+    default:
+      return { type: "boolean", probability: 0.5 };
+  }
+}
+
 export class MockAIHelper implements AIHelper {
   readonly topic: string;
   private config: MockAIHelperConfig;
@@ -228,6 +253,7 @@ export class MockAIHelper implements AIHelper {
       // references rather than cloning them.
       schemaResponses: new Map(),
       failures: [],
+      evaluateAnswers: new Map(),
       ...config,
     };
     this.parent = parent;
@@ -357,6 +383,47 @@ export class MockAIHelper implements AIHelper {
       response: `[${embeddings.length} embeddings, ${result.dimensions} dims]`,
       inputTokens: result.inputTokens,
       outputTokens: 0,
+      cost: result.cost,
+      options: options as Record<string, unknown>,
+      timestamp: new Date(),
+    });
+
+    return result;
+  }
+
+  async evaluate<const Q extends EvaluationQuestions>(
+    modelKey: ModelKey,
+    spec: EvaluationSpec<Q>,
+    options?: EvaluateOptions,
+  ): Promise<AIEvaluateResult<Q>> {
+    await this.simulateLatency();
+    this.checkForError();
+
+    const prompt =
+      typeof spec.state === "string" ? spec.state : JSON.stringify(spec.state);
+    this.consumeScriptedFailure({ modelKey, prompt, kind: "evaluate" });
+
+    const answers = Object.fromEntries(
+      Object.entries(spec.questions).map(([id, question]) => [
+        id,
+        this.config.evaluateAnswers?.get(id) ?? defaultEvaluateAnswer(question),
+      ]),
+    ) as AIEvaluateResult<Q>["answers"];
+
+    const result: AIEvaluateResult<Q> = {
+      answers,
+      inputTokens: 10,
+      outputTokens: 0,
+      cost: 0.0001,
+    };
+
+    this.recordCallInternal({
+      type: "evaluate",
+      modelKey,
+      prompt,
+      response: JSON.stringify(answers),
+      inputTokens: result.inputTokens,
+      outputTokens: result.outputTokens,
       cost: result.cost,
       options: options as Record<string, unknown>,
       timestamp: new Date(),
@@ -592,6 +659,23 @@ export class MockAIHelper implements AIHelper {
   }
 
   /**
+   * Script the answer `evaluate` returns for the question with this id, on
+   * every call, in this helper and its children. Unscripted questions get a
+   * neutral default: the first option of a `choice`, level 0 of a `score`,
+   * and a probability of 0.5 for a `boolean`.
+   *
+   * @example
+   * ```typescript
+   * mock.setEvaluateAnswer("route", { type: "choice", choice: "billing" });
+   * mock.setEvaluateAnswer("urgent", { type: "boolean", probability: 0.92 });
+   * ```
+   */
+  setEvaluateAnswer(questionId: string, answer: unknown): void {
+    if (!this.config.evaluateAnswers) this.config.evaluateAnswers = new Map();
+    this.config.evaluateAnswers.set(questionId, answer);
+  }
+
+  /**
    * Configure the mock to throw errors
    */
   setError(shouldError: boolean, message?: string): void {
@@ -677,6 +761,7 @@ export class MockAIHelper implements AIHelper {
     this.config.objectResponses?.clear();
     this.config.schemaResponses?.clear();
     this.config.failures?.splice(0, this.config.failures.length);
+    this.config.evaluateAnswers?.clear();
   }
 
   // ============================================================================
@@ -1004,6 +1089,7 @@ export type MockAIHelperFactory<THelper extends MockAIHelper = MockAIHelper> =
     setObjectResponse: MockAIHelper["setObjectResponse"];
     mockObjectResponseForSchema: MockAIHelper["mockObjectResponseForSchema"];
     failOnce: MockAIHelper["failOnce"];
+    setEvaluateAnswer: MockAIHelper["setEvaluateAnswer"];
     setError: MockAIHelper["setError"];
     setLatency: MockAIHelper["setLatency"];
     getCalls: MockAIHelper["getCalls"];
@@ -1048,6 +1134,7 @@ export function createMockAIHelperFactory<
     mockObjectResponseForSchema:
       helper.mockObjectResponseForSchema.bind(helper),
     failOnce: helper.failOnce.bind(helper),
+    setEvaluateAnswer: helper.setEvaluateAnswer.bind(helper),
     setError: helper.setError.bind(helper),
     setLatency: helper.setLatency.bind(helper),
     getCalls: helper.getCalls.bind(helper),
