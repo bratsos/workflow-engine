@@ -280,6 +280,8 @@ export class PrismaAICallLogger implements AICallLogger {
 }
 
 // Factory function to create PrismaAICallLogger with prisma client
-export function createPrismaAICallLogger(prisma: PrismaClient): AICallLogger {
+export function createPrismaAICallLogger(
+  prisma: PrismaClient,
+): PrismaAICallLogger {
   return new PrismaAICallLogger(prisma);
 }

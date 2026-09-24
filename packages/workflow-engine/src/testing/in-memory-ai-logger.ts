@@ -98,12 +98,17 @@ export class InMemoryAICallLogger implements AICallLogger {
   }
 
   /**
-   * List the calls under a topic prefix, in insertion order, with every
+   * List the calls under a topic prefix, oldest first, with every
    * cost figure as recorded.
    */
   async listCalls(topicPrefix: string): Promise<AICallRecord[]> {
     return Array.from(this.calls.values())
       .filter((call) => call.topic.startsWith(topicPrefix))
+      .sort(
+        (a, b) =>
+          a.createdAt.getTime() - b.createdAt.getTime() ||
+          a.id.localeCompare(b.id),
+      )
       .map((c) => ({ ...c }));
   }
 
