@@ -158,6 +158,7 @@ interface AIHelper {
   generateObject(modelKey, prompt, schema, options?): Promise<AIObjectResult>;
   embed(modelKey, text, options?): Promise<AIEmbedResult>;
   streamText(modelKey, input, options?): AIStreamResult;
+  evaluate(modelKey, { state, questions }, options?): Promise<AIEvaluateResult>;
   batch<T = string>(modelKey, provider?, options?): AIBatch<T>;
 
   createChild(segment, id?): AIHelper;
@@ -377,6 +378,87 @@ const { embedding } = await ai.embed("voyage-4-large", "Hello world");
 - Custom providers are checked **before** built-in providers, so you can even override `"openrouter"` or `"google"` if needed
 - The workflow engine stays provider-agnostic — install your chosen provider package as your app's dependency, not the library's
 - Provider-specific options (like Google's `taskType`) are handled by each provider through the AI SDK's standard mechanism
+
+## evaluate
+
+Answer typed questions about one shared state with a **decision model** — a
+model whose output is a typed judgment with probabilities rather than text.
+TypeSafe's Jev (`typesafe/jev-1.13`, `~typesafe/jev-latest`) is the first, served
+through OpenRouter's Decisions API. Use it for routing, classification,
+moderation and other decision points where a fast, calibrated answer matters
+more than prose.
+
+```typescript
+const result = await ai.evaluate("typesafe/jev-1.13", {
+  state: { ticket: { subject, body } },
+  questions: {
+    team: {
+      type: "choice",
+      instructions: "Which team should handle `ticket`?",
+      criteria: {
+        billing: "Charges, refunds and invoices.",
+        engineering: "Bugs, errors and outages.",
+      },
+    },
+    outage: {
+      type: "boolean",
+      instructions: "Does `ticket` report a problem affecting many customers?",
+    },
+    severity: {
+      type: "score",
+      instructions: "How severe is `ticket`?",
+      criteria: ["Cosmetic.", "Degraded for some users.", "Down for everyone."],
+    },
+  },
+});
+
+result.answers.team.choice;        // "billing" | "engineering"
+result.answers.team.probabilities; // { billing: 0, engineering: 1 }
+result.answers.team.confidence;    // 0.99
+result.answers.outage.probability; // 0.97 — P(true), not a confidence
+result.answers.severity.score;     // 2 — position on the scale, 0-based
+result.answers.severity.legend;    // { "0": "Cosmetic.", ... }
+```
+
+**Question types.**
+
+| `type` | `criteria` | Answer |
+|---|---|---|
+| `choice` | option name → description | `choice` (one of the option names), `probabilities`, `confidence?` |
+| `score` | ordered levels, lowest first (at least two) | `score` (fractional position), `probabilities` keyed `"0"`, `"1"`, ..., `confidence?`, `legend?` |
+| `boolean` | optional `{ true, false }`; give both or neither | `probability` that the statement is true |
+
+`state`, `instructions` and each criterion accept text, a JSON object or a JSON
+array. Every question is answered against the same `state` in one call.
+
+**Typed answers.** Each answer's type follows from its own question: a `choice`
+answer's `choice` is the union of that question's criteria keys. This works on
+an inline object literal — no `as const` needed.
+
+**Models.** Only a registry entry with `isEvaluationModel: true` can answer;
+any other model throws before a request is made. `workflow-engine-sync` sets
+the flag for every model whose OpenRouter output modality is `decisions`
+(re-run it if a synced registry predates the flag). Decision models cannot
+generate text.
+
+**Transport and routing.** The built-in path is `openrouter.evaluationModel(id)`
+from `@openrouter/ai-sdk-provider`, called through the AI SDK's `evaluate`. It
+carries the same `max_price` guard as every other OpenRouter call (registry
+price × `routing.priceHeadroom`). `registerEvaluationProvider(provider, factory)`
+plugs in any other AI SDK evaluation model, the way `registerEmbeddingProvider`
+does for embeddings.
+
+**Cost.** Decision models bill input tokens only. The row is logged with
+`callType: "evaluate"`, and OpenRouter's reported `usage.cost` is the recorded
+cost (`costSource: "reported"`), with the registry's input price as the
+fallback estimate.
+
+**Options.** `abortSignal`, `timeoutMs`, `maxRetries` (default 2),
+`headers`, `providerOptions`. There is no batch path for decision models.
+
+Inside a stage use `ctx.step.ai.evaluate(id, model, { state, questions })`
+(see 12-durable-steps.md), which memoises the answers so a replay takes the
+same branch.
 
 ## streamText
 

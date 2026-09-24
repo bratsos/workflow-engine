@@ -120,8 +120,9 @@ await kernel.dispatch({
 | `createServerlessHost` | Function | `@bratsos/workflow-engine-host-serverless` | Create serverless host |
 | `defineRemoteStage` / `createActivityWorker` | Function | `@bratsos/workflow-engine-host-remote` | Run a stage on a credential-free remote worker (see 11-remote-activity-workers.md) |
 | `createRoutingExecutor` / `createLocalExecutor` | Function | `@bratsos/workflow-engine/kernel` | `ActivityExecutor` port: route specific stages to a remote executor / default in-process executor |
-| `createAIHelper` | Function | `@bratsos/workflow-engine` | AI operations (text, object, embed, batch) with AI SDK & OpenRouter batch support |
+| `createAIHelper` | Function | `@bratsos/workflow-engine` | AI operations (text, object, embed, evaluate, batch) with AI SDK & OpenRouter batch support |
 | `registerEmbeddingProvider` | Function | `@bratsos/workflow-engine` | Register custom embedding providers (Voyage, Cohere, etc.) |
+| `registerEvaluationProvider` | Function | `@bratsos/workflow-engine` | Register a custom evaluation (decision) model provider |
 | `createStageIds` | Function | `@bratsos/workflow-engine` | Create stage ID constants from a workflow |
 | `defineStageIds` | Function | `@bratsos/workflow-engine` | Define stage ID constants from a tuple |
 | `isValidStageId` | Function | `@bratsos/workflow-engine` | Runtime stage ID validation |
@@ -503,6 +504,16 @@ import { registerEmbeddingProvider } from "@bratsos/workflow-engine";
 import { voyage } from "voyage-ai-provider";
 registerEmbeddingProvider("voyage", (modelId) => voyage.embeddingModel(modelId));
 // Then register models with provider: "voyage" and use ai.embed() as usual
+
+// Typed decisions with a decision model (TypeSafe's Jev via OpenRouter)
+const { answers } = await ai.evaluate("typesafe/jev-1.13", {
+  state: { ticket },
+  questions: {
+    team: { type: "choice", instructions: "Which team handles `ticket`?",
+      criteria: { billing: "Charges and refunds.", engineering: "Bugs and outages." } },
+  },
+});
+answers.team.choice; // "billing" | "engineering" — durable form: ctx.step.ai.evaluate(id, ...)
 
 // Batch operations (Google, Anthropic, OpenAI, OpenRouter)
 const batch = ai.batch("gemini-2.5-flash", "google");

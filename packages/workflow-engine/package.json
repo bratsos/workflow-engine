@@ -1,6 +1,6 @@
 {
   "name": "@bratsos/workflow-engine",
-  "version": "1.0.0-alpha.13",
+  "version": "1.0.0-alpha.14",
   "description": "Type-safe, distributed workflow engine for AI-orchestrated processes with suspend/resume, parallel execution, and cost tracking",
   "type": "module",
   "license": "MIT",
@@ -99,9 +99,9 @@
   },
   "dependencies": {
     "@ai-sdk/google": "^4.0.59",
-    "@ai-sdk/provider": "^4.0.9",
-    "@openrouter/ai-sdk-provider": "^3.0.0",
-    "ai": "^7.0.87",
+    "@ai-sdk/provider": "^4.0.18",
+    "@openrouter/ai-sdk-provider": "^3.1.0",
+    "ai": "^7.0.113",
     "js-tiktoken": "^1.0.21"
   },
   "peerDependencies": {

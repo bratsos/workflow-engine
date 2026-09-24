@@ -1,5 +1,12 @@
 # @bratsos/workflow-engine-host-node
 
+## 0.5.0-alpha.1
+
+### Patch Changes
+
+- Updated dependencies [cebe897]
+  - @bratsos/workflow-engine@1.0.0-alpha.14
+
 ## 0.5.0-alpha.0
 
 ### Minor Changes

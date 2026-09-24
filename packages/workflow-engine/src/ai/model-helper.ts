@@ -55,6 +55,12 @@ export interface ModelConfig {
     cachedInputCostPerMillion?: number;
   };
   isEmbeddingModel?: boolean; // true for embedding models
+  /**
+   * True for decision models (OpenRouter output modality `decisions`, e.g.
+   * TypeSafe's Jev). These answer typed questions through `ai.evaluate` and
+   * cannot generate text; `workflow-engine-sync` sets this from the catalogue.
+   */
+  isEvaluationModel?: boolean;
   supportsTools?: boolean; // true if model supports function calling
   supportsStructuredOutputs?: boolean; // true if model supports JSON schema outputs
   contextLength?: number; // Max context window from OpenRouter
@@ -73,6 +79,8 @@ export interface ModelFilter {
   supportsStructuredOutputs?: boolean;
   /** Only include models that support async batch */
   supportsAsyncBatch?: boolean;
+  /** Only include decision models (or, when false, exclude them) */
+  isEvaluationModel?: boolean;
 }
 
 /**
@@ -229,6 +237,12 @@ export function listModels(
       if (filter.isEmbeddingModel !== undefined) {
         if (filter.isEmbeddingModel && !config.isEmbeddingModel) return false;
         if (!filter.isEmbeddingModel && config.isEmbeddingModel) return false;
+      }
+
+      // Filter by decision model
+      if (filter.isEvaluationModel !== undefined) {
+        if (filter.isEvaluationModel && !config.isEvaluationModel) return false;
+        if (!filter.isEvaluationModel && config.isEvaluationModel) return false;
       }
 
       // Filter by tool support

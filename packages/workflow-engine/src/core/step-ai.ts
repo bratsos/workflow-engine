@@ -11,10 +11,14 @@ import type { z } from "zod";
 import type { ModelKey } from "../ai/model-helper";
 import type {
   AIBatchProvider,
+  AIEvaluateResult,
   AIObjectResult,
   AITextResult,
   BatchOptions,
   BatchReclaimPolicy,
+  EvaluateOptions,
+  EvaluationQuestions,
+  EvaluationSpec,
   ObjectOptions,
   StreamOptions,
   TextInput,
@@ -171,6 +175,19 @@ export interface StepAiApi {
     options?: StreamOptions,
     stepOptions?: StepRunOptions,
   ): Promise<StepStreamResult>;
+  /**
+   * Answer typed questions about one state with a decision model, durably.
+   * The answers are memoised under `id`, so a stage that replays after a
+   * suspension takes the same branch it took the first time instead of
+   * asking again and possibly deciding differently.
+   */
+  evaluate<const Q extends EvaluationQuestions>(
+    id: string,
+    modelKey: ModelKey,
+    spec: EvaluationSpec<Q>,
+    options?: EvaluateOptions,
+    stepOptions?: StepRunOptions,
+  ): Promise<AIEvaluateResult<Q>>;
   /**
    * Run one prompt per item under an execution policy (realtime or batch),
    * with schema validation and repair applied identically on both paths.

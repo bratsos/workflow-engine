@@ -89,6 +89,15 @@ export function isEmbeddingModel(model: OpenRouterModel): boolean {
   );
 }
 
+/**
+ * True for a decision model: its output modality is `decisions` (OpenRouter's
+ * Decisions API, e.g. TypeSafe's Jev). Such a model answers typed questions
+ * through `ai.evaluate` and produces no text.
+ */
+export function isEvaluationModel(model: OpenRouterModel): boolean {
+  return Boolean(model.architecture?.output_modalities?.includes("decisions"));
+}
+
 /** True when the model produces text. Missing architecture is treated as text. */
 export function producesText(model: OpenRouterModel): boolean {
   const outputs = model.architecture?.output_modalities;
@@ -207,6 +216,7 @@ export function toModelConfig(
   catalog: ReadonlyMap<string, OpenRouterModel>,
 ): ModelConfig {
   const embedding = isEmbeddingModel(model);
+  const evaluation = isEvaluationModel(model);
   const supportsTools = model.supported_parameters?.includes("tools") ?? false;
   const supportsStructuredOutputs =
     model.supported_parameters?.includes("structured_outputs") ?? false;
@@ -226,6 +236,7 @@ export function toModelConfig(
     contextLength: model.top_provider?.context_length ?? model.context_length,
     maxCompletionTokens: model.top_provider?.max_completion_tokens,
     ...(embedding && { isEmbeddingModel: true }),
+    ...(evaluation && { isEvaluationModel: true }),
     ...(supportsTools && { supportsTools: true }),
     ...(supportsStructuredOutputs && { supportsStructuredOutputs: true }),
     ...deriveBatchCapability(model, catalog),

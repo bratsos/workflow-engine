@@ -190,6 +190,8 @@ function generateTypeScript(models: Record<string, ModelConfig>): string {
           : []),
         `    provider: "${config.provider}",`,
         `    isEmbeddingModel: ${config.isEmbeddingModel || false},`,
+        // Emitted only when set, so a re-sync leaves every other entry as it was.
+        ...(config.isEvaluationModel ? [`    isEvaluationModel: true,`] : []),
         `    supportsTools: ${config.supportsTools || false},`,
         `    supportsStructuredOutputs: ${config.supportsStructuredOutputs || false},`,
         `    supportsAsyncBatch: ${config.supportsAsyncBatch || false},`,

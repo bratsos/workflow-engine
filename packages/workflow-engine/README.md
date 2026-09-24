@@ -891,10 +891,25 @@ async execute(ctx) {
     onChunk: (chunk) => ctx.log("DEBUG", chunk),
   });
 
+  // Typed decisions from a decision model (TypeSafe's Jev), memoized so a
+  // replay takes the same branch
+  const { answers } = await ctx.step.ai.evaluate("triage", "typesafe/jev-1.13", {
+    state: { text },
+    questions: {
+      tone: {
+        type: "choice",
+        instructions: "What is the tone of `text`?",
+        criteria: { neutral: "Matter of fact.", upset: "Frustrated or angry." },
+      },
+    },
+  });
+
   // Non-durable: plain call through the same logger (no memoization)
   const { embedding } = await ctx.ai.embed("text-embedding-3-small", text);
 
-  return { output: { text, analysis, draft: draft.text, embedding } };
+  return {
+    output: { text, analysis, draft: draft.text, tone: answers.tone.choice, embedding },
+  };
 }
 ```
 
@@ -906,7 +921,7 @@ const { text, reasoning } = await ctx.ai.generateText("anthropic/claude-opus-4.8
 });
 ```
 
-Models are configured with `registerModels()` and resolved with `getModel(key)` (`supportsAsyncBatch` says whether a batch transport exists). `AIHelperOptions.adapter` swaps the transport below logging and cost; `timeout.perCallMs` / per-call `timeoutMs` throw `AICallTimeoutError`. Schemas that no provider dialect can express fail before submit with `UnportableSchemaError`. Outside a stage, `createAIHelper(topic, logger)` builds the same helper by hand.
+Models are configured with `registerModels()` and resolved with `getModel(key)` (`supportsAsyncBatch` says whether a batch transport exists; `isEvaluationModel` marks decision models that answer `evaluate` and cannot generate text). `AIHelperOptions.adapter` swaps the transport below logging and cost; `timeout.perCallMs` / per-call `timeoutMs` throw `AICallTimeoutError`. Schemas that no provider dialect can express fail before submit with `UnportableSchemaError`. Outside a stage, `createAIHelper(topic, logger)` builds the same helper by hand.
 
 ### Batch AI Calls (`ctx.step.ai.map`)
 
