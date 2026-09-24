@@ -257,4 +257,38 @@ describe("AI adapter seam", () => {
       outputTokens: 2,
     });
   });
+
+  it("reports the adapter's stream cost when getUsage() runs before the stream is consumed", async () => {
+    const adapter: AIAdapter = {
+      streamText: () => ({
+        stream: (async function* () {
+          yield "hi";
+        })(),
+        inputTokens: 3,
+        outputTokens: 2,
+        costUsd: 0.004,
+      }),
+    };
+    const aiLogger = logger();
+    const ai = createAIHelper(
+      "adapter.stream.usage-first",
+      aiLogger,
+      undefined,
+      undefined,
+      { adapter },
+    );
+
+    const result = await ai.streamText(MODEL, { prompt: "hi" });
+    await expect(result.getUsage()).resolves.toMatchObject({
+      cost: 0.004,
+      reportedCostUsd: 0.004,
+      costSource: "reported",
+    });
+    for await (const _chunk of result.stream) {
+      // drain
+    }
+    expect(
+      aiLogger.getCallsByTopic("adapter.stream.usage-first")[0],
+    ).toMatchObject({ cost: 0.004, costSource: "reported" });
+  });
 });

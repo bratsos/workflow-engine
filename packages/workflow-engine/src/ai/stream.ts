@@ -179,6 +179,21 @@ export function streamText(
     return cachedUsage;
   };
 
+  // The adapter path persists from stream completion or getUsage(),
+  // whichever comes first; both must hand cost resolution the same inputs
+  // so the recorded cost does not depend on consumption order.
+  const persistAdapterUsage = (response: AdapterStreamResponse) =>
+    persistUsage(
+      response.inputTokens ?? 0,
+      response.outputTokens ?? 0,
+      response.text ?? fullText,
+      response.reasoning,
+      {
+        providerMetadata: response.providerMetadata,
+        costUsd: response.costUsd,
+      },
+    );
+
   // Build the streamText params based on input type
   const baseParams = {
     model,
@@ -272,18 +287,7 @@ export function streamText(
               reader.next(),
             );
             if (done) {
-              if (adapterResponse) {
-                persistUsage(
-                  adapterResponse.inputTokens ?? 0,
-                  adapterResponse.outputTokens ?? 0,
-                  adapterResponse.text ?? fullText,
-                  adapterResponse.reasoning,
-                  {
-                    providerMetadata: adapterResponse.providerMetadata,
-                    costUsd: adapterResponse.costUsd,
-                  },
-                );
-              }
+              if (adapterResponse) persistAdapterUsage(adapterResponse);
               return { done: true, value: undefined };
             }
             fullText += value;
@@ -311,15 +315,7 @@ export function streamText(
   const getUsage = async () => {
     try {
       if (timeout.timedOut() && timeout.error) throw timeout.error;
-      if (adapterResponse) {
-        return persistUsage(
-          adapterResponse.inputTokens ?? 0,
-          adapterResponse.outputTokens ?? 0,
-          adapterResponse.text ?? fullText,
-          adapterResponse.reasoning,
-          { providerMetadata: adapterResponse.providerMetadata },
-        );
-      }
+      if (adapterResponse) return persistAdapterUsage(adapterResponse);
       const sdkResult = result!;
       const usage = await runWithCallTimeout(timeout, () => sdkResult.usage);
       const reasoning = await getReasoning();
