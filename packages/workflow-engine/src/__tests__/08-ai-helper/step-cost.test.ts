@@ -19,6 +19,7 @@ import {
 
 const MODEL = "step-cost-test-model";
 const CACHED_MODEL = "step-cost-cached-model";
+const TIERED_MODEL = "step-cost-tiered-model";
 
 beforeAll(() => {
   registerModels({
@@ -37,6 +38,19 @@ beforeAll(() => {
       inputCostPerMillion: 1,
       cachedInputCostPerMillion: 0.1,
       outputCostPerMillion: 2,
+      provider: "openrouter",
+    },
+    [TIERED_MODEL]: {
+      id: "vendor/step-cost-tiered",
+      name: "Step Cost Tiered",
+      // $1/M in, $2/M in at or above 200k prompt tokens.
+      inputCostPerMillion: 1,
+      outputCostPerMillion: 2,
+      longContextTier: {
+        minPromptTokens: 200_000,
+        inputCostPerMillion: 2,
+        outputCostPerMillion: 4,
+      },
       provider: "openrouter",
     },
   });
@@ -174,6 +188,24 @@ describe("resolveCost over a multi-step result", () => {
     expect(r.costSource).toBe("estimated");
     expect(r.reportedCostUsd).toBeUndefined();
     expect(r.cost).toBeCloseTo(3, 10);
+  });
+
+  it("prices each step at its own long-context tier", () => {
+    // Two 150k-token steps: each is under the 200k tier, so the call is
+    // $0.30 at the base rate, not $0.60 at the tier rate for 300k.
+    const tokens = { inputTokens: 150_000, outputTokens: 0 };
+    const result = {
+      usage: { inputTokens: 300_000, outputTokens: 0 },
+      steps: [{ usage: tokens }, { usage: tokens }],
+    };
+    const r = resolveCost(
+      TIERED_MODEL,
+      300_000,
+      0,
+      costResultLikeForSteps(result),
+    );
+    expect(r.costSource).toBe("estimated");
+    expect(r.cost).toBeCloseTo(0.3, 10);
   });
 
   it("leaves a single-step result on its own reported figure", () => {

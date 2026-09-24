@@ -128,6 +128,11 @@ export interface ProviderResultLike {
       [key: string]: any;
     };
   };
+  /**
+   * Per-step results of a multi-step call. When two or more carry token
+   * counts, the estimate prices each step at its own long-context tier.
+   */
+  steps?: readonly unknown[];
 }
 
 export interface UsageDetails {
@@ -274,6 +279,59 @@ export interface CostResolution {
 }
 
 /**
+ * The realtime estimate of a multi-step call, priced step by step. The
+ * long-context tier applies per request, so a call whose steps each stay
+ * under `minPromptTokens` is billed at the base rate even when their summed
+ * input crosses it. Undefined unless the result carries two or more steps
+ * that all report finite input and output token counts whose sums (and
+ * summed cached-input counts) match the aggregate being estimated; the
+ * caller then estimates the aggregate.
+ */
+function estimateAcrossSteps(
+  modelKey: ModelKey,
+  result: ProviderResultLike | undefined,
+  inputTokens: number,
+  outputTokens: number,
+  cachedInputTokens: number,
+): number | undefined {
+  const steps = result && typeof result === "object" ? result.steps : undefined;
+  if (!Array.isArray(steps) || steps.length < 2) return undefined;
+
+  let total = 0;
+  let inputSum = 0;
+  let outputSum = 0;
+  let cachedSum = 0;
+  for (const step of steps) {
+    if (!step || typeof step !== "object") return undefined;
+    const usage = (step as ProviderResultLike).usage;
+    const input = usage?.inputTokens;
+    const output = usage?.outputTokens;
+    if (
+      typeof input !== "number" ||
+      !Number.isFinite(input) ||
+      typeof output !== "number" ||
+      !Number.isFinite(output)
+    ) {
+      return undefined;
+    }
+    const cached =
+      extractUsageDetails(step as ProviderResultLike).cachedInputTokens ?? 0;
+    inputSum += input;
+    outputSum += output;
+    cachedSum += cached;
+    total += calculateCost(modelKey, input, output, cached).totalCost;
+  }
+  if (
+    inputSum !== inputTokens ||
+    outputSum !== outputTokens ||
+    cachedSum !== cachedInputTokens
+  ) {
+    return undefined;
+  }
+  return total;
+}
+
+/**
  * Reconcile provider-reported cost with the local static pricing estimate.
  * Prefer reported cost when present, fallback to estimated cost.
  */
@@ -286,14 +344,24 @@ export function resolveCost(
 ): CostResolution {
   const providerResult = resultLike as ProviderResultLike | undefined;
   const usageDetails = extractUsageDetails(providerResult);
-  const estimatedCost = calculateCostWithDiscount(
-    modelKey,
-    inputTokens,
-    outputTokens,
-    isBatch,
-    undefined,
-    usageDetails.cachedInputTokens,
-  );
+  const estimatedCost =
+    (isBatch
+      ? undefined
+      : estimateAcrossSteps(
+          modelKey,
+          providerResult,
+          inputTokens,
+          outputTokens,
+          usageDetails.cachedInputTokens ?? 0,
+        )) ??
+    calculateCostWithDiscount(
+      modelKey,
+      inputTokens,
+      outputTokens,
+      isBatch,
+      undefined,
+      usageDetails.cachedInputTokens,
+    );
   const reportedCostUsd = extractReportedCost(providerResult);
   const servedBy = extractServedBy(providerResult);
   const extras = {

@@ -196,7 +196,8 @@ function servedByAcrossSteps(steps: readonly unknown[]): string | undefined {
  * the reported-cost decision: the summed cost as `costUsd`, or no cost at
  * all when the sum is unusable. Neither the top-level `providerMetadata`
  * nor `finalStep` is carried, so `resolveCost` cannot rediscover the last
- * step's figure and estimates the whole call instead.
+ * step's figure and estimates the whole call instead. The steps themselves
+ * are carried so that estimate prices each step at its own long-context tier.
  */
 export function costResultLikeForSteps<T>(result: T): T | ProviderResultLike {
   const multi = result as MultiStepResultLike | undefined;
@@ -221,6 +222,7 @@ export function costResultLikeForSteps<T>(result: T): T | ProviderResultLike {
 
   return {
     usage,
+    steps,
     ...(costUsd !== undefined ? { costUsd } : {}),
     ...(servedBy !== undefined
       ? { providerMetadata: { openrouter: { provider: servedBy } } }
