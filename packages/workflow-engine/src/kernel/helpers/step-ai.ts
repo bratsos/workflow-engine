@@ -1,5 +1,5 @@
 /**
- * Durable AI steps: `ctx.step.ai.generateText/generateObject/streamText/evaluate/map`.
+ * Durable AI steps: `ctx.step.ai.generateText/generateObject/streamText/evaluate/transcribe/map`.
  *
  * Every model call is memoized through `step.run`. `map` chooses between a
  * realtime path (one durable step per item, in-process concurrency, budget)
@@ -20,6 +20,7 @@ import type {
   AIHelper,
   AIObjectResult,
   AITextResult,
+  AITranscribeResult,
   EvaluateOptions,
   EvaluationQuestions,
   EvaluationSpec,
@@ -28,6 +29,8 @@ import type {
   StreamTextInput,
   TextInput,
   TextOptions,
+  TranscribeOptions,
+  TranscriptionAudio,
 } from "../../ai/types";
 import {
   AiMapBatchFailedError,
@@ -197,6 +200,25 @@ function pickEvaluateResult<Q extends EvaluationQuestions>(
     answers: result.answers,
     inputTokens: result.inputTokens,
     outputTokens: result.outputTokens,
+    cost: result.cost,
+    ...(result.reportedCostUsd !== undefined
+      ? { reportedCostUsd: result.reportedCostUsd }
+      : {}),
+    ...(result.costSource !== undefined
+      ? { costSource: result.costSource }
+      : {}),
+  };
+}
+
+/** What a durable transcribe step stores: the result without undefined fields. */
+function pickTranscribeResult(result: AITranscribeResult): AITranscribeResult {
+  return {
+    text: result.text,
+    segments: result.segments,
+    ...(result.language !== undefined ? { language: result.language } : {}),
+    ...(result.durationInSeconds !== undefined
+      ? { durationInSeconds: result.durationInSeconds }
+      : {}),
     cost: result.cost,
     ...(result.reportedCostUsd !== undefined
       ? { reportedCostUsd: result.reportedCostUsd }
@@ -483,6 +505,23 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
       id,
       async () =>
         pickEvaluateResult(await deps.ai().evaluate(modelKey, spec, options)),
+      stepOptions,
+    );
+  }
+
+  async function transcribe(
+    id: string,
+    modelKey: ModelKey,
+    audio: TranscriptionAudio,
+    options?: TranscribeOptions,
+    stepOptions?: StepRunOptions,
+  ): Promise<AITranscribeResult> {
+    return deps.run(
+      id,
+      async () =>
+        pickTranscribeResult(
+          await deps.ai().transcribe(modelKey, audio, options),
+        ),
       stepOptions,
     );
   }
@@ -1197,5 +1236,12 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
     return results;
   }
 
-  return { generateText, generateObject, streamText, evaluate, map };
+  return {
+    generateText,
+    generateObject,
+    streamText,
+    evaluate,
+    transcribe,
+    map,
+  };
 }

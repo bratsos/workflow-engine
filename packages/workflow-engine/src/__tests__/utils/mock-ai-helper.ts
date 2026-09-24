@@ -21,6 +21,7 @@ import type {
   AIObjectResult,
   AIStreamResult,
   AITextResult,
+  AITranscribeResult,
   BatchOptions,
   EmbedOptions,
   EvaluateOptions,
@@ -33,6 +34,8 @@ import type {
   StreamTextInput,
   TextInput,
   TextOptions,
+  TranscribeOptions,
+  TranscriptionAudio,
 } from "../../ai/ai-helper.js";
 import type { ModelKey } from "../../ai/model-helper.js";
 import { getModel } from "../../ai/model-helper.js";
@@ -75,6 +78,14 @@ export interface MockEmbedResponse {
   cost?: number;
 }
 
+export interface MockTranscribeResponse {
+  text: string;
+  segments?: Array<{ text: string; startSecond: number; endSecond: number }>;
+  language?: string;
+  durationInSeconds?: number;
+  cost?: number;
+}
+
 export interface MockBatchResult<T = string> {
   id: string;
   result: T;
@@ -94,7 +105,7 @@ export type MockCallMatcher =
 export interface MockCallDescriptor {
   modelKey: string;
   prompt: string;
-  kind: "text" | "object" | "embed" | "stream" | "evaluate";
+  kind: "text" | "object" | "embed" | "stream" | "evaluate" | "transcribe";
 }
 
 /** One armed, not-yet-consumed `failOnce` script. */
@@ -138,6 +149,8 @@ export interface MockAIHelperConfig {
    * schema responses and failures above.
    */
   evaluateAnswers?: Map<string, unknown>;
+  /** What `transcribe` returns, seeded through `setTranscribeResponse`. */
+  transcribeResponse?: MockTranscribeResponse;
 }
 
 export interface RecordedCall {
@@ -432,6 +445,52 @@ export class MockAIHelper implements AIHelper {
     return result;
   }
 
+  async transcribe(
+    modelKey: ModelKey,
+    audio: TranscriptionAudio,
+    options?: TranscribeOptions,
+  ): Promise<AITranscribeResult> {
+    await this.simulateLatency();
+    this.checkForError();
+
+    const prompt =
+      audio instanceof URL
+        ? audio.href
+        : typeof audio === "string"
+          ? "[audio base64]"
+          : `[audio ${audio.byteLength} bytes]`;
+    this.consumeScriptedFailure({ modelKey, prompt, kind: "transcribe" });
+
+    const response = this.config.transcribeResponse ?? {
+      text: "mock transcript",
+    };
+    const result: AITranscribeResult = {
+      text: response.text,
+      segments: response.segments ?? [],
+      ...(response.language !== undefined
+        ? { language: response.language }
+        : {}),
+      ...(response.durationInSeconds !== undefined
+        ? { durationInSeconds: response.durationInSeconds }
+        : {}),
+      cost: response.cost ?? 0.0001,
+    };
+
+    this.recordCallInternal({
+      type: "transcribe",
+      modelKey,
+      prompt,
+      response: result.text,
+      inputTokens: 0,
+      outputTokens: 0,
+      cost: result.cost,
+      options: options as Record<string, unknown>,
+      timestamp: new Date(),
+    });
+
+    return result;
+  }
+
   streamText(
     modelKey: ModelKey,
     input: StreamTextInput,
@@ -676,6 +735,14 @@ export class MockAIHelper implements AIHelper {
   }
 
   /**
+   * Script what `transcribe` returns, on every call, in this helper and its
+   * children. Unscripted, it returns the text "mock transcript".
+   */
+  setTranscribeResponse(response: MockTranscribeResponse): void {
+    this.config.transcribeResponse = response;
+  }
+
+  /**
    * Configure the mock to throw errors
    */
   setError(shouldError: boolean, message?: string): void {
@@ -762,6 +829,7 @@ export class MockAIHelper implements AIHelper {
     this.config.schemaResponses?.clear();
     this.config.failures?.splice(0, this.config.failures.length);
     this.config.evaluateAnswers?.clear();
+    this.config.transcribeResponse = undefined;
   }
 
   // ============================================================================
@@ -1090,6 +1158,7 @@ export type MockAIHelperFactory<THelper extends MockAIHelper = MockAIHelper> =
     mockObjectResponseForSchema: MockAIHelper["mockObjectResponseForSchema"];
     failOnce: MockAIHelper["failOnce"];
     setEvaluateAnswer: MockAIHelper["setEvaluateAnswer"];
+    setTranscribeResponse: MockAIHelper["setTranscribeResponse"];
     setError: MockAIHelper["setError"];
     setLatency: MockAIHelper["setLatency"];
     getCalls: MockAIHelper["getCalls"];
@@ -1135,6 +1204,7 @@ export function createMockAIHelperFactory<
       helper.mockObjectResponseForSchema.bind(helper),
     failOnce: helper.failOnce.bind(helper),
     setEvaluateAnswer: helper.setEvaluateAnswer.bind(helper),
+    setTranscribeResponse: helper.setTranscribeResponse.bind(helper),
     setError: helper.setError.bind(helper),
     setLatency: helper.setLatency.bind(helper),
     getCalls: helper.getCalls.bind(helper),

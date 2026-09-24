@@ -40,7 +40,8 @@ export type AICallType =
   | "embed"
   | "stream"
   | "batch"
-  | "evaluate";
+  | "evaluate"
+  | "transcribe";
 
 /** Normalized request passed to an adapter for text generation. */
 export interface AdapterTextRequest {
@@ -268,6 +269,48 @@ export interface AIEvaluateResult<Q extends EvaluationQuestions> {
   /** Actual USD cost as reported by the provider, when available. */
   reportedCostUsd?: number;
   /** Whether `cost` came from the provider or from the static price table. */
+  costSource?: "reported" | "estimated";
+}
+
+// ============================================================================
+// Transcription
+// ============================================================================
+
+/**
+ * Audio to transcribe: raw bytes, a base64 string, or a URL the AI SDK
+ * downloads (up to its 2 GiB default) before sending.
+ */
+export type TranscriptionAudio = Uint8Array | ArrayBuffer | string | URL;
+
+export interface TranscribeOptions {
+  /** Abort signal to cancel the call (pass-through) */
+  abortSignal?: AbortSignal;
+  /** Override the helper-level per-call timeout. */
+  timeoutMs?: number;
+  /** Retries for transient provider failures. Defaults to the AI SDK's 2. */
+  maxRetries?: number;
+  /** Extra HTTP headers for the request. */
+  headers?: Record<string, string>;
+  /**
+   * Provider-specific options passed through to the AI SDK, e.g.
+   * `{ openai: { language: "en", timestampGranularities: ["segment"] } }`.
+   */
+  providerOptions?: Record<string, Record<string, unknown>>;
+}
+
+export interface AITranscribeResult {
+  /** The full transcript. */
+  text: string;
+  /** Timed segments, when the provider returns them. */
+  segments: Array<{ text: string; startSecond: number; endSecond: number }>;
+  /** Detected language (ISO-639-1), when the provider reports it. */
+  language?: string;
+  /** Duration of the audio in seconds, when the provider reports it. */
+  durationInSeconds?: number;
+  cost: number;
+  /** Actual USD cost as reported by the provider, when available. */
+  reportedCostUsd?: number;
+  /** Whether `cost` came from the provider or from the registry's prices. */
   costSource?: "reported" | "estimated";
 }
 
@@ -671,6 +714,18 @@ export interface AIHelper {
     spec: EvaluationSpec<Q>,
     options?: EvaluateOptions,
   ): Promise<AIEvaluateResult<Q>>;
+
+  /**
+   * Transcribe audio with a speech-to-text model (`isTranscriptionModel` in
+   * the registry). Cost is estimated per minute of audio
+   * (`transcriptionCostPerMinute`) or per reported token, whichever the
+   * provider bills by, unless the provider reports a USD cost itself.
+   */
+  transcribe(
+    modelKey: ModelKey,
+    audio: TranscriptionAudio,
+    options?: TranscribeOptions,
+  ): Promise<AITranscribeResult>;
 
   // Batch Methods - provider is optional, will auto-detect based on model
   batch<T = string>(
