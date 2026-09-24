@@ -22,4 +22,4 @@ Cost accounting: every `ai_calls` row keeps the registry estimate beside the pro
     ADD COLUMN IF NOT EXISTS "reasoningTokens"   INTEGER;
   ```
 
-- The 0.13 → 1.0 migration guide gains the block above; `04-ai-integration.md` documents what each row field means and that OpenRouter's `max_price` guard is the same registry price times `routing.priceHeadroom`, so a `reportedCost` above `estimatedCost × priceHeadroom` points at a charge the per-token ceiling does not cover; `05-persistence-setup.md` and the docs-site custom-adapter page list `listCalls`.
+- The 0.13 → 1.0 migration guide gains the block above; `04-ai-integration.md` documents what each row field means and notes that comparing `reportedCost` against `estimatedCost × priceHeadroom` is a diagnostic (cache-read rates are unguarded and `priceHeadroom: 0` disables the guard) that needs the endpoint's rates, caching, routing, and fees checked; `05-persistence-setup.md` and the docs-site custom-adapter page list `listCalls`.
