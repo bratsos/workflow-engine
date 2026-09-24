@@ -389,6 +389,22 @@ suspension must not ask again and possibly get a different answer halfway
 through work done under the first one. Takes step options (`retries`, `lease`,
 ...) as its fifth argument like the other `ctx.step.ai` calls.
 
+### `ctx.step.ai.transcribe`
+
+```typescript
+const transcript = await ctx.step.ai.transcribe(
+  "transcript",
+  "whisper-1",
+  new URL(ctx.input.audioUrl),
+);
+// AITranscribeResult: { text, segments, language?, durationInSeconds?, cost }
+```
+
+A transcription model (see `ai.transcribe` in 04-ai-integration.md) called as
+one `run` step. The transcript is memoised, so a replay neither re-sends the
+audio nor pays for it again. Only the result is stored, never the audio;
+a long transcript is spilled to the blob store like any large step result.
+
 ### `ctx.step.ai.map`
 
 One prompt per item under an execution policy, with schema validation and repair applied identically on the realtime and batch paths. Results come back in input order.

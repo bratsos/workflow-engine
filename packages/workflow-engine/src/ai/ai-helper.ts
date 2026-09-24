@@ -34,6 +34,7 @@ import {
 import { getModel, type ModelKey } from "./model-helper";
 import { calculateCostWithDiscount, logger } from "./shared";
 import { streamText as streamTextImpl } from "./stream";
+import { transcribe as transcribeImpl } from "./transcribe";
 import type {
   AIBatch,
   AIBatchProvider,
@@ -46,6 +47,7 @@ import type {
   AIObjectResult,
   AIStreamResult,
   AITextResult,
+  AITranscribeResult,
   BatchLogFn,
   BatchOptions,
   EmbedOptions,
@@ -60,6 +62,8 @@ import type {
   StreamTextInput,
   TextInput,
   TextOptions,
+  TranscribeOptions,
+  TranscriptionAudio,
 } from "./types";
 
 // ============================================================================
@@ -168,6 +172,14 @@ class AIHelperImpl implements AIHelper {
     options?: EvaluateOptions,
   ): Promise<AIEvaluateResult<Q>> {
     return evaluateImpl(this.context(), modelKey, spec, options);
+  }
+
+  transcribe(
+    modelKey: ModelKey,
+    audio: TranscriptionAudio,
+    options?: TranscribeOptions,
+  ): Promise<AITranscribeResult> {
+    return transcribeImpl(this.context(), modelKey, audio, options);
   }
 
   batch<T = string>(
@@ -298,6 +310,10 @@ export {
   registerEvaluationProvider,
 } from "./evaluate";
 export type { ModelKey } from "./model-helper";
+export {
+  getTranscriptionModelProvider,
+  registerTranscriptionProvider,
+} from "./transcribe";
 export type {
   AdapterEmbedRequest,
   AdapterEmbedResponse,
@@ -324,6 +340,7 @@ export type {
   AISDKStreamResult,
   AIStreamResult,
   AITextResult,
+  AITranscribeResult,
   BatchLogFn,
   BatchOptions,
   BatchReclaimPolicy,
@@ -346,4 +363,6 @@ export type {
   TextInput,
   TextOptions,
   TextPart,
+  TranscribeOptions,
+  TranscriptionAudio,
 } from "./types";

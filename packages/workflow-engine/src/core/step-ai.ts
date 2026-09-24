@@ -14,6 +14,7 @@ import type {
   AIEvaluateResult,
   AIObjectResult,
   AITextResult,
+  AITranscribeResult,
   BatchOptions,
   BatchReclaimPolicy,
   EvaluateOptions,
@@ -23,6 +24,8 @@ import type {
   StreamOptions,
   TextInput,
   TextOptions,
+  TranscribeOptions,
+  TranscriptionAudio,
 } from "../ai/types";
 import type { StepRunOptions } from "./steps";
 
@@ -188,6 +191,18 @@ export interface StepAiApi {
     options?: EvaluateOptions,
     stepOptions?: StepRunOptions,
   ): Promise<AIEvaluateResult<Q>>;
+  /**
+   * Transcribe audio durably. The transcript is memoised under `id`, so a
+   * replay after a suspension neither re-sends the audio nor pays for it
+   * again. The audio itself is never stored; only the result is.
+   */
+  transcribe(
+    id: string,
+    modelKey: ModelKey,
+    audio: TranscriptionAudio,
+    options?: TranscribeOptions,
+    stepOptions?: StepRunOptions,
+  ): Promise<AITranscribeResult>;
   /**
    * Run one prompt per item under an execution policy (realtime or batch),
    * with schema validation and repair applied identically on both paths.

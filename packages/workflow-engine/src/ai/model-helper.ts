@@ -61,6 +61,19 @@ export interface ModelConfig {
    * cannot generate text; `workflow-engine-sync` sets this from the catalogue.
    */
   isEvaluationModel?: boolean;
+  /**
+   * True for speech-to-text models answered through `ai.transcribe` (OpenAI's
+   * `whisper-1` / `gpt-4o-transcribe`, Google's transcription models). Not in
+   * OpenRouter's catalogue, so registered by hand with `registerModels`.
+   */
+  isTranscriptionModel?: boolean;
+  /**
+   * USD per minute of transcribed audio, for providers that bill by the
+   * minute and report the audio's duration (OpenAI). Providers that bill by
+   * tokens (Google) are priced from `inputCostPerMillion` /
+   * `outputCostPerMillion` instead, from the usage they report.
+   */
+  transcriptionCostPerMinute?: number;
   supportsTools?: boolean; // true if model supports function calling
   supportsStructuredOutputs?: boolean; // true if model supports JSON schema outputs
   contextLength?: number; // Max context window from OpenRouter
@@ -81,6 +94,8 @@ export interface ModelFilter {
   supportsAsyncBatch?: boolean;
   /** Only include decision models (or, when false, exclude them) */
   isEvaluationModel?: boolean;
+  /** Only include transcription models (or, when false, exclude them) */
+  isTranscriptionModel?: boolean;
 }
 
 /**
@@ -243,6 +258,14 @@ export function listModels(
       if (filter.isEvaluationModel !== undefined) {
         if (filter.isEvaluationModel && !config.isEvaluationModel) return false;
         if (!filter.isEvaluationModel && config.isEvaluationModel) return false;
+      }
+
+      // Filter by transcription model
+      if (filter.isTranscriptionModel !== undefined) {
+        if (filter.isTranscriptionModel && !config.isTranscriptionModel)
+          return false;
+        if (!filter.isTranscriptionModel && config.isTranscriptionModel)
+          return false;
       }
 
       // Filter by tool support

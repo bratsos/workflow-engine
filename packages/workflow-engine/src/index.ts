@@ -116,6 +116,7 @@ export {
   type AIObjectResult,
   type AIStreamResult,
   type AITextResult,
+  type AITranscribeResult,
   type BatchLogFn,
   type BatchOptions,
   type BatchReclaimPolicy,
@@ -136,11 +137,14 @@ export {
   type RecordCallParams,
   registerEmbeddingProvider,
   registerEvaluationProvider,
+  registerTranscriptionProvider,
   type StreamOptions,
   type StreamTextInput,
   type TextInput,
   type TextOptions,
   type TextPart,
+  type TranscribeOptions,
+  type TranscriptionAudio,
 } from "./ai/ai-helper";
 // Batch Engine & OpenRouter Direct Driver
 export {
