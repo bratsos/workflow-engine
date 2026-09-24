@@ -46,16 +46,27 @@ function reportedCostOf(result: AIBatchResult<unknown>): number | undefined {
 }
 
 /**
- * The accounting the transport attached to a provider-successful item.
- * Independent of local validation: a response that fails JSON parsing or
- * the request's schema was still billed by the provider, so the figure
- * travels with the failed result too.
+ * The accounting the transport attached to an item. Independent of local
+ * validation: a response that fails JSON parsing or the request's schema was
+ * still billed and served by the provider, so the figures travel with the
+ * failed result too.
  */
-function reportedCostField(
-  item: EngineBatchItemResult,
-): { reportedCostUsd: number } | Record<string, never> {
+function accountingFields(item: EngineBatchItemResult): {
+  reportedCostUsd?: number;
+  servedBy?: string;
+  cachedInputTokens?: number;
+  reasoningTokens?: number;
+} {
   const value = item.status === "succeeded" ? item.reportedCostUsd : undefined;
-  return value !== undefined ? { reportedCostUsd: value } : {};
+  const servedBy = item.servedBy;
+  const cachedInputTokens = item.cachedInputTokens;
+  const reasoningTokens = item.reasoningTokens;
+  return {
+    ...(value !== undefined ? { reportedCostUsd: value } : {}),
+    ...(servedBy !== undefined ? { servedBy } : {}),
+    ...(cachedInputTokens !== undefined ? { cachedInputTokens } : {}),
+    ...(reasoningTokens !== undefined ? { reasoningTokens } : {}),
+  };
 }
 
 function resolveCustomId(item: EngineBatchItemResult): string | null {
@@ -833,6 +844,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
             status: "failed",
             error,
             validated: false,
+            ...accountingFields(item),
           });
           continue;
         }
@@ -881,7 +893,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
               error: `Failed to parse JSON response for schema validation: ${parseError}`,
               validated: false,
               responseText: item.text,
-              ...reportedCostField(item),
+              ...accountingFields(item),
             });
             continue;
           }
@@ -911,7 +923,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
               error: `Schema validation threw an error: ${errText}`,
               validated: false,
               responseText: item.text,
-              ...reportedCostField(item),
+              ...accountingFields(item),
             });
             continue;
           }
@@ -928,7 +940,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
               error: `Response did not match the request's schema: ${validation.error.message}`,
               validated: false,
               responseText: item.text,
-              ...reportedCostField(item),
+              ...accountingFields(item),
             });
             continue;
           }
@@ -941,7 +953,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
             outputTokens,
             status: "succeeded",
             validated: true,
-            ...reportedCostField(item),
+            ...accountingFields(item),
           });
         } else {
           unvalidatedCount++;
@@ -957,7 +969,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
             outputTokens,
             status: "succeeded",
             validated: false,
-            ...reportedCostField(item),
+            ...accountingFields(item),
           });
         }
       }
@@ -1084,6 +1096,13 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
               estimatedCost,
               reportedCost,
               costSource,
+              ...(r.servedBy !== undefined ? { servedBy: r.servedBy } : {}),
+              ...(r.cachedInputTokens !== undefined
+                ? { cachedInputTokens: r.cachedInputTokens }
+                : {}),
+              ...(r.reasoningTokens !== undefined
+                ? { reasoningTokens: r.reasoningTokens }
+                : {}),
               batchId,
               requestId: r.id,
               metadata: {

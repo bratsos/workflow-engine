@@ -1256,4 +1256,45 @@ describe("Batch Subsystem - OpenRouter per-request reported cost", () => {
     expect(items[0]?.status).toBe("succeeded");
     expect(items[0]).not.toHaveProperty("reportedCostUsd");
   });
+
+  it("extracts servedBy, cachedInputTokens, and reasoningTokens from OpenRouter items", async () => {
+    const mockFetch = vi.fn(async () =>
+      completedBatch([
+        {
+          custom_id: "r1",
+          response: {
+            status_code: 200,
+            body: {
+              provider: "DeepInfra",
+              choices: [{ message: { content: "one" } }],
+              usage: {
+                prompt_tokens: 100,
+                completion_tokens: 20,
+                cost: 0.005,
+                prompt_tokens_details: { cached_tokens: 40 },
+                completion_tokens_details: { reasoning_tokens: 10 },
+              },
+            },
+          },
+        },
+      ]),
+    );
+    const model = createOpenRouterBatchModel({
+      apiKey: "test-key",
+      modelId: "openai/gpt-4o",
+      fetch: mockFetch as any,
+    });
+
+    const items: EngineBatchItemResult[] = [];
+    for await (const item of model.results(ref)) items.push(item);
+
+    expect(items[0]).toMatchObject({
+      id: "r1",
+      status: "succeeded",
+      servedBy: "DeepInfra",
+      cachedInputTokens: 40,
+      reasoningTokens: 10,
+      reportedCostUsd: 0.005,
+    });
+  });
 });

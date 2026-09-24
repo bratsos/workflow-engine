@@ -529,6 +529,12 @@ export type AIBatchResult<T = string> =
        * transports; `recordResults` then bills the batch estimate.
        */
       reportedCostUsd?: number;
+      /** The endpoint that served the request, when known. */
+      servedBy?: string;
+      /** Input tokens served from the prompt cache, when reported. */
+      cachedInputTokens?: number;
+      /** Reasoning tokens the model emitted, when reported. */
+      reasoningTokens?: number;
     }
   | {
       id: string;
@@ -555,6 +561,12 @@ export type AIBatchResult<T = string> =
        * `recordResults`. Absent when the provider itself failed the request.
        */
       reportedCostUsd?: number;
+      /** The endpoint that served the request, when known. */
+      servedBy?: string;
+      /** Input tokens served from the prompt cache, when reported. */
+      cachedInputTokens?: number;
+      /** Reasoning tokens the model emitted, when reported. */
+      reasoningTokens?: number;
     };
 
 /** Handle for tracking a submitted batch */

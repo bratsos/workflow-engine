@@ -45,6 +45,9 @@ export type EngineBatchItemResult =
        * on the vendor transports, whose batch results carry tokens only.
        */
       reportedCostUsd?: number;
+      servedBy?: string;
+      cachedInputTokens?: number;
+      reasoningTokens?: number;
     }
   | {
       id: string;
@@ -52,6 +55,9 @@ export type EngineBatchItemResult =
       error?: string;
       inputTokens?: number;
       outputTokens?: number;
+      servedBy?: string;
+      cachedInputTokens?: number;
+      reasoningTokens?: number;
     };
 
 /**

@@ -868,4 +868,46 @@ describe("AIBatchImpl and AIHelper batch wiring", () => {
     expect(row?.reportedCost).toBeUndefined();
     expect(row?.costSource).toBe("estimated");
   });
+
+  it("carries servedBy, cachedInputTokens, and reasoningTokens through to logged batch results", async () => {
+    const mockBatchModel = {
+      provider: "openrouter",
+      modelId: "openai/gpt-4o",
+      results: vi.fn(async function* () {
+        yield {
+          id: "r-accounting",
+          status: "succeeded" as const,
+          text: "hello batch",
+          inputTokens: 1000,
+          outputTokens: 200,
+          reportedCostUsd: 0.05,
+          servedBy: "DeepInfra",
+          cachedInputTokens: 400,
+          reasoningTokens: 50,
+        };
+      }),
+    };
+    const { logger, loggedBatchResults } = makeFakeAICallLogger();
+    const ctx = { topic: "test-topic", aiCallLogger: logger as any };
+    const batch = new AIBatchImpl(ctx, "gemini-2.5-flash", "openrouter");
+    (batch as any).providerPromise = Promise.resolve(mockBatchModel);
+
+    const results = await batch.getResults("b-accounting");
+    expect(results[0]).toMatchObject({
+      id: "r-accounting",
+      servedBy: "DeepInfra",
+      cachedInputTokens: 400,
+      reasoningTokens: 50,
+    });
+
+    const row = loggedBatchResults[0]?.records[0];
+    expect(row).toMatchObject({
+      requestId: "r-accounting",
+      servedBy: "DeepInfra",
+      cachedInputTokens: 400,
+      reasoningTokens: 50,
+      cost: 0.05,
+      costSource: "reported",
+    });
+  });
 });
