@@ -272,6 +272,8 @@ harness.mockAi.failOnce("summarize", new Error("transient upstream 503"));
 // `evaluate` answers by question id; unscripted questions get the first
 // `choice` option, level 0 of a `score`, and probability 0.5 for a `boolean`.
 harness.mockAi.setEvaluateAnswer("team", { type: "choice", choice: "billing" });
+// Every `transcribe` returns this; unscripted, the text is "mock transcript".
+harness.mockAi.setTranscribeResponse({ text: "the interview", durationInSeconds: 600 });
 
 expect(harness.mockAi.helper.getAllCallsRecursive()).toHaveLength(2);
 ```

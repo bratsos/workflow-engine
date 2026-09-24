@@ -186,6 +186,18 @@ answers.outage.probability; // P(true)
 
 Only registry entries with `isEvaluationModel: true` can answer; `workflow-engine-sync` sets it for every model whose OpenRouter output modality is `decisions`. Decision models bill input tokens only, and OpenRouter's reported cost is recorded with the call. Inside a stage, `ctx.step.ai.evaluate(id, model, spec)` memoises the answers so a replay takes the same branch. `registerEvaluationProvider(provider, factory)` plugs in other evaluation providers.
 
+### 6. `transcribe`
+Speech to text through the AI SDK's `transcribe`, with OpenAI's (`whisper-1`, `gpt-4o-transcribe`) or Google's transcription models, or any AI SDK transcription provider registered with `registerTranscriptionProvider`.
+
+```typescript
+const { text, segments, durationInSeconds, cost } = await ai.transcribe(
+  "whisper-1",
+  new URL("https://example.com/interview.mp3"),
+);
+```
+
+Transcription models are registered by hand with `isTranscriptionModel: true`, since OpenRouter's catalogue has none. Cost follows how the provider bills: per minute of audio (`transcriptionCostPerMinute`) when it reports a duration, or per token when it reports usage, as Google does. Inside a stage, `ctx.step.ai.transcribe(id, model, audio)` memoises the transcript so a replay does not re-send the audio.
+
 ### Timeouts and adapters
 
 `AIHelperOptions.timeout.perCallMs` applies a deadline to every non-batch call, and `timeoutMs` on the text, object, embed and stream options overrides it per call. On expiry the call throws `AICallTimeoutError` (with `timeoutMs` and `modelKey`) and the failure is still logged as a cost row.

@@ -159,6 +159,7 @@ interface AIHelper {
   embed(modelKey, text, options?): Promise<AIEmbedResult>;
   streamText(modelKey, input, options?): AIStreamResult;
   evaluate(modelKey, { state, questions }, options?): Promise<AIEvaluateResult>;
+  transcribe(modelKey, audio, options?): Promise<AITranscribeResult>;
   batch<T = string>(modelKey, provider?, options?): AIBatch<T>;
 
   createChild(segment, id?): AIHelper;
@@ -459,6 +460,79 @@ fallback estimate.
 Inside a stage use `ctx.step.ai.evaluate(id, model, { state, questions })`
 (see 12-durable-steps.md), which memoises the answers so a replay takes the
 same branch.
+
+## transcribe
+
+Speech to text through the AI SDK's `transcribe`.
+
+```typescript
+import { registerModels } from "@bratsos/workflow-engine";
+
+registerModels({
+  "whisper-1": {
+    id: "whisper-1",
+    name: "Whisper",
+    provider: "openai",                 // needs @ai-sdk/openai installed
+    isTranscriptionModel: true,
+    transcriptionCostPerMinute: 0.006,  // billed per minute of audio
+    inputCostPerMillion: 0,
+    outputCostPerMillion: 0,
+  },
+  "gemini-transcribe": {
+    id: "gemini-3.5-transcribe",
+    name: "Gemini Transcribe",
+    provider: "google",
+    isTranscriptionModel: true,
+    inputCostPerMillion: 1,             // billed per token, from reported usage
+    outputCostPerMillion: 4,
+  },
+});
+
+const result = await ai.transcribe("whisper-1", audioBytes);
+// or: await ai.transcribe("whisper-1", new URL("https://.../interview.mp3"));
+
+result.text;              // the transcript
+result.segments;          // [{ text, startSecond, endSecond }], when returned
+result.language;          // "en", when reported
+result.durationInSeconds; // 90, when reported
+result.cost;
+```
+
+**Audio.** A `Uint8Array`, `ArrayBuffer`, base64 string, or a `URL` the AI SDK
+downloads first (2 GiB default limit). Providers have their own size limits
+(OpenAI's is 25 MB); split long recordings before transcribing.
+
+**Models.** Only a registry entry with `isTranscriptionModel: true` can answer;
+any other model throws before a request is made. Transcription models are not
+in OpenRouter's catalogue, so `workflow-engine-sync` does not produce them;
+register them by hand. Built-in providers are `"openai"` (`openai.transcription`,
+from the optional `@ai-sdk/openai` peer) and `"google"` (`google.transcription`).
+`registerTranscriptionProvider(provider, factory)` plugs in any other AI SDK
+transcription model (Groq, Deepgram, ElevenLabs, AssemblyAI, ...):
+
+```typescript
+import { registerTranscriptionProvider } from "@bratsos/workflow-engine";
+import { groq } from "@ai-sdk/groq";
+
+registerTranscriptionProvider("groq", (id) => groq.transcription(id));
+```
+
+**Cost.** Providers bill one of two ways, and the estimate follows whichever
+the provider reports: per minute of audio (`durationInSeconds` times
+`transcriptionCostPerMinute`; OpenAI) or per token (the reported usage priced
+at `inputCostPerMillion` / `outputCostPerMillion`; Google reports
+`total_input_tokens` / `total_output_tokens` in its metadata). The row is
+logged with `callType: "transcribe"`, the reported tokens, and a description
+of the audio (its URL or byte size) as the prompt; the audio itself is never
+logged.
+
+**Options.** `abortSignal`, `timeoutMs`, `maxRetries` (default 2),
+`headers`, `providerOptions` (for example
+`{ openai: { language: "en", timestampGranularities: ["segment"] } }`).
+
+Inside a stage use `ctx.step.ai.transcribe(id, model, audio)` (see
+12-durable-steps.md), which memoises the transcript so a replay neither
+re-sends the audio nor pays for it again.
 
 ## streamText
 
