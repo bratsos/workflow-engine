@@ -1,6 +1,11 @@
 import { z } from "zod";
 import { toPortableJsonSchema } from "../schema-portability";
 import {
+  extractReportedCost,
+  extractServedBy,
+  extractUsageDetails,
+} from "../shared";
+import {
   type EngineBatchItemResult,
   type EngineBatchModel,
   type EngineBatchRef,
@@ -270,6 +275,13 @@ export function createOpenRouterBatchModel(
                 { role: "user", content: req.prompt },
               ]
             : [{ role: "user", content: req.prompt }],
+          // Each item body is a chat-completions request, so the same
+          // usage-accounting flag the sync path sends asks OpenRouter to
+          // put `cost` (and the BYOK fields) on the item's `usage`. The
+          // batch-level `usage.cost` is the total only; per-item cost is
+          // what the ledger needs. Read defensively: an item whose usage
+          // carries no cost is priced from the catalogue instead.
+          usage: { include: true },
         };
         if (req.maxOutputTokens !== undefined) {
           body.max_tokens = req.maxOutputTokens;
@@ -501,6 +513,17 @@ export function createOpenRouterBatchModel(
             const usage = body?.usage;
             const inputTokens = usage?.prompt_tokens ?? 0;
             const outputTokens = usage?.completion_tokens ?? 0;
+            // Same reading (incl. BYOK upstream) as the sync path.
+            const reportedCostUsd = extractReportedCost({
+              providerMetadata: { openrouter: { usage } },
+            });
+            const servedBy = extractServedBy({
+              providerMetadata: { openrouter: { provider: body?.provider } },
+            });
+            const usageDetails = extractUsageDetails({
+              usage: { raw: usage },
+              providerMetadata: { openrouter: { usage } },
+            });
 
             yield {
               id: customId,
@@ -508,6 +531,9 @@ export function createOpenRouterBatchModel(
               text,
               inputTokens,
               outputTokens,
+              ...(reportedCostUsd !== undefined ? { reportedCostUsd } : {}),
+              ...(servedBy !== undefined ? { servedBy } : {}),
+              ...usageDetails,
             };
           } else {
             const body = response.body as Record<string, any> | undefined;

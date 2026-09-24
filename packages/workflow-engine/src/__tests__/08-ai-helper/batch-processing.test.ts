@@ -761,4 +761,153 @@ describe("AIBatchImpl and AIHelper batch wiring", () => {
     expect(loggedBatchResults[0]?.batchId).toBe("b123");
     expect(loggedBatchResults[0]?.records[0]?.cost).toBeGreaterThan(0);
   });
+
+  it("records a transport-reported per-request cost as the row's cost", async () => {
+    // getResults() carries OpenRouter's per-request usage.cost on the
+    // result; the ledger row must bill that figure, not the batch rate.
+    const { logger, loggedBatchResults } = makeFakeAICallLogger();
+    const ctx = { topic: "test-topic", aiCallLogger: logger as any };
+    const batch = new AIBatchImpl(ctx, "gemini-2.5-flash", "openrouter");
+
+    await batch.recordResults("b-reported", [
+      {
+        id: "r1",
+        prompt: "hello",
+        result: "world",
+        inputTokens: 100,
+        outputTokens: 200,
+        status: "succeeded",
+        validated: true,
+        reportedCostUsd: 0.0123,
+      },
+    ]);
+
+    const row = loggedBatchResults[0]?.records[0];
+    expect(row?.cost).toBe(0.0123);
+    expect(row?.reportedCost).toBe(0.0123);
+    expect(row?.costSource).toBe("reported");
+  });
+
+  it("keeps the provider's reported cost on a result that fails schema validation", async () => {
+    // The provider served (and billed) the response; only the local JSON
+    // parse / schema check failed. The ledger row must still carry the
+    // reported charge, not a token estimate of it.
+    const mockBatchModel = {
+      provider: "openrouter",
+      modelId: "openai/gpt-4o",
+      start: vi.fn(),
+      status: vi.fn(async () => ({ status: "completed" as const })),
+      results: vi.fn(async function* () {
+        yield {
+          id: "r-bad-json",
+          status: "succeeded" as const,
+          text: "not json at all",
+          inputTokens: 100,
+          outputTokens: 20,
+          reportedCostUsd: 0.12,
+        };
+        yield {
+          id: "r-wrong-shape",
+          status: "succeeded" as const,
+          text: JSON.stringify({ a: 1 }),
+          inputTokens: 100,
+          outputTokens: 20,
+          reportedCostUsd: 0.05,
+        };
+      }),
+    };
+    const { logger, loggedBatchResults } = makeFakeAICallLogger();
+    const ctx = { topic: "test", aiCallLogger: logger as any };
+    const batch = new AIBatchImpl(ctx, "gemini-2.5-flash", "openrouter");
+    (batch as any).providerPromise = Promise.resolve(mockBatchModel);
+
+    const schema = z.object({ a: z.string() });
+    const results = await batch.getResults("b-validation", {
+      schemas: { "r-bad-json": schema, "r-wrong-shape": schema },
+    });
+
+    expect(results.map((r) => r.status)).toEqual(["failed", "failed"]);
+    expect(results.map((r) => r.reportedCostUsd)).toEqual([0.12, 0.05]);
+
+    const rows = loggedBatchResults[0]?.records ?? [];
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toMatchObject({
+      requestId: "r-bad-json",
+      cost: 0.12,
+      reportedCost: 0.12,
+      costSource: "reported",
+      metadata: expect.objectContaining({ status: "failed" }),
+    });
+    expect(rows[1]).toMatchObject({
+      requestId: "r-wrong-shape",
+      cost: 0.05,
+      reportedCost: 0.05,
+      costSource: "reported",
+    });
+  });
+
+  it("falls back to the batch estimate when no per-request cost was reported", async () => {
+    const { logger, loggedBatchResults } = makeFakeAICallLogger();
+    const ctx = { topic: "test-topic", aiCallLogger: logger as any };
+    const batch = new AIBatchImpl(ctx, "gemini-2.5-flash", "openrouter");
+
+    await batch.recordResults("b-estimated", [
+      {
+        id: "r1",
+        prompt: "hello",
+        result: "world",
+        inputTokens: 100,
+        outputTokens: 200,
+        status: "succeeded",
+        validated: true,
+      },
+    ]);
+
+    const row = loggedBatchResults[0]?.records[0];
+    expect(row?.cost).toBeGreaterThan(0);
+    expect(row?.reportedCost).toBeUndefined();
+    expect(row?.costSource).toBe("estimated");
+  });
+
+  it("carries servedBy, cachedInputTokens, and reasoningTokens through to logged batch results", async () => {
+    const mockBatchModel = {
+      provider: "openrouter",
+      modelId: "openai/gpt-4o",
+      results: vi.fn(async function* () {
+        yield {
+          id: "r-accounting",
+          status: "succeeded" as const,
+          text: "hello batch",
+          inputTokens: 1000,
+          outputTokens: 200,
+          reportedCostUsd: 0.05,
+          servedBy: "DeepInfra",
+          cachedInputTokens: 400,
+          reasoningTokens: 50,
+        };
+      }),
+    };
+    const { logger, loggedBatchResults } = makeFakeAICallLogger();
+    const ctx = { topic: "test-topic", aiCallLogger: logger as any };
+    const batch = new AIBatchImpl(ctx, "gemini-2.5-flash", "openrouter");
+    (batch as any).providerPromise = Promise.resolve(mockBatchModel);
+
+    const results = await batch.getResults("b-accounting");
+    expect(results[0]).toMatchObject({
+      id: "r-accounting",
+      servedBy: "DeepInfra",
+      cachedInputTokens: 400,
+      reasoningTokens: 50,
+    });
+
+    const row = loggedBatchResults[0]?.records[0];
+    expect(row).toMatchObject({
+      requestId: "r-accounting",
+      servedBy: "DeepInfra",
+      cachedInputTokens: 400,
+      reasoningTokens: 50,
+      cost: 0.05,
+      costSource: "reported",
+    });
+  });
 });

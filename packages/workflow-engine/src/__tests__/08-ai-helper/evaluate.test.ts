@@ -158,6 +158,12 @@ describe("ai.evaluate", () => {
     });
 
     expect(logger.logCall).toHaveBeenCalledTimes(1);
+    // 400 input tokens at $0.042 per million: the registry estimate, kept
+    // alongside the reported figure.
+    expect(logger.logCall.mock.calls[0]![0].estimatedCost).toBeCloseTo(
+      (400 * 0.042) / 1_000_000,
+      12,
+    );
     expect(logger.logCall.mock.calls[0]![0]).toMatchObject({
       topic: "evaluate.test",
       callType: "evaluate",
@@ -165,6 +171,7 @@ describe("ai.evaluate", () => {
       inputTokens: 400,
       cost: 0.0000168,
       costSource: "reported",
+      servedBy: "TypeSafe",
       metadata: { questionCount: 3, responseId: "gen-dec-1" },
     });
   });

@@ -183,6 +183,11 @@ function generateTypeScript(models: Record<string, ModelConfig>): string {
           : []),
         `    inputCostPerMillion: ${config.inputCostPerMillion},`,
         `    outputCostPerMillion: ${config.outputCostPerMillion},`,
+        ...(config.cachedInputCostPerMillion !== undefined
+          ? [
+              `    cachedInputCostPerMillion: ${config.cachedInputCostPerMillion},`,
+            ]
+          : []),
         `    provider: "${config.provider}",`,
         `    isEmbeddingModel: ${config.isEmbeddingModel || false},`,
         // Emitted only when set, so a re-sync leaves every other entry as it was.
@@ -212,6 +217,11 @@ function generateTypeScript(models: Record<string, ModelConfig>): string {
               `      minPromptTokens: ${config.longContextTier.minPromptTokens},`,
               `      inputCostPerMillion: ${config.longContextTier.inputCostPerMillion},`,
               `      outputCostPerMillion: ${config.longContextTier.outputCostPerMillion},`,
+              ...(config.longContextTier.cachedInputCostPerMillion !== undefined
+                ? [
+                    `      cachedInputCostPerMillion: ${config.longContextTier.cachedInputCostPerMillion},`,
+                  ]
+                : []),
               `    },`,
             ]
           : []),

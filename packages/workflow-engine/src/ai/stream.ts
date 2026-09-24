@@ -12,6 +12,7 @@ import { streamText as aiStreamText } from "ai";
 import { logFailure } from "./generate";
 import { getModel, type ModelKey } from "./model-helper";
 import { logger, resolveCost, resolveLanguageModel } from "./shared";
+import { costResultLikeForSteps } from "./step-cost";
 import {
   createCallTimeout,
   runWithCallTimeout,
@@ -110,11 +111,19 @@ export function streamText(
   ) => {
     if (usageResolved) return cachedUsage!;
 
-    const { cost, reportedCostUsd, costSource } = resolveCost(
+    const {
+      cost,
+      estimatedCostUsd,
+      reportedCostUsd,
+      costSource,
+      servedBy,
+      cachedInputTokens,
+      reasoningTokens,
+    } = resolveCost(
       modelKey,
       inputTokens,
       outputTokens,
-      resultLike,
+      costResultLikeForSteps(resultLike),
     );
     const durationMs = Date.now() - startTime;
 
@@ -149,8 +158,12 @@ export function streamText(
       inputTokens,
       outputTokens,
       cost,
+      estimatedCost: estimatedCostUsd,
       reportedCost: reportedCostUsd,
       costSource,
+      servedBy,
+      cachedInputTokens,
+      reasoningTokens,
       metadata: {
         temperature: options.temperature,
         maxTokens: options.maxTokens,
@@ -165,6 +178,21 @@ export function streamText(
 
     return cachedUsage;
   };
+
+  // The adapter path persists from stream completion or getUsage(),
+  // whichever comes first; both must hand cost resolution the same inputs
+  // so the recorded cost does not depend on consumption order.
+  const persistAdapterUsage = (response: AdapterStreamResponse) =>
+    persistUsage(
+      response.inputTokens ?? 0,
+      response.outputTokens ?? 0,
+      response.text ?? fullText,
+      response.reasoning,
+      {
+        providerMetadata: response.providerMetadata,
+        costUsd: response.costUsd,
+      },
+    );
 
   // Build the streamText params based on input type
   const baseParams = {
@@ -259,18 +287,7 @@ export function streamText(
               reader.next(),
             );
             if (done) {
-              if (adapterResponse) {
-                persistUsage(
-                  adapterResponse.inputTokens ?? 0,
-                  adapterResponse.outputTokens ?? 0,
-                  adapterResponse.text ?? fullText,
-                  adapterResponse.reasoning,
-                  {
-                    providerMetadata: adapterResponse.providerMetadata,
-                    costUsd: adapterResponse.costUsd,
-                  },
-                );
-              }
+              if (adapterResponse) persistAdapterUsage(adapterResponse);
               return { done: true, value: undefined };
             }
             fullText += value;
@@ -298,15 +315,7 @@ export function streamText(
   const getUsage = async () => {
     try {
       if (timeout.timedOut() && timeout.error) throw timeout.error;
-      if (adapterResponse) {
-        return persistUsage(
-          adapterResponse.inputTokens ?? 0,
-          adapterResponse.outputTokens ?? 0,
-          adapterResponse.text ?? fullText,
-          adapterResponse.reasoning,
-          { providerMetadata: adapterResponse.providerMetadata },
-        );
-      }
+      if (adapterResponse) return persistAdapterUsage(adapterResponse);
       const sdkResult = result!;
       const usage = await runWithCallTimeout(timeout, () => sdkResult.usage);
       const reasoning = await getReasoning();
@@ -321,11 +330,15 @@ export function streamText(
       const providerMetadata =
         (await runWithCallTimeout(timeout, () => sdkResult.providerMetadata)) ??
         finalStep?.providerMetadata;
+      // Every step, so a tool-calling call is billed as the sum of its
+      // steps rather than the final step alone (see step-cost.ts).
+      const steps = await runWithCallTimeout(timeout, () => sdkResult.steps);
 
       return persistUsage(inputTokens, outputTokens, responseText, reasoning, {
         usage,
         providerMetadata,
         finalStep,
+        steps,
       });
     } catch (error) {
       logError(error);
