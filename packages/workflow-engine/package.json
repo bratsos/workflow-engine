@@ -128,8 +128,8 @@
     }
   },
   "devDependencies": {
-    "@ai-sdk/anthropic": "^4.0.46",
-    "@ai-sdk/openai": "^4.0.53",
+    "@ai-sdk/anthropic": "^4.0.62",
+    "@ai-sdk/openai": "^4.0.74",
     "@prisma/client": "^6.0.0",
     "@types/node": "^22",
     "prisma": "^6.0.0",

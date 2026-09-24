@@ -1,13 +1,4 @@
-import type {
-  Experimental_BatchLanguageModelV4,
-  Experimental_BatchV4ItemResult,
-  Experimental_BatchV4OperationOptions,
-  Experimental_BatchV4StartOptions,
-  Experimental_BatchV4StartResult,
-  Experimental_BatchV4Status,
-  Experimental_LanguageModelV4BatchRequest,
-  LanguageModelV4GenerateResult,
-} from "@ai-sdk/provider";
+import type { LanguageModelV4GenerateResult } from "@ai-sdk/provider";
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import {
@@ -17,10 +8,21 @@ import {
   EngineBatchRefSchema,
   type EngineBatchRequest,
   fromAiSdk,
+  fromAiSdkProviderBatch,
   isEngineBatchRef,
   resolveAiSdkBatchModel,
   toJsonSchema,
 } from "../../ai/batch";
+import type {
+  BatchLanguageModel as Experimental_BatchLanguageModelV4,
+  BatchItemResult as Experimental_BatchV4ItemResult,
+  BatchOperationOptions as Experimental_BatchV4OperationOptions,
+  BatchStartOptions as Experimental_BatchV4StartOptions,
+  BatchStartResult as Experimental_BatchV4StartResult,
+  BatchStatus as Experimental_BatchV4Status,
+  LanguageModelBatchRequest as Experimental_LanguageModelV4BatchRequest,
+} from "../../ai/batch/ai-sdk.js";
+import { fromAiSdkProvider } from "../../ai/batch/ai-sdk.js";
 
 // Hand-rolled fake Experimental_BatchLanguageModelV4 for testing
 class MockBatchLanguageModel
@@ -377,6 +379,162 @@ describe("Batch Subsystem - AI SDK Adapter (fromAiSdk)", () => {
     const openaiModel = await resolveAiSdkBatchModel("openai", "gpt-4o");
     expect(openaiModel.provider).toBe("openai.responses");
     expect(openaiModel.modelId).toBe("gpt-4o");
+  });
+
+  it("drives a provider-level batch, sending every request as text for the model", async () => {
+    const started: unknown[][] = [];
+    const batch = {
+      async doStartBatch(options: { requests: ReadonlyArray<unknown> }) {
+        started.push([...options.requests]);
+        return { batchId: "b-1", status: "pending" as const };
+      },
+      async doGetBatchStatus() {
+        return { status: "completed" as const };
+      },
+      async doGetBatchResults() {
+        return new ReadableStream({
+          start(controller) {
+            controller.enqueue({
+              type: "text",
+              id: "r1",
+              status: "succeeded",
+              result: {
+                content: [{ type: "text", text: "hello back" }],
+                usage: {
+                  inputTokens: { total: 7 },
+                  outputTokens: { total: 3 },
+                },
+              },
+            });
+            controller.enqueue({
+              type: "text",
+              id: "r2",
+              status: "failed",
+              error: { message: "content filtered" },
+            });
+            controller.close();
+          },
+        });
+      },
+    };
+
+    const model = fromAiSdkProviderBatch(batch, {
+      provider: "vendor.messages",
+      modelId: "vendor-model",
+    });
+    const ref = await model.start([
+      { id: "r1", prompt: "hello" },
+      { id: "r2", prompt: "again" },
+    ]);
+
+    expect(started[0]).toEqual([
+      expect.objectContaining({
+        type: "text",
+        id: "r1",
+        modelId: "vendor-model",
+      }),
+      expect.objectContaining({
+        type: "text",
+        id: "r2",
+        modelId: "vendor-model",
+      }),
+    ]);
+    expect(ref).toMatchObject({ id: "b-1", provider: "vendor.messages" });
+    expect((await model.status(ref)).status).toBe("completed");
+
+    const results = [];
+    for await (const result of model.results(ref)) results.push(result);
+    expect(results).toEqual([
+      {
+        id: "r1",
+        status: "succeeded",
+        text: "hello back",
+        inputTokens: 7,
+        outputTokens: 3,
+      },
+      { id: "r2", status: "failed", error: "content filtered" },
+    ]);
+  });
+
+  it("uses a provider's experimental_batch when present, else the model's own batch methods", async () => {
+    const providerLevel = Object.assign(() => ({ provider: "p.messages" }), {
+      experimental_batch: () => ({
+        doStartBatch: async () => ({
+          batchId: "via-provider",
+          status: "pending" as const,
+        }),
+        doGetBatchStatus: async () => ({ status: "pending" as const }),
+        doGetBatchResults: async () => new ReadableStream(),
+      }),
+    });
+    const viaProvider = fromAiSdkProvider(providerLevel, "m", "fallback");
+    expect(viaProvider.provider).toBe("p.messages");
+    expect((await viaProvider.start([{ id: "r", prompt: "x" }])).id).toBe(
+      "via-provider",
+    );
+
+    // A vendor release from before the provider-level seam.
+    const viaModel = fromAiSdkProvider(
+      () => new MockBatchLanguageModel(),
+      "mock-model",
+      "fallback",
+    );
+    expect(viaModel.provider).toBe("mock-provider");
+
+    expect(() => fromAiSdkProvider(() => ({}), "m", "none")).toThrow(
+      /not batch-capable/,
+    );
+  });
+
+  it("submits a real Anthropic batch through the current SDK's provider-level seam", async () => {
+    const posts: Array<{ url: string; body: string }> = [];
+    vi.stubEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+        posts.push({ url: String(url), body: String(init?.body ?? "") });
+        return new Response(
+          JSON.stringify({
+            id: "msgbatch_1",
+            type: "message_batch",
+            processing_status: "in_progress",
+            request_counts: {
+              processing: 1,
+              succeeded: 0,
+              errored: 0,
+              canceled: 0,
+              expired: 0,
+            },
+            ended_at: null,
+            created_at: "2026-09-24T00:00:00Z",
+            expires_at: "2026-09-25T00:00:00Z",
+            cancel_initiated_at: null,
+            results_url: null,
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }),
+    );
+    try {
+      const model = await resolveAiSdkBatchModel(
+        "anthropic",
+        "claude-haiku-4-5",
+      );
+      const ref = await model.start([{ id: "r1", prompt: "hello" }]);
+
+      expect(ref).toMatchObject({
+        id: "msgbatch_1",
+        provider: "anthropic.messages",
+      });
+      expect(posts[0]!.url).toContain("/messages/batches");
+      expect(JSON.parse(posts[0]!.body).requests[0]).toMatchObject({
+        custom_id: "r1",
+        params: expect.objectContaining({ model: "claude-haiku-4-5" }),
+      });
+    } finally {
+      vi.unstubAllGlobals();
+      vi.unstubAllEnvs();
+    }
   });
 });
 

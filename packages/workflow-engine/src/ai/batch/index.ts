@@ -1,5 +1,6 @@
 export {
   fromAiSdk,
+  fromAiSdkProviderBatch,
   resolveAiSdkBatchModel,
 } from "./ai-sdk";
 export {

@@ -84,6 +84,7 @@ export {
   type EngineBatchRequest,
   type EngineBatchStatus,
   fromAiSdk,
+  fromAiSdkProviderBatch,
   type OpenRouterBatchConfig,
   resolveAiSdkBatchModel,
 } from "./ai/batch";
