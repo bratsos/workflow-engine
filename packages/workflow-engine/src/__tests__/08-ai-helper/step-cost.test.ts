@@ -18,6 +18,7 @@ import {
 } from "../../ai/step-cost.js";
 
 const MODEL = "step-cost-test-model";
+const CACHED_MODEL = "step-cost-cached-model";
 
 beforeAll(() => {
   registerModels({
@@ -29,14 +30,46 @@ beforeAll(() => {
       outputCostPerMillion: 2,
       provider: "openrouter",
     },
+    [CACHED_MODEL]: {
+      id: "vendor/step-cost-cached",
+      name: "Step Cost Cached",
+      // $1/M in, $0.10/M cached in, $2/M out.
+      inputCostPerMillion: 1,
+      cachedInputCostPerMillion: 0.1,
+      outputCostPerMillion: 2,
+      provider: "openrouter",
+    },
   });
 });
 
-function step(cost: number | undefined, tokens = 10) {
+function step(
+  cost: number | undefined,
+  tokens = 10,
+  extra: { provider?: string; cachedTokens?: number } = {},
+) {
   return {
     usage: { inputTokens: tokens, outputTokens: tokens },
-    providerMetadata:
-      cost === undefined ? {} : { openrouter: { usage: { cost } } },
+    providerMetadata: {
+      ...(cost === undefined && extra.provider === undefined
+        ? {}
+        : {
+            openrouter: {
+              ...(cost === undefined
+                ? {}
+                : {
+                    usage: {
+                      cost,
+                      ...(extra.cachedTokens !== undefined
+                        ? { promptTokensDetails: { cachedTokens: extra.cachedTokens } }
+                        : {}),
+                    },
+                  }),
+              ...(extra.provider !== undefined
+                ? { provider: extra.provider }
+                : {}),
+            },
+          }),
+    },
   };
 }
 
@@ -98,10 +131,13 @@ describe("resolveCost over a multi-step result", () => {
 
   it("estimates the whole call when one step lacks a reported cost", () => {
     // Neither the partial sum ($0.40) nor the final step ($0.30) is the
-    // bill; the registry estimate ($3.00) is the honest number.
+    // bill; the registry estimate ($3.00) is the honest number. The final
+    // step's figure is reachable through both the top-level metadata and
+    // `finalStep`; neither may leak into the fallback.
     const result = {
       usage: { inputTokens: 1_000_000, outputTokens: 1_000_000 },
       providerMetadata: { openrouter: { usage: { cost: 0.3 } } },
+      finalStep: step(0.3),
       steps: [step(0.1), step(undefined), step(0.3)],
     };
     const r = resolveCost(
@@ -130,5 +166,69 @@ describe("resolveCost over a multi-step result", () => {
     );
     expect(r.costSource).toBe("reported");
     expect(r.cost).toBe(0.42);
+  });
+});
+
+describe("costResultLikeForSteps accounting details", () => {
+  it("keeps the aggregate token breakdown and the agreed serving endpoint", () => {
+    // Half the input was a cache read: the estimate must price it at the
+    // cached rate, and the row must keep the breakdown and the endpoint.
+    const result = {
+      usage: {
+        inputTokens: 1_000_000,
+        outputTokens: 1_000_000,
+        inputTokenDetails: { cacheReadTokens: 500_000 },
+        outputTokenDetails: { reasoningTokens: 100 },
+      },
+      steps: [
+        step(0.1, 10, { provider: "Google" }),
+        step(undefined, 10, { provider: "Google" }),
+      ],
+    };
+    const r = resolveCost(
+      CACHED_MODEL,
+      1_000_000,
+      1_000_000,
+      costResultLikeForSteps(result),
+    );
+    expect(r.costSource).toBe("estimated");
+    // 500k @ $1 + 500k @ $0.10 + 1M @ $2
+    expect(r.cost).toBeCloseTo(0.5 + 0.05 + 2, 10);
+    expect(r.servedBy).toBe("Google");
+    expect(r.cachedInputTokens).toBe(500_000);
+    expect(r.reasoningTokens).toBe(100);
+  });
+
+  it("sums per-step breakdowns when the aggregate carries none", () => {
+    const result = {
+      usage: { inputTokens: 1_000_000, outputTokens: 0 },
+      steps: [
+        step(0.1, 10, { cachedTokens: 200_000 }),
+        step(0.2, 10, { cachedTokens: 300_000 }),
+      ],
+    };
+    const r = resolveCost(
+      CACHED_MODEL,
+      1_000_000,
+      0,
+      costResultLikeForSteps(result),
+    );
+    expect(r.costSource).toBe("reported");
+    expect(r.cachedInputTokens).toBe(500_000);
+    expect(r.estimatedCostUsd).toBeCloseTo(0.5 + 0.05, 10);
+  });
+
+  it("omits servedBy when the steps were routed to different endpoints", () => {
+    const result = {
+      usage: { inputTokens: 20, outputTokens: 20 },
+      steps: [
+        step(0.1, 10, { provider: "Google" }),
+        step(0.2, 10, { provider: "DeepInfra" }),
+      ],
+    };
+    const r = resolveCost(MODEL, 20, 20, costResultLikeForSteps(result));
+    expect(r.costSource).toBe("reported");
+    expect(r.cost).toBeCloseTo(0.3, 10);
+    expect(r.servedBy).toBeUndefined();
   });
 });

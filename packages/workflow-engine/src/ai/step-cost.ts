@@ -11,7 +11,14 @@
  * Not part of the public API.
  */
 
-import { extractReportedCost, logger, type ProviderResultLike } from "./shared";
+import {
+  extractReportedCost,
+  extractServedBy,
+  extractUsageDetails,
+  logger,
+  type ProviderResultLike,
+  type UsageDetails,
+} from "./shared";
 
 interface StepUsageLike {
   inputTokens?: number;
@@ -27,6 +34,10 @@ interface StepLike {
 
 interface MultiStepResultLike {
   steps?: readonly unknown[];
+  /** The AI SDK's total usage across steps (generateText / onEnd). */
+  usage?: StepUsageLike & Record<string, unknown>;
+  /** streamText's onEnd event names the total `totalUsage`. */
+  totalUsage?: StepUsageLike & Record<string, unknown>;
 }
 
 function stepProducedUsage(step: StepLike): boolean {
@@ -80,18 +91,102 @@ export function sumReportedCostAcrossSteps(
   return reportedSteps > 0 ? total : undefined;
 }
 
+function finiteCount(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+/**
+ * Cached-input and reasoning counts for the whole call: the SDK's own
+ * aggregate details when it carries them, else the per-step figures summed
+ * (a step's OpenRouter metadata reports its own breakdown). Undefined when
+ * no source reports a count.
+ */
+function usageDetailsAcrossSteps(
+  aggregate: StepUsageLike | undefined,
+  steps: readonly unknown[],
+): UsageDetails {
+  const fromAggregate = extractUsageDetails(
+    aggregate ? { usage: { ...aggregate, raw: undefined } } : undefined,
+  );
+  let cached: number | undefined;
+  let reasoning: number | undefined;
+  for (const step of steps) {
+    if (!step || typeof step !== "object") continue;
+    const details = extractUsageDetails(step as ProviderResultLike);
+    if (details.cachedInputTokens !== undefined) {
+      cached = (cached ?? 0) + details.cachedInputTokens;
+    }
+    if (details.reasoningTokens !== undefined) {
+      reasoning = (reasoning ?? 0) + details.reasoningTokens;
+    }
+  }
+  const cachedInputTokens = fromAggregate.cachedInputTokens ?? cached;
+  const reasoningTokens = fromAggregate.reasoningTokens ?? reasoning;
+  return {
+    ...(cachedInputTokens !== undefined ? { cachedInputTokens } : {}),
+    ...(reasoningTokens !== undefined ? { reasoningTokens } : {}),
+  };
+}
+
+/**
+ * The endpoint that served the call. Kept only when every step that names
+ * one names the same endpoint; a call whose steps were routed to different
+ * endpoints has no single `servedBy` and the field is omitted.
+ */
+function servedByAcrossSteps(steps: readonly unknown[]): string | undefined {
+  let servedBy: string | undefined;
+  for (const step of steps) {
+    if (!step || typeof step !== "object") continue;
+    const stepServedBy = extractServedBy(step as ProviderResultLike);
+    if (stepServedBy === undefined) continue;
+    if (servedBy === undefined) {
+      servedBy = stepServedBy;
+    } else if (servedBy !== stepServedBy) {
+      return undefined;
+    }
+  }
+  return servedBy;
+}
+
 /**
  * The value to hand `resolveCost` for an AI SDK result.
  *
  * A single-step result is returned as-is (its own `providerMetadata` is the
- * whole bill). A multi-step result becomes a `ProviderResultLike` carrying
- * the summed cost as `costUsd` — or, when the sum is unusable, an empty one
- * so `resolveCost` estimates the whole call instead of silently taking the
- * final step's figure.
+ * whole bill). A multi-step result becomes a `ProviderResultLike` that keeps
+ * the call's aggregate usage (token totals plus the cached-input and
+ * reasoning breakdowns, so the estimate prices cached input at the cached
+ * rate) and the serving endpoint (when all steps agree), and replaces only
+ * the reported-cost decision: the summed cost as `costUsd`, or no cost at
+ * all when the sum is unusable. Neither the top-level `providerMetadata`
+ * nor `finalStep` is carried, so `resolveCost` cannot rediscover the last
+ * step's figure and estimates the whole call instead.
  */
 export function costResultLikeForSteps<T>(result: T): T | ProviderResultLike {
-  const steps = (result as MultiStepResultLike | undefined)?.steps;
+  const multi = result as MultiStepResultLike | undefined;
+  const steps = multi?.steps;
   if (!Array.isArray(steps) || steps.length < 2) return result;
+
+  const aggregate = multi?.usage ?? multi?.totalUsage;
   const costUsd = sumReportedCostAcrossSteps(steps);
-  return costUsd === undefined ? {} : { costUsd };
+  const servedBy = servedByAcrossSteps(steps);
+  const usage = {
+    ...(finiteCount(aggregate?.inputTokens) !== undefined
+      ? { inputTokens: aggregate!.inputTokens }
+      : {}),
+    ...(finiteCount(aggregate?.outputTokens) !== undefined
+      ? { outputTokens: aggregate!.outputTokens }
+      : {}),
+    ...(finiteCount(aggregate?.totalTokens) !== undefined
+      ? { totalTokens: aggregate!.totalTokens }
+      : {}),
+    ...usageDetailsAcrossSteps(aggregate, steps),
+  };
+
+  return {
+    usage,
+    ...(costUsd !== undefined ? { costUsd } : {}),
+    ...(servedBy !== undefined
+      ? { providerMetadata: { openrouter: { provider: servedBy } } }
+      : {}),
+  };
 }
