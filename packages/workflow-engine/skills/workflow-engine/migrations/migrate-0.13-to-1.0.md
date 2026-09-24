@@ -110,17 +110,33 @@ Verified against `git diff` of the package's `prisma/schema.prisma` between 0.13
     ON "ai_calls"("batchId", "requestId");
   ```
 
-- [ ] **Add the cost-accounting columns to `ai_calls`.** Since 1.0.0-alpha.14 every call row keeps the registry estimate beside the provider's figure, which of the two `cost` is, the endpoint that served the request, and the cached-input and reasoning token breakdowns. All six are nullable; rows written before this read back with them absent and `cost` is unchanged, so nothing depends on a backfill. The Prisma logger writes them on every insert, so a database without them fails the first `logCall` with `Unknown argument estimatedCost`.
+- [ ] **Add the cost-accounting fields and columns to `ai_calls`.** Since 1.0.0-alpha.14 every call row keeps the registry estimate beside the provider's figure, which of the two `cost` is, the endpoint that served the request, and the cached-input and reasoning token breakdowns. All six are nullable; rows written before this read back with them absent and `cost` is unchanged, so nothing depends on a backfill. The Prisma logger passes them on every write, so you must update your Prisma schema, apply the SQL migration, and regenerate your Prisma client before deploying:
 
-  ```sql
-  ALTER TABLE "ai_calls"
-    ADD COLUMN IF NOT EXISTS "estimatedCost"     DOUBLE PRECISION,
-    ADD COLUMN IF NOT EXISTS "reportedCost"      DOUBLE PRECISION,
-    ADD COLUMN IF NOT EXISTS "costSource"        TEXT,
-    ADD COLUMN IF NOT EXISTS "servedBy"          TEXT,
-    ADD COLUMN IF NOT EXISTS "cachedInputTokens" INTEGER,
-    ADD COLUMN IF NOT EXISTS "reasoningTokens"   INTEGER;
-  ```
+  1. **Add the six fields to your `AICall` model in `schema.prisma`:**
+     ```prisma
+     model AICall {
+       // ... existing fields ...
+       estimatedCost     Float?
+       reportedCost      Float?
+       costSource        String?
+       servedBy          String?
+       cachedInputTokens Int?
+       reasoningTokens   Int?
+     }
+     ```
+
+  2. **Add the columns to the database:**
+     ```sql
+     ALTER TABLE "ai_calls"
+       ADD COLUMN IF NOT EXISTS "estimatedCost"     DOUBLE PRECISION,
+       ADD COLUMN IF NOT EXISTS "reportedCost"      DOUBLE PRECISION,
+       ADD COLUMN IF NOT EXISTS "costSource"        TEXT,
+       ADD COLUMN IF NOT EXISTS "servedBy"          TEXT,
+       ADD COLUMN IF NOT EXISTS "cachedInputTokens" INTEGER,
+       ADD COLUMN IF NOT EXISTS "reasoningTokens"   INTEGER;
+     ```
+
+  3. **Regenerate the Prisma client** (`npx prisma generate` or `pnpm prisma generate`) before deploying. If you omit this step, the generated client rejects the logger's write with `Unknown argument estimatedCost`.
 
 - [ ] **Confirm the columns the adapters write on every dispatch.** These all exist in the 0.13 package schema, but consumers who forked the schema before 0.11 (or applied migrations selectively) have hit each of them as a runtime `Unknown argument` from Prisma on the first `dispatch`. Each write site is named so you can grep the adapter if you doubt it.
 
