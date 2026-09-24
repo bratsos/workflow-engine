@@ -60,7 +60,11 @@ function step(
                     usage: {
                       cost,
                       ...(extra.cachedTokens !== undefined
-                        ? { promptTokensDetails: { cachedTokens: extra.cachedTokens } }
+                        ? {
+                            promptTokensDetails: {
+                              cachedTokens: extra.cachedTokens,
+                            },
+                          }
                         : {}),
                     },
                   }),
