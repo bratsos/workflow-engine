@@ -1,5 +1,46 @@
 # @bratsos/workflow-engine
 
+## 1.0.0-alpha.15
+
+### Minor Changes
+
+- 8a96b20: Speech to text: `ai.transcribe` and `ctx.step.ai.transcribe`.
+
+  - **`ai.transcribe(modelKey, audio, options?)`** transcribes audio through the AI SDK's `transcribe`: a `Uint8Array`, `ArrayBuffer`, base64 string, or a `URL` the AI SDK downloads first. It returns `text`, timed `segments`, and the `language` and `durationInSeconds` when the provider reports them. Built-in providers are `"openai"` (`openai.transcription`, from the optional `@ai-sdk/openai` peer, loaded only when asked for) and `"google"` (`google.transcription`); `registerTranscriptionProvider(provider, factory)` plugs in any other AI SDK transcription model, as `registerEmbeddingProvider` does for embeddings.
+  - **`ctx.step.ai.transcribe(id, modelKey, audio, options?, stepOptions?)`** is the durable form: the transcript is memoised in the step ledger, so a replay after a suspension neither re-sends the audio nor pays for it again. Only the result is stored, never the audio.
+  - **Registry:** `isTranscriptionModel` on `ModelConfig` marks a speech-to-text model; only such a model can answer `transcribe`, and any other throws before a request is made. `transcriptionCostPerMinute` prices providers that bill per minute of audio. Transcription models are not in OpenRouter's catalogue, so they are registered by hand; `listModels({ isTranscriptionModel })` filters on the flag.
+  - **Cost** follows how the provider bills: per minute of audio where it reports a duration and the registry has a rate (OpenAI), and per token where it reports usage in its metadata, priced at the model's `inputCostPerMillion` / `outputCostPerMillion` (Google reports `total_input_tokens` / `total_output_tokens`). The call is logged with `callType: "transcribe"`, the reported tokens, and a description of the audio (its URL or byte size) in place of the audio itself.
+  - **Testing:** `MockAIHelper.transcribe` returns "mock transcript" by default, and `setTranscribeResponse(response)` (also on `harness.mockAi`) scripts what it returns.
+  - **Breaking for custom `AIHelper` implementations:** the interface gained `transcribe`, and `AICallType` gained `"transcribe"`. Code that consumes a helper is unaffected.
+
+- 6db8409: Cost accounting: every `ai_calls` row keeps the registry estimate beside the provider's figure, names which one `cost` is and which endpoint served the call, and records cached-input and reasoning tokens; the estimate prices cached input at the catalogue's cache-read rate.
+
+  **What changed and why:**
+
+  - **Both figures on the row.** Before this, `resolveCost` chose between the provider's reported cost and the registry estimate and the Prisma logger persisted only the winner as `cost`, so a consumer could not tell a reported figure from an estimate after the fact, nor compare the two. `CreateAICallInput` / `AICallRecord` now carry `estimatedCost` (the registry figure, always computed), `reportedCost` (the provider's figure, when any), `costSource` (`"reported"` | `"estimated"`) and `servedBy` (OpenRouter's `provider` metadata — the endpoint that served the request). `cost` is unchanged: reported when available, else estimated, and still what `getStats` sums and `WorkflowRun.totalCost` rolls up. `resolveCost` returns `estimatedCostUsd` and `servedBy` alongside its existing fields; `AIHelper.recordCall` writes `estimatedCost === cost` with `costSource: "estimated"`.
+  - **Cached and reasoning tokens.** `cachedInputTokens` (AI SDK 7 `usage.inputTokenDetails.cacheReadTokens`, falling back to OpenRouter's `promptTokensDetails.cachedTokens` and the raw `prompt_tokens_details.cached_tokens`) and `reasoningTokens` (`usage.outputTokenDetails.reasoningTokens`, then `completionTokensDetails.reasoningTokens`) are extracted, carried on the record and persisted. Both are breakdowns of `inputTokens` / `outputTokens`, not additions — every source counts them inside the totals — so neither total changes and reasoning is billed as output without a separate charge.
+  - **Cached input priced at the cache-read rate.** `ModelConfig.cachedInputCostPerMillion` (and the same field on `longContextTier`) is new; `calculateCost(modelKey, inputTokens, outputTokens, cachedInputTokens?)` bills the cached part of the prompt at that rate and the rest at the full rate, and bills everything at the full rate when the registry has no cached rate. `workflow-engine-sync` emits it from OpenRouter's `pricing.input_cache_read` (and an override's `input_cache_read` into the tier) when the catalogue publishes one, and omits it otherwise — absence means "full rate", never zero. The batch estimate is unchanged: batch prices are absolute per-row figures with no published cache tier.
+  - **Reading the rows back.** `AICallLogger.listCalls?(topicPrefix)` returns the rows under a prefix, oldest first, with every figure as recorded. Optional on the port so an adapter written before 1.0 keeps compiling; `PrismaAICallLogger` and `InMemoryAICallLogger` implement it, and the AI-logger conformance suite gains two cases (a reported call and an estimated call written through the batch path) that read back both figures, the source, the endpoint and the token breakdowns through it.
+  - **Migration:** six nullable columns on `ai_calls`, all idempotent to add. Rows written before this read back with the new fields absent and `cost` unchanged.
+
+    ```sql
+    ALTER TABLE "ai_calls"
+      ADD COLUMN IF NOT EXISTS "estimatedCost"     DOUBLE PRECISION,
+      ADD COLUMN IF NOT EXISTS "reportedCost"      DOUBLE PRECISION,
+      ADD COLUMN IF NOT EXISTS "costSource"        TEXT,
+      ADD COLUMN IF NOT EXISTS "servedBy"          TEXT,
+      ADD COLUMN IF NOT EXISTS "cachedInputTokens" INTEGER,
+      ADD COLUMN IF NOT EXISTS "reasoningTokens"   INTEGER;
+    ```
+
+  - The 0.13 → 1.0 migration guide gains the block above; `04-ai-integration.md` documents what each row field means and notes that comparing `reportedCost` against `estimatedCost × priceHeadroom` is a diagnostic (cache-read rates are unguarded and `priceHeadroom: 0` disables the guard) that needs the endpoint's rates, caching, routing, and fees checked; `05-persistence-setup.md` and the docs-site custom-adapter page list `listCalls`.
+
+### Patch Changes
+
+- 6db8409: Provider-reported cost is now summed across the steps of a tool-calling call. `generateText`, `generateObject` and the stream's `getUsage()` previously read the reported cost from the final step's provider metadata while the token usage was the total across steps, so every multi-step call under-reported. The per-step figures are now summed (each with the BYOK upstream rule) when every step that consumed tokens reported one; otherwise the whole call falls back to the registry estimate and is marked `costSource: "estimated"`.
+
+  OpenRouter batch rows now carry the provider's per-request cost. The transport asks for usage accounting on every request body and, when a result's `usage.cost` is present, records it as the row's `reportedCost` with `costSource: "reported"` instead of pricing the row from the catalogue's batch rates; rows without it keep the batch estimate. The vendor batch transports (google/anthropic/openai) return tokens only, so their rows remain estimated.
+
 ## 1.0.0-alpha.14
 
 ### Minor Changes

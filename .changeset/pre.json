@@ -11,6 +11,9 @@
   },
   "changesets": [
     "ai-evaluate",
+    "ai-transcribe",
+    "cost-accounting-steps",
+    "cost-accounting",
     "durable-steps-v1"
   ]
 }
