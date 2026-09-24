@@ -163,6 +163,29 @@ const batchResult = await ai.embed("text-embedding-004", ["doc1", "doc2", "doc3"
 console.log(batchResult.embeddings); // number[][]
 ```
 
+### 5. `evaluate`
+Answers typed questions about one shared state with a **decision model** such as TypeSafe's Jev (`typesafe/jev-1.13`, served through OpenRouter's Decisions API). Instead of text, each question comes back as a typed answer with probabilities: `choice` picks one named option, `score` places the state on an ordered scale, and `boolean` gives the probability a statement is true.
+
+```typescript
+const { answers, cost } = await ai.evaluate("typesafe/jev-1.13", {
+  state: { ticket: { subject, body } },
+  questions: {
+    team: {
+      type: "choice",
+      instructions: "Which team should handle `ticket`?",
+      criteria: { billing: "Charges and refunds.", engineering: "Bugs and outages." },
+    },
+    outage: { type: "boolean", instructions: "Does `ticket` report an outage?" },
+  },
+});
+
+answers.team.choice;        // "billing" | "engineering", typed from the criteria
+answers.team.confidence;    // provider confidence, when reported
+answers.outage.probability; // P(true)
+```
+
+Only registry entries with `isEvaluationModel: true` can answer; `workflow-engine-sync` sets it for every model whose OpenRouter output modality is `decisions`. Decision models bill input tokens only, and OpenRouter's reported cost is recorded with the call. Inside a stage, `ctx.step.ai.evaluate(id, model, spec)` memoises the answers so a replay takes the same branch. `registerEvaluationProvider(provider, factory)` plugs in other evaluation providers.
+
 ### Timeouts and adapters
 
 `AIHelperOptions.timeout.perCallMs` applies a deadline to every non-batch call, and `timeoutMs` on the text, object, embed and stream options overrides it per call. On expiry the call throws `AICallTimeoutError` (with `timeoutMs` and `modelKey`) and the failure is still logged as a cost row.

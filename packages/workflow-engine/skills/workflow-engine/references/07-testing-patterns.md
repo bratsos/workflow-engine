@@ -269,6 +269,9 @@ harness.mockAi.mockObjectResponseForSchema(FactsSchema, { facts: [] });
 // The next matching call throws once; later calls succeed. `match` is a
 // substring, a RegExp, or a predicate over `{ modelKey, prompt, kind }`.
 harness.mockAi.failOnce("summarize", new Error("transient upstream 503"));
+// `evaluate` answers by question id; unscripted questions get the first
+// `choice` option, level 0 of a `score`, and probability 0.5 for a `boolean`.
+harness.mockAi.setEvaluateAnswer("team", { type: "choice", choice: "billing" });
 
 expect(harness.mockAi.helper.getAllCallsRecursive()).toHaveLength(2);
 ```
