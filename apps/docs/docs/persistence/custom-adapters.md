@@ -226,8 +226,11 @@ class MyCustomAICallLogger implements AICallLogger {
   async logBatchResults(batchId: string, results: CreateAICallInput[]): Promise<void> { ... }
   async getStats(topicPrefix: string): Promise<AIHelperStats> { ... }
   async isRecorded(batchId: string): Promise<boolean> { ... }
+  async listCalls(topicPrefix: string): Promise<AICallRecord[]> { ... } // optional, see below
 }
 ```
+
+* **`listCalls`** is optional. It returns the rows under a topic prefix, oldest first, with every cost figure `CreateAICallInput` carries (`cost`, `estimatedCost`, `reportedCost`, `costSource`, `servedBy`, `cachedInputTokens`, `reasoningTokens`) as recorded. An adapter that stores only `cost` still gives `getStats` and the run cost rollup the right total; it just cannot show the registry estimate beside the provider's bill afterwards.
 
 ---
 

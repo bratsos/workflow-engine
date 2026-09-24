@@ -9,6 +9,15 @@ export interface ModelConfig {
   name: string;
   inputCostPerMillion: number; // Cost in USD per 1M input tokens
   outputCostPerMillion: number; // Cost in USD per 1M output tokens
+  /**
+   * Price of a cached (prompt-cache read) input token, per 1M. From
+   * OpenRouter's `pricing.input_cache_read`; populated by
+   * `workflow-engine-sync` when the catalogue publishes it. The estimate
+   * bills a call's cached input tokens at this rate and the rest at
+   * `inputCostPerMillion`; when absent every input token is billed at the
+   * full rate.
+   */
+  cachedInputCostPerMillion?: number;
   provider: string;
   description?: string;
   supportsAsyncBatch?: boolean;
@@ -42,6 +51,8 @@ export interface ModelConfig {
     minPromptTokens: number;
     inputCostPerMillion: number;
     outputCostPerMillion: number;
+    /** Cached-input rate inside the tier, when the override publishes one. */
+    cachedInputCostPerMillion?: number;
   };
   isEmbeddingModel?: boolean; // true for embedding models
   /**
@@ -270,12 +281,21 @@ export function listModels(
 }
 
 /**
- * Calculate costs based on token usage
+ * Calculate costs based on token usage.
+ *
+ * `inputTokens` is the total prompt size (the AI SDK's `usage.inputTokens`
+ * and OpenRouter's `prompt_tokens` both include cached tokens);
+ * `cachedInputTokens` is the part of it served from the prompt cache, billed
+ * at the model's `cachedInputCostPerMillion` when the catalogue has one and
+ * at the full input rate otherwise. `outputTokens` already includes
+ * reasoning tokens (both sources report them as part of the completion
+ * count), so reasoning is priced as output without any adjustment here.
  */
 export function calculateCost(
   modelKey: ModelKey,
   inputTokens: number,
   outputTokens: number,
+  cachedInputTokens: number = 0,
 ): {
   inputCost: number;
   outputCost: number;
@@ -293,8 +313,15 @@ export function calculateCost(
   const outputRate = useLongContextTier
     ? tier.outputCostPerMillion
     : model.outputCostPerMillion;
+  const cachedRate =
+    (useLongContextTier
+      ? tier.cachedInputCostPerMillion
+      : model.cachedInputCostPerMillion) ?? inputRate;
 
-  const inputCost = (inputTokens / 1_000_000) * inputRate;
+  const cached = Math.min(Math.max(cachedInputTokens, 0), inputTokens);
+  const inputCost =
+    ((inputTokens - cached) / 1_000_000) * inputRate +
+    (cached / 1_000_000) * cachedRate;
   const outputCost = (outputTokens / 1_000_000) * outputRate;
   const totalCost = inputCost + outputCost;
 

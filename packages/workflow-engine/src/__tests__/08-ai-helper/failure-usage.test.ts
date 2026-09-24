@@ -14,12 +14,21 @@ import type { AIAdapter } from "../../ai/types.js";
 import { InMemoryAICallLogger } from "../../testing/in-memory-ai-logger.js";
 
 const MODEL = "failure-usage-model";
+const CACHED_MODEL = "failure-usage-cached-model";
 registerModels({
   [MODEL]: {
     id: "failure-usage/model",
     name: "Failure Usage Model",
     provider: "failure-usage",
     inputCostPerMillion: 1_000_000,
+    outputCostPerMillion: 2_000_000,
+  },
+  [CACHED_MODEL]: {
+    id: "failure-usage/cached-model",
+    name: "Failure Usage Cached Model",
+    provider: "failure-usage",
+    inputCostPerMillion: 1_000_000,
+    cachedInputCostPerMillion: 100_000,
     outputCostPerMillion: 2_000_000,
   },
 });
@@ -41,6 +50,24 @@ describe("usageFromError", () => {
     expect(usageFromError(new Error("plain"))).toEqual({
       inputTokens: 0,
       outputTokens: 0,
+    });
+  });
+
+  it("reads cached input tokens and reasoning tokens from error usage", () => {
+    expect(
+      usageFromError({
+        usage: {
+          inputTokens: 100,
+          outputTokens: 50,
+          inputTokenDetails: { cacheReadTokens: 60 },
+          outputTokenDetails: { reasoningTokens: 20 },
+        },
+      }),
+    ).toEqual({
+      inputTokens: 100,
+      outputTokens: 50,
+      cachedInputTokens: 60,
+      reasoningTokens: 20,
     });
   });
 });
@@ -69,12 +96,54 @@ describe("generateObject failure accounting", () => {
       ai.generateObject(MODEL, "extract", z.object({ a: z.string() })),
     ).rejects.toThrow("not JSON");
 
-    const [row] = aiLogger.getCallsByTopic("t");
+    const [row] = await aiLogger.listCalls("t");
     expect(row).toMatchObject({
       callType: "object",
       inputTokens: 30,
       outputTokens: 5,
       cost: 30 + 10,
+      estimatedCost: 30 + 10,
+      costSource: "estimated",
+      metadata: expect.objectContaining({ status: "error" }),
+    });
+  });
+
+  it("persists estimatedCost, costSource, cachedInputTokens, and reasoningTokens when carried by error", async () => {
+    const adapter: AIAdapter = {
+      generateObject: async () => {
+        throw new NoObjectGeneratedError({
+          message: "schema mismatch",
+          text: "### bad",
+          response: { id: "r2", timestamp: new Date(), modelId: "m" },
+          usage: {
+            inputTokens: 10,
+            outputTokens: 5,
+            totalTokens: 15,
+            inputTokenDetails: { cacheReadTokens: 6 },
+            outputTokenDetails: { reasoningTokens: 2 },
+          } as never,
+          finishReason: "stop",
+        });
+      },
+    };
+    const aiLogger = new InMemoryAICallLogger();
+    const ai = createAIHelper("t", aiLogger, undefined, undefined, { adapter });
+
+    await expect(
+      ai.generateObject(CACHED_MODEL, "extract", z.object({ a: z.string() })),
+    ).rejects.toThrow("schema mismatch");
+
+    const calls = await aiLogger.listCalls("t");
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({
+      callType: "object",
+      inputTokens: 10,
+      outputTokens: 5,
+      cost: 14.6,
+      estimatedCost: 14.6,
+      costSource: "estimated",
+      cachedInputTokens: 6,
+      reasoningTokens: 2,
       metadata: expect.objectContaining({ status: "error" }),
     });
   });

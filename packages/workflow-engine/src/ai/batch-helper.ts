@@ -34,6 +34,41 @@ import type {
   BatchOptions,
 } from "./types";
 
+/**
+ * The per-request cost a transport reported, carried on the result object
+ * so it survives the trip through `getResults()` to `recordResults()`.
+ */
+function reportedCostOf(result: AIBatchResult<unknown>): number | undefined {
+  const value = result.reportedCostUsd;
+  return typeof value === "number" && Number.isFinite(value)
+    ? value
+    : undefined;
+}
+
+/**
+ * The accounting the transport attached to an item. Independent of local
+ * validation: a response that fails JSON parsing or the request's schema was
+ * still billed and served by the provider, so the figures travel with the
+ * failed result too.
+ */
+function accountingFields(item: EngineBatchItemResult): {
+  reportedCostUsd?: number;
+  servedBy?: string;
+  cachedInputTokens?: number;
+  reasoningTokens?: number;
+} {
+  const value = item.status === "succeeded" ? item.reportedCostUsd : undefined;
+  const servedBy = item.servedBy;
+  const cachedInputTokens = item.cachedInputTokens;
+  const reasoningTokens = item.reasoningTokens;
+  return {
+    ...(value !== undefined ? { reportedCostUsd: value } : {}),
+    ...(servedBy !== undefined ? { servedBy } : {}),
+    ...(cachedInputTokens !== undefined ? { cachedInputTokens } : {}),
+    ...(reasoningTokens !== undefined ? { reasoningTokens } : {}),
+  };
+}
+
 function resolveCustomId(item: EngineBatchItemResult): string | null {
   if (item.id && typeof item.id === "string" && item.id.trim().length > 0) {
     return item.id;
@@ -809,6 +844,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
             status: "failed",
             error,
             validated: false,
+            ...accountingFields(item),
           });
           continue;
         }
@@ -857,6 +893,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
               error: `Failed to parse JSON response for schema validation: ${parseError}`,
               validated: false,
               responseText: item.text,
+              ...accountingFields(item),
             });
             continue;
           }
@@ -886,6 +923,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
               error: `Schema validation threw an error: ${errText}`,
               validated: false,
               responseText: item.text,
+              ...accountingFields(item),
             });
             continue;
           }
@@ -902,6 +940,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
               error: `Response did not match the request's schema: ${validation.error.message}`,
               validated: false,
               responseText: item.text,
+              ...accountingFields(item),
             });
             continue;
           }
@@ -914,6 +953,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
             outputTokens,
             status: "succeeded",
             validated: true,
+            ...accountingFields(item),
           });
         } else {
           unvalidatedCount++;
@@ -929,6 +969,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
             outputTokens,
             status: "succeeded",
             validated: false,
+            ...accountingFields(item),
           });
         }
       }
@@ -1021,13 +1062,19 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
         await this.ctx.aiCallLogger.logBatchResults(
           batchId,
           results.map((r) => {
-            const cost = calculateCostWithDiscount(
+            const estimatedCost = calculateCostWithDiscount(
               this.modelKey,
               r.inputTokens,
               r.outputTokens,
               true,
               this.provider,
             );
+            // A transport that bills per request (OpenRouter) is the
+            // authority on that request's cost; otherwise the batch rate.
+            const reportedCost = reportedCostOf(r);
+            const cost = reportedCost ?? estimatedCost;
+            const costSource: "reported" | "estimated" =
+              reportedCost !== undefined ? "reported" : "estimated";
 
             return {
               topic: this.ctx.topic,
@@ -1046,6 +1093,16 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
               inputTokens: r.inputTokens,
               outputTokens: r.outputTokens,
               cost,
+              estimatedCost,
+              reportedCost,
+              costSource,
+              ...(r.servedBy !== undefined ? { servedBy: r.servedBy } : {}),
+              ...(r.cachedInputTokens !== undefined
+                ? { cachedInputTokens: r.cachedInputTokens }
+                : {}),
+              ...(r.reasoningTokens !== undefined
+                ? { reasoningTokens: r.reasoningTokens }
+                : {}),
               batchId,
               requestId: r.id,
               metadata: {

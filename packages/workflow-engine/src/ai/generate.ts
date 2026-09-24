@@ -14,10 +14,13 @@ import type { AICallLogger } from "../persistence";
 import { calculateCost, getModel, type ModelKey } from "./model-helper";
 import {
   explainRoutingError,
+  extractUsageDetails,
   logger,
+  type ProviderResultLike,
   resolveCost,
   resolveLanguageModel,
 } from "./shared";
+import { costResultLikeForSteps } from "./step-cost";
 import { createCallTimeout, runWithCallTimeout } from "./timeouts.js";
 import type {
   AICallType,
@@ -82,19 +85,49 @@ function tokenCount(value: unknown): number {
 export function usageFromError(error: unknown): {
   inputTokens: number;
   outputTokens: number;
+  cachedInputTokens?: number;
+  reasoningTokens?: number;
 } {
   if (typeof error !== "object" || error === null) {
     return { inputTokens: 0, outputTokens: 0 };
   }
   const source = error as {
-    usage?: { inputTokens?: unknown; outputTokens?: unknown };
+    usage?: {
+      inputTokens?: unknown;
+      outputTokens?: unknown;
+      inputTokenDetails?: { cacheReadTokens?: unknown };
+      outputTokenDetails?: { reasoningTokens?: unknown };
+      cachedInputTokens?: unknown;
+      reasoningTokens?: unknown;
+      raw?: Record<string, unknown>;
+    };
     inputTokens?: unknown;
     outputTokens?: unknown;
+    cachedInputTokens?: unknown;
+    reasoningTokens?: unknown;
   };
   const usage = source.usage;
+  const details = extractUsageDetails(source as ProviderResultLike);
+  const cachedInputTokens =
+    details.cachedInputTokens ??
+    (typeof source.cachedInputTokens === "number" &&
+    Number.isFinite(source.cachedInputTokens) &&
+    source.cachedInputTokens >= 0
+      ? source.cachedInputTokens
+      : undefined);
+  const reasoningTokens =
+    details.reasoningTokens ??
+    (typeof source.reasoningTokens === "number" &&
+    Number.isFinite(source.reasoningTokens) &&
+    source.reasoningTokens >= 0
+      ? source.reasoningTokens
+      : undefined);
+
   return {
     inputTokens: tokenCount(usage?.inputTokens ?? source.inputTokens),
     outputTokens: tokenCount(usage?.outputTokens ?? source.outputTokens),
+    ...(cachedInputTokens !== undefined ? { cachedInputTokens } : {}),
+    ...(reasoningTokens !== undefined ? { reasoningTokens } : {}),
   };
 }
 
@@ -122,17 +155,20 @@ export function logFailure(
     params.error instanceof Error ? params.error.message : String(params.error);
   // A call that reached the model and failed afterwards (`NoObjectGeneratedError`
   // and the like) still consumed tokens; the error carries the usage.
-  const { inputTokens, outputTokens } = usageFromError(params.error);
-  let cost = 0;
+  const usage = usageFromError(params.error);
+  const inputTokens = usage.inputTokens;
+  const outputTokens = usage.outputTokens;
+  let estimatedCost = 0;
   if (inputTokens > 0 || outputTokens > 0) {
     try {
-      cost = calculateCost(
+      estimatedCost = calculateCost(
         params.modelKey,
         inputTokens,
         outputTokens,
+        usage.cachedInputTokens ?? 0,
       ).totalCost;
     } catch {
-      cost = 0;
+      estimatedCost = 0;
     }
   }
 
@@ -145,7 +181,15 @@ export function logFailure(
     response: "",
     inputTokens,
     outputTokens,
-    cost,
+    cost: estimatedCost,
+    estimatedCost,
+    costSource: "estimated",
+    ...(usage.cachedInputTokens !== undefined
+      ? { cachedInputTokens: usage.cachedInputTokens }
+      : {}),
+    ...(usage.reasoningTokens !== undefined
+      ? { reasoningTokens: usage.reasoningTokens }
+      : {}),
     metadata: {
       ...params.metadata,
       durationMs,
@@ -362,7 +406,15 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
       resultAny.inputTokens ?? resultAny.usage?.inputTokens ?? 0;
     const outputTokens =
       resultAny.outputTokens ?? resultAny.usage?.outputTokens ?? 0;
-    const { cost, reportedCostUsd, costSource } = resolveCost(
+    const {
+      cost,
+      estimatedCostUsd,
+      reportedCostUsd,
+      costSource,
+      servedBy,
+      cachedInputTokens,
+      reasoningTokens,
+    } = resolveCost(
       modelKey,
       inputTokens,
       outputTokens,
@@ -371,7 +423,7 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
             providerMetadata: resultAny.providerMetadata,
             costUsd: resultAny.costUsd,
           }
-        : result,
+        : costResultLikeForSteps(result),
     );
     const durationMs = Date.now() - startTime;
     // Reasoning models emit on a separate channel; surface it so a
@@ -389,8 +441,12 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
       inputTokens,
       outputTokens,
       cost,
+      estimatedCost: estimatedCostUsd,
       reportedCost: reportedCostUsd,
       costSource,
+      servedBy,
+      cachedInputTokens,
+      reasoningTokens,
       metadata: {
         temperature: options.temperature,
         maxTokens: options.maxTokens,
@@ -574,7 +630,15 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
       resultAny.inputTokens ?? resultAny.usage?.inputTokens ?? 0;
     const outputTokens =
       resultAny.outputTokens ?? resultAny.usage?.outputTokens ?? 0;
-    const { cost, reportedCostUsd, costSource } = resolveCost(
+    const {
+      cost,
+      estimatedCostUsd,
+      reportedCostUsd,
+      costSource,
+      servedBy,
+      cachedInputTokens,
+      reasoningTokens,
+    } = resolveCost(
       modelKey,
       inputTokens,
       outputTokens,
@@ -583,7 +647,7 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
             providerMetadata: resultAny.providerMetadata,
             costUsd: resultAny.costUsd,
           }
-        : result,
+        : costResultLikeForSteps(result),
     );
     const durationMs = Date.now() - startTime;
 
@@ -599,8 +663,12 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
       inputTokens,
       outputTokens,
       cost,
+      estimatedCost: estimatedCostUsd,
       reportedCost: reportedCostUsd,
       costSource,
+      servedBy,
+      cachedInputTokens,
+      reasoningTokens,
       metadata: {
         temperature: options.temperature,
         maxTokens: options.maxTokens,

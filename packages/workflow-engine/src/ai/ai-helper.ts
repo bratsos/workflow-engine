@@ -235,6 +235,8 @@ class AIHelperImpl implements AIHelper {
       inputTokens,
       outputTokens,
       cost,
+      estimatedCost: cost,
+      costSource: "estimated",
       metadata: isBatch ? { ...metadata, isBatch: true } : metadata,
     });
   }
