@@ -143,6 +143,79 @@ export type BatchLanguageModel = {
   >;
 };
 
+// ---------------------------------------------------------------------------
+// The provider-level batch seam.
+//
+// Newer vendor releases (`@ai-sdk/google` 4.0.65+, and the current
+// `@ai-sdk/openai` / `@ai-sdk/anthropic`) moved batching off the language
+// model onto the provider: `provider.experimental_batch()` returns one batch
+// object whose requests each name their `modelId` and `type`. The HTTP calls
+// underneath are unchanged, so the engine's fetch-level hooks (Google schema
+// substitution and display-name stamp, OpenAI metadata stamp) apply to both.
+// A vendor release is driven through whichever seam it exposes.
+// ---------------------------------------------------------------------------
+
+export type ProviderTextBatchRequest = LanguageModelBatchRequest & {
+  readonly type: "text";
+  readonly modelId: string;
+};
+
+export type ProviderBatchItemResult = {
+  readonly type?: "text" | "image";
+} & BatchItemResult<LanguageModelV4GenerateResult>;
+
+export type ProviderBatch = {
+  readonly provider?: string;
+  doStartBatch(
+    options: BatchStartOptions<ProviderTextBatchRequest>,
+  ): PromiseLike<BatchStartResult>;
+  doGetBatchStatus(options: BatchOperationOptions): PromiseLike<BatchStatus>;
+  doGetBatchResults(
+    options: BatchOperationOptions,
+  ): PromiseLike<ReadableStream<ProviderBatchItemResult>>;
+};
+
+function isProviderBatch(b: unknown): b is ProviderBatch {
+  return (
+    typeof b === "object" &&
+    b !== null &&
+    typeof (b as { doStartBatch?: unknown }).doStartBatch === "function" &&
+    typeof (b as { doGetBatchStatus?: unknown }).doGetBatchStatus ===
+      "function" &&
+    typeof (b as { doGetBatchResults?: unknown }).doGetBatchResults ===
+      "function"
+  );
+}
+
+/**
+ * Thrown when a vendor model exposes neither batch seam. The batch helper
+ * falls back to the OpenRouter transport on it when OpenRouter can batch the
+ * model, the same way it does when the vendor package is not installed.
+ */
+export class NotBatchCapableError extends Error {
+  readonly provider: string;
+  readonly modelId: string;
+
+  constructor(provider: string, modelId: string) {
+    super(
+      `Model "${provider}:${modelId}" is not batch-capable: the vendor SDK exposes neither ` +
+        `provider.experimental_batch() nor the per-model experimental_doStartBatch / ` +
+        `experimental_doGetBatchStatus / experimental_doGetBatchResults. ` +
+        `If using OpenAI, note that openai.chat() is not batch-capable; use openai() or openai.responses() instead.`,
+    );
+    this.name = "NotBatchCapableError";
+    this.provider = provider;
+    this.modelId = modelId;
+  }
+}
+
+/** Detect `NotBatchCapableError` across duplicated package bundles. */
+export function isNotBatchCapableError(
+  error: unknown,
+): error is NotBatchCapableError {
+  return error instanceof Error && error.name === "NotBatchCapableError";
+}
+
 function isBatchModel(m: unknown): m is BatchLanguageModel {
   return (
     typeof m === "object" &&
@@ -230,6 +303,20 @@ async function* readableStreamToAsyncIterable<T>(
   }
 }
 
+/** The three operations either seam provides, normalised to one shape. */
+interface BatchSeamOps {
+  start(
+    requests: LanguageModelBatchRequest[],
+    callOpts: { abortSignal?: AbortSignal; headers?: Record<string, string> },
+  ): PromiseLike<BatchStartResult>;
+  status(options: BatchOperationOptions): PromiseLike<BatchStatus>;
+  results(
+    options: BatchOperationOptions,
+  ): PromiseLike<
+    ReadableStream<BatchItemResult<LanguageModelV4GenerateResult>>
+  >;
+}
+
 /**
  * Creates an EngineBatchModel adapter wrapping an AI SDK model that implements
  * the per-model batch seam (`BatchLanguageModel` above).
@@ -239,14 +326,71 @@ export function fromAiSdk(
   opts: { provider: string; modelId: string },
 ): EngineBatchModel {
   if (!isBatchModel(model)) {
-    throw new Error(
-      `Model "${opts.provider}:${opts.modelId}" is not batch-capable (missing experimental_doStartBatch, experimental_doGetBatchStatus, or experimental_doGetBatchResults). ` +
-        `If using OpenAI, note that openai.chat() is not batch-capable; use openai() or openai.responses() instead.`,
-    );
+    throw new NotBatchCapableError(opts.provider, opts.modelId);
   }
-
   const batchModel = model;
+  return buildEngineBatchModel(
+    {
+      start: (requests, callOpts) =>
+        batchModel.experimental_doStartBatch({ requests, ...callOpts }),
+      status: (options) => batchModel.experimental_doGetBatchStatus(options),
+      results: (options) => batchModel.experimental_doGetBatchResults(options),
+    },
+    opts,
+  );
+}
 
+/**
+ * Creates an EngineBatchModel adapter wrapping a provider-level AI SDK batch
+ * (`provider.experimental_batch()`, see `ProviderBatch` above). Every request
+ * is sent as a `text` request for `opts.modelId`.
+ */
+export function fromAiSdkProviderBatch(
+  batch: unknown,
+  opts: { provider: string; modelId: string },
+): EngineBatchModel {
+  if (!isProviderBatch(batch)) {
+    throw new NotBatchCapableError(opts.provider, opts.modelId);
+  }
+  return buildEngineBatchModel(
+    {
+      start: (requests, callOpts) =>
+        batch.doStartBatch({
+          requests: requests.map((request) => ({
+            ...request,
+            type: "text" as const,
+            modelId: opts.modelId,
+          })),
+          ...callOpts,
+        }),
+      status: (options) => batch.doGetBatchStatus(options),
+      results: (options) => batch.doGetBatchResults(options),
+    },
+    opts,
+  );
+}
+
+/**
+ * The engine batch model for a vendor provider instance: its provider-level
+ * batch when the release exposes one, else the language model's per-model
+ * seam. Throws `NotBatchCapableError` when it has neither.
+ */
+export function fromAiSdkProvider(
+  provider: unknown,
+  opts: { provider: string; modelId: string },
+): EngineBatchModel {
+  const factory = (provider as { experimental_batch?: unknown })
+    .experimental_batch;
+  if (typeof factory === "function") {
+    return fromAiSdkProviderBatch(factory.call(provider), opts);
+  }
+  return fromAiSdk((provider as (id: string) => unknown)(opts.modelId), opts);
+}
+
+function buildEngineBatchModel(
+  seam: BatchSeamOps,
+  opts: { provider: string; modelId: string },
+): EngineBatchModel {
   return {
     provider: opts.provider,
     modelId: opts.modelId,
@@ -291,14 +435,10 @@ export function fromAiSdk(
         };
       });
 
-      const startOptions: BatchStartOptions<LanguageModelBatchRequest> = {
-        requests: batchRequests,
-        abortSignal: callOpts?.abortSignal,
-        headers: callOpts?.headers,
-      };
-
-      const startResult =
-        await batchModel.experimental_doStartBatch(startOptions);
+      const startResult = await seam.start(batchRequests, {
+        ...(callOpts?.abortSignal ? { abortSignal: callOpts.abortSignal } : {}),
+        ...(callOpts?.headers ? { headers: callOpts.headers } : {}),
+      });
 
       const ref: EngineBatchRef = {
         version: 1,
@@ -324,11 +464,11 @@ export function fromAiSdk(
         headers?: Record<string, string>;
       },
     ): Promise<EngineBatchStatus> {
-      const res = await batchModel.experimental_doGetBatchStatus({
+      const res = await seam.status({
         batchId: ref.id,
         abortSignal: callOpts?.abortSignal,
         headers: callOpts?.headers,
-      } as any);
+      });
 
       return {
         status: mapAiSdkStatus(res.status),
@@ -345,17 +485,13 @@ export function fromAiSdk(
         headers?: Record<string, string>;
       },
     ): AsyncIterable<EngineBatchItemResult> {
-      const stream = await batchModel.experimental_doGetBatchResults({
+      const stream = await seam.results({
         batchId: ref.id,
         abortSignal: callOpts?.abortSignal,
         headers: callOpts?.headers,
-      } as any);
+      });
 
-      for await (const item of readableStreamToAsyncIterable(
-        stream as ReadableStream<
-          BatchItemResult<LanguageModelV4GenerateResult>
-        >,
-      )) {
+      for await (const item of readableStreamToAsyncIterable(stream)) {
         if (item.status === "succeeded") {
           const textParts = (item.result.content ?? []).filter(
             (part): part is LanguageModelV4Text => part.type === "text",
@@ -425,9 +561,12 @@ async function resolveGoogleBatchModel(
       createGoogleDisplayNameStamp(() => currentExternalKey),
     ) as typeof fetch,
   });
-  const model = provider(modelId);
-  const providerId = (model as any).provider ?? "google.generative-ai";
-  const inner = fromAiSdk(model, { provider: providerId, modelId });
+  // The ref's provider id stays the language model's, whichever seam runs,
+  // so a batch submitted before an SDK upgrade is polled the same way after.
+  const providerId =
+    (provider(modelId) as { provider?: string }).provider ??
+    "google.generative-ai";
+  const inner = fromAiSdkProvider(provider, { provider: providerId, modelId });
   const apiKey = resolveVendorApiKey("google", options);
   const baseURL = options.baseURL ?? GOOGLE_BATCH_BASE_URL;
   return {
@@ -504,16 +643,17 @@ async function resolveOpenAIBatchModel(
   const { createOpenAI } = await import("@ai-sdk/openai");
   let currentExternalKey: string | undefined;
   // For OpenAI use the default callable / .responses(), NEVER .chat()
-  const model = createOpenAI({
+  const provider = createOpenAI({
     ...(options.apiKey !== undefined ? { apiKey: options.apiKey } : {}),
     ...(options.baseURL !== undefined ? { baseURL: options.baseURL } : {}),
     fetch: createOpenAIBatchFetch(
       options.fetch,
       () => currentExternalKey,
     ) as typeof fetch,
-  })(modelId);
-  const providerId = (model as any).provider ?? "openai.responses";
-  const inner = fromAiSdk(model, { provider: providerId, modelId });
+  });
+  const providerId =
+    (provider(modelId) as { provider?: string }).provider ?? "openai.responses";
+  const inner = fromAiSdkProvider(provider, { provider: providerId, modelId });
   const apiKey = resolveVendorApiKey("openai", options);
   const baseURL = options.baseURL ?? OPENAI_BATCH_BASE_URL;
   return {
@@ -592,9 +732,11 @@ export async function resolveAiSdkBatchModel(
     }
     if (vendor === "anthropic") {
       const { createAnthropic } = await import("@ai-sdk/anthropic");
-      const model = createAnthropic(credentials)(modelId);
-      const providerId = (model as any).provider ?? "anthropic.messages";
-      return fromAiSdk(model, { provider: providerId, modelId });
+      const provider = createAnthropic(credentials);
+      const providerId =
+        (provider(modelId) as { provider?: string }).provider ??
+        "anthropic.messages";
+      return fromAiSdkProvider(provider, { provider: providerId, modelId });
     }
     if (vendor === "openai") {
       return await resolveOpenAIBatchModel(modelId, options);

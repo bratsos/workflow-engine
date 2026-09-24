@@ -10,7 +10,7 @@ import {
   getProviderModelId,
   resolveModelForProvider,
 } from "../utils/batch/model-mapping";
-import { resolveAiSdkBatchModel } from "./batch/ai-sdk";
+import { isNotBatchCapableError, resolveAiSdkBatchModel } from "./batch/ai-sdk";
 import {
   type EngineBatchItemResult,
   type EngineBatchModel,
@@ -239,13 +239,17 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
             onWarning: warn,
           });
         } catch (error) {
-          // The vendor SDK is an optional peer. When it is not installed but
+          // The vendor SDK is an optional peer, and a release can expose
+          // neither batch seam the engine drives. In either case, when
           // OpenRouter can batch the model (a ":batch" catalog row), use the
           // transport the consumer already has a key for rather than failing
-          // the submit with an install instruction.
+          // the submit. A batch already submitted natively is not affected:
+          // its ref names the native provider and is refused below rather
+          // than polled on OpenRouter.
           const missingSdk =
             error instanceof Error &&
             /Package ".*" is required/.test(error.message);
+          const noBatchSeam = isNotBatchCapableError(error);
           // A catalog generated before `batchModelId` existed names no
           // ":batch" sibling; derive it the way the sync CLI does
           // (`<id>:batch`) rather than failing on the install instruction.
@@ -255,7 +259,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
           const viaOpenRouter =
             getProviderModelId(this.modelKey, "openrouter") ??
             (modelConfig.supportsAsyncBatch ? modelConfig.id : undefined);
-          if (!missingSdk || !viaOpenRouter) throw error;
+          if ((!missingSdk && !noBatchSeam) || !viaOpenRouter) throw error;
           const derived = modelConfig.batchModelId === undefined;
           warn(
             `${error.message} Falling back to the OpenRouter batch transport for "${this.modelKey}"${
