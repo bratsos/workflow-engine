@@ -1,5 +1,15 @@
 # @bratsos/workflow-engine
 
+## 0.13.1
+
+### Patch Changes
+
+- Native batching works with current vendor AI SDK releases again.
+
+  - **The bug:** `@ai-sdk/google` 4.0.65 and the current `@ai-sdk/openai` and `@ai-sdk/anthropic` moved batching off the language model (`experimental_doStartBatch` / `experimental_doGetBatchStatus` / `experimental_doGetBatchResults`) onto the provider (`provider.experimental_batch()`). The engine only looked for the per-model methods, so on a fresh install `ai.batch()` failed with "not batch-capable" for every Google, OpenAI and Anthropic model. Installs whose lockfile pins an earlier vendor release were unaffected; the OpenRouter transport never was.
+  - **The fix:** the native transport drives whichever seam the installed release exposes, preferring the provider-level batch. The HTTP requests are identical across the two, and a batch's stored provider id is the same under both, so a batch submitted before a vendor upgrade is polled and collected after it.
+  - **New export:** `fromAiSdkProviderBatch` wraps a provider-level AI SDK batch as an `EngineBatchModel`, alongside the existing `fromAiSdk` for the per-model seam.
+
 ## 0.13.0
 
 ### Minor Changes

@@ -17,7 +17,7 @@
     "verify": "pnpm lint && pnpm typecheck && pnpm test && pnpm build",
     "changeset": "changeset",
     "version": "changeset version",
-    "release": "pnpm build && pnpm -r publish"
+    "release": "pnpm build && pnpm -r publish --no-git-checks"
   },
   "keywords": [],
   "author": "Alex Bratsos",
