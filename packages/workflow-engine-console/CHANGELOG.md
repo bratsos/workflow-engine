@@ -1,5 +1,12 @@
 # @bratsos/workflow-engine-console
 
+## 1.0.0-alpha.3
+
+### Patch Changes
+
+- Updated dependencies [3048dea]
+  - @bratsos/workflow-engine@1.0.0-alpha.16
+
 ## 1.0.0-alpha.2
 
 ### Patch Changes

@@ -12,6 +12,7 @@
   "changesets": [
     "ai-evaluate",
     "ai-transcribe",
+    "batch-provider-seam",
     "cost-accounting-steps",
     "cost-accounting",
     "durable-steps-v1"
