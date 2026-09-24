@@ -1,5 +1,8 @@
 export {
   fromAiSdk,
+  fromAiSdkProviderBatch,
+  isNotBatchCapableError,
+  NotBatchCapableError,
   resolveAiSdkBatchModel,
 } from "./ai-sdk";
 export {

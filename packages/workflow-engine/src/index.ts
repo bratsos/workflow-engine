@@ -157,6 +157,9 @@ export {
   type EngineBatchStartOptions,
   type EngineBatchStatus,
   fromAiSdk,
+  fromAiSdkProviderBatch,
+  isNotBatchCapableError,
+  NotBatchCapableError,
   type OpenRouterBatchConfig,
   resolveAiSdkBatchModel,
 } from "./ai/batch";

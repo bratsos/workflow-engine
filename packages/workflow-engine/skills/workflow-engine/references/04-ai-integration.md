@@ -742,6 +742,8 @@ Batch processing runs through AI SDK batch providers or OpenRouter's Batch API:
 | `openai` | OpenAI models via AI SDK | `@ai-sdk/openai` (optional peer >=4.0.53) |
 | `openrouter` | OpenRouter Batch API (HTTP) | None (uses direct fetch) |
 
+The native transports work with every release of the vendor packages. Earlier releases put the batch methods on the language model (`experimental_doStartBatch` and siblings); `@ai-sdk/google` 4.0.65 and the current `@ai-sdk/openai` / `@ai-sdk/anthropic` moved them to the provider (`provider.experimental_batch()`). The engine drives whichever seam the installed release exposes, and the HTTP requests are the same either way, so crash recovery and Google's schema substitution behave identically.
+
 > **Pricing Note:** Batch pricing is per-model (read from `batchInputCostPerMillion` / `batchOutputCostPerMillion` in the catalog), not a flat 50% discount. Many models are discounted by 50% or 75%, while some may differ.
 
 ```typescript
@@ -753,7 +755,7 @@ const batch = ai.batch("gemini-2.5-flash", "google");
 const openrouterBatch = ai.batch("openai/gpt-4o", "openrouter", { apiKey: myKey });
 ```
 
-Resolution order: the call's explicit provider, then the model's registry field `batchProvider` (`"openrouter" | "google" | "anthropic" | "openai"`), then the slug's native vendor, then OpenRouter. A model whose `batchProvider` is `"openrouter"` is batched there even without a catalog `:batch` row. If none of those yields a provider, `ai.batch()` **throws an error immediately** with an actionable message. When the vendor SDK is not installed (`@ai-sdk/anthropic` / `@ai-sdk/openai` are optional peers) and OpenRouter can batch the model, the helper falls back to the OpenRouter transport with a WARN instead of failing the submit. A batch is polled and collected through the transport its stored refs name, so changing `batchProvider` while a batch is in flight does not strand it.
+Resolution order: the call's explicit provider, then the model's registry field `batchProvider` (`"openrouter" | "google" | "anthropic" | "openai"`), then the slug's native vendor, then OpenRouter. A model whose `batchProvider` is `"openrouter"` is batched there even without a catalog `:batch` row. If none of those yields a provider, `ai.batch()` **throws an error immediately** with an actionable message. When the vendor SDK is not installed (`@ai-sdk/anthropic` / `@ai-sdk/openai` are optional peers), or its release exposes neither batch seam (`NotBatchCapableError`), and OpenRouter can batch the model, the helper falls back to the OpenRouter transport with a WARN instead of failing the submit. A batch is polled and collected through the transport its stored refs name, so changing `batchProvider` while a batch is in flight does not strand it.
 
 **Idempotent submits.** A `submit()` replayed after a crash (a durable `run` step whose lease expired) can create and bill a second batch. Inside `ctx.step.ai.map` the OpenAI and Google adapters stamp the step's external key into the batch (`metadata` / `displayName`) and a reclaimed submit adopts the batch it finds; Anthropic and OpenRouter carry no such field, so a reclaimed submit there throws `BatchNotAdoptableError` unless `batch: { onReclaim: "resubmit" }` accepts the duplicate cost. See 12-durable-steps.md.
 
