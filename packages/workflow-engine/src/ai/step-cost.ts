@@ -40,26 +40,55 @@ interface MultiStepResultLike {
   totalUsage?: StepUsageLike & Record<string, unknown>;
 }
 
-function stepProducedUsage(step: StepLike): boolean {
+function stepHasDemonstrablyZeroUsage(step: StepLike): boolean {
   const usage = step.usage;
-  if (!usage) return false;
-  return (
-    (usage.inputTokens ?? 0) > 0 ||
-    (usage.outputTokens ?? 0) > 0 ||
-    (usage.totalTokens ?? 0) > 0
-  );
+  if (!usage || typeof usage !== "object") return false;
+
+  const input = usage.inputTokens;
+  const output = usage.outputTokens;
+  const total = usage.totalTokens;
+
+  if (
+    (typeof input === "number" && input > 0) ||
+    (typeof output === "number" && output > 0) ||
+    (typeof total === "number" && total > 0)
+  ) {
+    return false;
+  }
+
+  if (
+    typeof input === "number" &&
+    input === 0 &&
+    typeof output === "number" &&
+    output === 0 &&
+    (total === undefined || (typeof total === "number" && total === 0))
+  ) {
+    return true;
+  }
+
+  if (
+    typeof total === "number" &&
+    total === 0 &&
+    (input === undefined || (typeof input === "number" && input === 0)) &&
+    (output === undefined || (typeof output === "number" && output === 0))
+  ) {
+    return true;
+  }
+
+  return false;
 }
 
 /**
  * Sum the provider-reported cost across a multi-step result's steps.
  *
- * Rule: every step that produced usage must have reported a cost (each
- * read with the same BYOK handling as `extractReportedCost`); their sum is
- * the call's reported cost. A step that produced usage but reported no cost
- * makes the whole sum unusable — returning `undefined` so the caller falls
- * back to the estimate for the entire call rather than recording a partial
- * bill as if it were complete. Steps without usage contribute their cost
- * when they have one and are ignored otherwise.
+ * Rule: every step that produced usage or has unknown usage must have
+ * reported a cost (each read with the same BYOK handling as
+ * `extractReportedCost`); their sum is the call's reported cost. A step with
+ * billable or unknown usage that reported no cost makes the whole sum
+ * unusable — returning `undefined` so the caller falls back to the estimate
+ * for the entire call rather than recording a partial bill as if it were
+ * complete. Steps whose usage is demonstrably zero are ignored when they
+ * report no cost, but contribute their charge when they have one.
  *
  * Returns `undefined` when `steps` is missing or has fewer than two entries;
  * a single-step result is the provider's own figure and needs no folding.
@@ -73,19 +102,25 @@ export function sumReportedCostAcrossSteps(
   let reportedSteps = 0;
   for (let index = 0; index < steps.length; index++) {
     const step = steps[index];
-    if (!step || typeof step !== "object") continue;
+    if (!step || typeof step !== "object") {
+      logger.debug(
+        `Step ${index + 1}/${steps.length} is invalid; the call's cost falls back to the estimate.`,
+      );
+      return undefined;
+    }
     const cost = extractReportedCost(step as ProviderResultLike);
     if (cost !== undefined) {
       total += cost;
       reportedSteps++;
       continue;
     }
-    if (stepProducedUsage(step as StepLike)) {
-      logger.debug(
-        `Step ${index + 1}/${steps.length} produced usage but reported no cost; the call's cost falls back to the estimate.`,
-      );
-      return undefined;
+    if (stepHasDemonstrablyZeroUsage(step as StepLike)) {
+      continue;
     }
+    logger.debug(
+      `Step ${index + 1}/${steps.length} has unknown or billable usage but reported no cost; the call's cost falls back to the estimate.`,
+    );
+    return undefined;
   }
 
   return reportedSteps > 0 ? total : undefined;

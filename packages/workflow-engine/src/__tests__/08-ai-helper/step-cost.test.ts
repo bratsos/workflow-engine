@@ -108,6 +108,27 @@ describe("sumReportedCostAcrossSteps", () => {
     ).toBeCloseTo(0.4, 10);
   });
 
+  it("treats unknown step usage without a reported cost as making the aggregate unavailable", () => {
+    expect(
+      sumReportedCostAcrossSteps([step(0.1), { providerMetadata: {} }]),
+    ).toBeUndefined();
+    expect(
+      sumReportedCostAcrossSteps([step(0.1), { usage: {} }]),
+    ).toBeUndefined();
+    expect(
+      sumReportedCostAcrossSteps([
+        step(0.1),
+        { usage: { inputTokens: 0, outputTokens: undefined } },
+      ]),
+    ).toBeUndefined();
+  });
+
+  it("includes a reported charge even when its step's token usage is zero", () => {
+    expect(
+      sumReportedCostAcrossSteps([step(0.1), step(0.05, 0), step(0.3)]),
+    ).toBeCloseTo(0.45, 10);
+  });
+
   it("does not fold a single-step or step-less result", () => {
     expect(sumReportedCostAcrossSteps([step(0.1)])).toBeUndefined();
     expect(sumReportedCostAcrossSteps(undefined)).toBeUndefined();
