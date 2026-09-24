@@ -1,14 +1,12 @@
 import type {
-  Experimental_BatchModelV4,
-  Experimental_BatchV4ItemResult,
-  Experimental_BatchV4StartOptions,
-  Experimental_BatchV4Status,
-  Experimental_LanguageModelV4BatchRequest,
   JSONSchema7,
   LanguageModelV4CallOptions,
   LanguageModelV4GenerateResult,
   LanguageModelV4Prompt,
   LanguageModelV4Text,
+  SharedV4ProviderMetadata,
+  SharedV4ProviderOptions,
+  SharedV4Warning,
 } from "@ai-sdk/provider";
 import { toPortableJsonSchema } from "../schema-portability";
 import {
@@ -33,12 +31,119 @@ import {
   toJsonSchema,
 } from "./model";
 
-function isBatchModel(
-  m: unknown,
-): m is Experimental_BatchModelV4<
-  Experimental_LanguageModelV4BatchRequest,
-  LanguageModelV4GenerateResult
-> {
+// ---------------------------------------------------------------------------
+// The per-model batch seam this transport calls.
+//
+// These mirror the experimental types `@ai-sdk/provider` 4.0.9 exported
+// (`Experimental_BatchModelV4` and friends): the vendor SDKs this transport
+// supports put `experimental_doStartBatch` / `doGetBatchStatus` /
+// `doGetBatchResults` on the language model. Later `@ai-sdk/provider`
+// releases replaced that seam with a provider-level one and dropped these
+// exports, so the engine declares the shapes it calls rather than importing
+// experimental types that no longer exist. Detection stays structural
+// (`isBatchModel`), exactly as before.
+// ---------------------------------------------------------------------------
+
+export type BatchError = {
+  readonly message: string;
+  readonly type?: string;
+  readonly code?: string;
+  readonly statusCode?: number;
+};
+
+export type BatchStatus = {
+  readonly status: "pending" | "completed" | "failed";
+  readonly rawStatus?: string;
+  readonly requestCounts?: {
+    readonly total: number;
+    readonly pending: number;
+    readonly completed: number;
+    readonly failed: number;
+  };
+  readonly error?: BatchError;
+  readonly createdAt?: string;
+  readonly expiresAt?: string;
+  readonly providerMetadata?: SharedV4ProviderMetadata;
+};
+
+export type BatchStartResult = BatchStatus & {
+  readonly batchId: string;
+  readonly warnings: Array<{
+    readonly requestId?: string;
+    readonly warning: SharedV4Warning;
+  }>;
+};
+
+export type BatchStartOptions<REQUEST> = {
+  readonly requests: ReadonlyArray<REQUEST>;
+  readonly providerOptions?: SharedV4ProviderOptions;
+  readonly abortSignal?: AbortSignal;
+  readonly headers?: Record<string, string | undefined>;
+  readonly webhookUrl?: string;
+};
+
+export type BatchOperationOptions = {
+  readonly batchId: string;
+  readonly providerOptions?: SharedV4ProviderOptions;
+  readonly abortSignal?: AbortSignal;
+  readonly headers?: Record<string, string | undefined>;
+};
+
+export type BatchItemResult<RESULT> =
+  | {
+      readonly id: string;
+      readonly status: "succeeded";
+      readonly result: RESULT;
+    }
+  | {
+      readonly id: string;
+      readonly status: "failed";
+      readonly error: BatchError;
+      readonly providerMetadata?: SharedV4ProviderMetadata;
+    }
+  | {
+      readonly id: string;
+      readonly status: "cancelled" | "expired";
+      readonly error?: BatchError;
+      readonly providerMetadata?: SharedV4ProviderMetadata;
+    };
+
+export type LanguageModelBatchRequest = {
+  readonly id: string;
+  readonly options: Pick<
+    LanguageModelV4CallOptions,
+    | "prompt"
+    | "maxOutputTokens"
+    | "temperature"
+    | "stopSequences"
+    | "topP"
+    | "topK"
+    | "presencePenalty"
+    | "frequencyPenalty"
+    | "seed"
+    | "reasoning"
+    | "responseFormat"
+    | "toolChoice"
+    | "tools"
+    | "providerOptions"
+  >;
+};
+
+export type BatchLanguageModel = {
+  experimental_doStartBatch(
+    options: BatchStartOptions<LanguageModelBatchRequest>,
+  ): PromiseLike<BatchStartResult>;
+  experimental_doGetBatchStatus(
+    options: BatchOperationOptions,
+  ): PromiseLike<BatchStatus>;
+  experimental_doGetBatchResults(
+    options: BatchOperationOptions,
+  ): PromiseLike<
+    ReadableStream<BatchItemResult<LanguageModelV4GenerateResult>>
+  >;
+};
+
+function isBatchModel(m: unknown): m is BatchLanguageModel {
   return (
     typeof m === "object" &&
     m !== null &&
@@ -52,7 +157,7 @@ function isBatchModel(
 }
 
 function mapAiSdkStatus(
-  status: Experimental_BatchV4Status["status"],
+  status: BatchStatus["status"],
 ): EngineBatchStatus["status"] {
   switch (status) {
     case "pending":
@@ -67,7 +172,7 @@ function mapAiSdkStatus(
 }
 
 function mapRequestCounts(
-  counts: Experimental_BatchV4Status["requestCounts"],
+  counts: BatchStatus["requestCounts"],
 ): EngineBatchStatus["requestCounts"] {
   if (!counts) return undefined;
   return {
@@ -126,7 +231,8 @@ async function* readableStreamToAsyncIterable<T>(
 }
 
 /**
- * Creates an EngineBatchModel adapter wrapping an AI SDK model implementing Experimental_BatchLanguageModelV4.
+ * Creates an EngineBatchModel adapter wrapping an AI SDK model that implements
+ * the per-model batch seam (`BatchLanguageModel` above).
  */
 export function fromAiSdk(
   model: unknown,
@@ -153,45 +259,43 @@ export function fromAiSdk(
       requests: EngineBatchRequest[],
       callOpts?: EngineBatchStartOptions,
     ): Promise<EngineBatchRef & EngineBatchStatus> {
-      const batchRequests: Experimental_LanguageModelV4BatchRequest[] =
-        requests.map((req) => {
-          let responseFormat:
-            | LanguageModelV4CallOptions["responseFormat"]
-            | undefined;
-          if (req.schema) {
-            // OpenAI's batch endpoint applies the same strict rules as its
-            // realtime one (no `oneOf`); Google's schema is substituted at
-            // the fetch boundary and Anthropic takes JSON Schema as is.
-            const jsonSchema = opts.provider.startsWith("openai")
-              ? toPortableJsonSchema(toJsonSchema(req.schema), "openai")
-              : toJsonSchema(req.schema);
-            responseFormat = {
-              type: "json",
-              schema: jsonSchema as JSONSchema7,
-            };
-          }
-
-          return {
-            id: req.id,
-            options: {
-              prompt: buildPrompt(req),
-              ...(req.maxOutputTokens !== undefined
-                ? { maxOutputTokens: req.maxOutputTokens }
-                : {}),
-              ...(req.temperature !== undefined
-                ? { temperature: req.temperature }
-                : {}),
-              ...(responseFormat ? { responseFormat } : {}),
-            },
+      const batchRequests: LanguageModelBatchRequest[] = requests.map((req) => {
+        let responseFormat:
+          | LanguageModelV4CallOptions["responseFormat"]
+          | undefined;
+        if (req.schema) {
+          // OpenAI's batch endpoint applies the same strict rules as its
+          // realtime one (no `oneOf`); Google's schema is substituted at
+          // the fetch boundary and Anthropic takes JSON Schema as is.
+          const jsonSchema = opts.provider.startsWith("openai")
+            ? toPortableJsonSchema(toJsonSchema(req.schema), "openai")
+            : toJsonSchema(req.schema);
+          responseFormat = {
+            type: "json",
+            schema: jsonSchema as JSONSchema7,
           };
-        });
+        }
 
-      const startOptions: Experimental_BatchV4StartOptions<Experimental_LanguageModelV4BatchRequest> =
-        {
-          requests: batchRequests,
-          abortSignal: callOpts?.abortSignal,
-          headers: callOpts?.headers,
+        return {
+          id: req.id,
+          options: {
+            prompt: buildPrompt(req),
+            ...(req.maxOutputTokens !== undefined
+              ? { maxOutputTokens: req.maxOutputTokens }
+              : {}),
+            ...(req.temperature !== undefined
+              ? { temperature: req.temperature }
+              : {}),
+            ...(responseFormat ? { responseFormat } : {}),
+          },
         };
+      });
+
+      const startOptions: BatchStartOptions<LanguageModelBatchRequest> = {
+        requests: batchRequests,
+        abortSignal: callOpts?.abortSignal,
+        headers: callOpts?.headers,
+      };
 
       const startResult =
         await batchModel.experimental_doStartBatch(startOptions);
@@ -249,7 +353,7 @@ export function fromAiSdk(
 
       for await (const item of readableStreamToAsyncIterable(
         stream as ReadableStream<
-          Experimental_BatchV4ItemResult<LanguageModelV4GenerateResult>
+          BatchItemResult<LanguageModelV4GenerateResult>
         >,
       )) {
         if (item.status === "succeeded") {

@@ -366,6 +366,29 @@ consumer that renders incrementally still receives the content. There is no
 replay. Hosts with an idle-connection timeout (Cloudflare Workers) need this
 where a single non-streaming call would trip the timeout.
 
+### `ctx.step.ai.evaluate`
+
+```typescript
+const decision = await ctx.step.ai.evaluate("route", "typesafe/jev-1.13", {
+  state: { ticket: ctx.input.ticket },
+  questions: {
+    team: {
+      type: "choice",
+      instructions: "Which team should handle `ticket`?",
+      criteria: { billing: "Charges and refunds.", engineering: "Bugs and outages." },
+    },
+  },
+});
+if (decision.answers.team.choice === "engineering") { /* ... */ }
+```
+
+A decision model (see `ai.evaluate` in 04-ai-integration.md) answered as one
+`run` step. Memoising matters more here than for text: a decision usually picks
+the branch the rest of the stage takes, so a stage that replays after a
+suspension must not ask again and possibly get a different answer halfway
+through work done under the first one. Takes step options (`retries`, `lease`,
+...) as its fifth argument like the other `ctx.step.ai` calls.
+
 ### `ctx.step.ai.map`
 
 One prompt per item under an execution policy, with schema validation and repair applied identically on the realtime and batch paths. Results come back in input order.
