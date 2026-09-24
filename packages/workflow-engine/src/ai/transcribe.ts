@@ -228,6 +228,7 @@ export async function transcribe(
       inputTokens,
       outputTokens,
       cost,
+      estimatedCost,
       reportedCost: reportedCostUsd,
       costSource,
       metadata: {

@@ -117,6 +117,7 @@ describe("ai.transcribe", () => {
       inputTokens: 0,
       outputTokens: 0,
       cost: expect.closeTo(0.009, 12),
+      estimatedCost: expect.closeTo(0.009, 12),
       costSource: "estimated",
       metadata: { durationInSeconds: 90, language: "en", segmentCount: 2 },
     });
