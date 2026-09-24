@@ -10,6 +10,7 @@
     "@bratsos/workflow-engine-host-serverless": "0.3.2"
   },
   "changesets": [
+    "ai-evaluate",
     "durable-steps-v1"
   ]
 }
