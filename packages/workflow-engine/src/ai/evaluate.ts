@@ -185,12 +185,10 @@ export async function evaluate<const Q extends EvaluationQuestions>(
 
     const inputTokens = result.usage.inputTokens ?? 0;
     const outputTokens = result.usage.outputTokens ?? 0;
-    const { cost, reportedCostUsd, costSource } = resolveCost(
-      modelKey,
-      inputTokens,
-      outputTokens,
-      { providerMetadata: result.providerMetadata },
-    );
+    const { cost, estimatedCostUsd, reportedCostUsd, costSource, servedBy } =
+      resolveCost(modelKey, inputTokens, outputTokens, {
+        providerMetadata: result.providerMetadata,
+      });
     const durationMs = Date.now() - startTime;
 
     ctx.aiCallLogger.logCall({
@@ -203,8 +201,10 @@ export async function evaluate<const Q extends EvaluationQuestions>(
       inputTokens,
       outputTokens,
       cost,
+      estimatedCost: estimatedCostUsd,
       reportedCost: reportedCostUsd,
       costSource,
+      ...(servedBy !== undefined ? { servedBy } : {}),
       metadata: {
         questionCount: questionIds.length,
         durationMs,
