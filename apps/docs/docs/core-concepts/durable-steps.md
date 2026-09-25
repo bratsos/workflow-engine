@@ -269,6 +269,34 @@ const summary = await ctx.step.ai.generateText(
 
 `ctx.step.ai.streamText(id, model, prompt, options?, stepOptions?)` streams through `ctx.ai.streamText` on the first execution (forwarding `onChunk`) and stores the final text, tokens, cost and reasoning as one `run` step; a replay returns the stored `StepStreamResult` and calls `onChunk` once with the whole text. Use it where a host kills an idle non-streaming connection.
 
+`ctx.step.ai.evaluate(id, model, { state, questions })` answers typed questions with a decision model such as TypeSafe's Jev and memoises the answers. This matters more than for text: a decision usually picks the branch the rest of the stage takes, so a stage that replays after a suspension must not ask again and possibly get a different answer halfway through work done under the first one.
+
+```typescript
+const { answers } = await ctx.step.ai.evaluate("route", "typesafe/jev-1.13", {
+  state: { ticket: ctx.input.ticket },
+  questions: {
+    team: {
+      type: "choice",
+      instructions: "Which team should handle `ticket`?",
+      criteria: { billing: "Charges and refunds.", engineering: "Bugs and outages." },
+    },
+  },
+});
+if (answers.team.choice === "engineering") { /* ... */ }
+```
+
+`ctx.step.ai.transcribe(id, model, audio)` transcribes audio (bytes, base64 or a `URL`) as one `run` step, so a replay neither re-sends the audio nor pays for it again. Only the transcript is stored, never the audio.
+
+```typescript
+const transcript = await ctx.step.ai.transcribe(
+  "transcript",
+  "whisper-1",
+  new URL(ctx.input.audioUrl),
+);
+```
+
+Both take step options (`retries`, `lease`, ...) as their last argument, like the other `ctx.step.ai` calls. See [AI Integration](../ai/overview.md) for the models and cost of each.
+
 `ctx.step.ai.map(id, items, spec)` runs one prompt per item under a realtime or batch policy with the same schema validation and repair on both paths — that is the replacement for the 0.x async-batch stage, and it has its own page: [Batch Operations](../ai/batch-operations.md).
 
 ---
