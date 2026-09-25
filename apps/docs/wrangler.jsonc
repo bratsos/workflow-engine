@@ -2,7 +2,7 @@
   // Cloudflare Workers - Static Assets (Workers, not Pages).
   // Docusaurus emits fully static HTML to ./build (a file per route plus a
   // 404.html), so this is an assets-only Worker with no `main` entrypoint.
-  // Live at https://workflow-engine-docs.bratsos.workers.dev
+  // Live at https://workflow-engine.dev
   //
   // Deploy:  pnpm run cf-deploy    (syncs migrations, builds, then `wrangler deploy`)
   // Preview: pnpm run cf-preview   (builds, then `wrangler dev`)
@@ -20,5 +20,8 @@
     "directory": "./build",
     // Docusaurus emits a real 404.html; serve it for unmatched paths.
     "not_found_handling": "404-page"
-  }
+  },
+  // `custom_domain: true` makes wrangler provision the DNS record and edge
+  // certificate in the workflow-engine.dev zone on deploy.
+  "routes": [{ "pattern": "workflow-engine.dev", "custom_domain": true }]
 }
