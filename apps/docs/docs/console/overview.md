@@ -12,6 +12,12 @@ prebuilt UI, mounted inside your own application.
 It is optional in the strict sense: nothing in the engine depends on it,
 and nothing in it is required to run a workflow.
 
+![The runs list: status, workflow, pinned definition version, duration, cost and tokens per run](/img/console/runs.png)
+
+The *Costs* tab rolls the same run totals up by workflow or by day:
+
+![Cost rollups by workflow](/img/console/costs.png)
+
 ## It never opens a connection
 
 Engine state lives in your Postgres. If you run the kernel inside one
@@ -87,6 +93,8 @@ the process that made it. Below that: the run's annotations (including the
 engine-written `run.supersededAttempt` and `step.outcome-conflict`), logs
 and the outbox event timeline.
 
+![Run detail for a contract review suspended on a legal sign-off signal: the stage timeline and a pending signal step in the ledger](/img/console/run-suspended.png)
+
 ## Delivering a signal
 
 A stage suspended on `ctx.step.waitForSignal` — the human-approval case —
@@ -114,6 +122,8 @@ rather than deleted. The request takes `from: { kind: "lastFailure" |
 a 400 rather than a silent fall back to one mode. The UI offers *Redrive on
 latest version* on any run carrying a pinned version. The action name is
 still `run.rerun`, so an existing `authorize` keeps matching.
+
+![A support-triage run that failed on a CRM outage and completed after one redrive: the header shows the redrive count](/img/console/run-redriven.png)
 
 ## Without a web application
 

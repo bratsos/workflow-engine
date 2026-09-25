@@ -10,13 +10,19 @@ const config: Config = {
 
   markdown: {
     format: 'detect',
+    // Renders ```mermaid code blocks as diagrams (theme below).
+    mermaid: true,
   },
+
+  themes: ['@docusaurus/theme-mermaid'],
 
   future: {
     v4: true,
     faster: true,
   },
 
+  // The live Worker. Change this when the site moves to a custom domain;
+  // it is the canonical URL on every page and in the sitemap.
   url: 'https://workflow-engine.dev',
   baseUrl: '/',
 
@@ -78,6 +84,9 @@ const config: Config = {
   ],
 
   themeConfig: {
+    mermaid: {
+      theme: { light: 'neutral', dark: 'dark' },
+    },
     colorMode: {
       respectPrefersColorScheme: true,
     },

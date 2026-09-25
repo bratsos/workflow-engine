@@ -71,7 +71,19 @@ export const batchAnalysisStage = defineStage({
 
 ### Policy resolution
 
-`auto` uses batch when there are at least `auto.batchAbove` items, the model's registry entry has `supportsAsyncBatch`, a batch provider resolves, and every prompt is a string; otherwise realtime. The provider resolves in this order: `batch.provider` on the call, the model's `batchProvider` registry field, the native vendor (the entry's `provider` when it is `"google"`, `"anthropic"` or `"openai"`, else the vendor named by the slug), then OpenRouter. Register `batchProvider: "openrouter"` on a model you call through OpenRouter to batch it there. When a vendor SDK is not installed and OpenRouter can batch the model, the helper falls back to OpenRouter with a WARN.
+```mermaid
+flowchart TD
+    items["ctx.step.ai.map(id, items, spec)"] --> policy{"policy"}
+    policy -- "realtime, or auto below batchAbove" --> rt["one durable step per item<br/>in-process concurrency, retries, budget"]
+    policy -- "batch, or auto above batchAbove" --> submit["id:submit — submit once"]
+    submit --> poll["id:poll — wait for the provider"]
+    poll --> collect["id:collect — fetch and validate"]
+    collect --> repair["realtime repair pass<br/>for failed or invalid items"]
+    rt --> results[("results, in input order")]
+    repair --> results
+```
+
+`auto` uses batch when there are at least `auto.batchAbove` items, the model's registry entry has `supportsAsyncBatch`, a batch provider resolves, and every prompt is a string; otherwise realtime. The provider resolves in this order: `batch.provider` on the call, the model's `batchProvider` registry field, the native vendor (the entry's `provider` when it is `"google"`, `"anthropic"` or `"openai"`, else the vendor named by the slug), then OpenRouter. Register `batchProvider: "openrouter"` on a model you call through OpenRouter to batch it there. When a vendor SDK is not installed, or its release exposes no batch interface the engine can drive, and OpenRouter can batch the model, the helper falls back to OpenRouter with a WARN.
 
 Once a batch is submitted, its polls and collect go through the transport recorded in the stored refs, whatever the registry resolves later.
 
@@ -111,6 +123,10 @@ A new job attempt of the stage re-opens failed item rows and re-prompts them; a 
 | `anthropic` | Claude models via AI SDK | `@ai-sdk/anthropic` (optional peer >=4.0.46) |
 | `openai` | OpenAI models via AI SDK | `@ai-sdk/openai` (optional peer >=4.0.53) |
 | `openrouter` | OpenRouter Batch API (HTTP) | None (direct fetch) |
+
+The native transports work with every release of the vendor packages. Earlier releases put the batch methods on the language model (`experimental_doStartBatch` and siblings); `@ai-sdk/google` 4.0.65 and the current `@ai-sdk/openai` / `@ai-sdk/anthropic` moved them to the provider (`provider.experimental_batch()`). The engine drives whichever the installed release exposes. The HTTP requests are the same either way, so crash recovery and Google's schema substitution behave identically, and a batch submitted before a vendor upgrade is polled and collected after it.
+
+When a native transport can't be used, the helper falls back to the OpenRouter transport with a WARN, provided OpenRouter can batch the model. That happens when the vendor package is not installed (`@ai-sdk/anthropic` and `@ai-sdk/openai` are optional peers), or when its release exposes neither batch interface (`NotBatchCapableError`). A batch already submitted natively is never polled on OpenRouter; it fails with a provider-mismatch error instead.
 
 > **Pricing:** Batch pricing is per-model (`batchInputCostPerMillion` / `batchOutputCostPerMillion` in the registry, or the OpenRouter `:batch` catalog row), not a flat 50% discount. Exactly one adjustment is applied — the batch discount never compounds with a cache discount — so on a Google batch that hits the implicit cache the flat figure *overstates* cost for the cached tokens, and OpenRouter does not discount non-token components at all.
 

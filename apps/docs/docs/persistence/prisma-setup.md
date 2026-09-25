@@ -53,8 +53,7 @@ model WorkflowRun {
   // claimable and executable by any host, exactly as before. See
   // `workflow_definitions` for the structure the version identifies.
   definitionVersion String?
-  // How many times `run.redrive` has re-driven this run (Step Functions'
-  // redrive count). Never reset -- it counts the whole life of the run.
+  // How many times `run.redrive` has re-driven this run. Never reset -- it counts the whole life of the run.
   redriveCount      Int     @default(0)
 
   stages        WorkflowStage[]
