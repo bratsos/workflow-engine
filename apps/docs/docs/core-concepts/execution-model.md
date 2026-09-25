@@ -28,6 +28,37 @@ Workflows consist of an ordered list of **Execution Groups**:
 * Multiple concurrent stages added via `.parallel()` reside in the same execution group.
 * The engine guarantees that all stages in execution group $N$ must reach a terminal state (`COMPLETED` or `SKIPPED`) before any stage in execution group $N+1$ can be claimed and executed.
 
+```mermaid
+flowchart LR
+    subgraph g1 [Group 1]
+        extract[extract]
+    end
+    subgraph g2 ["Group 2 (.parallel)"]
+        classify[classify]
+        embed[embed]
+    end
+    subgraph g3 [Group 3]
+        publish[publish]
+    end
+    extract --> classify & embed
+    classify & embed --> publish
+```
+
+A run moves through these statuses. `SUSPENDED` belongs to a stage, not a run: while a stage waits, its run stays `RUNNING`.
+
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING: run.create
+    PENDING --> RUNNING: run.claimPending
+    RUNNING --> COMPLETED: last group completes
+    RUNNING --> FAILED: a stage fails terminally
+    PENDING --> CANCELLED: run.cancel
+    RUNNING --> CANCELLED: run.cancel
+    COMPLETED --> RUNNING: run.redrive
+    FAILED --> RUNNING: run.redrive
+    CANCELLED --> RUNNING: run.redrive
+```
+
 ---
 
 ## Job Queue and Claiming
@@ -35,6 +66,24 @@ Workflows consist of an ordered list of **Execution Groups**:
 Jobs are queued in the `JobQueue` table. Polling is coordinated directly through database queries:
 * **PG-native lock avoidance**: The engine uses PostgreSQL's `FOR UPDATE SKIP LOCKED` (or SQLite's equivalent transactions) to dequeue jobs. This allows multiple host processes to safely run concurrently without double-claiming jobs.
 * **Orchestration ticks**: Hosts run periodic orchestration ticks that look for runs in `PENDING` status, claim them, and queue their initial stages as jobs in the `JobQueue`.
+
+```mermaid
+sequenceDiagram
+    participant H as Host
+    participant K as Kernel
+    participant DB as Postgres
+    H->>K: run.claimPending
+    K->>DB: PENDING run → RUNNING, enqueue group 1 jobs
+    loop each worker slot
+        H->>DB: dequeue job (FOR UPDATE SKIP LOCKED)
+        H->>K: job.execute (heartbeating the lease)
+        K->>DB: stage COMPLETED / SUSPENDED / retry
+    end
+    H->>K: run.transition
+    K->>DB: group done → enqueue next group, or finish the run
+    H->>K: stage.pollSuspended
+    K->>DB: replay due suspended stages
+```
 
 ---
 

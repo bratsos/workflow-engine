@@ -16,6 +16,35 @@ By decoupling execution logic from infrastructure, the core engine has:
 * **Zero runtime timers/signals**: The kernel does not manage standard intervals or event loops.
 * **Environment independence**: The exact same kernel can execute on Node.js, serverless edge workers, AWS Lambda, or in-memory unit tests.
 
+```mermaid
+flowchart LR
+    app["Your application<br/>(run.create, run.redrive, step.signal)"]
+    hosts["Host<br/>host-node · host-serverless · host-remote"]
+    kernel(["Kernel<br/>kernel.dispatch(command)"])
+    subgraph ports [Ports]
+        direction TB
+        persistence[persistence]
+        jobs[jobTransport]
+        ledger["stepLedger (optional)"]
+        blobs[blobStore]
+        sink[eventSink]
+        clock[clock]
+        registry[registry]
+    end
+    subgraph adapters [Adapters]
+        direction TB
+        pg[("Prisma / Postgres")]
+        mem["In-memory (tests)"]
+        custom["Your own"]
+    end
+    app --> kernel
+    hosts -- "ticks: claim, execute, poll, flush" --> kernel
+    kernel --> ports
+    ports --> adapters
+```
+
+The kernel never runs on its own. Hosts drive it with commands on a schedule, your code dispatches commands for the things only it knows about, and everything the kernel reads or writes goes through a port you supply.
+
 ---
 
 ## The Core Ports

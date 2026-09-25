@@ -30,6 +30,26 @@ await kernel.dispatch({
 });
 ```
 
+```mermaid
+flowchart LR
+    subgraph before ["A failed run"]
+        direction LR
+        A1["ingest ✓"] --> B1["summarise ✗"] --> C1["publish ·"]
+    end
+    subgraph retry ["from lastFailure (retry)"]
+        direction LR
+        A2["ingest ✓ kept"] --> B2["summarise ↻ reopened"] --> C2["publish ▶ new"]
+    end
+    subgraph restart ["from start (restart)"]
+        direction LR
+        A3["ingest ▶ new"] --> B3["summarise ▶ new"] --> C3["publish ▶ new"]
+    end
+    before --> retry
+    before --> restart
+```
+
+A retry or rerun reopens the stage it resumes from, keeping its completed durable steps, and replaces every stage after it. A restart replaces every stage. Either way the superseded attempts are archived as annotations.
+
 | `from` | Resumes at |
 | --- | --- |
 | `{ kind: "lastFailure" }` | the earliest stage record that is not `COMPLETED`; if every stage completed, the last one |

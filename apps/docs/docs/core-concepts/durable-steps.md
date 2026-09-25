@@ -9,6 +9,24 @@ A stage checkpoints at its boundary: its output is written once, when `execute()
 
 That is what lets one linear function submit a batch, wait hours for it, sleep, and wait for a human — and survive the process dying at any point in between.
 
+```mermaid
+sequenceDiagram
+    participant S as execute()
+    participant L as Step ledger
+    Note over S,L: First execution
+    S->>L: step.run("submit") — runs the body
+    L-->>S: result recorded
+    S->>L: step.waitFor("ready") — not ready yet
+    Note over S: stage suspends, the process may exit
+    Note over S,L: Replay, when the wait is due
+    S->>L: step.run("submit")
+    L-->>S: answered from the ledger, body not run
+    S->>L: step.waitFor("ready") — polls again, ready
+    L-->>S: result recorded
+    S->>L: step.run("collect") — runs the body
+    Note over S: execute() returns and the stage completes
+```
+
 ---
 
 ## Setup
