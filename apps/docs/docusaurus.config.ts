@@ -23,7 +23,7 @@ const config: Config = {
 
   // The live Worker. Change this when the site moves to a custom domain;
   // it is the canonical URL on every page and in the sitemap.
-  url: 'https://workflow-engine-docs.bratsos.workers.dev',
+  url: 'https://workflow-engine.dev',
   baseUrl: '/',
 
   organizationName: 'bratsos',
