@@ -4,8 +4,9 @@
   "private": true,
   "scripts": {
     "docusaurus": "docusaurus",
-    "start": "docusaurus start",
-    "build": "docusaurus build",
+    "sync-migrations": "node scripts/sync-migrations.mjs",
+    "start": "pnpm run sync-migrations && docusaurus start",
+    "build": "pnpm run sync-migrations && docusaurus build",
     "swizzle": "docusaurus swizzle",
     "clear": "docusaurus clear",
     "serve": "docusaurus serve",

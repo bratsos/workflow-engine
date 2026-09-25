@@ -3,3 +3,7 @@ build/
 .docusaurus/
 docs/api/
 node_modules/
+# Generated from the skill's migration guides (scripts/sync-migrations.mjs)
+docs/migrations/migrate-0.11-to-0.12.md
+docs/migrations/migrate-0.12-to-0.13.md
+docs/migrations/migrate-0.13-to-1.0.md

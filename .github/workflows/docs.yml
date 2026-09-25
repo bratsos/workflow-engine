@@ -6,11 +6,13 @@ on:
     paths:
       - 'apps/docs/**'
       - 'packages/workflow-engine/src/**'
+      - 'packages/workflow-engine/skills/workflow-engine/migrations/**'
   pull_request:
     branches: [main]
     paths:
       - 'apps/docs/**'
       - 'packages/workflow-engine/src/**'
+      - 'packages/workflow-engine/skills/workflow-engine/migrations/**'
 
 jobs:
   build-docs:
