@@ -17,7 +17,9 @@ const config: Config = {
     faster: true,
   },
 
-  url: 'https://workflow-engine.dev',
+  // The live Worker. Change this when the site moves to a custom domain;
+  // it is the canonical URL on every page and in the sitemap.
+  url: 'https://workflow-engine-docs.bratsos.workers.dev',
   baseUrl: '/',
 
   organizationName: 'bratsos',

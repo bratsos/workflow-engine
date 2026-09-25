@@ -37,8 +37,7 @@ jobs:
       - name: Build docs
         run: pnpm --filter workflow-engine-docs build
 
-      # Commented-out wrangler deploy step. Note: Requires CLOUDFLARE_API_TOKEN and Cloudflare Pages account setup.
-      # - name: Deploy to Cloudflare Pages
-      #   run: pnpm --filter workflow-engine-docs run cf-deploy
-      #   env:
-      #     CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      # Deploys happen outside this workflow: Cloudflare Workers Builds is
+      # connected to the repository and runs
+      # `pnpm --filter workflow-engine-docs run cf-deploy` (see
+      # apps/docs/wrangler.jsonc). This job only checks that the site builds.
