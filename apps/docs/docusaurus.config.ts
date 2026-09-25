@@ -10,7 +10,11 @@ const config: Config = {
 
   markdown: {
     format: 'detect',
+    // Renders ```mermaid code blocks as diagrams (theme below).
+    mermaid: true,
   },
+
+  themes: ['@docusaurus/theme-mermaid'],
 
   future: {
     v4: true,
@@ -80,6 +84,9 @@ const config: Config = {
   ],
 
   themeConfig: {
+    mermaid: {
+      theme: { light: 'neutral', dark: 'dark' },
+    },
     colorMode: {
       respectPrefersColorScheme: true,
     },
