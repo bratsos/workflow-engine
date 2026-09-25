@@ -12,9 +12,8 @@ loaded — so adding, removing or reordering a stage silently changes the
 shape of a run that is already half-finished.
 
 The engine answers completed steps from a ledger rather than replaying
-history, which makes it a *specification* engine (like Conductor or
-LittleHorse) rather than a *replay* engine (like Temporal). The right answer
-for that family is **pinning**, not patching: a run resolves against the
+history, which makes it a *specification* engine rather than a *replay*
+engine. The right answer for a specification engine is **pinning**, not patching: a run resolves against the
 definition it was created under. There are no patch markers and no
 `getVersion()` branches to retire.
 
@@ -32,9 +31,9 @@ The version is a hash of the pipeline's **structural contract**:
 It deliberately **excludes** stage `name`, stage `description`, and the
 bodies of `execute`, `checkCompletion` and `estimateCost`.
 
-That exclusion is the point. Hashing source code — DBOS's default — forks
-every in-flight run when you reformat a file or edit a log line. Hashing the
-contract — LittleHorse's `majorVersion` — forks only when a recorded run's
+That exclusion is the point. Hashing source code would fork every in-flight
+run when you reformat a file or edit a log line. Hashing the contract forks
+only when a recorded run's
 shape could actually stop lining up. Changing what a stage *does* is a
 deploy concern; changing the *set and order of stages a run is halfway
 through* is a run-compatibility concern.
@@ -53,7 +52,7 @@ workflow.getDefinitionSnapshot(); // the structure that hash identifies
 
 ### Declaring the version yourself
 
-If you would rather control forking by hand, Conductor-style:
+If you would rather control forking by hand:
 
 ```ts
 const workflow = defineWorkflow("invoice", { input: InvoiceInput })
