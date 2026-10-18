@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
   pull_request:
@@ -12,6 +13,7 @@ concurrency:
 
 jobs:
   ci:
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
 
     strategy:
@@ -90,6 +92,12 @@ jobs:
 
       - name: Push Prisma schema to Postgres
         run: pnpm --filter @bratsos/workflow-engine run prisma:db-push
+
+      - name: Run core package tests
+        if: github.event_name == 'workflow_dispatch'
+        run: pnpm --filter @bratsos/workflow-engine test
+        env:
+          NODE_ENV: test
 
       - name: Run Postgres conformance tests
         run: pnpm --filter @bratsos/workflow-engine run test:pg
