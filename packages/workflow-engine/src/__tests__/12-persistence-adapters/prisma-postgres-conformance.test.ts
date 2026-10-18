@@ -274,44 +274,62 @@ if (!DATABASE_URL) {
         };
         let emptyReads = 0;
         let release!: () => void;
-        const bothRead = new Promise<void>((resolve) => { release = resolve; });
-        const register = () => prisma.$transaction(async (tx: typeof prisma) => {
-          // Make the old find/create path race deterministically. The atomic
-          // insert path reads only after inserting, so never waits here.
-          const model = tx.workflowDefinition;
-          const client = new Proxy(tx, {
-            get(target, key) {
-              if (key === "workflowDefinition") return new Proxy(model, {
-                get(delegate, method) {
-                  if (method === "findUnique") return async (args: unknown) => {
-                    const row = await delegate.findUnique(args);
-                    if (!row) {
-                      if (++emptyReads === 2) release();
-                      await bothRead;
-                    }
-                    return row;
-                  };
-                  const value = Reflect.get(delegate, method);
-                  return typeof value === "function" ? value.bind(delegate) : value;
-                },
-              });
-              const value = Reflect.get(target, key);
-              return typeof value === "function" ? value.bind(target) : value;
-            },
-          });
-          const adapter = createPrismaWorkflowPersistence(client, { definitionVersioning: true });
-          const row = await adapter.insertDefinitionIfAbsent(input);
-          // An additional SQL read must work in the same caller transaction.
-          expect(await adapter.getDefinition(workflowId, input.version)).toEqual(row);
-          return row;
+        const bothRead = new Promise<void>((resolve) => {
+          release = resolve;
         });
+        const register = () =>
+          prisma.$transaction(async (tx: typeof prisma) => {
+            // Make the old find/create path race deterministically. The atomic
+            // insert path reads only after inserting, so never waits here.
+            const model = tx.workflowDefinition;
+            const client = new Proxy(tx, {
+              get(target, key) {
+                if (key === "workflowDefinition")
+                  return new Proxy(model, {
+                    get(delegate, method) {
+                      if (method === "findUnique")
+                        return async (args: unknown) => {
+                          const row = await delegate.findUnique(args);
+                          if (!row) {
+                            if (++emptyReads === 2) release();
+                            await bothRead;
+                          }
+                          return row;
+                        };
+                      const value = Reflect.get(delegate, method);
+                      return typeof value === "function"
+                        ? value.bind(delegate)
+                        : value;
+                    },
+                  });
+                const value = Reflect.get(target, key);
+                return typeof value === "function" ? value.bind(target) : value;
+              },
+            });
+            const adapter = createPrismaWorkflowPersistence(client, {
+              definitionVersioning: true,
+            });
+            const row = await adapter.insertDefinitionIfAbsent(input);
+            // An additional SQL read must work in the same caller transaction.
+            expect(
+              await adapter.getDefinition(workflowId, input.version),
+            ).toEqual(row);
+            return row;
+          });
         try {
           const results = await Promise.allSettled([register(), register()]);
-          expect(results.map((result) => result.status)).toEqual(["fulfilled", "fulfilled"]);
-          const rows = results.map((result) => result.status === "fulfilled" ? result.value : null);
+          expect(results.map((result) => result.status)).toEqual([
+            "fulfilled",
+            "fulfilled",
+          ]);
+          const rows = results.map((result) =>
+            result.status === "fulfilled" ? result.value : null,
+          );
           expect(rows[0]).toMatchObject(input);
           expect(rows[1]).toEqual(rows[0]);
-          expect(await prisma.workflowDefinition.count({ where: { workflowId } })).toBe(1);
+          expect(
+            await prisma.workflowDefinition.count({ where: { workflowId } }),
+          ).toBe(1);
         } finally {
           await prisma.workflowDefinition.deleteMany({ where: { workflowId } });
         }

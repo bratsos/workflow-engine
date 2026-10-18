@@ -697,7 +697,29 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
   ): Promise<WorkflowDefinitionRecord | null> {
     const model = this.prisma.workflowDefinition;
     if (!this.versioning.enabled || !model) return null;
-    const existing = await model.findUnique({
+    if (!this.prisma.$executeRaw) {
+      throw new Error("Definition registration requires $executeRaw.");
+    }
+    // A caught unique violation still aborts a caller-owned PostgreSQL
+    // transaction. Insert atomically, then read in a separate statement so
+    // READ COMMITTED sees the competing transaction's immutable winner.
+    const snapshot = JSON.stringify(input.snapshot);
+    if (this.databaseType === "sqlite") {
+      await this.prisma.$executeRaw`
+        INSERT INTO "workflow_definitions"
+          ("workflowId", version, snapshot, "structureHash", "createdAt")
+        VALUES (${input.workflowId}, ${input.version}, ${snapshot}, ${input.structureHash}, ${new Date()})
+        ON CONFLICT ("workflowId", version) DO NOTHING
+      `;
+    } else {
+      await this.prisma.$executeRaw`
+        INSERT INTO "workflow_definitions"
+          ("workflowId", version, snapshot, "structureHash")
+        VALUES (${input.workflowId}, ${input.version}, ${snapshot}::jsonb, ${input.structureHash})
+        ON CONFLICT ("workflowId", version) DO NOTHING
+      `;
+    }
+    const row = await model.findUnique({
       where: {
         workflowId_version: {
           workflowId: input.workflowId,
@@ -705,36 +727,11 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
         },
       },
     });
-    if (existing) return this.mapDefinition(existing);
-
-    try {
-      const created = await model.create({
-        data: {
-          workflowId: input.workflowId,
-          version: input.version,
-          snapshot: input.snapshot as unknown,
-          structureHash: input.structureHash,
-        },
-      });
-      return this.mapDefinition(created);
-    } catch {
-      // Lost the insert race with a concurrent run.create for the same
-      // version -- the row is content-addressed, so the winner's row is
-      // the answer either way.
-      const raced = await model.findUnique({
-        where: {
-          workflowId_version: {
-            workflowId: input.workflowId,
-            version: input.version,
-          },
-        },
-      });
-      if (!raced)
-        throw new Error(
-          `Could not store definition snapshot for workflow "${input.workflowId}" version "${input.version}".`,
-        );
-      return this.mapDefinition(raced);
-    }
+    if (!row)
+      throw new Error(
+        `Could not store definition snapshot for workflow "${input.workflowId}" version "${input.version}".`,
+      );
+    return this.mapDefinition(row);
   }
 
   async getDefinition(
