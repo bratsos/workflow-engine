@@ -1,5 +1,11 @@
 # @bratsos/workflow-engine
 
+## 1.0.0-alpha.17
+
+### Patch Changes
+
+- 2774ba5: Keep concurrent definition registration safe inside caller transactions and expose DefinitionRegistrationRetryableError when the caller must retry with a fresh transaction snapshot.
+
 ## 1.0.0-alpha.16
 
 ### Patch Changes
