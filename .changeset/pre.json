@@ -12,6 +12,7 @@
   "changesets": [
     "ai-evaluate",
     "ai-transcribe",
+    "atomic-definition-registration",
     "batch-provider-seam",
     "cost-accounting-steps",
     "cost-accounting",
