@@ -371,6 +371,7 @@ export type {
   WorkflowDefinitionRecord,
 } from "./persistence/interface";
 export {
+  DefinitionRegistrationRetryableError,
   LEASE_ABSOLUTE_CAP,
   LEASE_HEARTBEAT_LOST,
   StaleVersionError,

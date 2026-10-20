@@ -31,8 +31,12 @@
  * for the in-memory equivalents that always run unconditionally).
  */
 
+import { execFileSync } from "node:child_process";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
-import { afterAll, beforeEach, describe, expect, it } from "vitest";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
 import { defineStage } from "../../core/stage-factory.js";
 import { deriveStepExternalKey } from "../../core/step-external-key.js";
@@ -44,6 +48,7 @@ import {
   CollectingEventSink,
   InMemoryBlobStore,
 } from "../../kernel/testing/index.js";
+import { DefinitionRegistrationRetryableError } from "../../persistence/interface.js";
 import {
   createPrismaAICallLogger,
   createPrismaJobQueue,
@@ -332,6 +337,187 @@ if (!DATABASE_URL) {
           ).toBe(1);
         } finally {
           await prisma.workflowDefinition.deleteMany({ where: { workflowId } });
+        }
+      });
+
+      it.each([
+        "RepeatableRead",
+        "Serializable",
+      ])("returns a retry signal at %s and leaves the outer transaction usable", async (isolationLevel) => {
+        const workflowId = `definition-snapshot-${crypto.randomUUID()}`;
+        const input = {
+          workflowId,
+          version: "v1",
+          snapshot: { format: 1, workflowId, stages: [] },
+          structureHash: "same-structure",
+        };
+        let snapshots = 0;
+        let release!: () => void;
+        const bothRead = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        const register = (race: boolean) =>
+          prisma.$transaction(
+            async (tx: typeof prisma) => {
+              const adapter = createPrismaWorkflowPersistence(tx, {
+                definitionVersioning: true,
+              });
+              const prior = await adapter.createRun(
+                createRunData({ workflowId }),
+              );
+              // Both transactions acquire snapshots before either inserts.
+              if (race) {
+                expect(
+                  await adapter.getDefinition(workflowId, input.version),
+                ).toBeNull();
+                if (++snapshots === 2) release();
+                await bothRead;
+              }
+              try {
+                const row = await adapter.insertDefinitionIfAbsent(input);
+                expect(
+                  await adapter.getDefinition(workflowId, input.version),
+                ).toEqual(row);
+                return row;
+              } catch (error) {
+                expect(error).toBeInstanceOf(
+                  DefinitionRegistrationRetryableError,
+                );
+                expect(error).toMatchObject({
+                  code: "DEFINITION_REGISTRATION_RETRY",
+                  retryable: true,
+                  workflowId,
+                  version: input.version,
+                });
+                // A swallowed 40001 must not leave 25P02 or discard earlier work.
+                expect(await adapter.getRun(prior.id)).toMatchObject({
+                  id: prior.id,
+                });
+                await adapter.updateRun(prior.id, {
+                  status: "RUNNING",
+                });
+                throw error;
+              }
+            },
+            { isolationLevel, timeout: 15_000 },
+          );
+        try {
+          const results = await Promise.allSettled([
+            register(true),
+            register(true),
+          ]);
+          const winners = results.filter((r) => r.status === "fulfilled");
+          const losers = results.filter((r) => r.status === "rejected");
+          expect(winners).toHaveLength(1);
+          expect(losers).toHaveLength(1);
+          expect(losers[0].reason).toBeInstanceOf(
+            DefinitionRegistrationRetryableError,
+          );
+          expect(await register(false)).toEqual(winners[0].value);
+          expect(
+            await prisma.workflowDefinition.count({ where: { workflowId } }),
+          ).toBe(1);
+        } finally {
+          await prisma.workflowRun.deleteMany({ where: { workflowId } });
+          await prisma.workflowDefinition.deleteMany({ where: { workflowId } });
+        }
+      });
+
+      it("fails clearly without $executeRaw while preserving the caller transaction", async () => {
+        await prisma.$transaction(async (tx: typeof prisma) => {
+          const client = new Proxy(tx, {
+            get(target, key) {
+              if (key === "$executeRaw") return undefined;
+              const value = Reflect.get(target, key);
+              return typeof value === "function" ? value.bind(target) : value;
+            },
+          });
+          const adapter = createPrismaWorkflowPersistence(client, {
+            definitionVersioning: true,
+          });
+          await expect(
+            adapter.insertDefinitionIfAbsent({
+              workflowId: "missing-execute",
+              version: "v1",
+              snapshot: {},
+              structureHash: "hash",
+            }),
+          ).rejects.toThrow(
+            "Prisma client does not support $executeRaw (required for the insertDefinitionIfAbsent path)",
+          );
+          expect(await tx.$queryRaw`SELECT 1 AS ok`).toEqual([{ ok: 1 }]);
+        });
+      });
+
+      it.each([
+        false,
+        true,
+      ])("preserves caller work after a non-retryable insert failure (skip transactions: %s)", async (skipInteractiveTransactions) => {
+        await prisma.$transaction(async (tx: typeof prisma) => {
+          const adapter = createPrismaWorkflowPersistence(tx, {
+            definitionVersioning: true,
+            skipInteractiveTransactions,
+          });
+          const prior = await adapter.createRun(createRunData());
+          await expect(
+            adapter.withTransaction((inner) =>
+              inner.insertDefinitionIfAbsent({
+                workflowId: "invalid-definition",
+                version: "v1",
+                snapshot: {},
+                // Force a real NOT NULL violation, rather than a mocked rejection.
+                structureHash: null as unknown as string,
+              }),
+            ),
+          ).rejects.toMatchObject({ code: "P2010", meta: { code: "23502" } });
+          expect(await adapter.getRun(prior.id)).toMatchObject({
+            id: prior.id,
+          });
+          await adapter.updateRun(prior.id, { status: "RUNNING" });
+        });
+      });
+
+      it("returns a retry signal if a conflict winner disappears before the follow-up read", async () => {
+        const input = {
+          workflowId: `definition-disappeared-${crypto.randomUUID()}`,
+          version: "v1",
+          snapshot: {},
+          structureHash: "hash",
+        };
+        await persistence.insertDefinitionIfAbsent(input);
+        const client = new Proxy(prisma, {
+          get(target, key) {
+            if (key === "$executeRaw")
+              return async (
+                strings: TemplateStringsArray,
+                ...values: unknown[]
+              ) => {
+                const count = await target.$executeRaw(strings, ...values);
+                expect(count).toBe(0);
+                // A real concurrent autocommit deletion between the statements.
+                await prisma.workflowDefinition.deleteMany({
+                  where: { workflowId: input.workflowId },
+                });
+                return count;
+              };
+            const value = Reflect.get(target, key);
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        });
+        try {
+          const adapter = createPrismaWorkflowPersistence(client, {
+            definitionVersioning: true,
+          });
+          await expect(
+            adapter.insertDefinitionIfAbsent(input),
+          ).rejects.toBeInstanceOf(DefinitionRegistrationRetryableError);
+          expect(
+            await persistence.insertDefinitionIfAbsent(input),
+          ).toMatchObject(input);
+        } finally {
+          await prisma.workflowDefinition.deleteMany({
+            where: { workflowId: input.workflowId },
+          });
         }
       });
 
@@ -980,3 +1166,112 @@ if (!DATABASE_URL) {
     });
   });
 }
+
+// Generate a separate, minimal SQLite client without changing the shipped schema
+// or replacing the Postgres client used by the conformance suites above.
+describe("definition registration on real SQLite", () => {
+  const require = createRequire(import.meta.url);
+  let directory: string;
+  let prisma: any;
+  beforeAll(async () => {
+    directory = await mkdtemp(
+      join(tmpdir(), "definition-registration-sqlite-"),
+    );
+    const schema = join(directory, "schema.prisma");
+    await writeFile(
+      schema,
+      `
+      generator client {
+        provider = "node '${require.resolve("@prisma/client/generator-build/index.js")}'"
+        output = "${join(directory, "client")}"
+      }
+      datasource db {
+        provider = "sqlite"
+        url = "file:${join(directory, "test.db")}"
+      }
+      model WorkflowDefinition {
+        workflowId String
+        version String
+        createdAt DateTime @default(now())
+        snapshot Json
+        structureHash String
+        @@id([workflowId, version])
+        @@map("workflow_definitions")
+      }
+    `,
+    );
+    const cli = require.resolve("prisma/build/index.js");
+    execFileSync(process.execPath, [cli, "generate", "--schema", schema], {
+      stdio: "pipe",
+    });
+    execFileSync(
+      process.execPath,
+      [cli, "db", "push", "--schema", schema, "--skip-generate"],
+      { stdio: "pipe" },
+    );
+    const { PrismaClient } = require(join(directory, "client"));
+    prisma = new PrismaClient();
+  }, 30_000);
+  afterAll(async () => {
+    await prisma?.$disconnect();
+    if (directory) await rm(directory, { recursive: true, force: true });
+  });
+
+  it("returns the immutable winner, including different-hash registrations in an outer transaction", async () => {
+    const input = {
+      workflowId: "sqlite-definition",
+      version: "v1",
+      snapshot: { format: 1, stages: [] },
+      structureHash: "first-hash",
+    };
+    await prisma.$transaction(async (tx: any) => {
+      const adapter = createPrismaWorkflowPersistence(tx, {
+        databaseType: "sqlite",
+        definitionVersioning: true,
+      });
+      const first = await adapter.insertDefinitionIfAbsent(input);
+      expect(first).toMatchObject(input);
+      expect(first?.createdAt).toBeInstanceOf(Date);
+      expect(await adapter.insertDefinitionIfAbsent(input)).toEqual(first);
+      expect(
+        await adapter.insertDefinitionIfAbsent({
+          ...input,
+          structureHash: "different",
+          snapshot: { stages: ["drift"] },
+        }),
+      ).toEqual(first);
+      expect(
+        await adapter.getDefinition(input.workflowId, input.version),
+      ).toEqual(first);
+    });
+    expect(await prisma.workflowDefinition.count()).toBe(1);
+  });
+
+  it("keeps the SQLite caller transaction usable after a rejected insert", async () => {
+    await prisma.$transaction(async (tx: any) => {
+      const adapter = createPrismaWorkflowPersistence(tx, {
+        databaseType: "sqlite",
+        definitionVersioning: true,
+      });
+      await expect(
+        adapter.insertDefinitionIfAbsent({
+          workflowId: "sqlite-invalid",
+          version: "v1",
+          snapshot: {},
+          structureHash: null as unknown as string,
+        }),
+      ).rejects.toMatchObject({ code: "P2010" });
+      const input = {
+        workflowId: "sqlite-recovered",
+        version: "v1",
+        snapshot: {},
+        structureHash: "valid",
+      };
+      const row = await adapter.insertDefinitionIfAbsent(input);
+      expect(row).toMatchObject(input);
+      expect(
+        await adapter.getDefinition(input.workflowId, input.version),
+      ).toEqual(row);
+    });
+  });
+});

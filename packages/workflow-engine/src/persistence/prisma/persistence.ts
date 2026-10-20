@@ -3,6 +3,7 @@
  *
  * This is the default persistence implementation used by the workflow engine.
  * It wraps Prisma client operations to match the WorkflowPersistence interface.
+ * Raw SQL requires the shipped table/column names; `workflow_definitions` must not be remapped.
  */
 
 import type {
@@ -31,7 +32,10 @@ import type {
   WorkflowRunRecord,
   WorkflowStageRecord,
 } from "../interface";
-import { StaleVersionError } from "../interface";
+import {
+  DefinitionRegistrationRetryableError,
+  StaleVersionError,
+} from "../interface";
 import { createEnumHelper, type PrismaEnumHelper } from "./enum-compat";
 import type { EnginePrismaClient } from "./prisma-client-type";
 import { utcTimestampParam } from "./utc-timestamps";
@@ -697,41 +701,83 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
   ): Promise<WorkflowDefinitionRecord | null> {
     const model = this.prisma.workflowDefinition;
     if (!this.versioning.enabled || !model) return null;
-    if (!this.prisma.$executeRaw) {
-      throw new Error("Definition registration requires $executeRaw.");
-    }
-    // A caught unique violation still aborts a caller-owned PostgreSQL
-    // transaction. Insert atomically, then read in a separate statement so
-    // READ COMMITTED sees the competing transaction's immutable winner.
-    const snapshot = JSON.stringify(input.snapshot);
-    if (this.databaseType === "sqlite") {
-      await this.prisma.$executeRaw`
-        INSERT INTO "workflow_definitions"
-          ("workflowId", version, snapshot, "structureHash", "createdAt")
-        VALUES (${input.workflowId}, ${input.version}, ${snapshot}, ${input.structureHash}, ${new Date()})
-        ON CONFLICT ("workflowId", version) DO NOTHING
-      `;
-    } else {
-      await this.prisma.$executeRaw`
-        INSERT INTO "workflow_definitions"
-          ("workflowId", version, snapshot, "structureHash")
-        VALUES (${input.workflowId}, ${input.version}, ${snapshot}::jsonb, ${input.structureHash})
-        ON CONFLICT ("workflowId", version) DO NOTHING
-      `;
-    }
-    const row = await model.findUnique({
-      where: {
-        workflowId_version: {
-          workflowId: input.workflowId,
-          version: input.version,
-        },
-      },
-    });
-    if (!row)
+    if (typeof this.prisma.$executeRaw !== "function") {
       throw new Error(
-        `Could not store definition snapshot for workflow "${input.workflowId}" version "${input.version}".`,
+        "Prisma client does not support $executeRaw (required for the insertDefinitionIfAbsent path)",
       );
-    return this.mapDefinition(row);
+    }
+    const snapshot = JSON.stringify(input.snapshot);
+    // Prisma transaction clients omit $transaction. Protect all SQL in this
+    // operation so a caller can catch an error and keep using its transaction,
+    // including when ON CONFLICT raises 40001 at REPEATABLE READ/SERIALIZABLE.
+    const savepoint =
+      this.databaseType === "postgresql" &&
+      typeof this.prisma.$transaction !== "function"
+        ? `definition_registration_${crypto.randomUUID().replaceAll("-", "")}`
+        : null;
+    const control = async (statement: string) => {
+      // Only adapter-generated savepoint identifiers enter this statement.
+      const strings = Object.assign([statement], { raw: [statement] });
+      await this.prisma.$executeRaw!(strings);
+    };
+    if (savepoint) await control(`SAVEPOINT ${savepoint}`);
+    try {
+      // A caught unique violation aborts a PostgreSQL transaction. Insert
+      // atomically, then read separately so READ COMMITTED sees the winner.
+      if (this.databaseType === "sqlite") {
+        await this.prisma.$executeRaw`
+          INSERT INTO "workflow_definitions"
+            ("workflowId", version, snapshot, "structureHash", "createdAt")
+          VALUES (${input.workflowId}, ${input.version}, ${snapshot}, ${input.structureHash}, ${new Date()})
+          ON CONFLICT ("workflowId", version) DO NOTHING
+        `;
+      } else {
+        await this.prisma.$executeRaw`
+          INSERT INTO "workflow_definitions"
+            ("workflowId", version, snapshot, "structureHash")
+          VALUES (${input.workflowId}, ${input.version}, ${snapshot}::jsonb, ${input.structureHash})
+          ON CONFLICT ("workflowId", version) DO NOTHING
+        `;
+      }
+      const row = await model.findUnique({
+        where: {
+          workflowId_version: {
+            workflowId: input.workflowId,
+            version: input.version,
+          },
+        },
+      });
+      if (!row) {
+        throw new DefinitionRegistrationRetryableError(
+          input.workflowId,
+          input.version,
+        );
+      }
+      const definition = this.mapDefinition(row);
+      if (savepoint) await control(`RELEASE SAVEPOINT ${savepoint}`);
+      return definition;
+    } catch (error) {
+      if (savepoint) {
+        await control(`ROLLBACK TO SAVEPOINT ${savepoint}`);
+        await control(`RELEASE SAVEPOINT ${savepoint}`);
+      }
+      const failure = error as {
+        code?: string;
+        meta?: { code?: string };
+      } | null;
+      if (
+        failure?.code === "P2034" ||
+        failure?.code === "40001" ||
+        failure?.meta?.code === "40001"
+      ) {
+        throw new DefinitionRegistrationRetryableError(
+          input.workflowId,
+          input.version,
+          error,
+        );
+      }
+      throw error;
+    }
   }
 
   async getDefinition(
