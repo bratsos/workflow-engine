@@ -13,6 +13,8 @@ title: Prisma Setup
 
 The package ships this schema at `node_modules/@bratsos/workflow-engine/prisma/schema.prisma`; copy the definitions into your own `prisma/schema.prisma`. Ensure that all model names map to their plural database equivalents using `@@map`. The Prisma adapters require every model *and column* below — a wall of `PrismaClient is not assignable to EnginePrismaClient` errors means a delegate is missing (after 1.0, almost always `workflowStep` or `workflowDefinition`). Upgrading an existing database? The [0.13 → 1.0 guide](../migrations/migrate-0.13-to-1.0.md) has the column-level checklist as idempotent SQL.
 
+Definition registration requires `$executeRaw` on injected clients. Keep `@@map("workflow_definitions")` and its shipped column names: the raw SQL does not support remapping that table or its columns.
+
 ```prisma
 // schema.prisma
 

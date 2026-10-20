@@ -105,6 +105,13 @@ This guide covers common issues encountered when running **workflow-engine**, ho
 
 ---
 
+### 10. `DefinitionRegistrationRetryableError` during registration
+* **Symptom**: Definition registration throws `DefinitionRegistrationRetryableError` with `code: "DEFINITION_REGISTRATION_RETRY"`.
+* **Cause**: A concurrent winner is outside a `REPEATABLE READ` / `SERIALIZABLE` snapshot, PostgreSQL reports `40001` / Prisma `P2034`, or the follow-up read finds no row.
+* **Fix**: Catch it outside the caller transaction, let it roll back, and retry the **whole caller transaction**. It may already be aborted; retrying only registration inside it is insufficient. See [Definition Versioning](../core-concepts/definition-versioning.md#concurrent-registration-and-transaction-retries).
+
+---
+
 ## Orchestration Tick Flow
 
 The host orchestration tick executes these operations sequentially. Each operation runs inside its own try/catch block, preventing a single failure (e.g. one bad database query) from starving unrelated operations:

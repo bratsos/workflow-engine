@@ -48,6 +48,29 @@ export type LogLevel = "DEBUG" | "INFO" | "WARN" | "ERROR";
 
 export type ArtifactType = "STAGE_OUTPUT" | "ARTIFACT" | "METADATA";
 
+/**
+ * The definition winner is outside this transaction's snapshot, or its
+ * registration was serialized away. Retry the entire caller transaction
+ * with a fresh snapshot, rather than retrying within the same transaction.
+ * A database serialization failure may already have aborted the caller's
+ * transaction. This error does not recover it; let it roll back before retrying.
+ */
+export class DefinitionRegistrationRetryableError extends Error {
+  readonly code = "DEFINITION_REGISTRATION_RETRY";
+  readonly retryable = true;
+
+  constructor(
+    public readonly workflowId: string,
+    public readonly version: string,
+    public readonly cause?: unknown,
+  ) {
+    super(
+      `Could not observe the registered definition for workflow "${workflowId}" version "${version}". Retry the caller transaction.`,
+    );
+    this.name = "DefinitionRegistrationRetryableError";
+  }
+}
+
 export class StaleVersionError extends Error {
   constructor(
     public readonly entity: string,

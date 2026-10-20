@@ -61,6 +61,14 @@ await kernel.dispatch({ type: "run.transition", workflowRunId: runId });
 
 **If you still see P2002 errors:** They should only come from other parts of the system (e.g., idempotency key conflicts, which are expected and handled). Check the error's `meta.target` field to see which constraint was violated.
 
+## DefinitionRegistrationRetryableError During Registration
+
+**Symptom:** Definition registration throws `DefinitionRegistrationRetryableError` with `code: "DEFINITION_REGISTRATION_RETRY"`.
+
+**Cause:** A concurrent winner is outside a `REPEATABLE READ` / `SERIALIZABLE` snapshot, PostgreSQL reports `40001` / Prisma `P2034`, or the follow-up read finds no row.
+
+**Fix:** Catch the error outside the caller transaction, let it roll back, and retry the **whole caller transaction**. It may already be aborted; retrying only `insertDefinitionIfAbsent` inside it is insufficient. See [13-definition-versioning.md](13-definition-versioning.md#concurrent-registration-and-transaction-retries).
+
 ## P2028 Transaction Timeout on Suspended Stage Polling
 
 **Symptom:** Logs show `P2028: Transaction API error: A query cannot be executed on an expired transaction` during `stage.pollSuspended`. Suspended stages never transition to `COMPLETED` even when the batch provider reports completion.

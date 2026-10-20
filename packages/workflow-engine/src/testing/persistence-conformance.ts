@@ -557,6 +557,10 @@ export function persistenceConformanceSuite(
         expect(first?.version).toBe(input.version);
         expect(first?.structureHash).toBe(input.structureHash);
 
+        expect(await persistence.insertDefinitionIfAbsent(input)).toEqual(
+          first,
+        );
+
         // Content-addressed: a second registration of the same version
         // returns what is stored rather than overwriting it, so a caller
         // can detect an explicit version reused for a different structure.
@@ -565,13 +569,13 @@ export function persistenceConformanceSuite(
           snapshot: { format: 1, workflowId: "defver-wf", stages: ["drift"] },
           structureHash: "sha256-different000000000000000000000",
         });
-        expect(second?.structureHash).toBe(input.structureHash);
+        expect(second).toEqual(first);
 
         const loaded = await persistence.getDefinition(
           input.workflowId,
           input.version,
         );
-        expect(loaded?.structureHash).toBe(input.structureHash);
+        expect(loaded).toEqual(first);
       });
 
       it("returns null for a definition that was never registered", async () => {

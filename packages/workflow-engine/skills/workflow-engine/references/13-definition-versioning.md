@@ -164,6 +164,12 @@ interface RunCreateResult {
 }
 ```
 
+### Concurrent registration and transaction retries
+
+The Prisma adapter uses `INSERT ... ON CONFLICT DO NOTHING`, then reads the stored row. Concurrent registrations at `READ COMMITTED` return the winner without a duplicate-key race aborting the caller's transaction, including overlapping calls in one transaction.
+
+At `REPEATABLE READ` or `SERIALIZABLE`, a concurrent winner may be outside the transaction's snapshot, or the insert may raise SQLSTATE `40001` / Prisma `P2034`. The adapter throws `DefinitionRegistrationRetryableError` (`code: "DEFINITION_REGISTRATION_RETRY"`, `retryable: true`) for those failures or when the follow-up read finds no row. Import it from `@bratsos/workflow-engine`. Catch it **outside the caller transaction**, let that transaction roll back, and retry the **whole caller transaction** with a fresh snapshot. The transaction may already be aborted; retrying only registration inside it cannot recover it.
+
 ### Conflict detection on explicit versions
 
 Because derived versions are hashes of the structural snapshot, two identical derived versions are guaranteed to have identical structures. However, when explicit versions are used, an operator or developer might accidentally modify the pipeline's structure without bumping the version string.
