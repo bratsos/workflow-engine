@@ -118,9 +118,14 @@ harness.mockAi.mockObjectResponseForSchema(FactsSchema, { facts: [] });
 // The next matching call throws exactly once; later calls succeed — how a
 // replay-safety test makes one map item fail one time.
 harness.mockAi.failOnce("item-2", new Error("subscription limit reached"));
+// `evaluate` answers by question id; unscripted questions get the first
+// `choice` option, level 0 of a `score`, and probability 0.5 for a `boolean`.
+harness.mockAi.setEvaluateAnswer("team", { type: "choice", choice: "billing" });
+// Every `transcribe` returns this; unscripted, the text is "mock transcript".
+harness.mockAi.setTranscribeResponse({ text: "the interview", durationInSeconds: 600 });
 ```
 
-`setTextResponse(pattern, response)` matches the prompt by substring or RegExp; `MockTextResponse.output` seeds structured output for `generateText` + `Output.object(...)` (when omitted, the scripted `text` is parsed through the output spec exactly as the AI SDK does). `failOnce` takes a substring, a RegExp, or a predicate over `{ modelKey, prompt, kind }`.
+`setTextResponse(pattern, response)` matches the prompt by substring or RegExp; `MockTextResponse.output` seeds structured output for `generateText` + `Output.object(...)` (when omitted, the scripted `text` is parsed through the output spec exactly as the AI SDK does). `failOnce` takes a substring, a RegExp, or a predicate over `{ modelKey, prompt, kind }`; `kind` includes `"evaluate"` and `"transcribe"`. Recorded `evaluate` and `transcribe` calls appear in `harness.mockAi.helper.getAllCallsRecursive()` with `type: "evaluate"` / `"transcribe"`, so a test can assert a memoised decision or transcript was requested once across a replay.
 
 Cost and token accounting is real: the harness's `InMemoryAICallLogger` records every mocked call, so a test can assert on spend:
 

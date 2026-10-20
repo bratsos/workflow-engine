@@ -14,7 +14,7 @@ the same thing:
   same input.
 - **rerun** — go back to a stage you choose and go forward from there.
 
-Conductor exposes these as three verbs. `run.redrive` is one command with
+`run.redrive` is one command with
 those three modes, plus the ability to move the run onto a different
 definition version.
 
@@ -29,6 +29,26 @@ await kernel.dispatch({
   idempotencyKey: "redrive-invoice-4711",     // optional
 });
 ```
+
+```mermaid
+flowchart LR
+    subgraph before ["A failed run"]
+        direction LR
+        A1["ingest ✓"] --> B1["summarise ✗"] --> C1["publish ·"]
+    end
+    subgraph retry ["from lastFailure (retry)"]
+        direction LR
+        A2["ingest ✓ kept"] --> B2["summarise ↻ reopened"] --> C2["publish ▶ new"]
+    end
+    subgraph restart ["from start (restart)"]
+        direction LR
+        A3["ingest ▶ new"] --> B3["summarise ▶ new"] --> C3["publish ▶ new"]
+    end
+    before --> retry
+    before --> restart
+```
+
+A retry or rerun reopens the stage it resumes from, keeping its completed durable steps, and replaces every stage after it. A restart replaces every stage. Either way the superseded attempts are archived as annotations.
 
 | `from` | Resumes at |
 | --- | --- |
@@ -50,7 +70,7 @@ The result reports what happened:
 }
 ```
 
-Like Step Functions' redrive, this is the **same run**: the same id, an
+A redrive keeps the **same run**: the same id, an
 incremented `redriveCount`, no branching into a second execution. For
 `lastFailure` and `stage`, the stage you resume from is **reopened in
 place** — back to `PENDING`, its attempt incremented, the old outcome
@@ -143,9 +163,8 @@ rotate and the annotation stays on the run.
 ## Redriving onto a different definition version
 
 With [definition versioning](./definition-versioning.md) in place, a redrive
-can also move the run onto a different version — DBOS's fork-onto-a-new-
-application-version, which is the answer to "we shipped a bug, patch it and
-re-run":
+can also move the run onto a different version, which is the answer to "we
+shipped a bug, patch it and re-run":
 
 ```ts
 await kernel.dispatch({

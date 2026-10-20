@@ -38,12 +38,7 @@ your client rather than a dashboard with its own connection string, and it is
 why the suspended-stage lease is a row rather than a Postgres advisory lock
 (see [Execution Model](../core-concepts/execution-model.md)).
 
-The comparable design in the field is DBOS's `enqueueInTransaction`, which
-joins a caller's transaction for the *enqueue* and requires that transaction
-to be on its own system database. Several Postgres queues — pg-boss (including
-`fromPrisma(tx)`), Graphile Worker, River, Oban — put the enqueue in your
-transaction too. What is different here is scope: it is the whole kernel tick,
-not the enqueue.
+The scope is the whole kernel tick, not only the enqueue.
 
 ### Provider batch APIs as durable steps
 
@@ -55,10 +50,8 @@ run resumes where it left off. A crash between submit and collect resumes from
 the ledger rather than resubmitting, because the submit carries a derived
 `externalKey` a reclaim can search for and adopt.
 
-The Vercel AI SDK shipped a batch transport in August 2026 for OpenAI,
-Anthropic and Google; `@openrouter/ai-sdk-provider` does not implement it.
-What is not available elsewhere is the batch call being a step in a durable
-workflow, with its handle, its request ids and its cost recorded.
+The batch call is a step in a durable workflow, with its handle, its request
+ids and its cost recorded.
 
 ### Cost as a value your workflow code can read
 
@@ -67,12 +60,10 @@ and `totalTokens` in the same transaction as the stage that made it. Because
 it is a column and not a trace, the next stage can read it: you can gate a step
 on spend, route to a cheaper model, or bill a tenant from inside the workflow.
 
-Observability platforms compute cost after the fact and better than we do.
-LangSmith's price table is user-editable with per-token-type breakdowns, model
-activation dates and regex model matching; Langfuse's has dated price
-versioning, pricing tiers and dozens of distinct usage keys. Ours has neither
-activation dates nor regex matching, and covers fewer token subtypes. It is
-ahead on two things: **batch**, and **placement**.
+The price table has no activation dates or regex model matching, and covers
+a limited set of token subtypes. What it gets right is **batch** pricing and
+**placement**: cost is recorded next to the run, where workflow code can read
+it.
 
 ### Batch-aware cost accounting
 
@@ -93,14 +84,9 @@ engine converts your Zod schema to each provider's dialect at the model
 boundary and raises `UnportableSchemaError`, naming the JSON path and the
 keyword, *before* the request, for a schema feature no rewrite can express.
 
-Schema portability itself is not ours alone: `@mastra/schema-compat` is a
-standalone Apache-2.0 package that forces properties required, widens optionals
-to nullable, sets `additionalProperties: false` and strips `propertyNames`
-across six provider dialects; `@ai-sdk/anthropic` and `@ai-sdk/google` ship
-their own per-provider shims; LangChain sanitises `additionalProperties`. Two
-narrower things are unusual here: rewriting a `z.record()` into an array of
-`{ key, value }` pairs **and transforming the answer back** into your object
-before validation, and applying the same rewrite at the *batch* submission
+Two details of that rewrite: a `z.record()` becomes an array of
+`{ key, value }` pairs **and the answer is transformed back** into your object
+before validation, and the same rewrite applies at the *batch* submission
 boundary, not only the realtime one.
 
 ---
@@ -109,8 +95,7 @@ boundary, not only the realtime one.
 
 - **Keyed step identity.** A durable step is keyed by `(stageRecordId, stepId)`
   rather than by ordinal position, so reordering, branching and refactoring the
-  code around a step are free. Effect's `@effect/workflow` keys memoised
-  activities by name too. The cost of keyed identity is that we get no drift
+  code around a step are free. The cost of keyed identity is that we get no drift
   detection for free the way an ordinal ledger does, which is why
   `DuplicateStepKeyError` exists.
 - **Restart from a step.** `run.redrive` gives you retry, restart and rerun.
@@ -118,19 +103,13 @@ boundary, not only the realtime one.
   completed step rows and their external keys, so a stage that finished 9 of
   10 steps re-runs only the tenth; only a restart replaces everything (see
   [Retry, Restart and Rerun](../core-concepts/redriving-runs.md)).
-  Inngest, Cloudflare Workflows, Hatchet, DBOS, Restate, Conductor, Temporal,
-  Step Functions and Mastra all ship a form of this. The factoring here is
-  borrowed: the three verbs are Conductor's, the same-run-id, append-not-branch
-  audit shape with a `redriveCount` is Step Functions' redrive, and
-  re-pinning onto another definition version is DBOS's fork-onto-a-new-version.
+  A redrive keeps the same run id and appends to its history with a
+  `redriveCount`, and can re-pin the run onto another definition version.
 - **Transactional outbox.** The outbox is how system events reach your
   `EventSink` at least once without phantom events. It is not how the engine
-  wakes its own consumer, and it is not a differentiator: pg-boss, Graphile
-  Worker, River and Oban all get an enqueue into your transaction, three of
-  them by fusing a `pg_notify` into the insert.
-- **No payload ceiling.** Nothing rejects a large value. That is shared with
-  DBOS and Effect, both bounded only by Postgres. What used to be missing was
-  the escape hatch; since 1.0 a step result over 64 KiB spills to the blob
+  wakes its own consumer.
+- **No payload ceiling.** Nothing rejects a large value; it is bounded only by
+  Postgres. Since 1.0 a step result over 64 KiB spills to the blob
   store behind a claim check
   (see [Kernel and Ports](../core-concepts/kernel-and-ports.md)).
 
@@ -139,17 +118,16 @@ boundary, not only the realtime one.
 - **No arbitrary DAG.** Pipelines are linear with concurrent execution groups.
   There is no fan-out/fan-in graph and no child workflows.
 - **No exactly-once execution.** The step ledger gives exactly-once
-  *recording* and at-least-once *execution* of a step body — the same boundary
-  Inngest, Cloudflare Workflows, Hatchet, Restate and DBOS all document. A step
+  *recording* and at-least-once *execution* of a step body. A step
   body runs outside a transaction, so its result and its own writes do not
   commit together. What the engine gives you instead is a derived
   `step.externalKey`, written before the body runs, to make the repeat
   recoverable, and `onReclaim: "fail"` for a body where it cannot be.
 - **No per-tenant concurrency, throttle, rate limit, debounce or priority
   key.** The Postgres queue has priority and an opt-in per-group concurrency
-  cap; it has nothing like Inngest's or Hatchet's CEL-keyed flow control.
+  cap, and no keyed flow control.
 - **No replay-against-recorded-history test harness.** Per-step stubbing does
-  exist, in the shape of Cloudflare's: `harness.steps.mockResult(id, value)`,
+  exist: `harness.steps.mockResult(id, value)`,
   `.mockError(id, error)` and `.mockTimeout(id)`, plus `.skipSleeps()`. The
   clock is an injected port, so `FakeClock.advance(ms)` skips a sleep or a
   poll interval, and `createTestHarness` runs a whole workflow in memory.
