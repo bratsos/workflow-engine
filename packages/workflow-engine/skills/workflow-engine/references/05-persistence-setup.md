@@ -874,6 +874,8 @@ const persistence = createPrismaWorkflowPersistence(prisma, {
 });
 ```
 
+Definition registration requires `$executeRaw` on injected clients. Keep `@@map("workflow_definitions")` and its shipped column names: the raw SQL does not support remapping that table or its columns.
+
 `definitionVersioning` is the escape hatch that skips both checks: `false` for a client whose schema carries the models against a database deliberately left unmigrated, `true` for a model surface the structural detection cannot see (a hand-written wrapper, a proxy). Left unset, the client is checked synchronously for a `workflowDefinition` delegate and the database is confirmed once, lazily, through a catalogue read (`to_regclass` / `pg_attribute` on Postgres, `sqlite_master` / `pragma_table_info` on SQLite) that answers "absent" instead of raising, so it cannot abort a transaction the kernel is running inside.
 
 ## Database Type Options
