@@ -707,20 +707,6 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       );
     }
     const snapshot = JSON.stringify(input.snapshot);
-    // Prisma transaction clients omit $transaction. Protect all SQL in this
-    // operation so a caller can catch an error and keep using its transaction,
-    // including when ON CONFLICT raises 40001 at REPEATABLE READ/SERIALIZABLE.
-    const savepoint =
-      this.databaseType === "postgresql" &&
-      typeof this.prisma.$transaction !== "function"
-        ? `definition_registration_${crypto.randomUUID().replaceAll("-", "")}`
-        : null;
-    const control = async (statement: string) => {
-      // Only adapter-generated savepoint identifiers enter this statement.
-      const strings = Object.assign([statement], { raw: [statement] });
-      await this.prisma.$executeRaw!(strings);
-    };
-    if (savepoint) await control(`SAVEPOINT ${savepoint}`);
     try {
       // A caught unique violation aborts a PostgreSQL transaction. Insert
       // atomically, then read separately so READ COMMITTED sees the winner.
@@ -753,14 +739,8 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
           input.version,
         );
       }
-      const definition = this.mapDefinition(row);
-      if (savepoint) await control(`RELEASE SAVEPOINT ${savepoint}`);
-      return definition;
+      return this.mapDefinition(row);
     } catch (error) {
-      if (savepoint) {
-        await control(`ROLLBACK TO SAVEPOINT ${savepoint}`);
-        await control(`RELEASE SAVEPOINT ${savepoint}`);
-      }
       const failure = error as {
         code?: string;
         meta?: { code?: string };
