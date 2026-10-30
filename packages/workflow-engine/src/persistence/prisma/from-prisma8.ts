@@ -183,6 +183,8 @@ const REQUIRED_TABLES = [
   "workflow_steps",
 ];
 const OPTIONAL_TABLES = ["workflow_definitions", "workflow_blobs"];
+/** The most bind parameters Postgres takes in one statement. */
+const MAX_PARAMS = 65_535;
 
 const fail = (message: string): never => {
   throw new Error(`fromPrisma8: ${message}`);
@@ -243,6 +245,16 @@ class Sql {
     if (bound == null) return this.t(`NULL${suffix}`);
     this.values.push(bound);
     this.parts.push(suffix);
+    return this;
+  }
+
+  /** `other`'s text and parameters, after this one's. */
+  add(other: Sql): this {
+    this.t(other.parts[0]!);
+    for (let i = 0; i < other.values.length; i++) {
+      this.values.push(other.values[i]);
+      this.parts.push(other.parts[i + 1]!);
+    }
     return this;
   }
 }
@@ -661,7 +673,12 @@ async function attach(
   if (!on.select[target]) for (const child of children) delete child[target];
 }
 
-function insert(m: Model, data: Row[]): Sql {
+/**
+ * `INSERT` statements for `data`, each within Postgres's limit of 65,535 bind
+ * parameters (and of the arguments one call can spread): one statement unless
+ * the rows need more. Every row is checked before any statement runs.
+ */
+function insert(m: Model, data: Row[]): Sql[] {
   const rows = data.map((d) => {
     if (!isObject(d)) fail(`${m.name}: a row to create must be an object`);
     const row = { ...d };
@@ -676,19 +693,26 @@ function insert(m: Model, data: Row[]): Sql {
     ),
   ];
   for (const n of names) column(m, n);
-  const q = new Sql().t(
-    `INSERT INTO ${quote(m.table)} AS t0 (${names.map(quote).join(", ")}) VALUES `,
-  );
-  rows.forEach((row, i) => {
-    q.t(i ? ", (" : "(");
+  const head = `INSERT INTO ${quote(m.table)} AS t0 (${names.map(quote).join(", ")}) VALUES `;
+  const statements: Sql[] = [];
+  let q = new Sql();
+  for (const row of rows) {
+    const one = new Sql().t("(");
     names.forEach((n, j) => {
-      if (j) q.t(", ");
-      if (row[n] === undefined) q.t("DEFAULT");
-      else bind(q, m.cols[n]!, row[n]);
+      if (j) one.t(", ");
+      if (row[n] === undefined) one.t("DEFAULT");
+      else bind(one, m.cols[n]!, row[n]);
     });
-    q.t(")");
-  });
-  return q;
+    one.t(")");
+    if (
+      statements.length === 0 ||
+      q.values.length + one.values.length > MAX_PARAMS
+    ) {
+      statements.push((q = new Sql().t(head)));
+    } else q.t(", ");
+    q.add(one);
+  }
+  return statements;
 }
 
 /** The columns `data` changes: undefined leaves a column alone. */
@@ -927,16 +951,28 @@ function delegate(x: Executor, m: Model) {
         null,
     ),
     create: op("create", ["data"], async (e, a) => {
-      const q = insert(m, [a.data]);
+      const [q] = insert(m, [a.data]) as [Sql];
       const [row] = await rowsOf(e, q, returning(q, m));
       return row;
     }),
     createMany: op("createMany", ["data", "skipDuplicates"], async (e, a) => {
       if (!Array.isArray(a.data)) fail("createMany takes an array of rows");
       if (a.data.length === 0) return { count: 0 };
-      const q = insert(m, a.data);
-      if (a.skipDuplicates) q.t(" ON CONFLICT DO NOTHING");
-      return { count: await affected(e, q) };
+      const statements = insert(m, a.data);
+      if (a.skipDuplicates) {
+        for (const q of statements) q.t(" ON CONFLICT DO NOTHING");
+      }
+      const run = async (x: Executor) => {
+        let count = 0;
+        for (const q of statements) count += await affected(x, q);
+        return { count };
+      };
+      // Atomic, as one statement is on 6 and 7: on a root client the chunks
+      // share a transaction, inside a `tx` they use it.
+      return statements.length > 1 &&
+        typeof (e as Partial<Prisma8Db>).transaction === "function"
+        ? (e as Prisma8Db).transaction(run)
+        : run(e);
     }),
     update: op("update", ["where", "data", "select"], async (e, a) => {
       const run = updateOne(uniqueWhere(m, a.where).where, a.data, a.select);
@@ -964,7 +1000,7 @@ function delegate(x: Executor, m: Model) {
           fail(`${m.name}: upsert takes one unique key and no other filter`);
         }
         const names = Object.keys(key);
-        const insertion = insert(m, [a.create]);
+        const [insertion] = insert(m, [a.create]) as [Sql];
         if (
           changes(a.update).length > 0 &&
           names.every((n) => a.create[n] === key[n])

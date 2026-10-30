@@ -885,6 +885,9 @@ if (!DATABASE_URL) {
         );
       const sorted = (rows: any[], by: string) =>
         [...rows].sort((a, b) => String(a[by]).localeCompare(String(b[by])));
+      // A blob row binds 4 parameters on 8, so 16,383 rows fill one statement.
+      const blobRows = (n: number) =>
+        Array.from({ length: n }, (_, i) => ({ key: `bulk-${i}`, data: i }));
 
       // On 8 the rejection has to come from the bridge: that is what proves
       // no SQL ran.
@@ -3068,6 +3071,53 @@ if (!DATABASE_URL) {
               }),
             { count: 2 },
           ],
+          [
+            "createMany filling the bind limit",
+            async () => [
+              await prisma.workflowBlob.createMany({ data: blobRows(16_383) }),
+              await prisma.workflowBlob.count(),
+            ],
+            [{ count: 16_383 }, 16_385],
+          ],
+          [
+            "createMany one row over the bind limit",
+            async () => [
+              await prisma.workflowBlob.createMany({ data: blobRows(16_384) }),
+              await prisma.workflowBlob.count(),
+            ],
+            [{ count: 16_384 }, 16_386],
+          ],
+          [
+            "createMany of 40,000 rows",
+            async () => [
+              await prisma.workflowBlob.createMany({ data: blobRows(40_000) }),
+              await prisma.workflowBlob.count(),
+            ],
+            [{ count: 40_000 }, 40_002],
+          ],
+          [
+            "createMany skipping duplicates across the bind limit",
+            async () => [
+              await prisma.workflowBlob.createMany({
+                data: [
+                  { key: "x", data: 9 },
+                  ...blobRows(20_000),
+                  { key: "bulk-0", data: -1 },
+                  { key: "y", data: 9 },
+                ],
+                skipDuplicates: true,
+              }),
+              await blobs().then((all) => all.length),
+              (await prisma.workflowBlob.findUnique({ where: { key: "x" } }))
+                .data,
+              (
+                await prisma.workflowBlob.findUnique({
+                  where: { key: "bulk-0" },
+                })
+              ).data,
+            ],
+            [{ count: 20_000 }, 20_002, 1, 0],
+          ],
         ];
         it.each(WRITES)("writes %s", async (_name, write, expected) => {
           expect(await write()).toEqual(expected);
@@ -3171,6 +3221,13 @@ if (!DATABASE_URL) {
                 where: { key: "x" },
                 create: { key: "x", data: 3 },
                 update: { key: "y" },
+              }),
+          ],
+          [
+            "createMany across the bind limit ending in a taken key",
+            () =>
+              prisma.workflowBlob.createMany({
+                data: [...blobRows(20_000), { key: "x", data: 3 }],
               }),
           ],
         ];
@@ -3825,6 +3882,22 @@ if (!DATABASE_URL) {
           expect(await value()).toBe(6);
         });
 
+        it("runs a createMany across the bind limit inside the caller's transaction", async () => {
+          await expect(
+            prisma.$transaction(async (tx: any) => {
+              await tx.workflowBlob.createMany({ data: blobRows(20_000) });
+              throw new Error("mine");
+            }),
+          ).rejects.toThrow("mine");
+          expect(await prisma.workflowBlob.count()).toBe(2);
+          expect(
+            await prisma.$transaction([
+              prisma.workflowBlob.createMany({ data: blobRows(20_000) }),
+              prisma.workflowBlob.count(),
+            ]),
+          ).toEqual([{ count: 20_000 }, 20_002]);
+        });
+
         it("keeps the array form free of the default timeout", async () => {
           expect(await prisma.$transaction([])).toEqual([]);
           const [, count] = await prisma.$transaction([
@@ -3931,6 +4004,26 @@ if (!DATABASE_URL) {
           const stats = await logger.getStats("cost_");
           expect(stats.totalCalls).toBe(2);
           expect(stats.totalCost).toBe(0.375);
+        });
+
+        it("the AI call logger records a batch above the bind limit", async () => {
+          await prisma.$executeRawUnsafe(`TRUNCATE "ai_calls"`);
+          await createPrismaAICallLogger(prisma).logBatchResults(
+            "big",
+            Array.from({ length: 4_700 }, (_, i) => ({
+              callType: "c",
+              modelKey: "m",
+              modelId: "m",
+              prompt: "p",
+              response: "r",
+              topic: "t",
+              inputTokens: 1,
+              outputTokens: 1,
+              cost: 0,
+              requestId: `r${i}`,
+            })),
+          );
+          expect(await prisma.aICall.count()).toBe(4_700);
         });
 
         it("the blob store lists a prefix as a LIKE pattern", async () => {
