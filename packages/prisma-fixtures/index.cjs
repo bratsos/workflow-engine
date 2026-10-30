@@ -2,6 +2,7 @@
 // and `createSqliteClient(file)` for the Prisma major in PRISMA_MAJOR (default 7).
 // Each major is the workspace package ./v<major>; add a new major as a new
 // directory next to v6 and v7 and it is picked up here and by pnpm-workspace.yaml.
+// v8 exports `createPostgresDb(url)`, the raw Prisma 8 client, in their place.
 const { existsSync } = require("node:fs");
 const { join } = require("node:path");
 
