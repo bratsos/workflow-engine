@@ -836,8 +836,9 @@ import {
   createPrismaStepLedger,
 } from "@bratsos/workflow-engine";   // also re-exported from "@bratsos/workflow-engine/persistence/prisma"
 import { PrismaClient } from "@prisma/client";
+import { PrismaPg } from "@prisma/adapter-pg";
 
-const prisma = new PrismaClient();
+const prisma = new PrismaClient({ adapter: new PrismaPg({ connectionString: process.env.DATABASE_URL }) });
 
 // PostgreSQL (default)
 const persistence = createPrismaWorkflowPersistence(prisma);
@@ -936,19 +937,18 @@ Omitting the method is fine; the host then leaves the transport alone.
 
 ## Prisma Version Compatibility
 
-The library supports both Prisma 6.x and 7.x:
+The library supports both Prisma 6.x and 7.x. Status values are plain strings on both, and `createEnumHelper` returns strings:
 
-**Prisma 6.x**: Status values are strings
 ```typescript
 status: "PENDING"
 ```
 
-**Prisma 7.x**: Status values are typed enums
-```typescript
-status: prisma.$Enums.Status.PENDING
-```
+The versions differ in setup: Prisma 7 sets the URL in `prisma.config.ts` and needs a driver adapter when you construct the client, while Prisma 6 keeps `url = env("DATABASE_URL")` in the `datasource` block.
 
-The library automatically detects your Prisma version and handles this difference internally via the enum compatibility layer.
+```ts
+import { defineConfig, env } from "prisma/config";
+export default defineConfig({ schema: "prisma/schema.prisma", datasource: { url: env("DATABASE_URL") } });
+```
 
 ## Status Type
 

@@ -374,7 +374,16 @@ model WorkflowBlob {
 
 ## Applying the Schema
 
-After copying the models, run the Prisma migration command to apply the changes to your database:
+After copying the models, set the database URL and run the Prisma migration command to apply the changes to your database.
+
+Prisma 7 sets the URL in `prisma.config.ts`, not in the schema. Its `datasource` block has only `provider`:
+
+```ts
+import { defineConfig, env } from "prisma/config";
+export default defineConfig({ schema: "prisma/schema.prisma", datasource: { url: env("DATABASE_URL") } });
+```
+
+On Prisma 6, keep `url = env("DATABASE_URL")` in the `datasource` block and skip the config file.
 
 ```bash
 # Generate the migration and apply to database
@@ -497,8 +506,9 @@ import {
   createPrismaBlobStore,
 } from "@bratsos/workflow-engine/persistence/prisma";
 import { PrismaClient } from "@prisma/client"; // or your Prisma 7 generator's output path
+import { PrismaPg } from "@prisma/adapter-pg";
 
-const prisma = new PrismaClient();
+const prisma = new PrismaClient({ adapter: new PrismaPg({ connectionString: process.env.DATABASE_URL }) });
 
 const persistence = createPrismaWorkflowPersistence(prisma);
 const jobQueue = createPrismaJobQueue(prisma);   // adopts the host's workerId on start()

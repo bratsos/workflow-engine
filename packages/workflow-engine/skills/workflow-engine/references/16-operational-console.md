@@ -379,10 +379,11 @@ The CLI starts a local Node.js HTTP server hosting the console handler. It is st
 ```javascript
 // console.config.mjs
 import { PrismaClient } from "@prisma/client";
+import { PrismaPg } from "@prisma/adapter-pg";
 import { createPrismaConsoleReadPort } from "@bratsos/workflow-engine-console";
 import { createKernel } from "@bratsos/workflow-engine/kernel";
 
-const prisma = new PrismaClient();
+const prisma = new PrismaClient({ adapter: new PrismaPg({ connectionString: process.env.DATABASE_URL }) });
 const kernel = createKernel({ /* ... */ });
 
 export default {
