@@ -427,7 +427,7 @@ interface PersistenceCore {
 
 ### Feature detection in Prisma
 
-The built-in Prisma adapter detects definition versioning capability in two stages. First, **structurally** and synchronously, by inspecting whether `prisma.workflowDefinition` exists on the generated client object:
+The built-in Prisma adapter detects definition versioning capability in two stages. First, **structurally** and synchronously, by inspecting whether `prisma.workflowDefinition` exists on the generated client object (on Prisma 8, on the `fromPrisma8(db)` client, which has the delegate when the contract has the `WorkflowDefinition` model):
 
 ```typescript
 function detectDefinitionVersioning(prisma: PrismaClient): boolean {

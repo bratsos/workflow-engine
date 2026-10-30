@@ -8,7 +8,7 @@ The console runs embedded inside the host application rather than as a standalon
 
 A separate dashboard process connecting through its own connection pool establishes a separate database session. In that topology, row-level security cannot be scoped to the caller's session: the dashboard must either connect with a privileged role that bypasses RLS entirely—exposing all tenants' workflow executions to any console operator—or it sees no records at all.
 
-To maintain tenant boundaries, the console never opens its own database connection. You construct its read port (`ConsoleReadPort`) directly from the Prisma client or transaction client your application already holds. Authentication is handled upstream by your application framework; the console's `authorize` callback answers only whether the authenticated principal has permission to perform a specific action within that session.
+To maintain tenant boundaries, the console never opens its own database connection. You construct its read port (`ConsoleReadPort`) directly from the Prisma client or transaction client your application already holds, on Prisma 6, 7 or 8. A Prisma 8 client has no model delegates, so wrap it first: `createPrismaConsoleReadPort(fromPrisma8(db))`, with `fromPrisma8` from `@bratsos/workflow-engine/persistence/prisma`, and inside a transaction `fromPrisma8(tx, { contract: db.contract })`. Every snippet below that builds a reader from `prisma` or `tx` is the Prisma 6 or 7 form. Authentication is handled upstream by your application framework; the console's `authorize` callback answers only whether the authenticated principal has permission to perform a specific action within that session.
 
 The order in the host's own request pipeline is therefore: authenticate the
 request, open the tenant transaction (or set the session variables) you
@@ -144,6 +144,8 @@ export async function GET(request: Request): Promise<Response> {
 
 export const POST = GET;
 ```
+
+On Prisma 8 the same shape is `db.transaction(async (tx) => { const reader = createPrismaConsoleReadPort(fromPrisma8(tx, { contract: db.contract })); ... })`.
 
 ## Authorisation
 
@@ -320,6 +322,8 @@ To support console queries efficiently, ensure the following composite indexes f
 - `job_queue(status, createdAt)`
 - `outbox_events(dlqAt)`
 
+On Prisma 8 the three `DESC` indexes come from the engine's `mixed-order-indexes.sql`, not from the contract (see 05-persistence-setup.md).
+
 ## Testing
 
 For unit and integration tests, import `createInMemoryConsoleReadPort` from the `@bratsos/workflow-engine-console/testing` subpath export:
@@ -395,9 +399,32 @@ export default {
 };
 ```
 
+On Prisma 8 (no `@prisma/client`) the config module builds the reader with `fromPrisma8`:
+
+```javascript
+// console.config.mjs
+import postgres from "@prisma/orm-postgres/runtime";
+import { contractFromJson } from "@prisma/orm-postgres/static";
+import { createPrismaConsoleReadPort } from "@bratsos/workflow-engine-console";
+import { fromPrisma8 } from "@bratsos/workflow-engine/persistence/prisma";
+import contractJson from "./prisma/contract.json" with { type: "json" };
+
+const db = postgres({
+  contract: contractFromJson(contractJson),
+  url: process.env.DATABASE_URL,
+});
+
+export default {
+  reader: createPrismaConsoleReadPort(fromPrisma8(db)),
+  dispose: () => db.close(),
+};
+```
+
+A reader wrapped around `fromPrisma8(db)` by the consumer must forward `$withColumns`: Prisma 8 drops raw-read columns that are not declared, and the reader declares them through that member.
+
 ### Direct connection flag
 
-The CLI supports direct database connection strings via `--database-url`, but requires the `--allow-direct-connection` acknowledgement flag:
+The CLI supports direct database connection strings via `--database-url`, but requires the `--allow-direct-connection` acknowledgement flag. It needs `@prisma/client` (and `@prisma/adapter-pg` on Prisma 7), so it works on **Prisma 6 and 7 only**; on Prisma 8 use `--config` above:
 
 ```bash
 npx workflow-console --database-url postgres://localhost:5432/db --allow-direct-connection
@@ -410,7 +437,7 @@ npx workflow-console --database-url postgres://localhost:5432/db --allow-direct-
 | Flag | Argument | Default | Description |
 |---|---|---|---|
 | `--config` | `<path>` | — | Path to module exporting `{ reader, kernel?, dispose? }` |
-| `--database-url` | `<url>` | — | PostgreSQL connection URL; requires `--allow-direct-connection` |
+| `--database-url` | `<url>` | — | PostgreSQL connection URL; requires `--allow-direct-connection`; Prisma 6 and 7 only |
 | `--allow-direct-connection` | — | `false` | Acknowledge that direct connections bypass session-scoped RLS policies |
 | `--port` | `<n>` | `7799` | Port to bind (1–65535) |
 | `--host` | `<addr>` | `127.0.0.1` | Loopback address (`127.0.0.1`, `localhost`, `::1`, `[::1]`) |

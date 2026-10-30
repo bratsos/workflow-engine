@@ -1,6 +1,22 @@
 # Persistence Setup
 
-Complete guide for setting up workflow persistence with Prisma.
+Complete guide for setting up workflow persistence with Prisma 6, 7 or 8.
+
+## Pick the path per Prisma major first
+
+Read the project's `package.json` (and `prisma.config.ts`) before writing any setup code. The engine's Prisma adapters are one codebase, but the way you create the tables and construct the client differs per major:
+
+| The project has | Major | Schema | Client you pass to the `createPrisma*` factories |
+|---|---|---|---|
+| `@prisma/client` 7 + `@prisma/adapter-pg` (the default for new projects) | 7 | `prisma/schema.prisma` from the package, URL in `prisma.config.ts` | `new PrismaClient({ adapter: new PrismaPg({ connectionString }) })` |
+| `@prisma/client` 6 | 6 | `prisma/schema.prisma`, `url = env("DATABASE_URL")` in the datasource | `new PrismaClient()` |
+| `@prisma/orm-postgres` and `prisma` 8, a `contract.prisma`, no `@prisma/client` | 8 | `prisma/contract.prisma` from the package | `fromPrisma8(db)` ([Prisma 8](#prisma-8)) |
+
+- If the project has none yet: use **Prisma 7**. Prisma 6 receives only security patches until 2026-11-19 (https://www.prisma.io/docs/orm/release-status).
+- **Prisma 8 is a release candidate**, tested against exactly `prisma@8.0.0-rc.29` with `@prisma/orm-postgres@8.0.0-rc.21`. Pin both (`--save-exact`); the `latest` pair crashed `prisma contract emit`. It needs Node 22.18+/24.11+/26+, TypeScript 5.9+ and PostgreSQL 15+, and is **PostgreSQL only**.
+- **SQLite works on Prisma 6 and 7 only.** `databaseType: "sqlite"` over a `fromPrisma8` client throws.
+- `npx prisma` without a local `prisma` dependency runs Prisma 8. In a 6 or 7 project, make sure `prisma` is a local dependency before running any `npx prisma` command.
+- Prisma 8 has no `generate`, `migrate dev` or `db push`; do not suggest them there.
 
 ## ⚠️ Pre-Setup Checklist
 
@@ -19,7 +35,7 @@ Before creating persistence instances, verify your Prisma schema:
 - [ ] `IdempotencyKey` model exists (required for command idempotency keys)
 - [ ] `Status` enum exists with all values: PENDING, RUNNING, SUSPENDED, COMPLETED, FAILED, CANCELLED, SKIPPED
 - [ ] Table names use `@@map` (e.g., `@@map("workflow_runs")`)
-- [ ] Run `prisma db push` or `prisma migrate dev` after schema changes
+- [ ] Run `prisma db push` or `prisma migrate dev` after schema changes (Prisma 8: `prisma contract emit`, then `prisma db init` / `db update`; see [Prisma 8](#prisma-8))
 
 **Common Errors:**
 | Error | Cause | Fix |
@@ -413,6 +429,8 @@ enum Status {
 }
 ```
 
+On Prisma 8 the same enum is `native_enum Status { ... }` with `pg.enum(Status)` fields in `contract.prisma`: it must stay a native Postgres enum named `Status`, because the raw SQL casts to `::"Status"`.
+
 `LogLevel` and `ArtifactType` are **not** enums -- `WorkflowLog.level` and `WorkflowArtifact.type` are plain `String` columns (the engine validates the values at the TypeScript layer).
 
 ### Timestamps
@@ -426,6 +444,7 @@ the same columns, which is what makes lease expiry and the stale-job sweep
 work on a session in *any* timezone without the consumer setting anything. A
 `@db.Timestamptz` mapping puts the two writers back out of step and crash
 recovery stops happening -- see [Troubleshooting](09-troubleshooting.md#crash-recovery-never-happens-non-utc-postgres-session).
+On Prisma 8 the column type is `TimestampString(3)` (naive `timestamp(3)`, read and written as ISO text); `fromPrisma8` throws at construction for any other timestamp type.
 
 ### WorkflowRun Model
 
@@ -838,6 +857,7 @@ import {
 import { PrismaClient } from "@prisma/client";
 import { PrismaPg } from "@prisma/adapter-pg";
 
+// Prisma 7. Prisma 6: `new PrismaClient()`. Prisma 8: `const prisma = fromPrisma8(db)` (see "Prisma 8").
 const prisma = new PrismaClient({ adapter: new PrismaPg({ connectionString: process.env.DATABASE_URL }) });
 
 // PostgreSQL (default)
@@ -863,7 +883,7 @@ const jobQueue = createPrismaJobQueue(prisma, {
 });
 ```
 
-`PrismaWorkflowPersistence`, `PrismaJobQueue`, `PrismaAICallLogger`, `PrismaStepLedger` and `createEnumHelper` do not accept `prisma: any`. They require a structural `EnginePrismaClient` shape (an internal type, not exported from any public entry point -- you never import or write it by name). Any real Prisma-generated client (6.x or 7.x) satisfies it automatically, since it only requires the delegates the adapters actually call plus optional `$transaction`/`$queryRaw`/`$queryRawUnsafe`/`$executeRaw`/`$Enums`. The required delegates are exactly: `workflowRun`, `workflowStage`, `workflowStep`, `workflowLog`, `workflowArtifact`, `workflowAnnotation`, `outboxEvent`, `idempotencyKey`, `jobQueue`, `aICall`; `workflowDefinition` is optional (its absence turns definition versioning off rather than failing to start), and `createPrismaBlobStore` needs only `workflowBlob`. **A wall of `PrismaClient is not assignable to EnginePrismaClient` errors means one of those models is missing from your schema** (after an upgrade to 1.0 it is almost always `WorkflowStep`): add the model, run `prisma generate`, and the error goes away. The only other visible effect is on hand-written mocks/fakes: a `PrismaClient`-shaped test double missing a delegate the adapter actually calls fails to typecheck, where it previously compiled silently under `any`. No runtime behavior change.
+`PrismaWorkflowPersistence`, `PrismaJobQueue`, `PrismaAICallLogger`, `PrismaStepLedger` and `createEnumHelper` do not accept `prisma: any`. They require a structural `EnginePrismaClient` shape (an internal type, not exported from any public entry point -- you never import or write it by name). Any real Prisma-generated client (6.x or 7.x) satisfies it automatically; a Prisma 8 client has no delegates, so `fromPrisma8(db)` returns one that does (its type extends this shape, with the raw members required). The shape only requires the delegates the adapters actually call plus optional `$transaction`/`$queryRaw`/`$queryRawUnsafe`/`$executeRaw`/`$Enums`. The required delegates are exactly: `workflowRun`, `workflowStage`, `workflowStep`, `workflowLog`, `workflowArtifact`, `workflowAnnotation`, `outboxEvent`, `idempotencyKey`, `jobQueue`, `aICall`; `workflowDefinition` is optional (its absence turns definition versioning off rather than failing to start), and `createPrismaBlobStore` needs only `workflowBlob`. **A wall of `PrismaClient is not assignable to EnginePrismaClient` errors means one of those models is missing from your schema** (after an upgrade to 1.0 it is almost always `WorkflowStep`): add the model, run `prisma generate`, and the error goes away. The only other visible effect is on hand-written mocks/fakes: a `PrismaClient`-shaped test double missing a delegate the adapter actually calls fails to typecheck, where it previously compiled silently under `any`. No runtime behavior change.
 
 If your schema names the status enum differently (for example `WorkflowStatus`, with or without `@@map`), pass it: the Postgres claim path casts with `::"<name>"` (since 0.11) and fails with `42704 type "Status" does not exist` otherwise. The persistence also accepts a `now` clock; the raw claim statement binds that JS `Date` (converted with `AT TIME ZONE 'UTC'`) instead of `NOW()`. The job queue accepts `now` too, but on PostgreSQL the lease stamps (`lockedAt`, `startedAt`) come from the database clock and `staleLeaseThresholdMs` is measured there; `now` only feeds the SQLite dequeue and the timestamps written outside the raw statement.
 
@@ -937,18 +957,118 @@ Omitting the method is fine; the host then leaves the transport alone.
 
 ## Prisma Version Compatibility
 
-The library supports both Prisma 6.x and 7.x. Status values are plain strings on both, and `createEnumHelper` returns strings:
+The library supports Prisma 6, 7 and 8 from one codebase. Status values are plain strings on all three, and `createEnumHelper` returns strings (`prisma.$Enums` does not exist on a Prisma 7 or 8 client, so there are no typed enums to rely on):
 
 ```typescript
 status: "PENDING"
 ```
 
-The versions differ in setup: Prisma 7 sets the URL in `prisma.config.ts` and needs a driver adapter when you construct the client, while Prisma 6 keeps `url = env("DATABASE_URL")` in the `datasource` block.
+The versions differ in setup. Prisma 7 sets the URL in `prisma.config.ts` and needs a driver adapter when you construct the client, while Prisma 6 needs `url = env("DATABASE_URL")` added to the `datasource` block (the shipped schema has none, because Prisma 7 rejects it). No single `datasource` block validates on both, but the models are portable.
 
 ```ts
 import { defineConfig, env } from "prisma/config";
 export default defineConfig({ schema: "prisma/schema.prisma", datasource: { url: env("DATABASE_URL") } });
 ```
+
+Prisma 8 uses a contract and its own client; see the next section.
+
+## Prisma 8
+
+Release candidate, tested against exactly `prisma@8.0.0-rc.29` with `@prisma/orm-postgres@8.0.0-rc.21` (pin both; the `latest` pair crashed `prisma contract emit`). Requires Node 22.18+/24.11+/26+, TypeScript 5.9+, PostgreSQL 15+. PostgreSQL only. No `@prisma/client`, no `schema.prisma`, no `generate` / `migrate dev` / `db push`.
+
+```bash
+npm install --save-exact @prisma/orm-postgres@8.0.0-rc.21
+npm install --save-dev --save-exact prisma@8.0.0-rc.29
+mkdir -p prisma
+cp node_modules/@bratsos/workflow-engine/prisma/contract.prisma prisma/contract.prisma
+```
+
+```ts
+// prisma.config.ts
+import { defineConfig } from "@prisma/orm-postgres/config";
+import { definePrismaConfig } from "prisma/config";
+
+export default definePrismaConfig({
+  orm: defineConfig({
+    contract: "./prisma/contract.prisma",
+    db: { connection: process.env.DATABASE_URL ?? "" },
+  }),
+});
+```
+
+**The contract.** `prisma/contract.prisma` ships in the package with the same 12 models, names and relations as `schema.prisma` (copy the `native_enum Status` and the models into an existing contract if you have one). Two things must stay, and `fromPrisma8` throws at construction, naming the fix, when they do not:
+
+- Timestamps are `TimestampString(3)`, never `DateTime`: naive `timestamp(3)` holding UTC, read and written as ISO text. A `Date` is rejected by the column; `fromPrisma8` converts for the engine.
+- `Status` is a native Postgres enum named `Status` (`native_enum` plus `pg.enum(Status)`), because the raw SQL casts to `::"Status"`. A plain `enum` block is a text column with a `CHECK` and breaks the cast.
+
+**Provision an empty database.**
+
+```bash
+export DATABASE_URL="postgres://user:password@localhost:5432/mydb"
+npx prisma contract emit      # writes prisma/contract.json and prisma/contract.d.ts
+npx prisma db init
+psql "$DATABASE_URL" -f node_modules/@bratsos/workflow-engine/prisma/mixed-order-indexes.sql
+npx prisma db verify --strict
+```
+
+**The mixed-order indexes.** A Prisma 8 contract cannot express a sort direction, so `contract.prisma` declares five indexes ascending: `(status, priority DESC, createdAt)` on `workflow_runs` and `job_queue` (the claim and dequeue), and `(createdAt DESC, id DESC)` plus its `status` / `workflowId` prefixes on `workflow_runs` (every newest-first listing). `mixed-order-indexes.sql` drops and recreates them with their direction in one transaction; it is idempotent. Without it everything works but a claim reads and sorts every pending row. `db verify` and `migration plan` cannot see sort direction, so nothing warns when they are ascending. **Re-apply the file after anything that recreates one of the five** (a plan that changes their columns, a manual `DROP INDEX`). If the project uses `migration plan` and `db migrate`, put the five statements in the baseline migration instead (`migration plan --from @empty --name baseline`, then replace `columns: [...]` of the five matching `createIndex` calls with ``expression: sql`status, priority DESC, "createdAt"` ``, run the file with `node`, then `db migrate`) so every environment gets them.
+
+**The client.**
+
+```ts
+// db.ts
+import postgres from "@prisma/orm-postgres/runtime";
+import { contractFromJson } from "@prisma/orm-postgres/static";
+import type { Contract } from "./prisma/contract.d";
+import contractJson from "./prisma/contract.json" with { type: "json" };
+
+export const db = postgres({
+  contract: contractFromJson<Contract>(contractJson),
+  url: process.env.DATABASE_URL!,
+});
+```
+
+```ts
+import {
+  createPrismaJobQueue,
+  createPrismaWorkflowPersistence,
+  createPrismaStepLedger,
+  createPrismaAICallLogger,
+  createPrismaBlobStore,
+  fromPrisma8,
+} from "@bratsos/workflow-engine/persistence/prisma"; // fromPrisma8 is also exported from "@bratsos/workflow-engine"
+import { db } from "./db";
+
+const prisma = fromPrisma8(db); // wrap once; every factory and createPrismaConsoleReadPort take it
+const persistence = createPrismaWorkflowPersistence(prisma);
+const jobQueue = createPrismaJobQueue(prisma);
+```
+
+`fromPrisma8` compiles each delegate call the adapters make into one SQL statement from the contract, and throws `fromPrisma8: ...` for any argument outside that subset; it is not general Prisma emulation (use `db.orm` for your own queries). Errors are Prisma 8's `SqlQueryError` with `.sqlState`; the wrapper raises `P2025` for a missing row on `update` / `delete` and `P2028` after a `$transaction(fn, { timeout })` expires. Ids are generated by the wrapper (time-ordered hex such as `01a18d985ffe0000f041d3af`, not cuids); they are opaque and coexist with cuids in one table.
+
+**Inside the consumer's own transaction.** A `tx` has no contract, so pass it:
+
+```ts
+await db.transaction(async (tx) => {
+  await tx.orm.public.WorkflowLog.create({ level: "INFO", message: "mine" }); // consumer's own write
+  const prisma = fromPrisma8(tx, { contract: db.contract });
+  const persistence = createPrismaWorkflowPersistence(prisma); // commits or rolls back with the write above
+});
+```
+
+Like a Prisma 6 or 7 `tx`, the result has no `$transaction`: no nested transactions, and `enqueueParallel` throws.
+
+**The console.** `workflow-console --database-url` needs `@prisma/client` (Prisma 6 and 7 only). On Prisma 8 give `--config` a `console.config.mjs` that builds the reader with `createPrismaConsoleReadPort(fromPrisma8(db))` and a `dispose: () => db.close()`; see [16-operational-console.md](16-operational-console.md). A reader wrapped around `fromPrisma8(db)` by the consumer must forward `$withColumns`.
+
+**Adopting a database that Prisma 6 or 7 created.** The tables do not change and the five descending indexes already exist, so skip `mixed-order-indexes.sql`. Replace the Prisma 6 or 7 packages with the pinned Prisma 8 pair, copy `contract.prisma`, add `prisma.config.ts`, then:
+
+```bash
+npx prisma contract emit
+npx prisma db sign
+npx prisma db verify --strict
+```
+
+`db sign` writes a marker into Prisma 8's own `prisma_contract` schema only. Add models for the consumer's own tables to the contract, or `db verify --strict` reports them as extra (`prisma contract infer --db "$DATABASE_URL" --output prisma/inferred.prisma` writes them from the live database inside a `namespace public { }` block with plural names; copy those models into `prisma/contract.prisma`). The only row-level difference is the id format above.
 
 ## Status Type
 
@@ -1186,6 +1306,8 @@ npx prisma migrate deploy
 npx prisma generate
 ```
 
+On Prisma 8 edit `prisma/contract.prisma`, run `npx prisma contract emit`, then `npx prisma db update` (no migration history) or `npx prisma migration plan` and `npx prisma db migrate`. Re-apply `mixed-order-indexes.sql` after any step that recreates one of the five descending indexes.
+
 ## Transactional enqueue from SQL (PostgreSQL)
 
 `workflow_engine_enqueue` creates a workflow run from SQL, inside the caller's
@@ -1237,7 +1359,7 @@ Requires PostgreSQL 13+ (built-in `gen_random_uuid()`).
 
 ### Indexes
 
-The schema includes indexes for common query patterns:
+The schema includes indexes for common query patterns (on Prisma 8 the five with a `DESC` column come from `mixed-order-indexes.sql`, not the contract):
 - `(status, priority DESC, createdAt)` on `workflow_runs` and `job_queue` - the run claim and the dequeue, `FOR UPDATE SKIP LOCKED`, flat with depth
 - `(createdAt DESC, id DESC)` and its `status` / `workflowId` prefixes on `workflow_runs` - newest-first listings, keyset paginated
 - `(definitionVersion)` and `(status, workflowId, definitionVersion)` on `workflow_runs` - version lookups and the version-filtered claim
