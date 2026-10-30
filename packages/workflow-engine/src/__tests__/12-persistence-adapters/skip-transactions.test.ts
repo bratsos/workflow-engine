@@ -64,6 +64,6 @@ describe("withTransaction keeps every option on the transactional clone", () => 
     ];
     expect(sql).toContain('::"WorkflowStatus"');
     expect(sql).not.toContain('"Status"');
-    expect(params[2]).toBe(now);
+    expect(params[2]).toBe(now.toISOString());
   });
 });

@@ -535,11 +535,11 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     //
     // The enum type name is an identifier, which a tagged template cannot
     // bind, so the statement is built as text with positional parameters
-    // for every value. Timestamps are bound JS Dates from the injected
-    // clock and converted with `AT TIME ZONE 'UTC'` -- never `NOW()`, and
-    // never a bare parameter, both of which write session-local time into
-    // the naive TIMESTAMP columns Prisma fills with UTC (see
-    // utc-timestamps.ts).
+    // for every value. Timestamps are bound as ISO strings from the
+    // injected clock and converted with `AT TIME ZONE 'UTC'` -- never
+    // `NOW()`, never a bare parameter and never a JS Date, which write
+    // session-local time into the naive TIMESTAMP columns Prisma fills with
+    // UTC (see utc-timestamps.ts).
     const pending = this.enums.status("PENDING");
     const running = this.enums.status("RUNNING");
     let results: any[];
@@ -597,7 +597,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
         RETURNING "workflow_runs".*`,
         pending,
         running,
-        now,
+        now.toISOString(),
         ...extraParams,
       );
     } else if (this.prisma.$queryRaw) {
@@ -606,6 +606,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
           "statusEnumName requires a Prisma client with $queryRawUnsafe (the Postgres claimNextPendingRun path)",
         );
       }
+      const nowIso = now.toISOString();
       results = await this.prisma.$queryRaw<any[]>`
         WITH claimed AS (
           SELECT id
@@ -617,8 +618,8 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
         )
         UPDATE "workflow_runs"
         SET status = ${running}::"Status",
-            "startedAt" = ${now}::timestamptz AT TIME ZONE 'UTC',
-            "updatedAt" = ${now}::timestamptz AT TIME ZONE 'UTC',
+            "startedAt" = ${nowIso}::timestamptz AT TIME ZONE 'UTC',
+            "updatedAt" = ${nowIso}::timestamptz AT TIME ZONE 'UTC',
             version = version + 1
         FROM claimed
         WHERE "workflow_runs".id = claimed.id
@@ -712,6 +713,8 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       // A caught unique violation aborts a PostgreSQL transaction. Insert
       // atomically, then read separately so READ COMMITTED sees the winner.
       if (this.databaseType === "sqlite") {
+        // A Date, unlike the Postgres statements: SQLite stores it the way
+        // the model API does on every major (integer on 6, ISO text on 7).
         await this.prisma.$executeRaw`
           INSERT INTO "workflow_definitions"
             ("workflowId", version, snapshot, "structureHash", "createdAt")
@@ -1477,7 +1480,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
         WHERE "outbox_events".id = claimed.id
         RETURNING "outbox_events".*`,
         effectiveLimit,
-        now,
+        now.toISOString(),
       );
       return rows
         .map((r: any) => this.mapOutboxEvent(r))

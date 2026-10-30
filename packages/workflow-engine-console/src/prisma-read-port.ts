@@ -51,11 +51,15 @@ export interface PrismaConsoleReadPortOptions {
 }
 
 /**
- * Wraps a positional parameter carrying a JS Date in a timestamptz-to-UTC conversion.
+ * Wraps a positional parameter carrying an ISO-8601 timestamp string in a
+ * timestamptz-to-UTC conversion.
  *
- * Mirrors `utc-timestamps.ts` in the engine's Prisma adapter: Prisma binds a Date
- * as timestamptz and Postgres converts it through the session timezone, which skews
- * against naive timestamp columns unless explicitly converted via AT TIME ZONE 'UTC'.
+ * Mirrors `utc-timestamps.ts` in the engine's Prisma adapter: Postgres converts a
+ * timestamptz through the session timezone, which skews against naive timestamp
+ * columns unless explicitly converted via AT TIME ZONE 'UTC'. Callers bind
+ * `date.toISOString()` rather than a Date because driver-level Date binding differs
+ * between Prisma majors (7's pg adapter sends zone-less text that Postgres reads in
+ * the session timezone).
  */
 function utcParam(position: number): string {
   if (!Number.isInteger(position) || position < 1) {
@@ -528,7 +532,7 @@ export class PrismaConsoleReadPort implements ConsoleReadPort {
       where.push(
         `("createdAt", id) < (${utcParam(paramIdx)}, $${paramIdx + 1})`,
       );
-      params.push(cursor.createdAt, cursor.id);
+      params.push(cursor.createdAt.toISOString(), cursor.id);
       paramIdx += 2;
     }
 
@@ -568,13 +572,13 @@ export class PrismaConsoleReadPort implements ConsoleReadPort {
 
     if (query.filters?.createdAfter !== undefined) {
       where.push(`"createdAt" >= ${utcParam(paramIdx)}`);
-      params.push(query.filters.createdAfter);
+      params.push(query.filters.createdAfter.toISOString());
       paramIdx += 1;
     }
 
     if (query.filters?.createdBefore !== undefined) {
       where.push(`"createdAt" < ${utcParam(paramIdx)}`);
-      params.push(query.filters.createdBefore);
+      params.push(query.filters.createdBefore.toISOString());
       paramIdx += 1;
     }
 
@@ -751,7 +755,7 @@ ORDER BY sequence ASC LIMIT ${clampedLimit}`,
         this.select<{ count: unknown }>(
           client,
           `SELECT count(*) AS count FROM "job_queue" WHERE status = $1::"${this.statusEnumName}" AND "nextPollAt" IS NOT NULL AND "nextPollAt" <= ${utcParam(2)}`,
-          ["SUSPENDED", this.now()],
+          ["SUSPENDED", this.now().toISOString()],
         ),
       ]),
     );
@@ -827,7 +831,7 @@ GROUP BY "workerId" ORDER BY "workerId" ASC`,
         `SELECT "workflowId" AS key, count(*) AS runs, sum("totalCost") AS cost, sum("totalTokens") AS tokens
 FROM "workflow_runs" WHERE "createdAt" >= ${utcParam(1)} AND "createdAt" < ${utcParam(2)}
 GROUP BY "workflowId" ORDER BY sum("totalCost") DESC`,
-        [from, to],
+        [from.toISOString(), to.toISOString()],
       );
       return rows.map(mapCostBucket);
     } else {
@@ -837,7 +841,7 @@ GROUP BY "workflowId" ORDER BY sum("totalCost") DESC`,
        count(*) AS runs, sum("totalCost") AS cost, sum("totalTokens") AS tokens
 FROM "workflow_runs" WHERE "createdAt" >= ${utcParam(1)} AND "createdAt" < ${utcParam(2)}
 GROUP BY 1 ORDER BY 1 DESC`,
-        [from, to],
+        [from.toISOString(), to.toISOString()],
       );
       return rows.map(mapCostBucket);
     }

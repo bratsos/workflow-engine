@@ -1145,6 +1145,51 @@ if (!DATABASE_URL) {
         expect(stillHeld?.status).toBe("RUNNING");
       });
 
+      it("claims a pending run through the tagged-template fallback on a non-UTC session", async () => {
+        // A client without $queryRawUnsafe takes the template path, which
+        // binds the clock on its own.
+        const templateOnly = new Proxy(tzPrisma, {
+          get: (target, property) =>
+            property === "$queryRawUnsafe"
+              ? undefined
+              : Reflect.get(target, property),
+        });
+        const persistence = createPrismaWorkflowPersistence(templateOnly);
+        const run = await persistence.createRun({
+          workflowId: "tz-template-workflow",
+          workflowName: "TZ Template",
+          workflowType: "tz",
+          input: { value: "x" },
+        });
+
+        const claimed = await persistence.claimNextPendingRun();
+        expect(claimed?.id).toBe(run.id);
+        const lag =
+          (claimed?.startedAt?.getTime() ?? 0) - run.createdAt.getTime();
+        expect(lag).toBeGreaterThanOrEqual(0);
+        expect(lag).toBeLessThan(60_000);
+      });
+
+      it("stamps publishedAt in UTC when the outbox sweep claims events on a non-UTC session", async () => {
+        const persistence = createPrismaWorkflowPersistence(tzPrisma);
+        await persistence.appendOutboxEvents([
+          {
+            workflowRunId: "tz-outbox-run",
+            eventType: "run.started",
+            payload: {},
+            causationId: "tz-outbox",
+            occurredAt: new Date(),
+          },
+        ]);
+
+        const before = Date.now();
+        const [claimed] = await persistence.claimUnpublishedOutboxEvents();
+        expect(claimed?.workflowRunId).toBe("tz-outbox-run");
+        expect(
+          Math.abs((claimed?.publishedAt?.getTime() ?? 0) - before),
+        ).toBeLessThan(60_000);
+      });
+
       it("claims a pending run with a UTC startedAt on a non-UTC session", async () => {
         const persistence = createPrismaWorkflowPersistence(tzPrisma);
         const run = await persistence.createRun({
@@ -1329,5 +1374,33 @@ describe("definition registration on real SQLite", () => {
       ).toEqual(first);
     });
     expect(await prisma.workflowDefinition.count()).toBe(1);
+  });
+
+  it("stores a raw-inserted createdAt the way the model API stores one", async () => {
+    // The raw insert binds a Date, where the Postgres statements bind an ISO
+    // string: SQLite keeps an integer on 6 and ISO text on 7, and the raw
+    // statement must land on whichever one the model API writes.
+    await prisma.workflowDefinition.create({
+      data: {
+        workflowId: "sqlite-model",
+        version: "v1",
+        snapshot: {},
+        structureHash: "h",
+      },
+    });
+    await createPrismaWorkflowPersistence(prisma, {
+      databaseType: "sqlite",
+      definitionVersioning: true,
+    }).insertDefinitionIfAbsent({
+      workflowId: "sqlite-raw",
+      version: "v1",
+      snapshot: {},
+      structureHash: "h",
+    });
+    const rows = (await prisma.$queryRawUnsafe(
+      `SELECT "workflowId" AS id, typeof("createdAt") AS type FROM "workflow_definitions" WHERE "workflowId" IN ('sqlite-model', 'sqlite-raw')`,
+    )) as Array<{ id: string; type: string }>;
+    const types = Object.fromEntries(rows.map((row) => [row.id, row.type]));
+    expect(types["sqlite-raw"]).toBe(types["sqlite-model"]);
   });
 });

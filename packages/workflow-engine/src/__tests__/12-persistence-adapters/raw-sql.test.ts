@@ -3,10 +3,10 @@
  *
  * Two invariants, checked against the SQL a mocked client receives:
  *  - The status enum's type name is configurable (`statusEnumName`), and
- *    `claimNextPendingRun` binds a JS Date from the injected clock converted
- *    with `AT TIME ZONE 'UTC'` -- never a bare parameter and never `NOW()`,
- *    both of which write session-local time into the naive TIMESTAMP columns
- *    Prisma fills with UTC (see persistence/prisma/utc-timestamps.ts).
+ *    `claimNextPendingRun` binds the injected clock's ISO string converted
+ *    with `AT TIME ZONE 'UTC'` -- never a bare parameter, a JS Date or `NOW()`,
+ *    which write session-local time into the naive TIMESTAMP columns Prisma
+ *    fills with UTC (see persistence/prisma/utc-timestamps.ts).
  *  - The *job lease* binds no timestamp at all: claim, heartbeat and stale
  *    sweep all read `now() AT TIME ZONE 'UTC'`, so the lease has exactly one
  *    clock and a host whose system clock drifts cannot shorten or extend it.
@@ -42,7 +42,7 @@ describe("PrismaWorkflowPersistence.claimNextPendingRun raw SQL", () => {
     expect(sql).not.toContain("NOW()");
     expect(sql).toContain(`"startedAt" = ($3::timestamptz AT TIME ZONE 'UTC')`);
     expect(sql).toContain(`"updatedAt" = ($3::timestamptz AT TIME ZONE 'UTC')`);
-    expect(params).toEqual(["PENDING", "RUNNING", now]);
+    expect(params).toEqual(["PENDING", "RUNNING", now.toISOString()]);
   });
 
   it('defaults the enum name to "Status" and honours a per-call now', async () => {
@@ -60,7 +60,7 @@ describe("PrismaWorkflowPersistence.claimNextPendingRun raw SQL", () => {
       ...unknown[],
     ];
     expect(sql).toContain('::"Status"');
-    expect(params[2]).toBe(now);
+    expect(params[2]).toBe(now.toISOString());
   });
 
   it("falls back to the tagged template on a client without $queryRawUnsafe", async () => {
@@ -78,7 +78,10 @@ describe("PrismaWorkflowPersistence.claimNextPendingRun raw SQL", () => {
     expect(sql).toContain('::"Status"');
     expect(sql).not.toContain("NOW()");
     expect(sql).toContain("AT TIME ZONE 'UTC'");
-    expect(values.filter((v) => v instanceof Date)).toHaveLength(2);
+    expect(values.filter((v) => v instanceof Date)).toHaveLength(0);
+    expect(
+      values.filter((v) => typeof v === "string" && v.endsWith("Z")),
+    ).toHaveLength(2);
   });
 
   it("rejects a custom enum name on a client that only has $queryRaw", async () => {
@@ -268,7 +271,7 @@ describe("PrismaWorkflowPersistence.claimUnpublishedOutboxEvents raw SQL", () =>
     );
     expect(sql).toContain("RETURNING");
     expect(sql).not.toContain("NOW()");
-    expect(params).toEqual([25, now]);
+    expect(params).toEqual([25, now.toISOString()]);
   });
 
   it("falls back to a per-row compare-and-set on SQLite", async () => {
