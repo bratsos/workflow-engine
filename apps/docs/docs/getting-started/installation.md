@@ -71,7 +71,10 @@ npm install @ai-sdk/anthropic
 npm install @ai-sdk/openai
 
 # For Prisma-based database persistence (recommended); Prisma 6 or 7
-npm install @prisma/client
+npm install @prisma/client@7 @prisma/adapter-pg@7
+npm install -D prisma@7
 ```
+
+Pin the version: `npx prisma` without a local install now runs Prisma 8, which these commands do not support yet. Prisma 6 also works: use `@6` and skip the adapter.
 
 > **Note:** `@ai-sdk/google` and `@openrouter/ai-sdk-provider` are direct dependencies of `@bratsos/workflow-engine`; OpenRouter's Batch API is called over plain HTTP and needs no additional SDK. The Prisma adapters never import `@prisma/client` themselves — you pass them the client you generated, so Prisma 7's `prisma-client` generator with a custom `output` works unchanged. The engine also ships its reference schema at `node_modules/@bratsos/workflow-engine/prisma/schema.prisma`; see [Prisma Setup](../persistence/prisma-setup.md).

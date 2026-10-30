@@ -107,10 +107,11 @@ import {
   createPrismaAICallLogger,
 } from "@bratsos/workflow-engine/persistence/prisma";
 import { PrismaClient } from "@prisma/client";
+import { PrismaPg } from "@prisma/adapter-pg";
 import { documentAnalysisWorkflow } from "./workflow";
 import crypto from "crypto";
 
-const prisma = new PrismaClient();
+const prisma = new PrismaClient({ adapter: new PrismaPg({ connectionString: process.env.DATABASE_URL }) });
 const jobTransport = createPrismaJobQueue(prisma);
 
 // 1. Setup the pure command kernel

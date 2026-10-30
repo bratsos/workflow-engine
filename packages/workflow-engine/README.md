@@ -85,8 +85,11 @@ npm install @ai-sdk/anthropic
 npm install @ai-sdk/openai
 
 # For Prisma persistence (recommended)
-npm install @prisma/client
+npm install @prisma/client@7 @prisma/adapter-pg@7
+npm install -D prisma@7
 ```
+
+Pin the version: `npx prisma` without a local install now runs Prisma 8, which these commands do not support yet. Prisma 6 also works: use `@6` and skip the adapter.
 
 > `@ai-sdk/google` and `@openrouter/ai-sdk-provider` are direct dependencies of `@bratsos/workflow-engine`. OpenRouter models and OpenRouter `:batch` processing need no extra vendor SDK; when `@ai-sdk/anthropic` / `@ai-sdk/openai` is not installed and OpenRouter can batch the model, the batch falls back to OpenRouter with a WARN.
 
@@ -557,9 +560,10 @@ import {
   createPrismaWorkflowPersistence,
 } from "@bratsos/workflow-engine";
 import { PrismaClient } from "@prisma/client";
+import { PrismaPg } from "@prisma/adapter-pg";
 import { documentProcessorWorkflow } from "./workflows/document-processor";
 
-const prisma = new PrismaClient();
+const prisma = new PrismaClient({ adapter: new PrismaPg({ connectionString: process.env.DATABASE_URL }) });
 
 const kernel = createKernel({
   persistence: createPrismaWorkflowPersistence(prisma),
