@@ -13,6 +13,11 @@ export {
 } from "./blob-store";
 export { createEnumHelper, type PrismaEnumHelper } from "./enum-compat";
 export {
+  fromPrisma8,
+  type Prisma8Client,
+  type Prisma8Db,
+} from "./from-prisma8";
+export {
   createPrismaJobQueue,
   PrismaJobQueue,
   type PrismaJobQueueOptions,

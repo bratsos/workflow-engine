@@ -11,9 +11,10 @@
  * dependency on a specific generated client. Instead, this structural type captures only the delegates and
  * methods the adapters actually call, so that:
  *
- *   - any Prisma client generated from a schema with the required models
- *     (see `prisma/schema.prisma`) structurally satisfies it, regardless
- *     of Prisma version, and
+ *   - any Prisma 6 or 7 client generated from a schema with the required
+ *     models (see `prisma/schema.prisma`) structurally satisfies it, and a
+ *     Prisma 8 client does once wrapped by `fromPrisma8` (it has no model
+ *     delegates of its own), regardless of Prisma version, and
  *   - passing something that ISN'T a Prisma client at all (a typo'd mock,
  *     `{}`, an unrelated object) is rejected at the constructor call site
  *     by the type checker, instead of silently compiling under `any`.
@@ -120,8 +121,55 @@ export interface EnginePrismaClient {
   $executeRaw?(strings: TemplateStringsArray, ...values: any[]): Promise<any>;
   /**
    * An enum namespace, if the client has one. Prisma 6 and 7 client
-   * instances do not (their enums are module-level exports), so enum
-   * values are plain strings. See `enum-compat.ts`.
+   * instances do not (their enums are module-level exports), nor does a
+   * `fromPrisma8` client, so enum values are plain strings. See
+   * `enum-compat.ts`.
    */
   $Enums?: Record<string, Record<string, unknown>>;
+  /**
+   * Prisma 8 only (`fromPrisma8` provides it): a client whose raw reads
+   * return these columns. Prisma 8 silently drops result columns a raw read
+   * does not declare, so every raw read goes through {@link rawFor}.
+   */
+  $withColumns?(columns: RawColumns): EnginePrismaClient;
+}
+
+/** A raw read's column type: `bigint` is what `count(*)` returns. */
+export type RawColumnType =
+  | "text"
+  | "int"
+  | "bigint"
+  | "float"
+  | "bool"
+  | "json"
+  | "timestamp";
+
+/**
+ * The columns a raw read returns: a table name for `RETURNING "t".*`, else a
+ * column name -> type map (`{}` for a statement that returns no rows).
+ */
+export type RawColumns = string | Record<string, RawColumnType>;
+
+/**
+ * The client to run a raw read on. Prisma 6 and 7 return rows as they are, so
+ * this is the client itself there; a `fromPrisma8` client returns a view whose
+ * raw reads decode `columns`.
+ */
+export function rawFor<C extends EnginePrismaClient>(
+  prisma: C,
+  columns: RawColumns,
+): C {
+  return (prisma.$withColumns?.(columns) as C | undefined) ?? prisma;
+}
+
+/** Fails early on `databaseType: "sqlite"` over a `fromPrisma8` client: Prisma 8 is Postgres-only here. */
+export function rejectSqliteOn8(
+  prisma: EnginePrismaClient,
+  databaseType: string,
+): void {
+  if (databaseType === "sqlite" && prisma.$withColumns) {
+    throw new Error(
+      'databaseType "sqlite" is not supported on Prisma 8: use Prisma 6 or 7 for SQLite, or a Postgres database.',
+    );
+  }
 }

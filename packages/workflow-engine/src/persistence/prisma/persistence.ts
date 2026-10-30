@@ -37,7 +37,11 @@ import {
   StaleVersionError,
 } from "../interface";
 import { createEnumHelper, type PrismaEnumHelper } from "./enum-compat";
-import type { EnginePrismaClient } from "./prisma-client-type";
+import {
+  type EnginePrismaClient,
+  rawFor,
+  rejectSqliteOn8,
+} from "./prisma-client-type";
 import { isSerializationFailure, isUniqueViolation } from "./sql-errors";
 import { utcTimestampParam } from "./utc-timestamps";
 
@@ -162,10 +166,12 @@ async function probeDefinitionVersioningSchema(
         : null;
   if (sql === null) return null;
   try {
-    const rows =
-      await prisma.$queryRawUnsafe<
-        Array<{ has_table: unknown; has_column: unknown }>
-      >(sql);
+    const rows = await rawFor(prisma, {
+      has_table: "bool",
+      has_column: "bool",
+    }).$queryRawUnsafe!<Array<{ has_table: unknown; has_column: unknown }>>(
+      sql,
+    );
     const row = rows[0];
     if (!row) return null;
     return truthy(row.has_table) && truthy(row.has_column);
@@ -231,6 +237,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       statusEnumName: this.statusEnumName,
     });
     this.databaseType = options.databaseType ?? "postgresql";
+    rejectSqliteOn8(prisma, this.databaseType);
     this.skipTransactions = options.skipInteractiveTransactions ?? false;
     this.now = options.now ?? (() => new Date());
     this.versioning = {
@@ -577,7 +584,9 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
             OR ("definitionVersion" IS NULL AND "workflowId" IN (${ids.join(", ")})))`;
         }
       }
-      results = await this.prisma.$queryRawUnsafe<any[]>(
+      results = await rawFor(this.prisma, "workflow_runs").$queryRawUnsafe!<
+        any[]
+      >(
         `WITH claimed AS (
           SELECT id
           FROM "workflow_runs"
@@ -607,7 +616,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
         );
       }
       const nowIso = now.toISOString();
-      results = await this.prisma.$queryRaw<any[]>`
+      results = await rawFor(this.prisma, "workflow_runs").$queryRaw!<any[]>`
         WITH claimed AS (
           SELECT id
           FROM "workflow_runs"
@@ -1465,7 +1474,9 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       // flush holds), stamp them, return them. A concurrent flush — even
       // one inside a still-open transaction — cannot receive the same
       // rows. `RETURNING` order is unspecified, so the rows are re-sorted.
-      const rows = await this.prisma.$queryRawUnsafe<any[]>(
+      const rows = await rawFor(this.prisma, "outbox_events").$queryRawUnsafe!<
+        any[]
+      >(
         `WITH claimed AS (
           SELECT id
           FROM "outbox_events"
