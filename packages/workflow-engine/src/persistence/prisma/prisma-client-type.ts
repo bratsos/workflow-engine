@@ -7,9 +7,8 @@
  *
  * This is deliberately NOT `import type { PrismaClient } from "@prisma/client"`:
  * consumers generate their own client (their own output path, possibly a
- * different Prisma major version -- see `enum-compat.ts`'s 6.x/7.x note),
- * and this package must not force a dependency on a specific generated
- * client. Instead, this structural type captures only the delegates and
+ * different Prisma major version), and this package must not force a
+ * dependency on a specific generated client. Instead, this structural type captures only the delegates and
  * methods the adapters actually call, so that:
  *
  *   - any Prisma client generated from a schema with the required models
@@ -120,8 +119,9 @@ export interface EnginePrismaClient {
    */
   $executeRaw?(strings: TemplateStringsArray, ...values: any[]): Promise<any>;
   /**
-   * Prisma 7.x's typed-enum namespace (absent on 6.x clients, which use
-   * plain strings). See `enum-compat.ts`.
+   * An enum namespace, if the client has one. Prisma 6 and 7 client
+   * instances do not (their enums are module-level exports), so enum
+   * values are plain strings. See `enum-compat.ts`.
    */
   $Enums?: Record<string, Record<string, unknown>>;
 }
