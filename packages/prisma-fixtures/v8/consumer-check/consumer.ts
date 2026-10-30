@@ -25,7 +25,11 @@ const db = postgres({
 // The root client.
 const client = fromPrisma8(db);
 createPrismaWorkflowPersistence(client);
-createPrismaJobQueue(client);
+await createPrismaJobQueue(client).enqueue({
+  workflowRunId: "run",
+  workflowId: "workflow",
+  stageId: "stage",
+});
 createPrismaAICallLogger(client);
 createPrismaStepLedger(client);
 createPrismaBlobStore(client);

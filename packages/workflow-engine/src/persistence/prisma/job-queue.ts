@@ -1101,7 +1101,7 @@ export class PrismaJobQueue implements JobQueue {
 export function createPrismaJobQueue(
   prisma: PrismaClient,
   optionsOrWorkerId?: PrismaJobQueueOptions | string,
-): JobQueue {
+): PrismaJobQueue {
   // Handle backwards compatibility: if string is passed, treat as workerId
   const options: PrismaJobQueueOptions =
     typeof optionsOrWorkerId === "string"
