@@ -5,17 +5,9 @@ import type {
   StepRecordPatch,
 } from "../../kernel/ports.js";
 import type { EnginePrismaClient } from "./prisma-client-type.js";
+import { isUniqueViolation } from "./sql-errors.js";
 
 type PrismaClient = EnginePrismaClient;
-
-function isUniqueViolation(error: unknown): boolean {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    "code" in error &&
-    (error as { code?: unknown }).code === "P2002"
-  );
-}
 
 function mapStep(record: any): StepRecord {
   return {

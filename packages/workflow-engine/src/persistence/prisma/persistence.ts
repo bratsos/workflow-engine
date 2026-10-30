@@ -38,6 +38,7 @@ import {
 } from "../interface";
 import { createEnumHelper, type PrismaEnumHelper } from "./enum-compat";
 import type { EnginePrismaClient } from "./prisma-client-type";
+import { isSerializationFailure, isUniqueViolation } from "./sql-errors";
 import { utcTimestampParam } from "./utc-timestamps";
 
 // Structural client type -- see prisma-client-type.ts. Kept as a local
@@ -741,15 +742,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       }
       return this.mapDefinition(row);
     } catch (error) {
-      const failure = error as {
-        code?: string;
-        meta?: { code?: string };
-      } | null;
-      if (
-        failure?.code === "P2034" ||
-        failure?.code === "40001" ||
-        failure?.meta?.code === "40001"
-      ) {
+      if (isSerializationFailure(error)) {
         throw new DefinitionRegistrationRetryableError(
           input.workflowId,
           input.version,
@@ -1262,7 +1255,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       try {
         await this.prisma.workflowAnnotation.create({ data: row });
       } catch (error: any) {
-        if (error?.code === "P2002") continue;
+        if (isUniqueViolation(error)) continue;
         throw error;
       }
     }
@@ -1437,7 +1430,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     try {
       await this.prisma.outboxEvent.createMany({ data: rows });
     } catch (error: any) {
-      if (error?.code === "P2002" && attempt < MAX_CLAIM_ATTEMPTS) {
+      if (isUniqueViolation(error) && attempt < MAX_CLAIM_ATTEMPTS) {
         // Another writer assigned overlapping sequences between our read
         // and write (only reachable outside a transaction, or on DBs
         // without the advisory lock). Recompute and retry.
@@ -1597,7 +1590,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
         await this.prisma.idempotencyKey.create({ data: row });
         return { status: "acquired" };
       } catch (error: any) {
-        if (error?.code !== "P2002") {
+        if (!isUniqueViolation(error)) {
           throw error;
         }
       }

@@ -56,6 +56,11 @@ import {
   createPrismaWorkflowPersistence,
 } from "../../persistence/prisma/index.js";
 import {
+  isSerializationFailure,
+  isUniqueViolation,
+  sqlStateOf,
+} from "../../persistence/prisma/sql-errors.js";
+import {
   aiCallLoggerConformanceSuite,
   jobQueueConformanceSuite,
   persistenceConformanceSuite,
@@ -946,6 +951,73 @@ if (!DATABASE_URL) {
         expect(claimed?.payload).toEqual({ config: { x: 1 } });
         const [record] = await queue.getJobsByWorkflowRun("run-1");
         expect(record?.payload).toEqual({ config: { x: 1 } });
+      });
+    });
+
+    // ==========================================================================
+    // Error classification (PG-only): the same Postgres failure reaches us as
+    // a different error shape on each Prisma major (`meta.code` on 6,
+    // `meta.driverAdapterError.cause.originalCode` on 7), so every check goes
+    // through `sqlStateOf`. These drive real driver errors, not fixtures.
+    // ==========================================================================
+
+    describe("SQLSTATE classification of driver errors", () => {
+      const caught = (run: () => Promise<unknown>) =>
+        run().then(
+          () => {
+            throw new Error("expected the statement to fail");
+          },
+          (error: unknown) => error,
+        );
+
+      it("reads a unique violation from raw SQL", async () => {
+        const workflowId = `sqlstate-raw-${crypto.randomUUID()}`;
+        const insert = () =>
+          prisma.$executeRaw`
+            INSERT INTO "workflow_definitions"
+              ("workflowId", version, snapshot, "structureHash")
+            VALUES (${workflowId}, 'v1', '{}'::jsonb, 'h')
+          `;
+        try {
+          await insert();
+          const error = await caught(insert);
+          expect(sqlStateOf(error)).toBe("23505");
+          expect(isUniqueViolation(error)).toBe(true);
+          expect(isSerializationFailure(error)).toBe(false);
+        } finally {
+          await prisma.workflowDefinition.deleteMany({ where: { workflowId } });
+        }
+      });
+
+      it("reads a unique violation from the model API", async () => {
+        const workflowId = `sqlstate-model-${crypto.randomUUID()}`;
+        const data = {
+          workflowId,
+          version: "v1",
+          snapshot: {},
+          structureHash: "h",
+        };
+        try {
+          await prisma.workflowDefinition.create({ data });
+          const error = await caught(() =>
+            prisma.workflowDefinition.create({ data }),
+          );
+          expect(sqlStateOf(error)).toBe("23505");
+          expect(isUniqueViolation(error)).toBe(true);
+        } finally {
+          await prisma.workflowDefinition.deleteMany({ where: { workflowId } });
+        }
+      });
+
+      it("reads a cancelled statement from raw SQL", async () => {
+        const error = await caught(() =>
+          prisma.$transaction(async (tx: typeof prisma) => {
+            await tx.$executeRawUnsafe("SET LOCAL statement_timeout = 20");
+            await tx.$queryRawUnsafe("SELECT pg_sleep(2)");
+          }),
+        );
+        expect(sqlStateOf(error)).toBe("57014");
+        expect(isUniqueViolation(error)).toBe(false);
       });
     });
 

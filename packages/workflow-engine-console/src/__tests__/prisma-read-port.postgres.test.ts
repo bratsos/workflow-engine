@@ -24,7 +24,7 @@
  */
 import { createRequire } from "node:module";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
-import { ConsoleQueryTimeoutError } from "../errors";
+import { ConsoleQueryTimeoutError, isStatementTimeout } from "../errors";
 import {
   type ConsolePrismaClient,
   createPrismaConsoleReadPort,
@@ -540,6 +540,29 @@ if (!DATABASE_URL) {
           statusEnumName: 'Status"; DROP TABLE "workflow_runs',
         }),
       ).toThrow(/statusEnumName/);
+    });
+
+    it("recognises a real cancelled statement by its SQLSTATE, whatever the message says", async () => {
+      const error: any = await prisma
+        .$transaction(async (tx: ConsolePrismaClient) => {
+          await tx.$executeRawUnsafe?.("SET LOCAL statement_timeout = 20");
+          await tx.$queryRawUnsafe("SELECT pg_sleep(2)");
+        })
+        .then(
+          () => {
+            throw new Error("expected the statement to be cancelled");
+          },
+          (caught: unknown) => caught,
+        );
+      expect(isStatementTimeout(error)).toBe(true);
+      // The same driver error with every message removed: only the fields
+      // this Prisma major puts the SQLSTATE on are left.
+      const bare = Object.assign(new Error("failed"), {
+        code: error.code,
+        sqlState: error.sqlState,
+        meta: error.meta && { ...error.meta, message: undefined },
+      });
+      expect(isStatementTimeout(bare)).toBe(true);
     });
   });
 }
