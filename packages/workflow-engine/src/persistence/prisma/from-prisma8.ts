@@ -15,8 +15,9 @@
  * and no raw `Date` or array parameters. This wrapper gives it the client
  * surface the adapters call, nothing more: each delegate call is compiled to
  * one SQL statement through the client's raw lane, using the column types in
- * `db.contract`, and anything outside the subset the adapters use throws
- * instead of being ignored.
+ * `db.contract`. Every argument shape it accepts behaves as it does on Prisma 6
+ * and 7 (see the "argument parity" cases of the Postgres conformance suite);
+ * anything else throws before any SQL runs, so it is never ignored or coerced.
  *
  * - Delegates are lazy: a call runs when awaited, or inside `$transaction([...])`.
  * - Timestamps are `pg/timestamp-string@1` (UTC text without a zone): `Date`
@@ -38,6 +39,8 @@ interface Column {
   codecId: string;
   nullable: boolean;
   typeParams?: { typeName?: string };
+  /** The members of a native enum, from the contract. */
+  members?: string[];
 }
 interface Relation {
   cardinality: string;
@@ -55,8 +58,10 @@ interface Contract {
               columns: Record<string, Column>;
               primaryKey: { columns: string[] };
               indexes: Array<{ columns: string[]; unique: boolean }>;
+              uniques?: Array<{ columns: string[] }>;
             }
           >;
+          native_enum?: Record<string, { members: string[] }>;
         };
       };
     };
@@ -111,6 +116,7 @@ interface Model {
   name: string;
   table: string;
   cols: Record<string, Column>;
+  primaryKey: string[];
   /** Primary and unique keys by Prisma's compound name, `a_b`. */
   keys: Map<string, string[]>;
   relations: Record<string, Relation & { target: Model }>;
@@ -123,13 +129,12 @@ const INT4 = "pg/int4@1";
 const INT8 = "pg/int8@1";
 const JSONB = "pg/jsonb@1";
 const ENUM = "pg/enum@1";
+const FLOAT8 = "pg/float8@1";
 const TIMESTAMP = "pg/timestamp-string@1";
 const SQL_TYPES: Record<string, string> = {
   [TEXT]: "text",
   [INT4]: "int4",
-  [INT8]: "int8",
-  "pg/float8@1": "float8",
-  "pg/bool@1": "boolean",
+  [FLOAT8]: "float8",
   [JSONB]: "jsonb",
   [TIMESTAMP]: "timestamp",
 };
@@ -137,7 +142,7 @@ const RAW_TYPES: Record<string, string> = {
   text: TEXT,
   int: INT4,
   bigint: INT8,
-  float: "pg/float8@1",
+  float: FLOAT8,
   bool: "pg/bool@1",
   json: JSONB,
   timestamp: TIMESTAMP,
@@ -162,9 +167,9 @@ function sortableId(): string {
   const random = globalThis.crypto.getRandomValues(new Uint32Array(1))[0]!;
   return `${time.toString(16).padStart(12, "0")}${lastIdCount.toString(16).padStart(4, "0")}${random.toString(16).padStart(8, "0")}`;
 }
-const GENERATORS: Record<string, () => string> = {
+const GENERATORS: Record<string, () => unknown> = {
   cuid2: sortableId,
-  timestampStringNow: () => new Date().toISOString(),
+  timestampStringNow: () => new Date(),
 };
 const REQUIRED_TABLES = [
   "workflow_runs",
@@ -304,17 +309,36 @@ function castOf(c: Column): string {
 const specOf = (m: Model, names: string[]) =>
   Object.fromEntries(names.map((n) => [n, codecOf(m.cols[n]!)]));
 
+/** The values Prisma takes for each column type; a SQL cast would coerce others. */
+const ACCEPTS: Record<string, (value: any, c: Column) => boolean> = {
+  [TEXT]: (v) => typeof v === "string",
+  [INT4]: (v) => Number.isInteger(v) && Math.abs(v) < 2 ** 31,
+  [FLOAT8]: (v) => Number.isFinite(v),
+  [TIMESTAMP]: (v) => v instanceof Date && !Number.isNaN(v.getTime()),
+  [ENUM]: (v, c) => c.members?.includes(v) === true,
+};
+
+function accept(c: Column, value: unknown, nullable = false): void {
+  if (value === null ? !nullable : !ACCEPTS[c.codecId]?.(value, c)) {
+    fail(`invalid value for a ${c.codecId} column`);
+  }
+}
+
 /** A value written to, or compared with, column `c`. */
-function bind(q: Sql, c: Column, value: unknown, suffix = ""): void {
-  // A JS null written to a JSON column is the JSON value null, as on 6 and 7.
-  q.v(c.codecId === JSONB ? JSON.stringify(value) : value, castOf(c) + suffix);
+function bind(q: Sql, c: Column, value: unknown): void {
+  // A JS null is the JSON value null on a JSON column, as on 6 and 7.
+  if (c.codecId === JSONB) q.v(JSON.stringify(value), castOf(c));
+  else {
+    accept(c, value, c.nullable);
+    q.v(value, castOf(c));
+  }
 }
 
 function column(m: Model, name: string): Column {
   return m.cols[name] ?? fail(`${m.name} has no column "${name}"`);
 }
 
-function generate(id: string): string {
+function generate(id: string): unknown {
   return (GENERATORS[id] ?? fail(`unsupported default generator "${id}"`))();
 }
 
@@ -330,9 +354,46 @@ function check(op: string, args: Args, allowed: string[]): void {
   }
 }
 
-/** `where`: fields, `OR`, compound unique keys, relation filters, and the `equals not in notIn lt lte gt gte startsWith contains path` operators. */
-function where(q: Sql, m: Model, w: Args | undefined, a: string, d: number) {
-  const entries = Object.entries(w ?? {}).filter(([, v]) => v !== undefined);
+/**
+ * `w` without what Prisma treats as absent: undefined values, and operator
+ * objects, relation filters and `OR` children left empty by that. So `OR: [{}]`
+ * matches nothing, and `{ id: {} }` is no filter at all.
+ */
+function prune(m: Model, w: unknown): Args {
+  if (!isObject(w)) fail(`${m.name}: a filter must be an object`);
+  const out: Args = {};
+  for (const [key, v] of Object.entries(w as Args)) {
+    const relation = m.relations[key];
+    if (v === undefined) continue;
+    if (key === "OR") {
+      if (!Array.isArray(v)) fail("OR must be an array");
+      out.OR = v
+        .map((child: unknown) => prune(m, child))
+        .filter((child: Args) => Object.keys(child).length > 0);
+    } else if (relation?.cardinality === "1:N") {
+      if (!isObject(v) || Object.keys(v).join() !== "none") {
+        fail(`${m.name}.${key}: only a "none" filter is supported`);
+      }
+      if (v.none !== undefined) {
+        out[key] = { none: prune(relation.target, v.none) };
+      }
+    } else if (relation || isObject(v)) {
+      const child = relation
+        ? prune(relation.target, v)
+        : Object.fromEntries(
+            Object.entries(v).filter(([, x]) => x !== undefined),
+          );
+      if (Object.keys(child).length > 0) out[key] = child;
+    } else {
+      out[key] = v;
+    }
+  }
+  return out;
+}
+
+/** A pruned `where`: fields, `OR` and relation filters. */
+function where(q: Sql, m: Model, w: Args, a: string, d: number) {
+  const entries = Object.entries(w);
   if (entries.length === 0) {
     q.t("true");
     return;
@@ -348,7 +409,6 @@ function clause(q: Sql, m: Model, key: string, v: any, a: string, d: number) {
   const c = m.cols[key];
   const relation = m.relations[key];
   if (key === "OR") {
-    if (!Array.isArray(v)) fail("OR must be an array");
     if (v.length === 0) q.t("false");
     v.forEach((w: Args, i: number) => {
       q.t(i ? " OR (" : "(");
@@ -360,25 +420,25 @@ function clause(q: Sql, m: Model, key: string, v: any, a: string, d: number) {
     const [local] = relation.on.localFields;
     const [target] = relation.on.targetFields;
     const toMany = relation.cardinality === "1:N";
-    if (toMany && !(isObject(v) && Object.keys(v).join() === "none")) {
-      fail(`${m.name}.${key}: only a "none" filter is supported`);
-    }
     q.t(
       `${toMany ? "NOT " : ""}EXISTS (SELECT 1 FROM ${quote(relation.target.table)} ${child} WHERE ${child}.${quote(target!)} = ${a}.${quote(local!)} AND (`,
     );
     where(q, relation.target, toMany ? v.none : v, child, d + 1);
     q.t("))");
-  } else if (!c && m.keys.has(key) && isObject(v)) {
-    where(q, m, v, a, d);
   } else if (!c) {
     fail(`${m.name} has no field "${key}" to filter on`);
   } else {
     const ref = `${a}.${quote(key)}`;
+    if (c.codecId === JSONB && !isObject(v)) {
+      fail(`${m.name}.${key}: a JSON filter must be an object`);
+    }
     const ops: Args = isObject(v) ? v : { equals: v };
     if ("path" in ops) {
       if (
         c.codecId !== JSONB ||
-        Object.keys(ops).sort().join() !== "equals,path"
+        Object.keys(ops).sort().join() !== "equals,path" ||
+        !Array.isArray(ops.path) ||
+        ops.path.some((part) => typeof part !== "string")
       ) {
         fail(`${m.name}.${key}: only { path, equals } is supported on JSON`);
       }
@@ -388,13 +448,49 @@ function clause(q: Sql, m: Model, key: string, v: any, a: string, d: number) {
         .v(JSON.stringify(ops.equals), "::jsonb");
       return;
     }
-    Object.entries(ops)
-      .filter(([, x]) => x !== undefined)
-      .forEach(([op, x], i) => {
-        if (i) q.t(") AND (");
-        operator(q, c, ref, op, x);
-      });
+    Object.entries(ops).forEach(([op, x], i) => {
+      if (i) q.t(") AND (");
+      operator(q, c, ref, op, x);
+    });
   }
+}
+
+/** The whole `where` of a statement, on the table aliased `t0`. */
+const filtered = (q: Sql, m: Model, w: unknown) =>
+  where(q, m, prune(m, w ?? {}), "t0", 0);
+
+/**
+ * The `where` of a single-row operation, compound keys flattened into columns,
+ * and the unique keys in it. Prisma requires a complete one; with an empty
+ * filter these operations would reach every row. Other filters may sit beside
+ * it, which is how the adapters fence with `version`.
+ */
+function uniqueWhere(m: Model, w: unknown) {
+  const columns: Array<[string, unknown]> = [];
+  const keys: Args[] = [];
+  for (const [name, value] of Object.entries(w ?? {})) {
+    const parts = m.keys.get(name);
+    if (value === undefined) continue;
+    if (!parts) {
+      columns.push([name, value]);
+      continue;
+    }
+    const key = parts.length > 1 ? value : { [name]: value };
+    if (
+      !isObject(key) ||
+      Object.keys(key).sort().join() !== [...parts].sort().join() ||
+      Object.values(key).some((part) => part == null || isObject(part))
+    ) {
+      fail(`${m.name}: "${name}" is not a complete unique key`);
+    }
+    keys.push(key as Args);
+    columns.push(...Object.entries(key as Args));
+  }
+  const flat = Object.fromEntries(columns);
+  if (keys.length === 0 || Object.keys(flat).length !== columns.length) {
+    fail(`${m.name}: "where" needs one complete unique key`);
+  }
+  return { where: flat, keys };
 }
 
 const COMPARISONS: Record<string, string> = {
@@ -406,30 +502,52 @@ const COMPARISONS: Record<string, string> = {
   gte: ">=",
 };
 
+const EQUALITY = ["equals", "not"];
+const LISTED = [...EQUALITY, "in", "notIn"];
+const ORDERED = [...LISTED, "lt", "lte", "gt", "gte"];
+const OPERATORS: Record<string, string[]> = {
+  [TEXT]: [...ORDERED, "startsWith"],
+  [INT4]: ORDERED,
+  [FLOAT8]: ORDERED,
+  [TIMESTAMP]: ORDERED,
+  [ENUM]: LISTED,
+  [JSONB]: EQUALITY,
+};
+
 function operator(q: Sql, c: Column, ref: string, op: string, x: unknown) {
+  if (!OPERATORS[c.codecId]?.includes(op)) {
+    fail(`unsupported filter operator "${op}" on a ${c.codecId} column`);
+  }
   if (op === "in" || op === "notIn") {
     if (!Array.isArray(x)) fail(`${op} needs an array`);
-    q.t(`${ref} ${op === "in" ? "= ANY" : "<> ALL"}(`);
-    bind(q, c, x, "[]");
-    q.t(")");
+    for (const item of x as unknown[]) accept(c, item);
+    q.t(`${ref} ${op === "in" ? "= ANY" : "<> ALL"}(`)
+      .v(x, `${castOf(c)}[]`)
+      .t(")");
   } else if (op === "startsWith") {
-    q.t(`starts_with(${ref}, `).v(x, "::text").t(")");
-  } else if (op === "contains") {
-    q.t(`strpos(${ref}, `).v(x, "::text").t(") > 0");
-  } else if (COMPARISONS[op]) {
-    if (x === null && (op === "equals" || op === "not")) {
-      q.t(`${ref} IS ${op === "not" ? "NOT " : ""}NULL`);
-    } else {
-      q.t(`${ref} ${COMPARISONS[op]} `);
-      bind(q, c, x);
-    }
+    accept(c, x);
+    // A LIKE pattern, as on 6 and 7: `%`, `_` and backslash keep their meaning.
+    q.t(`${ref} LIKE (`).v(x, "::text").t(" || '%')");
+  } else if (x === null && c.codecId !== JSONB) {
+    accept(c, x, c.nullable && EQUALITY.includes(op));
+    q.t(`${ref} IS ${op === "not" ? "NOT " : ""}NULL`);
   } else {
-    fail(`unsupported filter operator "${op}"`);
+    q.t(`${ref} ${COMPARISONS[op]} `);
+    bind(q, c, x);
   }
 }
 
-function orderBy(q: Sql, m: Model, order: unknown) {
-  const terms = [order ?? []].flat().flatMap((o) => Object.entries(o as Args));
+/** `ORDER BY`; a `take` with no order sorts by primary key, as on 6 and 7. */
+function orderBy(q: Sql, m: Model, order: unknown, implicit: boolean) {
+  const terms = [order ?? []].flat().flatMap((o) => {
+    if (!isObject(o)) fail("an orderBy entry must be an object");
+    const entries = Object.entries(o as Args);
+    if (entries.length > 1) fail("each orderBy entry takes one column");
+    return entries;
+  });
+  if (terms.length === 0 && implicit) {
+    for (const name of m.primaryKey) terms.push([name, "asc"]);
+  }
   if (terms.length === 0) return;
   q.t(
     ` ORDER BY ${terms
@@ -444,21 +562,37 @@ function orderBy(q: Sql, m: Model, order: unknown) {
   );
 }
 
-/** The scalar columns and the relations a `select` / `include` asks for. */
+/** The columns and the relations a `select` / `include` asks for. */
 function pick(m: Model, select?: Args, include?: Args) {
   if (select && include) fail("select and include cannot be combined");
-  const all = Object.fromEntries(Object.keys(m.cols).map((n) => [n, true]));
+  if (select !== undefined && !isObject(select))
+    fail("select must be an object");
+  if (include !== undefined && !isObject(include)) {
+    fail("include must be an object");
+  }
   const cols: string[] = [];
-  const relations: Array<[string, any]> = [];
+  const relations: Array<[string, Args]> = [];
+  const relate = (name: string, on: unknown) => {
+    if (!isObject(on) || Object.keys(on).join() !== "select") {
+      fail(`${m.name}.${name}: a relation takes only { select }`);
+    }
+    pick(m.relations[name]!.target, (on as Args).select);
+    relations.push([name, on as Args]);
+  };
+  const all = Object.fromEntries(Object.keys(m.cols).map((n) => [n, true]));
   for (const [name, on] of Object.entries(select ?? all)) {
-    if (!on) continue;
-    if (m.cols[name]) cols.push(name);
-    else if (m.relations[name]) relations.push([name, on]);
+    if (on === undefined || on === false) continue;
+    if (m.relations[name]) relate(name, on);
+    else if (on !== true) fail(`select "${name}" must be true or false`);
+    else if (m.cols[name]) cols.push(name);
     else fail(`${m.name} has no field "${name}"`);
+  }
+  if (cols.length + relations.length === 0) {
+    fail(`${m.name}: select needs a field`);
   }
   for (const [name, on] of Object.entries(include ?? {})) {
     if (!m.relations[name]) fail(`${m.name} has no relation "${name}"`);
-    if (on) relations.push([name, on]);
+    if (on !== undefined && on !== false) relate(name, on);
   }
   return { cols, relations };
 }
@@ -466,7 +600,6 @@ function pick(m: Model, select?: Args, include?: Args) {
 const FIND = ["where", "select", "include", "orderBy", "take"];
 
 async function read(x: Executor, m: Model, args: Args, one = false) {
-  check("find", args, FIND);
   const { cols, relations } = pick(m, args.select, args.include);
   const need = [
     ...new Set([
@@ -477,8 +610,8 @@ async function read(x: Executor, m: Model, args: Args, one = false) {
   const q = new Sql().t(
     `SELECT ${need.map((n) => `t0.${quote(n)}`).join(", ")} FROM ${quote(m.table)} t0 WHERE `,
   );
-  where(q, m, args.where, "t0", 0);
-  orderBy(q, m, args.orderBy);
+  filtered(q, m, args.where);
+  orderBy(q, m, args.orderBy, !one && args.take !== undefined);
   const take = one ? 1 : args.take;
   if (take !== undefined) {
     if (!Number.isInteger(take) || take < 0) fail("take must be 0 or more");
@@ -498,18 +631,15 @@ async function attach(
   m: Model,
   rows: Row[],
   name: string,
-  on: any,
+  on: Args,
 ) {
   const relation = m.relations[name]!;
   const local = relation.on.localFields[0]!;
   const target = relation.on.targetFields[0]!;
-  if (on !== true && !(isObject(on) && Object.keys(on).join() === "select")) {
-    fail(`${m.name}.${name}: only true or { select } is supported`);
-  }
-  const own = on === true ? undefined : on.select;
+  const keys = rows.map((r) => r[local]).filter((key) => key !== null);
   const children = await read(x, relation.target, {
-    where: { [target]: { in: [...new Set(rows.map((r) => r[local]))] } },
-    ...(own ? { select: { ...own, [target]: true } } : {}),
+    where: { [target]: { in: [...new Set(keys)] } },
+    select: { ...on.select, [target]: true },
   });
   const byKey = new Map<unknown, Row[]>();
   for (const child of children) {
@@ -519,11 +649,12 @@ async function attach(
     const mine = byKey.get(row[local]) ?? [];
     row[name] = relation.cardinality === "1:N" ? mine : (mine[0] ?? null);
   }
-  if (own && !own[target]) for (const child of children) delete child[target];
+  if (!on.select[target]) for (const child of children) delete child[target];
 }
 
 function insert(m: Model, data: Row[]): Sql {
   const rows = data.map((d) => {
+    if (!isObject(d)) fail(`${m.name}: a row to create must be an object`);
     const row = { ...d };
     for (const [field, id] of Object.entries(m.onCreate)) {
       if (row[field] === undefined) row[field] = generate(id);
@@ -551,25 +682,33 @@ function insert(m: Model, data: Row[]): Sql {
   return q;
 }
 
+/** The columns `data` changes: undefined leaves a column alone. */
+function changes(data: unknown): Array<[string, unknown]> {
+  if (!isObject(data)) fail("data must be an object");
+  return Object.entries(data as Args).filter(([, v]) => v !== undefined);
+}
+
 /** `a = v, b = b + n`: plain values, `{ set }`, `{ increment }` and `{ decrement }`, plus `updatedAt`. */
 function assignments(q: Sql, m: Model, data: Args) {
-  const entries = Object.entries(data).filter(([, v]) => v !== undefined);
+  const entries = changes(data);
   for (const [field, id] of Object.entries(m.onUpdate)) {
     if (data[field] === undefined) entries.push([field, generate(id)]);
   }
-  if (entries.length === 0) fail("an update needs data");
   entries.forEach(([name, value], i) => {
     const c = column(m, name);
     q.t(`${i ? ", " : ""}${quote(name)} = `);
     if (c.codecId === JSONB || !isObject(value)) return bind(q, c, value);
-    const [op, operand] = Object.entries(value)[0] ?? [];
+    const [[op, operand] = []] = Object.entries(value);
+    const numeric = c.codecId === INT4 || c.codecId === FLOAT8;
     if (
       Object.keys(value).length !== 1 ||
-      !["set", "increment", "decrement"].includes(op!)
+      operand === undefined ||
+      !(op === "set" || (numeric && /^(in|de)crement$/.test(op!)))
     ) {
-      fail(`${m.name}.${name}: unsupported update ${JSON.stringify(value)}`);
+      fail(`${m.name}.${name}: unsupported update`);
     }
     if (op !== "set") {
+      accept(c, operand);
       q.t(`t0.${quote(name)} ${op === "increment" ? "+" : "-"} `);
     }
     bind(q, c, operand);
@@ -598,26 +737,34 @@ async function aggregate(x: Executor, m: Model, a: Args, by: string[] = []) {
   }));
   const add = (group: string, field: string, sql: string, codec: string) =>
     parts.push({ group, field, sql, codec, alias: `a${parts.length}` });
-  if (a._count) {
-    if (!isObject(a._count) || Object.keys(a._count).join() !== "_all") {
+  if (a._count !== undefined) {
+    if (
+      !isObject(a._count) ||
+      Object.keys(a._count).join() !== "_all" ||
+      a._count._all !== true
+    ) {
       fail("_count supports only { _all: true }");
     }
     add("_count", "_all", "count(*)", INT8);
   }
   for (const group of ["_min", "_max"]) {
-    for (const field of Object.keys(a[group] ?? {})) {
-      add(
-        group,
-        field,
-        `${group.slice(1)}(t0.${quote(field)})`,
-        codecOf(column(m, field)),
-      );
+    const fields = Object.entries(a[group] ?? {});
+    if (a[group] !== undefined && fields.length === 0) {
+      fail(`${group} needs a column`);
+    }
+    for (const [field, on] of fields) {
+      const c = column(m, field);
+      if (on !== true || c.codecId === JSONB) {
+        fail(`${group} "${field}" is not supported`);
+      }
+      add(group, field, `${group.slice(1)}(t0.${quote(field)})`, codecOf(c));
     }
   }
+  if (parts.length === 0) fail("an aggregate needs something to compute");
   const q = new Sql().t(
     `SELECT ${parts.map((p) => `${p.sql} AS ${quote(p.alias)}`).join(", ")} FROM ${quote(m.table)} t0 WHERE `,
   );
-  where(q, m, a.where, "t0", 0);
+  filtered(q, m, a.where);
   if (by.length > 0)
     q.t(` GROUP BY ${by.map((f) => `t0.${quote(f)}`).join(", ")}`);
   const spec = Object.fromEntries(parts.map((p) => [p.alias, p.codec]));
@@ -636,24 +783,27 @@ async function aggregate(x: Executor, m: Model, a: Args, by: string[] = []) {
   });
 }
 
+/** Prisma's default `timeout` for `$transaction(fn)`. */
+const DEFAULT_TIMEOUT = 5000;
+
 /**
- * `timeout` as Prisma has it: once it has passed, every further statement
- * fails with P2028, so the callback throws and the transaction rolls back.
+ * `timeout` as Prisma has it: once it has passed, every further statement, and
+ * the end of the callback, fails with P2028, so the transaction rolls back.
+ *
+ * shortcut: a statement running at the deadline, or a callback that never
+ * returns, holds its connection until it ends (6 and 7 reject at the deadline;
+ * neither commits), cancel it once Prisma 8 exposes a way to.
  */
-function within(tx: Executor, timeout?: number): Executor {
-  if (timeout === undefined) return tx;
+function deadline(timeout: number | undefined): () => void {
+  if (timeout === undefined) return () => {};
+  if (typeof timeout !== "number") fail("timeout must be a number");
   const end = Date.now() + timeout;
-  const open = () => {
-    if (Date.now() <= end) return;
+  return () => {
+    if (Date.now() < end) return;
     throw Object.assign(
       new Error(`Transaction already closed: the ${timeout}ms timeout passed.`),
       { code: "P2028" },
     );
-  };
-  return {
-    raw: tx.raw,
-    query: (plan) => (open(), tx.query(plan)),
-    execute: (plan) => (open(), tx.execute(plan)),
   };
 }
 
@@ -707,22 +857,36 @@ function delegate(x: Executor, m: Model) {
   // UPDATE and DELETE are aliased `t0`, like a read, so `where` is shared.
   const head = (verb: string, tail = "") =>
     new Sql().t(`${verb} ${quote(m.table)} AS t0${tail}`);
-  const filter = (q: Sql, w: Args | undefined) => {
+  const filter = (q: Sql, w: unknown) => {
     q.t(" WHERE ");
-    where(q, m, w, "t0", 0);
+    filtered(q, m, w);
     return q;
+  };
+  // Compiled apart from running, so `upsert` rejects bad arguments before any
+  // SQL. With nothing to change it only reads: as on 6 and 7, `updatedAt` stays.
+  const updateOne = (w: Args, data: Args, select?: Args) => {
+    if (changes(data).length === 0) {
+      return (e: Executor) => read(e, m, { where: w, select }, true);
+    }
+    const q = head("UPDATE", " SET ");
+    assignments(q, m, data);
+    const columns = returning(filter(q, w), m, select);
+    return (e: Executor) => rowsOf(e, q, columns);
   };
   return {
     findMany: op("findMany", FIND, (e, a) => read(e, m, a)),
-    findFirst: op(
-      "findFirst",
-      FIND,
-      async (e, a) => (await read(e, m, a, true))[0] ?? null,
-    ),
+    findFirst: op("findFirst", FIND, async (e, a) => {
+      if (a.take !== undefined && a.take !== 1) {
+        fail("findFirst does not support a take other than 1");
+      }
+      return (await read(e, m, a, true))[0] ?? null;
+    }),
     findUnique: op(
       "findUnique",
-      FIND,
-      async (e, a) => (await read(e, m, a, true))[0] ?? null,
+      ["where", "select", "include"],
+      async (e, a) =>
+        (await read(e, m, { ...a, ...uniqueWhere(m, a.where) }, true))[0] ??
+        null,
     ),
     create: op("create", ["data"], async (e, a) => {
       const q = insert(m, [a.data]);
@@ -730,33 +894,64 @@ function delegate(x: Executor, m: Model) {
       return row;
     }),
     createMany: op("createMany", ["data", "skipDuplicates"], async (e, a) => {
+      if (!Array.isArray(a.data)) fail("createMany takes an array of rows");
       if (a.data.length === 0) return { count: 0 };
       const q = insert(m, a.data);
       if (a.skipDuplicates) q.t(" ON CONFLICT DO NOTHING");
       return { count: await affected(e, q) };
     }),
-    update: op("update", ["where", "data", "select"], (e, a) => {
-      const q = head("UPDATE", " SET ");
-      assignments(q, m, a.data);
-      return mustChange(e, filter(q, a.where), a.select);
+    update: op("update", ["where", "data", "select"], async (e, a) => {
+      const run = updateOne(uniqueWhere(m, a.where).where, a.data, a.select);
+      const [row] = await run(e);
+      if (!row) throw notFound();
+      return row;
     }),
     updateMany: op("updateMany", ["where", "data"], async (e, a) => {
+      // 6 counts no rows here and 7 the rows matched, so neither can be matched.
+      if (changes(a.data).length === 0) fail("updateMany needs data");
       const q = head("UPDATE", " SET ");
       assignments(q, m, a.data);
       return { count: await affected(e, filter(q, a.where)) };
     }),
-    upsert: op("upsert", ["where", "create", "update", "select"], (e, a) => {
-      const [key, ...more] = Object.keys(a.where);
-      const target = m.keys.get(key!) ?? (m.cols[key!] ? [key!] : undefined);
-      if (!target || more.length > 0)
-        fail(`${m.name}: upsert needs one unique key`);
-      const q = insert(m, [a.create]);
-      q.t(` ON CONFLICT (${target!.map(quote).join(", ")}) DO UPDATE SET `);
-      assignments(q, m, a.update);
-      return mustChange(e, q, a.select);
-    }),
+    upsert: op(
+      "upsert",
+      ["where", "create", "update", "select"],
+      async (e, a) => {
+        const { where: flat, keys } = uniqueWhere(m, a.where);
+        const key = keys[0]!;
+        if (
+          keys.length > 1 ||
+          Object.keys(flat).length !== Object.keys(key).length
+        ) {
+          fail(`${m.name}: upsert takes one unique key and no other filter`);
+        }
+        const names = Object.keys(key);
+        const insertion = insert(m, [a.create]);
+        if (
+          changes(a.update).length > 0 &&
+          names.every((n) => a.create[n] === key[n])
+        ) {
+          // Atomic, which concurrent upserts of one key depend on.
+          insertion.t(
+            ` ON CONFLICT (${names.map(quote).join(", ")}) DO UPDATE SET `,
+          );
+          assignments(insertion, m, a.update);
+          return mustChange(e, insertion, a.select);
+        }
+        // As on 6 and 7: `where` picks the row, `create` is the row to add if
+        // there is none, and losing a race to add it is a unique violation.
+        const run = updateOne(flat, a.update, a.select);
+        const columns = returning(insertion, m, a.select);
+        const [row] = await run(e);
+        return row ?? (await rowsOf(e, insertion, columns))[0];
+      },
+    ),
     delete: op("delete", ["where", "select"], (e, a) =>
-      mustChange(e, filter(head("DELETE FROM"), a.where), a.select),
+      mustChange(
+        e,
+        filter(head("DELETE FROM"), uniqueWhere(m, a.where).where),
+        a.select,
+      ),
     ),
     deleteMany: op("deleteMany", ["where"], async (e, a) => ({
       count: await affected(e, filter(head("DELETE FROM"), a.where)),
@@ -765,7 +960,7 @@ function delegate(x: Executor, m: Model) {
       const q = new Sql().t(
         `SELECT count(*) AS n FROM ${quote(m.table)} t0 WHERE `,
       );
-      where(q, m, a.where, "t0", 0);
+      filtered(q, m, a.where);
       const [row] = await rowsOf(e, q, { n: INT8 });
       return Number(row!.n);
     }),
@@ -774,8 +969,15 @@ function delegate(x: Executor, m: Model) {
       ["where", "_count", "_min", "_max"],
       async (e, a) => (await aggregate(e, m, a))[0],
     ),
-    groupBy: op("groupBy", ["by", "where", "_count", "_min", "_max"], (e, a) =>
-      aggregate(e, m, a, a.by),
+    groupBy: op(
+      "groupBy",
+      ["by", "where", "_count", "_min", "_max"],
+      async (e, a) => {
+        if (!Array.isArray(a.by) || a.by.length === 0) {
+          fail("groupBy needs a list of columns");
+        }
+        return aggregate(e, m, a, a.by);
+      },
     ),
   };
 }
@@ -785,7 +987,8 @@ function delegate(x: Executor, m: Model) {
 // ============================================================================
 
 function describe(contract: Contract): Record<string, Model> {
-  const tables = contract.storage.namespaces.public.entries.table;
+  const { table: tables, native_enum: enums } =
+    contract.storage.namespaces.public.entries;
   const models: Record<string, Model> = {};
   for (const [name, model] of Object.entries(
     contract.domain.namespaces.public.models,
@@ -797,10 +1000,19 @@ function describe(contract: Contract): Record<string, Model> {
     for (const index of table.indexes) {
       if (index.unique) keys.set(index.columns.join("_"), index.columns);
     }
+    for (const unique of table.uniques ?? []) {
+      keys.set(unique.columns.join("_"), unique.columns);
+    }
     models[name] = {
       name,
       table: model.storage.table,
-      cols: table.columns,
+      cols: Object.fromEntries(
+        Object.entries(table.columns).map(([n, c]) => [
+          n,
+          { ...c, members: enums?.[c.typeParams?.typeName ?? ""]?.members },
+        ]),
+      ),
+      primaryKey: table.primaryKey.columns,
       keys,
       relations: {},
       onCreate: {},
@@ -930,8 +1142,16 @@ export function fromPrisma8(
 
     const transaction = async (arg: any, options: Args = {}) => {
       check("$transaction", options, ["isolationLevel", "timeout"]);
+      const callback = typeof arg === "function";
       return (db as Prisma8Db).transaction(async (raw: Executor) => {
-        const tx = within(raw, options.timeout);
+        const open = deadline(
+          options.timeout ?? (callback ? DEFAULT_TIMEOUT : undefined),
+        );
+        const tx: Executor = {
+          raw: raw.raw,
+          query: (plan) => (open(), raw.query(plan)),
+          execute: (plan) => (open(), raw.execute(plan)),
+        };
         if (options.isolationLevel) {
           const level =
             ISOLATION[options.isolationLevel] ??
@@ -941,7 +1161,11 @@ export function fromPrisma8(
             new Sql().t(`SET TRANSACTION ISOLATION LEVEL ${level}`),
           );
         }
-        if (typeof arg === "function") return arg(client(tx, true));
+        if (callback) {
+          const result = await arg(client(tx, true));
+          open();
+          return result;
+        }
         const results: unknown[] = [];
         for (const op of arg) {
           if (!(op instanceof Op))
