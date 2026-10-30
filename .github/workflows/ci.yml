@@ -43,6 +43,13 @@ jobs:
       - name: Type check
         run: pnpm --filter '!workflow-engine-docs' -r typecheck
 
+      # Compiles a Prisma 8 consumer against the packages Build just produced:
+      # every port factory over `fromPrisma8(db)` and over a transaction's `tx`.
+      - name: Type check a Prisma 8 consumer
+        run: |
+          pnpm --filter workflow-engine-prisma-v8 run generate
+          pnpm --filter workflow-engine-prisma-v8 run check:consumer
+
       - name: Test
         run: pnpm test
         env:

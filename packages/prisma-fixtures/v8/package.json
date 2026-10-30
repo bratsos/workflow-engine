@@ -9,10 +9,16 @@
   "scripts": {
     "generate": "prisma contract emit",
     "push": "node scripts/provision.mjs",
-    "schema-diff": "node scripts/schema-diff.mjs"
+    "schema-diff": "node scripts/schema-diff.mjs",
+    "check:consumer": "tsc -p consumer-check/tsconfig.json"
   },
   "dependencies": {
     "@prisma/orm-postgres": "8.0.0-rc.21",
     "prisma": "8.0.0-rc.29"
+  },
+  "devDependencies": {
+    "@bratsos/workflow-engine": "workspace:*",
+    "@bratsos/workflow-engine-console": "workspace:*",
+    "typescript": "^5.8.3"
   }
 }
