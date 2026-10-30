@@ -16,8 +16,10 @@
  * string of our own would quietly discard that property, so it is not the
  * default: it requires an explicit acknowledgement.
  */
+import { realpathSync } from "node:fs";
 import { createServer } from "node:http";
-import { pathToFileURL } from "node:url";
+import { resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import type { ConsoleKernel } from "./actions";
 import { createWorkflowConsole } from "./handler";
 import { toNodeHandler } from "./node";
@@ -342,11 +344,25 @@ export async function main(argv: string[]): Promise<number> {
   }
 }
 
+function toRealPath(path: string): string {
+  const resolved = resolve(path);
+  try {
+    return realpathSync(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
+// npm installs the bin as a symlink in node_modules/.bin, so compare real paths.
+export function isInvokedAsBin(metaUrl: string): boolean {
+  const invokedFile = process.argv[1] ? toRealPath(process.argv[1]) : undefined;
+  return Boolean(
+    invokedFile && invokedFile === toRealPath(fileURLToPath(metaUrl)),
+  );
+}
+
 // Only run when invoked as a program, so the exported pieces stay testable.
-if (
-  process.argv[1] &&
-  import.meta.url === pathToFileURL(process.argv[1]).href
-) {
+if (isInvokedAsBin(import.meta.url)) {
   const code = await main(process.argv.slice(2));
   if (code !== 0) process.exit(code);
 }

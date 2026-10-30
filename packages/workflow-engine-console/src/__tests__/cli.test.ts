@@ -1,11 +1,11 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { type AddressInfo, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { assertLoopback, main, parseArgs } from "../cli";
+import { assertLoopback, isInvokedAsBin, main, parseArgs } from "../cli";
 import { createPrismaConsoleReadPort } from "../prisma-read-port";
 import { createPostgresClient } from "./postgres-client";
 
@@ -30,6 +30,28 @@ function captureStdout(): { text: () => string; restore: () => void } {
     });
   return { text: () => buffer, restore: () => spy.mockRestore() };
 }
+
+describe("isInvokedAsBin", () => {
+  it("recognizes the node_modules/.bin symlink npm installs", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "workflow-console-bin-"));
+    const originalArgv = process.argv;
+    try {
+      const real = join(dir, "cli.js");
+      const link = join(dir, "workflow-console");
+      const other = join(dir, "other.js");
+      await writeFile(real, "");
+      await writeFile(other, "");
+      await symlink(real, link);
+
+      process.argv = ["node", link];
+      expect(isInvokedAsBin(pathToFileURL(real).href)).toBe(true);
+      expect(isInvokedAsBin(pathToFileURL(other).href)).toBe(false);
+    } finally {
+      process.argv = originalArgv;
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("parseArgs", () => {
   it("defaults to loopback, read-only, and a 5s poll", () => {
