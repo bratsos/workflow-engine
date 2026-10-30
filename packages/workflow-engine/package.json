@@ -93,7 +93,7 @@
     "sync-models": "tsx src/cli/sync-models.ts",
     "prisma:generate": "pnpm -C ../prisma-fixtures/v${PRISMA_MAJOR:-7} run generate",
     "prisma:db-push": "pnpm -C ../prisma-fixtures/v${PRISMA_MAJOR:-7} run push",
-    "test:pg": "vitest run --no-file-parallelism src/__tests__/12-persistence-adapters/prisma-postgres-conformance.test.ts src/__tests__/12-persistence-adapters/sql-enqueue.test.ts",
+    "test:pg": "vitest run --no-file-parallelism src/__tests__/12-persistence-adapters/prisma-postgres-conformance.test.ts src/__tests__/12-persistence-adapters/sql-enqueue.test.ts src/__tests__/12-persistence-adapters/from-prisma8.test.ts",
     "check:bundle": "node scripts/check-client-isolation.mjs",
     "verify": "pnpm build && pnpm check:bundle && pnpm typecheck && pnpm test"
   },

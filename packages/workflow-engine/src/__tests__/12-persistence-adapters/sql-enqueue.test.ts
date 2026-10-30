@@ -1,5 +1,4 @@
 import { readFile } from "node:fs/promises";
-import { createRequire } from "node:module";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
 import { defineStage } from "../../core/stage-factory.js";
@@ -15,7 +14,11 @@ import {
   createPrismaJobQueue,
   createPrismaWorkflowPersistence,
 } from "../../persistence/prisma/index.js";
-import type { EnginePrismaClient } from "../../persistence/prisma/prisma-client-type.js";
+import {
+  type EnginePrismaClient,
+  rawFor,
+} from "../../persistence/prisma/prisma-client-type.js";
+import { createPostgresClient } from "../utils/postgres-client.js";
 
 /**
  * Typed structurally, like the adapters themselves, so this file typechecks
@@ -35,10 +38,6 @@ if (!DATABASE_URL) {
   });
 } else {
   describe("I want SQL enqueue to agree with run.create", () => {
-    const require = createRequire(import.meta.url);
-    const {
-      createPostgresClient,
-    } = require("../../../../prisma-fixtures/index.cjs");
     const prisma: TestClient = createPostgresClient(DATABASE_URL);
 
     async function truncateAll() {
@@ -125,7 +124,9 @@ if (!DATABASE_URL) {
         input: { value: "hello" },
       });
 
-      const [sqlRow] = await prisma.$queryRawUnsafe<Array<{ id: string }>>(
+      const [sqlRow] = await rawFor(prisma, { id: "text" }).$queryRawUnsafe<
+        Array<{ id: string }>
+      >(
         SELECT_ENQUEUE,
         "sql-1",
         workflow.id,
@@ -176,7 +177,9 @@ if (!DATABASE_URL) {
         input: { value: "hello" },
       });
 
-      const [sqlRow] = await prisma.$queryRawUnsafe<Array<{ id: string }>>(
+      const [sqlRow] = await rawFor(prisma, { id: "text" }).$queryRawUnsafe<
+        Array<{ id: string }>
+      >(
         SELECT_ENQUEUE,
         "sql-1",
         workflow.id,
@@ -265,7 +268,9 @@ if (!DATABASE_URL) {
         input: { value: "world" },
       });
 
-      const [sqlRow] = await prisma.$queryRawUnsafe<Array<{ id: string }>>(
+      const [sqlRow] = await rawFor(prisma, { id: "text" }).$queryRawUnsafe<
+        Array<{ id: string }>
+      >(
         SELECT_ENQUEUE,
         "sql-exec",
         workflow.id,
@@ -309,7 +314,9 @@ if (!DATABASE_URL) {
     });
 
     it("returns the same run id on a replay instead of creating a second run", async () => {
-      const [first] = await prisma.$queryRawUnsafe<Array<{ id: string }>>(
+      const [first] = await rawFor(prisma, { id: "text" }).$queryRawUnsafe<
+        Array<{ id: string }>
+      >(
         SELECT_ENQUEUE,
         "replay-key",
         workflow.id,
@@ -320,7 +327,9 @@ if (!DATABASE_URL) {
         null,
       );
 
-      const [second] = await prisma.$queryRawUnsafe<Array<{ id: string }>>(
+      const [second] = await rawFor(prisma, { id: "text" }).$queryRawUnsafe<
+        Array<{ id: string }>
+      >(
         SELECT_ENQUEUE,
         "replay-key",
         workflow.id,
@@ -337,7 +346,9 @@ if (!DATABASE_URL) {
     });
 
     it("creates the run unpinned when no definition version is given", async () => {
-      const [row] = await prisma.$queryRawUnsafe<Array<{ id: string }>>(
+      const [row] = await rawFor(prisma, { id: "text" }).$queryRawUnsafe<
+        Array<{ id: string }>
+      >(
         SELECT_ENQUEUE,
         "unpinned-key",
         workflow.id,
@@ -366,7 +377,7 @@ if (!DATABASE_URL) {
 
     it("refuses to pin a run to a definition version that was never registered", async () => {
       await expect(
-        prisma.$queryRawUnsafe<Array<{ id: string }>>(
+        rawFor(prisma, { id: "text" }).$queryRawUnsafe<Array<{ id: string }>>(
           SELECT_ENQUEUE,
           "bogus-key",
           workflow.id,

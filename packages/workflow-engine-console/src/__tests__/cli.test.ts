@@ -1,8 +1,13 @@
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { type AddressInfo, createServer } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { assertLoopback, main, parseArgs } from "../cli";
+import { createPrismaConsoleReadPort } from "../prisma-read-port";
+import { createPostgresClient } from "./postgres-client";
 
 function captureStderr(): { text: () => string; restore: () => void } {
   let buffer = "";
@@ -129,7 +134,9 @@ describe("--help", () => {
 
 // The one path that builds its own Prisma client. Prisma 6 takes the URL as
 // `datasources`, Prisma 7 refuses that and needs `@prisma/adapter-pg`.
-// Requires DATABASE_URL and PRISMA_MAJOR (6 or 7, default 7), like the
+// Prisma 8 has no `@prisma/client` and needs a contract, so there the CLI
+// points at `--config` with `fromPrisma8` instead, and that route is tested.
+// Requires DATABASE_URL and PRISMA_MAJOR (6, 7 or 8, default 7), like the
 // Postgres suite; only reads, so it can run beside that suite.
 describe.skipIf(!process.env.DATABASE_URL)(
   "--database-url builds a client for the installed Prisma major",
@@ -178,19 +185,15 @@ describe.skipIf(!process.env.DATABASE_URL)(
       String(port),
     ];
 
-    it("serves reads from the database", async () => {
-      // Prisma 6 must never load the adapter package; Prisma 7 needs it.
-      useFixture(() => {
-        if (major === "6") throw new Error("adapter loaded on Prisma 6");
-        return fixtureRequire("@prisma/adapter-pg");
-      });
-      const port = await freePort();
+    // Starts the console with `args`, reads two routes, and shuts it down.
+    async function expectServesReads(args: string[]) {
       const before = process.listeners("SIGTERM");
       vi.spyOn(process.stdout, "write").mockImplementation(() => true);
-      expect(await main(argv(port))).toBe(0);
+      expect(await main(args)).toBe(0);
       const shutdown = process
         .listeners("SIGTERM")
         .filter((listener) => !before.includes(listener));
+      const port = Number(args[args.indexOf("--port") + 1]);
       try {
         // A time-range filter and the queue counts: raw SQL with a bound
         // timestamp and a bound enum value, on whatever session timezone
@@ -220,7 +223,58 @@ describe.skipIf(!process.env.DATABASE_URL)(
         }
         await exited;
       }
+    }
+
+    it.skipIf(major === "8")("serves reads from the database", async () => {
+      // Prisma 6 must never load the adapter package; Prisma 7 needs it.
+      useFixture(() => {
+        if (major === "6") throw new Error("adapter loaded on Prisma 6");
+        return fixtureRequire("@prisma/adapter-pg");
+      });
+      await expectServesReads(argv(await freePort()));
     });
+
+    it.runIf(major === "8")(
+      "points a Prisma 8 project at --config instead of --database-url",
+      async () => {
+        const stderr = captureStderr();
+        try {
+          expect(await main(argv(await freePort()))).toBe(1);
+          expect(stderr.text()).toMatch(/--config/);
+          expect(stderr.text()).toMatch(/fromPrisma8/);
+        } finally {
+          stderr.restore();
+        }
+      },
+    );
+
+    it.runIf(major === "8")(
+      "serves reads through --config with a fromPrisma8 reader",
+      async () => {
+        const directory = await mkdtemp(join(tmpdir(), "console-config-"));
+        const prisma = createPostgresClient(databaseUrl);
+        const key = "__consoleCliTestReader";
+        (globalThis as Record<string, unknown>)[key] =
+          createPrismaConsoleReadPort(prisma);
+        const config = join(directory, "console.config.mjs");
+        await writeFile(
+          config,
+          `export default { reader: globalThis.${key} };`,
+        );
+        try {
+          await expectServesReads([
+            "--config",
+            config,
+            "--port",
+            String(await freePort()),
+          ]);
+        } finally {
+          delete (globalThis as Record<string, unknown>)[key];
+          await prisma.$disconnect();
+          await rm(directory, { recursive: true, force: true });
+        }
+      },
+    );
 
     it.runIf(major === "7")(
       "names the adapter package to install when Prisma 7 has none",

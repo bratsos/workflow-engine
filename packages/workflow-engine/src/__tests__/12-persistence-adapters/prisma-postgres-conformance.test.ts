@@ -23,7 +23,7 @@
  *
  * Requires:
  *   - DATABASE_URL pointing at a Postgres database
- *   - PRISMA_MAJOR (6 or 7, default 7): the Prisma major under test
+ *   - PRISMA_MAJOR (6, 7 or 8, default 7): the Prisma major under test
  *   - `pnpm --filter @bratsos/workflow-engine run prisma:generate`
  *   - `pnpm --filter @bratsos/workflow-engine run prisma:db-push`
  *
@@ -55,6 +55,7 @@ import {
   createPrismaStepLedger,
   createPrismaWorkflowPersistence,
 } from "../../persistence/prisma/index.js";
+import { rawFor } from "../../persistence/prisma/prisma-client-type.js";
 import {
   isSerializationFailure,
   isUniqueViolation,
@@ -66,6 +67,7 @@ import {
   persistenceConformanceSuite,
   stepLedgerConformanceSuite,
 } from "../../testing/persistence-conformance.js";
+import { createPostgresClient, isPrisma8 } from "../utils/postgres-client.js";
 
 const DATABASE_URL = process.env.DATABASE_URL;
 
@@ -79,10 +81,6 @@ if (!DATABASE_URL) {
     // `@prisma/client` -- which only exists once `prisma:generate` has been run
     // -- is never resolved when this branch isn't taken (i.e. DATABASE_URL is
     // unset). The fixture for the Prisma major in PRISMA_MAJOR builds it.
-    const require = createRequire(import.meta.url);
-    const {
-      createPostgresClient,
-    } = require("../../../../prisma-fixtures/index.cjs");
     const prisma = createPostgresClient(DATABASE_URL);
 
     async function truncateAll() {
@@ -375,7 +373,9 @@ if (!DATABASE_URL) {
               if (result.status === "fulfilled")
                 expect(result.value).toMatchObject(inputs[index]);
             }
-            expect(await tx.$queryRaw`SELECT 1 AS ok`).toEqual([{ ok: 1 }]);
+            expect(
+              await rawFor(tx, { ok: "int" }).$queryRaw`SELECT 1 AS ok`,
+            ).toEqual([{ ok: 1 }]);
           });
           expect(await persistence.getRun(priorId)).toMatchObject({
             id: priorId,
@@ -425,7 +425,9 @@ if (!DATABASE_URL) {
           expect(
             await persistence.getDefinition(input.workflowId, input.version),
           ).toEqual(row);
-          expect(await prisma.$queryRaw`SELECT 1 AS ok`).toEqual([{ ok: 1 }]);
+          expect(
+            await rawFor(prisma, { ok: "int" }).$queryRaw`SELECT 1 AS ok`,
+          ).toEqual([{ ok: 1 }]);
         } finally {
           await prisma.workflowDefinition.deleteMany({
             where: { workflowId: input.workflowId },
@@ -520,7 +522,9 @@ if (!DATABASE_URL) {
           ).rejects.toThrow(
             "Prisma client does not support $executeRaw (required for the insertDefinitionIfAbsent path)",
           );
-          expect(await tx.$queryRaw`SELECT 1 AS ok`).toEqual([{ ok: 1 }]);
+          expect(
+            await rawFor(tx, { ok: "int" }).$queryRaw`SELECT 1 AS ok`,
+          ).toEqual([{ ok: 1 }]);
         });
       });
 
@@ -671,6 +675,39 @@ if (!DATABASE_URL) {
 
         // Nothing left to dequeue.
         expect(await jobQueue.dequeue()).toBeNull();
+      });
+
+      it("hands every pending run to exactly one of many concurrent claimers", async () => {
+        const runs = await Promise.all(
+          Array.from({ length: 12 }, () =>
+            persistence.createRun(createRunData()),
+          ),
+        );
+
+        const claims = await Promise.all(
+          Array.from({ length: 24 }, () => persistence.claimNextPendingRun()),
+        );
+
+        const claimed = claims.flatMap((run) => (run ? [run.id] : []));
+        expect(claimed.sort()).toEqual(runs.map((run) => run.id).sort());
+        expect(await persistence.getRunsByStatus("PENDING")).toHaveLength(0);
+      });
+
+      it("hands every pending job to exactly one of many concurrent dequeuers", async () => {
+        const jobIds = await jobQueue.enqueueParallel(
+          Array.from({ length: 12 }, (_, i) => ({
+            workflowRunId: "many-dequeuers-run",
+            workflowId: "many-dequeuers-workflow",
+            stageId: `stage-${i}`,
+          })),
+        );
+
+        const dequeued = await Promise.all(
+          Array.from({ length: 24 }, () => jobQueue.dequeue()),
+        );
+
+        const claimed = dequeued.flatMap((job) => (job ? [job.jobId] : []));
+        expect(claimed.sort()).toEqual([...jobIds].sort());
       });
     });
 
@@ -1013,7 +1050,7 @@ if (!DATABASE_URL) {
         const error = await caught(() =>
           prisma.$transaction(async (tx: typeof prisma) => {
             await tx.$executeRawUnsafe("SET LOCAL statement_timeout = 20");
-            await tx.$queryRawUnsafe("SELECT pg_sleep(2)");
+            await rawFor(tx, {}).$queryRawUnsafe("SELECT pg_sleep(2)");
           }),
         );
         expect(sqlStateOf(error)).toBe("57014");
@@ -1039,7 +1076,9 @@ if (!DATABASE_URL) {
       });
 
       it("runs its statements on a session that is not on UTC", async () => {
-        const rows = (await tzPrisma.$queryRawUnsafe(
+        const rows = (await rawFor(tzPrisma, {
+          tz: "text",
+        }).$queryRawUnsafe(
           `SELECT current_setting('TimeZone') AS tz`,
         )) as Array<{ tz: string }>;
         expect(rows[0]?.tz).toBe("Pacific/Kiritimati");
@@ -1328,7 +1367,8 @@ if (!DATABASE_URL) {
 
 // The fixture generates a separate, minimal SQLite client without changing the
 // shipped schema or replacing the Postgres client used by the suites above.
-describe("definition registration on real SQLite", () => {
+// Prisma 8 is Postgres-only, so there is no SQLite client to test there.
+describe.skipIf(isPrisma8)("definition registration on real SQLite", () => {
   const require = createRequire(import.meta.url);
   let directory: string;
   let prisma: any;
