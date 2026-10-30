@@ -796,23 +796,52 @@ async function aggregate(x: Executor, m: Model, a: Args, by: string[] = []) {
 const DEFAULT_TIMEOUT = 5000;
 
 /**
- * `timeout` as Prisma has it: once it has passed, every further statement, and
- * the end of the callback, fails with P2028, so the transaction rolls back.
+ * `timeout` as Prisma has it: a callback not settled by then rejects with
+ * P2028, so the transaction rolls back and frees its connection, and every
+ * further statement on its `tx` fails with P2028 too. 6 and 7 keep the caller
+ * waiting for the callback, so one that fails after the deadline gives its own
+ * error there and P2028 here.
  *
- * shortcut: a statement running at the deadline, or a callback that never
- * returns, holds its connection until it ends (6 and 7 reject at the deadline;
- * neither commits), cancel it once Prisma 8 exposes a way to.
+ * A statement running at the deadline holds its connection until it ends, and
+ * the caller settles then: measured the same on 6, 7 and 8.
  */
-function deadline(timeout: number | undefined): () => void {
-  if (timeout === undefined) return () => {};
+function deadline(timeout: number | undefined) {
+  if (timeout === undefined) {
+    return { check() {}, race: <T>(work: Promise<T>) => work };
+  }
   if (typeof timeout !== "number") fail("timeout must be a number");
   const end = Date.now() + timeout;
-  return () => {
-    if (Date.now() < end) return;
-    throw Object.assign(
+  // Set when the timer fires, so nothing slips through on clock rounding once
+  // the rollback has begun.
+  let closed = false;
+  const expired = () => {
+    closed = true;
+    return Object.assign(
       new Error(`Transaction already closed: the ${timeout}ms timeout passed.`),
       { code: "P2028" },
     );
+  };
+  return {
+    check() {
+      if (closed || Date.now() >= end) throw expired();
+    },
+    async race<T>(work: Promise<T>): Promise<T> {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        // `work` losing is handled by the race: no unhandled rejection.
+        return await Promise.race([
+          work,
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(
+              () => reject(expired()),
+              Math.max(0, end - Date.now()),
+            );
+          }),
+        ]);
+      } finally {
+        clearTimeout(timer);
+      }
+    },
   };
 }
 
@@ -1158,30 +1187,34 @@ export function fromPrisma8(
         );
         const tx: Executor = {
           raw: raw.raw,
-          query: (plan) => (open(), raw.query(plan)),
-          execute: (plan) => (open(), raw.execute(plan)),
+          query: (plan) => (open.check(), raw.query(plan)),
+          execute: (plan) => (open.check(), raw.execute(plan)),
         };
-        if (options.isolationLevel) {
-          const level =
-            ISOLATION[options.isolationLevel] ??
-            fail(`unknown isolation level "${options.isolationLevel}"`);
-          await affected(
-            raw,
-            new Sql().t(`SET TRANSACTION ISOLATION LEVEL ${level}`),
-          );
-        }
-        if (callback) {
-          const result = await arg(client(tx, true));
-          open();
-          return result;
-        }
-        const results: unknown[] = [];
-        for (const op of arg) {
-          if (!(op instanceof Op))
-            fail("$transaction([...]) takes delegate calls only");
-          results.push(await op.exec(tx));
-        }
-        return results;
+        return open.race(
+          (async () => {
+            if (options.isolationLevel) {
+              const level =
+                ISOLATION[options.isolationLevel] ??
+                fail(`unknown isolation level "${options.isolationLevel}"`);
+              await affected(
+                raw,
+                new Sql().t(`SET TRANSACTION ISOLATION LEVEL ${level}`),
+              );
+            }
+            if (callback) {
+              const result = await arg(client(tx, true));
+              open.check();
+              return result;
+            }
+            const results: unknown[] = [];
+            for (const op of arg) {
+              if (!(op instanceof Op))
+                fail("$transaction([...]) takes delegate calls only");
+              results.push(await op.exec(tx));
+            }
+            return results;
+          })(),
+        );
       });
     };
 

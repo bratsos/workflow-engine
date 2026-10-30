@@ -3699,7 +3699,27 @@ if (!DATABASE_URL) {
           10_000,
         );
 
-        it("lets a callback's own error through past the timeout", async () => {
+        it("lets a callback's own error through inside the timeout", async () => {
+          await expect(
+            prisma.$transaction(
+              async (tx: any) => {
+                await tx.workflowBlob.update({
+                  where: { key: "x" },
+                  data: { data: 5 },
+                });
+                await sleep(5);
+                throw new Error("mine");
+              },
+              { timeout: 2000 },
+            ),
+          ).rejects.toThrow("mine");
+          expect(await value()).toBe(1);
+        });
+
+        // 6 and 7 keep the caller waiting for the callback, so a late error is
+        // the callback's own; 8 rejects at the deadline, which is what frees
+        // the connection of a callback that never settles.
+        it("rolls back a callback that fails after the timeout", async () => {
           await expect(
             prisma.$transaction(
               async (tx: any) => {
@@ -3712,8 +3732,79 @@ if (!DATABASE_URL) {
               },
               { timeout: 20 },
             ),
-          ).rejects.toThrow("mine");
+          ).rejects.toThrow(isPrisma8 ? "Transaction already closed" : "mine");
           expect(await value()).toBe(1);
+        });
+
+        it("frees the connection of a callback that never settles", async () => {
+          const own = createPostgresClient(DATABASE_URL);
+          try {
+            // More than the default pool of 10 holds.
+            for (let i = 0; i < 12; i++) {
+              void own
+                .$transaction(
+                  async (tx: any) => {
+                    await tx.workflowBlob.count();
+                    await new Promise(() => {});
+                  },
+                  { timeout: 100 },
+                )
+                .catch(() => {});
+            }
+            await sleep(500);
+            expect(
+              await Promise.race([
+                own.workflowBlob.count(),
+                sleep(2000).then(() => "hung"),
+              ]),
+            ).toBe(2);
+          } finally {
+            await own.$disconnect();
+          }
+        }, 10_000);
+
+        it("fails every statement after the timeout, and leaves nothing unhandled", async () => {
+          const unhandled: unknown[] = [];
+          const onUnhandled = (reason: unknown) => unhandled.push(reason);
+          process.on("unhandledRejection", onUnhandled);
+          try {
+            const codes: unknown[] = [];
+            await prisma
+              .$transaction(
+                async (tx: any) => {
+                  await sleep(100);
+                  for (let i = 0; i < 3; i++) {
+                    await tx.workflowBlob
+                      .update({ where: { key: "x" }, data: { data: 5 } })
+                      .catch((e: any) => codes.push(e.code));
+                    await tx
+                      .$executeRawUnsafe(`SELECT 1`)
+                      .catch((e: any) => codes.push(e.code));
+                  }
+                  throw new Error("late");
+                },
+                { timeout: 20 },
+              )
+              .catch(() => {});
+            await sleep(300);
+            expect(codes).toEqual(Array(6).fill("P2028"));
+            expect(unhandled).toEqual([]);
+            expect(await value()).toBe(1);
+          } finally {
+            process.off("unhandledRejection", onUnhandled);
+          }
+        });
+
+        it("leaves no timer behind", async () => {
+          const timers = () =>
+            process.getActiveResourcesInfo().filter((r) => r === "Timeout")
+              .length;
+          await prisma.$transaction((tx: any) => tx.workflowBlob.count());
+          const before = timers();
+          for (let i = 0; i < 200; i++) {
+            await prisma.$transaction((tx: any) => tx.workflowBlob.count());
+          }
+          expect(timers()).toBeLessThanOrEqual(before);
         });
 
         it("commits inside the timeout", async () => {
