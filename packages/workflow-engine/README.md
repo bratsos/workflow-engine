@@ -1,7 +1,7 @@
 # @bratsos/workflow-engine
 
 A TypeScript library that runs durable, multi-stage workflows in **your own
-Postgres**. No server, no vendor: hand it a Prisma client and run it from a
+Postgres**. No server, no vendor: hand it a Prisma (6, 7 or 8) client and run it from a
 Node process, a serverless function or a cron trigger. Built for pipelines
 whose expensive steps are model calls — suspend and resume across hours,
 per-call cost accounting, and provider batch endpoints as durable steps.
@@ -74,6 +74,8 @@ What it does not do: no arbitrary DAG or child workflows (pipelines are linear e
 - **TypeScript** >= 5.0.0
 - **Zod** ^4.1.12
 - **PostgreSQL** >= 14 (for Prisma persistence; `sql/enqueue.sql` needs 13+)
+- **Prisma 7** needs Node.js 22.12+ or 24+ with this engine (Prisma 7 rejects Node 23)
+- **Prisma 8** additionally needs Node.js 22.18+, 24.11+ or 26+, TypeScript >= 5.9 and PostgreSQL >= 15
 
 ### Optional Peer Dependencies
 
@@ -84,12 +86,23 @@ npm install @ai-sdk/anthropic
 # For OpenAI Models (native or batch)
 npm install @ai-sdk/openai
 
-# For Prisma persistence (recommended)
+# For Prisma persistence (recommended): Prisma 7 is the default path
 npm install @prisma/client@7 @prisma/adapter-pg@7
 npm install -D prisma@7
 ```
 
-Pin the version: `npx prisma` without a local install now runs Prisma 8, which these commands do not support yet. Prisma 6 also works: use `@6` and skip the adapter.
+The engine supports Prisma 6, 7 and 8. Install `prisma` as a local dependency: `npx prisma` without a local install runs Prisma 8, so a Prisma 6 or 7 project that skips it runs the wrong major.
+
+**Prisma 6** takes the same commands with `@6` and no adapter. It receives only security patches until 2026-11-19 ([Prisma's release status](https://www.prisma.io/docs/orm/release-status)), so start new projects on 7.
+
+**Prisma 8** is a release candidate with its own short path. Support is tested against exactly `prisma@8.0.0-rc.29` with `@prisma/orm-postgres@8.0.0-rc.21`; pin both, because the `latest` pair crashed `prisma contract emit`. There is no `@prisma/client`, and it is PostgreSQL-only (SQLite stays on Prisma 6 and 7):
+
+```bash
+npm install --save-exact @prisma/orm-postgres@8.0.0-rc.21
+npm install --save-dev --save-exact prisma@8.0.0-rc.29
+```
+
+Then follow "Prisma 8" under [Database Setup](#1-database-setup) below.
 
 > `@ai-sdk/google` and `@openrouter/ai-sdk-provider` are direct dependencies of `@bratsos/workflow-engine`. OpenRouter models and OpenRouter `:batch` processing need no extra vendor SDK; when `@ai-sdk/anthropic` / `@ai-sdk/openai` is not installed and OpenRouter can batch the model, the batch falls back to OpenRouter with a WARN.
 
@@ -117,7 +130,7 @@ npm install @bratsos/workflow-engine-console
 
 ### 1. Database Setup
 
-The engine requires persistence tables. The package ships the reference schema at `node_modules/@bratsos/workflow-engine/prisma/schema.prisma`; add these models to your Prisma schema:
+The engine requires persistence tables. The package ships the reference schema at `node_modules/@bratsos/workflow-engine/prisma/schema.prisma` for Prisma 6 and 7 (for Prisma 8, its contract: see [Prisma 8](#prisma-8-database-setup) after this section); add these models to your Prisma schema (in a project with no schema yet, copy the whole file: it carries the `generator` and `datasource` blocks too):
 
 ```prisma
 // schema.prisma
@@ -467,6 +480,39 @@ npx prisma migrate dev --name add-workflow-tables
 npx prisma generate
 ```
 
+Prisma 7 sets the URL in `prisma.config.ts` (`defineConfig({ schema: "prisma/schema.prisma", datasource: { url: env("DATABASE_URL") } })` from `prisma/config`); on Prisma 6 add `url = env("DATABASE_URL")` to the `datasource` block (the shipped schema has none) and skip the config file.
+
+#### Prisma 8 database setup
+
+Prisma 8 has no `schema.prisma`, `generate`, `migrate dev` or `db push`. Copy the shipped contract, emit it, create the tables, then give five indexes their descending order, which a contract cannot express:
+
+```bash
+mkdir -p prisma
+cp node_modules/@bratsos/workflow-engine/prisma/contract.prisma prisma/contract.prisma
+```
+
+```ts
+// prisma.config.ts
+import { defineConfig } from "@prisma/orm-postgres/config";
+import { definePrismaConfig } from "prisma/config";
+
+export default definePrismaConfig({
+  orm: defineConfig({
+    contract: "./prisma/contract.prisma",
+    db: { connection: process.env.DATABASE_URL ?? "" },
+  }),
+});
+```
+
+```bash
+npx prisma contract emit    # writes prisma/contract.json and prisma/contract.d.ts
+npx prisma db init
+psql "$DATABASE_URL" -f node_modules/@bratsos/workflow-engine/prisma/mixed-order-indexes.sql
+npx prisma db verify --strict
+```
+
+Keep the contract's `TimestampString(3)` timestamps and its native `Status` enum: the engine's raw SQL depends on both, and `fromPrisma8` throws at construction when they are missing. Prisma 8 cannot see sort direction, so re-apply `mixed-order-indexes.sql` after anything that recreates one of the five indexes. A database that Prisma 6 or 7 created needs `prisma db sign` instead of `db init` and not the SQL file: its tables do not change. The full guide, including adoption, migrations and the console, is [Prisma Setup](https://github.com/bratsos/workflow-engine/blob/main/apps/docs/docs/persistence/prisma-setup.md#prisma-8).
+
 Upgrading from 0.13? The database checklist in `skills/workflow-engine/migrations/migrate-0.13-to-1.0.md` has the exact SQL (`workflow_steps`, the two `workflow_runs` columns, `workflow_definitions`, the index set above), `CONCURRENTLY` where it matters.
 
 ### 2. Define Your First Stage
@@ -563,6 +609,7 @@ import { PrismaClient } from "@prisma/client";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { documentProcessorWorkflow } from "./workflows/document-processor";
 
+// Prisma 7. Prisma 6: `new PrismaClient()`. Prisma 8: `const prisma = fromPrisma8(db)` (see "Prisma 8 client" below).
 const prisma = new PrismaClient({ adapter: new PrismaPg({ connectionString: process.env.DATABASE_URL }) });
 
 const kernel = createKernel({
@@ -574,6 +621,30 @@ const kernel = createKernel({
   eventSink: myEventSink,                   // EventSink implementation: { emit }
   clock: { now: () => new Date() },
   registry: createWorkflowRegistry([documentProcessorWorkflow]),
+});
+```
+
+#### Prisma 8 client
+
+A Prisma 8 client has no model delegates, so wrap it once with `fromPrisma8` and pass the result wherever the snippet above passes `prisma`:
+
+```typescript
+import postgres from "@prisma/orm-postgres/runtime";
+import { contractFromJson } from "@prisma/orm-postgres/static";
+import { fromPrisma8 } from "@bratsos/workflow-engine";
+import type { Contract } from "./prisma/contract.d";
+import contractJson from "./prisma/contract.json" with { type: "json" };
+
+const db = postgres({
+  contract: contractFromJson<Contract>(contractJson),
+  url: process.env.DATABASE_URL!,
+});
+const prisma = fromPrisma8(db); // every factory above takes it, and so does createPrismaConsoleReadPort
+
+// Inside your own transaction, wrap its tx and pass the contract:
+await db.transaction(async (tx) => {
+  const inTx = fromPrisma8(tx, { contract: db.contract });
+  // createPrismaWorkflowPersistence(inTx), ... commit or roll back with your tx.orm writes
 });
 ```
 
@@ -1307,7 +1378,7 @@ A `ctx.step.run` left `running` by a killed process is held by its step lease un
 
 ### `PrismaClient is not assignable to EnginePrismaClient`
 
-One of the delegates the adapter needs is missing from your generated client — after 1.0, almost always `workflowStep` (and `workflowDefinition`). Add the models from the schema above and re-run `prisma generate`.
+One of the delegates the adapter needs is missing from your generated client — after 1.0, almost always `workflowStep` (and `workflowDefinition`). Add the models from the schema above and re-run `prisma generate`. On Prisma 8 there is no generated client to be incomplete: `fromPrisma8(db)` throws `the contract has no model for the engine table "..."` instead, naming the table to copy from `contract.prisma`; the same call also throws when timestamps are not `TimestampString(3)` or `status` is not the native `Status` enum.
 
 ---
 

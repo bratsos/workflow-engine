@@ -2,7 +2,7 @@
 
 A TypeScript library that runs durable, multi-stage workflows in **your own
 Postgres**. No server to deploy, no vendor: install it, hand it a Prisma
-client, and run it from a Node process, a serverless function or a cron
+(6, 7 or 8) client, and run it from a Node process, a serverless function or a cron
 trigger. Workflow state lives in tables beside your application's tables.
 
 Built for pipelines whose expensive steps are model calls, so what it takes

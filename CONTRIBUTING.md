@@ -6,7 +6,7 @@
 pnpm install
 ```
 
-Requires Node.js >= 22.11 and pnpm (see `packageManager` in `package.json` for the exact version).
+Requires Node.js >= 22.11 (22.18+ for the Prisma 8 fixture) and pnpm (see `packageManager` in `package.json` for the exact version).
 
 ## Everyday commands
 
