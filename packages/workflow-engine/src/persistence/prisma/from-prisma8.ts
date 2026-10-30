@@ -14,8 +14,7 @@
  * A Prisma 8 client has no model delegates, no `$transaction`, no increments
  * and no raw `Date` or array parameters. This wrapper gives it the client
  * surface the adapters call, nothing more: each delegate call is compiled to
- * one SQL statement through the client's raw lane, using the column types in
- * `db.contract`. Every argument shape it accepts behaves as it does on Prisma 6
+ * SQL through the client's raw lane, using the column types in `db.contract`. Every argument shape it accepts behaves as it does on Prisma 6
  * and 7 (see the "argument parity" cases of the Postgres conformance suite);
  * anything else throws before any SQL runs, so it is never ignored or coerced.
  *
@@ -312,7 +311,10 @@ const specOf = (m: Model, names: string[]) =>
 /** The values Prisma takes for each column type; a SQL cast would coerce others. */
 const ACCEPTS: Record<string, (value: any, c: Column) => boolean> = {
   [TEXT]: (v) => typeof v === "string",
-  [INT4]: (v) => Number.isInteger(v) && Math.abs(v) < 2 ** 31,
+  [INT4]: (v) =>
+    Number.isFinite(v) &&
+    Math.trunc(v) >= -(2 ** 31) &&
+    Math.trunc(v) < 2 ** 31,
   [FLOAT8]: (v) => Number.isFinite(v),
   [TIMESTAMP]: (v) => v instanceof Date && !Number.isNaN(v.getTime()),
   [ENUM]: (v, c) => c.members?.includes(v) === true,
@@ -324,13 +326,17 @@ function accept(c: Column, value: unknown, nullable = false): void {
   }
 }
 
+/** 6 and 7 truncate a fractional Int; `retryBackoff` produces them. */
+const int = (c: Column, value: any) =>
+  c.codecId === INT4 && value !== null ? Math.trunc(value) : value;
+
 /** A value written to, or compared with, column `c`. */
 function bind(q: Sql, c: Column, value: unknown): void {
   // A JS null is the JSON value null on a JSON column, as on 6 and 7.
   if (c.codecId === JSONB) q.v(JSON.stringify(value), castOf(c));
   else {
     accept(c, value, c.nullable);
-    q.v(value, castOf(c));
+    q.v(int(c, value), castOf(c));
   }
 }
 
@@ -522,7 +528,10 @@ function operator(q: Sql, c: Column, ref: string, op: string, x: unknown) {
     if (!Array.isArray(x)) fail(`${op} needs an array`);
     for (const item of x as unknown[]) accept(c, item);
     q.t(`${ref} ${op === "in" ? "= ANY" : "<> ALL"}(`)
-      .v(x, `${castOf(c)}[]`)
+      .v(
+        (x as unknown[]).map((item) => int(c, item)),
+        `${castOf(c)}[]`,
+      )
       .t(")");
   } else if (op === "startsWith") {
     accept(c, x);
@@ -614,8 +623,8 @@ async function read(x: Executor, m: Model, args: Args, one = false) {
   orderBy(q, m, args.orderBy, !one && args.take !== undefined);
   const take = one ? 1 : args.take;
   if (take !== undefined) {
-    if (!Number.isInteger(take) || take < 0) fail("take must be 0 or more");
-    q.t(` LIMIT ${take}`);
+    if (!Number.isFinite(take) || take < 0) fail("take must be 0 or more");
+    q.t(` LIMIT ${Math.trunc(take)}`);
   }
   const rows = await rowsOf(x, q, specOf(m, need));
   for (const [name, on] of relations) await attach(x, m, rows, name, on);

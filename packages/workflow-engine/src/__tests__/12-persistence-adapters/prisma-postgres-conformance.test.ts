@@ -988,6 +988,9 @@ if (!DATABASE_URL) {
           "b",
         ],
         ["two operators", { priority: { gte: 2, lt: 4 } }, "b,c"],
+        ["a fractional int", { priority: 1.5 }, "a"],
+        ["a fractional bound", { priority: { lt: 2.5 } }, "a"],
+        ["a fractional list", { priority: { in: [1.5, 2.5] } }, "a,b"],
         ["not null with lt", { startedAt: { not: null, lt: D2 } }, "b"],
         [
           "an undefined operator beside a real one",
@@ -1297,7 +1300,6 @@ if (!DATABASE_URL) {
         ["NOT", { NOT: { id: "a" } }],
         ["a nested not", { definitionVersion: { not: { equals: "x" } } }],
         ["not of nothing", { definitionVersion: { not: {} } }],
-        ["a fractional int", { priority: 1.5 }],
         ["an ISO string for a Date", { startedAt: "2026-01-01T00:00:00.000Z" }],
         [
           "an offset string for a Date",
@@ -1395,6 +1397,7 @@ if (!DATABASE_URL) {
             "a,b,c",
           ],
           ["take: 0", () => runs({}, { take: 0 }), ""],
+          ["a fractional take", () => runs({}, { take: 2.5 }), "a,b"],
           [
             "an undefined take",
             async () => (await runs({}, { take: undefined })).length,
@@ -2168,7 +2171,6 @@ if (!DATABASE_URL) {
                 }),
             ],
             ["a negative take", () => runs({}, { take: -1 })],
-            ["a fractional take", () => runs({}, { take: 1.5 })],
             ["skip", () => runs({}, { skip: 1 })],
             ["cursor", () => runs({}, { cursor: { id: "a" } })],
             ["distinct", () => runs({}, { distinct: ["id"] })],
@@ -2392,6 +2394,33 @@ if (!DATABASE_URL) {
         });
 
         const WRITES: Array<[string, () => Promise<unknown>, unknown]> = [
+          ...(
+            [
+              ["a fractional int", { priority: 562.5 }, 562],
+              ["a negative fractional int", { priority: -5.5 }, -5],
+              ["the smallest int", { priority: -(2 ** 31) }, -(2 ** 31)],
+              [
+                "a fractional { increment }",
+                { priority: { increment: 1.5 } },
+                2,
+              ],
+            ] as Array<[string, Record<string, unknown>, number]>
+          ).map(
+            ([name, data, priority]): [
+              string,
+              () => Promise<unknown>,
+              unknown,
+            ] => [
+              `update with ${name}`,
+              () =>
+                prisma.workflowRun.update({
+                  where: { id: "a" },
+                  data,
+                  select: { priority: true },
+                }),
+              { priority },
+            ],
+          ),
           [
             "update with a matching fence",
             () =>
@@ -3535,14 +3564,6 @@ if (!DATABASE_URL) {
               () => prisma.workflowRun.deleteMany({ limit: 1 }),
             ],
             [
-              "a fractional { increment }",
-              () =>
-                prisma.workflowRun.update({
-                  where: { id: "a" },
-                  data: { priority: { increment: 1.5 } },
-                }),
-            ],
-            [
               "{ multiply }",
               () =>
                 prisma.workflowRun.update({
@@ -3763,6 +3784,29 @@ if (!DATABASE_URL) {
             { stageId: "other", errorMessage: null, version: 1 },
             { stageId: "target", errorMessage: "changed", version: 2 },
           ]);
+        });
+
+        it("updateStage stores the fractional delay a retry backoff produces", async () => {
+          const persistence = createPrismaWorkflowPersistence(prisma);
+          const run = await persistence.createRun({
+            workflowId: "wf",
+            workflowName: "wf",
+            workflowType: "t",
+            input: {},
+          });
+          const stage = await persistence.createStage({
+            workflowRunId: run.id,
+            stageId: "s",
+            stageName: "stage",
+            stageNumber: 1,
+            executionGroup: 1,
+          });
+          await persistence.updateStage(stage.id, { pollInterval: 562.5 });
+          const { pollInterval } = await prisma.workflowStage.findUnique({
+            where: { id: stage.id },
+            select: { pollInterval: true },
+          });
+          expect(pollInterval).toBe(562);
         });
 
         it("the AI call logger's stats treat a prefix as a LIKE pattern", async () => {
