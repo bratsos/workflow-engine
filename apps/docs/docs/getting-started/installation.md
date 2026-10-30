@@ -12,7 +12,9 @@ To install **workflow-engine** and its associated packages, ensure your project 
 * **Node.js** >= 22.11.0 (uses modern JavaScript features and runtime patterns)
 * **TypeScript** >= 5.0.0 (for full type-inference support)
 * **Zod** ^4.1 (peer dependency used for type validation schemas)
-* **PostgreSQL** >= 14 or **SQLite** (for Prisma persistence)
+* **PostgreSQL** >= 14, or **SQLite** (for Prisma persistence; SQLite on Prisma 6 and 7 only)
+* **Prisma 7** needs Node.js 22.12+ or 24+ with this engine (Prisma 7 rejects Node 23)
+* **Prisma 8** additionally needs Node.js 22.18+, 24.11+ or 26+, TypeScript >= 5.9 and PostgreSQL >= 15
 
 ---
 
@@ -70,11 +72,27 @@ npm install @ai-sdk/anthropic
 # For OpenAI Models (native or batch)
 npm install @ai-sdk/openai
 
-# For Prisma-based database persistence (recommended); Prisma 6 or 7
+# For Prisma-based database persistence (recommended): Prisma 7 is the default path
 npm install @prisma/client@7 @prisma/adapter-pg@7
 npm install -D prisma@7
 ```
 
-Pin the version: `npx prisma` without a local install now runs Prisma 8, which these commands do not support yet. Prisma 6 also works: use `@6` and skip the adapter.
+The engine supports Prisma 6, 7 and 8. Install `prisma` as a local dependency: `npx prisma` without a local install runs Prisma 8, so a Prisma 6 or 7 project that skips it runs the wrong major.
 
-> **Note:** `@ai-sdk/google` and `@openrouter/ai-sdk-provider` are direct dependencies of `@bratsos/workflow-engine`; OpenRouter's Batch API is called over plain HTTP and needs no additional SDK. The Prisma adapters never import `@prisma/client` themselves — you pass them the client you generated, so Prisma 7's `prisma-client` generator with a custom `output` works unchanged. The engine also ships its reference schema at `node_modules/@bratsos/workflow-engine/prisma/schema.prisma`; see [Prisma Setup](../persistence/prisma-setup.md).
+**Prisma 6** takes the same commands with `@6` and no adapter. It receives only security patches until 2026-11-19 (Prisma's [release status](https://www.prisma.io/docs/orm/release-status)), so start new projects on 7.
+
+```bash
+npm install @prisma/client@6
+npm install -D prisma@6
+```
+
+**Prisma 8** is a release candidate with its own short path. Support is tested against exactly `prisma@8.0.0-rc.29` with `@prisma/orm-postgres@8.0.0-rc.21`; pin both, because the `latest` pair crashed `prisma contract emit`. There is no `@prisma/client`. It needs Node.js 22.18+, 24.11+ or 26+, TypeScript 5.9+ and PostgreSQL 15+, and is PostgreSQL-only.
+
+```bash
+npm install --save-exact @prisma/orm-postgres@8.0.0-rc.21
+npm install --save-dev --save-exact prisma@8.0.0-rc.29
+```
+
+Then follow [Prisma 8](../persistence/prisma-setup.md#prisma-8) for the contract, the database and the client.
+
+> **Note:** `@ai-sdk/google` and `@openrouter/ai-sdk-provider` are direct dependencies of `@bratsos/workflow-engine`; OpenRouter's Batch API is called over plain HTTP and needs no additional SDK. The Prisma adapters never import `@prisma/client` themselves — you pass them the client you generated, so Prisma 7's `prisma-client` generator with a custom `output` works unchanged. The engine also ships its reference schema at `node_modules/@bratsos/workflow-engine/prisma/schema.prisma` (Prisma 6 and 7) and its Prisma 8 contract at `node_modules/@bratsos/workflow-engine/prisma/contract.prisma`; see [Prisma Setup](../persistence/prisma-setup.md).

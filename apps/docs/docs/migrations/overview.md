@@ -38,6 +38,8 @@ If a version bump introduces a database schema change (like adding a table or mo
    npx prisma generate
    ```
 
+On Prisma 8 there is no `schema.prisma` or generated client: update `prisma/contract.prisma` from the package's `contract.prisma`, run `npx prisma contract emit`, then `npx prisma db update` (or `migration plan` and `db migrate`). Any step that recreates one of the five descending indexes leaves it ascending, so re-run `prisma/mixed-order-indexes.sql` afterwards. See [Prisma 8](../persistence/prisma-setup.md#prisma-8).
+
 ---
 
 ## Available Migration Guides

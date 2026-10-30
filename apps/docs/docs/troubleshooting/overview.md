@@ -101,7 +101,7 @@ This guide covers common issues encountered when running **workflow-engine**, ho
 ### 9. `PrismaClient is not assignable to EnginePrismaClient`
 * **Symptom**: A wall of type errors when passing your Prisma client to `createPrismaWorkflowPersistence`, `createPrismaStepLedger` or `createPrismaJobQueue`.
 * **Cause**: The generated client is missing a delegate the adapter calls — after 1.0, almost always `workflowStep` (the `WorkflowStep` model) or `workflowDefinition`.
-* **Fix**: Add the missing models from [Prisma Setup](../persistence/prisma-setup.md) and re-run `prisma generate`.
+* **Fix**: Add the missing models from [Prisma Setup](../persistence/prisma-setup.md) and re-run `prisma generate`. On Prisma 8 there is no generated client to be incomplete; `fromPrisma8(db)` throws `the contract has no model for the engine table "..."` instead, naming the table to copy from `contract.prisma`. It also throws when a timestamp column is not `TimestampString(3)` or `status` is not the native `Status` enum, each with the fix in the message.
 
 ---
 

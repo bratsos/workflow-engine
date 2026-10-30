@@ -66,6 +66,13 @@ natively, so they call the handler directly. Express, Fastify and bare
 `@bratsos/workflow-engine-console/node`. There is no per-framework adapter
 package, and none is needed.
 
+The reader takes your Prisma client on Prisma 6, 7 or 8. A Prisma 8 client
+has no model delegates, so wrap it first:
+`createPrismaConsoleReadPort(fromPrisma8(db))`, with `fromPrisma8` from
+`@bratsos/workflow-engine/persistence/prisma`. Inside your own transaction,
+pass the `tx` and the contract: `fromPrisma8(tx, { contract: db.contract })`.
+See [Prisma 8](../persistence/prisma-setup.md#prisma-8).
+
 `authorize` is not optional in practice: omit it and every action is
 denied, because a permissive default would leak a tenant's runs to anyone
 who forgot a line of configuration. It runs *after* your authentication —
@@ -139,7 +146,30 @@ what keeps row-level security intact. It binds to loopback only and ships
 no authentication — it is a development tool. Connecting it directly with
 `--database-url` is possible but requires `--allow-direct-connection`,
 which acknowledges that the connection is a second session and will not be
-scoped by your policies.
+scoped by your policies. `--database-url` needs `@prisma/client`, so it works
+on Prisma 6 and 7 only.
+
+On Prisma 8, `--config` is the only route. The module builds the client and
+wraps it with `fromPrisma8`:
+
+```js
+// console.config.mjs
+import postgres from "@prisma/orm-postgres/runtime";
+import { contractFromJson } from "@prisma/orm-postgres/static";
+import { createPrismaConsoleReadPort } from "@bratsos/workflow-engine-console";
+import { fromPrisma8 } from "@bratsos/workflow-engine/persistence/prisma";
+import contractJson from "./prisma/contract.json" with { type: "json" };
+
+const db = postgres({
+  contract: contractFromJson(contractJson),
+  url: process.env.DATABASE_URL,
+});
+
+export default {
+  reader: createPrismaConsoleReadPort(fromPrisma8(db)),
+  dispose: () => db.close(),
+};
+```
 
 ## Finding a run stranded on an old definition version
 
@@ -165,7 +195,9 @@ The console's list views are "newest first, optionally narrowed", paged on
 a `(createdAt, id)` keyset. The reference schema carries the composite
 indexes for exactly those orderings — see
 [Prisma setup](../persistence/prisma-setup.md). Without them the runs list
-sequentially scans `workflow_runs`.
+sequentially scans `workflow_runs`. On Prisma 8 the descending ones come
+from [`mixed-order-indexes.sql`](../persistence/prisma-setup.md#the-mixed-order-indexes),
+because a contract cannot express a sort direction.
 
 There is deliberately no total count and no page numbers: counting a large
 run table is the expensive query the console exists to avoid issuing. A

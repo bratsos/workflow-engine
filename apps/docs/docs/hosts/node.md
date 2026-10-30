@@ -20,7 +20,7 @@ import { createPrismaJobQueue } from "@bratsos/workflow-engine/persistence/prism
 import { PrismaClient } from "@prisma/client";
 import { PrismaPg } from "@prisma/adapter-pg";
 
-const prisma = new PrismaClient({ adapter: new PrismaPg({ connectionString: process.env.DATABASE_URL }) });
+const prisma = new PrismaClient({ adapter: new PrismaPg({ connectionString: process.env.DATABASE_URL }) }); // Prisma 8: fromPrisma8(db)
 const jobTransport = createPrismaJobQueue(prisma);
 
 const kernel = createKernel({
