@@ -426,8 +426,9 @@ Prisma 8 has no `@prisma/client`, no `schema.prisma` and no model delegates. You
 ### Requirements
 
 * **Node.js** 22.18+, 24.11+ or 26+ (Prisma 8's own floor, higher than the engine's 22.11)
-* **TypeScript** 5.9+
+* **TypeScript** 5.9+, with `skipLibCheck: true`: the AI SDK's types import `json-schema`, which ships none
 * **PostgreSQL** 15+
+* **An ES module project**, `"type": "module"` in `package.json`: the generated `migration.ts`, and any `.ts` file you run with `node`, fail without it
 * Prisma 8 is Postgres-only here. SQLite stays on Prisma 6 and 7.
 
 ```bash
@@ -496,7 +497,7 @@ A Prisma 8 contract cannot express a sort direction, so `contract.prisma` declar
 * **Re-apply the file after anything that recreates one of the five indexes**: a `migration plan` or `db update` that changes their columns, or a `DROP INDEX` of your own. The recreated index is ascending. The file is idempotent (`DROP INDEX IF EXISTS`, then `CREATE INDEX`).
 * **If you manage schema changes with `migration plan` and `db migrate`**, put the five statements into the baseline migration instead of running the file by hand, so every environment gets them: plan it with `npx prisma migration plan --from @empty --name baseline`, then in the generated `migration.ts` find each of the five `createIndex` calls by its index name in the SQL file and replace its `columns: [...]` with ``expression: sql`"status", "priority" DESC, "createdAt"` `` (that index's column list from the SQL file). Run the file with `node` to re-emit `ops.json`, then `npx prisma db migrate --advance-ref db`.
 * **Pass `--advance-ref db` to every `db migrate`.** Plain `db migrate` does not record which contract the database is on, so the next `migration plan` fails with `MIGRATION.PLAN_ORIGIN_UNKNOWN`. If you hit that, run one of the two commands the error prints.
-* Check a database with `\d workflow_runs` in `psql`: the five indexes show `DESC`.
+* Check a database in `psql`: `\d workflow_runs` shows four of the indexes with `DESC`, and `\d job_queue` shows the fifth.
 
 `sql/enqueue.sql` (the optional [transactional enqueue](#transactional-enqueue-from-sql-postgresql)) works unchanged against a Prisma 8 database.
 
@@ -560,7 +561,7 @@ await db.transaction(async (tx) => {
 });
 ```
 
-Your writes and the engine's commit or roll back together, as with a Prisma 6 or 7 `$transaction` client. The result has no `$transaction` of its own, like a Prisma 6 or 7 `tx`: nested transactions are not available and `enqueueParallel` throws, exactly as it does there. Call `fromPrisma8(tx, ...)` once per transaction; the contract is checked once per contract object, so it is cheap.
+Your writes and the engine's commit or roll back together, as with a Prisma 6 or 7 `$transaction` client. The result has no `$transaction` of its own, like a Prisma 6 or 7 `tx`: nested transactions are not available, and `enqueue` and `enqueueParallel` throw, exactly as they do there. To enqueue inside your own transaction, use the [SQL function](#transactional-enqueue-from-sql-postgresql). Call `fromPrisma8(tx, ...)` once per transaction; the contract is checked once per contract object, so it is cheap.
 
 #### The console
 
@@ -586,8 +587,11 @@ export default {
 ```
 
 ```bash
+npm install @bratsos/workflow-engine-console
 npx workflow-console --config ./console.config.mjs
 ```
+
+It serves on `http://127.0.0.1:7799`; `--port` changes that.
 
 Prisma 8 drops the columns a raw read does not declare, so every console query declares its columns. If you wrap `fromPrisma8(db)` in an object of your own (to add a `SET LOCAL`, say), forward its `$withColumns` too.
 

@@ -14,7 +14,7 @@ To install **workflow-engine** and its associated packages, ensure your project 
 * **Zod** ^4.1 (peer dependency used for type validation schemas)
 * **PostgreSQL** >= 14, or **SQLite** (for Prisma persistence; SQLite on Prisma 6 and 7 only)
 * **Prisma 7** needs Node.js 22.12+ or 24+ with this engine (Prisma 7 rejects Node 23)
-* **Prisma 8** additionally needs Node.js 22.18+, 24.11+ or 26+, TypeScript >= 5.9 and PostgreSQL >= 15
+* **Prisma 8** additionally needs an ES module project (`"type": "module"`), Node.js 22.18+, 24.11+ or 26+, TypeScript >= 5.9 and PostgreSQL >= 15
 
 ---
 

@@ -974,7 +974,7 @@ Prisma 8 uses a contract and its own client; see the next section.
 
 ## Prisma 8
 
-Release candidate, tested against exactly `prisma@8.0.0-rc.29` with `@prisma/orm-postgres@8.0.0-rc.21` (pin both; the `latest` pair crashed `prisma contract emit`). Requires Node 22.18+/24.11+/26+, TypeScript 5.9+, PostgreSQL 15+. PostgreSQL only. No `@prisma/client`, no `schema.prisma`, no `generate` / `migrate dev` / `db push`.
+Release candidate, tested against exactly `prisma@8.0.0-rc.29` with `@prisma/orm-postgres@8.0.0-rc.21` (pin both; the `latest` pair crashed `prisma contract emit`). Requires an ES module project (`"type": "module"`, or the generated `migration.ts` and `.ts` files run with `node` fail), `skipLibCheck: true` (the AI SDK's types import `json-schema`, which ships none), Node 22.18+/24.11+/26+, TypeScript 5.9+, PostgreSQL 15+. PostgreSQL only. No `@prisma/client`, no `schema.prisma`, no `generate` / `migrate dev` / `db push`.
 
 ```bash
 npm install --save-exact @prisma/orm-postgres@8.0.0-rc.21
@@ -1058,7 +1058,7 @@ await db.transaction(async (tx) => {
 });
 ```
 
-Like a Prisma 6 or 7 `tx`, the result has no `$transaction`: no nested transactions, and `enqueueParallel` throws.
+Like a Prisma 6 or 7 `tx`, the result has no `$transaction`: no nested transactions, and `enqueue` and `enqueueParallel` throw. To enqueue inside the transaction, use `workflow_engine_enqueue`.
 
 **The console.** `workflow-console --database-url` needs `@prisma/client` (Prisma 6 and 7 only). On Prisma 8 give `--config` a `console.config.mjs` that builds the reader with `createPrismaConsoleReadPort(fromPrisma8(db))` and a `dispose: () => db.close()`; see [16-operational-console.md](16-operational-console.md). A reader wrapped around `fromPrisma8(db)` by the consumer must forward `$withColumns`.
 
