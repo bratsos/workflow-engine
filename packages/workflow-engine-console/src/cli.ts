@@ -180,11 +180,40 @@ async function loadConfigModule(path: string): Promise<ConsoleDevConfig> {
 }
 
 /**
+ * The Prisma 7 driver adapter for Postgres. Prisma 7 refuses a bare connection
+ * string and needs one of these, so it is loaded only on 7. When it is not
+ * installed the error names the package to add.
+ */
+async function createPgAdapter(databaseUrl: string): Promise<unknown> {
+  const adapterSpecifier = "@prisma/adapter-pg";
+  const adapterModule: Record<string, unknown> = await import(
+    adapterSpecifier
+  ).catch(() => {
+    throw new Error(
+      "--database-url on Prisma 7 needs @prisma/adapter-pg installed in this project (npm install @prisma/adapter-pg).",
+    );
+  });
+  const PrismaPg = adapterModule.PrismaPg as
+    | (new (config: {
+        connectionString: string;
+      }) => unknown)
+    | undefined;
+  if (!PrismaPg) {
+    throw new Error("@prisma/adapter-pg did not export PrismaPg.");
+  }
+  return new PrismaPg({ connectionString: databaseUrl });
+}
+
+/**
  * The escape hatch: our own Prisma client from a connection string.
  *
  * Deliberately behind an explicit flag. `@prisma/client` is imported
  * dynamically so the package does not depend on it for the mounted path,
  * which is the path that matters.
+ *
+ * The constructor differs by major: Prisma 6 takes the URL as `datasources`,
+ * Prisma 7 takes a driver adapter and rejects `datasources`. The major comes
+ * from the imported module (`Prisma.prismaVersion.client`).
  */
 async function connectDirectly(databaseUrl: string): Promise<ConsoleDevConfig> {
   const { createPrismaConsoleReadPort } = await import("./prisma-read-port");
@@ -209,9 +238,14 @@ async function connectDirectly(databaseUrl: string): Promise<ConsoleDevConfig> {
   if (!PrismaClient) {
     throw new Error("@prisma/client did not export PrismaClient.");
   }
-  const client = new PrismaClient({
-    datasources: { db: { url: databaseUrl } },
-  });
+  const version = (
+    prismaModule.Prisma as { prismaVersion?: { client?: string } } | undefined
+  )?.prismaVersion?.client;
+  const client = new PrismaClient(
+    Number.parseInt(version ?? "", 10) >= 7
+      ? { adapter: await createPgAdapter(databaseUrl) }
+      : { datasources: { db: { url: databaseUrl } } },
+  );
   return {
     reader: createPrismaConsoleReadPort(
       client as unknown as Parameters<typeof createPrismaConsoleReadPort>[0],
