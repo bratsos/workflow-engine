@@ -4,6 +4,13 @@
  *   const db = postgres({ contract, url });
  *   createPrismaWorkflowPersistence(fromPrisma8(db));
  *
+ * Inside your own transaction, pass its `tx` and the contract (a `tx` has
+ * none); your writes and the engine's then commit or roll back together:
+ *
+ *   await db.transaction(async (tx) => {
+ *     createPrismaWorkflowPersistence(fromPrisma8(tx, { contract: db.contract }));
+ *   });
+ *
  * A Prisma 8 client has no model delegates, no `$transaction`, no increments
  * and no raw `Date` or array parameters. This wrapper gives it the client
  * surface the adapters call, nothing more: each delegate call is compiled to
@@ -21,6 +28,7 @@
  * Imports nothing from Prisma, like the rest of the package.
  */
 
+import type { BlobPrismaClient } from "./blob-store";
 import type { EnginePrismaClient, RawColumns } from "./prisma-client-type";
 
 type Row = Record<string, any>;
@@ -74,22 +82,30 @@ interface Contract {
   };
 }
 
-/** The part of a Prisma 8 client (or its transaction context) this uses. */
-interface Executor {
+/** The part of a Prisma 8 client, or of the `tx` of its `transaction()`, this uses. */
+export interface Prisma8Tx {
   raw: { sql: (strings: any, ...values: any[]) => any };
   query(plan: any): { toArray(): Promise<Row[]> };
   execute(plan: any): Promise<{ affectedRows: number }>;
 }
-export interface Prisma8Db extends Executor {
+type Executor = Prisma8Tx;
+export interface Prisma8Db extends Prisma8Tx {
   contract: unknown;
   transaction(fn: (tx: any) => Promise<any>): Promise<any>;
 }
 
-/** What `fromPrisma8` returns: the engine's client, with the raw members required. */
-export type Prisma8Client = EnginePrismaClient & {
+/**
+ * What `fromPrisma8` returns: the engine's client with the raw members
+ * required, so it also fits the console's client type. `workflowBlob` is there
+ * when the contract has the `WorkflowBlob` model, which the blob store needs.
+ */
+export interface Prisma8Client
+  extends Omit<EnginePrismaClient, "$withColumns">,
+    BlobPrismaClient {
   $queryRawUnsafe<T = unknown>(query: string, ...values: any[]): Promise<T>;
   $executeRawUnsafe(query: string, ...values: any[]): Promise<number>;
-};
+  $withColumns(columns: RawColumns): Prisma8Client;
+}
 
 interface Model {
   name: string;
@@ -842,15 +858,38 @@ function validate(models: Record<string, Model>) {
   }
 }
 
-export function fromPrisma8(db: Prisma8Db): Prisma8Client {
-  if (!db?.contract || typeof db.transaction !== "function") {
-    fail("expected a Prisma 8 client from postgres({ contract, url })");
+/** The models of a contract, checked once per contract object. */
+const described = new WeakMap<object, Record<string, Model>>();
+function modelsOf(contract: object): Record<string, Model> {
+  let models = described.get(contract);
+  if (!models) {
+    models = describe(contract as Contract);
+    validate(models);
+    described.set(contract, models);
   }
-  const models = describe(db.contract as Contract);
-  validate(models);
+  return models;
+}
+
+export function fromPrisma8(db: Prisma8Db): Prisma8Client;
+export function fromPrisma8(
+  tx: Prisma8Tx,
+  options: { contract: unknown },
+): Prisma8Client;
+export function fromPrisma8(
+  db: Prisma8Db | Prisma8Tx,
+  options?: { contract: unknown },
+): Prisma8Client {
+  const contract = options?.contract ?? (db as Partial<Prisma8Db>)?.contract;
+  if (typeof contract !== "object" || contract === null) {
+    fail(
+      "expected a Prisma 8 client from postgres({ contract, url }), or a transaction's tx with { contract: db.contract }",
+    );
+  }
+  const models = modelsOf(contract as object);
   const byTable = Object.fromEntries(
     Object.values(models).map((m) => [m.table, m]),
   );
+  const root = typeof (db as Partial<Prisma8Db>).transaction === "function";
   const delegates = new WeakMap<Executor, Record<string, unknown>>();
 
   const client = (
@@ -891,7 +930,7 @@ export function fromPrisma8(db: Prisma8Db): Prisma8Client {
 
     const transaction = async (arg: any, options: Args = {}) => {
       check("$transaction", options, ["isolationLevel", "timeout"]);
-      return db.transaction(async (raw: Executor) => {
+      return (db as Prisma8Db).transaction(async (raw: Executor) => {
         const tx = within(raw, options.timeout);
         if (options.isolationLevel) {
           const level =
@@ -915,7 +954,7 @@ export function fromPrisma8(db: Prisma8Db): Prisma8Client {
 
     return {
       ...delegates.get(x),
-      ...(inTransaction ? {} : { $transaction: transaction }),
+      ...(inTransaction || !root ? {} : { $transaction: transaction }),
       $queryRaw: (strings: TemplateStringsArray, ...values: any[]) =>
         read(template(strings, values)),
       $queryRawUnsafe: (text: string, ...values: any[]) =>
@@ -928,5 +967,5 @@ export function fromPrisma8(db: Prisma8Db): Prisma8Client {
     } as unknown as Prisma8Client;
   };
 
-  return client(db, false);
+  return client(db, !root);
 }

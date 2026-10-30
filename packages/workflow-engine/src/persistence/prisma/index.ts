@@ -16,6 +16,7 @@ export {
   fromPrisma8,
   type Prisma8Client,
   type Prisma8Db,
+  type Prisma8Tx,
 } from "./from-prisma8";
 export {
   createPrismaJobQueue,

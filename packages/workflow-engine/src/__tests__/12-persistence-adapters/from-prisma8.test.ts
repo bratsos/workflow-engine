@@ -432,6 +432,71 @@ describe.skipIf(!DATABASE_URL || !isPrisma8)(
         ).rejects.toThrow(/maxWait/);
       });
 
+      it("builds the ports over a consumer's own tx, so their writes and the engine's commit and roll back together", async () => {
+        const db = createRequire(import.meta.url)(
+          "../../../../prisma-fixtures/index.cjs",
+        ).createPostgresDb(DATABASE_URL);
+        // The consumer's own ORM write, then engine writes of every kind: a
+        // model call, a raw read and write, and a claim.
+        const work = async (tx: any) => {
+          await tx.orm.public.WorkflowLog.create({
+            level: "INFO",
+            message: "mine",
+          });
+          const engine = createPrismaWorkflowPersistence(
+            fromPrisma8(tx, { contract: db.contract }),
+          );
+          const created = await engine.createRun({
+            workflowId: "wf",
+            workflowName: "wf",
+            workflowType: "t",
+            input: {},
+          });
+          await engine.appendOutboxEvents([
+            {
+              workflowRunId: created.id,
+              eventType: "run.started",
+              payload: {},
+              causationId: "c",
+              occurredAt: new Date(),
+            },
+          ]);
+          expect((await engine.claimNextPendingRun())?.id).toBe(created.id);
+          return created.id;
+        };
+        const counts = async () => [
+          await prisma.workflowLog.count(),
+          await prisma.workflowRun.count(),
+          await prisma.outboxEvent.count(),
+        ];
+        try {
+          await expect(
+            db.transaction(async (tx: any) => {
+              await work(tx);
+              throw new Error("stop");
+            }),
+          ).rejects.toThrow("stop");
+          expect(await counts()).toEqual([0, 0, 0]);
+
+          const runId = await db.transaction(work);
+          expect(await counts()).toEqual([1, 1, 1]);
+          expect(
+            await prisma.workflowRun.findUnique({ where: { id: runId } }),
+          ).toMatchObject({
+            status: "RUNNING",
+          });
+        } finally {
+          await db.close();
+        }
+      });
+
+      it("asks for the contract when given a tx without one", () => {
+        const { raw, query, execute } = prisma;
+        expect(() => fromPrisma8({ raw, query, execute } as never)).toThrow(
+          /contract: db\.contract/,
+        );
+      });
+
       it("rolls back when the callback throws", async () => {
         await expect(
           prisma.$transaction(async (tx: any) => {
