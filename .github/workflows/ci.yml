@@ -51,6 +51,13 @@ jobs:
   postgres-conformance:
     runs-on: ubuntu-latest
 
+    strategy:
+      fail-fast: false
+      matrix:
+        # Add "8" here when its fixture lands in packages/prisma-fixtures/v8.
+        prisma-major: ["6", "7"]
+        timezone: ["UTC", "Pacific/Kiritimati"]
+
     services:
       postgres:
         image: postgres:16
@@ -68,6 +75,7 @@ jobs:
 
     env:
       DATABASE_URL: postgresql://postgres:postgres@localhost:5432/workflow_engine_test
+      PRISMA_MAJOR: ${{ matrix.prisma-major }}
 
     steps:
       - name: Checkout
@@ -83,7 +91,14 @@ jobs:
           cache: "pnpm"
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile --filter @bratsos/workflow-engine
+        run: >-
+          pnpm install --frozen-lockfile
+          --filter @bratsos/workflow-engine
+          --filter @bratsos/workflow-engine-console
+          --filter "./packages/prisma-fixtures/*"
+
+      - name: Set the database session timezone
+        run: psql "$DATABASE_URL" -c "ALTER DATABASE workflow_engine_test SET timezone TO '${{ matrix.timezone }}'"
 
       - name: Generate Prisma client
         run: pnpm --filter @bratsos/workflow-engine run prisma:generate
@@ -93,5 +108,10 @@ jobs:
 
       - name: Run Postgres conformance tests
         run: pnpm --filter @bratsos/workflow-engine run test:pg
+        env:
+          NODE_ENV: test
+
+      - name: Run console Postgres tests
+        run: pnpm --filter @bratsos/workflow-engine-console exec vitest run src/__tests__/prisma-read-port.postgres.test.ts
         env:
           NODE_ENV: test

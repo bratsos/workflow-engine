@@ -23,6 +23,7 @@
  *
  * Requires:
  *   - DATABASE_URL pointing at a Postgres database
+ *   - PRISMA_MAJOR (6 or 7, default 7): the Prisma major under test
  *   - `pnpm --filter @bratsos/workflow-engine run prisma:generate`
  *   - `pnpm --filter @bratsos/workflow-engine run prisma:db-push`
  *
@@ -31,8 +32,7 @@
  * for the in-memory equivalents that always run unconditionally).
  */
 
-import { execFileSync } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -70,12 +70,15 @@ if (!DATABASE_URL) {
   });
 } else {
   describe("I want the Prisma adapters to conform against real Postgres", () => {
-    // Required lazily (not as a static ESM import) so that `@prisma/client`
-    // -- which only exists once `prisma generate` has been run -- is never
-    // resolved when this branch isn't taken (i.e. DATABASE_URL is unset).
+    // Required lazily (not as a static ESM import) so that the generated
+    // `@prisma/client` -- which only exists once `prisma:generate` has been run
+    // -- is never resolved when this branch isn't taken (i.e. DATABASE_URL is
+    // unset). The fixture for the Prisma major in PRISMA_MAJOR builds it.
     const require = createRequire(import.meta.url);
-    const { PrismaClient } = require("@prisma/client");
-    const prisma = new PrismaClient({ datasourceUrl: DATABASE_URL });
+    const {
+      createPostgresClient,
+    } = require("../../../../prisma-fixtures/index.cjs");
+    const prisma = createPostgresClient(DATABASE_URL);
 
     async function truncateAll() {
       await prisma.$executeRawUnsafe(
@@ -953,7 +956,7 @@ if (!DATABASE_URL) {
       const tzUrl = new URL(DATABASE_URL);
       tzUrl.searchParams.set("options", "-c timezone=Pacific/Kiritimati");
       tzUrl.searchParams.set("connection_limit", "1");
-      const tzPrisma = new PrismaClient({ datasourceUrl: tzUrl.toString() });
+      const tzPrisma = createPostgresClient(tzUrl.toString());
 
       beforeEach(async () => {
         await truncateAll();
@@ -1206,8 +1209,8 @@ if (!DATABASE_URL) {
   });
 }
 
-// Generate a separate, minimal SQLite client without changing the shipped schema
-// or replacing the Postgres client used by the conformance suites above.
+// The fixture generates a separate, minimal SQLite client without changing the
+// shipped schema or replacing the Postgres client used by the suites above.
 describe("definition registration on real SQLite", () => {
   const require = createRequire(import.meta.url);
   let directory: string;
@@ -1216,40 +1219,10 @@ describe("definition registration on real SQLite", () => {
     directory = await mkdtemp(
       join(tmpdir(), "definition-registration-sqlite-"),
     );
-    const schema = join(directory, "schema.prisma");
-    await writeFile(
-      schema,
-      `
-      generator client {
-        provider = "node '${require.resolve("@prisma/client/generator-build/index.js")}'"
-        output = "${join(directory, "client")}"
-      }
-      datasource db {
-        provider = "sqlite"
-        url = "file:${join(directory, "test.db")}"
-      }
-      model WorkflowDefinition {
-        workflowId String
-        version String
-        createdAt DateTime @default(now())
-        snapshot Json
-        structureHash String
-        @@id([workflowId, version])
-        @@map("workflow_definitions")
-      }
-    `,
-    );
-    const cli = require.resolve("prisma/build/index.js");
-    execFileSync(process.execPath, [cli, "generate", "--schema", schema], {
-      stdio: "pipe",
-    });
-    execFileSync(
-      process.execPath,
-      [cli, "db", "push", "--schema", schema, "--skip-generate"],
-      { stdio: "pipe" },
-    );
-    const { PrismaClient } = require(join(directory, "client"));
-    prisma = new PrismaClient();
+    const {
+      createSqliteClient,
+    } = require("../../../../prisma-fixtures/index.cjs");
+    prisma = createSqliteClient(join(directory, "test.db"));
   }, 30_000);
   afterAll(async () => {
     await prisma?.$disconnect();

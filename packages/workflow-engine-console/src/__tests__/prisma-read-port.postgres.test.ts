@@ -15,6 +15,7 @@
  *
  * Requires:
  *   - DATABASE_URL pointing at a Postgres database
+ *   - PRISMA_MAJOR (6 or 7, default 7): the Prisma major under test
  *   - `pnpm --filter @bratsos/workflow-engine run prisma:generate`
  *   - `pnpm --filter @bratsos/workflow-engine run prisma:db-push`
  *
@@ -37,12 +38,14 @@ if (!DATABASE_URL) {
   });
 } else {
   describe("I want the console read port to work against real Postgres", () => {
-    // Required lazily so `@prisma/client` -- which only exists once
-    // `prisma generate` has run -- is never resolved when this branch is
-    // not taken.
+    // Required lazily so the generated `@prisma/client` -- which only exists
+    // once `prisma:generate` has run -- is never resolved when this branch is
+    // not taken. The fixture for the Prisma major in PRISMA_MAJOR builds it.
     const require = createRequire(import.meta.url);
-    const { PrismaClient } = require("@prisma/client");
-    const prisma = new PrismaClient({ datasourceUrl: DATABASE_URL });
+    const {
+      createPostgresClient,
+    } = require("../../../prisma-fixtures/index.cjs");
+    const prisma = createPostgresClient(DATABASE_URL);
     const client = prisma as ConsolePrismaClient;
 
     const T0 = new Date("2026-03-01T12:00:00.000Z");

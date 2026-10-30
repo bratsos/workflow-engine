@@ -91,8 +91,8 @@
     "build": "tsup",
     "test": "vitest run",
     "sync-models": "tsx src/cli/sync-models.ts",
-    "prisma:generate": "prisma generate --schema ./prisma/schema.prisma",
-    "prisma:db-push": "prisma db push --schema ./prisma/schema.prisma --skip-generate",
+    "prisma:generate": "pnpm -C ../prisma-fixtures/v${PRISMA_MAJOR:-7} run generate",
+    "prisma:db-push": "pnpm -C ../prisma-fixtures/v${PRISMA_MAJOR:-7} run push",
     "test:pg": "vitest run --no-file-parallelism src/__tests__/12-persistence-adapters/prisma-postgres-conformance.test.ts src/__tests__/12-persistence-adapters/sql-enqueue.test.ts",
     "check:bundle": "node scripts/check-client-isolation.mjs",
     "verify": "pnpm build && pnpm check:bundle && pnpm typecheck && pnpm test"
@@ -132,9 +132,7 @@
   "devDependencies": {
     "@ai-sdk/anthropic": "^4.0.62",
     "@ai-sdk/openai": "^4.0.74",
-    "@prisma/client": "^6.0.0",
     "@types/node": "^22",
-    "prisma": "^6.0.0",
     "tsup": "^8.5.1",
     "tsx": "^4.19.0",
     "typescript": "^5.8.3",

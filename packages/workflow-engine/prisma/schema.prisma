@@ -1,10 +1,12 @@
 // Reference Prisma schema for the engine's tables.
 //
 // Shipped in the package ("prisma/" is in the "files" field) so a consumer
-// can copy the models into their own schema or diff theirs against it. It
-// also generates the real `@prisma/client` used by the Postgres conformance
-// suite (see
-// ../src/__tests__/12-persistence-adapters/prisma-postgres-conformance.test.ts).
+// can copy the models into their own schema or diff theirs against it. The
+// Postgres conformance suites generate their `@prisma/client` from it through
+// ../../prisma-fixtures (one fixture per Prisma major).
+//
+// The datasource has no `url`: Prisma 7 and later reject it (the URL lives in
+// `prisma.config.ts`), and the Prisma 6 fixture adds it when it generates.
 //
 // The migration guides under ../skills/workflow-engine/migrations/ derive
 // their SQL from this file; keep them in step when a model changes.
@@ -15,7 +17,6 @@ generator client {
 
 datasource db {
   provider = "postgresql"
-  url      = env("DATABASE_URL")
 }
 
 enum Status {

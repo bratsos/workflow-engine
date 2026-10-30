@@ -30,9 +30,11 @@ bugs. To run them locally:
 
 ```bash
 export DATABASE_URL=postgresql://postgres:postgres@localhost:5432/workflow_engine_test
+export PRISMA_MAJOR=6   # the Prisma major to test: 6 or 7 (default 7); the fixtures live in packages/prisma-fixtures
 pnpm --filter @bratsos/workflow-engine run prisma:generate
 pnpm --filter @bratsos/workflow-engine run prisma:db-push
 pnpm --filter @bratsos/workflow-engine run test:pg
+pnpm --filter @bratsos/workflow-engine-console exec vitest run src/__tests__/prisma-read-port.postgres.test.ts
 ```
 
 ## Package layout

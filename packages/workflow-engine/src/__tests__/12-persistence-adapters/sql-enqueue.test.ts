@@ -36,10 +36,10 @@ if (!DATABASE_URL) {
 } else {
   describe("I want SQL enqueue to agree with run.create", () => {
     const require = createRequire(import.meta.url);
-    const { PrismaClient } = require("@prisma/client");
-    const prisma: TestClient = new PrismaClient({
-      datasourceUrl: DATABASE_URL,
-    });
+    const {
+      createPostgresClient,
+    } = require("../../../../prisma-fixtures/index.cjs");
+    const prisma: TestClient = createPostgresClient(DATABASE_URL);
 
     async function truncateAll() {
       await prisma.$executeRawUnsafe(
