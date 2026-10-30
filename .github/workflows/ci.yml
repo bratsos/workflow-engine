@@ -56,13 +56,6 @@ jobs:
       matrix:
         prisma-major: ["6", "7", "8"]
         timezone: ["UTC", "Pacific/Kiritimati"]
-        # Prisma 8 only provisions a database and diffs its schema against
-        # Prisma 7's for now, which does not depend on the session timezone.
-        # Drop this exclude, and the `!= '8'` conditions below, when the
-        # suites run on Prisma 8.
-        exclude:
-          - prisma-major: "8"
-            timezone: "Pacific/Kiritimati"
 
     services:
       postgres:
@@ -124,13 +117,15 @@ jobs:
             postgresql://postgres:postgres@localhost:5432/workflow_engine_reference "$DATABASE_URL"
 
       - name: Run Postgres conformance tests
-        if: matrix.prisma-major != '8'
         run: pnpm --filter @bratsos/workflow-engine run test:pg
         env:
           NODE_ENV: test
 
+      # cli.test.ts imports the built UI bundle, which the package's own `test`
+      # script builds first.
       - name: Run console Postgres tests
-        if: matrix.prisma-major != '8'
-        run: pnpm --filter @bratsos/workflow-engine-console exec vitest run src/__tests__/prisma-read-port.postgres.test.ts
+        run: |
+          pnpm --filter @bratsos/workflow-engine-console exec node scripts/build-ui.mjs
+          pnpm --filter @bratsos/workflow-engine-console exec vitest run src/__tests__/prisma-read-port.postgres.test.ts src/__tests__/cli.test.ts
         env:
           NODE_ENV: test
