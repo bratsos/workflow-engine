@@ -42,7 +42,149 @@ export interface ConsolePrismaClient {
   $queryRawUnsafe<T = unknown>(query: string, ...values: unknown[]): Promise<T>;
   $executeRawUnsafe?(query: string, ...values: unknown[]): Promise<number>;
   $transaction?<T>(fn: (tx: ConsolePrismaClient) => Promise<T>): Promise<T>;
+  /**
+   * Prisma 8 (`fromPrisma8`): a client whose raw reads return these columns,
+   * since Prisma 8 drops the ones a raw read does not declare.
+   */
+  $withColumns?(columns: RawColumns): ConsolePrismaClient;
 }
+
+type RawType =
+  | "text"
+  | "int"
+  | "bigint"
+  | "float"
+  | "bool"
+  | "json"
+  | "timestamp";
+type RawColumns = Record<string, RawType>;
+
+/** The client to read on: with `columns` declared on Prisma 8, as it is on 6 and 7. */
+function rawFor(client: ConsolePrismaClient, columns: RawColumns) {
+  return client.$withColumns?.(columns) ?? client;
+}
+
+const RUN_COLUMNS: RawColumns = {
+  id: "text",
+  createdAt: "timestamp",
+  updatedAt: "timestamp",
+  workflowId: "text",
+  workflowName: "text",
+  workflowType: "text",
+  status: "text",
+  startedAt: "timestamp",
+  completedAt: "timestamp",
+  duration: "int",
+  totalCost: "float",
+  totalTokens: "int",
+  priority: "int",
+  definitionVersion: "text",
+  redriveCount: "int",
+};
+const RUN_DETAIL_COLUMNS: RawColumns = {
+  ...RUN_COLUMNS,
+  input: "json",
+  output: "json",
+  config: "json",
+  metadata: "json",
+};
+const STAGE_COLUMNS: RawColumns = {
+  id: "text",
+  workflowRunId: "text",
+  stageId: "text",
+  stageName: "text",
+  stageNumber: "int",
+  executionGroup: "int",
+  attempt: "int",
+  status: "text",
+  startedAt: "timestamp",
+  completedAt: "timestamp",
+  duration: "int",
+  nextPollAt: "timestamp",
+  pollInterval: "int",
+  maxWaitUntil: "timestamp",
+  errorMessage: "text",
+};
+const STEP_COLUMNS: RawColumns = {
+  id: "text",
+  stageRecordId: "text",
+  stepId: "text",
+  seq: "int",
+  kind: "text",
+  status: "text",
+  attempt: "int",
+  leaseExpiresAt: "timestamp",
+  deadlineAt: "timestamp",
+  externalKey: "text",
+  error: "text",
+  createdAt: "timestamp",
+  updatedAt: "timestamp",
+};
+const ANNOTATION_COLUMNS: RawColumns = {
+  id: "text",
+  createdAt: "timestamp",
+  workflowRunId: "text",
+  workflowStageRecordId: "text",
+  attempt: "int",
+  scope: "text",
+  scopeId: "text",
+  actorKind: "text",
+  actorId: "text",
+  key: "text",
+  value: "json",
+};
+const LOG_COLUMNS: RawColumns = {
+  id: "text",
+  createdAt: "timestamp",
+  workflowRunId: "text",
+  workflowStageId: "text",
+  level: "text",
+  message: "text",
+};
+const EVENT_COLUMNS: RawColumns = {
+  id: "text",
+  workflowRunId: "text",
+  sequence: "int",
+  eventType: "text",
+  occurredAt: "timestamp",
+  publishedAt: "timestamp",
+  retryCount: "int",
+  dlqAt: "timestamp",
+};
+const SUSPENDED_STAGE_COLUMNS: RawColumns = {
+  id: "text",
+  workflowRunId: "text",
+  workflowId: "text",
+  stageId: "text",
+  stageName: "text",
+  attempt: "int",
+  nextPollAt: "timestamp",
+  pollInterval: "int",
+  maxWaitUntil: "timestamp",
+};
+const DEAD_LETTER_COLUMNS: RawColumns = {
+  id: "text",
+  workflowRunId: "text",
+  sequence: "int",
+  eventType: "text",
+  retryCount: "int",
+  occurredAt: "timestamp",
+  dlqAt: "timestamp",
+};
+const WORKER_COLUMNS: RawColumns = {
+  workerId: "text",
+  running: "bigint",
+  oldest: "timestamp",
+  newest: "timestamp",
+};
+const COST_COLUMNS: RawColumns = {
+  key: "text",
+  runs: "bigint",
+  cost: "float",
+  tokens: "bigint",
+};
+const OLDEST_COLUMNS: RawColumns = { oldest: "timestamp" };
+const COUNT_COLUMNS: RawColumns = { count: "bigint" };
 
 export interface PrismaConsoleReadPortOptions {
   statusEnumName?: string; // default "Status"
@@ -448,10 +590,11 @@ export class PrismaConsoleReadPort implements ConsoleReadPort {
   /** One `SELECT` against whichever client the surrounding `read` gave us. */
   private select<T>(
     client: ConsolePrismaClient,
+    columns: RawColumns,
     sql: string,
     params: unknown[],
   ): Promise<T[]> {
-    return client.$queryRawUnsafe<T[]>(sql, ...params);
+    return rawFor(client, columns).$queryRawUnsafe<T[]>(sql, ...params);
   }
 
   /**
@@ -508,10 +651,13 @@ export class PrismaConsoleReadPort implements ConsoleReadPort {
   /** Convenience for the reads that are a single statement. */
   private query<T>(
     label: string,
+    columns: RawColumns,
     sql: string,
     params: unknown[],
   ): Promise<T[]> {
-    return this.read(label, (client) => this.select<T>(client, sql, params));
+    return this.read(label, (client) =>
+      this.select<T>(client, columns, sql, params),
+    );
   }
 
   async listRuns(query: RunListQuery): Promise<RunListPage> {
@@ -591,7 +737,12 @@ FROM "workflow_runs"${whereClause}
 ORDER BY "createdAt" DESC, id DESC
 LIMIT ${limit + 1}`;
 
-    const rows = await this.query<RawRunRow>("runs.list", sql, params);
+    const rows = await this.query<RawRunRow>(
+      "runs.list",
+      RUN_COLUMNS,
+      sql,
+      params,
+    );
     const hasNextPage = rows.length > limit;
     const returnedRows = hasNextPage ? rows.slice(0, limit) : rows;
     const runs = returnedRows.map(mapRunSummary);
@@ -620,6 +771,7 @@ LIMIT ${limit + 1}`;
     return this.read("run.detail", async (client) => {
       const runRows = await this.select<RawRunDetailRow>(
         client,
+        RUN_DETAIL_COLUMNS,
         `SELECT id, "createdAt", "updatedAt", "workflowId", "workflowName", "workflowType",
        status, "startedAt", "completedAt", duration, "totalCost", "totalTokens", priority,
        "definitionVersion", "redriveCount",
@@ -634,6 +786,7 @@ FROM "workflow_runs" WHERE id = $1`,
 
       const stageRows = await this.select<RawStageRow>(
         client,
+        STAGE_COLUMNS,
         `SELECT id, "workflowRunId", "stageId", "stageName", "stageNumber", "executionGroup",
        attempt, status, "startedAt", "completedAt", duration, "nextPollAt",
        "pollInterval", "maxWaitUntil", "errorMessage"
@@ -644,6 +797,7 @@ ORDER BY "stageNumber" ASC, "stageId" ASC`,
 
       const stepRows = await this.select<RawStepRow>(
         client,
+        STEP_COLUMNS,
         `SELECT s.id, s."stageRecordId", s."stepId", s.seq, s.kind, s.status, s.attempt,
        s."leaseExpiresAt", s."deadlineAt", s."externalKey", s.error, s."createdAt", s."updatedAt"
 FROM "workflow_steps" s
@@ -656,6 +810,7 @@ LIMIT ${stepLimit + 1}`,
 
       const annotationRows = await this.select<RawAnnotationRow>(
         client,
+        ANNOTATION_COLUMNS,
         `SELECT id, "createdAt", "workflowRunId", "workflowStageRecordId", attempt, scope,
        "scopeId", "actorKind", "actorId", key, value
 FROM "workflow_annotations" WHERE "workflowRunId" = $1
@@ -666,6 +821,7 @@ LIMIT ${annotationLimit + 1}`,
 
       const logRows = await this.select<RawLogRow>(
         client,
+        LOG_COLUMNS,
         `SELECT id, "createdAt", "workflowRunId", "workflowStageId", level, message
 FROM "workflow_logs" WHERE "workflowRunId" = $1
 ORDER BY "createdAt" DESC, id DESC
@@ -675,6 +831,7 @@ LIMIT ${logLimit + 1}`,
 
       const eventRows = await this.select<RawEventRow>(
         client,
+        EVENT_COLUMNS,
         `SELECT id, "workflowRunId", sequence, "eventType", "occurredAt", "publishedAt",
        "retryCount", "dlqAt"
 FROM "outbox_events" WHERE "workflowRunId" = $1
@@ -720,6 +877,7 @@ LIMIT ${eventLimit + 1}`,
     const clampedLimit = clampLimit(limit, 200);
     const rows = await this.query<RawEventRow>(
       "run.events.tail",
+      EVENT_COLUMNS,
       `SELECT id, "workflowRunId", sequence, "eventType", "occurredAt", "publishedAt",
        "retryCount", "dlqAt"
 FROM "outbox_events" WHERE "workflowRunId" = $1 AND sequence > $2
@@ -739,21 +897,25 @@ ORDER BY sequence ASC LIMIT ${clampedLimit}`,
       Promise.all([
         this.select<{ status: string; count: unknown }>(
           client,
+          { status: "text", count: "bigint" },
           `SELECT status::text AS status, count(*) AS count FROM "job_queue" GROUP BY status`,
           [],
         ),
         this.select<{ oldest: Date | string | null }>(
           client,
+          OLDEST_COLUMNS,
           `SELECT min("createdAt") AS oldest FROM "job_queue" WHERE status = $1::"${this.statusEnumName}"`,
           ["PENDING"],
         ),
         this.select<{ oldest: Date | string | null }>(
           client,
+          OLDEST_COLUMNS,
           `SELECT min("lockedAt") AS oldest FROM "job_queue" WHERE status = $1::"${this.statusEnumName}" AND "lockedAt" IS NOT NULL`,
           ["RUNNING"],
         ),
         this.select<{ count: unknown }>(
           client,
+          COUNT_COLUMNS,
           `SELECT count(*) AS count FROM "job_queue" WHERE status = $1::"${this.statusEnumName}" AND "nextPollAt" IS NOT NULL AND "nextPollAt" <= ${utcParam(2)}`,
           ["SUSPENDED", this.now().toISOString()],
         ),
@@ -782,6 +944,7 @@ ORDER BY sequence ASC LIMIT ${clampedLimit}`,
     const clampedLimit = clampLimit(limit, 50);
     const rows = await this.query<RawSuspendedStageRow>(
       "stages.suspended",
+      SUSPENDED_STAGE_COLUMNS,
       `SELECT st.id, st."workflowRunId", r."workflowId", st."stageId", st."stageName",
        st.attempt, st."nextPollAt", st."pollInterval", st."maxWaitUntil"
 FROM "workflow_stages" st
@@ -798,6 +961,7 @@ LIMIT ${clampedLimit}`,
     const clampedLimit = clampLimit(limit, 50);
     const rows = await this.query<RawDeadLetterRow>(
       "outbox.deadLetters",
+      DEAD_LETTER_COLUMNS,
       `SELECT id, "workflowRunId", sequence, "eventType", "retryCount", "occurredAt", "dlqAt"
 FROM "outbox_events" WHERE "dlqAt" IS NOT NULL
 ORDER BY "dlqAt" DESC LIMIT ${clampedLimit}`,
@@ -809,6 +973,7 @@ ORDER BY "dlqAt" DESC LIMIT ${clampedLimit}`,
   async listWorkers(): Promise<WorkerInstance[]> {
     const rows = await this.query<RawWorkerRow>(
       "workers.list",
+      WORKER_COLUMNS,
       `SELECT "workerId", count(*) AS running, min("lockedAt") AS oldest, max("lockedAt") AS newest
 FROM "job_queue"
 WHERE status = $1::"${this.statusEnumName}" AND "workerId" IS NOT NULL
@@ -828,6 +993,7 @@ GROUP BY "workerId" ORDER BY "workerId" ASC`,
     if (query.by === "workflow") {
       const rows = await this.query<RawCostRow>(
         "costs.byWorkflow",
+        COST_COLUMNS,
         `SELECT "workflowId" AS key, count(*) AS runs, sum("totalCost") AS cost, sum("totalTokens") AS tokens
 FROM "workflow_runs" WHERE "createdAt" >= ${utcParam(1)} AND "createdAt" < ${utcParam(2)}
 GROUP BY "workflowId" ORDER BY sum("totalCost") DESC`,
@@ -837,6 +1003,7 @@ GROUP BY "workflowId" ORDER BY sum("totalCost") DESC`,
     } else {
       const rows = await this.query<RawCostRow>(
         "costs.byDay",
+        COST_COLUMNS,
         `SELECT to_char(date_trunc('day', "createdAt"), 'YYYY-MM-DD') AS key,
        count(*) AS runs, sum("totalCost") AS cost, sum("totalTokens") AS tokens
 FROM "workflow_runs" WHERE "createdAt" >= ${utcParam(1)} AND "createdAt" < ${utcParam(2)}

@@ -66,8 +66,8 @@ Options
                              or a function returning one. This is the path that
                              preserves row-level security, because your code
                              constructs the client.
-  --database-url <url>       Connect directly with Prisma instead. Requires
-                             --allow-direct-connection.
+  --database-url <url>       Connect directly with Prisma 6 or 7 instead. Requires
+                             --allow-direct-connection. (Prisma 8: use --config.)
   --allow-direct-connection  Acknowledge that a direct connection is a second
                              session and therefore a second security context:
                              row-level security scoped to your application's
@@ -225,7 +225,7 @@ async function connectDirectly(databaseUrl: string): Promise<ConsoleDevConfig> {
     prismaSpecifier
   ).catch(() => {
     throw new Error(
-      "--database-url needs @prisma/client installed in this project.",
+      "--database-url needs @prisma/client installed in this project. Prisma 8 has no @prisma/client and needs a contract, so use --config with a console.config.mjs that builds the reader with createPrismaConsoleReadPort(fromPrisma8(db)).",
     );
   });
   const PrismaClient = prismaModule.PrismaClient as
