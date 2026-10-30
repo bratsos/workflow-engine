@@ -200,7 +200,7 @@ For each migration file, in order:
 
 1. Read the full migration doc.
 2. Surface the **Required actions** section to the user — these are non-optional.
-3. Apply schema changes if the migration includes them (Prisma migrations, etc.) — confirm with the user before running `prisma migrate dev` or equivalent.
+3. Apply schema changes if the migration includes them (Prisma migrations, etc.) — confirm with the user before running `prisma migrate dev` or equivalent. Prisma 8 has no `prisma migrate dev`: use `prisma contract emit` then `prisma db update`, as `references/05-persistence-setup.md` describes.
 4. Apply code changes — usually with grep + edit, occasionally manual review. For the 0.11, 0.12 and 0.13 hops the package ships a codemod: `npx workflow-engine-codemod --from 0.11|0.12|0.13 [--dry-run]` rewrites what it can and flags the rest with a pointer into the guide.
 5. Note any **Deprecations** — these don't break the current version but the user should plan to address them.
 6. Verify by running the project's tests if available.

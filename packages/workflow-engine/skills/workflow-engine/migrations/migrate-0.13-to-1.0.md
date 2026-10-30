@@ -19,6 +19,8 @@ The first real-world runs of the 1.0 alphas also found and fixed behaviour that 
 
 Verified against `git diff` of the package's `prisma/schema.prisma` between 0.13.0 and 1.0.0, plus every column the 1.0 Prisma adapters write. Apply in order; every statement is idempotent on Postgres (`IF NOT EXISTS`).
 
+On Prisma 8 there is no `schema.prisma` or generated client: update `prisma/contract.prisma` from the package's `contract.prisma`, run `npx prisma contract emit`, then `npx prisma db update` (or `migration plan` and `db migrate`). Any step that recreates one of the five descending indexes leaves it ascending, so re-run `prisma/mixed-order-indexes.sql` afterwards. See [Prisma 8](../references/05-persistence-setup.md#prisma-8).
+
 - [ ] **Add the `workflow_steps` table** (new in 1.0; used by `createPrismaStepLedger`).
 
   ```prisma
@@ -161,7 +163,7 @@ Verified against `git diff` of the package's `prisma/schema.prisma` between 0.13
   ALTER TABLE "idempotency_keys"  ADD COLUMN IF NOT EXISTS "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP;
   ```
 
-  The reliable check is a diff: `npx prisma migrate diff --from-schema-datasource prisma/schema.prisma --to-schema-datamodel node_modules/@bratsos/workflow-engine/prisma/schema.prisma --script` prints the SQL that separates your database from the package schema (ignore the differences on your own tables).
+  The reliable check is a diff: `npx prisma migrate diff --from-schema-datasource prisma/schema.prisma --to-schema-datamodel node_modules/@bratsos/workflow-engine/prisma/schema.prisma --script` prints the SQL that separates your database from the package schema (on Prisma 7, which removed those flags: `npx prisma migrate diff --from-config-datasource --to-schema node_modules/@bratsos/workflow-engine/prisma/schema.prisma --script`) (ignore the differences on your own tables).
 
 - [ ] **Optional: add `workflow_blobs` if you want Prisma as the blob store.** Stage outputs and every replay's `ctx.input` are read from the `BlobStore` by *every* process that executes or polls a run (workers, cron ticks, a web process that kicks orchestration), so the store must be shared — an `InMemoryBlobStore` in one of them fails the next process with `Blob "<key>" ... is not in the blob store`. `createPrismaBlobStore(prisma)` keeps blobs in this table so no object storage is needed; it requires only the `workflowBlob` delegate, so consumers on S3/R2 do not add it.
 
