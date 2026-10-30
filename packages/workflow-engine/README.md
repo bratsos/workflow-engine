@@ -648,6 +648,8 @@ await db.transaction(async (tx) => {
 });
 ```
 
+These imports suit `moduleResolution: "bundler"` (Vite, tsx, esbuild, Next, Bun). With `nodenext`, import `./prisma/contract.js` and `./db.js`; running a file directly with `node` needs `./db.ts`.
+
 `createWorkflowRegistry` is what makes definition versioning effective: it can enumerate the workflows this build serves, so a host only claims runs it can execute. A hand-written `{ getWorkflow }` registry still works but claims regardless of version. Without `stepLedger` every `ctx.step.*` call throws `StepLedgerNotConfiguredError`; without `services` accessing `ctx.ai` throws `AIServicesNotConfiguredError`. `spillThresholdBytes` (default 64 KiB) moves oversized step results to the blob store behind a claim check.
 
 ### 5. Choose a Host

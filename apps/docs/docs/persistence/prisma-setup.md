@@ -494,7 +494,8 @@ Five indexes have a descending column, and the engine's queries depend on it:
 A Prisma 8 contract cannot express a sort direction, so `contract.prisma` declares these five ascending and `mixed-order-indexes.sql` drops and recreates each one in a single transaction with its direction. Without the file everything still works, but a claim reads and sorts every pending row. Prisma 8 cannot see sort direction, so `db verify`, `db verify --strict` and `migration plan` accept the ascending and the descending form alike, and nothing warns you when they are ascending.
 
 * **Re-apply the file after anything that recreates one of the five indexes**: a `migration plan` or `db update` that changes their columns, or a `DROP INDEX` of your own. The recreated index is ascending. The file is idempotent (`DROP INDEX IF EXISTS`, then `CREATE INDEX`).
-* **If you manage schema changes with `migration plan` and `db migrate`**, put the five statements into the baseline migration instead of running the file by hand, so every environment gets them: plan it with `npx prisma migration plan --from @empty --name baseline`, then in the generated `migration.ts` replace `columns: [...]` in each of the five matching `createIndex` calls with ``expression: sql`status, priority DESC, "createdAt"` `` (the column list from the SQL file), run the file with `node` to re-emit `ops.json`, and `npx prisma db migrate`.
+* **If you manage schema changes with `migration plan` and `db migrate`**, put the five statements into the baseline migration instead of running the file by hand, so every environment gets them: plan it with `npx prisma migration plan --from @empty --name baseline`, then in the generated `migration.ts` find each of the five `createIndex` calls by its index name in the SQL file and replace its `columns: [...]` with ``expression: sql`"status", "priority" DESC, "createdAt"` `` (that index's column list from the SQL file). Run the file with `node` to re-emit `ops.json`, then `npx prisma db migrate --advance-ref db`.
+* **Pass `--advance-ref db` to every `db migrate`.** Plain `db migrate` does not record which contract the database is on, so the next `migration plan` fails with `MIGRATION.PLAN_ORIGIN_UNKNOWN`. If you hit that, run one of the two commands the error prints.
 * Check a database with `\d workflow_runs` in `psql`: the five indexes show `DESC`.
 
 `sql/enqueue.sql` (the optional [transactional enqueue](#transactional-enqueue-from-sql-postgresql)) works unchanged against a Prisma 8 database.
@@ -533,6 +534,8 @@ const aiCallLogger = createPrismaAICallLogger(prisma);
 const stepLedger = createPrismaStepLedger(prisma);
 const blobStore = createPrismaBlobStore(prisma); // needs the WorkflowBlob model
 ```
+
+These imports suit `moduleResolution: "bundler"` (Vite, tsx, esbuild, Next, Bun). With `nodenext`, import `./prisma/contract.js` and `./db.js`; running a file directly with `node` needs `./db.ts`.
 
 Every example in these docs that builds a `prisma` variable works with this one in its place. `fromPrisma8` is exported from `@bratsos/workflow-engine` as well as from `@bratsos/workflow-engine/persistence/prisma`. `createPrismaConsoleReadPort(prisma)` from the console package takes it too. Close the connection on shutdown with `await db.close()`.
 
