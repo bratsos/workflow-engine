@@ -5,8 +5,10 @@ Node.js host for the [`@bratsos/workflow-engine`](../workflow-engine) command ke
 ## Installation
 
 ```bash
-npm install @bratsos/workflow-engine-host-node
+npm install @bratsos/workflow-engine-host-node@alpha
 ```
+
+Name the `alpha` tag, next to `@bratsos/workflow-engine@alpha`: a bare install resolves `latest`, which is a 0.x host built for the 0.13 engine.
 
 ## Quick Start
 

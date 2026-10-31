@@ -96,7 +96,7 @@ The key kernel commands are:
 * **`job.execute`**: Executes a single stage (runs `execute()`). Takes the job's `attempt`/`maxAttempts` to decide `willRetry`, and an optional `abortSignal` that becomes `ctx.abortSignal`.
 * **`job.heartbeat`**: One beat of a host's job lease heartbeat: renews the lease and reports the run's status and whether the worker still holds the job, which is what the host aborts `ctx.abortSignal` from.
 * **`run.transition`**: Evaluates completed stage outputs and transitions the workflow run to the next execution group or completes the run.
-* **`run.cancel`**: Authority that marks a run cancelled, sets open stages to cancelled, and purges the job queue.
+* **`run.cancel`**: Authority that marks a run cancelled and sets open stages to cancelled; after that commits, it purges the run's jobs from the job queue.
 * **`run.redrive`**: Retry, restart or rerun a terminal run — `from: { kind: "lastFailure" | "start" | "stage" }` — keeping the resumed stage's step ledger and archiving every superseded attempt; optionally re-pins the run to another definition version. See [Retry, Restart and Rerun](./redriving-runs.md). `run.rerunFrom` still works but is deprecated and delegates to it.
 * **`stage.pollSuspended`**: Replays suspended durable stages whose `nextPollAt` has passed (and runs `checkCompletion` for the internal async-batch mode).
 * **`step.signal`**: Completes a `ctx.step.waitForSignal` step with a payload and nudges its stage for replay. Idempotent: a second signal reports `alreadyCompleted: true`.

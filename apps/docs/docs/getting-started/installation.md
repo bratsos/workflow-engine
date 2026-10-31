@@ -37,19 +37,19 @@ yarn add @bratsos/workflow-engine@alpha zod
 ```
 
 ### 2. Choose Your Host Runtime
-Install the host package that matches your operational environment. The host packages are versioned independently of the engine and are not on the `alpha` tag; each release depends on the engine release it was built against:
+Install the host package that matches your operational environment. The host packages are versioned independently of the engine and have their own `alpha` tag; each release depends on the engine release it was built against. Name the tag: a bare install resolves `latest`, which is still a 0.x host, and brings a second, 0.13 copy of the engine next to yours.
 
 * **Node.js Host** (for long-running daemon workers):
   ```bash
-  npm install @bratsos/workflow-engine-host-node
+  npm install @bratsos/workflow-engine-host-node@alpha
   ```
 * **Serverless Host** (for Cloudflare Workers, AWS Lambda, Vercel Edge, etc.):
   ```bash
-  npm install @bratsos/workflow-engine-host-serverless
+  npm install @bratsos/workflow-engine-host-serverless@alpha
   ```
 * **Remote Host** (for credential-free remote execution environments):
   ```bash
-  npm install @bratsos/workflow-engine-host-remote
+  npm install @bratsos/workflow-engine-host-remote@alpha
   ```
 
 ### 3. Optional: the operational console
@@ -58,6 +58,16 @@ Install the host package that matches your operational environment. The host pac
 ```bash
 npm install @bratsos/workflow-engine-console
 ```
+
+Unlike the packages above, the console is installed **without** `@alpha`: its `latest` tag is the current 1.0 alpha, and its `alpha` tag is an old version that does not install (`EUNSUPPORTEDPROTOCOL`). Its version must match the engine's alpha exactly, because it peers on that one version; with `@bratsos/workflow-engine@alpha` installed they match, and a different engine alpha fails with `ERESOLVE`.
+
+---
+
+## Module Format and Bundlers
+
+* **ES modules.** All five packages are ES modules (`"type": "module"`) with `import` conditions only. From a CommonJS project, `require()` of them works on Node.js 22.18, 24.22 and 26.13 (the versions tested) and fails with `ERR_REQUIRE_ESM` on 22.11.0.
+* **TypeScript in a CommonJS project.** `moduleResolution: "node10"` cannot resolve the `/kernel` and `/persistence/prisma` entry points (TS2307), and `node16` rejects a CommonJS file that imports them (TS1479). Use `nodenext` for `module` and `moduleResolution`, with TypeScript 5.9+. ES module projects work with `bundler` or `nodenext`.
+* **Bundlers.** The engine loads `@ai-sdk/openai` and `@ai-sdk/anthropic` lazily with `import()`, so a bundler that bundles the engine has to resolve both. Without them esbuild stops with `Could not resolve "@ai-sdk/openai"` and a Next.js 16 build with `Module not found: Can't resolve '@ai-sdk/openai'`. Install both packages, or keep the engine out of the bundle: `serverExternalPackages` in Next.js, `--external:@ai-sdk/openai --external:@ai-sdk/anthropic` in esbuild.
 
 ---
 
@@ -91,6 +101,7 @@ npm install -D prisma@6
 ```bash
 npm install --save-exact @prisma/orm-postgres@8.0.0-rc.21
 npm install --save-dev --save-exact prisma@8.0.0-rc.29
+npm install temporal-polyfill   # a peer of @prisma/orm-postgres; yarn classic and pnpm without auto-install-peers skip it
 ```
 
 Then follow [Prisma 8](../persistence/prisma-setup.md#prisma-8) for the contract, the database and the client.

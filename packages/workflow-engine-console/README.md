@@ -16,7 +16,7 @@ For that reason, `@bratsos/workflow-engine-console` never opens a database conne
 pnpm add @bratsos/workflow-engine-console
 ```
 
-`@bratsos/workflow-engine-console` declares `@bratsos/workflow-engine` as a peer dependency and is released in lockstep with it.
+`@bratsos/workflow-engine-console` declares `@bratsos/workflow-engine` as a peer dependency and is released in lockstep with it. Install it without `@alpha`: its `latest` tag is the current 1.0 alpha, and its `alpha` tag is an old version that does not install. Its version must match the engine's alpha exactly (`@bratsos/workflow-engine@alpha` does).
 
 ## Prisma 6, 7 and 8
 

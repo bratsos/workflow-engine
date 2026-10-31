@@ -429,13 +429,17 @@ Prisma 8 has no `@prisma/client`, no `schema.prisma` and no model delegates. You
 * **TypeScript** 5.9+, with `skipLibCheck: true`: the AI SDK's types import `json-schema`, which ships none
 * **PostgreSQL** 15+
 * **An ES module project**, `"type": "module"` in `package.json`: the generated `migration.ts`, and any `.ts` file you run with `node`, fail without it
+* **`psql`**, the PostgreSQL command-line client, on the machine that provisions the database: [step 3](#3-provision-an-empty-database) applies a SQL file with it
 * Prisma 8 is Postgres-only here. SQLite stays on Prisma 6 and 7.
 
 ```bash
 npm install @bratsos/workflow-engine@alpha zod
 npm install --save-exact @prisma/orm-postgres@8.0.0-rc.21
 npm install --save-dev --save-exact prisma@8.0.0-rc.29
+npm install temporal-polyfill
 ```
+
+`@prisma/orm-postgres` has a peer dependency on `temporal-polyfill`. npm installs it; yarn classic and pnpm with `auto-install-peers=false` do not, and `prisma contract emit` then fails with `Cannot find module 'temporal-polyfill/full/implementation'`. The last line fixes that.
 
 ### 1. Copy the contract
 
@@ -483,7 +487,7 @@ psql "$DATABASE_URL" -f node_modules/@bratsos/workflow-engine/prisma/mixed-order
 npx prisma db verify --strict
 ```
 
-`db init` creates the tables, indexes and constraints and writes Prisma 8's marker (in its own `prisma_contract` schema, which the engine never touches). The SQL file is the one step Prisma 8 cannot do for you.
+`db init` creates the tables, indexes and constraints and writes Prisma 8's marker (in its own `prisma_contract` schema, which the engine never touches). The SQL file is the one step Prisma 8 cannot do for you, and it needs `psql` installed where you run it.
 
 #### The mixed-order indexes
 
@@ -492,12 +496,12 @@ Five indexes have a descending column, and the engine's queries depend on it:
 * `workflow_runs` and `job_queue`: `(status, priority DESC, createdAt)` serves the claim and the dequeue (`ORDER BY priority DESC, "createdAt" ASC`) without a sort node.
 * `workflow_runs`: `(createdAt DESC, id DESC)` and its `status` and `workflowId` prefixes serve every newest-first listing, the console's included.
 
-A Prisma 8 contract cannot express a sort direction, so `contract.prisma` declares these five ascending and `mixed-order-indexes.sql` drops and recreates each one in a single transaction with its direction. Without the file everything still works, but a claim reads and sorts every pending row. Prisma 8 cannot see sort direction, so `db verify`, `db verify --strict` and `migration plan` accept the ascending and the descending form alike, and nothing warns you when they are ascending.
+A Prisma 8 contract cannot express a sort direction, so `contract.prisma` declares these five ascending and `mixed-order-indexes.sql` drops and recreates each one in a single transaction with its direction. Without the file everything still works, but a claim gets slower as pending rows pile up. Measured on Postgres 16 with every pending row at the default priority: a job claim at 10,000 pending jobs took 3.1 ms and at 100,000 took 51.6 ms (a sequential scan and sort of every row), against 0.04 ms and 0.03 ms with the indexes; a run claim at 100,000 pending runs took 70 ms against 0.11 ms; eight concurrent claim loops over 20,000 pending runs managed 260 claims a second against about 6,000. Nothing warns you. Prisma 8 cannot see sort direction, so `db verify`, `db verify --strict` (exit 0) and `migration plan` accept the ascending and the descending form alike. Check with `\d` in `psql`, below.
 
-* **Re-apply the file after anything that recreates one of the five indexes**: a `migration plan` or `db update` that changes their columns, or a `DROP INDEX` of your own. The recreated index is ascending. The file is idempotent (`DROP INDEX IF EXISTS`, then `CREATE INDEX`).
+* **Re-apply the file after anything that recreates one of the five indexes**: renaming one in the contract (`migration plan` and `db update` drop the old index and create the new one), or a `DROP INDEX` of your own followed by `db update`. The recreated index is ascending, and `db verify --strict` does not notice. Changing the columns of an index and keeping its name does not recreate it: `migration plan` and `db update` fail with `MIGRATION.PLANNING_FAILED` and tell you to use `migration new`. The file is idempotent (`DROP INDEX IF EXISTS`, then `CREATE INDEX`).
 * **If you manage schema changes with `migration plan` and `db migrate`**, put the five statements into the baseline migration instead of running the file by hand, so every environment gets them: plan it with `npx prisma migration plan --from @empty --name baseline`, then in the generated `migration.ts` find each of the five `createIndex` calls by its index name in the SQL file and replace its `columns: [...]` with ``expression: sql`"status", "priority" DESC, "createdAt"` `` (that index's column list from the SQL file). Run the file with `node` to re-emit `ops.json`, then `npx prisma db migrate --advance-ref db`.
-* **Pass `--advance-ref db` to every `db migrate`.** Plain `db migrate` does not record which contract the database is on, so the next `migration plan` fails with `MIGRATION.PLAN_ORIGIN_UNKNOWN`. If you hit that, run one of the two commands the error prints.
-* Check a database in `psql`: `\d workflow_runs` shows four of the indexes with `DESC`, and `\d job_queue` shows the fifth.
+* **Pass `--advance-ref db` to every `db migrate`.** Plain `db migrate` does not record which contract the database is on, so the next `migration plan` fails with `MIGRATION.PLAN_ORIGIN_UNKNOWN`. The error prints three commands. Run the first or the second: `prisma migration ref set db <contract>` points the `db` ref at the contract the database is on, and `prisma migration plan --from <contract>` plans from it once. `<contract>` is the hash that `prisma migration status` shows next to `@db`. Do not run the third, `migration plan --from @empty`, on a database that already has the tables: the plan would create every one of them again.
+* Check a database in `psql`, because `db verify --strict` will not: `\d workflow_runs` shows four of the indexes with `DESC`, and `\d job_queue` shows the fifth.
 
 `sql/enqueue.sql` (the optional [transactional enqueue](#transactional-enqueue-from-sql-postgresql)) works unchanged against a Prisma 8 database.
 
@@ -536,7 +540,7 @@ const stepLedger = createPrismaStepLedger(prisma);
 const blobStore = createPrismaBlobStore(prisma); // needs the WorkflowBlob model
 ```
 
-These imports suit `moduleResolution: "bundler"` (Vite, tsx, esbuild, Next, Bun). With `nodenext`, import `./prisma/contract.js` and `./db.js`; running a file directly with `node` needs `./db.ts`.
+These imports suit `moduleResolution: "bundler"` (Vite, tsx, esbuild, Next, Bun). With `nodenext`, import `./prisma/contract.js` and `./db.js`. Running a file directly with `node` needs `./db.ts`, and under `bundler` `tsc` rejects that import with TS5097 unless `allowImportingTsExtensions` is on (it requires `noEmit`). The JSON import (`with { type: "json" }`) fails with TS2823 under `module: "node16"`; use `esnext`, `node18`, `node20`, `nodenext` or `preserve`.
 
 Every example in these docs that builds a `prisma` variable works with this one in its place. `fromPrisma8` is exported from `@bratsos/workflow-engine` as well as from `@bratsos/workflow-engine/persistence/prisma`. `createPrismaConsoleReadPort(prisma)` from the console package takes it too. Close the connection on shutdown with `await db.close()`.
 
@@ -544,7 +548,8 @@ What the wrapper does, so you know what to expect:
 
 * It compiles each delegate call the adapters make into SQL from the contract's column types, and it throws `fromPrisma8: ...` for any argument outside the subset the adapters use, instead of ignoring it. It is not a general Prisma 6 and 7 emulation: use `db.orm` for your own queries.
 * Dates, JSON, arrays, `{ increment }`, `$transaction([...])` and `$transaction(fn, { isolationLevel, timeout })` behave as the adapters need. Prisma 8 itself takes no isolation option; the wrapper issues `SET TRANSACTION ISOLATION LEVEL` first.
-* Errors are Prisma 8's `SqlQueryError` (read `.sqlState`), not Prisma P-codes. The wrapper raises `P2025` when `update` or `delete` finds no row, and `P2028` once a `$transaction(fn)` passes its `timeout` (5000ms by default, as on Prisma 6 and 7): the next statement fails, and if the callback still returns, the transaction rolls back.
+* Errors are Prisma 8's `SqlQueryError` (read `.sqlState`), not Prisma P-codes. The wrapper raises `P2025` when `update` or `delete` finds no row, and `P2028` once a `$transaction(fn)` passes its `timeout` (5000ms by default, as on Prisma 6 and 7): the next statement fails and the transaction rolls back. A callback that has not settled at the deadline is rejected with `P2028` there and then, and its connection is freed. On Prisma 6 and 7 the connection is freed at the deadline too, but the caller keeps waiting for the callback, so a callback that fails after the deadline gives its own error there and `P2028` here. A statement still running at the deadline is not interrupted on any of the three majors: the caller gets `P2028` when it ends.
+* A raw read of your own through the wrapper has to declare its columns, because Prisma 8 drops the ones a raw read does not name: run it on `prisma.$withColumns({ name: "text" })`, or on `prisma.$withColumns("table_name")` for every column of a table. Without that the wrapper throws an error that says so.
 * Row ids from the Prisma 8 path are generated by the wrapper: time-ordered hex strings such as `01a18d985ffe0000f041d3af`, where Prisma 6 and 7 produce cuids. Both are opaque text and coexist in one table. It matters only to code that parses ids.
 
 #### Inside your own transaction
@@ -587,7 +592,7 @@ export default {
 ```
 
 ```bash
-npm install @bratsos/workflow-engine-console
+npm install @bratsos/workflow-engine-console   # no @alpha: its version must match the engine's alpha exactly
 npx workflow-console --config ./console.config.mjs
 ```
 
@@ -616,6 +621,7 @@ The id format difference above is the only visible change to rows. Existing cuid
 ### Limits on Prisma 8
 
 * PostgreSQL only. `databaseType: "sqlite"` over a `fromPrisma8` client throws.
+* The engine's tables must be in the `public` namespace (see [Environments](#environments)).
 * `workflow-console --database-url` is Prisma 6 and 7 only; use `--config`.
 * A pre-release: pin the exact pair above and re-test before moving either package.
 * Prisma 8's CLI has no `generate`, `migrate dev` or `db push`: the commands above replace them, and the generated `contract.json` / `contract.d.ts` are the only artefacts.
@@ -648,7 +654,7 @@ it after the engine's tables exist. It is `CREATE OR REPLACE`, so re-running is 
 psql "$DATABASE_URL" -f node_modules/@bratsos/workflow-engine/sql/enqueue.sql
 ```
 
-Or, with Prisma, paste it into a migration:
+Or, on Prisma 6 and 7, paste it into a migration:
 
 ```bash
 npx prisma migrate dev --create-only --name workflow-engine-enqueue-function
@@ -657,7 +663,28 @@ cat node_modules/@bratsos/workflow-engine/sql/enqueue.sql \
 npx prisma migrate dev
 ```
 
+Prisma 8 has no `migrate dev --create-only` (the CLI prints its root help). Apply the file with `psql`, as above (it works unchanged on a Prisma 8 database), or author a custom migration with `prisma migration new`.
+
 Requires PostgreSQL 13 or newer (for the built-in `gen_random_uuid()`).
+
+### Calling it from TypeScript
+
+On Prisma 8, call it through the transaction's raw lane, so the enqueue commits or rolls back with your own writes:
+
+```ts
+await db.transaction(async (tx) => {
+  // ...your own writes through tx.orm...
+  const [{ id }] = await tx
+    .query(
+      tx.raw.sql`SELECT workflow_engine_enqueue(${key}, ${"fulfil-order"}, ${"Fulfil Order"}, ${JSON.stringify(input)}::jsonb) AS id`
+        .returnsRow({ id: "pg/text@1" })
+        .build(),
+    )
+    .toArray();
+});
+```
+
+Prisma 8's raw lane takes strings, numbers and booleans as interpolations and rejects a `Date` or an array, so the input goes in as JSON text cast with `::jsonb`. On a rollback no run, outbox event or idempotency row is left; calling it twice with one key returns the same id, and the run is `PENDING` until a host claims it.
 
 ### Signature
 
@@ -775,6 +802,24 @@ const sqliteStepLedger = createPrismaStepLedger(prisma, {
   databaseType: "sqlite", // keeps the create-and-catch path; SQLite has no skipDuplicates
 });
 ```
+
+---
+
+## Environments
+
+### A schema other than `public`
+
+* **Prisma 6:** `?schema=name` in the connection URL works.
+* **Prisma 7:** the driver adapter's `schema` option, `new PrismaPg({ connectionString }, { schema: "name" })`, qualifies the SQL Prisma generates but not the engine's own raw SQL (`FROM job_queue`). Every dequeue then fails with `P2010 relation "job_queue" does not exist`, the host retries in a loop and runs stay `PENDING`. Set `search_path` as well: `new PrismaPg({ connectionString, options: "-c search_path=name" }, { schema: "name" })`.
+* **Prisma 8:** the engine's tables must be in `public`. `fromPrisma8` reads the contract's `public` namespace, so with the engine's models in another namespace it throws `TypeError: Cannot read properties of undefined (reading 'models')`, and `mixed-order-indexes.sql` fails with `relation "workflow_runs" does not exist`.
+
+### TLS
+
+Against a server with a self-signed or private-CA certificate, `?sslmode=require`, `sslmode=prefer` or no `sslmode` connects on Prisma 6 and fails on Prisma 7 and 8 with `DEPTH_ZERO_SELF_SIGNED_CERT`: the Postgres driver those two use treats `require` as `verify-full`, and `sslaccept=accept_invalid_certs` is ignored. These worked on all three majors: `sslmode=verify-full&sslrootcert=/path/to/ca.pem`, `sslmode=verify-ca&sslrootcert=/path/to/ca.pem`, and `sslmode=no-verify`.
+
+### PgBouncer
+
+PgBouncer in transaction mode works on Prisma 6, 7 and 8 (tested on PgBouncer 1.26.1 with `max_prepared_statements` 0 and 100): isolation levels, raw reads, the console read port and 16 concurrent claim loops over 1,000 jobs, each job claimed once. Prisma 6 needs `?pgbouncer=true` on the URL: without it 2,458 calls failed with prepared-statement errors and 238 of 1,000 jobs completed (none was claimed twice).
 
 ---
 

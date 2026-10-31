@@ -100,6 +100,7 @@ The engine supports Prisma 6, 7 and 8. Install `prisma` as a local dependency: `
 ```bash
 npm install --save-exact @prisma/orm-postgres@8.0.0-rc.21
 npm install --save-dev --save-exact prisma@8.0.0-rc.29
+npm install temporal-polyfill   # a peer of @prisma/orm-postgres; yarn classic and pnpm without auto-install-peers skip it
 ```
 
 Then follow "Prisma 8" under [Database Setup](#1-database-setup) below.
@@ -112,15 +113,17 @@ Then follow "Prisma 8" under [Database Setup](#1-database-setup) below.
 
 ```bash
 # Core library
-npm install @bratsos/workflow-engine zod
+npm install @bratsos/workflow-engine@alpha zod
 
 # Node.js host (long-running worker processes)
-npm install @bratsos/workflow-engine-host-node
+npm install @bratsos/workflow-engine-host-node@alpha
 
 # Serverless host (Cloudflare Workers, AWS Lambda, Vercel Edge, etc.)
-npm install @bratsos/workflow-engine-host-serverless
+npm install @bratsos/workflow-engine-host-serverless@alpha
 
-# Optional: embeddable operational console (a fetch handler + UI you mount in your app)
+# Optional: embeddable operational console (a fetch handler + UI you mount in your app).
+# No @alpha here: its `alpha` tag is an old version that does not install, and its
+# version must match the engine's alpha exactly.
 npm install @bratsos/workflow-engine-console
 ```
 
@@ -511,7 +514,7 @@ psql "$DATABASE_URL" -f node_modules/@bratsos/workflow-engine/prisma/mixed-order
 npx prisma db verify --strict
 ```
 
-Keep the contract's `TimestampString(3)` timestamps and its native `Status` enum: the engine's raw SQL depends on both, and `fromPrisma8` throws at construction when they are missing. Prisma 8 cannot see sort direction, so re-apply `mixed-order-indexes.sql` after anything that recreates one of the five indexes. A database that Prisma 6 or 7 created needs `prisma db sign` instead of `db init` and not the SQL file: its tables do not change. The full guide, including adoption, migrations and the console, is [Prisma Setup](https://github.com/bratsos/workflow-engine/blob/main/apps/docs/docs/persistence/prisma-setup.md#prisma-8).
+Keep the contract's `TimestampString(3)` timestamps and its native `Status` enum: the engine's raw SQL depends on both, and `fromPrisma8` throws at construction when they are missing. The SQL file needs `psql` installed where you run it. Prisma 8 cannot see sort direction, so `db verify --strict` passes without the descending indexes (check with `\d` in `psql`), and you re-apply `mixed-order-indexes.sql` after anything that recreates one of the five indexes (renaming one, or dropping and recreating it). Without them, with every pending row at the default priority, a job claim took 51.6 ms at 100,000 pending jobs against 0.03 ms. A database that Prisma 6 or 7 created needs `prisma db sign` instead of `db init` and not the SQL file: its tables do not change. The full guide, including adoption, migrations and the console, is [Prisma Setup](https://github.com/bratsos/workflow-engine/blob/main/apps/docs/docs/persistence/prisma-setup.md#prisma-8).
 
 Upgrading from 0.13? The database checklist in `skills/workflow-engine/migrations/migrate-0.13-to-1.0.md` has the exact SQL (`workflow_steps`, the two `workflow_runs` columns, `workflow_definitions`, the index set above), `CONCURRENTLY` where it matters.
 
@@ -648,7 +651,7 @@ await db.transaction(async (tx) => {
 });
 ```
 
-These imports suit `moduleResolution: "bundler"` (Vite, tsx, esbuild, Next, Bun). With `nodenext`, import `./prisma/contract.js` and `./db.js`; running a file directly with `node` needs `./db.ts`.
+These imports suit `moduleResolution: "bundler"` (Vite, tsx, esbuild, Next, Bun). With `nodenext`, import `./prisma/contract.js` and `./db.js`. Running a file directly with `node` needs `./db.ts`, and under `bundler` `tsc` rejects that import with TS5097 unless `allowImportingTsExtensions` is on (it requires `noEmit`). The JSON import fails with TS2823 under `module: "node16"`; use `esnext`, `node18`, `node20`, `nodenext` or `preserve`.
 
 `createWorkflowRegistry` is what makes definition versioning effective: it can enumerate the workflows this build serves, so a host only claims runs it can execute. A hand-written `{ getWorkflow }` registry still works but claims regardless of version. Without `stepLedger` every `ctx.step.*` call throws `StepLedgerNotConfiguredError`; without `services` accessing `ctx.ai` throws `AIServicesNotConfiguredError`. `spillThresholdBytes` (default 64 KiB) moves oversized step results to the blob store behind a claim check.
 
@@ -1250,12 +1253,12 @@ Idempotency behavior:
 - If the same key is already executing, dispatch throws `IdempotencyInProgressError`.
 
 Transaction behavior:
-- Most commands execute inside a single database transaction (handler + outbox events). Enqueues happen post-commit, so a job never names a run that is not yet visible.
+- Most commands execute inside a single database transaction (handler + outbox events). Enqueues happen post-commit, so a job never names a run that is not yet visible, and `run.cancel` cancels the run's jobs post-commit too, so a cancel needs one connection at a time.
 - `job.execute` uses multi-phase transactions: Phase 1 commits `RUNNING` status immediately, Phase 2 runs `stageDef.execute()` outside any transaction, Phase 3 commits the final status. This avoids holding a database connection during long-running stage execution. A failure with job attempts left leaves the stage `PENDING` with the error and returns `willRetry: true`; the stage becomes `FAILED` only when the transport's `maxAttempts` is exhausted.
 - `stage.pollSuspended` claims each stage (a version-guarded `nextPollAt` lease) before replaying it, so two orchestrators never replay the same stage; the replay runs outside any transaction and the outcome commits in a short per-stage transaction.
 
 Cancellation semantics:
-- `run.cancel` is **authoritative**: it marks the run as `CANCELLED`, cascades to all non-terminal stages (setting them to `CANCELLED` and clearing `nextPollAt`), and cancels all queued/suspended jobs via `jobTransport.cancelByRun()`.
+- `run.cancel` is **authoritative**: it marks the run as `CANCELLED` and cascades to all non-terminal stages (setting them to `CANCELLED` and clearing `nextPollAt`) in its transaction, then, after that commits, cancels all queued/suspended jobs via `jobTransport.cancelByRun()`. A worker that dequeues one of the run's jobs in between discards it as an orphan, so that job ends `FAILED`, not `CANCELLED`.
 - The running body sees it: the host's job heartbeat (`job.heartbeat`) aborts `ctx.abortSignal` with a `StageAbortedError` (`reason: "cancelled"`, or `"lease-lost"` when another worker took the job). `waitFor` checks the signal before it polls; a `run` body that finishes after a cancel is recorded as failed with the cancellation as its error.
 - `stage.pollSuspended` skips stages whose run has been cancelled.
 - `job.execute` re-checks run status after stage execution. If the run was cancelled during execution, the result is discarded and `ghost: true` is returned with `ghostReason: "orphan"`; `"race"` (the run was still `PENDING`) and `"version"` (this build does not serve the run) are re-delivered by the hosts rather than dropped.

@@ -19,7 +19,7 @@ The first real-world runs of the 1.0 alphas also found and fixed behaviour that 
 
 Verified against `git diff` of the package's `prisma/schema.prisma` between 0.13.0 and 1.0.0, plus every column the 1.0 Prisma adapters write. Apply in order; every statement is idempotent on Postgres (`IF NOT EXISTS`).
 
-On Prisma 8 there is no `schema.prisma` or generated client: update `prisma/contract.prisma` from the package's `contract.prisma`, run `npx prisma contract emit`, then `npx prisma db update` (or `npx prisma migration plan` and `npx prisma db migrate --advance-ref db`). Any step that recreates one of the five descending indexes leaves it ascending, so re-run `psql "$DATABASE_URL" -f node_modules/@bratsos/workflow-engine/prisma/mixed-order-indexes.sql` afterwards. See [Prisma 8](../references/05-persistence-setup.md#prisma-8).
+On Prisma 8 there is no `schema.prisma` or generated client: update `prisma/contract.prisma` from the package's `contract.prisma`, run `npx prisma contract emit`, then `npx prisma db update` (or `npx prisma migration plan` and `npx prisma db migrate --advance-ref db`). Renaming one of the five descending indexes, or dropping and recreating it, brings it back ascending, and `db verify --strict` does not notice, so re-run `psql "$DATABASE_URL" -f node_modules/@bratsos/workflow-engine/prisma/mixed-order-indexes.sql` afterwards. (A change to an index's columns under the same name fails planning with `MIGRATION.PLANNING_FAILED` instead.) See [Prisma 8](../references/05-persistence-setup.md#prisma-8).
 
 - [ ] **Add the `workflow_steps` table** (new in 1.0; used by `createPrismaStepLedger`).
 

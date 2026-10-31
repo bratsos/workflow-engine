@@ -35,7 +35,7 @@ Before creating persistence instances, verify your Prisma schema:
 - [ ] `IdempotencyKey` model exists (required for command idempotency keys)
 - [ ] `Status` enum exists with all values: PENDING, RUNNING, SUSPENDED, COMPLETED, FAILED, CANCELLED, SKIPPED
 - [ ] Table names use `@@map` (e.g., `@@map("workflow_runs")`)
-- [ ] Run `prisma db push` or `prisma migrate dev` after schema changes (Prisma 8: `prisma contract emit`, then `prisma db init` / `db update`; see [Prisma 8](#prisma-8))
+- [ ] Run `prisma db push` or `prisma migrate dev` after schema changes (Prisma 8: `prisma contract emit`, then `prisma db init` / `db update`, then re-apply `mixed-order-indexes.sql` if the step recreated one of the five descending indexes; see [Prisma 8](#prisma-8))
 
 **Common Errors:**
 | Error | Cause | Fix |
@@ -974,11 +974,12 @@ Prisma 8 uses a contract and its own client; see the next section.
 
 ## Prisma 8
 
-Release candidate, tested against exactly `prisma@8.0.0-rc.29` with `@prisma/orm-postgres@8.0.0-rc.21` (pin both; the `latest` pair crashed `prisma contract emit`). Requires an ES module project (`"type": "module"`, or the generated `migration.ts` and `.ts` files run with `node` fail), `skipLibCheck: true` (the AI SDK's types import `json-schema`, which ships none), Node 22.18+/24.11+/26+, TypeScript 5.9+, PostgreSQL 15+. PostgreSQL only. No `@prisma/client`, no `schema.prisma`, no `generate` / `migrate dev` / `db push`.
+Release candidate, tested against exactly `prisma@8.0.0-rc.29` with `@prisma/orm-postgres@8.0.0-rc.21` (pin both; the `latest` pair crashed `prisma contract emit`). Requires an ES module project (`"type": "module"`, or the generated `migration.ts` and `.ts` files run with `node` fail), `skipLibCheck: true` (the AI SDK's types import `json-schema`, which ships none), Node 22.18+/24.11+/26+, TypeScript 5.9+, PostgreSQL 15+. PostgreSQL only, with the engine's tables in the `public` namespace. Needs `psql` (the PostgreSQL command-line client) where the database is provisioned. No `@prisma/client`, no `schema.prisma`, no `generate` / `migrate dev` / `db push`. It is a pre-release: re-test before moving either pin.
 
 ```bash
 npm install --save-exact @prisma/orm-postgres@8.0.0-rc.21
 npm install --save-dev --save-exact prisma@8.0.0-rc.29
+npm install temporal-polyfill   # a peer of @prisma/orm-postgres; yarn classic and pnpm without auto-install-peers skip it, and `contract emit` then fails
 mkdir -p prisma
 cp node_modules/@bratsos/workflow-engine/prisma/contract.prisma prisma/contract.prisma
 ```
@@ -1011,7 +1012,7 @@ psql "$DATABASE_URL" -f node_modules/@bratsos/workflow-engine/prisma/mixed-order
 npx prisma db verify --strict
 ```
 
-**The mixed-order indexes.** A Prisma 8 contract cannot express a sort direction, so `contract.prisma` declares five indexes ascending: `(status, priority DESC, createdAt)` on `workflow_runs` and `job_queue` (the claim and dequeue), and `(createdAt DESC, id DESC)` plus its `status` / `workflowId` prefixes on `workflow_runs` (every newest-first listing). `mixed-order-indexes.sql` drops and recreates them with their direction in one transaction; it is idempotent. Without it everything works but a claim reads and sorts every pending row. `db verify` and `migration plan` cannot see sort direction, so nothing warns when they are ascending. **Re-apply the file after anything that recreates one of the five** (a plan that changes their columns, a manual `DROP INDEX`). If the project uses `migration plan` and `db migrate`, put the five statements in the baseline migration instead (`migration plan --from @empty --name baseline`, then replace `columns: [...]` of each of the five `createIndex` calls, found by index name, with its column list from the SQL file, such as ``expression: sql`"status", "priority" DESC, "createdAt"` ``, run the file with `node`, then `db migrate --advance-ref db`) so every environment gets them.
+**The mixed-order indexes.** A Prisma 8 contract cannot express a sort direction, so `contract.prisma` declares five indexes ascending: `(status, priority DESC, createdAt)` on `workflow_runs` and `job_queue` (the claim and dequeue), and `(createdAt DESC, id DESC)` plus its `status` / `workflowId` prefixes on `workflow_runs` (every newest-first listing). `mixed-order-indexes.sql` drops and recreates them with their direction in one transaction; it is idempotent. Without it everything works, but the claim slows as pending rows pile up: with every pending row at the default priority a job claim took 3.1 ms at 10,000 pending jobs and 51.6 ms at 100,000 (a sequential scan and sort of every row), against 0.04 ms and 0.03 ms with the indexes. `db verify`, `db verify --strict` (exit 0) and `migration plan` cannot see sort direction, so nothing warns when they are ascending: check with `\d workflow_runs` (four of the indexes show `DESC`) and `\d job_queue` (the fifth). **Re-apply the file after anything that recreates one of the five**: renaming one in the contract, or a manual `DROP INDEX` followed by `db update`; the recreated index is ascending. (Changing an index's columns under the same name does not recreate it: `migration plan` and `db update` fail with `MIGRATION.PLANNING_FAILED`.) If the project uses `migration plan` and `db migrate`, put the five statements in the baseline migration instead (`migration plan --from @empty --name baseline`, then replace `columns: [...]` of each of the five `createIndex` calls, found by index name, with its column list from the SQL file, such as ``expression: sql`"status", "priority" DESC, "createdAt"` ``, run the file with `node`, then `db migrate --advance-ref db`) so every environment gets them.
 
 **The client.**
 
@@ -1044,9 +1045,9 @@ const persistence = createPrismaWorkflowPersistence(prisma);
 const jobQueue = createPrismaJobQueue(prisma);
 ```
 
-These imports suit `moduleResolution: "bundler"` (Vite, tsx, esbuild, Next, Bun). With `nodenext`, import `./prisma/contract.js` and `./db.js`; running a file directly with `node` needs `./db.ts`.
+These imports suit `moduleResolution: "bundler"` (Vite, tsx, esbuild, Next, Bun). With `nodenext`, import `./prisma/contract.js` and `./db.js`. Running a file directly with `node` needs `./db.ts`, and under `bundler` `tsc` rejects that import with TS5097 unless `allowImportingTsExtensions` is on (it requires `noEmit`). The JSON import (`with { type: "json" }`) fails with TS2823 under `module: "node16"`; use `esnext`, `node18`, `node20`, `nodenext` or `preserve`.
 
-`fromPrisma8` compiles each delegate call the adapters make into SQL from the contract, and throws `fromPrisma8: ...` for any argument outside that subset; it is not general Prisma emulation (use `db.orm` for your own queries). Errors are Prisma 8's `SqlQueryError` with `.sqlState`; the wrapper raises `P2025` for a missing row on `update` / `delete` and `P2028` once a `$transaction(fn)` passes its `timeout` (5000ms by default): the next statement fails, and if the callback still returns, the transaction rolls back. Ids are generated by the wrapper (time-ordered hex such as `01a18d985ffe0000f041d3af`, not cuids); they are opaque and coexist with cuids in one table.
+`fromPrisma8` compiles each delegate call the adapters make into SQL from the contract, and throws `fromPrisma8: ...` for any argument outside that subset; it is not general Prisma emulation (use `db.orm` for your own queries). Errors are Prisma 8's `SqlQueryError` with `.sqlState`; the wrapper raises `P2025` for a missing row on `update` / `delete` and `P2028` once a `$transaction(fn)` passes its `timeout` (5000ms by default): the next statement fails and the transaction rolls back. A callback that has not settled at the deadline is rejected with `P2028` there and then, and its connection is freed; on Prisma 6 and 7 the connection is freed at the deadline too, but the caller keeps waiting for the callback, so one that fails after the deadline gives its own error there and `P2028` here. A statement still running at the deadline is not interrupted on any major: the caller gets `P2028` when it ends. `$transaction(fn, { isolationLevel })` works (the wrapper issues `SET TRANSACTION ISOLATION LEVEL` first; Prisma 8 itself has no isolation option). A raw read of your own through the wrapper must declare its columns, because Prisma 8 drops the ones it does not name: `prisma.$withColumns({ name: "text" })`, or `prisma.$withColumns("table_name")` for every column of a table. Ids are generated by the wrapper (time-ordered hex such as `01a18d985ffe0000f041d3af`, not cuids); they are opaque and coexist with cuids in one table.
 
 **Inside the consumer's own transaction.** A `tx` has no contract, so pass it:
 
@@ -1058,9 +1059,21 @@ await db.transaction(async (tx) => {
 });
 ```
 
-Like a Prisma 6 or 7 `tx`, the result has no `$transaction`: no nested transactions, and `enqueue` and `enqueueParallel` throw. To enqueue inside the transaction, use `workflow_engine_enqueue`.
+Like a Prisma 6 or 7 `tx`, the result has no `$transaction`: no nested transactions, and `enqueue` and `enqueueParallel` throw. To enqueue inside the transaction, use `workflow_engine_enqueue` (apply `sql/enqueue.sql` with `psql`; it works unchanged on Prisma 8) through the transaction's raw lane, which takes strings, numbers and booleans and rejects a `Date` or an array, so the input goes in as JSON text:
 
-**The console.** `workflow-console --database-url` needs `@prisma/client` (Prisma 6 and 7 only). On Prisma 8 give `--config` a `console.config.mjs` that builds the reader with `createPrismaConsoleReadPort(fromPrisma8(db))` and a `dispose: () => db.close()`; see [16-operational-console.md](16-operational-console.md). A reader wrapped around `fromPrisma8(db)` by the consumer must forward `$withColumns`.
+```ts
+await db.transaction(async (tx) => {
+  const [{ id }] = await tx
+    .query(
+      tx.raw.sql`SELECT workflow_engine_enqueue(${key}, ${"fulfil-order"}, ${"Fulfil Order"}, ${JSON.stringify(input)}::jsonb) AS id`
+        .returnsRow({ id: "pg/text@1" })
+        .build(),
+    )
+    .toArray();
+}); // a rollback leaves no run, outbox event or idempotency row; the same key twice returns the same id
+```
+
+**The console.** `workflow-console --database-url` needs `@prisma/client` (Prisma 6 and 7 only). On Prisma 8 install `@bratsos/workflow-engine-console` (no `@alpha`: its version must match the engine's alpha exactly), give `--config` a `console.config.mjs` that builds the reader with `createPrismaConsoleReadPort(fromPrisma8(db))` and a `dispose: () => db.close()`, and run `npx workflow-console --config ./console.config.mjs`. It serves on `http://127.0.0.1:7799`; `--port` changes that. See [16-operational-console.md](16-operational-console.md). A reader wrapped around `fromPrisma8(db)` by the consumer must forward `$withColumns`.
 
 **Adopting a database that Prisma 6 or 7 created.** The tables do not change and the five descending indexes already exist, so skip `mixed-order-indexes.sql`. Replace the Prisma 6 or 7 packages with the pinned Prisma 8 pair, copy `contract.prisma`, add `prisma.config.ts`, then:
 
@@ -1071,6 +1084,14 @@ npx prisma db verify --strict
 ```
 
 `db sign` writes a marker into Prisma 8's own `prisma_contract` schema only. Add models for the consumer's own tables to the contract, or `db verify --strict` reports them as extra (`prisma contract infer --db "$DATABASE_URL" --output prisma/inferred.prisma` writes them from the live database inside a `namespace public { }` block with plural names; copy those models into `prisma/contract.prisma`). The only row-level difference is the id format above.
+
+## Environments
+
+- **Schema other than `public`.** Prisma 6: `?schema=name` in the URL works. Prisma 7: the driver adapter's `schema` option qualifies only the SQL Prisma generates, so the engine's raw SQL (`FROM job_queue`) fails with `P2010 relation "job_queue" does not exist`, the host retries in a loop and runs stay `PENDING`; also set `search_path`: `new PrismaPg({ connectionString, options: "-c search_path=name" }, { schema: "name" })`. Prisma 8: the engine's tables must be in `public`; `fromPrisma8` throws `TypeError: Cannot read properties of undefined (reading 'models')` otherwise, and `mixed-order-indexes.sql` fails.
+- **TLS.** With a self-signed or private-CA certificate, `sslmode=require`, `prefer` or none connects on Prisma 6 and fails on 7 and 8 with `DEPTH_ZERO_SELF_SIGNED_CERT` (`sslaccept=accept_invalid_certs` is ignored there). These worked on all three: `sslmode=verify-full&sslrootcert=...`, `sslmode=verify-ca&sslrootcert=...`, `sslmode=no-verify`.
+- **PgBouncer in transaction mode** works on all three majors (tested with `max_prepared_statements` 0 and 100); Prisma 6 needs `?pgbouncer=true` (without it only 238 of 1,000 jobs completed; none was claimed twice).
+- **CommonJS.** All packages are ES modules: `require()` works on Node 22.18, 24.22 and 26.13 and fails with `ERR_REQUIRE_ESM` on 22.11. In a CommonJS TypeScript project use `module` and `moduleResolution` `nodenext` with TypeScript 5.9+ (`node10` cannot resolve `/kernel` and `/persistence/prisma`; `node16` gives TS1479).
+- **Bundlers.** The engine loads `@ai-sdk/openai` and `@ai-sdk/anthropic` with `import()`. A bundler that bundles the engine needs both installed (esbuild: `Could not resolve "@ai-sdk/openai"`; Next.js 16: `Module not found`) or the engine external (`serverExternalPackages`, esbuild `--external:@ai-sdk/openai --external:@ai-sdk/anthropic`).
 
 ## Status Type
 
@@ -1308,7 +1329,7 @@ npx prisma migrate deploy
 npx prisma generate
 ```
 
-On Prisma 8 edit `prisma/contract.prisma`, run `npx prisma contract emit`, then `npx prisma db update` (no migration history) or `npx prisma migration plan` and `npx prisma db migrate --advance-ref db`, because plain `db migrate` leaves the next `migration plan` failing with `MIGRATION.PLAN_ORIGIN_UNKNOWN`. Re-apply `mixed-order-indexes.sql` after any step that recreates one of the five descending indexes.
+On Prisma 8 edit `prisma/contract.prisma`, run `npx prisma contract emit`, then `npx prisma db update` (no migration history) or `npx prisma migration plan` and `npx prisma db migrate --advance-ref db`, because plain `db migrate` leaves the next `migration plan` failing with `MIGRATION.PLAN_ORIGIN_UNKNOWN`. The error prints three commands; run the first or the second: `npx prisma migration ref set db <contract>`, or `npx prisma migration plan --from <contract>`, where `<contract>` is the hash `npx prisma migration status` shows next to `@db`. Do not run the third, `migration plan --from @empty`, on a database that already has the tables: it plans every table again. Re-apply `mixed-order-indexes.sql` after any step that recreates one of the five descending indexes (renaming one in the contract, or a manual `DROP INDEX` then `db update`; the recreated index is ascending and `db verify --strict` does not notice).
 
 ## Transactional enqueue from SQL (PostgreSQL)
 
@@ -1321,6 +1342,8 @@ consumer's migration owns it.
 ```bash
 psql "$DATABASE_URL" -f node_modules/@bratsos/workflow-engine/sql/enqueue.sql
 ```
+
+It works unchanged against a Prisma 8 database; the call from a Prisma 8 transaction is under [Prisma 8](#prisma-8).
 
 ```sql
 workflow_engine_enqueue(
