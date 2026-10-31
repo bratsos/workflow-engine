@@ -12,7 +12,12 @@ import type {
   AIHelperStats,
   CreateAICallInput,
 } from "../interface";
-import type { EnginePrismaClient } from "./prisma-client-type";
+import type { DatabaseType } from "./persistence";
+import {
+  type EnginePrismaClient,
+  validateDatabaseType,
+} from "./prisma-client-type";
+import { isUniqueViolation } from "./sql-errors";
 
 const logger = createLogger("AICallLogger");
 
@@ -123,8 +128,21 @@ function toRecord(row: AICallRow): AICallRecord {
   };
 }
 
+export interface PrismaAICallLoggerOptions {
+  /** Database type. Defaults to "postgresql". */
+  databaseType?: DatabaseType;
+}
+
 export class PrismaAICallLogger implements AICallLogger {
-  constructor(private readonly prisma: PrismaClient) {}
+  private readonly databaseType: DatabaseType;
+
+  constructor(
+    private readonly prisma: PrismaClient,
+    options: PrismaAICallLoggerOptions = {},
+  ) {
+    this.databaseType = options.databaseType ?? "postgresql";
+    validateDatabaseType(prisma, this.databaseType);
+  }
 
   /**
    * Log a single AI call (fire and forget)
@@ -163,36 +181,48 @@ export class PrismaAICallLogger implements AICallLogger {
     batchId: string,
     results: CreateAICallInput[],
   ): Promise<void> {
-    await this.prisma.aICall.createMany({
-      data: results.map((call) => {
-        const requestId =
-          call.requestId ?? getMetadataString(call.metadata, "requestId");
+    const data = results.map((call) => {
+      const requestId =
+        call.requestId ?? getMetadataString(call.metadata, "requestId");
 
-        if (requestId === undefined) {
-          logger.warn(
-            "Batch result has no requestId; duplicate protection cannot be enforced for this row.",
-            { batchId },
-          );
-        }
+      if (requestId === undefined) {
+        logger.warn(
+          "Batch result has no requestId; duplicate protection cannot be enforced for this row.",
+          { batchId },
+        );
+      }
 
-        return {
-          topic: call.topic,
-          callType: call.callType,
-          modelKey: call.modelKey,
-          modelId: call.modelId,
-          prompt: call.prompt,
-          response: call.response,
-          inputTokens: call.inputTokens,
-          outputTokens: call.outputTokens,
-          cost: call.cost,
-          ...costColumns(call),
-          batchId,
-          ...(requestId !== undefined ? { requestId } : {}),
-          metadata: getBatchMetadata(call.metadata, batchId, requestId),
-        };
-      }),
-      skipDuplicates: true,
+      return {
+        topic: call.topic,
+        callType: call.callType,
+        modelKey: call.modelKey,
+        modelId: call.modelId,
+        prompt: call.prompt,
+        response: call.response,
+        inputTokens: call.inputTokens,
+        outputTokens: call.outputTokens,
+        cost: call.cost,
+        ...costColumns(call),
+        batchId,
+        ...(requestId !== undefined ? { requestId } : {}),
+        metadata: getBatchMetadata(call.metadata, batchId, requestId),
+      };
     });
+
+    if (this.databaseType === "postgresql") {
+      await this.prisma.aICall.createMany({ data, skipDuplicates: true });
+      return;
+    }
+
+    // SQLite does not support skipDuplicates, but a unique violation leaves
+    // the transaction usable, as in the annotation and step adapters.
+    for (const row of data) {
+      try {
+        await this.prisma.aICall.create({ data: row });
+      } catch (error) {
+        if (!isUniqueViolation(error)) throw error;
+      }
+    }
   }
 
   /**
@@ -256,7 +286,7 @@ export class PrismaAICallLogger implements AICallLogger {
           { batchId },
           {
             metadata: {
-              path: ["batchId"],
+              path: this.databaseType === "sqlite" ? "$.batchId" : ["batchId"],
               equals: batchId,
             },
           },
@@ -282,6 +312,7 @@ export class PrismaAICallLogger implements AICallLogger {
 // Factory function to create PrismaAICallLogger with prisma client
 export function createPrismaAICallLogger(
   prisma: PrismaClient,
+  options: PrismaAICallLoggerOptions = {},
 ): PrismaAICallLogger {
-  return new PrismaAICallLogger(prisma);
+  return new PrismaAICallLogger(prisma, options);
 }
