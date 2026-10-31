@@ -511,7 +511,7 @@ A Prisma 8 contract cannot express a sort direction, so `contract.prisma` declar
 // db.ts
 import postgres from "@prisma/orm-postgres/runtime";
 import { contractFromJson } from "@prisma/orm-postgres/static";
-import type { Contract } from "./prisma/contract.d";
+import type { Contract } from "./prisma/contract.js";
 import contractJson from "./prisma/contract.json" with { type: "json" };
 
 export const db = postgres({
@@ -1005,7 +1005,7 @@ Create the runtime from the emitted contract and wrap it once:
 // db.ts
 import sqlite from "@prisma/orm-sqlite/runtime";
 import { contractFromJson } from "@prisma/orm-sqlite/static";
-import type { Contract } from "./.generated/contract.d";
+import type { Contract } from "./.generated/contract.js";
 import contractJson from "./.generated/contract.json" with { type: "json" };
 import { fromPrisma8 } from "@bratsos/workflow-engine/persistence/prisma";
 

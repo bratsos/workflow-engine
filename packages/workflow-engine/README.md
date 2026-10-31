@@ -646,7 +646,7 @@ A Prisma 8 client has no model delegates, so wrap it once with `fromPrisma8` and
 import postgres from "@prisma/orm-postgres/runtime";
 import { contractFromJson } from "@prisma/orm-postgres/static";
 import { fromPrisma8 } from "@bratsos/workflow-engine";
-import type { Contract } from "./prisma/contract.d";
+import type { Contract } from "./prisma/contract.js";
 import contractJson from "./prisma/contract.json" with { type: "json" };
 
 const db = postgres({
