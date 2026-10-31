@@ -17,6 +17,8 @@ on:
 jobs:
   build-docs:
     runs-on: ubuntu-latest
+    # Deploys from main run in order, so an older build cannot replace a newer one.
+    concurrency: docs-${{ github.ref }}
 
     steps:
       - name: Checkout
@@ -35,9 +37,13 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Build docs
+        if: github.event_name == 'pull_request'
         run: pnpm --filter workflow-engine-docs build
 
-      # Deploys happen outside this workflow: Cloudflare Workers Builds is
-      # connected to the repository and runs
-      # `pnpm --filter workflow-engine-docs run cf-deploy` (see
-      # apps/docs/wrangler.jsonc). This job only checks that the site builds.
+      # cf-deploy builds first, so a push to main builds once.
+      - name: Build and deploy docs
+        if: github.event_name == 'push'
+        run: pnpm --filter workflow-engine-docs run cf-deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

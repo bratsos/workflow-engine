@@ -9,10 +9,9 @@
   // The scripts are cf-deploy/cf-preview, not `deploy`: `pnpm deploy` is a
   // reserved pnpm builtin.
   //
-  // Continuous deploys use Cloudflare Workers Builds, connected to the
-  // repository in the Cloudflare dashboard, with root directory "/", the
-  // build variable NODE_VERSION=22 and the deploy command:
-  //   pnpm --filter workflow-engine-docs run cf-deploy
+  // Pushes to main that touch the site deploy through the Docs workflow
+  // (.github/workflows/docs.yml), which runs cf-deploy with the repository
+  // secrets CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID.
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "workflow-engine-docs",
   "compatibility_date": "2026-07-04",
