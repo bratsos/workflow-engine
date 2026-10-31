@@ -5,6 +5,7 @@
  * for non-blocking logging during AI operations.
  */
 
+import type { Persistence } from "../../kernel/ports";
 import { createLogger } from "../../utils/logger";
 import type {
   AICallLogger,
@@ -18,6 +19,7 @@ import {
   validateDatabaseType,
 } from "./prisma-client-type";
 import { isUniqueViolation } from "./sql-errors";
+import { sqliteTransactionReads } from "./transaction-reads";
 
 const logger = createLogger("AICallLogger");
 
@@ -274,6 +276,18 @@ export class PrismaAICallLogger implements AICallLogger {
       ),
       perModel,
     };
+  }
+
+  transactionReads(
+    persistence: Persistence,
+  ): Partial<AICallLogger> | undefined {
+    if (this.databaseType !== "sqlite") return undefined;
+    return sqliteTransactionReads(persistence, this.prisma, (tx) => {
+      const reader = new PrismaAICallLogger(tx, {
+        databaseType: this.databaseType,
+      });
+      return { getStats: reader.getStats.bind(reader) };
+    });
   }
 
   /**

@@ -47,6 +47,7 @@ import {
   isSqliteBusy,
   isUniqueViolation,
 } from "./sql-errors";
+import { registerSqliteTransaction } from "./transaction-reads";
 import { utcTimestampParam } from "./utc-timestamps";
 
 // Structural client type -- see prisma-client-type.ts. Kept as a local
@@ -301,7 +302,8 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     ) {
       return fn(this);
     }
-    return this.prisma.$transaction(async (tx: PrismaClient) => {
+    let closeReads: (() => void) | undefined;
+    const transaction = this.prisma.$transaction(async (tx: PrismaClient) => {
       // The transactional clone must carry every option: a clone built
       // without `statusEnumName` cast with `::"Status"` inside the
       // transaction (`42704 type "Status" does not exist` on every
@@ -311,8 +313,23 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       // re-probe on every transaction, and a downgrade either side
       // discovers has to be visible to the other.
       txPersistence.versioning = this.versioning;
-      return fn(txPersistence);
+      if (this.databaseType !== "sqlite") return fn(txPersistence);
+      closeReads = registerSqliteTransaction(
+        txPersistence,
+        this,
+        this.prisma,
+        tx,
+      );
+      try {
+        return await fn(txPersistence);
+      } finally {
+        closeReads();
+      }
     });
+    // A driver deadline may reject before its callback settles.
+    return this.databaseType === "sqlite"
+      ? transaction.finally(() => closeReads?.())
+      : transaction;
   }
 
   // ============================================================================

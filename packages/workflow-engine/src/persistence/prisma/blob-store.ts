@@ -12,8 +12,12 @@
  * (S3, R2, ...) do not have to add the model.
  */
 
-import type { BlobStore } from "../../kernel/ports.js";
-import type { PrismaDelegate } from "./prisma-client-type.js";
+import type { BlobStore, Persistence } from "../../kernel/ports.js";
+import type {
+  EnginePrismaClient,
+  PrismaDelegate,
+} from "./prisma-client-type.js";
+import { sqliteTransactionReads } from "./transaction-reads.js";
 
 /** The one delegate the Prisma blob store needs. */
 export interface BlobPrismaClient {
@@ -61,6 +65,19 @@ export class PrismaBlobStore implements BlobStore {
       orderBy: { key: "asc" },
     })) as Array<{ key: string }>;
     return rows.map((r) => r.key);
+  }
+
+  transactionReads(persistence: Persistence): Partial<BlobStore> | undefined {
+    return sqliteTransactionReads(persistence, this.prisma, (tx) => {
+      const reader = new PrismaBlobStore(
+        tx as EnginePrismaClient & BlobPrismaClient,
+      );
+      return {
+        get: reader.get.bind(reader),
+        has: reader.has.bind(reader),
+        list: reader.list.bind(reader),
+      };
+    });
   }
 }
 
