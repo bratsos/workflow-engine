@@ -37,6 +37,8 @@ type Args = Record<string, any>;
 interface Column {
   codecId: string;
   nullable: boolean;
+  /** Present when the database fills the column in. */
+  default?: unknown;
   typeParams?: { typeName?: string };
   /** The members of a native enum, from the contract. */
   members?: string[];
@@ -676,14 +678,23 @@ async function attach(
 /**
  * `INSERT` statements for `data`, each within Postgres's limit of 65,535 bind
  * parameters (and of the arguments one call can spread): one statement unless
- * the rows need more. Every row is checked before any statement runs.
+ * the rows need more. Every row is checked before any statement runs, and a
+ * required column with no default has to be there, as on 6 and 7: left to the
+ * database, `undefined` would be a NOT NULL violation, or no error at all
+ * when an upsert never reaches its insert.
  */
 function insert(m: Model, data: Row[]): Sql[] {
+  const required = Object.keys(m.cols).filter(
+    (n) => !m.cols[n]!.nullable && m.cols[n]!.default === undefined,
+  );
   const rows = data.map((d) => {
     if (!isObject(d)) fail(`${m.name}: a row to create must be an object`);
     const row = { ...d };
     for (const [field, id] of Object.entries(m.onCreate)) {
       if (row[field] === undefined) row[field] = generate(id);
+    }
+    for (const n of required) {
+      if (row[n] === undefined) fail(`${m.name}.${n} is required`);
     }
     return row;
   });

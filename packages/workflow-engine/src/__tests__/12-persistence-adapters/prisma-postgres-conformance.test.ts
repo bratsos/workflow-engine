@@ -3568,6 +3568,61 @@ if (!DATABASE_URL) {
           ],
           ["createMany with no data", () => prisma.workflowRun.createMany({})],
           [
+            "create of undefined for a required column",
+            () =>
+              prisma.workflowRun.create({
+                data: run("n", { workflowName: undefined }),
+              }),
+          ],
+          [
+            "create without a required column",
+            () =>
+              prisma.workflowRun.create({
+                data: { id: "n", workflowId: "wf", workflowName: "wf" },
+              }),
+          ],
+          [
+            "create of undefined for a required JSON column",
+            () =>
+              prisma.workflowRun.create({
+                data: run("n", { input: undefined }),
+              }),
+          ],
+          [
+            "createMany with a row missing a required column",
+            () =>
+              prisma.workflowRun.createMany({
+                data: [run("n"), run("m", { workflowType: undefined })],
+              }),
+          ],
+          [
+            "upsert of undefined for a required column over a row",
+            () =>
+              prisma.workflowBlob.upsert({
+                where: { key: "x" },
+                create: { key: "x", data: undefined },
+                update: { data: 4 },
+              }),
+          ],
+          [
+            "upsert of undefined for a required column over no row",
+            () =>
+              prisma.workflowBlob.upsert({
+                where: { key: "n" },
+                create: { key: "n", data: undefined },
+                update: { data: 4 },
+              }),
+          ],
+          [
+            "upsert of undefined for a required column with update: {}",
+            () =>
+              prisma.workflowBlob.upsert({
+                where: { key: "x" },
+                create: { key: "x", data: undefined },
+                update: {},
+              }),
+          ],
+          [
             "createMany of an undefined row",
             () => prisma.workflowRun.createMany({ data: [undefined] }),
           ],
@@ -4024,6 +4079,14 @@ if (!DATABASE_URL) {
             })),
           );
           expect(await prisma.aICall.count()).toBe(4_700);
+        });
+
+        it("the blob store refuses undefined, and keeps the old value", async () => {
+          const store = createPrismaBlobStore(prisma);
+          await expect(store.put("x", undefined)).rejects.toThrow(REJECTED);
+          await expect(store.put("new", undefined)).rejects.toThrow(REJECTED);
+          expect(await store.get("x")).toBe(1);
+          expect(await store.list("new")).toEqual([]);
         });
 
         it("the blob store lists a prefix as a LIKE pattern", async () => {
