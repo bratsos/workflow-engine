@@ -565,6 +565,8 @@ export function createKernel(config: KernelConfig): Kernel {
     });
   }
 
+  let purgeTail = Promise.resolve();
+
   /**
    * Public dispatch: a thin generic wrapper around `dispatchAny`. `T` is
    * a generic type parameter, so it can't narrow through the discriminant
@@ -575,6 +577,16 @@ export function createKernel(config: KernelConfig): Kernel {
   function dispatch<T extends KernelCommand>(
     command: T,
   ): Promise<CommandResult<T>> {
+    if (command.type === "run.purge") {
+      // A run stays eligible until cleanup finishes. Serialize sweeps in this
+      // kernel so concurrent bounded purges do not all select the same run.
+      const result = purgeTail.then(() => dispatchAny(command));
+      purgeTail = result.then(
+        () => {},
+        () => {},
+      );
+      return result as Promise<CommandResult<T>>;
+    }
     return dispatchAny(command) as Promise<CommandResult<T>>;
   }
 

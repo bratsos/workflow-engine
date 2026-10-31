@@ -177,4 +177,6 @@ jobs:
         run: pnpm --filter @bratsos/workflow-engine run test:sqlite
 
       - name: Run console SQLite conformance tests
-        run: pnpm --filter @bratsos/workflow-engine-console exec vitest run src/__tests__/prisma-read-port.sqlite.test.ts
+        run: |
+          pnpm --filter @bratsos/workflow-engine-console exec node scripts/build-ui.mjs
+          pnpm --filter @bratsos/workflow-engine-console exec vitest run src/__tests__/prisma-read-port.sqlite.test.ts

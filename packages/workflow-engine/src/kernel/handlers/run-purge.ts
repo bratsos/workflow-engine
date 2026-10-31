@@ -12,8 +12,10 @@
  * their own connections: waiting on them inside a transaction can exhaust
  * the pool or block SQLite's writer, and their writes cannot be rolled back.
  * The reference ledger cascades with the stages; a pluggable ledger needs
- * explicit cleanup after commit. A cleanup failure leaves the run deleted
- * and propagates to the caller; its remaining external data needs cleanup.
+ * explicit cleanup. Selection commits first; each run is deleted only after
+ * all its cleanup succeeds. A failure propagates with that run and later
+ * runs still discoverable by the next purge, including after a process exit.
+ * Cleanup can be partial and must be safe to repeat.
  *
  * Nothing is emitted. Retention is housekeeping, not a lifecycle event.
  */
@@ -69,22 +71,13 @@ export async function handleRunPurge(
     limit,
   );
 
-  const workflowRunIds: string[] = [];
-  const blobPrefixes: string[] = [];
-
-  for (const run of runs) {
-    // The run and everything the persistence owns under it.
-    await deps.persistence.deleteRun(run.id);
-
-    workflowRunIds.push(run.id);
-    blobPrefixes.push(...runBlobPrefixes(run));
-  }
+  const workflowRunIds = runs.map((run) => run.id);
 
   return {
     purged: workflowRunIds.length,
     workflowRunIds,
     _events: [],
-    ...(blobPrefixes.length > 0
+    ...(runs.length > 0
       ? {
           _postCommit: async (postDeps: KernelDeps) => {
             for (const run of runs) {
@@ -104,12 +97,14 @@ export async function handleRunPurge(
                   stageIds,
                 );
               }
-            }
-            for (const prefix of blobPrefixes) {
-              const keys = await postDeps.blobStore.list(prefix);
-              for (const key of keys) {
-                await postDeps.blobStore.delete(key);
+              for (const prefix of runBlobPrefixes(run)) {
+                const keys = await postDeps.blobStore.list(prefix);
+                for (const key of keys) {
+                  await postDeps.blobStore.delete(key);
+                }
               }
+              // Keep the cleanup keys reachable until every port succeeds.
+              await postDeps.persistence.deleteRun(run.id);
             }
           },
         }

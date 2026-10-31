@@ -5,6 +5,7 @@ import {
   kernelWorkflow,
   override,
   realDatabase,
+  sqlite,
 } from "./sqlite8-kernel-utils.js";
 import { wrapStepLedger } from "./utils/step-ledger-double.js";
 
@@ -40,29 +41,29 @@ describe.skipIf(!realDatabase)(
       return { ...row, key };
     }
 
-    it("purges jobs, external ledger rows and blobs only after the run delete commits", async () => {
+    it("cleans external data after selection commits and deletes the run last", async () => {
       const { id, stage, key } = await seedPurge();
       const observed: string[] = [];
-      const afterDelete = async (name: string) => {
-        expect(await db.persistence.getRun(id)).toBeNull();
+      const beforeDelete = async (name: string) => {
+        expect((await db.persistence.getRun(id))?.status).toBe("COMPLETED");
         observed.push(name);
       };
       const kernel = db.makeKernel({
         stepLedger: wrapStepLedger(db.stepLedger, {
           async clear(recordId) {
-            await afterDelete("ledger");
+            await beforeDelete("ledger");
             await db.stepLedger.clear(recordId);
           },
         }),
         jobTransport: override(db.jobTransport, {
           deleteByRunAndStages: async (runId, stages) => {
-            await afterDelete("jobs");
+            await beforeDelete("jobs");
             return db.jobTransport.deleteByRunAndStages(runId, stages);
           },
         }),
         blobStore: override(db.blobStore, {
           delete: async (blobKey) => {
-            await afterDelete("blob");
+            await beforeDelete("blob");
             await db.blobStore.delete(blobKey);
           },
         }),
@@ -74,6 +75,7 @@ describe.skipIf(!realDatabase)(
       expect(await db.stepLedger.list(stage.id)).toEqual([]);
       expect(await db.jobTransport.getJobsByWorkflowRun(id)).toEqual([]);
       expect(await db.blobStore.has(key)).toBe(false);
+      expect(await db.persistence.getRun(id)).toBeNull();
     });
 
     it("rolls back a purge without removing jobs, ledger results or blobs", async () => {
@@ -98,20 +100,65 @@ describe.skipIf(!realDatabase)(
       expect(await db.blobStore.has(key)).toBe(true);
     });
 
-    it("reports a post-commit queue failure without restoring the purged run", async () => {
-      const { id } = await seedPurge();
-      const kernel = db.makeKernel({
-        jobTransport: override(db.jobTransport, {
-          deleteByRunAndStages: async () => {
-            throw new Error("queue unavailable");
-          },
-        }),
+    it.each([
+      "workflow_steps",
+      "job_queue",
+      "workflow_blobs",
+      "workflow_runs",
+    ])("retries purge after a real %s delete failure without losing cleanup keys", async (table) => {
+      const rows = [await seedPurge(), await seedPurge()];
+      const command = { type: "run.purge" as const, olderThan: new Date() };
+      if (sqlite) {
+        await db.client.$executeRawUnsafe(
+          `CREATE TRIGGER purge_cleanup_blocked BEFORE DELETE ON "${table}" BEGIN SELECT RAISE(ABORT, 'purge cleanup blocked'); END`,
+        );
+      } else {
+        await db.client.$executeRawUnsafe(
+          "CREATE FUNCTION purge_cleanup_blocked() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'purge cleanup blocked'; END $$",
+        );
+        await db.client.$executeRawUnsafe(
+          `CREATE TRIGGER purge_cleanup_blocked BEFORE DELETE ON "${table}" FOR EACH ROW EXECUTE FUNCTION purge_cleanup_blocked()`,
+        );
+      }
+      try {
+        await expect(db.kernel.dispatch(command)).rejects.toThrow();
+        // Both the interrupted run and the unattempted run remain discoverable.
+        for (const { id } of rows) {
+          expect((await db.persistence.getRun(id))?.status).toBe("COMPLETED");
+        }
+        if (table === "job_queue") {
+          for (const { id } of rows) {
+            expect(await db.jobTransport.getJobsByWorkflowRun(id)).toHaveLength(
+              1,
+            );
+          }
+        }
+      } finally {
+        await db.client.$executeRawUnsafe(
+          sqlite
+            ? "DROP TRIGGER purge_cleanup_blocked"
+            : `DROP TRIGGER purge_cleanup_blocked ON "${table}"`,
+        );
+        if (!sqlite) {
+          await db.client.$executeRawUnsafe(
+            "DROP FUNCTION purge_cleanup_blocked()",
+          );
+        }
+      }
+      await expect(db.kernel.dispatch(command)).resolves.toEqual({
+        purged: 2,
+        workflowRunIds: expect.arrayContaining(rows.map(({ id }) => id)),
       });
-      await expect(
-        kernel.dispatch({ type: "run.purge", olderThan: new Date() }),
-      ).rejects.toThrow("queue unavailable");
-      expect(await db.persistence.getRun(id)).toBeNull();
-      expect(await db.jobTransport.getJobsByWorkflowRun(id)).toHaveLength(1);
+      for (const { id, stage, key } of rows) {
+        expect(await db.persistence.getRun(id)).toBeNull();
+        expect(await db.stepLedger.list(stage.id)).toEqual([]);
+        expect(await db.jobTransport.getJobsByWorkflowRun(id)).toEqual([]);
+        expect(await db.blobStore.has(key)).toBe(false);
+      }
+      await expect(db.kernel.dispatch(command)).resolves.toEqual({
+        purged: 0,
+        workflowRunIds: [],
+      });
     });
 
     it.each([

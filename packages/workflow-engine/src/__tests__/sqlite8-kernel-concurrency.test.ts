@@ -178,22 +178,21 @@ describe.skipIf(!realDatabase)(
       120_000,
     );
 
-    it.skipIf(!sqlite)(
-      "purges with 100 concurrent sweeps and removes every job",
-      async () => {
-        for (let i = 0; i < BURST; i++) await db.seed("COMPLETED", "COMPLETED");
-        await burst(
-          Array.from({ length: BURST }, () => ({
-            type: "run.purge",
-            olderThan: new Date(),
-            limit: 1,
-          })),
-        );
-        expect(await db.client.workflowRun.count()).toBe(0);
-        expect(await db.client.jobQueue.count()).toBe(0);
-      },
-      120_000,
-    );
+    it("purges with 100 concurrent sweeps and removes every job", async () => {
+      for (let i = 0; i < BURST; i++) await db.seed("COMPLETED", "COMPLETED");
+      const results = await burst(
+        Array.from({ length: BURST }, () => ({
+          type: "run.purge",
+          olderThan: new Date(),
+          limit: 1,
+        })),
+      );
+      expect(results.reduce((sum, result) => sum + result.purged, 0)).toBe(
+        BURST,
+      );
+      expect(await db.client.workflowRun.count()).toBe(0);
+      expect(await db.client.jobQueue.count()).toBe(0);
+    }, 120_000);
 
     it.skipIf(!sqlite)(
       "executes 100 durable stages concurrently with real ledger, logs and blobs",

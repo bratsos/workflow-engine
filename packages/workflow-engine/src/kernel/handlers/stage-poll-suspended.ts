@@ -562,6 +562,7 @@ export async function handleStagePollSuspended(
   const resumedWorkflowRunIds = new Set<string>();
   // INVARIANT: job writes run in _postCommit after stage transactions have
   // committed, never while holding their connection (see run-cancel.ts).
+  // Settlement is best-effort; failed writes remain reachable by run.purge.
   const postCommits: Array<() => Promise<void>> = [];
 
   // 3. Process each suspended stage

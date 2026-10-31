@@ -1136,7 +1136,7 @@ The resumed stage keeps its step ledger: completed steps are answered from it, s
 
 ### Retention
 
-Nothing deletes runs unless you ask. `run.purge` — `{ olderThan, statuses?, limit? }` → `{ purged, workflowRunIds }` — clears a terminal run's step ledger, job rows and blobs and deletes the run with everything under it. Both hosts run it on the maintenance tick when given `retention: { olderThanMs, statuses?, limit? }`:
+Nothing deletes runs unless you ask. `run.purge` — `{ olderThan, statuses?, limit? }` → `{ purged, workflowRunIds }` — clears a terminal run's step ledger, job rows and blobs and deletes the run with everything under it. Selection commits before cleanup, which runs outside that transaction; the run is deleted last. A cleanup failure rejects dispatch and leaves the run available to a later purge. Cleanup can be partial, so custom ports must tolerate repeated cleanup. Both hosts run it on the maintenance tick when given `retention: { olderThanMs, statuses?, limit? }`:
 
 ```typescript
 createNodeHost({
