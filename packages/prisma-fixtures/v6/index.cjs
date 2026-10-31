@@ -10,7 +10,7 @@ exports.createPostgresClient = (url) => {
 // Generates a SQLite client and creates every table in `file`, then connects.
 exports.createSqliteClient = (file) => {
   const sqlite = schema.sqlite(__dirname, { withUrl: true });
-  const url = `file:${file}`;
+  const url = `file:${file}?connection_limit=1`;
   const prisma = (...args) =>
     execFileSync(
       process.execPath,

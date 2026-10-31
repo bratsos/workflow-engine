@@ -28,6 +28,7 @@ import {
   createPrismaStepLedger,
   createPrismaWorkflowPersistence,
 } from "../../persistence/prisma/index.js";
+import { rawFor } from "../../persistence/prisma/prisma-client-type.js";
 import {
   aiCallLoggerConformanceSuite,
   jobQueueConformanceSuite,
@@ -160,18 +161,11 @@ describe(`I want the Prisma ${major} SQLite adapters to conform against a real f
       expect(modelRun.config).toEqual({});
 
       const rawId = "sqlite-raw-config-default";
-      await prisma.$executeRawUnsafe(
-        `INSERT INTO "workflow_runs" ("id", "updatedAt", "workflowId", "workflowName", "workflowType", "input") VALUES (?, CURRENT_TIMESTAMP, ?, ?, ?, ?)`,
-        rawId,
-        "sqlite-config-default",
-        "SQLite config default",
-        "sqlite-config-default",
-        "{}",
-      );
-      const rawRows = await prisma.$queryRawUnsafe(
-        `SELECT "config" FROM "workflow_runs" WHERE "id" = ?`,
-        rawId,
-      );
+      await prisma.$executeRaw`
+        INSERT INTO "workflow_runs" ("id", "updatedAt", "workflowId", "workflowName", "workflowType", "input")
+        VALUES (${rawId}, CURRENT_TIMESTAMP, ${"sqlite-config-default"}, ${"SQLite config default"}, ${"sqlite-config-default"}, ${"{}"})`;
+      const rawRows = await rawFor(prisma, { config: "json" }).$queryRaw`
+        SELECT "config" FROM "workflow_runs" WHERE "id" = ${rawId}`;
       const rawConfig = rawRows[0].config;
       expect(
         typeof rawConfig === "string" ? JSON.parse(rawConfig) : rawConfig,

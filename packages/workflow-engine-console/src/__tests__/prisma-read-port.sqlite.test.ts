@@ -372,8 +372,8 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
 
     // The reverse label exercises the same pre-SQL validation branch for the
     // other supported contract target. No query is issued by this check.
-    const postgresTarget = Object.assign(Object.create(prisma), {
-      $databaseType: "postgresql" as const,
+    const postgresTarget = Object.create(prisma, {
+      $databaseType: { value: "postgresql" },
     });
     expect(() =>
       createPrismaConsoleReadPort(postgresTarget, { databaseType: "sqlite" }),

@@ -147,6 +147,7 @@ jobs:
 
     env:
       PRISMA_MAJOR: ${{ matrix.prisma-major }}
+      SQLITE8_KERNEL_SQLITE: "1"
       NODE_ENV: test
 
     steps:

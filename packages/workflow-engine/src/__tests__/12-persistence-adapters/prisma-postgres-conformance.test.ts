@@ -55,6 +55,7 @@ import {
   createPrismaJobQueue,
   createPrismaStepLedger,
   createPrismaWorkflowPersistence,
+  fromPrisma8,
 } from "../../persistence/prisma/index.js";
 import { rawFor } from "../../persistence/prisma/prisma-client-type.js";
 import {
@@ -4828,10 +4829,9 @@ if (!DATABASE_URL) {
   });
 }
 
-// The fixture generates a separate, minimal SQLite client without changing the
-// shipped schema or replacing the Postgres client used by the suites above.
-// Prisma 8 SQLite is covered by the full-file conformance suite.
-describe.skipIf(isPrisma8)("definition registration on real SQLite", () => {
+// A separate SQLite file leaves the Postgres database above untouched while
+// checking the same registration behavior on all three Prisma majors.
+describe("definition registration on real SQLite", () => {
   const require = createRequire(import.meta.url);
   let directory: string;
   let prisma: any;
@@ -4839,10 +4839,16 @@ describe.skipIf(isPrisma8)("definition registration on real SQLite", () => {
     directory = await mkdtemp(
       join(tmpdir(), "definition-registration-sqlite-"),
     );
-    const {
-      createSqliteClient,
-    } = require("../../../../prisma-fixtures/index.cjs");
-    prisma = createSqliteClient(join(directory, "test.db"));
+    const fixture = require("../../../../prisma-fixtures/index.cjs");
+    const file = join(directory, "test.db");
+    if (isPrisma8) {
+      const db = await fixture.createSqliteDb(file);
+      prisma = Object.assign(fromPrisma8(db), {
+        $disconnect: () => db.close(),
+      });
+    } else {
+      prisma = fixture.createSqliteClient(file);
+    }
   }, 30_000);
   afterAll(async () => {
     await prisma?.$disconnect();
@@ -4880,9 +4886,8 @@ describe.skipIf(isPrisma8)("definition registration on real SQLite", () => {
   });
 
   it("stores a raw-inserted createdAt the way the model API stores one", async () => {
-    // The raw insert binds a Date, where the Postgres statements bind an ISO
-    // string: SQLite keeps an integer on 6 and ISO text on 7, and the raw
-    // statement must land on whichever one the model API writes.
+    // Raw and model writes must agree: SQLite keeps integer milliseconds on
+    // Prisma 6 and text timestamps on Prisma 7 and 8.
     await prisma.workflowDefinition.create({
       data: {
         workflowId: "sqlite-model",
@@ -4900,7 +4905,10 @@ describe.skipIf(isPrisma8)("definition registration on real SQLite", () => {
       snapshot: {},
       structureHash: "h",
     });
-    const rows = (await prisma.$queryRawUnsafe(
+    const rows = (await rawFor(prisma, {
+      id: "text",
+      type: "text",
+    }).$queryRawUnsafe(
       `SELECT "workflowId" AS id, typeof("createdAt") AS type FROM "workflow_definitions" WHERE "workflowId" IN ('sqlite-model', 'sqlite-raw')`,
     )) as Array<{ id: string; type: string }>;
     const types = Object.fromEntries(rows.map((row) => [row.id, row.type]));
