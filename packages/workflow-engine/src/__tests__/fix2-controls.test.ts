@@ -210,6 +210,42 @@ describe.skipIf(!realDatabase)(
       },
     );
 
+    it.skipIf(!sqlite)(
+      "rejects a batched enqueue after its enclosing transaction rolls back",
+      async () => {
+        const resource = new AsyncResource("external-batch-host");
+        const id = crypto.randomUUID();
+        let late: Promise<string[]> | undefined;
+        try {
+          await expect(
+            db.client.$transaction(
+              async (tx: any) => {
+                await tx.workflowLog.create({
+                  data: { level: "INFO", message: "batch rollback" },
+                });
+                late = resource.runInAsyncScope(() =>
+                  db.jobTransport.enqueueParallel([
+                    {
+                      workflowRunId: id,
+                      workflowId: db.workflow.id,
+                      stageId: "late",
+                    },
+                  ]),
+                );
+                await late;
+              },
+              { timeout: 100 },
+            ),
+          ).rejects.toMatchObject({ code: "P2028" });
+          await expect(late).rejects.toMatchObject({ code: "P2028" });
+          expect(await db.jobTransport.getJobsByWorkflowRun(id)).toEqual([]);
+          expect(await db.client.workflowLog.findMany()).toEqual([]);
+        } finally {
+          resource.emitDestroy();
+        }
+      },
+    );
+
     it.skipIf(!sqlite || process.env.PRISMA_MAJOR !== "8")(
       "rejects a queued root write after rollback even if its async context is lost",
       async () => {

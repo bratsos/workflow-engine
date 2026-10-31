@@ -117,27 +117,25 @@ export function withTransactionWriteGuard<T extends object>(
     return client;
   const active = nativeTransactions(prisma);
   if (!active) return client;
+  const afterTransactions = async <R>(work: () => Promise<R>): Promise<R> => {
+    const owners = [...active];
+    const independent = await isIndependentWrite();
+    if (
+      (await Promise.all(owners)).some((committed) => !committed) &&
+      !independent
+    ) {
+      throw Object.assign(
+        new Error(
+          "Transaction rolled back before an outer adapter write could run. Use the transaction client for transactional writes.",
+        ),
+        { code: "P2028" },
+      );
+    }
+    return work();
+  };
   const guard = (operation: any) => {
     let pending: Promise<unknown> | undefined;
-    const run = () =>
-      (pending ??= (async () => {
-        // Capture by connection ownership, independent of async context. A root
-        // write awaited by its transaction waits until the driver rolls it back.
-        const owners = [...active];
-        const independent = await isIndependentWrite();
-        if (
-          (await Promise.all(owners)).some((committed) => !committed) &&
-          !independent
-        ) {
-          throw Object.assign(
-            new Error(
-              "Transaction rolled back before an outer adapter write could run. Use the transaction client for transactional writes.",
-            ),
-            { code: "P2028" },
-          );
-        }
-        return await operation;
-      })());
+    const run = () => (pending ??= afterTransactions(() => operation));
     return new Proxy(operation, {
       get(target, key) {
         if (key === "then") return (...args: any[]) => run().then(...args);
@@ -155,6 +153,13 @@ export function withTransactionWriteGuard<T extends object>(
     return new Proxy(target, {
       get(target, key) {
         const value: any = Reflect.get(target, key);
+        if (key === "$transaction")
+          return (arg: any, options?: any) =>
+            Array.isArray(arg)
+              ? // Gate the whole batch before Prisma binds its lazy operations to
+                // that transaction. Keep the batch form and its unlimited deadline.
+                afterTransactions(() => value.call(target, arg, options))
+              : value.call(target, arg, options);
         if (key === "$withColumns" && typeof value === "function")
           return (...args: any[]) => wrap(value.apply(target, args));
         if (
