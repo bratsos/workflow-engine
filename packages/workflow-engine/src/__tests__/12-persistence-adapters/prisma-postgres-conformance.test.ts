@@ -3953,6 +3953,27 @@ if (!DATABASE_URL) {
           ).toEqual([{ count: 20_000 }, 20_002]);
         });
 
+        it("opens a transaction at an isolation level on a client that has run nothing yet", async () => {
+          const own = createPostgresClient(DATABASE_URL);
+          try {
+            const levels = await Promise.all(
+              Array.from({ length: 4 }, () =>
+                own.$transaction(
+                  async (tx: any) =>
+                    (
+                      await rawFor(tx, { level: "text" })
+                        .$queryRaw`SELECT current_setting('transaction_isolation') AS level`
+                    )[0].level,
+                  { isolationLevel: "Serializable" },
+                ),
+              ),
+            );
+            expect(levels).toEqual(Array(4).fill("serializable"));
+          } finally {
+            await own.$disconnect();
+          }
+        });
+
         it("keeps the array form free of the default timeout", async () => {
           expect(await prisma.$transaction([])).toEqual([]);
           const [, count] = await prisma.$transaction([

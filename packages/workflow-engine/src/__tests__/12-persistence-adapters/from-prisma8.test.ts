@@ -4,7 +4,9 @@
  * construction checks. The adapters' own suites cover the rest on every major;
  * this file only runs on PRISMA_MAJOR=8 with DATABASE_URL set.
  */
+import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
   createPrismaJobQueue,
@@ -429,6 +431,49 @@ describe.skipIf(!DATABASE_URL || !isPrisma8)(
         await expect(
           prisma.$transaction(async () => {}, { maxWait: 1 }),
         ).rejects.toThrow(/maxWait/);
+      });
+
+      it("starts the first transaction at an isolation level on a client over a pool of its own", async () => {
+        const fixtureDir = join(
+          dirname(
+            createRequire(import.meta.url).resolve(
+              "../../../../prisma-fixtures/index.cjs",
+            ),
+          ),
+          "v8",
+        );
+        const v8 = createRequire(join(fixtureDir, "index.cjs"));
+        const postgres = v8("@prisma/orm-postgres/runtime").default;
+        const { contractFromJson } = v8("@prisma/orm-postgres/static");
+        const { Pool } = createRequire(
+          v8.resolve("@prisma/orm-postgres/runtime"),
+        )("pg");
+        const contract = contractFromJson(
+          JSON.parse(
+            readFileSync(join(fixtureDir, ".generated/contract.json"), "utf8"),
+          ),
+        );
+        const pool = new Pool({ connectionString: DATABASE_URL, max: 4 });
+        const db = postgres({ contract, pg: pool });
+        try {
+          const own: any = fromPrisma8(db);
+          const levels = await Promise.all(
+            Array.from({ length: 4 }, () =>
+              own.$transaction(
+                async (tx: any) =>
+                  (
+                    await rawFor(tx, { level: "text" })
+                      .$queryRaw`SELECT current_setting('transaction_isolation') AS level`
+                  )[0].level,
+                { isolationLevel: "RepeatableRead" },
+              ),
+            ),
+          );
+          expect(levels).toEqual(Array(4).fill("repeatable read"));
+        } finally {
+          await db.close();
+          await pool.end();
+        }
       });
 
       it("builds the ports over a consumer's own tx, so their writes and the engine's commit and roll back together", async () => {

@@ -827,6 +827,24 @@ async function aggregate(x: Executor, m: Model, a: Args, by: string[] = []) {
   });
 }
 
+/**
+ * Prisma 8 checks the database against the contract with the first statement a
+ * client runs, on that statement's connection. A transaction that starts with
+ * SET TRANSACTION ISOLATION LEVEL must not be that statement: the check's
+ * queries would come first, and Postgres refuses the SET after a query (25001).
+ * So the first one waits for a statement outside any transaction.
+ */
+const verified = new WeakMap<object, Promise<unknown>>();
+function verify(db: Prisma8Db): Promise<unknown> {
+  let done = verified.get(db);
+  if (!done) {
+    done = affected(db, new Sql().t("SELECT 1"));
+    verified.set(db, done);
+    done.catch(() => verified.delete(db));
+  }
+  return done;
+}
+
 /** Prisma's default `timeout` for `$transaction(fn)`. */
 const DEFAULT_TIMEOUT = 5000;
 
@@ -1228,6 +1246,11 @@ export function fromPrisma8(
     const transaction = async (arg: any, options: Args = {}) => {
       check("$transaction", options, ["isolationLevel", "timeout"]);
       const callback = typeof arg === "function";
+      const level = options.isolationLevel
+        ? (ISOLATION[options.isolationLevel] ??
+          fail(`unknown isolation level "${options.isolationLevel}"`))
+        : undefined;
+      if (level) await verify(db as Prisma8Db);
       return (db as Prisma8Db).transaction(async (raw: Executor) => {
         const open = deadline(
           options.timeout ?? (callback ? DEFAULT_TIMEOUT : undefined),
@@ -1239,10 +1262,7 @@ export function fromPrisma8(
         };
         return open.race(
           (async () => {
-            if (options.isolationLevel) {
-              const level =
-                ISOLATION[options.isolationLevel] ??
-                fail(`unknown isolation level "${options.isolationLevel}"`);
+            if (level) {
               await affected(
                 raw,
                 new Sql().t(`SET TRANSACTION ISOLATION LEVEL ${level}`),
