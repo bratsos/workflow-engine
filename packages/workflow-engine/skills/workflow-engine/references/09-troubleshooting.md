@@ -71,7 +71,7 @@ await kernel.dispatch({ type: "run.transition", workflowRunId: runId });
 
 ## P2028 Transaction Timeout on Suspended Stage Polling
 
-**Symptom:** Logs show `P2028: Transaction API error: A query cannot be executed on an expired transaction` during `stage.pollSuspended` (Prisma 6 and 7: a `PrismaClientKnownRequestError` with `meta`). On Prisma 8 the code is the same but the error is a plain `Error` with no `meta`, raised by `fromPrisma8`, and the message is `Transaction already closed: the 1000ms timeout passed.` (with your timeout), so search the logs for the code, not the text. Suspended stages never transition to `COMPLETED` even when the batch provider reports completion.
+**Symptom:** Logs show `P2028` during `stage.pollSuspended`, with a message that contains `A query cannot be executed on an expired transaction` (Prisma 6 and 7: a `PrismaClientKnownRequestError` with `meta`; Prisma 6 puts `Transaction already closed:` in front of that text). On Prisma 8 the code is the same but the error is a plain `Error` with no `meta`, raised by `fromPrisma8`, and the message is `Transaction already closed: the 1000ms timeout passed.` (with your timeout), so search the logs for the code, not the text. Suspended stages never transition to `COMPLETED` even when the batch provider reports completion.
 
 **What it was:** `checkCompletion()` was running inside the kernel's global Prisma interactive transaction. Batch provider API calls (Google Batch, OpenAI Batch, etc.) that took longer than the default 5s timeout would expire the transaction, and the subsequent `updateStage()` call would fail.
 

@@ -95,7 +95,7 @@ This guide covers common issues encountered when running **workflow-engine**, ho
   * Making external API calls to batch providers (like OpenAI or Google) inside a database transaction exceeds Prisma's interactive transaction timeout (5 seconds by default).
 * **Self-Healing**:
   * `stage.pollSuspended` replays the stage body (and runs `checkCompletion()`) outside database transactions. State updates are committed in a subsequent short transaction, resolving P2028 database timeouts.
-* **What it looks like**: the code is `P2028` on Prisma 6, 7 and 8, but the error differs. On Prisma 6 and 7 it is a `PrismaClientKnownRequestError` with `meta`, and the message starts `Transaction API error: A query cannot be executed on an expired transaction`. On Prisma 8 it is a plain `Error` with no `meta`, raised by `fromPrisma8`, and the message is `Transaction already closed: the 1000ms timeout passed.` (with your timeout). A log search for the Prisma 6 and 7 text finds nothing on Prisma 8, so search for the code.
+* **What it looks like**: the code is `P2028` on Prisma 6, 7 and 8, but the error differs. On Prisma 6 and 7 it is a `PrismaClientKnownRequestError` with `meta`, and the message contains `A query cannot be executed on an expired transaction` (Prisma 6 puts `Transaction already closed:` in front of it). On Prisma 8 it is a plain `Error` with no `meta`, raised by `fromPrisma8`, and the message is `Transaction already closed: the 1000ms timeout passed.` (with your timeout). A log search for the Prisma 6 and 7 text finds nothing on Prisma 8, so search for the code.
 
 ---
 

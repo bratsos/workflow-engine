@@ -20,6 +20,10 @@
  * when dequeued; a SUSPENDED job is never dequeued, so it stays SUSPENDED until
  * `run.purge`, and a second `run.cancel` returns `cancelled: false` without
  * retrying the update.
+ *
+ * `run.redrive` accepts a CANCELLED run, so one that lands in that window is
+ * undone: the run ends RUNNING with its new job CANCELLED, and
+ * `run.reapStuck` re-enqueues the job later.
  */
 
 import type { RunCancelCommand, RunCancelResult } from "../commands";

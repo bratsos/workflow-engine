@@ -663,7 +663,7 @@ cat node_modules/@bratsos/workflow-engine/sql/enqueue.sql \
 npx prisma migrate dev
 ```
 
-Prisma 8 has no `migrate dev --create-only` (the CLI prints its root help). Apply the file with `psql`, as above (it works unchanged on a Prisma 8 database), or author a custom migration with `prisma migration new`.
+Prisma 8 has no `migrate dev --create-only`: the CLI fails with `CLI.COMMAND_MOVED` and points to `contract emit`, then `migration plan --name <name>` (for `--create-only`, stop here), then `db migrate --advance-ref db`. Apply the file with `psql`, as above (it works unchanged on a Prisma 8 database), or author a custom migration with `prisma migration new`.
 
 Requires PostgreSQL 13 or newer (for the built-in `gen_random_uuid()`).
 
@@ -811,7 +811,7 @@ const sqliteStepLedger = createPrismaStepLedger(prisma, {
 
 * **Prisma 6:** `?schema=name` in the connection URL works.
 * **Prisma 7:** the driver adapter's `schema` option, `new PrismaPg({ connectionString }, { schema: "name" })`, qualifies the SQL Prisma generates but not the engine's own raw SQL (`FROM job_queue`). Every dequeue then fails with `P2010 relation "job_queue" does not exist`, the host retries in a loop and runs stay `PENDING`. Set `search_path` as well: `new PrismaPg({ connectionString, options: "-c search_path=name" }, { schema: "name" })`.
-* **Prisma 8:** the engine's tables must be in `public`. `fromPrisma8` reads the contract's `public` namespace, so with the engine's models in another namespace it throws `TypeError: Cannot read properties of undefined (reading 'models')`, and `mixed-order-indexes.sql` fails with `relation "workflow_runs" does not exist`.
+* **Prisma 8:** the engine's tables must be in `public`. `fromPrisma8` reads the contract's `public` namespace, so with the engine's models in another namespace it throws an error saying the engine's models must be in the contract's `public` namespace, and `mixed-order-indexes.sql` fails with `relation "workflow_runs" does not exist`.
 
 ### TLS
 
