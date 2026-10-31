@@ -7,7 +7,10 @@
     "@bratsos/workflow-engine-console": "0.0.0",
     "@bratsos/workflow-engine-host-node": "0.4.2",
     "@bratsos/workflow-engine-host-remote": "0.2.2",
-    "@bratsos/workflow-engine-host-serverless": "0.3.2"
+    "@bratsos/workflow-engine-host-serverless": "0.3.2",
+    "workflow-engine-prisma-v6": "0.0.0",
+    "workflow-engine-prisma-v7": "0.0.0",
+    "workflow-engine-prisma-v8": "0.0.0"
   },
   "changesets": [
     "ai-evaluate",
@@ -16,6 +19,10 @@
     "batch-provider-seam",
     "cost-accounting-steps",
     "cost-accounting",
-    "durable-steps-v1"
+    "durable-steps-v1",
+    "job-queue-enqueue-type",
+    "prisma-7-driver-adapter-fixes",
+    "prisma-8-support",
+    "run-cancel-bursts"
   ]
 }
