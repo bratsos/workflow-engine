@@ -6,6 +6,7 @@ import { dirname, join, resolve } from "node:path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { createPrismaAICallLogger } from "../../persistence/prisma/ai-logger.js";
 import { fromPrisma8 } from "../../persistence/prisma/from-prisma8.js";
+import { createPrismaJobQueue } from "../../persistence/prisma/job-queue.js";
 import {
   isSerializationFailure,
   isUniqueViolation,
@@ -113,6 +114,322 @@ describe.skipIf(process.env.PRISMA_MAJOR !== "8")(
         "workflowBlob",
       ])
         await prisma[model].deleteMany({});
+    });
+
+    const queueCycle = async (id: string) => {
+      const queue = createPrismaJobQueue(prisma, {
+        databaseType: "sqlite",
+        workerId: "recovery",
+      });
+      const jobId = await queue.enqueue({
+        workflowRunId: id,
+        workflowId: "wf",
+        stageId: "recovery",
+        payload: { recovered: true },
+      });
+      const job = await queue.dequeue();
+      expect(job?.jobId).toBe(jobId);
+      expect(
+        await queue.complete(jobId, {
+          attempt: job!.attempt,
+          startedAt: job!.startedAt,
+        }),
+      ).toBe("acknowledged");
+      expect(
+        await prisma.jobQueue.findUnique({
+          where: { id: jobId },
+          select: { status: true },
+        }),
+      ).toEqual({ status: "COMPLETED" });
+      const [row] = await prisma
+        .$withColumns({ status: "text" })
+        .$queryRawUnsafe("SELECT status FROM job_queue WHERE id = $1", jobId);
+      expect(row.status).toBe("COMPLETED");
+    };
+
+    it.each([
+      "raw",
+      "raw-json",
+      "raw-text",
+      "raw-float",
+      "delegate",
+      "aggregate",
+      "returning",
+    ])("recovers a valid queue cycle after a rejected %s INTEGER read", async (kind) => {
+      await prisma.workflowRun.create({ data: run("recovery") });
+      expect(
+        await prisma.$executeRawUnsafe(
+          "UPDATE workflow_runs SET totalTokens = $1 WHERE id = $2",
+          9007199254740993n,
+          "recovery",
+        ),
+      ).toBe(1);
+      const [stored] = await prisma
+        .$withColumns({ value: "text", storage: "text" })
+        .$queryRawUnsafe(
+          "SELECT CAST(totalTokens AS TEXT) AS value, typeof(totalTokens) AS storage FROM workflow_runs WHERE id = $1",
+          "recovery",
+        );
+      expect(stored).toEqual({ value: "9007199254740993", storage: "integer" });
+      const reads: Record<string, () => Promise<unknown>> = {
+        raw: () =>
+          prisma
+            .$withColumns({ totalTokens: "int" })
+            .$queryRawUnsafe(
+              "SELECT totalTokens FROM workflow_runs WHERE id = $1; -- read",
+              "recovery",
+            ),
+        "raw-json": () =>
+          prisma
+            .$withColumns({ totalTokens: "json" })
+            .$queryRawUnsafe(
+              "SELECT totalTokens FROM workflow_runs WHERE id = $1",
+              "recovery",
+            ),
+        "raw-text": () =>
+          prisma
+            .$withColumns({ totalTokens: "text" })
+            .$queryRawUnsafe(
+              "SELECT totalTokens FROM workflow_runs WHERE id = $1",
+              "recovery",
+            ),
+        "raw-float": () =>
+          prisma
+            .$withColumns({ totalTokens: "float" })
+            .$queryRawUnsafe(
+              "SELECT totalTokens FROM workflow_runs WHERE id = $1",
+              "recovery",
+            ),
+        delegate: () =>
+          prisma.workflowRun.findUnique({ where: { id: "recovery" } }),
+        aggregate: () =>
+          prisma.workflowRun.aggregate({ _max: { totalTokens: true } }),
+        returning: () =>
+          prisma
+            .$withColumns({ value: "int" })
+            .$queryRawUnsafe(
+              "UPDATE workflow_runs SET priority = 7 WHERE id = $1 RETURNING totalTokens AS value",
+              "recovery",
+            ),
+      };
+      await expect(reads[kind]!()).rejects.toThrow();
+      await queueCycle("recovery");
+      await prisma.$executeRaw`UPDATE workflow_runs SET totalTokens = ${3} WHERE id = ${"recovery"}`;
+      expect(
+        (await prisma.workflowRun.findUnique({ where: { id: "recovery" } }))
+          .totalTokens,
+      ).toBe(3);
+    });
+
+    it.each([
+      "raw-json",
+      "delegate-json",
+      "raw-date",
+      "delegate-date",
+      "sql",
+    ])("recovers a valid queue cycle after a rejected %s decode", async (kind) => {
+      await prisma.workflowRun.create({ data: run("recovery") });
+      const json = kind.includes("json"),
+        field = json ? "input" : "startedAt";
+      if (kind !== "sql")
+        await prisma.$executeRawUnsafe(
+          `UPDATE workflow_runs SET "${field}" = $1 WHERE id = $2`,
+          "invalid",
+          "recovery",
+        );
+      const read =
+        kind === "sql"
+          ? () =>
+              prisma
+                .$withColumns({ value: "json" })
+                .$queryRawUnsafe(
+                  "SELECT json_extract('invalid', '$') AS value FROM workflow_runs",
+                )
+          : kind.startsWith("raw")
+            ? () =>
+                prisma
+                  .$withColumns({ [field]: json ? "json" : "timestamp" })
+                  .$queryRawUnsafe(
+                    `SELECT "${field}" FROM workflow_runs WHERE id = $1`,
+                    "recovery",
+                  )
+            : () =>
+                prisma.workflowRun.findUnique({ where: { id: "recovery" } });
+      await expect(read()).rejects.toThrow();
+      await queueCycle("recovery");
+      if (kind !== "sql")
+        await prisma.$executeRawUnsafe(
+          `UPDATE workflow_runs SET "${field}" = $1 WHERE id = $2`,
+          json ? "{}" : "2026-01-01T00:00:00.000Z",
+          "recovery",
+        );
+      const row = await prisma.workflowRun.findUnique({
+        where: { id: "recovery" },
+      });
+      expect(row.input).toEqual({});
+      if (!json && kind !== "sql")
+        expect(row.startedAt).toEqual(new Date("2026-01-01T00:00:00.000Z"));
+    });
+
+    it("keeps every signed 64-bit BigInt exact and rejects out-of-range binds without mutation or poisoning", async () => {
+      await prisma.workflowRun.create({ data: run("bigints") });
+      const raw = prisma.$withColumns({ value: "bigint", storage: "text" });
+      for (const value of [
+        0n,
+        -1n,
+        9007199254740993n,
+        -9007199254740993n,
+        (1n << 63n) - 1n,
+        -(1n << 63n),
+      ]) {
+        expect(
+          await raw.$queryRaw`SELECT ${value} AS value, typeof(${value}) AS storage`,
+        ).toEqual([{ value, storage: "integer" }]);
+        await prisma.$executeRawUnsafe(
+          "UPDATE workflow_runs SET totalTokens = $1 WHERE id = $2",
+          value,
+          "bigints",
+        );
+        expect(
+          await prisma
+            .$withColumns({ totalTokens: "bigint" })
+            .$queryRawUnsafe(
+              "SELECT totalTokens FROM workflow_runs WHERE id = $1",
+              "bigints",
+            ),
+        ).toEqual([{ totalTokens: value }]);
+      }
+      await prisma.$executeRawUnsafe(
+        "UPDATE workflow_runs SET totalTokens = $1 WHERE id = $2",
+        9n,
+        "bigints",
+      );
+      for (const value of [1n << 63n, -(1n << 63n) - 1n]) {
+        await expect(
+          prisma.$executeRawUnsafe(
+            "UPDATE workflow_runs SET totalTokens = $1 WHERE id = $2",
+            value,
+            "bigints",
+          ),
+        ).rejects.toThrow();
+        expect(
+          (await prisma.workflowRun.findUnique({ where: { id: "bigints" } }))
+            .totalTokens,
+        ).toBe(9);
+      }
+      expect(() =>
+        prisma.$executeRawUnsafe(
+          "UPDATE workflow_runs SET workflowName = $1 WHERE id = $2",
+          ["invalid"],
+          "bigints",
+        ),
+      ).toThrow(/arrays/);
+      await queueCycle("bigints");
+      // Root connection state and valid floating point reads survive too.
+      const state = prisma.$withColumns({ changed: "int", fraction: "float" });
+      await prisma.$executeRawUnsafe(
+        "UPDATE workflow_runs SET priority = 8 WHERE id = $1",
+        "bigints",
+      );
+      expect(
+        await state.$queryRaw`SELECT changes() AS changed, ${1.0000000000000002} AS fraction`,
+      ).toEqual([{ changed: 1, fraction: 1.0000000000000002 }]);
+      await prisma.$executeRawUnsafe(
+        'CREATE TEMP TABLE "__prisma8_read" (value INTEGER)',
+      );
+      try {
+        await prisma.$executeRawUnsafe(
+          'INSERT INTO "__prisma8_read" VALUES (3)',
+        );
+        expect(
+          await prisma
+            .$withColumns({ value: "int" })
+            .$queryRawUnsafe('SELECT value FROM "__prisma8_read"'),
+        ).toEqual([{ value: 3 }]);
+      } finally {
+        await prisma.$executeRawUnsafe('DROP TABLE "__prisma8_read"');
+      }
+    });
+
+    it("keeps RETURNING aliases, expressions, wildcards and bind counts intact", async () => {
+      await prisma.workflowRun.create({ data: run("returning") });
+      const raw = prisma.$withColumns({ value: "int" });
+      for (const projection of [
+        "totalTokens AS value",
+        "totalTokens value",
+        "totalTokens + $2 AS value",
+        'totalTokens AS "value" -- comment',
+      ]) {
+        expect(
+          await raw.$queryRawUnsafe(
+            `UPDATE workflow_runs SET totalTokens = 3 WHERE id = $1 RETURNING ${projection}`,
+            "returning",
+            0,
+          ),
+        ).toEqual([{ value: 3 }]);
+      }
+      for (const projection of [
+        "(totalTokens)",
+        "(( totalTokens ))",
+        "totalTokens /* comment */",
+        "workflow_runs.totalTokens",
+      ]) {
+        expect(
+          await prisma
+            .$withColumns({ totalTokens: "int" })
+            .$queryRawUnsafe(
+              `UPDATE workflow_runs SET totalTokens = 3 WHERE id = $1 RETURNING ${projection}`,
+              "returning",
+            ),
+        ).toEqual([{ totalTokens: 3 }]);
+      }
+      expect(
+        (
+          await prisma
+            .$withColumns("workflow_runs")
+            .$queryRawUnsafe(
+              "UPDATE workflow_runs SET totalTokens = 4 WHERE id = $1 RETURNING *",
+              "returning",
+            )
+        )[0].totalTokens,
+      ).toBe(4);
+      const values = Array.from({ length: 5000 }, (_, i) => i);
+      expect(
+        await raw.$queryRawUnsafe(
+          `UPDATE workflow_runs SET priority = 5 WHERE id = $1 RETURNING totalTokens IN (${values.map((_, i) => `$${i + 2}`).join(", ")}) AS value`,
+          "returning",
+          ...values,
+        ),
+      ).toEqual([{ value: 1 }]);
+    });
+
+    it("retains explicit empty raw specs for reads and RETURNING, while requiring a declaration", async () => {
+      const empty = prisma.$withColumns({});
+      expect(await empty.$queryRawUnsafe("SELECT 1 AS value")).toEqual([{}]);
+      await prisma.workflowRun.createMany({
+        data: [run("empty-1"), run("empty-2")],
+      });
+      expect(
+        await empty.$queryRawUnsafe("SELECT * FROM workflow_runs"),
+      ).toEqual([{}, {}]);
+      expect(
+        await empty.$queryRawUnsafe(
+          "UPDATE workflow_runs SET priority = 7 RETURNING *",
+        ),
+      ).toEqual([{}, {}]);
+      expect(
+        await empty.$queryRawUnsafe(
+          "UPDATE workflow_runs SET priority = 8 WHERE id = $1 RETURNING priority",
+          "empty-1",
+        ),
+      ).toEqual([{}]);
+      expect(
+        (await prisma.workflowRun.findUnique({ where: { id: "empty-1" } }))
+          .priority,
+      ).toBe(8);
+      await expect(prisma.$queryRawUnsafe("SELECT 1 AS value")).rejects.toThrow(
+        /declare its result columns/,
+      );
     });
 
     it("exposes readonly target metadata on roots, transactions and raw views", async () => {

@@ -233,10 +233,13 @@ const notFound = () =>
 // ============================================================================
 
 /** A raw parameter in a form the Prisma 8 raw lane takes: `Date` and arrays are not. */
-function param(value: unknown): unknown {
+function param(value: unknown, sqlite = false): unknown {
   if (value instanceof Date) return value.toISOString();
-  if (typeof value === "bigint") return String(value);
-  if (Array.isArray(value)) return arrayLiteral(value);
+  if (typeof value === "bigint") return sqlite ? value : String(value);
+  if (Array.isArray(value)) {
+    if (sqlite) fail("SQLite raw parameters do not support arrays");
+    return arrayLiteral(value);
+  }
   return value;
 }
 
@@ -263,8 +266,8 @@ class Sql {
   }
 
   /** A parameter, followed by `suffix` (a cast such as `::text`). */
-  v(value: unknown, suffix = ""): this {
-    const bound = param(value);
+  v(value: unknown, suffix = "", sqlite = false): this {
+    const bound = param(value, sqlite);
     if (bound == null) return this.t(`NULL${suffix}`);
     this.values.push(bound);
     this.parts.push(suffix);
@@ -283,7 +286,7 @@ class Sql {
 }
 
 /** Text with `$1`..`$n` placeholders: a repeated `$n` binds its value at each occurrence. */
-function positional(text: string, values: unknown[]): Sql {
+function positional(text: string, values: unknown[], sqlite = false): Sql {
   const pieces = text.split(/\$(\d+)/);
   const q = new Sql().t(pieces[0]!);
   for (let i = 1; i < pieces.length; i += 2) {
@@ -291,16 +294,20 @@ function positional(text: string, values: unknown[]): Sql {
     if (index < 1 || index > values.length) {
       fail(`parameter $${index} has no value`);
     }
-    q.v(values[index - 1]).t(pieces[i + 1]!);
+    q.v(values[index - 1], "", sqlite).t(pieces[i + 1]!);
   }
   return q;
 }
 
-function template(strings: readonly string[], values: unknown[]): Sql {
+function template(
+  strings: readonly string[],
+  values: unknown[],
+  sqlite = false,
+): Sql {
   const q = new Sql();
   strings.forEach((text, i) => {
     q.t(text);
-    if (i < values.length) q.v(values[i]);
+    if (i < values.length) q.v(values[i], "", sqlite);
   });
   return q;
 }
@@ -311,13 +318,207 @@ const toPlan = (x: Executor, q: Sql) =>
 const affected = async (x: Executor, q: Sql): Promise<number> =>
   (await x.execute(toPlan(x, q).affectedCount().build())).affectedRows;
 
+const sqliteExecutors = new WeakSet<Executor>();
+
+/**
+ * rc.21 cannot finalize its native iterator when converting an INTEGER to a
+ * JS number throws in next(). Carry unsafe integers as text instead: decoding
+ * then happens after a row was yielded, where the runtime closes the iterator.
+ * BigInt columns can read that text exactly; other columns must still reject it.
+ */
+function sqliteRead(q: Sql, spec: Record<string, string>) {
+  const source = q.parts.join("\0");
+  const tokens = [
+    ...source.matchAll(
+      /--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/|'(?:''|[^'])*'|"(?:""|[^"])*"|`(?:``|[^`])*`|\[[^\]]*\]|\w+|[(),;*]/g,
+    ),
+  ].filter(([s]) => !s.startsWith("--") && !s.startsWith("/*"));
+  let depth = 0;
+  const top = tokens.filter(([s]) => {
+    if (s === ")") depth--;
+    const outside = depth === 0;
+    if (s === "(") depth++;
+    return outside;
+  });
+  const returning = top.find((t) => /^RETURNING$/i.test(t[0]));
+  const first = top[0]?.[0].toUpperCase();
+  if (
+    !returning &&
+    (!readOnly(q) || first === "EXPLAIN") &&
+    first !== "VALUES"
+  ) {
+    return { q, spec };
+  }
+  const bindings = q.values.map((value) => ({ value }));
+  const slice = (start: number, end = source.length) => {
+    const out = new Sql();
+    const parts = source.slice(start, end).split("\0");
+    const offset = source.slice(0, start).split("\0").length - 1;
+    out.parts.splice(0, 1, ...parts);
+    out.values.push(...bindings.slice(offset, offset + parts.length - 1));
+    return out;
+  };
+  const end = top.at(-1)?.[0] === ";" ? top.at(-1)!.index! : source.length;
+  const ident = (name: string) => `"${name.replace(/"/g, '""')}"`;
+  let overflow = "__prisma8_integer_overflow";
+  while (Object.keys(spec).some((name) => name.toLowerCase() === overflow))
+    overflow += "_";
+  let relation = "__prisma8_read";
+  while (source.toLowerCase().includes(relation)) relation += "_";
+  const unsafe = (value: Sql) =>
+    new Sql()
+      .t("(typeof(")
+      .add(value)
+      .t(") = 'integer' AND (")
+      .add(value)
+      .t(" < -9007199254740991 OR ")
+      .add(value)
+      .t(" > 9007199254740991))");
+  const checks: Sql[] = [];
+  const project = (value: Sql, name: string) => {
+    if (spec[name] !== SQLITE_TYPES.bigint) checks.push(unsafe(value));
+    return new Sql()
+      .t("CASE WHEN ")
+      .add(unsafe(value))
+      .t(" THEN CAST(")
+      .add(value)
+      .t(" AS TEXT) ELSE ")
+      .add(value)
+      .t(` END AS ${ident(name)}`);
+  };
+  let out: Sql;
+  let count = 0;
+  if (returning) {
+    out = slice(0, returning.index! + returning[0].length).t(" ");
+    const separators = top.filter(
+      (t) => t.index! > returning.index! && t[0] === ",",
+    );
+    const starts = [
+      returning.index! + returning[0].length,
+      ...separators.map((t) => t.index! + 1),
+    ];
+    const ends = [...separators.map((t) => t.index!), end];
+    for (let i = 0; i < starts.length; i++) {
+      const start = starts[i]!,
+        finish = ends[i]!;
+      const text = source.slice(start, finish).trim();
+      const fields = text === "*" ? Object.keys(spec) : undefined;
+      if (fields) {
+        for (const name of fields) {
+          if (count++) out.t(", ");
+          out.add(project(new Sql().t(ident(name)), name));
+        }
+        continue;
+      }
+      const own = top.filter((t) => t.index! >= start && t.index! < finish);
+      const as = own.findLast((t) => /^AS$/i.test(t[0]));
+      const alias = own.at(-1)?.[0] ?? text;
+      const last = own.at(-1);
+      const prefix = source.slice(start, last?.index ?? finish).trimEnd();
+      const implicit =
+        !as &&
+        own.length > 1 &&
+        /^(?:[a-z_]\w*|["'`\[])/i.test(alias) &&
+        !/[.+\-*/%|<>=]$/.test(prefix);
+      const plain = text
+        .replace(
+          /--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/|'(?:''|[^'])*'|"(?:""|[^"])*"|`(?:``|[^`])*`|\[[^\]]*\]/g,
+          (part) =>
+            part.startsWith("--") || part.startsWith("/*") ? " " : part,
+        )
+        .trim()
+        .replace(/^(?:\(\s*)+/, "")
+        .replace(/(?:\s*\))+$/, "")
+        .trim();
+      const simple =
+        /^(?:(?:"(?:""|[^"])*"|`[^`]*`|\[[^\]]*\]|\w+)\s*\.\s*)?(?:"(?:""|[^"])*"|`[^`]*`|\[[^\]]*\]|\w+)$/.test(
+          plain,
+        );
+      const label =
+        as || implicit
+          ? alias
+          : simple
+            ? [...plain.matchAll(/"(?:""|[^"])*"|`[^`]*`|\[[^\]]*\]|\w+/g)].at(
+                -1,
+              )![0]
+            : text;
+      const name =
+        as || implicit || simple
+          ? label
+              .replace(/^(["'`])([\s\S]*)\1$/, (_s, quote, body) =>
+                body.replaceAll(quote + quote, quote),
+              )
+              .replace(/^\[([\s\S]*)\]$/, "$1")
+          : text;
+      if (count++) out.t(", ");
+      out.add(
+        project(
+          slice(start, as?.index ?? (implicit ? last!.index! : finish)).t("\n"),
+          name,
+        ),
+      );
+    }
+  } else {
+    out = new Sql()
+      .t(`WITH ${ident(relation)} AS MATERIALIZED (`)
+      .add(slice(0, end))
+      .t("\n) SELECT ");
+    Object.keys(spec).forEach((name, i) => {
+      if (i) out.t(", ");
+      out.add(project(new Sql().t(ident(name)), name));
+      count++;
+    });
+  }
+  out.t(`${count ? ", " : ""}CASE WHEN `);
+  if (checks.length === 0) out.t("false");
+  checks.forEach((check, i) => {
+    if (i) out.t(" OR ");
+    out.add(check);
+  });
+  out.t(` THEN 1 ELSE 0 END AS ${ident(overflow)}`);
+  if (!returning) out.t(` FROM ${ident(relation)}`);
+  // Reuse SQLite's numbered binds when RETURNING repeats an expression.
+  const bound = new Sql().t(out.parts[0]!);
+  const seen = new Map<object, number>();
+  out.values.forEach((ref, i) => {
+    const binding = ref as { value: unknown };
+    const index = seen.get(binding);
+    if (index !== undefined) bound.t(`?${index}`);
+    else {
+      seen.set(binding, seen.size + 1);
+      bound.values.push(binding.value);
+      bound.parts.push("");
+    }
+    bound.t(out.parts[i + 1]!);
+  });
+  return {
+    q: bound,
+    spec: { ...spec, [overflow]: SQLITE_TYPES.int! },
+    overflow,
+  };
+}
+
 /** Rows for `spec` (column -> codec id); timestamps come back as `Date`. */
 async function rowsOf(
   x: Executor,
   q: Sql,
   spec: Record<string, string>,
 ): Promise<Row[]> {
-  const rows = await x.query(toPlan(x, q).returnsRow(spec).build()).toArray();
+  const wire = sqliteExecutors.has(x) ? sqliteRead(q, spec) : { q, spec };
+  const rows = await x
+    .query(toPlan(x, wire.q).returnsRow(wire.spec).build())
+    .toArray();
+  if (wire.overflow)
+    for (const row of rows) {
+      if (row[wire.overflow])
+        throw Object.assign(
+          new RangeError(
+            "SQLite INTEGER cannot be represented as a JavaScript number",
+          ),
+          { code: "ERR_OUT_OF_RANGE" },
+        );
+      delete row[wire.overflow];
+    }
   for (const row of rows) {
     for (const name in spec) {
       if (spec[name] === TIMESTAMP && typeof row[name] === "string") {
@@ -1387,6 +1588,7 @@ export function fromPrisma8(
     inTransaction: boolean,
     columns?: RawColumns,
   ): Prisma8Client => {
+    if (sqlite) sqliteExecutors.add(x);
     const schedule: Schedule | undefined =
       queue && !inTransaction ? (work) => enqueue(queue, work) : undefined;
     if (!delegates.has(x)) {
@@ -1460,6 +1662,7 @@ export function fromPrisma8(
             query: (plan) => (open.check(), raw.query(plan)),
             execute: (plan) => (open.check(), raw.execute(plan)),
           };
+          if (sqlite) sqliteExecutors.add(tx);
           const work = async () => {
             if (level && !sqlite) {
               await affected(
@@ -1498,13 +1701,13 @@ export function fromPrisma8(
       ...delegates.get(x),
       ...(inTransaction || !root ? {} : { $transaction: transaction }),
       $queryRaw: (strings: TemplateStringsArray, ...values: any[]) =>
-        rawRead(template(strings, values)),
+        rawRead(template(strings, values, sqlite)),
       $queryRawUnsafe: (text: string, ...values: any[]) =>
-        rawRead(positional(text, values)),
+        rawRead(positional(text, values, sqlite)),
       $executeRaw: (strings: TemplateStringsArray, ...values: any[]) =>
-        rawWrite(template(strings, values)),
+        rawWrite(template(strings, values, sqlite)),
       $executeRawUnsafe: (text: string, ...values: any[]) =>
-        rawWrite(positional(text, values)),
+        rawWrite(positional(text, values, sqlite)),
       $withColumns: (c: RawColumns) => client(x, inTransaction, c),
     } as unknown as Prisma8Client;
   };
