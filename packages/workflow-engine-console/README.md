@@ -4,7 +4,7 @@ An optional, embeddable operational console for [`@bratsos/workflow-engine`](../
 
 ## Why it mounts instead of running as a service
 
-Workflow engine state lives in your application's Postgres database. In multi-tenant environments, architectures frequently run the engine kernel inside a single database transaction per tenant under PostgreSQL row-level security (RLS). Row-level security policies are evaluated against the specific session in which the query executes — typically configured via session variables like `SET LOCAL app.current_tenant_id = '...'`.
+Workflow engine state lives in your application's database. PostgreSQL is the production path; SQLite is available for a single-process local or development deployment. In multi-tenant environments, architectures frequently run the engine kernel inside a single database transaction per tenant under PostgreSQL row-level security (RLS). Row-level security policies are evaluated against the specific session in which the query executes — typically configured via session variables like `SET LOCAL app.current_tenant_id = '...'`.
 
 A standalone dashboard service running as a separate process with its own database connection pool creates an entirely separate database session. In that architecture, there is no configuration that recovers tenant scoping: the external service either runs as a superuser or privileged role that bypasses RLS entirely — exposing all tenant data to any operator with dashboard access — or it cannot inspect runs at all.
 
@@ -25,12 +25,20 @@ The read port takes the Prisma client your application already has, on any of th
 ```typescript
 import { createPrismaConsoleReadPort } from "@bratsos/workflow-engine-console";
 import { fromPrisma8 } from "@bratsos/workflow-engine/persistence/prisma";
-import { db } from "./db"; // postgres({ contract, url }) from @prisma/orm-postgres/runtime
+import { db } from "./db"; // postgres(...) or sqlite(...) from the matching Prisma 8 runtime
 
-const reader = createPrismaConsoleReadPort(fromPrisma8(db));
+const reader = createPrismaConsoleReadPort(fromPrisma8(db)); // PostgreSQL
 ```
 
-Inside your own transaction use `fromPrisma8(tx, { contract: db.contract })` for a `tx` from `db.transaction(...)`. Prisma 8 is a release candidate, tested against exactly `prisma@8.0.0-rc.29` with `@prisma/orm-postgres@8.0.0-rc.21`, and is PostgreSQL-only; the engine's [Prisma Setup](https://github.com/bratsos/workflow-engine/blob/main/apps/docs/docs/persistence/prisma-setup.md#prisma-8) has the contract and database steps. The CLI's `--database-url` works on Prisma 6 and 7 only; on Prisma 8 use `--config` ([below](#the-local-dev-command)).
+For SQLite, build `db` with `sqlite({ contract, path })` from `@prisma/orm-sqlite/runtime` and pass the target option:
+
+```typescript
+const reader = createPrismaConsoleReadPort(fromPrisma8(db), {
+  databaseType: "sqlite",
+});
+```
+
+Inside your own transaction use `fromPrisma8(tx, { contract: db.contract })` for a `tx` from `db.transaction(...)`. Prisma 8 is a release candidate, tested against exactly `prisma@8.0.0-rc.29` with the matching `@prisma/orm-postgres@8.0.0-rc.21` or `@prisma/orm-sqlite@8.0.0-rc.21`. The engine's [Prisma Setup](https://github.com/bratsos/workflow-engine/blob/main/apps/docs/docs/persistence/prisma-setup.md#prisma-8) has the contract and database steps. The CLI's `--database-url` works on Prisma 6 and 7 only; on Prisma 8 use `--config` ([below](#the-local-dev-command)).
 
 ## Quick start — Next.js App Router
 
@@ -289,6 +297,8 @@ export default {
 
 On Prisma 8, the config module builds the reader with `fromPrisma8` (there is no `@prisma/client` to construct):
 
+The example below uses PostgreSQL. For SQLite, use `sqlite` from `@prisma/orm-sqlite/runtime` and pass `{ databaseType: "sqlite" }` to `createPrismaConsoleReadPort`, as shown in the quick start above.
+
 ```javascript
 // console.config.mjs
 import postgres from "@prisma/orm-postgres/runtime";
@@ -370,7 +380,7 @@ The console deliberately does not compute total record counts and provides no ar
 
 ### Query timeouts
 
-The read port enforces a query timeout via `statementTimeoutMs` (default: 15000 ms). If a query exceeds this limit, the database cancels execution and the console API responds with an HTTP 504 status:
+On PostgreSQL, the read port enforces a database query timeout via `statementTimeoutMs` (default: 15000 ms). If a query exceeds this limit, PostgreSQL cancels execution and the console API responds with an HTTP 504 status:
 
 ```json
 {
@@ -382,6 +392,8 @@ The read port enforces a query timeout via `statementTimeoutMs` (default: 15000 
 ```
 
 The frontend catches this error and renders an inline warning banner while maintaining filter bar interactivity, allowing operators to narrow search parameters rather than experiencing an unresponsive interface.
+
+SQLite has no `statement_timeout` support. On SQLite, `statementTimeoutMs` does not cancel a running query, so the timeout response described above applies to PostgreSQL only.
 
 ## The UI
 

@@ -5,7 +5,7 @@ title: Prisma Setup
 
 # Prisma Setup
 
-**workflow-engine** uses Prisma to manage state persistence in a database-native way. The engine supports **PostgreSQL** (recommended for production) and **SQLite** (useful for local development and testing, on Prisma 6 and 7).
+**workflow-engine** uses Prisma to manage state persistence in a database-native way. PostgreSQL is the production path; SQLite is supported on Prisma 6, 7 and 8 for single-process deployments and local development.
 
 ---
 
@@ -15,19 +15,19 @@ One engine build runs on Prisma 6, 7 and 8, against the same tables and the same
 
 | | Prisma 7 (default) | Prisma 6 | Prisma 8 (release candidate) |
 |---|---|---|---|
-| Schema file | `prisma/schema.prisma` | `prisma/schema.prisma` | `prisma/contract.prisma` |
-| Packages | `prisma`, `@prisma/client`, `@prisma/adapter-pg` | `prisma`, `@prisma/client` | `prisma`, `@prisma/orm-postgres` (no `@prisma/client`) |
-| Create the tables | `prisma migrate dev` / `db push`, then `prisma generate` | same as 7 | `prisma contract emit`, `prisma db init`, then [one SQL file](#the-mixed-order-indexes) |
+| Schema file | `prisma/schema.prisma` | `prisma/schema.prisma` | `prisma/contract.prisma` for PostgreSQL; `prisma/contract.prisma` copied from `contract-sqlite.prisma` for SQLite |
+| Packages | `prisma`, `@prisma/client`, `@prisma/adapter-pg` | `prisma`, `@prisma/client` | `prisma` and the matching `@prisma/orm-postgres` or `@prisma/orm-sqlite` package (no `@prisma/client`) |
+| Create the tables | `prisma migrate dev` / `db push`, then `prisma generate` | same as 7 | `prisma contract emit`, `prisma db init`; PostgreSQL also needs [one SQL file](#the-mixed-order-indexes) |
 | What you pass to the factories | the `PrismaClient` | the `PrismaClient` | `fromPrisma8(db)` |
-| Databases | PostgreSQL, SQLite | PostgreSQL, SQLite | PostgreSQL only |
+| Databases | PostgreSQL, SQLite | PostgreSQL, SQLite | PostgreSQL, SQLite |
 | Console `--database-url` | yes | yes | no: use `--config` |
 
 * **New projects should start on Prisma 7.** Prisma 6 receives only security patches until 2026-11-19, per Prisma's [release status page](https://www.prisma.io/docs/orm/release-status).
-* **Prisma 8 is a release candidate.** Support is tested against exactly `prisma@8.0.0-rc.29` with `@prisma/orm-postgres@8.0.0-rc.21`. Pin both: the pair that `latest` resolves to crashed `prisma contract emit`.
-* **SQLite stays on Prisma 6 and 7.** Over a `fromPrisma8` client, `databaseType: "sqlite"` throws.
+* **Prisma 8 is a release candidate.** Pin `prisma@8.0.0-rc.29` and the matching target package: `@prisma/orm-postgres@8.0.0-rc.21` or `@prisma/orm-sqlite@8.0.0-rc.21`. Do not use `latest` for the Prisma CLI or driver packages.
+* **Prisma 8 SQLite uses the same adapter option as Prisma 6 and 7.** Wrap the SQLite runtime with `fromPrisma8(db)` and pass `{ databaseType: "sqlite" }` to each SQLite-aware adapter. `fromPrisma8` reads the target from `db.contract`; it takes no new options.
 * `npx prisma` without a local install now runs Prisma 8. A Prisma 6 or 7 project needs `prisma` as a local dependency, or `npx prisma` runs the wrong major.
 
-The rest of this page describes the Prisma 6 and 7 path; the [Prisma 8](#prisma-8) section covers the third.
+The rest of this page describes the Prisma 6 and 7 path and the shared SQLite adapter options; the [Prisma 8](#prisma-8) section covers Prisma 8 setup for both databases.
 
 ---
 
@@ -419,20 +419,20 @@ npx prisma generate
 
 ## Prisma 8
 
-> **Release candidate.** The engine is tested against exactly `prisma@8.0.0-rc.29` with `@prisma/orm-postgres@8.0.0-rc.21`. Install both pinned. The `latest` pair (`@prisma/orm-postgres@8.0.0-rc.22`) crashed `prisma contract emit` with `CLI.UNEXPECTED`.
+> **Release candidate.** Pin `prisma@8.0.0-rc.29` with the matching target package: `@prisma/orm-postgres@8.0.0-rc.21` or `@prisma/orm-sqlite@8.0.0-rc.21`. Do not use `latest` for these packages.
 
-Prisma 8 has no `@prisma/client`, no `schema.prisma` and no model delegates. You write a *contract*, emit it, and talk to the database through `postgres({ contract, url })`. The engine's Prisma adapters expect the Prisma 6 and 7 client surface, so one wrapper, `fromPrisma8(db)`, gives a Prisma 8 client that surface. The adapters themselves are the same code on all three majors, and the engine imports nothing from Prisma.
+Prisma 8 has no `@prisma/client`, no `schema.prisma` and no model delegates. You write a *contract*, emit it, and talk to the database through the matching `postgres({ contract, url })` or `sqlite({ contract, path })` runtime. The engine's Prisma adapters expect the Prisma 6 and 7 client surface, so one wrapper, `fromPrisma8(db)`, gives a Prisma 8 client that surface. The adapters themselves are the same code on all three majors, and the engine imports nothing from Prisma.
 
 ### Requirements
 
-* **Node.js** 22.18+, 24.11+ or 26+ (Prisma 8's own floor, higher than the engine's 22.11)
+* **Node.js** 22.18+, 24.11+ or 26+ for the Prisma 8 PostgreSQL path. See [SQLite setup](#2-sqlite-setup-prisma-6-7-and-8) for its tested Node floor.
 * **TypeScript** 5.9+, with `skipLibCheck: true`: the AI SDK's types import `json-schema`, which ships none
-* **PostgreSQL** 15+
+* **PostgreSQL** 15+ for the Postgres target
 * **An ES module project**, `"type": "module"` in `package.json`: the generated `migration.ts`, and any `.ts` file you run with `node`, fail without it
-* **`psql`**, the PostgreSQL command-line client, on the machine that provisions the database: [step 3](#3-provision-an-empty-database) applies a SQL file with it
-* Prisma 8 is Postgres-only here. SQLite stays on Prisma 6 and 7.
+* **`psql`**, the PostgreSQL command-line client, on the machine that provisions a Postgres database: [step 3](#3-provision-an-empty-database) applies a SQL file with it
 
 ```bash
+# PostgreSQL target
 npm install @bratsos/workflow-engine@alpha zod
 npm install --save-exact @prisma/orm-postgres@8.0.0-rc.21
 npm install --save-dev --save-exact prisma@8.0.0-rc.29
@@ -547,8 +547,8 @@ Every example in these docs that builds a `prisma` variable works with this one 
 What the wrapper does, so you know what to expect:
 
 * It compiles each delegate call the adapters make into SQL from the contract's column types, and it throws `fromPrisma8: ...` for any argument outside the subset the adapters use, instead of ignoring it. It is not a general Prisma 6 and 7 emulation: use `db.orm` for your own queries.
-* Dates, JSON, arrays, `{ increment }`, `$transaction([...])` and `$transaction(fn, { isolationLevel, timeout })` behave as the adapters need. Prisma 8 itself takes no isolation option; the wrapper issues `SET TRANSACTION ISOLATION LEVEL` first.
-* Errors are Prisma 8's `SqlQueryError` (read `.sqlState`), not Prisma P-codes. The wrapper raises `P2025` when `update` or `delete` finds no row, and `P2028` once a `$transaction(fn)` passes its `timeout` (5000ms by default, as on Prisma 6 and 7): the next statement fails and the transaction rolls back. A callback that has not settled at the deadline is rejected with `P2028` there and then, and its connection is freed. On Prisma 6 and 7 the connection is freed at the deadline too, but the caller keeps waiting for the callback, so a callback that fails after the deadline gives its own error there and `P2028` here. A statement still running at the deadline is not interrupted on any of the three majors: the caller gets `P2028` when it ends.
+* On PostgreSQL, dates, JSON, arrays, `{ increment }`, `$transaction([...])` and `$transaction(fn, { isolationLevel, timeout })` behave as the adapters need. Prisma 8 itself takes no isolation option; the wrapper issues `SET TRANSACTION ISOLATION LEVEL` first. The SQLite target does not issue that PostgreSQL statement.
+* PostgreSQL calls can return Prisma 8's `SqlQueryError` (read `.sqlState`); SQLite driver errors use SQLite error codes instead. The wrapper raises `P2025` when `update` or `delete` finds no row, and `P2028` once a `$transaction(fn)` passes its `timeout` (5000ms by default, as on Prisma 6 and 7): the next statement fails and the transaction rolls back. A callback that has not settled at the deadline is rejected with `P2028` there and then, and its connection is freed. On Prisma 6 and 7 the connection is freed at the deadline too, but the caller keeps waiting for the callback, so a callback that fails after the deadline gives its own error there and `P2028` here. A statement still running at the deadline is not interrupted on any of the three majors: the caller gets `P2028` when it ends.
 * A raw read of your own through the wrapper has to declare its columns, because Prisma 8 drops the ones a raw read does not name: run it on `prisma.$withColumns({ name: "text" })`, or on `prisma.$withColumns("table_name")` for every column of a table. Without that the wrapper throws an error that says so.
 * Row ids from the Prisma 8 path are generated by the wrapper: time-ordered hex strings such as `01a18d985ffe0000f041d3af`, where Prisma 6 and 7 produce cuids. Both are opaque text and coexist in one table. It matters only to code that parses ids.
 
@@ -620,8 +620,7 @@ The id format difference above is the only visible change to rows. Existing cuid
 
 ### Limits on Prisma 8
 
-* PostgreSQL only. `databaseType: "sqlite"` over a `fromPrisma8` client throws.
-* The engine's tables must be in the `public` namespace (see [Environments](#environments)).
+* The PostgreSQL target requires the engine's tables in the `public` namespace (see [Environments](#environments)).
 * `workflow-console --database-url` is Prisma 6 and 7 only; use `--config`.
 * A pre-release: pin the exact pair above and re-test before moving either package.
 * Prisma 8's CLI has no `generate`, `migrate dev` or `db push`: the commands above replace them, and the generated `contract.json` / `contract.d.ts` are the only artefacts.
@@ -784,10 +783,8 @@ Options worth knowing:
 * `createPrismaJobQueue(prisma, { fairness: { maxConcurrentPerGroup, groupBy: "config.tenantId" } })` turns on the opt-in per-group concurrency cap in the PostgreSQL dequeue (off by default; it costs more on a deep queue).
 * On PostgreSQL the job lease runs on the database clock; `PrismaJobQueueOptions.now` only affects SQLite.
 
-### 2. SQLite Setup (Prisma 6 and 7)
-SQLite lacks native lock features like `FOR UPDATE SKIP LOCKED`. If you are running locally or inside a testing context on SQLite:
-1. **Pass `databaseType`**: You **must** pass `{ databaseType: "sqlite" }` in the config options of the persistence and job queue factories. Without this, the engine will attempt to run Postgres-specific locking syntax, throwing database query errors.
-2. **Transaction Handling**: The engine wraps SQLite dequeuing inside standard database transactions, maintaining concurrency protection for single-host or local dev setups.
+### 2. SQLite Setup (Prisma 6, 7 and 8)
+SQLite has no `FOR UPDATE SKIP LOCKED`, so its adapters use transaction-based claiming. Pass `{ databaseType: "sqlite" }` to every SQLite-aware adapter. Prisma 8 also checks that this option matches `contract.target`; a mismatch fails when you construct the adapter and tells you which value to use. `fromPrisma8(db)` reads the target itself and takes no new option.
 
 ```typescript
 const sqlitePersistence = createPrismaWorkflowPersistence(prisma, {
@@ -799,9 +796,80 @@ const sqliteJobQueue = createPrismaJobQueue(prisma, {
 });
 
 const sqliteStepLedger = createPrismaStepLedger(prisma, {
-  databaseType: "sqlite", // keeps the create-and-catch path; SQLite has no skipDuplicates
+  databaseType: "sqlite",
+});
+
+const sqliteLogger = createPrismaAICallLogger(prisma, {
+  databaseType: "sqlite",
 });
 ```
+
+`createPrismaBlobStore` does not need a database type option. When `prisma` is the wrapped Prisma 8 runtime, pass the same `{ databaseType: "sqlite" }` option to `createPrismaWorkflowPersistence`, `createPrismaJobQueue`, `createPrismaStepLedger`, `createPrismaAICallLogger`, and the console read port.
+
+SQLite is for a single host process per file. In the Prisma 8 wrapper, engine writes through one root client are serialized and root reads remain available. A direct `db.transaction(...)` call made by your code does not use that queue and can still contend with an engine write. Do not run multiple processes against one SQLite file; use PostgreSQL for production or multi-process fleets.
+
+Before adopting an existing Prisma 6 or 7 SQLite file on Prisma 8, verify its stored timestamp values against the Prisma 8 SQLite contract. In real-file checks, Prisma 6 stored `DateTime` as integer epoch milliseconds; mixing those values with Prisma 8 ISO text made due-time comparisons and ordering incorrect. Prisma 7 stored text timestamps and passed the checked comparisons and ordering. If the existing file does not pass checks using your data, initialise a fresh file from the contract and migrate application data.
+
+#### Prisma 8 with SQLite
+
+Prisma 8 SQLite uses `@prisma/orm-sqlite`, a SQLite contract, and the runtime's `path` option. It requires Node.js 22.20+, 24.11+ or 26+; these are Prisma 8 SQLite CLI floors and do not change the engine's general Node.js `>=22.11` requirement. Start with a new file so `db init` creates the database. The following setup starts from an empty directory:
+
+```bash
+npm init -y
+npm pkg set type=module
+npm install @bratsos/workflow-engine@alpha zod
+npm install --save-exact @prisma/orm-sqlite@8.0.0-rc.21
+npm install --save-dev --save-exact prisma@8.0.0-rc.29
+mkdir -p prisma
+cp node_modules/@bratsos/workflow-engine/prisma/contract-sqlite.prisma prisma/contract.prisma
+```
+
+Do not install `@prisma/client` on Prisma 8. Configure the SQLite target:
+
+```ts
+// prisma.config.ts
+import { defineConfig } from "@prisma/orm-sqlite/config";
+import { definePrismaConfig } from "prisma/config";
+
+export default definePrismaConfig({
+  orm: defineConfig({
+    contract: "./prisma/contract.prisma",
+    output: "./.generated",
+    db: { connection: "file:./dev.db" },
+    migrations: { dir: "./.generated/migrations" },
+  }),
+});
+```
+
+Emit the contract and initialise that new database file:
+
+```bash
+npx prisma contract emit
+npx prisma db init
+```
+
+The contract must start with `// use prisma-8`. Use the shipped SQLite contract as-is; it declares SQLite's text status values and `DateTime`/`Json` columns. The Postgres contract's native enum, timestamp codec and mixed-order-index SQL do not apply to SQLite.
+
+Create the runtime from the emitted contract and wrap it once:
+
+```ts
+// db.ts
+import sqlite from "@prisma/orm-sqlite/runtime";
+import { contractFromJson } from "@prisma/orm-sqlite/static";
+import type { Contract } from "./.generated/contract.d";
+import contractJson from "./.generated/contract.json" with { type: "json" };
+import { fromPrisma8 } from "@bratsos/workflow-engine/persistence/prisma";
+
+export const db = sqlite({
+  contract: contractFromJson<Contract>(contractJson),
+  path: "./dev.db",
+});
+export const prisma = fromPrisma8(db);
+```
+
+Close the SQLite runtime on shutdown with `await db.close()`.
+
+Pass `prisma` to the same factories shown above with `{ databaseType: "sqlite" }`. For the console, use `createPrismaConsoleReadPort(prisma, { databaseType: "sqlite" })`; `workflow-console --database-url` still requires `@prisma/client`, so configure the console with `--config` on Prisma 8. SQLite does not implement PostgreSQL's `statement_timeout`; `statementTimeoutMs` does not cancel an SQLite statement.
 
 ---
 
