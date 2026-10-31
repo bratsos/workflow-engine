@@ -426,11 +426,11 @@ export interface RunReapStuckResult {
 /**
  * Retention: deletes terminal runs that finished at or before `olderThan`.
  *
- * For each run the kernel clears the `StepLedger` for every stage record,
+ * The kernel deletes each run through `PersistenceCore.deleteRun`, which
+ * takes stages, logs, artifacts and annotations with it. After commit it
+ * clears the `StepLedger` for every stage record, removes the job rows and
  * deletes the run's blobs (stage outputs, artifacts, spilled job payloads
- * and step results under the engine's own key prefixes), removes its job
- * rows, and then deletes the run through `PersistenceCore.deleteRun`, which
- * takes stages, logs, artifacts and annotations with it. Emits no events.
+ * and step results under the engine's own key prefixes). Emits no events.
  * Bounded by `limit` so a tick stays short; repeat until `purged` is 0.
  */
 export interface RunPurgeCommand {

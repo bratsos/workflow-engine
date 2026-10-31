@@ -7,13 +7,15 @@
  * command to publish pending outbox events through EventSink.
  *
  * Most commands execute inside a single database transaction (handler
- * logic + outbox event writes). Two exceptions manage their own
+ * logic + outbox event writes). These commands manage their own
  * transactions to avoid holding connections during external I/O:
  *
  *  - `job.execute` — multi-phase pattern (see `handlers/job-execute.ts`)
  *  - `stage.pollSuspended` — per-stage transactions so that
  *    checkCompletion() HTTP calls run outside any transaction
  *    (see `handlers/stage-poll-suspended.ts`)
+ *  - `step.signal` — writes the external ledger before its stage/outbox
+ *    transaction
  *
  * Commands with idempotency keys are deduplicated: a replay returns the
  * cached result without re-executing the handler.
@@ -423,7 +425,18 @@ export function createKernel(config: KernelConfig): Kernel {
     // -----------------------------------------------------------------
     if (command.type === "stage.pollSuspended") {
       const result = await handleStagePollSuspended(command, deps);
+      await result._postCommit?.(deps);
       return stripEvents(result);
+    }
+
+    // These ports use their own connections. Lease reaping needs no
+    // persistence transaction; signalling commits its stage/outbox writes
+    // only after the external ledger (and any spilled payload) is written.
+    if (command.type === "lease.reapStale") {
+      return stripEvents(await handleLeaseReapStale(command, deps));
+    }
+    if (command.type === "step.signal") {
+      return stripEvents(await handleStepSignal(command, deps));
     }
 
     // -----------------------------------------------------------------
@@ -481,12 +494,6 @@ export function createKernel(config: KernelConfig): Kernel {
             break;
           case "run.listVersions":
             result = await handleRunListVersions(command, txDeps);
-            break;
-          case "step.signal":
-            result = await handleStepSignal(command, txDeps);
-            break;
-          case "lease.reapStale":
-            result = await handleLeaseReapStale(command, txDeps);
             break;
           case "run.reapStuck":
             result = await handleRunReapStuck(command, txDeps);

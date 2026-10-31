@@ -1,6 +1,7 @@
 import { StepResultNotSerializable } from "../../core/steps.js";
 import type { StepSignalCommand, StepSignalResult } from "../commands.js";
 import type { KernelEvent } from "../events.js";
+import { toOutboxEvents } from "../helpers/outbox-events.js";
 import type { HandlerResult, KernelDeps } from "../kernel.js";
 
 function jsonRoundTrip(value: unknown, stepId: string): unknown {
@@ -149,10 +150,6 @@ export async function handleStepSignal(
     }
   }
 
-  await deps.persistence.updateStage(stage.id, {
-    nextPollAt: deps.clock.now(),
-  });
-
   const event: KernelEvent = {
     type: "step:signalled",
     timestamp: deps.clock.now(),
@@ -161,10 +158,16 @@ export async function handleStepSignal(
     stepId: command.stepId,
     payload,
   };
+  // The ledger and spilled blobs use separate connections. Write them
+  // before opening the transaction that wakes the stage and emits its event.
+  await deps.persistence.withTransaction(async (tx) => {
+    await tx.updateStage(stage.id, { nextPollAt: deps.clock.now() });
+    await tx.appendOutboxEvents(toOutboxEvents(command.workflowRunId, [event]));
+  });
   return {
     signalled: true,
     ok: true,
     alreadyCompleted: false,
-    _events: [event],
+    _events: [],
   };
 }
