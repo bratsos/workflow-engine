@@ -7,12 +7,13 @@
  * the run row itself (stages, logs, artifacts and annotations go with it
  * through `PersistenceCore.deleteRun`).
  *
- * Order matters. The ledger is cleared through the `StepLedger` port
- * *before* the run is deleted: the reference schema cascades
- * `workflow_steps` from `workflow_stages`, but the port is pluggable and a
- * ledger that lives elsewhere has no cascade to rely on. Blob deletion is a
- * post-commit side effect: a rolled-back purge must not leave a surviving
- * run pointing at outputs that are gone.
+ * INVARIANT: jobs, ledger rows and blobs are removed in `_postCommit`, never
+ * inside the persistence transaction (see run-cancel.ts). These ports use
+ * their own connections: waiting on them inside a transaction can exhaust
+ * the pool or block SQLite's writer, and their writes cannot be rolled back.
+ * The reference ledger cascades with the stages; a pluggable ledger needs
+ * explicit cleanup after commit. A cleanup failure leaves the run deleted
+ * and propagates to the caller; its remaining external data needs cleanup.
  *
  * Nothing is emitted. Retention is housekeeping, not a lifecycle event.
  */
@@ -72,22 +73,7 @@ export async function handleRunPurge(
   const blobPrefixes: string[] = [];
 
   for (const run of runs) {
-    // 1. Ledger first, through the port (see the file comment).
-    if (deps.stepLedger) {
-      for (const stageRecordId of run.stageRecordIds) {
-        await deps.stepLedger.clear(stageRecordId);
-      }
-    }
-
-    // 2. Job rows: the reference schema has no foreign key from
-    //    job_queue to workflow_runs, so they would otherwise outlive it.
-    const jobs = await deps.jobTransport.getJobsByWorkflowRun(run.id);
-    const stageIds = Array.from(new Set(jobs.map((job) => job.stageId)));
-    if (stageIds.length > 0) {
-      await deps.jobTransport.deleteByRunAndStages(run.id, stageIds);
-    }
-
-    // 3. The run and everything the persistence owns under it.
+    // The run and everything the persistence owns under it.
     await deps.persistence.deleteRun(run.id);
 
     workflowRunIds.push(run.id);
@@ -100,8 +86,25 @@ export async function handleRunPurge(
     _events: [],
     ...(blobPrefixes.length > 0
       ? {
-          // 4. Blobs, only once the deletes above have committed.
           _postCommit: async (postDeps: KernelDeps) => {
+            for (const run of runs) {
+              for (const stageRecordId of run.stageRecordIds) {
+                await postDeps.stepLedger?.clear(stageRecordId);
+              }
+              // job_queue has no foreign key to workflow_runs.
+              const jobs = await postDeps.jobTransport.getJobsByWorkflowRun(
+                run.id,
+              );
+              const stageIds = Array.from(
+                new Set(jobs.map((job) => job.stageId)),
+              );
+              if (stageIds.length > 0) {
+                await postDeps.jobTransport.deleteByRunAndStages(
+                  run.id,
+                  stageIds,
+                );
+              }
+            }
             for (const prefix of blobPrefixes) {
               const keys = await postDeps.blobStore.list(prefix);
               for (const key of keys) {
