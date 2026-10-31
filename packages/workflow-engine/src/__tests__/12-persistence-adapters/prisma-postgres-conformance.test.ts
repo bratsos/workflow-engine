@@ -4830,7 +4830,7 @@ if (!DATABASE_URL) {
 
 // The fixture generates a separate, minimal SQLite client without changing the
 // shipped schema or replacing the Postgres client used by the suites above.
-// Prisma 8 is Postgres-only, so there is no SQLite client to test there.
+// Prisma 8 SQLite is covered by the full-file conformance suite.
 describe.skipIf(isPrisma8)("definition registration on real SQLite", () => {
   const require = createRequire(import.meta.url);
   let directory: string;

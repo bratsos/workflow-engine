@@ -64,7 +64,8 @@ stateDiagram-v2
 ## Job Queue and Claiming
 
 Jobs are queued in the `JobQueue` table. Polling is coordinated directly through database queries:
-* **PG-native lock avoidance**: The engine uses PostgreSQL's `FOR UPDATE SKIP LOCKED` (or SQLite's equivalent transactions) to dequeue jobs. This allows multiple host processes to safely run concurrently without double-claiming jobs.
+* **PostgreSQL lock avoidance**: The engine uses `FOR UPDATE SKIP LOCKED` to dequeue jobs, so multiple host processes can claim safely without double-claiming jobs.
+* **SQLite claiming**: The engine uses transaction-based compare-and-set operations. Keep a SQLite file to one host process; multiple processes sharing the file are not a supported deployment.
 * **Orchestration ticks**: Hosts run periodic orchestration ticks that look for runs in `PENDING` status, claim them, and queue their initial stages as jobs in the `JobQueue`.
 
 ```mermaid
