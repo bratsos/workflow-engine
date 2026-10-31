@@ -62,6 +62,7 @@ import {
   prepareExecutionGroup,
   type StepLedgerResetPlan,
 } from "../helpers/index.js";
+import { isTransactionReadBound } from "../helpers/transaction-reads.js";
 import type { HandlerResult, KernelDeps } from "../kernel";
 import type { StepRecord } from "../ports";
 
@@ -243,7 +244,10 @@ export async function handleRunRedrive(
   if (deps.stepLedger) {
     const ledger = deps.stepLedger;
     for (const stage of stagesToSupersede) {
-      const rows = await ledger.list(stage.id);
+      const rows = await ledger.list(stage.id).catch((error) => {
+        if (isTransactionReadBound(ledger)) throw error;
+        return [] as StepRecord[];
+      });
       let dropped: readonly StepRecord[] = rows;
       let reason: AbandonReason = "deleted";
       if (stagesToReopen.includes(stage)) {

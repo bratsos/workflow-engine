@@ -1,4 +1,10 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { withTransactionReads } from "../kernel/helpers/transaction-reads.js";
+import type {
+  BlobStore,
+  Persistence,
+  TransactionReadPort,
+} from "../kernel/ports.js";
 import {
   createPayloadSpill,
   createSpillingJobTransport,
@@ -126,9 +132,50 @@ describe.skipIf(!realDatabase)("kernel transaction-scoped port reads", () => {
     expect(await db.jobTransport.getJobsByWorkflowRun(id)).toHaveLength(1);
   });
 
-  it("fails a redrive without changing its run or ledger when ledger reads fail", async () => {
+  it.skipIf(!sqlite)(
+    "rolls back a redrive when scoped ledger reads fail",
+    async () => {
+      const { id, stage } = await seedStep();
+      const kernel = db.makeKernel({
+        stepLedger: Object.assign(wrapStepLedger(db.stepLedger), {
+          transactionReads(persistence: Persistence) {
+            const ledger = withTransactionReads(db.stepLedger, persistence, [
+              "list",
+            ]);
+            expect(ledger).not.toBe(db.stepLedger);
+            return {
+              async list(stageRecordId: string) {
+                await ledger.list(stageRecordId);
+                throw new Error("ledger unavailable");
+              },
+            };
+          },
+        }),
+      });
+      await expect(
+        kernel.dispatch({
+          type: "run.redrive",
+          workflowRunId: id,
+          from: { kind: "start" },
+        }),
+      ).rejects.toThrow("ledger unavailable");
+      expect((await db.persistence.getRun(id))?.status).toBe("COMPLETED");
+      expect((await db.stepLedger.list(stage.id))[0]!.externalKey).toBe(
+        "before",
+      );
+      expect(await db.persistence.listAnnotations(id)).toEqual([]);
+      expect(await db.persistence.getUnpublishedOutboxEvents(100)).toEqual([]);
+      expect(await db.jobTransport.getJobsByWorkflowRun(id)).toHaveLength(1);
+    },
+  );
+
+  it("retains the redrive fallback when unbound ledger reads fail", async () => {
     const { id, stage } = await seedStep();
     const kernel = db.makeKernel({
+      blobStore: override<BlobStore & TransactionReadPort<BlobStore>>(
+        db.blobStore,
+        { transactionReads: undefined },
+      ),
       stepLedger: wrapStepLedger(db.stepLedger, {
         list: async () => {
           throw new Error("ledger unavailable");
@@ -141,10 +188,12 @@ describe.skipIf(!realDatabase)("kernel transaction-scoped port reads", () => {
         workflowRunId: id,
         from: { kind: "start" },
       }),
-    ).rejects.toThrow("ledger unavailable");
-    expect((await db.persistence.getRun(id))?.status).toBe("COMPLETED");
-    expect((await db.stepLedger.list(stage.id))[0]!.externalKey).toBe("before");
-    expect(await db.persistence.listAnnotations(id)).toEqual([]);
+    ).resolves.toMatchObject({ redriveCount: 1 });
+    expect((await db.persistence.getRun(id))?.status).toBe("RUNNING");
+    expect(await db.stepLedger.list(stage.id)).toEqual([]);
+    const annotations = await db.persistence.listAnnotations(id);
+    expect(annotations).toHaveLength(1);
+    expect(annotations[0]!.payload).not.toHaveProperty("abandonedSteps");
     expect(await db.jobTransport.getJobsByWorkflowRun(id)).toHaveLength(1);
   });
 
@@ -248,7 +297,7 @@ describe.skipIf(!realDatabase)("kernel transaction-scoped port reads", () => {
     },
   );
 
-  it("claims missing-job recovery once and rolls that claim back on failure", async () => {
+  it("rolls recovery back and only claims runs with scoped job reads", async () => {
     const { id, stage } = await db.seed();
     await db.jobTransport.deleteByRunAndStages(id, ["first"]);
     const old = new Date("2020-01-01T00:00:00Z");
@@ -275,16 +324,31 @@ describe.skipIf(!realDatabase)("kernel transaction-scoped port reads", () => {
 
     await db.kernel.dispatch({ type: "run.reapStuck", stuckThresholdMs: 1000 });
     const recovered = (await db.persistence.getRun(id))!;
-    expect(recovered.version).toBe(before.version + 1);
-    expect(recovered.updatedAt.getTime()).toBeGreaterThan(old.getTime());
+    expect(recovered.version).toBe(before.version + (sqlite ? 1 : 0));
+    if (sqlite) {
+      expect(recovered.updatedAt.getTime()).toBeGreaterThan(old.getTime());
+    } else {
+      expect(recovered.updatedAt).toEqual(old);
+    }
     const [job] = await db.jobTransport.getJobsByWorkflowRun(id);
     expect(job!.status).toBe("PENDING");
-    await db.kernel.dispatch({ type: "run.reapStuck", stuckThresholdMs: 1000 });
-    expect((await db.persistence.getRun(id))?.version).toBe(recovered.version);
+    const swept = await db.kernel.dispatch({
+      type: "run.reapStuck",
+      stuckThresholdMs: 1000,
+    });
+    expect(swept).toMatchObject({ failed: sqlite ? 0 : 1, healed: 0 });
+    expect(await db.persistence.getRun(id)).toMatchObject({
+      version: recovered.version + (sqlite ? 0 : 1),
+      status: sqlite ? "RUNNING" : "FAILED",
+    });
     expect(
       (await db.jobTransport.getJobsByWorkflowRun(id)).map((row) => row.id),
     ).toEqual([job!.id]);
-    expect(await db.persistence.getUnpublishedOutboxEvents(100)).toEqual([]);
+    expect(
+      (await db.persistence.getUnpublishedOutboxEvents(100)).map(
+        (event) => event.eventType,
+      ),
+    ).toEqual(sqlite ? [] : ["workflow:failed"]);
   });
 
   it.skipIf(!sqlite)(

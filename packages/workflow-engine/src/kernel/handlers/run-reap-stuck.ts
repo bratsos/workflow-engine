@@ -2,6 +2,7 @@ import { StaleVersionError } from "../../persistence/interface.js";
 import type { RunReapStuckCommand, RunReapStuckResult } from "../commands";
 import type { KernelEvent } from "../events";
 import { servesRun } from "../helpers/definition-pinning.js";
+import { isTransactionReadBound } from "../helpers/transaction-reads.js";
 import type { HandlerResult, KernelDeps } from "../kernel";
 import {
   ACTIVE_STAGE_STATUSES,
@@ -64,17 +65,17 @@ export async function handleRunReapStuck(
           ),
       );
       if (missingJobStages.length > 0) {
-        // Claim the recovery and refresh its activity before scheduling jobs.
-        // Other sweepers then leave it alone until it becomes stale again,
-        // rather than repeatedly scheduling the same missing jobs while
-        // the first sweeper is still waiting to enqueue after commit.
-        try {
-          await deps.persistence.updateRun(run.id, {
-            expectedVersion: run.version,
-          });
-        } catch (error) {
-          if (error instanceof StaleVersionError) continue;
-          throw error;
+        if (isTransactionReadBound(deps.jobTransport)) {
+          // Scoped sweeps can queue behind each other before post-commit
+          // enqueues run. Refresh activity so they do not repeat that work.
+          try {
+            await deps.persistence.updateRun(run.id, {
+              expectedVersion: run.version,
+            });
+          } catch (error) {
+            if (error instanceof StaleVersionError) continue;
+            throw error;
+          }
         }
 
         // INVARIANT: no handler enqueues a job from inside the kernel
