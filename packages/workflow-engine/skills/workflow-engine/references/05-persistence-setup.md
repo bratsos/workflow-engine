@@ -108,7 +108,8 @@ interface PersistenceCore {
   getSuspendedStages(beforeDate: Date, options?: {
     limit?: number;                                             // cap, oldest nextPollAt first -- the adapter owns the ordering and the cap
     serves?: readonly ServedDefinition[];                       // same filter as claimNextPendingRun, evaluated against the stage's run
-  }): Promise<WorkflowStageRecord[]>;                           // plain read: SUSPENDED and nextPollAt <= beforeDate; the claim happens in updateStage
+    includeSettlements?: boolean;                               // also include COMPLETED/FAILED stages with a due nextPollAt
+  }): Promise<WorkflowStageRecord[]>;                           // plain read of due stages; the poll claim happens in updateStage
   deleteStage(id: string): Promise<void>;
 
   // WorkflowLog operations
