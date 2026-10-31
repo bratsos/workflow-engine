@@ -2,7 +2,7 @@
 
 Credential-free remote activity workers for `@bratsos/workflow-engine`.
 
-Run any stage's `execute()` on a **separate, credential-free machine** — no database connection, no root object-store credentials. The orchestrator (the existing kernel + Postgres) owns all state; a remote worker leases tasks, runs the real stage code, writes large outputs directly to object storage by reference, and reports back. The engine drives the whole thing through its existing suspend/resume machinery.
+Run any stage's `execute()` on a **separate, credential-free machine** — no database connection, no root object-store credentials. The orchestrator (the existing kernel + PostgreSQL, or one SQLite-backed process) owns all state; a remote worker leases tasks, runs the real stage code, writes large outputs directly to object storage by reference, and reports back. The engine drives the whole thing through its existing suspend/resume machinery. Use PostgreSQL when multiple orchestrator processes need to share state.
 
 ## What this package does
 

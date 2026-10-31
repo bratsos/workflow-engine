@@ -61,3 +61,46 @@ export function isUniqueViolation(error: unknown): boolean {
 export function isSerializationFailure(error: unknown): boolean {
   return sqlStateOf(error) === SERIALIZATION_FAILURE;
 }
+
+function isSqliteBusyCode(value: unknown): boolean {
+  if (typeof value === "string" && /^SQLITE_(BUSY|LOCKED)(_|$)/.test(value)) {
+    return true;
+  }
+  const code =
+    typeof value === "number"
+      ? value
+      : typeof value === "string" && /^\d+$/.test(value)
+        ? Number(value)
+        : NaN;
+  return Number.isInteger(code) && ((code & 255) === 5 || (code & 255) === 6);
+}
+
+/** SQLite BUSY/LOCKED can succeed in a fresh transaction after the writer finishes. */
+export function isSqliteBusy(error: unknown): boolean {
+  // Prisma 8 retains node:sqlite's numeric code on cause; 6/7 use meta.
+  for (
+    let depth = 0;
+    depth < 5 && typeof error === "object" && error;
+    depth++
+  ) {
+    const failure = error as {
+      code?: unknown;
+      errcode?: unknown;
+      cause?: unknown;
+      meta?: {
+        code?: unknown;
+        driverAdapterError?: { cause?: { originalCode?: unknown } };
+      };
+    };
+    if (
+      isSqliteBusyCode(failure.errcode) ||
+      isSqliteBusyCode(failure.code) ||
+      isSqliteBusyCode(failure.meta?.code) ||
+      isSqliteBusyCode(failure.meta?.driverAdapterError?.cause?.originalCode)
+    ) {
+      return true;
+    }
+    error = failure.cause;
+  }
+  return false;
+}

@@ -1,12 +1,12 @@
 /**
  * The Prisma read port against a real PostgreSQL database.
  *
- * Every query in `prisma-read-port.ts` is raw SQL, so an in-memory fake
- * cannot tell us whether the identifiers are quoted correctly, whether the
- * `Status` enum cast round-trips, whether the row-wise keyset comparison
- * pages the way it is supposed to, or whether `statement_timeout` actually
- * produces a `ConsoleQueryTimeoutError`. Only Postgres can, and it is the
- * only target the SQL is written for.
+ * An in-memory fake cannot tell us whether the identifiers are quoted
+ * correctly, whether the `Status` enum cast round-trips, whether the
+ * row-wise keyset comparison pages the way it is supposed to, or whether
+ * `statement_timeout` actually produces a `ConsoleQueryTimeoutError`. This
+ * suite covers those Postgres-specific behaviors; the SQLite suite covers
+ * its separate SQL and storage behavior.
  *
  * The other half of the point is the property this whole package exists to
  * preserve: the reader is checked here both with a root client and with a

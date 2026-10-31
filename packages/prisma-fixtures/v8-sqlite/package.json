@@ -1,0 +1,16 @@
+{
+  "name": "workflow-engine-prisma-v8-sqlite",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Prisma 8 SQLite contract and database fixture for the engine suites",
+  "main": "./index.cjs",
+  "scripts": {
+    "generate": "prisma contract emit",
+    "push": "prisma db init"
+  },
+  "dependencies": {
+    "@prisma/orm-sqlite": "8.0.0-rc.21",
+    "prisma": "8.0.0-rc.29"
+  }
+}

@@ -94,6 +94,7 @@
     "prisma:generate": "pnpm -C ../prisma-fixtures/v${PRISMA_MAJOR:-7} run generate",
     "prisma:db-push": "pnpm -C ../prisma-fixtures/v${PRISMA_MAJOR:-7} run push",
     "test:pg": "vitest run --no-file-parallelism src/__tests__/12-persistence-adapters/prisma-postgres-conformance.test.ts src/__tests__/12-persistence-adapters/sql-enqueue.test.ts src/__tests__/12-persistence-adapters/from-prisma8.test.ts",
+    "test:sqlite": "vitest run --no-file-parallelism src/__tests__/12-persistence-adapters/prisma-sqlite-conformance.test.ts src/__tests__/12-persistence-adapters/from-prisma8-sqlite.test.ts src/__tests__/12-persistence-adapters/sqlite8-adapter-regressions.test.ts src/__tests__/sqlite8-kernel-post-commit.test.ts src/__tests__/sqlite8-kernel-concurrency.test.ts",
     "check:bundle": "node scripts/check-client-isolation.mjs",
     "verify": "pnpm build && pnpm check:bundle && pnpm typecheck && pnpm test"
   },

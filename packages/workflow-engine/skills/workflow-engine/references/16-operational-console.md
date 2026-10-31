@@ -283,9 +283,10 @@ export function createPrismaConsoleReadPort(
 
 ### Statement timeout behaviour
 
-`statementTimeoutMs` defaults to 15,000 ms. Timeout management differs depending on the client supplied:
+`statementTimeoutMs` defaults to 15,000 ms and applies to PostgreSQL only. Timeout management differs depending on the target and client supplied:
 - **Root Prisma client**: When passed a root client (where `$transaction` is present), the read port wraps requests in a single transaction and executes `SET LOCAL statement_timeout = <ms>`. Running multi-query pages (like run detail) in one transaction prevents holding multiple connection pool slots and provides a consistent snapshot.
 - **Transaction client**: When passed an active transaction client (where `$transaction` is absent), the read port **skips** `SET LOCAL statement_timeout`. It does not override the timeout budget of a transaction opened by the caller.
+- **SQLite client**: SQLite has no `statement_timeout` support. The read port does not issue `SET LOCAL`, and `statementTimeoutMs` cannot cancel a running SQLite statement.
 
 If a query exceeds the limit, PostgreSQL cancels the statement with SQLSTATE `57014`. The read port catches this and throws `ConsoleQueryTimeoutError`:
 

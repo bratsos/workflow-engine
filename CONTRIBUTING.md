@@ -6,7 +6,7 @@
 pnpm install
 ```
 
-Requires Node.js >= 22.11 (22.18+ for the Prisma 8 fixture) and pnpm (see `packageManager` in `package.json` for the exact version).
+Requires Node.js >= 22.11 and pnpm (see `packageManager` in `package.json` for the exact version). Prisma 8 SQLite needs the target-specific Node floor listed in [Prisma Setup](apps/docs/docs/persistence/prisma-setup.md#2-sqlite-setup-prisma-6-7-and-8); the engine's general Node engine remains 22.11.
 
 ## Everyday commands
 
@@ -36,6 +36,21 @@ pnpm --filter @bratsos/workflow-engine run prisma:db-push
 pnpm --filter @bratsos/workflow-engine run test:pg
 pnpm --filter @bratsos/workflow-engine-console exec node scripts/build-ui.mjs   # cli.test.ts needs the built UI bundle
 pnpm --filter @bratsos/workflow-engine-console exec vitest run src/__tests__/prisma-read-port.postgres.test.ts src/__tests__/cli.test.ts
+```
+
+SQLite conformance uses a temporary real file and does not need `DATABASE_URL`.
+Its fixture helpers generate or emit the matching contract and initialise the
+file. Build the engine before the console suite because its Prisma 8 case loads
+`fromPrisma8` from the package entry point. Run it for each Prisma major:
+
+```bash
+PRISMA_MAJOR=6 pnpm --filter @bratsos/workflow-engine run test:sqlite
+PRISMA_MAJOR=7 pnpm --filter @bratsos/workflow-engine run test:sqlite
+PRISMA_MAJOR=8 pnpm --filter @bratsos/workflow-engine run test:sqlite
+pnpm --filter @bratsos/workflow-engine run build
+PRISMA_MAJOR=6 pnpm --filter @bratsos/workflow-engine-console exec vitest run src/__tests__/prisma-read-port.sqlite.test.ts
+PRISMA_MAJOR=7 pnpm --filter @bratsos/workflow-engine-console exec vitest run src/__tests__/prisma-read-port.sqlite.test.ts
+PRISMA_MAJOR=8 pnpm --filter @bratsos/workflow-engine-console exec vitest run src/__tests__/prisma-read-port.sqlite.test.ts
 ```
 
 ## Package layout

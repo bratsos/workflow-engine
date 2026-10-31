@@ -200,10 +200,11 @@ from [`mixed-order-indexes.sql`](../persistence/prisma-setup.md#the-mixed-order-
 because a contract cannot express a sort direction.
 
 There is deliberately no total count and no page numbers: counting a large
-run table is the expensive query the console exists to avoid issuing. A
-query cancelled by `statement_timeout` comes back as HTTP 504 with a
-`query_timeout` code, which the UI shows as an inline banner while leaving
-the filter bar interactive, rather than hanging the page.
+run table is the expensive query the console exists to avoid issuing. On
+PostgreSQL, a query cancelled by `statement_timeout` comes back as HTTP 504
+with a `query_timeout` code, which the UI shows as an inline banner while
+leaving the filter bar interactive. SQLite has no `statement_timeout`, so the
+console cannot cancel a running SQLite query this way.
 
 The full reference — every option, the action vocabulary, custom read
 ports, and what the console deliberately does not do — is in the
