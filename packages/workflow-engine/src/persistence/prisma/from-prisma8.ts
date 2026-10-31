@@ -1200,6 +1200,12 @@ export function fromPrisma8(
       "expected a Prisma 8 client from postgres({ contract, url }), or a transaction's tx with { contract: db.contract }",
     );
   }
+  const c = contract as Partial<Contract>;
+  if (!c.storage?.namespaces?.public || !c.domain?.namespaces?.public) {
+    fail(
+      "the engine's models must be in the contract's `public` namespace: its raw SQL does not qualify table names. Move them out of any other namespace in your contract.",
+    );
+  }
   const models = modelsOf(contract as object);
   const byTable = Object.fromEntries(
     Object.values(models).map((m) => [m.table, m]),

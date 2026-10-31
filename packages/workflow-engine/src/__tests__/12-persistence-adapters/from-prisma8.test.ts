@@ -581,6 +581,16 @@ describe.skipIf(!DATABASE_URL || !isPrisma8)(
         expect(() => fromPrisma8(db)).toThrow(/"job_queue".*contract\.prisma/);
       });
 
+      it("names the fix when the engine's models are not in the public namespace", () => {
+        const db = withContract((c) => {
+          for (const part of [c.storage, c.domain]) {
+            part.namespaces.envs = part.namespaces.public;
+            delete part.namespaces.public;
+          }
+        });
+        expect(() => fromPrisma8(db)).toThrow(/models must be in.*`public`/);
+      });
+
       it("names the fix when timestamps are not TimestampString", () => {
         const db = withContract((c) => {
           table(c, "workflow_runs").columns.createdAt.codecId =
