@@ -92,7 +92,7 @@ describe(`I want the Prisma ${major} SQLite adapters to conform against a real f
     directory = await mkdtemp(join(tmpdir(), `prisma-${major}-sqlite-`));
     const file = join(directory, "workflow.db");
     if (major === "8") {
-      const db = await fixtures.createSqliteDb(file);
+      const db = fixtures.createSqliteDb(file);
       try {
         prisma = Object.assign(fromPrisma8(db), {
           $disconnect: () => db.close(),
@@ -139,6 +139,51 @@ describe(`I want the Prisma ${major} SQLite adapters to conform against a real f
     () => Object.assign(createPrismaAICallLogger(prisma), { reset: resetAll }),
     api,
   );
+
+  describe("SQLite JSON defaults", () => {
+    beforeEach(resetAll);
+
+    it("uses the empty object default for model, raw, and persistence creates", async () => {
+      const modelRun = await prisma.workflowRun.create({
+        data: {
+          id: "sqlite-model-config-default",
+          workflowId: "sqlite-config-default",
+          workflowName: "SQLite config default",
+          workflowType: "sqlite-config-default",
+          input: {},
+        },
+      });
+      expect(modelRun.config).toEqual({});
+
+      const rawId = "sqlite-raw-config-default";
+      await prisma.$executeRawUnsafe(
+        `INSERT INTO "workflow_runs" ("id", "updatedAt", "workflowId", "workflowName", "workflowType", "input") VALUES (?, CURRENT_TIMESTAMP, ?, ?, ?, ?)`,
+        rawId,
+        "sqlite-config-default",
+        "SQLite config default",
+        "sqlite-config-default",
+        "{}",
+      );
+      const rawRows = await prisma.$queryRawUnsafe(
+        `SELECT "config" FROM "workflow_runs" WHERE "id" = ?`,
+        rawId,
+      );
+      const rawConfig = rawRows[0].config;
+      expect(
+        typeof rawConfig === "string" ? JSON.parse(rawConfig) : rawConfig,
+      ).toEqual({});
+
+      const portRun = await createPrismaWorkflowPersistence(prisma, {
+        databaseType: "sqlite",
+      }).createRun({
+        workflowId: "sqlite-config-default",
+        workflowName: "SQLite config default",
+        workflowType: "sqlite-config-default",
+        input: {},
+      });
+      expect(portRun.config).toEqual({});
+    });
+  });
 
   stepLedgerConformanceSuite(
     `PrismaStepLedger (SQLite ${major})`,
@@ -303,5 +348,49 @@ describe(`I want the Prisma ${major} SQLite adapters to conform against a real f
       });
       expect(replay.workflowRunId).toBe(created.workflowRunId);
     });
+  });
+});
+
+describe.skipIf(major !== "8")("Prisma 8 SQLite fixture defaults", () => {
+  let directory: string;
+  let db: any;
+
+  beforeAll(async () => {
+    directory = await mkdtemp(join(tmpdir(), "prisma-8-sqlite-default-"));
+    const path = join(directory, "workflow.db");
+    db = fixtures.createSqliteDb(path);
+    expect(db).not.toBeInstanceOf(Promise);
+  }, 60_000);
+
+  afterAll(async () => {
+    await db?.close();
+    if (directory) await rm(directory, { recursive: true, force: true });
+  });
+
+  it("applies the JSON default for Prisma ORM and raw inserts", async () => {
+    const modelRun = await db.orm.WorkflowRun.create({
+      id: "sqlite8-model-config-default",
+      workflowId: "sqlite8-config-default",
+      workflowName: "SQLite 8 config default",
+      workflowType: "sqlite8-config-default",
+      input: {},
+    });
+    expect(modelRun.config).toEqual({});
+
+    const plan = db.raw
+      .sql(
+        `INSERT INTO "workflow_runs" ("id", "updatedAt", "workflowId", "workflowName", "workflowType", "input") VALUES (?, CURRENT_TIMESTAMP, ?, ?, ?, ?) RETURNING "config"`.split(
+          "?",
+        ),
+        "sqlite8-raw-config-default",
+        "sqlite8-config-default",
+        "SQLite 8 config default",
+        "sqlite8-config-default",
+        "{}",
+      )
+      .returnsRow({ config: "sqlite/json@1" })
+      .build();
+    const rawRows = await db.query(plan).toArray();
+    expect(rawRows[0]?.config).toEqual({});
   });
 });

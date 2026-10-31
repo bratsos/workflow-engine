@@ -8,11 +8,15 @@
  * indexes are held against prisma/mixed-order-indexes.sql instead.
  */
 
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 const read = (name: string) =>
   readFile(new URL(`../../../prisma/${name}`, import.meta.url), "utf8");
+const require = createRequire(import.meta.url);
 
 const strip = (text: string) => text.replace(/\/\/.*$/gm, "");
 const columnsOf = (list: string) =>
@@ -119,8 +123,11 @@ function summarise(
       const defaultValue = /^cuid\(/.test(given ?? "")
         ? ""
         : (given ?? "").replace(/^json`|[`"]/g, "");
+      const normalizedDefault = /^dbgenerated\('\{\}'\)$/.test(defaultValue)
+        ? "{}"
+        : defaultValue;
       columns.push(
-        `${column} ${type}${modifier} default=${target === "sqlite" && column === "config" ? "" : defaultValue} generated=${generated}`,
+        `${column} ${type}${modifier} default=${normalizedDefault} generated=${generated}`,
       );
     }
     models[name] = {
@@ -149,14 +156,25 @@ describe("I want the Prisma 8 reference contracts to match schema.prisma", () =>
   });
 
   it("describes the same SQLite models, columns, indexes and relations", async () => {
-    const [schema, contract] = await Promise.all([
-      read("schema.prisma"),
-      read("contract-sqlite.prisma"),
-    ]);
-
-    expect(summarise(contract, "sqlite-contract", "sqlite")).toEqual(
-      summarise(schema, "schema", "sqlite"),
+    const directory = await mkdtemp(
+      join(tmpdir(), "workflow-engine-prisma-sqlite-schema-"),
     );
+    try {
+      const schemaPath =
+        require("../../../../prisma-fixtures/schema.cjs").sqlite(directory, {
+          withUrl: false,
+        });
+      const [schema, contract] = await Promise.all([
+        readFile(schemaPath, "utf8"),
+        read("contract-sqlite.prisma"),
+      ]);
+
+      expect(summarise(contract, "sqlite-contract", "sqlite")).toEqual(
+        summarise(schema, "schema", "sqlite"),
+      );
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 
   it("holds every sort: Desc index of schema.prisma in the companion SQL", async () => {

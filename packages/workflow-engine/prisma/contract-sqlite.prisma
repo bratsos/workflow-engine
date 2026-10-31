@@ -30,7 +30,7 @@ model WorkflowRun {
   duration     Int?
   input        Json
   output       Json?
-  config       Json
+  config       Json @default(json`{}`)
   totalCost    Float     @default(0)
   totalTokens  Int       @default(0)
   priority     Int       @default(5)

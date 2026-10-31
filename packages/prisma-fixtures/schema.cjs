@@ -37,7 +37,10 @@ exports.sqlite = (dir, { withUrl }) => {
     .replace('provider = "postgresql"', `provider = "sqlite"${withUrl ? urlLine : ""}`)
     .replace(/^enum Status \{[\s\S]*?^\}\n\n/m, "")
     .replace(/(\bstatus\s+)Status\s+@default\(PENDING\)/g, '$1String @default("PENDING")')
-    .replace(/(\bconfig\s+Json)\s+@default\("\{\}"\)/, "$1")
+    .replace(
+      /(\bconfig\s+Json)\s+@default\("\{\}"\)/,
+      "$1 @default(dbgenerated(\"'{}'\"))",
+    )
     .replace(/\s+@db\.Text/g, "");
   return write(
     dir,
