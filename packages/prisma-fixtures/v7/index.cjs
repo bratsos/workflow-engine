@@ -8,7 +8,7 @@ exports.createPostgresClient = (url) => {
   return new PrismaClient({ adapter: new PrismaPg({ connectionString: url }) });
 };
 
-// Generates a SQLite client and creates the table in `file`, then connects.
+// Generates a SQLite client and creates every table in `file`, then connects.
 exports.createSqliteClient = (file) => {
   const sqlite = schema.sqlite(__dirname, { withUrl: false });
   const url = `file:${file}`;

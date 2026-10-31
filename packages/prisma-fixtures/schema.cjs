@@ -26,24 +26,26 @@ exports.postgres = (dir, { withUrl }) =>
       : shipped,
   );
 
-// SQLite has no enums or native types, and only the definitions table is
-// exercised there. It gets its own client so the Postgres one is untouched.
+// SQLite has no native enums or PostgreSQL native types. Keep every shipped
+// model so the same adapter suites can exercise the complete schema.
 exports.sqlite = (dir, { withUrl }) => {
-  const model = shipped.match(/^model WorkflowDefinition \{[\s\S]*?^\}/m)[0];
+  const schema = shipped
+    .replace(
+      'generator client {\n  provider = "prisma-client-js"\n}',
+      'generator client {\n  provider = "prisma-client-js"\n  output   = "./sqlite-client"\n}',
+    )
+    .replace('provider = "postgresql"', `provider = "sqlite"${withUrl ? urlLine : ""}`)
+    .replace(/^enum Status \{[\s\S]*?^\}\n\n/m, "")
+    .replace(/(\bstatus\s+)Status\s+@default\(PENDING\)/g, '$1String @default("PENDING")')
+    .replace(
+      /(\bconfig\s+Json)\s+@default\("\{\}"\)/,
+      "$1 @default(dbgenerated(\"'{}'\"))",
+    )
+    .replace(/\s+@db\.Text/g, "");
   return write(
     dir,
     "sqlite.prisma",
-    `generator client {
-  provider = "prisma-client-js"
-  output   = "./sqlite-client"
-}
-
-datasource db {
-  provider = "sqlite"${withUrl ? urlLine : ""}
-}
-
-${model}
-`,
+    schema,
   );
 };
 

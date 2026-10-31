@@ -12,3 +12,6 @@ exports.createPostgresDb = (url) => {
   );
   return postgres({ contract, url });
 };
+
+exports.createSqliteDb = (file) =>
+  require("../v8-sqlite").createSqliteDb(file);
