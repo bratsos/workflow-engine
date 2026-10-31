@@ -96,6 +96,15 @@ describe.skipIf(!DATABASE_URL || !isPrisma8)(
         );
       });
 
+      it("names $withColumns, which the client has, in that error", async () => {
+        const error = await prisma
+          .$queryRawUnsafe("SELECT 1")
+          .catch((e: Error) => e);
+        expect(error.message).toContain("client.$withColumns(");
+        expect(error.message).not.toContain("rawFor");
+        expect(typeof prisma.$withColumns).toBe("function");
+      });
+
       it("derives a table's columns from the contract", async () => {
         await prisma.workflowRun.create({ data: run("derived") });
         const [row] = await rawFor(prisma, "workflow_runs").$queryRawUnsafe(

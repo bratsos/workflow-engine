@@ -21,7 +21,7 @@
  * - Delegates are lazy: a call runs when awaited, or inside `$transaction([...])`.
  * - Timestamps are `pg/timestamp-string@1` (UTC text without a zone): `Date`
  *   in becomes ISO text, text out becomes `Date`.
- * - Raw reads must declare their columns (see `rawFor`), since Prisma 8 drops
+ * - Raw reads must declare their columns (`client.$withColumns(...)`), since Prisma 8 drops
  *   the ones they do not.
  * - Postgres only.
  *
@@ -1227,7 +1227,7 @@ export function fromPrisma8(
     const spec = (): Record<string, string> => {
       if (columns === undefined) {
         fail(
-          "a raw read must declare its result columns: run it on rawFor(client, columns)",
+          'a raw read must declare its result columns: run it on client.$withColumns({ name: "text" }), or client.$withColumns("table_name") for every column of a table',
         );
       }
       if (typeof columns === "string") {
