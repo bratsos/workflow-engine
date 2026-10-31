@@ -30,7 +30,7 @@ import {
   rawFor,
   validateDatabaseType,
 } from "./prisma-client-type";
-import { sqliteTransactionReads } from "./transaction-reads";
+import { hasBaseReads, sqliteTransactionReads } from "./transaction-reads";
 
 const logger = createLogger("JobQueue");
 
@@ -939,6 +939,10 @@ export class PrismaJobQueue implements JobQueue {
   transactionReads(persistence: Persistence): Partial<JobQueue> | undefined {
     if (this.databaseType !== "sqlite") return undefined;
     return sqliteTransactionReads(persistence, this.prisma, (tx) => {
+      if (
+        !hasBaseReads(this, PrismaJobQueue.prototype, ["getJobsByWorkflowRun"])
+      )
+        return undefined;
       const reader = new PrismaJobQueue(tx, {
         databaseType: this.databaseType,
         workerId: this.workerId,

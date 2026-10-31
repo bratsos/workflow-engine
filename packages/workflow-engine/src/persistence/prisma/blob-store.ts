@@ -17,7 +17,7 @@ import type {
   EnginePrismaClient,
   PrismaDelegate,
 } from "./prisma-client-type.js";
-import { sqliteTransactionReads } from "./transaction-reads.js";
+import { hasBaseReads, sqliteTransactionReads } from "./transaction-reads.js";
 
 /** The one delegate the Prisma blob store needs. */
 export interface BlobPrismaClient {
@@ -69,6 +69,11 @@ export class PrismaBlobStore implements BlobStore {
 
   transactionReads(persistence: Persistence): Partial<BlobStore> | undefined {
     return sqliteTransactionReads(persistence, this.prisma, (tx) => {
+      // Keep custom reader policy and decoding on the configured port.
+      if (
+        !hasBaseReads(this, PrismaBlobStore.prototype, ["get", "has", "list"])
+      )
+        return undefined;
       const reader = new PrismaBlobStore(
         tx as EnginePrismaClient & BlobPrismaClient,
       );

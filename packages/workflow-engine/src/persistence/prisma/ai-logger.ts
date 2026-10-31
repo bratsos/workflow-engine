@@ -19,7 +19,7 @@ import {
   validateDatabaseType,
 } from "./prisma-client-type";
 import { isUniqueViolation } from "./sql-errors";
-import { sqliteTransactionReads } from "./transaction-reads";
+import { hasBaseReads, sqliteTransactionReads } from "./transaction-reads";
 
 const logger = createLogger("AICallLogger");
 
@@ -283,6 +283,8 @@ export class PrismaAICallLogger implements AICallLogger {
   ): Partial<AICallLogger> | undefined {
     if (this.databaseType !== "sqlite") return undefined;
     return sqliteTransactionReads(persistence, this.prisma, (tx) => {
+      if (!hasBaseReads(this, PrismaAICallLogger.prototype, ["getStats"]))
+        return undefined;
       const reader = new PrismaAICallLogger(tx, {
         databaseType: this.databaseType,
       });
