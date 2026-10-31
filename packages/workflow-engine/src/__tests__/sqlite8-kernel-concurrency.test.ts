@@ -224,6 +224,7 @@ describe.skipIf(!realDatabase)(
           }),
         ).toBe(BURST);
         expect(await db.client.workflowBlob.count()).toBe(BURST);
+        expect(await db.client.workflowLog.count()).toBe(BURST);
       },
       120_000,
     );

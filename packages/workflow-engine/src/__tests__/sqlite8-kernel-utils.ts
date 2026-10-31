@@ -8,6 +8,7 @@ import { WorkflowBuilder } from "../core/workflow.js";
 import { createKernel, type KernelConfig } from "../kernel/kernel.js";
 import { CollectingEventSink } from "../kernel/testing/index.js";
 import {
+  createPrismaAICallLogger,
   createPrismaBlobStore,
   createPrismaJobQueue,
   createPrismaStepLedger,
@@ -85,7 +86,9 @@ export async function kernelDatabase() {
         $disconnect: () => db.close(),
       });
     } else {
-      client = fixture.createSqliteClient(file);
+      client = fixture.createSqliteClient(
+        process.env.PRISMA_MAJOR === "6" ? `${file}?connection_limit=1` : file,
+      );
     }
   } else {
     const url = new URL(process.env.DATABASE_URL!);
@@ -96,6 +99,11 @@ export async function kernelDatabase() {
     databaseType: sqlite ? ("sqlite" as const) : ("postgresql" as const),
   };
   const persistence = createPrismaWorkflowPersistence(client, options);
+  const createLogger: (
+    client: Parameters<typeof createPrismaAICallLogger>[0],
+    options?: { databaseType: "postgresql" | "sqlite" },
+  ) => ReturnType<typeof createPrismaAICallLogger> = createPrismaAICallLogger;
+  const aiLogger = createLogger(client, options);
   const jobTransport = createPrismaJobQueue(client, {
     ...options,
     workerId: "kernel-worker",
@@ -118,6 +126,7 @@ export async function kernelDatabase() {
   return {
     client,
     persistence,
+    aiLogger,
     jobTransport,
     stepLedger,
     blobStore,

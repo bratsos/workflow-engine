@@ -243,7 +243,7 @@ export async function handleRunRedrive(
   if (deps.stepLedger) {
     const ledger = deps.stepLedger;
     for (const stage of stagesToSupersede) {
-      const rows = await ledger.list(stage.id).catch(() => [] as StepRecord[]);
+      const rows = await ledger.list(stage.id);
       let dropped: readonly StepRecord[] = rows;
       let reason: AbandonReason = "deleted";
       if (stagesToReopen.includes(stage)) {

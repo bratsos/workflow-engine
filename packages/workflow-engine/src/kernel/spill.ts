@@ -43,6 +43,7 @@ import type {
   JobRecord,
 } from "../persistence/interface.js";
 import { SpilledPayloadUnavailableError } from "./errors.js";
+import { withTransactionReads } from "./helpers/transaction-reads.js";
 import type {
   BlobStore,
   JobTransport,
@@ -50,6 +51,7 @@ import type {
   StepRecord,
   StepRecordExpectation,
   StepRecordPatch,
+  TransactionReadPort,
 } from "./ports.js";
 
 // ============================================================================
@@ -151,7 +153,9 @@ function jsonByteLength(json: string, limit: number): number {
   return new TextEncoder().encode(json).length;
 }
 
-export function createPayloadSpill(options: PayloadSpillOptions): PayloadSpill {
+export function createPayloadSpill(
+  options: PayloadSpillOptions,
+): PayloadSpill & TransactionReadPort<PayloadSpill> {
   const { blobStore } = options;
   const thresholdBytes =
     options.thresholdBytes ?? DEFAULT_SPILL_THRESHOLD_BYTES;
@@ -163,6 +167,13 @@ export function createPayloadSpill(options: PayloadSpillOptions): PayloadSpill {
 
   return {
     thresholdBytes,
+
+    transactionReads(persistence) {
+      const reader = withTransactionReads(blobStore, persistence, ["get"]);
+      return reader === blobStore
+        ? undefined
+        : createPayloadSpill({ ...options, blobStore: reader });
+    },
 
     async pack(key, value) {
       if (value === undefined || value === null) return value;
@@ -249,7 +260,7 @@ function jobSpillKey(workflowRunId: string, stageId: string): string {
 export function withStepResultSpill(
   ledger: StepLedger,
   spill: PayloadSpill,
-): StepLedger {
+): StepLedger & TransactionReadPort<StepLedger> {
   async function resolve(record: StepRecord): Promise<StepRecord> {
     if (!isSpillRef(record.result)) return record;
     return { ...record, result: await spill.unpack(record.result) };
@@ -271,6 +282,14 @@ export function withStepResultSpill(
   }
 
   return {
+    transactionReads(persistence) {
+      const reader = withTransactionReads(ledger, persistence, ["get", "list"]);
+      const readerSpill = withTransactionReads(spill, persistence, ["unpack"]);
+      return reader === ledger && readerSpill === spill
+        ? undefined
+        : withStepResultSpill(reader, readerSpill);
+    },
+
     async claim(record) {
       const result = await spill.pack(
         stepSpillKey(record.stageRecordId, record.stepId),
@@ -426,7 +445,7 @@ function extractGroupValue(payload: unknown, segments: string[]): unknown {
 export function createSpillingJobTransport(
   transport: JobTransport,
   options: SpillingJobTransportOptions,
-): JobTransport {
+): JobTransport & TransactionReadPort<JobTransport> {
   const spill = createPayloadSpill(options);
   const groupByPath = options.groupBy ?? transport.fairnessGroupBy ?? null;
   const groupSegments = groupByPath ? splitGroupPath(groupByPath) : null;
@@ -439,6 +458,23 @@ export function createSpillingJobTransport(
   }
 
   return {
+    transactionReads(persistence) {
+      const reader = withTransactionReads(transport, persistence, [
+        "getJobsByWorkflowRun",
+      ]);
+      const readerBlobStore = withTransactionReads(
+        options.blobStore,
+        persistence,
+        ["get"],
+      );
+      return reader === transport && readerBlobStore === options.blobStore
+        ? undefined
+        : createSpillingJobTransport(reader, {
+            ...options,
+            blobStore: readerBlobStore,
+          });
+    },
+
     async enqueueParallel(jobs: EnqueueJobInput[]) {
       const packed = await Promise.all(
         jobs.map(async (job) => {

@@ -64,6 +64,19 @@ export async function handleRunReapStuck(
           ),
       );
       if (missingJobStages.length > 0) {
+        // Claim the recovery and refresh its activity before scheduling jobs.
+        // Other sweepers then leave it alone until it becomes stale again,
+        // rather than repeatedly scheduling the same missing jobs while
+        // the first sweeper is still waiting to enqueue after commit.
+        try {
+          await deps.persistence.updateRun(run.id, {
+            expectedVersion: run.version,
+          });
+        } catch (error) {
+          if (error instanceof StaleVersionError) continue;
+          throw error;
+        }
+
         // INVARIANT: no handler enqueues a job from inside the kernel
         // transaction. The handler body runs under
         // `persistence.withTransaction`; a job enqueued there is visible

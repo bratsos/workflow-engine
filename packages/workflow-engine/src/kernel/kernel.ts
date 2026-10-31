@@ -77,6 +77,7 @@ import {
   filterCouldMatchLegacy,
   synthesizeLegacyMetadata,
 } from "./helpers/index.js";
+import { withTransactionReads } from "./helpers/transaction-reads.js";
 import type {
   ActivityExecutor,
   BlobStore,
@@ -470,7 +471,32 @@ export function createKernel(config: KernelConfig): Kernel {
       let postCommit: ((deps: KernelDeps) => Promise<unknown>) | undefined;
 
       const publicResult = await persistence.withTransaction(async (tx) => {
-        const txDeps: KernelDeps = { ...deps, persistence: tx };
+        // A root-client read can wait on the very connection this transaction
+        // holds. Supporting ports bind reads to its snapshot, keeping every
+        // write on the original port for _postCommit.
+        const txDeps: KernelDeps = {
+          ...deps,
+          persistence: tx,
+          jobTransport: withTransactionReads(jobTransport, tx, [
+            "getJobsByWorkflowRun",
+          ]),
+          blobStore: withTransactionReads(blobStore, tx, [
+            "get",
+            "has",
+            "list",
+          ]),
+          stepLedger: stepLedger
+            ? withTransactionReads(stepLedger, tx, ["get", "list"])
+            : undefined,
+          services: services?.aiLogger
+            ? {
+                ...services,
+                aiLogger: withTransactionReads(services.aiLogger, tx, [
+                  "getStats",
+                ]),
+              }
+            : services,
+        };
         let result: HandlerResult<any>;
 
         switch (command.type) {
