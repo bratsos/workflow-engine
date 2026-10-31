@@ -104,30 +104,36 @@ describe(`SQLite ledger keep lists on Prisma ${major}`, () => {
   }
 
   it.each([
-    { name: "one kept key", keys: ["keep-a"], remaining: ["keep-a"] },
     {
-      name: "multiple kept keys and a missing key",
-      keys: ["keep-b", "missing", "keep-a"],
+      name: "40,000 duplicate IDs for one kept key",
+      keep: Array(40_000).fill("keep-a") as string[],
+      remaining: ["keep-a"],
+    },
+    {
+      name: "40,000 duplicate IDs for multiple kept keys and a missing key",
+      keep: Array.from(
+        { length: 40_000 },
+        (_, index) => ["keep-b", "missing", "keep-a"][index % 3]!,
+      ),
       remaining: ["keep-a", "keep-b"],
     },
-  ])("clears with 32,768 duplicate IDs for $name", async ({
-    keys,
-    remaining,
-  }) => {
-    const keepStepIds = Array.from(
-      { length: 32_768 },
-      (_, index) => keys[index % keys.length]!,
-    );
-    const original = [...keepStepIds];
-    Object.freeze(keepStepIds);
+    {
+      name: "32,768 distinct IDs",
+      keep: [
+        "keep-a",
+        ...Array.from({ length: 32_766 }, (_, index) => `missing-${index}`),
+        "keep-b",
+      ],
+      remaining: ["keep-a", "keep-b"],
+    },
+  ])("clears with $name", async ({ keep, remaining }) => {
+    const original = [...keep];
+    Object.freeze(keep);
 
-    await createPrismaStepLedger(prisma, options).clearExcept!(
-      "stage-1",
-      keepStepIds,
-    );
+    await createPrismaStepLedger(prisma, options).clearExcept!("stage-1", keep);
 
     expect(await persistedSteps()).toEqual(expectedSteps(remaining));
-    expect(keepStepIds).toEqual(original);
+    expect(keep).toEqual(original);
   });
 
   it.each([
@@ -144,9 +150,59 @@ describe(`SQLite ledger keep lists on Prisma ${major}`, () => {
     expect(keep).toEqual(original);
   });
 
+  it("matches Unicode, quotes and NULs literally in stage and step IDs", async () => {
+    const stageRecordId = "stage-3-'\"\\雪🧪\0suffix";
+    const kept = ["keep-'\"\\雪🧪", "nul\0kept"];
+    await prisma.workflowStage.create({
+      data: {
+        id: stageRecordId,
+        workflowRunId: "ledger-run",
+        stageId: stageRecordId,
+        stageName: stageRecordId,
+        stageNumber: 3,
+        executionGroup: 3,
+      },
+    });
+    const ledger = createPrismaStepLedger(prisma, options);
+    for (const [seq, stepId] of [...kept, "nul", "nul\0drop"].entries()) {
+      await ledger.claim({
+        stageRecordId,
+        stepId,
+        seq,
+        kind: "run",
+        status: "completed",
+        attempt: 0,
+        leaseExpiresAt: null,
+        deadlineAt: null,
+        result: { stageRecordId, stepId },
+      });
+    }
+    const keep = ["missing", ...kept];
+    const original = [...keep];
+    Object.freeze(keep);
+
+    await ledger.clearExcept!(stageRecordId, keep);
+
+    expect(await persistedSteps()).toEqual([
+      ...expectedSteps(["keep-a", "keep-b", "drop"]),
+      ...kept.map((stepId) => ({
+        stageRecordId,
+        stepId,
+        status: "completed",
+        result: { stageRecordId, stepId },
+      })),
+    ]);
+    expect(keep).toEqual(original);
+  });
+
   it("rolls back a large keep-list deletion with the caller's transaction", async () => {
-    const keepStepIds = Array(32_768).fill("keep-a");
+    const keepStepIds = [
+      "keep-a",
+      ...Array.from({ length: 32_766 }, (_, index) => `missing-${index}`),
+      "keep-b",
+    ];
     const original = [...keepStepIds];
+    Object.freeze(keepStepIds);
     const rollback = new Error("roll back ledger deletion");
 
     await expect(
@@ -155,7 +211,9 @@ describe(`SQLite ledger keep lists on Prisma ${major}`, () => {
           "stage-1",
           keepStepIds,
         );
-        expect(await persistedSteps(tx)).toEqual(expectedSteps(["keep-a"]));
+        expect(await persistedSteps(tx)).toEqual(
+          expectedSteps(["keep-a", "keep-b"]),
+        );
         throw rollback;
       }),
     ).rejects.toBe(rollback);
