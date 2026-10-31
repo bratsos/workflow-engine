@@ -10,8 +10,8 @@
   // reserved pnpm builtin.
   //
   // Continuous deploys use Cloudflare Workers Builds, connected to the
-  // repository in the Cloudflare dashboard, with root directory "/" and the
-  // deploy command:
+  // repository in the Cloudflare dashboard, with root directory "/", the
+  // build variable NODE_VERSION=22 and the deploy command:
   //   pnpm --filter workflow-engine-docs run cf-deploy
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "workflow-engine-docs",
