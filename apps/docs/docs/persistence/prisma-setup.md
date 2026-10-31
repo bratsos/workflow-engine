@@ -866,23 +866,31 @@ writeFileSync(resolve("prisma/schema.prisma"), schema);
 console.log(`Wrote complete SQLite schema for Prisma ${major}.`);
 ```
 
-Save it under `scripts/`, then create `scripts/prisma-sqlite.cjs`. This runner gives Prisma CLI and the runtime the same absolute file URL on macOS, Linux and Windows; the Prisma 6 URL adds `connection_limit=1` so its native client serializes writes:
+Save it under `scripts/`, then create `scripts/prisma-sqlite.cjs`. Prisma's SQLite URL parser needs the resolved absolute path after `file:` with Windows backslashes changed to forward slashes. Keep spaces and Unicode literal. On Windows, Prisma 6/7 accepts `file:C:/...`; the `file:///C:/...` URL from `pathToFileURL` fails `db push` with OS error 161. This keeps the CLI and runtime on the same database file. The Prisma 6 URL adds `connection_limit=1` so its native client serializes writes:
 
 ```js
 const { execFileSync } = require("node:child_process");
 const { resolve } = require("node:path");
-const { pathToFileURL } = require("node:url");
 
 const [major, ...args] = process.argv.slice(2);
 if ((major !== "6" && major !== "7") || args.length === 0) {
   throw new Error("Usage: node scripts/prisma-sqlite.cjs 6|7 <prisma command>");
 }
-const fileUrl = pathToFileURL(resolve("prisma/dev.db")).href;
+const fileUrl = `file:${resolve("prisma/dev.db").replace(/\\/g, "/")}`;
 const databaseUrl = major === "6" ? `${fileUrl}?connection_limit=1` : fileUrl;
 execFileSync(
   process.execPath,
-  [require.resolve("prisma/build/index.js"), ...args, "--schema", "prisma/schema.prisma"],
-  { cwd: process.cwd(), env: { ...process.env, DATABASE_URL: databaseUrl }, stdio: "inherit" },
+  [
+    require.resolve("prisma/build/index.js"),
+    ...args,
+    "--schema",
+    "prisma/schema.prisma",
+  ],
+  {
+    cwd: process.cwd(),
+    env: { ...process.env, DATABASE_URL: databaseUrl },
+    stdio: "inherit",
+  }
 );
 ```
 
@@ -912,19 +920,20 @@ node scripts/prisma-sqlite.cjs 7 generate
 node scripts/prisma-sqlite.cjs 7 db push
 ```
 
-The generated client is at `prisma/sqlite-client`. Use the same absolute file URL at runtime that the runner used for `generate` and `db push`.
+The generated client is at `prisma/sqlite-client`. Use the same normalized absolute SQLite URL at runtime that the runner used for `generate` and `db push`.
 
 For Prisma 6, save this as `db.mjs`. Its native pool is limited to one connection so engine writes are serialized:
+
+On Windows ARM64, Prisma 6.19.3's native client was verified with Node 24.11.0 x64 under emulation; its native query engine did not load under Node 24.11.0 ARM64. Prisma 7.10.1 passed on ARM64 Node 24.11.0.
 
 ```js
 import { createRequire } from "node:module";
 import { resolve } from "node:path";
-import { pathToFileURL } from "node:url";
 import { createPrismaWorkflowPersistence } from "@bratsos/workflow-engine/persistence/prisma";
 
 const require = createRequire(import.meta.url);
 const { PrismaClient } = require("./prisma/sqlite-client");
-const fileUrl = pathToFileURL(resolve("prisma/dev.db")).href;
+const fileUrl = `file:${resolve("prisma/dev.db").replace(/\\/g, "/")}`;
 export const prisma = new PrismaClient({
   datasourceUrl: `${fileUrl}?connection_limit=1`,
 });
@@ -938,13 +947,12 @@ For Prisma 7, use the native better-sqlite3 driver adapter. Save this `db.mjs` i
 ```js
 import { createRequire } from "node:module";
 import { resolve } from "node:path";
-import { pathToFileURL } from "node:url";
 import { createPrismaWorkflowPersistence } from "@bratsos/workflow-engine/persistence/prisma";
 
 const require = createRequire(import.meta.url);
 const { PrismaClient } = require("./prisma/sqlite-client");
 const { PrismaBetterSqlite3 } = require("@prisma/adapter-better-sqlite3");
-const url = pathToFileURL(resolve("prisma/dev.db")).href;
+const url = `file:${resolve("prisma/dev.db").replace(/\\/g, "/")}`;
 export const prisma = new PrismaClient({
   adapter: new PrismaBetterSqlite3({ url }),
 });
