@@ -4,17 +4,9 @@
 // SQLite DateTime and Json codecs. Keep both references in step when models
 // change. See prisma/contract.prisma for the Postgres contract.
 
-// Reference Prisma schema for the engine's tables.
-//
-// Shipped in the package ("prisma/" is in the "files" field) so a consumer
-// can copy the models into their own schema or diff theirs against it. The
-// ../../prisma-fixtures (one fixture per Prisma major).
-//
-// The datasource has no `url`: Prisma 7 and later reject it (the URL lives in
-// `prisma.config.ts`), and the Prisma 6 fixture adds it when it generates.
-//
-// The migration guides under ../skills/workflow-engine/migrations/ derive
-// their SQL from this file; keep them in step when a model changes.
+// Copy these models into a Prisma 8 SQLite contract and configure the database
+// path in prisma.config.ts. The shipped schema.prisma is the model reference
+// for Prisma 6 and 7.
 
 model WorkflowRun {
   id           String @id @onCreate(cuid(2))
