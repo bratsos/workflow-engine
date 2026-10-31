@@ -1,3 +1,4 @@
+import { withPostCommitWrites } from "./helpers/post-commit-writes.js";
 /**
  * Kernel Factory
  *
@@ -14,8 +15,8 @@
  *  - `stage.pollSuspended` — per-stage transactions so that
  *    checkCompletion() HTTP calls run outside any transaction
  *    (see `handlers/stage-poll-suspended.ts`)
- *  - `step.signal` — writes the external ledger before its stage/outbox
- *    transaction
+ *  - `step.signal` — writes the external ledger first, then retries its
+ *    atomic stage/outbox wake until it commits
  *
  * Commands with idempotency keys are deduplicated: a replay returns the
  * cached result without re-executing the handler.
@@ -426,13 +427,17 @@ export function createKernel(config: KernelConfig): Kernel {
     // -----------------------------------------------------------------
     if (command.type === "stage.pollSuspended") {
       const result = await handleStagePollSuspended(command, deps);
-      await result._postCommit?.(deps);
+      if (result._postCommit)
+        await withPostCommitWrites(persistence, () =>
+          result._postCommit!(deps),
+        );
       return stripEvents(result);
     }
 
     // These ports use their own connections. Lease reaping needs no
     // persistence transaction; signalling commits its stage/outbox writes
-    // only after the external ledger (and any spilled payload) is written.
+    // after the external ledger (and any spilled payload) is written. A
+    // completed ledger row still retries an uncommitted wake.
     if (command.type === "lease.reapStale") {
       return stripEvents(await handleLeaseReapStale(command, deps));
     }
@@ -558,7 +563,7 @@ export function createKernel(config: KernelConfig): Kernel {
         // Runs only now that the transaction has committed — the DB
         // state this side effect depends on (e.g. deleted stage rows)
         // can no longer be rolled back out from under it.
-        await postCommit(deps);
+        await withPostCommitWrites(persistence, () => postCommit!(deps));
       }
 
       return publicResult;

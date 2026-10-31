@@ -1,3 +1,5 @@
+import { literalPrefixQuery, prefixCandidates } from "./literal-prefix.js";
+import { withTransactionWriteGuard } from "./transaction-writes.js";
 /**
  * PrismaAICallLogger - Prisma implementation of AICallLogger
  *
@@ -142,6 +144,10 @@ export class PrismaAICallLogger implements AICallLogger {
     private readonly prisma: PrismaClient,
     options: PrismaAICallLoggerOptions = {},
   ) {
+    this.prisma = withTransactionWriteGuard(
+      prisma,
+      options.databaseType ?? "postgresql",
+    );
     this.databaseType = options.databaseType ?? "postgresql";
     validateDatabaseType(prisma, this.databaseType);
   }
@@ -231,17 +237,38 @@ export class PrismaAICallLogger implements AICallLogger {
    * Get aggregated stats for a topic prefix
    */
   async getStats(topicPrefix: string): Promise<AIHelperStats> {
-    const calls = await this.prisma.aICall.findMany({
-      where: {
-        topic: { startsWith: topicPrefix },
+    const literal = literalPrefixQuery<{
+      modelKey: string;
+      inputTokens: number;
+      outputTokens: number;
+      cost: number;
+    }>(this.prisma, "ai_calls", "topic", topicPrefix, {
+      columns: {
+        modelKey: "text",
+        inputTokens: "int",
+        outputTokens: "int",
+        cost: "float",
       },
-      select: {
-        modelKey: true,
-        inputTokens: true,
-        outputTokens: true,
-        cost: true,
-      },
+      select: '"modelKey", "inputTokens", "outputTokens", "cost"',
     });
+    const calls = literal
+      ? await literal
+      : (
+          await this.prisma.aICall.findMany({
+            where: {
+              topic: { startsWith: prefixCandidates(topicPrefix) },
+            },
+            select: {
+              modelKey: true,
+              inputTokens: true,
+              outputTokens: true,
+              cost: true,
+              topic: true,
+            },
+          })
+        ).filter((call: { topic: string }) =>
+          call.topic.startsWith(topicPrefix),
+        );
 
     const perModel: AIHelperStats["perModel"] = {};
 
@@ -317,10 +344,58 @@ export class PrismaAICallLogger implements AICallLogger {
    * figure as recorded.
    */
   async listCalls(topicPrefix: string): Promise<AICallRecord[]> {
-    const rows = (await this.prisma.aICall.findMany({
-      where: { topic: { startsWith: topicPrefix } },
-      orderBy: [{ createdAt: "asc" }, { id: "asc" }],
-    })) as AICallRow[];
+    const nativeSqlite =
+      this.databaseType === "sqlite" && !this.prisma.$databaseType;
+    const literal = literalPrefixQuery<AICallRow>(
+      this.prisma,
+      "ai_calls",
+      "topic",
+      topicPrefix,
+      {
+        suffix: ' ORDER BY "createdAt" ASC, "id" ASC',
+        ...(nativeSqlite
+          ? {
+              select: [
+                "id",
+                "createdAt",
+                "topic",
+                "callType",
+                "modelKey",
+                "modelId",
+                "prompt",
+                "response",
+                "inputTokens",
+                "outputTokens",
+                "cost",
+                "estimatedCost",
+                "reportedCost",
+                "costSource",
+                "servedBy",
+                "cachedInputTokens",
+                "reasoningTokens",
+                "batchId",
+                "requestId",
+                "metadata",
+              ]
+                .map((column) =>
+                  column === "metadata"
+                    ? 'CAST("metadata" AS TEXT) AS "metadata"'
+                    : `"${column}"`,
+                )
+                .join(", "),
+              jsonColumns: ["metadata"],
+            }
+          : {}),
+      },
+    );
+    const rows = literal
+      ? await literal
+      : (
+          (await this.prisma.aICall.findMany({
+            where: { topic: { startsWith: prefixCandidates(topicPrefix) } },
+            orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+          })) as AICallRow[]
+        ).filter((row) => row.topic.startsWith(topicPrefix));
     return rows.map(toRecord);
   }
 }

@@ -523,7 +523,11 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
 
   async getSuspendedStages(
     beforeDate: Date,
-    options?: { limit?: number; serves?: readonly ServedDefinition[] },
+    options?: {
+      limit?: number;
+      serves?: readonly ServedDefinition[];
+      includeSettlements?: boolean;
+    },
   ): Promise<WorkflowStageRecord[]> {
     const serves = options?.serves;
     // Same predicate `claimNextPendingRun` applies, read through the
@@ -548,7 +552,9 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
         if (seenIds.has(s.id)) return false;
         seenIds.add(s.id);
         return (
-          s.status === "SUSPENDED" &&
+          (s.status === "SUSPENDED" ||
+            (options?.includeSettlements &&
+              (s.status === "COMPLETED" || s.status === "FAILED"))) &&
           s.nextPollAt !== null &&
           s.nextPollAt <= beforeDate &&
           runServed(s.workflowRunId)

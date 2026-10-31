@@ -11,6 +11,7 @@ import {
 } from "./prisma-client-type.js";
 import { isUniqueViolation } from "./sql-errors.js";
 import { hasBaseReads, sqliteTransactionReads } from "./transaction-reads.js";
+import { withTransactionWriteGuard } from "./transaction-writes.js";
 
 type PrismaClient = EnginePrismaClient;
 
@@ -88,6 +89,10 @@ export class PrismaStepLedger implements StepLedger {
     private readonly prisma: PrismaClient,
     options: PrismaStepLedgerOptions = {},
   ) {
+    this.prisma = withTransactionWriteGuard(
+      prisma,
+      options.databaseType ?? "postgresql",
+    );
     this.databaseType = options.databaseType ?? "postgresql";
     validateDatabaseType(prisma, this.databaseType);
   }

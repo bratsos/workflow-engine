@@ -60,7 +60,7 @@ class MyCustomPersistence implements WorkflowPersistence {
 
   // Stages
   async createStage / upsertStage / updateStage / getStage / getStagesByRun / deleteStage
-  async getSuspendedStages(beforeDate: Date, options?: { limit?, serves? }): Promise<WorkflowStageRecord[]> { ... }
+  async getSuspendedStages(beforeDate: Date, options?: { limit?, serves?, includeSettlements? }): Promise<WorkflowStageRecord[]> { ... }
 
   // Logs, annotations, outbox, idempotency
   async createLog / appendAnnotations / listAnnotations
@@ -73,7 +73,7 @@ class MyCustomPersistence implements WorkflowPersistence {
 Points that are easy to get wrong, all covered by the conformance suite:
 
 * **`claimNextPendingRun({ serves })`**: a pinned run is claimable only by a caller presenting its `(workflowId, version)` pair; an *unpinned* run (`definitionVersion` null) only by a caller whose `serves` names its workflow; an empty `serves` claims nothing. Omit `serves` (or pass `"all"`) for the version-blind predicate. Bind the `now` the kernel passes rather than the database's `NOW()`.
-* **`getSuspendedStages(beforeDate, { limit, serves })`** owns both narrowings: oldest `nextPollAt` first, capped at `limit`, and only stages of runs the caller serves. An adapter without a `definitionVersion` column may ignore `serves`.
+* **`getSuspendedStages(beforeDate, { limit, serves, includeSettlements })`** owns both narrowings: oldest `nextPollAt` first, capped at `limit`, and only stages of runs the caller serves. An adapter without a `definitionVersion` column may ignore `serves`. When `includeSettlements` is true, also return `COMPLETED` and `FAILED` stages with a due `nextPollAt`; the poller uses those rows to retry job settlement without executing a stage again.
 * **`claimUnpublishedOutboxEvents(limit)`** must stamp `publishedAt` atomically (`FOR UPDATE SKIP LOCKED` on Postgres, a per-row compare-and-set elsewhere) so two hosts flushing the same outbox do not both deliver an event; `releaseOutboxEvents(ids)` hands back the events of a run whose emit threw.
 * **`listRunsForPurge` / `deleteRun`** back `run.purge`; `deleteRun` must take stages, logs, artifacts and annotations with the run.
 * **`UpdateStageInput`** accepts `null` for `errorMessage`, `completedAt` and `duration` (a redrive clears them when it reopens a stage) and carries `attempt`.

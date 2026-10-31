@@ -34,6 +34,42 @@ export async function handleStepSignal(
     );
   }
 
+  // The ledger is external to the stage transaction. A completed ledger row
+  // must still retry its wake; this key commits with the wake and outbox event.
+  const wake = async (payload: unknown, alreadyCompleted: boolean) => {
+    await deps.persistence.withTransaction(async (tx) => {
+      const key = JSON.stringify([stage.id, command.stepId]);
+      const claim = await tx.acquireIdempotencyKey(key, "step.signal.wake");
+      if (claim.status === "replay") return;
+      if (claim.status === "in_progress") {
+        throw new Error(
+          `Durable signal step "${command.stepId}" wake is in progress`,
+        );
+      }
+      const event: KernelEvent = {
+        type: "step:signalled",
+        timestamp: deps.clock.now(),
+        workflowRunId: command.workflowRunId,
+        stageId: command.stageId,
+        stepId: command.stepId,
+        payload,
+      };
+      await tx.updateStage(stage.id, { nextPollAt: deps.clock.now() });
+      await tx.appendOutboxEvents(
+        toOutboxEvents(command.workflowRunId, [event]),
+      );
+      await tx.completeIdempotencyKey(key, "step.signal.wake", {
+        signalled: true,
+      });
+    });
+    return {
+      signalled: true as const,
+      ok: true as const,
+      alreadyCompleted,
+      _events: [],
+    };
+  };
+
   const existing = await deps.stepLedger.get(stage.id, command.stepId);
   if (existing?.kind !== undefined && existing.kind !== "signal") {
     throw new Error(
@@ -46,12 +82,7 @@ export async function handleStepSignal(
     );
   }
   if (existing?.status === "completed") {
-    return {
-      signalled: true,
-      ok: true,
-      alreadyCompleted: true,
-      _events: [],
-    };
+    return wake(existing.result, true);
   }
 
   const payload = jsonRoundTrip(command.payload, command.stepId);
@@ -70,12 +101,7 @@ export async function handleStepSignal(
     if (!completed.applied) {
       const winner = await deps.stepLedger.get(stage.id, command.stepId);
       if (winner?.status === "completed") {
-        return {
-          signalled: true,
-          ok: true,
-          alreadyCompleted: true,
-          _events: [],
-        };
+        return wake(winner.result, true);
       }
       if (winner?.status === "failed") {
         throw new Error(
@@ -110,12 +136,7 @@ export async function handleStepSignal(
         );
       }
       if (claimed.record.status === "completed") {
-        return {
-          signalled: true,
-          ok: true,
-          alreadyCompleted: true,
-          _events: [],
-        };
+        return wake(claimed.record.result, true);
       }
       const completed = await deps.stepLedger.compareAndSet(
         stage.id,
@@ -131,12 +152,7 @@ export async function handleStepSignal(
       if (!completed.applied) {
         const winner = await deps.stepLedger.get(stage.id, command.stepId);
         if (winner?.status === "completed") {
-          return {
-            signalled: true,
-            ok: true,
-            alreadyCompleted: true,
-            _events: [],
-          };
+          return wake(winner.result, true);
         }
         if (winner?.status === "failed") {
           throw new Error(
@@ -150,24 +166,5 @@ export async function handleStepSignal(
     }
   }
 
-  const event: KernelEvent = {
-    type: "step:signalled",
-    timestamp: deps.clock.now(),
-    workflowRunId: command.workflowRunId,
-    stageId: command.stageId,
-    stepId: command.stepId,
-    payload,
-  };
-  // The ledger and spilled blobs use separate connections. Write them
-  // before opening the transaction that wakes the stage and emits its event.
-  await deps.persistence.withTransaction(async (tx) => {
-    await tx.updateStage(stage.id, { nextPollAt: deps.clock.now() });
-    await tx.appendOutboxEvents(toOutboxEvents(command.workflowRunId, [event]));
-  });
-  return {
-    signalled: true,
-    ok: true,
-    alreadyCompleted: false,
-    _events: [],
-  };
+  return wake(payload, false);
 }

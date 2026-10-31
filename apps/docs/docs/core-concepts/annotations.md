@@ -167,3 +167,5 @@ Two keys are written by the engine itself, so operators and dashboards can rely 
 ## Legacy Metadata Migration
 
 In `v0.8.0+`, the `metadata` column on `WorkflowRun` is deprecated. If you query annotations for runs created before `v0.8.0`, the engine automatically projects existing metadata key-values as virtual annotations prefixed with `legacy.metadata.*` (e.g., `legacy.metadata.tenantId`). No database migrations or dual-writing are required.
+
+`keyPrefix` matches a literal prefix. Percent signs, underscores, backslashes and quotes are treated as data, including when combined with other annotation filters and a result limit.

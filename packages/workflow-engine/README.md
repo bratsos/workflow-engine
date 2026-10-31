@@ -1257,11 +1257,13 @@ async execute(ctx) {
 | `job.execute` | Execute a single stage (multi-phase transactions) | `idempotencyKey?`, `workflowRunId`, `workflowId`, `stageId`, `config`, `attempt?`, `maxAttempts?`, `abortSignal?` |
 | `job.heartbeat` | Renew a job lease and report whether the work is still wanted (feeds `abortSignal`) | `jobId`, `workflowRunId`, `attempt?` |
 | `stage.pollSuspended` | Poll suspended stages (per-stage transactions) | `maxChecks?`, `serves?` (returns `resumedWorkflowRunIds`) |
-| `step.signal` | Complete a `waitForSignal` step and wake its stage; idempotent | `workflowRunId`, `stageId`, `stepId`, `payload` |
+| `step.signal` | Complete a `waitForSignal` step; retry an interrupted wake with its original payload | `workflowRunId`, `stageId`, `stepId`, `payload` |
 | `lease.reapStale` | Release stale job leases; expire jobs past the absolute cap | `staleThresholdMs`, `absoluteTimeoutMs?` |
-| `run.reapStuck` | Fail runs stuck RUNNING with no activity; re-enqueue PENDING stages with no job | `stuckThresholdMs` |
+| `run.reapStuck` | Fail stuck RUNNING runs and their active stages atomically; re-enqueue PENDING stages with no job | `stuckThresholdMs` |
 | `outbox.flush` | Publish pending events; reports `eventSinkStatus` | `maxEvents?` |
 | `plugin.replayDLQ` | Replay dead-letter queue events | `maxEvents?` |
+
+If polling commits a stage outcome but its job settlement fails, the terminal stage keeps a durable poll marker. A later `stage.pollSuspended` retries settlement without rerunning the stage, including after restart.
 
 Idempotency behavior:
 - Replaying the same `idempotencyKey` returns cached results.

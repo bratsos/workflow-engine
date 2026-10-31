@@ -371,7 +371,7 @@ describe.skipIf(!realDatabase)("kernel transaction-scoped port reads", () => {
       (await db.persistence.getUnpublishedOutboxEvents(100)).map(
         (event) => event.eventType,
       ),
-    ).toEqual(sqlite ? [] : ["workflow:failed"]);
+    ).toEqual(sqlite ? [] : ["stage:failed", "workflow:failed"]);
   });
 
   it.skipIf(!sqlite)(

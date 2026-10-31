@@ -1,3 +1,4 @@
+import { isIndependentWrite } from "./transaction-writes.js";
 /**
  * `fromPrisma8(db)`: lets the Prisma adapters run on a Prisma 8 client.
  *
@@ -30,6 +31,7 @@
 import type { AsyncLocalStorage } from "node:async_hooks";
 import type { BlobPrismaClient } from "./blob-store";
 import type { EnginePrismaClient, RawColumns } from "./prisma-client-type";
+import { isReadOnlySql } from "./read-only-sql.js";
 
 type Row = Record<string, any>;
 type Args = Record<string, any>;
@@ -344,7 +346,7 @@ function sqliteRead(q: Sql, spec: Record<string, string>) {
   const first = top[0]?.[0].toUpperCase();
   if (
     !returning &&
-    (!readOnly(q) || first === "EXPLAIN") &&
+    (!isReadOnlySql(q.parts.join("?")) || first === "EXPLAIN") &&
     first !== "VALUES"
   ) {
     return { q, spec };
@@ -1113,7 +1115,19 @@ const DEFAULT_TIMEOUT = 5000;
  */
 function deadline(timeout: number | undefined) {
   if (timeout === undefined) {
-    return { check() {}, race: <T>(work: Promise<T>) => work };
+    let closed = false;
+    return {
+      close() {
+        closed = true;
+      },
+      check() {
+        if (closed)
+          throw Object.assign(new Error("Transaction already closed"), {
+            code: "P2028",
+          });
+      },
+      race: <T>(work: Promise<T>) => work,
+    };
   }
   if (typeof timeout !== "number") fail("timeout must be a number");
   const end = Date.now() + timeout;
@@ -1128,6 +1142,9 @@ function deadline(timeout: number | undefined) {
     );
   };
   return {
+    close() {
+      closed = true;
+    },
     check() {
       if (closed || Date.now() >= end) throw expired();
     },
@@ -1144,6 +1161,9 @@ function deadline(timeout: number | undefined) {
             );
           }),
         ]);
+      } catch (error) {
+        closed = true;
+        throw error;
       } finally {
         clearTimeout(timer);
       }
@@ -1154,6 +1174,7 @@ function deadline(timeout: number | undefined) {
 type Schedule = <T>(work: () => Promise<T>) => Promise<T>;
 interface WriteQueue {
   tail: Promise<void>;
+  active?: ReturnType<typeof deadline>;
 }
 const writeQueues = new WeakMap<object, WriteQueue>();
 let writeContext:
@@ -1184,8 +1205,11 @@ async function enqueue<T>(
   queue: WriteQueue,
   work: () => Promise<T>,
 ): Promise<T> {
+  const active = queue.active;
+  const independent = await isIndependentWrite();
   const owner = (await context()).getStore();
-  const open = owner?.queue === queue ? owner.open : undefined;
+  const open =
+    owner?.queue === queue ? owner.open : independent ? undefined : active;
   const pending = queue.tail.then(() => {
     // A root write awaited by its own transaction cannot acquire this queue.
     // Its transaction times out and rolls back; the stale write must not run.
@@ -1207,33 +1231,6 @@ const READS = new Set([
   "aggregate",
   "groupBy",
 ]);
-function readOnly(q: Sql): boolean {
-  // Ignore comments and quoted text when finding a WITH statement's final
-  // verb. A CTE read may use the root while a transaction owns the write queue.
-  const tokens =
-    q.parts
-      .join("?")
-      .replace(
-        /--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/|'(?:''|[^'])*'|"(?:""|[^"])*"|`(?:``|[^`])*`|\[[^\]]*\]/g,
-        " ",
-      )
-      .match(/\w+|[()]/g) ?? [];
-  const first = tokens.shift()?.toUpperCase();
-  if (first === "SELECT" || first === "EXPLAIN") return true;
-  if (first !== "WITH") return false;
-  let depth = 0;
-  for (const token of tokens) {
-    if (token === "(") depth++;
-    else if (token === ")") depth--;
-    else if (
-      depth === 0 &&
-      /^(SELECT|INSERT|UPDATE|DELETE|REPLACE)$/i.test(token)
-    ) {
-      return token.toUpperCase() === "SELECT";
-    }
-  }
-  return false;
-}
 
 // ============================================================================
 // Lazy operations and delegates
@@ -1634,7 +1631,11 @@ export function fromPrisma8(
     };
     const rawRead = (q: Sql) =>
       sqlite
-        ? new Op((e) => read(q, e), x, readOnly(q) ? undefined : schedule)
+        ? new Op(
+            (e) => read(q, e),
+            x,
+            isReadOnlySql(q.parts.join("?")) ? undefined : schedule,
+          )
         : read(q);
     const rawWrite = (q: Sql) =>
       sqlite ? new Op((e) => affected(e, q), x, schedule) : affected(x, q);
@@ -1652,45 +1653,60 @@ export function fromPrisma8(
         );
       }
       if (level && !sqlite) await verify(db as Prisma8Db);
-      const run = () =>
-        (db as Prisma8Db).transaction(async (raw: Executor) => {
-          const open = deadline(
-            options.timeout ?? (callback ? DEFAULT_TIMEOUT : undefined),
-          );
-          const tx: Executor = {
-            raw: raw.raw,
-            query: (plan) => (open.check(), raw.query(plan)),
-            execute: (plan) => (open.check(), raw.execute(plan)),
-          };
-          if (sqlite) sqliteExecutors.add(tx);
-          const work = async () => {
-            if (level && !sqlite) {
-              await affected(
-                raw,
-                new Sql().t(`SET TRANSACTION ISOLATION LEVEL ${level}`),
-              );
-            }
-            if (callback) {
-              const result = await arg(client(tx, true));
-              open.check();
-              return result;
-            }
-            const results: unknown[] = [];
-            for (const op of arg) {
-              if (!(op instanceof Op))
-                fail(
-                  sqlite
-                    ? "$transaction([...]) takes lazy client calls only"
-                    : "$transaction([...]) takes delegate calls only",
+      const run = async () => {
+        let open: ReturnType<typeof deadline> | undefined;
+        try {
+          return await (db as Prisma8Db).transaction(async (raw: Executor) => {
+            const lease = deadline(
+              options.timeout ?? (callback ? DEFAULT_TIMEOUT : undefined),
+            );
+            open = lease;
+            const tx: Executor = {
+              raw: raw.raw,
+              query: (plan) => (lease.check(), raw.query(plan)),
+              execute: (plan) => (lease.check(), raw.execute(plan)),
+            };
+            if (sqlite) sqliteExecutors.add(tx);
+            const work = async () => {
+              if (level && !sqlite) {
+                await affected(
+                  raw,
+                  new Sql().t(`SET TRANSACTION ISOLATION LEVEL ${level}`),
                 );
-              results.push(await op.exec(tx));
-            }
-            return results;
-          };
-          return queue
-            ? (await context()).run({ queue, open }, () => open.race(work()))
-            : open.race(work());
-        });
+              }
+              if (callback) {
+                const result = await arg(client(tx, true));
+                lease.check();
+                return result;
+              }
+              const results: unknown[] = [];
+              for (const op of arg) {
+                if (!(op instanceof Op))
+                  fail(
+                    sqlite
+                      ? "$transaction([...]) takes lazy client calls only"
+                      : "$transaction([...]) takes delegate calls only",
+                  );
+                results.push(await op.exec(tx));
+              }
+              return results;
+            };
+            if (!queue) return lease.race(work());
+            // Capture the active transaction even when external AsyncResource
+            // code lost our context. Writes queued during a rollback cannot
+            // become independent writes after that rollback.
+            queue.active = lease;
+            return (await context()).run({ queue, open: lease }, () =>
+              lease.race(work()),
+            );
+          });
+        } catch (error) {
+          open?.close();
+          throw error;
+        } finally {
+          if (queue && queue.active === open) queue.active = undefined;
+        }
+      };
       return schedule ? schedule(run) : run();
     };
 

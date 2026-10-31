@@ -861,7 +861,8 @@ export interface PersistenceCore {
   ): Promise<WorkflowStageRecord[]>;
   /**
    * Suspended stages whose `nextPollAt` has come due, oldest deadline
-   * first, capped at `limit`.
+   * first, capped at `limit`. With `includeSettlements`, also return COMPLETED
+   * and FAILED stages with a due deadline, retained for job acknowledgement.
    *
    * Both narrowings belong here rather than in the caller. Without the
    * ordering and the cap the adapter returns *every* ready row and the
@@ -878,6 +879,8 @@ export interface PersistenceCore {
     beforeDate: Date,
     options?: {
       limit?: number;
+      /** Include terminal poll outcomes awaiting job settlement. */
+      includeSettlements?: boolean;
       serves?: readonly ServedDefinition[];
     },
   ): Promise<WorkflowStageRecord[]>;

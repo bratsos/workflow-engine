@@ -806,7 +806,7 @@ const sqliteLogger = createPrismaAICallLogger(prisma, {
 
 `createPrismaBlobStore` does not need a database type option. When `prisma` is the wrapped Prisma 8 runtime, pass the same `{ databaseType: "sqlite" }` option to `createPrismaWorkflowPersistence`, `createPrismaJobQueue`, `createPrismaStepLedger`, `createPrismaAICallLogger`, and the console read port.
 
-SQLite is for a single host process per file. In the Prisma 8 wrapper, engine writes through one root client are serialized and root reads remain available. A direct `db.transaction(...)` call made by your code does not use that queue and can still contend with an engine write. Do not run multiple processes against one SQLite file; use PostgreSQL for production or multi-process fleets.
+SQLite is for a single host process per file. In the Prisma 8 wrapper, engine writes through one root client are serialized and root reads remain available. A direct `db.transaction(...)` call made by your code does not use that queue and can still contend with an engine write. Always build transactional ports over the passed transaction client. SQLite root writes queued while a transaction is active are rejected with `P2028` if it rolls back, including when an external `AsyncResource` loses async context. On Prisma 6/7, the adapters observe the native SQLite transaction lifecycle after they are constructed; create the root ports before starting consumer transactions. Direct writes through an unwrapped consumer client remain the consumer’s responsibility. Do not run multiple processes against one SQLite file; use PostgreSQL for production or multi-process fleets.
 
 #### Prisma 6 and 7: clean-room SQLite setup
 

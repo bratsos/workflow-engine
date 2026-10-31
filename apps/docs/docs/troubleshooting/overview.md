@@ -37,7 +37,7 @@ This guide covers common issues encountered when running **workflow-engine**, ho
 * **Self-Healing (Reap Stuck)**:
   * The kernel's `run.reapStuck` command runs automatically on every host orchestration tick.
   * It detects `RUNNING` runs that have had no database updates within the threshold (default: `max(3 * staleLeaseThresholdMs, 5 minutes)`).
-  * Stuck runs are failed with the error code `STUCK_RUN_REAPED`.
+  * Stuck runs are failed with the error code `STUCK_RUN_REAPED`. Their active child stages fail in the same transaction, with completion times and errors; terminal stages remain unchanged.
 * **Manual Recovery**:
   * If a run was completed but failed to transition, you can manually trigger a transition:
     ```typescript

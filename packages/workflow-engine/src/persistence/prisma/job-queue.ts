@@ -1,3 +1,4 @@
+import { withTransactionWriteGuard } from "./transaction-writes.js";
 /**
  * PrismaJobQueue - Prisma implementation of JobQueue
  *
@@ -154,7 +155,10 @@ export class PrismaJobQueue implements JobQueue {
   private readonly now: () => Date;
 
   constructor(prisma: PrismaClient, options: PrismaJobQueueOptions = {}) {
-    this.prisma = prisma;
+    this.prisma = withTransactionWriteGuard(
+      prisma,
+      options.databaseType ?? "postgresql",
+    );
     this.workerIdWasConfigured = Boolean(options.workerId);
     this.workerId = options.workerId || `worker-${process.pid}-${Date.now()}`;
     this.enums = createEnumHelper(prisma);

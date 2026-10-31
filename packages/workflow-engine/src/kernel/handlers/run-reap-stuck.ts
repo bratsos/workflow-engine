@@ -159,6 +159,28 @@ export async function handleRunReapStuck(
       throw error;
     }
 
+    // INVARIANT: a reaped run and all its active stages become terminal in
+    // the same transaction. A stale stage update rolls back the run failure.
+    for (const stage of stages) {
+      if (!ACTIVE_STAGE_STATUSES.has(stage.status)) continue;
+      const error = `Run stuck for >${command.stuckThresholdMs}ms with no activity`;
+      await deps.persistence.updateStage(stage.id, {
+        expectedVersion: stage.version,
+        status: "FAILED",
+        completedAt: deps.clock.now(),
+        nextPollAt: null,
+        errorMessage: error,
+      });
+      events.push({
+        type: "stage:failed",
+        timestamp: deps.clock.now(),
+        workflowRunId: run.id,
+        stageId: stage.stageId,
+        stageName: stage.stageName,
+        error,
+      });
+    }
+
     events.push({
       type: "workflow:failed",
       timestamp: deps.clock.now(),

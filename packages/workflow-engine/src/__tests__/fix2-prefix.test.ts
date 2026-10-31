@@ -8,6 +8,11 @@ import {
 
 const prefixCases = [
   {
+    prefix: "scope/!%_",
+    match: "scope/!%_hit",
+    confusable: "scope/!otherXhit",
+  },
+  {
     prefix: "scope/%_\\'quote/λ雪/",
     match: "scope/%_\\'quote/λ雪/hit",
     confusable: "scope/otherZ\\'quote/λ雪/miss",
@@ -55,8 +60,8 @@ describe.skipIf(!realDatabase)(
         })),
       );
 
-      const requestIds = entries.map((_entry, index) =>
-        `fix2-prefix-${index}-${crypto.randomUUID()}`,
+      const requestIds = entries.map(
+        (_entry, index) => `fix2-prefix-${index}-${crypto.randomUUID()}`,
       );
       entries.forEach(({ key, matches }, index) => {
         db.aiLogger.logCall({
@@ -70,6 +75,7 @@ describe.skipIf(!realDatabase)(
           outputTokens: matches ? 3 : 11,
           cost: matches ? 0.25 : 0.75,
           requestId: requestIds[index],
+          metadata: matches ? 42 : { skipped: true },
         });
       });
 
@@ -103,6 +109,9 @@ describe.skipIf(!realDatabase)(
         });
       }
 
+      for (const { prefix } of prefixCases) {
+        expect((await db.aiLogger.listCalls!(prefix))[0]?.metadata).toBe(42);
+      }
       expect(actual).toEqual(
         prefixCases.map(({ match }) => ({
           blobs: [match],
@@ -124,6 +133,59 @@ describe.skipIf(!realDatabase)(
           },
         })),
       );
+    });
+    it("applies annotation filters and limits after matching a literal prefix", async () => {
+      const { id: workflowRunId } = await db.seed();
+      const prefix = "scope/%_\\'quote/";
+      const match = `${prefix}hit`;
+      const common = {
+        workflowRunId,
+        scope: "run" as const,
+        scopeId: "review",
+        actor: { id: "operator", kind: "user" as const },
+        attempt: 2,
+      };
+      await db.persistence.appendAnnotations([
+        { ...common, key: "scope/otherZ\\'quote/miss", value: false },
+        { ...common, key: match, value: true },
+        {
+          ...common,
+          key: `${prefix}other`,
+          actor: { id: "someone-else", kind: "user" as const },
+          value: false,
+        },
+      ]);
+      const filters = {
+        keyPrefix: prefix,
+        scope: "run" as const,
+        scopeId: "review",
+        actorId: "operator",
+        actorKind: "user",
+        attempt: 2,
+        since: new Date(0),
+        until: new Date(Date.now() + 86_400_000),
+        limit: 1,
+      };
+      expect(
+        (await db.persistence.listAnnotations(workflowRunId, filters)).map(
+          (row) => row.key,
+        ),
+      ).toEqual([match]);
+      expect(
+        await db.persistence.listAnnotations(workflowRunId, {
+          ...filters,
+          since: new Date(Date.now() + 86_400_000),
+        }),
+      ).toEqual([]);
+      expect(
+        (
+          await db.persistence.listAnnotations(workflowRunId, {
+            ...filters,
+            key: match,
+            keyPrefix: "unrelated",
+          })
+        ).map((row) => row.key),
+      ).toEqual([match]);
     });
   },
 );

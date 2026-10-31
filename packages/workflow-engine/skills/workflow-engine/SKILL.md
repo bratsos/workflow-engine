@@ -155,7 +155,7 @@ All operations go through `kernel.dispatch(command)`:
 | `stage.pollSuspended` | Poll suspended stages for readiness (claims each stage first; skips cancelled runs; per-stage transactions) |
 | `step.signal` | Complete a durable `ctx.step.waitForSignal` step with a payload (idempotent) |
 | `lease.reapStale` | Release stale job leases (`{ staleThresholdMs, absoluteTimeoutMs? }` → `{ released, expired }`) |
-| `run.reapStuck` | Detect and fail RUNNING runs with no recent activity (heals wedged runs whose stages all finished) |
+| `run.reapStuck` | Fail stuck RUNNING runs and active stages atomically (heals runs whose stages all finished) |
 | `outbox.flush` | Publish pending outbox events; reports `eventSinkStatus: "healthy" \| "degraded"` |
 | `plugin.replayDLQ` | Replay dead-letter queue events |
 

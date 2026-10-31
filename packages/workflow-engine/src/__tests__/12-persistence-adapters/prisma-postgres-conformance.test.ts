@@ -4050,7 +4050,7 @@ if (!DATABASE_URL) {
           expect(pollInterval).toBe(562);
         });
 
-        it("the AI call logger's stats treat a prefix as a LIKE pattern", async () => {
+        it("the AI call logger's stats treat a prefix literally", async () => {
           await prisma.$executeRawUnsafe(`TRUNCATE "ai_calls"`);
           const logger = createPrismaAICallLogger(prisma);
           const call = {
@@ -4079,8 +4079,8 @@ if (!DATABASE_URL) {
             },
           ]);
           const stats = await logger.getStats("cost_");
-          expect(stats.totalCalls).toBe(2);
-          expect(stats.totalCost).toBe(0.375);
+          expect(stats.totalCalls).toBe(1);
+          expect(stats.totalCost).toBe(0.125);
         });
 
         it("the AI call logger records a batch above the bind limit", async () => {
@@ -4111,13 +4111,11 @@ if (!DATABASE_URL) {
           expect(await store.list("new")).toEqual([]);
         });
 
-        it("the blob store lists a prefix as a LIKE pattern", async () => {
+        it("the blob store lists a literal prefix", async () => {
           const store = createPrismaBlobStore(prisma);
           await store.put("prefix_1", {});
           await store.put("prefixX2", {});
-          expect(await store.list("prefix_")).toEqual(
-            expect.arrayContaining(["prefix_1", "prefixX2"]),
-          );
+          expect(await store.list("prefix_")).toEqual(["prefix_1"]);
         });
       });
     });

@@ -103,6 +103,8 @@ await kernel.annotations.list(runId, {
 
 ### Cross-DB notes
 
+`keyPrefix` is literal: `%`, `_`, backslash and quotes are data, not pattern syntax. Blob-store `list` and AI logger `listCalls` / `getStats` use the same literal-prefix rule.
+
 - **Postgres**: `keyPrefix` uses the `(workflowRunId, key)` btree index (LIKE 'prefix.%' range scan).
 - **SQLite**: same query path; `LIKE` is case-insensitive by default and may scan at scale. The engine convention is lowercase keys, which keeps the scan fast for small-to-mid datasets. For high-volume SQLite, consider Postgres.
 

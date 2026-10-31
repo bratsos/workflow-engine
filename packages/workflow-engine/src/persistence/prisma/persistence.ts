@@ -1,3 +1,9 @@
+import { POST_COMMIT_WRITES } from "../../kernel/helpers/post-commit-writes.js";
+import { literalPrefixQuery, prefixCandidates } from "./literal-prefix.js";
+import {
+  independentWrites,
+  withTransactionWriteGuard,
+} from "./transaction-writes.js";
 /**
  * PrismaWorkflowPersistence - Prisma implementation of WorkflowPersistence
  *
@@ -241,8 +247,20 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     this.enums = createEnumHelper(prisma, {
       statusEnumName: this.statusEnumName,
     });
+    this.prisma = withTransactionWriteGuard(
+      prisma,
+      options.databaseType ?? "postgresql",
+    );
     this.databaseType = options.databaseType ?? "postgresql";
     validateDatabaseType(prisma, this.databaseType);
+    if (this.databaseType === "sqlite") {
+      // Post-commit work belongs to an already committed command. It may wait
+      // for another writer, but that writer's rollback cannot invalidate it.
+      Object.defineProperty(this, POST_COMMIT_WRITES, {
+        value: independentWrites,
+        configurable: true,
+      });
+    }
     this.skipTransactions = options.skipInteractiveTransactions ?? false;
     this.now = options.now ?? (() => new Date());
     this.versioning = {
@@ -1057,14 +1075,24 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
 
   async getSuspendedStages(
     beforeDate: Date,
-    options?: { limit?: number; serves?: readonly ServedDefinition[] },
+    options?: {
+      limit?: number;
+      serves?: readonly ServedDefinition[];
+      includeSettlements?: boolean;
+    },
   ): Promise<WorkflowStageRecord[]> {
     // `serves` filters through the relation to `workflow_runs`, so it can
     // only be applied on a schema that has the column at all.
     const serves = this.versioning.enabled ? options?.serves : undefined;
     const stages = await this.prisma.workflowStage.findMany({
       where: {
-        status: this.enums.status("SUSPENDED"),
+        status: options?.includeSettlements
+          ? {
+              in: ["SUSPENDED", "COMPLETED", "FAILED"].map((status) =>
+                this.enums.status(status as Status),
+              ),
+            }
+          : this.enums.status("SUSPENDED"),
         nextPollAt: { lte: beforeDate },
         ...(serves !== undefined
           ? { workflowRun: this.servesFilter(serves) }
@@ -1311,13 +1339,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     if (filters.key !== undefined) {
       where.key = filters.key;
     } else if (filters.keyPrefix !== undefined) {
-      // NOTE: Prisma's `startsWith` compiles to `LIKE 'prefix%'`. On
-      // Postgres this uses the (workflowRunId, key) index. On SQLite the
-      // default `LIKE` is case-insensitive and will not use the btree
-      // index; high-volume SQLite consumers should keep keys lowercase
-      // (engine convention) and accept the scan cost. Documented in the
-      // RFC.
-      where.key = { startsWith: filters.keyPrefix };
+      where.key = { startsWith: prefixCandidates(filters.keyPrefix) };
     }
 
     if (filters.scope !== undefined) where.scope = filters.scope;
@@ -1333,15 +1355,96 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       where.createdAt = createdAt;
     }
 
+    if (filters.key === undefined && filters.keyPrefix !== undefined) {
+      const values: unknown[] = [workflowRunId];
+      let suffix = ' AND "workflowRunId" = $2';
+      for (const field of [
+        "scope",
+        "scopeId",
+        "actorId",
+        "actorKind",
+        "attempt",
+      ] as const) {
+        if (filters[field] === undefined) continue;
+        values.push(filters[field]);
+        suffix += ` AND "${field}" = $${values.length + 1}`;
+      }
+      for (const [date, operator] of [
+        [filters.since, ">="],
+        [filters.until, "<="],
+      ] as const) {
+        if (date === undefined) continue;
+        values.push(this.databaseType === "sqlite" ? date : date.toISOString());
+        const parameter = values.length + 1;
+        suffix += ` AND "createdAt" ${operator} ${this.databaseType === "sqlite" ? `$${parameter}` : utcTimestampParam(parameter)}`;
+      }
+      values.push(filters.limit ?? 1000);
+      suffix += ` ORDER BY "createdAt" ASC, "id" ASC LIMIT $${values.length + 1}`;
+      const nativeSqlite =
+        this.databaseType === "sqlite" && !this.prisma.$databaseType;
+      const literal = literalPrefixQuery<any>(
+        this.prisma,
+        "workflow_annotations",
+        "key",
+        filters.keyPrefix,
+        {
+          suffix,
+          values,
+          ...(nativeSqlite
+            ? {
+                // Native SQLite raw reads need JSON scalars carried as text.
+                select: [
+                  "id",
+                  "createdAt",
+                  "workflowRunId",
+                  "workflowStageRecordId",
+                  "attempt",
+                  "scope",
+                  "scopeId",
+                  "actorKind",
+                  "actorId",
+                  "actorVersion",
+                  "key",
+                  "value",
+                  "payload",
+                  "idempotencyKey",
+                ]
+                  .map((column) =>
+                    ["value", "payload"].includes(column)
+                      ? `CAST("${column}" AS TEXT) AS "${column}"`
+                      : `"${column}"`,
+                  )
+                  .join(", "),
+                jsonColumns: ["value", "payload"],
+              }
+            : {}),
+        },
+      );
+      if (literal)
+        return (await literal).map((record) =>
+          this.mapWorkflowAnnotation(record),
+        );
+    }
+
     const records = await this.prisma.workflowAnnotation.findMany({
       where,
       // Secondary order by `id` keeps timeline deterministic when many
       // rows are inserted in the same transaction (same `createdAt`).
       // CUIDs are roughly chronological, so this preserves insert order.
       orderBy: [{ createdAt: "asc" }, { id: "asc" }],
-      take: filters.limit ?? 1000,
+      ...(filters.key === undefined && filters.keyPrefix !== undefined
+        ? {}
+        : { take: filters.limit ?? 1000 }),
     });
-    return records.map((r: any) => this.mapWorkflowAnnotation(r));
+    return records
+      .filter(
+        (record: any) =>
+          filters.key !== undefined ||
+          filters.keyPrefix === undefined ||
+          record.key.startsWith(filters.keyPrefix),
+      )
+      .slice(0, filters.limit ?? 1000)
+      .map((r: any) => this.mapWorkflowAnnotation(r));
   }
 
   private mapWorkflowAnnotation(record: any): WorkflowAnnotationRecord {
