@@ -38,6 +38,8 @@ const reader = createPrismaConsoleReadPort(fromPrisma8(db), {
 });
 ```
 
+On Prisma 6 and 7, use the complete SQLite schema conversion from the engine's [clean-room setup guide](https://github.com/bratsos/workflow-engine/blob/main/apps/docs/docs/persistence/prisma-setup.md#2-sqlite-setup-prisma-6-7-and-8). Prisma 6 uses `connection_limit=1`; Prisma 7 uses `@prisma/adapter-better-sqlite3@7.10.1`.
+
 Inside your own transaction use `fromPrisma8(tx, { contract: db.contract })` for a `tx` from `db.transaction(...)`. Prisma 8 is a release candidate, tested against exactly `prisma@8.0.0-rc.29` with the matching `@prisma/orm-postgres@8.0.0-rc.21` or `@prisma/orm-sqlite@8.0.0-rc.21`. The engine's [Prisma Setup](https://github.com/bratsos/workflow-engine/blob/main/apps/docs/docs/persistence/prisma-setup.md#prisma-8) has the contract and database steps. The CLI's `--database-url` works on Prisma 6 and 7 only; on Prisma 8 use `--config` ([below](#the-local-dev-command)).
 
 ## Quick start — Next.js App Router

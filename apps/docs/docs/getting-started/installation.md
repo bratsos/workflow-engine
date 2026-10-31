@@ -96,6 +96,8 @@ npm install @prisma/client@6
 npm install -D prisma@6
 ```
 
+For SQLite on Prisma 6 or 7, changing only `provider` is not enough: use the full shipped-schema conversion, Prisma 6's `connection_limit=1`, or Prisma 7's `@prisma/adapter-better-sqlite3`. Follow the [clean-room SQLite setup](../persistence/prisma-setup.md#2-sqlite-setup-prisma-6-7-and-8).
+
 **Prisma 8** is a release candidate with its own short path. Pin `prisma@8.0.0-rc.29` with the matching target package: `@prisma/orm-postgres@8.0.0-rc.21` or `@prisma/orm-sqlite@8.0.0-rc.21`. There is no `@prisma/client` on Prisma 8. The Postgres target needs Node.js 22.18+, 24.11+ or 26+, TypeScript 5.9+ and PostgreSQL 15+.
 
 ```bash
