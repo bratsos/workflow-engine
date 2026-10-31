@@ -1,5 +1,6 @@
 import { AsyncResource } from "node:async_hooks";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { createPrismaWorkflowPersistence } from "../persistence/prisma/index.js";
 import {
   type KernelDatabase,
   kernelDatabase,
@@ -210,27 +211,34 @@ describe.skipIf(!realDatabase)(
       },
     );
 
-    it.skipIf(!sqlite)(
-      "rejects a batched enqueue after its enclosing transaction rolls back",
-      async () => {
-        const resource = new AsyncResource("external-batch-host");
+    it.skipIf(!sqlite).each(["batch", "callback"] as const)(
+      "rejects a queued %s transaction after its enclosing transaction rolls back",
+      async (kind) => {
+        const resource = new AsyncResource("external-transaction-host");
         const id = crypto.randomUUID();
-        let late: Promise<string[]> | undefined;
+        let late: Promise<unknown> | undefined;
         try {
           await expect(
             db.client.$transaction(
               async (tx: any) => {
                 await tx.workflowLog.create({
-                  data: { level: "INFO", message: "batch rollback" },
+                  data: { level: "INFO", message: "outer rollback" },
                 });
                 late = resource.runInAsyncScope(() =>
-                  db.jobTransport.enqueueParallel([
-                    {
-                      workflowRunId: id,
-                      workflowId: db.workflow.id,
-                      stageId: "late",
-                    },
-                  ]),
+                  kind === "batch"
+                    ? db.jobTransport.enqueueParallel([
+                        {
+                          workflowRunId: id,
+                          workflowId: db.workflow.id,
+                          stageId: "late",
+                        },
+                      ])
+                    : db.persistence.withTransaction((inner) =>
+                        inner.createLog({
+                          level: "INFO",
+                          message: "late callback",
+                        }),
+                      ),
                 );
                 await late;
               },
@@ -243,6 +251,41 @@ describe.skipIf(!realDatabase)(
         } finally {
           resource.emitDestroy();
         }
+      },
+    );
+
+    it.skipIf(!sqlite || process.env.PRISMA_MAJOR !== "7")(
+      "balances native nested transaction fences after commit and rollback",
+      async () => {
+        await db.client.$transaction(async (outer: any) => {
+          const scoped = createPrismaWorkflowPersistence(outer, {
+            databaseType: "sqlite",
+          });
+          await scoped.withTransaction((inner) =>
+            inner.createLog({ level: "INFO", message: "nested commit" }),
+          );
+          await expect(
+            scoped.withTransaction(async (inner) => {
+              await inner.createLog({
+                level: "INFO",
+                message: "nested rollback",
+              });
+              throw new Error("abort nested");
+            }),
+          ).rejects.toThrow("abort nested");
+          await scoped.createLog({ level: "INFO", message: "outer commit" });
+        });
+        await db.persistence.createLog({
+          level: "INFO",
+          message: "after nested",
+        });
+        expect(
+          (
+            await db.client.workflowLog.findMany({
+              orderBy: { message: "asc" },
+            })
+          ).map((row: any) => row.message),
+        ).toEqual(["after nested", "nested commit", "outer commit"]);
       },
     );
 
