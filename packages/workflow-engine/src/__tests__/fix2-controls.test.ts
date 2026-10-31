@@ -254,6 +254,28 @@ describe.skipIf(!realDatabase)(
       },
     );
 
+    it.skipIf(!sqlite)(
+      "releases the write queue when a transaction callback never settles",
+      async () => {
+        await expect(
+          db.persistence.withTransaction(async (tx) => {
+            await tx.createLog({ level: "INFO", message: "expired callback" });
+            await new Promise<never>(() => {});
+          }),
+        ).rejects.toMatchObject({ code: "P2028" });
+        await db.persistence.createLog({
+          level: "INFO",
+          message: "queue released",
+        });
+        expect(
+          (await db.client.workflowLog.findMany()).map(
+            (row: any) => row.message,
+          ),
+        ).toEqual(["queue released"]);
+      },
+      15_000,
+    );
+
     it.skipIf(!sqlite || process.env.PRISMA_MAJOR !== "7")(
       "balances native nested transaction fences after commit and rollback",
       async () => {

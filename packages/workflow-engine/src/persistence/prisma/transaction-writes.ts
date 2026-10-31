@@ -29,6 +29,23 @@ const mutations = new Set([
   "deleteMany",
 ]);
 
+function nativeTransactionId(client: object): string | undefined {
+  for (const key of Object.getOwnPropertySymbols(client)) {
+    const marker = Reflect.get(client, key);
+    if (
+      key.description === "prisma.client.transaction.id" &&
+      typeof marker === "string"
+    )
+      return marker;
+    if (
+      key.description === "prisma.client.transaction.scope_context" &&
+      typeof marker?.txId === "string"
+    )
+      return marker.txId;
+  }
+  return undefined;
+}
+
 interface NativeTransaction {
   result: Promise<boolean>;
   finish(committed: boolean): void;
@@ -36,6 +53,7 @@ interface NativeTransaction {
 interface NativeWriteQueue {
   active: Set<Promise<boolean>>;
   tail: Promise<void>;
+  fenceOf(client: object): Promise<boolean> | undefined;
 }
 const engines = new WeakMap<object, NativeWriteQueue>();
 
@@ -66,7 +84,10 @@ function nativeTransactions(
       const timer =
         options.timeout === undefined
           ? undefined
-          : setTimeout(() => resolve(false), options.timeout);
+          : setTimeout(() => {
+              resolve(false);
+              active.delete(result);
+            }, options.timeout);
       const entry = {
         result,
         finish(committed: boolean) {
@@ -96,7 +117,14 @@ function nativeTransactions(
       if (stack?.length === 0) transactions.delete(options?.id);
     }
   };
-  const queue = { active, tail: Promise.resolve() };
+  const queue: NativeWriteQueue = {
+    active,
+    tail: Promise.resolve(),
+    fenceOf(client) {
+      const id = nativeTransactionId(client);
+      return id ? transactions.get(id)?.at(-1)?.result : undefined;
+    },
+  };
   engines.set(engine, queue);
   return queue;
 }
@@ -114,29 +142,23 @@ export function withTransactionWriteGuard<T extends object>(
   // Transaction clients already write on the transaction's connection.
   if (
     prisma.$databaseType ||
-    Object.getOwnPropertySymbols(prisma).some((key) => {
-      if (key.description === "prisma.client.transaction.id")
-        return typeof Reflect.get(prisma, key) === "string";
-      if (key.description === "prisma.client.transaction.scope_context")
-        return typeof Reflect.get(prisma as object, key)?.txId === "string";
-      return false;
-    }) ||
+    nativeTransactionId(prisma) !== undefined ||
     typeof prisma.$transaction !== "function" ||
     (databaseType ?? (prisma as any)._activeProvider) !== "sqlite"
   )
     return client;
   const queue = nativeTransactions(prisma);
   if (!queue) return client;
+  const closed = () =>
+    Object.assign(
+      new Error(
+        "Transaction rolled back before an outer adapter write could run. Use the transaction client for transactional writes.",
+      ),
+      { code: "P2028" },
+    );
   const afterTransactions = <R>(work: () => Promise<R>): Promise<R> => {
     const owners = [...queue.active];
     const independent = isIndependentWrite();
-    const closed = () =>
-      Object.assign(
-        new Error(
-          "Transaction rolled back before an outer adapter write could run. Use the transaction client for transactional writes.",
-        ),
-        { code: "P2028" },
-      );
     const permit = Promise.all(owners).then(async (results) => {
       if (results.some((committed) => !committed) && !(await independent))
         throw closed();
@@ -186,9 +208,28 @@ export function withTransactionWriteGuard<T extends object>(
         const value: any = Reflect.get(target, key);
         if (key === "$transaction")
           return (arg: any, options?: any) =>
-            // Gate both transaction forms before Prisma starts them. Retain the
-            // array form so a batch does not gain an interactive deadline.
-            afterTransactions(() => value.call(target, arg, options));
+            afterTransactions(() =>
+              value.call(
+                target,
+                typeof arg === "function"
+                  ? (tx: EnginePrismaClient) => {
+                      const work = Promise.resolve().then(() => arg(tx));
+                      const fence = queue.fenceOf(tx);
+                      if (!fence) return work;
+                      // A callback need not cooperate with the native driver's timeout.
+                      // Its queue slot must still be released once the driver rolls back.
+                      return Promise.race([
+                        work,
+                        fence.then((committed) => {
+                          if (!committed) throw closed();
+                          return new Promise<never>(() => {});
+                        }),
+                      ]);
+                    }
+                  : arg,
+                options,
+              ),
+            );
         if (key === "$withColumns" && typeof value === "function")
           return (...args: any[]) => wrap(value.apply(target, args));
         if (
