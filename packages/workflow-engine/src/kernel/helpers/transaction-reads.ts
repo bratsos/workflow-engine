@@ -16,11 +16,18 @@ export function withTransactionReads<T extends object>(
     persistence,
   );
   if (!reads) return port;
+  const supplied = methods.filter(
+    (method) => typeof reads[method] === "function",
+  );
+  if (supplied.length === 0) return port;
 
   const view = new Proxy(port, {
     get(target, key) {
       const source =
-        methods.includes(key as keyof T) && key in reads ? reads : target;
+        supplied.includes(key as keyof T) &&
+        typeof Reflect.get(reads, key) === "function"
+          ? reads
+          : target;
       const value = Reflect.get(source, key);
       return typeof value === "function" ? value.bind(source) : value;
     },

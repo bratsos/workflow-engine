@@ -86,9 +86,7 @@ export async function kernelDatabase() {
         $disconnect: () => db.close(),
       });
     } else {
-      client = fixture.createSqliteClient(
-        process.env.PRISMA_MAJOR === "6" ? `${file}?connection_limit=1` : file,
-      );
+      client = fixture.createSqliteClient(file);
     }
   } else {
     const url = new URL(process.env.DATABASE_URL!);

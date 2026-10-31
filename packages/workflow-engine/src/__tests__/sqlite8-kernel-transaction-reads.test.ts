@@ -1,5 +1,8 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { withTransactionReads } from "../kernel/helpers/transaction-reads.js";
+import {
+  isTransactionReadBound,
+  withTransactionReads,
+} from "../kernel/helpers/transaction-reads.js";
 import type {
   BlobStore,
   Persistence,
@@ -31,6 +34,26 @@ describe.skipIf(!realDatabase)("kernel transaction-scoped port reads", () => {
   });
   afterAll(async () => {
     await db?.close();
+  });
+
+  it.each([
+    { name: "omitted", reads: {} },
+    { name: "undefined", reads: { get: undefined } },
+  ])("retains the original port when scoped reads are $name", async ({
+    reads,
+  }) => {
+    await db.blobStore.put("partial-read", { retained: true });
+    const configured = override(
+      db.blobStore as BlobStore & TransactionReadPort<BlobStore>,
+      { transactionReads: () => reads },
+    );
+    let reader = configured;
+    await db.persistence.withTransaction(async (tx) => {
+      reader = withTransactionReads(configured, tx, ["get"]);
+      expect(reader === configured).toBe(true);
+      expect(isTransactionReadBound(reader)).toBe(false);
+    });
+    expect(await reader.get("partial-read")).toEqual({ retained: true });
   });
 
   function inTransaction(
