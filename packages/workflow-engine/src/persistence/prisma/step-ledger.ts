@@ -216,6 +216,19 @@ export class PrismaStepLedger implements StepLedger {
     keepStepIds: string[],
   ): Promise<void> {
     if (keepStepIds.length === 0) return this.clear(stageRecordId);
+    if (this.databaseType === "sqlite") {
+      if (typeof this.prisma.$executeRaw !== "function") {
+        throw new Error(
+          "Prisma client does not support $executeRaw (required for the SQLite clearExcept path)",
+        );
+      }
+      await this.prisma.$executeRaw`
+        DELETE FROM "workflow_steps"
+        WHERE "stageRecordId" = ${stageRecordId}
+          AND "stepId" NOT IN (SELECT value FROM json_each(${JSON.stringify(keepStepIds)}))
+      `;
+      return;
+    }
     await this.prisma.workflowStep.deleteMany({
       where: { stageRecordId, stepId: { notIn: keepStepIds } },
     });
