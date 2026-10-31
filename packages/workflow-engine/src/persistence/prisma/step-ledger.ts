@@ -6,7 +6,7 @@ import type {
 } from "../../kernel/ports.js";
 import {
   type EnginePrismaClient,
-  rejectSqliteOn8,
+  validateDatabaseType,
 } from "./prisma-client-type.js";
 import { isUniqueViolation } from "./sql-errors.js";
 
@@ -87,7 +87,7 @@ export class PrismaStepLedger implements StepLedger {
     options: PrismaStepLedgerOptions = {},
   ) {
     this.databaseType = options.databaseType ?? "postgresql";
-    rejectSqliteOn8(prisma, this.databaseType);
+    validateDatabaseType(prisma, this.databaseType);
   }
 
   async claim(

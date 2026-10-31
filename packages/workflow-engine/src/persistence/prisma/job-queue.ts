@@ -27,7 +27,7 @@ import {
   type EnginePrismaClient,
   type RawColumns,
   rawFor,
-  rejectSqliteOn8,
+  validateDatabaseType,
 } from "./prisma-client-type";
 
 const logger = createLogger("JobQueue");
@@ -157,7 +157,7 @@ export class PrismaJobQueue implements JobQueue {
     this.workerId = options.workerId || `worker-${process.pid}-${Date.now()}`;
     this.enums = createEnumHelper(prisma);
     this.databaseType = options.databaseType ?? "postgresql";
-    rejectSqliteOn8(prisma, this.databaseType);
+    validateDatabaseType(prisma, this.databaseType);
     this.now = options.now ?? (() => new Date());
     this.fairnessGroupBy = options.fairness
       ? (options.fairness.groupBy ?? "_groupKey")

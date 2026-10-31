@@ -40,9 +40,13 @@ import { createEnumHelper, type PrismaEnumHelper } from "./enum-compat";
 import {
   type EnginePrismaClient,
   rawFor,
-  rejectSqliteOn8,
+  validateDatabaseType,
 } from "./prisma-client-type";
-import { isSerializationFailure, isUniqueViolation } from "./sql-errors";
+import {
+  isSerializationFailure,
+  isSqliteBusy,
+  isUniqueViolation,
+} from "./sql-errors";
 import { utcTimestampParam } from "./utc-timestamps";
 
 // Structural client type -- see prisma-client-type.ts. Kept as a local
@@ -237,7 +241,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       statusEnumName: this.statusEnumName,
     });
     this.databaseType = options.databaseType ?? "postgresql";
-    rejectSqliteOn8(prisma, this.databaseType);
+    validateDatabaseType(prisma, this.databaseType);
     this.skipTransactions = options.skipInteractiveTransactions ?? false;
     this.now = options.now ?? (() => new Date());
     this.versioning = {
@@ -722,12 +726,17 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       // A caught unique violation aborts a PostgreSQL transaction. Insert
       // atomically, then read separately so READ COMMITTED sees the winner.
       if (this.databaseType === "sqlite") {
-        // A Date, unlike the Postgres statements: SQLite stores it the way
-        // the model API does on every major (integer on 6, ISO text on 7).
+        // Prisma 8 raw binds require text; 6 and 7 keep their native Date
+        // encoding so raw and model timestamps agree on each driver.
+        const createdAt = new Date();
+        const timestamp =
+          this.prisma.$databaseType === "sqlite"
+            ? createdAt.toISOString()
+            : createdAt;
         await this.prisma.$executeRaw`
           INSERT INTO "workflow_definitions"
             ("workflowId", version, snapshot, "structureHash", "createdAt")
-          VALUES (${input.workflowId}, ${input.version}, ${snapshot}, ${input.structureHash}, ${new Date()})
+          VALUES (${input.workflowId}, ${input.version}, ${snapshot}, ${input.structureHash}, ${timestamp})
           ON CONFLICT ("workflowId", version) DO NOTHING
         `;
       } else {
@@ -754,7 +763,10 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       }
       return this.mapDefinition(row);
     } catch (error) {
-      if (isSerializationFailure(error)) {
+      if (
+        isSerializationFailure(error) ||
+        (this.databaseType === "sqlite" && isSqliteBusy(error))
+      ) {
         throw new DefinitionRegistrationRetryableError(
           input.workflowId,
           input.version,
