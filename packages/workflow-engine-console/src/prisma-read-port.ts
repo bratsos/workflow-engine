@@ -42,6 +42,8 @@ export interface ConsolePrismaClient {
   $queryRawUnsafe<T = unknown>(query: string, ...values: unknown[]): Promise<T>;
   $executeRawUnsafe?(query: string, ...values: unknown[]): Promise<number>;
   $transaction?<T>(fn: (tx: ConsolePrismaClient) => Promise<T>): Promise<T>;
+  /** Set by `fromPrisma8` from the wrapped client's contract target. */
+  readonly $databaseType?: "postgresql" | "sqlite";
   /**
    * Prisma 8 (`fromPrisma8`): a client whose raw reads return these columns,
    * since Prisma 8 drops the ones a raw read does not declare.
@@ -188,7 +190,9 @@ const COUNT_COLUMNS: RawColumns = { count: "bigint" };
 
 export interface PrismaConsoleReadPortOptions {
   statusEnumName?: string; // default "Status"
-  statementTimeoutMs?: number; // default 15000; 0 disables
+  /** PostgreSQL statement timeout; SQLite has no statement_timeout support. Default 15000; 0 disables. */
+  statementTimeoutMs?: number;
+  databaseType?: "postgresql" | "sqlite"; // default "postgresql"
   now?: () => Date; // default () => new Date()
 }
 
@@ -224,10 +228,14 @@ function toNumber(value: unknown): number {
   return 0;
 }
 
-/** Converts Date, string, null, or undefined values into Date or null. */
+/** Converts Date, SQLite epoch-millisecond values, ISO strings, null, or undefined into Date or null. */
 function toDate(value: unknown): Date | null {
   if (value === null || value === undefined) return null;
   if (value instanceof Date) return value;
+  if (typeof value === "number" || typeof value === "bigint") {
+    const parsed = new Date(Number(value));
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
+  }
   if (typeof value === "string") {
     const parsed = new Date(value);
     return Number.isNaN(parsed.getTime()) ? null : parsed;
@@ -237,14 +245,14 @@ function toDate(value: unknown): Date | null {
 
 interface RawRunRow {
   id: string;
-  createdAt: Date | string;
-  updatedAt: Date | string;
+  createdAt: RawTimestamp;
+  updatedAt: RawTimestamp;
   workflowId: string;
   workflowName: string;
   workflowType: string;
   status: string;
-  startedAt: Date | string | null;
-  completedAt: Date | string | null;
+  startedAt: RawNullableTimestamp;
+  completedAt: RawNullableTimestamp;
   duration: number | null;
   totalCost: number | null;
   totalTokens: number | bigint | null;
@@ -252,6 +260,9 @@ interface RawRunRow {
   definitionVersion?: string | null;
   redriveCount?: number | bigint | null;
 }
+
+type RawTimestamp = Date | string | number | bigint;
+type RawNullableTimestamp = RawTimestamp | null;
 
 interface RawRunDetailRow extends RawRunRow {
   input: unknown;
@@ -269,12 +280,12 @@ interface RawStageRow {
   executionGroup: number | bigint;
   attempt: number | bigint;
   status: string;
-  startedAt: Date | string | null;
-  completedAt: Date | string | null;
+  startedAt: RawNullableTimestamp;
+  completedAt: RawNullableTimestamp;
   duration: number | null;
-  nextPollAt: Date | string | null;
+  nextPollAt: RawNullableTimestamp;
   pollInterval: number | null;
-  maxWaitUntil: Date | string | null;
+  maxWaitUntil: RawNullableTimestamp;
   errorMessage: string | null;
 }
 
@@ -286,17 +297,17 @@ interface RawStepRow {
   kind: string;
   status: string;
   attempt: number | bigint;
-  leaseExpiresAt: Date | string | null;
-  deadlineAt: Date | string | null;
+  leaseExpiresAt: RawNullableTimestamp;
+  deadlineAt: RawNullableTimestamp;
   externalKey: string | null;
   error: string | null;
-  createdAt: Date | string;
-  updatedAt: Date | string;
+  createdAt: RawTimestamp;
+  updatedAt: RawTimestamp;
 }
 
 interface RawAnnotationRow {
   id: string;
-  createdAt: Date | string;
+  createdAt: RawTimestamp;
   workflowRunId: string;
   workflowStageRecordId: string | null;
   attempt: number | bigint;
@@ -310,7 +321,7 @@ interface RawAnnotationRow {
 
 interface RawLogRow {
   id: string;
-  createdAt: Date | string;
+  createdAt: RawTimestamp;
   workflowRunId: string | null;
   workflowStageId: string | null;
   level: string;
@@ -322,10 +333,10 @@ interface RawEventRow {
   workflowRunId: string;
   sequence: number | bigint;
   eventType: string;
-  occurredAt: Date | string;
-  publishedAt: Date | string | null;
+  occurredAt: RawTimestamp;
+  publishedAt: RawNullableTimestamp;
   retryCount: number | bigint;
-  dlqAt: Date | string | null;
+  dlqAt: RawNullableTimestamp;
 }
 
 interface RawSuspendedStageRow {
@@ -335,9 +346,9 @@ interface RawSuspendedStageRow {
   stageId: string;
   stageName: string;
   attempt: number | bigint;
-  nextPollAt: Date | string | null;
+  nextPollAt: RawNullableTimestamp;
   pollInterval: number | null;
-  maxWaitUntil: Date | string | null;
+  maxWaitUntil: RawNullableTimestamp;
 }
 
 interface RawDeadLetterRow {
@@ -346,15 +357,15 @@ interface RawDeadLetterRow {
   sequence: number | bigint;
   eventType: string;
   retryCount: number | bigint;
-  occurredAt: Date | string;
-  dlqAt: Date | string | null;
+  occurredAt: RawTimestamp;
+  dlqAt: RawNullableTimestamp;
 }
 
 interface RawWorkerRow {
   workerId: string;
   running: number | bigint;
-  oldest: Date | string | null;
-  newest: Date | string | null;
+  oldest: RawNullableTimestamp;
+  newest: RawNullableTimestamp;
 }
 
 interface RawCostRow {
@@ -552,6 +563,7 @@ export class PrismaConsoleReadPort implements ConsoleReadPort {
 
   private readonly prisma: ConsolePrismaClient;
   private readonly statusEnumName: string;
+  private readonly databaseType: "postgresql" | "sqlite";
   private readonly statementTimeoutMs: number;
   private readonly now: () => Date;
 
@@ -560,6 +572,15 @@ export class PrismaConsoleReadPort implements ConsoleReadPort {
     options?: PrismaConsoleReadPortOptions,
   ) {
     this.prisma = prisma;
+    this.databaseType = options?.databaseType ?? "postgresql";
+    if (
+      prisma.$databaseType !== undefined &&
+      prisma.$databaseType !== this.databaseType
+    ) {
+      throw new Error(
+        `createPrismaConsoleReadPort: the Prisma 8 contract targets "${prisma.$databaseType}", but databaseType is "${this.databaseType}". Set databaseType: "${prisma.$databaseType}" to match the contract.`,
+      );
+    }
 
     const statusEnumName = options?.statusEnumName ?? "Status";
     // The enum name is interpolated directly into SQL as an identifier cast
@@ -597,6 +618,34 @@ export class PrismaConsoleReadPort implements ConsoleReadPort {
     return rawFor(client, columns).$queryRawUnsafe<T[]>(sql, ...params);
   }
 
+  /** SQLite 6/7 adapters use `?`; the Prisma 8 shim expands `$n` itself. */
+  private param(position: number): string {
+    if (
+      this.databaseType === "sqlite" &&
+      this.prisma.$databaseType !== "sqlite"
+    ) {
+      return "?";
+    }
+    return `$${position}`;
+  }
+
+  private timestampParam(position: number): string {
+    return this.databaseType === "postgresql"
+      ? utcParam(position)
+      : this.param(position);
+  }
+
+  private timestampValue(value: Date): Date | string {
+    return this.databaseType === "postgresql" ? value.toISOString() : value;
+  }
+
+  private statusParam(position: number): string {
+    const param = this.param(position);
+    return this.databaseType === "postgresql"
+      ? `${param}::"${this.statusEnumName}"`
+      : param;
+  }
+
   /**
    * Runs one console read, whatever number of statements it takes, and
    * translates a cancelled statement into `ConsoleQueryTimeoutError`.
@@ -628,7 +677,10 @@ export class PrismaConsoleReadPort implements ConsoleReadPort {
       ) {
         const ms = this.statementTimeoutMs;
         return await this.prisma.$transaction(async (tx) => {
-          if (typeof tx.$executeRawUnsafe === "function") {
+          if (
+            this.databaseType === "postgresql" &&
+            typeof tx.$executeRawUnsafe === "function"
+          ) {
             // `ms` is a validated integer, and a bare number here is
             // milliseconds. It is the one interpolated value in this file
             // besides the enum name.
@@ -676,9 +728,9 @@ export class PrismaConsoleReadPort implements ConsoleReadPort {
       // Rewriting as `a < c OR (a = c AND b < d)` prevents Postgres from using the index
       // efficiently and degrades into a bitmap scan or sequential scan.
       where.push(
-        `("createdAt", id) < (${utcParam(paramIdx)}, $${paramIdx + 1})`,
+        `("createdAt", id) < (${this.timestampParam(paramIdx)}, ${this.param(paramIdx + 1)})`,
       );
-      params.push(cursor.createdAt.toISOString(), cursor.id);
+      params.push(this.timestampValue(cursor.createdAt), cursor.id);
       paramIdx += 2;
     }
 
@@ -691,7 +743,7 @@ export class PrismaConsoleReadPort implements ConsoleReadPort {
       // serialisation question and the same plan.
       const placeholders = statuses.map((status) => {
         params.push(status);
-        const placeholder = `$${paramIdx}::"${this.statusEnumName}"`;
+        const placeholder = this.statusParam(paramIdx);
         paramIdx += 1;
         return placeholder;
       });
@@ -699,32 +751,32 @@ export class PrismaConsoleReadPort implements ConsoleReadPort {
     }
 
     if (query.filters?.workflowId !== undefined) {
-      where.push(`"workflowId" = $${paramIdx}`);
+      where.push(`"workflowId" = ${this.param(paramIdx)}`);
       params.push(query.filters.workflowId);
       paramIdx += 1;
     }
 
     if (query.filters?.workflowType !== undefined) {
-      where.push(`"workflowType" = $${paramIdx}`);
+      where.push(`"workflowType" = ${this.param(paramIdx)}`);
       params.push(query.filters.workflowType);
       paramIdx += 1;
     }
 
     if (query.filters?.definitionVersion !== undefined) {
-      where.push(`"definitionVersion" = $${paramIdx}`);
+      where.push(`"definitionVersion" = ${this.param(paramIdx)}`);
       params.push(query.filters.definitionVersion);
       paramIdx += 1;
     }
 
     if (query.filters?.createdAfter !== undefined) {
-      where.push(`"createdAt" >= ${utcParam(paramIdx)}`);
-      params.push(query.filters.createdAfter.toISOString());
+      where.push(`"createdAt" >= ${this.timestampParam(paramIdx)}`);
+      params.push(this.timestampValue(query.filters.createdAfter));
       paramIdx += 1;
     }
 
     if (query.filters?.createdBefore !== undefined) {
-      where.push(`"createdAt" < ${utcParam(paramIdx)}`);
-      params.push(query.filters.createdBefore.toISOString());
+      where.push(`"createdAt" < ${this.timestampParam(paramIdx)}`);
+      params.push(this.timestampValue(query.filters.createdBefore));
       paramIdx += 1;
     }
 
@@ -776,7 +828,7 @@ LIMIT ${limit + 1}`;
        status, "startedAt", "completedAt", duration, "totalCost", "totalTokens", priority,
        "definitionVersion", "redriveCount",
        input, output, config, metadata
-FROM "workflow_runs" WHERE id = $1`,
+FROM "workflow_runs" WHERE id = ${this.param(1)}`,
         [runId],
       );
 
@@ -790,7 +842,7 @@ FROM "workflow_runs" WHERE id = $1`,
         `SELECT id, "workflowRunId", "stageId", "stageName", "stageNumber", "executionGroup",
        attempt, status, "startedAt", "completedAt", duration, "nextPollAt",
        "pollInterval", "maxWaitUntil", "errorMessage"
-FROM "workflow_stages" WHERE "workflowRunId" = $1
+FROM "workflow_stages" WHERE "workflowRunId" = ${this.param(1)}
 ORDER BY "stageNumber" ASC, "stageId" ASC`,
         [runId],
       );
@@ -802,7 +854,7 @@ ORDER BY "stageNumber" ASC, "stageId" ASC`,
        s."leaseExpiresAt", s."deadlineAt", s."externalKey", s.error, s."createdAt", s."updatedAt"
 FROM "workflow_steps" s
 JOIN "workflow_stages" st ON st.id = s."stageRecordId"
-WHERE st."workflowRunId" = $1
+WHERE st."workflowRunId" = ${this.param(1)}
 ORDER BY st."stageNumber" ASC, s.seq ASC
 LIMIT ${stepLimit + 1}`,
         [runId],
@@ -813,7 +865,7 @@ LIMIT ${stepLimit + 1}`,
         ANNOTATION_COLUMNS,
         `SELECT id, "createdAt", "workflowRunId", "workflowStageRecordId", attempt, scope,
        "scopeId", "actorKind", "actorId", key, value
-FROM "workflow_annotations" WHERE "workflowRunId" = $1
+FROM "workflow_annotations" WHERE "workflowRunId" = ${this.param(1)}
 ORDER BY "createdAt" DESC, id DESC
 LIMIT ${annotationLimit + 1}`,
         [runId],
@@ -823,7 +875,7 @@ LIMIT ${annotationLimit + 1}`,
         client,
         LOG_COLUMNS,
         `SELECT id, "createdAt", "workflowRunId", "workflowStageId", level, message
-FROM "workflow_logs" WHERE "workflowRunId" = $1
+FROM "workflow_logs" WHERE "workflowRunId" = ${this.param(1)}
 ORDER BY "createdAt" DESC, id DESC
 LIMIT ${logLimit + 1}`,
         [runId],
@@ -834,7 +886,7 @@ LIMIT ${logLimit + 1}`,
         EVENT_COLUMNS,
         `SELECT id, "workflowRunId", sequence, "eventType", "occurredAt", "publishedAt",
        "retryCount", "dlqAt"
-FROM "outbox_events" WHERE "workflowRunId" = $1
+FROM "outbox_events" WHERE "workflowRunId" = ${this.param(1)}
 ORDER BY sequence ASC
 LIMIT ${eventLimit + 1}`,
         [runId],
@@ -880,7 +932,7 @@ LIMIT ${eventLimit + 1}`,
       EVENT_COLUMNS,
       `SELECT id, "workflowRunId", sequence, "eventType", "occurredAt", "publishedAt",
        "retryCount", "dlqAt"
-FROM "outbox_events" WHERE "workflowRunId" = $1 AND sequence > $2
+FROM "outbox_events" WHERE "workflowRunId" = ${this.param(1)} AND sequence > ${this.param(2)}
 ORDER BY sequence ASC LIMIT ${clampedLimit}`,
       [runId, Math.floor(afterSequence)],
     );
@@ -898,26 +950,26 @@ ORDER BY sequence ASC LIMIT ${clampedLimit}`,
         this.select<{ status: string; count: unknown }>(
           client,
           { status: "text", count: "bigint" },
-          `SELECT status::text AS status, count(*) AS count FROM "job_queue" GROUP BY status`,
+          `SELECT ${this.databaseType === "postgresql" ? "status::text" : "status"} AS status, count(*) AS count FROM "job_queue" GROUP BY status`,
           [],
         ),
-        this.select<{ oldest: Date | string | null }>(
+        this.select<{ oldest: RawNullableTimestamp }>(
           client,
           OLDEST_COLUMNS,
-          `SELECT min("createdAt") AS oldest FROM "job_queue" WHERE status = $1::"${this.statusEnumName}"`,
+          `SELECT min("createdAt") AS oldest FROM "job_queue" WHERE status = ${this.statusParam(1)}`,
           ["PENDING"],
         ),
-        this.select<{ oldest: Date | string | null }>(
+        this.select<{ oldest: RawNullableTimestamp }>(
           client,
           OLDEST_COLUMNS,
-          `SELECT min("lockedAt") AS oldest FROM "job_queue" WHERE status = $1::"${this.statusEnumName}" AND "lockedAt" IS NOT NULL`,
+          `SELECT min("lockedAt") AS oldest FROM "job_queue" WHERE status = ${this.statusParam(1)} AND "lockedAt" IS NOT NULL`,
           ["RUNNING"],
         ),
         this.select<{ count: unknown }>(
           client,
           COUNT_COLUMNS,
-          `SELECT count(*) AS count FROM "job_queue" WHERE status = $1::"${this.statusEnumName}" AND "nextPollAt" IS NOT NULL AND "nextPollAt" <= ${utcParam(2)}`,
-          ["SUSPENDED", this.now().toISOString()],
+          `SELECT count(*) AS count FROM "job_queue" WHERE status = ${this.statusParam(1)} AND "nextPollAt" IS NOT NULL AND "nextPollAt" <= ${this.timestampParam(2)}`,
+          ["SUSPENDED", this.timestampValue(this.now())],
         ),
       ]),
     );
@@ -949,7 +1001,7 @@ ORDER BY sequence ASC LIMIT ${clampedLimit}`,
        st.attempt, st."nextPollAt", st."pollInterval", st."maxWaitUntil"
 FROM "workflow_stages" st
 JOIN "workflow_runs" r ON r.id = st."workflowRunId"
-WHERE st.status = $1::"${this.statusEnumName}" AND st."nextPollAt" IS NOT NULL
+WHERE st.status = ${this.statusParam(1)} AND st."nextPollAt" IS NOT NULL
 ORDER BY st."nextPollAt" ASC
 LIMIT ${clampedLimit}`,
       ["SUSPENDED"],
@@ -976,7 +1028,7 @@ ORDER BY "dlqAt" DESC LIMIT ${clampedLimit}`,
       WORKER_COLUMNS,
       `SELECT "workerId", count(*) AS running, min("lockedAt") AS oldest, max("lockedAt") AS newest
 FROM "job_queue"
-WHERE status = $1::"${this.statusEnumName}" AND "workerId" IS NOT NULL
+WHERE status = ${this.statusParam(1)} AND "workerId" IS NOT NULL
 GROUP BY "workerId" ORDER BY "workerId" ASC`,
       ["RUNNING"],
     );
@@ -995,20 +1047,31 @@ GROUP BY "workerId" ORDER BY "workerId" ASC`,
         "costs.byWorkflow",
         COST_COLUMNS,
         `SELECT "workflowId" AS key, count(*) AS runs, sum("totalCost") AS cost, sum("totalTokens") AS tokens
-FROM "workflow_runs" WHERE "createdAt" >= ${utcParam(1)} AND "createdAt" < ${utcParam(2)}
+FROM "workflow_runs" WHERE "createdAt" >= ${this.timestampParam(1)} AND "createdAt" < ${this.timestampParam(2)}
 GROUP BY "workflowId" ORDER BY sum("totalCost") DESC`,
-        [from.toISOString(), to.toISOString()],
+        [this.timestampValue(from), this.timestampValue(to)],
       );
       return rows.map(mapCostBucket);
     } else {
+      const sql =
+        this.databaseType === "postgresql"
+          ? `SELECT to_char(date_trunc('day', "createdAt"), 'YYYY-MM-DD') AS key,
+       count(*) AS runs, sum("totalCost") AS cost, sum("totalTokens") AS tokens
+FROM "workflow_runs" WHERE "createdAt" >= ${this.timestampParam(1)} AND "createdAt" < ${this.timestampParam(2)}
+GROUP BY 1 ORDER BY 1 DESC`
+          : `SELECT CASE
+         WHEN typeof("createdAt") IN ('integer', 'real')
+           THEN strftime('%Y-%m-%d', "createdAt" / 1000.0, 'unixepoch')
+         ELSE strftime('%Y-%m-%d', "createdAt")
+       END AS key,
+       count(*) AS runs, sum("totalCost") AS cost, sum("totalTokens") AS tokens
+FROM "workflow_runs" WHERE "createdAt" >= ${this.timestampParam(1)} AND "createdAt" < ${this.timestampParam(2)}
+GROUP BY 1 ORDER BY 1 DESC`;
       const rows = await this.query<RawCostRow>(
         "costs.byDay",
         COST_COLUMNS,
-        `SELECT to_char(date_trunc('day', "createdAt"), 'YYYY-MM-DD') AS key,
-       count(*) AS runs, sum("totalCost") AS cost, sum("totalTokens") AS tokens
-FROM "workflow_runs" WHERE "createdAt" >= ${utcParam(1)} AND "createdAt" < ${utcParam(2)}
-GROUP BY 1 ORDER BY 1 DESC`,
-        [from.toISOString(), to.toISOString()],
+        sql,
+        [this.timestampValue(from), this.timestampValue(to)],
       );
       return rows.map(mapCostBucket);
     }
