@@ -363,22 +363,23 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
     expect(body.runs[0]?.createdAt).toBe(at(120).toISOString());
   });
 
-  it("rejects databaseType mismatches with the contract target's corrective option", () => {
-    if (prisma.$databaseType === undefined) return;
+  it.skipIf(!isPrisma8)(
+    "rejects databaseType mismatches with the contract target's corrective option",
+    () => {
+      expect(() => createPrismaConsoleReadPort(prisma)).toThrow(
+        /databaseType: "sqlite"/,
+      );
 
-    expect(() => createPrismaConsoleReadPort(prisma)).toThrow(
-      /databaseType: "sqlite"/,
-    );
-
-    // The reverse label exercises the same pre-SQL validation branch for the
-    // other supported contract target. No query is issued by this check.
-    const postgresTarget = Object.create(prisma, {
-      $databaseType: { value: "postgresql" },
-    });
-    expect(() =>
-      createPrismaConsoleReadPort(postgresTarget, { databaseType: "sqlite" }),
-    ).toThrow(/databaseType: "postgresql"/);
-  });
+      // The reverse label exercises the same pre-SQL validation branch for the
+      // other supported contract target. No query is issued by this check.
+      const postgresTarget = Object.create(prisma, {
+        $databaseType: { value: "postgresql" },
+      });
+      expect(() =>
+        createPrismaConsoleReadPort(postgresTarget, { databaseType: "sqlite" }),
+      ).toThrow(/databaseType: "postgresql"/);
+    },
+  );
 });
 
 function mkRun(
