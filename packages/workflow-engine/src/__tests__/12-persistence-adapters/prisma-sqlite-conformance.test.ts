@@ -136,7 +136,11 @@ describe(`I want the Prisma ${major} SQLite adapters to conform against a real f
 
   aiCallLoggerConformanceSuite(
     `PrismaAICallLogger (SQLite ${major})`,
-    () => Object.assign(createPrismaAICallLogger(prisma), { reset: resetAll }),
+    () =>
+      Object.assign(
+        createPrismaAICallLogger(prisma, { databaseType: "sqlite" }),
+        { reset: resetAll },
+      ),
     api,
   );
 
