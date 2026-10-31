@@ -476,23 +476,21 @@ function clause(q: Sql, m: Model, key: string, v: any, a: string, d: number) {
     }
     const ops: Args = isObject(v) ? v : { equals: v };
     if ("path" in ops) {
+      const validPath = m.sqlite
+        ? typeof ops.path === "string"
+        : Array.isArray(ops.path) &&
+          ops.path.every((part) => typeof part === "string");
       if (
         kindOf(c) !== JSONB ||
         Object.keys(ops).sort().join() !== "equals,path" ||
-        !Array.isArray(ops.path) ||
-        ops.path.some((part) => typeof part !== "string")
+        !validPath
       ) {
         fail(`${m.name}.${key}: only { path, equals } is supported on JSON`);
       }
       if (m.sqlite) {
-        const path =
-          "$" +
-          ops.path.map((part: string) => `.${JSON.stringify(part)}`).join("");
-        q.t(`json_extract(${ref}, `)
-          .v(path)
-          .t(") = json_extract(")
-          .v(JSON.stringify(ops.equals))
-          .t(", '$')");
+        // Compare JSON text, as Prisma 6/7 do: json_extract would conflate
+        // true with 1, and JSON null with a missing path or SQL NULL.
+        q.t(`(${ref} -> `).v(ops.path).t(") = ").v(JSON.stringify(ops.equals));
       } else {
         q.t(`(${ref} #> `)
           .v(ops.path, "::text[]")

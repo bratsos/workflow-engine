@@ -4,6 +4,7 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { createPrismaAICallLogger } from "../../persistence/prisma/ai-logger.js";
 import { fromPrisma8 } from "../../persistence/prisma/from-prisma8.js";
 import {
   isSerializationFailure,
@@ -26,6 +27,59 @@ const run = (id: string, extra: Record<string, unknown> = {}) => ({
   ...extra,
 });
 const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const jsonRows: Array<[string, unknown]> = [
+  ["text", { k: "x" }],
+  ["num", { k: 1 }],
+  ["real", { k: 1.5 }],
+  ["string-num", { k: "1" }],
+  ["true", { k: true }],
+  ["false", { k: false }],
+  ["zero", { k: 0 }],
+  ["string-true", { k: "true" }],
+  ["null", { k: null }],
+  ["missing", {}],
+  ["sql-null", undefined],
+  ["root-null", null],
+  ["object", { k: { a: 1, b: 2 } }],
+  ["reversed-object", { k: { b: 2, a: 1 } }],
+  ["string-object", { k: '{"a":1,"b":2}' }],
+  ["array", { k: [1, 2] }],
+  ["string-array", { k: "[1,2]" }],
+  [
+    "deep",
+    {
+      nested: [{ value: "first" }, { value: "last" }],
+      "a.b": "it's exact",
+      "we'ird": "bound",
+      "": 17,
+    },
+  ],
+];
+// Expected ids observed through the real Prisma 6 SQLite client on these rows.
+const jsonPaths: Array<[string, string, unknown, string[]]> = [
+  ["text", "$.k", "x", ["text"]],
+  ["number", "$.k", 1, ["num"]],
+  ["real", "$.k", 1.5, ["real"]],
+  ["numeric string", "$.k", "1", ["string-num"]],
+  ["true", "$.k", true, ["true"]],
+  ["false", "$.k", false, ["false"]],
+  ["zero", "$.k", 0, ["zero"]],
+  ["boolean string", "$.k", "true", ["string-true"]],
+  ["JSON null", "$.k", null, ["null"]],
+  ["root JSON null", "$", null, ["root-null"]],
+  ["missing", "$.absent", null, []],
+  ["object", "$.k", { a: 1, b: 2 }, ["object"]],
+  ["object key order", "$.k", { b: 2, a: 1 }, ["reversed-object"]],
+  ["object string", "$.k", '{"a":1,"b":2}', ["string-object"]],
+  ["array", "$.k", [1, 2], ["array"]],
+  ["array string", "$.k", "[1,2]", ["string-array"]],
+  ["nested array", "$.nested[1].value", "last", ["deep"]],
+  ["negative array index", "$.nested[#-1].value", "last", ["deep"]],
+  ["quoted key", '$."a.b"', "it's exact", ["deep"]],
+  ["apostrophe in key", '$."we\'ird"', "bound", ["deep"]],
+  ["empty key", '$.""', 17, ["deep"]],
+  ["shorthand key", "k", 1, ["num"]],
+];
 
 describe.skipIf(process.env.PRISMA_MAJOR !== "8")(
   "fromPrisma8 on SQLite",
@@ -304,7 +358,7 @@ describe.skipIf(process.env.PRISMA_MAJOR !== "8")(
         await ids({ workflowId: { startsWith: "wf" }, startedAt: null }),
       ).toEqual(["a"]);
       expect(await ids({ input: { equals: { batch: "one" } } })).toEqual(["a"]);
-      expect(await ids({ input: { path: ["batch"], equals: "two" } })).toEqual([
+      expect(await ids({ input: { path: "$.batch", equals: "two" } })).toEqual([
         "b",
       ]);
       await prisma.workflowStage.create({
@@ -348,6 +402,83 @@ describe.skipIf(process.env.PRISMA_MAJOR !== "8")(
           { workflowId: "other", _count: { _all: 1 } },
         ]),
       );
+    });
+
+    it.each(
+      jsonPaths,
+    )("matches Prisma 6 SQLite JSON-path equality for %s", async (_name, path, equals, expected) => {
+      await prisma.workflowRun.createMany({
+        data: jsonRows.map(([id, metadata]) => run(id, { metadata })),
+      });
+      const rows = await prisma.workflowRun.findMany({
+        where: { metadata: { path, equals } },
+        select: { id: true },
+        orderBy: { id: "asc" },
+      });
+      expect(rows.map((row: { id: string }) => row.id)).toEqual(expected);
+    });
+
+    it("binds arbitrary JSON paths and rejects unsupported path filters", async () => {
+      await prisma.workflowRun.create({
+        data: run("safe", { metadata: { "x') OR 1=1 --": "bound" } }),
+      });
+      expect(
+        await prisma.workflowRun.count({
+          where: {
+            metadata: { path: '$."x\') OR 1=1 --"', equals: "bound" },
+          },
+        }),
+      ).toBe(1);
+      for (const filter of [
+        { path: ["k"], equals: 1 },
+        { path: "$.k" },
+        { path: "$.k", equals: undefined },
+        { path: "$.k", equals: 1, not: 2 },
+        { path: 1, equals: 1 },
+      ])
+        await expect(
+          prisma.workflowRun.count({ where: { metadata: filter } }),
+        ).rejects.toThrow(/only \{ path, equals \}/);
+      await expect(
+        prisma.workflowRun.count({
+          where: { metadata: { path: "", equals: 1 } },
+        }),
+      ).rejects.toThrow(/JSON path/i);
+    });
+
+    it("checks logger batches through both dedicated columns and legacy SQLite JSON paths", async () => {
+      const createLogger: (
+        client: Parameters<typeof createPrismaAICallLogger>[0],
+        options: { databaseType: "sqlite" },
+      ) => ReturnType<typeof createPrismaAICallLogger> =
+        createPrismaAICallLogger;
+      const logger = createLogger(prisma, { databaseType: "sqlite" });
+      expect(await logger.isRecorded("x")).toBe(false);
+      const call = {
+        topic: "t",
+        callType: "c",
+        modelKey: "m",
+        modelId: "m",
+        prompt: "p",
+        response: "r",
+        inputTokens: 1,
+        outputTokens: 1,
+        cost: 0,
+      };
+      await prisma.aICall.createMany({
+        data: [
+          { ...call, metadata: { batchId: "x" } },
+          { ...call, batchId: "column", metadata: {} },
+          { ...call, metadata: { batchId: 1 } },
+          { ...call, metadata: { batchId: true } },
+          { ...call, metadata: { batchId: null } },
+        ],
+      });
+      expect(await logger.isRecorded("x")).toBe(true);
+      expect(await logger.isRecorded("column")).toBe(true);
+      for (const value of ["missing", "1", "true", "null", "x' OR 1=1 --"]) {
+        expect(await logger.isRecorded(value)).toBe(false);
+      }
     });
 
     it("fills omitted values in heterogeneous createMany rows and skips duplicate keys", async () => {
