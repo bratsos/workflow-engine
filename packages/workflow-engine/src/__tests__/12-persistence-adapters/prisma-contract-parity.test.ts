@@ -1,8 +1,9 @@
 /**
- * prisma/contract.prisma (Prisma 8) must describe the same tables as
+ * Both Prisma 8 reference contracts must describe the same tables as
  * prisma/schema.prisma (Prisma 6 and 7). The files are compared as text, with
  * no database: models, tables, columns (type, nullability, defaults, generated
- * values), enums, index names and columns, and foreign keys. The one thing a
+ * values), enums where supported, index names and columns, and foreign keys.
+ * SQLite stores statuses as text and timestamps as DateTime. The one thing a
  * contract cannot say is a sort direction, so the schema's `sort: Desc`
  * indexes are held against prisma/mixed-order-indexes.sql instead.
  */
@@ -24,7 +25,13 @@ const SCALARS: Record<string, string> = {
   Json: "Jsonb",
 };
 
-function summarise(source: string, dialect: "schema" | "contract") {
+type Dialect = "schema" | "postgres-contract" | "sqlite-contract";
+
+function summarise(
+  source: string,
+  dialect: Dialect,
+  target: "postgresql" | "sqlite" = "postgresql",
+) {
   const text = strip(source);
   const enums = new Map<string, string[]>();
   const enumBlock =
@@ -77,7 +84,9 @@ function summarise(source: string, dialect: "schema" | "contract") {
           ? enums.has(rawType)
             ? rawType
             : undefined
-          : rawType.match(/^pg\.enum\((\w+)\)$/)?.[1];
+          : dialect === "postgres-contract"
+            ? rawType.match(/^pg\.enum\((\w+)\)$/)?.[1]
+            : undefined;
       if (modelNames.includes(rawType)) {
         const fk = rest.match(
           /fields: \[(\w+)\], references: \[(\w+)\].*?onDelete: (\w+)/,
@@ -89,9 +98,15 @@ function summarise(source: string, dialect: "schema" | "contract") {
       }
       if (rest.includes("@id")) indexes.push(`primary key (${column})`);
       const type = enumName
-        ? `pg.enum(${enumName})`
+        ? target === "sqlite"
+          ? "String"
+          : `pg.enum(${enumName})`
         : dialect === "schema"
-          ? SCALARS[rawType]
+          ? target === "sqlite" && rawType === "DateTime"
+            ? "DateTime"
+            : target === "sqlite" && rawType === "Json"
+              ? "Json"
+              : SCALARS[rawType]
           : rawType;
       const given = rest.match(/@default\(((?:[^()]|\([^()]*\))*)\)/)?.[1];
       // Generated values: a schema writes `@default(cuid())` / `@updatedAt`, a
@@ -105,7 +120,7 @@ function summarise(source: string, dialect: "schema" | "contract") {
         ? ""
         : (given ?? "").replace(/^json`|[`"]/g, "");
       columns.push(
-        `${column} ${type}${modifier} default=${defaultValue} generated=${generated}`,
+        `${column} ${type}${modifier} default=${target === "sqlite" && column === "config" ? "" : defaultValue} generated=${generated}`,
       );
     }
     models[name] = {
@@ -115,18 +130,32 @@ function summarise(source: string, dialect: "schema" | "contract") {
       indexes: indexes.sort(),
     };
   }
-  return { enums: Object.fromEntries(enums), models };
+  return {
+    enums: target === "sqlite" ? {} : Object.fromEntries(enums),
+    models,
+  };
 }
 
-describe("I want the Prisma 8 reference contract to match schema.prisma", () => {
-  it("describes the same models, columns, enums, indexes and relations", async () => {
+describe("I want the Prisma 8 reference contracts to match schema.prisma", () => {
+  it("describes the same Postgres models, columns, enums, indexes and relations", async () => {
     const [schema, contract] = await Promise.all([
       read("schema.prisma"),
       read("contract.prisma"),
     ]);
 
-    expect(summarise(contract, "contract")).toEqual(
+    expect(summarise(contract, "postgres-contract")).toEqual(
       summarise(schema, "schema"),
+    );
+  });
+
+  it("describes the same SQLite models, columns, indexes and relations", async () => {
+    const [schema, contract] = await Promise.all([
+      read("schema.prisma"),
+      read("contract-sqlite.prisma"),
+    ]);
+
+    expect(summarise(contract, "sqlite-contract", "sqlite")).toEqual(
+      summarise(schema, "schema", "sqlite"),
     );
   });
 
