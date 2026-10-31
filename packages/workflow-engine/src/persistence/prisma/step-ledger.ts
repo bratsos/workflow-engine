@@ -1,4 +1,5 @@
 import type {
+  Persistence,
   StepLedger,
   StepRecord,
   StepRecordExpectation,
@@ -9,6 +10,7 @@ import {
   validateDatabaseType,
 } from "./prisma-client-type.js";
 import { isUniqueViolation } from "./sql-errors.js";
+import { hasBaseReads, sqliteTransactionReads } from "./transaction-reads.js";
 
 type PrismaClient = EnginePrismaClient;
 
@@ -191,6 +193,18 @@ export class PrismaStepLedger implements StepLedger {
       orderBy: { seq: "asc" },
     });
     return records.map(mapStep);
+  }
+
+  transactionReads(persistence: Persistence): Partial<StepLedger> | undefined {
+    if (this.databaseType !== "sqlite") return undefined;
+    return sqliteTransactionReads(persistence, this.prisma, (tx) => {
+      if (!hasBaseReads(this, PrismaStepLedger.prototype, ["get", "list"]))
+        return undefined;
+      const reader = new PrismaStepLedger(tx, {
+        databaseType: this.databaseType,
+      });
+      return { get: reader.get.bind(reader), list: reader.list.bind(reader) };
+    });
   }
 
   async clear(stageRecordId: string): Promise<void> {

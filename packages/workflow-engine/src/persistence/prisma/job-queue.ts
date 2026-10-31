@@ -7,6 +7,7 @@
  * This is migrated from the original services/job-queue.server.ts
  */
 
+import type { Persistence } from "../../kernel/ports";
 import { createLogger } from "../../utils/logger";
 import {
   type DequeueOptions,
@@ -29,6 +30,7 @@ import {
   rawFor,
   validateDatabaseType,
 } from "./prisma-client-type";
+import { hasBaseReads, sqliteTransactionReads } from "./transaction-reads";
 
 const logger = createLogger("JobQueue");
 
@@ -931,6 +933,22 @@ export class PrismaJobQueue implements JobQueue {
         nextPollAt: job.nextPollAt,
         payload: rest,
       } satisfies JobRecord;
+    });
+  }
+
+  transactionReads(persistence: Persistence): Partial<JobQueue> | undefined {
+    if (this.databaseType !== "sqlite") return undefined;
+    return sqliteTransactionReads(persistence, this.prisma, (tx) => {
+      if (
+        !hasBaseReads(this, PrismaJobQueue.prototype, ["getJobsByWorkflowRun"])
+      )
+        return undefined;
+      const reader = new PrismaJobQueue(tx, {
+        databaseType: this.databaseType,
+        workerId: this.workerId,
+        now: this.now,
+      });
+      return { getJobsByWorkflowRun: reader.getJobsByWorkflowRun.bind(reader) };
     });
   }
 
