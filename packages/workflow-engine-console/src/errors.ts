@@ -27,19 +27,35 @@ const STATEMENT_TIMEOUT_SQLSTATE = "57014";
 
 /**
  * Recognise a cancelled statement through whatever wrapper the driver put
- * around it. Prisma surfaces the SQLSTATE on `meta.code` for
- * `PrismaClientKnownRequestError` P2010, node-postgres puts it on `code`,
- * and a raw error may only carry the message.
+ * around it. The SQLSTATE sits on `sqlState` (Prisma 8), on `meta.code`
+ * (Prisma 6 raw `P2010`), on `meta.driverAdapterError.cause.originalCode`
+ * (Prisma 7 raw `P2010`) or on `code` (node-postgres), and a raw error may
+ * only carry the message.
+ *
+ * This reads the same paths as `sqlStateOf` in the engine's Prisma adapter
+ * (`persistence/prisma/sql-errors.ts`). It is a local copy because that
+ * module is internal to the engine, and importing it would mean widening the
+ * engine's public API or giving this package a runtime dependency on it.
  */
 export function isStatementTimeout(error: unknown): boolean {
   if (typeof error !== "object" || error === null) return false;
   const candidate = error as {
+    sqlState?: unknown;
     code?: unknown;
-    meta?: { code?: unknown; message?: unknown };
+    meta?: {
+      code?: unknown;
+      message?: unknown;
+      driverAdapterError?: { cause?: { originalCode?: unknown } };
+    };
     message?: unknown;
   };
-  if (candidate.code === STATEMENT_TIMEOUT_SQLSTATE) return true;
-  if (candidate.meta?.code === STATEMENT_TIMEOUT_SQLSTATE) return true;
+  const sqlStates = [
+    candidate.sqlState,
+    candidate.code,
+    candidate.meta?.code,
+    candidate.meta?.driverAdapterError?.cause?.originalCode,
+  ];
+  if (sqlStates.includes(STATEMENT_TIMEOUT_SQLSTATE)) return true;
   const messages = [candidate.message, candidate.meta?.message];
   return messages.some(
     (message) =>

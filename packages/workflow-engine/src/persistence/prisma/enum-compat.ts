@@ -1,11 +1,13 @@
 /**
  * Prisma Enum Compatibility Layer
  *
- * Provides compatibility between Prisma 6.x (string enums) and Prisma 7.x (typed enums).
- * Prisma 7.x introduced runtime enum validation, requiring actual enum values instead of strings.
+ * Resolves enum values from the Prisma client's $Enums property when a client
+ * exposes one, and falls back to the plain string otherwise.
  *
- * This utility resolves enum values from the Prisma client's $Enums property when available,
- * falling back to string values for older Prisma versions.
+ * Neither Prisma 6 nor 7 puts `$Enums` on a client instance (it is a
+ * module-level export of the generated client), so with those clients this
+ * always returns the string. Both majors accept the string, and the
+ * values are identical.
  *
  * @example
  * ```typescript
@@ -36,7 +38,7 @@ export interface PrismaEnumHelper {
 /**
  * Creates an enum helper that resolves enum values from the Prisma client.
  *
- * Supports both Prisma 6.x (returns string) and Prisma 7.x (returns typed enum).
+ * Returns the enum object's value when the client has `$Enums`, else the string.
  */
 export function createEnumHelper(
   prisma: PrismaClient,
@@ -45,7 +47,7 @@ export function createEnumHelper(
   const statusEnumName = options.statusEnumName ?? "Status";
   const resolveEnum = (enumName: string, value: string): unknown => {
     try {
-      // Prisma 7.x exposes enums via $Enums
+      // A client that exposes its enums via $Enums (Prisma 6 and 7 do not)
       const enumObj = prisma.$Enums?.[enumName];
       if (enumObj && value in enumObj) {
         return enumObj[value];
@@ -53,7 +55,7 @@ export function createEnumHelper(
     } catch {
       // Ignore - fall through to string
     }
-    // Fallback for Prisma 6.x or if enum not found
+    // The string, which is what Prisma 6 and 7 clients take
     return value;
   };
 

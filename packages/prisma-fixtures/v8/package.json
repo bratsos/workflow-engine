@@ -1,0 +1,24 @@
+{
+  "name": "workflow-engine-prisma-v8",
+  "version": "0.0.0",
+  "private": true,
+  "//": "Exact pair on purpose: @prisma/orm-postgres rc.22 and later crash `prisma contract emit` (CLI.UNEXPECTED), and rc.29 is the CLI release tested with rc.21.",
+  "type": "module",
+  "description": "Prisma 8 client and database provisioning for the Postgres suites, from workflow-engine/prisma/contract.prisma",
+  "main": "./index.cjs",
+  "scripts": {
+    "generate": "prisma contract emit",
+    "push": "node scripts/provision.mjs",
+    "schema-diff": "node scripts/schema-diff.mjs",
+    "check:consumer": "tsc -p consumer-check/tsconfig.json"
+  },
+  "dependencies": {
+    "@prisma/orm-postgres": "8.0.0-rc.21",
+    "prisma": "8.0.0-rc.29"
+  },
+  "devDependencies": {
+    "@bratsos/workflow-engine": "workspace:*",
+    "@bratsos/workflow-engine-console": "workspace:*",
+    "typescript": "^5.8.3"
+  }
+}

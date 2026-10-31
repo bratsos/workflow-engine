@@ -8,13 +8,12 @@
  * and friends are all UTC no matter where the database or its client
  * lives.
  *
- * A raw statement does not get that for free. Prisma binds a JS `Date`
- * parameter as a `timestamptz`, and Postgres converts a `timestamptz`
- * into a naive `timestamp` column — or compares the two — through the
- * *session's* `TimeZone` setting. On a session at `Europe/Zurich` every
- * timestamp written by a raw statement therefore landed two hours ahead
- * of everything Prisma wrote: `job_queue.lockedAt` was permanently in the
- * future, no lease ever looked stale, and a crashed worker's job was
+ * A raw statement does not get that for free. Postgres converts a
+ * `timestamptz` into a naive `timestamp` column — or compares the two —
+ * through the *session's* `TimeZone` setting. On a session at
+ * `Europe/Zurich` every timestamp written by a raw statement therefore
+ * landed two hours ahead of everything Prisma wrote: `job_queue.lockedAt`
+ * was permanently in the future, no lease ever looked stale, and a crashed worker's job was
  * never released — crash recovery silently did not work. `NOW()` is wrong
  * for exactly the same reason, one step earlier.
  *
@@ -23,12 +22,16 @@
  * model writes agree on any session timezone with nothing for the
  * consumer to configure.
  *
+ * A bound JS `Date` is not safe here: driver-level `Date` binding differs
+ * between Prisma majors (6 sends a `timestamptz`, 7 sends zone-less text that
+ * Postgres reads in the session timezone), so callers bind `date.toISOString()`.
+ *
  * Scope note (1.0.0-alpha.9): the *job lease* no longer binds a Date at
  * all. `PrismaJobQueue`'s claim, heartbeat and stale sweep all read
  * `now() AT TIME ZONE 'UTC'` instead, so the lease has exactly one clock —
  * the database's — and a host with a drifting system clock cannot shorten
  * or extend it. What follows still applies to every other raw statement
- * (`claimNextPendingRun`, the outbox publish sweep), which do bind Dates.
+ * (`claimNextPendingRun`, the outbox publish sweep), which do bind timestamps.
  *
  * Scope: only the raw statements need this. Every other timestamp the
  * engine writes or compares — `leaseExpiresAt`, `deadlineAt`,
@@ -47,8 +50,9 @@
  */
 
 /**
- * SQL for a positional parameter carrying a JS `Date`, converted to the
- * naive UTC value the Prisma model API writes.
+ * SQL for a positional parameter carrying an ISO-8601 timestamp string
+ * (`date.toISOString()`), converted to the naive UTC value the Prisma model
+ * API writes.
  *
  * @param position 1-based parameter index, as `$queryRawUnsafe` numbers them.
  */

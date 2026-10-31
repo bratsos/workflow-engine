@@ -31,7 +31,7 @@ The **kernel** is a pure command dispatcher. All workflow operations are express
 
 - User wants to create workflow stages or pipelines
 - User mentions `defineStage`, `defineWorkflow`, `WorkflowBuilder`, `ctx.step`
-- User is implementing workflow persistence with Prisma
+- User is implementing workflow persistence with Prisma (6, 7 or 8: check the project's Prisma major first, see "Persistence Setup")
 - User needs AI integration (generateText, generateObject, embeddings, batch)
 - User is building multi-stage data processing pipelines
 - User mentions kernel, command dispatch, or job execution
@@ -78,7 +78,7 @@ const workflow = defineWorkflow({
   .pipe(processStage)
   .build();
 
-// 3. Create kernel
+// 3. Create kernel (`prisma` is the project's Prisma 6 or 7 client, or `fromPrisma8(db)` on Prisma 8)
 const kernel = createKernel({
   persistence: createPrismaWorkflowPersistence(prisma),
   blobStore: myBlobStore,
@@ -527,9 +527,21 @@ const handle = await batch.submit([{ id: "1", prompt: "Summarize..." }]);
 
 ## Persistence Setup
 
+### Pick the path for the project's Prisma major
+
+Read the project's `package.json` before writing persistence code, then follow [05-persistence-setup.md](references/05-persistence-setup.md) for the matching row:
+
+| The project has | Do this |
+|---|---|
+| `@prisma/client` 7 (default for new projects) | Copy the models from the package's `prisma/schema.prisma`; URL in `prisma.config.ts`; `new PrismaClient({ adapter: new PrismaPg(...) })`; `prisma migrate dev` + `prisma generate`. |
+| `@prisma/client` 6 | Same schema, with `url = env("DATABASE_URL")` in the datasource; `new PrismaClient()`. Prisma 6 gets only security patches until 2026-11-19: for a new project, use 7. |
+| `@prisma/orm-postgres` + `prisma` 8 (no `@prisma/client`) | The project needs `"type": "module"`, `skipLibCheck: true` and `psql`. Copy `node_modules/@bratsos/workflow-engine/prisma/contract.prisma` to `prisma/contract.prisma` (keep `TimestampString(3)` timestamps and the native `Status` enum), `prisma contract emit`, `prisma db init`, apply the indexes with `psql "$DATABASE_URL" -f node_modules/@bratsos/workflow-engine/prisma/mixed-order-indexes.sql`, then `fromPrisma8(db)` for every factory and `fromPrisma8(tx, { contract: db.contract })` inside your own transaction. Release candidate: install exactly `prisma@8.0.0-rc.29` with `@prisma/orm-postgres@8.0.0-rc.21`. PostgreSQL only; Node 22.18+/24.11+/26+, TypeScript 5.9+, PostgreSQL 15+. |
+
+SQLite is Prisma 6 and 7 only. `workflow-console --database-url` is Prisma 6 and 7 only; on 8 use `--config` with a module that builds the reader with `createPrismaConsoleReadPort(fromPrisma8(db))`. `npx prisma` with no local `prisma` runs Prisma 8, so in a 6 or 7 project confirm `prisma` is installed locally first. Prisma 8 has no `generate`, `migrate dev` or `db push`. An existing Prisma 6 or 7 database moves to 8 with `prisma db sign` (the tables do not change).
+
 ### Required Prisma Models (ALL are required)
 
-Copy the complete schema from the package's `prisma/schema.prisma` (also in the [package README](../../README.md#1-database-setup)). This includes:
+Copy the complete schema from the package's `prisma/schema.prisma` (Prisma 6 and 7) or `prisma/contract.prisma` (Prisma 8); the schema is also in the [package README](../../README.md#1-database-setup). This includes:
 WorkflowRun, WorkflowDefinition, WorkflowStage, WorkflowStep, WorkflowLog, WorkflowArtifact, AICall, WorkflowAnnotation, JobQueue, OutboxEvent, IdempotencyKey. `WorkflowBlob` is optional (only for `createPrismaBlobStore`). `sql/enqueue.sql` (the `workflow_engine_enqueue` function) is optional and applied by your own migration.
 
 ### Create Persistence
@@ -541,12 +553,13 @@ import {
   createPrismaAICallLogger,
 } from "@bratsos/workflow-engine/persistence/prisma";
 
+// `prisma`: the project's Prisma 6 or 7 client, or `fromPrisma8(db)` on Prisma 8
 const persistence = createPrismaWorkflowPersistence(prisma);
 const jobQueue = createPrismaJobQueue(prisma);
 const aiCallLogger = createPrismaAICallLogger(prisma);
 const stepLedger = createPrismaStepLedger(prisma); // durable steps (workflow_steps)
 
-// SQLite - MUST pass databaseType option
+// SQLite (Prisma 6 and 7 only) - MUST pass databaseType option
 const persistence = createPrismaWorkflowPersistence(prisma, { databaseType: "sqlite" });
 const jobQueue = createPrismaJobQueue(prisma, { databaseType: "sqlite" });
 ```

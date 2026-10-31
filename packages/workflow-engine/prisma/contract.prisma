@@ -1,0 +1,341 @@
+// use prisma-8
+// Reference Prisma 8 contract for the engine's tables.
+//
+// Shipped in the package ("prisma/" is in the "files" field) so a Prisma 8
+// consumer can copy the models into their own contract or diff theirs against
+// it. It describes the same tables as schema.prisma, which stays the source of
+// truth for Prisma 6 and 7; keep the two in step when a model changes.
+// ../../prisma-fixtures/v8 provisions a database from this file, and a test
+// fails when the models or columns of the two files disagree.
+//
+// Choices that keep a database provisioned from it interchangeable with one
+// pushed from schema.prisma, because the engine's raw SQL depends on them:
+// - Timestamps are naive `timestamp(3)` columns, read and written as ISO text
+//   (`TimestampString(3)`), never as JavaScript `Date`.
+// - `Status` is a native Postgres enum named "Status": the raw SQL casts to
+//   `::"Status"`.
+// - Index names are pinned with `map:` to the names Prisma 6 and 7 generate, so
+//   adopting a database from either needs no renames. Primary and foreign key
+//   names are left to the defaults, which are the same.
+// - `updatedAt` has no database default: the client fills it, as it did on 6
+//   and 7. `createdAt` keeps its `now()` default for the raw inserts.
+//
+// A contract cannot give an index column a sort direction, so the five indexes
+// that need one (marked below) are declared ascending here, and
+// mixed-order-indexes.sql gives them their direction. `db verify` and
+// `migration plan` read an index by its columns, so they accept both.
+
+native_enum Status {
+  PENDING   = "PENDING"
+  RUNNING   = "RUNNING"
+  SUSPENDED = "SUSPENDED"
+  COMPLETED = "COMPLETED"
+  FAILED    = "FAILED"
+  CANCELLED = "CANCELLED"
+  SKIPPED   = "SKIPPED"
+}
+
+model WorkflowRun {
+  id           String             @id @onCreate(cuid(2))
+  createdAt    TimestampString(3) @default(now()) @onCreate(now())
+  updatedAt    TimestampString(3) @onCreate(now()) @onUpdate(now())
+  version      Int                @default(1)
+  workflowId   String
+  workflowName String
+  workflowType String
+  status       pg.enum(Status)    @default("PENDING")
+  startedAt    TimestampString(3)?
+  completedAt  TimestampString(3)?
+  duration     Int?
+  input        Jsonb
+  output       Jsonb?
+  config       Jsonb              @default(json`{}`)
+  totalCost    Float              @default(0)
+  totalTokens  Int                @default(0)
+  priority     Int                @default(5)
+  metadata     Jsonb?
+
+  // The definition version this run is pinned to. NULL means the run was
+  // created before the consumer migrated to definition versioning: it is
+  // claimable and executable by any host, exactly as before. See
+  // `workflow_definitions` for the structure the version identifies.
+  definitionVersion String?
+  // How many times `run.redrive` has re-driven this run (Step Functions'
+  // redrive count). Never reset -- it counts the whole life of the run.
+  redriveCount      Int     @default(0)
+
+  stages      WorkflowStage[]
+  logs        WorkflowLog[]
+  artifacts   WorkflowArtifact[]
+  annotations WorkflowAnnotation[]
+
+  // List orderings: newest-first, optionally narrowed by status or workflow,
+  // paged on the keyset (createdAt, id). See schema.prisma for the reasoning.
+  // The next three are createdAt DESC, id DESC (mixed-order-indexes.sql).
+  @@index([createdAt, id], map: "workflow_runs_createdAt_id_idx")
+  @@index([status, createdAt, id], map: "workflow_runs_status_createdAt_id_idx")
+  @@index([workflowId, createdAt, id], map: "workflow_runs_workflowId_createdAt_id_idx")
+  // The claim: status = 'PENDING' ORDER BY priority DESC, "createdAt" ASC
+  // LIMIT 1 FOR UPDATE SKIP LOCKED. priority DESC (mixed-order-indexes.sql).
+  @@index([status, priority, createdAt], map: "workflow_runs_status_priority_createdAt_idx")
+  // Definition versioning. See schema.prisma.
+  @@index([definitionVersion], map: "workflow_runs_definitionVersion_idx")
+  @@index([status, workflowId, definitionVersion], map: "workflow_runs_status_workflowId_definitionVersion_idx")
+  @@map("workflow_runs")
+}
+
+// Content-addressed workflow definition snapshots. One row per distinct
+// (workflowId, version); every run pinned to that version references it.
+model WorkflowDefinition {
+  workflowId String
+  version    String
+  createdAt  TimestampString(3) @default(now()) @onCreate(now())
+  // The structure the version identifies: stage ids, execution groups,
+  // definition order, dependencies, modes and normalised JSON Schemas.
+  // See `core/definition-version.ts` for the exact shape.
+  snapshot   Jsonb
+  // Hash of `snapshot`. Equal to `version` for derived versions; for an
+  // explicit version it is what lets the engine reject re-registering the
+  // same version with a different structure.
+  structureHash String
+
+  @@id([workflowId, version])
+  @@map("workflow_definitions")
+}
+
+model WorkflowStage {
+  id             String             @id @onCreate(cuid(2))
+  createdAt      TimestampString(3) @default(now()) @onCreate(now())
+  updatedAt      TimestampString(3) @onCreate(now()) @onUpdate(now())
+  version        Int                @default(1)
+  workflowRunId  String
+  workflowRun    WorkflowRun        @relation(fields: [workflowRunId], references: [id], onDelete: Cascade, onUpdate: Cascade, index: "workflow_stages_workflowRunId_stageId_key")
+  stageId        String
+  stageName      String
+  stageNumber    Int
+  executionGroup Int
+  attempt        Int                @default(0)
+  status         pg.enum(Status)    @default("PENDING")
+  startedAt      TimestampString(3)?
+  completedAt    TimestampString(3)?
+  duration       Int?
+  inputData      Jsonb?
+  outputData     Jsonb?
+  config         Jsonb?
+  suspendedState Jsonb?
+  resumeData     Jsonb?
+  nextPollAt     TimestampString(3)?
+  pollInterval   Int?
+  maxWaitUntil   TimestampString(3)?
+  metrics        Jsonb?
+  embeddingInfo  Jsonb?
+  errorMessage   String?
+
+  logs        WorkflowLog[]
+  artifacts   WorkflowArtifact[]
+  annotations WorkflowAnnotation[]
+  steps       WorkflowStep[]
+
+  @@index([workflowRunId, stageId], map: "workflow_stages_workflowRunId_stageId_key", unique: true)
+  @@index([status], map: "workflow_stages_status_idx")
+  @@index([nextPollAt], map: "workflow_stages_nextPollAt_idx")
+  @@map("workflow_stages")
+}
+
+model WorkflowStep {
+  id            String             @id @onCreate(cuid(2))
+  stageRecordId String
+  stage         WorkflowStage      @relation(fields: [stageRecordId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  stepId        String
+  seq           Int
+  kind          String
+  status        String
+  attempt       Int                @default(1)
+  leaseExpiresAt TimestampString(3)?
+  deadlineAt    TimestampString(3)?
+  // Deterministic name for the external effect a `run` step body creates,
+  // written before the body runs so an orphaned provider-side effect can be
+  // found from the row after a crash.
+  externalKey   String?
+  result        Jsonb?
+  error         String?
+  waitState     Jsonb?
+  createdAt     TimestampString(3) @default(now()) @onCreate(now())
+  updatedAt     TimestampString(3) @onCreate(now()) @onUpdate(now())
+
+  @@index([stageRecordId, stepId], map: "workflow_steps_stageRecordId_stepId_key", unique: true)
+  @@index([stageRecordId], map: "workflow_steps_stageRecordId_idx")
+  @@map("workflow_steps")
+}
+
+model WorkflowLog {
+  id              String             @id @onCreate(cuid(2))
+  createdAt       TimestampString(3) @default(now()) @onCreate(now())
+  workflowRunId   String?
+  workflowRun     WorkflowRun?       @relation(fields: [workflowRunId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  workflowStageId String?
+  workflowStage   WorkflowStage?     @relation(fields: [workflowStageId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  level           String
+  message         String
+  metadata        Jsonb?
+
+  @@index([workflowRunId], map: "workflow_logs_workflowRunId_idx")
+  @@index([workflowStageId], map: "workflow_logs_workflowStageId_idx")
+  @@map("workflow_logs")
+}
+
+model WorkflowArtifact {
+  id              String             @id @onCreate(cuid(2))
+  createdAt       TimestampString(3) @default(now()) @onCreate(now())
+  updatedAt       TimestampString(3) @onCreate(now()) @onUpdate(now())
+  workflowRunId   String
+  workflowRun     WorkflowRun        @relation(fields: [workflowRunId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  workflowStageId String?
+  workflowStage   WorkflowStage?     @relation(fields: [workflowStageId], references: [id], onDelete: SetNull, onUpdate: Cascade, index: false)
+  key             String
+  type            String
+  data            Jsonb
+  size            Int
+  metadata        Jsonb?
+
+  @@index([workflowRunId, key], map: "workflow_artifacts_workflowRunId_key_key", unique: true)
+  @@index([workflowRunId], map: "workflow_artifacts_workflowRunId_idx")
+  @@map("workflow_artifacts")
+}
+
+model AICall {
+  id                String             @id @onCreate(cuid(2))
+  createdAt         TimestampString(3) @default(now()) @onCreate(now())
+  topic             String
+  callType          String
+  modelKey          String
+  modelId           String
+  prompt            String
+  response          String
+  inputTokens       Int
+  outputTokens      Int
+  cost              Float
+  estimatedCost     Float?
+  reportedCost      Float?
+  costSource        String?
+  servedBy          String?
+  cachedInputTokens Int?
+  reasoningTokens   Int?
+  batchId           String?
+  requestId         String?
+  metadata          Jsonb?
+
+  @@index([batchId, requestId], map: "ai_calls_batch_request_unique", unique: true)
+  @@index([batchId], map: "ai_calls_batchId_idx")
+  @@index([topic], map: "ai_calls_topic_idx")
+  @@map("ai_calls")
+}
+
+model WorkflowAnnotation {
+  id        String             @id @onCreate(cuid(2))
+  createdAt TimestampString(3) @default(now()) @onCreate(now())
+
+  workflowRunId String
+  workflowRun   WorkflowRun    @relation(fields: [workflowRunId], references: [id], onDelete: Cascade, onUpdate: Cascade, index: "workflow_annotations_workflowRunId_actorId_idx")
+
+  workflowStageRecordId String?
+  workflowStage         WorkflowStage? @relation(fields: [workflowStageRecordId], references: [id], onDelete: SetNull, onUpdate: Cascade, index: false)
+  attempt               Int            @default(0)
+
+  scope   String
+  scopeId String?
+
+  actorKind    String?
+  actorId      String?
+  actorVersion String?
+
+  key     String
+  value   Jsonb
+  payload Jsonb?
+
+  idempotencyKey String?
+
+  @@index([workflowRunId, key, idempotencyKey], map: "workflow_annotations_workflowRunId_key_idempotencyKey_key", unique: true)
+  @@index([workflowRunId, key], map: "workflow_annotations_workflowRunId_key_idx")
+  @@index([workflowRunId, createdAt], map: "workflow_annotations_workflowRunId_createdAt_idx")
+  @@index([workflowRunId, scope], map: "workflow_annotations_workflowRunId_scope_idx")
+  @@index([workflowRunId, actorId], map: "workflow_annotations_workflowRunId_actorId_idx")
+  @@map("workflow_annotations")
+}
+
+model JobQueue {
+  id            String             @id @onCreate(cuid(2))
+  createdAt     TimestampString(3) @default(now()) @onCreate(now())
+  updatedAt     TimestampString(3) @onCreate(now()) @onUpdate(now())
+  workflowRunId String
+  stageId       String
+  status        pg.enum(Status)    @default("PENDING")
+  priority      Int                @default(5)
+  attempt       Int                @default(0)
+  maxAttempts   Int                @default(3)
+  workerId      String?
+  lockedAt      TimestampString(3)?
+  startedAt     TimestampString(3)?
+  completedAt   TimestampString(3)?
+  nextPollAt    TimestampString(3)?
+  payload       Jsonb?
+  lastError     String?
+
+  // One job row per stage per run; every enqueue path is idempotent on this
+  // pair. See schema.prisma.
+  @@index([workflowRunId, stageId], map: "job_queue_workflowRunId_stageId_key", unique: true)
+  // The dequeue: status = 'PENDING' ORDER BY priority DESC, "createdAt" ASC
+  // LIMIT 1 FOR UPDATE SKIP LOCKED. priority DESC (mixed-order-indexes.sql).
+  @@index([status, priority, createdAt], map: "job_queue_status_priority_createdAt_idx")
+  // Queue health: the age of the oldest waiting job, MIN("createdAt") within
+  // a status.
+  @@index([status, createdAt], map: "job_queue_status_createdAt_idx")
+  @@index([nextPollAt], map: "job_queue_nextPollAt_idx")
+  @@map("job_queue")
+}
+
+model OutboxEvent {
+  id            String             @id @onCreate(cuid(2))
+  createdAt     TimestampString(3) @default(now()) @onCreate(now())
+  workflowRunId String
+  sequence      Int
+  eventType     String
+  payload       Jsonb
+  causationId   String
+  occurredAt    TimestampString(3)
+  publishedAt   TimestampString(3)?
+  retryCount    Int                @default(0)
+  dlqAt         TimestampString(3)?
+
+  @@index([workflowRunId, sequence], map: "outbox_events_workflowRunId_sequence_key", unique: true)
+  @@index([publishedAt], map: "outbox_events_publishedAt_idx")
+  // Dead letters are a subset of the unpublished rows. Prisma cannot express
+  // a partial index in schema.prisma; this contract could (`where:`), but the
+  // plain index keeps the two databases identical.
+  @@index([dlqAt], map: "outbox_events_dlqAt_idx")
+  @@map("outbox_events")
+}
+
+model IdempotencyKey {
+  id          String             @id @onCreate(cuid(2))
+  createdAt   TimestampString(3) @default(now()) @onCreate(now())
+  key         String
+  commandType String
+  result      Jsonb
+
+  @@index([key, commandType], map: "idempotency_keys_key_commandType_key", unique: true)
+  @@map("idempotency_keys")
+}
+
+// Optional: only when using createPrismaBlobStore. Stage outputs and replay
+// inputs are read from the blob store by every process that executes or
+// polls a run, so the store must be shared; this table makes Prisma that
+// shared store without object storage.
+model WorkflowBlob {
+  key       String             @id
+  data      Jsonb
+  createdAt TimestampString(3) @default(now()) @onCreate(now())
+  updatedAt TimestampString(3) @onCreate(now()) @onUpdate(now())
+
+  @@map("workflow_blobs")
+}

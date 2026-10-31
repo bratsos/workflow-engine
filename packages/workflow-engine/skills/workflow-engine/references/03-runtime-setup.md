@@ -26,8 +26,10 @@ import {
   createPrismaAICallLogger,
 } from "@bratsos/workflow-engine/persistence/prisma";
 import { PrismaClient } from "@prisma/client";
+import { PrismaPg } from "@prisma/adapter-pg";
 
-const prisma = new PrismaClient();
+// Prisma 7. Prisma 6: `new PrismaClient()`. Prisma 8: `const prisma = fromPrisma8(db)` (05-persistence-setup.md, "Prisma 8").
+const prisma = new PrismaClient({ adapter: new PrismaPg({ connectionString: process.env.DATABASE_URL }) });
 
 const kernel = createKernel({
   // Required: metadata storage (runs, stages, logs, outbox, idempotency)

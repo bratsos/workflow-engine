@@ -15,19 +15,20 @@
  *
  * Requires:
  *   - DATABASE_URL pointing at a Postgres database
+ *   - PRISMA_MAJOR (6, 7 or 8, default 7): the Prisma major under test
  *   - `pnpm --filter @bratsos/workflow-engine run prisma:generate`
  *   - `pnpm --filter @bratsos/workflow-engine run prisma:db-push`
  *
  * Skipped entirely without DATABASE_URL, so `pnpm test` stays green with
  * no database — the in-memory equivalents in `read-port.test.ts` always run.
  */
-import { createRequire } from "node:module";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
-import { ConsoleQueryTimeoutError } from "../errors";
+import { ConsoleQueryTimeoutError, isStatementTimeout } from "../errors";
 import {
   type ConsolePrismaClient,
   createPrismaConsoleReadPort,
 } from "../prisma-read-port";
+import { createPostgresClient } from "./postgres-client";
 
 const DATABASE_URL = process.env.DATABASE_URL;
 
@@ -37,13 +38,14 @@ if (!DATABASE_URL) {
   });
 } else {
   describe("I want the console read port to work against real Postgres", () => {
-    // Required lazily so `@prisma/client` -- which only exists once
-    // `prisma generate` has run -- is never resolved when this branch is
-    // not taken.
-    const require = createRequire(import.meta.url);
-    const { PrismaClient } = require("@prisma/client");
-    const prisma = new PrismaClient({ datasourceUrl: DATABASE_URL });
+    // Built lazily so the generated `@prisma/client` -- which only exists
+    // once `prisma:generate` has run -- is never resolved when this branch is
+    // not taken. The fixture for the Prisma major in PRISMA_MAJOR builds it.
+    const prisma = createPostgresClient(DATABASE_URL);
     const client = prisma as ConsolePrismaClient;
+    // A raw read that returns `columns`: on Prisma 8 it has to declare them.
+    const rawRead = (c: ConsolePrismaClient, columns = {}) =>
+      c.$withColumns?.(columns) ?? c;
 
     const T0 = new Date("2026-03-01T12:00:00.000Z");
     const at = (minutes: number) => new Date(T0.getTime() + minutes * 60_000);
@@ -488,13 +490,15 @@ if (!DATABASE_URL) {
       // slow -- pg_sleep is just the only reliable way to outrun a 1ms
       // budget.
       const sleepy: ConsolePrismaClient = {
-        $queryRawUnsafe: () => prisma.$queryRawUnsafe("SELECT pg_sleep(1)"),
+        $queryRawUnsafe: () =>
+          rawRead(prisma).$queryRawUnsafe("SELECT pg_sleep(1)"),
         $executeRawUnsafe: (sql: string, ...args: unknown[]) =>
           prisma.$executeRawUnsafe(sql, ...args),
         $transaction: (fn) =>
           prisma.$transaction((tx: ConsolePrismaClient) =>
             fn({
-              $queryRawUnsafe: () => tx.$queryRawUnsafe("SELECT pg_sleep(1)"),
+              $queryRawUnsafe: () =>
+                rawRead(tx).$queryRawUnsafe("SELECT pg_sleep(1)"),
               $executeRawUnsafe: (sql: string, ...args: unknown[]) =>
                 tx.$executeRawUnsafe?.(sql, ...args) ?? Promise.resolve(0),
             }),
@@ -519,11 +523,14 @@ if (!DATABASE_URL) {
           await tx.$executeRawUnsafe?.("SET LOCAL statement_timeout = 4321");
           const scoped = createPrismaConsoleReadPort({
             $queryRawUnsafe: tx.$queryRawUnsafe.bind(tx),
+            $withColumns: tx.$withColumns?.bind(tx),
           });
           const page = await scoped.listRuns({ limit: 3 });
-          const setting = await tx.$queryRawUnsafe<
-            Array<{ statement_timeout: string }>
-          >("SHOW statement_timeout");
+          const setting = await rawRead(tx, {
+            statement_timeout: "text",
+          }).$queryRawUnsafe<Array<{ statement_timeout: string }>>(
+            "SHOW statement_timeout",
+          );
           return [page.runs.length, setting[0]?.statement_timeout];
         },
       );
@@ -537,6 +544,29 @@ if (!DATABASE_URL) {
           statusEnumName: 'Status"; DROP TABLE "workflow_runs',
         }),
       ).toThrow(/statusEnumName/);
+    });
+
+    it("recognises a real cancelled statement by its SQLSTATE, whatever the message says", async () => {
+      const error: any = await prisma
+        .$transaction(async (tx: ConsolePrismaClient) => {
+          await tx.$executeRawUnsafe?.("SET LOCAL statement_timeout = 20");
+          await rawRead(tx).$queryRawUnsafe("SELECT pg_sleep(2)");
+        })
+        .then(
+          () => {
+            throw new Error("expected the statement to be cancelled");
+          },
+          (caught: unknown) => caught,
+        );
+      expect(isStatementTimeout(error)).toBe(true);
+      // The same driver error with every message removed: only the fields
+      // this Prisma major puts the SQLSTATE on are left.
+      const bare = Object.assign(new Error("failed"), {
+        code: error.code,
+        sqlState: error.sqlState,
+        meta: error.meta && { ...error.meta, message: undefined },
+      });
+      expect(isStatementTimeout(bare)).toBe(true);
     });
   });
 }

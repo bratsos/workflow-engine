@@ -38,6 +38,8 @@ If a version bump introduces a database schema change (like adding a table or mo
    npx prisma generate
    ```
 
+On Prisma 8 there is no `schema.prisma` or generated client: update `prisma/contract.prisma` from the package's `contract.prisma`, run `npx prisma contract emit`, then `npx prisma db update` (or `npx prisma migration plan` and `npx prisma db migrate --advance-ref db`). Renaming one of the five descending indexes, or dropping and recreating it, brings it back ascending, and `db verify --strict` does not notice, so re-run `psql "$DATABASE_URL" -f node_modules/@bratsos/workflow-engine/prisma/mixed-order-indexes.sql` afterwards. (A change to an index's columns under the same name fails planning with `MIGRATION.PLANNING_FAILED` instead.) See [Prisma 8](../persistence/prisma-setup.md#prisma-8).
+
 ---
 
 ## Available Migration Guides

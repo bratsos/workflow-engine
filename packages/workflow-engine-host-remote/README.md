@@ -15,8 +15,10 @@ A "heavy" stage (CPU-intensive transcoding, LLM inference, batch embedding, etc.
 ## Installation
 
 ```bash
-npm install @bratsos/workflow-engine-host-remote
+npm install @bratsos/workflow-engine-host-remote@alpha
 ```
+
+Name the `alpha` tag, next to `@bratsos/workflow-engine@alpha`: a bare install resolves `latest`, which is a 0.x host built for the 0.13 engine.
 
 ## Quickstart — in-process model (dev / tests)
 

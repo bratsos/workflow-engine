@@ -43,6 +43,13 @@ jobs:
       - name: Type check
         run: pnpm --filter '!workflow-engine-docs' -r typecheck
 
+      # Compiles a Prisma 8 consumer against the packages Build just produced:
+      # every port factory over `fromPrisma8(db)` and over a transaction's `tx`.
+      - name: Type check a Prisma 8 consumer
+        run: |
+          pnpm --filter workflow-engine-prisma-v8 run generate
+          pnpm --filter workflow-engine-prisma-v8 run check:consumer
+
       - name: Test
         run: pnpm test
         env:
@@ -50,6 +57,12 @@ jobs:
 
   postgres-conformance:
     runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        prisma-major: ["6", "7", "8"]
+        timezone: ["UTC", "Pacific/Kiritimati"]
 
     services:
       postgres:
@@ -68,6 +81,7 @@ jobs:
 
     env:
       DATABASE_URL: postgresql://postgres:postgres@localhost:5432/workflow_engine_test
+      PRISMA_MAJOR: ${{ matrix.prisma-major }}
 
     steps:
       - name: Checkout
@@ -83,15 +97,42 @@ jobs:
           cache: "pnpm"
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile --filter @bratsos/workflow-engine
+        run: >-
+          pnpm install --frozen-lockfile
+          --filter @bratsos/workflow-engine
+          --filter @bratsos/workflow-engine-console
+          --filter "./packages/prisma-fixtures/*"
 
+      - name: Set the database session timezone
+        run: psql "$DATABASE_URL" -c "ALTER DATABASE workflow_engine_test SET timezone TO '${{ matrix.timezone }}'"
+
+      # On Prisma 8 these two emit the contract and provision the database
+      # with `prisma migration plan` and `prisma db migrate`.
       - name: Generate Prisma client
         run: pnpm --filter @bratsos/workflow-engine run prisma:generate
 
       - name: Push Prisma schema to Postgres
         run: pnpm --filter @bratsos/workflow-engine run prisma:db-push
 
+      - name: Provision Prisma 7 as the reference and diff the Prisma 8 schema against it
+        if: matrix.prisma-major == '8'
+        run: |
+          psql "$DATABASE_URL" -c 'CREATE DATABASE workflow_engine_reference'
+          PRISMA_MAJOR=7 DATABASE_URL=postgresql://postgres:postgres@localhost:5432/workflow_engine_reference \
+            pnpm --filter @bratsos/workflow-engine run prisma:db-push
+          node packages/prisma-fixtures/v8/scripts/schema-diff.mjs \
+            postgresql://postgres:postgres@localhost:5432/workflow_engine_reference "$DATABASE_URL"
+
       - name: Run Postgres conformance tests
         run: pnpm --filter @bratsos/workflow-engine run test:pg
+        env:
+          NODE_ENV: test
+
+      # cli.test.ts imports the built UI bundle, which the package's own `test`
+      # script builds first.
+      - name: Run console Postgres tests
+        run: |
+          pnpm --filter @bratsos/workflow-engine-console exec node scripts/build-ui.mjs
+          pnpm --filter @bratsos/workflow-engine-console exec vitest run src/__tests__/prisma-read-port.postgres.test.ts src/__tests__/cli.test.ts
         env:
           NODE_ENV: test

@@ -5,8 +5,10 @@ Platform-agnostic serverless host for the [`@bratsos/workflow-engine`](../workfl
 ## Installation
 
 ```bash
-npm install @bratsos/workflow-engine-host-serverless
+npm install @bratsos/workflow-engine-host-serverless@alpha
 ```
+
+Name the `alpha` tag, next to `@bratsos/workflow-engine@alpha`: a bare install resolves `latest`, which is a 0.x host built for the 0.13 engine.
 
 ## Quick Start
 

@@ -16,8 +16,10 @@
  * string of our own would quietly discard that property, so it is not the
  * default: it requires an explicit acknowledgement.
  */
+import { realpathSync } from "node:fs";
 import { createServer } from "node:http";
-import { pathToFileURL } from "node:url";
+import { resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import type { ConsoleKernel } from "./actions";
 import { createWorkflowConsole } from "./handler";
 import { toNodeHandler } from "./node";
@@ -66,8 +68,8 @@ Options
                              or a function returning one. This is the path that
                              preserves row-level security, because your code
                              constructs the client.
-  --database-url <url>       Connect directly with Prisma instead. Requires
-                             --allow-direct-connection.
+  --database-url <url>       Connect directly with Prisma 6 or 7 instead. Requires
+                             --allow-direct-connection. (Prisma 8: use --config.)
   --allow-direct-connection  Acknowledge that a direct connection is a second
                              session and therefore a second security context:
                              row-level security scoped to your application's
@@ -180,11 +182,40 @@ async function loadConfigModule(path: string): Promise<ConsoleDevConfig> {
 }
 
 /**
+ * The Prisma 7 driver adapter for Postgres. Prisma 7 refuses a bare connection
+ * string and needs one of these, so it is loaded only on 7. When it is not
+ * installed the error names the package to add.
+ */
+async function createPgAdapter(databaseUrl: string): Promise<unknown> {
+  const adapterSpecifier = "@prisma/adapter-pg";
+  const adapterModule: Record<string, unknown> = await import(
+    adapterSpecifier
+  ).catch(() => {
+    throw new Error(
+      "--database-url on Prisma 7 needs @prisma/adapter-pg installed in this project (npm install @prisma/adapter-pg).",
+    );
+  });
+  const PrismaPg = adapterModule.PrismaPg as
+    | (new (config: {
+        connectionString: string;
+      }) => unknown)
+    | undefined;
+  if (!PrismaPg) {
+    throw new Error("@prisma/adapter-pg did not export PrismaPg.");
+  }
+  return new PrismaPg({ connectionString: databaseUrl });
+}
+
+/**
  * The escape hatch: our own Prisma client from a connection string.
  *
  * Deliberately behind an explicit flag. `@prisma/client` is imported
  * dynamically so the package does not depend on it for the mounted path,
  * which is the path that matters.
+ *
+ * The constructor differs by major: Prisma 6 takes the URL as `datasources`,
+ * Prisma 7 takes a driver adapter and rejects `datasources`. The major comes
+ * from the imported module (`Prisma.prismaVersion.client`).
  */
 async function connectDirectly(databaseUrl: string): Promise<ConsoleDevConfig> {
   const { createPrismaConsoleReadPort } = await import("./prisma-read-port");
@@ -196,7 +227,7 @@ async function connectDirectly(databaseUrl: string): Promise<ConsoleDevConfig> {
     prismaSpecifier
   ).catch(() => {
     throw new Error(
-      "--database-url needs @prisma/client installed in this project.",
+      "--database-url needs @prisma/client installed in this project. Prisma 8 has no @prisma/client and needs a contract, so use --config with a console.config.mjs that builds the reader with createPrismaConsoleReadPort(fromPrisma8(db)).",
     );
   });
   const PrismaClient = prismaModule.PrismaClient as
@@ -209,9 +240,14 @@ async function connectDirectly(databaseUrl: string): Promise<ConsoleDevConfig> {
   if (!PrismaClient) {
     throw new Error("@prisma/client did not export PrismaClient.");
   }
-  const client = new PrismaClient({
-    datasources: { db: { url: databaseUrl } },
-  });
+  const version = (
+    prismaModule.Prisma as { prismaVersion?: { client?: string } } | undefined
+  )?.prismaVersion?.client;
+  const client = new PrismaClient(
+    Number.parseInt(version ?? "", 10) >= 7
+      ? { adapter: await createPgAdapter(databaseUrl) }
+      : { datasources: { db: { url: databaseUrl } } },
+  );
   return {
     reader: createPrismaConsoleReadPort(
       client as unknown as Parameters<typeof createPrismaConsoleReadPort>[0],
@@ -308,11 +344,25 @@ export async function main(argv: string[]): Promise<number> {
   }
 }
 
+function toRealPath(path: string): string {
+  const resolved = resolve(path);
+  try {
+    return realpathSync(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
+// npm installs the bin as a symlink in node_modules/.bin, so compare real paths.
+export function isInvokedAsBin(metaUrl: string): boolean {
+  const invokedFile = process.argv[1] ? toRealPath(process.argv[1]) : undefined;
+  return Boolean(
+    invokedFile && invokedFile === toRealPath(fileURLToPath(metaUrl)),
+  );
+}
+
 // Only run when invoked as a program, so the exported pieces stay testable.
-if (
-  process.argv[1] &&
-  import.meta.url === pathToFileURL(process.argv[1]).href
-) {
+if (isInvokedAsBin(import.meta.url)) {
   const code = await main(process.argv.slice(2));
   if (code !== 0) process.exit(code);
 }

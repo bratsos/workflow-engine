@@ -266,6 +266,8 @@ npx prisma migrate dev --name workflow-engine-definition-versioning
 npx prisma generate
 ```
 
+(On Prisma 8, add the `WorkflowDefinition` model and the two `WorkflowRun` fields from the package's `contract.prisma` instead, then `npx prisma contract emit` and `npx prisma db update`.)
+
 The equivalent SQL, if you manage migrations by hand:
 
 ```sql

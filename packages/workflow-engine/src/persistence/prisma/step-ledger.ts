@@ -4,18 +4,13 @@ import type {
   StepRecordExpectation,
   StepRecordPatch,
 } from "../../kernel/ports.js";
-import type { EnginePrismaClient } from "./prisma-client-type.js";
+import {
+  type EnginePrismaClient,
+  rejectSqliteOn8,
+} from "./prisma-client-type.js";
+import { isUniqueViolation } from "./sql-errors.js";
 
 type PrismaClient = EnginePrismaClient;
-
-function isUniqueViolation(error: unknown): boolean {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    "code" in error &&
-    (error as { code?: unknown }).code === "P2002"
-  );
-}
 
 function mapStep(record: any): StepRecord {
   return {
@@ -92,6 +87,7 @@ export class PrismaStepLedger implements StepLedger {
     options: PrismaStepLedgerOptions = {},
   ) {
     this.databaseType = options.databaseType ?? "postgresql";
+    rejectSqliteOn8(prisma, this.databaseType);
   }
 
   async claim(

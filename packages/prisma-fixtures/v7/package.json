@@ -1,0 +1,17 @@
+{
+  "name": "workflow-engine-prisma-v7",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Prisma 7 client for the Postgres and SQLite suites, generated from workflow-engine/prisma/schema.prisma",
+  "main": "./index.cjs",
+  "scripts": {
+    "generate": "node ../schema.cjs postgres && prisma generate --schema .generated/postgres.prisma",
+    "push": "node ../schema.cjs postgres && prisma db push --schema .generated/postgres.prisma"
+  },
+  "dependencies": {
+    "@prisma/adapter-better-sqlite3": "7.10.1",
+    "@prisma/adapter-pg": "7.10.1",
+    "@prisma/client": "7.10.1",
+    "prisma": "7.10.1"
+  }
+}

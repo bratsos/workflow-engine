@@ -26,7 +26,7 @@ Common issues, how the engine handles them, and how to debug.
 
 ## `PrismaClient is not assignable to EnginePrismaClient`
 
-A wall of these at `createPrismaWorkflowPersistence` / `createPrismaJobQueue` / `createPrismaStepLedger` means one of the delegates the adapters require is missing from your generated client: `workflowRun`, `workflowStage`, `workflowStep`, `workflowLog`, `workflowArtifact`, `workflowAnnotation`, `outboxEvent`, `idempotencyKey`, `jobQueue`, `aICall`. After an upgrade to 1.0 it is almost always `WorkflowStep`. Add the model from `prisma/schema.prisma`, run `prisma generate`, and the error goes away. See [05-persistence-setup.md](05-persistence-setup.md).
+A wall of these at `createPrismaWorkflowPersistence` / `createPrismaJobQueue` / `createPrismaStepLedger` means one of the delegates the adapters require is missing from your generated client: `workflowRun`, `workflowStage`, `workflowStep`, `workflowLog`, `workflowArtifact`, `workflowAnnotation`, `outboxEvent`, `idempotencyKey`, `jobQueue`, `aICall`. After an upgrade to 1.0 it is almost always `WorkflowStep`. Add the model from `prisma/schema.prisma`, run `prisma generate`, and the error goes away. On Prisma 8 there is no generated client to be incomplete: `fromPrisma8(db)` throws `the contract has no model for the engine table "..."` instead, naming the table to copy from `prisma/contract.prisma`; it also throws when a timestamp column is not `TimestampString(3)` or `status` is not the native `Status` enum. See [05-persistence-setup.md](05-persistence-setup.md).
 
 ## Runs Stuck in RUNNING
 
@@ -71,7 +71,7 @@ await kernel.dispatch({ type: "run.transition", workflowRunId: runId });
 
 ## P2028 Transaction Timeout on Suspended Stage Polling
 
-**Symptom:** Logs show `P2028: Transaction API error: A query cannot be executed on an expired transaction` during `stage.pollSuspended`. Suspended stages never transition to `COMPLETED` even when the batch provider reports completion.
+**Symptom:** Logs show `P2028` during `stage.pollSuspended`, with a message that contains `A query cannot be executed on an expired transaction` (Prisma 6 and 7: a `PrismaClientKnownRequestError` with `meta`; Prisma 6 puts `Transaction already closed:` in front of that text). On Prisma 8 the code is the same but the error is a plain `Error` with no `meta`, raised by `fromPrisma8`, and the message is `Transaction already closed: the 1000ms timeout passed.` (with your timeout), so search the logs for the code, not the text. Suspended stages never transition to `COMPLETED` even when the batch provider reports completion.
 
 **What it was:** `checkCompletion()` was running inside the kernel's global Prisma interactive transaction. Batch provider API calls (Google Batch, OpenAI Batch, etc.) that took longer than the default 5s timeout would expire the transaction, and the subsequent `updateStage()` call would fail.
 
@@ -84,7 +84,7 @@ await kernel.dispatch({ type: "run.transition", workflowRunId: runId });
 **What it was:** If the kernel transaction rolled back after `jobTransport.enqueueParallel` committed (separate transaction), ghost jobs would exist in the queue pointing to runs/stages that were rolled back.
 
 **How it's fixed (three layers):**
-1. **Authoritative cancellation:** `run.cancel` cancels all queued/suspended jobs via `jobTransport.cancelByRun()`, preventing most ghost jobs before dequeue.
+1. **Authoritative cancellation:** `run.cancel` marks the run and its open stages `CANCELLED`, then, after that commits, cancels all queued/suspended jobs via `jobTransport.cancelByRun()`, preventing most ghost jobs before dequeue. A worker that dequeues one of the jobs between the commit and the purge finds the run `CANCELLED` and discards the job as an orphan (it ends `FAILED`, not `CANCELLED`).
 2. **Kernel guard:** `job.execute` checks `workflowRun.status === "RUNNING"` both before AND after stage execution. A job whose run is not RUNNING comes back with `outcome: "failed"` and a typed `ghost: true` flag, plus `ghostReason` saying which kind it is.
 3. **Host handling by reason:** both hosts read `ghostReason` (never the message text). `"orphan"` -- the run is `CANCELLED`/`COMPLETED`/`FAILED` -- is failed terminally, since a retry can only fail again. `"race"` -- the run is still `PENDING` -- is re-delivered while the job's attempt budget lasts; see below.
 

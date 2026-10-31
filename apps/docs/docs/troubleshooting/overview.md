@@ -54,7 +54,7 @@ This guide covers common issues encountered when running **workflow-engine**, ho
 * **Cause**:
   * If a workflow is cancelled, active jobs might still reside in the worker's queue.
 * **Self-Healing**:
-  * **Authoritative Cancellation**: Calling `run.cancel` automatically purges queued jobs from the queue via `jobTransport.cancelByRun()`, and the job executing at that moment is told to stop through `ctx.abortSignal` on its next lease heartbeat.
+  * **Authoritative Cancellation**: Calling `run.cancel` marks the run and its open stages cancelled, and once that commits it purges the run's queued jobs from the queue via `jobTransport.cancelByRun()`. The job executing at that moment is told to stop through `ctx.abortSignal` on its next lease heartbeat.
   * **Ghost Job Guard**: `job.execute` verifies that the run is in `RUNNING` status both before and after executing a stage.
   * **Reason-specific handling**: If the run is not something this worker should execute, the result is discarded and returned with `ghost: true` and a `ghostReason`. `"orphan"` (run cancelled or finished) is failed terminally without a retry; `"race"` (the run is still `PENDING` because the claim that enqueued the job had not committed) is re-delivered; `"version"` (the run is pinned to a definition version this build does not serve) is deferred without spending an attempt. See [Execution Model](../core-concepts/execution-model.md#ghost-job-guard).
 
@@ -95,13 +95,14 @@ This guide covers common issues encountered when running **workflow-engine**, ho
   * Making external API calls to batch providers (like OpenAI or Google) inside a database transaction exceeds Prisma's interactive transaction timeout (5 seconds by default).
 * **Self-Healing**:
   * `stage.pollSuspended` replays the stage body (and runs `checkCompletion()`) outside database transactions. State updates are committed in a subsequent short transaction, resolving P2028 database timeouts.
+* **What it looks like**: the code is `P2028` on Prisma 6, 7 and 8, but the error differs. On Prisma 6 and 7 it is a `PrismaClientKnownRequestError` with `meta`, and the message contains `A query cannot be executed on an expired transaction` (Prisma 6 puts `Transaction already closed:` in front of it). On Prisma 8 it is a plain `Error` with no `meta`, raised by `fromPrisma8`, and the message is `Transaction already closed: the 1000ms timeout passed.` (with your timeout). A log search for the Prisma 6 and 7 text finds nothing on Prisma 8, so search for the code.
 
 ---
 
 ### 9. `PrismaClient is not assignable to EnginePrismaClient`
 * **Symptom**: A wall of type errors when passing your Prisma client to `createPrismaWorkflowPersistence`, `createPrismaStepLedger` or `createPrismaJobQueue`.
 * **Cause**: The generated client is missing a delegate the adapter calls — after 1.0, almost always `workflowStep` (the `WorkflowStep` model) or `workflowDefinition`.
-* **Fix**: Add the missing models from [Prisma Setup](../persistence/prisma-setup.md) and re-run `prisma generate`.
+* **Fix**: Add the missing models from [Prisma Setup](../persistence/prisma-setup.md) and re-run `prisma generate`. On Prisma 8 there is no generated client to be incomplete; `fromPrisma8(db)` throws `the contract has no model for the engine table "..."` instead, naming the table to copy from `contract.prisma`. It also throws when a timestamp column is not `TimestampString(3)` or `status` is not the native `Status` enum, each with the fix in the message.
 
 ---
 

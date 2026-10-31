@@ -16,7 +16,21 @@ For that reason, `@bratsos/workflow-engine-console` never opens a database conne
 pnpm add @bratsos/workflow-engine-console
 ```
 
-`@bratsos/workflow-engine-console` declares `@bratsos/workflow-engine` as a peer dependency and is released in lockstep with it.
+`@bratsos/workflow-engine-console` declares `@bratsos/workflow-engine` as a peer dependency and is released in lockstep with it. Install it without `@alpha`: its `latest` tag is the current 1.0 alpha, and its `alpha` tag is an old version that does not install. Its version must match the engine's alpha exactly (`@bratsos/workflow-engine@alpha` does).
+
+## Prisma 6, 7 and 8
+
+The read port takes the Prisma client your application already has, on any of the three majors. The examples below use a Prisma 6 or 7 `prisma` client. A Prisma 8 client has no model delegates, so wrap it with `fromPrisma8` from the engine package and pass the result to `createPrismaConsoleReadPort`:
+
+```typescript
+import { createPrismaConsoleReadPort } from "@bratsos/workflow-engine-console";
+import { fromPrisma8 } from "@bratsos/workflow-engine/persistence/prisma";
+import { db } from "./db"; // postgres({ contract, url }) from @prisma/orm-postgres/runtime
+
+const reader = createPrismaConsoleReadPort(fromPrisma8(db));
+```
+
+Inside your own transaction use `fromPrisma8(tx, { contract: db.contract })` for a `tx` from `db.transaction(...)`. Prisma 8 is a release candidate, tested against exactly `prisma@8.0.0-rc.29` with `@prisma/orm-postgres@8.0.0-rc.21`, and is PostgreSQL-only; the engine's [Prisma Setup](https://github.com/bratsos/workflow-engine/blob/main/apps/docs/docs/persistence/prisma-setup.md#prisma-8) has the contract and database steps. The CLI's `--database-url` works on Prisma 6 and 7 only; on Prisma 8 use `--config` ([below](#the-local-dev-command)).
 
 ## Quick start — Next.js App Router
 
@@ -156,6 +170,8 @@ export async function GET(request: Request): Promise<Response> {
 export const POST = GET;
 ```
 
+On Prisma 8 the same shape is `db.transaction(async (tx) => { const reader = createPrismaConsoleReadPort(fromPrisma8(tx, { contract: db.contract })); ... })`.
+
 When `createPrismaConsoleReadPort` is passed a transaction client (a client instance where `$transaction` is absent), it deliberately does not issue `SET LOCAL statement_timeout`. The reader must not reconfigure the timeout budget of a transaction it did not open. In that scenario, timeout enforcement belongs to the caller who opened the transaction. When handed a root Prisma client, the reader manages its own bounded transaction per request.
 
 ## Authorisation
@@ -255,10 +271,11 @@ The configuration module must export a `ConsoleDevConfig` object (or a function 
 ```javascript
 // console.config.mjs
 import { PrismaClient } from "@prisma/client";
+import { PrismaPg } from "@prisma/adapter-pg";
 import { createPrismaConsoleReadPort } from "@bratsos/workflow-engine-console";
 import { createKernel } from "@bratsos/workflow-engine/kernel";
 
-const prisma = new PrismaClient();
+const prisma = new PrismaClient({ adapter: new PrismaPg({ connectionString: process.env.DATABASE_URL }) });
 const kernel = createKernel({ /* ... */ });
 
 export default {
@@ -270,9 +287,32 @@ export default {
 };
 ```
 
+On Prisma 8, the config module builds the reader with `fromPrisma8` (there is no `@prisma/client` to construct):
+
+```javascript
+// console.config.mjs
+import postgres from "@prisma/orm-postgres/runtime";
+import { contractFromJson } from "@prisma/orm-postgres/static";
+import { createPrismaConsoleReadPort } from "@bratsos/workflow-engine-console";
+import { fromPrisma8 } from "@bratsos/workflow-engine/persistence/prisma";
+import contractJson from "./prisma/contract.json" with { type: "json" };
+
+const db = postgres({
+  contract: contractFromJson(contractJson),
+  url: process.env.DATABASE_URL,
+});
+
+export default {
+  reader: createPrismaConsoleReadPort(fromPrisma8(db)),
+  dispose: () => db.close(),
+};
+```
+
+If you wrap `fromPrisma8(db)` in an object of your own, forward its `$withColumns` too: Prisma 8 drops the columns a raw read does not declare, and the reader declares them through that member.
+
 ### Direct connection escape hatch
 
-For rapid local inspection without writing a config file, `--database-url` can be paired with `--allow-direct-connection`:
+For rapid local inspection without writing a config file, `--database-url` can be paired with `--allow-direct-connection`. It needs `@prisma/client`, so it works on **Prisma 6 and 7 only** (on 7 also `@prisma/adapter-pg`); on Prisma 8 use `--config`:
 
 ```bash
 npx workflow-console --database-url postgres://postgres:postgres@localhost:5432/mydb --allow-direct-connection
@@ -285,7 +325,7 @@ The `--allow-direct-connection` flag requires explicit acknowledgement that conn
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `--config <path>` | string | — | Path to module exporting `{ reader, kernel?, dispose? }` |
-| `--database-url <url>` | string | `DATABASE_URL` | Direct PostgreSQL connection string (requires `--allow-direct-connection`) |
+| `--database-url <url>` | string | `DATABASE_URL` | Direct PostgreSQL connection string (requires `--allow-direct-connection`; Prisma 6 and 7 only) |
 | `--allow-direct-connection` | boolean | `false` | Acknowledge that direct connections bypass session-scoped row-level security |
 | `--port <n>` | number | `7799` | Port to bind (1–65535) |
 | `--host <addr>` | string | `127.0.0.1` | Loopback address to bind (`127.0.0.1`, `localhost`, `::1`) |
@@ -314,7 +354,7 @@ To maintain performant queries against operational tables without degraded index
 - `job_queue(status, createdAt)`
 - `outbox_events(dlqAt)`
 
-When upgrading existing deployments, apply these database migrations before enabling the console to avoid sequential scans over high-volume tables.
+When upgrading existing deployments, apply these database migrations before enabling the console to avoid sequential scans over high-volume tables. On Prisma 8 the three `DESC` indexes come from the engine's `mixed-order-indexes.sql`, not from the contract; see Prisma Setup.
 
 ### Keyset pagination
 

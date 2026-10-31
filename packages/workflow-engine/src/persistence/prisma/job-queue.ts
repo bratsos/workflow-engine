@@ -23,7 +23,12 @@ import {
 } from "../interface";
 import { createEnumHelper, type PrismaEnumHelper } from "./enum-compat";
 import type { DatabaseType } from "./persistence";
-import type { EnginePrismaClient } from "./prisma-client-type";
+import {
+  type EnginePrismaClient,
+  type RawColumns,
+  rawFor,
+  rejectSqliteOn8,
+} from "./prisma-client-type";
 
 const logger = createLogger("JobQueue");
 
@@ -56,6 +61,18 @@ type DequeuedJobRow = {
   maxAttempts: number;
   payload: unknown;
   startedAt: Date;
+};
+
+/** The columns of `DequeuedJobRow`, for clients that need raw reads declared. */
+const DEQUEUED_JOB_COLUMNS: RawColumns = {
+  id: "text",
+  workflowRunId: "text",
+  stageId: "text",
+  priority: "int",
+  attempt: "int",
+  maxAttempts: "int",
+  payload: "json",
+  startedAt: "timestamp",
 };
 
 /**
@@ -140,6 +157,7 @@ export class PrismaJobQueue implements JobQueue {
     this.workerId = options.workerId || `worker-${process.pid}-${Date.now()}`;
     this.enums = createEnumHelper(prisma);
     this.databaseType = options.databaseType ?? "postgresql";
+    rejectSqliteOn8(prisma, this.databaseType);
     this.now = options.now ?? (() => new Date());
     this.fairnessGroupBy = options.fairness
       ? (options.fairness.groupBy ?? "_groupKey")
@@ -412,7 +430,9 @@ export class PrismaJobQueue implements JobQueue {
       //   default statement stops at the first index entry. That is why
       //   fairness is opt-in; the measured difference is in the release notes.
       const result = this.fairnessPath
-        ? await this.prisma.$queryRaw<DequeuedJobRow[]>`
+        ? await rawFor(this.prisma, DEQUEUED_JOB_COLUMNS).$queryRaw!<
+            DequeuedJobRow[]
+          >`
         WITH "group_load" AS (
           SELECT COALESCE(payload #>> ${this.fairnessPath}::text[], payload ->> '_groupKey', '') AS grp,
                  count(*) AS running
@@ -465,7 +485,9 @@ export class PrismaJobQueue implements JobQueue {
         )
         RETURNING id, "workflowRunId", "stageId", priority, attempt, "maxAttempts", payload, "startedAt"
       `
-        : await this.prisma.$queryRaw<DequeuedJobRow[]>`
+        : await rawFor(this.prisma, DEQUEUED_JOB_COLUMNS).$queryRaw!<
+            DequeuedJobRow[]
+          >`
         UPDATE "job_queue"
         SET
           status = 'RUNNING',
@@ -920,7 +942,7 @@ export class PrismaJobQueue implements JobQueue {
       // Renew the lease from the database clock: a heartbeat written from
       // the application clock while the sweeper reads the database clock
       // would reintroduce exactly the drift this change removes.
-      await this.prisma.$queryRaw`
+      await rawFor(this.prisma, {}).$queryRaw!`
         UPDATE "job_queue"
         SET "lockedAt" = (now() AT TIME ZONE 'UTC'),
             "updatedAt" = (now() AT TIME ZONE 'UTC')
@@ -956,7 +978,9 @@ export class PrismaJobQueue implements JobQueue {
       // NOTE: deliberately calling `this.prisma.$queryRaw` directly rather
       // than destructuring it into a local first -- Prisma's runtime reads
       // internal state off `this` inside its own method bodies.
-      const released = await this.prisma.$queryRaw<Array<{ id: string }>>`
+      const released = await rawFor(this.prisma, { id: "text" }).$queryRaw!<
+        Array<{ id: string }>
+      >`
         UPDATE "job_queue"
         SET
           status = 'PENDING',
@@ -1028,7 +1052,9 @@ export class PrismaJobQueue implements JobQueue {
       // NOTE: deliberately calling `this.prisma.$queryRaw` directly rather
       // than destructuring it into a local first -- Prisma's runtime reads
       // internal state off `this` inside its own method bodies.
-      const expired = await this.prisma.$queryRaw<Array<{ id: string }>>`
+      const expired = await rawFor(this.prisma, { id: "text" }).$queryRaw!<
+        Array<{ id: string }>
+      >`
         UPDATE "job_queue"
         SET
           status = 'FAILED',
@@ -1075,7 +1101,7 @@ export class PrismaJobQueue implements JobQueue {
 export function createPrismaJobQueue(
   prisma: PrismaClient,
   optionsOrWorkerId?: PrismaJobQueueOptions | string,
-): JobQueue {
+): PrismaJobQueue {
   // Handle backwards compatibility: if string is passed, treat as workerId
   const options: PrismaJobQueueOptions =
     typeof optionsOrWorkerId === "string"

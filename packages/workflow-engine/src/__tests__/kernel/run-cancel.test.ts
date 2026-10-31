@@ -117,6 +117,98 @@ describe("kernel: run.cancel", () => {
     expect(result.cancelled).toBe(false);
   });
 
+  it("cancels the jobs of a run only after the transaction commits", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, persistence, jobTransport } = createTestKernel([workflow]);
+    const created = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "key-1",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+    const other = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "key-2",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+    const job = (workflowRunId: string, stageId: string) =>
+      jobTransport.enqueue({
+        workflowRunId,
+        workflowId: "test-workflow",
+        stageId,
+      });
+    await job(created.workflowRunId, "stage-1");
+    const suspended = await job(created.workflowRunId, "stage-2");
+    await job(other.workflowRunId, "stage-1");
+    const taken = await jobTransport.dequeue();
+    expect(taken?.jobId).toBeDefined();
+    await jobTransport.suspend(suspended, new Date(Date.now() + 60_000));
+
+    // The in-memory persistence has no transaction to roll back, so record
+    // whether one is open at the moment the job transport is called.
+    let inTransaction = false;
+    const openAtCancel: boolean[] = [];
+    const withTransaction = persistence.withTransaction.bind(persistence);
+    persistence.withTransaction = async (fn) => {
+      inTransaction = true;
+      try {
+        return await withTransaction(fn);
+      } finally {
+        inTransaction = false;
+      }
+    };
+    const cancelByRun = jobTransport.cancelByRun.bind(jobTransport);
+    jobTransport.cancelByRun = (id) => {
+      openAtCancel.push(inTransaction);
+      return cancelByRun(id);
+    };
+
+    await kernel.dispatch({
+      type: "run.cancel",
+      workflowRunId: created.workflowRunId,
+    });
+
+    expect(openAtCancel).toEqual([false]);
+    const statuses = (runId: string) =>
+      jobTransport
+        .getAllJobs()
+        .filter((j) => j.workflowRunId === runId)
+        .map((j) => j.status)
+        .sort();
+    // The job a worker already holds is left to that worker.
+    expect(statuses(created.workflowRunId)).toEqual(["CANCELLED", "RUNNING"]);
+    expect(statuses(other.workflowRunId)).toEqual(["PENDING"]);
+  });
+
+  it("leaves the jobs of a run alone when its transaction does not commit", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, persistence, jobTransport } = createTestKernel([workflow]);
+    const created = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "key-1",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+    await jobTransport.enqueue({
+      workflowRunId: created.workflowRunId,
+      workflowId: "test-workflow",
+      stageId: "stage-1",
+    });
+    persistence.appendOutboxEvents = async () => {
+      throw new Error("commit failed");
+    };
+
+    await expect(
+      kernel.dispatch({
+        type: "run.cancel",
+        workflowRunId: created.workflowRunId,
+      }),
+    ).rejects.toThrow("commit failed");
+
+    expect(jobTransport.getAllJobs().map((j) => j.status)).toEqual(["PENDING"]);
+  });
+
   it("can cancel a pending workflow", async () => {
     const workflow = createSimpleWorkflow();
     const { kernel, persistence } = createTestKernel([workflow]);

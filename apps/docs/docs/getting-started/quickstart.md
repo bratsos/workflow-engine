@@ -107,10 +107,12 @@ import {
   createPrismaAICallLogger,
 } from "@bratsos/workflow-engine/persistence/prisma";
 import { PrismaClient } from "@prisma/client";
+import { PrismaPg } from "@prisma/adapter-pg";
 import { documentAnalysisWorkflow } from "./workflow";
 import crypto from "crypto";
 
-const prisma = new PrismaClient();
+// Prisma 7. On Prisma 6, `new PrismaClient()`; on Prisma 8, `const prisma = fromPrisma8(db)`.
+const prisma = new PrismaClient({ adapter: new PrismaPg({ connectionString: process.env.DATABASE_URL }) });
 const jobTransport = createPrismaJobQueue(prisma);
 
 // 1. Setup the pure command kernel
@@ -154,5 +156,7 @@ async function main() {
 
 main().catch(console.error);
 ```
+
+On Prisma 8 there is no `PrismaClient`: build `db` as shown in [Prisma 8](../persistence/prisma-setup.md#4-hand-the-engine-a-client), import `fromPrisma8` from `@bratsos/workflow-engine/persistence/prisma`, and use `const prisma = fromPrisma8(db);` in place of the two client lines. Nothing else in this file changes.
 
 The `stepLedger` and `services` lines are what turn on the two things most pipelines reach for next: [durable steps](../core-concepts/durable-steps.md) (`ctx.step.run`, `waitFor`, `waitForSignal`, `sleep`) and injected AI (`ctx.ai`, `ctx.step.ai.map`). The tables they need are in [Prisma Setup](../persistence/prisma-setup.md).

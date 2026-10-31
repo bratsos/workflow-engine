@@ -23,6 +23,7 @@
  *
  * Requires:
  *   - DATABASE_URL pointing at a Postgres database
+ *   - PRISMA_MAJOR (6, 7 or 8, default 7): the Prisma major under test
  *   - `pnpm --filter @bratsos/workflow-engine run prisma:generate`
  *   - `pnpm --filter @bratsos/workflow-engine run prisma:db-push`
  *
@@ -31,8 +32,7 @@
  * for the in-memory equivalents that always run unconditionally).
  */
 
-import { execFileSync } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -51,16 +51,24 @@ import {
 import { DefinitionRegistrationRetryableError } from "../../persistence/interface.js";
 import {
   createPrismaAICallLogger,
+  createPrismaBlobStore,
   createPrismaJobQueue,
   createPrismaStepLedger,
   createPrismaWorkflowPersistence,
 } from "../../persistence/prisma/index.js";
+import { rawFor } from "../../persistence/prisma/prisma-client-type.js";
+import {
+  isSerializationFailure,
+  isUniqueViolation,
+  sqlStateOf,
+} from "../../persistence/prisma/sql-errors.js";
 import {
   aiCallLoggerConformanceSuite,
   jobQueueConformanceSuite,
   persistenceConformanceSuite,
   stepLedgerConformanceSuite,
 } from "../../testing/persistence-conformance.js";
+import { createPostgresClient, isPrisma8 } from "../utils/postgres-client.js";
 
 const DATABASE_URL = process.env.DATABASE_URL;
 
@@ -70,12 +78,11 @@ if (!DATABASE_URL) {
   });
 } else {
   describe("I want the Prisma adapters to conform against real Postgres", () => {
-    // Required lazily (not as a static ESM import) so that `@prisma/client`
-    // -- which only exists once `prisma generate` has been run -- is never
-    // resolved when this branch isn't taken (i.e. DATABASE_URL is unset).
-    const require = createRequire(import.meta.url);
-    const { PrismaClient } = require("@prisma/client");
-    const prisma = new PrismaClient({ datasourceUrl: DATABASE_URL });
+    // Required lazily (not as a static ESM import) so that the generated
+    // `@prisma/client` -- which only exists once `prisma:generate` has been run
+    // -- is never resolved when this branch isn't taken (i.e. DATABASE_URL is
+    // unset). The fixture for the Prisma major in PRISMA_MAJOR builds it.
+    const prisma = createPostgresClient(DATABASE_URL);
 
     async function truncateAll() {
       await prisma.$executeRawUnsafe(
@@ -367,7 +374,9 @@ if (!DATABASE_URL) {
               if (result.status === "fulfilled")
                 expect(result.value).toMatchObject(inputs[index]);
             }
-            expect(await tx.$queryRaw`SELECT 1 AS ok`).toEqual([{ ok: 1 }]);
+            expect(
+              await rawFor(tx, { ok: "int" }).$queryRaw`SELECT 1 AS ok`,
+            ).toEqual([{ ok: 1 }]);
           });
           expect(await persistence.getRun(priorId)).toMatchObject({
             id: priorId,
@@ -417,7 +426,9 @@ if (!DATABASE_URL) {
           expect(
             await persistence.getDefinition(input.workflowId, input.version),
           ).toEqual(row);
-          expect(await prisma.$queryRaw`SELECT 1 AS ok`).toEqual([{ ok: 1 }]);
+          expect(
+            await rawFor(prisma, { ok: "int" }).$queryRaw`SELECT 1 AS ok`,
+          ).toEqual([{ ok: 1 }]);
         } finally {
           await prisma.workflowDefinition.deleteMany({
             where: { workflowId: input.workflowId },
@@ -512,7 +523,9 @@ if (!DATABASE_URL) {
           ).rejects.toThrow(
             "Prisma client does not support $executeRaw (required for the insertDefinitionIfAbsent path)",
           );
-          expect(await tx.$queryRaw`SELECT 1 AS ok`).toEqual([{ ok: 1 }]);
+          expect(
+            await rawFor(tx, { ok: "int" }).$queryRaw`SELECT 1 AS ok`,
+          ).toEqual([{ ok: 1 }]);
         });
       });
 
@@ -664,6 +677,39 @@ if (!DATABASE_URL) {
         // Nothing left to dequeue.
         expect(await jobQueue.dequeue()).toBeNull();
       });
+
+      it("hands every pending run to exactly one of many concurrent claimers", async () => {
+        const runs = await Promise.all(
+          Array.from({ length: 12 }, () =>
+            persistence.createRun(createRunData()),
+          ),
+        );
+
+        const claims = await Promise.all(
+          Array.from({ length: 24 }, () => persistence.claimNextPendingRun()),
+        );
+
+        const claimed = claims.flatMap((run) => (run ? [run.id] : []));
+        expect(claimed.sort()).toEqual(runs.map((run) => run.id).sort());
+        expect(await persistence.getRunsByStatus("PENDING")).toHaveLength(0);
+      });
+
+      it("hands every pending job to exactly one of many concurrent dequeuers", async () => {
+        const jobIds = await jobQueue.enqueueParallel(
+          Array.from({ length: 12 }, (_, i) => ({
+            workflowRunId: "many-dequeuers-run",
+            workflowId: "many-dequeuers-workflow",
+            stageId: `stage-${i}`,
+          })),
+        );
+
+        const dequeued = await Promise.all(
+          Array.from({ length: 24 }, () => jobQueue.dequeue()),
+        );
+
+        const claimed = dequeued.flatMap((job) => (job ? [job.jobId] : []));
+        expect(claimed.sort()).toEqual([...jobIds].sort());
+      });
     });
 
     // ==========================================================================
@@ -676,6 +722,3404 @@ if (!DATABASE_URL) {
     // calls. `KernelConfig.scheduler` is optional (unused by the kernel;
     // see kernel/ports.ts) and intentionally omitted.
     // ==========================================================================
+
+    // Every argument shape `fromPrisma8` accepts, with the same literal expected
+    // values on every major: 6 and 7 prove the expectation, 8 has to meet it.
+    describe("argument parity across Prisma majors", () => {
+      const D1 = new Date("2026-01-01T00:00:00.000Z");
+      const D2 = new Date("2026-02-01T12:00:00.500Z");
+      const ALL = "a,b,c,d,e,f,g,h,i,j,k,l";
+      const NO_STAGES = "d,e,f,g,h,i,j,k,l";
+      const run = (id: string, extra = {}) => ({
+        id,
+        workflowId: "wf",
+        workflowName: "wf",
+        workflowType: "t",
+        input: {},
+        ...extra,
+      });
+      const stage = (
+        id: string,
+        runId: string,
+        stageId: string,
+        extra = {},
+      ) => ({
+        id,
+        workflowRunId: runId,
+        stageId,
+        stageName: stageId,
+        stageNumber: 1,
+        executionGroup: 1,
+        ...extra,
+      });
+      const annotation = (
+        id: string,
+        runId: string,
+        stageRecordId: string | null,
+      ) => ({
+        id,
+        workflowRunId: runId,
+        workflowStageRecordId: stageRecordId,
+        scope: "run",
+        key: id,
+        value: {},
+      });
+
+      // Rows a-d are written twice, so the heap order is not the id order, and
+      // metadata holds DB NULL (a, b), JSON null (c, d) and JSON values.
+      async function seed() {
+        await prisma.$executeRawUnsafe(
+          `TRUNCATE "workflow_runs", "workflow_blobs" RESTART IDENTITY CASCADE`,
+        );
+        await prisma.workflowRun.createMany({
+          data: [
+            run("a", {
+              workflowName: "ab",
+              priority: 1,
+              definitionVersion: "x",
+            }),
+            run("b", {
+              workflowName: "a_b",
+              priority: 2,
+              startedAt: D1,
+              definitionVersion: "y",
+            }),
+            run("c", { workflowName: "a%b", priority: 3, startedAt: D2 }),
+            run("d", { workflowName: "a\\b", priority: 4, status: "RUNNING" }),
+            run("e", {
+              workflowName: "xy",
+              priority: 5,
+              status: "RUNNING",
+              metadata: { k: 1, n: { m: 2 } },
+            }),
+            run("f", {
+              workflowName: "a\\%",
+              priority: 6,
+              metadata: { k: "1" },
+            }),
+            run("g", {
+              workflowName: "A_B",
+              priority: 7,
+              metadata: { k: null },
+            }),
+            run("h", { workflowName: "z", priority: 8, metadata: { k: true } }),
+            run("i", {
+              workflowName: "z2",
+              priority: 9,
+              metadata: { k: { a: 1 } },
+            }),
+            run("j", {
+              workflowName: "z3",
+              priority: 10,
+              metadata: { k: [1, 2] },
+            }),
+            run("k", {
+              workflowName: "z4",
+              priority: 11,
+              metadata: { other: 1 },
+            }),
+            run("l", {
+              workflowName: "z5",
+              priority: 12,
+              metadata: { k: 1, n: { m: 2 } },
+            }),
+          ],
+        });
+        await prisma.$executeRawUnsafe(
+          `UPDATE "workflow_runs" SET "metadata" = NULL WHERE "id" IN ('a', 'b')`,
+        );
+        await prisma.$executeRawUnsafe(
+          `UPDATE "workflow_runs" SET "metadata" = 'null'::jsonb WHERE "id" IN ('c', 'd')`,
+        );
+        await prisma.workflowStage.createMany({
+          data: [
+            stage("s1", "a", "s", { errorMessage: "boom", duration: 5 }),
+            stage("s2", "a", "t", { duration: 7, status: "RUNNING" }),
+            stage("s3", "b", "s", { errorMessage: "zap" }),
+            stage("s4", "c", "u", { status: "FAILED", startedAt: D1 }),
+          ],
+        });
+        await prisma.workflowAnnotation.createMany({
+          data: [
+            annotation("n1", "a", "s1"),
+            annotation("n2", "a", null),
+            annotation("n3", "b", null),
+          ],
+        });
+        await prisma.workflowBlob.createMany({
+          data: [
+            { key: "x", data: 1 },
+            { key: "y", data: 2 },
+          ],
+        });
+      }
+
+      afterAll(() => prisma.$executeRawUnsafe(`TRUNCATE "workflow_blobs"`));
+
+      const idsOf = (rows: Array<{ id: string }>) =>
+        rows.map((row) => row.id).join();
+      const runs = async (where?: unknown, extra = {}) =>
+        idsOf(
+          await prisma.workflowRun.findMany({
+            where,
+            select: { id: true },
+            orderBy: { id: "asc" },
+            ...extra,
+          }),
+        );
+      const stages = async (where?: unknown) =>
+        idsOf(
+          await prisma.workflowStage.findMany({
+            where,
+            select: { id: true },
+            orderBy: { id: "asc" },
+          }),
+        );
+      const annotations = async (where?: unknown) =>
+        idsOf(
+          await prisma.workflowAnnotation.findMany({
+            where,
+            select: { id: true },
+            orderBy: { id: "asc" },
+          }),
+        );
+      const sorted = (rows: any[], by: string) =>
+        [...rows].sort((a, b) => String(a[by]).localeCompare(String(b[by])));
+      // A blob row binds 4 parameters on 8, so 16,383 rows fill one statement.
+      const blobRows = (n: number) =>
+        Array.from({ length: n }, (_, i) => ({ key: `bulk-${i}`, data: i }));
+
+      // On 8 the rejection has to come from the bridge: that is what proves
+      // no SQL ran.
+      const REJECTED = isPrisma8 ? /^fromPrisma8: / : /./;
+
+      const FILTERS: Array<[string, unknown, string]> = [
+        ["no where", undefined, ALL],
+        [
+          "in with quotes, commas and NULL as text",
+          { workflowName: { in: ["a\\b", "a%b", "NULL", "", 'x"y,z'] } },
+          "c,d",
+        ],
+        ["an empty where", {}, ALL],
+        ["an undefined field", { id: undefined }, ALL],
+        ["an empty operator object", { id: {} }, ALL],
+        ["an undefined equals", { id: { equals: undefined } }, ALL],
+        ["an undefined not", { id: { not: undefined } }, ALL],
+        ["an undefined in", { id: { in: undefined } }, ALL],
+        ["an undefined gt", { definitionVersion: { gt: undefined } }, ALL],
+        ["a no-op beside a filter", { id: {}, workflowName: "ab" }, "a"],
+        [
+          "undefined beside a filter",
+          { id: undefined, workflowName: "ab" },
+          "a",
+        ],
+        ["OR: []", { OR: [] }, ""],
+        ["OR: [{}]", { OR: [{}] }, ""],
+        ["an undefined OR", { OR: undefined }, ALL],
+        ["an OR child of undefined", { OR: [{ id: undefined }] }, ""],
+        ["an OR child of a no-op", { OR: [{ id: {} }] }, ""],
+        [
+          "an OR child of equals undefined",
+          { OR: [{ id: { equals: undefined } }] },
+          "",
+        ],
+        ["an empty OR child before a real one", { OR: [{}, { id: "a" }] }, "a"],
+        ["an empty OR child after a real one", { OR: [{ id: "a" }, {}] }, "a"],
+        [
+          "an undefined OR child beside a real one",
+          { OR: [{ id: undefined }, { id: "a" }] },
+          "a",
+        ],
+        [
+          "a no-op OR child beside a real one",
+          { OR: [{ id: {} }, { id: "a" }] },
+          "a",
+        ],
+        ["a nested OR: []", { OR: [{ OR: [] }] }, ""],
+        ["a nested OR: [{}]", { OR: [{ OR: [{}] }] }, ""],
+        [
+          "a nested OR: [] beside a real child",
+          { OR: [{ OR: [] }, { id: "a" }] },
+          "a",
+        ],
+        [
+          "a nested OR: [{}] beside a real child",
+          { OR: [{ OR: [{}] }, { id: "a" }] },
+          "a",
+        ],
+        ["a child of an undefined OR", { OR: [{ OR: undefined }] }, ""],
+        ["OR: [] beside a filter", { id: "a", OR: [] }, ""],
+        ["OR: [{}] beside a filter", { id: "a", OR: [{}] }, ""],
+        ["OR of two fields", { OR: [{ id: "a" }, { id: "b" }] }, "a,b"],
+        [
+          "OR children mixing no-ops and filters",
+          {
+            OR: [
+              { id: "a", workflowName: undefined },
+              { id: {}, workflowName: "xy" },
+            ],
+          },
+          "a,e",
+        ],
+        [
+          "OR children of two fields",
+          {
+            OR: [
+              { id: "a", priority: 1 },
+              { id: "b", priority: 9 },
+            ],
+          },
+          "a",
+        ],
+        ["in: [] over NULLs", { definitionVersion: { in: [] } }, ""],
+        ["notIn: [] over NULLs", { definitionVersion: { notIn: [] } }, ALL],
+        ["in over NULLs", { definitionVersion: { in: ["x"] } }, "a"],
+        ["notIn over NULLs", { definitionVersion: { notIn: ["x"] } }, "b"],
+        ["not over NULLs", { definitionVersion: { not: "x" } }, "b"],
+        ["not: null", { definitionVersion: { not: null } }, "a,b"],
+        [
+          "equals: null",
+          { definitionVersion: { equals: null } },
+          "c,d,e,f,g,h,i,j,k,l",
+        ],
+        ["a bare null", { definitionVersion: null }, "c,d,e,f,g,h,i,j,k,l"],
+        ["gte on text", { definitionVersion: { gte: "x" } }, "a,b"],
+        ["lt on text", { workflowName: { lt: "b" } }, "a,b,c,d,f,g"],
+        [
+          "not with in",
+          { definitionVersion: { not: "x", in: ["x", "y"] } },
+          "b",
+        ],
+        ["two operators", { priority: { gte: 2, lt: 4 } }, "b,c"],
+        ["a fractional int", { priority: 1.5 }, "a"],
+        ["a fractional bound", { priority: { lt: 2.5 } }, "a"],
+        ["a fractional list", { priority: { in: [1.5, 2.5] } }, "a,b"],
+        ["not null with lt", { startedAt: { not: null, lt: D2 } }, "b"],
+        [
+          "an undefined operator beside a real one",
+          { priority: { gte: undefined, lt: 3 } },
+          "a,b",
+        ],
+        ["an enum", { status: "RUNNING" }, "d,e"],
+        ["an enum in", { status: { in: ["RUNNING"] } }, "d,e"],
+        ["an enum not", { status: { not: "PENDING" } }, "d,e"],
+        ["an enum notIn", { status: { notIn: ["PENDING"] } }, "d,e"],
+        ["a float", { totalCost: 0 }, ALL],
+        ["a float lt", { totalCost: { lt: 1 } }, ALL],
+        [
+          "startsWith % as a wildcard",
+          { workflowName: { startsWith: "a%" } },
+          "a,b,c,d,f",
+        ],
+        [
+          "startsWith _ as a wildcard",
+          { workflowName: { startsWith: "a_" } },
+          "a,b,c,d,f",
+        ],
+        [
+          "startsWith with a trailing backslash",
+          { workflowName: { startsWith: "a\\" } },
+          "",
+        ],
+        [
+          "startsWith with an escaped _",
+          { workflowName: { startsWith: "a\\_" } },
+          "b",
+        ],
+        [
+          "startsWith with an escaped %",
+          { workflowName: { startsWith: "a\\%" } },
+          "c",
+        ],
+        ["startsWith %", { workflowName: { startsWith: "%" } }, ALL],
+        ["startsWith nothing", { workflowName: { startsWith: "" } }, ALL],
+        [
+          "startsWith nothing over NULLs",
+          { definitionVersion: { startsWith: "" } },
+          "a,b",
+        ],
+        [
+          "startsWith, case sensitive",
+          { workflowName: { startsWith: "A" } },
+          "g",
+        ],
+        [
+          "startsWith a plain prefix",
+          { workflowName: { startsWith: "z" } },
+          "h,i,j,k,l",
+        ],
+        ["JSON equals: null", { metadata: { equals: null } }, "c,d"],
+        ["JSON not: null", { metadata: { not: null } }, "e,f,g,h,i,j,k,l"],
+        [
+          "JSON equals: null and not: null",
+          { metadata: { equals: null, not: null } },
+          "",
+        ],
+        [
+          "JSON equals an object",
+          { metadata: { equals: { k: 1, n: { m: 2 } } } },
+          "e,l",
+        ],
+        [
+          "JSON not an object",
+          { metadata: { not: { k: "1" } } },
+          "c,d,e,g,h,i,j,k,l",
+        ],
+        ["JSON equals a string", { metadata: { equals: "x" } }, ""],
+        [
+          "JSON not a string",
+          { metadata: { not: "x" } },
+          "c,d,e,f,g,h,i,j,k,l",
+        ],
+        ["an empty JSON filter", { metadata: {} }, ALL],
+        ["an undefined JSON equals", { metadata: { equals: undefined } }, ALL],
+        ["an undefined JSON not", { metadata: { not: undefined } }, ALL],
+        [
+          "a JSON path to a number",
+          { metadata: { path: ["k"], equals: 1 } },
+          "e,l",
+        ],
+        [
+          "a JSON path to a string",
+          { metadata: { path: ["k"], equals: "1" } },
+          "f",
+        ],
+        [
+          "a JSON path to null",
+          { metadata: { path: ["k"], equals: null } },
+          "g",
+        ],
+        [
+          "a JSON path to a boolean",
+          { metadata: { path: ["k"], equals: true } },
+          "h",
+        ],
+        [
+          "a JSON path to an object",
+          { metadata: { path: ["k"], equals: { a: 1 } } },
+          "i",
+        ],
+        [
+          "a JSON path to an array",
+          { metadata: { path: ["k"], equals: [1, 2] } },
+          "j",
+        ],
+        ["an empty JSON path", { metadata: { path: [], equals: 1 } }, ""],
+        [
+          "a JSON path to nothing",
+          { metadata: { path: ["absent"], equals: "1" } },
+          "",
+        ],
+        [
+          "a deep JSON path",
+          { metadata: { path: ["n", "m"], equals: 2 } },
+          "e,l",
+        ],
+        [
+          "a JSON path into an array",
+          { metadata: { path: ["k", "0"], equals: 1 } },
+          "j",
+        ],
+        [
+          "a JSON path in OR",
+          { OR: [{ metadata: { path: ["k"], equals: 1 } }, { id: "a" }] },
+          "a,e,l",
+        ],
+        [
+          "an undefined JSON path",
+          { metadata: { path: undefined, equals: 1 } },
+          "",
+        ],
+        ["a Date", { startedAt: D1 }, "b"],
+        ["a Date equals", { startedAt: { equals: D1 } }, "b"],
+        ["a Date not", { startedAt: { not: D1 } }, "c"],
+        ["a Date lt", { startedAt: { lt: D2 } }, "b"],
+        ["a Date lte", { startedAt: { lte: D2 } }, "b,c"],
+        ["a Date gt", { startedAt: { gt: D1 } }, "c"],
+        ["a Date gte", { startedAt: { gte: D1 } }, "b,c"],
+        ["a Date in", { startedAt: { in: [D1] } }, "b"],
+        ["a Date notIn", { startedAt: { notIn: [D1] } }, "c"],
+        ["a null Date", { startedAt: null }, "a,d,e,f,g,h,i,j,k,l"],
+        ["none: {}", { stages: { none: {} } }, NO_STAGES],
+        ["an undefined none", { stages: { none: undefined } }, ALL],
+        [
+          "none of undefined",
+          { stages: { none: { stageId: undefined } } },
+          NO_STAGES,
+        ],
+        ["none of a no-op", { stages: { none: { stageId: {} } } }, NO_STAGES],
+        ["none of OR: []", { stages: { none: { OR: [] } } }, ALL],
+        ["none of OR: [{}]", { stages: { none: { OR: [{}] } } }, ALL],
+        [
+          "none of a field",
+          { stages: { none: { stageId: "s" } } },
+          "c,d,e,f,g,h,i,j,k,l",
+        ],
+        [
+          "none in OR",
+          { OR: [{ stages: { none: {} } }, { id: "a" }] },
+          "a,d,e,f,g,h,i,j,k,l",
+        ],
+        [
+          "an undefined none in OR",
+          { OR: [{ stages: { none: undefined } }] },
+          "",
+        ],
+      ];
+
+      const STAGE_FILTERS: Array<[string, unknown, string]> = [
+        ["an empty relation filter", { workflowRun: {} }, "s1,s2,s3,s4"],
+        [
+          "an undefined relation filter",
+          { workflowRun: undefined },
+          "s1,s2,s3,s4",
+        ],
+        [
+          "a relation filter of undefined",
+          { workflowRun: { id: undefined } },
+          "s1,s2,s3,s4",
+        ],
+        [
+          "a relation filter of a no-op",
+          { workflowRun: { id: {} } },
+          "s1,s2,s3,s4",
+        ],
+        ["a relation filter of OR: []", { workflowRun: { OR: [] } }, ""],
+        ["a relation filter of OR: [{}]", { workflowRun: { OR: [{}] } }, ""],
+        [
+          "a relation filter of an undefined OR child",
+          { workflowRun: { OR: [{ id: undefined }] } },
+          "",
+        ],
+        ["a relation field", { workflowRun: { id: "a" } }, "s1,s2"],
+        [
+          "a relation OR",
+          { workflowRun: { OR: [{ id: "a" }, { id: "c" }] } },
+          "s1,s2,s4",
+        ],
+        [
+          "a relation beside a field",
+          { stageId: "s", workflowRun: { id: "a" } },
+          "s1",
+        ],
+        [
+          "a nested relation",
+          { workflowRun: { stages: { none: { stageId: "t" } } } },
+          "s3,s4",
+        ],
+        ["an empty relation filter in OR", { OR: [{ workflowRun: {} }] }, ""],
+        [
+          "a relation filter of undefined in OR",
+          { OR: [{ workflowRun: { id: undefined } }] },
+          "",
+        ],
+        [
+          "a relation in OR",
+          { OR: [{ workflowRun: { id: "c" } }, { stageId: "t" }] },
+          "s2,s4",
+        ],
+        [
+          "a relation of OR: [] in OR",
+          { OR: [{ workflowRun: { OR: [] } }] },
+          "",
+        ],
+      ];
+
+      const ANNOTATION_FILTERS: Array<[string, unknown, string]> = [
+        [
+          "an empty optional relation filter",
+          { workflowStage: {} },
+          "n1,n2,n3",
+        ],
+        [
+          "an undefined optional relation filter",
+          { workflowStage: undefined },
+          "n1,n2,n3",
+        ],
+        [
+          "an optional relation filter of undefined",
+          { workflowStage: { id: undefined } },
+          "n1,n2,n3",
+        ],
+        [
+          "an optional relation field",
+          { workflowStage: { stageId: "s" } },
+          "n1",
+        ],
+        ["an optional relation of OR: []", { workflowStage: { OR: [] } }, ""],
+      ];
+
+      // Rejected on every major; the call must never reach the database.
+      const INVALID: Array<[string, unknown]> = [
+        ["an undefined OR element", { OR: [undefined] }],
+        ["a null OR element", { OR: [null] }],
+        ["OR as an object", { OR: { id: "a" } }],
+        ["null in in", { definitionVersion: { in: [null] } }],
+        ["null in notIn", { definitionVersion: { notIn: [null] } }],
+        ["a value and null in in", { definitionVersion: { in: ["x", null] } }],
+        ["undefined in in", { definitionVersion: { in: [undefined] } }],
+        ["in without an array", { id: { in: "a" } }],
+        ["lt: null", { definitionVersion: { lt: null } }],
+        ["a number for text", { id: 5 }],
+        ["a string for an int", { priority: "1" }],
+        ["an array for an int", { priority: [1] }],
+        ["a string for a float", { totalCost: "0" }],
+        ["a date-only string", { createdAt: { lt: "2099-01-01" } }],
+        ["a number for a Date", { startedAt: 5 }],
+        ["an invalid Date", { startedAt: new Date("nope") }],
+        ["an unknown enum value", { status: "NOPE" }],
+        ["lt on an enum", { status: { lt: "RUNNING" } }],
+        ["startsWith on an enum", { status: { startsWith: "R" } }],
+        ["startsWith on an int", { priority: { startsWith: "1" } }],
+        ["startsWith: null", { workflowName: { startsWith: null } }],
+        ["startsWith a number", { workflowName: { startsWith: 1 } }],
+        ["null for a required column", { id: null }],
+        ["equals: null on a required column", { id: { equals: null } }],
+        ["not: null on a required column", { id: { not: null } }],
+        ["an unknown column", { nope: 1 }],
+        ["an unknown operator", { id: { nope: 1 } }],
+        ["a bare null on JSON", { metadata: null }],
+        ["a bare object on JSON", { metadata: { k: 1 } }],
+        ["a bare number on JSON", { metadata: 5 }],
+        ["a bare string on JSON", { metadata: "x" }],
+        ["in on JSON", { metadata: { in: [1] } }],
+        [
+          "a JSON path with equals undefined",
+          { metadata: { path: ["k"], equals: undefined } },
+        ],
+        ["a JSON path alone", { metadata: { path: ["k"] } }],
+        ["a JSON path as a string", { metadata: { path: "k", equals: 1 } }],
+        ["a JSON path on text", { workflowName: { path: ["k"], equals: 1 } }],
+        [
+          "a compound key in a list filter",
+          { workflowRunId_stageId: { workflowRunId: "a", stageId: "s" } },
+        ],
+      ];
+
+      // 6 and 7 accept these, but no adapter calls them, so the bridge rejects
+      // them rather than emulate them. Hence asserted on 8 only.
+      const UNSUPPORTED_ON_8: Array<[string, unknown]> = [
+        ["AND", { AND: [{ id: "a" }] }],
+        ["NOT", { NOT: { id: "a" } }],
+        ["a nested not", { definitionVersion: { not: { equals: "x" } } }],
+        ["not of nothing", { definitionVersion: { not: {} } }],
+        ["an ISO string for a Date", { startedAt: "2026-01-01T00:00:00.000Z" }],
+        [
+          "an offset string for a Date",
+          { startedAt: "2026-01-01T02:00:00.000+02:00" },
+        ],
+        ["contains", { workflowName: { contains: "b" } }],
+        ["endsWith", { workflowName: { endsWith: "b" } }],
+        ["mode", { workflowName: { startsWith: "a", mode: "insensitive" } }],
+        ["lt on JSON", { metadata: { lt: 1 } }],
+        ["a JSON path with not", { metadata: { path: ["k"], not: 1 } }],
+        ["a JSON path with gt", { metadata: { path: ["k"], gt: 0 } }],
+        ["a to-many filter with nothing in it", { stages: {} }],
+        ["some", { stages: { some: {} } }],
+        ["every", { stages: { every: {} } }],
+      ];
+
+      describe("reads", () => {
+        beforeAll(seed);
+
+        it.each(FILTERS)("filters on %s", async (_name, where, expected) => {
+          expect(await runs(where)).toBe(expected);
+        });
+        it.each(
+          STAGE_FILTERS,
+        )("filters stages on %s", async (_name, where, expected) => {
+          expect(await stages(where)).toBe(expected);
+        });
+        it.each(
+          ANNOTATION_FILTERS,
+        )("filters annotations on %s", async (_name, where, expected) => {
+          expect(await annotations(where)).toBe(expected);
+        });
+        it.each(INVALID)("rejects %s", async (_name, where) => {
+          await expect(runs(where)).rejects.toThrow(REJECTED);
+        });
+        it.runIf(isPrisma8).each(UNSUPPORTED_ON_8)(
+          "does not take %s on Prisma 8",
+          async (_name, where) => {
+            await expect(runs(where)).rejects.toThrow(REJECTED);
+          },
+        );
+
+        const READS: Array<[string, () => Promise<unknown>, unknown]> = [
+          [
+            "orderBy asc over NULLs",
+            () =>
+              runs(
+                {},
+                { orderBy: [{ startedAt: "asc" }, { id: "asc" }], take: 5 },
+              ),
+            "b,c,a,d,e",
+          ],
+          [
+            "orderBy desc over NULLs",
+            () =>
+              runs(
+                {},
+                { orderBy: [{ startedAt: "desc" }, { id: "asc" }], take: 5 },
+              ),
+            "a,d,e,f,g",
+          ],
+          [
+            "orderBy of JSON asc",
+            () => runs({}, { orderBy: [{ metadata: "asc" }, { id: "asc" }] }),
+            "c,d,g,f,h,j,i,k,e,l,a,b",
+          ],
+          [
+            "orderBy of JSON desc",
+            () => runs({}, { orderBy: [{ metadata: "desc" }, { id: "asc" }] }),
+            "a,b,e,l,k,i,j,h,f,g,c,d",
+          ],
+          [
+            "orderBy of an enum",
+            () => runs({}, { orderBy: [{ status: "desc" }, { id: "asc" }] }),
+            "d,e,a,b,c,f,g,h,i,j,k,l",
+          ],
+          [
+            "orderBy of a float",
+            () => runs({}, { orderBy: [{ totalCost: "asc" }, { id: "asc" }] }),
+            ALL,
+          ],
+          [
+            "take with no order, by primary key",
+            () => runs({}, { orderBy: undefined, take: 3 }),
+            "a,b,c",
+          ],
+          [
+            "take with an empty order, by primary key",
+            () => runs({}, { orderBy: {}, take: 3 }),
+            "a,b,c",
+          ],
+          [
+            "take with an empty order list, by primary key",
+            () => runs({}, { orderBy: [], take: 3 }),
+            "a,b,c",
+          ],
+          ["take: 0", () => runs({}, { take: 0 }), ""],
+          ["a fractional take", () => runs({}, { take: 2.5 }), "a,b"],
+          [
+            "an undefined take",
+            async () => (await runs({}, { take: undefined })).length,
+            ALL.length,
+          ],
+          [
+            "findFirst with no match",
+            () => prisma.workflowRun.findFirst({ where: { id: "zz" } }),
+            null,
+          ],
+          [
+            "findFirst with take: 1",
+            () =>
+              prisma.workflowRun.findFirst({
+                take: 1,
+                orderBy: { id: "desc" },
+                select: { id: true },
+              }),
+            { id: "l" },
+          ],
+          [
+            "select with a false column",
+            () =>
+              prisma.workflowRun.findFirst({
+                where: { id: "a" },
+                select: { id: true, workflowName: false },
+              }),
+            { id: "a" },
+          ],
+          [
+            "select with an undefined column",
+            () =>
+              prisma.workflowRun.findFirst({
+                where: { id: "a" },
+                select: { id: true, workflowName: undefined },
+              }),
+            { id: "a" },
+          ],
+          [
+            "select with a false relation",
+            () =>
+              prisma.workflowRun.findFirst({
+                where: { id: "a" },
+                select: { id: true, stages: false },
+              }),
+            { id: "a" },
+          ],
+          [
+            "select of a to-many relation",
+            async () => {
+              const row = await prisma.workflowRun.findFirst({
+                where: { id: "a" },
+                select: { id: true, stages: { select: { stageId: true } } },
+              });
+              return { ...row, stages: sorted(row.stages, "stageId") };
+            },
+            { id: "a", stages: [{ stageId: "s" }, { stageId: "t" }] },
+          ],
+          [
+            "select of a to-many relation with no rows",
+            () =>
+              prisma.workflowRun.findFirst({
+                where: { id: "d" },
+                select: { stages: { select: { stageId: true } } },
+              }),
+            { stages: [] },
+          ],
+          [
+            "include of a to-one relation",
+            async () =>
+              (
+                await prisma.workflowStage.findMany({
+                  where: { id: "s1" },
+                  include: { workflowRun: { select: { workflowType: true } } },
+                })
+              )[0].workflowRun,
+            { workflowType: "t" },
+          ],
+          [
+            "include of an optional relation with no row",
+            async () =>
+              (
+                await prisma.workflowAnnotation.findMany({
+                  where: { id: "n2" },
+                  include: { workflowStage: { select: { stageId: true } } },
+                })
+              )[0].workflowStage,
+            null,
+          ],
+          [
+            "include with no parents",
+            () =>
+              prisma.workflowStage.findMany({
+                where: { id: "zz" },
+                include: { workflowRun: { select: { workflowType: true } } },
+              }),
+            [],
+          ],
+          [
+            "an empty include",
+            async () =>
+              (
+                await prisma.workflowRun.findFirst({
+                  where: { id: "a" },
+                  include: {},
+                })
+              ).id,
+            "a",
+          ],
+          [
+            "a false include",
+            async () =>
+              "stages" in
+              (await prisma.workflowRun.findFirst({
+                where: { id: "a" },
+                include: { stages: false },
+              })),
+            false,
+          ],
+          ["count with no args", () => prisma.workflowRun.count(), 12],
+          [
+            "count with an empty where",
+            () => prisma.workflowRun.count({ where: {} }),
+            12,
+          ],
+          [
+            "count of a filter",
+            () => prisma.workflowRun.count({ where: { status: "RUNNING" } }),
+            2,
+          ],
+          [
+            "count of OR: []",
+            () => prisma.workflowRun.count({ where: { OR: [] } }),
+            0,
+          ],
+          [
+            "count of OR: [{}]",
+            () => prisma.workflowRun.count({ where: { OR: [{}] } }),
+            0,
+          ],
+          [
+            "aggregate _count over zero rows",
+            () =>
+              prisma.workflowRun.aggregate({
+                where: { id: "zz" },
+                _count: { _all: true },
+              }),
+            { _count: { _all: 0 } },
+          ],
+          [
+            "aggregate _max over zero rows",
+            () =>
+              prisma.workflowRun.aggregate({
+                where: { id: "zz" },
+                _max: { priority: true },
+              }),
+            { _max: { priority: null } },
+          ],
+          [
+            "aggregate _min over zero rows",
+            () =>
+              prisma.workflowRun.aggregate({
+                where: { id: "zz" },
+                _min: { createdAt: true },
+              }),
+            { _min: { createdAt: null } },
+          ],
+          [
+            "aggregate of everything over zero rows",
+            () =>
+              prisma.workflowRun.aggregate({
+                where: { id: "zz" },
+                _count: { _all: true },
+                _min: { priority: true },
+                _max: { startedAt: true },
+              }),
+            {
+              _count: { _all: 0 },
+              _min: { priority: null },
+              _max: { startedAt: null },
+            },
+          ],
+          [
+            "aggregate of OR: [{}]",
+            () =>
+              prisma.workflowRun.aggregate({
+                where: { OR: [{}] },
+                _count: { _all: true },
+              }),
+            { _count: { _all: 0 } },
+          ],
+          [
+            "groupBy of OR: [{}]",
+            () =>
+              prisma.workflowRun.groupBy({
+                by: ["status"],
+                where: { OR: [{}] },
+                _count: { _all: true },
+              }),
+            [],
+          ],
+          [
+            "aggregate _count",
+            () => prisma.workflowRun.aggregate({ _count: { _all: true } }),
+            { _count: { _all: 12 } },
+          ],
+          [
+            "aggregate _max",
+            () => prisma.workflowRun.aggregate({ _max: { priority: true } }),
+            { _max: { priority: 12 } },
+          ],
+          [
+            "aggregate _min of a Date",
+            () => prisma.workflowRun.aggregate({ _min: { startedAt: true } }),
+            { _min: { startedAt: D1 } },
+          ],
+          [
+            "aggregate _max of text",
+            () =>
+              prisma.workflowRun.aggregate({ _max: { workflowName: true } }),
+            { _max: { workflowName: "z5" } },
+          ],
+          [
+            "aggregate _max of an enum",
+            () => prisma.workflowRun.aggregate({ _max: { status: true } }),
+            { _max: { status: "RUNNING" } },
+          ],
+          [
+            "groupBy over zero rows",
+            () =>
+              prisma.workflowRun.groupBy({
+                by: ["status"],
+                where: { id: "zz" },
+                _count: { _all: true },
+              }),
+            [],
+          ],
+          [
+            "groupBy with _count",
+            async () =>
+              sorted(
+                await prisma.workflowRun.groupBy({
+                  by: ["status"],
+                  _count: { _all: true },
+                }),
+                "status",
+              ),
+            [
+              { status: "PENDING", _count: { _all: 10 } },
+              { status: "RUNNING", _count: { _all: 2 } },
+            ],
+          ],
+          [
+            "groupBy with _min and _max",
+            () =>
+              prisma.workflowStage.groupBy({
+                by: ["workflowRunId"],
+                where: { workflowRunId: "c" },
+                _min: { startedAt: true },
+                _max: { duration: true },
+              }),
+            [
+              {
+                workflowRunId: "c",
+                _min: { startedAt: D1 },
+                _max: { duration: null },
+              },
+            ],
+          ],
+          [
+            "groupBy on a nullable column",
+            async () =>
+              sorted(
+                await prisma.workflowRun.groupBy({
+                  by: ["definitionVersion"],
+                  _count: { _all: true },
+                }),
+                "definitionVersion",
+              ),
+            [
+              { definitionVersion: null, _count: { _all: 10 } },
+              { definitionVersion: "x", _count: { _all: 1 } },
+              { definitionVersion: "y", _count: { _all: 1 } },
+            ],
+          ],
+          [
+            "groupBy of two columns",
+            async () =>
+              (
+                await prisma.workflowRun.groupBy({
+                  by: ["status", "definitionVersion"],
+                })
+              ).length,
+            4,
+          ],
+          [
+            "findUnique of a miss",
+            () => prisma.workflowRun.findUnique({ where: { id: "zz" } }),
+            null,
+          ],
+          [
+            "findUnique beside a matching field",
+            () =>
+              prisma.workflowRun.findUnique({
+                where: { id: "a", workflowId: "wf" },
+                select: { id: true },
+              }),
+            { id: "a" },
+          ],
+          [
+            "findUnique beside a missing field",
+            () =>
+              prisma.workflowRun.findUnique({
+                where: { id: "a", workflowId: "nope" },
+              }),
+            null,
+          ],
+          [
+            "findUnique beside an undefined field",
+            () =>
+              prisma.workflowRun.findUnique({
+                where: { id: "a", workflowId: undefined },
+                select: { id: true },
+              }),
+            { id: "a" },
+          ],
+          [
+            "findUnique beside OR: []",
+            () => prisma.workflowRun.findUnique({ where: { id: "a", OR: [] } }),
+            null,
+          ],
+          [
+            "findUnique beside OR: [{}]",
+            () =>
+              prisma.workflowRun.findUnique({ where: { id: "a", OR: [{}] } }),
+            null,
+          ],
+          [
+            "findUnique beside an OR",
+            () =>
+              prisma.workflowRun.findUnique({
+                where: { id: "a", OR: [{ workflowId: "wf" }] },
+                select: { id: true },
+              }),
+            { id: "a" },
+          ],
+          [
+            "findUnique beside a relation filter",
+            () =>
+              prisma.workflowRun.findUnique({
+                where: { id: "a", stages: { none: {} } },
+              }),
+            null,
+          ],
+          [
+            "findUnique beside an operator",
+            () =>
+              prisma.workflowRun.findUnique({
+                where: { id: "a", priority: { gt: 0 } },
+                select: { id: true },
+              }),
+            { id: "a" },
+          ],
+          [
+            "findUnique of a compound key",
+            () =>
+              prisma.workflowStage.findUnique({
+                where: {
+                  workflowRunId_stageId: { workflowRunId: "a", stageId: "s" },
+                },
+                select: { id: true },
+              }),
+            { id: "s1" },
+          ],
+          [
+            "findUnique of a compound key miss",
+            () =>
+              prisma.workflowStage.findUnique({
+                where: {
+                  workflowRunId_stageId: { workflowRunId: "a", stageId: "zz" },
+                },
+              }),
+            null,
+          ],
+          [
+            "findUnique of the id and a compound key",
+            () =>
+              prisma.workflowStage.findUnique({
+                where: {
+                  id: "s1",
+                  workflowRunId_stageId: { workflowRunId: "a", stageId: "s" },
+                },
+                select: { id: true },
+              }),
+            { id: "s1" },
+          ],
+          [
+            "findUnique of an id and a compound key that differ",
+            () =>
+              prisma.workflowStage.findUnique({
+                where: {
+                  id: "s2",
+                  workflowRunId_stageId: { workflowRunId: "a", stageId: "s" },
+                },
+              }),
+            null,
+          ],
+          [
+            "findUnique of a compound key beside a field",
+            () =>
+              prisma.workflowStage.findUnique({
+                where: {
+                  workflowRunId_stageId: { workflowRunId: "a", stageId: "s" },
+                  status: "PENDING",
+                },
+                select: { id: true },
+              }),
+            { id: "s1" },
+          ],
+          [
+            "findUnique of a compound key beside a missing field",
+            () =>
+              prisma.workflowStage.findUnique({
+                where: {
+                  workflowRunId_stageId: { workflowRunId: "a", stageId: "s" },
+                  status: "RUNNING",
+                },
+              }),
+            null,
+          ],
+          [
+            "findUnique of a compound primary key",
+            () =>
+              prisma.workflowDefinition.findUnique({
+                where: {
+                  workflowId_version: { workflowId: "zz", version: "1" },
+                },
+              }),
+            null,
+          ],
+        ];
+        it.each(READS)("reads %s", async (_name, read, expected) => {
+          expect(await read()).toEqual(expected);
+        });
+
+        const INVALID_READS: Array<[string, () => Promise<unknown>]> = [
+          [
+            "orderBy of two columns in one entry",
+            () => runs({}, { orderBy: { priority: "desc", id: "asc" } }),
+          ],
+          [
+            "orderBy of undefined in a list",
+            () => runs({}, { orderBy: [undefined] }),
+          ],
+          [
+            "orderBy of a bad direction",
+            () => runs({}, { orderBy: { priority: "up" } }),
+          ],
+          [
+            "orderBy of an unknown column",
+            () => runs({}, { orderBy: { nope: "asc" } }),
+          ],
+          ["take: null", () => runs({}, { take: null })],
+          [
+            "findFirst with take: 0",
+            () => prisma.workflowRun.findFirst({ take: 0 }),
+          ],
+          [
+            "findFirst with take: 2",
+            () => prisma.workflowRun.findFirst({ take: 2 }),
+          ],
+          [
+            "an empty select",
+            () => prisma.workflowRun.findFirst({ select: {} }),
+          ],
+          [
+            "a select of false only",
+            () => prisma.workflowRun.findFirst({ select: { id: false } }),
+          ],
+          [
+            "a select of undefined only",
+            () => prisma.workflowRun.findFirst({ select: { id: undefined } }),
+          ],
+          [
+            "a select with options on a column",
+            () =>
+              prisma.workflowRun.findFirst({
+                select: { id: { unrecognized: true } },
+              }),
+          ],
+          [
+            "a select of a string",
+            () => prisma.workflowRun.findFirst({ select: { id: "yes" } }),
+          ],
+          [
+            "a select of null",
+            () => prisma.workflowRun.findFirst({ select: { id: null } }),
+          ],
+          [
+            "a select of an unknown column",
+            () => prisma.workflowRun.findFirst({ select: { nope: true } }),
+          ],
+          [
+            "an empty select of a relation",
+            () =>
+              prisma.workflowRun.findFirst({
+                select: { stages: { select: {} } },
+              }),
+          ],
+          [
+            "select with include",
+            () =>
+              prisma.workflowRun.findFirst({
+                select: { id: true },
+                include: { stages: true },
+              }),
+          ],
+          [
+            "include of an unknown relation",
+            () => prisma.workflowRun.findFirst({ include: { nope: true } }),
+          ],
+          [
+            "include of a column",
+            () => prisma.workflowRun.findFirst({ include: { id: true } }),
+          ],
+          [
+            "an empty select in an include",
+            () =>
+              prisma.workflowStage.findMany({
+                include: { workflowRun: { select: {} } },
+              }),
+          ],
+          ["an aggregate of nothing", () => prisma.workflowRun.aggregate({})],
+          ["an empty _min", () => prisma.workflowRun.aggregate({ _min: {} })],
+          [
+            "_min of false",
+            () => prisma.workflowRun.aggregate({ _min: { priority: false } }),
+          ],
+          [
+            "_min of undefined",
+            () =>
+              prisma.workflowRun.aggregate({ _min: { priority: undefined } }),
+          ],
+          [
+            "_min of a string",
+            () => prisma.workflowRun.aggregate({ _min: { priority: "yes" } }),
+          ],
+          [
+            "_max of JSON",
+            () => prisma.workflowRun.aggregate({ _max: { metadata: true } }),
+          ],
+          [
+            "_max of an unknown column",
+            () => prisma.workflowRun.aggregate({ _max: { nope: true } }),
+          ],
+          [
+            "_count of false",
+            () => prisma.workflowRun.aggregate({ _count: { _all: false } }),
+          ],
+          [
+            "_count of undefined",
+            () => prisma.workflowRun.aggregate({ _count: { _all: undefined } }),
+          ],
+          [
+            "an empty _count",
+            () => prisma.workflowRun.aggregate({ _count: {} }),
+          ],
+          [
+            "groupBy of no columns",
+            () =>
+              prisma.workflowRun.groupBy({ by: [], _count: { _all: true } }),
+          ],
+          [
+            "groupBy with no by",
+            () => prisma.workflowRun.groupBy({ _count: { _all: true } }),
+          ],
+          [
+            "groupBy of an unknown column",
+            () => prisma.workflowRun.groupBy({ by: ["nope"] }),
+          ],
+          [
+            "groupBy with _min of false",
+            () =>
+              prisma.workflowRun.groupBy({
+                by: ["status"],
+                _min: { priority: false },
+              }),
+          ],
+          [
+            "groupBy with _count of false",
+            () =>
+              prisma.workflowRun.groupBy({
+                by: ["status"],
+                _count: { _all: false },
+              }),
+          ],
+          ["findUnique with no args", () => prisma.workflowRun.findUnique()],
+          [
+            "findUnique with an empty where",
+            () => prisma.workflowRun.findUnique({ where: {} }),
+          ],
+          [
+            "findUnique of an undefined key",
+            () => prisma.workflowRun.findUnique({ where: { id: undefined } }),
+          ],
+          [
+            "findUnique of no key",
+            () =>
+              prisma.workflowRun.findUnique({ where: { workflowId: "wf" } }),
+          ],
+          [
+            "findUnique of a null key",
+            () => prisma.workflowRun.findUnique({ where: { id: null } }),
+          ],
+          [
+            "findUnique of a filter on the key",
+            () =>
+              prisma.workflowRun.findUnique({ where: { id: { equals: "a" } } }),
+          ],
+          [
+            "findUnique of in on the key",
+            () =>
+              prisma.workflowRun.findUnique({ where: { id: { in: ["a"] } } }),
+          ],
+          [
+            "findUnique of a number key",
+            () => prisma.workflowRun.findUnique({ where: { id: 5 } }),
+          ],
+          [
+            "findUnique of OR alone",
+            () =>
+              prisma.workflowRun.findUnique({ where: { OR: [{ id: "a" }] } }),
+          ],
+          [
+            "findUnique with take",
+            () =>
+              prisma.workflowRun.findUnique({ where: { id: "a" }, take: 1 }),
+          ],
+          [
+            "findUnique with orderBy",
+            () =>
+              prisma.workflowRun.findUnique({
+                where: { id: "a" },
+                orderBy: { id: "asc" },
+              }),
+          ],
+          [
+            "findUnique of a compound key missing a part",
+            () =>
+              prisma.workflowStage.findUnique({
+                where: { workflowRunId_stageId: { workflowRunId: "a" } },
+              }),
+          ],
+          [
+            "findUnique of a compound key with an undefined part",
+            () =>
+              prisma.workflowStage.findUnique({
+                where: {
+                  workflowRunId_stageId: {
+                    workflowRunId: "a",
+                    stageId: undefined,
+                  },
+                },
+              }),
+          ],
+          [
+            "findUnique of a compound key with a null part",
+            () =>
+              prisma.workflowStage.findUnique({
+                where: {
+                  workflowRunId_stageId: { workflowRunId: "a", stageId: null },
+                },
+              }),
+          ],
+          [
+            "findUnique of a compound key with a filter part",
+            () =>
+              prisma.workflowStage.findUnique({
+                where: {
+                  workflowRunId_stageId: {
+                    workflowRunId: "a",
+                    stageId: { equals: "s" },
+                  },
+                },
+              }),
+          ],
+          [
+            "findUnique of a compound key with an extra column",
+            () =>
+              prisma.workflowStage.findUnique({
+                where: {
+                  workflowRunId_stageId: {
+                    workflowRunId: "a",
+                    stageId: "s",
+                    status: "PENDING",
+                  },
+                },
+              }),
+          ],
+          [
+            "findUnique of an empty compound key",
+            () =>
+              prisma.workflowStage.findUnique({
+                where: { workflowRunId_stageId: {} },
+              }),
+          ],
+          [
+            "findUnique of the columns of a compound key",
+            () =>
+              prisma.workflowStage.findUnique({
+                where: { workflowRunId: "a", stageId: "s" },
+              }),
+          ],
+          [
+            "findUnique of the id and an incomplete compound key",
+            () =>
+              prisma.workflowStage.findUnique({
+                where: {
+                  id: "s1",
+                  workflowRunId_stageId: {
+                    workflowRunId: "a",
+                    stageId: undefined,
+                  },
+                },
+              }),
+          ],
+          [
+            "findUnique of a compound key with a null nullable part",
+            () =>
+              prisma.workflowAnnotation.findUnique({
+                where: {
+                  workflowRunId_key_idempotencyKey: {
+                    workflowRunId: "a",
+                    key: "k",
+                    idempotencyKey: null,
+                  },
+                },
+              }),
+          ],
+        ];
+        it.each(INVALID_READS)("rejects %s", async (_name, read) => {
+          await expect(read()).rejects.toThrow(REJECTED);
+        });
+
+        const UNSUPPORTED_READS_ON_8: Array<[string, () => Promise<unknown>]> =
+          [
+            [
+              "orderBy of undefined",
+              () => runs({}, { orderBy: { priority: undefined } }),
+            ],
+            [
+              "orderBy with nulls",
+              () =>
+                runs(
+                  {},
+                  { orderBy: { startedAt: { sort: "asc", nulls: "first" } } },
+                ),
+            ],
+            [
+              "orderBy of a relation count",
+              () => runs({}, { orderBy: { stages: { _count: "asc" } } }),
+            ],
+            [
+              "a unique key beside one of its own columns",
+              () =>
+                prisma.workflowStage.findUnique({
+                  where: {
+                    workflowRunId_stageId: { workflowRunId: "a", stageId: "s" },
+                    stageId: "t",
+                  },
+                }),
+            ],
+            ["a negative take", () => runs({}, { take: -1 })],
+            ["skip", () => runs({}, { skip: 1 })],
+            ["cursor", () => runs({}, { cursor: { id: "a" } })],
+            ["distinct", () => runs({}, { distinct: ["id"] })],
+            [
+              "a select of a number",
+              () => prisma.workflowRun.findFirst({ select: { id: 1 } }),
+            ],
+            [
+              "a select of an empty object",
+              () => prisma.workflowRun.findFirst({ select: { id: {} } }),
+            ],
+            [
+              "a relation selected with true",
+              () => prisma.workflowRun.findFirst({ select: { stages: true } }),
+            ],
+            [
+              "a relation included with true",
+              () => prisma.workflowRun.findFirst({ include: { stages: true } }),
+            ],
+            [
+              "an include with a where",
+              () =>
+                prisma.workflowRun.findFirst({
+                  include: { stages: { where: { stageId: "s" } } },
+                }),
+            ],
+            [
+              "count with select",
+              () => prisma.workflowRun.count({ select: { _all: true } }),
+            ],
+            ["count with take", () => prisma.workflowRun.count({ take: 1 })],
+            [
+              "_count: true",
+              () => prisma.workflowRun.aggregate({ _count: true }),
+            ],
+            [
+              "_count of a column",
+              () => prisma.workflowRun.aggregate({ _count: { id: true } }),
+            ],
+            [
+              "_sum",
+              () => prisma.workflowRun.aggregate({ _sum: { priority: true } }),
+            ],
+            [
+              "_avg",
+              () => prisma.workflowRun.aggregate({ _avg: { priority: true } }),
+            ],
+            [
+              "aggregate with take",
+              () =>
+                prisma.workflowRun.aggregate({
+                  take: 1,
+                  _max: { priority: true },
+                }),
+            ],
+            [
+              "aggregate with orderBy",
+              () =>
+                prisma.workflowRun.aggregate({
+                  orderBy: { id: "asc" },
+                  _max: { priority: true },
+                }),
+            ],
+            [
+              "groupBy of a string",
+              () => prisma.workflowRun.groupBy({ by: "status" }),
+            ],
+            [
+              "groupBy with having",
+              () =>
+                prisma.workflowRun.groupBy({
+                  by: ["status"],
+                  having: { status: "RUNNING" },
+                }),
+            ],
+            [
+              "groupBy with orderBy",
+              () =>
+                prisma.workflowRun.groupBy({
+                  by: ["status"],
+                  orderBy: { status: "asc" },
+                }),
+            ],
+            [
+              "groupBy with take",
+              () =>
+                prisma.workflowRun.groupBy({
+                  by: ["status"],
+                  take: 1,
+                  orderBy: { status: "asc" },
+                }),
+            ],
+          ];
+        it.runIf(isPrisma8).each(UNSUPPORTED_READS_ON_8)(
+          "does not take %s on Prisma 8",
+          async (_name, read) => {
+            await expect(read()).rejects.toThrow(REJECTED);
+          },
+        );
+      });
+
+      describe("writes", () => {
+        beforeEach(seed);
+
+        const row = (id = "a") =>
+          prisma.workflowRun.findUnique({
+            where: { id },
+            select: {
+              priority: true,
+              metadata: true,
+              input: true,
+              startedAt: true,
+              definitionVersion: true,
+            },
+          });
+        const updatedAt = async (id = "a") =>
+          (
+            await prisma.workflowRun.findUnique({
+              where: { id },
+              select: { updatedAt: true },
+            })
+          ).updatedAt.getTime();
+        const blobs = async () =>
+          (
+            await prisma.workflowBlob.findMany({
+              select: { key: true, data: true },
+            })
+          ).sort((a: { key: string }, b: { key: string }) =>
+            a.key.localeCompare(b.key),
+          );
+        const X = { key: "x", data: 1 };
+        const Y = { key: "y", data: 2 };
+        const blobStage = { stageName: "s", stageNumber: 1, executionGroup: 1 };
+        const ROW = {
+          priority: 1,
+          metadata: null,
+          input: {},
+          startedAt: null,
+          definitionVersion: "x",
+        };
+
+        // [name, data, row after, whether updatedAt moved]
+        const UPDATES: Array<[string, unknown, unknown, boolean]> = [
+          ["data: {}", {}, ROW, false],
+          ["only undefined values", { priority: undefined }, ROW, false],
+          [
+            "undefined beside a value",
+            { priority: undefined, workflowName: "n" },
+            ROW,
+            true,
+          ],
+          ["null JSON", { metadata: null }, ROW, true],
+          [
+            "a JSON object",
+            { metadata: { z: 1 } },
+            { ...ROW, metadata: { z: 1 } },
+            true,
+          ],
+          ["a JSON string", { metadata: "s" }, { ...ROW, metadata: "s" }, true],
+          [
+            "a JSON { set }, as a value",
+            { metadata: { set: 1 } },
+            { ...ROW, metadata: { set: 1 } },
+            true,
+          ],
+          [
+            "a JSON { increment }, as a value",
+            { metadata: { increment: 1 } },
+            { ...ROW, metadata: { increment: 1 } },
+            true,
+          ],
+          [
+            "null JSON on a required column",
+            { input: null },
+            { ...ROW, input: null },
+            true,
+          ],
+          [
+            "{ increment }",
+            { priority: { increment: 2 } },
+            { ...ROW, priority: 3 },
+            true,
+          ],
+          [
+            "{ decrement }",
+            { priority: { decrement: 2 } },
+            { ...ROW, priority: -1 },
+            true,
+          ],
+          ["{ increment: 0 }", { priority: { increment: 0 } }, ROW, true],
+          ["{ set }", { priority: { set: 7 } }, { ...ROW, priority: 7 }, true],
+          [
+            "{ set: null }",
+            { definitionVersion: { set: null } },
+            { ...ROW, definitionVersion: null },
+            true,
+          ],
+          [
+            "null on a nullable column",
+            { definitionVersion: null },
+            { ...ROW, definitionVersion: null },
+            true,
+          ],
+          ["a Date", { startedAt: D2 }, { ...ROW, startedAt: D2 }, true],
+          ["a null Date", { startedAt: null }, ROW, true],
+        ];
+        it.each(
+          UPDATES,
+        )("updates with %s", async (_name, data, expected, bumped) => {
+          const before = await updatedAt();
+          await new Promise((resolve) => setTimeout(resolve, 5));
+          expect(
+            await prisma.workflowRun.update({
+              where: { id: "a" },
+              data,
+              select: { id: true },
+            }),
+          ).toEqual({ id: "a" });
+          expect(await row()).toEqual(expected);
+          expect((await updatedAt()) !== before).toBe(bumped);
+        });
+
+        const WRITES: Array<[string, () => Promise<unknown>, unknown]> = [
+          ...(
+            [
+              ["a fractional int", { priority: 562.5 }, 562],
+              ["a negative fractional int", { priority: -5.5 }, -5],
+              ["the smallest int", { priority: -(2 ** 31) }, -(2 ** 31)],
+              [
+                "a fractional { increment }",
+                { priority: { increment: 1.5 } },
+                2,
+              ],
+            ] as Array<[string, Record<string, unknown>, number]>
+          ).map(
+            ([name, data, priority]): [
+              string,
+              () => Promise<unknown>,
+              unknown,
+            ] => [
+              `update with ${name}`,
+              () =>
+                prisma.workflowRun.update({
+                  where: { id: "a" },
+                  data,
+                  select: { priority: true },
+                }),
+              { priority },
+            ],
+          ),
+          [
+            "update with a matching fence",
+            () =>
+              prisma.workflowRun.update({
+                where: { id: "a", version: 1 },
+                data: { priority: 99 },
+                select: { priority: true },
+              }),
+            { priority: 99 },
+          ],
+          [
+            "update with an operator fence",
+            () =>
+              prisma.workflowRun.update({
+                where: { id: "a", status: { in: ["PENDING"] } },
+                data: { priority: 99 },
+                select: { priority: true },
+              }),
+            { priority: 99 },
+          ],
+          [
+            "update of a compound key with a fence",
+            () =>
+              prisma.workflowStage.update({
+                where: {
+                  workflowRunId_stageId: { workflowRunId: "a", stageId: "s" },
+                  version: 1,
+                },
+                data: { duration: 1 },
+                select: { id: true },
+              }),
+            { id: "s1" },
+          ],
+          [
+            "data: {} on a model without updatedAt",
+            () =>
+              prisma.workflowAnnotation.update({
+                where: { id: "n1" },
+                data: {},
+                select: { id: true },
+              }),
+            { id: "n1" },
+          ],
+          [
+            "undefined data on a model without updatedAt",
+            () =>
+              prisma.workflowAnnotation.update({
+                where: { id: "n1" },
+                data: { key: undefined },
+                select: { id: true },
+              }),
+            { id: "n1" },
+          ],
+          [
+            "{ increment } on a NULL column",
+            async () => {
+              await prisma.workflowStage.update({
+                where: { id: "s3" },
+                data: { duration: { increment: 1 } },
+              });
+              return prisma.workflowStage.findUnique({
+                where: { id: "s3" },
+                select: { duration: true },
+              });
+            },
+            { duration: null },
+          ],
+          [
+            "{ increment } on a float",
+            async () => {
+              await prisma.workflowRun.update({
+                where: { id: "a" },
+                data: { totalCost: { increment: 0.125 } },
+              });
+              return prisma.workflowRun.findUnique({
+                where: { id: "a" },
+                select: { totalCost: true },
+              });
+            },
+            { totalCost: 0.125 },
+          ],
+          [
+            "an explicit updatedAt",
+            async () => {
+              await prisma.workflowRun.update({
+                where: { id: "a" },
+                data: { updatedAt: D1 },
+              });
+              return updatedAt();
+            },
+            D1.getTime(),
+          ],
+          [
+            "updateMany matching zero rows",
+            () =>
+              prisma.workflowRun.updateMany({
+                where: { id: "zz" },
+                data: { priority: 9 },
+              }),
+            { count: 0 },
+          ],
+          [
+            "updateMany of every row",
+            () => prisma.workflowRun.updateMany({ data: { priority: 9 } }),
+            { count: 12 },
+          ],
+          [
+            "updateMany with an empty where",
+            () =>
+              prisma.workflowRun.updateMany({
+                where: {},
+                data: { priority: 9 },
+              }),
+            { count: 12 },
+          ],
+          [
+            "updateMany of OR: []",
+            () =>
+              prisma.workflowRun.updateMany({
+                where: { OR: [] },
+                data: { priority: 9 },
+              }),
+            { count: 0 },
+          ],
+          [
+            "updateMany of OR: [{}]",
+            () =>
+              prisma.workflowRun.updateMany({
+                where: { OR: [{}] },
+                data: { priority: 9 },
+              }),
+            { count: 0 },
+          ],
+          [
+            "updateMany with a stale fence",
+            () =>
+              prisma.workflowRun.updateMany({
+                where: { id: "a", version: 2 },
+                data: { priority: 9 },
+              }),
+            { count: 0 },
+          ],
+          [
+            "updateMany of { increment }",
+            () =>
+              prisma.workflowRun.updateMany({
+                where: { id: "a" },
+                data: { priority: { increment: 1 } },
+              }),
+            { count: 1 },
+          ],
+          [
+            "updateMany of null JSON",
+            () =>
+              prisma.workflowRun.updateMany({
+                where: { id: "a" },
+                data: { metadata: null },
+              }),
+            { count: 1 },
+          ],
+          [
+            "updateMany of a relation filter",
+            () =>
+              prisma.workflowRun.updateMany({
+                where: { stages: { none: {} } },
+                data: { priority: 9 },
+              }),
+            { count: 9 },
+          ],
+          [
+            "delete",
+            async () => [
+              await prisma.workflowRun.delete({
+                where: { id: "a" },
+                select: { id: true },
+              }),
+              await prisma.workflowRun.count(),
+            ],
+            [{ id: "a" }, 11],
+          ],
+          [
+            "delete with a matching fence",
+            async () => [
+              await prisma.workflowRun.delete({
+                where: { id: "a", version: 1 },
+                select: { id: true },
+              }),
+              await prisma.workflowRun.count(),
+            ],
+            [{ id: "a" }, 11],
+          ],
+          [
+            "deleteMany matching zero rows",
+            async () => [
+              await prisma.workflowRun.deleteMany({ where: { id: "zz" } }),
+              await prisma.workflowRun.count(),
+            ],
+            [{ count: 0 }, 12],
+          ],
+          [
+            "deleteMany with no args",
+            async () => [
+              await prisma.workflowRun.deleteMany(),
+              await prisma.workflowRun.count(),
+            ],
+            [{ count: 12 }, 0],
+          ],
+          [
+            "deleteMany with an empty where",
+            async () => [
+              await prisma.workflowRun.deleteMany({ where: {} }),
+              await prisma.workflowRun.count(),
+            ],
+            [{ count: 12 }, 0],
+          ],
+          [
+            "deleteMany of OR: []",
+            async () => [
+              await prisma.workflowRun.deleteMany({ where: { OR: [] } }),
+              await prisma.workflowRun.count(),
+            ],
+            [{ count: 0 }, 12],
+          ],
+          [
+            "deleteMany of OR: [{}]",
+            async () => [
+              await prisma.workflowRun.deleteMany({ where: { OR: [{}] } }),
+              await prisma.workflowRun.count(),
+            ],
+            [{ count: 0 }, 12],
+          ],
+          [
+            "deleteMany of an undefined field",
+            async () => [
+              await prisma.workflowRun.deleteMany({ where: { id: undefined } }),
+              await prisma.workflowRun.count(),
+            ],
+            [{ count: 12 }, 0],
+          ],
+          [
+            "deleteMany of a no-op",
+            async () => [
+              await prisma.workflowRun.deleteMany({ where: { id: {} } }),
+              await prisma.workflowRun.count(),
+            ],
+            [{ count: 12 }, 0],
+          ],
+          [
+            "deleteMany of in: []",
+            async () => [
+              await prisma.workflowRun.deleteMany({
+                where: { id: { in: [] } },
+              }),
+              await prisma.workflowRun.count(),
+            ],
+            [{ count: 0 }, 12],
+          ],
+          [
+            "deleteMany of a relation filter",
+            async () => [
+              await prisma.workflowRun.deleteMany({
+                where: { stages: { none: {} } },
+              }),
+              await prisma.workflowRun.count(),
+            ],
+            [{ count: 9 }, 3],
+          ],
+          [
+            "upsert with equal keys over a row",
+            async () => [
+              await prisma.workflowBlob.upsert({
+                where: { key: "x" },
+                create: { key: "x", data: 3 },
+                update: { data: 4 },
+                select: { key: true },
+              }),
+              await blobs(),
+            ],
+            [{ key: "x" }, [{ key: "x", data: 4 }, Y]],
+          ],
+          [
+            "upsert with equal keys and no row",
+            async () => [
+              (
+                await prisma.workflowBlob.upsert({
+                  where: { key: "n" },
+                  create: { key: "n", data: 3 },
+                  update: { data: 4 },
+                })
+              ).data,
+              await blobs(),
+            ],
+            [3, [{ key: "n", data: 3 }, X, Y]],
+          ],
+          [
+            "upsert with differing keys over a row",
+            async () => [
+              (
+                await prisma.workflowBlob.upsert({
+                  where: { key: "x" },
+                  create: { key: "y", data: 3 },
+                  update: { data: 4 },
+                })
+              ).key,
+              await blobs(),
+            ],
+            ["x", [{ key: "x", data: 4 }, Y]],
+          ],
+          [
+            "upsert with differing keys and no row",
+            async () => [
+              (
+                await prisma.workflowBlob.upsert({
+                  where: { key: "n" },
+                  create: { key: "m", data: 3 },
+                  update: { data: 4 },
+                })
+              ).key,
+              await blobs(),
+            ],
+            ["m", [{ key: "m", data: 3 }, X, Y]],
+          ],
+          [
+            "upsert with update: {} and equal keys over a row",
+            async () => [
+              (
+                await prisma.workflowBlob.upsert({
+                  where: { key: "x" },
+                  create: { key: "x", data: 3 },
+                  update: {},
+                })
+              ).data,
+              await blobs(),
+            ],
+            [1, [X, Y]],
+          ],
+          [
+            "upsert with update: {} and equal keys and no row",
+            async () => [
+              (
+                await prisma.workflowBlob.upsert({
+                  where: { key: "n" },
+                  create: { key: "n", data: 3 },
+                  update: {},
+                })
+              ).data,
+              await blobs(),
+            ],
+            [3, [{ key: "n", data: 3 }, X, Y]],
+          ],
+          [
+            "upsert with update: {} and differing keys over a row",
+            async () => [
+              (
+                await prisma.workflowBlob.upsert({
+                  where: { key: "x" },
+                  create: { key: "y", data: 3 },
+                  update: {},
+                })
+              ).key,
+              await blobs(),
+            ],
+            ["x", [X, Y]],
+          ],
+          [
+            "upsert with update: {} and differing keys and no row",
+            async () => [
+              (
+                await prisma.workflowBlob.upsert({
+                  where: { key: "n" },
+                  create: { key: "m", data: 3 },
+                  update: {},
+                })
+              ).key,
+              await blobs(),
+            ],
+            ["m", [{ key: "m", data: 3 }, X, Y]],
+          ],
+          [
+            "upsert with update of undefined",
+            async () => [
+              (
+                await prisma.workflowBlob.upsert({
+                  where: { key: "x" },
+                  create: { key: "x", data: 3 },
+                  update: { data: undefined },
+                })
+              ).data,
+              await blobs(),
+            ],
+            [1, [X, Y]],
+          ],
+          [
+            "upsert leaving updatedAt with update: {}",
+            async () => {
+              const stamp = async () =>
+                (
+                  await prisma.workflowBlob.findUnique({ where: { key: "x" } })
+                ).updatedAt.getTime();
+              const before = await stamp();
+              await new Promise((resolve) => setTimeout(resolve, 5));
+              await prisma.workflowBlob.upsert({
+                where: { key: "x" },
+                create: { key: "x", data: 3 },
+                update: {},
+              });
+              await prisma.workflowBlob.upsert({
+                where: { key: "x" },
+                create: { key: "y", data: 3 },
+                update: {},
+              });
+              return (await stamp()) === before;
+            },
+            true,
+          ],
+          [
+            "upsert changing the key",
+            async () => [
+              (
+                await prisma.workflowBlob.upsert({
+                  where: { key: "x" },
+                  create: { key: "x", data: 3 },
+                  update: { key: "z" },
+                })
+              ).key,
+              await blobs(),
+            ],
+            ["z", [Y, { key: "z", data: 1 }]],
+          ],
+          [
+            "upsert writing null JSON",
+            async () => [
+              (
+                await prisma.workflowBlob.upsert({
+                  where: { key: "x" },
+                  create: { key: "x", data: 3 },
+                  update: { data: null },
+                })
+              ).data,
+              await blobs(),
+            ],
+            [null, [{ key: "x", data: null }, Y]],
+          ],
+          [
+            "upsert creating null JSON",
+            async () => [
+              (
+                await prisma.workflowBlob.upsert({
+                  where: { key: "n" },
+                  create: { key: "n", data: null },
+                  update: { data: 4 },
+                })
+              ).data,
+              await blobs(),
+            ],
+            [null, [{ key: "n", data: null }, X, Y]],
+          ],
+          [
+            "upsert with update: {} on a model without updatedAt",
+            () =>
+              prisma.workflowAnnotation.upsert({
+                where: { id: "n1" },
+                create: annotation("n1", "a", null),
+                update: {},
+                select: { key: true },
+              }),
+            { key: "n1" },
+          ],
+          [
+            "upsert with update: {} and differing keys on a model without updatedAt",
+            () =>
+              prisma.workflowAnnotation.upsert({
+                where: { id: "n1" },
+                create: annotation("zz", "a", null),
+                update: {},
+                select: { key: true },
+              }),
+            { key: "n1" },
+          ],
+          [
+            "upsert with a generated key",
+            async () => {
+              const { id: _id, ...create } = run("x");
+              const created = await prisma.workflowRun.upsert({
+                where: { id: "new" },
+                create,
+                update: { priority: 2 },
+              });
+              return [created.id === "new", await prisma.workflowRun.count()];
+            },
+            [false, 13],
+          ],
+          [
+            "upsert of a compound key over a row",
+            () =>
+              prisma.workflowStage.upsert({
+                where: {
+                  workflowRunId_stageId: { workflowRunId: "a", stageId: "s" },
+                },
+                create: { workflowRunId: "a", stageId: "s", ...blobStage },
+                update: { version: { increment: 1 } },
+                select: { id: true, version: true },
+              }),
+            { id: "s1", version: 2 },
+          ],
+          [
+            "upsert of a compound key differing from create",
+            () =>
+              prisma.workflowStage.upsert({
+                where: {
+                  workflowRunId_stageId: { workflowRunId: "a", stageId: "s" },
+                },
+                create: { workflowRunId: "a", stageId: "t", ...blobStage },
+                update: { version: { increment: 1 } },
+                select: { id: true, version: true },
+              }),
+            { id: "s1", version: 2 },
+          ],
+          [
+            "upsert of a compound key differing from create, with no row",
+            () =>
+              prisma.workflowStage.upsert({
+                where: {
+                  workflowRunId_stageId: { workflowRunId: "a", stageId: "new" },
+                },
+                create: { workflowRunId: "a", stageId: "newer", ...blobStage },
+                update: { version: { increment: 1 } },
+                select: { stageId: true, version: true },
+              }),
+            { stageId: "newer", version: 1 },
+          ],
+          [
+            "concurrent upserts with equal keys",
+            async () => {
+              await Promise.all(
+                Array.from({ length: 16 }, (_, i) =>
+                  prisma.workflowBlob.upsert({
+                    where: { key: "race" },
+                    create: { key: "race", data: i },
+                    update: { data: 100 + i },
+                  }),
+                ),
+              );
+              return prisma.workflowBlob.count({ where: { key: "race" } });
+            },
+            1,
+          ],
+          [
+            // An empty update takes the read-then-insert path, so a loser may
+            // hit the unique key; that is why this is not `ON CONFLICT` on 8.
+            "concurrent upserts with equal keys and update: {}",
+            async () => {
+              const settled = await Promise.allSettled(
+                Array.from({ length: 16 }, (_, i) =>
+                  prisma.workflowBlob.upsert({
+                    where: { key: "race" },
+                    create: { key: "race", data: i },
+                    update: {},
+                  }),
+                ),
+              );
+              return [
+                settled.every(
+                  (s) =>
+                    s.status === "fulfilled" || isUniqueViolation(s.reason),
+                ),
+                await prisma.workflowBlob.count({ where: { key: "race" } }),
+              ];
+            },
+            [true, 1],
+          ],
+          [
+            "concurrent upserts with differing keys, where one wins and the rest hit the unique key",
+            async () => {
+              const settled = await Promise.allSettled(
+                Array.from({ length: 8 }, (_, i) =>
+                  prisma.workflowBlob.upsert({
+                    where: { key: "race-where" },
+                    create: { key: "race-create", data: i },
+                    update: {},
+                  }),
+                ),
+              );
+              return [
+                settled.filter((s) => s.status === "fulfilled").length,
+                settled.filter(
+                  (s) => s.status === "rejected" && isUniqueViolation(s.reason),
+                ).length,
+              ];
+            },
+            [1, 7],
+          ],
+          [
+            "create with null JSON",
+            async () => {
+              const created = await prisma.workflowRun.create({
+                data: run("n", { metadata: null }),
+              });
+              return [
+                created.metadata,
+                await runs({ id: "n", metadata: { equals: null } }),
+              ];
+            },
+            [null, "n"],
+          ],
+          [
+            "create with null JSON on a required column",
+            async () =>
+              (
+                await prisma.workflowRun.create({
+                  data: run("n", { input: null }),
+                })
+              ).input,
+            null,
+          ],
+          [
+            "create with undefined JSON, which is DB NULL",
+            async () => {
+              await prisma.workflowRun.create({
+                data: run("n", { metadata: undefined }),
+              });
+              return runs({ id: "n", metadata: { equals: null } });
+            },
+            "",
+          ],
+          [
+            "createMany of no rows",
+            () => prisma.workflowRun.createMany({ data: [] }),
+            { count: 0 },
+          ],
+          [
+            "createMany skipping a duplicate",
+            () =>
+              prisma.workflowRun.createMany({
+                data: [run("a"), run("n")],
+                skipDuplicates: true,
+              }),
+            { count: 1 },
+          ],
+          [
+            "createMany of rows with different columns",
+            () =>
+              prisma.workflowRun.createMany({
+                data: [run("n"), run("m", { metadata: { z: 1 } })],
+              }),
+            { count: 2 },
+          ],
+          [
+            "createMany filling the bind limit",
+            async () => [
+              await prisma.workflowBlob.createMany({ data: blobRows(16_383) }),
+              await prisma.workflowBlob.count(),
+            ],
+            [{ count: 16_383 }, 16_385],
+          ],
+          [
+            "createMany one row over the bind limit",
+            async () => [
+              await prisma.workflowBlob.createMany({ data: blobRows(16_384) }),
+              await prisma.workflowBlob.count(),
+            ],
+            [{ count: 16_384 }, 16_386],
+          ],
+          [
+            "createMany of 40,000 rows",
+            async () => [
+              await prisma.workflowBlob.createMany({ data: blobRows(40_000) }),
+              await prisma.workflowBlob.count(),
+            ],
+            [{ count: 40_000 }, 40_002],
+          ],
+          [
+            "createMany skipping duplicates across the bind limit",
+            async () => [
+              await prisma.workflowBlob.createMany({
+                data: [
+                  { key: "x", data: 9 },
+                  ...blobRows(20_000),
+                  { key: "bulk-0", data: -1 },
+                  { key: "y", data: 9 },
+                ],
+                skipDuplicates: true,
+              }),
+              await blobs().then((all) => all.length),
+              (await prisma.workflowBlob.findUnique({ where: { key: "x" } }))
+                .data,
+              (
+                await prisma.workflowBlob.findUnique({
+                  where: { key: "bulk-0" },
+                })
+              ).data,
+            ],
+            [{ count: 20_000 }, 20_002, 1, 0],
+          ],
+        ];
+        it.each(WRITES)("writes %s", async (_name, write, expected) => {
+          expect(await write()).toEqual(expected);
+        });
+
+        const FAILS: Array<[string, () => Promise<unknown>, string]> = [
+          [
+            "update of a missing row",
+            () =>
+              prisma.workflowRun.update({
+                where: { id: "zz" },
+                data: { priority: 9 },
+              }),
+            "P2025",
+          ],
+          [
+            "update with a stale fence",
+            () =>
+              prisma.workflowRun.update({
+                where: { id: "a", version: 2 },
+                data: { priority: 9 },
+              }),
+            "P2025",
+          ],
+          [
+            "update beside OR: []",
+            () =>
+              prisma.workflowRun.update({
+                where: { id: "a", OR: [] },
+                data: { priority: 9 },
+              }),
+            "P2025",
+          ],
+          [
+            "update with data: {} of a missing row",
+            () => prisma.workflowRun.update({ where: { id: "zz" }, data: {} }),
+            "P2025",
+          ],
+          [
+            "update with data: {} of a missing row on a model without updatedAt",
+            () =>
+              prisma.workflowAnnotation.update({
+                where: { id: "zz" },
+                data: {},
+              }),
+            "P2025",
+          ],
+          [
+            "update of a compound key with a stale fence",
+            () =>
+              prisma.workflowStage.update({
+                where: {
+                  workflowRunId_stageId: { workflowRunId: "a", stageId: "s" },
+                  version: 2,
+                },
+                data: { duration: 1 },
+              }),
+            "P2025",
+          ],
+          [
+            "delete of a missing row",
+            () => prisma.workflowRun.delete({ where: { id: "zz" } }),
+            "P2025",
+          ],
+          [
+            "delete with a stale fence",
+            () => prisma.workflowRun.delete({ where: { id: "a", version: 2 } }),
+            "P2025",
+          ],
+        ];
+        it.each(FAILS)("fails %s", async (_name, write, code) => {
+          await expect(write()).rejects.toMatchObject({ code });
+          expect(
+            await prisma.workflowRun.count({ where: { priority: 9 } }),
+          ).toBe(1);
+          expect(await prisma.workflowRun.count()).toBe(12);
+        });
+
+        const UNIQUE_VIOLATIONS: Array<[string, () => Promise<unknown>]> = [
+          [
+            "create of a taken id",
+            () => prisma.workflowRun.create({ data: run("a") }),
+          ],
+          [
+            "createMany of a taken id",
+            () => prisma.workflowRun.createMany({ data: [run("a")] }),
+          ],
+          [
+            "upsert with no row and a taken create key",
+            () =>
+              prisma.workflowBlob.upsert({
+                where: { key: "n" },
+                create: { key: "y", data: 3 },
+                update: { data: 4 },
+              }),
+          ],
+          [
+            "upsert changing to a taken key",
+            () =>
+              prisma.workflowBlob.upsert({
+                where: { key: "x" },
+                create: { key: "x", data: 3 },
+                update: { key: "y" },
+              }),
+          ],
+          [
+            "createMany across the bind limit ending in a taken key",
+            () =>
+              prisma.workflowBlob.createMany({
+                data: [...blobRows(20_000), { key: "x", data: 3 }],
+              }),
+          ],
+        ];
+        it.each(
+          UNIQUE_VIOLATIONS,
+        )("hits the unique key on %s", async (_name, write) => {
+          const error = await write().catch((e: unknown) => e);
+          expect(isUniqueViolation(error)).toBe(true);
+          expect(await blobs()).toEqual([X, Y]);
+        });
+
+        // Rejected on every major, and nothing is written: [name, the call].
+        const INVALID_WRITES: Array<[string, () => Promise<unknown>]> = [
+          ["update with no args", () => prisma.workflowRun.update()],
+          [
+            "update with no where",
+            () => prisma.workflowRun.update({ data: { priority: 99 } }),
+          ],
+          [
+            "update with an empty where",
+            () =>
+              prisma.workflowRun.update({ where: {}, data: { priority: 99 } }),
+          ],
+          [
+            "update of an undefined key",
+            () =>
+              prisma.workflowRun.update({
+                where: { id: undefined },
+                data: { priority: 99 },
+              }),
+          ],
+          [
+            "update of no key",
+            () =>
+              prisma.workflowRun.update({
+                where: { workflowId: "wf" },
+                data: { priority: 99 },
+              }),
+          ],
+          [
+            "update of a null key",
+            () =>
+              prisma.workflowRun.update({
+                where: { id: null },
+                data: { priority: 99 },
+              }),
+          ],
+          [
+            "update of a filter on the key",
+            () =>
+              prisma.workflowRun.update({
+                where: { id: { equals: "a" } },
+                data: { priority: 99 },
+              }),
+          ],
+          [
+            "update of OR alone",
+            () =>
+              prisma.workflowRun.update({
+                where: { OR: [{ id: "a" }] },
+                data: { priority: 99 },
+              }),
+          ],
+          [
+            "update of an incomplete compound key",
+            () =>
+              prisma.workflowStage.update({
+                where: {
+                  workflowRunId_stageId: {
+                    workflowRunId: "a",
+                    stageId: undefined,
+                  },
+                },
+                data: { duration: 99 },
+              }),
+          ],
+          [
+            "update with no data",
+            () => prisma.workflowRun.update({ where: { id: "a" } }),
+          ],
+          [
+            "update with an empty select",
+            () =>
+              prisma.workflowRun.update({
+                where: { id: "a" },
+                data: { priority: 99 },
+                select: {},
+              }),
+          ],
+          [
+            "{ increment: undefined }",
+            () =>
+              prisma.workflowRun.update({
+                where: { id: "a" },
+                data: { priority: { increment: undefined } },
+              }),
+          ],
+          [
+            "{ increment } and { decrement } at once",
+            () =>
+              prisma.workflowRun.update({
+                where: { id: "a" },
+                data: { priority: { increment: 1, decrement: 1 } },
+              }),
+          ],
+          [
+            "{ increment } of a string",
+            () =>
+              prisma.workflowRun.update({
+                where: { id: "a" },
+                data: { priority: { increment: "1" } },
+              }),
+          ],
+          [
+            "{ increment } on text",
+            () =>
+              prisma.workflowRun.update({
+                where: { id: "a" },
+                data: { workflowName: { increment: 1 } },
+              }),
+          ],
+          [
+            "{ set: undefined }",
+            () =>
+              prisma.workflowRun.update({
+                where: { id: "a" },
+                data: { priority: { set: undefined } },
+              }),
+          ],
+          [
+            "{ set: null } on a required column",
+            () =>
+              prisma.workflowRun.update({
+                where: { id: "a" },
+                data: { priority: { set: null } },
+              }),
+          ],
+          [
+            "an empty update operator",
+            () =>
+              prisma.workflowRun.update({
+                where: { id: "a" },
+                data: { priority: {} },
+              }),
+          ],
+          [
+            "null for a required column",
+            () =>
+              prisma.workflowRun.update({
+                where: { id: "a" },
+                data: { workflowName: null },
+              }),
+          ],
+          [
+            "a string for an int",
+            () =>
+              prisma.workflowRun.update({
+                where: { id: "a" },
+                data: { priority: "1" },
+              }),
+          ],
+          [
+            "a number for text",
+            () =>
+              prisma.workflowRun.update({
+                where: { id: "a" },
+                data: { workflowName: 5 },
+              }),
+          ],
+          [
+            "a date-only string",
+            () =>
+              prisma.workflowRun.update({
+                where: { id: "a" },
+                data: { startedAt: "2026-02-01" },
+              }),
+          ],
+          [
+            "an unknown enum value",
+            () =>
+              prisma.workflowRun.update({
+                where: { id: "a" },
+                data: { status: "NOPE" },
+              }),
+          ],
+          [
+            "an unknown column",
+            () =>
+              prisma.workflowRun.update({
+                where: { id: "a" },
+                data: { nope: 1 },
+              }),
+          ],
+          [
+            "updateMany with no data",
+            () => prisma.workflowRun.updateMany({ where: { id: "a" } }),
+          ],
+          ["delete with no args", () => prisma.workflowRun.delete()],
+          [
+            "delete with an empty where",
+            () => prisma.workflowRun.delete({ where: {} }),
+          ],
+          [
+            "delete of an undefined key",
+            () => prisma.workflowRun.delete({ where: { id: undefined } }),
+          ],
+          [
+            "delete of no key",
+            () => prisma.workflowRun.delete({ where: { workflowId: "wf" } }),
+          ],
+          [
+            "delete of a null key",
+            () => prisma.workflowRun.delete({ where: { id: null } }),
+          ],
+          [
+            "delete of OR alone",
+            () => prisma.workflowRun.delete({ where: { OR: [{ id: "a" }] } }),
+          ],
+          [
+            "delete of an incomplete compound key",
+            () =>
+              prisma.workflowStage.delete({
+                where: {
+                  workflowRunId_stageId: {
+                    workflowRunId: "a",
+                    stageId: undefined,
+                  },
+                },
+              }),
+          ],
+          [
+            "upsert with no where",
+            () =>
+              prisma.workflowBlob.upsert({ create: X, update: { data: 4 } }),
+          ],
+          [
+            "upsert with an empty where",
+            () =>
+              prisma.workflowBlob.upsert({
+                where: {},
+                create: X,
+                update: { data: 4 },
+              }),
+          ],
+          [
+            "upsert of an undefined key",
+            () =>
+              prisma.workflowBlob.upsert({
+                where: { key: undefined },
+                create: { key: "n", data: 3 },
+                update: { data: 4 },
+              }),
+          ],
+          [
+            "upsert of a null key",
+            () =>
+              prisma.workflowBlob.upsert({
+                where: { key: null },
+                create: { key: "n", data: 3 },
+                update: { data: 4 },
+              }),
+          ],
+          [
+            "upsert of a filter on the key",
+            () =>
+              prisma.workflowBlob.upsert({
+                where: { key: { equals: "x" } },
+                create: X,
+                update: { data: 4 },
+              }),
+          ],
+          [
+            "upsert with no update",
+            () =>
+              prisma.workflowBlob.upsert({ where: { key: "x" }, create: X }),
+          ],
+          [
+            "upsert with no create",
+            () =>
+              prisma.workflowBlob.upsert({
+                where: { key: "x" },
+                update: { data: 3 },
+              }),
+          ],
+          [
+            "upsert with a bad update over no row",
+            () =>
+              prisma.workflowBlob.upsert({
+                where: { key: "n" },
+                create: { key: "m", data: 3 },
+                update: { nope: 1 },
+              }),
+          ],
+          [
+            "upsert with a bad create over a row",
+            () =>
+              prisma.workflowBlob.upsert({
+                where: { key: "x" },
+                create: { key: "y", nope: 1 },
+                update: { data: 4 },
+              }),
+          ],
+          [
+            "upsert of an incomplete compound key",
+            () =>
+              prisma.workflowStage.upsert({
+                where: {
+                  workflowRunId_stageId: {
+                    workflowRunId: "a",
+                    stageId: undefined,
+                  },
+                },
+                create: { workflowRunId: "a", stageId: "s", ...blobStage },
+                update: { version: 9 },
+              }),
+          ],
+          ["create with no data", () => prisma.workflowRun.create({})],
+          [
+            "create of a string for an int",
+            () =>
+              prisma.workflowRun.create({ data: run("n", { priority: "1" }) }),
+          ],
+          [
+            "create of null for a required column",
+            () =>
+              prisma.workflowRun.create({
+                data: run("n", { workflowName: null }),
+              }),
+          ],
+          [
+            "create of an unknown enum value",
+            () =>
+              prisma.workflowRun.create({ data: run("n", { status: "NOPE" }) }),
+          ],
+          [
+            "create of an unknown column",
+            () => prisma.workflowRun.create({ data: run("n", { nope: 1 }) }),
+          ],
+          ["createMany with no data", () => prisma.workflowRun.createMany({})],
+          [
+            "create of undefined for a required column",
+            () =>
+              prisma.workflowRun.create({
+                data: run("n", { workflowName: undefined }),
+              }),
+          ],
+          [
+            "create without a required column",
+            () =>
+              prisma.workflowRun.create({
+                data: { id: "n", workflowId: "wf", workflowName: "wf" },
+              }),
+          ],
+          [
+            "create of undefined for a required JSON column",
+            () =>
+              prisma.workflowRun.create({
+                data: run("n", { input: undefined }),
+              }),
+          ],
+          [
+            "createMany with a row missing a required column",
+            () =>
+              prisma.workflowRun.createMany({
+                data: [run("n"), run("m", { workflowType: undefined })],
+              }),
+          ],
+          [
+            "upsert of undefined for a required column over a row",
+            () =>
+              prisma.workflowBlob.upsert({
+                where: { key: "x" },
+                create: { key: "x", data: undefined },
+                update: { data: 4 },
+              }),
+          ],
+          [
+            "upsert of undefined for a required column over no row",
+            () =>
+              prisma.workflowBlob.upsert({
+                where: { key: "n" },
+                create: { key: "n", data: undefined },
+                update: { data: 4 },
+              }),
+          ],
+          [
+            "upsert of undefined for a required column with update: {}",
+            () =>
+              prisma.workflowBlob.upsert({
+                where: { key: "x" },
+                create: { key: "x", data: undefined },
+                update: {},
+              }),
+          ],
+          [
+            "createMany of an undefined row",
+            () => prisma.workflowRun.createMany({ data: [undefined] }),
+          ],
+          [
+            "createMany of a string for an int",
+            () =>
+              prisma.workflowRun.createMany({
+                data: [run("n", { priority: "1" })],
+              }),
+          ],
+        ];
+        it.each(INVALID_WRITES)("rejects %s", async (_name, write) => {
+          const before = await prisma.workflowRun.findMany({
+            orderBy: { id: "asc" },
+          });
+          await expect(write()).rejects.toThrow(REJECTED);
+          expect(
+            await prisma.workflowRun.findMany({ orderBy: { id: "asc" } }),
+          ).toEqual(before);
+          expect(await blobs()).toEqual([X, Y]);
+        });
+
+        // 6 and 7 accept these. 6 counts no rows for an empty updateMany and 7
+        // counts the rows matched, so there is no one result to match; the
+        // rest have no adapter caller, so the bridge rejects them.
+        const UNSUPPORTED_WRITES_ON_8: Array<[string, () => Promise<unknown>]> =
+          [
+            [
+              "updateMany with data: {}",
+              () =>
+                prisma.workflowRun.updateMany({ where: { id: "a" }, data: {} }),
+            ],
+            [
+              "updateMany with only undefined data",
+              () =>
+                prisma.workflowRun.updateMany({
+                  where: { id: "a" },
+                  data: { priority: undefined },
+                }),
+            ],
+            [
+              "updateMany with limit",
+              () =>
+                prisma.workflowRun.updateMany({
+                  data: { priority: 9 },
+                  limit: 1,
+                }),
+            ],
+            [
+              "deleteMany with limit",
+              () => prisma.workflowRun.deleteMany({ limit: 1 }),
+            ],
+            [
+              "{ multiply }",
+              () =>
+                prisma.workflowRun.update({
+                  where: { id: "a" },
+                  data: { priority: { multiply: 2 } },
+                }),
+            ],
+            [
+              "an ISO string for a Date",
+              () =>
+                prisma.workflowRun.update({
+                  where: { id: "a" },
+                  data: { startedAt: "2026-02-01T12:00:00.500+02:00" },
+                }),
+            ],
+            [
+              "a nested relation write",
+              () =>
+                prisma.workflowRun.update({
+                  where: { id: "a" },
+                  data: { stages: { create: [] } },
+                }),
+            ],
+            [
+              "update with include",
+              () =>
+                prisma.workflowRun.update({
+                  where: { id: "a" },
+                  data: { priority: 2 },
+                  include: { stages: true },
+                }),
+            ],
+            [
+              "update selecting a relation",
+              () =>
+                prisma.workflowRun.update({
+                  where: { id: "a" },
+                  data: { priority: 2 },
+                  select: { stages: { select: { id: true } } },
+                }),
+            ],
+            [
+              "upsert with a filter beside the key",
+              () =>
+                prisma.workflowBlob.upsert({
+                  where: { key: "x", data: { path: ["a"], equals: 1 } },
+                  create: X,
+                  update: { data: 4 },
+                }),
+            ],
+            [
+              "upsert of two keys",
+              () =>
+                prisma.workflowStage.upsert({
+                  where: {
+                    id: "s1",
+                    workflowRunId_stageId: { workflowRunId: "a", stageId: "s" },
+                  },
+                  create: {
+                    id: "s1",
+                    workflowRunId: "a",
+                    stageId: "s",
+                    ...blobStage,
+                  },
+                  update: { version: 9 },
+                }),
+            ],
+            [
+              "create with select",
+              () =>
+                prisma.workflowRun.create({
+                  data: run("n"),
+                  select: { id: true },
+                }),
+            ],
+            [
+              "createMany of one object",
+              () => prisma.workflowRun.createMany({ data: run("n") }),
+            ],
+          ];
+        it.runIf(isPrisma8).each(UNSUPPORTED_WRITES_ON_8)(
+          "does not take %s on Prisma 8",
+          async (_name, write) => {
+            await expect(write()).rejects.toThrow(REJECTED);
+          },
+        );
+      });
+
+      describe("transactions", () => {
+        beforeEach(seed);
+
+        const sleep = (ms: number) =>
+          new Promise((resolve) => setTimeout(resolve, ms));
+        const store = createPrismaBlobStore(prisma);
+        const value = async () =>
+          (await prisma.workflowBlob.findUnique({ where: { key: "x" } })).data;
+
+        // [name, the callback, its timeout]: each writes x = 5 through the real
+        // blob store, then runs out of time in its own way.
+        const TIMEOUTS: Array<
+          [string, (tx: any) => Promise<unknown>, number | undefined]
+        > = [
+          ["waiting in the callback", () => sleep(200), 50],
+          [
+            "a slow statement",
+            (tx) => tx.$executeRawUnsafe(`SELECT pg_sleep(0.2)`),
+            50,
+          ],
+          [
+            "a caught timeout",
+            async (tx) => {
+              await sleep(200);
+              await tx.workflowBlob.count().catch(() => {});
+            },
+            50,
+          ],
+          ["the default timeout", () => sleep(5300), undefined],
+        ];
+        it.each(TIMEOUTS)(
+          "rolls back after %s",
+          async (_name, work, timeout) => {
+            await expect(
+              prisma.$transaction(
+                async (tx: any) => {
+                  await createPrismaBlobStore(tx).put("x", 5);
+                  await work(tx);
+                },
+                { timeout },
+              ),
+            ).rejects.toMatchObject({ code: "P2028" });
+            expect(await store.get("x")).toBe(1);
+          },
+          10_000,
+        );
+
+        it("lets a callback's own error through inside the timeout", async () => {
+          await expect(
+            prisma.$transaction(
+              async (tx: any) => {
+                await tx.workflowBlob.update({
+                  where: { key: "x" },
+                  data: { data: 5 },
+                });
+                await sleep(5);
+                throw new Error("mine");
+              },
+              { timeout: 2000 },
+            ),
+          ).rejects.toThrow("mine");
+          expect(await value()).toBe(1);
+        });
+
+        // 6 and 7 keep the caller waiting for the callback, so a late error is
+        // the callback's own; 8 rejects at the deadline, which is what frees
+        // the connection of a callback that never settles.
+        it("rolls back a callback that fails after the timeout", async () => {
+          await expect(
+            prisma.$transaction(
+              async (tx: any) => {
+                await tx.workflowBlob.update({
+                  where: { key: "x" },
+                  data: { data: 5 },
+                });
+                await sleep(100);
+                throw new Error("mine");
+              },
+              { timeout: 20 },
+            ),
+          ).rejects.toThrow(isPrisma8 ? "Transaction already closed" : "mine");
+          expect(await value()).toBe(1);
+        });
+
+        it("frees the connection of a callback that never settles", async () => {
+          const own = createPostgresClient(DATABASE_URL);
+          try {
+            // More than the default pool of 10 holds.
+            for (let i = 0; i < 12; i++) {
+              void own
+                .$transaction(
+                  async (tx: any) => {
+                    await tx.workflowBlob.count();
+                    await new Promise(() => {});
+                  },
+                  { timeout: 100 },
+                )
+                .catch(() => {});
+            }
+            await sleep(500);
+            expect(
+              await Promise.race([
+                own.workflowBlob.count(),
+                sleep(2000).then(() => "hung"),
+              ]),
+            ).toBe(2);
+          } finally {
+            await own.$disconnect();
+          }
+        }, 10_000);
+
+        it("fails every statement after the timeout, and leaves nothing unhandled", async () => {
+          const unhandled: unknown[] = [];
+          const onUnhandled = (reason: unknown) => unhandled.push(reason);
+          process.on("unhandledRejection", onUnhandled);
+          try {
+            const codes: unknown[] = [];
+            await prisma
+              .$transaction(
+                async (tx: any) => {
+                  await sleep(100);
+                  for (let i = 0; i < 3; i++) {
+                    await tx.workflowBlob
+                      .update({ where: { key: "x" }, data: { data: 5 } })
+                      .catch((e: any) => codes.push(e.code));
+                    await tx
+                      .$executeRawUnsafe(`SELECT 1`)
+                      .catch((e: any) => codes.push(e.code));
+                  }
+                  throw new Error("late");
+                },
+                { timeout: 20 },
+              )
+              .catch(() => {});
+            await sleep(300);
+            expect(codes).toEqual(Array(6).fill("P2028"));
+            expect(unhandled).toEqual([]);
+            expect(await value()).toBe(1);
+          } finally {
+            process.off("unhandledRejection", onUnhandled);
+          }
+        });
+
+        it("leaves no timer behind", async () => {
+          const timers = () =>
+            process.getActiveResourcesInfo().filter((r) => r === "Timeout")
+              .length;
+          await prisma.$transaction((tx: any) => tx.workflowBlob.count());
+          const before = timers();
+          for (let i = 0; i < 200; i++) {
+            await prisma.$transaction((tx: any) => tx.workflowBlob.count());
+          }
+          expect(timers()).toBeLessThanOrEqual(before);
+        });
+
+        it("commits inside the timeout", async () => {
+          await prisma.$transaction(
+            async (tx: any) => {
+              await tx.workflowBlob.update({
+                where: { key: "x" },
+                data: { data: 5 },
+              });
+              await sleep(5);
+            },
+            { timeout: 2000 },
+          );
+          expect(await value()).toBe(5);
+          await prisma.$transaction((tx: any) =>
+            tx.workflowBlob.update({ where: { key: "x" }, data: { data: 6 } }),
+          );
+          expect(await value()).toBe(6);
+        });
+
+        it("runs a createMany across the bind limit inside the caller's transaction", async () => {
+          await expect(
+            prisma.$transaction(async (tx: any) => {
+              await tx.workflowBlob.createMany({ data: blobRows(20_000) });
+              throw new Error("mine");
+            }),
+          ).rejects.toThrow("mine");
+          expect(await prisma.workflowBlob.count()).toBe(2);
+          expect(
+            await prisma.$transaction([
+              prisma.workflowBlob.createMany({ data: blobRows(20_000) }),
+              prisma.workflowBlob.count(),
+            ]),
+          ).toEqual([{ count: 20_000 }, 20_002]);
+        });
+
+        it("opens a transaction at an isolation level on a client that has run nothing yet", async () => {
+          const own = createPostgresClient(DATABASE_URL);
+          try {
+            const levels = await Promise.all(
+              Array.from({ length: 4 }, () =>
+                own.$transaction(
+                  async (tx: any) =>
+                    (
+                      await rawFor(tx, { level: "text" })
+                        .$queryRaw`SELECT current_setting('transaction_isolation') AS level`
+                    )[0].level,
+                  { isolationLevel: "Serializable" },
+                ),
+              ),
+            );
+            expect(levels).toEqual(Array(4).fill("serializable"));
+          } finally {
+            await own.$disconnect();
+          }
+        });
+
+        it("keeps the array form free of the default timeout", async () => {
+          expect(await prisma.$transaction([])).toEqual([]);
+          const [, count] = await prisma.$transaction([
+            prisma.workflowBlob.update({
+              where: { key: "x" },
+              data: { data: 7 },
+            }),
+            prisma.workflowBlob.count(),
+          ]);
+          expect(count).toBe(2);
+          expect(await value()).toBe(7);
+        });
+      });
+
+      describe("through the real adapters", () => {
+        beforeEach(seed);
+
+        it("upsertStage updates the stage it selects, not the one in create", async () => {
+          const persistence = createPrismaWorkflowPersistence(prisma);
+          const created = await persistence.createRun({
+            workflowId: "wf",
+            workflowName: "wf",
+            workflowType: "t",
+            input: {},
+          });
+          const base = {
+            workflowRunId: created.id,
+            stageName: "stage",
+            stageNumber: 1,
+            executionGroup: 1,
+          };
+          await persistence.createStage({ ...base, stageId: "target" });
+          await persistence.createStage({ ...base, stageId: "other" });
+          const returned = await persistence.upsertStage({
+            workflowRunId: created.id,
+            stageId: "target",
+            create: { ...base, stageId: "other" },
+            update: { errorMessage: "changed" },
+          });
+          expect(returned.stageId).toBe("target");
+          expect(
+            await prisma.workflowStage.findMany({
+              where: { workflowRunId: created.id },
+              select: { stageId: true, errorMessage: true, version: true },
+              orderBy: { stageId: "asc" },
+            }),
+          ).toEqual([
+            { stageId: "other", errorMessage: null, version: 1 },
+            { stageId: "target", errorMessage: "changed", version: 2 },
+          ]);
+        });
+
+        it("updateStage stores the fractional delay a retry backoff produces", async () => {
+          const persistence = createPrismaWorkflowPersistence(prisma);
+          const run = await persistence.createRun({
+            workflowId: "wf",
+            workflowName: "wf",
+            workflowType: "t",
+            input: {},
+          });
+          const stage = await persistence.createStage({
+            workflowRunId: run.id,
+            stageId: "s",
+            stageName: "stage",
+            stageNumber: 1,
+            executionGroup: 1,
+          });
+          await persistence.updateStage(stage.id, { pollInterval: 562.5 });
+          const { pollInterval } = await prisma.workflowStage.findUnique({
+            where: { id: stage.id },
+            select: { pollInterval: true },
+          });
+          expect(pollInterval).toBe(562);
+        });
+
+        it("the AI call logger's stats treat a prefix as a LIKE pattern", async () => {
+          await prisma.$executeRawUnsafe(`TRUNCATE "ai_calls"`);
+          const logger = createPrismaAICallLogger(prisma);
+          const call = {
+            callType: "c",
+            modelKey: "m",
+            modelId: "m",
+            prompt: "p",
+            response: "r",
+          };
+          await logger.logBatchResults("costs", [
+            {
+              ...call,
+              topic: "cost_",
+              inputTokens: 2,
+              outputTokens: 3,
+              cost: 0.125,
+              requestId: "1",
+            },
+            {
+              ...call,
+              topic: "costX",
+              inputTokens: 4,
+              outputTokens: 5,
+              cost: 0.25,
+              requestId: "2",
+            },
+          ]);
+          const stats = await logger.getStats("cost_");
+          expect(stats.totalCalls).toBe(2);
+          expect(stats.totalCost).toBe(0.375);
+        });
+
+        it("the AI call logger records a batch above the bind limit", async () => {
+          await prisma.$executeRawUnsafe(`TRUNCATE "ai_calls"`);
+          await createPrismaAICallLogger(prisma).logBatchResults(
+            "big",
+            Array.from({ length: 4_700 }, (_, i) => ({
+              callType: "c",
+              modelKey: "m",
+              modelId: "m",
+              prompt: "p",
+              response: "r",
+              topic: "t",
+              inputTokens: 1,
+              outputTokens: 1,
+              cost: 0,
+              requestId: `r${i}`,
+            })),
+          );
+          expect(await prisma.aICall.count()).toBe(4_700);
+        });
+
+        it("the blob store refuses undefined, and keeps the old value", async () => {
+          const store = createPrismaBlobStore(prisma);
+          await expect(store.put("x", undefined)).rejects.toThrow(REJECTED);
+          await expect(store.put("new", undefined)).rejects.toThrow(REJECTED);
+          expect(await store.get("x")).toBe(1);
+          expect(await store.list("new")).toEqual([]);
+        });
+
+        it("the blob store lists a prefix as a LIKE pattern", async () => {
+          const store = createPrismaBlobStore(prisma);
+          await store.put("prefix_1", {});
+          await store.put("prefixX2", {});
+          expect(await store.list("prefix_")).toEqual(
+            expect.arrayContaining(["prefix_1", "prefixX2"]),
+          );
+        });
+      });
+    });
 
     describe("kernel end-to-end smoke test", () => {
       beforeEach(async () => {
@@ -711,6 +4155,67 @@ if (!DATABASE_URL) {
           .pipe(stage2)
           .build();
       }
+
+      it("cancels a burst of 50 runs on a pool of 10, and every job of theirs", async () => {
+        // Prisma 6 sizes its pool from the CPU count unless told.
+        const own = createPostgresClient(
+          process.env.PRISMA_MAJOR === "6"
+            ? `${DATABASE_URL}${DATABASE_URL?.includes("?") ? "&" : "?"}connection_limit=10`
+            : DATABASE_URL,
+        );
+        try {
+          const persistence = createPrismaWorkflowPersistence(own);
+          const jobTransport = createPrismaJobQueue(own, {
+            workerId: "burst-worker",
+          });
+          const kernel = createKernel({
+            persistence,
+            jobTransport,
+            blobStore: new InMemoryBlobStore(),
+            eventSink: new CollectingEventSink(),
+            clock: { now: () => new Date() },
+            registry: { getWorkflow: () => undefined },
+          });
+          const ids = Array.from({ length: 50 }, (_, i) => `burst-${i}`);
+          for (const id of ids) {
+            await persistence.createRun({
+              id,
+              workflowId: "wf",
+              workflowName: "wf",
+              workflowType: "t",
+              input: {},
+            });
+            await persistence.updateRun(id, { status: "RUNNING" });
+            await jobTransport.enqueue({
+              workflowRunId: id,
+              workflowId: "wf",
+              stageId: "s",
+            });
+          }
+          const results = await Promise.all(
+            ids.map((id) =>
+              kernel.dispatch({ type: "run.cancel", workflowRunId: id }),
+            ),
+          );
+          expect(results.map((r) => r.cancelled)).toEqual(Array(50).fill(true));
+          expect(
+            await own.workflowRun.groupBy({
+              by: ["status"],
+              where: { id: { in: ids } },
+              _count: { _all: true },
+            }),
+          ).toEqual([{ status: "CANCELLED", _count: { _all: 50 } }]);
+          expect(
+            await own.jobQueue.groupBy({
+              by: ["status"],
+              where: { workflowRunId: { in: ids } },
+              _count: { _all: true },
+            }),
+          ).toEqual([{ status: "CANCELLED", _count: { _all: 50 } }]);
+        } finally {
+          await own.$disconnect();
+        }
+      }, 30_000);
 
       it("runs a 2-stage workflow to completion, flushes the outbox, and replays an idempotent re-dispatch", async () => {
         const workflow = createTwoStageWorkflow();
@@ -946,6 +4451,73 @@ if (!DATABASE_URL) {
       });
     });
 
+    // ==========================================================================
+    // Error classification (PG-only): the same Postgres failure reaches us as
+    // a different error shape on each Prisma major (`meta.code` on 6,
+    // `meta.driverAdapterError.cause.originalCode` on 7), so every check goes
+    // through `sqlStateOf`. These drive real driver errors, not fixtures.
+    // ==========================================================================
+
+    describe("SQLSTATE classification of driver errors", () => {
+      const caught = (run: () => Promise<unknown>) =>
+        run().then(
+          () => {
+            throw new Error("expected the statement to fail");
+          },
+          (error: unknown) => error,
+        );
+
+      it("reads a unique violation from raw SQL", async () => {
+        const workflowId = `sqlstate-raw-${crypto.randomUUID()}`;
+        const insert = () =>
+          prisma.$executeRaw`
+            INSERT INTO "workflow_definitions"
+              ("workflowId", version, snapshot, "structureHash")
+            VALUES (${workflowId}, 'v1', '{}'::jsonb, 'h')
+          `;
+        try {
+          await insert();
+          const error = await caught(insert);
+          expect(sqlStateOf(error)).toBe("23505");
+          expect(isUniqueViolation(error)).toBe(true);
+          expect(isSerializationFailure(error)).toBe(false);
+        } finally {
+          await prisma.workflowDefinition.deleteMany({ where: { workflowId } });
+        }
+      });
+
+      it("reads a unique violation from the model API", async () => {
+        const workflowId = `sqlstate-model-${crypto.randomUUID()}`;
+        const data = {
+          workflowId,
+          version: "v1",
+          snapshot: {},
+          structureHash: "h",
+        };
+        try {
+          await prisma.workflowDefinition.create({ data });
+          const error = await caught(() =>
+            prisma.workflowDefinition.create({ data }),
+          );
+          expect(sqlStateOf(error)).toBe("23505");
+          expect(isUniqueViolation(error)).toBe(true);
+        } finally {
+          await prisma.workflowDefinition.deleteMany({ where: { workflowId } });
+        }
+      });
+
+      it("reads a cancelled statement from raw SQL", async () => {
+        const error = await caught(() =>
+          prisma.$transaction(async (tx: typeof prisma) => {
+            await tx.$executeRawUnsafe("SET LOCAL statement_timeout = 20");
+            await rawFor(tx, {}).$queryRawUnsafe("SELECT pg_sleep(2)");
+          }),
+        );
+        expect(sqlStateOf(error)).toBe("57014");
+        expect(isUniqueViolation(error)).toBe(false);
+      });
+    });
+
     describe("session timezone independence", () => {
       // UTC+14, no DST: a session-timezone slip shows up as a 14-hour jump,
       // and the case still proves its point on a database whose own default
@@ -953,7 +4525,7 @@ if (!DATABASE_URL) {
       const tzUrl = new URL(DATABASE_URL);
       tzUrl.searchParams.set("options", "-c timezone=Pacific/Kiritimati");
       tzUrl.searchParams.set("connection_limit", "1");
-      const tzPrisma = new PrismaClient({ datasourceUrl: tzUrl.toString() });
+      const tzPrisma = createPostgresClient(tzUrl.toString());
 
       beforeEach(async () => {
         await truncateAll();
@@ -964,7 +4536,9 @@ if (!DATABASE_URL) {
       });
 
       it("runs its statements on a session that is not on UTC", async () => {
-        const rows = (await tzPrisma.$queryRawUnsafe(
+        const rows = (await rawFor(tzPrisma, {
+          tz: "text",
+        }).$queryRawUnsafe(
           `SELECT current_setting('TimeZone') AS tz`,
         )) as Array<{ tz: string }>;
         expect(rows[0]?.tz).toBe("Pacific/Kiritimati");
@@ -1068,6 +4642,51 @@ if (!DATABASE_URL) {
         expect(await skewed.releaseStaleJobs(60_000)).toBe(0);
         const [stillHeld] = await skewed.getJobsByWorkflowRun(runId);
         expect(stillHeld?.status).toBe("RUNNING");
+      });
+
+      it("claims a pending run through the tagged-template fallback on a non-UTC session", async () => {
+        // A client without $queryRawUnsafe takes the template path, which
+        // binds the clock on its own.
+        const templateOnly = new Proxy(tzPrisma, {
+          get: (target, property) =>
+            property === "$queryRawUnsafe"
+              ? undefined
+              : Reflect.get(target, property),
+        });
+        const persistence = createPrismaWorkflowPersistence(templateOnly);
+        const run = await persistence.createRun({
+          workflowId: "tz-template-workflow",
+          workflowName: "TZ Template",
+          workflowType: "tz",
+          input: { value: "x" },
+        });
+
+        const claimed = await persistence.claimNextPendingRun();
+        expect(claimed?.id).toBe(run.id);
+        const lag =
+          (claimed?.startedAt?.getTime() ?? 0) - run.createdAt.getTime();
+        expect(lag).toBeGreaterThanOrEqual(0);
+        expect(lag).toBeLessThan(60_000);
+      });
+
+      it("stamps publishedAt in UTC when the outbox sweep claims events on a non-UTC session", async () => {
+        const persistence = createPrismaWorkflowPersistence(tzPrisma);
+        await persistence.appendOutboxEvents([
+          {
+            workflowRunId: "tz-outbox-run",
+            eventType: "run.started",
+            payload: {},
+            causationId: "tz-outbox",
+            occurredAt: new Date(),
+          },
+        ]);
+
+        const before = Date.now();
+        const [claimed] = await persistence.claimUnpublishedOutboxEvents();
+        expect(claimed?.workflowRunId).toBe("tz-outbox-run");
+        expect(
+          Math.abs((claimed?.publishedAt?.getTime() ?? 0) - before),
+        ).toBeLessThan(60_000);
       });
 
       it("claims a pending run with a UTC startedAt on a non-UTC session", async () => {
@@ -1197,18 +4816,22 @@ if (!DATABASE_URL) {
 
         // No job was thrown away as an orphan of a run that was merely
         // waiting for its claim to commit.
-        const discarded = await prisma.jobQueue.count({
-          where: { lastError: { contains: "ghost job discarded" } },
+        const jobs = await prisma.jobQueue.findMany({
+          select: { lastError: true },
         });
-        expect(discarded).toBe(0);
+        const discarded = jobs.filter((job: { lastError: string | null }) =>
+          job.lastError?.includes("ghost job discarded"),
+        );
+        expect(discarded).toHaveLength(0);
       }, 40_000);
     });
   });
 }
 
-// Generate a separate, minimal SQLite client without changing the shipped schema
-// or replacing the Postgres client used by the conformance suites above.
-describe("definition registration on real SQLite", () => {
+// The fixture generates a separate, minimal SQLite client without changing the
+// shipped schema or replacing the Postgres client used by the suites above.
+// Prisma 8 is Postgres-only, so there is no SQLite client to test there.
+describe.skipIf(isPrisma8)("definition registration on real SQLite", () => {
   const require = createRequire(import.meta.url);
   let directory: string;
   let prisma: any;
@@ -1216,40 +4839,10 @@ describe("definition registration on real SQLite", () => {
     directory = await mkdtemp(
       join(tmpdir(), "definition-registration-sqlite-"),
     );
-    const schema = join(directory, "schema.prisma");
-    await writeFile(
-      schema,
-      `
-      generator client {
-        provider = "node '${require.resolve("@prisma/client/generator-build/index.js")}'"
-        output = "${join(directory, "client")}"
-      }
-      datasource db {
-        provider = "sqlite"
-        url = "file:${join(directory, "test.db")}"
-      }
-      model WorkflowDefinition {
-        workflowId String
-        version String
-        createdAt DateTime @default(now())
-        snapshot Json
-        structureHash String
-        @@id([workflowId, version])
-        @@map("workflow_definitions")
-      }
-    `,
-    );
-    const cli = require.resolve("prisma/build/index.js");
-    execFileSync(process.execPath, [cli, "generate", "--schema", schema], {
-      stdio: "pipe",
-    });
-    execFileSync(
-      process.execPath,
-      [cli, "db", "push", "--schema", schema, "--skip-generate"],
-      { stdio: "pipe" },
-    );
-    const { PrismaClient } = require(join(directory, "client"));
-    prisma = new PrismaClient();
+    const {
+      createSqliteClient,
+    } = require("../../../../prisma-fixtures/index.cjs");
+    prisma = createSqliteClient(join(directory, "test.db"));
   }, 30_000);
   afterAll(async () => {
     await prisma?.$disconnect();
@@ -1284,5 +4877,33 @@ describe("definition registration on real SQLite", () => {
       ).toEqual(first);
     });
     expect(await prisma.workflowDefinition.count()).toBe(1);
+  });
+
+  it("stores a raw-inserted createdAt the way the model API stores one", async () => {
+    // The raw insert binds a Date, where the Postgres statements bind an ISO
+    // string: SQLite keeps an integer on 6 and ISO text on 7, and the raw
+    // statement must land on whichever one the model API writes.
+    await prisma.workflowDefinition.create({
+      data: {
+        workflowId: "sqlite-model",
+        version: "v1",
+        snapshot: {},
+        structureHash: "h",
+      },
+    });
+    await createPrismaWorkflowPersistence(prisma, {
+      databaseType: "sqlite",
+      definitionVersioning: true,
+    }).insertDefinitionIfAbsent({
+      workflowId: "sqlite-raw",
+      version: "v1",
+      snapshot: {},
+      structureHash: "h",
+    });
+    const rows = (await prisma.$queryRawUnsafe(
+      `SELECT "workflowId" AS id, typeof("createdAt") AS type FROM "workflow_definitions" WHERE "workflowId" IN ('sqlite-model', 'sqlite-raw')`,
+    )) as Array<{ id: string; type: string }>;
+    const types = Object.fromEntries(rows.map((row) => [row.id, row.type]));
+    expect(types["sqlite-raw"]).toBe(types["sqlite-model"]);
   });
 });

@@ -243,6 +243,7 @@ export {
   createPrismaJobQueue,
   createPrismaStepLedger,
   createPrismaWorkflowPersistence,
+  fromPrisma8,
   PrismaAICallLogger,
   PrismaBlobStore,
   PrismaJobQueue,

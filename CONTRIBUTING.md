@@ -6,7 +6,7 @@
 pnpm install
 ```
 
-Requires Node.js >= 22.11 and pnpm (see `packageManager` in `package.json` for the exact version).
+Requires Node.js >= 22.11 (22.18+ for the Prisma 8 fixture) and pnpm (see `packageManager` in `package.json` for the exact version).
 
 ## Everyday commands
 
@@ -19,8 +19,8 @@ pnpm lint        # biome check
 pnpm lint:fix     # biome check --write
 ```
 
-Postgres-backed persistence tests (`prisma-postgres-conformance.test.ts` and
-`sql-enqueue.test.ts`, both under
+Postgres-backed persistence tests (`prisma-postgres-conformance.test.ts`,
+`sql-enqueue.test.ts` and, on Prisma 8 only, `from-prisma8.test.ts`, all under
 `packages/workflow-engine/src/__tests__/12-persistence-adapters/`) are skipped
 unless `DATABASE_URL` is set. They share one database and each truncates the
 tables between cases, so `test:pg` runs them with `--no-file-parallelism`; run
@@ -30,9 +30,12 @@ bugs. To run them locally:
 
 ```bash
 export DATABASE_URL=postgresql://postgres:postgres@localhost:5432/workflow_engine_test
+export PRISMA_MAJOR=6   # the Prisma major to test: 6, 7 or 8 (default 7); the fixtures live in packages/prisma-fixtures
 pnpm --filter @bratsos/workflow-engine run prisma:generate
 pnpm --filter @bratsos/workflow-engine run prisma:db-push
 pnpm --filter @bratsos/workflow-engine run test:pg
+pnpm --filter @bratsos/workflow-engine-console exec node scripts/build-ui.mjs   # cli.test.ts needs the built UI bundle
+pnpm --filter @bratsos/workflow-engine-console exec vitest run src/__tests__/prisma-read-port.postgres.test.ts src/__tests__/cli.test.ts
 ```
 
 ## Package layout

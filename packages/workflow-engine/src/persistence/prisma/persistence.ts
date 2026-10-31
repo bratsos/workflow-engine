@@ -37,7 +37,12 @@ import {
   StaleVersionError,
 } from "../interface";
 import { createEnumHelper, type PrismaEnumHelper } from "./enum-compat";
-import type { EnginePrismaClient } from "./prisma-client-type";
+import {
+  type EnginePrismaClient,
+  rawFor,
+  rejectSqliteOn8,
+} from "./prisma-client-type";
+import { isSerializationFailure, isUniqueViolation } from "./sql-errors";
 import { utcTimestampParam } from "./utc-timestamps";
 
 // Structural client type -- see prisma-client-type.ts. Kept as a local
@@ -161,10 +166,12 @@ async function probeDefinitionVersioningSchema(
         : null;
   if (sql === null) return null;
   try {
-    const rows =
-      await prisma.$queryRawUnsafe<
-        Array<{ has_table: unknown; has_column: unknown }>
-      >(sql);
+    const rows = await rawFor(prisma, {
+      has_table: "bool",
+      has_column: "bool",
+    }).$queryRawUnsafe!<Array<{ has_table: unknown; has_column: unknown }>>(
+      sql,
+    );
     const row = rows[0];
     if (!row) return null;
     return truthy(row.has_table) && truthy(row.has_column);
@@ -230,6 +237,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       statusEnumName: this.statusEnumName,
     });
     this.databaseType = options.databaseType ?? "postgresql";
+    rejectSqliteOn8(prisma, this.databaseType);
     this.skipTransactions = options.skipInteractiveTransactions ?? false;
     this.now = options.now ?? (() => new Date());
     this.versioning = {
@@ -534,11 +542,11 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     //
     // The enum type name is an identifier, which a tagged template cannot
     // bind, so the statement is built as text with positional parameters
-    // for every value. Timestamps are bound JS Dates from the injected
-    // clock and converted with `AT TIME ZONE 'UTC'` -- never `NOW()`, and
-    // never a bare parameter, both of which write session-local time into
-    // the naive TIMESTAMP columns Prisma fills with UTC (see
-    // utc-timestamps.ts).
+    // for every value. Timestamps are bound as ISO strings from the
+    // injected clock and converted with `AT TIME ZONE 'UTC'` -- never
+    // `NOW()`, never a bare parameter and never a JS Date, which write
+    // session-local time into the naive TIMESTAMP columns Prisma fills with
+    // UTC (see utc-timestamps.ts).
     const pending = this.enums.status("PENDING");
     const running = this.enums.status("RUNNING");
     let results: any[];
@@ -576,7 +584,9 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
             OR ("definitionVersion" IS NULL AND "workflowId" IN (${ids.join(", ")})))`;
         }
       }
-      results = await this.prisma.$queryRawUnsafe<any[]>(
+      results = await rawFor(this.prisma, "workflow_runs").$queryRawUnsafe!<
+        any[]
+      >(
         `WITH claimed AS (
           SELECT id
           FROM "workflow_runs"
@@ -596,7 +606,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
         RETURNING "workflow_runs".*`,
         pending,
         running,
-        now,
+        now.toISOString(),
         ...extraParams,
       );
     } else if (this.prisma.$queryRaw) {
@@ -605,7 +615,8 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
           "statusEnumName requires a Prisma client with $queryRawUnsafe (the Postgres claimNextPendingRun path)",
         );
       }
-      results = await this.prisma.$queryRaw<any[]>`
+      const nowIso = now.toISOString();
+      results = await rawFor(this.prisma, "workflow_runs").$queryRaw!<any[]>`
         WITH claimed AS (
           SELECT id
           FROM "workflow_runs"
@@ -616,8 +627,8 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
         )
         UPDATE "workflow_runs"
         SET status = ${running}::"Status",
-            "startedAt" = ${now}::timestamptz AT TIME ZONE 'UTC',
-            "updatedAt" = ${now}::timestamptz AT TIME ZONE 'UTC',
+            "startedAt" = ${nowIso}::timestamptz AT TIME ZONE 'UTC',
+            "updatedAt" = ${nowIso}::timestamptz AT TIME ZONE 'UTC',
             version = version + 1
         FROM claimed
         WHERE "workflow_runs".id = claimed.id
@@ -711,6 +722,8 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       // A caught unique violation aborts a PostgreSQL transaction. Insert
       // atomically, then read separately so READ COMMITTED sees the winner.
       if (this.databaseType === "sqlite") {
+        // A Date, unlike the Postgres statements: SQLite stores it the way
+        // the model API does on every major (integer on 6, ISO text on 7).
         await this.prisma.$executeRaw`
           INSERT INTO "workflow_definitions"
             ("workflowId", version, snapshot, "structureHash", "createdAt")
@@ -741,15 +754,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       }
       return this.mapDefinition(row);
     } catch (error) {
-      const failure = error as {
-        code?: string;
-        meta?: { code?: string };
-      } | null;
-      if (
-        failure?.code === "P2034" ||
-        failure?.code === "40001" ||
-        failure?.meta?.code === "40001"
-      ) {
+      if (isSerializationFailure(error)) {
         throw new DefinitionRegistrationRetryableError(
           input.workflowId,
           input.version,
@@ -1262,7 +1267,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       try {
         await this.prisma.workflowAnnotation.create({ data: row });
       } catch (error: any) {
-        if (error?.code === "P2002") continue;
+        if (isUniqueViolation(error)) continue;
         throw error;
       }
     }
@@ -1437,7 +1442,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     try {
       await this.prisma.outboxEvent.createMany({ data: rows });
     } catch (error: any) {
-      if (error?.code === "P2002" && attempt < MAX_CLAIM_ATTEMPTS) {
+      if (isUniqueViolation(error) && attempt < MAX_CLAIM_ATTEMPTS) {
         // Another writer assigned overlapping sequences between our read
         // and write (only reachable outside a transaction, or on DBs
         // without the advisory lock). Recompute and retry.
@@ -1469,7 +1474,9 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       // flush holds), stamp them, return them. A concurrent flush — even
       // one inside a still-open transaction — cannot receive the same
       // rows. `RETURNING` order is unspecified, so the rows are re-sorted.
-      const rows = await this.prisma.$queryRawUnsafe<any[]>(
+      const rows = await rawFor(this.prisma, "outbox_events").$queryRawUnsafe!<
+        any[]
+      >(
         `WITH claimed AS (
           SELECT id
           FROM "outbox_events"
@@ -1484,7 +1491,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
         WHERE "outbox_events".id = claimed.id
         RETURNING "outbox_events".*`,
         effectiveLimit,
-        now,
+        now.toISOString(),
       );
       return rows
         .map((r: any) => this.mapOutboxEvent(r))
@@ -1597,7 +1604,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
         await this.prisma.idempotencyKey.create({ data: row });
         return { status: "acquired" };
       } catch (error: any) {
-        if (error?.code !== "P2002") {
+        if (!isUniqueViolation(error)) {
           throw error;
         }
       }
