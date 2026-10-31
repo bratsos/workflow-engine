@@ -4156,6 +4156,67 @@ if (!DATABASE_URL) {
           .build();
       }
 
+      it("cancels a burst of 50 runs on a pool of 10, and every job of theirs", async () => {
+        // Prisma 6 sizes its pool from the CPU count unless told.
+        const own = createPostgresClient(
+          process.env.PRISMA_MAJOR === "6"
+            ? `${DATABASE_URL}${DATABASE_URL?.includes("?") ? "&" : "?"}connection_limit=10`
+            : DATABASE_URL,
+        );
+        try {
+          const persistence = createPrismaWorkflowPersistence(own);
+          const jobTransport = createPrismaJobQueue(own, {
+            workerId: "burst-worker",
+          });
+          const kernel = createKernel({
+            persistence,
+            jobTransport,
+            blobStore: new InMemoryBlobStore(),
+            eventSink: new CollectingEventSink(),
+            clock: { now: () => new Date() },
+            registry: { getWorkflow: () => undefined },
+          });
+          const ids = Array.from({ length: 50 }, (_, i) => `burst-${i}`);
+          for (const id of ids) {
+            await persistence.createRun({
+              id,
+              workflowId: "wf",
+              workflowName: "wf",
+              workflowType: "t",
+              input: {},
+            });
+            await persistence.updateRun(id, { status: "RUNNING" });
+            await jobTransport.enqueue({
+              workflowRunId: id,
+              workflowId: "wf",
+              stageId: "s",
+            });
+          }
+          const results = await Promise.all(
+            ids.map((id) =>
+              kernel.dispatch({ type: "run.cancel", workflowRunId: id }),
+            ),
+          );
+          expect(results.map((r) => r.cancelled)).toEqual(Array(50).fill(true));
+          expect(
+            await own.workflowRun.groupBy({
+              by: ["status"],
+              where: { id: { in: ids } },
+              _count: { _all: true },
+            }),
+          ).toEqual([{ status: "CANCELLED", _count: { _all: 50 } }]);
+          expect(
+            await own.jobQueue.groupBy({
+              by: ["status"],
+              where: { workflowRunId: { in: ids } },
+              _count: { _all: true },
+            }),
+          ).toEqual([{ status: "CANCELLED", _count: { _all: 50 } }]);
+        } finally {
+          await own.$disconnect();
+        }
+      }, 30_000);
+
       it("runs a 2-stage workflow to completion, flushes the outbox, and replays an idempotent re-dispatch", async () => {
         const workflow = createTwoStageWorkflow();
         const persistence = createPrismaWorkflowPersistence(prisma);

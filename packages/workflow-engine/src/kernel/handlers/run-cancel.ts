@@ -4,7 +4,22 @@
  * Cancels a running workflow authoritatively:
  * 1. Marks the run as CANCELLED
  * 2. Marks all non-terminal stages as CANCELLED
- * 3. Cancels queued/suspended jobs via job transport
+ * 3. Cancels queued/suspended jobs via job transport, in `_postCommit`
+ *
+ * INVARIANT: the jobs are cancelled after the transaction commits, never
+ * inside it. The job transport runs on its own connection, so inside the
+ * kernel transaction every cancel held one connection and waited for a second:
+ * a burst as large as the pool wedged it until the transactions timed out, and
+ * a timed-out cancel rolled back its run while its queued job update still ran
+ * afterwards, leaving CANCELLED jobs under a run that was not.
+ *
+ * In the window between the commit and the job update, a worker that dequeues
+ * one of the jobs finds the run CANCELLED and discards it as an orphan
+ * (`job.execute`, `ghostReason: "orphan"`, the job ends FAILED). If the job
+ * update fails, the run stays CANCELLED and a PENDING job is closed that way
+ * when dequeued; a SUSPENDED job is never dequeued, so it stays SUSPENDED until
+ * `run.purge`, and a second `run.cancel` returns `cancelled: false` without
+ * retrying the update.
  */
 
 import type { RunCancelCommand, RunCancelResult } from "../commands";
@@ -40,9 +55,6 @@ export async function handleRunCancel(
     }
   }
 
-  // 3. Cancel queued/suspended jobs
-  await deps.jobTransport.cancelByRun(command.workflowRunId);
-
   return {
     cancelled: true,
     _events: [
@@ -53,5 +65,9 @@ export async function handleRunCancel(
         reason: command.reason,
       },
     ],
+    // 3. Cancel queued/suspended jobs
+    _postCommit: async (postDeps) => {
+      await postDeps.jobTransport.cancelByRun(command.workflowRunId);
+    },
   };
 }
