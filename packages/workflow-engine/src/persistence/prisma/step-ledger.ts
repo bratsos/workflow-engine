@@ -217,7 +217,15 @@ export class PrismaStepLedger implements StepLedger {
   ): Promise<void> {
     if (keepStepIds.length === 0) return this.clear(stageRecordId);
     await this.prisma.workflowStep.deleteMany({
-      where: { stageRecordId, stepId: { notIn: keepStepIds } },
+      where: {
+        stageRecordId,
+        stepId: {
+          notIn:
+            this.databaseType === "sqlite"
+              ? [...new Set(keepStepIds)]
+              : keepStepIds,
+        },
+      },
     });
   }
 }
