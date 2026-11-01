@@ -82,8 +82,7 @@ function nativeTransactions(
   prisma: EnginePrismaClient,
 ): NativeWriteQueue | undefined {
   // Prisma 6/7 expose no public transaction observer. Observe their shared
-  // engine boundary so a caller's own $transaction is fenced too, including
-  // when its callback enters an external AsyncResource.
+  // engine boundary so a caller's own $transaction takes a turn too.
   const engine = (prisma as any)._engine;
   if (!engine || typeof engine.transaction !== "function") return undefined;
   const known = engines.get(engine);
