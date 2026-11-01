@@ -600,6 +600,44 @@ It serves on `http://127.0.0.1:7799`; `--port` changes that.
 
 Prisma 8 drops the columns a raw read does not declare, so every console query declares its columns. If you wrap `fromPrisma8(db)` in an object of your own (to add a `SET LOCAL`, say), forward its `$withColumns` too.
 
+#### Connection pool
+
+`postgres({ contract, url })` opens at most 10 connections. Keep that for one host process: with 50 hosts in one process polling every 5 ms, a pool of 10 ran workflows 16.7% faster than a pool of 64. To change the size, install `pg` and pass your own pool. `db.close()` does not close a pool you pass in, so end it yourself on shutdown.
+
+```ts
+import { Pool } from "pg";
+
+export const pool = new Pool({ connectionString: process.env.DATABASE_URL!, max: 20 });
+export const db = postgres({ contract: contractFromJson<Contract>(contractJson), pg: pool });
+```
+
+#### Workers and other per-request runtimes
+
+A Worker cannot keep a database connection across requests. Build the client with `postgresServerless` at module scope and open one connection per request:
+
+```ts
+import postgresServerless from "@prisma/orm-postgres/serverless";
+import { contractFromJson } from "@prisma/orm-postgres/static";
+import { createPrismaJobQueue, fromPrisma8 } from "@bratsos/workflow-engine/persistence/prisma";
+import type { Contract } from "./prisma/contract.d";
+import contractJson from "./prisma/contract.json" with { type: "json" };
+
+const postgres = postgresServerless({
+  contract: contractFromJson<Contract>(contractJson),
+  verifyMarker: false,
+});
+
+export default {
+  async fetch(request: Request, env: Env) {
+    await using db = await postgres.connect({ url: env.HYPERDRIVE.connectionString });
+    const jobQueue = createPrismaJobQueue(fromPrisma8(db));
+    return await handle(request, jobQueue); // await it: the connection closes when this returns
+  },
+};
+```
+
+Without `verifyMarker: false`, every connection reads Prisma's contract marker, which is two more statements per request: over 300 requests of one read and one claim, 1,202 statements against 602, and 7.9 ms against 5.4 ms per request. That read only logs a warning when the database and the contract differ, so turn it off where your deploy checks that already. Tested on a local PostgreSQL, not through Hyperdrive.
+
 ### Adopting a PostgreSQL database that Prisma 6 or 7 created
 
 An existing engine database does not change. Prisma 8 only records a marker in its own `prisma_contract` schema; the engine's tables, columns, indexes (the five descending ones included) and data are untouched, so **skip `mixed-order-indexes.sql`**. The tables a Prisma 8 database gets are the same ones Prisma 6 and 7 create: CI diffs the two schemas statement by statement.
@@ -807,6 +845,16 @@ const sqliteLogger = createPrismaAICallLogger(prisma, {
 `createPrismaBlobStore` does not need a database type option. When `prisma` is the wrapped Prisma 8 runtime, pass the same `{ databaseType: "sqlite" }` option to `createPrismaWorkflowPersistence`, `createPrismaJobQueue`, `createPrismaStepLedger`, `createPrismaAICallLogger`, and the console read port.
 
 SQLite is for a single host process per file. In the Prisma 8 wrapper, engine writes through one root client are serialized and root reads remain available. A direct `db.transaction(...)` call made by your code does not use that queue and can still contend with an engine write. Always build transactional ports over the passed transaction client. A root write or transaction from another caller waits for the active transaction and then runs, whether that transaction commits or rolls back. One made from inside a transaction's own callback belongs to it: it is rejected with `P2028` once that transaction rolls back, at the deadline if the callback is waiting on it. A callback that enters an external `AsyncResource` loses that link, so its root write runs after the rollback and persists; use the transaction client for anything that must roll back with the transaction. On Prisma 6/7, the adapters serialize root writes through one client and observe its native SQLite transaction lifecycle after they are constructed, so a transaction opened on that client takes a turn in the same queue; create the root ports before starting consumer transactions. Direct writes through an unwrapped consumer client remain the consumer’s responsibility: on Prisma 7 one made during an open transaction runs on that transaction's connection and goes with its rollback. Do not run multiple processes against one SQLite file; use PostgreSQL for production or multi-process fleets.
+
+Turn on write-ahead logging once, after the database file exists. With 50 hosts in one process, workflows ran 41.9% faster on Prisma 8 than on SQLite's default journal, and more than that on Prisma 7. The SQLite suites give the same results on 6, 7 and 8 with it on.
+
+```bash
+sqlite3 ./dev.db 'PRAGMA journal_mode=WAL;'
+# Without the sqlite3 tool, on Node 22.20 or later:
+node -e "new (require('node:sqlite').DatabaseSync)('./dev.db').exec('PRAGMA journal_mode=WAL')"
+```
+
+The setting stays in the file. While the database is open, SQLite keeps `dev.db-wal` and `dev.db-shm` beside it and recent commits can be only in `dev.db-wal`, so copy the file for a backup after `db.close()`, or copy all three with the process stopped. WAL needs a local disk: do not use it on a network file system.
 
 #### Prisma 6 and 7: clean-room SQLite setup
 
@@ -1045,6 +1093,8 @@ Against a server with a self-signed or private-CA certificate, `?sslmode=require
 ### PgBouncer
 
 PgBouncer in transaction mode works on Prisma 6, 7 and 8 (tested on PgBouncer 1.26.1 with `max_prepared_statements` 0 and 100): isolation levels, raw reads, the console read port and 16 concurrent claim loops over 1,000 jobs, each job claimed once. Prisma 6 needs `?pgbouncer=true` on the URL: without it 2,458 calls failed with prepared-statement errors and 238 of 1,000 jobs completed (none was claimed twice).
+
+The adapters do not use Prisma 8's `db.prepare`. It relies on named statements, which these setups cannot keep between transactions, and it gave no measurable gain at the default poll intervals.
 
 ---
 

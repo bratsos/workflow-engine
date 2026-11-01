@@ -1093,6 +1093,12 @@ await db.transaction(async (tx) => {
 
 **The console.** `workflow-console --database-url` needs `@prisma/client` (Prisma 6 and 7 only). On Prisma 8 install `@bratsos/workflow-engine-console` (no `@alpha`: its version must match the engine's alpha exactly), give `--config` a `console.config.mjs` that builds the reader with `createPrismaConsoleReadPort(fromPrisma8(db))` for PostgreSQL or `createPrismaConsoleReadPort(fromPrisma8(db), { databaseType: "sqlite" })` for SQLite, and a `dispose: () => db.close()`. Run `npx workflow-console --config ./console.config.mjs`; it serves on `http://127.0.0.1:7799`, and `--port` changes that. See [16-operational-console.md](16-operational-console.md). A reader wrapped around `fromPrisma8(db)` by the consumer must forward `$withColumns`. SQLite has no `statement_timeout`; `statementTimeoutMs` cannot cancel a running SQLite query.
 
+**Connection pool.** `postgres({ contract, url })` opens at most 10 connections. Keep that for one host process: with 50 hosts in one process polling every 5 ms, a pool of 10 ran workflows 16.7% faster than a pool of 64. To change it, pass your own `pg.Pool` as `pg:`. `db.close()` does not close a pool you pass in.
+
+**Workers and other per-request runtimes.** A Worker cannot keep a connection across requests. Build `const postgres = postgresServerless({ contract, verifyMarker: false })` from `@prisma/orm-postgres/serverless` at module scope, open `await using db = await postgres.connect({ url })` per request, and call `fromPrisma8(db)` on that connection. Await all work before the handler returns. Without `verifyMarker: false`, every connection reads the contract marker, two more statements per request; that read only logs a warning, so turn it off where your deploy checks that already. Tested on a local PostgreSQL, not through Hyperdrive.
+
+**Prepared statements.** The adapters do not use `db.prepare`. It relies on named statements, which PgBouncer in transaction mode cannot keep between transactions, and it gave no measurable gain at the default poll intervals.
+
 **Adopting a PostgreSQL database that Prisma 6 or 7 created.** The tables do not change and the five descending indexes already exist, so skip `mixed-order-indexes.sql`. Replace the Prisma 6 or 7 packages with the pinned Prisma 8 PostgreSQL pair, copy `contract.prisma`, add `prisma.config.ts`, then:
 
 ```bash
@@ -1159,6 +1165,8 @@ export const prisma = fromPrisma8(db);
 ```
 
 Close the SQLite runtime on shutdown with `await db.close()`.
+
+Turn on write-ahead logging once, after the file exists: `sqlite3 ./dev.db 'PRAGMA journal_mode=WAL;'`. Without the `sqlite3` tool, on Node 22.20 or later, run `node -e "new (require('node:sqlite').DatabaseSync)('./dev.db').exec('PRAGMA journal_mode=WAL')"`. It works on Prisma 6, 7 and 8; workflows ran 41.9% faster on Prisma 8 than on the default journal, and more than that on Prisma 7. The setting stays in the file. While the database is open, recent commits can be only in `dev.db-wal`, so back up after `db.close()` or copy `dev.db`, `dev.db-wal` and `dev.db-shm` with the process stopped. WAL needs a local disk.
 
 Pass `{ databaseType: "sqlite" }` to `createPrismaWorkflowPersistence`, `createPrismaJobQueue`, `createPrismaStepLedger`, and `createPrismaAICallLogger`. The console read port takes `createPrismaConsoleReadPort(prisma, { databaseType: "sqlite" })`. `fromPrisma8` reads the target from `contract.target` and needs no option; passing an adapter option that disagrees with the contract fails at construction and names the matching value.
 
