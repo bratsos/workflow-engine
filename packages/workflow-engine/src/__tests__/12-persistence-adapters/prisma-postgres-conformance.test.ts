@@ -3882,6 +3882,25 @@ if (!DATABASE_URL) {
           expect(await value()).toBe(1);
         });
 
+        // setTimeout fires after 1ms for a delay it cannot hold. Prisma 7's own
+        // timer does that, so its transaction expires before the commit.
+        it("commits under a timeout longer than a timer can hold", async () => {
+          const commit = prisma.$transaction(
+            async (tx: any) => {
+              await createPrismaBlobStore(tx).put("x", 5);
+              await sleep(5);
+            },
+            { timeout: 2 ** 31 },
+          );
+          if ((process.env.PRISMA_MAJOR ?? "7") === "7") {
+            await expect(commit).rejects.toMatchObject({ code: "P2028" });
+            expect(await store.get("x")).toBe(1);
+          } else {
+            await commit;
+            expect(await store.get("x")).toBe(5);
+          }
+        });
+
         // 6 and 7 keep the caller waiting for the callback, so a late error is
         // the callback's own; 8 rejects at the deadline, which is what frees
         // the connection of a callback that never settles.
