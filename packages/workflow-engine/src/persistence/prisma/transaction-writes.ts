@@ -22,21 +22,16 @@ const mutations = new Set([
   "deleteMany",
 ]);
 
+const scopeMarker = Symbol.for("prisma.client.transaction.scope_context");
+const idMarker = Symbol.for("prisma.client.transaction.id");
+
+// Read each marker by key: listing a client's keys walks every layer of
+// Prisma's proxy, and this runs for each adapter built on a transaction.
 function nativeTransactionId(client: object): string | undefined {
-  for (const key of Object.getOwnPropertySymbols(client)) {
-    const marker = Reflect.get(client, key);
-    if (
-      key.description === "prisma.client.transaction.id" &&
-      typeof marker === "string"
-    )
-      return marker;
-    if (
-      key.description === "prisma.client.transaction.scope_context" &&
-      typeof marker?.txId === "string"
-    )
-      return marker.txId;
-  }
-  return undefined;
+  const id =
+    (Reflect.get(client, scopeMarker) as { txId?: unknown } | undefined)
+      ?.txId ?? Reflect.get(client, idMarker);
+  return typeof id === "string" ? id : undefined;
 }
 
 interface NativeTransaction {
