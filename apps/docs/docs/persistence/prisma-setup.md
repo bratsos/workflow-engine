@@ -869,13 +869,13 @@ Initialise the project and install exactly one Prisma major. Prisma 6:
 ```bash
 npm init -y
 npm pkg set type=module
-npm install --save-exact @bratsos/workflow-engine@1.0.0-alpha.18 zod@4 prisma@6.19.3 @prisma/client@6.19.3
+npm install --save-exact @bratsos/workflow-engine@1.0.0-alpha.19 zod@4 prisma@6.19.3 @prisma/client@6.19.3
 ```
 
 For Prisma 7, use this install line instead:
 
 ```bash
-npm install --save-exact @bratsos/workflow-engine@1.0.0-alpha.18 zod@4 prisma@7.10.1 @prisma/client@7.10.1 @prisma/adapter-better-sqlite3@7.10.1
+npm install --save-exact @bratsos/workflow-engine@1.0.0-alpha.19 zod@4 prisma@7.10.1 @prisma/client@7.10.1 @prisma/adapter-better-sqlite3@7.10.1
 ```
 
 Create `scripts/sqlite-schema.cjs` with this content. It keeps every shipped model, default, relation and index except the SQLite-specific `Status` and JSON-default conversions shown below:
