@@ -9,7 +9,12 @@ type PrefixClient = Pick<
   "$queryRaw" | "$queryRawUnsafe" | "$withColumns"
 >;
 
-/** A bound LIKE pattern with one explicit escape character on both databases. */
+/**
+ * A bound LIKE pattern with one explicit escape character on both databases.
+ * SQLite's `LIKE` is ASCII case-insensitive and does not use the btree index:
+ * `list("Case/")` also returns `case/2`, and an annotation `keyPrefix` matches
+ * the same way. Keep keys lowercase (the engine's convention) there.
+ */
 export function literalPrefixQuery<T>(
   prisma: PrefixClient,
   table: string,
