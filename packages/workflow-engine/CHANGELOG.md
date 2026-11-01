@@ -1,5 +1,23 @@
 # @bratsos/workflow-engine
 
+## 1.0.0-alpha.19
+
+### Minor Changes
+
+- 0a79af8: - **Prisma 8 supports SQLite alongside PostgreSQL and Prisma 6/7.** Use the matching `@prisma/orm-sqlite` client and the existing `databaseType: "sqlite"` adapter option; one root client serializes engine writes, while multiple processes sharing a SQLite file remain unsupported.
+  - **The console read port accepts `databaseType: "sqlite"`.** Its `statementTimeoutMs` applies to PostgreSQL only; SQLite has no `statement_timeout` support.
+
+### Patch Changes
+
+- 0a79af8: Blob lists, annotation key-prefix filters and AI call lists/statistics now treat percent signs, underscores and backslashes in prefixes as literal data on PostgreSQL and SQLite across Prisma 6, 7 and 8. Quotes remain safely bound as parameters.
+- 0a79af8: Suspended-stage polling now keeps a durable settlement marker until its job acknowledgement succeeds. Later polls retry failed completion and failure acknowledgements without executing the terminal stage again, including after a restart.
+- 0a79af8: `run.reapStuck` now fails active child stages in the same transaction as a stuck run. It stamps their completion times and errors, clears their poll deadlines, preserves terminal children and retains the stale-version guard.
+- 0a79af8: `run.purge` no longer deletes a run redriven during its sweep, and its result names only the runs it deleted. `PersistenceCore.deleteRun` now takes `(id, cutoff, statuses)`, rechecks them in the delete itself and returns whether it deleted, so custom adapters must update it. `releaseIdempotencyKey` removes a key whatever its state.
+- 0a79af8: Retrying `step.signal` after a failed stage wake now wakes the stage and records its signal event once. The first accepted payload is preserved, including when the ledger completed before the wake failed. A signal delivered after its ledger row was reset wakes the stage and records its own event instead of being swallowed, and `run.purge` removes the `step.signal.wake` idempotency keys of the steps it clears.
+- 0a79af8: SQLite hosts sharing a Prisma client now claim jobs one at a time. Concurrent claims no longer read the same job and fail each other's update, which used most of the database's time on Prisma 6 and could make `dequeue()` return `null` with jobs still pending. On Prisma 6 and 7, the adapters also stop listing a transaction client's keys for each transaction, which saved CPU per transaction on SQLite and Postgres.
+- 0a79af8: SQLite writes queued through the Prisma adapters during an active transaction now wait for it and then run, whether it commits or rolls back. Only a write proven by async context to come from inside a transaction that rolled back is rejected with `P2028`, so another writer's rollback no longer rejects or discards unrelated work, including on Prisma 7, where a root statement shares the transaction's connection. A write whose callback lost its async context through an external `AsyncResource` runs after the rollback and persists: use the passed transaction client for transactional writes. Native SQLite adapters serialize root writes and both transaction forms before Prisma starts them, keeping driver acquisition waits outside the connection pool, and transactions opened on the same client take a turn in that queue. Batched enqueues retain batch semantics without gaining an interactive timeout. Expired native transaction callbacks release the queue even when the callback never settles, and the rejection now says the timeout passed. On Prisma 7, a call to a root port inside a raw `client.$transaction(fn)` used to commit with that transaction by accident of the shared connection; it now fails with `P2028` after 5 s while the adapter write persists alone, so build ports over `tx`. A raw `$transaction` on the root client inside a transaction's callback waits for the outer transaction's deadline and then commits on its own: never start one there. On SQLite on Prisma 6 and 7, `maxWait` does not bound the time a raw transaction waits in the queue; everything ahead of it has a deadline. `enqueue` and `enqueueParallel` on a Prisma 7 SQLite transaction client now throw "does not support $transaction" at once, as on Prisma 6, instead of queueing behind their own transaction.
+- 0a79af8: A `$transaction` `timeout` of 2^31 ms (about 25 days) or more no longer rolls the transaction back after a few milliseconds. The adapters' own timers, on SQLite for Prisma 6 and on Prisma 8, are capped at 2^31 - 1 ms, the longest delay `setTimeout` honours. Prisma 7 still rejects such a timeout in its own timer.
+
 ## 1.0.0-alpha.18
 
 ### Minor Changes

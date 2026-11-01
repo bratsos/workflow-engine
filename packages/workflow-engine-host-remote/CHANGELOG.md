@@ -1,5 +1,20 @@
 # @bratsos/workflow-engine-host-remote
 
+## 0.2.3-alpha.6
+
+### Patch Changes
+
+- Updated dependencies [0a79af8]
+- Updated dependencies [0a79af8]
+- Updated dependencies [0a79af8]
+- Updated dependencies [0a79af8]
+- Updated dependencies [0a79af8]
+- Updated dependencies [0a79af8]
+- Updated dependencies [0a79af8]
+- Updated dependencies [0a79af8]
+- Updated dependencies [0a79af8]
+  - @bratsos/workflow-engine@1.0.0-alpha.19
+
 ## 0.2.3-alpha.5
 
 ### Patch Changes

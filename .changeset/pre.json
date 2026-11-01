@@ -10,7 +10,8 @@
     "@bratsos/workflow-engine-host-serverless": "0.3.2",
     "workflow-engine-prisma-v6": "0.0.0",
     "workflow-engine-prisma-v7": "0.0.0",
-    "workflow-engine-prisma-v8": "0.0.0"
+    "workflow-engine-prisma-v8": "0.0.0",
+    "workflow-engine-prisma-v8-sqlite": "0.0.0"
   },
   "changesets": [
     "ai-evaluate",
@@ -21,8 +22,17 @@
     "cost-accounting",
     "durable-steps-v1",
     "job-queue-enqueue-type",
+    "literal-persistence-prefixes",
+    "poll-settlement-retry",
     "prisma-7-driver-adapter-fixes",
+    "prisma-8-sqlite",
     "prisma-8-support",
-    "run-cancel-bursts"
+    "reaper-stage-cascade",
+    "run-cancel-bursts",
+    "run-purge-reopened-runs",
+    "signal-wake-retry",
+    "sqlite-claim-turns",
+    "sqlite-rollback-write-fence",
+    "transaction-timeout-clamp"
   ]
 }
