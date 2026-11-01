@@ -1,4 +1,4 @@
-import { isIndependentWrite } from "./transaction-writes.js";
+import { rolledBackWrite } from "./transaction-writes.js";
 /**
  * `fromPrisma8(db)`: lets the Prisma adapters run on a Prisma 8 client.
  *
@@ -1106,9 +1106,10 @@ const DEFAULT_TIMEOUT = 5000;
 /**
  * `timeout` as Prisma has it: a callback not settled by then rejects with
  * P2028, so the transaction rolls back and frees its connection, and every
- * further statement on its `tx` fails with P2028 too. 6 and 7 keep the caller
- * waiting for the callback, so one that fails after the deadline gives its own
- * error there and P2028 here.
+ * further statement on its `tx` fails with P2028 too. On Postgres, 6 and 7 keep
+ * the caller waiting for the callback, so one that fails after the deadline
+ * gives its own error there and P2028 here; their SQLite adapters reject at the
+ * deadline too.
  *
  * A statement running at the deadline holds its connection until it ends, and
  * the caller settles then: measured the same on 6, 7 and 8.
@@ -1117,6 +1118,9 @@ function deadline(timeout: number | undefined) {
   if (timeout === undefined) {
     let closed = false;
     return {
+      get closed() {
+        return closed;
+      },
       close() {
         closed = true;
       },
@@ -1142,6 +1146,10 @@ function deadline(timeout: number | undefined) {
     );
   };
   return {
+    /** Set by a rollback only: a commit leaves it false past the deadline. */
+    get closed() {
+      return closed;
+    },
     close() {
       closed = true;
     },
@@ -1174,7 +1182,6 @@ function deadline(timeout: number | undefined) {
 type Schedule = <T>(work: () => Promise<T>) => Promise<T>;
 interface WriteQueue {
   tail: Promise<void>;
-  active?: ReturnType<typeof deadline>;
 }
 const writeQueues = new WeakMap<object, WriteQueue>();
 let writeContext:
@@ -1205,15 +1212,14 @@ async function enqueue<T>(
   queue: WriteQueue,
   work: () => Promise<T>,
 ): Promise<T> {
-  const active = queue.active;
-  const independent = await isIndependentWrite();
   const owner = (await context()).getStore();
-  const open =
-    owner?.queue === queue ? owner.open : independent ? undefined : active;
+  const open = owner?.queue === queue ? owner.open : undefined;
   const pending = queue.tail.then(() => {
     // A root write awaited by its own transaction cannot acquire this queue.
     // Its transaction times out and rolls back; the stale write must not run.
-    open?.check();
+    // Any other write only waited here, whatever became of the transaction
+    // ahead of it.
+    if (open?.closed) throw rolledBackWrite();
     return work();
   });
   queue.tail = pending.then(
@@ -1692,10 +1698,6 @@ export function fromPrisma8(
               return results;
             };
             if (!queue) return lease.race(work());
-            // Capture the active transaction even when external AsyncResource
-            // code lost our context. Writes queued during a rollback cannot
-            // become independent writes after that rollback.
-            queue.active = lease;
             return (await context()).run({ queue, open: lease }, () =>
               lease.race(work()),
             );
@@ -1703,8 +1705,6 @@ export function fromPrisma8(
         } catch (error) {
           open?.close();
           throw error;
-        } finally {
-          if (queue && queue.active === open) queue.active = undefined;
         }
       };
       return schedule ? schedule(run) : run();

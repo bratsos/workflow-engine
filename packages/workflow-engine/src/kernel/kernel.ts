@@ -1,4 +1,3 @@
-import { withPostCommitWrites } from "./helpers/post-commit-writes.js";
 /**
  * Kernel Factory
  *
@@ -427,10 +426,7 @@ export function createKernel(config: KernelConfig): Kernel {
     // -----------------------------------------------------------------
     if (command.type === "stage.pollSuspended") {
       const result = await handleStagePollSuspended(command, deps);
-      if (result._postCommit)
-        await withPostCommitWrites(persistence, () =>
-          result._postCommit!(deps),
-        );
+      await result._postCommit?.(deps);
       return stripEvents(result);
     }
 
@@ -563,7 +559,9 @@ export function createKernel(config: KernelConfig): Kernel {
         // Runs only now that the transaction has committed — the DB
         // state this side effect depends on (e.g. deleted stage rows)
         // can no longer be rolled back out from under it.
-        await withPostCommitWrites(persistence, () => postCommit!(deps));
+        const outcome = await postCommit(deps);
+        // A sweep reports what it deleted, not what selection found.
+        if (command.type === "run.purge") return outcome as RunPurgeResult;
       }
 
       return publicResult;

@@ -752,11 +752,19 @@ export interface PersistenceCore {
   /**
    * Delete a run and everything the persistence owns under it: stage
    * records, logs, artifacts, annotations, and (on the reference schema,
-   * through the cascade) `workflow_steps`. A missing id is a no-op. Never
-   * emits an outbox event; the kernel clears the step ledger and the blob
-   * store before calling it.
+   * through the cascade) `workflow_steps`. Never emits an outbox event; the
+   * kernel clears the step ledger and the blob store before calling it.
+   *
+   * Only while the run still matches `listRunsForPurge(cutoff, statuses)`,
+   * checked atomically with the delete: a redrive can reopen a listed run at
+   * any point of the sweep. Resolves whether the run was deleted, so a
+   * missing id or a run no longer eligible is a no-op that resolves `false`.
    */
-  deleteRun(id: string): Promise<void>;
+  deleteRun(
+    id: string,
+    cutoff: Date,
+    statuses: readonly PurgeableRunStatus[],
+  ): Promise<boolean>;
 
   /**
    * Atomically find and claim the next pending workflow run.
@@ -978,7 +986,10 @@ export interface PersistenceCore {
     result: unknown,
   ): Promise<void>;
 
-  /** Release an in-progress idempotency key after command failure. */
+  /**
+   * Delete an idempotency key whatever its state: an in-progress key after a
+   * command failed, or a completed one nothing will replay any more.
+   */
   releaseIdempotencyKey(key: string, commandType: string): Promise<void>;
 }
 

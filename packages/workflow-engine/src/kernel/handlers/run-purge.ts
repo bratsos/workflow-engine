@@ -17,6 +17,15 @@
  * runs still discoverable by the next purge, including after a process exit.
  * Cleanup can be partial and must be safe to repeat.
  *
+ * INVARIANT: selection is a snapshot, and a redrive can reopen a run at any
+ * point of the sweep. `deleteRun` repeats selection's check atomically, so a
+ * reopened run is never deleted and the job it enqueues is never orphaned.
+ * The run is also re-read before its cleanup and before its jobs go, so one
+ * reopened earlier keeps its data and its job, and the result names only the
+ * runs that were deleted. Cleanup already done for a run reopened after the
+ * last read is not undone: a job lost that way is re-enqueued by
+ * `run.reapStuck`.
+ *
  * Nothing is emitted. Retention is housekeeping, not a lifecycle event.
  */
 
@@ -24,6 +33,7 @@ import type { PurgeableRunStatus } from "../../persistence/interface.js";
 import type { RunPurgeCommand, RunPurgeResult } from "../commands";
 import type { HandlerResult, KernelDeps } from "../kernel";
 import { jobSpillPrefix, stepSpillPrefix } from "../spill.js";
+import { SIGNAL_WAKE, signalWakeKey } from "./step-signal.js";
 
 export const DEFAULT_PURGE_STATUSES: readonly PurgeableRunStatus[] = [
   "COMPLETED",
@@ -80,14 +90,37 @@ export async function handleRunPurge(
     ...(runs.length > 0
       ? {
           _postCommit: async (postDeps: KernelDeps) => {
+            const deleted: string[] = [];
+            const eligible = async (id: string) => {
+              const run = await postDeps.persistence.getRun(id);
+              return (
+                run !== null &&
+                statuses.some((status) => status === run.status) &&
+                (run.completedAt ?? run.updatedAt) <= command.olderThan
+              );
+            };
             for (const run of runs) {
+              if (!(await eligible(run.id))) continue;
               for (const stageRecordId of run.stageRecordIds) {
+                // Before the rows that name these keys. An unreadable row
+                // leaves a key behind, which must not stall retention.
+                const steps = await postDeps.stepLedger
+                  ?.list(stageRecordId)
+                  .catch(() => []);
+                for (const step of steps ?? []) {
+                  if (step.kind !== "signal") continue;
+                  await postDeps.persistence.releaseIdempotencyKey(
+                    signalWakeKey(stageRecordId, step.stepId),
+                    SIGNAL_WAKE,
+                  );
+                }
                 await postDeps.stepLedger?.clear(stageRecordId);
               }
               // job_queue has no foreign key to workflow_runs.
               const jobs = await postDeps.jobTransport.getJobsByWorkflowRun(
                 run.id,
               );
+              if (!(await eligible(run.id))) continue;
               const stageIds = Array.from(
                 new Set(jobs.map((job) => job.stageId)),
               );
@@ -104,8 +137,14 @@ export async function handleRunPurge(
                 }
               }
               // Keep the cleanup keys reachable until every port succeeds.
-              await postDeps.persistence.deleteRun(run.id);
+              const removed = await postDeps.persistence.deleteRun(
+                run.id,
+                command.olderThan,
+                statuses,
+              );
+              if (removed) deleted.push(run.id);
             }
+            return { purged: deleted.length, workflowRunIds: deleted };
           },
         }
       : {}),

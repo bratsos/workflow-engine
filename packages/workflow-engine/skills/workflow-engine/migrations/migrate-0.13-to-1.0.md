@@ -402,8 +402,9 @@ On Prisma 8 there is no `schema.prisma` or generated client: update `prisma/cont
     `countRunsByDefinitionVersion(filter?)`; an adapter without the schema
     returns `false` / `null` / `null` / `[]`. `ensureDefinitionVersioningDetected()`
     is optional.
-  - `listRunsForPurge(cutoff, statuses, limit)` and `deleteRun(id)` for
-    `run.purge`.
+  - `listRunsForPurge(cutoff, statuses, limit)` and
+    `deleteRun(id, cutoff, statuses)` for `run.purge`. `deleteRun` rechecks
+    `cutoff` and `statuses` in the delete itself and returns whether it deleted.
   - `claimNextPendingRun({ now?, serves? })`: a run is claimable only when it is
     pinned to one of the `serves` pairs, or unpinned *and* one of the pairs
     names its workflow; an empty `serves` claims nothing; omitted, it is the

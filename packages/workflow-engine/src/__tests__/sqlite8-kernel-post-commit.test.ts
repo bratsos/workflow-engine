@@ -100,6 +100,150 @@ describe.skipIf(!realDatabase)(
       expect(await db.blobStore.has(key)).toBe(true);
     });
 
+    function pauseOnce() {
+      let arrive!: () => void;
+      let open!: () => void;
+      const reached = new Promise<void>((resolve) => {
+        arrive = resolve;
+      });
+      const gate = new Promise<void>((resolve) => {
+        open = resolve;
+      });
+      return {
+        reached,
+        open,
+        pause: () => {
+          arrive();
+          return gate;
+        },
+      };
+    }
+
+    const pausing = (where: "ledger" | "blob", pause: () => Promise<void>) =>
+      db.makeKernel({
+        stepLedger:
+          where === "ledger"
+            ? wrapStepLedger(db.stepLedger, {
+                async clear(recordId) {
+                  await pause();
+                  await db.stepLedger.clear(recordId);
+                },
+              })
+            : db.stepLedger,
+        blobStore:
+          where === "blob"
+            ? override(db.blobStore, {
+                delete: async (blobKey) => {
+                  await pause();
+                  await db.blobStore.delete(blobKey);
+                },
+              })
+            : db.blobStore,
+      });
+
+    const redrive = (id: string) =>
+      db.kernel.dispatch({
+        type: "run.redrive",
+        workflowRunId: id,
+        from: { kind: "lastFailure" },
+        idempotencyKey: crypto.randomUUID(),
+      });
+
+    it.each([
+      "ledger",
+      "blob",
+    ] as const)("keeps a run and its job when it is redriven during its %s cleanup", async (where) => {
+      const { id } = await seedPurge();
+      const { reached, open, pause } = pauseOnce();
+      const purge = pausing(where, pause).dispatch({
+        type: "run.purge",
+        olderThan: new Date(),
+      });
+      await reached;
+      await redrive(id);
+      open();
+      await expect(purge).resolves.toEqual({ purged: 0, workflowRunIds: [] });
+      expect((await db.persistence.getRun(id))?.status).toBe("RUNNING");
+      expect(
+        (await db.jobTransport.getJobsByWorkflowRun(id)).map(
+          (job) => job.status,
+        ),
+      ).toEqual(["PENDING"]);
+      await expect(
+        db.kernel.dispatch({ type: "run.purge", olderThan: new Date() }),
+      ).resolves.toEqual({ purged: 0, workflowRunIds: [] });
+    });
+
+    it("recovers through run.reapStuck a job the sweep removed after its last check", async () => {
+      const { id } = await seedPurge();
+      const { reached, open, pause } = pauseOnce();
+      const purge = db
+        .makeKernel({
+          jobTransport: override(db.jobTransport, {
+            deleteByRunAndStages: async (runId, stageIds) => {
+              await pause();
+              return db.jobTransport.deleteByRunAndStages(runId, stageIds);
+            },
+          }),
+        })
+        .dispatch({ type: "run.purge", olderThan: new Date() });
+      await reached;
+      await redrive(id);
+      open();
+      await expect(purge).resolves.toEqual({ purged: 0, workflowRunIds: [] });
+      expect(await db.jobTransport.getJobsByWorkflowRun(id)).toEqual([]);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await db.kernel.dispatch({ type: "run.reapStuck", stuckThresholdMs: 0 });
+      expect(
+        (await db.jobTransport.getJobsByWorkflowRun(id)).map(
+          (job) => job.status,
+        ),
+      ).toEqual(["PENDING"]);
+    });
+
+    it("leaves a selected run untouched when it is redriven before the sweep reaches it", async () => {
+      const first = await seedPurge();
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      const second = await seedPurge();
+      const { reached, open, pause } = pauseOnce();
+      const purge = pausing("ledger", pause).dispatch({
+        type: "run.purge",
+        olderThan: new Date(),
+      });
+      await reached;
+      await redrive(second.id);
+      open();
+      await expect(purge).resolves.toEqual({
+        purged: 1,
+        workflowRunIds: [first.id],
+      });
+      expect(await db.persistence.getRun(first.id)).toBeNull();
+      expect((await db.persistence.getRun(second.id))?.status).toBe("RUNNING");
+      expect(await db.blobStore.has(second.key)).toBe(true);
+      expect(await db.stepLedger.list(second.stage.id)).toHaveLength(1);
+      expect(
+        await db.jobTransport.getJobsByWorkflowRun(second.id),
+      ).toHaveLength(1);
+    });
+
+    it("keeps a run that was redriven and finished again during the sweep", async () => {
+      const { id } = await seedPurge();
+      const { reached, open, pause } = pauseOnce();
+      const purge = pausing("blob", pause).dispatch({
+        type: "run.purge",
+        olderThan: new Date("2021-01-01T00:00:00Z"),
+      });
+      await reached;
+      await redrive(id);
+      await db.persistence.updateRun(id, {
+        status: "COMPLETED",
+        completedAt: new Date(),
+      });
+      open();
+      await expect(purge).resolves.toEqual({ purged: 0, workflowRunIds: [] });
+      expect((await db.persistence.getRun(id))?.status).toBe("COMPLETED");
+    });
+
     it.each([
       "workflow_steps",
       "job_queue",

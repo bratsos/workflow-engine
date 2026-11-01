@@ -2617,6 +2617,33 @@ if (!DATABASE_URL) {
             [{ id: "a" }, 11],
           ],
           [
+            "a root write overlapping another transaction's rollback",
+            async () => {
+              let opened!: () => void;
+              const entered = new Promise<void>((resolve) => {
+                opened = resolve;
+              });
+              const aborted = prisma
+                .$transaction(async (tx: any) => {
+                  await tx.workflowRun.delete({ where: { id: "a" } });
+                  opened();
+                  await new Promise((resolve) => setTimeout(resolve, 20));
+                  throw new Error("abort");
+                })
+                .catch((error: Error) => error.message);
+              await entered;
+              return [
+                await prisma.workflowRun.delete({
+                  where: { id: "b" },
+                  select: { id: true },
+                }),
+                await aborted,
+                await prisma.workflowRun.count(),
+              ];
+            },
+            [{ id: "b" }, "abort", 11],
+          ],
+          [
             "deleteMany matching zero rows",
             async () => [
               await prisma.workflowRun.deleteMany({ where: { id: "zz" } }),
@@ -2655,6 +2682,32 @@ if (!DATABASE_URL) {
               await prisma.workflowRun.count(),
             ],
             [{ count: 0 }, 12],
+          ],
+          [
+            "deleteMany of a status list and an OR with a null date",
+            async () => {
+              const eligible = {
+                status: { in: ["PENDING", "RUNNING"] },
+                OR: [
+                  { completedAt: { lte: D1 } },
+                  { completedAt: null, updatedAt: { lte: D1 } },
+                ],
+              };
+              return [
+                await prisma.workflowRun.deleteMany({
+                  where: { id: "d", ...eligible },
+                }),
+                await prisma.workflowRun.deleteMany({
+                  where: {
+                    ...eligible,
+                    id: "d",
+                    OR: [{ completedAt: null, updatedAt: { gt: D1 } }],
+                  },
+                }),
+                await prisma.workflowRun.count({ where: { id: "d" } }),
+              ];
+            },
+            [{ count: 0 }, { count: 1 }, 0],
           ],
           [
             "deleteMany of an undefined field",

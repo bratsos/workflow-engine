@@ -522,8 +522,13 @@ export function persistenceConformanceSuite(
         await finishedRun("purge-keep-me", "COMPLETED", old);
 
         // When: deleting the run (twice: the second is a no-op)
-        await persistence.deleteRun("purge-delete-me");
-        await persistence.deleteRun("purge-delete-me");
+        const eligible = ["COMPLETED"] as const;
+        await expect(
+          persistence.deleteRun("purge-delete-me", cutoff, eligible),
+        ).resolves.toBe(true);
+        await expect(
+          persistence.deleteRun("purge-delete-me", cutoff, eligible),
+        ).resolves.toBe(false);
 
         // Then: the run and its stage are gone, the other run is not
         expect(await persistence.getRun("purge-delete-me")).toBeNull();
@@ -532,6 +537,36 @@ export function persistenceConformanceSuite(
         expect(
           await persistence.listRunsForPurge(cutoff, ["COMPLETED"], 10),
         ).toHaveLength(1);
+      });
+
+      it("should keep a run that stopped being eligible after it was listed", async () => {
+        // Given: a listed run that went back to RUNNING, as a redrive does
+        await finishedRun("purge-reopened", "COMPLETED", old);
+        await persistence.updateRun("purge-reopened", {
+          status: "RUNNING",
+          completedAt: null,
+        });
+
+        // Then: neither that, another status, nor a later finish deletes it
+        const eligible = ["COMPLETED"] as const;
+        await expect(
+          persistence.deleteRun("purge-reopened", cutoff, eligible),
+        ).resolves.toBe(false);
+        await persistence.updateRun("purge-reopened", {
+          status: "FAILED",
+          completedAt: old,
+        });
+        await expect(
+          persistence.deleteRun("purge-reopened", cutoff, eligible),
+        ).resolves.toBe(false);
+        await persistence.updateRun("purge-reopened", {
+          status: "COMPLETED",
+          completedAt: recent,
+        });
+        await expect(
+          persistence.deleteRun("purge-reopened", cutoff, eligible),
+        ).resolves.toBe(false);
+        expect(await persistence.getRun("purge-reopened")).not.toBeNull();
       });
     });
 

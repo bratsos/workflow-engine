@@ -430,8 +430,9 @@ export interface RunReapStuckResult {
  * takes stages, logs, artifacts and annotations with it. After commit it
  * clears the `StepLedger` for every stage record, removes the job rows and
  * deletes the run's blobs (stage outputs, artifacts, spilled job payloads
- * and step results under the engine's own key prefixes). Emits no events.
- * Bounded by `limit` so a tick stays short; repeat until `purged` is 0.
+ * and step results under the engine's own key prefixes). A run reopened
+ * during the sweep is kept. Emits no events. Bounded by `limit` so a tick
+ * stays short; repeat until `purged` is 0.
  */
 export interface RunPurgeCommand {
   readonly type: "run.purge";
@@ -443,7 +444,7 @@ export interface RunPurgeCommand {
   readonly limit?: number;
 }
 
-/** Result of a `run.purge` command. */
+/** Result of a `run.purge` command. Names only the runs actually deleted. */
 export interface RunPurgeResult {
   readonly purged: number;
   readonly workflowRunIds: string[];

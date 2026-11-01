@@ -1,9 +1,5 @@
-import { POST_COMMIT_WRITES } from "../../kernel/helpers/post-commit-writes.js";
 import { literalPrefixQuery, prefixCandidates } from "./literal-prefix.js";
-import {
-  independentWrites,
-  withTransactionWriteGuard,
-} from "./transaction-writes.js";
+import { withTransactionWriteGuard } from "./transaction-writes.js";
 /**
  * PrismaWorkflowPersistence - Prisma implementation of WorkflowPersistence
  *
@@ -253,14 +249,6 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     );
     this.databaseType = options.databaseType ?? "postgresql";
     validateDatabaseType(prisma, this.databaseType);
-    if (this.databaseType === "sqlite") {
-      // Post-commit work belongs to an already committed command. It may wait
-      // for another writer, but that writer's rollback cannot invalidate it.
-      Object.defineProperty(this, POST_COMMIT_WRITES, {
-        value: independentWrites,
-        configurable: true,
-      });
-    }
     this.skipTransactions = options.skipInteractiveTransactions ?? false;
     this.now = options.now ?? (() => new Date());
     this.versioning = {
@@ -437,13 +425,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
   ): Promise<PurgeableRun[]> {
     if (statuses.length === 0 || limit <= 0) return [];
     const runs = await this.prisma.workflowRun.findMany({
-      where: {
-        status: { in: statuses.map((status) => this.enums.status(status)) },
-        OR: [
-          { completedAt: { lte: cutoff } },
-          { completedAt: null, updatedAt: { lte: cutoff } },
-        ],
-      },
+      where: this.purgeable(cutoff, statuses),
       // Oldest first, on the same "finished at" the filter reads: a run
       // with no completedAt sorts by its last write.
       orderBy: [{ completedAt: "asc" }, { updatedAt: "asc" }],
@@ -463,11 +445,29 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     }));
   }
 
-  async deleteRun(id: string): Promise<void> {
+  async deleteRun(
+    id: string,
+    cutoff: Date,
+    statuses: readonly PurgeableRunStatus[],
+  ): Promise<boolean> {
     // deleteMany rather than delete: a missing row is a no-op, not P2025.
     // Stages, logs, artifacts, annotations and (via workflow_stages) the
     // workflow_steps ledger go with it through the schema's cascades.
-    await this.prisma.workflowRun.deleteMany({ where: { id } });
+    const { count } = await this.prisma.workflowRun.deleteMany({
+      where: { id, ...this.purgeable(cutoff, statuses) },
+    });
+    return count > 0;
+  }
+
+  /** One statement decides, so a redrive commits either before it or not at all. */
+  private purgeable(cutoff: Date, statuses: readonly PurgeableRunStatus[]) {
+    return {
+      status: { in: statuses.map((status) => this.enums.status(status)) },
+      OR: [
+        { completedAt: { lte: cutoff } },
+        { completedAt: null, updatedAt: { lte: cutoff } },
+      ],
+    };
   }
 
   async getStuckRuns(stuckSince: Date): Promise<WorkflowRunRecord[]> {

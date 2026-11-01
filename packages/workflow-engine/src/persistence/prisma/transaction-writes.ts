@@ -2,21 +2,14 @@ import type { AsyncLocalStorage } from "node:async_hooks";
 import type { EnginePrismaClient } from "./prisma-client-type.js";
 import { isReadOnlySql } from "./read-only-sql.js";
 
-let independentScope: Promise<AsyncLocalStorage<boolean>> | undefined;
-const scopes = () =>
-  (independentScope ??= import("node:async_hooks").then(
-    ({ AsyncLocalStorage }) => new AsyncLocalStorage<boolean>(),
-  ));
-
-export async function independentWrites<T>(work: () => Promise<T>): Promise<T> {
-  return (await scopes()).run(true, work);
-}
-
-export async function isIndependentWrite(): Promise<boolean> {
-  return independentScope
-    ? (await independentScope).getStore() === true
-    : false;
-}
+/** A root write proven by async context to belong to a rolled-back transaction. */
+export const rolledBackWrite = () =>
+  Object.assign(
+    new Error(
+      "Transaction rolled back before an outer adapter write could run. Use the transaction client for transactional writes.",
+    ),
+    { code: "P2028" },
+  );
 
 const clients = new WeakMap<object, EnginePrismaClient>();
 const mutations = new Set([
@@ -48,14 +41,42 @@ function nativeTransactionId(client: object): string | undefined {
 
 interface NativeTransaction {
   result: Promise<boolean>;
+  timer: ReturnType<typeof setTimeout> | undefined;
   finish(committed: boolean): void;
 }
 interface NativeWriteQueue {
-  active: Set<Promise<boolean>>;
   tail: Promise<void>;
   fenceOf(client: object): Promise<boolean> | undefined;
 }
 const engines = new WeakMap<object, NativeWriteQueue>();
+
+interface NativeOwner {
+  queue: NativeWriteQueue;
+  fence: Promise<boolean>;
+}
+let owners: Promise<AsyncLocalStorage<NativeOwner> | undefined> | undefined;
+// Without async context nothing proves ownership, so nothing is rejected.
+const ownerContext = () =>
+  (owners ??= import("node:async_hooks").then(
+    ({ AsyncLocalStorage }) => new AsyncLocalStorage<NativeOwner>(),
+    () => undefined,
+  ));
+
+/**
+ * Waits for `turn`. Only async context can reject here: a caller inside a
+ * transaction's callback belongs to it and cannot outlive its rollback. Any
+ * other caller just waits, because another writer's rollback is not its own.
+ * Checked at the adapter's call, where the context is the caller's: Prisma's
+ * batch dispatch runs in whichever context queued first.
+ */
+async function admitted(
+  queue: NativeWriteQueue,
+  turn?: Promise<void>,
+): Promise<void> {
+  const owner = (await ownerContext())?.getStore();
+  if (owner?.queue === queue && !(await owner.fence)) throw rolledBackWrite();
+  await turn;
+}
 
 function nativeTransactions(
   prisma: EnginePrismaClient,
@@ -67,43 +88,64 @@ function nativeTransactions(
   if (!engine || typeof engine.transaction !== "function") return undefined;
   const known = engines.get(engine);
   if (known) return known;
-  const active = new Set<Promise<boolean>>();
   const transactions = new Map<string, NativeTransaction[]>();
   const transaction = engine.transaction.bind(engine);
+  const queue: NativeWriteQueue = {
+    tail: Promise.resolve(),
+    fenceOf(client) {
+      const id = nativeTransactionId(client);
+      return id ? transactions.get(id)?.at(-1)?.result : undefined;
+    },
+  };
   engine.transaction = async (
     action: string,
     headers: unknown,
     options: any,
   ) => {
     if (action === "start") {
-      const started = await transaction(action, headers, options);
       let resolve!: (committed: boolean) => void;
       const result = new Promise<boolean>((finish) => {
         resolve = finish;
       });
-      const timer =
-        options.timeout === undefined
-          ? undefined
-          : setTimeout(() => {
-              resolve(false);
-              active.delete(result);
-            }, options.timeout);
-      const entry = {
+      // Every transaction takes a turn, including one opened on the raw client:
+      // Prisma 7 runs root statements on an open transaction's connection, so
+      // a write that overlapped one would go with its rollback. A savepoint
+      // runs inside its transaction's turn.
+      const turn = options?.newTxId === undefined ? queue.tail : undefined;
+      if (turn) queue.tail = result.then(() => {});
+      let started: any;
+      try {
+        await turn;
+        started = await transaction(action, headers, options);
+      } catch (error) {
+        resolve(false);
+        throw error;
+      }
+      const entry: NativeTransaction = {
         result,
-        finish(committed: boolean) {
-          clearTimeout(timer);
-          resolve(committed);
-        },
+        timer:
+          options.timeout === undefined
+            ? undefined
+            : setTimeout(async () => {
+                // The driver's own timer starts its ROLLBACK first. Wait for
+                // it, or the next turn could land on that connection.
+                if (turn)
+                  await transaction("rollback", headers, started).catch(
+                    () => {},
+                  );
+                resolve(false);
+              }, options.timeout),
+        finish: resolve,
       };
       // Prisma 7 reuses a transaction ID for nested savepoint scopes.
       const stack = transactions.get(started.id) ?? [];
       stack.push(entry);
       transactions.set(started.id, stack);
-      active.add(result);
       return started;
     }
     const stack = transactions.get(options?.id);
     const entry = stack?.at(-1);
+    clearTimeout(entry?.timer);
     try {
       const result = await transaction(action, headers, options);
       entry?.finish(action === "commit");
@@ -112,18 +154,9 @@ function nativeTransactions(
       entry?.finish(false);
       throw error;
     } finally {
-      if (entry) active.delete(entry.result);
       stack?.pop();
       if (stack?.length === 0) transactions.delete(options?.id);
     }
-  };
-  const queue: NativeWriteQueue = {
-    active,
-    tail: Promise.resolve(),
-    fenceOf(client) {
-      const id = nativeTransactionId(client);
-      return id ? transactions.get(id)?.at(-1)?.result : undefined;
-    },
   };
   engines.set(engine, queue);
   return queue;
@@ -149,46 +182,17 @@ export function withTransactionWriteGuard<T extends object>(
     return client;
   const queue = nativeTransactions(prisma);
   if (!queue) return client;
-  const closed = () =>
-    Object.assign(
-      new Error(
-        "Transaction rolled back before an outer adapter write could run. Use the transaction client for transactional writes.",
-      ),
-      { code: "P2028" },
-    );
-  const afterTransactions = <R>(work: () => Promise<R>): Promise<R> => {
-    const owners = [...queue.active];
-    const independent = isIndependentWrite();
-    const permit = Promise.all(owners).then(async (results) => {
-      if (results.some((committed) => !committed) && !(await independent))
-        throw closed();
-    });
-    const pending = queue.tail.then(async () => {
-      await permit;
-      return work();
-    });
+  const afterTurn = <R>(work: () => Promise<R>): Promise<R> => {
+    const pending = admitted(queue, queue.tail).then(work);
     queue.tail = pending.then(
       () => {},
       () => {},
     );
-    // Native Prisma waits for its callback even after rolling the driver back.
-    // Reject a self-dependent queued write at that deadline so its callback
-    // can unwind, release the queue, and leave the queued SQL unexecuted.
-    const rollback = new Promise<never>((_, reject) => {
-      for (const owner of owners)
-        owner.then(async (committed) => {
-          if (!committed && !(await independent)) reject(closed());
-        });
-    });
-    return Promise.race([
-      pending,
-      rollback,
-      permit.then(() => new Promise<never>(() => {})),
-    ]);
+    return pending;
   };
   const guard = (operation: any) => {
     let pending: Promise<unknown> | undefined;
-    const run = () => (pending ??= afterTransactions(() => operation));
+    const run = () => (pending ??= afterTurn(() => operation));
     return new Proxy(operation, {
       get(target, key) {
         if (key === "then") return (...args: any[]) => run().then(...args);
@@ -208,28 +212,41 @@ export function withTransactionWriteGuard<T extends object>(
         const value: any = Reflect.get(target, key);
         if (key === "$transaction")
           return (arg: any, options?: any) =>
-            afterTransactions(() =>
-              value.call(
-                target,
-                typeof arg === "function"
-                  ? (tx: EnginePrismaClient) => {
-                      const work = Promise.resolve().then(() => arg(tx));
+            typeof arg === "function"
+              ? admitted(queue).then(() =>
+                  value.call(
+                    target,
+                    async (tx: EnginePrismaClient) => {
                       const fence = queue.fenceOf(tx);
-                      if (!fence) return work;
-                      // A callback need not cooperate with the native driver's timeout.
-                      // Its queue slot must still be released once the driver rolls back.
+                      if (!fence) return arg(tx);
+                      const context = await ownerContext();
+                      const callback = async () => arg(tx);
                       return Promise.race([
-                        work,
+                        context
+                          ? context.run({ queue, fence }, callback)
+                          : callback(),
+                        // A callback need not cooperate with the native driver's
+                        // timeout, and only that timeout ends one still running.
                         fence.then((committed) => {
-                          if (!committed) throw closed();
+                          if (!committed)
+                            throw Object.assign(
+                              new Error(
+                                "Transaction already closed: the transaction timeout passed before its callback settled.",
+                              ),
+                              { code: "P2028" },
+                            );
                           return new Promise<never>(() => {});
                         }),
                       ]);
-                    }
-                  : arg,
-                options,
-              ),
-            );
+                    },
+                    options,
+                  ),
+                )
+              : // Waits without holding the turn: Prisma 7 sends a batch through
+                // `transaction("start")`, which takes its own.
+                admitted(queue, queue.tail).then(() =>
+                  value.call(target, arg, options),
+                );
         if (key === "$withColumns" && typeof value === "function")
           return (...args: any[]) => wrap(value.apply(target, args));
         if (
