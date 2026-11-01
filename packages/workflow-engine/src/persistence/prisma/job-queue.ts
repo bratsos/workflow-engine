@@ -1,4 +1,7 @@
-import { withTransactionWriteGuard } from "./transaction-writes.js";
+import {
+  isNativeTransaction,
+  withTransactionWriteGuard,
+} from "./transaction-writes.js";
 /**
  * PrismaJobQueue - Prisma implementation of JobQueue
  *
@@ -145,6 +148,8 @@ export class PrismaJobQueue implements JobQueue {
   private prisma: PrismaClient;
   private enums: PrismaEnumHelper;
   private databaseType: DatabaseType;
+  /** A Prisma 6/7 SQLite transaction client: a batch on it would wait for its own transaction. */
+  private readonly inSqliteTransaction: boolean;
   private readonly fairnessPath: string[] | null;
   private readonly fairnessLimit: number;
 
@@ -167,6 +172,8 @@ export class PrismaJobQueue implements JobQueue {
     this.enums = createEnumHelper(prisma);
     this.databaseType = options.databaseType ?? "postgresql";
     validateDatabaseType(prisma, this.databaseType);
+    this.inSqliteTransaction =
+      this.databaseType === "sqlite" && isNativeTransaction(prisma);
     this.now = options.now ?? (() => new Date());
     this.fairnessGroupBy = options.fairness
       ? (options.fairness.groupBy ?? "_groupKey")
@@ -268,7 +275,7 @@ export class PrismaJobQueue implements JobQueue {
     // runtime reads internal state off `this` inside its own method
     // bodies, so an unbound reference throws at call time ("Cannot read
     // properties of undefined").
-    if (!this.prisma.$transaction) {
+    if (!this.prisma.$transaction || this.inSqliteTransaction) {
       throw new Error(
         "Prisma client does not support $transaction (required for enqueueParallel)",
       );

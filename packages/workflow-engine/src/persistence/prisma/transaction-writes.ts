@@ -34,6 +34,13 @@ function nativeTransactionId(client: object): string | undefined {
   return typeof id === "string" ? id : undefined;
 }
 
+/** The longest delay `setTimeout` honours: a longer one fires after 1ms. */
+export const maxTimerMs = 2 ** 31 - 1;
+
+/** Whether `client` is the client a Prisma 6/7 `$transaction(fn)` hands out. */
+export const isNativeTransaction = (client: object) =>
+  nativeTransactionId(client) !== undefined;
+
 interface NativeTransaction {
   result: Promise<boolean>;
   timer: ReturnType<typeof setTimeout> | undefined;
@@ -120,15 +127,18 @@ function nativeTransactions(
         timer:
           options.timeout === undefined
             ? undefined
-            : setTimeout(async () => {
-                // The driver's own timer starts its ROLLBACK first. Wait for
-                // it, or the next turn could land on that connection.
-                if (turn)
-                  await transaction("rollback", headers, started).catch(
-                    () => {},
-                  );
-                resolve(false);
-              }, options.timeout),
+            : setTimeout(
+                async () => {
+                  // The driver's own timer starts its ROLLBACK first. Wait for
+                  // it, or the next turn could land on that connection.
+                  if (turn)
+                    await transaction("rollback", headers, started).catch(
+                      () => {},
+                    );
+                  resolve(false);
+                },
+                Math.min(options.timeout, maxTimerMs),
+              ),
         finish: resolve,
       };
       // Prisma 7 reuses a transaction ID for nested savepoint scopes.

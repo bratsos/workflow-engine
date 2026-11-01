@@ -4,7 +4,10 @@ import { z } from "zod";
 import { defineStage } from "../core/stage-factory.js";
 import { WorkflowBuilder } from "../core/workflow.js";
 import { executeJobWithHeartbeat } from "../kernel/helpers/host-support.js";
-import { createPrismaWorkflowPersistence } from "../persistence/prisma/index.js";
+import {
+  createPrismaJobQueue,
+  createPrismaWorkflowPersistence,
+} from "../persistence/prisma/index.js";
 import { withTransactionWriteGuard } from "../persistence/prisma/transaction-writes.js";
 import {
   type KernelDatabase,
@@ -421,6 +424,55 @@ describe.skipIf(!realDatabase)(
         await expect(own).rejects.toMatchObject({ code: "P2028" });
         await db.persistence.createLog({ level: "INFO", message: "after" });
         expect(await logged()).toEqual(["after"]);
+      },
+    );
+
+    it.skipIf(!sqlite).each(["enqueue", "enqueueParallel"] as const)(
+      "fails %s over a transaction client at once",
+      async (method) => {
+        const id = crypto.randomUUID();
+        const job = {
+          workflowRunId: id,
+          workflowId: db.workflow.id,
+          stageId: "s",
+        };
+        const started = Date.now();
+        await expect(
+          db.client.$transaction(
+            async (tx: any) => {
+              await tx.workflowLog.create({
+                data: { level: "INFO", message: "in transaction" },
+              });
+              const queue = createPrismaJobQueue(tx, {
+                databaseType: "sqlite",
+              });
+              return method === "enqueue"
+                ? queue.enqueue(job)
+                : queue.enqueueParallel([job]);
+            },
+            { timeout: 4000 },
+          ),
+        ).rejects.toThrow("does not support $transaction");
+        expect(Date.now() - started).toBeLessThan(2000);
+        expect(await db.jobTransport.getJobsByWorkflowRun(id)).toEqual([]);
+        expect(await logged()).toEqual([]);
+      },
+    );
+
+    // Prisma 7 rejects such a timeout in its own timer, before the adapters'.
+    it.skipIf(!sqlite || process.env.PRISMA_MAJOR === "7")(
+      "commits a transaction whose timeout exceeds the longest timer delay",
+      async () => {
+        await db.client.$transaction(
+          async (tx: any) => {
+            await sleep(20);
+            await tx.workflowLog.create({
+              data: { level: "INFO", message: "long timeout" },
+            });
+          },
+          { timeout: 2 ** 40 },
+        );
+        expect(await logged()).toEqual(["long timeout"]);
       },
     );
 

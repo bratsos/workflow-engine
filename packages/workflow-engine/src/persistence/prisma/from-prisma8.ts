@@ -1,4 +1,4 @@
-import { rolledBackWrite } from "./transaction-writes.js";
+import { maxTimerMs, rolledBackWrite } from "./transaction-writes.js";
 /**
  * `fromPrisma8(db)`: lets the Prisma adapters run on a Prisma 8 client.
  *
@@ -1165,7 +1165,7 @@ function deadline(timeout: number | undefined) {
           new Promise<never>((_, reject) => {
             timer = setTimeout(
               () => reject(expired()),
-              Math.max(0, end - Date.now()),
+              Math.min(maxTimerMs, Math.max(0, end - Date.now())),
             );
           }),
         ]);
