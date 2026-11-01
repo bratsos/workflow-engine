@@ -273,6 +273,7 @@ export interface PrismaConsoleReadPortOptions {
   statusEnumName?: string;     // Defaults to "Status"
   statementTimeoutMs?: number; // Defaults to 15000; 0 disables
   now?: () => Date;            // Defaults to () => new Date()
+  databaseType?: "postgresql" | "sqlite"; // Defaults to "postgresql"; set "sqlite" on SQLite, on any major
 }
 
 export function createPrismaConsoleReadPort(
@@ -420,6 +421,8 @@ export default {
   dispose: () => db.close(),
 };
 ```
+
+For SQLite, build `db` with `sqlite({ contract, path })` from `@prisma/orm-sqlite/runtime` and pass `{ databaseType: "sqlite" }` to `createPrismaConsoleReadPort`.
 
 A reader wrapped around `fromPrisma8(db)` by the consumer must forward `$withColumns`: Prisma 8 drops raw-read columns that are not declared, and the reader declares them through that member.
 

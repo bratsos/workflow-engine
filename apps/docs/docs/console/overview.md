@@ -73,6 +73,10 @@ has no model delegates, so wrap it first:
 pass the `tx` and the contract: `fromPrisma8(tx, { contract: db.contract })`.
 See [Prisma 8](../persistence/prisma-setup.md#prisma-8).
 
+On SQLite, on any major, also pass the target:
+`createPrismaConsoleReadPort(prisma, { databaseType: "sqlite" })`. The default
+is `"postgresql"`.
+
 `authorize` is not optional in practice: omit it and every action is
 denied, because a permissive default would leak a tenant's runs to anyone
 who forgot a line of configuration. It runs *after* your authentication —
@@ -170,6 +174,10 @@ export default {
   dispose: () => db.close(),
 };
 ```
+
+For SQLite, build `db` with `sqlite({ contract, path })` from
+`@prisma/orm-sqlite/runtime` and pass `{ databaseType: "sqlite" }` to
+`createPrismaConsoleReadPort`.
 
 ## Finding a run stranded on an old definition version
 
