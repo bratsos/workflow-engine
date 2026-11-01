@@ -424,6 +424,66 @@ describe.skipIf(!realDatabase)(
       },
     );
 
+    const enqueueClaims = (count: number) =>
+      db.jobTransport.enqueueParallel(
+        Array.from({ length: count }, (_, index) => ({
+          workflowRunId: crypto.randomUUID(),
+          workflowId: db.workflow.id,
+          stageId: `claim-${index}`,
+        })),
+      );
+
+    it.skipIf(!sqlite)(
+      "gives every concurrent claim on one client its own job",
+      async () => {
+        const count = 24;
+        await enqueueClaims(count);
+        const claims = await Promise.all(
+          Array.from({ length: count }, () => db.jobTransport.dequeue()),
+        );
+        expect(new Set(claims.map((job) => job?.stageId)).size).toBe(count);
+        expect(claims).not.toContain(null);
+      },
+    );
+
+    it.skipIf(!sqlite)(
+      "rejects only the claim queued behind its own transaction",
+      async () => {
+        await enqueueClaims(2);
+        const client = withTransactionWriteGuard(db.client, "sqlite") as any;
+        const unrelated = new AsyncResource("unrelated-host");
+        let other: ReturnType<typeof db.jobTransport.dequeue> | undefined;
+        let own: Promise<unknown> | undefined;
+        try {
+          await expect(
+            client.$transaction(
+              async (tx: any) => {
+                await tx.workflowLog.create({
+                  data: { level: "INFO", message: "rollback" },
+                });
+                other = unrelated.runInAsyncScope(() =>
+                  db.jobTransport.dequeue(),
+                );
+                own = db.jobTransport.dequeue();
+                await own;
+              },
+              { timeout: 100 },
+            ),
+          ).rejects.toMatchObject({ code: "P2028" });
+          const claimed = await other;
+          await expect(own).rejects.toMatchObject({ code: "P2028" });
+          const left = await db.jobTransport.dequeue();
+          expect([claimed?.stageId, left?.stageId].sort()).toEqual([
+            "claim-0",
+            "claim-1",
+          ]);
+          expect(await logged()).toEqual([]);
+        } finally {
+          unrelated.emitDestroy();
+        }
+      },
+    );
+
     it.skipIf(!sqlite).each(["batch", "callback"] as const)(
       "runs a queued %s transaction after a rollback when async context is lost",
       async (kind) => {

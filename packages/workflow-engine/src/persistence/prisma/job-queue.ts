@@ -40,6 +40,9 @@ const logger = createLogger("JobQueue");
  * degrades to "try again later" instead of unbounded recursion.
  */
 const MAX_DEQUEUE_ATTEMPTS = 10;
+// Hosts sharing a client claim one at a time. Concurrent claims all read the
+// same head job, and every loser spends a write transaction on a failed update.
+const sqliteClaims = new WeakMap<object, Promise<DequeueResult | null>>();
 
 /**
  * How many ready rows the SQLite dequeue reads when `serves` filtering is
@@ -311,7 +314,11 @@ export class PrismaJobQueue implements JobQueue {
    */
   async dequeue(options?: DequeueOptions): Promise<DequeueResult | null> {
     if (this.databaseType === "sqlite") {
-      return this.dequeueSqlite(0, options?.serves);
+      const claim = () => this.dequeueSqlite(0, options?.serves);
+      const turn = sqliteClaims.get(this.prisma);
+      const claimed = turn ? turn.then(claim, claim) : claim();
+      sqliteClaims.set(this.prisma, claimed);
+      return claimed;
     }
     return this.dequeuePostgres(options?.serves);
   }
