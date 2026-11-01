@@ -1,5 +1,25 @@
 # @bratsos/workflow-engine-console
 
+## 1.0.0-alpha.6
+
+### Minor Changes
+
+- 0a79af8: - **Prisma 8 supports SQLite alongside PostgreSQL and Prisma 6/7.** Use the matching `@prisma/orm-sqlite` client and the existing `databaseType: "sqlite"` adapter option; one root client serializes engine writes, while multiple processes sharing a SQLite file remain unsupported.
+  - **The console read port accepts `databaseType: "sqlite"`.** Its `statementTimeoutMs` applies to PostgreSQL only; SQLite has no `statement_timeout` support.
+
+### Patch Changes
+
+- Updated dependencies [0a79af8]
+- Updated dependencies [0a79af8]
+- Updated dependencies [0a79af8]
+- Updated dependencies [0a79af8]
+- Updated dependencies [0a79af8]
+- Updated dependencies [0a79af8]
+- Updated dependencies [0a79af8]
+- Updated dependencies [0a79af8]
+- Updated dependencies [0a79af8]
+  - @bratsos/workflow-engine@1.0.0-alpha.19
+
 ## 1.0.0-alpha.5
 
 ### Minor Changes
