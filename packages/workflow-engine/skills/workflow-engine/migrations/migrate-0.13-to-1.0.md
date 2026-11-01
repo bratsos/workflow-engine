@@ -402,16 +402,19 @@ On Prisma 8 there is no `schema.prisma` or generated client: update `prisma/cont
     `countRunsByDefinitionVersion(filter?)`; an adapter without the schema
     returns `false` / `null` / `null` / `[]`. `ensureDefinitionVersioningDetected()`
     is optional.
-  - `listRunsForPurge(cutoff, statuses, limit)` and `deleteRun(id)` for
-    `run.purge`.
+  - `listRunsForPurge(cutoff, statuses, limit)` and
+    `deleteRun(id, cutoff, statuses)` for `run.purge`. `deleteRun` rechecks
+    `cutoff` and `statuses` in the delete itself and returns whether it deleted.
   - `claimNextPendingRun({ now?, serves? })`: a run is claimable only when it is
     pinned to one of the `serves` pairs, or unpinned *and* one of the pairs
     names its workflow; an empty `serves` claims nothing; omitted, it is the
     pre-1.0 predicate. An adapter with no `definitionVersion` column may
     ignore it.
-  - `getSuspendedStages(beforeDate, { limit?, serves? })` must return rows
+  - `getSuspendedStages(beforeDate, { limit?, serves?, includeSettlements? })` must return rows
     oldest `nextPollAt` first, capped at `limit`, and filtered by `serves`
-    (ignorable on a schema with no `definitionVersion` column).
+    (ignorable on a schema with no `definitionVersion` column). With
+    `includeSettlements: true`, include `COMPLETED` and `FAILED` stages
+    with a due `nextPollAt` so polling can retry job settlement.
   - `WorkflowRunRecord` gains `definitionVersion: string | null` and
     `redriveCount: number`; `CreateRunInput`/`UpdateRunInput` carry
     `definitionVersion`, `UpdateRunInput` carries `redriveCount`, and

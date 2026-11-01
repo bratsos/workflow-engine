@@ -1,4 +1,5 @@
 import type {
+  Persistence,
   StepLedger,
   StepRecord,
   StepRecordExpectation,
@@ -6,9 +7,11 @@ import type {
 } from "../../kernel/ports.js";
 import {
   type EnginePrismaClient,
-  rejectSqliteOn8,
+  validateDatabaseType,
 } from "./prisma-client-type.js";
 import { isUniqueViolation } from "./sql-errors.js";
+import { hasBaseReads, sqliteTransactionReads } from "./transaction-reads.js";
+import { withTransactionWriteGuard } from "./transaction-writes.js";
 
 type PrismaClient = EnginePrismaClient;
 
@@ -86,8 +89,12 @@ export class PrismaStepLedger implements StepLedger {
     private readonly prisma: PrismaClient,
     options: PrismaStepLedgerOptions = {},
   ) {
+    this.prisma = withTransactionWriteGuard(
+      prisma,
+      options.databaseType ?? "postgresql",
+    );
     this.databaseType = options.databaseType ?? "postgresql";
-    rejectSqliteOn8(prisma, this.databaseType);
+    validateDatabaseType(prisma, this.databaseType);
   }
 
   async claim(
@@ -193,6 +200,18 @@ export class PrismaStepLedger implements StepLedger {
     return records.map(mapStep);
   }
 
+  transactionReads(persistence: Persistence): Partial<StepLedger> | undefined {
+    if (this.databaseType !== "sqlite") return undefined;
+    return sqliteTransactionReads(persistence, this.prisma, (tx) => {
+      if (!hasBaseReads(this, PrismaStepLedger.prototype, ["get", "list"]))
+        return undefined;
+      const reader = new PrismaStepLedger(tx, {
+        databaseType: this.databaseType,
+      });
+      return { get: reader.get.bind(reader), list: reader.list.bind(reader) };
+    });
+  }
+
   async clear(stageRecordId: string): Promise<void> {
     await this.prisma.workflowStep.deleteMany({ where: { stageRecordId } });
   }
@@ -202,6 +221,19 @@ export class PrismaStepLedger implements StepLedger {
     keepStepIds: string[],
   ): Promise<void> {
     if (keepStepIds.length === 0) return this.clear(stageRecordId);
+    if (this.databaseType === "sqlite") {
+      if (typeof this.prisma.$executeRaw !== "function") {
+        throw new Error(
+          "Prisma client does not support $executeRaw (required for the SQLite clearExcept path)",
+        );
+      }
+      await this.prisma.$executeRaw`
+        DELETE FROM "workflow_steps"
+        WHERE "stageRecordId" = ${stageRecordId}
+          AND "stepId" NOT IN (SELECT value FROM json_each(${JSON.stringify(keepStepIds)}))
+      `;
+      return;
+    }
     await this.prisma.workflowStep.deleteMany({
       where: { stageRecordId, stepId: { notIn: keepStepIds } },
     });

@@ -412,7 +412,7 @@ interface PersistenceCore {
 
   getSuspendedStages(
     beforeDate: Date,
-    options?: { limit?: number; serves?: readonly ServedDefinition[] },
+    options?: { limit?: number; serves?: readonly ServedDefinition[]; includeSettlements?: boolean },
   ): Promise<WorkflowStageRecord[]>;
 }
 ```
@@ -423,7 +423,7 @@ interface PersistenceCore {
 - `getDefinition(workflowId, version)`: Fetches a definition snapshot by compound key, or returns `null` if not found.
 - `countRunsByDefinitionVersion(filter)`: Aggregates run counts grouped by `(workflowId, definitionVersion, status)`. Returns an empty array if versioning is unsupported.
 - `ServedDefinition`: Evaluated as a compound pair `(workflowId, version)` to ensure workflows declaring matching explicit versions (such as `"1.0.0"`) do not collide. `claimNextPendingRun({ serves })` must claim a pinned run only when the pair is listed, an unpinned run only when a listed pair names its workflow, and nothing at all for an empty list; omitted, it claims any pending run.
-- `getSuspendedStages(beforeDate, { limit, serves })`: Owns both narrowings — rows oldest `nextPollAt` first, capped at `limit`, and filtered by `serves` evaluated against the stage's run. An adapter with no `definitionVersion` column may ignore `serves`, because such a database has no pinned runs; it must not ignore `limit`.
+- `getSuspendedStages(beforeDate, { limit, serves, includeSettlements })`: Owns both narrowings — rows oldest `nextPollAt` first, capped at `limit`, and filtered by `serves` evaluated against the stage's run. An adapter with no `definitionVersion` column may ignore `serves`, because such a database has no pinned runs; it must not ignore `limit`. When `includeSettlements` is true, also return `COMPLETED` and `FAILED` stages with a due `nextPollAt`, so polling can retry job settlement without executing those stages.
 
 ### Feature detection in Prisma
 

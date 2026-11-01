@@ -55,6 +55,7 @@ import {
   createPrismaJobQueue,
   createPrismaStepLedger,
   createPrismaWorkflowPersistence,
+  fromPrisma8,
 } from "../../persistence/prisma/index.js";
 import { rawFor } from "../../persistence/prisma/prisma-client-type.js";
 import {
@@ -2616,6 +2617,33 @@ if (!DATABASE_URL) {
             [{ id: "a" }, 11],
           ],
           [
+            "a root write overlapping another transaction's rollback",
+            async () => {
+              let opened!: () => void;
+              const entered = new Promise<void>((resolve) => {
+                opened = resolve;
+              });
+              const aborted = prisma
+                .$transaction(async (tx: any) => {
+                  await tx.workflowRun.delete({ where: { id: "a" } });
+                  opened();
+                  await new Promise((resolve) => setTimeout(resolve, 20));
+                  throw new Error("abort");
+                })
+                .catch((error: Error) => error.message);
+              await entered;
+              return [
+                await prisma.workflowRun.delete({
+                  where: { id: "b" },
+                  select: { id: true },
+                }),
+                await aborted,
+                await prisma.workflowRun.count(),
+              ];
+            },
+            [{ id: "b" }, "abort", 11],
+          ],
+          [
             "deleteMany matching zero rows",
             async () => [
               await prisma.workflowRun.deleteMany({ where: { id: "zz" } }),
@@ -2654,6 +2682,32 @@ if (!DATABASE_URL) {
               await prisma.workflowRun.count(),
             ],
             [{ count: 0 }, 12],
+          ],
+          [
+            "deleteMany of a status list and an OR with a null date",
+            async () => {
+              const eligible = {
+                status: { in: ["PENDING", "RUNNING"] },
+                OR: [
+                  { completedAt: { lte: D1 } },
+                  { completedAt: null, updatedAt: { lte: D1 } },
+                ],
+              };
+              return [
+                await prisma.workflowRun.deleteMany({
+                  where: { id: "d", ...eligible },
+                }),
+                await prisma.workflowRun.deleteMany({
+                  where: {
+                    ...eligible,
+                    id: "d",
+                    OR: [{ completedAt: null, updatedAt: { gt: D1 } }],
+                  },
+                }),
+                await prisma.workflowRun.count({ where: { id: "d" } }),
+              ];
+            },
+            [{ count: 0 }, { count: 1 }, 0],
           ],
           [
             "deleteMany of an undefined field",
@@ -3828,6 +3882,25 @@ if (!DATABASE_URL) {
           expect(await value()).toBe(1);
         });
 
+        // setTimeout fires after 1ms for a delay it cannot hold. Prisma 7's own
+        // timer does that, so its transaction expires before the commit.
+        it("commits under a timeout longer than a timer can hold", async () => {
+          const commit = prisma.$transaction(
+            async (tx: any) => {
+              await createPrismaBlobStore(tx).put("x", 5);
+              await sleep(5);
+            },
+            { timeout: 2 ** 31 },
+          );
+          if ((process.env.PRISMA_MAJOR ?? "7") === "7") {
+            await expect(commit).rejects.toMatchObject({ code: "P2028" });
+            expect(await store.get("x")).toBe(1);
+          } else {
+            await commit;
+            expect(await store.get("x")).toBe(5);
+          }
+        });
+
         // 6 and 7 keep the caller waiting for the callback, so a late error is
         // the callback's own; 8 rejects at the deadline, which is what frees
         // the connection of a callback that never settles.
@@ -4049,7 +4122,7 @@ if (!DATABASE_URL) {
           expect(pollInterval).toBe(562);
         });
 
-        it("the AI call logger's stats treat a prefix as a LIKE pattern", async () => {
+        it("the AI call logger's stats treat a prefix literally", async () => {
           await prisma.$executeRawUnsafe(`TRUNCATE "ai_calls"`);
           const logger = createPrismaAICallLogger(prisma);
           const call = {
@@ -4078,8 +4151,8 @@ if (!DATABASE_URL) {
             },
           ]);
           const stats = await logger.getStats("cost_");
-          expect(stats.totalCalls).toBe(2);
-          expect(stats.totalCost).toBe(0.375);
+          expect(stats.totalCalls).toBe(1);
+          expect(stats.totalCost).toBe(0.125);
         });
 
         it("the AI call logger records a batch above the bind limit", async () => {
@@ -4110,13 +4183,11 @@ if (!DATABASE_URL) {
           expect(await store.list("new")).toEqual([]);
         });
 
-        it("the blob store lists a prefix as a LIKE pattern", async () => {
+        it("the blob store lists a literal prefix", async () => {
           const store = createPrismaBlobStore(prisma);
           await store.put("prefix_1", {});
           await store.put("prefixX2", {});
-          expect(await store.list("prefix_")).toEqual(
-            expect.arrayContaining(["prefix_1", "prefixX2"]),
-          );
+          expect(await store.list("prefix_")).toEqual(["prefix_1"]);
         });
       });
     });
@@ -4828,10 +4899,9 @@ if (!DATABASE_URL) {
   });
 }
 
-// The fixture generates a separate, minimal SQLite client without changing the
-// shipped schema or replacing the Postgres client used by the suites above.
-// Prisma 8 is Postgres-only, so there is no SQLite client to test there.
-describe.skipIf(isPrisma8)("definition registration on real SQLite", () => {
+// A separate SQLite file leaves the Postgres database above untouched while
+// checking the same registration behavior on all three Prisma majors.
+describe("definition registration on real SQLite", () => {
   const require = createRequire(import.meta.url);
   let directory: string;
   let prisma: any;
@@ -4839,10 +4909,16 @@ describe.skipIf(isPrisma8)("definition registration on real SQLite", () => {
     directory = await mkdtemp(
       join(tmpdir(), "definition-registration-sqlite-"),
     );
-    const {
-      createSqliteClient,
-    } = require("../../../../prisma-fixtures/index.cjs");
-    prisma = createSqliteClient(join(directory, "test.db"));
+    const fixture = require("../../../../prisma-fixtures/index.cjs");
+    const file = join(directory, "test.db");
+    if (isPrisma8) {
+      const db = await fixture.createSqliteDb(file);
+      prisma = Object.assign(fromPrisma8(db), {
+        $disconnect: () => db.close(),
+      });
+    } else {
+      prisma = fixture.createSqliteClient(file);
+    }
   }, 30_000);
   afterAll(async () => {
     await prisma?.$disconnect();
@@ -4880,9 +4956,8 @@ describe.skipIf(isPrisma8)("definition registration on real SQLite", () => {
   });
 
   it("stores a raw-inserted createdAt the way the model API stores one", async () => {
-    // The raw insert binds a Date, where the Postgres statements bind an ISO
-    // string: SQLite keeps an integer on 6 and ISO text on 7, and the raw
-    // statement must land on whichever one the model API writes.
+    // Raw and model writes must agree: SQLite keeps integer milliseconds on
+    // Prisma 6 and text timestamps on Prisma 7 and 8.
     await prisma.workflowDefinition.create({
       data: {
         workflowId: "sqlite-model",
@@ -4900,7 +4975,10 @@ describe.skipIf(isPrisma8)("definition registration on real SQLite", () => {
       snapshot: {},
       structureHash: "h",
     });
-    const rows = (await prisma.$queryRawUnsafe(
+    const rows = (await rawFor(prisma, {
+      id: "text",
+      type: "text",
+    }).$queryRawUnsafe(
       `SELECT "workflowId" AS id, typeof("createdAt") AS type FROM "workflow_definitions" WHERE "workflowId" IN ('sqlite-model', 'sqlite-raw')`,
     )) as Array<{ id: string; type: string }>;
     const types = Object.fromEntries(rows.map((row) => [row.id, row.type]));

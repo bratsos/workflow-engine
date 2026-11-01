@@ -161,6 +161,7 @@ export type {
   ServedDefinition,
   StepLedger,
   StepRecord,
+  TransactionReadPort,
   WorkflowAnnotationRecord,
 } from "./ports.js";
 // Claim-check spilling for unbounded payloads

@@ -37,7 +37,7 @@ This guide covers common issues encountered when running **workflow-engine**, ho
 * **Self-Healing (Reap Stuck)**:
   * The kernel's `run.reapStuck` command runs automatically on every host orchestration tick.
   * It detects `RUNNING` runs that have had no database updates within the threshold (default: `max(3 * staleLeaseThresholdMs, 5 minutes)`).
-  * Stuck runs are failed with the error code `STUCK_RUN_REAPED`.
+  * Stuck runs are failed with the error code `STUCK_RUN_REAPED`. Their active child stages fail in the same transaction, with completion times and errors; terminal stages remain unchanged.
 * **Manual Recovery**:
   * If a run was completed but failed to transition, you can manually trigger a transition:
     ```typescript
@@ -128,7 +128,7 @@ The host orchestration tick executes these operations sequentially. Each operati
 
 ## Run Retention
 
-Nothing deletes a finished run by itself. Opt in per host with `retention: { olderThanMs, statuses?, limit? }` (off by default) and the maintenance tick dispatches `run.purge`, which deletes `COMPLETED`/`FAILED`/`CANCELLED` runs that finished at or before the cutoff, `limit` (default 100) per tick, oldest first: the step ledger is cleared through the `StepLedger` port, job rows go through the `JobTransport`, the run through `PersistenceCore.deleteRun` (stages, logs, artifacts, annotations cascade), and the run's blobs (`workflow-v2/<workflowType>/<runId>/`, `workflow-v2/spill/jobs/<runId>/`, `workflow-v2/spill/steps/<stageRecordId>/`) are removed after commit. No events are emitted. The command can also be dispatched directly:
+Nothing deletes a finished run by itself. Opt in per host with `retention: { olderThanMs, statuses?, limit? }` (off by default) and the maintenance tick dispatches `run.purge`, which deletes `COMPLETED`/`FAILED`/`CANCELLED` runs that finished at or before the cutoff, `limit` (default 100) per tick, oldest first. Selection commits before cleanup starts. For each run, the step ledger is cleared through the `StepLedger` port, job rows go through the `JobTransport`, and blobs under `workflow-v2/<workflowType>/<runId>/`, `workflow-v2/spill/jobs/<runId>/` and `workflow-v2/spill/steps/<stageRecordId>/` are removed. Only then is the run deleted through `PersistenceCore.deleteRun` (stages, logs, artifacts, annotations cascade). A run redriven during the sweep is kept, and the result names only the runs deleted. Cleanup already done is not undone, so what follows depends on when the redrive lands: before cleanup starts, nothing is touched; after the ledger is cleared, completed steps can run again; after the job rows or blobs are gone, the stage output is missing and the run ends `FAILED` through `run.reapStuck`. Cleanup uses the ports outside the selection transaction. If any cleanup or the final delete fails, dispatch rejects and the run remains eligible for a later purge; cleanup can be partial, so custom ports must tolerate repeated cleanup. No events are emitted. The command can also be dispatched directly:
 
 ```typescript
 await kernel.dispatch({ type: "run.purge", olderThan: new Date(Date.now() - 30 * 86_400_000) });

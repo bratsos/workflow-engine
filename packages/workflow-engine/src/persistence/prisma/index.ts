@@ -5,7 +5,11 @@
  * Use the factory functions to create instances.
  */
 
-export { createPrismaAICallLogger, PrismaAICallLogger } from "./ai-logger";
+export {
+  createPrismaAICallLogger,
+  PrismaAICallLogger,
+  type PrismaAICallLoggerOptions,
+} from "./ai-logger";
 export {
   type BlobPrismaClient,
   createPrismaBlobStore,

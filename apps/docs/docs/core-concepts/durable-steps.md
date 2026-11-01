@@ -153,6 +153,8 @@ Suspension is a thrown control-flow error (`StepSuspend`, or `StepInFlight` when
 
 ### Signal keepalive
 
+If the signal ledger write succeeds but waking the stage fails, retry `step.signal`. The completed signal keeps its first payload; the retry finishes the stage wake and records one `step:signalled` event. A replay after a successful wake has no further effect.
+
 A signal wait re-suspends every `keepalive` (default five minutes, never later than `timeout`) while nothing has arrived. That interval does **not** set signal latency: `step.signal` moves the stage's `nextPollAt` to now, so a landed signal wakes the stage on the host's next tick whatever the keepalive is. What it bounds is how long a *lost* nudge — a host that was down when the signal landed — can delay the wake, and each keepalive costs one replay of the stage body up to the wait. Raise it for a wait measured in days; lower it only when the host that would receive the nudge is unreliable.
 
 ---

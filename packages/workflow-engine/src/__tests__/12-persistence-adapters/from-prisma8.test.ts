@@ -562,6 +562,21 @@ describe.skipIf(!DATABASE_URL || !isPrisma8)(
     });
 
     describe("construction", () => {
+      it("exposes readonly Postgres metadata on every client view", async () => {
+        expect(prisma.$databaseType).toBe("postgresql");
+        expect(prisma.$withColumns("workflow_runs").$databaseType).toBe(
+          "postgresql",
+        );
+        expect(() => {
+          prisma.$databaseType = "sqlite";
+        }).toThrow();
+        await prisma.$transaction(async (tx: any) => {
+          expect(tx.$databaseType).toBe("postgresql");
+          expect(tx.$withColumns({ n: "int" }).$databaseType).toBe(
+            "postgresql",
+          );
+        });
+      });
       const fixture = () =>
         createRequire(import.meta.url)("../../../../prisma-fixtures/index.cjs");
       // The raw client with its contract changed by `change`.
@@ -608,13 +623,13 @@ describe.skipIf(!DATABASE_URL || !isPrisma8)(
         expect(() => fromPrisma8(db)).toThrow(/job_queue\.status.*native/);
       });
 
-      it("fails clearly for a SQLite adapter over a Prisma 8 client", () => {
+      it("fails clearly when an adapter requests SQLite over a Postgres contract", () => {
         expect(() =>
           createPrismaWorkflowPersistence(prisma, { databaseType: "sqlite" }),
-        ).toThrow(/SQLite|sqlite.*Prisma 8/);
+        ).toThrow(/sqlite.*postgres/i);
         expect(() =>
           createPrismaJobQueue(prisma, { databaseType: "sqlite" }),
-        ).toThrow(/Prisma 8/);
+        ).toThrow(/sqlite.*postgres/i);
       });
     });
   },

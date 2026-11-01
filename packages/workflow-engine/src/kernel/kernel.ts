@@ -7,13 +7,15 @@
  * command to publish pending outbox events through EventSink.
  *
  * Most commands execute inside a single database transaction (handler
- * logic + outbox event writes). Two exceptions manage their own
+ * logic + outbox event writes). These commands manage their own
  * transactions to avoid holding connections during external I/O:
  *
  *  - `job.execute` — multi-phase pattern (see `handlers/job-execute.ts`)
  *  - `stage.pollSuspended` — per-stage transactions so that
  *    checkCompletion() HTTP calls run outside any transaction
  *    (see `handlers/stage-poll-suspended.ts`)
+ *  - `step.signal` — writes the external ledger first, then retries its
+ *    atomic stage/outbox wake until it commits
  *
  * Commands with idempotency keys are deduplicated: a replay returns the
  * cached result without re-executing the handler.
@@ -75,6 +77,7 @@ import {
   filterCouldMatchLegacy,
   synthesizeLegacyMetadata,
 } from "./helpers/index.js";
+import { withTransactionReads } from "./helpers/transaction-reads.js";
 import type {
   ActivityExecutor,
   BlobStore,
@@ -423,7 +426,19 @@ export function createKernel(config: KernelConfig): Kernel {
     // -----------------------------------------------------------------
     if (command.type === "stage.pollSuspended") {
       const result = await handleStagePollSuspended(command, deps);
+      await result._postCommit?.(deps);
       return stripEvents(result);
+    }
+
+    // These ports use their own connections. Lease reaping needs no
+    // persistence transaction; signalling commits its stage/outbox writes
+    // after the external ledger (and any spilled payload) is written. A
+    // completed ledger row still retries an uncommitted wake.
+    if (command.type === "lease.reapStale") {
+      return stripEvents(await handleLeaseReapStale(command, deps));
+    }
+    if (command.type === "step.signal") {
+      return stripEvents(await handleStepSignal(command, deps));
     }
 
     // -----------------------------------------------------------------
@@ -457,7 +472,32 @@ export function createKernel(config: KernelConfig): Kernel {
       let postCommit: ((deps: KernelDeps) => Promise<unknown>) | undefined;
 
       const publicResult = await persistence.withTransaction(async (tx) => {
-        const txDeps: KernelDeps = { ...deps, persistence: tx };
+        // A root-client read can wait on the very connection this transaction
+        // holds. Supporting ports bind reads to its snapshot, keeping every
+        // write on the original port for _postCommit.
+        const txDeps: KernelDeps = {
+          ...deps,
+          persistence: tx,
+          jobTransport: withTransactionReads(jobTransport, tx, [
+            "getJobsByWorkflowRun",
+          ]),
+          blobStore: withTransactionReads(blobStore, tx, [
+            "get",
+            "has",
+            "list",
+          ]),
+          stepLedger: stepLedger
+            ? withTransactionReads(stepLedger, tx, ["get", "list"])
+            : undefined,
+          services: services?.aiLogger
+            ? {
+                ...services,
+                aiLogger: withTransactionReads(services.aiLogger, tx, [
+                  "getStats",
+                ]),
+              }
+            : services,
+        };
         let result: HandlerResult<any>;
 
         switch (command.type) {
@@ -481,12 +521,6 @@ export function createKernel(config: KernelConfig): Kernel {
             break;
           case "run.listVersions":
             result = await handleRunListVersions(command, txDeps);
-            break;
-          case "step.signal":
-            result = await handleStepSignal(command, txDeps);
-            break;
-          case "lease.reapStale":
-            result = await handleLeaseReapStale(command, txDeps);
             break;
           case "run.reapStuck":
             result = await handleRunReapStuck(command, txDeps);
@@ -525,12 +559,16 @@ export function createKernel(config: KernelConfig): Kernel {
         // Runs only now that the transaction has committed — the DB
         // state this side effect depends on (e.g. deleted stage rows)
         // can no longer be rolled back out from under it.
-        await postCommit(deps);
+        const outcome = await postCommit(deps);
+        // A sweep reports what it deleted, not what selection found.
+        if (command.type === "run.purge") return outcome as RunPurgeResult;
       }
 
       return publicResult;
     });
   }
+
+  let purgeTail = Promise.resolve();
 
   /**
    * Public dispatch: a thin generic wrapper around `dispatchAny`. `T` is
@@ -542,6 +580,16 @@ export function createKernel(config: KernelConfig): Kernel {
   function dispatch<T extends KernelCommand>(
     command: T,
   ): Promise<CommandResult<T>> {
+    if (command.type === "run.purge") {
+      // A run stays eligible until cleanup finishes. Serialize sweeps in this
+      // kernel so concurrent bounded purges do not all select the same run.
+      const result = purgeTail.then(() => dispatchAny(command));
+      purgeTail = result.then(
+        () => {},
+        () => {},
+      );
+      return result as Promise<CommandResult<T>>;
+    }
     return dispatchAny(command) as Promise<CommandResult<T>>;
   }
 

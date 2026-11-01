@@ -1,3 +1,7 @@
+import {
+  isNativeTransaction,
+  withTransactionWriteGuard,
+} from "./transaction-writes.js";
 /**
  * PrismaJobQueue - Prisma implementation of JobQueue
  *
@@ -7,6 +11,7 @@
  * This is migrated from the original services/job-queue.server.ts
  */
 
+import type { Persistence } from "../../kernel/ports";
 import { createLogger } from "../../utils/logger";
 import {
   type DequeueOptions,
@@ -27,8 +32,9 @@ import {
   type EnginePrismaClient,
   type RawColumns,
   rawFor,
-  rejectSqliteOn8,
+  validateDatabaseType,
 } from "./prisma-client-type";
+import { hasBaseReads, sqliteTransactionReads } from "./transaction-reads";
 
 const logger = createLogger("JobQueue");
 
@@ -37,6 +43,9 @@ const logger = createLogger("JobQueue");
  * degrades to "try again later" instead of unbounded recursion.
  */
 const MAX_DEQUEUE_ATTEMPTS = 10;
+// Hosts sharing a client claim one at a time. Concurrent claims all read the
+// same head job, and every loser spends a write transaction on a failed update.
+const sqliteClaims = new WeakMap<object, Promise<DequeueResult | null>>();
 
 /**
  * How many ready rows the SQLite dequeue reads when `serves` filtering is
@@ -139,6 +148,8 @@ export class PrismaJobQueue implements JobQueue {
   private prisma: PrismaClient;
   private enums: PrismaEnumHelper;
   private databaseType: DatabaseType;
+  /** A Prisma 6/7 SQLite transaction client: a batch on it would wait for its own transaction. */
+  private readonly inSqliteTransaction: boolean;
   private readonly fairnessPath: string[] | null;
   private readonly fairnessLimit: number;
 
@@ -152,12 +163,17 @@ export class PrismaJobQueue implements JobQueue {
   private readonly now: () => Date;
 
   constructor(prisma: PrismaClient, options: PrismaJobQueueOptions = {}) {
-    this.prisma = prisma;
+    this.prisma = withTransactionWriteGuard(
+      prisma,
+      options.databaseType ?? "postgresql",
+    );
     this.workerIdWasConfigured = Boolean(options.workerId);
     this.workerId = options.workerId || `worker-${process.pid}-${Date.now()}`;
     this.enums = createEnumHelper(prisma);
     this.databaseType = options.databaseType ?? "postgresql";
-    rejectSqliteOn8(prisma, this.databaseType);
+    validateDatabaseType(prisma, this.databaseType);
+    this.inSqliteTransaction =
+      this.databaseType === "sqlite" && isNativeTransaction(prisma);
     this.now = options.now ?? (() => new Date());
     this.fairnessGroupBy = options.fairness
       ? (options.fairness.groupBy ?? "_groupKey")
@@ -259,7 +275,7 @@ export class PrismaJobQueue implements JobQueue {
     // runtime reads internal state off `this` inside its own method
     // bodies, so an unbound reference throws at call time ("Cannot read
     // properties of undefined").
-    if (!this.prisma.$transaction) {
+    if (!this.prisma.$transaction || this.inSqliteTransaction) {
       throw new Error(
         "Prisma client does not support $transaction (required for enqueueParallel)",
       );
@@ -305,7 +321,11 @@ export class PrismaJobQueue implements JobQueue {
    */
   async dequeue(options?: DequeueOptions): Promise<DequeueResult | null> {
     if (this.databaseType === "sqlite") {
-      return this.dequeueSqlite(0, options?.serves);
+      const claim = () => this.dequeueSqlite(0, options?.serves);
+      const turn = sqliteClaims.get(this.prisma);
+      const claimed = turn ? turn.then(claim, claim) : claim();
+      sqliteClaims.set(this.prisma, claimed);
+      return claimed;
     }
     return this.dequeuePostgres(options?.serves);
   }
@@ -931,6 +951,22 @@ export class PrismaJobQueue implements JobQueue {
         nextPollAt: job.nextPollAt,
         payload: rest,
       } satisfies JobRecord;
+    });
+  }
+
+  transactionReads(persistence: Persistence): Partial<JobQueue> | undefined {
+    if (this.databaseType !== "sqlite") return undefined;
+    return sqliteTransactionReads(persistence, this.prisma, (tx) => {
+      if (
+        !hasBaseReads(this, PrismaJobQueue.prototype, ["getJobsByWorkflowRun"])
+      )
+        return undefined;
+      const reader = new PrismaJobQueue(tx, {
+        databaseType: this.databaseType,
+        workerId: this.workerId,
+        now: this.now,
+      });
+      return { getJobsByWorkflowRun: reader.getJobsByWorkflowRun.bind(reader) };
     });
   }
 

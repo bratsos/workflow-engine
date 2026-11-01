@@ -1,3 +1,5 @@
+import { literalPrefixQuery, prefixCandidates } from "./literal-prefix.js";
+import { withTransactionWriteGuard } from "./transaction-writes.js";
 /**
  * PrismaWorkflowPersistence - Prisma implementation of WorkflowPersistence
  *
@@ -40,9 +42,14 @@ import { createEnumHelper, type PrismaEnumHelper } from "./enum-compat";
 import {
   type EnginePrismaClient,
   rawFor,
-  rejectSqliteOn8,
+  validateDatabaseType,
 } from "./prisma-client-type";
-import { isSerializationFailure, isUniqueViolation } from "./sql-errors";
+import {
+  isSerializationFailure,
+  isSqliteBusy,
+  isUniqueViolation,
+} from "./sql-errors";
+import { registerSqliteTransaction } from "./transaction-reads";
 import { utcTimestampParam } from "./utc-timestamps";
 
 // Structural client type -- see prisma-client-type.ts. Kept as a local
@@ -236,8 +243,12 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     this.enums = createEnumHelper(prisma, {
       statusEnumName: this.statusEnumName,
     });
+    this.prisma = withTransactionWriteGuard(
+      prisma,
+      options.databaseType ?? "postgresql",
+    );
     this.databaseType = options.databaseType ?? "postgresql";
-    rejectSqliteOn8(prisma, this.databaseType);
+    validateDatabaseType(prisma, this.databaseType);
     this.skipTransactions = options.skipInteractiveTransactions ?? false;
     this.now = options.now ?? (() => new Date());
     this.versioning = {
@@ -297,7 +308,8 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     ) {
       return fn(this);
     }
-    return this.prisma.$transaction(async (tx: PrismaClient) => {
+    let closeReads: (() => void) | undefined;
+    const transaction = this.prisma.$transaction(async (tx: PrismaClient) => {
       // The transactional clone must carry every option: a clone built
       // without `statusEnumName` cast with `::"Status"` inside the
       // transaction (`42704 type "Status" does not exist` on every
@@ -307,8 +319,23 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       // re-probe on every transaction, and a downgrade either side
       // discovers has to be visible to the other.
       txPersistence.versioning = this.versioning;
-      return fn(txPersistence);
+      if (this.databaseType !== "sqlite") return fn(txPersistence);
+      closeReads = registerSqliteTransaction(
+        txPersistence,
+        this,
+        this.prisma,
+        tx,
+      );
+      try {
+        return await fn(txPersistence);
+      } finally {
+        closeReads();
+      }
     });
+    // A driver deadline may reject before its callback settles.
+    return this.databaseType === "sqlite"
+      ? transaction.finally(() => closeReads?.())
+      : transaction;
   }
 
   // ============================================================================
@@ -398,13 +425,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
   ): Promise<PurgeableRun[]> {
     if (statuses.length === 0 || limit <= 0) return [];
     const runs = await this.prisma.workflowRun.findMany({
-      where: {
-        status: { in: statuses.map((status) => this.enums.status(status)) },
-        OR: [
-          { completedAt: { lte: cutoff } },
-          { completedAt: null, updatedAt: { lte: cutoff } },
-        ],
-      },
+      where: this.purgeable(cutoff, statuses),
       // Oldest first, on the same "finished at" the filter reads: a run
       // with no completedAt sorts by its last write.
       orderBy: [{ completedAt: "asc" }, { updatedAt: "asc" }],
@@ -424,11 +445,29 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     }));
   }
 
-  async deleteRun(id: string): Promise<void> {
+  async deleteRun(
+    id: string,
+    cutoff: Date,
+    statuses: readonly PurgeableRunStatus[],
+  ): Promise<boolean> {
     // deleteMany rather than delete: a missing row is a no-op, not P2025.
     // Stages, logs, artifacts, annotations and (via workflow_stages) the
     // workflow_steps ledger go with it through the schema's cascades.
-    await this.prisma.workflowRun.deleteMany({ where: { id } });
+    const { count } = await this.prisma.workflowRun.deleteMany({
+      where: { id, ...this.purgeable(cutoff, statuses) },
+    });
+    return count > 0;
+  }
+
+  /** One statement decides, so a redrive commits either before it or not at all. */
+  private purgeable(cutoff: Date, statuses: readonly PurgeableRunStatus[]) {
+    return {
+      status: { in: statuses.map((status) => this.enums.status(status)) },
+      OR: [
+        { completedAt: { lte: cutoff } },
+        { completedAt: null, updatedAt: { lte: cutoff } },
+      ],
+    };
   }
 
   async getStuckRuns(stuckSince: Date): Promise<WorkflowRunRecord[]> {
@@ -722,12 +761,17 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       // A caught unique violation aborts a PostgreSQL transaction. Insert
       // atomically, then read separately so READ COMMITTED sees the winner.
       if (this.databaseType === "sqlite") {
-        // A Date, unlike the Postgres statements: SQLite stores it the way
-        // the model API does on every major (integer on 6, ISO text on 7).
+        // Prisma 8 raw binds require text; 6 and 7 keep their native Date
+        // encoding so raw and model timestamps agree on each driver.
+        const createdAt = new Date();
+        const timestamp =
+          this.prisma.$databaseType === "sqlite"
+            ? createdAt.toISOString()
+            : createdAt;
         await this.prisma.$executeRaw`
           INSERT INTO "workflow_definitions"
             ("workflowId", version, snapshot, "structureHash", "createdAt")
-          VALUES (${input.workflowId}, ${input.version}, ${snapshot}, ${input.structureHash}, ${new Date()})
+          VALUES (${input.workflowId}, ${input.version}, ${snapshot}, ${input.structureHash}, ${timestamp})
           ON CONFLICT ("workflowId", version) DO NOTHING
         `;
       } else {
@@ -754,7 +798,10 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       }
       return this.mapDefinition(row);
     } catch (error) {
-      if (isSerializationFailure(error)) {
+      if (
+        isSerializationFailure(error) ||
+        (this.databaseType === "sqlite" && isSqliteBusy(error))
+      ) {
         throw new DefinitionRegistrationRetryableError(
           input.workflowId,
           input.version,
@@ -1028,14 +1075,24 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
 
   async getSuspendedStages(
     beforeDate: Date,
-    options?: { limit?: number; serves?: readonly ServedDefinition[] },
+    options?: {
+      limit?: number;
+      serves?: readonly ServedDefinition[];
+      includeSettlements?: boolean;
+    },
   ): Promise<WorkflowStageRecord[]> {
     // `serves` filters through the relation to `workflow_runs`, so it can
     // only be applied on a schema that has the column at all.
     const serves = this.versioning.enabled ? options?.serves : undefined;
     const stages = await this.prisma.workflowStage.findMany({
       where: {
-        status: this.enums.status("SUSPENDED"),
+        status: options?.includeSettlements
+          ? {
+              in: ["SUSPENDED", "COMPLETED", "FAILED"].map((status) =>
+                this.enums.status(status as Status),
+              ),
+            }
+          : this.enums.status("SUSPENDED"),
         nextPollAt: { lte: beforeDate },
         ...(serves !== undefined
           ? { workflowRun: this.servesFilter(serves) }
@@ -1282,13 +1339,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     if (filters.key !== undefined) {
       where.key = filters.key;
     } else if (filters.keyPrefix !== undefined) {
-      // NOTE: Prisma's `startsWith` compiles to `LIKE 'prefix%'`. On
-      // Postgres this uses the (workflowRunId, key) index. On SQLite the
-      // default `LIKE` is case-insensitive and will not use the btree
-      // index; high-volume SQLite consumers should keep keys lowercase
-      // (engine convention) and accept the scan cost. Documented in the
-      // RFC.
-      where.key = { startsWith: filters.keyPrefix };
+      where.key = { startsWith: prefixCandidates(filters.keyPrefix) };
     }
 
     if (filters.scope !== undefined) where.scope = filters.scope;
@@ -1304,15 +1355,96 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       where.createdAt = createdAt;
     }
 
+    if (filters.key === undefined && filters.keyPrefix !== undefined) {
+      const values: unknown[] = [workflowRunId];
+      let suffix = ' AND "workflowRunId" = $2';
+      for (const field of [
+        "scope",
+        "scopeId",
+        "actorId",
+        "actorKind",
+        "attempt",
+      ] as const) {
+        if (filters[field] === undefined) continue;
+        values.push(filters[field]);
+        suffix += ` AND "${field}" = $${values.length + 1}`;
+      }
+      for (const [date, operator] of [
+        [filters.since, ">="],
+        [filters.until, "<="],
+      ] as const) {
+        if (date === undefined) continue;
+        values.push(this.databaseType === "sqlite" ? date : date.toISOString());
+        const parameter = values.length + 1;
+        suffix += ` AND "createdAt" ${operator} ${this.databaseType === "sqlite" ? `$${parameter}` : utcTimestampParam(parameter)}`;
+      }
+      values.push(filters.limit ?? 1000);
+      suffix += ` ORDER BY "createdAt" ASC, "id" ASC LIMIT $${values.length + 1}`;
+      const nativeSqlite =
+        this.databaseType === "sqlite" && !this.prisma.$databaseType;
+      const literal = literalPrefixQuery<any>(
+        this.prisma,
+        "workflow_annotations",
+        "key",
+        filters.keyPrefix,
+        {
+          suffix,
+          values,
+          ...(nativeSqlite
+            ? {
+                // Native SQLite raw reads need JSON scalars carried as text.
+                select: [
+                  "id",
+                  "createdAt",
+                  "workflowRunId",
+                  "workflowStageRecordId",
+                  "attempt",
+                  "scope",
+                  "scopeId",
+                  "actorKind",
+                  "actorId",
+                  "actorVersion",
+                  "key",
+                  "value",
+                  "payload",
+                  "idempotencyKey",
+                ]
+                  .map((column) =>
+                    ["value", "payload"].includes(column)
+                      ? `CAST("${column}" AS TEXT) AS "${column}"`
+                      : `"${column}"`,
+                  )
+                  .join(", "),
+                jsonColumns: ["value", "payload"],
+              }
+            : {}),
+        },
+      );
+      if (literal)
+        return (await literal).map((record) =>
+          this.mapWorkflowAnnotation(record),
+        );
+    }
+
     const records = await this.prisma.workflowAnnotation.findMany({
       where,
       // Secondary order by `id` keeps timeline deterministic when many
       // rows are inserted in the same transaction (same `createdAt`).
       // CUIDs are roughly chronological, so this preserves insert order.
       orderBy: [{ createdAt: "asc" }, { id: "asc" }],
-      take: filters.limit ?? 1000,
+      ...(filters.key === undefined && filters.keyPrefix !== undefined
+        ? {}
+        : { take: filters.limit ?? 1000 }),
     });
-    return records.map((r: any) => this.mapWorkflowAnnotation(r));
+    return records
+      .filter(
+        (record: any) =>
+          filters.key !== undefined ||
+          filters.keyPrefix === undefined ||
+          record.key.startsWith(filters.keyPrefix),
+      )
+      .slice(0, filters.limit ?? 1000)
+      .map((r: any) => this.mapWorkflowAnnotation(r));
   }
 
   private mapWorkflowAnnotation(record: any): WorkflowAnnotationRecord {

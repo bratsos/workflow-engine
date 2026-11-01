@@ -6,7 +6,7 @@
 pnpm install
 ```
 
-Requires Node.js >= 22.11 (22.18+ for the Prisma 8 fixture) and pnpm (see `packageManager` in `package.json` for the exact version).
+Requires Node.js >= 22.11 and pnpm (see `packageManager` in `package.json` for the exact version). Prisma 8 SQLite needs the target-specific Node floor listed in [Prisma Setup](apps/docs/docs/persistence/prisma-setup.md#2-sqlite-setup-prisma-6-7-and-8); the engine's general Node engine remains 22.11.
 
 ## Everyday commands
 
@@ -21,7 +21,8 @@ pnpm lint:fix     # biome check --write
 
 Postgres-backed persistence tests (`prisma-postgres-conformance.test.ts`,
 `sql-enqueue.test.ts` and, on Prisma 8 only, `from-prisma8.test.ts`, all under
-`packages/workflow-engine/src/__tests__/12-persistence-adapters/`) are skipped
+`packages/workflow-engine/src/__tests__/12-persistence-adapters/`, plus
+`src/__tests__/sqlite8-kernel-{post-commit,concurrency,transaction-reads}.test.ts`) are skipped
 unless `DATABASE_URL` is set. They share one database and each truncates the
 tables between cases, so `test:pg` runs them with `--no-file-parallelism`; run
 any new Postgres-backed file through that script rather than on its own, or the
@@ -36,6 +37,25 @@ pnpm --filter @bratsos/workflow-engine run prisma:db-push
 pnpm --filter @bratsos/workflow-engine run test:pg
 pnpm --filter @bratsos/workflow-engine-console exec node scripts/build-ui.mjs   # cli.test.ts needs the built UI bundle
 pnpm --filter @bratsos/workflow-engine-console exec vitest run src/__tests__/prisma-read-port.postgres.test.ts src/__tests__/cli.test.ts
+```
+
+SQLite conformance uses a temporary real file and does not need `DATABASE_URL`.
+Its fixture helpers generate or emit the matching contract and initialise the
+file. Set `SQLITE8_KERNEL_SQLITE=1` to include the kernel suites. Build the
+engine before the console suite because its Prisma 8 case loads `fromPrisma8`
+from the package entry point, and generate the console UI bundle before test
+collection. Run it for each Prisma major on Node 24, matching the SQLite CI job:
+
+```bash
+export SQLITE8_KERNEL_SQLITE=1
+PRISMA_MAJOR=6 pnpm --filter @bratsos/workflow-engine run test:sqlite
+PRISMA_MAJOR=7 pnpm --filter @bratsos/workflow-engine run test:sqlite
+PRISMA_MAJOR=8 pnpm --filter @bratsos/workflow-engine run test:sqlite
+pnpm --filter @bratsos/workflow-engine run build
+pnpm --filter @bratsos/workflow-engine-console exec node scripts/build-ui.mjs
+PRISMA_MAJOR=6 pnpm --filter @bratsos/workflow-engine-console exec vitest run src/__tests__/prisma-read-port.sqlite.test.ts
+PRISMA_MAJOR=7 pnpm --filter @bratsos/workflow-engine-console exec vitest run src/__tests__/prisma-read-port.sqlite.test.ts
+PRISMA_MAJOR=8 pnpm --filter @bratsos/workflow-engine-console exec vitest run src/__tests__/prisma-read-port.sqlite.test.ts
 ```
 
 ## Package layout

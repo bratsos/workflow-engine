@@ -162,6 +162,7 @@ export async function failStageAndRun(
   errorMessage: string,
   bufferedAnnotations: CreateAnnotationInput[],
   deps: KernelDeps,
+  settlement?: { nextPollAt: Date },
 ): Promise<ClaimOutcome<void>> {
   // Spend so far, read outside the transaction (the logger is not part
   // of it); the run row carries it on FAILED as it does on COMPLETED.
@@ -178,7 +179,7 @@ export async function failStageAndRun(
         status: "FAILED",
         completedAt: deps.clock.now(),
         errorMessage,
-        nextPollAt: null,
+        nextPollAt: settlement?.nextPollAt ?? null,
       });
 
       await tx.updateRun(stageRecord.workflowRunId, {

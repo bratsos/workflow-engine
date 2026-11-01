@@ -273,6 +273,7 @@ export interface PrismaConsoleReadPortOptions {
   statusEnumName?: string;     // Defaults to "Status"
   statementTimeoutMs?: number; // Defaults to 15000; 0 disables
   now?: () => Date;            // Defaults to () => new Date()
+  databaseType?: "postgresql" | "sqlite"; // Defaults to "postgresql"; set "sqlite" on SQLite, on any major
 }
 
 export function createPrismaConsoleReadPort(
@@ -283,9 +284,10 @@ export function createPrismaConsoleReadPort(
 
 ### Statement timeout behaviour
 
-`statementTimeoutMs` defaults to 15,000 ms. Timeout management differs depending on the client supplied:
+`statementTimeoutMs` defaults to 15,000 ms and applies to PostgreSQL only. Timeout management differs depending on the target and client supplied:
 - **Root Prisma client**: When passed a root client (where `$transaction` is present), the read port wraps requests in a single transaction and executes `SET LOCAL statement_timeout = <ms>`. Running multi-query pages (like run detail) in one transaction prevents holding multiple connection pool slots and provides a consistent snapshot.
 - **Transaction client**: When passed an active transaction client (where `$transaction` is absent), the read port **skips** `SET LOCAL statement_timeout`. It does not override the timeout budget of a transaction opened by the caller.
+- **SQLite client**: SQLite has no `statement_timeout` support. The read port does not issue `SET LOCAL`, and `statementTimeoutMs` cannot cancel a running SQLite statement.
 
 If a query exceeds the limit, PostgreSQL cancels the statement with SQLSTATE `57014`. The read port catches this and throws `ConsoleQueryTimeoutError`:
 
@@ -419,6 +421,8 @@ export default {
   dispose: () => db.close(),
 };
 ```
+
+For SQLite, build `db` with `sqlite({ contract, path })` from `@prisma/orm-sqlite/runtime` and pass `{ databaseType: "sqlite" }` to `createPrismaConsoleReadPort`.
 
 A reader wrapped around `fromPrisma8(db)` by the consumer must forward `$withColumns`: Prisma 8 drops raw-read columns that are not declared, and the reader declares them through that member.
 

@@ -7,12 +7,24 @@
  * the run row itself (stages, logs, artifacts and annotations go with it
  * through `PersistenceCore.deleteRun`).
  *
- * Order matters. The ledger is cleared through the `StepLedger` port
- * *before* the run is deleted: the reference schema cascades
- * `workflow_steps` from `workflow_stages`, but the port is pluggable and a
- * ledger that lives elsewhere has no cascade to rely on. Blob deletion is a
- * post-commit side effect: a rolled-back purge must not leave a surviving
- * run pointing at outputs that are gone.
+ * INVARIANT: jobs, ledger rows and blobs are removed in `_postCommit`, never
+ * inside the persistence transaction (see run-cancel.ts). These ports use
+ * their own connections: waiting on them inside a transaction can exhaust
+ * the pool or block SQLite's writer, and their writes cannot be rolled back.
+ * The reference ledger cascades with the stages; a pluggable ledger needs
+ * explicit cleanup. Selection commits first; each run is deleted only after
+ * all its cleanup succeeds. A failure propagates with that run and later
+ * runs still discoverable by the next purge, including after a process exit.
+ * Cleanup can be partial and must be safe to repeat.
+ *
+ * INVARIANT: selection is a snapshot, and a redrive can reopen a run at any
+ * point of the sweep. `deleteRun` repeats selection's check atomically, so a
+ * reopened run is never deleted and the job it enqueues is never orphaned.
+ * The run is also re-read before its cleanup and before its jobs go, so one
+ * reopened earlier keeps its data and its job, and the result names only the
+ * runs that were deleted. Cleanup already done for a run reopened after the
+ * last read is not undone: a job lost that way is re-enqueued by
+ * `run.reapStuck`.
  *
  * Nothing is emitted. Retention is housekeeping, not a lifecycle event.
  */
@@ -21,6 +33,7 @@ import type { PurgeableRunStatus } from "../../persistence/interface.js";
 import type { RunPurgeCommand, RunPurgeResult } from "../commands";
 import type { HandlerResult, KernelDeps } from "../kernel";
 import { jobSpillPrefix, stepSpillPrefix } from "../spill.js";
+import { SIGNAL_WAKE, signalWakeKey } from "./step-signal.js";
 
 export const DEFAULT_PURGE_STATUSES: readonly PurgeableRunStatus[] = [
   "COMPLETED",
@@ -68,46 +81,70 @@ export async function handleRunPurge(
     limit,
   );
 
-  const workflowRunIds: string[] = [];
-  const blobPrefixes: string[] = [];
-
-  for (const run of runs) {
-    // 1. Ledger first, through the port (see the file comment).
-    if (deps.stepLedger) {
-      for (const stageRecordId of run.stageRecordIds) {
-        await deps.stepLedger.clear(stageRecordId);
-      }
-    }
-
-    // 2. Job rows: the reference schema has no foreign key from
-    //    job_queue to workflow_runs, so they would otherwise outlive it.
-    const jobs = await deps.jobTransport.getJobsByWorkflowRun(run.id);
-    const stageIds = Array.from(new Set(jobs.map((job) => job.stageId)));
-    if (stageIds.length > 0) {
-      await deps.jobTransport.deleteByRunAndStages(run.id, stageIds);
-    }
-
-    // 3. The run and everything the persistence owns under it.
-    await deps.persistence.deleteRun(run.id);
-
-    workflowRunIds.push(run.id);
-    blobPrefixes.push(...runBlobPrefixes(run));
-  }
+  const workflowRunIds = runs.map((run) => run.id);
 
   return {
     purged: workflowRunIds.length,
     workflowRunIds,
     _events: [],
-    ...(blobPrefixes.length > 0
+    ...(runs.length > 0
       ? {
-          // 4. Blobs, only once the deletes above have committed.
           _postCommit: async (postDeps: KernelDeps) => {
-            for (const prefix of blobPrefixes) {
-              const keys = await postDeps.blobStore.list(prefix);
-              for (const key of keys) {
-                await postDeps.blobStore.delete(key);
+            const deleted: string[] = [];
+            const eligible = async (id: string) => {
+              const run = await postDeps.persistence.getRun(id);
+              return (
+                run !== null &&
+                statuses.some((status) => status === run.status) &&
+                (run.completedAt ?? run.updatedAt) <= command.olderThan
+              );
+            };
+            for (const run of runs) {
+              if (!(await eligible(run.id))) continue;
+              for (const stageRecordId of run.stageRecordIds) {
+                // Before the rows that name these keys. An unreadable row
+                // leaves a key behind, which must not stall retention.
+                const steps = await postDeps.stepLedger
+                  ?.list(stageRecordId)
+                  .catch(() => []);
+                for (const step of steps ?? []) {
+                  if (step.kind !== "signal") continue;
+                  await postDeps.persistence.releaseIdempotencyKey(
+                    signalWakeKey(stageRecordId, step.stepId),
+                    SIGNAL_WAKE,
+                  );
+                }
+                await postDeps.stepLedger?.clear(stageRecordId);
               }
+              // job_queue has no foreign key to workflow_runs.
+              const jobs = await postDeps.jobTransport.getJobsByWorkflowRun(
+                run.id,
+              );
+              if (!(await eligible(run.id))) continue;
+              const stageIds = Array.from(
+                new Set(jobs.map((job) => job.stageId)),
+              );
+              if (stageIds.length > 0) {
+                await postDeps.jobTransport.deleteByRunAndStages(
+                  run.id,
+                  stageIds,
+                );
+              }
+              for (const prefix of runBlobPrefixes(run)) {
+                const keys = await postDeps.blobStore.list(prefix);
+                for (const key of keys) {
+                  await postDeps.blobStore.delete(key);
+                }
+              }
+              // Keep the cleanup keys reachable until every port succeeds.
+              const removed = await postDeps.persistence.deleteRun(
+                run.id,
+                command.olderThan,
+                statuses,
+              );
+              if (removed) deleted.push(run.id);
             }
+            return { purged: deleted.length, workflowRunIds: deleted };
           },
         }
       : {}),

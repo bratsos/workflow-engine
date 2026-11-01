@@ -12,9 +12,9 @@ To install **workflow-engine** and its associated packages, ensure your project 
 * **Node.js** >= 22.11.0 (uses modern JavaScript features and runtime patterns)
 * **TypeScript** >= 5.0.0 (for full type-inference support)
 * **Zod** ^4.1 (peer dependency used for type validation schemas)
-* **PostgreSQL** >= 14, or **SQLite** (for Prisma persistence; SQLite on Prisma 6 and 7 only)
+* **PostgreSQL** >= 14, or **SQLite** for Prisma persistence on Prisma 6, 7 and 8
 * **Prisma 7** needs Node.js 22.12+ or 24+ with this engine (Prisma 7 rejects Node 23)
-* **Prisma 8** additionally needs an ES module project (`"type": "module"`), Node.js 22.18+, 24.11+ or 26+, TypeScript >= 5.9 and PostgreSQL >= 15
+* **Prisma 8** additionally needs an ES module project (`"type": "module"`) and TypeScript >= 5.9. PostgreSQL uses Node.js 22.18+, 24.11+ or 26+ and requires PostgreSQL >= 15; SQLite uses Node.js 22.20+, 24.11+ or 26+.
 
 ---
 
@@ -96,7 +96,9 @@ npm install @prisma/client@6
 npm install -D prisma@6
 ```
 
-**Prisma 8** is a release candidate with its own short path. Support is tested against exactly `prisma@8.0.0-rc.29` with `@prisma/orm-postgres@8.0.0-rc.21`; pin both, because the `latest` pair crashed `prisma contract emit`. There is no `@prisma/client`. It needs Node.js 22.18+, 24.11+ or 26+, TypeScript 5.9+ and PostgreSQL 15+, and is PostgreSQL-only.
+For SQLite on Prisma 6 or 7, changing only `provider` is not enough: use the full shipped-schema conversion, Prisma 6's `connection_limit=1`, or Prisma 7's `@prisma/adapter-better-sqlite3`. Follow the [clean-room SQLite setup](../persistence/prisma-setup.md#2-sqlite-setup-prisma-6-7-and-8).
+
+**Prisma 8** is a release candidate with its own short path. Pin `prisma@8.0.0-rc.29` with the matching target package: `@prisma/orm-postgres@8.0.0-rc.21` or `@prisma/orm-sqlite@8.0.0-rc.21`. There is no `@prisma/client` on Prisma 8. The Postgres target needs Node.js 22.18+, 24.11+ or 26+, TypeScript 5.9+ and PostgreSQL 15+.
 
 ```bash
 npm install --save-exact @prisma/orm-postgres@8.0.0-rc.21
@@ -104,6 +106,6 @@ npm install --save-dev --save-exact prisma@8.0.0-rc.29
 npm install temporal-polyfill   # a peer of @prisma/orm-postgres; yarn classic and pnpm without auto-install-peers skip it
 ```
 
-Then follow [Prisma 8](../persistence/prisma-setup.md#prisma-8) for the contract, the database and the client.
+For SQLite, install `@prisma/orm-sqlite@8.0.0-rc.21` instead of `@prisma/orm-postgres`; `temporal-polyfill` is not part of that SQLite install path. Follow [Prisma 8 SQLite setup](../persistence/prisma-setup.md#2-sqlite-setup-prisma-6-7-and-8) for the ESM project, SQLite contract, database file and client. Wrap either target with `fromPrisma8(db)`; SQLite-aware adapters take `{ databaseType: "sqlite" }`.
 
 > **Note:** `@ai-sdk/google` and `@openrouter/ai-sdk-provider` are direct dependencies of `@bratsos/workflow-engine`; OpenRouter's Batch API is called over plain HTTP and needs no additional SDK. The Prisma adapters never import `@prisma/client` themselves — you pass them the client you generated, so Prisma 7's `prisma-client` generator with a custom `output` works unchanged. The engine also ships its reference schema at `node_modules/@bratsos/workflow-engine/prisma/schema.prisma` (Prisma 6 and 7) and its Prisma 8 contract at `node_modules/@bratsos/workflow-engine/prisma/contract.prisma`; see [Prisma Setup](../persistence/prisma-setup.md).

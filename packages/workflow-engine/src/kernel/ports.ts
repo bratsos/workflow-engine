@@ -245,6 +245,15 @@ export interface Clock {
  */
 export interface Persistence extends PersistenceCore {}
 
+/**
+ * Optional read binding for ports sharing a persistence transaction's
+ * database. Return undefined for unsupported scopes or another store.
+ * The kernel selects read methods only; writes keep their original port.
+ */
+export interface TransactionReadPort<T extends object> {
+  transactionReads?(persistence: Persistence): Partial<T> | undefined;
+}
+
 // ============================================================================
 // BlobStore
 // ============================================================================

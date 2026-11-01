@@ -197,7 +197,7 @@ console.log(result.status, result.output);
 
 ## Multi-Worker
 
-Multiple workers can share the same database. Each needs a unique `workerId`:
+Multiple workers can share a PostgreSQL database. Each needs a unique `workerId`:
 
 ```typescript
 // worker-1
@@ -207,7 +207,7 @@ createNodeHost({ kernel, jobTransport, workerId: "worker-1" });
 createNodeHost({ kernel, jobTransport, workerId: "worker-2" });
 ```
 
-Run claiming uses `FOR UPDATE SKIP LOCKED` in PostgreSQL to prevent race conditions.
+Run claiming uses `FOR UPDATE SKIP LOCKED` in PostgreSQL to prevent race conditions. SQLite supports one engine process per file; use PostgreSQL when multiple processes need to share a database.
 
 ### Rolling deploys
 

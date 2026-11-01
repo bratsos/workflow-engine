@@ -63,48 +63,52 @@ import type {
   WorkflowStageRecord,
 } from "../ports.js";
 
+async function settleSuspendedJobRow(
+  stage: WorkflowStageRecord,
+  deps: KernelDeps,
+): Promise<void> {
+  const jobs = await deps.jobTransport.getJobsByWorkflowRun(
+    stage.workflowRunId,
+  );
+  for (const job of jobs) {
+    if (job.stageId !== stage.stageId || job.status !== "SUSPENDED") continue;
+    if (stage.status === "COMPLETED") await deps.jobTransport.complete(job.id);
+    else
+      await deps.jobTransport.fail(
+        job.id,
+        stage.errorMessage ?? "Stage failed",
+        false,
+      );
+  }
+  // Clear the durable retry marker only after every job write succeeds.
+  // The version guard prevents a delayed settlement from clearing a new poll.
+  try {
+    await deps.persistence.updateStage(stage.id, {
+      expectedVersion: stage.version,
+      nextPollAt: null,
+    });
+  } catch (error) {
+    if (!(error instanceof StaleVersionError)) throw error;
+  }
+}
+
 async function completeSuspendedJobRow(
   workflowRunId: string,
   stageId: string,
   deps: KernelDeps,
 ): Promise<void> {
-  try {
-    const jobs = await deps.jobTransport.getJobsByWorkflowRun(workflowRunId);
-    const job = jobs.find(
-      (j) => j.stageId === stageId && j.status === "SUSPENDED",
-    );
-    if (job) {
-      await deps.jobTransport.complete(job.id);
-    }
-  } catch {
-    // Best-effort cleanup — a failure here must not fail the resume.
-  }
+  const stage = await deps.persistence.getStage(workflowRunId, stageId);
+  if (stage?.status === "COMPLETED") await settleSuspendedJobRow(stage, deps);
 }
 
-/**
- * A stage that ends terminally from the poll path (its retry ran here,
- * `checkCompletion` reported an error, the wait timed out) never goes back
- * through `jobTransport.fail`; its SUSPENDED job row would otherwise stay
- * open with `completedAt null` and misreport the run. Best effort, like
- * `completeSuspendedJobRow`.
- */
 async function failSuspendedJobRow(
   workflowRunId: string,
   stageId: string,
-  error: string,
+  _error: string,
   deps: KernelDeps,
 ): Promise<void> {
-  try {
-    const jobs = await deps.jobTransport.getJobsByWorkflowRun(workflowRunId);
-    const job = jobs.find(
-      (j) => j.stageId === stageId && j.status === "SUSPENDED",
-    );
-    if (job) {
-      await deps.jobTransport.fail(job.id, error, false);
-    }
-  } catch {
-    // Best-effort cleanup — a failure here must not mask the stage failure.
-  }
+  const stage = await deps.persistence.getStage(workflowRunId, stageId);
+  if (stage?.status === "FAILED") await settleSuspendedJobRow(stage, deps);
 }
 
 /**
@@ -118,13 +122,14 @@ async function failStageOnly(
   stageRecord: WorkflowStageRecord,
   errorMessage: string,
   deps: KernelDeps,
+  postCommits: Array<() => Promise<void>>,
 ): Promise<void> {
   await deps.persistence.withTransaction(async (tx) => {
     await tx.updateStage(stageRecord.id, {
       status: "FAILED",
       completedAt: deps.clock.now(),
       errorMessage,
-      nextPollAt: null,
+      nextPollAt: deps.clock.now(),
     });
     await tx.appendOutboxEvents(
       toOutboxEvents(stageRecord.workflowRunId, [
@@ -139,11 +144,13 @@ async function failStageOnly(
       ]),
     );
   });
-  await failSuspendedJobRow(
-    stageRecord.workflowRunId,
-    stageRecord.stageId,
-    errorMessage,
-    deps,
+  postCommits.push(() =>
+    failSuspendedJobRow(
+      stageRecord.workflowRunId,
+      stageRecord.stageId,
+      errorMessage,
+      deps,
+    ),
   );
 }
 
@@ -175,7 +182,8 @@ const MIN_CLAIM_LEASE_MS = 60_000;
  *
  * Every outcome branch of the handler ends by writing `nextPollAt`
  * explicitly (a re-suspend writes `pollConfig.nextPollAt`, not-ready writes
- * `now + pollInterval`, completed/failed/cancelled write `null`, a skipped
+ * `now + pollInterval`, completed/failed keep a job-settlement retry marker until acknowledged,
+ * cancelled writes `null`, a skipped
  * claim outcome hands the stage back through `releaseStageClaim`). The
  * lease value therefore only survives when the process dies mid-replay —
  * in which case the stage is picked up again by whichever poller runs
@@ -306,6 +314,7 @@ async function replayStage(
   run: WorkflowRunRecord,
   stageDef: Stage<any, any, any, any, any>,
   deps: KernelDeps,
+  postCommits: Array<() => Promise<void>>,
 ): Promise<ReplayOutcome> {
   let built: ReturnType<typeof buildStageExecutionContext> | undefined;
 
@@ -467,7 +476,7 @@ async function replayStage(
             _artifactKey: outputKey,
             ...(artifactKeys ? { _artifactKeys: artifactKeys } : {}),
           },
-          nextPollAt: null,
+          nextPollAt: deps.clock.now(),
           metrics: stageResult.metrics as any,
           embeddingInfo: stageResult.embeddings as any,
           // A retried attempt that finished through a suspension: the
@@ -495,10 +504,12 @@ async function replayStage(
       },
     );
     if (await handleClaimOutcome(claimResult, stageRecord, deps)) return "skip";
-    await completeSuspendedJobRow(
-      stageRecord.workflowRunId,
-      stageRecord.stageId,
-      deps,
+    postCommits.push(() =>
+      completeSuspendedJobRow(
+        stageRecord.workflowRunId,
+        stageRecord.stageId,
+        deps,
+      ),
     );
     return "resumed";
   } catch (error) {
@@ -509,13 +520,16 @@ async function replayStage(
       message,
       built?.annotationBuffer.flush() ?? [],
       deps,
+      { nextPollAt: deps.clock.now() },
     );
     if (await handleClaimOutcome(claimResult, stageRecord, deps)) return "skip";
-    await failSuspendedJobRow(
-      stageRecord.workflowRunId,
-      stageRecord.stageId,
-      message,
-      deps,
+    postCommits.push(() =>
+      failSuspendedJobRow(
+        stageRecord.workflowRunId,
+        stageRecord.stageId,
+        message,
+        deps,
+      ),
     );
     return "failed";
   }
@@ -545,17 +559,31 @@ export async function handleStagePollSuspended(
   //    this host cannot serve hold a candidate slot forever.
   const stagesToCheck = await deps.persistence.getSuspendedStages(
     deps.clock.now(),
-    { limit: maxChecks, ...(serves !== undefined ? { serves } : {}) },
+    {
+      limit: maxChecks,
+      includeSettlements: true,
+      ...(serves !== undefined ? { serves } : {}),
+    },
   );
 
   let checked = 0;
   let resumed = 0;
   let failed = 0;
   const resumedWorkflowRunIds = new Set<string>();
+  // INVARIANT: job writes run in _postCommit after stage transactions have
+  // committed, never while holding their connection (see run-cancel.ts).
+  // A terminal stage keeps nextPollAt until settlement succeeds. Polling a
+  // fresh kernel retries that marker without replaying the stage body.
+  const postCommits: Array<() => Promise<void>> = [];
 
   // 3. Process each suspended stage
   for (const candidate of stagesToCheck) {
     checked++;
+
+    if (candidate.status === "COMPLETED" || candidate.status === "FAILED") {
+      postCommits.push(() => settleSuspendedJobRow(candidate, deps));
+      continue;
+    }
 
     // ── Phase 0: claim the stage (no transaction) ──────────────────────
     // Another poller holds it → skip; nothing below runs for this stage.
@@ -593,6 +621,7 @@ export async function handleStagePollSuspended(
         stageRecord,
         `Workflow ${run.workflowId} not found in registry`,
         deps,
+        postCommits,
       );
       failed++;
       continue;
@@ -648,13 +677,19 @@ export async function handleStagePollSuspended(
         ? `Stage ${stageRecord.stageId} not found in workflow ${run.workflowId}`
         : `Stage ${stageRecord.stageId} does not support checkCompletion`;
 
-      await failStageOnly(stageRecord, errorMsg, deps);
+      await failStageOnly(stageRecord, errorMsg, deps, postCommits);
       failed++;
       continue;
     }
 
     if (isDurableReplay) {
-      const outcome = await replayStage(stageRecord, run, stageDef, deps);
+      const outcome = await replayStage(
+        stageRecord,
+        run,
+        stageDef,
+        deps,
+        postCommits,
+      );
       if (outcome === "resumed") {
         resumed++;
         resumedWorkflowRunIds.add(stageRecord.workflowRunId);
@@ -757,20 +792,24 @@ export async function handleStagePollSuspended(
 
       // ── Phase 2: persist results (transaction) ─────────────────────
       if (checkResult.error) {
+        const error = checkResult.error;
         const claimResult = await failStageAndRun(
           stageRecord,
           run,
           checkResult.error,
           annotationBuffer.flush(),
           deps,
+          { nextPollAt: deps.clock.now() },
         );
 
         if (await skipAfterClaim(claimResult)) continue;
-        await failSuspendedJobRow(
-          stageRecord.workflowRunId,
-          stageRecord.stageId,
-          checkResult.error,
-          deps,
+        postCommits.push(() =>
+          failSuspendedJobRow(
+            stageRecord.workflowRunId,
+            stageRecord.stageId,
+            error,
+            deps,
+          ),
         );
 
         failed++;
@@ -815,7 +854,7 @@ export async function handleStagePollSuspended(
               completedAt: deps.clock.now(),
               duration,
               outputData: outputRef as any,
-              nextPollAt: null,
+              nextPollAt: deps.clock.now(),
               metrics: checkResult.metrics as any,
               embeddingInfo: checkResult.embeddings as any,
               errorMessage: null,
@@ -850,10 +889,12 @@ export async function handleStagePollSuspended(
         // purely via persistence), so the SUSPENDED job row for this
         // stage is never marked complete. Without this, job_queue
         // accumulates a permanently-SUSPENDED row per suspended stage.
-        await completeSuspendedJobRow(
-          stageRecord.workflowRunId,
-          stageRecord.stageId,
-          deps,
+        postCommits.push(() =>
+          completeSuspendedJobRow(
+            stageRecord.workflowRunId,
+            stageRecord.stageId,
+            deps,
+          ),
         );
       } else if (
         stageRecord.maxWaitUntil &&
@@ -873,14 +914,17 @@ export async function handleStagePollSuspended(
           timeoutError,
           annotationBuffer.flush(),
           deps,
+          { nextPollAt: deps.clock.now() },
         );
 
         if (await skipAfterClaim(claimResult)) continue;
-        await failSuspendedJobRow(
-          stageRecord.workflowRunId,
-          stageRecord.stageId,
-          timeoutError,
-          deps,
+        postCommits.push(() =>
+          failSuspendedJobRow(
+            stageRecord.workflowRunId,
+            stageRecord.stageId,
+            timeoutError,
+            deps,
+          ),
         );
 
         failed++;
@@ -921,14 +965,17 @@ export async function handleStagePollSuspended(
         message,
         annotationBuffer.flush(),
         deps,
+        { nextPollAt: deps.clock.now() },
       );
 
       if (await skipAfterClaim(claimResult)) continue;
-      await failSuspendedJobRow(
-        stageRecord.workflowRunId,
-        stageRecord.stageId,
-        message,
-        deps,
+      postCommits.push(() =>
+        failSuspendedJobRow(
+          stageRecord.workflowRunId,
+          stageRecord.stageId,
+          message,
+          deps,
+        ),
       );
 
       failed++;
@@ -942,5 +989,15 @@ export async function handleStagePollSuspended(
     failed,
     resumedWorkflowRunIds: [...resumedWorkflowRunIds],
     _events: [],
+    _postCommit: async () => {
+      for (const postCommit of postCommits) {
+        try {
+          await postCommit();
+        } catch {
+          // The committed terminal stage retains nextPollAt. A later poll
+          // retries settlement, including after a process exit.
+        }
+      }
+    },
   };
 }

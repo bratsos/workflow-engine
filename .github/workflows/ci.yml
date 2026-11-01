@@ -136,3 +136,47 @@ jobs:
           pnpm --filter @bratsos/workflow-engine-console exec vitest run src/__tests__/prisma-read-port.postgres.test.ts src/__tests__/cli.test.ts
         env:
           NODE_ENV: test
+
+  sqlite-conformance:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        prisma-major: ["6", "7", "8"]
+
+    env:
+      PRISMA_MAJOR: ${{ matrix.prisma-major }}
+      SQLITE8_KERNEL_SQLITE: "1"
+      NODE_ENV: test
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: >-
+          pnpm install --frozen-lockfile
+          --filter @bratsos/workflow-engine
+          --filter @bratsos/workflow-engine-console
+          --filter "./packages/prisma-fixtures/*"
+
+      - name: Build engine for the console Prisma 8 shim import
+        run: pnpm --filter @bratsos/workflow-engine run build
+
+      - name: Run engine SQLite conformance tests
+        run: pnpm --filter @bratsos/workflow-engine run test:sqlite
+
+      - name: Run console SQLite conformance tests
+        run: |
+          pnpm --filter @bratsos/workflow-engine-console exec node scripts/build-ui.mjs
+          pnpm --filter @bratsos/workflow-engine-console exec vitest run src/__tests__/prisma-read-port.sqlite.test.ts

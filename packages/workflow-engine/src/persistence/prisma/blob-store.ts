@@ -1,3 +1,5 @@
+import { literalPrefixQuery, prefixCandidates } from "./literal-prefix.js";
+import { withTransactionWriteGuard } from "./transaction-writes.js";
 /**
  * Prisma-backed `BlobStore`.
  *
@@ -12,16 +14,26 @@
  * (S3, R2, ...) do not have to add the model.
  */
 
-import type { BlobStore } from "../../kernel/ports.js";
-import type { PrismaDelegate } from "./prisma-client-type.js";
+import type { BlobStore, Persistence } from "../../kernel/ports.js";
+import type {
+  EnginePrismaClient,
+  PrismaDelegate,
+} from "./prisma-client-type.js";
+import { hasBaseReads, sqliteTransactionReads } from "./transaction-reads.js";
 
 /** The one delegate the Prisma blob store needs. */
-export interface BlobPrismaClient {
+export interface BlobPrismaClient
+  extends Pick<
+    EnginePrismaClient,
+    "$queryRaw" | "$queryRawUnsafe" | "$withColumns"
+  > {
   workflowBlob: PrismaDelegate;
 }
 
 export class PrismaBlobStore implements BlobStore {
-  constructor(private readonly prisma: BlobPrismaClient) {}
+  constructor(private readonly prisma: BlobPrismaClient) {
+    this.prisma = withTransactionWriteGuard(prisma);
+  }
 
   async put(key: string, data: unknown): Promise<void> {
     await this.prisma.workflowBlob.upsert({
@@ -55,12 +67,42 @@ export class PrismaBlobStore implements BlobStore {
   }
 
   async list(prefix: string): Promise<string[]> {
+    const literal = literalPrefixQuery<{ key: string }>(
+      this.prisma,
+      "workflow_blobs",
+      "key",
+      prefix,
+      {
+        columns: { key: "text" },
+        select: '"key"',
+        suffix: ' ORDER BY "key" ASC',
+      },
+    );
+    if (literal) return (await literal).map((row) => row.key);
     const rows = (await this.prisma.workflowBlob.findMany({
-      where: { key: { startsWith: prefix } },
+      where: { key: { startsWith: prefixCandidates(prefix) } },
       select: { key: true },
       orderBy: { key: "asc" },
     })) as Array<{ key: string }>;
-    return rows.map((r) => r.key);
+    return rows.map((r) => r.key).filter((key) => key.startsWith(prefix));
+  }
+
+  transactionReads(persistence: Persistence): Partial<BlobStore> | undefined {
+    return sqliteTransactionReads(persistence, this.prisma, (tx) => {
+      // Keep custom reader policy and decoding on the configured port.
+      if (
+        !hasBaseReads(this, PrismaBlobStore.prototype, ["get", "has", "list"])
+      )
+        return undefined;
+      const reader = new PrismaBlobStore(
+        tx as EnginePrismaClient & BlobPrismaClient,
+      );
+      return {
+        get: reader.get.bind(reader),
+        has: reader.has.bind(reader),
+        list: reader.list.bind(reader),
+      };
+    });
   }
 }
 

@@ -1,3 +1,5 @@
+import { literalPrefixQuery, prefixCandidates } from "./literal-prefix.js";
+import { withTransactionWriteGuard } from "./transaction-writes.js";
 /**
  * PrismaAICallLogger - Prisma implementation of AICallLogger
  *
@@ -5,6 +7,7 @@
  * for non-blocking logging during AI operations.
  */
 
+import type { Persistence } from "../../kernel/ports";
 import { createLogger } from "../../utils/logger";
 import type {
   AICallLogger,
@@ -12,7 +15,13 @@ import type {
   AIHelperStats,
   CreateAICallInput,
 } from "../interface";
-import type { EnginePrismaClient } from "./prisma-client-type";
+import type { DatabaseType } from "./persistence";
+import {
+  type EnginePrismaClient,
+  validateDatabaseType,
+} from "./prisma-client-type";
+import { isUniqueViolation } from "./sql-errors";
+import { hasBaseReads, sqliteTransactionReads } from "./transaction-reads";
 
 const logger = createLogger("AICallLogger");
 
@@ -123,8 +132,25 @@ function toRecord(row: AICallRow): AICallRecord {
   };
 }
 
+export interface PrismaAICallLoggerOptions {
+  /** Database type. Defaults to "postgresql". */
+  databaseType?: DatabaseType;
+}
+
 export class PrismaAICallLogger implements AICallLogger {
-  constructor(private readonly prisma: PrismaClient) {}
+  private readonly databaseType: DatabaseType;
+
+  constructor(
+    private readonly prisma: PrismaClient,
+    options: PrismaAICallLoggerOptions = {},
+  ) {
+    this.prisma = withTransactionWriteGuard(
+      prisma,
+      options.databaseType ?? "postgresql",
+    );
+    this.databaseType = options.databaseType ?? "postgresql";
+    validateDatabaseType(prisma, this.databaseType);
+  }
 
   /**
    * Log a single AI call (fire and forget)
@@ -163,53 +189,86 @@ export class PrismaAICallLogger implements AICallLogger {
     batchId: string,
     results: CreateAICallInput[],
   ): Promise<void> {
-    await this.prisma.aICall.createMany({
-      data: results.map((call) => {
-        const requestId =
-          call.requestId ?? getMetadataString(call.metadata, "requestId");
+    const data = results.map((call) => {
+      const requestId =
+        call.requestId ?? getMetadataString(call.metadata, "requestId");
 
-        if (requestId === undefined) {
-          logger.warn(
-            "Batch result has no requestId; duplicate protection cannot be enforced for this row.",
-            { batchId },
-          );
-        }
+      if (requestId === undefined) {
+        logger.warn(
+          "Batch result has no requestId; duplicate protection cannot be enforced for this row.",
+          { batchId },
+        );
+      }
 
-        return {
-          topic: call.topic,
-          callType: call.callType,
-          modelKey: call.modelKey,
-          modelId: call.modelId,
-          prompt: call.prompt,
-          response: call.response,
-          inputTokens: call.inputTokens,
-          outputTokens: call.outputTokens,
-          cost: call.cost,
-          ...costColumns(call),
-          batchId,
-          ...(requestId !== undefined ? { requestId } : {}),
-          metadata: getBatchMetadata(call.metadata, batchId, requestId),
-        };
-      }),
-      skipDuplicates: true,
+      return {
+        topic: call.topic,
+        callType: call.callType,
+        modelKey: call.modelKey,
+        modelId: call.modelId,
+        prompt: call.prompt,
+        response: call.response,
+        inputTokens: call.inputTokens,
+        outputTokens: call.outputTokens,
+        cost: call.cost,
+        ...costColumns(call),
+        batchId,
+        ...(requestId !== undefined ? { requestId } : {}),
+        metadata: getBatchMetadata(call.metadata, batchId, requestId),
+      };
     });
+
+    if (this.databaseType === "postgresql") {
+      await this.prisma.aICall.createMany({ data, skipDuplicates: true });
+      return;
+    }
+
+    // SQLite does not support skipDuplicates, but a unique violation leaves
+    // the transaction usable, as in the annotation and step adapters.
+    for (const row of data) {
+      try {
+        await this.prisma.aICall.create({ data: row });
+      } catch (error) {
+        if (!isUniqueViolation(error)) throw error;
+      }
+    }
   }
 
   /**
    * Get aggregated stats for a topic prefix
    */
   async getStats(topicPrefix: string): Promise<AIHelperStats> {
-    const calls = await this.prisma.aICall.findMany({
-      where: {
-        topic: { startsWith: topicPrefix },
+    const literal = literalPrefixQuery<{
+      modelKey: string;
+      inputTokens: number;
+      outputTokens: number;
+      cost: number;
+    }>(this.prisma, "ai_calls", "topic", topicPrefix, {
+      columns: {
+        modelKey: "text",
+        inputTokens: "int",
+        outputTokens: "int",
+        cost: "float",
       },
-      select: {
-        modelKey: true,
-        inputTokens: true,
-        outputTokens: true,
-        cost: true,
-      },
+      select: '"modelKey", "inputTokens", "outputTokens", "cost"',
     });
+    const calls = literal
+      ? await literal
+      : (
+          await this.prisma.aICall.findMany({
+            where: {
+              topic: { startsWith: prefixCandidates(topicPrefix) },
+            },
+            select: {
+              modelKey: true,
+              inputTokens: true,
+              outputTokens: true,
+              cost: true,
+              topic: true,
+            },
+          })
+        ).filter((call: { topic: string }) =>
+          call.topic.startsWith(topicPrefix),
+        );
 
     const perModel: AIHelperStats["perModel"] = {};
 
@@ -246,6 +305,20 @@ export class PrismaAICallLogger implements AICallLogger {
     };
   }
 
+  transactionReads(
+    persistence: Persistence,
+  ): Partial<AICallLogger> | undefined {
+    if (this.databaseType !== "sqlite") return undefined;
+    return sqliteTransactionReads(persistence, this.prisma, (tx) => {
+      if (!hasBaseReads(this, PrismaAICallLogger.prototype, ["getStats"]))
+        return undefined;
+      const reader = new PrismaAICallLogger(tx, {
+        databaseType: this.databaseType,
+      });
+      return { getStats: reader.getStats.bind(reader) };
+    });
+  }
+
   /**
    * Check if batch results are already recorded
    */
@@ -256,7 +329,7 @@ export class PrismaAICallLogger implements AICallLogger {
           { batchId },
           {
             metadata: {
-              path: ["batchId"],
+              path: this.databaseType === "sqlite" ? "$.batchId" : ["batchId"],
               equals: batchId,
             },
           },
@@ -271,10 +344,58 @@ export class PrismaAICallLogger implements AICallLogger {
    * figure as recorded.
    */
   async listCalls(topicPrefix: string): Promise<AICallRecord[]> {
-    const rows = (await this.prisma.aICall.findMany({
-      where: { topic: { startsWith: topicPrefix } },
-      orderBy: [{ createdAt: "asc" }, { id: "asc" }],
-    })) as AICallRow[];
+    const nativeSqlite =
+      this.databaseType === "sqlite" && !this.prisma.$databaseType;
+    const literal = literalPrefixQuery<AICallRow>(
+      this.prisma,
+      "ai_calls",
+      "topic",
+      topicPrefix,
+      {
+        suffix: ' ORDER BY "createdAt" ASC, "id" ASC',
+        ...(nativeSqlite
+          ? {
+              select: [
+                "id",
+                "createdAt",
+                "topic",
+                "callType",
+                "modelKey",
+                "modelId",
+                "prompt",
+                "response",
+                "inputTokens",
+                "outputTokens",
+                "cost",
+                "estimatedCost",
+                "reportedCost",
+                "costSource",
+                "servedBy",
+                "cachedInputTokens",
+                "reasoningTokens",
+                "batchId",
+                "requestId",
+                "metadata",
+              ]
+                .map((column) =>
+                  column === "metadata"
+                    ? 'CAST("metadata" AS TEXT) AS "metadata"'
+                    : `"${column}"`,
+                )
+                .join(", "),
+              jsonColumns: ["metadata"],
+            }
+          : {}),
+      },
+    );
+    const rows = literal
+      ? await literal
+      : (
+          (await this.prisma.aICall.findMany({
+            where: { topic: { startsWith: prefixCandidates(topicPrefix) } },
+            orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+          })) as AICallRow[]
+        ).filter((row) => row.topic.startsWith(topicPrefix));
     return rows.map(toRecord);
   }
 }
@@ -282,6 +403,7 @@ export class PrismaAICallLogger implements AICallLogger {
 // Factory function to create PrismaAICallLogger with prisma client
 export function createPrismaAICallLogger(
   prisma: PrismaClient,
+  options: PrismaAICallLoggerOptions = {},
 ): PrismaAICallLogger {
-  return new PrismaAICallLogger(prisma);
+  return new PrismaAICallLogger(prisma, options);
 }

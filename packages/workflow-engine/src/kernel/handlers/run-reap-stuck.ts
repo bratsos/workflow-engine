@@ -2,6 +2,7 @@ import { StaleVersionError } from "../../persistence/interface.js";
 import type { RunReapStuckCommand, RunReapStuckResult } from "../commands";
 import type { KernelEvent } from "../events";
 import { servesRun } from "../helpers/definition-pinning.js";
+import { isTransactionReadBound } from "../helpers/transaction-reads.js";
 import type { HandlerResult, KernelDeps } from "../kernel";
 import {
   ACTIVE_STAGE_STATUSES,
@@ -64,6 +65,19 @@ export async function handleRunReapStuck(
           ),
       );
       if (missingJobStages.length > 0) {
+        if (isTransactionReadBound(deps.jobTransport)) {
+          // Scoped sweeps can queue behind each other before post-commit
+          // enqueues run. Refresh activity so they do not repeat that work.
+          try {
+            await deps.persistence.updateRun(run.id, {
+              expectedVersion: run.version,
+            });
+          } catch (error) {
+            if (error instanceof StaleVersionError) continue;
+            throw error;
+          }
+        }
+
         // INVARIANT: no handler enqueues a job from inside the kernel
         // transaction. The handler body runs under
         // `persistence.withTransaction`; a job enqueued there is visible
@@ -143,6 +157,28 @@ export async function handleRunReapStuck(
         continue;
       }
       throw error;
+    }
+
+    // INVARIANT: a reaped run and all its active stages become terminal in
+    // the same transaction. A stale stage update rolls back the run failure.
+    for (const stage of stages) {
+      if (!ACTIVE_STAGE_STATUSES.has(stage.status)) continue;
+      const error = `Run stuck for >${command.stuckThresholdMs}ms with no activity`;
+      await deps.persistence.updateStage(stage.id, {
+        expectedVersion: stage.version,
+        status: "FAILED",
+        completedAt: deps.clock.now(),
+        nextPollAt: null,
+        errorMessage: error,
+      });
+      events.push({
+        type: "stage:failed",
+        timestamp: deps.clock.now(),
+        workflowRunId: run.id,
+        stageId: stage.stageId,
+        stageName: stage.stageName,
+        error,
+      });
     }
 
     events.push({

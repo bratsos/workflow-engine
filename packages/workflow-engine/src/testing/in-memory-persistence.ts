@@ -225,8 +225,19 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
       }));
   }
 
-  async deleteRun(id: string): Promise<void> {
-    if (!this.runs.delete(id)) return;
+  async deleteRun(
+    id: string,
+    cutoff: Date,
+    statuses: readonly PurgeableRunStatus[],
+  ): Promise<boolean> {
+    const run = this.runs.get(id);
+    if (
+      !run ||
+      !statuses.some((status) => status === run.status) ||
+      (run.completedAt ?? run.updatedAt) > cutoff
+    )
+      return false;
+    this.runs.delete(id);
     for (const stage of this.stageRecordsOf(id)) {
       this.stages.delete(stage.id);
       this.stages.delete(this.stageKey(id, stage.stageId));
@@ -238,6 +249,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
       if (artifact.workflowRunId === id) this.artifacts.delete(key);
     }
     this.annotations = this.annotations.filter((a) => a.workflowRunId !== id);
+    return true;
   }
 
   /** Stage records of a run, deduplicated (stages are stored under two keys). */
@@ -523,7 +535,11 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
 
   async getSuspendedStages(
     beforeDate: Date,
-    options?: { limit?: number; serves?: readonly ServedDefinition[] },
+    options?: {
+      limit?: number;
+      serves?: readonly ServedDefinition[];
+      includeSettlements?: boolean;
+    },
   ): Promise<WorkflowStageRecord[]> {
     const serves = options?.serves;
     // Same predicate `claimNextPendingRun` applies, read through the
@@ -548,7 +564,9 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
         if (seenIds.has(s.id)) return false;
         seenIds.add(s.id);
         return (
-          s.status === "SUSPENDED" &&
+          (s.status === "SUSPENDED" ||
+            (options?.includeSettlements &&
+              (s.status === "COMPLETED" || s.status === "FAILED"))) &&
           s.nextPollAt !== null &&
           s.nextPollAt <= beforeDate &&
           runServed(s.workflowRunId)
@@ -787,9 +805,9 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
   }
 
   async releaseIdempotencyKey(key: string, commandType: string): Promise<void> {
-    this.idempotencyInProgress.delete(
-      this.idempotencyCompositeKey(commandType, key),
-    );
+    const compositeKey = this.idempotencyCompositeKey(commandType, key);
+    this.idempotencyInProgress.delete(compositeKey);
+    this.idempotencyKeys.delete(compositeKey);
   }
 
   // ============================================================================

@@ -59,6 +59,8 @@ export interface PrismaDelegate {
  * letter of the model name for the client property).
  */
 export interface EnginePrismaClient {
+  /** Database target declared by `fromPrisma8`'s contract, including transaction views. */
+  readonly $databaseType?: "postgresql" | "sqlite";
   /** WorkflowRun delegate (persistence.ts: run CRUD + claim). */
   workflowRun: PrismaDelegate;
   /** WorkflowStage delegate (persistence.ts: stage CRUD + queries). */
@@ -162,14 +164,14 @@ export function rawFor<C extends EnginePrismaClient>(
   return (prisma.$withColumns?.(columns) as C | undefined) ?? prisma;
 }
 
-/** Fails early on `databaseType: "sqlite"` over a `fromPrisma8` client: Prisma 8 is Postgres-only here. */
-export function rejectSqliteOn8(
+/** Reject a configured dialect that disagrees with the wrapped client's contract. */
+export function validateDatabaseType(
   prisma: EnginePrismaClient,
   databaseType: string,
 ): void {
-  if (databaseType === "sqlite" && prisma.$withColumns) {
+  if (prisma.$databaseType && databaseType !== prisma.$databaseType) {
     throw new Error(
-      'databaseType "sqlite" is not supported on Prisma 8: use Prisma 6 or 7 for SQLite, or a Postgres database.',
+      `databaseType "${databaseType}" does not match the Prisma 8 client target "${prisma.$databaseType}". Set databaseType: "${prisma.$databaseType}".`,
     );
   }
 }

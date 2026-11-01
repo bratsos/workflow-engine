@@ -1,3 +1,4 @@
+import { maxTimerMs, rolledBackWrite } from "./transaction-writes.js";
 /**
  * `fromPrisma8(db)`: lets the Prisma adapters run on a Prisma 8 client.
  *
@@ -19,17 +20,18 @@
  * anything else throws before any SQL runs, so it is never ignored or coerced.
  *
  * - Delegates are lazy: a call runs when awaited, or inside `$transaction([...])`.
- * - Timestamps are `pg/timestamp-string@1` (UTC text without a zone): `Date`
- *   in becomes ISO text, text out becomes `Date`.
+ * - Timestamps use UTC text: `Date` in becomes ISO text, text out becomes `Date`.
  * - Raw reads must declare their columns (`client.$withColumns(...)`), since Prisma 8 drops
  *   the ones they do not.
- * - Postgres only.
+ * - SQLite root writes share a queue, including entire transactions.
  *
  * Imports nothing from Prisma, like the rest of the package.
  */
 
+import type { AsyncLocalStorage } from "node:async_hooks";
 import type { BlobPrismaClient } from "./blob-store";
 import type { EnginePrismaClient, RawColumns } from "./prisma-client-type";
+import { isReadOnlySql } from "./read-only-sql.js";
 
 type Row = Record<string, any>;
 type Args = Record<string, any>;
@@ -49,9 +51,10 @@ interface Relation {
   to: { model: string };
 }
 interface Contract {
+  target: "postgres" | "sqlite";
   storage: {
     namespaces: {
-      public: {
+      [namespace: string]: {
         entries: {
           table: Record<
             string,
@@ -69,7 +72,7 @@ interface Contract {
   };
   domain: {
     namespaces: {
-      public: {
+      [namespace: string]: {
         models: Record<
           string,
           { relations: Record<string, Relation>; storage: { table: string } }
@@ -77,9 +80,9 @@ interface Contract {
       };
     };
   };
-  execution: {
-    mutations: {
-      defaults: Array<{
+  execution?: {
+    mutations?: {
+      defaults?: Array<{
         ref: { entry: string; field: string };
         onCreate?: { id: string };
         onUpdate?: { id: string };
@@ -108,12 +111,14 @@ export interface Prisma8Db extends Prisma8Tx {
 export interface Prisma8Client
   extends Omit<EnginePrismaClient, "$withColumns">,
     BlobPrismaClient {
+  readonly $databaseType?: "postgresql" | "sqlite";
   $queryRawUnsafe<T = unknown>(query: string, ...values: any[]): Promise<T>;
   $executeRawUnsafe(query: string, ...values: any[]): Promise<number>;
   $withColumns(columns: RawColumns): Prisma8Client;
 }
 
 interface Model {
+  sqlite: boolean;
   name: string;
   table: string;
   cols: Record<string, Column>;
@@ -148,6 +153,23 @@ const RAW_TYPES: Record<string, string> = {
   json: JSONB,
   timestamp: TIMESTAMP,
 };
+const SQLITE_TYPES: Record<string, string> = {
+  text: "sqlite/text@1",
+  int: "sqlite/integer@1",
+  bigint: "sqlite/bigint@1",
+  float: "sqlite/real@1",
+  bool: "sqlite/integer@1",
+  json: "sqlite/json@1",
+  timestamp: "sqlite/datetime@1",
+};
+const SQLITE_KINDS: Record<string, string> = {
+  "sqlite/text@1": TEXT,
+  "sqlite/integer@1": INT4,
+  "sqlite/real@1": FLOAT8,
+  "sqlite/json@1": JSONB,
+  "sqlite/datetime@1": TIMESTAMP,
+};
+const kindOf = (c: Column) => SQLITE_KINDS[c.codecId] ?? c.codecId;
 const ISOLATION: Record<string, string> = {
   ReadUncommitted: "READ UNCOMMITTED",
   ReadCommitted: "READ COMMITTED",
@@ -171,6 +193,7 @@ function sortableId(): string {
 const GENERATORS: Record<string, () => unknown> = {
   cuid2: sortableId,
   timestampStringNow: () => new Date(),
+  timestampNow: () => new Date(),
 };
 const REQUIRED_TABLES = [
   "workflow_runs",
@@ -212,10 +235,13 @@ const notFound = () =>
 // ============================================================================
 
 /** A raw parameter in a form the Prisma 8 raw lane takes: `Date` and arrays are not. */
-function param(value: unknown): unknown {
+function param(value: unknown, sqlite = false): unknown {
   if (value instanceof Date) return value.toISOString();
-  if (typeof value === "bigint") return String(value);
-  if (Array.isArray(value)) return arrayLiteral(value);
+  if (typeof value === "bigint") return sqlite ? value : String(value);
+  if (Array.isArray(value)) {
+    if (sqlite) fail("SQLite raw parameters do not support arrays");
+    return arrayLiteral(value);
+  }
   return value;
 }
 
@@ -242,8 +268,8 @@ class Sql {
   }
 
   /** A parameter, followed by `suffix` (a cast such as `::text`). */
-  v(value: unknown, suffix = ""): this {
-    const bound = param(value);
+  v(value: unknown, suffix = "", sqlite = false): this {
+    const bound = param(value, sqlite);
     if (bound == null) return this.t(`NULL${suffix}`);
     this.values.push(bound);
     this.parts.push(suffix);
@@ -262,7 +288,7 @@ class Sql {
 }
 
 /** Text with `$1`..`$n` placeholders: a repeated `$n` binds its value at each occurrence. */
-function positional(text: string, values: unknown[]): Sql {
+function positional(text: string, values: unknown[], sqlite = false): Sql {
   const pieces = text.split(/\$(\d+)/);
   const q = new Sql().t(pieces[0]!);
   for (let i = 1; i < pieces.length; i += 2) {
@@ -270,16 +296,20 @@ function positional(text: string, values: unknown[]): Sql {
     if (index < 1 || index > values.length) {
       fail(`parameter $${index} has no value`);
     }
-    q.v(values[index - 1]).t(pieces[i + 1]!);
+    q.v(values[index - 1], "", sqlite).t(pieces[i + 1]!);
   }
   return q;
 }
 
-function template(strings: readonly string[], values: unknown[]): Sql {
+function template(
+  strings: readonly string[],
+  values: unknown[],
+  sqlite = false,
+): Sql {
   const q = new Sql();
   strings.forEach((text, i) => {
     q.t(text);
-    if (i < values.length) q.v(values[i]);
+    if (i < values.length) q.v(values[i], "", sqlite);
   });
   return q;
 }
@@ -290,13 +320,207 @@ const toPlan = (x: Executor, q: Sql) =>
 const affected = async (x: Executor, q: Sql): Promise<number> =>
   (await x.execute(toPlan(x, q).affectedCount().build())).affectedRows;
 
+const sqliteExecutors = new WeakSet<Executor>();
+
+/**
+ * rc.21 cannot finalize its native iterator when converting an INTEGER to a
+ * JS number throws in next(). Carry unsafe integers as text instead: decoding
+ * then happens after a row was yielded, where the runtime closes the iterator.
+ * BigInt columns can read that text exactly; other columns must still reject it.
+ */
+function sqliteRead(q: Sql, spec: Record<string, string>) {
+  const source = q.parts.join("\0");
+  const tokens = [
+    ...source.matchAll(
+      /--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/|'(?:''|[^'])*'|"(?:""|[^"])*"|`(?:``|[^`])*`|\[[^\]]*\]|\w+|[(),;*]/g,
+    ),
+  ].filter(([s]) => !s.startsWith("--") && !s.startsWith("/*"));
+  let depth = 0;
+  const top = tokens.filter(([s]) => {
+    if (s === ")") depth--;
+    const outside = depth === 0;
+    if (s === "(") depth++;
+    return outside;
+  });
+  const returning = top.find((t) => /^RETURNING$/i.test(t[0]));
+  const first = top[0]?.[0].toUpperCase();
+  if (
+    !returning &&
+    (!isReadOnlySql(q.parts.join("?")) || first === "EXPLAIN") &&
+    first !== "VALUES"
+  ) {
+    return { q, spec };
+  }
+  const bindings = q.values.map((value) => ({ value }));
+  const slice = (start: number, end = source.length) => {
+    const out = new Sql();
+    const parts = source.slice(start, end).split("\0");
+    const offset = source.slice(0, start).split("\0").length - 1;
+    out.parts.splice(0, 1, ...parts);
+    out.values.push(...bindings.slice(offset, offset + parts.length - 1));
+    return out;
+  };
+  const end = top.at(-1)?.[0] === ";" ? top.at(-1)!.index! : source.length;
+  const ident = (name: string) => `"${name.replace(/"/g, '""')}"`;
+  let overflow = "__prisma8_integer_overflow";
+  while (Object.keys(spec).some((name) => name.toLowerCase() === overflow))
+    overflow += "_";
+  let relation = "__prisma8_read";
+  while (source.toLowerCase().includes(relation)) relation += "_";
+  const unsafe = (value: Sql) =>
+    new Sql()
+      .t("(typeof(")
+      .add(value)
+      .t(") = 'integer' AND (")
+      .add(value)
+      .t(" < -9007199254740991 OR ")
+      .add(value)
+      .t(" > 9007199254740991))");
+  const checks: Sql[] = [];
+  const project = (value: Sql, name: string) => {
+    if (spec[name] !== SQLITE_TYPES.bigint) checks.push(unsafe(value));
+    return new Sql()
+      .t("CASE WHEN ")
+      .add(unsafe(value))
+      .t(" THEN CAST(")
+      .add(value)
+      .t(" AS TEXT) ELSE ")
+      .add(value)
+      .t(` END AS ${ident(name)}`);
+  };
+  let out: Sql;
+  let count = 0;
+  if (returning) {
+    out = slice(0, returning.index! + returning[0].length).t(" ");
+    const separators = top.filter(
+      (t) => t.index! > returning.index! && t[0] === ",",
+    );
+    const starts = [
+      returning.index! + returning[0].length,
+      ...separators.map((t) => t.index! + 1),
+    ];
+    const ends = [...separators.map((t) => t.index!), end];
+    for (let i = 0; i < starts.length; i++) {
+      const start = starts[i]!,
+        finish = ends[i]!;
+      const text = source.slice(start, finish).trim();
+      const fields = text === "*" ? Object.keys(spec) : undefined;
+      if (fields) {
+        for (const name of fields) {
+          if (count++) out.t(", ");
+          out.add(project(new Sql().t(ident(name)), name));
+        }
+        continue;
+      }
+      const own = top.filter((t) => t.index! >= start && t.index! < finish);
+      const as = own.findLast((t) => /^AS$/i.test(t[0]));
+      const alias = own.at(-1)?.[0] ?? text;
+      const last = own.at(-1);
+      const prefix = source.slice(start, last?.index ?? finish).trimEnd();
+      const implicit =
+        !as &&
+        own.length > 1 &&
+        /^(?:[a-z_]\w*|["'`\[])/i.test(alias) &&
+        !/[.+\-*/%|<>=]$/.test(prefix);
+      const plain = text
+        .replace(
+          /--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/|'(?:''|[^'])*'|"(?:""|[^"])*"|`(?:``|[^`])*`|\[[^\]]*\]/g,
+          (part) =>
+            part.startsWith("--") || part.startsWith("/*") ? " " : part,
+        )
+        .trim()
+        .replace(/^(?:\(\s*)+/, "")
+        .replace(/(?:\s*\))+$/, "")
+        .trim();
+      const simple =
+        /^(?:(?:"(?:""|[^"])*"|`[^`]*`|\[[^\]]*\]|\w+)\s*\.\s*)?(?:"(?:""|[^"])*"|`[^`]*`|\[[^\]]*\]|\w+)$/.test(
+          plain,
+        );
+      const label =
+        as || implicit
+          ? alias
+          : simple
+            ? [...plain.matchAll(/"(?:""|[^"])*"|`[^`]*`|\[[^\]]*\]|\w+/g)].at(
+                -1,
+              )![0]
+            : text;
+      const name =
+        as || implicit || simple
+          ? label
+              .replace(/^(["'`])([\s\S]*)\1$/, (_s, quote, body) =>
+                body.replaceAll(quote + quote, quote),
+              )
+              .replace(/^\[([\s\S]*)\]$/, "$1")
+          : text;
+      if (count++) out.t(", ");
+      out.add(
+        project(
+          slice(start, as?.index ?? (implicit ? last!.index! : finish)).t("\n"),
+          name,
+        ),
+      );
+    }
+  } else {
+    out = new Sql()
+      .t(`WITH ${ident(relation)} AS MATERIALIZED (`)
+      .add(slice(0, end))
+      .t("\n) SELECT ");
+    Object.keys(spec).forEach((name, i) => {
+      if (i) out.t(", ");
+      out.add(project(new Sql().t(ident(name)), name));
+      count++;
+    });
+  }
+  out.t(`${count ? ", " : ""}CASE WHEN `);
+  if (checks.length === 0) out.t("false");
+  checks.forEach((check, i) => {
+    if (i) out.t(" OR ");
+    out.add(check);
+  });
+  out.t(` THEN 1 ELSE 0 END AS ${ident(overflow)}`);
+  if (!returning) out.t(` FROM ${ident(relation)}`);
+  // Reuse SQLite's numbered binds when RETURNING repeats an expression.
+  const bound = new Sql().t(out.parts[0]!);
+  const seen = new Map<object, number>();
+  out.values.forEach((ref, i) => {
+    const binding = ref as { value: unknown };
+    const index = seen.get(binding);
+    if (index !== undefined) bound.t(`?${index}`);
+    else {
+      seen.set(binding, seen.size + 1);
+      bound.values.push(binding.value);
+      bound.parts.push("");
+    }
+    bound.t(out.parts[i + 1]!);
+  });
+  return {
+    q: bound,
+    spec: { ...spec, [overflow]: SQLITE_TYPES.int! },
+    overflow,
+  };
+}
+
 /** Rows for `spec` (column -> codec id); timestamps come back as `Date`. */
 async function rowsOf(
   x: Executor,
   q: Sql,
   spec: Record<string, string>,
 ): Promise<Row[]> {
-  const rows = await x.query(toPlan(x, q).returnsRow(spec).build()).toArray();
+  const wire = sqliteExecutors.has(x) ? sqliteRead(q, spec) : { q, spec };
+  const rows = await x
+    .query(toPlan(x, wire.q).returnsRow(wire.spec).build())
+    .toArray();
+  if (wire.overflow)
+    for (const row of rows) {
+      if (row[wire.overflow])
+        throw Object.assign(
+          new RangeError(
+            "SQLite INTEGER cannot be represented as a JavaScript number",
+          ),
+          { code: "ERR_OUT_OF_RANGE" },
+        );
+      delete row[wire.overflow];
+    }
   for (const row of rows) {
     for (const name in spec) {
       if (spec[name] === TIMESTAMP && typeof row[name] === "string") {
@@ -315,6 +539,7 @@ async function rowsOf(
 const codecOf = (c: Column) => (c.codecId === ENUM ? TEXT : c.codecId);
 
 function castOf(c: Column): string {
+  if (c.codecId.startsWith("sqlite/")) return "";
   if (c.codecId === ENUM) return `::"${c.typeParams?.typeName}"`;
   return `::${SQL_TYPES[c.codecId] ?? fail(`unsupported column codec ${c.codecId}`)}`;
 }
@@ -335,19 +560,19 @@ const ACCEPTS: Record<string, (value: any, c: Column) => boolean> = {
 };
 
 function accept(c: Column, value: unknown, nullable = false): void {
-  if (value === null ? !nullable : !ACCEPTS[c.codecId]?.(value, c)) {
+  if (value === null ? !nullable : !ACCEPTS[kindOf(c)]?.(value, c)) {
     fail(`invalid value for a ${c.codecId} column`);
   }
 }
 
 /** 6 and 7 truncate a fractional Int; `retryBackoff` produces them. */
 const int = (c: Column, value: any) =>
-  c.codecId === INT4 && value !== null ? Math.trunc(value) : value;
+  kindOf(c) === INT4 && value !== null ? Math.trunc(value) : value;
 
 /** A value written to, or compared with, column `c`. */
 function bind(q: Sql, c: Column, value: unknown): void {
   // A JS null is the JSON value null on a JSON column, as on 6 and 7.
-  if (c.codecId === JSONB) q.v(JSON.stringify(value), castOf(c));
+  if (kindOf(c) === JSONB) q.v(JSON.stringify(value), castOf(c));
   else {
     accept(c, value, c.nullable);
     q.v(int(c, value), castOf(c));
@@ -449,23 +674,32 @@ function clause(q: Sql, m: Model, key: string, v: any, a: string, d: number) {
     fail(`${m.name} has no field "${key}" to filter on`);
   } else {
     const ref = `${a}.${quote(key)}`;
-    if (c.codecId === JSONB && !isObject(v)) {
+    if (kindOf(c) === JSONB && !isObject(v)) {
       fail(`${m.name}.${key}: a JSON filter must be an object`);
     }
     const ops: Args = isObject(v) ? v : { equals: v };
     if ("path" in ops) {
+      const validPath = m.sqlite
+        ? typeof ops.path === "string"
+        : Array.isArray(ops.path) &&
+          ops.path.every((part) => typeof part === "string");
       if (
-        c.codecId !== JSONB ||
+        kindOf(c) !== JSONB ||
         Object.keys(ops).sort().join() !== "equals,path" ||
-        !Array.isArray(ops.path) ||
-        ops.path.some((part) => typeof part !== "string")
+        !validPath
       ) {
         fail(`${m.name}.${key}: only { path, equals } is supported on JSON`);
       }
-      q.t(`(${ref} #> `)
-        .v(ops.path, "::text[]")
-        .t(") = ")
-        .v(JSON.stringify(ops.equals), "::jsonb");
+      if (m.sqlite) {
+        // Compare JSON text, as Prisma 6/7 do: json_extract would conflate
+        // true with 1, and JSON null with a missing path or SQL NULL.
+        q.t(`(${ref} -> `).v(ops.path).t(") = ").v(JSON.stringify(ops.equals));
+      } else {
+        q.t(`(${ref} #> `)
+          .v(ops.path, "::text[]")
+          .t(") = ")
+          .v(JSON.stringify(ops.equals), "::jsonb");
+      }
       return;
     }
     Object.entries(ops).forEach(([op, x], i) => {
@@ -535,23 +769,32 @@ const OPERATORS: Record<string, string[]> = {
 };
 
 function operator(q: Sql, c: Column, ref: string, op: string, x: unknown) {
-  if (!OPERATORS[c.codecId]?.includes(op)) {
+  if (!OPERATORS[kindOf(c)]?.includes(op)) {
     fail(`unsupported filter operator "${op}" on a ${c.codecId} column`);
   }
   if (op === "in" || op === "notIn") {
     if (!Array.isArray(x)) fail(`${op} needs an array`);
     for (const item of x as unknown[]) accept(c, item);
-    q.t(`${ref} ${op === "in" ? "= ANY" : "<> ALL"}(`)
-      .v(
-        (x as unknown[]).map((item) => int(c, item)),
-        `${castOf(c)}[]`,
+    if (c.codecId.startsWith("sqlite/")) {
+      // One bind for the list, including lists beyond SQLite's bind limit.
+      q.t(
+        `${ref} ${op === "in" ? "IN" : "NOT IN"} (SELECT value FROM json_each(`,
       )
-      .t(")");
+        .v(JSON.stringify((x as unknown[]).map((item) => param(int(c, item)))))
+        .t("))");
+    } else {
+      q.t(`${ref} ${op === "in" ? "= ANY" : "<> ALL"}(`)
+        .v(
+          (x as unknown[]).map((item) => int(c, item)),
+          `${castOf(c)}[]`,
+        )
+        .t(")");
+    }
   } else if (op === "startsWith") {
     accept(c, x);
     // A LIKE pattern, as on 6 and 7: `%`, `_` and backslash keep their meaning.
-    q.t(`${ref} LIKE (`).v(x, "::text").t(" || '%')");
-  } else if (x === null && c.codecId !== JSONB) {
+    q.t(`${ref} LIKE (`).v(x, castOf(c)).t(" || '%')");
+  } else if (x === null && kindOf(c) !== JSONB) {
     accept(c, x, c.nullable && EQUALITY.includes(op));
     q.t(`${ref} IS ${op === "not" ? "NOT " : ""}NULL`);
   } else {
@@ -676,7 +919,7 @@ async function attach(
 }
 
 /**
- * `INSERT` statements for `data`, each within Postgres's limit of 65,535 bind
+ * `INSERT` statements for `data`, each within the database's bind limit
  * parameters (and of the arguments one call can spread): one statement unless
  * the rows need more. Every row is checked before any statement runs, and a
  * required column with no default has to be there, as on 6 and 7: left to the
@@ -711,13 +954,25 @@ function insert(m: Model, data: Row[]): Sql[] {
     const one = new Sql().t("(");
     names.forEach((n, j) => {
       if (j) one.t(", ");
-      if (row[n] === undefined) one.t("DEFAULT");
+      if (row[n] === undefined && m.sqlite) {
+        const c = m.cols[n]!;
+        const d = c.default as
+          | { kind?: string; value?: unknown; expression?: string }
+          | undefined;
+        if (d?.kind === "literal") {
+          const numeric = [INT4, FLOAT8].includes(kindOf(c));
+          one.v(numeric ? Number(d.value) : d.value);
+        } else if (d?.kind === "function" && d.expression === "now()") {
+          one.v(new Date());
+        } else if (c.nullable) one.t("NULL");
+        else fail(`${m.name}.${n}: unsupported SQLite default`);
+      } else if (row[n] === undefined) one.t("DEFAULT");
       else bind(one, m.cols[n]!, row[n]);
     });
     one.t(")");
     if (
       statements.length === 0 ||
-      q.values.length + one.values.length > MAX_PARAMS
+      q.values.length + one.values.length > (m.sqlite ? 32_766 : MAX_PARAMS)
     ) {
       statements.push((q = new Sql().t(head)));
     } else q.t(", ");
@@ -741,9 +996,9 @@ function assignments(q: Sql, m: Model, data: Args) {
   entries.forEach(([name, value], i) => {
     const c = column(m, name);
     q.t(`${i ? ", " : ""}${quote(name)} = `);
-    if (c.codecId === JSONB || !isObject(value)) return bind(q, c, value);
+    if (kindOf(c) === JSONB || !isObject(value)) return bind(q, c, value);
     const [[op, operand] = []] = Object.entries(value);
-    const numeric = c.codecId === INT4 || c.codecId === FLOAT8;
+    const numeric = kindOf(c) === INT4 || kindOf(c) === FLOAT8;
     if (
       Object.keys(value).length !== 1 ||
       operand === undefined ||
@@ -789,7 +1044,7 @@ async function aggregate(x: Executor, m: Model, a: Args, by: string[] = []) {
     ) {
       fail("_count supports only { _all: true }");
     }
-    add("_count", "_all", "count(*)", INT8);
+    add("_count", "_all", "count(*)", m.sqlite ? SQLITE_TYPES.bigint! : INT8);
   }
   for (const group of ["_min", "_max"]) {
     const fields = Object.entries(a[group] ?? {});
@@ -798,7 +1053,7 @@ async function aggregate(x: Executor, m: Model, a: Args, by: string[] = []) {
     }
     for (const [field, on] of fields) {
       const c = column(m, field);
-      if (on !== true || c.codecId === JSONB) {
+      if (on !== true || kindOf(c) === JSONB) {
         fail(`${group} "${field}" is not supported`);
       }
       add(group, field, `${group.slice(1)}(t0.${quote(field)})`, codecOf(c));
@@ -851,16 +1106,32 @@ const DEFAULT_TIMEOUT = 5000;
 /**
  * `timeout` as Prisma has it: a callback not settled by then rejects with
  * P2028, so the transaction rolls back and frees its connection, and every
- * further statement on its `tx` fails with P2028 too. 6 and 7 keep the caller
- * waiting for the callback, so one that fails after the deadline gives its own
- * error there and P2028 here.
+ * further statement on its `tx` fails with P2028 too. On Postgres, 6 and 7 keep
+ * the caller waiting for the callback, so one that fails after the deadline
+ * gives its own error there and P2028 here; their SQLite adapters reject at the
+ * deadline too.
  *
  * A statement running at the deadline holds its connection until it ends, and
  * the caller settles then: measured the same on 6, 7 and 8.
  */
 function deadline(timeout: number | undefined) {
   if (timeout === undefined) {
-    return { check() {}, race: <T>(work: Promise<T>) => work };
+    let closed = false;
+    return {
+      get closed() {
+        return closed;
+      },
+      close() {
+        closed = true;
+      },
+      check() {
+        if (closed)
+          throw Object.assign(new Error("Transaction already closed"), {
+            code: "P2028",
+          });
+      },
+      race: <T>(work: Promise<T>) => work,
+    };
   }
   if (typeof timeout !== "number") fail("timeout must be a number");
   const end = Date.now() + timeout;
@@ -875,6 +1146,13 @@ function deadline(timeout: number | undefined) {
     );
   };
   return {
+    /** Set by a rollback only: a commit leaves it false past the deadline. */
+    get closed() {
+      return closed;
+    },
+    close() {
+      closed = true;
+    },
     check() {
       if (closed || Date.now() >= end) throw expired();
     },
@@ -887,16 +1165,78 @@ function deadline(timeout: number | undefined) {
           new Promise<never>((_, reject) => {
             timer = setTimeout(
               () => reject(expired()),
-              Math.max(0, end - Date.now()),
+              Math.min(maxTimerMs, Math.max(0, end - Date.now())),
             );
           }),
         ]);
+      } catch (error) {
+        closed = true;
+        throw error;
       } finally {
         clearTimeout(timer);
       }
     },
   };
 }
+
+type Schedule = <T>(work: () => Promise<T>) => Promise<T>;
+interface WriteQueue {
+  tail: Promise<void>;
+}
+const writeQueues = new WeakMap<object, WriteQueue>();
+let writeContext:
+  | Promise<
+      AsyncLocalStorage<{
+        queue: WriteQueue;
+        open: ReturnType<typeof deadline>;
+      }>
+    >
+  | undefined;
+// Load the Node context only for SQLite writes; other entry points and the
+// Postgres path need no async_hooks at runtime.
+const context = () =>
+  (writeContext ??= import("node:async_hooks").then(
+    ({ AsyncLocalStorage }) => new AsyncLocalStorage(),
+  ));
+
+function queueOf(db: object): WriteQueue {
+  let queue = writeQueues.get(db);
+  if (!queue) {
+    queue = { tail: Promise.resolve() };
+    writeQueues.set(db, queue);
+  }
+  return queue;
+}
+
+async function enqueue<T>(
+  queue: WriteQueue,
+  work: () => Promise<T>,
+): Promise<T> {
+  const owner = (await context()).getStore();
+  const open = owner?.queue === queue ? owner.open : undefined;
+  const pending = queue.tail.then(() => {
+    // A root write awaited by its own transaction cannot acquire this queue.
+    // Its transaction times out and rolls back; the stale write must not run.
+    // Any other write only waited here, whatever became of the transaction
+    // ahead of it.
+    if (open?.closed) throw rolledBackWrite();
+    return work();
+  });
+  queue.tail = pending.then(
+    () => {},
+    () => {},
+  );
+  return pending;
+}
+
+const READS = new Set([
+  "findMany",
+  "findFirst",
+  "findUnique",
+  "count",
+  "aggregate",
+  "groupBy",
+]);
 
 // ============================================================================
 // Lazy operations and delegates
@@ -912,10 +1252,13 @@ class Op {
   constructor(
     readonly exec: (x: Executor) => Promise<any>,
     private readonly home: Executor,
+    private readonly schedule?: Schedule,
   ) {}
 
   private run() {
-    return (this.promise ??= (async () => this.exec(this.home))());
+    return (this.promise ??= this.schedule
+      ? this.schedule(() => this.exec(this.home))
+      : (async () => this.exec(this.home))());
   }
   then(...args: Parameters<Promise<any>["then"]>) {
     return this.run().then(...args);
@@ -928,7 +1271,7 @@ class Op {
   }
 }
 
-function delegate(x: Executor, m: Model) {
+function delegate(x: Executor, m: Model, schedule?: Schedule) {
   const op =
     (
       name: string,
@@ -936,10 +1279,14 @@ function delegate(x: Executor, m: Model) {
       run: (e: Executor, a: Args) => Promise<unknown>,
     ) =>
     (args: Args = {}) =>
-      new Op((e) => {
-        check(name, args, allowed);
-        return run(e, args);
-      }, x);
+      new Op(
+        (e) => {
+          check(name, args, allowed);
+          return run(e, args);
+        },
+        x,
+        READS.has(name) ? undefined : schedule,
+      );
   const mustChange = async (e: Executor, q: Sql, select?: Args) => {
     const [row] = await rowsOf(e, q, returning(q, m, select));
     if (!row) throw notFound();
@@ -1064,7 +1411,9 @@ function delegate(x: Executor, m: Model) {
         `SELECT count(*) AS n FROM ${quote(m.table)} t0 WHERE `,
       );
       filtered(q, m, a.where);
-      const [row] = await rowsOf(e, q, { n: INT8 });
+      const [row] = await rowsOf(e, q, {
+        n: m.sqlite ? SQLITE_TYPES.bigint! : INT8,
+      });
       return Number(row!.n);
     }),
     aggregate: op(
@@ -1090,11 +1439,13 @@ function delegate(x: Executor, m: Model) {
 // ============================================================================
 
 function describe(contract: Contract): Record<string, Model> {
+  const sqlite = contract.target === "sqlite";
+  const namespace = sqlite ? "__unbound__" : "public";
   const { table: tables, native_enum: enums } =
-    contract.storage.namespaces.public.entries;
+    contract.storage.namespaces[namespace]!.entries;
   const models: Record<string, Model> = {};
   for (const [name, model] of Object.entries(
-    contract.domain.namespaces.public.models,
+    contract.domain.namespaces[namespace]!.models,
   )) {
     const table = tables[model.storage.table]!;
     const keys = new Map([
@@ -1107,6 +1458,7 @@ function describe(contract: Contract): Record<string, Model> {
       keys.set(unique.columns.join("_"), unique.columns);
     }
     models[name] = {
+      sqlite,
       name,
       table: model.storage.table,
       cols: Object.fromEntries(
@@ -1126,7 +1478,7 @@ function describe(contract: Contract): Record<string, Model> {
     Object.values(models).map((m) => [m.table, m]),
   );
   for (const [name, model] of Object.entries(
-    contract.domain.namespaces.public.models,
+    contract.domain.namespaces[namespace]!.models,
   )) {
     for (const [field, relation] of Object.entries(model.relations)) {
       models[name]!.relations[field] = {
@@ -1135,7 +1487,7 @@ function describe(contract: Contract): Record<string, Model> {
       };
     }
   }
-  for (const d of contract.execution.mutations.defaults) {
+  for (const d of contract.execution?.mutations?.defaults ?? []) {
     const m = byTable[d.ref.entry];
     if (d.onCreate && m) m.onCreate[d.ref.field] = d.onCreate.id;
     if (d.onUpdate && m) m.onUpdate[d.ref.field] = d.onUpdate.id;
@@ -1156,16 +1508,26 @@ function validate(models: Record<string, Model>) {
     }
   }
   for (const table of [...REQUIRED_TABLES, ...OPTIONAL_TABLES]) {
+    const timestamp = byTable[table]?.sqlite
+      ? SQLITE_TYPES.timestamp
+      : TIMESTAMP;
     for (const [name, c] of Object.entries(byTable[table]?.cols ?? {})) {
-      if (/time|date/i.test(c.codecId) && c.codecId !== TIMESTAMP) {
+      if (/time|date/i.test(c.codecId) && c.codecId !== timestamp) {
         fail(
-          `${table}.${name} uses ${c.codecId}. Declare timestamps as TimestampString(3), as in contract.prisma: the engine's raw SQL needs naive UTC timestamp columns.`,
+          byTable[table]!.sqlite
+            ? `${table}.${name} uses ${c.codecId}. Declare timestamps as DateTime in the SQLite contract.`
+            : `${table}.${name} uses ${c.codecId}. Declare timestamps as TimestampString(3), as in contract.prisma: the engine's raw SQL needs naive UTC timestamp columns.`,
         );
       }
     }
   }
   for (const table of ["workflow_runs", "workflow_stages", "job_queue"]) {
-    if (byTable[table]!.cols.status?.codecId !== ENUM) {
+    const model = byTable[table]!;
+    if (model.sqlite) {
+      if (model.cols.status?.codecId !== SQLITE_TYPES.text) {
+        fail(`${table}.status must be String in the SQLite contract.`);
+      }
+    } else if (model.cols.status?.codecId !== ENUM) {
       fail(
         `${table}.status must be a native Postgres enum named "Status" (native_enum Status and pg.enum(Status), as in contract.prisma): the engine's raw SQL casts to ::"Status".`,
       );
@@ -1197,13 +1559,23 @@ export function fromPrisma8(
   const contract = options?.contract ?? (db as Partial<Prisma8Db>)?.contract;
   if (typeof contract !== "object" || contract === null) {
     fail(
-      "expected a Prisma 8 client from postgres({ contract, url }), or a transaction's tx with { contract: db.contract }",
+      "expected a Prisma 8 client from postgres({ contract, url }) or sqlite({ contract, path }), or a transaction's tx with { contract: db.contract }",
     );
   }
   const c = contract as Partial<Contract>;
-  if (!c.storage?.namespaces?.public || !c.domain?.namespaces?.public) {
+  if (c.target !== "postgres" && c.target !== "sqlite") {
     fail(
-      "the engine's models must be in the contract's `public` namespace: its raw SQL does not qualify table names. Move them out of any other namespace in your contract.",
+      `unsupported contract target "${c.target}"; expected postgres or sqlite`,
+    );
+  }
+  const sqlite = c.target === "sqlite";
+  const namespace = sqlite ? "__unbound__" : "public";
+  if (
+    !c.storage?.namespaces?.[namespace] ||
+    !c.domain?.namespaces?.[namespace]
+  ) {
+    fail(
+      `the engine's models must be in the contract's \`${namespace}\` namespace: its raw SQL does not qualify table names. Move them out of any other namespace in your contract.`,
     );
   }
   const models = modelsOf(contract as object);
@@ -1211,6 +1583,7 @@ export function fromPrisma8(
     Object.values(models).map((m) => [m.table, m]),
   );
   const root = typeof (db as Partial<Prisma8Db>).transaction === "function";
+  const queue = sqlite && root ? queueOf(db) : undefined;
   const delegates = new WeakMap<Executor, Record<string, unknown>>();
 
   const client = (
@@ -1218,13 +1591,16 @@ export function fromPrisma8(
     inTransaction: boolean,
     columns?: RawColumns,
   ): Prisma8Client => {
+    if (sqlite) sqliteExecutors.add(x);
+    const schedule: Schedule | undefined =
+      queue && !inTransaction ? (work) => enqueue(queue, work) : undefined;
     if (!delegates.has(x)) {
       delegates.set(
         x,
         Object.fromEntries(
           Object.values(models).map((m) => [
             m.name[0]!.toLowerCase() + m.name.slice(1),
-            delegate(x, m),
+            delegate(x, m, schedule),
           ]),
         ),
       );
@@ -1243,11 +1619,32 @@ export function fromPrisma8(
       return Object.fromEntries(
         Object.entries(columns!).map(([n, t]) => [
           n,
-          RAW_TYPES[t] ?? fail(`unknown raw column type "${t}"`),
+          (sqlite ? SQLITE_TYPES : RAW_TYPES)[t] ??
+            fail(`unknown raw column type "${t}"`),
         ]),
       );
     };
-    const read = async (q: Sql) => rowsOf(x, q, spec());
+    const read = async (q: Sql, e = x) => {
+      const rows = await rowsOf(e, q, spec());
+      if (sqlite && typeof columns === "object") {
+        for (const row of rows)
+          for (const [name, type] of Object.entries(columns)) {
+            if (type === "bool" && row[name] !== null)
+              row[name] = Boolean(row[name]);
+          }
+      }
+      return rows;
+    };
+    const rawRead = (q: Sql) =>
+      sqlite
+        ? new Op(
+            (e) => read(q, e),
+            x,
+            isReadOnlySql(q.parts.join("?")) ? undefined : schedule,
+          )
+        : read(q);
+    const rawWrite = (q: Sql) =>
+      sqlite ? new Op((e) => affected(e, q), x, schedule) : affected(x, q);
 
     const transaction = async (arg: any, options: Args = {}) => {
       check("$transaction", options, ["isolationLevel", "timeout"]);
@@ -1256,52 +1653,77 @@ export function fromPrisma8(
         ? (ISOLATION[options.isolationLevel] ??
           fail(`unknown isolation level "${options.isolationLevel}"`))
         : undefined;
-      if (level) await verify(db as Prisma8Db);
-      return (db as Prisma8Db).transaction(async (raw: Executor) => {
-        const open = deadline(
-          options.timeout ?? (callback ? DEFAULT_TIMEOUT : undefined),
+      if (sqlite && level && options.isolationLevel !== "Serializable") {
+        fail(
+          "SQLite transactions support only the Serializable isolation level",
         );
-        const tx: Executor = {
-          raw: raw.raw,
-          query: (plan) => (open.check(), raw.query(plan)),
-          execute: (plan) => (open.check(), raw.execute(plan)),
-        };
-        return open.race(
-          (async () => {
-            if (level) {
-              await affected(
-                raw,
-                new Sql().t(`SET TRANSACTION ISOLATION LEVEL ${level}`),
-              );
-            }
-            if (callback) {
-              const result = await arg(client(tx, true));
-              open.check();
-              return result;
-            }
-            const results: unknown[] = [];
-            for (const op of arg) {
-              if (!(op instanceof Op))
-                fail("$transaction([...]) takes delegate calls only");
-              results.push(await op.exec(tx));
-            }
-            return results;
-          })(),
-        );
-      });
+      }
+      if (level && !sqlite) await verify(db as Prisma8Db);
+      const run = async () => {
+        let open: ReturnType<typeof deadline> | undefined;
+        try {
+          return await (db as Prisma8Db).transaction(async (raw: Executor) => {
+            const lease = deadline(
+              options.timeout ?? (callback ? DEFAULT_TIMEOUT : undefined),
+            );
+            open = lease;
+            const tx: Executor = {
+              raw: raw.raw,
+              query: (plan) => (lease.check(), raw.query(plan)),
+              execute: (plan) => (lease.check(), raw.execute(plan)),
+            };
+            if (sqlite) sqliteExecutors.add(tx);
+            const work = async () => {
+              if (level && !sqlite) {
+                await affected(
+                  raw,
+                  new Sql().t(`SET TRANSACTION ISOLATION LEVEL ${level}`),
+                );
+              }
+              if (callback) {
+                const result = await arg(client(tx, true));
+                lease.check();
+                return result;
+              }
+              const results: unknown[] = [];
+              for (const op of arg) {
+                if (!(op instanceof Op))
+                  fail(
+                    sqlite
+                      ? "$transaction([...]) takes lazy client calls only"
+                      : "$transaction([...]) takes delegate calls only",
+                  );
+                results.push(await op.exec(tx));
+              }
+              return results;
+            };
+            if (!queue) return lease.race(work());
+            return (await context()).run({ queue, open: lease }, () =>
+              lease.race(work()),
+            );
+          });
+        } catch (error) {
+          open?.close();
+          throw error;
+        }
+      };
+      return schedule ? schedule(run) : run();
     };
 
     return {
+      get $databaseType() {
+        return sqlite ? "sqlite" : "postgresql";
+      },
       ...delegates.get(x),
       ...(inTransaction || !root ? {} : { $transaction: transaction }),
       $queryRaw: (strings: TemplateStringsArray, ...values: any[]) =>
-        read(template(strings, values)),
+        rawRead(template(strings, values, sqlite)),
       $queryRawUnsafe: (text: string, ...values: any[]) =>
-        read(positional(text, values)),
+        rawRead(positional(text, values, sqlite)),
       $executeRaw: (strings: TemplateStringsArray, ...values: any[]) =>
-        affected(x, template(strings, values)),
+        rawWrite(template(strings, values, sqlite)),
       $executeRawUnsafe: (text: string, ...values: any[]) =>
-        affected(x, positional(text, values)),
+        rawWrite(positional(text, values, sqlite)),
       $withColumns: (c: RawColumns) => client(x, inTransaction, c),
     } as unknown as Prisma8Client;
   };

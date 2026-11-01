@@ -73,6 +73,10 @@ has no model delegates, so wrap it first:
 pass the `tx` and the contract: `fromPrisma8(tx, { contract: db.contract })`.
 See [Prisma 8](../persistence/prisma-setup.md#prisma-8).
 
+On SQLite, on any major, also pass the target:
+`createPrismaConsoleReadPort(prisma, { databaseType: "sqlite" })`. The default
+is `"postgresql"`.
+
 `authorize` is not optional in practice: omit it and every action is
 denied, because a permissive default would leak a tenant's runs to anyone
 who forgot a line of configuration. It runs *after* your authentication —
@@ -171,6 +175,10 @@ export default {
 };
 ```
 
+For SQLite, build `db` with `sqlite({ contract, path })` from
+`@prisma/orm-sqlite/runtime` and pass `{ databaseType: "sqlite" }` to
+`createPrismaConsoleReadPort`.
+
 ## Finding a run stranded on an old definition version
 
 [Definition versioning](../core-concepts/definition-versioning.md) pins a
@@ -200,10 +208,11 @@ from [`mixed-order-indexes.sql`](../persistence/prisma-setup.md#the-mixed-order-
 because a contract cannot express a sort direction.
 
 There is deliberately no total count and no page numbers: counting a large
-run table is the expensive query the console exists to avoid issuing. A
-query cancelled by `statement_timeout` comes back as HTTP 504 with a
-`query_timeout` code, which the UI shows as an inline banner while leaving
-the filter bar interactive, rather than hanging the page.
+run table is the expensive query the console exists to avoid issuing. On
+PostgreSQL, a query cancelled by `statement_timeout` comes back as HTTP 504
+with a `query_timeout` code, which the UI shows as an inline banner while
+leaving the filter bar interactive. SQLite has no `statement_timeout`, so the
+console cannot cancel a running SQLite query this way.
 
 The full reference — every option, the action vocabulary, custom read
 ports, and what the console deliberately does not do — is in the
