@@ -134,6 +134,7 @@ A **ghost job** occurs when a worker dequeues a job it must not execute. `job.ex
 If a run becomes stuck in `RUNNING` status (e.g., due to an unhandled worker crash and queue loss), the `run.reapStuck` command detects it.
 * A run is deemed stuck if neither the run nor any of its stages have had database updates within the threshold (default: `max(3 * staleLeaseThresholdMs, 5 minutes)`).
 * Stuck runs are automatically failed with the error code `STUCK_RUN_REAPED`.
+* A run whose `SUSPENDED` stage has a `nextPollAt` that is still in the future, or became due less than one threshold ago, is not reaped: a long `ctx.step.sleep`, `waitFor` `every` or signal `keepalive` leaves the rows untouched for longer than the threshold without the run being stuck. A suspended stage with no `nextPollAt`, or one overdue by more than the threshold, is reaped as before.
 
 ---
 

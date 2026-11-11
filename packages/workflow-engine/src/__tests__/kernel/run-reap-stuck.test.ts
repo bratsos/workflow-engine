@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { defineStage } from "../../core/stage-factory.js";
 import { WorkflowBuilder } from "../../core/workflow.js";
+import { FakeClock } from "../../kernel/testing/fake-clock.js";
+import { InMemoryStepLedger } from "../../testing/in-memory-step-ledger.js";
 import { createTestKernel } from "../utils/index.js";
 
 function createPassthroughStage(id: string, schema: z.ZodTypeAny) {
@@ -396,5 +398,107 @@ describe("kernel: run.reapStuck dropped-transition heal", () => {
     const run = await persistence.getRun(workflowRunId);
     expect(run!.status).toBe("COMPLETED");
     expect(run!.output).toEqual({ data: "hello" });
+  });
+});
+
+describe("kernel: run.reapStuck leaves a run that is waiting on a later poll", () => {
+  const THRESHOLD = 5 * 60 * 1000;
+
+  // Runs a stage up to its `ctx.step.sleep("nap", "20m")` suspension: the
+  // run and stage rows are written once and then not touched for 20 minutes.
+  async function suspendOnLongSleep() {
+    const schema = z.object({});
+    const stage = defineStage({
+      id: "nap",
+      name: "Nap",
+      schemas: { input: schema, output: schema, config: schema },
+      async execute(ctx) {
+        await ctx.step.sleep("nap", "20m");
+        return { output: {} };
+      },
+    });
+    const workflow = new WorkflowBuilder(
+      "sleepy",
+      "Sleepy",
+      "Test",
+      schema,
+      schema,
+    )
+      .pipe(stage)
+      .build();
+    const clock = new FakeClock(new Date());
+    const env = createTestKernel([workflow], {
+      clock,
+      stepLedger: new InMemoryStepLedger({ now: () => clock.now() }),
+    });
+    const { workflowRunId } = await env.kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "sleepy-1",
+      workflowId: workflow.id,
+      input: {},
+    });
+    await env.kernel.dispatch({ type: "run.claimPending", workerId: "w1" });
+    await env.kernel.dispatch({
+      type: "job.execute",
+      workflowRunId,
+      workflowId: workflow.id,
+      stageId: stage.id,
+      config: {},
+    });
+    const suspended = await env.persistence.getStage(workflowRunId, stage.id);
+    expect(suspended!.status).toBe("SUSPENDED");
+    return { ...env, clock, workflowRunId, stage: suspended! };
+  }
+
+  it("does not reap a suspended stage whose poll is due later than the threshold, and reaps it once the poll is overdue by a threshold", async () => {
+    const { kernel, persistence, clock, workflowRunId, stage } =
+      await suspendOnLongSleep();
+
+    // 10 minutes of silence against a 5 minute threshold, poll due in 10 more.
+    clock.advance(10 * 60 * 1000);
+    const early = await kernel.dispatch({
+      type: "run.reapStuck",
+      stuckThresholdMs: THRESHOLD,
+    });
+    expect(early.failed).toBe(0);
+    expect((await persistence.getRun(workflowRunId))!.status).toBe("RUNNING");
+
+    // The poll came due 3 minutes ago and nobody has run it yet: still
+    // inside one threshold, so the poller keeps its chance.
+    clock.advance(13 * 60 * 1000);
+    expect(clock.now().getTime() - stage.nextPollAt!.getTime()).toBe(
+      3 * 60 * 1000,
+    );
+    const due = await kernel.dispatch({
+      type: "run.reapStuck",
+      stuckThresholdMs: THRESHOLD,
+    });
+    expect(due.failed).toBe(0);
+
+    // Overdue for more than a threshold: nothing is polling it.
+    clock.advance(3 * 60 * 1000);
+    const overdue = await kernel.dispatch({
+      type: "run.reapStuck",
+      stuckThresholdMs: THRESHOLD,
+    });
+    expect(overdue.failed).toBe(1);
+    const run = await persistence.getRun(workflowRunId);
+    expect(run!.status).toBe("FAILED");
+    expect((run!.output as any).error.code).toBe("STUCK_RUN_REAPED");
+  });
+
+  it("still reaps a suspended stage that has no poll scheduled", async () => {
+    const { kernel, persistence, clock, workflowRunId, stage } =
+      await suspendOnLongSleep();
+    await persistence.updateStage(stage.id, { nextPollAt: null });
+
+    clock.advance(10 * 60 * 1000);
+    const result = await kernel.dispatch({
+      type: "run.reapStuck",
+      stuckThresholdMs: THRESHOLD,
+    });
+
+    expect(result.failed).toBe(1);
+    expect((await persistence.getRun(workflowRunId))!.status).toBe("FAILED");
   });
 });
