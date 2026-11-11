@@ -483,15 +483,10 @@ function redriveFromStart(): Scenario {
 }
 
 /**
- * Open defects the sweep found. A marked case runs under `it.fails`, so it
- * goes red the day the defect is fixed: delete the entry then. While an
- * entry stands, that one case cannot catch a second defect.
+ * A case for a defect that is still open names it here and runs under
+ * `it.fails`, so it goes red the day the defect is fixed: delete the entry
+ * then. While an entry stands, that one case cannot catch a second defect.
  */
-const REAPED_WHILE_WAITING =
-  "run.reapStuck fails a run whose suspended stage is not due for longer than the stuck threshold";
-const REPLAY_ERROR_IS_TERMINAL =
-  "stage.pollSuspended fails the run on a transient store error during a replay, where job.execute would retry";
-
 interface Case {
   build: () => Scenario;
   knownDefect?: Partial<Record<"clean" | Mode, string>>;
@@ -502,19 +497,12 @@ const SCENARIOS: Record<string, Case> = {
   "a parallel group": { build: parallelGroup },
   "a sleep longer than the stuck-run threshold": {
     build: sleepLongerThanTheStuckThreshold,
-    knownDefect: {
-      clean: REAPED_WHILE_WAITING,
-      error: REAPED_WHILE_WAITING,
-      crash: REAPED_WHILE_WAITING,
-    },
   },
   "a poll that is ready on the third try": {
     build: pollUntilReady,
-    knownDefect: { error: REPLAY_ERROR_IS_TERMINAL },
   },
   "a wait for a signal": {
     build: signal,
-    knownDefect: { error: REPLAY_ERROR_IS_TERMINAL },
   },
   "a redrive from the start": { build: redriveFromStart },
 };
