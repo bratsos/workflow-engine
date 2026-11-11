@@ -119,6 +119,7 @@ When a stage fails (by throwing an error), the engine increments the attempt cou
 ### Retry Mechanics
 * The job is returned to the queue if `attempt < maxAttempts` (the transport's `maxAttempts` is the retry budget; the built-in transports back off `2^attempt` seconds). The stage row stays `PENDING` with the error on `errorMessage`, `stage:retrying` is emitted, and the stage's durable step ledger is kept: the retry replays completed steps and re-opens failed ones.
 * The backoff strategy is managed by the host.
+* A suspended stage that throws while `stage.pollSuspended` replays it is retried under the same rule and with the same classifier, spending the attempts its `SUSPENDED` job row has left. The stage stays `SUSPENDED` with the error on `errorMessage`, `attempt` is bumped, `stage:retrying` is emitted and the next poll replays it after a `2^attempt` second backoff; the same single-flight claim applies to that replay as to any other.
 
 ### Terminal Failures
 Once a stage exhausts its `maxAttempts`, it is marked as `FAILED` and `stage:failed` is emitted.

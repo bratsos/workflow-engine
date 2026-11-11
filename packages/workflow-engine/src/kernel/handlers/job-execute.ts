@@ -32,45 +32,18 @@ import { HOST_DEFAULTS } from "../helpers/host-support.js";
 import {
   buildAnnotationEvents,
   loadWorkflowContext,
+  reopenFailedSteps,
   resetStageStepsForFreshAttempt,
   resolveStageInput,
   saveStageArtifacts,
   saveStageOutput,
   toErrorMessage,
   toOutboxEvents,
+  willRetryStage,
   withClaimedRun,
 } from "../helpers/index.js";
 import type { HandlerResult, KernelDeps } from "../kernel";
 import type { ActivityRunResult } from "../ports.js";
-
-/**
- * Re-open the FAILED `run` steps of a stage record for a new job attempt.
- * The row is put back to `running` with no lease — the state of a step
- * whose worker died — so the replay's compare-and-set re-claims it, bumps
- * `attempt` and executes the step again. `attempt` is never reset: it
- * counts every execution of the step across job attempts (a row that read
- * `failed attempt 3` re-runs as attempt 4), so the ledger keeps the
- * per-step history. The failure text stays on `error` until the re-run
- * overwrites it. Waits, signals and sleeps that failed (a deadline that
- * passed) are terminal and stay so.
- */
-async function reopenFailedSteps(
-  stageRecordId: string,
-  deps: KernelDeps,
-): Promise<void> {
-  const ledger = deps.stepLedger;
-  if (!ledger) return;
-  const rows = await ledger.list(stageRecordId);
-  for (const row of rows) {
-    if (row.status !== "failed" || row.kind !== "run") continue;
-    await ledger.compareAndSet(
-      stageRecordId,
-      row.stepId,
-      { status: "failed", attempt: row.attempt },
-      { status: "running", leaseExpiresAt: null },
-    );
-  }
-}
 
 // ---------------------------------------------------------------------------
 // Handler
@@ -307,10 +280,11 @@ export async function handleJobExecute(
     // attempt budget is exhausted (or the error is deterministic) is the
     // stage FAILED. A command without attempt information (a caller that
     // dispatches job.execute directly) keeps the historical FAILED write.
-    const willRetry =
-      command.attempt !== undefined &&
-      run.retryable !== false &&
-      command.attempt < (command.maxAttempts ?? HOST_DEFAULTS.maxAttempts);
+    const willRetry = willRetryStage({
+      attempt: command.attempt,
+      maxAttempts: command.maxAttempts,
+      retryable: run.retryable,
+    });
 
     // expectedVersion omitted: Phase 3 never writes the run row here (only
     // the stage row), so — unlike stage-poll-suspended's claim — parallel

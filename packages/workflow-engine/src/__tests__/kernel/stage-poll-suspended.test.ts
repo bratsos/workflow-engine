@@ -1,9 +1,10 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import {
   defineAsyncBatchStage,
   defineStage,
 } from "../../core/stage-factory.js";
+import type { StepApi } from "../../core/steps.js";
 import { WorkflowBuilder } from "../../core/workflow.js";
 import type { Kernel } from "../../kernel/kernel.js";
 import { FakeClock } from "../../kernel/testing/fake-clock.js";
@@ -763,6 +764,8 @@ describe("kernel: stage.pollSuspended", () => {
 async function suspendDurableWait(
   poll: () => Promise<{ done: boolean }>,
   timeoutMs = 60 * 60 * 1000,
+  /** Runs in the body after the wait, so only a replay reaches it. */
+  afterWait?: (step: StepApi) => Promise<unknown>,
 ) {
   let executions = 0;
   const stage = defineStage({
@@ -781,6 +784,7 @@ async function suspendDurableWait(
         every: 1_000,
         timeout: timeoutMs,
       });
+      await afterWait?.(ctx.step);
       return { output: value };
     },
   });
@@ -794,10 +798,8 @@ async function suspendDurableWait(
     .pipe(stage)
     .build();
   const clock = new FakeClock();
-  const env = createTestKernel([workflow], {
-    clock,
-    stepLedger: new InMemoryStepLedger({ now: () => clock.now() }),
-  });
+  const stepLedger = new InMemoryStepLedger({ now: () => clock.now() });
+  const env = createTestKernel([workflow], { clock, stepLedger });
   const created = await env.kernel.dispatch({
     type: "run.create",
     idempotencyKey: "claimed",
@@ -815,6 +817,7 @@ async function suspendDurableWait(
   env.eventSink.clear();
   return {
     ...env,
+    stepLedger,
     runId: created.workflowRunId,
     /** Replays so far: executions beyond the first (suspending) one. */
     replays: () => executions - 1,
@@ -958,6 +961,151 @@ describe("kernel: stage.pollSuspended claims a stage before working on it", () =
     expect(stage?.status).toBe("COMPLETED");
     expect(stage?.nextPollAt).toBeNull();
     expect((await env.persistence.getRun(env.runId))?.status).toBe("COMPLETED");
+  });
+});
+
+describe("kernel: stage.pollSuspended retries a replay that throws", () => {
+  it("keeps the stage suspended with its ledger and replays it after a backoff", async () => {
+    let ready = false;
+    const env = await suspendDurableWait(async () => ({ done: ready }));
+    ready = true;
+    env.clock.advance(1_000);
+    vi.spyOn(env.blobStore, "put").mockRejectedValueOnce(
+      new Error("blob store unavailable"),
+    );
+
+    const first = await env.kernel.dispatch({ type: "stage.pollSuspended" });
+
+    // Not a failure: the run keeps going, the error and the retry are on record.
+    expect(first).toMatchObject({ checked: 1, resumed: 0, failed: 0 });
+    const retrying = await env.persistence.getStage(env.runId, "wait");
+    expect(retrying).toMatchObject({
+      status: "SUSPENDED",
+      attempt: 1,
+      errorMessage: "blob store unavailable",
+      nextPollAt: new Date(env.clock.now().getTime() + 2_000),
+    });
+    expect((await env.persistence.getRun(env.runId))?.status).toBe("RUNNING");
+    await env.flush();
+    expect(env.eventSink.getByType("stage:failed")).toHaveLength(0);
+    expect(env.eventSink.getByType("stage:retrying")).toMatchObject([
+      {
+        stageId: "wait",
+        attempt: 1,
+        maxAttempts: 3,
+        error: "blob store unavailable",
+      },
+    ]);
+    expect(await env.stepLedger.list(retrying!.id)).toMatchObject([
+      { stepId: "external", status: "completed" },
+    ]);
+
+    // Nobody replays it before the backoff elapses; then it completes.
+    expect(
+      (await env.kernel.dispatch({ type: "stage.pollSuspended" })).checked,
+    ).toBe(0);
+    env.clock.advance(2_000);
+    const second = await env.kernel.dispatch({ type: "stage.pollSuspended" });
+    expect(second.resumed).toBe(1);
+    expect(await env.persistence.getStage(env.runId, "wait")).toMatchObject({
+      status: "COMPLETED",
+      attempt: 1,
+      errorMessage: null,
+    });
+  });
+
+  it("re-opens a step that failed in the replay and runs it again", async () => {
+    let charges = 0;
+    let ready = false;
+    const env = await suspendDurableWait(
+      async () => ({ done: ready }),
+      undefined,
+      (step) =>
+        step.run("charge", async () => {
+          if (++charges === 1) throw new Error("503 Service Unavailable");
+          return "charged";
+        }),
+    );
+    ready = true;
+    env.clock.advance(1_000);
+
+    await env.kernel.dispatch({ type: "stage.pollSuspended" });
+    const retrying = await env.persistence.getStage(env.runId, "wait");
+    expect(retrying).toMatchObject({
+      status: "SUSPENDED",
+      errorMessage: "503 Service Unavailable",
+    });
+    expect(await env.stepLedger.list(retrying!.id)).toMatchObject([
+      { stepId: "external", status: "completed" },
+      { stepId: "charge", status: "running", attempt: 1, leaseExpiresAt: null },
+    ]);
+
+    env.clock.advance(2_000);
+    expect(
+      (await env.kernel.dispatch({ type: "stage.pollSuspended" })).resumed,
+    ).toBe(1);
+    expect(charges).toBe(2);
+    expect(await env.stepLedger.list(retrying!.id)).toMatchObject([
+      { stepId: "external", status: "completed" },
+      { stepId: "charge", status: "completed", attempt: 2 },
+    ]);
+  });
+
+  it("fails the stage and the run once the attempt budget is spent", async () => {
+    let ready = false;
+    const env = await suspendDurableWait(async () => ({ done: ready }));
+    ready = true;
+    vi.spyOn(env.blobStore, "put").mockRejectedValue(
+      new Error("blob store down"),
+    );
+
+    // The budget is the job's: attempt 1 of 3, so two retries and a third failure.
+    for (const backoffMs of [2_000, 4_000, 0]) {
+      env.clock.advance(60_000);
+      await env.kernel.dispatch({ type: "stage.pollSuspended" });
+      if (backoffMs > 0) {
+        expect(
+          (await env.persistence.getStage(env.runId, "wait"))?.nextPollAt,
+        ).toEqual(new Date(env.clock.now().getTime() + backoffMs));
+      }
+    }
+
+    expect(await env.persistence.getStage(env.runId, "wait")).toMatchObject({
+      status: "FAILED",
+      errorMessage: "blob store down",
+      nextPollAt: null,
+    });
+    expect((await env.persistence.getRun(env.runId))?.status).toBe("FAILED");
+    await env.flush();
+    expect(
+      env.eventSink.getByType("stage:retrying").map((e) => e.attempt),
+    ).toEqual([1, 2]);
+    expect(env.eventSink.getByType("stage:failed")).toHaveLength(1);
+  });
+
+  it("fails at once on a deterministic error, as job.execute does", async () => {
+    let ready = false;
+    const env = await suspendDurableWait(
+      async () => ({ done: ready }),
+      undefined,
+      async (step) => {
+        await step.run("dup", async () => 1);
+        await step.run("dup", async () => 2);
+      },
+    );
+    ready = true;
+    env.clock.advance(1_000);
+
+    const result = await env.kernel.dispatch({ type: "stage.pollSuspended" });
+
+    expect(result.failed).toBe(1);
+    expect(await env.persistence.getStage(env.runId, "wait")).toMatchObject({
+      status: "FAILED",
+      attempt: 0,
+    });
+    expect((await env.persistence.getRun(env.runId))?.status).toBe("FAILED");
+    await env.flush();
+    expect(env.eventSink.getByType("stage:retrying")).toHaveLength(0);
   });
 });
 
