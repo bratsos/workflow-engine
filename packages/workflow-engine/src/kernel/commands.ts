@@ -353,8 +353,8 @@ export interface OutboxFlushCommand {
  *
  * `"degraded"` is the named state for "the sink is refusing events": the
  * run keeps progressing (the poller, not the sink, is what advances a
- * run), events stay committed in the outbox, and delivery is retried on
- * the next flush. It is not an error — it is a state a host reports so it
+ * run), events stay committed in the outbox, and a failed delivery is
+ * retried on the next flush, up to the retry budget. It is not an error — it is a state a host reports so it
  * is visible *before* the dead-letter queue fills.
  */
 export type EventSinkStatus = "healthy" | "degraded";

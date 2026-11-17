@@ -7,14 +7,32 @@
  * the same outbox concurrently — a cron tick and a request-kicked tick, or
  * two workers — never both deliver the same event.
  *
+ * What that guarantees, exactly:
+ * - No phantom events: the events are written in the transaction of the
+ *   state change they describe, so a rolled-back transaction writes none.
+ * - One delivery attempt (one `emit`) per claim.
+ * - A sink failure is retried: the event is released (its `publishedAt`
+ *   cleared) so the next flush tries again, together with the later events
+ *   of the same run, up to the retry budget (`maxRetries`, default 3
+ *   failed attempts); then the event moves to the DLQ and waits for
+ *   `plugin.replayDLQ`. A retry emits the whole event again, so a plugin
+ *   that ran before the failing one sees it again.
+ * - An event is lost only if the process dies between the claim and the
+ *   emit: it is left stamped as published and no later flush delivers it.
+ *   Delivery is at-most-once per claim, retried only after a sink failure:
+ *   NOT at-least-once. Closing that window needs a claim state of its own
+ *   (a schema change), not a change here.
+ * - The engine's own progress never depends on the sink: the poller, not
+ *   the sink, advances runs.
+ * - A consumer that needs every event reads the `outbox_events` table (or
+ *   the console, which reads the same rows): the row stays whatever became
+ *   of the delivery, until `run.purge` removes the run.
+ *
  * On handler failure:
  * - The event is released (its `publishedAt` cleared) so the next flush
  *   retries it, together with the later events of the same run
  * - Increments retryCount on the outbox event
  * - If retryCount >= maxRetries, moves event to DLQ
- *
- * A process that dies between the claim and the emit leaves the event
- * stamped as published: the claim is what makes delivery once-only.
  *
  * The result names the sink's state: `eventSinkStatus: "degraded"` when at
  * least one event could not be published this pass, plus how many will be

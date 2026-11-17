@@ -28,7 +28,7 @@ If the same key is currently executing, dispatch throws `IdempotencyInProgressEr
 
 ## Transactional Outbox
 
-Events are not emitted directly. Instead, handlers write events to a transactional outbox table. The `outbox.flush` command publishes pending events through the EventSink:
+Events are not emitted directly. Instead, handlers write events to a transactional outbox table in the transaction of the state change they describe (no phantom events). The `outbox.flush` command claims pending events and makes one delivery attempt each through the EventSink, retrying a sink failure up to the retry budget; an event is lost only if the process dies between the claim and the emit, so read the `outbox_events` table if you need every one (03-runtime-setup.md, "Degraded event sink"):
 
 ```typescript
 // Events accumulate in the outbox as commands execute

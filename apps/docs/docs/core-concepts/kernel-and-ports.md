@@ -240,11 +240,19 @@ saves. The claim check is applied only to rows that are engine plumbing.
 
 ## Transactional Outbox Events
 
-To ensure system notifications are reliable, **workflow-engine** implements the **Transactional Outbox Pattern**:
+**workflow-engine** implements the **Transactional Outbox Pattern** for system notifications:
 * When a command is executed, system events (like `workflow:completed`, `stage:failed`) are not sent immediately to the `EventSink`.
 * Instead, they are written to the database in the `OutboxEvent` table as part of the primary database transaction.
-* The host then dispatches the **`outbox.flush`** command, which reads these events, publishes them to the `EventSink`, and updates their status in the database.
-* This guarantees **at-least-once delivery** of all system events and eliminates "phantom" events (e.g. notifications sent for a transaction that was rolled back).
+* The host then dispatches the **`outbox.flush`** command, which claims these events, publishes them to the `EventSink`, and updates their status in the database.
+
+What that does and does not guarantee:
+
+* **No phantom events.** An event is written in the same transaction as the state change it describes, so a rolled-back transaction writes none.
+* **One delivery attempt per claim.** The flush claims an event (stamps its `publishedAt`) before it calls `EventSink.emit`. The claim is atomic, so two hosts flushing the same outbox never deliver the same event.
+* **Retried on a sink failure.** If `emit` throws, the event is released and the next flush tries again, up to the retry budget (`maxRetries`, default 3 failed attempts); then it is dead-lettered until you replay it with `plugin.replayDLQ`. A retry calls `emit` again for the whole event: with the plugin runner, plugins that ran before the failing one see it again, so keep plugin handlers idempotent.
+* **Lost only if the process dies between the claim and the emit.** The stamp then says the event was published, and no later flush picks it up. Delivery is at-most-once per claim, retried only after a sink failure; it is **not** at-least-once.
+* **The engine's own progress never depends on the sink.** The poller, not the sink, advances runs. A refusing sink costs delivery latency and dead letters you can replay, and nothing else.
+* **If you need every event, read the table.** Treat the `EventSink` as a notification channel and the `outbox_events` table as the record: the row stays whatever became of its delivery, until `run.purge` removes the run. The [console](../console/overview.md) reads the same rows (the run's outbox event timeline and the dead letters).
 
 ### Degraded delivery
 
@@ -266,7 +274,7 @@ const result = await kernel.dispatch({ type: "outbox.flush" });
 **`degraded`** is the named state for "the sink is refusing events". It is
 deliberately not an error, because an event sink is a notification channel
 and the committed poller is what advances a run: a degraded sink costs
-delivery latency and nothing else. What it must not do is stay invisible
+delivery latency and dead letters you can replay, and nothing else. What it must not do is stay invisible
 until the dead-letter queue fills, so both built-in hosts surface it from
 wherever they report status (`host.getStats().eventSink` on the Node host,
 `eventSinkStatus` in the serverless maintenance tick result). Consumers who

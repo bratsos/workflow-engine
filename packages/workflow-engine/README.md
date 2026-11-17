@@ -58,7 +58,7 @@ session, under your row-level security policies.
 | **Type-Safe** | Full TypeScript inference from input to output across all stages |
 | **Async-First** | Long-running operations: a stage submits a provider batch, releases its lease, and resumes hours later from the step ledger |
 | **AI cost as data** | Tokens and cost on `WorkflowRun.totalCost` in the stage's own transaction, priced from the endpoint actually dispatched to — batch prices for a batch call |
-| **Event-Driven** | Transactional outbox: system events reach your `EventSink` at least once, with no events for a rolled-back transaction |
+| **Event-Driven** | Transactional outbox: no events for a rolled-back transaction; one delivery attempt per claim to your `EventSink`, retried on a sink failure up to a retry budget, then dead-lettered. Not at-least-once: a process that dies between the claim and the emit loses that event, so read the `outbox_events` table (or the console) if you need every one |
 | **Parallel Execution** | Independent stages in one execution group run concurrently. Pipelines are linear -- there is no arbitrary DAG and no child workflows |
 | **Durable steps** | `ctx.step.*` results are keyed by name in a step ledger: exactly-once *recording*, at-least-once *execution*, with a derived `externalKey` so a reclaim adopts an external effect rather than repeating it |
 | **Definition versioning** | A run is pinned to the structural version it was created under, and a host claims only runs it serves, so a rolling deploy cannot change a run's shape mid-flight |

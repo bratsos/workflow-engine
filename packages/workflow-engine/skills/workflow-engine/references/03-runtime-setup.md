@@ -359,7 +359,27 @@ Each maintenance step runs in its own error boundary — if one step fails, the 
 
 ## Degraded event sink
 
-The outbox is the durable record; the `EventSink` is a delivery attempt. When
+The outbox is the durable record; the `EventSink` is a delivery attempt. What
+is guaranteed, exactly:
+
+- No phantom events: an event is written in the transaction of the state change
+  it describes, so a rolled-back transaction writes none.
+- One delivery attempt per claim: `outbox.flush` stamps `publishedAt` (claims)
+  before it calls `emit`, atomically, so two hosts flushing one outbox never
+  deliver the same event.
+- Retried on a sink failure, up to the retry budget (`maxRetries`, default 3
+  failed attempts), then dead-lettered until `plugin.replayDLQ`. A retry calls
+  `emit` for the whole event again: with the plugin runner, plugins that ran
+  before the failing one see it again, so keep handlers idempotent.
+- Lost only if the process dies between the claim and the emit: the stamp then
+  says "published" and no later flush picks the event up. This is at-most-once
+  per claim, not at-least-once.
+- The engine's progress never depends on the sink: the poller advances runs.
+- A consumer that needs every event reads the `outbox_events` table (or the
+  console, which reads the same rows) instead of relying on the sink: the row
+  stays whatever became of its delivery, until `run.purge` removes the run.
+
+When
 publishing fails, `outbox.flush` releases the events it had claimed so the next
 flush retries them, and reports `eventSinkStatus: "degraded"` with
 `eventSinkError` set to the first failure of that flush. Nothing about a run

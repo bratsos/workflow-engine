@@ -722,7 +722,7 @@ export async function runMaintenanceTick(
  * `"degraded"` is the named state for "the sink is refusing events". It is
  * deliberately not an error: an event sink is a *notification* channel, and
  * the committed poller is the truth that advances a run, so a degraded sink
- * costs delivery latency and nothing else. What it must not do is stay
+ * costs delivery latency and dead letters (replayable) and nothing else. What it must not do is stay
  * invisible until the dead-letter queue fills, which is what this report is
  * for — surface it from wherever the host reports its status, alert on
  * `status === "degraded"` and on `deadLettered` growing.

@@ -133,7 +133,7 @@ outbox flush.
 * **`healthy`** -- the last flush published everything it claimed.
 * **`degraded`** -- the last flush could not publish at least one event.
 
-A degraded sink is a *delivery-latency* problem, never a progress problem.
+A degraded sink is a delivery problem (latency, then dead letters you can replay), never a progress problem.
 Events live in the transactional outbox, the poller (not the sink) is what
 advances a run, and the events left behind are retried on the next flush. A
 run started while the sink is down still reaches `COMPLETED`.
