@@ -444,12 +444,9 @@ export async function driveToTerminal(
 export function createReplayRuntime(
   client: Record<string, any>,
   scenario: ReturnType<typeof createScenario>,
+  clockNow = new Date(Date.now() + 10 * 60_000),
 ) {
-  return createRuntime(
-    client,
-    scenario,
-    new FakeClock(new Date(Date.now() + 10 * 60_000)),
-  );
+  return createRuntime(client, scenario, new FakeClock(clockNow));
 }
 
 export function storedRowsReleaseVersion() {

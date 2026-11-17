@@ -1,6 +1,6 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   captureScenario,
   createReplayRuntime,
@@ -18,6 +18,7 @@ import {
   type StoredRowsSnapshot,
   snapshotShape,
 } from "./snapshot.js";
+import { compareSnapshotLabels } from "./snapshot-label.js";
 
 const snapshotRoot = resolve(new URL("./snapshots", import.meta.url).pathname);
 const currentSchema = readPrismaSchema(
@@ -88,7 +89,10 @@ function newestBaselineByScenario() {
     const previous = baseline.get(snapshot.metadata.scenario);
     if (
       !previous ||
-      compareRelease(snapshot.metadata.release, previous.metadata.release) > 0
+      compareSnapshotLabels(
+        snapshot.metadata.release,
+        previous.metadata.release,
+      ) > 0
     ) {
       baseline.set(snapshot.metadata.scenario, snapshot);
     }
@@ -96,10 +100,25 @@ function newestBaselineByScenario() {
   return baseline;
 }
 
-function compareRelease(left: string, right: string) {
-  const alpha = (value: string) =>
-    Number(value.match(/alpha\.(\d+)/)?.[1] ?? 0);
-  return alpha(left) - alpha(right);
+function durableWaitDeadlineExpired(
+  snapshot: StoredRowsSnapshot,
+  replayAt: Date,
+): boolean {
+  if (
+    ![
+      "wait-for",
+      "completed-step-checkpoint",
+      "ai-map-poll",
+      "parallel-partial",
+    ].includes(snapshot.metadata.scenario)
+  ) {
+    return false;
+  }
+  return (snapshot.tables.WorkflowStep ?? []).some((step) => {
+    if (step.status === "completed") return false;
+    const deadline = decodeValue(step.deadlineAt);
+    return deadline instanceof Date && deadline.getTime() <= replayAt.getTime();
+  });
 }
 
 async function assertTerminalRows(client: Record<string, any>) {
@@ -131,31 +150,54 @@ async function assertTerminalRows(client: Record<string, any>) {
 
 describe("stored rows from earlier releases", () => {
   let database: Awaited<ReturnType<typeof openCaptureDatabase>> | undefined;
+  const snapshots = loadSnapshots();
+  const replayAt = new Date(Date.now() + 10 * 60_000);
 
-  afterAll(async () => {
-    await database?.close();
-  });
-
-  gatedIt(
-    "loads each release snapshot and finishes it on the current build",
-    async () => {
-      const snapshots = loadSnapshots();
+  beforeAll(async () => {
+    if (isGated) {
       expect(
         snapshots.length,
         "no stored-row snapshots; run the capture command",
       ).toBeGreaterThan(0);
       database = await openCaptureDatabase();
+    }
+  });
 
-      for (const { path, snapshot } of snapshots) {
-        await loadSnapshot(database.client, currentSchema, snapshot);
+  afterAll(async () => {
+    await database?.close();
+  });
+
+  for (const { path, snapshot } of snapshots) {
+    const expectedExpiredWait = durableWaitDeadlineExpired(snapshot, replayAt);
+    // DEFECT: expired one-hour durable waits fail before replay can resume the suspended work.
+    const replayTest = !isGated ? it.skip : expectedExpiredWait ? it.fails : it;
+    replayTest(
+      `replays ${snapshot.metadata.release}/${snapshot.metadata.database}/prisma-${snapshot.metadata.prismaMajor}/${snapshot.metadata.scenario}`,
+      async () => {
+        expect(database).toBeDefined();
+        await loadSnapshot(database!.client, currentSchema, snapshot);
         const scenario = createScenario(snapshot.metadata.scenario);
-        const runtime = createReplayRuntime(database.client, scenario);
+        const runtime = createReplayRuntime(
+          database!.client,
+          scenario,
+          replayAt,
+        );
         const runId = String(snapshot.tables.WorkflowRun?.[0]?.id ?? "");
         expect(runId, `${path} does not contain a workflow run`).not.toBe("");
 
         scenario.release();
         await scenario.beforeReplay?.(runtime.kernel, runId, runtime.clock);
         const run = await driveToTerminal(runtime, runId);
+        if (expectedExpiredWait) {
+          const stage = await database!.client.workflowStage.findFirst({
+            where: { workflowRunId: runId },
+          });
+          expect(stage?.errorMessage, path).toContain("exceeded its timeout");
+          if (snapshot.metadata.scenario === "ai-map-poll") {
+            expect(scenario.fakeBatch.pollCount, path).toBe(0);
+          }
+          await assertTerminalRows(database!.client);
+        }
         expect(run.status, path).toBe(
           snapshot.metadata.expectedFinalOutcome.status,
         );
@@ -215,11 +257,11 @@ describe("stored rows from earlier releases", () => {
             `${path} did not publish ${row.id} exactly once`,
           ).toHaveLength(1);
         }
-        await assertTerminalRows(database.client);
-      }
-    },
-    5 * 60_000,
-  );
+        await assertTerminalRows(database!.client);
+      },
+      5 * 60_000,
+    );
+  }
 
   gatedIt(
     "guards stored table and JSON shapes against the newest committed snapshot",
