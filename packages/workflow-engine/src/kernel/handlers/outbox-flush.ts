@@ -73,6 +73,9 @@ export async function handleOutboxFlush(
         outboxEvent.id,
       );
       if (newCount >= maxRetries) {
+        // One write sets `dlqAt` AND drops the claim stamp, so no crash
+        // before the release below can leave a stamped dead letter (which
+        // a replay would turn into an event that reads as published).
         await deps.persistence.moveOutboxEventToDLQ(outboxEvent.id);
         deadLettered++;
       }

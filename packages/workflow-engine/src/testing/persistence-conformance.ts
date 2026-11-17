@@ -1982,6 +1982,33 @@ export function persistenceConformanceSuite(
         expect(afterReplay.some((e) => e.id === event.id)).toBe(true);
       });
 
+      it("should not leave a claimed event stamped as published when it is moved to DLQ", async () => {
+        // Given: An event the flush has claimed (the claim stamps it)
+        await persistence.appendOutboxEvents([
+          {
+            workflowRunId: "dlq-claimed-run",
+            eventType: "run.started",
+            payload: {},
+            causationId: "cmd-1",
+            occurredAt: new Date(),
+          },
+        ]);
+        const claimed = (
+          await persistence.claimUnpublishedOutboxEvents(100)
+        ).find((e) => e.workflowRunId === "dlq-claimed-run")!;
+        expect(claimed.publishedAt).not.toBeNull();
+
+        // When: It is dead-lettered WITHOUT the claim being released (the
+        // process died between the two writes), then replayed
+        await persistence.moveOutboxEventToDLQ(claimed.id);
+        expect(await persistence.replayDLQEvents(10)).toBeGreaterThanOrEqual(1);
+
+        // Then: It is live again: the move dropped the claim, so the next
+        // flush finds it instead of treating it as already published
+        const again = await persistence.claimUnpublishedOutboxEvents(100);
+        expect(again.some((e) => e.id === claimed.id)).toBe(true);
+      });
+
       it("should return 0 when no DLQ events to replay", async () => {
         // When: Replaying with no DLQ events
         const count = await persistence.replayDLQEvents(10);

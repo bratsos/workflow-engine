@@ -749,6 +749,8 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
     const record = this.outbox.find((r) => r.id === id);
     if (!record) throw new Error(`Outbox event not found: ${id}`);
     record.dlqAt = this.now();
+    // One write: a dead letter never keeps the flush's claim stamp.
+    record.publishedAt = null;
   }
 
   async replayDLQEvents(maxEvents: number): Promise<number> {
@@ -758,6 +760,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
     for (const record of dlqEvents) {
       record.dlqAt = null;
       record.retryCount = 0;
+      record.publishedAt = null;
     }
     return dlqEvents.length;
   }

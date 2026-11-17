@@ -128,8 +128,8 @@ interface PersistenceCore {
 
   // Outbox DLQ operations
   incrementOutboxRetryCount(id: string): Promise<number>;
-  moveOutboxEventToDLQ(id: string): Promise<void>;
-  replayDLQEvents(maxEvents: number): Promise<number>;
+  moveOutboxEventToDLQ(id: string): Promise<void>;  // sets dlqAt AND clears the claim stamp (publishedAt) in one write
+  replayDLQEvents(maxEvents: number): Promise<number>;  // clears dlqAt, retryCount and any publishedAt
 
   // Outbox operations
   appendOutboxEvents(events: CreateOutboxEventInput[]): Promise<void>;

@@ -993,10 +993,21 @@ export interface PersistenceCore {
   /** Increment retry count for a failed outbox event. Returns new count. */
   incrementOutboxRetryCount(id: string): Promise<number>;
 
-  /** Move an outbox event to DLQ (sets dlqAt). */
+  /**
+   * Move an outbox event to DLQ: sets `dlqAt` and clears `publishedAt` (the
+   * claim `claimUnpublishedOutboxEvents` stamped) in the SAME write. A
+   * stamped event reads as published, so an implementation that leaves the
+   * stamp for a later `releaseOutboxEvents` loses the event when the process
+   * dies between the two: a replay would make it live but stamped.
+   */
   moveOutboxEventToDLQ(id: string): Promise<void>;
 
-  /** Reset DLQ events so they can be reprocessed by outbox.flush. Returns count reset. */
+  /**
+   * Reset DLQ events so they can be reprocessed by outbox.flush: clears
+   * `dlqAt`, `retryCount` and any `publishedAt` (a dead letter was never
+   * delivered, so a stamp on one is a claim a crashed flush left). Returns
+   * count reset.
+   */
   replayDLQEvents(maxEvents: number): Promise<number>;
 
   // Outbox operations

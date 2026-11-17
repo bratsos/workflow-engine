@@ -1822,10 +1822,18 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     return record.retryCount;
   }
 
+  /**
+   * Dead-letters an event and drops the flush's claim in ONE write. The claim
+   * stamps `publishedAt` before the sink is tried, and a stamped event reads
+   * as published: with the move and the release as two writes, a process that
+   * died between them left `dlqAt` and `publishedAt` both set, and a replay
+   * that cleared only `dlqAt` made it look delivered for good. A dead letter
+   * was never delivered, so it never keeps a stamp.
+   */
   async moveOutboxEventToDLQ(id: string): Promise<void> {
     await this.prisma.outboxEvent.update({
       where: { id },
-      data: { dlqAt: new Date() },
+      data: { dlqAt: new Date(), publishedAt: null },
     });
   }
 
@@ -1840,7 +1848,9 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
 
     const result = await this.prisma.outboxEvent.updateMany({
       where: { id: { in: dlqEvents.map((e: any) => e.id) } },
-      data: { dlqAt: null, retryCount: 0 },
+      // Also clears the claim stamp: a dead letter an earlier version left
+      // stamped (a crash between its two writes) is revived, not skipped.
+      data: { dlqAt: null, retryCount: 0, publishedAt: null },
     });
     return result.count;
   }
