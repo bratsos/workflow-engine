@@ -106,6 +106,16 @@ jobs:
       - name: Set the database session timezone
         run: psql "$DATABASE_URL" -c "ALTER DATABASE workflow_engine_test SET timezone TO '${{ matrix.timezone }}'"
 
+      # A hook timeout in this job has been either a slow runner or a lock
+      # wait. With these two settings the server log tells them apart; the
+      # last step prints it when the job fails.
+      - name: Log lock waits and slow statements
+        run: >-
+          psql "$DATABASE_URL"
+          -c "ALTER SYSTEM SET log_lock_waits = on"
+          -c "ALTER SYSTEM SET log_min_duration_statement = 1000"
+          -c "SELECT pg_reload_conf()"
+
       # On Prisma 8 these two emit the contract and provision the database
       # with `prisma migration plan` and `prisma db migrate`.
       - name: Generate Prisma client
@@ -136,6 +146,13 @@ jobs:
           pnpm --filter @bratsos/workflow-engine-console exec vitest run src/__tests__/prisma-read-port.postgres.test.ts src/__tests__/cli.test.ts
         env:
           NODE_ENV: test
+
+      - name: Print the Postgres log and open locks after a failure
+        if: failure()
+        run: |
+          docker logs "${{ job.services.postgres.id }}" 2>&1 | tail -n 300
+          psql "$DATABASE_URL" -c "select pid, state, wait_event_type, wait_event, now() - xact_start as xact_age, left(query, 120) as query from pg_stat_activity where datname = current_database() and pid <> pg_backend_pid()"
+          psql "$DATABASE_URL" -c "select locktype, relation::regclass, mode, granted, pid from pg_locks where not granted"
 
   sqlite-conformance:
     runs-on: ubuntu-latest
