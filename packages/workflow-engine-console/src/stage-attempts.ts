@@ -49,6 +49,13 @@
  *    itself and the stage is `unproven-boundary`. The `stage:started` that
  *    follows a redrive is a `rerun` attempt, also for a stage whose last
  *    attempt was a job retry that a cancel interrupted.
+ *  - One `job.execute` writes a stage's start and that execution's end
+ *    under one causation id. An end written under the id of a retained
+ *    start that did not open the current attempt is the end of an earlier
+ *    execution, one whose body kept running after a cancel or a lost lease
+ *    and recorded its outcome later: which attempt it ended is not known,
+ *    so the stage is `unproven-boundary`. Ends written by other handlers
+ *    (a poll, `run.reapStuck`) carry ids of their own.
  *
  * What the page states rests on two kinds of evidence. The events must cover
  * the run from its first outbox row (`coverage: "from-start"`): an unbroken
@@ -96,15 +103,26 @@
  * later groups' rows be created again at 0. The events do not say which, so
  * after a redrive each row may hold any of those values; the row's `attempt`
  * must be one the recorded executions can produce. Without a redrive that is
- * exactly one value. The row and the event of one write are stamped in one
- * handler, the row first, so a row stamped after the last retained event
- * means the events that followed are not retained. A disagreement makes the
- * stage unavailable and names the field.
+ * exactly one value. Its status and error may also be the ones it had before
+ * the redrive (a row it kept), with a later cancel applied. The row and the
+ * event of one write are stamped in one handler, the row first, so a row
+ * stamped after the last retained event means the events that followed are
+ * not retained. A disagreement makes the stage unavailable and names the
+ * field.
+ *
+ * Only what every store writes the same way is read. The stores differ on
+ * `startedAt` before a stage's first start: the Prisma store stamps a row
+ * with the time it creates it (when the claim, `run.transition` or a redrive
+ * creates it), the in-memory store leaves it null, and a redrive from the
+ * start creates rows without it on both. So `startedAt` is compared only
+ * after a retained `stage:started` with no redrive since, when `job.execute`
+ * has stamped it on every store; a stage with no event of its own is read
+ * from its status and `attempt` alone.
  *
  * Times stamped by different processes are never compared to decide whether
  * the history is available. `startedAt` is checked against the last
- * `stage:started`, which `job.execute` writes in the transaction that stamps
- * it; `completedAt` against the `stage:completed` or `stage:failed` that ends a
+ * `stage:started` (as above), which `job.execute` writes in the transaction
+ * that stamps it; `completedAt` against the `stage:completed` or `stage:failed` that ends a
  * COMPLETED or FAILED stage, also written in the transaction that stamps it.
  * Everything else is ordered by `sequence`.
  *
@@ -158,6 +176,12 @@ export interface AttemptEventInput {
   error: string | null;
   /** True when `error` was cut by the reader. */
   errorTruncated?: boolean;
+  /**
+   * The id a stage event was written under; `undefined` skips the check that
+   * reads it. One `job.execute` writes a stage's start and that execution's
+   * end under one id.
+   */
+  causationId?: string | null;
 }
 
 export interface StageAttemptInput {
@@ -315,7 +339,8 @@ export type AttemptUnavailableReason =
   | "no-stage-events"
   /**
    * The events contradict each other: an execution ends with no start
-   * recorded, or a redrive starts while an execution has no recorded end.
+   * recorded, a redrive starts while an execution has no recorded end, or
+   * an end was written by an earlier execution than the open attempt's.
    */
   | "unproven-boundary"
   /** A retained event has no readable time. */
@@ -471,11 +496,12 @@ function historyForStage(
 
   if (!events.some((event) => event.stageId !== null)) {
     // The events cover the run from its first row and hold none of this
-    // stage; its row must say the same: never stamped by a start, still on
-    // its first attempt (0), and not past what a stage that never ran can be.
+    // stage; its row must say the same: not past what a stage that never ran
+    // can be, on an `attempt` the run's redrives can give a row that never
+    // ran. `startedAt` is not read: the Prisma store stamps it when it
+    // creates the row, so a row that never ran can carry one.
     const neverRan =
-      stage.attempt === 0 &&
-      stage.startedAt == null &&
+      possibleAttempts.has(stage.attempt) &&
       (stage.status === "PENDING" ||
         stage.status === "SKIPPED" ||
         stage.status === "CANCELLED");
@@ -529,6 +555,33 @@ function historyForStage(
   // job retry, or after a redrive reopened it. Only then can a `stage:failed`
   // arrive with no attempt open (`run.reapStuck` fails every unfinished stage).
   let waiting = true;
+  // A redrive keeps the rows of execution groups before its target as they
+  // were; the events do not say which group it targeted. Each entry is a
+  // state the row may have kept (its statuses and error) through the
+  // redrives since this stage's last event; a later cancel turns a kept
+  // PENDING row CANCELLED, and the stage's next event ends them all.
+  let kept: { statuses: Set<string>; error: typeof rowError }[] = [];
+  // The statuses a row whose last attempt is closed can hold now.
+  const closedStatuses = (last: Work | undefined) => {
+    const statuses = new Set<string>();
+    if (last?.outcome === "completed") statuses.add("COMPLETED");
+    if (last?.outcome === "failed") statuses.add("FAILED");
+    // Waiting for its next job attempt, or for a redrive's.
+    if (waiting) statuses.add("PENDING");
+    // Cancelled in that wait, or while it ran.
+    if (
+      runCancelled &&
+      (last?.outcome === "retrying" ||
+        last?.outcome === "cancelled" ||
+        cancelledIdle)
+    )
+      statuses.add("CANCELLED");
+    return statuses;
+  };
+  // The causation id of each retained `stage:started`, and of the one that
+  // opened the current attempt (null for a poll retry, which has none).
+  const startIds = new Set<string>();
+  let openStartId: string | null = null;
 
   for (const event of events) {
     const at = toMs(event.occurredAt);
@@ -555,8 +608,18 @@ function historyForStage(
         }
         waiting = false;
         runCancelled = true;
+        // `run.cancel` marks every unfinished row CANCELLED.
+        for (const world of kept) {
+          if (world.statuses.delete("PENDING")) world.statuses.add("CANCELLED");
+        }
       } else if (event.eventType === "workflow:started") {
         if (open !== null) return unavailable("unproven-boundary");
+        if (attempts.length > 0) {
+          kept.push({
+            statuses: closedStatuses(attempts[attempts.length - 1]),
+            error: rowError,
+          });
+        }
         runCancelled = false;
         if (attempts.length > 0) {
           next = "rerun";
@@ -570,7 +633,21 @@ function historyForStage(
       continue;
     }
 
+    // The stage's own handler wrote its row with this event.
+    kept = [];
+    const cause = event.causationId ?? null;
+    if (event.eventType !== "stage:started") {
+      // Written under the id of a start that did not open the current
+      // attempt: the end of an earlier execution that kept running (after a
+      // cancel or a lost lease), so which attempt it ended is not known.
+      const current: string | null = open !== null ? openStartId : null;
+      if (cause !== null && startIds.has(cause) && cause !== current)
+        return unavailable("unproven-boundary");
+    }
+
     if (event.eventType === "stage:started") {
+      if (cause !== null) startIds.add(cause);
+      openStartId = cause;
       let trigger: AttemptTrigger = next;
       if (open !== null) {
         // A second start is the proof that a new execution began; nothing
@@ -627,6 +704,7 @@ function historyForStage(
       open.errorTruncated = event.errorTruncated === true;
       if (suspended) {
         open = newAttempt("poll-retry", at);
+        openStartId = null;
       } else {
         open = null;
         next = "job-retry";
@@ -667,19 +745,13 @@ function historyForStage(
     if (!outcome) return unavailable("inconsistent", "status");
     last.outcome = outcome;
   } else {
-    // Closed: the row must say what the closing event says. A stage waiting
-    // for its next job attempt (or for a redrive's) is PENDING, and one
-    // cancelled in that wait is CANCELLED.
-    const agrees =
-      (stage.status === "COMPLETED" && last.outcome === "completed") ||
-      (stage.status === "FAILED" && last.outcome === "failed") ||
-      (stage.status === "PENDING" && waiting) ||
-      (stage.status === "CANCELLED" &&
-        runCancelled &&
-        (last.outcome === "retrying" ||
-          last.outcome === "cancelled" ||
-          cancelledIdle));
-    if (!agrees) return unavailable("inconsistent", "status");
+    // Closed: the row must say what the closing event says, or what a
+    // redrive that kept the row left. A stage waiting for its next job
+    // attempt (or for a redrive's) is PENDING, and one cancelled in that wait
+    // is CANCELLED.
+    kept.unshift({ statuses: closedStatuses(last), error: rowError });
+    kept = kept.filter((world) => world.statuses.has(stage.status));
+    if (kept.length === 0) return unavailable("inconsistent", "status");
   }
 
   // The row's attempt must be one the recorded executions produce (see
@@ -688,16 +760,19 @@ function historyForStage(
   if (!possibleAttempts.has(stage.attempt))
     return unavailable("inconsistent", "attempt");
 
-  // `job.execute` stamps `startedAt` before it writes `stage:started`, so the
-  // row's start is never later than the last retained start; a later one is
-  // a start whose event is not retained. A redrive keeps a reopened row's
-  // start and recreates a later stage's row without one.
+  // `job.execute` stamps `startedAt` before it writes `stage:started`, so
+  // after a retained start the row's start is never later than it; a later
+  // one is a start whose event is not retained, and none is a row that did
+  // not start. Before any start, and after a redrive (which keeps a row's
+  // start, or recreates the row), the row holds no start or the time the
+  // store created it: the Prisma store stamps a new row, the in-memory
+  // store does not, so a value there says nothing.
   if (stage.startedAt !== undefined) {
     const rowStart = stage.startedAt === null ? null : toMs(stage.startedAt);
     const agrees =
-      rowStart === null
-        ? lastStartMs === null || redrivenSinceStart
-        : lastStartMs !== null && rowStart <= lastStartMs;
+      lastStartMs === null ||
+      redrivenSinceStart ||
+      (rowStart !== null && rowStart <= lastStartMs);
     if (!agrees) return unavailable("inconsistent", "startedAt");
   }
   // The same for the end of a COMPLETED or FAILED stage and its event.
@@ -711,12 +786,14 @@ function historyForStage(
   }
   if (stage.errorMessage !== undefined) {
     const row = stage.errorMessage;
-    const agrees =
-      rowError.text === null
+    // The error of the current state, or of a kept one with the row's status.
+    const errors = last.endMs === null ? [rowError] : kept.map((w) => w.error);
+    const agrees = errors.some((error) =>
+      error.text === null
         ? row === null
         : row !== null &&
-          (row === rowError.text ||
-            (rowError.cut && row.startsWith(rowError.text)));
+          (row === error.text || (error.cut && row.startsWith(error.text))),
+    );
     if (!agrees) return unavailable("inconsistent", "errorMessage");
   }
 

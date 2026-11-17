@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Worker } from "node:worker_threads";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createWorkflowConsole } from "../handler";
 import {
@@ -15,6 +16,7 @@ import {
   mergeStageEvents,
 } from "../stage-attempts";
 import { type RecordedStatement, recordingClient } from "./recording-client";
+import { readStoredRows, runStoreOracle, storeWorld } from "./store-oracle";
 
 const major = process.env.PRISMA_MAJOR ?? "7";
 const isPrisma8 = major === "8";
@@ -409,6 +411,10 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
       stageId,
       error,
       errorTruncated: false,
+      // Only a stage event's: `run.create` writes the caller's key there.
+      causationId: eventType.startsWith("stage:")
+        ? `cause-retried-${sequence}`
+        : null,
     });
     const all = [
       event(1, "workflow:created", null),
@@ -1020,6 +1026,371 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
       runMismatch: "order",
     });
     await tail.db.$disconnect?.();
+  });
+
+  describe("the attempt history on the engine's Prisma store (real kernel)", () => {
+    let world: Awaited<ReturnType<typeof storeWorld>>;
+    let db: ConsolePrismaClient & Record<string, any>;
+    beforeAll(async () => {
+      // Its own file: a claim takes every pending run it finds.
+      const file = join(directory, "store-oracle.db");
+      db = isPrisma8
+        ? (() => {
+            const raw = fixture.createSqliteDb(file);
+            return Object.assign(fromPrisma8!(raw), {
+              $disconnect: () => raw.close(),
+            });
+          })()
+        : fixture.createSqliteClient(file);
+      world = await storeWorld(db, "sqlite");
+    }, 60_000);
+    afterAll(async () => {
+      await db?.$disconnect?.();
+    });
+
+    it("states nothing false after any dispatch, nor after rows removed from the end of a run's outbox", {
+      timeout: 300_000,
+    }, async () => {
+      const result = await runStoreOracle(world);
+      console.log(
+        [
+          `store oracle (SQLite, Prisma ${major}): ${result.samples} page reads with nothing removed, ${result.unavailableWithNothingRemoved.length} unavailable; ${result.removals} removals, ${result.outside.length} wrong outside the stated limit, ${result.limit.length} within it`,
+          ...result.limit.map((f) => `  ${f}`),
+        ].join("\n"),
+      );
+      expect(result.unavailableWithNothingRemoved).toEqual([]);
+      expect(result.outside).toEqual([]);
+      expect(result.visible).toEqual([]);
+      expect(result.samples).toBeGreaterThan(100);
+    });
+
+    it("reads the stored rows of every release since alpha.13", {
+      timeout: 120_000,
+    }, async () => {
+      const { files, lines } = await readStoredRows(world);
+      expect(files).toBeGreaterThanOrEqual(110);
+      const wrong = lines.filter((line) =>
+        // Its capture appends two `workflow:started` probes to a completed
+        // run, which the engine never writes: the order check finds them.
+        line.scenario === "unpublished-outbox"
+          ? line.read !== "unavailable run-inconsistent/order"
+          : !line.read.startsWith("available"),
+      );
+      expect(wrong).toEqual([]);
+      // A stage queued with its row stamped at creation (G1).
+      const queued = lines.filter((line) => line.scenario === "running-queued");
+      expect(queued.length).toBeGreaterThanOrEqual(10);
+      expect(new Set(queued.map((line) => line.read))).toEqual(
+        new Set(["available "]),
+      );
+    });
+  });
+
+  it("reads a run's rows and events at one moment, whatever another connection commits between its statements", {
+    timeout: 60_000,
+  }, async () => {
+    // With a statement timeout and without one (no `SET LOCAL` to scope).
+    for (const statementTimeoutMs of [15_000, 0]) {
+      const k = statementTimeoutMs;
+      const runId = `run-moment-${k}`;
+      const stageRecord = `stage-moment-${k}`;
+      await prisma.workflowRun.createMany({
+        data: [mkRun(runId, at(-9_010), "RUNNING", "wf-d", 0, 0)],
+      });
+      await prisma.workflowStage.createMany({
+        data: [
+          {
+            id: stageRecord,
+            workflowRunId: runId,
+            stageId: "only",
+            stageName: "Only",
+            stageNumber: 1,
+            executionGroup: 0,
+            status: "RUNNING",
+            createdAt: at(10),
+            updatedAt: at(12),
+            startedAt: at(12),
+          },
+        ],
+      });
+      const row = (sequence: number, eventType: string) =>
+        mkEvent(
+          `moment-${k}-${sequence}`,
+          runId,
+          sequence,
+          eventType,
+          at(10 + sequence),
+          null,
+          null,
+          { stageId: eventType.startsWith("stage:") ? "only" : undefined },
+        );
+      await prisma.outboxEvent.createMany({
+        data: [
+          row(1, "workflow:created"),
+          row(2, "workflow:started"),
+          row(3, "stage:started"),
+        ],
+      });
+      // Another process: its own connection to the same file, on a thread of
+      // its own, so that waiting for the file does not stop this one. The
+      // stage completes, and the run with it; the new rows copy the stored
+      // form of the existing ones.
+      const copy = (sequence: number, type: string, payload: string) =>
+        `INSERT INTO outbox_events (id, workflowRunId, sequence, eventType, payload, causationId, occurredAt, createdAt, retryCount)
+SELECT 'moment-${k}-${sequence}', workflowRunId, ${sequence}, '${type}', ${payload}, 'cause-moment-${k}-${sequence}', occurredAt, createdAt, 0
+FROM outbox_events WHERE id = 'moment-${k}-3'`;
+      const statements = [
+        "BEGIN IMMEDIATE",
+        `UPDATE workflow_stages SET status = 'COMPLETED', completedAt = startedAt WHERE id = '${stageRecord}'`,
+        copy(4, "stage:completed", "payload"),
+        copy(5, "workflow:completed", "'{}'"),
+        `UPDATE workflow_runs SET status = 'COMPLETED' WHERE id = '${runId}'`,
+        "COMMIT",
+      ];
+      const complete = () =>
+        new Promise<void>((resolve, reject) => {
+          const worker = new Worker(
+            `const { DatabaseSync } = require("node:sqlite");
+const { file, statements } = require("node:worker_threads").workerData;
+const db = new DatabaseSync(file);
+db.exec("PRAGMA busy_timeout = 20000");
+for (const statement of statements) db.exec(statement);
+db.close();`,
+            {
+              eval: true,
+              workerData: { file: join(directory, "console.db"), statements },
+            },
+          );
+          worker.once("error", reject);
+          worker.once("exit", (code) =>
+            code === 0 ? resolve() : reject(new Error(`writer exited ${code}`)),
+          );
+        });
+      let write: Promise<void> | undefined;
+      let readDone = false;
+      let committedDuringRead = false;
+      const port = createPrismaConsoleReadPort(
+        recordingClient(prisma, [], async (call) => {
+          if (write || !call.sql.includes('FROM "workflow_stages"')) return;
+          // Right after the stage rows are read. A writer cannot commit while
+          // a read holds a rollback-journal file; give it the time to.
+          write = complete().then(() => {
+            committedDuringRead = !readDone;
+          });
+          await Promise.race([
+            write.catch(() => {}),
+            new Promise((r) => setTimeout(r, 300)),
+          ]);
+        }),
+        { databaseType: "sqlite", statementTimeoutMs },
+      );
+      const page = (detail: any) => {
+        const json = JSON.parse(JSON.stringify(detail));
+        const held = mergeStageEvents(null, json.stageEvents)!;
+        const history = buildStageAttemptHistory({
+          redriveCount: json.run.redriveCount,
+          runStatus: json.run.status,
+          stages: json.stages,
+          steps: json.steps,
+          stageEvents: {
+            events: held.events,
+            coverage: held.coverage,
+            caughtUp: !held.more,
+          },
+        }).get(stageRecord)!;
+        return history.available
+          ? history.attempts.map((a) => `${a.trigger}:${a.outcome}`)
+          : `unavailable ${history.reason}`;
+      };
+      try {
+        const during = await port.getRunDetail(runId);
+        readDone = true;
+        expect(write).toBeDefined();
+        await write;
+        // The write either waited for the read, or committed during it unseen.
+        console.log(
+          `SQLite, Prisma ${major}, statement timeout ${k}: the write ${committedDuringRead ? "committed during the read" : "waited for the read to end"}`,
+        );
+        expect(during?.run.status).toBe("RUNNING");
+        expect(during?.stages[0]?.status).toBe("RUNNING");
+        expect(during?.stageEvents?.lastSequence).toBe(3);
+        expect(page(during)).toEqual(["initial:running"]);
+        // The next read sees all of the write.
+        expect(page(await reader().getRunDetail(runId))).toEqual([
+          "initial:completed",
+        ]);
+      } finally {
+        await write?.catch(() => {});
+      }
+    }
+  });
+
+  it("plans every statement on a run's outbox rows by the run's index, in each state of the table's statistics", {
+    timeout: 120_000,
+  }, async () => {
+    // Its own file: ANALYZE here must not change the plans of the others.
+    const file = join(directory, "plan.db");
+    const db: ConsolePrismaClient & Record<string, any> = isPrisma8
+      ? (() => {
+          const raw = fixture.createSqliteDb(file);
+          return Object.assign(fromPrisma8!(raw), {
+            $disconnect: () => raw.close(),
+          });
+        })()
+      : fixture.createSqliteClient(file);
+    const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite");
+    try {
+      const runs = [
+        "run-plan-0",
+        "run-plan-1000",
+        "run-plan-30000",
+        "run-plan-few",
+        "run-plan-others",
+      ];
+      await db.workflowRun.createMany({
+        data: runs.map((id, i) =>
+          mkRun(id, at(-9_100 - i), "RUNNING", "wf-d", 0, 0),
+        ),
+      });
+      // One row in the stored form of this Prisma major, then copies of it.
+      await db.outboxEvent.createMany({
+        data: [
+          mkEvent(
+            "plan-model",
+            "run-plan-model",
+            1,
+            "stage:started",
+            at(10),
+            null,
+            null,
+            { stageId: "fetch" },
+          ),
+        ],
+      });
+      const fill = (sql: string) => {
+        const raw = new DatabaseSync(file);
+        try {
+          raw.exec(sql);
+        } finally {
+          raw.close();
+        }
+      };
+      const copies = (runId: string, rows: number) =>
+        `INSERT INTO outbox_events (id, workflowRunId, sequence, eventType, payload, causationId, occurredAt, createdAt, retryCount)
+WITH RECURSIVE g(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM g WHERE n < ${rows})
+SELECT '${runId}-' || n, '${runId}', n, CASE WHEN n % 500 = 1 THEN 'stage:started' ELSE 'stage:progress' END,
+       payload, 'c', occurredAt, createdAt, 0
+FROM g, plan_model`;
+      const load = () => {
+        fill(copies("run-plan-1000", 1_000));
+        fill(copies("run-plan-30000", 30_000));
+        fill(copies("run-plan-others", 50_000));
+      };
+      // The model row moves to a table of its own, so the outbox can be empty.
+      fill(
+        "CREATE TABLE plan_model AS SELECT * FROM outbox_events WHERE id = 'plan-model'; DELETE FROM outbox_events",
+      );
+      const clear = () => fill("DELETE FROM outbox_events");
+      // What the planner holds for the table, read on a new connection.
+      const statistics = () => {
+        const raw = new DatabaseSync(file);
+        try {
+          const table = raw
+            .prepare(
+              "SELECT count(*) AS n FROM sqlite_schema WHERE name = 'sqlite_stat1'",
+            )
+            .get().n;
+          return table === 0
+            ? "no sqlite_stat1"
+            : (raw
+                .prepare(
+                  "SELECT group_concat(coalesce(idx, '(table)') || '=' || coalesce(stat, 'null'), '; ') AS s FROM sqlite_stat1 WHERE tbl = 'outbox_events'",
+                )
+                // ANALYZE of an empty table stores no row for it.
+                .get().s ?? "no row");
+        } finally {
+          raw.close();
+        }
+      };
+      const states: Array<[string, () => void, (s: string) => boolean]> = [
+        ["never analysed", load, (s) => s === "no sqlite_stat1"],
+        [
+          "analysed empty",
+          () => {
+            clear();
+            fill("ANALYZE outbox_events");
+            load();
+          },
+          (s) => s === "no row",
+        ],
+        [
+          "analysed at size",
+          () => fill("ANALYZE outbox_events"),
+          (s) => /=8\d{4}/.test(s),
+        ],
+        // Analysed while one run held its few rows, then grown.
+        [
+          "stale",
+          () => {
+            clear();
+            fill(copies("run-plan-few", 7));
+            fill("ANALYZE outbox_events");
+            load();
+          },
+          // 7 rows, all of one run.
+          (s) => /=7 7 1(;|$)/.test(s),
+        ],
+      ];
+      const seen: string[] = [];
+      for (const [state, setup, holds] of states) {
+        setup();
+        const stats = statistics();
+        expect(holds(stats), `${state}: ${stats}`).toBe(true);
+        const calls: RecordedStatement[] = [];
+        const port = createPrismaConsoleReadPort(recordingClient(db, calls), {
+          databaseType: "sqlite",
+          now: () => at(100),
+        });
+        await port.getRunDetail("run-plan-30000");
+        await port.getRunDetail("run-plan-30000", { stageEventsAfter: 29_990 });
+        await port.getRunDetail("run-plan-30000", { stageEventsAfter: 30_000 });
+        await port.getRunDetail("run-plan-0");
+        await port.listRunEvents("run-plan-30000", 0);
+        await port.listRunEvents("run-plan-30000", 29_990);
+        const outbox = calls.filter(
+          (c) =>
+            c.sql.includes('"outbox_events"') &&
+            c.sql.includes('"workflowRunId" ='),
+        );
+        expect(outbox.length).toBeGreaterThanOrEqual(14);
+        // The planner of a new connection, which loads the statistics now in the file.
+        const raw = new DatabaseSync(file);
+        try {
+          for (const { sql, params } of outbox) {
+            const plan = raw
+              // Numbered `?NNN`, which binds by position like the `$n` and `?` the readers write.
+              .prepare(`EXPLAIN QUERY PLAN ${sql.replace(/\$(\d+)/g, "?$1")}`)
+              .all(...(params as never[]))
+              .map((row: { detail: string }) => row.detail)
+              .join(" | ");
+            seen.push(`${state} (sqlite_stat1: ${stats}): ${plan}`);
+            expect(plan, `${state}: ${sql}`).toMatch(
+              // The unique (workflowRunId, sequence) index: named by Prisma 6 and 7, an
+              // inline constraint's automatic index on Prisma 8.
+              /SEARCH outbox_events USING (COVERING )?INDEX (outbox_events_workflowRunId_sequence_key|sqlite_autoindex_outbox_events_\d) \(workflowRunId=\?/,
+            );
+            expect(plan, `${state}: ${sql}`).not.toMatch(
+              /SCAN outbox_events|TEMP B-TREE/,
+            );
+          }
+        } finally {
+          raw.close();
+        }
+      }
+      console.log([...new Set(seen)].join("\n"));
+    } finally {
+      await db.$disconnect?.();
+    }
   });
 
   it("cuts a lifecycle event's error text in SQL and says it was cut", async () => {

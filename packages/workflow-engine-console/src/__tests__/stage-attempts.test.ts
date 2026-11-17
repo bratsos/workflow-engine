@@ -926,29 +926,280 @@ describe("I want a stage's history grouped by attempt, and never grouped wrongly
     expect(attempt.events.map((e) => e.errorTruncated)).toEqual([false, true]);
   });
 
-  it("says a stage has not started only when its record was never stamped by a start", () => {
-    // N1, tail form: the run's first rows are retained, the stage's are not,
-    // and its row (cancelled while it ran) has a start time.
-    const cancelledWhileRunning = {
-      ...stage("a", "CANCELLED"),
-      startedAt: at(3),
-      completedAt: at(4),
+  it("says a stage has not started from its status and attempt, whether or not the store stamped its row when it created it", () => {
+    seq = 0;
+    // The Prisma store stamps `startedAt` when it creates the row; the
+    // in-memory store leaves it null. Both read the same.
+    for (const startedAt of [null, at(1)]) {
+      const queued = {
+        ...stage("a", "PENDING"),
+        startedAt,
+        errorMessage: null,
+      };
+      expect(
+        available(
+          history([queued], [run("workflow:started", 1)], [], {
+            runStatus: "RUNNING",
+          }),
+          "a",
+        ).attempts,
+      ).toEqual([]);
+      // Cancelled while queued.
+      expect(
+        available(
+          history(
+            [{ ...queued, status: "CANCELLED", completedAt: at(2) }],
+            [run("workflow:started", 1), run("workflow:cancelled", 2)],
+            [],
+            { runStatus: "CANCELLED" },
+          ),
+          "a",
+        ).attempts,
+      ).toEqual([]);
+    }
+    // A row that says it ran has its events, whatever its start time.
+    expect(
+      history(
+        [{ ...stage("a", "COMPLETED"), startedAt: null }],
+        [run("workflow:started", 2)],
+      ).get("rec-a"),
+    ).toMatchObject({ available: false, reason: "no-stage-events" });
+    // An attempt no run of redrives gives a row that never ran.
+    expect(
+      history(
+        [{ ...stage("a", "PENDING", 1), startedAt: null }],
+        [run("workflow:started", 2)],
+      ).get("rec-a"),
+    ).toMatchObject({ available: false, reason: "no-stage-events" });
+    // N1, tail form: the stage was cancelled while it ran and the rows from
+    // its start on were removed; the run's record says CANCELLED and its
+    // retained events end RUNNING.
+    expect(
+      history(
+        [{ ...stage("a", "CANCELLED"), startedAt: at(3), completedAt: at(4) }],
+        [run("workflow:started", 2)],
+        [],
+        { runStatus: "CANCELLED" },
+      ).get("rec-a"),
+    ).toMatchObject({ available: false, reason: "run-inconsistent" });
+  });
+
+  it("reads a row a redrive created again by its start: none, or the time the store created it", () => {
+    seq = 0;
+    const events = [
+      ev("a", "stage:started", 1),
+      ev("a", "stage:failed", 2, "x"),
+      run("workflow:failed", 3),
+      run("workflow:started", 10),
+    ];
+    for (const startedAt of [null, at(10), at(0)]) {
+      expect(
+        available(
+          history(
+            [{ ...stage("a", "PENDING", 1), startedAt, errorMessage: null }],
+            events,
+            [],
+            { redriveCount: 1, runStatus: "RUNNING" },
+          ),
+          "a",
+        ).attempts.map((a) => a.outcome),
+      ).toEqual(["failed"]);
+    }
+    // Reaped while it waited for its first start: no start, any row stamp.
+    seq = 0;
+    for (const startedAt of [null, at(1)]) {
+      expect(
+        available(
+          history(
+            [
+              {
+                ...stage("a", "FAILED"),
+                startedAt,
+                completedAt: at(5),
+                errorMessage: "stuck",
+              },
+            ],
+            [ev("a", "stage:failed", 5, "stuck"), run("workflow:failed", 5)],
+            [],
+            { runStatus: "FAILED" },
+          ),
+          "a",
+        ).attempts.map((a) => [a.outcome, a.executed]),
+      ).toEqual([["failed", false]]);
+    }
+    // After a retained start with no redrive since, the row's start is
+    // `job.execute`'s: none, or one later than the event, is not.
+    seq = 0;
+    const ran = [ev("a", "stage:started", 1), ev("a", "stage:completed", 2)];
+    const row = (startedAt: Date | null) => ({
+      ...stage("a", "COMPLETED"),
+      startedAt,
+      completedAt: at(2),
+      errorMessage: null,
+    });
+    expect(history([row(at(1))], ran).get("rec-a")).toMatchObject({
+      available: true,
+    });
+    for (const startedAt of [null, at(1.5)])
+      expect(history([row(startedAt)], ran).get("rec-a")).toMatchObject({
+        available: false,
+        reason: "inconsistent",
+        mismatch: "startedAt",
+      });
+  });
+
+  it("accepts the status and error a redrive from a later stage kept on a row", () => {
+    seq = 0;
+    // G6: b was cancelled while it ran, the run was redriven from a later
+    // stage, which kept b's row CANCELLED; then that run failed.
+    const events = [
+      ev("b", "stage:started", 1),
+      run("workflow:cancelled", 2),
+      run("workflow:started", 3),
+      run("workflow:failed", 4),
+    ];
+    const b = {
+      ...stage("b", "CANCELLED"),
+      startedAt: at(1),
+      completedAt: at(2),
       errorMessage: null,
     };
+    const opts = { redriveCount: 1, runStatus: "FAILED" };
     expect(
-      history([cancelledWhileRunning], [run("workflow:started", 2)]).get(
-        "rec-a",
+      available(history([b], events, [], opts), "b").attempts.map(
+        (a) => a.outcome,
       ),
-    ).toMatchObject({ available: false, reason: "no-stage-events" });
+    ).toEqual(["cancelled"]);
+    // Reopened instead: PENDING with no error.
+    expect(
+      history([{ ...b, status: "PENDING", attempt: 1 }], events, [], opts).get(
+        "rec-b",
+      ),
+    ).toMatchObject({ available: true });
+    // A row a redrive could not have left: COMPLETED with no end recorded.
+    expect(
+      history([{ ...b, status: "COMPLETED" }], events, [], opts).get("rec-b"),
+    ).toMatchObject({ available: false, mismatch: "status" });
+
+    // Cancelled in a job retry's wait (its error kept), kept by a redrive
+    // from a later stage, then a cancel of that run: still CANCELLED, error kept.
+    seq = 0;
+    const waited = [
+      ev("b", "stage:started", 1),
+      ev("b", "stage:retrying", 2, "503"),
+      run("workflow:cancelled", 3),
+      run("workflow:started", 4),
+      run("workflow:cancelled", 5),
+    ];
+    const row = {
+      ...stage("b", "CANCELLED"),
+      startedAt: at(1),
+      completedAt: at(3),
+      errorMessage: "503",
+    };
+    const both = { redriveCount: 1, runStatus: "CANCELLED" };
+    expect(history([row], waited, [], both).get("rec-b")).toMatchObject({
+      available: true,
+    });
+    // Reopened and then cancelled: CANCELLED with no error.
+    expect(
+      history(
+        [{ ...row, errorMessage: null, attempt: 1 }],
+        waited,
+        [],
+        both,
+      ).get("rec-b"),
+    ).toMatchObject({ available: true });
+    // Neither a kept nor a reset row has another error.
+    expect(
+      history([{ ...row, errorMessage: "other" }], waited, [], both).get(
+        "rec-b",
+      ),
+    ).toMatchObject({ available: false, mismatch: "errorMessage" });
+  });
+
+  it("does not attribute an end written by an earlier execution to the attempt that is open", () => {
+    seq = 0;
+    const by = (event: AttemptEventInput, causationId: string) => ({
+      ...event,
+      causationId,
+    });
+    // G7: cancelled while running, redriven; the first execution's body
+    // records its completion while the rerun is still running.
+    const late = [
+      by(ev("s", "stage:started", 1), "job:1:attempt:1"),
+      run("workflow:cancelled", 2),
+      run("workflow:started", 3),
+      by(ev("s", "stage:started", 4), "job:2:attempt:1"),
+      by(ev("s", "stage:completed", 5), "job:1:attempt:1"),
+    ];
+    const row = {
+      ...stage("s", "COMPLETED", 1),
+      startedAt: at(4),
+      completedAt: at(5),
+      errorMessage: null,
+    };
+    const opts = { redriveCount: 1, runStatus: "RUNNING" };
+    expect(history([row], late, [], opts).get("rec-s")).toMatchObject({
+      available: false,
+      reason: "unproven-boundary",
+    });
+    // The rerun's own completion is its own.
+    const own = late.map((e, i) =>
+      i === 4 ? { ...e, causationId: "job:2:attempt:1" } : e,
+    );
+    expect(
+      available(history([row], own, [], opts), "s").attempts.map(
+        (a) => a.outcome,
+      ),
+    ).toEqual(["cancelled", "completed"]);
+    // Before the rerun starts, the earlier execution's failure is not a
+    // failure of the stage in its wait.
+    const early = [
+      ...late.slice(0, 3),
+      by(ev("s", "stage:failed", 4, "late"), "job:1:attempt:1"),
+    ];
+    expect(
+      history(
+        [{ ...row, status: "FAILED", errorMessage: "late" }],
+        early,
+        [],
+        opts,
+      ).get("rec-s"),
+    ).toMatchObject({ available: false, reason: "unproven-boundary" });
+    // Ends written by other handlers (a poll) carry ids of their own.
+    seq = 0;
+    const polled = [
+      by(ev("s", "stage:started", 1), "job:1:attempt:1"),
+      by(ev("s", "stage:suspended", 2), "job:1:attempt:1"),
+      by(ev("s", "stage:retrying", 3, "flaky"), "poll-a"),
+      by(ev("s", "stage:completed", 4), "poll-b"),
+    ];
     expect(
       available(
         history(
-          [{ ...cancelledWhileRunning, startedAt: null }],
-          [run("workflow:started", 2)],
+          [{ ...row, attempt: 1, startedAt: at(1), completedAt: at(4) }],
+          polled,
         ),
-        "a",
-      ).attempts,
-    ).toEqual([]);
+        "s",
+      ).attempts.map((a) => a.trigger),
+    ).toEqual(["initial", "poll-retry"]);
+    // A re-delivery under the same id ends under it.
+    seq = 0;
+    const again = [
+      by(ev("s", "stage:started", 1), "job:1:attempt:1"),
+      by(ev("s", "stage:started", 2), "job:1:attempt:1"),
+      by(ev("s", "stage:completed", 3), "job:1:attempt:1"),
+    ];
+    expect(
+      available(
+        history(
+          [{ ...row, attempt: 0, startedAt: at(2), completedAt: at(3) }],
+          again,
+        ),
+        "s",
+      ).attempts.map((a) => a.trigger),
+    ).toEqual(["initial", "redelivery"]);
   });
 
   it("names the field of the stage's record that its events do not agree with", () => {

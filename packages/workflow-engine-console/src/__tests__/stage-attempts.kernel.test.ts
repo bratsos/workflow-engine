@@ -39,7 +39,34 @@ const { createTestHarness, createTestKernel } = await import(testingSpecifier);
  */
 function harnessOn(workflow: unknown) {
   const { clock } = createTestKernel([], { clockStart: new Date() });
-  return createTestHarness({ workflows: [workflow], clock });
+  return prepared(createTestHarness({ workflows: [workflow], clock }));
+}
+
+/**
+ * How the store writes a stage row's `startedAt` before the stage starts:
+ * the in-memory store leaves it null; the Prisma store stamps the time it
+ * creates the row (an upsert's create, with its own clock), which the oracle
+ * reproduces here.
+ */
+type StoreForm = "null until started" | "stamped at creation";
+let storeForm: StoreForm = "null until started";
+/** Called with each harness the oracle creates, to watch its dispatches. */
+let onHarness: ((h: any) => void) | undefined;
+
+function prepared(h: any) {
+  if (storeForm === "stamped at creation") {
+    const p = h.persistence;
+    const upsert = p.upsertStage.bind(p);
+    p.upsertStage = async (data: any) =>
+      upsert(
+        data.create.startedAt !== undefined ||
+          (await p.getStage(data.workflowRunId, data.stageId))
+          ? data
+          : { ...data, create: { ...data.create, startedAt: new Date() } },
+      );
+  }
+  onHarness?.(h);
+  return h;
 }
 
 const io = z.object({ v: z.string() });
@@ -77,6 +104,7 @@ async function snapshot(h: any, runId: string): Promise<Snapshot> {
         row.eventType === "stage:retrying" || row.eventType === "stage:failed"
           ? (row.payload.error ?? null)
           : null,
+      causationId: row.eventType.startsWith("stage:") ? row.causationId : null,
     }));
   const steps: any[] = [];
   for (const stage of stages) {
@@ -630,6 +658,96 @@ describe("I want a cancelled or restarted stage never shown as one attempt with 
     expect(lost!.steps.map((x) => x.stepId)).toEqual(["fetch"]);
     expect(again!.steps).toEqual([]);
   });
+
+  // G7: a cancelled execution whose body keeps running records its outcome
+  // after a redrive started the stage again. The events carry which
+  // `job.execute` wrote them, so the page does not show that outcome on the
+  // rerun, in any of the three orders.
+  for (const variant of [
+    "the old body completes after the rerun completed",
+    "the old body fails after the rerun completed",
+    "the old body completes while the rerun is still running",
+  ] as const) {
+    it(`never attributes a late writer's outcome to the rerun: ${variant}`, async () => {
+      let release!: () => void;
+      const old = new Promise<void>((r) => {
+        release = r;
+      });
+      let finishRerun!: () => void;
+      const rerun = new Promise<void>((r) => {
+        finishRerun = r;
+      });
+      let calls = 0;
+      const slow = defineStage({
+        id: "slow",
+        name: "Slow",
+        schemas,
+        async execute(ctx: any) {
+          const mine = ++calls;
+          await ctx.step.run(`w${mine}`, async () => "x");
+          if (mine === 1) {
+            await old;
+            if (variant.includes("fails")) throw new Error("late failure");
+          }
+          if (mine === 2 && variant.includes("still running")) await rerun;
+          return { output: ctx.input };
+        },
+      });
+      const c = defineStage({
+        id: "c",
+        name: "C",
+        schemas,
+        execute: async (ctx: any) => ({ output: ctx.input }),
+      });
+      const h = tickingHarness([
+        new WorkflowBuilder("wf", "wf", "d", io, io).pipe(slow).pipe(c).build(),
+      ]);
+      const runId = (await h.start("wf", { v: "x" })).workflowRunId;
+      await h.kernel.dispatch({ type: "run.claimPending", workerId: "w" });
+      const execute = (job: any) =>
+        h.kernel.dispatch({
+          type: "job.execute",
+          workflowRunId: runId,
+          workflowId: "wf",
+          stageId: "slow",
+          config: {},
+          attempt: job.attempt,
+          maxAttempts: 3,
+        });
+      const page = async () => {
+        const m = await moment(h, runId);
+        return shapeOf(await pageModel(m, () => false), m, "slow");
+      };
+      const firstDone = execute(await h.jobQueue.dequeue());
+      while (calls === 0) await new Promise((r) => setTimeout(r, 1));
+      await h.kernel.dispatch({ type: "run.cancel", workflowRunId: runId });
+      await redrive(h, runId);
+      await h.kernel.dispatch({ type: "run.claimPending", workerId: "w" });
+      const secondDone = execute(await h.jobQueue.dequeue());
+      if (variant.includes("still running")) {
+        while (calls < 2) await new Promise((r) => setTimeout(r, 1));
+        expect(await page()).toEqual([
+          ["initial", "cancelled"],
+          ["rerun", "running"],
+        ]);
+      } else {
+        await secondDone;
+        expect(await page()).toEqual([
+          ["initial", "cancelled"],
+          ["rerun", "completed"],
+        ]);
+      }
+      release();
+      await firstDone.catch(() => {});
+      // The old execution's outcome is recorded now: the page does not say
+      // which attempt it ended.
+      expect(await page()).toBe("unavailable:unproven-boundary");
+      finishRerun();
+      await secondDone;
+      await drain(h, runId, 6);
+      expect(await page()).toBe("unavailable:unproven-boundary");
+    });
+  }
 });
 
 /** What the page reads of one run at one moment: its rows and every run's outbox. */
@@ -739,6 +857,9 @@ async function pageModel(m: Moment, removed: (row: any) => boolean) {
           row.eventType === "stage:retrying" || row.eventType === "stage:failed"
             ? (row.payload.error ?? null)
             : null,
+        causationId: row.eventType.startsWith("stage:")
+          ? row.causationId
+          : null,
       })),
   });
   const handler = createWorkflowConsole({ reader, authorize: () => true });
@@ -875,13 +996,15 @@ function tickingHarness(workflows: unknown[]) {
       return { output: ctx.input };
     },
   });
-  return createTestHarness({
-    workflows: [
-      ...workflows,
-      new WorkflowBuilder("other", "other", "d", io, io).pipe(other).build(),
-    ],
-    clock,
-  });
+  return prepared(
+    createTestHarness({
+      workflows: [
+        ...workflows,
+        new WorkflowBuilder("other", "other", "d", io, io).pipe(other).build(),
+      ],
+      clock,
+    }),
+  );
 }
 
 function shapeOf(
@@ -1522,6 +1645,63 @@ describe("I want a history shown as available after rows were removed and the ru
       },
     },
     {
+      name: "cancel while b runs, redrive from a later stage c, then from b",
+      marks: ["g1", "g2"],
+      tailLimit: 0,
+      async run(mark) {
+        // A redrive from c keeps b's row CANCELLED (G6).
+        let h: any;
+        let runId = "";
+        let runs = 0;
+        const b = stage("b", async (ctx) => {
+          runs++;
+          await ctx.step.run(`w${runs}`, async () => "x");
+          if (runs === 1)
+            await h.kernel.dispatch({
+              type: "run.cancel",
+              workflowRunId: runId,
+            });
+          return { output: ctx.input };
+        });
+        h = tickingHarness([
+          new WorkflowBuilder("wf", "wf", "d", io, io)
+            .pipe(stage("a", pass))
+            .pipe(b)
+            .pipe(stage("c", pass))
+            .build(),
+        ]);
+        runId = (await h.start("wf", { v: "x" })).workflowRunId;
+        await drain(h, runId, 6);
+        await mark("g1", h, runId);
+        await redrive(h, runId, { kind: "stage", stageId: "c" });
+        await drain(h, runId, 6);
+        await mark("g2", h, runId);
+        await redrive(h, runId, { kind: "stage", stageId: "b" });
+        await drain(h, runId, 6);
+        return { h, runId };
+      },
+    },
+    {
+      name: "cancelled before its first stage started, redrive",
+      marks: ["g1"],
+      tailLimit: 0,
+      async run(mark) {
+        const h = tickingHarness([
+          new WorkflowBuilder("wf", "wf", "d", io, io)
+            .parallel([stage("p", pass), stage("q", pass)])
+            .pipe(stage("c", pass))
+            .build(),
+        ]);
+        const runId = (await h.start("wf", { v: "x" })).workflowRunId;
+        await h.kernel.dispatch({ type: "run.claimPending", workerId: "w" });
+        await h.kernel.dispatch({ type: "run.cancel", workflowRunId: runId });
+        await mark("g1", h, runId);
+        await redrive(h, runId);
+        await drain(h, runId, 6);
+        return { h, runId };
+      },
+    },
+    {
       name: "job retry, completed, redrive from start, redrive from stage",
       marks: ["g1", "g2"],
       tailLimit: 0,
@@ -1637,105 +1817,154 @@ describe("I want a history shown as available after rows were removed and the ru
     return byStage;
   }
 
-  for (const scenario of scenarios) {
-    it(scenario.name, { timeout: 600_000 }, async () => {
-      const kept = await scenario.run(async () => {});
-      const truth = await model(kept.h, kept.runId);
-      const sizes: Record<string, number> = {};
-      await scenario.run(async (label, h, runId) => {
-        sizes[label] = (h.persistence.outbox as any[]).filter(
-          (r) => r.workflowRunId === runId,
-        ).length;
-      });
-
-      const outside: string[] = [];
-      const limit: string[] = [];
-      const visible: string[] = [];
-      const check = async (
-        shapes: string[],
-        how: string,
-        w: { h: any; runId: string },
-      ) => {
-        const got = await model(w.h, w.runId);
-        const inLimit =
-          shapes.includes(TAIL) &&
-          shapes.every((s) => s === TAIL || s === NONE);
-        for (const [stageId, g] of got) {
-          const t = truth.get(stageId)!;
-          const label = `[${shapes.join(" / ")}] ${how} | ${stageId}`;
-          if (!g.available) {
-            if (t.available && shapes.every((s) => s === NONE))
-              outside.push(
-                `${label}: unavailable (${g.reason}) with nothing removed`,
-              );
-            continue;
+  /**
+   * Runs the scenario with nothing removed and reads the page of every run
+   * after each kernel dispatch: a stage it calls unavailable then is a
+   * false statement, since nothing was removed.
+   */
+  async function sampled(scenario: Scenario) {
+    const unavailable = new Set<string>();
+    let samples = 0;
+    onHarness = (h) => {
+      const dispatch = h.kernel.dispatch.bind(h.kernel);
+      let busy = false;
+      h.kernel.dispatch = async (command: any) => {
+        const result = await dispatch(command);
+        if (!busy && !/^(outbox|lease)\./.test(command.type)) {
+          busy = true;
+          try {
+            for (const runId of (h.persistence as any).runs.keys()) {
+              const m = await moment(h, runId);
+              const histories = await pageModel(m, () => false);
+              samples++;
+              for (const stage of m.stages) {
+                const got = histories.get(stage.id)!;
+                if (!got.available)
+                  unavailable.add(
+                    `after ${command.type} | run ${m.run.status} | ${stage.stageId} ${stage.status} a=${stage.attempt} | ${got.reason}/${(got as any).mismatch ?? (got as any).runMismatch ?? ""}`,
+                  );
+              }
+            }
+          } finally {
+            busy = false;
           }
-          const same =
-            t.available &&
-            JSON.stringify(project(g)) === JSON.stringify(project(t));
-          if (same) continue;
-          const finding = `${label}\n      shown: ${JSON.stringify(project(g, false))}\n      kept:  ${JSON.stringify(project(t, false))}`;
-          if (!inLimit) {
-            outside.push(finding);
-            continue;
-          }
-          limit.push(finding);
-          if (
-            !t.available ||
-            JSON.stringify(counted(g)) !== JSON.stringify(counted(t))
-          )
-            visible.push(finding);
         }
+        return result;
       };
-
-      const rand = prng(scenario.name.length * 7919);
-      let trials = 0;
-      for (const mark of scenario.marks) {
-        for (const purge of purgesFor(sizes[mark]!, rand)) {
-          let shape = "";
-          const w = await scenario.run(async (label, h, runId) => {
-            if (label === mark) shape = applyPurge(h, runId, purge);
-          });
-          trials++;
-          await check([shape], `${mark}: ${purge.name}`, w);
-        }
-      }
-      // Two removals, at two marks.
-      if (scenario.marks.length > 1) {
-        for (let t = 0; t < 150; t++) {
-          const i1 = Math.floor(rand() * (scenario.marks.length - 1));
-          const m1 = scenario.marks[i1]!;
-          const m2 =
-            scenario.marks[
-              i1 + 1 + Math.floor(rand() * (scenario.marks.length - 1 - i1))
-            ]!;
-          const p1 = purgesFor(sizes[m1]!, rand);
-          const p2 = purgesFor(sizes[m2]! + 3, rand);
-          const a = p1[Math.floor(rand() * p1.length)]!;
-          const b = p2[Math.floor(rand() * p2.length)]!;
-          const shapes: string[] = [];
-          const w = await scenario.run(async (label, h, runId) => {
-            if (label === m1) shapes.push(applyPurge(h, runId, a));
-            if (label === m2) shapes.push(applyPurge(h, runId, b));
-          });
-          trials++;
-          await check(shapes, `${m1}: ${a.name} then ${m2}: ${b.name}`, w);
-        }
-      }
-
-      if (process.env.ORACLE_TRUTH)
-        for (const [id, t] of truth)
-          console.log(`kept ${id}: ${JSON.stringify(project(t, false))}`);
-      console.log(
-        [
-          `${scenario.name}: ${trials} removals, ${outside.length} wrong outside the stated limit, ${limit.length} within it`,
-          ...limit.map((f) => `  ${f}`),
-        ].join("\n"),
-      );
-      expect(outside).toEqual([]);
-      // Every wrong history left is one the row checks cannot see.
-      expect(visible).toEqual([]);
-      expect(limit.length).toBe(scenario.tailLimit);
-    });
+    };
+    try {
+      return { ...(await scenario.run(async () => {})), unavailable, samples };
+    } finally {
+      onHarness = undefined;
+    }
   }
+
+  const forms: StoreForm[] = ["null until started", "stamped at creation"];
+  for (const form of forms)
+    for (const scenario of scenarios) {
+      it(`${scenario.name} (stage start ${form})`, {
+        timeout: 600_000,
+      }, async () => {
+        storeForm = form;
+        const kept = await sampled(scenario);
+        expect([...kept.unavailable], `${kept.samples} samples`).toEqual([]);
+        const truth = await model(kept.h, kept.runId);
+        const sizes: Record<string, number> = {};
+        await scenario.run(async (label, h, runId) => {
+          sizes[label] = (h.persistence.outbox as any[]).filter(
+            (r) => r.workflowRunId === runId,
+          ).length;
+        });
+
+        const outside: string[] = [];
+        const limit: string[] = [];
+        const visible: string[] = [];
+        const check = async (
+          shapes: string[],
+          how: string,
+          w: { h: any; runId: string },
+        ) => {
+          const got = await model(w.h, w.runId);
+          const inLimit =
+            shapes.includes(TAIL) &&
+            shapes.every((s) => s === TAIL || s === NONE);
+          for (const [stageId, g] of got) {
+            const t = truth.get(stageId)!;
+            const label = `[${shapes.join(" / ")}] ${how} | ${stageId}`;
+            if (!g.available) {
+              if (t.available && shapes.every((s) => s === NONE))
+                outside.push(
+                  `${label}: unavailable (${g.reason}) with nothing removed`,
+                );
+              continue;
+            }
+            const same =
+              t.available &&
+              JSON.stringify(project(g)) === JSON.stringify(project(t));
+            if (same) continue;
+            const finding = `${label}\n      shown: ${JSON.stringify(project(g, false))}\n      kept:  ${JSON.stringify(project(t, false))}`;
+            if (!inLimit) {
+              outside.push(finding);
+              continue;
+            }
+            limit.push(finding);
+            if (
+              !t.available ||
+              JSON.stringify(counted(g)) !== JSON.stringify(counted(t))
+            )
+              visible.push(finding);
+          }
+        };
+
+        const rand = prng(scenario.name.length * 7919);
+        let trials = 0;
+        for (const mark of scenario.marks) {
+          for (const purge of purgesFor(sizes[mark]!, rand)) {
+            let shape = "";
+            const w = await scenario.run(async (label, h, runId) => {
+              if (label === mark) shape = applyPurge(h, runId, purge);
+            });
+            trials++;
+            await check([shape], `${mark}: ${purge.name}`, w);
+          }
+        }
+        // Two removals, at two marks.
+        if (scenario.marks.length > 1) {
+          for (let t = 0; t < 150; t++) {
+            const i1 = Math.floor(rand() * (scenario.marks.length - 1));
+            const m1 = scenario.marks[i1]!;
+            const m2 =
+              scenario.marks[
+                i1 + 1 + Math.floor(rand() * (scenario.marks.length - 1 - i1))
+              ]!;
+            const p1 = purgesFor(sizes[m1]!, rand);
+            const p2 = purgesFor(sizes[m2]! + 3, rand);
+            const a = p1[Math.floor(rand() * p1.length)]!;
+            const b = p2[Math.floor(rand() * p2.length)]!;
+            const shapes: string[] = [];
+            const w = await scenario.run(async (label, h, runId) => {
+              if (label === m1) shapes.push(applyPurge(h, runId, a));
+              if (label === m2) shapes.push(applyPurge(h, runId, b));
+            });
+            trials++;
+            await check(shapes, `${m1}: ${a.name} then ${m2}: ${b.name}`, w);
+          }
+        }
+
+        if (process.env.ORACLE_TRUTH)
+          for (const [id, t] of truth)
+            console.log(`kept ${id}: ${JSON.stringify(project(t, false))}`);
+        console.log(
+          [
+            `${scenario.name}: ${trials} removals, ${outside.length} wrong outside the stated limit, ${limit.length} within it`,
+            ...limit.map((f) => `  ${f}`),
+          ].join("\n"),
+        );
+        expect(outside).toEqual([]);
+        // Every wrong history left is one the row checks cannot see.
+        expect(visible).toEqual([]);
+        expect(limit.length).toBe(scenario.tailLimit);
+        storeForm = "null until started";
+      });
+    }
 });

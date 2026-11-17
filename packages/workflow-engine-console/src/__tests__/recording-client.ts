@@ -28,6 +28,10 @@ export function recordingClient(
     ...(c.$transaction
       ? { $transaction: (fn) => c.$transaction!((tx) => fn(wrap(tx))) }
       : {}),
+    // Settings statements (`SET TRANSACTION`, `SET LOCAL`) pass through unrecorded.
+    ...(c.$executeRawUnsafe
+      ? { $executeRawUnsafe: c.$executeRawUnsafe.bind(c) }
+      : {}),
     ...(c.$withColumns
       ? { $withColumns: (columns) => wrap(c.$withColumns!(columns)) }
       : {}),

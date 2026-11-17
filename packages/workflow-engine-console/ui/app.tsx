@@ -935,7 +935,7 @@ const UNAVAILABLE_LABEL: Record<AttemptUnavailableReason, string> = {
   "no-stage-events":
     "the stage's record says it ran, and no lifecycle event of it is retained",
   "unproven-boundary":
-    "the retained events contradict each other (an execution ends with no start recorded, or a redrive starts while an execution has no recorded end), so nothing proves where one attempt stops",
+    "the retained events contradict each other or cannot be attributed (an execution ends with no start recorded, a redrive starts while an execution has no recorded end, or an earlier execution that kept running recorded its outcome after a later one started), so nothing proves where one attempt stops",
   "invalid-event-time": "a retained event of the run has no readable time",
   "run-inconsistent":
     "the run's retained events contradict the order the engine writes them in or the run's record, which rows removed from the end of its outbox leave behind",

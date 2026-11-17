@@ -202,6 +202,14 @@ export interface StageEvent {
   error: string | null;
   /** True when `error` was cut at `STAGE_EVENT_ERROR_LIMIT` characters. */
   errorTruncated: boolean;
+  /**
+   * The row's `causationId` on `stage:*` events, null on the run-level ones
+   * (`run.create` writes the caller's idempotency key there). One
+   * `job.execute` writes a stage's start and that execution's end under one
+   * id, which is how the page finds an end recorded by an earlier execution.
+   * Optional: without it that check is skipped.
+   */
+  causationId?: string | null;
 }
 
 /**
@@ -421,11 +429,30 @@ export interface ConsoleReadPort {
   readonly capabilities: ConsoleCapabilities;
 
   listRuns(query: RunListQuery): Promise<RunListPage>;
+  /**
+   * The run, its rows and its events as of one moment: the attempt history
+   * checks the stage rows against the events, so a stage that changes
+   * between the read of its row and the read of its events would read as a
+   * contradiction. The Prisma reader reads in one REPEATABLE READ
+   * transaction on Postgres and one transaction on SQLite; inside a
+   * transaction the caller hands it, that transaction's isolation decides.
+   * A reader that cannot read at one moment still works: such a stage is
+   * shown as unavailable, naming the field that disagrees, until a later
+   * read sees the stage at one moment again (the page reads again on its
+   * next poll).
+   */
   getRunDetail(
     runId: string,
     options?: RunDetailOptions,
   ): Promise<RunDetail | null>;
-  /** Incremental tail of one run's timeline. `afterSequence` of 0 returns from the start. */
+  /**
+   * Incremental tail of one run's timeline. `afterSequence` of 0 returns
+   * from the start. An empty answer means the run has no row after
+   * `afterSequence`; an answer shorter than `limit` does not mean it has
+   * caught up: the Prisma reader reads the `limit` sequences that start at
+   * the first row it finds, so it returns fewer rows where some of those
+   * were removed. Read again from the last sequence.
+   */
   listRunEvents(
     runId: string,
     afterSequence: number,

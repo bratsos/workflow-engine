@@ -234,7 +234,10 @@ The checks against the records, none of which rests on the numbering:
   after a redrive the row's `attempt` must be one of the values these rules
   give for the recorded executions; its `startedAt` with the last
   `stage:started`, its `completedAt` with the event that ended it, and its
-  error with the last error event. The engine stamps the row and writes the
+  error with the last error event. After a redrive the row's status and
+  error may also be the ones it had before the redrive (a row the redrive
+  kept, such as a stage left cancelled by a redrive from a later stage), with
+  a later cancel applied. The engine stamps the row and writes the
   event in one transaction, the row first, so a row stamped after the last
   retained event shows that the events after it are not retained. These are
   the only time comparisons that decide whether the history is shown, and
@@ -243,13 +246,23 @@ The checks against the records, none of which rests on the numbering:
   `completedAt` with the `stage:completed` or `stage:failed` written with
   it), so a run spread over hosts whose clocks differ is not made unavailable
   by them. Everything else is ordered by sequence.
+- **Only what every store writes alike is read.** The stores differ in one
+  field the checks could read: before a stage first starts, the Prisma store
+  has stamped its row's `startedAt` with the time it created the row (when
+  the claim, a transition or a redrive creates it, and on rows written by
+  every earlier release), and the in-memory store leaves it null. So
+  `startedAt` is compared only after a retained `stage:started` with no
+  redrive since, when `job.execute` has stamped it on every store, and a
+  stage with no event of its own is read from its status and `attempt`
+  alone. A custom read port may return either form.
 
 Every count and label in the section is about recorded events: "First run
 recorded", "2 recorded attempts". A stage shows *No start of this stage is
 recorded* only when the events cover the run from its first event, none of
-them is of that stage, and its record was never stamped by a start
-(`startedAt` is null, `attempt` is 0, and it is `PENDING`, `SKIPPED` or
-`CANCELLED`).
+them is of that stage, and its record says it has not run: it is `PENDING`,
+`SKIPPED` or `CANCELLED` with an `attempt` the rules above give before any
+execution (0, or the value a redrive created it at). Its `startedAt` is not
+read for this, for the reason above.
 
 When the evidence is missing, the stage falls back to the flat view (the stage
 timeline above and the step ledger below show its latest attempt) and says
@@ -271,7 +284,12 @@ that the per-attempt history is unavailable, with the reason:
   before this existed);
 - the stage's record says it ran, and no lifecycle event of it is retained;
 - the retained events contradict each other (an execution ends with no start
-  recorded, or a redrive starts while an execution has no recorded end);
+  recorded, or a redrive starts while an execution has no recorded end), or
+  cannot be attributed: one `job.execute` writes a stage's start and that
+  execution's end under one causation id, so an end written under the id of
+  an earlier retained start is the outcome of an earlier execution that kept
+  running (after a cancel or a lost lease) and was recorded after a later one
+  started, and which attempt it ended is not known;
 - a retained event of the run has no readable time;
 - the retained events do not agree with the stage's current record, naming
   the field: its status, its attempt count, its start time, its end time or
@@ -286,14 +304,33 @@ only for those after its last sequence (`GET /api/runs/:id?stageEventsAfter=N`),
 so a refresh reads the rows the run wrote since the previous one. One read
 covers at most 10,000 of the run's outbox sequences and returns at most 2,000
 events; when rows remain, the page asks again from where the read stopped, at
-once, until it has caught up. With polling off the page makes no request on
+once, until it has caught up, at most four such reads per poll interval: at
+the default 5-second interval a run of 400,000 sequences takes 40 reads,
+about 50 seconds, and its stages say the history is still being read until
+then. With polling off the page makes no request on
 its own, these included: *Refresh now* reads one more part, and turning
 polling back on continues from what the page holds. Each such request
 needs the previous one to have advanced, so a reader that stops advancing is
 asked again only by the poll. What one read costs is therefore bounded
 whatever the run's size: on Postgres a first read of a run of 400,000 rows is
-the same 10,000-row index range as one of 10,000 rows, and that run is caught
-up in 40 reads. A view of one run only ever merges responses to its own
+the same 10,000-row index range as one of 10,000 rows. Each statement on a
+run's outbox rows is written so that its plan does not depend on the table's
+statistics: the run's highest sequence is read as `ORDER BY sequence DESC
+LIMIT 1`, not `max(sequence)`, which Postgres plans as a scan of the run's
+whole range when stale statistics expect one row for the run. The tests
+measure each statement with no statistics, with statistics of the empty
+table, with current ones, and with stale ones (taken while one run held a
+few rows, then grown), on Postgres by pages read and on SQLite by plan.
+
+The run's rows and its events are read at one moment, so a stage that ends
+between two of the read's statements is never shown as a contradiction: the
+Prisma reader reads in one `REPEATABLE READ` transaction on Postgres and one
+transaction on SQLite. Inside a transaction you hand it (the row-level
+security setup) that transaction's isolation decides; at `READ COMMITTED` a
+stage that changes during the read can show as unavailable, naming the
+field, until the next poll reads it at one moment. A custom
+`ConsoleReadPort` should return the run detail as of one moment; one that
+does not gets the same fallback, never a wrong history. A view of one run only ever merges responses to its own
 requests: a response that does not continue what the page holds (a late one,
 or one for another run) changes nothing. Rows missing from what was read keep
 the history unavailable until the page is reloaded.

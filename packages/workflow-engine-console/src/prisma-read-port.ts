@@ -167,8 +167,9 @@ const STAGE_EVENT_COLUMNS: RawColumns = {
   occurredAt: "timestamp",
   stageId: "text",
   error: "text",
+  causationId: "text",
 };
-const EVENT_TOP_COLUMNS: RawColumns = { maxSeq: "int" };
+const EVENT_TOP_COLUMNS: RawColumns = { sequence: "int" };
 const EVENT_COUNT_COLUMNS: RawColumns = { total: "bigint" };
 const SUSPENDED_STAGE_COLUMNS: RawColumns = {
   id: "text",
@@ -362,10 +363,11 @@ interface RawStageEventRow {
   occurredAt: RawTimestamp;
   stageId: string | null;
   error: string | null;
+  causationId: string | null;
 }
 
 interface RawEventTopRow {
-  maxSeq: number | bigint | null;
+  sequence: number | bigint;
 }
 
 interface RawEventCountRow {
@@ -556,6 +558,10 @@ function mapStageEvent(row: RawStageEventRow): StageEvent {
     ...cutStageEventError(
       row.error !== null && row.error !== undefined ? String(row.error) : null,
     ),
+    causationId:
+      row.causationId !== null && row.causationId !== undefined
+        ? String(row.causationId)
+        : null,
   };
 }
 
@@ -604,6 +610,34 @@ function mapCostBucket(row: RawCostRow): CostBucket {
     cost: toNumber(row.cost),
     tokens: toNumber(row.tokens),
   };
+}
+
+/** Thrown inside `read` when Postgres refuses to set the isolation level. */
+const CALLERS_TRANSACTION = Symbol("inside the caller's transaction");
+
+/**
+ * SQLSTATE 25001 (active SQL transaction): `SET TRANSACTION ISOLATION LEVEL`
+ * in a savepoint, or after the transaction's first query.
+ */
+function isLevelRefused(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const e = error as {
+    code?: unknown;
+    meta?: {
+      code?: unknown;
+      driverAdapterError?: { cause?: { originalCode?: unknown } };
+    };
+    message?: unknown;
+  };
+  return (
+    [
+      e.code,
+      e.meta?.code,
+      e.meta?.driverAdapterError?.cause?.originalCode,
+    ].includes("25001") ||
+    (typeof e.message === "string" &&
+      e.message.includes("SET TRANSACTION ISOLATION LEVEL must"))
+  );
 }
 
 export class PrismaConsoleReadPort implements ConsoleReadPort {
@@ -702,8 +736,16 @@ export class PrismaConsoleReadPort implements ConsoleReadPort {
    * that needs more than one statement issues all of them here, inside a
    * single transaction — a run-detail page is up to nine queries, and giving
    * each its own interactive transaction would take that many connections out
-   * of the consumer's pool to render one page. One transaction also means the
-   * results are a coherent snapshot rather than separate moments.
+   * of the consumer's pool to render one page.
+   *
+   * One transaction is not by itself one moment: at Postgres's default READ
+   * COMMITTED each statement sees what was committed when it began. A read
+   * whose statements are checked against each other (`snapshot`, the run
+   * detail: the stage rows against the run's events) therefore opens its
+   * transaction REPEATABLE READ on Postgres, so every statement sees the
+   * moment of the first. A SQLite transaction is one moment already: a
+   * writer cannot commit while it reads, or (in WAL mode) commits a version
+   * it does not see.
    *
    * The transaction is opened only when we were handed a root client. When
    * `$transaction` is absent we are already inside the caller's transaction
@@ -712,15 +754,22 @@ export class PrismaConsoleReadPort implements ConsoleReadPort {
    * silently re-time the remainder of a transaction the console did not
    * open and does not get to reconfigure. Timeouts in that case are the
    * caller's to set, and a cancellation is still reported honestly because
-   * the catch below does not care who set the limit.
+   * the catch below does not care who set the limit. So is the isolation
+   * level: inside the caller's transaction the statements see what its level
+   * gives them, and one moment needs that transaction to be REPEATABLE READ.
+   * A transaction client that has `$transaction` of its own (Prisma 7 nests
+   * one as a savepoint) is told apart by Postgres itself: it refuses to set
+   * the level of a transaction that is a savepoint or has already read, the
+   * savepoint is rolled back, and the read runs again at the caller's level.
    */
   private async read<T>(
     label: string,
     fn: (client: ConsolePrismaClient) => Promise<T>,
+    snapshot = false,
   ): Promise<T> {
     try {
       if (
-        this.statementTimeoutMs > 0 &&
+        (this.statementTimeoutMs > 0 || snapshot) &&
         typeof this.prisma.$transaction === "function"
       ) {
         const ms = this.statementTimeoutMs;
@@ -729,16 +778,27 @@ export class PrismaConsoleReadPort implements ConsoleReadPort {
             this.databaseType === "postgresql" &&
             typeof tx.$executeRawUnsafe === "function"
           ) {
+            // Before any query of the transaction, as Postgres requires.
+            if (snapshot)
+              await tx
+                .$executeRawUnsafe(
+                  "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+                )
+                .catch((error: unknown) => {
+                  throw isLevelRefused(error) ? CALLERS_TRANSACTION : error;
+                });
             // `ms` is a validated integer, and a bare number here is
             // milliseconds. It is the one interpolated value in this file
             // besides the enum name.
-            await tx.$executeRawUnsafe(`SET LOCAL statement_timeout = ${ms}`);
+            if (ms > 0)
+              await tx.$executeRawUnsafe(`SET LOCAL statement_timeout = ${ms}`);
           }
           return await fn(tx);
         });
       }
       return await fn(this.prisma);
     } catch (error) {
+      if (error === CALLERS_TRANSACTION) return this.read(label, fn);
       if (isStatementTimeout(error)) {
         throw new ConsoleQueryTimeoutError(label, this.statementTimeoutMs, {
           cause: error,
@@ -859,18 +919,21 @@ LIMIT ${limit + 1}`;
   /**
    * The attempt history's events of one run with a sequence above `after`.
    *
-   * What a read costs is bounded whatever the run's size: every statement is
-   * a range scan on the `(workflowRunId, sequence)` unique index, and the
-   * range is at most `STAGE_EVENT_WINDOW` sequences past `after`. `eventType`
+   * What a read costs is bounded whatever the run's size, in every state of
+   * the table's statistics (none, empty, current, stale): the highest
+   * sequence is one backward probe of the `(workflowRunId, sequence)` unique
+   * index, and the other statements are range scans on it of at most
+   * `STAGE_EVENT_WINDOW` sequences past `after`. `eventType`
    * has no index, so the lifecycle statement filters the heap rows of its
    * range; the window caps that, and the page passing the last sequence it
    * has read makes a poll read only the rows written since the previous one.
    * A first read of a long run is a few bounded reads, each continuing from
    * the last.
    *
-   * The read is closed at the run's highest sequence, taken first: the
-   * transaction is READ COMMITTED on Postgres, so a row committed between the
-   * statements must not be skipped by the page's next read. At most
+   * The read is closed at the run's highest sequence, taken first: inside a
+   * caller's READ COMMITTED transaction a row committed between the
+   * statements would be seen by the later ones, and must not be skipped by
+   * the page's next read. At most
    * `STAGE_EVENT_LIMIT` events come back; when more match, the read ends at
    * its last event. Either cut says `more`, and the page asks again from
    * `lastSequence`. The range check counts only the rows the read covers. A
@@ -885,13 +948,18 @@ LIMIT ${limit + 1}`;
     const after = Number.isFinite(afterRaw)
       ? Math.min(Math.max(0, Math.floor(afterRaw)), 2_147_483_647)
       : 0;
+    // Not `max(sequence)`: Postgres plans that aggregate as a backward probe
+    // of the index only when its statistics show the run as more than one
+    // row, and otherwise reads the run's whole index range. This form is the
+    // backward probe whatever the statistics say.
     const top = await this.select<RawEventTopRow>(
       client,
       EVENT_TOP_COLUMNS,
-      `SELECT max(sequence) AS "maxSeq" FROM "outbox_events" WHERE "workflowRunId" = ${this.param(1)}`,
+      `SELECT sequence FROM "outbox_events" WHERE "workflowRunId" = ${this.param(1)}
+ORDER BY sequence DESC LIMIT 1`,
       [runId],
     );
-    const maxSeq = toNumber(top[0]?.maxSeq);
+    const maxSeq = top[0] ? toNumber(top[0].sequence) : 0;
     if (maxSeq <= after) {
       // Below `after`: rows past what the page holds were removed, and what
       // it holds may no longer be the run's rows.
@@ -928,7 +996,8 @@ LIMIT ${limit + 1}`;
       STAGE_EVENT_COLUMNS,
       `SELECT sequence, "eventType", "occurredAt",
        ${payloadField("stageId")} AS "stageId",
-       CASE WHEN "eventType" IN ('stage:retrying', 'stage:failed') THEN substr(${payloadField("error")}, 1, ${STAGE_EVENT_ERROR_LIMIT + 1}) END AS error
+       CASE WHEN "eventType" IN ('stage:retrying', 'stage:failed') THEN substr(${payloadField("error")}, 1, ${STAGE_EVENT_ERROR_LIMIT + 1}) END AS error,
+       CASE WHEN "eventType" LIKE 'stage:%' THEN "causationId" END AS "causationId"
 FROM "outbox_events"
 WHERE "workflowRunId" = ${this.param(1)} AND sequence > ${this.param(2)} AND sequence <= ${this.param(3)}
   AND "eventType" IN (${types})
@@ -969,131 +1038,136 @@ WHERE "workflowRunId" = ${this.param(1)} AND sequence > ${this.param(2)} AND seq
     const logLimit = clampLimit(options?.logLimit, 200);
     const eventLimit = clampLimit(options?.eventLimit, 200);
 
-    // All statements share one transaction: that many interactive transactions
-    // to render one page would take as many connections out of the consumer's
-    // pool, and the results would be different moments.
-    return this.read("run.detail", async (client) => {
-      const runRows = await this.select<RawRunDetailRow>(
-        client,
-        RUN_DETAIL_COLUMNS,
-        `SELECT id, "createdAt", "updatedAt", "workflowId", "workflowName", "workflowType",
+    // All statements share one transaction, at one moment (see `read`): that
+    // many interactive transactions to render one page would take as many
+    // connections out of the consumer's pool, and a stage that changes
+    // between two of them would read as rows and events that disagree.
+    return this.read(
+      "run.detail",
+      async (client) => {
+        const runRows = await this.select<RawRunDetailRow>(
+          client,
+          RUN_DETAIL_COLUMNS,
+          `SELECT id, "createdAt", "updatedAt", "workflowId", "workflowName", "workflowType",
        status, "startedAt", "completedAt", duration, "totalCost", "totalTokens", priority,
        "definitionVersion", "redriveCount",
        input, output, config, metadata
 FROM "workflow_runs" WHERE id = ${this.param(1)}`,
-        [runId],
-      );
+          [runId],
+        );
 
-      // A run that does not exist costs one statement, not six.
-      const runRow = runRows[0];
-      if (!runRow) return null;
-      const run = {
-        ...mapRunSummary(runRow),
-        input: runRow.input,
-        output: runRow.output,
-        config: runRow.config,
-        metadata: runRow.metadata,
-      };
-      const after = Math.max(0, Math.floor(options?.stageEventsAfter ?? 0));
-      // The next part of a long history: two statements, not nine.
-      if (options?.stageEventsOnly) {
-        return {
-          run,
-          stages: [],
-          steps: [],
-          annotations: [],
-          logs: [],
-          events: [],
-          stageEvents: await this.readStageEvents(client, runId, after),
-          truncated: {
-            steps: false,
-            annotations: false,
-            logs: false,
-            events: false,
-          },
-        } satisfies RunDetail;
-      }
+        // A run that does not exist costs one statement, not six.
+        const runRow = runRows[0];
+        if (!runRow) return null;
+        const run = {
+          ...mapRunSummary(runRow),
+          input: runRow.input,
+          output: runRow.output,
+          config: runRow.config,
+          metadata: runRow.metadata,
+        };
+        const after = Math.max(0, Math.floor(options?.stageEventsAfter ?? 0));
+        // The next part of a long history: two statements, not nine.
+        if (options?.stageEventsOnly) {
+          return {
+            run,
+            stages: [],
+            steps: [],
+            annotations: [],
+            logs: [],
+            events: [],
+            stageEvents: await this.readStageEvents(client, runId, after),
+            truncated: {
+              steps: false,
+              annotations: false,
+              logs: false,
+              events: false,
+            },
+          } satisfies RunDetail;
+        }
 
-      const stageRows = await this.select<RawStageRow>(
-        client,
-        STAGE_COLUMNS,
-        `SELECT id, "workflowRunId", "stageId", "stageName", "stageNumber", "executionGroup",
+        const stageRows = await this.select<RawStageRow>(
+          client,
+          STAGE_COLUMNS,
+          `SELECT id, "workflowRunId", "stageId", "stageName", "stageNumber", "executionGroup",
        attempt, status, "startedAt", "completedAt", duration, "nextPollAt",
        "pollInterval", "maxWaitUntil", "errorMessage"
 FROM "workflow_stages" WHERE "workflowRunId" = ${this.param(1)}
 ORDER BY "stageNumber" ASC, "stageId" ASC`,
-        [runId],
-      );
+          [runId],
+        );
 
-      const stepRows = await this.select<RawStepRow>(
-        client,
-        STEP_COLUMNS,
-        `SELECT s.id, s."stageRecordId", s."stepId", s.seq, s.kind, s.status, s.attempt,
+        const stepRows = await this.select<RawStepRow>(
+          client,
+          STEP_COLUMNS,
+          `SELECT s.id, s."stageRecordId", s."stepId", s.seq, s.kind, s.status, s.attempt,
        s."leaseExpiresAt", s."deadlineAt", s."externalKey", s.error, s."createdAt", s."updatedAt"
 FROM "workflow_steps" s
 JOIN "workflow_stages" st ON st.id = s."stageRecordId"
 WHERE st."workflowRunId" = ${this.param(1)}
 ORDER BY st."stageNumber" ASC, s.seq ASC
 LIMIT ${stepLimit + 1}`,
-        [runId],
-      );
+          [runId],
+        );
 
-      const annotationRows = await this.select<RawAnnotationRow>(
-        client,
-        ANNOTATION_COLUMNS,
-        `SELECT id, "createdAt", "workflowRunId", "workflowStageRecordId", attempt, scope,
+        const annotationRows = await this.select<RawAnnotationRow>(
+          client,
+          ANNOTATION_COLUMNS,
+          `SELECT id, "createdAt", "workflowRunId", "workflowStageRecordId", attempt, scope,
        "scopeId", "actorKind", "actorId", key, value
 FROM "workflow_annotations" WHERE "workflowRunId" = ${this.param(1)}
 ORDER BY "createdAt" DESC, id DESC
 LIMIT ${annotationLimit + 1}`,
-        [runId],
-      );
+          [runId],
+        );
 
-      const logRows = await this.select<RawLogRow>(
-        client,
-        LOG_COLUMNS,
-        `SELECT id, "createdAt", "workflowRunId", "workflowStageId", level, message
+        const logRows = await this.select<RawLogRow>(
+          client,
+          LOG_COLUMNS,
+          `SELECT id, "createdAt", "workflowRunId", "workflowStageId", level, message
 FROM "workflow_logs" WHERE "workflowRunId" = ${this.param(1)}
 ORDER BY "createdAt" DESC, id DESC
 LIMIT ${logLimit + 1}`,
-        [runId],
-      );
+          [runId],
+        );
 
-      const eventRows = await this.select<RawEventRow>(
-        client,
-        EVENT_COLUMNS,
-        `SELECT id, "workflowRunId", sequence, "eventType", "occurredAt", "publishedAt",
+        const eventRows = await this.select<RawEventRow>(
+          client,
+          EVENT_COLUMNS,
+          `SELECT id, "workflowRunId", sequence, "eventType", "occurredAt", "publishedAt",
        "retryCount", "dlqAt"
 FROM "outbox_events" WHERE "workflowRunId" = ${this.param(1)}
 ORDER BY sequence ASC
 LIMIT ${eventLimit + 1}`,
-        [runId],
-      );
+          [runId],
+        );
 
-      const stageEvents = await this.readStageEvents(client, runId, after);
+        const stageEvents = await this.readStageEvents(client, runId, after);
 
-      // Each list asked for one row more than it will show, so "there is
-      // more than this" is known without a second count.
-      const truncated = {
-        steps: stepRows.length > stepLimit,
-        annotations: annotationRows.length > annotationLimit,
-        logs: logRows.length > logLimit,
-        events: eventRows.length > eventLimit,
-      };
+        // Each list asked for one row more than it will show, so "there is
+        // more than this" is known without a second count.
+        const truncated = {
+          steps: stepRows.length > stepLimit,
+          annotations: annotationRows.length > annotationLimit,
+          logs: logRows.length > logLimit,
+          events: eventRows.length > eventLimit,
+        };
 
-      return {
-        run,
-        stages: stageRows.map(mapStageSummary),
-        steps: stepRows.slice(0, stepLimit).map(mapStepSummary),
-        annotations: annotationRows
-          .slice(0, annotationLimit)
-          .map(mapAnnotationSummary),
-        logs: logRows.slice(0, logLimit).map(mapLogEntry),
-        events: eventRows.slice(0, eventLimit).map(mapRunEvent),
-        stageEvents,
-        truncated,
-      } satisfies RunDetail;
-    });
+        return {
+          run,
+          stages: stageRows.map(mapStageSummary),
+          steps: stepRows.slice(0, stepLimit).map(mapStepSummary),
+          annotations: annotationRows
+            .slice(0, annotationLimit)
+            .map(mapAnnotationSummary),
+          logs: logRows.slice(0, logLimit).map(mapLogEntry),
+          events: eventRows.slice(0, eventLimit).map(mapRunEvent),
+          stageEvents,
+          truncated,
+        } satisfies RunDetail;
+      },
+      true,
+    );
   }
 
   async listRunEvents(
@@ -1102,15 +1176,32 @@ LIMIT ${eventLimit + 1}`,
     limit?: number,
   ): Promise<RunEvent[]> {
     const clampedLimit = clampLimit(limit, 200);
-    const rows = await this.query<RawEventRow>(
-      "run.events.tail",
-      EVENT_COLUMNS,
-      `SELECT id, "workflowRunId", sequence, "eventType", "occurredAt", "publishedAt",
+    // Two statements, so that neither plan depends on the table's
+    // statistics: the first row after the cursor is a forward probe of the
+    // run's index, and the page is read within the next `limit` sequences
+    // from it. A single `sequence > $2 ORDER BY sequence LIMIT n` is planned as
+    // a sort of the run's whole remaining range when the planner expects
+    // fewer than `n` rows (no statistics, or stale ones).
+    const rows = await this.read("run.events.tail", async (client) => {
+      const start = await this.select<RawEventTopRow>(
+        client,
+        EVENT_TOP_COLUMNS,
+        `SELECT sequence FROM "outbox_events" WHERE "workflowRunId" = ${this.param(1)} AND sequence > ${this.param(2)}
+ORDER BY sequence ASC LIMIT 1`,
+        [runId, Math.floor(afterSequence)],
+      );
+      if (!start[0]) return [];
+      const first = toNumber(start[0].sequence);
+      return this.select<RawEventRow>(
+        client,
+        EVENT_COLUMNS,
+        `SELECT id, "workflowRunId", sequence, "eventType", "occurredAt", "publishedAt",
        "retryCount", "dlqAt"
-FROM "outbox_events" WHERE "workflowRunId" = ${this.param(1)} AND sequence > ${this.param(2)}
+FROM "outbox_events" WHERE "workflowRunId" = ${this.param(1)} AND sequence >= ${this.param(2)} AND sequence < ${this.param(3)}
 ORDER BY sequence ASC LIMIT ${clampedLimit}`,
-      [runId, Math.floor(afterSequence)],
-    );
+        [runId, first, first + clampedLimit],
+      );
+    });
     return rows.map(mapRunEvent);
   }
 
