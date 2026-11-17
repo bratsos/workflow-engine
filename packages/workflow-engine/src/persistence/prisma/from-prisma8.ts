@@ -353,9 +353,31 @@ const sqliteRoot = (x: Executor, plan: { meta?: { target?: string } }) =>
 
 const affected = async (x: Executor, q: Sql): Promise<number> => {
   const { plan } = buildPlan(x, q);
-  if (sqliteRoot(x, plan)) await inTurn(x);
-  return (await x.execute(plan)).affectedRows;
+  if (!sqliteRoot(x, plan)) return (await x.execute(plan)).affectedRows;
+  await inTurn(x);
+  try {
+    return (await x.execute(plan)).affectedRows;
+  } catch (error) {
+    // WAL: a root read still handing over rows keeps the root on a snapshot
+    // older than another connection's commit, and a write on it fails at once
+    // with SQLITE_BUSY_SNAPSHOT. Nothing ran; once those reads end it can.
+    const gate = readGates.get(x);
+    if (!gate || gate.closed || !staleSnapshot(error)) throw error;
+    return (await withoutReads(gate, () => x.execute(plan))).affectedRows;
+  }
 };
+
+function staleSnapshot(error: unknown): boolean {
+  for (
+    let depth = 0;
+    depth < 5 && error && typeof error === "object";
+    depth++
+  ) {
+    if ((error as { errcode?: unknown }).errcode === 517) return true;
+    error = (error as { cause?: unknown }).cause;
+  }
+  return false;
+}
 
 let nulReadable: boolean | undefined;
 /**
@@ -651,6 +673,77 @@ async function rootWrite(
   }
 }
 
+/**
+ * Root reads in flight on a SQLite root client. The driver hands rows over one
+ * at a time across microtasks, so a root read that returns rows holds its read
+ * lock between them; on a rollback-journal file a transaction's COMMIT on
+ * another connection of the same process then waits its busy_timeout
+ * synchronously, the read cannot finish meanwhile, and the commit fails.
+ */
+interface ReadGate {
+  reading: number;
+  drained?: () => void;
+  /** Set while a write waits for the reads in flight; new root reads wait for it. */
+  closed?: Promise<void>;
+  wal?: boolean;
+}
+const readGates = new WeakMap<object, ReadGate>();
+
+/**
+ * `db.transaction(fn)` for the adapter's own transactions. On a rollback-journal
+ * file the commit waits for the root reads in flight to finish, and root reads
+ * that start meanwhile wait for the commit. A WAL file is left as it is: there
+ * a commit does not wait for readers. Adapter transactions run one at a time
+ * (the root write queue), and a read made inside `fn` has ended before it.
+ */
+function transactionOf<T>(
+  db: Prisma8Db,
+  fn: (raw: Executor) => Promise<T>,
+): Promise<T> {
+  const gate = readGates.get(db);
+  if (!gate) return db.transaction(fn);
+  let open: (() => void) | undefined;
+  return db
+    .transaction(async (raw: Executor) => {
+      const result = await fn(raw);
+      gate.wal ??=
+        (
+          await rowsOf(raw, new Sql().t("PRAGMA journal_mode"), {
+            journal_mode: SQLITE_TYPES.text!,
+          })
+        )[0]?.journal_mode === "wal";
+      if (!gate.wal) open = await closeReads(gate);
+      return result;
+    })
+    .finally(() => open?.());
+}
+
+/** Holds new root reads back and waits for those in flight; returns the release. */
+async function closeReads(gate: ReadGate): Promise<() => void> {
+  let open!: () => void;
+  gate.closed = new Promise<void>((resolve) => {
+    open = resolve;
+  });
+  while (gate.reading > 0)
+    await new Promise<void>((resolve) => {
+      gate.drained = resolve;
+    });
+  gate.drained = undefined;
+  return () => {
+    gate.closed = undefined;
+    open();
+  };
+}
+
+async function withoutReads<T>(gate: ReadGate, work: () => Promise<T>) {
+  const open = await closeReads(gate);
+  try {
+    return await work();
+  } finally {
+    open();
+  }
+}
+
 /** Rows for `spec` (column -> codec id); timestamps come back as `Date`. Not public API. */
 export async function rowsOf(
   x: Executor,
@@ -663,7 +756,16 @@ export async function rowsOf(
   if (wire.statement && !wire.statement.read && sqliteRoot(x, wire.plan)) {
     await inTurn(x);
     rows = await rootWrite(x, q, wire.plan, wire.statement);
-  } else rows = await x.query(wire.plan).toArray();
+  } else {
+    const gate = readGates.get(x);
+    while (gate?.closed) await gate.closed;
+    if (gate) gate.reading++;
+    try {
+      rows = await x.query(wire.plan).toArray();
+    } finally {
+      if (gate && --gate.reading === 0) gate.drained?.();
+    }
+  }
   if (wire.overflow)
     for (const row of rows) {
       if (row[wire.overflow])
@@ -1509,7 +1611,7 @@ function delegate(x: Executor, m: Model, schedule?: Schedule) {
       // share a transaction, inside a `tx` they use it.
       return statements.length > 1 &&
         typeof (e as Partial<Prisma8Db>).transaction === "function"
-        ? (e as Prisma8Db).transaction(run)
+        ? transactionOf(e as Prisma8Db, run)
         : run(e);
     }),
     update: op("update", ["where", "data", "select"], async (e, a) => {
@@ -1746,6 +1848,7 @@ export function fromPrisma8(
   );
   const root = typeof (db as Partial<Prisma8Db>).transaction === "function";
   const queue = sqlite && root ? queueOf(db) : undefined;
+  if (queue && !readGates.has(db)) readGates.set(db, { reading: 0 });
   const delegates = new WeakMap<Executor, Record<string, unknown>>();
 
   const client = (
@@ -1823,7 +1926,7 @@ export function fromPrisma8(
       const run = async () => {
         let open: ReturnType<typeof deadline> | undefined;
         try {
-          return await (db as Prisma8Db).transaction(async (raw: Executor) => {
+          return await transactionOf(db as Prisma8Db, async (raw: Executor) => {
             const lease = deadline(
               options.timeout ?? (callback ? DEFAULT_TIMEOUT : undefined),
             );

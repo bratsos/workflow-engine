@@ -130,6 +130,10 @@ Both are `lastError` prefixes the lease sweep stamps on `job_queue`, so an opera
 
 The body that lost its lease learns of it through `ctx.abortSignal` (a `StageAbortedError` with `reason: "lease-lost"`) on the next heartbeat; its outcome, if it finishes anyway, is discarded as `"superseded"` by the fenced acknowledgement. A `run.cancel` aborts the same signal with `reason: "cancelled"`. Use `stageAbortReason(signal)` to read it.
 
+## Prisma 8 SQLite: `Transaction commit failed` after about 5 seconds
+
+Symptom: on a SQLite file in the default rollback-journal mode, your own `db.transaction(...)` (one you open on the Prisma 8 client, not the adapter's `$transaction`) fails with `Transaction commit failed` after the busy timeout, while the engine runs in the same process. Cause: a root read of the wrapped client was still handing over rows, holding the file's read lock, and the commit waited for it synchronously, so the read could not finish. The adapter's own transactions wait for those reads; yours cannot. Fix: turn on WAL once on the file (`PRAGMA journal_mode=WAL`, see [05-persistence-setup.md](05-persistence-setup.md)), or build the ports over your transaction's `tx` and do not read through the root client while it is open.
+
 ## Errors A Durable Stage Can Throw
 
 | Error | Thrown when | What to do |

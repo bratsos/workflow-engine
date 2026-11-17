@@ -379,3 +379,81 @@ describe.skipIf(!realDatabase)(
     );
   },
 );
+
+// The Prisma 8 SQLite driver hands a root read's rows over across microtasks,
+// holding its read lock between them. An engine transaction commits on another
+// connection of the same process: on a rollback journal its COMMIT waited its
+// busy timeout synchronously and failed; in WAL a root write behind it failed
+// with SQLITE_BUSY_SNAPSHOT. Both must commit.
+describe
+  .skipIf(!sqlite || process.env.PRISMA_MAJOR !== "8")
+  .each(["delete", "wal"] as const)(
+  "an engine transaction while a root read hands over rows, journal mode %s",
+  (mode) => {
+    let db: KernelDatabase;
+    beforeAll(async () => {
+      db = await kernelDatabase();
+      if (mode === "wal")
+        await db.client
+          .$withColumns({ journal_mode: "text" })
+          .$queryRawUnsafe("PRAGMA journal_mode = WAL");
+      for (let i = 0; i < 60; i++)
+        await db.kernel.dispatch({
+          type: "run.create",
+          idempotencyKey: `seed-${i}`,
+          workflowId: db.workflow.id,
+          input: { value: "seed" },
+        });
+    }, 120_000);
+    afterAll(async () => {
+      await db?.close();
+    });
+
+    it("commits run.create while getRunsByStatus is in flight", async () => {
+      for (let round = 0; round < 3; round++) {
+        // Root reads keep starting, so one is in flight whenever the commit comes.
+        let done = false;
+        const reads = Array.from({ length: 3 }, async () => {
+          while (!done) await db.persistence.getRunsByStatus("PENDING");
+        });
+        const created = await db.kernel
+          .dispatch({
+            type: "run.create",
+            idempotencyKey: `round-${round}`,
+            workflowId: db.workflow.id,
+            input: { value: "round" },
+          })
+          .then(
+            () => "ok",
+            (error: unknown) => error,
+          );
+        done = true;
+        await Promise.all(reads);
+        expect(created).toBe("ok");
+      }
+      expect(await db.client.workflowRun.count()).toBe(63);
+    }, 120_000);
+
+    it("does not hold back a root read made inside a transaction's own callback", async () => {
+      let early: Promise<unknown> | undefined;
+      await db.client.$transaction(async (tx: any) => {
+        expect(await db.client.workflowRun.count()).toBe(63);
+        // Not awaited by the callback: the commit waits for it instead.
+        early = db.client.workflowRun
+          .findMany()
+          .then((rows: unknown[]) => rows);
+        await tx.workflowRun.create({
+          data: {
+            id: "inside",
+            workflowId: db.workflow.id,
+            workflowName: "w",
+            workflowType: "t",
+            input: {},
+          },
+        });
+      });
+      expect(await early).toHaveLength(63);
+      expect(await db.client.workflowRun.count()).toBe(64);
+    }, 30_000);
+  },
+);
