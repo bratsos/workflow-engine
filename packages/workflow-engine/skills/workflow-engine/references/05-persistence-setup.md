@@ -1403,6 +1403,17 @@ acknowledgements, `enqueueParallel`'s idempotency, `deleteByRunAndStages`,
 `clearExcept`, `compareAndSet` with and without a pinned attempt, and the
 `StepRecordPatch` null rule.
 
+Two suites wait on real time (no injectable clock, no "flush pending writes"
+call), so keep the runner's per-test timeout at its 5 s default or higher.
+`aiCallLoggerConformanceSuite` polls every 20 ms for a fire-and-forget
+`logCall` write to become visible, for at most 4 s (it slept a fixed 100 ms
+before). `jobQueueConformanceSuite`'s heartbeat test ("a touched
+(heartbeating) job survives `releaseStaleJobs` ...") sleeps 200 ms, and when a
+loaded machine stretched the gap between `touchJob` and `releaseStaleJobs` to
+half its 100 ms window it repeats on fresh jobs with a 300 ms and then a 900 ms
+threshold (2.6 s of sleeping at most); an adapter whose `touchJob` does not
+refresh the lease still fails on the first attempt.
+
 ## Database Migrations
 
 After adding the Prisma schema:

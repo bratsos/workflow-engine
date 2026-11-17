@@ -314,3 +314,10 @@ npx vitest run my-adapter.conformance.test.ts
 ```
 
 If a test block fails, the assertion will pinpoint where your adapter's state mutations, concurrency handling, or lease reaping behavior diverges from the core engine's specifications.
+
+### Timing in the suites
+
+Two suites wait on real time, because neither `JobQueue` nor `AICallLogger` has an injectable clock or a "flush pending writes" call. Keep your runner's per-test timeout at its 5 second default or higher.
+
+* **`aiCallLoggerConformanceSuite`** reads back after a fire-and-forget `logCall` by polling every 20 ms until the write is visible, for at most 4 seconds. It used to sleep a fixed 100 ms, which a database under load outgrew. An adapter whose write is already visible pays nothing; one that never makes it visible fails with the value the read returned.
+* **`jobQueueConformanceSuite`**: the test "a touched (heartbeating) job survives releaseStaleJobs while an untouched stale job is reclaimed" sleeps 200 ms, touches one job and reaps with a 100 ms threshold. It measures the time between the touch and the reap. If that reached half the window on a loaded machine, it repeats the scenario on fresh jobs with a 300 ms and then a 900 ms threshold (2.6 seconds of sleeping at most), and fails only if the survivor was reclaimed although the reap came within half a window of the touch, or if all three attempts were too slow to judge. An adapter whose `touchJob` does not refresh the lease fails on the first attempt.

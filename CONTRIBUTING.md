@@ -27,7 +27,7 @@ unless `DATABASE_URL` is set. They share one database and each truncates the
 tables between cases, so `test:pg` runs them with `--no-file-parallelism`; run
 any new Postgres-backed file through that script rather than on its own, or the
 suites will delete each other's rows and fail in ways that look like adapter
-bugs. To run them locally:
+bugs. `test:pg` and `test:sqlite` run with `--hookTimeout=30000` (the Vitest default is 10 s): every case resets the database in a `beforeEach`, and on a shared CI runner that reset has been seen to stall past 10 s. To run them locally:
 
 ```bash
 export DATABASE_URL=postgresql://postgres:postgres@localhost:5432/workflow_engine_test
