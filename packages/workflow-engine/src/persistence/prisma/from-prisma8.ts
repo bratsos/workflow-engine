@@ -237,6 +237,8 @@ const notFound = () =>
 /** A raw parameter in a form the Prisma 8 raw lane takes: `Date` and arrays are not. */
 function param(value: unknown, sqlite = false): unknown {
   if (value instanceof Date) return value.toISOString();
+  // node:sqlite binds a boolean only from Node 24.21 and 26.8; 1 and 0 are what it stores.
+  if (typeof value === "boolean" && sqlite) return Number(value);
   if (typeof value === "bigint") return sqlite ? value : String(value);
   if (Array.isArray(value)) {
     if (sqlite) fail("SQLite raw parameters do not support arrays");
@@ -317,10 +319,43 @@ function template(
 const toPlan = (x: Executor, q: Sql) =>
   x.raw.sql(Object.assign(q.parts, { raw: q.parts }), ...q.values);
 
-const affected = async (x: Executor, q: Sql): Promise<number> =>
-  (await x.execute(toPlan(x, q).affectedCount().build())).affectedRows;
+const affected = async (x: Executor, q: Sql): Promise<number> => {
+  refuseNul(x, q);
+  return (await x.execute(toPlan(x, q).affectedCount().build())).affectedRows;
+};
 
 const sqliteExecutors = new WeakSet<Executor>();
+
+let nulReadable: boolean | undefined;
+/**
+ * node:sqlite stores a NUL in TEXT, but before Node 24.16 and 26.1 (every 22.x)
+ * it reads the value back cut at the NUL: nodejs/node#61954 made the read
+ * length-aware. Tested on the running Node, not by version number.
+ * `getBuiltinModule`, not `import()`: the bundler rewrites `node:sqlite` to `sqlite`.
+ */
+function readsNul(): boolean {
+  if (nulReadable === undefined) {
+    const sqlite = process.getBuiltinModule?.("node:sqlite");
+    const db = sqlite && new sqlite.DatabaseSync(":memory:");
+    try {
+      nulReadable =
+        !db || db.prepare("SELECT ? AS v").get("a\0b")?.v === "a\0b";
+    } finally {
+      db?.close();
+    }
+  }
+  return nulReadable;
+}
+
+/** A NUL that would be read back cut changes an ID or text without an error: refuse it. */
+function refuseNul(x: Executor, q: Sql): void {
+  if (!sqliteExecutors.has(x)) return;
+  if (!q.values.some((v) => typeof v === "string" && v.includes("\0"))) return;
+  if (!readsNul())
+    fail(
+      `SQLite text containing a NUL character cannot be stored on Node ${process.versions.node}: node:sqlite reads it back cut at the NUL, which would change IDs and text without an error. Use Node 24.16+ or 26.1+, or remove the NUL`,
+    );
+}
 
 /**
  * rc.21 cannot finalize its native iterator when converting an INTEGER to a
@@ -506,6 +541,7 @@ async function rowsOf(
   q: Sql,
   spec: Record<string, string>,
 ): Promise<Row[]> {
+  refuseNul(x, q);
   const wire = sqliteExecutors.has(x) ? sqliteRead(q, spec) : { q, spec };
   const rows = await x
     .query(toPlan(x, wire.q).returnsRow(wire.spec).build())
