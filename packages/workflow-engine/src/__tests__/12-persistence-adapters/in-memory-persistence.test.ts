@@ -759,12 +759,11 @@ describe("I want to use InMemoryWorkflowPersistence in tests", () => {
       // When: I get all stages
       const stages = persistence.getAllStages();
 
-      // Then: Returns stages (may include duplicates due to indexing)
-      // Use unique stageIds to verify both stages exist
-      const uniqueStageIds = new Set(stages.map((s) => s.stageId));
-      expect(uniqueStageIds.size).toBe(2);
-      expect(uniqueStageIds.has("stage-1")).toBe(true);
-      expect(uniqueStageIds.has("stage-2")).toBe(true);
+      // Then: Each stage is returned once, though it is stored under two keys
+      expect(stages.map((s) => s.stageId).sort()).toEqual([
+        "stage-1",
+        "stage-2",
+      ]);
     });
   });
 });

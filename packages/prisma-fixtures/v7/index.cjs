@@ -2,14 +2,18 @@ const { execFileSync } = require("node:child_process");
 const { join } = require("node:path");
 const schema = require("../schema.cjs");
 
-exports.createPostgresClient = (url) => {
+// `options` are extra PrismaClient options, e.g. `log` to record the SQL.
+exports.createPostgresClient = (url, options = {}) => {
   const { PrismaClient } = require("@prisma/client");
   const { PrismaPg } = require("@prisma/adapter-pg");
-  return new PrismaClient({ adapter: new PrismaPg({ connectionString: url }) });
+  return new PrismaClient({
+    adapter: new PrismaPg({ connectionString: url }),
+    ...options,
+  });
 };
 
 // Generates a SQLite client and creates every table in `file`, then connects.
-exports.createSqliteClient = (file) => {
+exports.createSqliteClient = (file, options = {}) => {
   const sqlite = schema.sqlite(__dirname, { withUrl: false });
   const url = `file:${file}`;
   const prisma = (...args) =>
@@ -22,5 +26,8 @@ exports.createSqliteClient = (file) => {
   prisma("db", "push");
   const { PrismaClient } = require(join(__dirname, ".generated/sqlite-client"));
   const { PrismaBetterSqlite3 } = require("@prisma/adapter-better-sqlite3");
-  return new PrismaClient({ adapter: new PrismaBetterSqlite3({ url }) });
+  return new PrismaClient({
+    adapter: new PrismaBetterSqlite3({ url }),
+    ...options,
+  });
 };

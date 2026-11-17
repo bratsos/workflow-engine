@@ -255,6 +255,13 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
     return true;
   }
 
+  /** Every stage record once (stages are stored under two keys, by id and by run and stage id). */
+  private uniqueStages(): WorkflowStageRecord[] {
+    return Array.from(
+      new Map(Array.from(this.stages.values(), (s) => [s.id, s])).values(),
+    );
+  }
+
   /** Stage records of a run, deduplicated (stages are stored under two keys). */
   private stageRecordsOf(runId: string): WorkflowStageRecord[] {
     const seen = new Set<string>();
@@ -1076,11 +1083,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
     const stages = emptyActiveStatusCounts();
     let suspendedDue = 0;
     let oldestSuspendedDueAt: Date | null = null;
-    const seenStages = new Set<string>();
-    for (const stage of this.stages.values()) {
-      // Stages are stored under two keys; count each record once.
-      if (seenStages.has(stage.id)) continue;
-      seenStages.add(stage.id);
+    for (const stage of this.uniqueStages()) {
       if (!isActiveStatus(stage.status)) continue;
       stages[stage.status]++;
       if (
@@ -1155,10 +1158,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
    * Get all stages for inspection
    */
   getAllStages(): WorkflowStageRecord[] {
-    // Filter out composite key duplicates
-    return Array.from(this.stages.values())
-      .filter((s) => this.stages.get(s.id) === s)
-      .map((s) => ({ ...s }));
+    return this.uniqueStages().map((s) => ({ ...s }));
   }
 
   /**

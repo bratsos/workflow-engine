@@ -465,6 +465,19 @@ export function createKernel(config: KernelConfig): Kernel {
     }
 
     // -----------------------------------------------------------------
+    // run.listVersions routes directly for the same reason: it reads the
+    // capability flag and issues ONE aggregate (`countRunsByDefinitionVersion`),
+    // so there is no second read for a snapshot to keep consistent with,
+    // and it writes nothing. A transaction would only hold a connection
+    // (on Prisma 8 SQLite it queues behind writers too). The versioning
+    // probe it awaits first is a catalogue read that is safe either way.
+    // -----------------------------------------------------------------
+    if (command.type === "run.listVersions") {
+      const result = await handleRunListVersions(command, deps);
+      return stripEvents(result);
+    }
+
+    // -----------------------------------------------------------------
     // job.execute manages its own multi-phase transactions so that
     // RUNNING status is visible immediately and long-running stage
     // execution does not hold a database transaction open.
@@ -532,9 +545,6 @@ export function createKernel(config: KernelConfig): Kernel {
             break;
           case "run.redrive":
             result = await handleRunRedrive(command, txDeps);
-            break;
-          case "run.listVersions":
-            result = await handleRunListVersions(command, txDeps);
             break;
           case "run.reapStuck":
             result = await handleRunReapStuck(command, txDeps);

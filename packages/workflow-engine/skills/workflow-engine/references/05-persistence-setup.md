@@ -1418,8 +1418,10 @@ The Prisma adapters serve `getActiveWorkStats` and `getJobStats` from the
 `outbox_events_publishedAt_idx` / `outbox_events_dlqAt_idx`. Two outbox filters
 are written to keep SQLite from driving the query off the wrong index (`dlqAt
 IS NULL` is true of every published row; `dlqAt IS NOT NULL` is not driven by
-an index): a custom SQL adapter should check its own plans with 100,000
-terminal rows present.
+an index); the first also applies to the SQLite claim's candidate select
+(`getUnpublishedOutboxEvents`). `stats-query-plans.test.ts` asserts the plans
+of the stats queries and of the claim on SQLite and Postgres. A custom SQL
+adapter should check its own plans with 100,000 terminal rows present.
 
 Two suites wait on real time (no injectable clock, no "flush pending writes"
 call), so keep the runner's per-test timeout at its 5 s default or higher.

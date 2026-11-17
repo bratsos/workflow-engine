@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { defineStage } from "../../core/stage-factory.js";
 import { defineWorkflow } from "../../core/workflow.js";
@@ -262,6 +262,24 @@ describe("run.listVersions: has it drained?", () => {
     });
     return created.workflowRunId;
   }
+
+  it("reads without opening a transaction or writing an outbox event", async () => {
+    // One aggregate query is all it reads, so no snapshot is needed.
+    const v1 = buildV1();
+    const { kernel, persistence } = createTestKernel([v1]);
+    await runToCompletion(kernel, v1.id, "k1");
+    const eventsBefore = (await persistence.getUnpublishedOutboxEvents(1000))
+      .length;
+    const withTransaction = vi.spyOn(persistence, "withTransaction");
+
+    const result = await kernel.dispatch({ type: "run.listVersions" });
+
+    expect(result.versions).toHaveLength(1);
+    expect(withTransaction).not.toHaveBeenCalled();
+    expect(await persistence.getUnpublishedOutboxEvents(1000)).toHaveLength(
+      eventsBefore,
+    );
+  });
 
   it("reports a version as undrained while any run at it still needs a host", async () => {
     const v1 = buildV1();

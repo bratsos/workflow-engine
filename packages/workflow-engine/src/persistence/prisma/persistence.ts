@@ -217,6 +217,30 @@ function isInProgressResult(result: unknown): boolean {
   );
 }
 
+/**
+ * Outbox events the next flush will deliver: not published, not dead-lettered.
+ *
+ * `OR retryCount < 0` never holds (the count starts at 0 and only rises) but
+ * makes the `dlqAt IS NULL` term unusable as an index key. Without it SQLite
+ * drives the query from `outbox_events_dlqAt_idx`, and `dlqAt IS NULL` is true
+ * of every published row, so the query walks them all: measured with 100,000
+ * published events and no `ANALYZE`, for the stats query and for the claim's
+ * candidate select alike. With it the only usable index is
+ * `outbox_events_publishedAt_idx`, which holds only the unpublished rows'
+ * NULLs.
+ *
+ * Used for the stats aggregate on both databases and, on SQLite only, for the
+ * claim's candidate select. Postgres's claim keeps the plain filter: it plans
+ * `publishedAt IS NULL AND dlqAt IS NULL ... ORDER BY workflowRunId, sequence`
+ * from `outbox_events_publishedAt_idx` plus a top-N sort once it has
+ * statistics (measured, 100,000 published rows: 0.5 ms), and the extra term
+ * would only raise its estimate of how many rows qualify.
+ */
+const LIVE_OUTBOX = {
+  publishedAt: null,
+  OR: [{ dlqAt: null }, { retryCount: { lt: 0 } }],
+};
+
 export class PrismaWorkflowPersistence implements WorkflowPersistence {
   private enums: PrismaEnumHelper;
   private databaseType: DatabaseType;
@@ -870,7 +894,11 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
    *   (covering: status and createdAt);
    * - stages by status: `workflow_stages_status_idx`;
    * - SUSPENDED stages that are due: `workflow_stages_status_idx` for the
-   *   `status` equality, `nextPollAt` filtered on the suspended rows only;
+   *   `status` equality (SQLite, no statistics), or `workflow_stages_nextPollAt_idx`
+   *   for the range (Postgres once its statistics say few stages carry a
+   *   deadline). Both stay bounded: the second reads only stages with a
+   *   deadline, and a terminal stage keeps its deadline only until its job is
+   *   settled;
    * - unpublished outbox events: `outbox_events_publishedAt_idx`, with the
    *   `dlqAt` and `occurredAt` terms read from those rows only;
    * - dead letters: `outbox_events_dlqAt_idx`.
@@ -878,11 +906,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
    * Two filters are written the way they are so the planner cannot choose a
    * plan that reads published rows (measured on SQLite, 100,000 published
    * events, no `ANALYZE`):
-   * - `dlqAt IS NULL` is true of every published row, so with it as a plain
-   *   term SQLite drove the query from `outbox_events_dlqAt_idx` and walked
-   *   them all. `OR retryCount < 0` never holds (the count starts at 0 and
-   *   only rises) but makes the term unusable as an index key, leaving
-   *   `outbox_events_publishedAt_idx`, which holds only the backlog's NULLs.
+   * - the unpublished filter is `LIVE_OUTBOX`: see its comment;
    * - `dlqAt IS NOT NULL` was a full table scan on SQLite, which does not
    *   drive an index from it. The lower bound `dlqAt > epoch` is an index
    *   range that excludes NULL the same way.
@@ -901,10 +925,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
         _min: { nextPollAt: true },
       }),
       this.prisma.outboxEvent.aggregate({
-        where: {
-          publishedAt: null,
-          OR: [{ dlqAt: null }, { retryCount: { lt: 0 } }],
-        },
+        where: LIVE_OUTBOX,
         _count: { _all: true },
         _min: { occurredAt: true },
       }),
@@ -1658,7 +1679,10 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
   async getUnpublishedOutboxEvents(limit?: number): Promise<OutboxRecord[]> {
     const effectiveLimit = limit ?? 100;
     const records = await this.prisma.outboxEvent.findMany({
-      where: { publishedAt: null, dlqAt: null },
+      where:
+        this.databaseType === "sqlite"
+          ? LIVE_OUTBOX
+          : { publishedAt: null, dlqAt: null },
       orderBy: [{ workflowRunId: "asc" }, { sequence: "asc" }],
       take: effectiveLimit,
     });
