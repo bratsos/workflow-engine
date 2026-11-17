@@ -63,6 +63,10 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
         mkRun("run-running", at(240), "RUNNING", "wf-b", 0.1, 10),
         mkRun("run-pending", at(300), "PENDING", "wf-a", 0, 0),
         mkRun("run-suspended", at(360), "SUSPENDED", "wf-c", 0.05, 5),
+        // Created before the cost and filter windows the other tests read.
+        mkRun("run-retried", at(-9_000), "COMPLETED", "wf-d", 0, 0),
+        mkRun("run-purged", at(-9_001), "COMPLETED", "wf-d", 0, 0),
+        mkRun("run-gap", at(-9_002), "COMPLETED", "wf-d", 0, 0),
       ],
     });
     await prisma.workflowStage.createMany({
@@ -156,6 +160,65 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
           at(11),
           null,
           at(12),
+        ),
+        // A stage that retried once, with the progress and run events a real
+        // run interleaves, and an output that must never leave the table.
+        ...[
+          ["workflow:created", {}],
+          ["stage:started", { stageId: "fetch" }],
+          ["stage:progress", { stageId: "fetch", progress: 0.5 }],
+          [
+            "stage:retrying",
+            {
+              stageId: "fetch",
+              attempt: 1,
+              maxAttempts: 3,
+              error: `upstream 503: can't "connect"`,
+            },
+          ],
+          ["stage:started", { stageId: "fetch" }],
+          ["stage:completed", { stageId: "fetch", duration: 5 }],
+          ["workflow:completed", { output: { secret: "do-not-read" } }],
+        ].map(([type, payload], index) =>
+          mkEvent(
+            `retried-${index + 1}`,
+            "run-retried",
+            index + 1,
+            type as string,
+            at(430 + index),
+            at(440),
+            null,
+            { type, ...(payload as object) },
+          ),
+        ),
+        // Retention removed the oldest rows of one run and a middle row of another.
+        ...[3, 4].map((sequence) =>
+          mkEvent(
+            `purged-${sequence}`,
+            "run-purged",
+            sequence,
+            "stage:started",
+            at(450),
+            at(451),
+            null,
+            {
+              stageId: "fetch",
+            },
+          ),
+        ),
+        ...[1, 2, 4].map((sequence) =>
+          mkEvent(
+            `gap-${sequence}`,
+            "run-gap",
+            sequence,
+            "stage:started",
+            at(460),
+            at(461),
+            null,
+            {
+              stageId: "fetch",
+            },
+          ),
         ),
       ],
     });
@@ -282,6 +345,68 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
     const events = await reader().listRunEvents("run-day-1", 1, 1);
     expect(events.map((event) => event.id)).toEqual(["event-2"]);
     expect(events[0]?.occurredAt.toISOString()).toBe(at(2).toISOString());
+  });
+
+  it("reads a run's stage lifecycle events with their stage and error, and reports a purged or broken history as incomplete", async () => {
+    const port = reader();
+    const retried = (await port.getRunDetail("run-retried"))!;
+    expect(retried.stageEvents).toEqual({
+      complete: true,
+      events: [
+        {
+          sequence: 2,
+          eventType: "stage:started",
+          occurredAt: at(431),
+          stageId: "fetch",
+          error: null,
+        },
+        {
+          sequence: 4,
+          eventType: "stage:retrying",
+          occurredAt: at(433),
+          stageId: "fetch",
+          error: `upstream 503: can't "connect"`,
+        },
+        {
+          sequence: 5,
+          eventType: "stage:started",
+          occurredAt: at(434),
+          stageId: "fetch",
+          error: null,
+        },
+        {
+          sequence: 6,
+          eventType: "stage:completed",
+          occurredAt: at(435),
+          stageId: "fetch",
+          error: null,
+        },
+      ],
+    });
+    // The plain event list still carries every row, payload-free.
+    expect(retried.events).toHaveLength(7);
+    expect(JSON.stringify(retried)).not.toContain("do-not-read");
+
+    expect((await port.getRunDetail("run-purged"))?.stageEvents).toMatchObject({
+      complete: false,
+    });
+    expect((await port.getRunDetail("run-gap"))?.stageEvents).toMatchObject({
+      complete: false,
+    });
+    // A run with no retained events at all cannot be called complete.
+    expect((await port.getRunDetail("run-pending"))?.stageEvents).toEqual({
+      events: [],
+      complete: false,
+    });
+
+    const response = await createWorkflowConsole({
+      reader: port,
+      authorize: () => true,
+    })(new Request("https://console.example/console/api/runs/run-retried"));
+    const body = (await response.json()) as {
+      stageEvents: { events: Array<{ occurredAt: string }> };
+    };
+    expect(body.stageEvents.events[0]?.occurredAt).toBe(at(431).toISOString());
   });
 
   it("reports queue health, suspended stages, dead letters, and workers", async () => {
@@ -419,13 +544,14 @@ function mkEvent(
   occurredAt: Date,
   publishedAt: Date | null,
   dlqAt: Date | null,
+  payload: object = { seeded: true },
 ) {
   return {
     id,
     workflowRunId,
     sequence,
     eventType,
-    payload: { seeded: true },
+    payload,
     causationId: `cause-${id}`,
     occurredAt,
     createdAt: occurredAt,

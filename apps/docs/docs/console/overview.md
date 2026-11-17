@@ -106,6 +106,67 @@ and the outbox event timeline.
 
 ![Run detail for a contract review suspended on a legal sign-off signal: the stage timeline and a pending signal step in the ledger](/img/console/run-suspended.png)
 
+## Attempts, grouped by stage
+
+A stage that retried used to show only its latest attempt: the stage row
+holds its current status and last error, and a step row holds its last
+state. The run detail now has an **Attempts by stage** section that lists
+every attempt of every stage, built from the run's retained stage events
+(`stage:started`, `stage:suspended`, `stage:retrying`, `stage:failed`,
+`stage:completed`):
+
+- when the attempt started and ended, why it began (first run, job retry,
+  retry while suspended, or a rerun after a terminal outcome such as a
+  redrive) and how it ended (completed, retrying, failed, suspended, running
+  or cancelled);
+- the error that ended it;
+- the stage events of the attempt;
+- the steps that last changed during it: step id, kind, status, the step's
+  own execution count, duration, error and external key.
+
+Each attempt is a native disclosure (`<details>`), so it works from the
+keyboard and with a screen reader. The status is spelled out in text, not
+only coloured, and long errors wrap.
+
+The attempt boundaries are:
+
+- `stage:started` opens an attempt. A second `stage:started` while one is open
+  is a re-delivery of the same job after a crash and stays in that attempt.
+- `stage:suspended` and the poll that later resumes the stage stay inside the
+  open attempt.
+- `stage:completed` and `stage:failed` end it. A `stage:started` after either
+  is a rerun and opens a new attempt.
+- `stage:retrying` ends the attempt as *retrying*. When the stage was suspended
+  at that moment, the retry happened inside `stage.pollSuspended`: the stage
+  stays `SUSPENDED`, no `stage:started` follows, and the next attempt begins
+  at the retry event. Otherwise it was a job retry and the next attempt begins
+  at the next `stage:started`.
+
+The ledger keeps only each step's latest state, so a step is listed under the
+one attempt whose time window contains the step row's `updatedAt`: the
+attempt in which it last changed. A step that failed in attempt 1 and
+succeeded in attempt 2 appears in attempt 2 with *Execution 2*. A step whose
+last change falls in no attempt, or on the boundary of two, is listed apart
+as not assignable to one attempt instead of being guessed into one. A step's
+duration is shown only when it executed once and has finished, because the
+row does not keep per-execution timings.
+
+When the history cannot be trusted, the stage falls back to the flat view (the
+stage timeline above and the step ledger below show its latest attempt) and
+says that the per-attempt history is unavailable, with the reason:
+
+- the run's retained events are not an unbroken range from sequence 1 (events
+  were purged or are past retention) or were cut off by the read's limit;
+- the reader provides no stage events (a custom `ConsoleReadPort` written
+  before this existed);
+- no lifecycle event of the stage is retained, the retained events are missing
+  a link, or they disagree with the stage's current row (status, and the
+  stage's `attempt` count on a run that was never redriven).
+
+The events come from a separate read of a run's stage lifecycle events, so the
+200-row event table does not limit them. The read extracts only the stage id
+and the error from each payload.
+
 ## Delivering a signal
 
 A stage suspended on `ctx.step.waitForSignal` — the human-approval case —

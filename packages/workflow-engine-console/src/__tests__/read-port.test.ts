@@ -328,6 +328,51 @@ describe("in-memory read port: run detail", () => {
     expect(await reader.getRunDetail("nope")).toBeNull();
   });
 
+  it("returns a run's stage lifecycle events in sequence order and calls the history complete only when its sequences are unbroken from 1", async () => {
+    const stageEvent = (
+      sequence: number,
+      eventType: any,
+      workflowRunId = "run-1",
+    ) => ({
+      workflowRunId,
+      sequence,
+      eventType,
+      occurredAt: at(sequence),
+      stageId: "first",
+      error: eventType === "stage:retrying" ? "boom" : null,
+    });
+    const reader = createInMemoryConsoleReadPort({
+      ...fixtures,
+      events: [], // the plain event list is independent of the lifecycle log
+      stageEvents: [
+        stageEvent(3, "stage:retrying"),
+        stageEvent(2, "stage:started"),
+        stageEvent(1, "stage:started", "other-run"),
+      ],
+    });
+    const detail = await reader.getRunDetail("run-1");
+    expect(detail?.stageEvents?.events.map((e) => e.sequence)).toEqual([2, 3]);
+    expect(detail?.stageEvents?.events[1]).toMatchObject({
+      eventType: "stage:retrying",
+      stageId: "first",
+      error: "boom",
+    });
+    // Sequence 1 is missing for run-1: its first rows were purged.
+    expect(detail?.stageEvents?.complete).toBe(false);
+
+    const whole = createInMemoryConsoleReadPort({
+      ...fixtures,
+      events: [fixtures.events![1]!], // sequence 1 is a non-stage event
+      stageEvents: [
+        stageEvent(2, "stage:started"),
+        stageEvent(3, "stage:retrying"),
+      ],
+    });
+    expect((await whole.getRunDetail("run-1"))?.stageEvents?.complete).toBe(
+      true,
+    );
+  });
+
   it("tails a run timeline from a sequence cursor", async () => {
     const reader = createInMemoryConsoleReadPort(fixtures);
     expect(

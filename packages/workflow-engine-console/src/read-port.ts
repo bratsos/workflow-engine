@@ -138,6 +138,49 @@ export interface RunEvent {
   dlqAt: Date | null;
 }
 
+/** The stage lifecycle events a stage's attempt history is built from. */
+export const STAGE_LIFECYCLE_EVENT_TYPES = [
+  "stage:started",
+  "stage:suspended",
+  "stage:retrying",
+  "stage:failed",
+  "stage:completed",
+] as const;
+
+export type StageLifecycleEventType =
+  (typeof STAGE_LIFECYCLE_EVENT_TYPES)[number];
+
+/**
+ * One stage lifecycle outbox row with the two payload fields the attempt
+ * history needs. The rest of the payload is never read: `workflow:completed`
+ * carries the run's output, and the console's lists are payload-free by design.
+ */
+export interface StageEvent {
+  sequence: number;
+  eventType: StageLifecycleEventType;
+  occurredAt: Date;
+  /** The stage definition's id (`StageSummary.stageId`), not the stage record id. */
+  stageId: string;
+  /** Carried by `stage:retrying` and `stage:failed`; null on the others. */
+  error: string | null;
+}
+
+/**
+ * Every stage lifecycle event of a run, independent of the run detail's
+ * 200-row event list (a run with many progress events would otherwise cut
+ * the lifecycle events off).
+ */
+export interface StageEventLog {
+  events: StageEvent[];
+  /**
+   * True only when the run's retained outbox rows form one unbroken range
+   * starting at sequence 1 and none of the lifecycle events were cut off by
+   * the read's limit. False means events were purged, are past retention,
+   * or were truncated, and a grouping built from them could be wrong.
+   */
+  complete: boolean;
+}
+
 export interface RunDetail {
   run: RunSummary & {
     input: unknown;
@@ -150,6 +193,12 @@ export interface RunDetail {
   annotations: AnnotationSummary[];
   logs: LogEntry[];
   events: RunEvent[];
+  /**
+   * Input to the per-attempt stage history. Optional so a custom reader that
+   * predates it keeps compiling; without it the UI shows each stage's latest
+   * attempt only and says the per-attempt history is unavailable.
+   */
+  stageEvents?: StageEventLog;
   /** True when a list was cut off by its limit, so the UI can say so instead of implying completeness. */
   truncated: {
     steps: boolean;

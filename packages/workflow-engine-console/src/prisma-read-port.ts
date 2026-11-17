@@ -25,6 +25,9 @@ import {
   type RunListPage,
   type RunListQuery,
   type RunSummary,
+  STAGE_LIFECYCLE_EVENT_TYPES,
+  type StageEvent,
+  type StageLifecycleEventType,
   type StageSummary,
   type StepSummary,
   type SuspendedStage,
@@ -153,6 +156,24 @@ const EVENT_COLUMNS: RawColumns = {
   retryCount: "int",
   dlqAt: "timestamp",
 };
+const STAGE_EVENT_COLUMNS: RawColumns = {
+  sequence: "int",
+  eventType: "text",
+  occurredAt: "timestamp",
+  stageId: "text",
+  error: "text",
+};
+const EVENT_RANGE_COLUMNS: RawColumns = {
+  minSeq: "int",
+  maxSeq: "int",
+  total: "bigint",
+};
+/**
+ * Ceiling on the lifecycle events read per run. A stage emits a handful per
+ * attempt, so this covers hundreds of stages; past it the read reports the
+ * history as incomplete instead of grouping a prefix.
+ */
+const STAGE_EVENT_LIMIT = 2000;
 const SUSPENDED_STAGE_COLUMNS: RawColumns = {
   id: "text",
   workflowRunId: "text",
@@ -339,6 +360,20 @@ interface RawEventRow {
   dlqAt: RawNullableTimestamp;
 }
 
+interface RawStageEventRow {
+  sequence: number | bigint;
+  eventType: string;
+  occurredAt: RawTimestamp;
+  stageId: string | null;
+  error: string | null;
+}
+
+interface RawEventRangeRow {
+  minSeq: number | bigint | null;
+  maxSeq: number | bigint | null;
+  total: number | bigint | null;
+}
+
 interface RawSuspendedStageRow {
   id: string;
   workflowRunId: string;
@@ -511,6 +546,20 @@ function mapRunEvent(row: RawEventRow): RunEvent {
   };
 }
 
+function mapStageEvent(row: RawStageEventRow): StageEvent {
+  return {
+    sequence: toNumber(row.sequence),
+    eventType: String(row.eventType) as StageLifecycleEventType,
+    occurredAt: toDate(row.occurredAt) ?? new Date(0),
+    stageId:
+      row.stageId !== null && row.stageId !== undefined
+        ? String(row.stageId)
+        : "",
+    error:
+      row.error !== null && row.error !== undefined ? String(row.error) : null,
+  };
+}
+
 function mapSuspendedStage(row: RawSuspendedStageRow): SuspendedStage {
   return {
     id: String(row.id),
@@ -652,10 +701,10 @@ export class PrismaConsoleReadPort implements ConsoleReadPort {
    *
    * The callback receives the client to issue statements on, and every read
    * that needs more than one statement issues all of them here, inside a
-   * single transaction — a run-detail page is six queries, and giving each
-   * its own interactive transaction would take six connections out of the
-   * consumer's pool to render one page. One transaction also means the six
-   * results are a coherent snapshot rather than six moments.
+   * single transaction — a run-detail page is eight queries, and giving each
+   * its own interactive transaction would take eight connections out of the
+   * consumer's pool to render one page. One transaction also means the eight
+   * results are a coherent snapshot rather than eight moments.
    *
    * The transaction is opened only when we were handed a root client. When
    * `$transaction` is absent we are already inside the caller's transaction
@@ -817,9 +866,9 @@ LIMIT ${limit + 1}`;
     const logLimit = clampLimit(options?.logLimit, 200);
     const eventLimit = clampLimit(options?.eventLimit, 200);
 
-    // All six statements share one transaction: six interactive transactions
-    // to render one page would take six connections out of the consumer's
-    // pool, and the results would be six different moments.
+    // All eight statements share one transaction: eight interactive
+    // transactions to render one page would take eight connections out of the
+    // consumer's pool, and the results would be eight different moments.
     return this.read("run.detail", async (client) => {
       const runRows = await this.select<RawRunDetailRow>(
         client,
@@ -892,6 +941,48 @@ LIMIT ${eventLimit + 1}`,
         [runId],
       );
 
+      // Stage lifecycle events, read apart from the capped event list above
+      // and with just two payload fields extracted in SQL, so the attempt
+      // history neither depends on how many progress events the run emitted
+      // nor pulls a payload (`workflow:completed` carries the run's output).
+      const payloadField = (name: string) =>
+        this.databaseType === "postgresql"
+          ? `payload->>'${name}'`
+          : `json_extract(payload, '$.${name}')`;
+      const lifecycleTypes = STAGE_LIFECYCLE_EVENT_TYPES.map(
+        (type) => `'${type}'`,
+      ).join(", ");
+      const stageEventRows = await this.select<RawStageEventRow>(
+        client,
+        STAGE_EVENT_COLUMNS,
+        `SELECT sequence, "eventType", "occurredAt",
+       ${payloadField("stageId")} AS "stageId",
+       CASE WHEN "eventType" IN ('stage:retrying', 'stage:failed') THEN ${payloadField("error")} END AS error
+FROM "outbox_events"
+WHERE "workflowRunId" = ${this.param(1)} AND "eventType" IN (${lifecycleTypes})
+ORDER BY sequence ASC
+LIMIT ${STAGE_EVENT_LIMIT + 1}`,
+        [runId],
+      );
+      // Whether the run's retained rows are an unbroken 1..n: purged or
+      // out-of-retention events show up as a missing prefix or a gap.
+      const rangeRows = await this.select<RawEventRangeRow>(
+        client,
+        EVENT_RANGE_COLUMNS,
+        `SELECT min(sequence) AS "minSeq", max(sequence) AS "maxSeq", count(*) AS total
+FROM "outbox_events" WHERE "workflowRunId" = ${this.param(1)}`,
+        [runId],
+      );
+      const total = toNumber(rangeRows[0]?.total);
+      const stageEvents = {
+        events: stageEventRows.slice(0, STAGE_EVENT_LIMIT).map(mapStageEvent),
+        complete:
+          stageEventRows.length <= STAGE_EVENT_LIMIT &&
+          total > 0 &&
+          toNumber(rangeRows[0]?.minSeq) === 1 &&
+          toNumber(rangeRows[0]?.maxSeq) === total,
+      };
+
       // Each list asked for one row more than it will show, so "there is
       // more than this" is known without a second count.
       const truncated = {
@@ -916,6 +1007,7 @@ LIMIT ${eventLimit + 1}`,
           .map(mapAnnotationSummary),
         logs: logRows.slice(0, logLimit).map(mapLogEntry),
         events: eventRows.slice(0, eventLimit).map(mapRunEvent),
+        stageEvents,
         truncated,
       } satisfies RunDetail;
     });

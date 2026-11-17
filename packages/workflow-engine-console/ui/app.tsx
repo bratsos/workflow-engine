@@ -1,5 +1,14 @@
 import { render } from "preact";
 import { useCallback, useEffect, useMemo, useRef, useState } from "preact/hooks";
+import {
+  type AttemptOutcome,
+  type AttemptStepEntry,
+  type AttemptTrigger,
+  type AttemptUnavailableReason,
+  buildStageAttemptHistory,
+  type StageAttempt,
+  type StageAttemptHistory,
+} from "../src/stage-attempts";
 
 interface ConsoleCapabilities {
   runs: boolean;
@@ -123,6 +132,16 @@ interface RunDetail {
   annotations: AnnotationSummary[];
   logs: LogEntry[];
   events: RunEvent[];
+  stageEvents?: {
+    events: Array<{
+      sequence: number;
+      eventType: string;
+      occurredAt: string;
+      stageId: string;
+      error: string | null;
+    }>;
+    complete: boolean;
+  };
   truncated: {
     steps: boolean;
     annotations: boolean;
@@ -863,6 +882,208 @@ function StepRow({
   );
 }
 
+const OUTCOME_LABEL: Record<AttemptOutcome, string> = {
+  completed: "Completed",
+  failed: "Failed",
+  retrying: "Retrying",
+  suspended: "Suspended",
+  running: "Running",
+  cancelled: "Cancelled",
+};
+
+const TRIGGER_LABEL: Record<AttemptTrigger, string> = {
+  initial: "First run",
+  "job-retry": "Job retry",
+  "poll-retry": "Retry while suspended (replayed on a poll)",
+  rerun: "Rerun after a terminal outcome (redrive)",
+};
+
+const UNAVAILABLE_LABEL: Record<AttemptUnavailableReason, string> = {
+  "no-event-history": "this reader does not provide stage events",
+  "events-incomplete":
+    "the run's events are incomplete (purged, past retention, or cut off by a read limit)",
+  "no-stage-events": "no lifecycle events of this stage are retained",
+  "history-gap": "the retained events of this stage are missing a link",
+  inconsistent: "the retained events do not agree with the stage's current record",
+};
+
+function AttemptSteps({ steps }: { steps: AttemptStepEntry[] }) {
+  return (
+    <ul class="attempt-steps">
+      {steps.map((step) => (
+        <li key={step.stepId} class="attempt-step">
+          <code>{step.stepId}</code>
+          <span>{step.kind}</span>
+          <StatusPill status={step.status} />
+          <span>Execution {step.attempt}</span>
+          <span
+            title={
+              step.durationMs === null
+                ? "Only a step that executed once and finished has a duration the ledger can state."
+                : undefined
+            }
+          >
+            Duration {formatDuration(step.durationMs)}
+          </span>
+          {step.externalKey && (
+            <span class="attempt-step-key">
+              External key <code>{step.externalKey}</code>
+            </span>
+          )}
+          {step.error && (
+            <p class="attempt-error">
+              <strong>Error:</strong> {step.error}
+            </p>
+          )}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+/** One attempt as a native disclosure: the summary is the control. */
+function AttemptItem({
+  attempt,
+  defaultOpen,
+}: {
+  attempt: StageAttempt;
+  defaultOpen: boolean;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+  const duration =
+    attempt.endedAt === null ? null : Date.parse(attempt.endedAt) - Date.parse(attempt.startedAt);
+  return (
+    <li class="attempt">
+      <details
+        open={open}
+        onToggle={(event) => setOpen((event.currentTarget as HTMLDetailsElement).open)}
+      >
+        <summary>
+          <span class="attempt-title">Attempt {attempt.number}</span>
+          <span class={`pill pill-${attempt.outcome}`}>{OUTCOME_LABEL[attempt.outcome]}</span>
+          <span class="attempt-trigger">{TRIGGER_LABEL[attempt.trigger]}</span>
+          <span class="attempt-times">
+            <time dateTime={attempt.startedAt}>{formatAbsolute(attempt.startedAt)}</time>
+            {" → "}
+            {attempt.endedAt ? (
+              <time dateTime={attempt.endedAt}>{formatAbsolute(attempt.endedAt)}</time>
+            ) : (
+              "in progress"
+            )}
+            {duration !== null && ` (${formatDuration(duration)})`}
+          </span>
+        </summary>
+        <div class="attempt-body">
+          {attempt.error && (
+            <p class="attempt-error">
+              <strong>Error:</strong> {attempt.error}
+            </p>
+          )}
+          <h5 class="attempt-subtitle">Events</h5>
+          {attempt.events.length === 0 ? (
+            <p class="attempt-empty">No stage events recorded for this attempt yet.</p>
+          ) : (
+            <ul class="attempt-events">
+              {attempt.events.map((event) => (
+                <li key={event.sequence}>
+                  <code>{event.eventType}</code>
+                  <time dateTime={event.occurredAt}>{formatAbsolute(event.occurredAt)}</time>
+                  <span class="attempt-seq">sequence {event.sequence}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+          <h5 class="attempt-subtitle">Steps</h5>
+          {attempt.steps.length === 0 ? (
+            <p class="attempt-empty">No step last changed during this attempt.</p>
+          ) : (
+            <AttemptSteps steps={attempt.steps} />
+          )}
+        </div>
+      </details>
+    </li>
+  );
+}
+
+function AttemptHistory({
+  stages,
+  histories,
+  stepsTruncated,
+}: {
+  stages: StageSummary[];
+  histories: Map<string, StageAttemptHistory>;
+  stepsTruncated: boolean;
+}) {
+  if (stages.length === 0) return null;
+  return (
+    <>
+      <div class="section-header">
+        <h3 class="section-title">Attempts by stage</h3>
+      </div>
+      <p class="attempt-hint">
+        Built from the run's retained stage events. The step ledger keeps only each step's latest
+        state, so a step is listed under the attempt in which it last changed.
+      </p>
+      {stepsTruncated && (
+        <p class="truncated-note">The step list is truncated, so attempts may omit steps.</p>
+      )}
+      {stages.map((stage) => {
+        const history = histories.get(stage.id);
+        const attempts = history?.available ? history.attempts : [];
+        const unavailable: AttemptUnavailableReason | null = history?.available
+          ? null
+          : (history?.reason ?? "no-event-history");
+        const titleId = `attempts-${stage.id}`;
+        return (
+          <section key={stage.id} class="attempt-stage" aria-labelledby={titleId}>
+            <h4 id={titleId} class="attempt-stage-title">
+              <span class="stage-num">#{stage.stageNumber}</span>
+              <span class="stage-name">{stage.stageName}</span>
+              <StatusPill status={stage.status} />
+              {history?.available && (
+                <span class="attempt-count">
+                  {attempts.length} {attempts.length === 1 ? "attempt" : "attempts"}
+                </span>
+              )}
+            </h4>
+            {unavailable ? (
+              <p class="attempt-note" role="note">
+                Per-attempt history is unavailable for this stage: {UNAVAILABLE_LABEL[unavailable]}.
+                The stage timeline above and the step ledger below show its latest attempt only.
+              </p>
+            ) : attempts.length === 0 ? (
+              <p class="attempt-empty">This stage has not started.</p>
+            ) : (
+              <ol class="attempt-list">
+                {attempts.map((attempt, index) => (
+                  <AttemptItem
+                    key={attempt.number}
+                    attempt={attempt}
+                    defaultOpen={
+                      attempt.outcome !== "completed" ||
+                      (index === attempts.length - 1 && attempts.length > 1)
+                    }
+                  />
+                ))}
+              </ol>
+            )}
+            {history?.available && history.unplacedSteps.length > 0 && (
+              <div class="attempt-unplaced">
+                <h5 class="attempt-subtitle">Steps not assignable to one attempt</h5>
+                <p class="attempt-empty">
+                  The time each of these steps last changed matches no attempt, or two (for example a
+                  step re-opened by a retry or a redrive that has not run yet).
+                </p>
+                <AttemptSteps steps={history.unplacedSteps} />
+              </div>
+            )}
+          </section>
+        );
+      })}
+    </>
+  );
+}
+
 function RunDetailView({
   config,
   runId,
@@ -1005,6 +1226,19 @@ function RunDetailView({
     return { stepsByStage: map, unassignedSteps: unassigned };
   }, [data?.steps]);
 
+  const attemptHistories = useMemo(
+    () =>
+      data
+        ? buildStageAttemptHistory({
+            redriveCount: data.run.redriveCount,
+            stages: data.stages,
+            steps: data.steps,
+            stageEvents: data.stageEvents,
+          })
+        : new Map<string, StageAttemptHistory>(),
+    [data],
+  );
+
   return (
     <div>
       <ErrorBanner
@@ -1145,6 +1379,12 @@ function RunDetailView({
               <div class="empty-state">No stages recorded.</div>
             )}
           </div>
+
+          <AttemptHistory
+            stages={sortedStages}
+            histories={attemptHistories}
+            stepsTruncated={data.truncated.steps}
+          />
 
           <div class="section-header">
             <h3 class="section-title">Step ledger</h3>

@@ -359,7 +359,7 @@ if (!DATABASE_URL) {
       });
     });
 
-    it("assembles a run detail from six statements in one transaction", async () => {
+    it("assembles a run detail from eight statements in one transaction", async () => {
       const detail = await reader().getRunDetail("run-1");
       expect(detail?.run.id).toBe("run-1");
       expect(detail?.run.input).toEqual({ seeded: true });
@@ -379,6 +379,90 @@ if (!DATABASE_URL) {
 
     it("returns null for a run that does not exist", async () => {
       expect(await reader().getRunDetail("nope")).toBeNull();
+    });
+
+    it("reads a run's stage lifecycle events with their stage and error, and reports a purged or broken history as incomplete", async () => {
+      await prisma.workflowRun.createMany({
+        data: [
+          mkRun("run-retried", at(-9_000), "COMPLETED", "wf-d"),
+          mkRun("run-purged", at(-9_001), "COMPLETED", "wf-d"),
+          mkRun("run-gap", at(-9_002), "COMPLETED", "wf-d"),
+        ],
+      });
+      const events = (
+        [
+          ["workflow:created", {}],
+          ["stage:started", { stageId: "fetch" }],
+          ["stage:progress", { stageId: "fetch", progress: 0.5 }],
+          [
+            "stage:retrying",
+            {
+              stageId: "fetch",
+              attempt: 1,
+              maxAttempts: 3,
+              error: `upstream 503: can't "connect"`,
+            },
+          ],
+          ["stage:started", { stageId: "fetch" }],
+          ["stage:completed", { stageId: "fetch", duration: 5 }],
+          ["workflow:completed", { output: { secret: "do-not-read" } }],
+        ] as Array<[string, object]>
+      ).map(([type, payload], index) => ({
+        ...mkEvent(
+          `retried-${index + 1}`,
+          "run-retried",
+          index + 1,
+          type,
+          at(430 + index),
+          at(440),
+          null,
+        ),
+        payload: { type, ...payload },
+      }));
+      const lifecycle = (id: string, runId: string, sequence: number) => ({
+        ...mkEvent(
+          id,
+          runId,
+          sequence,
+          "stage:started",
+          at(450),
+          at(451),
+          null,
+        ),
+        payload: { stageId: "fetch" },
+      });
+      await prisma.outboxEvent.createMany({
+        data: [
+          ...events,
+          ...[3, 4].map((n) => lifecycle(`purged-${n}`, "run-purged", n)),
+          ...[1, 2, 4].map((n) => lifecycle(`gap-${n}`, "run-gap", n)),
+        ],
+      });
+
+      const retried = (await reader().getRunDetail("run-retried"))!;
+      expect(retried.stageEvents).toEqual({
+        complete: true,
+        events: [
+          [2, "stage:started", 431, null],
+          [4, "stage:retrying", 433, `upstream 503: can't "connect"`],
+          [5, "stage:started", 434, null],
+          [6, "stage:completed", 435, null],
+        ].map(([sequence, eventType, minutes, error]) => ({
+          sequence,
+          eventType,
+          occurredAt: at(minutes as number),
+          stageId: "fetch",
+          error,
+        })),
+      });
+      expect(retried.events).toHaveLength(7);
+      expect(JSON.stringify(retried)).not.toContain("do-not-read");
+      expect(
+        (await reader().getRunDetail("run-purged"))?.stageEvents?.complete,
+      ).toBe(false);
+      expect(
+        (await reader().getRunDetail("run-gap"))?.stageEvents?.complete,
+      ).toBe(false);
     });
 
     it("selects the step columns the UI needs to offer a signal", async () => {

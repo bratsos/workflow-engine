@@ -20,6 +20,7 @@ import {
   type RunListPage,
   type RunListQuery,
   type RunSummary,
+  type StageEvent,
   type StageSummary,
   type StepSummary,
   type SuspendedStage,
@@ -43,6 +44,12 @@ export interface ConsoleFixtures {
   annotations?: AnnotationSummary[];
   logs?: LogEntry[];
   events?: RunEvent[];
+  /**
+   * Stage lifecycle events with their payload-derived fields. A run's history
+   * is complete when the sequences of these and of `events` together form one
+   * unbroken range from 1, the same rule the SQL reader applies to the outbox.
+   */
+  stageEvents?: Array<StageEvent & { workflowRunId: string }>;
   /** job_queue rows, reduced to what the console reads off them. */
   jobs?: Array<{
     id: string;
@@ -99,6 +106,7 @@ export class InMemoryConsoleReadPort implements ConsoleReadPort {
       annotations: fixtures?.annotations ?? [],
       logs: fixtures?.logs ?? [],
       events: fixtures?.events ?? [],
+      stageEvents: fixtures?.stageEvents ?? [],
       jobs: fixtures?.jobs ?? [],
     };
     this.capabilities = {
@@ -249,6 +257,22 @@ export class InMemoryConsoleReadPort implements ConsoleReadPort {
       .slice()
       .sort((a, b) => a.sequence - b.sequence);
 
+    const runStageEvents = this.fixtures.stageEvents
+      .filter((evt) => evt.workflowRunId === runId)
+      .slice()
+      .sort((a, b) => a.sequence - b.sequence);
+    const sequences = [
+      ...new Set([
+        ...matchingEvents.map((evt) => evt.sequence),
+        ...runStageEvents.map((evt) => evt.sequence),
+      ]),
+    ].sort((a, b) => a - b);
+    const stageEvents = {
+      events: runStageEvents.map(({ workflowRunId: _runId, ...evt }) => evt),
+      complete:
+        sequences.length > 0 && sequences.every((seq, i) => seq === i + 1),
+    };
+
     const steps = matchingSteps.slice(0, stepLimit);
     const annotations = matchingAnnotations.slice(0, annotationLimit);
     const logs = matchingLogs.slice(0, logLimit);
@@ -276,6 +300,7 @@ export class InMemoryConsoleReadPort implements ConsoleReadPort {
       annotations,
       logs,
       events,
+      stageEvents,
       truncated,
     };
   }

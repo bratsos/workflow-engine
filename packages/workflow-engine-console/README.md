@@ -349,7 +349,7 @@ The `--allow-direct-connection` flag requires explicit acknowledgement that conn
 
 The console provides seven operational views:
 - **Runs list**: Keyset-paginated list filtered by execution status, workflow ID, workflow type, definition version, and date ranges. Each row carries the run's definition version (shortened, full value on hover) with its redrive count as a `+N` suffix — filtering by version is how "show me everything still pinned to the old version" is answered.
-- **Run detail**: Definition version and redrive count alongside the run's timings and cost, plus the complete execution hierarchy including stage timelines, durable step ledger entries (kind, status, attempt, deadline, and the `externalKey` of `run` steps, so an orphaned provider-side effect can be searched for), annotations, execution logs, and outbox event streams. With actions enabled, a step with `kind === "signal"` and `status === "pending"` offers *Deliver signal* with a validated JSON payload box, and a run carrying a pinned version offers *Redrive on latest version*.
+- **Run detail**: Definition version and redrive count alongside the run's timings and cost, plus the complete execution hierarchy including stage timelines, durable step ledger entries (kind, status, attempt, deadline, and the `externalKey` of `run` steps, so an orphaned provider-side effect can be searched for), annotations, execution logs, and outbox event streams. An **Attempts by stage** section lists each stage's attempts (start and end, why it began, how it ended, its error, its stage events, and the steps that last changed during it), so a stage that retried, in a job retry or inside `stage.pollSuspended`, is no longer shown as only its latest attempt. When a run's events are purged, past retention, or disagree with the stage's row, the stage falls back to the latest-attempt view and says per-attempt history is unavailable. With actions enabled, a step with `kind === "signal"` and `status === "pending"` offers *Deliver signal* with a validated JSON payload box, and a run carrying a pinned version offers *Redrive on latest version*.
 - **Queue health**: Job distribution by status, enqueue timestamp of the oldest pending job, oldest active lock duration, and overdue polling stages.
 - **Suspended stages**: Stages awaiting external event resumption or deferred polling schedules.
 - **Workers**: Active worker instances derived from heartbeat locks on `job_queue`, reporting active execution count, oldest active lock, and last heartbeat age.
@@ -461,6 +461,8 @@ export class CustomConsoleReadPort implements ConsoleReadPort {
 ```
 
 The user interface inspects the reader's declared capabilities and omits navigation tabs for unsupported views.
+
+`RunDetail.stageEvents` is optional. It carries a run's stage lifecycle events (`stage:started`, `stage:suspended`, `stage:retrying`, `stage:failed`, `stage:completed`) as `{ sequence, eventType, occurredAt, stageId, error }`, with `complete: true` only when the run's retained outbox rows are an unbroken range from sequence 1 and none were cut off. A reader that omits it keeps working: the run detail shows each stage's latest attempt and says per-attempt history is unavailable. `stageId` is the stage definition's id, and `error` is set on `stage:retrying` and `stage:failed`. The in-memory reader takes them as `fixtures.stageEvents` (each with a `workflowRunId`).
 
 ## Testing
 
