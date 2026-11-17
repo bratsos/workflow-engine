@@ -454,7 +454,12 @@ export interface JobTransport {
 // EventSink
 // ============================================================================
 
-/** Stable identity of one durable outbox event. */
+/**
+ * Metadata for one durable outbox event. Deduplicate by `eventId`.
+ * `workflowRunId` and `sequence` order a run's events, but are not a
+ * permanent identity: deleting its newest outbox rows can allow the Prisma
+ * adapter to reuse a sequence.
+ */
 export interface OutboxDeliveryMetadata {
   readonly eventId: string;
   readonly workflowRunId: string;

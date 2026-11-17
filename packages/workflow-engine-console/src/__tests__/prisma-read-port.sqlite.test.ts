@@ -54,6 +54,38 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
     });
   }
 
+  it("refuses a SQLite file with dates from another Prisma major", async () => {
+    const file = join(directory, "foreign-dates.db");
+    const foreign = isPrisma8
+      ? (() => {
+          const db = fixture.createSqliteDb(file);
+          return Object.assign(fromPrisma8!(db), {
+            $disconnect: () => db.close(),
+          });
+        })()
+      : fixture.createSqliteClient(file);
+    try {
+      await foreign.workflowRun.create({
+        data: mkRun("foreign", at(0), "COMPLETED", "wf", 0, 0),
+      });
+      const incompatible =
+        major === "8"
+          ? "2020-01-01T00:00:00.000+00:00"
+          : "2020-01-01T00:00:00.000Z";
+      await foreign.$executeRawUnsafe(
+        `UPDATE workflow_runs SET "createdAt" = '${incompatible}' WHERE id = 'foreign'`,
+      );
+      const port = createPrismaConsoleReadPort(foreign, {
+        databaseType: "sqlite",
+      });
+      await expect(port.getRunDetail("foreign")).rejects.toMatchObject({
+        code: "SQLITE_DATE_STORAGE_MISMATCH",
+      });
+    } finally {
+      await foreign.$disconnect();
+    }
+  });
+
   async function seed() {
     await prisma.workflowRun.createMany({
       data: [

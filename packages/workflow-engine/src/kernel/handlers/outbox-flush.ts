@@ -3,14 +3,22 @@
  * mark delivery: `publishedAt` is written only after the sink resolves.
  * A crash after emit, an emit still running at claim expiry, or a partial
  * plugin failure can cause duplicates. Consumers can deduplicate by the
- * outbox event ID in the delivery metadata.
+ * outbox event ID in the delivery metadata. Run ID and sequence order events
+ * but are not permanent identities: SQL deletion of the newest outbox rows
+ * can allow the Prisma store to reuse a sequence.
  *
  * An earlier live event blocks later events of its run, including while it
  * is claimed or awaiting retry. Dead-lettered events do not block later
  * events; `plugin.replayDLQ` makes them eligible again. The engine's own
  * progress is independent of the sink.
  * Nothing in the engine deletes outbox rows; run.purge leaves them, and
- * an operator can remove them with SQL.
+ * an operator can remove them with SQL. For a purged run, a flush skips a
+ * live claim until completion or expiry, skips published rows, and skips
+ * dead letters until replay.
+ *
+ * A persistence write error rejects dispatch without a handler log. Host
+ * maintenance logs the error and reports degraded delivery; live claims
+ * remain recoverable after expiry unless the write already took effect.
  */
 
 import type { OutboxFlushCommand, OutboxFlushResult } from "../commands";

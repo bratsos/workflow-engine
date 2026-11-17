@@ -302,6 +302,78 @@ describe.skipIf(!sqlite && !databaseUrl)(
       expect((await flush()).published).toBe(1);
     });
 
+    it.each([
+      ["publication", false],
+      ["publication", true],
+      ["retry release", false],
+      ["retry release", true],
+      ["dead letter", false],
+      ["dead letter", true],
+    ] as const)("recovers three claimed events after a live-process %s error (committed: %s)", async (operation, committed) => {
+      for (let i = 0; i < 3; i++) await seedEvent(`write-error-${i}`);
+      shouldFail = operation !== "publication";
+      (runner as { maxRetries: number }).maxRetries =
+        operation === "dead letter" ? 1 : 3;
+      const delegate = client.outboxEvent;
+      const faultingDelegate = new Proxy(delegate, {
+        get(target, key) {
+          if (key === "updateMany")
+            return async (args: any) => {
+              const targetWrite =
+                operation === "publication"
+                  ? args.data.publishedAt !== undefined
+                  : args.data.retryCount !== undefined;
+              if (!targetWrite) return target.updateMany(args);
+              if (committed) await target.updateMany(args);
+              throw new Error("injected outbox write error");
+            };
+          return Reflect.get(target, key);
+        },
+      });
+      const faultingClient = new Proxy(client, {
+        get(target, key) {
+          return key === "outboxEvent"
+            ? faultingDelegate
+            : Reflect.get(target, key, target);
+        },
+      });
+      const faultingPersistence = createPrismaWorkflowPersistence(
+        faultingClient,
+        {
+          databaseType: sqlite ? "sqlite" : "postgresql",
+        },
+      );
+      const faultingKernel = createKernel({
+        persistence: faultingPersistence,
+        blobStore: new InMemoryBlobStore(),
+        jobTransport: new InMemoryJobQueue("write-fault"),
+        eventSink: runner,
+        clock,
+        registry: { getWorkflow: () => undefined },
+      });
+      await expect(
+        faultingKernel.dispatch({ type: "outbox.flush" }),
+      ).rejects.toThrow("injected outbox write error");
+      shouldFail = false;
+      const before = await flush();
+      expect(before.published).toBe(
+        operation === "retry release" && committed ? 1 : 0,
+      );
+      if (operation === "dead letter" && committed)
+        expect((await replay()).replayed).toBe(1);
+      clock.advance(60_001);
+      await flush();
+      expect(new Set(identities).size).toBe(3);
+      expect(
+        (await rows()).every(
+          (row: { publishedAt: Date | null }) => row.publishedAt !== null,
+        ),
+      ).toBe(true);
+      expect(delivered).toHaveLength(
+        operation === "publication" && !committed ? 4 : 3,
+      );
+    });
+
     it("prevents an overlapping run claim, then fences a slow sink after expiry", async () => {
       await seedEvent("slow-run");
       await persistence.appendOutboxEvents([
@@ -355,6 +427,79 @@ describe.skipIf(!sqlite && !databaseUrl)(
         (await kernel.dispatch({ type: "outbox.flush", maxEvents: 1 }))
           .published,
       ).toBe(1);
+    });
+
+    it("retains claimed, published and dead-lettered rows after purging their runs", async () => {
+      for (const id of ["purged-claimed", "purged-published", "purged-dead"])
+        await seedEvent(id);
+      const events = await client.outboxEvent.findMany({
+        orderBy: { workflowRunId: "asc" },
+      });
+      const published = events.find(
+        (row: { workflowRunId: string }) =>
+          row.workflowRunId === "purged-published",
+      );
+      const dead = events.find(
+        (row: { workflowRunId: string }) => row.workflowRunId === "purged-dead",
+      );
+      await persistence.markOutboxEventsPublished([published.id]);
+      await persistence.moveOutboxEventToDLQ(dead.id);
+      const expiry = new Date(clock.now().getTime() + 1_000);
+      await persistence.claimOutboxDelivery(
+        10,
+        `${expiry.toISOString()}|purge`,
+        clock.now(),
+        [],
+      );
+      await client.workflowRun.updateMany({
+        data: { status: "COMPLETED", completedAt: clock.now() },
+      });
+      expect(
+        (
+          await kernel.dispatch({
+            type: "run.purge",
+            olderThan: new Date(clock.now().getTime() + 1),
+          })
+        ).purged,
+      ).toBe(3);
+      shouldFail = false;
+      expect((await flush()).published).toBe(0);
+      expect((await replay()).replayed).toBe(1);
+      expect((await flush()).published).toBe(1);
+      clock.advance(1_001);
+      expect((await flush()).published).toBe(1);
+      expect(await client.outboxEvent.count()).toBe(3);
+      expect(delivered).toHaveLength(2);
+    });
+
+    it("reuses a sequence after an operator deletes the newest row, with a new event ID", async () => {
+      await seedEvent("sequence-reuse");
+      const append = () =>
+        persistence.appendOutboxEvents([
+          {
+            workflowRunId: "sequence-reuse",
+            eventType: "workflow:created",
+            payload: {
+              type: "workflow:created",
+              workflowRunId: "sequence-reuse",
+            },
+            causationId: "sequence",
+            occurredAt: clock.now(),
+          },
+        ]);
+      await append();
+      const latest = await client.outboxEvent.findFirst({
+        where: { workflowRunId: "sequence-reuse" },
+        orderBy: { sequence: "desc" },
+      });
+      await client.outboxEvent.delete({ where: { id: latest.id } });
+      await append();
+      const replacement = await client.outboxEvent.findFirst({
+        where: { workflowRunId: "sequence-reuse" },
+        orderBy: { sequence: "desc" },
+      });
+      expect(replacement.sequence).toBe(latest.sequence);
+      expect(replacement.id).not.toBe(latest.id);
     });
   },
 );

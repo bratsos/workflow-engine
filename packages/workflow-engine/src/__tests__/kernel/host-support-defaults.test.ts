@@ -4,7 +4,7 @@
  * object. The built-in hosts keep passing full ones.
  */
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { defineWorkflow } from "../../core/workflow.js";
 import {
@@ -93,6 +93,37 @@ describe("host support defaults", () => {
     await tick;
     expect(result).not.toBe("unbounded");
     if (result !== "unbounded") expect(result.eventSinkStatus).toBe("degraded");
+  });
+
+  it("logs a delivery write error and reports degraded while leaving the claim recoverable", async () => {
+    const { kernel, persistence, clock } = createTestKernel([workflow]);
+    await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "write-error",
+      workflowId: "host-defaults",
+      input: { value: 1 },
+    });
+    const complete = persistence.completeOutboxDelivery.bind(persistence);
+    persistence.completeOutboxDelivery = async () => {
+      throw new Error("write failed");
+    };
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const counts = await runMaintenanceTick(kernel);
+      expect(counts.eventSinkStatus).toBe("degraded");
+      expect(counts.eventSinkError).toContain("write failed");
+      expect(log).toHaveBeenCalledWith(
+        expect.stringContaining("outbox.flush error"),
+        expect.objectContaining({ message: "write failed" }),
+      );
+    } finally {
+      persistence.completeOutboxDelivery = complete;
+      log.mockRestore();
+    }
+    clock.advance(65_001);
+    expect(
+      (await kernel.dispatch({ type: "outbox.flush" })).published,
+    ).toBeGreaterThan(0);
   });
 
   it("executes a job with only the transport and the job", async () => {
