@@ -106,6 +106,40 @@ The key kernel commands are:
 * **`run.reapStuck`**: Automatically fails workflow runs that have ceased database updates.
 * **`run.purge`**: Deletes terminal runs older than a cutoff with everything under them (stages, logs, artifacts, annotations, step ledger, job rows, blobs). Off unless a host is given `retention`; see [Run Retention](../troubleshooting/overview.md#run-retention).
 * **`run.listVersions`**: Reports which definition versions still have runs and whether this build serves them.
+* **`engine.stats`**: Read-only gauges of active work: runs, stages, jobs and outbox events by status, plus the age of the oldest waiting item. See [Observing the engine](#observing-the-engine).
+
+---
+
+## Observing the engine
+
+`engine.stats` answers "is the engine keeping up?" without the engine taking a metrics dependency. It counts only active work (PENDING, RUNNING and SUSPENDED rows, plus unpublished and dead-lettered outbox events) and never reads a terminal row, so its cost follows the amount of work in flight, not the size of the tables. It writes nothing: no outbox event, no idempotency key, no transaction.
+
+```typescript
+const stats = await kernel.dispatch({ type: "engine.stats" });
+// {
+//   at: Date,                                     // the kernel clock; ages are measured at it
+//   runs:   { available: true,
+//             byStatus: { PENDING: 3, RUNNING: 12, SUSPENDED: 5 },
+//             oldestPendingAgeMs: 4200 },         // null when nothing is pending
+//   stages: { available: true,
+//             byStatus: { PENDING: 0, RUNNING: 12, SUSPENDED: 5 },
+//             suspendedDue: 1,                    // SUSPENDED and nextPollAt <= now
+//             mostOverdueMs: 800 },               // null when none is due
+//   jobs:   { available: true,
+//             byStatus: { PENDING: 3, RUNNING: 12, SUSPENDED: 0 },
+//             oldestPendingAgeMs: 4200 },
+//   outbox: { available: true,
+//             unpublished: 2,                     // what the next outbox.flush delivers
+//             oldestUnpublishedAgeMs: 1500,
+//             deadLettered: 0 },                  // replay with plugin.replayDLQ
+// }
+```
+
+The figures come from separate queries, not one snapshot, so work that moves while they run can be counted in two places or in none. Treat them as gauges.
+
+`engine.stats` reads through two optional port methods, `Persistence.getActiveWorkStats(now)` and `JobTransport.getJobStats()`. The built-in in-memory and Prisma adapters implement both. A custom port without one reports its sections as `{ available: false }` (`runs`, `stages` and `outbox` for persistence, `jobs` for the transport) instead of failing or reporting zero. See [Custom Adapters](../persistence/custom-adapters.md#active-work-stats).
+
+To export the gauges on every tick, combine the command with a host's `onTick` hook ([Node host](../hosts/node.md#exporting-gauges-with-ontick), [serverless host](../hosts/serverless.md#exporting-gauges-with-ontick)).
 
 ---
 

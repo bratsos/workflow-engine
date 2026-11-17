@@ -14,6 +14,7 @@ import {
 import type { Persistence } from "../../kernel/ports";
 import { createLogger } from "../../utils/logger";
 import {
+  ACTIVE_STATUSES,
   type DequeueOptions,
   type DequeueResult,
   type EnqueueJobInput,
@@ -21,11 +22,13 @@ import {
   type JobAckOutcome,
   type JobQueue,
   type JobQueueFairness,
+  type JobQueueStats,
   type JobRecord,
   LEASE_ABSOLUTE_CAP,
   LEASE_HEARTBEAT_LOST,
   type ServedDefinition,
 } from "../interface";
+import { countActiveByStatus } from "./active-stats";
 import { createEnumHelper, type PrismaEnumHelper } from "./enum-compat";
 import type { DatabaseType } from "./persistence";
 import {
@@ -919,6 +922,22 @@ export class PrismaJobQueue implements JobQueue {
       },
     });
     return result.count;
+  }
+
+  /**
+   * Active jobs for `engine.stats`: one `GROUP BY status` over PENDING,
+   * RUNNING and SUSPENDED, served index-only by
+   * `job_queue_status_createdAt_idx`, which also yields the oldest PENDING
+   * `createdAt`. Terminal rows (COMPLETED, FAILED, CANCELLED) are retained
+   * rather than deleted and are never visited.
+   */
+  async getJobStats(): Promise<JobQueueStats> {
+    const { byStatus, oldestPendingCreatedAt } = await countActiveByStatus(
+      this.prisma.jobQueue,
+      ACTIVE_STATUSES.map((status) => this.enums.status(status)),
+      true,
+    );
+    return { byStatus, oldestPendingCreatedAt };
   }
 
   /**

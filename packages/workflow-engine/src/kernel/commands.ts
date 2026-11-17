@@ -9,6 +9,7 @@
  */
 
 import type {
+  ActiveStatusCounts,
   AnnotationActor,
   PurgeableRunStatus,
   ServedDefinition,
@@ -570,6 +571,65 @@ export interface RunListVersionsResult {
 }
 
 // ---------------------------------------------------------------------------
+// engine.stats
+// ---------------------------------------------------------------------------
+
+/**
+ * Reads the state of active work: runs, stages, jobs and outbox events that
+ * still need something to happen. Read-only: no transaction, no outbox
+ * event, no idempotency key. Bounded: it counts rows in PENDING, RUNNING and
+ * SUSPENDED (and unpublished or dead-lettered outbox rows) through the
+ * optional `Persistence.getActiveWorkStats` and `JobTransport.getJobStats`
+ * methods, and never counts terminal rows.
+ *
+ * The figures come from separate queries, not one snapshot: work that moves
+ * while they run can be counted in two places or in none.
+ */
+export interface EngineStatsCommand {
+  readonly type: "engine.stats";
+}
+
+/**
+ * One section of an `engine.stats` result. `available: false` means the port
+ * behind it does not implement the optional method that reports it; the
+ * figures are then absent, not zero.
+ */
+export type EngineStatsSection<T> =
+  | ({ readonly available: true } & T)
+  | { readonly available: false };
+
+/** Result of an `engine.stats` command. Ages are milliseconds on the kernel clock. */
+export interface EngineStatsResult {
+  /** The kernel clock's time the ages and the "due" cut-off are measured at. */
+  readonly at: Date;
+  readonly runs: EngineStatsSection<{
+    readonly byStatus: ActiveStatusCounts;
+    /** Age of the oldest PENDING run (from `createdAt`), or `null` when none is pending. */
+    readonly oldestPendingAgeMs: number | null;
+  }>;
+  readonly stages: EngineStatsSection<{
+    readonly byStatus: ActiveStatusCounts;
+    /** SUSPENDED stages whose `nextPollAt` has passed: what `stage.pollSuspended` would pick up. */
+    readonly suspendedDue: number;
+    /** How long past its `nextPollAt` the most overdue suspended stage is, or `null` when none is due. */
+    readonly mostOverdueMs: number | null;
+  }>;
+  readonly jobs: EngineStatsSection<{
+    readonly byStatus: ActiveStatusCounts;
+    /** Age of the oldest PENDING job (from `createdAt`), including one waiting out a retry delay. `null` when none is pending. */
+    readonly oldestPendingAgeMs: number | null;
+  }>;
+  readonly outbox: EngineStatsSection<{
+    /** Events the next `outbox.flush` will deliver: not published, not dead-lettered. */
+    readonly unpublished: number;
+    /** Age of the oldest of those (from `occurredAt`), or `null` when there are none. */
+    readonly oldestUnpublishedAgeMs: number | null;
+    /** Events in the dead-letter queue: replay them with `plugin.replayDLQ`. */
+    readonly deadLettered: number;
+  }>;
+}
+
+// ---------------------------------------------------------------------------
 // Union & conditional result mapping
 // ---------------------------------------------------------------------------
 
@@ -582,6 +642,7 @@ export type KernelCommand =
   | RunRerunFromCommand
   | RunRedriveCommand
   | RunListVersionsCommand
+  | EngineStatsCommand
   | JobExecuteCommand
   | JobHeartbeatCommand
   | StagePollSuspendedCommand
@@ -610,22 +671,24 @@ export type CommandResult<T extends KernelCommand> = T extends RunCreateCommand
             ? RunRedriveResult
             : T extends RunListVersionsCommand
               ? RunListVersionsResult
-              : T extends JobExecuteCommand
-                ? JobExecuteResult
-                : T extends JobHeartbeatCommand
-                  ? JobHeartbeatResult
-                  : T extends StagePollSuspendedCommand
-                    ? StagePollSuspendedResult
-                    : T extends StepSignalCommand
-                      ? StepSignalResult
-                      : T extends LeaseReapStaleCommand
-                        ? LeaseReapStaleResult
-                        : T extends OutboxFlushCommand
-                          ? OutboxFlushResult
-                          : T extends PluginReplayDLQCommand
-                            ? PluginReplayDLQResult
-                            : T extends RunReapStuckCommand
-                              ? RunReapStuckResult
-                              : T extends RunPurgeCommand
-                                ? RunPurgeResult
-                                : never;
+              : T extends EngineStatsCommand
+                ? EngineStatsResult
+                : T extends JobExecuteCommand
+                  ? JobExecuteResult
+                  : T extends JobHeartbeatCommand
+                    ? JobHeartbeatResult
+                    : T extends StagePollSuspendedCommand
+                      ? StagePollSuspendedResult
+                      : T extends StepSignalCommand
+                        ? StepSignalResult
+                        : T extends LeaseReapStaleCommand
+                          ? LeaseReapStaleResult
+                          : T extends OutboxFlushCommand
+                            ? OutboxFlushResult
+                            : T extends PluginReplayDLQCommand
+                              ? PluginReplayDLQResult
+                              : T extends RunReapStuckCommand
+                                ? RunReapStuckResult
+                                : T extends RunPurgeCommand
+                                  ? RunPurgeResult
+                                  : never;

@@ -30,10 +30,12 @@ export {
   HOST_DEFAULTS,
   type HostJobMessage,
   type MaintenanceTickCounts,
+  type MaintenanceTickHook,
   type RetentionOptions,
   type RunMaintenanceTickOptions,
   retryBackoffMs,
   runMaintenanceTick,
+  runTickHook,
   toEventSinkObservation,
 } from "./host-support.js";
 export {

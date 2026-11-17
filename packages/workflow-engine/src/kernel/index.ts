@@ -9,6 +9,9 @@
 export type {
   CommandResult,
   DefinitionVersionSummary,
+  EngineStatsCommand,
+  EngineStatsResult,
+  EngineStatsSection,
   EventSinkStatus,
   JobExecuteCommand,
   JobExecuteResult,
@@ -103,10 +106,12 @@ export {
   type HostJobMessage,
   loadWorkflowContext,
   type MaintenanceTickCounts,
+  type MaintenanceTickHook,
   normalizeAnnotateArgs,
   type RetentionOptions,
   type RunMaintenanceTickOptions,
   runMaintenanceTick,
+  runTickHook,
   saveStageOutput,
   toErrorMessage,
   toEventSinkObservation,
@@ -138,6 +143,9 @@ export {
 } from "./plugins.js";
 // Port interfaces and annotation types
 export type {
+  ActiveStatus,
+  ActiveStatusCounts,
+  ActiveWorkStats,
   ActivityExecutor,
   ActivityRunInput,
   ActivityRunResult,
@@ -153,6 +161,7 @@ export type {
   EventSink,
   ExecutorDeps,
   IdempotencyRecord,
+  JobQueueStats,
   JobTransport,
   KernelServices,
   OutboxRecord,

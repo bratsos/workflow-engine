@@ -149,6 +149,7 @@ All operations go through `kernel.dispatch(command)`:
 | `run.redrive` | Retry (`from: { kind: "lastFailure" }`, default), restart (`"start"`) or rerun from a stage (`"stage"`) on the same run id; optionally re-pin with `definitionVersion: "latest"`. The superseded attempt is archived under `run.supersededAttempt` (see 14-redrive.md) |
 | `run.rerunFrom` | **Deprecated** — use `run.redrive`. Rerun from a specific stage; delegates to `run.redrive` (accepts an optional `idempotencyKey`) |
 | `run.listVersions` | Per-definition-version run counts: has a version drained, and which versions have active runs nobody here serves (see 13-definition-versioning.md) |
+| `engine.stats` | Read-only gauges of active work: runs, stages, jobs and outbox events by status, the oldest PENDING run/job, due SUSPENDED stages, unpublished and dead-lettered events (`{}` → `{ at, runs, stages, jobs, outbox }`; a section is `{ available: false }` when the port lacks `getActiveWorkStats` / `getJobStats`; see 03-runtime-setup.md) |
 | `run.purge` | Retention: delete terminal runs finished before `olderThan` (`{ olderThan, statuses?, limit? }` → `{ purged, workflowRunIds }`), clearing the step ledger, job rows and blobs with them |
 | `job.execute` | Execute a single stage (uses multi-phase transactions; see 08-common-patterns.md). Takes the job's `attempt`/`maxAttempts` and an optional `abortSignal` |
 | `job.heartbeat` | One beat of a host's job-lease heartbeat: renews the lease, reports `{ runStatus, leaseHeld }`, and is what aborts `ctx.abortSignal` |

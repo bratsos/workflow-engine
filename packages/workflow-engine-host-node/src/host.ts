@@ -17,8 +17,10 @@ import {
   HOST_DEFAULTS,
   type JobTransport,
   type Kernel,
+  type MaintenanceTickHook,
   type RetentionOptions,
   runMaintenanceTick as runMaintenanceTickCommands,
+  runTickHook,
   type ServedDefinition,
   toEventSinkObservation,
 } from "@bratsos/workflow-engine/kernel";
@@ -105,6 +107,20 @@ export interface NodeHostConfig {
    */
   retention?: RetentionOptions;
 
+  /**
+   * Called after every orchestration tick with the counts that tick
+   * computed. Use it to export gauges or counters (combine it with the
+   * `engine.stats` command for queue depth and age).
+   *
+   * A hook that throws or rejects is caught and logged; it never stops the
+   * loop. The hook is awaited as part of the tick, so a slow hook delays the
+   * next tick (interval firings that land while it runs are skipped, never
+   * queued) and ticks never overlap. A hook that never settles stops further
+   * ticks: bound anything it waits on. `stop()` waits for a running hook for
+   * at most `shutdownTimeoutMs`.
+   */
+  onTick?: MaintenanceTickHook;
+
   /** Job lease heartbeat interval in milliseconds (default: 60_000). */
   jobHeartbeatIntervalMs?: number;
 
@@ -169,6 +185,7 @@ class NodeHostImpl implements NodeHost {
   private readonly maxSuspendedChecksPerTick: number;
   private readonly maxOutboxFlushPerTick: number;
   private readonly retention: RetentionOptions | undefined;
+  private readonly onTick: MaintenanceTickHook | undefined;
   private readonly jobHeartbeatIntervalMs: number;
   private readonly shutdownTimeoutMs: number;
   private readonly flushOutboxOnStop: boolean;
@@ -194,6 +211,7 @@ class NodeHostImpl implements NodeHost {
     this.maxOutboxFlushPerTick =
       config.maxOutboxFlushPerTick ?? HOST_DEFAULTS.maxOutboxFlushPerTick;
     this.retention = config.retention;
+    this.onTick = config.onTick;
     this.jobHeartbeatIntervalMs =
       config.jobHeartbeatIntervalMs ?? HOST_DEFAULTS.jobHeartbeatIntervalMs;
     this.shutdownTimeoutMs = config.shutdownTimeoutMs ?? 10_000;
@@ -389,6 +407,7 @@ class NodeHostImpl implements NodeHost {
         ? { eventSinkError: counts.eventSinkError }
         : {}),
     });
+    await runTickHook(this.onTick, counts, "[NodeHost]");
   }
 
   // --------------------------------------------------------------------------

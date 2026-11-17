@@ -57,6 +57,8 @@ class MyCustomPersistence implements WorkflowPersistence {
   async insertDefinitionIfAbsent(...): Promise<...> { ... }
   async getDefinition(workflowId: string, version: string): Promise<... | null> { ... }
   async countRunsByDefinitionVersion(...): Promise<...> { ... }
+  // Observability (engine.stats)
+  async getActiveWorkStats(now: Date): Promise<ActiveWorkStats> { ... } // optional, see "Active-work stats"
 
   // Stages
   async createStage / upsertStage / updateStage / getStage / getStagesByRun / deleteStage
@@ -106,6 +108,7 @@ class MyCustomJobQueue implements JobQueue {
   async cancelByRun(workflowRunId: string): Promise<number> { ... }
   async getJobsByWorkflowRun(workflowRunId: string): Promise<JobRecord[]> { ... }
   async touchJob(jobId: string): Promise<void> { ... } // Heartbeat lock
+  async getJobStats(): Promise<JobQueueStats> { ... } // optional, see "Active-work stats"
   adoptWorkerId(workerId: string): string { ... } // optional: take the host's workerId on start()
   readonly fairnessGroupBy?: string | null;         // optional: read by createSpillingJobTransport
 }
@@ -231,6 +234,29 @@ class MyCustomAICallLogger implements AICallLogger {
 ```
 
 * **`listCalls`** is optional. It returns the rows under a topic prefix, oldest first, with every cost figure `CreateAICallInput` carries (`cost`, `estimatedCost`, `reportedCost`, `costSource`, `servedBy`, `cachedInputTokens`, `reasoningTokens`) as recorded. An adapter that stores only `cost` still gives `getStats` and the run cost rollup the right total; it just cannot show the registry estimate beside the provider's bill afterwards.
+
+### Active-work stats
+
+`engine.stats` reads two optional methods: `Persistence.getActiveWorkStats(now)` and `JobQueue.getJobStats()` (`JobTransport` has the same one). Both are read-only and bounded by contract: they count rows in `PENDING`, `RUNNING` and `SUSPENDED` (plus unpublished and dead-lettered outbox events) and never count or scan `COMPLETED`, `FAILED`, `CANCELLED` or `SKIPPED` rows, which accumulate without limit. On SQL that means every figure must come from an index that leads with `status` (or `publishedAt` / `dlqAt` for the outbox), not from a scan with a status filter.
+
+```typescript
+import type { ActiveWorkStats, JobQueueStats } from "@bratsos/workflow-engine";
+
+// getActiveWorkStats(now) returns:
+//   runs:   { byStatus: { PENDING, RUNNING, SUSPENDED }, oldestPendingCreatedAt: Date | null }
+//   stages: { byStatus, suspendedDue, oldestSuspendedDueAt }   // SUSPENDED and nextPollAt <= now
+//   outbox: { unpublished, oldestUnpublishedAt, deadLettered } // oldest by occurredAt
+// getJobStats() returns:
+//   { byStatus: { PENDING, RUNNING, SUSPENDED }, oldestPendingCreatedAt: Date | null }
+```
+
+* **`byStatus` has all three keys**, `0` for a status with no rows; never a key for a terminal status.
+* **`unpublished` and `deadLettered` are disjoint.** `unpublished` is what the next `outbox.flush` delivers (`publishedAt` and `dlqAt` both null); an event in the dead-letter queue is only in `deadLettered`, and does not count toward `oldestUnpublishedAt`.
+* **`suspendedDue` uses `getSuspendedStages`'s predicate**: `status = SUSPENDED` and `nextPollAt <= now`, with the `now` the kernel passes. Settled stages that still carry a deadline are not counted.
+* **Omit a method and its sections are `{ available: false }`** in the `engine.stats` result (`runs`, `stages` and `outbox` for persistence, `jobs` for the queue). The command never throws for a missing method, and never reports a missing figure as zero.
+* **Check your plan.** A filter that is true of every terminal row (`dlqAt IS NULL`, say) can make a planner drive the query from the wrong index and read them all; the built-in adapters' notes in `PrismaWorkflowPersistence.getActiveWorkStats` list what was measured. If you wrap a transport, forward `getJobStats` only when the inner transport has it, as `createSpillingJobTransport` does.
+
+The conformance suites cover both methods and skip them when absent.
 
 ---
 

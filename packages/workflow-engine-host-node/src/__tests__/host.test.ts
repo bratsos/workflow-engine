@@ -7,7 +7,11 @@
 
 import type { Workflow } from "@bratsos/workflow-engine";
 import { defineStage, WorkflowBuilder } from "@bratsos/workflow-engine";
-import { createKernel, type Kernel } from "@bratsos/workflow-engine/kernel";
+import {
+  createKernel,
+  type Kernel,
+  type MaintenanceTickCounts,
+} from "@bratsos/workflow-engine/kernel";
 import {
   CollectingEventSink,
   FakeClock,
@@ -17,7 +21,7 @@ import {
   InMemoryJobQueue,
   InMemoryWorkflowPersistence,
 } from "@bratsos/workflow-engine/testing";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { createNodeHost, type NodeHost } from "../host.js";
 
@@ -456,6 +460,100 @@ describe("NodeHost", () => {
     await stopping;
     expect(tickFinished).toBe(true);
     expect(host.getStats().orchestrationTicks).toBe(1);
+  });
+
+  it("calls onTick after every tick with that tick's counts", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, jobTransport } = createTestEnv([workflow]);
+    await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "on-tick-1",
+      workflowId: workflow.id,
+      input: { data: "hello" },
+    });
+
+    const seen: MaintenanceTickCounts[] = [];
+    host = createNodeHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+      orchestrationIntervalMs: 20,
+      jobPollIntervalMs: 20,
+      onTick: (counts) => {
+        seen.push(counts);
+      },
+    });
+    await host.start();
+    await waitFor(async () => seen.length >= 2);
+
+    // The first tick claimed the run; the counts are the tick's own.
+    expect(seen[0]?.claimed).toBe(1);
+    expect(seen[0]?.eventSinkStatus).toBe("healthy");
+    expect(seen[1]?.claimed).toBe(0);
+  });
+
+  it("logs a hook that throws or rejects and keeps ticking", async () => {
+    const { kernel, jobTransport } = createTestEnv([]);
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      let calls = 0;
+      host = createNodeHost({
+        kernel,
+        jobTransport,
+        workerId: "test-worker",
+        orchestrationIntervalMs: 20,
+        jobPollIntervalMs: 20,
+        onTick: async () => {
+          calls++;
+          if (calls === 1) throw new Error("hook threw");
+          if (calls === 2) return Promise.reject(new Error("hook rejected"));
+        },
+      });
+      await host.start();
+      await waitFor(async () => calls >= 3);
+
+      const messages = logged.mock.calls.map((args) => String(args[1]));
+      expect(messages).toContain("Error: hook threw");
+      expect(messages).toContain("Error: hook rejected");
+      expect(host.getStats().orchestrationTicks).toBeGreaterThanOrEqual(3);
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
+  it("holds the tick open for a slow hook instead of overlapping ticks", async () => {
+    const { kernel, jobTransport } = createTestEnv([]);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let running = 0;
+    let overlapped = false;
+    let calls = 0;
+
+    host = createNodeHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+      orchestrationIntervalMs: 10,
+      jobPollIntervalMs: 20,
+      onTick: async () => {
+        calls++;
+        running++;
+        if (running > 1) overlapped = true;
+        if (calls === 1) await gate;
+        running--;
+      },
+    });
+    await host.start();
+    // Many interval firings elapse while the first hook is held.
+    await new Promise((r) => setTimeout(r, 100));
+    expect(calls).toBe(1);
+    expect(host.getStats().orchestrationTicks).toBe(1);
+
+    release();
+    await waitFor(async () => calls >= 3);
+    expect(overlapped).toBe(false);
   });
 
   it("calling start() twice is safe", async () => {

@@ -7,7 +7,10 @@
 
 import type { Workflow } from "@bratsos/workflow-engine";
 import { defineStage, WorkflowBuilder } from "@bratsos/workflow-engine";
-import { createKernel } from "@bratsos/workflow-engine/kernel";
+import {
+  createKernel,
+  type MaintenanceTickCounts,
+} from "@bratsos/workflow-engine/kernel";
 import {
   CollectingEventSink,
   FakeClock,
@@ -18,7 +21,7 @@ import {
   InMemoryStepLedger,
   InMemoryWorkflowPersistence,
 } from "@bratsos/workflow-engine/testing";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { createServerlessHost, type JobMessage } from "../host.js";
 
@@ -871,5 +874,62 @@ describe("ServerlessHost", () => {
     expect(types).toContain("workflow:created");
     expect(types).toContain("workflow:started");
     expect(types).toContain("workflow:completed");
+  });
+  it("calls onTick with the counts the tick returns", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, jobTransport } = createTestEnv([workflow]);
+    const seen: MaintenanceTickCounts[] = [];
+    const host = createServerlessHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+      onTick: (counts) => {
+        seen.push(counts);
+      },
+    });
+    await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "on-tick-1",
+      workflowId: workflow.id,
+      input: { data: "hello" },
+    });
+
+    const tick = await host.runMaintenanceTick();
+    await host.runMaintenanceTick();
+
+    expect(tick.claimed).toBe(1);
+    expect(seen).toHaveLength(2);
+    expect(seen[0]).toEqual(tick);
+    expect(seen[1]?.claimed).toBe(0);
+  });
+
+  it("logs a hook that throws or rejects and still returns the counts", async () => {
+    const { kernel, jobTransport } = createTestEnv([]);
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      let calls = 0;
+      const host = createServerlessHost({
+        kernel,
+        jobTransport,
+        workerId: "test-worker",
+        onTick: async () => {
+          calls++;
+          if (calls === 1) throw new Error("hook threw");
+          return Promise.reject(new Error("hook rejected"));
+        },
+      });
+
+      const first = await host.runMaintenanceTick();
+      const second = await host.runMaintenanceTick();
+
+      expect(first.claimed).toBe(0);
+      expect(second.claimed).toBe(0);
+      expect(calls).toBe(2);
+      const messages = logged.mock.calls.map((args) => String(args[1]));
+      expect(messages).toContain("Error: hook threw");
+      expect(messages).toContain("Error: hook rejected");
+    } finally {
+      logged.mockRestore();
+    }
   });
 });

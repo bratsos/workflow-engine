@@ -31,6 +31,7 @@ import type {
   EnqueueJobInput,
   JobAckFence,
   JobAckOutcome,
+  JobQueueStats,
   JobRecord,
   PersistenceCore,
 } from "../persistence/interface";
@@ -40,6 +41,9 @@ import type { KernelEvent } from "./events";
 
 // Re-export record and input types for convenience
 export type {
+  ActiveStatus,
+  ActiveStatusCounts,
+  ActiveWorkStats,
   AnnotationActor,
   AnnotationFilters,
   AnnotationScope,
@@ -58,6 +62,7 @@ export type {
   JobAckFence,
   JobAckOutcome,
   JobQueueFairness,
+  JobQueueStats,
   JobRecord,
   OutboxRecord,
   ServedDefinition,
@@ -412,6 +417,15 @@ export interface JobTransport {
 
   /** Refresh a running job's lease without changing status. */
   touchJob(jobId: string): Promise<void>;
+
+  /**
+   * Optional. Jobs in each active status and the creation time of the oldest
+   * PENDING one, for `engine.stats`. Bounded: active rows only, served by an
+   * index that leads with `status`, no writes. A transport with no queue it
+   * can count (a push queue, say) omits it, and `engine.stats` reports
+   * `jobs` as `{ available: false }`.
+   */
+  getJobStats?(): Promise<JobQueueStats>;
 
   /**
    * Optional. Offer the host's `workerId` to the transport, so the id

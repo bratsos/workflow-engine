@@ -64,6 +64,7 @@ You can tune the host's polling frequency, lease times, and execution limits:
 | **`maxSuspendedChecksPerTick`**| `number` | `10` | Maximum number of suspended stage completion checks to perform in a single tick. |
 | **`maxOutboxFlushPerTick`** | `number` | `100` | Maximum number of outbox events to publish in a single tick. |
 | **`retention`** | `{ olderThanMs, statuses?, limit? }` | off | Delete terminal runs older than `olderThanMs` (with their stages, logs, artifacts, annotations, step ledger, job rows and blobs) through `run.purge` at the end of every tick. Nothing is deleted unless set. See [Run Retention](../troubleshooting/overview.md#run-retention). |
+| **`onTick`** | `(counts: MaintenanceTickCounts) => void \| Promise<void>` | none | Called after every orchestration tick with the counts that tick computed. A hook that throws or rejects is caught and logged and never stops the loop. It is awaited as part of the tick, so a slow hook delays the next tick (firings that land meanwhile are skipped, never queued) and ticks never overlap. See [Exporting gauges with `onTick`](#exporting-gauges-with-ontick). |
 | **`serves`** | `ServedDefinition[] \| "all"` | derived from the registry | Which definition versions this host may claim, poll and dequeue. Left unset, the kernel derives it from the registry, which is what makes a rolling deploy safe. `"all"` turns version filtering off entirely — the pre-1.0 behaviour. See [Definition versioning](../core-concepts/definition-versioning.md). |
 | **`shutdownTimeoutMs`** | `number` | `10000` (10s) | Upper bound on `stop()`: how long to wait for the in-flight job (and the in-flight orchestration tick) to finish, and separately for the final outbox flush. |
 | **`flushOutboxOnStop`** | `boolean` | `true` | Run a final `outbox.flush` in `stop()`, so `workflow:completed` for a run this process finished is published before it exits rather than by whichever process ticks next. |
@@ -152,6 +153,32 @@ own: those events have exhausted their retry budget and stop retrying. Alert
 on `eventSink.status === "degraded"` to see the problem before the queue
 fills, and on `eventSink.deadLettered` growing to see that it already has.
 Replay them with the `plugin.replayDLQ` command once the sink is back.
+
+### Exporting gauges with `onTick`
+
+`onTick` receives the counts of the tick that just ran (`claimed`, `suspendedChecked`, `staleReleased`, `eventsFlushed`, `stuckReaped`, `purged`, `eventsFailed`, `eventsDeadLettered`, `eventSinkStatus`). Dispatch [`engine.stats`](../core-concepts/kernel-and-ports.md#observing-the-engine) from it for queue depth and age. `metrics` below stands for your own metrics client; the engine depends on none.
+
+```typescript
+const host = createNodeHost({
+  kernel,
+  jobTransport,
+  workerId: "worker-prod-1",
+  onTick: async (counts) => {
+    metrics.increment("workflow_events_flushed", counts.eventsFlushed);
+
+    const stats = await kernel.dispatch({ type: "engine.stats" });
+    if (stats.jobs.available) {
+      metrics.gauge("workflow_jobs_pending", stats.jobs.byStatus.PENDING);
+      metrics.gauge("workflow_jobs_oldest_pending_age_ms", stats.jobs.oldestPendingAgeMs ?? 0);
+    }
+    if (stats.outbox.available) {
+      metrics.gauge("workflow_outbox_dead_lettered", stats.outbox.deadLettered);
+    }
+  },
+});
+```
+
+Keep the hook short and bound anything it waits on: a hook that never settles stops further ticks, and `stop()` waits for a running hook for at most `shutdownTimeoutMs`.
 
 ---
 

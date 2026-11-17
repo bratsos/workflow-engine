@@ -45,6 +45,10 @@ const host = createServerlessHost({
   // Omit it and the kernel derives it from the registry, which is what
   // makes a rolling deploy safe; "all" turns version filtering off.
   // serves: "all",
+
+  // Called at the end of every runMaintenanceTick() with its counts. A hook
+  // that throws or rejects is logged and the tick still returns.
+  // onTick: async (counts) => { ... },
 });
 ```
 
@@ -138,6 +142,30 @@ export default {
     // }
   }
 };
+```
+
+### Exporting gauges with `onTick`
+
+`onTick` receives the same counts `runMaintenanceTick()` returns, after the tick has finished and before the method returns them. A hook that throws or rejects is caught and logged, and the tick still returns its counts. The hook is awaited, so a slow hook delays the return: bound anything it waits on, as the invocation's time limit applies to it too. Dispatch [`engine.stats`](../core-concepts/kernel-and-ports.md#observing-the-engine) from it for queue depth and age. `metrics` below stands for your own metrics client; the engine depends on none.
+
+```typescript
+const host = createServerlessHost({
+  kernel,
+  jobTransport,
+  workerId: "edge-worker-1",
+  onTick: async (counts) => {
+    metrics.increment("workflow_events_flushed", counts.eventsFlushed);
+
+    const stats = await kernel.dispatch({ type: "engine.stats" });
+    if (stats.jobs.available) {
+      metrics.gauge("workflow_jobs_pending", stats.jobs.byStatus.PENDING);
+      metrics.gauge("workflow_jobs_oldest_pending_age_ms", stats.jobs.oldestPendingAgeMs ?? 0);
+    }
+    if (stats.outbox.available) {
+      metrics.gauge("workflow_outbox_dead_lettered", stats.outbox.deadLettered);
+    }
+  },
+});
 ```
 
 ## Running a workflow inside a request: `runToCompletion`

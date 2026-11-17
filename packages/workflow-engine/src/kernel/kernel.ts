@@ -34,6 +34,7 @@ import type {
 } from "../persistence/interface";
 import type {
   CommandResult,
+  EngineStatsResult,
   JobExecuteResult,
   JobHeartbeatResult,
   KernelCommand,
@@ -55,6 +56,7 @@ import type {
 import { IdempotencyInProgressError } from "./errors";
 import type { KernelEvent } from "./events";
 import { createLocalExecutor } from "./executor/local-executor.js";
+import { handleEngineStats } from "./handlers/engine-stats";
 import { handleJobExecute } from "./handlers/job-execute";
 import { handleJobHeartbeat } from "./handlers/job-heartbeat";
 import { handleLeaseReapStale } from "./handlers/lease-reap-stale";
@@ -291,6 +293,7 @@ type AnyCommandResult =
   | RunRerunFromResult
   | RunRedriveResult
   | RunListVersionsResult
+  | EngineStatsResult
   | JobExecuteResult
   | JobHeartbeatResult
   | StagePollSuspendedResult
@@ -447,6 +450,17 @@ export function createKernel(config: KernelConfig): Kernel {
     // -----------------------------------------------------------------
     if (command.type === "job.heartbeat") {
       const result = await handleJobHeartbeat(command, deps);
+      return stripEvents(result);
+    }
+
+    // -----------------------------------------------------------------
+    // engine.stats routes directly — a handful of indexed reads of active
+    // rows, no outbox write, no idempotency, no transaction. The figures
+    // are not a snapshot, so a transaction would add nothing but a held
+    // connection.
+    // -----------------------------------------------------------------
+    if (command.type === "engine.stats") {
+      const result = await handleEngineStats(command, deps);
       return stripEvents(result);
     }
 

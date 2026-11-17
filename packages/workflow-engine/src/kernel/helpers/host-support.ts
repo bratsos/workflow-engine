@@ -513,6 +513,37 @@ export interface MaintenanceTickCounts {
 }
 
 /**
+ * A host's `onTick` option: called after every maintenance tick with that
+ * tick's counts. See {@link runTickHook}.
+ */
+export type MaintenanceTickHook = (
+  counts: MaintenanceTickCounts,
+) => void | Promise<void>;
+
+/**
+ * Calls a host's `onTick` hook with the counts of the tick that just ran.
+ *
+ * A hook that throws or rejects is caught and logged: it never fails the
+ * tick, and the tick's own result is unaffected. The hook is awaited, so it
+ * counts as part of the tick: a slow hook holds the tick open (the Node host
+ * skips the interval firings that land meanwhile) instead of letting ticks
+ * overlap, and a hook that never settles holds it open for good. Keep a
+ * hook's work short and bound anything it waits on.
+ */
+export async function runTickHook(
+  hook: MaintenanceTickHook | undefined,
+  counts: MaintenanceTickCounts,
+  logPrefix: string = HOST_DEFAULTS.logPrefix,
+): Promise<void> {
+  if (!hook) return;
+  try {
+    await hook(counts);
+  } catch (error) {
+    console.error(`${logPrefix} onTick hook error:`, error);
+  }
+}
+
+/**
  * Runs one bounded maintenance pass: claim pending runs, poll suspended
  * stages (transitioning any that resumed), reap stale leases, flush the
  * outbox, reap stuck runs, and — only when `retention` is set — purge

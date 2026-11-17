@@ -9,6 +9,7 @@ import { withTransactionWriteGuard } from "./transaction-writes.js";
  */
 
 import type {
+  ActiveWorkStats,
   AnnotationFilters,
   CreateAnnotationInput,
   CreateDefinitionInput,
@@ -35,9 +36,11 @@ import type {
   WorkflowStageRecord,
 } from "../interface";
 import {
+  ACTIVE_STATUSES,
   DefinitionRegistrationRetryableError,
   StaleVersionError,
 } from "../interface";
+import { countActiveByStatus } from "./active-stats";
 import { createEnumHelper, type PrismaEnumHelper } from "./enum-compat";
 import {
   type EnginePrismaClient,
@@ -857,6 +860,70 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       count: row._count?._all ?? 0,
       oldestCreatedAt: row._min?.createdAt ?? null,
     }));
+  }
+
+  /**
+   * Active work for `engine.stats`. Every figure is served by an index, and
+   * none reads a terminal row:
+   *
+   * - runs by status, oldest PENDING: `workflow_runs_status_createdAt_id_idx`
+   *   (covering: status and createdAt);
+   * - stages by status: `workflow_stages_status_idx`;
+   * - SUSPENDED stages that are due: `workflow_stages_status_idx` for the
+   *   `status` equality, `nextPollAt` filtered on the suspended rows only;
+   * - unpublished outbox events: `outbox_events_publishedAt_idx`, with the
+   *   `dlqAt` and `occurredAt` terms read from those rows only;
+   * - dead letters: `outbox_events_dlqAt_idx`.
+   *
+   * Two filters are written the way they are so the planner cannot choose a
+   * plan that reads published rows (measured on SQLite, 100,000 published
+   * events, no `ANALYZE`):
+   * - `dlqAt IS NULL` is true of every published row, so with it as a plain
+   *   term SQLite drove the query from `outbox_events_dlqAt_idx` and walked
+   *   them all. `OR retryCount < 0` never holds (the count starts at 0 and
+   *   only rises) but makes the term unusable as an index key, leaving
+   *   `outbox_events_publishedAt_idx`, which holds only the backlog's NULLs.
+   * - `dlqAt IS NOT NULL` was a full table scan on SQLite, which does not
+   *   drive an index from it. The lower bound `dlqAt > epoch` is an index
+   *   range that excludes NULL the same way.
+   */
+  async getActiveWorkStats(now: Date): Promise<ActiveWorkStats> {
+    const active = ACTIVE_STATUSES.map((status) => this.enums.status(status));
+    const [runs, stages, due, unpublished, deadLettered] = await Promise.all([
+      countActiveByStatus(this.prisma.workflowRun, active, true),
+      countActiveByStatus(this.prisma.workflowStage, active, false),
+      this.prisma.workflowStage.aggregate({
+        where: {
+          status: this.enums.status("SUSPENDED"),
+          nextPollAt: { lte: now },
+        },
+        _count: { _all: true },
+        _min: { nextPollAt: true },
+      }),
+      this.prisma.outboxEvent.aggregate({
+        where: {
+          publishedAt: null,
+          OR: [{ dlqAt: null }, { retryCount: { lt: 0 } }],
+        },
+        _count: { _all: true },
+        _min: { occurredAt: true },
+      }),
+      this.prisma.outboxEvent.count({ where: { dlqAt: { gt: new Date(0) } } }),
+    ]);
+
+    return {
+      runs,
+      stages: {
+        byStatus: stages.byStatus,
+        suspendedDue: due._count?._all ?? 0,
+        oldestSuspendedDueAt: due._min?.nextPollAt ?? null,
+      },
+      outbox: {
+        unpublished: unpublished._count?._all ?? 0,
+        oldestUnpublishedAt: unpublished._min?.occurredAt ?? null,
+        deadLettered,
+      },
+    };
   }
 
   private mapDefinition(row: any): WorkflowDefinitionRecord {

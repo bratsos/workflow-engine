@@ -277,6 +277,9 @@ export {
 export type {
   CommandResult,
   DefinitionVersionSummary,
+  EngineStatsCommand,
+  EngineStatsResult,
+  EngineStatsSection,
   JobExecuteCommand,
   JobExecuteResult,
   JobHeartbeatCommand,
@@ -362,16 +365,21 @@ export {
   withStepResultSpill,
 } from "./kernel/spill";
 export type {
+  ActiveStatus,
+  ActiveStatusCounts,
+  ActiveWorkStats,
   CreateDefinitionInput,
   CreateOutboxEventInput,
   DefinitionVersionCount,
   DefinitionVersionCountFilter,
   IdempotencyRecord,
+  JobQueueStats,
   OutboxRecord,
   ServedDefinition,
   WorkflowDefinitionRecord,
 } from "./persistence/interface";
 export {
+  ACTIVE_STATUSES,
   DefinitionRegistrationRetryableError,
   LEASE_ABSOLUTE_CAP,
   LEASE_HEARTBEAT_LOST,

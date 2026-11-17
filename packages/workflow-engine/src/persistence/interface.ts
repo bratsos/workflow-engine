@@ -268,6 +268,57 @@ export interface IdempotencyRecord {
 }
 
 // ============================================================================
+// Active-work stats (optional ports: `PersistenceCore.getActiveWorkStats`,
+// `JobQueue.getJobStats`; read by the `engine.stats` command)
+// ============================================================================
+
+/** The non-terminal statuses: a row in one of them still has work to do. */
+export const ACTIVE_STATUSES = ["PENDING", "RUNNING", "SUSPENDED"] as const;
+export type ActiveStatus = (typeof ACTIVE_STATUSES)[number];
+
+/** A count for every active status (0 when none), never for a terminal one. */
+export type ActiveStatusCounts = Record<ActiveStatus, number>;
+
+export function isActiveStatus(status: string): status is ActiveStatus {
+  return (ACTIVE_STATUSES as readonly string[]).includes(status);
+}
+
+export function emptyActiveStatusCounts(): ActiveStatusCounts {
+  return { PENDING: 0, RUNNING: 0, SUSPENDED: 0 };
+}
+
+/** What `PersistenceCore.getActiveWorkStats` reports. */
+export interface ActiveWorkStats {
+  runs: {
+    byStatus: ActiveStatusCounts;
+    /** `createdAt` of the oldest PENDING run, or `null` when none is pending. */
+    oldestPendingCreatedAt: Date | null;
+  };
+  stages: {
+    byStatus: ActiveStatusCounts;
+    /** SUSPENDED stages whose `nextPollAt` is at or before `now`. */
+    suspendedDue: number;
+    /** The earliest `nextPollAt` among those due stages, or `null` when none is due. */
+    oldestSuspendedDueAt: Date | null;
+  };
+  outbox: {
+    /** Events the next flush will deliver: not published, not dead-lettered. */
+    unpublished: number;
+    /** `occurredAt` of the oldest of those, or `null` when there are none. */
+    oldestUnpublishedAt: Date | null;
+    /** Events moved to the dead-letter queue and not yet replayed. */
+    deadLettered: number;
+  };
+}
+
+/** What `JobQueue.getJobStats` reports. */
+export interface JobQueueStats {
+  byStatus: ActiveStatusCounts;
+  /** `createdAt` of the oldest PENDING job, or `null` when none is pending. */
+  oldestPendingCreatedAt: Date | null;
+}
+
+// ============================================================================
 // AI Call Record Types
 // ============================================================================
 
@@ -853,6 +904,24 @@ export interface PersistenceCore {
     filter?: DefinitionVersionCountFilter,
   ): Promise<DefinitionVersionCount[]>;
 
+  /**
+   * Optional. The state of active work, for `engine.stats`: runs, stages and
+   * outbox events that still need something to happen.
+   *
+   * Bounded by contract: it counts rows in {@link ACTIVE_STATUSES} (and
+   * unpublished or dead-lettered outbox rows) only, and never counts or
+   * scans COMPLETED, FAILED, CANCELLED or SKIPPED rows, which accumulate
+   * without limit. An implementation backed by SQL must serve every figure
+   * from an index that leads with `status` (or `publishedAt` / `dlqAt` for
+   * the outbox). It writes nothing. `now` is the kernel clock, used for the
+   * "due" cut-off of suspended stages: the same `status = SUSPENDED AND
+   * nextPollAt <= now` predicate `getSuspendedStages` applies.
+   *
+   * Omit it and `engine.stats` reports the `runs`, `stages` and `outbox`
+   * figures as `{ available: false }` instead of failing.
+   */
+  getActiveWorkStats?(now: Date): Promise<ActiveWorkStats>;
+
   // WorkflowStage operations
   createStage(data: CreateStageInput): Promise<WorkflowStageRecord>;
   upsertStage(data: UpsertStageInput): Promise<WorkflowStageRecord>;
@@ -1208,6 +1277,15 @@ export interface JobQueue {
    * `releaseStaleJobs` doesn't duplicate work still in-flight.
    */
   touchJob(jobId: string): Promise<void>;
+
+  /**
+   * Optional. Jobs in each active status and the creation time of the oldest
+   * PENDING one, for `engine.stats`. Bounded like
+   * {@link PersistenceCore.getActiveWorkStats}: active rows only, served by an
+   * index that leads with `status`, no writes. Omit it and `engine.stats`
+   * reports `jobs` as `{ available: false }`.
+   */
+  getJobStats?(): Promise<JobQueueStats>;
 
   /**
    * Optional. Offer a host's `workerId` to the queue so it is the id

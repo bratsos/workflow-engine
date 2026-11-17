@@ -1991,6 +1991,138 @@ export function persistenceConformanceSuite(
       });
     });
 
+    describe("active work stats (optional getActiveWorkStats)", () => {
+      const minDate = (...dates: Date[]) =>
+        new Date(Math.min(...dates.map((d) => d.getTime())));
+
+      it("should report zeros and nulls on an empty store", async () => {
+        if (!persistence.getActiveWorkStats) return; // optional port method
+
+        const stats = await persistence.getActiveWorkStats(new Date());
+
+        const none = { PENDING: 0, RUNNING: 0, SUSPENDED: 0 };
+        expect(stats.runs).toEqual({
+          byStatus: none,
+          oldestPendingCreatedAt: null,
+        });
+        expect(stats.stages).toEqual({
+          byStatus: none,
+          suspendedDue: 0,
+          oldestSuspendedDueAt: null,
+        });
+        expect(stats.outbox).toEqual({
+          unpublished: 0,
+          oldestUnpublishedAt: null,
+          deadLettered: 0,
+        });
+      });
+
+      it("should count runs by active status and leave terminal runs out", async () => {
+        if (!persistence.getActiveWorkStats) return;
+
+        const statuses = [
+          ["stats-pending-1", "PENDING"],
+          ["stats-pending-2", "PENDING"],
+          ["stats-running", "RUNNING"],
+          ["stats-suspended", "SUSPENDED"],
+          ["stats-completed", "COMPLETED"],
+          ["stats-failed", "FAILED"],
+          ["stats-cancelled", "CANCELLED"],
+        ] as const;
+        for (const [id, status] of statuses) {
+          await persistence.createRun(createRunData({ id }));
+          if (status !== "PENDING") await persistence.updateRun(id, { status });
+        }
+        const pending1 = (await persistence.getRun("stats-pending-1"))!;
+        const pending2 = (await persistence.getRun("stats-pending-2"))!;
+
+        const stats = await persistence.getActiveWorkStats(new Date());
+
+        expect(stats.runs.byStatus).toEqual({
+          PENDING: 2,
+          RUNNING: 1,
+          SUSPENDED: 1,
+        });
+        expect(stats.runs.oldestPendingCreatedAt).toEqual(
+          minDate(pending1.createdAt, pending2.createdAt),
+        );
+      });
+
+      it("should count stages by active status and the suspended ones that are due", async () => {
+        if (!persistence.getActiveWorkStats) return;
+
+        const now = new Date("2026-03-01T12:00:00.000Z");
+        const at = (offsetMs: number) => new Date(now.getTime() + offsetMs);
+        const stages: Array<
+          [
+            string,
+            "PENDING" | "RUNNING" | "SUSPENDED" | "COMPLETED" | "FAILED",
+            Date | null,
+          ]
+        > = [
+          ["stats-pending", "PENDING", null],
+          ["stats-running", "RUNNING", null],
+          ["stats-due-old", "SUSPENDED", at(-60_000)],
+          ["stats-due-new", "SUSPENDED", at(-10_000)],
+          ["stats-due-edge", "SUSPENDED", now],
+          ["stats-not-due", "SUSPENDED", at(60_000)],
+          ["stats-no-poll", "SUSPENDED", null],
+          // A settled stage can keep a due deadline until its job is acked.
+          ["stats-settled", "COMPLETED", at(-120_000)],
+          ["stats-failed", "FAILED", at(-120_000)],
+        ];
+        for (const [stageId, status, nextPollAt] of stages) {
+          const created = await persistence.createStage(
+            await createStageData({ stageId, status }),
+          );
+          if (nextPollAt)
+            await persistence.updateStage(created.id, { nextPollAt });
+        }
+
+        const stats = await persistence.getActiveWorkStats(now);
+
+        expect(stats.stages.byStatus).toEqual({
+          PENDING: 1,
+          RUNNING: 1,
+          SUSPENDED: 5,
+        });
+        expect(stats.stages.suspendedDue).toBe(3);
+        expect(stats.stages.oldestSuspendedDueAt).toEqual(at(-60_000));
+      });
+
+      it("should count the outbox backlog and dead letters apart", async () => {
+        if (!persistence.getActiveWorkStats) return;
+
+        const now = Date.now();
+        const occurred = [-400_000, -300_000, -200_000, -100_000, -50_000].map(
+          (offsetMs) => new Date(now + offsetMs),
+        );
+        await persistence.appendOutboxEvents(
+          occurred.map((occurredAt, i) => ({
+            workflowRunId: "stats-outbox-run",
+            eventType: "run.started",
+            payload: { i },
+            causationId: `cmd-${i}`,
+            occurredAt,
+          })),
+        );
+        const events = await persistence.getUnpublishedOutboxEvents();
+        expect(events).toHaveLength(5);
+        // The oldest event is dead-lettered, so it must not be the backlog's
+        // oldest; the newest is published, so it is not in the backlog.
+        await persistence.moveOutboxEventToDLQ(events[0]!.id);
+        await persistence.markOutboxEventsPublished([events[4]!.id]);
+
+        const stats = await persistence.getActiveWorkStats(new Date());
+
+        expect(stats.outbox).toEqual({
+          unpublished: 3,
+          oldestUnpublishedAt: occurred[1],
+          deadLettered: 1,
+        });
+      });
+    });
+
     describe("idempotency operations", () => {
       it("should acquire a new idempotency key", async () => {
         const result = await persistence.acquireIdempotencyKey(
@@ -3095,6 +3227,53 @@ export function jobQueueConformanceSuite(
         expect(await expire(60 * 60_000)).toBe(0);
         const [job] = await queue.getJobsByWorkflowRun("tier-within");
         expect(job?.status).toBe("RUNNING");
+      });
+    });
+
+    describe("job stats (optional getJobStats)", () => {
+      it("should report zeros and a null age on an empty queue", async () => {
+        if (!queue.getJobStats) return; // optional port method
+
+        expect(await queue.getJobStats()).toEqual({
+          byStatus: { PENDING: 0, RUNNING: 0, SUSPENDED: 0 },
+          oldestPendingCreatedAt: null,
+        });
+      });
+
+      it("should count jobs by active status and leave terminal jobs out", async () => {
+        if (!queue.getJobStats) return;
+
+        // Dequeue order is priority DESC: a, b, c, d leave the queue in turn.
+        const priorities = { a: 9, b: 8, c: 7, d: 6, e: 5, f: 5 };
+        for (const [key, priority] of Object.entries(priorities)) {
+          await (queue as LegacyQueue).enqueue(
+            createJobInput({
+              workflowRunId: `stats-run-${key}`,
+              stageId: "stats-stage",
+              priority,
+            }),
+          );
+        }
+        const a = await queue.dequeue();
+        await queue.complete(a!.jobId); // COMPLETED
+        await queue.dequeue(); // b stays RUNNING
+        const c = await queue.dequeue();
+        await queue.suspend(c!.jobId, new Date(Date.now() + 3_600_000)); // SUSPENDED
+        const d = await queue.dequeue();
+        await queue.fail(d!.jobId, "terminal", false); // FAILED
+        const [e] = await queue.getJobsByWorkflowRun("stats-run-e");
+        const [f] = await queue.getJobsByWorkflowRun("stats-run-f");
+
+        const stats = await queue.getJobStats();
+
+        expect(stats.byStatus).toEqual({
+          PENDING: 2,
+          RUNNING: 1,
+          SUSPENDED: 1,
+        });
+        expect(stats.oldestPendingCreatedAt).toEqual(
+          new Date(Math.min(e!.createdAt.getTime(), f!.createdAt.getTime())),
+        );
       });
     });
 

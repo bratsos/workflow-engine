@@ -16,8 +16,10 @@ import {
   HOST_DEFAULTS,
   type JobTransport,
   type Kernel,
+  type MaintenanceTickHook,
   type RetentionOptions,
   runMaintenanceTick as runMaintenanceTickCommands,
+  runTickHook,
   type ServedDefinition,
 } from "@bratsos/workflow-engine/kernel";
 
@@ -70,6 +72,19 @@ export interface ServerlessHostConfig {
    * default: nothing is deleted unless this is set.
    */
   retention?: RetentionOptions;
+
+  /**
+   * Called at the end of every `runMaintenanceTick()` with the counts it
+   * computed, before the method returns them. Use it to export gauges or
+   * counters (combine it with the `engine.stats` command for queue depth and
+   * age).
+   *
+   * A hook that throws or rejects is caught and logged; the tick still
+   * returns its counts. The hook is awaited, so a slow hook delays the
+   * return of `runMaintenanceTick()`, so an invocation with a time limit
+   * should bound what the hook waits on.
+   */
+  onTick?: MaintenanceTickHook;
 
   /**
    * Publish this job's outbox events right after `handleJob` settles it
@@ -180,6 +195,7 @@ class ServerlessHostImpl implements ServerlessHost {
   private readonly maxSuspendedChecksPerTick: number;
   private readonly maxOutboxFlushPerTick: number;
   private readonly retention: RetentionOptions | undefined;
+  private readonly onTick: MaintenanceTickHook | undefined;
   private readonly jobHeartbeatIntervalMs: number;
   private readonly flushOutboxAfterJob: boolean;
   private readonly outboxFlushTimeoutMs: number;
@@ -201,6 +217,7 @@ class ServerlessHostImpl implements ServerlessHost {
     this.maxOutboxFlushPerTick =
       config.maxOutboxFlushPerTick ?? HOST_DEFAULTS.maxOutboxFlushPerTick;
     this.retention = config.retention;
+    this.onTick = config.onTick;
     this.jobHeartbeatIntervalMs =
       config.jobHeartbeatIntervalMs ?? HOST_DEFAULTS.jobHeartbeatIntervalMs;
     this.flushOutboxAfterJob = config.flushOutboxAfterJob ?? true;
@@ -338,6 +355,7 @@ class ServerlessHostImpl implements ServerlessHost {
         `[ServerlessHost] event sink DEAD-LETTERED ${counts.eventsDeadLettered} event(s): they will not be delivered until replayed with the plugin.replayDLQ command`,
       );
     }
+    await runTickHook(this.onTick, counts, "[ServerlessHost]");
     return counts;
   }
 }

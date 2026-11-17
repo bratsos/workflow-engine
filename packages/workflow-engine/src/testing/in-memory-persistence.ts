@@ -16,6 +16,7 @@
 
 import { randomUUID } from "crypto";
 import {
+  type ActiveWorkStats,
   type AnnotationFilters,
   type CreateAnnotationInput,
   type CreateDefinitionInput,
@@ -25,7 +26,9 @@ import {
   type CreateStageInput,
   type DefinitionVersionCount,
   type DefinitionVersionCountFilter,
+  emptyActiveStatusCounts,
   type IdempotencyRecord,
+  isActiveStatus,
   type OutboxRecord,
   type PurgeableRun,
   type PurgeableRunStatus,
@@ -1053,6 +1056,70 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
       }
     }
     return Array.from(buckets.values());
+  }
+
+  async getActiveWorkStats(now: Date): Promise<ActiveWorkStats> {
+    const runs = emptyActiveStatusCounts();
+    let oldestPendingCreatedAt: Date | null = null;
+    for (const run of this.runs.values()) {
+      if (!isActiveStatus(run.status)) continue;
+      runs[run.status]++;
+      if (
+        run.status === "PENDING" &&
+        (oldestPendingCreatedAt === null ||
+          run.createdAt < oldestPendingCreatedAt)
+      ) {
+        oldestPendingCreatedAt = run.createdAt;
+      }
+    }
+
+    const stages = emptyActiveStatusCounts();
+    let suspendedDue = 0;
+    let oldestSuspendedDueAt: Date | null = null;
+    const seenStages = new Set<string>();
+    for (const stage of this.stages.values()) {
+      // Stages are stored under two keys; count each record once.
+      if (seenStages.has(stage.id)) continue;
+      seenStages.add(stage.id);
+      if (!isActiveStatus(stage.status)) continue;
+      stages[stage.status]++;
+      if (
+        stage.status === "SUSPENDED" &&
+        stage.nextPollAt !== null &&
+        stage.nextPollAt <= now
+      ) {
+        suspendedDue++;
+        if (
+          oldestSuspendedDueAt === null ||
+          stage.nextPollAt < oldestSuspendedDueAt
+        ) {
+          oldestSuspendedDueAt = stage.nextPollAt;
+        }
+      }
+    }
+
+    let unpublished = 0;
+    let deadLettered = 0;
+    let oldestUnpublishedAt: Date | null = null;
+    for (const event of this.outbox) {
+      if (event.dlqAt !== null) {
+        deadLettered++;
+      } else if (event.publishedAt === null) {
+        unpublished++;
+        if (
+          oldestUnpublishedAt === null ||
+          event.occurredAt < oldestUnpublishedAt
+        ) {
+          oldestUnpublishedAt = event.occurredAt;
+        }
+      }
+    }
+
+    return {
+      runs: { byStatus: runs, oldestPendingCreatedAt },
+      stages: { byStatus: stages, suspendedDue, oldestSuspendedDueAt },
+      outbox: { unpublished, oldestUnpublishedAt, deadLettered },
+    };
   }
 
   // ============================================================================

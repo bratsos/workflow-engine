@@ -99,6 +99,13 @@ interface PersistenceCore {
   getDefinition(workflowId: string, version: string): Promise<WorkflowDefinitionRecord | null>;
   countRunsByDefinitionVersion(filter?: DefinitionVersionCountFilter): Promise<DefinitionVersionCount[]>;
 
+  // Observability. Optional: without it `engine.stats` reports runs, stages and outbox as
+  // `{ available: false }`. Counts ACTIVE rows only (PENDING/RUNNING/SUSPENDED, unpublished and
+  // dead-lettered outbox events) from status-led indexes; never reads a terminal row. Returns
+  // { runs: { byStatus, oldestPendingCreatedAt }, stages: { byStatus, suspendedDue, oldestSuspendedDueAt },
+  //   outbox: { unpublished, oldestUnpublishedAt (by occurredAt), deadLettered } }.
+  getActiveWorkStats?(now: Date): Promise<ActiveWorkStats>;
+
   // WorkflowStage operations
   createStage(data: CreateStageInput): Promise<WorkflowStageRecord>;
   upsertStage(data: UpsertStageInput): Promise<WorkflowStageRecord>;
@@ -201,6 +208,8 @@ interface JobQueue {
   cancelByRun(workflowRunId: string): Promise<number>;
   getJobsByWorkflowRun(workflowRunId: string): Promise<JobRecord[]>;
   touchJob(jobId: string): Promise<void>;
+  /** Optional: jobs per active status and the oldest PENDING `createdAt`, for `engine.stats` (active rows only, status-led index). Without it `jobs` is `{ available: false }`. */
+  getJobStats?(): Promise<JobQueueStats>;
   /** Optional: take the host's workerId unless one was configured; return the id actually stamped. */
   adoptWorkerId?(workerId: string): string;
 }
@@ -1400,8 +1409,17 @@ takes a `StepLedgerFactory` returning a `StepLedgerFixture`
 has a `clear(stageRecordId)` of its own. The suites cover `listRunsForPurge` /
 `deleteRun`, the outbox claim/release pair, the fenced and unfenced job
 acknowledgements, `enqueueParallel`'s idempotency, `deleteByRunAndStages`,
-`clearExcept`, `compareAndSet` with and without a pinned attempt, and the
-`StepRecordPatch` null rule.
+`clearExcept`, `compareAndSet` with and without a pinned attempt, the
+`StepRecordPatch` null rule, and the optional `getActiveWorkStats` /
+`getJobStats` (skipped when absent).
+
+The Prisma adapters serve `getActiveWorkStats` and `getJobStats` from the
+`status`-led indexes (`workflow_runs`, `workflow_stages`, `job_queue`) and from
+`outbox_events_publishedAt_idx` / `outbox_events_dlqAt_idx`. Two outbox filters
+are written to keep SQLite from driving the query off the wrong index (`dlqAt
+IS NULL` is true of every published row; `dlqAt IS NOT NULL` is not driven by
+an index): a custom SQL adapter should check its own plans with 100,000
+terminal rows present.
 
 Two suites wait on real time (no injectable clock, no "flush pending writes"
 call), so keep the runner's per-test timeout at its 5 s default or higher.

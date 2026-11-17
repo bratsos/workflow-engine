@@ -19,10 +19,13 @@ import {
   type DequeueOptions,
   type DequeueResult,
   type EnqueueJobInput,
+  emptyActiveStatusCounts,
+  isActiveStatus,
   type JobAckFence,
   type JobAckOutcome,
   type JobQueue,
   type JobQueueFairness,
+  type JobQueueStats,
   type JobRecord,
   LEASE_ABSOLUTE_CAP,
   LEASE_HEARTBEAT_LOST,
@@ -575,6 +578,23 @@ export class InMemoryJobQueue implements JobQueue {
     }
 
     return expired;
+  }
+
+  async getJobStats(): Promise<JobQueueStats> {
+    const byStatus = emptyActiveStatusCounts();
+    let oldestPendingCreatedAt: Date | null = null;
+    for (const job of this.jobs.values()) {
+      if (!isActiveStatus(job.status)) continue;
+      byStatus[job.status]++;
+      if (
+        job.status === "PENDING" &&
+        (oldestPendingCreatedAt === null ||
+          job.createdAt < oldestPendingCreatedAt)
+      ) {
+        oldestPendingCreatedAt = job.createdAt;
+      }
+    }
+    return { byStatus, oldestPendingCreatedAt };
   }
 
   async getJobsByWorkflowRun(workflowRunId: string): Promise<JobRecord[]> {

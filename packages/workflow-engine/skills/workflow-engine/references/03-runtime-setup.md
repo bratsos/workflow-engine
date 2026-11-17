@@ -89,7 +89,7 @@ const kernel = createKernel({
 
 | Port | Interface | Purpose |
 |------|-----------|---------|
-| `persistence` | `Persistence` | CRUD for runs, stages, logs, outbox events, idempotency keys |
+| `persistence` | `Persistence` | CRUD for runs, stages, logs, outbox events, idempotency keys; optional `getActiveWorkStats(now)` (read by `engine.stats`) |
 | `blobStore` | `BlobStore` | `put(key, data)`, `get(key)`, `has(key)`, `delete(key)`, `list(prefix)` |
 | `jobTransport` | `JobTransport` | `enqueueParallel` (idempotent on `(workflowRunId, stageId)`; the legacy `enqueue` left the port at 1.0), `deleteByRunAndStages` (used by `run.redrive` / `run.rerunFrom`), `dequeue(options?)` (`options.serves` filters by definition version; returns `startedAt`), `complete`, `suspend(jobId, nextPollAt, fence?)`, `fail(jobId, error, shouldRetry?, fence?)` (all three take an optional `JobAckFence` and return `"acknowledged" \| "superseded"`), `defer` (optional: decline a job without spending an attempt), `releaseStaleJobs`, `expireRunawayJobs` (optional, absolute lease tier), `cancelByRun`, `touchJob` (lease heartbeat), `getJobsByWorkflowRun`, `adoptWorkerId` (optional), `fairnessGroupBy` (optional readonly property, read by `createSpillingJobTransport`) |
 | `eventSink` | `EventSink` | `emit(event)` - async event publishing |
@@ -126,6 +126,7 @@ const host = createNodeHost({
   shutdownTimeoutMs: 10_000,          // 1.0: bound on stop() waiting for the in-flight job / tick and the final flush
   flushOutboxOnStop: true,            // 1.0: run a final outbox.flush in stop() so this process publishes its own workflow:completed
   // retention: { olderThanMs: 30 * 24 * 60 * 60 * 1000, statuses?, limit? }, // Opt-in: run.purge on every tick (see 09-troubleshooting.md, "Run Retention")
+  // onTick: async (counts) => { ... }, // 1.0.0-alpha.21: called after every tick with its MaintenanceTickCounts (see "Exporting gauges")
   // serves: "all",                   // 1.0: turn definition-version filtering off.
                                       // Omitted, the kernel derives it from the
                                       // registry (claim, poll and dequeue alike).
@@ -193,6 +194,29 @@ SQLite the comparison stays in application code -- one process, one clock.
 
 An interval firing that lands while the previous tick is still running is skipped (`orchestrationTicks` counts ticks that ran), and `stop()` waits for an in-flight tick, bounded by `shutdownTimeoutMs`, before its final outbox flush. Several hosts may run against one database: suspended stages are claimed per poll, so a stage body runs once across processes (see 08-common-patterns.md, "Suspended-Stage Claims").
 
+### Exporting gauges
+
+`onTick` (both hosts) is called after every maintenance tick with that tick's `MaintenanceTickCounts`; the `engine.stats` command adds queue depth and age. The engine takes no metrics dependency: `metrics` below is your own client.
+
+```typescript
+const host = createNodeHost({
+  kernel, jobTransport, workerId: "worker-1",
+  onTick: async (counts) => {
+    metrics.increment("workflow_events_flushed", counts.eventsFlushed);
+    const stats = await kernel.dispatch({ type: "engine.stats" });
+    if (stats.jobs.available) {
+      metrics.gauge("workflow_jobs_pending", stats.jobs.byStatus.PENDING);
+      metrics.gauge("workflow_jobs_oldest_pending_age_ms", stats.jobs.oldestPendingAgeMs ?? 0);
+    }
+    if (stats.outbox.available) metrics.gauge("workflow_outbox_dead_lettered", stats.outbox.deadLettered);
+  },
+});
+```
+
+- A hook that throws or rejects is caught and logged (`<prefix> onTick hook error:`); it never stops the loop and never fails a tick.
+- The hook is awaited as part of the tick. On the Node host a slow hook delays the next tick (firings that land meanwhile are skipped, never queued), so ticks never overlap; a hook that never settles stops further ticks, and `stop()` waits for it for at most `shutdownTimeoutMs`. On the serverless host it delays the return of `runMaintenanceTick()`.
+- `engine.stats` returns `{ at, runs, stages, jobs, outbox }`. Each section is `{ available: true, ... }` or `{ available: false }` when the port behind it has no `getActiveWorkStats` (runs, stages, outbox) or `getJobStats` (jobs). It counts PENDING, RUNNING and SUSPENDED rows only, never terminal ones, and writes nothing. Ages are milliseconds on the kernel clock; `null` means nothing is waiting.
+
 ### Worker Process Pattern
 
 ```typescript
@@ -228,6 +252,7 @@ const host = createServerlessHost({
   flushOutboxAfterJob: true,          // 1.0: publish outbox events right after handleJob settles (no process lifecycle to hook)
   outboxFlushTimeoutMs: 5_000,        // 1.0: bound on that post-job flush
   // retention: { olderThanMs: 30 * 24 * 60 * 60 * 1000 }, // Opt-in: run.purge on every tick
+  // onTick: async (counts) => { ... }, // 1.0.0-alpha.21: called at the end of every runMaintenanceTick() (see "Exporting gauges")
   // serves: "all",                   // 1.0: turn definition-version filtering off
 });
 ```
@@ -381,6 +406,7 @@ import {
 | `executeJobWithHeartbeat(kernel, options)` | Dispatches `job.execute` for one job (passing the job's `attempt`/`maxAttempts` and an `abortSignal`), dispatching `job.heartbeat` on `jobHeartbeatIntervalMs` for its duration (renews the lease, aborts the body on cancel or a lost lease), then routes the outcome through the job transport (`complete`/`suspend`/`fail`/`defer`, fenced with the job's `startedAt`) and `run.transition` when terminal. Returns an `ExecuteJobOutcome` (`outcome`, `error?`, `dead?`, `willRetry?`, `attempt?`, `maxAttempts?`, `retryDelayMs?`, `deferred?`). |
 | `runMaintenanceTick(kernel, options)` | Runs one bounded maintenance pass -- `run.claimPending`, `stage.pollSuspended` (transitioning any resumed runs), `lease.reapStale` (both lease tiers), `outbox.flush`, `run.reapStuck`, and `run.purge` when `retention` is set. Each command's error is caught and logged independently so one failure doesn't block the rest of the tick. |
 | `HOST_DEFAULTS` | The shared tuning defaults (`workerId`, `logPrefix`, `staleLeaseThresholdMs` 300s, `jobAbsoluteTimeoutMs` 1h, `maxClaimsPerTick` 10, `maxSuspendedChecksPerTick` 10, `maxOutboxFlushPerTick` 100, `jobHeartbeatIntervalMs` 60s, `maxAttempts` 3, `versionDeferMs` 30s, `computeStuckThresholdMs()`) both built-in hosts fall back to. Every field of both option bags is optional, so `runMaintenanceTick(kernel)` and `executeJobWithHeartbeat(kernel, { jobTransport, job })` work as-is. |
+| `runTickHook(hook, counts, logPrefix)` / `MaintenanceTickHook` | What both hosts use to call `onTick`: awaits the hook and logs, rather than throws, whatever it throws. For a custom loop. |
 | `createEventSinkMonitor()` / `EventSinkHealth` | The degraded-sink state machine the Node host uses, for a custom loop (see "Degraded event sink"). |
 | `toErrorMessage(error)` | Normalizes a caught `unknown` into a display-safe string (`Error#message`, or `String(error)`). |
 
