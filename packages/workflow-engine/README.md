@@ -445,7 +445,6 @@ model OutboxEvent {
   dlqAt           DateTime?
 
   @@unique([workflowRunId, sequence])
-  @@index([deliveryClaim, id], map: "outbox_events_delivery_ready_idx")
   @@index([publishedAt, dlqAt, workflowRunId, deliveryClaim], map: "outbox_events_delivery_run_idx")
   @@index([publishedAt, dlqAt, workflowRunId, sequence], map: "outbox_events_live_run_sequence_idx")
   @@index([publishedAt])
@@ -484,7 +483,7 @@ model WorkflowBlob {
 }
 ```
 
-Install the shipped outbox-head SQL for your database in the same migration as the schema. Use `prisma/outbox-heads.postgresql.sql` for PostgreSQL and `prisma/outbox-heads.sqlite.sql` for SQLite. The scripts initialize and maintain the index of claimable run heads. Run this SQL for a fresh database as well.
+The Prisma schema provisions outbox delivery on PostgreSQL and SQLite. Keep `deliveryClaim` nullable. It holds an expiry and owner token during a claim. Flushers compute run heads from the current rows. The live-run sequence index finds the next run head, and the live-run claim index checks for a lease when replay has restored an earlier event.
 
 Run the migration:
 

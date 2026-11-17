@@ -22,7 +22,6 @@ exports.createSqliteDb = (file) => {
   mkdirSync(dirname(file), { recursive: true });
   run("contract", "emit");
   run("db", "init");
-  require("../schema.cjs").installOutboxHeads(file);
 
   const contract = contractFromJson(
     JSON.parse(

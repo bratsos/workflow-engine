@@ -1857,6 +1857,64 @@ export function persistenceConformanceSuite(
         ).toBe(2);
       });
 
+      it("serves other runs while their heads keep failing", async () => {
+        const now = new Date("2025-01-01T00:00:00.000Z");
+        const runs = ["retry-a", "retry-b", "retry-c", "retry-d"];
+        await persistence.appendOutboxEvents(
+          runs.map((workflowRunId) => ({
+            workflowRunId,
+            eventType: "delivery",
+            payload: {},
+            occurredAt: now,
+            causationId: "fairness",
+          })),
+        );
+        for (let round = 0; round < 2; round++) {
+          const attempted = [];
+          for (let i = 0; i < runs.length; i++) {
+            const claim = `2025-01-01T00:01:00.000Z|fairness-${round}-${i}`;
+            const [row] = await persistence.claimOutboxDelivery(
+              1,
+              claim,
+              now,
+              [],
+            );
+            expect(row).toBeDefined();
+            attempted.push(row!.workflowRunId);
+            expect(
+              await persistence.failOutboxDelivery(row!.id, claim, 10, now),
+            ).toBe("retry");
+          }
+          expect(attempted.sort()).toEqual(runs);
+        }
+      });
+
+      it("does not acquire a page for a cancelled flush", async () => {
+        const now = new Date("2025-01-01T00:00:00.000Z");
+        const claim = "2025-01-01T00:01:00.000Z|cancelled";
+        await persistence.appendOutboxEvents([
+          {
+            workflowRunId: "cancelled-flush",
+            eventType: "delivery",
+            payload: {},
+            occurredAt: now,
+            causationId: "cancel",
+          },
+        ]);
+        expect(
+          await persistence.claimOutboxDelivery(
+            1,
+            claim,
+            now,
+            [],
+            AbortSignal.abort(),
+          ),
+        ).toEqual([]);
+        expect(
+          await persistence.claimOutboxDelivery(1, claim, now, []),
+        ).toHaveLength(1);
+      });
+
       it("schedules independent run heads and preserves a successor already claimed before replay", async () => {
         const now = new Date("2025-01-01T00:00:00.000Z");
         const token = "2025-01-01T00:01:00.000Z|replay";

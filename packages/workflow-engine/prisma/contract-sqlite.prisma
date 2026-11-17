@@ -327,7 +327,6 @@ model OutboxEvent {
   dlqAt         DateTime?
 
   @@unique([workflowRunId, sequence])
-  @@index([deliveryClaim, id], map: "outbox_events_delivery_ready_idx")
   @@index([publishedAt, dlqAt, workflowRunId, deliveryClaim], map: "outbox_events_delivery_run_idx")
   @@index([publishedAt, dlqAt, workflowRunId, sequence], map: "outbox_events_live_run_sequence_idx")
   @@index([publishedAt])

@@ -104,6 +104,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
   private nextAnnotationSequence = 0;
   private outbox: OutboxRecord[] = [];
   private outboxClaims = new Map<string, string>();
+  private lastOutboxRun?: string;
   private idempotencyKeys = new Map<string, IdempotencyRecord>();
   /** Maps composite key -> the time the key was (re)acquired as in-progress. */
   private idempotencyInProgress = new Map<string, Date>();
@@ -711,36 +712,36 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
     claim: string,
     now: Date,
     excludedRunIds: readonly string[],
+    signal?: Pick<AbortSignal, "aborted">,
   ): Promise<OutboxRecord[]> {
+    if (limit <= 0 || signal?.aborted) return [];
     const excluded = new Set(excludedRunIds);
-    const seen = new Set<string>();
-    const result: OutboxRecord[] = [];
-    const rows = this.outbox
-      .filter((row) => row.publishedAt === null && row.dlqAt === null)
-      .sort(
-        (a, b) =>
-          a.workflowRunId.localeCompare(b.workflowRunId) ||
-          a.sequence - b.sequence,
-      );
-    // A replay can reinsert an earlier sequence after a successor was claimed.
-    // Keep the already selected row at the head until it settles.
-    const owned = new Map<string, string>();
-    for (const row of rows) {
-      if (this.outboxClaims.has(row.id)) owned.set(row.workflowRunId, row.id);
+    const blocked = new Set<string>();
+    const heads = new Map<string, OutboxRecord>();
+    const deadline = now.toISOString();
+    for (const row of this.outbox) {
+      if (row.publishedAt !== null || row.dlqAt !== null) continue;
+      if (excluded.has(row.workflowRunId)) continue;
+      const lease = this.outboxClaims.get(row.id);
+      if (lease && lease.slice(0, 24) > deadline)
+        blocked.add(row.workflowRunId);
+      const head = heads.get(row.workflowRunId);
+      if (!head || row.sequence < head.sequence)
+        heads.set(row.workflowRunId, row);
     }
-    for (const row of rows) {
-      const owner = owned.get(row.workflowRunId);
-      if (
-        (owner !== undefined && owner !== row.id) ||
-        seen.has(row.workflowRunId) ||
-        excluded.has(row.workflowRunId)
-      )
-        continue;
-      seen.add(row.workflowRunId);
-      const previous = this.outboxClaims.get(row.id);
-      if (previous && previous.slice(0, 24) > now.toISOString()) continue;
+    const runs = [...heads.keys()].sort();
+    const after = this.lastOutboxRun;
+    const split =
+      after === undefined ? 0 : runs.findIndex((run) => run > after);
+    const ordered =
+      split > 0 ? runs.slice(split).concat(runs.slice(0, split)) : runs;
+    const result: OutboxRecord[] = [];
+    for (const run of ordered) {
       if (result.length >= limit) break;
+      if (blocked.has(run)) continue;
+      const row = heads.get(run)!;
       this.outboxClaims.set(row.id, claim);
+      this.lastOutboxRun = run;
       result.push({ ...row });
     }
     return result;
@@ -1221,6 +1222,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
     this.nextAnnotationSequence = 0;
     this.outbox = [];
     this.outboxClaims.clear();
+    this.lastOutboxRun = undefined;
     this.idempotencyKeys.clear();
     this.idempotencyInProgress.clear();
     this.outboxSequences.clear();

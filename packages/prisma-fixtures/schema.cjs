@@ -53,14 +53,3 @@ if (require.main === module) {
   const [kind, flag] = process.argv.slice(2);
   exports[kind](process.cwd(), { withUrl: flag === "--url" });
 }
-
-exports.installOutboxHeads = (file) => {
-  const { DatabaseSync } = require("node:sqlite");
-  const sql = readFileSync(join(__dirname, "../workflow-engine/prisma/outbox-heads.sqlite.sql"), "utf8");
-  const db = new DatabaseSync(file);
-  try {
-    db.exec(`BEGIN; ${sql} COMMIT;`);
-  } finally {
-    db.close();
-  }
-};

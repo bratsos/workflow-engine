@@ -132,10 +132,10 @@ const STATS: Expectation[] = [
 const CLAIM: Expectation = {
   name: "indexed outbox claim",
   matches: (sql) =>
-    sql.includes('SET "deliveryClaim"') && /ORDER BY/i.test(sql),
-  index: "outbox_events_delivery_ready_idx",
+    /WITH RECURSIVE walk/i.test(sql) ||
+    /UPDATE "outbox_events" SET "deliveryClaim" = .*WHERE id = ANY/is.test(sql),
+  index: "outbox_events_live_run_sequence_idx",
 };
-const CLAIM_WITHOUT_STATISTICS = CLAIM;
 const UNPUBLISHED: Expectation = {
   name: "unpublished outbox inspection",
   matches: (sql) =>
@@ -178,6 +178,22 @@ async function openRecordingClient(file?: string, url = databaseUrl) {
         statements.push({ sql, params });
       }
     };
+    const transaction = db.transaction.bind(db);
+    db.transaction = (work: (tx: any) => Promise<unknown>) =>
+      transaction((tx: any) =>
+        work({
+          ...tx,
+          raw: tx.raw,
+          query: (plan: any) => {
+            capture(plan);
+            return tx.query(plan);
+          },
+          execute: (plan: any) => {
+            capture(plan);
+            return tx.execute(plan);
+          },
+        }),
+      );
     db.query = (plan: any) => {
       capture(plan);
       return query(plan);
@@ -295,8 +311,15 @@ describe.skipIf(!sqlite && !databaseUrl)(
         // Without this Postgres picks a sequential scan on a small table
         // whatever the indexes are. With it, a sequential scan appears only
         // when no index can serve the statement.
-        if (forceIndex)
+        const claim = CLAIM.matches(statement.sql);
+        if (forceIndex || claim)
           await tx.$executeRawUnsafe("SET LOCAL enable_seqscan = off");
+        if (claim) {
+          await tx.$executeRawUnsafe("SET LOCAL enable_bitmapscan = off");
+          await tx.$executeRawUnsafe("SET LOCAL enable_sort = off");
+          await tx.$executeRawUnsafe("SET LOCAL enable_incremental_sort = off");
+          await tx.$executeRawUnsafe("SET LOCAL jit = off");
+        }
         const rows = await rawFor(tx, {
           "QUERY PLAN": "text",
         }).$queryRawUnsafe(
@@ -318,7 +341,11 @@ describe.skipIf(!sqlite && !databaseUrl)(
       // Only what touches an engine table: a driver also logs statements of its
       // own (the Prisma 6 engine's connection check is `SELECT 1`) and the
       // client's `BEGIN` and `COMMIT`, which are no query of the engine's.
-      return statements.filter((s) => ENGINE_TABLE.test(s.sql));
+      // An asynchronous query event from the previous EXPLAIN can also
+      // arrive while recording the next operation.
+      return statements.filter(
+        (s) => ENGINE_TABLE.test(s.sql) && !/^\s*EXPLAIN\b/i.test(s.sql),
+      );
     }
 
     /** Asserts the expected index and no scan of an engine table for one statement. */
@@ -376,15 +403,12 @@ describe.skipIf(!sqlite && !databaseUrl)(
       }
     }
 
-    async function expectClaimPlans(
-      forceIndex = true,
-      expectation: Expectation = CLAIM,
-    ) {
+    async function expectClaimPlans(forceIndex = true) {
       const captured = await record(async () => {
         await persistence.getUnpublishedOutboxEvents(10);
         await persistence.claimOutboxDelivery(
           10,
-          "2099-01-01T00:00:00.000Z|plans",
+          "2000-01-01T00:00:00.000Z|plans",
           new Date(),
           [],
         );
@@ -393,8 +417,7 @@ describe.skipIf(!sqlite && !databaseUrl)(
       expect(candidates.length, "no claim candidate statement").toBeGreaterThan(
         0,
       );
-      for (const s of candidates)
-        await expectServedBy(expectation, s, forceIndex);
+      for (const s of candidates) await expectServedBy(CLAIM, s, forceIndex);
       for (const s of captured.filter((item) => UNPUBLISHED.matches(item.sql)))
         await expectServedBy(UNPUBLISHED, s, forceIndex);
     }
@@ -439,8 +462,8 @@ describe.skipIf(!sqlite && !databaseUrl)(
         if (!allowSmallScan) {
           expect(text).toMatch(
             sqlite
-              ? /USING INDEX (sqlite_autoindex_outbox_events_1|outbox_events_delivery_ready_idx)/
-              : /Index Scan using "?outbox_events_(pkey|delivery_ready_idx)/,
+              ? /USING INDEX (sqlite_autoindex_outbox_events_1)/
+              : /Index Scan using "?outbox_events_pkey/,
           );
           expect(text).not.toMatch(sqlite ? SQLITE_TABLE_SCAN : /Seq Scan/);
         }
@@ -461,8 +484,8 @@ describe.skipIf(!sqlite && !databaseUrl)(
       if (!allowSmallScan) {
         expect(checkPlan).toMatch(
           sqlite
-            ? /USING (COVERING )?INDEX (sqlite_autoindex_outbox_events_1|outbox_events_delivery_ready_idx)/
-            : /Index (Only )?Scan using "?outbox_events_(pkey|delivery_ready_idx)/,
+            ? /USING (COVERING )?INDEX (sqlite_autoindex_outbox_events_1)/
+            : /Index (Only )?Scan using "?outbox_events_pkey/,
         );
         expect(checkPlan).not.toMatch(sqlite ? SQLITE_TABLE_SCAN : /Seq Scan/);
       }
@@ -600,7 +623,7 @@ describe.skipIf(!sqlite && !databaseUrl)(
       it("serves every stats query from its index", () => expectStatsPlans());
       it("ignores a statement that touches no engine table", () =>
         expectStatsPlans(true, true));
-      it("serves the outbox claim's candidates from the ready-head index", () =>
+      it("serves the outbox claim's candidates from the live-run index", () =>
         expectClaimPlans());
       it("uses the primary key for publication and retry release", () =>
         expectDeliveryWritePlans());
@@ -615,7 +638,7 @@ describe.skipIf(!sqlite && !databaseUrl)(
         await client.$executeRawUnsafe("ANALYZE");
       });
       it("serves every stats query from its index", () => expectStatsPlans());
-      it("serves the outbox claim's candidates from the ready-head index", () =>
+      it("serves the outbox claim's candidates from the live-run index", () =>
         expectClaimPlans());
       it("uses the primary key for publication and retry release", () =>
         expectDeliveryWritePlans());
@@ -666,7 +689,7 @@ describe.skipIf(!sqlite && !databaseUrl)(
         it("serves every stats query from its index", () =>
           expectStatsPlans(false));
         it("serves the outbox claim's candidates without reading the dlqAt index", () =>
-          expectClaimPlans(false, CLAIM_WITHOUT_STATISTICS));
+          expectClaimPlans(false));
         it("uses the primary key for publication and retry release", () =>
           expectDeliveryWritePlans());
       });
@@ -677,7 +700,7 @@ describe.skipIf(!sqlite && !databaseUrl)(
         });
         it("serves every stats query from its index", () =>
           expectStatsPlans(false));
-        it("serves the outbox claim's candidates from the ready-head index", () =>
+        it("serves the outbox claim's candidates from the live-run index", () =>
           expectClaimPlans(false));
         it("uses the primary key for publication and retry release", () =>
           expectDeliveryWritePlans());
@@ -906,7 +929,7 @@ describe.skipIf(!sqlite && !databaseUrl)(
           );
           expect(claim).toBeDefined();
           const text = await plan(claim!, false, true);
-          expect(text).toMatch(/outbox_events_delivery_ready_idx/);
+          expect(text).toMatch(/outbox_events_live_run_sequence_idx/);
           expect(text).not.toMatch(
             /Nested Loop Anti Join|Seq Scan on outbox_events|outbox_events_dlqAt_idx/,
           );
@@ -1071,22 +1094,74 @@ describe.skipIf(!sqlite && !databaseUrl)(
             : major === "8"
               ? "'2025-01-01T00:00:00.000Z'"
               : "'2025-01-01T00:00:00.000+00:00'";
+        const run = wide
+          ? `'${prefix}-run-' || ((g - 1) % 28000 + 1)`
+          : `'${prefix}'`;
+        const sequence = wide ? "(g - 1) / 28000 + 1" : "g";
         const body = `INSERT INTO outbox_events (id, "workflowRunId", sequence, "eventType", payload, "causationId", "occurredAt", "publishedAt")
-          SELECT '${prefix}-' || g, ${wide ? `'${prefix}-run-' || g` : `'${prefix}'`}, ${wide ? "1" : "g"}, 'e', '{}', 'c', ${date}, ${published ? date : "NULL"}`;
+          SELECT '${prefix}-' || g, ${run}, ${sequence}, 'e', '{}', 'c', ${date}, ${published ? date : "NULL"}`;
         return client.$executeRawUnsafe(count(n, body));
       };
 
-      async function captureClaim() {
-        return (
-          await record(() =>
-            persistence.claimOutboxDelivery(
-              10,
-              "2000-01-01T00:00:00.000Z|measure",
-              new Date(),
-              [],
-            ),
-          )
-        ).find((statement) => CLAIM.matches(statement.sql));
+      function sharedBuffers(text: string): number {
+        const buffers = /Buffers: shared ([^\n]+)/.exec(text);
+        return [...(buffers?.[1] ?? "").matchAll(/(?:hit|read)=(\d+)/g)].reduce(
+          (sum, entry) => sum + Number(entry[1]),
+          0,
+        );
+      }
+
+      async function expectBoundedClaim(limit = 10, expected?: number) {
+        let acquired = 0;
+        const claim = await record(async () => {
+          const rows = await persistence.claimOutboxDelivery(
+            limit,
+            "2000-01-01T00:00:00.000Z|measure",
+            new Date(),
+            [],
+          );
+          acquired = rows.length;
+        });
+        if (expected !== undefined) expect(acquired).toBe(expected);
+        if (!sqlite) {
+          for (const setting of [
+            "seqscan",
+            "bitmapscan",
+            "sort",
+            "incremental_sort",
+          ]) {
+            expect(
+              statements.some(({ sql }) =>
+                sql.includes(`SET LOCAL enable_${setting} = off`),
+              ),
+            ).toBe(true);
+          }
+        }
+        const phases = claim.filter((statement) =>
+          CLAIM.matches(statement.sql),
+        );
+        expect(phases.length).toBeGreaterThan(0);
+        for (const phase of phases) {
+          const text = await plan(phase, false, !sqlite);
+          const message = `${phase.sql}
+${text}`;
+          expect(text, message).toContain(
+            "outbox_events_live_run_sequence_idx",
+          );
+          expect(text, message).not.toMatch(
+            sqlite
+              ? /\bSCAN (outbox_events|e|main\.outbox_events)\b|USE TEMP B-TREE/
+              : /Seq Scan on outbox_events/,
+          );
+          if (sqlite) {
+            expect(text, message).toMatch(/workflowRunId>\?/);
+            expect(text, message).toMatch(
+              /outbox_events_delivery_run_idx.*deliveryClaim>\?/,
+            );
+          } else {
+            expect(sharedBuffers(text), message).toBeLessThan(500);
+          }
+        }
       }
 
       for (const n of [0, 10_000, 100_000]) {
@@ -1110,23 +1185,7 @@ describe.skipIf(!sqlite && !databaseUrl)(
               }
               if (statistics === "analysed")
                 await client.$executeRawUnsafe("ANALYZE outbox_events");
-              const claim = await captureClaim();
-              expect(claim).toBeDefined();
-              const text = await plan(claim!, false, !sqlite);
-              if (n) {
-                expect(text).toContain("outbox_events_delivery_ready_idx");
-                expect(text).not.toMatch(
-                  sqlite ? SQLITE_TABLE_SCAN : /Seq Scan on outbox_events/,
-                );
-                if (!sqlite) {
-                  const buffers =
-                    /Buffers: shared hit=(\d+)(?: read=(\d+))?/.exec(text);
-                  expect(buffers).toBeTruthy();
-                  expect(
-                    Number(buffers![1]) + Number(buffers![2] ?? 0),
-                  ).toBeLessThan(300);
-                }
-              }
+              await expectBoundedClaim(10, n ? 1 : 0);
               const append = await record(() =>
                 persistence.appendOutboxEvents([
                   {
@@ -1171,43 +1230,114 @@ describe.skipIf(!sqlite && !databaseUrl)(
         }
       }
 
-      for (const [shape, n] of [
-        ["dense", 100_000],
-        ["wide", 28_000],
-      ] as const) {
-        for (const statistics of ["never", "analysed", "stale live"]) {
-          it(`bounds the ${shape} live claim with ${statistics} statistics`, async () => {
-            await resetOutboxPlanner();
-            try {
-              if (statistics === "stale live") {
-                await history(7, false, "small");
-                await client.$executeRawUnsafe("ANALYZE outbox_events");
-              }
-              await history(n, false, shape, shape === "wide");
-              if (statistics === "analysed") {
-                await client.$executeRawUnsafe("ANALYZE outbox_events");
-              }
-              const claim = await captureClaim();
-              expect(claim).toBeDefined();
-              const text = await plan(claim!, false, !sqlite);
-              expect(text).toContain("outbox_events_delivery_ready_idx");
-              expect(text).not.toMatch(
-                sqlite ? SQLITE_TABLE_SCAN : /Seq Scan on outbox_events/,
-              );
-              if (!sqlite) {
-                const buffers =
-                  /Buffers: shared hit=(\d+)(?: read=(\d+))?/.exec(text);
-                expect(buffers).toBeTruthy();
-                expect(
-                  Number(buffers![1]) + Number(buffers![2] ?? 0),
-                ).toBeLessThan(500);
-              }
-            } finally {
+      for (const n of [0, 10_000, 100_000]) {
+        for (const shape of ["dense", "wide", "held"]) {
+          for (const statistics of [
+            "never",
+            "analysed",
+            "stale published",
+            "stale live",
+          ]) {
+            it(`bounds the ${shape} claim at ${n} rows with ${statistics} statistics`, async () => {
               await resetOutboxPlanner();
-            }
-          }, 60_000);
+              try {
+                if (statistics.startsWith("stale")) {
+                  await history(7, statistics === "stale published", "stale");
+                  await client.$executeRawUnsafe("ANALYZE outbox_events");
+                  await client.outboxEvent.deleteMany({});
+                }
+                await history(
+                  shape === "held" && n ? n - 20 : n,
+                  false,
+                  shape,
+                  shape === "wide",
+                );
+                if (shape === "held" && n) {
+                  await history(10, false, "a-held", true);
+                  await history(10, false, "z-ready", true);
+                  await client.$executeRawUnsafe(
+                    `UPDATE outbox_events SET "deliveryClaim" = '2099-01-01T00:00:00.000Z|crashed'
+                     WHERE "workflowRunId" LIKE 'a-held-%'`,
+                  );
+                }
+                if (statistics === "analysed")
+                  await client.$executeRawUnsafe("ANALYZE outbox_events");
+                await expectBoundedClaim(
+                  10,
+                  n ? (shape === "dense" ? 1 : 10) : 0,
+                );
+              } finally {
+                await resetOutboxPlanner();
+              }
+            }, 60_000);
+          }
         }
       }
+
+      it.skipIf(sqlite)(
+        "measures PostgreSQL's visibility cost before dead index entries can be vacuumed",
+        async () => {
+          await resetOutboxPlanner();
+          try {
+            // Capture the real point probes before the dead range has been touched.
+            const fresh = createPrismaWorkflowPersistence(client);
+            const statements = await record(() =>
+              fresh.claimOutboxDelivery(
+                1,
+                "2000-01-01T00:00:00.000Z|measure",
+                new Date(),
+                [],
+              ),
+            );
+            const seek = statements.find((statement) =>
+              CLAIM.matches(statement.sql),
+            )!;
+            await history(100_000, false, "a-old", true);
+            await history(1, false, "z-ready");
+            let finish!: () => void;
+            let open!: () => void;
+            const snapshotOpen = new Promise<void>((resolve) => {
+              open = resolve;
+            });
+            const hold = new Promise<void>((resolve) => {
+              finish = resolve;
+            });
+            const snapshot = client.$transaction(
+              async (tx: typeof client) => {
+                await tx.outboxEvent.count();
+                open();
+                await hold;
+              },
+              { isolationLevel: "RepeatableRead", timeout: 30_000 },
+            );
+            try {
+              await Promise.race([snapshotOpen, snapshot]);
+              await client.$executeRawUnsafe(
+                `UPDATE outbox_events SET "publishedAt" = now() WHERE "workflowRunId" LIKE 'a-old-%'`,
+              );
+              const dirty = await plan(seek, false, true);
+              expect(dirty).toContain("outbox_events_live_run_sequence_idx");
+              expect(dirty).not.toMatch(/Seq Scan on outbox_events/);
+              expect(sharedBuffers(dirty)).toBeGreaterThan(500);
+              console.info(
+                `Outbox PostgreSQL dead entries: ${sharedBuffers(dirty)} shared buffers; ${dirty.match(/Execution Time: [^\n]+/)?.[0]}`,
+              );
+            } finally {
+              finish();
+              await snapshot;
+            }
+            await client.$executeRawUnsafe("VACUUM outbox_events");
+            const clean = await plan(seek, false, true);
+            expect(sharedBuffers(clean)).toBeLessThan(100);
+            console.info(
+              `Outbox PostgreSQL after vacuum: ${sharedBuffers(clean)} shared buffers; ${clean.match(/Execution Time: [^\n]+/)?.[0]}`,
+            );
+          } finally {
+            await resetOutboxPlanner();
+          }
+        },
+        60_000,
+      );
 
       it.each([
         ["dense", 100_000, 100],
@@ -1221,13 +1351,6 @@ describe.skipIf(!sqlite && !databaseUrl)(
             await history(7, true, "small");
             await client.$executeRawUnsafe("ANALYZE outbox_events");
             await history(n, false, shape, shape === "wide");
-            const claim = await captureClaim();
-            expect(claim).toBeDefined();
-            const text = await plan(claim!, false, !sqlite);
-            expect(text).toContain("outbox_events_delivery_ready_idx");
-            expect(text).not.toMatch(
-              sqlite ? SQLITE_TABLE_SCAN : /Seq Scan on outbox_events/,
-            );
             const delivered: number[] = [];
             const userUrl = sqlite ? undefined : new URL(databaseUrl!);
             if (userUrl) {
@@ -1322,7 +1445,7 @@ describe.skipIf(!sqlite && !databaseUrl)(
         expect(candidates.map((e) => e.id)).toEqual([next!.id]);
         const claimed = await persistence.claimOutboxDelivery(
           1,
-          "2099-01-01T00:00:00.000Z|plans",
+          "2000-01-01T00:00:00.000Z|plans",
           new Date(),
           ["plan-pending", "plan-negative-other"],
         );

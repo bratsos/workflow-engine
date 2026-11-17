@@ -1021,12 +1021,15 @@ export interface PersistenceCore {
    * retry count. A live predecessor blocks its successors at acquisition.
    * Replay can make an earlier event eligible after a successor was claimed.
    * Skip excluded runs and page past blocked runs without reading their tails.
+   * Rotate after the last run served so a retry cannot starve other runs.
+   * Do not start another claim write after the signal is aborted.
    */
   claimOutboxDelivery(
     limit: number,
     claim: string,
     now: Date,
     excludedRunIds: readonly string[],
+    signal?: Pick<AbortSignal, "aborted">,
   ): Promise<OutboxRecord[]>;
 
   /** Check ownership, expiry, publication and DLQ state before the sink. */

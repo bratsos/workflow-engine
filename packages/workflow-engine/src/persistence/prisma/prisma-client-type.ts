@@ -116,9 +116,8 @@ export interface EnginePrismaClient {
    */
   $queryRawUnsafe?<T = unknown>(query: string, ...values: any[]): Promise<T>;
   /**
-   * Raw parameterized statement (tagged template). Optional -- already
-   * guarded with a `typeof ... === "function"` check at its one call site
-   * (the advisory-lock statement in `appendOutboxEventsForRun`).
+   * Raw parameterized statement (tagged template). Optional.
+   * Used to configure the local planner in an outbox claim transaction.
    */
   $executeRaw?(strings: TemplateStringsArray, ...values: any[]): Promise<any>;
   /**

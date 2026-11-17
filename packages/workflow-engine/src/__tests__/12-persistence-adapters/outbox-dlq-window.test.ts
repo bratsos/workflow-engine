@@ -3,12 +3,10 @@
  * real SQLite and PostgreSQL adapters for Prisma 6, 7 and 8.
  */
 
-import { execFileSync } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 import {
   afterAll,
   beforeAll,
@@ -512,7 +510,7 @@ describe.skipIf(!sqlite && !databaseUrl)(
       expect(
         (await make(sink).dispatch({ type: "outbox.flush" })).published,
       ).toBe(commit ? 2 : 1);
-      expect(delivered).toEqual(
+      expect([...delivered].sort()).toEqual(
         commit ? ["committed", "inside"] : ["committed"],
       );
     });
@@ -642,6 +640,63 @@ describe.skipIf(!sqlite && !databaseUrl)(
         }
         expect((await pending).published).toBe(1);
         expect(delivered).toEqual(["2"]);
+      },
+    );
+
+    it.skipIf(sqlite)(
+      "cancels a PostgreSQL claim between the candidate read and the write",
+      async () => {
+        await seedEvent("cancel-after-select");
+        const controller = new AbortController();
+        let cancelled = false;
+        const gate = (tx: typeof client): typeof client =>
+          new Proxy(tx, {
+            get(target, key) {
+              if (key === "$withColumns" && target.$withColumns) {
+                return (...args: unknown[]) =>
+                  gate(target.$withColumns(...args));
+              }
+              if (key === "$queryRawUnsafe") {
+                return async (sql: string, ...args: unknown[]) => {
+                  const rows = await target.$queryRawUnsafe(sql, ...args);
+                  if (sql.startsWith("WITH RECURSIVE walk")) {
+                    cancelled = true;
+                    controller.abort();
+                  }
+                  return rows;
+                };
+              }
+              return Reflect.get(target, key, target);
+            },
+          });
+        const wrapper = new Proxy(client, {
+          get(target, key) {
+            if (key === "$transaction") {
+              return (
+                callback: (tx: typeof client) => unknown,
+                options: unknown,
+              ) =>
+                target.$transaction(
+                  (tx: typeof client) => callback(gate(tx)),
+                  options,
+                );
+            }
+            return Reflect.get(target, key, target);
+          },
+        });
+        const result = await make(runner, storeOver(wrapper)).dispatch({
+          type: "outbox.flush",
+          signal: controller.signal,
+        });
+        expect(cancelled).toBe(true);
+        expect(result).toMatchObject({
+          published: 0,
+          eventSinkStatus: "degraded",
+        });
+        const row = await client.outboxEvent.findFirst({
+          where: { workflowRunId: "cancel-after-select" },
+        });
+        expect(row.deliveryClaim).toBeNull();
       },
     );
 
@@ -893,50 +948,11 @@ describe.skipIf(!sqlite && !databaseUrl)(
       expect(delivered).toHaveLength(2);
     });
 
-    it("lets the old schema commit events, fails the first flush, and schedules live rows during upgrade", async () => {
-      const names = sqlite
-        ? ["insert", "resolve", "replay", "delete"].map(
-            (suffix) => `workflow_engine_outbox_${suffix}`,
-          )
-        : ["workflow_engine_outbox_head"];
-      const companion = fileURLToPath(
-        new URL(
-          `../../../prisma/outbox-heads.${sqlite ? "sqlite" : "postgresql"}.sql`,
-          import.meta.url,
-        ),
-      );
-      const migrate = async () => {
-        await client.$executeRawUnsafe(
-          'ALTER TABLE outbox_events RENAME COLUMN "preUpgradeClaim" TO "deliveryClaim"',
-        );
-        if (sqlite) {
-          const fixture = createRequire(import.meta.url)(
-            "../../../../prisma-fixtures/schema.cjs",
-          );
-          fixture.installOutboxHeads(join(directory!, "dlq.db"));
-        } else {
-          execFileSync(
-            "psql",
-            [
-              databaseUrl!,
-              "-v",
-              "ON_ERROR_STOP=1",
-              "--single-transaction",
-              "-f",
-              companion,
-            ],
-            { stdio: "pipe" },
-          );
-        }
-      };
+    it("delivers legacy unstamped rows after the schema-only upgrade", async () => {
       await seedEvent("legacy-stamped");
       await client.outboxEvent.updateMany({
         data: { publishedAt: clock.now() },
       });
-      for (const name of names)
-        await client.$executeRawUnsafe(
-          `DROP TRIGGER ${name}${sqlite ? "" : " ON outbox_events"}`,
-        );
       await client.$executeRawUnsafe(
         'ALTER TABLE outbox_events RENAME COLUMN "deliveryClaim" TO "preUpgradeClaim"',
       );
@@ -967,7 +983,7 @@ describe.skipIf(!sqlite && !databaseUrl)(
           type: "run.create",
           workflowId: workflow.id,
           input: {},
-          idempotencyKey: "outbox-legacy",
+          idempotencyKey: `outbox-legacy-${crypto.randomUUID()}`,
         });
         expect(
           (await legacy.dispatch({ type: "engine.stats" })).outbox,
@@ -976,11 +992,95 @@ describe.skipIf(!sqlite && !databaseUrl)(
           /deliveryClaim/i,
         );
       } finally {
-        await migrate();
+        await client.$executeRawUnsafe(
+          'ALTER TABLE outbox_events RENAME COLUMN "preUpgradeClaim" TO "deliveryClaim"',
+        );
       }
       shouldFail = false;
       expect((await flush()).published).toBe(1);
       expect(delivered).toEqual(["workflow:created"]);
+    });
+
+    it.skipIf(sqlite)(
+      "reserves contiguous sequences across concurrent PostgreSQL appends",
+      async () => {
+        const events = (cause: string) =>
+          [1, 2, 3].map(() => ({
+            workflowRunId: "append-race",
+            eventType: "workflow:created",
+            payload: {},
+            causationId: cause,
+            occurredAt: clock.now(),
+          }));
+        const read = deferred();
+        let readers = 0;
+        const append = (cause: string) =>
+          client.$transaction(async (tx: typeof client) => {
+            const wrapped = new Proxy(tx, {
+              get(target, key) {
+                if (key !== "outboxEvent") return Reflect.get(target, key);
+                return new Proxy(target.outboxEvent, {
+                  get(delegate, method) {
+                    if (method !== "findFirst")
+                      return Reflect.get(delegate, method);
+                    return async (args: unknown) => {
+                      const row = await delegate.findFirst(args);
+                      if (++readers === 2) read.release();
+                      await read.promise;
+                      return row;
+                    };
+                  },
+                });
+              },
+            });
+            await storeOver(wrapped).appendOutboxEvents(events(cause));
+          });
+        await Promise.all([append("a"), append("b")]);
+        const rows = await client.outboxEvent.findMany({
+          where: { workflowRunId: "append-race" },
+          orderBy: { sequence: "asc" },
+        });
+        expect(rows.map((row: { sequence: number }) => row.sequence)).toEqual([
+          1, 2, 3, 4, 5, 6,
+        ]);
+        expect(
+          rows
+            .slice(0, 3)
+            .map((row: { causationId: string }) => row.causationId),
+        ).toEqual(Array(3).fill(rows[0].causationId));
+        expect(
+          rows.slice(3).map((row: { causationId: string }) => row.causationId),
+        ).toEqual(Array(3).fill(rows[3].causationId));
+        expect(rows[0].causationId).not.toBe(rows[3].causationId);
+      },
+    );
+
+    it("derives the next head after SQL changes the earliest unpublished row", async () => {
+      await seedEvent("operator");
+      await persistence.appendOutboxEvents([
+        {
+          workflowRunId: "operator",
+          eventType: "workflow:created",
+          payload: {},
+          causationId: "successor",
+          occurredAt: clock.now(),
+        },
+      ]);
+      const head = await client.outboxEvent.findFirst({
+        where: { workflowRunId: "operator" },
+        orderBy: { sequence: "asc" },
+      });
+      await client.outboxEvent.delete({ where: { id: head.id } });
+      const sequences: number[] = [];
+      const kernel = make({
+        async emit(_, delivery) {
+          sequences.push(delivery!.sequence);
+        },
+      });
+      expect((await kernel.dispatch({ type: "outbox.flush" })).published).toBe(
+        1,
+      );
+      expect(sequences).toEqual([2]);
     });
 
     it("reuses a sequence after an operator deletes the newest row, with a new event ID", async () => {

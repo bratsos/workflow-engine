@@ -51,6 +51,12 @@ import {
 import { countActiveByStatus, SQLITE_RARE, sqliteDate } from "./active-stats";
 import { createEnumHelper, type PrismaEnumHelper } from "./enum-compat";
 import {
+  type OutboxClaimPage,
+  postgresOutboxCandidates,
+  postgresOutboxWrite,
+  sqliteOutboxClaim,
+} from "./outbox-claim";
+import {
   type EnginePrismaClient,
   rawFor,
   validateDatabaseType,
@@ -246,8 +252,8 @@ function isInProgressResult(result: unknown): boolean {
  * Postgres case above: 38 buffers, 0.1 ms), and `dlqAt` is read from those
  * rows only.
  *
- * Used for the stats aggregate and inspection reads. Delivery claims use the
- * separate ready-head index.
+ * Used for the stats aggregate and inspection reads. Delivery claims seek
+ * directly to live run heads using the composite indexes.
  */
 const LIVE_OUTBOX = {
   publishedAt: null,
@@ -309,6 +315,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
   private skipTransactions: boolean;
   private isOutboxTransaction: boolean;
   private readonly rawOutboxQueries: boolean;
+  private lastOutboxRun?: string;
   private statusEnumName: string;
   private now: () => Date;
   /**
@@ -1747,34 +1754,16 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
   }
 
   /**
-   * Assigns sequential `sequence` numbers for a single run's outbox events
-   * and inserts them.
-   *
-   * `pg_advisory_xact_lock` only serializes concurrent callers when this
-   * call is itself running inside a real database transaction (i.e. this
-   * instance was produced by `withTransaction`) — outside a transaction,
-   * Postgres releases the advisory lock the instant the statement's
-   * implicit autocommit transaction ends, making it a no-op safeguard.
-   * The `(workflowRunId, sequence)` unique constraint is the actual
-   * correctness backstop in both cases: on a conflict we recompute the
-   * max sequence and retry, bounded to avoid unbounded recursion under
-   * pathological contention.
+   * Assign sequential numbers using the unique (run, sequence) index.
+   * Concurrent PostgreSQL transactions reserve the first sequence before
+   * inserting the rest of the batch. A conflicting reservation is a no-op
+   * so it can retry without aborting the caller's transaction.
    */
   private async appendOutboxEventsForRun(
     workflowRunId: string,
     runEvents: CreateOutboxEventInput[],
     attempt = 0,
   ): Promise<void> {
-    if (
-      this.databaseType === "postgresql" &&
-      typeof this.prisma.$executeRaw === "function"
-    ) {
-      // Best-effort serialization; only effective inside a transaction.
-      await this.prisma.$executeRaw`
-        SELECT pg_advisory_xact_lock(hashtext(${workflowRunId}))
-      `;
-    }
-
     const last = await this.prisma.outboxEvent.findFirst({
       where: { workflowRunId },
       orderBy: { sequence: "desc" },
@@ -1791,19 +1780,29 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       occurredAt: event.occurredAt,
     }));
 
+    const retry = () =>
+      this.appendOutboxEventsForRun(workflowRunId, runEvents, attempt + 1);
+    if (this.databaseType === "postgresql" && this.isOutboxTransaction) {
+      const reserved = await this.prisma.outboxEvent.createMany({
+        data: rows.slice(0, 1),
+        skipDuplicates: true,
+      });
+      if (!reserved.count) {
+        if (attempt < MAX_CLAIM_ATTEMPTS) return retry();
+        throw new Error(
+          `Could not reserve an outbox sequence for run ${workflowRunId}`,
+        );
+      }
+      if (rows.length > 1) {
+        await this.prisma.outboxEvent.createMany({ data: rows.slice(1) });
+      }
+      return;
+    }
     try {
       await this.prisma.outboxEvent.createMany({ data: rows });
     } catch (error: any) {
-      if (isUniqueViolation(error) && attempt < MAX_CLAIM_ATTEMPTS) {
-        // Another writer assigned overlapping sequences between our read
-        // and write (only reachable outside a transaction, or on DBs
-        // without the advisory lock). Recompute and retry.
-        return this.appendOutboxEventsForRun(
-          workflowRunId,
-          runEvents,
-          attempt + 1,
-        );
-      }
+      if (isUniqueViolation(error) && attempt < MAX_CLAIM_ATTEMPTS)
+        return retry();
       throw error;
     }
   }
@@ -1837,79 +1836,211 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     claim: string,
     now: Date,
     excludedRunIds: readonly string[],
+    signal?: Pick<AbortSignal, "aborted">,
   ): Promise<OutboxRecord[]> {
-    if (limit <= 0) return [];
-    const deadline = `${now.toISOString()}~`;
-    const excluded = excludedRunIds.length
-      ? `AND "workflowRunId" NOT IN (${excludedRunIds.map((_, i) => `$${i + 4}`).join(", ")})`
-      : "";
-    const candidates = `SELECT id FROM "outbox_events"
-      WHERE "deliveryClaim" >= '' AND "deliveryClaim" <= $2 ${excluded}
-      ORDER BY "deliveryClaim", id LIMIT $1`;
-    if (this.rawOutboxQueries) {
-      // The ready index holds one scheduled row per run. Bound the page
-      // before attempting any locks so contention cannot scan the queue.
-      const postgres = this.databaseType === "postgresql";
-      const sql = postgres
-        ? `UPDATE "outbox_events" SET "deliveryClaim" = $3
-           WHERE id = ANY(ARRAY(
-             SELECT locked.id FROM (${candidates}) ready
-             CROSS JOIN LATERAL (
-               SELECT e.id FROM "outbox_events" e
-               WHERE e.id = ready.id AND e."deliveryClaim" >= ''
-                 AND e."deliveryClaim" <= $2
-               FOR UPDATE OF e SKIP LOCKED
-             ) locked
-           )) RETURNING *`
-        : `UPDATE "outbox_events" INDEXED BY sqlite_autoindex_outbox_events_1 SET "deliveryClaim" = $1
-           WHERE id IN (
-             SELECT id FROM "outbox_events" INDEXED BY outbox_events_delivery_ready_idx
-             WHERE "deliveryClaim" >= '' AND "deliveryClaim" <= $2
-             ${excludedRunIds.length ? `AND "workflowRunId" NOT IN (${excludedRunIds.map((_, i) => `$${i + 3}`).join(", ")})` : ""}
-             ORDER BY "deliveryClaim", id LIMIT $${excludedRunIds.length + 3}
-           ) RETURNING *`;
-      const params = postgres
-        ? [limit, deadline, claim, ...excludedRunIds]
-        : [claim, deadline, ...excludedRunIds, limit];
+    if (limit <= 0 || signal?.aborted) return [];
+    const after = this.lastOutboxRun;
+    const page = {
+      limit,
+      claim,
+      deadline: `${now.toISOString()}~`,
+      excluded: excludedRunIds,
+      after,
+      signal,
+    };
+    const claimed = await this.claimOutboxPage(page);
+    if (claimed.length < limit && after !== undefined && !signal?.aborted) {
+      claimed.push(
+        ...(await this.claimOutboxPage({
+          ...page,
+          limit: limit - claimed.length,
+          after: undefined,
+          through: after,
+        })),
+      );
+    }
+    const last = claimed.at(-1);
+    if (last) this.lastOutboxRun = last.workflowRunId;
+    return claimed;
+  }
+
+  private async configureOutboxPlanner(tx: PrismaClient): Promise<void> {
+    // Keep ordered probes on the indexed ranges under stale statistics.
+    // A sort of the bounded result is still allowed. Disable JIT so that
+    // the penalty for a sort does not trigger compilation for a small page.
+    await tx.$executeRaw!`SET LOCAL enable_seqscan = off`;
+    await tx.$executeRaw!`SET LOCAL enable_bitmapscan = off`;
+    await tx.$executeRaw!`SET LOCAL enable_sort = off`;
+    await tx.$executeRaw!`SET LOCAL enable_incremental_sort = off`;
+    await tx.$executeRaw!`SET LOCAL jit = off`;
+  }
+
+  private async claimOutboxPage(
+    page: OutboxClaimPage,
+  ): Promise<OutboxRecord[]> {
+    if (page.signal?.aborted) return [];
+    if (this.rawOutboxQueries && this.databaseType === "sqlite") {
+      const { sql, args } = sqliteOutboxClaim(page);
+      const orderedArgs: (string | number)[] = [];
+      const query = this.prisma.$withColumns
+        ? sql
+        : sql.replace(/\$(\d+)/g, (_, index) => {
+            orderedArgs.push(args[Number(index) - 1]!);
+            return "?";
+          });
       const rows = await rawFor(this.prisma, "outbox_events").$queryRawUnsafe!<
         any[]
-      >(
-        postgres || this.prisma.$withColumns ? sql : sql.replace(/\$\d+/g, "?"),
-        ...params,
-      );
-      return rows
-        .map((row) => this.mapOutboxEvent(row))
-        .sort(
-          (a, b) =>
-            a.workflowRunId.localeCompare(b.workflowRunId) ||
-            a.sequence - b.sequence,
-        );
+      >(query, ...(this.prisma.$withColumns ? args : orderedArgs));
+      // SQLite BINARY compares UTF-8 bytes, which follow code point order.
+      const encoder = new TextEncoder();
+      const ordered = rows.map((row) => ({
+        row,
+        key: encoder.encode(row.workflowRunId),
+      }));
+      ordered.sort((a, b) => {
+        for (let i = 0; i < Math.min(a.key.length, b.key.length); i++) {
+          const diff = a.key[i]! - b.key[i]!;
+          if (diff) return diff;
+        }
+        return a.key.length - b.key.length;
+      });
+      return ordered.map(({ row }) => this.mapOutboxEvent(row));
     }
 
-    // Structural clients without raw SQL page over scheduled run heads
-    // directly. An independently blocked run cannot fill the candidate page.
-    const rows = await this.prisma.outboxEvent.findMany({
-      where: {
-        deliveryClaim: { gte: "", lte: deadline },
-        ...(excludedRunIds.length
-          ? { workflowRunId: { notIn: excludedRunIds } }
-          : {}),
+    if (
+      this.rawOutboxQueries &&
+      this.prisma.$executeRaw &&
+      this.prisma.$transaction
+    ) {
+      return this.prisma.$transaction(
+        async (tx: PrismaClient) => {
+          await this.configureOutboxPlanner(tx);
+          if (page.signal?.aborted) return [];
+          const selection = postgresOutboxCandidates(page);
+          const candidates = await rawFor(tx, {
+            id: "text",
+            workflowRunId: "text",
+          }).$queryRawUnsafe!<{ id: string; workflowRunId: string }[]>(
+            selection.sql,
+            ...selection.args,
+          );
+          if (!candidates.length || page.signal?.aborted) return [];
+          const write = postgresOutboxWrite(page, candidates);
+          const rows = await rawFor(tx, "outbox_events").$queryRawUnsafe!<
+            any[]
+          >(write.sql, ...write.args);
+          const persisted = new Map(rows.map((row) => [row.id, row]));
+          return candidates.flatMap(({ id }) => {
+            const row = persisted.get(id);
+            return row ? [this.mapOutboxEvent(row)] : [];
+          });
+        },
+        { isolationLevel: "ReadCommitted" },
+      );
+    }
+
+    // Without raw reads, use delegate single-row seeks for the same walk.
+    if (!this.prisma.$transaction)
+      return this.claimOutboxWithDelegates(this.prisma, page, false);
+    const postgres = this.databaseType === "postgresql";
+    return this.prisma.$transaction(
+      async (tx: PrismaClient) => {
+        if (postgres && tx.$executeRaw) await this.configureOutboxPlanner(tx);
+        return this.claimOutboxWithDelegates(tx, page, postgres);
       },
-      orderBy: [{ deliveryClaim: "asc" }, { id: "asc" }],
-      take: limit,
-    });
+      { isolationLevel: postgres ? "ReadCommitted" : "Serializable" },
+    );
+  }
+
+  private async claimOutboxWithDelegates(
+    prisma: PrismaClient,
+    {
+      limit,
+      claim,
+      deadline,
+      excluded,
+      after,
+      through,
+      signal,
+    }: OutboxClaimPage,
+    lockRun: boolean,
+  ): Promise<OutboxRecord[]> {
+    const live = { publishedAt: null, dlqAt: null };
+    const liveOrder = [{ publishedAt: "asc" }, { dlqAt: "asc" }];
+    const headOrder = [
+      ...liveOrder,
+      { workflowRunId: "asc" },
+      { sequence: "asc" },
+    ];
     const claimed: OutboxRecord[] = [];
-    for (const row of rows) {
-      const updated = await this.prisma.outboxEvent.updateMany({
+    const excludedRuns = new Set(excluded);
+    let previous = after;
+    while (claimed.length < limit && !signal?.aborted) {
+      const head = await prisma.outboxEvent.findFirst({
         where: {
-          id: row.id,
-          deliveryClaim: { gte: "", lte: deadline },
+          ...live,
+          workflowRunId: {
+            ...(previous !== undefined ? { gt: previous } : {}),
+            ...(through !== undefined ? { lte: through } : {}),
+          },
+        },
+        orderBy: headOrder,
+        select: { id: true, workflowRunId: true },
+      });
+      if (!head) break;
+      const runId: string = head.workflowRunId;
+      previous = runId;
+      if (signal?.aborted) break;
+      if (excludedRuns.has(runId)) continue;
+      const activeClaim = () =>
+        prisma.outboxEvent.findFirst({
+          where: {
+            ...live,
+            workflowRunId: runId,
+            deliveryClaim: { gt: deadline },
+          },
+          orderBy: [
+            ...liveOrder,
+            { workflowRunId: "asc" },
+            { deliveryClaim: "asc" },
+          ],
+          select: { id: true },
+        });
+      if (await activeClaim()) continue;
+      if (lockRun) {
+        // The delegates have no row-lock operation. Lock the same first
+        // retained row as the raw path with an update that preserves its data.
+        const anchor = await prisma.outboxEvent.findFirst({
+          where: { workflowRunId: runId },
+          orderBy: { sequence: "asc" },
+          select: { id: true },
+        });
+        if (signal?.aborted) break;
+        if (!anchor) continue;
+        const locked = await prisma.outboxEvent.updateMany({
+          where: { id: anchor.id },
+          data: { sequence: { increment: 0 } },
+        });
+        if (!locked.count) continue;
+        const current = await prisma.outboxEvent.findFirst({
+          where: { ...live, workflowRunId: runId },
+          orderBy: headOrder,
+          select: { id: true },
+        });
+        if (current?.id !== head.id || (await activeClaim())) continue;
+      }
+      if (signal?.aborted) break;
+      const updated = await prisma.outboxEvent.updateMany({
+        where: {
+          id: head.id,
+          ...live,
+          OR: [{ deliveryClaim: null }, { deliveryClaim: { lte: deadline } }],
         },
         data: { deliveryClaim: claim },
       });
       if (!updated.count) continue;
-      const persisted = await this.prisma.outboxEvent.findUnique({
-        where: { id: row.id },
+      const persisted = await prisma.outboxEvent.findUnique({
+        where: { id: head.id },
       });
       if (persisted?.deliveryClaim === claim)
         claimed.push(this.mapOutboxEvent(persisted));
@@ -1974,7 +2105,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       },
       data: {
         retryCount: { increment: 1 },
-        deliveryClaim: dead ? null : "",
+        deliveryClaim: null,
         ...(dead ? { dlqAt: now } : {}),
       },
     });

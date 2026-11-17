@@ -250,25 +250,32 @@ describe("PrismaWorkflowPersistence.claimOutboxDelivery raw SQL", () => {
       retryCount: 0,
       dlqAt: null,
     };
-    const queryRawUnsafe = vi.fn(async () => [row]);
-    const prisma = {
+    const queryRawUnsafe = vi.fn(
+      async (_sql: string, ..._params: unknown[]) => [row],
+    );
+    const tx = {
       $queryRawUnsafe: queryRawUnsafe,
+      $executeRaw: vi.fn(async () => 0),
+    };
+    const prisma = {
+      ...tx,
+      $transaction: (work: (client: typeof tx) => unknown) => work(tx),
     } as unknown as EnginePrismaClient;
     const persistence = new PrismaWorkflowPersistence(prisma);
     expect(await persistence.claimOutboxDelivery(25, claim, now, [])).toEqual([
       row,
     ]);
-    const [sql, ...params] = queryRawUnsafe.mock.calls[0] as unknown as [
-      string,
-      ...unknown[],
-    ];
+    const [sql, ...params] = queryRawUnsafe.mock.calls[0]!;
     expect(sql).toContain("FOR UPDATE OF e SKIP LOCKED");
-    expect(sql).toContain('SET "deliveryClaim" = $3');
-    expect(sql).toContain('ORDER BY "deliveryClaim", id LIMIT $1');
-    expect(params).toEqual([25, `${now.toISOString()}~`, claim]);
+    expect(sql).toContain('AND "workflowRunId" > walk.run_id');
+    expect(params).toEqual([25, `${now.toISOString()}~`]);
+    const [write, token] = queryRawUnsafe.mock.calls[1]!;
+    expect(write).toContain('SET "deliveryClaim" = $1');
+    expect(write).not.toMatch(/SET.*publishedAt/);
+    expect(token).toBe(claim);
   });
 
-  it("uses a compare-and-set on a scheduled run head", async () => {
+  it("uses a compare-and-set on a derived run head", async () => {
     const now = new Date("2026-09-04T11:00:00.000Z");
     const rows = [
       {
@@ -292,7 +299,10 @@ describe("PrismaWorkflowPersistence.claimOutboxDelivery raw SQL", () => {
     const prisma = {
       $queryRaw: vi.fn(async () => []),
       outboxEvent: {
-        findMany: vi.fn(async () => rows.slice(0, 1)),
+        findFirst: vi
+          .fn()
+          .mockResolvedValueOnce(rows[0])
+          .mockResolvedValue(null),
         updateMany,
       },
     } as unknown as EnginePrismaClient;

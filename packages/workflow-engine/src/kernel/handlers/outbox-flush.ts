@@ -84,6 +84,7 @@ export async function handleOutboxFlush(
       claim,
       now,
       [],
+      command.signal,
     );
     if (interrupted(expiresAt) || !events.length) break;
     for (const event of events) {

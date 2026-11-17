@@ -24,7 +24,6 @@ exports.createSqliteClient = (file, options = {}) => {
     );
   prisma("generate");
   prisma("db", "push");
-  schema.installOutboxHeads(file);
   const { PrismaClient } = require(join(__dirname, ".generated/sqlite-client"));
   const { PrismaBetterSqlite3 } = require("@prisma/adapter-better-sqlite3");
   return new PrismaClient({
