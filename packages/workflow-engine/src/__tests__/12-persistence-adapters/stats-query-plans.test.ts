@@ -8,8 +8,8 @@
  * walks the table reads every terminal row, which accumulate without limit.
  * This was found by measuring: SQLite drove the unpublished-outbox query and
  * the claim's candidate select from `outbox_events_dlqAt_idx` (`dlqAt IS NULL`
- * is true of every published row), and scanned the table for `dlqAt IS NOT
- * NULL`. See `LIVE_OUTBOX` in `persistence/prisma/persistence.ts`.
+ * is true of every published row), and Postgres with no statistics did the
+ * same inside a BitmapAnd. See `LIVE_OUTBOX` in `persistence/prisma/persistence.ts`.
  *
  * What it does: records the SQL each adapter really sends (the client's query
  * log on Prisma 6 and 7, the compiled plan on Prisma 8), asks the database for
@@ -23,12 +23,19 @@
  *   counts, so this is the choice a large database nobody ANALYZEd gets. It
  *   does not cover a database that was analysed: SQLite then plans from the
  *   row counts, which a few seeded rows cannot stand in for.
- * - Postgres: with `enable_seqscan = off` (set in the checking transaction),
- *   the planner picks a sequential scan only when no index can serve the
- *   statement. So the assertion is that an index path exists and which index
- *   the planner prefers among them; it is independent of row counts. It does
- *   not prove the plan is best at scale: with accurate statistics Postgres
- *   plans these the same way (measured), but the test cannot see that.
+ * - Postgres, forced (`enable_seqscan = off`, a few seeded rows): a sequential
+ *   scan appears only when no index can serve the statement. So this checks
+ *   that an index path exists and which index is preferred among them,
+ *   independent of row counts. It cannot see a plan that is cheaper only while
+ *   the planner has no statistics.
+ * - Postgres, not forced, at scale ("at scale, no forced plan" below): the
+ *   tables are bulk-loaded (500,000 published outbox events and 100,000
+ *   terminal runs, stages and jobs) and the plan is whatever the planner
+ *   chooses, first for tables it has no statistics for (`reltuples = -1`, no
+ *   `pg_statistic` rows, autovacuum off: a fresh bulk load), then after
+ *   `ANALYZE`. Parameters are inlined as the driver sends them, which for the
+ *   dead-letter count's `OFFSET` makes it a quoted literal; that form allows a
+ *   parallel sequential scan, which the parameterised statement does not.
  */
 
 import { mkdtemp, rm } from "node:fs/promises";
@@ -61,6 +68,8 @@ interface Expectation {
   matches: (sql: string) => boolean;
   /** Regular expression source for the index name (Prisma 8 SQLite appends a hash suffix). */
   index: string;
+  /** Regular expression source for an index the plan must not use. */
+  not?: string;
 }
 
 const STATS: Expectation[] = [
@@ -96,6 +105,7 @@ const STATS: Expectation[] = [
     matches: (sql) =>
       sql.includes("outbox_events") && sql.includes("publishedAt"),
     index: "outbox_events_publishedAt_idx",
+    not: "outbox_events_dlqAt_idx",
   },
   {
     name: "dead-lettered outbox events",
@@ -112,6 +122,21 @@ const CLAIM: Expectation = {
   name: "outbox claim candidates",
   matches: (sql) => sql.includes("outbox_events") && /ORDER BY/i.test(sql),
   index: "outbox_events_publishedAt_idx",
+  not: "outbox_events_dlqAt_idx",
+};
+
+/**
+ * The claim on Postgres with no statistics. It must not read the NULL range of
+ * `outbox_events_dlqAt_idx` (one entry per published event, which the plain
+ * `dlqAt IS NULL` filter made it do), but a limit below about 50 can make it
+ * walk the unique (workflowRunId, sequence) index instead: it estimates 1,400
+ * qualifying rows in 250,000 and expects the first few to turn up early. They
+ * do not when the live events sort last, as seeded in the scale tests. Only
+ * statistics settle that choice.
+ */
+const CLAIM_WITHOUT_STATISTICS: Expectation = {
+  ...CLAIM,
+  index: "outbox_events_(publishedAt_idx|workflowRunId_sequence_key)",
 };
 
 const SQLITE_TABLE_SCAN =
@@ -184,8 +209,15 @@ describe.skipIf(!sqlite && !databaseUrl)(
       );
     }
 
-    /** The plan of one statement as text lines. */
-    async function plan(statement: Statement): Promise<string> {
+    /**
+     * The plan of one statement as text lines. On Postgres `forceIndex` turns
+     * sequential scans off for the checking transaction; without it the plan
+     * is whatever the planner chooses.
+     */
+    async function plan(
+      statement: Statement,
+      forceIndex: boolean,
+    ): Promise<string> {
       if (sqlite) {
         const rows = await rawFor(client, {
           detail: "text",
@@ -199,7 +231,8 @@ describe.skipIf(!sqlite && !databaseUrl)(
         // Without this Postgres picks a sequential scan on a small table
         // whatever the indexes are. With it, a sequential scan appears only
         // when no index can serve the statement.
-        await tx.$executeRawUnsafe("SET LOCAL enable_seqscan = off");
+        if (forceIndex)
+          await tx.$executeRawUnsafe("SET LOCAL enable_seqscan = off");
         const rows = await rawFor(tx, {
           "QUERY PLAN": "text",
         }).$queryRawUnsafe(
@@ -222,8 +255,12 @@ describe.skipIf(!sqlite && !databaseUrl)(
     }
 
     /** Asserts the expected index and no scan of an engine table for one statement. */
-    async function expectServedBy(expectation: Expectation, s: Statement) {
-      const text = await plan(s);
+    async function expectServedBy(
+      expectation: Expectation,
+      s: Statement,
+      forceIndex: boolean,
+    ) {
+      const text = await plan(s, forceIndex);
       const message = `${expectation.name}\n${s.sql}\n${text}`;
       expect(text, message).toMatch(
         sqlite
@@ -235,9 +272,12 @@ describe.skipIf(!sqlite && !databaseUrl)(
       expect(text, message).not.toMatch(
         sqlite ? SQLITE_TABLE_SCAN : /Seq Scan/,
       );
+      if (expectation.not) {
+        expect(text, message).not.toMatch(new RegExp(expectation.not));
+      }
     }
 
-    async function expectStatsPlans() {
+    async function expectStatsPlans(forceIndex = true) {
       const captured = await record(() =>
         Promise.all([
           persistence.getActiveWorkStats(new Date()),
@@ -255,11 +295,14 @@ describe.skipIf(!sqlite && !databaseUrl)(
       for (const expectation of STATS) {
         const own = captured.filter((s) => expectation.matches(s.sql));
         expect(own, expectation.name).toHaveLength(1);
-        await expectServedBy(expectation, own[0]!);
+        await expectServedBy(expectation, own[0]!, forceIndex);
       }
     }
 
-    async function expectClaimPlans() {
+    async function expectClaimPlans(
+      forceIndex = true,
+      expectation: Expectation = CLAIM,
+    ) {
       const captured = await record(async () => {
         await persistence.getUnpublishedOutboxEvents(10);
         await persistence.claimUnpublishedOutboxEvents(10);
@@ -268,7 +311,9 @@ describe.skipIf(!sqlite && !databaseUrl)(
       expect(candidates.length, "no claim candidate statement").toBeGreaterThan(
         0,
       );
-      for (const s of candidates) await expectServedBy(CLAIM, s);
+      for (const s of candidates) {
+        await expectServedBy(expectation, s, forceIndex);
+      }
     }
 
     /** A few rows of each kind, in the statuses the stats queries tell apart. */
@@ -356,14 +401,9 @@ describe.skipIf(!sqlite && !databaseUrl)(
     });
 
     describe(sqlite ? "without statistics" : "before ANALYZE", () => {
-      it("serves every stats query from its index", expectStatsPlans);
-      // Not on Postgres: with no statistics it may plan the claim's ORDER BY
-      // from the unique (workflowRunId, sequence) index, a choice only its
-      // statistics settle. The claim's plan is asserted after ANALYZE there.
-      it.skipIf(!sqlite)(
-        "serves the outbox claim's candidates from the unpublished index",
-        expectClaimPlans,
-      );
+      it("serves every stats query from its index", () => expectStatsPlans());
+      it("serves the outbox claim's candidates from the unpublished index", () =>
+        expectClaimPlans());
     });
 
     // Not on SQLite: after ANALYZE it plans from the row counts, and on the two
@@ -374,11 +414,150 @@ describe.skipIf(!sqlite && !databaseUrl)(
       beforeAll(async () => {
         await client.$executeRawUnsafe("ANALYZE");
       });
-      it("serves every stats query from its index", expectStatsPlans);
-      it(
-        "serves the outbox claim's candidates from the unpublished index",
-        expectClaimPlans,
+      it("serves every stats query from its index", () => expectStatsPlans());
+      it("serves the outbox claim's candidates from the unpublished index", () =>
+        expectClaimPlans());
+    });
+
+    // The forced tests above cannot see a plan that is cheaper only while the
+    // planner has no statistics: a fresh bulk load, autovacuum off or behind.
+    // These load the volumes the statements must not read (terminal rows,
+    // published events) and take whatever plan the planner chooses.
+    describe.skipIf(sqlite)("at scale, no forced plan", () => {
+      const TABLES = [
+        "workflow_runs",
+        "workflow_stages",
+        "job_queue",
+        "outbox_events",
+      ];
+      const TERMINAL_ROWS = 100_000;
+      const PUBLISHED_EVENTS = 500_000;
+      const inTables = TABLES.map((table) => `'"${table}"'::regclass`).join(
+        ", ",
       );
+
+      /** How many of the tables carry planner statistics of any kind. */
+      async function analysedTables(): Promise<number> {
+        const [rows, stats] = await Promise.all([
+          rawFor(client, { n: "int" }).$queryRawUnsafe(
+            `SELECT count(*)::int AS n FROM pg_class WHERE oid IN (${inTables}) AND reltuples <> -1`,
+          ),
+          rawFor(client, { n: "int" }).$queryRawUnsafe(
+            `SELECT count(*)::int AS n FROM pg_statistic WHERE starelid IN (${inTables})`,
+          ),
+        ]);
+        return Number(rows[0].n) + Number(stats[0].n);
+      }
+
+      beforeAll(async () => {
+        await truncate();
+        for (const table of TABLES) {
+          await client.$executeRawUnsafe(
+            `ALTER TABLE "${table}" SET (autovacuum_enabled = false)`,
+          );
+        }
+        // Statistics an earlier ANALYZE left survive TRUNCATE.
+        await client.$executeRawUnsafe(
+          `DELETE FROM pg_statistic WHERE starelid IN (${inTables})`,
+        );
+        const terminal = (statuses: string[]) =>
+          `(ARRAY[${statuses.map((s) => `'${s}'`).join(",")}])[1 + g % ${statuses.length}]::"Status"`;
+        await client.$executeRawUnsafe(
+          `INSERT INTO "workflow_runs" (id, "updatedAt", "workflowId", "workflowName", "workflowType", status, input, "createdAt")
+           SELECT 'a-scale-run-' || g, now(), 'plans', 'plans', 'plans', ${terminal(["COMPLETED", "FAILED", "CANCELLED"])}, '{}'::jsonb, now()
+           FROM generate_series(1, ${TERMINAL_ROWS}) g`,
+        );
+        await client.$executeRawUnsafe(
+          `INSERT INTO "workflow_stages" (id, "updatedAt", "workflowRunId", "stageId", "stageName", "stageNumber", "executionGroup", status)
+           SELECT 'scale-stage-' || g, now(), 'a-scale-run-' || g, 's', 's', 1, 1, ${terminal(["COMPLETED", "FAILED", "SKIPPED", "CANCELLED"])}
+           FROM generate_series(1, ${TERMINAL_ROWS}) g`,
+        );
+        await client.$executeRawUnsafe(
+          `INSERT INTO "job_queue" (id, "updatedAt", "workflowRunId", "stageId", status, "createdAt")
+           SELECT 'scale-job-' || g, now(), 'a-scale-run-' || g, 's', ${terminal(["COMPLETED", "FAILED", "CANCELLED"])}, now()
+           FROM generate_series(1, ${TERMINAL_ROWS}) g`,
+        );
+        await client.$executeRawUnsafe(
+          `INSERT INTO "outbox_events" (id, "workflowRunId", sequence, "eventType", payload, "causationId", "occurredAt", "publishedAt")
+           SELECT 'scale-event-' || g, 'a-scale-run-' || g, 1, 'e', '{}'::jsonb, 'c', now(), now()
+           FROM generate_series(1, ${PUBLISHED_EVENTS}) g`,
+        );
+        // The live rows sort after every published one, the worst case for a
+        // plan that walks the events in (workflowRunId, sequence) order.
+        await seed();
+        expect(
+          await analysedTables(),
+          "tables must start without statistics",
+        ).toBe(0);
+      }, 300_000);
+
+      afterAll(async () => {
+        for (const table of TABLES) {
+          await client.$executeRawUnsafe(
+            `ALTER TABLE "${table}" RESET (autovacuum_enabled)`,
+          );
+        }
+      });
+
+      describe("never analysed", () => {
+        it("serves every stats query from its index", () =>
+          expectStatsPlans(false));
+        it("serves the outbox claim's candidates without reading the dlqAt index", () =>
+          expectClaimPlans(false, CLAIM_WITHOUT_STATISTICS));
+      });
+
+      describe("after ANALYZE", () => {
+        beforeAll(async () => {
+          await client.$executeRawUnsafe("ANALYZE");
+        });
+        it("serves every stats query from its index", () =>
+          expectStatsPlans(false));
+        it("serves the outbox claim's candidates from the unpublished index", () =>
+          expectClaimPlans(false));
+      });
+    });
+
+    // A claim candidate that nothing will claim must not occupy the slot of
+    // one that can be claimed. `retryCount` is NOT NULL DEFAULT 0 and only the
+    // engine writes it, but the schema does not stop a negative value, and a
+    // filter that treated it as "live" stalled a claim with a small limit.
+    describe("a row an operator edited", () => {
+      it("does not stall the claim: a dead letter with a negative retryCount is skipped", async () => {
+        const run = "plan-negative";
+        await persistence.createRun({
+          id: run,
+          workflowId: "plans",
+          workflowName: "plans",
+          workflowType: "plans",
+          input: {},
+        });
+        await persistence.appendOutboxEvents(
+          Array.from({ length: 3 }, (_, i) => ({
+            workflowRunId: run,
+            eventType: "e",
+            payload: {},
+            causationId: `neg${i}`,
+            occurredAt: new Date(),
+          })),
+        );
+        const [head, next] = (await persistence.getUnpublishedOutboxEvents())
+          .filter((e) => e.workflowRunId === run)
+          .sort((a, b) => a.sequence - b.sequence);
+        await persistence.moveOutboxEventToDLQ(head!.id);
+        await client.outboxEvent.update({
+          where: { id: head!.id },
+          data: { retryCount: -1 },
+        });
+
+        // `run` sorts before every other seeded run: the head of the queue.
+        const candidates = await persistence.getUnpublishedOutboxEvents(1);
+        expect(candidates.map((e) => e.id)).toEqual([next!.id]);
+        const claimed = await persistence.claimUnpublishedOutboxEvents(1);
+        expect(claimed.map((e) => e.id)).toEqual([next!.id]);
+
+        await client.outboxEvent.deleteMany({ where: { workflowRunId: run } });
+        await client.workflowRun.deleteMany({ where: { id: run } });
+      });
     });
   },
 );

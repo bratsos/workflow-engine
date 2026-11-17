@@ -220,26 +220,42 @@ function isInProgressResult(result: unknown): boolean {
 /**
  * Outbox events the next flush will deliver: not published, not dead-lettered.
  *
- * `OR retryCount < 0` never holds (the count starts at 0 and only rises) but
- * makes the `dlqAt IS NULL` term unusable as an index key. Without it SQLite
- * drives the query from `outbox_events_dlqAt_idx`, and `dlqAt IS NULL` is true
- * of every published row, so the query walks them all: measured with 100,000
- * published events and no `ANALYZE`, for the stats query and for the claim's
- * candidate select alike. With it the only usable index is
- * `outbox_events_publishedAt_idx`, which holds only the unpublished rows'
- * NULLs.
+ * It selects the same rows as `publishedAt IS NULL AND dlqAt IS NULL`. The
+ * extra disjunct, `publishedAt IS NOT NULL`, contradicts the first term, so it
+ * is false for every possible row, whatever the data holds; it is there only
+ * to keep `dlqAt IS NULL` from being used as an index key. `dlqAt IS NULL` is
+ * true of nearly every row, and both databases plan as if it were selective:
+ * - SQLite drives the query from `outbox_events_dlqAt_idx` and walks every
+ *   published row: with 100,000 published events and no `ANALYZE` the claim's
+ *   candidate select took 5.0 ms at the median and 81 ms at worst;
+ * - Postgres with no statistics estimates `IS NULL` at 0.5%, puts the whole
+ *   NULL range of `outbox_events_dlqAt_idx` into a BitmapAnd with
+ *   `outbox_events_publishedAt_idx`, and reads one entry per published row:
+ *   with 500,000 published events and no `ANALYZE` the claim read 500,028
+ *   index entries (432 buffers, 9.1 ms).
+ * With the disjunct the only usable key is `publishedAt IS NULL`
+ * (`outbox_events_publishedAt_idx` holds the unpublished rows' NULLs, 35 in the
+ * Postgres case above: 38 buffers, 0.1 ms), and `dlqAt` is read from those
+ * rows only.
  *
- * Used for the stats aggregate on both databases and, on SQLite only, for the
- * claim's candidate select. Postgres's claim keeps the plain filter: it plans
- * `publishedAt IS NULL AND dlqAt IS NULL ... ORDER BY workflowRunId, sequence`
- * from `outbox_events_publishedAt_idx` plus a top-N sort once it has
- * statistics (measured, 100,000 published rows: 0.5 ms), and the extra term
- * would only raise its estimate of how many rows qualify.
+ * Used for the stats aggregate, the claim's candidate select and the Postgres
+ * claim statement, which spells the same condition in SQL.
  */
 const LIVE_OUTBOX = {
   publishedAt: null,
-  OR: [{ dlqAt: null }, { retryCount: { lt: 0 } }],
+  OR: [{ dlqAt: null }, { publishedAt: { not: null } }],
 };
+
+/** The same condition for the Postgres claim's raw statement. */
+const LIVE_OUTBOX_SQL = `"publishedAt" IS NULL AND ("dlqAt" IS NULL OR "publishedAt" IS NOT NULL)`;
+
+/**
+ * Bounds of the dead-letter count on Postgres (see `countDeadLettered`): every
+ * `dlqAt` the engine writes lies between them, it being the application clock
+ * at the time of the move.
+ */
+const DLQ_AT_LOWER_BOUND = new Date(0);
+const DLQ_AT_UPPER_BOUND = new Date("9999-12-31T23:59:59.999Z");
 
 export class PrismaWorkflowPersistence implements WorkflowPersistence {
   private enums: PrismaEnumHelper;
@@ -887,29 +903,25 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
   }
 
   /**
-   * Active work for `engine.stats`. Every figure is served by an index, and
-   * none reads a terminal row:
+   * Active work for `engine.stats`. Each statement is planned from an index
+   * that leads with the active column, so none reads a terminal row, with or
+   * without planner statistics (checked on Postgres 16 for a table that was
+   * never analysed, see `stats-query-plans.test.ts`):
    *
    * - runs by status, oldest PENDING: `workflow_runs_status_createdAt_id_idx`
    *   (covering: status and createdAt);
    * - stages by status: `workflow_stages_status_idx`;
    * - SUSPENDED stages that are due: `workflow_stages_status_idx` for the
-   *   `status` equality (SQLite, no statistics), or `workflow_stages_nextPollAt_idx`
-   *   for the range (Postgres once its statistics say few stages carry a
-   *   deadline). Both stay bounded: the second reads only stages with a
-   *   deadline, and a terminal stage keeps its deadline only until its job is
-   *   settled;
+   *   `status` equality (SQLite, and Postgres without statistics), or
+   *   `workflow_stages_nextPollAt_idx` for the range (Postgres once its
+   *   statistics say few stages carry a deadline). Both stay bounded: the
+   *   second reads only stages with a deadline, and a terminal stage keeps its
+   *   deadline only until its job is settled;
    * - unpublished outbox events: `outbox_events_publishedAt_idx`, with the
-   *   `dlqAt` and `occurredAt` terms read from those rows only;
-   * - dead letters: `outbox_events_dlqAt_idx`.
-   *
-   * Two filters are written the way they are so the planner cannot choose a
-   * plan that reads published rows (measured on SQLite, 100,000 published
-   * events, no `ANALYZE`):
-   * - the unpublished filter is `LIVE_OUTBOX`: see its comment;
-   * - `dlqAt IS NOT NULL` was a full table scan on SQLite, which does not
-   *   drive an index from it. The lower bound `dlqAt > epoch` is an index
-   *   range that excludes NULL the same way.
+   *   `dlqAt` and `occurredAt` terms read from those rows only (`LIVE_OUTBOX`);
+   * - dead letters: `outbox_events_dlqAt_idx`, read from the first non-NULL
+   *   entry, so only the dead letters' entries are visited. See
+   *   `countDeadLettered` for how each database is made to plan it that way.
    */
   async getActiveWorkStats(now: Date): Promise<ActiveWorkStats> {
     const active = ACTIVE_STATUSES.map((status) => this.enums.status(status));
@@ -929,7 +941,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
         _count: { _all: true },
         _min: { occurredAt: true },
       }),
-      this.prisma.outboxEvent.count({ where: { dlqAt: { gt: new Date(0) } } }),
+      this.countDeadLettered(),
     ]);
 
     return {
@@ -945,6 +957,43 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
         deadLettered,
       },
     };
+  }
+
+  /**
+   * Events with `dlqAt` set, from `outbox_events_dlqAt_idx` alone.
+   *
+   * SQLite: a bare `COUNT(*) ... WHERE dlqAt IS NOT NULL` is a range search of
+   * the index from its first non-NULL entry on every SQLite the three Prisma
+   * majors use. It is raw SQL because Prisma 6 and 7 wrap `count` in a
+   * subselect (`SELECT COUNT(*) FROM (SELECT id ... LIMIT -1 OFFSET 0)`) that
+   * SQLite plans as a table scan for this filter. Unlike a comparison with a
+   * date it does not depend on how the file stores dates (integer
+   * milliseconds written by Prisma 6, ISO text by Prisma 7), which decides
+   * every `<`, `>` and `<=` on a date column.
+   *
+   * Postgres: `dlqAt IS NOT NULL` and `dlqAt > epoch` alone are estimated at
+   * 99.5% and 33% of the table when it has no statistics (never analysed: a
+   * fresh bulk load, autovacuum off or behind), which makes a sequential scan
+   * the cheaper plan: measured with 500,000 published events, a parallel
+   * sequential scan of the table, 247 ms. Ordering the select by `dlqAt` does
+   * not change the choice (the sort is added to every plan alike). A lower
+   * and an upper bound together are estimated at 0.5%, so the index is
+   * chosen; with statistics the estimate is accurate and it is chosen too.
+   * The bounds exclude a `dlqAt` before 1970 or after the year 9999, which
+   * the engine never writes.
+   */
+  private async countDeadLettered(): Promise<number> {
+    if (this.databaseType === "sqlite" && this.prisma.$queryRawUnsafe) {
+      const rows = await rawFor(this.prisma, {
+        n: "bigint",
+      }).$queryRawUnsafe!<{ n: bigint | number }[]>(
+        `SELECT COUNT(*) AS n FROM "outbox_events" WHERE "dlqAt" IS NOT NULL`,
+      );
+      return Number(rows[0]?.n ?? 0);
+    }
+    return this.prisma.outboxEvent.count({
+      where: { dlqAt: { gt: DLQ_AT_LOWER_BOUND, lt: DLQ_AT_UPPER_BOUND } },
+    });
   }
 
   private mapDefinition(row: any): WorkflowDefinitionRecord {
@@ -1679,10 +1728,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
   async getUnpublishedOutboxEvents(limit?: number): Promise<OutboxRecord[]> {
     const effectiveLimit = limit ?? 100;
     const records = await this.prisma.outboxEvent.findMany({
-      where:
-        this.databaseType === "sqlite"
-          ? LIVE_OUTBOX
-          : { publishedAt: null, dlqAt: null },
+      where: LIVE_OUTBOX,
       orderBy: [{ workflowRunId: "asc" }, { sequence: "asc" }],
       take: effectiveLimit,
     });
@@ -1703,7 +1749,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
         `WITH claimed AS (
           SELECT id
           FROM "outbox_events"
-          WHERE "publishedAt" IS NULL AND "dlqAt" IS NULL
+          WHERE ${LIVE_OUTBOX_SQL}
           ORDER BY "workflowRunId" ASC, sequence ASC
           LIMIT $1
           FOR UPDATE SKIP LOCKED

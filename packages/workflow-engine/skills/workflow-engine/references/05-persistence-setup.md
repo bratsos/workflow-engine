@@ -997,7 +997,7 @@ Do not change only the datasource provider. Derive `prisma/schema.prisma` from t
 
 Use the guide's Node runner for both CLI provisioning commands and runtime construction. It builds `file:${resolve("prisma/dev.db").replace(/\\/g, "/")}` from an absolute path, so schema, CLI and adapter use the same file. Keep spaces and Unicode literal. Prisma 6/7's Windows SQLite parser accepts the normalized `file:C:/...` form; `pathToFileURL` emits `file:///C:/...`, which `db push` rejects with OS error 161. For Prisma 6, append `?connection_limit=1` and construct `new PrismaClient({ datasourceUrl })`; this limits its native pool to one connection so engine writes serialize. On Windows ARM64, use x64 Node 24.11.0 under emulation for Prisma 6.19.3; its native query engine did not load under ARM64 Node 24.11.0. Prisma 7.10.1 passed on ARM64 Node 24.11.0. For Prisma 7, construct `new PrismaClient({ adapter: new PrismaBetterSqlite3({ url }) })` from `@prisma/adapter-better-sqlite3`. Run `generate`, then `db push` into the new file; use `--skip-generate` on Prisma 6 when following the guide's separate generation step. Pass `{ databaseType: "sqlite" }` to SQLite-aware engine factories.
 
-When moving either version's SQLite data to Prisma 8, use a fresh file from `contract-sqlite.prisma` and migrate application data. Do not use an existing Prisma 6 or 7 SQLite file directly; exact-time queries differed in real Prisma 7-to-8 checks, and Prisma 6 integer-millisecond timestamps also differ from Prisma 8 ISO text. No normalization migration is supported here.
+A SQLite file belongs to the Prisma major that created it: Prisma 6 stores `DateTime` as integer epoch milliseconds, Prisma 7 and 8 as ISO text, and SQLite orders every integer before every text value, so a date comparison between the two is decided by the type. Read through another major, a Prisma 6 file made `listRunsForPurge` return a run completed a moment ago (retention would delete it), `getStuckRuns` return a run updated a moment ago (`run.reapStuck` would fail it) and `getSuspendedStages` return a stage not due for an hour; a Prisma 7 file read through Prisma 6 never returned a stage whose deadline had passed. Never point one major at another's file; start the new one from a fresh file and migrate application data. When moving either version's SQLite data to Prisma 8, use a fresh file from `contract-sqlite.prisma` and migrate application data. Do not use an existing Prisma 6 or 7 SQLite file directly; exact-time queries differed in real Prisma 7-to-8 checks, and Prisma 6 integer-millisecond timestamps also differ from Prisma 8 ISO text. No normalization migration is supported here.
 
 ## Prisma 8
 
@@ -1411,17 +1411,30 @@ has a `clear(stageRecordId)` of its own. The suites cover `listRunsForPurge` /
 acknowledgements, `enqueueParallel`'s idempotency, `deleteByRunAndStages`,
 `clearExcept`, `compareAndSet` with and without a pinned attempt, the
 `StepRecordPatch` null rule, and the optional `getActiveWorkStats` /
-`getJobStats` (skipped when absent).
+`getJobStats` (an adapter without them passes: the tests return early when the method is absent and are not reported as skipped).
 
 The Prisma adapters serve `getActiveWorkStats` and `getJobStats` from the
 `status`-led indexes (`workflow_runs`, `workflow_stages`, `job_queue`) and from
-`outbox_events_publishedAt_idx` / `outbox_events_dlqAt_idx`. Two outbox filters
-are written to keep SQLite from driving the query off the wrong index (`dlqAt
-IS NULL` is true of every published row; `dlqAt IS NOT NULL` is not driven by
-an index); the first also applies to the SQLite claim's candidate select
-(`getUnpublishedOutboxEvents`). `stats-query-plans.test.ts` asserts the plans
-of the stats queries and of the claim on SQLite and Postgres. A custom SQL
-adapter should check its own plans with 100,000 terminal rows present.
+`outbox_events_publishedAt_idx` / `outbox_events_dlqAt_idx`, with or without
+planner statistics. Three things keep the plans off the wrong index. The
+unpublished filter carries a disjunct that is false for every row
+(`publishedAt IS NOT NULL` next to `publishedAt IS NULL`) so `dlqAt IS NULL`,
+true of every published row, is never an index key: SQLite walked every
+published event and Postgres without statistics read one `dlqAt` index entry
+per published event; it also applies to the claim's candidate select, on both
+databases and in the Postgres claim statement. The dead-letter count is a bare
+`COUNT(*) ... WHERE "dlqAt" IS NOT NULL` on SQLite (an index range from the
+first non-NULL entry, independent of how the file stores dates) and, on
+Postgres, a `dlqAt` range from 1970-01-01 to 9999-12-31 (a lone `dlqAt > epoch`
+or `IS NOT NULL` is estimated at a third or all of an unanalysed table, which
+made a parallel sequential scan the cheaper plan). One limit remains: on an
+unanalysed Postgres table the claim can walk the unique `(workflowRunId,
+sequence)` index at a limit below about 50, which reads the published rows
+that sort before the live ones; `ANALYZE` settles it.
+`stats-query-plans.test.ts` asserts the plans of the stats queries and of the
+claim on SQLite and Postgres, and on Postgres at 500,000 published events with
+no forced plan, before and after `ANALYZE`. A custom SQL adapter should check
+its own plans with 100,000 terminal rows present and with no statistics.
 
 Two suites wait on real time (no injectable clock, no "flush pending writes"
 call), so keep the runner's per-test timeout at its 5 s default or higher.

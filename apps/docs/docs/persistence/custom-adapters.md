@@ -254,9 +254,9 @@ import type { ActiveWorkStats, JobQueueStats } from "@bratsos/workflow-engine";
 * **`unpublished` and `deadLettered` are disjoint.** `unpublished` is what the next `outbox.flush` delivers (`publishedAt` and `dlqAt` both null); an event in the dead-letter queue is only in `deadLettered`, and does not count toward `oldestUnpublishedAt`.
 * **`suspendedDue` uses `getSuspendedStages`'s predicate**: `status = SUSPENDED` and `nextPollAt <= now`, with the `now` the kernel passes. Settled stages that still carry a deadline are not counted.
 * **Omit a method and its sections are `{ available: false }`** in the `engine.stats` result (`runs`, `stages` and `outbox` for persistence, `jobs` for the queue). The command never throws for a missing method, and never reports a missing figure as zero.
-* **Check your plan.** A filter that is true of every terminal row (`dlqAt IS NULL`, say) can make a planner drive the query from the wrong index and read them all; the built-in adapters' notes in `PrismaWorkflowPersistence.getActiveWorkStats` list what was measured. If you wrap a transport, forward `getJobStats` only when the inner transport has it, as `createSpillingJobTransport` does.
+* **Check your plan, with and without statistics.** A filter that is true of every terminal row (`dlqAt IS NULL`, say) can make a planner drive the query from the wrong index and read them all, and PostgreSQL with no statistics (a fresh bulk load, a table never analysed) estimates `IS NULL` at 0.5%, a one-sided range at a third of the table and a two-sided one at 0.5%, so the plan can change with the table's size. The built-in adapters' notes in `PrismaWorkflowPersistence.getActiveWorkStats` and `LIVE_OUTBOX` list what was measured. If you wrap a transport, forward `getJobStats` only when the inner transport has it, as `createSpillingJobTransport` does.
 
-The conformance suites cover both methods and skip them when absent.
+The conformance suites cover both methods. An adapter that omits one passes them without the method being checked: the tests return early when it is absent; they are not reported as skipped.
 
 ---
 

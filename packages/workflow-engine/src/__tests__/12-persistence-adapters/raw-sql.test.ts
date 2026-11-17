@@ -265,7 +265,9 @@ describe("PrismaWorkflowPersistence.claimUnpublishedOutboxEvents raw SQL", () =>
       ...unknown[],
     ];
     expect(sql).toContain("FOR UPDATE SKIP LOCKED");
-    expect(sql).toContain('"publishedAt" IS NULL AND "dlqAt" IS NULL');
+    expect(sql).toContain(
+      '"publishedAt" IS NULL AND ("dlqAt" IS NULL OR "publishedAt" IS NOT NULL)',
+    );
     expect(sql).toContain(
       `SET "publishedAt" = ($2::timestamptz AT TIME ZONE 'UTC')`,
     );

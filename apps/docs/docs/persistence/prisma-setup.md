@@ -1015,7 +1015,16 @@ export const persistence = createPrismaWorkflowPersistence(prisma, {
 
 Use the same `{ databaseType: "sqlite" }` option on the other SQLite-aware factories. The client adapter setup is different on Prisma 6 and 7; the engine factories are not.
 
-#### Fresh database required for Prisma 8 SQLite
+#### A SQLite file belongs to the Prisma major that created it
+
+Prisma 6 stores `DateTime` values in SQLite as integer epoch milliseconds, Prisma 7 and Prisma 8 as ISO text. SQLite orders every integer before every text value, so a comparison between a stored value of one kind and a parameter of the other is decided by the type, not by the time. Do not point one Prisma major at a SQLite file another one created, in either direction. Real-file checks of the engine's own queries (a file written by Prisma 6, read through Prisma 7, holding a run completed a moment ago, a `RUNNING` run updated a moment ago and a `SUSPENDED` stage not due for an hour):
+
+- `listRunsForPurge` with a cutoff of one hour ago returned the run completed a moment ago, so `retention` would delete it;
+- `getStuckRuns` with a threshold of one hour ago returned the run updated a moment ago, so `run.reapStuck` would fail it;
+- `getSuspendedStages` for a time before the deadline returned the stage that is not due, so it would be polled early;
+- `engine.stats` reported that stage as due and the dead-lettered events as 0.
+
+Read the other way (a file written by Prisma 7, read through Prisma 6), a stage whose deadline had passed was not returned, so it would never be polled. There is no supported timestamp-normalization migration: start the new major from a fresh SQLite file and migrate application data into it.
 
 Do not point Prisma 8 at a SQLite file created by Prisma 6 or Prisma 7. Real-file checks found timestamp comparison differences from both origins. In the Prisma 7 boundary probe, the stored value `2026-06-07T08:09:10.123+00:00` matched a Prisma 7 exact-range query and console filter (1 row each), while Prisma 8's `Z`-formatted exact-range query and console filter returned 0 rows each at that same instant. Prisma 6 stores `DateTime` values as integer epoch milliseconds, which also fail when mixed with Prisma 8 ISO-text timestamps. There is no supported timestamp-normalization migration. For either origin, initialise a fresh SQLite file from the Prisma 8 SQLite contract and migrate application data into it.
 
