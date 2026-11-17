@@ -6,7 +6,10 @@
 //   the raw SQL names every column, including RETURNING "table".*, which is
 //   read by name);
 // - CURRENT_TIMESTAMP versus now(), which Prisma 7 and Prisma 8 write
-//   respectively for the same column default.
+//   respectively for the same column default;
+// - the number in the `pg_attver` column option, which pg_dump prints for
+//   every column on Postgres 16.16: it is one value per database, so it
+//   differs between any two databases. The option itself is still compared.
 import { execFileSync } from "node:child_process";
 
 const [reference, candidate] = process.argv.slice(2);
@@ -26,7 +29,10 @@ function statements(url) {
       const body = lines.slice(1, -1).map((l) => l.replace(/,$/, "")).sort();
       lines = [lines[0], ...body.map((l, i) => (i < body.length - 1 ? `${l},` : l)), lines.at(-1)];
     }
-    const text = lines.join("\n").replaceAll("CURRENT_TIMESTAMP", "now()");
+    const text = lines
+      .join("\n")
+      .replaceAll("CURRENT_TIMESTAMP", "now()")
+      .replace(/pg_attver=\d+/g, "pg_attver=N");
     if (!text.includes("prisma_contract")) result.push(text);
     lines = [];
   }
