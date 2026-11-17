@@ -301,8 +301,13 @@ describe("PrismaWorkflowPersistence.claimUnpublishedOutboxEvents raw SQL", () =>
     const updateMany = vi.fn(async (args: any) => ({
       count: args.where.id === "a" ? 0 : 1,
     }));
+    // The SQLite date check reads through a raw query: answer it as an empty file.
+    const $queryRaw = vi.fn(async () => [
+      { col: "bound", lo: "text", loValue: "x", hi: "text", hiValue: "x" },
+    ]);
     const prisma = {
       outboxEvent: { findMany, updateMany },
+      $queryRaw,
     } as unknown as EnginePrismaClient;
     const persistence = new PrismaWorkflowPersistence(prisma, {
       databaseType: "sqlite",
