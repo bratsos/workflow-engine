@@ -182,6 +182,32 @@ describe("runToCompletion", () => {
     expect(result.foreignJobsProcessed).toBe(0);
   });
 
+  it("rejects a jobHeartbeatIntervalMs a timer cannot honour before it creates a run", async () => {
+    const workflow = createTwoStageWorkflow();
+    const { kernel, persistence, jobTransport } = createTestEnv([workflow]);
+
+    for (const jobHeartbeatIntervalMs of [Infinity, NaN, 0, -5]) {
+      await expect(
+        runToCompletion({
+          kernel,
+          jobTransport,
+          persistence,
+          command: {
+            type: "run.create",
+            idempotencyKey: `bad-heartbeat-${String(jobHeartbeatIntervalMs)}`,
+            workflowId: "two-stage",
+            input: { data: "hello" },
+          },
+          jobHeartbeatIntervalMs,
+        }),
+        String(jobHeartbeatIntervalMs),
+      ).rejects.toThrow(
+        /jobHeartbeatIntervalMs must be a number of milliseconds/,
+      );
+    }
+    expect(await persistence.getRunsByStatus("PENDING")).toHaveLength(0);
+  });
+
   it("reports a failed run rather than throwing", async () => {
     const workflow = createFailingWorkflow();
     const { kernel, persistence, jobTransport } = createTestEnv([workflow]);

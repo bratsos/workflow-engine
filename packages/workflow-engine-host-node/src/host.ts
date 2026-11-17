@@ -10,6 +10,7 @@
  */
 
 import {
+  assertTimerMs,
   createEventSinkMonitor,
   type EventSinkHealth,
   type EventSinkMonitor,
@@ -40,10 +41,14 @@ export interface NodeHostConfig {
   /** Unique worker identifier. */
   workerId: string;
 
-  /** Orchestration poll interval in milliseconds (default: 10_000). */
+  /**
+   * Orchestration poll interval in milliseconds (default: 10_000). Must be a number from 1 to 2147483647 (a timer honours nothing else); anything else throws a `RangeError` from `createNodeHost`.
+   */
   orchestrationIntervalMs?: number;
 
-  /** Job dequeue poll interval when queue is empty (default: 1_000). */
+  /**
+   * Job dequeue poll interval when queue is empty (default: 1_000). Must be a number from 1 to 2147483647 (a timer honours nothing else); anything else throws a `RangeError` from `createNodeHost`.
+   */
   jobPollIntervalMs?: number;
 
   /**
@@ -65,6 +70,9 @@ export interface NodeHostConfig {
    * It costs latency only while the worker is following a run it just
    * advanced: the pause is skipped as soon as the loop sees work from
    * another run (a backlog), and resumes when the queue next runs dry.
+   *
+   * Must be a number from 0 to 2147483647; anything else throws a
+   * `RangeError` from `createNodeHost`.
    *
    * Set to `0` to disable it entirely and restore the pre-0.4.4 behaviour
    * (lowest latency for a single-worker deployment; a multi-worker one
@@ -131,14 +139,19 @@ export interface NodeHostConfig {
    */
   onTick?: MaintenanceTickHook;
 
-  /** Job lease heartbeat interval in milliseconds (default: 60_000). */
+  /**
+   * Job lease heartbeat interval in milliseconds (default: 60_000). Must be a number from 1 to 2147483647 (a timer honours nothing else); anything else throws a `RangeError` from `createNodeHost`.
+   */
   jobHeartbeatIntervalMs?: number;
 
   /**
    * Upper bound (ms) on `stop()`: how long to wait for the in-flight tick
    * and `onTick` call, then for the in-flight job to finish, and separately
    * for the final `outbox.flush`, before giving up on each (default:
-   * 10_000). Errors are logged, never thrown.
+   * 10_000). Errors are logged, never thrown. Must be a number from 1 to
+   * 2147483647; anything else throws a `RangeError` from `createNodeHost`,
+   * and nothing switches the bound off (pass 2147483647 to wait for
+   * practically anything).
    */
   shutdownTimeoutMs?: number;
 
@@ -217,9 +230,20 @@ class NodeHostImpl implements NodeHost {
     this.kernel = config.kernel;
     this.jobTransport = config.jobTransport;
     this.workerId = config.workerId;
-    this.orchestrationIntervalMs = config.orchestrationIntervalMs ?? 10_000;
-    this.jobPollIntervalMs = config.jobPollIntervalMs ?? 1_000;
-    this.postJobYieldMs = config.postJobYieldMs ?? this.jobPollIntervalMs;
+    this.orchestrationIntervalMs = assertTimerMs(
+      "orchestrationIntervalMs",
+      config.orchestrationIntervalMs ?? 10_000,
+    );
+    this.jobPollIntervalMs = assertTimerMs(
+      "jobPollIntervalMs",
+      config.jobPollIntervalMs ?? 1_000,
+    );
+    // `0` turns the pause off (see the option); nothing is then timed.
+    this.postJobYieldMs = assertTimerMs(
+      "postJobYieldMs",
+      config.postJobYieldMs ?? this.jobPollIntervalMs,
+      { allowZero: true },
+    );
     this.staleLeaseThresholdMs =
       config.staleLeaseThresholdMs ?? HOST_DEFAULTS.staleLeaseThresholdMs;
     this.jobAbsoluteTimeoutMs =
@@ -234,9 +258,17 @@ class NodeHostImpl implements NodeHost {
       config.maxOutboxFlushPerTick ?? HOST_DEFAULTS.maxOutboxFlushPerTick;
     this.retention = config.retention;
     this.onTick = config.onTick;
-    this.jobHeartbeatIntervalMs =
-      config.jobHeartbeatIntervalMs ?? HOST_DEFAULTS.jobHeartbeatIntervalMs;
-    this.shutdownTimeoutMs = config.shutdownTimeoutMs ?? 10_000;
+    this.jobHeartbeatIntervalMs = assertTimerMs(
+      "jobHeartbeatIntervalMs",
+      config.jobHeartbeatIntervalMs ?? HOST_DEFAULTS.jobHeartbeatIntervalMs,
+    );
+    this.shutdownTimeoutMs = assertTimerMs(
+      "shutdownTimeoutMs",
+      config.shutdownTimeoutMs ?? 10_000,
+      {
+        hint: "The bound cannot be switched off; pass 2147483647 (about 24.8 days) to wait for practically anything.",
+      },
+    );
     this.flushOutboxOnStop = config.flushOutboxOnStop ?? true;
     this.eventSinkMonitor = createEventSinkMonitor({ logPrefix: "[NodeHost]" });
   }

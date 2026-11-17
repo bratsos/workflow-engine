@@ -26,6 +26,35 @@ import { toErrorMessage } from "./error-message.js";
 // ============================================================================
 
 /** Default tuning knobs shared by every host implementation. */
+/** The longest delay a timer honours: a longer one fires after 1 ms. */
+export const MAX_TIMER_MS = 2 ** 31 - 1;
+
+/**
+ * Checks a host option that ends up in `setTimeout` or `setInterval` and
+ * returns it. A timer cannot honour anything else than a finite number of
+ * milliseconds up to {@link MAX_TIMER_MS}: `Infinity`, `NaN`, a negative
+ * number or a value above it fires after 1 ms (Node logs a
+ * `TimeoutOverflowWarning`), which turns a bound meant as "no limit" into the
+ * tightest one and an interval into a busy loop. So it is refused, at
+ * construction, with a `RangeError` that names the option.
+ *
+ * `allowZero` is for an option whose documented `0` means "off" (the caller
+ * then does not start a timer at all). `hint` is appended to the message.
+ */
+export function assertTimerMs(
+  name: string,
+  value: unknown,
+  options: { allowZero?: boolean; hint?: string } = {},
+): number {
+  const min = options.allowZero ? 0 : 1;
+  if (typeof value !== "number" || !(value >= min) || value > MAX_TIMER_MS) {
+    throw new RangeError(
+      `${name} must be a number of milliseconds from ${min} to ${MAX_TIMER_MS} (the longest delay a timer honours, about 24.8 days), got ${String(value)}.${options.hint ? ` ${options.hint}` : ""}`,
+    );
+  }
+  return value;
+}
+
 export const HOST_DEFAULTS = {
   /** Worker id used when a caller does not supply one. */
   workerId: "worker",
@@ -188,6 +217,7 @@ export async function executeJobWithHeartbeat(
     jobHeartbeatIntervalMs = HOST_DEFAULTS.jobHeartbeatIntervalMs,
     logPrefix = HOST_DEFAULTS.logPrefix,
   } = options;
+  assertTimerMs("jobHeartbeatIntervalMs", jobHeartbeatIntervalMs);
 
   // A malformed message (a bridge that dropped `payload` or `workflowId`)
   // is a dead job: reject it up front with a clear message instead of
@@ -531,10 +561,10 @@ export type MaintenanceTickHook = (
  * hook that never settles never returns. With it, the call returns once the
  * hook settles or `timeoutMs` has elapsed, whichever is first; after the
  * bound it logs one warning and leaves the hook running (a later throw or
- * rejection is still caught and logged). `timeoutMs` must be a number from 1
- * to 2147483647: a timer cannot honour anything else (the serverless host
- * checks its `onTickTimeoutMs` at construction). The Node host does not await
- * the hook at all.
+ * rejection is still caught and logged). `timeoutMs` must pass
+ * {@link assertTimerMs} (a number from 1 to 2147483647), or the call rejects
+ * with a `RangeError`; the serverless host checks its `onTickTimeoutMs` at
+ * construction. The Node host does not await the hook at all.
  */
 export async function runTickHook(
   hook: MaintenanceTickHook | undefined,
@@ -543,6 +573,7 @@ export async function runTickHook(
   timeoutMs?: number,
 ): Promise<void> {
   if (!hook) return;
+  if (timeoutMs !== undefined) assertTimerMs("timeoutMs", timeoutMs);
   const call = (async () => {
     try {
       await hook({ ...counts });

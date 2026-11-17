@@ -69,6 +69,8 @@ You can tune the host's polling frequency, lease times, and execution limits:
 | **`shutdownTimeoutMs`** | `number` | `10000` (10s) | Upper bound on `stop()`: how long to wait for the in-flight orchestration tick and `onTick` call, then for the in-flight job to finish, and separately for the final outbox flush. |
 | **`flushOutboxOnStop`** | `boolean` | `true` | Run a final `outbox.flush` in `stop()`, so `workflow:completed` for a run this process finished is published before it exits rather than by whichever process ticks next. |
 
+Every option that reaches a timer (`orchestrationIntervalMs`, `jobPollIntervalMs`, `postJobYieldMs`, `jobHeartbeatIntervalMs`, `shutdownTimeoutMs`) must be a number of milliseconds from `1` to `2147483647` (the longest delay a timer honours, about 24.8 days); `postJobYieldMs` may also be `0`, which turns the pause off. Anything else (`Infinity`, `NaN`, zero, a negative number) makes `createNodeHost` throw a `RangeError` that names the option, because a timer fires after 1 ms on such a value: an interval becomes a busy loop and a bound meant as "no limit" becomes the tightest one. Nothing switches `shutdownTimeoutMs` off; pass `2147483647` to wait for practically anything. `runAndWait` applies the same rule to `pollIntervalMs`, before it creates the run.
+
 `workerId` also reaches `job_queue.workerId`: a `createPrismaJobQueue(prisma)` built without a `workerId` of its own adopts the host's on `start()`, so the job row says which worker ran the stage.
 
 ---

@@ -1,5 +1,6 @@
 // packages/workflow-engine-host-serverless/src/run-to-completion.ts
 import {
+  assertTimerMs,
   executeJobWithHeartbeat,
   HOST_DEFAULTS,
   type JobTransport,
@@ -171,6 +172,8 @@ export async function runToCompletion(
     maxOutboxFlush = HOST_DEFAULTS.maxOutboxFlushPerTick,
     logPrefix = "[runToCompletion]",
   } = options;
+  // Before the run is created: a bad option must not leave one behind.
+  assertTimerMs("jobHeartbeatIntervalMs", jobHeartbeatIntervalMs);
 
   const created = await kernel.dispatch(command);
   const workflowRunId = created.workflowRunId;

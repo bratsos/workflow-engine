@@ -109,6 +109,32 @@ describe("runAndWait", () => {
     expect(host.stop).toHaveBeenCalled();
   });
 
+  it("rejects a pollIntervalMs a timer cannot honour before it creates a run", async () => {
+    const kernel = createFakeKernel();
+    const persistence = createFakePersistence({ terminalStatus: "COMPLETED" });
+    const host = createFakeHost();
+
+    for (const pollIntervalMs of [Infinity, NaN, 0, -5]) {
+      await expect(
+        runAndWait({
+          kernel: kernel as any,
+          persistence: persistence as any,
+          host: host as any,
+          command: {
+            type: "run.create",
+            idempotencyKey: "test-bad-poll",
+            workflowId: "test-workflow",
+            input: {},
+          },
+          pollIntervalMs,
+        }),
+        String(pollIntervalMs),
+      ).rejects.toThrow(/pollIntervalMs must be a number of milliseconds/);
+    }
+    expect(kernel.dispatch).not.toHaveBeenCalled();
+    expect(host.start).not.toHaveBeenCalled();
+  });
+
   it("returns FAILED status when run fails", async () => {
     const kernel = createFakeKernel();
     const persistence = createFakePersistence({ terminalStatus: "FAILED" });

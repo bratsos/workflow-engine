@@ -11,6 +11,7 @@
  */
 
 import {
+  assertTimerMs,
   type EventSinkStatus,
   executeJobWithHeartbeat,
   HOST_DEFAULTS,
@@ -22,9 +23,6 @@ import {
   runTickHook,
   type ServedDefinition,
 } from "@bratsos/workflow-engine/kernel";
-
-/** The longest delay `setTimeout` honours: a longer one fires after 1 ms. */
-const MAX_TIMER_MS = 2 ** 31 - 1;
 
 // ============================================================================
 // Public interfaces
@@ -98,7 +96,10 @@ export interface ServerlessHostConfig {
    */
   flushOutboxAfterJob?: boolean;
 
-  /** Upper bound (ms) on the post-job outbox flush (default: 5_000). */
+  /**
+   * Upper bound (ms) on the post-job outbox flush (default: 5_000). Must be a number from 1 to 2147483647 (a timer honours nothing else); anything else throws a `RangeError` from `createServerlessHost`. Nothing
+   * switches the bound off: pass 2147483647 to wait for practically any flush.
+   */
   outboxFlushTimeoutMs?: number;
 
   /**
@@ -114,7 +115,9 @@ export interface ServerlessHostConfig {
    */
   onTickTimeoutMs?: number;
 
-  /** Job lease heartbeat interval in milliseconds (default: 60_000). */
+  /**
+   * Job lease heartbeat interval in milliseconds (default: 60_000). Must be a number from 1 to 2147483647 (a timer honours nothing else); anything else throws a `RangeError` from `createServerlessHost`.
+   */
   jobHeartbeatIntervalMs?: number;
 }
 
@@ -235,20 +238,25 @@ class ServerlessHostImpl implements ServerlessHost {
       config.maxOutboxFlushPerTick ?? HOST_DEFAULTS.maxOutboxFlushPerTick;
     this.retention = config.retention;
     this.onTick = config.onTick;
-    this.jobHeartbeatIntervalMs =
-      config.jobHeartbeatIntervalMs ?? HOST_DEFAULTS.jobHeartbeatIntervalMs;
+    this.jobHeartbeatIntervalMs = assertTimerMs(
+      "jobHeartbeatIntervalMs",
+      config.jobHeartbeatIntervalMs ?? HOST_DEFAULTS.jobHeartbeatIntervalMs,
+    );
     this.flushOutboxAfterJob = config.flushOutboxAfterJob ?? true;
-    this.outboxFlushTimeoutMs = config.outboxFlushTimeoutMs ?? 5_000;
-    this.onTickTimeoutMs = config.onTickTimeoutMs ?? 5_000;
-    if (
-      typeof this.onTickTimeoutMs !== "number" ||
-      !(this.onTickTimeoutMs >= 1) ||
-      this.onTickTimeoutMs > MAX_TIMER_MS
-    ) {
-      throw new RangeError(
-        `onTickTimeoutMs must be a number of milliseconds from 1 to ${MAX_TIMER_MS}, got ${String(config.onTickTimeoutMs)}. The bound cannot be switched off, because a hook that never settles would then withhold the counts; pass ${MAX_TIMER_MS} (about 24.8 days) to wait for practically any hook.`,
-      );
-    }
+    this.outboxFlushTimeoutMs = assertTimerMs(
+      "outboxFlushTimeoutMs",
+      config.outboxFlushTimeoutMs ?? 5_000,
+      {
+        hint: "The bound cannot be switched off; pass 2147483647 (about 24.8 days) to wait for practically any flush.",
+      },
+    );
+    this.onTickTimeoutMs = assertTimerMs(
+      "onTickTimeoutMs",
+      config.onTickTimeoutMs ?? 5_000,
+      {
+        hint: "The bound cannot be switched off, because a hook that never settles would then withhold the counts; pass 2147483647 (about 24.8 days) to wait for practically any hook.",
+      },
+    );
   }
 
   async handleJob(msg: JobMessage): Promise<JobResult> {

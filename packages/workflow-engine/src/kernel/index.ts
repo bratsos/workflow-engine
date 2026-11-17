@@ -94,6 +94,7 @@ export {
 } from "./helpers/definition-pinning.js";
 // Kernel helpers
 export {
+  assertTimerMs,
   type CreateEventSinkMonitorOptions,
   createEventSinkMonitor,
   type EventSinkHealth,
@@ -105,6 +106,7 @@ export {
   HOST_DEFAULTS,
   type HostJobMessage,
   loadWorkflowContext,
+  MAX_TIMER_MS,
   type MaintenanceTickCounts,
   type MaintenanceTickHook,
   normalizeAnnotateArgs,

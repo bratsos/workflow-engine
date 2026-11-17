@@ -759,6 +759,40 @@ describe("NodeHost", () => {
     expect(host.getStats().eventSink.deadLettered).toBe(0);
   });
 
+  // Every option that reaches setTimeout or setInterval is checked at
+  // construction: Infinity, NaN, a negative number or more than 2**31 - 1 would
+  // otherwise become a 1 ms timer.
+  const TIMER_OPTIONS = [
+    ["orchestrationIntervalMs", false],
+    ["jobPollIntervalMs", false],
+    ["postJobYieldMs", true],
+    ["jobHeartbeatIntervalMs", false],
+    ["shutdownTimeoutMs", false],
+  ] as const;
+  for (const [option, zeroIsOff] of TIMER_OPTIONS) {
+    it(`rejects ${option} when a timer cannot honour it`, () => {
+      const { kernel, jobTransport } = createTestEnv([]);
+      const create = (value: unknown) =>
+        createNodeHost({
+          kernel,
+          jobTransport,
+          workerId: "test-worker",
+          [option]: value,
+        });
+      const bad: unknown[] = [Infinity, -Infinity, NaN, -5, 2 ** 31, "5000"];
+      // A pause drawn uniformly from [0, ms) may be fractional; the others are not.
+      if (!zeroIsOff) bad.push(0, 0.5);
+      for (const value of bad) {
+        expect(() => create(value), `${option}: ${String(value)}`).toThrow(
+          new RegExp(`${option} must be a number of milliseconds`),
+        );
+      }
+      expect(() => create(1)).not.toThrow();
+      expect(() => create(2 ** 31 - 1)).not.toThrow();
+      if (zeroIsOff) expect(() => create(0)).not.toThrow();
+    });
+  }
+
   it("calling start() twice is safe", async () => {
     const { kernel, jobTransport } = createTestEnv([]);
 

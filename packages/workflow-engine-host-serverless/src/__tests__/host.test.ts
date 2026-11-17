@@ -994,21 +994,41 @@ describe("ServerlessHost", () => {
     }
   });
 
-  it("rejects an onTickTimeoutMs that cannot be a timeout", () => {
-    const { kernel, jobTransport } = createTestEnv([]);
-    const create = (onTickTimeoutMs: unknown) =>
-      createServerlessHost({
-        kernel,
-        jobTransport,
-        workerId: "test-worker",
-        onTickTimeoutMs: onTickTimeoutMs as number,
-      });
-    for (const bad of [Infinity, NaN, 0, -5, 0.5, 2 ** 31, "5000"]) {
-      expect(() => create(bad), String(bad)).toThrow(/onTickTimeoutMs must be/);
-    }
-    expect(() => create(1)).not.toThrow();
-    expect(() => create(2 ** 31 - 1)).not.toThrow();
-  });
+  // Every option that reaches setTimeout or setInterval is checked at
+  // construction: Infinity, NaN, zero, a negative number or more than 2**31 - 1
+  // would otherwise become a 1 ms timer (or none).
+  for (const option of [
+    "onTickTimeoutMs",
+    "outboxFlushTimeoutMs",
+    "jobHeartbeatIntervalMs",
+  ] as const) {
+    it(`rejects ${option} when a timer cannot honour it`, () => {
+      const { kernel, jobTransport } = createTestEnv([]);
+      const create = (value: unknown) =>
+        createServerlessHost({
+          kernel,
+          jobTransport,
+          workerId: "test-worker",
+          [option]: value,
+        });
+      for (const bad of [
+        Infinity,
+        -Infinity,
+        NaN,
+        0,
+        -5,
+        0.5,
+        2 ** 31,
+        "5000",
+      ]) {
+        expect(() => create(bad), `${option}: ${String(bad)}`).toThrow(
+          new RegExp(`${option} must be a number of milliseconds`),
+        );
+      }
+      expect(() => create(1)).not.toThrow();
+      expect(() => create(2 ** 31 - 1)).not.toThrow();
+    });
+  }
 
   it("gives the hook its own copy of the counts", async () => {
     const { kernel, jobTransport } = createTestEnv([]);
