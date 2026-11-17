@@ -132,6 +132,23 @@ export async function handleRunReapStuck(
       }
     }
 
+    // Waiting guard: a SUSPENDED stage is touched only when its poll comes
+    // due, so a sleep, `waitFor` `every` or signal `keepalive` longer than
+    // the threshold leaves the run looking exactly like a stuck one. While
+    // a poll is still due, or came due less than one threshold ago, the
+    // poller has not had its chance to wake it; past that, nothing is
+    // polling it and the reap below is right. Placed after the heals so a
+    // sibling PENDING stage with no job is still re-enqueued.
+    const waiting = stages.some(
+      (s) =>
+        s.status === "SUSPENDED" &&
+        s.nextPollAt != null &&
+        s.nextPollAt.getTime() > stuckSince.getTime(),
+    );
+    if (waiting) {
+      continue;
+    }
+
     // Version guard: two hosts racing to reap the same run would
     // otherwise both pass the status check above and both write
     // updateRun + emit workflow:failed. expectedVersion turns the second

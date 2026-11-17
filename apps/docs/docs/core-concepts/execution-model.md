@@ -119,6 +119,7 @@ When a stage fails (by throwing an error), the engine increments the attempt cou
 ### Retry Mechanics
 * The job is returned to the queue if `attempt < maxAttempts` (the transport's `maxAttempts` is the retry budget; the built-in transports back off `2^attempt` seconds). The stage row stays `PENDING` with the error on `errorMessage`, `stage:retrying` is emitted, and the stage's durable step ledger is kept: the retry replays completed steps and re-opens failed ones.
 * The backoff strategy is managed by the host.
+* A suspended stage that throws while `stage.pollSuspended` replays it is retried under the same rule and with the same classifier, spending the attempts its `SUSPENDED` job row has left. The stage stays `SUSPENDED` with the error on `errorMessage`, `attempt` is bumped, `stage:retrying` is emitted and the next poll replays it after a `2^attempt` second backoff; the same single-flight claim applies to that replay as to any other.
 
 ### Terminal Failures
 Once a stage exhausts its `maxAttempts`, it is marked as `FAILED` and `stage:failed` is emitted.
@@ -134,6 +135,7 @@ A **ghost job** occurs when a worker dequeues a job it must not execute. `job.ex
 If a run becomes stuck in `RUNNING` status (e.g., due to an unhandled worker crash and queue loss), the `run.reapStuck` command detects it.
 * A run is deemed stuck if neither the run nor any of its stages have had database updates within the threshold (default: `max(3 * staleLeaseThresholdMs, 5 minutes)`).
 * Stuck runs are automatically failed with the error code `STUCK_RUN_REAPED`.
+* A run whose `SUSPENDED` stage has a `nextPollAt` that is still in the future, or became due less than one threshold ago, is not reaped: a long `ctx.step.sleep`, `waitFor` `every` or signal `keepalive` leaves the rows untouched for longer than the threshold without the run being stuck. A suspended stage with no `nextPollAt`, or one overdue by more than the threshold, is reaped as before.
 
 ---
 

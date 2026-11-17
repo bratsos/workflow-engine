@@ -32,6 +32,7 @@ export {
   type MaintenanceTickCounts,
   type RetentionOptions,
   type RunMaintenanceTickOptions,
+  retryBackoffMs,
   runMaintenanceTick,
   toEventSinkObservation,
 } from "./host-support.js";
@@ -49,6 +50,11 @@ export { resolveExecutionGroupOutput } from "./resolve-execution-group-output.js
 export { rollUpRunTotals } from "./run-totals.js";
 export { saveStageArtifacts } from "./save-stage-artifacts.js";
 export { saveStageOutput } from "./save-stage-output.js";
+export {
+  isRetryableStageError,
+  reopenFailedSteps,
+  willRetryStage,
+} from "./stage-retry.js";
 export {
   type CreateStepApiOptions,
   createStepApi,

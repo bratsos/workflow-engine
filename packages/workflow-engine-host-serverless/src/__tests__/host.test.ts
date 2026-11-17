@@ -551,11 +551,23 @@ describe("ServerlessHost", () => {
     expect(first.outcome).toBe("suspended");
     expect(jobTransport.getJobsByStatus("SUSPENDED")).toHaveLength(1);
 
-    // The retry runs inside stage.pollSuspended and fails for good.
+    // The retry runs inside stage.pollSuspended and spends the step's own
+    // retries; the stage is then retried with the attempts its job has left.
     clock.advance(2_000);
     const tick = await host.runMaintenanceTick();
     expect(tick.suspendedChecked).toBe(1);
     expect(attempts).toBe(2);
+    expect((await persistence.getRun(created.workflowRunId))?.status).toBe(
+      "RUNNING",
+    );
+    expect(jobTransport.getJobsByStatus("SUSPENDED")).toHaveLength(1);
+
+    // Each remaining attempt runs the step once more; the last fails for good.
+    for (let i = 0; i < 2; i++) {
+      clock.advance(10_000);
+      await host.runMaintenanceTick();
+    }
+    expect(attempts).toBe(4);
     expect((await persistence.getRun(created.workflowRunId))?.status).toBe(
       "FAILED",
     );
@@ -566,7 +578,7 @@ describe("ServerlessHost", () => {
     const [job] = jobTransport.getJobsByStatus("FAILED");
     expect(job).toMatchObject({
       stageId: "flaky-step",
-      lastError: "upstream down (2)",
+      lastError: "upstream down (4)",
     });
     expect(job?.completedAt).toBeInstanceOf(Date);
   });

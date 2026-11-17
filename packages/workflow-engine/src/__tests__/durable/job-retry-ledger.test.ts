@@ -9,6 +9,7 @@ import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { registerModels } from "../../ai/model-helper.js";
 import { defineWorkflow } from "../../core/workflow.js";
+import type { CollectingEventSink } from "../../kernel/testing/collecting-event-sink.js";
 import { createTestHarness } from "../../testing/index.js";
 
 const MODEL = "job-retry-ledger-model";
@@ -201,6 +202,57 @@ describe("failed steps across a job retry", () => {
       status: "COMPLETED",
       attempt: 1,
       errorMessage: null,
+    });
+  });
+
+  it("spends only the attempts the job has left on a replay that throws after a retry suspended", async () => {
+    let executions = 0;
+    let polls = 0;
+    const workflow = defineWorkflow("job-retry-replay-budget", { input: In })
+      .stage("extract", {
+        schemas: {
+          input: In,
+          output: z.object({ ready: z.boolean() }),
+          config: z.object({}),
+        },
+        async execute(ctx) {
+          executions++;
+          if (executions === 1) throw new Error("503 Service Unavailable");
+          const ready = await ctx.step.waitFor("extract:poll", {
+            poll: async () => ++polls >= 2,
+            ready: (v) => v === true,
+            every: "1s",
+            timeout: "1h",
+          });
+          // Only a replay gets here, and it never gets through.
+          throw new Error(`still broken (${ready})`);
+        },
+      })
+      .build();
+    const harness = createTestHarness({ workflows: [workflow] });
+
+    const result = await harness.run("job-retry-replay-budget", { items: [] });
+    await harness.flush();
+
+    // Job attempt 1 threw; attempt 2 suspended; its replay is retried once
+    // (attempt 3 of 3) and then the budget is spent.
+    expect(result.status).toBe("FAILED");
+    expect(
+      (harness.eventSink as CollectingEventSink)
+        .getByType("stage:retrying")
+        .map((e) => [e.attempt, e.maxAttempts]),
+    ).toEqual([
+      [1, 3],
+      [2, 3],
+    ]);
+    const stage = await harness.persistence.getStage(
+      result.workflowRunId,
+      "extract",
+    );
+    expect(stage).toMatchObject({
+      status: "FAILED",
+      attempt: 2,
+      errorMessage: "still broken (true)",
     });
   });
 
