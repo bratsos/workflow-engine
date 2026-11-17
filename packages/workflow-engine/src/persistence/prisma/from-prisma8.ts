@@ -32,6 +32,7 @@ import type { AsyncLocalStorage } from "node:async_hooks";
 import type { BlobPrismaClient } from "./blob-store";
 import type { EnginePrismaClient, RawColumns } from "./prisma-client-type";
 import { isReadOnlySql } from "./read-only-sql.js";
+import { isSqliteBusy } from "./sql-errors.js";
 
 type Row = Record<string, any>;
 type Args = Record<string, any>;
@@ -585,6 +586,48 @@ async function withWriteLock<T>(x: Executor, work: () => Promise<T>) {
   }
 }
 
+let collectGarbage: (() => void) | null | undefined;
+let collecting: Promise<void> | undefined;
+/**
+ * The same driver loop leaves a read that fails SQLITE_BUSY at its first step
+ * active, and no write lock can prevent that: the lock is what the read could
+ * not get. SQLite counts the statement as an active reader, so the next
+ * statement on the connection starts a read transaction that does not end while
+ * it exists: other connections cannot commit (rollback journal) or the
+ * connection reads a stale snapshot, fails its writes with SQLITE_BUSY_SNAPSHOT
+ * and holds back the checkpoint (WAL), until the statement object is collected.
+ * It is collected here, once for failures that overlap. This only finalizes a
+ * read statement: it cannot undo a commit, and a write in progress or an open
+ * transaction on the connection is left alone. If the runtime cannot be asked to
+ * collect, the failure is left as it is.
+ */
+function releaseStalledRead(): Promise<void> {
+  return (collecting ??= (async () => {
+    try {
+      if (collectGarbage === undefined) {
+        const v8 = process.getBuiltinModule?.("node:v8");
+        v8?.setFlagsFromString("--expose-gc");
+        collectGarbage =
+          (globalThis as { gc?: () => void }).gc ??
+          process.getBuiltinModule?.("node:vm")?.runInNewContext("gc") ??
+          null;
+        v8?.setFlagsFromString("--no-expose-gc");
+      }
+      // The iterator holds the statement: one collection frees the iterator,
+      // the next the statement. A tick before each lets the call's frames unwind.
+      for (let pass = 0; pass < 3; pass++) {
+        await new Promise((resolve) => setTimeout(resolve));
+        collectGarbage?.();
+      }
+      await new Promise((resolve) => setTimeout(resolve));
+    } catch {
+      collectGarbage = null; // the original failure is what the caller gets
+    } finally {
+      collecting = undefined;
+    }
+  })());
+}
+
 /** Rows for `spec` (column -> codec id); timestamps come back as `Date`. Not public API. */
 export async function rowsOf(
   x: Executor,
@@ -592,12 +635,20 @@ export async function rowsOf(
   spec: Record<string, string>,
 ): Promise<Row[]> {
   const wire = buildPlan(x, q, spec);
+  // The root has `transaction`; a transaction's `tx` does not, and there a failed COMMIT is loud
+  // and the connection goes with the transaction.
+  const root = typeof (x as Partial<Prisma8Db>).transaction === "function";
   const read = () => x.query(wire.plan).toArray();
-  // Not in a transaction (the root has `transaction`), where a COMMIT would fail loudly.
-  const rows =
-    wire.writes && typeof (x as Partial<Prisma8Db>).transaction === "function"
-      ? await withWriteLock(x, read)
-      : await read();
+  let rows: Row[];
+  try {
+    rows = await (wire.writes && root ? withWriteLock(x, read) : read());
+  } catch (error) {
+    // Here, not in `read`: that frame still holds the failed statement. A write
+    // took its lock first, so a BUSY from one left no statement behind.
+    if (root && !wire.writes && !postgres(wire.plan) && isSqliteBusy(error))
+      await releaseStalledRead();
+    throw error;
+  }
   if (wire.overflow)
     for (const row of rows) {
       if (row[wire.overflow])
