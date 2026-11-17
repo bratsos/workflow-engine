@@ -1,6 +1,12 @@
 // Every fixture schema is derived from the engine's shipped schema, so no model
 // is declared twice. Written to ./.generated under the calling fixture.
-const { mkdirSync, readFileSync, writeFileSync } = require("node:fs");
+const { randomUUID } = require("node:crypto");
+const {
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+} = require("node:fs");
 const { join } = require("node:path");
 
 const shipped = readFileSync(
@@ -12,7 +18,11 @@ const urlLine = '\n  url      = env("DATABASE_URL")';
 function write(dir, name, text) {
   mkdirSync(join(dir, ".generated"), { recursive: true });
   const file = join(dir, ".generated", name);
-  writeFileSync(file, text);
+  // Test files call this at the same time: a rename is atomic, a plain write
+  // lets the Prisma CLI read a half-written schema ("no datasource").
+  const partial = `${file}.${randomUUID()}.tmp`;
+  writeFileSync(partial, text);
+  renameSync(partial, file);
   return file;
 }
 
