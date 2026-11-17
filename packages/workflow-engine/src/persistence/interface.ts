@@ -803,7 +803,8 @@ export interface PersistenceCore {
   /**
    * Delete a run and everything the persistence owns under it: stage
    * records, logs, artifacts, annotations, and (on the reference schema,
-   * through the cascade) `workflow_steps`. Never emits an outbox event; the
+   * through the cascade) `workflow_steps`. Never emits an outbox event and
+   * leaves the run's `outbox_events` rows alone; the
    * kernel clears the step ledger and the blob store before calling it.
    *
    * Only while the run still matches `listRunsForPurge(cutoff, statuses)`,

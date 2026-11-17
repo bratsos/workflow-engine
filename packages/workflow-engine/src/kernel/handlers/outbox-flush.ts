@@ -26,7 +26,9 @@
  *   the sink, advances runs.
  * - A consumer that needs every event reads the `outbox_events` table (or
  *   the console, which reads the same rows): the row stays whatever became
- *   of the delivery, until `run.purge` removes the run.
+ *   of the delivery: nothing in the engine deletes outbox rows (`run.purge`
+ *   does not touch `outbox_events`, which has no foreign key to the run), so
+ *   they are removed with SQL.
  *
  * On handler failure:
  * - The event is released (its `publishedAt` cleared) so the next flush

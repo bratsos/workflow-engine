@@ -136,7 +136,7 @@ Nothing deletes a finished run by itself. Opt in per host with `retention: { old
 await kernel.dispatch({ type: "run.purge", olderThan: new Date(Date.now() - 30 * 86_400_000) });
 ```
 
-Deleting by SQL instead: with the reference schema, `DELETE FROM "workflow_runs" WHERE ...` cascades to stages, logs, artifacts and annotations, and from `workflow_stages` to `workflow_steps` **only once the `workflow_steps_stageRecordId_fkey` foreign key exists** (package schema from the release that added `run.purge`; earlier 1.0 alphas need the `ADD CONSTRAINT` in the [0.13 → 1.0 migration guide](../migrations/migrate-0.13-to-1.0.md)). `job_queue` has no foreign key to the run and must be deleted explicitly, and blobs live outside the database.
+Deleting by SQL instead: with the reference schema, `DELETE FROM "workflow_runs" WHERE ...` cascades to stages, logs, artifacts and annotations, and from `workflow_stages` to `workflow_steps` **only once the `workflow_steps_stageRecordId_fkey` foreign key exists** (package schema from the release that added `run.purge`; earlier 1.0 alphas need the `ADD CONSTRAINT` in the [0.13 → 1.0 migration guide](../migrations/migrate-0.13-to-1.0.md)). `job_queue` and `outbox_events` have no foreign key to the run and must be deleted explicitly, and blobs live outside the database. `run.purge` itself never deletes outbox rows (nor `ai_calls`): nothing in the engine does, so the outbox table is not bounded by retention and you remove its rows with SQL.
 
 ---
 

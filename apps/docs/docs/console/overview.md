@@ -214,6 +214,8 @@ with a `query_timeout` code, which the UI shows as an inline banner while
 leaving the filter bar interactive. SQLite has no `statement_timeout`, so the
 console cannot cancel a running SQLite query this way.
 
+On SQLite the read port also refuses a file that another Prisma major wrote (Prisma 6 stores dates as integer milliseconds, 7 and 8 as ISO text): its first read rejects with the engine's `SqliteDateStorageError`, because its date filters and cursors would answer wrongly. See [A SQLite file belongs to the Prisma major that created it](../persistence/prisma-setup.md#a-sqlite-file-belongs-to-the-prisma-major-that-created-it).
+
 The full reference — every option, the action vocabulary, custom read
 ports, and what the console deliberately does not do — is in the
 [package README](https://github.com/bratsos/workflow-engine/tree/main/packages/workflow-engine-console).

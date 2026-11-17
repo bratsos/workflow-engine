@@ -134,7 +134,9 @@ cannot change the definition version and it still refuses a `CANCELLED` run.
 
 Nothing deletes a terminal run on its own. `run.purge` (`{ olderThan,
 statuses?, limit? }` → `{ purged, workflowRunIds }`) clears each run's step
-ledger, job rows and blobs and deletes the run with everything under it;
+ledger, job rows and blobs and deletes the run with its stages, logs, artifacts
+and annotations (not its `outbox_events`: nothing in the engine deletes outbox
+rows);
 both hosts run it at the end of the maintenance tick once `retention:
 { olderThanMs, statuses?, limit? }` is set (off by default). See "Run
 Retention" in [09-troubleshooting.md](09-troubleshooting.md).

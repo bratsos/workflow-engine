@@ -288,6 +288,7 @@ export function createPrismaConsoleReadPort(
 - **Root Prisma client**: When passed a root client (where `$transaction` is present), the read port wraps requests in a single transaction and executes `SET LOCAL statement_timeout = <ms>`. Running multi-query pages (like run detail) in one transaction prevents holding multiple connection pool slots and provides a consistent snapshot.
 - **Transaction client**: When passed an active transaction client (where `$transaction` is absent), the read port **skips** `SET LOCAL statement_timeout`. It does not override the timeout budget of a transaction opened by the caller.
 - **SQLite client**: SQLite has no `statement_timeout` support. The read port does not issue `SET LOCAL`, and `statementTimeoutMs` cannot cancel a running SQLite statement.
+- **SQLite file of another Prisma major**: the read port's first read rejects with `SqliteDateStorageError` (the engine's own check, once per client) when the file's dates were written by another major (Prisma 6 integer milliseconds, 7 and 8 ISO text): its date filters and cursors would otherwise answer wrongly. See 05-persistence-setup.md.
 
 If a query exceeds the limit, PostgreSQL cancels the statement with SQLSTATE `57014`. The read port catches this and throws `ConsoleQueryTimeoutError`:
 

@@ -111,6 +111,7 @@ class MyCustomJobQueue implements JobQueue {
   async touchJob(jobId: string): Promise<void> { ... } // Heartbeat lock
   async getJobStats(): Promise<JobQueueStats> { ... } // optional, see "Active-work stats"
   adoptWorkerId(workerId: string): string { ... } // optional: take the host's workerId on start()
+  async verifyStorage(): Promise<void> { ... } // optional: reject if the storage may not be used; a host's start() calls it
   readonly fairnessGroupBy?: string | null;         // optional: read by createSpillingJobTransport
 }
 ```

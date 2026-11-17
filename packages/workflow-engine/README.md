@@ -1136,7 +1136,7 @@ The resumed stage keeps its step ledger: completed steps are answered from it, s
 
 ### Retention
 
-Nothing deletes runs unless you ask. `run.purge` — `{ olderThan, statuses?, limit? }` → `{ purged, workflowRunIds }` — clears a terminal run's step ledger, job rows and blobs and deletes the run with everything under it. Selection commits before cleanup, which runs outside that transaction; the run is deleted last. A cleanup failure rejects dispatch and leaves the run available to a later purge. Cleanup can be partial, so custom ports must tolerate repeated cleanup. A run redriven during the sweep is kept, and `workflowRunIds` names only the runs deleted. Both hosts run it on the maintenance tick when given `retention: { olderThanMs, statuses?, limit? }`:
+Nothing deletes runs unless you ask. `run.purge` — `{ olderThan, statuses?, limit? }` → `{ purged, workflowRunIds }` — clears a terminal run's step ledger, job rows and blobs and deletes the run with its stages, logs, artifacts and annotations. It does not touch the run's `outbox_events` or `ai_calls` rows: nothing in the engine deletes outbox rows, so remove them with SQL. Selection commits before cleanup, which runs outside that transaction; the run is deleted last. A cleanup failure rejects dispatch and leaves the run available to a later purge. Cleanup can be partial, so custom ports must tolerate repeated cleanup. A run redriven during the sweep is kept, and `workflowRunIds` names only the runs deleted. Both hosts run it on the maintenance tick when given `retention: { olderThanMs, statuses?, limit? }`:
 
 ```typescript
 createNodeHost({
@@ -1252,7 +1252,7 @@ async execute(ctx) {
 | `run.cancel` | Cancel a running workflow (cascades to stages + jobs, aborts the running body) | `workflowRunId`, `reason?` |
 | `run.redrive` | Retry from the last failure, restart, or resume at a stage; archives the superseded attempt | `workflowRunId`, `from?`, `definitionVersion?` |
 | `run.rerunFrom` | **Deprecated** — use `run.redrive` | `workflowRunId`, `fromStageId` |
-| `run.purge` | Delete terminal runs older than a cutoff with everything under them | `olderThan`, `statuses?`, `limit?` |
+| `run.purge` | Delete terminal runs older than a cutoff with their stages, logs, artifacts, annotations, step ledger, jobs and blobs (not `outbox_events`) | `olderThan`, `statuses?`, `limit?` |
 | `run.listVersions` | Per-version run counts: which versions have drained, which nobody here serves | `workflowId?`, `definitionVersion?` |
 | `job.execute` | Execute a single stage (multi-phase transactions) | `idempotencyKey?`, `workflowRunId`, `workflowId`, `stageId`, `config`, `attempt?`, `maxAttempts?`, `abortSignal?` |
 | `job.heartbeat` | Renew a job lease and report whether the work is still wanted (feeds `abortSignal`) | `jobId`, `workflowRunId`, `attempt?` |

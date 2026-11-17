@@ -104,7 +104,7 @@ The key kernel commands are:
 * **`outbox.flush`**: Publishes committed outbox events to the `EventSink` and reports the sink's health.
 * **`plugin.replayDLQ`**: Re-queues dead-lettered outbox events once the sink is back.
 * **`run.reapStuck`**: Automatically fails workflow runs that have ceased database updates.
-* **`run.purge`**: Deletes terminal runs older than a cutoff with everything under them (stages, logs, artifacts, annotations, step ledger, job rows, blobs). Off unless a host is given `retention`; see [Run Retention](../troubleshooting/overview.md#run-retention).
+* **`run.purge`**: Deletes terminal runs older than a cutoff with the stages, logs, artifacts, annotations, step ledger, job rows and blobs under them (not the run's `outbox_events` or `ai_calls` rows: nothing in the engine deletes those). Off unless a host is given `retention`; see [Run Retention](../troubleshooting/overview.md#run-retention).
 * **`run.listVersions`**: Reports which definition versions still have runs and whether this build serves them.
 * **`engine.stats`**: Read-only gauges of active work: runs, stages, jobs and outbox events by status, plus the age of the oldest waiting item. See [Observing the engine](#observing-the-engine).
 
@@ -252,7 +252,7 @@ What that does and does not guarantee:
 * **Retried on a sink failure.** If `emit` throws, the event is released and the next flush tries again, up to the retry budget (`maxRetries`, default 3 failed attempts); then it is dead-lettered until you replay it with `plugin.replayDLQ`. A retry calls `emit` again for the whole event: with the plugin runner, plugins that ran before the failing one see it again, so keep plugin handlers idempotent.
 * **Lost only if the process dies between the claim and the emit.** The stamp then says the event was published, and no later flush picks it up. Delivery is at-most-once per claim, retried only after a sink failure; it is **not** at-least-once.
 * **The engine's own progress never depends on the sink.** The poller, not the sink, advances runs. A refusing sink costs delivery latency and dead letters you can replay, and nothing else.
-* **If you need every event, read the table.** Treat the `EventSink` as a notification channel and the `outbox_events` table as the record: the row stays whatever became of its delivery, until `run.purge` removes the run. The [console](../console/overview.md) reads the same rows (the run's outbox event timeline and the dead letters).
+* **If you need every event, read the table.** Treat the `EventSink` as a notification channel and the `outbox_events` table as the record: the row stays whatever became of its delivery: nothing in the engine deletes outbox rows (`run.purge` does not touch `outbox_events`, which has no foreign key to the run), so the table is not bounded by retention and you remove rows with SQL when you no longer need them. The [console](../console/overview.md) reads the same rows (the run's outbox event timeline and the dead letters).
 
 ### Degraded delivery
 

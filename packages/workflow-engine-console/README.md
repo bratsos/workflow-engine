@@ -397,6 +397,8 @@ The frontend catches this error and renders an inline warning banner while maint
 
 SQLite has no `statement_timeout` support. On SQLite, `statementTimeoutMs` does not cancel a running query, so the timeout response described above applies to PostgreSQL only.
 
+On SQLite the read port also refuses a file that another Prisma major wrote (Prisma 6 stores dates as integer milliseconds, 7 and 8 as ISO text): its date filters and cursors would answer wrongly. Its first read rejects with the engine's `SqliteDateStorageError`, the same check the engine's SQLite adapters run, once per client. See [A SQLite file belongs to the Prisma major that created it](https://github.com/bratsos/workflow-engine/blob/main/apps/docs/docs/persistence/prisma-setup.md#a-sqlite-file-belongs-to-the-prisma-major-that-created-it).
+
 ## The UI
 
 The frontend is a single-page application built with Preact, compiled at package build time directly into string literals within the distribution bundle. Consumers run no frontend build pipelines, install no client dependencies, introduce no additional packages into their dependency tree, and load no assets from external CDNs.
