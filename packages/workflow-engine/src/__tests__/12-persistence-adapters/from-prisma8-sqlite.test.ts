@@ -1721,3 +1721,152 @@ describe
     });
   },
 );
+
+// A write that waits for the root reads in flight (an adapter commit on a
+// rollback journal, a root write retrying after SQLITE_BUSY_SNAPSHOT in WAL)
+// must not wait for reads that start after it: those queue behind it. The
+// driver's root `query` is gated here, so each read holds its first row until
+// the test releases it, and each read starts before the previous one ends.
+describe
+  .skipIf(process.env.PRISMA_MAJOR !== "8")
+  .each(["delete", "wal"] as const)(
+  "a waiting write on a %s file with overlapping root reads",
+  (mode) => {
+    let dir: string;
+    let db: any;
+    beforeAll(async () => {
+      dir = mkdtempSync(join(tmpdir(), "workflow-prisma8-starve-"));
+      const file = join(dir, "engine.db");
+      db = await require(join(fixtureDir, "index.cjs")).createSqliteDb(file);
+      const raw = new DatabaseSync(file);
+      raw.exec(`PRAGMA journal_mode = ${mode}`);
+      raw.close();
+    }, 30_000);
+    afterAll(async () => {
+      await db?.close();
+      if (dir) rmSync(dir, { recursive: true, force: true });
+    });
+
+    it("finishes after the read it waited for, and later reads run after it", async () => {
+      const held: Array<() => void> = [];
+      let armed = false;
+      let waiting = false;
+      const staleSnapshot = (error: any) => {
+        for (let e = error; e; e = e.cause) if (e.errcode === 517) return true;
+        return false;
+      };
+      const gated = new Proxy(db, {
+        get(target, prop) {
+          if (prop === "query")
+            return (plan: unknown) => {
+              const result = target.query(plan);
+              if (!armed) return result;
+              return {
+                toArray: async () => {
+                  const it = result[Symbol.asyncIterator]();
+                  const rows: unknown[] = [];
+                  let step = await it.next();
+                  if (!step.done) rows.push(step.value);
+                  await new Promise<void>((release) => held.push(release));
+                  while (!(step = await it.next()).done) rows.push(step.value);
+                  return rows;
+                },
+              };
+            };
+          if (prop === "execute")
+            return (plan: unknown) =>
+              target.execute(plan).catch((error: unknown) => {
+                if (staleSnapshot(error)) waiting = true;
+                throw error;
+              });
+          // The adapter closes its read gate right after reading the journal mode.
+          if (prop === "transaction")
+            return (fn: (raw: any) => Promise<unknown>) =>
+              target.transaction((raw: any) =>
+                fn(
+                  new Proxy(raw, {
+                    get(t, p) {
+                      const value = Reflect.get(t, p, t);
+                      if (p !== "query") return value;
+                      return (plan: unknown) => {
+                        const result = value.call(t, plan);
+                        if (!JSON.stringify(plan).includes("journal_mode"))
+                          return result;
+                        return {
+                          toArray: () =>
+                            result.toArray().finally(() => {
+                              if (mode === "delete") waiting = true;
+                            }),
+                        };
+                      };
+                    },
+                  }),
+                ),
+              );
+          const value = Reflect.get(target, prop, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      const prisma: any = fromPrisma8(gated);
+      await prisma.workflowRun.deleteMany({});
+      await prisma.workflowRun.createMany({
+        data: [run("a"), run("b"), run("c")],
+      });
+      // Runs every callback already queued; no clock is involved.
+      const drain = async () => {
+        for (let i = 0; i < 20; i++)
+          await new Promise<void>((resolve) => setImmediate(resolve));
+      };
+      const events: string[] = [];
+      const read = (n: number) =>
+        prisma.workflowRun
+          .findMany()
+          .then((rows: unknown[]) => events.push(`read ${n}: ${rows.length}`));
+
+      armed = true;
+      const reads = [read(0)];
+      await drain();
+      expect(held).toHaveLength(1);
+      // delete: an adapter commit waits for read 0. wal: the commit does not
+      // wait, and the root write behind it fails 517 and then waits for read 0.
+      let done = false;
+      const write = (async () => {
+        await prisma.$transaction((tx: any) =>
+          tx.workflowRun.create({ data: run("d") }),
+        );
+        if (mode === "wal")
+          await prisma.workflowRun.updateMany({ data: { priority: 9 } });
+      })().then(() => {
+        done = true;
+        events.push("write");
+      });
+      try {
+        await drain();
+        expect(waiting).toBe(true);
+        expect(done).toBe(false);
+        let started = 0;
+        while (!done && started < 5) {
+          reads.push(read(++started));
+          await drain();
+          held[started - 1]!();
+          await drain();
+        }
+        // Without the queue every new read holds the gate open: still waiting.
+        expect({ done, started }).toEqual({ done: true, started: 1 });
+      } finally {
+        armed = false;
+        while (held.length) {
+          held.shift()!();
+          await drain();
+        }
+        await write;
+        await Promise.all(reads);
+      }
+      expect(events.slice(0, 2)).toEqual(["read 0: 3", "write"]);
+      expect(events[2]).toMatch(/^read 1: 4$/);
+      expect(
+        (await prisma.workflowRun.findMany()).map((r: any) => r.priority),
+      ).toEqual(mode === "wal" ? [9, 9, 9, 9] : [5, 5, 5, 5]);
+    }, 30_000);
+  },
+);
