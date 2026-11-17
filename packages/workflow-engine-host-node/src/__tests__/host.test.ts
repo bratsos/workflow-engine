@@ -793,6 +793,74 @@ describe("NodeHost", () => {
     });
   }
 
+  it("fails start() instead of running when the storage is refused", async () => {
+    const { kernel, jobTransport } = createTestEnv([]);
+    // What the SQLite adapters throw for a file another Prisma major wrote.
+    const refusal = Object.assign(new Error("a foreign SQLite file"), {
+      code: "SQLITE_DATE_STORAGE_MISMATCH",
+    });
+    (jobTransport as any).verifyStorage = async () => {
+      throw refusal;
+    };
+    const dispatched = vi.spyOn(kernel, "dispatch");
+    const refused = createNodeHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+      orchestrationIntervalMs: 10,
+      jobPollIntervalMs: 10,
+    });
+    await expect(refused.start()).rejects.toBe(refusal);
+    await new Promise((r) => setTimeout(r, 60));
+    // No tick, no job poll, no timer, no signal handler: nothing ran.
+    expect(refused.getStats().isRunning).toBe(false);
+    expect(refused.getStats().orchestrationTicks).toBe(0);
+    expect(dispatched).not.toHaveBeenCalled();
+    await refused.stop();
+  });
+
+  it("verifies the storage once, however many start() calls are in flight", async () => {
+    const { kernel, jobTransport } = createTestEnv([]);
+    let verified = 0;
+    (jobTransport as any).verifyStorage = async () => {
+      verified++;
+      await new Promise((r) => setTimeout(r, 20));
+    };
+    host = createNodeHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+      orchestrationIntervalMs: 10_000,
+      jobPollIntervalMs: 20,
+    });
+    await Promise.all([host.start(), host.start(), host.start()]);
+    expect(verified).toBe(1);
+    expect(host.getStats().isRunning).toBe(true);
+    expect(host.getStats().orchestrationTicks).toBe(1);
+  });
+
+  it("rejects an onTick that is not a function", () => {
+    const { kernel, jobTransport } = createTestEnv([]);
+    for (const bad of ["x", 5, {}, null as never]) {
+      if (bad === null) continue;
+      expect(
+        () =>
+          createNodeHost({
+            kernel,
+            jobTransport,
+            workerId: "test-worker",
+            onTick: bad as never,
+          }),
+        String(bad),
+      ).toThrow(
+        new TypeError(`onTick must be a function, got ${String(bad)}.`),
+      );
+    }
+    expect(() =>
+      createNodeHost({ kernel, jobTransport, workerId: "test-worker" }),
+    ).not.toThrow();
+  });
+
   it("calling start() twice is safe", async () => {
     const { kernel, jobTransport } = createTestEnv([]);
 

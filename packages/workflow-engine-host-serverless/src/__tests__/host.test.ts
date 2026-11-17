@@ -1030,6 +1030,63 @@ describe("ServerlessHost", () => {
     });
   }
 
+  it("rejects an onTick that is not a function", () => {
+    const { kernel, jobTransport } = createTestEnv([]);
+    for (const bad of ["x", 5, {}]) {
+      expect(
+        () =>
+          createServerlessHost({
+            kernel,
+            jobTransport,
+            workerId: "test-worker",
+            onTick: bad as never,
+          }),
+        String(bad),
+      ).toThrow(
+        new TypeError(`onTick must be a function, got ${String(bad)}.`),
+      );
+    }
+  });
+
+  it("refuses every entry point when the storage is refused, and recovers when it is not", async () => {
+    const { kernel, jobTransport } = createTestEnv([]);
+    // What the SQLite adapters throw for a file another Prisma major wrote.
+    const refusal = Object.assign(new Error("a foreign SQLite file"), {
+      code: "SQLITE_DATE_STORAGE_MISMATCH",
+    });
+    let refusing = true;
+    (jobTransport as any).verifyStorage = async () => {
+      if (refusing) throw refusal;
+    };
+    const dispatched = vi.spyOn(kernel, "dispatch");
+    const host = createServerlessHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+    });
+
+    await expect(host.runMaintenanceTick()).rejects.toBe(refusal);
+    await expect(host.processAvailableJobs()).rejects.toBe(refusal);
+    await expect(
+      host.handleJob({
+        jobId: "j",
+        workflowRunId: "r",
+        workflowId: "w",
+        stageId: "s",
+        attempt: 1,
+        payload: {},
+      }),
+    ).rejects.toBe(refusal);
+    expect(dispatched).not.toHaveBeenCalled();
+
+    // The check is asked again until it passes, then remembered.
+    refusing = false;
+    await expect(host.runMaintenanceTick()).resolves.toMatchObject({
+      claimed: 0,
+    });
+    expect(dispatched).toHaveBeenCalled();
+  });
+
   it("gives the hook its own copy of the counts", async () => {
     const { kernel, jobTransport } = createTestEnv([]);
     const host = createServerlessHost({

@@ -219,6 +219,7 @@ class ServerlessHostImpl implements ServerlessHost {
   private readonly flushOutboxAfterJob: boolean;
   private readonly outboxFlushTimeoutMs: number;
   private readonly onTickTimeoutMs: number;
+  private storageVerified = false;
 
   constructor(config: ServerlessHostConfig) {
     this.kernel = config.kernel;
@@ -237,6 +238,11 @@ class ServerlessHostImpl implements ServerlessHost {
     this.maxOutboxFlushPerTick =
       config.maxOutboxFlushPerTick ?? HOST_DEFAULTS.maxOutboxFlushPerTick;
     this.retention = config.retention;
+    if (config.onTick !== undefined && typeof config.onTick !== "function") {
+      throw new TypeError(
+        `onTick must be a function, got ${String(config.onTick)}.`,
+      );
+    }
     this.onTick = config.onTick;
     this.jobHeartbeatIntervalMs = assertTimerMs(
       "jobHeartbeatIntervalMs",
@@ -259,7 +265,22 @@ class ServerlessHostImpl implements ServerlessHost {
     );
   }
 
+  /**
+   * There is no `start()` here, so the first call of any entry point
+   * (`handleJob`, `processAvailableJobs`, `runMaintenanceTick`) checks that the
+   * storage may be used and throws if not (a SQLite file another Prisma major
+   * wrote: `SqliteDateStorageError`), instead of every command logging it.
+   * A success is remembered; a failure is asked again (the check itself is
+   * cached by the adapter, so that costs nothing).
+   */
+  private async ready(): Promise<void> {
+    if (this.storageVerified) return;
+    await this.jobTransport.verifyStorage?.();
+    this.storageVerified = true;
+  }
+
   async handleJob(msg: JobMessage): Promise<JobResult> {
+    await this.ready();
     // Dispatch job.execute under a lease heartbeat and route the outcome
     // (complete/suspend/fail + terminal run.transition) — see
     // executeJobWithHeartbeat in @bratsos/workflow-engine/kernel for the
@@ -317,6 +338,7 @@ class ServerlessHostImpl implements ServerlessHost {
   async processAvailableJobs(opts?: {
     maxJobs?: number;
   }): Promise<ProcessJobsResult> {
+    await this.ready();
     const maxJobs = opts?.maxJobs ?? 1;
     let processed = 0;
     let succeeded = 0;
@@ -362,6 +384,7 @@ class ServerlessHostImpl implements ServerlessHost {
   }
 
   async runMaintenanceTick(): Promise<MaintenanceTickResult> {
+    await this.ready();
     // Claim pending runs, poll suspended stages, reap stale leases, flush
     // the outbox, and reap stuck runs — see runMaintenanceTick in
     // @bratsos/workflow-engine/kernel for the shared command sequence. The

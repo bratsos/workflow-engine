@@ -194,6 +194,8 @@ class NodeHostImpl implements NodeHost {
   private jobLoop: Promise<void> | null = null;
   /** The orchestration tick currently running, if any. */
   private tickInFlight: Promise<void> | null = null;
+  /** `start()` while it is still verifying the storage, so a second call joins it. */
+  private starting: Promise<void> | null = null;
   /** The `onTick` call currently running, if any. */
   private hookInFlight: Promise<void> | null = null;
   private hookStartedAt = 0;
@@ -257,6 +259,11 @@ class NodeHostImpl implements NodeHost {
     this.maxOutboxFlushPerTick =
       config.maxOutboxFlushPerTick ?? HOST_DEFAULTS.maxOutboxFlushPerTick;
     this.retention = config.retention;
+    if (config.onTick !== undefined && typeof config.onTick !== "function") {
+      throw new TypeError(
+        `onTick must be a function, got ${String(config.onTick)}.`,
+      );
+    }
     this.onTick = config.onTick;
     this.jobHeartbeatIntervalMs = assertTimerMs(
       "jobHeartbeatIntervalMs",
@@ -279,7 +286,26 @@ class NodeHostImpl implements NodeHost {
 
   async start(): Promise<void> {
     if (this.running) return;
+    this.starting ??= this.verifyThenBegin().finally(() => {
+      this.starting = null;
+    });
+    return this.starting;
+  }
 
+  /**
+   * A host whose storage refuses to be used fails here, before any timer,
+   * loop or signal handler exists, instead of running and logging the same
+   * error on every tick: a SQLite file another Prisma major wrote makes
+   * `verifyStorage` reject with `SqliteDateStorageError` (a transport with no
+   * such check starts as before).
+   */
+  private async verifyThenBegin(): Promise<void> {
+    await this.jobTransport.verifyStorage?.();
+    if (this.running) return;
+    this.begin();
+  }
+
+  private begin(): void {
     this.running = true;
     this.startTime = Date.now();
 
