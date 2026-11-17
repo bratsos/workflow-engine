@@ -4,6 +4,7 @@ import {
   type AttemptStageInput,
   type AttemptStepInput,
   buildStageAttemptHistory,
+  CATCH_UP_READS_PER_INTERVAL,
   catchUpStep,
   type EventCoverage,
   type HeldStageEvents,
@@ -70,17 +71,33 @@ function history(
   steps: AttemptStepInput[] = [],
   options: {
     redriveCount?: number;
+    runStatus?: string;
     coverage?: EventCoverage;
     caughtUp?: boolean;
     paused?: boolean;
   } = {},
 ) {
+  // The run's first rows, as `run.create` and the claim write them, unless the
+  // test gives its own.
+  const head: AttemptEventInput[] = [];
+  if (!events.some((e) => e.eventType === "workflow:created")) {
+    head.push({ ...run("workflow:created", -2), sequence: -1 });
+    const firstRun = events.find((e) => e.stageId === null);
+    const claimed =
+      firstRun?.eventType === "workflow:started" &&
+      !events.some((e) => e.stageId !== null && e.sequence < firstRun.sequence);
+    if (!claimed) head.push({ ...run("workflow:started", -1), sequence: 0 });
+    seq -= head.length;
+  }
   return buildStageAttemptHistory({
     redriveCount: options.redriveCount ?? 0,
+    ...(options.runStatus === undefined
+      ? {}
+      : { runStatus: options.runStatus }),
     stages,
     steps,
     stageEvents: {
-      events,
+      events: [...head, ...events],
       coverage: options.coverage ?? "from-start",
       ...(options.caughtUp === undefined ? {} : { caughtUp: options.caughtUp }),
       ...(options.paused === undefined ? {} : { paused: options.paused }),
@@ -266,13 +283,14 @@ describe("I want a stage's history grouped by attempt, and never grouped wrongly
     const events = [
       ev("a", "stage:started", 0),
       ev("a", "stage:failed", 10, "boom"),
+      run("workflow:failed", 11),
       run("workflow:started", 50),
       ev("a", "stage:started", 100),
       ev("a", "stage:completed", 110),
     ];
-    // A redrive renumbers the row either way: reopened it is one past the
-    // highest in its group, recreated (a later stage) it starts again at 0.
-    for (const rowAttempt of [3, 0]) {
+    // A redrive renumbers the row either way: reopened it is its attempt plus
+    // 1, recreated (a later stage) it starts again at 0.
+    for (const rowAttempt of [1, 0]) {
       const redriven = available(
         history([stage("a", "COMPLETED", rowAttempt)], events, [], {
           redriveCount: 1,
@@ -287,8 +305,9 @@ describe("I want a stage's history grouped by attempt, and never grouped wrongly
       ]);
     }
 
-    // A start after the stage ended with no redrive recorded is a restart,
-    // which the row counts like any other attempt.
+    // A start after the stage ended with no redrive recorded is a restart.
+    // `job.execute` adds to the row only on a retry of a PENDING row that kept
+    // its error, so a restart of a FAILED row leaves its attempt as it was.
     seq = 0;
     const restarted = [
       ev("a", "stage:started", 0),
@@ -298,7 +317,7 @@ describe("I want a stage's history grouped by attempt, and never grouped wrongly
     ];
     expect(
       available(
-        history([stage("a", "COMPLETED", 1)], restarted),
+        history([stage("a", "COMPLETED", 0)], restarted),
         "a",
       ).attempts.map((a) => [a.trigger, a.outcome]),
     ).toEqual([
@@ -306,7 +325,7 @@ describe("I want a stage's history grouped by attempt, and never grouped wrongly
       ["restart", "completed"],
     ]);
     expect(
-      history([stage("a", "COMPLETED", 0)], restarted).get("rec-a"),
+      history([stage("a", "COMPLETED", 1)], restarted).get("rec-a"),
     ).toMatchObject({
       available: false,
       reason: "inconsistent",
@@ -392,9 +411,14 @@ describe("I want a stage's history grouped by attempt, and never grouped wrongly
     );
     expect(
       reason(
-        history(stages, [run("workflow:started", -5), ...events], [], {
-          redriveCount: 2,
-        }),
+        history(
+          stages,
+          [{ ...run("workflow:started", -5), sequence: 0 }, ...events],
+          [],
+          {
+            redriveCount: 2,
+          },
+        ),
       ),
     ).toBe("fewer-redrives");
     expect(reason(history(stages, []))).toBe("no-stage-events");
@@ -520,6 +544,7 @@ describe("I want a stage's history grouped by attempt, and never grouped wrongly
     const failedThenRedriven = [
       ev("a", "stage:started", 0),
       ev("a", "stage:failed", 5, "boom"),
+      run("workflow:failed", 6),
       run("workflow:started", 10),
       run("workflow:cancelled", 11),
     ];
@@ -668,10 +693,11 @@ describe("I want a stage's history grouped by attempt, and never grouped wrongly
     expect(
       available(
         history(
-          [stage("a", "FAILED", 2)],
+          [stage("a", "FAILED", 1)],
           [
             ev("a", "stage:started", 0),
             ev("a", "stage:failed", 5, "boom"),
+            run("workflow:failed", 6),
             run("workflow:started", 10),
             ev("a", "stage:failed", 70, "stuck"),
           ],
@@ -684,6 +710,148 @@ describe("I want a stage's history grouped by attempt, and never grouped wrongly
       ["initial", "failed", true],
       ["rerun", "failed", false],
     ]);
+  });
+
+  it("checks the run's own events against the order the engine writes them in and against the run row", () => {
+    const outcome = (
+      events: AttemptEventInput[],
+      options: { redriveCount?: number; runStatus?: string } = {},
+      head: AttemptEventInput[] = [],
+    ) => {
+      const entry = history(
+        [stage("a", "COMPLETED", 0)],
+        [...head, ...events],
+        [],
+        options,
+      ).get("rec-a")!;
+      return entry.available
+        ? "available"
+        : `${entry.reason}:${entry.runMismatch}`;
+    };
+    const ran = () => [
+      ev("a", "stage:started", 0),
+      ev("a", "stage:completed", 5),
+    ];
+    // The run as the engine writes it: claimed, ran, completed.
+    seq = 0;
+    expect(
+      outcome([...ran(), run("workflow:completed", 6)], {
+        runStatus: "COMPLETED",
+      }),
+    ).toBe("available");
+    // A second start with no end before it: rows were removed from the end
+    // and the run wrote again (a redrive takes only an ended run).
+    seq = 0;
+    expect(
+      outcome([...ran(), run("workflow:started", 7)], {
+        redriveCount: 1,
+        runStatus: "RUNNING",
+      }),
+    ).toBe("run-inconsistent:order");
+    // `workflow:completed` before the claim: the claim's start is not retained.
+    seq = 0;
+    expect(
+      outcome([run("workflow:completed", 6)], { runStatus: "COMPLETED" }, [
+        { ...run("workflow:created", -2), sequence: -1 },
+      ]),
+    ).toBe("run-inconsistent:order");
+    // A claim that fails writes `workflow:failed` with no start.
+    seq = 0;
+    expect(
+      history(
+        [stage("a", "PENDING", 0)],
+        [
+          { ...run("workflow:created", -2), sequence: -1 },
+          run("workflow:failed", 1),
+        ],
+        [],
+        { runStatus: "FAILED" },
+      ).get("rec-a")!.available,
+    ).toBe(true);
+    // `workflow:failed` after the run ended: an end in between is not retained.
+    seq = 0;
+    expect(
+      outcome(
+        [...ran(), run("workflow:completed", 6), run("workflow:failed", 7)],
+        {
+          runStatus: "FAILED",
+        },
+      ),
+    ).toBe("run-inconsistent:order");
+    // A cancel that races the run's own end can follow it.
+    seq = 0;
+    expect(
+      outcome(
+        [...ran(), run("workflow:completed", 6), run("workflow:cancelled", 7)],
+        {
+          runStatus: "CANCELLED",
+        },
+      ),
+    ).toBe("available");
+    // More redrives recorded than the run row counts.
+    seq = 0;
+    expect(
+      outcome(
+        [
+          ...ran(),
+          run("workflow:completed", 6),
+          run("workflow:started", 7),
+          ev("a", "stage:started", 8),
+          ev("a", "stage:completed", 9),
+          run("workflow:completed", 10),
+        ],
+        { redriveCount: 0, runStatus: "COMPLETED" },
+      ),
+    ).toBe("run-inconsistent:redrives");
+    // A job that runs after the run was cancelled during its retry's backoff
+    // starts a CANCELLED row, which `job.execute` does not count as a retry.
+    seq = 0;
+    expect(
+      history(
+        [stage("a", "CANCELLED", 0)],
+        [
+          ev("a", "stage:started", 0),
+          ev("a", "stage:retrying", 5, "boom"),
+          run("workflow:cancelled", 6),
+          ev("a", "stage:started", 7),
+        ],
+        [],
+        { runStatus: "CANCELLED" },
+      ).get("rec-a")!.available,
+    ).toBe(true);
+    // A redrive from a later stage leaves an earlier stage's row as it was:
+    // a retried twice (attempt 2), b redriven from its failure.
+    seq = 0;
+    const kept = history(
+      [stage("a", "COMPLETED", 2), stage("b", "COMPLETED", 1)],
+      [
+        ev("a", "stage:started", 0),
+        ev("a", "stage:retrying", 1, "x"),
+        ev("a", "stage:started", 2),
+        ev("a", "stage:retrying", 3, "x"),
+        ev("a", "stage:started", 4),
+        ev("a", "stage:completed", 5),
+        ev("b", "stage:started", 6),
+        ev("b", "stage:failed", 7, "y"),
+        run("workflow:failed", 8),
+        run("workflow:started", 9),
+        ev("b", "stage:started", 10),
+        ev("b", "stage:completed", 11),
+        run("workflow:completed", 12),
+      ],
+      [],
+      { redriveCount: 1, runStatus: "COMPLETED" },
+    );
+    expect([
+      kept.get("rec-a")!.available,
+      kept.get("rec-b")!.available,
+    ]).toEqual([true, true]);
+    // The run's last event leaves it running; its row says COMPLETED.
+    seq = 0;
+    expect(outcome(ran(), { runStatus: "COMPLETED" })).toBe(
+      "run-inconsistent:status",
+    );
+    expect(outcome(ran(), { runStatus: "RUNNING" })).toBe("available");
   });
 
   it("falls back as unproven when the events contradict themselves", () => {
@@ -701,6 +869,7 @@ describe("I want a stage's history grouped by attempt, and never grouped wrongly
     expect(
       reason([
         ev("a", "stage:started", 0),
+        run("workflow:failed", 5),
         run("workflow:started", 10),
         ev("a", "stage:completed", 20),
       ]),
@@ -819,6 +988,7 @@ describe("I want a stage's history grouped by attempt, and never grouped wrongly
     const redriven = [
       ev("a", "stage:started", 0),
       ev("a", "stage:failed", 5, "boom"),
+      run("workflow:failed", 6),
       run("workflow:started", 10),
     ];
     expect(
@@ -966,6 +1136,30 @@ describe("I want the page to keep the events it has read and fold each poll into
     expect(mergeStageEvents(held, page(7, 9, false))).toBe(held);
   });
 
+  it("starts again from nothing when a read from what it holds ends below it, as after rows were removed", () => {
+    const held = fold(page(0, 5))!;
+    // The reader's answer to `after` 5 once the run's rows past 2 are gone.
+    expect(
+      mergeStageEvents(held, {
+        events: [],
+        after: 5,
+        lastSequence: 2,
+        complete: false,
+        more: false,
+      }),
+    ).toBeNull();
+    // A late answer to an earlier position changes nothing.
+    expect(
+      mergeStageEvents(held, {
+        events: [],
+        after: 3,
+        lastSequence: 2,
+        complete: false,
+        more: false,
+      }),
+    ).toBe(held);
+  });
+
   it("keeps asking from the last sequence until a long history has caught up", () => {
     const first = fold(page(0, 2, true, true));
     expect(first).toMatchObject({
@@ -1002,5 +1196,18 @@ describe("I want the page to keep the events it has read and fold each poll into
     expect(catchUpStep(4, 4, false)).toEqual({ read: false, askedAt: 4 });
     // The resume poll advanced to 6 with rows still left: read on at once.
     expect(catchUpStep(6, 4, false)).toEqual({ read: true, askedAt: 6 });
+    // A reader that returns small chunks: at the cap per poll interval the
+    // page waits for the interval instead of asking at server speed, and asks
+    // from the same position after it.
+    expect(catchUpStep(8, 6, false, CATCH_UP_READS_PER_INTERVAL - 1)).toEqual({
+      read: true,
+      askedAt: 8,
+    });
+    expect(catchUpStep(10, 8, false, CATCH_UP_READS_PER_INTERVAL)).toEqual({
+      read: false,
+      askedAt: 8,
+      wait: true,
+    });
+    expect(catchUpStep(10, 8, false, 0)).toEqual({ read: true, askedAt: 10 });
   });
 });

@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "preact/hooks"
 import {
   type AttemptOutcome,
   type AttemptRowMismatch,
+  type AttemptRunMismatch,
   type AttemptStepEntry,
   type AttemptTrigger,
   type AttemptUnavailableReason,
@@ -912,7 +913,7 @@ const OUTCOME_LABEL: Record<AttemptOutcome, string> = {
 };
 
 const TRIGGER_LABEL: Record<AttemptTrigger, string> = {
-  initial: "First run",
+  initial: "First run recorded",
   "job-retry": "Job retry",
   "poll-retry": "Retry while suspended (replayed on a poll)",
   rerun: "Rerun after a redrive",
@@ -923,7 +924,7 @@ const TRIGGER_LABEL: Record<AttemptTrigger, string> = {
 const UNAVAILABLE_LABEL: Record<AttemptUnavailableReason, string> = {
   "no-event-history": "this reader does not provide stage events",
   "events-incomplete":
-    "some of the run's events are missing from its outbox (purged or past retention)",
+    "some of the run's events are missing from its outbox (removed by SQL, such as a pruning job)",
   "no-retained-events": "none of the run's events are retained in its outbox",
   "events-loading":
     "the page has read only part of the run's events so far and is reading the rest",
@@ -936,7 +937,15 @@ const UNAVAILABLE_LABEL: Record<AttemptUnavailableReason, string> = {
   "unproven-boundary":
     "the retained events contradict each other (an execution ends with no start recorded, or a redrive starts while an execution has no recorded end), so nothing proves where one attempt stops",
   "invalid-event-time": "a retained event of the run has no readable time",
+  "run-inconsistent":
+    "the run's retained events contradict the order the engine writes them in or the run's record, which rows removed from the end of its outbox leave behind",
   inconsistent: "the retained events do not agree with the stage's current record",
+};
+
+const RUN_MISMATCH_LABEL: Record<AttemptRunMismatch, string> = {
+  order: "a redrive or an end with no recorded event before it that the engine writes first",
+  redrives: "more redrives recorded than the run's record counts",
+  status: "the run's status",
 };
 
 const MISMATCH_LABEL: Record<AttemptRowMismatch, string> = {
@@ -1118,6 +1127,14 @@ function AttemptHistory({
         of its last change. Those times come from the processes that wrote them, so hosts whose
         clocks differ can move a step across an attempt boundary.
       </p>
+      {[...histories.values()].some((history) => history.available) && (
+        <p class="attempt-limit" role="note">
+          Shown from the events the run's outbox still holds. Rows removed from its start or middle
+          are always found; rows removed from its end are found only when what remains contradicts
+          the run's or a stage's record, so a re-delivery after a crash or a retry while suspended
+          recorded only in such rows is not shown.
+        </p>
+      )}
       {stepsTruncated && (
         <p class="truncated-note">The step list is truncated, so attempts may omit steps.</p>
       )}
@@ -1128,6 +1145,7 @@ function AttemptHistory({
           ? null
           : (history?.reason ?? "no-event-history");
         const mismatch = history && !history.available ? history.mismatch : undefined;
+        const runMismatch = history && !history.available ? history.runMismatch : undefined;
         const titleId = `attempts-${stage.id}`;
         return (
           <section key={stage.id} class="attempt-stage" aria-labelledby={titleId}>
@@ -1137,18 +1155,19 @@ function AttemptHistory({
               <StatusPill status={stage.status} />
               {history?.available && (
                 <span class="attempt-count">
-                  {attempts.length} {attempts.length === 1 ? "attempt" : "attempts"}
+                  {attempts.length} {attempts.length === 1 ? "recorded attempt" : "recorded attempts"}
                 </span>
               )}
             </h4>
             {unavailable ? (
               <p class="attempt-note" role="note">
                 Per-attempt history is unavailable for this stage: {UNAVAILABLE_LABEL[unavailable]}
-                {mismatch && ` (${MISMATCH_LABEL[mismatch]})`}.
+                {mismatch && ` (${MISMATCH_LABEL[mismatch]})`}
+                {runMismatch && ` (${RUN_MISMATCH_LABEL[runMismatch]})`}.
                 The stage timeline above and the step ledger below show its latest attempt only.
               </p>
             ) : attempts.length === 0 ? (
-              <p class="attempt-empty">This stage has not started.</p>
+              <p class="attempt-empty">No start of this stage is recorded.</p>
             ) : (
               <ol class="attempt-list">
                 {attempts.map((attempt, index) => (
@@ -1204,14 +1223,30 @@ function RunDetailView({
   // ever be merged into the events of the run it was requested for.
   const heldEvents = useRef<HeldStageEvents | null>(null);
 
+  // The last full answer. A read of the next part of a long history asks only
+  // for the run's events (`stageEventsOnly`), and the page keeps these rows
+  // until the full read that follows the last part.
+  const lastDetail = useRef<RunDetail | null>(null);
+  // Set by the catch-up below: the next read asks only for the next part.
+  const partNext = useRef(false);
+  const askedAt = useRef(-1);
+
   const fetchDetail = useCallback(async () => {
     const before = heldEvents.current;
-    const query = before ? `?stageEventsAfter=${before.lastSequence}` : "";
-    const detail = await api<RunDetail>(config, `/runs/${encodeURIComponent(runId)}${query}`);
+    const part = partNext.current && before !== null && lastDetail.current !== null;
+    partNext.current = false;
+    const query = before
+      ? `?stageEventsAfter=${before.lastSequence}${part ? "&stageEventsOnly=1" : ""}`
+      : "";
+    const answer = await api<RunDetail>(config, `/runs/${encodeURIComponent(runId)}${query}`);
+    if (!part) lastDetail.current = answer;
+    const detail = part ? { ...lastDetail.current!, stageEvents: answer.stageEvents } : answer;
     if (!detail.stageEvents) return { ...detail, stageLog: undefined };
     // Merged against what is held now, not at the request: a slow earlier
     // response must not overwrite a newer one.
     const held = mergeStageEvents(heldEvents.current, detail.stageEvents);
+    // Rows past what was held were removed: read the run again from the start.
+    if (held === null && heldEvents.current !== null) askedAt.current = -1;
     heldEvents.current = held;
     return {
       ...detail,
@@ -1219,7 +1254,9 @@ function RunDetailView({
         ? {
             events: held.events,
             coverage: held.coverage,
-            caughtUp: !held.more,
+            // After a part, the rows shown are older than the events: the
+            // history waits for the full read that follows.
+            caughtUp: !held.more && !part,
             lastSequence: held.lastSequence,
           }
         : // Nothing held yet: the response did not begin the history.
@@ -1235,19 +1272,36 @@ function RunDetailView({
   );
 
   // A read returns at most one chunk of a long history; ask again at once
-  // until the page has caught up instead of waiting for the next poll. Each
-  // immediate request needs the held events to have advanced past the last
-  // one, so a reader that stops advancing is asked again only by the poll.
-  // Paused, the page makes no request on its own; resuming re-polls from
-  // what it holds (`usePolled` runs again when `paused` changes).
+  // until the page has caught up instead of waiting for the next poll, for
+  // the next part only while more remains and in full after the last one.
+  // Each immediate request needs the held events to have advanced past the
+  // last one, so a reader that stops advancing is asked again only by the
+  // poll, and at most `CATCH_UP_READS_PER_INTERVAL` are made per poll
+  // interval. Paused, the page makes no request on its own; resuming
+  // re-polls from what it holds (`usePolled` runs again when `paused` changes).
   const behindAt =
     data?.stageLog && !data.stageLog.caughtUp ? data.stageLog.lastSequence : null;
-  const askedAt = useRef(-1);
+  const catchUpTimes = useRef<number[]>([]);
+  const [wake, setWake] = useState(0);
   useEffect(() => {
-    const step = catchUpStep(behindAt, askedAt.current, paused);
+    const now = Date.now();
+    const window = pollInterval > 0 ? pollInterval : 2000;
+    catchUpTimes.current = catchUpTimes.current.filter((t) => now - t < window);
+    const step = catchUpStep(behindAt, askedAt.current, paused, catchUpTimes.current.length);
     askedAt.current = step.askedAt;
-    if (step.read) refresh();
-  }, [behindAt, paused, refresh]);
+    if (step.wait) {
+      const timer = setTimeout(
+        () => setWake((w) => w + 1),
+        window - (now - catchUpTimes.current[0]!),
+      );
+      return () => clearTimeout(timer);
+    }
+    if (step.read) {
+      catchUpTimes.current.push(now);
+      partNext.current = heldEvents.current?.more === true;
+      refresh();
+    }
+  }, [behindAt, paused, refresh, pollInterval, wake]);
 
   const effectiveError = actionError ?? error;
   const activeError = effectiveError === dismissedError ? null : effectiveError;
@@ -1368,6 +1422,7 @@ function RunDetailView({
       data
         ? buildStageAttemptHistory({
             redriveCount: data.run.redriveCount,
+            runStatus: data.run.status,
             stages: data.stages,
             steps: data.steps,
             stageEvents: data.stageLog && { ...data.stageLog, paused },

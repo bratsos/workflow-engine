@@ -283,15 +283,16 @@ if (!DATABASE_URL) {
       };
     }
 
+    // The plan test leaves about 190,000 outbox rows to truncate.
     beforeEach(async () => {
       await truncateAll();
       await seed();
-    });
+    }, 60_000);
 
     afterAll(async () => {
       await truncateAll();
       await prisma.$disconnect();
-    });
+    }, 60_000);
 
     const reader = () =>
       createPrismaConsoleReadPort(client, { now: () => at(100) });
@@ -477,6 +478,8 @@ if (!DATABASE_URL) {
         event(6, "stage:started", "fetch"),
         event(7, "stage:completed", "fetch"),
         event(8, "workflow:cancelled", null),
+        // Read for the run checks; its payload (the run's output) is not.
+        event(9, "workflow:completed", null),
       ];
       const retried = (await reader().getRunDetail("run-retried"))!;
       expect(retried.stageEvents).toEqual({
@@ -513,6 +516,24 @@ if (!DATABASE_URL) {
       expect(
         (await reader().getRunDetail("run-purged"))?.stageEvents?.complete,
       ).toBe(false);
+      expect(
+        (await reader().getRunDetail("run-retried", { stageEventsAfter: 99 }))
+          ?.stageEvents,
+      ).toEqual({
+        events: [],
+        after: 99,
+        lastSequence: 9,
+        complete: false,
+        more: false,
+      });
+      const part = (await reader().getRunDetail("run-retried", {
+        stageEventsAfter: 5,
+        stageEventsOnly: true,
+      }))!;
+      expect(part.stageEvents?.events.map((e) => e.sequence)).toEqual([
+        6, 7, 8, 9,
+      ]);
+      expect([part.stages, part.steps, part.events]).toEqual([[], [], []]);
       expect(
         (await reader().getRunDetail("run-purged", { stageEventsAfter: 2 }))
           ?.stageEvents,
@@ -688,7 +709,9 @@ FROM generate_series(1, ${span}) g`,
       expect(next?.stageEvents?.events.map((e) => e.sequence)).toEqual([3]);
     });
 
-    it("reads only the new rows of a run on a poll: the plan's cost does not grow with the run's outbox", async () => {
+    it("reads only the new rows of a run on a poll: the plan's cost does not grow with the run's outbox, before and after the table is analysed and vacuumed", {
+      timeout: 120_000,
+    }, async () => {
       const calls: RecordedStatement[] = [];
       // `$n` -> a literal, so EXPLAIN plans the statement with the values it ran with.
       const inline = (sql: string, params: unknown[]) =>
@@ -727,6 +750,14 @@ FROM generate_series(1, ${span}) g`,
         return { statements: outbox.length, buffers, nodes };
       };
 
+      // The table's state is held still for the test: autovacuum would
+      // analyse or vacuum it at a moment of its choosing. No plan is forced.
+      await prisma.$executeRawUnsafe(
+        `ALTER TABLE "outbox_events" SET (autovacuum_enabled = false)`,
+      );
+      await prisma.workflowRun.createMany({
+        data: [mkRun("run-plan-0", at(-9_000), "RUNNING", "wf-d")],
+      });
       const sizes = [1_000, 12_000, 30_000];
       for (const rows of sizes) {
         const runId = `run-plan-${rows}`;
@@ -753,38 +784,59 @@ SELECT 'plan-others-' || g, 'run-plan-others', g, 'stage:progress',
        jsonb_build_object('stageId', 'fetch'), 'c', now()
 FROM generate_series(1, 150000) g`,
       );
-      // VACUUM as well: an index-only scan's cost depends on the visibility
-      // map, which autovacuum would otherwise set at a moment of its choosing.
-      await prisma.$executeRawUnsafe(`VACUUM ANALYZE "outbox_events"`);
+      // The same bounds hold in each state the table is in: just written and
+      // not analysed since, analysed, and vacuumed (an index-only scan's cost
+      // depends on the visibility map, which VACUUM sets).
+      const bounded = async (state: string) => {
+        const poll = [];
+        for (const rows of [1_000, 30_000]) {
+          poll.push(await measure(`run-plan-${rows}`, rows - 10));
+        }
+        const first = await measure("run-plan-30000");
+        const firstOfSmaller = await measure("run-plan-12000");
+        // Nothing new: the highest-sequence probe answers and no range is read.
+        const idle = await measure("run-plan-30000", 30_000);
+        // A run with no row: the probe alone.
+        const empty = await measure("run-plan-0");
+        const all = [...poll, first, firstOfSmaller, idle, empty];
+        // Buffers: poll at 1,000 and 30,000, first read at 30,000 and 12,000, idle, no row.
+        const seen = `${state}: ${JSON.stringify(all.map((m) => m.buffers))}`;
+        console.log(seen);
+        expect(idle.statements, seen).toBe(poll[1]!.statements - 2);
+        expect(idle.buffers, seen).toBeLessThan(poll[1]!.buffers);
+        expect(empty.buffers, seen).toBeLessThanOrEqual(idle.buffers);
 
-      const poll = [];
-      for (const rows of [1_000, 30_000]) {
-        poll.push(await measure(`run-plan-${rows}`, rows - 10));
+        // Ten new rows: the same statements, the same few pages, at 1,000 and
+        // at 30,000 rows (one more index level at most).
+        expect(poll[0]!.statements, seen).toBe(poll[1]!.statements);
+        expect(poll[1]!.buffers, seen).toBeLessThanOrEqual(
+          poll[0]!.buffers + 6,
+        );
+        expect(poll[1]!.buffers, seen).toBeLessThan(60);
+        for (const node of all.flatMap((m) => m.nodes)) {
+          expect(node, seen).not.toContain("Seq Scan");
+        }
+        expect(poll[1]!.nodes.join(""), seen).toContain(
+          "outbox_events_workflowRunId_sequence_key",
+        );
+        // A first read covers one window of the run's rows: what a poll
+        // avoids, and the same at 12,000 and at 30,000 rows.
+        expect(first.buffers, seen).toBeGreaterThan(poll[1]!.buffers * 10);
+        expect(first.buffers, seen).toBeLessThanOrEqual(
+          firstOfSmaller.buffers * 1.25 + 10,
+        );
+      };
+      try {
+        await bounded("never analysed");
+        await prisma.$executeRawUnsafe(`ANALYZE "outbox_events"`);
+        await bounded("analysed, not vacuumed");
+        await prisma.$executeRawUnsafe(`VACUUM ANALYZE "outbox_events"`);
+        await bounded("vacuumed and analysed");
+      } finally {
+        await prisma.$executeRawUnsafe(
+          `ALTER TABLE "outbox_events" RESET (autovacuum_enabled)`,
+        );
       }
-      const first = await measure("run-plan-30000");
-      const firstOfSmaller = await measure("run-plan-12000");
-      // Nothing new: the highest-sequence probe answers and no range is read.
-      const idle = await measure("run-plan-30000", 30_000);
-      expect(idle.statements).toBe(poll[1]!.statements - 2);
-      expect(idle.buffers).toBeLessThan(poll[1]!.buffers);
-
-      // Ten new rows: the same statements, the same few pages, at 1,000 and
-      // at 30,000 rows (one more index level at most).
-      expect(poll[0]!.statements).toBe(poll[1]!.statements);
-      expect(poll[1]!.buffers).toBeLessThanOrEqual(poll[0]!.buffers + 6);
-      expect(poll[1]!.buffers).toBeLessThan(60);
-      for (const node of poll[1]!.nodes) {
-        expect(node).not.toContain("Seq Scan");
-      }
-      expect(poll[1]!.nodes.join("")).toContain(
-        "outbox_events_workflowRunId_sequence_key",
-      );
-      // A first read covers one window of the run's rows: what a poll avoids,
-      // and the same at 12,000 and at 30,000 rows.
-      expect(first.buffers).toBeGreaterThan(poll[1]!.buffers * 10);
-      expect(first.buffers).toBeLessThanOrEqual(
-        firstOfSmaller.buffers * 1.25 + 10,
-      );
     });
 
     it("selects the step columns the UI needs to offer a signal", async () => {

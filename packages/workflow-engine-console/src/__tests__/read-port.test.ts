@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { ConsoleBadRequestError } from "../errors";
+import { createWorkflowConsole } from "../handler";
 import {
   type ConsoleFixtures,
   createInMemoryConsoleReadPort,
@@ -385,6 +386,33 @@ describe("in-memory read port: run detail", () => {
       complete: true,
       more: false,
     });
+    // Past the run's highest row: the read ends there, so a page holding
+    // more than the run has sees that rows were removed.
+    expect(
+      (await reader.getRunDetail("run-1", { stageEventsAfter: 9 }))
+        ?.stageEvents,
+    ).toEqual({
+      events: [],
+      after: 9,
+      lastSequence: 3,
+      complete: false,
+      more: false,
+    });
+    // The next part of a long history, through the console handler: the run
+    // and its events only.
+    const part = (await (
+      await createWorkflowConsole({ reader, authorize: () => true })(
+        new Request(
+          "https://console.example/console/api/runs/run-1?stageEventsAfter=1&stageEventsOnly=1",
+        ),
+      )
+    ).json()) as {
+      stages: unknown[];
+      steps: unknown[];
+      stageEvents: { lastSequence: number };
+    };
+    expect([part.stages, part.steps]).toEqual([[], []]);
+    expect(part.stageEvents.lastSequence).toBe(3);
 
     const whole = createInMemoryConsoleReadPort({
       ...fixtures,

@@ -429,6 +429,9 @@ export function createWorkflowConsole(
         }
         const detail = await reader.getRunDetail(runId, {
           stageEventsAfter: Math.floor(after),
+          ...(params.get("stageEventsOnly") === "1"
+            ? { stageEventsOnly: true }
+            : {}),
         });
         if (detail === null) {
           return errorResponse("not_found", "No such run.", 404);

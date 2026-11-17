@@ -111,12 +111,13 @@ and the outbox event timeline.
 A stage that retried used to show only its latest attempt: the stage row
 holds its current status and last error, and a step row holds its last
 state. The run detail now has an **Attempts by stage** section that lists
-every attempt of every stage, built from the run's retained outbox events:
-the stage events (`stage:started`, `stage:suspended`, `stage:retrying`,
-`stage:failed`, `stage:completed`) and the run's `workflow:created`,
-`workflow:started` and `workflow:cancelled` events:
+every attempt of every stage, built from the events the run's outbox still
+holds: the stage events (`stage:started`, `stage:suspended`,
+`stage:retrying`, `stage:failed`, `stage:completed`) and the run's
+`workflow:created`, `workflow:started`, `workflow:completed`,
+`workflow:failed` and `workflow:cancelled` events:
 
-- when the attempt started and ended, why it began (first run, job retry,
+- when the attempt started and ended, why it began (first run recorded, job retry,
   retry while suspended, rerun after a redrive, started again after the
   previous attempt ended, or started again while the previous execution had
   no recorded end) and how it ended (completed, retrying, failed, suspended,
@@ -190,47 +191,72 @@ row does not keep per-execution timings.
 
 ### What the page relies on
 
-Each statement rests on two kinds of evidence.
+Every history is built from the events the run's outbox still holds, and
+the page says so in one line wherever it shows one. Nothing in the engine
+deletes outbox rows: `run.purge` removes the run and leaves its rows, and a
+purged run has no page. Rows of a run that still exists are removed only by
+SQL, such as a pruning job of your own. What the page finds of such a
+removal:
 
-- **The events cover the run from its first event.** A run's outbox starts at
-  sequence 1 with its `workflow:created`, and the page uses the events only
-  when every row from sequence 1 to the last one it read is retained and the
-  row at sequence 1 is that `workflow:created`. The second condition matters
-  after a purge: a store numbers a run's rows from the highest one it still
-  holds, so once every row of a run is gone, a later redrive's
-  `workflow:started` is numbered 1 again and the range looks unbroken. Only
-  when the run's creation is among the rows is the first attempt the first
-  run, and a stage with no event one that never started.
-- **The run's record agrees with them.** Each redrive writes one
-  `workflow:started`, so fewer of them than the run's redrive count means the
-  events of earlier executions are not retained.
+- **Rows removed from the start or the middle are always found.** A run's
+  outbox starts at sequence 1 with its `workflow:created`, and the page uses
+  the events only when every row from sequence 1 to the last one it read is
+  retained and the row at sequence 1 is that `workflow:created`. The second
+  condition is needed because a store numbers a run's next row one past the
+  highest one it still holds: once every row of a run is gone, a later
+  redrive's `workflow:started` is numbered 1 again.
+- **Rows removed from the end are found only when what remains contradicts
+  the run's or a stage's record.** By the same numbering, when rows are
+  removed from the end and the run then writes again, the new rows take the
+  removed numbers and the range is unbroken again. A re-delivery after a
+  crash, or a retry while suspended, recorded only in such rows is not shown.
+
+The checks against the records, none of which rests on the numbering:
+
+- **The run's events follow the engine's order and agree with the run's
+  record.** `workflow:created` comes first; the claim writes one
+  `workflow:started`; every later `workflow:started` is a redrive and follows
+  a `workflow:completed`, `workflow:failed` or `workflow:cancelled`, because a
+  redrive takes only an ended run; `workflow:completed` comes only while the
+  run is running. The redrives found that way must be exactly the run's
+  redrive count, and the state the last of these events leaves (pending
+  before the claim, running after a start, otherwise the last end) must be
+  the run's status.
 - **The stage's record agrees with them.** Its status with the last attempt
   (a `SUSPENDED` stage needs its `stage:suspended`, a `CANCELLED` one a
-  `workflow:cancelled`, a `PENDING` one a retry or a redrive to wait for), its
-  `attempt` count on a run never redriven, its `startedAt` with the last
+  `workflow:cancelled`, a `PENDING` one a retry or a redrive to wait for); its
+  `attempt` with the executions recorded: a row starts at 0 and gains 1 per
+  job retry and per retry while suspended, never for a re-delivery; a
+  redrive leaves a row of an earlier execution group as it was, reopens a row
+  of the target group at its attempt plus 1 (`lastFailure`, `stage`), creates
+  the target group's rows one past the highest attempt of the rows it
+  replaced (`start`), and lets later groups' rows be created again at 0, so
+  after a redrive the row's `attempt` must be one of the values these rules
+  give for the recorded executions; its `startedAt` with the last
   `stage:started`, its `completedAt` with the event that ended it, and its
   error with the last error event. The engine stamps the row and writes the
   event in one transaction, the row first, so a row stamped after the last
-  retained event shows that the events after it are not retained. That is how
-  a removed tail of the run's events is found: nothing else in the remaining
-  rows shows it. These are the only time comparisons that decide whether the
-  history is shown, and each compares two values one transaction of one
-  process stamped (`startedAt` with the `stage:started` that `job.execute`
-  writes with it; `completedAt` with the `stage:completed` or `stage:failed`
-  written with it), so a run spread over hosts whose clocks differ is not
-  made unavailable by them. Everything else is ordered by sequence.
+  retained event shows that the events after it are not retained. These are
+  the only time comparisons that decide whether the history is shown, and
+  each compares two values one transaction of one process stamped
+  (`startedAt` with the `stage:started` that `job.execute` writes with it;
+  `completedAt` with the `stage:completed` or `stage:failed` written with
+  it), so a run spread over hosts whose clocks differ is not made unavailable
+  by them. Everything else is ordered by sequence.
 
-A stage is shown as *not started* only when the events cover the run from its
-first event, none of them is of that stage, and its record was never stamped
-by a start (`startedAt` is null, `attempt` is 0, and it is `PENDING`,
-`SKIPPED` or `CANCELLED`).
+Every count and label in the section is about recorded events: "First run
+recorded", "2 recorded attempts". A stage shows *No start of this stage is
+recorded* only when the events cover the run from its first event, none of
+them is of that stage, and its record was never stamped by a start
+(`startedAt` is null, `attempt` is 0, and it is `PENDING`, `SKIPPED` or
+`CANCELLED`).
 
 When the evidence is missing, the stage falls back to the flat view (the stage
 timeline above and the step ledger below show its latest attempt) and says
 that the per-attempt history is unavailable, with the reason:
 
-- some of the run's events are missing from its outbox (purged or past
-  retention): the rows the page read are not an unbroken range from
+- some of the run's events are missing from its outbox (removed by SQL, such
+  as a pruning job): the rows the page read are not an unbroken range from
   sequence 1, or do not begin with the run's `workflow:created`;
 - none of the run's events are retained in its outbox: the first read found
   no row of the run;
@@ -238,6 +264,9 @@ that the per-attempt history is unavailable, with the reason:
   rest (see below), or, with polling off, reads no more on its own until
   polling resumes;
 - the run's record counts more redrives than its retained events record;
+- the run's retained events contradict the order the engine writes them in,
+  record more redrives than the run's record counts, or end in a state that
+  is not the run's status;
 - the reader provides no stage events (a custom `ConsoleReadPort` written
   before this existed);
 - the stage's record says it ran, and no lifecycle event of it is retained;

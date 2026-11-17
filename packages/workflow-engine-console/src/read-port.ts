@@ -150,14 +150,19 @@ export const STAGE_LIFECYCLE_EVENT_TYPES = [
 /**
  * The run-level events the attempt history reads. `workflow:created` is the
  * run's first outbox row (sequence 1): a range that begins with it starts
- * where the run did. The others bound stage executions without a stage event
- * of their own: `run.cancel` marks every non-terminal stage CANCELLED and
- * emits only `workflow:cancelled`; `run.redrive` (and `run.rerunFrom`) reopen
- * or recreate stages and emit only `workflow:started`.
+ * where the run did. `workflow:started` is written by the claim and by every
+ * redrive (`run.redrive`, `run.rerunFrom`), which reopen or recreate stages
+ * without a stage event; `workflow:completed`, `workflow:failed` and
+ * `workflow:cancelled` are written with every terminal status of the run.
+ * `run.cancel` marks every non-terminal stage CANCELLED and emits only
+ * `workflow:cancelled`. A redrive takes only a terminal run, so in a run's
+ * events each `workflow:started` after the first follows one of those three.
  */
 export const RUN_BOUNDARY_EVENT_TYPES = [
   "workflow:created",
   "workflow:started",
+  "workflow:completed",
+  "workflow:failed",
   "workflow:cancelled",
 ] as const;
 
@@ -238,13 +243,14 @@ export interface StageEventLog {
    * The highest outbox sequence this read covers: the run's highest sequence,
    * `after + STAGE_EVENT_WINDOW` when that is lower, or the sequence of its
    * last event when it stopped at `STAGE_EVENT_LIMIT`. `after` when no row is
-   * newer.
+   * newer. The run's highest sequence when that is below `after`: rows past
+   * the page's position were removed, and `complete` is false.
    */
   lastSequence: number;
   /**
    * True only when every sequence in `(after, lastSequence]` has a retained
-   * row. A first read that finds no row is false. False means events were
-   * purged or are past retention, and a grouping built from them could be
+   * row. A first read that finds no row is false. False means rows were
+   * removed (by SQL, such as a pruning job), and a grouping built from them could be
    * wrong. True with `after` 0 is not enough for the page: a run's outbox
    * starts at sequence 1 with `workflow:created`, and a store numbers rows
    * from 1 again after every row of a run was removed, so the page also needs
@@ -402,6 +408,13 @@ export interface RunDetailOptions {
    * run's new outbox rows and a first load reads the run once.
    */
   stageEventsAfter?: number;
+  /**
+   * Read only the run and its `stageEvents`; `stages`, `steps`,
+   * `annotations`, `logs` and `events` come back empty. The page asks this
+   * way for the next part of a long history, and uses nothing else of the
+   * answer, so a reader that ignores it keeps working.
+   */
+  stageEventsOnly?: boolean;
 }
 
 export interface ConsoleReadPort {

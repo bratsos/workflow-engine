@@ -49,7 +49,8 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
     }
 
     await seed();
-  });
+    // `prisma generate` and `db push` run here, in child processes.
+  }, 60_000);
 
   afterAll(async () => {
     await prisma?.$disconnect?.();
@@ -417,6 +418,8 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
       event(6, "stage:started", "fetch"),
       event(7, "stage:completed", "fetch"),
       event(8, "workflow:cancelled", null),
+      // Read for the run checks; its payload (the run's output) is not.
+      event(9, "workflow:completed", null),
     ];
     expect(retried.stageEvents).toEqual({
       events: all,
@@ -475,11 +478,35 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
       complete: false,
       more: false,
     });
-    // A later read with nothing newer is an empty range past what is held.
+    // A read past the run's highest row says where the run's rows end, so
+    // the page sees that rows past what it holds were removed.
     expect(
       (await port.getRunDetail("run-retried", { stageEventsAfter: 99 }))
         ?.stageEvents,
-    ).toMatchObject({ events: [], lastSequence: 99, complete: true });
+    ).toEqual({
+      events: [],
+      after: 99,
+      lastSequence: 9,
+      complete: false,
+      more: false,
+    });
+    // The next part of a long history reads the run and its events only.
+    const part = (await port.getRunDetail("run-retried", {
+      stageEventsAfter: 5,
+      stageEventsOnly: true,
+    }))!;
+    expect(part.stageEvents).toEqual(
+      (await port.getRunDetail("run-retried", { stageEventsAfter: 5 }))!
+        .stageEvents,
+    );
+    expect(part.run.id).toBe("run-retried");
+    expect([
+      part.stages,
+      part.steps,
+      part.annotations,
+      part.logs,
+      part.events,
+    ]).toEqual([[], [], [], [], []]);
 
     const response = await createWorkflowConsole({
       reader: port,
@@ -690,6 +717,7 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
       } while (held?.more);
       const histories = buildStageAttemptHistory({
         redriveCount: body.run.redriveCount,
+        runStatus: body.run.status,
         stages: body.stages,
         steps: body.steps,
         stageEvents: {
@@ -713,13 +741,15 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
         kept.history.attempts.map((a) => [a.trigger, a.outcome]),
     ).toEqual([["initial", "cancelled"]]);
 
-    // The cancel and the stage's start removed, the run's first rows kept.
+    // The cancel and the stage's start removed, the run's first rows kept:
+    // the run's events end running, and its row says CANCELLED.
     await db.outboxEvent.deleteMany({
       where: { workflowRunId: runId, sequence: { gte: 3 } },
     });
     expect((await page()).history).toMatchObject({
       available: false,
-      reason: "no-stage-events",
+      reason: "run-inconsistent",
+      runMismatch: "status",
     });
 
     // Every row removed: before this change, "This stage has not started."
@@ -783,6 +813,213 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
       reason: "events-incomplete",
     });
     await db.$disconnect?.();
+  });
+
+  it("finds rows removed from the end of a run's outbox after the run wrote again, by the run's own events (real kernel)", {
+    timeout: 60_000,
+  }, async () => {
+    // The store numbers a run's next row one past the highest it still holds,
+    // so after rows are removed from the end and the run writes again, the
+    // range from `workflow:created` is unbroken. Stage b fails three times,
+    // the run is redriven and b completes: four executions.
+    const { createKernel, executeJobWithHeartbeat } = await import(
+      kernelSpecifier
+    );
+    const persistenceModule = await import(enginePersistence);
+    const { defineStage, WorkflowBuilder } = await import(engineSpecifier);
+    const { z } = await import("zod");
+    const io = z.object({ v: z.string() });
+    const schemas = { input: io, output: io, config: z.object({}) };
+
+    async function world(name: string, sinkFails: (type: string) => boolean) {
+      let failing = 3;
+      const workflow = new WorkflowBuilder("tail", "tail", "d", io, io)
+        .pipe(
+          defineStage({
+            id: "a",
+            name: "A",
+            schemas,
+            async execute(ctx: any) {
+              return { output: ctx.input };
+            },
+          }),
+        )
+        .pipe(
+          defineStage({
+            id: "b",
+            name: "B",
+            schemas,
+            async execute(ctx: any) {
+              if (failing-- > 0) throw new Error("crm down");
+              return { output: ctx.input };
+            },
+          }),
+        )
+        .build();
+      const file = join(directory, `${name}.db`);
+      const db: ConsolePrismaClient & Record<string, any> = isPrisma8
+        ? (() => {
+            const raw = fixture.createSqliteDb(file);
+            return Object.assign(fromPrisma8!(raw), {
+              $disconnect: () => raw.close(),
+            });
+          })()
+        : fixture.createSqliteClient(file);
+      const options = { databaseType: "sqlite" as const };
+      const jobTransport = persistenceModule.createPrismaJobQueue(db, {
+        ...options,
+        workerId: "w",
+      });
+      const kernel: any = createKernel({
+        persistence: persistenceModule.createPrismaWorkflowPersistence(
+          db,
+          options,
+        ),
+        jobTransport,
+        stepLedger: persistenceModule.createPrismaStepLedger(db, options),
+        blobStore: persistenceModule.createPrismaBlobStore(db),
+        clock: { now: () => new Date() },
+        eventSink: {
+          async emit(event: any) {
+            if (sinkFails(event.type))
+              throw new Error(`subscriber cannot handle ${event.type}`);
+          },
+        },
+        registry: { getWorkflow: () => workflow },
+      });
+      const runId = (
+        await kernel.dispatch({
+          type: "run.create",
+          idempotencyKey: `${name}-run`,
+          workflowId: "tail",
+          input: { v: "x" },
+        })
+      ).workflowRunId as string;
+      const drain = async () => {
+        for (let round = 0; round < 12; round++) {
+          await kernel.dispatch({
+            type: "run.claimPending",
+            workerId: "w",
+            maxClaims: 10,
+          });
+          // Every job is due now: the queue's retry backoff is skipped.
+          await db.jobQueue.updateMany({ data: { nextPollAt: null } });
+          const job = await jobTransport.dequeue();
+          if (!job) break;
+          await executeJobWithHeartbeat(kernel, {
+            jobTransport,
+            job,
+            jobHeartbeatIntervalMs: 5_000,
+            logPrefix: "[tail]",
+          });
+        }
+      };
+      const handler = createWorkflowConsole({
+        reader: createPrismaConsoleReadPort(db, { databaseType: "sqlite" }),
+        authorize: () => true,
+      });
+      const page = async () => {
+        let held: HeldStageEvents | null = null;
+        let body: any;
+        do {
+          const query = held ? `?stageEventsAfter=${held.lastSequence}` : "";
+          body = await (
+            await handler(
+              new Request(
+                `https://console.example/console/api/runs/${runId}${query}`,
+              ),
+            )
+          ).json();
+          held = mergeStageEvents(held, body.stageEvents);
+        } while (held?.more);
+        const histories = buildStageAttemptHistory({
+          redriveCount: body.run.redriveCount,
+          runStatus: body.run.status,
+          stages: body.stages,
+          steps: body.steps,
+          stageEvents: {
+            events: held!.events,
+            coverage: held!.coverage,
+            caughtUp: !held!.more,
+          },
+        });
+        const b = body.stages.find((s: any) => s.stageId === "b");
+        return { run: body.run, held: held!, b, history: histories.get(b.id)! };
+      };
+      const redrive = async () => {
+        await kernel.dispatch({
+          type: "run.redrive",
+          workflowRunId: runId,
+          from: { kind: "lastFailure" },
+        });
+        await drain();
+      };
+      return { db, kernel, runId, drain, page, redrive, handler };
+    }
+
+    // A: a subscriber that cannot handle `workflow:created` leaves that row
+    // as a dead letter, and a retention job removes every published row.
+    const dlq = await world("dlq", (type) => type === "workflow:created");
+    await dlq.drain();
+    for (let pass = 0; pass < 5; pass++)
+      await dlq.kernel.dispatch({ type: "outbox.flush", maxEvents: 100 });
+    await dlq.db.outboxEvent.deleteMany({
+      where: { workflowRunId: dlq.runId, publishedAt: { not: null } },
+    });
+    await dlq.redrive();
+    const a = await dlq.page();
+    expect(a.run).toMatchObject({ status: "COMPLETED", redriveCount: 1 });
+    expect(a.b).toMatchObject({ status: "COMPLETED" });
+    // The numbering shows nothing missing: sequence 1 is the run's creation.
+    expect(a.held.coverage).toBe("from-start");
+    expect(a.held.events.map((e) => e.eventType)).toEqual([
+      "workflow:created",
+      "workflow:started",
+      "stage:started",
+      "stage:completed",
+      "workflow:completed",
+    ]);
+    // Before: "1 attempt, First run". The redrive's start follows the run's
+    // creation, so it reads as the claim and records no redrive.
+    expect(a.history).toMatchObject({
+      available: false,
+      reason: "fewer-redrives",
+    });
+    await dlq.db.$disconnect?.();
+
+    // B: the rows from sequence 7 on removed, then the run is redriven.
+    const tail = await world("tail", () => false);
+    await tail.drain();
+    const open = (await tail.page()).held;
+    await tail.db.outboxEvent.deleteMany({
+      where: { workflowRunId: tail.runId, sequence: { gte: 7 } },
+    });
+    // A page open on the run asks for the rows after what it holds: the read
+    // ends below that, so the page drops what it holds and starts again.
+    const poll: any = await (
+      await tail.handler(
+        new Request(
+          `https://console.example/console/api/runs/${tail.runId}?stageEventsAfter=${open.lastSequence}`,
+        ),
+      )
+    ).json();
+    expect(poll.stageEvents).toMatchObject({
+      lastSequence: 6,
+      complete: false,
+    });
+    expect(mergeStageEvents(open, poll.stageEvents)).toBeNull();
+    await tail.redrive();
+    const b = await tail.page();
+    expect(b.run).toMatchObject({ status: "COMPLETED", redriveCount: 1 });
+    expect(b.held.coverage).toBe("from-start");
+    // Before: "initial -> retrying, rerun -> completed". The redrive's start
+    // follows no end of the run, which a redrive needs.
+    expect(b.history).toMatchObject({
+      available: false,
+      reason: "run-inconsistent",
+      runMismatch: "order",
+    });
+    await tail.db.$disconnect?.();
   });
 
   it("cuts a lifecycle event's error text in SQL and says it was cut", async () => {

@@ -893,13 +893,23 @@ LIMIT ${limit + 1}`;
     );
     const maxSeq = toNumber(top[0]?.maxSeq);
     if (maxSeq <= after) {
-      return {
-        events: [],
-        after,
-        lastSequence: after,
-        complete: after > 0,
-        more: false,
-      };
+      // Below `after`: rows past what the page holds were removed, and what
+      // it holds may no longer be the run's rows.
+      return maxSeq < after
+        ? {
+            events: [],
+            after,
+            lastSequence: maxSeq,
+            complete: false,
+            more: false,
+          }
+        : {
+            events: [],
+            after,
+            lastSequence: after,
+            complete: after > 0,
+            more: false,
+          };
     }
     const upper = Math.min(maxSeq, after + STAGE_EVENT_WINDOW);
 
@@ -977,6 +987,32 @@ FROM "workflow_runs" WHERE id = ${this.param(1)}`,
       // A run that does not exist costs one statement, not six.
       const runRow = runRows[0];
       if (!runRow) return null;
+      const run = {
+        ...mapRunSummary(runRow),
+        input: runRow.input,
+        output: runRow.output,
+        config: runRow.config,
+        metadata: runRow.metadata,
+      };
+      const after = Math.max(0, Math.floor(options?.stageEventsAfter ?? 0));
+      // The next part of a long history: two statements, not nine.
+      if (options?.stageEventsOnly) {
+        return {
+          run,
+          stages: [],
+          steps: [],
+          annotations: [],
+          logs: [],
+          events: [],
+          stageEvents: await this.readStageEvents(client, runId, after),
+          truncated: {
+            steps: false,
+            annotations: false,
+            logs: false,
+            events: false,
+          },
+        } satisfies RunDetail;
+      }
 
       const stageRows = await this.select<RawStageRow>(
         client,
@@ -1034,11 +1070,7 @@ LIMIT ${eventLimit + 1}`,
         [runId],
       );
 
-      const stageEvents = await this.readStageEvents(
-        client,
-        runId,
-        Math.max(0, Math.floor(options?.stageEventsAfter ?? 0)),
-      );
+      const stageEvents = await this.readStageEvents(client, runId, after);
 
       // Each list asked for one row more than it will show, so "there is
       // more than this" is known without a second count.
@@ -1050,13 +1082,7 @@ LIMIT ${eventLimit + 1}`,
       };
 
       return {
-        run: {
-          ...mapRunSummary(runRow),
-          input: runRow.input,
-          output: runRow.output,
-          config: runRow.config,
-          metadata: runRow.metadata,
-        },
+        run,
         stages: stageRows.map(mapStageSummary),
         steps: stepRows.slice(0, stepLimit).map(mapStepSummary),
         annotations: annotationRows

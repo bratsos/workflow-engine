@@ -758,6 +758,7 @@ async function pageModel(m: Moment, removed: (row: any) => boolean) {
   }
   return buildStageAttemptHistory({
     redriveCount: body.run.redriveCount,
+    runStatus: body.run.status,
     stages: body.stages,
     steps: body.steps,
     stageEvents: {
@@ -806,17 +807,23 @@ function retentionStates(m: Moment, purged: boolean): Retention[] {
     });
   }
   for (let k = 2; k <= n; k++) {
-    // Nothing in the remaining rows can show that a tail is missing; only the
-    // stage's row can, and the page must say so instead of a stale history.
+    // The numbering cannot show that a tail is missing; only the run's and
+    // the stage's rows can, and the page must say so instead of a stale
+    // history. After an earlier purge no remaining row is the run's creation.
+    // A removed tail that held a redrive's `workflow:started` leaves fewer of
+    // them than the run row's `redriveCount`; one that held the run's last
+    // `workflow:*` event leaves a run state that is not the run row's status.
     states.push({
       name: `tail ${k}..${n} gone`,
       removed: (row) => own(row) && row.sequence >= k,
-      // After an earlier purge no remaining row is the run's creation.
-      // A removed tail that held a redrive's `workflow:started` leaves fewer
-      // of them than the run row's `redriveCount`.
       reasons: purged
         ? ["events-incomplete"]
-        : ["inconsistent", "no-stage-events", "fewer-redrives"],
+        : [
+            "inconsistent",
+            "no-stage-events",
+            "fewer-redrives",
+            "run-inconsistent",
+          ],
     });
   }
   return states;
@@ -1237,4 +1244,498 @@ describe("I want every statement about a stage's history to be true under any re
     expect(tally["no-retained-events"]).toBeGreaterThan(0);
     expect(tally["events-incomplete"]).toBeGreaterThan(0);
   });
+});
+
+/**
+ * Two worlds run the same kernel commands. One keeps every outbox row; in the
+ * other, rows of the run are removed at a mark and the run then goes on
+ * writing, numbered as the Prisma store numbers them (one past the highest
+ * row it still holds). Whatever the page shows as available in the second
+ * world must be what it shows in the first.
+ *
+ * Rows removed from the start or the middle are always found. Rows removed
+ * from the end are found only when what remains contradicts the run or stage
+ * rows; the histories that remain wrong after such a removal are counted per
+ * scenario, printed with their shapes, and must each be a history the row
+ * checks cannot see: one that differs from the kept history only by
+ * executions the stage row does not count (a re-delivery after a crash) or
+ * by where the steps are placed.
+ */
+describe("I want a history shown as available after rows were removed and the run wrote again to be the one kept in full", () => {
+  type Purge = { name: string; keep: (row: any) => boolean };
+  type Mark = (label: string, h: any, runId: string) => Promise<void>;
+  type Scenario = {
+    name: string;
+    marks: string[];
+    /** Wrong histories after removals from the end, as measured. */
+    tailLimit: number;
+    run: (mark: Mark) => Promise<{ h: any; runId: string }>;
+  };
+  const TAIL = "tail gone (head kept)";
+  const NONE = "none gone";
+
+  const stage = (id: string, execute: (ctx: any) => Promise<unknown>) =>
+    defineStage({ id, name: id.toUpperCase(), schemas, execute });
+  const pass = async (ctx: any) => ({ output: ctx.input });
+
+  /** Removes rows of one run; the next row is numbered one past the highest left. */
+  function applyPurge(h: any, runId: string, purge: Purge): string {
+    const all = h.persistence.outbox as any[];
+    const own = all.filter((r) => r.workflowRunId === runId);
+    h.persistence.outbox = all.filter(
+      (r) => r.workflowRunId !== runId || purge.keep(r),
+    );
+    const seqs = own
+      .filter((r) => purge.keep(r))
+      .map((r) => r.sequence as number)
+      .sort((a, b) => a - b);
+    h.persistence.outboxSequences.set(runId, seqs[seqs.length - 1] ?? 0);
+    const contiguous =
+      seqs.length > 0 && seqs[seqs.length - 1]! - seqs[0]! + 1 === seqs.length;
+    return seqs.length === 0
+      ? "all gone"
+      : seqs.length === own.length
+        ? NONE
+        : contiguous && seqs[0] === 1
+          ? TAIL
+          : contiguous && seqs[seqs.length - 1] === own.length
+            ? "prefix gone (tail kept)"
+            : seqs[0] === 1
+              ? "creation kept, gaps"
+              : "gaps, creation gone";
+  }
+
+  const scenarios: Scenario[] = [
+    {
+      name: "fail, redrive lastFailure twice, redrive from start",
+      marks: ["g1", "g2", "g3"],
+      tailLimit: 0,
+      async run(mark) {
+        let failing = 5;
+        const a = stage("a", pass);
+        const b = stage("b", async (ctx) => {
+          if (failing > 0) {
+            failing--;
+            throw new Error(`b down ${failing}`);
+          }
+          return { output: ctx.input };
+        });
+        const h = tickingHarness([
+          new WorkflowBuilder("wf", "wf", "d", io, io).pipe(a).pipe(b).build(),
+        ]);
+        await h.start("other", { v: "o" });
+        const { workflowRunId: runId } = await h.run("wf", { v: "x" });
+        await mark("g1", h, runId);
+        await redrive(h, runId);
+        await drain(h, runId, 10);
+        await mark("g2", h, runId);
+        await redrive(h, runId);
+        await drain(h, runId, 10);
+        await mark("g3", h, runId);
+        await redrive(h, runId, { kind: "start" });
+        await drain(h, runId, 10);
+        return { h, runId };
+      },
+    },
+    {
+      name: "parallel group, one member fails, redrive, redrive from stage",
+      marks: ["g1", "g2"],
+      tailLimit: 0,
+      async run(mark) {
+        let failing = 3;
+        const p = stage("p", async (ctx) => {
+          if (failing > 0) {
+            failing--;
+            throw new Error("p down");
+          }
+          return { output: ctx.input };
+        });
+        const h = tickingHarness([
+          new WorkflowBuilder("wf", "wf", "d", io, io)
+            .parallel([p, stage("q", pass)])
+            .pipe(stage("c", pass))
+            .build(),
+        ]);
+        const { workflowRunId: runId } = await h.run("wf", { v: "x" });
+        await mark("g1", h, runId);
+        await redrive(h, runId);
+        await drain(h, runId, 10);
+        await mark("g2", h, runId);
+        await redrive(h, runId, { kind: "stage", stageId: "q" });
+        await drain(h, runId, 10);
+        return { h, runId };
+      },
+    },
+    {
+      name: "suspended stage with a poll retry, redrive from stage",
+      marks: ["g1", "g2"],
+      tailLimit: 0,
+      async run(mark) {
+        let replays = 0;
+        const s = stage("s", async (ctx) => {
+          await ctx.step.sleep("nap", "1m");
+          await ctx.step.run("after-nap", async () => {
+            replays++;
+            if (replays === 1) throw new Error("flaky after the wait");
+            return "ok";
+          });
+          return { output: ctx.input };
+        });
+        const h = tickingHarness([
+          new WorkflowBuilder("wf", "wf", "d", io, io)
+            .pipe(s)
+            .pipe(stage("c", pass))
+            .build(),
+        ]);
+        const { workflowRunId: runId } = await h.run("wf", { v: "x" });
+        await mark("g1", h, runId);
+        await redrive(h, runId, { kind: "stage", stageId: "s" });
+        await drain(h, runId, 14);
+        await mark("g2", h, runId);
+        await redrive(h, runId, { kind: "start" });
+        await drain(h, runId, 14);
+        return { h, runId };
+      },
+    },
+    {
+      name: "cancel while running, redrive, cancel again, redrive",
+      marks: ["g1", "g2", "g3"],
+      tailLimit: 0,
+      async run(mark) {
+        let h: any;
+        let runId = "";
+        let runs = 0;
+        const slow = stage("slow", async (ctx) => {
+          runs++;
+          await ctx.step.run(`w${runs}`, async () => "x");
+          if (runs <= 2)
+            await h.kernel.dispatch({
+              type: "run.cancel",
+              workflowRunId: runId,
+            });
+          return { output: ctx.input };
+        });
+        h = tickingHarness([
+          new WorkflowBuilder("wf", "wf", "d", io, io)
+            .pipe(slow)
+            .pipe(stage("c", pass))
+            .build(),
+        ]);
+        runId = (await h.start("wf", { v: "x" })).workflowRunId;
+        await drain(h, runId, 4);
+        await mark("g1", h, runId);
+        await redrive(h, runId);
+        await drain(h, runId, 4);
+        await mark("g2", h, runId);
+        await redrive(h, runId);
+        await drain(h, runId, 6);
+        await mark("g3", h, runId);
+        await redrive(h, runId, { kind: "start" });
+        await drain(h, runId, 6);
+        return { h, runId };
+      },
+    },
+    {
+      name: "reapStuck of a suspended stage, redrive",
+      marks: ["g1"],
+      tailLimit: 0,
+      async run(mark) {
+        const nap = stage("nap", async (ctx) => {
+          await ctx.step.sleep("nap", "20m");
+          return { output: ctx.input };
+        });
+        const h = harnessOn(
+          new WorkflowBuilder("wf", "wf", "d", io, io).pipe(nap).build(),
+        );
+        const runId = (await h.start("wf", { v: "x" })).workflowRunId;
+        await h.kernel.dispatch({ type: "run.claimPending", workerId: "w" });
+        await h.kernel.dispatch({
+          type: "job.execute",
+          workflowRunId: runId,
+          workflowId: "wf",
+          stageId: "nap",
+          config: {},
+        });
+        h.clock.advance(30 * 60_000);
+        await h.kernel.dispatch({
+          type: "run.reapStuck",
+          stuckThresholdMs: 5 * 60_000,
+        });
+        await mark("g1", h, runId);
+        await redrive(h, runId);
+        await drain(h, runId, 14);
+        return { h, runId };
+      },
+    },
+    {
+      name: "crash re-delivery, completed, redrive from start",
+      marks: ["g1", "g2"],
+      tailLimit: 2,
+      async run(mark) {
+        let h: any;
+        let runId = "";
+        let calls = 0;
+        const slow = stage("slow", async (ctx) => {
+          calls++;
+          await ctx.step.run(`w${calls}`, async () => "x");
+          // The first worker never comes back; the re-delivery's start is
+          // written when the mark removes rows.
+          if (calls === 1) await new Promise(() => {});
+          if (calls === 2) await mark("g1", h, runId);
+          return { output: ctx.input };
+        });
+        h = harnessOn(
+          new WorkflowBuilder("wf", "wf", "d", io, io)
+            .pipe(slow)
+            .pipe(stage("c", pass))
+            .build(),
+        );
+        runId = (await h.start("wf", { v: "x" })).workflowRunId;
+        await h.kernel.dispatch({ type: "run.claimPending", workerId: "w" });
+        const execute = (job: any) =>
+          h.kernel.dispatch({
+            type: "job.execute",
+            workflowRunId: runId,
+            workflowId: "wf",
+            stageId: "slow",
+            config: {},
+            attempt: job.attempt,
+            maxAttempts: 3,
+          });
+        const first = await h.jobQueue.dequeue();
+        void execute(first);
+        while (calls === 0) await new Promise((r) => setTimeout(r, 1));
+        h.clock.advance(5_000);
+        await h.jobQueue.fail(first.jobId, "worker crashed", true);
+        const second = await h.jobQueue.dequeue();
+        await execute(second);
+        await h.jobQueue.complete(second.jobId);
+        await h.kernel.dispatch({
+          type: "run.transition",
+          workflowRunId: runId,
+        });
+        await drain(h, runId, 10);
+        await mark("g2", h, runId);
+        await redrive(h, runId, { kind: "start" });
+        await drain(h, runId, 10);
+        return { h, runId };
+      },
+    },
+    {
+      name: "job retry, completed, redrive from start, redrive from stage",
+      marks: ["g1", "g2"],
+      tailLimit: 0,
+      async run(mark) {
+        let calls = 0;
+        const a = stage("a", async (ctx) => {
+          calls++;
+          if (calls === 1) throw new Error("upstream 503");
+          return { output: ctx.input };
+        });
+        const h = tickingHarness([
+          new WorkflowBuilder("wf", "wf", "d", io, io)
+            .pipe(a)
+            .pipe(stage("b", pass))
+            .build(),
+        ]);
+        const { workflowRunId: runId } = await h.run("wf", { v: "x" });
+        await mark("g1", h, runId);
+        await redrive(h, runId, { kind: "start" });
+        await drain(h, runId, 10);
+        await mark("g2", h, runId);
+        await redrive(h, runId, { kind: "stage", stageId: "b" });
+        await drain(h, runId, 10);
+        return { h, runId };
+      },
+    },
+  ];
+
+  /** mulberry32: the same removals on every run. */
+  function prng(seed: number) {
+    return () => {
+      seed |= 0;
+      seed = (seed + 0x6d2b79f5) | 0;
+      let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function purgesFor(n: number, rand: () => number): Purge[] {
+    const out: Purge[] = [
+      { name: "all", keep: () => false },
+      { name: "only seq 1", keep: (r) => r.sequence === 1 },
+      {
+        name: "only workflow:* rows",
+        keep: (r) => r.eventType.startsWith("workflow:"),
+      },
+      {
+        name: "no workflow:started",
+        keep: (r) => r.eventType !== "workflow:started",
+      },
+      {
+        name: "no stage:* rows",
+        keep: (r) => !r.eventType.startsWith("stage:"),
+      },
+      {
+        name: "no progress/annotation rows",
+        keep: (r) => !/progress|annotation/.test(r.eventType),
+      },
+    ];
+    for (let k = 1; k < n; k++) {
+      out.push({ name: `prefix ${k}`, keep: (r) => r.sequence > k });
+      out.push({ name: `head ${k}`, keep: (r) => r.sequence <= k });
+    }
+    for (let i = 2; i < n; i++)
+      out.push({ name: `middle ${i}`, keep: (r) => r.sequence !== i });
+    for (let t = 0; t < 40; t++) {
+      const p = 0.2 + rand() * 0.6;
+      const drop = new Set<number>();
+      for (let i = 1; i <= n; i++) if (rand() > p) drop.add(i);
+      out.push({
+        name: `random drop {${[...drop].join(",")}}`,
+        keep: (r) => !drop.has(r.sequence),
+      });
+    }
+    return out;
+  }
+
+  const project = (history: StageAttemptHistory, steps = true) =>
+    history.available
+      ? {
+          attempts: history.attempts.map((a) => ({
+            trigger: a.trigger,
+            outcome: a.outcome,
+            executed: a.executed,
+            events: a.events.map((e) => e.eventType),
+            error: a.error,
+            ...(steps ? { steps: a.steps.map((s) => s.stepId) } : {}),
+          })),
+          ...(steps
+            ? { unplaced: history.unplacedSteps.map((s) => s.stepId) }
+            : {}),
+        }
+      : null;
+
+  /** The executions the stage row counts: neither re-deliveries nor their lost predecessors. */
+  const counted = (history: StageAttemptHistory) =>
+    history.available
+      ? history.attempts
+          .filter((a) => a.trigger !== "redelivery")
+          .map((a) => ({
+            trigger: a.trigger,
+            executed: a.executed,
+            error: a.error,
+          }))
+      : null;
+
+  async function model(h: any, runId: string) {
+    const m = await moment(h, runId);
+    const histories = await pageModel(m, () => false);
+    const byStage = new Map<string, StageAttemptHistory>();
+    for (const s of m.stages) byStage.set(s.stageId, histories.get(s.id)!);
+    return byStage;
+  }
+
+  for (const scenario of scenarios) {
+    it(scenario.name, { timeout: 600_000 }, async () => {
+      const kept = await scenario.run(async () => {});
+      const truth = await model(kept.h, kept.runId);
+      const sizes: Record<string, number> = {};
+      await scenario.run(async (label, h, runId) => {
+        sizes[label] = (h.persistence.outbox as any[]).filter(
+          (r) => r.workflowRunId === runId,
+        ).length;
+      });
+
+      const outside: string[] = [];
+      const limit: string[] = [];
+      const visible: string[] = [];
+      const check = async (
+        shapes: string[],
+        how: string,
+        w: { h: any; runId: string },
+      ) => {
+        const got = await model(w.h, w.runId);
+        const inLimit =
+          shapes.includes(TAIL) &&
+          shapes.every((s) => s === TAIL || s === NONE);
+        for (const [stageId, g] of got) {
+          const t = truth.get(stageId)!;
+          const label = `[${shapes.join(" / ")}] ${how} | ${stageId}`;
+          if (!g.available) {
+            if (t.available && shapes.every((s) => s === NONE))
+              outside.push(
+                `${label}: unavailable (${g.reason}) with nothing removed`,
+              );
+            continue;
+          }
+          const same =
+            t.available &&
+            JSON.stringify(project(g)) === JSON.stringify(project(t));
+          if (same) continue;
+          const finding = `${label}\n      shown: ${JSON.stringify(project(g, false))}\n      kept:  ${JSON.stringify(project(t, false))}`;
+          if (!inLimit) {
+            outside.push(finding);
+            continue;
+          }
+          limit.push(finding);
+          if (
+            !t.available ||
+            JSON.stringify(counted(g)) !== JSON.stringify(counted(t))
+          )
+            visible.push(finding);
+        }
+      };
+
+      const rand = prng(scenario.name.length * 7919);
+      let trials = 0;
+      for (const mark of scenario.marks) {
+        for (const purge of purgesFor(sizes[mark]!, rand)) {
+          let shape = "";
+          const w = await scenario.run(async (label, h, runId) => {
+            if (label === mark) shape = applyPurge(h, runId, purge);
+          });
+          trials++;
+          await check([shape], `${mark}: ${purge.name}`, w);
+        }
+      }
+      // Two removals, at two marks.
+      if (scenario.marks.length > 1) {
+        for (let t = 0; t < 150; t++) {
+          const i1 = Math.floor(rand() * (scenario.marks.length - 1));
+          const m1 = scenario.marks[i1]!;
+          const m2 =
+            scenario.marks[
+              i1 + 1 + Math.floor(rand() * (scenario.marks.length - 1 - i1))
+            ]!;
+          const p1 = purgesFor(sizes[m1]!, rand);
+          const p2 = purgesFor(sizes[m2]! + 3, rand);
+          const a = p1[Math.floor(rand() * p1.length)]!;
+          const b = p2[Math.floor(rand() * p2.length)]!;
+          const shapes: string[] = [];
+          const w = await scenario.run(async (label, h, runId) => {
+            if (label === m1) shapes.push(applyPurge(h, runId, a));
+            if (label === m2) shapes.push(applyPurge(h, runId, b));
+          });
+          trials++;
+          await check(shapes, `${m1}: ${a.name} then ${m2}: ${b.name}`, w);
+        }
+      }
+
+      if (process.env.ORACLE_TRUTH)
+        for (const [id, t] of truth)
+          console.log(`kept ${id}: ${JSON.stringify(project(t, false))}`);
+      console.log(
+        [
+          `${scenario.name}: ${trials} removals, ${outside.length} wrong outside the stated limit, ${limit.length} within it`,
+          ...limit.map((f) => `  ${f}`),
+        ].join("\n"),
+      );
+      expect(outside).toEqual([]);
+      // Every wrong history left is one the row checks cannot see.
+      expect(visible).toEqual([]);
+      expect(limit.length).toBe(scenario.tailLimit);
+    });
+  }
 });

@@ -27,7 +27,7 @@ unless `DATABASE_URL` is set. They share one database and each truncates the
 tables between cases, so `test:pg` runs them with `--no-file-parallelism`; run
 any new Postgres-backed file through that script rather than on its own, or the
 suites will delete each other's rows and fail in ways that look like adapter
-bugs. `test:pg` and `test:sqlite` run with `--hookTimeout=30000` (the Vitest default is 10 s): every case resets the database in a `beforeEach`, and on a shared CI runner that reset has been seen to stall past 10 s. To run them locally:
+bugs. `test:pg` and `test:sqlite` run with `--hookTimeout=30000` (the Vitest default is 10 s): every case resets the database in a `beforeEach`, and on a shared CI runner that reset has been seen to stall past 10 s. The console's database suites run with the same flags; their heaviest hooks and tests (the SQLite `beforeAll` that generates and pushes the schema, the Postgres reset and the query-plan test) carry longer timeouts of their own. To run them locally:
 
 ```bash
 export DATABASE_URL=postgresql://postgres:postgres@localhost:5432/workflow_engine_test
@@ -36,7 +36,7 @@ pnpm --filter @bratsos/workflow-engine run prisma:generate
 pnpm --filter @bratsos/workflow-engine run prisma:db-push
 pnpm --filter @bratsos/workflow-engine run test:pg
 pnpm --filter @bratsos/workflow-engine-console exec node scripts/build-ui.mjs   # cli.test.ts needs the built UI bundle
-pnpm --filter @bratsos/workflow-engine-console exec vitest run src/__tests__/prisma-read-port.postgres.test.ts src/__tests__/cli.test.ts
+pnpm --filter @bratsos/workflow-engine-console exec vitest run --hookTimeout=30000 --testTimeout=30000 src/__tests__/prisma-read-port.postgres.test.ts src/__tests__/cli.test.ts
 ```
 
 SQLite conformance uses a temporary real file and does not need `DATABASE_URL`.
@@ -53,9 +53,9 @@ PRISMA_MAJOR=7 pnpm --filter @bratsos/workflow-engine run test:sqlite
 PRISMA_MAJOR=8 pnpm --filter @bratsos/workflow-engine run test:sqlite
 pnpm --filter @bratsos/workflow-engine run build
 pnpm --filter @bratsos/workflow-engine-console exec node scripts/build-ui.mjs
-PRISMA_MAJOR=6 pnpm --filter @bratsos/workflow-engine-console exec vitest run src/__tests__/prisma-read-port.sqlite.test.ts
-PRISMA_MAJOR=7 pnpm --filter @bratsos/workflow-engine-console exec vitest run src/__tests__/prisma-read-port.sqlite.test.ts
-PRISMA_MAJOR=8 pnpm --filter @bratsos/workflow-engine-console exec vitest run src/__tests__/prisma-read-port.sqlite.test.ts
+PRISMA_MAJOR=6 pnpm --filter @bratsos/workflow-engine-console exec vitest run --hookTimeout=30000 --testTimeout=30000 src/__tests__/prisma-read-port.sqlite.test.ts
+PRISMA_MAJOR=7 pnpm --filter @bratsos/workflow-engine-console exec vitest run --hookTimeout=30000 --testTimeout=30000 src/__tests__/prisma-read-port.sqlite.test.ts
+PRISMA_MAJOR=8 pnpm --filter @bratsos/workflow-engine-console exec vitest run --hookTimeout=30000 --testTimeout=30000 src/__tests__/prisma-read-port.sqlite.test.ts
 ```
 
 ### Stored-row compatibility fixtures

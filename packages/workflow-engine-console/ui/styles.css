@@ -710,6 +710,7 @@
 }
 
 #workflow-console .attempt-hint,
+#workflow-console .attempt-limit,
 #workflow-console .attempt-note,
 #workflow-console .attempt-empty {
   margin: 0 0 0.5rem;

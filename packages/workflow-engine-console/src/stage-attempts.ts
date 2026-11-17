@@ -39,6 +39,9 @@
  *  - `workflow:cancelled` closes the open attempt as "cancelled". `run.cancel`
  *    marks every non-terminal stage CANCELLED in one transaction and emits no
  *    stage event, so this event is the only proof that the execution ended.
+ *  - `workflow:completed` and `workflow:failed` end the run; they close no
+ *    attempt (each stage ended with its own event first) and are read for the
+ *    run checks below.
  *  - `workflow:started` is emitted by the first claim and by every redrive
  *    (`run.redrive`, `run.rerunFrom`). It finds no attempt open, because a
  *    redrive takes only a COMPLETED, FAILED or CANCELLED run and each of those
@@ -53,17 +56,50 @@
  * run's rows from the highest one it still holds, so after every row of a run
  * was removed the next one is numbered 1 again; only `workflow:created`, which
  * `run.create` writes once and first, shows that a range starts where the run
- * did. Only then is the first attempt the first run and "no event" proof that
- * nothing happened. The run row must agree too: each redrive writes one
- * `workflow:started`, so fewer of them than its `redriveCount` means earlier
- * generations are not retained.
+ * did. A range that starts there and has no hole proves that no row is
+ * missing from its start or its middle. It proves nothing about its end: the
+ * store numbers the next row one past the highest it still holds, so when
+ * rows are removed from the end of a run's outbox and the run then writes
+ * again, the new rows take the removed numbers and the range is unbroken
+ * again. Nothing in the engine deletes outbox rows (`run.purge` removes the
+ * run and leaves them); only the operator's own SQL, such as a pruning job,
+ * does, and a purged run has no page. What was
+ * removed from the end is found only where what remains contradicts the run
+ * or stage rows, by the checks that follow, none of which rests on the
+ * numbering.
+ *
+ * The run's own events must follow the order the engine writes them in:
+ * `workflow:created` first; one `workflow:started` for the claim, after
+ * `workflow:created` and before any end; every later `workflow:started` (a
+ * redrive) after a `workflow:completed`, `workflow:failed` or
+ * `workflow:cancelled`, because a redrive takes only an ended run;
+ * `workflow:completed` only while the run is running, `workflow:failed` also
+ * before the claim (a claim that fails writes no start), and
+ * `workflow:cancelled` at any point (a cancel that races the run's own end
+ * can follow it). The redrives found that way must be exactly the run row's
+ * `redriveCount`, since each redrive writes one start and only a redrive adds
+ * to the count; fewer is `fewer-redrives`, more contradicts the row. The run
+ * state the last of them leaves must be the run row's status: PENDING before
+ * the claim, RUNNING after a start, otherwise the status of the last end.
+ *
  * And the stage row must agree with them: its status with the last attempt,
- * its `attempt` count (on a run never redriven), its `startedAt` with the
- * last `stage:started`, its `completedAt` with the event that ended it, and
- * its `errorMessage` with the last error event. The row and the event of one
- * write are stamped in one handler, the row first, so a row stamped after the
- * last retained event means the events that followed are not retained. A
- * disagreement makes the stage unavailable and names the field.
+ * its `attempt` with the executions the engine counts on it, its `startedAt`
+ * with the last `stage:started`, its `completedAt` with the event that ended
+ * it, and its `errorMessage` with the last error event. A row starts at
+ * attempt 0 and gains 1 per job retry (at the `stage:started` that follows a
+ * `stage:retrying`) and per poll retry (at a `stage:retrying` while
+ * suspended); a re-delivery and a start after the stage ended gain nothing.
+ * A redrive leaves a row of an earlier execution group as it was, reopens a
+ * row of the target group at its attempt plus 1 (`lastFailure`, `stage`),
+ * creates the target group's rows one past the highest attempt of the rows
+ * it replaced (`start`, or a stage new to the definition version), and lets
+ * later groups' rows be created again at 0. The events do not say which, so
+ * after a redrive each row may hold any of those values; the row's `attempt`
+ * must be one the recorded executions can produce. Without a redrive that is
+ * exactly one value. The row and the event of one write are stamped in one
+ * handler, the row first, so a row stamped after the last retained event
+ * means the events that followed are not retained. A disagreement makes the
+ * stage unavailable and names the field.
  *
  * Times stamped by different processes are never compared to decide whether
  * the history is available. `startedAt` is checked against the last
@@ -126,6 +162,11 @@ export interface AttemptEventInput {
 
 export interface StageAttemptInput {
   redriveCount: number;
+  /**
+   * The run row's status. When given, the run state its last retained
+   * `workflow:*` event leaves must match it.
+   */
+  runStatus?: string;
   stages: readonly AttemptStageInput[];
   steps: readonly AttemptStepInput[];
   /** Absent when the reader does not provide stage events. */
@@ -182,7 +223,10 @@ export interface StageEventPage {
  * request this page did not make) changes nothing. Events are appended by
  * sequence, so a reader that ignores `after` adds each event once. A read
  * that stopped at the reader's limit leaves `more` true: the page asks again
- * from `lastSequence` until it has caught up.
+ * from `lastSequence` until it has caught up. A read from the held position
+ * whose `lastSequence` is below it says the run's rows past some point were
+ * removed: what is held may no longer be the run's rows, so null is returned
+ * and the page reads the run again from the start.
  */
 export function mergeStageEvents(
   held: HeldStageEvents | null,
@@ -206,6 +250,8 @@ export function mergeStageEvents(
       more,
     };
   }
+  if (page.after === held.lastSequence && page.lastSequence < page.after)
+    return null;
   if (page.lastSequence <= held.lastSequence || page.after > held.lastSequence)
     return held;
   return {
@@ -249,7 +295,7 @@ export type AttemptTrigger =
 export type AttemptUnavailableReason =
   /** The reader returned no stage events. */
   | "no-event-history"
-  /** Rows are missing from the run's outbox: purged or past retention. */
+  /** Rows are missing from the run's outbox: removed by SQL, such as a pruning job. */
   | "events-incomplete"
   /** The run has no retained outbox row at all. */
   | "no-retained-events"
@@ -259,6 +305,12 @@ export type AttemptUnavailableReason =
   | "events-paused"
   /** The run row counts more redrives than the retained `workflow:started` events. */
   | "fewer-redrives"
+  /**
+   * The run's retained `workflow:*` events contradict the engine's order or
+   * the run row; `runMismatch` says which. Rows removed from the end of the
+   * run's outbox, after which the run wrote again, leave this.
+   */
+  | "run-inconsistent"
   /** The stage row says it ran, and no lifecycle event of it is retained. */
   | "no-stage-events"
   /**
@@ -270,6 +322,15 @@ export type AttemptUnavailableReason =
   | "invalid-event-time"
   /** The events disagree with the stage's current row; `mismatch` names the field. */
   | "inconsistent";
+
+/** What of the run's own events is contradicted. */
+export type AttemptRunMismatch =
+  /** An event the engine writes only after another, with that other not before it. */
+  | "order"
+  /** More redrives recorded than the run row counts. */
+  | "redrives"
+  /** The run state the events end in is not the run row's status. */
+  | "status";
 
 /** The stage row field the events disagree with. */
 export type AttemptRowMismatch =
@@ -352,6 +413,8 @@ export type StageAttemptHistory =
       reason: AttemptUnavailableReason;
       /** Set with `inconsistent`. */
       mismatch?: AttemptRowMismatch;
+      /** Set with `run-inconsistent`. */
+      runMismatch?: AttemptRunMismatch;
     };
 
 interface Work {
@@ -394,7 +457,7 @@ function historyForStage(
   stage: AttemptStageInput,
   events: readonly AttemptEventInput[],
   steps: readonly AttemptStepInput[],
-  redriveCount: number,
+  possibleAttempts: ReadonlySet<number>,
 ): StageAttemptHistory {
   const unavailable = (
     reason: AttemptUnavailableReason,
@@ -619,17 +682,10 @@ function historyForStage(
     if (!agrees) return unavailable("inconsistent", "status");
   }
 
-  // Without a redrive the row's attempt starts at 0 and gains exactly 1 per
-  // retry, so it must equal the events' count of attempts the engine counts:
-  // a re-delivery does not bump the row, and an attempt that never started
-  // has no execution to count. A redrive breaks the rule in both directions
-  // (it numbers a reopened row one past the highest in its execution group,
-  // and recreates the rows of later stages at 0), so after one the events'
-  // completeness is what is relied on.
-  const counted = attempts.filter(
-    (attempt) => attempt.executed && attempt.trigger !== "redelivery",
-  ).length;
-  if (redriveCount === 0 && stage.attempt !== Math.max(0, counted - 1))
+  // The row's attempt must be one the recorded executions produce (see
+  // `foldRunEvents`): a row ahead of every such value counts executions whose
+  // events are not retained.
+  if (!possibleAttempts.has(stage.attempt))
     return unavailable("inconsistent", "attempt");
 
   // `job.execute` stamps `startedAt` before it writes `stage:started`, so the
@@ -704,20 +760,30 @@ function historyForStage(
   };
 }
 
+/** At most this many immediate reads of a long history per poll interval. */
+export const CATCH_UP_READS_PER_INTERVAL = 4;
+
 /**
  * Whether the page reads the next chunk of a run's events at once, and what
  * it then counts as asked. `behindAt` is the held `lastSequence` while rows
  * past it remain, else null. A chunk is read only past the last one asked
  * for, so a reader that stops advancing is not asked again at once. While
  * paused the page reads nothing on its own; resuming polls from what it
- * holds, so the position it holds counts as asked.
+ * holds, so the position it holds counts as asked. `recentReads` is how many
+ * such reads the page made within the current poll interval: at
+ * `CATCH_UP_READS_PER_INTERVAL` it reads nothing and `wait` says to ask again
+ * when the interval has passed, so a reader that returns small chunks costs
+ * a bounded number of requests per interval.
  */
 export function catchUpStep(
   behindAt: number | null,
   askedAt: number,
   paused: boolean,
-): { read: boolean; askedAt: number } {
+  recentReads = 0,
+): { read: boolean; askedAt: number; wait?: boolean } {
   if (behindAt === null || behindAt <= askedAt) return { read: false, askedAt };
+  if (!paused && recentReads >= CATCH_UP_READS_PER_INTERVAL)
+    return { read: false, askedAt, wait: true };
   return { read: !paused, askedAt: behindAt };
 }
 
@@ -727,7 +793,10 @@ export function buildStageAttemptHistory(
 ): Map<string, StageAttemptHistory> {
   const result = new Map<string, StageAttemptHistory>();
   const log = input.stageEvents;
-  const runReason = !log
+  const events = log
+    ? [...log.events].sort((a, b) => a.sequence - b.sequence)
+    : [];
+  const readReason = !log
     ? "no-event-history"
     : log.caughtUp === false
       ? log.paused
@@ -737,33 +806,179 @@ export function buildStageAttemptHistory(
         ? "no-retained-events"
         : log.coverage === "gap"
           ? "events-incomplete"
-          : log.events.filter((event) => event.eventType === "workflow:started")
-                .length < input.redriveCount
-            ? "fewer-redrives"
-            : null;
+          : null;
+  const fold =
+    readReason === null
+      ? foldRunEvents(
+          events,
+          input.stages.map((stage) => stage.stageId),
+          input.redriveCount,
+          input.runStatus,
+        )
+      : null;
   for (const stage of input.stages) {
-    if (!log || runReason !== null) {
+    if (readReason !== null || fold!.unavailable) {
       result.set(stage.id, {
         stageRecordId: stage.id,
         available: false,
-        reason: runReason ?? "no-event-history",
+        ...(readReason !== null ? { reason: readReason } : fold!.unavailable!),
       });
     } else {
       result.set(
         stage.id,
         historyForStage(
           stage,
-          log.events
-            .filter(
-              (event) =>
-                event.stageId === null || event.stageId === stage.stageId,
-            )
-            .sort((a, b) => a.sequence - b.sequence),
+          events.filter(
+            (event) =>
+              event.stageId === null || event.stageId === stage.stageId,
+          ),
           input.steps.filter((step) => step.stageRecordId === stage.id),
-          input.redriveCount,
+          fold!.attempts.get(stage.stageId)!,
         ),
       );
     }
   }
   return result;
+}
+
+type RunState = "created" | "running" | "COMPLETED" | "FAILED" | "CANCELLED";
+
+/**
+ * One pass over a run's events in sequence order: checks the run's own
+ * events against the engine's order and the run row (see the header), and
+ * collects for every stage the `attempt` values its row can hold.
+ */
+function foldRunEvents(
+  events: readonly AttemptEventInput[],
+  rowStageIds: readonly string[],
+  redriveCount: number,
+  runStatus: string | undefined,
+): {
+  unavailable?: {
+    reason: "fewer-redrives" | "run-inconsistent";
+    runMismatch?: AttemptRunMismatch;
+  };
+  attempts: Map<string, Set<number>>;
+} {
+  const attempts = new Map<string, Set<number>>();
+  const stageState = new Map<
+    string,
+    { suspended: boolean; retryPending: boolean }
+  >();
+  const own = (stageId: string) => {
+    if (!attempts.has(stageId)) attempts.set(stageId, new Set([0]));
+    let state = stageState.get(stageId);
+    if (!state) {
+      state = { suspended: false, retryPending: false };
+      stageState.set(stageId, state);
+    }
+    return state;
+  };
+  for (const stageId of rowStageIds) own(stageId);
+  for (const event of events) if (event.stageId !== null) own(event.stageId);
+  const bump = (stageId: string) =>
+    attempts.set(
+      stageId,
+      new Set([...attempts.get(stageId)!].map((value) => value + 1)),
+    );
+  const order = {
+    unavailable: {
+      reason: "run-inconsistent" as const,
+      runMismatch: "order" as const,
+    },
+    attempts,
+  };
+
+  let run: RunState | null = null;
+  let redrives = 0;
+  for (const event of events) {
+    if (event.stageId !== null) {
+      const state = own(event.stageId);
+      switch (event.eventType) {
+        case "stage:started":
+          // `job.execute` adds 1 when it starts a retry of a stage whose
+          // last attempt threw (PENDING with its error kept).
+          if (state.retryPending) bump(event.stageId);
+          state.retryPending = false;
+          state.suspended = false;
+          break;
+        case "stage:suspended":
+          state.suspended = true;
+          break;
+        case "stage:retrying":
+          // A poll retry adds 1 at once and the stage stays suspended.
+          if (state.suspended) bump(event.stageId);
+          else state.retryPending = true;
+          break;
+        case "stage:completed":
+        case "stage:failed":
+          state.suspended = false;
+          state.retryPending = false;
+          break;
+      }
+      continue;
+    }
+    const ended =
+      run === "COMPLETED" || run === "FAILED" || run === "CANCELLED";
+    switch (event.eventType) {
+      case "workflow:created":
+        if (run !== null) return order;
+        run = "created";
+        break;
+      case "workflow:started":
+        if (ended) {
+          // A redrive: each row may now hold any value the header lists.
+          redrives++;
+          const any = new Set<number>();
+          for (const values of attempts.values())
+            for (const value of values) any.add(value + 1);
+          for (const [stageId, values] of attempts) {
+            // Kept, 0, or one past some row's value (its own reopened, or the
+            // highest of those a restart replaced).
+            const next = new Set<number>([0, ...any, ...values]);
+            attempts.set(stageId, next);
+          }
+        } else if (run !== "created") return order;
+        run = "running";
+        for (const state of stageState.values()) {
+          state.suspended = false;
+          state.retryPending = false;
+        }
+        break;
+      case "workflow:completed":
+        if (run !== "running") return order;
+        run = "COMPLETED";
+        break;
+      case "workflow:failed":
+        if (run !== "running" && run !== "created") return order;
+        run = "FAILED";
+        break;
+      case "workflow:cancelled":
+        if (run === null) return order;
+        run = "CANCELLED";
+        // A cancelled stage is not PENDING, so a later start is no retry.
+        for (const state of stageState.values()) {
+          state.suspended = false;
+          state.retryPending = false;
+        }
+        break;
+    }
+  }
+  if (redrives < redriveCount)
+    return { unavailable: { reason: "fewer-redrives" }, attempts };
+  if (redrives > redriveCount)
+    return {
+      unavailable: { reason: "run-inconsistent", runMismatch: "redrives" },
+      attempts,
+    };
+  if (runStatus !== undefined) {
+    const expected =
+      run === "created" ? "PENDING" : run === "running" ? "RUNNING" : run;
+    if (runStatus !== expected)
+      return {
+        unavailable: { reason: "run-inconsistent", runMismatch: "status" },
+        attempts,
+      };
+  }
+  return { attempts };
 }

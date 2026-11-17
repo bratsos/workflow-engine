@@ -290,6 +290,23 @@ export class InMemoryConsoleReadPort implements ConsoleReadPort {
       metadata: rawRun.metadata ?? null,
     };
 
+    if (options?.stageEventsOnly) {
+      return {
+        run,
+        stages: [],
+        steps: [],
+        annotations: [],
+        logs: [],
+        events: [],
+        stageEvents,
+        truncated: {
+          steps: false,
+          annotations: false,
+          logs: false,
+          events: false,
+        },
+      };
+    }
     return {
       run,
       stages,
@@ -324,6 +341,22 @@ export class InMemoryConsoleReadPort implements ConsoleReadPort {
       ]),
     ].sort((a, b) => a - b);
     if (sequences.length === 0) {
+      const top = Math.max(
+        0,
+        ...eventSequences,
+        ...this.fixtures.stageEvents
+          .filter((evt) => evt.workflowRunId === runId)
+          .map((evt) => evt.sequence),
+      );
+      // Below `after`: rows past what the page holds were removed.
+      if (top < after)
+        return {
+          events: [],
+          after,
+          lastSequence: top,
+          complete: false,
+          more: false,
+        };
       return {
         events: [],
         after,
