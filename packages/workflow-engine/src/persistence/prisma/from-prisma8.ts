@@ -259,8 +259,9 @@ function arrayLiteral(items: unknown[]): string {
 /**
  * A statement being built: SQL text parts and the parameters between them.
  * A null is written into the text as `NULL`, since the raw lane cannot bind one.
+ * Exported with `rowsOf` for the tests that drive a bare executor; not public API.
  */
-class Sql {
+export class Sql {
   readonly parts = [""];
   readonly values: unknown[] = [];
 
@@ -316,24 +317,36 @@ function template(
   return q;
 }
 
+const sqlOf = (x: Executor, q: Sql) =>
+  x.raw.sql(Object.assign(q.parts, { raw: q.parts }), ...q.values);
+/** The plan names its database (`meta.target`); this is only Postgres, so an unknown one is treated as SQLite. */
+const postgres = (plan: { meta?: { target?: string } }) =>
+  plan.meta?.target === "postgres";
+
 /**
  * The one place a statement becomes a plan, and every `x.query` and `x.execute`
- * here runs a plan built by it. The NUL check reads the plan, not the executor:
- * the root client, a transaction's, a consumer's `tx` and the driver's own
- * executor inside a chunked write all pass it, and none can go around it.
+ * here runs a plan built by it. What depends on the database (the NUL check,
+ * SQLite's unsafe-integer read) is decided from the plan, never from the
+ * executor: the root client, a transaction's, a consumer's `tx` and the driver's
+ * own executor inside a chunked write all pass through here the same way.
+ * With `spec` the plan returns rows, else it counts the rows it changes.
  */
-const buildPlan = (x: Executor, q: Sql, finish: (statement: any) => any) => {
-  const plan = finish(
-    x.raw.sql(Object.assign(q.parts, { raw: q.parts }), ...q.values),
+function buildPlan(x: Executor, q: Sql, spec?: Record<string, string>) {
+  const plan = (
+    spec ? sqlOf(x, q).returnsRow(spec) : sqlOf(x, q).affectedCount()
   ).build();
   refuseNul(plan, q);
-  return plan;
-};
+  if (!spec || postgres(plan)) return { plan };
+  const wire = sqliteRead(q, spec);
+  return {
+    plan: sqlOf(x, wire.q).returnsRow(wire.spec).build(),
+    overflow: wire.overflow,
+    writes: wire.writes,
+  };
+}
 
 const affected = async (x: Executor, q: Sql): Promise<number> =>
-  (await x.execute(buildPlan(x, q, (s) => s.affectedCount()))).affectedRows;
-
-const sqliteExecutors = new WeakSet<Executor>();
+  (await x.execute(buildPlan(x, q).plan)).affectedRows;
 
 let nulReadable: boolean | undefined;
 /**
@@ -360,10 +373,10 @@ function readsNul(): boolean {
 
 /**
  * A NUL that would be read back cut changes an ID or text without an error: refuse it.
- * The plan names its database (`meta.target`); anything but Postgres is checked.
+ * Postgres rejects a NUL itself.
  */
 function refuseNul(plan: { meta?: { target?: string } }, q: Sql): void {
-  if (plan.meta?.target === "postgres") return;
+  if (postgres(plan)) return;
   if (!q.values.some((v) => typeof v === "string" && v.includes("\0"))) return;
   if (!readsNul())
     fail(
@@ -393,12 +406,13 @@ function sqliteRead(q: Sql, spec: Record<string, string>) {
   });
   const returning = top.find((t) => /^RETURNING$/i.test(t[0]));
   const first = top[0]?.[0].toUpperCase();
+  const writes = !!returning || /^(INSERT|UPDATE|DELETE|REPLACE)$/.test(first!);
   if (
     !returning &&
     (!isReadOnlySql(q.parts.join("?")) || first === "EXPLAIN") &&
     first !== "VALUES"
   ) {
-    return { q, spec };
+    return { q, spec, writes };
   }
   const bindings = q.values.map((value) => ({ value }));
   const slice = (start: number, end = source.length) => {
@@ -546,19 +560,44 @@ function sqliteRead(q: Sql, spec: Record<string, string>) {
     q: bound,
     spec: { ...spec, [overflow]: SQLITE_TYPES.int! },
     overflow,
+    writes,
   };
 }
 
-/** Rows for `spec` (column -> codec id); timestamps come back as `Date`. */
-async function rowsOf(
+/**
+ * A statement that writes and returns rows runs through the driver's
+ * `iterate()`, and node:sqlite leaves one that fails SQLITE_BUSY at its first
+ * step active on its connection. On the shared root connection every later
+ * write then reports success but is not committed, and is rolled back when
+ * the statement object is collected. `BEGIN IMMEDIATE` takes the write lock
+ * through `run()` first, which fails cleanly on BUSY and honours the
+ * connection's busy_timeout; the statement then cannot hit BUSY.
+ */
+async function withWriteLock<T>(x: Executor, work: () => Promise<T>) {
+  await affected(x, new Sql().t("BEGIN IMMEDIATE"));
+  try {
+    const result = await work();
+    await affected(x, new Sql().t("COMMIT"));
+    return result;
+  } catch (error) {
+    await affected(x, new Sql().t("ROLLBACK")).catch(() => {});
+    throw error;
+  }
+}
+
+/** Rows for `spec` (column -> codec id); timestamps come back as `Date`. Not public API. */
+export async function rowsOf(
   x: Executor,
   q: Sql,
   spec: Record<string, string>,
 ): Promise<Row[]> {
-  const wire = sqliteExecutors.has(x) ? sqliteRead(q, spec) : { q, spec };
-  const rows = await x
-    .query(buildPlan(x, wire.q, (s) => s.returnsRow(wire.spec)))
-    .toArray();
+  const wire = buildPlan(x, q, spec);
+  const read = () => x.query(wire.plan).toArray();
+  // Not in a transaction (the root has `transaction`), where a COMMIT would fail loudly.
+  const rows =
+    wire.writes && typeof (x as Partial<Prisma8Db>).transaction === "function"
+      ? await withWriteLock(x, read)
+      : await read();
   if (wire.overflow)
     for (const row of rows) {
       if (row[wire.overflow])
@@ -1640,7 +1679,6 @@ export function fromPrisma8(
     inTransaction: boolean,
     columns?: RawColumns,
   ): Prisma8Client => {
-    if (sqlite) sqliteExecutors.add(x);
     const schedule: Schedule | undefined =
       queue && !inTransaction ? (work) => enqueue(queue, work) : undefined;
     if (!delegates.has(x)) {
@@ -1721,7 +1759,6 @@ export function fromPrisma8(
               query: (plan) => (lease.check(), raw.query(plan)),
               execute: (plan) => (lease.check(), raw.execute(plan)),
             };
-            if (sqlite) sqliteExecutors.add(tx);
             const work = async () => {
               if (level && !sqlite) {
                 await affected(

@@ -13,7 +13,11 @@ import {
   vi,
 } from "vitest";
 import { createPrismaAICallLogger } from "../../persistence/prisma/ai-logger.js";
-import { fromPrisma8 } from "../../persistence/prisma/from-prisma8.js";
+import {
+  fromPrisma8,
+  rowsOf,
+  Sql,
+} from "../../persistence/prisma/from-prisma8.js";
 import { createPrismaJobQueue } from "../../persistence/prisma/job-queue.js";
 import {
   isSerializationFailure,
@@ -21,6 +25,7 @@ import {
 } from "../../persistence/prisma/sql-errors.js";
 
 const require = createRequire(import.meta.url);
+const { DatabaseSync } = require("node:sqlite");
 const fixtureDir = process.env.PRISMA8_SQLITE_FIXTURE
   ? resolve(process.env.PRISMA8_SQLITE_FIXTURE)
   : join(
@@ -30,7 +35,6 @@ const fixtureDir = process.env.PRISMA8_SQLITE_FIXTURE
 // node:sqlite reads TEXT back cut at a NUL before Node 24.16 and 26.1 (every
 // 22.x), nodejs/node#61954: there the adapter refuses a NUL in any statement.
 const nulCut = (() => {
-  const { DatabaseSync } = require("node:sqlite");
   const probe = new DatabaseSync(":memory:");
   try {
     return probe.prepare("SELECT ? AS v").get("a\0b").v !== "a\0b";
@@ -1263,19 +1267,19 @@ describe.skipIf(process.env.PRISMA_MAJOR !== "8")(
   },
 );
 
-// Its own file: the checks below roll back and read rows, and must not depend on
-// what the tests above left on a shared connection.
+// A file of its own: these tests read the file through a second connection and
+// load a fresh copy of the adapter, so they share nothing with the tests above.
 describe.skipIf(process.env.PRISMA_MAJOR !== "8")(
-  "a NUL in text on Prisma 8 SQLite",
+  "Prisma 8 SQLite on a file of its own",
   () => {
     let dir: string;
+    let file: string;
     let db: any;
     let prisma: any;
     beforeAll(async () => {
-      dir = mkdtempSync(join(tmpdir(), "workflow-prisma8-nul-"));
-      db = await require(join(fixtureDir, "index.cjs")).createSqliteDb(
-        join(dir, "engine.db"),
-      );
+      dir = mkdtempSync(join(tmpdir(), "workflow-prisma8-own-"));
+      file = join(dir, "engine.db");
+      db = await require(join(fixtureDir, "index.cjs")).createSqliteDb(file);
       prisma = fromPrisma8(db);
     }, 30_000);
     afterAll(async () => {
@@ -1287,7 +1291,7 @@ describe.skipIf(process.env.PRISMA_MAJOR !== "8")(
       await prisma.workflowRun.create({ data: run("seed") });
     });
 
-    describe.runIf(nulCut)("where node:sqlite reads it back cut", () => {
+    describe.runIf(nulCut)("a NUL where node:sqlite reads it back cut", () => {
       // The executor a statement runs on differs by entry point; each is listed.
       const clients: Array<[string, (work: (c: any) => unknown) => unknown]> = [
         ["the root client", (work) => work(prisma)],
@@ -1355,5 +1359,106 @@ describe.skipIf(process.env.PRISMA_MAJOR !== "8")(
         expect(await prisma.workflowRun.count()).toBe(10_001);
       },
     );
+
+    // node:sqlite leaves a statement that failed SQLITE_BUSY at its first step
+    // active on the shared root connection; every later root write then reports
+    // success, is not committed and is rolled back when the statement object is
+    // collected. The root takes the write lock first, so the failure leaves nothing.
+    it("commits the root writes that follow a root write that failed BUSY", async () => {
+      const observer = new DatabaseSync(file);
+      observer.exec("PRAGMA busy_timeout = 50");
+      const committed = () =>
+        observer
+          .prepare("SELECT id, priority FROM workflow_runs ORDER BY id")
+          .all()
+          .map((r: any) => `${r.id}:${r.priority}`);
+      const timeout = (ms: number) =>
+        prisma
+          .$withColumns({ timeout: "int" })
+          .$queryRawUnsafe(`PRAGMA busy_timeout = ${ms}`);
+      try {
+        await timeout(1);
+        let error: unknown;
+        await db.transaction(async (tx: any) => {
+          await fromPrisma8(tx, { contract: db.contract }).workflowRun.update({
+            where: { id: "seed" },
+            data: { priority: 8 },
+          });
+          error = await prisma.workflowRun
+            .update({ where: { id: "seed" }, data: { priority: 9 } })
+            .catch((e: unknown) => e);
+        });
+        expect(error).toMatchObject({ transient: true });
+        await timeout(5000);
+
+        await prisma.workflowRun.create({ data: run("created") });
+        await prisma.workflowRun.update({
+          where: { id: "seed" },
+          data: { priority: 3 },
+        });
+        await prisma.workflowRun.upsert({
+          where: { id: "upserted" },
+          create: run("upserted"),
+          update: {},
+        });
+        await prisma
+          .$withColumns({ id: "text" })
+          .$queryRawUnsafe(
+            "UPDATE workflow_runs SET priority = 4 WHERE id = $1 RETURNING id",
+            "created",
+          );
+        await prisma.workflowRun.deleteMany({ where: { id: "upserted" } });
+
+        const expected = ["created:4", "seed:3"];
+        expect(committed()).toEqual(expected);
+        // No write lock is left on the root connection, and the next transaction sees the rows.
+        expect(() => {
+          observer.exec("BEGIN IMMEDIATE");
+          observer.exec("ROLLBACK");
+        }).not.toThrow();
+        expect(
+          (
+            await prisma.$transaction((tx: any) =>
+              tx.workflowRun.findMany({ orderBy: { id: "asc" } }),
+            )
+          ).map((r: any) => `${r.id}:${r.priority}`),
+        ).toEqual(expected);
+      } finally {
+        await timeout(5000);
+        observer.close();
+      }
+    });
+
+    // The driver's own executor was never given to fromPrisma8: what is decided
+    // about SQLite reads must come from the plan, not from which executor runs it.
+    it("reads rows through an executor the adapter never saw", async () => {
+      const integer = (n: string) =>
+        new Sql().t(`SELECT ${n} AS n`) as InstanceType<typeof Sql>;
+      await db.transaction(async (tx: any) => {
+        expect(
+          await rowsOf(tx, integer("7"), { n: "sqlite/integer@1" }),
+        ).toEqual([{ n: 7 }]);
+        // Past 2^53, node:sqlite's iterator throws; the adapter reads it as text instead.
+        expect(
+          await rowsOf(tx, integer("9007199254740993"), {
+            n: "sqlite/bigint@1",
+          }),
+        ).toEqual([{ n: 9007199254740993n }]);
+        // A write that returns rows, on an executor that is already in a transaction.
+        expect(
+          await rowsOf(
+            tx,
+            new Sql().t(
+              "UPDATE workflow_runs SET priority = 6 WHERE id = 'seed' RETURNING priority",
+            ),
+            { priority: "sqlite/integer@1" },
+          ),
+        ).toEqual([{ priority: 6 }]);
+      });
+      expect(
+        (await prisma.workflowRun.findUnique({ where: { id: "seed" } }))
+          ?.priority,
+      ).toBe(6);
+    });
   },
 );
