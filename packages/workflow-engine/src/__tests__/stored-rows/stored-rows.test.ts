@@ -1,6 +1,6 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   captureScenario,
   createReplayRuntime,
@@ -16,6 +16,7 @@ import {
   loadSnapshot,
   readPrismaSchema,
   type StoredRowsSnapshot,
+  snapshotCaptureTime,
   snapshotShape,
 } from "./snapshot.js";
 import { compareSnapshotLabels } from "./snapshot-label.js";
@@ -29,6 +30,11 @@ const isGated =
 const gatedIt = isGated ? it : it.skip;
 const CAPTURE_COMMAND =
   "pnpm --filter @bratsos/workflow-engine run capture:stored-rows";
+const FOUR_HUNDRED_DAYS_MS = 400 * 24 * 60 * 60 * 1_000;
+const replayWallClocks = [
+  { name: "current wall clock", offsetMs: 0 },
+  { name: "wall clock moved 400 days forward", offsetMs: FOUR_HUNDRED_DAYS_MS },
+];
 
 function listSnapshotFiles(directory = snapshotRoot): string[] {
   return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
@@ -100,27 +106,6 @@ function newestBaselineByScenario() {
   return baseline;
 }
 
-function durableWaitDeadlineExpired(
-  snapshot: StoredRowsSnapshot,
-  replayAt: Date,
-): boolean {
-  if (
-    ![
-      "wait-for",
-      "completed-step-checkpoint",
-      "ai-map-poll",
-      "parallel-partial",
-    ].includes(snapshot.metadata.scenario)
-  ) {
-    return false;
-  }
-  return (snapshot.tables.WorkflowStep ?? []).some((step) => {
-    if (step.status === "completed") return false;
-    const deadline = decodeValue(step.deadlineAt);
-    return deadline instanceof Date && deadline.getTime() <= replayAt.getTime();
-  });
-}
-
 async function assertTerminalRows(client: Record<string, any>) {
   const [runs, stages, steps, jobs] = await Promise.all([
     client.workflowRun.findMany({}),
@@ -148,10 +133,89 @@ async function assertTerminalRows(client: Record<string, any>) {
   ).toBe(true);
 }
 
+async function replaySnapshot(
+  client: Record<string, any>,
+  path: string,
+  snapshot: StoredRowsSnapshot,
+  wallClockOffsetMs: number,
+) {
+  const captureTime = snapshotCaptureTime(snapshot);
+  const wallClockBeforeReplay = Date.now();
+  if (wallClockOffsetMs > 0) {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(wallClockBeforeReplay + wallClockOffsetMs);
+  }
+
+  try {
+    await loadSnapshot(client, currentSchema, snapshot);
+    const scenario = createScenario(snapshot.metadata.scenario);
+    const runtime = createReplayRuntime(client, scenario, captureTime);
+    const runId = String(snapshot.tables.WorkflowRun?.[0]?.id ?? "");
+    expect(runId, `${path} does not contain a workflow run`).not.toBe("");
+
+    scenario.release();
+    await scenario.beforeReplay?.(runtime.kernel, runId, runtime.clock);
+    const run = await driveToTerminal(runtime, runId);
+    expect(run.status, path).toBe(
+      snapshot.metadata.expectedFinalOutcome.status,
+    );
+    expect(run.output, path).toEqual(
+      snapshot.metadata.expectedFinalOutcome.output,
+    );
+
+    const capturedSteps = snapshot.tables.WorkflowStep ?? [];
+    for (const completed of capturedSteps.filter(
+      (step) => step.status === "completed" && step.kind === "run",
+    )) {
+      const stage = (snapshot.tables.WorkflowStage ?? []).find(
+        (row) => row.id === completed.stageRecordId,
+      );
+      const key = `${String(stage?.stageId)}:${String(completed.stepId)}`;
+      if (scenario.completedStepBodies.includes(key)) {
+        expect(
+          scenario.stepBodyExecutions[key] ?? 0,
+          `${path} reran ${key}`,
+        ).toBe(0);
+      }
+    }
+    if (snapshot.metadata.scenario === "ai-map-poll") {
+      expect(
+        scenario.fakeBatch.startCount,
+        `${path} resubmitted the batch`,
+      ).toBe(0);
+      expect(
+        scenario.fakeBatch.pollCount,
+        `${path} did not poll the stored batch`,
+      ).toBeGreaterThan(0);
+    }
+
+    await hostTick(runtime);
+    const outbox = snapshot.tables.OutboxEvent ?? [];
+    const sinkEvents = runtime.eventSink.events as unknown as Record<
+      string,
+      unknown
+    >[];
+    for (const row of outbox.filter((event) => event.publishedAt !== null)) {
+      expect(
+        sinkEvents.some((event) => outboxMatches(event, row)),
+        `${path} republished ${row.id}`,
+      ).toBe(false);
+    }
+    for (const row of outbox.filter((event) => event.publishedAt === null)) {
+      expect(
+        sinkEvents.filter((event) => outboxMatches(event, row)),
+        `${path} did not publish ${row.id} exactly once`,
+      ).toHaveLength(1);
+    }
+    await assertTerminalRows(client);
+  } finally {
+    if (wallClockOffsetMs > 0) vi.useRealTimers();
+  }
+}
+
 describe("stored rows from earlier releases", () => {
   let database: Awaited<ReturnType<typeof openCaptureDatabase>> | undefined;
   const snapshots = loadSnapshots();
-  const replayAt = new Date(Date.now() + 10 * 60_000);
 
   beforeAll(async () => {
     if (isGated) {
@@ -168,99 +232,21 @@ describe("stored rows from earlier releases", () => {
   });
 
   for (const { path, snapshot } of snapshots) {
-    const expectedExpiredWait = durableWaitDeadlineExpired(snapshot, replayAt);
-    // DEFECT: expired one-hour durable waits fail before replay can resume the suspended work.
-    const replayTest = !isGated ? it.skip : expectedExpiredWait ? it.fails : it;
-    replayTest(
-      `replays ${snapshot.metadata.release}/${snapshot.metadata.database}/prisma-${snapshot.metadata.prismaMajor}/${snapshot.metadata.scenario}`,
-      async () => {
-        expect(database).toBeDefined();
-        await loadSnapshot(database!.client, currentSchema, snapshot);
-        const scenario = createScenario(snapshot.metadata.scenario);
-        const runtime = createReplayRuntime(
-          database!.client,
-          scenario,
-          replayAt,
-        );
-        const runId = String(snapshot.tables.WorkflowRun?.[0]?.id ?? "");
-        expect(runId, `${path} does not contain a workflow run`).not.toBe("");
-
-        scenario.release();
-        await scenario.beforeReplay?.(runtime.kernel, runId, runtime.clock);
-        const run = await driveToTerminal(runtime, runId);
-        if (expectedExpiredWait) {
-          const stage = await database!.client.workflowStage.findFirst({
-            where: { workflowRunId: runId },
-          });
-          expect(stage?.errorMessage, path).toContain("exceeded its timeout");
-          if (snapshot.metadata.scenario === "ai-map-poll") {
-            expect(scenario.fakeBatch.pollCount, path).toBe(0);
-          }
-          await assertTerminalRows(database!.client);
-        }
-        expect(run.status, path).toBe(
-          snapshot.metadata.expectedFinalOutcome.status,
-        );
-        expect(run.output, path).toEqual(
-          snapshot.metadata.expectedFinalOutcome.output,
-        );
-
-        const capturedSteps = snapshot.tables.WorkflowStep ?? [];
-        for (const completed of capturedSteps.filter(
-          (step) => step.status === "completed" && step.kind === "run",
-        )) {
-          const stage = (snapshot.tables.WorkflowStage ?? []).find(
-            (row) => row.id === completed.stageRecordId,
+    for (const wallClock of replayWallClocks) {
+      gatedIt(
+        `replays ${snapshot.metadata.release}/${snapshot.metadata.database}/prisma-${snapshot.metadata.prismaMajor}/${snapshot.metadata.scenario} with ${wallClock.name}`,
+        async () => {
+          expect(database).toBeDefined();
+          await replaySnapshot(
+            database!.client,
+            path,
+            snapshot,
+            wallClock.offsetMs,
           );
-          const key = `${String(stage?.stageId)}:${String(completed.stepId)}`;
-          if (scenario.completedStepBodies.includes(key)) {
-            expect(
-              scenario.stepBodyExecutions[key] ?? 0,
-              `${path} reran ${key}`,
-            ).toBe(0);
-          }
-        }
-        if (snapshot.metadata.scenario === "ai-map-poll") {
-          expect(
-            scenario.fakeBatch.startCount,
-            `${path} resubmitted the batch`,
-          ).toBe(0);
-          expect(
-            scenario.fakeBatch.pollCount,
-            `${path} did not poll the stored batch`,
-          ).toBeGreaterThan(0);
-        }
-
-        await hostTick(runtime);
-        const outbox = snapshot.tables.OutboxEvent ?? [];
-        const sinkEvents = runtime.eventSink.events as unknown as Record<
-          string,
-          unknown
-        >[];
-        for (const row of outbox.filter(
-          (event) => event.publishedAt !== null,
-        )) {
-          expect(
-            sinkEvents.some((event: Record<string, unknown>) =>
-              outboxMatches(event, row),
-            ),
-            `${path} republished ${row.id}`,
-          ).toBe(false);
-        }
-        for (const row of outbox.filter(
-          (event) => event.publishedAt === null,
-        )) {
-          expect(
-            sinkEvents.filter((event: Record<string, unknown>) =>
-              outboxMatches(event, row),
-            ),
-            `${path} did not publish ${row.id} exactly once`,
-          ).toHaveLength(1);
-        }
-        await assertTerminalRows(database!.client);
-      },
-      5 * 60_000,
-    );
+        },
+        5 * 60_000,
+      );
+    }
   }
 
   gatedIt(

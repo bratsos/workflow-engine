@@ -83,7 +83,10 @@ SQLITE8_KERNEL_SQLITE=1 PRISMA_MAJOR=7 \
 
 Commit the generated JSON files with the change. Do not edit captured rows by
 hand. Historical snapshots must be captured by the release named in their
-metadata; the capture script writes all scenarios supported by its build.
+metadata; new snapshots record their capture time, and older snapshots derive
+it from the newest lifecycle timestamp in their rows. Replays use that time
+for the kernel clock so durable waits are tested at the point they were
+captured.
 
 After a release, create an isolated worktree at the package release tag and
 capture the canonical `<version>` snapshot from that build. Set

@@ -28,6 +28,8 @@ export interface StoredRowsMetadata {
   inFlightPoint: string;
   expectedFinalOutcome: { status: string; output: unknown };
   skippedScenarios: string[];
+  /** Missing only on snapshots captured before capture-time metadata was added. */
+  captureTime?: string;
 }
 
 export interface StoredRowsSnapshot {
@@ -125,6 +127,56 @@ export function decodeValue(value: unknown): unknown {
     );
   }
   return value;
+}
+
+const futureTimestampColumn =
+  /(?:deadline|nextPoll|wake|leaseExpires|lockExpires|retry|scheduled|available)At$/i;
+
+/**
+ * Old snapshots predate metadata.captureTime. Use their latest lifecycle date
+ * column, while excluding deadlines and scheduling dates that point forward.
+ */
+export function snapshotCaptureTime(snapshot: StoredRowsSnapshot): Date {
+  if (snapshot.metadata.captureTime) {
+    const capturedAt = new Date(snapshot.metadata.captureTime);
+    if (Number.isNaN(capturedAt.getTime())) {
+      throw new Error(
+        `Invalid stored-row captureTime: ${snapshot.metadata.captureTime}`,
+      );
+    }
+    return capturedAt;
+  }
+
+  let latest: Date | undefined;
+  for (const rows of Object.values(snapshot.tables)) {
+    for (const row of rows) {
+      for (const [column, encoded] of Object.entries(row)) {
+        if (futureTimestampColumn.test(column)) continue;
+        if (!/(?:At|Time|Timestamp)$/.test(column)) continue;
+        const decoded = decodeValue(encoded);
+        const value =
+          decoded instanceof Date
+            ? decoded
+            : typeof decoded === "string" &&
+                /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z$/.test(decoded)
+              ? new Date(decoded)
+              : undefined;
+        if (
+          value &&
+          !Number.isNaN(value.getTime()) &&
+          (!latest || value.getTime() > latest.getTime())
+        ) {
+          latest = value;
+        }
+      }
+    }
+  }
+  if (!latest) {
+    throw new Error(
+      `Cannot derive capture time for ${snapshot.metadata.release}/${snapshot.metadata.scenario}`,
+    );
+  }
+  return latest;
 }
 
 export async function captureRows(

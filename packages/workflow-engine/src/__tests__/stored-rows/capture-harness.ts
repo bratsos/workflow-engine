@@ -405,6 +405,7 @@ export async function captureScenario(
     inFlightPoint: scenario.inFlightPoint,
     expectedFinalOutcome: scenario.expectedFinalOutcome,
     skippedScenarios: [],
+    captureTime: runtime.clock.now().toISOString(),
   });
 }
 
@@ -444,7 +445,7 @@ export async function driveToTerminal(
 export function createReplayRuntime(
   client: Record<string, any>,
   scenario: ReturnType<typeof createScenario>,
-  clockNow = new Date(Date.now() + 10 * 60_000),
+  clockNow: Date,
 ) {
   return createRuntime(client, scenario, new FakeClock(clockNow));
 }
