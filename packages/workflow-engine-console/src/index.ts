@@ -57,6 +57,7 @@ export {
   type LogEntry,
   MAX_LIMIT,
   type QueueHealth,
+  type RunBoundaryEventType,
   type RunCursor,
   type RunDetail,
   type RunDetailOptions,

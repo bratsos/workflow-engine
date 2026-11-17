@@ -420,7 +420,16 @@ export function createWorkflowConsole(
         if (!(await allowed("run.read", request, runId))) {
           return errorResponse("forbidden", "Not permitted.", 403);
         }
-        const detail = await reader.getRunDetail(runId);
+        const afterRaw = params.get("stageEventsAfter") ?? "0";
+        const after = Number(afterRaw);
+        if (!Number.isFinite(after) || after < 0) {
+          throw new ConsoleBadRequestError(
+            `Invalid stageEventsAfter: "${afterRaw}".`,
+          );
+        }
+        const detail = await reader.getRunDetail(runId, {
+          stageEventsAfter: Math.floor(after),
+        });
         if (detail === null) {
           return errorResponse("not_found", "No such run.", 404);
         }

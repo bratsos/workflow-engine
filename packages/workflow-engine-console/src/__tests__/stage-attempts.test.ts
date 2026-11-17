@@ -4,6 +4,8 @@ import {
   type AttemptStageInput,
   type AttemptStepInput,
   buildStageAttemptHistory,
+  type HeldStageEvents,
+  mergeStageEvents,
 } from "../stage-attempts";
 
 const T0 = Date.parse("2026-03-01T12:00:00.000Z");
@@ -21,6 +23,15 @@ const ev = (
   occurredAt: at(seconds),
   stageId,
   error,
+});
+
+/** A run-level event (`workflow:started`, `workflow:cancelled`): it names no stage. */
+const run = (eventType: string, seconds: number): AttemptEventInput => ({
+  sequence: ++seq,
+  eventType,
+  occurredAt: at(seconds),
+  stageId: null,
+  error: null,
 });
 
 const stage = (
@@ -392,5 +403,170 @@ describe("I want a stage's history grouped by attempt, and never grouped wrongly
       ["b-late"],
     ]);
     expect(a.flatMap((x) => x.events).every((e) => e.sequence > 0)).toBe(true);
+  });
+
+  it("closes an open attempt as cancelled at workflow:cancelled and makes the next start a rerun", () => {
+    seq = 0;
+    const events = [
+      run("workflow:started", 0),
+      ev("a", "stage:started", 1),
+      ev("a", "stage:suspended", 2),
+      ev("b", "stage:started", 1),
+      ev("b", "stage:completed", 3),
+      run("workflow:cancelled", 10),
+      run("workflow:started", 20),
+      ev("a", "stage:started", 21),
+      ev("a", "stage:completed", 30),
+    ];
+    const result = history(
+      [stage("a", "COMPLETED", 1), stage("b", "COMPLETED")],
+      events,
+      [],
+      { redriveCount: 1 },
+    );
+
+    const a = available(result, "a").attempts;
+    expect(a.map((x) => [x.trigger, x.outcome, x.endedAt])).toEqual([
+      ["initial", "cancelled", at(10).toISOString()],
+      ["rerun", "completed", at(30).toISOString()],
+    ]);
+    expect(a[0]!.events.map((e) => e.eventType)).toEqual([
+      "stage:started",
+      "stage:suspended",
+      "workflow:cancelled",
+    ]);
+    // A stage that had finished before the cancel keeps its one attempt.
+    expect(available(result, "b").attempts.map((x) => x.outcome)).toEqual([
+      "completed",
+    ]);
+  });
+
+  it("explains a CANCELLED row whose last attempt closed before the cancel only by a redrive in between", () => {
+    seq = 0;
+    const failedThenRedriven = [
+      ev("a", "stage:started", 0),
+      ev("a", "stage:failed", 5, "boom"),
+      run("workflow:started", 10),
+      run("workflow:cancelled", 11),
+    ];
+    const redriveCount = { redriveCount: 1 };
+    expect(
+      available(
+        history(
+          [stage("a", "CANCELLED", 1)],
+          failedThenRedriven,
+          [],
+          redriveCount,
+        ),
+        "a",
+      ).attempts.map((x) => x.outcome),
+    ).toEqual(["failed"]);
+    // The cancel alone cannot cancel a stage that already failed.
+    seq = 0;
+    expect(
+      history(
+        [stage("a", "CANCELLED")],
+        [
+          ev("a", "stage:started", 0),
+          ev("a", "stage:failed", 5, "boom"),
+          run("workflow:cancelled", 11),
+        ],
+      ).get("rec-a"),
+    ).toMatchObject({ available: false, reason: "inconsistent" });
+  });
+
+  it("does not guess when nothing proves where an execution ended", () => {
+    const reason = (events: AttemptEventInput[], status = "COMPLETED") => {
+      const entry = history([stage("a", status, 1)], events, [], {
+        redriveCount: 1,
+      }).get("rec-a")!;
+      return entry.available ? "available" : entry.reason;
+    };
+    // Started again with no stage event or cancel between: a worker crash
+    // and re-delivery, a reaped lease, or a purged event.
+    seq = 0;
+    expect(
+      reason([
+        ev("a", "stage:started", 0),
+        ev("a", "stage:started", 10),
+        ev("a", "stage:completed", 20),
+      ]),
+    ).toBe("unproven-boundary");
+    // The run restarted while an attempt was still open: its end is missing.
+    seq = 0;
+    expect(
+      reason([
+        ev("a", "stage:started", 0),
+        run("workflow:started", 10),
+        ev("a", "stage:completed", 20),
+      ]),
+    ).toBe("unproven-boundary");
+    // The same stage started again in a poll-retry attempt is no exception.
+    seq = 0;
+    expect(
+      reason([
+        ev("a", "stage:started", 0),
+        ev("a", "stage:suspended", 5),
+        ev("a", "stage:retrying", 8, "x"),
+        ev("a", "stage:started", 10),
+        ev("a", "stage:completed", 20),
+      ]),
+    ).toBe("unproven-boundary");
+  });
+
+  it("carries the reader's cut flag from a closing event to its attempt", () => {
+    seq = 0;
+    const events = [
+      ev("a", "stage:started", 0),
+      { ...ev("a", "stage:failed", 5, "long error"), errorTruncated: true },
+    ];
+    const attempt = available(history([stage("a", "FAILED")], events), "a")
+      .attempts[0]!;
+    expect(attempt).toMatchObject({
+      error: "long error",
+      errorTruncated: true,
+    });
+    expect(attempt.events.map((e) => e.errorTruncated)).toEqual([false, true]);
+  });
+});
+
+describe("I want the page to keep the events it has read and fold each poll into them", () => {
+  const e = (sequence: number) =>
+    ({
+      sequence,
+      eventType: "stage:started",
+      occurredAt: at(sequence),
+      stageId: "a",
+      error: null,
+    }) satisfies AttemptEventInput;
+  const page = (after: number, last: number, complete = true) => ({
+    events: Array.from({ length: last - after }, (_, i) => e(after + i + 1)),
+    after,
+    lastSequence: last,
+    complete,
+  });
+
+  it("holds a first read, appends each poll's rows once, and ignores a read that is not newer", () => {
+    const first = mergeStageEvents(null, page(0, 3));
+    expect(first).toMatchObject({ lastSequence: 3, complete: true });
+    const second = mergeStageEvents(first, page(3, 5));
+    expect(second.events.map((x) => x.sequence)).toEqual([1, 2, 3, 4, 5]);
+    // A response that arrives late changes nothing.
+    expect(mergeStageEvents(second, page(3, 4))).toBe(second);
+    // A reader that ignores `after` and returns everything adds each event once.
+    const full = mergeStageEvents(second, page(0, 6));
+    expect(full.events.map((x) => x.sequence)).toEqual([1, 2, 3, 4, 5, 6]);
+  });
+
+  it("stays incomplete once a read was incomplete, and when a read cannot vouch for the rows before it", () => {
+    const first = mergeStageEvents(null, page(0, 3));
+    const broken = mergeStageEvents(first, page(3, 5, false));
+    expect(broken.complete).toBe(false);
+    expect(mergeStageEvents(broken, page(5, 6)).complete).toBe(false);
+    // Nothing held and the read starts past the beginning.
+    expect(mergeStageEvents(null, page(2, 4)).complete).toBe(false);
+    // A read that starts past what is held leaves a gap.
+    const held: HeldStageEvents = mergeStageEvents(null, page(0, 3));
+    expect(mergeStageEvents(held, page(4, 6)).complete).toBe(false);
   });
 });

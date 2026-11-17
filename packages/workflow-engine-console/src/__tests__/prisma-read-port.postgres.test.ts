@@ -29,6 +29,7 @@ import {
   createPrismaConsoleReadPort,
 } from "../prisma-read-port";
 import { createPostgresClient } from "./postgres-client";
+import { type RecordedStatement, recordingClient } from "./recording-client";
 
 const DATABASE_URL = process.env.DATABASE_URL;
 
@@ -381,7 +382,7 @@ if (!DATABASE_URL) {
       expect(await reader().getRunDetail("nope")).toBeNull();
     });
 
-    it("reads a run's stage lifecycle events with their stage and error, and reports a purged or broken history as incomplete", async () => {
+    it("reads the attempt history's events of a run past a sequence, with only their stage and error, and reports a purged or broken range as incomplete", async () => {
       await prisma.workflowRun.createMany({
         data: [
           mkRun("run-retried", at(-9_000), "COMPLETED", "wf-d"),
@@ -389,10 +390,15 @@ if (!DATABASE_URL) {
           mkRun("run-gap", at(-9_002), "COMPLETED", "wf-d"),
         ],
       });
+      // Every payload carries fields the console must never read.
       const events = (
         [
-          ["workflow:created", {}],
-          ["stage:started", { stageId: "fetch" }],
+          ["workflow:created", { input: { secret: "do-not-read" } }],
+          ["workflow:started", { secret: "do-not-read" }],
+          [
+            "stage:started",
+            { stageId: "fetch", input: { secret: "do-not-read" } },
+          ],
           ["stage:progress", { stageId: "fetch", progress: 0.5 }],
           [
             "stage:retrying",
@@ -401,10 +407,19 @@ if (!DATABASE_URL) {
               attempt: 1,
               maxAttempts: 3,
               error: `upstream 503: can't "connect"`,
+              output: { secret: "do-not-read" },
             },
           ],
           ["stage:started", { stageId: "fetch" }],
-          ["stage:completed", { stageId: "fetch", duration: 5 }],
+          [
+            "stage:completed",
+            {
+              stageId: "fetch",
+              duration: 5,
+              output: { secret: "do-not-read" },
+            },
+          ],
+          ["workflow:cancelled", { reason: "do-not-read" }],
           ["workflow:completed", { output: { secret: "do-not-read" } }],
         ] as Array<[string, object]>
       ).map(([type, payload], index) => ({
@@ -439,30 +454,244 @@ if (!DATABASE_URL) {
         ],
       });
 
+      const event = (
+        sequence: number,
+        eventType: string,
+        stageId: string | null,
+        error: string | null = null,
+      ) => ({
+        sequence,
+        eventType,
+        occurredAt: at(429 + sequence),
+        stageId,
+        error,
+        errorTruncated: false,
+      });
+      const all = [
+        event(2, "workflow:started", null),
+        event(3, "stage:started", "fetch"),
+        event(5, "stage:retrying", "fetch", `upstream 503: can't "connect"`),
+        event(6, "stage:started", "fetch"),
+        event(7, "stage:completed", "fetch"),
+        event(8, "workflow:cancelled", null),
+      ];
       const retried = (await reader().getRunDetail("run-retried"))!;
       expect(retried.stageEvents).toEqual({
+        events: all,
+        after: 0,
+        lastSequence: 9,
         complete: true,
-        events: [
-          [2, "stage:started", 431, null],
-          [4, "stage:retrying", 433, `upstream 503: can't "connect"`],
-          [5, "stage:started", 434, null],
-          [6, "stage:completed", 435, null],
-        ].map(([sequence, eventType, minutes, error]) => ({
-          sequence,
-          eventType,
-          occurredAt: at(minutes as number),
-          stageId: "fetch",
-          error,
-        })),
       });
-      expect(retried.events).toHaveLength(7);
+      expect(retried.events).toHaveLength(9);
       expect(JSON.stringify(retried)).not.toContain("do-not-read");
+
+      expect(
+        (await reader().getRunDetail("run-retried", { stageEventsAfter: 5 }))
+          ?.stageEvents,
+      ).toEqual({
+        events: all.slice(3),
+        after: 5,
+        lastSequence: 9,
+        complete: true,
+      });
+      expect(
+        (await reader().getRunDetail("run-retried", { stageEventsAfter: 9 }))
+          ?.stageEvents,
+      ).toEqual({ events: [], after: 9, lastSequence: 9, complete: true });
+
       expect(
         (await reader().getRunDetail("run-purged"))?.stageEvents?.complete,
       ).toBe(false);
       expect(
+        (await reader().getRunDetail("run-purged", { stageEventsAfter: 2 }))
+          ?.stageEvents,
+      ).toMatchObject({ lastSequence: 4, complete: true });
+      expect(
         (await reader().getRunDetail("run-gap"))?.stageEvents?.complete,
       ).toBe(false);
+      expect(
+        (await reader().getRunDetail("run-gap", { stageEventsAfter: 2 }))
+          ?.stageEvents,
+      ).toMatchObject({ lastSequence: 4, complete: false });
+    });
+
+    it("cuts a lifecycle event's error text in SQL and says it was cut", async () => {
+      await prisma.workflowRun.createMany({
+        data: [mkRun("run-long-error", at(-9_003), "FAILED", "wf-d")],
+      });
+      await prisma.outboxEvent.createMany({
+        data: [
+          ["stage:started", { stageId: "fetch" }],
+          ["stage:retrying", { stageId: "fetch", error: "y".repeat(2000) }],
+          [
+            "stage:failed",
+            { stageId: "fetch", error: "\u{1F600}".repeat(2500) },
+          ],
+        ].map(([type, payload], index) => ({
+          ...mkEvent(
+            `long-${index + 1}`,
+            "run-long-error",
+            index + 1,
+            type as string,
+            at(470 + index),
+            at(480),
+            null,
+          ),
+          payload: payload as object,
+        })),
+      });
+      const { events } = (await reader().getRunDetail("run-long-error"))!
+        .stageEvents!;
+      expect(events[1]).toMatchObject({ errorTruncated: false });
+      expect(events[1]?.error).toHaveLength(2000);
+      expect(events[2]).toMatchObject({ errorTruncated: true });
+      expect(events[2]?.error).toBe("\u{1F600}".repeat(2000));
+
+      // The database cut it: no row left it longer than the limit plus the one
+      // character that tells the read it was cut.
+      const calls: RecordedStatement[] = [];
+      await createPrismaConsoleReadPort(recordingClient(client, calls), {
+        now: () => at(100),
+      }).getRunDetail("run-long-error");
+      const lifecycle = calls.find((call) =>
+        call.sql.includes('"eventType" IN'),
+      );
+      const errors = (lifecycle!.rows as Array<{ error: string | null }>)
+        .map((row) => row.error)
+        .filter((error): error is string => error !== null);
+      expect(errors).toHaveLength(2);
+      expect(Math.max(...errors.map((error) => [...error].length))).toBe(2001);
+    });
+
+    it("reports a run with more lifecycle events than the read's limit as incomplete", async () => {
+      await prisma.workflowRun.createMany({
+        data: [mkRun("run-many", at(-9_004), "RUNNING", "wf-d")],
+      });
+      await prisma.$executeRawUnsafe(
+        `INSERT INTO outbox_events (id, "workflowRunId", sequence, "eventType", payload, "causationId", "occurredAt")
+SELECT 'many-' || g, 'run-many', g, 'stage:started', jsonb_build_object('stageId', 's' || g), 'c', now()
+FROM generate_series(1, 2001) g`,
+      );
+      const log = (await reader().getRunDetail("run-many"))!.stageEvents!;
+      expect(log.events).toHaveLength(2000);
+      expect(log).toMatchObject({ lastSequence: 2001, complete: false });
+    });
+
+    it("does not skip a row committed between its two statements", async () => {
+      await prisma.workflowRun.createMany({
+        data: [mkRun("run-race", at(-9_005), "RUNNING", "wf-d")],
+      });
+      const row = (sequence: number) => ({
+        ...mkEvent(
+          `race-${sequence}`,
+          "run-race",
+          sequence,
+          "stage:started",
+          at(480),
+          null,
+          null,
+        ),
+        payload: { stageId: "fetch" },
+      });
+      await prisma.outboxEvent.createMany({ data: [row(1), row(2)] });
+      let injected = false;
+      const raced = await createPrismaConsoleReadPort(
+        recordingClient(client, [], async (call) => {
+          // A writer commits sequence 3 after the read has counted the range.
+          if (!injected && call.sql.includes("max(sequence)")) {
+            injected = true;
+            await prisma.outboxEvent.createMany({ data: [row(3)] });
+          }
+        }),
+        { now: () => at(100) },
+      ).getRunDetail("run-race");
+      expect(injected).toBe(true);
+      expect(raced?.stageEvents).toMatchObject({
+        lastSequence: 2,
+        complete: true,
+      });
+      expect(raced?.stageEvents?.events.map((e) => e.sequence)).toEqual([1, 2]);
+      // The page's next read starts after 2 and finds it.
+      const next = await reader().getRunDetail("run-race", {
+        stageEventsAfter: 2,
+      });
+      expect(next?.stageEvents?.events.map((e) => e.sequence)).toEqual([3]);
+    });
+
+    it("reads only the new rows of a run on a poll: the plan's cost does not grow with the run's outbox", async () => {
+      const calls: RecordedStatement[] = [];
+      // `$n` -> a literal, so EXPLAIN plans the statement with the values it ran with.
+      const inline = (sql: string, params: unknown[]) =>
+        sql.replace(/\$(\d+)/g, (_m, n) => {
+          const value = params[Number(n) - 1];
+          return typeof value === "number"
+            ? String(value)
+            : `'${String(value).replace(/'/g, "''")}'`;
+        });
+      const planOf = async (sql: string, params: unknown[]) => {
+        const rows = await rawRead(client, {
+          "QUERY PLAN": "json",
+        }).$queryRawUnsafe<Array<{ "QUERY PLAN": unknown }>>(
+          `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${inline(sql, params)}`,
+        );
+        const plan = rows[0]!["QUERY PLAN"];
+        return (typeof plan === "string" ? JSON.parse(plan) : plan)[0].Plan;
+      };
+      // Buffers and node types of every outbox statement one read issues.
+      const measure = async (runId: string, after?: number) => {
+        calls.length = 0;
+        await createPrismaConsoleReadPort(recordingClient(client, calls), {
+          now: () => at(100),
+        }).getRunDetail(
+          runId,
+          after === undefined ? {} : { stageEventsAfter: after },
+        );
+        const outbox = calls.filter((c) => c.sql.includes('"outbox_events"'));
+        let buffers = 0;
+        const nodes: string[] = [];
+        for (const { sql, params } of outbox) {
+          const plan = await planOf(sql, params);
+          buffers += plan["Shared Hit Blocks"] + plan["Shared Read Blocks"];
+          nodes.push(JSON.stringify(plan));
+        }
+        return { statements: outbox.length, buffers, nodes };
+      };
+
+      const sizes = [1_000, 30_000];
+      for (const rows of sizes) {
+        const runId = `run-plan-${rows}`;
+        await prisma.workflowRun.createMany({
+          data: [mkRun(runId, at(-9_100 - rows), "RUNNING", "wf-d")],
+        });
+        await prisma.$executeRawUnsafe(
+          `INSERT INTO outbox_events (id, "workflowRunId", sequence, "eventType", payload, "causationId", "occurredAt")
+SELECT 'plan-${rows}-' || g, '${runId}', g,
+       CASE WHEN g % 500 = 1 THEN 'stage:started' ELSE 'stage:progress' END,
+       jsonb_build_object('stageId', 'fetch'), 'c', now()
+FROM generate_series(1, ${rows}) g`,
+        );
+      }
+      await prisma.$executeRawUnsafe(`ANALYZE "outbox_events"`);
+
+      const poll = [];
+      for (const rows of sizes) {
+        poll.push(await measure(`run-plan-${rows}`, rows - 10));
+      }
+      const first = await measure("run-plan-30000");
+
+      // Ten new rows: the same statements, the same few pages, at 1,000 and
+      // at 30,000 rows (one more index level at most).
+      expect(poll[0]!.statements).toBe(poll[1]!.statements);
+      expect(poll[1]!.buffers).toBeLessThanOrEqual(poll[0]!.buffers + 6);
+      expect(poll[1]!.buffers).toBeLessThan(60);
+      for (const node of poll[1]!.nodes) {
+        expect(node).not.toContain("Seq Scan");
+      }
+      expect(poll[1]!.nodes.join("")).toContain(
+        "outbox_events_workflowRunId_sequence_key",
+      );
+      // A first read goes through the run once; that is what the poll avoids.
+      expect(first.buffers).toBeGreaterThan(poll[1]!.buffers * 10);
     });
 
     it("selects the step columns the UI needs to offer a signal", async () => {

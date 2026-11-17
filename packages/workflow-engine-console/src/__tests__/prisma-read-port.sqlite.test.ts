@@ -8,6 +8,7 @@ import {
   type ConsolePrismaClient,
   createPrismaConsoleReadPort,
 } from "../prisma-read-port";
+import { type RecordedStatement, recordingClient } from "./recording-client";
 
 const major = process.env.PRISMA_MAJOR ?? "7";
 const isPrisma8 = major === "8";
@@ -67,6 +68,7 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
         mkRun("run-retried", at(-9_000), "COMPLETED", "wf-d", 0, 0),
         mkRun("run-purged", at(-9_001), "COMPLETED", "wf-d", 0, 0),
         mkRun("run-gap", at(-9_002), "COMPLETED", "wf-d", 0, 0),
+        mkRun("run-long-error", at(-9_003), "FAILED", "wf-d", 0, 0),
       ],
     });
     await prisma.workflowStage.createMany({
@@ -163,9 +165,14 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
         ),
         // A stage that retried once, with the progress and run events a real
         // run interleaves, and an output that must never leave the table.
+        // Every payload carries fields the console must never read.
         ...[
-          ["workflow:created", {}],
-          ["stage:started", { stageId: "fetch" }],
+          ["workflow:created", { input: { secret: "do-not-read" } }],
+          ["workflow:started", { secret: "do-not-read" }],
+          [
+            "stage:started",
+            { stageId: "fetch", input: { secret: "do-not-read" } },
+          ],
           ["stage:progress", { stageId: "fetch", progress: 0.5 }],
           [
             "stage:retrying",
@@ -174,10 +181,19 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
               attempt: 1,
               maxAttempts: 3,
               error: `upstream 503: can't "connect"`,
+              output: { secret: "do-not-read" },
             },
           ],
           ["stage:started", { stageId: "fetch" }],
-          ["stage:completed", { stageId: "fetch", duration: 5 }],
+          [
+            "stage:completed",
+            {
+              stageId: "fetch",
+              duration: 5,
+              output: { secret: "do-not-read" },
+            },
+          ],
+          ["workflow:cancelled", { reason: "do-not-read" }],
           ["workflow:completed", { output: { secret: "do-not-read" } }],
         ].map(([type, payload], index) =>
           mkEvent(
@@ -187,6 +203,27 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
             type as string,
             at(430 + index),
             at(440),
+            null,
+            { type, ...(payload as object) },
+          ),
+        ),
+        // Error texts past the cap, one of 4-byte characters, one exactly at it.
+        ...[
+          ["stage:started", { stageId: "fetch" }, 1],
+          ["stage:retrying", { stageId: "fetch", error: "y".repeat(2000) }, 2],
+          [
+            "stage:failed",
+            { stageId: "fetch", error: "\u{1F600}".repeat(2500) },
+            3,
+          ],
+        ].map(([type, payload, sequence]) =>
+          mkEvent(
+            `long-${sequence}`,
+            "run-long-error",
+            sequence as number,
+            type as string,
+            at(470 + (sequence as number)),
+            at(480),
             null,
             { type, ...(payload as object) },
           ),
@@ -347,66 +384,154 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
     expect(events[0]?.occurredAt.toISOString()).toBe(at(2).toISOString());
   });
 
-  it("reads a run's stage lifecycle events with their stage and error, and reports a purged or broken history as incomplete", async () => {
+  it("reads the attempt history's events of a run past a sequence, with only their stage and error, and reports a purged or broken range as incomplete", async () => {
     const port = reader();
     const retried = (await port.getRunDetail("run-retried"))!;
+    const event = (
+      sequence: number,
+      eventType: string,
+      stageId: string | null,
+      error: string | null = null,
+    ) => ({
+      sequence,
+      eventType,
+      occurredAt: at(429 + sequence),
+      stageId,
+      error,
+      errorTruncated: false,
+    });
+    const all = [
+      event(2, "workflow:started", null),
+      event(3, "stage:started", "fetch"),
+      event(5, "stage:retrying", "fetch", `upstream 503: can't "connect"`),
+      event(6, "stage:started", "fetch"),
+      event(7, "stage:completed", "fetch"),
+      event(8, "workflow:cancelled", null),
+    ];
     expect(retried.stageEvents).toEqual({
+      events: all,
+      after: 0,
+      lastSequence: 9,
       complete: true,
-      events: [
-        {
-          sequence: 2,
-          eventType: "stage:started",
-          occurredAt: at(431),
-          stageId: "fetch",
-          error: null,
-        },
-        {
-          sequence: 4,
-          eventType: "stage:retrying",
-          occurredAt: at(433),
-          stageId: "fetch",
-          error: `upstream 503: can't "connect"`,
-        },
-        {
-          sequence: 5,
-          eventType: "stage:started",
-          occurredAt: at(434),
-          stageId: "fetch",
-          error: null,
-        },
-        {
-          sequence: 6,
-          eventType: "stage:completed",
-          occurredAt: at(435),
-          stageId: "fetch",
-          error: null,
-        },
-      ],
     });
     // The plain event list still carries every row, payload-free.
-    expect(retried.events).toHaveLength(7);
+    expect(retried.events).toHaveLength(9);
     expect(JSON.stringify(retried)).not.toContain("do-not-read");
 
+    // A poll reads the rows after the page's last sequence, and nothing it already holds.
+    expect(
+      (await port.getRunDetail("run-retried", { stageEventsAfter: 5 }))
+        ?.stageEvents,
+    ).toEqual({
+      events: all.slice(3),
+      after: 5,
+      lastSequence: 9,
+      complete: true,
+    });
+    expect(
+      (await port.getRunDetail("run-retried", { stageEventsAfter: 9 }))
+        ?.stageEvents,
+    ).toEqual({ events: [], after: 9, lastSequence: 9, complete: true });
+
+    // Rows 1-2 are purged: the range from 0 is broken, the range after them is not.
     expect((await port.getRunDetail("run-purged"))?.stageEvents).toMatchObject({
       complete: false,
     });
+    expect(
+      (await port.getRunDetail("run-purged", { stageEventsAfter: 2 }))
+        ?.stageEvents,
+    ).toMatchObject({ lastSequence: 4, complete: true });
     expect((await port.getRunDetail("run-gap"))?.stageEvents).toMatchObject({
       complete: false,
     });
-    // A run with no retained events at all cannot be called complete.
+    expect(
+      (await port.getRunDetail("run-gap", { stageEventsAfter: 2 }))
+        ?.stageEvents,
+    ).toMatchObject({ lastSequence: 4, complete: false });
+    // A run with no rows has an empty, unbroken range.
     expect((await port.getRunDetail("run-pending"))?.stageEvents).toEqual({
       events: [],
-      complete: false,
+      after: 0,
+      lastSequence: 0,
+      complete: true,
     });
 
     const response = await createWorkflowConsole({
       reader: port,
       authorize: () => true,
-    })(new Request("https://console.example/console/api/runs/run-retried"));
+    })(
+      new Request(
+        "https://console.example/console/api/runs/run-retried?stageEventsAfter=5",
+      ),
+    );
     const body = (await response.json()) as {
-      stageEvents: { events: Array<{ occurredAt: string }> };
+      stageEvents: { after: number; events: Array<{ occurredAt: string }> };
     };
-    expect(body.stageEvents.events[0]?.occurredAt).toBe(at(431).toISOString());
+    expect(body.stageEvents.after).toBe(5);
+    expect(body.stageEvents.events[0]?.occurredAt).toBe(at(435).toISOString());
+    const bad = await createWorkflowConsole({
+      reader: port,
+      authorize: () => true,
+    })(
+      new Request(
+        "https://console.example/console/api/runs/run-retried?stageEventsAfter=-1",
+      ),
+    );
+    expect(bad.status).toBe(400);
+  });
+
+  it("reports a run with more lifecycle events than the read's limit as incomplete", async () => {
+    await prisma.workflowRun.createMany({
+      data: [mkRun("run-many", at(-9_004), "RUNNING", "wf-d", 0, 0)],
+    });
+    await prisma.outboxEvent.createMany({
+      data: Array.from({ length: 2001 }, (_, i) =>
+        mkEvent(
+          `many-${i + 1}`,
+          "run-many",
+          i + 1,
+          "stage:started",
+          at(490),
+          null,
+          null,
+          { stageId: `s${i + 1}` },
+        ),
+      ),
+    });
+    const log = (await reader().getRunDetail("run-many"))!.stageEvents!;
+    expect(log.events).toHaveLength(2000);
+    expect(log).toMatchObject({ lastSequence: 2001, complete: false });
+  });
+
+  it("cuts a lifecycle event's error text in SQL and says it was cut", async () => {
+    const { events } = (await reader().getRunDetail("run-long-error"))!
+      .stageEvents!;
+    const [, atLimit, past] = events;
+    expect(atLimit).toMatchObject({
+      eventType: "stage:retrying",
+      errorTruncated: false,
+    });
+    expect(atLimit?.error).toHaveLength(2000);
+    expect(past).toMatchObject({
+      eventType: "stage:failed",
+      errorTruncated: true,
+    });
+    // Cut on whole characters, not in the middle of a surrogate pair.
+    expect([...past!.error!]).toHaveLength(2000);
+    expect(past!.error).toBe("\u{1F600}".repeat(2000));
+
+    // The database cut it: no row left it longer than the limit plus the one
+    // character that tells the read it was cut.
+    const calls: RecordedStatement[] = [];
+    await createPrismaConsoleReadPort(recordingClient(prisma, calls), {
+      databaseType: "sqlite",
+    }).getRunDetail("run-long-error");
+    const lifecycle = calls.find((call) => call.sql.includes('"eventType" IN'));
+    const errors = (lifecycle!.rows as Array<{ error: string | null }>)
+      .map((row) => row.error)
+      .filter((error): error is string => error !== null);
+    expect(errors).toHaveLength(2);
+    expect(Math.max(...errors.map((error) => [...error].length))).toBe(2001);
   });
 
   it("reports queue health, suspended stages, dead letters, and workers", async () => {

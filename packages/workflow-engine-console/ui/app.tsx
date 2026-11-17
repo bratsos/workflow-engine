@@ -6,6 +6,8 @@ import {
   type AttemptTrigger,
   type AttemptUnavailableReason,
   buildStageAttemptHistory,
+  type HeldStageEvents,
+  mergeStageEvents,
   type StageAttempt,
   type StageAttemptHistory,
 } from "../src/stage-attempts";
@@ -137,9 +139,12 @@ interface RunDetail {
       sequence: number;
       eventType: string;
       occurredAt: string;
-      stageId: string;
+      stageId: string | null;
       error: string | null;
+      errorTruncated: boolean;
     }>;
+    after: number;
+    lastSequence: number;
     complete: boolean;
   };
   truncated: {
@@ -882,6 +887,9 @@ function StepRow({
   );
 }
 
+/** The reader's cap on a lifecycle event's error text (`STAGE_EVENT_ERROR_LIMIT`). */
+const ERROR_CUT = "2,000";
+
 const OUTCOME_LABEL: Record<AttemptOutcome, string> = {
   completed: "Completed",
   failed: "Failed",
@@ -904,6 +912,8 @@ const UNAVAILABLE_LABEL: Record<AttemptUnavailableReason, string> = {
     "the run's events are incomplete (purged, past retention, or cut off by a read limit)",
   "no-stage-events": "no lifecycle events of this stage are retained",
   "history-gap": "the retained events of this stage are missing a link",
+  "unproven-boundary":
+    "an execution of this stage started again and no event ends the one before it (a worker crash and re-delivery, a reaped lease, or a purged event)",
   inconsistent: "the retained events do not agree with the stage's current record",
 };
 
@@ -977,6 +987,9 @@ function AttemptItem({
           {attempt.error && (
             <p class="attempt-error">
               <strong>Error:</strong> {attempt.error}
+              {attempt.errorTruncated && (
+                <span class="attempt-cut"> … (the error text was cut at {ERROR_CUT} characters)</span>
+              )}
             </p>
           )}
           <h5 class="attempt-subtitle">Events</h5>
@@ -1101,8 +1114,23 @@ function RunDetailView({
   const [actionError, setActionError] = useState<ApiError | Error | null>(null);
   const [dismissedError, setDismissedError] = useState<Error | null>(null);
 
+  // The stage events read so far. A poll asks only for the rows written after
+  // the last one, so its cost does not grow with the run's event count.
+  const heldEvents = useRef<{ runId: string; held: HeldStageEvents | null }>({
+    runId,
+    held: null,
+  });
+
   const fetchDetail = useCallback(async () => {
-    return await api<RunDetail>(config, `/runs/${encodeURIComponent(runId)}`);
+    const before = heldEvents.current.runId === runId ? heldEvents.current.held : null;
+    const query = before ? `?stageEventsAfter=${before.lastSequence}` : "";
+    const detail = await api<RunDetail>(config, `/runs/${encodeURIComponent(runId)}${query}`);
+    // Merged against what is held now, not at the request: a slow earlier
+    // response must not overwrite a newer one.
+    const current = heldEvents.current.runId === runId ? heldEvents.current.held : null;
+    const held = detail.stageEvents ? mergeStageEvents(current, detail.stageEvents) : null;
+    heldEvents.current = { runId, held };
+    return { ...detail, stageLog: held ? { events: held.events, complete: held.complete } : undefined };
   }, [config, runId]);
 
   const { data, error, refresh } = usePolled(
@@ -1233,7 +1261,7 @@ function RunDetailView({
             redriveCount: data.run.redriveCount,
             stages: data.stages,
             steps: data.steps,
-            stageEvents: data.stageEvents,
+            stageEvents: data.stageLog,
           })
         : new Map<string, StageAttemptHistory>(),
     [data],

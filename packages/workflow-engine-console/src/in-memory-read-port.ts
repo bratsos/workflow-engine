@@ -9,6 +9,7 @@ import {
   type CostBucket,
   type CostQuery,
   clampLimit,
+  cutStageEventError,
   type DeadLetter,
   decodeCursor,
   encodeCursor,
@@ -20,7 +21,9 @@ import {
   type RunListPage,
   type RunListQuery,
   type RunSummary,
+  STAGE_EVENT_LIMIT,
   type StageEvent,
+  type StageEventLog,
   type StageSummary,
   type StepSummary,
   type SuspendedStage,
@@ -45,11 +48,14 @@ export interface ConsoleFixtures {
   logs?: LogEntry[];
   events?: RunEvent[];
   /**
-   * Stage lifecycle events with their payload-derived fields. A run's history
-   * is complete when the sequences of these and of `events` together form one
-   * unbroken range from 1, the same rule the SQL reader applies to the outbox.
+   * Stage lifecycle and run boundary events with their payload-derived fields.
+   * The rows of a run are the sequences of these and of `events` together; a
+   * read is complete when the rows past its `after` form one unbroken range,
+   * the same rule the SQL reader applies to the outbox.
    */
-  stageEvents?: Array<StageEvent & { workflowRunId: string }>;
+  stageEvents?: Array<
+    Omit<StageEvent, "errorTruncated"> & { workflowRunId: string }
+  >;
   /** job_queue rows, reduced to what the console reads off them. */
   jobs?: Array<{
     id: string;
@@ -257,21 +263,11 @@ export class InMemoryConsoleReadPort implements ConsoleReadPort {
       .slice()
       .sort((a, b) => a.sequence - b.sequence);
 
-    const runStageEvents = this.fixtures.stageEvents
-      .filter((evt) => evt.workflowRunId === runId)
-      .slice()
-      .sort((a, b) => a.sequence - b.sequence);
-    const sequences = [
-      ...new Set([
-        ...matchingEvents.map((evt) => evt.sequence),
-        ...runStageEvents.map((evt) => evt.sequence),
-      ]),
-    ].sort((a, b) => a - b);
-    const stageEvents = {
-      events: runStageEvents.map(({ workflowRunId: _runId, ...evt }) => evt),
-      complete:
-        sequences.length > 0 && sequences.every((seq, i) => seq === i + 1),
-    };
+    const stageEvents = this.stageEventLog(
+      runId,
+      matchingEvents.map((evt) => evt.sequence),
+      Math.max(0, Math.floor(options?.stageEventsAfter ?? 0)),
+    );
 
     const steps = matchingSteps.slice(0, stepLimit);
     const annotations = matchingAnnotations.slice(0, annotationLimit);
@@ -302,6 +298,46 @@ export class InMemoryConsoleReadPort implements ConsoleReadPort {
       events,
       stageEvents,
       truncated,
+    };
+  }
+
+  /**
+   * The same contract as the SQL reader: the events past `after`, the
+   * highest sequence of the run's rows, and whether that range is unbroken
+   * and within `STAGE_EVENT_LIMIT`. The rows of a run are the sequences of
+   * `events` and `stageEvents` together.
+   */
+  private stageEventLog(
+    runId: string,
+    eventSequences: number[],
+    after: number,
+  ): StageEventLog {
+    const history = this.fixtures.stageEvents
+      .filter((evt) => evt.workflowRunId === runId && evt.sequence > after)
+      .slice()
+      .sort((a, b) => a.sequence - b.sequence);
+    const sequences = [
+      ...new Set([
+        ...eventSequences.filter((seq) => seq > after),
+        ...history.map((evt) => evt.sequence),
+      ]),
+    ].sort((a, b) => a - b);
+    if (sequences.length === 0) {
+      return { events: [], after, lastSequence: after, complete: true };
+    }
+    const lastSequence = sequences[sequences.length - 1]!;
+    return {
+      events: history
+        .slice(0, STAGE_EVENT_LIMIT)
+        .map(({ workflowRunId: _runId, ...evt }) => ({
+          ...evt,
+          ...cutStageEventError(evt.error),
+        })),
+      after,
+      lastSequence,
+      complete:
+        history.length <= STAGE_EVENT_LIMIT &&
+        lastSequence - after === sequences.length,
     };
   }
 

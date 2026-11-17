@@ -10,6 +10,8 @@ import {
   encodeCursor,
   isConsoleStatus,
   MAX_LIMIT,
+  STAGE_EVENT_ERROR_LIMIT,
+  STAGE_EVENT_LIMIT,
 } from "../read-port";
 
 const T0 = new Date("2026-01-01T00:00:00.000Z");
@@ -328,17 +330,18 @@ describe("in-memory read port: run detail", () => {
     expect(await reader.getRunDetail("nope")).toBeNull();
   });
 
-  it("returns a run's stage lifecycle events in sequence order and calls the history complete only when its sequences are unbroken from 1", async () => {
+  it("returns the attempt history's events past a sequence, and calls the range complete only when its rows are unbroken", async () => {
     const stageEvent = (
       sequence: number,
       eventType: any,
       workflowRunId = "run-1",
+      stageId: string | null = "first",
     ) => ({
       workflowRunId,
       sequence,
       eventType,
       occurredAt: at(sequence),
-      stageId: "first",
+      stageId,
       error: eventType === "stage:retrying" ? "boom" : null,
     });
     const reader = createInMemoryConsoleReadPort({
@@ -356,21 +359,80 @@ describe("in-memory read port: run detail", () => {
       eventType: "stage:retrying",
       stageId: "first",
       error: "boom",
+      errorTruncated: false,
     });
     // Sequence 1 is missing for run-1: its first rows were purged.
-    expect(detail?.stageEvents?.complete).toBe(false);
+    expect(detail?.stageEvents).toMatchObject({
+      after: 0,
+      lastSequence: 3,
+      complete: false,
+    });
+    // After them the range is unbroken.
+    expect(
+      (await reader.getRunDetail("run-1", { stageEventsAfter: 1 }))
+        ?.stageEvents,
+    ).toMatchObject({ after: 1, lastSequence: 3, complete: true });
+    // Nothing newer: an empty, unbroken range at the same sequence.
+    expect(
+      (await reader.getRunDetail("run-1", { stageEventsAfter: 3 }))
+        ?.stageEvents,
+    ).toEqual({ events: [], after: 3, lastSequence: 3, complete: true });
 
     const whole = createInMemoryConsoleReadPort({
       ...fixtures,
       events: [fixtures.events![1]!], // sequence 1 is a non-stage event
       stageEvents: [
         stageEvent(2, "stage:started"),
-        stageEvent(3, "stage:retrying"),
+        stageEvent(3, "workflow:cancelled", "run-1", null),
       ],
     });
-    expect((await whole.getRunDetail("run-1"))?.stageEvents?.complete).toBe(
+    const wholeDetail = await whole.getRunDetail("run-1");
+    expect(wholeDetail?.stageEvents?.complete).toBe(true);
+    expect(wholeDetail?.stageEvents?.events[1]).toMatchObject({
+      eventType: "workflow:cancelled",
+      stageId: null,
+    });
+  });
+
+  it("applies the SQL reader's limit and error cap to the attempt history's events", async () => {
+    const stageEvent = (sequence: number, error: string | null = null) => ({
+      workflowRunId: "run-1",
+      sequence,
+      eventType: "stage:started" as const,
+      occurredAt: at(0),
+      stageId: "first",
+      error,
+    });
+    const many = createInMemoryConsoleReadPort({
+      ...fixtures,
+      events: [],
+      stageEvents: Array.from({ length: STAGE_EVENT_LIMIT + 1 }, (_, i) =>
+        stageEvent(i + 1),
+      ),
+    });
+    const cut = (await many.getRunDetail("run-1"))!.stageEvents!;
+    expect(cut.events).toHaveLength(STAGE_EVENT_LIMIT);
+    expect(cut.complete).toBe(false);
+
+    const exact = createInMemoryConsoleReadPort({
+      ...fixtures,
+      events: [],
+      stageEvents: Array.from({ length: STAGE_EVENT_LIMIT }, (_, i) =>
+        stageEvent(i + 1),
+      ),
+    });
+    expect((await exact.getRunDetail("run-1"))!.stageEvents!.complete).toBe(
       true,
     );
+
+    const long = createInMemoryConsoleReadPort({
+      ...fixtures,
+      events: [],
+      stageEvents: [stageEvent(1, "x".repeat(STAGE_EVENT_ERROR_LIMIT + 1))],
+    });
+    const [event] = (await long.getRunDetail("run-1"))!.stageEvents!.events;
+    expect(event?.error).toHaveLength(STAGE_EVENT_ERROR_LIMIT);
+    expect(event?.errorTruncated).toBe(true);
   });
 
   it("tails a run timeline from a sequence cursor", async () => {

@@ -11,6 +11,7 @@ export default defineConfig({
         "persistence/index.ts",
       ),
       "@bratsos/workflow-engine/kernel": path.join(coreSrc, "kernel/index.ts"),
+      "@bratsos/workflow-engine/testing": path.join(coreSrc, "testing/index.ts"),
       "@bratsos/workflow-engine": path.join(coreSrc, "index.ts"),
     },
   },

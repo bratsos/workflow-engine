@@ -147,36 +147,87 @@ export const STAGE_LIFECYCLE_EVENT_TYPES = [
   "stage:completed",
 ] as const;
 
+/**
+ * The run-level events that bound stage executions without a stage event of
+ * their own. `run.cancel` marks every non-terminal stage CANCELLED and emits
+ * only `workflow:cancelled`; `run.redrive` (and `run.rerunFrom`) reopen or
+ * recreate stages and emit only `workflow:started`.
+ */
+export const RUN_BOUNDARY_EVENT_TYPES = [
+  "workflow:started",
+  "workflow:cancelled",
+] as const;
+
 export type StageLifecycleEventType =
   (typeof STAGE_LIFECYCLE_EVENT_TYPES)[number];
+export type RunBoundaryEventType = (typeof RUN_BOUNDARY_EVENT_TYPES)[number];
+
+/** Ceiling on the events one run-detail read returns for the attempt history. */
+export const STAGE_EVENT_LIMIT = 2000;
+/** Characters of a lifecycle event's error text that a read returns; the rest is cut. */
+export const STAGE_EVENT_ERROR_LIMIT = 2000;
 
 /**
- * One stage lifecycle outbox row with the two payload fields the attempt
- * history needs. The rest of the payload is never read: `workflow:completed`
- * carries the run's output, and the console's lists are payload-free by design.
+ * One outbox row of the attempt history with the two payload fields it
+ * needs. The rest of the payload is never read: `workflow:completed` carries
+ * the run's output, and the console's lists are payload-free by design.
  */
 export interface StageEvent {
   sequence: number;
-  eventType: StageLifecycleEventType;
+  eventType: StageLifecycleEventType | RunBoundaryEventType;
   occurredAt: Date;
-  /** The stage definition's id (`StageSummary.stageId`), not the stage record id. */
-  stageId: string;
-  /** Carried by `stage:retrying` and `stage:failed`; null on the others. */
+  /**
+   * The stage definition's id (`StageSummary.stageId`), not the stage record
+   * id. Null on the run-level events, which concern every stage of the run.
+   */
+  stageId: string | null;
+  /**
+   * Carried by `stage:retrying` and `stage:failed`; null on the others. At
+   * most `STAGE_EVENT_ERROR_LIMIT` characters.
+   */
   error: string | null;
+  /** True when `error` was cut at `STAGE_EVENT_ERROR_LIMIT` characters. */
+  errorTruncated: boolean;
 }
 
 /**
- * Every stage lifecycle event of a run, independent of the run detail's
- * 200-row event list (a run with many progress events would otherwise cut
- * the lifecycle events off).
+ * Cuts an error text to `STAGE_EVENT_ERROR_LIMIT` characters (code points, as
+ * both databases count them). Readers fetch one character more than the limit
+ * so that a cut is known without a second read.
+ */
+export function cutStageEventError(text: string | null): {
+  error: string | null;
+  errorTruncated: boolean;
+} {
+  if (text === null) return { error: null, errorTruncated: false };
+  const chars = [...text];
+  if (chars.length <= STAGE_EVENT_ERROR_LIMIT) {
+    return { error: text, errorTruncated: false };
+  }
+  return {
+    error: chars.slice(0, STAGE_EVENT_ERROR_LIMIT).join(""),
+    errorTruncated: true,
+  };
+}
+
+/**
+ * The attempt history's input: the stage lifecycle events and run-level
+ * boundary events of a run with a sequence greater than `after`. The page
+ * keeps what it has read and asks only for the rows after its last
+ * sequence, so one read costs the new rows of the run, never all of them.
  */
 export interface StageEventLog {
+  /** Ascending by sequence, at most `STAGE_EVENT_LIMIT`. */
   events: StageEvent[];
+  /** The `stageEventsAfter` this read was made with; 0 for a first read. */
+  after: number;
+  /** The highest outbox sequence of the run seen by this read; `after` when no row is newer. */
+  lastSequence: number;
   /**
-   * True only when the run's retained outbox rows form one unbroken range
-   * starting at sequence 1 and none of the lifecycle events were cut off by
-   * the read's limit. False means events were purged, are past retention,
-   * or were truncated, and a grouping built from them could be wrong.
+   * True only when the retained rows in `(after, lastSequence]` are one
+   * unbroken range and no event in it was cut off by `STAGE_EVENT_LIMIT`.
+   * False means events were purged, are past retention, or were truncated,
+   * and a grouping built from them could be wrong.
    */
   complete: boolean;
 }
@@ -194,7 +245,8 @@ export interface RunDetail {
   logs: LogEntry[];
   events: RunEvent[];
   /**
-   * Input to the per-attempt stage history. Optional so a custom reader that
+   * Input to the per-attempt stage history, read after
+   * `RunDetailOptions.stageEventsAfter`. Optional so a custom reader that
    * predates it keeps compiling; without it the UI shows each stage's latest
    * attempt only and says the per-attempt history is unavailable.
    */
@@ -321,6 +373,12 @@ export interface RunDetailOptions {
   annotationLimit?: number;
   logLimit?: number;
   eventLimit?: number;
+  /**
+   * Return only the stage events with a sequence greater than this. The
+   * console page passes the last sequence it has read, so a poll reads the
+   * run's new outbox rows and a first load reads the run once.
+   */
+  stageEventsAfter?: number;
 }
 
 export interface ConsoleReadPort {

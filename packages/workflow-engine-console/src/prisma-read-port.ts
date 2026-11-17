@@ -13,21 +13,25 @@ import {
   type CostBucket,
   type CostQuery,
   clampLimit,
+  cutStageEventError,
   type DeadLetter,
   decodeCursor,
   encodeCursor,
   isConsoleStatus,
   type LogEntry,
   type QueueHealth,
+  RUN_BOUNDARY_EVENT_TYPES,
   type RunDetail,
   type RunDetailOptions,
   type RunEvent,
   type RunListPage,
   type RunListQuery,
   type RunSummary,
+  STAGE_EVENT_ERROR_LIMIT,
+  STAGE_EVENT_LIMIT,
   STAGE_LIFECYCLE_EVENT_TYPES,
   type StageEvent,
-  type StageLifecycleEventType,
+  type StageEventLog,
   type StageSummary,
   type StepSummary,
   type SuspendedStage,
@@ -164,16 +168,9 @@ const STAGE_EVENT_COLUMNS: RawColumns = {
   error: "text",
 };
 const EVENT_RANGE_COLUMNS: RawColumns = {
-  minSeq: "int",
   maxSeq: "int",
   total: "bigint",
 };
-/**
- * Ceiling on the lifecycle events read per run. A stage emits a handful per
- * attempt, so this covers hundreds of stages; past it the read reports the
- * history as incomplete instead of grouping a prefix.
- */
-const STAGE_EVENT_LIMIT = 2000;
 const SUSPENDED_STAGE_COLUMNS: RawColumns = {
   id: "text",
   workflowRunId: "text",
@@ -369,7 +366,6 @@ interface RawStageEventRow {
 }
 
 interface RawEventRangeRow {
-  minSeq: number | bigint | null;
   maxSeq: number | bigint | null;
   total: number | bigint | null;
 }
@@ -549,14 +545,15 @@ function mapRunEvent(row: RawEventRow): RunEvent {
 function mapStageEvent(row: RawStageEventRow): StageEvent {
   return {
     sequence: toNumber(row.sequence),
-    eventType: String(row.eventType) as StageLifecycleEventType,
+    eventType: String(row.eventType) as StageEvent["eventType"],
     occurredAt: toDate(row.occurredAt) ?? new Date(0),
     stageId:
       row.stageId !== null && row.stageId !== undefined
         ? String(row.stageId)
-        : "",
-    error:
+        : null,
+    ...cutStageEventError(
       row.error !== null && row.error !== undefined ? String(row.error) : null,
+    ),
   };
 }
 
@@ -701,10 +698,10 @@ export class PrismaConsoleReadPort implements ConsoleReadPort {
    *
    * The callback receives the client to issue statements on, and every read
    * that needs more than one statement issues all of them here, inside a
-   * single transaction — a run-detail page is eight queries, and giving each
-   * its own interactive transaction would take eight connections out of the
-   * consumer's pool to render one page. One transaction also means the eight
-   * results are a coherent snapshot rather than eight moments.
+   * single transaction — a run-detail page is up to eight queries, and giving
+   * each its own interactive transaction would take that many connections out
+   * of the consumer's pool to render one page. One transaction also means the
+   * results are a coherent snapshot rather than separate moments.
    *
    * The transaction is opened only when we were handed a root client. When
    * `$transaction` is absent we are already inside the caller's transaction
@@ -857,6 +854,76 @@ LIMIT ${limit + 1}`;
     return { runs, nextCursor };
   }
 
+  /**
+   * The attempt history's events of one run with a sequence above `after`.
+   *
+   * What a read costs follows the run's rows past `after`, never the run's
+   * total: both statements are range scans on the `(workflowRunId, sequence)`
+   * unique index. `eventType` has no index, so the lifecycle statement still
+   * filters the heap rows of that range, which is why the page passes the
+   * last sequence it has read: a poll reads the rows written since the
+   * previous one, and only a first read goes through the whole run, once.
+   *
+   * The range is closed at the highest sequence the first statement saw, so
+   * a row committed between the two statements cannot be skipped by the
+   * page's next read (the transaction is READ COMMITTED on Postgres).
+   */
+  private async readStageEvents(
+    client: ConsolePrismaClient,
+    runId: string,
+    afterRaw: number,
+  ): Promise<StageEventLog> {
+    const after = Number.isFinite(afterRaw)
+      ? Math.min(Math.max(0, Math.floor(afterRaw)), 2_147_483_647)
+      : 0;
+    // The rows past `after`: how many, and the highest sequence. With no
+    // gap they are exactly `after + 1 .. maxSeq`, so a count equal to
+    // `maxSeq - after` says the range is unbroken without reading a row.
+    const rangeRows = await this.select<RawEventRangeRow>(
+      client,
+      EVENT_RANGE_COLUMNS,
+      `SELECT max(sequence) AS "maxSeq", count(*) AS total
+FROM "outbox_events" WHERE "workflowRunId" = ${this.param(1)} AND sequence > ${this.param(2)}`,
+      [runId, after],
+    );
+    const total = toNumber(rangeRows[0]?.total);
+    if (total === 0) {
+      return { events: [], after, lastSequence: after, complete: true };
+    }
+    const lastSequence = toNumber(rangeRows[0]?.maxSeq);
+
+    // Two payload fields are extracted in SQL and nothing else of the payload
+    // is read (`workflow:completed` carries the run's output). The error text
+    // comes back one character over its limit so a cut is visible.
+    const payloadField = (name: string) =>
+      this.databaseType === "postgresql"
+        ? `payload->>'${name}'`
+        : `json_extract(payload, '$.${name}')`;
+    const types = [...STAGE_LIFECYCLE_EVENT_TYPES, ...RUN_BOUNDARY_EVENT_TYPES]
+      .map((type) => `'${type}'`)
+      .join(", ");
+    const rows = await this.select<RawStageEventRow>(
+      client,
+      STAGE_EVENT_COLUMNS,
+      `SELECT sequence, "eventType", "occurredAt",
+       ${payloadField("stageId")} AS "stageId",
+       CASE WHEN "eventType" IN ('stage:retrying', 'stage:failed') THEN substr(${payloadField("error")}, 1, ${STAGE_EVENT_ERROR_LIMIT + 1}) END AS error
+FROM "outbox_events"
+WHERE "workflowRunId" = ${this.param(1)} AND sequence > ${this.param(2)} AND sequence <= ${this.param(3)}
+  AND "eventType" IN (${types})
+ORDER BY sequence ASC
+LIMIT ${STAGE_EVENT_LIMIT + 1}`,
+      [runId, after, lastSequence],
+    );
+    return {
+      events: rows.slice(0, STAGE_EVENT_LIMIT).map(mapStageEvent),
+      after,
+      lastSequence,
+      complete:
+        rows.length <= STAGE_EVENT_LIMIT && lastSequence - after === total,
+    };
+  }
+
   async getRunDetail(
     runId: string,
     options?: RunDetailOptions,
@@ -866,9 +933,9 @@ LIMIT ${limit + 1}`;
     const logLimit = clampLimit(options?.logLimit, 200);
     const eventLimit = clampLimit(options?.eventLimit, 200);
 
-    // All eight statements share one transaction: eight interactive
-    // transactions to render one page would take eight connections out of the
-    // consumer's pool, and the results would be eight different moments.
+    // All statements share one transaction: that many interactive transactions
+    // to render one page would take as many connections out of the consumer's
+    // pool, and the results would be different moments.
     return this.read("run.detail", async (client) => {
       const runRows = await this.select<RawRunDetailRow>(
         client,
@@ -941,47 +1008,11 @@ LIMIT ${eventLimit + 1}`,
         [runId],
       );
 
-      // Stage lifecycle events, read apart from the capped event list above
-      // and with just two payload fields extracted in SQL, so the attempt
-      // history neither depends on how many progress events the run emitted
-      // nor pulls a payload (`workflow:completed` carries the run's output).
-      const payloadField = (name: string) =>
-        this.databaseType === "postgresql"
-          ? `payload->>'${name}'`
-          : `json_extract(payload, '$.${name}')`;
-      const lifecycleTypes = STAGE_LIFECYCLE_EVENT_TYPES.map(
-        (type) => `'${type}'`,
-      ).join(", ");
-      const stageEventRows = await this.select<RawStageEventRow>(
+      const stageEvents = await this.readStageEvents(
         client,
-        STAGE_EVENT_COLUMNS,
-        `SELECT sequence, "eventType", "occurredAt",
-       ${payloadField("stageId")} AS "stageId",
-       CASE WHEN "eventType" IN ('stage:retrying', 'stage:failed') THEN ${payloadField("error")} END AS error
-FROM "outbox_events"
-WHERE "workflowRunId" = ${this.param(1)} AND "eventType" IN (${lifecycleTypes})
-ORDER BY sequence ASC
-LIMIT ${STAGE_EVENT_LIMIT + 1}`,
-        [runId],
+        runId,
+        Math.max(0, Math.floor(options?.stageEventsAfter ?? 0)),
       );
-      // Whether the run's retained rows are an unbroken 1..n: purged or
-      // out-of-retention events show up as a missing prefix or a gap.
-      const rangeRows = await this.select<RawEventRangeRow>(
-        client,
-        EVENT_RANGE_COLUMNS,
-        `SELECT min(sequence) AS "minSeq", max(sequence) AS "maxSeq", count(*) AS total
-FROM "outbox_events" WHERE "workflowRunId" = ${this.param(1)}`,
-        [runId],
-      );
-      const total = toNumber(rangeRows[0]?.total);
-      const stageEvents = {
-        events: stageEventRows.slice(0, STAGE_EVENT_LIMIT).map(mapStageEvent),
-        complete:
-          stageEventRows.length <= STAGE_EVENT_LIMIT &&
-          total > 0 &&
-          toNumber(rangeRows[0]?.minSeq) === 1 &&
-          toNumber(rangeRows[0]?.maxSeq) === total,
-      };
 
       // Each list asked for one row more than it will show, so "there is
       // more than this" is known without a second count.
