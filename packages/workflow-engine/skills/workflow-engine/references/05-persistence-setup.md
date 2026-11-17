@@ -1111,7 +1111,7 @@ npx prisma db verify --strict
 
 ### SQLite target
 
-Use the SQLite contract and driver; the PostgreSQL contract, native `Status` enum, `TimestampString` columns, `psql` step, and `mixed-order-indexes.sql` do not apply. Prisma 8 SQLite requires Node.js 22.20+, 24.11+ or 26+; this target-specific CLI floor does not change the engine's general `>=22.11` requirement. CI runs the SQLite suite on 22.20.0, 24.11.0 and 26.0.0. Text containing a NUL character needs Node.js 24.16+ or 26.1+: before that, `node:sqlite` reads a stored NUL back cut at it (every Node 22 release), which would change a stage or step ID without an error, so the engine throws instead of writing it. Starting from an empty directory:
+Use the SQLite contract and driver; the PostgreSQL contract, native `Status` enum, `TimestampString` columns, `psql` step, and `mixed-order-indexes.sql` do not apply. Prisma 8 SQLite requires Node.js 22.20+, 24.11+ or 26+; this target-specific CLI floor does not change the engine's general `>=22.11` requirement. CI runs the SQLite suite on 22.20.0, 24.11.0 and 26.0.0. Text containing a NUL character needs Node.js 24.16+ or 26.1+: before that, `node:sqlite` reads a stored NUL back cut at it (every Node 22 release), which would change a stage or step ID without an error, so the engine throws instead of writing it. The engine cannot see a NUL that is already in the file, for example text written on Node 24.16+ and then opened on an older Node: that value is read back cut at the NUL, with no error. Starting from an empty directory:
 
 ```bash
 npm init -y
