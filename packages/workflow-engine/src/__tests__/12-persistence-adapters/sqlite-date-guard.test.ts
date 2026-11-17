@@ -16,12 +16,12 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { createKernel, runMaintenanceTick } from "../../kernel/index.js";
 import {
   CollectingEventSink,
   FakeClock,
   InMemoryBlobStore,
 } from "../../kernel/testing/index.js";
-import { createKernel, runMaintenanceTick } from "../../kernel/index.js";
 import {
   createPrismaJobQueue,
   createPrismaWorkflowPersistence,
