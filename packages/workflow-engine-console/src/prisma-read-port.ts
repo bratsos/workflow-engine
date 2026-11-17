@@ -670,6 +670,13 @@ export class PrismaConsoleReadPort implements ConsoleReadPort {
     label: string,
     fn: (client: ConsolePrismaClient) => Promise<T>,
   ): Promise<T> {
+    // A SQLite file another Prisma major wrote answers every date filter and
+    // cursor wrongly: refuse it with the engine's own check (one statement per
+    // client, shared with the engine's adapters). Loaded only for SQLite.
+    if (this.databaseType === "sqlite") {
+      const engine = "@bratsos/workflow-engine/persistence";
+      await (await import(engine)).assertSqliteDateStorage(this.prisma);
+    }
     try {
       if (
         this.statementTimeoutMs > 0 &&
