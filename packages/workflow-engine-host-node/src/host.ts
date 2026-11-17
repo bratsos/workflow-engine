@@ -196,6 +196,8 @@ class NodeHostImpl implements NodeHost {
   private tickInFlight: Promise<void> | null = null;
   /** `start()` while it is still verifying the storage, so a second call joins it. */
   private starting: Promise<void> | null = null;
+  /** Incremented by every stop(), so a start whose storage check settles after it does not begin. */
+  private lifecycle = 0;
   /** The `onTick` call currently running, if any. */
   private hookInFlight: Promise<void> | null = null;
   private hookStartedAt = 0;
@@ -286,9 +288,12 @@ class NodeHostImpl implements NodeHost {
 
   async start(): Promise<void> {
     if (this.running) return;
-    this.starting ??= this.verifyThenBegin().finally(() => {
-      this.starting = null;
-    });
+    if (!this.starting) {
+      const starting = this.verifyThenBegin(this.lifecycle).finally(() => {
+        if (this.starting === starting) this.starting = null;
+      });
+      this.starting = starting;
+    }
     return this.starting;
   }
 
@@ -297,11 +302,13 @@ class NodeHostImpl implements NodeHost {
    * loop or signal handler exists, instead of running and logging the same
    * error on every tick: a SQLite file another Prisma major wrote makes
    * `verifyStorage` reject with `SqliteDateStorageError` (a transport with no
-   * such check starts as before).
+   * such check starts as before). A `stop()` while the check is pending
+   * cancels the start: when the check settles, nothing is installed and the
+   * pending `start()` resolves with the host stopped.
    */
-  private async verifyThenBegin(): Promise<void> {
+  private async verifyThenBegin(lifecycle: number): Promise<void> {
     await this.jobTransport.verifyStorage?.();
-    if (this.running) return;
+    if (this.running || lifecycle !== this.lifecycle) return;
     this.begin();
   }
 
@@ -349,6 +356,9 @@ class NodeHostImpl implements NodeHost {
   }
 
   async stop(): Promise<void> {
+    // Cancels a start() whose storage check is still pending (see verifyThenBegin).
+    this.lifecycle++;
+    this.starting = null;
     if (!this.running) return;
 
     this.running = false;

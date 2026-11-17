@@ -819,6 +819,100 @@ describe("NodeHost", () => {
     await refused.stop();
   });
 
+  describe("stop() while start() is still checking the storage", () => {
+    /** A storage check that settles when the test says so. */
+    function gatedCheck(jobTransport: unknown) {
+      const gates: { settle: (error?: Error) => void }[] = [];
+      (jobTransport as any).verifyStorage = () =>
+        new Promise<void>((resolve, reject) => {
+          gates.push({
+            settle: (error) => (error ? reject(error) : resolve()),
+          });
+        });
+      return gates;
+    }
+    const signalListeners = () =>
+      process.listenerCount("SIGTERM") + process.listenerCount("SIGINT");
+
+    it("installs nothing when the check settles after stop() returned", async () => {
+      const { kernel, jobTransport } = createTestEnv([]);
+      const gates = gatedCheck(jobTransport);
+      const dispatched = vi.spyOn(kernel, "dispatch");
+      const listeners = signalListeners();
+      const h = createNodeHost({
+        kernel,
+        jobTransport,
+        workerId: "test-worker",
+        orchestrationIntervalMs: 10,
+        jobPollIntervalMs: 5,
+      });
+      const boot = h.start();
+      await vi.waitFor(() => expect(gates).toHaveLength(1));
+      await h.stop();
+      await h.stop(); // twice: still nothing to wind down
+      gates[0].settle();
+      await boot;
+      await new Promise((r) => setTimeout(r, 60));
+      expect(h.getStats().isRunning).toBe(false);
+      expect(h.getStats().orchestrationTicks).toBe(0);
+      expect(dispatched).not.toHaveBeenCalled();
+      expect(signalListeners()).toBe(listeners);
+    });
+
+    it("start, stop, start: only the second start runs, once", async () => {
+      const { kernel, jobTransport } = createTestEnv([]);
+      const gates = gatedCheck(jobTransport);
+      const listeners = signalListeners();
+      host = createNodeHost({
+        kernel,
+        jobTransport,
+        workerId: "test-worker",
+        orchestrationIntervalMs: 10_000,
+        jobPollIntervalMs: 20,
+      });
+      const first = host.start();
+      await vi.waitFor(() => expect(gates).toHaveLength(1));
+      await host.stop();
+      const second = host.start();
+      await vi.waitFor(() => expect(gates).toHaveLength(2));
+      gates[1].settle();
+      await second;
+      // The first check settles late: it must not begin a second set of loops.
+      gates[0].settle();
+      await first;
+      await new Promise((r) => setTimeout(r, 30));
+      expect(host.getStats().isRunning).toBe(true);
+      expect(host.getStats().orchestrationTicks).toBe(1);
+      expect(signalListeners()).toBe(listeners + 2);
+      await host.stop();
+      expect(signalListeners()).toBe(listeners);
+    });
+
+    it("a check that fails after stop() rejects that start() and leaves the host stopped and startable", async () => {
+      const { kernel, jobTransport } = createTestEnv([]);
+      const gates = gatedCheck(jobTransport);
+      host = createNodeHost({
+        kernel,
+        jobTransport,
+        workerId: "test-worker",
+        orchestrationIntervalMs: 10_000,
+        jobPollIntervalMs: 20,
+      });
+      const boot = host.start();
+      await vi.waitFor(() => expect(gates).toHaveLength(1));
+      await host.stop();
+      const refusal = new Error("refused");
+      gates[0].settle(refusal);
+      await expect(boot).rejects.toBe(refusal);
+      expect(host.getStats().isRunning).toBe(false);
+      const again = host.start();
+      await vi.waitFor(() => expect(gates).toHaveLength(2));
+      gates[1].settle();
+      await again;
+      expect(host.getStats().isRunning).toBe(true);
+    });
+  });
+
   it("verifies the storage once, however many start() calls are in flight", async () => {
     const { kernel, jobTransport } = createTestEnv([]);
     let verified = 0;

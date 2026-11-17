@@ -1079,12 +1079,52 @@ describe("ServerlessHost", () => {
     ).rejects.toBe(refusal);
     expect(dispatched).not.toHaveBeenCalled();
 
-    // The check is asked again until it passes, then remembered.
+    // The check is asked again on every call.
     refusing = false;
     await expect(host.runMaintenanceTick()).resolves.toMatchObject({
       claimed: 0,
     });
     expect(dispatched).toHaveBeenCalled();
+  });
+
+  it("dispatches nothing until the storage check settles, and checks again on every call", async () => {
+    const { kernel, jobTransport } = createTestEnv([]);
+    const gates: { settle: (error?: Error) => void }[] = [];
+    (jobTransport as any).verifyStorage = () =>
+      new Promise<void>((resolve, reject) => {
+        gates.push({ settle: (error) => (error ? reject(error) : resolve()) });
+      });
+    const dispatched = vi.spyOn(kernel, "dispatch");
+    const host = createServerlessHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+    });
+
+    // A check that fails late: the tick rejects and nothing was dispatched.
+    const failing = host.runMaintenanceTick();
+    await vi.waitFor(() => expect(gates).toHaveLength(1));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(dispatched).not.toHaveBeenCalled();
+    const refusal = new Error("refused");
+    gates[0].settle(refusal);
+    await expect(failing).rejects.toBe(refusal);
+    expect(dispatched).not.toHaveBeenCalled();
+
+    // A check that passes late: the tick runs only then.
+    const passing = host.runMaintenanceTick();
+    await vi.waitFor(() => expect(gates).toHaveLength(2));
+    expect(dispatched).not.toHaveBeenCalled();
+    gates[1].settle();
+    await passing;
+    expect(dispatched).toHaveBeenCalled();
+
+    // The host remembers nothing: the next call asks the transport again (the
+    // Prisma queue answers from its own memo once the check was conclusive).
+    const third = host.runMaintenanceTick();
+    await vi.waitFor(() => expect(gates).toHaveLength(3));
+    gates[2].settle();
+    await third;
   });
 
   it("gives the hook its own copy of the counts", async () => {

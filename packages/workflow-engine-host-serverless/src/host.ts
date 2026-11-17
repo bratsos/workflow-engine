@@ -219,7 +219,6 @@ class ServerlessHostImpl implements ServerlessHost {
   private readonly flushOutboxAfterJob: boolean;
   private readonly outboxFlushTimeoutMs: number;
   private readonly onTickTimeoutMs: number;
-  private storageVerified = false;
 
   constructor(config: ServerlessHostConfig) {
     this.kernel = config.kernel;
@@ -266,17 +265,17 @@ class ServerlessHostImpl implements ServerlessHost {
   }
 
   /**
-   * There is no `start()` here, so the first call of any entry point
-   * (`handleJob`, `processAvailableJobs`, `runMaintenanceTick`) checks that the
-   * storage may be used and throws if not (a SQLite file another Prisma major
-   * wrote: `SqliteDateStorageError`), instead of every command logging it.
-   * A success is remembered; a failure is asked again (the check itself is
-   * cached by the adapter, so that costs nothing).
+   * There is no `start()` here, so every call of an entry point (`handleJob`,
+   * `processAvailableJobs`, `runMaintenanceTick`) checks that the storage may
+   * be used before it dispatches anything, and throws if not (a SQLite file
+   * another Prisma major wrote: `SqliteDateStorageError`; a check that could
+   * not be made: `SqliteDateStorageUnverifiedError`), instead of every command
+   * logging it. Nothing is remembered here: the adapter remembers a conclusive
+   * pass itself (one statement per client), and asks again after a check that
+   * failed or saw an empty file.
    */
   private async ready(): Promise<void> {
-    if (this.storageVerified) return;
     await this.jobTransport.verifyStorage?.();
-    this.storageVerified = true;
   }
 
   async handleJob(msg: JobMessage): Promise<JobResult> {
