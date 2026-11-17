@@ -23,7 +23,8 @@ import { maxTimerMs, rolledBackWrite } from "./transaction-writes.js";
  * - Timestamps use UTC text: `Date` in becomes ISO text, text out becomes `Date`.
  * - Raw reads must declare their columns (`client.$withColumns(...)`), since Prisma 8 drops
  *   the ones they do not.
- * - SQLite root writes share a queue, including entire transactions.
+ * - SQLite root writes share a queue, including entire transactions; a statement
+ *   that may write reaches the root connection only in its turn (`inTurn`).
  *
  * Imports nothing from Prisma, like the rest of the package.
  */
@@ -31,8 +32,6 @@ import { maxTimerMs, rolledBackWrite } from "./transaction-writes.js";
 import type { AsyncLocalStorage } from "node:async_hooks";
 import type { BlobPrismaClient } from "./blob-store";
 import type { EnginePrismaClient, RawColumns } from "./prisma-client-type";
-import { isReadOnlySql } from "./read-only-sql.js";
-import { isSqliteBusy } from "./sql-errors.js";
 
 type Row = Record<string, any>;
 type Args = Record<string, any>;
@@ -338,16 +337,25 @@ function buildPlan(x: Executor, q: Sql, spec?: Record<string, string>) {
   ).build();
   refuseNul(plan, q);
   if (!spec || postgres(plan)) return { plan };
-  const wire = sqliteRead(q, spec);
+  const statement = statementOf(q);
+  const wire = sqliteRead(q, spec, statement);
   return {
     plan: sqlOf(x, wire.q).returnsRow(wire.spec).build(),
     overflow: wire.overflow,
-    writes: wire.writes,
+    statement,
   };
 }
 
-const affected = async (x: Executor, q: Sql): Promise<number> =>
-  (await x.execute(buildPlan(x, q).plan)).affectedRows;
+/** The shared root connection of a SQLite client: it has `transaction`, a transaction's `tx` does not. */
+const sqliteRoot = (x: Executor, plan: { meta?: { target?: string } }) =>
+  !postgres(plan) &&
+  typeof (x as Partial<Prisma8Db>).transaction === "function";
+
+const affected = async (x: Executor, q: Sql): Promise<number> => {
+  const { plan } = buildPlan(x, q);
+  if (sqliteRoot(x, plan)) await inTurn(x);
+  return (await x.execute(plan)).affectedRows;
+};
 
 let nulReadable: boolean | undefined;
 /**
@@ -386,12 +394,14 @@ function refuseNul(plan: { meta?: { target?: string } }, q: Sql): void {
 }
 
 /**
- * rc.21 cannot finalize its native iterator when converting an INTEGER to a
- * JS number throws in next(). Carry unsafe integers as text instead: decoding
- * then happens after a row was yielded, where the runtime closes the iterator.
- * BigInt columns can read that text exactly; other columns must still reject it.
+ * The one decision about a SQLite statement: `read` when it provably only
+ * reads, that is SELECT, VALUES, EXPLAIN of anything, or WITH whose statement
+ * is a SELECT or VALUES (SQLite refuses a write in a CTE body). Anything else,
+ * PRAGMA included, may write: on the root client it is queued, and only its
+ * queue turn may run it (`inTurn`, `rootWrite`). A read taken for a write
+ * costs a wait in the queue; the reverse would lose writes.
  */
-function sqliteRead(q: Sql, spec: Record<string, string>) {
+function statementOf(q: Sql) {
   const source = q.parts.join("\0");
   const tokens = [
     ...source.matchAll(
@@ -405,16 +415,36 @@ function sqliteRead(q: Sql, spec: Record<string, string>) {
     if (s === "(") depth++;
     return outside;
   });
-  const returning = top.find((t) => /^RETURNING$/i.test(t[0]));
-  const first = top[0]?.[0].toUpperCase();
-  const writes = !!returning || /^(INSERT|UPDATE|DELETE|REPLACE)$/.test(first!);
-  if (
-    !returning &&
-    (!isReadOnlySql(q.parts.join("?")) || first === "EXPLAIN") &&
-    first !== "VALUES"
-  ) {
-    return { q, spec, writes };
-  }
+  const words = top.map(([s]) => s.toUpperCase());
+  const first = words[0];
+  const verb =
+    first === "WITH"
+      ? words.find((w) =>
+          /^(SELECT|VALUES|INSERT|UPDATE|DELETE|REPLACE)$/.test(w),
+        )
+      : first;
+  return {
+    source,
+    top,
+    first,
+    returning: top.find((t) => /^RETURNING$/i.test(t[0])),
+    read: first === "EXPLAIN" || verb === "SELECT" || verb === "VALUES",
+  };
+}
+
+/**
+ * rc.21 cannot finalize its native iterator when converting an INTEGER to a
+ * JS number throws in next(). Carry unsafe integers as text instead: decoding
+ * then happens after a row was yielded, where the runtime closes the iterator.
+ * BigInt columns can read that text exactly; other columns must still reject it.
+ */
+function sqliteRead(
+  q: Sql,
+  spec: Record<string, string>,
+  { source, top, first, returning, read }: ReturnType<typeof statementOf>,
+) {
+  // EXPLAIN returns the plan's own columns, whatever it explains.
+  if (first === "EXPLAIN" || (!returning && !read)) return { q, spec };
   const bindings = q.values.map((value) => ({ value }));
   const slice = (start: number, end = source.length) => {
     const out = new Sql();
@@ -561,71 +591,64 @@ function sqliteRead(q: Sql, spec: Record<string, string>) {
     q: bound,
     spec: { ...spec, [overflow]: SQLITE_TYPES.int! },
     overflow,
-    writes,
   };
 }
 
 /**
- * A statement that writes and returns rows runs through the driver's
- * `iterate()`, and node:sqlite leaves one that fails SQLITE_BUSY at its first
- * step active on its connection. On the shared root connection every later
- * write then reports success but is not committed, and is rolled back when
- * the statement object is collected. `BEGIN IMMEDIATE` takes the write lock
- * through `run()` first, which fails cleanly on BUSY and honours the
- * connection's busy_timeout; the statement then cannot hit BUSY.
+ * Fails unless this runs in the queue turn of `x`, the shared root connection
+ * of a SQLite client. Only the queue's runner opens a turn (`enqueue`), one at
+ * a time, and it ends when the queued call settles: so nothing that may write,
+ * and no `BEGIN IMMEDIATE`, reaches the root outside the queue, and no other
+ * caller's write can run inside a lock taken here.
  */
-async function withWriteLock<T>(x: Executor, work: () => Promise<T>) {
+async function inTurn(x: Executor): Promise<void> {
+  const store = (await context()).getStore();
+  if (!store?.turn?.active || store.queue !== writeQueues.get(x))
+    fail(
+      "internal error: a SQLite statement that may write reached the root connection outside its write queue",
+    );
+}
+
+/**
+ * A statement that may write, on the root connection, in its queue turn.
+ * node:sqlite leaves a statement that fails SQLITE_BUSY at its first step
+ * active when it runs through `iterate()`, which the Prisma 8 driver uses for
+ * every statement that returns rows; on the root, every later write then
+ * reports success, is not committed, and is rolled back when the statement
+ * object is collected. So a statement that returns rows runs under
+ * `BEGIN IMMEDIATE`, which takes the write lock through `run()` (it fails
+ * cleanly on BUSY after the busy_timeout), and one that returns none runs
+ * through the driver's `execute`, which uses `run()` itself. A PRAGMA that
+ * returns rows runs as it is: none of SQLite's opens a write transaction, and
+ * `journal_mode = WAL` and `wal_checkpoint` cannot run inside one.
+ */
+async function rootWrite(
+  x: Executor,
+  q: Sql,
+  plan: ReturnType<typeof buildPlan>["plan"],
+  statement: ReturnType<typeof statementOf>,
+): Promise<Row[]> {
+  const rows = () => x.query(plan).toArray();
+  if (!statement.returning) {
+    try {
+      await affected(x, q);
+      return [];
+    } catch (error) {
+      // The driver refuses before it runs a statement that returns rows.
+      if (!/cannot execute statements that return rows/.test(String(error)))
+        throw error;
+    }
+    if (statement.first === "PRAGMA") return rows();
+  }
   await affected(x, new Sql().t("BEGIN IMMEDIATE"));
   try {
-    const result = await work();
+    const result = await rows();
     await affected(x, new Sql().t("COMMIT"));
     return result;
   } catch (error) {
     await affected(x, new Sql().t("ROLLBACK")).catch(() => {});
     throw error;
   }
-}
-
-let collectGarbage: (() => void) | null | undefined;
-let collecting: Promise<void> | undefined;
-/**
- * The same driver loop leaves a read that fails SQLITE_BUSY at its first step
- * active, and no write lock can prevent that: the lock is what the read could
- * not get. SQLite counts the statement as an active reader, so the next
- * statement on the connection starts a read transaction that does not end while
- * it exists: other connections cannot commit (rollback journal) or the
- * connection reads a stale snapshot, fails its writes with SQLITE_BUSY_SNAPSHOT
- * and holds back the checkpoint (WAL), until the statement object is collected.
- * It is collected here, once for failures that overlap. This only finalizes a
- * read statement: it cannot undo a commit, and a write in progress or an open
- * transaction on the connection is left alone. If the runtime cannot be asked to
- * collect, the failure is left as it is.
- */
-function releaseStalledRead(): Promise<void> {
-  return (collecting ??= (async () => {
-    try {
-      if (collectGarbage === undefined) {
-        const v8 = process.getBuiltinModule?.("node:v8");
-        v8?.setFlagsFromString("--expose-gc");
-        collectGarbage =
-          (globalThis as { gc?: () => void }).gc ??
-          process.getBuiltinModule?.("node:vm")?.runInNewContext("gc") ??
-          null;
-        v8?.setFlagsFromString("--no-expose-gc");
-      }
-      // The iterator holds the statement: one collection frees the iterator,
-      // the next the statement. A tick before each lets the call's frames unwind.
-      for (let pass = 0; pass < 3; pass++) {
-        await new Promise((resolve) => setTimeout(resolve));
-        collectGarbage?.();
-      }
-      await new Promise((resolve) => setTimeout(resolve));
-    } catch {
-      collectGarbage = null; // the original failure is what the caller gets
-    } finally {
-      collecting = undefined;
-    }
-  })());
 }
 
 /** Rows for `spec` (column -> codec id); timestamps come back as `Date`. Not public API. */
@@ -635,20 +658,12 @@ export async function rowsOf(
   spec: Record<string, string>,
 ): Promise<Row[]> {
   const wire = buildPlan(x, q, spec);
-  // The root has `transaction`; a transaction's `tx` does not, and there a failed COMMIT is loud
-  // and the connection goes with the transaction.
-  const root = typeof (x as Partial<Prisma8Db>).transaction === "function";
-  const read = () => x.query(wire.plan).toArray();
+  // A transaction's `tx` has a connection of its own, which goes with the transaction.
   let rows: Row[];
-  try {
-    rows = await (wire.writes && root ? withWriteLock(x, read) : read());
-  } catch (error) {
-    // Here, not in `read`: that frame still holds the failed statement. A write
-    // took its lock first, so a BUSY from one left no statement behind.
-    if (root && !wire.writes && !postgres(wire.plan) && isSqliteBusy(error))
-      await releaseStalledRead();
-    throw error;
-  }
+  if (wire.statement && !wire.statement.read && sqliteRoot(x, wire.plan)) {
+    await inTurn(x);
+    rows = await rootWrite(x, q, wire.plan, wire.statement);
+  } else rows = await x.query(wire.plan).toArray();
   if (wire.overflow)
     for (const row of rows) {
       if (row[wire.overflow])
@@ -1327,7 +1342,9 @@ let writeContext:
   | Promise<
       AsyncLocalStorage<{
         queue: WriteQueue;
-        open: ReturnType<typeof deadline>;
+        open?: ReturnType<typeof deadline>;
+        /** Set by the queue's runner for the call whose turn it is (`inTurn`). */
+        turn?: { active: boolean };
       }>
     >
   | undefined;
@@ -1351,15 +1368,21 @@ async function enqueue<T>(
   queue: WriteQueue,
   work: () => Promise<T>,
 ): Promise<T> {
-  const owner = (await context()).getStore();
+  const store = await context();
+  const owner = store.getStore();
   const open = owner?.queue === queue ? owner.open : undefined;
-  const pending = queue.tail.then(() => {
+  const pending = queue.tail.then(async () => {
     // A root write awaited by its own transaction cannot acquire this queue.
     // Its transaction times out and rolls back; the stale write must not run.
     // Any other write only waited here, whatever became of the transaction
     // ahead of it.
     if (open?.closed) throw rolledBackWrite();
-    return work();
+    const turn = { active: true };
+    try {
+      return await store.run({ queue, open, turn }, work);
+    } finally {
+      turn.active = false;
+    }
   });
   queue.tail = pending.then(
     () => {},
@@ -1778,7 +1801,7 @@ export function fromPrisma8(
         ? new Op(
             (e) => read(q, e),
             x,
-            isReadOnlySql(q.parts.join("?")) ? undefined : schedule,
+            statementOf(q).read ? undefined : schedule,
           )
         : read(q);
     const rawWrite = (q: Sql) =>

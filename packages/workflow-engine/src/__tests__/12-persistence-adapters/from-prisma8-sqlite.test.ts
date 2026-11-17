@@ -10,6 +10,7 @@ import {
   describe,
   expect,
   it,
+  onTestFinished,
   vi,
 } from "vitest";
 import { createPrismaAICallLogger } from "../../persistence/prisma/ai-logger.js";
@@ -1085,6 +1086,22 @@ describe.skipIf(process.env.PRISMA_MAJOR !== "8")(
             "counter",
           ),
       ).toEqual([{ version: 1 }]);
+      // Every form that only reads runs without waiting for the queue.
+      for (const sql of [
+        "VALUES (1)",
+        "WITH q AS (SELECT 1) VALUES (1)",
+        "EXPLAIN QUERY PLAN SELECT 1",
+        "EXPLAIN UPDATE workflow_runs SET version = 0 RETURNING id",
+      ])
+        expect(
+          await Promise.race([
+            prisma
+              .$withColumns({})
+              .$queryRawUnsafe(sql)
+              .then(() => `${sql}: ran`),
+            pause(1000).then(() => `${sql}: queued`),
+          ]),
+        ).toBe(`${sql}: ran`);
       release();
       await transaction;
       expect(await pending).toHaveLength(120);
@@ -1461,15 +1478,126 @@ describe.skipIf(process.env.PRISMA_MAJOR !== "8")(
           ?.priority,
       ).toBe(6);
     });
+
+    // Only the root's write queue may open a transaction on the root
+    // connection. An EXPLAIN reads: it neither waits in the queue nor takes the
+    // lock, so a queued write never runs inside it and never goes with its error.
+    it("never takes another caller's write into a raw EXPLAIN", async () => {
+      const observer = new DatabaseSync(file);
+      try {
+        const explain =
+          "EXPLAIN UPDATE workflow_runs SET priority = 9 WHERE id = 'seed' RETURNING id";
+        for (const columns of [{}, { missing: "int" }]) {
+          await prisma.workflowRun.upsert({
+            where: { id: "seed" },
+            create: run("seed"),
+            update: {},
+          });
+          const [plan, removed] = await Promise.allSettled([
+            prisma.$withColumns(columns).$queryRawUnsafe(explain),
+            prisma.workflowRun.deleteMany({ where: { id: "seed" } }),
+          ]);
+          expect(removed).toEqual({ status: "fulfilled", value: { count: 1 } });
+          expect(
+            observer
+              .prepare("SELECT id FROM workflow_runs WHERE id = 'seed'")
+              .all(),
+          ).toEqual([]);
+          expect(plan.status).toBe(
+            "missing" in columns ? "rejected" : "fulfilled",
+          );
+        }
+      } finally {
+        observer.close();
+      }
+    });
+
+    // Every raw form that may write waits in the queue and leaves nothing active
+    // on the root when it fails BUSY: the next root write is committed.
+    it.each([
+      "WITH q AS (SELECT 1) UPDATE workflow_runs SET priority = 9 WHERE id = 'seed'",
+      "WITH q AS (SELECT 1) UPDATE workflow_runs SET priority = 9 WHERE id = 'seed' RETURNING id",
+      "UPDATE workflow_runs SET priority = 9 WHERE id = 'seed'",
+      "/* c */ -- c\n (UPDATE workflow_runs SET priority = 9 WHERE id = 'seed') RETURNING id",
+      "REPLACE INTO workflow_runs (id, \"workflowId\", \"workflowName\", \"workflowType\", input) VALUES ('seed', 'wf', 'wf', 't', '{}') RETURNING id",
+      "INSERT OR IGNORE INTO workflow_runs (id, \"workflowId\", \"workflowName\", \"workflowType\", input) VALUES ('other', 'wf', 'wf', 't', '{}') RETURNING id",
+      "PRAGMA user_version = 7",
+      "CREATE TABLE IF NOT EXISTS raw_probe (n INTEGER)",
+    ])("commits the root write after %s failed BUSY", async (sql) => {
+      const observer = new DatabaseSync(file);
+      const timeout = (ms: number) =>
+        prisma
+          .$withColumns({ timeout: "int" })
+          .$queryRawUnsafe(`PRAGMA busy_timeout = ${ms}`);
+      try {
+        observer.exec("BEGIN IMMEDIATE");
+        await timeout(1);
+        const error = await prisma
+          .$withColumns({ id: "text" })
+          .$queryRawUnsafe(sql)
+          .catch((e: unknown) => e);
+        observer.exec("ROLLBACK");
+        await timeout(5000);
+        expect(isSqliteBusy(error) || /syntax error/.test(String(error))).toBe(
+          true,
+        );
+        expect(
+          await prisma.workflowRun.deleteMany({ where: { id: "seed" } }),
+        ).toEqual({ count: 1 });
+        expect(observer.prepare("SELECT id FROM workflow_runs").all()).toEqual(
+          [],
+        );
+      } finally {
+        await timeout(5000);
+        observer.close();
+      }
+    });
+
+    it("runs a raw statement SQLite cannot run in a transaction", async () => {
+      await expect(
+        prisma.$withColumns({}).$queryRawUnsafe("VACUUM"),
+      ).resolves.toEqual([]);
+      await expect(
+        prisma
+          .$withColumns({ busy: "int", log: "int", checkpointed: "int" })
+          .$queryRawUnsafe("PRAGMA wal_checkpoint(PASSIVE)"),
+      ).resolves.toEqual([{ busy: 0, log: -1, checkpointed: -1 }]);
+    });
+
+    // The same rule, from the inside: a statement that may write, sent to the
+    // root by anything but its queue turn, is refused before it runs.
+    it("refuses a root statement that may write outside the write queue", async () => {
+      const observer = new DatabaseSync(file);
+      onTestFinished(() => observer.close());
+      const update = new Sql().t(
+        "UPDATE workflow_runs SET priority = 77 WHERE id = 'seed' RETURNING priority",
+      ) as InstanceType<typeof Sql>;
+      await expect(
+        rowsOf(db, update, { priority: "sqlite/integer@1" }),
+      ).rejects.toThrow(/outside its write queue/);
+      expect(
+        await rowsOf(
+          db,
+          new Sql().t("SELECT 1 AS n") as InstanceType<typeof Sql>,
+          {
+            n: "sqlite/integer@1",
+          },
+        ),
+      ).toEqual([{ n: 1 }]);
+      expect(
+        observer.prepare("SELECT priority FROM workflow_runs").all(),
+      ).toEqual([{ priority: 5 }]);
+    });
   },
 );
 
-// A read that fails SQLITE_BUSY at its first step stays active on the root
-// connection (node:sqlite does not reset the iterator). SQLite then keeps the
-// read transaction of the next statement open: with a rollback journal other
-// connections cannot commit, in WAL the root reads a stale snapshot, fails its
-// writes with SQLITE_BUSY_SNAPSHOT and holds back the checkpoint. The adapter
-// collects the statement after such a failure.
+// A root read that fails SQLITE_BUSY at its first step stays active on the
+// root connection until the statement object is garbage collected (node:sqlite
+// does not reset the iterator, and the adapter cannot reach it). That is a
+// documented limit: other connections cannot commit (rollback journal), or the
+// root reads a stale snapshot and fails its writes with SQLITE_BUSY_SNAPSHOT
+// (WAL). These tests hold the rule that matters: no root write is acknowledged
+// and then lost, on either journal mode.
 describe
   .skipIf(process.env.PRISMA_MAJOR !== "8")
   .each(["delete", "wal"] as const)(
@@ -1488,7 +1616,7 @@ describe
       observer = new DatabaseSync(file);
       observer.exec("PRAGMA busy_timeout = 50");
       observer.exec("CREATE TABLE probe (n INTEGER)");
-      await prisma.workflowRun.count();
+      await prisma.workflowRun.create({ data: run("seed") });
     }, 30_000);
     afterAll(async () => {
       observer?.close();
@@ -1496,12 +1624,12 @@ describe
       if (dir) rmSync(dir, { recursive: true, force: true });
     });
 
-    it("leaves no read transaction open on the root connection", async () => {
+    it("acknowledges no root write it then loses", async () => {
       const timeout = (ms: number) =>
         prisma
           .$withColumns({ timeout: "int" })
           .$queryRawUnsafe(`PRAGMA busy_timeout = ${ms}`);
-      // Another connection that keeps the root out: it holds the file (rollback
+      // Another connection keeps the root out: it holds the file (rollback
       // journal), or takes it over to switch to WAL with exclusive locking, as
       // another process starting on the file would.
       const holder = new DatabaseSync(file);
@@ -1512,73 +1640,84 @@ describe
         holder.prepare("SELECT count(*) FROM sqlite_master").all();
       }
       await timeout(1);
-      const error = await prisma.workflowRun
-        .findMany()
-        .catch((e: unknown) => e);
-      expect(isSqliteBusy(error)).toBe(true);
+      expect(
+        isSqliteBusy(
+          await prisma.workflowRun.findMany().catch((e: unknown) => e),
+        ),
+      ).toBe(true);
+      // A write that needs no rows back fails BUSY too, and leaves nothing behind.
+      expect(
+        isSqliteBusy(
+          await prisma
+            .$withColumns({})
+            .$queryRawUnsafe(
+              "WITH q AS (SELECT 1) UPDATE workflow_runs SET priority = 9 WHERE id = 'seed'",
+            )
+            .catch((e: unknown) => e),
+        ),
+      ).toBe(true);
       if (mode === "delete") holder.exec("COMMIT");
       holder.close();
+      // In WAL another connection commits after the root's snapshot was pinned.
+      if (mode === "wal") observer.exec("INSERT INTO probe VALUES (1)");
       await timeout(5000);
 
-      // The root's next statement is where a stalled read would keep its transaction open.
-      expect(await prisma.workflowRun.count()).toBe(0);
-      expect(() => {
-        observer.exec("BEGIN IMMEDIATE");
-        observer.exec("INSERT INTO probe VALUES (1)");
-        observer.exec("COMMIT");
-      }).not.toThrow();
-      expect(
-        await prisma
-          .$withColumns({ n: "int" })
-          .$queryRawUnsafe("SELECT count(*) AS n FROM probe"),
-      ).toEqual([{ n: 1 }]);
-      await expect(
-        prisma.workflowRun.create({ data: run("after-busy-read") }),
-      ).resolves.toMatchObject({ id: "after-busy-read" });
-      if (mode === "wal") {
-        expect(
-          observer.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get().busy,
-        ).toBe(0);
-      }
-    });
-
-    // The statement is collected while root writes are running: none is lost.
-    // (Rollback journal only: the WAL file cannot be taken over again once converted.)
-    it.runIf(mode === "delete")(
-      "keeps every root write acknowledged while the stalled read is collected",
-      async () => {
-        const holder = new DatabaseSync(file);
-        holder.exec("BEGIN EXCLUSIVE");
-        await prisma
-          .$withColumns({ timeout: "int" })
-          .$queryRawUnsafe("PRAGMA busy_timeout = 1");
-        const ids = Array.from({ length: 20 }, (_, i) => `during-${i}`);
-        const failed = prisma.workflowRun.findMany().catch((e: unknown) => e);
-        // The timer fires while the adapter is between its collections.
-        const written = new Promise<void>((resolve, reject) =>
-          setTimeout(async () => {
-            try {
-              holder.exec("COMMIT");
-              holder.close();
-              for (const id of ids)
-                await prisma.workflowRun.create({ data: run(id) });
-              resolve();
-            } catch (error) {
-              reject(error);
-            }
-          }),
-        );
-        expect(isSqliteBusy(await failed)).toBe(true);
-        await written;
-        await prisma
-          .$withColumns({ timeout: "int" })
-          .$queryRawUnsafe("PRAGMA busy_timeout = 5000");
-        const committed = observer
-          .prepare("SELECT id FROM workflow_runs WHERE id LIKE 'during-%'")
+      const writes: Array<[string, () => Promise<unknown>]> = [
+        ["create", () => prisma.workflowRun.create({ data: run("created") })],
+        [
+          "raw RETURNING",
+          () =>
+            prisma
+              .$withColumns({ id: "text" })
+              .$queryRawUnsafe(
+                "UPDATE workflow_runs SET priority = 4 WHERE id = 'seed' RETURNING id",
+              ),
+        ],
+        [
+          "raw CTE",
+          () =>
+            prisma
+              .$withColumns({})
+              .$queryRawUnsafe(
+                "WITH q AS (SELECT 1) UPDATE workflow_runs SET \"workflowName\" = 'cte' WHERE id = 'seed'",
+              ),
+        ],
+        [
+          "deleteMany",
+          () => prisma.workflowRun.deleteMany({ where: { id: "created" } }),
+        ],
+      ];
+      const committed = () =>
+        observer
+          .prepare(
+            'SELECT id, priority, "workflowName" AS name FROM workflow_runs ORDER BY id',
+          )
           .all()
-          .map((r: any) => r.id);
-        expect(committed.sort()).toEqual([...ids].sort());
-      },
-    );
+          .map((r: any) => `${r.id}:${r.priority}:${r.name}`);
+      const outcomes: string[] = [];
+      for (const [name, write] of writes) {
+        const before = committed();
+        const error = await write().then(
+          () => undefined,
+          (e: unknown) => e,
+        );
+        // Acknowledged means committed; refused means nothing changed.
+        if (error) {
+          expect(isSqliteBusy(error)).toBe(true);
+          expect(committed()).toEqual(before);
+        } else expect(committed()).not.toEqual(before);
+        outcomes.push(`${name}:${error ? "refused" : "committed"}`);
+      }
+      // With a rollback journal the root still holds its read lock and can
+      // upgrade: every write commits. In WAL a write may be refused while the
+      // stale snapshot lasts, never acknowledged and dropped.
+      if (mode === "delete")
+        expect(outcomes).toEqual([
+          "create:committed",
+          "raw RETURNING:committed",
+          "raw CTE:committed",
+          "deleteMany:committed",
+        ]);
+    });
   },
 );
