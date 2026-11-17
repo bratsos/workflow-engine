@@ -76,8 +76,10 @@ describe.skipIf(!realDatabase)(
         executionGroup: 3,
         status: "SUSPENDED",
       });
+      // Overdue by more than one threshold: nothing is polling it, so the
+      // reaper's waiting guard does not hold the run back.
       await db.persistence.updateStage(suspended.id, {
-        nextPollAt: failedAt,
+        nextPollAt: new Date(failedAt.getTime() - 2 * stuckThresholdMs),
         pollInterval: 1_000,
         suspendedState: { batchId: "suspended-batch" },
       });
@@ -219,6 +221,26 @@ describe.skipIf(!realDatabase)(
           expectedErrorMessage: errorMessage,
         })),
       );
+    });
+
+    it("leaves a run whose suspended stage is not yet overdue", async () => {
+      const { id, stage } = await db.seed("RUNNING", "SUSPENDED");
+      await db.persistence.updateStage(stage.id, { nextPollAt: failedAt });
+
+      const result = await db.kernel.dispatch({
+        type: "run.reapStuck",
+        stuckThresholdMs,
+      });
+
+      expect(result).toMatchObject({ failed: 0, transitioned: 0, healed: 0 });
+      expect(await db.persistence.getRun(id)).toMatchObject({
+        status: "RUNNING",
+        completedAt: null,
+      });
+      expect(await db.persistence.getStage(id, "first")).toMatchObject({
+        status: "SUSPENDED",
+        nextPollAt: failedAt,
+      });
     });
 
     it("does not reap after a competing version update", async () => {
