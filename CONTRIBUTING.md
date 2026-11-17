@@ -58,6 +58,18 @@ PRISMA_MAJOR=7 pnpm --filter @bratsos/workflow-engine-console exec vitest run sr
 PRISMA_MAJOR=8 pnpm --filter @bratsos/workflow-engine-console exec vitest run src/__tests__/prisma-read-port.sqlite.test.ts
 ```
 
+The `sqlite-conformance` job runs those commands for each Prisma major on Node 24,
+and on floor rows: Prisma 6 and 7 on 22.12.0, and Prisma 8 on 22.20.0, 24.11.0
+and 26.0.0, the lowest releases the docs claim for its SQLite target. The floor
+rows exist because Prisma 8 SQLite runs on Node's experimental `node:sqlite`,
+which differs between releases (boolean binds, reading text that holds a NUL,
+and a required flag before 22.13), so a claimed floor that CI never runs is a
+guess. Node 22.11.0, the engine's general floor, has no row: the workspace's
+Prisma 7 dev dependency (`prisma@7.10.1`) fails its install below 22.12. To
+reproduce a row, switch to that Node (for example `fnm use 22.20.0`), run
+`pnpm install` again so Prisma 7's `better-sqlite3` binary matches that Node
+major, and run the commands above with the row's `PRISMA_MAJOR`.
+
 ### Stored-row compatibility fixtures
 
 The gated `test:sqlite` and `test:pg` suites load committed snapshots from
@@ -103,18 +115,6 @@ DATABASE_URL=postgresql://postgres:postgres@localhost:5432/workflow_engine_test 
   PRISMA_MAJOR=7 STORED_ROWS_SNAPSHOT_LABEL="$VERSION" \
   pnpm --filter @bratsos/workflow-engine run capture:stored-rows
 ```
-
-The `sqlite-conformance` job runs those commands for each Prisma major on Node 24,
-and on floor rows: Prisma 6 and 7 on 22.12.0, and Prisma 8 on 22.20.0, 24.11.0
-and 26.0.0, the lowest releases the docs claim for its SQLite target. The floor
-rows exist because Prisma 8 SQLite runs on Node's experimental `node:sqlite`,
-which differs between releases (boolean binds, reading text that holds a NUL,
-and a required flag before 22.13), so a claimed floor that CI never runs is a
-guess. Node 22.11.0, the engine's general floor, has no row: the workspace's
-Prisma 7 dev dependency (`prisma@7.10.1`) fails its install below 22.12. To
-reproduce a row, switch to that Node (for example `fnm use 22.20.0`), run
-`pnpm install` again so Prisma 7's `better-sqlite3` binary matches that Node
-major, and run the commands above with the row's `PRISMA_MAJOR`.
 
 ## Package layout
 
