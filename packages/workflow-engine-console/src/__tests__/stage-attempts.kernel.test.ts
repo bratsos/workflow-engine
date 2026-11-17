@@ -10,9 +10,14 @@
  */
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
+import { createWorkflowConsole } from "../handler";
+import { createInMemoryConsoleReadPort } from "../in-memory-read-port";
 import {
   type AttemptEventInput,
+  type AttemptUnavailableReason,
   buildStageAttemptHistory,
+  type HeldStageEvents,
+  mergeStageEvents,
   type StageAttemptHistory,
 } from "../stage-attempts";
 
@@ -98,10 +103,13 @@ async function snapshot(h: any, runId: string): Promise<Snapshot> {
       stageId: s.stageId,
       attempt: s.attempt,
       status: s.status,
+      startedAt: s.startedAt ?? null,
+      completedAt: s.completedAt ?? null,
+      errorMessage: s.errorMessage ?? null,
     })),
     steps,
     // Complete: the in-memory outbox is never purged, so its rows are 1..n.
-    stageEvents: { events, complete: true },
+    stageEvents: { events, coverage: "from-start" },
   });
   const snap: Snapshot = {
     runStatus: run.status,
@@ -609,5 +617,534 @@ describe("I want a cancelled or restarted stage never shown as one attempt with 
     expect(lost!.events.map((e) => e.eventType)).toEqual(["stage:started"]);
     expect(lost!.steps.map((x) => x.stepId)).toEqual(["fetch"]);
     expect(again!.steps).toEqual([]);
+  });
+});
+
+/** What the page reads of one run at one moment: its rows and every run's outbox. */
+interface Moment {
+  runId: string;
+  run: any;
+  stages: any[];
+  steps: any[];
+  outbox: any[];
+}
+
+async function moment(h: any, runId: string): Promise<Moment> {
+  const stages = await h.persistence.getStagesByRun(runId);
+  const steps: any[] = [];
+  for (const stage of stages) {
+    for (const step of await h.stepLedger.list(stage.id)) {
+      steps.push({ ...step, stageRecordId: stage.id });
+    }
+  }
+  return {
+    runId,
+    run: { ...(await h.persistence.getRun(runId)) },
+    stages: stages.map((s: any) => ({ ...s })),
+    steps,
+    outbox: (h.persistence.outbox as any[]).map((row) => ({ ...row })),
+  };
+}
+
+/**
+ * The page's model of a run with some outbox rows removed: the in-memory
+ * reader over the remaining rows, served by the console handler, folded by
+ * the page's merge (asking again while `more`), grouped from the JSON as the
+ * UI receives it.
+ */
+async function pageModel(m: Moment, removed: (row: any) => boolean) {
+  const rows = m.outbox.filter((row) => !removed(row));
+  const reader = createInMemoryConsoleReadPort({
+    runs: [
+      {
+        id: m.runId,
+        createdAt: m.run.createdAt,
+        updatedAt: m.run.updatedAt,
+        workflowId: m.run.workflowId,
+        workflowName: m.run.workflowName,
+        workflowType: m.run.workflowType,
+        status: m.run.status,
+        startedAt: m.run.startedAt ?? null,
+        completedAt: m.run.completedAt ?? null,
+        duration: null,
+        totalCost: 0,
+        totalTokens: 0,
+        priority: 0,
+        redriveCount: m.run.redriveCount ?? 0,
+      },
+    ],
+    stages: m.stages.map((s) => ({
+      id: s.id,
+      workflowRunId: m.runId,
+      stageId: s.stageId,
+      stageName: s.stageName,
+      stageNumber: s.stageNumber,
+      executionGroup: s.executionGroup,
+      attempt: s.attempt,
+      status: s.status,
+      startedAt: s.startedAt ?? null,
+      completedAt: s.completedAt ?? null,
+      duration: s.duration ?? null,
+      nextPollAt: s.nextPollAt ?? null,
+      pollInterval: s.pollInterval ?? null,
+      maxWaitUntil: s.maxWaitUntil ?? null,
+      errorMessage: s.errorMessage ?? null,
+    })),
+    steps: m.steps.map((step) => ({
+      id: `${step.stageRecordId}:${step.stepId}`,
+      stageRecordId: step.stageRecordId,
+      stepId: step.stepId,
+      seq: step.seq,
+      kind: step.kind,
+      status: step.status,
+      attempt: step.attempt,
+      leaseExpiresAt: null,
+      deadlineAt: null,
+      externalKey: step.externalKey ?? null,
+      error: step.error ?? null,
+      createdAt: step.createdAt,
+      updatedAt: step.updatedAt,
+    })),
+    events: rows.map((row) => ({
+      id: row.id,
+      workflowRunId: row.workflowRunId,
+      sequence: row.sequence,
+      eventType: row.eventType,
+      occurredAt: row.occurredAt,
+      publishedAt: null,
+      retryCount: 0,
+      dlqAt: null,
+    })),
+    stageEvents: rows
+      .filter((row) => HISTORY_TYPES.has(row.eventType))
+      .map((row) => ({
+        workflowRunId: row.workflowRunId,
+        sequence: row.sequence,
+        eventType: row.eventType,
+        occurredAt: row.occurredAt,
+        stageId: row.payload.stageId ?? null,
+        error:
+          row.eventType === "stage:retrying" || row.eventType === "stage:failed"
+            ? (row.payload.error ?? null)
+            : null,
+      })),
+  });
+  const handler = createWorkflowConsole({ reader, authorize: () => true });
+  let held: HeldStageEvents | null = null;
+  let body: any;
+  for (let read = 0; read < 10; read++) {
+    const query = held ? `?stageEventsAfter=${held.lastSequence}` : "";
+    const res = await handler(
+      new Request(
+        `https://console.example/console/api/runs/${m.runId}${query}`,
+      ),
+    );
+    expect(res.status).toBe(200);
+    body = await res.json();
+    held = mergeStageEvents(held, body.stageEvents);
+    if (held && !held.more) break;
+  }
+  return buildStageAttemptHistory({
+    redriveCount: body.run.redriveCount,
+    stages: body.stages,
+    steps: body.steps,
+    stageEvents: {
+      events: held!.events,
+      coverage: held!.coverage,
+      caughtUp: !held!.more,
+    },
+  });
+}
+
+type Retention = {
+  name: string;
+  removed: (row: any) => boolean;
+  /** The only reasons that are true for a stage of the run when rows are removed this way. */
+  reasons: AttemptUnavailableReason[];
+};
+
+function retentionStates(m: Moment): Retention[] {
+  const own = (row: any) => row.workflowRunId === m.runId;
+  const n = m.outbox.filter(own).length;
+  const states: Retention[] = [
+    { name: "all kept", removed: () => false, reasons: [] },
+    { name: "all gone", removed: () => true, reasons: ["no-retained-events"] },
+    {
+      name: "only other runs' rows left",
+      removed: own,
+      reasons: ["no-retained-events"],
+    },
+  ];
+  for (let k = 1; k < n; k++) {
+    states.push({
+      name: `prefix 1..${k} gone`,
+      removed: (row) => own(row) && row.sequence <= k,
+      reasons: ["events-incomplete"],
+    });
+  }
+  for (let i = 2; i < n; i++) {
+    states.push({
+      name: `middle ${i} gone`,
+      removed: (row) => own(row) && row.sequence === i,
+      reasons: ["events-incomplete"],
+    });
+  }
+  for (let k = 2; k <= n; k++) {
+    // Nothing in the remaining rows can show that a tail is missing; only the
+    // stage's row can, and the page must say so instead of a stale history.
+    states.push({
+      name: `tail ${k}..${n} gone`,
+      removed: (row) => own(row) && row.sequence >= k,
+      reasons: ["inconsistent", "no-stage-events"],
+    });
+  }
+  return states;
+}
+
+/**
+ * Every retention state of the run's rows gives, for every stage, either the
+ * history read with all rows kept, or unavailable with a reason that is true
+ * for what was removed.
+ */
+async function expectTrueUnderRetention(m: Moment) {
+  const truth = await pageModel(m, () => false);
+  const tally: Record<string, number> = {};
+  for (const state of retentionStates(m)) {
+    const model = await pageModel(m, state.removed);
+    for (const [stageRecordId, expected] of truth) {
+      const got = model.get(stageRecordId)!;
+      const label = `${state.name} / ${stageRecordId}`;
+      if (got.available) {
+        expect(got, label).toEqual(expected);
+        tally.same = (tally.same ?? 0) + 1;
+      } else {
+        expect(state.reasons, label).toContain(got.reason);
+        if (got.reason === "inconsistent")
+          expect(got.mismatch, label).toBeDefined();
+        tally[got.reason] = (tally[got.reason] ?? 0) + 1;
+      }
+    }
+  }
+  return { truth, tally };
+}
+
+/** A harness whose clock moves 1 ms on every reading, as a real clock moves between two writes. */
+function tickingHarness(workflows: unknown[]) {
+  const { clock } = createTestKernel([], {
+    clockStart: new Date("2026-03-01T12:00:00.000Z"),
+  });
+  const read = clock.now.bind(clock);
+  clock.now = () => {
+    const now = read();
+    clock.advance(1);
+    return now;
+  };
+  const other = defineStage({
+    id: "other",
+    name: "Other",
+    schemas,
+    async execute(ctx: any) {
+      return { output: ctx.input };
+    },
+  });
+  return createTestHarness({
+    workflows: [
+      ...workflows,
+      new WorkflowBuilder("other", "other", "d", io, io).pipe(other).build(),
+    ],
+    clock,
+  });
+}
+
+function shapeOf(
+  histories: Map<string, StageAttemptHistory>,
+  m: Moment,
+  stageId: string,
+) {
+  const record = m.stages.find((s) => s.stageId === stageId)!;
+  const history = histories.get(record.id)!;
+  return history.available
+    ? history.attempts.map((a) => [a.trigger, a.outcome])
+    : `unavailable:${history.reason}`;
+}
+
+describe("I want every statement about a stage's history to be true under any retention of the run's events", () => {
+  const wf = (id: string, stage: unknown) =>
+    new WorkflowBuilder(id, id, "d", io, io).pipe(stage).build();
+  const stageOf = (execute: (ctx: any) => Promise<unknown>) =>
+    defineStage({ id: "s", name: "S", schemas, execute });
+
+  async function withOtherRun(h: any) {
+    const other = (await h.start("other", { v: "o" })).workflowRunId;
+    await drain(h, other, 4);
+  }
+
+  const outcomes: Array<{
+    name: string;
+    expected: unknown;
+    run: () => Promise<Moment>;
+  }> = [
+    {
+      name: "never started (claimed, its job not run)",
+      expected: [],
+      async run() {
+        const h = tickingHarness([
+          wf(
+            "wf",
+            stageOf(async (ctx) => ({ output: ctx.input })),
+          ),
+        ]);
+        await withOtherRun(h);
+        const runId = (await h.start("wf", { v: "x" })).workflowRunId;
+        await h.kernel.dispatch({ type: "run.claimPending", workerId: "w" });
+        return moment(h, runId);
+      },
+    },
+    {
+      name: "never started (cancelled before its job ran)",
+      expected: [],
+      async run() {
+        const h = tickingHarness([
+          wf(
+            "wf",
+            stageOf(async (ctx) => ({ output: ctx.input })),
+          ),
+        ]);
+        await withOtherRun(h);
+        const runId = (await h.start("wf", { v: "x" })).workflowRunId;
+        await h.kernel.dispatch({ type: "run.claimPending", workerId: "w" });
+        await h.cancel(runId);
+        return moment(h, runId);
+      },
+    },
+    {
+      name: "running",
+      expected: [["initial", "running"]],
+      async run() {
+        let h: any;
+        let runId = "";
+        let inside: Moment | undefined;
+        h = tickingHarness([
+          wf(
+            "wf",
+            stageOf(async (ctx) => {
+              await ctx.step.run("fetch", async () => "x");
+              inside = await moment(h, runId);
+              return { output: ctx.input };
+            }),
+          ),
+        ]);
+        await withOtherRun(h);
+        runId = (await h.start("wf", { v: "x" })).workflowRunId;
+        await drain(h, runId, 2);
+        return inside!;
+      },
+    },
+    {
+      name: "suspended",
+      expected: [["initial", "suspended"]],
+      async run() {
+        const h = tickingHarness([
+          wf(
+            "wf",
+            stageOf(async (ctx) => {
+              await ctx.step.sleep("nap", "20m");
+              return { output: ctx.input };
+            }),
+          ),
+        ]);
+        await withOtherRun(h);
+        const runId = (await h.start("wf", { v: "x" })).workflowRunId;
+        for (let i = 0; i < 5; i++) {
+          await h.tick([runId]);
+          const stages = await h.persistence.getStagesByRun(runId);
+          if (stages[0]?.status === "SUSPENDED") break;
+        }
+        return moment(h, runId);
+      },
+    },
+    {
+      name: "completed after a job retry",
+      expected: [
+        ["initial", "retrying"],
+        ["job-retry", "completed"],
+      ],
+      async run() {
+        let calls = 0;
+        const h = tickingHarness([
+          wf(
+            "wf",
+            stageOf(async (ctx) => {
+              calls++;
+              await ctx.step.run(`call-${calls}`, async () => calls);
+              if (calls === 1) throw new Error("upstream 503");
+              return { output: ctx.input };
+            }),
+          ),
+        ]);
+        await withOtherRun(h);
+        const { workflowRunId } = await h.run("wf", { v: "x" });
+        return moment(h, workflowRunId);
+      },
+    },
+    {
+      name: "failed",
+      expected: [
+        ["initial", "retrying"],
+        ["job-retry", "retrying"],
+        ["job-retry", "failed"],
+      ],
+      async run() {
+        let calls = 0;
+        const h = tickingHarness([
+          wf(
+            "wf",
+            stageOf(async () => {
+              calls++;
+              throw new Error(`always ${calls}`);
+            }),
+          ),
+        ]);
+        await withOtherRun(h);
+        const { workflowRunId } = await h.run("wf", { v: "x" });
+        return moment(h, workflowRunId);
+      },
+    },
+    {
+      name: "cancelled while running",
+      expected: [["initial", "cancelled"]],
+      async run() {
+        let h: any;
+        let runId = "";
+        h = tickingHarness([
+          wf(
+            "wf",
+            stageOf(async (ctx) => {
+              await ctx.step.run("fetch", async () => "x");
+              await h.kernel.dispatch({
+                type: "run.cancel",
+                workflowRunId: runId,
+              });
+              return { output: ctx.input };
+            }),
+          ),
+        ]);
+        await withOtherRun(h);
+        runId = (await h.start("wf", { v: "x" })).workflowRunId;
+        await drain(h, runId, 2);
+        return moment(h, runId);
+      },
+    },
+    {
+      name: "completed on a rerun after a redrive",
+      expected: [
+        ["initial", "retrying"],
+        ["job-retry", "retrying"],
+        ["job-retry", "failed"],
+        ["rerun", "completed"],
+      ],
+      async run() {
+        let failing = true;
+        const h = tickingHarness([
+          wf(
+            "wf",
+            stageOf(async (ctx) => {
+              if (failing) throw new Error("down");
+              return { output: ctx.input };
+            }),
+          ),
+        ]);
+        await withOtherRun(h);
+        const { workflowRunId } = await h.run("wf", { v: "x" });
+        failing = false;
+        await redrive(h, workflowRunId);
+        await drain(h, workflowRunId);
+        return moment(h, workflowRunId);
+      },
+    },
+    {
+      name: "suspended again after a retry inside stage.pollSuspended",
+      expected: [
+        ["initial", "retrying"],
+        ["poll-retry", "suspended"],
+      ],
+      async run() {
+        let replays = 0;
+        const h = tickingHarness([
+          wf(
+            "wf",
+            stageOf(async (ctx) => {
+              await ctx.step.sleep("nap", "1m");
+              await ctx.step.run("after-nap", async () => {
+                replays++;
+                if (replays === 1) throw new Error("flaky after the wait");
+                return "ok";
+              });
+              return { output: ctx.input };
+            }),
+          ),
+        ]);
+        await withOtherRun(h);
+        const runId = (await h.start("wf", { v: "x" })).workflowRunId;
+        for (let i = 0; i < 8 && replays === 0; i++) await h.tick([runId]);
+        const stages = await h.persistence.getStagesByRun(runId);
+        expect(stages[0]?.status).toBe("SUSPENDED");
+        return moment(h, runId);
+      },
+    },
+    {
+      name: "completed after its job was delivered again (worker crash)",
+      expected: [
+        ["initial", "lost"],
+        ["redelivery", "completed"],
+      ],
+      async run() {
+        let calls = 0;
+        const h: any = tickingHarness([
+          wf(
+            "wf",
+            stageOf(async (ctx) => {
+              calls++;
+              await ctx.step.run("fetch", async () => "fetched");
+              if (calls === 1) await new Promise(() => {});
+              return { output: ctx.input };
+            }),
+          ),
+        ]);
+        await withOtherRun(h);
+        const runId = (await h.start("wf", { v: "x" })).workflowRunId;
+        await h.kernel.dispatch({ type: "run.claimPending", workerId: "w" });
+        const execute = (job: any) =>
+          h.kernel.dispatch({
+            type: "job.execute",
+            workflowRunId: runId,
+            workflowId: "wf",
+            stageId: "s",
+            config: {},
+            attempt: job.attempt,
+            maxAttempts: 3,
+          });
+        const first = await h.jobQueue.dequeue();
+        void execute(first);
+        for (;;) {
+          const stage = await h.persistence.getStage(runId, "s");
+          if (stage && (await h.stepLedger.list(stage.id)).length === 1) break;
+          await new Promise((r) => setTimeout(r, 1));
+        }
+        await h.jobQueue.fail(first.jobId, "worker crashed", true);
+        await execute(await h.jobQueue.dequeue());
+        return moment(h, runId);
+      },
+    },
+  ];
+
+  it.each(outcomes)("$name", async ({ expected, run }) => {
+    const m = await run();
+    const { truth, tally } = await expectTrueUnderRetention(m);
+    expect(shapeOf(truth, m, "s")).toEqual(expected);
+    // Every stage is available with all rows kept, and some state of each
+    // kind made the page fall back.
+    expect(tally["no-retained-events"]).toBeGreaterThan(0);
+    expect(tally["events-incomplete"]).toBeGreaterThan(0);
   });
 });

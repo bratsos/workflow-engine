@@ -8,11 +8,20 @@ import {
   type ConsolePrismaClient,
   createPrismaConsoleReadPort,
 } from "../prisma-read-port";
+import { STAGE_EVENT_WINDOW } from "../read-port";
+import {
+  buildStageAttemptHistory,
+  type HeldStageEvents,
+  mergeStageEvents,
+} from "../stage-attempts";
 import { type RecordedStatement, recordingClient } from "./recording-client";
 
 const major = process.env.PRISMA_MAJOR ?? "7";
 const isPrisma8 = major === "8";
 const enginePersistence = "@bratsos/workflow-engine/persistence";
+// Variables, so `tsc` does not pull the engine's source into this typecheck.
+const kernelSpecifier = "@bratsos/workflow-engine/kernel";
+const engineSpecifier = "@bratsos/workflow-engine";
 const fromPrisma8 = isPrisma8
   ? (await import(enginePersistence)).fromPrisma8
   : undefined;
@@ -456,14 +465,20 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
       (await port.getRunDetail("run-gap", { stageEventsAfter: 2 }))
         ?.stageEvents,
     ).toMatchObject({ lastSequence: 4, complete: false });
-    // A run with no rows has an empty, unbroken range.
+    // A first read of a run with no retained row is not complete: a run has
+    // an outbox row from its creation, so none means they were removed.
     expect((await port.getRunDetail("run-pending"))?.stageEvents).toEqual({
       events: [],
       after: 0,
       lastSequence: 0,
-      complete: true,
+      complete: false,
       more: false,
     });
+    // A later read with nothing newer is an empty range past what is held.
+    expect(
+      (await port.getRunDetail("run-retried", { stageEventsAfter: 99 }))
+        ?.stageEvents,
+    ).toMatchObject({ events: [], lastSequence: 99, complete: true });
 
     const response = await createWorkflowConsole({
       reader: port,
@@ -523,6 +538,185 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
       complete: true,
       more: false,
     });
+  });
+
+  it("reads at most a window of a run's sequences per read, however few of them are lifecycle events", async () => {
+    const span = STAGE_EVENT_WINDOW + 500;
+    await prisma.workflowRun.createMany({
+      data: [mkRun("run-window", at(-9_005), "RUNNING", "wf-d", 0, 0)],
+    });
+    for (let start = 1; start <= span; start += 1000) {
+      await prisma.outboxEvent.createMany({
+        data: Array.from(
+          { length: Math.min(1000, span - start + 1) },
+          (_, i) => {
+            const sequence = start + i;
+            const lifecycle = sequence === 1 || sequence === span;
+            return mkEvent(
+              `window-${sequence}`,
+              "run-window",
+              sequence,
+              lifecycle ? "stage:started" : "stage:progress",
+              at(491),
+              null,
+              null,
+              { stageId: "fetch" },
+            );
+          },
+        ),
+      });
+    }
+    const calls: RecordedStatement[] = [];
+    const port = createPrismaConsoleReadPort(recordingClient(prisma, calls), {
+      databaseType: "sqlite",
+      now: () => at(100),
+    });
+    const first = (await port.getRunDetail("run-window"))!.stageEvents!;
+    expect(first).toMatchObject({
+      lastSequence: STAGE_EVENT_WINDOW,
+      complete: true,
+      more: true,
+    });
+    expect(first.events.map((e) => e.sequence)).toEqual([1]);
+    // Both range statements of the read are closed at the window.
+    const ranged = calls.filter(
+      (c) => c.sql.includes("outbox_events") && c.params.length === 3,
+    );
+    expect(ranged.length).toBe(2);
+    for (const call of ranged) expect(call.params[2]).toBe(STAGE_EVENT_WINDOW);
+    const rest = (await port.getRunDetail("run-window", {
+      stageEventsAfter: first.lastSequence,
+    }))!.stageEvents!;
+    expect(rest).toMatchObject({
+      lastSequence: span,
+      complete: true,
+      more: false,
+    });
+    expect(rest.events.map((e) => e.sequence)).toEqual([span]);
+  });
+
+  it("never says a stage that ran has not started when the run's outbox rows are gone (real kernel)", async () => {
+    // The gate's reproduction: a stage running when its run is cancelled,
+    // then the run's outbox rows removed as a retention job would.
+    const { createKernel } = await import(kernelSpecifier);
+    const persistenceModule = await import(enginePersistence);
+    const { defineStage, WorkflowBuilder } = await import(engineSpecifier);
+    const { z } = await import("zod");
+    const io = z.object({ v: z.string() });
+    let kernel: any;
+    let runId = "";
+    const slow = defineStage({
+      id: "slow",
+      name: "Slow",
+      schemas: { input: io, output: io, config: z.object({}) },
+      async execute(ctx: any) {
+        await kernel.dispatch({ type: "run.cancel", workflowRunId: runId });
+        return { output: ctx.input };
+      },
+    });
+    const workflow = new WorkflowBuilder("purged", "purged", "d", io, io)
+      .pipe(slow)
+      .build();
+    // Its own file: a claim takes every pending run it finds.
+    const file = join(directory, "kernel.db");
+    const db: ConsolePrismaClient & Record<string, any> = isPrisma8
+      ? (() => {
+          const raw = fixture.createSqliteDb(file);
+          return Object.assign(fromPrisma8!(raw), {
+            $disconnect: () => raw.close(),
+          });
+        })()
+      : fixture.createSqliteClient(file);
+    const options = { databaseType: "sqlite" as const };
+    kernel = createKernel({
+      persistence: persistenceModule.createPrismaWorkflowPersistence(
+        db,
+        options,
+      ),
+      jobTransport: persistenceModule.createPrismaJobQueue(db, {
+        ...options,
+        workerId: "w",
+      }),
+      stepLedger: persistenceModule.createPrismaStepLedger(db, options),
+      blobStore: persistenceModule.createPrismaBlobStore(db),
+      clock: { now: () => new Date() },
+      eventSink: { emit: async () => {} },
+      registry: { getWorkflow: () => workflow },
+    });
+    runId = (
+      await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "purged-run",
+        workflowId: "purged",
+        input: { v: "x" },
+      })
+    ).workflowRunId;
+    await kernel.dispatch({ type: "run.claimPending", workerId: "w" });
+    await kernel.dispatch({
+      type: "job.execute",
+      workflowRunId: runId,
+      workflowId: "purged",
+      stageId: "slow",
+      config: {},
+      attempt: 1,
+      maxAttempts: 3,
+    });
+
+    const handler = createWorkflowConsole({
+      reader: createPrismaConsoleReadPort(db, { databaseType: "sqlite" }),
+      authorize: () => true,
+    });
+    const page = async () => {
+      let held: HeldStageEvents | null = null;
+      let body: any;
+      do {
+        const query = held ? `?stageEventsAfter=${held.lastSequence}` : "";
+        body = await (
+          await handler(
+            new Request(
+              `https://console.example/console/api/runs/${runId}${query}`,
+            ),
+          )
+        ).json();
+        held = mergeStageEvents(held, body.stageEvents);
+      } while (held?.more);
+      const histories = buildStageAttemptHistory({
+        redriveCount: body.run.redriveCount,
+        stages: body.stages,
+        steps: body.steps,
+        stageEvents: {
+          events: held!.events,
+          coverage: held!.coverage,
+          caughtUp: !held!.more,
+        },
+      });
+      return { stage: body.stages[0], history: [...histories.values()][0]! };
+    };
+
+    const kept = await page();
+    expect(kept.stage).toMatchObject({ status: "CANCELLED", attempt: 0 });
+    expect(kept.stage.startedAt).not.toBeNull();
+    expect(
+      kept.history.available &&
+        kept.history.attempts.map((a) => [a.trigger, a.outcome]),
+    ).toEqual([["initial", "cancelled"]]);
+
+    // The cancel and the stage's start removed, the run's first rows kept.
+    await db.outboxEvent.deleteMany({
+      where: { workflowRunId: runId, sequence: { gte: 3 } },
+    });
+    expect((await page()).history).toMatchObject({
+      available: false,
+      reason: "no-stage-events",
+    });
+
+    // Every row removed: before this change, "This stage has not started."
+    await db.outboxEvent.deleteMany({ where: { workflowRunId: runId } });
+    expect((await page()).history).toMatchObject({
+      available: false,
+      reason: "no-retained-events",
+    });
+    await db.$disconnect?.();
   });
 
   it("cuts a lifecycle event's error text in SQL and says it was cut", async () => {

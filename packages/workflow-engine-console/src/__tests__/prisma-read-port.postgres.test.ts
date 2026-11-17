@@ -360,7 +360,7 @@ if (!DATABASE_URL) {
       });
     });
 
-    it("assembles a run detail from eight statements in one transaction", async () => {
+    it("assembles a run detail from nine statements in one transaction", async () => {
       const detail = await reader().getRunDetail("run-1");
       expect(detail?.run.id).toBe("run-1");
       expect(detail?.run.input).toEqual({ seeded: true });
@@ -521,6 +521,21 @@ if (!DATABASE_URL) {
         (await reader().getRunDetail("run-gap", { stageEventsAfter: 2 }))
           ?.stageEvents,
       ).toMatchObject({ lastSequence: 4, complete: false });
+
+      // A first read of a run with no retained row is not complete: a run
+      // has an outbox row from its creation, so none means they were removed.
+      await prisma.workflowRun.createMany({
+        data: [mkRun("run-no-rows", at(-9_010), "COMPLETED", "wf-d")],
+      });
+      expect((await reader().getRunDetail("run-no-rows"))?.stageEvents).toEqual(
+        {
+          events: [],
+          after: 0,
+          lastSequence: 0,
+          complete: false,
+          more: false,
+        },
+      );
     });
 
     it("cuts a lifecycle event's error text in SQL and says it was cut", async () => {
@@ -678,7 +693,7 @@ FROM generate_series(1, 2001) g`,
         return { statements: outbox.length, buffers, nodes };
       };
 
-      const sizes = [1_000, 30_000];
+      const sizes = [1_000, 12_000, 30_000];
       for (const rows of sizes) {
         const runId = `run-plan-${rows}`;
         await prisma.workflowRun.createMany({
@@ -695,10 +710,11 @@ FROM generate_series(1, ${rows}) g`,
       await prisma.$executeRawUnsafe(`ANALYZE "outbox_events"`);
 
       const poll = [];
-      for (const rows of sizes) {
+      for (const rows of [1_000, 30_000]) {
         poll.push(await measure(`run-plan-${rows}`, rows - 10));
       }
       const first = await measure("run-plan-30000");
+      const firstOfSmaller = await measure("run-plan-12000");
       // Nothing new: the highest-sequence probe answers and no range is read.
       const idle = await measure("run-plan-30000", 30_000);
       expect(idle.statements).toBe(poll[1]!.statements - 2);
@@ -715,8 +731,12 @@ FROM generate_series(1, ${rows}) g`,
       expect(poll[1]!.nodes.join("")).toContain(
         "outbox_events_workflowRunId_sequence_key",
       );
-      // A first read goes through the run once; that is what the poll avoids.
+      // A first read covers one window of the run's rows: what a poll avoids,
+      // and the same at 12,000 and at 30,000 rows.
       expect(first.buffers).toBeGreaterThan(poll[1]!.buffers * 10);
+      expect(first.buffers).toBeLessThanOrEqual(
+        firstOfSmaller.buffers * 1.25 + 10,
+      );
     });
 
     it("selects the step columns the UI needs to offer a signal", async () => {

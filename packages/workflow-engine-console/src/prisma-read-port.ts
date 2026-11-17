@@ -29,6 +29,7 @@ import {
   type RunSummary,
   STAGE_EVENT_ERROR_LIMIT,
   STAGE_EVENT_LIMIT,
+  STAGE_EVENT_WINDOW,
   STAGE_LIFECYCLE_EVENT_TYPES,
   type StageEvent,
   type StageEventLog,
@@ -858,19 +859,23 @@ LIMIT ${limit + 1}`;
   /**
    * The attempt history's events of one run with a sequence above `after`.
    *
-   * What a read costs follows the run's rows past `after`, never the run's
-   * total: every statement is a range scan on the `(workflowRunId, sequence)`
-   * unique index. `eventType` has no index, so the lifecycle statement still
-   * filters the heap rows of its range, which is why the page passes the last
-   * sequence it has read: a poll reads the rows written since the previous
-   * one, and only a first read goes through the whole run, once.
+   * What a read costs is bounded whatever the run's size: every statement is
+   * a range scan on the `(workflowRunId, sequence)` unique index, and the
+   * range is at most `STAGE_EVENT_WINDOW` sequences past `after`. `eventType`
+   * has no index, so the lifecycle statement filters the heap rows of its
+   * range; the window caps that, and the page passing the last sequence it
+   * has read makes a poll read only the rows written since the previous one.
+   * A first read of a long run is a few bounded reads, each continuing from
+   * the last.
    *
    * The read is closed at the run's highest sequence, taken first: the
    * transaction is READ COMMITTED on Postgres, so a row committed between the
    * statements must not be skipped by the page's next read. At most
    * `STAGE_EVENT_LIMIT` events come back; when more match, the read ends at
-   * its last event and says `more`, and the page asks again from there. The
-   * range check counts only the rows the read covers.
+   * its last event. Either cut says `more`, and the page asks again from
+   * `lastSequence`. The range check counts only the rows the read covers. A
+   * first read that finds no row is not complete: the run has an outbox row
+   * from its creation, so none means its events were removed.
    */
   private async readStageEvents(
     client: ConsolePrismaClient,
@@ -892,10 +897,11 @@ LIMIT ${limit + 1}`;
         events: [],
         after,
         lastSequence: after,
-        complete: true,
+        complete: after > 0,
         more: false,
       };
     }
+    const upper = Math.min(maxSeq, after + STAGE_EVENT_WINDOW);
 
     // Two payload fields are extracted in SQL and nothing else of the payload
     // is read (`workflow:completed` carries the run's output). The error text
@@ -918,11 +924,12 @@ WHERE "workflowRunId" = ${this.param(1)} AND sequence > ${this.param(2)} AND seq
   AND "eventType" IN (${types})
 ORDER BY sequence ASC
 LIMIT ${STAGE_EVENT_LIMIT + 1}`,
-      [runId, after, maxSeq],
+      [runId, after, upper],
     );
-    const more = rows.length > STAGE_EVENT_LIMIT;
+    const cut = rows.length > STAGE_EVENT_LIMIT;
     const events = rows.slice(0, STAGE_EVENT_LIMIT).map(mapStageEvent);
-    const lastSequence = more ? events[events.length - 1]!.sequence : maxSeq;
+    const lastSequence = cut ? events[events.length - 1]!.sequence : upper;
+    const more = lastSequence < maxSeq;
 
     // With no gap the rows in `(after, lastSequence]` are exactly
     // `after + 1 .. lastSequence`, so a count equal to the difference says the

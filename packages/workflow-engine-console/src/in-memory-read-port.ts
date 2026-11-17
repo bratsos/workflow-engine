@@ -22,6 +22,7 @@ import {
   type RunListQuery,
   type RunSummary,
   STAGE_EVENT_LIMIT,
+  STAGE_EVENT_WINDOW,
   type StageEvent,
   type StageEventLog,
   type StageSummary,
@@ -302,24 +303,24 @@ export class InMemoryConsoleReadPort implements ConsoleReadPort {
   }
 
   /**
-   * The same contract as the SQL reader: the events past `after`, at most
-   * `STAGE_EVENT_LIMIT` of them (then `more`, ending at the last event), the
-   * highest sequence the read covers, and whether that range is unbroken. The
-   * rows of a run are the sequences of `events` and `stageEvents` together.
+   * The same contract as the SQL reader: the events past `after` within
+   * `STAGE_EVENT_WINDOW` sequences, at most `STAGE_EVENT_LIMIT` of them (then
+   * ending at the last event), `more` when rows remain past the read, the
+   * highest sequence the read covers, and whether that range is unbroken (a
+   * first read with no row is not). The rows of a run are the sequences of
+   * `events` and `stageEvents` together.
    */
   private stageEventLog(
     runId: string,
     eventSequences: number[],
     after: number,
   ): StageEventLog {
-    const history = this.fixtures.stageEvents
-      .filter((evt) => evt.workflowRunId === runId && evt.sequence > after)
-      .slice()
-      .sort((a, b) => a.sequence - b.sequence);
     const sequences = [
       ...new Set([
         ...eventSequences.filter((seq) => seq > after),
-        ...history.map((evt) => evt.sequence),
+        ...this.fixtures.stageEvents
+          .filter((evt) => evt.workflowRunId === runId && evt.sequence > after)
+          .map((evt) => evt.sequence),
       ]),
     ].sort((a, b) => a - b);
     if (sequences.length === 0) {
@@ -327,27 +328,36 @@ export class InMemoryConsoleReadPort implements ConsoleReadPort {
         events: [],
         after,
         lastSequence: after,
-        complete: true,
+        complete: after > 0,
         more: false,
       };
     }
-    const more = history.length > STAGE_EVENT_LIMIT;
+    const maxSeq = sequences[sequences.length - 1]!;
+    const upper = Math.min(maxSeq, after + STAGE_EVENT_WINDOW);
+    const history = this.fixtures.stageEvents
+      .filter(
+        (evt) =>
+          evt.workflowRunId === runId &&
+          evt.sequence > after &&
+          evt.sequence <= upper,
+      )
+      .slice()
+      .sort((a, b) => a.sequence - b.sequence);
+    const cut = history.length > STAGE_EVENT_LIMIT;
     const events = history
       .slice(0, STAGE_EVENT_LIMIT)
       .map(({ workflowRunId: _runId, ...evt }) => ({
         ...evt,
         ...cutStageEventError(evt.error),
       }));
-    const lastSequence = more
-      ? events[events.length - 1]!.sequence
-      : sequences[sequences.length - 1]!;
+    const lastSequence = cut ? events[events.length - 1]!.sequence : upper;
     const covered = sequences.filter((seq) => seq <= lastSequence).length;
     return {
       events,
       after,
       lastSequence,
       complete: lastSequence - after === covered,
-      more,
+      more: lastSequence < maxSeq,
     };
   }
 

@@ -164,6 +164,12 @@ export type RunBoundaryEventType = (typeof RUN_BOUNDARY_EVENT_TYPES)[number];
 
 /** Ceiling on the events one run-detail read returns for the attempt history. */
 export const STAGE_EVENT_LIMIT = 2000;
+/**
+ * Outbox sequences of a run that one read of the attempt history covers at
+ * most, so a read goes through at most this many rows of the run whatever
+ * its size (`eventType` has no index, so the rows of the range are read).
+ */
+export const STAGE_EVENT_WINDOW = 10_000;
 /** Characters of a lifecycle event's error text that a read returns; the rest is cut. */
 export const STAGE_EVENT_ERROR_LIMIT = 2000;
 
@@ -215,9 +221,10 @@ export function cutStageEventError(text: string | null): {
  * boundary events of a run with a sequence greater than `after`. The page
  * keeps what it has read and asks only for the rows after its last sequence,
  * so one read costs the new rows of the run, never all of them. A read
- * returns at most `STAGE_EVENT_LIMIT` events; when more remain it stops there
+ * covers at most `STAGE_EVENT_WINDOW` sequences and returns at most
+ * `STAGE_EVENT_LIMIT` events; when rows remain past either it stops there
  * (`more`) and the page asks again from `lastSequence`, so a long history is
- * read in chunks over a few refreshes.
+ * read in bounded chunks.
  */
 export interface StageEventLog {
   /** Ascending by sequence, at most `STAGE_EVENT_LIMIT`. */
@@ -226,17 +233,20 @@ export interface StageEventLog {
   after: number;
   /**
    * The highest outbox sequence this read covers: the run's highest sequence,
-   * or when the read stopped at its limit, the sequence of its last event.
-   * `after` when no row is newer.
+   * `after + STAGE_EVENT_WINDOW` when that is lower, or the sequence of its
+   * last event when it stopped at `STAGE_EVENT_LIMIT`. `after` when no row is
+   * newer.
    */
   lastSequence: number;
   /**
-   * True only when the retained rows in `(after, lastSequence]` are one
-   * unbroken range. False means events were purged or are past retention, and
-   * a grouping built from them could be wrong.
+   * True only when every sequence in `(after, lastSequence]` has a retained
+   * row: with `after` 0, the run's history from its first event (a run's
+   * outbox starts at sequence 1 with `workflow:created`). A first read that
+   * finds no row is false. False means events were purged or are past
+   * retention, and a grouping built from them could be wrong.
    */
   complete: boolean;
-  /** True when the read stopped at `STAGE_EVENT_LIMIT` and rows past `lastSequence` remain. */
+  /** True when rows past `lastSequence` remain: the read stopped at its window or its limit. */
   more: boolean;
 }
 

@@ -117,9 +117,10 @@ the stage events (`stage:started`, `stage:suspended`, `stage:retrying`,
 `workflow:cancelled` events:
 
 - when the attempt started and ended, why it began (first run, job retry,
-  retry while suspended, or a rerun after a terminal outcome such as a
-  redrive) and how it ended (completed, retrying, failed, suspended, running
-  or cancelled);
+  retry while suspended, rerun after a redrive, started again after the
+  previous attempt ended, or started again while the previous execution had
+  no recorded end) and how it ended (completed, retrying, failed, suspended,
+  running, cancelled, or no end recorded);
 - the error that ended it;
 - the events of the attempt;
 - the steps that last changed during it: step id, kind, status, the step's
@@ -132,19 +133,23 @@ characters is cut by the read, and the page says so.
 
 The attempt boundaries are:
 
-- `stage:started` opens an attempt. A second `stage:started` while one is open
-  is itself the proof that a new execution began; what is not known is how the
-  earlier one ended, because a worker crash and re-delivery and a lease reaped
-  by `lease.reapStale` write no event. The earlier attempt is shown as *No end
-  recorded* (a lost worker or an expired lease, not failed and not cancelled),
-  its window closes where the next execution started, and the next attempt is
-  labelled a re-delivery. The page says that the steps of such a window are
-  placed by time only. The engine does not count a re-delivery on the stage's
+- `stage:started` opens an attempt.
+- A second `stage:started` while an attempt is open shows that the stage
+  started again; no event says how the earlier execution ended. The earlier
+  attempt is shown as *No end recorded* (not failed and not cancelled), its
+  window closes where the stage started again, and the next attempt is
+  labelled as started while the previous execution had no recorded end. Causes
+  that leave this record include a worker that stopped or lost its lease
+  (`lease.reapStale`), a job delivered again while it was still running, and an
+  outcome that could not be written after the stage's code ran; the page lists
+  them and does not pick one. The steps of such a window are placed by time
+  only, and the page says so. The engine does not count this on the stage's
   `attempt`, so the count check leaves it out.
 - `stage:suspended` and the poll that later resumes the stage stay inside the
   open attempt.
-- `stage:completed` and `stage:failed` end it. A `stage:started` after either
-  is a rerun and opens a new attempt.
+- `stage:completed` and `stage:failed` end it. A `stage:started` after an
+  ended attempt with no redrive in between is shown as *started again after
+  the previous attempt ended, with no redrive recorded*.
 - `stage:retrying` ends the attempt as *retrying*. When the stage was suspended
   at that moment, the retry happened inside `stage.pollSuspended`: the stage
   stays `SUSPENDED`, no `stage:started` follows, and the next attempt begins
@@ -152,20 +157,23 @@ The attempt boundaries are:
   at the next `stage:started`.
 - `workflow:cancelled` ends the open attempt as *cancelled*. `run.cancel`
   marks every unfinished stage `CANCELLED` and emits no stage event, so this is
-  the only event that says the execution ended.
+  the only event that says the execution ended. A job that started its stage
+  after the cancel is cancelled when it tries to record its outcome, with no
+  event: that attempt shows *Cancelled* from the stage's record and says no
+  event records when it ended.
 - `workflow:started` is written by the first claim and by every redrive
   (`run.redrive`, `run.rerunFrom`). A redrive takes only a completed, failed or
   cancelled run, each of which ended its attempts with an event, so no attempt
   is open there; if one is, the history contradicts itself and the stage falls
-  back. The next `stage:started` is a
-  rerun, also for a stage that was waiting for a job retry when the run was
-  cancelled.
+  back. The next `stage:started` is a rerun after a redrive, also for a stage
+  that was waiting for a job retry when the run was cancelled.
 - `run.reapStuck` writes `stage:failed` for every unfinished stage, so a reaped
   attempt ends as *failed*. A reaped stage that was waiting for a job retry (or
   for a redrive's first job) has no attempt open: it is listed as a failed
-  attempt that never started, with the reaper's error, and it is not counted
-  against the stage's `attempt`. Any other end event with no attempt open, such
-  as a `stage:failed` for a stage that completed, contradicts the history.
+  attempt that never started, with the reaper's error and the time it failed,
+  and it is not counted against the stage's `attempt`. Any other end event with
+  no attempt open, such as a `stage:failed` for a stage that completed,
+  contradicts the history.
 
 The ledger keeps only each step's latest state, so a step is listed under the
 one attempt whose time window contains the step row's `updatedAt`: the
@@ -176,35 +184,70 @@ as not assignable to one attempt instead of being guessed into one. A step's
 duration is shown only when it executed once and has finished, because the
 row does not keep per-execution timings.
 
-When the history cannot be trusted, the stage falls back to the flat view (the
-stage timeline above and the step ledger below show its latest attempt) and
-says that the per-attempt history is unavailable, with the reason:
+### What the page relies on
 
-- the events the page read are not an unbroken range of retained rows (events
-  were purged or are past retention);
-- the page is still reading a long history: a read returns at most 2,000
-  events, and the page asks again from its last sequence until it has caught
-  up, so the history becomes available after a few refreshes;
+Each statement rests on two kinds of evidence.
+
+- **The events cover the run from its first event.** A run's outbox starts at
+  sequence 1 (`workflow:created`), and the page uses the events only when
+  every row from sequence 1 to the last one it read is retained. Only then is
+  the first attempt the first run, and a stage with no event one that never
+  started.
+- **The stage's record agrees with them.** Its status with the last attempt
+  (a `SUSPENDED` stage needs its `stage:suspended`, a `CANCELLED` one a
+  `workflow:cancelled`, a `PENDING` one a retry or a redrive to wait for), its
+  `attempt` count on a run never redriven, its `startedAt` with the last
+  `stage:started`, its `completedAt` with the event that ended it, and its
+  error with the last error event. The engine stamps the row and writes the
+  event in one handler, the row first, so a row stamped after the last
+  retained event shows that the events after it are not retained. That is how
+  a removed tail of the run's events is found: nothing else in the remaining
+  rows shows it.
+
+A stage is shown as *not started* only when the events cover the run from its
+first event, none of them is of that stage, and its record was never stamped
+by a start (`startedAt` is null, `attempt` is 0, and it is `PENDING`,
+`SKIPPED` or `CANCELLED`).
+
+When the evidence is missing, the stage falls back to the flat view (the stage
+timeline above and the step ledger below show its latest attempt) and says
+that the per-attempt history is unavailable, with the reason:
+
+- some of the run's events are missing from its outbox (purged or past
+  retention): the rows the page read are not an unbroken range from
+  sequence 1;
+- none of the run's events are retained in its outbox: the first read found
+  no row of the run;
+- the page has read only part of the run's events so far and is reading the
+  rest (see below);
 - the reader provides no stage events (a custom `ConsoleReadPort` written
   before this existed);
-- no lifecycle event of the stage is retained;
-- the events contradict themselves (an end event for an attempt that never
-  started, a redrive over an attempt that never ended) or their attempts cannot
-  be reconciled with the stage's `attempt` count on a run that was never
-  redriven;
-- the events disagree with the stage's current row status.
+- the stage's record says it ran, and no lifecycle event of it is retained;
+- the retained events contradict each other (an execution ends with no start
+  recorded, or a redrive starts while an execution has no recorded end);
+- a retained event of the run has no readable time;
+- the retained events do not agree with the stage's current record, naming
+  the field: its status, its attempt count, its start time, its end time or
+  its error.
+
+### How the events are read
 
 The events come from a separate read of the run's outbox, so the 200-row event
 table does not limit them, and only the stage id and the error are extracted
 from each payload. The page keeps the events it has read and each refresh asks
-only for those after its last sequence (`GET /api/runs/:id?stageEventsAfter=N`):
-a refresh reads the rows the run wrote since the previous one, and only the
-first load goes through the run's rows, once. The cost of a refresh therefore
-does not grow with the number of outbox events the run has. A history of
-more than 2,000 events is read in chunks, each refresh continuing from the last
-sequence of the one before, and is complete once the page has caught up. A
-refresh that finds a purged or broken range keeps the history incomplete until
-the page is reloaded.
+only for those after its last sequence (`GET /api/runs/:id?stageEventsAfter=N`),
+so a refresh reads the rows the run wrote since the previous one. One read
+covers at most 10,000 of the run's outbox sequences and returns at most 2,000
+events; when rows remain, the page asks again from where the read stopped, at
+once and also with polling off, until it has caught up. Each such request
+needs the previous one to have advanced, so a reader that stops advancing is
+asked again only by the poll. What one read costs is therefore bounded
+whatever the run's size: on Postgres a first read of a run of 400,000 rows is
+the same 10,000-row index range as one of 10,000 rows, and that run is caught
+up in 40 reads. A view of one run only ever merges responses to its own
+requests: a response that does not continue what the page holds (a late one,
+or one for another run) changes nothing. Rows missing from what was read keep
+the history unavailable until the page is reloaded.
 
 ## Delivering a signal
 

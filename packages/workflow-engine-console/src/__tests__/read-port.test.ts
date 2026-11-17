@@ -12,6 +12,7 @@ import {
   MAX_LIMIT,
   STAGE_EVENT_ERROR_LIMIT,
   STAGE_EVENT_LIMIT,
+  STAGE_EVENT_WINDOW,
 } from "../read-port";
 
 const T0 = new Date("2026-01-01T00:00:00.000Z");
@@ -399,6 +400,63 @@ describe("in-memory read port: run detail", () => {
       eventType: "workflow:cancelled",
       stageId: null,
     });
+
+    // A first read of a run none of whose rows are retained (other runs' rows
+    // are) finds an empty range, which says nothing of the run's history.
+    const purged = createInMemoryConsoleReadPort({
+      ...fixtures,
+      events: [],
+      stageEvents: [stageEvent(1, "stage:started", "other-run")],
+    });
+    expect((await purged.getRunDetail("run-1"))?.stageEvents).toEqual({
+      events: [],
+      after: 0,
+      lastSequence: 0,
+      complete: false,
+      more: false,
+    });
+  });
+
+  it("reads at most a window of the run's sequences per read, however few of them are lifecycle events", async () => {
+    // Progress rows between two lifecycle events, past one window.
+    const span = STAGE_EVENT_WINDOW + 500;
+    const reader = createInMemoryConsoleReadPort({
+      ...fixtures,
+      events: Array.from({ length: span }, (_, i) => ({
+        id: `progress-${i + 1}`,
+        workflowRunId: "run-1",
+        sequence: i + 1,
+        eventType: "stage:progress",
+        occurredAt: at(0),
+        publishedAt: null,
+        retryCount: 0,
+        dlqAt: null,
+      })),
+      stageEvents: [1, span].map((sequence) => ({
+        workflowRunId: "run-1",
+        sequence,
+        eventType: "stage:started" as const,
+        occurredAt: at(0),
+        stageId: "first",
+        error: null,
+      })),
+    });
+    const first = (await reader.getRunDetail("run-1"))!.stageEvents!;
+    expect(first).toMatchObject({
+      lastSequence: STAGE_EVENT_WINDOW,
+      complete: true,
+      more: true,
+    });
+    expect(first.events.map((e) => e.sequence)).toEqual([1]);
+    const rest = (await reader.getRunDetail("run-1", {
+      stageEventsAfter: first.lastSequence,
+    }))!.stageEvents!;
+    expect(rest).toMatchObject({
+      lastSequence: span,
+      complete: true,
+      more: false,
+    });
+    expect(rest.events.map((e) => e.sequence)).toEqual([span]);
   });
 
   it("applies the SQL reader's chunk limit and error cap to the attempt history's events", async () => {
