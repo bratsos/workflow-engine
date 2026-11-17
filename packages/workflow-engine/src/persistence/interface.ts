@@ -1299,6 +1299,15 @@ export interface JobQueue {
   getJobStats?(): Promise<JobQueueStats>;
 
   /**
+   * Optional. Resolves when the storage behind the queue is fit to run on and
+   * rejects when it is not, so a host can refuse to start instead of logging
+   * the same failure on every tick: the SQLite adapters reject, with
+   * `SqliteDateStorageError`, a file whose dates another Prisma major stored.
+   * Cheap and read-only; omit it when there is nothing to check.
+   */
+  verifyStorage?(): Promise<void>;
+
+  /**
    * Optional. Offer a host's `workerId` to the queue so it is the id
    * written to `job_queue.workerId`. A queue explicitly configured with
    * its own worker id keeps it. Returns the id the queue will stamp,

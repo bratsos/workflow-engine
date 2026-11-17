@@ -428,6 +428,15 @@ export interface JobTransport {
   getJobStats?(): Promise<JobQueueStats>;
 
   /**
+   * Optional. Resolves when the storage behind the queue is fit to run on and
+   * rejects when it is not, so a host can refuse to start instead of logging
+   * the same failure on every tick: the SQLite adapters reject, with
+   * `SqliteDateStorageError`, a file whose dates another Prisma major stored.
+   * Cheap and read-only; omit it when there is nothing to check.
+   */
+  verifyStorage?(): Promise<void>;
+
+  /**
    * Optional. Offer the host's `workerId` to the transport, so the id
    * stamped on `job_queue.workerId` is the one that identifies the
    * process — transports are usually constructed before the host and

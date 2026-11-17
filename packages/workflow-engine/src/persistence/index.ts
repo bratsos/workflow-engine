@@ -58,9 +58,9 @@ export type {
   WorkflowStageStatus,
   WorkflowStatus,
 } from "./interface";
-
 // Export Prisma implementations
 export {
+  assertSqliteDateStorage,
   createPrismaAICallLogger,
   createPrismaBlobStore,
   createPrismaJobQueue,

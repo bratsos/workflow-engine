@@ -937,6 +937,14 @@ export class PrismaJobQueue implements JobQueue {
    * `createdAt`. Terminal rows (COMPLETED, FAILED, CANCELLED) are retained
    * rather than deleted and are never visited.
    */
+  /**
+   * Nothing to do here: on SQLite every method of this class awaits the date
+   * check first (see `sqlite-date-guard.ts`), so this rejects with
+   * `SqliteDateStorageError` for a file another Prisma major wrote and
+   * resolves otherwise. On PostgreSQL it resolves at once.
+   */
+  async verifyStorage(): Promise<void> {}
+
   async getJobStats(): Promise<JobQueueStats> {
     const { byStatus, oldestPendingCreatedAt } = await countActiveByStatus(
       this.prisma.jobQueue,
@@ -1154,9 +1162,20 @@ export class PrismaJobQueue implements JobQueue {
   }
 }
 
-// Every `async` method checks a SQLite file's date storage first (see the
-// module); an instance that is not SQLite runs them as before.
-guardSqliteAdapter(PrismaJobQueue.prototype);
+// Every method but these synchronous ones checks a SQLite file's date storage
+// first (see the module); an instance that is not SQLite runs them as before.
+// A new synchronous helper must be added here, a new method needs nothing.
+guardSqliteAdapter(PrismaJobQueue.prototype, [
+  "ackOutcome",
+  "adoptWorkerId",
+  "enqueueData",
+  "enqueueDeleteFilter",
+  "fenceWhere",
+  "getWorkerId",
+  "servesParams",
+  "servesPayload",
+  "transactionReads",
+]);
 
 /**
  * Factory function to create PrismaJobQueue with prisma client

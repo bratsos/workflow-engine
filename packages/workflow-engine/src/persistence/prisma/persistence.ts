@@ -2063,9 +2063,22 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
   }
 }
 
-// Every `async` method checks a SQLite file's date storage first (see the
-// module); an instance that is not SQLite runs them as before.
-guardSqliteAdapter(PrismaWorkflowPersistence.prototype);
+// Every method but these synchronous ones checks a SQLite file's date storage
+// first (see the module); an instance that is not SQLite runs them as before.
+// A new synchronous helper must be added here, a new method needs nothing.
+guardSqliteAdapter(PrismaWorkflowPersistence.prototype, [
+  "buildRunUpdateData",
+  "buildStageUpdateData",
+  "mapDefinition",
+  "mapOutboxEvent",
+  "mapWorkflowAnnotation",
+  "mapWorkflowArtifact",
+  "mapWorkflowRun",
+  "mapWorkflowStage",
+  "purgeable",
+  "servesFilter",
+  "supportsDefinitionVersioning",
+]);
 
 /**
  * Factory function to create PrismaWorkflowPersistence

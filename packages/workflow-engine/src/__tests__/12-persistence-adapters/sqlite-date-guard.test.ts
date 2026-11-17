@@ -15,6 +15,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { createKernel, runMaintenanceTick } from "../../kernel/index.js";
 import {
@@ -33,8 +34,8 @@ import {
 } from "../../persistence/prisma/index.js";
 import { rawFor } from "../../persistence/prisma/prisma-client-type.js";
 import {
+  assertSqliteDateStorage,
   sqliteDateGuard,
-  unguarded,
   verifySqliteDates,
 } from "../../persistence/prisma/sqlite-date-guard.js";
 
@@ -54,19 +55,38 @@ function fakeClient(answer: () => unknown) {
 describe("sqlite date guard: the check", () => {
   const PLUS = "2026-11-17T16:48:54.224+00:00";
   const ZED = "2026-11-17T16:48:54.224Z";
+  /**
+   * What the probe returns: the oldest and newest `workflow_runs.createdAt`
+   * (`lo`, `hi`, and their text) and the bound `Date`; `extra` adds rows for
+   * other probed columns.
+   */
   const probe = (
     lo: string,
     hi: string,
     bound: string,
     values: [string | null, string | null, string | null] = [PLUS, PLUS, PLUS],
+    extra: {
+      col: string;
+      lo: string;
+      loValue: string | null;
+      hi: string;
+      hiValue: string | null;
+    }[] = [],
   ) => [
     {
+      col: "workflow_runs.createdAt",
       lo,
-      hi,
-      bound,
       loValue: values[0],
+      hi,
       hiValue: values[1],
-      boundValue: values[2],
+    },
+    ...extra,
+    {
+      col: "bound",
+      lo: bound,
+      loValue: values[2],
+      hi: bound,
+      hiValue: values[2],
     },
   ];
 
@@ -139,6 +159,69 @@ describe("sqlite date guard: the check", () => {
     }
   });
 
+  it("looks at the other indexed date columns too, and says which one differs", async () => {
+    // The runs are in this client's class, the outbox and the stage polls are not.
+    for (const [col, lo, loValue, hi, hiValue, kind] of [
+      [
+        "outbox_events.publishedAt",
+        "integer",
+        "1794934130124",
+        "integer",
+        "1794934130999",
+        "class",
+      ],
+      [
+        "workflow_stages.nextPollAt",
+        "text",
+        PLUS,
+        "integer",
+        "1794934130124",
+        "class",
+      ],
+      ["job_queue.nextPollAt", "text", ZED, "text", ZED, "form"],
+      ["outbox_events.dlqAt", "text", PLUS, "text", ZED, "form"],
+    ] as const) {
+      const { client } = fakeClient(() =>
+        probe(
+          "text",
+          "text",
+          "text",
+          [PLUS, PLUS, PLUS],
+          [{ col, lo, loValue, hi, hiValue }],
+        ),
+      );
+      const error = await verifySqliteDates(
+        client,
+        sqliteDateGuard(client),
+      ).catch((e) => e);
+      expect(error, col).toBeInstanceOf(SqliteDateStorageError);
+      expect(error.kind).toBe(kind);
+      expect(error.column).toBe(col);
+      expect(error.message).toContain(`(in ${col})`);
+    }
+    // Empty columns (the common case for the poll deadlines) say nothing.
+    const { client } = fakeClient(() =>
+      probe(
+        "text",
+        "text",
+        "text",
+        [PLUS, PLUS, PLUS],
+        [
+          {
+            col: "job_queue.nextPollAt",
+            lo: "null",
+            loValue: null,
+            hi: "null",
+            hiValue: null,
+          },
+        ],
+      ),
+    );
+    await expect(
+      verifySqliteDates(client, sqliteDateGuard(client)),
+    ).resolves.toBeUndefined();
+  });
+
   it("does not refuse an empty table, a file of the same class or a client without raw queries", async () => {
     for (const answer of [
       probe("null", "null", "text", [null, null, PLUS]),
@@ -195,15 +278,16 @@ const fixtures = createRequire(import.meta.url)(
 );
 
 /**
- * Methods that are not `async` and so are not guarded: constructors, mappers
- * and query builders that never touch the database, and the few synchronous
- * accessors. A method that returns a promise must be `async`, or it would
- * skip the check: this list is what makes adding one a deliberate decision.
+ * The methods each adapter leaves unguarded because they are synchronous:
+ * mappers and query builders that never touch the database, and a few
+ * accessors. The source lists the same names (`guardSqliteAdapter(...)` after
+ * each class); a method is guarded unless it is named there, whatever way the
+ * code was compiled, so a new one needs no decision and a new synchronous
+ * helper has to be named in both places.
  */
 const SYNC_PERSISTENCE = [
   "buildRunUpdateData",
   "buildStageUpdateData",
-  "constructor",
   "mapDefinition",
   "mapOutboxEvent",
   "mapWorkflowAnnotation",
@@ -217,7 +301,6 @@ const SYNC_PERSISTENCE = [
 const SYNC_QUEUE = [
   "ackOutcome",
   "adoptWorkerId",
-  "constructor",
   "enqueueData",
   "enqueueDeleteFilter",
   "fenceWhere",
@@ -226,6 +309,65 @@ const SYNC_QUEUE = [
   "servesPayload",
   "transactionReads",
 ];
+
+/** The prototype's methods, split into the guarded ones and the ones left unguarded. */
+function auditNames(prototype: object) {
+  const guarded: string[] = [];
+  const unguardedNames: string[] = [];
+  for (const name of Object.getOwnPropertyNames(prototype)) {
+    if (name === "constructor") continue;
+    const method = Object.getOwnPropertyDescriptor(prototype, name)?.value;
+    if (typeof method !== "function") continue;
+    // The marker is a symbol each copy of the guard module makes for itself, so a
+    // lowered bundle's is not the one this file imports: find it by description.
+    const wrapped = Object.getOwnPropertySymbols(method).some(
+      (symbol) => symbol.description === "sqliteDateGuard.original",
+    );
+    (wrapped ? guarded : unguardedNames).push(name);
+  }
+  return { guarded, unguardedNames: unguardedNames.sort() };
+}
+
+/**
+ * The persistence adapters as a consumer's toolchain would ship them when it
+ * lowers `async` (an ES2016 target): bundled from source with esbuild, which
+ * turns every `async` method into a plain function returning a promise.
+ */
+async function loadLowered(): Promise<any> {
+  const require = createRequire(import.meta.url);
+  const esbuild = createRequire(require.resolve("tsup/package.json"))(
+    "esbuild",
+  );
+  // Inside the package, so the bundle's bare imports resolve from its node_modules.
+  const dir = await mkdtemp(
+    join(
+      fileURLToPath(new URL("../../../", import.meta.url)),
+      "node_modules",
+      ".lowered-",
+    ),
+  );
+  try {
+    const outfile = join(dir, "lowered.mjs");
+    await esbuild.build({
+      entryPoints: [
+        fileURLToPath(
+          new URL("../../persistence/prisma/index.ts", import.meta.url),
+        ),
+      ],
+      bundle: true,
+      format: "esm",
+      platform: "node",
+      target: "es2016",
+      packages: "external",
+      outfile,
+      logLevel: "silent",
+    });
+    return await import(pathToFileURL(outfile).href);
+  } finally {
+    // The module is loaded; the files are not needed.
+    await rm(dir, { recursive: true, force: true });
+  }
+}
 
 describe.skipIf(!sqlite)(`sqlite date guard on Prisma ${major}`, () => {
   let directory: string;
@@ -298,7 +440,14 @@ describe.skipIf(!sqlite)(`sqlite date guard on Prisma ${major}`, () => {
       db.exec(`CREATE TABLE "workflow_runs" (
         "id" TEXT NOT NULL PRIMARY KEY, "status" TEXT NOT NULL,
         "createdAt" DATETIME NOT NULL, "updatedAt" DATETIME NOT NULL, "completedAt" DATETIME);
-        CREATE INDEX "workflow_runs_createdAt_id_idx" ON "workflow_runs"("createdAt" DESC, "id" DESC);`);
+        CREATE INDEX "workflow_runs_createdAt_id_idx" ON "workflow_runs"("createdAt" DESC, "id" DESC);
+        CREATE TABLE "outbox_events" ("id" TEXT NOT NULL PRIMARY KEY, "publishedAt" DATETIME, "dlqAt" DATETIME);
+        CREATE INDEX "outbox_events_publishedAt_idx" ON "outbox_events"("publishedAt");
+        CREATE INDEX "outbox_events_dlqAt_idx" ON "outbox_events"("dlqAt");
+        CREATE TABLE "workflow_stages" ("id" TEXT NOT NULL PRIMARY KEY, "nextPollAt" DATETIME);
+        CREATE INDEX "workflow_stages_nextPollAt_idx" ON "workflow_stages"("nextPollAt");
+        CREATE TABLE "job_queue" ("id" TEXT NOT NULL PRIMARY KEY, "nextPollAt" DATETIME);
+        CREATE INDEX "job_queue_nextPollAt_idx" ON "job_queue"("nextPollAt");`);
       const now = Date.now();
       const iso = (ms: number) => new Date(ms).toISOString();
       const insert = db.prepare(
@@ -488,17 +637,40 @@ describe.skipIf(!sqlite)(`sqlite date guard on Prisma ${major}`, () => {
     60_000,
   );
 
-  it("asks one cheap question: the probe (this statement copies the guard's) is answered from an index", async () => {
+  it("asks one cheap question: the guard's own statement is answered from indexes", async () => {
     const client = await open(join(directory, "plan.db"));
+    // Capture the statement the guard sends, exactly as it sends it.
+    let statement = "";
+    const spy = (target: any): any =>
+      new Proxy(target, {
+        get(t, key) {
+          const value = Reflect.get(t, key);
+          if (key === "$queryRaw") {
+            return (strings: TemplateStringsArray, ...values: unknown[]) => {
+              statement = strings.join("?");
+              return value.call(t, strings, ...values);
+            };
+          }
+          if (key === "$withColumns" && typeof value === "function") {
+            return (...args: unknown[]) => spy(value.apply(t, args));
+          }
+          return typeof value === "function" ? value.bind(t) : value;
+        },
+      });
+    await assertSqliteDateStorage(spy(client));
+    expect(statement).toContain("UNION ALL");
     const rows = await rawFor(client, { detail: "text" }).$queryRawUnsafe(
-      `EXPLAIN QUERY PLAN SELECT typeof(m.lo) AS lo, typeof(m.hi) AS hi, typeof(b.d) AS bound, CAST(m.lo AS TEXT) AS loValue, CAST(m.hi AS TEXT) AS hiValue, CAST(b.d AS TEXT) AS boundValue FROM (SELECT (SELECT MIN("createdAt") FROM "workflow_runs") AS lo, (SELECT MAX("createdAt") FROM "workflow_runs") AS hi) AS m, (SELECT 0 AS d) AS b`,
+      `EXPLAIN QUERY PLAN ${statement.replace("?", "0")}`,
     );
     const plan = rows.map((r: any) => String(r.detail)).join("\n");
-    expect(plan).toMatch(/SEARCH workflow_runs USING (COVERING )?INDEX/);
-    expect(plan).not.toMatch(/SCAN workflow_runs/);
+    // Two lookups (the oldest and the newest) in the index of each of five columns.
+    expect(plan.match(/SEARCH \S+ USING (COVERING )?INDEX/g)).toHaveLength(10);
+    expect(plan).not.toMatch(
+      /SCAN (workflow_runs|outbox_events|workflow_stages|job_queue)/,
+    );
   }, 60_000);
 
-  it("guards every method of both adapters, and the unguarded ones are the listed ones", async () => {
+  it("guards every method of both adapters except the listed synchronous ones", async () => {
     const { persistence, queue } = stack(
       await open(await otherClassFile("audit.db"), true),
     );
@@ -507,21 +679,12 @@ describe.skipIf(!sqlite)(`sqlite date guard on Prisma ${major}`, () => {
       [persistence, PrismaWorkflowPersistence, SYNC_PERSISTENCE, 40],
       [queue, PrismaJobQueue, SYNC_QUEUE, 10],
     ] as const) {
-      const asyncNames: string[] = [];
-      const other: string[] = [];
-      for (const name of Object.getOwnPropertyNames(klass.prototype)) {
-        const original = unguarded(
-          Object.getOwnPropertyDescriptor(klass.prototype, name)?.value,
-        );
-        if (typeof original !== "function") continue;
-        if (original.constructor.name === "AsyncFunction")
-          asyncNames.push(name);
-        else other.push(name);
-      }
-      // A method that returns a promise must be `async`, or it is not guarded.
-      expect(other.sort(), klass.name).toEqual(sync);
-      expect(asyncNames.length, klass.name).toBeGreaterThan(atLeast);
-      for (const name of asyncNames) {
+      const { guarded, unguardedNames } = auditNames(klass.prototype);
+      expect(unguardedNames, `${klass.name}: unguarded methods`).toEqual(
+        [...sync].sort(),
+      );
+      expect(guarded.length, klass.name).toBeGreaterThan(atLeast);
+      for (const name of guarded) {
         await expect(
           (instance as any)[name](),
           `${klass.name}.${name}`,
@@ -529,4 +692,59 @@ describe.skipIf(!sqlite)(`sqlite date guard on Prisma ${major}`, () => {
       }
     }
   }, 60_000);
+
+  it("guards the same methods when the toolchain lowers async below ES2017", async () => {
+    const lowered = await loadLowered();
+    const writer = await open(await otherClassFile("lowered.db"), true);
+    // The very thing the old rule keyed on: after lowering, no method is an
+    // AsyncFunction any more, so a rule that looked at that would guard none.
+    for (const klass of [
+      lowered.PrismaWorkflowPersistence,
+      lowered.PrismaJobQueue,
+    ]) {
+      const { guarded } = auditNames(klass.prototype);
+      expect(guarded.length).toBeGreaterThan(10);
+      for (const name of guarded) {
+        const wrapper = Object.getOwnPropertyDescriptor(klass.prototype, name)
+          ?.value as Function;
+        const symbol = Object.getOwnPropertySymbols(wrapper).find(
+          (candidate) => candidate.description === "sqliteDateGuard.original",
+        )!;
+        const original = (wrapper as any)[symbol] as Function;
+        expect(original.constructor.name, name).not.toBe("AsyncFunction");
+      }
+    }
+    const persistence = lowered.createPrismaWorkflowPersistence(writer, {
+      databaseType: "sqlite",
+    });
+    const queue = lowered.createPrismaJobQueue(writer, {
+      databaseType: "sqlite",
+      workerId: "lowered",
+    });
+    const hourAgo = new Date(Date.now() - 3_600_000);
+    // The calls the engine acts on: refused, with the error code the package
+    // exports (a lowered bundle has its own copy of the class).
+    for (const call of [
+      () => persistence.getStuckRuns(hourAgo),
+      () => persistence.listRunsForPurge(hourAgo, ["COMPLETED"], 10),
+      () => persistence.getSuspendedStages(new Date()),
+      () => queue.dequeue(),
+      () => queue.verifyStorage(),
+    ]) {
+      await expect(call()).rejects.toMatchObject({
+        code: "SQLITE_DATE_STORAGE_MISMATCH",
+      });
+    }
+    for (const [instance, klass] of [
+      [persistence, lowered.PrismaWorkflowPersistence],
+      [queue, lowered.PrismaJobQueue],
+    ] as const) {
+      for (const name of auditNames(klass.prototype).guarded) {
+        await expect(
+          (instance as any)[name](),
+          `${klass.name}.${name}`,
+        ).rejects.toMatchObject({ code: "SQLITE_DATE_STORAGE_MISMATCH" });
+      }
+    }
+  }, 120_000);
 });

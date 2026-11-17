@@ -12,19 +12,33 @@
  * offered. Two text forms agree except at an exact instant (`+00:00` sorts
  * before `Z`), which is the path a Prisma 7 to 8 upgrade takes.
  *
- * This module reads the oldest and the newest stored `workflow_runs.createdAt`
- * and a `Date` as this client binds it, and throws before the adapter runs
- * anything if the storage class differs or, when both are text, if the form
- * differs (the text with every digit replaced: `9999-99-99T99:99:99.999Z`
- * against `9999-99-99T99:99:99.999+99:99`). It names no Prisma major: what the
- * client binds is read off the client itself, with the same `Date` parameter
- * binding every model query uses (checked on Prisma 6, 7 and 8).
+ * This module reads the oldest and the newest stored value of every date
+ * column that has an index leading with it (`workflow_runs.createdAt`,
+ * `outbox_events.publishedAt` and `dlqAt`, `workflow_stages.nextPollAt`,
+ * `job_queue.nextPollAt`: two index lookups each) and a `Date` as this client
+ * binds it, and throws before the adapter runs anything if the storage class
+ * differs or, when both are text, if the form differs (the text with every
+ * digit replaced: `9999-99-99T99:99:99.999Z` against
+ * `9999-99-99T99:99:99.999+99:99`). It names no Prisma major: what the client
+ * binds is read off the client itself, with the same `Date` parameter binding
+ * every model query uses (checked on Prisma 6, 7 and 8).
+ *
+ * What it cannot see, because a bounded probe cannot: a foreign TEXT form on
+ * rows strictly between the oldest and the newest of a column (the class check
+ * has no such gap: integers sort before every text value, so one foreign
+ * integer among text makes the oldest or the newest differ), and any column no
+ * index leads with (`updatedAt`, `completedAt`, `lockedAt`, `startedAt`,
+ * `occurredAt` and the dates of the other tables). A file the engine's
+ * adapters have written to since they carry this guard cannot have gained such
+ * rows (the first call on a foreign file refuses); only a file mixed by an
+ * earlier release can hold them.
  *
  * Where it runs: the adapters that compare dates (`PrismaWorkflowPersistence`,
- * `PrismaJobQueue`) wrap every `async` method of their prototype with
- * {@link guardSqliteAdapter}, so each entry point (the kernel's commands, both
- * hosts' ticks and job loops, a direct call) awaits the check first. The
- * check is one statement per client, answered by an index on `createdAt`.
+ * `PrismaJobQueue`) wrap EVERY method of their prototype except an explicit
+ * list of synchronous ones with {@link guardSqliteAdapter}, whatever way the
+ * code was compiled, so each entry point (the kernel's commands, both hosts'
+ * ticks and job loops, a direct call) awaits the check first. The check is one
+ * statement per client.
  */
 
 import { type EnginePrismaClient, rawFor } from "./prisma-client-type.js";
@@ -47,13 +61,15 @@ export class SqliteDateStorageError extends Error {
     readonly bound: string,
     /** `"class"`: integer against text. `"form"`: both text, written differently. */
     readonly kind: "class" | "form" = "class",
+    /** The date column the difference was found in, as `table.column`. */
+    readonly column?: string,
   ) {
     const why =
       kind === "class"
         ? "SQLite orders every integer before every text value, so each date comparison the engine sends (run.purge retention, run.reapStuck, suspended-stage polls, job leases) would be decided by the type and not by the time, and the engine would purge, reap or poll the wrong rows."
         : "Two ISO text forms agree except at an exact instant, where the suffix decides (`+00:00` sorts before `Z`): a deadline, retention or stuck-run threshold that equals a stored time is compared wrongly, and an exact-time lookup finds nothing.";
     super(
-      `This SQLite file stores dates as ${stored}, but this Prisma client binds them as ${bound}: the file was written by a different Prisma major (Prisma 6 stores integer epoch milliseconds, Prisma 7 ISO text ending in +00:00, Prisma 8 ISO text ending in Z). ${why} Nothing was read or written. Use the Prisma major that created the file, or start the new major from a fresh SQLite file and migrate the application data into it. See ${SQLITE_DATE_STORAGE_DOCS}`,
+      `This SQLite file stores dates as ${stored}${column ? ` (in ${column})` : ""}, but this Prisma client binds them as ${bound}: the file was written by a different Prisma major (Prisma 6 stores integer epoch milliseconds, Prisma 7 ISO text ending in +00:00, Prisma 8 ISO text ending in Z). ${why} Nothing was read or written. Use the Prisma major that created the file, or start the new major from a fresh SQLite file and migrate the application data into it. See ${SQLITE_DATE_STORAGE_DOCS}`,
     );
     this.name = "SqliteDateStorageError";
   }
@@ -77,43 +93,52 @@ export function sqliteDateGuard(prisma: object): SqliteDateGuard {
   return guard;
 }
 
+/** One probed column: the storage class and text of its oldest and newest value. */
 interface Probe {
+  col: string;
   lo: string;
-  hi: string;
-  bound: string;
   loValue: string | null;
+  hi: string;
   hiValue: string | null;
-  boundValue: string | null;
 }
 
 /**
- * One statement. `MIN` and `MAX` of `createdAt` are the oldest and newest
- * stored dates (SQLite orders a mixed column integers first, so a file two
- * majors wrote shows both classes), each answered by one lookup in the
- * `createdAt` index of `workflow_runs` (a subquery apiece: one statement with
- * both aggregates scans the index); `typeof` of a bound `Date` is what this
- * client stores. The three values come back as text so the form of a text date
- * can be compared. `createdAt` is set by the client on every insert, never by a
- * column default.
+ * One statement, one row per probed column plus one for the bound `Date`.
+ * Each `MIN` and `MAX` is a scalar subquery of its own, so SQLite answers it
+ * with one lookup in the index that leads with the column (one statement
+ * holding both aggregates scans the index); `typeof` is the storage class, and
+ * the values come back as text so the form of a text date can be compared. A
+ * mixed column shows both classes (integers sort before text). The dates
+ * probed are set by the client on every insert, never by a column default.
  */
-async function probe(prisma: EnginePrismaClient): Promise<Probe | undefined> {
+async function probe(prisma: EnginePrismaClient): Promise<Probe[] | undefined> {
   const run = rawFor(prisma, {
+    col: "text",
     lo: "text",
-    hi: "text",
-    bound: "text",
     loValue: "text",
+    hi: "text",
     hiValue: "text",
-    boundValue: "text",
   });
   if (!run.$queryRaw) return undefined;
-  const rows = await run.$queryRaw<Probe[]>`
-    SELECT typeof(m.lo) AS lo, typeof(m.hi) AS hi, typeof(b.d) AS bound,
-           CAST(m.lo AS TEXT) AS loValue, CAST(m.hi AS TEXT) AS hiValue,
-           CAST(b.d AS TEXT) AS boundValue
-    FROM (SELECT (SELECT MIN("createdAt") FROM "workflow_runs") AS lo,
-                 (SELECT MAX("createdAt") FROM "workflow_runs") AS hi) AS m,
-         (SELECT ${new Date(0)} AS d) AS b`;
-  return rows[0];
+  const d = new Date(0);
+  return run.$queryRaw<Probe[]>`
+    SELECT 'workflow_runs.createdAt' AS col, typeof(m.lo) AS lo, CAST(m.lo AS TEXT) AS loValue, typeof(m.hi) AS hi, CAST(m.hi AS TEXT) AS hiValue
+    FROM (SELECT (SELECT MIN("createdAt") FROM "workflow_runs") AS lo, (SELECT MAX("createdAt") FROM "workflow_runs") AS hi) AS m
+    UNION ALL
+    SELECT 'outbox_events.publishedAt', typeof(m.lo), CAST(m.lo AS TEXT), typeof(m.hi), CAST(m.hi AS TEXT)
+    FROM (SELECT (SELECT MIN("publishedAt") FROM "outbox_events") AS lo, (SELECT MAX("publishedAt") FROM "outbox_events") AS hi) AS m
+    UNION ALL
+    SELECT 'outbox_events.dlqAt', typeof(m.lo), CAST(m.lo AS TEXT), typeof(m.hi), CAST(m.hi AS TEXT)
+    FROM (SELECT (SELECT MIN("dlqAt") FROM "outbox_events") AS lo, (SELECT MAX("dlqAt") FROM "outbox_events") AS hi) AS m
+    UNION ALL
+    SELECT 'workflow_stages.nextPollAt', typeof(m.lo), CAST(m.lo AS TEXT), typeof(m.hi), CAST(m.hi AS TEXT)
+    FROM (SELECT (SELECT MIN("nextPollAt") FROM "workflow_stages") AS lo, (SELECT MAX("nextPollAt") FROM "workflow_stages") AS hi) AS m
+    UNION ALL
+    SELECT 'job_queue.nextPollAt', typeof(m.lo), CAST(m.lo AS TEXT), typeof(m.hi), CAST(m.hi AS TEXT)
+    FROM (SELECT (SELECT MIN("nextPollAt") FROM "job_queue") AS lo, (SELECT MAX("nextPollAt") FROM "job_queue") AS hi) AS m
+    UNION ALL
+    SELECT 'bound', typeof(b.d), CAST(b.d AS TEXT), typeof(b.d), CAST(b.d AS TEXT)
+    FROM (SELECT ${d} AS d) AS b`;
 }
 
 /** A text date with every digit replaced: what its form is, whatever the time. */
@@ -125,7 +150,7 @@ const describe = (kind: string, value: string | null) =>
 
 /**
  * Resolves when the file may be used, rejects with {@link SqliteDateStorageError}
- * when it may not. An empty table (`typeof(NULL)` is `null`), a client with no
+ * when it may not. An empty column (`typeof(NULL)` is `null`), a client with no
  * raw queries, a probe that fails (the schema is not pushed yet, the file is
  * busy) and a file of the same storage class and form are not refusals; the
  * failed probe is retried by the next call.
@@ -135,38 +160,49 @@ export function verifySqliteDates(
   guard: SqliteDateGuard,
 ): Promise<void> {
   guard.verified ??= (async () => {
-    let seen: Probe | undefined;
+    let rows: Probe[] | undefined;
     try {
-      seen = await probe(prisma);
+      rows = await probe(prisma);
     } catch {
       guard.verified = null;
       return;
     }
-    if (!seen) return;
-    const ends = [
-      { kind: seen.lo, value: seen.loValue },
-      { kind: seen.hi, value: seen.hiValue },
-    ].filter((end) => end.kind !== "null");
-    // Integer against text, or the other way round.
-    const other = ends.find((end) => end.kind !== seen.bound);
-    if (other !== undefined) {
-      throw new SqliteDateStorageError(other.kind, seen.bound);
-    }
-    // Both text, written differently (Prisma 7's `+00:00`, Prisma 8's `Z`).
-    const bound = seen.boundValue;
-    const differing =
-      seen.bound === "text" && typeof bound === "string"
-        ? ends.find(
-            (end) =>
-              typeof end.value === "string" && form(end.value) !== form(bound),
-          )
-        : undefined;
-    if (differing !== undefined) {
-      throw new SqliteDateStorageError(
-        describe("text", differing.value),
-        describe("text", seen.boundValue),
-        "form",
-      );
+    const bound = rows?.find((row) => row.col === "bound");
+    if (!rows || !bound) return;
+    for (const row of rows) {
+      if (row === bound) continue;
+      const ends = [
+        { kind: row.lo, value: row.loValue },
+        { kind: row.hi, value: row.hiValue },
+      ].filter((end) => end.kind !== "null");
+      // Integer against text, or the other way round.
+      const other = ends.find((end) => end.kind !== bound.lo);
+      if (other !== undefined) {
+        throw new SqliteDateStorageError(
+          other.kind,
+          bound.lo,
+          "class",
+          row.col,
+        );
+      }
+      // Both text, written differently (Prisma 7's `+00:00`, Prisma 8's `Z`).
+      const sample = bound.loValue;
+      const differing =
+        bound.lo === "text" && typeof sample === "string"
+          ? ends.find(
+              (end) =>
+                typeof end.value === "string" &&
+                form(end.value) !== form(sample),
+            )
+          : undefined;
+      if (differing !== undefined) {
+        throw new SqliteDateStorageError(
+          describe("text", differing.value),
+          describe("text", sample),
+          "form",
+          row.col,
+        );
+      }
     }
   })();
   return guard.verified;
@@ -180,25 +216,31 @@ interface Guarded {
 }
 
 /**
- * Wraps every `async` method on `prototype` so that, on an instance that
- * {@link armSqliteAdapter} armed, it awaits {@link verifySqliteDates} before
- * the method runs. An instance that is not armed (PostgreSQL) runs the method
- * as before, with no added await. Call once, after the class is defined.
+ * Wraps every method on `prototype` except the named synchronous ones, so that,
+ * on an instance that {@link armSqliteAdapter} armed, it awaits
+ * {@link verifySqliteDates} before the method runs. An instance that is not
+ * armed (PostgreSQL) runs the method as before, with no added await. Call once,
+ * after the class is defined.
  *
- * A method that is not `async` is left alone: it must not return a promise.
- * The adapter tests list those methods, so a new one is classified on purpose.
+ * The rule does not look at how a function was compiled (a toolchain that
+ * lowers `async` below ES2017 turns each `async` method into a plain function
+ * that returns a promise, and a check keyed on `AsyncFunction` would then skip
+ * every one of them): a method is guarded unless the caller lists it in
+ * `synchronous`. A synchronous method that is not listed would start returning
+ * a promise, which breaks its callers at once; a listed one that is in fact
+ * asynchronous would skip the check, which the adapter tests catch by calling
+ * every method of both classes on a refused file.
  */
-export function guardSqliteAdapter(prototype: object): void {
+export function guardSqliteAdapter(
+  prototype: object,
+  synchronous: readonly string[],
+): void {
+  let guardedCount = 0;
   for (const name of Object.getOwnPropertyNames(prototype)) {
-    if (name === "constructor") continue;
+    if (name === "constructor" || synchronous.includes(name)) continue;
     const descriptor = Object.getOwnPropertyDescriptor(prototype, name);
     const method = descriptor?.value;
-    if (
-      typeof method !== "function" ||
-      method.constructor.name !== "AsyncFunction"
-    ) {
-      continue;
-    }
+    if (typeof method !== "function") continue;
     const guarded = function (this: Guarded, ...args: unknown[]) {
       const state = this[STATE];
       if (!state) return method.apply(this, args);
@@ -209,7 +251,26 @@ export function guardSqliteAdapter(prototype: object): void {
     Object.defineProperty(guarded, "name", { value: name });
     Object.defineProperty(guarded, ORIGINAL, { value: method });
     Object.defineProperty(prototype, name, { ...descriptor, value: guarded });
+    guardedCount++;
   }
+  if (guardedCount === 0) {
+    throw new Error(
+      "The SQLite date guard wrapped no method: the adapter would run unguarded.",
+    );
+  }
+}
+
+/**
+ * Runs the check on `prisma` and rejects with {@link SqliteDateStorageError}
+ * when the file was written by another Prisma major. For code outside the
+ * adapters that reads the same file with dates (the console's read port): one
+ * statement per client, shared with every adapter built on that client.
+ */
+export function assertSqliteDateStorage(prisma: object): Promise<void> {
+  return verifySqliteDates(
+    prisma as EnginePrismaClient,
+    sqliteDateGuard(prisma),
+  );
 }
 
 /** Arms a SQLite instance: its guarded methods now check `prisma` once. */

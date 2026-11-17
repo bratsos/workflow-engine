@@ -573,6 +573,9 @@ export function createSpillingJobTransport(
     ...(transport.getJobStats
       ? { getJobStats: () => transport.getJobStats!() }
       : {}),
+    ...(transport.verifyStorage
+      ? { verifyStorage: () => transport.verifyStorage!() }
+      : {}),
     ...(transport.adoptWorkerId
       ? {
           adoptWorkerId: (workerId: string) =>

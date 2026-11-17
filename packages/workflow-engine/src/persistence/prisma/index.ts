@@ -35,6 +35,7 @@ export {
 } from "./persistence";
 export type { EnginePrismaClient, PrismaDelegate } from "./prisma-client-type";
 export {
+  assertSqliteDateStorage,
   SQLITE_DATE_STORAGE_DOCS,
   SqliteDateStorageError,
 } from "./sqlite-date-guard";
