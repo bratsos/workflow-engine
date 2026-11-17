@@ -410,6 +410,7 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
       errorTruncated: false,
     });
     const all = [
+      event(1, "workflow:created", null),
       event(2, "workflow:started", null),
       event(3, "stage:started", "fetch"),
       event(5, "stage:retrying", "fetch", `upstream 503: can't "connect"`),
@@ -433,7 +434,7 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
       (await port.getRunDetail("run-retried", { stageEventsAfter: 5 }))
         ?.stageEvents,
     ).toEqual({
-      events: all.slice(3),
+      events: all.slice(4),
       after: 5,
       lastSequence: 9,
       complete: true,
@@ -540,7 +541,9 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
     });
   });
 
-  it("reads at most a window of a run's sequences per read, however few of them are lifecycle events", async () => {
+  it("reads at most a window of a run's sequences per read, however few of them are lifecycle events", {
+    timeout: 30_000,
+  }, async () => {
     const span = STAGE_EVENT_WINDOW + 500;
     await prisma.workflowRun.createMany({
       data: [mkRun("run-window", at(-9_005), "RUNNING", "wf-d", 0, 0)],
@@ -595,7 +598,9 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
     expect(rest.events.map((e) => e.sequence)).toEqual([span]);
   });
 
-  it("never says a stage that ran has not started when the run's outbox rows are gone (real kernel)", async () => {
+  it("never says a stage that ran has not started when the run's outbox rows are gone (real kernel)", {
+    timeout: 30_000,
+  }, async () => {
     // The gate's reproduction: a stage running when its run is cancelled,
     // then the run's outbox rows removed as a retention job would.
     const { createKernel } = await import(kernelSpecifier);
@@ -605,12 +610,15 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
     const io = z.object({ v: z.string() });
     let kernel: any;
     let runId = "";
+    let executions = 0;
     const slow = defineStage({
       id: "slow",
       name: "Slow",
       schemas: { input: io, output: io, config: z.object({}) },
       async execute(ctx: any) {
-        await kernel.dispatch({ type: "run.cancel", workflowRunId: runId });
+        // The first execution is cancelled while it runs; the reruns complete.
+        if (++executions === 1)
+          await kernel.dispatch({ type: "run.cancel", workflowRunId: runId });
         return { output: ctx.input };
       },
     });
@@ -690,7 +698,11 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
           caughtUp: !held!.more,
         },
       });
-      return { stage: body.stages[0], history: [...histories.values()][0]! };
+      return {
+        run: body.run,
+        stage: body.stages[0],
+        history: [...histories.values()][0]!,
+      };
     };
 
     const kept = await page();
@@ -715,6 +727,60 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
     expect((await page()).history).toMatchObject({
       available: false,
       reason: "no-retained-events",
+    });
+
+    // A redrive after every row was removed: the store numbers the run's rows
+    // from 1 again, so its `workflow:started` is sequence 1 and the range is
+    // unbroken. Before this check the rerun read as the stage's first run.
+    const rerun = async () => {
+      await kernel.dispatch({
+        type: "run.redrive",
+        workflowRunId: runId,
+        from: { kind: "start" },
+      });
+      const stage = (await db.workflowStage.findFirst({
+        where: { workflowRunId: runId },
+      }))!;
+      await kernel.dispatch({
+        type: "job.execute",
+        workflowRunId: runId,
+        workflowId: "purged",
+        stageId: "slow",
+        config: {},
+        attempt: stage.attempt,
+        maxAttempts: 3,
+      });
+      await kernel.dispatch({ type: "run.transition", workflowRunId: runId });
+    };
+    await rerun();
+    const first = await db.outboxEvent.findFirst({
+      where: { workflowRunId: runId },
+      orderBy: { sequence: "asc" },
+    });
+    expect(first).toMatchObject({ sequence: 1, eventType: "workflow:started" });
+    const afterOne = await page();
+    expect(afterOne.stage).toMatchObject({ status: "COMPLETED" });
+    expect(afterOne.run).toMatchObject({
+      status: "COMPLETED",
+      redriveCount: 1,
+    });
+    expect(afterOne.history).toMatchObject({
+      available: false,
+      reason: "events-incomplete",
+    });
+
+    // Removed again and redriven again: still incomplete, and the run row
+    // counts two redrives where the rows record one.
+    await db.outboxEvent.deleteMany({ where: { workflowRunId: runId } });
+    await rerun();
+    const afterTwo = await page();
+    expect(afterTwo.run).toMatchObject({
+      status: "COMPLETED",
+      redriveCount: 2,
+    });
+    expect(afterTwo.history).toMatchObject({
+      available: false,
+      reason: "events-incomplete",
     });
     await db.$disconnect?.();
   });

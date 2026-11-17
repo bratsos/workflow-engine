@@ -4,6 +4,7 @@ import {
   type AttemptStageInput,
   type AttemptStepInput,
   buildStageAttemptHistory,
+  catchUpStep,
   type EventCoverage,
   type HeldStageEvents,
   mergeStageEvents,
@@ -71,6 +72,7 @@ function history(
     redriveCount?: number;
     coverage?: EventCoverage;
     caughtUp?: boolean;
+    paused?: boolean;
   } = {},
 ) {
   return buildStageAttemptHistory({
@@ -81,6 +83,7 @@ function history(
       events,
       coverage: options.coverage ?? "from-start",
       ...(options.caughtUp === undefined ? {} : { caughtUp: options.caughtUp }),
+      ...(options.paused === undefined ? {} : { paused: options.paused }),
     },
   });
 }
@@ -378,6 +381,22 @@ describe("I want a stage's history grouped by attempt, and never grouped wrongly
     expect(reason(history(stages, [], [], { caughtUp: false }))).toBe(
       "events-loading",
     );
+    // Paused, the page reads no more on its own: it must not say it is reading.
+    expect(
+      reason(history(stages, [], [], { caughtUp: false, paused: true })),
+    ).toBe("events-paused");
+    // The run row counts a redrive, and no retained `workflow:started` records
+    // it: the events of the earlier execution are not retained.
+    expect(reason(history(stages, events, [], { redriveCount: 1 }))).toBe(
+      "fewer-redrives",
+    );
+    expect(
+      reason(
+        history(stages, [run("workflow:started", -5), ...events], [], {
+          redriveCount: 2,
+        }),
+      ),
+    ).toBe("fewer-redrives");
     expect(reason(history(stages, []))).toBe("no-stage-events");
     // An end event for an attempt that never started contradicts the history.
     expect(reason(history(stages, [events[1]!]))).toBe("unproven-boundary");
@@ -669,8 +688,10 @@ describe("I want a stage's history grouped by attempt, and never grouped wrongly
 
   it("falls back as unproven when the events contradict themselves", () => {
     const reason = (events: AttemptEventInput[], status = "COMPLETED") => {
+      // The run row counts the redrives its events record.
       const entry = history([stage("a", status, 1)], events, [], {
-        redriveCount: 1,
+        redriveCount: events.filter((e) => e.eventType === "workflow:started")
+          .length,
       }).get("rec-a")!;
       return entry.available ? "available" : entry.reason;
     };
@@ -864,12 +885,13 @@ describe("I want a stage's history grouped by attempt, and never grouped wrongly
 });
 
 describe("I want the page to keep the events it has read and fold each poll into them", () => {
+  // A run's outbox starts with its `workflow:created` at sequence 1.
   const e = (sequence: number) =>
     ({
       sequence,
-      eventType: "stage:started",
+      eventType: sequence === 1 ? "workflow:created" : "stage:started",
       occurredAt: at(sequence),
-      stageId: "a",
+      stageId: sequence === 1 ? null : "a",
       error: null,
     }) satisfies AttemptEventInput;
   const page = (
@@ -907,6 +929,23 @@ describe("I want the page to keep the events it has read and fold each poll into
     expect(fold({ ...page(0, 0), complete: true })?.coverage).toBe("none");
     // Rows written after that are not the run's first ones.
     expect(mergeStageEvents(none, page(0, 2))?.coverage).toBe("gap");
+  });
+
+  it("covers the run from its start only when the first read begins with its workflow:created at sequence 1", () => {
+    expect(fold(page(0, 3))?.coverage).toBe("from-start");
+    // Every earlier row was removed and the store numbered the next ones from
+    // 1 again (a redrive after a full purge): sequence 1 is not the creation.
+    const restarted: StageEventPage = {
+      ...page(0, 3),
+      events: [
+        { ...e(2), sequence: 1, eventType: "workflow:started", stageId: null },
+        e(2),
+        e(3),
+      ],
+    };
+    expect(fold(restarted)?.coverage).toBe("gap");
+    // A reader that calls a range complete without returning its first event.
+    expect(fold({ ...page(0, 3), events: [e(2), e(3)] })?.coverage).toBe("gap");
   });
 
   it("keeps a gap once one was read", () => {
@@ -948,5 +987,20 @@ describe("I want the page to keep the events it has read and fold each poll into
     expect(fold(legacy)?.more).toBe(false);
     // A reader that says `more` without advancing adds nothing.
     expect(mergeStageEvents(last, page(5, 5, true, true))).toBe(last);
+  });
+
+  it("reads the next chunk at once only while polling runs, and only past the last one asked for", () => {
+    // Caught up: nothing to read.
+    expect(catchUpStep(null, -1, false)).toEqual({ read: false, askedAt: -1 });
+    // Behind at 2: read at once, and count 2 as asked.
+    expect(catchUpStep(2, -1, false)).toEqual({ read: true, askedAt: 2 });
+    // A reader that answers `more` without advancing is not asked again at once.
+    expect(catchUpStep(2, 2, false)).toEqual({ read: false, askedAt: 2 });
+    // Paused: no request of its own. Resuming re-polls from what is held, so
+    // the held position counts as asked and the catch-up adds no second read.
+    expect(catchUpStep(4, 2, true)).toEqual({ read: false, askedAt: 4 });
+    expect(catchUpStep(4, 4, false)).toEqual({ read: false, askedAt: 4 });
+    // The resume poll advanced to 6 with rows still left: read on at once.
+    expect(catchUpStep(6, 4, false)).toEqual({ read: true, askedAt: 6 });
   });
 });

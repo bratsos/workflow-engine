@@ -28,6 +28,7 @@ import {
   type ConsolePrismaClient,
   createPrismaConsoleReadPort,
 } from "../prisma-read-port";
+import { STAGE_EVENT_WINDOW } from "../read-port";
 import { createPostgresClient } from "./postgres-client";
 import { type RecordedStatement, recordingClient } from "./recording-client";
 
@@ -468,6 +469,8 @@ if (!DATABASE_URL) {
         errorTruncated: false,
       });
       const all = [
+        // Its payload carries the run's input: only the two fields are read.
+        event(1, "workflow:created", null),
         event(2, "workflow:started", null),
         event(3, "stage:started", "fetch"),
         event(5, "stage:retrying", "fetch", `upstream 503: can't "connect"`),
@@ -490,7 +493,7 @@ if (!DATABASE_URL) {
         (await reader().getRunDetail("run-retried", { stageEventsAfter: 5 }))
           ?.stageEvents,
       ).toEqual({
-        events: all.slice(3),
+        events: all.slice(4),
         after: 5,
         lastSequence: 9,
         complete: true,
@@ -613,6 +616,37 @@ FROM generate_series(1, 2001) g`,
       });
     });
 
+    it("reads at most a window of a run's sequences per read, and says rows remain past it however few of them are lifecycle events", async () => {
+      const span = STAGE_EVENT_WINDOW + 500;
+      await prisma.workflowRun.createMany({
+        data: [mkRun("run-window", at(-9_005), "RUNNING", "wf-d")],
+      });
+      await prisma.$executeRawUnsafe(
+        `INSERT INTO outbox_events (id, "workflowRunId", sequence, "eventType", payload, "causationId", "occurredAt")
+SELECT 'window-' || g, 'run-window', g,
+  CASE WHEN g = 1 THEN 'workflow:created' WHEN g = ${span} THEN 'stage:started' ELSE 'stage:progress' END,
+  jsonb_build_object('stageId', 'fetch'), 'c', now()
+FROM generate_series(1, ${span}) g`,
+      );
+      // The window ends the read long before the event limit does.
+      const first = (await reader().getRunDetail("run-window"))!.stageEvents!;
+      expect(first.events.map((e) => e.sequence)).toEqual([1]);
+      expect(first).toMatchObject({
+        lastSequence: STAGE_EVENT_WINDOW,
+        complete: true,
+        more: true,
+      });
+      const rest = (await reader().getRunDetail("run-window", {
+        stageEventsAfter: first.lastSequence,
+      }))!.stageEvents!;
+      expect(rest.events.map((e) => e.sequence)).toEqual([span]);
+      expect(rest).toMatchObject({
+        lastSequence: span,
+        complete: true,
+        more: false,
+      });
+    });
+
     it("does not skip a row committed between its two statements", async () => {
       await prisma.workflowRun.createMany({
         data: [mkRun("run-race", at(-9_005), "RUNNING", "wf-d")],
@@ -707,7 +741,21 @@ SELECT 'plan-${rows}-' || g, '${runId}', g,
 FROM generate_series(1, ${rows}) g`,
         );
       }
-      await prisma.$executeRawUnsafe(`ANALYZE "outbox_events"`);
+      // Other runs' rows, as a real outbox holds: with the 30,000-row run most
+      // of a small table, a sampled ANALYZE can rightly prefer reading the
+      // whole table to the run's range, which is a fixture's artefact.
+      await prisma.workflowRun.createMany({
+        data: [mkRun("run-plan-others", at(-9_200), "COMPLETED", "wf-d")],
+      });
+      await prisma.$executeRawUnsafe(
+        `INSERT INTO outbox_events (id, "workflowRunId", sequence, "eventType", payload, "causationId", "occurredAt")
+SELECT 'plan-others-' || g, 'run-plan-others', g, 'stage:progress',
+       jsonb_build_object('stageId', 'fetch'), 'c', now()
+FROM generate_series(1, 150000) g`,
+      );
+      // VACUUM as well: an index-only scan's cost depends on the visibility
+      // map, which autovacuum would otherwise set at a moment of its choosing.
+      await prisma.$executeRawUnsafe(`VACUUM ANALYZE "outbox_events"`);
 
       const poll = [];
       for (const rows of [1_000, 30_000]) {

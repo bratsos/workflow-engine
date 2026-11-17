@@ -148,12 +148,15 @@ export const STAGE_LIFECYCLE_EVENT_TYPES = [
 ] as const;
 
 /**
- * The run-level events that bound stage executions without a stage event of
- * their own. `run.cancel` marks every non-terminal stage CANCELLED and emits
- * only `workflow:cancelled`; `run.redrive` (and `run.rerunFrom`) reopen or
- * recreate stages and emit only `workflow:started`.
+ * The run-level events the attempt history reads. `workflow:created` is the
+ * run's first outbox row (sequence 1): a range that begins with it starts
+ * where the run did. The others bound stage executions without a stage event
+ * of their own: `run.cancel` marks every non-terminal stage CANCELLED and
+ * emits only `workflow:cancelled`; `run.redrive` (and `run.rerunFrom`) reopen
+ * or recreate stages and emit only `workflow:started`.
  */
 export const RUN_BOUNDARY_EVENT_TYPES = [
+  "workflow:created",
   "workflow:started",
   "workflow:cancelled",
 ] as const;
@@ -240,10 +243,12 @@ export interface StageEventLog {
   lastSequence: number;
   /**
    * True only when every sequence in `(after, lastSequence]` has a retained
-   * row: with `after` 0, the run's history from its first event (a run's
-   * outbox starts at sequence 1 with `workflow:created`). A first read that
-   * finds no row is false. False means events were purged or are past
-   * retention, and a grouping built from them could be wrong.
+   * row. A first read that finds no row is false. False means events were
+   * purged or are past retention, and a grouping built from them could be
+   * wrong. True with `after` 0 is not enough for the page: a run's outbox
+   * starts at sequence 1 with `workflow:created`, and a store numbers rows
+   * from 1 again after every row of a run was removed, so the page also needs
+   * that first event among `events`.
    */
   complete: boolean;
   /** True when rows past `lastSequence` remain: the read stopped at its window or its limit. */

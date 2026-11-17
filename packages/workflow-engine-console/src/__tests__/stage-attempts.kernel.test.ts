@@ -13,6 +13,10 @@ import { z } from "zod";
 import { createWorkflowConsole } from "../handler";
 import { createInMemoryConsoleReadPort } from "../in-memory-read-port";
 import {
+  RUN_BOUNDARY_EVENT_TYPES,
+  STAGE_LIFECYCLE_EVENT_TYPES,
+} from "../read-port";
+import {
   type AttemptEventInput,
   type AttemptUnavailableReason,
   buildStageAttemptHistory,
@@ -42,14 +46,9 @@ const io = z.object({ v: z.string() });
 const schemas = { input: io, output: io, config: z.object({}) };
 
 /** What the console reads off the outbox (`STAGE_LIFECYCLE_EVENT_TYPES` and `RUN_BOUNDARY_EVENT_TYPES`). */
-const HISTORY_TYPES = new Set([
-  "stage:started",
-  "stage:suspended",
-  "stage:retrying",
-  "stage:failed",
-  "stage:completed",
-  "workflow:started",
-  "workflow:cancelled",
+const HISTORY_TYPES = new Set<string>([
+  ...STAGE_LIFECYCLE_EVENT_TYPES,
+  ...RUN_BOUNDARY_EVENT_TYPES,
 ]);
 
 interface Snapshot {
@@ -159,6 +158,19 @@ const redrive = (
   runId: string,
   from: unknown = { kind: "lastFailure" },
 ) => h.kernel.dispatch({ type: "run.redrive", workflowRunId: runId, from });
+
+/**
+ * Removes every outbox row of a run, as a retention job does. The reference
+ * Prisma store numbers a run's next row from the highest one it still holds
+ * (`max(sequence) + 1`), so after this the next row is sequence 1 again; the
+ * in-memory store keeps a counter per run, reset here to number the same way.
+ */
+function purgeOutbox(h: any, runId: string) {
+  h.persistence.outbox = (h.persistence.outbox as any[]).filter(
+    (row) => row.workflowRunId !== runId,
+  );
+  h.persistence.outboxSequences.delete(runId);
+}
 
 async function drain(h: any, runId: string, ticks = 8) {
   for (let i = 0; i < ticks; i++) await h.tick([runId]);
@@ -763,11 +775,15 @@ type Retention = {
   reasons: AttemptUnavailableReason[];
 };
 
-function retentionStates(m: Moment): Retention[] {
+function retentionStates(m: Moment, purged: boolean): Retention[] {
   const own = (row: any) => row.workflowRunId === m.runId;
   const n = m.outbox.filter(own).length;
   const states: Retention[] = [
-    { name: "all kept", removed: () => false, reasons: [] },
+    {
+      name: "all kept",
+      removed: () => false,
+      reasons: purged ? ["events-incomplete"] : [],
+    },
     { name: "all gone", removed: () => true, reasons: ["no-retained-events"] },
     {
       name: "only other runs' rows left",
@@ -795,7 +811,12 @@ function retentionStates(m: Moment): Retention[] {
     states.push({
       name: `tail ${k}..${n} gone`,
       removed: (row) => own(row) && row.sequence >= k,
-      reasons: ["inconsistent", "no-stage-events"],
+      // After an earlier purge no remaining row is the run's creation.
+      // A removed tail that held a redrive's `workflow:started` leaves fewer
+      // of them than the run row's `redriveCount`.
+      reasons: purged
+        ? ["events-incomplete"]
+        : ["inconsistent", "no-stage-events", "fewer-redrives"],
     });
   }
   return states;
@@ -806,10 +827,10 @@ function retentionStates(m: Moment): Retention[] {
  * history read with all rows kept, or unavailable with a reason that is true
  * for what was removed.
  */
-async function expectTrueUnderRetention(m: Moment) {
+async function expectTrueUnderRetention(m: Moment, purged = false) {
   const truth = await pageModel(m, () => false);
   const tally: Record<string, number> = {};
-  for (const state of retentionStates(m)) {
+  for (const state of retentionStates(m, purged)) {
     const model = await pageModel(m, state.removed);
     for (const [stageRecordId, expected] of truth) {
       const got = model.get(stageRecordId)!;
@@ -882,6 +903,8 @@ describe("I want every statement about a stage's history to be true under any re
   const outcomes: Array<{
     name: string;
     expected: unknown;
+    /** Every row of the run was purged at some point before the moment. */
+    purged?: boolean;
     run: () => Promise<Moment>;
   }> = [
     {
@@ -1063,6 +1086,73 @@ describe("I want every statement about a stage's history to be true under any re
       },
     },
     {
+      // Without the run's creation among its rows, the redrive's events would
+      // read as the stage's first run.
+      name: "every row purged, then a redrive that completed",
+      expected: "unavailable:events-incomplete",
+      purged: true,
+      async run() {
+        let failing = true;
+        const h = tickingHarness([
+          wf(
+            "wf",
+            stageOf(async (ctx) => {
+              if (failing) throw new Error("down");
+              return { output: ctx.input };
+            }),
+          ),
+        ]);
+        await withOtherRun(h);
+        const { workflowRunId } = await h.run("wf", { v: "x" });
+        purgeOutbox(h, workflowRunId);
+        failing = false;
+        await redrive(h, workflowRunId);
+        await drain(h, workflowRunId);
+        const m = await moment(h, workflowRunId);
+        const own = m.outbox.filter(
+          (row) => row.workflowRunId === workflowRunId,
+        );
+        expect(own[0]).toMatchObject({
+          sequence: 1,
+          eventType: "workflow:started",
+        });
+        return m;
+      },
+    },
+    {
+      name: "purged, redriven, purged again, redriven",
+      expected: "unavailable:events-incomplete",
+      purged: true,
+      async run() {
+        let failures = 2;
+        const h = tickingHarness([
+          wf(
+            "wf",
+            stageOf(async (ctx) => {
+              if (failures > 0) throw new Error("down");
+              return { output: ctx.input };
+            }),
+          ),
+        ]);
+        await withOtherRun(h);
+        const { workflowRunId } = await h.run("wf", { v: "x" });
+        purgeOutbox(h, workflowRunId);
+        failures = 1;
+        await redrive(h, workflowRunId, { kind: "start" });
+        await drain(h, workflowRunId);
+        expect((await h.persistence.getRun(workflowRunId)).status).toBe(
+          "FAILED",
+        );
+        purgeOutbox(h, workflowRunId);
+        failures = 0;
+        await redrive(h, workflowRunId, { kind: "start" });
+        await drain(h, workflowRunId);
+        const m = await moment(h, workflowRunId);
+        expect(m.run).toMatchObject({ status: "COMPLETED", redriveCount: 2 });
+        return m;
+      },
+    },
+    {
       name: "suspended again after a retry inside stage.pollSuspended",
       expected: [
         ["initial", "retrying"],
@@ -1138,9 +1228,9 @@ describe("I want every statement about a stage's history to be true under any re
     },
   ];
 
-  it.each(outcomes)("$name", async ({ expected, run }) => {
+  it.each(outcomes)("$name", async ({ expected, run, purged }) => {
     const m = await run();
-    const { truth, tally } = await expectTrueUnderRetention(m);
+    const { truth, tally } = await expectTrueUnderRetention(m, purged);
     expect(shapeOf(truth, m, "s")).toEqual(expected);
     // Every stage is available with all rows kept, and some state of each
     // kind made the page fall back.

@@ -7,6 +7,7 @@ import {
   type AttemptTrigger,
   type AttemptUnavailableReason,
   buildStageAttemptHistory,
+  catchUpStep,
   type HeldStageEvents,
   mergeStageEvents,
   type StageAttempt,
@@ -348,9 +349,14 @@ function usePolled<T>(
     setTick((t) => t + 1);
   }, []);
 
+  const wasPaused = useRef(paused);
+
   useEffect(() => {
     let mounted = true;
-    setLoading(true);
+    // Pausing stops the polling; it is no reason to read again. Resuming,
+    // a refresh and a change of what is read each read at once.
+    const justPaused = paused && !wasPaused.current;
+    wasPaused.current = paused;
 
     const execute = async () => {
       try {
@@ -369,7 +375,10 @@ function usePolled<T>(
       }
     };
 
-    void execute();
+    if (!justPaused) {
+      setLoading(true);
+      void execute();
+    }
 
     let timer: ReturnType<typeof setInterval> | null = null;
 
@@ -918,6 +927,10 @@ const UNAVAILABLE_LABEL: Record<AttemptUnavailableReason, string> = {
   "no-retained-events": "none of the run's events are retained in its outbox",
   "events-loading":
     "the page has read only part of the run's events so far and is reading the rest",
+  "events-paused":
+    "the page has read only part of the run's events so far, and while polling is paused it reads no more on its own (it reads the rest once polling resumes)",
+  "fewer-redrives":
+    "the run's record counts more redrives than its retained events record, so the events of earlier executions are not retained",
   "no-stage-events":
     "the stage's record says it ran, and no lifecycle event of it is retained",
   "unproven-boundary":
@@ -1072,8 +1085,8 @@ function AttemptItem({
           {attempt.steps.length === 0 ? (
             <p class="attempt-empty">
               {stepsTruncated
-                ? "None of the steps read last changed during this attempt."
-                : "No step last changed during this attempt."}
+                ? "None of the steps read has its last recorded change within this attempt's recorded times."
+                : "No step has its last recorded change within this attempt's recorded times."}
             </p>
           ) : (
             <AttemptSteps steps={attempt.steps} />
@@ -1101,7 +1114,9 @@ function AttemptHistory({
       </div>
       <p class="attempt-hint">
         Built from the run's retained stage events. The step ledger keeps only each step's latest
-        state, so a step is listed under the attempt in which it last changed.
+        state, so a step is listed under the attempt whose recorded start and end contain the time
+        of its last change. Those times come from the processes that wrote them, so hosts whose
+        clocks differ can move a step across an attempt boundary.
       </p>
       {stepsTruncated && (
         <p class="truncated-note">The step list is truncated, so attempts may omit steps.</p>
@@ -1220,19 +1235,19 @@ function RunDetailView({
   );
 
   // A read returns at most one chunk of a long history; ask again at once
-  // until the page has caught up instead of waiting for the next poll, also
-  // with polling off. Each immediate request needs the held events to have
-  // advanced past the last one, so a reader that stops advancing is asked
-  // again only by the poll.
+  // until the page has caught up instead of waiting for the next poll. Each
+  // immediate request needs the held events to have advanced past the last
+  // one, so a reader that stops advancing is asked again only by the poll.
+  // Paused, the page makes no request on its own; resuming re-polls from
+  // what it holds (`usePolled` runs again when `paused` changes).
   const behindAt =
     data?.stageLog && !data.stageLog.caughtUp ? data.stageLog.lastSequence : null;
   const askedAt = useRef(-1);
   useEffect(() => {
-    if (behindAt !== null && behindAt > askedAt.current) {
-      askedAt.current = behindAt;
-      refresh();
-    }
-  }, [behindAt, refresh]);
+    const step = catchUpStep(behindAt, askedAt.current, paused);
+    askedAt.current = step.askedAt;
+    if (step.read) refresh();
+  }, [behindAt, paused, refresh]);
 
   const effectiveError = actionError ?? error;
   const activeError = effectiveError === dismissedError ? null : effectiveError;
@@ -1355,10 +1370,10 @@ function RunDetailView({
             redriveCount: data.run.redriveCount,
             stages: data.stages,
             steps: data.steps,
-            stageEvents: data.stageLog,
+            stageEvents: data.stageLog && { ...data.stageLog, paused },
           })
         : new Map<string, StageAttemptHistory>(),
-    [data],
+    [data, paused],
   );
 
   return (

@@ -48,8 +48,15 @@
  *    attempt was a job retry that a cancel interrupted.
  *
  * What the page states rests on two kinds of evidence. The events must cover
- * the run from its first outbox row (`coverage: "from-start"`): only then is
- * the first attempt the first run and "no event" proof that nothing happened.
+ * the run from its first outbox row (`coverage: "from-start"`): an unbroken
+ * range whose sequence 1 is the run's `workflow:created`. A store numbers a
+ * run's rows from the highest one it still holds, so after every row of a run
+ * was removed the next one is numbered 1 again; only `workflow:created`, which
+ * `run.create` writes once and first, shows that a range starts where the run
+ * did. Only then is the first attempt the first run and "no event" proof that
+ * nothing happened. The run row must agree too: each redrive writes one
+ * `workflow:started`, so fewer of them than its `redriveCount` means earlier
+ * generations are not retained.
  * And the stage row must agree with them: its status with the last attempt,
  * its `attempt` count (on a run never redriven), its `startedAt` with the
  * last `stage:started`, its `completedAt` with the event that ended it, and
@@ -58,12 +65,20 @@
  * last retained event means the events that followed are not retained. A
  * disagreement makes the stage unavailable and names the field.
  *
+ * Times stamped by different processes are never compared to decide whether
+ * the history is available. `startedAt` is checked against the last
+ * `stage:started`, which `job.execute` writes in the transaction that stamps
+ * it; `completedAt` against the `stage:completed` or `stage:failed` that ends a
+ * COMPLETED or FAILED stage, also written in the transaction that stamps it.
+ * Everything else is ordered by `sequence`.
+ *
  * Step rows carry no attempt marker of the stage, only `updatedAt`. A step
  * row records the step's latest state, so it is placed in the one attempt
- * whose window [start, end] contains `updatedAt`: the attempt in which the
- * step last changed, which is the attempt its status and error describe. The
- * window of a "lost" attempt closes where the next execution started, so the
- * steps placed in it are placed by time only.
+ * whose window [start, end] contains `updatedAt`. That compares the step's
+ * time with event times that other processes may have stamped (a window that
+ * ends where another worker started, a poll that resumed the stage, a
+ * cancel), so the page says a step is placed by its recorded times, not that
+ * it changed during that attempt.
  * A step that ran in an earlier attempt and again later appears only in the
  * later one (its `attempt` count says it executed more than once). A step
  * whose `updatedAt` is in no window, or on the boundary shared by two, is
@@ -119,14 +134,16 @@ export interface StageAttemptInput {
     coverage: EventCoverage;
     /** False while the page is still reading the run's events in chunks. */
     caughtUp?: boolean;
+    /** True while the page makes no request on its own (polling paused). */
+    paused?: boolean;
   };
 }
 
 /** What the held events are known to cover of the run's outbox rows. */
 export type EventCoverage =
-  /** Every row from sequence 1 (the run's first event) to the last one read. */
+  /** Every row from sequence 1, the run's `workflow:created`, to the last one read. */
   | "from-start"
-  /** Rows are missing from what was read: purged or past retention. */
+  /** Rows are missing from what was read, or it does not begin with the run's creation. */
   | "gap"
   /** The run has no retained outbox row at all. */
   | "none";
@@ -156,7 +173,10 @@ export interface StageEventPage {
  * Folds one read into the events the page already holds, and returns null
  * while nothing is held. Only a read from the start (`after` 0) can begin the
  * history; a first read that finds no row says the run has none retained,
- * never that its history is empty. After that, a read is taken only when it
+ * never that its history is empty, and a first read covers the run from its
+ * start only when it begins with the run's `workflow:created` at sequence 1
+ * (rows numbered from 1 again after every earlier row was removed do not).
+ * After that, a read is taken only when it
  * continues what is held (`after` not past `lastSequence`) and reaches
  * further; anything else (a slow response that arrives late, an answer to a
  * request this page did not make) changes nothing. Events are appended by
@@ -171,11 +191,18 @@ export function mergeStageEvents(
   const more = page.more === true;
   if (held === null) {
     if (page.after !== 0) return null;
+    const first = page.events[0];
+    const fromCreation =
+      first?.sequence === 1 && first.eventType === "workflow:created";
     return {
       events: page.events,
       lastSequence: page.lastSequence,
       coverage:
-        page.lastSequence <= 0 ? "none" : page.complete ? "from-start" : "gap",
+        page.lastSequence <= 0
+          ? "none"
+          : page.complete && fromCreation
+            ? "from-start"
+            : "gap",
       more,
     };
   }
@@ -228,6 +255,10 @@ export type AttemptUnavailableReason =
   | "no-retained-events"
   /** The page has read only part of the run's events so far. */
   | "events-loading"
+  /** As `events-loading`, while the page is paused and reads nothing on its own. */
+  | "events-paused"
+  /** The run row counts more redrives than the retained `workflow:started` events. */
+  | "fewer-redrives"
   /** The stage row says it ran, and no lifecycle event of it is retained. */
   | "no-stage-events"
   /**
@@ -673,29 +704,49 @@ function historyForStage(
   };
 }
 
+/**
+ * Whether the page reads the next chunk of a run's events at once, and what
+ * it then counts as asked. `behindAt` is the held `lastSequence` while rows
+ * past it remain, else null. A chunk is read only past the last one asked
+ * for, so a reader that stops advancing is not asked again at once. While
+ * paused the page reads nothing on its own; resuming polls from what it
+ * holds, so the position it holds counts as asked.
+ */
+export function catchUpStep(
+  behindAt: number | null,
+  askedAt: number,
+  paused: boolean,
+): { read: boolean; askedAt: number } {
+  if (behindAt === null || behindAt <= askedAt) return { read: false, askedAt };
+  return { read: !paused, askedAt: behindAt };
+}
+
 /** Attempt history of every stage, keyed by stage record id. */
 export function buildStageAttemptHistory(
   input: StageAttemptInput,
 ): Map<string, StageAttemptHistory> {
   const result = new Map<string, StageAttemptHistory>();
   const log = input.stageEvents;
+  const runReason = !log
+    ? "no-event-history"
+    : log.caughtUp === false
+      ? log.paused
+        ? "events-paused"
+        : "events-loading"
+      : log.coverage === "none"
+        ? "no-retained-events"
+        : log.coverage === "gap"
+          ? "events-incomplete"
+          : log.events.filter((event) => event.eventType === "workflow:started")
+                .length < input.redriveCount
+            ? "fewer-redrives"
+            : null;
   for (const stage of input.stages) {
-    if (!log) {
+    if (!log || runReason !== null) {
       result.set(stage.id, {
         stageRecordId: stage.id,
         available: false,
-        reason: "no-event-history",
-      });
-    } else if (log.caughtUp === false || log.coverage !== "from-start") {
-      result.set(stage.id, {
-        stageRecordId: stage.id,
-        available: false,
-        reason:
-          log.caughtUp === false
-            ? "events-loading"
-            : log.coverage === "none"
-              ? "no-retained-events"
-              : "events-incomplete",
+        reason: runReason ?? "no-event-history",
       });
     } else {
       result.set(
