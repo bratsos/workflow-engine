@@ -138,13 +138,15 @@ describe(`the console read port on a SQLite file another Prisma major wrote, on 
       const db = new DatabaseSync(file);
       db.exec(`CREATE TABLE "workflow_runs" ("id" TEXT NOT NULL PRIMARY KEY, "createdAt" DATETIME NOT NULL);
         CREATE INDEX "workflow_runs_createdAt_id_idx" ON "workflow_runs"("createdAt" DESC, "id" DESC);
-        CREATE TABLE "outbox_events" ("id" TEXT NOT NULL PRIMARY KEY, "publishedAt" DATETIME, "dlqAt" DATETIME);
+        CREATE TABLE "outbox_events" ("id" TEXT NOT NULL PRIMARY KEY, "occurredAt" DATETIME, "publishedAt" DATETIME, "dlqAt" DATETIME);
         CREATE INDEX "outbox_events_publishedAt_idx" ON "outbox_events"("publishedAt");
         CREATE INDEX "outbox_events_dlqAt_idx" ON "outbox_events"("dlqAt");
         CREATE TABLE "workflow_stages" ("id" TEXT NOT NULL PRIMARY KEY, "nextPollAt" DATETIME);
         CREATE INDEX "workflow_stages_nextPollAt_idx" ON "workflow_stages"("nextPollAt");
-        CREATE TABLE "job_queue" ("id" TEXT NOT NULL PRIMARY KEY, "nextPollAt" DATETIME);
-        CREATE INDEX "job_queue_nextPollAt_idx" ON "job_queue"("nextPollAt");`);
+        CREATE TABLE "job_queue" ("id" TEXT NOT NULL PRIMARY KEY, "createdAt" DATETIME, "nextPollAt" DATETIME);
+        CREATE INDEX "job_queue_nextPollAt_idx" ON "job_queue"("nextPollAt");
+        CREATE TABLE "idempotency_keys" ("id" TEXT NOT NULL PRIMARY KEY, "createdAt" DATETIME NOT NULL);
+        CREATE TABLE "ai_calls" ("id" TEXT NOT NULL PRIMARY KEY, "createdAt" DATETIME NOT NULL);`);
       db.prepare(`INSERT INTO "workflow_runs" VALUES (?, ?)`).run(
         "recent",
         now,
@@ -157,6 +159,75 @@ describe(`the console read port on a SQLite file another Prisma major wrote, on 
     },
     60_000,
   );
+
+  /**
+   * A client with exactly the published minimum (`ConsolePrismaClient`): the
+   * parameterized raw read, plus on Prisma 8 the two members `fromPrisma8`
+   * gives every client. No tagged `$queryRaw`, no model delegates.
+   */
+  const minimum = (client: any): ConsolePrismaClient =>
+    isPrisma8
+      ? {
+          $queryRawUnsafe: (q: string, ...v: unknown[]) =>
+            client.$queryRawUnsafe(q, ...v),
+          $databaseType: "sqlite",
+          $withColumns: (c: any) => minimum(client.$withColumns(c)),
+        }
+      : {
+          $queryRawUnsafe: (q: string, ...v: unknown[]) =>
+            client.$queryRawUnsafe(q, ...v),
+        };
+
+  /** Dates rewritten into what another major writes (class on 6 and 7, form on 8). */
+  async function foreign(name: string) {
+    if (!isPrisma8) return otherClass(name);
+    const { file, writer } = await writtenByThisMajor(name);
+    for (const column of ["createdAt", "updatedAt"]) {
+      await writer.$executeRawUnsafe!(
+        `UPDATE "workflow_runs" SET "${column}" = replace("${column}", 'Z', '+00:00')`,
+      );
+    }
+    return file;
+  }
+
+  it("checks a client that has only the published minimum, through its parameterized raw read", async () => {
+    const { writer } = await writtenByThisMajor("minimum-same.db");
+    const same = readerOn(minimum(writer));
+    const page = await same.listRuns({
+      filters: { createdAfter: new Date(now - HOUR) },
+    });
+    expect(page.runs.map((r) => r.id)).toEqual(["recent"]);
+
+    const other = readerOn(
+      minimum(await open(await foreign("minimum.db"), true)),
+    );
+    await expect(
+      other.listRuns({ filters: { createdAfter: new Date(now - HOUR) } }),
+    ).rejects.toBeInstanceOf(engine.SqliteDateStorageError);
+  }, 60_000);
+
+  it("checks again after a read of an empty file, and refuses once another major has written", async () => {
+    const file = join(directory, "warm.db");
+    const warm = await open(file, false);
+    const reader = readerOn(minimum(warm));
+    await expect(reader.listRuns({ limit: 5 })).resolves.toMatchObject({
+      runs: [],
+    });
+    const other = await open(file, true);
+    await other.workflowRun.create({ data: run("recent", new Date(now)) });
+    for (const column of ["createdAt", "updatedAt"]) {
+      await other.$executeRawUnsafe!(
+        major === "6"
+          ? `UPDATE "workflow_runs" SET "${column}" = strftime('%Y-%m-%dT%H:%M:%f', "${column}" / 1000.0, 'unixepoch') || '+00:00'`
+          : major === "7"
+            ? `UPDATE "workflow_runs" SET "${column}" = CAST(ROUND((julianday(substr("${column}", 1, 23)) - 2440587.5) * 86400000) AS INTEGER)`
+            : `UPDATE "workflow_runs" SET "${column}" = replace("${column}", 'Z', '+00:00')`,
+      );
+    }
+    await expect(
+      reader.listRuns({ filters: { createdAfter: new Date(now - HOUR) } }),
+    ).rejects.toBeInstanceOf(engine.SqliteDateStorageError);
+  }, 60_000);
 
   it("does not run the check for PostgreSQL", async () => {
     // A client that would fail on any SQLite probe is untouched: the check is

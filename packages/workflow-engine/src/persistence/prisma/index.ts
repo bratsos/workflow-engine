@@ -38,6 +38,7 @@ export {
   assertSqliteDateStorage,
   SQLITE_DATE_STORAGE_DOCS,
   SqliteDateStorageError,
+  SqliteDateStorageUnverifiedError,
 } from "./sqlite-date-guard";
 export {
   createPrismaStepLedger,

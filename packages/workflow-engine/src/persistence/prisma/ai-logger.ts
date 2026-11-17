@@ -21,6 +21,12 @@ import {
   validateDatabaseType,
 } from "./prisma-client-type";
 import { isUniqueViolation } from "./sql-errors";
+import {
+  armSqliteAdapter,
+  guardSqliteAdapter,
+  shareSqliteGuard,
+  sqliteCheckFor,
+} from "./sqlite-date-guard";
 import { hasBaseReads, sqliteTransactionReads } from "./transaction-reads";
 
 const logger = createLogger("AICallLogger");
@@ -150,6 +156,7 @@ export class PrismaAICallLogger implements AICallLogger {
     );
     this.databaseType = options.databaseType ?? "postgresql";
     validateDatabaseType(prisma, this.databaseType);
+    if (this.databaseType === "sqlite") armSqliteAdapter(this, prisma);
   }
 
   /**
@@ -157,8 +164,11 @@ export class PrismaAICallLogger implements AICallLogger {
    * Does not await - logs asynchronously to avoid blocking AI operations
    */
   logCall(call: CreateAICallInput): void {
-    this.prisma.aICall
-      .create({
+    // Not awaited by the caller, so the SQLite date check runs here (it is
+    // `undefined` on PostgreSQL); a refusal is logged like any failed write.
+    const check = sqliteCheckFor(this);
+    const write = () =>
+      this.prisma.aICall.create({
         data: {
           topic: call.topic,
           callType: call.callType,
@@ -176,10 +186,10 @@ export class PrismaAICallLogger implements AICallLogger {
             ? { requestId: call.requestId }
             : {}),
         },
-      })
-      .catch((error: unknown) =>
-        logger.error("Failed to persist AI call:", error),
-      );
+      });
+    (check ? check.then(write) : write()).catch((error: unknown) =>
+      logger.error("Failed to persist AI call:", error),
+    );
   }
 
   /**
@@ -315,6 +325,7 @@ export class PrismaAICallLogger implements AICallLogger {
       const reader = new PrismaAICallLogger(tx, {
         databaseType: this.databaseType,
       });
+      shareSqliteGuard(reader, this);
       return { getStats: reader.getStats.bind(reader) };
     });
   }
@@ -399,6 +410,13 @@ export class PrismaAICallLogger implements AICallLogger {
     return rows.map(toRecord);
   }
 }
+
+// Every method but the two synchronous ones awaits the SQLite date check first
+// (see sqlite-date-guard.ts); `logCall` makes it itself.
+guardSqliteAdapter(PrismaAICallLogger.prototype, [
+  "logCall",
+  "transactionReads",
+]);
 
 // Factory function to create PrismaAICallLogger with prisma client
 export function createPrismaAICallLogger(

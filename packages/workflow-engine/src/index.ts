@@ -250,6 +250,7 @@ export {
   PrismaStepLedger,
   PrismaWorkflowPersistence,
   SqliteDateStorageError,
+  SqliteDateStorageUnverifiedError,
 } from "./persistence";
 // Batch Model Mapping
 export {

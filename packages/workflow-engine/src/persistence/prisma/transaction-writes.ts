@@ -253,11 +253,14 @@ export function withTransactionWriteGuard<T extends object>(
                 );
         if (key === "$withColumns" && typeof value === "function")
           return (...args: any[]) => wrap(value.apply(target, args));
+        // A raw method the client lacks stays absent: callers choose their
+        // path by whether it exists.
         if (
-          key === "$executeRaw" ||
-          key === "$executeRawUnsafe" ||
-          key === "$queryRaw" ||
-          key === "$queryRawUnsafe"
+          typeof value === "function" &&
+          (key === "$executeRaw" ||
+            key === "$executeRawUnsafe" ||
+            key === "$queryRaw" ||
+            key === "$queryRawUnsafe")
         )
           return (...args: any[]) => {
             const sql =

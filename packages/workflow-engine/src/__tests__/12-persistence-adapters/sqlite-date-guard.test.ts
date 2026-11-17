@@ -24,13 +24,18 @@ import {
   InMemoryBlobStore,
 } from "../../kernel/testing/index.js";
 import {
+  createPrismaAICallLogger,
   createPrismaJobQueue,
+  createPrismaStepLedger,
   createPrismaWorkflowPersistence,
   fromPrisma8,
+  PrismaAICallLogger,
   PrismaJobQueue,
+  PrismaStepLedger,
   PrismaWorkflowPersistence,
   SQLITE_DATE_STORAGE_DOCS,
   SqliteDateStorageError,
+  SqliteDateStorageUnverifiedError,
 } from "../../persistence/prisma/index.js";
 import { rawFor } from "../../persistence/prisma/prisma-client-type.js";
 import {
@@ -38,6 +43,7 @@ import {
   sqliteDateGuard,
   verifySqliteDates,
 } from "../../persistence/prisma/sqlite-date-guard.js";
+import { InMemoryJobQueue } from "../../testing/index.js";
 
 /** A client whose probe answers `rows` (or throws), counting the probes. */
 function fakeClient(answer: () => unknown) {
@@ -222,25 +228,19 @@ describe("sqlite date guard: the check", () => {
     ).resolves.toBeUndefined();
   });
 
-  it("does not refuse an empty table, a file of the same class or a client without raw queries", async () => {
+  it("does not refuse a file of the same class or form", async () => {
     for (const answer of [
-      probe("null", "null", "text", [null, null, PLUS]),
       probe("text", "text", "text"),
-      probe("integer", "integer", "integer"),
-      [],
+      probe("integer", "integer", "integer", ["1", "2", "0"]),
     ]) {
       const { client } = fakeClient(() => answer);
       await expect(
         verifySqliteDates(client, sqliteDateGuard(client)),
       ).resolves.toBeUndefined();
     }
-    const bare: any = { $withColumns: () => ({}) };
-    await expect(
-      verifySqliteDates(bare, sqliteDateGuard(bare)),
-    ).resolves.toBeUndefined();
   });
 
-  it("asks once per client, and retries only a probe that failed", async () => {
+  it("asks once per client after a conclusive pass", async () => {
     const { client, calls } = fakeClient(() => probe("text", "text", "text"));
     const guard = sqliteDateGuard(client);
     await Promise.all(
@@ -249,25 +249,92 @@ describe("sqlite date guard: the check", () => {
     await verifySqliteDates(client, guard);
     expect(calls.n).toBe(1);
     expect(sqliteDateGuard(client)).toBe(guard);
+  });
 
-    // A schema that is not pushed yet: not a refusal, asked again next time.
+  it("fails the operation when the probe throws, keeps the cause, and probes again on the next call", async () => {
     let failing = true;
-    const unpushed = fakeClient(() => {
-      if (failing) throw new Error("no such table: workflow_runs");
+    const cause = new Error("no such table: job_queue");
+    const { client, calls } = fakeClient(() => {
+      if (failing) throw cause;
       return probe("text", "text", "text");
     });
-    const g = sqliteDateGuard(unpushed.client);
-    await expect(
-      verifySqliteDates(unpushed.client, g),
-    ).resolves.toBeUndefined();
-    await expect(
-      verifySqliteDates(unpushed.client, g),
-    ).resolves.toBeUndefined();
-    expect(unpushed.calls.n).toBe(2);
+    const guard = sqliteDateGuard(client);
+    for (let i = 0; i < 2; i++) {
+      const error = await verifySqliteDates(client, guard).catch((e) => e);
+      expect(error).toBeInstanceOf(SqliteDateStorageUnverifiedError);
+      expect(error.code).toBe("SQLITE_DATE_STORAGE_UNVERIFIED");
+      expect(error.reason).toBe("probe-failed");
+      expect(error.cause).toBe(cause);
+      expect(error.message).toContain("no such table: job_queue");
+    }
+    expect(calls.n).toBe(2);
     failing = false;
-    await verifySqliteDates(unpushed.client, g);
-    await verifySqliteDates(unpushed.client, g);
-    expect(unpushed.calls.n).toBe(3);
+    await verifySqliteDates(client, guard);
+    await verifySqliteDates(client, guard);
+    expect(calls.n).toBe(3);
+  });
+
+  it("never remembers a check that saw no stored date, and refuses the first foreign date written after it", async () => {
+    // Every probed column empty: an empty file (only the bound row has a value).
+    let answer = probe("null", "null", "text", [null, null, PLUS]);
+    const { client, calls } = fakeClient(() => answer);
+    const guard = sqliteDateGuard(client);
+    await verifySqliteDates(client, guard);
+    await verifySqliteDates(client, guard);
+    expect(calls.n).toBe(2);
+    expect(guard.verified).toBeNull();
+    // Another major writes its first row: the next call sees it.
+    answer = probe("integer", "integer", "text", ["1", "1", PLUS]);
+    await expect(verifySqliteDates(client, guard)).rejects.toBeInstanceOf(
+      SqliteDateStorageError,
+    );
+    // A sampled table alone (only an outbox row, say) is conclusive too.
+    const outboxOnly = fakeClient(() =>
+      probe(
+        "null",
+        "null",
+        "text",
+        [null, null, PLUS],
+        [
+          {
+            col: "outbox_events.occurredAt",
+            lo: "integer",
+            loValue: "1",
+            hi: "integer",
+            hiValue: "1",
+          },
+        ],
+      ),
+    );
+    await expect(
+      verifySqliteDates(outboxOnly.client, sqliteDateGuard(outboxOnly.client)),
+    ).rejects.toMatchObject({ column: "outbox_events.occurredAt" });
+  });
+
+  it("probes through $queryRawUnsafe when the client has no tagged $queryRaw, and refuses a client with neither", async () => {
+    const seen: { sql: string; values: unknown[] }[] = [];
+    const unsafeOnly: any = {
+      $queryRawUnsafe: async (sql: string, ...values: unknown[]) => {
+        seen.push({ sql, values });
+        return probe("integer", "integer", "text");
+      },
+    };
+    await expect(
+      verifySqliteDates(unsafeOnly, sqliteDateGuard(unsafeOnly)),
+    ).rejects.toBeInstanceOf(SqliteDateStorageError);
+    expect(seen).toHaveLength(1);
+    // Prisma 6 and 7 adapters take `?`; one parameter, the bound `Date`.
+    expect(seen[0].sql).toContain("SELECT ? AS d");
+    expect(seen[0].values).toEqual([new Date(0)]);
+
+    const bare: any = { $withColumns: () => ({}) };
+    const error = await verifySqliteDates(bare, sqliteDateGuard(bare)).catch(
+      (e) => e,
+    );
+    expect(error).toBeInstanceOf(SqliteDateStorageUnverifiedError);
+    expect(error.reason).toBe("no-raw-query");
+    expect(error.message).toContain("$queryRaw");
+    expect(error.message).toContain("$queryRawUnsafe");
   });
 });
 
@@ -424,6 +491,72 @@ describe.skipIf(!sqlite)(`sqlite date guard on Prisma ${major}`, () => {
   });
 
   /**
+   * Rewrites the stored dates of `columns` into what another major writes:
+   * Prisma 6's integers into text, Prisma 7's text into integers (both a class
+   * difference), Prisma 8's `Z` text into `+00:00` (a form difference; its
+   * tables' text affinity keeps an integer as text).
+   */
+  async function foreignize(client: any, table: string, columns: string[]) {
+    const to: Record<string, (c: string) => string> = {
+      "6": (c) =>
+        `strftime('%Y-%m-%dT%H:%M:%f', "${c}" / 1000.0, 'unixepoch') || '+00:00'`,
+      "7": (c) =>
+        `CAST(ROUND((julianday(substr("${c}", 1, 23)) - 2440587.5) * 86400000) AS INTEGER)`,
+      "8": (c) => `replace("${c}", 'Z', '+00:00')`,
+    };
+    for (const column of columns) {
+      await client.$executeRawUnsafe(
+        `UPDATE "${table}" SET "${column}" = ${to[major](column)} WHERE "${column}" IS NOT NULL`,
+      );
+    }
+  }
+
+  /** A view of `client` without the named members, as a wrapper that does not forward them. */
+  const without = (target: any, hidden: string[]): any =>
+    new Proxy(target, {
+      get(t, key) {
+        if (hidden.includes(String(key))) return undefined;
+        const value = Reflect.get(t, key);
+        if (key === "$withColumns" && typeof value === "function")
+          return (...args: unknown[]) => without(value.apply(t, args), hidden);
+        return typeof value === "function" ? value.bind(t) : value;
+      },
+      has: (t, key) => !hidden.includes(String(key)) && Reflect.has(t, key),
+    });
+
+  /** A view of `client` whose first `n` raw probes throw `cause`. */
+  const failingProbes = (target: any, n: number, cause: Error): any => {
+    let left = n;
+    const wrap = (inner: any): any =>
+      new Proxy(inner, {
+        get(t, key) {
+          const value = Reflect.get(t, key);
+          if (key === "$queryRaw" || key === "$queryRawUnsafe") {
+            return (first: any, ...rest: unknown[]) => {
+              const text = Array.isArray(first) ? first.join("?") : first;
+              if (String(text).includes("'bound'") && left > 0) {
+                left--;
+                return Promise.reject(cause);
+              }
+              return value.call(t, first, ...rest);
+            };
+          }
+          if (key === "$withColumns" && typeof value === "function")
+            return (...args: unknown[]) => wrap(value.apply(t, args));
+          return typeof value === "function" ? value.bind(t) : value;
+        },
+      });
+    return wrap(target);
+  };
+
+  const statuses = async (client: any) =>
+    (
+      await rawFor(client, { id: "text", status: "text" }).$queryRawUnsafe(
+        `SELECT id, status FROM "workflow_runs" ORDER BY id`,
+      )
+    ).map((r: any) => `${r.id}:${r.status}`);
+
+  /**
    * A file holding a run completed a moment ago ("done") and a RUNNING run
    * updated a moment ago ("running"), whose dates are in the storage class
    * this major does not write (the older run's only, with `mixed`). Prisma 6
@@ -441,13 +574,15 @@ describe.skipIf(!sqlite)(`sqlite date guard on Prisma ${major}`, () => {
         "id" TEXT NOT NULL PRIMARY KEY, "status" TEXT NOT NULL,
         "createdAt" DATETIME NOT NULL, "updatedAt" DATETIME NOT NULL, "completedAt" DATETIME);
         CREATE INDEX "workflow_runs_createdAt_id_idx" ON "workflow_runs"("createdAt" DESC, "id" DESC);
-        CREATE TABLE "outbox_events" ("id" TEXT NOT NULL PRIMARY KEY, "publishedAt" DATETIME, "dlqAt" DATETIME);
+        CREATE TABLE "outbox_events" ("id" TEXT NOT NULL PRIMARY KEY, "occurredAt" DATETIME, "publishedAt" DATETIME, "dlqAt" DATETIME);
         CREATE INDEX "outbox_events_publishedAt_idx" ON "outbox_events"("publishedAt");
         CREATE INDEX "outbox_events_dlqAt_idx" ON "outbox_events"("dlqAt");
         CREATE TABLE "workflow_stages" ("id" TEXT NOT NULL PRIMARY KEY, "nextPollAt" DATETIME);
         CREATE INDEX "workflow_stages_nextPollAt_idx" ON "workflow_stages"("nextPollAt");
-        CREATE TABLE "job_queue" ("id" TEXT NOT NULL PRIMARY KEY, "nextPollAt" DATETIME);
-        CREATE INDEX "job_queue_nextPollAt_idx" ON "job_queue"("nextPollAt");`);
+        CREATE TABLE "job_queue" ("id" TEXT NOT NULL PRIMARY KEY, "createdAt" DATETIME, "nextPollAt" DATETIME);
+        CREATE INDEX "job_queue_nextPollAt_idx" ON "job_queue"("nextPollAt");
+        CREATE TABLE "idempotency_keys" ("id" TEXT NOT NULL PRIMARY KEY, "createdAt" DATETIME NOT NULL);
+        CREATE TABLE "ai_calls" ("id" TEXT NOT NULL PRIMARY KEY, "createdAt" DATETIME NOT NULL);`);
       const now = Date.now();
       const iso = (ms: number) => new Date(ms).toISOString();
       const insert = db.prepare(
@@ -637,7 +772,217 @@ describe.skipIf(!sqlite)(`sqlite date guard on Prisma ${major}`, () => {
     60_000,
   );
 
-  it("asks one cheap question: the guard's own statement is answered from indexes", async () => {
+  it("fails closed when the probe throws: the operation does not run, and the next call probes again", async () => {
+    // Port of the deep review's single probe failure: a run completed a moment
+    // ago, in the other class, offered to retention with a cutoff an hour ago.
+    const file = await otherClassFile("probe-fails.db");
+    const cause = new Error("disk I/O error");
+    const reader = failingProbes(await open(file, true), 1, cause);
+    const persistence = createPrismaWorkflowPersistence(reader, {
+      databaseType: "sqlite",
+    });
+    const hourAgo = new Date(Date.now() - 3_600_000);
+    const error = await persistence
+      .deleteRun("done", hourAgo, ["COMPLETED"])
+      .catch((e) => e);
+    expect(error).toBeInstanceOf(SqliteDateStorageUnverifiedError);
+    expect(error.cause).toBe(cause);
+    expect(await statuses(reader)).toEqual([
+      "done:COMPLETED",
+      "running:RUNNING",
+    ]);
+    // Probed again, conclusively this time: refused, and still nothing deleted.
+    await expect(
+      persistence.deleteRun("done", hourAgo, ["COMPLETED"]),
+    ).rejects.toBeInstanceOf(SqliteDateStorageError);
+    expect(await statuses(reader)).toEqual([
+      "done:COMPLETED",
+      "running:RUNNING",
+    ]);
+  }, 60_000);
+
+  it("fails closed on a real database error in the probe (a table it reads is missing)", async () => {
+    // Port of the deep review's case: the kernel's job transport is not the
+    // Prisma queue, the file has no job_queue table, and the reaper would
+    // fail a run updated a moment ago.
+    const file = await otherClassFile("no-queue.db");
+    const reader = await open(file, true);
+    await reader.$executeRawUnsafe(
+      `ALTER TABLE "job_queue" RENAME TO "job_queue_offline"`,
+    );
+    const kernel = createKernel({
+      persistence: createPrismaWorkflowPersistence(reader, {
+        databaseType: "sqlite",
+      }),
+      blobStore: new InMemoryBlobStore(),
+      jobTransport: new InMemoryJobQueue(),
+      eventSink: new CollectingEventSink(),
+      clock: new FakeClock(),
+      registry: { getWorkflow: () => undefined },
+    });
+    const error = await kernel
+      .dispatch({ type: "run.reapStuck", stuckThresholdMs: 3_600_000 })
+      .catch((e) => e);
+    expect(error).toBeInstanceOf(SqliteDateStorageUnverifiedError);
+    expect(error.reason).toBe("probe-failed");
+    expect(String(error.cause?.message)).toMatch(/job_queue/);
+    expect(await statuses(reader)).toEqual([
+      "done:COMPLETED",
+      "running:RUNNING",
+    ]);
+  }, 60_000);
+
+  it("re-checks a warm client that saw an empty file, and refuses once another major has written", async () => {
+    // Two processes on one new file: this major's (warm) and another's.
+    const file = join(directory, "warm.db");
+    const warm = await open(file);
+    const { kernel } = stack(warm);
+    const stats = await kernel.dispatch({ type: "engine.stats" });
+    expect(stats.runs).toMatchObject({ available: true });
+    // The other major writes a RUNNING run, updated a moment ago.
+    const other = await open(file, true);
+    const writer = stack(other).persistence;
+    await writer.createRun(runInput("running"));
+    await writer.updateRun("running", { status: "RUNNING" });
+    await foreignize(other, "workflow_runs", ["createdAt", "updatedAt"]);
+    // The warm client checks again and refuses; the run is untouched.
+    await expect(
+      kernel.dispatch({ type: "run.reapStuck", stuckThresholdMs: 3_600_000 }),
+    ).rejects.toBeInstanceOf(SqliteDateStorageError);
+    await expect(
+      kernel.dispatch({ type: "engine.stats" }),
+    ).rejects.toBeInstanceOf(SqliteDateStorageError);
+    expect(await statuses(warm)).toEqual(["running:RUNNING"]);
+  }, 60_000);
+
+  it("sees a file holding only rows no run implies: outbox events, idempotency keys, jobs, AI calls", async () => {
+    const cases: [string, string, string[], (s: any) => Promise<void>][] = [
+      [
+        "outbox_events",
+        "outbox_events.occurredAt",
+        ["occurredAt", "createdAt"],
+        ({ persistence }) =>
+          persistence.appendOutboxEvents([
+            {
+              workflowRunId: "gone",
+              eventType: "workflow:completed",
+              payload: {},
+              causationId: "c",
+              occurredAt: new Date(),
+            },
+          ]),
+      ],
+      [
+        "idempotency_keys",
+        "idempotency_keys.createdAt",
+        ["createdAt"],
+        async ({ persistence }) => {
+          await persistence.acquireIdempotencyKey("k", "run.create");
+        },
+      ],
+      [
+        "job_queue",
+        "job_queue.createdAt",
+        ["createdAt", "updatedAt"],
+        async ({ queue }) => {
+          await queue.enqueueParallel([
+            { workflowRunId: "gone", workflowId: "guard", stageId: "a" },
+          ]);
+        },
+      ],
+      [
+        "ai_calls",
+        "ai_calls.createdAt",
+        ["createdAt"],
+        ({ ai }) =>
+          ai.logBatchResults("b", [
+            {
+              topic: "t",
+              callType: "text",
+              modelKey: "m",
+              modelId: "m",
+              prompt: "p",
+              response: "r",
+              inputTokens: 1,
+              outputTokens: 1,
+              cost: 0,
+              requestId: "r1",
+            },
+          ]),
+      ],
+    ];
+    for (const [table, column, columns, write] of cases) {
+      const file = join(directory, `only-${table}.db`);
+      const writer = await open(file);
+      const ws = stack(writer);
+      await write({
+        ...ws,
+        ai: createPrismaAICallLogger(writer, { databaseType: "sqlite" }),
+      });
+      await foreignize(writer, table, columns);
+      const reader = stack(await open(file, true));
+      const error = await reader.kernel
+        .dispatch({ type: "engine.stats" })
+        .catch((e) => e);
+      expect(error, table).toBeInstanceOf(SqliteDateStorageError);
+      expect(error.column, table).toBe(column);
+    }
+  }, 120_000);
+
+  it("checks a client that exposes only $queryRawUnsafe through it, and refuses a client with no raw read", async () => {
+    const hourAgo = new Date(Date.now() - 3_600_000);
+    // Port of the deep review's facade: delegates, $transaction and the
+    // parameterized raw read, no tagged $queryRaw.
+    const foreign = without(
+      await open(await otherClassFile("facade.db"), true),
+      ["$queryRaw"],
+    );
+    const f = stack(foreign);
+    await expect(
+      f.kernel.dispatch({ type: "run.reapStuck", stuckThresholdMs: 3_600_000 }),
+    ).rejects.toBeInstanceOf(SqliteDateStorageError);
+    await expect(
+      f.persistence.listRunsForPurge(hourAgo, ["COMPLETED"], 10),
+    ).rejects.toBeInstanceOf(SqliteDateStorageError);
+    expect(await statuses(foreign)).toEqual([
+      "done:COMPLETED",
+      "running:RUNNING",
+    ]);
+    // The same facade on a file this major wrote passes, through the unsafe read.
+    const file = join(directory, "facade-same.db");
+    const own = stack(await open(file));
+    await own.persistence.createRun(runInput("mine"));
+    const same = stack(without(await open(file, true), ["$queryRaw"]));
+    expect((await same.persistence.getRun("mine"))?.id).toBe("mine");
+    // The adapters' own reads choose their path by which raw read the client
+    // has (the SQLite write wrapper used to report both as present).
+    for (const hidden of [["$queryRaw"], ["$queryRawUnsafe"]]) {
+      const client = without(await open(file, true), hidden);
+      const s: any = await stack(client).kernel.dispatch({
+        type: "engine.stats",
+      });
+      expect(s.runs.byStatus.PENDING, hidden[0]).toBe(1);
+    }
+    expect(
+      await createPrismaAICallLogger(
+        without(await open(file, true), ["$queryRawUnsafe"]),
+        { databaseType: "sqlite" },
+      ).listCalls("t"),
+    ).toEqual([]);
+
+    // No raw read at all: the check is impossible, so the call is refused.
+    const blind = stack(
+      without(await open(file, true), ["$queryRaw", "$queryRawUnsafe"]),
+    );
+    const error = await blind.persistence.getRun("mine").catch((e) => e);
+    expect(error).toBeInstanceOf(SqliteDateStorageUnverifiedError);
+    expect(error.reason).toBe("no-raw-query");
+    await expect(blind.queue.dequeue()).rejects.toBeInstanceOf(
+      SqliteDateStorageUnverifiedError,
+    );
+  }, 60_000);
+
+  it("asks one cheap question: index lookups and one row of each sampled table", async () => {
     const client = await open(join(directory, "plan.db"));
     // Capture the statement the guard sends, exactly as it sends it.
     let statement = "";
@@ -665,19 +1010,33 @@ describe.skipIf(!sqlite)(`sqlite date guard on Prisma ${major}`, () => {
     const plan = rows.map((r: any) => String(r.detail)).join("\n");
     // Two lookups (the oldest and the newest) in the index of each of five columns.
     expect(plan.match(/SEARCH \S+ USING (COVERING )?INDEX/g)).toHaveLength(10);
-    expect(plan).not.toMatch(
-      /SCAN (workflow_runs|outbox_events|workflow_stages|job_queue)/,
-    );
+    // The four sampled tables are read from their first row (`LIMIT 1`), and
+    // nothing else is scanned.
+    expect(statement.match(/LIMIT 1\)/g)).toHaveLength(4);
+    const scanned = (
+      plan.match(
+        /SCAN (workflow_\w+|outbox_events|job_queue|idempotency_keys|ai_calls)\b/g,
+      ) ?? []
+    ).map((line: string) => line.slice(5));
+    expect(scanned.sort()).toEqual([
+      "ai_calls",
+      "idempotency_keys",
+      "job_queue",
+      "outbox_events",
+    ]);
   }, 60_000);
 
-  it("guards every method of both adapters except the listed synchronous ones", async () => {
-    const { persistence, queue } = stack(
-      await open(await otherClassFile("audit.db"), true),
-    );
+  it("guards every method of the four adapters except the listed synchronous ones", async () => {
+    const reader = await open(await otherClassFile("audit.db"), true);
+    const { persistence, queue } = stack(reader);
+    const ledger = createPrismaStepLedger(reader, { databaseType: "sqlite" });
+    const ai = createPrismaAICallLogger(reader, { databaseType: "sqlite" });
 
     for (const [instance, klass, sync, atLeast] of [
       [persistence, PrismaWorkflowPersistence, SYNC_PERSISTENCE, 40],
       [queue, PrismaJobQueue, SYNC_QUEUE, 10],
+      [ledger, PrismaStepLedger, ["transactionReads"], 6],
+      [ai, PrismaAICallLogger, ["logCall", "transactionReads"], 3],
     ] as const) {
       const { guarded, unguardedNames } = auditNames(klass.prototype);
       expect(unguardedNames, `${klass.name}: unguarded methods`).toEqual(
@@ -691,6 +1050,35 @@ describe.skipIf(!sqlite)(`sqlite date guard on Prisma ${major}`, () => {
         ).rejects.toBeInstanceOf(SqliteDateStorageError);
       }
     }
+
+    // logCall returns nothing to await: it checks itself, writes nothing and logs the refusal.
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      ai.logCall({
+        topic: "t",
+        callType: "text",
+        modelKey: "m",
+        modelId: "m",
+        prompt: "p",
+        response: "r",
+        inputTokens: 1,
+        outputTokens: 1,
+        cost: 0,
+      });
+      await vi.waitFor(() =>
+        expect(
+          logged.mock.calls.some((args) =>
+            args.some((a) => a instanceof SqliteDateStorageError),
+          ),
+        ).toBe(true),
+      );
+    } finally {
+      logged.mockRestore();
+    }
+    const calls = await rawFor(reader, { n: "int" }).$queryRawUnsafe(
+      `SELECT COUNT(*) AS n FROM "ai_calls"`,
+    );
+    expect(Number(calls[0].n)).toBe(0);
   }, 60_000);
 
   it("guards the same methods when the toolchain lowers async below ES2017", async () => {

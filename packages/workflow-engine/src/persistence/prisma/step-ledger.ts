@@ -10,6 +10,11 @@ import {
   validateDatabaseType,
 } from "./prisma-client-type.js";
 import { isUniqueViolation } from "./sql-errors.js";
+import {
+  armSqliteAdapter,
+  guardSqliteAdapter,
+  shareSqliteGuard,
+} from "./sqlite-date-guard.js";
 import { hasBaseReads, sqliteTransactionReads } from "./transaction-reads.js";
 import { withTransactionWriteGuard } from "./transaction-writes.js";
 
@@ -95,6 +100,7 @@ export class PrismaStepLedger implements StepLedger {
     );
     this.databaseType = options.databaseType ?? "postgresql";
     validateDatabaseType(prisma, this.databaseType);
+    if (this.databaseType === "sqlite") armSqliteAdapter(this, prisma);
   }
 
   async claim(
@@ -208,6 +214,7 @@ export class PrismaStepLedger implements StepLedger {
       const reader = new PrismaStepLedger(tx, {
         databaseType: this.databaseType,
       });
+      shareSqliteGuard(reader, this);
       return { get: reader.get.bind(reader), list: reader.list.bind(reader) };
     });
   }
@@ -239,6 +246,9 @@ export class PrismaStepLedger implements StepLedger {
     });
   }
 }
+
+// Every method awaits the SQLite date check first (see sqlite-date-guard.ts).
+guardSqliteAdapter(PrismaStepLedger.prototype, ["transactionReads"]);
 
 export function createPrismaStepLedger(
   prisma: PrismaClient,

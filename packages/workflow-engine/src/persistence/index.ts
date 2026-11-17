@@ -73,4 +73,5 @@ export {
   PrismaStepLedger,
   PrismaWorkflowPersistence,
   SqliteDateStorageError,
+  SqliteDateStorageUnverifiedError,
 } from "./prisma";
