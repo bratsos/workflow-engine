@@ -1,0 +1,616 @@
+{
+  "format": 1,
+  "metadata": {
+    "release": "1.0.0-alpha.19",
+    "database": "sqlite",
+    "prismaMajor": 7,
+    "scenario": "wait-for",
+    "inFlightPoint": "stage is SUSPENDED in ctx.step.waitFor with its poll step pending",
+    "expectedFinalOutcome": {
+      "status": "COMPLETED",
+      "output": {
+        "value": "released"
+      }
+    },
+    "skippedScenarios": []
+  },
+  "columns": {
+    "WorkflowRun": [
+      "completedAt",
+      "config",
+      "createdAt",
+      "definitionVersion",
+      "duration",
+      "id",
+      "input",
+      "metadata",
+      "output",
+      "priority",
+      "redriveCount",
+      "startedAt",
+      "status",
+      "totalCost",
+      "totalTokens",
+      "updatedAt",
+      "version",
+      "workflowId",
+      "workflowName",
+      "workflowType"
+    ],
+    "WorkflowDefinition": [
+      "createdAt",
+      "snapshot",
+      "structureHash",
+      "version",
+      "workflowId"
+    ],
+    "WorkflowStage": [
+      "attempt",
+      "completedAt",
+      "config",
+      "createdAt",
+      "duration",
+      "embeddingInfo",
+      "errorMessage",
+      "executionGroup",
+      "id",
+      "inputData",
+      "maxWaitUntil",
+      "metrics",
+      "nextPollAt",
+      "outputData",
+      "pollInterval",
+      "resumeData",
+      "stageId",
+      "stageName",
+      "stageNumber",
+      "startedAt",
+      "status",
+      "suspendedState",
+      "updatedAt",
+      "version",
+      "workflowRunId"
+    ],
+    "WorkflowStep": [
+      "attempt",
+      "createdAt",
+      "deadlineAt",
+      "error",
+      "externalKey",
+      "id",
+      "kind",
+      "leaseExpiresAt",
+      "result",
+      "seq",
+      "stageRecordId",
+      "status",
+      "stepId",
+      "updatedAt",
+      "waitState"
+    ],
+    "WorkflowLog": [
+      "createdAt",
+      "id",
+      "level",
+      "message",
+      "metadata",
+      "workflowRunId",
+      "workflowStageId"
+    ],
+    "WorkflowArtifact": [
+      "createdAt",
+      "data",
+      "id",
+      "key",
+      "metadata",
+      "size",
+      "type",
+      "updatedAt",
+      "workflowRunId",
+      "workflowStageId"
+    ],
+    "AICall": [
+      "batchId",
+      "cachedInputTokens",
+      "callType",
+      "cost",
+      "costSource",
+      "createdAt",
+      "estimatedCost",
+      "id",
+      "inputTokens",
+      "metadata",
+      "modelId",
+      "modelKey",
+      "outputTokens",
+      "prompt",
+      "reasoningTokens",
+      "reportedCost",
+      "requestId",
+      "response",
+      "servedBy",
+      "topic"
+    ],
+    "WorkflowAnnotation": [
+      "actorId",
+      "actorKind",
+      "actorVersion",
+      "attempt",
+      "createdAt",
+      "id",
+      "idempotencyKey",
+      "key",
+      "payload",
+      "scope",
+      "scopeId",
+      "value",
+      "workflowRunId",
+      "workflowStageRecordId"
+    ],
+    "JobQueue": [
+      "attempt",
+      "completedAt",
+      "createdAt",
+      "id",
+      "lastError",
+      "lockedAt",
+      "maxAttempts",
+      "nextPollAt",
+      "payload",
+      "priority",
+      "stageId",
+      "startedAt",
+      "status",
+      "updatedAt",
+      "workerId",
+      "workflowRunId"
+    ],
+    "OutboxEvent": [
+      "causationId",
+      "createdAt",
+      "dlqAt",
+      "eventType",
+      "id",
+      "occurredAt",
+      "payload",
+      "publishedAt",
+      "retryCount",
+      "sequence",
+      "workflowRunId"
+    ],
+    "IdempotencyKey": ["commandType", "createdAt", "id", "key", "result"],
+    "WorkflowBlob": ["createdAt", "data", "key", "updatedAt"]
+  },
+  "jsonColumns": {
+    "WorkflowRun": ["config", "input", "metadata", "output"],
+    "WorkflowDefinition": ["snapshot"],
+    "WorkflowStage": [
+      "config",
+      "embeddingInfo",
+      "inputData",
+      "metrics",
+      "outputData",
+      "resumeData",
+      "suspendedState"
+    ],
+    "WorkflowStep": ["result", "waitState"],
+    "WorkflowLog": ["metadata"],
+    "WorkflowArtifact": ["data", "metadata"],
+    "AICall": ["metadata"],
+    "WorkflowAnnotation": ["payload", "value"],
+    "JobQueue": ["payload"],
+    "OutboxEvent": ["payload"],
+    "IdempotencyKey": ["result"],
+    "WorkflowBlob": ["data"]
+  },
+  "tables": {
+    "WorkflowRun": [
+      {
+        "id": "cmwksfofq000aqn3bpxpgauih",
+        "createdAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:49.142Z"
+        },
+        "updatedAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:49.145Z"
+        },
+        "version": 2,
+        "workflowId": "stored-rows-wait-for",
+        "workflowName": "Stored rows wait-for",
+        "workflowType": "stored-rows-wait-for",
+        "status": "RUNNING",
+        "startedAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:49.145Z"
+        },
+        "completedAt": null,
+        "duration": null,
+        "input": {
+          "value": "seed"
+        },
+        "output": null,
+        "config": {
+          "wait": {}
+        },
+        "totalCost": 0,
+        "totalTokens": 0,
+        "priority": 5,
+        "metadata": null,
+        "definitionVersion": "sha256-9d8e71c61dcc4e76e4614e7851d62a61",
+        "redriveCount": 0
+      }
+    ],
+    "WorkflowDefinition": [
+      {
+        "workflowId": "stored-rows-wait-for",
+        "version": "sha256-9d8e71c61dcc4e76e4614e7851d62a61",
+        "createdAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:49.140Z"
+        },
+        "snapshot": {
+          "format": 1,
+          "workflowId": "stored-rows-wait-for",
+          "inputSchema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "additionalProperties": {},
+            "properties": {
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": ["value"],
+            "type": "object"
+          },
+          "outputSchema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "additionalProperties": {},
+            "properties": {
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": ["value"],
+            "type": "object"
+          },
+          "stages": [
+            {
+              "id": "wait",
+              "stageNumber": 1,
+              "executionGroup": 1,
+              "mode": "sync",
+              "inputSchema": {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "additionalProperties": {},
+                "properties": {
+                  "value": {
+                    "type": "string"
+                  }
+                },
+                "required": ["value"],
+                "type": "object"
+              },
+              "outputSchema": {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "additionalProperties": {},
+                "properties": {
+                  "value": {
+                    "type": "string"
+                  }
+                },
+                "required": ["value"],
+                "type": "object"
+              },
+              "configSchema": {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "properties": {},
+                "type": "object"
+              }
+            }
+          ]
+        },
+        "structureHash": "sha256-9d8e71c61dcc4e76e4614e7851d62a61"
+      }
+    ],
+    "WorkflowStage": [
+      {
+        "id": "cmwksfofv000cqn3bmf6nkqjg",
+        "createdAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:49.147Z"
+        },
+        "updatedAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:49.192Z"
+        },
+        "version": 3,
+        "workflowRunId": "cmwksfofq000aqn3bpxpgauih",
+        "stageId": "wait",
+        "stageName": "wait",
+        "stageNumber": 1,
+        "executionGroup": 1,
+        "attempt": 0,
+        "status": "SUSPENDED",
+        "startedAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:49.138Z"
+        },
+        "completedAt": null,
+        "duration": null,
+        "inputData": null,
+        "outputData": null,
+        "config": {},
+        "suspendedState": {
+          "batchId": "step:release",
+          "submittedAt": "2026-11-17T14:28:49.138Z",
+          "pollInterval": 1000,
+          "maxWaitTime": 3600000,
+          "metadata": {
+            "__durable": true,
+            "stepId": "release"
+          }
+        },
+        "resumeData": null,
+        "nextPollAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:50.138Z"
+        },
+        "pollInterval": 1000,
+        "maxWaitUntil": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T15:28:49.138Z"
+        },
+        "metrics": {
+          "startTime": 0,
+          "endTime": 0,
+          "duration": 0
+        },
+        "embeddingInfo": null,
+        "errorMessage": null
+      }
+    ],
+    "WorkflowStep": [
+      {
+        "id": "cmwksfogx000iqn3b6z9gslkw",
+        "stageRecordId": "cmwksfofv000cqn3bmf6nkqjg",
+        "stepId": "release",
+        "seq": 1,
+        "kind": "wait",
+        "status": "pending",
+        "attempt": 1,
+        "leaseExpiresAt": null,
+        "deadlineAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T15:28:49.138Z"
+        },
+        "externalKey": null,
+        "result": null,
+        "error": null,
+        "waitState": {
+          "everyMs": 1000
+        },
+        "createdAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:49.185Z"
+        },
+        "updatedAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:49.185Z"
+        }
+      }
+    ],
+    "WorkflowLog": [],
+    "WorkflowArtifact": [],
+    "AICall": [],
+    "WorkflowAnnotation": [],
+    "JobQueue": [
+      {
+        "id": "cmwksfofy000eqn3bphqlwz6l",
+        "createdAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:49.150Z"
+        },
+        "updatedAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:49.266Z"
+        },
+        "workflowRunId": "cmwksfofq000aqn3bpxpgauih",
+        "stageId": "wait",
+        "status": "SUSPENDED",
+        "priority": 5,
+        "attempt": 1,
+        "maxAttempts": 3,
+        "workerId": null,
+        "lockedAt": null,
+        "startedAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:49.156Z"
+        },
+        "completedAt": null,
+        "nextPollAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:50.138Z"
+        },
+        "payload": {
+          "config": {
+            "wait": {}
+          },
+          "_workflowId": "stored-rows-wait-for",
+          "_definitionVersion": "sha256-9d8e71c61dcc4e76e4614e7851d62a61"
+        },
+        "lastError": null
+      }
+    ],
+    "OutboxEvent": [
+      {
+        "id": "cmwksfofr000bqn3bbt159oc0",
+        "createdAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:49.143Z"
+        },
+        "workflowRunId": "cmwksfofq000aqn3bpxpgauih",
+        "sequence": 1,
+        "eventType": "workflow:created",
+        "payload": {
+          "type": "workflow:created",
+          "timestamp": "2026-11-17T14:28:49.138Z",
+          "workflowRunId": "cmwksfofq000aqn3bpxpgauih",
+          "workflowId": "stored-rows-wait-for"
+        },
+        "causationId": "stored-rows:wait-for",
+        "occurredAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:49.138Z"
+        },
+        "publishedAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:49.280Z"
+        },
+        "retryCount": 0,
+        "dlqAt": null
+      },
+      {
+        "id": "cmwksfofx000dqn3bat1b2207",
+        "createdAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:49.149Z"
+        },
+        "workflowRunId": "cmwksfofq000aqn3bpxpgauih",
+        "sequence": 2,
+        "eventType": "workflow:started",
+        "payload": {
+          "type": "workflow:started",
+          "timestamp": "2026-11-17T14:28:49.138Z",
+          "workflowRunId": "cmwksfofq000aqn3bpxpgauih"
+        },
+        "causationId": "312c9651-9ec7-4d18-95d5-715182fa4b98",
+        "occurredAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:49.138Z"
+        },
+        "publishedAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:49.280Z"
+        },
+        "retryCount": 0,
+        "dlqAt": null
+      },
+      {
+        "id": "cmwksfogp000hqn3bnz305rlr",
+        "createdAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:49.177Z"
+        },
+        "workflowRunId": "cmwksfofq000aqn3bpxpgauih",
+        "sequence": 3,
+        "eventType": "stage:started",
+        "payload": {
+          "type": "stage:started",
+          "timestamp": "2026-11-17T14:28:49.138Z",
+          "workflowRunId": "cmwksfofq000aqn3bpxpgauih",
+          "stageId": "wait",
+          "stageName": "wait",
+          "stageNumber": 1
+        },
+        "causationId": "job:cmwksfofy000eqn3bphqlwz6l:attempt:1",
+        "occurredAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:49.138Z"
+        },
+        "publishedAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:49.280Z"
+        },
+        "retryCount": 0,
+        "dlqAt": null
+      },
+      {
+        "id": "cmwksfohj000jqn3bi75gkopc",
+        "createdAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:49.207Z"
+        },
+        "workflowRunId": "cmwksfofq000aqn3bpxpgauih",
+        "sequence": 4,
+        "eventType": "stage:suspended",
+        "payload": {
+          "type": "stage:suspended",
+          "timestamp": "2026-11-17T14:28:49.138Z",
+          "workflowRunId": "cmwksfofq000aqn3bpxpgauih",
+          "stageId": "wait",
+          "stageName": "wait",
+          "nextPollAt": "2026-11-17T14:28:50.138Z"
+        },
+        "causationId": "job:cmwksfofy000eqn3bphqlwz6l:attempt:1",
+        "occurredAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:49.138Z"
+        },
+        "publishedAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:49.280Z"
+        },
+        "retryCount": 0,
+        "dlqAt": null
+      },
+      {
+        "id": "cmwksfohj000kqn3bpyacsjge",
+        "createdAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:49.207Z"
+        },
+        "workflowRunId": "cmwksfofq000aqn3bpxpgauih",
+        "sequence": 5,
+        "eventType": "workflow:suspended",
+        "payload": {
+          "type": "workflow:suspended",
+          "timestamp": "2026-11-17T14:28:49.138Z",
+          "workflowRunId": "cmwksfofq000aqn3bpxpgauih",
+          "stageId": "wait"
+        },
+        "causationId": "job:cmwksfofy000eqn3bphqlwz6l:attempt:1",
+        "occurredAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:49.138Z"
+        },
+        "publishedAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:49.280Z"
+        },
+        "retryCount": 0,
+        "dlqAt": null
+      }
+    ],
+    "IdempotencyKey": [
+      {
+        "id": "cmwksfofn0009qn3bqy5bj7ch",
+        "createdAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:49.138Z"
+        },
+        "key": "stored-rows:wait-for",
+        "commandType": "run.create",
+        "result": {
+          "workflowRunId": "cmwksfofq000aqn3bpxpgauih",
+          "status": "PENDING",
+          "definitionVersion": "sha256-9d8e71c61dcc4e76e4614e7851d62a61"
+        }
+      },
+      {
+        "id": "cmwksfoga000fqn3bs9vzgvy6",
+        "createdAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:49.138Z"
+        },
+        "key": "job:cmwksfofy000eqn3bphqlwz6l:attempt:1",
+        "commandType": "job.execute",
+        "result": {
+          "outcome": "suspended",
+          "nextPollAt": "2026-11-17T14:28:50.138Z"
+        }
+      }
+    ],
+    "WorkflowBlob": []
+  }
+}

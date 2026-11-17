@@ -58,6 +58,52 @@ PRISMA_MAJOR=7 pnpm --filter @bratsos/workflow-engine-console exec vitest run sr
 PRISMA_MAJOR=8 pnpm --filter @bratsos/workflow-engine-console exec vitest run src/__tests__/prisma-read-port.sqlite.test.ts
 ```
 
+### Stored-row compatibility fixtures
+
+The gated `test:sqlite` and `test:pg` suites load committed snapshots from
+`packages/workflow-engine/src/__tests__/stored-rows/snapshots/` through the
+current Prisma client. They compare every table's column set and each JSON
+column's key paths and value types with the newest snapshot. IDs, timestamps,
+and other values do not participate in the shape comparison. A shape change
+fails with the changed table or JSON path and the capture command.
+
+To add a snapshot after an intentional storage-shape change, provision the
+current schema for the selected database, then run. The Postgres database must
+be disposable because capture clears its engine tables.
+
+```bash
+# PostgreSQL: pass DATABASE_URL inline.
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/workflow_engine_test \
+  PRISMA_MAJOR=7 pnpm --filter @bratsos/workflow-engine run capture:stored-rows
+
+# SQLite: the capture script creates a temporary database and current schema.
+SQLITE8_KERNEL_SQLITE=1 PRISMA_MAJOR=7 \
+  pnpm --filter @bratsos/workflow-engine run capture:stored-rows
+```
+
+Commit the generated JSON files with the change. Do not edit captured rows by
+hand. Historical snapshots must be captured by the release named in their
+metadata; new snapshots record their capture time, and older snapshots derive
+it from the newest lifecycle timestamp in their rows. Replays use that time
+for the kernel clock so durable waits are tested at the point they were
+captured.
+
+After a release, create an isolated worktree at the package release tag and
+capture the canonical `<version>` snapshot from that build. Set
+`STORED_ROWS_SNAPSHOT_LABEL=<version>` to select the released label explicitly;
+the capture refuses to overwrite any existing snapshot path whose label has a
+release tag. In the same change, commit the new `<version>` directory and
+delete the preceding `<version>+next` directory.
+
+```bash
+VERSION=1.0.0-alpha.21
+git worktree add --detach .lane/release-capture "@bratsos/workflow-engine@$VERSION"
+cd .lane/release-capture
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/workflow_engine_test \
+  PRISMA_MAJOR=7 STORED_ROWS_SNAPSHOT_LABEL="$VERSION" \
+  pnpm --filter @bratsos/workflow-engine run capture:stored-rows
+```
+
 ## Package layout
 
 This is a pnpm monorepo (`packages/*`):
