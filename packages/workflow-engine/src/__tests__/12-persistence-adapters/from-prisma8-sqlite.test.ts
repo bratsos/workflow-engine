@@ -3,7 +3,15 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import {
+  afterAll,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 import { createPrismaAICallLogger } from "../../persistence/prisma/ai-logger.js";
 import { fromPrisma8 } from "../../persistence/prisma/from-prisma8.js";
 import { createPrismaJobQueue } from "../../persistence/prisma/job-queue.js";
@@ -19,6 +27,110 @@ const fixtureDir = process.env.PRISMA8_SQLITE_FIXTURE
       dirname(require.resolve("../../../../prisma-fixtures/index.cjs")),
       "v8-sqlite",
     );
+// node:sqlite reads TEXT back cut at a NUL before Node 24.16 and 26.1 (every
+// 22.x), nodejs/node#61954: there the adapter refuses a NUL in any statement.
+const nulCut = (() => {
+  const { DatabaseSync } = require("node:sqlite");
+  const probe = new DatabaseSync(":memory:");
+  try {
+    return probe.prepare("SELECT ? AS v").get("a\0b").v !== "a\0b";
+  } finally {
+    probe.close();
+  }
+})();
+const NUL = "a\0b";
+// Past SQLite's 32,766 binds, so the write is split into chunks.
+const bulk = (last: string) =>
+  Array.from({ length: 5000 }, (_, i) => run(i === 4999 ? last : `bulk-${i}`));
+// Every way the adapter sends text to SQLite, as a call on a client.
+const nulWrites: Array<[string, (c: any) => unknown]> = [
+  ["create", (c) => c.workflowRun.create({ data: run(`id-${NUL}`) })],
+  [
+    "createMany",
+    (c) => c.workflowRun.createMany({ data: [run("ok"), run(`id-${NUL}`)] }),
+  ],
+  [
+    "createMany with skipDuplicates",
+    (c) =>
+      c.workflowRun.createMany({
+        data: [run(`id-${NUL}`)],
+        skipDuplicates: true,
+      }),
+  ],
+  [
+    "createMany in two chunks, NUL in the last",
+    (c) => c.workflowRun.createMany({ data: bulk(`id-${NUL}`) }),
+  ],
+  [
+    "createMany in two chunks, NUL in the first",
+    (c) =>
+      c.workflowRun.createMany({
+        data: [run(`id-${NUL}`), ...bulk("bulk-last").slice(1)],
+      }),
+  ],
+  [
+    "update data",
+    (c) =>
+      c.workflowRun.update({
+        where: { id: "seed" },
+        data: { workflowName: NUL },
+      }),
+  ],
+  [
+    "updateMany data",
+    (c) =>
+      c.workflowRun.updateMany({
+        where: { id: "seed" },
+        data: { workflowName: NUL },
+      }),
+  ],
+  [
+    "upsert create",
+    (c) =>
+      c.workflowRun.upsert({
+        where: { id: `id-${NUL}` },
+        create: run(`id-${NUL}`),
+        update: { priority: 1 },
+      }),
+  ],
+  [
+    "upsert update",
+    (c) =>
+      c.workflowRun.upsert({
+        where: { id: "seed" },
+        create: run("seed"),
+        update: { workflowName: NUL },
+      }),
+  ],
+  ["where equals", (c) => c.workflowRun.findMany({ where: { id: NUL } })],
+  [
+    "where startsWith",
+    (c) => c.workflowRun.findMany({ where: { id: { startsWith: NUL } } }),
+  ],
+  ["deleteMany where", (c) => c.workflowRun.deleteMany({ where: { id: NUL } })],
+  [
+    "$executeRaw",
+    (c) =>
+      c.$executeRaw`UPDATE workflow_runs SET workflowName = ${NUL} WHERE id = ${"seed"}`,
+  ],
+  [
+    "$executeRawUnsafe",
+    (c) =>
+      c.$executeRawUnsafe(
+        "UPDATE workflow_runs SET workflowName = $1 WHERE id = $2",
+        NUL,
+        "seed",
+      ),
+  ],
+  [
+    "$queryRaw",
+    (c) => c.$withColumns({ v: "text" }).$queryRaw`SELECT ${NUL} AS v`,
+  ],
+  [
+    "$queryRawUnsafe",
+    (c) => c.$withColumns({ v: "text" }).$queryRawUnsafe("SELECT $1 AS v", NUL),
+  ],
+];
 const run = (id: string, extra: Record<string, unknown> = {}) => ({
   id,
   workflowId: "wf",
@@ -1148,5 +1260,100 @@ describe.skipIf(process.env.PRISMA_MAJOR !== "8")(
           .$queryRawUnsafe("PRAGMA busy_timeout = 5000");
       }
     });
+  },
+);
+
+// Its own file: the checks below roll back and read rows, and must not depend on
+// what the tests above left on a shared connection.
+describe.skipIf(process.env.PRISMA_MAJOR !== "8")(
+  "a NUL in text on Prisma 8 SQLite",
+  () => {
+    let dir: string;
+    let db: any;
+    let prisma: any;
+    beforeAll(async () => {
+      dir = mkdtempSync(join(tmpdir(), "workflow-prisma8-nul-"));
+      db = await require(join(fixtureDir, "index.cjs")).createSqliteDb(
+        join(dir, "engine.db"),
+      );
+      prisma = fromPrisma8(db);
+    }, 30_000);
+    afterAll(async () => {
+      await db?.close();
+      if (dir) rmSync(dir, { recursive: true, force: true });
+    });
+    beforeEach(async () => {
+      await prisma.workflowRun.deleteMany({});
+      await prisma.workflowRun.create({ data: run("seed") });
+    });
+
+    describe.runIf(nulCut)("where node:sqlite reads it back cut", () => {
+      // The executor a statement runs on differs by entry point; each is listed.
+      const clients: Array<[string, (work: (c: any) => unknown) => unknown]> = [
+        ["the root client", (work) => work(prisma)],
+        [
+          "$transaction(callback)",
+          (work) => prisma.$transaction((tx: any) => work(tx)),
+        ],
+        [
+          "$transaction([...])",
+          (work) => prisma.$transaction([work(prisma)] as any),
+        ],
+        [
+          "a consumer's db.transaction",
+          (work) =>
+            db.transaction((tx: any) =>
+              work(fromPrisma8(tx, { contract: db.contract })),
+            ),
+        ],
+      ];
+      for (const [client, on] of clients)
+        it.each(nulWrites)(`refuses %s on ${client}`, async (_, write) => {
+          await expect(on(write)).rejects.toThrow(/NUL character/);
+          expect(
+            (await prisma.workflowRun.findMany()).map(
+              (r: any) => `${r.id}:${r.workflowName}`,
+            ),
+          ).toEqual(["seed:wf"]);
+        });
+    });
+
+    it("refuses a NUL when the probe cannot run, on any Node", async () => {
+      const { getBuiltinModule } = process;
+      vi.resetModules();
+      const fresh = await import("../../persistence/prisma/from-prisma8.js");
+      process.getBuiltinModule = undefined as any;
+      try {
+        await expect(
+          fresh.fromPrisma8(db).workflowRun.create({ data: run(NUL) }),
+        ).rejects.toThrow(/NUL character/);
+      } finally {
+        process.getBuiltinModule = getBuiltinModule;
+      }
+    });
+
+    it.skipIf(nulCut)(
+      "stores a NUL whole, also through a two-chunk createMany",
+      async () => {
+        const last = `id-${NUL}`;
+        await prisma.workflowRun.createMany({ data: bulk(last) });
+        expect(
+          (await prisma.workflowRun.findUnique({ where: { id: last } }))?.id,
+        ).toBe(last);
+        await prisma.$transaction((tx: any) =>
+          tx.workflowRun.createMany({
+            data: bulk(`id-tx${NUL}`).map((r) => ({ ...r, id: `tx-${r.id}` })),
+          }),
+        );
+        expect(
+          (
+            await prisma.workflowRun.findUnique({
+              where: { id: `tx-id-tx${NUL}` },
+            })
+          )?.id,
+        ).toBe(`tx-id-tx${NUL}`);
+        expect(await prisma.workflowRun.count()).toBe(10_001);
+      },
+    );
   },
 );

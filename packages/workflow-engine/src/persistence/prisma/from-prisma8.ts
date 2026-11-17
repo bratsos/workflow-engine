@@ -316,13 +316,22 @@ function template(
   return q;
 }
 
-const toPlan = (x: Executor, q: Sql) =>
-  x.raw.sql(Object.assign(q.parts, { raw: q.parts }), ...q.values);
-
-const affected = async (x: Executor, q: Sql): Promise<number> => {
-  refuseNul(x, q);
-  return (await x.execute(toPlan(x, q).affectedCount().build())).affectedRows;
+/**
+ * The one place a statement becomes a plan, and every `x.query` and `x.execute`
+ * here runs a plan built by it. The NUL check reads the plan, not the executor:
+ * the root client, a transaction's, a consumer's `tx` and the driver's own
+ * executor inside a chunked write all pass it, and none can go around it.
+ */
+const buildPlan = (x: Executor, q: Sql, finish: (statement: any) => any) => {
+  const plan = finish(
+    x.raw.sql(Object.assign(q.parts, { raw: q.parts }), ...q.values),
+  ).build();
+  refuseNul(plan, q);
+  return plan;
 };
+
+const affected = async (x: Executor, q: Sql): Promise<number> =>
+  (await x.execute(buildPlan(x, q, (s) => s.affectedCount()))).affectedRows;
 
 const sqliteExecutors = new WeakSet<Executor>();
 
@@ -332,6 +341,8 @@ let nulReadable: boolean | undefined;
  * it reads the value back cut at the NUL: nodejs/node#61954 made the read
  * length-aware. Tested on the running Node, not by version number.
  * `getBuiltinModule`, not `import()`: the bundler rewrites `node:sqlite` to `sqlite`.
+ * Node has `getBuiltinModule` since 22.3 and `node:sqlite` since 22.5; another
+ * runtime without it cannot be probed, so it counts as cutting.
  */
 function readsNul(): boolean {
   if (nulReadable === undefined) {
@@ -339,7 +350,7 @@ function readsNul(): boolean {
     const db = sqlite && new sqlite.DatabaseSync(":memory:");
     try {
       nulReadable =
-        !db || db.prepare("SELECT ? AS v").get("a\0b")?.v === "a\0b";
+        !!db && db.prepare("SELECT ? AS v").get("a\0b")?.v === "a\0b";
     } finally {
       db?.close();
     }
@@ -347,13 +358,16 @@ function readsNul(): boolean {
   return nulReadable;
 }
 
-/** A NUL that would be read back cut changes an ID or text without an error: refuse it. */
-function refuseNul(x: Executor, q: Sql): void {
-  if (!sqliteExecutors.has(x)) return;
+/**
+ * A NUL that would be read back cut changes an ID or text without an error: refuse it.
+ * The plan names its database (`meta.target`); anything but Postgres is checked.
+ */
+function refuseNul(plan: { meta?: { target?: string } }, q: Sql): void {
+  if (plan.meta?.target === "postgres") return;
   if (!q.values.some((v) => typeof v === "string" && v.includes("\0"))) return;
   if (!readsNul())
     fail(
-      `SQLite text containing a NUL character cannot be stored on Node ${process.versions.node}: node:sqlite reads it back cut at the NUL, which would change IDs and text without an error. Use Node 24.16+ or 26.1+, or remove the NUL`,
+      `SQLite text containing a NUL character cannot be stored on Node ${process.versions.node}: node:sqlite reads it back cut at the NUL here (or could not be tested for it), which would change IDs and text without an error. Use Node 24.16+ or 26.1+, or remove the NUL`,
     );
 }
 
@@ -541,10 +555,9 @@ async function rowsOf(
   q: Sql,
   spec: Record<string, string>,
 ): Promise<Row[]> {
-  refuseNul(x, q);
   const wire = sqliteExecutors.has(x) ? sqliteRead(q, spec) : { q, spec };
   const rows = await x
-    .query(toPlan(x, wire.q).returnsRow(wire.spec).build())
+    .query(buildPlan(x, wire.q, (s) => s.returnsRow(wire.spec)))
     .toArray();
   if (wire.overflow)
     for (const row of rows) {
