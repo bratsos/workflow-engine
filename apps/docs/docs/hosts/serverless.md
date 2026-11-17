@@ -254,3 +254,5 @@ serverless host reports it per tick (and logs it per tick) rather than on a
 transition; alert on a *run* of degraded ticks. `eventsDeadLettered` counts
 events that exhausted their retry budget in this tick: those stop retrying on
 their own and need a `plugin.replayDLQ` dispatch once the sink is back.
+
+A timed-out outbox flush starts no further claims or sink calls. A claim already sent to the database can finish, and a sink call already in flight can settle under its original owner fence. A tick on a caller-owned transaction reports `outboxDeferred: true`. Flush on the root client after commit.

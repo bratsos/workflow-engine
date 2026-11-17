@@ -15,6 +15,7 @@ import {
   type EventSinkHealth,
   type EventSinkMonitor,
   executeJobWithHeartbeat,
+  flushOutboxWithin,
   HOST_DEFAULTS,
   type JobTransport,
   type Kernel,
@@ -416,15 +417,9 @@ class NodeHostImpl implements NodeHost {
           );
           return;
         }
-        const flushed = await withTimeout(
-          this.kernel.dispatch({
-            type: "outbox.flush",
-            maxEvents: this.maxOutboxFlushPerTick,
-            claimDurationMs: Math.min(
-              2_147_483_647,
-              Math.ceil(this.shutdownTimeoutMs + 60_000),
-            ),
-          }),
+        const flushed = await flushOutboxWithin(
+          this.kernel,
+          this.maxOutboxFlushPerTick,
           remaining,
         );
         if (flushed === undefined) {
@@ -493,7 +488,14 @@ class NodeHostImpl implements NodeHost {
     // and doesn't need the per-command counts (unlike the serverless host,
     // which returns them to its caller) — see runMaintenanceTick in
     // @bratsos/workflow-engine/kernel for the shared command sequence.
+    const host = this;
+    const timer = this.orchestrationTimer;
     const counts = await runMaintenanceTickCommands(this.kernel, {
+      outboxFlushSignal: {
+        get aborted() {
+          return !host.running || host.orchestrationTimer !== timer;
+        },
+      },
       workerId: this.workerId,
       maxClaimsPerTick: this.maxClaimsPerTick,
       ...(this.serves !== undefined ? { serves: this.serves } : {}),
@@ -505,14 +507,16 @@ class NodeHostImpl implements NodeHost {
       ...(this.retention !== undefined ? { retention: this.retention } : {}),
       logPrefix: "[NodeHost]",
     });
-    this.eventSinkMonitor.observe({
-      failed: counts.eventsFailed,
-      deadLettered: counts.eventsDeadLettered,
-      eventSinkStatus: counts.eventSinkStatus,
-      ...(counts.eventSinkError !== undefined
-        ? { eventSinkError: counts.eventSinkError }
-        : {}),
-    });
+    if (!counts.outboxDeferred) {
+      this.eventSinkMonitor.observe({
+        failed: counts.eventsFailed,
+        deadLettered: counts.eventsDeadLettered,
+        eventSinkStatus: counts.eventSinkStatus,
+        ...(counts.eventSinkError !== undefined
+          ? { eventSinkError: counts.eventSinkError }
+          : {}),
+      });
+    }
     this.startTickHook(counts);
   }
 

@@ -2,10 +2,10 @@
 import {
   assertTimerMs,
   executeJobWithHeartbeat,
+  flushOutboxWithin,
   HOST_DEFAULTS,
   type JobTransport,
   type Kernel,
-  MAX_TIMER_MS,
   type RunCreateCommand,
 } from "@bratsos/workflow-engine/kernel";
 
@@ -253,27 +253,16 @@ export async function runToCompletion(
   if (flushOutbox) {
     // Best effort: the events are already durable in the outbox, and a
     // publish failure must not turn a finished run into a thrown request.
-    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      const outcome = await Promise.race([
-        kernel.dispatch({
-          type: "outbox.flush",
-          maxEvents: maxOutboxFlush,
-          claimDurationMs: Math.min(
-            MAX_TIMER_MS,
-            Math.ceil(outboxFlushTimeoutMs + 60_000),
-          ),
-        }),
-        new Promise<"timeout">((resolve) => {
-          timer = setTimeout(() => resolve("timeout"), outboxFlushTimeoutMs);
-        }),
-      ]);
-      if (outcome === "timeout")
+      const outcome = await flushOutboxWithin(
+        kernel,
+        maxOutboxFlush,
+        outboxFlushTimeoutMs,
+      );
+      if (outcome === undefined)
         console.error(`${logPrefix} outbox.flush timed out`);
     } catch (error) {
       console.error(`${logPrefix} outbox.flush failed:`, error);
-    } finally {
-      if (timer) clearTimeout(timer);
     }
   }
 

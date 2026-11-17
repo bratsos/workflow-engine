@@ -28,6 +28,7 @@ export {
   type ExecuteJobOutcome,
   type ExecuteJobWithHeartbeatOptions,
   executeJobWithHeartbeat,
+  flushOutboxWithin,
   HOST_DEFAULTS,
   type HostJobMessage,
   MAX_TIMER_MS,

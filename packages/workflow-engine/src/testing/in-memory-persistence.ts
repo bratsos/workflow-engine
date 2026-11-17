@@ -722,8 +722,19 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
           a.workflowRunId.localeCompare(b.workflowRunId) ||
           a.sequence - b.sequence,
       );
+    // A replay can reinsert an earlier sequence after a successor was claimed.
+    // Keep the already selected row at the head until it settles.
+    const owned = new Map<string, string>();
     for (const row of rows) {
-      if (seen.has(row.workflowRunId) || excluded.has(row.workflowRunId))
+      if (this.outboxClaims.has(row.id)) owned.set(row.workflowRunId, row.id);
+    }
+    for (const row of rows) {
+      const owner = owned.get(row.workflowRunId);
+      if (
+        (owner !== undefined && owner !== row.id) ||
+        seen.has(row.workflowRunId) ||
+        excluded.has(row.workflowRunId)
+      )
         continue;
       seen.add(row.workflowRunId);
       const previous = this.outboxClaims.get(row.id);

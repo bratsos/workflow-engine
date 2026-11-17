@@ -309,6 +309,9 @@ model OutboxEvent {
   dlqAt         TimestampString(3)?
 
   @@index([workflowRunId, sequence], map: "outbox_events_workflowRunId_sequence_key", unique: true)
+  @@index([deliveryClaim, id], map: "outbox_events_delivery_ready_idx")
+  @@index([publishedAt, dlqAt, workflowRunId, deliveryClaim], map: "outbox_events_delivery_run_idx")
+  @@index([publishedAt, dlqAt, workflowRunId, sequence], map: "outbox_events_live_run_sequence_idx")
   @@index([publishedAt], map: "outbox_events_publishedAt_idx")
   // Dead letters are a subset of the unpublished rows. Prisma cannot express
   // a partial index in schema.prisma; this contract could (`where:`), but the

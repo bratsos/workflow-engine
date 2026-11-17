@@ -4,7 +4,10 @@ import {
   guardSqliteAdapter,
   shareSqliteGuard,
 } from "./sqlite-date-guard.js";
-import { withTransactionWriteGuard } from "./transaction-writes.js";
+import {
+  isNativeTransaction,
+  withTransactionWriteGuard,
+} from "./transaction-writes.js";
 /**
  * PrismaWorkflowPersistence - Prisma implementation of WorkflowPersistence
  *
@@ -243,8 +246,8 @@ function isInProgressResult(result: unknown): boolean {
  * Postgres case above: 38 buffers, 0.1 ms), and `dlqAt` is read from those
  * rows only.
  *
- * Used for the stats aggregate, the claim's candidate select and the Postgres
- * claim statement, which spells the same condition in SQL.
+ * Used for the stats aggregate and inspection reads. Delivery claims use the
+ * separate ready-head index.
  */
 const LIVE_OUTBOX = {
   publishedAt: null,
@@ -304,6 +307,8 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
   private enums: PrismaEnumHelper;
   private databaseType: DatabaseType;
   private skipTransactions: boolean;
+  private isOutboxTransaction: boolean;
+  private readonly rawOutboxQueries: boolean;
   private statusEnumName: string;
   private now: () => Date;
   /**
@@ -329,6 +334,9 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     this.enums = createEnumHelper(prisma, {
       statusEnumName: this.statusEnumName,
     });
+    this.isOutboxTransaction =
+      isNativeTransaction(prisma) || typeof prisma.$transaction !== "function";
+    this.rawOutboxQueries = typeof prisma.$queryRawUnsafe === "function";
     this.prisma = withTransactionWriteGuard(
       prisma,
       options.databaseType ?? "postgresql",
@@ -406,6 +414,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       // re-probe on every transaction, and a downgrade either side
       // discovers has to be visible to the other.
       txPersistence.versioning = this.versioning;
+      txPersistence.isOutboxTransaction = true;
       if (this.databaseType !== "sqlite") return fn(txPersistence);
       // The date check ran before this transaction opened; do not repeat it in it.
       shareSqliteGuard(txPersistence, this);
@@ -1717,6 +1726,10 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
   // Outbox Operations
   // ============================================================================
 
+  get outboxDeliveryDeferred(): boolean {
+    return this.isOutboxTransaction;
+  }
+
   async appendOutboxEvents(events: CreateOutboxEventInput[]): Promise<void> {
     if (events.length === 0) return;
 
@@ -1762,11 +1775,12 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       `;
     }
 
-    const maxResult = await this.prisma.outboxEvent.aggregate({
+    const last = await this.prisma.outboxEvent.findFirst({
       where: { workflowRunId },
-      _max: { sequence: true },
+      orderBy: { sequence: "desc" },
+      select: { sequence: true },
     });
-    let seq = maxResult._max.sequence ?? 0;
+    let seq = last?.sequence ?? 0;
 
     const rows = runEvents.map((event) => ({
       workflowRunId: event.workflowRunId,
@@ -1826,92 +1840,79 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
   ): Promise<OutboxRecord[]> {
     if (limit <= 0) return [];
     const deadline = `${now.toISOString()}~`;
-    if (this.databaseType === "postgresql" && this.prisma.$queryRawUnsafe) {
-      const excluded = excludedRunIds.length
-        ? `AND e."workflowRunId" NOT IN (${excludedRunIds.map((_, i) => `$${i + 4}`).join(", ")})`
-        : "";
+    const excluded = excludedRunIds.length
+      ? `AND "workflowRunId" NOT IN (${excludedRunIds.map((_, i) => `$${i + 4}`).join(", ")})`
+      : "";
+    const candidates = `SELECT id FROM "outbox_events"
+      WHERE "deliveryClaim" >= '' AND "deliveryClaim" <= $2 ${excluded}
+      ORDER BY "deliveryClaim", id LIMIT $1`;
+    if (this.rawOutboxQueries) {
+      // The ready index holds one scheduled row per run. Bound the page
+      // before attempting any locks so contention cannot scan the queue.
+      const postgres = this.databaseType === "postgresql";
+      const sql = postgres
+        ? `UPDATE "outbox_events" SET "deliveryClaim" = $3
+           WHERE id = ANY(ARRAY(
+             SELECT locked.id FROM (${candidates}) ready
+             CROSS JOIN LATERAL (
+               SELECT e.id FROM "outbox_events" e
+               WHERE e.id = ready.id AND e."deliveryClaim" >= ''
+                 AND e."deliveryClaim" <= $2
+               FOR UPDATE OF e SKIP LOCKED
+             ) locked
+           )) RETURNING *`
+        : `UPDATE "outbox_events" INDEXED BY sqlite_autoindex_outbox_events_1 SET "deliveryClaim" = $1
+           WHERE id IN (
+             SELECT id FROM "outbox_events" INDEXED BY outbox_events_delivery_ready_idx
+             WHERE "deliveryClaim" >= '' AND "deliveryClaim" <= $2
+             ${excludedRunIds.length ? `AND "workflowRunId" NOT IN (${excludedRunIds.map((_, i) => `$${i + 3}`).join(", ")})` : ""}
+             ORDER BY "deliveryClaim", id LIMIT $${excludedRunIds.length + 3}
+           ) RETURNING *`;
+      const params = postgres
+        ? [limit, deadline, claim, ...excludedRunIds]
+        : [claim, deadline, ...excludedRunIds, limit];
       const rows = await rawFor(this.prisma, "outbox_events").$queryRawUnsafe!<
         any[]
       >(
-        `WITH heads AS MATERIALIZED (
-          SELECT DISTINCT ON (("workflowRunId" || '')) id, "workflowRunId", sequence
-          FROM "outbox_events"
-          WHERE "publishedAt" IS NULL
-            AND ("dlqAt" IS NULL OR "publishedAt" IS NOT NULL)
-          ORDER BY ("workflowRunId" || ''), sequence
-        ), candidates AS (
-          SELECT e.id FROM "outbox_events" e JOIN heads h ON h.id = e.id
-          WHERE e."publishedAt" IS NULL
-            AND (e."dlqAt" IS NULL OR e."publishedAt" IS NOT NULL)
-            AND (e."deliveryClaim" IS NULL OR e."deliveryClaim" <= $2)
-            ${excluded}
-          ORDER BY e."workflowRunId", e.sequence
-          LIMIT $1 FOR UPDATE OF e SKIP LOCKED
-        )
-        UPDATE "outbox_events" e SET "deliveryClaim" = $3
-        FROM candidates WHERE e.id = candidates.id
-        RETURNING e.*`,
-        limit,
-        deadline,
-        claim,
-        ...excludedRunIds,
+        postgres || this.prisma.$withColumns ? sql : sql.replace(/\$\d+/g, "?"),
+        ...params,
       );
       return rows
-        .map((row: any) => this.mapOutboxEvent(row))
+        .map((row) => this.mapOutboxEvent(row))
         .sort(
           (a, b) =>
             a.workflowRunId.localeCompare(b.workflowRunId) ||
             a.sequence - b.sequence,
         );
     }
-    // The first live row of each run is its only candidate. Compare-and-set
-    // the claim: concurrent SQLite writers cannot both acquire that row.
-    const sqliteQuery = `WITH ranked AS (
-           SELECT id, row_number() OVER (PARTITION BY "workflowRunId" ORDER BY sequence) AS position
-           FROM "outbox_events"
-           WHERE "publishedAt" IS NULL
-             AND ("dlqAt" IS NULL OR "publishedAt" IS NOT NULL)
-         ) SELECT e.* FROM "outbox_events" e JOIN ranked r ON r.id = e.id AND r.position = 1
-           WHERE e."publishedAt" IS NULL
-             AND (e."dlqAt" IS NULL OR e."publishedAt" IS NOT NULL)
-             AND (e."deliveryClaim" IS NULL OR e."deliveryClaim" <= $1)
-             ${excludedRunIds.length ? `AND e."workflowRunId" NOT IN (${excludedRunIds.map((_, i) => `$${i + 2}`).join(", ")})` : ""}
-           ORDER BY e."workflowRunId", e.sequence LIMIT $${excludedRunIds.length + 2}`;
-    const rows = this.prisma.$queryRawUnsafe
-      ? await rawFor(this.prisma, "outbox_events").$queryRawUnsafe!<any[]>(
-          this.prisma.$withColumns
-            ? sqliteQuery
-            : sqliteQuery.replace(/\$\d+/g, "?"),
-          deadline,
-          ...excludedRunIds,
-          limit,
-        )
-      : await this.prisma.outboxEvent.findMany({
-          where: {
-            ...LIVE_OUTBOX,
-            ...(excludedRunIds.length
-              ? { workflowRunId: { notIn: excludedRunIds } }
-              : {}),
-          },
-          orderBy: [{ workflowRunId: "asc" }, { sequence: "asc" }],
-          take: Math.max(limit, 100),
-        });
-    const seen = new Set(excludedRunIds);
+
+    // Structural clients without raw SQL page over scheduled run heads
+    // directly. An independently blocked run cannot fill the candidate page.
+    const rows = await this.prisma.outboxEvent.findMany({
+      where: {
+        deliveryClaim: { gte: "", lte: deadline },
+        ...(excludedRunIds.length
+          ? { workflowRunId: { notIn: excludedRunIds } }
+          : {}),
+      },
+      orderBy: [{ deliveryClaim: "asc" }, { id: "asc" }],
+      take: limit,
+    });
     const claimed: OutboxRecord[] = [];
     for (const row of rows) {
-      if (seen.has(row.workflowRunId)) continue;
-      seen.add(row.workflowRunId);
-      if (claimed.length >= limit) break;
       const updated = await this.prisma.outboxEvent.updateMany({
         where: {
           id: row.id,
-          publishedAt: null,
-          dlqAt: null,
-          OR: [{ deliveryClaim: null }, { deliveryClaim: { lte: deadline } }],
+          deliveryClaim: { gte: "", lte: deadline },
         },
         data: { deliveryClaim: claim },
       });
-      if (updated.count) claimed.push(this.mapOutboxEvent(row));
+      if (!updated.count) continue;
+      const persisted = await this.prisma.outboxEvent.findUnique({
+        where: { id: row.id },
+      });
+      if (persisted?.deliveryClaim === claim)
+        claimed.push(this.mapOutboxEvent(persisted));
     }
     return claimed;
   }
@@ -1973,7 +1974,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       },
       data: {
         retryCount: { increment: 1 },
-        deliveryClaim: null,
+        deliveryClaim: dead ? null : "",
         ...(dead ? { dlqAt: now } : {}),
       },
     });

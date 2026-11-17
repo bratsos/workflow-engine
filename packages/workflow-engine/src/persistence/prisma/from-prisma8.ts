@@ -344,11 +344,9 @@ function sqliteRead(q: Sql, spec: Record<string, string>) {
   });
   const returning = top.find((t) => /^RETURNING$/i.test(t[0]));
   const first = top[0]?.[0].toUpperCase();
-  if (
-    !returning &&
-    (!isReadOnlySql(q.parts.join("?")) || first === "EXPLAIN") &&
-    first !== "VALUES"
-  ) {
+  // EXPLAIN returns plan rows, even when the explained write has RETURNING.
+  if (first === "EXPLAIN") return { q, spec };
+  if (!returning && !isReadOnlySql(q.parts.join("?")) && first !== "VALUES") {
     return { q, spec };
   }
   const bindings = q.values.map((value) => ({ value }));

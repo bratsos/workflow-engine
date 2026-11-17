@@ -55,6 +55,132 @@ describe.skipIf(!sqlite && !databaseUrl)(
       if (directory) await rm(directory, { recursive: true, force: true });
     });
 
+    const store = (prisma: typeof client) =>
+      createPrismaWorkflowPersistence(prisma, {
+        databaseType: sqlite ? "sqlite" : "postgresql",
+      });
+
+    const seed = (persistence: ReturnType<typeof store>, run: string, n = 1) =>
+      persistence.appendOutboxEvents(
+        Array.from({ length: n }, () => ({
+          workflowRunId: run,
+          eventType: "workflow:created",
+          payload: { type: "workflow:created", workflowRunId: run },
+          causationId: "host",
+          occurredAt: new Date(),
+        })),
+      );
+
+    it("keeps a caller's transactional tick free of outbox effects", async () => {
+      const root = store(client);
+      const accepted: string[] = [];
+      const jobTransport = new InMemoryJobQueue("tx-host");
+      const make = (persistence: ReturnType<typeof store>) =>
+        createKernel({
+          persistence,
+          jobTransport,
+          blobStore: new InMemoryBlobStore(),
+          clock: new FakeClock(),
+          registry: { getWorkflow: () => undefined },
+          eventSink: {
+            async emit(event) {
+              if ("workflowRunId" in event) accepted.push(event.workflowRunId);
+            },
+          },
+        });
+      await seed(root, "committed-tx-host");
+      await expect(
+        client.$transaction(async (tx: typeof client) => {
+          const scoped = store(tx);
+          await seed(scoped, "rollback-tx-host");
+          const kernel = make(scoped);
+          const host = createServerlessHost({
+            kernel,
+            jobTransport,
+            workerId: "tx-host",
+          });
+          expect(await host.runMaintenanceTick()).toMatchObject({
+            outboxDeferred: true,
+            eventsFlushed: 0,
+          });
+          expect(accepted).toEqual([]);
+          throw new Error("rollback host tick");
+        }),
+      ).rejects.toThrow("rollback host tick");
+      expect(
+        (await make(root).dispatch({ type: "outbox.flush" })).published,
+      ).toBe(1);
+      expect(accepted).toEqual(["committed-tx-host"]);
+      await client.outboxEvent.deleteMany();
+    });
+
+    it("starts no more claims or emits after the maintenance timeout", async () => {
+      const persistence = store(client);
+      await seed(persistence, "blocked-host", 3);
+      const accepted: number[] = [];
+      let claims = 0;
+      const claim = persistence.claimOutboxDelivery.bind(persistence);
+      persistence.claimOutboxDelivery = (...args) => {
+        claims++;
+        return claim(...args);
+      };
+      let entered!: () => void;
+      let release!: () => void;
+      const started = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const jobTransport = new InMemoryJobQueue("blocked-host");
+      const kernel = createKernel({
+        persistence,
+        jobTransport,
+        blobStore: new InMemoryBlobStore(),
+        clock: new FakeClock(),
+        registry: { getWorkflow: () => undefined },
+        eventSink: {
+          async emit(_, delivery) {
+            accepted.push(delivery!.sequence);
+            entered();
+            await gate;
+          },
+        },
+      });
+      const dispatch = kernel.dispatch.bind(kernel);
+      let flushing: Promise<unknown> | undefined;
+      const tracked = {
+        ...kernel,
+        dispatch: ((command: Parameters<typeof dispatch>[0]) => {
+          const result = dispatch(command);
+          if (command.type === "outbox.flush") flushing = result;
+          return result;
+        }) as typeof kernel.dispatch,
+      };
+      const host = createServerlessHost({
+        kernel: tracked,
+        jobTransport,
+        workerId: "blocked-host",
+        outboxFlushTimeoutMs: 100,
+      });
+      const tick = host.runMaintenanceTick();
+      try {
+        await started;
+        expect(await tick).toMatchObject({ eventSinkStatus: "degraded" });
+      } finally {
+        release();
+      }
+      expect(await flushing).toMatchObject({ published: 1 });
+      expect(accepted).toEqual([1]);
+      expect(claims).toBe(1);
+      expect(
+        (await persistence.getUnpublishedOutboxEvents()).map(
+          (row) => row.sequence,
+        ),
+      ).toEqual([2, 3]);
+      await client.outboxEvent.deleteMany();
+    });
+
     it("fences a timed-out post-job flush and lets a second host recover the event", async () => {
       const schema = z.object({ value: z.string() });
       const stage = defineStage({
@@ -126,7 +252,7 @@ describe.skipIf(!sqlite && !databaseUrl)(
         kernel,
         jobTransport,
         workerId: "host-worker",
-        outboxFlushTimeoutMs: 10,
+        outboxFlushTimeoutMs: 300,
       });
       const other = createServerlessHost({
         kernel: peer,
@@ -157,7 +283,7 @@ describe.skipIf(!sqlite && !databaseUrl)(
       await started;
       await handling;
       try {
-        clock.advance(60_011);
+        clock.advance(60_301);
         const tick = await other.runMaintenanceTick();
         expect(tick.eventsFlushed).toBe(1);
         expect(ids).toHaveLength(2);

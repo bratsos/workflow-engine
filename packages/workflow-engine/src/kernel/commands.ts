@@ -348,6 +348,8 @@ export interface OutboxFlushCommand {
   readonly maxEvents?: number;
   /** Claim lifetime in milliseconds. Defaults to 60 seconds. */
   readonly claimDurationMs?: number;
+  /** Stop starting claims or sink calls. Calls already in flight may settle. */
+  readonly signal?: Pick<AbortSignal, "aborted">;
 }
 
 /**
@@ -363,6 +365,8 @@ export type EventSinkStatus = "healthy" | "degraded";
 
 /** Result of an `outbox.flush` command. */
 export interface OutboxFlushResult {
+  /** The caller owns a transaction. Dispatch another flush after it commits. */
+  readonly deferred?: true;
   readonly published: number;
   /**
    * Events this flush claimed but could not publish **and which the next

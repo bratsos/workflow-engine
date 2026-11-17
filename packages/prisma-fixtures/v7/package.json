@@ -6,7 +6,7 @@
   "main": "./index.cjs",
   "scripts": {
     "generate": "node ../schema.cjs postgres && prisma generate --schema .generated/postgres.prisma",
-    "push": "node ../schema.cjs postgres && prisma db push --schema .generated/postgres.prisma"
+    "push": "node ../schema.cjs postgres && prisma db push --schema .generated/postgres.prisma && node ../outbox-heads.cjs"
   },
   "dependencies": {
     "@prisma/adapter-better-sqlite3": "7.10.1",

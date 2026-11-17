@@ -103,6 +103,7 @@ export {
   type ExecuteJobOutcome,
   type ExecuteJobWithHeartbeatOptions,
   executeJobWithHeartbeat,
+  flushOutboxWithin,
   HOST_DEFAULTS,
   type HostJobMessage,
   loadWorkflowContext,

@@ -1,16 +1,14 @@
 /**
  * Deliver committed outbox events at least once. Claims expire and do not
  * mark delivery: `publishedAt` is written only after the sink resolves.
- * A crash after emit, an emit still running at claim expiry, or a partial
- * plugin failure can cause duplicates. Consumers can deduplicate by the
- * outbox event ID in the delivery metadata. Run ID and sequence order events
- * but are not permanent identities: SQL deletion of the newest outbox rows
- * can allow the Prisma store to reuse a sequence.
+ * Delivery can duplicate when an effect happens without its durable
+ * acknowledgement, including on a crash, write error or ambiguous sink result.
+ * Deduplicate by the outbox event ID. Run ID and sequence order events, but
+ * SQL deletion of the newest rows can let the store reuse a sequence.
  *
- * An earlier live event blocks later events of its run, including while it
- * is claimed or awaiting retry. Dead-lettered events do not block later
- * events; `plugin.replayDLQ` makes them eligible again. The engine's own
- * progress is independent of the sink.
+ * Order is decided when the run head is claimed. A live predecessor blocks
+ * successors then. A dead letter replayed after a successor was claimed can
+ * arrive later. The engine's progress is independent of the sink.
  * Nothing in the engine deletes outbox rows; run.purge leaves them, and
  * an operator can remove them with SQL. For a purged run, a flush skips a
  * live claim until completion or expiry, skips published rows, and skips
@@ -31,6 +29,17 @@ export async function handleOutboxFlush(
   command: OutboxFlushCommand,
   deps: KernelDeps,
 ): Promise<HandlerResult<OutboxFlushResult>> {
+  if (deps.persistence.outboxDeliveryDeferred) {
+    return {
+      deferred: true,
+      published: 0,
+      failed: 0,
+      deadLettered: 0,
+      eventSinkStatus: "healthy",
+      _events: [],
+    };
+  }
+
   const limit = command.maxEvents ?? 100;
   const claimDurationMs = command.claimDurationMs ?? 60_000;
   if (
@@ -43,14 +52,30 @@ export async function handleOutboxFlush(
     );
   }
   const maxRetries = (deps.eventSink as Partial<PluginRunner>).maxRetries ?? 3;
-  const failedRuns = new Set<string>();
+  let stopAfterPage = false;
   let attempted = 0;
   let published = 0;
   let failed = 0;
   let deadLettered = 0;
   let firstError: string | undefined;
 
-  while (attempted < limit) {
+  const interrupted = (expiresAt?: number) => {
+    if (expiresAt !== undefined && deps.clock.now().getTime() >= expiresAt) {
+      const message = "outbox.flush claim expired before delivery";
+      console.warn(message);
+      firstError ??= message;
+      return true;
+    }
+    if (command.signal?.aborted) {
+      firstError ??= "outbox.flush cancelled";
+      return true;
+    }
+    return false;
+  };
+
+  flush: while (attempted < limit && !interrupted()) {
+    // Start the lease before awaiting the database, so there is one deadline
+    // shared by the stored owner token and every pre-emit expiry check.
     const now = deps.clock.now();
     const expiresAt = now.getTime() + claimDurationMs;
     const claim = `${new Date(expiresAt).toISOString()}|${crypto.randomUUID()}`;
@@ -58,20 +83,20 @@ export async function handleOutboxFlush(
       limit - attempted,
       claim,
       now,
-      [...failedRuns],
+      [],
     );
-    if (!events.length) break;
+    if (interrupted(expiresAt) || !events.length) break;
     for (const event of events) {
       attempted++;
-      if (deps.clock.now().getTime() >= expiresAt) break;
-      if (
-        !(await deps.persistence.isOutboxDeliveryClaimActive(
-          event.id,
-          claim,
-          deps.clock.now(),
-        ))
-      ) {
-        failedRuns.add(event.workflowRunId);
+      if (interrupted(expiresAt)) break flush;
+      const active = await deps.persistence.isOutboxDeliveryClaimActive(
+        event.id,
+        claim,
+        deps.clock.now(),
+      );
+      if (interrupted(expiresAt)) break flush;
+      if (!active) {
+        stopAfterPage = true;
         continue;
       }
       try {
@@ -82,14 +107,14 @@ export async function handleOutboxFlush(
           attempt: event.retryCount + 1,
         });
       } catch (error) {
-        firstError ??= toErrorMessage(error);
-        failedRuns.add(event.workflowRunId);
+        stopAfterPage = true;
         const outcome = await deps.persistence.failOutboxDelivery(
           event.id,
           claim,
           maxRetries,
           deps.clock.now(),
         );
+        firstError ??= toErrorMessage(error);
         if (outcome === "dead-lettered") deadLettered++;
         if (outcome === "retry") failed++;
         continue;
@@ -103,7 +128,9 @@ export async function handleOutboxFlush(
       )
         published++;
     }
-    if (deps.clock.now().getTime() >= expiresAt) break;
+    // Finish the page but leave retries for the next flush. This avoids
+    // repeatedly scanning failed heads to find independent work.
+    if (stopAfterPage || deps.clock.now().getTime() >= expiresAt) break;
   }
 
   return {

@@ -42,3 +42,5 @@ for (const [, name, elements] of indexes) {
 writeFileSync(file, source);
 run(file); // re-emits ops.json and migration.json from the edited source
 prisma("db", "migrate", "--db", process.env.DATABASE_URL);
+
+run(join(root, "../outbox-heads.cjs"));

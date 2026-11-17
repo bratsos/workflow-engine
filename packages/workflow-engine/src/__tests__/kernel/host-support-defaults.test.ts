@@ -95,6 +95,55 @@ describe("host support defaults", () => {
     if (result !== "unbounded") expect(result.eventSinkStatus).toBe("degraded");
   });
 
+  it("stops a timed-out flush from claiming the next event after the sink settles", async () => {
+    let entered!: () => void;
+    let resume!: () => void;
+    const started = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      resume = resolve;
+    });
+    const attempted: number[] = [];
+    const { kernel, persistence } = createTestKernel<EventSink>([], {
+      eventSink: {
+        async emit(_, metadata) {
+          attempted.push(metadata!.sequence);
+          entered();
+          await gate;
+        },
+      },
+    });
+    await persistence.appendOutboxEvents(
+      Array.from({ length: 3 }, () => ({
+        workflowRunId: "timeout",
+        eventType: "workflow:created",
+        payload: {},
+        occurredAt: new Date(),
+        causationId: "timeout",
+      })),
+    );
+    const dispatch = kernel.dispatch.bind(kernel);
+    let flushing: Promise<unknown> | undefined;
+    const tracked = {
+      ...kernel,
+      dispatch: ((command: Parameters<typeof dispatch>[0]) => {
+        const result = dispatch(command);
+        if (command.type === "outbox.flush") flushing = result;
+        return result;
+      }) as typeof kernel.dispatch,
+    };
+    const tick = runMaintenanceTick(tracked, { outboxFlushTimeoutMs: 50 });
+    try {
+      await started;
+      expect(await tick).toMatchObject({ eventSinkStatus: "degraded" });
+    } finally {
+      resume();
+    }
+    expect(await flushing).toMatchObject({ published: 1 });
+    expect(attempted).toEqual([1]);
+  });
+
   it("logs a delivery write error and reports degraded while leaving the claim recoverable", async () => {
     const { kernel, persistence, clock } = createTestKernel([workflow]);
     await kernel.dispatch({

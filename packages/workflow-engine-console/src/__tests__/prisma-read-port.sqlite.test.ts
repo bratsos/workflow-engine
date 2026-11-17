@@ -316,6 +316,21 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
     expect(events[0]?.occurredAt.toISOString()).toBe(at(2).toISOString());
   });
 
+  it("refuses an outbox timeline before the delivery claim column is migrated", async () => {
+    await prisma.$executeRawUnsafe!(
+      'ALTER TABLE "outbox_events" RENAME COLUMN "deliveryClaim" TO "legacyClaim"',
+    );
+    try {
+      await expect(reader().listRunEvents("run-day-1", 0)).rejects.toThrow(
+        /deliveryClaim/,
+      );
+    } finally {
+      await prisma.$executeRawUnsafe!(
+        'ALTER TABLE "outbox_events" RENAME COLUMN "legacyClaim" TO "deliveryClaim"',
+      );
+    }
+  });
+
   it("exposes the expiry of an unpublished delivery claim", async () => {
     const expiry = new Date("2099-01-01T00:00:00.000Z");
     await prisma.outboxEvent.updateMany({

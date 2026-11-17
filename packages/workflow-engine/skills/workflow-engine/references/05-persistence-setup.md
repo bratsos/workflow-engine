@@ -802,6 +802,9 @@ model OutboxEvent {
   dlqAt           DateTime?
 
   @@unique([workflowRunId, sequence])
+  @@index([deliveryClaim, id], map: "outbox_events_delivery_ready_idx")
+  @@index([publishedAt, dlqAt, workflowRunId, deliveryClaim], map: "outbox_events_delivery_run_idx")
+  @@index([publishedAt, dlqAt, workflowRunId, sequence], map: "outbox_events_live_run_sequence_idx")
   @@index([publishedAt])
   // Dead letters are a subset of the unpublished rows, so without this the
   // dead-letter view has to walk every unpublished event and fetch its heap
@@ -814,7 +817,9 @@ model OutboxEvent {
 }
 ```
 
-Events commit with their state changes. Events are delivered at least once while retries remain: a crash after sink acceptance but before the published write, an emit still in flight when its claim expires, or a partial plugin failure can cause duplicates. Deduplicate using the outbox `eventId` supplied to the sink or plugin. `workflowRunId` and `sequence` order events within a run, but are not a permanent identity: after an operator deletes the newest outbox rows, the Prisma store can reuse a sequence. Failures exhaust the retry budget and move the event to the DLQ; `plugin.replayDLQ` makes it eligible again. The engine’s progress never depends on the sink. Nothing in the engine deletes outbox rows; `run.purge` leaves them. For a purged run, a flush skips a live claim until it completes or expires, skips published rows, and skips dead letters until replay; only an operator removes rows with SQL. Claims are stored in `deliveryClaim`, not `publishedAt`; custom adapters must implement the four delivery methods above. See 03-runtime-setup.md for expiry, ordering and upgrade boundaries.
+Install the shipped outbox-head SQL for your database in the same migration as the schema. Use `prisma/outbox-heads.postgresql.sql` for PostgreSQL and `prisma/outbox-heads.sqlite.sql` for SQLite. The scripts initialize and maintain the index of claimable run heads. Run this SQL for a fresh database as well.
+
+Events commit with their state changes. Events are delivered at least once while retries remain. Delivery can duplicate whenever the sink effect happens without a durable acknowledgement. Examples include a crash or write error after acceptance, an emit in flight at expiry, a sink that commits and then rejects, and partial plugin success. Deduplicate using the outbox `eventId` supplied to the sink or plugin. `workflowRunId` and `sequence` order events within a run, but are not a permanent identity: after an operator deletes the newest outbox rows, the Prisma store can reuse a sequence. Failures exhaust the retry budget and move the event to the DLQ; `plugin.replayDLQ` makes it eligible again. The engine’s progress never depends on the sink. Nothing in the engine deletes outbox rows; `run.purge` leaves them. For a purged run, a flush skips a live claim until it completes or expires, skips published rows, and skips dead letters until replay; only an operator removes rows with SQL. Claims are stored in `deliveryClaim`, not `publishedAt`; custom adapters must implement the four delivery methods above. Claim via a bounded page of run heads, return each acquired row with its persisted retry count, and mark uncommitted transaction views with `outboxDeliveryDeferred: true` for a later root flush. See 03-runtime-setup.md for expiry, ordering and upgrade boundaries.
 
 ### IdempotencyKey Model
 

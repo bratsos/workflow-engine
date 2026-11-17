@@ -264,11 +264,11 @@ describe("PrismaWorkflowPersistence.claimOutboxDelivery raw SQL", () => {
     ];
     expect(sql).toContain("FOR UPDATE OF e SKIP LOCKED");
     expect(sql).toContain('SET "deliveryClaim" = $3');
-    expect(sql).toContain("DISTINCT ON");
+    expect(sql).toContain('ORDER BY "deliveryClaim", id LIMIT $1');
     expect(params).toEqual([25, `${now.toISOString()}~`, claim]);
   });
 
-  it("uses a compare-and-set and never skips a claimed run head", async () => {
+  it("uses a compare-and-set on a scheduled run head", async () => {
     const now = new Date("2026-09-04T11:00:00.000Z");
     const rows = [
       {
@@ -291,7 +291,10 @@ describe("PrismaWorkflowPersistence.claimOutboxDelivery raw SQL", () => {
     const updateMany = vi.fn(async () => ({ count: 0 }));
     const prisma = {
       $queryRaw: vi.fn(async () => []),
-      outboxEvent: { findMany: vi.fn(async () => rows), updateMany },
+      outboxEvent: {
+        findMany: vi.fn(async () => rows.slice(0, 1)),
+        updateMany,
+      },
     } as unknown as EnginePrismaClient;
     const persistence = new PrismaWorkflowPersistence(prisma, {
       databaseType: "sqlite",

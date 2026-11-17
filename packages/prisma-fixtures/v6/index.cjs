@@ -20,6 +20,7 @@ exports.createSqliteClient = (file, options = {}) => {
     );
   prisma("generate");
   prisma("db", "push", "--skip-generate");
+  schema.installOutboxHeads(file);
   const { PrismaClient } = require(join(__dirname, ".generated/sqlite-client"));
   return new PrismaClient({ datasourceUrl: url, ...options });
 };

@@ -1857,6 +1857,67 @@ export function persistenceConformanceSuite(
         ).toBe(2);
       });
 
+      it("schedules independent run heads and preserves a successor already claimed before replay", async () => {
+        const now = new Date("2025-01-01T00:00:00.000Z");
+        const token = "2025-01-01T00:01:00.000Z|replay";
+        const peer = "2025-01-01T00:01:00.000Z|peer";
+        const append = (workflowRunId: string, n: number) =>
+          persistence.appendOutboxEvents(
+            Array.from({ length: n }, () => ({
+              workflowRunId,
+              eventType: "delivery",
+              payload: {},
+              occurredAt: now,
+              causationId: "replay",
+            })),
+          );
+        await append("blocked", 105);
+        const [first] = await persistence.claimOutboxDelivery(
+          1,
+          token,
+          now,
+          [],
+        );
+        expect(
+          await persistence.failOutboxDelivery(first!.id, token, 1, now),
+        ).toBe("dead-lettered");
+        const [second] = await persistence.claimOutboxDelivery(
+          1,
+          token,
+          now,
+          [],
+        );
+        expect(second?.sequence).toBe(2);
+        expect(await persistence.replayDLQEvents(1)).toBe(1);
+        await append("ready", 1);
+        const other = await persistence.claimOutboxDelivery(1, peer, now, []);
+        expect(other.map((row) => row.workflowRunId)).toEqual(["ready"]);
+        expect(
+          await persistence.isOutboxDeliveryClaimActive(second!.id, token, now),
+        ).toBe(true);
+        expect(
+          await persistence.failOutboxDelivery(second!.id, token, 2, now),
+        ).toBe("retry");
+        const [replayed] = await persistence.claimOutboxDelivery(
+          1,
+          peer,
+          now,
+          [],
+        );
+        expect(replayed).toMatchObject({
+          id: first!.id,
+          sequence: 1,
+          retryCount: 0,
+        });
+      });
+
+      it("marks real caller transaction views as deferred for delivery", async () => {
+        if (!persistence.withTransaction) return;
+        await persistence.withTransaction(async (tx) => {
+          if (tx !== persistence) expect(tx.outboxDeliveryDeferred).toBe(true);
+        });
+      });
+
       it("should append outbox events with auto-assigned sequences", async () => {
         // Given: Two events for the same run
         const events = [

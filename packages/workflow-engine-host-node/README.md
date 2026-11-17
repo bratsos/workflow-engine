@@ -217,3 +217,5 @@ Build the kernel's registry with `createWorkflowRegistry(workflows)`. A run is p
 ## License
 
 MIT
+
+A flush starts no further claims or sink calls after its timeout or after Node shutdown cancels its tick. A claim already sent to the database can finish, and a sink call already in flight can settle under its original owner fence.

@@ -10,6 +10,7 @@ import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { defineStage } from "../../core/stage-factory.js";
 import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
+import { toErrorMessage } from "../../kernel/helpers/error-message.js";
 import { createKernel } from "../../kernel/kernel.js";
 import {
   createPluginRunner,
@@ -742,5 +743,46 @@ describe("kernel: outbox.flush", () => {
 
     const result = await flush();
     expect(result.published).toBe(0);
+  });
+});
+
+describe("outbox rejection diagnostics", () => {
+  it("formats arbitrary caught values without throwing or reading their cause", () => {
+    const circular = new Error("self");
+    circular.cause = circular;
+    const getter = Object.defineProperty(new Error(), "message", {
+      get() {
+        throw new Error("message trap");
+      },
+    });
+    const proxy = new Proxy(
+      {},
+      {
+        getPrototypeOf() {
+          throw new Error("prototype trap");
+        },
+      },
+    );
+    const changing = Object.defineProperty(new Error(), "message", {
+      get: (() => {
+        let reads = 0;
+        return () => (reads++ === 0 ? "read once" : null);
+      })(),
+    });
+    expect(
+      [
+        Object.create(null),
+        {
+          toString() {
+            throw new Error("coercion trap");
+          },
+        },
+        getter,
+        proxy,
+      ].map(toErrorMessage),
+    ).toEqual(Array(4).fill("Unprintable error"));
+    expect([Symbol("failure"), circular, changing].map(toErrorMessage)).toEqual(
+      ["Symbol(failure)", "self", "read once"],
+    );
   });
 });

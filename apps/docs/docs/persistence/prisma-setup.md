@@ -356,6 +356,9 @@ model OutboxEvent {
   dlqAt           DateTime?
 
   @@unique([workflowRunId, sequence])
+  @@index([deliveryClaim, id], map: "outbox_events_delivery_ready_idx")
+  @@index([publishedAt, dlqAt, workflowRunId, deliveryClaim], map: "outbox_events_delivery_run_idx")
+  @@index([publishedAt, dlqAt, workflowRunId, sequence], map: "outbox_events_live_run_sequence_idx")
   @@index([publishedAt])
   // Dead letters are a subset of the unpublished rows, so without this the
   // dead-letter view has to walk every unpublished event and fetch its heap
@@ -392,6 +395,8 @@ model WorkflowBlob {
   @@map("workflow_blobs")
 }
 ```
+
+Install the shipped outbox-head SQL for your database in the same migration as the schema. Use `prisma/outbox-heads.postgresql.sql` for PostgreSQL and `prisma/outbox-heads.sqlite.sql` for SQLite. The scripts initialize and maintain the index of claimable run heads. Run this SQL for a fresh database as well.
 
 ---
 
@@ -817,7 +822,7 @@ const blobStore = createPrismaBlobStore(prisma); // needs the WorkflowBlob model
 
 The adapters take a structural client type and never import `@prisma/client`, so any generated client — Prisma 6 or 7, default or custom `output` — satisfies them as long as it has the delegates. A Prisma 8 client has no delegates, so wrap it first: `fromPrisma8(db)` returns a client that satisfies the same type ([Prisma 8](#prisma-8)).
 
-A transaction client works too, on all three majors: build the ports over the `tx` inside your own transaction and the whole kernel tick runs in that transaction, under your `SET LOCAL` and row-level security. On Prisma 6 and 7 that is the `tx` of your `$transaction(async (tx) => ...)`; on Prisma 8 it is `fromPrisma8(tx, { contract: db.contract })` inside `db.transaction(async (tx) => ...)`. (The Prisma step ledger and idempotency-key inserts use `createMany({ skipDuplicates: true })` on Postgres precisely so a conflict does not abort an enclosing transaction.)
+A transaction client works too, on all three majors. Build the ports over the `tx` inside your own transaction and the whole kernel tick runs there under your `SET LOCAL` and row-level security. Its outbox flush returns `deferred: true` without calling the sink. After commit, run `outbox.flush` on a kernel built over the root client. On Prisma 6 and 7 that is the `tx` of your `$transaction(async (tx) => ...)`; on Prisma 8 it is `fromPrisma8(tx, { contract: db.contract })` inside `db.transaction(async (tx) => ...)`. (The Prisma step ledger and idempotency-key inserts use `createMany({ skipDuplicates: true })` on Postgres precisely so a conflict does not abort an enclosing transaction.)
 
 Options worth knowing:
 

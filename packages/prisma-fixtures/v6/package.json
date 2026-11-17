@@ -6,7 +6,7 @@
   "main": "./index.cjs",
   "scripts": {
     "generate": "node ../schema.cjs postgres --url && prisma generate --schema .generated/postgres.prisma",
-    "push": "node ../schema.cjs postgres --url && prisma db push --schema .generated/postgres.prisma --skip-generate"
+    "push": "node ../schema.cjs postgres --url && prisma db push --schema .generated/postgres.prisma --skip-generate && node ../outbox-heads.cjs"
   },
   "dependencies": {
     "@prisma/client": "6.19.3",

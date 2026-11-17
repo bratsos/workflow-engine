@@ -248,3 +248,5 @@ Consumers wire platform-specific glue (queue ack/retry, `waitUntil`, cron trigge
 ## License
 
 MIT
+
+A timed-out outbox flush starts no further claims or sink calls. A claim already sent to the database can finish, and a sink call already in flight can settle under its original owner fence. A tick on a caller-owned transaction reports `outboxDeferred: true`. Flush on the root client after commit.

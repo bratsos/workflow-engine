@@ -470,6 +470,46 @@ export interface RetentionOptions {
   limit?: number;
 }
 
+/**
+ * Bound the caller's wait and stop the dispatch before it starts more work.
+ * An already-started sink call can still settle and acknowledge its claim.
+ */
+export async function flushOutboxWithin(
+  kernel: Pick<Kernel, "dispatch">,
+  maxEvents: number,
+  timeoutMs: number,
+  parent?: Pick<AbortSignal, "aborted">,
+): Promise<OutboxFlushResult | undefined> {
+  const deadline = performance.now() + timeoutMs;
+  let timedOut = false;
+  const signal = {
+    get aborted() {
+      return (
+        timedOut || parent?.aborted === true || performance.now() >= deadline
+      );
+    },
+  };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      kernel.dispatch({
+        type: "outbox.flush",
+        maxEvents,
+        signal,
+        claimDurationMs: Math.min(MAX_TIMER_MS, Math.ceil(timeoutMs + 60_000)),
+      }),
+      new Promise<undefined>((resolve) => {
+        timer = setTimeout(() => {
+          timedOut = true;
+          resolve(undefined);
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 export interface RunMaintenanceTickOptions {
   /**
    * Unique worker identifier passed to `run.claimPending`. Defaults to
@@ -496,6 +536,8 @@ export interface RunMaintenanceTickOptions {
   maxOutboxFlushPerTick?: number;
   /** Maximum wait for this tick's outbox flush, in milliseconds (default 5,000). */
   outboxFlushTimeoutMs?: number;
+  /** Cancellation from the host's lifecycle for this tick's flush. */
+  outboxFlushSignal?: Pick<AbortSignal, "aborted">;
   /** Defaults to `HOST_DEFAULTS.staleLeaseThresholdMs`. */
   staleLeaseThresholdMs?: number;
   /** Defaults to `HOST_DEFAULTS.jobAbsoluteTimeoutMs`. Pass 0 to disable the absolute tier. */
@@ -524,6 +566,8 @@ export interface MaintenanceTickCounts {
   /** Jobs the absolute cap failed as runaways. */
   staleExpired: number;
   eventsFlushed: number;
+  /** Outbox delivery waits for the caller transaction to commit. */
+  outboxDeferred?: true;
   stuckReaped: number;
   /** Terminal runs `run.purge` deleted this tick; 0 unless `retention` is set. */
   purged: number;
@@ -632,6 +676,7 @@ export async function runMaintenanceTick(
   let staleReleased = 0;
   let staleExpired = 0;
   let eventsFlushed = 0;
+  let outboxDeferred: true | undefined;
   let stuckReaped = 0;
   let purged = 0;
   let eventsFailed = 0;
@@ -684,27 +729,20 @@ export async function runMaintenanceTick(
   }
 
   // 4. Flush outbox → publish pending events through EventSink
-  let flushTimer: ReturnType<typeof setTimeout> | undefined;
   try {
-    const flushResult = await Promise.race([
-      kernel.dispatch({
-        type: "outbox.flush",
-        maxEvents: maxOutboxFlushPerTick,
-        claimDurationMs: Math.min(
-          MAX_TIMER_MS,
-          Math.ceil(outboxFlushTimeoutMs + 60_000),
-        ),
-      }),
-      new Promise<undefined>((resolve) => {
-        flushTimer = setTimeout(() => resolve(undefined), outboxFlushTimeoutMs);
-      }),
-    ]);
+    const flushResult = await flushOutboxWithin(
+      kernel,
+      maxOutboxFlushPerTick,
+      outboxFlushTimeoutMs,
+      options.outboxFlushSignal,
+    );
     if (flushResult === undefined) {
       eventSinkStatus = "degraded";
       eventSinkError = `outbox.flush timed out after ${outboxFlushTimeoutMs}ms`;
       console.error(`${logPrefix} ${eventSinkError}`);
     } else {
       eventsFlushed = flushResult.published;
+      outboxDeferred = flushResult.deferred;
       eventsFailed = flushResult.failed;
       eventsDeadLettered = flushResult.deadLettered;
       eventSinkStatus = flushResult.eventSinkStatus;
@@ -717,8 +755,6 @@ export async function runMaintenanceTick(
     console.error(`${logPrefix} outbox.flush error:`, error);
     eventSinkStatus = "degraded";
     eventSinkError = toErrorMessage(error);
-  } finally {
-    if (flushTimer) clearTimeout(flushTimer);
   }
 
   // 5. Reap stuck runs → fail runs with no activity past threshold
@@ -757,6 +793,7 @@ export async function runMaintenanceTick(
     staleReleased,
     staleExpired,
     eventsFlushed,
+    ...(outboxDeferred ? { outboxDeferred } : {}),
     stuckReaped,
     purged,
     eventsFailed,

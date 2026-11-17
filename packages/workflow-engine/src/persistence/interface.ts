@@ -1011,11 +1011,16 @@ export interface PersistenceCore {
   /** Read unpublished events ordered by (workflowRunId, sequence). */
   getUnpublishedOutboxEvents(limit?: number): Promise<OutboxRecord[]>;
 
+  /** Set on a caller's uncommitted transaction view. Delivery waits for a root flush. */
+  readonly outboxDeliveryDeferred?: boolean;
+
   /**
-   * Claim the first live event of each eligible run. `claim` is an ISO UTC
-   * expiry, `|`, and a unique owner ID; it must be stored atomically without
-   * changing `publishedAt`. An earlier unpublished, non-dead-lettered event
-   * blocks the rest of its run. Excluded runs are skipped.
+   * Claim an indexed page of eligible run heads. `claim` is an ISO UTC
+   * expiry, `|`, and a unique owner ID. Store it atomically without changing
+   * `publishedAt`, and return each row's state at acquisition, including its
+   * retry count. A live predecessor blocks its successors at acquisition.
+   * Replay can make an earlier event eligible after a successor was claimed.
+   * Skip excluded runs and page past blocked runs without reading their tails.
    */
   claimOutboxDelivery(
     limit: number,

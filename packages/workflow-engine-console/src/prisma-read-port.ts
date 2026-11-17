@@ -896,7 +896,7 @@ LIMIT ${logLimit + 1}`,
       const eventRows = await this.select<RawEventRow>(
         client,
         EVENT_COLUMNS,
-        `SELECT id, "workflowRunId", sequence, "eventType", "occurredAt", "publishedAt", "deliveryClaim",
+        `SELECT id, "workflowRunId", sequence, "eventType", "occurredAt", "publishedAt", "outbox_events"."deliveryClaim",
        "retryCount", "dlqAt"
 FROM "outbox_events" WHERE "workflowRunId" = ${this.param(1)}
 ORDER BY sequence ASC
@@ -942,7 +942,7 @@ LIMIT ${eventLimit + 1}`,
     const rows = await this.query<RawEventRow>(
       "run.events.tail",
       EVENT_COLUMNS,
-      `SELECT id, "workflowRunId", sequence, "eventType", "occurredAt", "publishedAt", "deliveryClaim",
+      `SELECT id, "workflowRunId", sequence, "eventType", "occurredAt", "publishedAt", "outbox_events"."deliveryClaim",
        "retryCount", "dlqAt"
 FROM "outbox_events" WHERE "workflowRunId" = ${this.param(1)} AND sequence > ${this.param(2)}
 ORDER BY sequence ASC LIMIT ${clampedLimit}`,

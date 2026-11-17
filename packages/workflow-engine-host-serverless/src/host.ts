@@ -14,6 +14,7 @@ import {
   assertTimerMs,
   type EventSinkStatus,
   executeJobWithHeartbeat,
+  flushOutboxWithin,
   HOST_DEFAULTS,
   type JobTransport,
   type Kernel,
@@ -165,6 +166,8 @@ export interface MaintenanceTickResult {
   suspendedChecked: number;
   staleReleased: number;
   eventsFlushed: number;
+  /** Outbox delivery waits for the caller transaction to commit. */
+  outboxDeferred?: true;
   stuckReaped: number;
   /** Terminal runs deleted by `run.purge`; 0 unless `retention` is configured. */
   purged: number;
@@ -298,25 +301,15 @@ class ServerlessHostImpl implements ServerlessHost {
 
   /** Publish pending outbox events, bounded by `outboxFlushTimeoutMs`. */
   private async flushOutbox(): Promise<void> {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeout = new Promise<"timeout">((resolve) => {
-      timer = setTimeout(() => resolve("timeout"), this.outboxFlushTimeoutMs);
-    });
     try {
-      const outcome = await Promise.race([
-        this.kernel.dispatch({
-          type: "outbox.flush",
-          maxEvents: this.maxOutboxFlushPerTick,
-          claimDurationMs: Math.min(
-            2_147_483_647,
-            Math.ceil(this.outboxFlushTimeoutMs + 60_000),
-          ),
-        }),
-        timeout,
-      ]);
-      if (outcome === "timeout") {
+      const outcome = await flushOutboxWithin(
+        this.kernel,
+        this.maxOutboxFlushPerTick,
+        this.outboxFlushTimeoutMs,
+      );
+      if (outcome === undefined) {
         console.error(
-          "[ServerlessHost] outbox.flush after job: timed out; the next maintenance tick publishes the rest",
+          "[ServerlessHost] outbox.flush after job timed out. Pending events remain for a later flush.",
         );
       } else if (outcome.eventSinkStatus === "degraded") {
         // Stateless: no transition to detect, so say it every time.
@@ -326,15 +319,13 @@ class ServerlessHostImpl implements ServerlessHost {
           }`,
         );
       }
-      if (outcome !== "timeout" && outcome.deadLettered > 0) {
+      if (outcome && outcome.deadLettered > 0) {
         console.error(
           `[ServerlessHost] event sink DEAD-LETTERED ${outcome.deadLettered} event(s): they will not be delivered until replayed with the plugin.replayDLQ command`,
         );
       }
     } catch (error) {
       console.error("[ServerlessHost] outbox.flush after job error:", error);
-    } finally {
-      if (timer) clearTimeout(timer);
     }
   }
 

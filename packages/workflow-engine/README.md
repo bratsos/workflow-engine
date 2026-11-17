@@ -58,7 +58,7 @@ session, under your row-level security policies.
 | **Type-Safe** | Full TypeScript inference from input to output across all stages |
 | **Async-First** | Long-running operations: a stage submits a provider batch, releases its lease, and resumes hours later from the step ledger |
 | **AI cost as data** | Tokens and cost on `WorkflowRun.totalCost` in the stage's own transaction, priced from the endpoint actually dispatched to — batch prices for a batch call |
-| **Event-Driven** | Transactional outbox delivers at least once until the retry budget is exhausted. Crashes after emit, expiry during an emit, and partial plugin failures can duplicate events; deduplicate by the outbox `eventId`. `workflowRunId` and `sequence` order events within a run, but are not a permanent identity: after an operator deletes the newest outbox rows, the Prisma store can reuse a sequence. Dead letters await `plugin.replayDLQ`; engine progress never depends on the sink. After `run.purge`, a flush skips a live claim until it completes or expires, skips published rows, and skips dead letters until replay. The engine never deletes outbox rows; operators remove them with SQL. |
+| **Event-Driven** | Transactional outbox delivers at least once until the retry budget is exhausted. Delivery can duplicate whenever the sink effect happens without a durable acknowledgement. Examples include a crash or write error after acceptance, an emit in flight at expiry, a sink that commits and then rejects, and partial plugin success. Deduplicate by the outbox `eventId`. `workflowRunId` and `sequence` order events within a run, but are not a permanent identity: after an operator deletes the newest outbox rows, the Prisma store can reuse a sequence. Order is decided when a run head is claimed. A dead letter replayed after a successor was claimed can arrive after it. Dead letters await `plugin.replayDLQ`; engine progress never depends on the sink. After `run.purge`, a flush skips a live claim until it completes or expires, skips published rows, and skips dead letters until replay. The engine never deletes outbox rows; operators remove them with SQL. |
 | **Parallel Execution** | Independent stages in one execution group run concurrently. Pipelines are linear -- there is no arbitrary DAG and no child workflows |
 | **Durable steps** | `ctx.step.*` results are keyed by name in a step ledger: exactly-once *recording*, at-least-once *execution*, with a derived `externalKey` so a reclaim adopts an external effect rather than repeating it |
 | **Definition versioning** | A run is pinned to the structural version it was created under, and a host claims only runs it serves, so a rolling deploy cannot change a run's shape mid-flight |
@@ -445,6 +445,9 @@ model OutboxEvent {
   dlqAt           DateTime?
 
   @@unique([workflowRunId, sequence])
+  @@index([deliveryClaim, id], map: "outbox_events_delivery_ready_idx")
+  @@index([publishedAt, dlqAt, workflowRunId, deliveryClaim], map: "outbox_events_delivery_run_idx")
+  @@index([publishedAt, dlqAt, workflowRunId, sequence], map: "outbox_events_live_run_sequence_idx")
   @@index([publishedAt])
   // Dead letters are a subset of the unpublished rows, so without this the
   // dead-letter view has to walk every unpublished event and fetch its heap
@@ -480,6 +483,8 @@ model WorkflowBlob {
   @@map("workflow_blobs")
 }
 ```
+
+Install the shipped outbox-head SQL for your database in the same migration as the schema. Use `prisma/outbox-heads.postgresql.sql` for PostgreSQL and `prisma/outbox-heads.sqlite.sql` for SQLite. The scripts initialize and maintain the index of claimable run heads. Run this SQL for a fresh database as well.
 
 Run the migration:
 
