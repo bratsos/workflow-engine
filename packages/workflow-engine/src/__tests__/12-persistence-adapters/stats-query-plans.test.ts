@@ -23,6 +23,9 @@
  *   counts, so this is the choice a large database nobody ANALYZEd gets. It
  *   does not cover a database that was analysed: SQLite then plans from the
  *   row counts, which a few seeded rows cannot stand in for.
+ * - Postgres needs a role that may `DELETE FROM pg_statistic` (a superuser; the
+ *   CI role `postgres` is one): every state described below is built, not
+ *   assumed, so no test depends on what ran against the database before.
  * - Postgres, forced (`enable_seqscan = off`, a few seeded rows): a sequential
  *   scan appears only when no index can serve the statement. So this checks
  *   that an index path exists and which index is preferred among them,
@@ -209,6 +212,46 @@ describe.skipIf(!sqlite && !databaseUrl)(
       );
     }
 
+    // Postgres: the tables the statistics checks are about.
+    const TABLES = [
+      "workflow_runs",
+      "workflow_stages",
+      "job_queue",
+      "outbox_events",
+    ];
+    const inTables = TABLES.map((table) => `'"${table}"'::regclass`).join(", ");
+
+    /** How many of the tables carry planner statistics of any kind. */
+    async function analysedTables(): Promise<number> {
+      const [rows, stats] = await Promise.all([
+        rawFor(client, { n: "int" }).$queryRawUnsafe(
+          `SELECT count(*)::int AS n FROM pg_class WHERE oid IN (${inTables}) AND reltuples <> -1`,
+        ),
+        rawFor(client, { n: "int" }).$queryRawUnsafe(
+          `SELECT count(*)::int AS n FROM pg_statistic WHERE starelid IN (${inTables})`,
+        ),
+      ]);
+      return Number(rows[0].n) + Number(stats[0].n);
+    }
+
+    /**
+     * Puts the tables in the state of a fresh bulk load: `TRUNCATE` resets
+     * `reltuples`, but the `pg_statistic` rows an earlier `ANALYZE` (this
+     * file's, a previous run's, an autovacuum's) left survive it, and an
+     * autovacuum could analyse them again mid-test. Deleting from
+     * `pg_statistic` needs a superuser, which the CI role is.
+     */
+    async function withoutStatistics() {
+      for (const table of TABLES) {
+        await client.$executeRawUnsafe(
+          `ALTER TABLE "${table}" SET (autovacuum_enabled = false)`,
+        );
+      }
+      await client.$executeRawUnsafe(
+        `DELETE FROM pg_statistic WHERE starelid IN (${inTables})`,
+      );
+    }
+
     /**
      * The plan of one statement as text lines. On Postgres `forceIndex` turns
      * sequential scans off for the checking transaction; without it the plan
@@ -390,17 +433,35 @@ describe.skipIf(!sqlite && !databaseUrl)(
         ...options,
         workerId: "plans-worker",
       });
-      if (!sqlite) await truncate();
+      if (!sqlite) {
+        await truncate();
+        await withoutStatistics();
+      }
       await seed();
     }, 120_000);
 
     afterAll(async () => {
-      if (!sqlite && client) await truncate();
+      if (!sqlite && client) {
+        await truncate();
+        for (const table of TABLES) {
+          await client.$executeRawUnsafe(
+            `ALTER TABLE "${table}" RESET (autovacuum_enabled)`,
+          );
+        }
+      }
       await client?.$disconnect();
       if (directory) await rm(directory, { recursive: true, force: true });
     });
 
     describe(sqlite ? "without statistics" : "before ANALYZE", () => {
+      // The premise of this describe, checked rather than assumed.
+      beforeAll(async () => {
+        if (sqlite) return;
+        expect(
+          await analysedTables(),
+          "tables must start without statistics",
+        ).toBe(0);
+      });
       it("serves every stats query from its index", () => expectStatsPlans());
       it("serves the outbox claim's candidates from the unpublished index", () =>
         expectClaimPlans());
@@ -424,42 +485,11 @@ describe.skipIf(!sqlite && !databaseUrl)(
     // These load the volumes the statements must not read (terminal rows,
     // published events) and take whatever plan the planner chooses.
     describe.skipIf(sqlite)("at scale, no forced plan", () => {
-      const TABLES = [
-        "workflow_runs",
-        "workflow_stages",
-        "job_queue",
-        "outbox_events",
-      ];
       const TERMINAL_ROWS = 100_000;
       const PUBLISHED_EVENTS = 500_000;
-      const inTables = TABLES.map((table) => `'"${table}"'::regclass`).join(
-        ", ",
-      );
-
-      /** How many of the tables carry planner statistics of any kind. */
-      async function analysedTables(): Promise<number> {
-        const [rows, stats] = await Promise.all([
-          rawFor(client, { n: "int" }).$queryRawUnsafe(
-            `SELECT count(*)::int AS n FROM pg_class WHERE oid IN (${inTables}) AND reltuples <> -1`,
-          ),
-          rawFor(client, { n: "int" }).$queryRawUnsafe(
-            `SELECT count(*)::int AS n FROM pg_statistic WHERE starelid IN (${inTables})`,
-          ),
-        ]);
-        return Number(rows[0].n) + Number(stats[0].n);
-      }
-
       beforeAll(async () => {
         await truncate();
-        for (const table of TABLES) {
-          await client.$executeRawUnsafe(
-            `ALTER TABLE "${table}" SET (autovacuum_enabled = false)`,
-          );
-        }
-        // Statistics an earlier ANALYZE left survive TRUNCATE.
-        await client.$executeRawUnsafe(
-          `DELETE FROM pg_statistic WHERE starelid IN (${inTables})`,
-        );
+        await withoutStatistics();
         const terminal = (statuses: string[]) =>
           `(ARRAY[${statuses.map((s) => `'${s}'`).join(",")}])[1 + g % ${statuses.length}]::"Status"`;
         await client.$executeRawUnsafe(
@@ -490,14 +520,6 @@ describe.skipIf(!sqlite && !databaseUrl)(
           "tables must start without statistics",
         ).toBe(0);
       }, 300_000);
-
-      afterAll(async () => {
-        for (const table of TABLES) {
-          await client.$executeRawUnsafe(
-            `ALTER TABLE "${table}" RESET (autovacuum_enabled)`,
-          );
-        }
-      });
 
       describe("never analysed", () => {
         it("serves every stats query from its index", () =>

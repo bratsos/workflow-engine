@@ -553,7 +553,7 @@ describe("NodeHost", () => {
       await waitFor(async () => host!.getStats().orchestrationTicks >= 5);
       expect(calls).toBe(1);
       const skips = warned.mock.calls.filter((args) =>
-        String(args[0]).includes("onTick hook still running after"),
+        String(args[0]).includes("onTick hook is still running after"),
       );
       expect(skips).toHaveLength(1);
       expect(String(skips[0]?.[0])).toMatch(/running after \d+ ms/);
@@ -561,6 +561,47 @@ describe("NodeHost", () => {
       release();
       await waitFor(async () => calls >= 3);
       expect(overlapped).toBe(false);
+    } finally {
+      warned.mockRestore();
+    }
+  });
+
+  it("warns once for a hook that stays slower than the interval, and again after a call that was not skipped", async () => {
+    const { kernel, jobTransport } = createTestEnv([]);
+    const warned = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      // Every call takes about six intervals until `slow` is cleared.
+      let slow = true;
+      let calls = 0;
+      host = createNodeHost({
+        kernel,
+        jobTransport,
+        workerId: "test-worker",
+        orchestrationIntervalMs: 10,
+        jobPollIntervalMs: 20,
+        onTick: async () => {
+          calls++;
+          if (slow) await new Promise((r) => setTimeout(r, 60));
+        },
+      });
+      const skips = () =>
+        warned.mock.calls.filter((args) =>
+          String(args[0]).includes("onTick hook is still running after"),
+        ).length;
+      await host.start();
+      // Four slow calls, each skipped by several ticks: one warning in all.
+      await waitFor(async () => calls >= 4);
+      expect(skips()).toBe(1);
+
+      // A call that finishes before the next tick ends the episode ...
+      slow = false;
+      const before = calls;
+      await waitFor(async () => calls >= before + 3);
+      expect(skips()).toBe(1);
+
+      // ... so the next slow call warns again.
+      slow = true;
+      await waitFor(async () => skips() === 2);
     } finally {
       warned.mockRestore();
     }

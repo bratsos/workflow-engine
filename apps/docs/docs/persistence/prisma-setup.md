@@ -1022,7 +1022,7 @@ Prisma 6 stores `DateTime` values in SQLite as integer epoch milliseconds, Prism
 - `listRunsForPurge` with a cutoff of one hour ago returned the run completed a moment ago, so `retention` would delete it;
 - `getStuckRuns` with a threshold of one hour ago returned the run updated a moment ago, so `run.reapStuck` would fail it;
 - `getSuspendedStages` for a time before the deadline returned the stage that is not due, so it would be polled early;
-- `engine.stats` reported that stage as due and the dead-lettered events as 0.
+- `engine.stats` reported two stages as due where one was (`suspendedDue`). The dead-lettered count was right: it is a bare `IS NOT NULL` count, which does not depend on the storage class.
 
 Read the other way (a file written by Prisma 7, read through Prisma 6), a stage whose deadline had passed was not returned, so it would never be polled. There is no supported timestamp-normalization migration: start the new major from a fresh SQLite file and migrate application data into it.
 

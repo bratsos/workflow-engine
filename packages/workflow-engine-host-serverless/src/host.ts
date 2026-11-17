@@ -23,6 +23,9 @@ import {
   type ServedDefinition,
 } from "@bratsos/workflow-engine/kernel";
 
+/** The longest delay `setTimeout` honours: a longer one fires after 1 ms. */
+const MAX_TIMER_MS = 2 ** 31 - 1;
+
 // ============================================================================
 // Public interfaces
 // ============================================================================
@@ -103,7 +106,11 @@ export interface ServerlessHostConfig {
    * (default: 5_000, the same as `outboxFlushTimeoutMs`: both bound optional
    * work this host awaits after its own commands have finished, inside an
    * invocation that has a time limit). A hook that never settles then costs
-   * one bounded wait per tick and never withholds the counts.
+   * one bounded wait per tick and never withholds the counts. Must be a
+   * number from 1 to 2147483647 (the longest delay a timer honours, about 24.8
+   * days); anything else, `Infinity`, `NaN`, zero or a negative number
+   * included, throws a `RangeError` from `createServerlessHost`. Nothing
+   * switches the bound off: pass 2147483647 to wait for practically any hook.
    */
   onTickTimeoutMs?: number;
 
@@ -233,6 +240,15 @@ class ServerlessHostImpl implements ServerlessHost {
     this.flushOutboxAfterJob = config.flushOutboxAfterJob ?? true;
     this.outboxFlushTimeoutMs = config.outboxFlushTimeoutMs ?? 5_000;
     this.onTickTimeoutMs = config.onTickTimeoutMs ?? 5_000;
+    if (
+      typeof this.onTickTimeoutMs !== "number" ||
+      !(this.onTickTimeoutMs >= 1) ||
+      this.onTickTimeoutMs > MAX_TIMER_MS
+    ) {
+      throw new RangeError(
+        `onTickTimeoutMs must be a number of milliseconds from 1 to ${MAX_TIMER_MS}, got ${String(config.onTickTimeoutMs)}. The bound cannot be switched off, because a hook that never settles would then withhold the counts; pass ${MAX_TIMER_MS} (about 24.8 days) to wait for practically any hook.`,
+      );
+    }
   }
 
   async handleJob(msg: JobMessage): Promise<JobResult> {

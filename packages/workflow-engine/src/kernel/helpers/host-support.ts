@@ -531,8 +531,10 @@ export type MaintenanceTickHook = (
  * hook that never settles never returns. With it, the call returns once the
  * hook settles or `timeoutMs` has elapsed, whichever is first; after the
  * bound it logs one warning and leaves the hook running (a later throw or
- * rejection is still caught and logged). The Node host does not await the
- * hook at all; the serverless host passes its `onTickTimeoutMs`.
+ * rejection is still caught and logged). `timeoutMs` must be a number from 1
+ * to 2147483647: a timer cannot honour anything else (the serverless host
+ * checks its `onTickTimeoutMs` at construction). The Node host does not await
+ * the hook at all.
  */
 export async function runTickHook(
   hook: MaintenanceTickHook | undefined,

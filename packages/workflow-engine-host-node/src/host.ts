@@ -118,9 +118,11 @@ export interface NodeHostConfig {
    * does cannot delay claiming, polling, lease reaping or the outbox flush. At
    * most one call is in flight. A tick that finds the previous call still
    * running skips the hook and logs one warning (with how long the call has
-   * run) the first time that happens, not on every tick, then calls it again
-   * after it settles. A hook that throws or rejects is caught and logged; it
-   * never stops the loop.
+   * run) the first time that happens, then calls it again after it settles.
+   * The warning is not repeated while the hook stays slower than the interval:
+   * it is logged again only after a call has finished without any tick
+   * skipping it. A hook that throws or rejects is caught and logged; it never
+   * stops the loop.
    *
    * `stop()` waits for a running hook for at most `shutdownTimeoutMs` and no
    * hook starts once it began, so a hook must not await `host.stop()`: the
@@ -182,7 +184,13 @@ class NodeHostImpl implements NodeHost {
   /** The `onTick` call currently running, if any. */
   private hookInFlight: Promise<void> | null = null;
   private hookStartedAt = 0;
-  /** Whether this run of the hook already logged that ticks skipped it. */
+  /** A tick skipped the hook while the current call ran. */
+  private hookSkippedDuringCall = false;
+  /**
+   * The skip warning was logged and no call has since finished without a
+   * tick skipping it: a hook slower than the interval is one episode, however
+   * many calls it takes.
+   */
   private hookSkipLogged = false;
 
   private readonly kernel: Kernel;
@@ -437,16 +445,17 @@ class NodeHostImpl implements NodeHost {
   private startTickHook(counts: MaintenanceTickCounts): void {
     if (!this.onTick || !this.running) return;
     if (this.hookInFlight) {
+      this.hookSkippedDuringCall = true;
       if (!this.hookSkipLogged) {
         this.hookSkipLogged = true;
         console.warn(
-          `[NodeHost] onTick hook still running after ${Date.now() - this.hookStartedAt} ms: skipping it on this tick and on every tick until it settles`,
+          `[NodeHost] onTick hook is still running after ${Date.now() - this.hookStartedAt} ms and ticks skip it while it runs; this is logged once until a call finishes without being skipped`,
         );
       }
       return;
     }
     this.hookStartedAt = Date.now();
-    this.hookSkipLogged = false;
+    this.hookSkippedDuringCall = false;
     // Started a microtask later so `hookInFlight` is already set when the hook
     // body first runs: a hook that calls `stop()` is then always waited for.
     const hook = this.onTick;
@@ -456,6 +465,7 @@ class NodeHostImpl implements NodeHost {
       })
       .finally(() => {
         this.hookInFlight = null;
+        if (!this.hookSkippedDuringCall) this.hookSkipLogged = false;
       });
   }
 

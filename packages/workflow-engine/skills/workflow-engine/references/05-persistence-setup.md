@@ -1427,10 +1427,14 @@ databases and in the Postgres claim statement. The dead-letter count is a bare
 first non-NULL entry, independent of how the file stores dates) and, on
 Postgres, a `dlqAt` range from 1970-01-01 to 9999-12-31 (a lone `dlqAt > epoch`
 or `IS NOT NULL` is estimated at a third or all of an unanalysed table, which
-made a parallel sequential scan the cheaper plan). One limit remains: on an
-unanalysed Postgres table the claim can walk the unique `(workflowRunId,
-sequence)` index at a limit below about 50, which reads the published rows
-that sort before the live ones; `ANALYZE` settles it.
+made a parallel sequential scan the cheaper plan). One limit remains: on a
+Postgres table with no statistics the claim at a limit below about 50 walks the
+unique `(workflowRunId, sequence)` index, which reads the published rows that
+sort before the live ones (104,706 buffers and about 50 ms at 500,000 published
+events, against 413 before this change); the default limit of 100 and every
+limit after `ANALYZE` use `outbox_events_publishedAt_idx`. Forms that avoid the
+walk sort the whole live backlog on every flush (306 ms at 300,000 live events
+against 18 ms), so the planner's choice with statistics was kept.
 `stats-query-plans.test.ts` asserts the plans of the stats queries and of the
 claim on SQLite and Postgres, and on Postgres at 500,000 published events with
 no forced plan, before and after `ANALYZE`. A custom SQL adapter should check
