@@ -130,15 +130,37 @@ async function resetFixture(fixture: ResettableFixture): Promise<void> {
 }
 
 /**
- * Real-time delay, used sparingly where a suite has no other way to wait
- * for adapter-async behavior to settle (neither `JobQueue` nor
- * `AICallLogger` expose an injectable clock or a "flush pending writes"
- * primitive) -- e.g. `AICallLogger.logCall` is documented fire-and-forget,
- * so a real (non-fake) implementation logging to a database may not have
- * committed the write by the time a `logCall` call returns.
+ * Real-time delay, for the tests that need time to have PASSED (a lower
+ * bound, which a slow machine only makes safer). Never use it to wait for an
+ * adapter's asynchronous work to land: a fixed delay is a guess that a
+ * loaded database outgrows. Use `waitFor` for that.
  */
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Reads until `done` accepts the value or `timeoutMs` passes, and returns the
+ * last value either way so the caller's assertion reports the real state.
+ * `AICallLogger.logCall` is documented fire-and-forget, so a database-backed
+ * adapter may not have committed the write when it returns, and neither
+ * `AICallLogger` nor `JobQueue` expose a "flush pending writes" primitive.
+ * The wait ends the moment the write is visible, so a fast adapter pays
+ * nothing and a slow one gets the whole timeout instead of a guess. The
+ * default stays under the 5 s default test timeout of vitest and jest.
+ */
+async function waitFor<T>(
+  read: () => Promise<T>,
+  done: (value: T) => boolean,
+  timeoutMs = 4_000,
+): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  let value = await read();
+  while (!done(value) && Date.now() < deadline) {
+    await sleep(20);
+    value = await read();
+  }
+  return value;
 }
 
 // ============================================================================
@@ -2275,10 +2297,12 @@ export function aiCallLoggerConformanceSuite(
             reasoningTokens: 10,
           }),
         );
-        await sleep(100);
 
-        // When: reading the call back
-        const calls = await listCalls("workflow.cost.reported");
+        // When: reading the call back, once the fire-and-forget write landed
+        const calls = await waitFor(
+          () => listCalls("workflow.cost.reported"),
+          (rows) => rows === undefined || rows.length > 0,
+        );
         if (calls === undefined) return;
 
         // Then: `cost` is the reported figure and the estimate survives beside it
@@ -2347,9 +2371,13 @@ export function aiCallLoggerConformanceSuite(
             metadata: { batchId: "legacy-metadata-batch" },
           }),
         );
-        await sleep(100);
 
-        expect(await logger.isRecorded("legacy-metadata-batch")).toBe(true);
+        expect(
+          await waitFor(
+            () => logger.isRecorded("legacy-metadata-batch"),
+            (recorded) => recorded,
+          ),
+        ).toBe(true);
       });
     });
 
@@ -2374,12 +2402,13 @@ export function aiCallLoggerConformanceSuite(
         );
         // logCall is documented fire-and-forget (see AICallLogger.logCall)
         // -- a real adapter logging to a database may not have committed
-        // the write yet when logCall() returns, so give it a moment
-        // before reading it back via getStats.
-        await sleep(100);
+        // the write yet when logCall() returns, so read until it has.
 
         // When: Getting stats
-        const stats = await logger.getStats("workflow.stats");
+        const stats = await waitFor(
+          () => logger.getStats("workflow.stats"),
+          (value) => value.totalCalls >= 2,
+        );
 
         // Then: Stats are aggregated
         expect(stats.totalCalls).toBe(2);
@@ -2433,10 +2462,12 @@ export function aiCallLoggerConformanceSuite(
         );
         // logCall is fire-and-forget -- see the equivalent wait in
         // "should aggregate stats for matching topic prefix" above.
-        await sleep(100);
 
         // When: Getting stats
-        const stats = await logger.getStats("workflow.model");
+        const stats = await waitFor(
+          () => logger.getStats("workflow.model"),
+          (value) => value.totalCalls >= 3,
+        );
 
         // Then: Per-model stats are correct
         expect(stats.perModel["model-a"]).toEqual({
@@ -3106,50 +3137,72 @@ export function jobQueueConformanceSuite(
       });
 
       it("a touched (heartbeating) job survives releaseStaleJobs while an untouched stale job is reclaimed", async () => {
-        // Given: Two jobs locked at roughly the same time (the
-        // heartbeat-vs-reaper race, at the queue level -- mirrors
-        // NodeHost's periodic touchJob heartbeat racing lease.reapStale)
-        const survivorRunId = "touch-survivor-run";
-        const victimRunId = "touch-victim-run";
-        const survivorId = await (queue as LegacyQueue).enqueue(
-          createJobInput({
-            workflowRunId: survivorRunId,
-            stageId: "heartbeat-survivor",
-          }),
+        // Neither JobQueue nor its factory expose an injectable clock, so
+        // real elapsed time decides this test. The victim is stale however
+        // slow the machine is (the sleep is a lower bound). The survivor
+        // stays out of the reap only if the reap runs within `windowMs` of
+        // its touch, and on a loaded machine that gap can outgrow a short
+        // window, in which case reclaiming it is correct. So the gap is
+        // measured: an attempt where it reached half the window proves
+        // nothing and is repeated on fresh jobs at three times the window.
+        // A quiet machine finishes on the first attempt (200 ms); a loaded
+        // one pays more time (2.6 s of sleeping at most, inside the 5 s
+        // default test timeout), never a wrong verdict.
+        for (const windowMs of [100, 300, 900]) {
+          // Given: Two jobs locked at roughly the same time (the
+          // heartbeat-vs-reaper race, at the queue level -- mirrors
+          // NodeHost's periodic touchJob heartbeat racing lease.reapStale)
+          const survivorRunId = `touch-survivor-run-${windowMs}`;
+          const victimRunId = `touch-victim-run-${windowMs}`;
+          const survivorId = await (queue as LegacyQueue).enqueue(
+            createJobInput({
+              workflowRunId: survivorRunId,
+              stageId: "heartbeat-survivor",
+            }),
+          );
+          await queue.dequeue();
+          const victimId = await (queue as LegacyQueue).enqueue(
+            createJobInput({
+              workflowRunId: victimRunId,
+              stageId: "heartbeat-victim",
+            }),
+          );
+          await queue.dequeue();
+
+          // When: Real time passes, then only the survivor is heartbeated
+          // (touched) right before the stale-lease reap runs
+          await sleep(2 * windowMs);
+          const touchedAt = Date.now();
+          await queue.touchJob(survivorId);
+          const released = await queue.releaseStaleJobs(windowMs);
+          const gapMs = Date.now() - touchedAt;
+
+          // Then: The untouched job was reclaimed (back to PENDING, lock
+          // cleared)
+          expect(released).toBeGreaterThanOrEqual(1);
+          const [victim] = await queue.getJobsByWorkflowRun(victimRunId);
+          expect(victim?.status).toBe("PENDING");
+          expect(victim?.lockedAt).toBeNull();
+          expect(victim?.workerId).toBeNull();
+          expect(victim?.id).toBe(victimId);
+
+          // And: The freshly-touched job is untouched by the reap and
+          // stays RUNNING with its worker lock intact -- unless the reap
+          // came too late for the touch to count (see above)
+          const [survivor] = await queue.getJobsByWorkflowRun(survivorRunId);
+          if (survivor?.status === "PENDING" && gapMs >= windowMs / 2) {
+            await queue.cancelByRun(survivorRunId);
+            await queue.cancelByRun(victimRunId);
+            continue;
+          }
+          expect(survivor?.status).toBe("RUNNING");
+          expect(survivor?.lockedAt).not.toBeNull();
+          expect(survivor?.id).toBe(survivorId);
+          return;
+        }
+        throw new Error(
+          "the machine was too slow to tell a heartbeat from a stale lease: the reap ran more than half a window after the touch in every attempt, up to a 900 ms window",
         );
-        await queue.dequeue();
-        const victimId = await (queue as LegacyQueue).enqueue(
-          createJobInput({
-            workflowRunId: victimRunId,
-            stageId: "heartbeat-victim",
-          }),
-        );
-        await queue.dequeue();
-
-        // When: Real time passes, then only the survivor is heartbeated
-        // (touched) right before the stale-lease reap runs. Margins are
-        // generous (well beyond typical DB round-trip / CI scheduling
-        // jitter) since this assertion depends on real elapsed time --
-        // neither JobQueue nor its factory expose an injectable clock.
-        await sleep(200);
-        await queue.touchJob(survivorId);
-        const released = await queue.releaseStaleJobs(100);
-
-        // Then: The untouched job was reclaimed (back to PENDING, lock
-        // cleared); the freshly-touched job is untouched by the reap and
-        // stays RUNNING with its worker lock intact
-        expect(released).toBeGreaterThanOrEqual(1);
-
-        const [victim] = await queue.getJobsByWorkflowRun(victimRunId);
-        expect(victim?.status).toBe("PENDING");
-        expect(victim?.lockedAt).toBeNull();
-        expect(victim?.workerId).toBeNull();
-
-        const [survivor] = await queue.getJobsByWorkflowRun(survivorRunId);
-        expect(survivor?.status).toBe("RUNNING");
-        expect(survivor?.lockedAt).not.toBeNull();
-        expect(survivor?.id).toBe(survivorId);
-        expect(victim?.id).toBe(victimId);
       });
     });
   });

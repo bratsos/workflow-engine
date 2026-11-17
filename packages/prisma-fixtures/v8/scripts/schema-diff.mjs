@@ -7,9 +7,12 @@
 //   read by name);
 // - CURRENT_TIMESTAMP versus now(), which Prisma 7 and Prisma 8 write
 //   respectively for the same column default;
-// - the number in the `pg_attver` column option, which pg_dump prints for
-//   every column on Postgres 16.16: it is one value per database, so it
-//   differs between any two databases. The option itself is still compared.
+// - the number in the `pg_attver` column option. A Postgres 16.16 server
+//   stores one on every column (16.15 does not), and a pg_dump client older
+//   than 16.16 prints it as `ALTER COLUMN ... SET (pg_attver=<n>)`; pg_dump
+//   16.16 omits it. The number changes from one table creation to the next,
+//   so it differs between any two databases. The option itself is still
+//   compared.
 import { execFileSync } from "node:child_process";
 
 const [reference, candidate] = process.argv.slice(2);
