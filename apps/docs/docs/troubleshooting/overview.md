@@ -39,6 +39,7 @@ This guide covers common issues encountered when running **workflow-engine**, ho
   * It detects `RUNNING` runs that have had no database updates within the threshold (default: `max(3 * staleLeaseThresholdMs, 5 minutes)`).
   * Stuck runs are failed with the error code `STUCK_RUN_REAPED`. Their active child stages fail in the same transaction, with completion times and errors; terminal stages remain unchanged.
   * A run waiting on a `SUSPENDED` stage is not stuck: while that stage's `nextPollAt` is ahead, or came due less than one threshold ago, the run is left alone, so a long `ctx.step.sleep`, `waitFor` `every` or signal `keepalive` is safe.
+  * In a parallel group the same rule covers the whole run: while one stage waits this way, the run is not reaped even if a sibling stage has stopped making progress. The reap follows once the waiting stage resumes, or once its `nextPollAt` is more than one threshold behind. A `PENDING` sibling whose job was lost is still re-enqueued in the meantime.
 * **Manual Recovery**:
   * If a run was completed but failed to transition, you can manually trigger a transition:
     ```typescript
