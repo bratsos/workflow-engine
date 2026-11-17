@@ -3,17 +3,22 @@
  * stores them.
  *
  * Prisma 6 stores a `DateTime` in SQLite as integer epoch milliseconds,
- * Prisma 7 and 8 as ISO text. SQLite orders every integer before every text
- * value, so a comparison between a stored date of one kind and a bound
- * parameter of the other is decided by the type and not by the time: with a
- * file Prisma 6 wrote, a Prisma 7 client offers a run completed a moment ago
- * to `run.purge` and a run updated a moment ago to `run.reapStuck`, which act
- * on what they are offered. This module reads the storage class of the
- * oldest and the newest stored `workflow_runs.createdAt` and the storage class
- * this client binds for a `Date`, and throws before the adapter runs anything
- * if they differ. It names no Prisma major: the bound class is read off the
- * client itself, with the same `Date` parameter binding every model query
- * uses (checked on Prisma 6, 7 and 8).
+ * Prisma 7 as ISO text ending in `+00:00` and Prisma 8 as ISO text ending in
+ * `Z`. SQLite orders every integer before every text value, so a comparison
+ * between a stored date of one kind and a bound parameter of the other is
+ * decided by the type and not by the time: with a file Prisma 6 wrote, a
+ * Prisma 7 client offers a run completed a moment ago to `run.purge` and a
+ * run updated a moment ago to `run.reapStuck`, which act on what they are
+ * offered. Two text forms agree except at an exact instant (`+00:00` sorts
+ * before `Z`), which is the path a Prisma 7 to 8 upgrade takes.
+ *
+ * This module reads the oldest and the newest stored `workflow_runs.createdAt`
+ * and a `Date` as this client binds it, and throws before the adapter runs
+ * anything if the storage class differs or, when both are text, if the form
+ * differs (the text with every digit replaced: `9999-99-99T99:99:99.999Z`
+ * against `9999-99-99T99:99:99.999+99:99`). It names no Prisma major: what the
+ * client binds is read off the client itself, with the same `Date` parameter
+ * binding every model query uses (checked on Prisma 6, 7 and 8).
  *
  * Where it runs: the adapters that compare dates (`PrismaWorkflowPersistence`,
  * `PrismaJobQueue`) wrap every `async` method of their prototype with
@@ -33,13 +38,22 @@ export class SqliteDateStorageError extends Error {
   readonly code = "SQLITE_DATE_STORAGE_MISMATCH";
 
   constructor(
-    /** SQLite storage class of the stored dates that differ (`integer` or `text`). */
+    /**
+     * What the file stores: the SQLite storage class of the dates that differ
+     * (`integer` or `text`), with a sample value when both are text.
+     */
     readonly stored: string,
-    /** SQLite storage class this client binds for a `Date`. */
+    /** What this client binds for a `Date`, described the same way. */
     readonly bound: string,
+    /** `"class"`: integer against text. `"form"`: both text, written differently. */
+    readonly kind: "class" | "form" = "class",
   ) {
+    const why =
+      kind === "class"
+        ? "SQLite orders every integer before every text value, so each date comparison the engine sends (run.purge retention, run.reapStuck, suspended-stage polls, job leases) would be decided by the type and not by the time, and the engine would purge, reap or poll the wrong rows."
+        : "Two ISO text forms agree except at an exact instant, where the suffix decides (`+00:00` sorts before `Z`): a deadline, retention or stuck-run threshold that equals a stored time is compared wrongly, and an exact-time lookup finds nothing.";
     super(
-      `This SQLite file stores dates as ${stored}, but this Prisma client binds them as ${bound}: the file was written by a different Prisma major (Prisma 6 stores integer epoch milliseconds, Prisma 7 and 8 ISO text). SQLite orders every integer before every text value, so each date comparison the engine sends (run.purge retention, run.reapStuck, suspended-stage polls, job leases) would be decided by the type and not by the time, and the engine would purge, reap or poll the wrong rows. Nothing was read or written. Use the Prisma major that created the file, or start the new major from a fresh SQLite file and migrate the application data into it. See ${SQLITE_DATE_STORAGE_DOCS}`,
+      `This SQLite file stores dates as ${stored}, but this Prisma client binds them as ${bound}: the file was written by a different Prisma major (Prisma 6 stores integer epoch milliseconds, Prisma 7 ISO text ending in +00:00, Prisma 8 ISO text ending in Z). ${why} Nothing was read or written. Use the Prisma major that created the file, or start the new major from a fresh SQLite file and migrate the application data into it. See ${SQLITE_DATE_STORAGE_DOCS}`,
     );
     this.name = "SqliteDateStorageError";
   }
@@ -67,6 +81,9 @@ interface Probe {
   lo: string;
   hi: string;
   bound: string;
+  loValue: string | null;
+  hiValue: string | null;
+  boundValue: string | null;
 }
 
 /**
@@ -75,24 +92,43 @@ interface Probe {
  * majors wrote shows both classes), each answered by one lookup in the
  * `createdAt` index of `workflow_runs` (a subquery apiece: one statement with
  * both aggregates scans the index); `typeof` of a bound `Date` is what this
- * client stores.
- * `createdAt` is set by the client on every insert, never by a column default.
+ * client stores. The three values come back as text so the form of a text date
+ * can be compared. `createdAt` is set by the client on every insert, never by a
+ * column default.
  */
 async function probe(prisma: EnginePrismaClient): Promise<Probe | undefined> {
-  const run = rawFor(prisma, { lo: "text", hi: "text", bound: "text" });
+  const run = rawFor(prisma, {
+    lo: "text",
+    hi: "text",
+    bound: "text",
+    loValue: "text",
+    hiValue: "text",
+    boundValue: "text",
+  });
   if (!run.$queryRaw) return undefined;
   const rows = await run.$queryRaw<Probe[]>`
-    SELECT typeof((SELECT MIN("createdAt") FROM "workflow_runs")) AS lo,
-           typeof((SELECT MAX("createdAt") FROM "workflow_runs")) AS hi,
-           typeof(${new Date(0)}) AS bound`;
+    SELECT typeof(m.lo) AS lo, typeof(m.hi) AS hi, typeof(b.d) AS bound,
+           CAST(m.lo AS TEXT) AS loValue, CAST(m.hi AS TEXT) AS hiValue,
+           CAST(b.d AS TEXT) AS boundValue
+    FROM (SELECT (SELECT MIN("createdAt") FROM "workflow_runs") AS lo,
+                 (SELECT MAX("createdAt") FROM "workflow_runs") AS hi) AS m,
+         (SELECT ${new Date(0)} AS d) AS b`;
   return rows[0];
 }
+
+/** A text date with every digit replaced: what its form is, whatever the time. */
+const form = (value: string) => value.replace(/[0-9]/g, "9");
+
+/** What a refusal says about a stored or bound date: its class, and a sample when it is text. */
+const describe = (kind: string, value: string | null) =>
+  kind === "text" && value !== null ? `text like ${value}` : kind;
 
 /**
  * Resolves when the file may be used, rejects with {@link SqliteDateStorageError}
  * when it may not. An empty table (`typeof(NULL)` is `null`), a client with no
- * raw queries and a probe that fails (the schema is not pushed yet, the file is
- * busy) are not refusals; the failed probe is retried by the next call.
+ * raw queries, a probe that fails (the schema is not pushed yet, the file is
+ * busy) and a file of the same storage class and form are not refusals; the
+ * failed probe is retried by the next call.
  */
 export function verifySqliteDates(
   prisma: EnginePrismaClient,
@@ -107,11 +143,31 @@ export function verifySqliteDates(
       return;
     }
     if (!seen) return;
-    const stored = [seen.lo, seen.hi].find(
-      (kind) => kind !== "null" && kind !== seen.bound,
-    );
-    if (stored !== undefined)
-      throw new SqliteDateStorageError(stored, seen.bound);
+    const ends = [
+      { kind: seen.lo, value: seen.loValue },
+      { kind: seen.hi, value: seen.hiValue },
+    ].filter((end) => end.kind !== "null");
+    // Integer against text, or the other way round.
+    const other = ends.find((end) => end.kind !== seen.bound);
+    if (other !== undefined) {
+      throw new SqliteDateStorageError(other.kind, seen.bound);
+    }
+    // Both text, written differently (Prisma 7's `+00:00`, Prisma 8's `Z`).
+    const bound = seen.boundValue;
+    const differing =
+      seen.bound === "text" && typeof bound === "string"
+        ? ends.find(
+            (end) =>
+              typeof end.value === "string" && form(end.value) !== form(bound),
+          )
+        : undefined;
+    if (differing !== undefined) {
+      throw new SqliteDateStorageError(
+        describe("text", differing.value),
+        describe("text", seen.boundValue),
+        "form",
+      );
+    }
   })();
   return guard.verified;
 }

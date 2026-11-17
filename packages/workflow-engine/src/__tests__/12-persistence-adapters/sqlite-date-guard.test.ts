@@ -52,7 +52,23 @@ function fakeClient(answer: () => unknown) {
 }
 
 describe("sqlite date guard: the check", () => {
-  const probe = (lo: string, hi: string, bound: string) => [{ lo, hi, bound }];
+  const PLUS = "2026-11-17T16:48:54.224+00:00";
+  const ZED = "2026-11-17T16:48:54.224Z";
+  const probe = (
+    lo: string,
+    hi: string,
+    bound: string,
+    values: [string | null, string | null, string | null] = [PLUS, PLUS, PLUS],
+  ) => [
+    {
+      lo,
+      hi,
+      bound,
+      loValue: values[0],
+      hiValue: values[1],
+      boundValue: values[2],
+    },
+  ];
 
   it("refuses stored dates of the other storage class and names the cause", async () => {
     const { client } = fakeClient(() => probe("integer", "integer", "text"));
@@ -83,9 +99,49 @@ describe("sqlite date guard: the check", () => {
     }
   });
 
+  it("refuses text dates written in the other form (Prisma 7 against 8), either way round, and says so", async () => {
+    for (const [values, stored, bound] of [
+      [[PLUS, PLUS, ZED], PLUS, ZED],
+      [[ZED, ZED, PLUS], ZED, PLUS],
+      // Only the newest stored date differs from the oldest: a file two majors wrote.
+      [[PLUS, ZED, PLUS], ZED, PLUS],
+    ] as const) {
+      const { client } = fakeClient(() =>
+        probe("text", "text", "text", [...values] as [string, string, string]),
+      );
+      const error = await verifySqliteDates(
+        client,
+        sqliteDateGuard(client),
+      ).catch((e) => e);
+      expect(error).toBeInstanceOf(SqliteDateStorageError);
+      expect(error.kind).toBe("form");
+      expect(error.stored).toBe(`text like ${stored}`);
+      expect(error.bound).toBe(`text like ${bound}`);
+      expect(error.message).toContain("exact instant");
+      expect(error.message).toContain(SQLITE_DATE_STORAGE_DOCS);
+    }
+  });
+
+  it("does not refuse text dates of the same form at other times, or integers whatever their digits", async () => {
+    for (const answer of [
+      probe("text", "text", "text", [
+        "2026-01-02T03:04:05.006+00:00",
+        "2031-12-31T23:59:59.999+00:00",
+        "1970-01-01T00:00:00.000+00:00",
+      ]),
+      probe("text", "text", "text", [ZED, "2031-12-31T23:59:59.999Z", ZED]),
+      probe("integer", "integer", "integer", ["0", "1794934130124", "0"]),
+    ]) {
+      const { client } = fakeClient(() => answer);
+      await expect(
+        verifySqliteDates(client, sqliteDateGuard(client)),
+      ).resolves.toBeUndefined();
+    }
+  });
+
   it("does not refuse an empty table, a file of the same class or a client without raw queries", async () => {
     for (const answer of [
-      probe("null", "null", "text"),
+      probe("null", "null", "text", [null, null, PLUS]),
       probe("text", "text", "text"),
       probe("integer", "integer", "integer"),
       [],
@@ -282,6 +338,29 @@ describe.skipIf(!sqlite)(`sqlite date guard on Prisma ${major}`, () => {
     return file;
   }
 
+  /**
+   * A file this major wrote, whose text dates are then rewritten into the other
+   * text form (Prisma 7's `+00:00` into Prisma 8's `Z` and back), the older
+   * run's only when `mixed`. Prisma 6 stores integers, which have no text form.
+   */
+  async function otherFormFile(name: string, mixed = false) {
+    const file = join(directory, name);
+    const writer = await open(file);
+    const { persistence } = stack(writer);
+    await persistence.createRun(runInput("done"));
+    await new Promise((r) => setTimeout(r, 15));
+    await persistence.createRun(runInput("running"));
+    const where = mixed ? `id = 'done'` : "1 = 1";
+    for (const column of ["createdAt", "updatedAt"]) {
+      await writer.$executeRawUnsafe(
+        major === "7"
+          ? `UPDATE "workflow_runs" SET "${column}" = replace("${column}", '+00:00', 'Z') WHERE ${where}`
+          : `UPDATE "workflow_runs" SET "${column}" = replace("${column}", 'Z', '+00:00') WHERE ${where}`,
+      );
+    }
+    return file;
+  }
+
   beforeAll(async () => {
     directory = await mkdtemp(join(tmpdir(), `sqlite-date-guard-${major}-`));
   });
@@ -371,10 +450,48 @@ describe.skipIf(!sqlite)(`sqlite date guard on Prisma ${major}`, () => {
     );
   }, 60_000);
 
-  it("asks one cheap question: the probe is answered from an index", async () => {
+  it.skipIf(major === "6")(
+    "refuses a file whose text dates are in the other form, the path of a Prisma 7 to 8 upgrade",
+    async () => {
+      const { persistence, kernel } = stack(
+        await open(await otherFormFile("form.db"), true),
+      );
+      const error = await persistence.getRun("done").catch((e) => e);
+      expect(error).toBeInstanceOf(SqliteDateStorageError);
+      expect(error.kind).toBe("form");
+      expect(error.stored).toMatch(
+        major === "7" ? /text like .*Z$/ : /text like .*\+00:00$/,
+      );
+      expect(error.bound).toMatch(
+        major === "7" ? /text like .*\+00:00$/ : /text like .*Z$/,
+      );
+      await expect(
+        kernel.dispatch({
+          type: "run.reapStuck",
+          stuckThresholdMs: 3_600_000,
+        }),
+      ).rejects.toBeInstanceOf(SqliteDateStorageError);
+    },
+    60_000,
+  );
+
+  it.skipIf(major === "6")(
+    "refuses a file whose text dates are in both forms",
+    async () => {
+      const { persistence } = stack(
+        await open(await otherFormFile("form-mixed.db", true), true),
+      );
+      await expect(persistence.getRun("running")).rejects.toBeInstanceOf(
+        SqliteDateStorageError,
+      );
+    },
+    60_000,
+  );
+
+  it("asks one cheap question: the probe (this statement copies the guard's) is answered from an index", async () => {
     const client = await open(join(directory, "plan.db"));
     const rows = await rawFor(client, { detail: "text" }).$queryRawUnsafe(
-      `EXPLAIN QUERY PLAN SELECT typeof((SELECT MIN("createdAt") FROM "workflow_runs")) AS lo, typeof((SELECT MAX("createdAt") FROM "workflow_runs")) AS hi, typeof(0) AS bound`,
+      `EXPLAIN QUERY PLAN SELECT typeof(m.lo) AS lo, typeof(m.hi) AS hi, typeof(b.d) AS bound, CAST(m.lo AS TEXT) AS loValue, CAST(m.hi AS TEXT) AS hiValue, CAST(b.d AS TEXT) AS boundValue FROM (SELECT (SELECT MIN("createdAt") FROM "workflow_runs") AS lo, (SELECT MAX("createdAt") FROM "workflow_runs") AS hi) AS m, (SELECT 0 AS d) AS b`,
     );
     const plan = rows.map((r: any) => String(r.detail)).join("\n");
     expect(plan).toMatch(/SEARCH workflow_runs USING (COVERING )?INDEX/);
