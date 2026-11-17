@@ -65,13 +65,21 @@ function history(
   stages: AttemptStageInput[],
   events: AttemptEventInput[],
   steps: AttemptStepInput[] = [],
-  options: { redriveCount?: number; complete?: boolean } = {},
+  options: {
+    redriveCount?: number;
+    complete?: boolean;
+    caughtUp?: boolean;
+  } = {},
 ) {
   return buildStageAttemptHistory({
     redriveCount: options.redriveCount ?? 0,
     stages,
     steps,
-    stageEvents: { events, complete: options.complete ?? true },
+    stageEvents: {
+      events,
+      complete: options.complete ?? true,
+      ...(options.caughtUp === undefined ? {} : { caughtUp: options.caughtUp }),
+    },
   });
 }
 
@@ -259,7 +267,7 @@ describe("I want a stage's history grouped by attempt, and never grouped wrongly
     // Without a redrive the row would have counted the second attempt.
     expect(
       history([stage("a", "COMPLETED", 0)], events).get("rec-a"),
-    ).toMatchObject({ available: false, reason: "inconsistent" });
+    ).toMatchObject({ available: false, reason: "unproven-boundary" });
   });
 
   it("puts a step in no attempt when its last change matches none or two", () => {
@@ -323,9 +331,12 @@ describe("I want a stage's history grouped by attempt, and never grouped wrongly
     expect(reason(history(stages, events, [], { complete: false }))).toBe(
       "events-incomplete",
     );
+    expect(reason(history(stages, [], [], { caughtUp: false }))).toBe(
+      "events-loading",
+    );
     expect(reason(history(stages, []))).toBe("no-stage-events");
-    // The start was purged: the first retained event is the end.
-    expect(reason(history(stages, [events[1]!]))).toBe("history-gap");
+    // An end event for an attempt that never started contradicts the history.
+    expect(reason(history(stages, [events[1]!]))).toBe("unproven-boundary");
     // The row says FAILED, the events say COMPLETED.
     expect(reason(history([stage("a", "FAILED")], events))).toBe(
       "inconsistent",
@@ -341,7 +352,7 @@ describe("I want a stage's history grouped by attempt, and never grouped wrongly
           ev("a", "stage:completed", 10),
         ]),
       ),
-    ).toBe("inconsistent");
+    ).toBe("unproven-boundary");
     // A stage that has not run yet has no attempts and nothing to doubt.
     expect(
       available(history([stage("a", "PENDING")], []), "a").attempts,
@@ -475,24 +486,148 @@ describe("I want a stage's history grouped by attempt, and never grouped wrongly
     ).toMatchObject({ available: false, reason: "inconsistent" });
   });
 
-  it("does not guess when nothing proves where an execution ended", () => {
+  it("shows a second stage:started as a new attempt and the earlier one as having no recorded end", () => {
+    seq = 0;
+    const result = history(
+      [stage("a", "COMPLETED")],
+      [
+        ev("a", "stage:started", 0),
+        ev("a", "stage:started", 10),
+        ev("a", "stage:completed", 20),
+      ],
+      [
+        step("a", "inside-lost", 1, 1, 4),
+        step("a", "on-the-next-start", 2, 1, 10),
+        step("a", "inside-next", 3, 11, 15),
+      ],
+    );
+
+    const { attempts, unplacedSteps } = available(result, "a");
+    expect(attempts.map((x) => [x.trigger, x.outcome, x.executed])).toEqual([
+      ["initial", "lost", true],
+      ["redelivery", "completed", true],
+    ]);
+    // No end event: `endedAt` is null, the window closes where the next
+    // execution started, and the lost attempt carries no error.
+    expect(attempts[0]).toMatchObject({
+      endedAt: null,
+      windowEndedAt: at(10).toISOString(),
+      error: null,
+    });
+    expect(attempts[1]).toMatchObject({
+      startedAt: at(10).toISOString(),
+      endedAt: at(20).toISOString(),
+    });
+    // Steps are placed by time only; one on the shared instant is not guessed.
+    expect(attempts[0]!.steps.map((x) => x.stepId)).toEqual(["inside-lost"]);
+    expect(attempts[1]!.steps.map((x) => x.stepId)).toEqual(["inside-next"]);
+    expect(unplacedSteps.map((x) => x.stepId)).toEqual(["on-the-next-start"]);
+    // The engine does not count a re-delivery on the stage row: row attempt 0
+    // matches two executions of one attempt, row attempt 1 does not.
+    seq = 0;
+    expect(
+      history(
+        [stage("a", "COMPLETED", 1)],
+        [
+          ev("a", "stage:started", 0),
+          ev("a", "stage:started", 10),
+          ev("a", "stage:completed", 20),
+        ],
+      ).get("rec-a"),
+    ).toMatchObject({ available: false, reason: "unproven-boundary" });
+  });
+
+  it("chains re-deliveries and keeps a retry's own attempt count", () => {
+    seq = 0;
+    const result = history(
+      [stage("a", "COMPLETED", 1)],
+      [
+        ev("a", "stage:started", 0),
+        ev("a", "stage:started", 10),
+        ev("a", "stage:started", 20),
+        ev("a", "stage:retrying", 25, "boom"),
+        ev("a", "stage:started", 40),
+        ev("a", "stage:completed", 50),
+      ],
+    );
+    expect(
+      available(result, "a").attempts.map((x) => [x.trigger, x.outcome]),
+    ).toEqual([
+      ["initial", "lost"],
+      ["redelivery", "lost"],
+      ["redelivery", "retrying"],
+      ["job-retry", "completed"],
+    ]);
+  });
+
+  it("groups a stage failed while it waited, as an attempt that never started", () => {
+    seq = 0;
+    // A job retry was pending when `run.reapStuck` failed the stage.
+    const waiting = available(
+      history(
+        [stage("a", "FAILED")],
+        [
+          ev("a", "stage:started", 0),
+          ev("a", "stage:retrying", 5, "boom"),
+          ev(
+            "a",
+            "stage:failed",
+            60,
+            "Run stuck for >300000ms with no activity",
+          ),
+        ],
+      ),
+      "a",
+    ).attempts;
+    expect(waiting.map((x) => [x.trigger, x.outcome, x.executed])).toEqual([
+      ["initial", "retrying", true],
+      ["job-retry", "failed", false],
+    ]);
+    expect(waiting[1]).toMatchObject({
+      startedAt: at(60).toISOString(),
+      endedAt: at(60).toISOString(),
+      error: "Run stuck for >300000ms with no activity",
+    });
+    // A stage that never started at all.
+    seq = 0;
+    expect(
+      available(
+        history([stage("a", "FAILED")], [ev("a", "stage:failed", 60, "stuck")]),
+        "a",
+      ).attempts.map((x) => [x.trigger, x.outcome, x.executed]),
+    ).toEqual([["initial", "failed", false]]);
+    // After a redrive reopened it.
+    seq = 0;
+    expect(
+      available(
+        history(
+          [stage("a", "FAILED", 2)],
+          [
+            ev("a", "stage:started", 0),
+            ev("a", "stage:failed", 5, "boom"),
+            run("workflow:started", 10),
+            ev("a", "stage:failed", 70, "stuck"),
+          ],
+          [],
+          { redriveCount: 1 },
+        ),
+        "a",
+      ).attempts.map((x) => [x.trigger, x.outcome, x.executed]),
+    ).toEqual([
+      ["initial", "failed", true],
+      ["rerun", "failed", false],
+    ]);
+  });
+
+  it("falls back as unproven when the events contradict themselves", () => {
     const reason = (events: AttemptEventInput[], status = "COMPLETED") => {
       const entry = history([stage("a", status, 1)], events, [], {
         redriveCount: 1,
       }).get("rec-a")!;
       return entry.available ? "available" : entry.reason;
     };
-    // Started again with no stage event or cancel between: a worker crash
-    // and re-delivery, a reaped lease, or a purged event.
-    seq = 0;
-    expect(
-      reason([
-        ev("a", "stage:started", 0),
-        ev("a", "stage:started", 10),
-        ev("a", "stage:completed", 20),
-      ]),
-    ).toBe("unproven-boundary");
-    // The run restarted while an attempt was still open: its end is missing.
+    // The run restarted while an attempt was still open: a redrive takes only
+    // a run whose attempts all ended, so the history contradicts itself.
     seq = 0;
     expect(
       reason([
@@ -501,16 +636,40 @@ describe("I want a stage's history grouped by attempt, and never grouped wrongly
         ev("a", "stage:completed", 20),
       ]),
     ).toBe("unproven-boundary");
-    // The same stage started again in a poll-retry attempt is no exception.
+    // An end event for an attempt that is not open.
     seq = 0;
     expect(
       reason([
         ev("a", "stage:started", 0),
-        ev("a", "stage:suspended", 5),
-        ev("a", "stage:retrying", 8, "x"),
-        ev("a", "stage:started", 10),
+        ev("a", "stage:completed", 10),
         ev("a", "stage:completed", 20),
       ]),
+    ).toBe("unproven-boundary");
+    seq = 0;
+    expect(reason([ev("a", "stage:suspended", 5)])).toBe("unproven-boundary");
+    // A completed stage is terminal: nothing fails it without a redrive.
+    seq = 0;
+    expect(
+      reason(
+        [
+          ev("a", "stage:started", 0),
+          ev("a", "stage:completed", 10),
+          ev("a", "stage:failed", 20, "x"),
+        ],
+        "FAILED",
+      ),
+    ).toBe("unproven-boundary");
+    // A cancelled stage is terminal too.
+    seq = 0;
+    expect(
+      reason(
+        [
+          ev("a", "stage:started", 0),
+          run("workflow:cancelled", 10),
+          ev("a", "stage:failed", 20, "x"),
+        ],
+        "FAILED",
+      ),
     ).toBe("unproven-boundary");
   });
 
@@ -539,11 +698,17 @@ describe("I want the page to keep the events it has read and fold each poll into
       stageId: "a",
       error: null,
     }) satisfies AttemptEventInput;
-  const page = (after: number, last: number, complete = true) => ({
+  const page = (
+    after: number,
+    last: number,
+    complete = true,
+    more = false,
+  ) => ({
     events: Array.from({ length: last - after }, (_, i) => e(after + i + 1)),
     after,
     lastSequence: last,
     complete,
+    more,
   });
 
   it("holds a first read, appends each poll's rows once, and ignores a read that is not newer", () => {
@@ -568,5 +733,32 @@ describe("I want the page to keep the events it has read and fold each poll into
     // A read that starts past what is held leaves a gap.
     const held: HeldStageEvents = mergeStageEvents(null, page(0, 3));
     expect(mergeStageEvents(held, page(4, 6)).complete).toBe(false);
+  });
+
+  it("keeps asking from the last sequence until a long history has caught up, then is complete", () => {
+    const first = mergeStageEvents(null, page(0, 2, true, true));
+    expect(first).toMatchObject({
+      lastSequence: 2,
+      complete: true,
+      more: true,
+    });
+    const second = mergeStageEvents(first, page(2, 4, true, true));
+    expect(second.more).toBe(true);
+    const last = mergeStageEvents(second, page(4, 5));
+    expect(last.events.map((x) => x.sequence)).toEqual([1, 2, 3, 4, 5]);
+    expect(last).toMatchObject({
+      lastSequence: 5,
+      complete: true,
+      more: false,
+    });
+    // A reader that predates `more` is taken as caught up.
+    expect(
+      mergeStageEvents(null, {
+        events: [],
+        after: 0,
+        lastSequence: 0,
+        complete: true,
+      }).more,
+    ).toBe(false);
   });
 });

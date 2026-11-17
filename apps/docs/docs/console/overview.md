@@ -132,11 +132,15 @@ characters is cut by the read, and the page says so.
 
 The attempt boundaries are:
 
-- `stage:started` opens an attempt. It must find none open. A second
-  `stage:started` with no event between it and the first means an execution
-  ended or restarted without an event that says so (a worker crash and
-  re-delivery, a lease reaped by `lease.reapStale`, a purged event), and the
-  stage falls back instead of merging the two.
+- `stage:started` opens an attempt. A second `stage:started` while one is open
+  is itself the proof that a new execution began; what is not known is how the
+  earlier one ended, because a worker crash and re-delivery and a lease reaped
+  by `lease.reapStale` write no event. The earlier attempt is shown as *No end
+  recorded* (a lost worker or an expired lease, not failed and not cancelled),
+  its window closes where the next execution started, and the next attempt is
+  labelled a re-delivery. The page says that the steps of such a window are
+  placed by time only. The engine does not count a re-delivery on the stage's
+  `attempt`, so the count check leaves it out.
 - `stage:suspended` and the poll that later resumes the stage stay inside the
   open attempt.
 - `stage:completed` and `stage:failed` end it. A `stage:started` after either
@@ -152,12 +156,16 @@ The attempt boundaries are:
 - `workflow:started` is written by the first claim and by every redrive
   (`run.redrive`, `run.rerunFrom`). A redrive takes only a completed, failed or
   cancelled run, each of which ended its attempts with an event, so no attempt
-  is open there; if one is, the stage falls back. The next `stage:started` is a
+  is open there; if one is, the history contradicts itself and the stage falls
+  back. The next `stage:started` is a
   rerun, also for a stage that was waiting for a job retry when the run was
   cancelled.
 - `run.reapStuck` writes `stage:failed` for every unfinished stage, so a reaped
-  attempt ends as *failed*. A reaped stage that was waiting for a job retry has
-  no attempt open, and the stage falls back.
+  attempt ends as *failed*. A reaped stage that was waiting for a job retry (or
+  for a redrive's first job) has no attempt open: it is listed as a failed
+  attempt that never started, with the reaper's error, and it is not counted
+  against the stage's `attempt`. Any other end event with no attempt open, such
+  as a `stage:failed` for a stage that completed, contradicts the history.
 
 The ledger keeps only each step's latest state, so a step is listed under the
 one attempt whose time window contains the step row's `updatedAt`: the
@@ -173,14 +181,18 @@ stage timeline above and the step ledger below show its latest attempt) and
 says that the per-attempt history is unavailable, with the reason:
 
 - the events the page read are not an unbroken range of retained rows (events
-  were purged or are past retention) or were cut off by the read's limit of
-  2,000 events;
+  were purged or are past retention);
+- the page is still reading a long history: a read returns at most 2,000
+  events, and the page asks again from its last sequence until it has caught
+  up, so the history becomes available after a few refreshes;
 - the reader provides no stage events (a custom `ConsoleReadPort` written
   before this existed);
-- no lifecycle event of the stage is retained, the retained events are missing
-  a link, no event ends an execution before the next one starts, or they
-  disagree with the stage's current row (status, and the stage's `attempt`
-  count on a run that was never redriven).
+- no lifecycle event of the stage is retained;
+- the events contradict themselves (an end event for an attempt that never
+  started, a redrive over an attempt that never ended) or their attempts cannot
+  be reconciled with the stage's `attempt` count on a run that was never
+  redriven;
+- the events disagree with the stage's current row status.
 
 The events come from a separate read of the run's outbox, so the 200-row event
 table does not limit them, and only the stage id and the error are extracted
@@ -188,9 +200,11 @@ from each payload. The page keeps the events it has read and each refresh asks
 only for those after its last sequence (`GET /api/runs/:id?stageEventsAfter=N`):
 a refresh reads the rows the run wrote since the previous one, and only the
 first load goes through the run's rows, once. The cost of a refresh therefore
-does not grow with the number of outbox events the run has. A refresh that
-finds a purged or broken range keeps the history incomplete until the page is
-reloaded.
+does not grow with the number of outbox events the run has. A history of
+more than 2,000 events is read in chunks, each refresh continuing from the last
+sequence of the one before, and is complete once the page has caught up. A
+refresh that finds a purged or broken range keeps the history incomplete until
+the page is reloaded.
 
 ## Delivering a signal
 

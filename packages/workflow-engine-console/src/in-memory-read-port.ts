@@ -302,10 +302,10 @@ export class InMemoryConsoleReadPort implements ConsoleReadPort {
   }
 
   /**
-   * The same contract as the SQL reader: the events past `after`, the
-   * highest sequence of the run's rows, and whether that range is unbroken
-   * and within `STAGE_EVENT_LIMIT`. The rows of a run are the sequences of
-   * `events` and `stageEvents` together.
+   * The same contract as the SQL reader: the events past `after`, at most
+   * `STAGE_EVENT_LIMIT` of them (then `more`, ending at the last event), the
+   * highest sequence the read covers, and whether that range is unbroken. The
+   * rows of a run are the sequences of `events` and `stageEvents` together.
    */
   private stageEventLog(
     runId: string,
@@ -323,21 +323,31 @@ export class InMemoryConsoleReadPort implements ConsoleReadPort {
       ]),
     ].sort((a, b) => a - b);
     if (sequences.length === 0) {
-      return { events: [], after, lastSequence: after, complete: true };
+      return {
+        events: [],
+        after,
+        lastSequence: after,
+        complete: true,
+        more: false,
+      };
     }
-    const lastSequence = sequences[sequences.length - 1]!;
+    const more = history.length > STAGE_EVENT_LIMIT;
+    const events = history
+      .slice(0, STAGE_EVENT_LIMIT)
+      .map(({ workflowRunId: _runId, ...evt }) => ({
+        ...evt,
+        ...cutStageEventError(evt.error),
+      }));
+    const lastSequence = more
+      ? events[events.length - 1]!.sequence
+      : sequences[sequences.length - 1]!;
+    const covered = sequences.filter((seq) => seq <= lastSequence).length;
     return {
-      events: history
-        .slice(0, STAGE_EVENT_LIMIT)
-        .map(({ workflowRunId: _runId, ...evt }) => ({
-          ...evt,
-          ...cutStageEventError(evt.error),
-        })),
+      events,
       after,
       lastSequence,
-      complete:
-        history.length <= STAGE_EVENT_LIMIT &&
-        lastSequence - after === sequences.length,
+      complete: lastSequence - after === covered,
+      more,
     };
   }
 

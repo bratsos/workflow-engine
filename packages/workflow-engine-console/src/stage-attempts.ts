@@ -12,14 +12,22 @@
  *
  * Attempt boundaries, from a stage's events and the run's `workflow:*`
  * boundary events, in `sequence` order:
- *  - `stage:started` opens attempt N. It must find no attempt open: a second
- *    start with nothing between it and the first means an execution ended or
- *    restarted without an event that says so (a worker crash and re-delivery,
- *    a lease reaped by `lease.reapStale`, a purged event), and the stage is
- *    reported as `unproven-boundary` rather than guessed.
+ *  - `stage:started` opens attempt N. When an attempt is already open, the
+ *    second start is itself the proof that a new execution began; what is
+ *    unknown is how the earlier one ended (a worker crash and re-delivery, or
+ *    a lease reaped by `lease.reapStale`, both write no event). The earlier
+ *    attempt is closed as "lost" (no end recorded), its window ends at the
+ *    new start, and the new attempt is a "redelivery". The engine does not
+ *    count a re-delivery as an attempt of the stage row, so it is left out
+ *    of the row-count check.
  *  - `stage:suspended` and the poll that later resumes the stage stay inside
  *    the open attempt.
  *  - `stage:completed` and `stage:failed` close the attempt.
+ *  - `stage:failed` with no attempt open is a stage failed while it waited
+ *    for its next execution (`run.reapStuck` fails every unfinished stage): a
+ *    failed attempt that never started. Any other end event with no attempt
+ *    open, or `stage:failed` for a stage that was not waiting, contradicts
+ *    the history and is `unproven-boundary`.
  *  - `stage:retrying` closes the attempt as "retrying". If the stage was
  *    suspended when it fired, the retry happened in `stage.pollSuspended`:
  *    the stage stays SUSPENDED, no `stage:started` follows, and attempt N+1
@@ -31,10 +39,10 @@
  *  - `workflow:started` is emitted by the first claim and by every redrive
  *    (`run.redrive`, `run.rerunFrom`). It finds no attempt open, because a
  *    redrive takes only a COMPLETED, FAILED or CANCELLED run and each of those
- *    ends the attempts with an event; if one is open the stage is
- *    `unproven-boundary`. The `stage:started` that follows a redrive is a
- *    `rerun` attempt, also for a stage whose last attempt was a job retry
- *    that a cancel interrupted.
+ *    ends the attempts with an event; if one is open the history contradicts
+ *    itself and the stage is `unproven-boundary`. The `stage:started` that
+ *    follows a redrive is a `rerun` attempt, also for a stage whose last
+ *    attempt was a job retry that a cancel interrupted.
  *  - A `stage:started` after `stage:completed`, `stage:failed` or a
  *    cancelled attempt is a rerun (a redrive, or a fresh execution of a
  *    failed stage) and opens a new attempt.
@@ -42,7 +50,9 @@
  * Step rows carry no attempt marker of the stage, only `updatedAt`. A step
  * row records the step's latest state, so it is placed in the one attempt
  * whose window [start, end] contains `updatedAt`: the attempt in which the
- * step last changed, which is the attempt its status and error describe.
+ * step last changed, which is the attempt its status and error describe. The
+ * window of a "lost" attempt closes where the next execution started, so the
+ * steps placed in it are placed by time only.
  * A step that ran in an earlier attempt and again later appears only in the
  * later one (its `attempt` count says it executed more than once). A step
  * whose `updatedAt` is in no window, or on the boundary shared by two, is
@@ -92,6 +102,8 @@ export interface StageAttemptInput {
   stageEvents?: {
     events: readonly AttemptEventInput[];
     complete: boolean;
+    /** False while the page is still reading the run's events in chunks. */
+    caughtUp?: boolean;
   };
 }
 
@@ -100,8 +112,10 @@ export interface HeldStageEvents {
   events: readonly AttemptEventInput[];
   /** The highest outbox sequence read so far; the next read asks for rows after it. */
   lastSequence: number;
-  /** False once any read was not an unbroken range. Stays false for this view of the run. */
+  /** False once any chunk read was not an unbroken range. Stays false for this view of the run. */
   complete: boolean;
+  /** True while rows past `lastSequence` remain to be read (a read stops at the reader's limit). */
+  more: boolean;
 }
 
 /** One read of the run detail's `stageEvents`, as the server returns it. */
@@ -110,6 +124,8 @@ export interface StageEventPage {
   after: number;
   lastSequence: number;
   complete: boolean;
+  /** True when the read stopped at its limit and rows past `lastSequence` remain. */
+  more?: boolean;
 }
 
 /**
@@ -118,17 +134,21 @@ export interface StageEventPage {
  * nothing; events are appended by sequence, so a reader that ignores `after`
  * and returns the whole history adds each event once. A page that has
  * nothing held yet, or whose read starts past what is held, cannot vouch for
- * the rows before it and is incomplete.
+ * the rows before it and is incomplete. A read that stopped at the reader's
+ * limit leaves `more` true: the page asks again from `lastSequence` until it
+ * has caught up, and the history is complete only then.
  */
 export function mergeStageEvents(
   held: HeldStageEvents | null,
   page: StageEventPage,
 ): HeldStageEvents {
+  const more = page.more === true;
   if (held === null) {
     return {
       events: page.events,
       lastSequence: page.lastSequence,
       complete: page.after === 0 && page.complete,
+      more,
     };
   }
   if (page.lastSequence <= held.lastSequence) return held;
@@ -139,6 +159,7 @@ export function mergeStageEvents(
     ],
     lastSequence: page.lastSequence,
     complete: held.complete && page.complete && page.after <= held.lastSequence,
+    more,
   };
 }
 
@@ -148,23 +169,36 @@ export type AttemptOutcome =
   | "retrying"
   | "suspended"
   | "running"
-  | "cancelled";
+  | "cancelled"
+  /**
+   * No end was recorded: a second `stage:started` shows a new execution began
+   * (a lost worker or an expired lease) and nothing says how this one ended.
+   */
+  | "lost";
 
 /** Why an attempt began: its first run, or what the previous attempt ended with. */
-export type AttemptTrigger = "initial" | "job-retry" | "poll-retry" | "rerun";
+export type AttemptTrigger =
+  | "initial"
+  | "job-retry"
+  | "poll-retry"
+  | "rerun"
+  /** The same job ran again after a lost worker or an expired lease. */
+  | "redelivery";
 
 export type AttemptUnavailableReason =
   /** The reader returned no stage events. */
   | "no-event-history"
-  /** Events are purged, past retention, or were cut off by a read limit. */
+  /** Events are purged, past retention, or have a gap. */
   | "events-incomplete"
+  /** The page is still reading the run's events, a chunk per refresh. */
+  | "events-loading"
   /** The stage has run but no lifecycle event of it is retained. */
   | "no-stage-events"
-  /** The retained events are missing a link (they do not start at `stage:started`, or skip one). */
-  | "history-gap"
   /**
-   * An execution of the stage started again or the run restarted, and no
-   * event ends the previous execution: nothing proves where one attempt stops.
+   * The events contradict themselves, or their attempts cannot be reconciled
+   * with the stage row's attempt count: an end event for an execution that
+   * never started, a redrive over an attempt that never ended, a count the
+   * row does not agree with. Nothing proves where one attempt stops.
    */
   | "unproven-boundary"
   /** The events disagree with the stage's current row. */
@@ -204,8 +238,22 @@ export interface StageAttempt {
    * retry was recorded (the stage is replayed on a later poll).
    */
   startedAt: string;
-  /** ISO 8601 of the event that closed the attempt; null while it is open. */
+  /**
+   * ISO 8601 of the event that closed the attempt; null while it is open and
+   * for a "lost" attempt, whose end was never recorded.
+   */
   endedAt: string | null;
+  /**
+   * ISO 8601 of where the attempt's window for placing steps closes: the
+   * closing event, or for a "lost" attempt the start of the next execution.
+   * Null while the attempt is open.
+   */
+  windowEndedAt: string | null;
+  /**
+   * False for a failed attempt that never started: the stage was failed while
+   * it waited for its next execution (for example by `run.reapStuck`).
+   */
+  executed: boolean;
   outcome: AttemptOutcome;
   /** The error of the event that closed the attempt (`stage:retrying` or `stage:failed`). */
   error: string | null;
@@ -232,7 +280,11 @@ export type StageAttemptHistory =
 interface Work {
   trigger: AttemptTrigger;
   startMs: number;
+  /** Where the window for placing steps closes; null while open. */
   endMs: number | null;
+  /** False when `endMs` is only where the next execution started. */
+  endRecorded: boolean;
+  executed: boolean;
   outcome: AttemptOutcome | null;
   error: string | null;
   errorTruncated: boolean;
@@ -298,6 +350,8 @@ function historyForStage(
       trigger,
       startMs,
       endMs: null,
+      endRecorded: true,
+      executed: true,
       outcome: null,
       error: null,
       errorTruncated: false,
@@ -314,6 +368,10 @@ function historyForStage(
   // CANCELLED with a closed last attempt, which only this sequence explains.
   let redriven = false;
   let cancelledIdle = false;
+  // The stage is PENDING between executions: before its first start, after a
+  // job retry, or after a redrive reopened it. Only then can a `stage:failed`
+  // arrive with no attempt open (`run.reapStuck` fails every unfinished stage).
+  let waiting = true;
 
   for (const event of events) {
     const at = toMs(event.occurredAt);
@@ -338,28 +396,54 @@ function historyForStage(
         } else if (redriven) {
           cancelledIdle = true;
         }
+        waiting = false;
       } else if (event.eventType === "workflow:started") {
         if (open !== null) return unavailable("unproven-boundary");
         if (attempts.length > 0) {
           next = "rerun";
           redriven = true;
           cancelledIdle = false;
+          waiting = true;
         }
       }
       continue;
     }
 
     if (event.eventType === "stage:started") {
-      if (open !== null) return unavailable("unproven-boundary");
-      open = newAttempt(next, at);
+      let trigger: AttemptTrigger = next;
+      if (open !== null) {
+        // A second start is the proof that a new execution began; nothing
+        // says how the earlier one ended, so its window closes here.
+        open.endMs = at;
+        open.endRecorded = false;
+        open.outcome = "lost";
+        trigger = "redelivery";
+      }
+      open = newAttempt(trigger, at);
       open.events.push(entry);
       suspended = false;
       redriven = false;
       cancelledIdle = false;
+      waiting = false;
       continue;
     }
 
-    if (open === null) return unavailable("history-gap");
+    if (open === null) {
+      // A stage failed while it waited for its next execution never started.
+      if (event.eventType !== "stage:failed" || !waiting) {
+        return unavailable("unproven-boundary");
+      }
+      const never = newAttempt(next, at);
+      never.executed = false;
+      never.events.push(entry);
+      never.endMs = at;
+      never.outcome = "failed";
+      never.error = event.error;
+      never.errorTruncated = event.errorTruncated === true;
+      waiting = false;
+      next = "rerun";
+      continue;
+    }
     open.events.push(entry);
 
     if (event.eventType === "stage:suspended") {
@@ -374,6 +458,7 @@ function historyForStage(
       } else {
         open = null;
         next = "job-retry";
+        waiting = true;
       }
     } else if (
       event.eventType === "stage:failed" ||
@@ -387,12 +472,13 @@ function historyForStage(
       open = null;
       suspended = false;
       next = "rerun";
+      waiting = false;
     }
   }
 
   // An attempt still open takes its outcome from the stage's row.
   const last = attempts[attempts.length - 1];
-  if (!last) return unavailable("history-gap");
+  if (!last) return unavailable("unproven-boundary");
   if (last.endMs === null) {
     const live: Record<string, AttemptOutcome | undefined> = {
       RUNNING: "running",
@@ -418,12 +504,17 @@ function historyForStage(
   }
 
   // Without a redrive the row's attempt starts at 0 and gains exactly 1 per
-  // retry, so it must equal the events' count. A redrive breaks that in both
-  // directions (it numbers a reopened row one past the highest in its
-  // execution group, and recreates the rows of later stages at 0), so after
-  // one the events' completeness is what is relied on.
-  if (redriveCount === 0 && stage.attempt !== attempts.length - 1)
-    return unavailable("inconsistent");
+  // retry, so it must equal the events' count of attempts the engine counts:
+  // a re-delivery does not bump the row, and an attempt that never started
+  // has no execution to count. A redrive breaks the rule in both directions
+  // (it numbers a reopened row one past the highest in its execution group,
+  // and recreates the rows of later stages at 0), so after one the events'
+  // completeness is what is relied on.
+  const counted = attempts.filter(
+    (attempt) => attempt.executed && attempt.trigger !== "redelivery",
+  ).length;
+  if (redriveCount === 0 && stage.attempt !== Math.max(0, counted - 1))
+    return unavailable("unproven-boundary");
 
   const placed: AttemptStepEntry[][] = attempts.map(() => []);
   const unplacedSteps: AttemptStepEntry[] = [];
@@ -449,7 +540,12 @@ function historyForStage(
       number: index + 1,
       trigger: attempt.trigger,
       startedAt: iso(attempt.startMs),
-      endedAt: attempt.endMs === null ? null : iso(attempt.endMs),
+      endedAt:
+        attempt.endMs === null || !attempt.endRecorded
+          ? null
+          : iso(attempt.endMs),
+      windowEndedAt: attempt.endMs === null ? null : iso(attempt.endMs),
+      executed: attempt.executed,
       outcome: attempt.outcome!,
       error: attempt.error,
       errorTruncated: attempt.errorTruncated,
@@ -472,6 +568,12 @@ export function buildStageAttemptHistory(
         stageRecordId: stage.id,
         available: false,
         reason: "no-event-history",
+      });
+    } else if (log.caughtUp === false) {
+      result.set(stage.id, {
+        stageRecordId: stage.id,
+        available: false,
+        reason: "events-loading",
       });
     } else if (!log.complete) {
       result.set(stage.id, {

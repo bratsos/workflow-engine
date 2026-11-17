@@ -134,6 +134,12 @@ function shape(snap: Snapshot, stageId: string) {
     : `unavailable:${history.reason}`;
 }
 
+function attemptsOf(snap: Snapshot, stageId: string) {
+  const history = snap.histories.get(snap.stageIds[stageId]!)!;
+  if (!history.available) throw new Error("unavailable");
+  return history.attempts;
+}
+
 function eventsOf(snap: Snapshot, stageId: string, attempt: number) {
   const history = snap.histories.get(snap.stageIds[stageId]!)!;
   if (!history.available) throw new Error("unavailable");
@@ -470,7 +476,7 @@ describe("I want a cancelled or restarted stage never shown as one attempt with 
     ]);
   });
 
-  it("run.reapStuck of a stage waiting for a job retry has no attempt to close and is unavailable", async () => {
+  it("run.reapStuck of a stage waiting for a job retry shows a failed attempt that never started", async () => {
     let calls = 0;
     const flaky = defineStage({
       id: "flaky",
@@ -509,10 +515,22 @@ describe("I want a cancelled or restarted stage never shown as one attempt with 
 
     const failed = await snapshot(h, runId);
     expect(failed.stageStatus.flaky).toBe("FAILED");
-    expect(shape(failed, "flaky")).toBe("unavailable:history-gap");
+    expect(shape(failed, "flaky")).toEqual([
+      ["initial", "retrying"],
+      ["job-retry", "failed"],
+    ]);
+    const attempts = attemptsOf(failed, "flaky");
+    expect(attempts.map((a) => a.executed)).toEqual([true, false]);
+    expect(attempts[1]!.error).toMatch(/Run stuck for >300000ms/);
+    expect(attempts[1]!.events.map((e) => e.eventType)).toEqual([
+      "stage:failed",
+    ]);
   });
 
-  it("a stage started again after its worker died and its lease was reaped is unavailable, not one attempt", async () => {
+  it.each([
+    ["its lease was reaped", "lease"],
+    ["the host requeued its job after the worker crashed", "crash"],
+  ] as const)("a stage started again after %s shows the earlier execution as lost and the re-delivery as its own attempt", async (_name, route) => {
     let calls = 0;
     const slow = defineStage({
       id: "slow",
@@ -520,6 +538,7 @@ describe("I want a cancelled or restarted stage never shown as one attempt with 
       schemas,
       async execute(ctx: any) {
         calls++;
+        await ctx.step.run("fetch", async () => "fetched");
         // The first worker never comes back.
         if (calls === 1) await new Promise(() => {});
         return { output: ctx.input };
@@ -543,22 +562,52 @@ describe("I want a cancelled or restarted stage never shown as one attempt with 
 
     const first = await h.jobQueue.dequeue();
     void execute(first);
-    while (!(await h.persistence.getStage(runId, "slow"))) {
-      await new Promise((resolve) => setTimeout(resolve, 1));
-    }
-    // The worker stopped heartbeating ten minutes ago.
-    h.jobQueue.setJobLockedAt(first.jobId, new Date(Date.now() - 10 * 60_000));
-    const reaped = await h.kernel.dispatch({
-      type: "lease.reapStale",
-      staleThresholdMs: 60_000,
+    const waitFor = async (done: () => Promise<boolean>) => {
+      while (!(await done())) await new Promise((r) => setTimeout(r, 1));
+    };
+    await waitFor(async () => {
+      const stage = await h.persistence.getStage(runId, "slow");
+      return stage ? (await h.stepLedger.list(stage.id)).length === 1 : false;
     });
-    expect(reaped.released).toBe(1);
-    await execute(await h.jobQueue.dequeue());
+    h.clock.advance(5_000);
+    if (route === "lease") {
+      // The worker stopped heartbeating ten minutes ago.
+      h.jobQueue.setJobLockedAt(
+        first.jobId,
+        new Date(Date.now() - 10 * 60_000),
+      );
+      const reaped = await h.kernel.dispatch({
+        type: "lease.reapStale",
+        staleThresholdMs: 60_000,
+      });
+      expect(reaped.released).toBe(1);
+    } else {
+      // What a host does when the worker process dies mid-execution.
+      await h.jobQueue.fail(first.jobId, "worker crashed", true);
+    }
+    const second = await h.jobQueue.dequeue();
+    expect(second.jobId).toBe(first.jobId);
+    await execute(second);
 
     const redelivered = await snapshot(h, runId);
     expect(
       redelivered.events.filter((e) => e.eventType === "stage:started"),
     ).toHaveLength(2);
-    expect(shape(redelivered, "slow")).toBe("unavailable:unproven-boundary");
+    expect(redelivered.stageStatus.slow).toBe("COMPLETED");
+    expect(shape(redelivered, "slow")).toEqual([
+      ["initial", "lost"],
+      ["redelivery", "completed"],
+    ]);
+    const [lost, again] = attemptsOf(redelivered, "slow");
+    // No end event: the window closes where the re-delivery started, and the
+    // step the first execution wrote is placed in it by time.
+    expect(lost).toMatchObject({
+      endedAt: null,
+      windowEndedAt: again!.startedAt,
+      error: null,
+    });
+    expect(lost!.events.map((e) => e.eventType)).toEqual(["stage:started"]);
+    expect(lost!.steps.map((x) => x.stepId)).toEqual(["fetch"]);
+    expect(again!.steps).toEqual([]);
   });
 });

@@ -481,6 +481,7 @@ if (!DATABASE_URL) {
         after: 0,
         lastSequence: 9,
         complete: true,
+        more: false,
       });
       expect(retried.events).toHaveLength(9);
       expect(JSON.stringify(retried)).not.toContain("do-not-read");
@@ -493,11 +494,18 @@ if (!DATABASE_URL) {
         after: 5,
         lastSequence: 9,
         complete: true,
+        more: false,
       });
       expect(
         (await reader().getRunDetail("run-retried", { stageEventsAfter: 9 }))
           ?.stageEvents,
-      ).toEqual({ events: [], after: 9, lastSequence: 9, complete: true });
+      ).toEqual({
+        events: [],
+        after: 9,
+        lastSequence: 9,
+        complete: true,
+        more: false,
+      });
 
       expect(
         (await reader().getRunDetail("run-purged"))?.stageEvents?.complete,
@@ -563,7 +571,7 @@ if (!DATABASE_URL) {
       expect(Math.max(...errors.map((error) => [...error].length))).toBe(2001);
     });
 
-    it("reports a run with more lifecycle events than the read's limit as incomplete", async () => {
+    it("reads a run with more lifecycle events than the limit in chunks, each unbroken, until it has caught up", async () => {
       await prisma.workflowRun.createMany({
         data: [mkRun("run-many", at(-9_004), "RUNNING", "wf-d")],
       });
@@ -572,9 +580,22 @@ if (!DATABASE_URL) {
 SELECT 'many-' || g, 'run-many', g, 'stage:started', jsonb_build_object('stageId', 's' || g), 'c', now()
 FROM generate_series(1, 2001) g`,
       );
-      const log = (await reader().getRunDetail("run-many"))!.stageEvents!;
-      expect(log.events).toHaveLength(2000);
-      expect(log).toMatchObject({ lastSequence: 2001, complete: false });
+      const first = (await reader().getRunDetail("run-many"))!.stageEvents!;
+      expect(first.events).toHaveLength(2000);
+      expect(first).toMatchObject({
+        lastSequence: 2000,
+        complete: true,
+        more: true,
+      });
+      const rest = (await reader().getRunDetail("run-many", {
+        stageEventsAfter: first.lastSequence,
+      }))!.stageEvents!;
+      expect(rest.events.map((e) => e.sequence)).toEqual([2001]);
+      expect(rest).toMatchObject({
+        lastSequence: 2001,
+        complete: true,
+        more: false,
+      });
     });
 
     it("does not skip a row committed between its two statements", async () => {
@@ -678,6 +699,10 @@ FROM generate_series(1, ${rows}) g`,
         poll.push(await measure(`run-plan-${rows}`, rows - 10));
       }
       const first = await measure("run-plan-30000");
+      // Nothing new: the highest-sequence probe answers and no range is read.
+      const idle = await measure("run-plan-30000", 30_000);
+      expect(idle.statements).toBe(poll[1]!.statements - 2);
+      expect(idle.buffers).toBeLessThan(poll[1]!.buffers);
 
       // Ten new rows: the same statements, the same few pages, at 1,000 and
       // at 30,000 rows (one more index level at most).

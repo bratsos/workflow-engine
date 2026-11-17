@@ -213,23 +213,31 @@ export function cutStageEventError(text: string | null): {
 /**
  * The attempt history's input: the stage lifecycle events and run-level
  * boundary events of a run with a sequence greater than `after`. The page
- * keeps what it has read and asks only for the rows after its last
- * sequence, so one read costs the new rows of the run, never all of them.
+ * keeps what it has read and asks only for the rows after its last sequence,
+ * so one read costs the new rows of the run, never all of them. A read
+ * returns at most `STAGE_EVENT_LIMIT` events; when more remain it stops there
+ * (`more`) and the page asks again from `lastSequence`, so a long history is
+ * read in chunks over a few refreshes.
  */
 export interface StageEventLog {
   /** Ascending by sequence, at most `STAGE_EVENT_LIMIT`. */
   events: StageEvent[];
   /** The `stageEventsAfter` this read was made with; 0 for a first read. */
   after: number;
-  /** The highest outbox sequence of the run seen by this read; `after` when no row is newer. */
+  /**
+   * The highest outbox sequence this read covers: the run's highest sequence,
+   * or when the read stopped at its limit, the sequence of its last event.
+   * `after` when no row is newer.
+   */
   lastSequence: number;
   /**
    * True only when the retained rows in `(after, lastSequence]` are one
-   * unbroken range and no event in it was cut off by `STAGE_EVENT_LIMIT`.
-   * False means events were purged, are past retention, or were truncated,
-   * and a grouping built from them could be wrong.
+   * unbroken range. False means events were purged or are past retention, and
+   * a grouping built from them could be wrong.
    */
   complete: boolean;
+  /** True when the read stopped at `STAGE_EVENT_LIMIT` and rows past `lastSequence` remain. */
+  more: boolean;
 }
 
 export interface RunDetail {

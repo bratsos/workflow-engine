@@ -485,6 +485,11 @@
   color: var(--wc-status-skipped-text);
 }
 
+#workflow-console .pill-lost {
+  background-color: var(--wc-status-skipped-bg);
+  color: var(--wc-status-skipped-text);
+}
+
 #workflow-console .pill-retrying {
   background-color: var(--wc-status-retrying-bg);
   color: var(--wc-status-retrying-text);

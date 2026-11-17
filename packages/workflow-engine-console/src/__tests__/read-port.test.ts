@@ -366,6 +366,7 @@ describe("in-memory read port: run detail", () => {
       after: 0,
       lastSequence: 3,
       complete: false,
+      more: false,
     });
     // After them the range is unbroken.
     expect(
@@ -376,7 +377,13 @@ describe("in-memory read port: run detail", () => {
     expect(
       (await reader.getRunDetail("run-1", { stageEventsAfter: 3 }))
         ?.stageEvents,
-    ).toEqual({ events: [], after: 3, lastSequence: 3, complete: true });
+    ).toEqual({
+      events: [],
+      after: 3,
+      lastSequence: 3,
+      complete: true,
+      more: false,
+    });
 
     const whole = createInMemoryConsoleReadPort({
       ...fixtures,
@@ -394,7 +401,7 @@ describe("in-memory read port: run detail", () => {
     });
   });
 
-  it("applies the SQL reader's limit and error cap to the attempt history's events", async () => {
+  it("applies the SQL reader's chunk limit and error cap to the attempt history's events", async () => {
     const stageEvent = (sequence: number, error: string | null = null) => ({
       workflowRunId: "run-1",
       sequence,
@@ -410,9 +417,24 @@ describe("in-memory read port: run detail", () => {
         stageEvent(i + 1),
       ),
     });
+    // The first read stops at the limit and says more remain; the next read
+    // starts after its last event and finishes the history, each unbroken.
     const cut = (await many.getRunDetail("run-1"))!.stageEvents!;
     expect(cut.events).toHaveLength(STAGE_EVENT_LIMIT);
-    expect(cut.complete).toBe(false);
+    expect(cut).toMatchObject({
+      lastSequence: STAGE_EVENT_LIMIT,
+      complete: true,
+      more: true,
+    });
+    const rest = (await many.getRunDetail("run-1", {
+      stageEventsAfter: cut.lastSequence,
+    }))!.stageEvents!;
+    expect(rest.events.map((e) => e.sequence)).toEqual([STAGE_EVENT_LIMIT + 1]);
+    expect(rest).toMatchObject({
+      lastSequence: STAGE_EVENT_LIMIT + 1,
+      complete: true,
+      more: false,
+    });
 
     const exact = createInMemoryConsoleReadPort({
       ...fixtures,
@@ -421,9 +443,10 @@ describe("in-memory read port: run detail", () => {
         stageEvent(i + 1),
       ),
     });
-    expect((await exact.getRunDetail("run-1"))!.stageEvents!.complete).toBe(
-      true,
-    );
+    expect((await exact.getRunDetail("run-1"))!.stageEvents!).toMatchObject({
+      complete: true,
+      more: false,
+    });
 
     const long = createInMemoryConsoleReadPort({
       ...fixtures,

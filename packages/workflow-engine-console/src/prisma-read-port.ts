@@ -167,10 +167,8 @@ const STAGE_EVENT_COLUMNS: RawColumns = {
   stageId: "text",
   error: "text",
 };
-const EVENT_RANGE_COLUMNS: RawColumns = {
-  maxSeq: "int",
-  total: "bigint",
-};
+const EVENT_TOP_COLUMNS: RawColumns = { maxSeq: "int" };
+const EVENT_COUNT_COLUMNS: RawColumns = { total: "bigint" };
 const SUSPENDED_STAGE_COLUMNS: RawColumns = {
   id: "text",
   workflowRunId: "text",
@@ -365,8 +363,11 @@ interface RawStageEventRow {
   error: string | null;
 }
 
-interface RawEventRangeRow {
+interface RawEventTopRow {
   maxSeq: number | bigint | null;
+}
+
+interface RawEventCountRow {
   total: number | bigint | null;
 }
 
@@ -698,7 +699,7 @@ export class PrismaConsoleReadPort implements ConsoleReadPort {
    *
    * The callback receives the client to issue statements on, and every read
    * that needs more than one statement issues all of them here, inside a
-   * single transaction — a run-detail page is up to eight queries, and giving
+   * single transaction — a run-detail page is up to nine queries, and giving
    * each its own interactive transaction would take that many connections out
    * of the consumer's pool to render one page. One transaction also means the
    * results are a coherent snapshot rather than separate moments.
@@ -858,15 +859,18 @@ LIMIT ${limit + 1}`;
    * The attempt history's events of one run with a sequence above `after`.
    *
    * What a read costs follows the run's rows past `after`, never the run's
-   * total: both statements are range scans on the `(workflowRunId, sequence)`
+   * total: every statement is a range scan on the `(workflowRunId, sequence)`
    * unique index. `eventType` has no index, so the lifecycle statement still
-   * filters the heap rows of that range, which is why the page passes the
-   * last sequence it has read: a poll reads the rows written since the
-   * previous one, and only a first read goes through the whole run, once.
+   * filters the heap rows of its range, which is why the page passes the last
+   * sequence it has read: a poll reads the rows written since the previous
+   * one, and only a first read goes through the whole run, once.
    *
-   * The range is closed at the highest sequence the first statement saw, so
-   * a row committed between the two statements cannot be skipped by the
-   * page's next read (the transaction is READ COMMITTED on Postgres).
+   * The read is closed at the run's highest sequence, taken first: the
+   * transaction is READ COMMITTED on Postgres, so a row committed between the
+   * statements must not be skipped by the page's next read. At most
+   * `STAGE_EVENT_LIMIT` events come back; when more match, the read ends at
+   * its last event and says `more`, and the page asks again from there. The
+   * range check counts only the rows the read covers.
    */
   private async readStageEvents(
     client: ConsolePrismaClient,
@@ -876,21 +880,22 @@ LIMIT ${limit + 1}`;
     const after = Number.isFinite(afterRaw)
       ? Math.min(Math.max(0, Math.floor(afterRaw)), 2_147_483_647)
       : 0;
-    // The rows past `after`: how many, and the highest sequence. With no
-    // gap they are exactly `after + 1 .. maxSeq`, so a count equal to
-    // `maxSeq - after` says the range is unbroken without reading a row.
-    const rangeRows = await this.select<RawEventRangeRow>(
+    const top = await this.select<RawEventTopRow>(
       client,
-      EVENT_RANGE_COLUMNS,
-      `SELECT max(sequence) AS "maxSeq", count(*) AS total
-FROM "outbox_events" WHERE "workflowRunId" = ${this.param(1)} AND sequence > ${this.param(2)}`,
-      [runId, after],
+      EVENT_TOP_COLUMNS,
+      `SELECT max(sequence) AS "maxSeq" FROM "outbox_events" WHERE "workflowRunId" = ${this.param(1)}`,
+      [runId],
     );
-    const total = toNumber(rangeRows[0]?.total);
-    if (total === 0) {
-      return { events: [], after, lastSequence: after, complete: true };
+    const maxSeq = toNumber(top[0]?.maxSeq);
+    if (maxSeq <= after) {
+      return {
+        events: [],
+        after,
+        lastSequence: after,
+        complete: true,
+        more: false,
+      };
     }
-    const lastSequence = toNumber(rangeRows[0]?.maxSeq);
 
     // Two payload fields are extracted in SQL and nothing else of the payload
     // is read (`workflow:completed` carries the run's output). The error text
@@ -913,14 +918,28 @@ WHERE "workflowRunId" = ${this.param(1)} AND sequence > ${this.param(2)} AND seq
   AND "eventType" IN (${types})
 ORDER BY sequence ASC
 LIMIT ${STAGE_EVENT_LIMIT + 1}`,
+      [runId, after, maxSeq],
+    );
+    const more = rows.length > STAGE_EVENT_LIMIT;
+    const events = rows.slice(0, STAGE_EVENT_LIMIT).map(mapStageEvent);
+    const lastSequence = more ? events[events.length - 1]!.sequence : maxSeq;
+
+    // With no gap the rows in `(after, lastSequence]` are exactly
+    // `after + 1 .. lastSequence`, so a count equal to the difference says the
+    // range is unbroken. It reads the index entries of this read's range only.
+    const counted = await this.select<RawEventCountRow>(
+      client,
+      EVENT_COUNT_COLUMNS,
+      `SELECT count(*) AS total FROM "outbox_events"
+WHERE "workflowRunId" = ${this.param(1)} AND sequence > ${this.param(2)} AND sequence <= ${this.param(3)}`,
       [runId, after, lastSequence],
     );
     return {
-      events: rows.slice(0, STAGE_EVENT_LIMIT).map(mapStageEvent),
+      events,
       after,
       lastSequence,
-      complete:
-        rows.length <= STAGE_EVENT_LIMIT && lastSequence - after === total,
+      complete: lastSequence - after === toNumber(counted[0]?.total),
+      more,
     };
   }
 

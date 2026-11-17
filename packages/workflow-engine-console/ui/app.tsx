@@ -146,6 +146,7 @@ interface RunDetail {
     after: number;
     lastSequence: number;
     complete: boolean;
+    more: boolean;
   };
   truncated: {
     steps: boolean;
@@ -897,6 +898,7 @@ const OUTCOME_LABEL: Record<AttemptOutcome, string> = {
   suspended: "Suspended",
   running: "Running",
   cancelled: "Cancelled",
+  lost: "No end recorded",
 };
 
 const TRIGGER_LABEL: Record<AttemptTrigger, string> = {
@@ -904,16 +906,16 @@ const TRIGGER_LABEL: Record<AttemptTrigger, string> = {
   "job-retry": "Job retry",
   "poll-retry": "Retry while suspended (replayed on a poll)",
   rerun: "Rerun after a terminal outcome (redrive)",
+  redelivery: "Re-delivery after a lost worker or an expired lease",
 };
 
 const UNAVAILABLE_LABEL: Record<AttemptUnavailableReason, string> = {
   "no-event-history": "this reader does not provide stage events",
-  "events-incomplete":
-    "the run's events are incomplete (purged, past retention, or cut off by a read limit)",
+  "events-incomplete": "the run's events are incomplete (purged or past retention)",
+  "events-loading": "the run's events are still being read, 2,000 per refresh",
   "no-stage-events": "no lifecycle events of this stage are retained",
-  "history-gap": "the retained events of this stage are missing a link",
   "unproven-boundary":
-    "an execution of this stage started again and no event ends the one before it (a worker crash and re-delivery, a reaped lease, or a purged event)",
+    "the retained events contradict themselves or cannot be reconciled with the stage's attempt count, so nothing proves where one attempt stops",
   inconsistent: "the retained events do not agree with the stage's current record",
 };
 
@@ -962,6 +964,7 @@ function AttemptItem({
   const [open, setOpen] = useState(defaultOpen);
   const duration =
     attempt.endedAt === null ? null : Date.parse(attempt.endedAt) - Date.parse(attempt.startedAt);
+  const lost = attempt.outcome === "lost";
   return (
     <li class="attempt">
       <details
@@ -977,6 +980,8 @@ function AttemptItem({
             {" → "}
             {attempt.endedAt ? (
               <time dateTime={attempt.endedAt}>{formatAbsolute(attempt.endedAt)}</time>
+            ) : lost ? (
+              "no end recorded"
             ) : (
               "in progress"
             )}
@@ -984,6 +989,27 @@ function AttemptItem({
           </span>
         </summary>
         <div class="attempt-body">
+          {lost && attempt.windowEndedAt && (
+            <p class="attempt-note" role="note">
+              No event records how this execution ended: its worker was lost or its lease expired,
+              and the same job ran again at{" "}
+              <time dateTime={attempt.windowEndedAt}>{formatAbsolute(attempt.windowEndedAt)}</time>.
+              The window of this attempt closes there, so the steps listed below are placed in it by
+              time only.
+            </p>
+          )}
+          {!attempt.executed && (
+            <p class="attempt-note" role="note">
+              This attempt never started: the stage was failed while it waited for its next
+              execution (for example by <code>run.reapStuck</code>).
+            </p>
+          )}
+          {attempt.trigger === "redelivery" && (
+            <p class="attempt-note" role="note">
+              The earlier execution of this stage has no recorded end; steps that changed near the
+              start of this attempt are placed by time only.
+            </p>
+          )}
           {attempt.error && (
             <p class="attempt-error">
               <strong>Error:</strong> {attempt.error}
@@ -1130,7 +1156,12 @@ function RunDetailView({
     const current = heldEvents.current.runId === runId ? heldEvents.current.held : null;
     const held = detail.stageEvents ? mergeStageEvents(current, detail.stageEvents) : null;
     heldEvents.current = { runId, held };
-    return { ...detail, stageLog: held ? { events: held.events, complete: held.complete } : undefined };
+    return {
+      ...detail,
+      stageLog: held
+        ? { events: held.events, complete: held.complete, caughtUp: !held.more }
+        : undefined,
+    };
   }, [config, runId]);
 
   const { data, error, refresh } = usePolled(
@@ -1139,6 +1170,13 @@ function RunDetailView({
     pollInterval,
     paused,
   );
+
+  // A read returns at most one chunk of a long history; ask again at once
+  // until the page has caught up instead of waiting for the next poll.
+  const behind = data?.stageLog?.caughtUp === false;
+  useEffect(() => {
+    if (behind && !paused) refresh();
+  }, [behind, data, paused, refresh]);
 
   const effectiveError = actionError ?? error;
   const activeError = effectiveError === dismissedError ? null : effectiveError;

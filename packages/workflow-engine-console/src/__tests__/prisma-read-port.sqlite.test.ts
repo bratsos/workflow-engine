@@ -413,6 +413,7 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
       after: 0,
       lastSequence: 9,
       complete: true,
+      more: false,
     });
     // The plain event list still carries every row, payload-free.
     expect(retried.events).toHaveLength(9);
@@ -427,11 +428,18 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
       after: 5,
       lastSequence: 9,
       complete: true,
+      more: false,
     });
     expect(
       (await port.getRunDetail("run-retried", { stageEventsAfter: 9 }))
         ?.stageEvents,
-    ).toEqual({ events: [], after: 9, lastSequence: 9, complete: true });
+    ).toEqual({
+      events: [],
+      after: 9,
+      lastSequence: 9,
+      complete: true,
+      more: false,
+    });
 
     // Rows 1-2 are purged: the range from 0 is broken, the range after them is not.
     expect((await port.getRunDetail("run-purged"))?.stageEvents).toMatchObject({
@@ -454,6 +462,7 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
       after: 0,
       lastSequence: 0,
       complete: true,
+      more: false,
     });
 
     const response = await createWorkflowConsole({
@@ -480,7 +489,7 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
     expect(bad.status).toBe(400);
   });
 
-  it("reports a run with more lifecycle events than the read's limit as incomplete", async () => {
+  it("reads a run with more lifecycle events than the limit in chunks, each unbroken, until it has caught up", async () => {
     await prisma.workflowRun.createMany({
       data: [mkRun("run-many", at(-9_004), "RUNNING", "wf-d", 0, 0)],
     });
@@ -498,9 +507,22 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
         ),
       ),
     });
-    const log = (await reader().getRunDetail("run-many"))!.stageEvents!;
-    expect(log.events).toHaveLength(2000);
-    expect(log).toMatchObject({ lastSequence: 2001, complete: false });
+    const first = (await reader().getRunDetail("run-many"))!.stageEvents!;
+    expect(first.events).toHaveLength(2000);
+    expect(first).toMatchObject({
+      lastSequence: 2000,
+      complete: true,
+      more: true,
+    });
+    const rest = (await reader().getRunDetail("run-many", {
+      stageEventsAfter: first.lastSequence,
+    }))!.stageEvents!;
+    expect(rest.events.map((e) => e.sequence)).toEqual([2001]);
+    expect(rest).toMatchObject({
+      lastSequence: 2001,
+      complete: true,
+      more: false,
+    });
   });
 
   it("cuts a lifecycle event's error text in SQL and says it was cut", async () => {
