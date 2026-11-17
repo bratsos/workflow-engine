@@ -45,7 +45,7 @@ import {
   DefinitionRegistrationRetryableError,
   StaleVersionError,
 } from "../interface";
-import { countActiveByStatus } from "./active-stats";
+import { countActiveByStatus, SQLITE_RARE, sqliteDate } from "./active-stats";
 import { createEnumHelper, type PrismaEnumHelper } from "./enum-compat";
 import {
   type EnginePrismaClient,
@@ -255,9 +255,50 @@ const LIVE_OUTBOX = {
 const LIVE_OUTBOX_SQL = `"publishedAt" IS NULL AND ("dlqAt" IS NULL OR "publishedAt" IS NOT NULL)`;
 
 /**
+ * The live-outbox count and its oldest `occurredAt` on SQLite, in the shape of
+ * the model API's `aggregate`. `likelihood()` tells the planner the
+ * unpublished rows are few, which they are whenever the outbox drains: without
+ * it, statistics from an `ANALYZE` that ran while the rows were unpublished
+ * (or while the table was small) make SQLite scan the whole table once it has
+ * grown by published events, on Prisma 6, 7 and 8. With it the read is a
+ * search of `outbox_events_publishedAt_idx` whatever `sqlite_stat1` says.
+ */
+async function liveOutboxSqlite(prisma: PrismaClient) {
+  const rows = await rawFor(prisma, {
+    n: "bigint",
+    oldest: "timestamp",
+  }).$queryRawUnsafe!<{ n: bigint | number; oldest: unknown }[]>(
+    `SELECT COUNT(*) AS n, MIN("occurredAt") AS oldest FROM "outbox_events" WHERE likelihood("publishedAt" IS NULL, ${SQLITE_RARE}) AND ("dlqAt" IS NULL OR "publishedAt" IS NOT NULL)`,
+  );
+  return {
+    _count: { _all: Number(rows[0]?.n ?? 0) },
+    _min: { occurredAt: sqliteDate(rows[0]?.oldest) },
+  };
+}
+
+/** SUSPENDED stages due by `now` on SQLite, searched on the status index whatever the statistics (see `liveOutboxSqlite`). */
+async function dueStagesSqlite(prisma: PrismaClient, now: Date) {
+  // Prisma 6 and 7 take `?`; the Prisma 8 facade expands `$1` itself. The
+  // `Date` binds as the model API binds it (the date guard checked the file).
+  const param = prisma.$databaseType === "sqlite" ? "$1" : "?";
+  const rows = await rawFor(prisma, {
+    n: "bigint",
+    oldest: "timestamp",
+  }).$queryRawUnsafe!<{ n: bigint | number; oldest: unknown }[]>(
+    `SELECT COUNT(*) AS n, MIN("nextPollAt") AS oldest FROM "workflow_stages" WHERE likelihood("status" = 'SUSPENDED', ${SQLITE_RARE}) AND "nextPollAt" <= ${param}`,
+    now,
+  );
+  return {
+    _count: { _all: Number(rows[0]?.n ?? 0) },
+    _min: { nextPollAt: sqliteDate(rows[0]?.oldest) },
+  };
+}
+
+/**
  * Bounds of the dead-letter count on Postgres (see `countDeadLettered`): every
  * `dlqAt` the engine writes lies between them, it being the application clock
- * at the time of the move.
+ * at the time of the move. A dead letter stamped before 1970 (a test clock set
+ * that far back) is not counted.
  */
 const DLQ_AT_LOWER_BOUND = new Date(0);
 const DLQ_AT_UPPER_BOUND = new Date("9999-12-31T23:59:59.999Z");
@@ -912,9 +953,13 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
 
   /**
    * Active work for `engine.stats`. Each statement is planned from an index
-   * that leads with the active column, so none reads a terminal row, with or
-   * without planner statistics (checked on Postgres 16 for a table that was
-   * never analysed, see `stats-query-plans.test.ts`):
+   * that leads with the active column, so none reads a terminal row: on SQLite
+   * in every statistics state (the active terms are marked rare with
+   * `likelihood()`), on Postgres when the tables were never analysed or their
+   * statistics are current. Postgres statistics taken while most rows were
+   * active, then outgrown by terminal rows, make the runs, jobs and
+   * unpublished-outbox counts read the whole table until the next ANALYZE
+   * (see `stats-query-plans.test.ts`):
    *
    * - runs by status, oldest PENDING: `workflow_runs_status_createdAt_id_idx`
    *   (covering: status and createdAt);
@@ -933,22 +978,40 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
    */
   async getActiveWorkStats(now: Date): Promise<ActiveWorkStats> {
     const active = ACTIVE_STATUSES.map((status) => this.enums.status(status));
+    const sqlite =
+      this.databaseType === "sqlite" && this.prisma.$queryRawUnsafe
+        ? this.prisma
+        : undefined;
     const [runs, stages, due, unpublished, deadLettered] = await Promise.all([
-      countActiveByStatus(this.prisma.workflowRun, active, true),
-      countActiveByStatus(this.prisma.workflowStage, active, false),
-      this.prisma.workflowStage.aggregate({
-        where: {
-          status: this.enums.status("SUSPENDED"),
-          nextPollAt: { lte: now },
-        },
-        _count: { _all: true },
-        _min: { nextPollAt: true },
-      }),
-      this.prisma.outboxEvent.aggregate({
-        where: LIVE_OUTBOX,
-        _count: { _all: true },
-        _min: { occurredAt: true },
-      }),
+      countActiveByStatus(
+        this.prisma.workflowRun,
+        active,
+        true,
+        sqlite && { prisma: sqlite, table: "workflow_runs" },
+      ),
+      countActiveByStatus(
+        this.prisma.workflowStage,
+        active,
+        false,
+        sqlite && { prisma: sqlite, table: "workflow_stages" },
+      ),
+      sqlite
+        ? dueStagesSqlite(sqlite, now)
+        : this.prisma.workflowStage.aggregate({
+            where: {
+              status: this.enums.status("SUSPENDED"),
+              nextPollAt: { lte: now },
+            },
+            _count: { _all: true },
+            _min: { nextPollAt: true },
+          }),
+      sqlite
+        ? liveOutboxSqlite(sqlite)
+        : this.prisma.outboxEvent.aggregate({
+            where: LIVE_OUTBOX,
+            _count: { _all: true },
+            _min: { occurredAt: true },
+          }),
       this.countDeadLettered(),
     ]);
 
@@ -995,7 +1058,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       const rows = await rawFor(this.prisma, {
         n: "bigint",
       }).$queryRawUnsafe!<{ n: bigint | number }[]>(
-        `SELECT COUNT(*) AS n FROM "outbox_events" WHERE "dlqAt" IS NOT NULL`,
+        `SELECT COUNT(*) AS n FROM "outbox_events" WHERE likelihood("dlqAt" IS NOT NULL, ${SQLITE_RARE})`,
       );
       return Number(rows[0]?.n ?? 0);
     }

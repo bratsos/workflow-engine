@@ -950,6 +950,9 @@ export class PrismaJobQueue implements JobQueue {
       this.prisma.jobQueue,
       ACTIVE_STATUSES.map((status) => this.enums.status(status)),
       true,
+      this.databaseType === "sqlite"
+        ? { prisma: this.prisma, table: "job_queue" }
+        : undefined,
     );
     return { byStatus, oldestPendingCreatedAt };
   }

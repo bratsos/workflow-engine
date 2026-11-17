@@ -562,6 +562,199 @@ describe.skipIf(!sqlite && !databaseUrl)(
       });
     });
 
+    // Statistics taken while the rows were active, then the tables grew by
+    // terminal rows and published events and nobody analysed them again (an
+    // ANALYZE early in a deployment's life, autovacuum off or behind; SQLite
+    // keeps `sqlite_stat1` until the next ANALYZE). The planner then believes
+    // most rows are active or unpublished.
+    describe("stale statistics: analysed while the rows were active, then grown by terminal rows", () => {
+      const TABLES_GROWN = [
+        "workflow_runs",
+        "workflow_stages",
+        "job_queue",
+        "outbox_events",
+      ] as const;
+
+      /** Copies the row `template` of `table` `n` times under new ids (and new run ids). */
+      async function grow(table: string, template: string, n: number) {
+        const columns: string[] = sqlite
+          ? (
+              await rawFor(client, { name: "text" }).$queryRawUnsafe(
+                `SELECT name FROM pragma_table_info('${table}')`,
+              )
+            ).map((r: any) => String(r.name))
+          : (
+              await rawFor(client, { name: "text" }).$queryRawUnsafe(
+                `SELECT column_name AS name FROM information_schema.columns WHERE table_name = '${table}' AND table_schema = current_schema()`,
+              )
+            ).map((r: any) => String(r.name));
+        const value = (column: string) =>
+          column === "id"
+            ? `'grown-' || g.x`
+            : column === "workflowRunId" && table !== "workflow_runs"
+              ? `'grown-' || g.x`
+              : `t."${column}"`;
+        const numbers = sqlite
+          ? `(WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < ${n}) SELECT x FROM n)`
+          : `(SELECT generate_series(1, ${n}) AS x)`;
+        await client.$executeRawUnsafe(
+          `INSERT INTO "${table}" (${columns.map((c) => `"${c}"`).join(", ")})
+           SELECT ${columns.map(value).join(", ")} FROM "${table}" t, ${numbers} g WHERE t.id = '${template}'`,
+        );
+      }
+
+      /** Root buffers an executed statement read (Postgres). */
+      async function buffers(statement: Statement): Promise<number> {
+        const rows = await rawFor(client, {
+          "QUERY PLAN": "text",
+        }).$queryRawUnsafe(
+          `EXPLAIN (ANALYZE, BUFFERS, TIMING OFF) ${inlineParams(statement.sql, statement.params)}`,
+        );
+        const text = rows.map((r: any) => String(r["QUERY PLAN"])).join("\n");
+        const match = text.match(/Buffers: shared( hit=(\d+))?( read=(\d+))?/);
+        return Number(match?.[2] ?? 0) + Number(match?.[4] ?? 0);
+      }
+
+      async function pages(table: string): Promise<number> {
+        const rows = await rawFor(client, { n: "int" }).$queryRawUnsafe(
+          `SELECT pg_relation_size('"${table}"'::regclass)::int / current_setting('block_size')::int AS n`,
+        );
+        return Number(rows[0].n);
+      }
+
+      for (const n of [10_000, 100_000]) {
+        describe(`${n.toLocaleString("en")} terminal rows`, () => {
+          beforeAll(async () => {
+            if (sqlite) {
+              for (const table of TABLES_GROWN)
+                await client.$executeRawUnsafe(`DELETE FROM "${table}"`);
+            } else {
+              await truncate();
+              await withoutStatistics();
+            }
+            // Active rows (and unpublished events) only, then the statistics.
+            await seed();
+            await client.$executeRawUnsafe(
+              `UPDATE "outbox_events" SET "publishedAt" = NULL, "dlqAt" = NULL`,
+            );
+            await client.$executeRawUnsafe(
+              `UPDATE "workflow_runs" SET status = 'RUNNING' WHERE id = 'plan-done'`,
+            );
+            await client.$executeRawUnsafe(
+              `UPDATE "workflow_stages" SET status = 'RUNNING' WHERE status = 'COMPLETED'`,
+            );
+            for (const table of TABLES_GROWN)
+              await client.$executeRawUnsafe(`ANALYZE "${table}"`);
+            // The active rows finish and terminal history grows.
+            const done = sqlite ? `'COMPLETED'` : `'COMPLETED'::"Status"`;
+            await client.$executeRawUnsafe(
+              `UPDATE "workflow_runs" SET status = ${done}`,
+            );
+            await client.$executeRawUnsafe(
+              `UPDATE "workflow_stages" SET status = ${done}, "nextPollAt" = NULL`,
+            );
+            await client.$executeRawUnsafe(
+              `UPDATE "job_queue" SET status = ${done}`,
+            );
+            await client.$executeRawUnsafe(
+              `UPDATE "outbox_events" SET "publishedAt" = "occurredAt"`,
+            );
+            await grow("workflow_runs", "plan-done", n);
+            for (const table of [
+              "workflow_stages",
+              "job_queue",
+              "outbox_events",
+            ]) {
+              const template = await rawFor(client, {
+                id: "text",
+              }).$queryRawUnsafe(
+                `SELECT id FROM "${table}" ORDER BY id LIMIT 1`,
+              );
+              await grow(table, String(template[0].id), n);
+            }
+            // Fresh live work, as before: a few active rows, unpublished events, a dead letter.
+            for (const id of [
+              "plan-pending",
+              "plan-running",
+              "plan-suspended",
+              "plan-done",
+            ]) {
+              await client.$executeRawUnsafe(
+                `DELETE FROM "workflow_runs" WHERE id = '${id}'`,
+              );
+            }
+            await client.$executeRawUnsafe(
+              `DELETE FROM "job_queue" WHERE id NOT LIKE 'grown-%'`,
+            );
+            await client.$executeRawUnsafe(
+              `DELETE FROM "outbox_events" WHERE id NOT LIKE 'grown-%'`,
+            );
+            await seed();
+            if (!sqlite) {
+              // The premise: statistics exist and were not refreshed.
+              expect(await analysedTables()).toBeGreaterThan(0);
+            }
+          }, 600_000);
+
+          it("counts correctly", async () => {
+            const stats = await persistence.getActiveWorkStats(new Date());
+            expect(stats.runs.byStatus).toEqual({
+              PENDING: 1,
+              RUNNING: 1,
+              SUSPENDED: 1,
+            });
+            expect(stats.outbox.unpublished).toBe(2);
+            expect(stats.outbox.deadLettered).toBe(1);
+            expect((await queue.getJobStats()).byStatus.PENDING).toBe(2);
+          });
+
+          it.skipIf(!sqlite)(
+            "serves every stats query from its index (SQLite)",
+            () => expectStatsPlans(false),
+          );
+
+          // Postgres plans these from the stale estimate ("most rows are
+          // active"): the runs, stages, jobs and live-outbox reads take one
+          // pass over their table, the due-stage and dead-letter reads stay on
+          // their index. No way of writing the statement changes that without a
+          // planner setting or a new index; the docs state this cost.
+          it.skipIf(sqlite)(
+            "reads at most one pass of each table, and the due-stage and dead-letter reads stay on their index (Postgres)",
+            async () => {
+              const captured = await record(() =>
+                Promise.all([
+                  persistence.getActiveWorkStats(new Date()),
+                  queue.getJobStats(),
+                ]),
+              );
+              const report: string[] = [];
+              for (const expectation of STATS) {
+                const statement = captured.find((c) =>
+                  expectation.matches(c.sql),
+                )!;
+                const table = statement.sql.match(ENGINE_TABLE)![1]!;
+                const read = await buffers(statement);
+                const size = await pages(table);
+                report.push(
+                  `${expectation.name}: ${read} buffers (${table}: ${size} pages)`,
+                );
+                expect(read, expectation.name).toBeLessThanOrEqual(size + 64);
+                if (
+                  expectation.name === "dead-lettered outbox events" ||
+                  expectation.name === "due suspended stages"
+                ) {
+                  expect(read, expectation.name).toBeLessThan(64);
+                }
+              }
+              console.log(
+                `stale statistics, ${n} rows:\n  ${report.join("\n  ")}`,
+              );
+            },
+          );
+        });
+      }
+    });
+
     // A claim candidate that nothing will claim must not occupy the slot of
     // one that can be claimed. `retryCount` is NOT NULL DEFAULT 0 and only the
     // engine writes it, but the schema does not stop a negative value, and a
