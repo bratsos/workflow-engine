@@ -1,0 +1,5 @@
+---
+"@bratsos/workflow-engine": patch
+---
+
+Prisma 8 SQLite: the wrapper now coordinates every statement on the client's root connection, whatever API sends it (`db.orm`, `db.sql`, `db.query`, `db.execute`, prepared statements, a second wrapper or a second copy of the engine). Reads are counted, so an engine commit no longer fails with `Transaction commit failed` on a rollback-journal file, and no longer rejects with `SQLITE_BUSY_SNAPSHOT` in WAL after storing its work, while such a read is returning rows; writes run in the write queue; a root write that returns rows holds root reads back until it commits. The journal mode is read at every commit, so a mode changed after start-up is followed. Raw `BEGIN`, `SAVEPOINT`, `RELEASE`, `COMMIT`, `ROLLBACK` and `END` on the root are refused (use `$transaction`). `EXPLAIN PRAGMA` is classified as a write, since SQLite runs the PRAGMA while preparing it; identifiers that contain `$` or non-ASCII letters no longer change how a statement is classified, and a leading `;` no longer changes how a statement runs.

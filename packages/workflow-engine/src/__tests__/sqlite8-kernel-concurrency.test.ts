@@ -434,10 +434,87 @@ describe
       expect(await db.client.workflowRun.count()).toBe(63);
     }, 120_000);
 
+    // Reads through Prisma 8's own API on the same client, which the docs
+    // suggest for the application's queries, reach the same root connection.
+    it.each([
+      ["db.orm", () => db.native.orm.WorkflowRun.all()],
+      [
+        "db.query",
+        () =>
+          db.native
+            .query(
+              db.native.raw.sql`SELECT id FROM workflow_runs`
+                .returnsRow({ id: "sqlite/text@1" })
+                .build(),
+            )
+            .toArray(),
+      ],
+    ])(
+      "commits run.create while reads through %s are in flight",
+      async (_, read) => {
+        const before = await db.client.workflowRun.count();
+        for (let round = 0; round < 3; round++) {
+          let done = false;
+          const reads = Array.from({ length: 3 }, async () => {
+            while (!done) await read();
+          });
+          const created = await db.kernel
+            .dispatch({
+              type: "run.create",
+              idempotencyKey: `native-${_}-${round}`,
+              workflowId: db.workflow.id,
+              input: { value: "native" },
+            })
+            .then(
+              () => "ok",
+              (error: unknown) => error,
+            );
+          done = true;
+          await Promise.all(reads);
+          expect(created).toBe("ok");
+        }
+        expect(await db.client.workflowRun.count()).toBe(before + 3);
+      },
+      120_000,
+    );
+
+    // The mode can change after the first commit: the next commit follows it.
+    it("follows a journal mode changed after the client's first commit", async () => {
+      const other = mode === "wal" ? "delete" : "wal";
+      const journal = (to: string) =>
+        db.client
+          .$withColumns({ journal_mode: "text" })
+          .$queryRawUnsafe(`PRAGMA journal_mode = ${to}`);
+      try {
+        await journal(other);
+        let done = false;
+        const reads = Array.from({ length: 3 }, async () => {
+          while (!done) await db.persistence.getRunsByStatus("PENDING");
+        });
+        const created = await db.kernel
+          .dispatch({
+            type: "run.create",
+            idempotencyKey: `switched-${mode}`,
+            workflowId: db.workflow.id,
+            input: { value: "switched" },
+          })
+          .then(
+            () => "ok",
+            (error: unknown) => error,
+          );
+        done = true;
+        await Promise.all(reads);
+        expect(created).toBe("ok");
+      } finally {
+        await journal(mode);
+      }
+    }, 120_000);
+
     it("does not hold back a root read made inside a transaction's own callback", async () => {
       let early: Promise<unknown> | undefined;
+      const before = await db.client.workflowRun.count();
       await db.client.$transaction(async (tx: any) => {
-        expect(await db.client.workflowRun.count()).toBe(63);
+        expect(await db.client.workflowRun.count()).toBe(before);
         // Not awaited by the callback: the commit waits for it instead.
         early = db.client.workflowRun
           .findMany()
@@ -452,8 +529,8 @@ describe
           },
         });
       });
-      expect(await early).toHaveLength(63);
-      expect(await db.client.workflowRun.count()).toBe(64);
+      expect(await early).toHaveLength(before);
+      expect(await db.client.workflowRun.count()).toBe(before + 1);
     }, 30_000);
   },
 );

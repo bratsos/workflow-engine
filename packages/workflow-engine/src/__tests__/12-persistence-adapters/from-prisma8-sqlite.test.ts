@@ -1102,8 +1102,28 @@ describe.skipIf(process.env.PRISMA_MAJOR !== "8")(
             pause(1000).then(() => `${sql}: queued`),
           ]),
         ).toBe(`${sql}: ran`);
+      // A PRAGMA runs while it is prepared, so under EXPLAIN too, and an
+      // identifier may hold `$` or non-ASCII letters: these may write, and wait.
+      const waiting = [
+        "EXPLAIN PRAGMA busy_timeout = 5000",
+        "EXPLAIN QUERY PLAN PRAGMA busy_timeout = 5000",
+        "WITH daily$values AS (SELECT 1) UPDATE workflow_runs SET version = version WHERE 0",
+        "WITH dailyévalues AS (SELECT 1) UPDATE workflow_runs SET version = version WHERE 0",
+      ].map((sql) => {
+        let ran = false;
+        const done = prisma
+          .$withColumns({})
+          .$queryRawUnsafe(sql)
+          .then(() => (ran = true));
+        return { sql, done, ran: () => ran };
+      });
+      await pause(200);
+      expect(
+        waiting.filter((form) => form.ran()).map((form) => form.sql),
+      ).toEqual([]);
       release();
       await transaction;
+      await Promise.all(waiting.map((form) => form.done));
       expect(await pending).toHaveLength(120);
       expect(
         (await prisma.workflowRun.findUnique({ where: { id: "counter" } }))
@@ -1553,6 +1573,107 @@ describe.skipIf(process.env.PRISMA_MAJOR !== "8")(
       }
     });
 
+    it("refuses transaction control on the root, from any wrapper or the client's own API", async () => {
+      const other: any = fromPrisma8(db);
+      for (const sql of [
+        "BEGIN",
+        " /* x */ BEGIN IMMEDIATE",
+        "SAVEPOINT app",
+        "RELEASE app",
+        "ROLLBACK",
+        "COMMIT",
+        "END",
+      ]) {
+        expect(() => other.$executeRawUnsafe(sql)).toThrow(/Use \$transaction/);
+        expect(() => prisma.$withColumns({}).$queryRawUnsafe(sql)).toThrow(
+          /Use \$transaction/,
+        );
+      }
+      await expect(
+        db.execute(db.raw.sql`BEGIN`.affectedCount().build()),
+      ).rejects.toThrow(/BEGIN on the root client/);
+      await expect(
+        db.execute(db.raw.sql`SAVEPOINT app`.affectedCount().build()),
+      ).rejects.toThrow(/SAVEPOINT on the root client/);
+      // Inside a transaction a savepoint is the caller's own.
+      await prisma.$transaction(async (tx: any) => {
+        await tx.$executeRawUnsafe("SAVEPOINT app");
+        await tx.$executeRawUnsafe("RELEASE app");
+      });
+      await other.workflowRun.create({ data: run("after") });
+      const observer = new DatabaseSync(file);
+      onTestFinished(() => observer.close());
+      expect(
+        observer.prepare("SELECT count(*) AS n FROM workflow_runs").get(),
+      ).toEqual({ n: 2 });
+    });
+
+    // A write through the client's own API is not run inside the adapter's
+    // root transaction, where a failed COMMIT would take it back after its
+    // caller saw it succeed.
+    it("keeps a write through db.orm out of a root write that then fails", async () => {
+      const observer = new DatabaseSync(file);
+      onTestFinished(() => {
+        observer.exec(
+          "DROP TABLE IF EXISTS totals; DROP TABLE IF EXISTS allowed",
+        );
+        observer.close();
+      });
+      observer.exec(
+        "CREATE TABLE allowed (v INTEGER PRIMARY KEY); INSERT INTO allowed VALUES (0); CREATE TABLE totals (v INTEGER REFERENCES allowed DEFERRABLE INITIALLY DEFERRED); WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 400) INSERT INTO totals SELECT 0 FROM r",
+      );
+      // Fails at COMMIT: the deferred key is checked there.
+      const failing = prisma
+        .$withColumns({ v: "int" })
+        .$queryRawUnsafe("UPDATE totals SET v = 1 RETURNING v")
+        .then(
+          () => "stored",
+          (error: Error) => error.message,
+        );
+      // Start it once the root write holds its lock (the observer cannot take one).
+      observer.exec("PRAGMA busy_timeout = 0");
+      const locked = () => {
+        try {
+          observer.exec("BEGIN IMMEDIATE; ROLLBACK");
+          return false;
+        } catch {
+          return true;
+        }
+      };
+      for (let i = 0; i < 10_000 && !locked(); i++) await Promise.resolve();
+      expect(locked()).toBe(true);
+      const creating = db.orm.WorkflowLog.create({
+        level: "INFO",
+        message: "beside a failing write",
+      });
+      // A write that returns no rows goes through the driver's execute.
+      const inserting = db.execute(
+        db.raw
+          .sql`INSERT INTO workflow_logs (id, level, message, "createdAt") VALUES ('beside', 'INFO', 'beside a failing write', CURRENT_TIMESTAMP)`
+          .affectedCount()
+          .build(),
+      );
+      let seen = false;
+      for (let i = 0; i < 20; i++) {
+        const [row] = await prisma
+          .$withColumns({ v: "int" })
+          .$queryRawUnsafe("SELECT max(v) AS v FROM totals");
+        if (row.v === 1) seen = true;
+      }
+      const created = await creating;
+      expect(await inserting).toMatchObject({ affectedRows: 1 });
+      expect(await failing).toMatch(/FOREIGN KEY constraint failed/);
+      expect(seen).toBe(false);
+      expect(
+        observer
+          .prepare(
+            "SELECT count(*) AS n FROM workflow_logs WHERE message = 'beside a failing write'",
+          )
+          .get(),
+      ).toEqual({ n: 2 });
+      expect(created).toBeTruthy();
+    });
+
     it("runs a raw statement SQLite cannot run in a transaction", async () => {
       await expect(
         prisma.$withColumns({}).$queryRawUnsafe("VACUUM"),
@@ -1562,6 +1683,15 @@ describe.skipIf(process.env.PRISMA_MAJOR !== "8")(
           .$withColumns({ busy: "int", log: "int", checkpointed: "int" })
           .$queryRawUnsafe("PRAGMA wal_checkpoint(PASSIVE)"),
       ).resolves.toEqual([{ busy: 0, log: -1, checkpointed: -1 }]);
+      // An empty statement before it changes nothing: still not in a transaction.
+      await expect(
+        prisma
+          .$withColumns({ journal_mode: "text" })
+          .$queryRawUnsafe("; PRAGMA journal_mode = WAL"),
+      ).resolves.toEqual([{ journal_mode: "wal" }]);
+      await prisma
+        .$withColumns({ journal_mode: "text" })
+        .$queryRawUnsafe("PRAGMA journal_mode = DELETE");
     });
 
     // The same rule, from the inside: a statement that may write, sent to the

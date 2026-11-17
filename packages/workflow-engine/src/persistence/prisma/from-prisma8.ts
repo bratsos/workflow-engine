@@ -361,11 +361,21 @@ const affected = async (x: Executor, q: Sql): Promise<number> => {
     // WAL: a root read still handing over rows keeps the root on a snapshot
     // older than another connection's commit, and a write on it fails at once
     // with SQLITE_BUSY_SNAPSHOT. Nothing ran; once those reads end it can.
-    const gate = readGates.get(x);
-    if (!gate || gate.closed || !staleSnapshot(error)) throw error;
-    return (await withoutReads(gate, () => x.execute(plan))).affectedRows;
+    return (
+      await afterStaleSnapshot(readGates.get(x), error, () => x.execute(plan))
+    ).affectedRows;
   }
 };
+
+/** Runs `retry` once the root reads in flight have ended, if `error` came from one. */
+function afterStaleSnapshot<T>(
+  gate: ReadGate | undefined,
+  error: unknown,
+  retry: () => Promise<T>,
+): Promise<T> {
+  if (!gate || gate.closed || !staleSnapshot(error)) throw error;
+  return withoutReads(gate, retry);
+}
 
 function staleSnapshot(error: unknown): boolean {
   for (
@@ -427,7 +437,7 @@ function statementOf(q: Sql) {
   const source = q.parts.join("\0");
   const tokens = [
     ...source.matchAll(
-      /--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/|'(?:''|[^'])*'|"(?:""|[^"])*"|`(?:``|[^`])*`|\[[^\]]*\]|\w+|[(),;*]/g,
+      /--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/|'(?:''|[^'])*'|"(?:""|[^"])*"|`(?:``|[^`])*`|\[[^\]]*\]|[\w$\u0080-￿]+|[(),;*]/g,
     ),
   ].filter(([s]) => !s.startsWith("--") && !s.startsWith("/*"));
   let depth = 0;
@@ -437,8 +447,12 @@ function statementOf(q: Sql) {
     if (s === "(") depth++;
     return outside;
   });
+  while (top[0]?.[0] === ";") top.shift();
   const words = top.map(([s]) => s.toUpperCase());
   const first = words[0];
+  // SQLite runs a PRAGMA while preparing it, so `EXPLAIN PRAGMA x = 1` sets it.
+  const explained =
+    first === "EXPLAIN" ? words[words[1] === "QUERY" ? 3 : 1] : undefined;
   const verb =
     first === "WITH"
       ? words.find((w) =>
@@ -450,7 +464,10 @@ function statementOf(q: Sql) {
     top,
     first,
     returning: top.find((t) => /^RETURNING$/i.test(t[0])),
-    read: first === "EXPLAIN" || verb === "SELECT" || verb === "VALUES",
+    read:
+      (first === "EXPLAIN" && explained !== "PRAGMA") ||
+      verb === "SELECT" ||
+      verb === "VALUES",
   };
 }
 
@@ -662,14 +679,22 @@ async function rootWrite(
     }
     if (statement.first === "PRAGMA") return rows();
   }
-  await affected(x, new Sql().t("BEGIN IMMEDIATE"));
+  // No other root read runs inside this transaction: it would see rows a
+  // failed COMMIT then takes back.
+  const gate = readGates.get(x);
+  const open = gate && !gate.closed ? await closeReads(gate) : undefined;
   try {
-    const result = await rows();
-    await affected(x, new Sql().t("COMMIT"));
-    return result;
-  } catch (error) {
-    await affected(x, new Sql().t("ROLLBACK")).catch(() => {});
-    throw error;
+    await affected(x, new Sql().t("BEGIN IMMEDIATE"));
+    try {
+      const result = await rows();
+      await affected(x, new Sql().t("COMMIT"));
+      return result;
+    } catch (error) {
+      await affected(x, new Sql().t("ROLLBACK")).catch(() => {});
+      throw error;
+    }
+  } finally {
+    open?.();
   }
 }
 
@@ -685,7 +710,8 @@ interface ReadGate {
   drained?: () => void;
   /** Set while a write waits for the reads in flight; new root reads wait for it. */
   closed?: Promise<void>;
-  wal?: boolean;
+  /** The root driver is taken over (`ownRootConnection`). */
+  owned?: boolean;
 }
 const readGates = new WeakMap<object, ReadGate>();
 
@@ -693,7 +719,7 @@ const readGates = new WeakMap<object, ReadGate>();
  * `db.transaction(fn)` for the adapter's own transactions. On a rollback-journal
  * file the commit waits for the root reads in flight to finish, and root reads
  * that start meanwhile wait for the commit. A WAL file is left as it is: there
- * a commit does not wait for readers. Adapter transactions run one at a time
+ * a commit does not wait for readers. The mode is read at each commit. Adapter transactions run one at a time
  * (the root write queue), and a read made inside `fn` has ended before it.
  */
 function transactionOf<T>(
@@ -706,13 +732,11 @@ function transactionOf<T>(
   return db
     .transaction(async (raw: Executor) => {
       const result = await fn(raw);
-      gate.wal ??=
-        (
-          await rowsOf(raw, new Sql().t("PRAGMA journal_mode"), {
-            journal_mode: SQLITE_TYPES.text!,
-          })
-        )[0]?.journal_mode === "wal";
-      if (!gate.wal) open = await closeReads(gate);
+      // Read at every commit: the mode can change between two of them.
+      const [mode] = await rowsOf(raw, new Sql().t("PRAGMA journal_mode"), {
+        journal_mode: SQLITE_TYPES.text!,
+      });
+      if (mode?.journal_mode !== "wal") open = await closeReads(gate);
       return result;
     })
     .finally(() => open?.());
@@ -757,7 +781,8 @@ export async function rowsOf(
     await inTurn(x);
     rows = await rootWrite(x, q, wire.plan, wire.statement);
   } else {
-    const gate = readGates.get(x);
+    // With the driver taken over, it counts every root read, this one included.
+    const gate = readGates.get(x)?.owned ? undefined : readGates.get(x);
     while (gate?.closed) await gate.closed;
     if (gate) gate.reading++;
     try {
@@ -1440,27 +1465,37 @@ interface WriteQueue {
   tail: Promise<void>;
 }
 const writeQueues = new WeakMap<object, WriteQueue>();
-let writeContext:
-  | Promise<
-      AsyncLocalStorage<{
-        queue: WriteQueue;
-        open?: ReturnType<typeof deadline>;
-        /** Set by the queue's runner for the call whose turn it is (`inTurn`). */
-        turn?: { active: boolean };
-      }>
-    >
-  | undefined;
+type WriteContext = Promise<
+  AsyncLocalStorage<{
+    queue: WriteQueue;
+    open?: ReturnType<typeof deadline>;
+    /** Set by the queue's runner for the call whose turn it is (`inTurn`). */
+    turn?: { active: boolean };
+  }>
+>;
+// Two copies of this module (two engine packages in one process) wrapping the
+// same client must see each other's queue turns: the context and each root
+// driver's queue and read gate are process-wide.
+const CONTEXT = Symbol.for("@bratsos/workflow-engine/prisma8-write-context");
+const ROOT = Symbol.for("@bratsos/workflow-engine/prisma8-root");
 // Load the Node context only for SQLite writes; other entry points and the
 // Postgres path need no async_hooks at runtime.
-const context = () =>
-  (writeContext ??= import("node:async_hooks").then(
-    ({ AsyncLocalStorage }) => new AsyncLocalStorage(),
-  ));
+const context = (): WriteContext =>
+  ((globalThis as { [CONTEXT]?: WriteContext })[CONTEXT] ??= import(
+    "node:async_hooks"
+  ).then(({ AsyncLocalStorage }) => new AsyncLocalStorage()));
+
+/** The queue and read gate of a root driver: every client over it shares them. */
+type SharedRoot = { queue: WriteQueue; gate: ReadGate };
+const sharedRoot = (driver: object | undefined): SharedRoot | undefined =>
+  driver && (driver as { [ROOT]?: SharedRoot })[ROOT];
 
 function queueOf(db: object): WriteQueue {
   let queue = writeQueues.get(db);
   if (!queue) {
-    queue = { tail: Promise.resolve() };
+    const shared = sharedRoot(driverOf(db));
+    if (shared) readGates.set(db, shared.gate);
+    queue = shared?.queue ?? { tail: Promise.resolve() };
     writeQueues.set(db, queue);
   }
   return queue;
@@ -1491,6 +1526,137 @@ async function enqueue<T>(
     () => {},
   );
   return pending;
+}
+
+const TRANSACTION_CONTROL = /^(BEGIN|COMMIT|END|ROLLBACK|SAVEPOINT|RELEASE)$/;
+
+interface DriverRequest {
+  sql: string;
+  params: unknown[];
+}
+interface RootDriver {
+  query(request: DriverRequest): AsyncIterable<unknown>;
+  execute(request: DriverRequest): Promise<unknown>;
+}
+
+function driverOf(db: object): RootDriver | undefined {
+  try {
+    const driver = (
+      db as { runtime?: () => { driver?: Partial<RootDriver> } }
+    ).runtime?.()?.driver;
+    if (
+      typeof driver?.query === "function" &&
+      typeof driver.execute === "function"
+    )
+      return driver as RootDriver;
+  } catch {}
+  return undefined;
+}
+
+/**
+ * Every statement on the root connection, whatever API sends it (this
+ * adapter, `db.orm`, `db.sql`, `db.query`, a prepared statement), reaches the
+ * runtime's driver. The adapter takes that call over, so a read is counted and
+ * waits while a write waits for the reads, and a statement that may write runs
+ * in the write queue, as the adapter's own do. `runtime().driver` is not typed
+ * by Prisma 8 (rc.21): without it the adapter sees only its own reads, as the
+ * docs state. Returns whether it took the driver over.
+ */
+function ownRootConnection(
+  db: Prisma8Db,
+  queue: WriteQueue,
+  gate: ReadGate,
+): boolean {
+  const driver = driverOf(db);
+  if (!driver || sharedRoot(driver)) return false;
+  Object.defineProperty(driver, ROOT, { value: { queue, gate } });
+  const query = driver.query.bind(driver);
+  const execute = driver.execute.bind(driver);
+  const exec = (sql: string) => execute({ sql, params: [] });
+  const own = async () => {
+    const store = (await context()).getStore();
+    return Boolean(store?.turn?.active && store.queue === queue);
+  };
+  const classify = (sql: string) => {
+    const statement = statementOf(new Sql().t(sql));
+    if (TRANSACTION_CONTROL.test(statement.first ?? ""))
+      fail(
+        `${statement.first} on the root client: other callers' writes would join it. Use $transaction`,
+      );
+    return statement;
+  };
+  // A write sent around the adapter, as `rootWrite` runs one: in a lock it
+  // takes cleanly, with no root read inside it.
+  const write = async (request: DriverRequest) => {
+    const rows: unknown[] = [];
+    const all = async () => {
+      for await (const row of query(request)) rows.push(row);
+      return rows;
+    };
+    if (classify(request.sql).first === "PRAGMA") return all();
+    return withoutReads(gate, async () => {
+      await exec("BEGIN IMMEDIATE");
+      try {
+        await all();
+        await exec("COMMIT");
+        return rows;
+      } catch (error) {
+        await exec("ROLLBACK").catch(() => {});
+        throw error;
+      }
+    });
+  };
+  driver.query = (request) => ({
+    [Symbol.asyncIterator]() {
+      let rows: AsyncIterator<unknown> | Iterator<unknown> | undefined;
+      let counted = false;
+      const end = () => {
+        if (!counted) return;
+        counted = false;
+        if (--gate.reading === 0) gate.drained?.();
+      };
+      return {
+        async next() {
+          if (!rows) {
+            const mine = await own();
+            if (!mine && !classify(request.sql).read) {
+              rows = (await enqueue(queue, () => write(request)))[
+                Symbol.iterator
+              ]();
+            } else {
+              if (!mine) while (gate.closed) await gate.closed;
+              gate.reading++;
+              counted = true;
+              rows = query(request)[Symbol.asyncIterator]();
+            }
+          }
+          try {
+            const step = await rows.next();
+            if (step.done) end();
+            return step;
+          } catch (error) {
+            end();
+            throw error;
+          }
+        },
+        async return(value?: unknown) {
+          end();
+          await rows?.return?.(value);
+          return { done: true as const, value };
+        },
+      };
+    },
+  });
+  driver.execute = async (request) => {
+    if (await own()) return execute(request);
+    classify(request.sql);
+    return enqueue(queue, () =>
+      execute(request).catch((error: unknown) =>
+        afterStaleSnapshot(gate, error, () => execute(request)),
+      ),
+    );
+  };
+  return true;
 }
 
 const READS = new Set([
@@ -1848,7 +2014,11 @@ export function fromPrisma8(
   );
   const root = typeof (db as Partial<Prisma8Db>).transaction === "function";
   const queue = sqlite && root ? queueOf(db) : undefined;
-  if (queue && !readGates.has(db)) readGates.set(db, { reading: 0 });
+  if (queue && !readGates.has(db)) {
+    const gate: ReadGate = { reading: 0 };
+    readGates.set(db, gate);
+    gate.owned = ownRootConnection(db as Prisma8Db, queue, gate);
+  }
   const delegates = new WeakMap<Executor, Record<string, unknown>>();
 
   const client = (
@@ -1899,8 +2069,19 @@ export function fromPrisma8(
       }
       return rows;
     };
+    const control = (q: Sql) => {
+      if (
+        queue &&
+        !inTransaction &&
+        TRANSACTION_CONTROL.test(statementOf(q).first ?? "")
+      )
+        fail(
+          `${statementOf(q).first} on the root client: other callers' writes would join it. Use $transaction`,
+        );
+      return q;
+    };
     const rawRead = (q: Sql) =>
-      sqlite
+      control(q) && sqlite
         ? new Op(
             (e) => read(q, e),
             x,
@@ -1908,7 +2089,9 @@ export function fromPrisma8(
           )
         : read(q);
     const rawWrite = (q: Sql) =>
-      sqlite ? new Op((e) => affected(e, q), x, schedule) : affected(x, q);
+      control(q) && sqlite
+        ? new Op((e) => affected(e, q), x, schedule)
+        : affected(x, q);
 
     const transaction = async (arg: any, options: Args = {}) => {
       check("$transaction", options, ["isolationLevel", "timeout"]);

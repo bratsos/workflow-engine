@@ -119,6 +119,10 @@ This guide covers common issues encountered when running **workflow-engine**, ho
 
 Symptom: on a SQLite file in the default rollback-journal mode, your own `db.transaction(...)` (one you open on the Prisma 8 client, not the adapter's `$transaction`) fails with `Transaction commit failed` after the busy timeout, while the engine runs in the same process. Cause: a root read of the wrapped client was still handing over rows, holding the file's read lock, and the commit waited for it synchronously, so the read could not finish. The adapter's own transactions wait for those reads; yours cannot. Fix: turn on WAL once on the file (`PRAGMA journal_mode=WAL`, see Prisma Setup), or build the ports over your transaction's `tx` and do not read through the root client while it is open.
 
+### 12. Prisma 8 SQLite: `BEGIN on the root client ... Use $transaction`
+
+Symptom: `$executeRaw`/`$queryRaw` of `BEGIN`, `SAVEPOINT`, `RELEASE`, `COMMIT`, `ROLLBACK` or `END` on the Prisma 8 SQLite wrapper (or `db.execute` of one on the client it wraps) throws `fromPrisma8: BEGIN on the root client: other callers' writes would join it. Use $transaction`. Cause: the root connection is shared by every caller in the process; a transaction opened on it by hand would take in the engine's writes, and a later `ROLLBACK` would undo writes their callers saw succeed. Fix: use `prisma.$transaction(async (tx) => ...)` or `db.transaction(async (tx) => ...)`; inside either, `SAVEPOINT` and `RELEASE` work.
+
 ## Orchestration Tick Flow
 
 The host orchestration tick executes these operations sequentially. Each operation runs inside its own try/catch block, preventing a single failure (e.g. one bad database query) from starving unrelated operations:
