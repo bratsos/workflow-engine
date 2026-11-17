@@ -360,32 +360,17 @@ Each maintenance step runs in its own error boundary — if one step fails, the 
 
 ## Degraded event sink
 
-The outbox is the durable record; the `EventSink` is a delivery attempt. What
-is guaranteed, exactly:
+The outbox is the durable record. Events are delivered at least once while retries remain: a crash after sink acceptance but before the published write, an emit still in flight when its claim expires, or a partial plugin failure can cause duplicates. Deduplicate using the outbox `eventId` supplied to the sink or plugin. Failures exhaust the retry budget and move the event to the DLQ; `plugin.replayDLQ` makes it eligible again. The engine’s progress never depends on the sink. `publishedAt` is written only after the sink resolves. Claims expire after 60 seconds by default and are checked before each emit; a flush stops when its claim expires. Maintenance ticks and `runToCompletion` wait at most `outboxFlushTimeoutMs` (default 5,000 ms) for a flush, so a hanging sink cannot block run progress. The serverless post-job claim lasts `outboxFlushTimeoutMs + 60_000` ms and Node shutdown uses `shutdownTimeoutMs + 60_000` ms, both capped at 2,147,483,647 ms. A batch shares its claim deadline, so a slow sink can leave later events for a future flush. Synchronize host clocks.
 
-- No phantom events: an event is written in the transaction of the state change
-  it describes, so a rolled-back transaction writes none.
-- One delivery attempt per claim: `outbox.flush` stamps `publishedAt` (claims)
-  before it calls `emit`, atomically, so two hosts flushing one outbox never
-  deliver the same event.
-- Retried on a sink failure, up to the retry budget (`maxRetries`, default 3
-  failed attempts), then dead-lettered until `plugin.replayDLQ`. A retry calls
-  `emit` for the whole event again: with the plugin runner, plugins that ran
-  before the failing one see it again, so keep handlers idempotent.
-- Lost only if the process dies between the claim and the emit: the stamp then
-  says "published" and no later flush picks the event up. This is at-most-once
-  per claim, not at-least-once.
-- The engine's progress never depends on the sink: the poller advances runs.
-- A consumer that needs every event reads the `outbox_events` table (or the
-  console, which reads the same rows) instead of relying on the sink: the row
-  stays whatever became of its delivery: nothing in the engine deletes outbox
-  rows (`run.purge` does not touch `outbox_events`, which has no foreign key to
-  the run), so the table is not bounded by retention and rows are removed with
-  SQL.
+One live unpublished event per run can be claimed: later events wait while an earlier event is claimed or awaiting retry. A dead letter no longer blocks the run; after replay it can appear after later events. The sink and plugin handlers receive optional delivery metadata with `eventId`, `workflowRunId`, `sequence` and `attempt`; deduplicate by `eventId` or `(workflowRunId, sequence)`. The attempt is recorded failures plus one, so crashes or overlaps may repeat it. Claimed events count as unpublished in `engine.stats` and the console shows a live claim as claimed.
+
+An alpha.20 flusher ignores new claims and can lose an event by stamping before emit. Stop all alpha.20 flushers before relying on the new guarantee. A legacy stamp without a claim means published to the new code; an event already lost by an old flusher cannot be recovered.
+
+Nothing in the engine deletes outbox rows: `run.purge` leaves them in place, and only an operator removes them with SQL.
 
 When
-publishing fails, `outbox.flush` releases the events it had claimed so the next
-flush retries them, and reports `eventSinkStatus: "degraded"` with
+publishing fails, `outbox.flush` releases the failed event so the next
+flush retries it, and reports `eventSinkStatus: "degraded"` with
 `eventSinkError` set to the first failure of that flush. Nothing about a run
 stalls: the poller advances runs, not the sink. `OutboxFlushResult` carries
 `published`, `failed`, `deadLettered`, `eventSinkStatus` and `eventSinkError?`,

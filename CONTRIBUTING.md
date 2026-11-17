@@ -35,6 +35,8 @@ export PRISMA_MAJOR=6   # the Prisma major to test: 6, 7 or 8 (default 7); the f
 pnpm --filter @bratsos/workflow-engine run prisma:generate
 pnpm --filter @bratsos/workflow-engine run prisma:db-push
 pnpm --filter @bratsos/workflow-engine run test:pg
+pnpm --filter @bratsos/workflow-engine-host-node exec vitest run src/__tests__/outbox-prisma.test.ts
+pnpm --filter @bratsos/workflow-engine-host-serverless exec vitest run src/__tests__/outbox-prisma.test.ts
 pnpm --filter @bratsos/workflow-engine-console exec node scripts/build-ui.mjs   # cli.test.ts needs the built UI bundle
 pnpm --filter @bratsos/workflow-engine-console exec vitest run src/__tests__/prisma-read-port.postgres.test.ts src/__tests__/cli.test.ts
 ```
@@ -58,6 +60,12 @@ pnpm --filter @bratsos/workflow-engine-console exec node scripts/build-ui.mjs
 PRISMA_MAJOR=6 pnpm --filter @bratsos/workflow-engine-console exec vitest run src/__tests__/prisma-read-port.sqlite.test.ts
 PRISMA_MAJOR=7 pnpm --filter @bratsos/workflow-engine-console exec vitest run src/__tests__/prisma-read-port.sqlite.test.ts
 PRISMA_MAJOR=8 pnpm --filter @bratsos/workflow-engine-console exec vitest run src/__tests__/prisma-read-port.sqlite.test.ts
+PRISMA_MAJOR=6 pnpm --filter @bratsos/workflow-engine-host-node exec vitest run src/__tests__/outbox-prisma.test.ts
+PRISMA_MAJOR=7 pnpm --filter @bratsos/workflow-engine-host-node exec vitest run src/__tests__/outbox-prisma.test.ts
+PRISMA_MAJOR=8 pnpm --filter @bratsos/workflow-engine-host-node exec vitest run src/__tests__/outbox-prisma.test.ts
+PRISMA_MAJOR=6 pnpm --filter @bratsos/workflow-engine-host-serverless exec vitest run src/__tests__/outbox-prisma.test.ts
+PRISMA_MAJOR=7 pnpm --filter @bratsos/workflow-engine-host-serverless exec vitest run src/__tests__/outbox-prisma.test.ts
+PRISMA_MAJOR=8 pnpm --filter @bratsos/workflow-engine-host-serverless exec vitest run src/__tests__/outbox-prisma.test.ts
 ```
 
 ### Stored-row compatibility fixtures

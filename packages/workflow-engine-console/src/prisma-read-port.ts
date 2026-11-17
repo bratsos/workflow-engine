@@ -150,6 +150,7 @@ const EVENT_COLUMNS: RawColumns = {
   eventType: "text",
   occurredAt: "timestamp",
   publishedAt: "timestamp",
+  deliveryClaim: "text",
   retryCount: "int",
   dlqAt: "timestamp",
 };
@@ -335,6 +336,7 @@ interface RawEventRow {
   eventType: string;
   occurredAt: RawTimestamp;
   publishedAt: RawNullableTimestamp;
+  deliveryClaim: string | null;
   retryCount: number | bigint;
   dlqAt: RawNullableTimestamp;
 }
@@ -506,6 +508,9 @@ function mapRunEvent(row: RawEventRow): RunEvent {
     eventType: String(row.eventType),
     occurredAt: toDate(row.occurredAt) ?? new Date(0),
     publishedAt: toDate(row.publishedAt),
+    ...(row.deliveryClaim
+      ? { claimExpiresAt: new Date(row.deliveryClaim.slice(0, 24)) }
+      : {}),
     retryCount: toNumber(row.retryCount),
     dlqAt: toDate(row.dlqAt),
   };
@@ -891,7 +896,7 @@ LIMIT ${logLimit + 1}`,
       const eventRows = await this.select<RawEventRow>(
         client,
         EVENT_COLUMNS,
-        `SELECT id, "workflowRunId", sequence, "eventType", "occurredAt", "publishedAt",
+        `SELECT id, "workflowRunId", sequence, "eventType", "occurredAt", "publishedAt", "deliveryClaim",
        "retryCount", "dlqAt"
 FROM "outbox_events" WHERE "workflowRunId" = ${this.param(1)}
 ORDER BY sequence ASC
@@ -937,7 +942,7 @@ LIMIT ${eventLimit + 1}`,
     const rows = await this.query<RawEventRow>(
       "run.events.tail",
       EVENT_COLUMNS,
-      `SELECT id, "workflowRunId", sequence, "eventType", "occurredAt", "publishedAt",
+      `SELECT id, "workflowRunId", sequence, "eventType", "occurredAt", "publishedAt", "deliveryClaim",
        "retryCount", "dlqAt"
 FROM "outbox_events" WHERE "workflowRunId" = ${this.param(1)} AND sequence > ${this.param(2)}
 ORDER BY sequence ASC LIMIT ${clampedLimit}`,

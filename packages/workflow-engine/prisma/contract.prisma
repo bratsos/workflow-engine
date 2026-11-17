@@ -304,6 +304,7 @@ model OutboxEvent {
   causationId   String
   occurredAt    TimestampString(3)
   publishedAt   TimestampString(3)?
+  deliveryClaim String?
   retryCount    Int                @default(0)
   dlqAt         TimestampString(3)?
 

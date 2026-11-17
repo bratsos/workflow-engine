@@ -4740,7 +4740,7 @@ if (!DATABASE_URL) {
         expect(lag).toBeLessThan(60_000);
       });
 
-      it("stamps publishedAt in UTC when the outbox sweep claims events on a non-UTC session", async () => {
+      it("writes publishedAt in UTC only after delivery on a non-UTC session", async () => {
         const persistence = createPrismaWorkflowPersistence(tzPrisma);
         await persistence.appendOutboxEvents([
           {
@@ -4753,10 +4753,22 @@ if (!DATABASE_URL) {
         ]);
 
         const before = Date.now();
-        const [claimed] = await persistence.claimUnpublishedOutboxEvents();
+        const now = new Date();
+        const claim = `${new Date(now.getTime() + 60_000).toISOString()}|tz`;
+        const [claimed] = await persistence.claimOutboxDelivery(
+          1,
+          claim,
+          now,
+          [],
+        );
         expect(claimed?.workflowRunId).toBe("tz-outbox-run");
+        expect(claimed?.publishedAt).toBeNull();
+        await persistence.completeOutboxDelivery(claimed!.id, claim, now);
+        const [stored] = await tzPrisma.outboxEvent.findMany({
+          where: { id: claimed!.id },
+        });
         expect(
-          Math.abs((claimed?.publishedAt?.getTime() ?? 0) - before),
+          Math.abs((stored?.publishedAt?.getTime() ?? 0) - before),
         ).toBeLessThan(60_000);
       });
 

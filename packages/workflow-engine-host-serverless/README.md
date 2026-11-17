@@ -53,7 +53,7 @@ Creates a new serverless host instance.
 | `maxOutboxFlushPerTick` | `number` | `100` | Max outbox events to flush per tick |
 | `retention` | `RetentionOptions` | off | `{ olderThanMs, statuses?, limit? }`: delete terminal runs through `run.purge` at the end of every tick |
 | `flushOutboxAfterJob` | `boolean` | `true` | Publish the job's outbox events right after `handleJob` settles it |
-| `outboxFlushTimeoutMs` | `number` | `5_000` | Bound on that post-job flush; errors are logged, not thrown |
+| `outboxFlushTimeoutMs` | `number` | `5_000` | Bound on post-job and maintenance flushes; an in-flight emit can continue after timeout |
 
 ### `ServerlessHost`
 

@@ -223,7 +223,7 @@ function isInProgressResult(result: unknown): boolean {
 }
 
 /**
- * Outbox events the next flush will deliver: not published, not dead-lettered.
+ * Unpublished, non-dead-lettered outbox events, including live claims.
  *
  * It selects the same rows as `publishedAt IS NULL AND dlqAt IS NULL`. The
  * extra disjunct, `publishedAt IS NOT NULL`, contradicts the first term, so it
@@ -250,9 +250,6 @@ const LIVE_OUTBOX = {
   publishedAt: null,
   OR: [{ dlqAt: null }, { publishedAt: { not: null } }],
 };
-
-/** The same condition for the Postgres claim's raw statement. */
-const LIVE_OUTBOX_SQL = `"publishedAt" IS NULL AND ("dlqAt" IS NULL OR "publishedAt" IS NOT NULL)`;
 
 /**
  * The live-outbox count and its oldest `occurredAt` on SQLite, in the shape of
@@ -1799,6 +1796,20 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
 
   async getUnpublishedOutboxEvents(limit?: number): Promise<OutboxRecord[]> {
     const effectiveLimit = limit ?? 100;
+    if (this.databaseType === "postgresql" && this.prisma.$queryRawUnsafe) {
+      // Sorting by an equivalent expression prevents a small LIMIT from
+      // walking the run/sequence index through all published history when
+      // planner statistics are missing or stale.
+      const rows = await rawFor(this.prisma, "outbox_events").$queryRawUnsafe!<
+        any[]
+      >(
+        `SELECT * FROM "outbox_events"
+         WHERE "publishedAt" IS NULL AND ("dlqAt" IS NULL OR "publishedAt" IS NOT NULL)
+         ORDER BY ("workflowRunId" || ''), sequence LIMIT $1`,
+        effectiveLimit,
+      );
+      return rows.map((row: any) => this.mapOutboxEvent(row));
+    }
     const records = await this.prisma.outboxEvent.findMany({
       where: LIVE_OUTBOX,
       orderBy: [{ workflowRunId: "asc" }, { sequence: "asc" }],
@@ -1807,62 +1818,166 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     return records.map((r: any) => this.mapOutboxEvent(r));
   }
 
-  async claimUnpublishedOutboxEvents(limit?: number): Promise<OutboxRecord[]> {
-    const effectiveLimit = limit ?? 100;
-    const now = this.now();
+  async claimOutboxDelivery(
+    limit: number,
+    claim: string,
+    now: Date,
+    excludedRunIds: readonly string[],
+  ): Promise<OutboxRecord[]> {
+    if (limit <= 0) return [];
+    const deadline = `${now.toISOString()}~`;
     if (this.databaseType === "postgresql" && this.prisma.$queryRawUnsafe) {
-      // One statement: lock the candidate rows (skipping rows another
-      // flush holds), stamp them, return them. A concurrent flush — even
-      // one inside a still-open transaction — cannot receive the same
-      // rows. `RETURNING` order is unspecified, so the rows are re-sorted.
+      const excluded = excludedRunIds.length
+        ? `AND e."workflowRunId" NOT IN (${excludedRunIds.map((_, i) => `$${i + 4}`).join(", ")})`
+        : "";
       const rows = await rawFor(this.prisma, "outbox_events").$queryRawUnsafe!<
         any[]
       >(
-        `WITH claimed AS (
-          SELECT id
+        `WITH heads AS MATERIALIZED (
+          SELECT DISTINCT ON (("workflowRunId" || '')) id, "workflowRunId", sequence
           FROM "outbox_events"
-          WHERE ${LIVE_OUTBOX_SQL}
-          ORDER BY "workflowRunId" ASC, sequence ASC
-          LIMIT $1
-          FOR UPDATE SKIP LOCKED
+          WHERE "publishedAt" IS NULL
+            AND ("dlqAt" IS NULL OR "publishedAt" IS NOT NULL)
+          ORDER BY ("workflowRunId" || ''), sequence
+        ), candidates AS (
+          SELECT e.id FROM "outbox_events" e JOIN heads h ON h.id = e.id
+          WHERE e."publishedAt" IS NULL
+            AND (e."dlqAt" IS NULL OR e."publishedAt" IS NOT NULL)
+            AND (e."deliveryClaim" IS NULL OR e."deliveryClaim" <= $2)
+            ${excluded}
+          ORDER BY e."workflowRunId", e.sequence
+          LIMIT $1 FOR UPDATE OF e SKIP LOCKED
         )
-        UPDATE "outbox_events"
-        SET "publishedAt" = ${utcTimestampParam(2)}
-        FROM claimed
-        WHERE "outbox_events".id = claimed.id
-        RETURNING "outbox_events".*`,
-        effectiveLimit,
-        now.toISOString(),
+        UPDATE "outbox_events" e SET "deliveryClaim" = $3
+        FROM candidates WHERE e.id = candidates.id
+        RETURNING e.*`,
+        limit,
+        deadline,
+        claim,
+        ...excludedRunIds,
       );
       return rows
-        .map((r: any) => this.mapOutboxEvent(r))
+        .map((row: any) => this.mapOutboxEvent(row))
         .sort(
           (a, b) =>
             a.workflowRunId.localeCompare(b.workflowRunId) ||
             a.sequence - b.sequence,
         );
     }
-
-    // SQLite (or a client without raw queries): compare-and-set per row on
-    // `publishedAt IS NULL`; a row another flush claimed first is skipped.
-    const candidates = await this.getUnpublishedOutboxEvents(effectiveLimit);
+    // The first live row of each run is its only candidate. Compare-and-set
+    // the claim: concurrent SQLite writers cannot both acquire that row.
+    const sqliteQuery = `WITH ranked AS (
+           SELECT id, row_number() OVER (PARTITION BY "workflowRunId" ORDER BY sequence) AS position
+           FROM "outbox_events"
+           WHERE "publishedAt" IS NULL
+             AND ("dlqAt" IS NULL OR "publishedAt" IS NOT NULL)
+         ) SELECT e.* FROM "outbox_events" e JOIN ranked r ON r.id = e.id AND r.position = 1
+           WHERE e."publishedAt" IS NULL
+             AND (e."dlqAt" IS NULL OR e."publishedAt" IS NOT NULL)
+             AND (e."deliveryClaim" IS NULL OR e."deliveryClaim" <= $1)
+             ${excludedRunIds.length ? `AND e."workflowRunId" NOT IN (${excludedRunIds.map((_, i) => `$${i + 2}`).join(", ")})` : ""}
+           ORDER BY e."workflowRunId", e.sequence LIMIT $${excludedRunIds.length + 2}`;
+    const rows = this.prisma.$queryRawUnsafe
+      ? await rawFor(this.prisma, "outbox_events").$queryRawUnsafe!<any[]>(
+          this.prisma.$withColumns
+            ? sqliteQuery
+            : sqliteQuery.replace(/\$\d+/g, "?"),
+          deadline,
+          ...excludedRunIds,
+          limit,
+        )
+      : await this.prisma.outboxEvent.findMany({
+          where: {
+            ...LIVE_OUTBOX,
+            ...(excludedRunIds.length
+              ? { workflowRunId: { notIn: excludedRunIds } }
+              : {}),
+          },
+          orderBy: [{ workflowRunId: "asc" }, { sequence: "asc" }],
+          take: Math.max(limit, 100),
+        });
+    const seen = new Set(excludedRunIds);
     const claimed: OutboxRecord[] = [];
-    for (const candidate of candidates) {
-      const result = await this.prisma.outboxEvent.updateMany({
-        where: { id: candidate.id, publishedAt: null, dlqAt: null },
-        data: { publishedAt: now },
+    for (const row of rows) {
+      if (seen.has(row.workflowRunId)) continue;
+      seen.add(row.workflowRunId);
+      if (claimed.length >= limit) break;
+      const updated = await this.prisma.outboxEvent.updateMany({
+        where: {
+          id: row.id,
+          publishedAt: null,
+          dlqAt: null,
+          OR: [{ deliveryClaim: null }, { deliveryClaim: { lte: deadline } }],
+        },
+        data: { deliveryClaim: claim },
       });
-      if (result.count > 0) claimed.push({ ...candidate, publishedAt: now });
+      if (updated.count) claimed.push(this.mapOutboxEvent(row));
     }
     return claimed;
   }
 
-  async releaseOutboxEvents(ids: string[]): Promise<void> {
-    if (ids.length === 0) return;
-    await this.prisma.outboxEvent.updateMany({
-      where: { id: { in: ids } },
-      data: { publishedAt: null },
+  async isOutboxDeliveryClaimActive(
+    id: string,
+    claim: string,
+    now: Date,
+  ): Promise<boolean> {
+    if (claim.slice(0, 24) <= now.toISOString()) return false;
+    return (
+      (await this.prisma.outboxEvent.count({
+        where: {
+          id,
+          deliveryClaim: claim,
+          OR: [{ publishedAt: null, dlqAt: null }, { id: { not: id } }],
+        },
+      })) > 0
+    );
+  }
+
+  async completeOutboxDelivery(
+    id: string,
+    claim: string,
+    now: Date,
+  ): Promise<boolean> {
+    const result = await this.prisma.outboxEvent.updateMany({
+      // The disjunctions are equivalent to the null checks under id = id.
+      // They keep the planner on the unique id lookup when an analysed
+      // table has very few unpublished rows, even if that estimate is stale.
+      where: {
+        id,
+        deliveryClaim: claim,
+        OR: [{ publishedAt: null, dlqAt: null }, { id: { not: id } }],
+      },
+      data: { publishedAt: now, deliveryClaim: null },
     });
+    return result.count > 0;
+  }
+
+  async failOutboxDelivery(
+    id: string,
+    claim: string,
+    maxRetries: number,
+    now: Date,
+  ): Promise<"retry" | "dead-lettered" | "lost"> {
+    const row = await this.prisma.outboxEvent.findUnique({
+      where: { id },
+      select: { retryCount: true },
+    });
+    if (!row) return "lost";
+    const dead = row.retryCount + 1 >= maxRetries;
+    const result = await this.prisma.outboxEvent.updateMany({
+      where: {
+        id,
+        deliveryClaim: claim,
+        retryCount: row.retryCount,
+        OR: [{ publishedAt: null, dlqAt: null }, { id: { not: id } }],
+      },
+      data: {
+        retryCount: { increment: 1 },
+        deliveryClaim: null,
+        ...(dead ? { dlqAt: now } : {}),
+      },
+    });
+    return result.count ? (dead ? "dead-lettered" : "retry") : "lost";
   }
 
   async markOutboxEventsPublished(ids: string[]): Promise<void> {
@@ -1886,18 +2001,11 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     return record.retryCount;
   }
 
-  /**
-   * Dead-letters an event and drops the flush's claim in ONE write. The claim
-   * stamps `publishedAt` before the sink is tried, and a stamped event reads
-   * as published: with the move and the release as two writes, a process that
-   * died between them left `dlqAt` and `publishedAt` both set, and a replay
-   * that cleared only `dlqAt` made it look delivered for good. A dead letter
-   * was never delivered, so it never keeps a stamp.
-   */
+  /** Move a row to the DLQ and clear any legacy stamp and delivery claim. */
   async moveOutboxEventToDLQ(id: string): Promise<void> {
     await this.prisma.outboxEvent.update({
       where: { id },
-      data: { dlqAt: new Date(), publishedAt: null },
+      data: { dlqAt: new Date(), publishedAt: null, deliveryClaim: null },
     });
   }
 
@@ -1911,10 +2019,18 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     if (dlqEvents.length === 0) return 0;
 
     const result = await this.prisma.outboxEvent.updateMany({
-      where: { id: { in: dlqEvents.map((e: any) => e.id) } },
+      where: {
+        id: { in: dlqEvents.map((e: any) => e.id) },
+        dlqAt: { not: null },
+      },
       // Also clears the claim stamp: a dead letter an earlier version left
       // stamped (a crash between its two writes) is revived, not skipped.
-      data: { dlqAt: null, retryCount: 0, publishedAt: null },
+      data: {
+        dlqAt: null,
+        retryCount: 0,
+        publishedAt: null,
+        deliveryClaim: null,
+      },
     });
     return result.count;
   }

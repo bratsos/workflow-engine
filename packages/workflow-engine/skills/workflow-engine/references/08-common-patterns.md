@@ -28,7 +28,7 @@ If the same key is currently executing, dispatch throws `IdempotencyInProgressEr
 
 ## Transactional Outbox
 
-Events are not emitted directly. Instead, handlers write events to a transactional outbox table in the transaction of the state change they describe (no phantom events). The `outbox.flush` command claims pending events and makes one delivery attempt each through the EventSink, retrying a sink failure up to the retry budget; an event is lost only if the process dies between the claim and the emit, so read the `outbox_events` table if you need every one (03-runtime-setup.md, "Degraded event sink"):
+Events commit with their state change in the transactional outbox. Events are delivered at least once while retries remain: a crash after sink acceptance but before the published write, an emit still in flight when its claim expires, or a partial plugin failure can cause duplicates. Deduplicate using the outbox `eventId` supplied to the sink or plugin. Failures exhaust the retry budget and move the event to the DLQ; `plugin.replayDLQ` makes it eligible again. The engine’s progress never depends on the sink. See 03-runtime-setup.md for claim expiry and ordering:
 
 ```typescript
 // Events accumulate in the outbox as commands execute

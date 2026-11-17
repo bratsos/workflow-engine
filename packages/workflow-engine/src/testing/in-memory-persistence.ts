@@ -103,6 +103,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
   private annotationSequence = new Map<string, number>();
   private nextAnnotationSequence = 0;
   private outbox: OutboxRecord[] = [];
+  private outboxClaims = new Map<string, string>();
   private idempotencyKeys = new Map<string, IdempotencyRecord>();
   /** Maps composite key -> the time the key was (re)acquired as in-progress. */
   private idempotencyInProgress = new Map<string, Date>();
@@ -705,28 +706,89 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
       .map((r) => ({ ...r }));
   }
 
-  async claimUnpublishedOutboxEvents(limit?: number): Promise<OutboxRecord[]> {
-    const effectiveLimit = limit ?? 100;
-    const now = this.now();
-    // Filter and stamp are synchronous: a concurrent flush that awaits
-    // this call after us sees `publishedAt` set and claims nothing.
-    const claimed = this.outbox
-      .filter((r) => r.publishedAt === null && r.dlqAt === null)
-      .sort((a, b) => {
-        const runCmp = a.workflowRunId.localeCompare(b.workflowRunId);
-        if (runCmp !== 0) return runCmp;
-        return a.sequence - b.sequence;
-      })
-      .slice(0, effectiveLimit);
-    for (const record of claimed) record.publishedAt = now;
-    return claimed.map((r) => ({ ...r }));
+  async claimOutboxDelivery(
+    limit: number,
+    claim: string,
+    now: Date,
+    excludedRunIds: readonly string[],
+  ): Promise<OutboxRecord[]> {
+    const excluded = new Set(excludedRunIds);
+    const seen = new Set<string>();
+    const result: OutboxRecord[] = [];
+    const rows = this.outbox
+      .filter((row) => row.publishedAt === null && row.dlqAt === null)
+      .sort(
+        (a, b) =>
+          a.workflowRunId.localeCompare(b.workflowRunId) ||
+          a.sequence - b.sequence,
+      );
+    for (const row of rows) {
+      if (seen.has(row.workflowRunId) || excluded.has(row.workflowRunId))
+        continue;
+      seen.add(row.workflowRunId);
+      const previous = this.outboxClaims.get(row.id);
+      if (previous && previous.slice(0, 24) > now.toISOString()) continue;
+      if (result.length >= limit) break;
+      this.outboxClaims.set(row.id, claim);
+      result.push({ ...row });
+    }
+    return result;
   }
 
-  async releaseOutboxEvents(ids: string[]): Promise<void> {
-    const idSet = new Set(ids);
-    for (const record of this.outbox) {
-      if (idSet.has(record.id)) record.publishedAt = null;
+  async isOutboxDeliveryClaimActive(
+    id: string,
+    claim: string,
+    now: Date,
+  ): Promise<boolean> {
+    const row = this.outbox.find((event) => event.id === id);
+    return (
+      !!row &&
+      row.publishedAt === null &&
+      row.dlqAt === null &&
+      this.outboxClaims.get(id) === claim &&
+      claim.slice(0, 24) > now.toISOString()
+    );
+  }
+
+  async completeOutboxDelivery(
+    id: string,
+    claim: string,
+    now: Date,
+  ): Promise<boolean> {
+    const row = this.outbox.find((event) => event.id === id);
+    if (
+      !row ||
+      row.publishedAt !== null ||
+      row.dlqAt !== null ||
+      this.outboxClaims.get(id) !== claim
+    )
+      return false;
+    row.publishedAt = now;
+    this.outboxClaims.delete(id);
+    return true;
+  }
+
+  async failOutboxDelivery(
+    id: string,
+    claim: string,
+    maxRetries: number,
+    now: Date,
+  ): Promise<"retry" | "dead-lettered" | "lost"> {
+    const row = this.outbox.find((event) => event.id === id);
+    if (
+      !row ||
+      row.publishedAt !== null ||
+      row.dlqAt !== null ||
+      this.outboxClaims.get(id) !== claim
+    )
+      return "lost";
+    row.retryCount++;
+    this.outboxClaims.delete(id);
+    if (row.retryCount >= maxRetries) {
+      row.dlqAt = now;
+      return "dead-lettered";
     }
+    return "retry";
   }
 
   async markOutboxEventsPublished(ids: string[]): Promise<void> {
@@ -751,6 +813,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
     record.dlqAt = this.now();
     // One write: a dead letter never keeps the flush's claim stamp.
     record.publishedAt = null;
+    this.outboxClaims.delete(id);
   }
 
   async replayDLQEvents(maxEvents: number): Promise<number> {
@@ -761,6 +824,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
       record.dlqAt = null;
       record.retryCount = 0;
       record.publishedAt = null;
+      this.outboxClaims.delete(record.id);
     }
     return dlqEvents.length;
   }
@@ -1145,6 +1209,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
     this.annotationSequence.clear();
     this.nextAnnotationSequence = 0;
     this.outbox = [];
+    this.outboxClaims.clear();
     this.idempotencyKeys.clear();
     this.idempotencyInProgress.clear();
     this.outboxSequences.clear();

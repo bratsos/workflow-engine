@@ -134,6 +134,8 @@ export interface RunEvent {
   eventType: string;
   occurredAt: Date;
   publishedAt: Date | null;
+  /** Expiry of an outstanding delivery claim, when one is present. */
+  claimExpiresAt?: Date;
   retryCount: number;
   dlqAt: Date | null;
 }

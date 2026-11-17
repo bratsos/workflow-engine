@@ -5,6 +5,7 @@ import {
   HOST_DEFAULTS,
   type JobTransport,
   type Kernel,
+  MAX_TIMER_MS,
   type RunCreateCommand,
 } from "@bratsos/workflow-engine/kernel";
 
@@ -87,6 +88,8 @@ export interface RunToCompletionOptions {
   flushOutbox?: boolean;
   /** Max events published by that final flush. Defaults to 100. */
   maxOutboxFlush?: number;
+  /** Maximum time spent waiting for the final outbox flush (default 5,000 ms). */
+  outboxFlushTimeoutMs?: number;
   /** Log prefix for the job loop. Defaults to `"[runToCompletion]"`. */
   logPrefix?: string;
 }
@@ -170,10 +173,12 @@ export async function runToCompletion(
     jobHeartbeatIntervalMs = HOST_DEFAULTS.jobHeartbeatIntervalMs,
     flushOutbox = true,
     maxOutboxFlush = HOST_DEFAULTS.maxOutboxFlushPerTick,
+    outboxFlushTimeoutMs = HOST_DEFAULTS.outboxFlushTimeoutMs,
     logPrefix = "[runToCompletion]",
   } = options;
   // Before the run is created: a bad option must not leave one behind.
   assertTimerMs("jobHeartbeatIntervalMs", jobHeartbeatIntervalMs);
+  assertTimerMs("outboxFlushTimeoutMs", outboxFlushTimeoutMs);
 
   const created = await kernel.dispatch(command);
   const workflowRunId = created.workflowRunId;
@@ -248,13 +253,27 @@ export async function runToCompletion(
   if (flushOutbox) {
     // Best effort: the events are already durable in the outbox, and a
     // publish failure must not turn a finished run into a thrown request.
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      await kernel.dispatch({
-        type: "outbox.flush",
-        maxEvents: maxOutboxFlush,
-      });
+      const outcome = await Promise.race([
+        kernel.dispatch({
+          type: "outbox.flush",
+          maxEvents: maxOutboxFlush,
+          claimDurationMs: Math.min(
+            MAX_TIMER_MS,
+            Math.ceil(outboxFlushTimeoutMs + 60_000),
+          ),
+        }),
+        new Promise<"timeout">((resolve) => {
+          timer = setTimeout(() => resolve("timeout"), outboxFlushTimeoutMs);
+        }),
+      ]);
+      if (outcome === "timeout")
+        console.error(`${logPrefix} outbox.flush timed out`);
     } catch (error) {
       console.error(`${logPrefix} outbox.flush failed:`, error);
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
 

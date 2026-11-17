@@ -10,11 +10,13 @@ import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { defineStage } from "../../core/stage-factory.js";
 import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
+import { createKernel } from "../../kernel/kernel.js";
 import {
   createPluginRunner,
   definePlugin,
   type PluginDefinition,
 } from "../../kernel/plugins.js";
+import type { EventSink } from "../../kernel/ports.js";
 import { createTestKernel } from "../utils/index.js";
 
 // ---------------------------------------------------------------------------
@@ -55,6 +57,237 @@ function createTestKernelWithPlugins(
 // ---------------------------------------------------------------------------
 
 describe("kernel: outbox.flush", () => {
+  it.each([
+    "claimOutboxDelivery",
+    "isOutboxDeliveryClaimActive",
+    "completeOutboxDelivery",
+    "failOutboxDelivery",
+  ])("rejects an adapter that still implements an older port missing %s", (method) => {
+    const { persistence, blobStore, jobTransport, eventSink, clock } =
+      createTestKernel();
+    const legacy = Object.create(persistence);
+    legacy[method] = undefined;
+    expect(() =>
+      createKernel({
+        persistence: legacy,
+        blobStore,
+        jobTransport,
+        eventSink,
+        clock,
+        registry: { getWorkflow: () => undefined },
+      }),
+    ).toThrow(`missing ${method}`);
+  });
+
+  it("keeps a claimed event unpublished until the sink accepts it", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, persistence, clock, eventSink } = createTestKernel([
+      workflow,
+    ]);
+    await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "claimed-not-published",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+
+    const claim = persistence.claimOutboxDelivery.bind(persistence);
+    persistence.claimOutboxDelivery = async (...args) => {
+      await claim(...args);
+      throw new Error("process died after claim");
+    };
+    await expect(kernel.dispatch({ type: "outbox.flush" })).rejects.toThrow(
+      "process died after claim",
+    );
+    expect(await persistence.getUnpublishedOutboxEvents()).toHaveLength(1);
+    persistence.claimOutboxDelivery = claim;
+    clock.advance(60_001);
+    expect((await kernel.dispatch({ type: "outbox.flush" })).published).toBe(1);
+    expect(eventSink.events).toHaveLength(1);
+  });
+
+  it("redelivers with the same identity after a crash after sink acceptance", async () => {
+    const workflow = createSimpleWorkflow();
+    const identities: string[] = [];
+    const { kernel, persistence, clock } = createTestKernel<EventSink>(
+      [workflow],
+      {
+        eventSink: {
+          async emit(_event, delivery) {
+            identities.push(delivery!.eventId);
+          },
+        },
+      },
+    );
+    await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "death-after-emit",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+    const complete = persistence.completeOutboxDelivery.bind(persistence);
+    persistence.completeOutboxDelivery = async () => {
+      throw new Error("process died");
+    };
+    await expect(kernel.dispatch({ type: "outbox.flush" })).rejects.toThrow(
+      "process died",
+    );
+    persistence.completeOutboxDelivery = complete;
+    clock.advance(60_001);
+    expect((await kernel.dispatch({ type: "outbox.flush" })).published).toBe(1);
+    expect(identities).toHaveLength(2);
+    expect(identities[0]).toBe(identities[1]);
+  });
+
+  it("does not redeliver when the process dies after the published write", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, persistence, clock, eventSink } = createTestKernel([
+      workflow,
+    ]);
+    await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "death-after-published",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+    const complete = persistence.completeOutboxDelivery.bind(persistence);
+    persistence.completeOutboxDelivery = async (...args) => {
+      await complete(...args);
+      throw new Error("process died");
+    };
+    await expect(kernel.dispatch({ type: "outbox.flush" })).rejects.toThrow(
+      "process died",
+    );
+    persistence.completeOutboxDelivery = complete;
+    clock.advance(60_001);
+    expect((await kernel.dispatch({ type: "outbox.flush" })).published).toBe(0);
+    expect(eventSink.events).toHaveLength(1);
+  });
+
+  it("retries when the process dies after the retry-and-release write", async () => {
+    const workflow = createSimpleWorkflow();
+    let shouldFail = true;
+    const delivered: string[] = [];
+    const { kernel, persistence } = createTestKernel<EventSink>([workflow], {
+      eventSink: {
+        async emit(event) {
+          if (shouldFail) throw new Error("sink down");
+          delivered.push(event.type);
+        },
+      },
+    });
+    await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "death-after-release",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+    const fail = persistence.failOutboxDelivery.bind(persistence);
+    persistence.failOutboxDelivery = async (...args) => {
+      await fail(...args);
+      throw new Error("process died");
+    };
+    await expect(kernel.dispatch({ type: "outbox.flush" })).rejects.toThrow(
+      "process died",
+    );
+    persistence.failOutboxDelivery = fail;
+    expect(
+      (await persistence.getUnpublishedOutboxEvents())[0]?.retryCount,
+    ).toBe(1);
+    shouldFail = false;
+    expect((await kernel.dispatch({ type: "outbox.flush" })).published).toBe(1);
+    expect(delivered).toEqual(["workflow:created"]);
+  });
+
+  it("does not start the next sink call when its batch claim has expired", async () => {
+    const workflow = createSimpleWorkflow();
+    let started!: () => void;
+    let unblock!: () => void;
+    const inFlight = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const blocked = new Promise<void>((resolve) => {
+      unblock = resolve;
+    });
+    const seen: string[] = [];
+    const { kernel, clock } = createTestKernel<EventSink>([workflow], {
+      eventSink: {
+        async emit(event) {
+          seen.push(event.workflowRunId);
+          if (seen.length === 1) {
+            started();
+            await blocked;
+          }
+        },
+      },
+    });
+    for (const key of ["slow-first", "slow-second"]) {
+      await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: key,
+        workflowId: "test-workflow",
+        input: { data: key },
+      });
+    }
+    const flush = kernel.dispatch({
+      type: "outbox.flush",
+      claimDurationMs: 1_000,
+    });
+    await inFlight;
+    clock.advance(1_001);
+    unblock();
+    await flush;
+    expect(seen).toHaveLength(1);
+    expect((await kernel.dispatch({ type: "outbox.flush" })).published).toBe(1);
+    expect(seen).toHaveLength(2);
+  });
+
+  it("does not emit a later event while an earlier event of the run is in flight", async () => {
+    const workflow = createSimpleWorkflow();
+    let started!: () => void;
+    let unblock!: () => void;
+    const inFlight = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const blocked = new Promise<void>((resolve) => {
+      unblock = resolve;
+    });
+    const emitted: string[] = [];
+    const { kernel } = createTestKernel<EventSink>([workflow], {
+      eventSink: {
+        async emit(event) {
+          if (event.type === "workflow:created") {
+            started();
+            await blocked;
+          }
+          emitted.push(event.type);
+        },
+      },
+    });
+    await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "ordered-in-flight",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+    await kernel.dispatch({ type: "run.claimPending", workerId: "w1" });
+
+    const first = kernel.dispatch({ type: "outbox.flush", maxEvents: 1 });
+    await inFlight;
+    try {
+      expect(
+        (await kernel.dispatch({ type: "engine.stats" })).outbox,
+      ).toMatchObject({ available: true, unpublished: 2 });
+      await kernel.dispatch({ type: "outbox.flush", maxEvents: 1 });
+      expect([...emitted]).toEqual([]);
+    } finally {
+      unblock();
+      await first;
+    }
+    await kernel.dispatch({ type: "outbox.flush", maxEvents: 1 });
+    expect(emitted).toEqual(["workflow:created", "workflow:started"]);
+  });
+
   it("events are written to outbox after dispatch, not emitted directly", async () => {
     const workflow = createSimpleWorkflow();
     const { kernel, flush, eventSink } = createTestKernel([workflow]);
@@ -474,9 +707,8 @@ describe("kernel: outbox.flush", () => {
 
     expect(result.published).toBe(0);
     expect(result.deadLettered).toBe(1);
-    // Only workflow:started retries; workflow:created is in the DLQ and is
-    // already reported by deadLettered.
-    expect(result.failed).toBe(1);
+    // Only the first event was claimed. The later event remains pending.
+    expect(result.failed).toBe(0);
 
     // And the count was honest: exactly that one event comes round again.
     const next = await flush();

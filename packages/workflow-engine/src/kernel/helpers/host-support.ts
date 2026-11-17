@@ -78,6 +78,8 @@ export const HOST_DEFAULTS = {
   maxSuspendedChecksPerTick: 10,
   /** Max outbox events to flush per maintenance tick. */
   maxOutboxFlushPerTick: 100,
+  /** Maximum time a maintenance tick waits for the event sink. */
+  outboxFlushTimeoutMs: 5_000,
   /** Job lease heartbeat interval (ms). */
   jobHeartbeatIntervalMs: 60_000,
   /** Fallback max attempts when a job/queue doesn't specify one. */
@@ -492,6 +494,8 @@ export interface RunMaintenanceTickOptions {
   maxSuspendedChecksPerTick?: number;
   /** Defaults to `HOST_DEFAULTS.maxOutboxFlushPerTick`. */
   maxOutboxFlushPerTick?: number;
+  /** Maximum wait for this tick's outbox flush, in milliseconds (default 5,000). */
+  outboxFlushTimeoutMs?: number;
   /** Defaults to `HOST_DEFAULTS.staleLeaseThresholdMs`. */
   staleLeaseThresholdMs?: number;
   /** Defaults to `HOST_DEFAULTS.jobAbsoluteTimeoutMs`. Pass 0 to disable the absolute tier. */
@@ -524,10 +528,9 @@ export interface MaintenanceTickCounts {
   /** Terminal runs `run.purge` deleted this tick; 0 unless `retention` is set. */
   purged: number;
   /**
-   * Events the flush claimed but could not publish and which the next
-   * flush will retry: the ones whose emit threw, plus the later events of
-   * those same runs, held back to keep per-run order. They stay committed
-   * in the outbox. Disjoint from `eventsDeadLettered`.
+   * Events whose emit failed and whose claims were released for retry.
+   * Later events remain pending and are not included. Disjoint from
+   * `eventsDeadLettered`.
    */
   eventsFailed: number;
   /** Events the flush moved to the DLQ (retry budget exhausted). */
@@ -535,7 +538,7 @@ export interface MaintenanceTickCounts {
   /**
    * `"degraded"` when the sink refused at least one event this tick. Runs
    * keep progressing regardless — the poller, not the sink, advances a run.
-   * A tick whose `outbox.flush` itself threw also reports `"degraded"`.
+   * A tick whose `outbox.flush` threw or timed out also reports `"degraded"`.
    */
   eventSinkStatus: EventSinkStatus;
   /** First publish failure of this tick, when degraded. */
@@ -615,12 +618,14 @@ export async function runMaintenanceTick(
     maxClaimsPerTick = HOST_DEFAULTS.maxClaimsPerTick,
     maxSuspendedChecksPerTick = HOST_DEFAULTS.maxSuspendedChecksPerTick,
     maxOutboxFlushPerTick = HOST_DEFAULTS.maxOutboxFlushPerTick,
+    outboxFlushTimeoutMs = HOST_DEFAULTS.outboxFlushTimeoutMs,
     staleLeaseThresholdMs = HOST_DEFAULTS.staleLeaseThresholdMs,
     jobAbsoluteTimeoutMs = HOST_DEFAULTS.jobAbsoluteTimeoutMs,
     logPrefix = HOST_DEFAULTS.logPrefix,
     serves,
     retention,
   } = options;
+  assertTimerMs("outboxFlushTimeoutMs", outboxFlushTimeoutMs);
 
   let claimed = 0;
   let suspendedChecked = 0;
@@ -679,16 +684,32 @@ export async function runMaintenanceTick(
   }
 
   // 4. Flush outbox → publish pending events through EventSink
+  let flushTimer: ReturnType<typeof setTimeout> | undefined;
   try {
-    const flushResult = await kernel.dispatch({
-      type: "outbox.flush",
-      maxEvents: maxOutboxFlushPerTick,
-    });
-    eventsFlushed = flushResult.published;
-    eventsFailed = flushResult.failed;
-    eventsDeadLettered = flushResult.deadLettered;
-    eventSinkStatus = flushResult.eventSinkStatus;
-    eventSinkError = flushResult.eventSinkError;
+    const flushResult = await Promise.race([
+      kernel.dispatch({
+        type: "outbox.flush",
+        maxEvents: maxOutboxFlushPerTick,
+        claimDurationMs: Math.min(
+          MAX_TIMER_MS,
+          Math.ceil(outboxFlushTimeoutMs + 60_000),
+        ),
+      }),
+      new Promise<undefined>((resolve) => {
+        flushTimer = setTimeout(() => resolve(undefined), outboxFlushTimeoutMs);
+      }),
+    ]);
+    if (flushResult === undefined) {
+      eventSinkStatus = "degraded";
+      eventSinkError = `outbox.flush timed out after ${outboxFlushTimeoutMs}ms`;
+      console.error(`${logPrefix} ${eventSinkError}`);
+    } else {
+      eventsFlushed = flushResult.published;
+      eventsFailed = flushResult.failed;
+      eventsDeadLettered = flushResult.deadLettered;
+      eventSinkStatus = flushResult.eventSinkStatus;
+      eventSinkError = flushResult.eventSinkError;
+    }
   } catch (error) {
     // The flush itself failed (the outbox query, not an individual emit).
     // Nothing was delivered this tick either, so the sink is degraded from
@@ -696,6 +717,8 @@ export async function runMaintenanceTick(
     console.error(`${logPrefix} outbox.flush error:`, error);
     eventSinkStatus = "degraded";
     eventSinkError = toErrorMessage(error);
+  } finally {
+    if (flushTimer) clearTimeout(flushTimer);
   }
 
   // 5. Reap stuck runs → fail runs with no activity past threshold

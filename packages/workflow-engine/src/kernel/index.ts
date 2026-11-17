@@ -166,6 +166,7 @@ export type {
   JobQueueStats,
   JobTransport,
   KernelServices,
+  OutboxDeliveryMetadata,
   OutboxRecord,
   Persistence,
   Scheduler,

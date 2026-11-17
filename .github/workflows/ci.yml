@@ -101,6 +101,8 @@ jobs:
           pnpm install --frozen-lockfile
           --filter @bratsos/workflow-engine
           --filter @bratsos/workflow-engine-console
+          --filter @bratsos/workflow-engine-host-node
+          --filter @bratsos/workflow-engine-host-serverless
           --filter "./packages/prisma-fixtures/*"
 
       - name: Set the database session timezone
@@ -135,6 +137,13 @@ jobs:
 
       - name: Run Postgres conformance tests
         run: pnpm --filter @bratsos/workflow-engine run test:pg
+        env:
+          NODE_ENV: test
+
+      - name: Run host outbox recovery tests on Postgres
+        run: |
+          pnpm --filter @bratsos/workflow-engine-host-node exec vitest run --hookTimeout=30000 --testTimeout=30000 src/__tests__/outbox-prisma.test.ts
+          pnpm --filter @bratsos/workflow-engine-host-serverless exec vitest run --hookTimeout=30000 --testTimeout=30000 src/__tests__/outbox-prisma.test.ts
         env:
           NODE_ENV: test
 
@@ -185,6 +194,8 @@ jobs:
           pnpm install --frozen-lockfile
           --filter @bratsos/workflow-engine
           --filter @bratsos/workflow-engine-console
+          --filter @bratsos/workflow-engine-host-node
+          --filter @bratsos/workflow-engine-host-serverless
           --filter "./packages/prisma-fixtures/*"
 
       - name: Build engine for the console Prisma 8 shim import
@@ -192,6 +203,11 @@ jobs:
 
       - name: Run engine SQLite conformance tests
         run: pnpm --filter @bratsos/workflow-engine run test:sqlite
+
+      - name: Run host outbox recovery tests on SQLite
+        run: |
+          pnpm --filter @bratsos/workflow-engine-host-node exec vitest run --hookTimeout=30000 --testTimeout=30000 src/__tests__/outbox-prisma.test.ts
+          pnpm --filter @bratsos/workflow-engine-host-serverless exec vitest run --hookTimeout=30000 --testTimeout=30000 src/__tests__/outbox-prisma.test.ts
 
       - name: Run console SQLite conformance tests
         run: |

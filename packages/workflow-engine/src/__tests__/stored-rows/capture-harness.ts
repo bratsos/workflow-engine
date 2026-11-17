@@ -4,11 +4,13 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import type { KernelEvent } from "../../kernel/events.js";
 import {
   executeJobWithHeartbeat,
   runMaintenanceTick,
 } from "../../kernel/helpers/index.js";
 import { createKernel, createWorkflowRegistry } from "../../kernel/kernel.js";
+import type { OutboxDeliveryMetadata } from "../../kernel/ports.js";
 import { CollectingEventSink, FakeClock } from "../../kernel/testing/index.js";
 import {
   createPrismaAICallLogger,
@@ -53,6 +55,7 @@ interface Runtime {
   jobTransport: ReturnType<typeof createPrismaJobQueue>;
   clock: FakeClock;
   eventSink: CollectingEventSink;
+  deliveries: Array<{ event: KernelEvent; eventId: string }>;
 }
 
 export async function openCaptureDatabase(): Promise<CaptureDatabase> {
@@ -149,6 +152,15 @@ function createRuntime(
   const blobStore = createPrismaBlobStore(client as any);
   const aiLogger = createPrismaAICallLogger(client as any, options);
   const eventSink = new CollectingEventSink();
+  const deliveries: Array<{ event: KernelEvent; eventId: string }> = [];
+  const emit = eventSink.emit.bind(eventSink);
+  eventSink.emit = async (
+    event: KernelEvent,
+    delivery?: OutboxDeliveryMetadata,
+  ) => {
+    await emit(event);
+    if (delivery) deliveries.push({ event, eventId: delivery.eventId });
+  };
   const kernel = createKernel({
     persistence,
     jobTransport,
@@ -159,7 +171,15 @@ function createRuntime(
     registry: createWorkflowRegistry([scenario.workflow]),
     services: { aiLogger, ai: aiFactoryForScenario(scenario) },
   });
-  return { client, kernel, persistence, jobTransport, clock, eventSink };
+  return {
+    client,
+    kernel,
+    persistence,
+    jobTransport,
+    clock,
+    eventSink,
+    deliveries,
+  };
 }
 
 /** One host round matching the liveness-sweep test's claim/execute/poll order. */

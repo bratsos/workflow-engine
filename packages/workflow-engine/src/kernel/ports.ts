@@ -454,9 +454,17 @@ export interface JobTransport {
 // EventSink
 // ============================================================================
 
+/** Stable identity of one durable outbox event. */
+export interface OutboxDeliveryMetadata {
+  readonly eventId: string;
+  readonly workflowRunId: string;
+  readonly sequence: number;
+  readonly attempt: number;
+}
+
 /** Event publishing (replaces global EventBus). */
 export interface EventSink {
-  emit(event: KernelEvent): Promise<void>;
+  emit(event: KernelEvent, delivery?: OutboxDeliveryMetadata): Promise<void>;
 }
 
 // ============================================================================

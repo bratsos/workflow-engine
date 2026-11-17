@@ -107,6 +107,8 @@ export interface NodeHostConfig {
 
   /** Max outbox events to flush per tick (default: 100). */
   maxOutboxFlushPerTick?: number;
+  /** Maximum time a maintenance tick waits for the outbox flush (default: 5,000 ms). */
+  outboxFlushTimeoutMs?: number;
 
   /**
    * Delete finished runs older than `retention.olderThanMs` (with their
@@ -223,6 +225,7 @@ class NodeHostImpl implements NodeHost {
   private readonly serves: readonly ServedDefinition[] | "all" | undefined;
   private readonly maxSuspendedChecksPerTick: number;
   private readonly maxOutboxFlushPerTick: number;
+  private readonly outboxFlushTimeoutMs: number;
   private readonly retention: RetentionOptions | undefined;
   private readonly onTick: MaintenanceTickHook | undefined;
   private readonly jobHeartbeatIntervalMs: number;
@@ -260,6 +263,10 @@ class NodeHostImpl implements NodeHost {
       HOST_DEFAULTS.maxSuspendedChecksPerTick;
     this.maxOutboxFlushPerTick =
       config.maxOutboxFlushPerTick ?? HOST_DEFAULTS.maxOutboxFlushPerTick;
+    this.outboxFlushTimeoutMs = assertTimerMs(
+      "outboxFlushTimeoutMs",
+      config.outboxFlushTimeoutMs ?? HOST_DEFAULTS.outboxFlushTimeoutMs,
+    );
     this.retention = config.retention;
     if (config.onTick !== undefined && typeof config.onTick !== "function") {
       throw new TypeError(
@@ -413,6 +420,10 @@ class NodeHostImpl implements NodeHost {
           this.kernel.dispatch({
             type: "outbox.flush",
             maxEvents: this.maxOutboxFlushPerTick,
+            claimDurationMs: Math.min(
+              2_147_483_647,
+              Math.ceil(this.shutdownTimeoutMs + 60_000),
+            ),
           }),
           remaining,
         );
@@ -488,6 +499,7 @@ class NodeHostImpl implements NodeHost {
       ...(this.serves !== undefined ? { serves: this.serves } : {}),
       maxSuspendedChecksPerTick: this.maxSuspendedChecksPerTick,
       maxOutboxFlushPerTick: this.maxOutboxFlushPerTick,
+      outboxFlushTimeoutMs: this.outboxFlushTimeoutMs,
       staleLeaseThresholdMs: this.staleLeaseThresholdMs,
       jobAbsoluteTimeoutMs: this.jobAbsoluteTimeoutMs,
       ...(this.retention !== undefined ? { retention: this.retention } : {}),

@@ -97,7 +97,7 @@ export interface ServerlessHostConfig {
   flushOutboxAfterJob?: boolean;
 
   /**
-   * Upper bound (ms) on the post-job outbox flush (default: 5_000). Must be a number from 1 to 2147483647 (a timer honours nothing else); anything else throws a `RangeError` from `createServerlessHost`. Nothing
+   * Upper bound (ms) on post-job and maintenance outbox flushes (default: 5_000). Must be a number from 1 to 2147483647 (a timer honours nothing else); anything else throws a `RangeError` from `createServerlessHost`. Nothing
    * switches the bound off: pass 2147483647 to wait for practically any flush.
    */
   outboxFlushTimeoutMs?: number;
@@ -307,6 +307,10 @@ class ServerlessHostImpl implements ServerlessHost {
         this.kernel.dispatch({
           type: "outbox.flush",
           maxEvents: this.maxOutboxFlushPerTick,
+          claimDurationMs: Math.min(
+            2_147_483_647,
+            Math.ceil(this.outboxFlushTimeoutMs + 60_000),
+          ),
         }),
         timeout,
       ]);
@@ -395,6 +399,7 @@ class ServerlessHostImpl implements ServerlessHost {
       ...(this.serves !== undefined ? { serves: this.serves } : {}),
       maxSuspendedChecksPerTick: this.maxSuspendedChecksPerTick,
       maxOutboxFlushPerTick: this.maxOutboxFlushPerTick,
+      outboxFlushTimeoutMs: this.outboxFlushTimeoutMs,
       staleLeaseThresholdMs: this.staleLeaseThresholdMs,
       jobAbsoluteTimeoutMs: this.jobAbsoluteTimeoutMs,
       ...(this.retention !== undefined ? { retention: this.retention } : {}),

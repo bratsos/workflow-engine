@@ -994,20 +994,13 @@ export interface PersistenceCore {
   /** Increment retry count for a failed outbox event. Returns new count. */
   incrementOutboxRetryCount(id: string): Promise<number>;
 
-  /**
-   * Move an outbox event to DLQ: sets `dlqAt` and clears `publishedAt` (the
-   * claim `claimUnpublishedOutboxEvents` stamped) in the SAME write. A
-   * stamped event reads as published, so an implementation that leaves the
-   * stamp for a later `releaseOutboxEvents` loses the event when the process
-   * dies between the two: a replay would make it live but stamped.
-   */
+  /** Move an event to the DLQ and clear any legacy publication stamp and claim. */
   moveOutboxEventToDLQ(id: string): Promise<void>;
 
   /**
    * Reset DLQ events so they can be reprocessed by outbox.flush: clears
-   * `dlqAt`, `retryCount` and any `publishedAt` (a dead letter was never
-   * delivered, so a stamp on one is a claim a crashed flush left). Returns
-   * count reset.
+   * `dlqAt`, `retryCount`, the claim and any legacy `publishedAt` stamp.
+   * Returns the count reset. A previous partial delivery can be repeated.
    */
   replayDLQEvents(maxEvents: number): Promise<number>;
 
@@ -1019,19 +1012,39 @@ export interface PersistenceCore {
   getUnpublishedOutboxEvents(limit?: number): Promise<OutboxRecord[]>;
 
   /**
-   * Atomically claim up to `limit` unpublished events for this caller by
-   * setting `publishedAt`, ordered by (workflowRunId, sequence). Two
-   * processes flushing the same outbox concurrently must never both
-   * receive the same event: on Postgres this is one
-   * `UPDATE ... FROM (SELECT ... FOR UPDATE SKIP LOCKED) RETURNING`; other
-   * stores use a compare-and-set on `publishedAt IS NULL` per row. Events
-   * whose publication then fails are handed back with
-   * `releaseOutboxEvents`.
+   * Claim the first live event of each eligible run. `claim` is an ISO UTC
+   * expiry, `|`, and a unique owner ID; it must be stored atomically without
+   * changing `publishedAt`. An earlier unpublished, non-dead-lettered event
+   * blocks the rest of its run. Excluded runs are skipped.
    */
-  claimUnpublishedOutboxEvents(limit?: number): Promise<OutboxRecord[]>;
+  claimOutboxDelivery(
+    limit: number,
+    claim: string,
+    now: Date,
+    excludedRunIds: readonly string[],
+  ): Promise<OutboxRecord[]>;
 
-  /** Un-claim events (clear `publishedAt`) so a later flush retries them. */
-  releaseOutboxEvents(ids: string[]): Promise<void>;
+  /** Check ownership, expiry, publication and DLQ state before the sink. */
+  isOutboxDeliveryClaimActive(
+    id: string,
+    claim: string,
+    now: Date,
+  ): Promise<boolean>;
+
+  /** Publish only a live row still owned by this claim after sink acceptance. */
+  completeOutboxDelivery(
+    id: string,
+    claim: string,
+    now: Date,
+  ): Promise<boolean>;
+
+  /** Atomically count a failure, release the claim, and dead-letter at the limit. */
+  failOutboxDelivery(
+    id: string,
+    claim: string,
+    maxRetries: number,
+    now: Date,
+  ): Promise<"retry" | "dead-lettered" | "lost">;
 
   /** Mark events as published. */
   markOutboxEventsPublished(ids: string[]): Promise<void>;

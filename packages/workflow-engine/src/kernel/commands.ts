@@ -346,6 +346,8 @@ export interface LeaseReapStaleResult {
 export interface OutboxFlushCommand {
   readonly type: "outbox.flush";
   readonly maxEvents?: number;
+  /** Claim lifetime in milliseconds. Defaults to 60 seconds. */
+  readonly claimDurationMs?: number;
 }
 
 /**
@@ -364,10 +366,8 @@ export interface OutboxFlushResult {
   readonly published: number;
   /**
    * Events this flush claimed but could not publish **and which the next
-   * flush will retry** — the ones whose emit threw, plus the later events
-   * of those same runs, held back so nothing is redelivered out of order.
-   * They were released (their `publishedAt` cleared), so this is a
-   * delivery-lag signal, not data loss. Events that exhausted their retry
+   * flush will retry** — the ones whose emit threw and whose claim was
+   * released. Later events of that run are left pending. Events that exhausted their retry
    * budget in this same pass are not counted here; they are `deadLettered`.
    */
   readonly failed: number;
@@ -622,7 +622,7 @@ export interface EngineStatsResult {
     readonly oldestPendingAgeMs: number | null;
   }>;
   readonly outbox: EngineStatsSection<{
-    /** Events the next `outbox.flush` will deliver: not published, not dead-lettered. */
+    /** Unpublished, non-dead-lettered events, including live claims. */
     readonly unpublished: number;
     /** Age of the oldest of those (from `occurredAt`), or `null` when there are none. */
     readonly oldestUnpublishedAgeMs: number | null;

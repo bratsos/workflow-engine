@@ -35,7 +35,7 @@ const host = createServerlessHost({
   maxSuspendedChecksPerTick: 10,
   maxOutboxFlushPerTick: 100,
   flushOutboxAfterJob: true,      // default: publish this job's events before returning
-  outboxFlushTimeoutMs: 10_000,   // bound on that flush; errors are logged, never thrown
+  outboxFlushTimeoutMs: 10_000,   // bounds post-job and maintenance flushes; errors are logged, never thrown
 
   // Opt-in retention: run.purge deletes terminal runs older than this on
   // every maintenance tick. Off unless set.

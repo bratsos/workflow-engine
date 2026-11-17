@@ -128,14 +128,16 @@ interface PersistenceCore {
 
   // Outbox DLQ operations
   incrementOutboxRetryCount(id: string): Promise<number>;
-  moveOutboxEventToDLQ(id: string): Promise<void>;  // sets dlqAt AND clears the claim stamp (publishedAt) in one write
+  moveOutboxEventToDLQ(id: string): Promise<void>;  // clears a legacy stamp and claim when moving to DLQ
   replayDLQEvents(maxEvents: number): Promise<number>;  // clears dlqAt, retryCount and any publishedAt
 
   // Outbox operations
   appendOutboxEvents(events: CreateOutboxEventInput[]): Promise<void>;
   getUnpublishedOutboxEvents(limit?: number): Promise<OutboxRecord[]>;
-  claimUnpublishedOutboxEvents(limit?: number): Promise<OutboxRecord[]>;
-  releaseOutboxEvents(ids: string[]): Promise<void>;
+  claimOutboxDelivery(limit: number, claim: string, now: Date, excludedRunIds: readonly string[]): Promise<OutboxRecord[]>;
+  isOutboxDeliveryClaimActive(id: string, claim: string, now: Date): Promise<boolean>;
+  completeOutboxDelivery(id: string, claim: string, now: Date): Promise<boolean>;
+  failOutboxDelivery(id: string, claim: string, maxRetries: number, now: Date): Promise<"retry" | "dead-lettered" | "lost">;
   markOutboxEventsPublished(ids: string[]): Promise<void>;
 
   // Idempotency operations
@@ -795,6 +797,7 @@ model OutboxEvent {
   causationId     String
   occurredAt      DateTime
   publishedAt     DateTime?
+  deliveryClaim   String?
   retryCount      Int       @default(0)
   dlqAt           DateTime?
 
@@ -811,7 +814,7 @@ model OutboxEvent {
 }
 ```
 
-Backs the kernel's transactional outbox: command handlers write events here in the same transaction as their state changes, and `outbox.flush` publishes them to the `EventSink` afterward. The flush **claims** rows before it emits them (`claimUnpublishedOutboxEvents` stamps `publishedAt` atomically — one `UPDATE ... FROM (SELECT ... FOR UPDATE SKIP LOCKED) RETURNING` on Postgres, a per-row compare-and-set on `publishedAt IS NULL` on SQLite), so Postgres can safely have multiple processes flushing the same outbox. SQLite deployments use one process per file; do not share a SQLite file across hosts or processes. An emit that throws hands the event (and the rest of its run, to keep order) back with `releaseOutboxEvents` for the next flush. A process that dies between the claim and the emit leaves that event stamped, and no later flush delivers it: the claim is what stops two hosts delivering one event twice, and it makes delivery at-most-once per claim, retried only after a sink failure (see 03-runtime-setup.md, "Degraded event sink"). Read this table when you need every event. A custom `WorkflowPersistence` must implement both methods; the conformance suite covers them. `dlqAt` marks events that exhausted their retry budget; `replayDLQEvents` resets them for reprocessing.
+Events commit with their state changes. Events are delivered at least once while retries remain: a crash after sink acceptance but before the published write, an emit still in flight when its claim expires, or a partial plugin failure can cause duplicates. Deduplicate using the outbox `eventId` supplied to the sink or plugin. Failures exhaust the retry budget and move the event to the DLQ; `plugin.replayDLQ` makes it eligible again. The engine’s progress never depends on the sink. Claims are stored in `deliveryClaim`, not `publishedAt`; custom adapters must implement the four delivery methods above. See 03-runtime-setup.md for expiry, ordering and upgrade boundaries.
 
 ### IdempotencyKey Model
 
@@ -1431,18 +1434,7 @@ databases and in the Postgres claim statement. The dead-letter count is
 first non-NULL entry, independent of how the file stores dates) and, on
 Postgres, a `dlqAt` range from 1970-01-01 to 9999-12-31 (a dead letter stamped before 1970 by a test clock is not counted) (a lone `dlqAt > epoch`
 or `IS NOT NULL` is estimated at a third or all of an unanalysed table, which
-made a parallel sequential scan the cheaper plan). One limit remains: on a
-Postgres table with no statistics the claim at a limit below about 50 walks the
-unique `(workflowRunId, sequence)` index, which reads the published rows that
-sort before the live ones (104,706 buffers and about 50 ms at 500,000 published
-events, against 413 before this change); the default limit of 100 and every
-limit after `ANALYZE` use `outbox_events_publishedAt_idx`. Forms that avoid the
-walk sort the whole live backlog on every flush (306 ms at 300,000 live events
-against 18 ms), so the planner's choice with statistics was kept.
-`stats-query-plans.test.ts` asserts the plans of the stats queries and of the
-claim on SQLite and Postgres, and on Postgres at 500,000 published events with
-no forced plan, before and after `ANALYZE`. A custom SQL adapter should check
-its own plans with 100,000 terminal rows present and with no statistics.
+made a parallel sequential scan the cheaper plan). The claim selects the first live event of each run from the unpublished index before acquiring row locks. This avoids both walking published history and a quadratic join across an active backlog. PostgreSQL uses a materialized set of run heads; SQLite ranks the live rows before compare-and-set claims. `stats-query-plans.test.ts` explains counts, claims and owner-guarded writes as an ordinary PostgreSQL role on empty tables and with 10,000 and 100,000 rows, before and after `ANALYZE`; it also covers 10,000 live events alongside 100,000 published events, and checks SQLite plans. A custom SQL adapter should check its own plans with a live backlog and without statistics.
 
 Two suites wait on real time (no injectable clock, no "flush pending writes"
 call), so keep the runner's per-test timeout at its 5 s default or higher.

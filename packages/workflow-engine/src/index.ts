@@ -350,6 +350,7 @@ export type {
   EventSink,
   JobTransport,
   KernelServices,
+  OutboxDeliveryMetadata,
   Persistence,
   Scheduler,
   StepLedger,

@@ -767,6 +767,7 @@ describe("NodeHost", () => {
     ["jobPollIntervalMs", false],
     ["postJobYieldMs", true],
     ["jobHeartbeatIntervalMs", false],
+    ["outboxFlushTimeoutMs", false],
     ["shutdownTimeoutMs", false],
   ] as const;
   for (const [option, zeroIsOff] of TIMER_OPTIONS) {

@@ -107,6 +107,7 @@ interface RunEvent {
   eventType: string;
   occurredAt: string;
   publishedAt: string | null;
+  claimExpiresAt?: string;
   retryCount: number;
   dlqAt: string | null;
 }
@@ -1250,7 +1251,7 @@ function RunDetailView({
                     <td>{evt.sequence}</td>
                     <td>{evt.eventType}</td>
                     <td>{formatAbsolute(evt.occurredAt)}</td>
-                    <td>{evt.publishedAt ? formatAbsolute(evt.publishedAt) : "pending"}</td>
+                    <td>{evt.publishedAt ? formatAbsolute(evt.publishedAt) : evt.claimExpiresAt && Date.parse(evt.claimExpiresAt) > Date.now() ? "claimed" : "pending"}</td>
                     <td>{evt.retryCount}</td>
                     <td>
                       {evt.dlqAt ? (

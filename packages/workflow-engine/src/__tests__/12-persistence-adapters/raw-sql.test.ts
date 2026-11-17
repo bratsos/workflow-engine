@@ -234,18 +234,19 @@ describe("PrismaJobQueue.dequeue on a row without a payload", () => {
   });
 });
 
-describe("PrismaWorkflowPersistence.claimUnpublishedOutboxEvents raw SQL", () => {
-  it("claims with FOR UPDATE SKIP LOCKED and stamps publishedAt from the clock in one statement", async () => {
+describe("PrismaWorkflowPersistence.claimOutboxDelivery raw SQL", () => {
+  it("claims an unblocked run head with SKIP LOCKED without stamping publishedAt", async () => {
     const now = new Date("2026-09-04T10:00:00.000Z");
+    const claim = "2026-09-04T10:01:00.000Z|owner";
     const row = {
       id: "evt-1",
       workflowRunId: "run-1",
       sequence: 1,
       eventType: "workflow:created",
-      payload: { type: "workflow:created" },
+      payload: {},
       causationId: "cmd-1",
       occurredAt: now,
-      publishedAt: now,
+      publishedAt: null,
       retryCount: 0,
       dlqAt: null,
     };
@@ -253,30 +254,21 @@ describe("PrismaWorkflowPersistence.claimUnpublishedOutboxEvents raw SQL", () =>
     const prisma = {
       $queryRawUnsafe: queryRawUnsafe,
     } as unknown as EnginePrismaClient;
-    const persistence = new PrismaWorkflowPersistence(prisma, {
-      now: () => now,
-    });
-
-    const claimed = await persistence.claimUnpublishedOutboxEvents(25);
-
-    expect(claimed).toEqual([row]);
+    const persistence = new PrismaWorkflowPersistence(prisma);
+    expect(await persistence.claimOutboxDelivery(25, claim, now, [])).toEqual([
+      row,
+    ]);
     const [sql, ...params] = queryRawUnsafe.mock.calls[0] as unknown as [
       string,
       ...unknown[],
     ];
-    expect(sql).toContain("FOR UPDATE SKIP LOCKED");
-    expect(sql).toContain(
-      '"publishedAt" IS NULL AND ("dlqAt" IS NULL OR "publishedAt" IS NOT NULL)',
-    );
-    expect(sql).toContain(
-      `SET "publishedAt" = ($2::timestamptz AT TIME ZONE 'UTC')`,
-    );
-    expect(sql).toContain("RETURNING");
-    expect(sql).not.toContain("NOW()");
-    expect(params).toEqual([25, now.toISOString()]);
+    expect(sql).toContain("FOR UPDATE OF e SKIP LOCKED");
+    expect(sql).toContain('SET "deliveryClaim" = $3');
+    expect(sql).toContain("DISTINCT ON");
+    expect(params).toEqual([25, `${now.toISOString()}~`, claim]);
   });
 
-  it("falls back to a per-row compare-and-set on SQLite", async () => {
+  it("uses a compare-and-set and never skips a claimed run head", async () => {
     const now = new Date("2026-09-04T11:00:00.000Z");
     const rows = [
       {
@@ -296,34 +288,23 @@ describe("PrismaWorkflowPersistence.claimUnpublishedOutboxEvents raw SQL", () =>
         retryCount: 0,
       },
     ];
-    const findMany = vi.fn(async () => rows);
-    // "a" was claimed by another flush between the read and the update.
-    const updateMany = vi.fn(async (args: any) => ({
-      count: args.where.id === "a" ? 0 : 1,
-    }));
-    // The SQLite date check reads through a raw query: answer it as an empty file.
-    const $queryRaw = vi.fn(async () => [
-      { col: "bound", lo: "text", loValue: "x", hi: "text", hiValue: "x" },
-    ]);
+    const updateMany = vi.fn(async () => ({ count: 0 }));
     const prisma = {
-      outboxEvent: { findMany, updateMany },
-      $queryRaw,
+      $queryRaw: vi.fn(async () => []),
+      outboxEvent: { findMany: vi.fn(async () => rows), updateMany },
     } as unknown as EnginePrismaClient;
     const persistence = new PrismaWorkflowPersistence(prisma, {
       databaseType: "sqlite",
-      now: () => now,
     });
-
-    const claimed = await persistence.claimUnpublishedOutboxEvents();
-
-    expect(claimed.map((e) => e.id)).toEqual(["b"]);
-    expect(claimed[0]!.publishedAt).toBe(now);
-    expect(updateMany).toHaveBeenCalledTimes(2);
-    expect(updateMany.mock.calls[0]![0].where).toEqual({
-      id: "a",
-      publishedAt: null,
-      dlqAt: null,
-    });
+    expect(
+      await persistence.claimOutboxDelivery(
+        10,
+        "2026-09-04T11:01:00.000Z|owner",
+        now,
+        [],
+      ),
+    ).toEqual([]);
+    expect(updateMany).toHaveBeenCalledTimes(1);
   });
 });
 

@@ -63,11 +63,12 @@ You can tune the host's polling frequency, lease times, and execution limits:
 | **`maxClaimsPerTick`** | `number` | `10` | Maximum number of pending workflow runs to claim in a single orchestration tick. |
 | **`maxSuspendedChecksPerTick`**| `number` | `10` | Maximum number of suspended stage completion checks to perform in a single tick. |
 | **`maxOutboxFlushPerTick`** | `number` | `100` | Maximum number of outbox events to publish in a single tick. |
+| **`outboxFlushTimeoutMs`** | `number` | `5000` | Maximum time a maintenance tick waits for the sink. An in-flight emit can continue after the timeout. |
 | **`retention`** | `{ olderThanMs, statuses?, limit? }` | off | Delete terminal runs older than `olderThanMs` (with their stages, logs, artifacts, annotations, step ledger, job rows and blobs) through `run.purge` at the end of every tick. Nothing is deleted unless set. See [Run Retention](../troubleshooting/overview.md#run-retention). |
 | **`onTick`** | `(counts: MaintenanceTickCounts) => void \| Promise<void>` | none | Called after every orchestration tick with a copy of the counts that tick computed. Must be a function: anything else throws a `TypeError` from `createNodeHost`. It runs outside the tick, so ticks never wait for what it awaits (its synchronous code runs on the host's thread): at most one call is in flight, and a tick that finds the previous call still running skips the hook and logs one warning at the first skip. A hook that throws or rejects is caught and logged. A hook must not await `host.stop()`. See [Exporting gauges with `onTick`](#exporting-gauges-with-ontick). |
 | **`serves`** | `ServedDefinition[] \| "all"` | derived from the registry | Which definition versions this host may claim, poll and dequeue. Left unset, the kernel derives it from the registry, which is what makes a rolling deploy safe. `"all"` turns version filtering off entirely — the pre-1.0 behaviour. See [Definition versioning](../core-concepts/definition-versioning.md). |
 | **`shutdownTimeoutMs`** | `number` | `10000` (10s) | Upper bound on `stop()`: how long to wait for the in-flight orchestration tick and `onTick` call, then for the in-flight job to finish, and separately for the final outbox flush. |
-| **`flushOutboxOnStop`** | `boolean` | `true` | Run a final `outbox.flush` in `stop()`, so `workflow:completed` for a run this process finished is published before it exits rather than by whichever process ticks next. |
+| **`flushOutboxOnStop`** | `boolean` | `true` | Attempt a final `outbox.flush` in `stop()`; events not delivered before the timeout remain available to a later flush. |
 
 Every option that reaches a timer (`orchestrationIntervalMs`, `jobPollIntervalMs`, `postJobYieldMs`, `jobHeartbeatIntervalMs`, `shutdownTimeoutMs`) must be a number of milliseconds from `1` to `2147483647` (the longest delay a timer honours, about 24.8 days); `postJobYieldMs` may also be `0`, which turns the pause off. Anything else (`Infinity`, `NaN`, zero, a negative number) makes `createNodeHost` throw a `RangeError` that names the option, because a timer fires after 1 ms on such a value: an interval becomes a busy loop and a bound meant as "no limit" becomes the tightest one. Nothing switches `shutdownTimeoutMs` off; pass `2147483647` to wait for practically anything. `runAndWait` applies the same rule to `pollIntervalMs`, before it creates the run.
 
@@ -137,7 +138,7 @@ outbox flush.
 * **`healthy`** -- the last flush published everything it claimed.
 * **`degraded`** -- the last flush could not publish at least one event.
 
-A degraded sink is a delivery problem (latency, then dead letters you can replay), never a progress problem.
+Events are delivered at least once while retries remain: a crash after sink acceptance but before the published write, an emit still in flight when its claim expires, or a partial plugin failure can cause duplicates. Deduplicate using the outbox `eventId` supplied to the sink or plugin. Failures exhaust the retry budget and move the event to the DLQ; `plugin.replayDLQ` makes it eligible again. The engine’s progress never depends on the sink.
 Events live in the transactional outbox, the poller (not the sink) is what
 advances a run, and the events left behind are retried on the next flush. A
 run started while the sink is down still reaches `COMPLETED`.

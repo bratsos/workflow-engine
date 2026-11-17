@@ -117,7 +117,7 @@ run onto a version you do serve. See
 
 **What it was:** the raw `FOR UPDATE SKIP LOCKED` statements bound a JS `Date`, which Prisma sends as a `timestamptz`. Assigning that to the naive `timestamp` columns the schema declares -- or comparing the two -- converts it through the *session's* timezone, while everything Prisma's model API writes to the same columns is UTC. On `Europe/Zurich` every raw-written timestamp landed two hours in the future, so a lease could never look stale. (`NOW()` is wrong the same way.)
 
-**How it's fixed:** every raw statement converts its bound timestamps explicitly -- `$n::timestamptz AT TIME ZONE 'UTC'` -- so `job_queue.lockedAt`/`startedAt`, `workflow_runs.startedAt`/`updatedAt` and `outbox_events.publishedAt` mean the same thing as the columns Prisma writes, on any session timezone, with nothing for you to set. The Postgres conformance suite runs the lease sweep on a session pinned to `Pacific/Kiritimati` to keep it that way.
+**How it's fixed:** the raw lease and run-claim statements convert bound timestamps explicitly with `$n::timestamptz AT TIME ZONE 'UTC'`. Outbox publication uses a Prisma date write after sink acceptance. These values match the other Prisma timestamp columns on any session timezone. The Postgres conformance suite tests a session pinned to `Pacific/Kiritimati`.
 
 **Check your own schema:** the engine's timestamp columns must stay plain Prisma `DateTime` (naive `timestamp`), as the shipped `prisma/schema.prisma` declares them. Mapping them to `@db.Timestamptz` re-introduces the skew in the opposite direction.
 

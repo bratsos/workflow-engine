@@ -284,6 +284,25 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
     expect(events[0]?.occurredAt.toISOString()).toBe(at(2).toISOString());
   });
 
+  it("exposes the expiry of an unpublished delivery claim", async () => {
+    const expiry = new Date("2099-01-01T00:00:00.000Z");
+    await prisma.outboxEvent.updateMany({
+      where: { id: "event-1" },
+      data: {
+        publishedAt: null,
+        deliveryClaim: `${expiry.toISOString()}|owner`,
+      },
+    });
+    const detail = await reader().getRunDetail("run-day-1");
+    expect(detail?.events[0]).toMatchObject({
+      publishedAt: null,
+      claimExpiresAt: expiry,
+    });
+    expect((await reader().listRunEvents("run-day-1", 0))[0]).toMatchObject({
+      claimExpiresAt: expiry,
+    });
+  });
+
   it("reports queue health, suspended stages, dead letters, and workers", async () => {
     const port = reader();
     const health = await port.getQueueHealth();

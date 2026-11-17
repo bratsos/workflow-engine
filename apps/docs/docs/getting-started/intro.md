@@ -105,17 +105,8 @@ boundary, not only the realtime one.
   [Retry, Restart and Rerun](../core-concepts/redriving-runs.md)).
   A redrive keeps the same run id and appends to its history with a
   `redriveCount`, and can re-pin the run onto another definition version.
-- **Transactional outbox.** The outbox is how system events reach your
-  `EventSink` without phantom events: an event is written in the transaction
-  of the state change it describes. Each claimed event gets one delivery
-  attempt, and a sink failure is retried up to a retry budget and then
-  dead-lettered. It is not at-least-once: a process that dies between the
-  claim and the emit loses that event (the claim is what stops two hosts
-  delivering it twice), so a consumer that needs every event reads the
-  `outbox_events` table or the console, which keep the row. The outbox is
-  not how the engine wakes its own consumer, and the engine's progress never
-  depends on the sink (see
-  [Kernel and Ports](../core-concepts/kernel-and-ports.md#transactional-outbox-events)).
+- **Transactional outbox.** Events commit with the state change they describe. Events are delivered at least once while retries remain: a crash after sink acceptance but before the published write, an emit still in flight when its claim expires, or a partial plugin failure can cause duplicates. Deduplicate using the outbox `eventId` supplied to the sink or plugin. Failures exhaust the retry budget and move the event to the DLQ; `plugin.replayDLQ` makes it eligible again. The engine’s progress never depends on the sink. See [Kernel and Ports](../core-concepts/kernel-and-ports.md#transactional-outbox-events).
+
 - **No payload ceiling.** Nothing rejects a large value; it is bounded only by
   Postgres. Since 1.0 a step result over 64 KiB spills to the blob
   store behind a claim check

@@ -318,6 +318,19 @@ export function createKernel(config: KernelConfig): Kernel {
   const { persistence, blobStore, jobTransport, eventSink, clock, registry } =
     config;
 
+  for (const method of [
+    "claimOutboxDelivery",
+    "isOutboxDeliveryClaimActive",
+    "completeOutboxDelivery",
+    "failOutboxDelivery",
+  ] as const) {
+    if (typeof persistence[method] !== "function") {
+      throw new Error(
+        `Persistence adapter is missing ${method}; upgrade its outbox implementation for at-least-once delivery`,
+      );
+    }
+  }
+
   // Default to LocalExecutor if none provided
   const executor = config.executor ?? createLocalExecutor();
   const idempotencyStaleInProgressMs =

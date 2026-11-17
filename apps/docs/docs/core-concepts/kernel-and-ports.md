@@ -129,7 +129,7 @@ const stats = await kernel.dispatch({ type: "engine.stats" });
 //             byStatus: { PENDING: 3, RUNNING: 12, SUSPENDED: 0 },
 //             oldestPendingAgeMs: 4200 },
 //   outbox: { available: true,
-//             unpublished: 2,                     // what the next outbox.flush delivers
+//             unpublished: 2,                     // includes events with live claims
 //             oldestUnpublishedAgeMs: 1500,
 //             deadLettered: 0 },                  // replay with plugin.replayDLQ
 // }
@@ -245,14 +245,15 @@ saves. The claim check is applied only to rows that are engine plumbing.
 * Instead, they are written to the database in the `OutboxEvent` table as part of the primary database transaction.
 * The host then dispatches the **`outbox.flush`** command, which claims these events, publishes them to the `EventSink`, and updates their status in the database.
 
-What that does and does not guarantee:
+The outbox delivers at least once until the retry budget is exhausted. A claim is separate from `publishedAt`, expires after 60 seconds by default, and is checked immediately before each emit. Only a successful sink call can set `publishedAt`. After a crash, an expired claim can be recovered. Two flushers cannot own the same live claim. The first unpublished non-dead-lettered event of a run blocks its later events, including during a live claim or retry. A dead letter no longer blocks later events; replay may therefore deliver it after them.
 
-* **No phantom events.** An event is written in the same transaction as the state change it describes, so a rolled-back transaction writes none.
-* **One delivery attempt per claim.** The flush claims an event (stamps its `publishedAt`) before it calls `EventSink.emit`. The claim is atomic, so two hosts flushing the same outbox never deliver the same event.
-* **Retried on a sink failure.** If `emit` throws, the event is released and the next flush tries again, up to the retry budget (`maxRetries`, default 3 failed attempts); then it is dead-lettered until you replay it with `plugin.replayDLQ`. A retry calls `emit` again for the whole event: with the plugin runner, plugins that ran before the failing one see it again, so keep plugin handlers idempotent.
-* **Lost only if the process dies between the claim and the emit.** The stamp then says the event was published, and no later flush picks it up. Delivery is at-most-once per claim, retried only after a sink failure; it is **not** at-least-once.
-* **The engine's own progress never depends on the sink.** The poller, not the sink, advances runs. A refusing sink costs delivery latency and dead letters you can replay, and nothing else.
-* **If you need every event, read the table.** Treat the `EventSink` as a notification channel and the `outbox_events` table as the record: the row stays whatever became of its delivery: nothing in the engine deletes outbox rows (`run.purge` does not touch `outbox_events`, which has no foreign key to the run), so the table is not bounded by retention and you remove rows with SQL when you no longer need them. The [console](../console/overview.md) reads the same rows (the run's outbox event timeline and the dead letters).
+The sink or plugin receives an optional second argument `{ eventId, workflowRunId, sequence, attempt }`. Deduplicate with `eventId` (or `workflowRunId` and `sequence`). `attempt` is the number of recorded failures plus one; crashes and overlapping emits can repeat that number. Duplicates can arise after an emit succeeds and before publication is recorded, when a slow emit is still running after claim expiry, or when a plugin fails after an earlier plugin handled the event. Once failures reach `maxRetries` (default 3), the event is dead-lettered and does not retry until `plugin.replayDLQ` resets it. The poller advances runs independently of the sink. Maintenance ticks and `runToCompletion` bound their waits for outbox delivery (5 seconds by default).
+
+`maxEvents` bounds how many events a flush claims. Each claim permits at most one emit and has a 60-second lifetime, independent of batch size; a slow sink can use it up before later events are emitted. The flush checks each claim before emit and stops after its batch expires. The serverless post-job claim lasts `outboxFlushTimeoutMs + 60_000` milliseconds (capped at 2,147,483,647); the timeout does not cancel an emit already in progress. Node shutdown uses `shutdownTimeoutMs + 60_000`, with the same cap. Repeated crashes or indefinitely slow sink calls can cause repeated deliveries; there is no fixed total duplicate bound. Clocks on hosts must be synchronized for expiry decisions.
+
+`engine.stats` and `getUnpublishedOutboxEvents` include claimed events until publication. The console shows a live claim as claimed. `run.purge` removes the run but does not delete outbox rows. During a rolling upgrade an alpha.20 flusher ignores the new claim and can stamp an undelivered event as published; the new guarantee starts only after all alpha.20 flushers stop. A legacy stamp without a claim is treated as published and a legacy event already lost that way cannot be recovered.
+
+Nothing in the engine deletes outbox rows: `run.purge` leaves them in place, and only an operator removes them with SQL.
 
 ### Degraded delivery
 

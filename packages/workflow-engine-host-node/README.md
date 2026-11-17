@@ -54,6 +54,7 @@ Creates a new Node host instance.
 | `maxOutboxFlushPerTick` | `number` | `100` | Max outbox events to flush per tick |
 | `retention` | `RetentionOptions` | off | `{ olderThanMs, statuses?, limit? }`: delete terminal runs older than this through `run.purge` at the end of every tick |
 | `shutdownTimeoutMs` | `number` | `10_000` | Bound on `stop()`: wait for the in-flight job, then for the final outbox flush |
+| `outboxFlushTimeoutMs` | `number` | `5_000` | Maximum wait for a maintenance outbox flush; an in-flight emit can continue after the timeout |
 | `flushOutboxOnStop` | `boolean` | `true` | Run a final `outbox.flush` in `stop()` |
 
 ### `NodeHost`
@@ -61,7 +62,7 @@ Creates a new Node host instance.
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `start()` | `Promise<void>` | Start polling loops and register SIGTERM/SIGINT handlers |
-| `stop()` | `Promise<void>` | Graceful shutdown -- clears timers and signal handlers, waits (bounded) for the in-flight job, then runs a final `outbox.flush` so a run this process finished is published before exit |
+| `stop()` | `Promise<void>` | Graceful shutdown -- clears timers and signal handlers, waits (bounded) for the in-flight job, then attempts a final `outbox.flush` before exit |
 | `getStats()` | `HostStats` | Runtime statistics |
 
 ### `HostStats`

@@ -12,6 +12,7 @@ import {
   HOST_DEFAULTS,
   runMaintenanceTick,
 } from "../../kernel/helpers/host-support.js";
+import type { EventSink } from "../../kernel/ports.js";
 import { createTestKernel } from "../utils/index.js";
 
 const In = z.object({ value: z.number() });
@@ -61,6 +62,37 @@ describe("host support defaults", () => {
     const counts = await runMaintenanceTick(kernel, { workerId: "w-1" });
     expect(counts.claimed).toBe(1);
     expect(counts.eventsFlushed).toBeGreaterThan(0);
+  });
+
+  it("continues maintenance when the event sink never settles", async () => {
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const { kernel } = createTestKernel<EventSink>([workflow], {
+      eventSink: {
+        async emit() {
+          await blocked;
+        },
+      },
+    });
+    await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "blocked-sink",
+      workflowId: "host-defaults",
+      input: { value: 1 },
+    });
+    const tick = runMaintenanceTick(kernel, { outboxFlushTimeoutMs: 5 });
+    const result = await Promise.race([
+      tick,
+      new Promise<"unbounded">((resolve) =>
+        setTimeout(() => resolve("unbounded"), 100),
+      ),
+    ]);
+    release();
+    await tick;
+    expect(result).not.toBe("unbounded");
+    if (result !== "unbounded") expect(result.eventSinkStatus).toBe("degraded");
   });
 
   it("executes a job with only the transport and the job", async () => {

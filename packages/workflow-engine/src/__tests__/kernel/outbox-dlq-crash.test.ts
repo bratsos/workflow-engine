@@ -1,17 +1,7 @@
 /**
- * Kernel Tests: a crash between the two writes that dead-letter an event.
- *
- * `outbox.flush` claims an event (stamps `publishedAt`), tries to publish it,
- * and on the last allowed failure moves it to the DLQ (`dlqAt`) and releases
- * the claim (`publishedAt` back to null). A process that dies between the move
- * and the release used to leave `dlqAt` and `publishedAt` both set; a later
- * `plugin.replayDLQ` cleared only `dlqAt`, and the event, stamped as
- * published, was never delivered. The move now clears the claim in the same
- * write, and a replay clears a stamp an earlier version left behind.
- *
- * Everything runs through `kernel.dispatch`: `outbox.flush` with a plugin that
- * fails until the event is dead-lettered, a crash injected between the two
- * writes, `plugin.replayDLQ`, then `outbox.flush` again.
+ * Kernel tests for a crash after the atomic failure and dead-letter write.
+ * A replay clears legacy stamps and makes the same event eligible again.
+ * The tests exercise outbox.flush and plugin.replayDLQ through dispatch.
  */
 
 import { describe, expect, it } from "vitest";
@@ -71,7 +61,7 @@ function createKernelWithFailingPlugin() {
 }
 
 describe("kernel: dead-lettering an event across a crash", () => {
-  it("delivers the event after a replay when the process died between the move and the release", async () => {
+  it("delivers the event after a replay when the process died after the dead-letter write", async () => {
     const { kernel, flush, persistence, delivered, heal } =
       createKernelWithFailingPlugin();
     await kernel.dispatch({
@@ -81,13 +71,14 @@ describe("kernel: dead-lettering an event across a crash", () => {
       input: { data: "hello" },
     });
 
-    // The process dies after the DLQ move, before the claim is released.
-    const release = persistence.releaseOutboxEvents.bind(persistence);
-    persistence.releaseOutboxEvents = async () => {
+    // The process dies immediately after the atomic dead-letter and claim release.
+    const fail = persistence.failOutboxDelivery.bind(persistence);
+    persistence.failOutboxDelivery = async (...args) => {
+      await fail(...args);
       throw new Error("process died");
     };
     await expect(flush()).rejects.toThrow("process died");
-    persistence.releaseOutboxEvents = release;
+    persistence.failOutboxDelivery = fail;
 
     // The row the crash left: dead-lettered, and not stamped as published.
     const [row] = (persistence as any).outbox as {
