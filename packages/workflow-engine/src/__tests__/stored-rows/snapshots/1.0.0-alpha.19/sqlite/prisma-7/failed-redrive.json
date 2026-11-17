@@ -1,0 +1,593 @@
+{
+  "format": 1,
+  "metadata": {
+    "release": "1.0.0-alpha.19",
+    "database": "sqlite",
+    "prismaMajor": 7,
+    "scenario": "failed-redrive",
+    "inFlightPoint": "run and stage are FAILED with an exhausted queued-job attempt; replay starts with run.redrive",
+    "expectedFinalOutcome": {
+      "status": "COMPLETED",
+      "output": {
+        "value": "recovered"
+      }
+    },
+    "skippedScenarios": []
+  },
+  "columns": {
+    "WorkflowRun": [
+      "completedAt",
+      "config",
+      "createdAt",
+      "definitionVersion",
+      "duration",
+      "id",
+      "input",
+      "metadata",
+      "output",
+      "priority",
+      "redriveCount",
+      "startedAt",
+      "status",
+      "totalCost",
+      "totalTokens",
+      "updatedAt",
+      "version",
+      "workflowId",
+      "workflowName",
+      "workflowType"
+    ],
+    "WorkflowDefinition": [
+      "createdAt",
+      "snapshot",
+      "structureHash",
+      "version",
+      "workflowId"
+    ],
+    "WorkflowStage": [
+      "attempt",
+      "completedAt",
+      "config",
+      "createdAt",
+      "duration",
+      "embeddingInfo",
+      "errorMessage",
+      "executionGroup",
+      "id",
+      "inputData",
+      "maxWaitUntil",
+      "metrics",
+      "nextPollAt",
+      "outputData",
+      "pollInterval",
+      "resumeData",
+      "stageId",
+      "stageName",
+      "stageNumber",
+      "startedAt",
+      "status",
+      "suspendedState",
+      "updatedAt",
+      "version",
+      "workflowRunId"
+    ],
+    "WorkflowStep": [
+      "attempt",
+      "createdAt",
+      "deadlineAt",
+      "error",
+      "externalKey",
+      "id",
+      "kind",
+      "leaseExpiresAt",
+      "result",
+      "seq",
+      "stageRecordId",
+      "status",
+      "stepId",
+      "updatedAt",
+      "waitState"
+    ],
+    "WorkflowLog": [
+      "createdAt",
+      "id",
+      "level",
+      "message",
+      "metadata",
+      "workflowRunId",
+      "workflowStageId"
+    ],
+    "WorkflowArtifact": [
+      "createdAt",
+      "data",
+      "id",
+      "key",
+      "metadata",
+      "size",
+      "type",
+      "updatedAt",
+      "workflowRunId",
+      "workflowStageId"
+    ],
+    "AICall": [
+      "batchId",
+      "cachedInputTokens",
+      "callType",
+      "cost",
+      "costSource",
+      "createdAt",
+      "estimatedCost",
+      "id",
+      "inputTokens",
+      "metadata",
+      "modelId",
+      "modelKey",
+      "outputTokens",
+      "prompt",
+      "reasoningTokens",
+      "reportedCost",
+      "requestId",
+      "response",
+      "servedBy",
+      "topic"
+    ],
+    "WorkflowAnnotation": [
+      "actorId",
+      "actorKind",
+      "actorVersion",
+      "attempt",
+      "createdAt",
+      "id",
+      "idempotencyKey",
+      "key",
+      "payload",
+      "scope",
+      "scopeId",
+      "value",
+      "workflowRunId",
+      "workflowStageRecordId"
+    ],
+    "JobQueue": [
+      "attempt",
+      "completedAt",
+      "createdAt",
+      "id",
+      "lastError",
+      "lockedAt",
+      "maxAttempts",
+      "nextPollAt",
+      "payload",
+      "priority",
+      "stageId",
+      "startedAt",
+      "status",
+      "updatedAt",
+      "workerId",
+      "workflowRunId"
+    ],
+    "OutboxEvent": [
+      "causationId",
+      "createdAt",
+      "dlqAt",
+      "eventType",
+      "id",
+      "occurredAt",
+      "payload",
+      "publishedAt",
+      "retryCount",
+      "sequence",
+      "workflowRunId"
+    ],
+    "IdempotencyKey": ["commandType", "createdAt", "id", "key", "result"],
+    "WorkflowBlob": ["createdAt", "data", "key", "updatedAt"]
+  },
+  "jsonColumns": {
+    "WorkflowRun": ["config", "input", "metadata", "output"],
+    "WorkflowDefinition": ["snapshot"],
+    "WorkflowStage": [
+      "config",
+      "embeddingInfo",
+      "inputData",
+      "metrics",
+      "outputData",
+      "resumeData",
+      "suspendedState"
+    ],
+    "WorkflowStep": ["result", "waitState"],
+    "WorkflowLog": ["metadata"],
+    "WorkflowArtifact": ["data", "metadata"],
+    "AICall": ["metadata"],
+    "WorkflowAnnotation": ["payload", "value"],
+    "JobQueue": ["payload"],
+    "OutboxEvent": ["payload"],
+    "IdempotencyKey": ["result"],
+    "WorkflowBlob": ["data"]
+  },
+  "tables": {
+    "WorkflowRun": [
+      {
+        "id": "cmwksfpdd002bqn3bgh2yeyzu",
+        "createdAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:50.353Z"
+        },
+        "updatedAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:50.390Z"
+        },
+        "version": 4,
+        "workflowId": "stored-rows-failed-redrive",
+        "workflowName": "Stored rows failed-redrive",
+        "workflowType": "stored-rows-failed-redrive",
+        "status": "FAILED",
+        "startedAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:50.359Z"
+        },
+        "completedAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:50.351Z"
+        },
+        "duration": null,
+        "input": {
+          "value": "seed"
+        },
+        "output": null,
+        "config": {
+          "recover": {}
+        },
+        "totalCost": 0,
+        "totalTokens": 0,
+        "priority": 5,
+        "metadata": null,
+        "definitionVersion": "sha256-28e86e4d27c49127ac24895e736f67ef",
+        "redriveCount": 0
+      }
+    ],
+    "WorkflowDefinition": [
+      {
+        "workflowId": "stored-rows-failed-redrive",
+        "version": "sha256-28e86e4d27c49127ac24895e736f67ef",
+        "createdAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:50.352Z"
+        },
+        "snapshot": {
+          "format": 1,
+          "workflowId": "stored-rows-failed-redrive",
+          "inputSchema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "additionalProperties": {},
+            "properties": {
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": ["value"],
+            "type": "object"
+          },
+          "outputSchema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "additionalProperties": {},
+            "properties": {
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": ["value"],
+            "type": "object"
+          },
+          "stages": [
+            {
+              "id": "recover",
+              "stageNumber": 1,
+              "executionGroup": 1,
+              "mode": "sync",
+              "inputSchema": {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "additionalProperties": {},
+                "properties": {
+                  "value": {
+                    "type": "string"
+                  }
+                },
+                "required": ["value"],
+                "type": "object"
+              },
+              "outputSchema": {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "additionalProperties": {},
+                "properties": {
+                  "value": {
+                    "type": "string"
+                  }
+                },
+                "required": ["value"],
+                "type": "object"
+              },
+              "configSchema": {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "properties": {},
+                "type": "object"
+              }
+            }
+          ]
+        },
+        "structureHash": "sha256-28e86e4d27c49127ac24895e736f67ef"
+      }
+    ],
+    "WorkflowStage": [
+      {
+        "id": "cmwksfpdk002dqn3b7u6ymc4x",
+        "createdAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:50.360Z"
+        },
+        "updatedAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:50.377Z"
+        },
+        "version": 3,
+        "workflowRunId": "cmwksfpdd002bqn3bgh2yeyzu",
+        "stageId": "recover",
+        "stageName": "recover",
+        "stageNumber": 1,
+        "executionGroup": 1,
+        "attempt": 0,
+        "status": "FAILED",
+        "startedAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:50.351Z"
+        },
+        "completedAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:50.351Z"
+        },
+        "duration": 0,
+        "inputData": null,
+        "outputData": null,
+        "config": {},
+        "suspendedState": null,
+        "resumeData": null,
+        "nextPollAt": null,
+        "pollInterval": null,
+        "maxWaitUntil": null,
+        "metrics": null,
+        "embeddingInfo": null,
+        "errorMessage": "stored rows fixture failure"
+      }
+    ],
+    "WorkflowStep": [],
+    "WorkflowLog": [
+      {
+        "id": "cmwksfpe5002kqn3bzrjcfvzm",
+        "createdAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:50.381Z"
+        },
+        "workflowRunId": "cmwksfpdd002bqn3bgh2yeyzu",
+        "workflowStageId": "cmwksfpdk002dqn3b7u6ymc4x",
+        "level": "ERROR",
+        "message": "stored rows fixture failure",
+        "metadata": null
+      }
+    ],
+    "WorkflowArtifact": [],
+    "AICall": [],
+    "WorkflowAnnotation": [],
+    "JobQueue": [
+      {
+        "id": "cmwksfpdn002fqn3bql7rzz11",
+        "createdAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:50.363Z"
+        },
+        "updatedAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:50.385Z"
+        },
+        "workflowRunId": "cmwksfpdd002bqn3bgh2yeyzu",
+        "stageId": "recover",
+        "status": "FAILED",
+        "priority": 5,
+        "attempt": 1,
+        "maxAttempts": 1,
+        "workerId": "stored-rows-host",
+        "lockedAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:50.366Z"
+        },
+        "startedAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:50.366Z"
+        },
+        "completedAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:50.384Z"
+        },
+        "nextPollAt": null,
+        "payload": {
+          "config": {
+            "recover": {}
+          },
+          "_workflowId": "stored-rows-failed-redrive",
+          "_definitionVersion": "sha256-28e86e4d27c49127ac24895e736f67ef"
+        },
+        "lastError": "stored rows fixture failure"
+      }
+    ],
+    "OutboxEvent": [
+      {
+        "id": "cmwksfpde002cqn3b2jc746r7",
+        "createdAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:50.354Z"
+        },
+        "workflowRunId": "cmwksfpdd002bqn3bgh2yeyzu",
+        "sequence": 1,
+        "eventType": "workflow:created",
+        "payload": {
+          "type": "workflow:created",
+          "timestamp": "2026-11-17T14:28:50.351Z",
+          "workflowRunId": "cmwksfpdd002bqn3bgh2yeyzu",
+          "workflowId": "stored-rows-failed-redrive"
+        },
+        "causationId": "stored-rows:failed-redrive",
+        "occurredAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:50.351Z"
+        },
+        "publishedAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:50.402Z"
+        },
+        "retryCount": 0,
+        "dlqAt": null
+      },
+      {
+        "id": "cmwksfpdl002eqn3bacf2tjm5",
+        "createdAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:50.361Z"
+        },
+        "workflowRunId": "cmwksfpdd002bqn3bgh2yeyzu",
+        "sequence": 2,
+        "eventType": "workflow:started",
+        "payload": {
+          "type": "workflow:started",
+          "timestamp": "2026-11-17T14:28:50.351Z",
+          "workflowRunId": "cmwksfpdd002bqn3bgh2yeyzu"
+        },
+        "causationId": "4d44b4bb-aa1e-4589-a7e4-afe3af3c9564",
+        "occurredAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:50.351Z"
+        },
+        "publishedAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:50.402Z"
+        },
+        "retryCount": 0,
+        "dlqAt": null
+      },
+      {
+        "id": "cmwksfpdt002iqn3bk7a2wa9t",
+        "createdAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:50.369Z"
+        },
+        "workflowRunId": "cmwksfpdd002bqn3bgh2yeyzu",
+        "sequence": 3,
+        "eventType": "stage:started",
+        "payload": {
+          "type": "stage:started",
+          "timestamp": "2026-11-17T14:28:50.351Z",
+          "workflowRunId": "cmwksfpdd002bqn3bgh2yeyzu",
+          "stageId": "recover",
+          "stageName": "recover",
+          "stageNumber": 1
+        },
+        "causationId": "job:cmwksfpdn002fqn3bql7rzz11:attempt:1",
+        "occurredAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:50.351Z"
+        },
+        "publishedAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:50.402Z"
+        },
+        "retryCount": 0,
+        "dlqAt": null
+      },
+      {
+        "id": "cmwksfpe3002jqn3bob75ziei",
+        "createdAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:50.379Z"
+        },
+        "workflowRunId": "cmwksfpdd002bqn3bgh2yeyzu",
+        "sequence": 4,
+        "eventType": "stage:failed",
+        "payload": {
+          "type": "stage:failed",
+          "timestamp": "2026-11-17T14:28:50.351Z",
+          "workflowRunId": "cmwksfpdd002bqn3bgh2yeyzu",
+          "stageId": "recover",
+          "stageName": "recover",
+          "error": "stored rows fixture failure"
+        },
+        "causationId": "job:cmwksfpdn002fqn3bql7rzz11:attempt:1",
+        "occurredAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:50.351Z"
+        },
+        "publishedAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:50.402Z"
+        },
+        "retryCount": 0,
+        "dlqAt": null
+      },
+      {
+        "id": "cmwksfpen002lqn3b4s1kr7j2",
+        "createdAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:50.399Z"
+        },
+        "workflowRunId": "cmwksfpdd002bqn3bgh2yeyzu",
+        "sequence": 5,
+        "eventType": "workflow:failed",
+        "payload": {
+          "type": "workflow:failed",
+          "timestamp": "2026-11-17T14:28:50.351Z",
+          "workflowRunId": "cmwksfpdd002bqn3bgh2yeyzu",
+          "error": "stored rows fixture failure"
+        },
+        "causationId": "5f727f75-a07a-4ca9-89e8-c1057c8d071c",
+        "occurredAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:50.351Z"
+        },
+        "publishedAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:50.402Z"
+        },
+        "retryCount": 0,
+        "dlqAt": null
+      }
+    ],
+    "IdempotencyKey": [
+      {
+        "id": "cmwksfpdb002aqn3bfm9fh6o6",
+        "createdAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:50.351Z"
+        },
+        "key": "stored-rows:failed-redrive",
+        "commandType": "run.create",
+        "result": {
+          "workflowRunId": "cmwksfpdd002bqn3bgh2yeyzu",
+          "status": "PENDING",
+          "definitionVersion": "sha256-28e86e4d27c49127ac24895e736f67ef"
+        }
+      },
+      {
+        "id": "cmwksfpdr002gqn3btct8qxp4",
+        "createdAt": {
+          "$storedRows": "Date",
+          "value": "2026-11-17T14:28:50.351Z"
+        },
+        "key": "job:cmwksfpdn002fqn3bql7rzz11:attempt:1",
+        "commandType": "job.execute",
+        "result": {
+          "outcome": "failed",
+          "error": "stored rows fixture failure",
+          "willRetry": false,
+          "attempt": 1,
+          "maxAttempts": 1
+        }
+      }
+    ],
+    "WorkflowBlob": []
+  }
+}

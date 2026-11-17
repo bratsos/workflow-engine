@@ -10,6 +10,8 @@ This skill activates when a user says things like:
 - "I just bumped workflow-engine, walk me through the migration"
 - "what do I need to change after upgrading workflow-engine?"
 
+CI replays stored-row snapshots from `1.0.0-alpha.13` through `1.0.0-alpha.20` on SQLite and Postgres, covering queued and suspended runs, durable steps, batch work, redrive, parallel stages, and outbox delivery.
+
 The router's job is to figure out **which migration guides to apply**, in order, given the version delta. The user should already have run their package manager's upgrade command before invoking this — if not, ask them to do that first or do it for them. See "Package manager reference" below for the right command per ecosystem.
 
 ## Step 0 — Detect the project layout
