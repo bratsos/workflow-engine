@@ -932,4 +932,83 @@ describe("ServerlessHost", () => {
       logged.mockRestore();
     }
   });
+
+  it("returns the counts after onTickTimeoutMs (default 5 s) when a hook never settles", async () => {
+    const { kernel, jobTransport } = createTestEnv([]);
+    const warned = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.useFakeTimers();
+    try {
+      let calls = 0;
+      const host = createServerlessHost({
+        kernel,
+        jobTransport,
+        workerId: "test-worker",
+        onTick: () => {
+          calls++;
+          return new Promise<void>(() => {});
+        },
+      });
+      let result:
+        | Awaited<ReturnType<typeof host.runMaintenanceTick>>
+        | undefined;
+      const ticking = host.runMaintenanceTick().then((counts) => {
+        result = counts;
+      });
+
+      await vi.advanceTimersByTimeAsync(4_999);
+      expect(calls).toBe(1);
+      expect(result).toBeUndefined();
+      expect(warned).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(1);
+      await ticking;
+      expect(result?.claimed).toBe(0);
+      expect(String(warned.mock.calls[0]?.[0])).toContain(
+        "onTick hook did not settle within 5000 ms",
+      );
+      expect(warned).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+      warned.mockRestore();
+    }
+  });
+
+  it("uses onTickTimeoutMs as the bound", async () => {
+    const { kernel, jobTransport } = createTestEnv([]);
+    const warned = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const host = createServerlessHost({
+        kernel,
+        jobTransport,
+        workerId: "test-worker",
+        onTickTimeoutMs: 30,
+        onTick: () => new Promise<void>(() => {}),
+      });
+      const started = Date.now();
+      const counts = await host.runMaintenanceTick();
+      expect(Date.now() - started).toBeLessThan(2_000);
+      expect(counts.claimed).toBe(0);
+      expect(warned).toHaveBeenCalledTimes(1);
+    } finally {
+      warned.mockRestore();
+    }
+  });
+
+  it("gives the hook its own copy of the counts", async () => {
+    const { kernel, jobTransport } = createTestEnv([]);
+    const host = createServerlessHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+      onTick: (counts) => {
+        counts.claimed = 99;
+        counts.eventSinkStatus = "degraded";
+      },
+    });
+
+    const counts = await host.runMaintenanceTick();
+
+    expect(counts.claimed).toBe(0);
+    expect(counts.eventSinkStatus).toBe("healthy");
+  });
 });

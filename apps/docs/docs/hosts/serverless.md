@@ -46,9 +46,12 @@ const host = createServerlessHost({
   // makes a rolling deploy safe; "all" turns version filtering off.
   // serves: "all",
 
-  // Called at the end of every runMaintenanceTick() with its counts. A hook
-  // that throws or rejects is logged and the tick still returns.
+  // Called at the end of every runMaintenanceTick() with a copy of its counts.
+  // A hook that throws or rejects is logged and the tick still returns; the
+  // call waits for it at most onTickTimeoutMs (default 5s), then returns the
+  // counts and logs a warning.
   // onTick: async (counts) => { ... },
+  // onTickTimeoutMs: 5_000,
 });
 ```
 
@@ -146,7 +149,7 @@ export default {
 
 ### Exporting gauges with `onTick`
 
-`onTick` receives the same counts `runMaintenanceTick()` returns, after the tick has finished and before the method returns them. A hook that throws or rejects is caught and logged, and the tick still returns its counts. The hook is awaited, so a slow hook delays the return: bound anything it waits on, as the invocation's time limit applies to it too. Dispatch [`engine.stats`](../core-concepts/kernel-and-ports.md#observing-the-engine) from it for queue depth and age. `metrics` below stands for your own metrics client; the engine depends on none.
+`onTick` receives a copy of the counts `runMaintenanceTick()` returns (mutating it changes nothing the method returns), after the tick has finished and before the method returns them. A hook that throws or rejects is caught and logged, and the tick still returns its counts. The hook is awaited for at most `onTickTimeoutMs` (default `5000`, the same as `outboxFlushTimeoutMs`: both bound optional work the host awaits after its own commands finished, inside an invocation that has a time limit). When the bound passes, `runMaintenanceTick()` returns the counts, logs `[ServerlessHost] onTick hook did not settle within <n> ms; not waiting for it (it keeps running)` and leaves the hook running in the background, where the platform may cut it off when the invocation ends. A hook that never settles therefore costs one bounded wait per tick and never withholds the counts. Dispatch [`engine.stats`](../core-concepts/kernel-and-ports.md#observing-the-engine) from it for queue depth and age. `metrics` below stands for your own metrics client; the engine depends on none.
 
 ```typescript
 const host = createServerlessHost({

@@ -2,4 +2,4 @@
 "@bratsos/workflow-engine-host-serverless": minor
 ---
 
-`createServerlessHost` accepts `onTick(counts)`, called at the end of every `runMaintenanceTick()` with the counts it computed, before the method returns them. Combine it with the `engine.stats` command to export gauges. A hook that throws or rejects is caught and logged, and the tick still returns its counts. The hook is awaited, so a slow hook delays the return of `runMaintenanceTick()`.
+`createServerlessHost` accepts `onTick(counts)`, called at the end of every `runMaintenanceTick()` with a copy of the counts it computed (changing it does not change what the method returns), before the method returns them. Combine it with the `engine.stats` command to export gauges. A hook that throws or rejects is caught and logged, and the tick still returns its counts. The hook is awaited for at most the new option `onTickTimeoutMs` (default 5000, the same as `outboxFlushTimeoutMs`, the host's bound on its other optional wait after the maintenance commands finished): after that the counts are returned, one warning is logged and the hook keeps running in the background.

@@ -521,39 +521,201 @@ describe("NodeHost", () => {
     }
   });
 
-  it("holds the tick open for a slow hook instead of overlapping ticks", async () => {
+  it("never holds a tick for a slow hook and never runs two at once", async () => {
     const { kernel, jobTransport } = createTestEnv([]);
+    const warned = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let running = 0;
+      let overlapped = false;
+      let calls = 0;
+
+      host = createNodeHost({
+        kernel,
+        jobTransport,
+        workerId: "test-worker",
+        orchestrationIntervalMs: 10,
+        jobPollIntervalMs: 20,
+        onTick: async () => {
+          calls++;
+          running++;
+          if (running > 1) overlapped = true;
+          if (calls === 1) await gate;
+          running--;
+        },
+      });
+      await host.start();
+      // The first hook is held: ticks go on, the hook is not called again, and
+      // the skip is logged once, not once per tick.
+      await waitFor(async () => host!.getStats().orchestrationTicks >= 5);
+      expect(calls).toBe(1);
+      const skips = warned.mock.calls.filter((args) =>
+        String(args[0]).includes("onTick hook still running after"),
+      );
+      expect(skips).toHaveLength(1);
+      expect(String(skips[0]?.[0])).toMatch(/running after \d+ ms/);
+
+      release();
+      await waitFor(async () => calls >= 3);
+      expect(overlapped).toBe(false);
+    } finally {
+      warned.mockRestore();
+    }
+  });
+
+  it("keeps ticking and claiming work while a hook never settles, and stop() is bounded", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, persistence, jobTransport } = createTestEnv([workflow]);
+    const warned = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      let calls = 0;
+      host = createNodeHost({
+        kernel,
+        jobTransport,
+        workerId: "test-worker",
+        orchestrationIntervalMs: 15,
+        jobPollIntervalMs: 20,
+        shutdownTimeoutMs: 400,
+        onTick: () => {
+          calls++;
+          return new Promise<void>(() => {});
+        },
+      });
+      await host.start();
+      await waitFor(async () => calls === 1);
+
+      // A run created after the hook hung is still claimed and finished.
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "hung-hook",
+        workflowId: workflow.id,
+        input: { data: "hello" },
+      });
+      await waitFor(
+        async () =>
+          (await persistence.getRun(workflowRunId))?.status === "COMPLETED",
+      );
+      expect(host.getStats().orchestrationTicks).toBeGreaterThanOrEqual(3);
+      expect(calls).toBe(1);
+
+      const started = Date.now();
+      await host.stop();
+      const took = Date.now() - started;
+      host = null;
+      expect(took).toBeGreaterThanOrEqual(350);
+      expect(took).toBeLessThan(1_500);
+    } finally {
+      warned.mockRestore();
+    }
+  });
+
+  it("starts no hook once stop() has begun and waits for one that is running", async () => {
+    const { kernel, jobTransport } = createTestEnv([]);
+    // Hold the first tick inside stage.pollSuspended, so stop() begins while
+    // the tick is still running and the tick's hook would start after it.
     let release!: () => void;
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
-    let running = 0;
-    let overlapped = false;
+    let held = false;
+    const slowKernel = {
+      dispatch: async (command: Parameters<Kernel["dispatch"]>[0]) => {
+        if (command.type === "stage.pollSuspended" && !held) {
+          held = true;
+          await gate;
+        }
+        return kernel.dispatch(command as never);
+      },
+    } as unknown as Kernel;
     let calls = 0;
 
+    host = createNodeHost({
+      kernel: slowKernel,
+      jobTransport,
+      workerId: "test-worker",
+      orchestrationIntervalMs: 1_000,
+      jobPollIntervalMs: 20,
+      onTick: () => {
+        calls++;
+      },
+    });
+    await host.start();
+    await waitFor(async () => held);
+    const stopping = host.stop();
+    release();
+    await stopping;
+    host = null;
+    expect(calls).toBe(0);
+
+    // A hook that is already running is waited for: stop() resolves after it.
+    let hookStarted = false;
+    let hookDone = false;
+    const waiting = createNodeHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+      orchestrationIntervalMs: 1_000,
+      jobPollIntervalMs: 20,
+      onTick: async () => {
+        hookStarted = true;
+        await new Promise((r) => setTimeout(r, 150));
+        hookDone = true;
+      },
+    });
+    await waiting.start();
+    await waitFor(async () => hookStarted);
+    await waiting.stop();
+    expect(hookDone).toBe(true);
+  });
+
+  it("makes a hook that awaits host.stop() wait for shutdownTimeoutMs", async () => {
+    const { kernel, jobTransport } = createTestEnv([]);
+    let stopMs = -1;
+    let calls = 0;
+    const self: NodeHost = createNodeHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+      orchestrationIntervalMs: 15,
+      jobPollIntervalMs: 20,
+      shutdownTimeoutMs: 300,
+      onTick: async () => {
+        calls++;
+        const started = Date.now();
+        await self.stop();
+        stopMs = Date.now() - started;
+      },
+    });
+    await self.start();
+    await waitFor(async () => stopMs >= 0);
+    // stop() waited for the hook that was waiting for it, until the timeout.
+    expect(stopMs).toBeGreaterThanOrEqual(250);
+    expect(self.getStats().isRunning).toBe(false);
+    expect(calls).toBe(1);
+  });
+
+  it("gives the hook its own copy of the counts", async () => {
+    const { kernel, jobTransport } = createTestEnv([]);
+    let mutated = false;
     host = createNodeHost({
       kernel,
       jobTransport,
       workerId: "test-worker",
-      orchestrationIntervalMs: 10,
+      orchestrationIntervalMs: 20,
       jobPollIntervalMs: 20,
-      onTick: async () => {
-        calls++;
-        running++;
-        if (running > 1) overlapped = true;
-        if (calls === 1) await gate;
-        running--;
+      onTick: (counts) => {
+        counts.eventSinkStatus = "degraded";
+        counts.eventsDeadLettered = 99;
+        mutated = true;
       },
     });
     await host.start();
-    // Many interval firings elapse while the first hook is held.
-    await new Promise((r) => setTimeout(r, 100));
-    expect(calls).toBe(1);
-    expect(host.getStats().orchestrationTicks).toBe(1);
-
-    release();
-    await waitFor(async () => calls >= 3);
-    expect(overlapped).toBe(false);
+    await waitFor(async () => mutated);
+    expect(host.getStats().eventSink.status).toBe("healthy");
+    expect(host.getStats().eventSink.deadLettered).toBe(0);
   });
 
   it("calling start() twice is safe", async () => {

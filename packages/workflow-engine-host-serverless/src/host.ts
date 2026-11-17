@@ -74,15 +74,15 @@ export interface ServerlessHostConfig {
   retention?: RetentionOptions;
 
   /**
-   * Called at the end of every `runMaintenanceTick()` with the counts it
-   * computed, before the method returns them. Use it to export gauges or
-   * counters (combine it with the `engine.stats` command for queue depth and
-   * age).
+   * Called at the end of every `runMaintenanceTick()` with a copy of the
+   * counts it computed (changing it affects nothing the method returns), before
+   * the method returns them. Use it to export gauges or counters (combine it
+   * with the `engine.stats` command for queue depth and age).
    *
    * A hook that throws or rejects is caught and logged; the tick still
-   * returns its counts. The hook is awaited, so a slow hook delays the
-   * return of `runMaintenanceTick()`, so an invocation with a time limit
-   * should bound what the hook waits on.
+   * returns its counts. The hook is awaited for at most `onTickTimeoutMs`:
+   * after that the counts are returned, one warning is logged and the hook
+   * keeps running in the background (an invocation that ends may cut it off).
    */
   onTick?: MaintenanceTickHook;
 
@@ -97,6 +97,15 @@ export interface ServerlessHostConfig {
 
   /** Upper bound (ms) on the post-job outbox flush (default: 5_000). */
   outboxFlushTimeoutMs?: number;
+
+  /**
+   * Upper bound (ms) on how long `runMaintenanceTick()` waits for `onTick`
+   * (default: 5_000, the same as `outboxFlushTimeoutMs`: both bound optional
+   * work this host awaits after its own commands have finished, inside an
+   * invocation that has a time limit). A hook that never settles then costs
+   * one bounded wait per tick and never withholds the counts.
+   */
+  onTickTimeoutMs?: number;
 
   /** Job lease heartbeat interval in milliseconds (default: 60_000). */
   jobHeartbeatIntervalMs?: number;
@@ -199,6 +208,7 @@ class ServerlessHostImpl implements ServerlessHost {
   private readonly jobHeartbeatIntervalMs: number;
   private readonly flushOutboxAfterJob: boolean;
   private readonly outboxFlushTimeoutMs: number;
+  private readonly onTickTimeoutMs: number;
 
   constructor(config: ServerlessHostConfig) {
     this.kernel = config.kernel;
@@ -222,6 +232,7 @@ class ServerlessHostImpl implements ServerlessHost {
       config.jobHeartbeatIntervalMs ?? HOST_DEFAULTS.jobHeartbeatIntervalMs;
     this.flushOutboxAfterJob = config.flushOutboxAfterJob ?? true;
     this.outboxFlushTimeoutMs = config.outboxFlushTimeoutMs ?? 5_000;
+    this.onTickTimeoutMs = config.onTickTimeoutMs ?? 5_000;
   }
 
   async handleJob(msg: JobMessage): Promise<JobResult> {
@@ -355,7 +366,12 @@ class ServerlessHostImpl implements ServerlessHost {
         `[ServerlessHost] event sink DEAD-LETTERED ${counts.eventsDeadLettered} event(s): they will not be delivered until replayed with the plugin.replayDLQ command`,
       );
     }
-    await runTickHook(this.onTick, counts, "[ServerlessHost]");
+    await runTickHook(
+      this.onTick,
+      counts,
+      "[ServerlessHost]",
+      this.onTickTimeoutMs,
+    );
     return counts;
   }
 }

@@ -123,7 +123,7 @@ const host = createNodeHost({
   maxClaimsPerTick: 10,               // Max pending runs to claim per tick
   maxSuspendedChecksPerTick: 10,      // Max suspended stages to poll per tick
   maxOutboxFlushPerTick: 100,         // Max outbox events to flush per tick
-  shutdownTimeoutMs: 10_000,          // 1.0: bound on stop() waiting for the in-flight job / tick and the final flush
+  shutdownTimeoutMs: 10_000,          // 1.0: bound on stop() waiting for the in-flight tick / onTick call, the job, and the final flush
   flushOutboxOnStop: true,            // 1.0: run a final outbox.flush in stop() so this process publishes its own workflow:completed
   // retention: { olderThanMs: 30 * 24 * 60 * 60 * 1000, statuses?, limit? }, // Opt-in: run.purge on every tick (see 09-troubleshooting.md, "Run Retention")
   // onTick: async (counts) => { ... }, // 1.0.0-alpha.21: called after every tick with its MaintenanceTickCounts (see "Exporting gauges")
@@ -196,7 +196,7 @@ An interval firing that lands while the previous tick is still running is skippe
 
 ### Exporting gauges
 
-`onTick` (both hosts) is called after every maintenance tick with that tick's `MaintenanceTickCounts`; the `engine.stats` command adds queue depth and age. The engine takes no metrics dependency: `metrics` below is your own client.
+`onTick` (both hosts) is called after every maintenance tick with a copy of that tick's `MaintenanceTickCounts` (mutating it changes nothing else); the `engine.stats` command adds queue depth and age. The engine takes no metrics dependency: `metrics` below is your own client.
 
 ```typescript
 const host = createNodeHost({
@@ -214,7 +214,8 @@ const host = createNodeHost({
 ```
 
 - A hook that throws or rejects is caught and logged (`<prefix> onTick hook error:`); it never stops the loop and never fails a tick.
-- The hook is awaited as part of the tick. On the Node host a slow hook delays the next tick (firings that land meanwhile are skipped, never queued), so ticks never overlap; a hook that never settles stops further ticks, and `stop()` waits for it for at most `shutdownTimeoutMs`. On the serverless host it delays the return of `runMaintenanceTick()`.
+- Node host: the hook runs outside the tick, so ticks never wait for it and claiming, polling, lease reaping, the outbox flush and `run.reapStuck` go on whatever it does. At most one call is in flight: a tick that finds the previous call still running skips the hook and logs one warning (`[NodeHost] onTick hook still running after <n> ms: ...`) at the first skip, not on every tick. A hook that never settles is called once, warned about once, and its gauges stop updating until it settles: bound what it waits on. `stop()` waits for a running hook, with the in-flight tick, for at most `shutdownTimeoutMs`, and no hook starts once it began. A hook must not `await host.stop()`: `stop()` waits for the hook that is waiting for it until `shutdownTimeoutMs` elapses (use `void host.stop()`, or stop from outside).
+- Serverless host: the hook is awaited for at most `onTickTimeoutMs` (default 5000, the same as `outboxFlushTimeoutMs`); then `runMaintenanceTick()` returns the counts, logs `[ServerlessHost] onTick hook did not settle within <n> ms; ...` and leaves the hook running.
 - `engine.stats` returns `{ at, runs, stages, jobs, outbox }`. Each section is `{ available: true, ... }` or `{ available: false }` when the port behind it has no `getActiveWorkStats` (runs, stages, outbox) or `getJobStats` (jobs). It counts PENDING, RUNNING and SUSPENDED rows only, never terminal ones, and writes nothing. Ages are milliseconds on the kernel clock; `null` means nothing is waiting.
 
 ### Worker Process Pattern
@@ -253,6 +254,7 @@ const host = createServerlessHost({
   outboxFlushTimeoutMs: 5_000,        // 1.0: bound on that post-job flush
   // retention: { olderThanMs: 30 * 24 * 60 * 60 * 1000 }, // Opt-in: run.purge on every tick
   // onTick: async (counts) => { ... }, // 1.0.0-alpha.21: called at the end of every runMaintenanceTick() (see "Exporting gauges")
+  // onTickTimeoutMs: 5_000,          // 1.0.0-alpha.21: runMaintenanceTick() waits for onTick at most this long, then returns the counts and logs a warning
   // serves: "all",                   // 1.0: turn definition-version filtering off
 });
 ```
@@ -406,7 +408,7 @@ import {
 | `executeJobWithHeartbeat(kernel, options)` | Dispatches `job.execute` for one job (passing the job's `attempt`/`maxAttempts` and an `abortSignal`), dispatching `job.heartbeat` on `jobHeartbeatIntervalMs` for its duration (renews the lease, aborts the body on cancel or a lost lease), then routes the outcome through the job transport (`complete`/`suspend`/`fail`/`defer`, fenced with the job's `startedAt`) and `run.transition` when terminal. Returns an `ExecuteJobOutcome` (`outcome`, `error?`, `dead?`, `willRetry?`, `attempt?`, `maxAttempts?`, `retryDelayMs?`, `deferred?`). |
 | `runMaintenanceTick(kernel, options)` | Runs one bounded maintenance pass -- `run.claimPending`, `stage.pollSuspended` (transitioning any resumed runs), `lease.reapStale` (both lease tiers), `outbox.flush`, `run.reapStuck`, and `run.purge` when `retention` is set. Each command's error is caught and logged independently so one failure doesn't block the rest of the tick. |
 | `HOST_DEFAULTS` | The shared tuning defaults (`workerId`, `logPrefix`, `staleLeaseThresholdMs` 300s, `jobAbsoluteTimeoutMs` 1h, `maxClaimsPerTick` 10, `maxSuspendedChecksPerTick` 10, `maxOutboxFlushPerTick` 100, `jobHeartbeatIntervalMs` 60s, `maxAttempts` 3, `versionDeferMs` 30s, `computeStuckThresholdMs()`) both built-in hosts fall back to. Every field of both option bags is optional, so `runMaintenanceTick(kernel)` and `executeJobWithHeartbeat(kernel, { jobTransport, job })` work as-is. |
-| `runTickHook(hook, counts, logPrefix)` / `MaintenanceTickHook` | What both hosts use to call `onTick`: awaits the hook and logs, rather than throws, whatever it throws. For a custom loop. |
+| `runTickHook(hook, counts, logPrefix, timeoutMs?)` / `MaintenanceTickHook` | What both hosts use to call `onTick`: passes the hook a copy of `counts` and logs, rather than throws, whatever it throws. With `timeoutMs` it stops waiting after that long, logs one warning and leaves the hook running (the serverless host); without it, it settles when the hook does (the Node host calls it without awaiting). For a custom loop. |
 | `createEventSinkMonitor()` / `EventSinkHealth` | The degraded-sink state machine the Node host uses, for a custom loop (see "Degraded event sink"). |
 | `toErrorMessage(error)` | Normalizes a caught `unknown` into a display-safe string (`Error#message`, or `String(error)`). |
 

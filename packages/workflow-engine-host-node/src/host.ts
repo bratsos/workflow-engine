@@ -17,6 +17,7 @@ import {
   HOST_DEFAULTS,
   type JobTransport,
   type Kernel,
+  type MaintenanceTickCounts,
   type MaintenanceTickHook,
   type RetentionOptions,
   runMaintenanceTick as runMaintenanceTickCommands,
@@ -108,16 +109,23 @@ export interface NodeHostConfig {
   retention?: RetentionOptions;
 
   /**
-   * Called after every orchestration tick with the counts that tick
-   * computed. Use it to export gauges or counters (combine it with the
-   * `engine.stats` command for queue depth and age).
+   * Called after every orchestration tick with a copy of the counts that tick
+   * computed (changing it affects nothing else). Use it to export gauges or
+   * counters (combine it with the `engine.stats` command for queue depth and
+   * age).
    *
-   * A hook that throws or rejects is caught and logged; it never stops the
-   * loop. The hook is awaited as part of the tick, so a slow hook delays the
-   * next tick (interval firings that land while it runs are skipped, never
-   * queued) and ticks never overlap. A hook that never settles stops further
-   * ticks: bound anything it waits on. `stop()` waits for a running hook for
-   * at most `shutdownTimeoutMs`.
+   * The hook runs outside the tick: ticks never wait for it, so whatever it
+   * does cannot delay claiming, polling, lease reaping or the outbox flush. At
+   * most one call is in flight. A tick that finds the previous call still
+   * running skips the hook and logs one warning (with how long the call has
+   * run) the first time that happens, not on every tick, then calls it again
+   * after it settles. A hook that throws or rejects is caught and logged; it
+   * never stops the loop.
+   *
+   * `stop()` waits for a running hook for at most `shutdownTimeoutMs` and no
+   * hook starts once it began, so a hook must not await `host.stop()`: the
+   * call waits for the hook that is waiting for it until the timeout elapses
+   * (a hook may call `void host.stop()`).
    */
   onTick?: MaintenanceTickHook;
 
@@ -125,9 +133,10 @@ export interface NodeHostConfig {
   jobHeartbeatIntervalMs?: number;
 
   /**
-   * Upper bound (ms) on `stop()`: how long to wait for the in-flight job
-   * to finish, and separately for the final `outbox.flush`, before giving
-   * up on each (default: 10_000). Errors are logged, never thrown.
+   * Upper bound (ms) on `stop()`: how long to wait for the in-flight tick
+   * and `onTick` call, then for the in-flight job to finish, and separately
+   * for the final `outbox.flush`, before giving up on each (default:
+   * 10_000). Errors are logged, never thrown.
    */
   shutdownTimeoutMs?: number;
 
@@ -170,6 +179,11 @@ class NodeHostImpl implements NodeHost {
   private jobLoop: Promise<void> | null = null;
   /** The orchestration tick currently running, if any. */
   private tickInFlight: Promise<void> | null = null;
+  /** The `onTick` call currently running, if any. */
+  private hookInFlight: Promise<void> | null = null;
+  private hookStartedAt = 0;
+  /** Whether this run of the hook already logged that ticks skipped it. */
+  private hookSkipLogged = false;
 
   private readonly kernel: Kernel;
   private readonly jobTransport: JobTransport;
@@ -289,9 +303,13 @@ class NodeHostImpl implements NodeHost {
     // process. Without the flush, `workflow:completed` for a run this
     // process finished sits in the outbox until whichever process ticks
     // next. A tick cut short here leaves its claimed suspended stages on
-    // their poll lease; the next poller picks them up when it elapses.
-    if (this.tickInFlight) {
-      await withTimeout(this.tickInFlight, this.shutdownTimeoutMs);
+    // their poll lease; the next poller picks them up when it elapses. The
+    // `onTick` call in flight shares that bound; none starts after this point.
+    const winding = [this.tickInFlight, this.hookInFlight].filter(
+      (call) => call !== null,
+    );
+    if (winding.length > 0) {
+      await withTimeout(Promise.all(winding), this.shutdownTimeoutMs);
     }
     if (this.jobLoop) {
       await withTimeout(this.jobLoop, this.shutdownTimeoutMs);
@@ -407,7 +425,38 @@ class NodeHostImpl implements NodeHost {
         ? { eventSinkError: counts.eventSinkError }
         : {}),
     });
-    await runTickHook(this.onTick, counts, "[NodeHost]");
+    this.startTickHook(counts);
+  }
+
+  /**
+   * Calls `onTick` without waiting for it, so the hook cannot hold a tick
+   * open. One call at a time: a tick that finds the previous call running
+   * skips the hook and, the first time in a row, says so. None starts once
+   * `stop()` has begun.
+   */
+  private startTickHook(counts: MaintenanceTickCounts): void {
+    if (!this.onTick || !this.running) return;
+    if (this.hookInFlight) {
+      if (!this.hookSkipLogged) {
+        this.hookSkipLogged = true;
+        console.warn(
+          `[NodeHost] onTick hook still running after ${Date.now() - this.hookStartedAt} ms: skipping it on this tick and on every tick until it settles`,
+        );
+      }
+      return;
+    }
+    this.hookStartedAt = Date.now();
+    this.hookSkipLogged = false;
+    // Started a microtask later so `hookInFlight` is already set when the hook
+    // body first runs: a hook that calls `stop()` is then always waited for.
+    const hook = this.onTick;
+    this.hookInFlight = Promise.resolve()
+      .then(() => {
+        if (this.running) return runTickHook(hook, counts, "[NodeHost]");
+      })
+      .finally(() => {
+        this.hookInFlight = null;
+      });
   }
 
   // --------------------------------------------------------------------------

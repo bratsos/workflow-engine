@@ -523,23 +523,45 @@ export type MaintenanceTickHook = (
 /**
  * Calls a host's `onTick` hook with the counts of the tick that just ran.
  *
- * A hook that throws or rejects is caught and logged: it never fails the
- * tick, and the tick's own result is unaffected. The hook is awaited, so it
- * counts as part of the tick: a slow hook holds the tick open (the Node host
- * skips the interval firings that land meanwhile) instead of letting ticks
- * overlap, and a hook that never settles holds it open for good. Keep a
- * hook's work short and bound anything it waits on.
+ * The hook gets its own copy of `counts`: mutating it changes nothing the host
+ * returns or reports. A hook that throws or rejects is caught and logged: it
+ * never fails the caller.
+ *
+ * Without `timeoutMs` the returned promise settles when the hook does, so a
+ * hook that never settles never returns. With it, the call returns once the
+ * hook settles or `timeoutMs` has elapsed, whichever is first; after the
+ * bound it logs one warning and leaves the hook running (a later throw or
+ * rejection is still caught and logged). The Node host does not await the
+ * hook at all; the serverless host passes its `onTickTimeoutMs`.
  */
 export async function runTickHook(
   hook: MaintenanceTickHook | undefined,
   counts: MaintenanceTickCounts,
   logPrefix: string = HOST_DEFAULTS.logPrefix,
+  timeoutMs?: number,
 ): Promise<void> {
   if (!hook) return;
+  const call = (async () => {
+    try {
+      await hook({ ...counts });
+    } catch (error) {
+      console.error(`${logPrefix} onTick hook error:`, error);
+    }
+  })();
+  if (timeoutMs === undefined) return call;
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const bound = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => resolve("timeout"), timeoutMs);
+  });
   try {
-    await hook(counts);
-  } catch (error) {
-    console.error(`${logPrefix} onTick hook error:`, error);
+    if ((await Promise.race([call, bound])) === "timeout") {
+      console.warn(
+        `${logPrefix} onTick hook did not settle within ${timeoutMs} ms; not waiting for it (it keeps running)`,
+      );
+    }
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 

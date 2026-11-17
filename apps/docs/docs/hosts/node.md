@@ -64,9 +64,9 @@ You can tune the host's polling frequency, lease times, and execution limits:
 | **`maxSuspendedChecksPerTick`**| `number` | `10` | Maximum number of suspended stage completion checks to perform in a single tick. |
 | **`maxOutboxFlushPerTick`** | `number` | `100` | Maximum number of outbox events to publish in a single tick. |
 | **`retention`** | `{ olderThanMs, statuses?, limit? }` | off | Delete terminal runs older than `olderThanMs` (with their stages, logs, artifacts, annotations, step ledger, job rows and blobs) through `run.purge` at the end of every tick. Nothing is deleted unless set. See [Run Retention](../troubleshooting/overview.md#run-retention). |
-| **`onTick`** | `(counts: MaintenanceTickCounts) => void \| Promise<void>` | none | Called after every orchestration tick with the counts that tick computed. A hook that throws or rejects is caught and logged and never stops the loop. It is awaited as part of the tick, so a slow hook delays the next tick (firings that land meanwhile are skipped, never queued) and ticks never overlap. See [Exporting gauges with `onTick`](#exporting-gauges-with-ontick). |
+| **`onTick`** | `(counts: MaintenanceTickCounts) => void \| Promise<void>` | none | Called after every orchestration tick with a copy of the counts that tick computed. It runs outside the tick, so ticks never wait for it: at most one call is in flight, and a tick that finds the previous call still running skips the hook and logs one warning at the first skip. A hook that throws or rejects is caught and logged. A hook must not await `host.stop()`. See [Exporting gauges with `onTick`](#exporting-gauges-with-ontick). |
 | **`serves`** | `ServedDefinition[] \| "all"` | derived from the registry | Which definition versions this host may claim, poll and dequeue. Left unset, the kernel derives it from the registry, which is what makes a rolling deploy safe. `"all"` turns version filtering off entirely — the pre-1.0 behaviour. See [Definition versioning](../core-concepts/definition-versioning.md). |
-| **`shutdownTimeoutMs`** | `number` | `10000` (10s) | Upper bound on `stop()`: how long to wait for the in-flight job (and the in-flight orchestration tick) to finish, and separately for the final outbox flush. |
+| **`shutdownTimeoutMs`** | `number` | `10000` (10s) | Upper bound on `stop()`: how long to wait for the in-flight orchestration tick and `onTick` call, then for the in-flight job to finish, and separately for the final outbox flush. |
 | **`flushOutboxOnStop`** | `boolean` | `true` | Run a final `outbox.flush` in `stop()`, so `workflow:completed` for a run this process finished is published before it exits rather than by whichever process ticks next. |
 
 `workerId` also reaches `job_queue.workerId`: a `createPrismaJobQueue(prisma)` built without a `workerId` of its own adopts the host's on `start()`, so the job row says which worker ran the stage.
@@ -156,7 +156,7 @@ Replay them with the `plugin.replayDLQ` command once the sink is back.
 
 ### Exporting gauges with `onTick`
 
-`onTick` receives the counts of the tick that just ran (`claimed`, `suspendedChecked`, `staleReleased`, `eventsFlushed`, `stuckReaped`, `purged`, `eventsFailed`, `eventsDeadLettered`, `eventSinkStatus`). Dispatch [`engine.stats`](../core-concepts/kernel-and-ports.md#observing-the-engine) from it for queue depth and age. `metrics` below stands for your own metrics client; the engine depends on none.
+`onTick` receives a copy of the counts of the tick that just ran (mutating it changes nothing else; `claimed`, `suspendedChecked`, `staleReleased`, `eventsFlushed`, `stuckReaped`, `purged`, `eventsFailed`, `eventsDeadLettered`, `eventSinkStatus`). Dispatch [`engine.stats`](../core-concepts/kernel-and-ports.md#observing-the-engine) from it for queue depth and age. `metrics` below stands for your own metrics client; the engine depends on none.
 
 ```typescript
 const host = createNodeHost({
@@ -178,7 +178,12 @@ const host = createNodeHost({
 });
 ```
 
-Keep the hook short and bound anything it waits on: a hook that never settles stops further ticks, and `stop()` waits for a running hook for at most `shutdownTimeoutMs`.
+The hook runs outside the tick, so the engine's liveness does not depend on it: claiming, polling suspended stages, lease reaping, the outbox flush and `run.reapStuck` go on whatever the hook does.
+
+- At most one call is in flight. A tick that finds the previous call still running skips the hook and logs one warning the first time that happens (`[NodeHost] onTick hook still running after <n> ms: skipping it on this tick and on every tick until it settles`), not on every tick; the hook is called again on the first tick after it settles. A hook that never settles is therefore called once and warned about once, and gauges stop updating until it does settle: bound what it waits on (a timeout on the HTTP call) so they do not.
+- A hook that throws or rejects is caught and logged (`[NodeHost] onTick hook error:`); it never stops the loop.
+- `stop()` waits for a running hook for at most `shutdownTimeoutMs`, together with the in-flight tick. No hook starts once `stop()` has begun.
+- A hook must not `await host.stop()`. `stop()` waits for the running hook, which is waiting for `stop()`, so the call returns only after `shutdownTimeoutMs` has elapsed (the host is already stopping by then, and the hook is not called again). Call `void host.stop()` from a hook if it has to stop the host, or stop it from outside.
 
 ---
 
