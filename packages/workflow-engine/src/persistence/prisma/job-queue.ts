@@ -37,6 +37,11 @@ import {
   rawFor,
   validateDatabaseType,
 } from "./prisma-client-type";
+import {
+  armSqliteAdapter,
+  guardSqliteAdapter,
+  shareSqliteGuard,
+} from "./sqlite-date-guard.js";
 import { hasBaseReads, sqliteTransactionReads } from "./transaction-reads";
 
 const logger = createLogger("JobQueue");
@@ -175,6 +180,7 @@ export class PrismaJobQueue implements JobQueue {
     this.enums = createEnumHelper(prisma);
     this.databaseType = options.databaseType ?? "postgresql";
     validateDatabaseType(prisma, this.databaseType);
+    if (this.databaseType === "sqlite") armSqliteAdapter(this, prisma);
     this.inSqliteTransaction =
       this.databaseType === "sqlite" && isNativeTransaction(prisma);
     this.now = options.now ?? (() => new Date());
@@ -985,6 +991,7 @@ export class PrismaJobQueue implements JobQueue {
         workerId: this.workerId,
         now: this.now,
       });
+      shareSqliteGuard(reader, this);
       return { getJobsByWorkflowRun: reader.getJobsByWorkflowRun.bind(reader) };
     });
   }
@@ -1146,6 +1153,10 @@ export class PrismaJobQueue implements JobQueue {
     return result.count;
   }
 }
+
+// Every `async` method checks a SQLite file's date storage first (see the
+// module); an instance that is not SQLite runs them as before.
+guardSqliteAdapter(PrismaJobQueue.prototype);
 
 /**
  * Factory function to create PrismaJobQueue with prisma client

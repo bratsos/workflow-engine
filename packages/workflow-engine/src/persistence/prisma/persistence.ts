@@ -1,4 +1,9 @@
 import { literalPrefixQuery, prefixCandidates } from "./literal-prefix.js";
+import {
+  armSqliteAdapter,
+  guardSqliteAdapter,
+  shareSqliteGuard,
+} from "./sqlite-date-guard.js";
 import { withTransactionWriteGuard } from "./transaction-writes.js";
 /**
  * PrismaWorkflowPersistence - Prisma implementation of WorkflowPersistence
@@ -292,6 +297,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     );
     this.databaseType = options.databaseType ?? "postgresql";
     validateDatabaseType(prisma, this.databaseType);
+    if (this.databaseType === "sqlite") armSqliteAdapter(this, prisma);
     this.skipTransactions = options.skipInteractiveTransactions ?? false;
     this.now = options.now ?? (() => new Date());
     this.versioning = {
@@ -363,6 +369,8 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       // discovers has to be visible to the other.
       txPersistence.versioning = this.versioning;
       if (this.databaseType !== "sqlite") return fn(txPersistence);
+      // The date check ran before this transaction opened; do not repeat it in it.
+      shareSqliteGuard(txPersistence, this);
       closeReads = registerSqliteTransaction(
         txPersistence,
         this,
@@ -2044,6 +2052,10 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     };
   }
 }
+
+// Every `async` method checks a SQLite file's date storage first (see the
+// module); an instance that is not SQLite runs them as before.
+guardSqliteAdapter(PrismaWorkflowPersistence.prototype);
 
 /**
  * Factory function to create PrismaWorkflowPersistence

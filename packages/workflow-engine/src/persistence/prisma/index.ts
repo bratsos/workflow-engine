@@ -35,6 +35,10 @@ export {
 } from "./persistence";
 export type { EnginePrismaClient, PrismaDelegate } from "./prisma-client-type";
 export {
+  SQLITE_DATE_STORAGE_DOCS,
+  SqliteDateStorageError,
+} from "./sqlite-date-guard";
+export {
   createPrismaStepLedger,
   PrismaStepLedger,
   type PrismaStepLedgerOptions,

@@ -249,6 +249,7 @@ export {
   PrismaJobQueue,
   PrismaStepLedger,
   PrismaWorkflowPersistence,
+  SqliteDateStorageError,
 } from "./persistence";
 // Batch Model Mapping
 export {

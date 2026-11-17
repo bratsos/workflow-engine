@@ -72,4 +72,5 @@ export {
   PrismaJobQueue,
   PrismaStepLedger,
   PrismaWorkflowPersistence,
+  SqliteDateStorageError,
 } from "./prisma";
