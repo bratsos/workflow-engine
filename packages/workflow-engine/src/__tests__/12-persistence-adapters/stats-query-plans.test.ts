@@ -23,9 +23,13 @@
  *   counts, so this is the choice a large database nobody ANALYZEd gets. It
  *   does not cover a database that was analysed: SQLite then plans from the
  *   row counts, which a few seeded rows cannot stand in for.
- * - Postgres needs a role that may `DELETE FROM pg_statistic` (a superuser; the
- *   CI role `postgres` is one): every state described below is built, not
- *   assumed, so no test depends on what ran against the database before.
+ * - Postgres needs the owner of the engine tables and a role that may `DELETE
+ *   FROM pg_statistic` (a superuser; the CI role `postgres` is both and owns
+ *   the tables `prisma db push` created): the tests `ALTER TABLE ... SET
+ *   (autovacuum_enabled)` and delete statistics. Every state described below
+ *   is built, not assumed, so no test depends on what ran against the database
+ *   before. As an ordinary non-owner role they fail with `must be owner of
+ *   table`.
  * - Postgres, forced (`enable_seqscan = off`, a few seeded rows): a sequential
  *   scan appears only when no index can serve the statement. So this checks
  *   that an index path exists and which index is preferred among them,
@@ -141,6 +145,10 @@ const CLAIM_WITHOUT_STATISTICS: Expectation = {
   ...CLAIM,
   index: "outbox_events_(publishedAt_idx|workflowRunId_sequence_key)",
 };
+
+/** A statement of the engine's: one that names an engine table. */
+const ENGINE_TABLE =
+  /\b(workflow_runs|workflow_stages|job_queue|outbox_events)\b/;
 
 const SQLITE_TABLE_SCAN =
   /\bSCAN (main\.)?(t0|workflow_runs|workflow_stages|job_queue|outbox_events)\b/;
@@ -294,7 +302,10 @@ describe.skipIf(!sqlite && !databaseUrl)(
         seen = statements.length;
         await new Promise((resolve) => setTimeout(resolve, 25));
       }
-      return statements.slice();
+      // Only what touches an engine table: a driver also logs statements of its
+      // own (the Prisma 6 engine's connection check is `SELECT 1`) and the
+      // client's `BEGIN` and `COMMIT`, which are no query of the engine's.
+      return statements.filter((s) => ENGINE_TABLE.test(s.sql));
     }
 
     /** Asserts the expected index and no scan of an engine table for one statement. */
@@ -320,13 +331,23 @@ describe.skipIf(!sqlite && !databaseUrl)(
       }
     }
 
-    async function expectStatsPlans(forceIndex = true) {
+    async function expectStatsPlans(
+      forceIndex = true,
+      connectionCheck = false,
+    ) {
       const captured = await record(() =>
         Promise.all([
           persistence.getActiveWorkStats(new Date()),
           queue.getJobStats(),
+          // What a driver's own connection check looks like in the log.
+          ...(connectionCheck
+            ? [rawFor(client, { n: "int" }).$queryRawUnsafe("SELECT 1 AS n")]
+            : []),
         ]),
       );
+      if (connectionCheck) {
+        expect(statements.some((s) => !ENGINE_TABLE.test(s.sql))).toBe(true);
+      }
       // Every statement is claimed by exactly one expectation and every
       // expectation by exactly one statement: a new query must be named here.
       for (const s of captured) {
@@ -463,6 +484,8 @@ describe.skipIf(!sqlite && !databaseUrl)(
         ).toBe(0);
       });
       it("serves every stats query from its index", () => expectStatsPlans());
+      it("ignores a statement that touches no engine table", () =>
+        expectStatsPlans(true, true));
       it("serves the outbox claim's candidates from the unpublished index", () =>
         expectClaimPlans());
     });

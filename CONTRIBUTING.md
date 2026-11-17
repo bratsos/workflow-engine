@@ -39,6 +39,8 @@ pnpm --filter @bratsos/workflow-engine-console exec node scripts/build-ui.mjs   
 pnpm --filter @bratsos/workflow-engine-console exec vitest run src/__tests__/prisma-read-port.postgres.test.ts src/__tests__/cli.test.ts
 ```
 
+`stats-query-plans.test.ts` (part of `test:pg`) builds its own planner-statistics states, so the role in `DATABASE_URL` must own the engine tables (the role that ran `prisma:db-push` does) and be allowed to delete from `pg_statistic`, which takes a superuser: it runs `ALTER TABLE ... SET (autovacuum_enabled)` and `DELETE FROM pg_statistic` on `workflow_runs`, `workflow_stages`, `job_queue` and `outbox_events`. The `postgres` role of the CI service container and of the local command above is both. As an ordinary non-owner role the file fails with `must be owner of table workflow_runs`.
+
 SQLite conformance uses a temporary real file and does not need `DATABASE_URL`.
 Its fixture helpers generate or emit the matching contract and initialise the
 file. Set `SQLITE8_KERNEL_SQLITE=1` to include the kernel suites. Build the
