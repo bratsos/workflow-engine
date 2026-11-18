@@ -91,7 +91,7 @@ During a graceful shutdown (when `SIGTERM` is received, or `host.stop()` is call
 3. A final `outbox.flush` publishes the events this process committed (unless `flushOutboxOnStop: false`).
 4. The `host.stop()` promise resolves. Errors during shutdown are logged, never thrown.
 
-Each start owns its tick and job loop. A stopped tick cannot call `onTick` after a restart. A stopped job loop starts no further dequeue or job execution. If a dequeue is still pending when shutdown returns, the replacement loop waits for it to settle. A job leased by that old dequeue can be recovered when its lease expires.
+Each start owns its tick and job loop. A stopped tick cannot call `onTick` after a restart. A stopped job loop starts no further dequeue or job execution. If a dequeue is still pending when shutdown returns, the replacement loop waits for it to settle. A job that the old dequeue leased is not run. The host returns it to the queue with `defer`, fenced by the job's lease, so the job keeps its attempt count and becomes due at once. With a transport that has no `defer`, the job is recovered when its lease expires.
 
 If your process manager (e.g. PM2, Kubernetes) manages process lifecycles, you can manually trigger a stop:
 

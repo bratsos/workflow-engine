@@ -137,7 +137,10 @@ interface PersistenceCore {
   claimOutboxDelivery(limit: number, claim: string, now: Date, excludedRunIds: readonly string[]): Promise<OutboxRecord[]>;
   isOutboxDeliveryClaimActive(id: string, claim: string, now: Date): Promise<boolean>;
   completeOutboxDelivery(id: string, claim: string, now: Date): Promise<boolean>;
-  failOutboxDelivery(id: string, claim: string, maxRetries: number, now: Date): Promise<"retry" | "dead-lettered" | "lost">;
+  failOutboxDelivery(id: string, claim: string, maxRetries: number, now: Date): Promise<"retry" | "dead-lettered" | "lost">; // also releases the run's other events under this claim
+  // Optional batch forms: one ownership read and one acknowledgement write per page.
+  activeOutboxDeliveryClaims?(ids: readonly string[], claim: string, now: Date): Promise<readonly string[]>;
+  completeOutboxDeliveries?(ids: readonly string[], claim: string, now: Date): Promise<number>;
   markOutboxEventsPublished(ids: string[]): Promise<void>;
 
   // Idempotency operations
@@ -817,7 +820,7 @@ model OutboxEvent {
 }
 ```
 
-The Prisma schema provisions outbox delivery on PostgreSQL and SQLite. Keep `deliveryClaim` nullable. It holds a rotation rank and, during a live claim, an expiry and owner token. The rank persists after delivery or a retry so a fresh flusher can resume the rotation with one index lookup. Flushers compute run heads from the current rows. The live-run sequence index finds the next run head, and the live-run claim index checks for a lease when replay has restored an earlier event.
+The Prisma schema provisions outbox delivery on PostgreSQL and SQLite. Keep `deliveryClaim` nullable. It holds a rotation rank (`r`, 19 digits, `|`) and, during a live claim, an expiry and owner token after it. The rank persists after delivery or a retry so a fresh flusher can resume the rotation with one index lookup. One statement reads the rotation position, claims one head per available run and then each claimed run's next live events, up to an equal share of the page. Flushers compute run heads from the current rows. The live-run sequence index finds the next run head, and the live-run claim index checks for a lease when replay has restored an earlier event. On PostgreSQL the claim needs a raw read (`$queryRaw` or `$queryRawUnsafe`); `createPrismaWorkflowPersistence` refuses a root without one with `OutboxClaimUnsupportedError` (`OUTBOX_CLAIM_UNSUPPORTED`).
 
 Events commit with their state changes. Events are delivered at least once while retries remain. Delivery can duplicate whenever the sink effect happens without a durable acknowledgement. Examples include a crash or write error after acceptance, an emit in flight at expiry, a sink that commits and then rejects, and partial plugin success. Deduplicate using the outbox `eventId` supplied to the sink or plugin. `workflowRunId` and `sequence` order events within a run, but are not a permanent identity: after an operator deletes the newest outbox rows, the Prisma store can reuse a sequence. Failures exhaust the retry budget and move the event to the DLQ; `plugin.replayDLQ` makes it eligible again. The engine’s progress never depends on the sink. Nothing in the engine deletes outbox rows; `run.purge` leaves them. For a purged run, a flush skips a live claim until it completes or expires, skips published rows, and skips dead letters until replay; only an operator removes rows with SQL. Claims are stored in `deliveryClaim`, not `publishedAt`; custom adapters must implement the four delivery methods above. Claim via a bounded page of run heads, return each acquired row with its persisted retry count, and mark uncommitted transaction views with `outboxDeliveryDeferred: true` for a later root flush. See 03-runtime-setup.md for expiry, ordering and upgrade boundaries.
 
