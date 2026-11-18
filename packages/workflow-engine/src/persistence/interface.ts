@@ -1038,17 +1038,6 @@ export interface PersistenceCore {
   ): Promise<OutboxRecord[]>;
 
   /**
-   * Optional page form of `isOutboxDeliveryClaimActive`: the IDs, of those
-   * given, this claim still owns live and unexpired, read at once. Without
-   * it the kernel calls `isOutboxDeliveryClaimActive` for each event.
-   */
-  activeOutboxDeliveryClaims?(
-    ids: readonly string[],
-    claim: string,
-    now: Date,
-  ): Promise<readonly string[]>;
-
-  /**
    * Optional page form of `completeOutboxDelivery`: publish every given row
    * this claim still owns live, at once, and return how many. Without it the
    * kernel calls `completeOutboxDelivery` for each event.
@@ -1059,7 +1048,11 @@ export interface PersistenceCore {
     now: Date,
   ): Promise<number>;
 
-  /** Check ownership, expiry, publication and DLQ state before the sink. */
+  /**
+   * Whether this claim still owns the row live and unexpired. The kernel's
+   * flush does not call it (the claim returns only owned rows and the
+   * acknowledgement is fenced); operators and conformance checks do.
+   */
   isOutboxDeliveryClaimActive(
     id: string,
     claim: string,

@@ -769,18 +769,6 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
     );
   }
 
-  async activeOutboxDeliveryClaims(
-    ids: readonly string[],
-    claim: string,
-    now: Date,
-  ): Promise<string[]> {
-    const owned: string[] = [];
-    for (const id of ids)
-      if (await this.isOutboxDeliveryClaimActive(id, claim, now))
-        owned.push(id);
-    return owned;
-  }
-
   async completeOutboxDeliveries(
     ids: readonly string[],
     claim: string,

@@ -2013,17 +2013,10 @@ export function persistenceConformanceSuite(
         // A run's events are adjacent in the page.
         const first = page.findIndex((row) => row.workflowRunId === "batch-a");
         expect(page.slice(first, first + runA.length)).toEqual(runA);
-        const ids = page.map(({ id }) => id);
-        if (persistence.activeOutboxDeliveryClaims)
+        for (const { id } of page)
           expect(
-            [
-              ...(await persistence.activeOutboxDeliveryClaims(
-                ids,
-                claim,
-                now,
-              )),
-            ].sort(),
-          ).toEqual([...ids].sort());
+            await persistence.isOutboxDeliveryClaimActive(id, claim, now),
+          ).toBe(true);
         expect(
           await persistence.failOutboxDelivery(runA[0]!.id, claim, 3, now),
         ).toBe("retry");

@@ -81,6 +81,10 @@ export async function handleOutboxFlush(
     const now = deps.clock.now();
     const expiresAt = now.getTime() + claimDurationMs;
     const claim = `${new Date(expiresAt).toISOString()}|${crypto.randomUUID()}`;
+    // The claim statement returns only rows it now owns. A row revoked after
+    // it (an operator's DLQ move, a purge) can still reach the sink once; its
+    // acknowledgement, fenced on this claim, then changes nothing, and the
+    // flush ends after this page.
     const events = await persistence.claimOutboxDelivery(
       limit - attempted,
       claim,
@@ -90,72 +94,50 @@ export async function handleOutboxFlush(
     );
     if (interrupted(expiresAt) || !events.length) break;
     attempted += events.length;
-    // Finish the ownership read before invoking any sink. Otherwise a slow
-    // sink can leave the page to expire while another run is still awaiting
-    // its ownership read.
-    const ids = events.map((event) => event.id);
-    const owned = new Set(
-      persistence.activeOutboxDeliveryClaims
-        ? await persistence.activeOutboxDeliveryClaims(
-            ids,
-            claim,
-            deps.clock.now(),
-          )
-        : (
-            await Promise.all(
-              events.map(async (event) =>
-                (await persistence.isOutboxDeliveryClaimActive(
-                  event.id,
-                  claim,
-                  deps.clock.now(),
-                ))
-                  ? event.id
-                  : undefined,
-              ),
-            )
-          ).filter((id) => id !== undefined),
-    );
-    if (interrupted(expiresAt)) break;
 
     // Acknowledge accepted events together: one write carries every event
-    // accepted while the previous write was in flight. A run's next event
-    // does not wait for the acknowledgement of the one before it; a crash
-    // in between redelivers both, in order.
+    // accepted while the previous write was in flight, and the first waits
+    // one turn so runs whose sinks settle together share it. A run's next
+    // event does not wait for the acknowledgement of the one before it; a
+    // crash in between redelivers both, in order.
     let accepted: string[] = [];
     let writing: Promise<void> | undefined;
     let writeError: { error: unknown } | undefined;
+    const write = async () => {
+      // Before any adapter call: `writing` is set when this body runs.
+      await undefined;
+      while (accepted.length) {
+        const batch = accepted;
+        accepted = [];
+        try {
+          const count = persistence.completeOutboxDeliveries
+            ? await persistence.completeOutboxDeliveries(
+                batch,
+                claim,
+                deps.clock.now(),
+              )
+            : (
+                await Promise.all(
+                  batch.map((id) =>
+                    persistence.completeOutboxDelivery(
+                      id,
+                      claim,
+                      deps.clock.now(),
+                    ),
+                  ),
+                )
+              ).filter(Boolean).length;
+          published += count;
+          if (count < batch.length) stopAfterPage = true;
+        } catch (error) {
+          writeError ??= { error };
+        }
+      }
+      writing = undefined;
+    };
     const acknowledge = (id: string) => {
       accepted.push(id);
-      writing ??= (async () => {
-        while (accepted.length) {
-          const batch = accepted;
-          accepted = [];
-          try {
-            const count = persistence.completeOutboxDeliveries
-              ? await persistence.completeOutboxDeliveries(
-                  batch,
-                  claim,
-                  deps.clock.now(),
-                )
-              : (
-                  await Promise.all(
-                    batch.map((id) =>
-                      persistence.completeOutboxDelivery(
-                        id,
-                        claim,
-                        deps.clock.now(),
-                      ),
-                    ),
-                  )
-                ).filter(Boolean).length;
-            published += count;
-            if (count < batch.length) stopAfterPage = true;
-          } catch (error) {
-            writeError ??= { error };
-          }
-        }
-        writing = undefined;
-      })();
+      writing ??= write();
     };
 
     // Runs are delivered concurrently, a run's events one after another.
@@ -169,10 +151,6 @@ export async function handleOutboxFlush(
       [...runs.values()].map(async (run) => {
         for (const event of run) {
           if (writeError || interrupted(expiresAt)) return;
-          if (!owned.has(event.id)) {
-            stopAfterPage = true;
-            return;
-          }
           try {
             await deps.eventSink.emit(event.payload as KernelEvent, {
               eventId: event.id,
@@ -182,13 +160,22 @@ export async function handleOutboxFlush(
             });
           } catch (error) {
             stopAfterPage = true;
-            const outcome = await persistence.failOutboxDelivery(
-              event.id,
-              claim,
-              maxRetries,
-              deps.clock.now(),
-            );
             firstError ??= toErrorMessage(error);
+            let outcome: Awaited<
+              ReturnType<typeof persistence.failOutboxDelivery>
+            >;
+            try {
+              outcome = await persistence.failOutboxDelivery(
+                event.id,
+                claim,
+                maxRetries,
+                deps.clock.now(),
+              );
+            } catch (writeFailure) {
+              // A write error stops the whole page, as an acknowledgement's does.
+              writeError ??= { error: writeFailure };
+              return;
+            }
             if (outcome === "dead-lettered") deadLettered++;
             if (outcome === "retry") failed++;
             return;

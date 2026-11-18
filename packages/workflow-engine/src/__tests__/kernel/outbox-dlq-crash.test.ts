@@ -97,11 +97,12 @@ describe("kernel: dead-lettering an event across a crash", () => {
     if (operation === "publication") heal();
     (eventSink as { maxRetries: number }).maxRetries =
       operation === "dead letter" ? 1 : 3;
-    const complete = persistence.completeOutboxDelivery.bind(persistence);
+    const complete = persistence.completeOutboxDeliveries.bind(persistence);
     const fail = persistence.failOutboxDelivery.bind(persistence);
     if (operation === "publication") {
-      persistence.completeOutboxDelivery = async (...args) => {
-        if (args[0] !== first.id) return complete(...args);
+      // One acknowledgement write, committed whole or not at all.
+      persistence.completeOutboxDeliveries = async (...args) => {
+        if (!args[0].includes(first.id)) return complete(...args);
         if (committed) await complete(...args);
         throw new Error("injected publication write error");
       };
@@ -118,7 +119,7 @@ describe("kernel: dead-lettering an event across a crash", () => {
       expect(log).not.toHaveBeenCalled();
     } finally {
       log.mockRestore();
-      persistence.completeOutboxDelivery = complete;
+      persistence.completeOutboxDeliveries = complete;
       persistence.failOutboxDelivery = fail;
     }
     heal();
@@ -133,8 +134,10 @@ describe("kernel: dead-lettering an event across a crash", () => {
     clock.advance(60_001);
     await flush();
     expect(await persistence.getUnpublishedOutboxEvents(10)).toHaveLength(0);
+    // The three runs' acceptances share one acknowledgement write: when it
+    // fails uncommitted, all three are delivered again.
     expect(delivered).toHaveLength(
-      operation === "publication" && !committed ? 4 : 3,
+      operation === "publication" && !committed ? 6 : 3,
     );
   });
 

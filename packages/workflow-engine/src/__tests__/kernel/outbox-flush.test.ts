@@ -6,7 +6,11 @@
  * `outbox.flush` is dispatched.
  */
 
-import { describe, expect, it } from "vitest";
+import { spawn } from "node:child_process";
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { defineStage } from "../../core/stage-factory.js";
 import { type Workflow, WorkflowBuilder } from "../../core/workflow.js";
@@ -18,6 +22,9 @@ import {
   type PluginDefinition,
 } from "../../kernel/plugins.js";
 import type { EventSink } from "../../kernel/ports.js";
+import { InMemoryBlobStore } from "../../kernel/testing/index.js";
+import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
+import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 import { createTestKernel } from "../utils/index.js";
 
 // ---------------------------------------------------------------------------
@@ -56,6 +63,144 @@ function createTestKernelWithPlugins(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+// A port method that throws synchronously, rejects, returns a plain value or
+// never settles must not keep the flush running without yielding: each case
+// runs in a child process the parent kills after 5 s.
+describe("kernel: outbox.flush with a misbehaving persistence port", () => {
+  const child = fileURLToPath(
+    new URL("./outbox-flush-port-child.ts", import.meta.url),
+  );
+  const loader = join(
+    dirname(createRequire(import.meta.url).resolve("tsx/package.json")),
+    "dist/loader.mjs",
+  );
+  const expected: Record<string, RegExp> = {
+    throw: /^REJECTED storage closed$/m,
+    reject: /^REJECTED storage closed$/m,
+    value: /^RESOLVED /m,
+    hang: /^timer$/m,
+  };
+  it.each(
+    [
+      "claimOutboxDelivery",
+      "completeOutboxDeliveries",
+      "completeOutboxDelivery",
+      "failOutboxDelivery",
+    ].flatMap((method) =>
+      ["throw", "reject", "value", "hang"].map((behaviour) => [
+        method,
+        behaviour,
+      ]),
+    ),
+  )(
+    "%s that does %s leaves the event loop running",
+    async (method, behaviour) => {
+      const { stdout, code } = await new Promise<{
+        stdout: string;
+        code: number | null;
+      }>((resolve) => {
+        const proc = spawn(
+          process.execPath,
+          ["--import", loader, child, method, behaviour],
+          { stdio: ["ignore", "pipe", "inherit"] },
+        );
+        let stdout = "";
+        proc.stdout.on("data", (chunk) => (stdout += chunk));
+        const kill = setTimeout(() => proc.kill("SIGKILL"), 5_000);
+        proc.on("exit", (code) => {
+          clearTimeout(kill);
+          resolve({ stdout, code });
+        });
+      });
+      expect(code).toBe(0);
+      expect(stdout).toMatch(/^timer$/m);
+      expect(stdout).toMatch(expected[behaviour]!);
+      if (behaviour === "hang") expect(stdout).not.toMatch(/RESOLVED|REJECTED/);
+    },
+    20_000,
+  );
+
+  it("does not emit a run's next event once the claim expired during the one before", async () => {
+    const persistence = new InMemoryWorkflowPersistence();
+    await persistence.appendOutboxEvents(
+      [1, 2].map((i) => ({
+        workflowRunId: "a",
+        eventType: "probe",
+        payload: { type: "probe" },
+        causationId: `c${i}`,
+        occurredAt: new Date(),
+      })),
+    );
+    let now = Date.parse("2026-01-01T00:00:00.000Z");
+    const calls: number[] = [];
+    const kernel = createKernel({
+      persistence,
+      jobTransport: new InMemoryJobQueue(),
+      blobStore: new InMemoryBlobStore(),
+      clock: { now: () => new Date(now) },
+      registry: { getWorkflow: () => undefined },
+      eventSink: {
+        async emit(_event, delivery) {
+          calls.push(delivery!.sequence);
+          now += 1_001; // past the claim
+        },
+      },
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      expect(
+        await kernel.dispatch({
+          type: "outbox.flush",
+          maxEvents: 10,
+          claimDurationMs: 1_000,
+        }),
+      ).toMatchObject({ eventSinkStatus: "degraded" });
+    } finally {
+      warn.mockRestore();
+    }
+    expect(calls).toEqual([1]);
+  });
+
+  it("stops the page's other runs when the failure write after a sink rejection fails", async () => {
+    const persistence = new InMemoryWorkflowPersistence();
+    await persistence.appendOutboxEvents(
+      ["a", "a", "z", "z", "z"].map((workflowRunId, i) => ({
+        workflowRunId,
+        eventType: "probe",
+        payload: { type: "probe" },
+        causationId: `c${i}`,
+        occurredAt: new Date(),
+      })),
+    );
+    let failureKnown!: () => void;
+    const known = new Promise<void>((resolve) => (failureKnown = resolve));
+    persistence.failOutboxDelivery = async () => {
+      // Z1's sink settles once the handler has seen this rejection.
+      setImmediate(failureKnown);
+      throw new Error("failure write failed");
+    };
+    const calls: string[] = [];
+    const kernel = createKernel({
+      persistence,
+      jobTransport: new InMemoryJobQueue(),
+      blobStore: new InMemoryBlobStore(),
+      clock: { now: () => new Date() },
+      registry: { getWorkflow: () => undefined },
+      eventSink: {
+        async emit(_event, delivery) {
+          calls.push(`${delivery!.workflowRunId}${delivery!.sequence}`);
+          if (delivery!.workflowRunId === "a") throw new Error("sink rejected");
+          await known;
+        },
+      },
+    });
+    await expect(
+      kernel.dispatch({ type: "outbox.flush", maxEvents: 10 }),
+    ).rejects.toThrow("failure write failed");
+    expect(calls.sort()).toEqual(["a1", "z1"]);
+  });
+});
 
 describe("kernel: outbox.flush", () => {
   it.each([
