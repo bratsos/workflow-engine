@@ -726,9 +726,10 @@ describe
         other.close();
       }
     };
+    // Dates in the form the client binds: the storage check refuses a file that mixes forms.
     const seed = (id: string) =>
       sql(
-        `INSERT INTO workflow_runs (id, "workflowId", "workflowName", "workflowType", input, status, priority, "createdAt", "updatedAt") VALUES ('${id}', 'w', 'w', 't', '{}', 'PENDING', 5, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+        `INSERT INTO workflow_runs (id, "workflowId", "workflowName", "workflowType", input, status, priority, "createdAt", "updatedAt") VALUES ('${id}', 'w', 'w', 't', '{}', 'PENDING', 5, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`,
       );
 
     it.each([
