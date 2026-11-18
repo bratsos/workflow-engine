@@ -4,12 +4,13 @@ const { join } = require("node:path");
 const { generateOnce } = require("../generate-once.cjs");
 const schema = require("../schema.cjs");
 
-// `options` are extra PrismaClient options, e.g. `log` to record the SQL.
-exports.createPostgresClient = (url, options = {}) => {
+// `max`: the most connections the client's pool opens (the suites' pool of one).
+// Other `options` are extra PrismaClient options, e.g. `log` to record the SQL.
+exports.createPostgresClient = (url, { max, ...options } = {}) => {
   const { PrismaClient } = require("@prisma/client");
   const { PrismaPg } = require("@prisma/adapter-pg");
   return new PrismaClient({
-    adapter: new PrismaPg({ connectionString: url }),
+    adapter: new PrismaPg({ connectionString: url, ...(max ? { max } : {}) }),
     ...options,
   });
 };

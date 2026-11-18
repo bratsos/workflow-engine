@@ -140,6 +140,137 @@ export interface RunEvent {
   dlqAt: Date | null;
 }
 
+/** The stage lifecycle events a stage's attempt history is built from. */
+export const STAGE_LIFECYCLE_EVENT_TYPES = [
+  "stage:started",
+  "stage:suspended",
+  "stage:retrying",
+  "stage:failed",
+  "stage:completed",
+] as const;
+
+/**
+ * The run-level events the attempt history reads. `workflow:created` is the
+ * run's first outbox row (sequence 1): a range that begins with it starts
+ * where the run did. `workflow:started` is written by the claim and by every
+ * redrive (`run.redrive`, `run.rerunFrom`), which reopen or recreate stages
+ * without a stage event; `workflow:completed`, `workflow:failed` and
+ * `workflow:cancelled` are written with every terminal status of the run.
+ * `run.cancel` marks every non-terminal stage CANCELLED and emits only
+ * `workflow:cancelled`. A redrive takes only a terminal run, so in a run's
+ * events each `workflow:started` after the first follows one of those three.
+ */
+export const RUN_BOUNDARY_EVENT_TYPES = [
+  "workflow:created",
+  "workflow:started",
+  "workflow:completed",
+  "workflow:failed",
+  "workflow:cancelled",
+] as const;
+
+export type StageLifecycleEventType =
+  (typeof STAGE_LIFECYCLE_EVENT_TYPES)[number];
+export type RunBoundaryEventType = (typeof RUN_BOUNDARY_EVENT_TYPES)[number];
+
+/** Ceiling on the events one run-detail read returns for the attempt history. */
+export const STAGE_EVENT_LIMIT = 2000;
+/**
+ * Outbox sequences of a run that one read of the attempt history covers at
+ * most, so a read goes through at most this many rows of the run whatever
+ * its size (`eventType` has no index, so the rows of the range are read).
+ */
+export const STAGE_EVENT_WINDOW = 10_000;
+/** Characters of a lifecycle event's error text that a read returns; the rest is cut. */
+export const STAGE_EVENT_ERROR_LIMIT = 2000;
+
+/**
+ * One outbox row of the attempt history with the two payload fields it
+ * needs. The rest of the payload is never read: `workflow:completed` carries
+ * the run's output, and the console's lists are payload-free by design.
+ */
+export interface StageEvent {
+  sequence: number;
+  eventType: StageLifecycleEventType | RunBoundaryEventType;
+  occurredAt: Date;
+  /**
+   * The stage definition's id (`StageSummary.stageId`), not the stage record
+   * id. Null on the run-level events, which concern every stage of the run.
+   */
+  stageId: string | null;
+  /**
+   * Carried by `stage:retrying` and `stage:failed`; null on the others. At
+   * most `STAGE_EVENT_ERROR_LIMIT` characters.
+   */
+  error: string | null;
+  /** True when `error` was cut at `STAGE_EVENT_ERROR_LIMIT` characters. */
+  errorTruncated: boolean;
+  /**
+   * The row's `causationId` on `stage:*` events, null on the run-level ones
+   * (`run.create` writes the caller's idempotency key there). One
+   * `job.execute` writes a stage's start and that execution's end under one
+   * id, which is how the page finds an end recorded by an earlier execution.
+   * Optional: without it that check is skipped.
+   */
+  causationId?: string | null;
+}
+
+/**
+ * Cuts an error text to `STAGE_EVENT_ERROR_LIMIT` characters (code points, as
+ * both databases count them). Readers fetch one character more than the limit
+ * so that a cut is known without a second read.
+ */
+export function cutStageEventError(text: string | null): {
+  error: string | null;
+  errorTruncated: boolean;
+} {
+  if (text === null) return { error: null, errorTruncated: false };
+  const chars = [...text];
+  if (chars.length <= STAGE_EVENT_ERROR_LIMIT) {
+    return { error: text, errorTruncated: false };
+  }
+  return {
+    error: chars.slice(0, STAGE_EVENT_ERROR_LIMIT).join(""),
+    errorTruncated: true,
+  };
+}
+
+/**
+ * The attempt history's input: the stage lifecycle events and run-level
+ * boundary events of a run with a sequence greater than `after`. The page
+ * keeps what it has read and asks only for the rows after its last sequence,
+ * so one read costs the new rows of the run, never all of them. A read
+ * covers at most `STAGE_EVENT_WINDOW` sequences and returns at most
+ * `STAGE_EVENT_LIMIT` events; when rows remain past either it stops there
+ * (`more`) and the page asks again from `lastSequence`, so a long history is
+ * read in bounded chunks.
+ */
+export interface StageEventLog {
+  /** Ascending by sequence, at most `STAGE_EVENT_LIMIT`. */
+  events: StageEvent[];
+  /** The `stageEventsAfter` this read was made with; 0 for a first read. */
+  after: number;
+  /**
+   * The highest outbox sequence this read covers: the run's highest sequence,
+   * `after + STAGE_EVENT_WINDOW` when that is lower, or the sequence of its
+   * last event when it stopped at `STAGE_EVENT_LIMIT`. `after` when no row is
+   * newer. The run's highest sequence when that is below `after`: rows past
+   * the page's position were removed, and `complete` is false.
+   */
+  lastSequence: number;
+  /**
+   * True only when every sequence in `(after, lastSequence]` has a retained
+   * row. A first read that finds no row is false. False means rows were
+   * removed (by SQL, such as a pruning job), and a grouping built from them could be
+   * wrong. True with `after` 0 is not enough for the page: a run's outbox
+   * starts at sequence 1 with `workflow:created`, and a store numbers rows
+   * from 1 again after every row of a run was removed, so the page also needs
+   * that first event among `events`.
+   */
+  complete: boolean;
+  /** True when rows past `lastSequence` remain: the read stopped at its window or its limit. */
+  more: boolean;
+}
+
 export interface RunDetail {
   run: RunSummary & {
     input: unknown;
@@ -152,6 +283,13 @@ export interface RunDetail {
   annotations: AnnotationSummary[];
   logs: LogEntry[];
   events: RunEvent[];
+  /**
+   * Input to the per-attempt stage history, read after
+   * `RunDetailOptions.stageEventsAfter`. Optional so a custom reader that
+   * predates it keeps compiling; without it the UI shows each stage's latest
+   * attempt only and says the per-attempt history is unavailable.
+   */
+  stageEvents?: StageEventLog;
   /** True when a list was cut off by its limit, so the UI can say so instead of implying completeness. */
   truncated: {
     steps: boolean;
@@ -274,17 +412,49 @@ export interface RunDetailOptions {
   annotationLimit?: number;
   logLimit?: number;
   eventLimit?: number;
+  /**
+   * Return only the stage events with a sequence greater than this. The
+   * console page passes the last sequence it has read, so a poll reads the
+   * run's new outbox rows and a first load reads the run once.
+   */
+  stageEventsAfter?: number;
+  /**
+   * Read only the run and its `stageEvents`; `stages`, `steps`,
+   * `annotations`, `logs` and `events` come back empty. The page asks this
+   * way for the next part of a long history, and uses nothing else of the
+   * answer, so a reader that ignores it keeps working.
+   */
+  stageEventsOnly?: boolean;
 }
 
 export interface ConsoleReadPort {
   readonly capabilities: ConsoleCapabilities;
 
   listRuns(query: RunListQuery): Promise<RunListPage>;
+  /**
+   * The run, its rows and its events as of one moment: the attempt history
+   * checks the stage rows against the events, so a stage that changes
+   * between the read of its row and the read of its events would read as a
+   * contradiction. The Prisma reader reads in one REPEATABLE READ
+   * transaction on Postgres and one transaction on SQLite; inside a
+   * transaction the caller hands it, that transaction's isolation decides.
+   * A reader that cannot read at one moment still works: such a stage is
+   * shown as unavailable, naming the field that disagrees, until a later
+   * read sees the stage at one moment again (the page reads again on its
+   * next poll).
+   */
   getRunDetail(
     runId: string,
     options?: RunDetailOptions,
   ): Promise<RunDetail | null>;
-  /** Incremental tail of one run's timeline. `afterSequence` of 0 returns from the start. */
+  /**
+   * Incremental tail of one run's timeline. `afterSequence` of 0 returns
+   * from the start. An empty answer means the run has no row after
+   * `afterSequence`; an answer shorter than `limit` does not mean it has
+   * caught up: the Prisma reader reads the `limit` sequences that start at
+   * the first row it finds, so it returns fewer rows where some of those
+   * were removed. Read again from the last sequence.
+   */
   listRunEvents(
     runId: string,
     afterSequence: number,

@@ -13,11 +13,14 @@ const fromPrisma8 = isPrisma8 ? (await import(engine)).fromPrisma8 : undefined;
  * the fixture's generated client on 6 and 7, `fromPrisma8` over its raw client
  * on 8, with the `$disconnect` the suites call.
  */
-export function createPostgresClient(url: string): any {
+export function createPostgresClient(
+  url: string,
+  options: { max?: number } = {},
+): any {
   const fixture = createRequire(import.meta.url)(
     "../../../prisma-fixtures/index.cjs",
   );
-  if (!fromPrisma8) return fixture.createPostgresClient(url);
-  const db = fixture.createPostgresDb(url);
+  if (!fromPrisma8) return fixture.createPostgresClient(url, options);
+  const db = fixture.createPostgresDb(url, options);
   return Object.assign(fromPrisma8(db), { $disconnect: () => db.close() });
 }

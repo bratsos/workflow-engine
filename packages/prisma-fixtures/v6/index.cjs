@@ -4,10 +4,15 @@ const { join } = require("node:path");
 const { generateOnce } = require("../generate-once.cjs");
 const schema = require("../schema.cjs");
 
-// `options` are extra PrismaClient options, e.g. `log` to record the SQL.
-exports.createPostgresClient = (url, options = {}) => {
+// `max`: the most connections the client's pool opens (the suites' pool of one).
+// Other `options` are extra PrismaClient options, e.g. `log` to record the SQL.
+exports.createPostgresClient = (url, { max, ...options } = {}) => {
   const { PrismaClient } = require("@prisma/client");
-  return new PrismaClient({ datasourceUrl: url, ...options });
+  const pooled =
+    max === undefined
+      ? url
+      : `${url}${url.includes("?") ? "&" : "?"}connection_limit=${max}`;
+  return new PrismaClient({ datasourceUrl: pooled, ...options });
 };
 
 const versions = ["prisma", "@prisma/client"].map((name) => require(`${name}/package.json`).version);

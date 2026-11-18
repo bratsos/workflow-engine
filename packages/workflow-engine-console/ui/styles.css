@@ -31,6 +31,8 @@
   --wc-status-cancelled-text: #4b5563;
   --wc-status-skipped-bg: #f3f4f6;
   --wc-status-skipped-text: #4b5563;
+  --wc-status-retrying-bg: #ffedd5;
+  --wc-status-retrying-text: #9a3412;
 
   --wc-log-info-bg: #e0f2fe;
   --wc-log-info-text: #0369a1;
@@ -85,6 +87,8 @@
     --wc-status-cancelled-text: #9ca3af;
     --wc-status-skipped-bg: #374151;
     --wc-status-skipped-text: #9ca3af;
+    --wc-status-retrying-bg: #7c2d12;
+    --wc-status-retrying-text: #fed7aa;
 
     --wc-log-info-bg: #075985;
     --wc-log-info-text: #bae6fd;
@@ -481,6 +485,16 @@
   color: var(--wc-status-skipped-text);
 }
 
+#workflow-console .pill-lost {
+  background-color: var(--wc-status-skipped-bg);
+  color: var(--wc-status-skipped-text);
+}
+
+#workflow-console .pill-retrying {
+  background-color: var(--wc-status-retrying-bg);
+  color: var(--wc-status-retrying-text);
+}
+
 #workflow-console .pill-log-info {
   background-color: var(--wc-log-info-bg);
   color: var(--wc-log-info-text);
@@ -693,6 +707,148 @@
   border-radius: 4px;
   border: 1px solid var(--wc-banner-border);
   margin-top: 0.25rem;
+}
+
+#workflow-console .attempt-hint,
+#workflow-console .attempt-limit,
+#workflow-console .attempt-note,
+#workflow-console .attempt-empty {
+  margin: 0 0 0.5rem;
+  font-size: 0.75rem;
+  color: var(--wc-text-muted);
+}
+
+#workflow-console .attempt-stage {
+  margin-bottom: 0.5rem;
+  padding: 0.75rem;
+  border: 1px solid var(--wc-border);
+  border-radius: 4px;
+  background-color: var(--wc-surface);
+}
+
+#workflow-console .attempt-stage-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0 0 0.5rem;
+  font-size: 0.9375rem;
+}
+
+#workflow-console .attempt-count {
+  font-size: 0.75rem;
+  font-weight: 400;
+  color: var(--wc-text-muted);
+}
+
+#workflow-console .attempt-list,
+#workflow-console .attempt-events,
+#workflow-console .attempt-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 0.375rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+#workflow-console .attempt {
+  min-width: 0;
+  border: 1px solid var(--wc-border);
+  border-radius: 4px;
+  background-color: var(--wc-bg);
+}
+
+#workflow-console .attempt summary {
+  padding: 0.5rem 0.75rem;
+  cursor: pointer;
+}
+
+#workflow-console .attempt summary > * {
+  margin-right: 0.5rem;
+}
+
+#workflow-console .attempt summary:focus-visible {
+  outline: 2px solid var(--wc-focus-ring);
+  outline-offset: 1px;
+}
+
+#workflow-console .attempt-title {
+  font-weight: 600;
+}
+
+#workflow-console .attempt-trigger,
+#workflow-console .attempt-times,
+#workflow-console .attempt-seq {
+  font-size: 0.75rem;
+  color: var(--wc-text-muted);
+}
+
+/* Wrap each summary field as a unit instead of mid-label at narrow widths. */
+#workflow-console .attempt-trigger,
+#workflow-console .attempt-times {
+  display: inline-block;
+}
+
+#workflow-console .attempt-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  min-width: 0;
+  padding: 0.5rem 0.75rem 0.75rem;
+  border-top: 1px solid var(--wc-border);
+}
+
+#workflow-console .attempt-subtitle {
+  margin: 0;
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  color: var(--wc-text-muted);
+}
+
+#workflow-console .attempt-events li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.25rem 0.5rem;
+  font-size: 0.8125rem;
+}
+
+#workflow-console .attempt-step {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem 0.75rem;
+  padding: 0.375rem 0.5rem;
+  border: 1px solid var(--wc-border-subtle);
+  border-radius: 4px;
+  font-size: 0.8125rem;
+}
+
+#workflow-console .attempt-step code,
+#workflow-console .attempt-step-key code {
+  overflow-wrap: anywhere;
+}
+
+#workflow-console .attempt-error {
+  flex: 1 1 100%;
+  margin: 0;
+  padding: 0.375rem 0.5rem;
+  font-size: 0.75rem;
+  color: var(--wc-banner-text);
+  background-color: var(--wc-banner-bg);
+  border: 1px solid var(--wc-banner-border);
+  border-radius: 4px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+#workflow-console .attempt-unplaced {
+  display: flex;
+  flex-direction: column;
+  gap: 0.375rem;
+  margin-top: 0.5rem;
 }
 
 #workflow-console .cost-bar-track {
