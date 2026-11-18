@@ -127,9 +127,14 @@ describe(`SQLite adapter regressions on Prisma ${major}`, () => {
     );
     // A separate process owns the lock: closing an unrelated SQLite connection
     // in this process must not release the holder's POSIX file locks.
+    const [nodeMajor, nodeMinor] = process.versions.node.split(".").map(Number);
     const holder = spawn(
       process.execPath,
       [
+        // node:sqlite needs this flag before Node 22.13.
+        ...(nodeMajor === 22 && nodeMinor! < 13
+          ? ["--experimental-sqlite"]
+          : []),
         "-e",
         `
       const { DatabaseSync } = require("node:sqlite");
