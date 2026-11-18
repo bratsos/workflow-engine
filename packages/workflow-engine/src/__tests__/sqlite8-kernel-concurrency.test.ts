@@ -1,5 +1,15 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { createRequire } from "node:module";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+} from "vitest";
 import type { KernelCommand } from "../kernel/commands.js";
+import { isSqliteBusy } from "../persistence/prisma/sql-errors.js";
 import {
   type KernelDatabase,
   kernelDatabase,
@@ -377,5 +387,414 @@ describe.skipIf(!realDatabase)(
       },
       30_000,
     );
+  },
+);
+
+// The Prisma 8 SQLite driver hands a root read's rows over across microtasks,
+// holding its read lock between them. An engine transaction commits on another
+// connection of the same process: on a rollback journal its COMMIT waited its
+// busy timeout synchronously and failed; in WAL a root write behind it failed
+// with SQLITE_BUSY_SNAPSHOT. Both must commit.
+describe
+  .skipIf(!sqlite || process.env.PRISMA_MAJOR !== "8")
+  .each(["delete", "wal"] as const)(
+  "an engine transaction while a root read hands over rows, journal mode %s",
+  (mode) => {
+    let db: KernelDatabase;
+    beforeAll(async () => {
+      db = await kernelDatabase();
+      if (mode === "wal")
+        await db.client
+          .$withColumns({ journal_mode: "text" })
+          .$queryRawUnsafe("PRAGMA journal_mode = WAL");
+      for (let i = 0; i < 60; i++)
+        await db.kernel.dispatch({
+          type: "run.create",
+          idempotencyKey: `seed-${i}`,
+          workflowId: db.workflow.id,
+          input: { value: "seed" },
+        });
+    }, 120_000);
+    afterAll(async () => {
+      await db?.close();
+    });
+
+    it("commits run.create while getRunsByStatus is in flight", async () => {
+      for (let round = 0; round < 3; round++) {
+        // Root reads keep starting, so one is in flight whenever the commit comes.
+        let done = false;
+        const reads = Array.from({ length: 3 }, async () => {
+          while (!done) await db.persistence.getRunsByStatus("PENDING");
+        });
+        const created = await db.kernel
+          .dispatch({
+            type: "run.create",
+            idempotencyKey: `round-${round}`,
+            workflowId: db.workflow.id,
+            input: { value: "round" },
+          })
+          .then(
+            () => "ok",
+            (error: unknown) => error,
+          );
+        done = true;
+        await Promise.all(reads);
+        expect(created).toBe("ok");
+      }
+      expect(await db.client.workflowRun.count()).toBe(63);
+    }, 120_000);
+
+    // Reads through Prisma 8's own API on the same client, which the docs
+    // suggest for the application's queries, reach the same root connection.
+    it.each([
+      ["db.orm", () => db.native.orm.WorkflowRun.all()],
+      [
+        "db.query",
+        () =>
+          db.native
+            .query(
+              db.native.raw.sql`SELECT id FROM workflow_runs`
+                .returnsRow({ id: "sqlite/text@1" })
+                .build(),
+            )
+            .toArray(),
+      ],
+    ])(
+      "commits run.create while reads through %s are in flight",
+      async (_, read) => {
+        const before = await db.client.workflowRun.count();
+        for (let round = 0; round < 3; round++) {
+          let done = false;
+          const reads = Array.from({ length: 3 }, async () => {
+            while (!done) await read();
+          });
+          const created = await db.kernel
+            .dispatch({
+              type: "run.create",
+              idempotencyKey: `native-${_}-${round}`,
+              workflowId: db.workflow.id,
+              input: { value: "native" },
+            })
+            .then(
+              () => "ok",
+              (error: unknown) => error,
+            );
+          done = true;
+          await Promise.all(reads);
+          expect(created).toBe("ok");
+        }
+        expect(await db.client.workflowRun.count()).toBe(before + 3);
+      },
+      120_000,
+    );
+
+    // The mode can change after the first commit: the next commit follows it.
+    it("follows a journal mode changed after the client's first commit", async () => {
+      const other = mode === "wal" ? "delete" : "wal";
+      const journal = (to: string) =>
+        db.client
+          .$withColumns({ journal_mode: "text" })
+          .$queryRawUnsafe(`PRAGMA journal_mode = ${to}`);
+      try {
+        await journal(other);
+        let done = false;
+        const reads = Array.from({ length: 3 }, async () => {
+          while (!done) await db.persistence.getRunsByStatus("PENDING");
+        });
+        const created = await db.kernel
+          .dispatch({
+            type: "run.create",
+            idempotencyKey: `switched-${mode}`,
+            workflowId: db.workflow.id,
+            input: { value: "switched" },
+          })
+          .then(
+            () => "ok",
+            (error: unknown) => error,
+          );
+        done = true;
+        await Promise.all(reads);
+        expect(created).toBe("ok");
+      } finally {
+        await journal(mode);
+      }
+    }, 120_000);
+
+    it("does not hold back a root read made inside a transaction's own callback", async () => {
+      let early: Promise<unknown> | undefined;
+      const before = await db.client.workflowRun.count();
+      await db.client.$transaction(async (tx: any) => {
+        expect(await db.client.workflowRun.count()).toBe(before);
+        // Not awaited by the callback: the commit waits for it instead.
+        early = db.client.workflowRun
+          .findMany()
+          .then((rows: unknown[]) => rows);
+        await tx.workflowRun.create({
+          data: {
+            id: "inside",
+            workflowId: db.workflow.id,
+            workflowName: "w",
+            workflowType: "t",
+            input: {},
+          },
+        });
+      });
+      expect(await early).toHaveLength(before);
+      expect(await db.client.workflowRun.count()).toBe(before + 1);
+    }, 30_000);
+  },
+);
+
+// A root read whose consumer keeps it open (a for-await loop over db.orm, an
+// iterator left unfinished) must never be waited on without a bound: its
+// consumer may be awaiting the very write that would wait for it. Each case
+// matches the adapter without the read coordination: what completes there
+// completes here at once, what fails there fails here as soon, nothing hangs.
+describe
+  .skipIf(!sqlite || process.env.PRISMA_MAJOR !== "8")
+  .each(["delete", "wal"] as const)(
+  "a root read its consumer holds, journal mode %s",
+  (mode) => {
+    let db: KernelDatabase;
+    let n = 0;
+    const create = () =>
+      db.kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: `held-${mode}-${n++}`,
+        workflowId: db.workflow.id,
+        input: { value: "held" },
+      });
+    const settle = async (work: Promise<unknown>) => {
+      const start = Date.now();
+      const outcome = await work.then(
+        () => "ok",
+        (error: Error) => error.message,
+      );
+      return { outcome, ms: Date.now() - start };
+    };
+    const runs = () => db.client.workflowRun.count();
+    beforeAll(async () => {
+      db = await kernelDatabase();
+      if (mode === "wal")
+        await db.client
+          .$withColumns({ journal_mode: "text" })
+          .$queryRawUnsafe("PRAGMA journal_mode = WAL");
+      for (let i = 0; i < 3; i++) await create();
+    }, 120_000);
+    afterAll(async () => {
+      await db?.close();
+    });
+
+    it("runs a write awaited inside the loop without waiting for the loop's read", async () => {
+      const before = await runs();
+      let inside: { outcome: string; ms: number } | undefined;
+      let dispatched: { outcome: string; ms: number } | undefined;
+      for await (const _ of db.native.orm.WorkflowRun.all()) {
+        inside ??= await settle(
+          db.client.workflowRun.create({
+            data: {
+              workflowId: db.workflow.id,
+              workflowName: "w",
+              workflowType: "t",
+              input: {},
+            },
+          }),
+        );
+        dispatched ??= await settle(create());
+      }
+      expect(inside?.outcome).toBe("ok");
+      expect(inside!.ms).toBeLessThan(1000);
+      // Bounded by the busy timeout (5 s), as without the coordination: on a
+      // rollback journal the open read keeps the commit out.
+      expect(dispatched!.ms).toBeLessThan(8000);
+      if (dispatched!.outcome !== "ok")
+        expect(dispatched!.outcome).toMatch(
+          /Transaction commit failed|database is locked/,
+        );
+      // In WAL a refused dispatch may still be stored: the kernel completes
+      // its idempotency key after the commit, a known limit on any database.
+      expect(await runs()).toBeGreaterThanOrEqual(
+        before + 1 + (dispatched!.outcome === "ok" ? 1 : 0),
+      );
+    }, 30_000);
+
+    it("lets every later caller through after an iterator is left unfinished", async () => {
+      const it = db.native.orm.WorkflowRun.all()[Symbol.asyncIterator]();
+      try {
+        await it.next();
+        const dispatched = await settle(create());
+        expect(dispatched.ms).toBeLessThan(8000);
+        const later = await settle(
+          db.client.workflowRun.create({
+            data: {
+              workflowId: db.workflow.id,
+              workflowName: "w",
+              workflowType: "t",
+              input: {},
+            },
+          }),
+        );
+        // In WAL the open read's snapshot is older than the dispatch's commit:
+        // a write on its connection fails at once, as without the coordination.
+        if (mode === "delete") expect(later).toMatchObject({ outcome: "ok" });
+        else expect(later.outcome).toMatch(/^ok$|database is locked/);
+        expect(later.ms).toBeLessThan(1000);
+        expect(
+          (await db.persistence.getRunsByStatus("PENDING")).length,
+        ).toBeGreaterThan(0);
+        expect(
+          (await db.native.orm.WorkflowRun.all().toArray()).length,
+        ).toBeGreaterThan(0);
+      } finally {
+        await it.return?.();
+      }
+      expect(await settle(create())).toMatchObject({ outcome: "ok" });
+    }, 30_000);
+
+    it("finishes a loop of nested root reads while the engine writes beside it", async () => {
+      const pause = (ms: number) => new Promise((r) => setTimeout(r, ms));
+      const before = await runs();
+      const background = pause(20).then(() => settle(create()));
+      let rows = 0;
+      for await (const row of db.native.orm.WorkflowRun.all()) {
+        await db.persistence.getRun((row as { id: string }).id);
+        await db.native.orm.WorkflowRun.all().toArray();
+        rows++;
+        await pause(1);
+      }
+      // The loop reads its snapshot: in WAL the dispatch beside it may commit meanwhile.
+      expect(rows).toBe(before);
+      // As without the coordination: on a rollback journal it fails.
+      expect((await background).ms).toBeLessThan(8000);
+      expect(await settle(create())).toMatchObject({ outcome: "ok" });
+    }, 30_000);
+  },
+);
+
+// A transaction the consumer opens on the root connection itself, before the
+// adapter's first call (the takeover is installed then), must never take an
+// acknowledged engine write with it: engine writes wait for it to end, for
+// at most 5 s, and then fail busy. Ending it is never refused.
+describe
+  .skipIf(!sqlite || process.env.PRISMA_MAJOR !== "8")
+  .each(["delete", "wal"] as const)(
+  "a transaction the consumer opens on the root connection, journal mode %s",
+  (mode) => {
+    // A skipped suite still runs this callback, and Node 22.12 (the Prisma 6
+    // and 7 floor) has no node:sqlite to load.
+    const { DatabaseSync } =
+      process.env.PRISMA_MAJOR === "8"
+        ? createRequire(import.meta.url)("node:sqlite")
+        : ({} as any);
+    let db: KernelDatabase;
+    beforeEach(async () => {
+      db = await kernelDatabase();
+      const raw = new DatabaseSync(db.file);
+      raw.exec(`PRAGMA journal_mode = ${mode}`);
+      raw.close();
+    }, 120_000);
+    afterEach(async () => {
+      await db?.close();
+    });
+    const sql = (text: string) =>
+      db.native.execute(
+        db.native.raw
+          .sql([text] as any)
+          .affectedCount()
+          .build(),
+      );
+    const settle = (work: Promise<unknown>) =>
+      work.then(
+        () => "ok",
+        (error: Error) => error,
+      );
+    const create = (key: string) =>
+      db.kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: key,
+        workflowId: db.workflow.id,
+        input: { value: key },
+      });
+    // What another connection sees: what is durable.
+    const stored = () => {
+      const other = new DatabaseSync(db.file);
+      try {
+        return other
+          .prepare("SELECT id, priority FROM workflow_runs ORDER BY id")
+          .all();
+      } finally {
+        other.close();
+      }
+    };
+    const seed = (id: string) =>
+      sql(
+        `INSERT INTO workflow_runs (id, "workflowId", "workflowName", "workflowType", input, status, priority, "createdAt", "updatedAt") VALUES ('${id}', 'w', 'w', 't', '{}', 'PENDING', 5, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+      );
+
+    it.each([
+      "COMMIT",
+      "ROLLBACK",
+    ])("holds engine writes until the consumer's %s, and keeps each one acknowledged", async (end) => {
+      await seed("a");
+      await sql("BEGIN");
+      await sql("UPDATE workflow_runs SET priority = 7 WHERE id = 'a'");
+      const update = settle(
+        db.client.workflowRun.updateMany({
+          where: { id: "a" },
+          data: { priority: 9 },
+        }),
+      );
+      const dispatched = settle(create("inside"));
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      await sql(end);
+      expect(await update).toBe("ok");
+      expect(await dispatched).toBe("ok");
+      expect(stored()).toEqual(
+        expect.arrayContaining([{ id: "a", priority: 9 }]),
+      );
+      expect(stored()).toHaveLength(2);
+    }, 30_000);
+
+    it("fails an engine write busy after 5 s when the transaction never ends, and stores nothing of it", async () => {
+      await seed("a");
+      await sql("BEGIN");
+      const start = Date.now();
+      const update = await settle(
+        db.client.workflowRun.updateMany({
+          where: { id: "a" },
+          data: { priority: 9 },
+        }),
+      );
+      expect(Date.now() - start).toBeLessThan(7000);
+      expect(Date.now() - start).toBeGreaterThan(4000);
+      expect(isSqliteBusy(update)).toBe(true);
+      expect(String(update)).toMatch(/did not open/);
+      await sql("COMMIT");
+      expect(stored()).toEqual([{ id: "a", priority: 5 }]);
+      await expect(create("after")).resolves.toBeTruthy();
+      expect(stored()).toHaveLength(2);
+    }, 30_000);
+
+    it("lets a savepoint opened before the takeover end through the wrapper, then refuses a new one", async () => {
+      await sql("SAVEPOINT s1");
+      await seed("a");
+      const update = settle(
+        db.client.workflowRun.updateMany({
+          where: { id: "a" },
+          data: { priority: 9 },
+        }),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      await db.client.$executeRawUnsafe("RELEASE s1");
+      expect(await update).toBe("ok");
+      expect(stored()).toEqual([{ id: "a", priority: 9 }]);
+      await expect(sql("SAVEPOINT s2")).rejects.toThrow(/Use \$transaction/);
+      await expect(sql("BEGIN")).rejects.toThrow(/Use \$transaction/);
+      // Ending is never refused: SQLite answers it.
+      await expect(sql("ROLLBACK")).rejects.toThrow(/no transaction is active/);
+      await expect(db.client.$executeRawUnsafe("COMMIT")).rejects.toThrow(
+        /no transaction is active/,
+      );
+    }, 30_000);
   },
 );

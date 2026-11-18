@@ -23,15 +23,18 @@ import { maxTimerMs, rolledBackWrite } from "./transaction-writes.js";
  * - Timestamps use UTC text: `Date` in becomes ISO text, text out becomes `Date`.
  * - Raw reads must declare their columns (`client.$withColumns(...)`), since Prisma 8 drops
  *   the ones they do not.
- * - SQLite root writes share a queue, including entire transactions.
+ * - SQLite root writes share a queue, including entire transactions; a statement
+ *   that may write reaches the root connection only in its turn (`inTurn`).
  *
  * Imports nothing from Prisma, like the rest of the package.
  */
 
 import type { AsyncLocalStorage } from "node:async_hooks";
+import { createLogger } from "../../utils/logger";
 import type { BlobPrismaClient } from "./blob-store";
 import type { EnginePrismaClient, RawColumns } from "./prisma-client-type";
-import { isReadOnlySql } from "./read-only-sql.js";
+
+const logger = createLogger("fromPrisma8");
 
 type Row = Record<string, any>;
 type Args = Record<string, any>;
@@ -237,6 +240,8 @@ const notFound = () =>
 /** A raw parameter in a form the Prisma 8 raw lane takes: `Date` and arrays are not. */
 function param(value: unknown, sqlite = false): unknown {
   if (value instanceof Date) return value.toISOString();
+  // node:sqlite binds a boolean only from Node 24.21 and 26.8; 1 and 0 are what it stores.
+  if (typeof value === "boolean" && sqlite) return Number(value);
   if (typeof value === "bigint") return sqlite ? value : String(value);
   if (Array.isArray(value)) {
     if (sqlite) fail("SQLite raw parameters do not support arrays");
@@ -257,8 +262,9 @@ function arrayLiteral(items: unknown[]): string {
 /**
  * A statement being built: SQL text parts and the parameters between them.
  * A null is written into the text as `NULL`, since the raw lane cannot bind one.
+ * Exported with `rowsOf` for the tests that drive a bare executor; not public API.
  */
-class Sql {
+export class Sql {
   readonly parts = [""];
   readonly values: unknown[] = [];
 
@@ -314,25 +320,126 @@ function template(
   return q;
 }
 
-const toPlan = (x: Executor, q: Sql) =>
+const sqlOf = (x: Executor, q: Sql) =>
   x.raw.sql(Object.assign(q.parts, { raw: q.parts }), ...q.values);
-
-const affected = async (x: Executor, q: Sql): Promise<number> =>
-  (await x.execute(toPlan(x, q).affectedCount().build())).affectedRows;
-
-const sqliteExecutors = new WeakSet<Executor>();
+/** The plan names its database (`meta.target`); this is only Postgres, so an unknown one is treated as SQLite. */
+const postgres = (plan: { meta?: { target?: string } }) =>
+  plan.meta?.target === "postgres";
 
 /**
- * rc.21 cannot finalize its native iterator when converting an INTEGER to a
- * JS number throws in next(). Carry unsafe integers as text instead: decoding
- * then happens after a row was yielded, where the runtime closes the iterator.
- * BigInt columns can read that text exactly; other columns must still reject it.
+ * The one place a statement becomes a plan, and every `x.query` and `x.execute`
+ * here runs a plan built by it. What depends on the database (the NUL check,
+ * SQLite's unsafe-integer read) is decided from the plan, never from the
+ * executor: the root client, a transaction's, a consumer's `tx` and the driver's
+ * own executor inside a chunked write all pass through here the same way.
+ * With `spec` the plan returns rows, else it counts the rows it changes.
  */
-function sqliteRead(q: Sql, spec: Record<string, string>) {
+function buildPlan(x: Executor, q: Sql, spec?: Record<string, string>) {
+  const plan = (
+    spec ? sqlOf(x, q).returnsRow(spec) : sqlOf(x, q).affectedCount()
+  ).build();
+  refuseNul(plan, q);
+  if (!spec || postgres(plan)) return { plan };
+  const statement = statementOf(q);
+  const wire = sqliteRead(q, spec, statement);
+  return {
+    plan: sqlOf(x, wire.q).returnsRow(wire.spec).build(),
+    overflow: wire.overflow,
+    statement,
+  };
+}
+
+/** The shared root connection of a SQLite client: it has `transaction`, a transaction's `tx` does not. */
+const sqliteRoot = (x: Executor, plan: { meta?: { target?: string } }) =>
+  !postgres(plan) &&
+  typeof (x as Partial<Prisma8Db>).transaction === "function";
+
+const affected = async (x: Executor, q: Sql): Promise<number> => {
+  const { plan } = buildPlan(x, q);
+  if (!sqliteRoot(x, plan)) return (await x.execute(plan)).affectedRows;
+  await inTurn(x);
+  try {
+    return (await x.execute(plan)).affectedRows;
+  } catch (error) {
+    // WAL: a root read still handing over rows keeps the root on a snapshot
+    // older than another connection's commit, and a write on it fails at once
+    // with SQLITE_BUSY_SNAPSHOT. Nothing ran; once those reads end it can.
+    return (await afterStaleSnapshot(gateOf(x), error, () => x.execute(plan)))
+      .affectedRows;
+  }
+};
+
+/** Runs `retry` once the root reads in flight have ended, if `error` came from one. */
+function afterStaleSnapshot<T>(
+  gate: ReadGate | undefined,
+  error: unknown,
+  retry: () => Promise<T>,
+): Promise<T> {
+  if (!gate || gate.closed || !staleSnapshot(error)) throw error;
+  return withoutReads(gate, retry);
+}
+
+function staleSnapshot(error: unknown): boolean {
+  for (
+    let depth = 0;
+    depth < 5 && error && typeof error === "object";
+    depth++
+  ) {
+    if ((error as { errcode?: unknown }).errcode === 517) return true;
+    error = (error as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+let nulReadable: boolean | undefined;
+/**
+ * node:sqlite stores a NUL in TEXT, but before Node 24.16 and 26.1 (every 22.x)
+ * it reads the value back cut at the NUL: nodejs/node#61954 made the read
+ * length-aware. Tested on the running Node, not by version number.
+ * `getBuiltinModule`, not `import()`: the bundler rewrites `node:sqlite` to `sqlite`.
+ * Node has `getBuiltinModule` since 22.3 and `node:sqlite` since 22.5; another
+ * runtime without it cannot be probed, so it counts as cutting.
+ */
+function readsNul(): boolean {
+  if (nulReadable === undefined) {
+    const sqlite = process.getBuiltinModule?.("node:sqlite");
+    const db = sqlite && new sqlite.DatabaseSync(":memory:");
+    try {
+      nulReadable =
+        !!db && db.prepare("SELECT ? AS v").get("a\0b")?.v === "a\0b";
+    } finally {
+      db?.close();
+    }
+  }
+  return nulReadable;
+}
+
+/**
+ * A NUL that would be read back cut changes an ID or text without an error: refuse it.
+ * Postgres rejects a NUL itself.
+ */
+function refuseNul(plan: { meta?: { target?: string } }, q: Sql): void {
+  if (postgres(plan)) return;
+  if (!q.values.some((v) => typeof v === "string" && v.includes("\0"))) return;
+  if (!readsNul())
+    fail(
+      `SQLite text containing a NUL character cannot be stored on Node ${process.versions.node}: node:sqlite reads it back cut at the NUL here (or could not be tested for it), which would change IDs and text without an error. Use Node 24.16+ or 26.1+, or remove the NUL`,
+    );
+}
+
+/**
+ * The one decision about a SQLite statement: `read` when it provably only
+ * reads, that is SELECT, VALUES, EXPLAIN of anything, or WITH whose statement
+ * is a SELECT or VALUES (SQLite refuses a write in a CTE body). Anything else,
+ * PRAGMA included, may write: on the root client it is queued, and only its
+ * queue turn may run it (`inTurn`, `rootWrite`). A read taken for a write
+ * costs a wait in the queue; the reverse would lose writes.
+ */
+function statementOf(q: Sql) {
   const source = q.parts.join("\0");
   const tokens = [
     ...source.matchAll(
-      /--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/|'(?:''|[^'])*'|"(?:""|[^"])*"|`(?:``|[^`])*`|\[[^\]]*\]|\w+|[(),;*]/g,
+      /--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/|'(?:''|[^'])*'|"(?:""|[^"])*"|`(?:``|[^`])*`|\[[^\]]*\]|[\w$\u0080-￿]+|[(),;*]/g,
     ),
   ].filter(([s]) => !s.startsWith("--") && !s.startsWith("/*"));
   let depth = 0;
@@ -342,13 +449,43 @@ function sqliteRead(q: Sql, spec: Record<string, string>) {
     if (s === "(") depth++;
     return outside;
   });
-  const returning = top.find((t) => /^RETURNING$/i.test(t[0]));
-  const first = top[0]?.[0].toUpperCase();
-  // EXPLAIN returns plan rows, even when the explained write has RETURNING.
-  if (first === "EXPLAIN") return { q, spec };
-  if (!returning && !isReadOnlySql(q.parts.join("?")) && first !== "VALUES") {
-    return { q, spec };
-  }
+  while (top[0]?.[0] === ";") top.shift();
+  const words = top.map(([s]) => s.toUpperCase());
+  const first = words[0];
+  // SQLite runs a PRAGMA while preparing it, so `EXPLAIN PRAGMA x = 1` sets it.
+  const explained =
+    first === "EXPLAIN" ? words[words[1] === "QUERY" ? 3 : 1] : undefined;
+  const verb =
+    first === "WITH"
+      ? words.find((w) =>
+          /^(SELECT|VALUES|INSERT|UPDATE|DELETE|REPLACE)$/.test(w),
+        )
+      : first;
+  return {
+    source,
+    top,
+    first,
+    returning: top.find((t) => /^RETURNING$/i.test(t[0])),
+    read:
+      (first === "EXPLAIN" && explained !== "PRAGMA") ||
+      verb === "SELECT" ||
+      verb === "VALUES",
+  };
+}
+
+/**
+ * rc.21 cannot finalize its native iterator when converting an INTEGER to a
+ * JS number throws in next(). Carry unsafe integers as text instead: decoding
+ * then happens after a row was yielded, where the runtime closes the iterator.
+ * BigInt columns can read that text exactly; other columns must still reject it.
+ */
+function sqliteRead(
+  q: Sql,
+  spec: Record<string, string>,
+  { source, top, first, returning, read }: ReturnType<typeof statementOf>,
+) {
+  // EXPLAIN returns the plan's own columns, whatever it explains.
+  if (first === "EXPLAIN" || (!returning && !read)) return { q, spec };
   const bindings = q.values.map((value) => ({ value }));
   const slice = (start: number, end = source.length) => {
     const out = new Sql();
@@ -498,16 +635,275 @@ function sqliteRead(q: Sql, spec: Record<string, string>) {
   };
 }
 
-/** Rows for `spec` (column -> codec id); timestamps come back as `Date`. */
-async function rowsOf(
+/**
+ * Fails unless this runs in the queue turn of `x`, the shared root connection
+ * of a SQLite client. Only the queue's runner opens a turn (`enqueue`), one at
+ * a time, and it ends when the queued call settles: so nothing that may write,
+ * and no `BEGIN IMMEDIATE`, reaches the root outside the queue, and no other
+ * caller's write can run inside a lock taken here.
+ */
+async function inTurn(x: Executor): Promise<void> {
+  const store = (await context()).getStore();
+  if (!store?.turn?.active || store.queue !== followQueue(writeQueues.get(x)))
+    fail(
+      "internal error: a SQLite statement that may write reached the root connection outside its write queue",
+    );
+}
+
+/**
+ * A statement that may write, on the root connection, in its queue turn.
+ * node:sqlite leaves a statement that fails SQLITE_BUSY at its first step
+ * active when it runs through `iterate()`, which the Prisma 8 driver uses for
+ * every statement that returns rows; on the root, every later write then
+ * reports success, is not committed, and is rolled back when the statement
+ * object is collected. So a statement that returns rows runs under
+ * `BEGIN IMMEDIATE`, which takes the write lock through `run()` (it fails
+ * cleanly on BUSY after the busy_timeout), and one that returns none runs
+ * through the driver's `execute`, which uses `run()` itself. A PRAGMA that
+ * returns rows runs as it is: none of SQLite's opens a write transaction, and
+ * `journal_mode = WAL` and `wal_checkpoint` cannot run inside one.
+ */
+async function rootWrite(
+  x: Executor,
+  q: Sql,
+  plan: ReturnType<typeof buildPlan>["plan"],
+  statement: ReturnType<typeof statementOf>,
+): Promise<Row[]> {
+  const rows = () => x.query(plan).toArray();
+  if (!statement.returning) {
+    try {
+      await affected(x, q);
+      return [];
+    } catch (error) {
+      // The driver refuses before it runs a statement that returns rows.
+      if (!/cannot execute statements that return rows/.test(String(error)))
+        throw error;
+    }
+    if (statement.first === "PRAGMA") return rows();
+  }
+  // No other root read starts inside this transaction: it would see rows a
+  // failed COMMIT then takes back. Those in flight get a bounded wait.
+  const gate = gateOf(x);
+  const open = gate && !gate.closed ? await closeReads(gate) : undefined;
+  try {
+    await affected(x, new Sql().t("BEGIN IMMEDIATE"));
+    try {
+      const result = await rows();
+      await affected(x, new Sql().t("COMMIT"));
+      return result;
+    } catch (error) {
+      await affected(x, new Sql().t("ROLLBACK")).catch(() => {});
+      throw error;
+    }
+  } finally {
+    open?.();
+  }
+}
+
+/**
+ * Root reads in flight on a SQLite root client. The driver hands rows over one
+ * at a time across microtasks, so a root read that returns rows holds its read
+ * lock between them; on a rollback-journal file a transaction's COMMIT on
+ * another connection of the same process then waits its busy_timeout
+ * synchronously, the read cannot finish meanwhile, and the commit fails.
+ */
+interface ReadGate {
+  /** Every root read in flight. */
+  reading: number;
+  /** Of those, the adapter's own (`rowsOf`): it drains them itself. */
+  adapter: number;
+  /** Counts every step of a read: a turn without one means none moved. */
+  progress: number;
+  /** Called when a read ends, for a write waiting on the adapter's reads. */
+  ended?: () => void;
+  /** Set while a write waits for the reads in flight; new root reads wait for it. */
+  closed?: Promise<void>;
+  /** `adopt` ran: the driver was looked up once, at the client's first use. */
+  adopted?: boolean;
+  /** Another client over the same driver owns the gate: use that one. */
+  to?: ReadGate;
+  /** Settles once the root's transaction state was read at the takeover. */
+  ready?: Promise<void>;
+  /**
+   * Set while the root connection is inside a transaction this layer did not
+   * open (a raw BEGIN sent before the takeover): `ended` settles when it ends.
+   */
+  foreign?: { ended: Promise<void>; end: () => void };
+  /** Reads the root's transaction state again (`ownRootConnection`). */
+  recheck?: () => Promise<void>;
+}
+const readGates = new WeakMap<object, ReadGate>();
+
+function gateOf(x: object): ReadGate | undefined {
+  let gate = readGates.get(x);
+  while (gate?.to) gate = gate.to;
+  return gate;
+}
+
+/**
+ * Longest a write waits for root reads in flight: the driver's busy timeout,
+ * which bounds how long a COMMIT would have waited for them itself.
+ */
+const READ_WAIT_MS = 5000;
+
+/**
+ * An engine write on a root connection that is inside a transaction this
+ * layer did not open waits for that transaction to end, outside the write
+ * queue so the consumer can still end it, for at most READ_WAIT_MS, and then
+ * fails with this busy-class error. Joining it instead would let the
+ * consumer's ROLLBACK, or a close without COMMIT, undo a write already
+ * acknowledged.
+ */
+async function untilOwnRoot(db: object): Promise<void> {
+  const gate = gateOf(db);
+  await gate?.ready;
+  const foreign = gate?.foreign;
+  if (!foreign) return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    foreign.ended,
+    new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, READ_WAIT_MS);
+    }),
+  ]);
+  clearTimeout(timer);
+  if (gate.foreign)
+    throw Object.assign(
+      new Error(
+        "fromPrisma8: the SQLite root connection is inside a transaction this adapter did not open (a raw BEGIN sent through the client before the adapter's first call); the engine's write waited 5 s for it to end. COMMIT or ROLLBACK it, and open transactions with $transaction or db.transaction",
+      ),
+      { code: "SQLITE_BUSY", errcode: 5 },
+    );
+}
+
+/**
+ * `db.transaction(fn)` for the adapter's own transactions. Root reads that
+ * start while it commits wait for the commit. On a rollback-journal file the
+ * commit also waits for the root reads in flight (`closeReads`, bounded); a
+ * WAL commit does not wait for readers. The mode is read only when reads are
+ * in flight, at that commit, so a mode changed later is followed. Adapter
+ * transactions run one at a time (the root write queue).
+ */
+function transactionOf<T>(
+  db: Prisma8Db,
+  fn: (raw: Executor) => Promise<T>,
+): Promise<T> {
+  adopt(db);
+  const gate = gateOf(db);
+  if (!gate) return db.transaction(fn);
+  let open: (() => void) | undefined;
+  return db
+    .transaction(async (raw: Executor) => {
+      const result = await fn(raw);
+      const reading = gate.reading > 0;
+      const [mode] = reading
+        ? await rowsOf(raw, new Sql().t("PRAGMA journal_mode"), {
+            journal_mode: SQLITE_TYPES.text!,
+          })
+        : [];
+      // Without reads in flight the mode is not read: closing costs nothing.
+      if (!reading || mode?.journal_mode !== "wal") {
+        const start = Date.now();
+        open = await closeReads(gate);
+        // Reads left in flight hold the file: COMMIT waits for them in its
+        // busy timeout. This connection is the transaction's own, closed after
+        // it: give COMMIT only what is left of the one wait, so it fails no
+        // later than it would without the wait above.
+        if (gate.reading > 0)
+          await rowsOf(
+            raw,
+            new Sql().t(
+              `PRAGMA busy_timeout = ${Math.max(0, READ_WAIT_MS - (Date.now() - start))}`,
+            ),
+            { timeout: SQLITE_TYPES.int! },
+          );
+      }
+      return result;
+    })
+    .finally(() => open?.());
+}
+
+/**
+ * Holds new root reads back and waits, for at most READ_WAIT_MS, for those in
+ * flight. The adapter's own reads are drained by the adapter, so they are
+ * waited for. A read some consumer iterates (`db.orm`, `db.query`) is waited
+ * for only while it moves: one whole event-loop turn without a step means its
+ * consumer holds it, and may itself be waiting on this write, so the write
+ * goes ahead and SQLite decides, as it would without this layer. Returns the
+ * release. One waiter at a time: the callers run in write-queue turns.
+ */
+async function closeReads(gate: ReadGate): Promise<() => void> {
+  const end = Date.now() + READ_WAIT_MS;
+  let open!: () => void;
+  gate.closed = new Promise<void>((resolve) => {
+    open = resolve;
+  });
+  let seen = -1;
+  while (gate.reading > 0 && Date.now() < end) {
+    if (gate.adapter > 0) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await new Promise<void>((resolve) => {
+        gate.ended = resolve;
+        timer = setTimeout(resolve, end - Date.now());
+      });
+      clearTimeout(timer);
+      gate.ended = undefined;
+      continue;
+    }
+    if (gate.progress === seen) break;
+    seen = gate.progress;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  return () => {
+    gate.closed = undefined;
+    open();
+  };
+}
+
+async function withoutReads<T>(gate: ReadGate, work: () => Promise<T>) {
+  const open = await closeReads(gate);
+  try {
+    return await work();
+  } finally {
+    open();
+  }
+}
+
+/** Rows for `spec` (column -> codec id); timestamps come back as `Date`. Not public API. */
+export async function rowsOf(
   x: Executor,
   q: Sql,
   spec: Record<string, string>,
 ): Promise<Row[]> {
-  const wire = sqliteExecutors.has(x) ? sqliteRead(q, spec) : { q, spec };
-  const rows = await x
-    .query(toPlan(x, wire.q).returnsRow(wire.spec).build())
-    .toArray();
+  const wire = buildPlan(x, q, spec);
+  // A transaction's `tx` has a connection of its own, which goes with the transaction.
+  let rows: Row[];
+  if (wire.statement && !wire.statement.read && sqliteRoot(x, wire.plan)) {
+    await inTurn(x);
+    rows = await rootWrite(x, q, wire.plan, wire.statement);
+  } else {
+    adopt(x);
+    const gate = gateOf(x);
+    if (!gate) rows = await x.query(wire.plan).toArray();
+    else {
+      while (gate.closed) await gate.closed;
+      gate.reading++;
+      gate.adapter++;
+      gate.progress++;
+      try {
+        // Marked, so the driver hook (`ownRootConnection`) leaves it to this count.
+        const als = await context();
+        rows = await als.run({ ...als.getStore(), read: true }, () =>
+          x.query(wire.plan).toArray(),
+        );
+      } finally {
+        gate.reading--;
+        gate.adapter--;
+        gate.progress++;
+        gate.ended?.();
+      }
+    }
+  }
   if (wire.overflow)
     for (const row of rows) {
       if (row[wire.overflow])
@@ -1184,22 +1580,41 @@ function deadline(timeout: number | undefined) {
 type Schedule = <T>(work: () => Promise<T>) => Promise<T>;
 interface WriteQueue {
   tail: Promise<void>;
+  /** Another client over the same driver owns the queue: use that one. */
+  to?: WriteQueue;
+}
+function followQueue<Q extends WriteQueue | undefined>(queue: Q): Q {
+  let q = queue;
+  while (q?.to) q = q.to as Q;
+  return q;
 }
 const writeQueues = new WeakMap<object, WriteQueue>();
-let writeContext:
-  | Promise<
-      AsyncLocalStorage<{
-        queue: WriteQueue;
-        open: ReturnType<typeof deadline>;
-      }>
-    >
-  | undefined;
+type WriteContext = Promise<
+  AsyncLocalStorage<{
+    queue?: WriteQueue;
+    /** An adapter read (`rowsOf`), counted there. */
+    read?: true;
+    open?: ReturnType<typeof deadline>;
+    /** Set by the queue's runner for the call whose turn it is (`inTurn`). */
+    turn?: { active: boolean };
+  }>
+>;
+// Two copies of this module (two engine packages in one process) wrapping the
+// same client must see each other's queue turns: the context and each root
+// driver's queue and read gate are process-wide.
+const CONTEXT = Symbol.for("@bratsos/workflow-engine/prisma8-write-context");
+const ROOT = Symbol.for("@bratsos/workflow-engine/prisma8-root");
 // Load the Node context only for SQLite writes; other entry points and the
 // Postgres path need no async_hooks at runtime.
-const context = () =>
-  (writeContext ??= import("node:async_hooks").then(
-    ({ AsyncLocalStorage }) => new AsyncLocalStorage(),
-  ));
+const context = (): WriteContext =>
+  ((globalThis as { [CONTEXT]?: WriteContext })[CONTEXT] ??= import(
+    "node:async_hooks"
+  ).then(({ AsyncLocalStorage }) => new AsyncLocalStorage()));
+
+/** The queue and read gate of a root driver: every client over it shares them. */
+type SharedRoot = { queue: WriteQueue; gate: ReadGate };
+const sharedRoot = (driver: object | undefined): SharedRoot | undefined =>
+  driver && (driver as { [ROOT]?: SharedRoot })[ROOT];
 
 function queueOf(db: object): WriteQueue {
   let queue = writeQueues.get(db);
@@ -1210,25 +1625,249 @@ function queueOf(db: object): WriteQueue {
   return queue;
 }
 
+let warnedUnowned = false;
+
+/**
+ * At a client's first use, not at `fromPrisma8`: looking the driver up
+ * (`db.runtime()`) starts the client's connection, which its own first query
+ * would do too, so constructing the adapter changes nothing on the client.
+ * A second client over the same driver shares the first one's queue and gate.
+ */
+function adopt(db: object): void {
+  const gate = readGates.get(db);
+  if (!gate || gate.adopted) return;
+  let driver: RootDriver | undefined;
+  try {
+    driver = driverOf(db);
+  } catch {
+    return; // a closed client: its own statement reports it
+  }
+  gate.adopted = true;
+  if (!driver) {
+    if (!warnedUnowned) {
+      warnedUnowned = true;
+      logger.warn(
+        "fromPrisma8: this Prisma 8 build exposes no root driver (db.runtime().driver), so statements sent through db.orm, db.sql, db.query or db.execute on the wrapped client are not coordinated with the engine's: on a rollback-journal file an engine commit can fail with `Transaction commit failed` while one of those reads is returning rows, a write sent there is not queued with the engine's, and raw BEGIN/SAVEPOINT through db.execute is not refused (engine writes after one join that transaction).",
+      );
+    }
+    return;
+  }
+  const shared = sharedRoot(driver);
+  if (shared) {
+    writeQueues.get(db)!.to = shared.queue;
+    gate.to = shared.gate;
+    return;
+  }
+  ownRootConnection(driver, writeQueues.get(db)!, gate);
+}
+
 async function enqueue<T>(
-  queue: WriteQueue,
+  input: WriteQueue,
   work: () => Promise<T>,
 ): Promise<T> {
-  const owner = (await context()).getStore();
+  const queue = followQueue(input);
+  const store = await context();
+  const owner = store.getStore();
   const open = owner?.queue === queue ? owner.open : undefined;
-  const pending = queue.tail.then(() => {
+  const pending = queue.tail.then(async () => {
     // A root write awaited by its own transaction cannot acquire this queue.
     // Its transaction times out and rolls back; the stale write must not run.
     // Any other write only waited here, whatever became of the transaction
     // ahead of it.
     if (open?.closed) throw rolledBackWrite();
-    return work();
+    const turn = { active: true };
+    try {
+      return await store.run({ queue, open, turn }, work);
+    } finally {
+      turn.active = false;
+    }
   });
   queue.tail = pending.then(
     () => {},
     () => {},
   );
   return pending;
+}
+
+// Opening a transaction on the root is refused; ending one never is (`ROLLBACK
+// TO` and `RELEASE` included), whatever opened it.
+const OPENS_TRANSACTION = /^(BEGIN|SAVEPOINT)$/;
+const ENDS_TRANSACTION = /^(COMMIT|END|ROLLBACK|RELEASE)$/;
+
+interface DriverRequest {
+  sql: string;
+  params: unknown[];
+}
+interface RootDriver {
+  query(request: DriverRequest): AsyncIterable<unknown>;
+  execute(request: DriverRequest): Promise<unknown>;
+}
+
+function driverOf(db: object): RootDriver | undefined {
+  const driver = (
+    db as { runtime?: () => { driver?: Partial<RootDriver> } }
+  ).runtime?.()?.driver;
+  return typeof driver?.query === "function" &&
+    typeof driver.execute === "function"
+    ? (driver as RootDriver)
+    : undefined;
+}
+
+/**
+ * Every statement on the root connection, whatever API sends it (this
+ * adapter, `db.orm`, `db.sql`, `db.query`, a prepared statement), reaches the
+ * runtime's driver. The adapter takes that call over, so a read is counted and
+ * waits while a write waits for the reads, and a statement that may write runs
+ * in the write queue, as the adapter's own do. `runtime().driver` is not typed
+ * by Prisma 8 (rc.21): without it the adapter sees only its own reads, as the
+ * docs state (and `adopt` warns).
+ */
+function ownRootConnection(
+  driver: RootDriver,
+  queue: WriteQueue,
+  gate: ReadGate,
+): void {
+  Object.defineProperty(driver, ROOT, { value: { queue, gate } });
+  const query = driver.query.bind(driver);
+  const execute = driver.execute.bind(driver);
+  const exec = (sql: string) => execute({ sql, params: [] });
+  // The driver keeps its connection private: read the state from it. A
+  // deferred BEGIN takes no lock, and fails only inside a transaction.
+  const inside = async () => {
+    try {
+      await exec("BEGIN");
+    } catch (error) {
+      if (/within a transaction/.test(String((error as Error)?.message)))
+        return true;
+      return false; // e.g. a closed client: its own next statement says so
+    }
+    await exec("COMMIT");
+    return false;
+  };
+  gate.recheck = async () => {
+    if (!gate.foreign || (await inside())) return;
+    const { end } = gate.foreign;
+    gate.foreign = undefined;
+    end();
+  };
+  gate.ready = inside().then((yes) => {
+    if (!yes) return;
+    let end!: () => void;
+    const ended = new Promise<void>((resolve) => {
+      end = resolve;
+    });
+    gate.foreign = { ended, end };
+  });
+  const own = async () => {
+    const store = (await context()).getStore();
+    if (store?.read) return "adapter read";
+    return Boolean(store?.turn?.active && store.queue === queue);
+  };
+  const classify = (sql: string) => {
+    const statement = statementOf(new Sql().t(sql));
+    if (OPENS_TRANSACTION.test(statement.first ?? "") && !gate.foreign)
+      fail(
+        `${statement.first} on the root client: other callers' writes would join it. Use $transaction`,
+      );
+    return statement;
+  };
+  // A write sent around the adapter, as `rootWrite` runs one: in a lock it
+  // takes cleanly.
+  const write = async (request: DriverRequest) => {
+    const rows: unknown[] = [];
+    const all = async () => {
+      for await (const row of query(request)) rows.push(row);
+      return rows;
+    };
+    if (classify(request.sql).first === "PRAGMA") return all();
+    await exec("BEGIN IMMEDIATE");
+    try {
+      await all();
+      await exec("COMMIT");
+      return rows;
+    } catch (error) {
+      await exec("ROLLBACK").catch(() => {});
+      throw error;
+    }
+  };
+  driver.query = (request) => ({
+    [Symbol.asyncIterator]() {
+      let rows: AsyncIterator<unknown> | Iterator<unknown> | undefined;
+      let counted = false;
+      const end = () => {
+        if (!counted) return;
+        counted = false;
+        gate.reading--;
+        gate.progress++;
+        gate.ended?.();
+      };
+      return {
+        async next() {
+          if (!rows) {
+            await gate.ready;
+            const mine = await own();
+            if (mine === "adapter read")
+              rows = query(request)[Symbol.asyncIterator]();
+            else if (!mine && gate.foreign) {
+              // Inside the consumer's own transaction, as without this layer:
+              // no engine write runs on the root meanwhile (`untilOwnRoot`).
+              const it = query(request)[Symbol.asyncIterator]();
+              rows = {
+                next: () =>
+                  it.next().then(
+                    async (step) => (
+                      step.done && (await gate.recheck?.()), step
+                    ),
+                    async (error) => {
+                      await gate.recheck?.();
+                      throw error;
+                    },
+                  ),
+                return: (value?: unknown) =>
+                  it.return?.(value) ??
+                  Promise.resolve({ done: true as const, value }),
+              };
+            } else if (!mine && !classify(request.sql).read) {
+              rows = (await enqueue(queue, () => write(request)))[
+                Symbol.iterator
+              ]();
+            } else {
+              if (!mine) while (gate.closed) await gate.closed;
+              gate.reading++;
+              gate.progress++;
+              counted = true;
+              rows = query(request)[Symbol.asyncIterator]();
+            }
+          }
+          if (counted) gate.progress++;
+          try {
+            const step = await rows.next();
+            if (step.done) end();
+            return step;
+          } catch (error) {
+            end();
+            throw error;
+          }
+        },
+        async return(value?: unknown) {
+          end();
+          await rows?.return?.(value);
+          return { done: true as const, value };
+        },
+      };
+    },
+  });
+  driver.execute = async (request) => {
+    await gate.ready;
+    if ((await own()) === true) return execute(request);
+    classify(request.sql);
+    if (gate.foreign) return execute(request).finally(() => gate.recheck?.());
+    return enqueue(queue, () =>
+      execute(request).catch((error: unknown) =>
+        afterStaleSnapshot(gate, error, () => execute(request)),
+      ),
+    );
+  };
 }
 
 const READS = new Set([
@@ -1349,7 +1988,7 @@ function delegate(x: Executor, m: Model, schedule?: Schedule) {
       // share a transaction, inside a `tx` they use it.
       return statements.length > 1 &&
         typeof (e as Partial<Prisma8Db>).transaction === "function"
-        ? (e as Prisma8Db).transaction(run)
+        ? transactionOf(e as Prisma8Db, run)
         : run(e);
     }),
     update: op("update", ["where", "data", "select"], async (e, a) => {
@@ -1586,6 +2225,8 @@ export function fromPrisma8(
   );
   const root = typeof (db as Partial<Prisma8Db>).transaction === "function";
   const queue = sqlite && root ? queueOf(db) : undefined;
+  if (queue && !readGates.has(db))
+    readGates.set(db, { reading: 0, adapter: 0, progress: 0 });
   const delegates = new WeakMap<Executor, Record<string, unknown>>();
 
   const client = (
@@ -1593,9 +2234,12 @@ export function fromPrisma8(
     inTransaction: boolean,
     columns?: RawColumns,
   ): Prisma8Client => {
-    if (sqlite) sqliteExecutors.add(x);
     const schedule: Schedule | undefined =
-      queue && !inTransaction ? (work) => enqueue(queue, work) : undefined;
+      queue && !inTransaction
+        ? (work) => (
+            adopt(db), untilOwnRoot(db).then(() => enqueue(queue, work))
+          )
+        : undefined;
     if (!delegates.has(x)) {
       delegates.set(
         x,
@@ -1637,16 +2281,44 @@ export function fromPrisma8(
       }
       return rows;
     };
+    const control = (q: Sql) => {
+      if (
+        queue &&
+        !inTransaction &&
+        OPENS_TRANSACTION.test(statementOf(q).first ?? "") &&
+        !gateOf(db)?.foreign
+      )
+        fail(
+          `${statementOf(q).first} on the root client: other callers' writes would join it. Use $transaction`,
+        );
+      return q;
+    };
+    // Ending a transaction must not wait for it to end (`untilOwnRoot`).
+    const ending = (work: () => Promise<any>) => (
+      adopt(db), enqueue(queue!, work).finally(() => gateOf(db)?.recheck?.())
+    );
     const rawRead = (q: Sql) =>
-      sqlite
+      control(q) && sqlite
         ? new Op(
             (e) => read(q, e),
             x,
-            isReadOnlySql(q.parts.join("?")) ? undefined : schedule,
+            statementOf(q).read
+              ? undefined
+              : schedule && ENDS_TRANSACTION.test(statementOf(q).first ?? "")
+                ? ending
+                : schedule,
           )
         : read(q);
     const rawWrite = (q: Sql) =>
-      sqlite ? new Op((e) => affected(e, q), x, schedule) : affected(x, q);
+      control(q) && sqlite
+        ? new Op(
+            (e) => affected(e, q),
+            x,
+            schedule && ENDS_TRANSACTION.test(statementOf(q).first ?? "")
+              ? ending
+              : schedule,
+          )
+        : affected(x, q);
 
     const transaction = async (arg: any, options: Args = {}) => {
       check("$transaction", options, ["isolationLevel", "timeout"]);
@@ -1664,7 +2336,7 @@ export function fromPrisma8(
       const run = async () => {
         let open: ReturnType<typeof deadline> | undefined;
         try {
-          return await (db as Prisma8Db).transaction(async (raw: Executor) => {
+          return await transactionOf(db as Prisma8Db, async (raw: Executor) => {
             const lease = deadline(
               options.timeout ?? (callback ? DEFAULT_TIMEOUT : undefined),
             );
@@ -1674,7 +2346,6 @@ export function fromPrisma8(
               query: (plan) => (lease.check(), raw.query(plan)),
               execute: (plan) => (lease.check(), raw.execute(plan)),
             };
-            if (sqlite) sqliteExecutors.add(tx);
             const work = async () => {
               if (level && !sqlite) {
                 await affected(
@@ -1700,8 +2371,9 @@ export function fromPrisma8(
               return results;
             };
             if (!queue) return lease.race(work());
-            return (await context()).run({ queue, open: lease }, () =>
-              lease.race(work()),
+            return (await context()).run(
+              { queue: followQueue(queue), open: lease },
+              () => lease.race(work()),
             );
           });
         } catch (error) {

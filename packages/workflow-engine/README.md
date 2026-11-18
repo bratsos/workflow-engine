@@ -75,7 +75,7 @@ What it does not do: no arbitrary DAG or child workflows (pipelines are linear e
 - **Zod** ^4.1.12
 - **PostgreSQL** >= 14 or **SQLite** (for Prisma persistence; `sql/enqueue.sql` needs PostgreSQL 13+)
 - **Prisma 7** needs Node.js 22.12+ or 24+ with this engine (Prisma 7 rejects Node 23)
-- **Prisma 8** additionally needs an ES module project (`"type": "module"`), TypeScript >= 5.9 and Node.js 22.18+, 24.11+ or 26+ for PostgreSQL. SQLite requires Node.js 22.20+, 24.11+ or 26+. PostgreSQL requires PostgreSQL >= 15; SQLite uses the SQLite target package. The engine's general Node.js requirement remains >= 22.11.
+- **Prisma 8** additionally needs an ES module project (`"type": "module"`), TypeScript >= 5.9 and Node.js 22.18+, 24.11+ or 26+ for PostgreSQL. SQLite is tested and supported on Node.js 22.20+, 24.11+ or 26+ (the Prisma 8 CLI declares `^22.18.0 || ^24.11.0 || >=26.0.0`). PostgreSQL requires PostgreSQL >= 15; SQLite uses the SQLite target package. The engine's general Node.js requirement remains >= 22.11.
 
 ### Optional Peer Dependencies
 
