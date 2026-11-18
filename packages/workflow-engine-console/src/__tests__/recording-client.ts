@@ -26,11 +26,22 @@ export function recordingClient(
       return rows;
     }) as ConsolePrismaClient["$queryRawUnsafe"],
     ...(c.$transaction
-      ? { $transaction: (fn) => c.$transaction!((tx) => fn(wrap(tx))) }
+      ? {
+          $transaction: (fn, options) =>
+            c.$transaction!((tx) => fn(wrap(tx)), options),
+        }
       : {}),
-    // Settings statements (`SET TRANSACTION`, `SET LOCAL`) pass through unrecorded.
+    // A cursor's `DECLARE` is recorded (its query is the read); settings
+    // statements (`SET LOCAL`) and `CLOSE` pass through unrecorded.
     ...(c.$executeRawUnsafe
-      ? { $executeRawUnsafe: c.$executeRawUnsafe.bind(c) }
+      ? {
+          $executeRawUnsafe: async (sql: string, ...params: unknown[]) => {
+            const count = await c.$executeRawUnsafe!(sql, ...params);
+            if (sql.startsWith("DECLARE "))
+              calls.push({ sql, params, rows: count });
+            return count;
+          },
+        }
       : {}),
     ...(c.$withColumns
       ? { $withColumns: (columns) => wrap(c.$withColumns!(columns)) }

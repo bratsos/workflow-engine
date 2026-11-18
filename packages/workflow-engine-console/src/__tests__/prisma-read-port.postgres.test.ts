@@ -24,6 +24,7 @@
  */
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import { ConsoleQueryTimeoutError, isStatementTimeout } from "../errors";
+import { createWorkflowConsole } from "../handler";
 import {
   type ConsolePrismaClient,
   createPrismaConsoleReadPort,
@@ -32,6 +33,7 @@ import { STAGE_EVENT_WINDOW } from "../read-port";
 import { buildStageAttemptHistory, mergeStageEvents } from "../stage-attempts";
 import { createPostgresClient } from "./postgres-client";
 import { type RecordedStatement, recordingClient } from "./recording-client";
+import { countServerErrors } from "./server-errors";
 import { readStoredRows, runStoreOracle, storeWorld } from "./store-oracle";
 
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -50,6 +52,19 @@ if (!DATABASE_URL) {
     // A raw read that returns `columns`: on Prisma 8 it has to declare them.
     const rawRead = (c: ConsolePrismaClient, columns = {}) =>
       c.$withColumns?.(columns) ?? c;
+
+    // The plan tests read as an ordinary role, as an application does: one
+    // made inside their rolled-back transaction, so it exists nowhere else.
+    async function asOrdinaryRole(tx: any) {
+      const role = `console_plan_reader_${process.pid}`;
+      for (const statement of [
+        `CREATE ROLE ${role} NOLOGIN NOSUPERUSER`,
+        `GRANT USAGE ON SCHEMA console_plan_statistics, public TO ${role}`,
+        `GRANT SELECT ON ALL TABLES IN SCHEMA console_plan_statistics, public TO ${role}`,
+        `SET LOCAL ROLE ${role}`,
+      ])
+        await tx.$executeRawUnsafe(statement);
+    }
 
     const T0 = new Date("2026-03-01T12:00:00.000Z");
     const at = (minutes: number) => new Date(T0.getTime() + minutes * 60_000);
@@ -568,6 +583,51 @@ if (!DATABASE_URL) {
       );
     });
 
+    it("pages annotations newest first, ordering those that share a time by id across the page's end", async () => {
+      await prisma.workflowRun.createMany({
+        data: [mkRun("run-annotation-ties", at(-9_030), "RUNNING", "wf-d")],
+      });
+      // Written in the opposite order of their ids, so that the order the
+      // rows were written in is not the answer.
+      for (const [id, minute] of [
+        ["tie-5", 40],
+        ["tie-4", 40],
+        ["tie-3", 40],
+        ["tie-2", 40],
+        ["tie-1", 40],
+        ["tie-newest", 41],
+      ] as const) {
+        await prisma.workflowAnnotation.createMany({
+          data: [
+            {
+              id,
+              workflowRunId: "run-annotation-ties",
+              attempt: 0,
+              scope: "run",
+              key: id,
+              value: {},
+              createdAt: at(minute),
+            },
+          ],
+        });
+      }
+      const ids = async (annotationLimit: number) => {
+        const detail = await reader().getRunDetail("run-annotation-ties", {
+          annotationLimit,
+        });
+        return [
+          detail!.annotations.map((a) => a.id),
+          detail!.truncated.annotations,
+        ];
+      };
+      expect(await ids(3)).toEqual([["tie-newest", "tie-5", "tie-4"], true]);
+      expect(await ids(1)).toEqual([["tie-newest"], true]);
+      expect(await ids(6)).toEqual([
+        ["tie-newest", "tie-5", "tie-4", "tie-3", "tie-2", "tie-1"],
+        false,
+      ]);
+    });
+
     it("cuts a lifecycle event's error text in SQL and says it was cut", async () => {
       await prisma.workflowRun.createMany({
         data: [mkRun("run-long-error", at(-9_003), "FAILED", "wf-d")],
@@ -981,6 +1041,7 @@ FROM generate_series(1, 7) g`,
                 setup.holds(stats),
                 `${state}: ${JSON.stringify(stats)}`,
               ).toBe(true);
+              await asOrdinaryRole(tx);
 
               const calls: RecordedStatement[] = [];
               const planOf = async (sql: string, params: unknown[]) => {
@@ -1039,9 +1100,12 @@ FROM generate_series(1, 7) g`,
                 await createPrismaConsoleReadPort(recordingClient(tx, calls), {
                   now: () => at(100),
                 }).listRunEvents("run-plan-30000", after);
-                expect(calls).toHaveLength(2);
+                const statements = calls.filter((c) =>
+                  c.sql.includes('"outbox_events"'),
+                );
+                expect(statements).toHaveLength(2);
                 let pages = 0;
-                for (const call of calls) {
+                for (const call of statements) {
                   const plan = await planOf(call.sql, call.params);
                   expect(JSON.stringify(plan)).not.toContain("Seq Scan");
                   pages +=
@@ -1099,6 +1163,218 @@ FROM generate_series(1, 7) g`,
       expect(seen).toHaveLength(4);
     });
 
+    it("reads a run's stages, steps, annotations and logs with plans that do not depend on the tables' statistics, or at the cost the docs state", {
+      timeout: 300_000,
+    }, async () => {
+      const inline = (sql: string, params: unknown[]) =>
+        sql.replace(/\$(\d+)/g, (_m, n) => {
+          const value = params[Number(n) - 1];
+          return typeof value === "number"
+            ? String(value)
+            : `'${String(value).replace(/'/g, "''")}'`;
+        });
+      const tables = [
+        "workflow_stages",
+        "workflow_steps",
+        "workflow_annotations",
+        "workflow_logs",
+      ];
+      const sizes = [1_000, 30_000];
+      // Rows of one run: 20 stages, and `rows` steps, annotations (three to
+      // a millisecond, so the page boundary has ties) and logs.
+      const fill = async (tx: any, runId: string, rows: number) => {
+        await tx.$executeRawUnsafe(
+          `INSERT INTO workflow_stages (id, "updatedAt", "workflowRunId", "stageId", "stageName", "stageNumber", "executionGroup", status)
+SELECT '${runId}-s' || k, now(), '${runId}', 's' || k, 'S' || k, k, k, 'COMPLETED'::"Status"
+FROM generate_series(1, 20) k`,
+        );
+        await tx.$executeRawUnsafe(
+          `INSERT INTO workflow_steps (id, "stageRecordId", "stepId", seq, kind, status, "updatedAt")
+SELECT '${runId}-t' || g, '${runId}-s' || (1 + g % 20), 't' || g, g, 'run', 'COMPLETED', now()
+FROM generate_series(1, ${rows}) g`,
+        );
+        await tx.$executeRawUnsafe(
+          `INSERT INTO workflow_annotations (id, "createdAt", "workflowRunId", scope, key, value)
+SELECT '${runId}-a' || g, timestamp '2026-03-01' + (g / 3) * interval '1 millisecond', '${runId}', 'run', 'k' || g, '{}'::jsonb
+FROM generate_series(1, ${rows}) g`,
+        );
+        await tx.$executeRawUnsafe(
+          `INSERT INTO workflow_logs (id, "createdAt", "workflowRunId", level, message)
+SELECT '${runId}-l' || g, timestamp '2026-03-01' + g * interval '1 millisecond', '${runId}', 'INFO', 'm'
+FROM generate_series(1, ${rows}) g`,
+        );
+      };
+      const load = async (tx: any) => {
+        for (const rows of sizes) await fill(tx, `run-plan-${rows}`, rows);
+        await fill(tx, "run-plan-others", 60_000);
+      };
+      const reltuples = async (tx: any) =>
+        Object.fromEntries(
+          (
+            await rawRead(tx, {
+              relname: "text",
+              reltuples: "float",
+            }).$queryRawUnsafe<Array<{ relname: string; reltuples: number }>>(
+              `SELECT c.relname, c.reltuples::float8 AS reltuples FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'console_plan_statistics' AND c.relkind = 'r'`,
+            )
+          ).map((r) => [r.relname, Number(r.reltuples)]),
+        );
+      const analyze = async (tx: any) => {
+        for (const table of tables)
+          await tx.$executeRawUnsafe(`ANALYZE ${table}`);
+      };
+      const states: Record<
+        string,
+        {
+          before: (tx: any) => Promise<void>;
+          after: (tx: any) => Promise<void>;
+          holds: (r: Record<string, number>) => boolean;
+        }
+      > = {
+        "never analysed": {
+          before: async () => {},
+          after: async () => {},
+          holds: (r) => tables.every((t) => r[t] === -1),
+        },
+        "analysed empty": {
+          before: analyze,
+          after: async () => {},
+          holds: (r) => tables.every((t) => r[t] === 0),
+        },
+        "analysed at size": {
+          before: async () => {},
+          after: analyze,
+          holds: (r) => r.workflow_logs! > 60_000,
+        },
+        // Analysed while one run held a few rows, then grown.
+        stale: {
+          before: async (tx) => {
+            await fill(tx, "run-plan-few", 7);
+            await analyze(tx);
+          },
+          after: async () => {},
+          holds: (r) => r.workflow_logs === 7,
+        },
+      };
+      const rollback = new Error("rolled back on purpose");
+      const lines: string[] = [];
+      for (const [state, setup] of Object.entries(states)) {
+        await prisma
+          .$transaction(
+            async (tx: any) => {
+              await tx.$executeRawUnsafe(
+                "CREATE SCHEMA console_plan_statistics",
+              );
+              for (const table of tables)
+                await tx.$executeRawUnsafe(
+                  `CREATE TABLE console_plan_statistics.${table} (LIKE public.${table} INCLUDING ALL)`,
+                );
+              await tx.$executeRawUnsafe(
+                "SET LOCAL search_path = console_plan_statistics, public",
+              );
+              await tx.workflowRun.createMany({
+                data: [
+                  "run-plan-few",
+                  "run-plan-others",
+                  ...sizes.map((n) => `run-plan-${n}`),
+                ].map((id, i) => mkRun(id, at(-9_200 - i), "RUNNING", "wf-d")),
+              });
+              await setup.before(tx);
+              await load(tx);
+              await setup.after(tx);
+              const r = await reltuples(tx);
+              expect(setup.holds(r), `${state}: ${JSON.stringify(r)}`).toBe(
+                true,
+              );
+              await asOrdinaryRole(tx);
+              const pages: Record<string, number[]> = {};
+              const plans: Record<string, string[]> = {};
+              for (const rows of sizes) {
+                const calls: RecordedStatement[] = [];
+                await createPrismaConsoleReadPort(recordingClient(tx, calls), {
+                  now: () => at(100),
+                }).getRunDetail(`run-plan-${rows}`);
+                for (const { sql, params } of calls) {
+                  const table = tables.find((t) => sql.includes(`FROM "${t}"`));
+                  if (!table) continue;
+                  const [row] = await rawRead(tx, {
+                    "QUERY PLAN": "json",
+                  }).$queryRawUnsafe<Array<{ "QUERY PLAN": unknown }>>(
+                    `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${inline(sql, params)}`,
+                  );
+                  const raw = row!["QUERY PLAN"];
+                  const plan = (
+                    typeof raw === "string" ? JSON.parse(raw) : raw
+                  )[0].Plan;
+                  const key = `${table}@${rows}`;
+                  pages[key] = [
+                    ...(pages[key] ?? []),
+                    plan["Shared Hit Blocks"] + plan["Shared Read Blocks"],
+                  ];
+                  plans[key] = [...(plans[key] ?? []), JSON.stringify(plan)];
+                }
+              }
+              const line = `${state}: ${JSON.stringify(pages)}`;
+              lines.push(line);
+              console.log(line);
+              const sum = (key: string) =>
+                pages[key]!.reduce((a, b) => a + b, 0);
+              // Annotations: cursors whose plans walk the run's
+              // ("workflowRunId", "createdAt") index backwards and stop at
+              // the page (its rows, then the group of rows that share the
+              // time it ends at): the same few pages at 1,000 and 30,000.
+              for (const rows of sizes) {
+                const key = `workflow_annotations@${rows}`;
+                expect(plans[key]!.length, line).toBeGreaterThanOrEqual(1);
+                for (const plan of plans[key]!) {
+                  const walk = JSON.parse(plan);
+                  const scan =
+                    walk["Node Type"] === "Limit" ? walk.Plans[0] : walk;
+                  expect(scan, line).toMatchObject({
+                    "Node Type": "Index Scan",
+                    "Scan Direction": "Backward",
+                    "Index Name":
+                      "workflow_annotations_workflowRunId_createdAt_idx",
+                  });
+                }
+              }
+              // Three annotations to a millisecond: the page of 200 ends in
+              // a group, so the group is read too.
+              expect(plans["workflow_annotations@30000"], line).toHaveLength(2);
+              expect(sum("workflow_annotations@30000"), line).toBeLessThan(40);
+              expect(
+                Math.max(...pages["workflow_annotations@30000"]!),
+                line,
+              ).toBeLessThanOrEqual(
+                Math.max(...pages["workflow_annotations@1000"]!) + 5,
+              );
+              // Stages: the run's 20 rows by an index on the run.
+              expect(sum("workflow_stages@30000"), line).toBeLessThan(20);
+              // Logs and steps: no index serves their order, so a page of
+              // them reads every row of the run (or the whole table): the
+              // cost the console docs state ("How the events are read"),
+              // which grows with the run, and never more.
+              for (const rows of sizes) {
+                expect(sum(`workflow_logs@${rows}`), line).toBeLessThanOrEqual(
+                  15 + rows * 0.0125,
+                );
+                expect(sum(`workflow_steps@${rows}`), line).toBeLessThanOrEqual(
+                  rows === 1_000 ? 1_800 : 11_000,
+                );
+              }
+              throw rollback;
+            },
+            { timeout: 240_000 },
+          )
+          .catch((error: unknown) => {
+            if (error !== rollback) throw error;
+          });
+      }
+      expect(lines).toHaveLength(4);
+    });
+
     describe("the attempt history on the engine's Prisma store (real kernel)", () => {
       // The store's own runs only: a claim takes every pending run it finds.
       beforeEach(truncateAll, 60_000);
@@ -1129,8 +1405,11 @@ FROM generate_series(1, 7) g`,
         );
         expect(files).toBeGreaterThanOrEqual(110);
         const wrong = lines.filter((line) =>
-          // Its capture appends two `workflow:started` probes to a completed
-          // run, which the engine never writes: the order check finds them.
+          // Its capture harness appends two `workflow:started` rows of its own
+          // to the completed run, and the run row counts no redrive. The first
+          // reads as a redrive; the second, with no end between, is neither a
+          // redrive nor the claim after a transition (that pair is a run's first
+          // start only), so the order check finds it.
           line.scenario === "unpublished-outbox"
             ? line.read !== "unavailable run-inconsistent/order"
             : !line.read.startsWith("available"),
@@ -1203,6 +1482,46 @@ FROM generate_series(1, 7) g`,
       expect(await tail(0, 1)).toEqual([1]);
       expect(await tail(0, 3)).toEqual([1, 2]);
       expect(await tail(4 + STAGE_EVENT_WINDOW)).toEqual([]);
+      // Near and past the largest value of the sequence column, through the
+      // handler: the rows there, or none, not a 500 for a bound Postgres
+      // refuses.
+      await prisma.outboxEvent.createMany({
+        data: [
+          mkEvent(
+            "tail-gap-top",
+            "run-tail-gap",
+            2_147_483_600,
+            "stage:progress",
+            at(21),
+            null,
+            null,
+          ),
+        ],
+      });
+      const handle = createWorkflowConsole({
+        reader: reader(),
+        authorize: () => true,
+      });
+      for (const query of [
+        "events?afterSequence=9007199254740993",
+        "events?afterSequence=2147483647",
+        "events?afterSequence=2147483599&limit=500",
+        "?stageEventsAfter=9007199254740993",
+      ]) {
+        const response = await handle(
+          new Request(
+            `https://console.example/console/api/runs/run-tail-gap${query.startsWith("?") ? "" : "/"}${query}`,
+          ),
+        );
+        expect(response.status, query).toBe(200);
+        if (query.startsWith("events"))
+          expect(
+            ((await response.json()) as Array<{ sequence: number }>).map(
+              (e) => e.sequence,
+            ),
+            query,
+          ).toEqual(query.includes("limit") ? [2_147_483_600] : []);
+      }
     });
 
     it("counts the queue and finds the oldest pending job and lease", async () => {
@@ -1279,33 +1598,124 @@ FROM generate_series(1, 7) g`,
       );
     });
 
+    it("makes the server raise no error, at its own level or inside a caller's transaction, and leaves the caller's statement_timeout as it was", {
+      timeout: 60_000,
+    }, async () => {
+      const relay = await countServerErrors(DATABASE_URL);
+      const observed = createPostgresClient(relay.url);
+      try {
+        const reads = async (c: ConsolePrismaClient) => {
+          const port = createPrismaConsoleReadPort(c, { now: () => at(100) });
+          for (let i = 0; i < 10; i++) {
+            const detail = await port.getRunDetail("run-1");
+            expect(detail?.run.id).toBe("run-1");
+          }
+          await port.listRunEvents("run-1", 0);
+          await port.listRuns({ limit: 3 });
+        };
+        await reads(observed);
+        // The caller's transaction: on Prisma 7 its client has a
+        // `$transaction` of its own (a savepoint); on 6 and 8 it has none.
+        const after = await observed.$transaction(
+          async (tx: ConsolePrismaClient) => {
+            await tx.$executeRawUnsafe?.("SET LOCAL statement_timeout = 4321");
+            await reads(tx);
+            const [row] = await rawRead(tx, {
+              statement_timeout: "text",
+            }).$queryRawUnsafe<Array<{ statement_timeout: string }>>(
+              "SHOW statement_timeout",
+            );
+            return row?.statement_timeout;
+          },
+          { timeout: 30_000 },
+        );
+        expect(after).toBe("4321ms");
+        expect(relay.errors).toEqual([]);
+      } finally {
+        await observed.$disconnect?.();
+        await relay.close();
+      }
+    });
+
+    it("gives a read's transaction the time its statements may take, and reports a client that gives up as a console timeout", {
+      timeout: 60_000,
+    }, async () => {
+      // A statement that outlasts Prisma's default transaction limit (5 s):
+      // with no statement timeout the read waits for it.
+      const slow = (c: ConsolePrismaClient, ms: number) =>
+        recordingClient(c, [], async (call) => {
+          if (call.sql.includes('FROM "workflow_stages"'))
+            await new Promise((r) => setTimeout(r, ms));
+        });
+      const unbounded = await createPrismaConsoleReadPort(slow(client, 6_000), {
+        now: () => at(100),
+        statementTimeoutMs: 0,
+      }).getRunDetail("run-1");
+      expect(unbounded?.run.id).toBe("run-1");
+      // A client-side wait past the read's budget (12 statements of 50 ms):
+      // the client ends the transaction (P2028), reported as the console's
+      // timeout.
+      const error = await createPrismaConsoleReadPort(slow(client, 1_500), {
+        now: () => at(100),
+        statementTimeoutMs: 50,
+      })
+        .getRunDetail("run-1")
+        .catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(ConsoleQueryTimeoutError);
+      expect((error as { cause?: { code?: string } }).cause?.code).toBe(
+        "P2028",
+      );
+    });
+
     it("actually applies statement_timeout on a root client", async () => {
       // A client that answers every read with a one-second sleep. The point
       // is that the `SET LOCAL statement_timeout` the reader issues inside
       // the transaction it opened really takes effect, not that listRuns is
-      // slow -- pg_sleep is just the only reliable way to outrun a 1ms
+      // slow -- pg_sleep is just the only reliable way to outrun a 200ms
       // budget.
       const sleepy: ConsolePrismaClient = {
         $queryRawUnsafe: () =>
-          rawRead(prisma).$queryRawUnsafe("SELECT pg_sleep(1)"),
+          rawRead(prisma, { pg_sleep: "text" }).$queryRawUnsafe(
+            "SELECT pg_sleep(1)::text AS pg_sleep",
+          ),
         $executeRawUnsafe: (sql: string, ...args: unknown[]) =>
           prisma.$executeRawUnsafe(sql, ...args),
-        $transaction: (fn) =>
-          prisma.$transaction((tx: ConsolePrismaClient) =>
-            fn({
-              $queryRawUnsafe: () =>
-                rawRead(tx).$queryRawUnsafe("SELECT pg_sleep(1)"),
-              $executeRawUnsafe: (sql: string, ...args: unknown[]) =>
-                tx.$executeRawUnsafe?.(sql, ...args) ?? Promise.resolve(0),
-            }),
+        $transaction: (fn, options) =>
+          prisma.$transaction(
+            (tx: ConsolePrismaClient) =>
+              fn({
+                // The reader's own settings statements run as they are.
+                $queryRawUnsafe: (sql: string, ...args: unknown[]) =>
+                  /^SHOW |set_config/.test(sql)
+                    ? rawRead(
+                        tx,
+                        sql.startsWith("SHOW ")
+                          ? { statement_timeout: "text" }
+                          : { set_config: "text" },
+                      ).$queryRawUnsafe(sql, ...args)
+                    : // Prisma 8 reads only the columns it is told of.
+                      rawRead(tx, { pg_sleep: "text" }).$queryRawUnsafe(
+                        "SELECT pg_sleep(1)::text AS pg_sleep",
+                      ),
+                $executeRawUnsafe: (sql: string, ...args: unknown[]) =>
+                  tx.$executeRawUnsafe?.(sql, ...args) ?? Promise.resolve(0),
+              }),
+            options,
           ),
+        // Prisma 8's shim says so, and takes no `maxWait`.
+        ...(prisma.$databaseType
+          ? { $databaseType: prisma.$databaseType }
+          : {}),
       };
+      // The transaction may take 20 times this: the server's cancel comes first.
       const impatient = createPrismaConsoleReadPort(sleepy, {
-        statementTimeoutMs: 1,
+        statementTimeoutMs: 200,
       });
-      await expect(impatient.listRuns({})).rejects.toBeInstanceOf(
-        ConsoleQueryTimeoutError,
-      );
+      const error = await impatient.listRuns({}).catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(ConsoleQueryTimeoutError);
+      // The server cancelled the statement (57014), before the client's
+      // transaction limit.
+      expect(isStatementTimeout((error as Error).cause)).toBe(true);
     });
 
     it("runs inside a transaction the caller opened, and leaves its settings alone", async () => {

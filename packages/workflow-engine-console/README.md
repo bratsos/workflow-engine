@@ -182,7 +182,7 @@ export const POST = GET;
 
 On Prisma 8 the same shape is `db.transaction(async (tx) => { const reader = createPrismaConsoleReadPort(fromPrisma8(tx, { contract: db.contract })); ... })`.
 
-When `createPrismaConsoleReadPort` is passed a transaction client (a client instance where `$transaction` is absent), it deliberately does not issue `SET LOCAL statement_timeout`. The reader must not reconfigure the timeout budget of a transaction it did not open. In that scenario, timeout enforcement belongs to the caller who opened the transaction. When handed a root Prisma client, the reader manages its own bounded transaction per request.
+A read inside your transaction leaves it with the settings it had. Prisma 6's transaction client and `fromPrisma8(tx)` have no `$transaction`: the reader sends no `SET LOCAL statement_timeout` and no isolation level, and timeout enforcement belongs to the caller who opened the transaction. Prisma 7's transaction client has a `$transaction` that opens a savepoint: the reader runs in it, sends no `SET TRANSACTION` (Prisma ignores the isolation level there, so the server raises no error per read), and with `statementTimeoutMs` above 0 sets `statement_timeout` for its own statements and restores your previous value after them. When handed a root Prisma client, the reader manages its own bounded transaction per request.
 
 ## Authorisation
 
@@ -395,6 +395,8 @@ On PostgreSQL, the read port enforces a database query timeout via `statementTim
 
 The frontend catches this error and renders an inline warning banner while maintaining filter bar interactivity, allowing operators to narrow search parameters rather than experiencing an unresponsive interface.
 
+The read's transaction has limits of its own, which follow `statementTimeoutMs`: Prisma's interactive-transaction `timeout` is twenty times it (a read runs at most seventeen statements) and its `maxWait` is it; with `statementTimeoutMs: 0` neither has a limit, so Prisma's defaults (5 s, and 2 s to start) never end a read. A transaction the client gave up on (Prisma's `P2028`) answers the same 504 `query_timeout`.
+
 SQLite has no `statement_timeout` support. On SQLite, `statementTimeoutMs` does not cancel a running query, so the timeout response described above applies to PostgreSQL only.
 
 ## The UI
@@ -421,7 +423,7 @@ The operational console separates storage queries, API serialization, and UI pre
 - `GET /api/meta`: System capabilities and runtime configuration
 - `GET /api/runs`: Keyset-paginated workflow runs
 - `GET /api/runs/:id`: Complete run detail graph
-- `GET /api/runs/:id/events`: Incremental outbox event stream
+- `GET /api/runs/:id/events?afterSequence=N&limit=L`: Incremental outbox event stream: the run's rows with a sequence above `N`, in order, at most `L` (`ConsoleReadPort.listRunEvents`). An answer may hold fewer than `L` rows while more remain (the Prisma reader reads at most `L` sequences past the first row it finds, so removed rows or a gap shorten it); only an empty answer means no row remains past `N`. Read again from the last sequence returned until the answer is empty.
 - `GET /api/queue`: Queue metrics and lease telemetry
 - `GET /api/suspended`: Stages waiting on external triggers
 - `GET /api/dead-letters`: Dead-letter queue messages

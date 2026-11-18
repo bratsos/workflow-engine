@@ -163,7 +163,11 @@ The attempt boundaries are:
   event: that attempt shows *Cancelled* from the stage's record and says no
   event records when it ended.
 - `workflow:started` is written by the first claim and by every redrive
-  (`run.redrive`, `run.rerunFrom`). A redrive takes only a completed, failed or
+  (`run.redrive`, `run.rerunFrom`). A run's first start can be two of them:
+  `run.transition` dispatched for a pending run before `run.claimPending`
+  writes one, starts the first group's jobs and leaves the run `PENDING`, and
+  the claim writes the second. The page reads that pair as the run's one first
+  start, wherever a job of the first group ran between them. A redrive takes only a completed, failed or
   cancelled run, each of which ended its attempts with an event, so no attempt
   is open there; if one is, the history contradicts itself and the stage falls
   back. The next `stage:started` is a rerun after a redrive, also for a stage
@@ -215,7 +219,9 @@ The checks against the records, none of which rests on the numbering:
 
 - **The run's events follow the engine's order and agree with the run's
   record.** `workflow:created` comes first; the claim writes one
-  `workflow:started`; every later `workflow:started` is a redrive and follows
+  `workflow:started` (two, a transition's and the claim's, with no run end
+  between, when `run.transition` came first; the run is `PENDING` after the
+  first alone); every later `workflow:started` is a redrive and follows
   a `workflow:completed`, `workflow:failed` or `workflow:cancelled`, because a
   redrive takes only an ended run; `workflow:completed` comes only while the
   run is running. The redrives found that way must be exactly the run's
@@ -322,9 +328,28 @@ measure each statement with no statistics, with statistics of the empty
 table, with current ones, and with stale ones (taken while one run held a
 few rows, then grown), on Postgres by pages read and on SQLite by plan.
 
+The run's other rows are read with plans that hold in the same four states.
+The stages are read by an index on the run. The annotations page is read
+in the order of the run's `("workflowRunId", "createdAt")` index alone, on
+Postgres as a cursor (planned for its first rows), then, when the page ends
+inside a group of annotations that share a time, that group again with the
+newer ones, ties ordered by id: a few index pages whatever the run's size,
+where a single `ORDER BY "createdAt" DESC, id DESC LIMIT n` is planned as a
+read and sort of every annotation of the run when the statistics expect few
+of them. No index serves the order of the steps and logs pages without a
+schema change, so each sorts every step or log of the run: measured on
+Postgres with 30,000 rows of the run in a table of 91,000, the logs page reads
+about 335 pages (11 per 1,000 logs of the run) and the steps page between
+1,450 pages with current statistics and 9,300 with none (a 1,000-step run:
+360 to 1,450, the whole table when the planner prefers it); on SQLite, with
+statistics taken while the tables held a few rows, the logs page scans the
+whole logs table and the steps page the whole stages table.
+
 The run's rows and its events are read at one moment, so a stage that ends
 between two of the read's statements is never shown as a contradiction: the
-Prisma reader reads in one `REPEATABLE READ` transaction on Postgres and one
+Prisma reader reads in one `REPEATABLE READ` transaction on Postgres (it asks
+the client for the level, as `$transaction`'s `isolationLevel` option, and
+sends no statement of its own that the server could refuse) and one
 transaction on SQLite. Inside a transaction you hand it (the row-level
 security setup) that transaction's isolation decides; at `READ COMMITTED` a
 stage that changes during the read can show as unavailable, naming the
@@ -438,8 +463,9 @@ because a contract cannot express a sort direction.
 
 There is deliberately no total count and no page numbers: counting a large
 run table is the expensive query the console exists to avoid issuing. On
-PostgreSQL, a query cancelled by `statement_timeout` comes back as HTTP 504
-with a `query_timeout` code, which the UI shows as an inline banner while
+PostgreSQL, a query cancelled by `statement_timeout`, or a read whose
+transaction the client gave up on (Prisma's `P2028`, at twenty times
+`statementTimeoutMs`), comes back as HTTP 504 with a `query_timeout` code, which the UI shows as an inline banner while
 leaving the filter bar interactive. SQLite has no `statement_timeout`, so the
 console cannot cancel a running SQLite query this way.
 

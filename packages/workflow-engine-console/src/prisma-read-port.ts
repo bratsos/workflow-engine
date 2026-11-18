@@ -49,7 +49,14 @@ import {
 export interface ConsolePrismaClient {
   $queryRawUnsafe<T = unknown>(query: string, ...values: unknown[]): Promise<T>;
   $executeRawUnsafe?(query: string, ...values: unknown[]): Promise<number>;
-  $transaction?<T>(fn: (tx: ConsolePrismaClient) => Promise<T>): Promise<T>;
+  $transaction?<T>(
+    fn: (tx: ConsolePrismaClient) => Promise<T>,
+    options?: {
+      isolationLevel?: "RepeatableRead";
+      timeout?: number;
+      maxWait?: number;
+    },
+  ): Promise<T>;
   /** Set by `fromPrisma8` from the wrapped client's contract target. */
   readonly $databaseType?: "postgresql" | "sqlite";
   /**
@@ -612,31 +619,30 @@ function mapCostBucket(row: RawCostRow): CostBucket {
   };
 }
 
-/** Thrown inside `read` when Postgres refuses to set the isolation level. */
-const CALLERS_TRANSACTION = Symbol("inside the caller's transaction");
+/**
+ * The longest a client timer can wait: Node fires a longer `setTimeout`
+ * at once. A transaction limit of "none" is this.
+ */
+const NO_LIMIT_MS = 2_147_483_647;
+let cursorCount = 0;
+/** The largest value of `outbox_events.sequence` (an `Int`). */
+const SEQUENCE_MAX = 2_147_483_647;
 
 /**
- * SQLSTATE 25001 (active SQL transaction): `SET TRANSACTION ISOLATION LEVEL`
- * in a savepoint, or after the transaction's first query.
+ * More than the statements one read issues: the run detail's on Postgres
+ * are at most 17 (the run, stages, steps, two annotation cursors of three
+ * statements each, logs, events, three of the stage events, and the
+ * timeout's `SHOW`, `SET LOCAL` and restore). A read's transaction may last
+ * as long as its statements may run.
  */
-function isLevelRefused(error: unknown): boolean {
-  if (typeof error !== "object" || error === null) return false;
-  const e = error as {
-    code?: unknown;
-    meta?: {
-      code?: unknown;
-      driverAdapterError?: { cause?: { originalCode?: unknown } };
-    };
-    message?: unknown;
-  };
+const MAX_STATEMENTS_PER_READ = 20;
+
+/** Prisma's P2028: a transaction past its `timeout`, or not started within `maxWait`. */
+function isTransactionTimeout(error: unknown): boolean {
   return (
-    [
-      e.code,
-      e.meta?.code,
-      e.meta?.driverAdapterError?.cause?.originalCode,
-    ].includes("25001") ||
-    (typeof e.message === "string" &&
-      e.message.includes("SET TRANSACTION ISOLATION LEVEL must"))
+    typeof error === "object" &&
+    error !== null &&
+    (error as { code?: unknown }).code === "P2028"
   );
 }
 
@@ -700,6 +706,38 @@ export class PrismaConsoleReadPort implements ConsoleReadPort {
     return rawFor(client, columns).$queryRawUnsafe<T[]>(sql, ...params);
   }
 
+  /**
+   * A statement that reads the first rows of an index order, planned for
+   * them alone. On Postgres it runs as a cursor: a cursor is planned for
+   * its first rows (`cursor_tuple_fraction`), so an index in the
+   * statement's order is walked and the walk stops at the limit, in every
+   * state of the table's statistics. A cursor needs a transaction; a run
+   * detail is always read in one (its own, or the caller's).
+   */
+  private async firstRows<T>(
+    client: ConsolePrismaClient,
+    columns: RawColumns,
+    sql: string,
+    params: unknown[],
+  ): Promise<T[]> {
+    if (this.databaseType !== "postgresql" || !client.$executeRawUnsafe)
+      return this.select<T>(client, columns, sql, params);
+    // Unique per statement: two reads may share a caller's transaction.
+    const cursor = `workflow_console_first_rows_${++cursorCount}`;
+    await client.$executeRawUnsafe(
+      `DECLARE ${cursor} NO SCROLL CURSOR FOR ${sql}`,
+      ...params,
+    );
+    const rows = await this.select<T>(
+      client,
+      columns,
+      `FETCH ALL FROM ${cursor}`,
+      [],
+    );
+    await client.$executeRawUnsafe(`CLOSE ${cursor}`);
+    return rows;
+  }
+
   /** SQLite 6/7 adapters use `?`; the Prisma 8 shim expands `$n` itself. */
   private param(position: number): string {
     if (
@@ -734,9 +772,9 @@ export class PrismaConsoleReadPort implements ConsoleReadPort {
    *
    * The callback receives the client to issue statements on, and every read
    * that needs more than one statement issues all of them here, inside a
-   * single transaction — a run-detail page is up to nine queries, and giving
-   * each its own interactive transaction would take that many connections out
-   * of the consumer's pool to render one page.
+   * single transaction — a run-detail page is up to seventeen statements,
+   * and giving each its own interactive transaction would take that many
+   * connections out of the consumer's pool to render one page.
    *
    * One transaction is not by itself one moment: at Postgres's default READ
    * COMMITTED each statement sees what was committed when it began. A read
@@ -747,62 +785,82 @@ export class PrismaConsoleReadPort implements ConsoleReadPort {
    * writer cannot commit while it reads, or (in WAL mode) commits a version
    * it does not see.
    *
-   * The transaction is opened only when we were handed a root client. When
-   * `$transaction` is absent we are already inside the caller's transaction
-   * — the row-level-security case this package exists for — and we neither
-   * open another nor touch `statement_timeout`: `SET LOCAL` there would
-   * silently re-time the remainder of a transaction the console did not
-   * open and does not get to reconfigure. Timeouts in that case are the
-   * caller's to set, and a cancellation is still reported honestly because
-   * the catch below does not care who set the limit. So is the isolation
-   * level: inside the caller's transaction the statements see what its level
-   * gives them, and one moment needs that transaction to be REPEATABLE READ.
-   * A transaction client that has `$transaction` of its own (Prisma 7 nests
-   * one as a savepoint) is told apart by Postgres itself: it refuses to set
-   * the level of a transaction that is a savepoint or has already read, the
-   * savepoint is rolled back, and the read runs again at the caller's level.
+   * The transaction is opened only when the client has `$transaction`, and
+   * the level is asked of the client (`isolationLevel`), never sent as a
+   * statement: whether the client is already inside a transaction is the
+   * client's to know. A Prisma 6 or Prisma 8 (`fromPrisma8`) transaction
+   * client has no `$transaction`, so the read runs on it as it is. A Prisma
+   * 7 transaction client has one, which opens a savepoint and does not apply
+   * `isolationLevel`. A root client of any major begins its transaction at
+   * that level. No statement the server refuses is sent either way.
+   *
+   * Inside the caller's transaction — the row-level-security case this
+   * package exists for — its isolation level decides what the statements
+   * see, and one moment needs it to be REPEATABLE READ. The caller's
+   * `statement_timeout` is left as it was: with no `$transaction` the read
+   * does not set it; in a Prisma 7 savepoint it sets it for its own
+   * statements and restores the previous value before the savepoint is
+   * released (a savepoint rolled back on an error restores it by itself).
+   * A cancellation is reported honestly whoever set the limit.
+   *
+   * The client's own transaction limits (`timeout`, `maxWait`; Prisma's
+   * defaults are 5 s and 2 s) are derived from `statementTimeoutMs`: the
+   * transaction may last as long as its statements may run, and wait for a
+   * connection as long as one statement may; with 0, neither is limited.
+   * A client that gives up on the transaction (P2028) is reported as
+   * `ConsoleQueryTimeoutError` too.
    */
   private async read<T>(
     label: string,
     fn: (client: ConsolePrismaClient) => Promise<T>,
     snapshot = false,
   ): Promise<T> {
+    const ms = this.statementTimeoutMs;
+    const postgres = this.databaseType === "postgresql";
     try {
       if (
-        (this.statementTimeoutMs > 0 || snapshot) &&
+        (ms > 0 || snapshot) &&
         typeof this.prisma.$transaction === "function"
       ) {
-        const ms = this.statementTimeoutMs;
+        const options = {
+          ...(snapshot && postgres
+            ? { isolationLevel: "RepeatableRead" as const }
+            : {}),
+          timeout: ms > 0 ? ms * MAX_STATEMENTS_PER_READ : NO_LIMIT_MS,
+          // `fromPrisma8` takes no `maxWait`; its pool's wait is its own.
+          ...(this.prisma.$databaseType === undefined
+            ? { maxWait: ms > 0 ? ms : NO_LIMIT_MS }
+            : {}),
+        };
         return await this.prisma.$transaction(async (tx) => {
-          if (
-            this.databaseType === "postgresql" &&
-            typeof tx.$executeRawUnsafe === "function"
-          ) {
-            // Before any query of the transaction, as Postgres requires.
-            if (snapshot)
-              await tx
-                .$executeRawUnsafe(
-                  "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
-                )
-                .catch((error: unknown) => {
-                  throw isLevelRefused(error) ? CALLERS_TRANSACTION : error;
-                });
-            // `ms` is a validated integer, and a bare number here is
-            // milliseconds. It is the one interpolated value in this file
-            // besides the enum name.
-            if (ms > 0)
-              await tx.$executeRawUnsafe(`SET LOCAL statement_timeout = ${ms}`);
-          }
-          return await fn(tx);
-        });
+          if (!postgres || ms === 0 || !tx.$executeRawUnsafe) return fn(tx);
+          const [previous] = await this.select<{ statement_timeout: string }>(
+            tx,
+            { statement_timeout: "text" },
+            "SHOW statement_timeout",
+            [],
+          );
+          // `ms` is a validated integer, and a bare number here is
+          // milliseconds. It is the one interpolated value in this file
+          // besides the enum name.
+          await tx.$executeRawUnsafe(`SET LOCAL statement_timeout = ${ms}`);
+          const result = await fn(tx);
+          // Inside a caller's transaction (a Prisma 7 savepoint) the setting
+          // would outlive the read; in the read's own transaction this is a
+          // no-op before the commit.
+          await this.select(
+            tx,
+            { set_config: "text" },
+            "SELECT set_config('statement_timeout', $1, true)",
+            [previous!.statement_timeout],
+          );
+          return result;
+        }, options);
       }
       return await fn(this.prisma);
     } catch (error) {
-      if (error === CALLERS_TRANSACTION) return this.read(label, fn);
-      if (isStatementTimeout(error)) {
-        throw new ConsoleQueryTimeoutError(label, this.statementTimeoutMs, {
-          cause: error,
-        });
+      if (isStatementTimeout(error) || isTransactionTimeout(error)) {
+        throw new ConsoleQueryTimeoutError(label, ms, { cause: error });
       }
       throw error;
     }
@@ -946,7 +1004,7 @@ LIMIT ${limit + 1}`;
     afterRaw: number,
   ): Promise<StageEventLog> {
     const after = Number.isFinite(afterRaw)
-      ? Math.min(Math.max(0, Math.floor(afterRaw)), 2_147_483_647)
+      ? Math.min(Math.max(0, Math.floor(afterRaw)), SEQUENCE_MAX)
       : 0;
     // Not `max(sequence)`: Postgres plans that aggregate as a backward probe
     // of the index only when its statistics show the run as more than one
@@ -1110,16 +1168,49 @@ LIMIT ${stepLimit + 1}`,
           [runId],
         );
 
-        const annotationRows = await this.select<RawAnnotationRow>(
+        // The newest annotations in the order of the run's ("workflowRunId",
+        // "createdAt") index alone, then, when the page ends inside a group
+        // of annotations that share a time, that group and the newer ones;
+        // ties are ordered by id here. `ORDER BY "createdAt" DESC, id DESC`
+        // in one statement is planned, when the statistics expect few rows
+        // for the run (never analysed, analysed empty, or stale), as a read
+        // of every annotation of the run and a sort. Each statement here
+        // runs, on Postgres, as a cursor (see `firstRows`): a backward walk
+        // of the index that stops at the page.
+        const annotationSelect = `SELECT id, "createdAt", "workflowRunId", "workflowStageRecordId", attempt, scope,
+       "scopeId", "actorKind", "actorId", key, value
+FROM "workflow_annotations" WHERE "workflowRunId" = ${this.param(1)}`;
+        let annotationRows = await this.firstRows<RawAnnotationRow>(
           client,
           ANNOTATION_COLUMNS,
-          `SELECT id, "createdAt", "workflowRunId", "workflowStageRecordId", attempt, scope,
-       "scopeId", "actorKind", "actorId", key, value
-FROM "workflow_annotations" WHERE "workflowRunId" = ${this.param(1)}
-ORDER BY "createdAt" DESC, id DESC
-LIMIT ${annotationLimit + 1}`,
+          `${annotationSelect}\nORDER BY "createdAt" DESC\nLIMIT ${annotationLimit + 1}`,
           [runId],
         );
+        const time = (row: RawAnnotationRow | undefined) =>
+          toDate(row?.createdAt)?.getTime();
+        if (
+          annotationRows.length > annotationLimit &&
+          time(annotationRows[annotationLimit - 1]) ===
+            time(annotationRows[annotationLimit])
+        ) {
+          annotationRows = await this.firstRows<RawAnnotationRow>(
+            client,
+            ANNOTATION_COLUMNS,
+            `${annotationSelect} AND "createdAt" >= ${this.timestampParam(2)}\nORDER BY "createdAt" DESC`,
+            [
+              runId,
+              this.timestampValue(
+                toDate(annotationRows[annotationLimit]!.createdAt)!,
+              ),
+            ],
+          );
+        }
+        annotationRows = annotationRows
+          .sort(
+            (a, b) =>
+              time(b)! - time(a)! || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0),
+          )
+          .slice(0, annotationLimit + 1);
 
         const logRows = await this.select<RawLogRow>(
           client,
@@ -1176,6 +1267,10 @@ LIMIT ${eventLimit + 1}`,
     limit?: number,
   ): Promise<RunEvent[]> {
     const clampedLimit = clampLimit(limit, 200);
+    // A sequence is a 32-bit integer column: no row lies past its largest
+    // value, and a bound past it would be refused by Postgres.
+    const after = Math.max(-1, Math.floor(afterSequence));
+    if (after >= SEQUENCE_MAX) return [];
     // Two statements, so that neither plan depends on the table's
     // statistics: the first row after the cursor is a forward probe of the
     // run's index, and the page is read within the next `limit` sequences
@@ -1188,7 +1283,7 @@ LIMIT ${eventLimit + 1}`,
         EVENT_TOP_COLUMNS,
         `SELECT sequence FROM "outbox_events" WHERE "workflowRunId" = ${this.param(1)} AND sequence > ${this.param(2)}
 ORDER BY sequence ASC LIMIT 1`,
-        [runId, Math.floor(afterSequence)],
+        [runId, after],
       );
       if (!start[0]) return [];
       const first = toNumber(start[0].sequence);
@@ -1197,9 +1292,9 @@ ORDER BY sequence ASC LIMIT 1`,
         EVENT_COLUMNS,
         `SELECT id, "workflowRunId", sequence, "eventType", "occurredAt", "publishedAt",
        "retryCount", "dlqAt"
-FROM "outbox_events" WHERE "workflowRunId" = ${this.param(1)} AND sequence >= ${this.param(2)} AND sequence < ${this.param(3)}
+FROM "outbox_events" WHERE "workflowRunId" = ${this.param(1)} AND sequence >= ${this.param(2)} AND sequence <= ${this.param(3)}
 ORDER BY sequence ASC LIMIT ${clampedLimit}`,
-        [runId, first, first + clampedLimit],
+        [runId, first, Math.min(first + clampedLimit - 1, SEQUENCE_MAX)],
       );
     });
     return rows.map(mapRunEvent);

@@ -1,8 +1,8 @@
+import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Worker } from "node:worker_threads";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createWorkflowConsole } from "../handler";
 import {
@@ -30,6 +30,16 @@ const fromPrisma8 = isPrisma8
 const fixture = createRequire(import.meta.url)(
   "../../../prisma-fixtures/index.cjs",
 );
+
+// The tests that write or read the file beside Prisma use `node:sqlite`,
+// which Node has from 22.13; the package supports Node 22.11 and later, and
+// its code does not use it. Below 22.13 those tests are skipped.
+const [nodeMajor, nodeMinor] = process.versions.node.split(".").map(Number);
+const hasNodeSqlite = nodeMajor! > 22 || (nodeMajor === 22 && nodeMinor! >= 13);
+if (!hasNodeSqlite)
+  console.warn(
+    `Node ${process.versions.node} has no node:sqlite (22.13+): the SQLite plan and one-moment tests are skipped`,
+  );
 
 const T0 = new Date("2026-03-01T23:30:00.000Z");
 const at = (minutes: number) => new Date(T0.getTime() + minutes * 60_000);
@@ -1019,11 +1029,12 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
     expect(b.run).toMatchObject({ status: "COMPLETED", redriveCount: 1 });
     expect(b.held.coverage).toBe("from-start");
     // Before: "initial -> retrying, rerun -> completed". The redrive's start
-    // follows no end of the run, which a redrive needs.
+    // follows no end of the run, which a redrive needs, so it is not counted
+    // as one (it reads as the claim after a transition), and the run's row
+    // counts a redrive its retained events do not record.
     expect(b.history).toMatchObject({
       available: false,
-      reason: "run-inconsistent",
-      runMismatch: "order",
+      reason: "fewer-redrives",
     });
     await tail.db.$disconnect?.();
   });
@@ -1070,8 +1081,11 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
       const { files, lines } = await readStoredRows(world);
       expect(files).toBeGreaterThanOrEqual(110);
       const wrong = lines.filter((line) =>
-        // Its capture appends two `workflow:started` probes to a completed
-        // run, which the engine never writes: the order check finds them.
+        // Its capture harness appends two `workflow:started` rows of its own
+        // to the completed run, and the run row counts no redrive. The first
+        // reads as a redrive; the second, with no end between, is neither a
+        // redrive nor the claim after a transition (that pair is a run's first
+        // start only), so the order check finds it.
         line.scenario === "unpublished-outbox"
           ? line.read !== "unavailable run-inconsistent/order"
           : !line.read.startsWith("available"),
@@ -1086,311 +1100,624 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
     });
   });
 
-  it("reads a run's rows and events at one moment, whatever another connection commits between its statements", {
-    timeout: 60_000,
-  }, async () => {
-    // With a statement timeout and without one (no `SET LOCAL` to scope).
-    for (const statementTimeoutMs of [15_000, 0]) {
-      const k = statementTimeoutMs;
-      const runId = `run-moment-${k}`;
-      const stageRecord = `stage-moment-${k}`;
-      await prisma.workflowRun.createMany({
-        data: [mkRun(runId, at(-9_010), "RUNNING", "wf-d", 0, 0)],
-      });
-      await prisma.workflowStage.createMany({
-        data: [
-          {
-            id: stageRecord,
-            workflowRunId: runId,
-            stageId: "only",
-            stageName: "Only",
-            stageNumber: 1,
-            executionGroup: 0,
-            status: "RUNNING",
-            createdAt: at(10),
-            updatedAt: at(12),
-            startedAt: at(12),
-          },
-        ],
-      });
-      const row = (sequence: number, eventType: string) =>
-        mkEvent(
-          `moment-${k}-${sequence}`,
-          runId,
-          sequence,
-          eventType,
-          at(10 + sequence),
-          null,
-          null,
-          { stageId: eventType.startsWith("stage:") ? "only" : undefined },
-        );
-      await prisma.outboxEvent.createMany({
-        data: [
-          row(1, "workflow:created"),
-          row(2, "workflow:started"),
-          row(3, "stage:started"),
-        ],
-      });
-      // Another process: its own connection to the same file, on a thread of
-      // its own, so that waiting for the file does not stop this one. The
-      // stage completes, and the run with it; the new rows copy the stored
-      // form of the existing ones.
-      const copy = (sequence: number, type: string, payload: string) =>
-        `INSERT INTO outbox_events (id, workflowRunId, sequence, eventType, payload, causationId, occurredAt, createdAt, retryCount)
+  it.skipIf(!hasNodeSqlite)(
+    "reads a run's rows and events at one moment, whatever another process commits between its statements",
+    {
+      timeout: 60_000,
+    },
+    async () => {
+      // With a statement timeout and without one (no `SET LOCAL` to scope).
+      for (const statementTimeoutMs of [15_000, 0]) {
+        const k = statementTimeoutMs;
+        const runId = `run-moment-${k}`;
+        const stageRecord = `stage-moment-${k}`;
+        await prisma.workflowRun.createMany({
+          data: [mkRun(runId, at(-9_010), "RUNNING", "wf-d", 0, 0)],
+        });
+        await prisma.workflowStage.createMany({
+          data: [
+            {
+              id: stageRecord,
+              workflowRunId: runId,
+              stageId: "only",
+              stageName: "Only",
+              stageNumber: 1,
+              executionGroup: 0,
+              status: "RUNNING",
+              createdAt: at(10),
+              updatedAt: at(12),
+              startedAt: at(12),
+            },
+          ],
+        });
+        const row = (sequence: number, eventType: string) =>
+          mkEvent(
+            `moment-${k}-${sequence}`,
+            runId,
+            sequence,
+            eventType,
+            at(10 + sequence),
+            null,
+            null,
+            { stageId: eventType.startsWith("stage:") ? "only" : undefined },
+          );
+        await prisma.outboxEvent.createMany({
+          data: [
+            row(1, "workflow:created"),
+            row(2, "workflow:started"),
+            row(3, "stage:started"),
+          ],
+        });
+        // Another process, with its own connection to the same file and its
+        // own file locks (a thread of this process shares them). The stage
+        // completes, and the run with it; the new rows copy the stored form of
+        // the existing ones.
+        const copy = (sequence: number, type: string, payload: string) =>
+          `INSERT INTO outbox_events (id, workflowRunId, sequence, eventType, payload, causationId, occurredAt, createdAt, retryCount)
 SELECT 'moment-${k}-${sequence}', workflowRunId, ${sequence}, '${type}', ${payload}, 'cause-moment-${k}-${sequence}', occurredAt, createdAt, 0
 FROM outbox_events WHERE id = 'moment-${k}-3'`;
-      const statements = [
-        "BEGIN IMMEDIATE",
-        `UPDATE workflow_stages SET status = 'COMPLETED', completedAt = startedAt WHERE id = '${stageRecord}'`,
-        copy(4, "stage:completed", "payload"),
-        copy(5, "workflow:completed", "'{}'"),
-        `UPDATE workflow_runs SET status = 'COMPLETED' WHERE id = '${runId}'`,
-        "COMMIT",
-      ];
-      const complete = () =>
-        new Promise<void>((resolve, reject) => {
-          const worker = new Worker(
-            `const { DatabaseSync } = require("node:sqlite");
-const { file, statements } = require("node:worker_threads").workerData;
+        const statements = [
+          "BEGIN IMMEDIATE",
+          `UPDATE workflow_stages SET status = 'COMPLETED', completedAt = startedAt WHERE id = '${stageRecord}'`,
+          copy(4, "stage:completed", "payload"),
+          copy(5, "workflow:completed", "'{}'"),
+          `UPDATE workflow_runs SET status = 'COMPLETED' WHERE id = '${runId}'`,
+          "COMMIT",
+        ];
+        const complete = () =>
+          new Promise<void>((resolve, reject) => {
+            const writer = spawn(
+              process.execPath,
+              [
+                "-e",
+                `const { DatabaseSync } = require("node:sqlite");
+const { file, statements } = JSON.parse(process.env.CONSOLE_TEST_WRITE);
 const db = new DatabaseSync(file);
 db.exec("PRAGMA busy_timeout = 20000");
 for (const statement of statements) db.exec(statement);
 db.close();`,
-            {
-              eval: true,
-              workerData: { file: join(directory, "console.db"), statements },
-            },
-          );
-          worker.once("error", reject);
-          worker.once("exit", (code) =>
-            code === 0 ? resolve() : reject(new Error(`writer exited ${code}`)),
-          );
-        });
-      let write: Promise<void> | undefined;
-      let readDone = false;
-      let committedDuringRead = false;
-      const port = createPrismaConsoleReadPort(
-        recordingClient(prisma, [], async (call) => {
-          if (write || !call.sql.includes('FROM "workflow_stages"')) return;
-          // Right after the stage rows are read. A writer cannot commit while
-          // a read holds a rollback-journal file; give it the time to.
-          write = complete().then(() => {
-            committedDuringRead = !readDone;
+              ],
+              {
+                env: {
+                  ...process.env,
+                  CONSOLE_TEST_WRITE: JSON.stringify({
+                    file: join(directory, "console.db"),
+                    statements,
+                  }),
+                },
+                stdio: ["ignore", "ignore", "pipe"],
+              },
+            );
+            let stderr = "";
+            writer.stderr!.on("data", (chunk) => {
+              stderr += chunk;
+            });
+            writer.once("error", reject);
+            writer.once("exit", (code) =>
+              code === 0
+                ? resolve()
+                : reject(new Error(`writer exited ${code}: ${stderr}`)),
+            );
           });
-          await Promise.race([
-            write.catch(() => {}),
-            new Promise((r) => setTimeout(r, 300)),
-          ]);
-        }),
-        { databaseType: "sqlite", statementTimeoutMs },
-      );
-      const page = (detail: any) => {
-        const json = JSON.parse(JSON.stringify(detail));
-        const held = mergeStageEvents(null, json.stageEvents)!;
-        const history = buildStageAttemptHistory({
-          redriveCount: json.run.redriveCount,
-          runStatus: json.run.status,
-          stages: json.stages,
-          steps: json.steps,
-          stageEvents: {
-            events: held.events,
-            coverage: held.coverage,
-            caughtUp: !held.more,
-          },
-        }).get(stageRecord)!;
-        return history.available
-          ? history.attempts.map((a) => `${a.trigger}:${a.outcome}`)
-          : `unavailable ${history.reason}`;
-      };
-      try {
-        const during = await port.getRunDetail(runId);
-        readDone = true;
-        expect(write).toBeDefined();
-        await write;
-        // The write either waited for the read, or committed during it unseen.
-        console.log(
-          `SQLite, Prisma ${major}, statement timeout ${k}: the write ${committedDuringRead ? "committed during the read" : "waited for the read to end"}`,
+        let write: Promise<void> | undefined;
+        let readDone = false;
+        let committedDuringRead = false;
+        const port = createPrismaConsoleReadPort(
+          recordingClient(prisma, [], async (call) => {
+            if (write || !call.sql.includes('FROM "workflow_stages"')) return;
+            // Right after the stage rows are read. A writer cannot commit while
+            // a read holds a rollback-journal file; give it the time to (a
+            // process takes longer to start than a thread).
+            write = complete().then(() => {
+              committedDuringRead = !readDone;
+            });
+            await Promise.race([
+              write.catch(() => {}),
+              new Promise((r) => setTimeout(r, 1_500)),
+            ]);
+          }),
+          { databaseType: "sqlite", statementTimeoutMs },
         );
-        expect(during?.run.status).toBe("RUNNING");
-        expect(during?.stages[0]?.status).toBe("RUNNING");
-        expect(during?.stageEvents?.lastSequence).toBe(3);
-        expect(page(during)).toEqual(["initial:running"]);
-        // The next read sees all of the write.
-        expect(page(await reader().getRunDetail(runId))).toEqual([
-          "initial:completed",
-        ]);
-      } finally {
-        await write?.catch(() => {});
-      }
-    }
-  });
-
-  it("plans every statement on a run's outbox rows by the run's index, in each state of the table's statistics", {
-    timeout: 120_000,
-  }, async () => {
-    // Its own file: ANALYZE here must not change the plans of the others.
-    const file = join(directory, "plan.db");
-    const db: ConsolePrismaClient & Record<string, any> = isPrisma8
-      ? (() => {
-          const raw = fixture.createSqliteDb(file);
-          return Object.assign(fromPrisma8!(raw), {
-            $disconnect: () => raw.close(),
-          });
-        })()
-      : fixture.createSqliteClient(file);
-    const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite");
-    try {
-      const runs = [
-        "run-plan-0",
-        "run-plan-1000",
-        "run-plan-30000",
-        "run-plan-few",
-        "run-plan-others",
-      ];
-      await db.workflowRun.createMany({
-        data: runs.map((id, i) =>
-          mkRun(id, at(-9_100 - i), "RUNNING", "wf-d", 0, 0),
-        ),
-      });
-      // One row in the stored form of this Prisma major, then copies of it.
-      await db.outboxEvent.createMany({
-        data: [
-          mkEvent(
-            "plan-model",
-            "run-plan-model",
-            1,
-            "stage:started",
-            at(10),
-            null,
-            null,
-            { stageId: "fetch" },
-          ),
-        ],
-      });
-      const fill = (sql: string) => {
-        const raw = new DatabaseSync(file);
+        const page = (detail: any) => {
+          const json = JSON.parse(JSON.stringify(detail));
+          const held = mergeStageEvents(null, json.stageEvents)!;
+          const history = buildStageAttemptHistory({
+            redriveCount: json.run.redriveCount,
+            runStatus: json.run.status,
+            stages: json.stages,
+            steps: json.steps,
+            stageEvents: {
+              events: held.events,
+              coverage: held.coverage,
+              caughtUp: !held.more,
+            },
+          }).get(stageRecord)!;
+          return history.available
+            ? history.attempts.map((a) => `${a.trigger}:${a.outcome}`)
+            : `unavailable ${history.reason}`;
+        };
         try {
-          raw.exec(sql);
+          const during = await port.getRunDetail(runId);
+          readDone = true;
+          expect(write).toBeDefined();
+          await write;
+          // The write either waited for the read, or committed during it unseen.
+          console.log(
+            `SQLite, Prisma ${major}, statement timeout ${k}: the write ${committedDuringRead ? "committed during the read" : "waited for the read to end"}`,
+          );
+          expect(during?.run.status).toBe("RUNNING");
+          expect(during?.stages[0]?.status).toBe("RUNNING");
+          expect(during?.stageEvents?.lastSequence).toBe(3);
+          expect(page(during)).toEqual(["initial:running"]);
+          // The next read sees all of the write.
+          expect(page(await reader().getRunDetail(runId))).toEqual([
+            "initial:completed",
+          ]);
         } finally {
-          raw.close();
+          await write?.catch(() => {});
         }
-      };
-      const copies = (runId: string, rows: number) =>
-        `INSERT INTO outbox_events (id, workflowRunId, sequence, eventType, payload, causationId, occurredAt, createdAt, retryCount)
+      }
+    },
+  );
+
+  it.skipIf(!hasNodeSqlite)(
+    "plans every statement on a run's outbox rows by the run's index, in each state of the table's statistics",
+    {
+      timeout: 120_000,
+    },
+    async () => {
+      // Its own file: ANALYZE here must not change the plans of the others.
+      const file = join(directory, "plan.db");
+      const db: ConsolePrismaClient & Record<string, any> = isPrisma8
+        ? (() => {
+            const raw = fixture.createSqliteDb(file);
+            return Object.assign(fromPrisma8!(raw), {
+              $disconnect: () => raw.close(),
+            });
+          })()
+        : fixture.createSqliteClient(file);
+      const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite");
+      try {
+        const runs = [
+          "run-plan-0",
+          "run-plan-1000",
+          "run-plan-30000",
+          "run-plan-few",
+          "run-plan-others",
+        ];
+        await db.workflowRun.createMany({
+          data: runs.map((id, i) =>
+            mkRun(id, at(-9_100 - i), "RUNNING", "wf-d", 0, 0),
+          ),
+        });
+        // One row in the stored form of this Prisma major, then copies of it.
+        await db.outboxEvent.createMany({
+          data: [
+            mkEvent(
+              "plan-model",
+              "run-plan-model",
+              1,
+              "stage:started",
+              at(10),
+              null,
+              null,
+              { stageId: "fetch" },
+            ),
+          ],
+        });
+        const fill = (sql: string) => {
+          const raw = new DatabaseSync(file);
+          try {
+            raw.exec(sql);
+          } finally {
+            raw.close();
+          }
+        };
+        const copies = (runId: string, rows: number) =>
+          `INSERT INTO outbox_events (id, workflowRunId, sequence, eventType, payload, causationId, occurredAt, createdAt, retryCount)
 WITH RECURSIVE g(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM g WHERE n < ${rows})
 SELECT '${runId}-' || n, '${runId}', n, CASE WHEN n % 500 = 1 THEN 'stage:started' ELSE 'stage:progress' END,
        payload, 'c', occurredAt, createdAt, 0
 FROM g, plan_model`;
-      const load = () => {
-        fill(copies("run-plan-1000", 1_000));
-        fill(copies("run-plan-30000", 30_000));
-        fill(copies("run-plan-others", 50_000));
-      };
-      // The model row moves to a table of its own, so the outbox can be empty.
-      fill(
-        "CREATE TABLE plan_model AS SELECT * FROM outbox_events WHERE id = 'plan-model'; DELETE FROM outbox_events",
-      );
-      const clear = () => fill("DELETE FROM outbox_events");
-      // What the planner holds for the table, read on a new connection.
-      const statistics = () => {
-        const raw = new DatabaseSync(file);
-        try {
-          const table = raw
-            .prepare(
-              "SELECT count(*) AS n FROM sqlite_schema WHERE name = 'sqlite_stat1'",
-            )
-            .get().n;
-          return table === 0
-            ? "no sqlite_stat1"
-            : (raw
-                .prepare(
-                  "SELECT group_concat(coalesce(idx, '(table)') || '=' || coalesce(stat, 'null'), '; ') AS s FROM sqlite_stat1 WHERE tbl = 'outbox_events'",
-                )
-                // ANALYZE of an empty table stores no row for it.
-                .get().s ?? "no row");
-        } finally {
-          raw.close();
-        }
-      };
-      const states: Array<[string, () => void, (s: string) => boolean]> = [
-        ["never analysed", load, (s) => s === "no sqlite_stat1"],
-        [
-          "analysed empty",
-          () => {
-            clear();
-            fill("ANALYZE outbox_events");
-            load();
-          },
-          (s) => s === "no row",
-        ],
-        [
-          "analysed at size",
-          () => fill("ANALYZE outbox_events"),
-          (s) => /=8\d{4}/.test(s),
-        ],
-        // Analysed while one run held its few rows, then grown.
-        [
-          "stale",
-          () => {
-            clear();
-            fill(copies("run-plan-few", 7));
-            fill("ANALYZE outbox_events");
-            load();
-          },
-          // 7 rows, all of one run.
-          (s) => /=7 7 1(;|$)/.test(s),
-        ],
-      ];
-      const seen: string[] = [];
-      for (const [state, setup, holds] of states) {
-        setup();
-        const stats = statistics();
-        expect(holds(stats), `${state}: ${stats}`).toBe(true);
-        const calls: RecordedStatement[] = [];
-        const port = createPrismaConsoleReadPort(recordingClient(db, calls), {
-          databaseType: "sqlite",
-          now: () => at(100),
-        });
-        await port.getRunDetail("run-plan-30000");
-        await port.getRunDetail("run-plan-30000", { stageEventsAfter: 29_990 });
-        await port.getRunDetail("run-plan-30000", { stageEventsAfter: 30_000 });
-        await port.getRunDetail("run-plan-0");
-        await port.listRunEvents("run-plan-30000", 0);
-        await port.listRunEvents("run-plan-30000", 29_990);
-        const outbox = calls.filter(
-          (c) =>
-            c.sql.includes('"outbox_events"') &&
-            c.sql.includes('"workflowRunId" ='),
+        const load = () => {
+          fill(copies("run-plan-1000", 1_000));
+          fill(copies("run-plan-30000", 30_000));
+          fill(copies("run-plan-others", 50_000));
+        };
+        // The model row moves to a table of its own, so the outbox can be empty.
+        fill(
+          "CREATE TABLE plan_model AS SELECT * FROM outbox_events WHERE id = 'plan-model'; DELETE FROM outbox_events",
         );
-        expect(outbox.length).toBeGreaterThanOrEqual(14);
-        // The planner of a new connection, which loads the statistics now in the file.
-        const raw = new DatabaseSync(file);
-        try {
-          for (const { sql, params } of outbox) {
-            const plan = raw
-              // Numbered `?NNN`, which binds by position like the `$n` and `?` the readers write.
-              .prepare(`EXPLAIN QUERY PLAN ${sql.replace(/\$(\d+)/g, "?$1")}`)
-              .all(...(params as never[]))
-              .map((row: { detail: string }) => row.detail)
-              .join(" | ");
-            seen.push(`${state} (sqlite_stat1: ${stats}): ${plan}`);
-            expect(plan, `${state}: ${sql}`).toMatch(
-              // The unique (workflowRunId, sequence) index: named by Prisma 6 and 7, an
-              // inline constraint's automatic index on Prisma 8.
-              /SEARCH outbox_events USING (COVERING )?INDEX (outbox_events_workflowRunId_sequence_key|sqlite_autoindex_outbox_events_\d) \(workflowRunId=\?/,
+        const clear = () => fill("DELETE FROM outbox_events");
+        // What the planner holds for the table, read on a new connection.
+        const statistics = () => {
+          const raw = new DatabaseSync(file);
+          try {
+            const table = raw
+              .prepare(
+                "SELECT count(*) AS n FROM sqlite_schema WHERE name = 'sqlite_stat1'",
+              )
+              .get().n;
+            return table === 0
+              ? "no sqlite_stat1"
+              : (raw
+                  .prepare(
+                    "SELECT group_concat(coalesce(idx, '(table)') || '=' || coalesce(stat, 'null'), '; ') AS s FROM sqlite_stat1 WHERE tbl = 'outbox_events'",
+                  )
+                  // ANALYZE of an empty table stores no row for it.
+                  .get().s ?? "no row");
+          } finally {
+            raw.close();
+          }
+        };
+        const states: Array<[string, () => void, (s: string) => boolean]> = [
+          ["never analysed", load, (s) => s === "no sqlite_stat1"],
+          [
+            "analysed empty",
+            () => {
+              clear();
+              fill("ANALYZE outbox_events");
+              load();
+            },
+            (s) => s === "no row",
+          ],
+          [
+            "analysed at size",
+            () => fill("ANALYZE outbox_events"),
+            (s) => /=8\d{4}/.test(s),
+          ],
+          // Analysed while one run held its few rows, then grown.
+          [
+            "stale",
+            () => {
+              clear();
+              fill(copies("run-plan-few", 7));
+              fill("ANALYZE outbox_events");
+              load();
+            },
+            // 7 rows, all of one run.
+            (s) => /=7 7 1(;|$)/.test(s),
+          ],
+        ];
+        const seen: string[] = [];
+        for (const [state, setup, holds] of states) {
+          setup();
+          const stats = statistics();
+          expect(holds(stats), `${state}: ${stats}`).toBe(true);
+          const calls: RecordedStatement[] = [];
+          const port = createPrismaConsoleReadPort(recordingClient(db, calls), {
+            databaseType: "sqlite",
+            now: () => at(100),
+          });
+          await port.getRunDetail("run-plan-30000");
+          await port.getRunDetail("run-plan-30000", {
+            stageEventsAfter: 29_990,
+          });
+          await port.getRunDetail("run-plan-30000", {
+            stageEventsAfter: 30_000,
+          });
+          await port.getRunDetail("run-plan-0");
+          await port.listRunEvents("run-plan-30000", 0);
+          await port.listRunEvents("run-plan-30000", 29_990);
+          const outbox = calls.filter(
+            (c) =>
+              c.sql.includes('"outbox_events"') &&
+              c.sql.includes('"workflowRunId" ='),
+          );
+          expect(outbox.length).toBeGreaterThanOrEqual(14);
+          // The planner of a new connection, which loads the statistics now in the file.
+          const raw = new DatabaseSync(file);
+          try {
+            for (const { sql, params } of outbox) {
+              const plan = raw
+                // Numbered `?NNN`, which binds by position like the `$n` and `?` the readers write.
+                .prepare(`EXPLAIN QUERY PLAN ${sql.replace(/\$(\d+)/g, "?$1")}`)
+                .all(...(params as never[]))
+                .map((row: { detail: string }) => row.detail)
+                .join(" | ");
+              seen.push(`${state} (sqlite_stat1: ${stats}): ${plan}`);
+              expect(plan, `${state}: ${sql}`).toMatch(
+                // The unique (workflowRunId, sequence) index: named by Prisma 6 and 7, an
+                // inline constraint's automatic index on Prisma 8.
+                /SEARCH outbox_events USING (COVERING )?INDEX (outbox_events_workflowRunId_sequence_key|sqlite_autoindex_outbox_events_\d) \(workflowRunId=\?/,
+              );
+              expect(plan, `${state}: ${sql}`).not.toMatch(
+                /SCAN outbox_events|TEMP B-TREE/,
+              );
+            }
+          } finally {
+            raw.close();
+          }
+        }
+        console.log([...new Set(seen)].join("\n"));
+      } finally {
+        await db.$disconnect?.();
+      }
+    },
+  );
+
+  it.skipIf(!hasNodeSqlite)(
+    "plans a run's stages and annotations by the run's indexes, and its steps and logs as the docs state, in each state of the tables' statistics",
+    {
+      timeout: 120_000,
+    },
+    async () => {
+      const file = join(directory, "plan-tables.db");
+      const db: ConsolePrismaClient & Record<string, any> = isPrisma8
+        ? (() => {
+            const raw = fixture.createSqliteDb(file);
+            return Object.assign(fromPrisma8!(raw), {
+              $disconnect: () => raw.close(),
+            });
+          })()
+        : fixture.createSqliteClient(file);
+      const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite");
+      const tables = [
+        "workflow_stages",
+        "workflow_steps",
+        "workflow_annotations",
+        "workflow_logs",
+      ];
+      try {
+        await db.workflowRun.createMany({
+          data: [
+            "run-plan-model",
+            "run-plan-1000",
+            "run-plan-30000",
+            "run-plan-few",
+            "run-plan-others",
+          ].map((id, i) => mkRun(id, at(-9_200 - i), "RUNNING", "wf-d", 0, 0)),
+        });
+        // One row of each table in the stored form of this Prisma major.
+        await db.workflowStage.createMany({
+          data: [
+            {
+              id: "model-stage",
+              workflowRunId: "run-plan-model",
+              stageId: "s",
+              stageName: "S",
+              stageNumber: 1,
+              executionGroup: 1,
+              status: "COMPLETED",
+              createdAt: at(0),
+              updatedAt: at(0),
+            },
+          ],
+        });
+        await db.workflowStep.createMany({
+          data: [
+            {
+              id: "model-step",
+              stageRecordId: "model-stage",
+              stepId: "t",
+              seq: 1,
+              kind: "run",
+              status: "completed",
+              attempt: 1,
+              createdAt: at(0),
+              updatedAt: at(0),
+            },
+          ],
+        });
+        await db.workflowAnnotation.createMany({
+          data: [
+            {
+              id: "model-annotation",
+              workflowRunId: "run-plan-model",
+              attempt: 0,
+              scope: "run",
+              key: "k",
+              value: {},
+              createdAt: at(0),
+            },
+          ],
+        });
+        await db.workflowLog.createMany({
+          data: [
+            {
+              id: "model-log",
+              workflowRunId: "run-plan-model",
+              level: "INFO",
+              message: "m",
+              createdAt: at(0),
+            },
+          ],
+        });
+        const fill = (sql: string) => {
+          const raw = new DatabaseSync(file);
+          try {
+            raw.exec(sql);
+          } finally {
+            raw.close();
+          }
+        };
+        // The model rows move to tables of their own, so the tables can be empty.
+        fill(
+          tables
+            .map(
+              (t) =>
+                `CREATE TABLE plan_model_${t} AS SELECT * FROM ${t}; DELETE FROM ${t};`,
+            )
+            .join("\n"),
+        );
+        // A time `seconds` after a stored one, in the stored form.
+        const later = (column: string, seconds: string) =>
+          `CASE typeof(${column}) WHEN 'integer' THEN ${column} + (${seconds}) * 1000
+ ELSE strftime('%Y-%m-%dT%H:%M:%f', ${column}, '+' || (${seconds}) || ' seconds') || substr(${column}, 24) END`;
+        const series = (rows: number) =>
+          `WITH RECURSIVE g(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM g WHERE n < ${rows})`;
+        // A run of 20 stages and `rows` steps, annotations (three to a time) and logs.
+        const copies = (runId: string, rows: number) => `
+INSERT INTO workflow_stages (id, createdAt, updatedAt, version, workflowRunId, stageId, stageName, stageNumber, executionGroup, attempt, status)
+${series(20)} SELECT '${runId}-s' || n, createdAt, updatedAt, version, '${runId}', 's' || n, 'S' || n, n, n, attempt, status FROM g, plan_model_workflow_stages;
+INSERT INTO workflow_steps (id, stageRecordId, stepId, seq, kind, status, attempt, createdAt, updatedAt)
+${series(rows)} SELECT '${runId}-t' || n, '${runId}-s' || (1 + n % 20), 't' || n, n, kind, status, attempt, createdAt, updatedAt FROM g, plan_model_workflow_steps;
+INSERT INTO workflow_annotations (id, createdAt, workflowRunId, attempt, scope, key, value)
+${series(rows)} SELECT '${runId}-a' || n, ${later("createdAt", "n / 3")}, '${runId}', attempt, scope, 'k' || n, value FROM g, plan_model_workflow_annotations;
+INSERT INTO workflow_logs (id, createdAt, workflowRunId, level, message)
+${series(rows)} SELECT '${runId}-l' || n, ${later("createdAt", "n")}, '${runId}', level, message FROM g, plan_model_workflow_logs;`;
+        const load = () => {
+          fill(copies("run-plan-1000", 1_000));
+          fill(copies("run-plan-30000", 30_000));
+          fill(copies("run-plan-others", 50_000));
+        };
+        const clear = () =>
+          fill(tables.map((t) => `DELETE FROM ${t};`).join("\n"));
+        const analyze = () =>
+          fill(tables.map((t) => `ANALYZE ${t};`).join("\n"));
+        const statistics = () => {
+          const raw = new DatabaseSync(file);
+          try {
+            if (
+              raw
+                .prepare(
+                  "SELECT count(*) AS n FROM sqlite_schema WHERE name = 'sqlite_stat1'",
+                )
+                .get().n === 0
+            )
+              return "no sqlite_stat1";
+            return (
+              raw
+                .prepare(
+                  "SELECT group_concat(idx || '=' || stat, '; ') AS s FROM sqlite_stat1 WHERE tbl = 'workflow_annotations'",
+                )
+                .get().s ?? "no row"
             );
-            expect(plan, `${state}: ${sql}`).not.toMatch(
-              /SCAN outbox_events|TEMP B-TREE/,
+          } finally {
+            raw.close();
+          }
+        };
+        const states: Array<[string, () => void, (s: string) => boolean]> = [
+          ["never analysed", load, (s) => s === "no sqlite_stat1"],
+          [
+            "analysed empty",
+            () => {
+              clear();
+              analyze();
+              load();
+            },
+            (s) => s === "no row",
+          ],
+          ["analysed at size", analyze, (s) => /=8\d{4}/.test(s)],
+          [
+            "stale",
+            () => {
+              clear();
+              fill(copies("run-plan-few", 7));
+              analyze();
+              load();
+            },
+            (s) => /=7 7(;| |$)/.test(s),
+          ],
+        ];
+        const seen: string[] = [];
+        for (const [state, setup, holds] of states) {
+          setup();
+          const stats = statistics();
+          expect(holds(stats), `${state}: ${stats}`).toBe(true);
+          const calls: RecordedStatement[] = [];
+          const detail = await createPrismaConsoleReadPort(
+            recordingClient(db, calls),
+            { databaseType: "sqlite", now: () => at(100) },
+          ).getRunDetail("run-plan-30000");
+          // The page of 200 ends inside a group of three: the group is read too.
+          expect(detail?.annotations).toHaveLength(200);
+          expect(detail?.truncated.annotations).toBe(true);
+          const raw = new DatabaseSync(file);
+          const plans: Record<string, string[]> = {};
+          try {
+            for (const { sql, params } of calls) {
+              const table = tables.find((t) => sql.includes(`FROM "${t}"`));
+              if (!table) continue;
+              const plan = raw
+                .prepare(`EXPLAIN QUERY PLAN ${sql.replace(/\$(\d+)/g, "?$1")}`)
+                // A time binds as text here; the plan is that of its stored form.
+                .all(
+                  ...(params.map((p) =>
+                    p instanceof Date ? p.toISOString() : p,
+                  ) as never[]),
+                )
+                .map((row: { detail: string }) => row.detail)
+                .join(" | ");
+              plans[table] = [...(plans[table] ?? []), plan];
+              seen.push(`${state}: ${table}: ${plan}`);
+            }
+          } finally {
+            raw.close();
+          }
+          expect(plans.workflow_annotations, state).toHaveLength(2);
+          for (const plan of plans.workflow_annotations!) {
+            expect(plan, state).toMatch(
+              // Prisma 8 adds a hash to an index's name on SQLite.
+              /SEARCH workflow_annotations USING INDEX workflow_annotations_workflowRunId_createdAt_idx(_[0-9a-f]{8})? \(workflowRunId=\?/,
+            );
+            expect(plan, state).not.toMatch(
+              /TEMP B-TREE|SCAN workflow_annotations/,
             );
           }
-        } finally {
-          raw.close();
+          expect(plans.workflow_stages!.join(" | "), state).toMatch(
+            /SEARCH workflow_stages USING INDEX (workflow_stages_workflowRunId_\w+|sqlite_autoindex_workflow_stages_\d) \(workflowRunId=\?/,
+          );
+          // Logs and steps: no index serves their order, so a page sorts
+          // every log or step of the run, found by the run's index or, with
+          // statistics taken when the table held few rows, by a scan of the
+          // whole table (the cost the docs state).
+          expect(plans.workflow_logs!.join(" | "), state).toMatch(
+            state === "stale"
+              ? /SCAN workflow_logs|SEARCH workflow_logs USING INDEX workflow_logs_workflowRunId_idx/
+              : /SEARCH workflow_logs USING INDEX workflow_logs_workflowRunId_idx(_[0-9a-f]{8})? \(workflowRunId=\?\)/,
+          );
         }
+        console.log([...new Set(seen)].join("\n"));
+      } finally {
+        await db.$disconnect?.();
       }
-      console.log([...new Set(seen)].join("\n"));
-    } finally {
-      await db.$disconnect?.();
+    },
+  );
+
+  it("pages annotations newest first, ordering those that share a time by id across the page's end", async () => {
+    await prisma.workflowRun.createMany({
+      data: [mkRun("run-annotation-ties", at(-9_030), "RUNNING", "wf-d", 0, 0)],
+    });
+    // Written in the opposite order of their ids, so that the order the
+    // rows were written in is not the answer.
+    for (const [id, minute] of [
+      ["tie-5", 40],
+      ["tie-4", 40],
+      ["tie-3", 40],
+      ["tie-2", 40],
+      ["tie-1", 40],
+      ["tie-newest", 41],
+    ] as const) {
+      await prisma.workflowAnnotation.createMany({
+        data: [
+          {
+            id,
+            workflowRunId: "run-annotation-ties",
+            attempt: 0,
+            scope: "run",
+            key: id,
+            value: {},
+            createdAt: at(minute),
+          },
+        ],
+      });
     }
+    const ids = async (annotationLimit: number) => {
+      const detail = await reader().getRunDetail("run-annotation-ties", {
+        annotationLimit,
+      });
+      return [
+        detail!.annotations.map((a) => a.id),
+        detail!.truncated.annotations,
+      ];
+    };
+    expect(await ids(3)).toEqual([["tie-newest", "tie-5", "tie-4"], true]);
+    expect(await ids(1)).toEqual([["tie-newest"], true]);
+    expect(await ids(6)).toEqual([
+      ["tie-newest", "tie-5", "tie-4", "tie-3", "tie-2", "tie-1"],
+      false,
+    ]);
   });
 
   it("cuts a lifecycle event's error text in SQL and says it was cut", async () => {

@@ -48,7 +48,11 @@
  *    ends the attempts with an event; if one is open the history contradicts
  *    itself and the stage is `unproven-boundary`. The `stage:started` that
  *    follows a redrive is a `rerun` attempt, also for a stage whose last
- *    attempt was a job retry that a cancel interrupted.
+ *    attempt was a job retry that a cancel interrupted. A `run.transition`
+ *    dispatched before the claim also writes one, on a PENDING run with no
+ *    stage rows, and leaves the run PENDING; the claim then writes its own.
+ *    That second start, right after the first with no run event between,
+ *    is read as part of the first: no redrive, and no event of the stages.
  *  - One `job.execute` writes a stage's start and that execution's end
  *    under one causation id. An end written under the id of a retained
  *    start that did not open the current attempt is the end of an earlier
@@ -77,7 +81,8 @@
  *
  * The run's own events must follow the order the engine writes them in:
  * `workflow:created` first; one `workflow:started` for the claim, after
- * `workflow:created` and before any end; every later `workflow:started` (a
+ * `workflow:created` and before any end (or two, a transition's and the
+ * claim's, with the run PENDING after the first alone); every later `workflow:started` (a
  * redrive) after a `workflow:completed`, `workflow:failed` or
  * `workflow:cancelled`, because a redrive takes only an ended run;
  * `workflow:completed` only while the run is running, `workflow:failed` also
@@ -907,7 +912,8 @@ export function buildStageAttemptHistory(
           stage,
           events.filter(
             (event) =>
-              event.stageId === null || event.stageId === stage.stageId,
+              (event.stageId === null || event.stageId === stage.stageId) &&
+              !fold!.claims.has(event.sequence),
           ),
           input.steps.filter((step) => step.stageRecordId === stage.id),
           fold!.attempts.get(stage.stageId)!,
@@ -936,8 +942,11 @@ function foldRunEvents(
     runMismatch?: AttemptRunMismatch;
   };
   attempts: Map<string, Set<number>>;
+  /** Sequences of claims' `workflow:started` that followed a transition's. */
+  claims: Set<number>;
 } {
   const attempts = new Map<string, Set<number>>();
+  const claims = new Set<number>();
   const stageState = new Map<
     string,
     { suspended: boolean; retryPending: boolean }
@@ -964,10 +973,15 @@ function foldRunEvents(
       runMismatch: "order" as const,
     },
     attempts,
+    claims,
   };
 
   let run: RunState | null = null;
   let redrives = 0;
+  // The run's first `workflow:started`, with no run event since. A
+  // `run.transition` of a PENDING run with no stage rows writes one and
+  // leaves the run PENDING; the claim then writes its own.
+  let firstStartOnly = false;
   for (const event of events) {
     if (event.stageId !== null) {
       const state = own(event.stageId);
@@ -1003,6 +1017,13 @@ function foldRunEvents(
         run = "created";
         break;
       case "workflow:started":
+        if (run === "running" && firstStartOnly) {
+          // The claim after a transition: no redrive, no change to a row.
+          firstStartOnly = false;
+          claims.add(event.sequence);
+          continue;
+        }
+        firstStartOnly = run === "created";
         if (ended) {
           // A redrive: each row may now hold any value the header lists.
           redrives++;
@@ -1023,14 +1044,17 @@ function foldRunEvents(
         }
         break;
       case "workflow:completed":
+        firstStartOnly = false;
         if (run !== "running") return order;
         run = "COMPLETED";
         break;
       case "workflow:failed":
+        firstStartOnly = false;
         if (run !== "running" && run !== "created") return order;
         run = "FAILED";
         break;
       case "workflow:cancelled":
+        firstStartOnly = false;
         if (run === null) return order;
         run = "CANCELLED";
         // A cancelled stage is not PENDING, so a later start is no retry.
@@ -1042,20 +1066,25 @@ function foldRunEvents(
     }
   }
   if (redrives < redriveCount)
-    return { unavailable: { reason: "fewer-redrives" }, attempts };
+    return { unavailable: { reason: "fewer-redrives" }, attempts, claims };
   if (redrives > redriveCount)
     return {
       unavailable: { reason: "run-inconsistent", runMismatch: "redrives" },
       attempts,
+      claims,
     };
   if (runStatus !== undefined) {
     const expected =
       run === "created" ? "PENDING" : run === "running" ? "RUNNING" : run;
-    if (runStatus !== expected)
+    // After a transition's start alone the run is still PENDING.
+    const pendingAfterTransition =
+      firstStartOnly && run === "running" && runStatus === "PENDING";
+    if (runStatus !== expected && !pendingAfterTransition)
       return {
         unavailable: { reason: "run-inconsistent", runMismatch: "status" },
         attempts,
+        claims,
       };
   }
-  return { attempts };
+  return { attempts, claims };
 }

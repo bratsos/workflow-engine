@@ -407,6 +407,27 @@ export async function storeScenarios(): Promise<StoreScenario[]> {
       },
     },
     {
+      // Two `workflow:started` with no end between: the transition's, which
+      // leaves the run PENDING, and the claim's.
+      name: "run.transition before the claim, a job of it run before the claim, redrive",
+      marks: ["g1"],
+      async run(w, mark) {
+        const wf = register(w, (b) => b.pipe(stage("a")).pipe(stage("b")));
+        const runId = await w.start(wf);
+        await w.kernel.dispatch({
+          type: "run.transition",
+          workflowRunId: runId,
+        });
+        await w.runJobs(1);
+        await w.claim();
+        await w.drain();
+        await mark("g1", runId);
+        await w.redrive(runId, { kind: "start" });
+        await w.drain();
+        return runId;
+      },
+    },
+    {
       name: "cancelled while b runs, redrive from a later stage c, then from b",
       marks: ["g1", "g2"],
       async run(w, mark) {

@@ -712,6 +712,52 @@ describe("I want a stage's history grouped by attempt, and never grouped wrongly
     ]);
   });
 
+  it("reads a transition's start and the claim's after it as the run's first start", () => {
+    // `run.transition` before the claim, on a run with no stage rows: it
+    // writes `workflow:started` and leaves the run PENDING; the claim
+    // writes its own. Neither is a redrive, and the stage ran once.
+    const created = { ...run("workflow:created", -2), sequence: -1 };
+    const read = (
+      events: AttemptEventInput[],
+      row: AttemptStageInput,
+      runStatus: string,
+    ) => {
+      const entry = history([row], [created, ...events], [], {
+        runStatus,
+      }).get("rec-a")!;
+      return entry.available
+        ? entry.attempts.map((a) => `${a.trigger}:${a.outcome}`).join(" ")
+        : `${entry.reason}:${entry.runMismatch}`;
+    };
+    seq = 0;
+    const transition = run("workflow:started", 0);
+    expect(read([transition], stage("a", "PENDING", 0), "PENDING")).toBe("");
+    const claim = run("workflow:started", 1);
+    expect(read([transition, claim], stage("a", "PENDING", 0), "RUNNING")).toBe(
+      "",
+    );
+    const ran = [ev("a", "stage:started", 2), ev("a", "stage:completed", 5)];
+    expect(
+      read(
+        [transition, claim, ...ran, run("workflow:completed", 6)],
+        stage("a", "COMPLETED", 0),
+        "COMPLETED",
+      ),
+    ).toBe("initial:completed");
+    // A job the transition queued may run before the claim.
+    seq = 0;
+    const early = [
+      run("workflow:started", 0),
+      ev("a", "stage:started", 1),
+      run("workflow:started", 2),
+      ev("a", "stage:completed", 5),
+      run("workflow:completed", 6),
+    ];
+    expect(read(early, stage("a", "COMPLETED", 0), "COMPLETED")).toBe(
+      "initial:completed",
+    );
+  });
+
   it("checks the run's own events against the order the engine writes them in and against the run row", () => {
     const outcome = (
       events: AttemptEventInput[],
@@ -739,14 +785,41 @@ describe("I want a stage's history grouped by attempt, and never grouped wrongly
         runStatus: "COMPLETED",
       }),
     ).toBe("available");
-    // A second start with no end before it: rows were removed from the end
-    // and the run wrote again (a redrive takes only an ended run).
+    // A second start with no end before it, on a run that counts a redrive:
+    // rows were removed from the end and the run wrote again (a redrive
+    // takes only an ended run). Read as the claim after a transition, the
+    // start records no redrive, which the row counts.
     seq = 0;
     expect(
       outcome([...ran(), run("workflow:started", 7)], {
         redriveCount: 1,
         runStatus: "RUNNING",
       }),
+    ).toBe("fewer-redrives:undefined");
+    // A third start with no end between: neither a claim nor a redrive.
+    seq = 0;
+    expect(
+      outcome(
+        [run("workflow:started", 1), ...ran(), run("workflow:started", 7)],
+        { runStatus: "RUNNING" },
+        [
+          { ...run("workflow:created", -2), sequence: -1 },
+          { ...run("workflow:started", -1), sequence: 0 },
+        ],
+      ),
+    ).toBe("run-inconsistent:order");
+    // After a redrive, a start with no end before it is out of order too.
+    seq = 0;
+    expect(
+      outcome(
+        [
+          ...ran(),
+          run("workflow:completed", 6),
+          run("workflow:started", 7),
+          run("workflow:started", 8),
+        ],
+        { redriveCount: 1, runStatus: "RUNNING" },
+      ),
     ).toBe("run-inconsistent:order");
     // `workflow:completed` before the claim: the claim's start is not retained.
     seq = 0;
