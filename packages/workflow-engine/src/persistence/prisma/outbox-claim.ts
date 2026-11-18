@@ -37,74 +37,52 @@ export function readOutboxSql<T>(
 }
 
 /**
- * Walk a range of run IDs in index order. Each iteration seeks past the
- * previous run, even when that run has a large tail of unpublished events.
+ * Thrown by `createPrismaWorkflowPersistence` on PostgreSQL for a root client
+ * that exposes neither raw read. Outbox delivery claims with one statement
+ * that locks each run and returns the rows it claimed; model delegates cannot
+ * hold a run's claim exclusive against a concurrent replay and claim.
  */
+export class OutboxClaimUnsupportedError extends Error {
+  readonly code = "OUTBOX_CLAIM_UNSUPPORTED";
+
+  constructor() {
+    super(
+      "This Prisma client exposes neither $queryRaw (tagged template) nor $queryRawUnsafe. Outbox delivery on PostgreSQL claims events with one SQL statement that returns the rows it claimed, and the engine has no claim that keeps a run's events in order without it. Pass the Prisma client itself, or a wrapper that forwards one of the two.",
+    );
+    this.name = "OutboxClaimUnsupportedError";
+  }
+}
+
 export interface OutboxClaimPage {
   limit: number;
   claim: string;
   deadline: string;
   excluded: readonly string[];
-  after?: string;
-  through?: string;
-  signal?: Pick<AbortSignal, "aborted">;
-  firstRank: string;
 }
 
-// The prefix sorts acquisition order independently of the lease duration.
-export const firstOutboxRotation = "r0000000000000000";
+// A rank is the acquisition counter, zero-padded to the width of the largest
+// BIGINT. It saturates below that maximum, so it never needs another digit:
+// string order is numeric order and every offset below is fixed.
+const RANK_DIGITS = 19;
+const RANK_CEILING = "9223372036854775679"; // 2^63 - 1 - 128, the page cap
+export const firstOutboxRotation = `r${"0".repeat(RANK_DIGITS)}`;
+/** `r`, the rank and `|`: what a released claim keeps. */
+const RANK_PREFIX = RANK_DIGITS + 2;
 
-export function nextOutboxRotation(previous: string | undefined): string {
-  const rank = previous ? BigInt(previous.slice(1, 17)) : 0n;
-  return `r${(rank + 1n).toString().padStart(16, "0")}`;
+export function outboxClaimOwner(stored: string): string {
+  return stored.startsWith("r") ? stored.slice(RANK_PREFIX) : stored;
 }
 
 export function outboxClaimExpiry(stored: string): string {
-  return stored.startsWith("r") ? stored.slice(18, 42) : stored.slice(0, 24);
+  return outboxClaimOwner(stored).slice(0, 24);
 }
 
 export function releasedOutboxClaim(stored: string | null): string | null {
-  return stored?.startsWith("r") ? stored.slice(0, 18) : null;
-}
-
-// Keep the ranked cursor probe independent of the head walk. The statement
-// snapshot supplies the rank even if another adapter advanced the cursor
-// between the caller's cursor read and the acquisition.
-function outboxRank(sqlite: boolean, offset: string) {
-  const index = sqlite ? "INDEXED BY outbox_events_delivery_cursor_idx" : "";
-  const previous = `(SELECT CAST(substr("deliveryClaim", 2, 16) AS BIGINT)
-    FROM "outbox_events" ${index} WHERE "deliveryClaim" >= '${firstOutboxRotation}'
-    ORDER BY "deliveryClaim" DESC, "workflowRunId" DESC LIMIT 1)`;
-  const rank = `COALESCE(${previous}, 0) + ${offset}`;
-  return sqlite
-    ? `printf('r%016d|', ${rank}) || $3`
-    : `'r' || lpad((${rank})::text, 16, '0') || '|' || $3`;
+  return stored?.startsWith("r") ? stored.slice(0, RANK_PREFIX) : null;
 }
 
 const live = '"publishedAt" IS NULL AND "dlqAt" IS NULL';
 const headOrder = '"publishedAt", "dlqAt", "workflowRunId", sequence';
-
-function pageBindings(page: OutboxClaimPage) {
-  const args: (string | number)[] = [page.limit, page.deadline, page.claim];
-  const bind = (value: string) => `$${args.push(value)}`;
-  const start =
-    page.after === undefined ? "" : `AND "workflowRunId" > ${bind(page.after)}`;
-  const end =
-    page.through === undefined
-      ? ""
-      : `AND "workflowRunId" <= ${bind(page.through)}`;
-  const excluded = page.excluded.map(bind).join(", ");
-  return {
-    args,
-    head: (next: string, index = "", columns = 'id, "workflowRunId"') =>
-      `SELECT ${columns} FROM "outbox_events" ${index}
-       WHERE ${live} ${next} ${end}
-       ORDER BY ${headOrder} LIMIT 1`,
-    start,
-    eligible: (run: string) =>
-      excluded ? `${run} NOT IN (${excluded}) AND` : "",
-  };
-}
 
 function noActiveClaim(run: string, index = "") {
   const probe = (range: string, order: string) => `(
@@ -117,106 +95,227 @@ function noActiveClaim(run: string, index = "") {
   // live, even after replay restored an older predecessor.
   const latest = probe(`"deliveryClaim" >= '${firstOutboxRotation}'`, "DESC");
   const legacy = probe(`"deliveryClaim" > $2 AND "deliveryClaim" < 'r'`, "ASC");
-  return `(COALESCE(substr(${latest}, 19, 24), '') <= substr($2, 1, 24)
+  return `(COALESCE(substr(${latest}, ${
+    RANK_PREFIX + 1
+  }, 24), '') <= substr($2, 1, 24)
     AND ${legacy} IS NULL)`;
 }
 
-export function sqliteOutboxClaim(page: OutboxClaimPage) {
-  const { args, head, start, eligible } = pageBindings(page);
-  const primary = "INDEXED BY sqlite_autoindex_outbox_events_1";
-  const run = 'e."workflowRunId"';
-  const available = `(${eligible(run)} ${noActiveClaim(run, "INDEXED BY outbox_events_delivery_run_idx")})`;
-  const probe = (next: string) =>
-    head(next, "INDEXED BY outbox_events_live_run_sequence_idx", "id");
+/**
+ * The run that took the most recent rank, read inside the claim statement so
+ * that every acquisition starts from the rotation position current when it
+ * runs, and the rank it continues from.
+ */
+function cursorCte(sqlite: boolean) {
+  const index = sqlite ? "INDEXED BY outbox_events_delivery_cursor_idx" : "";
+  const rank = sqlite
+    ? `MIN(CAST(substr("deliveryClaim", 2, ${RANK_DIGITS}) AS INTEGER), ${RANK_CEILING})`
+    : `LEAST(CAST(substr("deliveryClaim", 2, ${RANK_DIGITS}) AS BIGINT), ${RANK_CEILING})`;
+  return `cursor AS MATERIALIZED (
+    SELECT "workflowRunId" AS run_id, ${rank} AS rank
+    FROM "outbox_events" ${index} WHERE "deliveryClaim" >= '${firstOutboxRotation}'
+    ORDER BY "deliveryClaim" DESC, "workflowRunId" DESC LIMIT 1
+  )`;
+}
+
+/**
+ * Where the head walk goes next, as guarded single-row index seeks tried in
+ * order: the next run after the cursor (the first run without a cursor),
+ * then from the first run through the cursor's run (the wrap, then the
+ * wrapped walk). The guards read the walk row only.
+ */
+function steps(head: (where: string) => string) {
+  const cursorRun = "(SELECT run_id FROM cursor)";
+  return [
+    ["walk.wrapped = 0 AND walk.run_id IS NULL", head("")],
+    [
+      "walk.wrapped = 0 AND walk.run_id IS NOT NULL",
+      head('"workflowRunId" > walk.run_id'),
+    ],
+    [
+      `walk.wrapped = 0 AND ${cursorRun} IS NOT NULL`,
+      head(`"workflowRunId" <= ${cursorRun}`),
+    ],
+    [
+      "walk.wrapped = 1",
+      head(`"workflowRunId" > walk.run_id AND "workflowRunId" <= ${cursorRun}`),
+    ],
+  ] as const;
+}
+
+const wrapped = (run: string) =>
+  `CASE WHEN walk.wrapped = 1 OR ${run} <= (SELECT run_id FROM cursor) THEN 1 ELSE 0 END`;
+
+function bindings(page: OutboxClaimPage) {
+  const args: (string | number)[] = [page.limit, page.deadline, page.claim];
+  const excluded = page.excluded
+    .map((value) => `$${args.push(value)}`)
+    .join(", ");
   return {
-    sql: `WITH RECURSIVE walk(id, run_id, available, served) AS (
-      SELECT e.id, e."workflowRunId", ${available}, ${available}
-      FROM "outbox_events" e ${primary} WHERE e.id = (${probe(start)})
+    args,
+    eligible: (run: string) =>
+      excluded ? `${run} NOT IN (${excluded}) AND` : "",
+  };
+}
+
+/**
+ * Rank of a claimed row: the cursor's rank plus the run's position in the
+ * walk, counting the runs it skipped. Statements that start from the same
+ * cursor rank a run by its rotation distance from it, so the highest rank,
+ * the next cursor, is the furthest run any of them claimed.
+ */
+function rankSql(sqlite: boolean, ordinal: string) {
+  const rank = `COALESCE((SELECT rank FROM cursor), 0) + ${ordinal}`;
+  return sqlite
+    ? `'r' || printf('%0${RANK_DIGITS}d', ${rank}) || '|' || $3`
+    : `'r' || lpad((${rank})::text, ${RANK_DIGITS}, '0') || '|' || $3`;
+}
+
+/**
+ * Each claimed run takes its head and its next live events in sequence
+ * order, `limit / heads` events in all, so a page is shared equally by the
+ * runs it reached. One seek per event.
+ */
+const share = `share AS MATERIALIZED (
+    SELECT CAST($1 AS integer) / NULLIF(COUNT(*), 0) AS take FROM heads
+  )`;
+
+/**
+ * One statement claims a page. A walk over run heads in run-ID order from the
+ * rotation cursor, wrapping once, claims one head per available run until
+ * the page is full or the rotation is done. Then each claimed run adds its
+ * next live events up to its share. SQLite runs one writer at a time, so the
+ * walk and the write see the same rows.
+ *
+ * Walk columns: `claimed` is 1 for a claimed head, `served` counts the heads
+ * claimed before the row, `visit` is the row's position in the walk.
+ */
+export function sqliteOutboxClaim(page: OutboxClaimPage) {
+  const { args, eligible } = bindings(page);
+  const primary = "INDEXED BY sqlite_autoindex_outbox_events_1";
+  const head = (where: string) =>
+    `(SELECT id FROM "outbox_events" INDEXED BY outbox_events_live_run_sequence_idx
+      WHERE ${live} ${
+        where ? `AND ${where}` : ""
+      } ORDER BY ${headOrder} LIMIT 1)`;
+  const available = `(${eligible('e."workflowRunId"')} ${noActiveClaim(
+    'e."workflowRunId"',
+    "INDEXED BY outbox_events_delivery_run_idx",
+  )})`;
+  const next = steps(head)
+    .map(([guard, seek]) => `CASE WHEN ${guard} THEN ${seek} END`)
+    .join(",\n        ");
+  return {
+    sql: `WITH RECURSIVE ${cursorCte(true)},
+    walk(id, run_id, seq, wrapped, claimed, served, visit) AS (
+      SELECT NULL, (SELECT run_id FROM cursor), NULL, 0, 0, 0, 0
       UNION ALL
-      SELECT e.id, e."workflowRunId", ${available}, walk.served + (${available})
+      SELECT e.id, e."workflowRunId", e.sequence, ${wrapped(
+        'e."workflowRunId"',
+      )},
+        ${available}, walk.served + walk.claimed, walk.visit + 1
       FROM walk CROSS JOIN "outbox_events" e ${primary}
-      WHERE walk.served < $1 AND e.id = (
-        ${probe('AND "workflowRunId" > walk.run_id')}
+      WHERE walk.served + walk.claimed < $1 AND e.id = COALESCE(
+        ${next}
       )
-    ), chosen AS MATERIALIZED (SELECT id, served FROM walk WHERE available)
+    ), heads AS MATERIALIZED (
+      SELECT id, run_id, seq, visit AS ordinal FROM walk WHERE claimed = 1
+    ), ${share},
+    fill(id, run_id, seq, ordinal, n) AS (
+      SELECT id, run_id, seq, ordinal, 1 FROM heads
+      UNION ALL
+      SELECT e.id, e."workflowRunId", e.sequence, fill.ordinal, fill.n + 1
+      FROM fill CROSS JOIN "outbox_events" e ${primary}
+      WHERE fill.n < (SELECT take FROM share)
+        AND e.id = ${head(
+          '"workflowRunId" = fill.run_id AND sequence > fill.seq',
+        )}
+    ), chosen AS MATERIALIZED (SELECT id, ordinal FROM fill)
     UPDATE "outbox_events" ${primary} SET "deliveryClaim" =
-      (${outboxRank(true, '(SELECT served FROM chosen WHERE chosen.id = "outbox_events".id)')})
-    WHERE id IN (SELECT id FROM chosen)
+      (${rankSql(true, "chosen.ordinal")})
+    FROM chosen WHERE chosen.id = "outbox_events".id
+      AND "outbox_events".id IN (SELECT id FROM chosen)
     RETURNING *`,
     args,
   };
 }
 
-export function postgresOutboxClaim(
-  page: OutboxClaimPage,
-  returnRows: boolean,
-) {
-  const { args, head, start, eligible } = pageBindings(page);
-  // The first retained event serializes claims even when a replay changes
-  // the head. Updating the anchor changes its tuple version (xmin). A
-  // contender with an older statement snapshot cannot claim using that
-  // version, even after the winning statement commits and unlocks it.
-  const locks = `LEFT JOIN LATERAL (
-    SELECT e.id FROM (
-      SELECT id, xmin FROM "outbox_events" WHERE "workflowRunId" = head."workflowRunId"
-      ORDER BY sequence LIMIT 1
-    ) snapshot JOIN "outbox_events" e
-      ON e.id = snapshot.id AND e.xmin = snapshot.xmin
-    WHERE ${eligible('head."workflowRunId"')} ${noActiveClaim('head."workflowRunId"')}
-    FOR UPDATE OF e SKIP LOCKED
-  ) anchor ON true
-  LEFT JOIN LATERAL (
-    SELECT e.id FROM "outbox_events" e
-    WHERE anchor.id IS NOT NULL AND e.id = head.id
-    FOR UPDATE OF e SKIP LOCKED
-  ) locked ON true`;
+/**
+ * The PostgreSQL walk locks each run before it claims there: the run's
+ * first retained event (the anchor) with `FOR UPDATE SKIP LOCKED`, then the
+ * head. Updating the anchor changes its tuple version (xmin). A contender
+ * with an older statement snapshot cannot claim using that version, even
+ * after the winning statement commits and unlocks it. A run's later events
+ * are covered by its anchor lock and the active-claim check its head passed.
+ * The write skips a row a peer published or dead-lettered since the snapshot.
+ */
+export function postgresOutboxClaim(page: OutboxClaimPage) {
+  const { args, eligible } = bindings(page);
+  const head = (where: string) =>
+    `SELECT id, "workflowRunId", sequence FROM "outbox_events"
+      WHERE ${live} ${
+        where ? `AND ${where}` : ""
+      } ORDER BY ${headOrder} LIMIT 1`;
+  const run = 'step."workflowRunId"';
+  const next = steps(head)
+    .map(([guard, seek]) => `(SELECT n.* FROM (${seek}) n WHERE ${guard})`)
+    .join("\n        UNION ALL ");
   return {
-    sql: `WITH RECURSIVE walk(run_id, id, anchor, served) AS (
-      SELECT head."workflowRunId", locked.id, anchor.id, (locked.id IS NOT NULL)::int
-      FROM (${head(start)}) head ${locks}
+    sql: `WITH RECURSIVE ${cursorCte(false)},
+    walk(id, anchor, run_id, seq, wrapped, claimed, served, visit) AS (
+      SELECT NULL::text, NULL::text, (SELECT run_id FROM cursor), NULL::int, 0, 0, 0, 0
       UNION ALL
-      SELECT head."workflowRunId", locked.id, anchor.id, walk.served + (locked.id IS NOT NULL)::int
+      SELECT step.id, anchor.id, ${run}, step.sequence, ${wrapped(run)},
+        (locked.id IS NOT NULL)::int, walk.served + walk.claimed, walk.visit + 1
       FROM walk CROSS JOIN LATERAL (
-        ${head('AND "workflowRunId" > walk.run_id')}
-      ) head ${locks}
-      WHERE walk.served < $1
-    ), chosen AS MATERIALIZED (
-      SELECT id, anchor, served FROM walk WHERE id IS NOT NULL
-    )${returnRows ? ", updated AS (" : ""}
-    UPDATE "outbox_events" e SET "deliveryClaim" =
-      CASE WHEN e.id = ANY(ARRAY(SELECT id FROM chosen))
-        THEN (${outboxRank(false, "(SELECT served FROM chosen WHERE chosen.id = e.id)")})
-        ELSE e."deliveryClaim" END
-    WHERE e.id = ANY(ARRAY(SELECT id FROM chosen UNION ALL SELECT anchor FROM chosen))
-    ${
-      returnRows
-        ? `RETURNING e.*
+        ${next}
+        LIMIT 1
+      ) step
+      LEFT JOIN LATERAL (
+        SELECT e.id FROM "outbox_events" e
+        WHERE ${["id", "xmin"]
+          .map(
+            // Scalar subqueries keep the primary-key probe an index condition
+            // whatever the statistics; a join can become a filter on a scan.
+            (column) => `e.${column} = (SELECT ${column} FROM "outbox_events"
+            WHERE "workflowRunId" = ${run} ORDER BY sequence LIMIT 1)`,
+          )
+          .join(" AND ")}
+          AND ${eligible(run)} ${noActiveClaim(run)}
+        FOR UPDATE OF e SKIP LOCKED
+      ) anchor ON true
+      LEFT JOIN LATERAL (
+        SELECT e.id FROM "outbox_events" e
+        WHERE anchor.id IS NOT NULL AND e.id = step.id
+        FOR UPDATE OF e SKIP LOCKED
+      ) locked ON true
+      WHERE walk.served + walk.claimed < $1
+    ), heads AS MATERIALIZED (
+      SELECT id, anchor, run_id, seq, visit AS ordinal FROM walk WHERE claimed = 1
+    ), ${share},
+    fill(id, run_id, seq, ordinal, n) AS (
+      SELECT id, run_id, seq, ordinal, 1 FROM heads
+      UNION ALL
+      SELECT n.id, n."workflowRunId", n.sequence, fill.ordinal, fill.n + 1
+      FROM fill CROSS JOIN LATERAL (
+        ${head('"workflowRunId" = fill.run_id AND sequence > fill.seq')}
+      ) n
+      WHERE fill.n < (SELECT take FROM share)
+    ), chosen AS MATERIALIZED (SELECT id, ordinal FROM fill),
+    updated AS (
+      UPDATE "outbox_events" e SET "deliveryClaim" =
+        CASE WHEN e.id = ANY(ARRAY(SELECT id FROM chosen))
+            AND e."publishedAt" IS NULL AND e."dlqAt" IS NULL
+          THEN (${rankSql(
+            false,
+            "(SELECT ordinal FROM chosen WHERE chosen.id = e.id)",
+          )})
+          ELSE e."deliveryClaim" END
+      WHERE e.id = ANY(ARRAY(SELECT id FROM chosen UNION ALL SELECT anchor FROM heads))
+      RETURNING e.*
     )
-    SELECT updated.* FROM updated JOIN chosen USING (id) ORDER BY chosen.served`
-        : ""
-    }`,
+    SELECT updated.* FROM updated JOIN chosen USING (id)
+    WHERE updated."publishedAt" IS NULL AND updated."dlqAt" IS NULL`,
     args,
   };
-}
-
-export async function executeOutboxSql(
-  prisma: EnginePrismaClient,
-  sql: string,
-  args: readonly unknown[],
-): Promise<void> {
-  if (prisma.$executeRawUnsafe) {
-    await prisma.$executeRawUnsafe(sql, ...args);
-    return;
-  }
-  const parts = sql.split(/\$(\d+)/);
-  const strings = [parts[0]!];
-  const values: unknown[] = [];
-  for (let i = 1; i < parts.length; i += 2) {
-    values.push(args[Number(parts[i]) - 1]);
-    strings.push(parts[i + 1]!);
-  }
-  await prisma.$executeRaw!(
-    Object.assign(strings, { raw: strings }),
-    ...values,
-  );
 }

@@ -717,7 +717,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
     if (limit <= 0 || signal?.aborted) return [];
     const excluded = new Set(excludedRunIds);
     const blocked = new Set<string>();
-    const heads = new Map<string, OutboxRecord>();
+    const live = new Map<string, OutboxRecord[]>();
     const deadline = now.toISOString();
     for (const row of this.outbox) {
       if (row.publishedAt !== null || row.dlqAt !== null) continue;
@@ -725,24 +725,31 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
       const lease = this.outboxClaims.get(row.id);
       if (lease && lease.slice(0, 24) > deadline)
         blocked.add(row.workflowRunId);
-      const head = heads.get(row.workflowRunId);
-      if (!head || row.sequence < head.sequence)
-        heads.set(row.workflowRunId, row);
+      const events = live.get(row.workflowRunId) ?? [];
+      events.push(row);
+      live.set(row.workflowRunId, events);
     }
-    const runs = [...heads.keys()].sort();
+    const runs = [...live.keys()].sort();
     const after = this.lastOutboxRun;
     const split =
       after === undefined ? 0 : runs.findIndex((run) => run > after);
     const ordered =
       split > 0 ? runs.slice(split).concat(runs.slice(0, split)) : runs;
+    // One head per available run, then each claimed run takes its next live
+    // events up to an equal share of the page, as the SQL claim does.
+    const heads = ordered.filter((run) => !blocked.has(run)).slice(0, limit);
+    const share = Math.floor(limit / Math.max(heads.length, 1));
     const result: OutboxRecord[] = [];
-    for (const run of ordered) {
-      if (result.length >= limit) break;
-      if (blocked.has(run)) continue;
-      const row = heads.get(run)!;
-      this.outboxClaims.set(row.id, claim);
+    for (const run of heads) {
+      const events = live
+        .get(run)!
+        .sort((a, b) => a.sequence - b.sequence)
+        .slice(0, share);
+      for (const row of events) {
+        this.outboxClaims.set(row.id, claim);
+        result.push({ ...row });
+      }
       this.lastOutboxRun = run;
-      result.push({ ...row });
     }
     return result;
   }
@@ -760,6 +767,29 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
       this.outboxClaims.get(id) === claim &&
       claim.slice(0, 24) > now.toISOString()
     );
+  }
+
+  async activeOutboxDeliveryClaims(
+    ids: readonly string[],
+    claim: string,
+    now: Date,
+  ): Promise<string[]> {
+    const owned: string[] = [];
+    for (const id of ids)
+      if (await this.isOutboxDeliveryClaimActive(id, claim, now))
+        owned.push(id);
+    return owned;
+  }
+
+  async completeOutboxDeliveries(
+    ids: readonly string[],
+    claim: string,
+    now: Date,
+  ): Promise<number> {
+    let published = 0;
+    for (const id of ids)
+      if (await this.completeOutboxDelivery(id, claim, now)) published++;
+    return published;
   }
 
   async completeOutboxDelivery(
@@ -795,7 +825,12 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
     )
       return "lost";
     row.retryCount++;
-    this.outboxClaims.delete(id);
+    // Release this claim's later events of the run for the next flush.
+    for (const [other, owner] of this.outboxClaims) {
+      const event = this.outbox.find((e) => e.id === other);
+      if (owner === claim && event?.workflowRunId === row.workflowRunId)
+        this.outboxClaims.delete(other);
+    }
     if (row.retryCount >= maxRetries) {
       row.dlqAt = now;
       return "dead-lettered";
@@ -1121,7 +1156,9 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
       ) {
         continue;
       }
-      const key = `${run.workflowId}\u0000${run.definitionVersion ?? ""}\u0000${run.status}`;
+      const key = `${run.workflowId}\u0000${run.definitionVersion ?? ""}\u0000${
+        run.status
+      }`;
       const bucket = buckets.get(key);
       if (bucket) {
         bucket.count += 1;

@@ -21,6 +21,7 @@
 
 import type { OutboxFlushCommand, OutboxFlushResult } from "../commands";
 import type { KernelEvent } from "../events";
+import type { OutboxRecord } from "../ports";
 import { toErrorMessage } from "../helpers/error-message.js";
 import type { HandlerResult, KernelDeps } from "../kernel";
 import type { PluginRunner } from "../plugins";
@@ -52,6 +53,7 @@ export async function handleOutboxFlush(
     );
   }
   const maxRetries = (deps.eventSink as Partial<PluginRunner>).maxRetries ?? 3;
+  const persistence = deps.persistence;
   let stopAfterPage = false;
   let attempted = 0;
   let published = 0;
@@ -79,7 +81,7 @@ export async function handleOutboxFlush(
     const now = deps.clock.now();
     const expiresAt = now.getTime() + claimDurationMs;
     const claim = `${new Date(expiresAt).toISOString()}|${crypto.randomUUID()}`;
-    const events = await deps.persistence.claimOutboxDelivery(
+    const events = await persistence.claimOutboxDelivery(
       limit - attempted,
       claim,
       now,
@@ -88,65 +90,118 @@ export async function handleOutboxFlush(
     );
     if (interrupted(expiresAt) || !events.length) break;
     attempted += events.length;
-    // Finish the ownership reads before invoking any sink. Otherwise a
-    // slow sink can leave the page to expire while another run is still
-    // awaiting its ownership read.
-    const ownership = await Promise.allSettled(
-      events.map((event) =>
-        deps.persistence.isOutboxDeliveryClaimActive(
-          event.id,
-          claim,
-          deps.clock.now(),
-        ),
-      ),
-    );
-    if (interrupted(expiresAt)) break;
-
-    // A page has at most one head per run. Start independent deliveries
-    // without waiting for another run's sink call to settle.
-    const results = await Promise.allSettled(
-      events.map(async (event, index) => {
-        const check = ownership[index]!;
-        if (check.status === "rejected") throw check.reason;
-        if (interrupted(expiresAt)) return;
-        const active = check.value;
-        if (!active) {
-          stopAfterPage = true;
-          return;
-        }
-        try {
-          await deps.eventSink.emit(event.payload as KernelEvent, {
-            eventId: event.id,
-            workflowRunId: event.workflowRunId,
-            sequence: event.sequence,
-            attempt: event.retryCount + 1,
-          });
-        } catch (error) {
-          stopAfterPage = true;
-          const outcome = await deps.persistence.failOutboxDelivery(
-            event.id,
-            claim,
-            maxRetries,
-            deps.clock.now(),
-          );
-          firstError ??= toErrorMessage(error);
-          if (outcome === "dead-lettered") deadLettered++;
-          if (outcome === "retry") failed++;
-          return;
-        }
-        if (
-          await deps.persistence.completeOutboxDelivery(
-            event.id,
+    // Finish the ownership read before invoking any sink. Otherwise a slow
+    // sink can leave the page to expire while another run is still awaiting
+    // its ownership read.
+    const ids = events.map((event) => event.id);
+    const owned = new Set(
+      persistence.activeOutboxDeliveryClaims
+        ? await persistence.activeOutboxDeliveryClaims(
+            ids,
             claim,
             deps.clock.now(),
           )
-        )
-          published++;
+        : (
+            await Promise.all(
+              events.map(async (event) =>
+                (await persistence.isOutboxDeliveryClaimActive(
+                  event.id,
+                  claim,
+                  deps.clock.now(),
+                ))
+                  ? event.id
+                  : undefined,
+              ),
+            )
+          ).filter((id) => id !== undefined),
+    );
+    if (interrupted(expiresAt)) break;
+
+    // Acknowledge accepted events together: one write carries every event
+    // accepted while the previous write was in flight. A run's next event
+    // does not wait for the acknowledgement of the one before it; a crash
+    // in between redelivers both, in order.
+    let accepted: string[] = [];
+    let writing: Promise<void> | undefined;
+    let writeError: { error: unknown } | undefined;
+    const acknowledge = (id: string) => {
+      accepted.push(id);
+      writing ??= (async () => {
+        while (accepted.length) {
+          const batch = accepted;
+          accepted = [];
+          try {
+            const count = persistence.completeOutboxDeliveries
+              ? await persistence.completeOutboxDeliveries(
+                  batch,
+                  claim,
+                  deps.clock.now(),
+                )
+              : (
+                  await Promise.all(
+                    batch.map((id) =>
+                      persistence.completeOutboxDelivery(
+                        id,
+                        claim,
+                        deps.clock.now(),
+                      ),
+                    ),
+                  )
+                ).filter(Boolean).length;
+            published += count;
+            if (count < batch.length) stopAfterPage = true;
+          } catch (error) {
+            writeError ??= { error };
+          }
+        }
+        writing = undefined;
+      })();
+    };
+
+    // Runs are delivered concurrently, a run's events one after another.
+    const runs = new Map<string, OutboxRecord[]>();
+    for (const event of events) {
+      const run = runs.get(event.workflowRunId);
+      if (run) run.push(event);
+      else runs.set(event.workflowRunId, [event]);
+    }
+    const results = await Promise.allSettled(
+      [...runs.values()].map(async (run) => {
+        for (const event of run) {
+          if (writeError || interrupted(expiresAt)) return;
+          if (!owned.has(event.id)) {
+            stopAfterPage = true;
+            return;
+          }
+          try {
+            await deps.eventSink.emit(event.payload as KernelEvent, {
+              eventId: event.id,
+              workflowRunId: event.workflowRunId,
+              sequence: event.sequence,
+              attempt: event.retryCount + 1,
+            });
+          } catch (error) {
+            stopAfterPage = true;
+            const outcome = await persistence.failOutboxDelivery(
+              event.id,
+              claim,
+              maxRetries,
+              deps.clock.now(),
+            );
+            firstError ??= toErrorMessage(error);
+            if (outcome === "dead-lettered") deadLettered++;
+            if (outcome === "retry") failed++;
+            return;
+          }
+          acknowledge(event.id);
+        }
       }),
     );
+    while (writing) await writing;
     for (const result of results) {
       if (result.status === "rejected") throw result.reason;
     }
+    if (writeError) throw writeError.error;
     // Finish the page but leave retries for the next flush. This avoids
     // repeatedly scanning failed heads to find independent work.
     if (stopAfterPage || deps.clock.now().getTime() >= expiresAt) break;

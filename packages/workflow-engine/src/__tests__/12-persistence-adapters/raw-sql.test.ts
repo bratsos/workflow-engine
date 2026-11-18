@@ -266,58 +266,35 @@ describe("PrismaWorkflowPersistence.claimOutboxDelivery raw SQL", () => {
     expect(await persistence.claimOutboxDelivery(25, claim, now, [])).toEqual([
       row,
     ]);
-    const [sql, ...params] = queryRawUnsafe.mock.calls[0]!;
+    // One planner statement, then the claim, in one transaction.
+    expect(queryRawUnsafe).toHaveBeenCalledTimes(2);
+    expect(queryRawUnsafe.mock.calls[0]![0]).toContain(
+      "set_config('enable_seqscan', 'off', true)",
+    );
+    const [sql, ...params] = queryRawUnsafe.mock.calls[1]!;
     expect(sql).toContain("FOR UPDATE OF e SKIP LOCKED");
-    expect(sql).toContain('AND "workflowRunId" > walk.run_id');
+    expect(sql).toContain('"workflowRunId" > walk.run_id');
+    expect(sql).toContain("cursor AS MATERIALIZED");
     expect(params).toEqual([25, `${now.toISOString()}~`, claim]);
     expect(sql).toContain('SET "deliveryClaim"');
     expect(sql).not.toMatch(/SET "publishedAt"/);
-    expect(queryRawUnsafe).toHaveBeenCalledTimes(1);
+    expect(prisma.outboxEvent.findFirst).not.toHaveBeenCalled();
   });
 
-  it("uses a compare-and-set on the PostgreSQL delegate path", async () => {
-    const now = new Date("2026-09-04T11:00:00.000Z");
-    const rows = [
-      {
-        id: "a",
-        workflowRunId: "run-1",
-        sequence: 1,
-        publishedAt: null,
-        dlqAt: null,
-        retryCount: 0,
-      },
-      {
-        id: "b",
-        workflowRunId: "run-1",
-        sequence: 2,
-        publishedAt: null,
-        dlqAt: null,
-        retryCount: 0,
-      },
-    ];
-    const updateMany = vi.fn(async () => ({ count: 0 }));
+  it("refuses a PostgreSQL root without a raw read when it is built", () => {
     const prisma = {
-      outboxEvent: {
-        findFirst: vi
-          .fn()
-          .mockResolvedValueOnce(null)
-          .mockResolvedValueOnce({ ...rows[0], deliveryClaim: null })
-          .mockResolvedValue(null),
-        updateMany,
-      },
+      outboxEvent: { findFirst: vi.fn(), updateMany: vi.fn() },
+      $executeRawUnsafe: vi.fn(),
+      $transaction: vi.fn(),
     } as unknown as EnginePrismaClient;
-    const persistence = new PrismaWorkflowPersistence(prisma, {
-      databaseType: "postgresql",
-    });
     expect(
-      await persistence.claimOutboxDelivery(
-        10,
-        "2026-09-04T11:01:00.000Z|owner",
-        now,
-        [],
-      ),
-    ).toEqual([]);
-    expect(updateMany).toHaveBeenCalledTimes(1);
+      () => new PrismaWorkflowPersistence(prisma, { databaseType: "postgresql" }),
+    ).toThrow(
+      expect.objectContaining({
+        name: "OutboxClaimUnsupportedError",
+        code: "OUTBOX_CLAIM_UNSUPPORTED",
+      }),
+    );
   });
 });
 

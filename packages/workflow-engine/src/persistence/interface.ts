@@ -1015,16 +1015,19 @@ export interface PersistenceCore {
   readonly outboxDeliveryDeferred?: boolean;
 
   /**
-   * Claim an indexed page with at most one eligible head per run. The sink
-   * may receive several runs in a page concurrently. `claim` is an ISO UTC
-   * expiry, `|`, and a unique owner ID. Store it atomically without changing
-   * `publishedAt`, and return each row's state at acquisition, including its
-   * retry count. A live predecessor blocks its successors at acquisition.
-   * Replay can make an earlier event eligible after a successor was claimed.
-   * Skip excluded runs and page past blocked runs without reading their tails.
-   * Keep the rotation position in the store so retries cannot starve
-   * other runs even when each flush uses a fresh adapter.
-   * Do not start another claim write after the signal is aborted.
+   * Claim an indexed page of at most `limit` events. For each eligible run
+   * return its head, optionally followed by the run's next live events in
+   * sequence order; a run's events are adjacent in the result. The kernel
+   * delivers a run's events one after another and different runs
+   * concurrently. `claim` is an ISO UTC expiry, `|`, and a unique owner ID.
+   * Store it atomically without changing `publishedAt`, and return each
+   * row's state at acquisition, including its retry count. A live claim
+   * anywhere in a run blocks the run at acquisition. Replay can make an
+   * earlier event eligible after a successor was claimed. Skip excluded runs
+   * and page past blocked runs without reading their tails. Keep the
+   * rotation position in the store so retries cannot starve other runs even
+   * when each flush uses a fresh adapter. Do not start another claim write
+   * after the signal is aborted.
    */
   claimOutboxDelivery(
     limit: number,
@@ -1033,6 +1036,28 @@ export interface PersistenceCore {
     excludedRunIds: readonly string[],
     signal?: Pick<AbortSignal, "aborted">,
   ): Promise<OutboxRecord[]>;
+
+  /**
+   * Optional page form of `isOutboxDeliveryClaimActive`: the IDs, of those
+   * given, this claim still owns live and unexpired, read at once. Without
+   * it the kernel calls `isOutboxDeliveryClaimActive` for each event.
+   */
+  activeOutboxDeliveryClaims?(
+    ids: readonly string[],
+    claim: string,
+    now: Date,
+  ): Promise<readonly string[]>;
+
+  /**
+   * Optional page form of `completeOutboxDelivery`: publish every given row
+   * this claim still owns live, at once, and return how many. Without it the
+   * kernel calls `completeOutboxDelivery` for each event.
+   */
+  completeOutboxDeliveries?(
+    ids: readonly string[],
+    claim: string,
+    now: Date,
+  ): Promise<number>;
 
   /** Check ownership, expiry, publication and DLQ state before the sink. */
   isOutboxDeliveryClaimActive(
@@ -1048,7 +1073,11 @@ export interface PersistenceCore {
     now: Date,
   ): Promise<boolean>;
 
-  /** Atomically count a failure, release the claim, and dead-letter at the limit. */
+  /**
+   * Atomically count a failure, release the claim, and dead-letter at the
+   * limit. An adapter that claims several events of a run also releases this
+   * claim on the run's other events, without counting a failure for them.
+   */
   failOutboxDelivery(
     id: string,
     claim: string,

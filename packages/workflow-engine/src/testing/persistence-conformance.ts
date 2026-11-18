@@ -1718,7 +1718,7 @@ export function persistenceConformanceSuite(
           })),
         );
         const first = await persistence.claimOutboxDelivery(
-          10,
+          1,
           firstClaim,
           now,
           [],
@@ -1730,7 +1730,7 @@ export function persistenceConformanceSuite(
         ).toEqual([]);
         const later = new Date("2025-01-01T00:01:01.000Z");
         const reclaimed = await persistence.claimOutboxDelivery(
-          10,
+          1,
           secondClaim,
           later,
           [],
@@ -1985,7 +1985,62 @@ export function persistenceConformanceSuite(
           now,
           [],
         );
-        expect(successor.map(({ sequence }) => sequence)).toEqual([3]);
+        // The head, optionally with the run's next live events in order.
+        expect(successor.map(({ sequence }) => sequence)).toEqual(
+          successor.map((_, index) => 3 + index),
+        );
+        expect(successor.length).toBeGreaterThan(0);
+      });
+
+      it("returns a run's events in order and releases the rest of them when one fails", async () => {
+        const now = new Date("2025-01-01T00:00:00.000Z");
+        const claim = "2025-01-01T00:01:00.000Z|batch";
+        const peer = "2025-01-01T00:01:00.000Z|batch-peer";
+        await persistence.appendOutboxEvents(
+          ["batch-a", "batch-a", "batch-a", "batch-z"].map((workflowRunId) => ({
+            workflowRunId,
+            eventType: "delivery",
+            payload: {},
+            occurredAt: now,
+            causationId: "batch",
+          })),
+        );
+        const page = await persistence.claimOutboxDelivery(10, claim, now, []);
+        const runA = page.filter((row) => row.workflowRunId === "batch-a");
+        expect(runA.map(({ sequence }) => sequence)).toEqual(
+          runA.map((_, index) => 1 + index),
+        );
+        // A run's events are adjacent in the page.
+        const first = page.findIndex((row) => row.workflowRunId === "batch-a");
+        expect(page.slice(first, first + runA.length)).toEqual(runA);
+        const ids = page.map(({ id }) => id);
+        if (persistence.activeOutboxDeliveryClaims)
+          expect(
+            [...(await persistence.activeOutboxDeliveryClaims(ids, claim, now))].sort(),
+          ).toEqual([...ids].sort());
+        expect(
+          await persistence.failOutboxDelivery(runA[0]!.id, claim, 3, now),
+        ).toBe("retry");
+        // The run is free again from its head, for any claimant.
+        const retried = await persistence.claimOutboxDelivery(
+          10,
+          peer,
+          now,
+          [],
+        );
+        expect(
+          retried.find((row) => row.workflowRunId === "batch-a"),
+        ).toMatchObject({ id: runA[0]!.id, retryCount: 1 });
+        const z = page.find((row) => row.workflowRunId === "batch-z");
+        if (z && persistence.completeOutboxDeliveries) {
+          expect(
+            await persistence.completeOutboxDeliveries(
+              [z.id, runA[0]!.id],
+              claim,
+              now,
+            ),
+          ).toBe(1);
+        }
       });
 
       it("marks real caller transaction views as deferred for delivery", async () => {
