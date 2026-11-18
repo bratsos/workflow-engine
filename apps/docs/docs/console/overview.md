@@ -366,21 +366,22 @@ whose rows are interleaved with theirs.
   row of the run. The logs page reads 18 pages for 1,000 logs together and
   331 for 30,000; interleaved, 493 to 710 for 1,000 and 651 to 1,270 for
   30,000. The steps page reads the steps of each stage the stages statement
-  returned (on Postgres one lookup per stage, as a `LATERAL` subquery; on
-  SQLite an `IN` list that names the steps' `"stageRecordId"` index, ordered
-  by a `CASE` over the stage ids, with no join): 313 to
+  returned (on Postgres one lookup per stage, as a `LATERAL` subquery over
+  the stage ids; on SQLite one lookup per stage through the steps' named
+  `"stageRecordId"` index, the stage ids the outer side of a `CROSS JOIN`):
+  313 to
   343 pages for 1,000 steps together and 873 to 1,048 interleaved, 2,438 to
   8,483 for 30,000 together and 12,611 to 19,757 interleaved, 3,003 to 4,003
   for a run of 1,000 stages. A join to the stages table, which the console
   used before, was planned as a scan of the whole steps table with no
   statistics, and for a run of many stages with current ones; on SQLite,
   with statistics taken while the stages table held one row, as a scan of
-  the stages table for every step. The statement takes one parameter per
-  stage (two on SQLite), so the stages are read 1,000 at a time, in order,
-  until the page is full: a run of more stages than a statement takes
-  parameters (65,535 in Postgres's protocol, 32,767 in Prisma 6's query
-  engine, 32,766 in SQLite) reads
-  correctly, in one statement per 1,000 stages it has to look through.
+  the stages table for every step. The stage ids go as one parameter (an
+  array on Postgres, a JSON array read by `json_each` on SQLite), so the
+  steps are one statement for a run of any number of stages, past every
+  store's parameter limit (65,535 in Postgres's protocol, 32,767 in Prisma
+  6's query engine, 32,766 in SQLite), and a run detail is at most 18
+  statements on Postgres and 12 on SQLite.
 - After rows are deleted, until a vacuum, a walk of an index also visits the
   run's deleted entries in its range. That costs at most a page per deleted
   row of the run, and only when the run has fewer live rows than the walk
@@ -534,9 +535,11 @@ console cannot cancel a running SQLite query this way. A SQLite read queued
 behind another transaction (SQLite takes one at a time) gives up after
 `statementTimeoutMs` on every Prisma major, with the same HTTP 504
 `query_timeout` and a `ConsoleQueryTimeoutError` whose `limit` is
-`"connection"`: Prisma 6 and 7 through `maxWait`, Prisma 8 through the
-reader's own bound. With `statementTimeoutMs: 0` it waits for that
-transaction.
+`"connection"`, whether or not the engine's adapters are built on the same
+client. The reader bounds this wait itself on SQLite: on Prisma 6 and 7 the
+engine's adapters queue each transaction's begin behind the one before, and
+that queue is outside Prisma's `maxWait`. With `statementTimeoutMs: 0` it
+waits for that transaction.
 
 The run detail's cursors need its transaction to keep one server connection:
 behind a pooler, use a transaction-scoped connection (PgBouncer's transaction

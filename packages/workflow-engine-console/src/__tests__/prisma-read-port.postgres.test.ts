@@ -1170,12 +1170,15 @@ FROM generate_series(1, 7) g`,
     it("reads a run's stages, steps, annotations and logs with plans that do not depend on the tables' statistics, or at the cost the docs state", {
       timeout: 300_000,
     }, async () => {
+      const quote = (value: unknown) =>
+        `'${String(value).replace(/'/g, "''")}'`;
       const inline = (sql: string, params: unknown[]) =>
         sql.replace(/\$(\d+)/g, (_m, n) => {
           const value = params[Number(n) - 1];
-          return typeof value === "number"
-            ? String(value)
-            : `'${String(value).replace(/'/g, "''")}'`;
+          // The steps statement's stage ids, one array parameter.
+          if (Array.isArray(value))
+            return `ARRAY[${value.map(quote).join(", ")}]`;
+          return typeof value === "number" ? String(value) : quote(value);
         });
       const tables = [
         "workflow_stages",
@@ -2030,7 +2033,17 @@ VALUES ('many-t1', 'many-s1', 'first', 1, 'run', 'completed', now()),
        ('many-t2', 'many-s65800', 'late-1', 1, 'run', 'completed', now()),
        ('many-t4', 'many-s66000', 'last', 1, 'run', 'completed', now())`,
       );
-      const detail = await reader().getRunDetail("run-many-stages");
+      const calls: RecordedStatement[] = [];
+      const detail = await createPrismaConsoleReadPort(
+        recordingClient(client, calls),
+        { now: () => at(100) },
+      ).getRunDetail("run-many-stages");
+      // One steps statement whatever the number of stages, so a read stays
+      // within the eighteen statements its transaction limit counts on.
+      expect(
+        calls.filter((c) => c.sql.includes('"workflow_steps" x')),
+      ).toHaveLength(1);
+      expect(calls.length).toBeLessThanOrEqual(18);
       expect(detail?.stages).toHaveLength(66_000);
       expect(detail?.steps.map((s) => s.stepId)).toEqual([
         "first",

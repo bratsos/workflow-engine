@@ -1680,7 +1680,10 @@ SELECT run || '-l' || n, ${later("createdAt", "n")}, run, level, message FROM ($
           const plans: Record<string, string[]> = {};
           try {
             for (const { sql, params } of calls) {
-              const table = tables.find((t) => sql.includes(`FROM "${t}"`));
+              // The table read first; the steps read theirs after `json_each`.
+              const table =
+                tables.find((t) => sql.includes(`FROM "${t}"`)) ??
+                tables.find((t) => sql.includes(`JOIN "${t}"`));
               if (!table) continue;
               const plan = raw
                 .prepare(`EXPLAIN QUERY PLAN ${sql.replace(/\$(\d+)/g, "?$1")}`)
@@ -1726,15 +1729,18 @@ SELECT run || '-l' || n, ${later("createdAt", "n")}, run, level, message FROM ($
           expect(plans.workflow_logs!.join(" | "), state).toMatch(
             /^SEARCH workflow_logs USING INDEX workflow_logs_workflowRunId_idx(_[0-9a-f]{8})? \(workflowRunId=\?\)/,
           );
+          // Steps: the stage list (`json_each`, `st`) outside, each stage's
+          // steps found through the stage id index inside.
           expect(plans.workflow_steps!.join(" | "), state).toMatch(
-            /^SEARCH s USING INDEX workflow_steps_stageRecordId_idx(_[0-9a-f]{8})? \(stageRecordId=\?\)/,
+            /^SCAN st VIRTUAL TABLE INDEX \d+:.* \| SEARCH s USING INDEX workflow_steps_stageRecordId_idx(_[0-9a-f]{8})? \(stageRecordId=\?\)/,
           );
-          // No scan of a table: only the group's subquery (`g`) is scanned.
+          // No scan of a table: only the group's subquery (`g`) and the
+          // steps' stage list (`st`, not a table) are scanned.
           for (const table of tables)
             expect(
               plans[table]!.join(" | "),
               `${state} (run detail ${Math.round(took)} ms): ${plans[table]!.join(" | ")}`,
-            ).not.toMatch(/SCAN (?!g( |$))/);
+            ).not.toMatch(/SCAN (?!g( |$)|st VIRTUAL TABLE )/);
         }
         console.log([...new Set(seen)].join("\n"));
       } finally {
@@ -1921,7 +1927,17 @@ SELECT run || '-l' || n, ${later("createdAt", "n")}, run, level, message FROM ($
         updatedAt: at(0),
       })),
     });
-    const detail = await reader().getRunDetail("run-many-stages");
+    const calls: RecordedStatement[] = [];
+    const detail = await createPrismaConsoleReadPort(
+      recordingClient(prisma, calls),
+      { databaseType: "sqlite", now: () => at(100) },
+    ).getRunDetail("run-many-stages");
+    // One steps statement whatever the number of stages, so a read is still
+    // at most twelve statements (the transaction limit counts on it).
+    expect(
+      calls.filter((c) => c.sql.includes('JOIN "workflow_steps"')),
+    ).toHaveLength(1);
+    expect(calls.length).toBeLessThanOrEqual(12);
     expect(detail?.stages).toHaveLength(33_000);
     expect(detail?.steps.map((s) => s.stepId)).toEqual([
       "first",
@@ -1945,52 +1961,115 @@ SELECT run || '-l' || n, ${later("createdAt", "n")}, run, level, message FROM ($
     ).toHaveLength(4);
   });
 
-  it("gives up on a transaction it is queued behind after statementTimeoutMs, and waits for it with 0, on every Prisma major", {
-    timeout: 60_000,
+  it("gives up on a transaction it is queued behind after statementTimeoutMs, and waits for it with 0, on every Prisma major, with or without the engine's adapters on the client", {
+    timeout: 120_000,
   }, async () => {
-    // Another transaction holds SQLite's one connection for 1.5 s.
-    const hold = () => {
+    // A client the engine's adapters are built on, as an application that
+    // gives the console its engine's client has: on Prisma 6 and 7 they
+    // queue every transaction's begin, outside Prisma's `maxWait`.
+    const file = join(directory, "adapters.db");
+    const engineDb: ConsolePrismaClient & Record<string, any> = isPrisma8
+      ? (() => {
+          const raw = fixture.createSqliteDb(file);
+          return Object.assign(fromPrisma8!(raw), {
+            $disconnect: () => raw.close(),
+          });
+        })()
+      : fixture.createSqliteClient(file);
+    try {
+      await engineDb.workflowRun.createMany({
+        data: [mkRun("run-day-1", at(0), "COMPLETED", "wf-a", 0, 0)],
+      });
+      const engine = await import(enginePersistence);
+      const options = { databaseType: "sqlite" as const };
+      engine.createPrismaWorkflowPersistence(engineDb, options);
+      engine.createPrismaJobQueue(engineDb, { ...options, workerId: "w" });
+      engine.createPrismaStepLedger(engineDb, options);
+      engine.createPrismaBlobStore(engineDb);
+      await queuedReads(prisma);
+      await queuedReads(engineDb);
+    } finally {
+      await engineDb.$disconnect?.();
+    }
+  });
+
+  async function queuedReads(db: ConsolePrismaClient) {
+    const reader = (statementTimeoutMs: number) =>
+      createPrismaConsoleReadPort(db, {
+        databaseType: "sqlite",
+        statementTimeoutMs,
+        now: () => at(100),
+      });
+    // Another transaction holds SQLite's one connection: it has begun (run a
+    // statement) when this resolves, and ends only on `release`.
+    const hold = async () => {
       let release!: () => void;
-      const held = new Promise<void>((r) => {
+      const released = new Promise<void>((r) => {
         release = r;
       });
-      const holder = prisma.$transaction!(
+      let began!: () => void;
+      const begun = new Promise<void>((r) => {
+        began = r;
+      });
+      const done = db.$transaction!(
         async (tx: ConsolePrismaClient) => {
           await (tx.$withColumns?.({ one: "int" }) ?? tx).$queryRawUnsafe(
             "SELECT 1 AS one",
           );
-          await held;
+          began();
+          await released;
         },
-        { timeout: 20_000 },
+        { timeout: 60_000 },
       );
-      setTimeout(release, 1_500);
-      return holder;
+      await Promise.race([begun, done]);
+      // Only bounds a failure: a read that waits for the holder (the bug)
+      // answers after this, and the assertions on it fail instead of hanging.
+      const watchdog = setTimeout(release, 10_000);
+      void done.finally(() => clearTimeout(watchdog)).catch(() => {});
+      return { release, done };
     };
-    let holder = hold();
-    let started = performance.now();
-    const error = await reader(300)
-      .getRunDetail("run-day-1")
-      .catch((e: unknown) => e);
-    expect(performance.now() - started).toBeLessThan(1_200);
-    expect(error).toBeInstanceOf(ConsoleQueryTimeoutError);
-    expect((error as ConsoleQueryTimeoutError).limit).toBe("connection");
-    await holder;
-    holder = hold();
-    started = performance.now();
+    const timedOut = (error: unknown) => {
+      expect(error).toBeInstanceOf(ConsoleQueryTimeoutError);
+      expect((error as ConsoleQueryTimeoutError).limit).toBe("connection");
+    };
+    let holder = await hold();
+    timedOut(
+      await reader(300)
+        .getRunDetail("run-day-1")
+        .catch((e: unknown) => e),
+    );
+    holder.release();
+    await holder.done;
+    holder = await hold();
     const response = await createWorkflowConsole({
       reader: reader(300),
       authorize: () => true,
     })(new Request("https://console.example/console/api/runs/run-day-1"));
     expect(response.status).toBe(504);
-    await holder;
-    // With 0 the read waits for the holder.
-    holder = hold();
-    started = performance.now();
-    const detail = await reader(0).getRunDetail("run-day-1");
-    await holder;
-    expect(detail?.run.id).toBe("run-day-1");
-    expect(performance.now() - started).toBeGreaterThan(1_000);
-  });
+    expect(await response.json()).toMatchObject({
+      error: { code: "query_timeout" },
+    });
+    holder.release();
+    await holder.done;
+    // With 0 the read waits for the holder: still pending after a bounded
+    // read queued beside it has given up, it answers once the holder ends.
+    holder = await hold();
+    let settled = false;
+    const waiting = reader(0)
+      .getRunDetail("run-day-1")
+      .finally(() => {
+        settled = true;
+      });
+    timedOut(
+      await reader(300)
+        .getRunDetail("run-day-1")
+        .catch((e: unknown) => e),
+    );
+    expect(settled).toBe(false);
+    holder.release();
+    await holder.done;
+    expect((await waiting)?.run.id).toBe("run-day-1");
+  }
 
   it("reads a run's steps in milliseconds after ANALYZE ran while the stages table held one row", {
     timeout: 170_000,

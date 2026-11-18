@@ -642,12 +642,6 @@ const SEQUENCE_MAX = 2_147_483_647;
 const MAX_STATEMENTS_PER_READ = 20;
 
 /**
- * Stages per steps statement: well under every store's parameter limit (a
- * run of more stages reads them in parts, see `readSteps`).
- */
-const STAGES_PER_STATEMENT = 1_000;
-
-/**
  * The limit a client's error says ended the read's transaction: Prisma's
  * P2028 is a transaction past its `timeout` ("expired", or `fromPrisma8`'s
  * "timeout passed"), or one not started within `maxWait` ("Unable to start
@@ -941,7 +935,8 @@ export class PrismaConsoleReadPort implements ConsoleReadPort {
         (ms > 0 || snapshot) &&
         typeof this.prisma.$transaction === "function"
       ) {
-        // `fromPrisma8` takes no `maxWait`: the port bounds the wait itself.
+        // `fromPrisma8` takes no `maxWait`: the port bounds the wait itself
+        // (and on SQLite on every major, see below).
         const shim = this.prisma.$databaseType !== undefined;
         const options = {
           ...(snapshot && postgres
@@ -979,9 +974,10 @@ export class PrismaConsoleReadPort implements ConsoleReadPort {
           );
           return result;
         }, options);
-        // On SQLite too: a read queued behind another transaction gives up
-        // after `statementTimeoutMs`, as Prisma 6 and 7's `maxWait` does.
-        if (!shim || ms === 0) return await transaction;
+        // On SQLite the port bounds the wait on every major: an engine adapter
+        // built on a Prisma 6 or 7 client queues each transaction's begin
+        // behind the one before, and that queue is outside `maxWait`.
+        if (ms === 0 || (!shim && postgres)) return await transaction;
         let timer: ReturnType<typeof setTimeout> | undefined;
         const wait = new Promise<never>((_, reject) => {
           timer = setTimeout(() => {
@@ -1445,16 +1441,16 @@ LIMIT ${eventLimit + 1}`,
    * limit: a nested loop over the stage list whose inner side is a lookup by
    * `"stageRecordId"`. A join to the stages table, or one `IN` list over the
    * stage ids, is planned as a scan of the whole steps table for a run of
-   * many stages or with no statistics. On SQLite the `IN` list names the
-   * `"stageRecordId"` index (`INDEXED BY`) and the stages' order is a `CASE`
-   * over their ids: no join, so no statistics can make the planner scan the
-   * stages table for each step (statistics taken while it held one row do).
+   * many stages or with no statistics. On SQLite the stage list is the
+   * outer side of a `CROSS JOIN` (which SQLite never reorders) and each
+   * stage's steps are found through the named `"stageRecordId"` index
+   * (`INDEXED BY`): no statistics can make the planner scan a table for each
+   * step (statistics taken while the stages table held one row planned a
+   * scan of it per step when the stages table was joined).
    *
-   * One parameter per stage on Postgres, two on SQLite, so the stages are
-   * read `STAGES_PER_STATEMENT` at a time, in order, until the page is full:
-   * a run of any number of stages stays under every store's parameter limit
-   * (65,535 in Postgres's protocol, 32,767 in Prisma 6's query engine,
-   * 32,766 in SQLite).
+   * The stage ids go as one parameter (a `text[]` on Postgres, a JSON array
+   * on SQLite), so a run of any number of stages is one statement, under
+   * every store's parameter limit.
    */
   private async readSteps(
     client: ConsolePrismaClient,
@@ -1462,62 +1458,33 @@ LIMIT ${eventLimit + 1}`,
     stepLimit: number,
     index: string | undefined,
   ): Promise<RawStepRow[]> {
-    const rows: RawStepRow[] = [];
-    for (
-      let from = 0;
-      from < stages.length && rows.length <= stepLimit;
-      from += STAGES_PER_STATEMENT
-    )
-      rows.push(
-        ...(await this.readStageSteps(
-          client,
-          stages.slice(from, from + STAGES_PER_STATEMENT),
-          stepLimit + 1 - rows.length,
-          index,
-        )),
-      );
-    return rows;
-  }
-
-  /** The first `limit` steps of `stages`, in their order, then `seq`. */
-  private async readStageSteps(
-    client: ConsolePrismaClient,
-    stages: RawStageRow[],
-    limit: number,
-    index: string | undefined,
-  ): Promise<RawStepRow[]> {
+    if (stages.length === 0) return [];
     const columns = `s.id, s."stageRecordId", s."stepId", s.seq, s.kind, s.status, s.attempt,
        s."leaseExpiresAt", s."deadlineAt", s."externalKey", s.error, s."createdAt", s."updatedAt"`;
     const ids = stages.map((stage) => stage.id);
-    if (this.databaseType === "postgresql") {
-      // The position is a number this code writes, not a value it was given.
-      const values = stages
-        .map((_, k) => `(${this.param(k + 1)}::text, ${k})`)
-        .join(", ");
+    if (this.databaseType === "postgresql")
       return this.select<RawStepRow>(
         client,
         STEP_COLUMNS,
         `SELECT ${columns}
-FROM (VALUES ${values}) AS st(id, position)
+FROM unnest(${this.param(1)}::text[]) WITH ORDINALITY AS st(id, position)
 CROSS JOIN LATERAL (
   SELECT * FROM "workflow_steps" x WHERE x."stageRecordId" = st.id
-  ORDER BY x.seq ASC LIMIT ${limit}
+  ORDER BY x.seq ASC LIMIT ${stepLimit + 1}
 ) s
 ORDER BY st.position ASC, s.seq ASC
-LIMIT ${limit}`,
-        ids,
+LIMIT ${stepLimit + 1}`,
+        [ids],
       );
-    }
-    const n = ids.length;
     return this.select<RawStepRow>(
       client,
       STEP_COLUMNS,
       `SELECT ${columns}
-FROM "workflow_steps" AS s${indexedBy(index)}
-WHERE s."stageRecordId" IN (${ids.map((_, k) => this.param(k + 1)).join(", ")})
-ORDER BY CASE s."stageRecordId" ${ids.map((_, k) => `WHEN ${this.param(n + k + 1)} THEN ${k}`).join(" ")} END ASC, s.seq ASC
-LIMIT ${limit}`,
-      [...ids, ...ids],
+FROM json_each(${this.param(1)}) AS st
+CROSS JOIN "workflow_steps" AS s${indexedBy(index)} ON s."stageRecordId" = st.value
+ORDER BY st.key ASC, s.seq ASC
+LIMIT ${stepLimit + 1}`,
+      [JSON.stringify(ids)],
     );
   }
 
