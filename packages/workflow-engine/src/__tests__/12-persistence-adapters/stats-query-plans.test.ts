@@ -1254,6 +1254,14 @@ describe.skipIf(!sqlite && !databaseUrl)(
         const phases = claim.filter((statement) =>
           CLAIM.matches(statement.sql),
         );
+        if (sqlite && expected === 0) {
+          // An idle SQLite flush reads one live row and takes no write lock.
+          expect(phases).toHaveLength(0);
+          const idle = claim.filter(({ sql }) => IDLE.matches(sql));
+          expect(idle).toHaveLength(1);
+          await expectServedBy(IDLE, idle[0]!, false);
+          return;
+        }
         expect(phases.length).toBeGreaterThan(0);
         for (const phase of phases) {
           const text = await plan(phase, false, !sqlite);

@@ -1907,7 +1907,8 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       if (!prisma.$queryRawUnsafe && !prisma.$queryRaw)
         throw new OutboxClaimUnsupportedError();
       // The SQLite claim is a write: with no live row, an idle flush takes no
-      // write lock at all.
+      // write lock at all. Pinned: statistics taken on live rows plan a scan
+      // through every published row.
       if (
         this.databaseType === "sqlite" &&
         !(
@@ -1915,7 +1916,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
             prisma,
             "sqlite",
             { id: "text" },
-            `SELECT id FROM "outbox_events" WHERE "publishedAt" IS NULL AND "dlqAt" IS NULL LIMIT 1`,
+            `SELECT id FROM "outbox_events" INDEXED BY outbox_events_live_run_sequence_idx WHERE "publishedAt" IS NULL AND "dlqAt" IS NULL LIMIT 1`,
             [],
           )
         ).length
