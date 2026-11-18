@@ -367,21 +367,41 @@ whose rows are interleaved with theirs.
   331 for 30,000; interleaved, 493 to 710 for 1,000 and 651 to 1,270 for
   30,000. The steps page reads the steps of each stage the stages statement
   returned (on Postgres one lookup per stage, as a `LATERAL` subquery; on
-  SQLite an `IN` list that names the steps' `"stageRecordId"` index): 313 to
+  SQLite an `IN` list that names the steps' `"stageRecordId"` index, ordered
+  by a `CASE` over the stage ids, with no join): 313 to
   343 pages for 1,000 steps together and 873 to 1,048 interleaved, 2,438 to
   8,483 for 30,000 together and 12,611 to 19,757 interleaved, 3,003 to 4,003
   for a run of 1,000 stages. A join to the stages table, which the console
   used before, was planned as a scan of the whole steps table with no
-  statistics, and for a run of many stages with current ones.
+  statistics, and for a run of many stages with current ones; on SQLite,
+  with statistics taken while the stages table held one row, as a scan of
+  the stages table for every step. The statement takes one parameter per
+  stage (two on SQLite), so the stages are read 1,000 at a time, in order,
+  until the page is full: a run of more stages than a statement takes
+  parameters (65,535 in Postgres's protocol, 32,767 in Prisma 6's query
+  engine, 32,766 in SQLite) reads
+  correctly, in one statement per 1,000 stages it has to look through.
 - After rows are deleted, until a vacuum, a walk of an index also visits the
-  run's deleted entries (up to 1,006 pages for an annotations page whose run
-  lost 80% of its rows).
+  run's deleted entries in its range. That costs at most a page per deleted
+  row of the run, and only when the run has fewer live rows than the walk
+  needs: in the tests, 1,006 pages for a page of annotations of one
+  1,000-row interleaved run that lost 80% of them.
 
 On SQLite every one of these statements is a `SEARCH` by an index on the run
-or on its stage ids in all four states, with the annotations walks free of a
-sort; the logs, steps and annotations statements name their index
-(`INDEXED BY`), since statistics taken while the tables held a few rows plan
-a scan of the whole table.
+or on its stage ids, with no scan of a table, in each state the tests take:
+no statistics, those of empty tables, current ones, those taken while the
+tables held seven rows, and those taken while they held one row, each then
+grown. A run detail of 30,000 steps in 20 stages, beside 6,000 other
+stages, after statistics taken while the stages table held one row, took
+4.4 to 6 s with a join to the stages table and is under a second without
+it. The
+annotations walks are free of a sort. The logs, steps and annotations
+statements name their index (`INDEXED BY`), since statistics taken while
+the tables held a few rows plan a scan of the whole table. Only a full index
+(not partial) whose leading key columns are the statement's, in the default
+collation, is named; a schema without one reads that table unnamed. When a
+named index has gone since the reader looked it up, the read runs again
+without naming one, and the next read looks the indexes up anew.
 
 The run's rows and its events are read at one moment, so a stage that ends
 between two of the read's statements is never shown as a contradiction: the
@@ -510,7 +530,13 @@ itself, as `fromPrisma8` takes no `maxWait`), comes back as HTTP 504 with a
 leaving the filter bar interactive; the error names the limit that fired.
 Each limit is capped at the longest timer Node keeps (24.8 days), so any
 `statementTimeoutMs` works. SQLite has no `statement_timeout`, so the
-console cannot cancel a running SQLite query this way.
+console cannot cancel a running SQLite query this way. A SQLite read queued
+behind another transaction (SQLite takes one at a time) gives up after
+`statementTimeoutMs` on every Prisma major, with the same HTTP 504
+`query_timeout` and a `ConsoleQueryTimeoutError` whose `limit` is
+`"connection"`: Prisma 6 and 7 through `maxWait`, Prisma 8 through the
+reader's own bound. With `statementTimeoutMs: 0` it waits for that
+transaction.
 
 The run detail's cursors need its transaction to keep one server connection:
 behind a pooler, use a transaction-scoped connection (PgBouncer's transaction

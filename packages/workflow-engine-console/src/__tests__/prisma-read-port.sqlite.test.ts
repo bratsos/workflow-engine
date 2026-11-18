@@ -1379,6 +1379,17 @@ FROM g, plan_model`;
             // 7 rows, all of one run.
             (s) => /=7 7 1(;|$)/.test(s),
           ],
+          // Analysed while the table held one row, then grown.
+          [
+            "stale at one row",
+            () => {
+              clear();
+              fill(copies("run-plan-few", 1));
+              fill("ANALYZE outbox_events");
+              load();
+            },
+            (s) => /=1 1 1(;|$)/.test(s),
+          ],
         ];
         const seen: string[] = [];
         for (const [state, setup, holds] of states) {
@@ -1440,7 +1451,7 @@ FROM g, plan_model`;
   it.skipIf(!hasNodeSqlite)(
     "plans a run's stages and annotations by the run's indexes, and its steps and logs as the docs state, in each state of the tables' statistics",
     {
-      timeout: 120_000,
+      timeout: 240_000,
     },
     async () => {
       const file = join(directory, "plan-tables.db");
@@ -1547,19 +1558,20 @@ FROM g, plan_model`;
  ELSE strftime('%Y-%m-%dT%H:%M:%f', ${column}, '+' || (${seconds}) || ' seconds') || substr(${column}, 24) END`;
         const series = (rows: number) =>
           `WITH RECURSIVE g(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM g WHERE n < ${rows})`;
-        // Runs of 20 stages and `rows` steps, annotations (three to a time)
-        // and logs each, interleaved in the tables as runs that work at once
-        // write them.
-        const copies = (runs: Array<[string, number]>) => {
+        // Runs of `stages` stages (20 unless given) and `rows` steps,
+        // annotations (three to a time) and logs each, interleaved in the
+        // tables as runs that work at once write them.
+        const copies = (runs: Array<[string, number, number?]>) => {
           const max = Math.max(...runs.map(([, n]) => n));
-          const r = `(VALUES ${runs.map(([id, n]) => `('${id}', ${n})`).join(", ")}) AS r`;
+          const most = Math.max(...runs.map(([, , s]) => s ?? 20));
+          const r = `(VALUES ${runs.map(([id, n, s]) => `('${id}', ${n}, ${s ?? 20})`).join(", ")}) AS r`;
           const each = (rows: number, where = "g.n <= r.column2") =>
-            `${series(rows)} SELECT r.column1 AS run, g.n AS n FROM g, ${r} WHERE ${where} ORDER BY g.n, r.column1`;
+            `${series(rows)} SELECT r.column1 AS run, g.n AS n, r.column3 AS stages FROM g, ${r} WHERE ${where} ORDER BY g.n, r.column1`;
           return `
 INSERT INTO workflow_stages (id, createdAt, updatedAt, version, workflowRunId, stageId, stageName, stageNumber, executionGroup, attempt, status)
-SELECT run || '-s' || n, createdAt, updatedAt, version, run, 's' || n, 'S' || n, n, n, attempt, status FROM (${each(20, "1")}), plan_model_workflow_stages;
+SELECT run || '-s' || n, createdAt, updatedAt, version, run, 's' || n, 'S' || n, n, n, attempt, status FROM (${each(most, "g.n <= r.column3")}), plan_model_workflow_stages;
 INSERT INTO workflow_steps (id, stageRecordId, stepId, seq, kind, status, attempt, createdAt, updatedAt)
-SELECT run || '-t' || n, run || '-s' || (1 + n % 20), 't' || n, n, kind, status, attempt, createdAt, updatedAt FROM (${each(max)}), plan_model_workflow_steps;
+SELECT run || '-t' || n, run || '-s' || (1 + n % stages), 't' || n, n, kind, status, attempt, createdAt, updatedAt FROM (${each(max)}), plan_model_workflow_steps;
 INSERT INTO workflow_annotations (id, createdAt, workflowRunId, attempt, scope, key, value)
 SELECT run || '-a' || n, ${later("createdAt", "n / 3")}, run, attempt, scope, 'k' || n, value FROM (${each(max)}), plan_model_workflow_annotations;
 INSERT INTO workflow_logs (id, createdAt, workflowRunId, level, message)
@@ -1621,6 +1633,30 @@ SELECT run || '-l' || n, ${later("createdAt", "n")}, run, level, message FROM ($
             },
             (s) => /=7 7(;| |$)/.test(s),
           ],
+          // Analysed while the stages table held one row and the others
+          // seven (a one-stage workflow's first run of seven steps).
+          [
+            "stale at one stage",
+            () => {
+              clear();
+              fill(copies([["run-plan-few", 7, 1]]));
+              analyze();
+              load();
+            },
+            (s) => /=7 7(;| |$)/.test(s),
+          ],
+          // Analysed while the tables held one row each (a one-stage
+          // workflow's first run), then grown.
+          [
+            "stale at one row",
+            () => {
+              clear();
+              fill(copies([["run-plan-few", 1, 1]]));
+              analyze();
+              load();
+            },
+            (s) => /=1 1(;| |$)/.test(s),
+          ],
         ];
         const seen: string[] = [];
         for (const [state, setup, holds] of states) {
@@ -1628,10 +1664,15 @@ SELECT run || '-l' || n, ${later("createdAt", "n")}, run, level, message FROM ($
           const stats = statistics();
           expect(holds(stats), `${state}: ${stats}`).toBe(true);
           const calls: RecordedStatement[] = [];
+          const started = performance.now();
           const detail = await createPrismaConsoleReadPort(
             recordingClient(db, calls),
             { databaseType: "sqlite", now: () => at(100) },
           ).getRunDetail("run-plan-30000");
+          const took = performance.now() - started;
+          seen.push(`${state}: run detail ${Math.round(took)} ms`);
+          // A plan that reads the stages table once per step takes seconds.
+          expect(took, state).toBeLessThan(2_000);
           // The page of 200 ends inside a group of three: the group is read too.
           expect(detail?.annotations).toHaveLength(200);
           expect(detail?.truncated.annotations).toBe(true);
@@ -1688,10 +1729,12 @@ SELECT run || '-l' || n, ${later("createdAt", "n")}, run, level, message FROM ($
           expect(plans.workflow_steps!.join(" | "), state).toMatch(
             /^SEARCH s USING INDEX workflow_steps_stageRecordId_idx(_[0-9a-f]{8})? \(stageRecordId=\?\)/,
           );
+          // No scan of a table: only the group's subquery (`g`) is scanned.
           for (const table of tables)
-            expect(plans[table]!.join(" | "), state).not.toMatch(
-              /SCAN (workflow_\w+|s)( |$)/,
-            );
+            expect(
+              plans[table]!.join(" | "),
+              `${state} (run detail ${Math.round(took)} ms): ${plans[table]!.join(" | ")}`,
+            ).not.toMatch(/SCAN (?!g( |$))/);
         }
         console.log([...new Set(seen)].join("\n"));
       } finally {
@@ -1835,6 +1878,368 @@ SELECT run || '-l' || n, ${later("createdAt", "n")}, run, level, message FROM ($
         String(value),
       ).rejects.toBeInstanceOf(ConsoleBadRequestError);
   });
+
+  it("reads the steps of a run with more stages than a statement takes parameters", {
+    timeout: 120_000,
+  }, async () => {
+    // 33,000 stages: past SQLite's 32,766 host parameters.
+    await prisma.workflowRun.createMany({
+      data: [mkRun("run-many-stages", at(-9_050), "RUNNING", "wf-d", 0, 0)],
+    });
+    const stages = Array.from({ length: 33_000 }, (_, i) => ({
+      id: `many-s${i + 1}`,
+      workflowRunId: "run-many-stages",
+      stageId: `s${i + 1}`,
+      stageName: `S${i + 1}`,
+      stageNumber: i + 1,
+      executionGroup: i + 1,
+      status: "COMPLETED",
+      createdAt: at(0),
+      updatedAt: at(0),
+    }));
+    for (let i = 0; i < stages.length; i += 1_000)
+      await prisma.workflowStage.createMany({
+        data: stages.slice(i, i + 1_000),
+      });
+    // Steps in the first stage and in the last ones only: a page reads on
+    // through every part of the stage list.
+    await prisma.workflowStep.createMany({
+      data: [
+        ["many-t1", "many-s1", "first", 1],
+        ["many-t3", "many-s32800", "late-2", 2],
+        ["many-t2", "many-s32800", "late-1", 1],
+        ["many-t4", "many-s33000", "last", 1],
+      ].map(([id, stageRecordId, stepId, seq]) => ({
+        id,
+        stageRecordId,
+        stepId,
+        seq,
+        kind: "run",
+        status: "completed",
+        attempt: 1,
+        createdAt: at(0),
+        updatedAt: at(0),
+      })),
+    });
+    const detail = await reader().getRunDetail("run-many-stages");
+    expect(detail?.stages).toHaveLength(33_000);
+    expect(detail?.steps.map((s) => s.stepId)).toEqual([
+      "first",
+      "late-1",
+      "late-2",
+      "last",
+    ]);
+    expect(detail?.truncated.steps).toBe(false);
+    const paged = await reader().getRunDetail("run-many-stages", {
+      stepLimit: 2,
+    });
+    expect(paged?.steps.map((s) => s.stepId)).toEqual(["first", "late-1"]);
+    expect(paged?.truncated.steps).toBe(true);
+    const response = await createWorkflowConsole({
+      reader: reader(),
+      authorize: () => true,
+    })(new Request("https://console.example/console/api/runs/run-many-stages"));
+    expect(response.status).toBe(200);
+    expect(
+      ((await response.json()) as { steps: unknown[] }).steps,
+    ).toHaveLength(4);
+  });
+
+  it("gives up on a transaction it is queued behind after statementTimeoutMs, and waits for it with 0, on every Prisma major", {
+    timeout: 60_000,
+  }, async () => {
+    // Another transaction holds SQLite's one connection for 1.5 s.
+    const hold = () => {
+      let release!: () => void;
+      const held = new Promise<void>((r) => {
+        release = r;
+      });
+      const holder = prisma.$transaction!(
+        async (tx: ConsolePrismaClient) => {
+          await (tx.$withColumns?.({ one: "int" }) ?? tx).$queryRawUnsafe(
+            "SELECT 1 AS one",
+          );
+          await held;
+        },
+        { timeout: 20_000 },
+      );
+      setTimeout(release, 1_500);
+      return holder;
+    };
+    let holder = hold();
+    let started = performance.now();
+    const error = await reader(300)
+      .getRunDetail("run-day-1")
+      .catch((e: unknown) => e);
+    expect(performance.now() - started).toBeLessThan(1_200);
+    expect(error).toBeInstanceOf(ConsoleQueryTimeoutError);
+    expect((error as ConsoleQueryTimeoutError).limit).toBe("connection");
+    await holder;
+    holder = hold();
+    started = performance.now();
+    const response = await createWorkflowConsole({
+      reader: reader(300),
+      authorize: () => true,
+    })(new Request("https://console.example/console/api/runs/run-day-1"));
+    expect(response.status).toBe(504);
+    await holder;
+    // With 0 the read waits for the holder.
+    holder = hold();
+    started = performance.now();
+    const detail = await reader(0).getRunDetail("run-day-1");
+    await holder;
+    expect(detail?.run.id).toBe("run-day-1");
+    expect(performance.now() - started).toBeGreaterThan(1_000);
+  });
+
+  it("reads a run's steps in milliseconds after ANALYZE ran while the stages table held one row", {
+    timeout: 170_000,
+  }, async () => {
+    const file = join(directory, "one-stage-statistics.db");
+    const db: ConsolePrismaClient & Record<string, any> = isPrisma8
+      ? (() => {
+          const raw = fixture.createSqliteDb(file);
+          return Object.assign(fromPrisma8!(raw), {
+            $disconnect: () => raw.close(),
+          });
+        })()
+      : fixture.createSqliteClient(file);
+    const stage = (id: string, run: string, n: number) => ({
+      id,
+      workflowRunId: run,
+      stageId: `s${n}`,
+      stageName: "S",
+      stageNumber: n,
+      executionGroup: n,
+      status: "COMPLETED",
+      createdAt: at(0),
+      updatedAt: at(0),
+    });
+    const step = (id: string, stageRecordId: string, n: number) => ({
+      id,
+      stageRecordId,
+      stepId: `x${n}`,
+      seq: n,
+      kind: "run",
+      status: "completed",
+      attempt: 1,
+      createdAt: at(0),
+      updatedAt: at(0),
+    });
+    const inParts = async (model: any, rows: unknown[]) => {
+      for (let i = 0; i < rows.length; i += 1_000)
+        await model.createMany({ data: rows.slice(i, i + 1_000) });
+    };
+    try {
+      await db.workflowRun.createMany({
+        data: ["few", "target", "others"].map((id) =>
+          mkRun(id, at(0), "RUNNING", "wf-d", 0, 0),
+        ),
+      });
+      // A one-stage workflow's first run of seven steps, analysed.
+      await db.workflowStage.createMany({ data: [stage("few-s", "few", 1)] });
+      await db.workflowStep.createMany({
+        data: Array.from({ length: 7 }, (_, i) =>
+          step(`few-t${i}`, "few-s", i + 1),
+        ),
+      });
+      await db.$executeRawUnsafe!("ANALYZE");
+      // Then a run of 20 stages and 30,000 steps beside 6,000 other stages.
+      await inParts(db.workflowStage, [
+        ...Array.from({ length: 6_000 }, (_, i) =>
+          stage(`o-s${i}`, "others", i + 1),
+        ),
+        ...Array.from({ length: 20 }, (_, i) =>
+          stage(`t-s${i}`, "target", i + 1),
+        ),
+      ]);
+      await inParts(db.workflowStep, [
+        ...Array.from({ length: 6_000 }, (_, i) =>
+          step(`o-t${i}`, `o-s${i}`, 1),
+        ),
+        ...Array.from({ length: 30_000 }, (_, i) =>
+          step(`t-t${i}`, `t-s${i % 20}`, i + 1),
+        ),
+      ]);
+      const port = createPrismaConsoleReadPort(db, {
+        databaseType: "sqlite",
+        now: () => at(100),
+      });
+      const started = performance.now();
+      const detail = await port.getRunDetail("target");
+      const took = performance.now() - started;
+      expect(detail?.steps).toHaveLength(200);
+      // The first stage's steps, by seq: 1, 21, 41, ...
+      expect(detail?.steps.slice(0, 3).map((s) => s.stepId)).toEqual([
+        "x1",
+        "x21",
+        "x41",
+      ]);
+      // A plan that scans the stages table for every step took 4.4 s here.
+      expect(took).toBeLessThan(1_000);
+    } finally {
+      await db.$disconnect?.();
+    }
+  });
+
+  it.skipIf(!hasNodeSqlite)(
+    "names only an index that serves the statement, and reads on when an index is dropped after it was looked up",
+    { timeout: 120_000 },
+    async () => {
+      const file = join(directory, "indexes.db");
+      const db: ConsolePrismaClient & Record<string, any> = isPrisma8
+        ? (() => {
+            const raw = fixture.createSqliteDb(file);
+            return Object.assign(fromPrisma8!(raw), {
+              $disconnect: () => raw.close(),
+            });
+          })()
+        : fixture.createSqliteClient(file);
+      const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite");
+      const sql = (statement: string) => {
+        const raw = new DatabaseSync(file);
+        try {
+          raw.exec(statement);
+        } finally {
+          raw.close();
+        }
+      };
+      // The engine's index on these columns, whatever its name (Prisma 8
+      // adds a hash).
+      const engineIndex = (table: string, column: string) => {
+        const raw = new DatabaseSync(file);
+        try {
+          return raw
+            .prepare(
+              `SELECT l.name AS name FROM pragma_index_list('${table}') l
+WHERE (SELECT group_concat(name) FROM pragma_index_info(l.name)) = '${column}' AND l."unique" = 0`,
+            )
+            .get().name as string;
+        } finally {
+          raw.close();
+        }
+      };
+      try {
+        await db.workflowRun.createMany({
+          data: [mkRun("run-idx", at(0), "RUNNING", "wf-d", 0, 0)],
+        });
+        await db.workflowStage.createMany({
+          data: [1, 2].map((n) => ({
+            id: `idx-s${n}`,
+            workflowRunId: "run-idx",
+            stageId: `s${n}`,
+            stageName: `S${n}`,
+            stageNumber: n,
+            executionGroup: n,
+            status: "COMPLETED",
+            createdAt: at(0),
+            updatedAt: at(0),
+          })),
+        });
+        await db.workflowStep.createMany({
+          data: [2, 1].map((n) => ({
+            id: `idx-t${n}`,
+            stageRecordId: `idx-s${n}`,
+            stepId: `t${n}`,
+            seq: 1,
+            kind: "run",
+            status: "completed",
+            attempt: 1,
+            createdAt: at(0),
+            updatedAt: at(0),
+          })),
+        });
+        await db.workflowLog.createMany({
+          data: [1, 2].map((n) => ({
+            id: `idx-l${n}`,
+            workflowRunId: "run-idx",
+            level: "INFO",
+            message: `m${n}`,
+            createdAt: at(n),
+          })),
+        });
+        const read = async (
+          port: ReturnType<typeof createPrismaConsoleReadPort>,
+        ) => {
+          const detail = await port.getRunDetail("run-idx");
+          return [
+            detail?.steps.map((s) => s.stepId),
+            detail?.logs.map((l) => l.id),
+          ];
+        };
+        const expected = [
+          ["t1", "t2"],
+          ["idx-l2", "idx-l1"],
+        ];
+        // A port and the statements it ran; a read that ran again without
+        // naming an index ran the stages statement twice.
+        const port = () => {
+          const calls: RecordedStatement[] = [];
+          const reader = createPrismaConsoleReadPort(
+            recordingClient(db, calls),
+            {
+              databaseType: "sqlite",
+              now: () => at(100),
+            },
+          );
+          const runs = () => {
+            const runs = calls.filter((c) =>
+              c.sql.includes('FROM "workflow_stages" WHERE "workflowRunId"'),
+            ).length;
+            const named = calls
+              .map((c) => /INDEXED BY "(\w+)"/.exec(c.sql)?.[1])
+              .filter(Boolean);
+            calls.length = 0;
+            return { runs, named };
+          };
+          return { reader, runs };
+        };
+        // The engine's unique (stageRecordId, stepId) index, which serves
+        // (on Prisma 8 a table constraint's automatic index).
+        const unique = expect.stringMatching(
+          /^(workflow_steps_stageRecordId_stepId_key|sqlite_autoindex_workflow_steps_\d+$)/,
+        );
+        // Indexes that cannot serve, and would be picked first for their
+        // single column: a partial one, and one in another collation. None
+        // is named, and the read does not fail on one first.
+        sql(`DROP INDEX "${engineIndex("workflow_steps", "stageRecordId")}";
+DROP INDEX "${engineIndex("workflow_logs", "workflowRunId")}";
+CREATE INDEX a_partial ON workflow_steps (stageRecordId) WHERE status = 'never';
+CREATE INDEX a_nocase ON workflow_logs (workflowRunId COLLATE NOCASE);`);
+        const first = port();
+        expect(await read(first.reader)).toEqual(expected);
+        expect(first.runs()).toEqual({
+          runs: 1,
+          named: [unique, expect.stringMatching(/^workflow_annotations_/)],
+        });
+        // Indexes that serve (one with a further column), looked up by a
+        // port, then dropped.
+        sql(`CREATE INDEX back_steps ON workflow_steps (stageRecordId, seq);
+CREATE INDEX back_logs ON workflow_logs (workflowRunId);`);
+        const cached = port();
+        expect(await read(cached.reader)).toEqual(expected);
+        expect(cached.runs().named).toEqual([
+          "back_steps",
+          expect.stringMatching(/^workflow_annotations_/),
+          "back_logs",
+        ]);
+        sql("DROP INDEX back_steps; DROP INDEX back_logs;");
+        // No permanent failure: this read runs again without naming an
+        // index, and the next ones look the indexes up anew.
+        expect(await read(cached.reader)).toEqual(expected);
+        expect(cached.runs().runs).toBe(2);
+        for (let i = 0; i < 3; i++) {
+          expect(await read(cached.reader)).toEqual(expected);
+          expect(cached.runs()).toEqual({
+            runs: 1,
+            named: [unique, expect.stringMatching(/^workflow_annotations_/)],
+          });
+        }
+      } finally {
+        await db.$disconnect?.();
+      }
+    },
+  );
 
   it("cuts a lifecycle event's error text in SQL and says it was cut", async () => {
     const { events } = (await reader().getRunDetail("run-long-error"))!

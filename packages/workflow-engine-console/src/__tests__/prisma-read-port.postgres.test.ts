@@ -1935,7 +1935,9 @@ WHERE n.nspname = 'console_plan_statistics' AND c.relkind = 'r'`,
       timeout: 60_000,
     }, async () => {
       const failure = new Error("the client failed");
-      for (const after of ["DECLARE", "FETCH"]) {
+      // After the server ran the DECLARE, after the FETCH, and in place of
+      // the CLOSE (the client fails before sending it).
+      for (const after of ["DECLARE", "FETCH", "CLOSE"]) {
         await prisma.$transaction(
           async (tx: ConsolePrismaClient) => {
             let thrown = 0;
@@ -1958,6 +1960,12 @@ WHERE n.nspname = 'console_plan_statistics' AND c.relkind = 'r'`,
                 )
                   throw failure;
               },
+              async (sql) => {
+                if (after === "CLOSE" && sql.startsWith("CLOSE ") && !thrown) {
+                  thrown++;
+                  throw failure;
+                }
+              },
             );
             const port = createPrismaConsoleReadPort(failing, {
               now: () => at(100),
@@ -1974,6 +1982,74 @@ WHERE n.nspname = 'console_plan_statistics' AND c.relkind = 'r'`,
           { timeout: 30_000 },
         );
       }
+    });
+
+    it("names its cursors apart from those of another copy of the module on the same client", async () => {
+      // A duplicated bundle: a second instance of the module, its own counter.
+      const specifier = "../prisma-read-port.ts?second-copy";
+      const copy: typeof import("../prisma-read-port") = await import(
+        /* @vite-ignore */ specifier
+      );
+      const calls: RecordedStatement[] = [];
+      const recorded = recordingClient(client, calls);
+      const ports = [
+        createPrismaConsoleReadPort(recorded, { now: () => at(100) }),
+        copy.createPrismaConsoleReadPort(recorded, { now: () => at(100) }),
+      ];
+      const details = [];
+      for (let i = 0; i < 3; i++)
+        for (const port of ports)
+          details.push(await port.getRunDetail("run-1"));
+      for (const detail of details) expect(detail).toEqual(details[0]);
+      const names = calls
+        .filter((c) => c.sql.startsWith("DECLARE "))
+        .map((c) => c.sql.split(" ")[1]);
+      expect(names.length).toBeGreaterThanOrEqual(12);
+      expect(new Set(names).size).toBe(names.length);
+    });
+
+    it("reads the steps of a run with more stages than a statement takes parameters", {
+      timeout: 120_000,
+    }, async () => {
+      // 66,000 stages: past the 65,535 parameters of Postgres's protocol
+      // (and Prisma 6's 32,767).
+      await prisma.workflowRun.createMany({
+        data: [mkRun("run-many-stages", at(-9_050), "RUNNING", "wf-d")],
+      });
+      await prisma.$executeRawUnsafe(
+        `INSERT INTO workflow_stages (id, "updatedAt", "workflowRunId", "stageId", "stageName", "stageNumber", "executionGroup", status)
+SELECT 'many-s' || k, now(), 'run-many-stages', 's' || k, 'S' || k, k, k, 'COMPLETED'::"Status"
+FROM generate_series(1, 66000) k`,
+      );
+      // Steps in the first stage and in the last ones only: a page reads on
+      // through every part of the stage list.
+      await prisma.$executeRawUnsafe(
+        `INSERT INTO workflow_steps (id, "stageRecordId", "stepId", seq, kind, status, "updatedAt")
+VALUES ('many-t1', 'many-s1', 'first', 1, 'run', 'completed', now()),
+       ('many-t3', 'many-s65800', 'late-2', 2, 'run', 'completed', now()),
+       ('many-t2', 'many-s65800', 'late-1', 1, 'run', 'completed', now()),
+       ('many-t4', 'many-s66000', 'last', 1, 'run', 'completed', now())`,
+      );
+      const detail = await reader().getRunDetail("run-many-stages");
+      expect(detail?.stages).toHaveLength(66_000);
+      expect(detail?.steps.map((s) => s.stepId)).toEqual([
+        "first",
+        "late-1",
+        "late-2",
+        "last",
+      ]);
+      expect(detail?.truncated.steps).toBe(false);
+      const paged = await reader().getRunDetail("run-many-stages", {
+        stepLimit: 2,
+      });
+      expect(paged?.steps.map((s) => s.stepId)).toEqual(["first", "late-1"]);
+      expect(paged?.truncated.steps).toBe(true);
+      const response = await http(reader(), "run-many-stages");
+      expect(response.status).toBe(200);
+      expect(
+        ((await response.json()) as { steps: Array<{ stepId: string }> }).steps
+          .length,
+      ).toBe(4);
     });
 
     it("refuses an afterSequence that is not a number at the port", async () => {

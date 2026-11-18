@@ -625,6 +625,10 @@ function mapCostBucket(row: RawCostRow): CostBucket {
  */
 const NO_LIMIT_MS = 2_147_483_647;
 let cursorCount = 0;
+// Drawn once per copy of this module: two copies (a duplicated bundle) on
+// one connection never name a cursor, or its FETCH text, alike. Prisma 6
+// caches a prepared statement by its text with the columns it returned.
+const cursorPrefix = `workflow_console_${Math.random().toString(36).slice(2, 10).padEnd(8, "0")}`;
 /** The largest value of `outbox_events.sequence` (an `Int`). */
 const SEQUENCE_MAX = 2_147_483_647;
 
@@ -636,6 +640,12 @@ const SEQUENCE_MAX = 2_147_483_647;
  * transaction may last as long as its statements may run.
  */
 const MAX_STATEMENTS_PER_READ = 20;
+
+/**
+ * Stages per steps statement: well under every store's parameter limit (a
+ * run of more stages reads them in parts, see `readSteps`).
+ */
+const STAGES_PER_STATEMENT = 1_000;
 
 /**
  * The limit a client's error says ended the read's transaction: Prisma's
@@ -658,6 +668,13 @@ function transactionLimitOf(
   return /unable to start a transaction/i.test(message)
     ? "connection"
     : "transaction";
+}
+
+/** SQLite refused an `INDEXED BY`: the index is gone or cannot serve. */
+function isIndexError(error: unknown): boolean {
+  return /no such index|no query solution/i.test(
+    String((error as Error | undefined)?.message ?? error),
+  );
 }
 
 /** ` INDEXED BY "<index>"` for SQLite, or nothing. */
@@ -789,7 +806,7 @@ export class PrismaConsoleReadPort implements ConsoleReadPort {
     )
       return this.select<T>(client, columns, sql, params);
     // Unique per statement: two reads may share a caller's transaction.
-    const name = `workflow_console_first_rows_${++cursorCount}`;
+    const name = `${cursorPrefix}_${++cursorCount}`;
     let rows: T[];
     try {
       await client.$executeRawUnsafe(
@@ -802,11 +819,11 @@ export class PrismaConsoleReadPort implements ConsoleReadPort {
         `FETCH ALL FROM ${name}`,
         [],
       );
+      await client.$executeRawUnsafe(`CLOSE ${name}`);
     } catch (error) {
       if (!fromServer(error)) await this.closeIfOpen(client, name);
       throw error;
     }
-    await client.$executeRawUnsafe(`CLOSE ${name}`);
     return rows;
   }
 
@@ -962,6 +979,8 @@ export class PrismaConsoleReadPort implements ConsoleReadPort {
           );
           return result;
         }, options);
+        // On SQLite too: a read queued behind another transaction gives up
+        // after `statementTimeoutMs`, as Prisma 6 and 7's `maxWait` does.
         if (!shim || ms === 0) return await transaction;
         let timer: ReturnType<typeof setTimeout> | undefined;
         const wait = new Promise<never>((_, reject) => {
@@ -1263,6 +1282,40 @@ WHERE "workflowRunId" = ${this.param(1)} AND sequence > ${this.param(2)} AND seq
     // many interactive transactions to render one page would take as many
     // connections out of the consumer's pool, and a stage that changes
     // between two of them would read as rows and events that disagree.
+    // On SQLite an index named by `INDEXED BY` that no longer serves (dropped
+    // or changed since it was looked up) fails the statement: the read runs
+    // again with no index named, and the next read looks the indexes up anew.
+    try {
+      return await this.readRunDetail(runId, options, true, {
+        stepLimit,
+        annotationLimit,
+        logLimit,
+        eventLimit,
+      });
+    } catch (error) {
+      if (this.databaseType !== "sqlite" || !isIndexError(error)) throw error;
+      this.indexes = undefined;
+      return this.readRunDetail(runId, options, false, {
+        stepLimit,
+        annotationLimit,
+        logLimit,
+        eventLimit,
+      });
+    }
+  }
+
+  private readRunDetail(
+    runId: string,
+    options: RunDetailOptions | undefined,
+    named: boolean,
+    limits: {
+      stepLimit: number;
+      annotationLimit: number;
+      logLimit: number;
+      eventLimit: number;
+    },
+  ): Promise<RunDetail | null> {
+    const { stepLimit, annotationLimit, logLimit, eventLimit } = limits;
     return this.read(
       "run.detail",
       async (client, inTransaction) => {
@@ -1318,7 +1371,7 @@ ORDER BY "stageNumber" ASC, "stageId" ASC`,
           [runId],
         );
 
-        const hints = await this.sqliteIndexes(client);
+        const hints = named ? await this.sqliteIndexes(client) : {};
         const stepRows = await this.readSteps(
           client,
           stageRows,
@@ -1393,9 +1446,15 @@ LIMIT ${eventLimit + 1}`,
    * `"stageRecordId"`. A join to the stages table, or one `IN` list over the
    * stage ids, is planned as a scan of the whole steps table for a run of
    * many stages or with no statistics. On SQLite the `IN` list names the
-   * `"stageRecordId"` index (`INDEXED BY`) and `CROSS JOIN` keeps the steps
-   * the outer side, since statistics taken while the tables were small plan
-   * a scan of both. One parameter per stage.
+   * `"stageRecordId"` index (`INDEXED BY`) and the stages' order is a `CASE`
+   * over their ids: no join, so no statistics can make the planner scan the
+   * stages table for each step (statistics taken while it held one row do).
+   *
+   * One parameter per stage on Postgres, two on SQLite, so the stages are
+   * read `STAGES_PER_STATEMENT` at a time, in order, until the page is full:
+   * a run of any number of stages stays under every store's parameter limit
+   * (65,535 in Postgres's protocol, 32,767 in Prisma 6's query engine,
+   * 32,766 in SQLite).
    */
   private async readSteps(
     client: ConsolePrismaClient,
@@ -1403,7 +1462,30 @@ LIMIT ${eventLimit + 1}`,
     stepLimit: number,
     index: string | undefined,
   ): Promise<RawStepRow[]> {
-    if (stages.length === 0) return [];
+    const rows: RawStepRow[] = [];
+    for (
+      let from = 0;
+      from < stages.length && rows.length <= stepLimit;
+      from += STAGES_PER_STATEMENT
+    )
+      rows.push(
+        ...(await this.readStageSteps(
+          client,
+          stages.slice(from, from + STAGES_PER_STATEMENT),
+          stepLimit + 1 - rows.length,
+          index,
+        )),
+      );
+    return rows;
+  }
+
+  /** The first `limit` steps of `stages`, in their order, then `seq`. */
+  private async readStageSteps(
+    client: ConsolePrismaClient,
+    stages: RawStageRow[],
+    limit: number,
+    index: string | undefined,
+  ): Promise<RawStepRow[]> {
     const columns = `s.id, s."stageRecordId", s."stepId", s.seq, s.kind, s.status, s.attempt,
        s."leaseExpiresAt", s."deadlineAt", s."externalKey", s.error, s."createdAt", s."updatedAt"`;
     const ids = stages.map((stage) => stage.id);
@@ -1419,23 +1501,23 @@ LIMIT ${eventLimit + 1}`,
 FROM (VALUES ${values}) AS st(id, position)
 CROSS JOIN LATERAL (
   SELECT * FROM "workflow_steps" x WHERE x."stageRecordId" = st.id
-  ORDER BY x.seq ASC LIMIT ${stepLimit + 1}
+  ORDER BY x.seq ASC LIMIT ${limit}
 ) s
 ORDER BY st.position ASC, s.seq ASC
-LIMIT ${stepLimit + 1}`,
+LIMIT ${limit}`,
         ids,
       );
     }
+    const n = ids.length;
     return this.select<RawStepRow>(
       client,
       STEP_COLUMNS,
       `SELECT ${columns}
 FROM "workflow_steps" AS s${indexedBy(index)}
-CROSS JOIN "workflow_stages" AS st ON st.id = s."stageRecordId"
 WHERE s."stageRecordId" IN (${ids.map((_, k) => this.param(k + 1)).join(", ")})
-ORDER BY st."stageNumber" ASC, st."stageId" ASC, s.seq ASC
-LIMIT ${stepLimit + 1}`,
-      ids,
+ORDER BY CASE s."stageRecordId" ${ids.map((_, k) => `WHEN ${this.param(n + k + 1)} THEN ${k}`).join(" ")} END ASC, s.seq ASC
+LIMIT ${limit}`,
+      [...ids, ...ids],
     );
   }
 
@@ -1539,7 +1621,11 @@ LIMIT ${limit - newer}`,
    * their columns (Prisma 8 adds a hash to an index's name). Statistics
    * taken while a table held a few rows plan a run's lookup as a scan of
    * the whole table; naming the index leaves the planner no other choice.
-   * A schema without one of them reads that table unnamed. Read once.
+   * Only a full index (not partial) whose leading key columns are the
+   * statement's, by plain column and the default collation, can serve it;
+   * the one with the fewest key columns is named. A schema without one
+   * reads that table unnamed. Read once, and again after a statement fails
+   * on an index (see `getRunDetail`).
    */
   private sqliteIndexes(
     client: ConsolePrismaClient,
@@ -1548,16 +1634,28 @@ LIMIT ${limit - newer}`,
     this.indexes ??= this.select<{ tbl: string; name: string; cols: string }>(
       client,
       { tbl: "text", name: "text", cols: "text" },
-      `SELECT m.tbl_name AS tbl, m.name AS name,
-       (SELECT group_concat(name, ',') FROM (SELECT name FROM pragma_index_info(m.name) ORDER BY seqno)) AS cols
-FROM sqlite_master m
-WHERE m.type = 'index' AND m.tbl_name IN ('workflow_annotations', 'workflow_logs', 'workflow_steps')
-ORDER BY m.name`,
+      // An expression key column has no name; another collation is written
+      // after the column, so neither matches a plain column name.
+      `SELECT t.tbl AS tbl, l.name AS name,
+       (SELECT group_concat(coalesce(x.name, '(expression)') || CASE WHEN x.coll = 'BINARY' THEN '' ELSE ' ' || x.coll END, ',')
+        FROM (SELECT * FROM pragma_index_xinfo(l.name) WHERE key = 1 ORDER BY seqno) x) AS cols
+FROM (SELECT 'workflow_annotations' AS tbl UNION ALL SELECT 'workflow_logs' UNION ALL SELECT 'workflow_steps') t,
+     pragma_index_list(t.tbl) l
+WHERE l.partial = 0
+ORDER BY l.name`,
       [],
     ).then(
       (rows) => {
         const find = (table: string, cols: string) =>
-          rows.find((row) => row.tbl === table && row.cols === cols)?.name;
+          rows
+            .filter(
+              (row) =>
+                row.tbl === table &&
+                (row.cols === cols || row.cols?.startsWith(`${cols},`)),
+            )
+            .sort(
+              (a, b) => a.cols.split(",").length - b.cols.split(",").length,
+            )[0]?.name;
         return {
           annotations: find("workflow_annotations", "workflowRunId,createdAt"),
           logs: find("workflow_logs", "workflowRunId"),
