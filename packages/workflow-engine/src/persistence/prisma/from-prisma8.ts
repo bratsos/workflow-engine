@@ -758,7 +758,7 @@ const EQUALITY = ["equals", "not"];
 const LISTED = [...EQUALITY, "in", "notIn"];
 const ORDERED = [...LISTED, "lt", "lte", "gt", "gte"];
 const OPERATORS: Record<string, string[]> = {
-  [TEXT]: [...ORDERED, "startsWith"],
+  [TEXT]: [...ORDERED, "startsWith", "endsWith"],
   [INT4]: ORDERED,
   [FLOAT8]: ORDERED,
   [TIMESTAMP]: ORDERED,
@@ -788,10 +788,14 @@ function operator(q: Sql, c: Column, ref: string, op: string, x: unknown) {
         )
         .t(")");
     }
-  } else if (op === "startsWith") {
+  } else if (op === "startsWith" || op === "endsWith") {
     accept(c, x);
     // A LIKE pattern, as on 6 and 7: `%`, `_` and backslash keep their meaning.
-    q.t(`${ref} LIKE (`).v(x, castOf(c)).t(" || '%')");
+    q.t(`${ref} LIKE (`);
+    if (op === "endsWith") q.t("'%' || ");
+    q.v(x, castOf(c));
+    if (op === "startsWith") q.t(" || '%'");
+    q.t(")");
   } else if (x === null && kindOf(c) !== JSONB) {
     accept(c, x, c.nullable && EQUALITY.includes(op));
     q.t(`${ref} IS ${op === "not" ? "NOT " : ""}NULL`);
@@ -1713,6 +1717,7 @@ export function fromPrisma8(
         return sqlite ? "sqlite" : "postgresql";
       },
       ...delegates.get(x),
+      $inTransaction: inTransaction,
       ...(inTransaction || !root ? {} : { $transaction: transaction }),
       $queryRaw: (strings: TemplateStringsArray, ...values: any[]) =>
         rawRead(template(strings, values, sqlite)),

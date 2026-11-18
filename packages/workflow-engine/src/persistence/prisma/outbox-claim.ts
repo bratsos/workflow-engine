@@ -48,14 +48,44 @@ export interface OutboxClaimPage {
   after?: string;
   through?: string;
   signal?: Pick<AbortSignal, "aborted">;
+  firstRank: string;
+}
+
+// The prefix sorts acquisition order independently of the lease duration.
+export const firstOutboxRotation = "r0000000000000000";
+
+export function nextOutboxRotation(previous: string | undefined): string {
+  const rank = previous ? BigInt(previous.slice(1, 17)) : 0n;
+  return `r${(rank + 1n).toString().padStart(16, "0")}`;
+}
+
+export function outboxClaimExpiry(stored: string): string {
+  return stored.startsWith("r") ? stored.slice(18, 42) : stored.slice(0, 24);
+}
+
+export function releasedOutboxClaim(stored: string | null): string | null {
+  return stored?.startsWith("r") ? stored.slice(0, 18) : null;
+}
+
+// Keep the ranked cursor probe independent of the head walk. The statement
+// snapshot supplies the rank even if another adapter advanced the cursor
+// between the caller's cursor read and the acquisition.
+function outboxRank(sqlite: boolean, offset: string) {
+  const index = sqlite ? "INDEXED BY outbox_events_delivery_cursor_idx" : "";
+  const previous = `(SELECT CAST(substr("deliveryClaim", 2, 16) AS BIGINT)
+    FROM "outbox_events" ${index} WHERE "deliveryClaim" >= '${firstOutboxRotation}'
+    ORDER BY "deliveryClaim" DESC, "workflowRunId" DESC LIMIT 1)`;
+  const rank = `COALESCE(${previous}, 0) + ${offset}`;
+  return sqlite
+    ? `printf('r%016d|', ${rank}) || $3`
+    : `'r' || lpad((${rank})::text, 16, '0') || '|' || $3`;
 }
 
 const live = '"publishedAt" IS NULL AND "dlqAt" IS NULL';
 const headOrder = '"publishedAt", "dlqAt", "workflowRunId", sequence';
 
-function pageBindings(page: OutboxClaimPage, sqlite = false) {
-  const args: (string | number)[] = [page.limit, page.deadline];
-  if (sqlite) args.push(page.claim);
+function pageBindings(page: OutboxClaimPage) {
+  const args: (string | number)[] = [page.limit, page.deadline, page.claim];
   const bind = (value: string) => `$${args.push(value)}`;
   const start =
     page.after === undefined ? "" : `AND "workflowRunId" > ${bind(page.after)}`;
@@ -77,17 +107,22 @@ function pageBindings(page: OutboxClaimPage, sqlite = false) {
 }
 
 function noActiveClaim(run: string, index = "") {
-  // Normally the head carries the lease. After replay, its already claimed
-  // successor may still carry it. Seek to the live lease in either case.
-  return `(
+  const probe = (range: string, order: string) => `(
     SELECT "deliveryClaim" FROM "outbox_events" ${index}
-    WHERE ${live} AND "workflowRunId" = ${run} AND "deliveryClaim" > $2
-    ORDER BY "publishedAt", "dlqAt", "workflowRunId", "deliveryClaim" LIMIT 1
-  ) IS NULL`;
+    WHERE ${live} AND "workflowRunId" = ${run} AND ${range}
+    ORDER BY "publishedAt" ${order}, "dlqAt" ${order}, "workflowRunId" ${order},
+      "deliveryClaim" ${order} LIMIT 1
+  )`;
+  // New claims sort by acquisition rank. Only the latest could still be
+  // live, even after replay restored an older predecessor.
+  const latest = probe(`"deliveryClaim" >= '${firstOutboxRotation}'`, "DESC");
+  const legacy = probe(`"deliveryClaim" > $2 AND "deliveryClaim" < 'r'`, "ASC");
+  return `(COALESCE(substr(${latest}, 19, 24), '') <= substr($2, 1, 24)
+    AND ${legacy} IS NULL)`;
 }
 
 export function sqliteOutboxClaim(page: OutboxClaimPage) {
-  const { args, head, start, eligible } = pageBindings(page, true);
+  const { args, head, start, eligible } = pageBindings(page);
   const primary = "INDEXED BY sqlite_autoindex_outbox_events_1";
   const run = 'e."workflowRunId"';
   const available = `(${eligible(run)} ${noActiveClaim(run, "INDEXED BY outbox_events_delivery_run_idx")})`;
@@ -103,25 +138,31 @@ export function sqliteOutboxClaim(page: OutboxClaimPage) {
       WHERE walk.served < $1 AND e.id = (
         ${probe('AND "workflowRunId" > walk.run_id')}
       )
-    )
-    UPDATE "outbox_events" ${primary} SET "deliveryClaim" = $3
-    WHERE id IN (SELECT id FROM walk WHERE available)
+    ), chosen AS MATERIALIZED (SELECT id, served FROM walk WHERE available)
+    UPDATE "outbox_events" ${primary} SET "deliveryClaim" =
+      (${outboxRank(true, '(SELECT served FROM chosen WHERE chosen.id = "outbox_events".id)')})
+    WHERE id IN (SELECT id FROM chosen)
     RETURNING *`,
     args,
   };
 }
 
-export function postgresOutboxCandidates(page: OutboxClaimPage) {
+export function postgresOutboxClaim(
+  page: OutboxClaimPage,
+  returnRows: boolean,
+) {
   const { args, head, start, eligible } = pageBindings(page);
-  // Serialize competing claims for the same run, even if a replay changed
-  // which row one of them saw as its head. The first retained row is a lock
-  // target only. It need not be live, and appending does not lock it.
+  // The first retained event serializes claims even when a replay changes
+  // the head. Updating the anchor changes its tuple version (xmin). A
+  // contender with an older statement snapshot cannot claim using that
+  // version, even after the winning statement commits and unlocks it.
   const locks = `LEFT JOIN LATERAL (
-    SELECT e.id FROM "outbox_events" e
-    WHERE e.id = (
-      SELECT id FROM "outbox_events" WHERE "workflowRunId" = head."workflowRunId"
+    SELECT e.id FROM (
+      SELECT id, xmin FROM "outbox_events" WHERE "workflowRunId" = head."workflowRunId"
       ORDER BY sequence LIMIT 1
-    ) AND ${eligible('head."workflowRunId"')} ${noActiveClaim('head."workflowRunId"')}
+    ) snapshot JOIN "outbox_events" e
+      ON e.id = snapshot.id AND e.xmin = snapshot.xmin
+    WHERE ${eligible('head."workflowRunId"')} ${noActiveClaim('head."workflowRunId"')}
     FOR UPDATE OF e SKIP LOCKED
   ) anchor ON true
   LEFT JOIN LATERAL (
@@ -130,44 +171,52 @@ export function postgresOutboxCandidates(page: OutboxClaimPage) {
     FOR UPDATE OF e SKIP LOCKED
   ) locked ON true`;
   return {
-    sql: `WITH RECURSIVE walk(run_id, id, served) AS (
-      SELECT head."workflowRunId", locked.id, (locked.id IS NOT NULL)::int
+    sql: `WITH RECURSIVE walk(run_id, id, anchor, served) AS (
+      SELECT head."workflowRunId", locked.id, anchor.id, (locked.id IS NOT NULL)::int
       FROM (${head(start)}) head ${locks}
       UNION ALL
-      SELECT head."workflowRunId", locked.id, walk.served + (locked.id IS NOT NULL)::int
+      SELECT head."workflowRunId", locked.id, anchor.id, walk.served + (locked.id IS NOT NULL)::int
       FROM walk CROSS JOIN LATERAL (
         ${head('AND "workflowRunId" > walk.run_id')}
       ) head ${locks}
       WHERE walk.served < $1
+    ), chosen AS MATERIALIZED (
+      SELECT id, anchor, served FROM walk WHERE id IS NOT NULL
+    )${returnRows ? ", updated AS (" : ""}
+    UPDATE "outbox_events" e SET "deliveryClaim" =
+      CASE WHEN e.id = ANY(ARRAY(SELECT id FROM chosen))
+        THEN (${outboxRank(false, "(SELECT served FROM chosen WHERE chosen.id = e.id)")})
+        ELSE e."deliveryClaim" END
+    WHERE e.id = ANY(ARRAY(SELECT id FROM chosen UNION ALL SELECT anchor FROM chosen))
+    ${
+      returnRows
+        ? `RETURNING e.*
     )
-    SELECT id, run_id AS "workflowRunId" FROM walk
-    WHERE id IS NOT NULL ORDER BY served`,
+    SELECT updated.* FROM updated JOIN chosen USING (id) ORDER BY chosen.served`
+        : ""
+    }`,
     args,
   };
 }
 
-export function postgresOutboxWrite(
-  page: OutboxClaimPage,
-  candidates: readonly { id: string; workflowRunId: string }[],
-) {
-  // READ COMMITTED gives this statement a fresh snapshot after the locks.
-  // A competitor can acquire and release the anchor between our initial
-  // snapshot and lock acquisition. Check both the head and the lease again.
-  return {
-    sql: `UPDATE "outbox_events" SET "deliveryClaim" = $1
-    WHERE id = ANY(ARRAY(
-      SELECT candidate.id FROM unnest($3::text[], $4::text[]) candidate(id, "workflowRunId")
-      WHERE candidate.id = (
-        SELECT id FROM "outbox_events" WHERE ${live}
-          AND "workflowRunId" = candidate."workflowRunId"
-        ORDER BY ${headOrder} LIMIT 1
-      ) AND ${noActiveClaim('candidate."workflowRunId"')}
-    )) RETURNING *`,
-    args: [
-      page.claim,
-      page.deadline,
-      candidates.map(({ id }) => id),
-      candidates.map(({ workflowRunId }) => workflowRunId),
-    ],
-  };
+export async function executeOutboxSql(
+  prisma: EnginePrismaClient,
+  sql: string,
+  args: readonly unknown[],
+): Promise<void> {
+  if (prisma.$executeRawUnsafe) {
+    await prisma.$executeRawUnsafe(sql, ...args);
+    return;
+  }
+  const parts = sql.split(/\$(\d+)/);
+  const strings = [parts[0]!];
+  const values: unknown[] = [];
+  for (let i = 1; i < parts.length; i += 2) {
+    values.push(args[Number(parts[i]) - 1]);
+    strings.push(parts[i + 1]!);
+  }
+  await prisma.$executeRaw!(
+    Object.assign(strings, { raw: strings }),
+    ...values,
+  );
 }

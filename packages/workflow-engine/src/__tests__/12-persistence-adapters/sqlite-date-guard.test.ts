@@ -17,6 +17,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { z } from "zod";
+import { defineWorkflow } from "../../core/workflow.js";
 import { createKernel, runMaintenanceTick } from "../../kernel/index.js";
 import {
   CollectingEventSink,
@@ -164,6 +166,36 @@ describe("sqlite date guard: the check", () => {
         verifySqliteDates(client, sqliteDateGuard(client)),
       ).resolves.toBeUndefined();
     }
+  });
+
+  it("treats bound REAL and stored INTEGER as the same numeric format", async () => {
+    const { client } = fakeClient(() => probe("integer", "integer", "real"));
+    await expect(assertSqliteDateStorage(client)).resolves.toBeUndefined();
+  });
+
+  it("refuses a numeric writer on empty TEXT-affinity tables", async () => {
+    const { client } = fakeClient(() =>
+      probe(
+        "null",
+        "null",
+        "integer",
+        [null, null, "0"],
+        [
+          {
+            col: "affinity",
+            lo: "text",
+            loValue: "TEXT",
+            hi: "text",
+            hiValue: "TEXT",
+          },
+        ],
+      ),
+    );
+    await expect(assertSqliteDateStorage(client)).rejects.toMatchObject({
+      code: "SQLITE_DATE_STORAGE_MISMATCH",
+      kind: "affinity",
+      column: "workflow_runs.createdAt",
+    });
   });
 
   it("looks at the other indexed date columns too, and says which one differs", async () => {
@@ -524,6 +556,63 @@ describe.skipIf(!sqlite)(`sqlite date guard on Prisma ${major}`, () => {
       },
       has: (t, key) => !hidden.includes(String(key)) && Reflect.has(t, key),
     });
+
+  const schema = z.object({});
+  const workflow = defineWorkflow("guard-create", { input: schema })
+    .stage("stage", {
+      schemas: { input: schema, output: schema, config: schema },
+      async execute() {
+        return { output: {} };
+      },
+    })
+    .build();
+
+  const createOver = (client: any) =>
+    createKernel({
+      persistence: createPrismaWorkflowPersistence(client, {
+        databaseType: "sqlite",
+      }),
+      eventSink: new CollectingEventSink(),
+      jobTransport: createPrismaJobQueue(client, { databaseType: "sqlite" }),
+      blobStore: new InMemoryBlobStore(),
+      clock: new FakeClock(),
+      registry: { getWorkflow: () => workflow },
+    });
+
+  it.skipIf(major !== "7").each([
+    ["full", []],
+    ["tagged", ["$queryRawUnsafe"]],
+    ["unsafe", ["$queryRaw"]],
+  ] as [string, string[]][])(
+    "creates with unixepoch-ms over a %s client, and refuses an ISO writer before acquiring its key",
+    async (shape, hidden) => {
+      const file = join(directory, `numeric-${shape}.db`);
+      const numeric = fixtures.createSqliteClient(
+        file,
+        {},
+        { timestampFormat: "unixepoch-ms" },
+      );
+      clients.push(numeric);
+      const dispatch = (client: any, idempotencyKey: string) =>
+        createOver(without(client, hidden)).dispatch({
+          type: "run.create",
+          workflowId: workflow.id,
+          input: {},
+          idempotencyKey,
+        });
+      await expect(dispatch(numeric, "numeric-create")).resolves.toMatchObject({
+        status: "PENDING",
+      });
+      expect(await classOf(numeric, "createdAt")).toBe("integer");
+      const iso = await open(file, true);
+      await expect(dispatch(iso, "foreign-create")).rejects.toBeInstanceOf(
+        SqliteDateStorageError,
+      );
+      expect(
+        await numeric.idempotencyKey.findMany({ select: { key: true } }),
+      ).toEqual([{ key: "numeric-create" }]);
+    },
+  );
 
   /** A view of `client` whose first raw probes reject with the supplied causes. */
   const failingProbes = (target: any, ...causes: unknown[]): any => {

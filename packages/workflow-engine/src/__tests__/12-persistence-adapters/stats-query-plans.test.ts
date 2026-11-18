@@ -141,10 +141,22 @@ const UNPUBLISHED: Expectation = {
   matches: (sql) =>
     /ORDER BY/i.test(sql) &&
     sql.includes("outbox_events") &&
-    !CLAIM.matches(sql),
+    !CLAIM.matches(sql) &&
+    !ROTATION.matches(sql),
   index:
     "outbox_events_(publishedAt_idx|live_run_sequence_idx|delivery_run_idx)",
   not: "outbox_events_dlqAt_idx",
+};
+
+const ROTATION: Expectation = {
+  name: "latest recorded outbox rotation",
+  matches: (sql) =>
+    /ORDER BY[^;]*["`]deliveryClaim["`] DESC[^;]*["`]workflowRunId["`] DESC/i.test(
+      sql,
+    ) &&
+    sql.includes("outbox_events") &&
+    !CLAIM.matches(sql),
+  index: "outbox_events_delivery_cursor_idx",
 };
 
 /** A statement of the engine's: one that names an engine table. */
@@ -360,7 +372,7 @@ describe.skipIf(!sqlite && !databaseUrl)(
         sqlite
           ? new RegExp(`USING (COVERING )?INDEX ${expectation.index}`)
           : new RegExp(
-              `(Index (Only )?Scan using|Bitmap Index Scan on) "?${expectation.index}`,
+              `(Index (Only )?Scan (Backward )?using|Bitmap Index Scan on) "?${expectation.index}`,
             ),
       );
       expect(text, message).not.toMatch(
@@ -374,11 +386,39 @@ describe.skipIf(!sqlite && !databaseUrl)(
     async function expectStatsPlans(
       forceIndex = true,
       connectionCheck = false,
+      readShape?: "$queryRaw" | "$queryRawUnsafe",
     ) {
+      const expose = (target: typeof client): typeof client =>
+        new Proxy(target, {
+          get(prisma, key) {
+            if (
+              (key === "$queryRaw" || key === "$queryRawUnsafe") &&
+              key !== readShape
+            )
+              return undefined;
+            if (key === "$withColumns" && prisma.$withColumns)
+              return (...args: unknown[]) =>
+                expose(prisma.$withColumns(...args));
+            return Reflect.get(prisma, key, prisma);
+          },
+        });
+      const view = readShape ? expose(client) : client;
+      const options = {
+        databaseType: sqlite ? ("sqlite" as const) : ("postgresql" as const),
+      };
+      const statsPort = readShape
+        ? createPrismaWorkflowPersistence(view, options)
+        : persistence;
+      const jobPort = readShape ? createPrismaJobQueue(view, options) : queue;
+      if (readShape) {
+        // Verify dates outside the capture so only the stats statements are explained.
+        await statsPort.getActiveWorkStats(new Date());
+        await jobPort.getJobStats();
+      }
       const captured = await record(() =>
         Promise.all([
-          persistence.getActiveWorkStats(new Date()),
-          queue.getJobStats(),
+          statsPort.getActiveWorkStats(new Date()),
+          jobPort.getJobStats(),
           // What a driver's own connection check looks like in the log.
           ...(connectionCheck
             ? [rawFor(client, { n: "int" }).$queryRawUnsafe("SELECT 1 AS n")]
@@ -420,6 +460,8 @@ describe.skipIf(!sqlite && !databaseUrl)(
       for (const s of candidates) await expectServedBy(CLAIM, s, forceIndex);
       for (const s of captured.filter((item) => UNPUBLISHED.matches(item.sql)))
         await expectServedBy(UNPUBLISHED, s, forceIndex);
+      for (const s of captured.filter((item) => ROTATION.matches(item.sql)))
+        await expectServedBy(ROTATION, s, forceIndex);
     }
 
     async function expectDeliveryWritePlans(
@@ -854,8 +896,11 @@ describe.skipIf(!sqlite && !databaseUrl)(
           });
 
           it.skipIf(!sqlite)(
-            "serves every stats query from its index (SQLite)",
-            () => expectStatsPlans(false),
+            "serves each stats count from its index on both SQLite single-read shapes",
+            async () => {
+              await expectStatsPlans(false, false, "$queryRaw");
+              await expectStatsPlans(false, false, "$queryRawUnsafe");
+            },
           );
 
           it.skipIf(!sqlite)(
@@ -1160,6 +1205,12 @@ describe.skipIf(!sqlite && !databaseUrl)(
             ).toBe(true);
           }
         }
+        for (const statement of claim.filter(({ sql }) =>
+          ROTATION.matches(sql),
+        )) {
+          if (sqlite || expected !== 0)
+            await expectServedBy(ROTATION, statement, false);
+        }
         const phases = claim.filter((statement) =>
           CLAIM.matches(statement.sql),
         );
@@ -1182,7 +1233,9 @@ ${text}`;
               /outbox_events_delivery_run_idx.*deliveryClaim>\?/,
             );
           } else {
-            expect(sharedBuffers(text), message).toBeLessThan(500);
+            // The atomic claim includes the anchor writes and the rotation
+            // read as well as the probes. The bound stays fixed at ten heads.
+            expect(sharedBuffers(text), message).toBeLessThan(850);
           }
         }
       }

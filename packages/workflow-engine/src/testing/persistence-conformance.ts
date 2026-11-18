@@ -1947,15 +1947,21 @@ export function persistenceConformanceSuite(
         );
         expect(second?.sequence).toBe(2);
         expect(await persistence.replayDLQEvents(1)).toBe(1);
+        expect(
+          await persistence.claimOutboxDelivery(10, peer, now, []),
+        ).toHaveLength(0);
         await append("ready", 1);
         const other = await persistence.claimOutboxDelivery(1, peer, now, []);
         expect(other.map((row) => row.workflowRunId)).toEqual(["ready"]);
         expect(
+          await persistence.completeOutboxDelivery(other[0]!.id, peer, now),
+        ).toBe(true);
+        expect(
           await persistence.isOutboxDeliveryClaimActive(second!.id, token, now),
         ).toBe(true);
         expect(
-          await persistence.failOutboxDelivery(second!.id, token, 2, now),
-        ).toBe("retry");
+          await persistence.completeOutboxDelivery(second!.id, token, now),
+        ).toBe(true);
         const [replayed] = await persistence.claimOutboxDelivery(
           1,
           peer,
@@ -1967,6 +1973,19 @@ export function persistenceConformanceSuite(
           sequence: 1,
           retryCount: 0,
         });
+        expect(
+          await persistence.claimOutboxDelivery(10, token, now, []),
+        ).toHaveLength(0);
+        expect(
+          await persistence.completeOutboxDelivery(replayed!.id, peer, now),
+        ).toBe(true);
+        const successor = await persistence.claimOutboxDelivery(
+          10,
+          token,
+          now,
+          [],
+        );
+        expect(successor.map(({ sequence }) => sequence)).toEqual([3]);
       });
 
       it("marks real caller transaction views as deferred for delivery", async () => {

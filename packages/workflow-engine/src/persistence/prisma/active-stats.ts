@@ -24,10 +24,10 @@ import {
   emptyActiveStatusCounts,
   isActiveStatus,
 } from "../interface";
+import { readOutboxSql } from "./outbox-claim";
 import {
   type EnginePrismaClient,
   type PrismaDelegate,
-  rawFor,
 } from "./prisma-client-type";
 
 /** A date a raw SQLite read returned: Prisma 6 gives the stored integer, 7 the stored text, 8 a `Date`. */
@@ -55,15 +55,17 @@ export async function countActiveByStatus(
   byStatus: ActiveStatusCounts;
   oldestPendingCreatedAt: Date | null;
 }> {
-  if (sqlite?.prisma.$queryRawUnsafe) {
-    const rows = await rawFor(sqlite.prisma, {
-      status: "text",
-      n: "bigint",
-      oldest: "timestamp",
-    }).$queryRawUnsafe!<
-      { status: string; n: bigint | number; oldest: unknown }[]
-    >(
+  if (sqlite) {
+    const rows = await readOutboxSql<{
+      status: string;
+      n: bigint | number;
+      oldest: unknown;
+    }>(
+      sqlite.prisma,
+      "sqlite",
+      { status: "text", n: "bigint", oldest: "timestamp" },
       `SELECT "status" AS status, COUNT(*) AS n, ${withOldestPending ? `MIN("createdAt")` : "NULL"} AS oldest FROM "${sqlite.table}" WHERE likelihood("status" IN (${ACTIVE_STATUSES.map((s) => `'${s}'`).join(", ")}), ${SQLITE_RARE}) GROUP BY "status"`,
+      [],
     );
     const byStatus = emptyActiveStatusCounts();
     let oldestPendingCreatedAt: Date | null = null;

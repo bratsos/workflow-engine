@@ -1015,13 +1015,15 @@ export interface PersistenceCore {
   readonly outboxDeliveryDeferred?: boolean;
 
   /**
-   * Claim an indexed page of eligible run heads. `claim` is an ISO UTC
+   * Claim an indexed page with at most one eligible head per run. The sink
+   * may receive several runs in a page concurrently. `claim` is an ISO UTC
    * expiry, `|`, and a unique owner ID. Store it atomically without changing
    * `publishedAt`, and return each row's state at acquisition, including its
    * retry count. A live predecessor blocks its successors at acquisition.
    * Replay can make an earlier event eligible after a successor was claimed.
    * Skip excluded runs and page past blocked runs without reading their tails.
-   * Rotate after the last run served so a retry cannot starve other runs.
+   * Keep the rotation position in the store so retries cannot starve
+   * other runs even when each flush uses a fresh adapter.
    * Do not start another claim write after the signal is aborted.
    */
   claimOutboxDelivery(

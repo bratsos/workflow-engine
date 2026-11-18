@@ -318,10 +318,14 @@ class NodeHostImpl implements NodeHost {
   private async verifyThenBegin(lifecycle: number): Promise<void> {
     await this.jobTransport.verifyStorage?.();
     if (this.running || lifecycle !== this.lifecycle) return;
-    this.begin();
+    this.begin(lifecycle);
   }
 
-  private begin(): void {
+  private isCurrent(lifecycle: number): boolean {
+    return this.running && lifecycle === this.lifecycle;
+  }
+
+  private begin(lifecycle: number): void {
     this.running = true;
     this.startTime = Date.now();
 
@@ -343,15 +347,26 @@ class NodeHostImpl implements NodeHost {
 
     // Start orchestration timer
     this.orchestrationTimer = setInterval(
-      () => this.startOrchestrationTick(),
+      () => this.startOrchestrationTick(lifecycle),
       this.orchestrationIntervalMs,
     );
 
     // Immediate first tick
-    this.startOrchestrationTick();
+    if (this.tickInFlight) {
+      void this.tickInFlight.then(() => this.startOrchestrationTick(lifecycle));
+    } else {
+      this.startOrchestrationTick(lifecycle);
+    }
 
     // Start job processing loop (runs until stop())
-    this.jobLoop = this.processJobs();
+    // A timed-out dequeue or job can still be settling from the last start.
+    // Queue its replacement behind it so we never have two job loops.
+    const loop = (this.jobLoop ?? Promise.resolve())
+      .then(() => this.processJobs(lifecycle))
+      .finally(() => {
+        if (this.jobLoop === loop) this.jobLoop = null;
+      });
+    this.jobLoop = loop;
 
     // Signal handlers — use wrapper functions so we can remove them on stop
     const onSignal = () => void this.stop();
@@ -390,15 +405,15 @@ class NodeHostImpl implements NodeHost {
     // next. A tick cut short here leaves its claimed suspended stages on
     // their poll lease; the next poller picks them up when it elapses. The
     // `onTick` call in flight shares that bound; none starts after this point.
+    const jobLoop = this.jobLoop;
     const winding = [this.tickInFlight, this.hookInFlight].filter(
       (call) => call !== null,
     );
     if (winding.length > 0) {
       await withTimeout(Promise.all(winding), this.shutdownTimeoutMs);
     }
-    if (this.jobLoop) {
-      await withTimeout(this.jobLoop, this.shutdownTimeoutMs);
-      this.jobLoop = null;
+    if (jobLoop) {
+      await withTimeout(jobLoop, this.shutdownTimeoutMs);
     }
     if (this.flushOutboxOnStop) {
       await this.flushOutbox();
@@ -459,9 +474,9 @@ class NodeHostImpl implements NodeHost {
    * overlap the next tick in the same process. `orchestrationTicks` counts
    * only ticks that ran.
    */
-  private startOrchestrationTick(): void {
-    if (this.tickInFlight) return;
-    this.tickInFlight = this.orchestrationTick()
+  private startOrchestrationTick(lifecycle: number): void {
+    if (this.tickInFlight || !this.isCurrent(lifecycle)) return;
+    this.tickInFlight = this.orchestrationTick(lifecycle)
       .catch((error) => {
         console.error("[NodeHost] orchestration tick error:", error);
       })
@@ -481,7 +496,7 @@ class NodeHostImpl implements NodeHost {
     return this.serves ?? this.kernel.servedDefinitions?.();
   }
 
-  private async orchestrationTick(): Promise<void> {
+  private async orchestrationTick(lifecycle: number): Promise<void> {
     this.orchestrationTicks++;
 
     // Claim pending runs, poll suspended stages, reap stale leases, flush
@@ -490,11 +505,10 @@ class NodeHostImpl implements NodeHost {
     // which returns them to its caller) — see runMaintenanceTick in
     // @bratsos/workflow-engine/kernel for the shared command sequence.
     const host = this;
-    const timer = this.orchestrationTimer;
     const counts = await runMaintenanceTickCommands(this.kernel, {
       outboxFlushSignal: {
         get aborted() {
-          return !host.running || host.orchestrationTimer !== timer;
+          return !host.isCurrent(lifecycle);
         },
       },
       workerId: this.workerId,
@@ -508,6 +522,7 @@ class NodeHostImpl implements NodeHost {
       ...(this.retention !== undefined ? { retention: this.retention } : {}),
       logPrefix: "[NodeHost]",
     });
+    if (!this.isCurrent(lifecycle)) return;
     if (!counts.outboxDeferred) {
       this.eventSinkMonitor.observe({
         failed: counts.eventsFailed,
@@ -518,7 +533,7 @@ class NodeHostImpl implements NodeHost {
           : {}),
       });
     }
-    this.startTickHook(counts);
+    this.startTickHook(counts, lifecycle);
   }
 
   /**
@@ -527,8 +542,11 @@ class NodeHostImpl implements NodeHost {
    * skips the hook and, the first time in a row, says so. None starts once
    * `stop()` has begun.
    */
-  private startTickHook(counts: MaintenanceTickCounts): void {
-    if (!this.onTick || !this.running) return;
+  private startTickHook(
+    counts: MaintenanceTickCounts,
+    lifecycle: number,
+  ): void {
+    if (!this.onTick || !this.isCurrent(lifecycle)) return;
     if (this.hookInFlight) {
       this.hookSkippedDuringCall = true;
       if (!this.hookSkipLogged) {
@@ -546,7 +564,8 @@ class NodeHostImpl implements NodeHost {
     const hook = this.onTick;
     this.hookInFlight = Promise.resolve()
       .then(() => {
-        if (this.running) return runTickHook(hook, counts, "[NodeHost]");
+        if (this.isCurrent(lifecycle))
+          return runTickHook(hook, counts, "[NodeHost]");
       })
       .finally(() => {
         this.hookInFlight = null;
@@ -558,7 +577,7 @@ class NodeHostImpl implements NodeHost {
   // Job processing loop
   // --------------------------------------------------------------------------
 
-  private async processJobs(): Promise<void> {
+  private async processJobs(lifecycle: number): Promise<void> {
     // Run of the job this loop completed last, and whether the queue has
     // since handed it work from a different run. Together they separate
     // "I am following the run I just advanced" (yield, so another worker
@@ -568,12 +587,13 @@ class NodeHostImpl implements NodeHost {
     let lastRunId: string | null = null;
     let drainingBacklog = false;
 
-    while (this.running) {
+    while (this.isCurrent(lifecycle)) {
       try {
         const serves = this.dequeueServes();
         const job = await this.jobTransport.dequeue(
           serves !== undefined ? { serves } : undefined,
         );
+        if (!this.isCurrent(lifecycle)) return;
 
         if (!job) {
           lastRunId = null;

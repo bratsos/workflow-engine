@@ -91,6 +91,9 @@ describe("kernel: dead-lettering an event across a crash", () => {
         },
       ]);
     }
+    const first = (await persistence.getUnpublishedOutboxEvents(3)).find(
+      (row) => row.workflowRunId === "write-error-0",
+    )!;
     if (operation === "publication") heal();
     (eventSink as { maxRetries: number }).maxRetries =
       operation === "dead letter" ? 1 : 3;
@@ -98,11 +101,13 @@ describe("kernel: dead-lettering an event across a crash", () => {
     const fail = persistence.failOutboxDelivery.bind(persistence);
     if (operation === "publication") {
       persistence.completeOutboxDelivery = async (...args) => {
+        if (args[0] !== first.id) return complete(...args);
         if (committed) await complete(...args);
         throw new Error("injected publication write error");
       };
     } else {
       persistence.failOutboxDelivery = async (...args) => {
+        if (args[0] !== first.id) return fail(...args);
         if (committed) await fail(...args);
         throw new Error("injected failure write error");
       };
@@ -118,13 +123,13 @@ describe("kernel: dead-lettering an event across a crash", () => {
     }
     heal();
     expect((await flush()).published).toBe(
-      operation === "retry release" && committed ? 1 : 0,
+      operation === "retry release" ? (committed ? 3 : 2) : 0,
     );
-    if (operation === "dead letter" && committed)
+    if (operation === "dead letter")
       expect(
         (await kernel.dispatch({ type: "plugin.replayDLQ", maxEvents: 10 }))
           .replayed,
-      ).toBe(1);
+      ).toBe(committed ? 3 : 2);
     clock.advance(60_001);
     await flush();
     expect(await persistence.getUnpublishedOutboxEvents(10)).toHaveLength(0);

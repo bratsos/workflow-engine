@@ -200,7 +200,7 @@ describe("kernel: outbox.flush", () => {
     expect(delivered).toEqual(["workflow:created"]);
   });
 
-  it("does not start the next sink call when its batch claim has expired", async () => {
+  it("does not start the next sink call when its preceding claim has expired", async () => {
     const workflow = createSimpleWorkflow();
     let started!: () => void;
     let unblock!: () => void;
@@ -211,25 +211,35 @@ describe("kernel: outbox.flush", () => {
       unblock = resolve;
     });
     const seen: string[] = [];
-    const { kernel, clock } = createTestKernel<EventSink>([workflow], {
-      eventSink: {
-        async emit(event) {
-          seen.push(event.workflowRunId);
-          if (seen.length === 1) {
-            started();
-            await blocked;
-          }
+    const { kernel, clock, persistence } = createTestKernel<EventSink>(
+      [workflow],
+      {
+        eventSink: {
+          async emit(event) {
+            seen.push(event.workflowRunId);
+            if (seen.length === 1) {
+              started();
+              await blocked;
+            }
+          },
         },
       },
+    );
+    const created = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "slow-first",
+      workflowId: "test-workflow",
+      input: { data: "slow-first" },
     });
-    for (const key of ["slow-first", "slow-second"]) {
-      await kernel.dispatch({
-        type: "run.create",
-        idempotencyKey: key,
-        workflowId: "test-workflow",
-        input: { data: key },
-      });
-    }
+    await persistence.appendOutboxEvents([
+      {
+        workflowRunId: created.workflowRunId,
+        eventType: "workflow:created",
+        payload: { workflowRunId: created.workflowRunId },
+        causationId: "slow-second",
+        occurredAt: clock.now(),
+      },
+    ]);
     const flush = kernel.dispatch({
       type: "outbox.flush",
       claimDurationMs: 1_000,

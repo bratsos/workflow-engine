@@ -6,9 +6,9 @@
  * Deduplicate by the outbox event ID. Run ID and sequence order events, but
  * SQL deletion of the newest rows can let the store reuse a sequence.
  *
- * Order is decided when the run head is claimed. A live predecessor blocks
- * successors then. A dead letter replayed after a successor was claimed can
- * arrive later. The engine's progress is independent of the sink.
+ * Order is decided at claim time. A replayed dead letter follows successors
+ * already claimed or published. Unclaimed successors wait behind it after
+ * replay. The engine's progress is independent of the sink.
  * Nothing in the engine deletes outbox rows; run.purge leaves them, and
  * an operator can remove them with SQL. For a purged run, a flush skips a
  * live claim until completion or expiry, skips published rows, and skips
@@ -73,7 +73,7 @@ export async function handleOutboxFlush(
     return false;
   };
 
-  flush: while (attempted < limit && !interrupted()) {
+  while (attempted < limit && !interrupted()) {
     // Start the lease before awaiting the database, so there is one deadline
     // shared by the stored owner token and every pre-emit expiry check.
     const now = deps.clock.now();
@@ -87,47 +87,65 @@ export async function handleOutboxFlush(
       command.signal,
     );
     if (interrupted(expiresAt) || !events.length) break;
-    for (const event of events) {
-      attempted++;
-      if (interrupted(expiresAt)) break flush;
-      const active = await deps.persistence.isOutboxDeliveryClaimActive(
-        event.id,
-        claim,
-        deps.clock.now(),
-      );
-      if (interrupted(expiresAt)) break flush;
-      if (!active) {
-        stopAfterPage = true;
-        continue;
-      }
-      try {
-        await deps.eventSink.emit(event.payload as KernelEvent, {
-          eventId: event.id,
-          workflowRunId: event.workflowRunId,
-          sequence: event.sequence,
-          attempt: event.retryCount + 1,
-        });
-      } catch (error) {
-        stopAfterPage = true;
-        const outcome = await deps.persistence.failOutboxDelivery(
-          event.id,
-          claim,
-          maxRetries,
-          deps.clock.now(),
-        );
-        firstError ??= toErrorMessage(error);
-        if (outcome === "dead-lettered") deadLettered++;
-        if (outcome === "retry") failed++;
-        continue;
-      }
-      if (
-        await deps.persistence.completeOutboxDelivery(
+    attempted += events.length;
+    // Finish the ownership reads before invoking any sink. Otherwise a
+    // slow sink can leave the page to expire while another run is still
+    // awaiting its ownership read.
+    const ownership = await Promise.allSettled(
+      events.map((event) =>
+        deps.persistence.isOutboxDeliveryClaimActive(
           event.id,
           claim,
           deps.clock.now(),
+        ),
+      ),
+    );
+    if (interrupted(expiresAt)) break;
+
+    // A page has at most one head per run. Start independent deliveries
+    // without waiting for another run's sink call to settle.
+    const results = await Promise.allSettled(
+      events.map(async (event, index) => {
+        const check = ownership[index]!;
+        if (check.status === "rejected") throw check.reason;
+        if (interrupted(expiresAt)) return;
+        const active = check.value;
+        if (!active) {
+          stopAfterPage = true;
+          return;
+        }
+        try {
+          await deps.eventSink.emit(event.payload as KernelEvent, {
+            eventId: event.id,
+            workflowRunId: event.workflowRunId,
+            sequence: event.sequence,
+            attempt: event.retryCount + 1,
+          });
+        } catch (error) {
+          stopAfterPage = true;
+          const outcome = await deps.persistence.failOutboxDelivery(
+            event.id,
+            claim,
+            maxRetries,
+            deps.clock.now(),
+          );
+          firstError ??= toErrorMessage(error);
+          if (outcome === "dead-lettered") deadLettered++;
+          if (outcome === "retry") failed++;
+          return;
+        }
+        if (
+          await deps.persistence.completeOutboxDelivery(
+            event.id,
+            claim,
+            deps.clock.now(),
+          )
         )
-      )
-        published++;
+          published++;
+      }),
+    );
+    for (const result of results) {
+      if (result.status === "rejected") throw result.reason;
     }
     // Finish the page but leave retries for the next flush. This avoids
     // repeatedly scanning failed heads to find independent work.

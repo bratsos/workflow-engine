@@ -125,6 +125,82 @@ describe.skipIf(!sqlite && !databaseUrl)(
       await client.outboxEvent.deleteMany();
     });
 
+    it("keeps a timed-out dequeue and tick with the start that created them", async () => {
+      const latch = () => {
+        let release!: () => void;
+        const wait = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        return { release, wait };
+      };
+      const persistence = store(client);
+      await seed(persistence, "first-generation");
+      const queue = createPrismaJobQueue(client, {
+        databaseType: sqlite ? "sqlite" : "postgresql",
+      });
+      const oldDequeue = latch();
+      const oldTick = latch();
+      const release = latch();
+      const notified = latch();
+      const calls: number[] = [];
+      let dequeues = 0;
+      const dequeue = queue.dequeue.bind(queue);
+      queue.dequeue = async (...args) => {
+        if (++dequeues === 1) {
+          oldDequeue.release();
+          await release.wait;
+        }
+        return dequeue(...args);
+      };
+      const kernel = createKernel({
+        persistence,
+        jobTransport: queue,
+        blobStore: new InMemoryBlobStore(),
+        clock: new FakeClock(),
+        registry: { getWorkflow: () => undefined },
+        eventSink: { async emit() {} },
+      });
+      const dispatch = kernel.dispatch.bind(kernel);
+      let first = true;
+      kernel.dispatch = async (command) => {
+        if (command.type === "run.reapStuck" && first) {
+          first = false;
+          oldTick.release();
+          await release.wait;
+        }
+        return dispatch(command);
+      };
+      const host = createNodeHost({
+        kernel,
+        jobTransport: queue,
+        workerId: "generations",
+        orchestrationIntervalMs: 60_000,
+        jobPollIntervalMs: 2,
+        flushOutboxOnStop: false,
+        shutdownTimeoutMs: 10,
+        onTick(counts) {
+          calls.push(counts.eventsFlushed);
+          notified.release();
+        },
+      });
+      try {
+        await host.start();
+        await Promise.all([oldDequeue.wait, oldTick.wait]);
+        await host.stop();
+        await host.start();
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        expect(dequeues).toBe(1);
+        release.release();
+        await notified.wait;
+        expect(calls).toEqual([0]);
+        expect(host.getStats().orchestrationTicks).toBe(2);
+      } finally {
+        release.release();
+        await host.stop();
+        await client.outboxEvent.deleteMany();
+      }
+    });
+
     it.each([
       false,
       true,

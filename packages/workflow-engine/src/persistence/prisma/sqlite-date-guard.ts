@@ -74,16 +74,18 @@ export class SqliteDateStorageError extends Error {
     /** What this client binds for a `Date`, described the same way. */
     readonly bound: string,
     /** `"class"`: integer against text. `"form"`: both text, written differently. */
-    readonly kind: "class" | "form" = "class",
+    readonly kind: "class" | "form" | "affinity" = "class",
     /** The date column the difference was found in, as `table.column`. */
     readonly column?: string,
   ) {
     const why =
       kind === "class"
         ? "SQLite orders every integer before every text value, so each date comparison the engine sends (run.purge retention, run.reapStuck, suspended-stage polls, job leases) would be decided by the type and not by the time, and the engine would purge, reap or poll the wrong rows."
-        : "Two ISO text forms agree except at an exact instant, where the suffix decides (`+00:00` sorts before `Z`): a deadline, retention or stuck-run threshold that equals a stored time is compared wrongly, and an exact-time lookup finds nothing.";
+        : kind === "affinity"
+          ? "The table has TEXT affinity, so it would store numeric dates as text. Use a fresh file before switching to a numeric timestamp driver."
+          : "Two ISO text forms agree except at an exact instant, where the suffix decides (`+00:00` sorts before `Z`): a deadline, retention or stuck-run threshold that equals a stored time is compared wrongly, and an exact-time lookup finds nothing.";
     super(
-      `This SQLite file stores dates as ${stored}${column ? ` (in ${column})` : ""}, but this Prisma client binds them as ${bound}: the file was written by a different Prisma major (Prisma 6 stores integer epoch milliseconds, Prisma 7 ISO text ending in +00:00, Prisma 8 ISO text ending in Z). ${why} Nothing was read or written. Use the Prisma major that created the file, or start the new major from a fresh SQLite file and migrate the application data into it. See ${SQLITE_DATE_STORAGE_DOCS}`,
+      `This SQLite file stores dates as ${stored}${column ? ` (in ${column})` : ""}, but this Prisma client binds them as ${bound}: the file uses a different Prisma major or SQLite timestamp format. ${why} Nothing was read or written. Use the Prisma major that created the file, or start the new major from a fresh SQLite file and migrate the application data into it. See ${SQLITE_DATE_STORAGE_DOCS}`,
     );
     this.name = "SqliteDateStorageError";
   }
@@ -180,6 +182,11 @@ const PROBE_SQL = [
   sample("outbox_events", "occurredAt"),
   sample("idempotency_keys", "createdAt"),
   sample("ai_calls", "createdAt"),
+  // A drained Prisma 8 file retains TEXT affinity across intermediate
+  // major switches. Reject a numeric writer before it inserts its first key.
+  `SELECT 'affinity', 'text', type, 'text', type FROM pragma_table_info('workflow_runs')
+    WHERE name = 'createdAt' AND instr(upper(type), 'INT') = 0
+      AND (instr(upper(type), 'TEXT') > 0 OR instr(upper(type), 'CHAR') > 0 OR instr(upper(type), 'CLOB') > 0)`,
   `SELECT 'bound', typeof(b.d), CAST(b.d AS TEXT), typeof(b.d), CAST(b.d AS TEXT) FROM (SELECT $1 AS d) AS b`,
 ].join("\n    UNION ALL\n    ");
 
@@ -229,6 +236,9 @@ const form = (value: string) => value.replace(/[0-9]/g, "9");
 const describe = (kind: string, value: string | null) =>
   kind === "text" && value !== null ? `text like ${value}` : kind;
 
+/** INTEGER and REAL are ordered together as numbers by SQLite. */
+const numeric = (kind: string) => kind === "integer" || kind === "real";
+
 /**
  * Compares the probe's answer. Throws {@link SqliteDateStorageError} for a date
  * of another class or form; returns whether any stored date was seen (a
@@ -244,13 +254,28 @@ function judge(rows: Probe[]): boolean {
   let seen = false;
   for (const row of rows) {
     if (row === bound) continue;
+    if (row.col === "affinity") {
+      if (numeric(bound.lo))
+        throw new SqliteDateStorageError(
+          `${row.loValue} affinity`,
+          bound.lo,
+          "affinity",
+          "workflow_runs.createdAt",
+        );
+      continue;
+    }
     const ends = [
       { kind: row.lo, value: row.loValue },
       { kind: row.hi, value: row.hiValue },
     ].filter((end) => end.kind !== "null");
     if (ends.length > 0) seen = true;
-    // Integer against text, or the other way round.
-    const other = ends.find((end) => end.kind !== bound.lo);
+    // SQLite compares both numeric storage classes as numbers. The
+    // better-sqlite3 adapter can bind a REAL that DATETIME affinity stores
+    // as an INTEGER, without changing the value or its ordering.
+    const other = ends.find(
+      (end) =>
+        end.kind !== bound.lo && !(numeric(end.kind) && numeric(bound.lo)),
+    );
     if (other !== undefined) {
       throw new SqliteDateStorageError(other.kind, bound.lo, "class", row.col);
     }

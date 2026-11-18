@@ -895,6 +895,7 @@ if (!DATABASE_URL) {
       const REJECTED = isPrisma8 ? /^fromPrisma8: / : /./;
 
       const FILTERS: Array<[string, unknown, string]> = [
+        ["endsWith", { workflowName: { endsWith: "b" } }, "a,b,c,d"],
         ["no where", undefined, ALL],
         [
           "in with quotes, commas and NULL as text",
@@ -1310,7 +1311,6 @@ if (!DATABASE_URL) {
           { startedAt: "2026-01-01T02:00:00.000+02:00" },
         ],
         ["contains", { workflowName: { contains: "b" } }],
-        ["endsWith", { workflowName: { endsWith: "b" } }],
         ["mode", { workflowName: { startsWith: "a", mode: "insensitive" } }],
         ["lt on JSON", { metadata: { lt: 1 } }],
         ["a JSON path with not", { metadata: { path: ["k"], not: 1 } }],

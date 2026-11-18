@@ -99,6 +99,8 @@ export interface EnginePrismaClient {
    * member).
    */
   $transaction?(arg: any, options?: any): Promise<any>;
+  /** Explicit marker for a caller-owned transaction view. */
+  readonly $inTransaction?: boolean;
   /**
    * Raw parameterized SELECT (tagged template). Optional -- the two
    * Postgres-only call sites that need it (`claimNextPendingRunPostgres`,
@@ -120,6 +122,8 @@ export interface EnginePrismaClient {
    * Used to configure the local planner in an outbox claim transaction.
    */
   $executeRaw?(strings: TemplateStringsArray, ...values: any[]): Promise<any>;
+  /** Raw SQL execution with positional parameters. */
+  $executeRawUnsafe?(query: string, ...values: any[]): Promise<number>;
   /**
    * An enum namespace, if the client has one. Prisma 6 and 7 client
    * instances do not (their enums are module-level exports), nor does a

@@ -358,6 +358,7 @@ model OutboxEvent {
   @@unique([workflowRunId, sequence])
   @@index([publishedAt, dlqAt, workflowRunId, deliveryClaim], map: "outbox_events_delivery_run_idx")
   @@index([publishedAt, dlqAt, workflowRunId, sequence], map: "outbox_events_live_run_sequence_idx")
+  @@index([deliveryClaim, workflowRunId], map: "outbox_events_delivery_cursor_idx")
   @@index([publishedAt])
   // Dead letters are a subset of the unpublished rows, so without this the
   // dead-letter view has to walk every unpublished event and fetch its heap
@@ -395,7 +396,7 @@ model WorkflowBlob {
 }
 ```
 
-The Prisma schema provisions outbox delivery on PostgreSQL and SQLite. Keep `deliveryClaim` nullable. It holds an expiry and owner token during a claim. Flushers compute run heads from the current rows. The live-run sequence index finds the next run head, and the live-run claim index checks for a lease when replay has restored an earlier event.
+The Prisma schema provisions outbox delivery on PostgreSQL and SQLite. Keep `deliveryClaim` nullable. It holds a rotation rank and, during a live claim, an expiry and owner token. The rank persists after delivery or a retry so a fresh flusher can resume the rotation with one index lookup. Flushers compute run heads from the current rows. The live-run sequence index finds the next run head, and the live-run claim index checks for a lease when replay has restored an earlier event.
 
 ---
 
@@ -1041,7 +1042,11 @@ The engine refuses such a file, and it does not run on a file it could not check
 | The check fails (a database error, a missing table, a busy file) | Throws `SqliteDateStorageUnverifiedError` (`code: "SQLITE_DATE_STORAGE_UNVERIFIED"`, `reason: "probe-failed"`, the original rejection as `cause`) and does not run. If the rejection cannot be formatted, the message says `Unprintable error`. | No: the next call checks again. |
 | The client exposes neither `$queryRaw` nor `$queryRawUnsafe` | Throws `SqliteDateStorageUnverifiedError` with `reason: "no-raw-query"`, naming both, on every call. | Not applicable. |
 
-Both errors are exported from `@bratsos/workflow-engine`. All six cross directions are refused (6 against 7, 6 against 8, 7 against 6, 7 against 8, 8 against 6, 8 against 7), checked on real files written by one major and opened by another, for each adapter, the console read port and both hosts, with the full client, a client without `$queryRaw`, a client without `$queryRawUnsafe` and the console's minimum client (`$queryRawUnsafe` only); a client with no raw read is refused as unverified.
+The engine samples what the driver binds, including when a better-sqlite3 adapter uses `timestampFormat: "unixepoch-ms"`. SQLite compares INTEGER and REAL numerically, so a REAL parameter can match a date stored as INTEGER. It still refuses a foreign text format. [Prisma 6 SQLite driver options](https://www.prisma.io/docs/orm/v6/overview/databases/sqlite#using-the-better-sqlite3-driver), [Prisma 7 SQLite driver options](https://www.prisma.io/docs/orm/v7/core-concepts/supported-databases/sqlite#common-considerations), [Prisma 8 SQLite storage](https://www.prisma.io/docs/orm/supported-databases#what-the-labels-mean)
+
+If the probe never settles, the guarded calls sharing that client stay pending, including host startup or the serverless entry point. They issue no downstream operations. A different client makes its own probe.
+
+Both errors are exported from `@bratsos/workflow-engine`. All six cross directions using the default timestamp modes are refused (6 against 7, 6 against 8, 7 against 6, 7 against 8, 8 against 6, 8 against 7), checked on real files written by one major and opened by another, for each adapter, the console read port and both hosts, with the full client, a client without `$queryRaw`, a client without `$queryRawUnsafe` and the console's minimum client (`$queryRawUnsafe` only); a client with no raw read is refused as unverified.
 
 **Why an operation on a file with no stored date is safe.** The check reads a date from every table that can hold a row without a run, and every other engine table's rows belong to a run, whose `createdAt` it reads. So when it sees no date, no engine table holds a row the operation could compare (only `workflow_definitions` and `workflow_blobs` may hold rows, and the engine compares none of their dates): its comparisons match nothing, and what it writes is in this client's own form. The next call sees what was written and decides from it.
 
@@ -1049,17 +1054,28 @@ Both errors are exported from `@bratsos/workflow-engine`. All six cross directio
 
 - **Hosts fail fast.** `createNodeHost(...).start()` rejects with the error before it starts a timer, a loop or a signal handler; a `stop()` while that check is still pending cancels the start (nothing is installed when the check settles). The serverless host's `handleJob`, `processAvailableJobs` and `runMaintenanceTick` check before they dispatch anything, on every call. Both call the optional `JobTransport.verifyStorage()`, which the Prisma job queue implements; a custom transport without it starts as before.
 - **The console refuses too.** `createPrismaConsoleReadPort` binds dates in its filters and keyset cursors, so on a foreign file it listed the wrong runs; on SQLite it now runs the same check before each read, through `$queryRawUnsafe` when that is all its client has.
-- **Cost.** One statement per client until a check is conclusive, shared by every adapter and the console on that client: ten index lookups and four one-row reads, p50 0.22 to 0.50 ms (Prisma 7, 6 and 8) with 100,000 rows in each of `workflow_runs`, `workflow_stages`, `job_queue`, `outbox_events`, `idempotency_keys` and `ai_calls`. On a file with no stored date every call checks again.
+- **Cost.** One statement per client until a check is conclusive, shared by every adapter and the console on that client: ten index lookups, four one-row reads and a column metadata check, p50 0.22 to 0.50 ms (Prisma 7, 6 and 8) with 100,000 rows in each of `workflow_runs`, `workflow_stages`, `job_queue`, `outbox_events`, `idempotency_keys` and `ai_calls`. On a file with no stored date every call checks again.
 - **Not checked:** the blob store compares no dates.
 
 What a bounded probe cannot see: a foreign text form (Prisma 7's against Prisma 8's) on rows strictly between the oldest and the newest of a column, and the rows of a sampled table other than the one it reads. A class mix in an indexed column is always seen, because every integer sorts before every text value and so changes the oldest or the newest of its column. While one major at a time uses a file, such rows cannot arise (the first call on a foreign file refuses); only a file an earlier release mixed, or two majors writing one file at once, can hold them.
 
 ### Switching SQLite Prisma majors
 
-The drain-and-open procedure below supports Prisma 6 → 7, 6 → 8, 7 → 6, 7 → 8, and 8 → 7. For Prisma 8 → 6, start with a fresh file and migrate application data. For the supported switches, stop every writer, host and flusher. Use the creating Prisma major and the schema with the nullable `deliveryClaim` field.
+The drain-and-open procedure below supports Prisma 6 → 7, 6 → 8, 7 → 6, 7 → 8, and 8 → 7 with the physical schema checks below. Stop every process using the file and close its clients. Use the current writer's Prisma major and the schema with the nullable `deliveryClaim` field. If the file needs the column or its indexes, apply that schema migration in its own process before draining, with all other clients closed.
+
+Before targeting Prisma 6, check the physical schema with `SELECT type FROM pragma_table_info('workflow_runs') WHERE name = 'createdAt';`. If it shows `TEXT`, start with a fresh file and migrate application data. This includes a Prisma 8 file previously switched to Prisma 7. Draining leaves the column affinity unchanged, and the numeric writer refuses it before its first engine write.
+
+Check for orphaned jobs before the drain. A direct `persistence.deleteRun` can leave them behind. Review the returned jobs and resolve or explicitly discard them before switching. `run.purge` removes only jobs attached to runs it purges.
+
+```sql
+SELECT j.id, j.status FROM job_queue j
+WHERE NOT EXISTS (
+  SELECT 1 FROM workflow_runs r WHERE r.id = j."workflowRunId"
+);
+```
 
 1. Dispatch `run.cancel` for every non-terminal run (`PENDING`, `RUNNING` or `SUSPENDED`). Cancellation appends outbox events.
-2. Run `outbox.flush` on a root client with the creating major until `engine.stats` reports `outbox.unpublished: 0`. That figure includes claimed events. With every other flusher stopped, allow any live claim to expire and flush again. Before deleting rows, verify that there are no unpublished events and no live delivery claims.
+2. Run `outbox.flush` on a root client with the creating major until `engine.stats` reports `outbox.unpublished: 0`. That figure includes claimed events. With every other flusher stopped, allow any live claim to expire and flush again. Before deleting rows, verify that there are no unpublished events. A zero count also rules out live claims. Published and dead-lettered rows may retain a rotation rank.
 3. Resolve the dead letters. When the sink can accept them, run `plugin.replayDLQ` and flush again until there are no unpublished events, live claims or dead letters. If you choose to discard dead letters, record that decision before the outbox DELETE.
 4. Dispatch `run.purge` with an `olderThan` in the future until `purged` is 0. This removes the run history and its associated rows. Export what you need first, including any AI call history.
 5. Execute the following with the creating major. `run.purge` leaves all three tables intact.
@@ -1074,7 +1090,6 @@ The drain-and-open procedure below supports Prisma 6 → 7, 6 → 8, 7 → 6, 7 
 
 On real files with delivery claims, omitting the outbox, idempotency or AI DELETE caused the new major to refuse the file in `outbox_events.publishedAt`, `idempotency_keys.createdAt` or `ai_calls.createdAt`, respectively. Retain `workflow_definitions` and your application tables.
 
-**Prisma 8 → 6 requires a fresh file.** Prisma 8 declares date columns as `TEXT`. SQLite stores the integer timestamps from Prisma 6 as text in that schema, and Prisma 6 cannot read them. The problem persists after draining the file.
 
 #### Prisma 8 with SQLite
 

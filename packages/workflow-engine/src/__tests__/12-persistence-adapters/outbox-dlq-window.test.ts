@@ -323,6 +323,9 @@ describe.skipIf(!sqlite && !databaseUrl)(
       ["dead letter", true],
     ] as const)("recovers three claimed events after a live-process %s error (committed: %s)", async (operation, committed) => {
       for (let i = 0; i < 3; i++) await seedEvent(`write-error-${i}`);
+      const first = await client.outboxEvent.findFirst({
+        where: { workflowRunId: "write-error-0" },
+      });
       shouldFail = operation !== "publication";
       (runner as { maxRetries: number }).maxRetries =
         operation === "dead letter" ? 1 : 3;
@@ -335,7 +338,8 @@ describe.skipIf(!sqlite && !databaseUrl)(
                 operation === "publication"
                   ? args.data.publishedAt !== undefined
                   : args.data.retryCount !== undefined;
-              if (!targetWrite) return target.updateMany(args);
+              if (args.where.id !== first.id || !targetWrite)
+                return target.updateMany(args);
               if (committed) await target.updateMany(args);
               throw new Error("injected outbox write error");
             };
@@ -369,10 +373,10 @@ describe.skipIf(!sqlite && !databaseUrl)(
       shouldFail = false;
       const before = await flush();
       expect(before.published).toBe(
-        operation === "retry release" && committed ? 1 : 0,
+        operation === "retry release" ? (committed ? 3 : 2) : 0,
       );
-      if (operation === "dead letter" && committed)
-        expect((await replay()).replayed).toBe(1);
+      if (operation === "dead letter")
+        expect((await replay()).replayed).toBe(committed ? 3 : 2);
       clock.advance(60_001);
       await flush();
       expect(new Set(identities).size).toBe(3);
@@ -468,6 +472,302 @@ describe.skipIf(!sqlite && !databaseUrl)(
         databaseType: sqlite ? "sqlite" : "postgresql",
       });
     }
+
+    function omitClientMembers(...hidden: string[]) {
+      function view(target: typeof client): typeof client {
+        return new Proxy(target, {
+          get(prisma, key) {
+            if (hidden.includes(String(key))) return undefined;
+            if (key === "$withColumns" && prisma.$withColumns)
+              return (...args: unknown[]) => view(prisma.$withColumns(...args));
+            return Reflect.get(prisma, key, prisma);
+          },
+        });
+      }
+      return view(client);
+    }
+
+    it.each([
+      false,
+      true,
+    ])("flushes a root facade and inserts its batch atomically (skip transactions: %s)", async (skipInteractiveTransactions) => {
+      const root = omitClientMembers("$transaction");
+      const inserted: string[][] = [];
+      const facade = new Proxy(root, {
+        get(target, key) {
+          if (key !== "outboxEvent") return Reflect.get(target, key, target);
+          return new Proxy(target.outboxEvent, {
+            get(table, method) {
+              if (method !== "createMany") return Reflect.get(table, method);
+              return async (args: { data: { workflowRunId: string }[] }) => {
+                inserted.push(
+                  args.data.map(({ workflowRunId }) => workflowRunId),
+                );
+                return table.createMany(args);
+              };
+            },
+          });
+        },
+      });
+      const store = createPrismaWorkflowPersistence(facade, {
+        databaseType: sqlite ? "sqlite" : "postgresql",
+        skipInteractiveTransactions,
+      });
+      await store.appendOutboxEvents(
+        ["z", "a", "a"].map((workflowRunId) => ({
+          workflowRunId,
+          eventType: "workflow:created",
+          payload: { workflowRunId },
+          occurredAt: clock.now(),
+          causationId: "autocommit",
+        })),
+      );
+      expect(inserted).toEqual([["a", "a", "z"]]);
+      const accepted: string[] = [];
+      const dispatcher = make(
+        {
+          async emit(_, meta) {
+            accepted.push(meta!.workflowRunId);
+          },
+        },
+        store,
+      );
+      await expect(
+        dispatcher.dispatch({ type: "outbox.flush" }),
+      ).resolves.toMatchObject({ published: 3 });
+      expect(accepted.sort()).toEqual(["a", "a", "z"]);
+    });
+
+    it.skipIf(sqlite)(
+      "honours skipInteractiveTransactions for an outbox claim",
+      async () => {
+        await seedEvent("skip-transaction");
+        const root = new Proxy(client, {
+          get(target, key) {
+            if (key === "$transaction")
+              return () => {
+                throw new Error("unexpected interactive transaction");
+              };
+            return Reflect.get(target, key, target);
+          },
+        });
+        const store = createPrismaWorkflowPersistence(root, {
+          skipInteractiveTransactions: true,
+        });
+        await expect(
+          make({ async emit() {} }, store).dispatch({ type: "outbox.flush" }),
+        ).resolves.toMatchObject({ published: 1 });
+      },
+    );
+
+    it.skipIf(sqlite)(
+      "reserves sequences in the same run order for opposite append inputs",
+      async () => {
+        const writes: string[][] = [[], []];
+        const batches = [
+          ["a", "z"],
+          ["z", "a"],
+        ];
+        await Promise.all(
+          batches.map((runIds, index) =>
+            client.$transaction(async (tx: typeof client) => {
+              const table = new Proxy(tx.outboxEvent, {
+                get(target, key) {
+                  if (key !== "createMany") return Reflect.get(target, key);
+                  return async (args: {
+                    data: { workflowRunId: string }[];
+                    skipDuplicates?: boolean;
+                  }) => {
+                    const result = await target.createMany(args);
+                    if (args.skipDuplicates && result.count) {
+                      writes[index]!.push(args.data[0]!.workflowRunId);
+                      // Hold the first reservation to expose opposite lock order.
+                      if (writes[index]!.length === 1)
+                        await new Promise((resolve) =>
+                          setTimeout(resolve, 100),
+                        );
+                    }
+                    return result;
+                  };
+                },
+              });
+              const view = new Proxy(tx, {
+                get(target, key) {
+                  return key === "outboxEvent"
+                    ? table
+                    : Reflect.get(target, key, target);
+                },
+              });
+              await storeOver(view).appendOutboxEvents(
+                runIds.flatMap((workflowRunId) =>
+                  [1, 2].map((sequence) => ({
+                    workflowRunId,
+                    eventType: "workflow:created",
+                    payload: { sequence },
+                    occurredAt: clock.now(),
+                    causationId: "opposite-orders",
+                  })),
+                ),
+              );
+            }),
+          ),
+        );
+        expect(writes).toEqual([
+          ["a", "z"],
+          ["a", "z"],
+        ]);
+        const rows = await client.outboxEvent.findMany({
+          orderBy: [{ workflowRunId: "asc" }, { sequence: "asc" }],
+        });
+        expect(rows.map((r: { sequence: number }) => r.sequence)).toEqual([
+          1, 2, 3, 4, 1, 2, 3, 4,
+        ]);
+      },
+    );
+
+    it("attempts a ready run without waiting for another run's slow sink", async () => {
+      await seedEvent("a-slow");
+      await seedEvent("z-ready");
+      const slow = deferred();
+      const slowEntered = deferred();
+      const healthy = deferred();
+      const pending = make({
+        async emit(_, meta) {
+          if (meta!.workflowRunId === "a-slow") {
+            slowEntered.release();
+            await slow.promise;
+          } else healthy.release();
+        },
+      }).dispatch({ type: "outbox.flush", maxEvents: 2, claimDurationMs: 100 });
+      await slowEntered.promise;
+      clock.advance(101);
+      const outcome = await Promise.race([
+        healthy.promise.then(() => "healthy"),
+        new Promise((resolve) => setTimeout(() => resolve("blocked"), 1000)),
+      ]);
+      slow.release();
+      await pending;
+      expect(outcome).toBe("healthy");
+    });
+
+    it("rotates across fresh adapters despite busy earlier runs refilling", async () => {
+      for (const id of ["a", "b", "c", "z"]) await seedEvent(id);
+      const calls: string[] = [];
+      const sink = {
+        async emit(_, meta) {
+          const runId = meta!.workflowRunId;
+          calls.push(runId);
+          if (runId === "z") return;
+          await persistence.appendOutboxEvents([
+            {
+              workflowRunId: runId,
+              eventType: "workflow:created",
+              payload: {},
+              occurredAt: clock.now(),
+              causationId: "refill",
+            },
+          ]);
+          if (runId === "a") throw new Error("failing lower run");
+        },
+      } satisfies NonNullable<Parameters<typeof createKernel>[0]["eventSink"]>;
+      for (let i = 0; i < 4; i++) {
+        await make(sink, storeOver(client)).dispatch({
+          type: "outbox.flush",
+          maxEvents: 1,
+        });
+      }
+      expect(calls).toEqual(["a", "b", "c", "z"]);
+    });
+
+    it("reaches the 101st run on the second cold default-size page", async () => {
+      const hotRuns = Array.from(
+        { length: 100 },
+        (_, i) => `a-${String(i).padStart(3, "0")}`,
+      );
+      await persistence.appendOutboxEvents(
+        [...hotRuns.flatMap((runId) => Array(10).fill(runId)), "z"].map(
+          (workflowRunId) => ({
+            workflowRunId,
+            eventType: "workflow:created",
+            payload: {},
+            occurredAt: clock.now(),
+            causationId: "cold-default-page",
+          }),
+        ),
+      );
+      const attempted: string[] = [];
+      const sink: NonNullable<Parameters<typeof createKernel>[0]["eventSink"]> =
+        {
+          async emit(_, meta) {
+            attempted.push(meta!.workflowRunId);
+          },
+        };
+      await make(sink, storeOver(client)).dispatch({ type: "outbox.flush" });
+      expect(attempted).not.toContain("z");
+      await make(sink, storeOver(client)).dispatch({ type: "outbox.flush" });
+      expect(attempted).toContain("z");
+    });
+
+    it.skipIf(sqlite)(
+      "acquires a bounded page through a PostgreSQL facade hiding raw reads",
+      async () => {
+        const store = storeOver(
+          omitClientMembers("$queryRaw", "$queryRawUnsafe"),
+        );
+        const seed = `INSERT INTO outbox_events
+        (id, "workflowRunId", sequence, "eventType", payload, "causationId", "occurredAt", "deliveryClaim")
+        SELECT 'd'||g, 'a'||lpad(g::text,6,'0'), 1, 'workflow:created', '{}', 'wide', now(), $1
+        FROM generate_series(1,$2::int) g`;
+        await client.$executeRawUnsafe(
+          seed,
+          "2099-01-01T00:00:00.000Z|held",
+          25000,
+        );
+        await seedEvent("z-ready");
+        const start = performance.now();
+        await expect(
+          make({ async emit() {} }, store).dispatch({
+            type: "outbox.flush",
+            maxEvents: 1,
+            claimDurationMs: 4000,
+          }),
+        ).resolves.toMatchObject({ published: 1 });
+        expect(performance.now() - start).toBeLessThan(4000);
+        await client.outboxEvent.deleteMany({});
+        await client.$executeRawUnsafe(seed, null, 12000);
+        const claim = (suffix: string) =>
+          store.claimOutboxDelivery(
+            12000,
+            `2099-01-01T00:00:00.000Z|${suffix}`,
+            clock.now(),
+            [],
+          );
+        const first = await claim("first");
+        const second = await claim("second");
+        expect(first).toHaveLength(128);
+        expect(second).toHaveLength(128);
+        expect(new Set([...first, ...second].map(({ id }) => id)).size).toBe(
+          256,
+        );
+      },
+      30_000,
+    );
+
+    it("counts a sink rejection at the Unix epoch for every raw-read shape", async () => {
+      await seedEvent("epoch-dead-letter");
+      clock.set(new Date(0));
+      expect((await flush()).deadLettered).toBe(1);
+      for (const hide of [[], ["$queryRaw"], ["$queryRawUnsafe"]]) {
+        const result = await make(
+          runner,
+          storeOver(omitClientMembers(...hide)),
+        ).dispatch({ type: "engine.stats" });
+        expect(result.outbox).toMatchObject({
+          deadLettered: 1,
+          unpublished: 0,
+        });
+      }
+    });
 
     it.each([
       false,
@@ -643,62 +943,38 @@ describe.skipIf(!sqlite && !databaseUrl)(
       },
     );
 
-    it.skipIf(sqlite)(
-      "cancels a PostgreSQL claim between the candidate read and the write",
-      async () => {
-        await seedEvent("cancel-after-select");
-        const controller = new AbortController();
-        let cancelled = false;
-        const gate = (tx: typeof client): typeof client =>
-          new Proxy(tx, {
-            get(target, key) {
-              if (key === "$withColumns" && target.$withColumns) {
-                return (...args: unknown[]) =>
-                  gate(target.$withColumns(...args));
-              }
-              if (key === "$queryRawUnsafe") {
-                return async (sql: string, ...args: unknown[]) => {
-                  const rows = await target.$queryRawUnsafe(sql, ...args);
-                  if (sql.startsWith("WITH RECURSIVE walk")) {
-                    cancelled = true;
-                    controller.abort();
-                  }
-                  return rows;
-                };
-              }
-              return Reflect.get(target, key, target);
-            },
-          });
-        const wrapper = new Proxy(client, {
-          get(target, key) {
-            if (key === "$transaction") {
-              return (
-                callback: (tx: typeof client) => unknown,
-                options: unknown,
-              ) =>
-                target.$transaction(
-                  (tx: typeof client) => callback(gate(tx)),
-                  options,
-                );
-            }
-            return Reflect.get(target, key, target);
-          },
-        });
-        const result = await make(runner, storeOver(wrapper)).dispatch({
+    it("honours cancellation after the cursor read and before acquisition", async () => {
+      await seedEvent("cancel-after-select");
+      const controller = new AbortController();
+      const delegate = new Proxy(client.outboxEvent, {
+        get(target, key) {
+          if (key !== "findFirst") return Reflect.get(target, key);
+          return async (args: unknown) => {
+            const cursor = await target.findFirst(args);
+            controller.abort();
+            return cursor;
+          };
+        },
+      });
+      const wrapper = new Proxy(client, {
+        get(target, key) {
+          return key === "outboxEvent"
+            ? delegate
+            : Reflect.get(target, key, target);
+        },
+      });
+      await expect(
+        make(runner, storeOver(wrapper)).dispatch({
           type: "outbox.flush",
           signal: controller.signal,
-        });
-        expect(cancelled).toBe(true);
-        expect(result).toMatchObject({
-          published: 0,
-          eventSinkStatus: "degraded",
-        });
-        const row = await client.outboxEvent.findFirst({
-          where: { workflowRunId: "cancel-after-select" },
-        });
-        expect(row.deliveryClaim).toBeNull();
-      },
-    );
+        }),
+      ).resolves.toMatchObject({ published: 0, eventSinkStatus: "degraded" });
+      expect(controller.signal.aborted).toBe(true);
+      const row = await client.outboxEvent.findFirst({
+        where: { workflowRunId: "cancel-after-select" },
+      });
+      expect(row.deliveryClaim).toBeNull();
+    });
 
     it.skipIf(sqlite)(
       "never claims a successor past a PostgreSQL row lock",
@@ -816,16 +1092,16 @@ describe.skipIf(!sqlite && !databaseUrl)(
       expect(accepted[0]?.id).toBe(accepted[1]?.id);
     });
 
-    it("allows a claimed successor to arrive after a dead letter is replayed", async () => {
+    it("delivers already claimed successors before replay and unclaimed successors after replay", async () => {
       await seedEvent("replay-order");
       await persistence.appendOutboxEvents([
-        {
+        ...[2, 3].map((sequence) => ({
           workflowRunId: "replay-order",
           eventType: "workflow:created",
           payload: { type: "workflow:created", workflowRunId: "replay-order" },
-          causationId: "second",
+          causationId: `successor-${sequence}`,
           occurredAt: clock.now(),
-        },
+        })),
       ]);
       expect((await flush()).deadLettered).toBe(1);
       const entered = deferred();
@@ -860,8 +1136,8 @@ describe.skipIf(!sqlite && !databaseUrl)(
       expect((await later).published).toBe(1);
       expect(
         (await make(sink).dispatch({ type: "outbox.flush" })).published,
-      ).toBe(1);
-      expect(accepted).toEqual([2, 1]);
+      ).toBe(2);
+      expect(accepted).toEqual([2, 1, 3]);
     });
 
     it.each([

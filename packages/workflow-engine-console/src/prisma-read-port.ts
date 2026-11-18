@@ -508,8 +508,17 @@ function mapRunEvent(row: RawEventRow): RunEvent {
     eventType: String(row.eventType),
     occurredAt: toDate(row.occurredAt) ?? new Date(0),
     publishedAt: toDate(row.publishedAt),
-    ...(row.deliveryClaim
-      ? { claimExpiresAt: new Date(row.deliveryClaim.slice(0, 24)) }
+    ...(row.publishedAt === null &&
+    row.dlqAt === null &&
+    row.deliveryClaim &&
+    row.deliveryClaim.length > 24
+      ? {
+          claimExpiresAt: new Date(
+            row.deliveryClaim.startsWith("r")
+              ? row.deliveryClaim.slice(18, 42)
+              : row.deliveryClaim.slice(0, 24),
+          ),
+        }
       : {}),
     retryCount: toNumber(row.retryCount),
     dlqAt: toDate(row.dlqAt),

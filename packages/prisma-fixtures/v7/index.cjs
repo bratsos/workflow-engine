@@ -13,7 +13,7 @@ exports.createPostgresClient = (url, options = {}) => {
 };
 
 // Generates a SQLite client and creates every table in `file`, then connects.
-exports.createSqliteClient = (file, options = {}) => {
+exports.createSqliteClient = (file, options = {}, adapterOptions) => {
   const sqlite = schema.sqlite(__dirname, { withUrl: false });
   const url = `file:${file}`;
   const prisma = (...args) =>
@@ -27,7 +27,7 @@ exports.createSqliteClient = (file, options = {}) => {
   const { PrismaClient } = require(join(__dirname, ".generated/sqlite-client"));
   const { PrismaBetterSqlite3 } = require("@prisma/adapter-better-sqlite3");
   return new PrismaClient({
-    adapter: new PrismaBetterSqlite3({ url }),
+    adapter: new PrismaBetterSqlite3({ url }, adapterOptions),
     ...options,
   });
 };

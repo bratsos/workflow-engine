@@ -259,6 +259,7 @@ describe("PrismaWorkflowPersistence.claimOutboxDelivery raw SQL", () => {
     };
     const prisma = {
       ...tx,
+      outboxEvent: { findFirst: vi.fn(async () => null) },
       $transaction: (work: (client: typeof tx) => unknown) => work(tx),
     } as unknown as EnginePrismaClient;
     const persistence = new PrismaWorkflowPersistence(prisma);
@@ -268,11 +269,10 @@ describe("PrismaWorkflowPersistence.claimOutboxDelivery raw SQL", () => {
     const [sql, ...params] = queryRawUnsafe.mock.calls[0]!;
     expect(sql).toContain("FOR UPDATE OF e SKIP LOCKED");
     expect(sql).toContain('AND "workflowRunId" > walk.run_id');
-    expect(params).toEqual([25, `${now.toISOString()}~`]);
-    const [write, token] = queryRawUnsafe.mock.calls[1]!;
-    expect(write).toContain('SET "deliveryClaim" = $1');
-    expect(write).not.toMatch(/SET.*publishedAt/);
-    expect(token).toBe(claim);
+    expect(params).toEqual([25, `${now.toISOString()}~`, claim]);
+    expect(sql).toContain('SET "deliveryClaim"');
+    expect(sql).not.toMatch(/SET "publishedAt"/);
+    expect(queryRawUnsafe).toHaveBeenCalledTimes(1);
   });
 
   it("uses a compare-and-set on the PostgreSQL delegate path", async () => {
@@ -297,11 +297,11 @@ describe("PrismaWorkflowPersistence.claimOutboxDelivery raw SQL", () => {
     ];
     const updateMany = vi.fn(async () => ({ count: 0 }));
     const prisma = {
-      $queryRaw: vi.fn(async () => []),
       outboxEvent: {
         findFirst: vi
           .fn()
-          .mockResolvedValueOnce(rows[0])
+          .mockResolvedValueOnce(null)
+          .mockResolvedValueOnce({ ...rows[0], deliveryClaim: null })
           .mockResolvedValue(null),
         updateMany,
       },

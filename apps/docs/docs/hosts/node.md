@@ -89,7 +89,9 @@ During a graceful shutdown (when `SIGTERM` is received, or `host.stop()` is call
 1. The host stops accepting new jobs from the queue and skips further orchestration ticks.
 2. The job currently running, and any orchestration tick in flight, are allowed to finish (bounded by `shutdownTimeoutMs`).
 3. A final `outbox.flush` publishes the events this process committed (unless `flushOutboxOnStop: false`).
-4. The `host.start()` promise resolves. Errors during shutdown are logged, never thrown.
+4. The `host.stop()` promise resolves. Errors during shutdown are logged, never thrown.
+
+Each start owns its tick and job loop. A stopped tick cannot call `onTick` after a restart. A stopped job loop starts no further dequeue or job execution. If a dequeue is still pending when shutdown returns, the replacement loop waits for it to settle. A job leased by that old dequeue can be recovered when its lease expires.
 
 If your process manager (e.g. PM2, Kubernetes) manages process lifecycles, you can manually trigger a stop:
 
