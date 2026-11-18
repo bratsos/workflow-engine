@@ -345,8 +345,9 @@ describe.skipIf(!sqlite && !databaseUrl)(
       const completed = new Promise<void>((resolve) => {
         firstCompleted = resolve;
       });
-      const complete = persistence.completeOutboxDelivery.bind(persistence);
-      persistence.completeOutboxDelivery = async (...args) => {
+      // The flush acknowledges a page through the batch write.
+      const complete = persistence.completeOutboxDeliveries!.bind(persistence);
+      persistence.completeOutboxDeliveries = async (...args) => {
         try {
           return await complete(...args);
         } finally {
