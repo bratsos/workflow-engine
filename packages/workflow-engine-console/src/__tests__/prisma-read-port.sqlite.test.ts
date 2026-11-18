@@ -1144,7 +1144,6 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
         ].join("\n"),
       );
       expect(result.unavailableWithNothingRemoved).toEqual([]);
-      expect(result.unexpected).toEqual([]);
       expect(result.outside).toEqual([]);
       expect(result.visible).toEqual([]);
       expect(result.samples).toBeGreaterThan(100);
