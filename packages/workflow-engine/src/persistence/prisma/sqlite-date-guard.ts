@@ -177,7 +177,10 @@ const range = (table: string, column: string) =>
  * before every `T` form, so it is the first text value of its day: the walk
  * seeks the first text value of each stored day, one index seek per day, and
  * returns the first whose 11th character is not `T`. Integers sort before
- * every text value and are skipped by the first seek.
+ * every text value and are skipped by the first seek. The step has one lower
+ * bound, so it is the seek (with two, SQLite seeks on one and filters the
+ * rest, row by row); a text whose 11th character sorts after `U` would not
+ * advance it, so the walk stops there and reports that text.
  */
 const ownForm = (table: string, column: string) => {
   const c = `"${column}"`;
@@ -187,7 +190,8 @@ const ownForm = (table: string, column: string) => {
       WITH RECURSIVE day(v) AS (
         SELECT ${first(`${c} >= ''`)}
         UNION ALL
-        SELECT ${first(`${c} > day.v AND ${c} >= substr(day.v, 1, 10) || 'U'`)} FROM day WHERE day.v IS NOT NULL
+        SELECT ${first(`${c} >= substr(day.v, 1, 10) || 'U'`)} FROM day
+        WHERE day.v IS NOT NULL AND substr(day.v, 1, 10) || 'U' > day.v
       )
       SELECT v FROM day WHERE substr(v, 11, 1) <> 'T' LIMIT 1
     ) AS w`;

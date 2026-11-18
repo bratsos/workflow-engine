@@ -1301,6 +1301,14 @@ describe.skipIf(!sqlite)(`sqlite date guard on Prisma ${major}`, () => {
     // the first value of the next day, repeated once per stored day).
     expect(plan.match(/SEARCH \S+ USING (COVERING )?INDEX/g)).toHaveLength(20);
     expect(plan.match(/RECURSIVE STEP/g)).toHaveLength(5);
+    // Each step seeks on the next day alone: with a second lower bound on the
+    // column, SQLite seeks on one and steps through the column row by row
+    // (both plans print `>?`; 13 ms against 0.02 ms for 100,000 rows of one day).
+    expect(
+      statement.match(
+        /WHERE "\w+" >= substr\(day\.v, 1, 10\) \|\| 'U' ORDER BY "\w+" LIMIT 1\)/g,
+      ),
+    ).toHaveLength(5);
     // The four sampled tables are read from their first row (`LIMIT 1`), and
     // nothing else is scanned.
     expect(statement.match(/FROM "\w+" LIMIT 1\)/g)).toHaveLength(4);
