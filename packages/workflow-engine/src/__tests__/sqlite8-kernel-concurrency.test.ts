@@ -545,8 +545,8 @@ describe
   },
 );
 
-// SQLite 3.53.4 (node:sqlite on Node 22 and 24) keeps a connection's page
-// cache as of that connection's last read when it leaves WAL, though another
+// In the SQLite that node:sqlite ships on Node 22 and 24, a connection keeps
+// its page cache as of its last read when it leaves WAL, though another
 // connection committed since: its next write then drops rows or breaks
 // indexes in the file. Engine transactions commit on their own connections.
 describe.skipIf(!sqlite || process.env.PRISMA_MAJOR !== "8")(
@@ -565,45 +565,149 @@ describe.skipIf(!sqlite || process.env.PRISMA_MAJOR !== "8")(
         input: {},
       },
     });
-    it.each([
-      "the wrapped client",
-      "db.query",
-    ] as const)("keeps every row and index of the file, switched through %s", async (via) => {
-      const db = await kernelDatabase();
-      try {
-        await db.client
-          .$withColumns({ journal_mode: "text" })
-          .$queryRawUnsafe("PRAGMA journal_mode = WAL");
-        for (let i = 0; i < 40; i++)
-          await db.client.workflowRun.create(run(`seed-${i}`));
-        expect(await db.client.workflowRun.findMany()).toHaveLength(40);
-        await db.client.$transaction((tx: any) =>
-          tx.workflowRun.create(run("engine")),
-        );
-        if (via === "db.query")
-          await db.native
+    const vias = ["the wrapped client", "db.query"] as const;
+    // Spellings SQLite accepts alike: the statement is found by its name, not its shape.
+    const spellings = [
+      "PRAGMA journal_mode = DELETE",
+      "PRAGMA journal_mode /*x*/ = DELETE",
+      "PRAGMA journal_mode -- x\n= DELETE",
+      'PRAGMA "journal_mode" = DELETE',
+      "PRAGMA [journal_mode] = DELETE",
+      "PRAGMA `journal_mode` = DELETE",
+      'PRAGMA main."journal_mode" = DELETE',
+    ];
+    const send = (
+      db: KernelDatabase,
+      via: (typeof vias)[number],
+      statement: string,
+    ): Promise<unknown[]> =>
+      via === "db.query"
+        ? db.native
             .query(
-              db.native.raw.sql`PRAGMA journal_mode = DELETE`
+              db.native.raw
+                .sql([statement])
                 .returnsRow({ journal_mode: "sqlite/text@1" })
                 .build(),
             )
-            .toArray();
-        else
-          await db.client
+            .toArray()
+        : db.client
             .$withColumns({ journal_mode: "text" })
-            .$queryRawUnsafe("PRAGMA journal_mode = DELETE");
-        await db.client.workflowRun.create(run("root"));
-        const raw = new DatabaseSync(db.file);
+            .$queryRawUnsafe(statement);
+    // The file as a connection of its own finds it, rows counted without an index.
+    const stored = (file: string, table: string) => {
+      const raw = new DatabaseSync(file);
+      try {
+        return {
+          integrity: raw.prepare("PRAGMA integrity_check").all(),
+          rows: raw
+            .prepare(`SELECT count(*) AS n FROM ${table} NOT INDEXED`)
+            .get().n,
+        };
+      } finally {
+        raw.close();
+      }
+    };
+    const intact = (rows: number) => ({
+      integrity: [{ integrity_check: "ok" }],
+      rows,
+    });
+
+    it.each(
+      vias.flatMap((via) => spellings.map((statement) => [via, statement])),
+    )(
+      "keeps every row and index of the file, switched through %s with %j",
+      async (via, statement) => {
+        const db = await kernelDatabase();
         try {
-          expect(raw.prepare("PRAGMA integrity_check").all()).toEqual([
-            { integrity_check: "ok" },
-          ]);
-          expect(
-            raw.prepare("SELECT count(*) AS n FROM workflow_runs").get().n,
-          ).toBe(42);
+          await send(db, "the wrapped client", "PRAGMA journal_mode = WAL");
+          for (let i = 0; i < 40; i++)
+            await db.client.workflowRun.create(run(`seed-${i}`));
+          expect(await db.client.workflowRun.findMany()).toHaveLength(40);
+          await db.client.$transaction((tx: any) =>
+            tx.workflowRun.create(run("engine")),
+          );
+          await send(db, via as (typeof vias)[number], statement as string);
+          await db.client.workflowRun.create(run("root"));
+          expect(stored(db.file!, "workflow_runs")).toEqual(intact(42));
         } finally {
-          raw.close();
+          await db.close();
         }
+      },
+      60_000,
+    );
+
+    // An unqualified `journal_mode` change reaches every attached database.
+    it.each(
+      vias,
+    )("keeps every row of an attached database, switched through %s", async (via) => {
+      const db = await kernelDatabase();
+      try {
+        await send(db, "the wrapped client", "PRAGMA journal_mode = WAL");
+        const aux = `${db.file}.aux`;
+        const seed = new DatabaseSync(aux);
+        seed.exec(
+          "CREATE TABLE r (id TEXT PRIMARY KEY, a TEXT); CREATE INDEX ra ON r(a); PRAGMA journal_mode = WAL",
+        );
+        for (let i = 0; i < 70; i++)
+          seed.prepare("INSERT INTO r VALUES (?, ?)").run(`id${i}`, `x${i}`);
+        seed.close();
+        const exec = (statement: string) =>
+          db.native.execute(
+            db.native.raw.sql([statement]).affectedCount().build(),
+          );
+        await exec(`ATTACH DATABASE '${aux}' AS aux`);
+        await db.native
+          .query(
+            db.native.raw
+              .sql(["SELECT id FROM aux.r"])
+              .returnsRow({ id: "sqlite/text@1" })
+              .build(),
+          )
+          .toArray();
+        const other = new DatabaseSync(aux);
+        other.exec("INSERT INTO r VALUES ('engine', 'xe')");
+        other.close();
+        await send(db, via, "PRAGMA journal_mode = DELETE");
+        await exec("INSERT INTO aux.r VALUES ('root', 'xr')");
+        expect(stored(aux, "r")).toEqual(intact(72));
+      } finally {
+        await db.close();
+      }
+    }, 60_000);
+
+    // The change fails busy after the 5 s wait; nothing may stay open on the root.
+    it.each(
+      vias,
+    )("serves the engine at once after a journal_mode change failed busy, switched through %s", async (via) => {
+      const db = await kernelDatabase();
+      try {
+        await db.client.workflowRun.create(run("seed"));
+        const outside = new DatabaseSync(db.file);
+        outside.exec("PRAGMA busy_timeout = 0; BEGIN EXCLUSIVE");
+        let failure: unknown;
+        try {
+          failure = await send(db, via, "PRAGMA journal_mode = WAL").catch(
+            (error: unknown) => error,
+          );
+        } finally {
+          outside.exec("COMMIT");
+          outside.close();
+        }
+        expect(isSqliteBusy(failure)).toBe(true);
+        const start = Date.now();
+        await db.kernel.dispatch({
+          type: "run.create",
+          idempotencyKey: "after-busy",
+          workflowId: db.workflow.id,
+          input: { value: "after" },
+        });
+        await db.client.$transaction((tx: any) =>
+          tx.workflowRun.create(run("after")),
+        );
+        expect(Date.now() - start).toBeLessThan(2000);
+        expect(await send(db, via, "PRAGMA journal_mode = WAL")).toEqual([
+          { journal_mode: "wal" },
+        ]);
       } finally {
         await db.close();
       }
