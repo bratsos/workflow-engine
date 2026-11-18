@@ -2016,7 +2016,13 @@ export function persistenceConformanceSuite(
         const ids = page.map(({ id }) => id);
         if (persistence.activeOutboxDeliveryClaims)
           expect(
-            [...(await persistence.activeOutboxDeliveryClaims(ids, claim, now))].sort(),
+            [
+              ...(await persistence.activeOutboxDeliveryClaims(
+                ids,
+                claim,
+                now,
+              )),
+            ].sort(),
           ).toEqual([...ids].sort());
         expect(
           await persistence.failOutboxDelivery(runA[0]!.id, claim, 3, now),

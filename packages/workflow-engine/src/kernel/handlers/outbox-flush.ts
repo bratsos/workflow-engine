@@ -21,10 +21,10 @@
 
 import type { OutboxFlushCommand, OutboxFlushResult } from "../commands";
 import type { KernelEvent } from "../events";
-import type { OutboxRecord } from "../ports";
 import { toErrorMessage } from "../helpers/error-message.js";
 import type { HandlerResult, KernelDeps } from "../kernel";
 import type { PluginRunner } from "../plugins";
+import type { OutboxRecord } from "../ports";
 
 export async function handleOutboxFlush(
   command: OutboxFlushCommand,

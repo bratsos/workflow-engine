@@ -288,7 +288,8 @@ describe("PrismaWorkflowPersistence.claimOutboxDelivery raw SQL", () => {
       $transaction: vi.fn(),
     } as unknown as EnginePrismaClient;
     expect(
-      () => new PrismaWorkflowPersistence(prisma, { databaseType: "postgresql" }),
+      () =>
+        new PrismaWorkflowPersistence(prisma, { databaseType: "postgresql" }),
     ).toThrow(
       expect.objectContaining({
         name: "OutboxClaimUnsupportedError",

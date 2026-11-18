@@ -1161,7 +1161,9 @@ describe("NodeHost", () => {
       const stopping = make();
       await stopping.start();
       await hit;
-      expect((await jobTransport.getJobsByWorkflowRun(workflowRunId))[0]).toMatchObject({ status: "RUNNING", attempt: 1 });
+      expect(
+        (await jobTransport.getJobsByWorkflowRun(workflowRunId))[0],
+      ).toMatchObject({ status: "RUNNING", attempt: 1 });
       await stopping.stop();
       respond();
       await returned;
@@ -1169,13 +1171,16 @@ describe("NodeHost", () => {
         const [job] = await jobTransport.getJobsByWorkflowRun(workflowRunId);
         return job?.status === "PENDING";
       });
-      expect((await jobTransport.getJobsByWorkflowRun(workflowRunId))[0]?.attempt).toBe(0);
+      expect(
+        (await jobTransport.getJobsByWorkflowRun(workflowRunId))[0]?.attempt,
+      ).toBe(0);
     }
     jobTransport.dequeue = dequeue;
     host = make();
     await host.start();
     await waitFor(
-      async () => (await persistence.getRun(workflowRunId))?.status === "COMPLETED",
+      async () =>
+        (await persistence.getRun(workflowRunId))?.status === "COMPLETED",
       10_000,
     );
     expect(calls).toBe(2);
