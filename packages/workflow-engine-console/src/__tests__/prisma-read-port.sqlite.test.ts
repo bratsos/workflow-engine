@@ -429,8 +429,7 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
           },
         ],
       });
-      // As the kernel's `run.storageCleaned` (a number) and any caller's
-      // annotation of any JSON value.
+      // A caller's annotation holds any JSON value.
       const values = [2, 0, -2.5, "2", true, false, [1, "a"], { n: 3 }];
       await db.workflowAnnotation.createMany({
         data: values.map((value, i) => ({
