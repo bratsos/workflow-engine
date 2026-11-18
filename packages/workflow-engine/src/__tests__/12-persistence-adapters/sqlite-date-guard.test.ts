@@ -816,6 +816,71 @@ describe.skipIf(!sqlite)(`sqlite date guard on Prisma ${major}`, () => {
     ]);
   }, 60_000);
 
+  it("refuses a row in SQLite's own form wherever it lies, names the statement that rewrites it, and passes once it is rewritten", async () => {
+    const file = join(directory, "own-form.db");
+    const writer = await open(file);
+    const { persistence: writing } = stack(writer);
+    await writing.createRun(runInput("a-older"));
+    await writing.createRun(runInput("c-newer"));
+    await writer.workflowRun.update({
+      where: { id: "a-older" },
+      data: { createdAt: new Date(Date.now() - 86_400_000) },
+    });
+    // Another program's insert: between the two days on 7 and 8, the newest on 6.
+    await writer.$executeRawUnsafe(
+      `INSERT INTO "workflow_runs" (id, "workflowId", "workflowName", "workflowType", input, status, priority, "updatedAt", "createdAt")
+       SELECT 'b-raw', 'guard', 'guard', 'guard', '{}', 'PENDING', 5, "updatedAt", CURRENT_TIMESTAMP FROM "workflow_runs" WHERE id = 'c-newer'`,
+    );
+    const reader = await open(file, true);
+    const { persistence, kernel } = stack(reader);
+    const error = await persistence.getRun("c-newer").catch((e) => e);
+    expect(error).toBeInstanceOf(SqliteDateStorageError);
+    expect(error).toMatchObject({
+      kind: "sqlite-timestamp",
+      column: "workflow_runs.createdAt",
+    });
+    expect(error.stored).toMatch(/^text like \d{4}-\d\d-\d\d \d\d:\d\d:\d\d$/);
+    expect(error.message).toContain("CURRENT_TIMESTAMP");
+    expect(error.message).toContain(error.recovery);
+    await expect(
+      kernel.dispatch({ type: "run.purge", olderThan: new Date() }),
+    ).rejects.toBeInstanceOf(SqliteDateStorageError);
+    // The statement from the error, as an operator would run it.
+    expect(await writer.$executeRawUnsafe(error.recovery)).toBe(1);
+    expect((await persistence.getRun("b-raw"))?.createdAt).toBeInstanceOf(Date);
+    const ids = await rawFor(reader, { id: "text" }).$queryRawUnsafe(
+      `SELECT id FROM "workflow_runs" ORDER BY "createdAt", id`,
+    );
+    expect(ids.map((r: any) => r.id)).toEqual(["a-older", "b-raw", "c-newer"]);
+  }, 60_000);
+
+  it.skipIf(major !== "8")(
+    "does not remember a pass made inside a transaction the consumer opened on the root connection",
+    async () => {
+      const file = await otherFormFile("uncommitted.db");
+      const db = fixtures.openSqliteDb(file);
+      const sql = (text: string) =>
+        db.execute(db.raw.sql([text]).affectedCount().build());
+      await sql("BEGIN");
+      await sql(
+        `UPDATE "workflow_runs" SET "createdAt" = replace("createdAt", '+00:00', 'Z')`,
+      );
+      const client = fromPrisma8(db);
+      try {
+        const { persistence } = stack(client);
+        // The probe reads the consumer's uncommitted rewrite.
+        expect((await persistence.getRun("done"))?.id).toBe("done");
+        await sql("ROLLBACK");
+        await expect(persistence.getRun("done")).rejects.toMatchObject({
+          kind: "form",
+        });
+      } finally {
+        await db.close();
+      }
+    },
+    60_000,
+  );
+
   it("refuses a file that two majors have both written to", async () => {
     const { persistence } = stack(
       await open(await otherClassFile("mixed.db", true), true),
@@ -1107,15 +1172,21 @@ describe.skipIf(!sqlite)(`sqlite date guard on Prisma ${major}`, () => {
     ).toEqual([]);
 
     // No raw read at all: the check is impossible, so the call is refused.
-    const blind = stack(
-      without(await open(file, true), ["$queryRaw", "$queryRawUnsafe"]),
-    );
-    const error = await blind.persistence.getRun("mine").catch((e) => e);
+    // The workflow persistence, whose outbox claim needs one, refuses it when built.
+    const hidden = without(await open(file, true), [
+      "$queryRaw",
+      "$queryRawUnsafe",
+    ]);
+    expect(() =>
+      createPrismaWorkflowPersistence(hidden, { databaseType: "sqlite" }),
+    ).toThrow(expect.objectContaining({ code: "OUTBOX_CLAIM_UNSUPPORTED" }));
+    const queue = createPrismaJobQueue(hidden, {
+      databaseType: "sqlite",
+      workerId: "guard-worker",
+    });
+    const error = await queue.dequeue().catch((e) => e);
     expect(error).toBeInstanceOf(SqliteDateStorageUnverifiedError);
     expect(error.reason).toBe("no-raw-query");
-    await expect(blind.queue.dequeue()).rejects.toBeInstanceOf(
-      SqliteDateStorageUnverifiedError,
-    );
   }, 60_000);
 
   it("lists AI calls by prefix through either single raw read", async () => {
@@ -1225,11 +1296,14 @@ describe.skipIf(!sqlite)(`sqlite date guard on Prisma ${major}`, () => {
       `EXPLAIN QUERY PLAN ${statement.replace("?", "0")}`,
     );
     const plan = rows.map((r: any) => String(r.detail)).join("\n");
-    // Two lookups (the oldest and the newest) in the index of each of five columns.
-    expect(plan.match(/SEARCH \S+ USING (COVERING )?INDEX/g)).toHaveLength(10);
+    // Four lookups in the index of each of five columns: the oldest, the
+    // newest, and the two seeks of the day walk (its first text value, then
+    // the first value of the next day, repeated once per stored day).
+    expect(plan.match(/SEARCH \S+ USING (COVERING )?INDEX/g)).toHaveLength(20);
+    expect(plan.match(/RECURSIVE STEP/g)).toHaveLength(5);
     // The four sampled tables are read from their first row (`LIMIT 1`), and
     // nothing else is scanned.
-    expect(statement.match(/LIMIT 1\)/g)).toHaveLength(4);
+    expect(statement.match(/FROM "\w+" LIMIT 1\)/g)).toHaveLength(4);
     const scanned = (
       plan.match(
         /SCAN (workflow_\w+|outbox_events|job_queue|idempotency_keys|ai_calls)\b/g,

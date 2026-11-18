@@ -29,21 +29,27 @@
  * It fails closed. An operation runs only after a check that succeeded: a probe
  * that throws, or a client with no raw read, refuses the operation with
  * {@link SqliteDateStorageUnverifiedError}. Only a conclusive pass (stored
- * dates seen, all matching) is remembered. A check that sees no stored date
+ * dates seen, all matching, none of them uncommitted) is remembered; a refusal
+ * is not, so rewriting the rows it names lets the next call through. It also
+ * walks each indexed column day by day for SQLite's own timestamp form
+ * (`2026-11-18 06:30:09`), which other SQL writes and which sorts before the
+ * ISO dates of its day, so that form is found wherever it lies, not only at
+ * the ends. A check that sees no stored date
  * (an empty file) lets that one operation run and is asked again on the next
  * call: such a file holds no row of a table that has a date the engine
  * compares, so the operation's comparisons match nothing and its writes store
  * this client's form, and the first date another major writes is seen on the
  * next call.
  *
- * What it cannot see, because a bounded probe cannot: a foreign TEXT form on
- * rows strictly between the oldest and the newest of a column (the class check
- * has no such gap: integers sort before every text value, so one foreign
- * integer among text makes the oldest or the newest differ), and rows of a
- * sampled table other than the one read. Neither arises while one Prisma major
- * at a time uses a file: only a file an earlier release mixed, or two majors
- * writing to one file at once (which no probe can tell apart while the file is
- * empty), can hold them.
+ * What it cannot see, because a bounded probe cannot: the other ISO text form
+ * (`+00:00` among `Z`, or the reverse) on rows strictly between the oldest and
+ * the newest of an indexed column, since the two interleave within a day (the
+ * class check has no such gap: integers sort before every text value, so one
+ * foreign integer among text makes the oldest or the newest differ), and any
+ * row of a sampled table other than the one read, SQLite's own form included.
+ * Such a row is seen once it becomes the oldest, the newest or the row read,
+ * for example after `run.purge` deletes the rows around it. The ISO mix arises
+ * only from two Prisma majors writing to one file.
  *
  * Where it runs: the adapters (`PrismaWorkflowPersistence`, `PrismaJobQueue`,
  * `PrismaStepLedger`, `PrismaAICallLogger`) wrap EVERY method of their
@@ -73,19 +79,31 @@ export class SqliteDateStorageError extends Error {
     readonly stored: string,
     /** What this client binds for a `Date`, described the same way. */
     readonly bound: string,
-    /** `"class"`: integer against text. `"form"`: both text, written differently. */
-    readonly kind: "class" | "form" | "affinity" = "class",
+    /**
+     * `"class"`: integer against text. `"form"`: both text, written
+     * differently. `"sqlite-timestamp"`: rows in SQLite's own form
+     * (`2026-11-18 06:30:09`), written by SQL outside the engine.
+     */
+    readonly kind: "class" | "form" | "affinity" | "sqlite-timestamp" = "class",
     /** The date column the difference was found in, as `table.column`. */
     readonly column?: string,
+    /** For `"sqlite-timestamp"`: the statement that rewrites those rows in this client's form. */
+    readonly recovery?: string,
   ) {
     const why =
       kind === "class"
         ? "SQLite orders every integer before every text value, so each date comparison the engine sends (run.purge retention, run.reapStuck, suspended-stage polls, job leases) would be decided by the type and not by the time, and the engine would purge, reap or poll the wrong rows."
         : kind === "affinity"
           ? "The table has TEXT affinity, so it would store numeric dates as text. Use a fresh file before switching to a numeric timestamp driver."
-          : "Two ISO text forms agree except at an exact instant, where the suffix decides (`+00:00` sorts before `Z`): a deadline, retention or stuck-run threshold that equals a stored time is compared wrongly, and an exact-time lookup finds nothing.";
+          : kind === "sqlite-timestamp"
+            ? "That is SQLite's own timestamp form, which `CURRENT_TIMESTAMP` and `datetime('now')` write, as does the Prisma 6 and 7 column default when an insert leaves the column out. The engine never writes it. It sorts before every other date of its day (and, as text, after every integer date), so the engine's date comparisons would treat such a row as up to a day early, or always late."
+            : "Two ISO text forms agree except at an exact instant, where the suffix decides (`+00:00` sorts before `Z`): a deadline, retention or stuck-run threshold that equals a stored time is compared wrongly, and an exact-time lookup finds nothing.";
+    const remedy =
+      kind === "sqlite-timestamp"
+        ? `Rewrite those rows in this client's form, and do the same in any other date column that SQL outside the engine writes: ${recovery}; then retry, since a refusal is not remembered.`
+        : "Use the Prisma major that created the file, or start the new major from a fresh SQLite file and migrate the application data into it.";
     super(
-      `This SQLite file stores dates as ${stored}${column ? ` (in ${column})` : ""}, but this Prisma client binds them as ${bound}: the file uses a different Prisma major or SQLite timestamp format. ${why} Nothing was read or written. Use the Prisma major that created the file, or start the new major from a fresh SQLite file and migrate the application data into it. See ${SQLITE_DATE_STORAGE_DOCS}`,
+      `This SQLite file stores dates as ${stored}${column ? ` (in ${column})` : ""}, but this Prisma client binds them as ${bound}${kind === "sqlite-timestamp" ? "" : ": the file uses a different Prisma major or SQLite timestamp format"}. ${why} Nothing was read or written. ${remedy} See ${SQLITE_DATE_STORAGE_DOCS}`,
     );
     this.name = "SqliteDateStorageError";
   }
@@ -152,6 +170,29 @@ const range = (table: string, column: string) =>
   `SELECT '${table}.${column}' AS col, typeof(m.lo) AS lo, CAST(m.lo AS TEXT) AS loValue, typeof(m.hi) AS hi, CAST(m.hi AS TEXT) AS hiValue
     FROM (SELECT (SELECT MIN("${column}") FROM "${table}") AS lo, (SELECT MAX("${column}") FROM "${table}") AS hi) AS m`;
 
+/**
+ * A text date in SQLite's own form (`2026-11-18 06:30:09`, what
+ * `CURRENT_TIMESTAMP`, `datetime('now')` and the Prisma 6 and 7 `db push`
+ * column defaults write) anywhere in an indexed column. Within a day it sorts
+ * before every `T` form, so it is the first text value of its day: the walk
+ * seeks the first text value of each stored day, one index seek per day, and
+ * returns the first whose 11th character is not `T`. Integers sort before
+ * every text value and are skipped by the first seek.
+ */
+const ownForm = (table: string, column: string) => {
+  const c = `"${column}"`;
+  const first = (where: string) =>
+    `(SELECT ${c} FROM "${table}" WHERE ${where} ORDER BY ${c} LIMIT 1)`;
+  return `SELECT '${table}.${column}', 'text', w.v, 'text', w.v FROM (
+      WITH RECURSIVE day(v) AS (
+        SELECT ${first(`${c} >= ''`)}
+        UNION ALL
+        SELECT ${first(`${c} > day.v AND ${c} >= substr(day.v, 1, 10) || 'U'`)} FROM day WHERE day.v IS NOT NULL
+      )
+      SELECT v FROM day WHERE substr(v, 11, 1) <> 'T' LIMIT 1
+    ) AS w`;
+};
+
 /** The required date of the first row of a table (one row read, no index needed). */
 const sample = (table: string, column: string) =>
   `SELECT '${table}.${column}', typeof(s.v), CAST(s.v AS TEXT), typeof(s.v), CAST(s.v AS TEXT)
@@ -164,20 +205,31 @@ const sample = (table: string, column: string) =>
  * - The oldest and newest value of each date column an index leads with (two
  *   index lookups each). A mixed column shows both classes there (integers sort
  *   before text).
+ * - For each of those columns, the first text value of each stored day, to
+ *   find SQLite's own form anywhere in it ({@link ownForm}): one index seek
+ *   per distinct day.
  * - The required date of one row of each table whose rows no run implies
  *   (`job_queue`, `outbox_events`, `idempotency_keys`, `ai_calls`: they have no
  *   foreign key to `workflow_runs`). Stages, steps, logs, artifacts and
  *   annotations belong to a run, whose `createdAt` is probed. So the probe sees
  *   no stored date only when none of these tables holds a row.
  *
- * Every date probed is set by the client on insert, never by a column default.
+ * The engine sets every date it writes through the client. A column default
+ * (`CURRENT_TIMESTAMP` on the `createdAt` of `workflow_runs`, `job_queue`,
+ * `idempotency_keys` and `ai_calls` in a Prisma 6 or 7 schema) fills only rows
+ * inserted by other SQL that leaves the column out.
  */
-const PROBE_SQL = [
-  range("workflow_runs", "createdAt"),
-  range("outbox_events", "publishedAt"),
-  range("outbox_events", "dlqAt"),
-  range("workflow_stages", "nextPollAt"),
-  range("job_queue", "nextPollAt"),
+const RANGES = [
+  ["workflow_runs", "createdAt"],
+  ["outbox_events", "publishedAt"],
+  ["outbox_events", "dlqAt"],
+  ["workflow_stages", "nextPollAt"],
+  ["job_queue", "nextPollAt"],
+] as const;
+/** @internal The probe statement, for the plan test. */
+export const PROBE_SQL = [
+  ...RANGES.map(([table, column]) => range(table, column)),
+  ...RANGES.map(([table, column]) => ownForm(table, column)),
   sample("job_queue", "createdAt"),
   sample("outbox_events", "occurredAt"),
   sample("idempotency_keys", "createdAt"),
@@ -240,6 +292,24 @@ const describe = (kind: string, value: string | null) =>
 const numeric = (kind: string) => kind === "integer" || kind === "real";
 
 /**
+ * The statement that rewrites SQLite's own form in `column` (`table.column`)
+ * into what this client binds: epoch milliseconds (Prisma 6), ISO text ending
+ * in `+00:00` (Prisma 7) or in `Z` (Prisma 8). `CURRENT_TIMESTAMP` is UTC.
+ */
+function rewriteSql(
+  kind: string,
+  sample: string | null,
+  column: string,
+): string {
+  const [table, name] = column.split(".");
+  const c = `"${name}"`;
+  if (numeric(kind))
+    return `UPDATE "${table}" SET ${c} = CAST(ROUND((julianday(${c}) - 2440587.5) * 86400000) AS INTEGER) WHERE typeof(${c}) = 'text' AND substr(${c}, 11, 1) = ' '`;
+  const suffix = sample?.endsWith("Z") ? "Z" : "+00:00";
+  return `UPDATE "${table}" SET ${c} = strftime('%Y-%m-%dT%H:%M:%f${suffix}', ${c}) WHERE substr(${c}, 11, 1) = ' '`;
+}
+
+/**
  * Compares the probe's answer. Throws {@link SqliteDateStorageError} for a date
  * of another class or form; returns whether any stored date was seen (a
  * conclusive pass) or none was (inconclusive).
@@ -254,6 +324,19 @@ function judge(rows: Probe[]): boolean {
   let seen = false;
   for (const row of rows) {
     if (row === bound) continue;
+    // SQLite's own form, written by SQL outside the engine: refused with the
+    // statement that rewrites it, whatever this client binds.
+    const own = [row.loValue, row.hiValue].find(
+      (value, i) => [row.lo, row.hi][i] === "text" && value?.charAt(10) === " ",
+    );
+    if (own)
+      throw new SqliteDateStorageError(
+        describe("text", own),
+        describe(bound.lo, bound.loValue),
+        "sqlite-timestamp",
+        row.col,
+        rewriteSql(bound.lo, bound.loValue, row.col),
+      );
     if (row.col === "affinity") {
       if (numeric(bound.lo))
         throw new SqliteDateStorageError(
@@ -305,9 +388,12 @@ function judge(rows: Probe[]): boolean {
  * Resolves when the operation may run, rejects when it may not.
  *
  * - Stored dates seen, all in this client's class and form: resolves, and the
- *   pass is remembered for the client (no further probe).
+ *   pass is remembered for the client (no further probe), unless the probe
+ *   ran inside a transaction the consumer opened on a Prisma 8 root
+ *   connection, whose writes it saw before they committed.
  * - A stored date of another class or form: rejects with
- *   {@link SqliteDateStorageError}, and the refusal is remembered.
+ *   {@link SqliteDateStorageError}. Not remembered: once the rows are
+ *   rewritten, the next call passes on the same client.
  * - No stored date anywhere the probe looks (an empty file, a file holding
  *   only definitions or blobs): resolves for this call only; the next call
  *   probes again, so the first date another major writes is seen.
@@ -319,24 +405,35 @@ export function verifySqliteDates(
   guard: SqliteDateGuard,
 ): Promise<void> {
   if (guard.verified) return guard.verified;
+  const uncommitted = () =>
+    (prisma as { [UNCOMMITTED_READS]?: boolean })[UNCOMMITTED_READS] === true;
+  const before = uncommitted();
+  const forget = () => {
+    if (guard.verified === check) guard.verified = null;
+  };
   const check: Promise<void> = probe(prisma)
     .then(judge)
     .then(
       (conclusive) => {
-        if (!conclusive && guard.verified === check) guard.verified = null;
+        if (!conclusive || before || uncommitted()) forget();
       },
       (error) => {
-        if (
-          !(error instanceof SqliteDateStorageError) &&
-          guard.verified === check
-        )
-          guard.verified = null;
+        forget();
         throw error;
       },
     );
   guard.verified = check;
   return check;
 }
+
+/**
+ * Set by `fromPrisma8` on a SQLite root client: `true` while a transaction the
+ * consumer opened is in progress on its connection, so a read there sees
+ * uncommitted writes.
+ */
+export const UNCOMMITTED_READS = Symbol.for(
+  "@bratsos/workflow-engine/uncommitted-reads",
+);
 
 const ORIGINAL = Symbol("sqliteDateGuard.original");
 const STATE = Symbol("sqliteDateGuard.state");
