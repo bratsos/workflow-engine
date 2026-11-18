@@ -593,7 +593,12 @@ class NodeHostImpl implements NodeHost {
         const job = await this.jobTransport.dequeue(
           serves !== undefined ? { serves } : undefined,
         );
-        if (!this.isCurrent(lifecycle)) return;
+        if (!this.isCurrent(lifecycle)) {
+          // The dequeue counted an attempt. Give it back instead of leaving
+          // the job RUNNING for the reaper, which keeps the attempt.
+          if (job) await this.returnUnstartedJob(job);
+          return;
+        }
 
         if (!job) {
           lastRunId = null;
@@ -644,6 +649,31 @@ class NodeHostImpl implements NodeHost {
   // --------------------------------------------------------------------------
   // Helpers
   // --------------------------------------------------------------------------
+
+  /**
+   * Put a job this stopped loop dequeued but will not run back to PENDING
+   * with its attempt refunded (`defer`, fenced on this claim). A transport
+   * without `defer` leaves it RUNNING; the stale-lease reaper then releases
+   * it with the attempt still counted.
+   */
+  private async returnUnstartedJob(
+    job: NonNullable<Awaited<ReturnType<JobTransport["dequeue"]>>>,
+  ): Promise<void> {
+    if (!this.jobTransport.defer) return;
+    const fence = job.startedAt
+      ? { startedAt: job.startedAt, attempt: job.attempt }
+      : undefined;
+    try {
+      await this.jobTransport.defer(
+        job.jobId,
+        new Date(),
+        "host stopped before running the job",
+        fence,
+      );
+    } catch (error) {
+      console.error("[NodeHost] Could not return an unstarted job:", error);
+    }
+  }
 
   private sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));

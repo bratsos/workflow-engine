@@ -1101,6 +1101,86 @@ describe("NodeHost", () => {
     expect(run?.output).toEqual({ result: "HELLO" });
   });
 
+  it("refunds the attempt of a job dequeued while stop() runs, so stops never use up its retries", async () => {
+    let calls = 0;
+    const flaky = defineStage({
+      id: "flaky",
+      name: "Flaky",
+      schemas: { input: schema, output: outputSchema, config: z.object({}) },
+      async execute(ctx) {
+        if (++calls === 1) throw new Error("transient failure");
+        return { output: { result: ctx.input.data } };
+      },
+    });
+    const workflow = new WorkflowBuilder(
+      "stop-wf",
+      "Stop",
+      "Test",
+      schema,
+      outputSchema,
+    )
+      .pipe(flaky)
+      .build();
+    const { kernel, persistence, jobTransport } = createTestEnv([workflow]);
+    const { workflowRunId } = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "stop-1",
+      workflowId: "stop-wf",
+      input: { data: "x" },
+    });
+    await kernel.dispatch({
+      type: "run.claimPending",
+      workerId: "test-worker",
+      maxClaims: 1,
+    });
+    const dequeue = jobTransport.dequeue.bind(jobTransport);
+    const make = () =>
+      createNodeHost({
+        kernel,
+        jobTransport,
+        workerId: "test-worker",
+        orchestrationIntervalMs: 60_000,
+        jobPollIntervalMs: 5,
+        shutdownTimeoutMs: 10,
+        flushOutboxOnStop: false,
+      });
+    // Two stops, each while a real dequeue has claimed the job and its
+    // response is still on the way back to the loop.
+    for (let stop = 0; stop < 2; stop++) {
+      let claimed!: () => void;
+      let respond!: () => void;
+      const hit = new Promise<void>((resolve) => (claimed = resolve));
+      const held = new Promise<void>((resolve) => (respond = resolve));
+      let returned!: Promise<unknown>;
+      jobTransport.dequeue = (...args) =>
+        (returned = dequeue(...args).then(async (job) => {
+          claimed();
+          await held;
+          return job;
+        }));
+      const stopping = make();
+      await stopping.start();
+      await hit;
+      expect((await jobTransport.getJobsByWorkflowRun(workflowRunId))[0]).toMatchObject({ status: "RUNNING", attempt: 1 });
+      await stopping.stop();
+      respond();
+      await returned;
+      await waitFor(async () => {
+        const [job] = await jobTransport.getJobsByWorkflowRun(workflowRunId);
+        return job?.status === "PENDING";
+      });
+      expect((await jobTransport.getJobsByWorkflowRun(workflowRunId))[0]?.attempt).toBe(0);
+    }
+    jobTransport.dequeue = dequeue;
+    host = make();
+    await host.start();
+    await waitFor(
+      async () => (await persistence.getRun(workflowRunId))?.status === "COMPLETED",
+      10_000,
+    );
+    expect(calls).toBe(2);
+  });
+
   it("flushes the outbox on stop() so a run finished by this process is published", async () => {
     const workflow = createSimpleWorkflow();
     const { kernel, persistence, jobTransport, eventSink } = createTestEnv([
