@@ -762,13 +762,32 @@ export class PrismaConsoleReadPort implements ConsoleReadPort {
   }
 
   /** One `SELECT` against whichever client the surrounding `read` gave us. */
-  private select<T>(
+  private async select<T>(
     client: ConsolePrismaClient,
     columns: RawColumns,
     sql: string,
     params: unknown[],
   ): Promise<T[]> {
-    return rawFor(client, columns).$queryRawUnsafe<T[]>(sql, ...params);
+    const json = Object.keys(columns).filter((k) => columns[k] === "json");
+    if (this.databaseType !== "sqlite" || json.length === 0)
+      return rawFor(client, columns).$queryRawUnsafe<T[]>(sql, ...params);
+    // A JSON column holds a JSON number as a SQLite number (its type's
+    // affinity is NUMERIC), which Prisma 7 refuses to read as JSON. These
+    // columns are selected as `json(column)` (`jsonColumn`): text on every
+    // major, parsed here.
+    const rows = await rawFor(client, {
+      ...columns,
+      ...Object.fromEntries(json.map((k) => [k, "text" as const])),
+    }).$queryRawUnsafe<Record<string, unknown>[]>(sql, ...params);
+    for (const row of rows)
+      for (const k of json)
+        if (typeof row[k] === "string") row[k] = JSON.parse(row[k]);
+    return rows as T[];
+  }
+
+  /** A JSON column as `select` reads it: on SQLite as `json(column)`. */
+  private jsonColumn(name: string): string {
+    return this.databaseType === "sqlite" ? `json(${name}) AS ${name}` : name;
   }
 
   /**
@@ -1321,7 +1340,7 @@ WHERE "workflowRunId" = ${this.param(1)} AND sequence > ${this.param(2)} AND seq
           `SELECT id, "createdAt", "updatedAt", "workflowId", "workflowName", "workflowType",
        status, "startedAt", "completedAt", duration, "totalCost", "totalTokens", priority,
        "definitionVersion", "redriveCount",
-       input, output, config, metadata
+       ${["input", "output", "config", "metadata"].map((c) => this.jsonColumn(c)).join(", ")}
 FROM "workflow_runs" WHERE id = ${this.param(1)}`,
           [runId],
         );
@@ -1521,7 +1540,7 @@ LIMIT ${stepLimit + 1}`,
   ): Promise<{ rows: RawAnnotationRow[]; more: boolean }> {
     const from = `FROM "workflow_annotations"${indexedBy(index)} WHERE "workflowRunId" = ${this.param(1)}`;
     const columns = `id, "createdAt", "workflowRunId", "workflowStageRecordId", attempt, scope,
-       "scopeId", "actorKind", "actorId", key, value`;
+       "scopeId", "actorKind", "actorId", key, ${this.jsonColumn("value")}`;
     const times = await this.firstRows<{ createdAt: unknown }>(
       client,
       { createdAt: "timestamp" },
