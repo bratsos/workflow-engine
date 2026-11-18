@@ -1036,8 +1036,9 @@ The engine refuses such a file, and it does not run on a file it could not check
 
 | What the check finds | What the operation does | Remembered for the client |
 | --- | --- | --- |
-| A stored date of another class or form | Throws `SqliteDateStorageError` (`code: "SQLITE_DATE_STORAGE_MISMATCH"`, `kind: "class"` or `"form"`, `column`) before it reads or writes anything; the message shows what is stored, what is bound and where, and links this section. | Yes: every later call throws it. |
-| Stored dates, all of this client's class and form | Runs. | Yes: no further check on this client. |
+| A stored date of another class or form | Throws `SqliteDateStorageError` (`code: "SQLITE_DATE_STORAGE_MISMATCH"`, `kind: "class"` or `"form"`, `column`) before it reads or writes anything; the message shows what is stored, what is bound and where, and links this section. | No: every call checks again, so a fixed file runs without a restart. |
+| A date in SQLite's own form (`2026-11-18 06:30:09`) anywhere in an indexed date column, or as the oldest, newest or sampled value | Throws `SqliteDateStorageError` with `kind: "sqlite-timestamp"`, `column`, and `recovery`: the statement that rewrites those rows (see [below](#rows-in-sqlites-own-timestamp-form)). | No: once the rows are rewritten, the next call runs. |
+| Stored dates, all of this client's class and form | Runs. | Yes: no further check on this client. On a Prisma 8 root client whose connection is inside a transaction the consumer opened, the check saw uncommitted rows, so it is not remembered. |
 | No stored date (an empty file, or one holding only workflow definitions and blobs) | Runs. | No: the next call checks again. |
 | The check fails (a database error, a missing table, a busy file) | Throws `SqliteDateStorageUnverifiedError` (`code: "SQLITE_DATE_STORAGE_UNVERIFIED"`, `reason: "probe-failed"`, the original rejection as `cause`) and does not run. If the rejection cannot be formatted, the message says `Unprintable error`. | No: the next call checks again. |
 | The client exposes neither `$queryRaw` nor `$queryRawUnsafe` | Throws `SqliteDateStorageUnverifiedError` with `reason: "no-raw-query"`, naming both, on every call. | Not applicable. |
@@ -1054,10 +1055,30 @@ Both errors are exported from `@bratsos/workflow-engine`. All six cross directio
 
 - **Hosts fail fast.** `createNodeHost(...).start()` rejects with the error before it starts a timer, a loop or a signal handler; a `stop()` while that check is still pending cancels the start (nothing is installed when the check settles). The serverless host's `handleJob`, `processAvailableJobs` and `runMaintenanceTick` check before they dispatch anything, on every call. Both call the optional `JobTransport.verifyStorage()`, which the Prisma job queue implements; a custom transport without it starts as before.
 - **The console refuses too.** `createPrismaConsoleReadPort` binds dates in its filters and keyset cursors, so on a foreign file it listed the wrong runs; on SQLite it now runs the same check before each read, through `$queryRawUnsafe` when that is all its client has.
-- **Cost.** One statement per client until a check is conclusive, shared by every adapter and the console on that client: ten index lookups, four one-row reads and a column metadata check, p50 0.22 to 0.50 ms (Prisma 7, 6 and 8) with 100,000 rows in each of `workflow_runs`, `workflow_stages`, `job_queue`, `outbox_events`, `idempotency_keys` and `ai_calls`. On a file with no stored date every call checks again.
+- **Cost.** One statement per client until a check is conclusive, shared by every adapter and the console on that client: ten index lookups, four one-row reads, a column metadata check, and one index seek per stored day in each of the five indexed columns (the walk for [SQLite's own form](#rows-in-sqlites-own-timestamp-form)). Measured locally on a file with 100,000 runs and 100,000 published events, the statement took a median 0.02 ms when every date fell on one day, 0.36 ms over 365 days and 1.03 ms over 1,000 days: about half a microsecond per stored day and column. A pass is remembered, so a client pays this once. On a file with no stored date, and on a refused file, every call checks again.
 - **Not checked:** the blob store compares no dates.
 
-What a bounded probe cannot see: a foreign text form (Prisma 7's against Prisma 8's) on rows strictly between the oldest and the newest of a column, and the rows of a sampled table other than the one it reads. A class mix in an indexed column is always seen, because every integer sorts before every text value and so changes the oldest or the newest of its column. While one major at a time uses a file, such rows cannot arise (the first call on a foreign file refuses); only a file an earlier release mixed, or two majors writing one file at once, can hold them.
+What a bounded probe cannot see: the other ISO text form (Prisma 7's `+00:00` among Prisma 8's `Z`, or the reverse) on rows strictly between the oldest and the newest of an indexed column, since the two forms interleave within a day; and any row of a sampled table (`job_queue.createdAt`, `outbox_events.occurredAt`, `idempotency_keys.createdAt`, `ai_calls.createdAt`) other than the one it reads, SQLite's own form included. Such a row is seen once it becomes the oldest, the newest or the row read, for example after `run.purge` or a queue cleanup deletes the rows around it: the file is then refused from that call on. A class mix in an indexed column is always seen, because every integer sorts before every text value and so changes the oldest or the newest of its column. While one major at a time uses a file, the ISO mix cannot arise (the first call on a foreign file refuses); only a file an earlier release mixed, or two majors writing one file at once, can hold it.
+
+#### Rows in SQLite's own timestamp form
+
+SQLite's date functions and `CURRENT_TIMESTAMP` write `2026-11-18 06:30:09`: a space, not a `T`, and no fraction or zone. The engine never writes this form. Other SQL does: an insert that leaves `createdAt` out of `workflow_runs`, `job_queue`, `idempotency_keys` or `ai_calls` in a Prisma 6 or 7 schema (their column default is `CURRENT_TIMESTAMP`; Prisma 8's default writes the client's own form), any statement or tool that writes `CURRENT_TIMESTAMP` or `datetime('now')`, and seed or migration scripts that do either. Such a row is compared wrongly: as text it sorts after every integer date of a Prisma 6 file, and before every ISO date of its own day in a Prisma 7 or 8 file, so retention, the stuck-run reaper and stage polls treat it as up to a day early.
+
+The check walks each indexed date column day by day (`workflow_runs.createdAt`, `outbox_events.publishedAt` and `dlqAt`, `workflow_stages.nextPollAt`, `job_queue.nextPollAt`): within a day this form sorts first, so the first text value of each stored day reveals it, one index seek per day that holds a date, wherever the row lies. The file is refused with `kind: "sqlite-timestamp"`, and the error's `recovery` is the statement for the column it names. Rewrite the rows in your client's form, in a separate process (for example the `sqlite3` shell with `.timeout 10000`), for that column and every other date column your SQL writes, then retry; no restart is needed, since a refusal is not remembered. Per major, for `workflow_runs.createdAt`:
+
+```sql
+-- Prisma 6 (integer epoch milliseconds; also Prisma 7 with timestampFormat "unixepoch-ms")
+UPDATE "workflow_runs" SET "createdAt" = CAST(ROUND((julianday("createdAt") - 2440587.5) * 86400000) AS INTEGER)
+WHERE typeof("createdAt") = 'text' AND substr("createdAt", 11, 1) = ' ';
+-- Prisma 7 (ISO text ending in +00:00)
+UPDATE "workflow_runs" SET "createdAt" = strftime('%Y-%m-%dT%H:%M:%f+00:00', "createdAt")
+WHERE substr("createdAt", 11, 1) = ' ';
+-- Prisma 8 (ISO text ending in Z)
+UPDATE "workflow_runs" SET "createdAt" = strftime('%Y-%m-%dT%H:%M:%fZ', "createdAt")
+WHERE substr("createdAt", 11, 1) = ' ';
+```
+
+`CURRENT_TIMESTAMP` is UTC, as the rewritten values are. To keep it from happening, set the date in your SQL in the client's form, or insert through the Prisma client.
 
 ### Switching SQLite Prisma majors
 
