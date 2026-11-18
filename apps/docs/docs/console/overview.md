@@ -538,8 +538,10 @@ behind another transaction (SQLite takes one at a time) gives up after
 `"connection"`, whether or not the engine's adapters are built on the same
 client. The reader bounds this wait itself on SQLite: on Prisma 6 and 7 the
 engine's adapters queue each transaction's begin behind the one before, and
-that queue is outside Prisma's `maxWait`. With `statementTimeoutMs: 0` it
-waits for that transaction.
+that queue is outside Prisma's `maxWait`. The wait is measured from when the
+read is sent, so a bound shorter than the machine's own delay before the
+transaction begins also answers 504. With `statementTimeoutMs: 0` it waits for
+that transaction.
 
 The run detail's cursors need its transaction to keep one server connection:
 behind a pooler, use a transaction-scoped connection (PgBouncer's transaction

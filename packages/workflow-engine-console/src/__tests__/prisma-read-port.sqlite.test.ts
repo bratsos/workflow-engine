@@ -2411,7 +2411,9 @@ CREATE INDEX back_logs ON workflow_logs (workflowRunId);`);
   });
 
   it("serves SQLite-backed runs through the real console handler and does not issue SET LOCAL", async () => {
-    const port = reader(1);
+    // A positive bound, which SET LOCAL would follow on Postgres; long
+    // enough that no machine's begin misses it.
+    const port = reader();
     const handler = createWorkflowConsole({
       reader: port,
       authorize: () => true,

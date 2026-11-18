@@ -1890,8 +1890,15 @@ WHERE n.nspname = 'console_plan_statistics' AND c.relkind = 'r'`,
           error: { code: "query_timeout" },
         });
         await holder;
-        // The pool is free again: the next read works.
-        expect((await port.getRunDetail("run-1"))?.run.id).toBe("run-1");
+        // The pool is free again: the next read works. With a bound no
+        // machine's begin misses: the wait is measured from the send.
+        expect(
+          (
+            await createPrismaConsoleReadPort(one, {
+              now: () => at(100),
+            }).getRunDetail("run-1")
+          )?.run.id,
+        ).toBe("run-1");
       } finally {
         await one.$disconnect?.();
       }
