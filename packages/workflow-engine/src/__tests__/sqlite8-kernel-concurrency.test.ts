@@ -534,3 +534,129 @@ describe
     }, 30_000);
   },
 );
+
+// A root read whose consumer keeps it open (a for-await loop over db.orm, an
+// iterator left unfinished) must never be waited on without a bound: its
+// consumer may be awaiting the very write that would wait for it. Each case
+// matches the adapter without the read coordination: what completes there
+// completes here at once, what fails there fails here as soon, nothing hangs.
+describe
+  .skipIf(!sqlite || process.env.PRISMA_MAJOR !== "8")
+  .each(["delete", "wal"] as const)(
+  "a root read its consumer holds, journal mode %s",
+  (mode) => {
+    let db: KernelDatabase;
+    let n = 0;
+    const create = () =>
+      db.kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: `held-${mode}-${n++}`,
+        workflowId: db.workflow.id,
+        input: { value: "held" },
+      });
+    const settle = async (work: Promise<unknown>) => {
+      const start = Date.now();
+      const outcome = await work.then(
+        () => "ok",
+        (error: Error) => error.message,
+      );
+      return { outcome, ms: Date.now() - start };
+    };
+    const runs = () => db.client.workflowRun.count();
+    beforeAll(async () => {
+      db = await kernelDatabase();
+      if (mode === "wal")
+        await db.client
+          .$withColumns({ journal_mode: "text" })
+          .$queryRawUnsafe("PRAGMA journal_mode = WAL");
+      for (let i = 0; i < 3; i++) await create();
+    }, 120_000);
+    afterAll(async () => {
+      await db?.close();
+    });
+
+    it("runs a write awaited inside the loop without waiting for the loop's read", async () => {
+      const before = await runs();
+      let inside: { outcome: string; ms: number } | undefined;
+      let dispatched: { outcome: string; ms: number } | undefined;
+      for await (const _ of db.native.orm.WorkflowRun.all()) {
+        inside ??= await settle(
+          db.client.workflowRun.create({
+            data: {
+              workflowId: db.workflow.id,
+              workflowName: "w",
+              workflowType: "t",
+              input: {},
+            },
+          }),
+        );
+        dispatched ??= await settle(create());
+      }
+      expect(inside?.outcome).toBe("ok");
+      expect(inside!.ms).toBeLessThan(1000);
+      // Bounded by the busy timeout (5 s), as without the coordination: on a
+      // rollback journal the open read keeps the commit out.
+      expect(dispatched!.ms).toBeLessThan(8000);
+      if (dispatched!.outcome !== "ok")
+        expect(dispatched!.outcome).toMatch(
+          /Transaction commit failed|database is locked/,
+        );
+      // In WAL a refused dispatch may still be stored: the kernel completes
+      // its idempotency key after the commit, a known limit on any database.
+      expect(await runs()).toBeGreaterThanOrEqual(
+        before + 1 + (dispatched!.outcome === "ok" ? 1 : 0),
+      );
+    }, 30_000);
+
+    it("lets every later caller through after an iterator is left unfinished", async () => {
+      const it = db.native.orm.WorkflowRun.all()[Symbol.asyncIterator]();
+      try {
+        await it.next();
+        const dispatched = await settle(create());
+        expect(dispatched.ms).toBeLessThan(8000);
+        const later = await settle(
+          db.client.workflowRun.create({
+            data: {
+              workflowId: db.workflow.id,
+              workflowName: "w",
+              workflowType: "t",
+              input: {},
+            },
+          }),
+        );
+        // In WAL the open read's snapshot is older than the dispatch's commit:
+        // a write on its connection fails at once, as without the coordination.
+        if (mode === "delete") expect(later).toMatchObject({ outcome: "ok" });
+        else expect(later.outcome).toMatch(/^ok$|database is locked/);
+        expect(later.ms).toBeLessThan(1000);
+        expect(
+          (await db.persistence.getRunsByStatus("PENDING")).length,
+        ).toBeGreaterThan(0);
+        expect(
+          (await db.native.orm.WorkflowRun.all().toArray()).length,
+        ).toBeGreaterThan(0);
+      } finally {
+        await it.return?.();
+      }
+      expect(await settle(create())).toMatchObject({ outcome: "ok" });
+    }, 30_000);
+
+    it("finishes a loop of nested root reads while the engine writes beside it", async () => {
+      const pause = (ms: number) => new Promise((r) => setTimeout(r, ms));
+      const before = await runs();
+      const background = pause(20).then(() => settle(create()));
+      let rows = 0;
+      for await (const row of db.native.orm.WorkflowRun.all()) {
+        await db.persistence.getRun((row as { id: string }).id);
+        await db.native.orm.WorkflowRun.all().toArray();
+        rows++;
+        await pause(1);
+      }
+      // The loop reads its snapshot: in WAL the dispatch beside it may commit meanwhile.
+      expect(rows).toBe(before);
+      // As without the coordination: on a rollback journal it fails.
+      expect((await background).ms).toBeLessThan(8000);
+      expect(await settle(create())).toMatchObject({ outcome: "ok" });
+    }, 30_000);
+  },
+);

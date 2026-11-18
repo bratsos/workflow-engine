@@ -1998,5 +1998,168 @@ describe
         (await prisma.workflowRun.findMany()).map((r: any) => r.priority),
       ).toEqual(mode === "wal" ? [9, 9, 9, 9] : [5, 5, 5, 5]);
     }, 30_000);
+
+    // A read that does not end (a driver step that never returns) is waited
+    // for at most the busy timeout, and the write then fails no later than it
+    // would have without the wait; every caller after it runs.
+    it("gives up on a read that does not end, at the busy timeout, and lets later callers through", async () => {
+      const held: Array<() => void> = [];
+      let armed = false;
+      const gated = new Proxy(db, {
+        get(target, prop) {
+          if (prop === "query")
+            return (plan: unknown) => {
+              const result = target.query(plan);
+              if (!armed) return result;
+              armed = false;
+              return {
+                toArray: async () => {
+                  const it = result[Symbol.asyncIterator]();
+                  const rows: unknown[] = [];
+                  let step = await it.next();
+                  if (!step.done) rows.push(step.value);
+                  await new Promise<void>((release) => held.push(release));
+                  while (!(step = await it.next()).done) rows.push(step.value);
+                  return rows;
+                },
+              };
+            };
+          const value = Reflect.get(target, prop, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      const prisma: any = fromPrisma8(gated);
+      await prisma.workflowRun.deleteMany({});
+      await prisma.workflowRun.createMany({ data: [run("a"), run("b")] });
+      armed = true;
+      // Started now: the adapter's calls run when awaited, as Prisma's do.
+      const stuck = prisma.workflowRun
+        .findMany()
+        .then((rows: unknown[]) => rows);
+      while (held.length === 0) await pause(1);
+      const timed = async (work: Promise<unknown>) => {
+        const start = Date.now();
+        const outcome = await work.then(
+          () => "ok",
+          (error: Error) => error.message,
+        );
+        return { outcome, ms: Date.now() - start };
+      };
+      try {
+        // wal: a commit from another connection makes the read's snapshot
+        // stale, so the root write after it fails 517 and waits for the read.
+        if (mode === "wal")
+          await prisma.$transaction((tx: any) =>
+            tx.workflowRun.create({ data: run("c") }),
+          );
+        const write = await timed(
+          mode === "delete"
+            ? prisma.$transaction((tx: any) =>
+                tx.workflowRun.create({ data: run("c") }),
+              )
+            : prisma.workflowRun.updateMany({ data: { priority: 3 } }),
+        );
+        // delete: COMMIT gets what is left of the one 5 s wait. wal: the
+        // retry after the wait meets the same snapshot. Both fail, as they
+        // would at once without the wait.
+        expect(write.outcome).not.toBe("ok");
+        expect(write.ms).toBeLessThan(7000);
+        expect(write.ms).toBeGreaterThan(4000);
+        const later = await timed(prisma.workflowRun.count());
+        expect(later).toMatchObject({ outcome: "ok" });
+        expect(later.ms).toBeLessThan(1000);
+      } finally {
+        for (const release of held) release();
+      }
+      expect(await stuck).toHaveLength(2);
+      await expect(
+        prisma.workflowRun.create({ data: run("d") }),
+      ).resolves.toBeTruthy();
+    }, 30_000);
+  },
+);
+
+// Constructing the adapter must change nothing on the client: `db.runtime()`
+// starts its connection, so the adapter looks the driver up at first use.
+describe.skipIf(process.env.PRISMA_MAJOR !== "8")(
+  "fromPrisma8 and the client's own connection",
+  () => {
+    let dir: string;
+    let file: string;
+    let sqlite: (options: object) => any;
+    let contract: unknown;
+    const clients: any[] = [];
+    const client = (withPath = true) => {
+      const db = sqlite(withPath ? { contract, path: file } : { contract });
+      clients.push(db);
+      return db;
+    };
+    beforeAll(async () => {
+      dir = mkdtempSync(join(tmpdir(), "workflow-prisma8-connect-"));
+      file = join(dir, "engine.db");
+      const fixture = require(join(fixtureDir, "index.cjs"));
+      const db = await fixture.createSqliteDb(file);
+      contract = db.contract;
+      await db.close();
+      sqlite = createRequire(join(fixtureDir, "index.cjs"))(
+        "@prisma/orm-sqlite/runtime",
+      ).default;
+    }, 30_000);
+    afterAll(async () => {
+      for (const db of clients) await db.close().catch(() => {});
+      if (dir) rmSync(dir, { recursive: true, force: true });
+    });
+
+    it("leaves connect() to the client, before or after the adapter is built", async () => {
+      const after = client();
+      const adapter = fromPrisma8(after);
+      await expect(after.connect()).resolves.toBeTruthy();
+      expect(await adapter.workflowRun.count()).toBe(0);
+
+      const before = client();
+      await before.connect();
+      expect(await fromPrisma8(before).workflowRun.count()).toBe(0);
+
+      const lazy = client(false);
+      const late = fromPrisma8(lazy);
+      await lazy.connect({ path: file });
+      expect(await late.workflowRun.count()).toBe(0);
+
+      // Never connected explicitly: the first call connects, as the client's own would.
+      expect(await fromPrisma8(client()).workflowRun.count()).toBe(0);
+    });
+
+    it("fails as the client does once the client is closed", async () => {
+      const db = client();
+      const adapter = fromPrisma8(db);
+      await db.close();
+      await expect(adapter.workflowRun.count()).rejects.toThrow(/closed/);
+      await expect(db.orm.WorkflowRun.all().toArray()).rejects.toThrow(
+        /closed/,
+      );
+    });
+
+    it("warns once when the client exposes no root driver", async () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const db = client();
+        for (let i = 0; i < 2; i++) {
+          const bare = fromPrisma8(
+            Object.create(db, { runtime: { value: () => ({}) } }),
+          );
+          expect(await bare.workflowRun.count()).toBe(i);
+          await bare.workflowRun.create({ data: run(`bare-${i}`) });
+        }
+        const warned = warn.mock.calls.filter(([m]) =>
+          String(m).includes("no root driver"),
+        );
+        expect(warned).toHaveLength(1);
+        expect(String(warned[0]![0])).toMatch(
+          /not coordinated.*Transaction commit failed.*not queued.*not refused/s,
+        );
+      } finally {
+        warn.mockRestore();
+      }
+    });
   },
 );
