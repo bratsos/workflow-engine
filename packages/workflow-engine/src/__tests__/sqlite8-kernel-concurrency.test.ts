@@ -545,6 +545,72 @@ describe
   },
 );
 
+// SQLite 3.53.4 (node:sqlite on Node 22 and 24) keeps a connection's page
+// cache as of that connection's last read when it leaves WAL, though another
+// connection committed since: its next write then drops rows or breaks
+// indexes in the file. Engine transactions commit on their own connections.
+describe.skipIf(!sqlite || process.env.PRISMA_MAJOR !== "8")(
+  "the root connection leaving WAL after an engine commit",
+  () => {
+    const { DatabaseSync } =
+      process.env.PRISMA_MAJOR === "8"
+        ? createRequire(import.meta.url)("node:sqlite")
+        : ({} as any);
+    const run = (id: string) => ({
+      data: {
+        id,
+        workflowId: "w",
+        workflowName: "w",
+        workflowType: "t",
+        input: {},
+      },
+    });
+    it.each([
+      "the wrapped client",
+      "db.query",
+    ] as const)("keeps every row and index of the file, switched through %s", async (via) => {
+      const db = await kernelDatabase();
+      try {
+        await db.client
+          .$withColumns({ journal_mode: "text" })
+          .$queryRawUnsafe("PRAGMA journal_mode = WAL");
+        for (let i = 0; i < 40; i++)
+          await db.client.workflowRun.create(run(`seed-${i}`));
+        expect(await db.client.workflowRun.findMany()).toHaveLength(40);
+        await db.client.$transaction((tx: any) =>
+          tx.workflowRun.create(run("engine")),
+        );
+        if (via === "db.query")
+          await db.native
+            .query(
+              db.native.raw.sql`PRAGMA journal_mode = DELETE`
+                .returnsRow({ journal_mode: "sqlite/text@1" })
+                .build(),
+            )
+            .toArray();
+        else
+          await db.client
+            .$withColumns({ journal_mode: "text" })
+            .$queryRawUnsafe("PRAGMA journal_mode = DELETE");
+        await db.client.workflowRun.create(run("root"));
+        const raw = new DatabaseSync(db.file);
+        try {
+          expect(raw.prepare("PRAGMA integrity_check").all()).toEqual([
+            { integrity_check: "ok" },
+          ]);
+          expect(
+            raw.prepare("SELECT count(*) AS n FROM workflow_runs").get().n,
+          ).toBe(42);
+        } finally {
+          raw.close();
+        }
+      } finally {
+        await db.close();
+      }
+    }, 60_000);
+  },
+);
+
 // A root read whose consumer keeps it open (a for-await loop over db.orm, an
 // iterator left unfinished) must never be waited on without a bound: its
 // consumer may be awaiting the very write that would wait for it. Each case

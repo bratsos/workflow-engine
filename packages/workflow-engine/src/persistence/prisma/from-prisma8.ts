@@ -651,6 +651,17 @@ async function inTurn(x: Executor): Promise<void> {
 }
 
 /**
+ * SQLite 3.53.4 (node:sqlite on Node 22 and 24) keeps a connection's page
+ * cache as of its last read when `journal_mode` takes it out of WAL, though
+ * another connection (an engine transaction's) committed since: its next
+ * write then drops rows or breaks indexes in the file. A read of the header
+ * just before brings the cache up to date.
+ */
+const setsJournalMode = (statement: ReturnType<typeof statementOf>) =>
+  statement.first === "PRAGMA" && /journal_mode\s*[=(]/i.test(statement.source);
+const REFRESH_CACHE = "PRAGMA schema_version";
+
+/**
  * A statement that may write, on the root connection, in its queue turn.
  * node:sqlite leaves a statement that fails SQLITE_BUSY at its first step
  * active when it runs through `iterate()`, which the Prisma 8 driver uses for
@@ -670,6 +681,14 @@ async function rootWrite(
   statement: ReturnType<typeof statementOf>,
 ): Promise<Row[]> {
   const rows = () => x.query(plan).toArray();
+  if (setsJournalMode(statement))
+    await x
+      .query(
+        buildPlan(x, new Sql().t(REFRESH_CACHE), {
+          schema_version: SQLITE_TYPES.int!,
+        }).plan,
+      )
+      .toArray();
   if (!statement.returning) {
     try {
       await affected(x, q);
@@ -1775,7 +1794,10 @@ function ownRootConnection(
       for await (const row of query(request)) rows.push(row);
       return rows;
     };
-    if (classify(request.sql).first === "PRAGMA") return all();
+    const statement = classify(request.sql);
+    if (setsJournalMode(statement))
+      for await (const _ of query({ sql: REFRESH_CACHE, params: [] }));
+    if (statement.first === "PRAGMA") return all();
     await exec("BEGIN IMMEDIATE");
     try {
       await all();
