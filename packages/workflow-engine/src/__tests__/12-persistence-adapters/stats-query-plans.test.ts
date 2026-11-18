@@ -1323,9 +1323,11 @@ ${text}`;
               );
               expect(lookup).toBeDefined();
               const high = await plan(lookup!, false, !sqlite);
-              // shortcut: drained statistics can send the highest-sequence lookup
-              // through outbox_events_delivery_cursor_idx (all the run's rows);
-              // the append path is not bounded for that state yet.
+              // shortcut: under drained statistics the planner reads all of the
+              // run's rows for the highest-sequence lookup (99,998 at 100k: 1,593
+              // buffers here, through any index on "workflowRunId"); alpha.20's
+              // MAX(sequence) read the same rows in that state (1,796 buffers).
+              // Bound it when the append pins its plan as the claim does.
               if (n && statistics !== "emptied") {
                 expect(high).toContain(
                   sqlite && major === "8"

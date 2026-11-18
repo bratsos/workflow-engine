@@ -121,6 +121,62 @@ describe("kernel: outbox.flush with a misbehaving persistence port", () => {
     20_000,
   );
 
+  it("acknowledges a run's share of the page in one write, and its accepted events before a failure write releases the rest", async () => {
+    const persistence = new InMemoryWorkflowPersistence();
+    const append = (run: string, count: number) =>
+      persistence.appendOutboxEvents(
+        Array.from({ length: count }, (_, i) => ({
+          workflowRunId: run,
+          eventType: "probe",
+          payload: { type: "probe" },
+          causationId: `${run}${i}`,
+          occurredAt: new Date(),
+        })),
+      );
+    await append("a", 8);
+    await append("b", 3);
+    const writes: string[] = [];
+    const complete = persistence.completeOutboxDeliveries.bind(persistence);
+    persistence.completeOutboxDeliveries = async (ids, ...rest) => {
+      writes.push(`ack ${ids.length}`);
+      return complete(ids, ...rest);
+    };
+    const fail = persistence.failOutboxDelivery.bind(persistence);
+    persistence.failOutboxDelivery = async (...args) => {
+      writes.push("fail");
+      return fail(...args);
+    };
+    let rejectB2 = true;
+    const calls: string[] = [];
+    const kernel = createKernel({
+      persistence,
+      jobTransport: new InMemoryJobQueue(),
+      blobStore: new InMemoryBlobStore(),
+      clock: { now: () => new Date() },
+      registry: { getWorkflow: () => undefined },
+      eventSink: {
+        async emit(_event, delivery) {
+          const key = `${delivery!.workflowRunId}${delivery!.sequence}`;
+          calls.push(key);
+          // b1 settles after a's eight, so the two runs end apart.
+          if (key === "b1") await new Promise((r) => setTimeout(r, 5));
+          if (key === "b2" && rejectB2) throw new Error("sink rejected");
+        },
+      },
+    });
+    expect(
+      await kernel.dispatch({ type: "outbox.flush", maxEvents: 22 }),
+    ).toMatchObject({ published: 9, failed: 1 });
+    expect(writes).toEqual(["ack 8", "ack 1", "fail"]);
+    rejectB2 = false;
+    calls.length = 0;
+    expect(
+      (await kernel.dispatch({ type: "outbox.flush", maxEvents: 22 }))
+        .published,
+    ).toBe(2);
+    expect(calls).toEqual(["b2", "b3"]);
+  });
+
   it("does not emit a run's next event once the claim expired during the one before", async () => {
     const persistence = new InMemoryWorkflowPersistence();
     await persistence.appendOutboxEvents(

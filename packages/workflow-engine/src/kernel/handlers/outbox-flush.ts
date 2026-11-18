@@ -95,11 +95,11 @@ export async function handleOutboxFlush(
     if (interrupted(expiresAt) || !events.length) break;
     attempted += events.length;
 
-    // Acknowledge accepted events together: one write carries every event
-    // accepted while the previous write was in flight, and the first waits
-    // one turn so runs whose sinks settle together share it. A run's next
-    // event does not wait for the acknowledgement of the one before it; a
-    // crash in between redelivers both, in order.
+    // Acknowledge accepted events together: a run's when its share of the
+    // page ends, every run's that ends while a write is in flight in the next
+    // write, and the first write waits one turn so runs that end together
+    // share it. A run's next event does not wait for the acknowledgement of
+    // the one before it; a crash in between redelivers both, in order.
     let accepted: string[] = [];
     let writing: Promise<void> | undefined;
     let writeError: { error: unknown } | undefined;
@@ -135,8 +135,9 @@ export async function handleOutboxFlush(
       }
       writing = undefined;
     };
-    const acknowledge = (id: string) => {
-      accepted.push(id);
+    const acknowledge = (ids: string[]) => {
+      if (!ids.length) return;
+      accepted.push(...ids);
       writing ??= write();
     };
 
@@ -149,38 +150,48 @@ export async function handleOutboxFlush(
     }
     const results = await Promise.allSettled(
       [...runs.values()].map(async (run) => {
-        for (const event of run) {
-          if (writeError || interrupted(expiresAt)) return;
-          try {
-            await deps.eventSink.emit(event.payload as KernelEvent, {
-              eventId: event.id,
-              workflowRunId: event.workflowRunId,
-              sequence: event.sequence,
-              attempt: event.retryCount + 1,
-            });
-          } catch (error) {
-            stopAfterPage = true;
-            firstError ??= toErrorMessage(error);
-            let outcome: Awaited<
-              ReturnType<typeof persistence.failOutboxDelivery>
-            >;
+        const sent: string[] = [];
+        try {
+          for (const event of run) {
+            if (writeError || interrupted(expiresAt)) return;
             try {
-              outcome = await persistence.failOutboxDelivery(
-                event.id,
-                claim,
-                maxRetries,
-                deps.clock.now(),
-              );
-            } catch (writeFailure) {
-              // A write error stops the whole page, as an acknowledgement's does.
-              writeError ??= { error: writeFailure };
+              await deps.eventSink.emit(event.payload as KernelEvent, {
+                eventId: event.id,
+                workflowRunId: event.workflowRunId,
+                sequence: event.sequence,
+                attempt: event.retryCount + 1,
+              });
+            } catch (error) {
+              stopAfterPage = true;
+              firstError ??= toErrorMessage(error);
+              // The failure write releases the run's other events under this
+              // claim: acknowledge the ones already accepted first.
+              acknowledge(sent.splice(0));
+              while (writing) await writing;
+              if (writeError) return;
+              let outcome: Awaited<
+                ReturnType<typeof persistence.failOutboxDelivery>
+              >;
+              try {
+                outcome = await persistence.failOutboxDelivery(
+                  event.id,
+                  claim,
+                  maxRetries,
+                  deps.clock.now(),
+                );
+              } catch (writeFailure) {
+                // A write error stops the whole page, as an acknowledgement's does.
+                writeError ??= { error: writeFailure };
+                return;
+              }
+              if (outcome === "dead-lettered") deadLettered++;
+              if (outcome === "retry") failed++;
               return;
             }
-            if (outcome === "dead-lettered") deadLettered++;
-            if (outcome === "retry") failed++;
-            return;
+            sent.push(event.id);
           }
-          acknowledge(event.id);
+        } finally {
+          acknowledge(sent);
         }
       }),
     );
