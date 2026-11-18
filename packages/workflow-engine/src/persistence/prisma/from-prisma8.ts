@@ -652,6 +652,25 @@ async function inTurn(x: Executor): Promise<void> {
 }
 
 /**
+ * In the SQLite that node:sqlite ships on Node 22 and 24, a connection keeps
+ * its page cache as of its last read when `journal_mode` takes it out of WAL,
+ * though another connection (an engine transaction's) committed since: its next
+ * write then drops rows or breaks indexes in the file. An unqualified
+ * `journal_mode` change reaches every attached database too. So the root's
+ * cache is dropped after any root statement that may have changed it, whether
+ * it succeeded or threw: `PRAGMA shrink_memory` only releases the connection's
+ * own memory (measured: it never waited, failed busy or left a statement open;
+ * SQLite documents no lock for it), and it cannot free a page a read still
+ * handing over rows holds (SQLite refuses the change then). A statement
+ * whose text contains `journal_mode`, however spelled, counts: a drop after one
+ * that only reads the mode costs just the cache. A failed drop is ignored, so
+ * the statement's own result or error is what the caller sees.
+ */
+const mayChangeJournalMode = (statement: ReturnType<typeof statementOf>) =>
+  /journal_mode/i.test(statement.source);
+const DROP_CACHE = "PRAGMA shrink_memory";
+
+/**
  * A statement that may write, on the root connection, in its queue turn.
  * node:sqlite leaves a statement that fails SQLITE_BUSY at its first step
  * active when it runs through `iterate()`, which the Prisma 8 driver uses for
@@ -895,7 +914,12 @@ export async function rowsOf(
   let rows: Row[];
   if (wire.statement && !wire.statement.read && sqliteRoot(x, wire.plan)) {
     await inTurn(x);
-    rows = await rootWrite(x, q, wire.plan, wire.statement);
+    try {
+      rows = await rootWrite(x, q, wire.plan, wire.statement);
+    } finally {
+      if (mayChangeJournalMode(wire.statement))
+        await affected(x, new Sql().t(DROP_CACHE)).catch(() => {});
+    }
   } else {
     adopt(x);
     const gate = gateOf(x);
@@ -1848,15 +1872,21 @@ function ownRootConnection(
       for await (const row of query(request)) rows.push(row);
       return rows;
     };
-    if (classify(request.sql).first === "PRAGMA") return all();
-    await exec("BEGIN IMMEDIATE");
+    const statement = classify(request.sql);
     try {
-      await all();
-      await exec("COMMIT");
-      return rows;
-    } catch (error) {
-      await exec("ROLLBACK").catch(() => {});
-      throw error;
+      if (statement.first === "PRAGMA") return await all();
+      await exec("BEGIN IMMEDIATE");
+      try {
+        await all();
+        await exec("COMMIT");
+        return rows;
+      } catch (error) {
+        await exec("ROLLBACK").catch(() => {});
+        throw error;
+      }
+    } finally {
+      if (mayChangeJournalMode(statement))
+        await exec(DROP_CACHE).catch(() => {});
     }
   };
   driver.query = (request) => ({
