@@ -4,10 +4,13 @@ const { join } = require("node:path");
 const { generateOnce } = require("../generate-once.cjs");
 const schema = require("../schema.cjs");
 
-exports.createPostgresClient = (url) => {
+// `max`: the most connections the client's pool opens (the suites' pool of one).
+exports.createPostgresClient = (url, { max } = {}) => {
   const { PrismaClient } = require("@prisma/client");
   const { PrismaPg } = require("@prisma/adapter-pg");
-  return new PrismaClient({ adapter: new PrismaPg({ connectionString: url }) });
+  return new PrismaClient({
+    adapter: new PrismaPg({ connectionString: url, ...(max ? { max } : {}) }),
+  });
 };
 
 const versions = ["prisma", "@prisma/client"].map((name) => require(`${name}/package.json`).version);

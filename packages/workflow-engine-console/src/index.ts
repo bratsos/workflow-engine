@@ -25,6 +25,7 @@ export {
 } from "./actions";
 export {
   ConsoleBadRequestError,
+  type ConsoleQueryLimit,
   ConsoleQueryTimeoutError,
   isStatementTimeout,
 } from "./errors";
@@ -57,6 +58,7 @@ export {
   type LogEntry,
   MAX_LIMIT,
   type QueueHealth,
+  type RunBoundaryEventType,
   type RunCursor,
   type RunDetail,
   type RunDetailOptions,
@@ -65,6 +67,9 @@ export {
   type RunListPage,
   type RunListQuery,
   type RunSummary,
+  type StageEvent,
+  type StageEventLog,
+  type StageLifecycleEventType,
   type StageSummary,
   type StepSummary,
   type SuspendedStage,

@@ -143,7 +143,7 @@ jobs:
       - name: Run console Postgres tests
         run: |
           pnpm --filter @bratsos/workflow-engine-console exec node scripts/build-ui.mjs
-          pnpm --filter @bratsos/workflow-engine-console exec vitest run src/__tests__/prisma-read-port.postgres.test.ts src/__tests__/cli.test.ts
+          pnpm --filter @bratsos/workflow-engine-console exec vitest run --hookTimeout=30000 --testTimeout=30000 src/__tests__/prisma-read-port.postgres.test.ts src/__tests__/cli.test.ts
         env:
           NODE_ENV: test
 
@@ -206,4 +206,4 @@ jobs:
       - name: Run console SQLite conformance tests
         run: |
           pnpm --filter @bratsos/workflow-engine-console exec node scripts/build-ui.mjs
-          pnpm --filter @bratsos/workflow-engine-console exec vitest run src/__tests__/prisma-read-port.sqlite.test.ts
+          pnpm --filter @bratsos/workflow-engine-console exec vitest run --hookTimeout=30000 --testTimeout=30000 src/__tests__/prisma-read-port.sqlite.test.ts

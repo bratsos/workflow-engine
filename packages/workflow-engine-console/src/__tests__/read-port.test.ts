@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { ConsoleBadRequestError } from "../errors";
+import { createWorkflowConsole } from "../handler";
 import {
   type ConsoleFixtures,
   createInMemoryConsoleReadPort,
@@ -10,6 +11,9 @@ import {
   encodeCursor,
   isConsoleStatus,
   MAX_LIMIT,
+  STAGE_EVENT_ERROR_LIMIT,
+  STAGE_EVENT_LIMIT,
+  STAGE_EVENT_WINDOW,
 } from "../read-port";
 
 const T0 = new Date("2026-01-01T00:00:00.000Z");
@@ -328,12 +332,228 @@ describe("in-memory read port: run detail", () => {
     expect(await reader.getRunDetail("nope")).toBeNull();
   });
 
+  it("returns the attempt history's events past a sequence, and calls the range complete only when its rows are unbroken", async () => {
+    const stageEvent = (
+      sequence: number,
+      eventType: any,
+      workflowRunId = "run-1",
+      stageId: string | null = "first",
+    ) => ({
+      workflowRunId,
+      sequence,
+      eventType,
+      occurredAt: at(sequence),
+      stageId,
+      error: eventType === "stage:retrying" ? "boom" : null,
+    });
+    const reader = createInMemoryConsoleReadPort({
+      ...fixtures,
+      events: [], // the plain event list is independent of the lifecycle log
+      stageEvents: [
+        stageEvent(3, "stage:retrying"),
+        stageEvent(2, "stage:started"),
+        stageEvent(1, "stage:started", "other-run"),
+      ],
+    });
+    const detail = await reader.getRunDetail("run-1");
+    expect(detail?.stageEvents?.events.map((e) => e.sequence)).toEqual([2, 3]);
+    expect(detail?.stageEvents?.events[1]).toMatchObject({
+      eventType: "stage:retrying",
+      stageId: "first",
+      error: "boom",
+      errorTruncated: false,
+    });
+    // Sequence 1 is missing for run-1: its first rows were purged.
+    expect(detail?.stageEvents).toMatchObject({
+      after: 0,
+      lastSequence: 3,
+      complete: false,
+      more: false,
+    });
+    // After them the range is unbroken.
+    expect(
+      (await reader.getRunDetail("run-1", { stageEventsAfter: 1 }))
+        ?.stageEvents,
+    ).toMatchObject({ after: 1, lastSequence: 3, complete: true });
+    // Nothing newer: an empty, unbroken range at the same sequence.
+    expect(
+      (await reader.getRunDetail("run-1", { stageEventsAfter: 3 }))
+        ?.stageEvents,
+    ).toEqual({
+      events: [],
+      after: 3,
+      lastSequence: 3,
+      complete: true,
+      more: false,
+    });
+    // Past the run's highest row: the read ends there, so a page holding
+    // more than the run has sees that rows were removed.
+    expect(
+      (await reader.getRunDetail("run-1", { stageEventsAfter: 9 }))
+        ?.stageEvents,
+    ).toEqual({
+      events: [],
+      after: 9,
+      lastSequence: 3,
+      complete: false,
+      more: false,
+    });
+    // The next part of a long history, through the console handler: the run
+    // and its events only.
+    const part = (await (
+      await createWorkflowConsole({ reader, authorize: () => true })(
+        new Request(
+          "https://console.example/console/api/runs/run-1?stageEventsAfter=1&stageEventsOnly=1",
+        ),
+      )
+    ).json()) as {
+      stages: unknown[];
+      steps: unknown[];
+      stageEvents: { lastSequence: number };
+    };
+    expect([part.stages, part.steps]).toEqual([[], []]);
+    expect(part.stageEvents.lastSequence).toBe(3);
+
+    const whole = createInMemoryConsoleReadPort({
+      ...fixtures,
+      events: [fixtures.events![1]!], // sequence 1 is a non-stage event
+      stageEvents: [
+        stageEvent(2, "stage:started"),
+        stageEvent(3, "workflow:cancelled", "run-1", null),
+      ],
+    });
+    const wholeDetail = await whole.getRunDetail("run-1");
+    expect(wholeDetail?.stageEvents?.complete).toBe(true);
+    expect(wholeDetail?.stageEvents?.events[1]).toMatchObject({
+      eventType: "workflow:cancelled",
+      stageId: null,
+    });
+
+    // A first read of a run none of whose rows are retained (other runs' rows
+    // are) finds an empty range, which says nothing of the run's history.
+    const purged = createInMemoryConsoleReadPort({
+      ...fixtures,
+      events: [],
+      stageEvents: [stageEvent(1, "stage:started", "other-run")],
+    });
+    expect((await purged.getRunDetail("run-1"))?.stageEvents).toEqual({
+      events: [],
+      after: 0,
+      lastSequence: 0,
+      complete: false,
+      more: false,
+    });
+  });
+
+  it("reads at most a window of the run's sequences per read, however few of them are lifecycle events", async () => {
+    // Progress rows between two lifecycle events, past one window.
+    const span = STAGE_EVENT_WINDOW + 500;
+    const reader = createInMemoryConsoleReadPort({
+      ...fixtures,
+      events: Array.from({ length: span }, (_, i) => ({
+        id: `progress-${i + 1}`,
+        workflowRunId: "run-1",
+        sequence: i + 1,
+        eventType: "stage:progress",
+        occurredAt: at(0),
+        publishedAt: null,
+        retryCount: 0,
+        dlqAt: null,
+      })),
+      stageEvents: [1, span].map((sequence) => ({
+        workflowRunId: "run-1",
+        sequence,
+        eventType: "stage:started" as const,
+        occurredAt: at(0),
+        stageId: "first",
+        error: null,
+      })),
+    });
+    const first = (await reader.getRunDetail("run-1"))!.stageEvents!;
+    expect(first).toMatchObject({
+      lastSequence: STAGE_EVENT_WINDOW,
+      complete: true,
+      more: true,
+    });
+    expect(first.events.map((e) => e.sequence)).toEqual([1]);
+    const rest = (await reader.getRunDetail("run-1", {
+      stageEventsAfter: first.lastSequence,
+    }))!.stageEvents!;
+    expect(rest).toMatchObject({
+      lastSequence: span,
+      complete: true,
+      more: false,
+    });
+    expect(rest.events.map((e) => e.sequence)).toEqual([span]);
+  });
+
+  it("applies the SQL reader's chunk limit and error cap to the attempt history's events", async () => {
+    const stageEvent = (sequence: number, error: string | null = null) => ({
+      workflowRunId: "run-1",
+      sequence,
+      eventType: "stage:started" as const,
+      occurredAt: at(0),
+      stageId: "first",
+      error,
+    });
+    const many = createInMemoryConsoleReadPort({
+      ...fixtures,
+      events: [],
+      stageEvents: Array.from({ length: STAGE_EVENT_LIMIT + 1 }, (_, i) =>
+        stageEvent(i + 1),
+      ),
+    });
+    // The first read stops at the limit and says more remain; the next read
+    // starts after its last event and finishes the history, each unbroken.
+    const cut = (await many.getRunDetail("run-1"))!.stageEvents!;
+    expect(cut.events).toHaveLength(STAGE_EVENT_LIMIT);
+    expect(cut).toMatchObject({
+      lastSequence: STAGE_EVENT_LIMIT,
+      complete: true,
+      more: true,
+    });
+    const rest = (await many.getRunDetail("run-1", {
+      stageEventsAfter: cut.lastSequence,
+    }))!.stageEvents!;
+    expect(rest.events.map((e) => e.sequence)).toEqual([STAGE_EVENT_LIMIT + 1]);
+    expect(rest).toMatchObject({
+      lastSequence: STAGE_EVENT_LIMIT + 1,
+      complete: true,
+      more: false,
+    });
+
+    const exact = createInMemoryConsoleReadPort({
+      ...fixtures,
+      events: [],
+      stageEvents: Array.from({ length: STAGE_EVENT_LIMIT }, (_, i) =>
+        stageEvent(i + 1),
+      ),
+    });
+    expect((await exact.getRunDetail("run-1"))!.stageEvents!).toMatchObject({
+      complete: true,
+      more: false,
+    });
+
+    const long = createInMemoryConsoleReadPort({
+      ...fixtures,
+      events: [],
+      stageEvents: [stageEvent(1, "x".repeat(STAGE_EVENT_ERROR_LIMIT + 1))],
+    });
+    const [event] = (await long.getRunDetail("run-1"))!.stageEvents!.events;
+    expect(event?.error).toHaveLength(STAGE_EVENT_ERROR_LIMIT);
+    expect(event?.errorTruncated).toBe(true);
+  });
+
   it("tails a run timeline from a sequence cursor", async () => {
     const reader = createInMemoryConsoleReadPort(fixtures);
     expect(
       (await reader.listRunEvents("run-1", 1)).map((event) => event.sequence),
     ).toEqual([2]);
     expect(await reader.listRunEvents("run-1", 2)).toEqual([]);
+    // The same validation as the Prisma port's, on every major.
+    await expect(reader.listRunEvents("run-1", Number.NaN)).rejects.toThrow(
+      ConsoleBadRequestError,
+    );
   });
 });
 

@@ -1,5 +1,19 @@
 import { render } from "preact";
 import { useCallback, useEffect, useMemo, useRef, useState } from "preact/hooks";
+import {
+  type AttemptOutcome,
+  type AttemptRowMismatch,
+  type AttemptRunMismatch,
+  type AttemptStepEntry,
+  type AttemptTrigger,
+  type AttemptUnavailableReason,
+  buildStageAttemptHistory,
+  catchUpStep,
+  type HeldStageEvents,
+  mergeStageEvents,
+  type StageAttempt,
+  type StageAttemptHistory,
+} from "../src/stage-attempts";
 
 interface ConsoleCapabilities {
   runs: boolean;
@@ -123,6 +137,20 @@ interface RunDetail {
   annotations: AnnotationSummary[];
   logs: LogEntry[];
   events: RunEvent[];
+  stageEvents?: {
+    events: Array<{
+      sequence: number;
+      eventType: string;
+      occurredAt: string;
+      stageId: string | null;
+      error: string | null;
+      errorTruncated: boolean;
+    }>;
+    after: number;
+    lastSequence: number;
+    complete: boolean;
+    more: boolean;
+  };
   truncated: {
     steps: boolean;
     annotations: boolean;
@@ -322,9 +350,14 @@ function usePolled<T>(
     setTick((t) => t + 1);
   }, []);
 
+  const wasPaused = useRef(paused);
+
   useEffect(() => {
     let mounted = true;
-    setLoading(true);
+    // Pausing stops the polling; it is no reason to read again. Resuming,
+    // a refresh and a change of what is read each read at once.
+    const justPaused = paused && !wasPaused.current;
+    wasPaused.current = paused;
 
     const execute = async () => {
       try {
@@ -343,7 +376,10 @@ function usePolled<T>(
       }
     };
 
-    void execute();
+    if (!justPaused) {
+      setLoading(true);
+      void execute();
+    }
 
     let timer: ReturnType<typeof setInterval> | null = null;
 
@@ -863,6 +899,307 @@ function StepRow({
   );
 }
 
+/** The reader's cap on a lifecycle event's error text (`STAGE_EVENT_ERROR_LIMIT`). */
+const ERROR_CUT = "2,000";
+
+const OUTCOME_LABEL: Record<AttemptOutcome, string> = {
+  completed: "Completed",
+  failed: "Failed",
+  retrying: "Retrying",
+  suspended: "Suspended",
+  running: "Running",
+  cancelled: "Cancelled",
+  lost: "No end recorded",
+};
+
+const TRIGGER_LABEL: Record<AttemptTrigger, string> = {
+  initial: "First run recorded",
+  "job-retry": "Job retry",
+  "poll-retry": "Retry while suspended (replayed on a poll)",
+  rerun: "Rerun after a redrive",
+  restart: "Started again after the previous attempt ended, with no redrive recorded",
+  redelivery: "Started again while the previous execution had no recorded end",
+};
+
+const UNAVAILABLE_LABEL: Record<AttemptUnavailableReason, string> = {
+  "no-event-history": "this reader does not provide stage events",
+  "events-incomplete":
+    "some of the run's events are missing from its outbox (removed by SQL, such as a pruning job)",
+  "no-retained-events": "none of the run's events are retained in its outbox",
+  "events-loading":
+    "the page has read only part of the run's events so far and is reading the rest",
+  "events-paused":
+    "the page has read only part of the run's events so far, and while polling is paused it reads no more on its own (it reads the rest once polling resumes)",
+  "fewer-redrives":
+    "the run's record counts more redrives than its retained events record, so the events of earlier executions are not retained",
+  "no-stage-events":
+    "the stage's record says it ran, and no lifecycle event of it is retained",
+  "unproven-boundary":
+    "the retained events contradict each other or cannot be attributed (an execution ends with no start recorded, a redrive starts while an execution has no recorded end, or an earlier execution that kept running recorded its outcome after a later one started), so nothing proves where one attempt stops",
+  "invalid-event-time": "a retained event of the run has no readable time",
+  "run-inconsistent":
+    "the run's retained events contradict the order the engine writes them in or the run's record (rows removed from the end of its outbox, or written by something other than the engine, can do this)",
+  inconsistent: "the retained events do not agree with the stage's current record",
+};
+
+const RUN_MISMATCH_LABEL: Record<AttemptRunMismatch, string> = {
+  order: "a redrive or an end with no recorded event before it that the engine writes first",
+  redrives: "more redrives recorded than the run's record counts",
+  status: "the run's status",
+};
+
+const MISMATCH_LABEL: Record<AttemptRowMismatch, string> = {
+  status: "its status",
+  attempt: "its attempt count",
+  startedAt: "its start time",
+  completedAt: "its end time",
+  errorMessage: "its error",
+};
+
+function AttemptSteps({ steps }: { steps: AttemptStepEntry[] }) {
+  return (
+    <ul class="attempt-steps">
+      {steps.map((step) => (
+        <li key={step.stepId} class="attempt-step">
+          <code>{step.stepId}</code>
+          <span>{step.kind}</span>
+          <StatusPill status={step.status} />
+          <span>Execution {step.attempt}</span>
+          <span
+            title={
+              step.durationMs === null
+                ? "Only a step that executed once and finished has a duration the ledger can state."
+                : undefined
+            }
+          >
+            Duration {formatDuration(step.durationMs)}
+          </span>
+          {step.externalKey && (
+            <span class="attempt-step-key">
+              External key <code>{step.externalKey}</code>
+            </span>
+          )}
+          {step.error && (
+            <p class="attempt-error">
+              <strong>Error:</strong> {step.error}
+            </p>
+          )}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+/** One attempt as a native disclosure: the summary is the control. */
+function AttemptItem({
+  attempt,
+  defaultOpen,
+  stepsTruncated,
+}: {
+  attempt: StageAttempt;
+  defaultOpen: boolean;
+  stepsTruncated: boolean;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+  const duration =
+    attempt.endedAt === null || !attempt.executed
+      ? null
+      : Date.parse(attempt.endedAt) - Date.parse(attempt.startedAt);
+  const lost = attempt.outcome === "lost";
+  const live = attempt.outcome === "running" || attempt.outcome === "suspended";
+  return (
+    <li class="attempt">
+      <details
+        open={open}
+        onToggle={(event) => setOpen((event.currentTarget as HTMLDetailsElement).open)}
+      >
+        <summary>
+          <span class="attempt-title">Attempt {attempt.number}</span>
+          <span class={`pill pill-${attempt.outcome}`}>{OUTCOME_LABEL[attempt.outcome]}</span>
+          <span class="attempt-trigger">{TRIGGER_LABEL[attempt.trigger]}</span>
+          <span class="attempt-times">
+            {attempt.executed ? (
+              <>
+                <time dateTime={attempt.startedAt}>{formatAbsolute(attempt.startedAt)}</time>
+                {" → "}
+                {attempt.endedAt ? (
+                  <time dateTime={attempt.endedAt}>{formatAbsolute(attempt.endedAt)}</time>
+                ) : live ? (
+                  "in progress"
+                ) : (
+                  "no end recorded"
+                )}
+                {duration !== null && ` (${formatDuration(duration)})`}
+              </>
+            ) : (
+              <>
+                Failed at{" "}
+                <time dateTime={attempt.startedAt}>{formatAbsolute(attempt.startedAt)}</time>
+              </>
+            )}
+          </span>
+        </summary>
+        <div class="attempt-body">
+          {lost && attempt.windowEndedAt && (
+            <p class="attempt-note" role="note">
+              No event records how this execution ended, and the stage started again at{" "}
+              <time dateTime={attempt.windowEndedAt}>{formatAbsolute(attempt.windowEndedAt)}</time>.
+              Causes that leave this record include a worker that stopped or lost its lease, a job
+              delivered again while it was still running, and an outcome that could not be written
+              after the stage's code ran; the events do not say which. The window of this attempt
+              closes at the next start, so the steps listed below are placed in it by time only.
+            </p>
+          )}
+          {!lost && !live && attempt.executed && attempt.endedAt === null && (
+            <p class="attempt-note" role="note">
+              The stage's record says {OUTCOME_LABEL[attempt.outcome].toLowerCase()}; no event
+              records when this execution ended.
+            </p>
+          )}
+          {!attempt.executed && (
+            <p class="attempt-note" role="note">
+              This attempt never started: the stage was failed while it waited for its next
+              execution (for example by <code>run.reapStuck</code>).
+            </p>
+          )}
+          {attempt.trigger === "redelivery" && (
+            <p class="attempt-note" role="note">
+              The earlier execution of this stage has no recorded end; steps that changed near the
+              start of this attempt are placed by time only.
+            </p>
+          )}
+          {attempt.error && (
+            <p class="attempt-error">
+              <strong>Error:</strong> {attempt.error}
+              {attempt.errorTruncated && (
+                <span class="attempt-cut"> … (the error text was cut at {ERROR_CUT} characters)</span>
+              )}
+            </p>
+          )}
+          <h5 class="attempt-subtitle">Events</h5>
+          {attempt.events.length === 0 ? (
+            <p class="attempt-empty">No stage events recorded for this attempt yet.</p>
+          ) : (
+            <ul class="attempt-events">
+              {attempt.events.map((event) => (
+                <li key={event.sequence}>
+                  <code>{event.eventType}</code>
+                  <time dateTime={event.occurredAt}>{formatAbsolute(event.occurredAt)}</time>
+                  <span class="attempt-seq">sequence {event.sequence}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+          <h5 class="attempt-subtitle">Steps</h5>
+          {attempt.steps.length === 0 ? (
+            <p class="attempt-empty">
+              {stepsTruncated
+                ? "None of the steps read has its last recorded change within this attempt's recorded times."
+                : "No step has its last recorded change within this attempt's recorded times."}
+            </p>
+          ) : (
+            <AttemptSteps steps={attempt.steps} />
+          )}
+        </div>
+      </details>
+    </li>
+  );
+}
+
+function AttemptHistory({
+  stages,
+  histories,
+  stepsTruncated,
+}: {
+  stages: StageSummary[];
+  histories: Map<string, StageAttemptHistory>;
+  stepsTruncated: boolean;
+}) {
+  if (stages.length === 0) return null;
+  return (
+    <>
+      <div class="section-header">
+        <h3 class="section-title">Attempts by stage</h3>
+      </div>
+      <p class="attempt-hint">
+        Built from the run's retained stage events. The step ledger keeps only each step's latest
+        state, so a step is listed under the attempt whose recorded start and end contain the time
+        of its last change. Those times come from the processes that wrote them, so hosts whose
+        clocks differ can move a step across an attempt boundary.
+      </p>
+      {[...histories.values()].some((history) => history.available) && (
+        <p class="attempt-limit" role="note">
+          Shown from the events the run's outbox still holds. Rows removed from its start or middle
+          are always found; rows removed from its end are found only when what remains contradicts
+          the run's or a stage's record, so a re-delivery after a crash or a retry while suspended
+          recorded only in such rows is not shown.
+        </p>
+      )}
+      {stepsTruncated && (
+        <p class="truncated-note">The step list is truncated, so attempts may omit steps.</p>
+      )}
+      {stages.map((stage) => {
+        const history = histories.get(stage.id);
+        const attempts = history?.available ? history.attempts : [];
+        const unavailable: AttemptUnavailableReason | null = history?.available
+          ? null
+          : (history?.reason ?? "no-event-history");
+        const mismatch = history && !history.available ? history.mismatch : undefined;
+        const runMismatch = history && !history.available ? history.runMismatch : undefined;
+        const titleId = `attempts-${stage.id}`;
+        return (
+          <section key={stage.id} class="attempt-stage" aria-labelledby={titleId}>
+            <h4 id={titleId} class="attempt-stage-title">
+              <span class="stage-num">#{stage.stageNumber}</span>
+              <span class="stage-name">{stage.stageName}</span>
+              <StatusPill status={stage.status} />
+              {history?.available && (
+                <span class="attempt-count">
+                  {attempts.length} {attempts.length === 1 ? "recorded attempt" : "recorded attempts"}
+                </span>
+              )}
+            </h4>
+            {unavailable ? (
+              <p class="attempt-note" role="note">
+                Per-attempt history is unavailable for this stage: {UNAVAILABLE_LABEL[unavailable]}
+                {mismatch && ` (${MISMATCH_LABEL[mismatch]})`}
+                {runMismatch && ` (${RUN_MISMATCH_LABEL[runMismatch]})`}.
+                The stage timeline above and the step ledger below show its latest attempt only.
+              </p>
+            ) : attempts.length === 0 ? (
+              <p class="attempt-empty">No start of this stage is recorded.</p>
+            ) : (
+              <ol class="attempt-list">
+                {attempts.map((attempt, index) => (
+                  <AttemptItem
+                    key={attempt.number}
+                    attempt={attempt}
+                    stepsTruncated={stepsTruncated}
+                    defaultOpen={
+                      attempt.outcome !== "completed" ||
+                      (index === attempts.length - 1 && attempts.length > 1)
+                    }
+                  />
+                ))}
+              </ol>
+            )}
+            {history?.available && history.unplacedSteps.length > 0 && (
+              <div class="attempt-unplaced">
+                <h5 class="attempt-subtitle">Steps not assignable to one attempt</h5>
+                <p class="attempt-empty">
+                  The time each of these steps last changed matches no attempt, or two (for example a
+                  step re-opened by a retry or a redrive that has not run yet).
+                </p>
+                <AttemptSteps steps={history.unplacedSteps} />
+              </div>
+            )}
+          </section>
+        );
+      })}
+    </>
+  );
+}
+
 function RunDetailView({
   config,
   runId,
@@ -880,8 +1217,51 @@ function RunDetailView({
   const [actionError, setActionError] = useState<ApiError | Error | null>(null);
   const [dismissedError, setDismissedError] = useState<Error | null>(null);
 
+  // The stage events read so far. A poll asks only for the rows written after
+  // the last one, so its cost does not grow with the run's event count. The
+  // view is mounted once per run (keyed by run id), so a response can only
+  // ever be merged into the events of the run it was requested for.
+  const heldEvents = useRef<HeldStageEvents | null>(null);
+
+  // The last full answer. A read of the next part of a long history asks only
+  // for the run's events (`stageEventsOnly`), and the page keeps these rows
+  // until the full read that follows the last part.
+  const lastDetail = useRef<RunDetail | null>(null);
+  // Set by the catch-up below: the next read asks only for the next part.
+  const partNext = useRef(false);
+  const askedAt = useRef(-1);
+
   const fetchDetail = useCallback(async () => {
-    return await api<RunDetail>(config, `/runs/${encodeURIComponent(runId)}`);
+    const before = heldEvents.current;
+    const part = partNext.current && before !== null && lastDetail.current !== null;
+    partNext.current = false;
+    const query = before
+      ? `?stageEventsAfter=${before.lastSequence}${part ? "&stageEventsOnly=1" : ""}`
+      : "";
+    const answer = await api<RunDetail>(config, `/runs/${encodeURIComponent(runId)}${query}`);
+    if (!part) lastDetail.current = answer;
+    const detail = part ? { ...lastDetail.current!, stageEvents: answer.stageEvents } : answer;
+    if (!detail.stageEvents) return { ...detail, stageLog: undefined };
+    // Merged against what is held now, not at the request: a slow earlier
+    // response must not overwrite a newer one.
+    const held = mergeStageEvents(heldEvents.current, detail.stageEvents);
+    // Rows past what was held were removed: read the run again from the start.
+    if (held === null && heldEvents.current !== null) askedAt.current = -1;
+    heldEvents.current = held;
+    return {
+      ...detail,
+      stageLog: held
+        ? {
+            events: held.events,
+            coverage: held.coverage,
+            // After a part, the rows shown are older than the events: the
+            // history waits for the full read that follows.
+            caughtUp: !held.more && !part,
+            lastSequence: held.lastSequence,
+          }
+        : // Nothing held yet: the response did not begin the history.
+          { events: [], coverage: "from-start" as const, caughtUp: false, lastSequence: 0 },
+    };
   }, [config, runId]);
 
   const { data, error, refresh } = usePolled(
@@ -890,6 +1270,38 @@ function RunDetailView({
     pollInterval,
     paused,
   );
+
+  // A read returns at most one chunk of a long history; ask again at once
+  // until the page has caught up instead of waiting for the next poll, for
+  // the next part only while more remains and in full after the last one.
+  // Each immediate request needs the held events to have advanced past the
+  // last one, so a reader that stops advancing is asked again only by the
+  // poll, and at most `CATCH_UP_READS_PER_INTERVAL` are made per poll
+  // interval. Paused, the page makes no request on its own; resuming
+  // re-polls from what it holds (`usePolled` runs again when `paused` changes).
+  const behindAt =
+    data?.stageLog && !data.stageLog.caughtUp ? data.stageLog.lastSequence : null;
+  const catchUpTimes = useRef<number[]>([]);
+  const [wake, setWake] = useState(0);
+  useEffect(() => {
+    const now = Date.now();
+    const window = pollInterval > 0 ? pollInterval : 2000;
+    catchUpTimes.current = catchUpTimes.current.filter((t) => now - t < window);
+    const step = catchUpStep(behindAt, askedAt.current, paused, catchUpTimes.current.length);
+    askedAt.current = step.askedAt;
+    if (step.wait) {
+      const timer = setTimeout(
+        () => setWake((w) => w + 1),
+        window - (now - catchUpTimes.current[0]!),
+      );
+      return () => clearTimeout(timer);
+    }
+    if (step.read) {
+      catchUpTimes.current.push(now);
+      partNext.current = heldEvents.current?.more === true;
+      refresh();
+    }
+  }, [behindAt, paused, refresh, pollInterval, wake]);
 
   const effectiveError = actionError ?? error;
   const activeError = effectiveError === dismissedError ? null : effectiveError;
@@ -1004,6 +1416,20 @@ function RunDetailView({
     }
     return { stepsByStage: map, unassignedSteps: unassigned };
   }, [data?.steps]);
+
+  const attemptHistories = useMemo(
+    () =>
+      data
+        ? buildStageAttemptHistory({
+            redriveCount: data.run.redriveCount,
+            runStatus: data.run.status,
+            stages: data.stages,
+            steps: data.steps,
+            stageEvents: data.stageLog && { ...data.stageLog, paused },
+          })
+        : new Map<string, StageAttemptHistory>(),
+    [data, paused],
+  );
 
   return (
     <div>
@@ -1145,6 +1571,12 @@ function RunDetailView({
               <div class="empty-state">No stages recorded.</div>
             )}
           </div>
+
+          <AttemptHistory
+            stages={sortedStages}
+            histories={attemptHistories}
+            stepsTruncated={data.truncated.steps}
+          />
 
           <div class="section-header">
             <h3 class="section-title">Step ledger</h3>
@@ -1798,6 +2230,7 @@ function App({ config }: { config: ConsoleConfig }) {
     if (route.view === "run-detail") {
       return (
         <RunDetailView
+          key={route.runId}
           config={config}
           runId={route.runId}
           pollInterval={pollInterval}
