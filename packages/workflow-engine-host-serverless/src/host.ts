@@ -284,6 +284,10 @@ class ServerlessHostImpl implements ServerlessHost {
 
   async handleJob(msg: JobMessage): Promise<JobResult> {
     await this.ready();
+    return this.runJob(msg);
+  }
+
+  private async runJob(msg: JobMessage): Promise<JobResult> {
     // Dispatch job.execute under a lease heartbeat and route the outcome
     // (complete/suspend/fail + terminal run.transition) — see
     // executeJobWithHeartbeat in @bratsos/workflow-engine/kernel for the
@@ -346,7 +350,9 @@ class ServerlessHostImpl implements ServerlessHost {
       );
       if (!job) break;
 
-      const result = await this.handleJob({
+      // Storage was checked above. A second check here could throw after the
+      // dequeue counted an attempt and leave the job unrun.
+      const result = await this.runJob({
         jobId: job.jobId,
         workflowRunId: job.workflowRunId,
         workflowId: job.workflowId,

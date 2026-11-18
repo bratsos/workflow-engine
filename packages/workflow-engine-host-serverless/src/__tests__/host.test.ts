@@ -759,6 +759,35 @@ describe("ServerlessHost", () => {
     expect(completed).toHaveLength(1);
   });
 
+  it("processAvailableJobs runs every job it dequeues without checking the storage again", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, persistence, jobTransport } = createTestEnv([workflow]);
+    const host = createServerlessHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+    });
+    await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "paj-check",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+    await host.runMaintenanceTick();
+    // Passes once, then refuses: a check made after the dequeue would throw
+    // with the job claimed and its attempt counted.
+    let checks = 0;
+    (jobTransport as any).verifyStorage = async () => {
+      if (++checks > 1) throw new Error("refused after the dequeue");
+    };
+    await expect(host.processAvailableJobs()).resolves.toMatchObject({
+      processed: 1,
+      succeeded: 1,
+    });
+    expect(checks).toBe(1);
+    expect(await persistence.getRunsByStatus("COMPLETED")).toHaveLength(1);
+  });
+
   it("processAvailableJobs completes a two-stage workflow across invocations", async () => {
     const workflow = createTwoStageWorkflow();
     const { kernel, persistence, jobTransport } = createTestEnv([workflow]);
