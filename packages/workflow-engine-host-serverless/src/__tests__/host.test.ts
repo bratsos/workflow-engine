@@ -1032,7 +1032,12 @@ describe("ServerlessHost", () => {
 
   it("rejects an onTick that is not a function", () => {
     const { kernel, jobTransport } = createTestEnv([]);
-    for (const bad of ["x", 5, {}]) {
+    for (const [bad, message] of [
+      ["x", "x"],
+      [5, "5"],
+      [{}, "[object Object]"],
+      [Object.create(null), "Unprintable error"],
+    ]) {
       expect(
         () =>
           createServerlessHost({
@@ -1041,10 +1046,8 @@ describe("ServerlessHost", () => {
             workerId: "test-worker",
             onTick: bad as never,
           }),
-        String(bad),
-      ).toThrow(
-        new TypeError(`onTick must be a function, got ${String(bad)}.`),
-      );
+        message,
+      ).toThrow(new TypeError(`onTick must be a function, got ${message}.`));
     }
   });
 

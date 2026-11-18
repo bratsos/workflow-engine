@@ -49,7 +49,7 @@ export function assertTimerMs(
   const min = options.allowZero ? 0 : 1;
   if (typeof value !== "number" || !(value >= min) || value > MAX_TIMER_MS) {
     throw new RangeError(
-      `${name} must be a number of milliseconds from ${min} to ${MAX_TIMER_MS} (the longest delay a timer honours, about 24.8 days), got ${String(value)}.${options.hint ? ` ${options.hint}` : ""}`,
+      `${name} must be a number of milliseconds from ${min} to ${MAX_TIMER_MS} (the longest delay a timer honours, about 24.8 days), got ${toErrorMessage(value)}.${options.hint ? ` ${options.hint}` : ""}`,
     );
   }
   return value;

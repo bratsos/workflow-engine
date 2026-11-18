@@ -25,6 +25,7 @@ import {
   runMaintenanceTick as runMaintenanceTickCommands,
   runTickHook,
   type ServedDefinition,
+  toErrorMessage,
   toEventSinkObservation,
 } from "@bratsos/workflow-engine/kernel";
 
@@ -271,7 +272,7 @@ class NodeHostImpl implements NodeHost {
     this.retention = config.retention;
     if (config.onTick !== undefined && typeof config.onTick !== "function") {
       throw new TypeError(
-        `onTick must be a function, got ${String(config.onTick)}.`,
+        `onTick must be a function, got ${toErrorMessage(config.onTick)}.`,
       );
     }
     this.onTick = config.onTick;

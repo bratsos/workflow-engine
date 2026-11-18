@@ -54,6 +54,7 @@
  * {@link assertSqliteDateStorage}. The check is one statement per client.
  */
 
+import { toErrorMessage } from "../../kernel/helpers/error-message.js";
 import { type EnginePrismaClient, rawFor } from "./prisma-client-type.js";
 
 /** Where the explanation of this refusal lives. */
@@ -105,7 +106,7 @@ export class SqliteDateStorageUnverifiedError extends Error {
     super(
       reason === "no-raw-query"
         ? `This Prisma client exposes neither $queryRaw (tagged template) nor $queryRawUnsafe, so the engine cannot check how this SQLite file stores dates, and it does not run on a file it has not checked. Pass the Prisma client itself, or a wrapper that forwards one of the two. See ${SQLITE_DATE_STORAGE_DOCS}`
-        : `The check of how this SQLite file stores dates failed (${options?.cause instanceof Error ? options.cause.message : String(options?.cause)}), so the operation was not run; the next call checks again. See ${SQLITE_DATE_STORAGE_DOCS}`,
+        : `The check of how this SQLite file stores dates failed (${toErrorMessage(options?.cause)}), so the operation was not run; the next call checks again. See ${SQLITE_DATE_STORAGE_DOCS}`,
       options,
     );
     this.name = "SqliteDateStorageUnverifiedError";
@@ -190,26 +191,33 @@ const PROBE_SQL = [
  * binds it (measured on Prisma 6, 7 and 8). A client with neither cannot be
  * checked: refused.
  */
-function probe(prisma: EnginePrismaClient): Promise<Probe[]> {
-  const run = rawFor(prisma, {
-    col: "text",
-    lo: "text",
-    loValue: "text",
-    hi: "text",
-    hiValue: "text",
-  });
-  const bound = new Date(0);
-  if (typeof run.$queryRaw === "function") {
-    const parts = PROBE_SQL.split("$1");
-    return run.$queryRaw<Probe[]>(Object.assign(parts, { raw: parts }), bound);
-  }
-  if (typeof run.$queryRawUnsafe === "function") {
-    // Prisma 6 and 7 adapters take `?`; the Prisma 8 facade expands `$n` itself.
-    const sql =
-      prisma.$databaseType === "sqlite"
-        ? PROBE_SQL
-        : PROBE_SQL.replace("$1", "?");
-    return run.$queryRawUnsafe<Probe[]>(sql, bound);
+async function probe(prisma: EnginePrismaClient): Promise<Probe[]> {
+  try {
+    const run = rawFor(prisma, {
+      col: "text",
+      lo: "text",
+      loValue: "text",
+      hi: "text",
+      hiValue: "text",
+    });
+    const bound = new Date(0);
+    if (typeof run.$queryRaw === "function") {
+      const parts = PROBE_SQL.split("$1");
+      return await run.$queryRaw<Probe[]>(
+        Object.assign(parts, { raw: parts }),
+        bound,
+      );
+    }
+    if (typeof run.$queryRawUnsafe === "function") {
+      // Prisma 6 and 7 adapters take `?`; the Prisma 8 facade expands `$n` itself.
+      const sql =
+        prisma.$databaseType === "sqlite"
+          ? PROBE_SQL
+          : PROBE_SQL.replace("$1", "?");
+      return await run.$queryRawUnsafe<Probe[]>(sql, bound);
+    }
+  } catch (cause) {
+    throw new SqliteDateStorageUnverifiedError("probe-failed", { cause });
   }
   throw new SqliteDateStorageUnverifiedError("no-raw-query");
 }
@@ -268,19 +276,6 @@ function judge(rows: Probe[]): boolean {
   return seen;
 }
 
-/** Probes and judges: `true` for a conclusive pass, `false` for no stored date. */
-async function probeAndJudge(prisma: EnginePrismaClient): Promise<boolean> {
-  let rows: Probe[];
-  try {
-    rows = await probe(prisma);
-  } catch (error) {
-    throw error instanceof SqliteDateStorageUnverifiedError
-      ? error
-      : new SqliteDateStorageUnverifiedError("probe-failed", { cause: error });
-  }
-  return judge(rows);
-}
-
 /**
  * Resolves when the operation may run, rejects when it may not.
  *
@@ -299,19 +294,21 @@ export function verifySqliteDates(
   guard: SqliteDateGuard,
 ): Promise<void> {
   if (guard.verified) return guard.verified;
-  const check: Promise<void> = probeAndJudge(prisma).then(
-    (conclusive) => {
-      if (!conclusive && guard.verified === check) guard.verified = null;
-    },
-    (error) => {
-      if (
-        !(error instanceof SqliteDateStorageError) &&
-        guard.verified === check
-      )
-        guard.verified = null;
-      throw error;
-    },
-  );
+  const check: Promise<void> = probe(prisma)
+    .then(judge)
+    .then(
+      (conclusive) => {
+        if (!conclusive && guard.verified === check) guard.verified = null;
+      },
+      (error) => {
+        if (
+          !(error instanceof SqliteDateStorageError) &&
+          guard.verified === check
+        )
+          guard.verified = null;
+        throw error;
+      },
+    );
   guard.verified = check;
   return check;
 }

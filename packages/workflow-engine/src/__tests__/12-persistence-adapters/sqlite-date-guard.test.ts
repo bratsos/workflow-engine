@@ -525,20 +525,21 @@ describe.skipIf(!sqlite)(`sqlite date guard on Prisma ${major}`, () => {
       has: (t, key) => !hidden.includes(String(key)) && Reflect.has(t, key),
     });
 
-  /** A view of `client` whose first `n` raw probes throw `cause`. */
-  const failingProbes = (target: any, n: number, cause: Error): any => {
-    let left = n;
+  /** A view of `client` whose first raw probes reject with the supplied causes. */
+  const failingProbes = (target: any, ...causes: unknown[]): any => {
+    let next = 0;
     const wrap = (inner: any): any =>
       new Proxy(inner, {
         get(t, key) {
           const value = Reflect.get(t, key);
-          if (key === "$queryRaw" || key === "$queryRawUnsafe") {
+          if (
+            (key === "$queryRaw" || key === "$queryRawUnsafe") &&
+            typeof value === "function"
+          ) {
             return (first: any, ...rest: unknown[]) => {
               const text = Array.isArray(first) ? first.join("?") : first;
-              if (String(text).includes("'bound'") && left > 0) {
-                left--;
-                return Promise.reject(cause);
-              }
+              if (String(text).includes("'bound'") && next < causes.length)
+                return Promise.reject(causes[next++]);
               return value.call(t, first, ...rest);
             };
           }
@@ -778,7 +779,7 @@ describe.skipIf(!sqlite)(`sqlite date guard on Prisma ${major}`, () => {
     // ago, in the other class, offered to retention with a cutoff an hour ago.
     const file = await otherClassFile("probe-fails.db");
     const cause = new Error("disk I/O error");
-    const reader = failingProbes(await open(file, true), 1, cause);
+    const reader = failingProbes(await open(file, true), cause);
     const persistence = createPrismaWorkflowPersistence(reader, {
       databaseType: "sqlite",
     });
@@ -797,6 +798,51 @@ describe.skipIf(!sqlite)(`sqlite date guard on Prisma ${major}`, () => {
       persistence.deleteRun("done", hourAgo, ["COMPLETED"]),
     ).rejects.toBeInstanceOf(SqliteDateStorageError);
     expect(await statuses(reader)).toEqual([
+      "done:COMPLETED",
+      "running:RUNNING",
+    ]);
+  }, 60_000);
+
+  it.each([
+    { read: "$queryRaw", hide: "$queryRawUnsafe" },
+    { read: "$queryRawUnsafe", hide: "$queryRaw" },
+  ])("preserves unformattable probe causes through $read", async ({
+    read,
+    hide,
+  }) => {
+    const file = await otherClassFile(`unformattable-${read}.db`);
+    const causes = [
+      Object.create(null),
+      new Proxy(
+        {},
+        {
+          getPrototypeOf() {
+            throw new Error("cannot inspect cause");
+          },
+        },
+      ),
+    ];
+    const client = await open(file, true);
+    const reader = failingProbes(without(client, [hide]), ...causes);
+    const { persistence } = stack(reader);
+    const hourAgo = new Date(Date.now() - 3_600_000);
+    const remove = () => persistence.deleteRun("done", hourAgo, ["COMPLETED"]);
+
+    for (const cause of causes) {
+      const error = await remove().catch((value) => value);
+      expect(error).toBeInstanceOf(SqliteDateStorageUnverifiedError);
+      expect(error).toMatchObject({
+        code: "SQLITE_DATE_STORAGE_UNVERIFIED",
+        reason: "probe-failed",
+        message: expect.stringContaining("Unprintable error"),
+      });
+      expect(Object.is(error.cause, cause)).toBe(true);
+    }
+
+    // The driver now answers the probe. Its dates are foreign and the write is
+    // still refused, proving a failed check did not settle the guard's cache.
+    await expect(remove()).rejects.toBeInstanceOf(SqliteDateStorageError);
+    expect(await statuses(client)).toEqual([
       "done:COMPLETED",
       "running:RUNNING",
     ]);

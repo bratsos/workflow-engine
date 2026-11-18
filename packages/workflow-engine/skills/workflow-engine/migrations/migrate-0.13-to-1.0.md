@@ -596,6 +596,8 @@ What changes: submit happens exactly once (`${id}:submit` step), polling is a st
 
 ## Behaviour changes
 
+- **SQLite probe errors keep their type and cause (1.0.0-alpha.21).** A failed date-storage probe throws `SqliteDateStorageUnverifiedError` with the original rejection as `cause`. If the rejection cannot be formatted, the message says `Unprintable error`. The operation stays blocked and the next call checks again. Host constructors also retain their `RangeError` for invalid timer options and `TypeError` for invalid `onTick` values when those values cannot be formatted.
+
 - **Caller transactions defer outbox delivery (1.0.0-alpha.21).** A kernel built over a caller-owned Prisma transaction still runs the whole maintenance tick there. Its `outbox.flush` now returns `deferred: true` with zero deliveries and the tick reports `outboxDeferred: true`. Dispatch `outbox.flush` on a root-client kernel after commit to deliver the committed rows. A rollback produces no sink effects from that tick.
 - **Outbox at-least-once delivery and schema upgrade (1.0.0-alpha.21).** Stop old flushers and close their connections before running the migration. A warm alpha.20 query can fail with `cached plan must not change result type` after the new column changes its result shape. Restart on the new release after migration. Treat legacy stamped rows as published. An event that an old flusher already lost cannot be recovered from its stamp.
 

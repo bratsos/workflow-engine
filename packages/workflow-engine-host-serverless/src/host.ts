@@ -23,6 +23,7 @@ import {
   runMaintenanceTick as runMaintenanceTickCommands,
   runTickHook,
   type ServedDefinition,
+  toErrorMessage,
 } from "@bratsos/workflow-engine/kernel";
 
 // ============================================================================
@@ -242,7 +243,7 @@ class ServerlessHostImpl implements ServerlessHost {
     this.retention = config.retention;
     if (config.onTick !== undefined && typeof config.onTick !== "function") {
       throw new TypeError(
-        `onTick must be a function, got ${String(config.onTick)}.`,
+        `onTick must be a function, got ${toErrorMessage(config.onTick)}.`,
       );
     }
     this.onTick = config.onTick;
