@@ -514,8 +514,9 @@ function mapRunEvent(row: RawEventRow): RunEvent {
     row.deliveryClaim.length > 24
       ? {
           claimExpiresAt: new Date(
+            // A ranked claim is `r`, 19 rank digits and `|` before the expiry.
             row.deliveryClaim.startsWith("r")
-              ? row.deliveryClaim.slice(18, 42)
+              ? row.deliveryClaim.slice(21, 45)
               : row.deliveryClaim.slice(0, 24),
           ),
         }

@@ -409,13 +409,16 @@ if (!DATABASE_URL) {
       ).toEqual([2]);
     });
 
-    it("exposes the expiry of an unpublished delivery claim", async () => {
+    it.each([
+      "",
+      "r0000000000000000042|",
+    ])("exposes the expiry of an unpublished delivery claim (rank prefix %j)", async (rank) => {
       const expiry = new Date("2099-01-01T00:00:00.000Z");
       await prisma.outboxEvent.updateMany({
         where: { id: "evt-1" },
         data: {
           publishedAt: null,
-          deliveryClaim: `${expiry.toISOString()}|owner`,
+          deliveryClaim: `${rank}${expiry.toISOString()}|owner`,
         },
       });
       expect((await reader().getRunDetail("run-1"))?.events[0]).toMatchObject({
