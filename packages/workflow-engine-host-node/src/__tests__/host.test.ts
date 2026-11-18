@@ -1186,6 +1186,63 @@ describe("NodeHost", () => {
     expect(calls).toBe(2);
   });
 
+  it("starts the replacement job loop when returning an unstarted job commits but never answers", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, persistence, jobTransport } = createTestEnv([workflow]);
+    const { workflowRunId } = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "stop-defer-1",
+      workflowId: "test-workflow",
+      input: { data: "x" },
+    });
+    await kernel.dispatch({
+      type: "run.claimPending",
+      workerId: "test-worker",
+      maxClaims: 1,
+    });
+    const dequeue = jobTransport.dequeue.bind(jobTransport);
+    const defer = jobTransport.defer!.bind(jobTransport);
+    let claimed!: () => void;
+    let respond!: () => void;
+    const hit = new Promise<void>((resolve) => (claimed = resolve));
+    const held = new Promise<void>((resolve) => (respond = resolve));
+    jobTransport.dequeue = (...args) =>
+      dequeue(...args).then(async (job) => {
+        claimed();
+        await held;
+        return job;
+      });
+    let deferred = 0;
+    jobTransport.defer = async (...args) => {
+      await defer(...args);
+      deferred++;
+      return new Promise<never>(() => {});
+    };
+    host = createNodeHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+      orchestrationIntervalMs: 60_000,
+      jobPollIntervalMs: 5,
+      shutdownTimeoutMs: 50,
+      flushOutboxOnStop: false,
+    });
+    await host.start();
+    await hit;
+    await host.stop();
+    respond();
+    await waitFor(async () => deferred === 1);
+    jobTransport.dequeue = dequeue;
+    jobTransport.defer = defer;
+    // The same host again: its new job loop starts after the old one ends.
+    await host.start();
+    await waitFor(
+      async () =>
+        (await persistence.getRun(workflowRunId))?.status === "COMPLETED",
+      5_000,
+    );
+  });
+
   it("flushes the outbox on stop() so a run finished by this process is published", async () => {
     const workflow = createSimpleWorkflow();
     const { kernel, persistence, jobTransport, eventSink } = createTestEnv([

@@ -664,12 +664,22 @@ class NodeHostImpl implements NodeHost {
       ? { startedAt: job.startedAt, attempt: job.attempt }
       : undefined;
     try {
-      await this.jobTransport.defer(
-        job.jobId,
-        new Date(),
-        "host stopped before running the job",
-        fence,
-      );
+      // A replacement job loop waits for this one: bound the wait. A defer
+      // that commits later is still fenced on this claim.
+      const returned = this.jobTransport
+        .defer(
+          job.jobId,
+          new Date(),
+          "host stopped before running the job",
+          fence,
+        )
+        .then(() => true);
+      if (!(await withTimeout(returned, this.shutdownTimeoutMs))) {
+        returned.catch(() => {});
+        console.error(
+          `[NodeHost] Returning an unstarted job took longer than shutdownTimeoutMs (${this.shutdownTimeoutMs} ms); the job is recovered when its lease expires if the return did not commit.`,
+        );
+      }
     } catch (error) {
       console.error("[NodeHost] Could not return an unstarted job:", error);
     }
