@@ -399,6 +399,10 @@ export class InMemoryConsoleReadPort implements ConsoleReadPort {
     afterSequence: number,
     limit?: number,
   ): Promise<RunEvent[]> {
+    if (typeof afterSequence !== "number" || Number.isNaN(afterSequence))
+      throw new ConsoleBadRequestError(
+        `afterSequence must be a number, got ${String(afterSequence)}`,
+      );
     const clampedLimit = clampLimit(limit, 200);
     const floorSeq = Math.floor(afterSequence);
     return this.fixtures.events

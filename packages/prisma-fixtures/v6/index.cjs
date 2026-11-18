@@ -2,9 +2,14 @@ const { execFileSync } = require("node:child_process");
 const { join } = require("node:path");
 const schema = require("../schema.cjs");
 
-exports.createPostgresClient = (url) => {
+// `max`: the most connections the client's pool opens (the suites' pool of one).
+exports.createPostgresClient = (url, { max } = {}) => {
   const { PrismaClient } = require("@prisma/client");
-  return new PrismaClient({ datasourceUrl: url });
+  const pooled =
+    max === undefined
+      ? url
+      : `${url}${url.includes("?") ? "&" : "?"}connection_limit=${max}`;
+  return new PrismaClient({ datasourceUrl: pooled });
 };
 
 // Generates a SQLite client and creates every table in `file`, then connects.

@@ -289,22 +289,28 @@ export function createPrismaConsoleReadPort(
 ### Statement timeout behaviour
 
 `statementTimeoutMs` defaults to 15,000 ms and applies to PostgreSQL only. Timeout management differs depending on the target and client supplied:
-- **Root Prisma client**: When passed a root client (Prisma 6 or 7's `PrismaClient`, or `fromPrisma8(db)`), the read port runs each read in one transaction of its own (`$transaction`) and, when `statementTimeoutMs` is above 0, executes `SET LOCAL statement_timeout = <ms>` in it. Running multi-query pages (like run detail, up to seventeen statements) in one transaction keeps them on one connection of the pool. The run detail's transaction is `REPEATABLE READ` on PostgreSQL, so all its statements see one moment and a stage that ends during the read never reads as a contradiction; the port asks the client for the level (`$transaction`'s `isolationLevel` option) and sends no `SET TRANSACTION` of its own. The others run at the default `READ COMMITTED`, where each statement sees what was committed when it began. On SQLite one transaction is one moment. The transaction's own limits follow `statementTimeoutMs`: Prisma's `timeout` is twenty times it (a read runs at most seventeen statements) and `maxWait` is it (not passed to `fromPrisma8`, which takes no `maxWait`); with 0 neither has a limit, so Prisma's defaults (5 s, 2 s to start) do not apply.
+- **Root Prisma client**: When passed a root client (Prisma 6 or 7's `PrismaClient`, or `fromPrisma8(db)`), the read port runs each read in one transaction of its own (`$transaction`) and, when `statementTimeoutMs` is above 0, executes `SET LOCAL statement_timeout = <ms>` in it. Running multi-query pages (like run detail, up to eighteen statements) in one transaction keeps them on one connection of the pool. The run detail's transaction is `REPEATABLE READ` on PostgreSQL, so all its statements see one moment and a stage that ends during the read never reads as a contradiction; the port asks the client for the level (`$transaction`'s `isolationLevel` option) and sends no `SET TRANSACTION` of its own. The others run at the default `READ COMMITTED`, where each statement sees what was committed when it began. On SQLite one transaction is one moment. The transaction's own limits follow `statementTimeoutMs`: Prisma's `timeout` is twenty times it (a read runs at most eighteen statements) and `maxWait` is it; `fromPrisma8` takes no `maxWait`, so on Prisma 8 the port bounds the wait for a connection itself (a read whose transaction has not begun after `statementTimeoutMs` throws, and the transaction rolls back when it begins). With 0 neither has a limit, so Prisma's defaults (5 s, 2 s to start) do not apply. Every limit is capped at 2,147,483,647 ms, the longest timer Node keeps. On Postgres the run detail reads its annotations through cursors (`DECLARE ... NO SCROLL CURSOR`), so behind a pooler the read's transaction needs one server connection for its length (a transaction-scoped connection; PgBouncer is untested). A client with no `$transaction` that is not a transaction client (the port asks the server whether a transaction is open) gets the same rows from plain statements.
 - **Transaction client**: The port knows a read is nested from the client it was given. Prisma 6's transaction client has no `$transaction`, nor has `fromPrisma8(tx)`'s: the read runs in the caller's transaction and sets nothing (no `SET LOCAL statement_timeout`, no isolation level). Prisma 7's transaction client has a `$transaction` that opens a savepoint: the read runs in it, Prisma ignores the `isolationLevel` option there and sends nothing for it (so the server raises no error), and with `statementTimeoutMs` above 0 the read sets `statement_timeout` for its statements and restores the caller's previous value after them (`set_config(..., true)`); a read that fails rolls back to the savepoint, which restores it too. Either way the caller's transaction is left with the settings it had, and its isolation level decides: at `READ COMMITTED` a stage that changes during the run-detail read can show as unavailable, naming the field, until the next poll. A custom `ConsoleReadPort` should return the run detail as of one moment; one that does not gets the same fallback, never a wrong history.
 - **SQLite client**: SQLite has no `statement_timeout` support. The read port does not issue `SET LOCAL`, and `statementTimeoutMs` cannot cancel a running SQLite statement.
 
-If a query exceeds the limit, PostgreSQL cancels the statement with SQLSTATE `57014`. The read port catches this, and a transaction the client gave up on (Prisma's `P2028`), and throws `ConsoleQueryTimeoutError` (HTTP 504, code `query_timeout`):
+When a read fails on the client side inside a caller's transaction, the port closes its cursor if the transaction still takes statements; after a server error the caller's transaction is aborted and the cursor ends with it, or with the caller's rollback to a savepoint.
+
+If a query exceeds the limit, PostgreSQL cancels the statement with SQLSTATE `57014`. The read port catches this, a transaction the client gave up on (Prisma's `P2028`) and a wait for a connection past `statementTimeoutMs`, and throws `ConsoleQueryTimeoutError` (HTTP 504, code `query_timeout`), whose `limit` and message name the limit that fired:
 
 ```typescript
+export type ConsoleQueryLimit = "statement_timeout" | "transaction" | "connection";
 export class ConsoleQueryTimeoutError extends Error {
   readonly code = "query_timeout" as const;
+  readonly limit: ConsoleQueryLimit;
   constructor(
     readonly query: string,
     readonly timeoutMs: number,
-    options?: { cause?: unknown },
+    options?: { cause?: unknown; limit?: ConsoleQueryLimit; limitMs?: number },
   );
 }
 ```
+
+`listRunEvents(runId, afterSequence)` throws `ConsoleBadRequestError` (HTTP 400) for an `afterSequence` that is not a number (`NaN` included), on every port.
 
 The console handler converts this error into an HTTP 504 response with error code `"query_timeout"`. The UI catches the 504 and renders an inline warning banner while leaving the search filter controls interactive, allowing the operator to narrow filters without hanging the browser.
 

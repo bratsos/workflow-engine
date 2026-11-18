@@ -25,6 +25,7 @@ export {
 } from "./actions";
 export {
   ConsoleBadRequestError,
+  type ConsoleQueryLimit,
   ConsoleQueryTimeoutError,
   isStatementTimeout,
 } from "./errors";

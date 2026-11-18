@@ -550,6 +550,10 @@ describe("in-memory read port: run detail", () => {
       (await reader.listRunEvents("run-1", 1)).map((event) => event.sequence),
     ).toEqual([2]);
     expect(await reader.listRunEvents("run-1", 2)).toEqual([]);
+    // The same validation as the Prisma port's, on every major.
+    await expect(reader.listRunEvents("run-1", Number.NaN)).rejects.toThrow(
+      ConsoleBadRequestError,
+    );
   });
 });
 

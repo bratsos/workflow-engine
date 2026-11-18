@@ -167,7 +167,12 @@ The attempt boundaries are:
   `run.transition` dispatched for a pending run before `run.claimPending`
   writes one, starts the first group's jobs and leaves the run `PENDING`, and
   the claim writes the second. The page reads that pair as the run's one first
-  start, wherever a job of the first group ran between them. A redrive takes only a completed, failed or
+  start, wherever a job of the first group ran between them. By design it
+  cannot tell that pair from one claim's start followed by one extra
+  `workflow:started` (which the engine never writes, but SQL could) while
+  the run is running: such a run reads as healthy. A third start before a
+  run end, or one after a run end that the run's redrive count does not
+  account for, makes the history fall back. A redrive takes only a completed, failed or
   cancelled run, each of which ended its attempts with an event, so no attempt
   is open there; if one is, the history contradicts itself and the stage falls
   back. The next `stage:started` is a rerun after a redrive, also for a stage
@@ -328,22 +333,55 @@ measure each statement with no statistics, with statistics of the empty
 table, with current ones, and with stale ones (taken while one run held a
 few rows, then grown), on Postgres by pages read and on SQLite by plan.
 
-The run's other rows are read with plans that hold in the same four states.
-The stages are read by an index on the run. The annotations page is read
-in the order of the run's `("workflowRunId", "createdAt")` index alone, on
-Postgres as a cursor (planned for its first rows), then, when the page ends
-inside a group of annotations that share a time, that group again with the
-newer ones, ties ordered by id: a few index pages whatever the run's size,
-where a single `ORDER BY "createdAt" DESC, id DESC LIMIT n` is planned as a
-read and sort of every annotation of the run when the statistics expect few
-of them. No index serves the order of the steps and logs pages without a
-schema change, so each sorts every step or log of the run: measured on
-Postgres with 30,000 rows of the run in a table of 91,000, the logs page reads
-about 335 pages (11 per 1,000 logs of the run) and the steps page between
-1,450 pages with current statistics and 9,300 with none (a 1,000-step run:
-360 to 1,450, the whole table when the planner prefers it); on SQLite, with
-statistics taken while the tables held a few rows, the logs page scans the
-whole logs table and the steps page the whole stages table.
+The run's other rows are read with plans that hold in the same four states
+and read no other run's rows: every statement reaches its table through an
+index on the run, or on the run's stage ids, whatever the statistics say.
+What a statement costs still depends on how the run's rows lie in the table:
+rows a run writes alone sit together, a few to a page, while runs that work
+at once interleave their rows, up to one page per row. The figures below are
+Postgres pages read (the largest over the four states) with 30,000 and
+90,000 rows of other runs, for a run whose rows are together and for one
+whose rows are interleaved with theirs.
+
+- The stages are read by an index on the run: 9 to 14 pages for 20 stages,
+  27 to 28 for 1,000 stages (215 under stale statistics).
+- The annotations page reads the times of its rows, then its rows, both in
+  the order of the run's `("workflowRunId", "createdAt")` index alone (on
+  Postgres as cursors, which are planned for their first rows; on SQLite by
+  naming the index), so the walk stops at the page: 7 pages for a page of 200
+  together, about 205 interleaved, at either table size. When the page ends
+  inside a group of annotations that share a time (the engine writes one
+  time for every row of a `createMany`), a third statement reads that group's
+  first ids, with the limit of the rows still missing. No index orders a
+  group by id, so the server reads the whole group through the run's index
+  and keeps that many rows: 370 pages and 12 to 31 ms for a group of 30,000,
+  1,219 pages and 38 to 58 ms for 100,000. With statistics taken while the
+  run held a few rows Postgres may read the group through another index on
+  the run, which reads every annotation of the run. The process receives at
+  most a page of rows (and the times of one more), never the group. A single
+  `ORDER BY "createdAt" DESC, id DESC LIMIT n` is planned as a read and sort
+  of every annotation of the run when the statistics expect few of them.
+- No index serves the order of the steps and logs pages without a schema
+  change, so each sorts every step or log of the run, at most one page per
+  row of the run. The logs page reads 18 pages for 1,000 logs together and
+  331 for 30,000; interleaved, 493 to 710 for 1,000 and 651 to 1,270 for
+  30,000. The steps page reads the steps of each stage the stages statement
+  returned (on Postgres one lookup per stage, as a `LATERAL` subquery; on
+  SQLite an `IN` list that names the steps' `"stageRecordId"` index): 313 to
+  343 pages for 1,000 steps together and 873 to 1,048 interleaved, 2,438 to
+  8,483 for 30,000 together and 12,611 to 19,757 interleaved, 3,003 to 4,003
+  for a run of 1,000 stages. A join to the stages table, which the console
+  used before, was planned as a scan of the whole steps table with no
+  statistics, and for a run of many stages with current ones.
+- After rows are deleted, until a vacuum, a walk of an index also visits the
+  run's deleted entries (up to 1,006 pages for an annotations page whose run
+  lost 80% of its rows).
+
+On SQLite every one of these statements is a `SEARCH` by an index on the run
+or on its stage ids in all four states, with the annotations walks free of a
+sort; the logs, steps and annotations statements name their index
+(`INDEXED BY`), since statistics taken while the tables held a few rows plan
+a scan of the whole table.
 
 The run's rows and its events are read at one moment, so a stage that ends
 between two of the read's statements is never shown as a contradiction: the
@@ -463,11 +501,25 @@ because a contract cannot express a sort direction.
 
 There is deliberately no total count and no page numbers: counting a large
 run table is the expensive query the console exists to avoid issuing. On
-PostgreSQL, a query cancelled by `statement_timeout`, or a read whose
+PostgreSQL, a query cancelled by `statement_timeout`, a read whose
 transaction the client gave up on (Prisma's `P2028`, at twenty times
-`statementTimeoutMs`), comes back as HTTP 504 with a `query_timeout` code, which the UI shows as an inline banner while
-leaving the filter bar interactive. SQLite has no `statement_timeout`, so the
+`statementTimeoutMs`), or one that waited `statementTimeoutMs` for a
+connection to begin its transaction (on Prisma 8 the reader bounds this wait
+itself, as `fromPrisma8` takes no `maxWait`), comes back as HTTP 504 with a
+`query_timeout` code, which the UI shows as an inline banner while
+leaving the filter bar interactive; the error names the limit that fired.
+Each limit is capped at the longest timer Node keeps (24.8 days), so any
+`statementTimeoutMs` works. SQLite has no `statement_timeout`, so the
 console cannot cancel a running SQLite query this way.
+
+The run detail's cursors need its transaction to keep one server connection:
+behind a pooler, use a transaction-scoped connection (PgBouncer's transaction
+mode), not a statement-scoped one; PgBouncer itself has not been tested. A
+client with no `$transaction` that is not a transaction client reads the same
+rows with plain statements. When a read fails on the client side inside your
+transaction, the reader closes its cursor if the transaction still takes
+statements; after a server error the transaction is aborted and the cursor
+ends with it (or with your rollback to a savepoint).
 
 The full reference — every option, the action vocabulary, custom read
 ports, and what the console deliberately does not do — is in the

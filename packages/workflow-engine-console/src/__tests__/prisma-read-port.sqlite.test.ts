@@ -4,6 +4,7 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { ConsoleBadRequestError, ConsoleQueryTimeoutError } from "../errors";
 import { createWorkflowConsole } from "../handler";
 import {
   type ConsolePrismaClient,
@@ -1546,21 +1547,32 @@ FROM g, plan_model`;
  ELSE strftime('%Y-%m-%dT%H:%M:%f', ${column}, '+' || (${seconds}) || ' seconds') || substr(${column}, 24) END`;
         const series = (rows: number) =>
           `WITH RECURSIVE g(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM g WHERE n < ${rows})`;
-        // A run of 20 stages and `rows` steps, annotations (three to a time) and logs.
-        const copies = (runId: string, rows: number) => `
+        // Runs of 20 stages and `rows` steps, annotations (three to a time)
+        // and logs each, interleaved in the tables as runs that work at once
+        // write them.
+        const copies = (runs: Array<[string, number]>) => {
+          const max = Math.max(...runs.map(([, n]) => n));
+          const r = `(VALUES ${runs.map(([id, n]) => `('${id}', ${n})`).join(", ")}) AS r`;
+          const each = (rows: number, where = "g.n <= r.column2") =>
+            `${series(rows)} SELECT r.column1 AS run, g.n AS n FROM g, ${r} WHERE ${where} ORDER BY g.n, r.column1`;
+          return `
 INSERT INTO workflow_stages (id, createdAt, updatedAt, version, workflowRunId, stageId, stageName, stageNumber, executionGroup, attempt, status)
-${series(20)} SELECT '${runId}-s' || n, createdAt, updatedAt, version, '${runId}', 's' || n, 'S' || n, n, n, attempt, status FROM g, plan_model_workflow_stages;
+SELECT run || '-s' || n, createdAt, updatedAt, version, run, 's' || n, 'S' || n, n, n, attempt, status FROM (${each(20, "1")}), plan_model_workflow_stages;
 INSERT INTO workflow_steps (id, stageRecordId, stepId, seq, kind, status, attempt, createdAt, updatedAt)
-${series(rows)} SELECT '${runId}-t' || n, '${runId}-s' || (1 + n % 20), 't' || n, n, kind, status, attempt, createdAt, updatedAt FROM g, plan_model_workflow_steps;
+SELECT run || '-t' || n, run || '-s' || (1 + n % 20), 't' || n, n, kind, status, attempt, createdAt, updatedAt FROM (${each(max)}), plan_model_workflow_steps;
 INSERT INTO workflow_annotations (id, createdAt, workflowRunId, attempt, scope, key, value)
-${series(rows)} SELECT '${runId}-a' || n, ${later("createdAt", "n / 3")}, '${runId}', attempt, scope, 'k' || n, value FROM g, plan_model_workflow_annotations;
+SELECT run || '-a' || n, ${later("createdAt", "n / 3")}, run, attempt, scope, 'k' || n, value FROM (${each(max)}), plan_model_workflow_annotations;
 INSERT INTO workflow_logs (id, createdAt, workflowRunId, level, message)
-${series(rows)} SELECT '${runId}-l' || n, ${later("createdAt", "n")}, '${runId}', level, message FROM g, plan_model_workflow_logs;`;
-        const load = () => {
-          fill(copies("run-plan-1000", 1_000));
-          fill(copies("run-plan-30000", 30_000));
-          fill(copies("run-plan-others", 50_000));
+SELECT run || '-l' || n, ${later("createdAt", "n")}, run, level, message FROM (${each(max)}), plan_model_workflow_logs;`;
         };
+        const load = () =>
+          fill(
+            copies([
+              ["run-plan-1000", 1_000],
+              ["run-plan-30000", 30_000],
+              ["run-plan-others", 50_000],
+            ]),
+          );
         const clear = () =>
           fill(tables.map((t) => `DELETE FROM ${t};`).join("\n"));
         const analyze = () =>
@@ -1603,7 +1615,7 @@ ${series(rows)} SELECT '${runId}-l' || n, ${later("createdAt", "n")}, '${runId}'
             "stale",
             () => {
               clear();
-              fill(copies("run-plan-few", 7));
+              fill(copies([["run-plan-few", 7]]));
               analyze();
               load();
             },
@@ -1645,28 +1657,41 @@ ${series(rows)} SELECT '${runId}-l' || n, ${later("createdAt", "n")}, '${runId}'
           } finally {
             raw.close();
           }
-          expect(plans.workflow_annotations, state).toHaveLength(2);
+          // Annotations: the page's times, then its newer rows, walking the
+          // run's ("workflowRunId", "createdAt") index (named, so no
+          // statistics plan another), then the first ids of the group the
+          // page ends in, read by the same index and sorted.
+          expect(plans.workflow_annotations, state).toHaveLength(3);
           for (const plan of plans.workflow_annotations!) {
             expect(plan, state).toMatch(
               // Prisma 8 adds a hash to an index's name on SQLite.
-              /SEARCH workflow_annotations USING INDEX workflow_annotations_workflowRunId_createdAt_idx(_[0-9a-f]{8})? \(workflowRunId=\?/,
+              /SEARCH workflow_annotations USING (COVERING )?INDEX workflow_annotations_workflowRunId_createdAt_idx(_[0-9a-f]{8})? \(workflowRunId=\?/,
             );
-            expect(plan, state).not.toMatch(
-              /TEMP B-TREE|SCAN workflow_annotations/,
-            );
+            expect(plan, state).not.toMatch(/SCAN workflow_annotations/);
           }
+          for (const plan of plans.workflow_annotations!.slice(0, 2))
+            expect(plan, state).not.toMatch(/TEMP B-TREE/);
+          expect(plans.workflow_annotations![2], state).toMatch(
+            /\(workflowRunId=\? AND createdAt=\?\)/,
+          );
           expect(plans.workflow_stages!.join(" | "), state).toMatch(
             /SEARCH workflow_stages USING INDEX (workflow_stages_workflowRunId_\w+|sqlite_autoindex_workflow_stages_\d) \(workflowRunId=\?/,
           );
           // Logs and steps: no index serves their order, so a page sorts
-          // every log or step of the run, found by the run's index or, with
-          // statistics taken when the table held few rows, by a scan of the
-          // whole table (the cost the docs state).
+          // every log or step of the run, found by the run's index (or, for
+          // steps, the index on the run's stage ids), named so that
+          // statistics taken when the table held few rows do not plan a scan
+          // of the whole table: the cost the docs state.
           expect(plans.workflow_logs!.join(" | "), state).toMatch(
-            state === "stale"
-              ? /SCAN workflow_logs|SEARCH workflow_logs USING INDEX workflow_logs_workflowRunId_idx/
-              : /SEARCH workflow_logs USING INDEX workflow_logs_workflowRunId_idx(_[0-9a-f]{8})? \(workflowRunId=\?\)/,
+            /^SEARCH workflow_logs USING INDEX workflow_logs_workflowRunId_idx(_[0-9a-f]{8})? \(workflowRunId=\?\)/,
           );
+          expect(plans.workflow_steps!.join(" | "), state).toMatch(
+            /^SEARCH s USING INDEX workflow_steps_stageRecordId_idx(_[0-9a-f]{8})? \(stageRecordId=\?\)/,
+          );
+          for (const table of tables)
+            expect(plans[table]!.join(" | "), state).not.toMatch(
+              /SCAN (workflow_\w+|s)( |$)/,
+            );
         }
         console.log([...new Set(seen)].join("\n"));
       } finally {
@@ -1718,6 +1743,97 @@ ${series(rows)} SELECT '${runId}-l' || n, ${later("createdAt", "n")}, '${runId}'
       ["tie-newest", "tie-5", "tie-4", "tie-3", "tie-2", "tie-1"],
       false,
     ]);
+  });
+
+  it("fetches no more than a page of annotations, whatever the size of the group of rows that share the time it ends at", {
+    timeout: 60_000,
+  }, async () => {
+    await prisma.workflowRun.createMany({
+      data: [mkRun("run-tie-group", at(-9_040), "RUNNING", "wf-d", 0, 0)],
+    });
+    // 100 newer rows, then 5,000 rows written at one time (one createMany),
+    // then 50 older ones: the page of 200 ends in the group.
+    const rows = Array.from({ length: 5_150 }, (_, i) => {
+      const g = i + 1;
+      return {
+        id: `${g <= 100 ? "n" : g <= 5_100 ? "t" : "o"}${String((g * 7919) % 100_003).padStart(6, "0")}`,
+        workflowRunId: "run-tie-group",
+        attempt: 0,
+        scope: "run",
+        key: `k${g}`,
+        value: {},
+        createdAt:
+          g <= 100
+            ? new Date(at(-9_000).getTime() + g)
+            : g <= 5_100
+              ? at(-9_010)
+              : at(-9_020),
+      };
+    });
+    for (let i = 0; i < rows.length; i += 500)
+      await prisma.workflowAnnotation.createMany({
+        data: rows.slice(i, i + 500),
+      });
+    const calls: RecordedStatement[] = [];
+    const detail = await createPrismaConsoleReadPort(
+      recordingClient(prisma, calls),
+      { databaseType: "sqlite", now: () => at(100) },
+    ).getRunDetail("run-tie-group");
+    // The times of 201 rows, then 100 newer rows and the group's first 100.
+    expect(
+      calls
+        .filter((c) => c.sql.includes('FROM "workflow_annotations"'))
+        .map((c) => (c.rows as unknown[]).length),
+    ).toEqual([201, 100, 100]);
+    const expected = [...rows]
+      .sort(
+        (a, b) =>
+          b.createdAt.getTime() - a.createdAt.getTime() ||
+          Buffer.compare(Buffer.from(b.id), Buffer.from(a.id)),
+      )
+      .slice(0, 200)
+      .map((r) => r.id);
+    expect(detail?.annotations.map((a) => a.id)).toEqual(expected);
+    expect(detail?.truncated.annotations).toBe(true);
+  });
+
+  it("reads with any statementTimeoutMs, and names the transaction's limit when a read outlasts it", {
+    timeout: 60_000,
+  }, async () => {
+    // 20 times 107,374,183 passes the longest timer Node keeps.
+    for (const ms of [107_374_183, 2_147_483_647, 10 ** 12]) {
+      const port = reader(ms);
+      expect((await port.getRunDetail("run-day-1"))?.run.id, `${ms}`).toBe(
+        "run-day-1",
+      );
+      expect((await port.listRuns({ limit: 2 })).runs, `${ms}`).toHaveLength(2);
+    }
+    // A client-side wait past the read's budget (20 statements of 50 ms).
+    const slow = recordingClient(prisma, [], async (call) => {
+      if (call.sql.includes('FROM "workflow_stages"'))
+        await new Promise((r) => setTimeout(r, 1_500));
+    });
+    const error = await createPrismaConsoleReadPort(slow, {
+      databaseType: "sqlite",
+      statementTimeoutMs: 50,
+      now: () => at(100),
+    })
+      .getRunDetail("run-day-1")
+      .catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ConsoleQueryTimeoutError);
+    expect((error as ConsoleQueryTimeoutError).limit).toBe("transaction");
+    expect((error as Error).message).toMatch(
+      /ran past its transaction's limit of 1000ms/,
+    );
+    expect((error as Error).message).not.toMatch(/statement_timeout\b/);
+  });
+
+  it("refuses an afterSequence that is not a number at the port", async () => {
+    for (const value of [Number.NaN, "3" as unknown as number])
+      await expect(
+        reader().listRunEvents("run-day-1", value),
+        String(value),
+      ).rejects.toBeInstanceOf(ConsoleBadRequestError);
   });
 
   it("cuts a lifecycle event's error text in SQL and says it was cut", async () => {

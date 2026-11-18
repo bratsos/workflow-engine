@@ -1,5 +1,17 @@
 /**
- * A console query was cancelled by `statement_timeout` (Postgres `57014`).
+ * Which limit ended a console query: Postgres's `statement_timeout`, the
+ * read's transaction outliving the time its statements may take, or the
+ * wait for a connection to begin it.
+ */
+export type ConsoleQueryLimit =
+  | "statement_timeout"
+  | "transaction"
+  | "connection";
+
+/**
+ * A console query ran past one of its limits: cancelled by
+ * `statement_timeout` (Postgres `57014`), or its transaction given up by
+ * the client (its timeout, or the wait for a connection).
  *
  * Thrown rather than swallowed so the handler can answer with an honest
  * "that query was too expensive" instead of holding the request open. The
@@ -9,15 +21,24 @@
  */
 export class ConsoleQueryTimeoutError extends Error {
   readonly code = "query_timeout" as const;
+  /** The limit that fired; `statement_timeout` when not given. */
+  readonly limit: ConsoleQueryLimit;
   constructor(
     readonly query: string,
     readonly timeoutMs: number,
-    options?: { cause?: unknown },
+    options?: { cause?: unknown; limit?: ConsoleQueryLimit; limitMs?: number },
   ) {
+    const limit = options?.limit ?? "statement_timeout";
+    const limitMs = options?.limitMs ?? timeoutMs;
     super(
-      `Console query "${query}" was cancelled after ${timeoutMs}ms by statement_timeout. Narrow the filter or raise statementTimeoutMs.`,
-      options,
+      limit === "statement_timeout"
+        ? `Console query "${query}" was cancelled after ${timeoutMs}ms by statement_timeout. Narrow the filter or raise statementTimeoutMs.`
+        : limit === "transaction"
+          ? `Console query "${query}" ran past its transaction's limit of ${limitMs}ms (derived from statementTimeoutMs ${timeoutMs}). Narrow the filter or raise statementTimeoutMs.`
+          : `Console query "${query}" waited ${limitMs}ms for a database connection to begin its transaction (statementTimeoutMs ${timeoutMs}). The connection pool is busy; retry, or raise statementTimeoutMs.`,
+      options?.cause === undefined ? undefined : { cause: options.cause },
     );
+    this.limit = limit;
     this.name = "ConsoleQueryTimeoutError";
   }
 }
