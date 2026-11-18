@@ -14,6 +14,7 @@ export {
   type BlobPrismaClient,
   createPrismaBlobStore,
   PrismaBlobStore,
+  type PrismaBlobStoreOptions,
 } from "./blob-store";
 export { createEnumHelper, type PrismaEnumHelper } from "./enum-compat";
 export {

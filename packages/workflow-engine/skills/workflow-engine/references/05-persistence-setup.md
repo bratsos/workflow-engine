@@ -946,6 +946,10 @@ interface PrismaStepLedgerOptions {
 interface PrismaAICallLoggerOptions {
   databaseType?: DatabaseType;  // "sqlite" uses SQLite's JSON path syntax
 }
+
+interface PrismaBlobStoreOptions {
+  databaseType?: DatabaseType;  // Set to "sqlite" for a Prisma 6/7 unsafe-only SQLite facade
+}
 ```
 
 ### `workerId`: let the host supply it
@@ -970,7 +974,7 @@ A custom `JobTransport` may implement `adoptWorkerId(workerId): string` -- take 
 id unless one was explicitly configured, and return the id you will actually stamp.
 Omitting the method is fine; the host then leaves the transport alone.
 
-For Prisma 8, the wrapper exposes the target from `contract.target`. SQLite-aware factories validate their explicit or effective `databaseType` against it before issuing SQL. When using SQLite, pass `{ databaseType: "sqlite" }` to `createPrismaWorkflowPersistence`, `createPrismaJobQueue`, `createPrismaStepLedger` and `createPrismaAICallLogger`. Otherwise, you'll get SQL syntax errors from PostgreSQL-specific queries (or, for the step ledger, a `skipDuplicates` the driver does not support).
+For Prisma 8, the wrapper exposes the target from `contract.target`. SQLite-aware factories validate their explicit or effective `databaseType` against it before issuing SQL. When using SQLite, pass `{ databaseType: "sqlite" }` to `createPrismaWorkflowPersistence`, `createPrismaJobQueue`, `createPrismaStepLedger` and `createPrismaAICallLogger`. For a Prisma 6/7 SQLite facade that exposes only `$queryRawUnsafe`, pass `{ databaseType: "sqlite" }` to `createPrismaBlobStore` so its prefix read uses native SQLite placeholders. Otherwise, you'll get SQL syntax errors from PostgreSQL-specific queries (or, for the step ledger, a `skipDuplicates` the driver does not support).
 
 ## Prisma Version Compatibility
 

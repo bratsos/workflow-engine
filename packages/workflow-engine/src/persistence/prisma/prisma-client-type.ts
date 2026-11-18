@@ -166,7 +166,7 @@ export function rawFor<C extends EnginePrismaClient>(
 
 /** Reject a configured dialect that disagrees with the wrapped client's contract. */
 export function validateDatabaseType(
-  prisma: EnginePrismaClient,
+  prisma: Pick<EnginePrismaClient, "$databaseType">,
   databaseType: string,
 ): void {
   if (prisma.$databaseType && databaseType !== prisma.$databaseType) {

@@ -25,6 +25,7 @@ import {
 } from "../../kernel/testing/index.js";
 import {
   createPrismaAICallLogger,
+  createPrismaBlobStore,
   createPrismaJobQueue,
   createPrismaStepLedger,
   createPrismaWorkflowPersistence,
@@ -980,6 +981,87 @@ describe.skipIf(!sqlite)(`sqlite date guard on Prisma ${major}`, () => {
     await expect(blind.queue.dequeue()).rejects.toBeInstanceOf(
       SqliteDateStorageUnverifiedError,
     );
+  }, 60_000);
+
+  it("lists AI calls by prefix through either single raw read", async () => {
+    const file = join(directory, "list-calls-single-raw.db");
+    const writer = await open(file);
+    const logger = createPrismaAICallLogger(writer, { databaseType: "sqlite" });
+    const persistence = createPrismaWorkflowPersistence(writer, {
+      databaseType: "sqlite",
+    });
+    const run = await persistence.createRun(runInput("prefix-run"));
+    await persistence.appendAnnotations([
+      {
+        workflowRunId: run.id,
+        scope: "run",
+        key: "workflow/run-1.annotation",
+        value: { source: "test" },
+      },
+      {
+        workflowRunId: run.id,
+        scope: "run",
+        key: "other/run-2.annotation",
+        value: { source: "test" },
+      },
+    ]);
+    const blobs = createPrismaBlobStore(writer, { databaseType: "sqlite" });
+    await blobs.put("workflow/run-1/blob", { source: "test" });
+    await blobs.put("other/run-2/blob", { source: "test" });
+    await logger.logBatchResults("prefix-filter", [
+      {
+        topic: "workflow/run-1.stage.extract",
+        callType: "text",
+        modelKey: "model-key",
+        modelId: "model-id",
+        prompt: "prompt",
+        response: "response",
+        inputTokens: 3,
+        outputTokens: 2,
+        cost: 0.01,
+        requestId: "request-1",
+      },
+      {
+        topic: "other/run-2.stage.extract",
+        callType: "text",
+        modelKey: "model-key",
+        modelId: "model-id",
+        prompt: "prompt",
+        response: "response",
+        inputTokens: 3,
+        outputTokens: 2,
+        cost: 0.01,
+        requestId: "request-2",
+      },
+    ]);
+
+    for (const hidden of [["$queryRaw"], ["$queryRawUnsafe"]]) {
+      const reader = without(await open(file, true), hidden);
+      const readerLogger = createPrismaAICallLogger(reader, {
+        databaseType: "sqlite",
+      });
+      expect(
+        (await readerLogger.listCalls("workflow/")).map((call) => call.topic),
+        hidden[0],
+      ).toEqual(["workflow/run-1.stage.extract"]);
+      expect(await readerLogger.getStats("workflow/")).toMatchObject({
+        totalCalls: 1,
+        totalInputTokens: 3,
+        totalOutputTokens: 2,
+      });
+      expect(
+        (
+          await createPrismaWorkflowPersistence(reader, {
+            databaseType: "sqlite",
+          }).listAnnotations(run.id, { keyPrefix: "workflow/" })
+        ).map((annotation) => annotation.key),
+      ).toEqual(["workflow/run-1.annotation"]);
+      expect(
+        await createPrismaBlobStore(reader, { databaseType: "sqlite" }).list(
+          "workflow/",
+        ),
+      ).toEqual(["workflow/run-1/blob"]);
+    }
   }, 60_000);
 
   it("asks one cheap question: index lookups and one row of each sampled table", async () => {

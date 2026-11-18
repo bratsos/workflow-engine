@@ -1596,6 +1596,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
         "key",
         filters.keyPrefix,
         {
+          databaseType: this.databaseType,
           suffix,
           values,
           ...(nativeSqlite

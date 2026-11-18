@@ -253,6 +253,7 @@ export class PrismaAICallLogger implements AICallLogger {
       outputTokens: number;
       cost: number;
     }>(this.prisma, "ai_calls", "topic", topicPrefix, {
+      databaseType: this.databaseType,
       columns: {
         modelKey: "text",
         inputTokens: "int",
@@ -363,6 +364,7 @@ export class PrismaAICallLogger implements AICallLogger {
       "topic",
       topicPrefix,
       {
+        databaseType: this.databaseType,
         suffix: ' ORDER BY "createdAt" ASC, "id" ASC',
         ...(nativeSqlite
           ? {
