@@ -27,7 +27,10 @@ import {
 } from "../../persistence/prisma/sql-errors.js";
 
 const require = createRequire(import.meta.url);
-const { DatabaseSync } = require("node:sqlite");
+// Every suite here is for Prisma 8. The Prisma 6 and 7 floor (Node 22.12) has
+// no node:sqlite to load, and a skipped suite still evaluates this file.
+const prisma8 = process.env.PRISMA_MAJOR === "8";
+const { DatabaseSync } = prisma8 ? require("node:sqlite") : ({} as any);
 const fixtureDir = process.env.PRISMA8_SQLITE_FIXTURE
   ? resolve(process.env.PRISMA8_SQLITE_FIXTURE)
   : join(
@@ -36,14 +39,16 @@ const fixtureDir = process.env.PRISMA8_SQLITE_FIXTURE
     );
 // node:sqlite reads TEXT back cut at a NUL before Node 24.16 and 26.1 (every
 // 22.x), nodejs/node#61954: there the adapter refuses a NUL in any statement.
-const nulCut = (() => {
-  const probe = new DatabaseSync(":memory:");
-  try {
-    return probe.prepare("SELECT ? AS v").get("a\0b").v !== "a\0b";
-  } finally {
-    probe.close();
-  }
-})();
+const nulCut =
+  prisma8 &&
+  (() => {
+    const probe = new DatabaseSync(":memory:");
+    try {
+      return probe.prepare("SELECT ? AS v").get("a\0b").v !== "a\0b";
+    } finally {
+      probe.close();
+    }
+  })();
 const NUL = "a\0b";
 // Past SQLite's 32,766 binds, so the write is split into chunks.
 const bulk = (last: string) =>

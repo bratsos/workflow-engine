@@ -680,7 +680,12 @@ describe
   .each(["delete", "wal"] as const)(
   "a transaction the consumer opens on the root connection, journal mode %s",
   (mode) => {
-    const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite");
+    // A skipped suite still runs this callback, and Node 22.12 (the Prisma 6
+    // and 7 floor) has no node:sqlite to load.
+    const { DatabaseSync } =
+      process.env.PRISMA_MAJOR === "8"
+        ? createRequire(import.meta.url)("node:sqlite")
+        : ({} as any);
     let db: KernelDatabase;
     beforeEach(async () => {
       db = await kernelDatabase();
