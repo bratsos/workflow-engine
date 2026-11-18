@@ -1029,7 +1029,7 @@ Prisma 6 stores `DateTime` values in SQLite as integer epoch milliseconds, Prism
 - `getSuspendedStages` for a time before the deadline returned the stage that is not due, so it would be polled early;
 - `engine.stats` reported two stages as due where one was (`suspendedDue`). The dead-lettered count was right: it is a bare `IS NOT NULL` count, which does not depend on the storage class.
 
-Read the other way (a file written by Prisma 7, read through Prisma 6), a stage whose deadline had passed was not returned, so it would never be polled. There is no supported timestamp-normalization migration: start the new major from a fresh SQLite file and migrate application data into it.
+Read the other way (a file written by Prisma 7, read through Prisma 6), a stage whose deadline had passed was not returned, so it would never be polled. Follow the [SQLite major-switch procedure](#switching-sqlite-prisma-majors) before opening a file with a different major.
 
 The engine refuses such a file, and it does not run on a file it could not check. On SQLite, `PrismaWorkflowPersistence`, `PrismaJobQueue`, `PrismaStepLedger` and `PrismaAICallLogger` check before every method, and the console read port before every read. The check is one statement through the client's own raw read (the tagged `$queryRaw`, or `$queryRawUnsafe` when that is all the client has): the oldest and the newest stored value of every date column that has an index leading with it (`workflow_runs.createdAt`, `outbox_events.publishedAt` and `dlqAt`, `workflow_stages.nextPollAt`, `job_queue.nextPollAt`), the required date of one row of each table whose rows no run implies (`job_queue.createdAt`, `outbox_events.occurredAt`, `idempotency_keys.createdAt`, `ai_calls.createdAt`), and a `Date` as this client binds it, read off the client and not from a table of majors. It compares the storage class (integer or text) and, when both are text, the form (the text with every digit replaced, which tells Prisma 7's `...+00:00` from Prisma 8's `...Z`). Each method is covered by name, not by how the code was compiled (a bundler that lowers `async` changes nothing), so every entry point passes the check: a kernel command, a host's tick or job loop, `engine.stats`, a direct call.
 
@@ -1054,40 +1054,27 @@ Both errors are exported from `@bratsos/workflow-engine`. All six cross directio
 
 What a bounded probe cannot see: a foreign text form (Prisma 7's against Prisma 8's) on rows strictly between the oldest and the newest of a column, and the rows of a sampled table other than the one it reads. A class mix in an indexed column is always seen, because every integer sorts before every text value and so changes the oldest or the newest of its column. While one major at a time uses a file, such rows cannot arise (the first call on a foreign file refuses); only a file an earlier release mixed, or two majors writing one file at once, can hold them.
 
-**Recovering.** A file keeps working under the major that created it. To move it to another major without starting from an empty file, drain it with the major that created it, then open it with the new one. With every process that uses the file stopped, and using the creating major:
+### Switching SQLite Prisma majors
 
-1. dispatch `run.cancel` for every run that is not terminal (`PENDING`, `RUNNING`, `SUSPENDED`); each cancel appends outbox events;
-2. dispatch `outbox.flush` until `engine.stats` reports `outbox.unpublished` as `0`, so the event sink receives every event, the cancels' included;
-3. resolve the dead letters (`engine.stats` `outbox.deadLettered`): once the sink accepts them, `plugin.replayDLQ` and another `outbox.flush`; or discard them knowingly, since step 5 deletes them;
-4. dispatch `run.purge` with an `olderThan` in the future until `purged` is `0` (it deletes the runs with their stages, logs, annotations, step ledger, jobs and blobs);
-5. run `DELETE FROM outbox_events;`, `DELETE FROM idempotency_keys;` and `DELETE FROM ai_calls;` (`run.purge` touches none of them);
-6. open the file with the new major. For Prisma 8 that is `sqlite({ contract, path })` on the file as it is: `prisma db init` refuses a file that already holds tables.
+The drain-and-open procedure below supports Prisma 6 → 7, 6 → 8, 7 → 6, 7 → 8, and 8 → 7. For Prisma 8 → 6, start with a fresh file and migrate application data. For the supported switches, stop every writer, host and flusher. Use the creating Prisma major and the schema with the nullable `deliveryClaim` field.
 
-The drain deletes the run history and the AI call rows: export what you need first. A file that mixes engine tables with your own keeps your own tables; only the engine's rows go.
+1. Dispatch `run.cancel` for every non-terminal run (`PENDING`, `RUNNING` or `SUSPENDED`). Cancellation appends outbox events.
+2. Run `outbox.flush` on a root client with the creating major until `engine.stats` reports `outbox.unpublished: 0`. That figure includes claimed events. With every other flusher stopped, allow any live claim to expire and flush again. Before deleting rows, verify that there are no unpublished events and no live delivery claims.
+3. Resolve the dead letters. When the sink can accept them, run `plugin.replayDLQ` and flush again until there are no unpublished events, live claims or dead letters. If you choose to discard dead letters, record that decision before the outbox DELETE.
+4. Dispatch `run.purge` with an `olderThan` in the future until `purged` is 0. This removes the run history and its associated rows. Export what you need first, including any AI call history.
+5. Execute the following with the creating major. `run.purge` leaves all three tables intact.
 
-What was run, exactly as above, on a real file per direction (the commands through the kernel with an event sink whose first delivery failed and whose `maxRetries` was 1, the three statements through the creating major's client with `$executeRawUnsafe`). Before the drain each file held four runs (one completed through the Node host, one `PENDING`, one claimed and `RUNNING`, one `RUNNING` with a `SUSPENDED` stage and a suspended job), eight outbox events of which three were unpublished, five idempotency keys of which one (`rc-inprogress`) was acquired and never completed, one AI call, one step, one log, one annotation, one blob and one workflow definition. The new major refused the untouched file (`start()` rejected with `SqliteDateStorageError`: `class` for 6 to 7, 6 to 8 and 7 to 6, `form` for 7 to 8 and 8 to 7). Then, with the creating major, in each of the five directions:
+   ```sql
+   DELETE FROM outbox_events;
+   DELETE FROM idempotency_keys;
+   DELETE FROM ai_calls;
+   ```
 
-- step 1 cancelled 3 runs: 6 events unpublished;
-- step 2 took two flushes: 5 events published and 1 dead-lettered (the failed delivery), then 0 unpublished and 1 dead letter;
-- step 3 replayed 1 and the next flush published it: 0 unpublished, 0 dead letters, 6 events received by the sink;
-- step 4 purged 4 runs; 11 outbox events remained, none undelivered, with the 5 keys and the AI call;
-- after step 5 the three tables were empty and `workflow_definitions` still held its one row.
+6. Open the file with the new major. On Prisma 8, use `sqlite({ contract, path })` on the drained file. Use `prisma db init` for fresh files.
 
-The new major then started the Node host (`start()` checks the storage), and:
+On real files with delivery claims, omitting the outbox, idempotency or AI DELETE caused the new major to refuse the file in `outbox_events.publishedAt`, `idempotency_keys.createdAt` or `ai_calls.createdAt`, respectively. Retain `workflow_definitions` and your application tables.
 
-- `run.create` ran to `COMPLETED` through the job loop;
-- `run.purge` with an `olderThan` of an hour ago kept that run, completed a moment before;
-- `run.reapStuck` with a one-hour threshold left a fresh `RUNNING` run alone, and failed it once the kernel clock was two hours ahead;
-- a `run.create` that reused the in-progress key two hours later created its run;
-- a final `run.purge` with a future `olderThan` removed the two terminal runs the check had created (the completed one and the reaped one), and `engine.stats` answered.
-
-Passed: 6 to 7, 6 to 8, 7 to 6, 7 to 8 and 8 to 7.
-
-What each statement of step 5 is for, from runs that skipped it in the five directions that pass (the other steps as above): the new major's `start()` rejected with `SqliteDateStorageError` in all five, in `outbox_events.publishedAt` without `DELETE FROM outbox_events;`, in `idempotency_keys.createdAt` without `DELETE FROM idempotency_keys;` and in `ai_calls.createdAt` without `DELETE FROM ai_calls;` (`class` or `form` as above). `workflow_definitions` rows stay: nothing compares their dates, and every check above passed with the old row in place.
-
-**8 to 6 does not recover.** Prisma 8 declares its date columns `TEXT` where Prisma 6 and 7 declare `DATETIME`, so the integers a Prisma 6 client writes into a Prisma 8 file are stored as text, and its first read fails. After the full drain, with every engine table empty, the first `run.create` on Prisma 6 failed in its idempotency lookup with `Inconsistent column data: Could not convert value "1794943967975" of the field createdAt to type DateTime`. Prisma 6's `db push` onto that file stops at `Use the --accept-data-loss flag`, also with the engine tables dropped (the file then held only Prisma 8's `_prisma_ledger` and `_prisma_marker`), so do not use it. To go from Prisma 8 to Prisma 6, start Prisma 6 from a fresh SQLite file and migrate application data into it.
-
-Do not point Prisma 8 at a SQLite file created by Prisma 6 or Prisma 7. Real-file checks found timestamp comparison differences from both origins. In the Prisma 7 boundary probe, the stored value `2026-06-07T08:09:10.123+00:00` matched a Prisma 7 exact-range query and console filter (1 row each), while Prisma 8's `Z`-formatted exact-range query and console filter returned 0 rows each at that same instant. Prisma 6 stores `DateTime` values as integer epoch milliseconds, which also fail when mixed with Prisma 8 ISO-text timestamps. There is no supported timestamp-normalization migration. For either origin, initialise a fresh SQLite file from the Prisma 8 SQLite contract and migrate application data into it.
+**Prisma 8 → 6 requires a fresh file.** Prisma 8 declares date columns as `TEXT`. SQLite stores the integer timestamps from Prisma 6 as text in that schema, and Prisma 6 cannot read them. The problem persists after draining the file.
 
 #### Prisma 8 with SQLite
 

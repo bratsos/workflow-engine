@@ -54,6 +54,7 @@ import {
   type OutboxClaimPage,
   postgresOutboxCandidates,
   postgresOutboxWrite,
+  readOutboxSql,
   sqliteOutboxClaim,
 } from "./outbox-claim";
 import {
@@ -343,7 +344,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     });
     this.isOutboxTransaction =
       isNativeTransaction(prisma) || typeof prisma.$transaction !== "function";
-    this.rawOutboxQueries = typeof prisma.$queryRawUnsafe === "function";
+    this.rawOutboxQueries = Boolean(prisma.$queryRawUnsafe || prisma.$queryRaw);
     this.prisma = withTransactionWriteGuard(
       prisma,
       options.databaseType ?? "postgresql",
@@ -1809,19 +1810,26 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
 
   async getUnpublishedOutboxEvents(limit?: number): Promise<OutboxRecord[]> {
     const effectiveLimit = limit ?? 100;
-    if (this.databaseType === "postgresql" && this.prisma.$queryRawUnsafe) {
-      // Sorting by an equivalent expression prevents a small LIMIT from
-      // walking the run/sequence index through all published history when
-      // planner statistics are missing or stale.
-      const rows = await rawFor(this.prisma, "outbox_events").$queryRawUnsafe!<
-        any[]
-      >(
-        `SELECT * FROM "outbox_events"
-         WHERE "publishedAt" IS NULL AND ("dlqAt" IS NULL OR "publishedAt" IS NOT NULL)
-         ORDER BY ("workflowRunId" || ''), sequence LIMIT $1`,
-        effectiveLimit,
+    if (this.rawOutboxQueries) {
+      // The SQLite index provides the live range in run/sequence order.
+      // On Postgres the equivalent sort expression keeps a small limit
+      // from walking the unfiltered run/sequence index through history.
+      const sql =
+        this.databaseType === "sqlite"
+          ? `SELECT * FROM "outbox_events" INDEXED BY outbox_events_live_run_sequence_idx
+           WHERE "publishedAt" IS NULL AND "dlqAt" IS NULL
+           ORDER BY "workflowRunId", sequence LIMIT $1`
+          : `SELECT * FROM "outbox_events"
+           WHERE "publishedAt" IS NULL AND ("dlqAt" IS NULL OR "publishedAt" IS NOT NULL)
+           ORDER BY ("workflowRunId" || ''), sequence LIMIT $1`;
+      const rows = await readOutboxSql<any>(
+        this.prisma,
+        this.databaseType,
+        "outbox_events",
+        sql,
+        [effectiveLimit],
       );
-      return rows.map((row: any) => this.mapOutboxEvent(row));
+      return rows.map((row) => this.mapOutboxEvent(row));
     }
     const records = await this.prisma.outboxEvent.findMany({
       where: LIVE_OUTBOX,
@@ -1881,16 +1889,13 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     if (page.signal?.aborted) return [];
     if (this.rawOutboxQueries && this.databaseType === "sqlite") {
       const { sql, args } = sqliteOutboxClaim(page);
-      const orderedArgs: (string | number)[] = [];
-      const query = this.prisma.$withColumns
-        ? sql
-        : sql.replace(/\$(\d+)/g, (_, index) => {
-            orderedArgs.push(args[Number(index) - 1]!);
-            return "?";
-          });
-      const rows = await rawFor(this.prisma, "outbox_events").$queryRawUnsafe!<
-        any[]
-      >(query, ...(this.prisma.$withColumns ? args : orderedArgs));
+      const rows = await readOutboxSql<any>(
+        this.prisma,
+        "sqlite",
+        "outbox_events",
+        sql,
+        args,
+      );
       // SQLite BINARY compares UTF-8 bytes, which follow code point order.
       const encoder = new TextEncoder();
       const ordered = rows.map((row) => ({
@@ -1917,18 +1922,25 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
           await this.configureOutboxPlanner(tx);
           if (page.signal?.aborted) return [];
           const selection = postgresOutboxCandidates(page);
-          const candidates = await rawFor(tx, {
-            id: "text",
-            workflowRunId: "text",
-          }).$queryRawUnsafe!<{ id: string; workflowRunId: string }[]>(
+          const candidates = await readOutboxSql<{
+            id: string;
+            workflowRunId: string;
+          }>(
+            tx,
+            "postgresql",
+            { id: "text", workflowRunId: "text" },
             selection.sql,
-            ...selection.args,
+            selection.args,
           );
           if (!candidates.length || page.signal?.aborted) return [];
           const write = postgresOutboxWrite(page, candidates);
-          const rows = await rawFor(tx, "outbox_events").$queryRawUnsafe!<
-            any[]
-          >(write.sql, ...write.args);
+          const rows = await readOutboxSql<any>(
+            tx,
+            "postgresql",
+            "outbox_events",
+            write.sql,
+            write.args,
+          );
           const persisted = new Map(rows.map((row) => [row.id, row]));
           return candidates.flatMap(({ id }) => {
             const row = persisted.get(id);

@@ -275,7 +275,7 @@ describe("PrismaWorkflowPersistence.claimOutboxDelivery raw SQL", () => {
     expect(token).toBe(claim);
   });
 
-  it("uses a compare-and-set on a derived run head", async () => {
+  it("uses a compare-and-set on the PostgreSQL delegate path", async () => {
     const now = new Date("2026-09-04T11:00:00.000Z");
     const rows = [
       {
@@ -307,7 +307,7 @@ describe("PrismaWorkflowPersistence.claimOutboxDelivery raw SQL", () => {
       },
     } as unknown as EnginePrismaClient;
     const persistence = new PrismaWorkflowPersistence(prisma, {
-      databaseType: "sqlite",
+      databaseType: "postgresql",
     });
     expect(
       await persistence.claimOutboxDelivery(

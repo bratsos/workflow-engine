@@ -864,46 +864,169 @@ describe.skipIf(!sqlite && !databaseUrl)(
       expect(accepted).toEqual([2, 1]);
     });
 
-    it("claims an independent run through a delegate-only client despite a large blocked run", async () => {
-      await seedEvent("a-blocked");
-      await persistence.appendOutboxEvents(
-        Array.from({ length: 100 }, (_, i) => ({
-          workflowRunId: "a-blocked",
-          eventType: "workflow:created",
-          payload: {},
-          causationId: String(i),
-          occurredAt: clock.now(),
-        })),
-      );
-      await seedEvent("z-ready");
-      const token = "2099-01-01T00:00:00.000Z|held";
+    it.each([
+      "$queryRaw",
+      "$queryRawUnsafe",
+    ] as const)("reads and claims through the single %s capability", async (available) => {
+      const statements: string[] = [];
+      const singleRead = (prisma: typeof client): typeof client =>
+        new Proxy(prisma, {
+          get(target, key) {
+            if (key === "$withColumns" && target.$withColumns)
+              return (...args: unknown[]) =>
+                singleRead(target.$withColumns(...args));
+            if (key === "$transaction" && target.$transaction)
+              return (work: (tx: typeof client) => unknown, options: unknown) =>
+                target.$transaction(
+                  (tx: typeof client) => work(singleRead(tx)),
+                  options,
+                );
+            if (key === "$queryRaw" || key === "$queryRawUnsafe") {
+              if (key !== available) return undefined;
+              return (
+                sql: string | TemplateStringsArray,
+                ...args: unknown[]
+              ) => {
+                statements.push(typeof sql === "string" ? sql : sql.join("?"));
+                return target[key](sql, ...args);
+              };
+            }
+            return Reflect.get(target, key, target);
+          },
+        });
+      const store = storeOver(singleRead(client));
+      const append = () =>
+        store.appendOutboxEvents([
+          {
+            workflowRunId: "a-selected",
+            eventType: "workflow:created",
+            payload: { workflowRunId: "a-selected" },
+            causationId: "single-read",
+            occurredAt: clock.now(),
+          },
+        ]);
+      await append();
+      await append();
+      await seedEvent("z-excluded");
+      expect((await store.getUnpublishedOutboxEvents(1))[0]?.sequence).toBe(1);
+      const lease = "2099-01-01T00:00:00.000Z|single-read";
+      const claim = () =>
+        store.claimOutboxDelivery(2, lease, clock.now(), ["z-excluded"]);
+      const [first] = await claim();
+      expect(first).toMatchObject({ workflowRunId: "a-selected", sequence: 1 });
+      expect(await claim()).toEqual([]);
       expect(
-        (
-          await persistence.claimOutboxDelivery(1, token, clock.now(), [
-            "z-ready",
-          ])
-        )[0]?.workflowRunId,
-      ).toBe("a-blocked");
-      const wrapper = new Proxy(client, {
-        get(target, key) {
-          if (key === "$queryRawUnsafe") return undefined;
-          return Reflect.get(target, key, target);
-        },
+        await store.isOutboxDeliveryClaimActive(first!.id, lease, clock.now()),
+      ).toBe(true);
+      expect(
+        await store.failOutboxDelivery(first!.id, lease, 2, clock.now()),
+      ).toBe("retry");
+      const [retry] = await claim();
+      expect(retry).toMatchObject({ id: first!.id, retryCount: 1 });
+      expect(
+        await store.completeOutboxDelivery(retry!.id, lease, clock.now()),
+      ).toBe(true);
+      expect((await claim())[0]).toMatchObject({
+        workflowRunId: "a-selected",
+        sequence: 2,
       });
-      const sink = {
-        async emit(event: { workflowRunId?: string }) {
-          delivered.push(event.workflowRunId!);
-        },
-      };
       expect(
-        (
-          await make(sink, storeOver(wrapper)).dispatch({
-            type: "outbox.flush",
-          })
-        ).published,
-      ).toBe(1);
-      expect(delivered).toEqual(["z-ready"]);
+        statements.some((sql) => sql.startsWith("WITH RECURSIVE walk")),
+      ).toBe(true);
+      expect(
+        statements.some((sql) => sql.includes('SET "deliveryClaim"')),
+      ).toBe(true);
     });
+
+    it.skipIf(!sqlite)(
+      "refuses unverified outbox operations before reading or writing",
+      async () => {
+        await seedEvent("unverified");
+        const row = await client.outboxEvent.findFirst();
+        const withoutRawReads = (prisma: typeof client): typeof client =>
+          new Proxy(prisma, {
+            get(target, key) {
+              if (key === "$queryRaw" || key === "$queryRawUnsafe")
+                return undefined;
+              if (key === "$withColumns" && target.$withColumns)
+                return (...args: unknown[]) =>
+                  withoutRawReads(target.$withColumns(...args));
+              return Reflect.get(target, key, target);
+            },
+          });
+        const store = storeOver(withoutRawReads(client));
+        const now = clock.now();
+        const claim = "2099-01-01T00:00:00.000Z|unverified";
+        for (const run of [
+          () => store.getUnpublishedOutboxEvents(),
+          () => store.claimOutboxDelivery(1, claim, now, []),
+          () => store.isOutboxDeliveryClaimActive(row.id, claim, now),
+          () => store.completeOutboxDelivery(row.id, claim, now),
+          () => store.failOutboxDelivery(row.id, claim, 1, now),
+          () =>
+            store.appendOutboxEvents([
+              {
+                workflowRunId: row.workflowRunId,
+                eventType: "workflow:created",
+                payload: {},
+                causationId: "unverified",
+                occurredAt: now,
+              },
+            ]),
+        ]) {
+          await expect(run()).rejects.toMatchObject({
+            code: "SQLITE_DATE_STORAGE_UNVERIFIED",
+            reason: "no-raw-query",
+          });
+        }
+        expect(await client.outboxEvent.findMany()).toEqual([row]);
+      },
+    );
+
+    it.skipIf(sqlite)(
+      "claims an independent run through the PostgreSQL delegate path despite a large blocked run",
+      async () => {
+        await seedEvent("a-blocked");
+        await persistence.appendOutboxEvents(
+          Array.from({ length: 100 }, (_, i) => ({
+            workflowRunId: "a-blocked",
+            eventType: "workflow:created",
+            payload: {},
+            causationId: String(i),
+            occurredAt: clock.now(),
+          })),
+        );
+        await seedEvent("z-ready");
+        const token = "2099-01-01T00:00:00.000Z|held";
+        expect(
+          (
+            await persistence.claimOutboxDelivery(1, token, clock.now(), [
+              "z-ready",
+            ])
+          )[0]?.workflowRunId,
+        ).toBe("a-blocked");
+        const wrapper = new Proxy(client, {
+          get(target, key) {
+            if (key === "$queryRawUnsafe" || key === "$queryRaw")
+              return undefined;
+            return Reflect.get(target, key, target);
+          },
+        });
+        const sink = {
+          async emit(event: { workflowRunId?: string }) {
+            delivered.push(event.workflowRunId!);
+          },
+        };
+        expect(
+          (
+            await make(sink, storeOver(wrapper)).dispatch({
+              type: "outbox.flush",
+            })
+          ).published,
+        ).toBe(1);
+        expect(delivered).toEqual(["z-ready"]);
+      },
+    );
 
     it("retains claimed, published and dead-lettered rows after purging their runs", async () => {
       for (const id of ["purged-claimed", "purged-published", "purged-dead"])

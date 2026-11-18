@@ -858,6 +858,29 @@ describe.skipIf(!sqlite && !databaseUrl)(
             () => expectStatsPlans(false),
           );
 
+          it.skipIf(!sqlite)(
+            "inspects unpublished rows from the live sequence index (SQLite)",
+            async () => {
+              const captured = await record(async () => {
+                expect(
+                  await persistence.getUnpublishedOutboxEvents(1),
+                ).toHaveLength(1);
+              });
+              const inspection = captured.find((statement) =>
+                UNPUBLISHED.matches(statement.sql),
+              );
+              expect(inspection).toBeDefined();
+              await expectServedBy(
+                {
+                  ...UNPUBLISHED,
+                  index: "outbox_events_live_run_sequence_idx",
+                },
+                inspection!,
+                false,
+              );
+            },
+          );
+
           // Postgres plans these from the stale estimate ("most rows are
           // active"): the runs, stages, jobs and live-outbox reads take one
           // pass over their table, the due-stage and dead-letter reads stay on

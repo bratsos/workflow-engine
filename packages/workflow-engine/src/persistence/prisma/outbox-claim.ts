@@ -1,3 +1,41 @@
+import {
+  type EnginePrismaClient,
+  type RawColumns,
+  rawFor,
+} from "./prisma-client-type";
+
+/** Execute the same positional statement through either raw-read capability. */
+export function readOutboxSql<T>(
+  prisma: EnginePrismaClient,
+  databaseType: "sqlite" | "postgresql",
+  columns: RawColumns,
+  sql: string,
+  args: readonly unknown[],
+): Promise<T[]> {
+  const client = rawFor(prisma, columns);
+  if (
+    prisma.$queryRawUnsafe &&
+    (databaseType === "postgresql" || prisma.$databaseType === "sqlite")
+  ) {
+    return client.$queryRawUnsafe!<T[]>(sql, ...args);
+  }
+  // A repeated $n binds the same value at each occurrence when a native
+  // SQLite query or a tagged template needs one value per placeholder.
+  const parts = sql.split(/\$(\d+)/);
+  const strings: string[] = [parts[0]!];
+  const values: unknown[] = [];
+  for (let i = 1; i < parts.length; i += 2) {
+    values.push(args[Number(parts[i]) - 1]);
+    strings.push(parts[i + 1]!);
+  }
+  if (prisma.$queryRawUnsafe)
+    return client.$queryRawUnsafe!<T[]>(strings.join("?"), ...values);
+  return client.$queryRaw!<T[]>(
+    Object.assign(strings, { raw: strings }),
+    ...values,
+  );
+}
+
 /**
  * Walk a range of run IDs in index order. Each iteration seeks past the
  * previous run, even when that run has a large tail of unpublished events.

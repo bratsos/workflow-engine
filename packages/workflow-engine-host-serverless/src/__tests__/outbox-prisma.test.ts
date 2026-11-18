@@ -12,6 +12,7 @@ import { InMemoryJobQueue } from "@bratsos/workflow-engine/testing";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { z } from "zod";
 import {
+  createPrismaJobQueue,
   createPrismaWorkflowPersistence,
   fromPrisma8,
 } from "../../../workflow-engine/src/persistence/prisma/index.js";
@@ -132,7 +133,16 @@ describe.skipIf(!sqlite && !databaseUrl)(
       const gate = new Promise<void>((resolve) => {
         release = resolve;
       });
-      const jobTransport = new InMemoryJobQueue("blocked-host");
+      const queue = createPrismaJobQueue(client, {
+        databaseType: sqlite ? "sqlite" : "postgresql",
+      });
+      let verifies = 0;
+      const jobTransport = Object.assign(new InMemoryJobQueue("blocked-host"), {
+        async verifyStorage() {
+          await queue.verifyStorage();
+          verifies++;
+        },
+      });
       const kernel = createKernel({
         persistence,
         jobTransport,
@@ -179,6 +189,8 @@ describe.skipIf(!sqlite && !databaseUrl)(
         ),
       ).toEqual([2, 3]);
       await client.outboxEvent.deleteMany();
+      await host.runMaintenanceTick();
+      expect(verifies).toBe(2);
     });
 
     it("fences a timed-out post-job flush and lets a second host recover the event", async () => {

@@ -12,6 +12,7 @@ import { InMemoryJobQueue } from "@bratsos/workflow-engine/testing";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { z } from "zod";
 import {
+  createPrismaJobQueue,
   createPrismaWorkflowPersistence,
   fromPrisma8,
 } from "../../../workflow-engine/src/persistence/prisma/index.js";
@@ -124,7 +125,10 @@ describe.skipIf(!sqlite && !databaseUrl)(
       await client.outboxEvent.deleteMany();
     });
 
-    it("starts no more claims or emits after the Node host stops", async () => {
+    it.each([
+      false,
+      true,
+    ])("stops an in-flight flush and cancels any pending restart (restart: %s)", async (restart) => {
       const persistence = store(client);
       await seed(persistence, "blocked-host", 3);
       const accepted: number[] = [];
@@ -142,7 +146,27 @@ describe.skipIf(!sqlite && !databaseUrl)(
       const gate = new Promise<void>((resolve) => {
         release = resolve;
       });
-      const jobTransport = new InMemoryJobQueue("blocked-host");
+      const queue = createPrismaJobQueue(client, {
+        databaseType: sqlite ? "sqlite" : "postgresql",
+      });
+      let checking!: () => void;
+      let finishCheck!: () => void;
+      const secondCheck = new Promise<void>((resolve) => {
+        checking = resolve;
+      });
+      const checkGate = new Promise<void>((resolve) => {
+        finishCheck = resolve;
+      });
+      let verifies = 0;
+      const jobTransport = Object.assign(new InMemoryJobQueue("blocked-host"), {
+        async verifyStorage() {
+          await queue.verifyStorage();
+          if (++verifies === 2) {
+            checking();
+            await checkGate;
+          }
+        },
+      });
       const kernel = createKernel({
         persistence,
         jobTransport,
@@ -181,10 +205,20 @@ describe.skipIf(!sqlite && !databaseUrl)(
         await host.start();
         await started;
         await host.stop();
+        if (restart) {
+          const starting = host.start();
+          await secondCheck;
+          await host.stop();
+          finishCheck();
+          await starting;
+          expect(host.getStats().isRunning).toBe(false);
+        }
       } finally {
+        finishCheck();
         release();
         await host.stop();
       }
+      expect(verifies).toBe(restart ? 2 : 1);
       expect(await flushing).toMatchObject({ published: 1 });
       expect(accepted).toEqual([1]);
       expect(claims).toBe(1);
