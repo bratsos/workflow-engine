@@ -364,12 +364,8 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       prisma.$inTransaction === true ||
       isNativeTransaction(prisma);
     this.rawOutboxQueries = Boolean(prisma.$queryRawUnsafe || prisma.$queryRaw);
-    // SQLite refuses the same client at its first operation (no-raw-query).
-    if (
-      (options.databaseType ?? "postgresql") === "postgresql" &&
-      !this.rawOutboxQueries &&
-      !this.isOutboxTransaction
-    )
+    // The claim calls these members on the root, on both dialects.
+    if (!this.rawOutboxQueries && !this.isOutboxTransaction)
       throw new OutboxClaimUnsupportedError();
     this.prisma = withTransactionWriteGuard(
       prisma,
@@ -1910,6 +1906,21 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       if (signal?.aborted) return [];
       if (!prisma.$queryRawUnsafe && !prisma.$queryRaw)
         throw new OutboxClaimUnsupportedError();
+      // The SQLite claim is a write: with no live row, an idle flush takes no
+      // write lock at all.
+      if (
+        this.databaseType === "sqlite" &&
+        !(
+          await readOutboxSql<{ id: string }>(
+            prisma,
+            "sqlite",
+            { id: "text" },
+            `SELECT id FROM "outbox_events" WHERE "publishedAt" IS NULL AND "dlqAt" IS NULL LIMIT 1`,
+            [],
+          )
+        ).length
+      )
+        return [];
       const { sql, args } =
         this.databaseType === "sqlite"
           ? sqliteOutboxClaim(page)
@@ -1987,27 +1998,6 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
         row.dlqAt === null &&
         ownsOutboxClaim(row.deliveryClaim, claim),
     );
-  }
-
-  /** One read for a page: the IDs this claim still owns, live and unexpired. */
-  async activeOutboxDeliveryClaims(
-    ids: readonly string[],
-    claim: string,
-    now: Date,
-  ): Promise<string[]> {
-    if (!ids.length || claim.slice(0, 24) <= now.toISOString()) return [];
-    const rows = await this.prisma.outboxEvent.findMany({
-      where: { id: { in: [...ids] } },
-      select: { id: true, deliveryClaim: true, publishedAt: true, dlqAt: true },
-    });
-    return rows
-      .filter(
-        (row: any) =>
-          row.publishedAt === null &&
-          row.dlqAt === null &&
-          ownsOutboxClaim(row.deliveryClaim, claim),
-      )
-      .map((row: any) => row.id);
   }
 
   /** One write for the accepted events of a page that this claim still owns. */

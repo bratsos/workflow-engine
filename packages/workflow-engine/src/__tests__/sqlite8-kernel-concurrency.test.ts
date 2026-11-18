@@ -9,6 +9,10 @@ import {
   it,
 } from "vitest";
 import type { KernelCommand } from "../kernel/commands.js";
+import {
+  createPrismaWorkflowPersistence,
+  fromPrisma8,
+} from "../persistence/prisma/index.js";
 import { isSqliteBusy } from "../persistence/prisma/sql-errors.js";
 import {
   type KernelDatabase,
@@ -667,6 +671,170 @@ describe
       // As without the coordination: on a rollback journal it fails.
       expect((await background).ms).toBeLessThan(8000);
       expect(await settle(create())).toMatchObject({ outcome: "ok" });
+    }, 30_000);
+  },
+);
+
+// node:sqlite waits for a lock synchronously. Root clients of one process on
+// one file write through one queue and a write holds the other roots' reads
+// back, so none waits on another for its busy timeout with the event loop
+// blocked; an idle flush takes no write lock.
+describe
+  .skipIf(!sqlite || process.env.PRISMA_MAJOR !== "8")
+  .each(["delete", "wal"] as const)(
+  "several root clients of one process on the file, journal mode %s",
+  (mode) => {
+    const { DatabaseSync } =
+      process.env.PRISMA_MAJOR === "8"
+        ? createRequire(import.meta.url)("node:sqlite")
+        : ({} as any);
+    let db: KernelDatabase;
+    const roots: Array<{ close(): void }> = [];
+    beforeEach(async () => {
+      db = await kernelDatabase();
+      const raw = new DatabaseSync(db.file);
+      raw.exec(`PRAGMA journal_mode = ${mode}`);
+      raw.close();
+    }, 120_000);
+    afterEach(async () => {
+      for (const root of roots.splice(0)) root.close();
+      await db?.close();
+    });
+    const open = (count: number) =>
+      Array.from({ length: count }, (_, i) => {
+        const native =
+          i === 0
+            ? db.native
+            : createRequire(
+                createRequire(import.meta.url).resolve(
+                  "../../../prisma-fixtures/v8-sqlite/index.cjs",
+                ),
+              )("@prisma/orm-sqlite/runtime").default({
+                contract: db.native.contract,
+                path: db.file,
+              });
+        if (i > 0) roots.push(native);
+        const persistence = createPrismaWorkflowPersistence(
+          i === 0 ? db.client : fromPrisma8(native),
+          { databaseType: "sqlite" },
+        );
+        return { persistence, kernel: db.makeKernel({ persistence }) };
+      });
+    // The longest a 1 ms timer fired late while `work` ran.
+    const loopDelay = async <T>(work: () => Promise<T>) => {
+      let late = 0;
+      let due = Date.now() + 1;
+      const timer = setInterval(() => {
+        late = Math.max(late, Date.now() - due);
+        due = Date.now() + 1;
+      }, 1);
+      try {
+        const results = await Promise.allSettled([work()]);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        return { result: results[0]!, late };
+      } finally {
+        clearInterval(timer);
+      }
+    };
+
+    it.each([
+      [2, 0],
+      [2, 20],
+      [13, 0],
+      [13, 20],
+    ])(
+      "%i roots flush an outbox of %i events and create runs at once without blocking the event loop",
+      async (count, events) => {
+        const stacks = open(count);
+        for (let i = 0; i < events; i++)
+          await db.persistence.appendOutboxEvents([
+            {
+              workflowRunId: `run-${String(i).padStart(2, "0")}`,
+              eventType: "probe",
+              payload: { i },
+              causationId: `c-${i}`,
+              occurredAt: new Date(),
+            },
+          ]);
+        // Each root's storage check runs before the burst.
+        for (const { persistence } of stacks) await persistence.getRun("warm");
+        const { result, late } = await loopDelay(() =>
+          Promise.all(
+            stacks.flatMap(({ kernel }, i) => [
+              kernel.dispatch({ type: "outbox.flush", maxEvents: 1 }),
+              kernel.dispatch({
+                type: "run.create",
+                idempotencyKey: `root-${count}-${events}-${i}`,
+                workflowId: db.workflow.id,
+                input: { value: "root" },
+              }),
+            ]),
+          ),
+        );
+        expect(result.status).toBe("fulfilled");
+        const values = (result as PromiseFulfilledResult<any[]>).value;
+        expect(
+          values.reduce((sum, value) => sum + (value.published ?? 0), 0),
+        ).toBe(Math.min(count, events));
+        expect(late).toBeLessThan(1000);
+        expect(await db.client.workflowRun.count()).toBe(count);
+      },
+      60_000,
+    );
+
+    it("commits one root's writes while another root's reads are in flight", async () => {
+      const [first, second] = open(2);
+      for (let i = 0; i < 60; i++)
+        await first!.kernel.dispatch({
+          type: "run.create",
+          idempotencyKey: `seed-${i}`,
+          workflowId: db.workflow.id,
+          input: { value: "seed" },
+        });
+      const run = (await db.client.workflowRun.findFirst({})).id;
+      await second!.persistence.getRun("warm");
+      let done = false;
+      const reads = Array.from({ length: 3 }, async () => {
+        while (!done) {
+          await second!.persistence.getRunsByStatus("PENDING");
+          await new Promise((resolve) => setImmediate(resolve));
+        }
+      });
+      // Versioned updates: a count-returning write (`updateMany`), which runs
+      // outside the returning-write path.
+      const { result, late } = await loopDelay(async () => {
+        for (let i = 0; i < 10; i++) {
+          const { version } = (await first!.persistence.getRun(run))!;
+          await first!.persistence.updateRun(run, {
+            totalTokens: i,
+            expectedVersion: version,
+          });
+        }
+      });
+      done = true;
+      await Promise.all(reads);
+      expect(result).toEqual({ status: "fulfilled", value: undefined });
+      expect(late).toBeLessThan(1000);
+    }, 60_000);
+
+    it("flushes an empty outbox while another connection holds the write lock", async () => {
+      const [{ kernel, persistence }] = open(1);
+      await persistence.getRun("warm");
+      const holder = new DatabaseSync(db.file);
+      holder.exec("BEGIN IMMEDIATE");
+      try {
+        const { result, late } = await loopDelay(() =>
+          kernel.dispatch({ type: "outbox.flush", maxEvents: 10 }),
+        );
+        expect(result).toMatchObject({
+          status: "fulfilled",
+          value: { published: 0 },
+        });
+        expect(late).toBeLessThan(1000);
+      } finally {
+        holder.exec("ROLLBACK");
+        holder.close();
+      }
     }, 30_000);
   },
 );

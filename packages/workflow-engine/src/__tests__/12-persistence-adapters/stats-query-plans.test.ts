@@ -147,6 +147,16 @@ const UNPUBLISHED: Expectation = {
   not: "outbox_events_dlqAt_idx",
 };
 
+// SQLite's claim is a write; it first reads whether any live row exists.
+const IDLE: Expectation = {
+  name: "live outbox row before the SQLite claim",
+  matches: (sql) =>
+    !/ORDER BY/i.test(sql) &&
+    /"publishedAt" IS NULL AND "dlqAt" IS NULL LIMIT 1/.test(sql),
+  index: "outbox_events_(live_run_sequence_idx|delivery_run_idx)",
+  not: "outbox_events_dlqAt_idx",
+};
+
 const ROTATION: Expectation = {
   name: "latest recorded outbox rotation",
   matches: (sql) =>
@@ -461,6 +471,9 @@ describe.skipIf(!sqlite && !databaseUrl)(
         await expectServedBy(UNPUBLISHED, s, forceIndex);
       for (const s of captured.filter((item) => ROTATION.matches(item.sql)))
         await expectServedBy(ROTATION, s, forceIndex);
+      const idle = captured.filter((item) => IDLE.matches(item.sql));
+      expect(idle, IDLE.name).toHaveLength(sqlite ? 1 : 0);
+      for (const s of idle) await expectServedBy(IDLE, s, forceIndex);
     }
 
     async function expectDeliveryWritePlans(
@@ -536,21 +549,6 @@ describe.skipIf(!sqlite && !databaseUrl)(
             : /Index (Only )?Scan using "?outbox_events_pkey/,
         );
         expect(checkPlan).not.toMatch(sqlite ? SQLITE_TABLE_SCAN : /Seq Scan/);
-      }
-      const owned = await record(() =>
-        persistence.activeOutboxDeliveryClaims([event.id], claim, now),
-      );
-      const ownedPlan = await plan(
-        owned.find((statement) => /\bSELECT\b/i.test(statement.sql))!,
-        forceIndex,
-      );
-      if (!allowSmallScan) {
-        expect(ownedPlan).toMatch(
-          sqlite
-            ? /USING (COVERING )?INDEX (sqlite_autoindex_outbox_events_1)/
-            : /Index (Only )?Scan using "?outbox_events_pkey/,
-        );
-        expect(ownedPlan).not.toMatch(sqlite ? SQLITE_TABLE_SCAN : /Seq Scan/);
       }
       await check(
         await record(() =>

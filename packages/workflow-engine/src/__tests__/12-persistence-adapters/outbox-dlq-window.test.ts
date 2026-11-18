@@ -389,8 +389,10 @@ describe.skipIf(!sqlite && !databaseUrl)(
           (row: { publishedAt: Date | null }) => row.publishedAt !== null,
         ),
       ).toBe(true);
+      // The three runs' acceptances share one acknowledgement write: when it
+      // fails uncommitted, all three are delivered again.
       expect(delivered).toHaveLength(
-        operation === "publication" && !committed ? 4 : 3,
+        operation === "publication" && !committed ? 6 : 3,
       );
     });
 
@@ -785,7 +787,7 @@ describe.skipIf(!sqlite && !databaseUrl)(
       },
     );
 
-    it("drains a run's backlog in one claim, one ownership read and few acknowledgements", async () => {
+    it("drains a run's backlog in one claim and few acknowledgements", async () => {
       await persistence.appendOutboxEvents(
         [...Array(50).fill("a-backlog"), "z-other"].map((workflowRunId) => ({
           workflowRunId,
@@ -848,10 +850,12 @@ describe.skipIf(!sqlite && !databaseUrl)(
       expect(accepted.filter((key) => key.startsWith("a-"))).toEqual(
         Array.from({ length: 50 }, (_, i) => `a-backlog:${i + 1}`),
       );
-      // The page, then the empty claim that ends the flush.
-      expect(counts.claims).toBe(2);
+      // The page, then the empty claim that ends the flush; on SQLite the
+      // read that finds no live row ends it without a claim.
+      expect(counts.claims).toBe(sqlite ? 1 : 2);
       expect(counts.settings).toBe(sqlite ? 0 : 2);
-      expect(counts.reads).toBe(1);
+      // No ownership read: the claim returns only the rows it owns.
+      expect(counts.reads).toBe(0);
       expect(counts.acknowledgements).toBeGreaterThan(0);
       expect(counts.acknowledgements).toBeLessThanOrEqual(4);
     });
@@ -897,6 +901,54 @@ describe.skipIf(!sqlite && !databaseUrl)(
       expect(
         await persistence.completeOutboxDelivery(row!.id, lease, clock.now()),
       ).toBe(true);
+    });
+
+    it("ranks at the maximum when the walk skips more heads than a page at the ceiling", async () => {
+      await seedEvent("a-ceiling");
+      await client.outboxEvent.updateMany({
+        where: { workflowRunId: "a-ceiling" },
+        data: {
+          publishedAt: clock.now(),
+          deliveryClaim: "r9223372036854775679|",
+        },
+      });
+      const leased = Array.from(
+        { length: 129 },
+        (_, i) => `b-leased-${String(i).padStart(3, "0")}`,
+      );
+      await persistence.appendOutboxEvents(
+        [...leased, "c-ready-1", "c-ready-2"].map((workflowRunId) => ({
+          workflowRunId,
+          eventType: "probe",
+          payload: {},
+          causationId: workflowRunId,
+          occurredAt: new Date(),
+        })),
+      );
+      await client.outboxEvent.updateMany({
+        where: { workflowRunId: { in: leased } },
+        data: {
+          deliveryClaim: "r0000000000000000001|2099-01-01T00:00:00.000Z|held",
+        },
+      });
+      const lease = "2099-01-01T00:00:00.000Z|ceiling";
+      const rows = await persistence.claimOutboxDelivery(
+        2,
+        lease,
+        clock.now(),
+        [],
+      );
+      expect(rows.map((row) => row.workflowRunId).sort()).toEqual([
+        "c-ready-1",
+        "c-ready-2",
+      ]);
+      const stored = await client.outboxEvent.findMany({
+        where: { workflowRunId: { in: ["c-ready-1", "c-ready-2"] } },
+      });
+      expect(stored.map((row: any) => row.deliveryClaim)).toEqual([
+        `r9223372036854775807|${lease}`,
+        `r9223372036854775807|${lease}`,
+      ]);
     });
 
     it.skipIf(sqlite)(
@@ -1061,27 +1113,51 @@ describe.skipIf(!sqlite && !databaseUrl)(
       expect(delivered).toEqual(["z-healthy"]);
     });
 
-    it.each([
-      "claimOutboxDelivery",
-      "activeOutboxDeliveryClaims",
-    ] as const)("warns and skips an expired claim after awaiting %s", async (point) => {
+    it("delivers a row dead-lettered by an operator after the claim once, keeps it dead-lettered, and delivers it again on replay", async () => {
+      await seedEvent("operator-dlq");
+      const row = await client.outboxEvent.findFirst({
+        where: { workflowRunId: "operator-dlq" },
+      });
+      const entered = deferred();
+      const resume = deferred();
+      const seen: string[] = [];
+      const page = make({
+        async emit(_: unknown, delivery?: { eventId: string }) {
+          seen.push(delivery!.eventId);
+          entered.release();
+          await resume.promise;
+        },
+      }).dispatch({ type: "outbox.flush" });
+      await entered.promise;
+      await persistence.moveOutboxEventToDLQ(row.id);
+      resume.release();
+      // The sink got it once; the fenced acknowledgement changed nothing.
+      expect(await page).toMatchObject({ published: 0 });
+      expect(seen).toEqual([row.id]);
+      const stored = await client.outboxEvent.findUnique({
+        where: { id: row.id },
+      });
+      expect(stored.publishedAt).toBeNull();
+      expect(stored.dlqAt).not.toBeNull();
+      shouldFail = false;
+      expect((await flush()).published).toBe(0);
+      expect((await replay()).replayed).toBe(1);
+      expect((await flush()).published).toBe(1);
+      expect(identities).toEqual([row.id]);
+    });
+
+    it("warns and skips an expired claim after awaiting claimOutboxDelivery", async () => {
       await seedEvent("expiry");
       const entered = deferred();
       const resume = deferred();
       const slow = storeOver(client);
       const claim = slow.claimOutboxDelivery.bind(slow);
-      const check = slow.activeOutboxDeliveryClaims!.bind(slow);
-      const wait = async <T>(value: T) => {
+      slow.claimOutboxDelivery = async (...args) => {
+        const rows = await claim(...args);
         entered.release();
         await resume.promise;
-        return value;
+        return rows;
       };
-      if (point === "claimOutboxDelivery")
-        slow.claimOutboxDelivery = async (...args) =>
-          wait(await claim(...args));
-      else
-        slow.activeOutboxDeliveryClaims = async (...args) =>
-          wait(await check(...args));
       const sink = (who: string) => ({
         async emit() {
           delivered.push(who);
@@ -1342,12 +1418,12 @@ describe.skipIf(!sqlite && !databaseUrl)(
       const entered = deferred();
       const resume = deferred();
       const store = storeOver(client);
-      const check = store.activeOutboxDeliveryClaims!.bind(store);
-      store.activeOutboxDeliveryClaims = async (...args) => {
-        const active = await check(...args);
+      const claim = store.claimOutboxDelivery.bind(store);
+      store.claimOutboxDelivery = async (...args) => {
+        const rows = await claim(...args);
         entered.release();
         await resume.promise;
-        return active;
+        return rows;
       };
       const accepted: number[] = [];
       const sink = {
@@ -1457,46 +1533,30 @@ describe.skipIf(!sqlite && !databaseUrl)(
     });
 
     it.skipIf(!sqlite)(
-      "refuses unverified outbox operations before reading or writing",
+      "refuses a SQLite root hiding its raw reads when built, before reading or writing",
       async () => {
         await seedEvent("unverified");
         const row = await client.outboxEvent.findFirst();
-        const withoutRawReads = (prisma: typeof client): typeof client =>
+        // `deep`: column-typed reads (`$withColumns`, Prisma 8) hide them too;
+        // otherwise they still reach raw SQL, so the storage check passes.
+        const withoutRawReads = (
+          prisma: typeof client,
+          deep: boolean,
+        ): typeof client =>
           new Proxy(prisma, {
             get(target, key) {
               if (key === "$queryRaw" || key === "$queryRawUnsafe")
                 return undefined;
-              if (key === "$withColumns" && target.$withColumns)
+              if (deep && key === "$withColumns" && target.$withColumns)
                 return (...args: unknown[]) =>
-                  withoutRawReads(target.$withColumns(...args));
+                  withoutRawReads(target.$withColumns(...args), deep);
               return Reflect.get(target, key, target);
             },
           });
-        const store = storeOver(withoutRawReads(client));
-        const now = clock.now();
-        const claim = "2099-01-01T00:00:00.000Z|unverified";
-        for (const run of [
-          () => store.getUnpublishedOutboxEvents(),
-          () => store.claimOutboxDelivery(1, claim, now, []),
-          () => store.isOutboxDeliveryClaimActive(row.id, claim, now),
-          () => store.completeOutboxDelivery(row.id, claim, now),
-          () => store.failOutboxDelivery(row.id, claim, 1, now),
-          () =>
-            store.appendOutboxEvents([
-              {
-                workflowRunId: row.workflowRunId,
-                eventType: "workflow:created",
-                payload: {},
-                causationId: "unverified",
-                occurredAt: now,
-              },
-            ]),
-        ]) {
-          await expect(run()).rejects.toMatchObject({
-            code: "SQLITE_DATE_STORAGE_UNVERIFIED",
-            reason: "no-raw-query",
-          });
-        }
+        for (const deep of [true, false])
+          expect(() => storeOver(withoutRawReads(client, deep))).toThrow(
+            expect.objectContaining({ code: "OUTBOX_CLAIM_UNSUPPORTED" }),
+          );
         expect(await client.outboxEvent.findMany()).toEqual([row]);
       },
     );

@@ -47,7 +47,7 @@ export class OutboxClaimUnsupportedError extends Error {
 
   constructor() {
     super(
-      "This Prisma client exposes neither $queryRaw (tagged template) nor $queryRawUnsafe. Outbox delivery on PostgreSQL claims events with one SQL statement that returns the rows it claimed, and the engine has no claim that keeps a run's events in order without it. Pass the Prisma client itself, or a wrapper that forwards one of the two.",
+      "This Prisma client exposes neither $queryRaw (tagged template) nor $queryRawUnsafe. Outbox delivery claims events with one SQL statement that returns the rows it claimed, and the engine has no claim that keeps a run's events in order without it. Pass the Prisma client itself, or a wrapper that forwards one of the two.",
     );
     this.name = "OutboxClaimUnsupportedError";
   }
@@ -61,10 +61,13 @@ export interface OutboxClaimPage {
 }
 
 // A rank is the acquisition counter, zero-padded to the width of the largest
-// BIGINT. It saturates below that maximum, so it never needs another digit:
-// string order is numeric order and every offset below is fixed.
+// BIGINT. It saturates at that maximum, so it never needs another digit:
+// string order is numeric order and every offset below is fixed. The cursor
+// is read at most 128 (a page) below it, so a page at the ceiling still ranks
+// its runs apart unless the walk skipped more heads than that.
 const RANK_DIGITS = 19;
-const RANK_CEILING = "9223372036854775679"; // 2^63 - 1 - 128, the page cap
+const RANK_MAX = "9223372036854775807"; // 2^63 - 1
+const RANK_CEILING = "9223372036854775679"; // RANK_MAX - 128, the page cap
 export const firstOutboxRotation = `r${"0".repeat(RANK_DIGITS)}`;
 /** `r`, the rank and `|`: what a released claim keeps. */
 const RANK_PREFIX = RANK_DIGITS + 2;
@@ -165,7 +168,9 @@ function bindings(page: OutboxClaimPage) {
  * the next cursor, is the furthest run any of them claimed.
  */
 function rankSql(sqlite: boolean, ordinal: string) {
-  const rank = `COALESCE((SELECT rank FROM cursor), 0) + ${ordinal}`;
+  const cursor = "COALESCE((SELECT rank FROM cursor), 0)";
+  // Clamped without overflow: the walk position counts skipped heads too.
+  const rank = `CASE WHEN ${ordinal} > ${RANK_MAX} - ${cursor} THEN ${RANK_MAX} ELSE ${cursor} + ${ordinal} END`;
   return sqlite
     ? `'r' || printf('%0${RANK_DIGITS}d', ${rank}) || '|' || $3`
     : `'r' || lpad((${rank})::text, ${RANK_DIGITS}, '0') || '|' || $3`;
