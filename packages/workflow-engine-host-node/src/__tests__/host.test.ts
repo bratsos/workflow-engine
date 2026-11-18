@@ -1151,7 +1151,7 @@ describe("NodeHost", () => {
       let respond!: () => void;
       const hit = new Promise<void>((resolve) => (claimed = resolve));
       const held = new Promise<void>((resolve) => (respond = resolve));
-      let returned!: Promise<unknown>;
+      let returned!: ReturnType<typeof dequeue>;
       jobTransport.dequeue = (...args) =>
         (returned = dequeue(...args).then(async (job) => {
           claimed();
