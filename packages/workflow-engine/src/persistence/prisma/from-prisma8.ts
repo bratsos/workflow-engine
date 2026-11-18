@@ -657,9 +657,10 @@ async function inTurn(x: Executor): Promise<void> {
  * write then drops rows or breaks indexes in the file. An unqualified
  * `journal_mode` change reaches every attached database too. So the root's
  * cache is dropped after any root statement that may have changed it, whether
- * it succeeded or threw: `PRAGMA shrink_memory` takes no lock, so it cannot
- * wait, fail busy or leave a statement open, and it cannot free a page a read
- * still handing over rows holds (SQLite refuses the change then). A statement
+ * it succeeded or threw: `PRAGMA shrink_memory` only releases the connection's
+ * own memory (measured: it never waited, failed busy or left a statement open;
+ * SQLite documents no lock for it), and it cannot free a page a read still
+ * handing over rows holds (SQLite refuses the change then). A statement
  * whose text contains `journal_mode`, however spelled, counts: a drop after one
  * that only reads the mode costs just the cache. A failed drop is ignored, so
  * the statement's own result or error is what the caller sees.
