@@ -44,7 +44,7 @@ Its fixture helpers generate or emit the matching contract and initialise the
 file. Set `SQLITE8_KERNEL_SQLITE=1` to include the kernel suites. Build the
 engine before the console suite because its Prisma 8 case loads `fromPrisma8`
 from the package entry point, and generate the console UI bundle before test
-collection. Run it for each Prisma major on Node 24, matching the SQLite CI job:
+collection. Run it for each Prisma major on Node 24, matching the default rows of the SQLite CI job:
 
 ```bash
 export SQLITE8_KERNEL_SQLITE=1
@@ -57,6 +57,18 @@ PRISMA_MAJOR=6 pnpm --filter @bratsos/workflow-engine-console exec vitest run --
 PRISMA_MAJOR=7 pnpm --filter @bratsos/workflow-engine-console exec vitest run --hookTimeout=30000 --testTimeout=30000 src/__tests__/prisma-read-port.sqlite.test.ts
 PRISMA_MAJOR=8 pnpm --filter @bratsos/workflow-engine-console exec vitest run --hookTimeout=30000 --testTimeout=30000 src/__tests__/prisma-read-port.sqlite.test.ts
 ```
+
+The `sqlite-conformance` job runs those commands for each Prisma major on Node 24,
+and on floor rows: Prisma 6 and 7 on 22.12.0, and Prisma 8 on 22.20.0, 24.11.0
+and 26.0.0, the lowest releases the docs claim for its SQLite target. The floor
+rows exist because Prisma 8 SQLite runs on Node's experimental `node:sqlite`,
+which differs between releases (boolean binds, reading text that holds a NUL,
+and a required flag before 22.13), so a claimed floor that CI never runs is a
+guess. Node 22.11.0, the engine's general floor, has no row: the workspace's
+Prisma 7 dev dependency (`prisma@7.10.1`) fails its install below 22.12. To
+reproduce a row, switch to that Node (for example `fnm use 22.20.0`), run
+`pnpm install` again so Prisma 7's `better-sqlite3` binary matches that Node
+major, and run the commands above with the row's `PRISMA_MAJOR`.
 
 ### Stored-row compatibility fixtures
 
@@ -129,4 +141,4 @@ This is a pnpm monorepo (`packages/*`):
 
 ## CI
 
-`.github/workflows/ci.yml` runs lint, build, typecheck, and tests across a Node 22/24 matrix, plus a separate job that runs the Postgres conformance suite against a real `postgres:16` service container.
+`.github/workflows/ci.yml` runs lint, build, typecheck, and tests across a Node 22/24 matrix, plus a separate job that runs the Postgres conformance suite against a real `postgres:16` service container, and a `sqlite-conformance` job that runs the SQLite suites against a real file for each Prisma major (Node 24, plus the floor rows described under SQLite conformance above).

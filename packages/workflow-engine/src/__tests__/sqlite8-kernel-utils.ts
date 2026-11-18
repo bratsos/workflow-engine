@@ -74,6 +74,8 @@ export function override<T extends object>(target: T, methods: Partial<T>): T {
 export async function kernelDatabase() {
   let directory: string | undefined;
   let client: any;
+  /** The Prisma 8 client under `client`, for calls that go around the adapter. */
+  let native: any;
   if (sqlite) {
     directory = await mkdtemp(join(tmpdir(), "sqlite8-kernel-"));
     const fixture = createRequire(import.meta.url)(
@@ -82,6 +84,7 @@ export async function kernelDatabase() {
     const file = join(directory, "kernel.db");
     if (process.env.PRISMA_MAJOR === "8") {
       const db = await fixture.createSqliteDb(file);
+      native = db;
       client = Object.assign(fromPrisma8(db), {
         $disconnect: () => db.close(),
       });
@@ -123,6 +126,9 @@ export async function kernelDatabase() {
   };
   return {
     client,
+    native,
+    /** The SQLite file, for a connection of its own. */
+    file: directory ? join(directory, "kernel.db") : undefined,
     persistence,
     aiLogger,
     jobTransport,

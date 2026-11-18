@@ -13,6 +13,18 @@ const fixtures = createRequire(import.meta.url)(
   "../../../../prisma-fixtures/index.cjs",
 );
 const options = { databaseType: "sqlite" } as const;
+// node:sqlite before Node 24.16 and 26.1 (every 22.x) reads TEXT back cut at a
+// NUL (nodejs/node#61954); on Prisma 8 the engine refuses such a value there.
+function nodeCutsNul(): boolean {
+  const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite");
+  const db = new DatabaseSync(":memory:");
+  try {
+    return db.prepare("SELECT ? AS v").get("a\0b").v !== "a\0b";
+  } finally {
+    db.close();
+  }
+}
+const nulRefused = major === "8" && nodeCutsNul();
 
 describe(`SQLite ledger keep lists on Prisma ${major}`, () => {
   let directory: string;
@@ -150,9 +162,9 @@ describe(`SQLite ledger keep lists on Prisma ${major}`, () => {
     expect(keep).toEqual(original);
   });
 
-  it("matches Unicode, quotes and NULs literally in stage and step IDs", async () => {
-    const stageRecordId = "stage-3-'\"\\雪🧪\0suffix";
-    const kept = ["keep-'\"\\雪🧪", "nul\0kept"];
+  async function clearsLiterally(nul: string) {
+    const stageRecordId = `stage-3-'"\\雪🧪${nul}suffix`;
+    const kept = [`keep-'"\\雪🧪`, `nul${nul}kept`];
     await prisma.workflowStage.create({
       data: {
         id: stageRecordId,
@@ -164,7 +176,7 @@ describe(`SQLite ledger keep lists on Prisma ${major}`, () => {
       },
     });
     const ledger = createPrismaStepLedger(prisma, options);
-    for (const [seq, stepId] of [...kept, "nul", "nul\0drop"].entries()) {
+    for (const [seq, stepId] of [...kept, "nul", `nul${nul}drop`].entries()) {
       await ledger.claim({
         stageRecordId,
         stepId,
@@ -193,7 +205,34 @@ describe(`SQLite ledger keep lists on Prisma ${major}`, () => {
       })),
     ]);
     expect(keep).toEqual(original);
-  });
+  }
+
+  it.skipIf(nulRefused)(
+    "matches Unicode, quotes and NULs literally in stage and step IDs",
+    () => clearsLiterally("\0"),
+  );
+
+  it("matches Unicode and quotes literally in stage and step IDs", () =>
+    clearsLiterally(""));
+
+  it.runIf(nulRefused)(
+    "refuses a NUL in a stage ID it would read back cut",
+    async () => {
+      await expect(
+        prisma.workflowStage.create({
+          data: {
+            id: "stage-nul\0suffix",
+            workflowRunId: "ledger-run",
+            stageId: "stage-nul",
+            stageName: "stage-nul",
+            stageNumber: 3,
+            executionGroup: 3,
+          },
+        }),
+      ).rejects.toThrow(/NUL character/);
+      expect(await prisma.workflowStage.count()).toBe(2);
+    },
+  );
 
   it("rolls back a large keep-list deletion with the caller's transaction", async () => {
     const keepStepIds = [
