@@ -722,6 +722,15 @@ interface ReadGate {
   adopted?: boolean;
   /** Another client over the same driver owns the gate: use that one. */
   to?: ReadGate;
+  /** Settles once the root's transaction state was read at the takeover. */
+  ready?: Promise<void>;
+  /**
+   * Set while the root connection is inside a transaction this layer did not
+   * open (a raw BEGIN sent before the takeover): `ended` settles when it ends.
+   */
+  foreign?: { ended: Promise<void>; end: () => void };
+  /** Reads the root's transaction state again (`ownRootConnection`). */
+  recheck?: () => Promise<void>;
 }
 const readGates = new WeakMap<object, ReadGate>();
 
@@ -736,6 +745,36 @@ function gateOf(x: object): ReadGate | undefined {
  * which bounds how long a COMMIT would have waited for them itself.
  */
 const READ_WAIT_MS = 5000;
+
+/**
+ * An engine write on a root connection that is inside a transaction this
+ * layer did not open waits for that transaction to end, outside the write
+ * queue so the consumer can still end it, for at most READ_WAIT_MS, and then
+ * fails with this busy-class error. Joining it instead would let the
+ * consumer's ROLLBACK, or a close without COMMIT, undo a write already
+ * acknowledged.
+ */
+async function untilOwnRoot(db: object): Promise<void> {
+  const gate = gateOf(db);
+  await gate?.ready;
+  const foreign = gate?.foreign;
+  if (!foreign) return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    foreign.ended,
+    new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, READ_WAIT_MS);
+    }),
+  ]);
+  clearTimeout(timer);
+  if (gate.foreign)
+    throw Object.assign(
+      new Error(
+        "fromPrisma8: the SQLite root connection is inside a transaction this adapter did not open (a raw BEGIN sent through the client before the adapter's first call); the engine's write waited 5 s for it to end. COMMIT or ROLLBACK it, and open transactions with $transaction or db.transaction",
+      ),
+      { code: "SQLITE_BUSY", errcode: 5 },
+    );
+}
 
 /**
  * `db.transaction(fn)` for the adapter's own transactions. Root reads that
@@ -1604,7 +1643,7 @@ function adopt(db: object): void {
     if (!warnedUnowned) {
       warnedUnowned = true;
       logger.warn(
-        "fromPrisma8: this Prisma 8 build exposes no root driver (db.runtime().driver), so statements sent through db.orm, db.sql, db.query or db.execute on the wrapped client are not coordinated with the engine's: on a rollback-journal file an engine commit can fail with `Transaction commit failed` while one of those reads is returning rows, a write sent there is not queued with the engine's, and raw BEGIN/SAVEPOINT through db.execute is not refused.",
+        "fromPrisma8: this Prisma 8 build exposes no root driver (db.runtime().driver), so statements sent through db.orm, db.sql, db.query or db.execute on the wrapped client are not coordinated with the engine's: on a rollback-journal file an engine commit can fail with `Transaction commit failed` while one of those reads is returning rows, a write sent there is not queued with the engine's, and raw BEGIN/SAVEPOINT through db.execute is not refused (engine writes after one join that transaction).",
       );
     }
     return;
@@ -1646,7 +1685,10 @@ async function enqueue<T>(
   return pending;
 }
 
-const TRANSACTION_CONTROL = /^(BEGIN|COMMIT|END|ROLLBACK|SAVEPOINT|RELEASE)$/;
+// Opening a transaction on the root is refused; ending one never is (`ROLLBACK
+// TO` and `RELEASE` included), whatever opened it.
+const OPENS_TRANSACTION = /^(BEGIN|SAVEPOINT)$/;
+const ENDS_TRANSACTION = /^(COMMIT|END|ROLLBACK|RELEASE)$/;
 
 interface DriverRequest {
   sql: string;
@@ -1685,6 +1727,33 @@ function ownRootConnection(
   const query = driver.query.bind(driver);
   const execute = driver.execute.bind(driver);
   const exec = (sql: string) => execute({ sql, params: [] });
+  // The driver keeps its connection private: read the state from it. A
+  // deferred BEGIN takes no lock, and fails only inside a transaction.
+  const inside = async () => {
+    try {
+      await exec("BEGIN");
+    } catch (error) {
+      if (/within a transaction/.test(String((error as Error)?.message)))
+        return true;
+      return false; // e.g. a closed client: its own next statement says so
+    }
+    await exec("COMMIT");
+    return false;
+  };
+  gate.recheck = async () => {
+    if (!gate.foreign || (await inside())) return;
+    const { end } = gate.foreign;
+    gate.foreign = undefined;
+    end();
+  };
+  gate.ready = inside().then((yes) => {
+    if (!yes) return;
+    let end!: () => void;
+    const ended = new Promise<void>((resolve) => {
+      end = resolve;
+    });
+    gate.foreign = { ended, end };
+  });
   const own = async () => {
     const store = (await context()).getStore();
     if (store?.read) return "adapter read";
@@ -1692,7 +1761,7 @@ function ownRootConnection(
   };
   const classify = (sql: string) => {
     const statement = statementOf(new Sql().t(sql));
-    if (TRANSACTION_CONTROL.test(statement.first ?? ""))
+    if (OPENS_TRANSACTION.test(statement.first ?? "") && !gate.foreign)
       fail(
         `${statement.first} on the root client: other callers' writes would join it. Use $transaction`,
       );
@@ -1731,10 +1800,30 @@ function ownRootConnection(
       return {
         async next() {
           if (!rows) {
+            await gate.ready;
             const mine = await own();
             if (mine === "adapter read")
               rows = query(request)[Symbol.asyncIterator]();
-            else if (!mine && !classify(request.sql).read) {
+            else if (!mine && gate.foreign) {
+              // Inside the consumer's own transaction, as without this layer:
+              // no engine write runs on the root meanwhile (`untilOwnRoot`).
+              const it = query(request)[Symbol.asyncIterator]();
+              rows = {
+                next: () =>
+                  it.next().then(
+                    async (step) => (
+                      step.done && (await gate.recheck?.()), step
+                    ),
+                    async (error) => {
+                      await gate.recheck?.();
+                      throw error;
+                    },
+                  ),
+                return: (value?: unknown) =>
+                  it.return?.(value) ??
+                  Promise.resolve({ done: true as const, value }),
+              };
+            } else if (!mine && !classify(request.sql).read) {
               rows = (await enqueue(queue, () => write(request)))[
                 Symbol.iterator
               ]();
@@ -1765,8 +1854,10 @@ function ownRootConnection(
     },
   });
   driver.execute = async (request) => {
+    await gate.ready;
     if ((await own()) === true) return execute(request);
     classify(request.sql);
+    if (gate.foreign) return execute(request).finally(() => gate.recheck?.());
     return enqueue(queue, () =>
       execute(request).catch((error: unknown) =>
         afterStaleSnapshot(gate, error, () => execute(request)),
@@ -2141,7 +2232,9 @@ export function fromPrisma8(
   ): Prisma8Client => {
     const schedule: Schedule | undefined =
       queue && !inTransaction
-        ? (work) => (adopt(db), enqueue(queue, work))
+        ? (work) => (
+            adopt(db), untilOwnRoot(db).then(() => enqueue(queue, work))
+          )
         : undefined;
     if (!delegates.has(x)) {
       delegates.set(
@@ -2188,24 +2281,39 @@ export function fromPrisma8(
       if (
         queue &&
         !inTransaction &&
-        TRANSACTION_CONTROL.test(statementOf(q).first ?? "")
+        OPENS_TRANSACTION.test(statementOf(q).first ?? "") &&
+        !gateOf(db)?.foreign
       )
         fail(
           `${statementOf(q).first} on the root client: other callers' writes would join it. Use $transaction`,
         );
       return q;
     };
+    // Ending a transaction must not wait for it to end (`untilOwnRoot`).
+    const ending = (work: () => Promise<any>) => (
+      adopt(db), enqueue(queue!, work).finally(() => gateOf(db)?.recheck?.())
+    );
     const rawRead = (q: Sql) =>
       control(q) && sqlite
         ? new Op(
             (e) => read(q, e),
             x,
-            statementOf(q).read ? undefined : schedule,
+            statementOf(q).read
+              ? undefined
+              : schedule && ENDS_TRANSACTION.test(statementOf(q).first ?? "")
+                ? ending
+                : schedule,
           )
         : read(q);
     const rawWrite = (q: Sql) =>
       control(q) && sqlite
-        ? new Op((e) => affected(e, q), x, schedule)
+        ? new Op(
+            (e) => affected(e, q),
+            x,
+            schedule && ENDS_TRANSACTION.test(statementOf(q).first ?? "")
+              ? ending
+              : schedule,
+          )
         : affected(x, q);
 
     const transaction = async (arg: any, options: Args = {}) => {

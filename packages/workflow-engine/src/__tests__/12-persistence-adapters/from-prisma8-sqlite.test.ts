@@ -1573,21 +1573,33 @@ describe.skipIf(process.env.PRISMA_MAJOR !== "8")(
       }
     });
 
-    it("refuses transaction control on the root, from any wrapper or the client's own API", async () => {
+    it("refuses opening a transaction on the root, from any wrapper or the client's own API, and never ending one", async () => {
       const other: any = fromPrisma8(db);
       for (const sql of [
         "BEGIN",
         " /* x */ BEGIN IMMEDIATE",
         "SAVEPOINT app",
-        "RELEASE app",
-        "ROLLBACK",
-        "COMMIT",
-        "END",
       ]) {
         expect(() => other.$executeRawUnsafe(sql)).toThrow(/Use \$transaction/);
         expect(() => prisma.$withColumns({}).$queryRawUnsafe(sql)).toThrow(
           /Use \$transaction/,
         );
+      }
+      // Ending one is never refused: with none open, SQLite answers.
+      const none = /no transaction is active|no such savepoint/;
+      for (const sql of ["RELEASE app", "ROLLBACK", "COMMIT", "END"]) {
+        await expect(other.$executeRawUnsafe(sql)).rejects.toThrow(none);
+        await expect(
+          prisma.$withColumns({}).$queryRawUnsafe(sql),
+        ).rejects.toThrow(none);
+        await expect(
+          db.execute(
+            db.raw
+              .sql([sql] as any)
+              .affectedCount()
+              .build(),
+          ),
+        ).rejects.toThrow(none);
       }
       await expect(
         db.execute(db.raw.sql`BEGIN`.affectedCount().build()),

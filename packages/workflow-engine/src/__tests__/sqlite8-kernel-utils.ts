@@ -127,6 +127,8 @@ export async function kernelDatabase() {
   return {
     client,
     native,
+    /** The SQLite file, for a connection of its own. */
+    file: directory ? join(directory, "kernel.db") : undefined,
     persistence,
     aiLogger,
     jobTransport,

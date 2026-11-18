@@ -1,5 +1,15 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { createRequire } from "node:module";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+} from "vitest";
 import type { KernelCommand } from "../kernel/commands.js";
+import { isSqliteBusy } from "../persistence/prisma/sql-errors.js";
 import {
   type KernelDatabase,
   kernelDatabase,
@@ -657,6 +667,129 @@ describe
       // As without the coordination: on a rollback journal it fails.
       expect((await background).ms).toBeLessThan(8000);
       expect(await settle(create())).toMatchObject({ outcome: "ok" });
+    }, 30_000);
+  },
+);
+
+// A transaction the consumer opens on the root connection itself, before the
+// adapter's first call (the takeover is installed then), must never take an
+// acknowledged engine write with it: engine writes wait for it to end, for
+// at most 5 s, and then fail busy. Ending it is never refused.
+describe
+  .skipIf(!sqlite || process.env.PRISMA_MAJOR !== "8")
+  .each(["delete", "wal"] as const)(
+  "a transaction the consumer opens on the root connection, journal mode %s",
+  (mode) => {
+    const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite");
+    let db: KernelDatabase;
+    beforeEach(async () => {
+      db = await kernelDatabase();
+      const raw = new DatabaseSync(db.file);
+      raw.exec(`PRAGMA journal_mode = ${mode}`);
+      raw.close();
+    }, 120_000);
+    afterEach(async () => {
+      await db?.close();
+    });
+    const sql = (text: string) =>
+      db.native.execute(
+        db.native.raw
+          .sql([text] as any)
+          .affectedCount()
+          .build(),
+      );
+    const settle = (work: Promise<unknown>) =>
+      work.then(
+        () => "ok",
+        (error: Error) => error,
+      );
+    const create = (key: string) =>
+      db.kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: key,
+        workflowId: db.workflow.id,
+        input: { value: key },
+      });
+    // What another connection sees: what is durable.
+    const stored = () => {
+      const other = new DatabaseSync(db.file);
+      try {
+        return other
+          .prepare("SELECT id, priority FROM workflow_runs ORDER BY id")
+          .all();
+      } finally {
+        other.close();
+      }
+    };
+    const seed = (id: string) =>
+      sql(
+        `INSERT INTO workflow_runs (id, "workflowId", "workflowName", "workflowType", input, status, priority, "createdAt", "updatedAt") VALUES ('${id}', 'w', 'w', 't', '{}', 'PENDING', 5, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+      );
+
+    it.each([
+      "COMMIT",
+      "ROLLBACK",
+    ])("holds engine writes until the consumer's %s, and keeps each one acknowledged", async (end) => {
+      await seed("a");
+      await sql("BEGIN");
+      await sql("UPDATE workflow_runs SET priority = 7 WHERE id = 'a'");
+      const update = settle(
+        db.client.workflowRun.updateMany({
+          where: { id: "a" },
+          data: { priority: 9 },
+        }),
+      );
+      const dispatched = settle(create("inside"));
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      await sql(end);
+      expect(await update).toBe("ok");
+      expect(await dispatched).toBe("ok");
+      expect(stored()).toEqual(
+        expect.arrayContaining([{ id: "a", priority: 9 }]),
+      );
+      expect(stored()).toHaveLength(2);
+    }, 30_000);
+
+    it("fails an engine write busy after 5 s when the transaction never ends, and stores nothing of it", async () => {
+      await seed("a");
+      await sql("BEGIN");
+      const start = Date.now();
+      const update = await settle(
+        db.client.workflowRun.updateMany({
+          where: { id: "a" },
+          data: { priority: 9 },
+        }),
+      );
+      expect(Date.now() - start).toBeLessThan(7000);
+      expect(Date.now() - start).toBeGreaterThan(4000);
+      expect(isSqliteBusy(update)).toBe(true);
+      expect(String(update)).toMatch(/did not open/);
+      await sql("COMMIT");
+      expect(stored()).toEqual([{ id: "a", priority: 5 }]);
+      await expect(create("after")).resolves.toBeTruthy();
+      expect(stored()).toHaveLength(2);
+    }, 30_000);
+
+    it("lets a savepoint opened before the takeover end through the wrapper, then refuses a new one", async () => {
+      await sql("SAVEPOINT s1");
+      await seed("a");
+      const update = settle(
+        db.client.workflowRun.updateMany({
+          where: { id: "a" },
+          data: { priority: 9 },
+        }),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      await db.client.$executeRawUnsafe("RELEASE s1");
+      expect(await update).toBe("ok");
+      expect(stored()).toEqual([{ id: "a", priority: 9 }]);
+      await expect(sql("SAVEPOINT s2")).rejects.toThrow(/Use \$transaction/);
+      await expect(sql("BEGIN")).rejects.toThrow(/Use \$transaction/);
+      // Ending is never refused: SQLite answers it.
+      await expect(sql("ROLLBACK")).rejects.toThrow(/no transaction is active/);
+      await expect(db.client.$executeRawUnsafe("COMMIT")).rejects.toThrow(
+        /no transaction is active/,
+      );
     }, 30_000);
   },
 );
