@@ -790,10 +790,11 @@ export class PrismaConsoleReadPort implements ConsoleReadPort {
    * is printed with 17 significant digits, which read back as the same
    * double; older SQLite builds (Prisma 6's) print `json(real)` with fewer.
    * An infinite real prints as `Inf` there, so it keeps `json()` (`9.0e+999`).
+   * A blob (only raw SQL writes one) is read as stored: `json()` refuses it.
    */
   private jsonColumn(name: string): string {
     return this.databaseType === "sqlite"
-      ? `CASE WHEN typeof(${name}) = 'real' AND abs(${name}) <= 1.7976931348623157e308 THEN printf('%!.17g', ${name}) ELSE json(${name}) END AS ${name}`
+      ? `CASE WHEN typeof(${name}) = 'real' AND abs(${name}) <= 1.7976931348623157e308 THEN printf('%!.17g', ${name}) WHEN typeof(${name}) = 'blob' THEN ${name} ELSE json(${name}) END AS ${name}`
       : name;
   }
 

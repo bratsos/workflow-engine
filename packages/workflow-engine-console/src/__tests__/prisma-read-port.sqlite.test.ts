@@ -493,6 +493,17 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
         now: () => at(100),
       }).getRunDetail("run-json");
       expect(infinite?.run.output).toBe(Infinity);
+      // A blob, which only raw SQL writes, is not read through `json()`:
+      // Prisma 6 and 8 return its bytes; Prisma 7 refuses it, as it did before.
+      await db.$executeRawUnsafe(
+        `UPDATE "workflow_runs" SET metadata = X'FF' WHERE id = 'run-json'`,
+      );
+      const blob = createPrismaConsoleReadPort(db, {
+        databaseType: "sqlite",
+        now: () => at(100),
+      }).getRunDetail("run-json");
+      if (major === "7") await expect(blob).rejects.toThrow();
+      else expect((await blob)?.run.metadata).toEqual(new Uint8Array([255]));
     } finally {
       await db.$disconnect?.();
     }
