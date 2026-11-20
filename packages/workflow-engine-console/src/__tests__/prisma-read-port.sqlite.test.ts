@@ -485,7 +485,7 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
         values,
       );
       // Raw SQL can store an infinite real, which `printf` would print as `Inf`.
-      await db.$executeRawUnsafe(
+      await db.$executeRawUnsafe!(
         `UPDATE "workflow_runs" SET output = 1e999 WHERE id = 'run-json'`,
       );
       const infinite = await createPrismaConsoleReadPort(db, {
@@ -495,7 +495,7 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
       expect(infinite?.run.output).toBe(Infinity);
       // A blob, which only raw SQL writes, is not read through `json()`:
       // Prisma 6 and 8 return its bytes; Prisma 7 refuses it, as it did before.
-      await db.$executeRawUnsafe(
+      await db.$executeRawUnsafe!(
         `UPDATE "workflow_runs" SET metadata = X'FF' WHERE id = 'run-json'`,
       );
       const blob = createPrismaConsoleReadPort(db, {
