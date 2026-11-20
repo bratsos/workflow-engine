@@ -407,6 +407,108 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
     expect(events[0]?.occurredAt.toISOString()).toBe(at(2).toISOString());
   });
 
+  it("reads a JSON scalar in every JSON column it reads, though SQLite keeps a JSON number as a number", async () => {
+    const file = join(directory, "json-scalars.db");
+    const db: ConsolePrismaClient & Record<string, any> = isPrisma8
+      ? (() => {
+          const raw = fixture.createSqliteDb(file);
+          return Object.assign(fromPrisma8!(raw), {
+            $disconnect: () => raw.close(),
+          });
+        })()
+      : fixture.createSqliteClient(file);
+    try {
+      await db.workflowRun.createMany({
+        data: [
+          {
+            ...mkRun("run-json", at(0), "COMPLETED", "wf-json", 0, 0),
+            input: 7,
+            output: -2.5,
+            config: "2",
+            metadata: true,
+          },
+        ],
+      });
+      // A caller's annotation holds any JSON value.
+      const values = [
+        2,
+        0,
+        -2.5,
+        2 ** 63,
+        "2",
+        true,
+        false,
+        [1, "a"],
+        { n: 3 },
+      ];
+      await db.workflowAnnotation.createMany({
+        data: values.map((value, i) => ({
+          id: `annotation-json-${i}`,
+          workflowRunId: "run-json",
+          attempt: 0,
+          scope: "run",
+          actorKind: "engine",
+          actorId: "test",
+          key: `k${i}`,
+          value,
+          createdAt: at(i),
+        })),
+      });
+      const stored = await (
+        db.$withColumns?.({ t: "text" }) ?? db
+      ).$queryRawUnsafe<Array<{ t: string }>>(
+        `SELECT typeof(value) AS t FROM "workflow_annotations" ORDER BY "createdAt"`,
+      );
+      // A JSON-declared column (Prisma 6 and 7) keeps a number as a number;
+      // Prisma 8 provisions its columns as TEXT.
+      expect(stored.map((r) => r.t)).toEqual([
+        ...(isPrisma8
+          ? ["text", "text", "text", "text"]
+          : ["integer", "integer", "real", "real"]),
+        "text",
+        "text",
+        "text",
+        "text",
+        "text",
+      ]);
+      const detail = await createPrismaConsoleReadPort(db, {
+        databaseType: "sqlite",
+        now: () => at(100),
+      }).getRunDetail("run-json");
+      expect(detail?.run).toMatchObject({
+        input: 7,
+        output: -2.5,
+        config: "2",
+        metadata: true,
+      });
+      expect([...detail!.annotations].reverse().map((a) => a.value)).toEqual(
+        values,
+      );
+      // Raw SQL can store an infinite real, which `printf` would print as `Inf`.
+      await db.$executeRawUnsafe!(
+        `UPDATE "workflow_runs" SET output = 1e999 WHERE id = 'run-json'`,
+      );
+      const infinite = await createPrismaConsoleReadPort(db, {
+        databaseType: "sqlite",
+        now: () => at(100),
+      }).getRunDetail("run-json");
+      expect(infinite?.run.output).toBe(Infinity);
+      // A blob, which only raw SQL writes, is not read through `json()`:
+      // Prisma 6 and 8 return its bytes; Prisma 7 refuses it, as it did before.
+      await db.$executeRawUnsafe!(
+        `UPDATE "workflow_runs" SET metadata = X'FF' WHERE id = 'run-json'`,
+      );
+      const blob = createPrismaConsoleReadPort(db, {
+        databaseType: "sqlite",
+        now: () => at(100),
+      }).getRunDetail("run-json");
+      if (major === "7") await expect(blob).rejects.toThrow();
+      else expect((await blob)?.run.metadata).toEqual(new Uint8Array([255]));
+    } finally {
+      await db.$disconnect?.();
+    }
+  });
+
   it("reads the attempt history's events of a run past a sequence, with only their stage and error, and reports a purged or broken range as incomplete", async () => {
     const port = reader();
     const retried = (await port.getRunDetail("run-retried"))!;
