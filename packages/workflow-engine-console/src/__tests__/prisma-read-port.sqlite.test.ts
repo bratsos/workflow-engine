@@ -484,6 +484,15 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
       expect([...detail!.annotations].reverse().map((a) => a.value)).toEqual(
         values,
       );
+      // Raw SQL can store an infinite real, which `printf` would print as `Inf`.
+      await db.$executeRawUnsafe(
+        `UPDATE "workflow_runs" SET output = 1e999 WHERE id = 'run-json'`,
+      );
+      const infinite = await createPrismaConsoleReadPort(db, {
+        databaseType: "sqlite",
+        now: () => at(100),
+      }).getRunDetail("run-json");
+      expect(infinite?.run.output).toBe(Infinity);
     } finally {
       await db.$disconnect?.();
     }
