@@ -785,9 +785,15 @@ export class PrismaConsoleReadPort implements ConsoleReadPort {
     return rows as T[];
   }
 
-  /** A JSON column as `select` reads it: on SQLite as `json(column)`. */
+  /**
+   * A JSON column as `select` reads it: on SQLite as JSON text. A stored real
+   * is printed with 17 significant digits, which read back as the same
+   * double; older SQLite builds (Prisma 6's) print `json(real)` with fewer.
+   */
   private jsonColumn(name: string): string {
-    return this.databaseType === "sqlite" ? `json(${name}) AS ${name}` : name;
+    return this.databaseType === "sqlite"
+      ? `CASE WHEN typeof(${name}) = 'real' THEN printf('%!.17g', ${name}) ELSE json(${name}) END AS ${name}`
+      : name;
   }
 
   /**
