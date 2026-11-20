@@ -881,7 +881,8 @@ describe.skipIf(!sqlite && !databaseUrl)(
       const stored = await client.outboxEvent.findFirst({
         where: { id: row!.id },
       });
-      expect(stored.deliveryClaim).toBe(`r9223372036854775680|${lease}`);
+      // Never below a stored rank, so it stays the latest acquisition.
+      expect(stored.deliveryClaim).toBe(`r9223372036854775807|${lease}`);
       expect(
         await persistence.isOutboxDeliveryClaimActive(
           row!.id,
@@ -949,6 +950,171 @@ describe.skipIf(!sqlite && !databaseUrl)(
         `r9223372036854775807|${lease}`,
         `r9223372036854775807|${lease}`,
       ]);
+    });
+
+    it("names the schema step when the delivery column or its indexes are missing, and keeps the events", async () => {
+      await seedEvent("a-schema");
+      const flusher = make({ async emit() {} });
+      const flushOnce = () =>
+        flusher.dispatch({ type: "outbox.flush", maxEvents: 5 });
+      const missing = expect.objectContaining({
+        code: "OUTBOX_SCHEMA_MISSING",
+        message: expect.stringContaining("outbox schema migration"),
+      });
+      const indexes = [
+        [
+          "outbox_events_delivery_run_idx",
+          '"publishedAt", "dlqAt", "workflowRunId", "deliveryClaim"',
+        ],
+        [
+          "outbox_events_live_run_sequence_idx",
+          '"publishedAt", "dlqAt", "workflowRunId", "sequence"',
+        ],
+        [
+          "outbox_events_delivery_cursor_idx",
+          '"deliveryClaim", "workflowRunId"',
+        ],
+      ];
+      const live = () =>
+        client.outboxEvent.count({ where: { publishedAt: null } });
+      // A rename keeps the column's position, so restored PostgreSQL row
+      // types match the plans cached before.
+      const rename = (from: string, to: string) =>
+        client.$executeRawUnsafe(
+          `ALTER TABLE "outbox_events" RENAME COLUMN "${from}" TO "${to}"`,
+        );
+      await rename("deliveryClaim", "legacyClaim");
+      try {
+        await expect(flushOnce()).rejects.toThrow(missing);
+      } finally {
+        await rename("legacyClaim", "deliveryClaim");
+      }
+      expect(await live()).toBe(1);
+      for (const [name] of indexes)
+        await client.$executeRawUnsafe(`DROP INDEX "${name}"`);
+      try {
+        // PostgreSQL claims without them, on slower plans.
+        if (sqlite) await expect(flushOnce()).rejects.toThrow(missing);
+        else expect(await flushOnce()).toMatchObject({ published: 1 });
+        expect(await live()).toBe(sqlite ? 1 : 0);
+      } finally {
+        for (const [name, columns] of indexes)
+          await client.$executeRawUnsafe(
+            `CREATE INDEX "${name}" ON "outbox_events" (${columns})`,
+          );
+      }
+      expect(await flushOnce()).toMatchObject({ published: sqlite ? 1 : 0 });
+      expect(await live()).toBe(0);
+    });
+
+    it("releases only the failed run's claim when runs of a page share the maximum rank", async () => {
+      await seedEvent("a-max");
+      await client.outboxEvent.updateMany({
+        where: { workflowRunId: "a-max" },
+        data: {
+          publishedAt: clock.now(),
+          deliveryClaim: `r9223372036854775807|${clock.now().toISOString()}|seeded`,
+        },
+      });
+      await persistence.appendOutboxEvents(
+        ["z-1", "z-2"].flatMap((workflowRunId) =>
+          [1, 2].map((n) => ({
+            workflowRunId,
+            eventType: "probe",
+            payload: {},
+            causationId: `${workflowRunId}-${n}`,
+            occurredAt: new Date(),
+          })),
+        ),
+      );
+      const entered = deferred();
+      const release = deferred();
+      const first: string[] = [];
+      const pending = make({
+        async emit(_, meta) {
+          const key = `${meta!.workflowRunId}#${meta!.sequence}`;
+          first.push(key);
+          if (key === "z-2#1") {
+            entered.release();
+            await release.promise;
+          }
+          if (key === "z-1#1") {
+            await entered.promise;
+            throw new Error("z-1 fails");
+          }
+        },
+      }).dispatch({ type: "outbox.flush", maxEvents: 10 });
+      await entered.promise;
+      // z-1's failure is written while z-2#1 is still in the sink.
+      await vi.waitFor(async () => {
+        const failed = await client.outboxEvent.findFirst({
+          where: { workflowRunId: "z-1", sequence: 1 },
+        });
+        expect(failed.retryCount).toBe(1);
+      });
+      const claims = await client.outboxEvent.findMany({
+        where: { workflowRunId: "z-2" },
+        select: { deliveryClaim: true },
+      });
+      expect(
+        claims.every((row: { deliveryClaim: string }) =>
+          row.deliveryClaim.startsWith("r9223372036854775807|20"),
+        ),
+      ).toBe(true);
+      const second: string[] = [];
+      await make({
+        async emit(_, meta) {
+          second.push(`${meta!.workflowRunId}#${meta!.sequence}`);
+        },
+      }).dispatch({ type: "outbox.flush", maxEvents: 10 });
+      expect(second).toEqual(["z-1#1", "z-1#2"]);
+      release.release();
+      expect(await pending).toMatchObject({ published: 2, failed: 1 });
+      expect(first).toEqual(["z-1#1", "z-2#1", "z-2#2"]);
+    });
+
+    it("keeps rotating once every rank is equal at the maximum", async () => {
+      await seedEvent("a-max");
+      await client.outboxEvent.updateMany({
+        where: { workflowRunId: "a-max" },
+        data: {
+          publishedAt: clock.now(),
+          deliveryClaim: `r9223372036854775807|${clock.now().toISOString()}|seeded`,
+        },
+      });
+      const runs = ["d0", "d1", "d2", "d3", "d4", "d5"];
+      await persistence.appendOutboxEvents(
+        runs.flatMap((workflowRunId) =>
+          [1, 2, 3].map((n) => ({
+            workflowRunId,
+            eventType: "probe",
+            payload: {},
+            causationId: `${workflowRunId}-${n}`,
+            occurredAt: new Date(),
+          })),
+        ),
+      );
+      const pages: string[] = [];
+      for (let i = 0; i < 9; i++) {
+        const page: string[] = [];
+        clock.advance(1);
+        await make({
+          async emit(_, meta) {
+            page.push(meta!.workflowRunId);
+          },
+        }).dispatch({ type: "outbox.flush", maxEvents: 2 });
+        pages.push(page.join(","));
+      }
+      expect(pages).toEqual(Array(3).fill(["d0,d1", "d2,d3", "d4,d5"]).flat());
+      const ranks = await client.outboxEvent.findMany({
+        where: { workflowRunId: { in: runs } },
+        select: { deliveryClaim: true },
+      });
+      expect(
+        ranks.every((row: { deliveryClaim: string }) =>
+          row.deliveryClaim.startsWith("r9223372036854775807|"),
+        ),
+      ).toBe(true);
     });
 
     it.skipIf(sqlite)(

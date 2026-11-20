@@ -320,7 +320,6 @@ export function createKernel(config: KernelConfig): Kernel {
 
   for (const method of [
     "claimOutboxDelivery",
-    "isOutboxDeliveryClaimActive",
     "completeOutboxDelivery",
     "failOutboxDelivery",
   ] as const) {

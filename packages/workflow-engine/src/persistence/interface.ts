@@ -1049,11 +1049,11 @@ export interface PersistenceCore {
   ): Promise<number>;
 
   /**
-   * Whether this claim still owns the row live and unexpired. The kernel's
-   * flush does not call it (the claim returns only owned rows and the
-   * acknowledgement is fenced); operators and conformance checks do.
+   * Optional. Whether this claim still owns the row live and unexpired. The
+   * kernel never calls it (the claim returns only owned rows and the
+   * acknowledgement is fenced); operators and the conformance suite may.
    */
-  isOutboxDeliveryClaimActive(
+  isOutboxDeliveryClaimActive?(
     id: string,
     claim: string,
     now: Date,

@@ -53,6 +53,36 @@ export class OutboxClaimUnsupportedError extends Error {
   }
 }
 
+/**
+ * Thrown by the Prisma claim on a database without the outbox delivery
+ * schema step: the `deliveryClaim` column or one of its three indexes is
+ * missing. The flush claims nothing, so every event stays in the outbox.
+ */
+export class OutboxSchemaMissingError extends Error {
+  readonly code = "OUTBOX_SCHEMA_MISSING";
+
+  constructor(cause: unknown) {
+    super(
+      'outbox_events lacks the nullable "deliveryClaim" column or one of the indexes outbox_events_delivery_run_idx, outbox_events_live_run_sequence_idx and outbox_events_delivery_cursor_idx. Stop the flushers, apply the 1.0.0-alpha.21 outbox schema migration ("Outbox at-least-once delivery and schema upgrade" in the 0.13 to 1.0 migration guide) and restart. No event was claimed; every event stays in the outbox.',
+      { cause },
+    );
+    this.name = "OutboxSchemaMissingError";
+  }
+}
+
+const MISSING_SCHEMA =
+  /no such (?:index|column): [\w."]*(?:outbox_events_\w+_idx|deliveryClaim)|column [\w."]*deliveryClaim"? does not exist/;
+
+/** The claim's error, or `OutboxSchemaMissingError` when the schema step is missing. */
+export function outboxSchemaError(error: unknown): unknown {
+  const meta = (error as { meta?: unknown })?.meta;
+  return MISSING_SCHEMA.test(
+    `${(error as Error)?.message ?? error} ${JSON.stringify(meta) ?? ""}`,
+  )
+    ? new OutboxSchemaMissingError(error)
+    : error;
+}
+
 export interface OutboxClaimPage {
   limit: number;
   claim: string;
@@ -62,12 +92,12 @@ export interface OutboxClaimPage {
 
 // A rank is the acquisition counter, zero-padded to the width of the largest
 // BIGINT. It saturates at that maximum, so it never needs another digit:
-// string order is numeric order and every offset below is fixed. The cursor
-// is read at most 128 (a page) below it, so a page at the ceiling still ranks
-// its runs apart unless the walk skipped more heads than that.
+// string order is numeric order and every offset below is fixed. A new rank
+// is never below a stored one, so the latest acquisition stays the highest
+// claim. Equal ranks (saturated or seeded) order by the rest of the claim,
+// the lease expiry, then by run ID.
 const RANK_DIGITS = 19;
 const RANK_MAX = "9223372036854775807"; // 2^63 - 1
-const RANK_CEILING = "9223372036854775679"; // RANK_MAX - 128, the page cap
 export const firstOutboxRotation = `r${"0".repeat(RANK_DIGITS)}`;
 /** `r`, the rank and `|`: what a released claim keeps. */
 const RANK_PREFIX = RANK_DIGITS + 2;
@@ -111,9 +141,9 @@ function noActiveClaim(run: string, index = "") {
  */
 function cursorCte(sqlite: boolean) {
   const index = sqlite ? "INDEXED BY outbox_events_delivery_cursor_idx" : "";
-  const rank = sqlite
-    ? `MIN(CAST(substr("deliveryClaim", 2, ${RANK_DIGITS}) AS INTEGER), ${RANK_CEILING})`
-    : `LEAST(CAST(substr("deliveryClaim", 2, ${RANK_DIGITS}) AS BIGINT), ${RANK_CEILING})`;
+  const rank = `CAST(substr("deliveryClaim", 2, ${RANK_DIGITS}) AS ${
+    sqlite ? "INTEGER" : "BIGINT"
+  })`;
   return `cursor AS MATERIALIZED (
     SELECT "workflowRunId" AS run_id, ${rank} AS rank
     FROM "outbox_events" ${index} WHERE "deliveryClaim" >= '${firstOutboxRotation}'

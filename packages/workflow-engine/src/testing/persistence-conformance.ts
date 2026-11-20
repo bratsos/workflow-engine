@@ -172,6 +172,19 @@ export function persistenceConformanceSuite(
   api: ConformanceTestApi,
 ) {
   const { describe, it, expect, beforeEach } = api;
+  /** `isOutboxDeliveryClaimActive` is optional: an adapter without it skips the check. */
+  const expectClaimActive = async (
+    persistence: WorkflowPersistence,
+    id: string,
+    claim: string,
+    now: Date,
+    active: boolean,
+  ) => {
+    if (persistence.isOutboxDeliveryClaimActive)
+      expect(
+        await persistence.isOutboxDeliveryClaimActive(id, claim, now),
+      ).toBe(active);
+  };
   describe(`I want ${name} to conform to WorkflowPersistence interface`, () => {
     let persistence: ReturnType<PersistenceFactory>;
 
@@ -1736,13 +1749,13 @@ export function persistenceConformanceSuite(
           [],
         );
         expect(reclaimed[0]?.id).toBe(first[0]?.id);
-        expect(
-          await persistence.isOutboxDeliveryClaimActive(
-            first[0]!.id,
-            firstClaim,
-            later,
-          ),
-        ).toBe(false);
+        await expectClaimActive(
+          persistence,
+          first[0]!.id,
+          firstClaim,
+          later,
+          false,
+        );
         expect(
           await persistence.completeOutboxDelivery(
             first[0]!.id,
@@ -1828,13 +1841,13 @@ export function persistenceConformanceSuite(
         const winner = results.findIndex((rows) => rows.length > 0);
         const row = results[winner]![0]!;
         await persistence.markOutboxEventsPublished([row.id]);
-        expect(
-          await persistence.isOutboxDeliveryClaimActive(
-            row.id,
-            claims[winner]!,
-            now,
-          ),
-        ).toBe(false);
+        await expectClaimActive(
+          persistence,
+          row.id,
+          claims[winner]!,
+          now,
+          false,
+        );
         expect(
           await persistence.completeOutboxDelivery(
             row.id,
@@ -1956,9 +1969,7 @@ export function persistenceConformanceSuite(
         expect(
           await persistence.completeOutboxDelivery(other[0]!.id, peer, now),
         ).toBe(true);
-        expect(
-          await persistence.isOutboxDeliveryClaimActive(second!.id, token, now),
-        ).toBe(true);
+        await expectClaimActive(persistence, second!.id, token, now, true);
         expect(
           await persistence.completeOutboxDelivery(second!.id, token, now),
         ).toBe(true);
@@ -2014,9 +2025,7 @@ export function persistenceConformanceSuite(
         const first = page.findIndex((row) => row.workflowRunId === "batch-a");
         expect(page.slice(first, first + runA.length)).toEqual(runA);
         for (const { id } of page)
-          expect(
-            await persistence.isOutboxDeliveryClaimActive(id, claim, now),
-          ).toBe(true);
+          await expectClaimActive(persistence, id, claim, now, true);
         expect(
           await persistence.failOutboxDelivery(runA[0]!.id, claim, 3, now),
         ).toBe("retry");

@@ -261,7 +261,6 @@ describe("kernel: outbox.flush with a misbehaving persistence port", () => {
 describe("kernel: outbox.flush", () => {
   it.each([
     "claimOutboxDelivery",
-    "isOutboxDeliveryClaimActive",
     "completeOutboxDelivery",
     "failOutboxDelivery",
   ])("rejects an adapter that still implements an older port missing %s", (method) => {
@@ -279,6 +278,31 @@ describe("kernel: outbox.flush", () => {
         registry: { getWorkflow: () => undefined },
       }),
     ).toThrow(`missing ${method}`);
+  });
+
+  it("builds and flushes with an adapter without the optional isOutboxDeliveryClaimActive", async () => {
+    const workflow = createSimpleWorkflow();
+    const { persistence, blobStore, jobTransport, eventSink, clock } =
+      createTestKernel([workflow]);
+    const adapter = Object.create(persistence);
+    adapter.isOutboxDeliveryClaimActive = undefined;
+    const kernel = createKernel({
+      persistence: adapter,
+      blobStore,
+      jobTransport,
+      eventSink,
+      clock,
+      registry: { getWorkflow: () => workflow },
+    });
+    await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "no-active-check",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+    expect(
+      await kernel.dispatch({ type: "outbox.flush", maxEvents: 10 }),
+    ).toMatchObject({ published: 1, failed: 0 });
   });
 
   it("keeps a claimed event unpublished until the sink accepts it", async () => {

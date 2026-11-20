@@ -54,6 +54,7 @@ import {
   type OutboxClaimPage,
   OutboxClaimUnsupportedError,
   outboxClaimOwner,
+  outboxSchemaError,
   postgresOutboxClaim,
   readOutboxSql,
   releasedOutboxClaim,
@@ -1902,7 +1903,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       deadline: `${now.toISOString()}~`,
       excluded: excludedRunIds,
     };
-    const claimRows = async (prisma: PrismaClient) => {
+    const claimPage = async (prisma: PrismaClient) => {
       if (signal?.aborted) return [];
       if (!prisma.$queryRawUnsafe && !prisma.$queryRaw)
         throw new OutboxClaimUnsupportedError();
@@ -1944,6 +1945,10 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       );
       return rows.map((row) => this.mapOutboxEvent(row));
     };
+    const claimRows = (prisma: PrismaClient) =>
+      claimPage(prisma).catch((error: unknown) => {
+        throw outboxSchemaError(error);
+      });
     if (
       this.databaseType === "postgresql" &&
       !this.skipTransactions &&
@@ -2052,7 +2057,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
   ): Promise<"retry" | "dead-lettered" | "lost"> {
     const row = await this.prisma.outboxEvent.findUnique({
       where: { id },
-      select: { retryCount: true, deliveryClaim: true },
+      select: { retryCount: true, deliveryClaim: true, workflowRunId: true },
     });
     if (!row || !ownsOutboxClaim(row.deliveryClaim, claim)) return "lost";
     const dead = row.retryCount + 1 >= maxRetries;
@@ -2070,12 +2075,15 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     });
     if (!result.count) return "lost";
     // The same claim holds the run's later events of this page; release them
-    // for the next flush without counting a failure. The stored claim is the
-    // run's own in this page, and equality on it alone leaves the planner one
-    // bounded index (outbox_events_delivery_cursor_idx) whatever the
-    // statistics. Published rows of the batch keep their rank.
+    // for the next flush without counting a failure. Runs ranked alike (at
+    // the rank ceiling) share the stored claim, so the run scopes it; the
+    // pair is the bounded index outbox_events_delivery_cursor_idx whatever
+    // the statistics. Published rows of the batch keep their rank.
     await this.prisma.outboxEvent.updateMany({
-      where: { deliveryClaim: row.deliveryClaim },
+      where: {
+        deliveryClaim: row.deliveryClaim,
+        workflowRunId: row.workflowRunId,
+      },
       data: { deliveryClaim: released },
     });
     return dead ? "dead-lettered" : "retry";

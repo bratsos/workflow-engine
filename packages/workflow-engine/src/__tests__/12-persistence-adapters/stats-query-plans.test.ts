@@ -506,7 +506,8 @@ describe.skipIf(!sqlite && !databaseUrl)(
           },
         });
       // The write by event ID, then (a failure) the release of the run's
-      // other events by their stored claim, from the cursor index.
+      // other events by their stored claim and run ID: the cursor index, or
+      // the run's unique key, which bounds it to that run's events.
       const check = async (statementsToCheck: Statement[], count = 1) => {
         const updates = statementsToCheck.filter(
           (statement) =>
@@ -523,8 +524,8 @@ describe.skipIf(!sqlite && !databaseUrl)(
                 ? /USING INDEX (sqlite_autoindex_outbox_events_1)/
                 : /Index Scan using "?outbox_events_pkey/
               : sqlite
-                ? /USING (COVERING )?INDEX outbox_events_delivery_cursor_idx/
-                : /(Index (Only )?Scan using|Bitmap Index Scan on) "?outbox_events_delivery_cursor_idx/,
+                ? /USING (COVERING )?INDEX (outbox_events_delivery_cursor_idx|outbox_events_workflowRunId_sequence_key)/
+                : /(Index (Only )?Scan using|Bitmap Index Scan on) "?(outbox_events_delivery_cursor_idx|outbox_events_workflowRunId_sequence_key)/,
           );
           expect(text).not.toMatch(sqlite ? SQLITE_TABLE_SCAN : /Seq Scan/);
         }
