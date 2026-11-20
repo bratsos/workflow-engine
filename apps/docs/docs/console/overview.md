@@ -381,7 +381,12 @@ whose rows are interleaved with theirs.
   steps are one statement for a run of any number of stages, past every
   store's parameter limit (65,535 in Postgres's protocol, 32,767 in Prisma
   6's query engine, 32,766 in SQLite), and a run detail is at most 18
-  statements on Postgres and 12 on SQLite.
+  statements on Postgres and 12 on SQLite in its transaction. On SQLite a
+  client's first read also runs the engine's date-storage check, one
+  statement before that transaction (none once the check has seen a stored
+  date for that client object), so a client's first run detail is at most
+  13 statements. In the tests a SQLite run detail took 8 to 11 statements in
+  its transaction, plus the check on a client's first read.
 - After rows are deleted, until a vacuum, a walk of an index also visits the
   run's deleted entries in its range. That costs at most a page per deleted
   row of the run, and only when the run has fewer live rows than the walk

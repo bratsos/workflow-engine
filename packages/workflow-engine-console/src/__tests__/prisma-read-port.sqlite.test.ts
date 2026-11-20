@@ -2099,16 +2099,26 @@ SELECT run || '-l' || n, ${later("createdAt", "n")}, run, level, message FROM ($
       })),
     });
     const calls: RecordedStatement[] = [];
-    const detail = await createPrismaConsoleReadPort(
-      recordingClient(prisma, calls),
+    const probes: RecordedStatement[] = [];
+    // A new client object: its first read runs the date check.
+    const port = createPrismaConsoleReadPort(
+      recordingClient(prisma, calls, undefined, undefined, undefined, probes),
       { databaseType: "sqlite", now: () => at(100) },
-    ).getRunDetail("run-many-stages");
+    );
+    const detail = await port.getRunDetail("run-many-stages");
     // One steps statement whatever the number of stages, so a read is still
-    // at most twelve statements (the transaction limit counts on it).
+    // at most twelve statements (the transaction limit counts on it), and
+    // the client's first read one more: the date check, before the
+    // transaction.
     expect(
       calls.filter((c) => c.sql.includes('JOIN "workflow_steps"')),
     ).toHaveLength(1);
     expect(calls.length).toBeLessThanOrEqual(12);
+    expect(probes).toHaveLength(1);
+    calls.length = 0;
+    await port.getRunDetail("run-many-stages");
+    expect(calls.length).toBeLessThanOrEqual(12);
+    expect(probes).toHaveLength(1);
     expect(detail?.stages).toHaveLength(33_000);
     expect(detail?.steps.map((s) => s.stepId)).toEqual([
       "first",
