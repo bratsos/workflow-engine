@@ -987,6 +987,120 @@ describe
       expect(late).toBeLessThan(1000);
     }, 60_000);
 
+    it("holds engine writes on every root of the file while another root is inside a raw transaction", async () => {
+      await db.persistence.getRun("warm");
+      const [, other] = open(2);
+      const native = roots.at(-1) as unknown as {
+        execute(plan: unknown): Promise<unknown>;
+        raw: any;
+      };
+      const sql = (text: string) =>
+        native.execute(
+          native.raw
+            .sql([text] as any)
+            .affectedCount()
+            .build(),
+        );
+      // Opened before the wrapper's first call on that root.
+      await sql("BEGIN IMMEDIATE");
+      await sql(`UPDATE "workflow_runs" SET priority = 7`);
+      await other!.persistence.getRun("warm");
+      const commit = setTimeout(() => void sql("COMMIT"), 100);
+      try {
+        const { result, late } = await loopDelay(() =>
+          db.kernel.dispatch({
+            type: "run.create",
+            idempotencyKey: "behind-foreign",
+            workflowId: db.workflow.id,
+            input: { value: "behind-foreign" },
+          }),
+        );
+        expect(result.status).toBe("fulfilled");
+        expect(late).toBeLessThan(1000);
+      } finally {
+        clearTimeout(commit);
+      }
+      expect(await db.client.workflowRun.count()).toBe(1);
+    }, 30_000);
+
+    it("reads through another root of the file inside a root's transaction", async () => {
+      const [, other] = open(2);
+      await other!.persistence.getRun("warm");
+      await db.kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "in-tx",
+        workflowId: db.workflow.id,
+        input: { value: "in-tx" },
+      });
+      const { result, late } = await loopDelay(() =>
+        db.client.$transaction(
+          async (tx: any) => {
+            await tx.$executeRawUnsafe(
+              `UPDATE "workflow_runs" SET "totalTokens" = 7`,
+            );
+            return other!.persistence.getRunsByStatus("PENDING");
+          },
+          { timeout: 2_000 },
+        ),
+      );
+      expect(result.status).toBe("fulfilled");
+      expect((result as PromiseFulfilledResult<unknown[]>).value).toHaveLength(
+        1,
+      );
+      expect(late).toBeLessThan(1000);
+      const [run] = await other!.persistence.getRunsByStatus("PENDING");
+      expect(run!.totalTokens).toBe(7);
+    }, 30_000);
+
+    it("drops a file's registry entry with its last root, and a root opened after one closed joins the live roots' queue", async () => {
+      const registry = () =>
+        (globalThis as Record<symbol, Map<string, { gates: Set<unknown> }>>)[
+          Symbol.for("@bratsos/workflow-engine/prisma8-files")
+        ]!;
+      const stacks = open(3);
+      for (const { persistence } of stacks) await persistence.getRun("warm");
+      const reader = stacks[2]!;
+      const file = [...registry().keys()].find((key) =>
+        key.endsWith(db.file!.split("/").pop()!),
+      )!;
+      expect(registry().get(file)!.gates.size).toBe(3);
+      // The root that opened the file's queue first closes.
+      await db.native.close();
+      expect(registry().get(file)!.gates.size).toBe(2);
+      const late = open(2)[1]!;
+      for (let i = 0; i < 30; i++)
+        await late.kernel.dispatch({
+          type: "run.create",
+          idempotencyKey: `late-${i}`,
+          workflowId: db.workflow.id,
+          input: { value: "late" },
+        });
+      const run = (await late.persistence.getRunsByStatus("PENDING"))[0]!.id;
+      let done = false;
+      const reads = Array.from({ length: 3 }, async () => {
+        while (!done) {
+          await reader.persistence.getRunsByStatus("PENDING");
+          await new Promise((resolve) => setImmediate(resolve));
+        }
+      });
+      const { result, late: delay } = await loopDelay(async () => {
+        for (let i = 0; i < 10; i++) {
+          const { version } = (await late.persistence.getRun(run))!;
+          await late.persistence.updateRun(run, {
+            totalTokens: i,
+            expectedVersion: version,
+          });
+        }
+      });
+      done = true;
+      await Promise.all(reads);
+      expect(result).toEqual({ status: "fulfilled", value: undefined });
+      expect(delay).toBeLessThan(1000);
+      for (const root of roots.splice(0))
+        await (root as unknown as { close(): Promise<void> }).close();
+      expect(registry().has(file)).toBe(false);
+    }, 60_000);
+
     it("flushes an empty outbox while another connection holds the write lock", async () => {
       const [{ kernel, persistence }] = open(1);
       await persistence.getRun("warm");
