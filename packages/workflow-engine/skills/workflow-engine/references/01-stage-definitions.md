@@ -226,21 +226,22 @@ async execute(ctx) {
 
 ### Storage
 
+`save`, `load`, `exists` and `delete` use the key as given: a bare key such as `"raw-data"` names one blob shared by every run of every workflow, and no engine command deletes it. Build keys with `getStageKey(stageId, suffix)`, which returns `workflow-v2/<workflowType>/<runId>/<stageId>/<suffix>`: that blob belongs to this run and stage, and `run.purge` deletes it with the run, as does a redrive that restarts the stage.
+
 ```typescript
 async execute(ctx) {
+  const key = (name: string) => ctx.storage.getStageKey(ctx.stageId, name);
+
   // Save intermediate data
-  await ctx.storage.save("raw-data", rawData);
+  await ctx.storage.save(key("raw-data"), rawData);
 
   // Check if data exists
-  if (await ctx.storage.exists("cached-result")) {
-    return { output: await ctx.storage.load("cached-result") };
+  if (await ctx.storage.exists(key("cached-result"))) {
+    return { output: await ctx.storage.load(key("cached-result")) };
   }
 
   // Delete old data
-  await ctx.storage.delete("old-cache");
-
-  // Get stage-specific key
-  const key = ctx.storage.getStageKey(ctx.stageId, "output.json");
+  await ctx.storage.delete(key("old-cache"));
 }
 ```
 
@@ -521,7 +522,7 @@ const batchEmbeddingStage = defineStage({
   async execute(ctx) {
     // Check for resume
     if (ctx.resumeState) {
-      const cached = await ctx.storage.load("embeddings-result");
+      const cached = await ctx.storage.load(ctx.storage.getStageKey(ctx.stageId, "embeddings-result"));
       if (cached) return { output: cached };
     }
 
@@ -567,7 +568,7 @@ const batchEmbeddingStage = defineStage({
       }));
 
       // Cache for resume
-      await ctx.storage.save("embeddings-result", { embeddings });
+      await ctx.storage.save(ctx.storage.getStageKey(ctx.stageId, "embeddings-result"), { embeddings });
 
       return { ready: true, output: { embeddings } };
     }
