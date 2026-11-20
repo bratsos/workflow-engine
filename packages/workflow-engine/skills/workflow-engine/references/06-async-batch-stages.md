@@ -59,7 +59,7 @@ async execute(ctx) {
   // ===================
   if (ctx.resumeState) {
     // Check for cached results
-    const cached = await ctx.storage.load("batch-result");
+    const cached = await ctx.storage.load(ctx.storage.getStageKey(ctx.stageId, "batch-result"));
     if (cached) {
       return { output: cached };
     }
@@ -93,7 +93,7 @@ async execute(ctx) {
   const handle = await batch.submit(requests);
 
   // Store metadata for resume
-  await ctx.storage.save("batch-metadata", {
+  await ctx.storage.save(ctx.storage.getStageKey(ctx.stageId, "batch-metadata"), {
     requestCount: requests.length,
     requestIds: requests.map(r => r.id),
   });
@@ -208,7 +208,7 @@ async checkCompletion(suspendedState, ctx) {
   const totalOutputTokens = results.reduce((sum, r) => sum + r.outputTokens, 0);
 
   // Cache results for potential resume
-  await ctx.storage.save("batch-result", { items: processedResults });
+  await ctx.storage.save(ctx.storage.getStageKey(ctx.stageId, "batch-result"), { items: processedResults });
 
   // Return completed result
   return {
@@ -361,7 +361,7 @@ const batchEmbeddingStage = defineStage({
     const totalTokens = results.reduce((sum, r) => sum + r.inputTokens, 0);
 
     // Cache for resume
-    await ctx.storage.save("embeddings", { embeddings });
+    await ctx.storage.save(ctx.storage.getStageKey(ctx.stageId, "embeddings"), { embeddings });
 
     await ctx.log("INFO", `Generated ${embeddings.length} embeddings`);
 
@@ -590,11 +590,11 @@ async checkCompletion(state, ctx) {
 
 ```typescript
 // In checkCompletion, cache before returning
-await ctx.storage.save("batch-results", processedResults);
+await ctx.storage.save(ctx.storage.getStageKey(ctx.stageId, "batch-results"), processedResults);
 
 // In execute resume path
 if (ctx.resumeState) {
-  const cached = await ctx.storage.load("batch-results");
+  const cached = await ctx.storage.load(ctx.storage.getStageKey(ctx.stageId, "batch-results"));
   if (cached) return { output: cached };
 }
 ```
@@ -603,14 +603,14 @@ if (ctx.resumeState) {
 
 ```typescript
 // Save metadata during submission
-await ctx.storage.save("batch-metadata", {
+await ctx.storage.save(ctx.storage.getStageKey(ctx.stageId, "batch-metadata"), {
   requestCount: requests.length,
   requestIds: requests.map(r => r.id),
   customData: { ... },
 });
 
 // Retrieve in checkCompletion
-const metadata = await ctx.storage.load("batch-metadata");
+const metadata = await ctx.storage.load(ctx.storage.getStageKey(ctx.stageId, "batch-metadata"));
 ```
 
 ## Inspecting a Batch Outside a Stage

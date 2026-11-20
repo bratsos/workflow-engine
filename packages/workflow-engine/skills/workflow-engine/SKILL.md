@@ -209,7 +209,7 @@ const batchStage = defineStage({
 
   async execute(ctx) {
     if (ctx.resumeState) {
-      return { output: await ctx.storage.load("batch-result") };
+      return { output: await ctx.storage.load(ctx.storage.getStageKey(ctx.stageId, "batch-result")) };
     }
 
     const batch = ctx.ai.batch("gemini-2.5-flash", "google"); // ctx.ai is scoped to workflow.<runId>.stage.<stageId>
