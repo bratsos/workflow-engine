@@ -18,6 +18,9 @@
     "ai-transcribe",
     "atomic-definition-registration",
     "batch-provider-seam",
+    "conformance-timing",
+    "console-attempt-timeline",
+    "console-sqlite-json-numbers",
     "cost-accounting-steps",
     "cost-accounting",
     "durable-steps-v1",
@@ -35,6 +38,14 @@
     "signal-wake-retry",
     "sqlite-claim-turns",
     "sqlite-rollback-write-fence",
+    "sqlite8-bounded-waits",
+    "sqlite8-commit-reads",
+    "sqlite8-consumer-transaction",
+    "sqlite8-journal-mode-cache",
+    "sqlite8-node-floors",
+    "sqlite8-root-busy",
+    "sqlite8-root-connection",
+    "stored-row-fixtures",
     "transaction-timeout-clamp"
   ]
 }
