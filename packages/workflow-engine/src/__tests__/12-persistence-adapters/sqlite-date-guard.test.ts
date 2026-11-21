@@ -826,6 +826,12 @@ describe.skipIf(!sqlite)(`sqlite date guard on Prisma ${major}`, () => {
       where: { id: "a-older" },
       data: { createdAt: new Date(Date.now() - 86_400_000) },
     });
+    // A day ahead: CURRENT_TIMESTAMP below has whole seconds, so on the same
+    // day it sorts after c-newer whenever the insert crosses a second.
+    await writer.workflowRun.update({
+      where: { id: "c-newer" },
+      data: { createdAt: new Date(Date.now() + 86_400_000) },
+    });
     // Another program's insert: between the two days on 7 and 8, the newest on 6.
     await writer.$executeRawUnsafe(
       `INSERT INTO "workflow_runs" (id, "workflowId", "workflowName", "workflowType", input, status, priority, "updatedAt", "createdAt")
