@@ -310,6 +310,43 @@ async function claimSuspendedStage(
  * leaves the ready set it permanently occupies one of the tick's candidate
  * slots and pushes servable stages out of the window.
  */
+/**
+ * Whether the stage row moved on while this poller ran user code: a job
+ * completed it, a cancel or redrive replaced it, another poller took it
+ * over. Checked before the poller's first write, and every Phase-2 stage
+ * write is fenced on the claimed version too, so a superseded poll writes
+ * nothing of its own. What user code itself wrote meanwhile (`ctx.storage`,
+ * `ctx.log`, step rows) is not covered.
+ */
+async function superseded(
+  stageRecord: WorkflowStageRecord,
+  deps: KernelDeps,
+): Promise<boolean> {
+  const current = await deps.persistence.getStage(
+    stageRecord.workflowRunId,
+    stageRecord.stageId,
+  );
+  return (
+    current?.id !== stageRecord.id || current.version !== stageRecord.version
+  );
+}
+
+/**
+ * Folder for the output and artifacts a poll writes before its fenced
+ * commit, so a poll that loses the fence never overwrites the bytes of the
+ * execution that won it. Unique per stage record and claim.
+ */
+const pollScope = (stageRecord: WorkflowStageRecord) =>
+  `poll-${stageRecord.id}-${stageRecord.version}`;
+
+/** Removes the bytes a poll wrote for a commit it lost. */
+async function dropPollBlobs(
+  keys: readonly string[],
+  deps: KernelDeps,
+): Promise<void> {
+  for (const key of keys) await deps.blobStore.delete(key).catch(() => {});
+}
+
 async function releaseStageClaim(
   stageRecord: WorkflowStageRecord,
   deps: KernelDeps,
@@ -397,6 +434,7 @@ async function replayStage(
     };
     built = buildStageExecutionContext(input, deps);
     const result = await stageDef.execute(built.context);
+    if (await superseded(stageRecord, deps)) return "skip";
 
     if (isSuspendedResult(result)) {
       const suspended = result as SuspendedResult;
@@ -432,6 +470,7 @@ async function replayStage(
             pollInterval: suspended.pollConfig.pollInterval,
             maxWaitUntil,
             metrics: suspended.metrics as any,
+            expectedVersion: stageRecord.version,
           });
           if (bufferedAnnotations.length > 0) {
             await tx.appendAnnotations(bufferedAnnotations);
@@ -495,6 +534,7 @@ async function replayStage(
       stageRecord.stageId,
       validatedOutput,
       deps,
+      pollScope(stageRecord),
     );
     const artifactKeys =
       stageResult.artifacts && Object.keys(stageResult.artifacts).length > 0
@@ -504,6 +544,7 @@ async function replayStage(
             stageRecord.stageId,
             stageResult.artifacts,
             deps,
+            pollScope(stageRecord),
           )
         : undefined;
     const duration =
@@ -529,6 +570,7 @@ async function replayStage(
           // A retried attempt that finished through a suspension: the
           // earlier attempt's error is stale, exactly as on direct completion.
           errorMessage: null,
+          expectedVersion: stageRecord.version,
         });
         if (bufferedAnnotations.length > 0) {
           await tx.appendAnnotations(bufferedAnnotations);
@@ -550,7 +592,13 @@ async function replayStage(
         );
       },
     );
-    if (await handleClaimOutcome(claimResult, stageRecord, deps)) return "skip";
+    if (await handleClaimOutcome(claimResult, stageRecord, deps)) {
+      await dropPollBlobs(
+        [outputKey, ...Object.values(artifactKeys ?? {})],
+        deps,
+      );
+      return "skip";
+    }
     postCommits.push(() =>
       completeSuspendedJobRow(
         stageRecord.workflowRunId,
@@ -739,7 +787,7 @@ export async function handleStagePollSuspended(
 
     // 3a.1 Skip cancelled runs — mark the suspended stage as cancelled
     if (run.status === "CANCELLED") {
-      await markStageCancelled(stageRecord.id, deps);
+      await markStageCancelled(stageRecord.id, deps, stageRecord.version);
       continue;
     }
 
@@ -918,6 +966,7 @@ export async function handleStagePollSuspended(
         stageRecord.suspendedState as any,
         checkContext,
       );
+      if (await superseded(stageRecord, deps)) continue;
 
       // ── Phase 2: persist results (transaction) ─────────────────────
       if (checkResult.error) {
@@ -964,6 +1013,7 @@ export async function handleStagePollSuspended(
             stageRecord.stageId,
             validatedOutput,
             deps,
+            pollScope(stageRecord),
           );
           outputRef = { _artifactKey: outputKey };
         }
@@ -987,6 +1037,7 @@ export async function handleStagePollSuspended(
               metrics: checkResult.metrics as any,
               embeddingInfo: checkResult.embeddings as any,
               errorMessage: null,
+              expectedVersion: stageRecord.version,
             });
 
             if (bufferedAnnotations.length > 0) {
@@ -1009,7 +1060,10 @@ export async function handleStagePollSuspended(
           },
         );
 
-        if (await skipAfterClaim(claimResult)) continue;
+        if (await skipAfterClaim(claimResult)) {
+          if (outputRef) await dropPollBlobs([outputRef._artifactKey], deps);
+          continue;
+        }
 
         resumed++;
         resumedWorkflowRunIds.add(stageRecord.workflowRunId);
@@ -1073,6 +1127,7 @@ export async function handleStagePollSuspended(
           async (tx) => {
             await tx.updateStage(stageRecord.id, {
               nextPollAt,
+              expectedVersion: stageRecord.version,
             });
 
             if (bufferedAnnotations.length > 0) {

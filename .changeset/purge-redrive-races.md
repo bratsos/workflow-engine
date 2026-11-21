@@ -11,5 +11,6 @@
 - `run.rerunFrom` checks COMPLETED/FAILED on the same read its run update is fenced on, so a run cancelled while it was deciding is refused instead of redriven.
 
 - `stage.pollSuspended` no longer fails a stage that a `job.execute` completed while the poll was running. A stale `checkCompletion` that returned or threw an error, a deadline that elapsed, or a durable replay that ran out of attempts used to write FAILED over the COMPLETED stage and fail its run. The failure is now fenced on the stage row's version and the poll moves on.
+- More generally, a `checkCompletion` or durable replay that resolves after a `job.execute`, a cancel, a redrive or another poller wrote the stage now writes nothing of its own: no stage update, output, artifacts, annotations or events, and it is not counted as resumed. Each poll reads the stage row once more before its first write. Output and artifacts a poll writes go under a `poll-<stageRecordId>-<version>/` folder of the stage prefix and are removed if its commit loses. What user code writes itself (`ctx.storage`, `ctx.log`, step rows) is not covered. The in-memory persistence now throws `StaleVersionError`, as the Prisma adapter does, for a version-fenced `updateStage` on a deleted row.
 
 No port changes. `job.execute` is unchanged; each post-commit enqueue reads the run once more.

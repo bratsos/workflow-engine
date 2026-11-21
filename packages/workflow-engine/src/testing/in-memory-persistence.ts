@@ -431,6 +431,15 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
 
   async updateStage(id: string, data: UpdateStageInput): Promise<void> {
     const stage = this.stages.get(id);
+    // A fenced write to a deleted row is stale, as on the Prisma adapter.
+    if (!stage && data.expectedVersion !== undefined) {
+      throw new StaleVersionError(
+        "WorkflowStage",
+        id,
+        data.expectedVersion,
+        -1,
+      );
+    }
     if (!stage) {
       throw new Error(`WorkflowStage not found: ${id}`);
     }

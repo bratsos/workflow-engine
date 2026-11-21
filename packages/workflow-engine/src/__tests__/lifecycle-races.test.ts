@@ -345,67 +345,175 @@ describe(`lifecycle races on ${realDatabase ? (sqlite ? "SQLite" : "Postgres") :
     expect((await wake(first, "ready")).status).toBe("acquired");
   });
 
-  it.each([
-    "returns",
-    "throws",
-  ] as const)("keeps a stage a job completed when a stale checkCompletion %s an error", async (how) => {
-    const held = gate();
-    let calls = 0;
-    const legacy = new WorkflowBuilder(
-      "lifecycle-legacy",
-      "Lifecycle legacy",
-      "lifecycle-legacy",
-      schema,
-      z.any(),
-    )
-      .pipe(
-        defineAsyncBatchStage({
-          id: "s",
-          name: "S",
-          mode: "async-batch",
-          schemas: { input: schema, output: z.any(), config: schema },
-          async execute() {
-            if (++calls > 1) return { output: { winner: "job" } };
-            const poll = { pollInterval: 1000, maxWaitTime: 3_600_000 };
-            return {
-              suspended: true,
-              state: {
-                batchId: "b",
-                submittedAt: new Date().toISOString(),
-                ...poll,
-              },
-              pollConfig: { nextPollAt: new Date(0), ...poll },
-            };
-          },
-          async checkCompletion() {
-            await held.pause();
-            if (how === "throws") throw new Error("stale poll");
-            return { ready: false, error: "stale poll" };
-          },
-        }),
-      )
-      .build();
-    const send = kernel({ registry: { getWorkflow: () => legacy } });
-    const runId = await createClaimed(send);
-    const execute = () =>
-      send({
-        type: "job.execute",
-        workflowRunId: runId,
-        workflowId: legacy.id,
-        stageId: "s",
-        config: {},
-      });
-    await execute();
-    const poll = send({ type: "stage.pollSuspended" });
-    await held.reached;
-    await expect(execute()).resolves.toMatchObject({ outcome: "completed" });
-    held.open();
+  describe("a poll that a newer execution superseded writes nothing", () => {
+    const outcomes = {
+      "returns an error": async () => ({ ready: false, error: "stale poll" }),
+      throws: async () => {
+        throw new Error("stale poll");
+      },
+      succeeds: async () => ({ ready: true, output: { winner: "poll" } }),
+    } as const;
+    const cases = (Object.keys(outcomes) as (keyof typeof outcomes)[]).flatMap(
+      (outcome) =>
+        (["a completed job", "a redrive"] as const).map(
+          (by) => [outcome, by] as const,
+        ),
+    );
 
-    await expect(poll).resolves.toMatchObject({ failed: 0 });
-    const stage = await ports.persistence.getStage(runId, "s");
-    expect(stage?.status).toBe("COMPLETED");
-    expect(stage?.errorMessage ?? null).toBeNull();
-    expect((await ports.persistence.getRun(runId))?.status).toBe("RUNNING");
+    it.each(cases)("checkCompletion %s after %s", async (outcome, by) => {
+      const held = gate();
+      let calls = 0;
+      let receipt = "";
+      const legacy = new WorkflowBuilder(
+        "lifecycle-legacy",
+        "Lifecycle legacy",
+        "lifecycle-legacy",
+        schema,
+        z.any(),
+      )
+        .pipe(
+          defineAsyncBatchStage({
+            id: "s",
+            name: "S",
+            mode: "async-batch",
+            schemas: { input: schema, output: z.any(), config: schema },
+            async execute() {
+              if (++calls > 1) return { output: { winner: "job" } };
+              const poll = { pollInterval: 1000, maxWaitTime: 3_600_000 };
+              return {
+                suspended: true,
+                state: {
+                  batchId: "b",
+                  submittedAt: new Date().toISOString(),
+                  ...poll,
+                },
+                pollConfig: { nextPollAt: new Date(0), ...poll },
+              };
+            },
+            async checkCompletion(_state, ctx) {
+              await held.pause();
+              ctx.annotate("stale-note", "poll");
+              // What user code writes itself is not fenced: see below.
+              receipt = ctx.storage.getStageKey("s", "receipt");
+              await ctx.storage.save(receipt, "stale poll");
+              return outcomes[outcome]() as never;
+            },
+          }),
+        )
+        .build();
+      const send = kernel({ registry: { getWorkflow: () => legacy } });
+      const runId = await createClaimed(send);
+      const execute = () =>
+        send({
+          type: "job.execute",
+          workflowRunId: runId,
+          workflowId: legacy.id,
+          stageId: "s",
+          config: {},
+        });
+      await execute();
+      const poll = send({ type: "stage.pollSuspended" });
+      await held.reached;
+      if (by === "a redrive") {
+        await send({ type: "run.cancel", workflowRunId: runId });
+        await send({
+          type: "run.redrive",
+          workflowRunId: runId,
+          from: { kind: "start" },
+        });
+      }
+      await expect(execute()).resolves.toMatchObject({ outcome: "completed" });
+      const winner = await ports.persistence.getStage(runId, "s");
+      held.open();
+
+      await expect(poll).resolves.toMatchObject({ resumed: 0, failed: 0 });
+      expect(await ports.persistence.getStage(runId, "s")).toEqual(winner);
+      expect((await ports.persistence.getRun(runId))?.status).toBe("RUNNING");
+      const output = (winner?.outputData as { _artifactKey: string })
+        ._artifactKey;
+      expect(await ports.blobStore.get(output)).toEqual({ winner: "job" });
+      const prefix = receipt.slice(0, -"receipt".length);
+      expect(
+        (await ports.blobStore.list(prefix)).filter((k) => k.includes("poll-")),
+      ).toEqual([]);
+      const events = (await ports.persistence.getUnpublishedOutboxEvents(1000))
+        .filter((e) => e.workflowRunId === runId)
+        .map((e) => e.eventType);
+      expect(events.filter((t) => t === "stage:completed")).toHaveLength(1);
+      expect(events).not.toContain("stage:failed");
+      expect(await ports.persistence.listAnnotations(runId)).not.toContainEqual(
+        expect.objectContaining({ key: "stale-note" }),
+      );
+      // Left as documented: a write user code makes through ctx.storage
+      // after the poll was superseded lands, at whatever key it names.
+      expect(await ports.blobStore.get(receipt)).toBe("stale poll");
+    });
+
+    it("a durable replay that finishes after a completed job", async () => {
+      const held = gate();
+      let calls = 0;
+      const durable = new WorkflowBuilder(
+        "lifecycle-durable",
+        "Lifecycle durable",
+        "lifecycle-durable",
+        schema,
+        z.any(),
+      )
+        .pipe(
+          defineStage({
+            id: "s",
+            name: "S",
+            schemas: { input: schema, output: z.any(), config: schema },
+            async execute(ctx) {
+              const call = ++calls;
+              await ctx.step.waitForSignal("go", { timeout: "1h" });
+              if (call === 2) {
+                await held.pause();
+                return {
+                  output: { winner: "poll" },
+                  artifacts: { proof: "poll" },
+                };
+              }
+              return { output: { winner: "job" } };
+            },
+          }),
+        )
+        .build();
+      const send = kernel({ registry: { getWorkflow: () => durable } });
+      const runId = await createClaimed(send);
+      const execute = () =>
+        send({
+          type: "job.execute",
+          workflowRunId: runId,
+          workflowId: durable.id,
+          stageId: "s",
+          config: {},
+        });
+      await execute();
+      await send({
+        type: "step.signal",
+        workflowRunId: runId,
+        stageId: "s",
+        stepId: "go",
+        payload: true,
+      });
+      const poll = send({ type: "stage.pollSuspended" });
+      await held.reached;
+      await expect(execute()).resolves.toMatchObject({ outcome: "completed" });
+      const winner = await ports.persistence.getStage(runId, "s");
+      held.open();
+
+      await expect(poll).resolves.toMatchObject({ resumed: 0, failed: 0 });
+      expect(await ports.persistence.getStage(runId, "s")).toEqual(winner);
+      const output = (winner?.outputData as { _artifactKey: string })
+        ._artifactKey;
+      expect(await ports.blobStore.get(output)).toEqual({ winner: "job" });
+      expect(
+        await ports.blobStore.list(
+          `${output.slice(0, output.lastIndexOf("/") + 1)}poll-`,
+        ),
+      ).toEqual([]);
+    });
   });
 
   // On the databases the purge claim each redrive takes first serializes the

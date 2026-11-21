@@ -75,7 +75,7 @@ await kernel.dispatch({ type: "run.transition", workflowRunId: runId });
 
 **What it was:** `checkCompletion()` was running inside the kernel's global Prisma interactive transaction. Batch provider API calls (Google Batch, OpenAI Batch, etc.) that took longer than the default 5s timeout would expire the transaction, and the subsequent `updateStage()` call would fail.
 
-**How it's fixed:** `stage.pollSuspended` now manages its own per-stage transactions (same pattern as `job.execute`). `checkCompletion()` runs outside any transaction, and only the DB state update + outbox writes are wrapped in a short transaction afterward.
+**How it's fixed:** `stage.pollSuspended` now manages its own per-stage transactions (same pattern as `job.execute`). `checkCompletion()` runs outside any transaction, and only the DB state update + outbox writes are wrapped in a short transaction afterward. If a `job.execute`, a cancel, a redrive or another poller writes the stage while `checkCompletion()` or the replay runs, the poll writes nothing of its own when it returns: no stage update, output, artifacts, annotations or events, and it is not counted as resumed or failed. It checks the stage row before its first write and fences the short transaction on the version it claimed; output and artifacts go under a `poll-<stageRecordId>-<version>/` folder of the stage prefix until that transaction commits, and are removed if it loses. What the user code itself wrote meanwhile is not undone: `ctx.storage` writes (at whatever key they name, so a stable key can overwrite the newer execution's bytes), `ctx.log` lines and durable step rows.
 
 ## Ghost Jobs
 

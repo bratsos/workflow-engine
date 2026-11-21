@@ -86,15 +86,26 @@ export async function withClaimedRun<T>(
 }
 
 /** Marks a suspended stage CANCELLED after its run was found cancelled. */
+/**
+ * With `expectedVersion`, a row written since that version (a job that
+ * completed it, a newer attempt) is left as it is.
+ */
 export async function markStageCancelled(
   stageId: string,
   deps: KernelDeps,
+  expectedVersion?: number,
 ): Promise<void> {
-  await deps.persistence.updateStage(stageId, {
-    status: "CANCELLED",
-    completedAt: deps.clock.now(),
-    nextPollAt: null,
-  });
+  try {
+    await deps.persistence.updateStage(stageId, {
+      status: "CANCELLED",
+      completedAt: deps.clock.now(),
+      nextPollAt: null,
+      expectedVersion,
+    });
+  } catch (error) {
+    if (expectedVersion === undefined || !(error instanceof StaleVersionError))
+      throw error;
+  }
 }
 
 /**
@@ -122,7 +133,7 @@ export async function markStageCancelled(
  */
 export async function handleClaimOutcome<T>(
   claimResult: ClaimOutcome<T>,
-  stageRecord: { id: string; workflowRunId: string },
+  stageRecord: { id: string; workflowRunId: string; version?: number },
   deps: KernelDeps,
 ): Promise<boolean> {
   if (claimResult.status === "stale") {
@@ -130,7 +141,7 @@ export async function handleClaimOutcome<T>(
       stageRecord.workflowRunId,
     );
     if (latestStatus === "CANCELLED") {
-      await markStageCancelled(stageRecord.id, deps);
+      await markStageCancelled(stageRecord.id, deps, stageRecord.version);
     }
     return true;
   }
@@ -141,7 +152,7 @@ export async function handleClaimOutcome<T>(
     // genuine cancel marks this stage cancelled — any other terminal
     // status means another orchestrator finished the stage and the run.
     if (claimResult.runStatus === "CANCELLED") {
-      await markStageCancelled(stageRecord.id, deps);
+      await markStageCancelled(stageRecord.id, deps, stageRecord.version);
     }
     return true;
   }
