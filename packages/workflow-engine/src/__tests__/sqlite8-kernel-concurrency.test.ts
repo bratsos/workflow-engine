@@ -1110,10 +1110,14 @@ describe
         (_, i) => `q-${String(i).padStart(2, "0")}`,
       );
       // Bound to this context: the consumer's call, not part of the engine
-      // turn whose statement triggers it below.
+      // turn whose statement triggers it below. Settled at once, so its
+      // rejection is never unhandled.
       const insert = AsyncResource.bind(() =>
         sql(
           `INSERT INTO workflow_runs (id, "workflowId", "workflowName", "workflowType", input, status, priority, "createdAt", "updatedAt") VALUES ('a-raw', 'w', 'w', 't', '{}', 'PENDING', 5, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`,
+        ).then(
+          () => "ok",
+          (error: Error) => error.message,
         ),
       );
       // It writes the moment the first engine write has checked the write
@@ -1159,10 +1163,7 @@ describe
           }),
         );
       });
-      const raw = await inserted!.then(
-        () => "ok",
-        (error: Error) => error.message,
-      );
+      const raw = await inserted!;
       clearTimeout(commit);
       expect(result.status).toBe("fulfilled");
       // A write that lost the race used to wait its busy timeout synchronously
