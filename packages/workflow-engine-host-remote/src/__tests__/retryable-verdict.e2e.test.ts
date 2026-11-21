@@ -207,6 +207,31 @@ describe("remote worker retry verdict over the HTTP transport pair", () => {
     });
   }, 30_000);
 
+  it("records a decoded Zod error from input validation as a local stage does", async () => {
+    const decoded = {
+      name: "ZodError",
+      message: "input is invalid",
+      issues: [],
+    };
+    const stage = stageThatThrows("s", () => new Error("unreachable"));
+    // Validation that rejects with an error decoded from JSON.
+    Object.assign(stage, {
+      inputSchema: {
+        parse() {
+          throw decoded;
+        },
+      },
+    });
+    const { result } = await runOverHttp(stage);
+
+    expect(result).toMatchObject({
+      outcome: "failed",
+      error: "ZodError: input is invalid",
+      retryable: false,
+      willRetry: false,
+    });
+  }, 30_000);
+
   it("keeps today's behaviour for a worker that sends no verdict", async () => {
     const { result } = await runOverHttp(
       stageThatThrows("s", () => new NonRetryableError("card revoked")),

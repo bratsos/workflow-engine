@@ -6,8 +6,8 @@
  * coercion. Never throws, even for a value with no string conversion.
  */
 export function toErrorMessage(error: unknown): string {
-  if (error instanceof Error) return error.message;
   try {
+    if (error instanceof Error) return error.message;
     if (typeof error === "object" && error !== null) {
       const { message } = error as { message?: unknown };
       if (typeof message === "string") return message;

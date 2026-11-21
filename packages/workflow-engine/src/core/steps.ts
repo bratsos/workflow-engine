@@ -514,11 +514,16 @@ export class NonRetryableError extends Error {
 export function isNonRetryableError(
   error: unknown,
 ): error is NonRetryableError {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    (error as { [STEP_NON_RETRYABLE]?: unknown })[STEP_NON_RETRYABLE] === true
-  );
+  try {
+    return (
+      typeof error === "object" &&
+      error !== null &&
+      (error as { [STEP_NON_RETRYABLE]?: unknown })[STEP_NON_RETRYABLE] === true
+    );
+  } catch {
+    // A thrown value whose property read throws (a Proxy) carries no brand.
+    return false;
+  }
 }
 
 /** Thrown when a stage uses durable steps without a configured ledger. */

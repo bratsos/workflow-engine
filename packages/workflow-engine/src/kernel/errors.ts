@@ -55,14 +55,14 @@ export class JobTargetMissingError extends Error {
  *   stage and run, all three. The missing target of another dispatch made
  *   inside the job (a custom executor calling a kernel) names another
  *   target, and is that dispatch's failure, not this job's.
- * - The same error carried across a boundary that keeps only its name and
- *   message, or the plain `Error` an earlier release's kernel throws: its
- *   message must be exactly the text thrown for one of this job's own
- *   workflow, stage or run. This cannot tell this job's missing workflow
- *   from another dispatch's missing workflow of the same id; the branded
- *   error can.
+ * - Otherwise, any value whose `name` is `JobTargetMissingError` or `Error`
+ *   and whose `message` is exactly the text thrown for one of this job's own
+ *   workflow, stage or run (the plain `Error` an earlier release's kernel
+ *   throws, an error decoded from JSON). The texts do not name every id, so
+ *   any other error with that name and text matches too; the branded error
+ *   does not.
  *
- * An error that only reads like one (other text, other name) is neither.
+ * An error with any other name or text is neither.
  */
 export function isJobTargetMissingError(
   error: unknown,

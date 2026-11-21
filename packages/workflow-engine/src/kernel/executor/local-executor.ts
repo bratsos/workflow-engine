@@ -44,7 +44,7 @@ export function createLocalExecutor(): ActivityExecutor {
         return {
           error,
           errorName: name,
-          errorStack: e instanceof Error ? e.stack : undefined,
+          errorStack: stackOf(e),
           retryable,
           progress: built?.progressEvents ?? [],
           annotations: built?.annotationBuffer.flush() ?? [],
@@ -53,4 +53,13 @@ export function createLocalExecutor(): ActivityExecutor {
       }
     },
   };
+}
+
+/** The stack of a thrown Error; a throwing `stack` getter must not hide the failure. */
+function stackOf(e: unknown): string | undefined {
+  try {
+    return e instanceof Error ? e.stack : undefined;
+  } catch {
+    return undefined;
+  }
 }

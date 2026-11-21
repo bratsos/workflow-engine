@@ -30,12 +30,18 @@ import { describeThrown } from "./error-message.js";
  * thrown by another copy of the engine or of zod gets the same verdict.
  */
 export function isRetryableStageError(error: unknown): boolean {
-  return !(
-    isZodError(error) ||
-    isDuplicateStepKeyError(error) ||
-    isNonRetryableError(error) ||
-    isTerminalStepFailure(error)
-  );
+  try {
+    return !(
+      isZodError(error) ||
+      isDuplicateStepKeyError(error) ||
+      isNonRetryableError(error) ||
+      isTerminalStepFailure(error)
+    );
+  } catch {
+    // A diagnostic getter that throws (`name`, `issues`) proves no verdict:
+    // the error stays ordinary, and its failure is still recorded.
+    return true;
+  }
 }
 
 function isTerminalStepFailure(error: unknown): boolean {
@@ -76,11 +82,10 @@ export interface StepFailure {
   readonly final: boolean;
   /**
    * Step-level verdict: the body threw `NonRetryableError` or `retryIf`
-   * said no, so the step's own `retries` stop here.
+   * said no, so the step's own `retries` stop here. Never set for an
+   * engine refusal, which leaves the step's retries as they were.
    */
   readonly stop: boolean;
-  /** The engine refused to replay a step whose worker died. */
-  readonly refused: boolean;
   /** A `retryIf` refusal wrapped the original error as its `cause`. */
   readonly wrapped?: boolean;
   /** `Error.name` of that original error, when it had one. */
@@ -129,14 +134,15 @@ export function readStepFailure(row: {
   if (typeof result !== "object" || result === null) return undefined;
   const record = (result as Record<string, unknown>)[STEP_FAILURE_KEY];
   if (typeof record !== "object" || record === null) return undefined;
-  const { attempt, name, final, stop, refused, wrapped, causeName } =
-    record as Record<string, unknown>;
+  const { attempt, name, final, stop, wrapped, causeName } = record as Record<
+    string,
+    unknown
+  >;
   if (attempt !== row.attempt) return undefined;
   return {
     ...(typeof name === "string" ? { name } : {}),
     final: final === true,
     stop: stop === true,
-    refused: refused === true,
     ...(wrapped === true ? { wrapped: true } : {}),
     ...(typeof causeName === "string" ? { causeName } : {}),
   };
@@ -157,7 +163,7 @@ export function replayedStepError(
   failure: StepFailure | undefined,
 ): Error {
   let error: Error;
-  if (failure?.stop && !failure.refused) {
+  if (failure?.stop) {
     const cause = failure.wrapped ? new Error(message) : undefined;
     if (cause && failure.causeName) cause.name = failure.causeName;
     error = new NonRetryableError(message, cause ? { cause } : undefined);

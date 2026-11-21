@@ -19,6 +19,7 @@ import {
   isNonRetryableError,
   NonRetryableError,
   type StepRunOptions,
+  StepTimeoutError,
 } from "../core/steps.js";
 import { type Workflow, WorkflowBuilder } from "../core/workflow.js";
 import { createKernel, type KernelConfig } from "../kernel/kernel.js";
@@ -165,6 +166,34 @@ function fromAnotherEngineCopy(name: string) {
   );
   return error;
 }
+
+/** `target` with `key` turned into a getter that throws. */
+function withThrowingGetter<T extends object>(target: T, key: string): T {
+  Object.defineProperty(target, key, {
+    get() {
+      throw new Error(`${key} getter`);
+    },
+    configurable: true,
+  });
+  return target;
+}
+
+const brokenGetterCases: Array<[string, () => unknown]> = [
+  ...["name", "message", "cause", "constructor", "issues", "stack"].map(
+    (key): [string, () => unknown] => [
+      key,
+      () => withThrowingGetter(new Error("boom"), key),
+    ],
+  ),
+  [
+    "name (plain object)",
+    () => withThrowingGetter({ message: "boom" }, "name"),
+  ],
+  [
+    "issues (plain object)",
+    () => withThrowingGetter({ name: "ZodError", message: "boom" }, "issues"),
+  ],
+];
 
 const zodParse = () => z.number().parse("x");
 const zodV3Parse = () => zodV3.number().parse("x");
@@ -713,6 +742,98 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
           status: "FAILED",
           errorMessage: "over quota",
         });
+      });
+
+      it("are left to run after an engine refusal, as before", async () => {
+        const started = signal();
+        const release = signal();
+        const body = async () => {
+          body.calls++;
+          if (body.calls === 1) {
+            started.open();
+            await release.promise;
+          }
+          return "done";
+        };
+        body.calls = 0;
+        const run = await start(
+          env,
+          workflowOf(
+            "refusal-retries",
+            storedStage(body, { onReclaim: "fail", retries: 2, lease: 1000 }),
+          ),
+        );
+        const first = run.execute(1);
+        try {
+          await started.promise;
+          env.clock.advance(5000);
+          // The next delivery refuses to take over the expired lease.
+          expect(await run.execute(2)).toMatchObject({ outcome: "suspended" });
+          // The failed row still has retries, and the replay runs the body.
+          await run.poll();
+          expect(await run.stage()).toMatchObject({ status: "COMPLETED" });
+          expect(body.calls).toBe(2);
+        } finally {
+          release.open();
+          await first.catch(() => {});
+        }
+      });
+    });
+
+    describe("a failure row written before this release", () => {
+      it("replays timeout-shaped text as StepTimeoutError and fails the stage, as before", async () => {
+        const text = new StepTimeoutError("call").message;
+        const body = failing(1, () => new Error(text));
+        const run = await start(
+          env,
+          workflowOf("legacy-timeout", storedStage(body)),
+        );
+        expect(await run.execute(1)).toMatchObject({ outcome: "suspended" });
+        // What an earlier release wrote: the message, and no failure record.
+        const stripped = await env.stepLedger.compareAndSet(
+          (await run.stage()).id,
+          "call",
+          { status: "failed", attempt: 1 },
+          { result: null },
+        );
+        expect(stripped.applied).toBe(true);
+        await run.poll();
+        expect(await run.stage()).toMatchObject({ status: "FAILED" });
+        await run.poll();
+        expect(body.calls).toBe(1);
+      });
+    });
+
+    describe.each(
+      brokenGetterCases,
+    )("a body error with a throwing %s getter", (_case, make) => {
+      it("is recorded, and the step's own retry runs", async () => {
+        const body = failing(1, make);
+        const run = await start(
+          env,
+          workflowOf("getter-step", directStage(body, { retries: 1 })),
+        );
+        expect(await run.execute(1)).toMatchObject({ outcome: "suspended" });
+        const [row] = await env.stepLedger.list((await run.stage()).id);
+        expect(row).toMatchObject({ status: "failed", leaseExpiresAt: null });
+        expect(typeof row!.error).toBe("string");
+        await run.poll();
+        expect(await run.stage()).toMatchObject({ status: "COMPLETED" });
+        expect(body.calls).toBe(2);
+      });
+
+      it("fails the job retryably, and the retry runs the step again", async () => {
+        const body = failing(1, make);
+        const run = await start(
+          env,
+          workflowOf("getter-job", directStage(body)),
+        );
+        expect(await run.execute(1)).toMatchObject({
+          outcome: "failed",
+          willRetry: true,
+        });
+        expect(await run.execute(2)).toMatchObject({ outcome: "completed" });
+        expect(body.calls).toBe(2);
       });
     });
 

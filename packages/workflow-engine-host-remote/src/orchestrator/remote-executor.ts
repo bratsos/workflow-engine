@@ -16,11 +16,11 @@ import {
   type ActivityRunResult,
   type BufferedLog,
   type CreateAnnotationInput,
+  describeThrown,
   type ExecutorDeps,
   isRetryableStageError,
   type KernelEvent,
   normalizeAnnotateArgs,
-  toErrorMessage,
 } from "@bratsos/workflow-engine/kernel";
 import type { BufferedProgress } from "../protocol.js";
 import type { OrchestratorTransport } from "../transport.js";
@@ -79,9 +79,10 @@ export function createRemoteExecutor(
       try {
         validatedInput = stageDef.inputSchema.parse(input.rawInput);
       } catch (e) {
+        const { name, message } = describeThrown(e);
         return {
-          error: toErrorMessage(e),
-          errorName: e instanceof Error ? e.name : undefined,
+          error: message,
+          errorName: name,
           // Bad input fails identically on every attempt, as in LocalExecutor.
           retryable: isRetryableStageError(e) ? undefined : false,
           progress: [],

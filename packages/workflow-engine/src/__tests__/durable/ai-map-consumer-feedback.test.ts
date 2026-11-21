@@ -90,6 +90,28 @@ describe("ctx.step.ai.map — consumer feedback surfaces", () => {
     expect(b && "cause" in b).toBe(false);
   });
 
+  it("keeps the message and name of a decoded error a call rejects with", async () => {
+    const workflow = mapWorkflow("map-decoded-error", {
+      realtime: { retries: 0, concurrency: 1 },
+    });
+    const harness = createTestHarness({ workflows: [workflow] });
+    harness.mockAi.setTextResponse("process", { text: "processed" });
+    // An error that crossed a JSON boundary: plain fields, no prototype.
+    harness.mockAi.failOnce("process a", {
+      name: "SubscriptionLimitError",
+      message: "subscription limit reached",
+    } as unknown as Error);
+
+    const result = await harness.run("map-decoded-error", { items: ["a"] });
+
+    expect(result.status).toBe("COMPLETED");
+    expect(results(result.output)[0]).toMatchObject({
+      status: "failed",
+      error: "subscription limit reached",
+      errorName: "SubscriptionLimitError",
+    });
+  });
+
   it("retries a thrown item call in-process and completes in one execution", async () => {
     const workflow = mapWorkflow("map-fail-twice", {
       realtime: { retries: 2, concurrency: 2 },

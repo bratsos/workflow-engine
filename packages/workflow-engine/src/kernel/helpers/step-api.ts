@@ -119,9 +119,12 @@ function parkedResult<T>(record: StepRecord): T {
 }
 
 function storedError(record: StepRecord): Error {
+  const failure = readStepFailure(record);
   // Only a wait, signal or sleep fails by timing out; a `run` body whose
-  // message reads like a timeout is still the body's own error.
-  if (record.kind !== "run") {
+  // message reads like a timeout is still the body's own error, which its
+  // failure record says. A row with no record (written by an earlier
+  // release) replays exactly as it did there.
+  if (record.kind !== "run" || failure === undefined) {
     const timeout = new StepTimeoutError(record.stepId);
     if (record.error === timeout.message) return timeout;
   }
@@ -129,7 +132,7 @@ function storedError(record: StepRecord): Error {
     record.error ?? `Durable step "${record.stepId}" previously failed`;
   // The failure comes back under its original `name` and with the verdict
   // of the first throw (see `replayedStepError`).
-  return replayedStepError(message, readStepFailure(record));
+  return replayedStepError(message, failure);
 }
 
 /** Text for a value that may not even convert to a string. */
@@ -601,10 +604,11 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
             error: error.message,
             // The verdict travels with the row (read-only: the row stays
             // failed exactly as before, only its replayed error is named).
+            // An engine refusal is no body verdict, so it leaves the step's
+            // own retries as they were.
             result: stepFailureResult(error, record.attempt, {
               final: true,
-              stop: true,
-              refused: true,
+              stop: false,
             }),
             leaseExpiresAt: null,
           });
@@ -705,7 +709,6 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
           result: stepFailureResult(thrown, record.attempt, {
             final: !isRetryableStageError(thrown),
             stop,
-            refused: false,
             ...(declined ? { wrapped: true } : {}),
             ...(declined && originalName ? { causeName: originalName } : {}),
           }),

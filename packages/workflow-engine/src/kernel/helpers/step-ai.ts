@@ -52,6 +52,7 @@ import {
   StepTimeoutError,
 } from "../../core/steps";
 import { getBestProviderForModel } from "../../utils/batch/model-mapping";
+import { describeThrown, toErrorMessage } from "./error-message";
 
 const DEFAULT_CONCURRENCY = 10;
 const DEFAULT_BATCH_ABOVE = 20;
@@ -230,9 +231,9 @@ function pickTranscribeResult(result: AITranscribeResult): AITranscribeResult {
   };
 }
 
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
+// A decoded `{ name, message }` keeps both, like a thrown Error.
+const errorMessage = toErrorMessage;
+const errorName = (error: unknown) => describeThrown(error).name;
 
 function formatIssues(error: z.ZodError): string {
   return error.issues
@@ -629,10 +630,7 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
           return "repair";
         }
         if (retriesLeft <= 0) {
-          return failed(
-            errorMessage(error),
-            error instanceof Error ? error.name : undefined,
-          );
+          return failed(errorMessage(error), errorName(error));
         }
         retriesLeft--;
         await deps.noteAttempt(stepId);
@@ -847,12 +845,13 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
           if (stored && stored.status === "failed" && stored.id === entry.id) {
             return stored;
           }
+          const name = errorName(error);
           const verdict: AiMapResult<TOut> = {
             id: entry.id,
             index: entry.index,
             status: "failed",
             error: errorMessage(error),
-            ...(error instanceof Error ? { errorName: error.name } : {}),
+            ...(name !== undefined ? { errorName: name } : {}),
             attempts: (prior?.attempts ?? 0) + 1,
             inputTokens: prior?.inputTokens ?? 0,
             outputTokens: prior?.outputTokens ?? 0,
