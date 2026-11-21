@@ -8,6 +8,7 @@ import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { registerModels } from "../../ai/model-helper.js";
 import type { AiMapResult } from "../../core/step-ai.js";
+import { NonRetryableError } from "../../core/steps.js";
 import { defineWorkflow } from "../../core/workflow.js";
 import { createTestHarness } from "../../testing/index.js";
 
@@ -205,6 +206,29 @@ describe("ctx.step.ai.map — consumer feedback surfaces", () => {
     expect(result.reports.flatMap((r) => r.outcomes)).toEqual([
       { stageId: "map", outcome: "completed" },
     ]);
+  });
+  it("gives an item its failed verdict at once when the model call throws NonRetryableError", async () => {
+    const workflow = mapWorkflow("map-non-retryable", {
+      realtime: { retries: 3, concurrency: 1 },
+    });
+    const harness = createTestHarness({ workflows: [workflow] });
+    harness.mockAi.setTextResponse("process", { text: "processed" });
+    harness.mockAi.failOnce("process a", new NonRetryableError("key revoked"));
+
+    const result = await harness.run("map-non-retryable", {
+      items: ["a", "b"],
+    });
+
+    // Three in-process retries were available and none was spent.
+    expect(result.status).toBe("COMPLETED");
+    const [a, b] = results(result.output);
+    expect(a).toMatchObject({
+      status: "failed",
+      error: "key revoked",
+      errorName: "NonRetryableError",
+      attempts: 1,
+    });
+    expect(b?.status).toBe("succeeded");
   });
   it("paces each concurrency slot with realtime.minDelayMs", async () => {
     const workflow = mapWorkflow("map-min-delay", {

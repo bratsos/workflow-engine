@@ -10,6 +10,34 @@ export class IdempotencyInProgressError extends Error {
   }
 }
 
+const JOB_TARGET_MISSING: unique symbol = Symbol.for(
+  "@bratsos/workflow-engine/job-target-missing",
+) as typeof JOB_TARGET_MISSING;
+
+/**
+ * Thrown by `job.execute` when the job's workflow, stage or run does not
+ * exist: the queue row is an orphan, and a host acknowledges it as dead.
+ * Hosts recognise it by its brand, never by its text, so an executor error
+ * that happens to read the same way is not taken for one.
+ */
+export class JobTargetMissingError extends Error {
+  readonly [JOB_TARGET_MISSING] = true as const;
+
+  constructor(message: string) {
+    super(message);
+    this.name = "JobTargetMissingError";
+  }
+}
+
+/** Detect a {@link JobTargetMissingError} across duplicated package bundles. */
+export function isJobTargetMissingError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    (error as { [JOB_TARGET_MISSING]?: unknown })[JOB_TARGET_MISSING] === true
+  );
+}
+
 /** Thrown when a stage asks for AI without kernel AI services configured. */
 export class AIServicesNotConfiguredError extends Error {
   constructor() {

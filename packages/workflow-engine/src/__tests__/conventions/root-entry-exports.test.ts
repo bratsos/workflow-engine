@@ -14,4 +14,19 @@ describe("root entry exports", () => {
     expect(typeof root.StepNotReplaySafeError).toBe("function");
     expect(typeof root.StepLeaseLostError).toBe("function");
   });
+
+  it("exports NonRetryableError and a cross-bundle check for it", () => {
+    const error = new root.NonRetryableError("card revoked", {
+      cause: new Error("402"),
+    });
+    expect(error).toBeInstanceOf(Error);
+    expect(error.name).toBe("NonRetryableError");
+    expect(root.isNonRetryableError(error)).toBe(true);
+    // A copy from another bundle carries the same registered brand.
+    const brand = Object.getOwnPropertySymbols(error)[0]!;
+    expect(root.isNonRetryableError({ [brand]: true })).toBe(true);
+    expect(root.isNonRetryableError(new Error("NonRetryableError: x"))).toBe(
+      false,
+    );
+  });
 });

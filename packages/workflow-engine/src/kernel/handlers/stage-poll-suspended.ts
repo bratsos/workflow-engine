@@ -21,11 +21,7 @@
  */
 
 import type { CheckCompletionContext, Stage } from "../../core/stage";
-import {
-  DURABLE_SUSPEND_MARKER,
-  StepNotReplaySafeError,
-  StepTimeoutError,
-} from "../../core/steps.js";
+import { DURABLE_SUSPEND_MARKER, StepTimeoutError } from "../../core/steps.js";
 import {
   isSuspendedResult,
   type StageResult,
@@ -48,6 +44,7 @@ import {
   createStepApi,
   createStorageShim,
   defineLazyAIContext,
+  describeStageError,
   failStageAndRun,
   HOST_DEFAULTS,
   handleClaimOutcome,
@@ -190,17 +187,122 @@ async function replayAttemptBudget(
   const job = jobs.find(
     (j) => j.stageId === stageRecord.stageId && j.status === "SUSPENDED",
   );
-  const spent = (
-    stageRecord.suspendedState as {
-      metadata?: Record<string, unknown>;
-    } | null
-  )?.metadata?.[REPLAY_FAILURES_KEY];
-  const failures = typeof spent === "number" ? spent : 0;
+  const failures = failedReplays(stageRecord);
   return {
     attempt: (job?.attempt ?? 1) + failures,
     maxAttempts: job?.maxAttempts ?? HOST_DEFAULTS.maxAttempts,
     failures,
   };
+}
+
+/** The consecutive failures this suspension has retried so far. */
+function failedReplays(stageRecord: WorkflowStageRecord): number {
+  const spent = (
+    stageRecord.suspendedState as { metadata?: Record<string, unknown> } | null
+  )?.metadata?.[REPLAY_FAILURES_KEY];
+  return typeof spent === "number" ? spent : 0;
+}
+
+/** `suspendedState` with the failure streak removed. */
+function withoutReplayFailures(stageRecord: WorkflowStageRecord): object {
+  const state = stageRecord.suspendedState as {
+    metadata?: Record<string, unknown>;
+  };
+  const { [REPLAY_FAILURES_KEY]: _spent, ...metadata } = state.metadata ?? {};
+  return { ...state, metadata };
+}
+
+/**
+ * A throw from a suspended stage's replay or from its `checkCompletion` is
+ * retried exactly as `job.execute` retries a throwing body: the same
+ * classifier (`isRetryableStageError`) and the same attempt budget. Returns
+ * undefined when the error is not retried, so the caller fails the stage.
+ *
+ * The stage stays SUSPENDED with its claim written back as a short backoff,
+ * so the next poll runs it again as attempt + 1. `expectedVersion` fences
+ * the write on the stage version the poller's claim left: a stage written
+ * since (completed by a job, cancelled, claimed again) is not this poller's
+ * to retry, and the claimed transaction rolls back as stale.
+ */
+async function retrySuspendedStage(
+  error: unknown,
+  stageRecord: WorkflowStageRecord,
+  run: WorkflowRunRecord,
+  annotationBuffer: { flush(): CreateAnnotationInput[] } | undefined,
+  deps: KernelDeps,
+  expectedVersion?: number,
+): Promise<"retrying" | "skip" | undefined> {
+  if (!isRetryableStageError(error)) return undefined;
+  const budget = await replayAttemptBudget(stageRecord, deps);
+  if (
+    !willRetryStage({
+      attempt: budget.attempt,
+      maxAttempts: budget.maxAttempts,
+      retryable: true,
+    })
+  ) {
+    return undefined;
+  }
+  const message = describeStageError(error);
+  const annotations = annotationBuffer?.flush() ?? [];
+  const metadata = (
+    stageRecord.suspendedState as {
+      metadata?: Record<string, unknown>;
+    } | null
+  )?.metadata;
+  const claimResult = await withClaimedRun(
+    stageRecord.workflowRunId,
+    run.version,
+    deps,
+    async (tx) => {
+      await tx.updateStage(stageRecord.id, {
+        attempt: stageRecord.attempt + 1,
+        errorMessage: message,
+        nextPollAt: new Date(
+          deps.clock.now().getTime() + retryBackoffMs(budget.attempt),
+        ),
+        suspendedState: {
+          ...(stageRecord.suspendedState as object),
+          metadata: {
+            ...metadata,
+            [REPLAY_FAILURES_KEY]: budget.failures + 1,
+          },
+        },
+        ...(expectedVersion !== undefined ? { expectedVersion } : {}),
+      });
+      if (annotations.length > 0) {
+        await tx.appendAnnotations(annotations);
+      }
+      await tx.appendOutboxEvents(
+        toOutboxEvents(stageRecord.workflowRunId, [
+          {
+            type: "stage:retrying",
+            timestamp: deps.clock.now(),
+            workflowRunId: stageRecord.workflowRunId,
+            stageId: stageRecord.stageId,
+            stageName: stageRecord.stageName,
+            attempt: budget.attempt,
+            maxAttempts: budget.maxAttempts,
+            error: message,
+          },
+          ...buildAnnotationEvents(annotations, deps.clock.now()),
+        ]),
+      );
+    },
+  );
+  if (await handleClaimOutcome(claimResult, stageRecord, deps)) return "skip";
+  await deps.persistence
+    .createLog({
+      workflowRunId: stageRecord.workflowRunId,
+      workflowStageId: stageRecord.id,
+      level: "WARN",
+      message: `${message} (attempt ${budget.attempt} of ${budget.maxAttempts}; retry pending)`,
+    })
+    .catch(() => {});
+  // After the commit: the retry is on record before a step is re-opened,
+  // so a crash in between costs one attempt, never an uncounted rerun.
+  await reopenFailedSteps(stageRecord.id, deps);
+  return "retrying";
 }
 
 /**
@@ -560,89 +662,15 @@ async function replayStage(
     );
     return "resumed";
   } catch (error) {
-    const message = toErrorMessage(error);
-    // An expired wait and a step that refuses to be replayed are final
-    // verdicts on this suspension; any other throw is retried exactly as
-    // `job.execute` retries it (same classifier, same attempt budget).
-    const retryable =
-      isRetryableStageError(error) &&
-      !(
-        error instanceof StepTimeoutError ||
-        error instanceof StepNotReplaySafeError
-      );
-    const budget = retryable
-      ? await replayAttemptBudget(stageRecord, deps)
-      : null;
-    if (
-      budget &&
-      willRetryStage({
-        attempt: budget.attempt,
-        maxAttempts: budget.maxAttempts,
-        retryable,
-      })
-    ) {
-      const annotations = built?.annotationBuffer.flush() ?? [];
-      const metadata = (
-        stageRecord.suspendedState as {
-          metadata?: Record<string, unknown>;
-        } | null
-      )?.metadata;
-      // The stage stays SUSPENDED with its claim written back as a short
-      // backoff: the next poll replays it, ledger kept, as attempt + 1.
-      const claimResult = await withClaimedRun(
-        stageRecord.workflowRunId,
-        run.version,
-        deps,
-        async (tx) => {
-          await tx.updateStage(stageRecord.id, {
-            attempt: stageRecord.attempt + 1,
-            errorMessage: message,
-            nextPollAt: new Date(
-              deps.clock.now().getTime() + retryBackoffMs(budget.attempt),
-            ),
-            suspendedState: {
-              ...(stageRecord.suspendedState as object),
-              metadata: {
-                ...metadata,
-                [REPLAY_FAILURES_KEY]: budget.failures + 1,
-              },
-            },
-          });
-          if (annotations.length > 0) {
-            await tx.appendAnnotations(annotations);
-          }
-          await tx.appendOutboxEvents(
-            toOutboxEvents(stageRecord.workflowRunId, [
-              {
-                type: "stage:retrying",
-                timestamp: deps.clock.now(),
-                workflowRunId: stageRecord.workflowRunId,
-                stageId: stageRecord.stageId,
-                stageName: stageRecord.stageName,
-                attempt: budget.attempt,
-                maxAttempts: budget.maxAttempts,
-                error: message,
-              },
-              ...buildAnnotationEvents(annotations, deps.clock.now()),
-            ]),
-          );
-        },
-      );
-      if (await handleClaimOutcome(claimResult, stageRecord, deps))
-        return "skip";
-      await deps.persistence
-        .createLog({
-          workflowRunId: stageRecord.workflowRunId,
-          workflowStageId: stageRecord.id,
-          level: "WARN",
-          message: `${message} (attempt ${budget.attempt} of ${budget.maxAttempts}; retry pending)`,
-        })
-        .catch(() => {});
-      // After the commit: the retry is on record before a step is re-opened,
-      // so a crash in between costs one attempt, never an uncounted rerun.
-      await reopenFailedSteps(stageRecord.id, deps);
-      return "retrying";
-    }
+    const message = describeStageError(error);
+    const retried = await retrySuspendedStage(
+      error,
+      stageRecord,
+      run,
+      built?.annotationBuffer,
+      deps,
+    );
+    if (retried) return retried;
     const claimResult = await failStageAndRun(
       stageRecord,
       run,
@@ -1073,6 +1101,14 @@ export async function handleStagePollSuspended(
           async (tx) => {
             await tx.updateStage(stageRecord.id, {
               nextPollAt,
+              // A poll that answered cleanly ends a streak of retried
+              // throws and retires the error it was retrying.
+              ...(failedReplays(stageRecord) > 0
+                ? {
+                    errorMessage: null,
+                    suspendedState: withoutReplayFailures(stageRecord),
+                  }
+                : {}),
             });
 
             if (bufferedAnnotations.length > 0) {
@@ -1084,10 +1120,25 @@ export async function handleStagePollSuspended(
         if (await skipAfterClaim(claimResult)) continue;
       }
     } catch (error) {
-      // Unexpected error during checkCompletion. Flush any annotations
-      // recorded before the throw so they persist alongside the FAILED
-      // outcome.
-      const message = toErrorMessage(error);
+      // A throwing checkCompletion is retried as a throwing replay is (same
+      // classifier, same budget), fenced on the claim's stage version. An
+      // explicit `checkResult.error` never reaches here: it stays terminal.
+      const retried = await retrySuspendedStage(
+        error,
+        stageRecord,
+        run,
+        annotationBuffer,
+        deps,
+        stageRecord.version,
+      );
+      if (retried === "skip") {
+        await releaseStageClaim(stageRecord, deps);
+        continue;
+      }
+      if (retried) continue;
+      // Not retried: flush any annotations recorded before the throw so
+      // they persist alongside the FAILED outcome.
+      const message = describeStageError(error);
       const claimResult = await failStageAndRun(
         stageRecord,
         run,

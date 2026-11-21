@@ -5,20 +5,11 @@
  * throw gets the same treatment" true by construction.
  */
 
-import { ZodError } from "zod";
-import { isDuplicateStepKeyError } from "../../core/steps.js";
 import type { KernelDeps } from "../kernel.js";
 import { HOST_DEFAULTS } from "./host-support.js";
+import { readStepFailure } from "./stage-error-class.js";
 
-/**
- * `false` for an error that will fail identically on every attempt: Zod
- * input/config validation (the same rawInput fails the same way) and a
- * duplicate durable step key (a collision between two call sites in the
- * stage body). Hosts must not burn attempts on those.
- */
-export function isRetryableStageError(error: unknown): boolean {
-  return !(error instanceof ZodError || isDuplicateStepKeyError(error));
-}
+export { isRetryableStageError } from "./stage-error-class.js";
 
 /**
  * Whether a failed attempt is retried: the error is not deterministic and
@@ -46,7 +37,10 @@ export function willRetryStage(options: {
  * `failed attempt 3` re-runs as attempt 4), so the ledger keeps the
  * per-step history. The failure text stays on `error` until the re-run
  * overwrites it. Waits, signals and sleeps that failed (a deadline that
- * passed) are terminal and stay so.
+ * passed) are terminal and stay so, and so is a `run` step whose failure was
+ * recorded as a final verdict (a `NonRetryableError`, a `retryIf` that said
+ * no, any error the stage classifier rejects, a refused replay): the replay
+ * answers it with the same error.
  */
 export async function reopenFailedSteps(
   stageRecordId: string,
@@ -57,6 +51,7 @@ export async function reopenFailedSteps(
   const rows = await ledger.list(stageRecordId);
   for (const row of rows) {
     if (row.status !== "failed" || row.kind !== "run") continue;
+    if (readStepFailure(row)?.final) continue;
     await ledger.compareAndSet(
       stageRecordId,
       row.stepId,

@@ -25,7 +25,10 @@
 
 import { isSuspendedResult } from "../../core/types";
 import type { JobExecuteCommand, JobExecuteResult } from "../commands";
-import { DefinitionVersionMismatchError } from "../errors.js";
+import {
+  DefinitionVersionMismatchError,
+  JobTargetMissingError,
+} from "../errors.js";
 import type { KernelEvent } from "../events";
 import { assertServesRun } from "../helpers/definition-pinning.js";
 import { HOST_DEFAULTS } from "../helpers/host-support.js";
@@ -62,14 +65,19 @@ export async function handleJobExecute(
 
   const workflow = deps.registry.getWorkflow(workflowId);
   if (!workflow)
-    throw new Error(`Workflow ${workflowId} not found in registry`);
+    throw new JobTargetMissingError(
+      `Workflow ${workflowId} not found in registry`,
+    );
 
   const stageDef = workflow.getStage(stageId);
   if (!stageDef)
-    throw new Error(`Stage ${stageId} not found in workflow ${workflowId}`);
+    throw new JobTargetMissingError(
+      `Stage ${stageId} not found in workflow ${workflowId}`,
+    );
 
   const workflowRun = await deps.persistence.getRun(workflowRunId);
-  if (!workflowRun) throw new Error(`WorkflowRun ${workflowRunId} not found`);
+  if (!workflowRun)
+    throw new JobTargetMissingError(`WorkflowRun ${workflowRunId} not found`);
 
   // Definition pinning: a run resolves against the definition it started
   // under. This build presenting a different structure means the job

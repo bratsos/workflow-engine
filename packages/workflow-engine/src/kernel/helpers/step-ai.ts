@@ -42,6 +42,7 @@ import {
 } from "../../core/step-ai";
 import {
   isDuplicateStepKeyError,
+  isNonRetryableError,
   isStepControlFlowError,
   parseStepDuration,
   type StepApi,
@@ -618,6 +619,10 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
         error: unknown,
       ): Promise<"repair" | "retry" | AiMapResult<TOut>> {
         if (isStepControlFlowError(error)) throw error;
+        // The call said a retry cannot succeed: no retry, no repair.
+        if (isNonRetryableError(error)) {
+          return failed(errorMessage(error), error.name);
+        }
         const failure = asGenerationFailure(error);
         if (failure) {
           feedback = failure;

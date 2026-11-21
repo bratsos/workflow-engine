@@ -18,7 +18,24 @@ import {
   defineStage,
 } from "../../core/stage-factory.js";
 import { WorkflowBuilder } from "../../core/workflow.js";
+import { HOST_DEFAULTS } from "../../kernel/helpers/host-support.js";
+import type { Kernel } from "../../kernel/kernel.js";
+import type { FakeClock } from "../../kernel/testing/fake-clock.js";
 import { createTestKernel } from "../utils/index.js";
+
+/**
+ * Polls until the attempts a throwing `checkCompletion` is given are spent
+ * (the host default budget: no job row here), and returns how many stages
+ * the polls failed. A throw is retried, not failed, until then.
+ */
+async function pollThroughRetries(kernel: Kernel, clock: FakeClock) {
+  let failed = 0;
+  for (let i = 0; i < HOST_DEFAULTS.maxAttempts; i++) {
+    clock.advance(60_000);
+    failed += (await kernel.dispatch({ type: "stage.pollSuspended" })).failed;
+  }
+  return failed;
+}
 
 describe("I want to handle failures in async-batch stages", () => {
   describe("checkCompletion error handling via stage.pollSuspended", () => {
@@ -293,9 +310,8 @@ describe("I want to handle failures in async-batch stages", () => {
         nextPollAt: new Date(clock.now().getTime() - 1000),
       });
 
-      // Poll -> checkCompletion throws
-      const pollResult = await kernel.dispatch({ type: "stage.pollSuspended" });
-      expect(pollResult.failed).toBe(1);
+      // Poll -> checkCompletion throws, until its attempts are spent
+      expect(await pollThroughRetries(kernel, clock)).toBe(1);
 
       const updatedStages = await persistence.getStagesByRun(
         createResult.workflowRunId,
@@ -774,9 +790,8 @@ describe("I want to handle failures in async-batch stages", () => {
         nextPollAt: new Date(clock.now().getTime() - 1000),
       });
 
-      // Poll -> checkCompletion throws
-      const pollResult = await kernel.dispatch({ type: "stage.pollSuspended" });
-      expect(pollResult.failed).toBe(1);
+      // Poll -> checkCompletion throws, until its attempts are spent
+      expect(await pollThroughRetries(kernel, clock)).toBe(1);
 
       // Run should be FAILED
       const run = await persistence.getRun(createResult.workflowRunId);
@@ -856,8 +871,8 @@ describe("I want to handle failures in async-batch stages", () => {
         nextPollAt: new Date(clock.now().getTime() - 1000),
       });
 
-      // Poll -> checkCompletion throws
-      await kernel.dispatch({ type: "stage.pollSuspended" });
+      // Poll -> checkCompletion throws, until its attempts are spent
+      await pollThroughRetries(kernel, clock);
 
       // Stage record should have error details
       const updatedStages = await persistence.getStagesByRun(

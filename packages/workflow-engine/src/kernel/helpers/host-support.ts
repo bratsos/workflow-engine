@@ -17,6 +17,7 @@ import type {
   ServedDefinition,
 } from "../../persistence/interface.js";
 import type { EventSinkStatus, OutboxFlushResult } from "../commands.js";
+import { isJobTargetMissingError } from "../errors.js";
 import type { Kernel } from "../kernel.js";
 import type { JobTransport } from "../ports.js";
 import { toErrorMessage } from "./error-message.js";
@@ -153,9 +154,6 @@ export interface ExecuteJobOutcome {
   deferred?: boolean;
 }
 
-const DEAD_JOB_PATTERN =
-  /^(WorkflowRun .* not found|Workflow .* not found in registry|Stage .* not found in workflow)/;
-
 const JobMessageSchema = z.object({
   jobId: z.string().min(1),
   workflowRunId: z.string().min(1),
@@ -266,7 +264,7 @@ export async function executeJobWithHeartbeat(
     // return instead of throwing — for a consumer that runs a whole tick
     // inside one transaction, a throw here aborted every other job.
     const message = error instanceof Error ? error.message : String(error);
-    if (!DEAD_JOB_PATTERN.test(message)) throw error;
+    if (!isJobTargetMissingError(error)) throw error;
     console.error(
       `${logPrefix} dead job ${job.jobId} (run ${job.workflowRunId}, stage ${job.stageId}): ${message}`,
     );

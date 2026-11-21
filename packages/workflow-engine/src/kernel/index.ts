@@ -101,6 +101,7 @@ export {
   executeJobWithHeartbeat,
   HOST_DEFAULTS,
   type HostJobMessage,
+  isRetryableStageError,
   loadWorkflowContext,
   type MaintenanceTickCounts,
   normalizeAnnotateArgs,

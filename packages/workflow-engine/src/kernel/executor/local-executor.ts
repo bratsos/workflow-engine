@@ -36,9 +36,10 @@ export function createLocalExecutor(): ActivityExecutor {
         };
       } catch (e) {
         const error = toErrorMessage(e);
-        // A deterministic error (Zod validation, a duplicate durable step
-        // key) is marked non-retryable rather than let hosts burn retry
-        // attempts on a doomed job.
+        // An error retrying cannot change (a Zod error, a duplicate durable
+        // step key, a NonRetryableError, an expired wait, a refused replay)
+        // is marked non-retryable rather than let hosts burn retry attempts
+        // on a doomed job.
         const retryable = isRetryableStageError(e) ? undefined : false;
         return {
           error,
