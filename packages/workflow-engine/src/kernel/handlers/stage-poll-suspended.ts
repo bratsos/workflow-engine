@@ -187,9 +187,12 @@ async function replayAttemptBudget(
   const jobs = await deps.jobTransport.getJobsByWorkflowRun(
     stageRecord.workflowRunId,
   );
-  const job = jobs.find(
-    (j) => j.stageId === stageRecord.stageId && j.status === "SUSPENDED",
-  );
+  // The SUSPENDED row, or the RUNNING one whose suspension the host has
+  // not acknowledged yet: either carries the delivery's real budget.
+  const ofStage = jobs.filter((j) => j.stageId === stageRecord.stageId);
+  const job =
+    ofStage.find((j) => j.status === "SUSPENDED") ??
+    ofStage.find((j) => j.status === "RUNNING");
   const spent = (
     stageRecord.suspendedState as {
       metadata?: Record<string, unknown>;
@@ -645,6 +648,8 @@ async function replayStage(
           await tx.updateStage(stageRecord.id, {
             attempt: stageRecord.attempt + 1,
             errorMessage: message,
+            // A job that finished the stage meanwhile keeps its outcome.
+            expectedVersion: stageRecord.version,
             nextPollAt: new Date(
               deps.clock.now().getTime() + retryBackoffMs(budget.attempt),
             ),

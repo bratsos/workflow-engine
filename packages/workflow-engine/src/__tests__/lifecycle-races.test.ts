@@ -514,7 +514,128 @@ describe(`lifecycle races on ${realDatabase ? (sqlite ? "SQLite" : "Postgres") :
         ),
       ).toEqual([]);
     });
+
+    it.each([
+      "with a retry left",
+      "on its last attempt",
+    ] as const)("a durable replay that throws after a completed job, %s", async (budget) => {
+      const held = gate();
+      const durable = signalWorkflow(async (call) => {
+        if (call === 2) {
+          await held.pause();
+          throw new Error("stale replay");
+        }
+        return { output: { winner: "job" } };
+      });
+      const { send, runId, execute } = await suspendOnSignal(
+        durable,
+        budget === "on its last attempt" ? 1 : 3,
+      );
+      const poll = send({ type: "stage.pollSuspended" });
+      await held.reached;
+      await expect(execute()).resolves.toMatchObject({ outcome: "completed" });
+      const winner = await ports.persistence.getStage(runId, "s");
+      held.open();
+
+      await expect(poll).resolves.toMatchObject({ resumed: 0, failed: 0 });
+      expect(await ports.persistence.getStage(runId, "s")).toEqual(winner);
+      expect((await ports.persistence.getRun(runId))?.status).toBe("RUNNING");
+      const events = (await ports.persistence.getUnpublishedOutboxEvents(1000))
+        .filter((e) => e.workflowRunId === runId)
+        .map((e) => e.eventType);
+      expect(events).not.toContain("stage:retrying");
+      expect(events).not.toContain("stage:failed");
+    });
   });
+
+  it("spends the real budget of a job whose suspension the host has not acknowledged", async () => {
+    const durable = signalWorkflow(async (call) => {
+      if (call === 2) throw new Error("temporary");
+      return { output: { call } };
+    });
+    // The job is dequeued (RUNNING) with one attempt and never acknowledged.
+    const { send, runId } = await suspendOnSignal(durable, 1);
+    expect(
+      (await ports.jobTransport.getJobsByWorkflowRun(runId))[0]?.status,
+    ).toBe("RUNNING");
+
+    await send({ type: "stage.pollSuspended" });
+    expect((await ports.persistence.getStage(runId, "s"))?.status).toBe(
+      "FAILED",
+    );
+    expect((await ports.persistence.getRun(runId))?.status).toBe("FAILED");
+    expect(durable.calls()).toBe(2);
+  });
+
+  /** One durable stage that waits for signal "go"; `after` runs once it arrives. */
+  function signalWorkflow(after: (call: number) => Promise<unknown>) {
+    let calls = 0;
+    return {
+      calls: () => calls,
+      workflow: new WorkflowBuilder(
+        "lifecycle-signal",
+        "Lifecycle signal",
+        "lifecycle-signal",
+        schema,
+        z.any(),
+      )
+        .pipe(
+          defineStage({
+            id: "s",
+            name: "S",
+            schemas: { input: schema, output: z.any(), config: schema },
+            async execute(ctx) {
+              const call = ++calls;
+              await ctx.step.waitForSignal("go", { timeout: "1h" });
+              return (await after(call)) as never;
+            },
+          }),
+        )
+        .build(),
+    };
+  }
+
+  /**
+   * Creates and claims a run, dequeues its job with `maxAttempts`, runs that
+   * delivery to its suspension (the row stays RUNNING) and signals it.
+   */
+  async function suspendOnSignal(
+    durable: ReturnType<typeof signalWorkflow>,
+    maxAttempts: number,
+  ) {
+    const send = kernel({ registry: { getWorkflow: () => durable.workflow } });
+    if (!db) {
+      (ports.jobTransport as InMemoryJobQueue).setDefaultMaxAttempts(
+        maxAttempts,
+      );
+    }
+    const runId = await createClaimed(send);
+    if (db) {
+      await (db.client as any).jobQueue.updateMany({ data: { maxAttempts } });
+    }
+    const delivery = (await ports.jobTransport.dequeue())!;
+    const execute = (extra: Record<string, unknown> = {}) =>
+      send({
+        type: "job.execute",
+        workflowRunId: runId,
+        workflowId: durable.workflow.id,
+        stageId: "s",
+        config: {},
+        ...extra,
+      });
+    await execute({
+      attempt: delivery.attempt,
+      maxAttempts: delivery.maxAttempts,
+    });
+    await send({
+      type: "step.signal",
+      workflowRunId: runId,
+      stageId: "s",
+      stepId: "go",
+      payload: true,
+    });
+    return { send, runId, execute };
+  }
 
   it("lets run.purge finish the ledger clear of records a restart deleted when its own clear failed", async () => {
     const external = new InMemoryStepLedger();
