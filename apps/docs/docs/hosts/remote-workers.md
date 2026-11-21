@@ -175,7 +175,7 @@ Bumping `stageCodeVersion` acts as a deploy barrier. If a task was suspended usi
 ### Failures and retries
 A stage that throws on a worker is reported as a failed outcome carrying the message, the error's `name` and the worker's retry verdict. The worker reaches the verdict with the kernel's own classifier: a `NonRetryableError`, a Zod error (from any copy of zod) and the other errors retrying cannot change are reported `retryable: false`. Through the `ActivityExecutor` port, the `RemoteExecutor` hands both to `job.execute`, so the job is not retried and the stage records the same text a local stage would (`"QuotaError: over quota"`). A stage input that fails validation on the orchestrator is non-retryable too, as with `LocalExecutor`.
 
-Both fields are optional on the wire. A report without them (a worker from an earlier release) is retryable and records the bare message, as before, and a broker from an earlier release drops them. A proxy stage built with `defineRemoteStage` fails the run on any failed outcome, retryable or not: its `checkCompletion` returns the failure as `{ error }`, which is terminal.
+Both fields are optional on the wire. A report without them (a worker from an earlier release) is retryable and records the bare message, as before, and a broker from an earlier release drops them. A proxy stage built with `defineRemoteStage` fails the run on any failed outcome, retryable or not: its `checkCompletion` returns the failure as `{ error }`, which is terminal, under the error's name when the message is empty.
 
 ### What the worker's stage context carries
 The activity worker builds the stage context by hand, so a stage that runs remotely gets the full `StageContext` contract with these limits:

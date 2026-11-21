@@ -182,10 +182,9 @@ async checkCompletion(suspendedState, ctx) {
       error: `Batch ${batchId} failed`,
     };
   }
-  // A *thrown* error (a 503 from the status endpoint) is retried like a
-  // throwing stage body: the next poll calls checkCompletion again after a
-  // 2^attempt s backoff, within the job's attempts; only consecutive throws
-  // count. Throw NonRetryableError (or let a Zod error escape) to fail at once.
+  // A *thrown* error fails the stage and the run on this poll too: it is not
+  // retried. Catch a transient status error (a 503) and return
+  // { ready: false } to poll again.
 
   // ===================
   // Completed
