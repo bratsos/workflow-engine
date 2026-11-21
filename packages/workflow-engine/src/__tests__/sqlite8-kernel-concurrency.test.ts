@@ -1,3 +1,4 @@
+import { AsyncResource } from "node:async_hooks";
 import { createRequire } from "node:module";
 import {
   afterAll,
@@ -1085,6 +1086,166 @@ describe
         }
       } finally {
         await sql("ROLLBACK");
+      }
+    }, 30_000);
+
+    it("holds engine writes without blocking the event loop when another root's raw transaction starts writing, and resumes them in call order after it commits", async () => {
+      const [, other, writer] = open(3);
+      const native = roots.at(-2) as any;
+      const sql = rawOn(native);
+      // A raw transaction on the other root, read-only so far, opened before
+      // the adapter's first call there.
+      await sql("BEGIN");
+      await native
+        .query(
+          native.raw
+            .sql(["SELECT id FROM workflow_runs"])
+            .returnsRow({ id: "sqlite/text@1" })
+            .build(),
+        )
+        .toArray();
+      await other!.persistence.getRun("warm");
+      const ids = Array.from(
+        { length: 20 },
+        (_, i) => `q-${String(i).padStart(2, "0")}`,
+      );
+      // Bound to this context: the consumer's call, not part of the engine
+      // turn whose statement triggers it below.
+      const insert = AsyncResource.bind(() =>
+        sql(
+          `INSERT INTO workflow_runs (id, "workflowId", "workflowName", "workflowType", input, status, priority, "createdAt", "updatedAt") VALUES ('a-raw', 'w', 'w', 't', '{}', 'PENDING', 5, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`,
+        ),
+      );
+      // It writes the moment the first engine write has checked the write
+      // lock (its last step restores the busy timeout): the race to lose.
+      let inserted: Promise<unknown> | undefined;
+      let armed = false;
+      const { StatementSync } = createRequire(import.meta.url)("node:sqlite");
+      const methods = ["all", "get", "run", "iterate"] as const;
+      const originals = methods.map((m) => StatementSync.prototype[m]);
+      methods.forEach((m, k) => {
+        StatementSync.prototype[m] = function (this: any, ...args: unknown[]) {
+          const result = originals[k].apply(this, args);
+          const text = String(this.sourceSQL);
+          if (text === "PRAGMA busy_timeout = 0") armed = true;
+          else if (armed && !inserted && /^PRAGMA busy_timeout = /.test(text))
+            inserted = insert();
+          return result;
+        };
+      });
+      await writer!.persistence.getRun("warm");
+      let commit: ReturnType<typeof setTimeout> | undefined;
+      const { result, late } = await loopDelay(async () => {
+        const writes = ids.map((id) =>
+          writer!.client.workflowRun.create({
+            data: {
+              id,
+              workflowId: "w",
+              workflowName: "w",
+              workflowType: "t",
+              status: "PENDING",
+              input: {},
+            },
+          }),
+        );
+        // A rollback journal never checks the lock (a reader holds a commit
+        // back): there it writes once the engine writes are queued.
+        await new Promise((resolve) => setImmediate(resolve));
+        if (mode === "delete") inserted = insert();
+        commit = setTimeout(() => void sql("COMMIT"), 300);
+        return await Promise.all(writes).finally(() =>
+          methods.forEach((m, k) => {
+            StatementSync.prototype[m] = originals[k];
+          }),
+        );
+      });
+      const raw = await inserted!.then(
+        () => "ok",
+        (error: Error) => error.message,
+      );
+      clearTimeout(commit);
+      expect(result.status).toBe("fulfilled");
+      // A write that lost the race used to wait its busy timeout synchronously
+      // (5.2 s); a single statement on a loaded disk can take about 2 s.
+      expect(late).toBeLessThan(2_500);
+      const other2 = new DatabaseSync(db.file);
+      try {
+        const stored = other2
+          .prepare("SELECT id FROM workflow_runs ORDER BY rowid")
+          .all()
+          .map((row: { id: string }) => row.id);
+        // In WAL a read transaction cannot write once another connection has
+        // committed (SQLITE_BUSY_SNAPSHOT), as without this layer; otherwise
+        // its row commits with it.
+        if (raw === "ok") expect(stored).toContain("a-raw");
+        else expect(raw).toMatch(/database is locked/);
+        expect(stored.filter((id: string) => id !== "a-raw")).toEqual(ids);
+      } finally {
+        other2.close();
+      }
+    }, 30_000);
+
+    it("resumes engine writes held back by another root's raw transaction in call order", async () => {
+      const [, other, writer] = open(3);
+      const sql = rawOn(roots.at(-2));
+      await sql("BEGIN IMMEDIATE");
+      await sql(`UPDATE "workflow_runs" SET priority = 7`);
+      await other!.persistence.getRun("warm");
+      await writer!.persistence.getRun("warm");
+      const create = (id: string) =>
+        writer!.client.workflowRun.create({
+          data: {
+            id,
+            workflowId: "w",
+            workflowName: "w",
+            workflowType: "t",
+            status: "PENDING",
+            input: {},
+          },
+        });
+      const ids = ["w-0", "w-1", "w-2", "w-3", "w-4"];
+      // The transaction ends while a held write is looking at the lock: the
+      // others must not overtake it. (Without such looks, a timer ends it.)
+      const commitNow = AsyncResource.bind(() => sql("COMMIT"));
+      let armed = false;
+      let committed: Promise<unknown> | undefined;
+      const { StatementSync } = createRequire(import.meta.url)("node:sqlite");
+      const methods = ["all", "get", "run", "iterate"] as const;
+      const originals = methods.map((m) => StatementSync.prototype[m]);
+      methods.forEach((m, k) => {
+        StatementSync.prototype[m] = function (this: any, ...args: unknown[]) {
+          if (armed && !committed && this.sourceSQL === "PRAGMA journal_mode")
+            committed = commitNow();
+          return originals[k].apply(this, args);
+        };
+      });
+      const timer = setTimeout(() => {
+        committed ??= commitNow();
+      }, 400);
+      try {
+        // A delegate call runs when awaited, as Prisma's: start each now.
+        const writes = ids.map((id) => create(id).then((run: unknown) => run));
+        // Past every write's first look, so the end meets one of the later ones.
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        armed = true;
+        await Promise.all(writes);
+        await committed;
+      } finally {
+        clearTimeout(timer);
+        methods.forEach((m, k) => {
+          StatementSync.prototype[m] = originals[k];
+        });
+      }
+      const reader = new DatabaseSync(db.file);
+      try {
+        expect(
+          reader
+            .prepare("SELECT id FROM workflow_runs ORDER BY rowid")
+            .all()
+            .map((row: { id: string }) => row.id),
+        ).toEqual(ids);
+      } finally {
+        reader.close();
       }
     }, 30_000);
 

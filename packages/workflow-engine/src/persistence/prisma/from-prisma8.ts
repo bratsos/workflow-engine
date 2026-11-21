@@ -748,7 +748,7 @@ interface ReadGate {
    * Set while the root connection is inside a transaction this layer did not
    * open (a raw BEGIN sent before the takeover): `ended` settles when it ends.
    */
-  foreign?: { ended: Promise<void>; end: () => void };
+  foreign?: Foreign;
   /** Reads the root's transaction state again (`ownRootConnection`). */
   recheck?: () => Promise<void>;
   /**
@@ -763,6 +763,13 @@ interface ReadGate {
   left?: boolean;
   /** Removes the gate from its file, and the file once no root is left. */
   leave?: () => void;
+}
+/** A transaction this layer did not open, on a root connection. */
+interface Foreign {
+  ended: Promise<void>;
+  end: () => void;
+  /** One of its statements may have written (`ownRootConnection`). */
+  wrote?: boolean;
 }
 const readGates = new WeakMap<object, ReadGate>();
 
@@ -779,51 +786,112 @@ function gateOf(x: object): ReadGate | undefined {
 const READ_WAIT_MS = 5000;
 
 /**
- * An engine write on a root connection that is inside a transaction this
- * layer did not open waits for that transaction to end, outside the write
- * queue so the consumer can still end it, for at most READ_WAIT_MS, and then
- * fails with this busy-class error. Joining it instead would let the
- * consumer's ROLLBACK, or a close without COMMIT, undo a write already
- * acknowledged.
+ * An engine write while a root of this process on the file is inside a
+ * transaction this layer did not open (a raw BEGIN sent before the takeover).
+ * The write's own root: it waits for that transaction to end. Another root:
+ * it waits while that transaction can hold its commit back, that is on a
+ * rollback journal (a reader holds a commit back), or in WAL once it has
+ * written or while any connection holds the write lock. It decides in its own
+ * queue turn, and a statement of such a transaction that may write waits for
+ * the turn in progress (`ownRootConnection`), so no write starts between the
+ * check and the engine write. A held write leaves the queue and waits for the
+ * transaction's end, which releases the held writes in call order, for at
+ * most READ_WAIT_MS in all, and then fails with this busy-class error.
+ * Joining the transaction instead would let the consumer's ROLLBACK, or a
+ * close without COMMIT, undo a write already acknowledged.
  */
-async function untilOwnRoot(db: object): Promise<void> {
+async function writeOutsideForeign<T>(
+  db: object,
+  queue: WriteQueue,
+  work: () => Promise<T>,
+): Promise<T> {
   const gate = gateOf(db);
   await gate?.ready;
-  if (!gate) return;
+  if (!gate) return enqueue(queue, work);
+  const file = followQueue(queue);
   const end = Date.now() + READ_WAIT_MS;
+  // The parking this write holds a place in, if any.
+  let mine: Parked | undefined;
+  const leave = () => {
+    if (mine && --mine.writes === 0 && file.parked === mine)
+      file.parked = undefined;
+    mine = undefined;
+  };
+  const park = (parked: Parked) => {
+    mine = parked;
+    parked.writes++;
+  };
   for (;;) {
-    // Any root of this process on the file: a transaction there that holds the
-    // file's write lock would make this root's write wait synchronously.
-    const holder: ReadGate | undefined = [...(gate.file ?? [gate])].find(
-      (g) => g.foreign,
-    );
-    const open = holder?.foreign;
-    if (!holder || !open) return;
-    // In WAL a transaction of another root that has not written blocks no
-    // writer: go ahead once no connection holds the write lock.
-    const other = holder !== gate;
-    if (other && (await gate.writable?.())) return;
+    // While writes are parked, a later write parks behind them: they all
+    // wait on one promise and queue again in the order they parked, and the
+    // parking ends once the last of them is back in the queue.
+    if (file.parked && !mine) park(file.parked);
+    else {
+      let parked = false;
+      const result = await enqueue(queue, async () => {
+        if (mine) leave();
+        else if (file.parked) {
+          park(file.parked);
+          parked = true;
+          return undefined;
+        }
+        const held = await heldBy(gate);
+        if (!held) return work();
+        // In the turn, so the writes queued behind this one see it.
+        let mark = file.parked;
+        if (!mark || mark.over) {
+          const created: Parked = {
+            other: held.other,
+            over: false,
+            writes: 0,
+            done: held.open.ended.then(() => {
+              created.over = true;
+            }),
+          };
+          file.parked = mark = created;
+        }
+        park(mark);
+        parked = true;
+        return undefined;
+      });
+      if (!parked) return result as T;
+    }
+    const waiting = mine!;
     const left = end - Date.now();
-    if (left <= 0)
+    if (left <= 0) {
+      leave();
       throw Object.assign(
         new Error(
-          other
+          waiting.other
             ? "fromPrisma8: another SQLite root connection of this process on the same file (another client over the file) is inside a transaction this adapter did not open (a raw BEGIN sent through that client before the adapter's first call on it); the engine's write waited 5 s for it to end. COMMIT or ROLLBACK it, and open transactions with $transaction or db.transaction. In WAL only such a transaction that has written holds engine writes back"
             : "fromPrisma8: the SQLite root connection is inside a transaction this adapter did not open (a raw BEGIN sent through the client before the adapter's first call); the engine's write waited 5 s for it to end. COMMIT or ROLLBACK it, and open transactions with $transaction or db.transaction",
         ),
         { code: "SQLITE_BUSY", errcode: 5 },
       );
+    }
     let timer: ReturnType<typeof setTimeout> | undefined;
     await Promise.race([
-      open.ended,
+      waiting.done,
       new Promise<void>((resolve) => {
-        // Another root's transaction may stop holding the write lock without
-        // ending (WAL): look again shortly.
-        timer = setTimeout(resolve, other ? Math.min(left, 25) : left);
+        timer = setTimeout(resolve, left);
       }),
     ]);
     clearTimeout(timer);
   }
+}
+
+/** In a queue turn: the raw transaction that holds this root's write back, if any. */
+async function heldBy(
+  gate: ReadGate,
+): Promise<{ open: Foreign; other: boolean } | undefined> {
+  const holder: ReadGate | undefined = [...(gate.file ?? [gate])].find(
+    (g) => g.foreign,
+  );
+  const open = holder?.foreign;
+  if (!holder || !open) return undefined;
+  if (holder === gate) return { open, other: false };
+  if (open.wrote || !(await gate.writable?.())) return { open, other: true };
+  return undefined;
 }
 
 /**
@@ -1675,6 +1743,18 @@ interface WriteQueue {
   to?: WriteQueue;
   /** Turns queued and not yet settled (`enqueue`). */
   waiting?: number;
+  /** Set while engine writes wait for a raw transaction (`writeOutsideForeign`). */
+  parked?: Parked;
+}
+interface Parked {
+  /** Settles when the transaction that holds the writes back ends. */
+  done: Promise<void>;
+  /** `done` settled: a write held again starts a new parking. */
+  over: boolean;
+  /** That transaction is on another root of the file. */
+  other: boolean;
+  /** Writes holding a place in it and not yet queued again. */
+  writes: number;
 }
 function followQueue<Q extends WriteQueue | undefined>(queue: Q): Q {
   let q = queue;
@@ -1920,8 +2000,7 @@ function ownRootConnection(
     gate.foreign = undefined;
     end();
   };
-  // In a queue turn, so no adapter write of this root is half-done meanwhile;
-  // inline when already in one, which a queued probe would wait behind.
+  // Called in a queue turn (`heldBy`), so no adapter write is half-done.
   const probe = async () => {
     const one = async (sql: string) => {
       for await (const row of query({ sql, params: [] }))
@@ -1944,8 +2023,24 @@ function ownRootConnection(
       ).catch(() => {});
     }
   };
-  gate.writable = async () =>
-    (await own()) === true ? probe() : enqueue(queue, probe);
+  gate.writable = probe;
+  // A statement of that transaction that may write marks it, so other roots'
+  // writes from now on wait for its end, and waits for the write turn in
+  // progress: no engine write is then between its check and its commit.
+  const beforeForeignStatement = async (sql: string) => {
+    const open = gate.foreign;
+    if (!open || open.wrote) return;
+    const statement = statementOf(new Sql().t(sql));
+    if (
+      statement.read ||
+      /^(BEGIN|SAVEPOINT|COMMIT|END|ROLLBACK|RELEASE)$/.test(
+        statement.first ?? "",
+      )
+    )
+      return;
+    open.wrote = true;
+    await enqueue(queue, async () => {});
+  };
   gate.ready = inside().then(async (yes) => {
     await joinFile(query, queue, gate);
     if (!yes) return;
@@ -2013,7 +2108,8 @@ function ownRootConnection(
               rows = query(request)[Symbol.asyncIterator]();
             else if (!mine && gate.foreign) {
               // Inside the consumer's own transaction, as without this layer:
-              // no engine write runs on the root meanwhile (`untilOwnRoot`).
+              // no engine write runs on the root meanwhile (`writeOutsideForeign`).
+              await beforeForeignStatement(request.sql);
               const it = query(request)[Symbol.asyncIterator]();
               rows = {
                 next: () =>
@@ -2066,7 +2162,10 @@ function ownRootConnection(
     await gate.ready;
     if ((await own()) === true) return execute(request);
     classify(request.sql);
-    if (gate.foreign) return execute(request).finally(() => gate.recheck?.());
+    if (gate.foreign) {
+      await beforeForeignStatement(request.sql);
+      return execute(request).finally(() => gate.recheck?.());
+    }
     return enqueue(queue, () =>
       othersClosed(gate, () => execute(request)).catch((error: unknown) =>
         afterStaleSnapshot(gate, error, () => execute(request)),
@@ -2441,9 +2540,7 @@ export function fromPrisma8(
   ): Prisma8Client => {
     const schedule: Schedule | undefined =
       queue && !inTransaction
-        ? (work) => (
-            adopt(db), untilOwnRoot(db).then(() => enqueue(queue, work))
-          )
+        ? (work) => (adopt(db), writeOutsideForeign(db, queue, work))
         : undefined;
     if (!delegates.has(x)) {
       delegates.set(
@@ -2498,7 +2595,7 @@ export function fromPrisma8(
         );
       return q;
     };
-    // Ending a transaction must not wait for it to end (`untilOwnRoot`).
+    // Ending a transaction must not wait for it to end (`writeOutsideForeign`).
     const ending = (work: () => Promise<any>) => (
       adopt(db), enqueue(queue!, work).finally(() => gateOf(db)?.recheck?.())
     );
