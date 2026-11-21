@@ -58,7 +58,7 @@ session, under your row-level security policies.
 | **Type-Safe** | Full TypeScript inference from input to output across all stages |
 | **Async-First** | Long-running operations: a stage submits a provider batch, releases its lease, and resumes hours later from the step ledger |
 | **AI cost as data** | Tokens and cost on `WorkflowRun.totalCost` in the stage's own transaction, priced from the endpoint actually dispatched to — batch prices for a batch call |
-| **Event-Driven** | Transactional outbox: system events reach your `EventSink` at least once, with no events for a rolled-back transaction |
+| **Event-Driven** | Transactional outbox delivers at least once until the retry budget is exhausted. Delivery can duplicate whenever the sink effect happens without a durable acknowledgement. Examples include a crash or write error after acceptance, an emit in flight at expiry, a sink that commits and then rejects, and partial plugin success. Deduplicate by the outbox `eventId`. `workflowRunId` and `sequence` order events within a run, but are not a permanent identity: after an operator deletes the newest outbox rows, the Prisma store can reuse a sequence. Order is decided at claim time. A replayed dead letter is delivered after later events of its run already claimed or published before replay. After replay, later unclaimed events wait behind it. Dead letters await `plugin.replayDLQ`; engine progress never depends on the sink. After `run.purge`, a flush skips a live claim until it completes or expires, skips published rows, and skips dead letters until replay. The engine never deletes outbox rows; operators remove them with SQL. |
 | **Parallel Execution** | Independent stages in one execution group run concurrently. Pipelines are linear -- there is no arbitrary DAG and no child workflows |
 | **Durable steps** | `ctx.step.*` results are keyed by name in a step ledger: exactly-once *recording*, at-least-once *execution*, with a derived `externalKey` so a reclaim adopts an external effect rather than repeating it |
 | **Definition versioning** | A run is pinned to the structural version it was created under, and a host claims only runs it serves, so a rolling deploy cannot change a run's shape mid-flight |
@@ -440,10 +440,14 @@ model OutboxEvent {
   causationId     String
   occurredAt      DateTime
   publishedAt     DateTime?
+  deliveryClaim   String?
   retryCount      Int       @default(0)
   dlqAt           DateTime?
 
   @@unique([workflowRunId, sequence])
+  @@index([publishedAt, dlqAt, workflowRunId, deliveryClaim], map: "outbox_events_delivery_run_idx")
+  @@index([publishedAt, dlqAt, workflowRunId, sequence], map: "outbox_events_live_run_sequence_idx")
+  @@index([deliveryClaim, workflowRunId], map: "outbox_events_delivery_cursor_idx")
   @@index([publishedAt])
   // Dead letters are a subset of the unpublished rows, so without this the
   // dead-letter view has to walk every unpublished event and fetch its heap
@@ -479,6 +483,8 @@ model WorkflowBlob {
   @@map("workflow_blobs")
 }
 ```
+
+The Prisma schema provisions outbox delivery on PostgreSQL and SQLite. Keep `deliveryClaim` nullable. It holds a rotation rank and, during a live claim, an expiry and owner token. The rank persists after delivery or a retry so a fresh flusher can resume the rotation with one index lookup. Flushers compute run heads from the current rows. The live-run sequence index finds the next run head, and the live-run claim index checks for a lease when replay has restored an earlier event.
 
 Run the migration:
 
@@ -522,7 +528,7 @@ Keep the contract's `TimestampString(3)` timestamps and its native `Status` enum
 
 For SQLite on Prisma 6 or 7, convert the complete shipped `prisma/schema.prisma` for SQLite: remove the native `Status` enum and `@db.Text`, convert the three status fields to `String`, and change `WorkflowRun.config` to `@default(dbgenerated("'{}'"))`. Prisma 6 uses its native client with `connection_limit=1`; Prisma 7 uses `@prisma/adapter-better-sqlite3@7.10.1`. The [full clean-room setup](https://github.com/bratsos/workflow-engine/blob/main/apps/docs/docs/persistence/prisma-setup.md#2-sqlite-setup-prisma-6-7-and-8) includes the conversion script and cross-platform absolute SQLite URL handling that preserves spaces and Unicode in file paths.
 
-Prisma 8 SQLite always starts from a fresh database file, whether the source was Prisma 6 or 7. Existing SQLite files have incompatible timestamp representations at exact instants; do not sign or point the Prisma 8 runtime at them. Create a fresh file from `contract-sqlite.prisma` and migrate application data.
+For an existing SQLite file, use the [SQLite major-switch procedure](https://workflow-engine.dev/persistence/prisma-setup#switching-sqlite-prisma-majors). Run one major per file. Prisma 8 → 6 requires a fresh file.
 
 For Prisma 8 SQLite, copy `node_modules/@bratsos/workflow-engine/prisma/contract-sqlite.prisma` and configure `@prisma/orm-sqlite/config` with a new `file:./dev.db` connection. After `prisma contract emit` and `prisma db init`, build the client with `sqlite({ contract, path: "./dev.db" })`. Pass `createPrismaWorkflowPersistence(fromPrisma8(db), { databaseType: "sqlite" })` and the same option to the other SQLite-aware factories. See the [full SQLite setup](https://github.com/bratsos/workflow-engine/blob/main/apps/docs/docs/persistence/prisma-setup.md#2-sqlite-setup-prisma-6-7-and-8).
 
@@ -1136,7 +1142,7 @@ The resumed stage keeps its step ledger: completed steps are answered from it, s
 
 ### Retention
 
-Nothing deletes runs unless you ask. `run.purge` — `{ olderThan, statuses?, limit? }` → `{ purged, workflowRunIds }` — clears a terminal run's step ledger, job rows and blobs and deletes the run with everything under it. Selection commits before cleanup, which runs outside that transaction; the run is deleted last. A cleanup failure rejects dispatch and leaves the run available to a later purge. Cleanup can be partial, so custom ports must tolerate repeated cleanup. A run redriven during the sweep is kept, and `workflowRunIds` names only the runs deleted. Both hosts run it on the maintenance tick when given `retention: { olderThanMs, statuses?, limit? }`:
+Nothing deletes runs unless you ask. `run.purge` — `{ olderThan, statuses?, limit? }` → `{ purged, workflowRunIds }` — clears a terminal run's step ledger, job rows and blobs and deletes the run with its stages, logs, artifacts and annotations. It does not touch the run's `outbox_events` or `ai_calls` rows: nothing in the engine deletes outbox rows, so remove them with SQL. Selection commits before cleanup, which runs outside that transaction; the run is deleted last. A cleanup failure rejects dispatch and leaves the run available to a later purge. Cleanup can be partial, so custom ports must tolerate repeated cleanup. A run redriven during the sweep is kept, and `workflowRunIds` names only the runs deleted. Both hosts run it on the maintenance tick when given `retention: { olderThanMs, statuses?, limit? }`:
 
 ```typescript
 createNodeHost({
@@ -1252,7 +1258,7 @@ async execute(ctx) {
 | `run.cancel` | Cancel a running workflow (cascades to stages + jobs, aborts the running body) | `workflowRunId`, `reason?` |
 | `run.redrive` | Retry from the last failure, restart, or resume at a stage; archives the superseded attempt | `workflowRunId`, `from?`, `definitionVersion?` |
 | `run.rerunFrom` | **Deprecated** — use `run.redrive` | `workflowRunId`, `fromStageId` |
-| `run.purge` | Delete terminal runs older than a cutoff with everything under them | `olderThan`, `statuses?`, `limit?` |
+| `run.purge` | Delete terminal runs older than a cutoff with their stages, logs, artifacts, annotations, step ledger, jobs and blobs (not `outbox_events`) | `olderThan`, `statuses?`, `limit?` |
 | `run.listVersions` | Per-version run counts: which versions have drained, which nobody here serves | `workflowId?`, `definitionVersion?` |
 | `job.execute` | Execute a single stage (multi-phase transactions) | `idempotencyKey?`, `workflowRunId`, `workflowId`, `stageId`, `config`, `attempt?`, `maxAttempts?`, `abortSignal?` |
 | `job.heartbeat` | Renew a job lease and report whether the work is still wanted (feeds `abortSignal`) | `jobId`, `workflowRunId`, `attempt?` |

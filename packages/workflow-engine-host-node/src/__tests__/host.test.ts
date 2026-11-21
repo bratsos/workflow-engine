@@ -7,7 +7,11 @@
 
 import type { Workflow } from "@bratsos/workflow-engine";
 import { defineStage, WorkflowBuilder } from "@bratsos/workflow-engine";
-import { createKernel, type Kernel } from "@bratsos/workflow-engine/kernel";
+import {
+  createKernel,
+  type Kernel,
+  type MaintenanceTickCounts,
+} from "@bratsos/workflow-engine/kernel";
 import {
   CollectingEventSink,
   FakeClock,
@@ -17,7 +21,7 @@ import {
   InMemoryJobQueue,
   InMemoryWorkflowPersistence,
 } from "@bratsos/workflow-engine/testing";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { createNodeHost, type NodeHost } from "../host.js";
 
@@ -458,6 +462,505 @@ describe("NodeHost", () => {
     expect(host.getStats().orchestrationTicks).toBe(1);
   });
 
+  it("calls onTick after every tick with that tick's counts", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, jobTransport } = createTestEnv([workflow]);
+    await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "on-tick-1",
+      workflowId: workflow.id,
+      input: { data: "hello" },
+    });
+
+    const seen: MaintenanceTickCounts[] = [];
+    host = createNodeHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+      orchestrationIntervalMs: 20,
+      jobPollIntervalMs: 20,
+      onTick: (counts) => {
+        seen.push(counts);
+      },
+    });
+    await host.start();
+    await waitFor(async () => seen.length >= 2);
+
+    // The first tick claimed the run; the counts are the tick's own.
+    expect(seen[0]?.claimed).toBe(1);
+    expect(seen[0]?.eventSinkStatus).toBe("healthy");
+    expect(seen[1]?.claimed).toBe(0);
+  });
+
+  it("logs a hook that throws or rejects and keeps ticking", async () => {
+    const { kernel, jobTransport } = createTestEnv([]);
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      let calls = 0;
+      host = createNodeHost({
+        kernel,
+        jobTransport,
+        workerId: "test-worker",
+        orchestrationIntervalMs: 20,
+        jobPollIntervalMs: 20,
+        onTick: async () => {
+          calls++;
+          if (calls === 1) throw new Error("hook threw");
+          if (calls === 2) return Promise.reject(new Error("hook rejected"));
+        },
+      });
+      await host.start();
+      await waitFor(async () => calls >= 3);
+
+      const messages = logged.mock.calls.map((args) => String(args[1]));
+      expect(messages).toContain("Error: hook threw");
+      expect(messages).toContain("Error: hook rejected");
+      expect(host.getStats().orchestrationTicks).toBeGreaterThanOrEqual(3);
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
+  it("never holds a tick for a slow hook and never runs two at once", async () => {
+    const { kernel, jobTransport } = createTestEnv([]);
+    const warned = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let running = 0;
+      let overlapped = false;
+      let calls = 0;
+
+      host = createNodeHost({
+        kernel,
+        jobTransport,
+        workerId: "test-worker",
+        orchestrationIntervalMs: 10,
+        jobPollIntervalMs: 20,
+        onTick: async () => {
+          calls++;
+          running++;
+          if (running > 1) overlapped = true;
+          if (calls === 1) await gate;
+          running--;
+        },
+      });
+      await host.start();
+      // The first hook is held: ticks go on, the hook is not called again, and
+      // the skip is logged once, not once per tick.
+      await waitFor(async () => host!.getStats().orchestrationTicks >= 5);
+      expect(calls).toBe(1);
+      const skips = warned.mock.calls.filter((args) =>
+        String(args[0]).includes("onTick hook is still running after"),
+      );
+      expect(skips).toHaveLength(1);
+      expect(String(skips[0]?.[0])).toMatch(/running after \d+ ms/);
+
+      release();
+      await waitFor(async () => calls >= 3);
+      expect(overlapped).toBe(false);
+    } finally {
+      warned.mockRestore();
+    }
+  });
+
+  it("warns once for a hook that stays slower than the interval, and again after a call that was not skipped", async () => {
+    const { kernel, jobTransport } = createTestEnv([]);
+    const warned = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      // Every call takes about six intervals until `slow` is cleared.
+      let slow = true;
+      let calls = 0;
+      host = createNodeHost({
+        kernel,
+        jobTransport,
+        workerId: "test-worker",
+        orchestrationIntervalMs: 10,
+        jobPollIntervalMs: 20,
+        onTick: async () => {
+          calls++;
+          if (slow) await new Promise((r) => setTimeout(r, 60));
+        },
+      });
+      const skips = () =>
+        warned.mock.calls.filter((args) =>
+          String(args[0]).includes("onTick hook is still running after"),
+        ).length;
+      await host.start();
+      // Four slow calls, each skipped by several ticks: one warning in all.
+      await waitFor(async () => calls >= 4);
+      expect(skips()).toBe(1);
+
+      // A call that finishes before the next tick ends the episode ...
+      slow = false;
+      const before = calls;
+      await waitFor(async () => calls >= before + 3);
+      expect(skips()).toBe(1);
+
+      // ... so the next slow call warns again.
+      slow = true;
+      await waitFor(async () => skips() === 2);
+    } finally {
+      warned.mockRestore();
+    }
+  });
+
+  it("keeps ticking and claiming work while a hook never settles, and stop() is bounded", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, persistence, jobTransport } = createTestEnv([workflow]);
+    const warned = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      let calls = 0;
+      host = createNodeHost({
+        kernel,
+        jobTransport,
+        workerId: "test-worker",
+        orchestrationIntervalMs: 15,
+        jobPollIntervalMs: 20,
+        shutdownTimeoutMs: 400,
+        onTick: () => {
+          calls++;
+          return new Promise<void>(() => {});
+        },
+      });
+      await host.start();
+      await waitFor(async () => calls === 1);
+
+      // A run created after the hook hung is still claimed and finished.
+      const { workflowRunId } = await kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "hung-hook",
+        workflowId: workflow.id,
+        input: { data: "hello" },
+      });
+      await waitFor(
+        async () =>
+          (await persistence.getRun(workflowRunId))?.status === "COMPLETED",
+      );
+      expect(host.getStats().orchestrationTicks).toBeGreaterThanOrEqual(3);
+      expect(calls).toBe(1);
+
+      const started = Date.now();
+      await host.stop();
+      const took = Date.now() - started;
+      host = null;
+      expect(took).toBeGreaterThanOrEqual(350);
+      expect(took).toBeLessThan(1_500);
+    } finally {
+      warned.mockRestore();
+    }
+  });
+
+  it("starts no hook once stop() has begun and waits for one that is running", async () => {
+    const { kernel, jobTransport } = createTestEnv([]);
+    // Hold the first tick inside stage.pollSuspended, so stop() begins while
+    // the tick is still running and the tick's hook would start after it.
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let held = false;
+    const slowKernel = {
+      dispatch: async (command: Parameters<Kernel["dispatch"]>[0]) => {
+        if (command.type === "stage.pollSuspended" && !held) {
+          held = true;
+          await gate;
+        }
+        return kernel.dispatch(command as never);
+      },
+    } as unknown as Kernel;
+    let calls = 0;
+
+    host = createNodeHost({
+      kernel: slowKernel,
+      jobTransport,
+      workerId: "test-worker",
+      orchestrationIntervalMs: 1_000,
+      jobPollIntervalMs: 20,
+      onTick: () => {
+        calls++;
+      },
+    });
+    await host.start();
+    await waitFor(async () => held);
+    const stopping = host.stop();
+    release();
+    await stopping;
+    host = null;
+    expect(calls).toBe(0);
+
+    // A hook that is already running is waited for: stop() resolves after it.
+    let hookStarted = false;
+    let hookDone = false;
+    const waiting = createNodeHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+      orchestrationIntervalMs: 1_000,
+      jobPollIntervalMs: 20,
+      onTick: async () => {
+        hookStarted = true;
+        await new Promise((r) => setTimeout(r, 150));
+        hookDone = true;
+      },
+    });
+    await waiting.start();
+    await waitFor(async () => hookStarted);
+    await waiting.stop();
+    expect(hookDone).toBe(true);
+  });
+
+  it("makes a hook that awaits host.stop() wait for shutdownTimeoutMs", async () => {
+    const { kernel, jobTransport } = createTestEnv([]);
+    let stopMs = -1;
+    let calls = 0;
+    const self: NodeHost = createNodeHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+      orchestrationIntervalMs: 15,
+      jobPollIntervalMs: 20,
+      shutdownTimeoutMs: 300,
+      onTick: async () => {
+        calls++;
+        const started = Date.now();
+        await self.stop();
+        stopMs = Date.now() - started;
+      },
+    });
+    await self.start();
+    await waitFor(async () => stopMs >= 0);
+    // stop() waited for the hook that was waiting for it, until the timeout.
+    expect(stopMs).toBeGreaterThanOrEqual(250);
+    expect(self.getStats().isRunning).toBe(false);
+    expect(calls).toBe(1);
+  });
+
+  it("gives the hook its own copy of the counts", async () => {
+    const { kernel, jobTransport } = createTestEnv([]);
+    let mutated = false;
+    host = createNodeHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+      orchestrationIntervalMs: 20,
+      jobPollIntervalMs: 20,
+      onTick: (counts) => {
+        counts.eventSinkStatus = "degraded";
+        counts.eventsDeadLettered = 99;
+        mutated = true;
+      },
+    });
+    await host.start();
+    await waitFor(async () => mutated);
+    expect(host.getStats().eventSink.status).toBe("healthy");
+    expect(host.getStats().eventSink.deadLettered).toBe(0);
+  });
+
+  // Every option that reaches setTimeout or setInterval is checked at
+  // construction: Infinity, NaN, a negative number or more than 2**31 - 1 would
+  // otherwise become a 1 ms timer.
+  const TIMER_OPTIONS = [
+    ["orchestrationIntervalMs", false],
+    ["jobPollIntervalMs", false],
+    ["postJobYieldMs", true],
+    ["jobHeartbeatIntervalMs", false],
+    ["outboxFlushTimeoutMs", false],
+    ["shutdownTimeoutMs", false],
+  ] as const;
+  for (const [option, zeroIsOff] of TIMER_OPTIONS) {
+    it(`rejects ${option} when a timer cannot honour it`, () => {
+      const { kernel, jobTransport } = createTestEnv([]);
+      const create = (value: unknown) =>
+        createNodeHost({
+          kernel,
+          jobTransport,
+          workerId: "test-worker",
+          [option]: value,
+        });
+      const bad: unknown[] = [Infinity, -Infinity, NaN, -5, 2 ** 31, "5000"];
+      // A pause drawn uniformly from [0, ms) may be fractional; the others are not.
+      if (!zeroIsOff) bad.push(0, 0.5);
+      for (const value of bad) {
+        expect(() => create(value), `${option}: ${String(value)}`).toThrow(
+          new RegExp(`${option} must be a number of milliseconds`),
+        );
+      }
+      const unformattable = () => create(Object.create(null));
+      expect(unformattable).toThrow(RangeError);
+      expect(unformattable).toThrow(/got Unprintable error/);
+      expect(() => create(1)).not.toThrow();
+      expect(() => create(2 ** 31 - 1)).not.toThrow();
+      if (zeroIsOff) expect(() => create(0)).not.toThrow();
+    });
+  }
+
+  it("fails start() instead of running when the storage is refused", async () => {
+    const { kernel, jobTransport } = createTestEnv([]);
+    // What the SQLite adapters throw for a file another Prisma major wrote.
+    const refusal = Object.assign(new Error("a foreign SQLite file"), {
+      code: "SQLITE_DATE_STORAGE_MISMATCH",
+    });
+    (jobTransport as any).verifyStorage = async () => {
+      throw refusal;
+    };
+    const dispatched = vi.spyOn(kernel, "dispatch");
+    const refused = createNodeHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+      orchestrationIntervalMs: 10,
+      jobPollIntervalMs: 10,
+    });
+    await expect(refused.start()).rejects.toBe(refusal);
+    await new Promise((r) => setTimeout(r, 60));
+    // No tick, no job poll, no timer, no signal handler: nothing ran.
+    expect(refused.getStats().isRunning).toBe(false);
+    expect(refused.getStats().orchestrationTicks).toBe(0);
+    expect(dispatched).not.toHaveBeenCalled();
+    await refused.stop();
+  });
+
+  describe("stop() while start() is still checking the storage", () => {
+    /** A storage check that settles when the test says so. */
+    function gatedCheck(jobTransport: unknown) {
+      const gates: { settle: (error?: Error) => void }[] = [];
+      (jobTransport as any).verifyStorage = () =>
+        new Promise<void>((resolve, reject) => {
+          gates.push({
+            settle: (error) => (error ? reject(error) : resolve()),
+          });
+        });
+      return gates;
+    }
+    const signalListeners = () =>
+      process.listenerCount("SIGTERM") + process.listenerCount("SIGINT");
+
+    it("installs nothing when the check settles after stop() returned", async () => {
+      const { kernel, jobTransport } = createTestEnv([]);
+      const gates = gatedCheck(jobTransport);
+      const dispatched = vi.spyOn(kernel, "dispatch");
+      const listeners = signalListeners();
+      const h = createNodeHost({
+        kernel,
+        jobTransport,
+        workerId: "test-worker",
+        orchestrationIntervalMs: 10,
+        jobPollIntervalMs: 5,
+      });
+      const boot = h.start();
+      await vi.waitFor(() => expect(gates).toHaveLength(1));
+      await h.stop();
+      await h.stop(); // twice: still nothing to wind down
+      gates[0].settle();
+      await boot;
+      await new Promise((r) => setTimeout(r, 60));
+      expect(h.getStats().isRunning).toBe(false);
+      expect(h.getStats().orchestrationTicks).toBe(0);
+      expect(dispatched).not.toHaveBeenCalled();
+      expect(signalListeners()).toBe(listeners);
+    });
+
+    it("start, stop, start: only the second start runs, once", async () => {
+      const { kernel, jobTransport } = createTestEnv([]);
+      const gates = gatedCheck(jobTransport);
+      const listeners = signalListeners();
+      host = createNodeHost({
+        kernel,
+        jobTransport,
+        workerId: "test-worker",
+        orchestrationIntervalMs: 10_000,
+        jobPollIntervalMs: 20,
+      });
+      const first = host.start();
+      await vi.waitFor(() => expect(gates).toHaveLength(1));
+      await host.stop();
+      const second = host.start();
+      await vi.waitFor(() => expect(gates).toHaveLength(2));
+      gates[1].settle();
+      await second;
+      // The first check settles late: it must not begin a second set of loops.
+      gates[0].settle();
+      await first;
+      await new Promise((r) => setTimeout(r, 30));
+      expect(host.getStats().isRunning).toBe(true);
+      expect(host.getStats().orchestrationTicks).toBe(1);
+      expect(signalListeners()).toBe(listeners + 2);
+      await host.stop();
+      expect(signalListeners()).toBe(listeners);
+    });
+
+    it("a check that fails after stop() rejects that start() and leaves the host stopped and startable", async () => {
+      const { kernel, jobTransport } = createTestEnv([]);
+      const gates = gatedCheck(jobTransport);
+      host = createNodeHost({
+        kernel,
+        jobTransport,
+        workerId: "test-worker",
+        orchestrationIntervalMs: 10_000,
+        jobPollIntervalMs: 20,
+      });
+      const boot = host.start();
+      await vi.waitFor(() => expect(gates).toHaveLength(1));
+      await host.stop();
+      const refusal = new Error("refused");
+      gates[0].settle(refusal);
+      await expect(boot).rejects.toBe(refusal);
+      expect(host.getStats().isRunning).toBe(false);
+      const again = host.start();
+      await vi.waitFor(() => expect(gates).toHaveLength(2));
+      gates[1].settle();
+      await again;
+      expect(host.getStats().isRunning).toBe(true);
+    });
+  });
+
+  it("verifies the storage once, however many start() calls are in flight", async () => {
+    const { kernel, jobTransport } = createTestEnv([]);
+    let verified = 0;
+    (jobTransport as any).verifyStorage = async () => {
+      verified++;
+      await new Promise((r) => setTimeout(r, 20));
+    };
+    host = createNodeHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+      orchestrationIntervalMs: 10_000,
+      jobPollIntervalMs: 20,
+    });
+    await Promise.all([host.start(), host.start(), host.start()]);
+    expect(verified).toBe(1);
+    expect(host.getStats().isRunning).toBe(true);
+    expect(host.getStats().orchestrationTicks).toBe(1);
+  });
+
+  it("rejects an onTick that is not a function", () => {
+    const { kernel, jobTransport } = createTestEnv([]);
+    for (const [bad, message] of [
+      ["x", "x"],
+      [5, "5"],
+      [{}, "[object Object]"],
+      [Object.create(null), "Unprintable error"],
+    ]) {
+      expect(
+        () =>
+          createNodeHost({
+            kernel,
+            jobTransport,
+            workerId: "test-worker",
+            onTick: bad as never,
+          }),
+        message,
+      ).toThrow(new TypeError(`onTick must be a function, got ${message}.`));
+    }
+    expect(() =>
+      createNodeHost({ kernel, jobTransport, workerId: "test-worker" }),
+    ).not.toThrow();
+  });
+
   it("calling start() twice is safe", async () => {
     const { kernel, jobTransport } = createTestEnv([]);
 
@@ -596,6 +1099,148 @@ describe("NodeHost", () => {
     expect(seen).not.toContain("FAILED");
     const run = await persistence.getRun(created.workflowRunId);
     expect(run?.output).toEqual({ result: "HELLO" });
+  });
+
+  it("refunds the attempt of a job dequeued while stop() runs, so stops never use up its retries", async () => {
+    let calls = 0;
+    const flaky = defineStage({
+      id: "flaky",
+      name: "Flaky",
+      schemas: { input: schema, output: outputSchema, config: z.object({}) },
+      async execute(ctx) {
+        if (++calls === 1) throw new Error("transient failure");
+        return { output: { result: ctx.input.data } };
+      },
+    });
+    const workflow = new WorkflowBuilder(
+      "stop-wf",
+      "Stop",
+      "Test",
+      schema,
+      outputSchema,
+    )
+      .pipe(flaky)
+      .build();
+    const { kernel, persistence, jobTransport } = createTestEnv([workflow]);
+    const { workflowRunId } = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "stop-1",
+      workflowId: "stop-wf",
+      input: { data: "x" },
+    });
+    await kernel.dispatch({
+      type: "run.claimPending",
+      workerId: "test-worker",
+      maxClaims: 1,
+    });
+    const dequeue = jobTransport.dequeue.bind(jobTransport);
+    const make = () =>
+      createNodeHost({
+        kernel,
+        jobTransport,
+        workerId: "test-worker",
+        orchestrationIntervalMs: 60_000,
+        jobPollIntervalMs: 5,
+        shutdownTimeoutMs: 10,
+        flushOutboxOnStop: false,
+      });
+    // Two stops, each while a real dequeue has claimed the job and its
+    // response is still on the way back to the loop.
+    for (let stop = 0; stop < 2; stop++) {
+      let claimed!: () => void;
+      let respond!: () => void;
+      const hit = new Promise<void>((resolve) => (claimed = resolve));
+      const held = new Promise<void>((resolve) => (respond = resolve));
+      let returned!: ReturnType<typeof dequeue>;
+      jobTransport.dequeue = (...args) =>
+        (returned = dequeue(...args).then(async (job) => {
+          claimed();
+          await held;
+          return job;
+        }));
+      const stopping = make();
+      await stopping.start();
+      await hit;
+      expect(
+        (await jobTransport.getJobsByWorkflowRun(workflowRunId))[0],
+      ).toMatchObject({ status: "RUNNING", attempt: 1 });
+      await stopping.stop();
+      respond();
+      await returned;
+      await waitFor(async () => {
+        const [job] = await jobTransport.getJobsByWorkflowRun(workflowRunId);
+        return job?.status === "PENDING";
+      });
+      expect(
+        (await jobTransport.getJobsByWorkflowRun(workflowRunId))[0]?.attempt,
+      ).toBe(0);
+    }
+    jobTransport.dequeue = dequeue;
+    host = make();
+    await host.start();
+    await waitFor(
+      async () =>
+        (await persistence.getRun(workflowRunId))?.status === "COMPLETED",
+      10_000,
+    );
+    expect(calls).toBe(2);
+  });
+
+  it("starts the replacement job loop when returning an unstarted job commits but never answers", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, persistence, jobTransport } = createTestEnv([workflow]);
+    const { workflowRunId } = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "stop-defer-1",
+      workflowId: "test-workflow",
+      input: { data: "x" },
+    });
+    await kernel.dispatch({
+      type: "run.claimPending",
+      workerId: "test-worker",
+      maxClaims: 1,
+    });
+    const dequeue = jobTransport.dequeue.bind(jobTransport);
+    const defer = jobTransport.defer!.bind(jobTransport);
+    let claimed!: () => void;
+    let respond!: () => void;
+    const hit = new Promise<void>((resolve) => (claimed = resolve));
+    const held = new Promise<void>((resolve) => (respond = resolve));
+    jobTransport.dequeue = (...args) =>
+      dequeue(...args).then(async (job) => {
+        claimed();
+        await held;
+        return job;
+      });
+    let deferred = 0;
+    jobTransport.defer = async (...args) => {
+      await defer(...args);
+      deferred++;
+      return new Promise<never>(() => {});
+    };
+    host = createNodeHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+      orchestrationIntervalMs: 60_000,
+      jobPollIntervalMs: 5,
+      shutdownTimeoutMs: 50,
+      flushOutboxOnStop: false,
+    });
+    await host.start();
+    await hit;
+    await host.stop();
+    respond();
+    await waitFor(async () => deferred === 1);
+    jobTransport.dequeue = dequeue;
+    jobTransport.defer = defer;
+    // The same host again: its new job loop starts after the old one ends.
+    await host.start();
+    await waitFor(
+      async () =>
+        (await persistence.getRun(workflowRunId))?.status === "COMPLETED",
+      5_000,
+    );
   });
 
   it("flushes the outbox on stop() so a run finished by this process is published", async () => {

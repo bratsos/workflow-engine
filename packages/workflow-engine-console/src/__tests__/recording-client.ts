@@ -12,7 +12,8 @@ export interface RecordedStatement {
  * it: directly, inside `$transaction`, or through Prisma 8's `$withColumns`.
  * `afterStatement` runs between a statement and the next, to write a row there;
  * `afterExecute` after each `$executeRawUnsafe` (a cursor's `DECLARE`, `CLOSE`),
- * `beforeExecute` before it is sent.
+ * `beforeExecute` before it is sent. The engine's SQLite date check passes
+ * through unrecorded, into `probes` when given.
  */
 export function recordingClient(
   client: ConsolePrismaClient,
@@ -20,9 +21,17 @@ export function recordingClient(
   afterStatement?: (call: RecordedStatement) => Promise<void>,
   afterExecute?: (sql: string) => Promise<void>,
   beforeExecute?: (sql: string) => Promise<void>,
+  probes?: RecordedStatement[],
 ): ConsolePrismaClient {
   const wrap = (c: ConsolePrismaClient): ConsolePrismaClient => ({
     $queryRawUnsafe: (async (sql: string, ...params: unknown[]) => {
+      // The engine's SQLite date check, before a read: not one of the read's
+      // statements, so neither recorded nor a point to write between.
+      if (sql.includes("SELECT 'bound', typeof(b.d)")) {
+        const rows = await c.$queryRawUnsafe(sql, ...params);
+        probes?.push({ sql, params, rows });
+        return rows;
+      }
       const rows = await c.$queryRawUnsafe(sql, ...params);
       const call = { sql, params, rows };
       calls.push(call);

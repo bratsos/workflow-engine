@@ -35,7 +35,7 @@ const host = createServerlessHost({
   maxSuspendedChecksPerTick: 10,
   maxOutboxFlushPerTick: 100,
   flushOutboxAfterJob: true,      // default: publish this job's events before returning
-  outboxFlushTimeoutMs: 10_000,   // bound on that flush; errors are logged, never thrown
+  outboxFlushTimeoutMs: 10_000,   // bounds post-job and maintenance flushes; errors are logged, never thrown
 
   // Opt-in retention: run.purge deletes terminal runs older than this on
   // every maintenance tick. Off unless set.
@@ -45,6 +45,13 @@ const host = createServerlessHost({
   // Omit it and the kernel derives it from the registry, which is what
   // makes a rolling deploy safe; "all" turns version filtering off.
   // serves: "all",
+
+  // Called at the end of every runMaintenanceTick() with a copy of its counts.
+  // A hook that throws or rejects is logged and the tick still returns; the
+  // call waits for it at most onTickTimeoutMs (default 5s), then returns the
+  // counts and logs a warning.
+  // onTick: async (counts) => { ... },
+  // onTickTimeoutMs: 5_000,
 });
 ```
 
@@ -140,6 +147,32 @@ export default {
 };
 ```
 
+### Exporting gauges with `onTick`
+
+`onTick` receives a copy of the counts `runMaintenanceTick()` returns (mutating it changes nothing the method returns), after the tick has finished and before the method returns them. A hook that throws or rejects is caught and logged, and the tick still returns its counts. The hook is awaited for at most `onTickTimeoutMs` (default `5000`, the same as `outboxFlushTimeoutMs`: both bound optional work the host awaits after its own commands finished, inside an invocation that has a time limit). When the bound passes, `runMaintenanceTick()` returns the counts, logs `[ServerlessHost] onTick hook did not settle within <n> ms; not waiting for it (it keeps running)` and leaves the hook running in the background, where the platform may cut it off when the invocation ends. `onTick` must be a function: anything else throws a `TypeError` from `createServerlessHost`. A hook that never settles therefore costs one bounded wait per tick and never withholds the counts. The bound covers a hook that yields: measured with a hook that never settles and `onTickTimeoutMs: 25`, `runMaintenanceTick()` returned after 28 ms. Synchronous code in the hook cannot be bounded: the timer fires only once it yields, so a body that computed for 60 ms delayed the return by 60 ms. `onTickTimeoutMs` must be a number from `1` to `2147483647` (the longest delay a timer honours, about 24.8 days); `Infinity`, `NaN`, zero or a negative number makes `createServerlessHost` throw a `RangeError`. Nothing switches the bound off: pass `2147483647` to wait for practically any hook. The same rule applies to every other option that reaches a timer: `outboxFlushTimeoutMs` and `jobHeartbeatIntervalMs` (and `runToCompletion`'s `jobHeartbeatIntervalMs`, checked before it creates the run). Dispatch [`engine.stats`](../core-concepts/kernel-and-ports.md#observing-the-engine) from it for queue depth and age. `metrics` below stands for your own metrics client; the engine depends on none.
+
+If a timer option or `onTick` value cannot be formatted, the constructor still throws the validation error and describes the value as `Unprintable error`.
+
+```typescript
+const host = createServerlessHost({
+  kernel,
+  jobTransport,
+  workerId: "edge-worker-1",
+  onTick: async (counts) => {
+    metrics.increment("workflow_events_flushed", counts.eventsFlushed);
+
+    const stats = await kernel.dispatch({ type: "engine.stats" });
+    if (stats.jobs.available) {
+      metrics.gauge("workflow_jobs_pending", stats.jobs.byStatus.PENDING);
+      metrics.gauge("workflow_jobs_oldest_pending_age_ms", stats.jobs.oldestPendingAgeMs ?? 0);
+    }
+    if (stats.outbox.available) {
+      metrics.gauge("workflow_outbox_dead_lettered", stats.outbox.deadLettered);
+    }
+  },
+});
+```
+
 ## Running a workflow inside a request: `runToCompletion`
 
 Running a workflow synchronously in one request handler is a real pattern,
@@ -207,6 +240,10 @@ Options: `kernel`, `jobTransport`, `persistence`, `command`, plus `workerId`,
 `flushOutbox` (default true — publish the run's events before returning),
 `maxOutboxFlush` and `logPrefix`.
 
+### Refused storage
+
+There is no `start()` here, so every call of `handleJob`, `processAvailableJobs` or `runMaintenanceTick` first calls the job transport's optional `verifyStorage()` and throws its error when the storage may not be used: with the Prisma SQLite adapters, a file another Prisma major wrote (`SqliteDateStorageError`, see [A SQLite file belongs to the Prisma major that created it](../persistence/prisma-setup.md#a-sqlite-file-belongs-to-the-prisma-major-that-created-it)). Nothing is dispatched. The host remembers nothing: the Prisma job queue answers from its own cache once a check is conclusive, and checks again after a failure (`SqliteDateStorageUnverifiedError`) or on a file with no stored date.
+
 ### Degraded event sink
 
 `eventSinkStatus` is `"degraded"` when the flush in this tick could not
@@ -219,3 +256,5 @@ serverless host reports it per tick (and logs it per tick) rather than on a
 transition; alert on a *run* of degraded ticks. `eventsDeadLettered` counts
 events that exhausted their retry budget in this tick: those stop retrying on
 their own and need a `plugin.replayDLQ` dispatch once the sink is back.
+
+A timed-out outbox flush starts no further claims or sink calls. A claim already sent to the database can finish, and a sink call already in flight can settle under its original owner fence. A tick on a caller-owned transaction reports `outboxDeferred: true`. Flush on the root client after commit.

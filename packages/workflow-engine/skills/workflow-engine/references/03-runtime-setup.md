@@ -89,7 +89,7 @@ const kernel = createKernel({
 
 | Port | Interface | Purpose |
 |------|-----------|---------|
-| `persistence` | `Persistence` | CRUD for runs, stages, logs, outbox events, idempotency keys |
+| `persistence` | `Persistence` | CRUD for runs, stages, logs, outbox events, idempotency keys; optional `getActiveWorkStats(now)` (read by `engine.stats`) |
 | `blobStore` | `BlobStore` | `put(key, data)`, `get(key)`, `has(key)`, `delete(key)`, `list(prefix)` |
 | `jobTransport` | `JobTransport` | `enqueueParallel` (idempotent on `(workflowRunId, stageId)`; the legacy `enqueue` left the port at 1.0), `deleteByRunAndStages` (used by `run.redrive` / `run.rerunFrom`), `dequeue(options?)` (`options.serves` filters by definition version; returns `startedAt`), `complete`, `suspend(jobId, nextPollAt, fence?)`, `fail(jobId, error, shouldRetry?, fence?)` (all three take an optional `JobAckFence` and return `"acknowledged" \| "superseded"`), `defer` (optional: decline a job without spending an attempt), `releaseStaleJobs`, `expireRunawayJobs` (optional, absolute lease tier), `cancelByRun`, `touchJob` (lease heartbeat), `getJobsByWorkflowRun`, `adoptWorkerId` (optional), `fairnessGroupBy` (optional readonly property, read by `createSpillingJobTransport`) |
 | `eventSink` | `EventSink` | `emit(event)` - async event publishing |
@@ -123,9 +123,10 @@ const host = createNodeHost({
   maxClaimsPerTick: 10,               // Max pending runs to claim per tick
   maxSuspendedChecksPerTick: 10,      // Max suspended stages to poll per tick
   maxOutboxFlushPerTick: 100,         // Max outbox events to flush per tick
-  shutdownTimeoutMs: 10_000,          // 1.0: bound on stop() waiting for the in-flight job / tick and the final flush
+  shutdownTimeoutMs: 10_000,          // 1.0: bound on stop() waiting for the in-flight tick / onTick call, the job, and the final flush
   flushOutboxOnStop: true,            // 1.0: run a final outbox.flush in stop() so this process publishes its own workflow:completed
   // retention: { olderThanMs: 30 * 24 * 60 * 60 * 1000, statuses?, limit? }, // Opt-in: run.purge on every tick (see 09-troubleshooting.md, "Run Retention")
+  // onTick: async (counts) => { ... }, // 1.0.0-alpha.21: called after every tick with its MaintenanceTickCounts (see "Exporting gauges")
   // serves: "all",                   // 1.0: turn definition-version filtering off.
                                       // Omitted, the kernel derives it from the
                                       // registry (claim, poll and dequeue alike).
@@ -193,6 +194,31 @@ SQLite the comparison stays in application code -- one process, one clock.
 
 An interval firing that lands while the previous tick is still running is skipped (`orchestrationTicks` counts ticks that ran), and `stop()` waits for an in-flight tick, bounded by `shutdownTimeoutMs`, before its final outbox flush. Several hosts may run against one database: suspended stages are claimed per poll, so a stage body runs once across processes (see 08-common-patterns.md, "Suspended-Stage Claims").
 
+### Exporting gauges
+
+`onTick` (both hosts) is called after every maintenance tick with a copy of that tick's `MaintenanceTickCounts` (mutating it changes nothing else); the `engine.stats` command adds queue depth and age. The engine takes no metrics dependency: `metrics` below is your own client.
+
+```typescript
+const host = createNodeHost({
+  kernel, jobTransport, workerId: "worker-1",
+  onTick: async (counts) => {
+    metrics.increment("workflow_events_flushed", counts.eventsFlushed);
+    const stats = await kernel.dispatch({ type: "engine.stats" });
+    if (stats.jobs.available) {
+      metrics.gauge("workflow_jobs_pending", stats.jobs.byStatus.PENDING);
+      metrics.gauge("workflow_jobs_oldest_pending_age_ms", stats.jobs.oldestPendingAgeMs ?? 0);
+    }
+    if (stats.outbox.available) metrics.gauge("workflow_outbox_dead_lettered", stats.outbox.deadLettered);
+  },
+});
+```
+
+- A hook that throws or rejects is caught and logged (`<prefix> onTick hook error:`); it never stops the loop and never fails a tick.
+- Node host: the hook runs outside the tick, so ticks never wait for what it awaits (a never-settling hook: 16 ticks in 155 ms against 15 without one), but its synchronous code runs on the host's thread and holds every tick while it runs (40 ms of computation per call at a 10 ms interval: five calls in 202 ms); claiming, polling, lease reaping, the outbox flush and `run.reapStuck` go on whatever it does. At most one call is in flight: a tick that finds the previous call still running skips the hook and logs one warning (`[NodeHost] onTick hook is still running after <n> ms ...`) at the first skip; it is not repeated while the hook stays slower than the interval, and a call that finishes without a tick skipping it ends the episode. A hook that never settles is called once, warned about once, and its gauges stop updating until it settles: bound what it waits on. `stop()` waits for a running hook, with the in-flight tick, for at most `shutdownTimeoutMs`, and no hook starts once it began. A hook must not `await host.stop()`: `stop()` waits for the hook that is waiting for it until `shutdownTimeoutMs` elapses (use `void host.stop()`, or stop from outside).
+- `onTick` must be a function (a `TypeError` from the host constructor otherwise). `createNodeHost(...).start()` first calls the job transport's optional `verifyStorage()` and rejects with its error (a SQLite file another Prisma major wrote: `SqliteDateStorageError`) before it starts anything (a `stop()` during that check cancels the start; a check that cannot run rejects with `SqliteDateStorageUnverifiedError`); the serverless host's `handleJob`, `processAvailableJobs` and `runMaintenanceTick` check on every call and throw it instead of logging it per command. If an invalid `onTick` or timer value cannot be formatted, the constructor keeps its `TypeError` or `RangeError` and describes the value as `Unprintable error`.
+- Serverless host: the hook is awaited for at most `onTickTimeoutMs` (default 5000, the same as `outboxFlushTimeoutMs`; a number from 1 to 2147483647, anything else throws a `RangeError` from `createServerlessHost`, and nothing switches the bound off). Every option that reaches a timer follows that rule and is checked at construction (`assertTimerMs`, exported from `@bratsos/workflow-engine/kernel`): Node `orchestrationIntervalMs`, `jobPollIntervalMs`, `postJobYieldMs` (0 allowed: off), `jobHeartbeatIntervalMs`, `shutdownTimeoutMs`, and `runAndWait`'s `pollIntervalMs`; serverless `outboxFlushTimeoutMs`, `onTickTimeoutMs`, `jobHeartbeatIntervalMs`, and `runToCompletion`'s `jobHeartbeatIntervalMs`; then `runMaintenanceTick()` returns the counts, logs `[ServerlessHost] onTick hook did not settle within <n> ms; ...` and leaves the hook running. The bound covers a hook that yields (a never-settling hook with a 25 ms bound: returned after 28 ms); synchronous code in the hook cannot be bounded (a 60 ms body delayed the return by 60 ms).
+- `engine.stats` returns `{ at, runs, stages, jobs, outbox }`. Each section is `{ available: true, ... }` or `{ available: false }` when the port behind it has no `getActiveWorkStats` (runs, stages, outbox) or `getJobStats` (jobs). It counts PENDING, RUNNING and SUSPENDED rows only, never terminal ones, and writes nothing. Ages are milliseconds on the kernel clock; `null` means nothing is waiting.
+
 ### Worker Process Pattern
 
 ```typescript
@@ -228,6 +254,8 @@ const host = createServerlessHost({
   flushOutboxAfterJob: true,          // 1.0: publish outbox events right after handleJob settles (no process lifecycle to hook)
   outboxFlushTimeoutMs: 5_000,        // 1.0: bound on that post-job flush
   // retention: { olderThanMs: 30 * 24 * 60 * 60 * 1000 }, // Opt-in: run.purge on every tick
+  // onTick: async (counts) => { ... }, // 1.0.0-alpha.21: called at the end of every runMaintenanceTick() (see "Exporting gauges")
+  // onTickTimeoutMs: 5_000,          // 1.0.0-alpha.21: runMaintenanceTick() waits for onTick at most this long, then returns the counts and logs a warning
   // serves: "all",                   // 1.0: turn definition-version filtering off
 });
 ```
@@ -332,9 +360,17 @@ Each maintenance step runs in its own error boundary — if one step fails, the 
 
 ## Degraded event sink
 
-The outbox is the durable record; the `EventSink` is a delivery attempt. When
-publishing fails, `outbox.flush` releases the events it had claimed so the next
-flush retries them, and reports `eventSinkStatus: "degraded"` with
+The outbox is the durable record. Events are delivered at least once while retries remain. Delivery can duplicate whenever the sink effect happens without a durable acknowledgement. Examples include a crash or write error after acceptance, an emit in flight at expiry, a sink that commits and then rejects, and partial plugin success. Deduplicate using the outbox `eventId` supplied to the sink or plugin. `workflowRunId` and `sequence` order events within a run, but are not a permanent identity: after an operator deletes the newest outbox rows, the Prisma store can reuse a sequence. Failures exhaust the retry budget and move the event to the DLQ; `plugin.replayDLQ` makes it eligible again. The engine’s progress never depends on the sink. `publishedAt` is written only after the sink resolves. The default 60-second lease starts before the claim query. The flush checks its clock again after awaiting the claim, immediately before each emit. It warns and reports degraded if a claim expires before delivery. A timeout stops further claims and emits. An emit already in flight can settle under its owner fence. Maintenance ticks and `runToCompletion` wait at most `outboxFlushTimeoutMs` (default 5,000 ms) for a flush, so a hanging sink cannot block run progress. The serverless post-job claim lasts `outboxFlushTimeoutMs + 60_000` ms and Node shutdown uses the remaining shutdown wait plus 60,000 ms ms, both capped at 2,147,483,647 ms. A batch shares its claim deadline, so a slow sink can leave later events for a future flush. Synchronize host clocks.
+
+Order is decided at claim time. A replayed dead letter is delivered after later events of its run already claimed or published before replay. After replay, later unclaimed events wait behind it. Different runs in a page can reach the sink concurrently. The Prisma cursor follows the recorded outbox ranks across fresh host instances. The Prisma store walks run IDs in database order and wraps after the last run claimed by that persistence instance. A retrying run cannot hold the first slot on every flush while another run is ready. Old index entries that a PostgreSQL snapshot prevents vacuum from removing can add work to a head lookup. The sink and plugin handlers receive optional delivery metadata with `eventId`, `workflowRunId`, `sequence` and `attempt`. The attempt is recorded failures plus one, so crashes or overlaps may repeat it. Claimed events count as unpublished in `engine.stats` and the console shows a live claim as claimed.
+
+An alpha.20 flusher ignores new claims and can lose an event by stamping before emit. Stop all alpha.20 flushers before relying on the new guarantee. A legacy stamp without a claim means published to the new code; an event already lost by an old flusher cannot be recovered.
+
+Nothing in the engine deletes outbox rows; `run.purge` leaves them. For a purged run, a flush skips a live claim until it completes or expires, skips published rows, and skips dead letters until replay; only an operator removes rows with SQL. If a persistence write fails, `kernel.dispatch` rejects without logging; host maintenance logs `outbox.flush error` and reports degraded delivery. A later flush recovers still-claimed rows after expiry; if the write committed before the error, its recorded outcome applies.
+
+When
+publishing fails, `outbox.flush` releases the failed event so the next
+flush retries it, and reports `eventSinkStatus: "degraded"` with
 `eventSinkError` set to the first failure of that flush. Nothing about a run
 stalls: the poller advances runs, not the sink. `OutboxFlushResult` carries
 `published`, `failed`, `deadLettered`, `eventSinkStatus` and `eventSinkError?`,
@@ -381,6 +417,7 @@ import {
 | `executeJobWithHeartbeat(kernel, options)` | Dispatches `job.execute` for one job (passing the job's `attempt`/`maxAttempts` and an `abortSignal`), dispatching `job.heartbeat` on `jobHeartbeatIntervalMs` for its duration (renews the lease, aborts the body on cancel or a lost lease), then routes the outcome through the job transport (`complete`/`suspend`/`fail`/`defer`, fenced with the job's `startedAt`) and `run.transition` when terminal. Returns an `ExecuteJobOutcome` (`outcome`, `error?`, `dead?`, `willRetry?`, `attempt?`, `maxAttempts?`, `retryDelayMs?`, `deferred?`). |
 | `runMaintenanceTick(kernel, options)` | Runs one bounded maintenance pass -- `run.claimPending`, `stage.pollSuspended` (transitioning any resumed runs), `lease.reapStale` (both lease tiers), `outbox.flush`, `run.reapStuck`, and `run.purge` when `retention` is set. Each command's error is caught and logged independently so one failure doesn't block the rest of the tick. |
 | `HOST_DEFAULTS` | The shared tuning defaults (`workerId`, `logPrefix`, `staleLeaseThresholdMs` 300s, `jobAbsoluteTimeoutMs` 1h, `maxClaimsPerTick` 10, `maxSuspendedChecksPerTick` 10, `maxOutboxFlushPerTick` 100, `jobHeartbeatIntervalMs` 60s, `maxAttempts` 3, `versionDeferMs` 30s, `computeStuckThresholdMs()`) both built-in hosts fall back to. Every field of both option bags is optional, so `runMaintenanceTick(kernel)` and `executeJobWithHeartbeat(kernel, { jobTransport, job })` work as-is. |
+| `runTickHook(hook, counts, logPrefix, timeoutMs?)` / `MaintenanceTickHook` | What both hosts use to call `onTick`: passes the hook a copy of `counts` and logs, rather than throws, whatever it throws. With `timeoutMs` it stops waiting after that long, logs one warning and leaves the hook running (the serverless host); without it, it settles when the hook does (the Node host calls it without awaiting). For a custom loop. |
 | `createEventSinkMonitor()` / `EventSinkHealth` | The degraded-sink state machine the Node host uses, for a custom loop (see "Degraded event sink"). |
 | `toErrorMessage(error)` | Normalizes a caught `unknown` into a display-safe string (`Error#message`, or `String(error)`). |
 

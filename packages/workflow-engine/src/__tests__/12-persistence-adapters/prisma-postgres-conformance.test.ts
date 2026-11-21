@@ -895,6 +895,7 @@ if (!DATABASE_URL) {
       const REJECTED = isPrisma8 ? /^fromPrisma8: / : /./;
 
       const FILTERS: Array<[string, unknown, string]> = [
+        ["endsWith", { workflowName: { endsWith: "b" } }, "a,b,c,d"],
         ["no where", undefined, ALL],
         [
           "in with quotes, commas and NULL as text",
@@ -1310,7 +1311,6 @@ if (!DATABASE_URL) {
           { startedAt: "2026-01-01T02:00:00.000+02:00" },
         ],
         ["contains", { workflowName: { contains: "b" } }],
-        ["endsWith", { workflowName: { endsWith: "b" } }],
         ["mode", { workflowName: { startsWith: "a", mode: "insensitive" } }],
         ["lt on JSON", { metadata: { lt: 1 } }],
         ["a JSON path with not", { metadata: { path: ["k"], not: 1 } }],
@@ -4740,7 +4740,7 @@ if (!DATABASE_URL) {
         expect(lag).toBeLessThan(60_000);
       });
 
-      it("stamps publishedAt in UTC when the outbox sweep claims events on a non-UTC session", async () => {
+      it("writes publishedAt in UTC only after delivery on a non-UTC session", async () => {
         const persistence = createPrismaWorkflowPersistence(tzPrisma);
         await persistence.appendOutboxEvents([
           {
@@ -4753,10 +4753,22 @@ if (!DATABASE_URL) {
         ]);
 
         const before = Date.now();
-        const [claimed] = await persistence.claimUnpublishedOutboxEvents();
+        const now = new Date();
+        const claim = `${new Date(now.getTime() + 60_000).toISOString()}|tz`;
+        const [claimed] = await persistence.claimOutboxDelivery(
+          1,
+          claim,
+          now,
+          [],
+        );
         expect(claimed?.workflowRunId).toBe("tz-outbox-run");
+        expect(claimed?.publishedAt).toBeNull();
+        await persistence.completeOutboxDelivery(claimed!.id, claim, now);
+        const [stored] = await tzPrisma.outboxEvent.findMany({
+          where: { id: claimed!.id },
+        });
         expect(
-          Math.abs((claimed?.publishedAt?.getTime() ?? 0) - before),
+          Math.abs((stored?.publishedAt?.getTime() ?? 0) - before),
         ).toBeLessThan(60_000);
       });
 

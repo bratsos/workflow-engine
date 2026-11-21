@@ -14,6 +14,7 @@ export {
   type BlobPrismaClient,
   createPrismaBlobStore,
   PrismaBlobStore,
+  type PrismaBlobStoreOptions,
 } from "./blob-store";
 export { createEnumHelper, type PrismaEnumHelper } from "./enum-compat";
 export {
@@ -28,12 +29,22 @@ export {
   type PrismaJobQueueOptions,
 } from "./job-queue";
 export {
+  OutboxClaimUnsupportedError,
+  OutboxSchemaMissingError,
+} from "./outbox-claim";
+export {
   createPrismaWorkflowPersistence,
   type DatabaseType,
   PrismaWorkflowPersistence,
   type PrismaWorkflowPersistenceOptions,
 } from "./persistence";
 export type { EnginePrismaClient, PrismaDelegate } from "./prisma-client-type";
+export {
+  assertSqliteDateStorage,
+  SQLITE_DATE_STORAGE_DOCS,
+  SqliteDateStorageError,
+  SqliteDateStorageUnverifiedError,
+} from "./sqlite-date-guard";
 export {
   createPrismaStepLedger,
   PrismaStepLedger,

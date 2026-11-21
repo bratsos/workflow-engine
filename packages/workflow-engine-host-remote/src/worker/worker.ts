@@ -1,3 +1,4 @@
+import { assertTimerMs } from "@bratsos/workflow-engine/kernel";
 import type { WorkerTransport } from "../transport.js";
 import type { RemoteStage } from "./run-activity.js";
 import { runActivity } from "./run-activity.js";
@@ -15,9 +16,15 @@ export interface ActivityWorkerConfig {
    * intentionally well below the broker's default stale-lease window (60 000 ms)
    * — at least one heartbeat fires before any stale-lease sweep can release the
    * lease. Rule: heartbeatMs < staleLeaseMs (a safe margin is heartbeatMs ≤
-   * staleLeaseMs / 4).
+   * staleLeaseMs / 4). A number from 1 to 2147483647 (a timer honours nothing
+   * else); anything else throws a `RangeError` from `createActivityWorker`.
    */
   heartbeatMs?: number;
+  /**
+   * How long (ms) the loop waits when there was no task to lease (default
+   * 500), and the base of its backoff after a failure. A number from 1 to
+   * 2147483647; anything else throws a `RangeError` from `createActivityWorker`.
+   */
   idleDelayMs?: number;
   /**
    * Called whenever processOne() throws (e.g. a permanent lease/version
@@ -26,6 +33,11 @@ export interface ActivityWorkerConfig {
    * loop also backs off (capped by maxBackoffMs) as this count grows.
    */
   onError?: (error: unknown, info: { consecutiveFailures: number }) => void;
+  /**
+   * Cap (ms) on the backoff between consecutive failures (default 30 000). A
+   * number from 1 to 2147483647; anything else throws a `RangeError` from
+   * `createActivityWorker`.
+   */
   maxBackoffMs?: number;
 }
 
@@ -38,9 +50,15 @@ export interface ActivityWorker {
 export function createActivityWorker(
   cfg: ActivityWorkerConfig,
 ): ActivityWorker {
-  const heartbeatMs = cfg.heartbeatMs ?? 5_000;
-  const idleDelayMs = cfg.idleDelayMs ?? 500;
-  const maxBackoffMs = cfg.maxBackoffMs ?? 30_000;
+  // All three end in a timer (`setInterval` for the heartbeat, `setTimeout` for
+  // the idle wait and the backoff); a value a timer cannot honour would fire
+  // after 1 ms, so they are checked before the worker exists.
+  const heartbeatMs = assertTimerMs("heartbeatMs", cfg.heartbeatMs ?? 5_000);
+  const idleDelayMs = assertTimerMs("idleDelayMs", cfg.idleDelayMs ?? 500);
+  const maxBackoffMs = assertTimerMs(
+    "maxBackoffMs",
+    cfg.maxBackoffMs ?? 30_000,
+  );
   const onError =
     cfg.onError ??
     ((error: unknown, info: { consecutiveFailures: number }) => {

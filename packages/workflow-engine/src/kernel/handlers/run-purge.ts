@@ -2,10 +2,10 @@
  * Handler: run.purge
  *
  * Retention sweep. Deletes terminal runs that finished at or before the
- * cutoff, bounded by `limit`, and takes everything the engine stored for
- * them along: the durable-step ledger, the run's blobs, its job rows, and
+ * cutoff, bounded by `limit`, and takes the following along: the durable-step ledger, the run's blobs, its job rows, and
  * the run row itself (stages, logs, artifacts and annotations go with it
- * through `PersistenceCore.deleteRun`).
+ * through `PersistenceCore.deleteRun`). Not the run's `outbox_events` (no
+ * foreign key, nothing in the engine deletes them) nor its `ai_calls`.
  *
  * INVARIANT: jobs, ledger rows and blobs are removed in `_postCommit`, never
  * inside the persistence transaction (see run-cancel.ts). These ports use

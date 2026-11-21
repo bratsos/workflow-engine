@@ -570,6 +570,12 @@ export function createSpillingJobTransport(
             Promise.resolve(0),
         }
       : {}),
+    ...(transport.getJobStats
+      ? { getJobStats: () => transport.getJobStats!() }
+      : {}),
+    ...(transport.verifyStorage
+      ? { verifyStorage: () => transport.verifyStorage!() }
+      : {}),
     ...(transport.adoptWorkerId
       ? {
           adoptWorkerId: (workerId: string) =>

@@ -63,10 +63,18 @@ You can tune the host's polling frequency, lease times, and execution limits:
 | **`maxClaimsPerTick`** | `number` | `10` | Maximum number of pending workflow runs to claim in a single orchestration tick. |
 | **`maxSuspendedChecksPerTick`**| `number` | `10` | Maximum number of suspended stage completion checks to perform in a single tick. |
 | **`maxOutboxFlushPerTick`** | `number` | `100` | Maximum number of outbox events to publish in a single tick. |
+| **`outboxFlushTimeoutMs`** | `number` | `5000` | Maximum time a maintenance tick waits for the sink. An in-flight emit can continue after the timeout. |
 | **`retention`** | `{ olderThanMs, statuses?, limit? }` | off | Delete terminal runs older than `olderThanMs` (with their stages, logs, artifacts, annotations, step ledger, job rows and blobs) through `run.purge` at the end of every tick. Nothing is deleted unless set. See [Run Retention](../troubleshooting/overview.md#run-retention). |
+| **`onTick`** | `(counts: MaintenanceTickCounts) => void \| Promise<void>` | none | Called after every orchestration tick with a copy of the counts that tick computed. Must be a function: anything else throws a `TypeError` from `createNodeHost`. It runs outside the tick, so ticks never wait for what it awaits (its synchronous code runs on the host's thread): at most one call is in flight, and a tick that finds the previous call still running skips the hook and logs one warning at the first skip. A hook that throws or rejects is caught and logged. A hook must not await `host.stop()`. See [Exporting gauges with `onTick`](#exporting-gauges-with-ontick). |
 | **`serves`** | `ServedDefinition[] \| "all"` | derived from the registry | Which definition versions this host may claim, poll and dequeue. Left unset, the kernel derives it from the registry, which is what makes a rolling deploy safe. `"all"` turns version filtering off entirely — the pre-1.0 behaviour. See [Definition versioning](../core-concepts/definition-versioning.md). |
-| **`shutdownTimeoutMs`** | `number` | `10000` (10s) | Upper bound on `stop()`: how long to wait for the in-flight job (and the in-flight orchestration tick) to finish, and separately for the final outbox flush. |
-| **`flushOutboxOnStop`** | `boolean` | `true` | Run a final `outbox.flush` in `stop()`, so `workflow:completed` for a run this process finished is published before it exits rather than by whichever process ticks next. |
+| **`shutdownTimeoutMs`** | `number` | `10000` (10s) | Upper bound on `stop()`: how long to wait for the in-flight orchestration tick and `onTick` call, then for the in-flight job to finish, and separately for the final outbox flush. |
+| **`flushOutboxOnStop`** | `boolean` | `true` | Attempt a final `outbox.flush` in `stop()`; events not delivered before the timeout remain available to a later flush. |
+
+Every option that reaches a timer (`orchestrationIntervalMs`, `jobPollIntervalMs`, `postJobYieldMs`, `jobHeartbeatIntervalMs`, `shutdownTimeoutMs`) must be a number of milliseconds from `1` to `2147483647` (the longest delay a timer honours, about 24.8 days); `postJobYieldMs` may also be `0`, which turns the pause off. Anything else (`Infinity`, `NaN`, zero, a negative number) makes `createNodeHost` throw a `RangeError` that names the option, because a timer fires after 1 ms on such a value: an interval becomes a busy loop and a bound meant as "no limit" becomes the tightest one. Nothing switches `shutdownTimeoutMs` off; pass `2147483647` to wait for practically anything. `runAndWait` applies the same rule to `pollIntervalMs`, before it creates the run.
+
+If a timer option or `onTick` value cannot be formatted, the constructor still throws the validation error and describes the value as `Unprintable error`.
+
+`start()` first calls the job transport's optional `verifyStorage()` and rejects with its error, before it starts a timer, a loop or a signal handler, when the storage may not be used: with the Prisma SQLite adapters that is a file another Prisma major wrote (`SqliteDateStorageError`, see [A SQLite file belongs to the Prisma major that created it](../persistence/prisma-setup.md#a-sqlite-file-belongs-to-the-prisma-major-that-created-it)). Without it the host would run and log the same error on every tick. A check that cannot run rejects `start()` with `SqliteDateStorageUnverifiedError`; call `start()` again to retry. A `stop()` that returns while the check is still pending cancels the start: nothing is installed when the check settles.
 
 `workerId` also reaches `job_queue.workerId`: a `createPrismaJobQueue(prisma)` built without a `workerId` of its own adopts the host's on `start()`, so the job row says which worker ran the stage.
 
@@ -81,7 +89,9 @@ During a graceful shutdown (when `SIGTERM` is received, or `host.stop()` is call
 1. The host stops accepting new jobs from the queue and skips further orchestration ticks.
 2. The job currently running, and any orchestration tick in flight, are allowed to finish (bounded by `shutdownTimeoutMs`).
 3. A final `outbox.flush` publishes the events this process committed (unless `flushOutboxOnStop: false`).
-4. The `host.start()` promise resolves. Errors during shutdown are logged, never thrown.
+4. The `host.stop()` promise resolves. Errors during shutdown are logged, never thrown.
+
+Each start owns its tick and job loop. A stopped tick cannot call `onTick` after a restart. A stopped job loop starts no further dequeue or job execution. If a dequeue is still pending when shutdown returns, the replacement loop waits for it to settle. A job that the old dequeue leased is not run. The host returns it to the queue with `defer`, fenced by the job's lease, so the job keeps its attempt count and becomes due at once. The replacement loop waits for that `defer` at most `shutdownTimeoutMs`; if it has not answered by then, the host logs it and the new loop starts. A `defer` that commits later is still fenced by the lease, and one that never commits leaves the job to be recovered when its lease expires. With a transport that has no `defer`, the job is recovered when its lease expires.
 
 If your process manager (e.g. PM2, Kubernetes) manages process lifecycles, you can manually trigger a stop:
 
@@ -132,7 +142,7 @@ outbox flush.
 * **`healthy`** -- the last flush published everything it claimed.
 * **`degraded`** -- the last flush could not publish at least one event.
 
-A degraded sink is a *delivery-latency* problem, never a progress problem.
+Events are delivered at least once while retries remain. Delivery can duplicate whenever the sink effect happens without a durable acknowledgement. Examples include a crash or write error after acceptance, an emit in flight at expiry, a sink that commits and then rejects, and partial plugin success. Deduplicate using the outbox `eventId` supplied to the sink or plugin. `workflowRunId` and `sequence` order events within a run, but are not a permanent identity: after an operator deletes the newest outbox rows, the Prisma store can reuse a sequence. Failures exhaust the retry budget and move the event to the DLQ; `plugin.replayDLQ` makes it eligible again. The engine’s progress never depends on the sink. After `run.purge`, a flush skips a live claim until it completes or expires, skips published rows, and skips dead letters until replay. The engine never deletes outbox rows; operators remove them with SQL.
 Events live in the transactional outbox, the poller (not the sink) is what
 advances a run, and the events left behind are retried on the next flush. A
 run started while the sink is down still reaches `COMPLETED`.
@@ -152,6 +162,37 @@ own: those events have exhausted their retry budget and stop retrying. Alert
 on `eventSink.status === "degraded"` to see the problem before the queue
 fills, and on `eventSink.deadLettered` growing to see that it already has.
 Replay them with the `plugin.replayDLQ` command once the sink is back.
+
+### Exporting gauges with `onTick`
+
+`onTick` receives a copy of the counts of the tick that just ran (mutating it changes nothing else; `claimed`, `suspendedChecked`, `staleReleased`, `staleExpired`, `eventsFlushed`, `stuckReaped`, `purged`, `eventsFailed`, `eventsDeadLettered`, `eventSinkStatus` and, when the sink is degraded, `eventSinkError`). Dispatch [`engine.stats`](../core-concepts/kernel-and-ports.md#observing-the-engine) from it for queue depth and age. `metrics` below stands for your own metrics client; the engine depends on none.
+
+```typescript
+const host = createNodeHost({
+  kernel,
+  jobTransport,
+  workerId: "worker-prod-1",
+  onTick: async (counts) => {
+    metrics.increment("workflow_events_flushed", counts.eventsFlushed);
+
+    const stats = await kernel.dispatch({ type: "engine.stats" });
+    if (stats.jobs.available) {
+      metrics.gauge("workflow_jobs_pending", stats.jobs.byStatus.PENDING);
+      metrics.gauge("workflow_jobs_oldest_pending_age_ms", stats.jobs.oldestPendingAgeMs ?? 0);
+    }
+    if (stats.outbox.available) {
+      metrics.gauge("workflow_outbox_dead_lettered", stats.outbox.deadLettered);
+    }
+  },
+});
+```
+
+The hook runs outside the tick, so the engine's liveness does not depend on it: claiming, polling suspended stages, lease reaping, the outbox flush and `run.reapStuck` go on whatever the hook awaits. This holds for a hook that yields (awaits I/O or a timer): measured with a hook that never settles, the host ran 16 ticks in 155 ms against 15 without a hook. Synchronous code in the hook runs on the host's thread and no tick runs while it does: a hook that computed for 40 ms on each call at a 10 ms interval left room for five calls in 202 ms. Keep the hook's synchronous part short and await the rest.
+
+- At most one call is in flight. A tick that finds the previous call still running skips the hook and logs one warning the first time that happens (`[NodeHost] onTick hook is still running after <n> ms and ticks skip it while it runs; ...`); the hook is called again on the first tick after it settles. The warning is not repeated while the hook stays slower than the interval: a call that finishes without any tick having skipped it ends the episode, and the next skip warns again. A hook that never settles is therefore called once and warned about once, and gauges stop updating until it does settle: bound what it waits on (a timeout on the HTTP call) so they do not.
+- A hook that throws or rejects is caught and logged (`[NodeHost] onTick hook error:`); it never stops the loop.
+- `stop()` waits for a running hook for at most `shutdownTimeoutMs`, together with the in-flight tick. No hook starts once `stop()` has begun.
+- A hook must not `await host.stop()`. `stop()` waits for the running hook, which is waiting for `stop()`, so the call returns only after `shutdownTimeoutMs` has elapsed (the host is already stopping by then, and the hook is not called again). Call `void host.stop()` from a hook if it has to stop the host, or stop it from outside.
 
 ---
 
@@ -227,3 +268,5 @@ const result = await runAndWait({
 console.log(`Run ${result.runId} finished as ${result.status}`);
 console.log(result.output);
 ```
+
+A flush starts no further claims or sink calls after its timeout or after Node shutdown cancels its tick. A claim already sent to the database can finish, and a sink call already in flight can settle under its original owner fence.

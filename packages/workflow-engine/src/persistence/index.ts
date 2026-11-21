@@ -58,18 +58,22 @@ export type {
   WorkflowStageStatus,
   WorkflowStatus,
 } from "./interface";
-
 // Export Prisma implementations
 export {
+  assertSqliteDateStorage,
   createPrismaAICallLogger,
   createPrismaBlobStore,
   createPrismaJobQueue,
   createPrismaStepLedger,
   createPrismaWorkflowPersistence,
   fromPrisma8,
+  OutboxClaimUnsupportedError,
+  OutboxSchemaMissingError,
   PrismaAICallLogger,
   PrismaBlobStore,
   PrismaJobQueue,
   PrismaStepLedger,
   PrismaWorkflowPersistence,
+  SqliteDateStorageError,
+  SqliteDateStorageUnverifiedError,
 } from "./prisma";

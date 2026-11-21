@@ -41,3 +41,20 @@ exports.createSqliteDb = (file) => {
   );
   return sqlite({ contract, path: file });
 };
+
+// Opens a file that already holds tables, without `db init`: for a file this
+// contract did not create (the date-storage guard's tests hand-build one whose
+// dates are integers, as a Prisma 6 file's are).
+exports.openSqliteDb = (file) => {
+  execFileSync(process.execPath, [prismaBin, "contract", "emit"], {
+    cwd: __dirname,
+    env: { ...process.env, DATABASE_URL: `file:${file}` },
+    stdio: "pipe",
+  });
+  const contract = contractFromJson(
+    JSON.parse(
+      readFileSync(join(__dirname, ".generated/contract.json"), "utf8"),
+    ),
+  );
+  return sqlite({ contract, path: file });
+};

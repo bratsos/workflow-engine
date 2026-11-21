@@ -7,7 +7,7 @@
  */
 
 import type { KernelEvent, KernelEventType } from "./events.js";
-import type { EventSink } from "./ports.js";
+import type { EventSink, OutboxDeliveryMetadata } from "./ports.js";
 
 // ============================================================================
 // Types
@@ -17,7 +17,10 @@ export interface PluginDefinition<T extends KernelEventType = KernelEventType> {
   readonly id: string;
   readonly name: string;
   readonly on: readonly T[];
-  handle(event: Extract<KernelEvent, { type: T }>): Promise<void>;
+  handle(
+    event: Extract<KernelEvent, { type: T }>,
+    delivery?: OutboxDeliveryMetadata,
+  ): Promise<void>;
 }
 
 export interface PluginRunnerConfig {
@@ -61,12 +64,16 @@ export function createPluginRunner(config: PluginRunnerConfig): PluginRunner {
   return {
     maxRetries,
 
-    async emit(event: KernelEvent): Promise<void> {
+    async emit(
+      event: KernelEvent,
+      delivery?: OutboxDeliveryMetadata,
+    ): Promise<void> {
       const matching = handlersByType.get(event.type);
       if (!matching || matching.length === 0) return;
 
       for (const plugin of matching) {
-        await plugin.handle(event as any);
+        if (delivery === undefined) await plugin.handle(event as any);
+        else await plugin.handle(event as any, delivery);
       }
     },
   };

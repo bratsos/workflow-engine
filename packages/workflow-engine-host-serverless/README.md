@@ -53,7 +53,7 @@ Creates a new serverless host instance.
 | `maxOutboxFlushPerTick` | `number` | `100` | Max outbox events to flush per tick |
 | `retention` | `RetentionOptions` | off | `{ olderThanMs, statuses?, limit? }`: delete terminal runs through `run.purge` at the end of every tick |
 | `flushOutboxAfterJob` | `boolean` | `true` | Publish the job's outbox events right after `handleJob` settles it |
-| `outboxFlushTimeoutMs` | `number` | `5_000` | Bound on that post-job flush; errors are logged, not thrown |
+| `outboxFlushTimeoutMs` | `number` | `5_000` | Bound on post-job and maintenance flushes; an in-flight emit can continue after timeout |
 
 ### `ServerlessHost`
 
@@ -248,3 +248,5 @@ Consumers wire platform-specific glue (queue ack/retry, `waitUntil`, cron trigge
 ## License
 
 MIT
+
+A timed-out outbox flush starts no further claims or sink calls. A claim already sent to the database can finish, and a sink call already in flight can settle under its original owner fence. A tick on a caller-owned transaction reports `outboxDeferred: true`. Flush on the root client after commit.

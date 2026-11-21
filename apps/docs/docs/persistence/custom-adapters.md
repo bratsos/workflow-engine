@@ -57,6 +57,8 @@ class MyCustomPersistence implements WorkflowPersistence {
   async insertDefinitionIfAbsent(...): Promise<...> { ... }
   async getDefinition(workflowId: string, version: string): Promise<... | null> { ... }
   async countRunsByDefinitionVersion(...): Promise<...> { ... }
+  // Observability (engine.stats)
+  async getActiveWorkStats(now: Date): Promise<ActiveWorkStats> { ... } // optional, see "Active-work stats"
 
   // Stages
   async createStage / upsertStage / updateStage / getStage / getStagesByRun / deleteStage
@@ -64,7 +66,8 @@ class MyCustomPersistence implements WorkflowPersistence {
 
   // Logs, annotations, outbox, idempotency
   async createLog / appendAnnotations / listAnnotations
-  async appendOutboxEvents / getUnpublishedOutboxEvents / claimUnpublishedOutboxEvents / releaseOutboxEvents
+  async appendOutboxEvents / getUnpublishedOutboxEvents / claimOutboxDelivery / isOutboxDeliveryClaimActive?
+  async completeOutboxDelivery / failOutboxDelivery
   async markOutboxEventsPublished / incrementOutboxRetryCount / moveOutboxEventToDLQ / replayDLQEvents
   async acquireIdempotencyKey / completeIdempotencyKey / releaseIdempotencyKey
 }
@@ -74,7 +77,10 @@ Points that are easy to get wrong, all covered by the conformance suite:
 
 * **`claimNextPendingRun({ serves })`**: a pinned run is claimable only by a caller presenting its `(workflowId, version)` pair; an *unpinned* run (`definitionVersion` null) only by a caller whose `serves` names its workflow; an empty `serves` claims nothing. Omit `serves` (or pass `"all"`) for the version-blind predicate. Bind the `now` the kernel passes rather than the database's `NOW()`.
 * **`getSuspendedStages(beforeDate, { limit, serves, includeSettlements })`** owns both narrowings: oldest `nextPollAt` first, capped at `limit`, and only stages of runs the caller serves. An adapter without a `definitionVersion` column may ignore `serves`. When `includeSettlements` is true, also return `COMPLETED` and `FAILED` stages with a due `nextPollAt`; the poller uses those rows to retry job settlement without executing a stage again.
-* **`claimUnpublishedOutboxEvents(limit)`** must stamp `publishedAt` atomically (`FOR UPDATE SKIP LOCKED` on Postgres, a per-row compare-and-set elsewhere) so two hosts flushing the same outbox do not both deliver an event; `releaseOutboxEvents(ids)` hands back the events of a run whose emit threw.
+* **Outbox delivery:** implement `claimOutboxDelivery(limit, claim, now, excludedRunIds, signal?)`, `completeOutboxDelivery(id, claim, now)` and `failOutboxDelivery(id, claim, maxRetries, now)`. This is a breaking change for custom adapters; `createKernel` rejects an adapter missing any of them. `isOutboxDeliveryClaimActive(id, claim, now)` is optional: the kernel never calls it, and `persistenceConformanceSuite` checks it only when present. Claims must be atomic, unique to the owner, and expire; never claim a later live event of a run while its earlier event remains unpublished. A claim is encoded as an ISO expiry, `|`, and a unique owner. Excluded runs must not be claimed. `completeOutboxDelivery` writes `publishedAt` only for its own claim and an unstamped live row. `failOutboxDelivery` atomically increments retries, clears its own claim, and sets `dlqAt` when the budget is exhausted; return `lost` if ownership or the live state changed. All writes must be indexed by event ID. Rotate service among ready runs so a repeatedly failing head cannot starve a different run. Honor the optional abort signal before starting each additional claim write.
+* **Claim selection:** Read a bounded page of run heads. A page can also hold a claimed run's next live events, adjacent and in sequence order; the kernel delivers a run's events one after another and stops the run at its first failure, so `failOutboxDelivery` must release that run's other events under the same claim. Different runs in the page can reach the sink concurrently. `claimOutboxDelivery` must return only rows it now owns: the kernel emits them without reading ownership again. The optional `completeOutboxDeliveries(ids, claim, now)` lets the kernel acknowledge the events accepted together with one call; without it the kernel calls `completeOutboxDelivery` per event. Return the persisted retry count from acquisition. Live or retrying predecessors block successors at claim time. Order is decided at claim time. A replayed dead letter is delivered after later events of its run already claimed or published before replay. After replay, later unclaimed events wait behind it. Skip blocked runs without reading their backlogs.
+* **Caller transactions:** Mark an uncommitted view with `outboxDeliveryDeferred: true`. The kernel defers delivery on that view until the application calls the root-client flush after commit.
+* **Replay:** `replayDLQEvents` clears `dlqAt`, `retryCount`, any legacy `publishedAt` and the claim. A dead letter no longer blocks later events. Events are delivered at least once while retries remain. Delivery can duplicate whenever the sink effect happens without a durable acknowledgement. Examples include a crash or write error after acceptance, an emit in flight at expiry, a sink that commits and then rejects, and partial plugin success. Deduplicate using the outbox `eventId` supplied to the sink or plugin. `workflowRunId` and `sequence` order events within a run, but are not a permanent identity: after an operator deletes the newest outbox rows, the Prisma store can reuse a sequence. Failures exhaust the retry budget and move the event to the DLQ; `plugin.replayDLQ` makes it eligible again. The engine’s progress never depends on the sink. After `run.purge`, a flush skips a live claim until it completes or expires, skips published rows, and skips dead letters until replay. The engine never deletes outbox rows; operators remove them with SQL. The published `persistenceConformanceSuite` checks ownership, expiry, concurrent claims and replay.
 * **`listRunsForPurge` / `deleteRun`** back `run.purge`; `deleteRun` must take stages, logs, artifacts and annotations with the run, and must recheck `cutoff` and `statuses` in the delete itself: a run redriven after it was listed stays, and the method returns `false`.
 * **`UpdateStageInput`** accepts `null` for `errorMessage`, `completedAt` and `duration` (a redrive clears them when it reopens a stage) and carries `attempt`.
 * An adapter without the versioning schema returns `false` / `null` / `[]` from the four definition methods and ignores `serves`; runs then stay unpinned.
@@ -106,7 +112,9 @@ class MyCustomJobQueue implements JobQueue {
   async cancelByRun(workflowRunId: string): Promise<number> { ... }
   async getJobsByWorkflowRun(workflowRunId: string): Promise<JobRecord[]> { ... }
   async touchJob(jobId: string): Promise<void> { ... } // Heartbeat lock
+  async getJobStats(): Promise<JobQueueStats> { ... } // optional, see "Active-work stats"
   adoptWorkerId(workerId: string): string { ... } // optional: take the host's workerId on start()
+  async verifyStorage(): Promise<void> { ... } // optional: reject if the storage may not be used; a host's start() calls it
   readonly fairnessGroupBy?: string | null;         // optional: read by createSpillingJobTransport
 }
 ```
@@ -231,6 +239,29 @@ class MyCustomAICallLogger implements AICallLogger {
 ```
 
 * **`listCalls`** is optional. It returns the rows under a topic prefix, oldest first, with every cost figure `CreateAICallInput` carries (`cost`, `estimatedCost`, `reportedCost`, `costSource`, `servedBy`, `cachedInputTokens`, `reasoningTokens`) as recorded. An adapter that stores only `cost` still gives `getStats` and the run cost rollup the right total; it just cannot show the registry estimate beside the provider's bill afterwards.
+
+### Active-work stats
+
+`engine.stats` reads two optional methods: `Persistence.getActiveWorkStats(now)` and `JobQueue.getJobStats()` (`JobTransport` has the same one). Both are read-only and count `PENDING`, `RUNNING` and `SUSPENDED` rows, unpublished outbox events and dead letters. For SQL adapters, provide index paths that lead with `status`, `publishedAt` or `dlqAt` so the counts follow active work. A PostgreSQL planner with stale estimates can still scan terminal history until the next `ANALYZE`. Verify plans at scale and document any such limit.
+
+```typescript
+import type { ActiveWorkStats, JobQueueStats } from "@bratsos/workflow-engine";
+
+// getActiveWorkStats(now) returns:
+//   runs:   { byStatus: { PENDING, RUNNING, SUSPENDED }, oldestPendingCreatedAt: Date | null }
+//   stages: { byStatus, suspendedDue, oldestSuspendedDueAt }   // SUSPENDED and nextPollAt <= now
+//   outbox: { unpublished, oldestUnpublishedAt, deadLettered } // oldest by occurredAt
+// getJobStats() returns:
+//   { byStatus: { PENDING, RUNNING, SUSPENDED }, oldestPendingCreatedAt: Date | null }
+```
+
+* **`byStatus` has all three keys**, `0` for a status with no rows; never a key for a terminal status.
+* **`unpublished` and `deadLettered` are disjoint.** `unpublished` includes claimed and unclaimed rows (`publishedAt` and `dlqAt` both null); an event in the dead-letter queue is only in `deadLettered`, and does not count toward `oldestUnpublishedAt`.
+* **`suspendedDue` uses `getSuspendedStages`'s predicate**: `status = SUSPENDED` and `nextPollAt <= now`, with the `now` the kernel passes. Settled stages that still carry a deadline are not counted.
+* **Omit a method and its sections are `{ available: false }`** in the `engine.stats` result (`runs`, `stages` and `outbox` for persistence, `jobs` for the queue). The command never throws for a missing method, and never reports a missing figure as zero.
+* **Check your plan, with and without statistics.** A filter that is true of every terminal row (`dlqAt IS NULL`, say) can make a planner drive the query from the wrong index and read them all, and PostgreSQL with no statistics (a fresh bulk load, a table never analysed) estimates `IS NULL` at 0.5%, a one-sided range at a third of the table and a two-sided one at 0.5%, so the plan can change with the table's size. The built-in adapters' notes in `PrismaWorkflowPersistence.getActiveWorkStats` and `LIVE_OUTBOX` list what was measured. If you wrap a transport, forward `getJobStats` only when the inner transport has it, as `createSpillingJobTransport` does.
+
+The conformance suites cover both methods. An adapter that omits one passes them without the method being checked: the tests return early when it is absent; they are not reported as skipped.
 
 ---
 

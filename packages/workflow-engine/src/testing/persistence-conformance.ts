@@ -35,7 +35,6 @@ import type {
   CreateStageInput,
   EnqueueJobInput,
   JobQueue,
-  OutboxRecord,
   SaveArtifactInput,
   UpdateStageInput,
   WorkflowArtifactRecord,
@@ -173,6 +172,19 @@ export function persistenceConformanceSuite(
   api: ConformanceTestApi,
 ) {
   const { describe, it, expect, beforeEach } = api;
+  /** `isOutboxDeliveryClaimActive` is optional: an adapter without it skips the check. */
+  const expectClaimActive = async (
+    persistence: WorkflowPersistence,
+    id: string,
+    claim: string,
+    now: Date,
+    active: boolean,
+  ) => {
+    if (persistence.isOutboxDeliveryClaimActive)
+      expect(
+        await persistence.isOutboxDeliveryClaimActive(id, claim, now),
+      ).toBe(active);
+  };
   describe(`I want ${name} to conform to WorkflowPersistence interface`, () => {
     let persistence: ReturnType<PersistenceFactory>;
 
@@ -1705,6 +1717,347 @@ export function persistenceConformanceSuite(
     });
 
     describe("outbox operations", () => {
+      it("fences expired delivery claims and preserves per-run order", async () => {
+        const now = new Date("2025-01-01T00:00:00.000Z");
+        const firstClaim = "2025-01-01T00:01:00.000Z|first";
+        const secondClaim = "2025-01-01T00:02:00.000Z|second";
+        await persistence.appendOutboxEvents(
+          [1, 2].map((n) => ({
+            workflowRunId: "delivery-claim-run",
+            eventType: `event-${n}`,
+            payload: { n },
+            causationId: "claim-test",
+            occurredAt: now,
+          })),
+        );
+        const first = await persistence.claimOutboxDelivery(
+          1,
+          firstClaim,
+          now,
+          [],
+        );
+        expect(first.map((event) => event.sequence)).toEqual([1]);
+        expect(await persistence.getUnpublishedOutboxEvents()).toHaveLength(2);
+        expect(
+          await persistence.claimOutboxDelivery(10, secondClaim, now, []),
+        ).toEqual([]);
+        const later = new Date("2025-01-01T00:01:01.000Z");
+        const reclaimed = await persistence.claimOutboxDelivery(
+          1,
+          secondClaim,
+          later,
+          [],
+        );
+        expect(reclaimed[0]?.id).toBe(first[0]?.id);
+        await expectClaimActive(
+          persistence,
+          first[0]!.id,
+          firstClaim,
+          later,
+          false,
+        );
+        expect(
+          await persistence.completeOutboxDelivery(
+            first[0]!.id,
+            firstClaim,
+            later,
+          ),
+        ).toBe(false);
+        expect(
+          await persistence.failOutboxDelivery(
+            first[0]!.id,
+            firstClaim,
+            1,
+            later,
+          ),
+        ).toBe("lost");
+        expect(
+          await persistence.completeOutboxDelivery(
+            first[0]!.id,
+            secondClaim,
+            later,
+          ),
+        ).toBe(true);
+        expect(
+          (await persistence.claimOutboxDelivery(10, secondClaim, later, []))[0]
+            ?.sequence,
+        ).toBe(2);
+      });
+
+      it("releases failed claims and atomically dead-letters at the retry limit", async () => {
+        const now = new Date("2025-01-01T00:00:00.000Z");
+        const claim = "2025-01-01T00:01:00.000Z|owner";
+        await persistence.appendOutboxEvents([
+          {
+            workflowRunId: "delivery-failure-run",
+            eventType: "failed",
+            payload: {},
+            causationId: "failure",
+            occurredAt: now,
+          },
+        ]);
+        const [row] = await persistence.claimOutboxDelivery(10, claim, now, []);
+        expect(
+          await persistence.failOutboxDelivery(row!.id, claim, 2, now),
+        ).toBe("retry");
+        expect(
+          (await persistence.claimOutboxDelivery(10, claim, now, []))[0]
+            ?.retryCount,
+        ).toBe(1);
+        expect(
+          await persistence.failOutboxDelivery(row!.id, claim, 2, now),
+        ).toBe("dead-lettered");
+        expect(
+          await persistence.claimOutboxDelivery(10, claim, now, []),
+        ).toEqual([]);
+        expect(await persistence.replayDLQEvents(10)).toBe(1);
+        expect(
+          (await persistence.claimOutboxDelivery(10, claim, now, []))[0]
+            ?.retryCount,
+        ).toBe(0);
+      });
+
+      it("lets only one concurrent claimant acquire a run and respects legacy publication stamps", async () => {
+        const now = new Date("2025-01-01T00:00:00.000Z");
+        const claims = [
+          "2025-01-01T00:01:00.000Z|a",
+          "2025-01-01T00:01:00.000Z|b",
+        ];
+        await persistence.appendOutboxEvents(
+          [1, 2].map((n) => ({
+            workflowRunId: "delivery-concurrent-run",
+            eventType: `event-${n}`,
+            payload: {},
+            causationId: "concurrent",
+            occurredAt: now,
+          })),
+        );
+        const results = await Promise.all(
+          claims.map((claim) =>
+            persistence.claimOutboxDelivery(1, claim, now, []),
+          ),
+        );
+        expect(results.flat().map((event) => event.sequence)).toEqual([1]);
+        const winner = results.findIndex((rows) => rows.length > 0);
+        const row = results[winner]![0]!;
+        await persistence.markOutboxEventsPublished([row.id]);
+        await expectClaimActive(
+          persistence,
+          row.id,
+          claims[winner]!,
+          now,
+          false,
+        );
+        expect(
+          await persistence.completeOutboxDelivery(
+            row.id,
+            claims[winner]!,
+            now,
+          ),
+        ).toBe(false);
+        expect(
+          await persistence.failOutboxDelivery(row.id, claims[winner]!, 1, now),
+        ).toBe("lost");
+        expect(
+          (
+            await persistence.claimOutboxDelivery(
+              1,
+              claims[1 - winner]!,
+              now,
+              [],
+            )
+          )[0]?.sequence,
+        ).toBe(2);
+      });
+
+      it("serves other runs while their heads keep failing", async () => {
+        const now = new Date("2025-01-01T00:00:00.000Z");
+        const runs = ["retry-a", "retry-b", "retry-c", "retry-d"];
+        await persistence.appendOutboxEvents(
+          runs.map((workflowRunId) => ({
+            workflowRunId,
+            eventType: "delivery",
+            payload: {},
+            occurredAt: now,
+            causationId: "fairness",
+          })),
+        );
+        for (let round = 0; round < 2; round++) {
+          const attempted = [];
+          for (let i = 0; i < runs.length; i++) {
+            const claim = `2025-01-01T00:01:00.000Z|fairness-${round}-${i}`;
+            const [row] = await persistence.claimOutboxDelivery(
+              1,
+              claim,
+              now,
+              [],
+            );
+            expect(row).toBeDefined();
+            attempted.push(row!.workflowRunId);
+            expect(
+              await persistence.failOutboxDelivery(row!.id, claim, 10, now),
+            ).toBe("retry");
+          }
+          expect(attempted.sort()).toEqual(runs);
+        }
+      });
+
+      it("does not acquire a page for a cancelled flush", async () => {
+        const now = new Date("2025-01-01T00:00:00.000Z");
+        const claim = "2025-01-01T00:01:00.000Z|cancelled";
+        await persistence.appendOutboxEvents([
+          {
+            workflowRunId: "cancelled-flush",
+            eventType: "delivery",
+            payload: {},
+            occurredAt: now,
+            causationId: "cancel",
+          },
+        ]);
+        expect(
+          await persistence.claimOutboxDelivery(
+            1,
+            claim,
+            now,
+            [],
+            AbortSignal.abort(),
+          ),
+        ).toEqual([]);
+        expect(
+          await persistence.claimOutboxDelivery(1, claim, now, []),
+        ).toHaveLength(1);
+      });
+
+      it("schedules independent run heads and preserves a successor already claimed before replay", async () => {
+        const now = new Date("2025-01-01T00:00:00.000Z");
+        const token = "2025-01-01T00:01:00.000Z|replay";
+        const peer = "2025-01-01T00:01:00.000Z|peer";
+        const append = (workflowRunId: string, n: number) =>
+          persistence.appendOutboxEvents(
+            Array.from({ length: n }, () => ({
+              workflowRunId,
+              eventType: "delivery",
+              payload: {},
+              occurredAt: now,
+              causationId: "replay",
+            })),
+          );
+        await append("blocked", 105);
+        const [first] = await persistence.claimOutboxDelivery(
+          1,
+          token,
+          now,
+          [],
+        );
+        expect(
+          await persistence.failOutboxDelivery(first!.id, token, 1, now),
+        ).toBe("dead-lettered");
+        const [second] = await persistence.claimOutboxDelivery(
+          1,
+          token,
+          now,
+          [],
+        );
+        expect(second?.sequence).toBe(2);
+        expect(await persistence.replayDLQEvents(1)).toBe(1);
+        expect(
+          await persistence.claimOutboxDelivery(10, peer, now, []),
+        ).toHaveLength(0);
+        await append("ready", 1);
+        const other = await persistence.claimOutboxDelivery(1, peer, now, []);
+        expect(other.map((row) => row.workflowRunId)).toEqual(["ready"]);
+        expect(
+          await persistence.completeOutboxDelivery(other[0]!.id, peer, now),
+        ).toBe(true);
+        await expectClaimActive(persistence, second!.id, token, now, true);
+        expect(
+          await persistence.completeOutboxDelivery(second!.id, token, now),
+        ).toBe(true);
+        const [replayed] = await persistence.claimOutboxDelivery(
+          1,
+          peer,
+          now,
+          [],
+        );
+        expect(replayed).toMatchObject({
+          id: first!.id,
+          sequence: 1,
+          retryCount: 0,
+        });
+        expect(
+          await persistence.claimOutboxDelivery(10, token, now, []),
+        ).toHaveLength(0);
+        expect(
+          await persistence.completeOutboxDelivery(replayed!.id, peer, now),
+        ).toBe(true);
+        const successor = await persistence.claimOutboxDelivery(
+          10,
+          token,
+          now,
+          [],
+        );
+        // The head, optionally with the run's next live events in order.
+        expect(successor.map(({ sequence }) => sequence)).toEqual(
+          successor.map((_, index) => 3 + index),
+        );
+        expect(successor.length).toBeGreaterThan(0);
+      });
+
+      it("returns a run's events in order and releases the rest of them when one fails", async () => {
+        const now = new Date("2025-01-01T00:00:00.000Z");
+        const claim = "2025-01-01T00:01:00.000Z|batch";
+        const peer = "2025-01-01T00:01:00.000Z|batch-peer";
+        await persistence.appendOutboxEvents(
+          ["batch-a", "batch-a", "batch-a", "batch-z"].map((workflowRunId) => ({
+            workflowRunId,
+            eventType: "delivery",
+            payload: {},
+            occurredAt: now,
+            causationId: "batch",
+          })),
+        );
+        const page = await persistence.claimOutboxDelivery(10, claim, now, []);
+        const runA = page.filter((row) => row.workflowRunId === "batch-a");
+        expect(runA.map(({ sequence }) => sequence)).toEqual(
+          runA.map((_, index) => 1 + index),
+        );
+        // A run's events are adjacent in the page.
+        const first = page.findIndex((row) => row.workflowRunId === "batch-a");
+        expect(page.slice(first, first + runA.length)).toEqual(runA);
+        for (const { id } of page)
+          await expectClaimActive(persistence, id, claim, now, true);
+        expect(
+          await persistence.failOutboxDelivery(runA[0]!.id, claim, 3, now),
+        ).toBe("retry");
+        // The run is free again from its head, for any claimant.
+        const retried = await persistence.claimOutboxDelivery(
+          10,
+          peer,
+          now,
+          [],
+        );
+        expect(
+          retried.find((row) => row.workflowRunId === "batch-a"),
+        ).toMatchObject({ id: runA[0]!.id, retryCount: 1 });
+        const z = page.find((row) => row.workflowRunId === "batch-z");
+        if (z && persistence.completeOutboxDeliveries) {
+          expect(
+            await persistence.completeOutboxDeliveries(
+              [z.id, runA[0]!.id],
+              claim,
+              now,
+            ),
+          ).toBe(1);
+        }
+      });
+
+      it("marks real caller transaction views as deferred for delivery", async () => {
+        if (!persistence.withTransaction) return;
+        await persistence.withTransaction(async (tx) => {
+          if (tx !== persistence) expect(tx.outboxDeliveryDeferred).toBe(true);
+        });
+      });
+
       it("should append outbox events with auto-assigned sequences", async () => {
         // Given: Two events for the same run
         const events = [
@@ -1829,81 +2182,6 @@ export function persistenceConformanceSuite(
         await expect(
           persistence.markOutboxEventsPublished([]),
         ).resolves.not.toThrow();
-        await expect(
-          persistence.releaseOutboxEvents([]),
-        ).resolves.not.toThrow();
-      });
-
-      it("should hand each unpublished event to exactly one claimant, in order", async () => {
-        // Given: Two events for one run
-        await persistence.appendOutboxEvents([
-          {
-            workflowRunId: "outbox-claim-run",
-            eventType: "run.created",
-            payload: { n: 1 },
-            causationId: "cmd-1",
-            occurredAt: new Date(),
-          },
-          {
-            workflowRunId: "outbox-claim-run",
-            eventType: "run.started",
-            payload: { n: 2 },
-            causationId: "cmd-1",
-            occurredAt: new Date(),
-          },
-        ]);
-
-        // When: Two flushes claim concurrently
-        const [first, second] = await Promise.all([
-          persistence.claimUnpublishedOutboxEvents(),
-          persistence.claimUnpublishedOutboxEvents(),
-        ]);
-        const forRun = (events: OutboxRecord[]) =>
-          events.filter((e) => e.workflowRunId === "outbox-claim-run");
-
-        // Then: Every event is claimed by exactly one of them, in
-        // sequence order, and is stamped as published
-        const claimed = [...forRun(first), ...forRun(second)];
-        expect(claimed).toHaveLength(2);
-        expect(new Set(claimed.map((e) => e.id)).size).toBe(2);
-        expect(claimed.every((e) => e.publishedAt !== null)).toBe(true);
-        const winner =
-          forRun(first).length > 0 ? forRun(first) : forRun(second);
-        expect(winner.map((e) => e.sequence)).toEqual([1, 2]);
-        const unpublished = await persistence.getUnpublishedOutboxEvents();
-        expect(forRun(unpublished)).toHaveLength(0);
-      });
-
-      it("should make released events claimable again", async () => {
-        // Given: A claimed event
-        await persistence.appendOutboxEvents([
-          {
-            workflowRunId: "outbox-release-run",
-            eventType: "run.created",
-            payload: {},
-            causationId: "cmd-1",
-            occurredAt: new Date(),
-          },
-        ]);
-        const claimed = (
-          await persistence.claimUnpublishedOutboxEvents()
-        ).filter((e) => e.workflowRunId === "outbox-release-run");
-        expect(claimed).toHaveLength(1);
-
-        // When: Releasing it
-        await persistence.releaseOutboxEvents([claimed[0]!.id]);
-
-        // Then: It is unpublished again and the next claim gets it
-        const unpublished = await persistence.getUnpublishedOutboxEvents();
-        expect(
-          unpublished.some(
-            (e) => e.id === claimed[0]!.id && e.publishedAt === null,
-          ),
-        ).toBe(true);
-        const again = (await persistence.claimUnpublishedOutboxEvents()).filter(
-          (e) => e.workflowRunId === "outbox-release-run",
-        );
-        expect(again.map((e) => e.id)).toEqual([claimed[0]!.id]);
       });
     });
 
@@ -1988,6 +2266,138 @@ export function persistenceConformanceSuite(
 
         // Then: Returns 0
         expect(count).toBe(0);
+      });
+    });
+
+    describe("active work stats (optional getActiveWorkStats)", () => {
+      const minDate = (...dates: Date[]) =>
+        new Date(Math.min(...dates.map((d) => d.getTime())));
+
+      it("should report zeros and nulls on an empty store", async () => {
+        if (!persistence.getActiveWorkStats) return; // optional port method
+
+        const stats = await persistence.getActiveWorkStats(new Date());
+
+        const none = { PENDING: 0, RUNNING: 0, SUSPENDED: 0 };
+        expect(stats.runs).toEqual({
+          byStatus: none,
+          oldestPendingCreatedAt: null,
+        });
+        expect(stats.stages).toEqual({
+          byStatus: none,
+          suspendedDue: 0,
+          oldestSuspendedDueAt: null,
+        });
+        expect(stats.outbox).toEqual({
+          unpublished: 0,
+          oldestUnpublishedAt: null,
+          deadLettered: 0,
+        });
+      });
+
+      it("should count runs by active status and leave terminal runs out", async () => {
+        if (!persistence.getActiveWorkStats) return;
+
+        const statuses = [
+          ["stats-pending-1", "PENDING"],
+          ["stats-pending-2", "PENDING"],
+          ["stats-running", "RUNNING"],
+          ["stats-suspended", "SUSPENDED"],
+          ["stats-completed", "COMPLETED"],
+          ["stats-failed", "FAILED"],
+          ["stats-cancelled", "CANCELLED"],
+        ] as const;
+        for (const [id, status] of statuses) {
+          await persistence.createRun(createRunData({ id }));
+          if (status !== "PENDING") await persistence.updateRun(id, { status });
+        }
+        const pending1 = (await persistence.getRun("stats-pending-1"))!;
+        const pending2 = (await persistence.getRun("stats-pending-2"))!;
+
+        const stats = await persistence.getActiveWorkStats(new Date());
+
+        expect(stats.runs.byStatus).toEqual({
+          PENDING: 2,
+          RUNNING: 1,
+          SUSPENDED: 1,
+        });
+        expect(stats.runs.oldestPendingCreatedAt).toEqual(
+          minDate(pending1.createdAt, pending2.createdAt),
+        );
+      });
+
+      it("should count stages by active status and the suspended ones that are due", async () => {
+        if (!persistence.getActiveWorkStats) return;
+
+        const now = new Date("2026-03-01T12:00:00.000Z");
+        const at = (offsetMs: number) => new Date(now.getTime() + offsetMs);
+        const stages: Array<
+          [
+            string,
+            "PENDING" | "RUNNING" | "SUSPENDED" | "COMPLETED" | "FAILED",
+            Date | null,
+          ]
+        > = [
+          ["stats-pending", "PENDING", null],
+          ["stats-running", "RUNNING", null],
+          ["stats-due-old", "SUSPENDED", at(-60_000)],
+          ["stats-due-new", "SUSPENDED", at(-10_000)],
+          ["stats-due-edge", "SUSPENDED", now],
+          ["stats-not-due", "SUSPENDED", at(60_000)],
+          ["stats-no-poll", "SUSPENDED", null],
+          // A settled stage can keep a due deadline until its job is acked.
+          ["stats-settled", "COMPLETED", at(-120_000)],
+          ["stats-failed", "FAILED", at(-120_000)],
+        ];
+        for (const [stageId, status, nextPollAt] of stages) {
+          const created = await persistence.createStage(
+            await createStageData({ stageId, status }),
+          );
+          if (nextPollAt)
+            await persistence.updateStage(created.id, { nextPollAt });
+        }
+
+        const stats = await persistence.getActiveWorkStats(now);
+
+        expect(stats.stages.byStatus).toEqual({
+          PENDING: 1,
+          RUNNING: 1,
+          SUSPENDED: 5,
+        });
+        expect(stats.stages.suspendedDue).toBe(3);
+        expect(stats.stages.oldestSuspendedDueAt).toEqual(at(-60_000));
+      });
+
+      it("should count the outbox backlog and dead letters apart", async () => {
+        if (!persistence.getActiveWorkStats) return;
+
+        const now = Date.now();
+        const occurred = [-400_000, -300_000, -200_000, -100_000, -50_000].map(
+          (offsetMs) => new Date(now + offsetMs),
+        );
+        await persistence.appendOutboxEvents(
+          occurred.map((occurredAt, i) => ({
+            workflowRunId: "stats-outbox-run",
+            eventType: "run.started",
+            payload: { i },
+            causationId: `cmd-${i}`,
+            occurredAt,
+          })),
+        );
+        const events = await persistence.getUnpublishedOutboxEvents();
+        expect(events).toHaveLength(5);
+        // The oldest event is dead-lettered, so it must not be the backlog's
+        // oldest; the newest is published, so it is not in the backlog.
+        await persistence.moveOutboxEventToDLQ(events[0]!.id);
+        await persistence.markOutboxEventsPublished([events[4]!.id]);
+
+        const stats = await persistence.getActiveWorkStats(new Date());
+
+        expect(stats.outbox).toEqual({
+          unpublished: 3,
+          oldestUnpublishedAt: occurred[1],
+          deadLettered: 1,
+        });
       });
     });
 
@@ -3095,6 +3505,53 @@ export function jobQueueConformanceSuite(
         expect(await expire(60 * 60_000)).toBe(0);
         const [job] = await queue.getJobsByWorkflowRun("tier-within");
         expect(job?.status).toBe("RUNNING");
+      });
+    });
+
+    describe("job stats (optional getJobStats)", () => {
+      it("should report zeros and a null age on an empty queue", async () => {
+        if (!queue.getJobStats) return; // optional port method
+
+        expect(await queue.getJobStats()).toEqual({
+          byStatus: { PENDING: 0, RUNNING: 0, SUSPENDED: 0 },
+          oldestPendingCreatedAt: null,
+        });
+      });
+
+      it("should count jobs by active status and leave terminal jobs out", async () => {
+        if (!queue.getJobStats) return;
+
+        // Dequeue order is priority DESC: a, b, c, d leave the queue in turn.
+        const priorities = { a: 9, b: 8, c: 7, d: 6, e: 5, f: 5 };
+        for (const [key, priority] of Object.entries(priorities)) {
+          await (queue as LegacyQueue).enqueue(
+            createJobInput({
+              workflowRunId: `stats-run-${key}`,
+              stageId: "stats-stage",
+              priority,
+            }),
+          );
+        }
+        const a = await queue.dequeue();
+        await queue.complete(a!.jobId); // COMPLETED
+        await queue.dequeue(); // b stays RUNNING
+        const c = await queue.dequeue();
+        await queue.suspend(c!.jobId, new Date(Date.now() + 3_600_000)); // SUSPENDED
+        const d = await queue.dequeue();
+        await queue.fail(d!.jobId, "terminal", false); // FAILED
+        const [e] = await queue.getJobsByWorkflowRun("stats-run-e");
+        const [f] = await queue.getJobsByWorkflowRun("stats-run-f");
+
+        const stats = await queue.getJobStats();
+
+        expect(stats.byStatus).toEqual({
+          PENDING: 2,
+          RUNNING: 1,
+          SUSPENDED: 1,
+        });
+        expect(stats.oldestPendingCreatedAt).toEqual(
+          new Date(Math.min(e!.createdAt.getTime(), f!.createdAt.getTime())),
+        );
       });
     });
 

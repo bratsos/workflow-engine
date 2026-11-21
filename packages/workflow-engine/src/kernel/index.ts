@@ -9,6 +9,9 @@
 export type {
   CommandResult,
   DefinitionVersionSummary,
+  EngineStatsCommand,
+  EngineStatsResult,
+  EngineStatsSection,
   EventSinkStatus,
   JobExecuteCommand,
   JobExecuteResult,
@@ -91,6 +94,7 @@ export {
 } from "./helpers/definition-pinning.js";
 // Kernel helpers
 export {
+  assertTimerMs,
   type CreateEventSinkMonitorOptions,
   createEventSinkMonitor,
   type EventSinkHealth,
@@ -99,14 +103,18 @@ export {
   type ExecuteJobOutcome,
   type ExecuteJobWithHeartbeatOptions,
   executeJobWithHeartbeat,
+  flushOutboxWithin,
   HOST_DEFAULTS,
   type HostJobMessage,
   loadWorkflowContext,
+  MAX_TIMER_MS,
   type MaintenanceTickCounts,
+  type MaintenanceTickHook,
   normalizeAnnotateArgs,
   type RetentionOptions,
   type RunMaintenanceTickOptions,
   runMaintenanceTick,
+  runTickHook,
   saveStageOutput,
   toErrorMessage,
   toEventSinkObservation,
@@ -138,6 +146,9 @@ export {
 } from "./plugins.js";
 // Port interfaces and annotation types
 export type {
+  ActiveStatus,
+  ActiveStatusCounts,
+  ActiveWorkStats,
   ActivityExecutor,
   ActivityRunInput,
   ActivityRunResult,
@@ -153,8 +164,10 @@ export type {
   EventSink,
   ExecutorDeps,
   IdempotencyRecord,
+  JobQueueStats,
   JobTransport,
   KernelServices,
+  OutboxDeliveryMetadata,
   OutboxRecord,
   Persistence,
   Scheduler,

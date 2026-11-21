@@ -159,6 +159,42 @@ function createTestEnv(
 // ============================================================================
 
 describe("runToCompletion", () => {
+  it("returns the run result when its final outbox sink does not settle", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, persistence, jobTransport, eventSink } = createTestEnv([
+      workflow,
+    ]);
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    eventSink.emit = async () => {
+      await blocked;
+    };
+    const run = runToCompletion({
+      kernel,
+      persistence,
+      jobTransport,
+      command: {
+        type: "run.create",
+        idempotencyKey: "blocked-final-sink",
+        workflowId: "simple-workflow",
+        input: { data: "x" },
+      },
+      outboxFlushTimeoutMs: 5,
+    });
+    const result = await Promise.race([
+      run,
+      new Promise<"unbounded">((resolve) =>
+        setTimeout(() => resolve("unbounded"), 100),
+      ),
+    ]);
+    release();
+    await run;
+    expect(result).not.toBe("unbounded");
+    if (result !== "unbounded") expect(result.outcome).toBe("completed");
+  });
+
   it("drives a multi-stage workflow to completion in one call", async () => {
     const workflow = createTwoStageWorkflow();
     const { kernel, persistence, jobTransport } = createTestEnv([workflow]);
@@ -180,6 +216,57 @@ describe("runToCompletion", () => {
     expect(result.output).toEqual({ result: "HELLO!" });
     expect(result.jobsProcessed).toBe(2);
     expect(result.foreignJobsProcessed).toBe(0);
+  });
+
+  it("rejects a jobHeartbeatIntervalMs a timer cannot honour before it creates a run", async () => {
+    const workflow = createTwoStageWorkflow();
+    const { kernel, persistence, jobTransport } = createTestEnv([workflow]);
+
+    for (const jobHeartbeatIntervalMs of [Infinity, NaN, 0, -5]) {
+      await expect(
+        runToCompletion({
+          kernel,
+          jobTransport,
+          persistence,
+          command: {
+            type: "run.create",
+            idempotencyKey: `bad-heartbeat-${String(jobHeartbeatIntervalMs)}`,
+            workflowId: "two-stage",
+            input: { data: "hello" },
+          },
+          jobHeartbeatIntervalMs,
+        }),
+        String(jobHeartbeatIntervalMs),
+      ).rejects.toThrow(
+        /jobHeartbeatIntervalMs must be a number of milliseconds/,
+      );
+    }
+    expect(await persistence.getRunsByStatus("PENDING")).toHaveLength(0);
+  });
+
+  it("rejects an invalid outbox timeout before creating a run", async () => {
+    const { kernel, persistence, jobTransport } = createTestEnv([
+      createTwoStageWorkflow(),
+    ]);
+    for (const outboxFlushTimeoutMs of [Infinity, NaN, 0, -5]) {
+      await expect(
+        runToCompletion({
+          kernel,
+          persistence,
+          jobTransport,
+          command: {
+            type: "run.create",
+            idempotencyKey: `bad-outbox-${String(outboxFlushTimeoutMs)}`,
+            workflowId: "two-stage",
+            input: { data: "hello" },
+          },
+          outboxFlushTimeoutMs,
+        }),
+      ).rejects.toThrow(
+        /outboxFlushTimeoutMs must be a number of milliseconds/,
+      );
+    }
+    expect(await persistence.getRunsByStatus("PENDING")).toHaveLength(0);
   });
 
   it("reports a failed run rather than throwing", async () => {
