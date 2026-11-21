@@ -7,7 +7,7 @@
 
 import type { KernelDeps } from "../kernel.js";
 import { HOST_DEFAULTS } from "./host-support.js";
-import { readStepFailure } from "./stage-error-class.js";
+import { readStepFailure, retryGrantedResult } from "./stage-error-class.js";
 
 export { isRetryableStageError } from "./stage-error-class.js";
 
@@ -52,11 +52,17 @@ export async function reopenFailedSteps(
   for (const row of rows) {
     if (row.status !== "failed" || row.kind !== "run") continue;
     if (readStepFailure(row)?.final) continue;
+    // The grant lets a body that threw run again under onReclaim: "fail".
+    const result = retryGrantedResult(row);
     await ledger.compareAndSet(
       stageRecordId,
       row.stepId,
       { status: "failed", attempt: row.attempt },
-      { status: "running", leaseExpiresAt: null },
+      {
+        status: "running",
+        leaseExpiresAt: null,
+        ...(result ? { result } : {}),
+      },
     );
   }
 }

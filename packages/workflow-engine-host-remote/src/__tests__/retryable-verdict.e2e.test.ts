@@ -38,6 +38,7 @@ import {
 } from "../transport.js";
 import { type RemoteStage } from "../worker/run-activity.js";
 import { createActivityWorker } from "../worker/worker.js";
+import { buildOrchestrator, heavyStage } from "./fixtures.js";
 
 class QuotaError extends Error {
   constructor() {
@@ -229,4 +230,72 @@ describe("remote worker retry verdict over the HTTP transport pair", () => {
       willRetry: true,
     });
   }, 30_000);
+});
+
+describe("a defineRemoteStage proxy", () => {
+  it("fails the stage on a failed outcome whose message is empty", async () => {
+    const clock = new FakeClock(new Date(0));
+    const objectStore = new InMemoryObjectStore(clock);
+    const broker = new Broker({
+      store: new InMemoryBrokerStore(),
+      presigner: objectStore,
+      clock,
+      stageCodeVersion: "v1",
+      staleLeaseMs: 60_000,
+    });
+    const { orchestrator, worker: workerTransport } = createInProcessTransport(
+      broker,
+      objectStore,
+    );
+    const orch = buildOrchestrator(orchestrator, objectStore, clock);
+    const worker = createActivityWorker({
+      registry: new Map<string, RemoteStage>([
+        [
+          "heavy",
+          {
+            ...heavyStage,
+            async execute() {
+              throw new NonRetryableError();
+            },
+          } as RemoteStage,
+        ],
+      ]),
+      transport: workerTransport,
+      workerId: "w1",
+      stageIds: ["heavy"],
+      stageCodeVersion: "v1",
+    });
+
+    const { workflowRunId } = await orch.kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "empty-failure",
+      workflowId: orch.workflowId,
+      input: { seed: 1 },
+    });
+    await orch.kernel.dispatch({ type: "run.claimPending", workerId: "orch" });
+    const job = (await orch.jobQueue.dequeue())!;
+    expect(
+      await orch.kernel.dispatch({
+        type: "job.execute",
+        workflowRunId,
+        workflowId: orch.workflowId,
+        stageId: job.stageId,
+        config: {},
+      }),
+    ).toMatchObject({ outcome: "suspended" });
+    expect(await worker.processOne()).toBe(true);
+    const suspended = (
+      await orch.persistence.getStagesByRun(workflowRunId)
+    )[0]!;
+    await orch.persistence.updateStage(suspended.id, {
+      nextPollAt: new Date(clock.now().getTime() - 1),
+    });
+
+    const poll = await orch.kernel.dispatch({ type: "stage.pollSuspended" });
+
+    expect(poll.failed).toBe(1);
+    expect(
+      await orch.persistence.getStage(workflowRunId, "heavy"),
+    ).toMatchObject({ status: "FAILED", errorMessage: "NonRetryableError" });
+  });
 });

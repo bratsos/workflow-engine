@@ -49,12 +49,16 @@ export interface StepRunOptions {
    * terminally instead of being retried by its job or by the poll loop. The
    * stage sees a `NonRetryableError` carrying the original error as `cause`.
    * Any other return value (`true`, `undefined`, `0`) leaves `retries` in
-   * charge. A predicate that throws is logged and counts as `true`.
+   * charge. A predicate that throws or rejects is logged and counts as
+   * `true`. An async predicate is awaited.
    *
    * Without `retryIf`, a step retries every error but `NonRetryableError`,
    * a Zod error from a response the body validates included.
    */
-  retryIf?: (error: unknown, info: { attempt: number }) => boolean;
+  retryIf?: (
+    error: unknown,
+    info: { attempt: number },
+  ) => boolean | Promise<boolean>;
   /**
    * Delay before retrying a failed attempt. A number of milliseconds or a
    * duration string (`"30s"`, `"5m"`). Defaults to zero.
@@ -334,8 +338,19 @@ export function isStepControlFlowError(
   );
 }
 
+/**
+ * Cross-bundle brand for a step failure no retry can change: an expired wait,
+ * a refused replay, and a failure the stage classifier rejected as a ledger
+ * replay rethrows it. `isRetryableStageError` reads it, so a second copy of
+ * the engine reaches the same verdict as the one that threw.
+ */
+export const STEP_TERMINAL_FAILURE: unique symbol = Symbol.for(
+  "@bratsos/workflow-engine/terminal-step-failure",
+) as typeof STEP_TERMINAL_FAILURE;
+
 /** Thrown after a durable wait reaches its original, non-sliding deadline. */
 export class StepTimeoutError extends Error {
+  readonly [STEP_TERMINAL_FAILURE] = true as const;
   readonly stepId: string;
 
   constructor(stepId: string) {
@@ -365,6 +380,7 @@ export class StepLedgerWriteError extends Error {
  * would carry so an operator can go and look.
  */
 export class StepNotReplaySafeError extends Error {
+  readonly [STEP_TERMINAL_FAILURE] = true as const;
   readonly stepId: string;
   readonly externalKey: string;
 

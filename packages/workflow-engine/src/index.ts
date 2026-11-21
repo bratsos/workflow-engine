@@ -319,6 +319,9 @@ export {
   DefinitionVersionConflictError,
   DefinitionVersionMismatchError,
   IdempotencyInProgressError,
+  isJobTargetMissingError,
+  type JobTarget,
+  JobTargetMissingError,
   SpilledPayloadUnavailableError,
 } from "./kernel/errors";
 export type {

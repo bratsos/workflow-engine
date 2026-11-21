@@ -264,7 +264,7 @@ export async function executeJobWithHeartbeat(
     // return instead of throwing — for a consumer that runs a whole tick
     // inside one transaction, a throw here aborted every other job.
     const message = error instanceof Error ? error.message : String(error);
-    if (!isJobTargetMissingError(error)) throw error;
+    if (!isJobTargetMissingError(error, job)) throw error;
     console.error(
       `${logPrefix} dead job ${job.jobId} (run ${job.workflowRunId}, stage ${job.stageId}): ${message}`,
     );

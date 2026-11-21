@@ -29,4 +29,14 @@ describe("root entry exports", () => {
       false,
     );
   });
+
+  it("exports JobTargetMissingError and its target-aware guard", () => {
+    const target = { workflowId: "w", stageId: "s", workflowRunId: "r" };
+    const error = new root.JobTargetMissingError(target, "run");
+    expect(error.message).toBe("WorkflowRun r not found");
+    expect(root.isJobTargetMissingError(error, target)).toBe(true);
+    expect(
+      root.isJobTargetMissingError(error, { ...target, workflowRunId: "x" }),
+    ).toBe(false);
+  });
 });

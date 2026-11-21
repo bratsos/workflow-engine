@@ -2,20 +2,25 @@
  * Retry classification through the real entry points: `kernel.dispatch` of
  * `job.execute` and `stage.pollSuspended`, on the in-memory ports and, when
  * `SQLITE8_KERNEL_SQLITE=1` or `DATABASE_URL` is set, on the Prisma adapters
- * (the failure verdict travels in a step row's JSON `result`, and the
- * `checkCompletion` retry write is fenced by the stage version).
+ * (the failure verdict travels in a step row's JSON `result`).
  *
- * One rule: the same throw gets the same verdict and the same text whether
- * `job.execute` meets it directly or a poll meets it after a round trip
- * through the step ledger.
+ * One rule: the same throw gets the same verdict, and the stage sees the
+ * same name and brand, whether `job.execute` meets it directly or a poll
+ * meets it after a round trip through the step ledger.
  */
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
 import { z as zodMini } from "zod/mini";
 import { z as zodV3 } from "zod/v3";
+import { $ZodError } from "zod/v4/core";
 import { defineAsyncBatchStage, defineStage } from "../core/stage-factory.js";
 import { deriveStepExternalKey } from "../core/step-external-key.js";
-import { NonRetryableError, type StepRunOptions } from "../core/steps.js";
+import {
+  isNonRetryableError,
+  NonRetryableError,
+  StepNotReplaySafeError,
+  type StepRunOptions,
+} from "../core/steps.js";
 import { type Workflow, WorkflowBuilder } from "../core/workflow.js";
 import { createKernel, type KernelConfig } from "../kernel/kernel.js";
 import type { JobTransport, StepLedger } from "../kernel/ports.js";
@@ -138,6 +143,21 @@ class QuotaError extends Error {
   }
 }
 
+/**
+ * What another copy of the engine throws: its own class, with the same
+ * `Symbol.for` brand, which `instanceof` against this copy does not see.
+ */
+function fromAnotherEngineCopy(name: string) {
+  const error = new Error("from another copy");
+  error.name = name;
+  Object.defineProperty(
+    error,
+    Symbol.for("@bratsos/workflow-engine/terminal-step-failure"),
+    { value: true },
+  );
+  return error;
+}
+
 const zodParse = () => z.number().parse("x");
 const zodV3Parse = () => zodV3.number().parse("x");
 const zodMiniParse = () => zodMini.parse(zodMini.number(), "x");
@@ -166,7 +186,7 @@ const verdictCases: Array<
   [
     "retryIf false",
     () => new QuotaError(),
-    { retryIf: () => false },
+    { retryIf: (): boolean => false },
     false,
     "NonRetryableError: over quota",
   ],
@@ -180,6 +200,62 @@ const verdictCases: Array<
     },
     true,
     "QuotaError: over quota",
+  ],
+  [
+    "an async retryIf that resolves false",
+    () => new QuotaError(),
+    { retryIf: async () => false },
+    false,
+    "NonRetryableError: over quota",
+  ],
+  [
+    "a rejecting async retryIf",
+    () => new QuotaError(),
+    {
+      retryIf: async () => {
+        throw new Error("predicate rejected");
+      },
+    },
+    true,
+    "QuotaError: over quota",
+  ],
+  [
+    "a Zod error decoded from JSON",
+    () =>
+      JSON.parse(
+        JSON.stringify({
+          name: "ZodError",
+          message: "bad input",
+          issues: [{ code: "custom", path: [], message: "bad input" }],
+        }),
+      ),
+    {},
+    false,
+    "ZodError: bad input",
+  ],
+  [
+    "a zod core $ZodError, which is not an Error",
+    () =>
+      new $ZodError([
+        { code: "custom", path: [], message: "bad input", input: 1 },
+      ] as never),
+    {},
+    false,
+    /^\$ZodError: \[/,
+  ],
+  [
+    "a StepTimeoutError from another engine copy",
+    () => fromAnotherEngineCopy("StepTimeoutError"),
+    {},
+    false,
+    "StepTimeoutError: from another copy",
+  ],
+  [
+    "a StepNotReplaySafeError from another engine copy",
+    () => fromAnotherEngineCopy("StepNotReplaySafeError"),
+    {},
+    false,
+    "StepNotReplaySafeError: from another copy",
   ],
   [
     "retryIf 0",
@@ -233,7 +309,10 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
         const polled = await run.poll();
         const stage = await run.stage();
         expect(stage.status).toBe(retryable ? "SUSPENDED" : "FAILED");
-        expect(stage.errorMessage).toMatch(text);
+        // The poll records the bare message, as it always has.
+        if (typeof text === "string") {
+          expect(stage.errorMessage).toBe(text.slice(text.indexOf(": ") + 2));
+        }
         expect(polled.failed).toBe(retryable ? 0 : 1);
         expect(await run.retryEvents()).toBe(retryable ? 1 : 0);
         expect(body.calls).toBe(1);
@@ -367,7 +446,6 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
         expect(body.calls).toBe(3);
         // Once the step gives up, the stage classifier has the last word.
         expect(await run.stage()).toMatchObject({ status: "FAILED" });
-        expect((await run.stage()).errorMessage).toMatch(/^ZodError: /);
       });
 
       it("stop at a NonRetryableError", async () => {
@@ -405,168 +483,219 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
         ]);
         expect(await run.stage()).toMatchObject({
           status: "FAILED",
-          errorMessage: "NonRetryableError: over quota",
+          errorMessage: "over quota",
         });
       });
     });
 
-    describe("a throwing checkCompletion", () => {
-      function pollingStage(
-        check: () => Promise<unknown>,
-        onResume?: () => unknown,
-      ) {
-        return defineAsyncBatchStage({
+    it("fails a stage whose checkCompletion throws on the first throw, as before", async () => {
+      let calls = 0;
+      const stage = defineAsyncBatchStage({
+        id: "s",
+        name: "s",
+        mode: "async-batch",
+        schemas: { input: z.object({}), output: out, config: z.object({}) },
+        async execute() {
+          return {
+            suspended: true,
+            state: { batchId: "b" },
+            pollConfig: {
+              pollInterval: 1000,
+              maxWaitTime: 24 * 3_600_000,
+              nextPollAt: new Date(env.clock.now().getTime() + 1000),
+            },
+          };
+        },
+        async checkCompletion() {
+          calls++;
+          throw new QuotaError("provider 503");
+        },
+      });
+      const run = await start(env, workflowOf("cc-main", stage));
+      expect(await run.execute(1)).toMatchObject({ outcome: "suspended" });
+      expect((await run.poll()).failed).toBe(1);
+      expect(await run.stage()).toMatchObject({ status: "FAILED" });
+      expect(await run.retryEvents()).toBe(0);
+      expect(calls).toBe(1);
+    });
+
+    describe("a redelivered job of a stage that failed terminally", () => {
+      it.each([
+        ["a Zod error", zodParse, 1],
+        ["a NonRetryableError", () => new NonRetryableError("declined"), 1],
+        ["an ordinary error on the last attempt", () => new QuotaError(), 3],
+      ])('does not repeat an onReclaim: "fail" step after %s', async (_case, make, attempt) => {
+        let effects = 0;
+        const body = async () => {
+          effects++; // the effect happens, then the body throws
+          throw make();
+        };
+        const run = await start(
+          env,
+          workflowOf("redeliver", directStage(body, { onReclaim: "fail" })),
+        );
+        expect(await run.execute(attempt)).toMatchObject({
+          outcome: "failed",
+          willRetry: false,
+        });
+        // The acknowledgement was lost: the same delivery arrives again,
+        // then the next one. Re-running the FAILED stage re-opens the row.
+        for (const again of [attempt, attempt + 1]) {
+          const result = await run.execute(again);
+          expect(result).toMatchObject({ outcome: "failed", willRetry: false });
+          expect((result as { error: string }).error).toMatch(
+            /^StepNotReplaySafeError: /,
+          );
+        }
+        expect(effects).toBe(1);
+      });
+
+      it("does not read a completed step's own result as a failure record", async () => {
+        let effects = 0;
+        const stage = defineStage({
           id: "s",
           name: "s",
-          mode: "async-batch",
           schemas: { input: z.object({}), output: out, config: z.object({}) },
           async execute(ctx) {
-            if (ctx.resumeState && onResume) {
-              return { output: onResume() as { ok: boolean } };
-            }
-            return {
-              suspended: true,
-              state: { batchId: "b" },
-              pollConfig: {
-                pollInterval: 1000,
-                maxWaitTime: 24 * 3_600_000,
-                nextPollAt: new Date(env.clock.now().getTime() + 1000),
+            await ctx.step.run(
+              "call",
+              async () => {
+                effects++;
+                return { receipt: 42, __failure: { attempt: 1 } };
               },
-            };
-          },
-          async checkCompletion() {
-            return (await check()) as never;
+              { onReclaim: "fail" },
+            );
+            throw new NonRetryableError("later");
           },
         });
-      }
-      function script(
-        ...steps: Array<"throw" | "wait" | "ready" | (() => unknown)>
+        const run = await start(env, workflowOf("collision", stage));
+        expect(await run.execute(1)).toMatchObject({ willRetry: false });
+        const again = await run.execute(2);
+        expect((again as { error: string }).error).toMatch(
+          /^StepNotReplaySafeError: /,
+        );
+        expect(effects).toBe(1);
+      });
+    });
+
+    it("keeps refusing a refusal row written before refusals were recorded", async () => {
+      const body = failing(0, () => undefined);
+      let seeded = false;
+      const stage = defineStage({
+        id: "s",
+        name: "s",
+        schemas: { input: z.object({}), output: out, config: z.object({}) },
+        async execute(ctx) {
+          const stageRecordId = ctx.stageRecordId!;
+          const externalKey = deriveStepExternalKey(stageRecordId, "call");
+          if (!seeded) {
+            seeded = true;
+            // The row a 1.0.0-alpha.20 refusal left: failed, no record.
+            await env.stepLedger.claim({
+              stageRecordId,
+              stepId: "call",
+              seq: 1,
+              kind: "run",
+              status: "running",
+              attempt: 1,
+              leaseExpiresAt: null,
+              deadlineAt: null,
+              externalKey,
+            });
+            await env.stepLedger.compareAndSet(
+              stageRecordId,
+              "call",
+              { status: "running", attempt: 1 },
+              {
+                status: "failed",
+                error: new StepNotReplaySafeError(
+                  "call",
+                  externalKey,
+                  env.clock.now(),
+                ).message,
+                result: null,
+              },
+            );
+          }
+          await ctx.step.run("call", body, { onReclaim: "fail", retries: 2 });
+          return { output: { ok: true } };
+        },
+      });
+      const run = await start(env, workflowOf("legacy-refusal", stage));
+      const result = await run.execute(1);
+      expect(result).toMatchObject({ outcome: "failed", willRetry: false });
+      expect((result as { error: string }).error).toMatch(
+        /^StepNotReplaySafeError: /,
+      );
+      expect(body.calls).toBe(0);
+    });
+
+    describe("the error a stage catches from a step", () => {
+      /** Records what the stage caught, directly and on the replay. */
+      function observingStage(
+        body: () => Promise<unknown>,
+        opts: StepRunOptions,
+        seen: unknown[],
       ) {
-        const check = async () => {
-          const step = steps[check.calls++] ?? steps[steps.length - 1]!;
-          if (step === "throw") throw new QuotaError("provider 503");
-          if (step === "wait") return { ready: false };
-          if (step === "ready") return { ready: true, output: { ok: true } };
-          throw step();
-        };
-        check.calls = 0;
-        return check;
+        return defineStage({
+          id: "s",
+          name: "s",
+          schemas: { input: z.object({}), output: out, config: z.object({}) },
+          async execute(ctx) {
+            try {
+              await ctx.step.run("call", body, opts);
+            } catch (error) {
+              const e = error as Error;
+              seen.push({
+                name: e.name,
+                branded: isNonRetryableError(e),
+                cause: (e.cause as Error | undefined)?.name,
+              });
+            }
+            await ctx.step.sleep("nap", 1000);
+            return { output: { ok: true } };
+          },
+        });
       }
-
-      it("is retried within the attempt budget and completes", async () => {
-        const run = await start(
-          env,
-          workflowOf("cc-ok", pollingStage(script("throw", "ready"))),
-        );
-        await run.execute(1);
-        expect(await run.poll()).toMatchObject({ failed: 0, resumed: 0 });
-        const retried = await run.stage();
-        expect(retried).toMatchObject({
-          status: "SUSPENDED",
-          errorMessage: "QuotaError: provider 503",
-        });
-        expect(await run.retryEvents()).toBe(1);
-        expect(await run.poll()).toMatchObject({ resumed: 1 });
-        expect(await run.stage()).toMatchObject({
-          status: "COMPLETED",
-          errorMessage: null,
-        });
-      });
-
-      it("fails the stage once the budget is spent", async () => {
-        const check = script("throw");
-        const run = await start(
-          env,
-          workflowOf("cc-spent", pollingStage(check)),
-        );
-        await run.execute(1);
-        expect((await run.poll()).failed).toBe(0);
-        expect((await run.poll()).failed).toBe(0);
-        expect((await run.poll()).failed).toBe(1);
-        expect(check.calls).toBe(3);
-        expect(await run.stage()).toMatchObject({
-          status: "FAILED",
-          errorMessage: "QuotaError: provider 503",
-        });
-      });
 
       it.each([
-        ["a NonRetryableError", () => new NonRetryableError("bad batch")],
-        ["a Zod error from another copy of zod", zodV3Parse],
-      ])("fails at once on %s", async (_case, make) => {
-        const run = await start(
-          env,
-          workflowOf("cc-final", pollingStage(script(make))),
-        );
-        await run.execute(1);
-        expect((await run.poll()).failed).toBe(1);
-        expect(await run.stage()).toMatchObject({ status: "FAILED" });
-        expect(await run.retryEvents()).toBe(0);
-      });
-
-      it("counts only consecutive throws: a clean answer ends the streak", async () => {
-        const check = script(
-          "throw",
-          "throw",
-          "wait",
-          "throw",
-          "throw",
-          "ready",
-        );
-        const run = await start(
-          env,
-          workflowOf("cc-streak", pollingStage(check)),
-        );
-        await run.execute(1);
-        await run.poll();
-        await run.poll();
-        await run.poll();
-        expect(await run.stage()).toMatchObject({
-          status: "SUSPENDED",
-          errorMessage: null,
-        });
-        await run.poll();
-        await run.poll();
-        expect((await run.poll()).resumed).toBe(1);
-        expect(await run.stage()).toMatchObject({ status: "COMPLETED" });
-      });
-
-      it("does not write its retry onto a stage a job completed meanwhile", async () => {
-        let release!: () => void;
-        let entered!: () => void;
-        const inCheck = new Promise<void>((resolve) => {
-          entered = resolve;
-        });
-        const gate = new Promise<void>((resolve) => {
-          release = resolve;
-        });
-        const check = async () => {
-          entered();
-          await gate;
-          throw new QuotaError("stale poll");
-        };
+        [
+          "a Zod error declined by retryIf",
+          zodParse,
+          { retryIf: (): boolean => false },
+          { name: "NonRetryableError", branded: true, cause: "ZodError" },
+        ],
+        [
+          "an ordinary error declined by retryIf",
+          () => new QuotaError(),
+          { retryIf: (): boolean => false },
+          { name: "NonRetryableError", branded: true, cause: "QuotaError" },
+        ],
+        [
+          "a Zod error",
+          zodParse,
+          {},
+          { name: "ZodError", branded: false, cause: undefined },
+        ],
+        [
+          "a NonRetryableError",
+          () => new NonRetryableError("revoked"),
+          {},
+          { name: "NonRetryableError", branded: true, cause: undefined },
+        ],
+      ])("is the same directly and after a replay: %s", async (_case, make, opts, expected) => {
+        const seen: unknown[] = [];
         const run = await start(
           env,
           workflowOf(
-            "cc-fence",
-            pollingStage(check, () => ({ ok: true })),
+            "observe",
+            observingStage(failing(9, make), opts as StepRunOptions, seen),
           ),
         );
-        await run.execute(1);
-        const before = await run.stage();
-        env.clock.advance(POLL_GAP_MS);
-        const polling = run.kernel.dispatch({ type: "stage.pollSuspended" });
-        await inCheck;
-        // A redelivered job resumes and completes the stage.
-        expect(await run.execute()).toMatchObject({ outcome: "completed" });
-        release();
-        expect(await polling).toMatchObject({ failed: 0, resumed: 0 });
-        expect(await run.stage()).toMatchObject({
-          status: "COMPLETED",
-          attempt: before.attempt,
-          errorMessage: null,
-        });
-        expect(await run.retryEvents()).toBe(0);
+        expect(await run.execute(1)).toMatchObject({ outcome: "suspended" });
+        await run.poll();
+        expect(await run.stage()).toMatchObject({ status: "COMPLETED" });
+        expect(seen).toEqual([expected, expected]);
       });
     });
   });

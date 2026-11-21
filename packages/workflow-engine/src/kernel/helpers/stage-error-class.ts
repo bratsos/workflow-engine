@@ -10,9 +10,10 @@ import { ZodError } from "zod";
 import {
   isDuplicateStepKeyError,
   isNonRetryableError,
-  StepNotReplaySafeError,
-  StepTimeoutError,
+  NonRetryableError,
+  STEP_TERMINAL_FAILURE,
 } from "../../core/steps.js";
+import { describeThrown } from "./error-message.js";
 
 /**
  * `false` for an error that retrying cannot change, so nothing may spend an
@@ -23,15 +24,26 @@ import {
  *    step's `retryIf`), including one a replay reads back from the ledger;
  *  - an expired durable wait (`StepTimeoutError`) and a step that refuses to
  *    be replayed (`StepNotReplaySafeError`): each is recorded on its ledger
- *    row, which the next attempt answers with the same error.
+ *    row, which the next attempt answers with the same error;
+ *  - a failure of any of these kinds that a ledger replay rethrows.
+ * Every check is a brand or a shape, never `instanceof` alone, so an error
+ * thrown by another copy of the engine or of zod gets the same verdict.
  */
 export function isRetryableStageError(error: unknown): boolean {
   return !(
     isZodError(error) ||
     isDuplicateStepKeyError(error) ||
     isNonRetryableError(error) ||
-    error instanceof StepTimeoutError ||
-    error instanceof StepNotReplaySafeError
+    isTerminalStepFailure(error)
+  );
+}
+
+function isTerminalStepFailure(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    (error as { [STEP_TERMINAL_FAILURE]?: unknown })[STEP_TERMINAL_FAILURE] ===
+      true
   );
 }
 
@@ -71,6 +83,16 @@ export interface StepFailure {
    * "fail"`): the body's outcome is unknown, unlike a body that threw.
    */
   readonly refused: boolean;
+  /** `Error.name` of a `retryIf` refusal's original error (its `cause`). */
+  readonly causeName?: string;
+  /**
+   * A stage retry re-opened this row because its body threw a retryable
+   * error: the body said its effect did not take, so the next execution
+   * runs it even under `onReclaim: "fail"`. Only `reopenFailedSteps` sets
+   * it; a row re-opened any other way (re-running a failed stage) is
+   * treated as a takeover.
+   */
+  readonly retry?: boolean;
 }
 
 /**
@@ -84,40 +106,88 @@ export interface StepFailure {
 export function stepFailureResult(
   thrown: unknown,
   attempt: number,
-  verdict: Omit<StepFailure, "name">,
+  verdict: Omit<StepFailure, "name" | "retry">,
 ): Record<string, unknown> {
+  const { name } = describeThrown(thrown);
   return {
     [STEP_FAILURE_KEY]: {
       attempt,
-      ...(thrown instanceof Error ? { name: thrown.name } : {}),
+      ...(name ? { name } : {}),
       ...verdict,
     },
+  };
+}
+
+/** `result` for a row a stage retry re-opens: its record, granted a rerun. */
+export function retryGrantedResult(row: {
+  attempt: number;
+  result?: unknown;
+  error?: string | null;
+}): Record<string, unknown> | undefined {
+  const failure = readStepFailure(row);
+  if (!failure) return undefined;
+  return {
+    [STEP_FAILURE_KEY]: { attempt: row.attempt, ...failure, retry: true },
   };
 }
 
 /**
  * The failure record a `run` row holds for its current attempt, whatever
  * its status: a failed row, or one a stage retry or a reset re-opened
- * (`running`, no lease, attempt unchanged). Rows written before this record
- * existed have none and read as an ordinary failure.
+ * (`running`, no lease, attempt unchanged). Only a row whose last outcome
+ * was a failure carries one: the `error` column is set on every failed
+ * write and cleared by every completion, so a completed body's own result
+ * is never read as a record, whatever it contains. Rows written before
+ * this record existed have none and read as an ordinary failure.
  */
 export function readStepFailure(row: {
   attempt: number;
   result?: unknown;
+  error?: string | null;
 }): StepFailure | undefined {
+  if (typeof row.error !== "string") return undefined;
   const result = row.result;
   if (typeof result !== "object" || result === null) return undefined;
   const record = (result as Record<string, unknown>)[STEP_FAILURE_KEY];
   if (typeof record !== "object" || record === null) return undefined;
-  const { attempt, name, final, stop, refused } = record as Record<
-    string,
-    unknown
-  >;
+  const { attempt, name, final, stop, refused, causeName, retry } =
+    record as Record<string, unknown>;
   if (attempt !== row.attempt) return undefined;
   return {
     ...(typeof name === "string" ? { name } : {}),
+    ...(typeof causeName === "string" ? { causeName } : {}),
     final: final === true,
     stop: stop === true,
     refused: refused === true,
+    ...(retry === true ? { retry: true } : {}),
   };
+}
+
+/**
+ * The error a replay rethrows for a failed `run` row: the message as
+ * thrown, under its original name, and with the verdict of the first throw.
+ * A `NonRetryableError` (thrown, or made by a `retryIf` refusal, whose
+ * original comes back as `cause` by name and message) is one again; any
+ * other error the classifier rejected carries the terminal brand but not
+ * the `NonRetryableError` one, so `isNonRetryableError` answers the same
+ * directly and after a replay.
+ */
+export function replayedStepError(
+  message: string,
+  failure: StepFailure | undefined,
+): Error {
+  let error: Error;
+  if (failure?.stop && !failure.refused) {
+    const cause =
+      failure.causeName !== undefined
+        ? Object.assign(new Error(message), { name: failure.causeName })
+        : undefined;
+    error = new NonRetryableError(message, cause ? { cause } : undefined);
+  } else {
+    error = new Error(message);
+    if (failure?.final)
+      Object.defineProperty(error, STEP_TERMINAL_FAILURE, { value: true });
+  }
+  if (failure?.name) error.name = failure.name;
+  return error;
 }

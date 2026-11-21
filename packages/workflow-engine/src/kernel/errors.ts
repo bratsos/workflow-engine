@@ -14,27 +14,61 @@ const JOB_TARGET_MISSING: unique symbol = Symbol.for(
   "@bratsos/workflow-engine/job-target-missing",
 ) as typeof JOB_TARGET_MISSING;
 
+/** The workflow, stage and run a `job.execute` command names. */
+export interface JobTarget {
+  workflowId: string;
+  stageId: string;
+  workflowRunId: string;
+}
+
+/** The message `job.execute` throws for each missing part of `target`. */
+function missingTargetMessages(target: JobTarget) {
+  return {
+    workflow: `Workflow ${target.workflowId} not found in registry`,
+    stage: `Stage ${target.stageId} not found in workflow ${target.workflowId}`,
+    run: `WorkflowRun ${target.workflowRunId} not found`,
+  };
+}
+
 /**
  * Thrown by `job.execute` when the job's workflow, stage or run does not
  * exist: the queue row is an orphan, and a host acknowledges it as dead.
- * Hosts recognise it by its brand, never by its text, so an executor error
- * that happens to read the same way is not taken for one.
  */
 export class JobTargetMissingError extends Error {
   readonly [JOB_TARGET_MISSING] = true as const;
 
-  constructor(message: string) {
-    super(message);
+  constructor(target: JobTarget, missing: "workflow" | "stage" | "run") {
+    super(missingTargetMessages(target)[missing]);
     this.name = "JobTargetMissingError";
   }
 }
 
-/** Detect a {@link JobTargetMissingError} across duplicated package bundles. */
-export function isJobTargetMissingError(error: unknown): boolean {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    (error as { [JOB_TARGET_MISSING]?: unknown })[JOB_TARGET_MISSING] === true
+/**
+ * Whether `error` is the {@link JobTargetMissingError} `job.execute` throws
+ * for this very job. It is recognised by its brand or its name (an
+ * integration that carries dispatch errors across a boundary keeps the name
+ * and message, not the brand), and only when its message names this job's
+ * own workflow, stage or run: a missing target of a different dispatch made
+ * inside the job (a custom executor) is that dispatch's verdict, not this
+ * job's, and an ordinary error that reads the same way is neither.
+ */
+export function isJobTargetMissingError(
+  error: unknown,
+  target: JobTarget,
+): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const candidate = error as {
+    [JOB_TARGET_MISSING]?: unknown;
+    name?: unknown;
+    message?: unknown;
+  };
+  if (
+    candidate[JOB_TARGET_MISSING] !== true &&
+    candidate.name !== "JobTargetMissingError"
+  )
+    return false;
+  return Object.values(missingTargetMessages(target)).includes(
+    candidate.message as string,
   );
 }
 

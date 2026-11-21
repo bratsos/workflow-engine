@@ -53,6 +53,9 @@ export {
   DefinitionVersionConflictError,
   DefinitionVersionMismatchError,
   IdempotencyInProgressError,
+  isJobTargetMissingError,
+  type JobTarget,
+  JobTargetMissingError,
   SpilledPayloadUnavailableError,
 } from "./errors.js";
 
@@ -93,6 +96,7 @@ export {
 export {
   type CreateEventSinkMonitorOptions,
   createEventSinkMonitor,
+  describeThrown,
   type EventSinkHealth,
   type EventSinkMonitor,
   type EventSinkObservation,

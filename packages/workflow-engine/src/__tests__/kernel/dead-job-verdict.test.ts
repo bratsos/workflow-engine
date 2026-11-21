@@ -1,7 +1,8 @@
 /**
  * The shared host path acknowledges a job as dead only when `job.execute`
- * says its workflow, stage or run is missing — by the error's type, never
- * by its text. An infrastructure error that happens to read the same way is
+ * says its own workflow, stage or run is missing: by the error's brand or
+ * name and the job's own target, never by text alone. An infrastructure
+ * error that reads the same way, or a nested dispatch's missing target, is
  * an ordinary failure the host must not swallow.
  */
 
@@ -9,7 +10,7 @@ import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { defineWorkflow } from "../../core/workflow.js";
 import { executeJobWithHeartbeat } from "../../kernel/helpers/host-support.js";
-import { createKernel } from "../../kernel/kernel.js";
+import { createKernel, type Kernel } from "../../kernel/kernel.js";
 import type { ActivityExecutor } from "../../kernel/ports.js";
 import {
   CollectingEventSink,
@@ -97,5 +98,61 @@ describe("dead job verdict", () => {
     expect(outcome).toMatchObject({ outcome: "failed", dead: true });
     expect(outcome.error).toBe("WorkflowRun gone not found");
     expect(await status()).toBe("FAILED");
+  });
+
+  it("acknowledges the missing run when a dispatcher carries the error by name and message", async () => {
+    const { kernel, jobTransport, message, status } = await claimedJob();
+    // A decorator that transports dispatch errors keeps name and message only.
+    const serializing = {
+      ...kernel,
+      dispatch: (async (command: Parameters<typeof kernel.dispatch>[0]) => {
+        try {
+          return await kernel.dispatch(command);
+        } catch (error) {
+          const { name, message } = JSON.parse(
+            JSON.stringify({
+              name: (error as Error).name,
+              message: (error as Error).message,
+            }),
+          );
+          throw Object.assign(new Error(message), { name });
+        }
+      }) as typeof kernel.dispatch,
+    };
+
+    const outcome = await executeJobWithHeartbeat(serializing, {
+      jobTransport,
+      job: { ...message, workflowRunId: "gone" },
+    });
+
+    expect(outcome).toMatchObject({ outcome: "failed", dead: true });
+    expect(await status()).toBe("FAILED");
+  });
+
+  it("does not take a missing target of a dispatch made inside the job for its own", async () => {
+    let inner: Kernel | undefined;
+    const { kernel, jobTransport, message, status } = await claimedJob({
+      // A custom executor that dispatches another job, whose run is gone.
+      run: async () =>
+        inner!.dispatch({
+          type: "job.execute",
+          workflowRunId: "another-run",
+          workflowId: workflow.id,
+          stageId: "only",
+          config: {},
+        }) as never,
+    });
+    inner = kernel;
+
+    const failure = await executeJobWithHeartbeat(kernel, {
+      jobTransport,
+      job: message,
+    }).catch((error: unknown) => error);
+
+    expect(failure).toMatchObject({
+      name: "JobTargetMissingError",
+      message: "WorkflowRun another-run not found",
+    });
+    expect(await status()).toBe("RUNNING");
   });
 });

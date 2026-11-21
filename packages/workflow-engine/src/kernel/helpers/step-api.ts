@@ -29,9 +29,11 @@ import {
 } from "../../core/steps.js";
 import { AIServicesNotConfiguredError } from "../errors.js";
 import type { Clock, StepLedger, StepRecord } from "../ports.js";
+import { describeThrown } from "./error-message.js";
 import {
   isRetryableStageError,
   readStepFailure,
+  replayedStepError,
   stepFailureResult,
 } from "./stage-error-class.js";
 import { createStepAi } from "./step-ai.js";
@@ -125,33 +127,51 @@ function storedError(record: StepRecord): Error {
   }
   const message =
     record.error ?? `Durable step "${record.stepId}" previously failed`;
-  // The failure comes back as it was thrown: under its original `name`, so
-  // the stage records the same text either way, and, when the classifier
-  // rejected it, as a `NonRetryableError`, so every path that classifies it
-  // reaches the verdict of the first throw. The `cause` is not kept: a row
-  // holds text.
-  const failure = readStepFailure(record);
-  const error = failure?.final
-    ? new NonRetryableError(message)
-    : new Error(message);
-  if (failure?.name) error.name = failure.name;
-  return error;
+  // The failure comes back under its original `name` and with the verdict
+  // of the first throw (see `replayedStepError`).
+  if (record.kind === "run" && isLegacyRefusal(record)) {
+    return replayedStepError(message, {
+      name: "StepNotReplaySafeError",
+      final: true,
+      stop: true,
+      refused: true,
+    });
+  }
+  return replayedStepError(message, readStepFailure(record));
 }
 
 /**
- * Whether `retryIf` says this throw must not be retried. A predicate that
- * throws gives no verdict: it is logged and the failure stays retryable, so
- * a bug in it cannot hide the original error or end a stage early.
+ * A refusal row written before failure records existed (1.0.0-alpha.20 and
+ * earlier): failed, no record, and the refusal's own text. Only such a row
+ * is read by its text, and only to keep refusing it; a recorded row never
+ * is.
  */
-function retryIfDeclines(
+function isLegacyRefusal(record: StepRecord): boolean {
+  return (
+    record.status === "failed" &&
+    readStepFailure(record) === undefined &&
+    typeof record.error === "string" &&
+    record.error.startsWith(
+      `Durable step "${record.stepId}" is declared onReclaim: "fail" and its lease expired at `,
+    )
+  );
+}
+
+/**
+ * Whether `retryIf` says this throw must not be retried. An async predicate
+ * is awaited. A predicate that throws or rejects gives no verdict: it is
+ * logged and the failure stays retryable, so a bug in it cannot hide the
+ * original error, end a stage early, or escape as an unhandled rejection.
+ */
+async function retryIfDeclines(
   opts: StepRunOptions,
   error: unknown,
   attempt: number,
   onLog: CreateStepApiOptions["onLog"],
-): boolean {
+): Promise<boolean> {
   if (!opts.retryIf) return false;
   try {
-    return opts.retryIf(error, { attempt }) === false;
+    return (await opts.retryIf(error, { attempt })) === false;
   } catch (predicateError) {
     onLog?.(
       "WARN",
@@ -564,13 +584,16 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
         ) {
           suspend(new StepInFlight(id, now));
         }
-        // A row a stage retry (or a reset) re-opened after its body threw
-        // is not a dead worker: the body reported that its effect did not
-        // take. Its failure record, for this attempt and with no lease,
-        // says so. A refused replay re-opened by a reset is still unknown.
-        const failure =
-          record.leaseExpiresAt === null ? readStepFailure(record) : undefined;
-        if (onReclaim === "fail" && (!failure || failure.refused)) {
+        // A row a stage retry re-opened after its body threw a retryable
+        // error is not a dead worker: the body reported that its effect did
+        // not take, and the retry granted it a rerun on its failure record.
+        // Any other open row with no live lease (a dead worker; a refusal, a
+        // terminal failure or a completed body that re-running a failed
+        // stage re-opened) is a takeover.
+        const granted =
+          record.leaseExpiresAt === null &&
+          readStepFailure(record)?.retry === true;
+        if (onReclaim === "fail" && !granted) {
           // The dead worker may have completed the body's external effect.
           // Fail the row so the replay after this one meets a stored error
           // rather than racing to the same decision again.
@@ -601,9 +624,14 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
       }
       if (!claimResult.created && record.status === "failed") {
         // The replay the step's own retry runs in: unless the body gave up
-        // (`NonRetryableError`, a `retryIf` that said no, a refused replay),
-        // a failure with `retries` left is executed again.
-        if (record.attempt > retries || readStepFailure(record)?.stop) {
+        // (`NonRetryableError`, a `retryIf` that said no, a refused replay,
+        // including one written before refusals were recorded), a failure
+        // with `retries` left is executed again.
+        if (
+          record.attempt > retries ||
+          readStepFailure(record)?.stop ||
+          (onReclaim === "fail" && isLegacyRefusal(record))
+        ) {
           throw storedError(record);
         }
         record = await reclaim(id, record, leaseMs);
@@ -666,21 +694,21 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
           abortSignal,
         });
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
+        const { message, name: originalName } = describeThrown(error);
         // Two verdicts, recorded with the row. Step level: only a
         // `NonRetryableError`, or a `retryIf` that says no, stops the step's
         // own `retries`; any other error is retried as asked. Stage level:
         // what `isRetryableStageError` says about the error the stage will
         // see, so the stage reaches the same verdict directly and after a
-        // round trip through the ledger. A `retryIf` refusal is thrown as a
-        // `NonRetryableError` wrapping the original.
-        const stop =
-          isNonRetryableError(error) ||
-          retryIfDeclines(opts, error, record.attempt, options.onLog);
-        const thrown =
-          stop && isRetryableStageError(error)
-            ? new NonRetryableError(message, { cause: error })
-            : error;
+        // round trip through the ledger. A `retryIf` refusal is always thrown
+        // as a `NonRetryableError` with the original as `cause`.
+        const declined =
+          !isNonRetryableError(error) &&
+          (await retryIfDeclines(opts, error, record.attempt, options.onLog));
+        const stop = declined || isNonRetryableError(error);
+        const thrown = declined
+          ? new NonRetryableError(message, { cause: error })
+          : error;
         // Under the same constraint as the success write: a body that threw
         // here must not bury an outcome another execution already recorded.
         const failure = await commitOutcome(id, "running", {
@@ -690,6 +718,7 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
             final: !isRetryableStageError(thrown),
             stop,
             refused: false,
+            ...(declined && originalName ? { causeName: originalName } : {}),
           }),
           leaseExpiresAt: null,
         });

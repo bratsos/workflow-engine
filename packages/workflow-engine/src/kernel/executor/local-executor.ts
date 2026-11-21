@@ -8,7 +8,7 @@
  */
 
 import { buildStageExecutionContext } from "../helpers/build-stage-execution-context.js";
-import { toErrorMessage } from "../helpers/error-message.js";
+import { describeThrown } from "../helpers/error-message.js";
 import { isRetryableStageError } from "../helpers/stage-retry.js";
 import type {
   ActivityExecutor,
@@ -35,7 +35,7 @@ export function createLocalExecutor(): ActivityExecutor {
           logs: [],
         };
       } catch (e) {
-        const error = toErrorMessage(e);
+        const { name, message: error } = describeThrown(e);
         // An error retrying cannot change (a Zod error, a duplicate durable
         // step key, a NonRetryableError, an expired wait, a refused replay)
         // is marked non-retryable rather than let hosts burn retry attempts
@@ -43,7 +43,7 @@ export function createLocalExecutor(): ActivityExecutor {
         const retryable = isRetryableStageError(e) ? undefined : false;
         return {
           error,
-          errorName: e instanceof Error ? e.name : undefined,
+          errorName: name,
           errorStack: e instanceof Error ? e.stack : undefined,
           retryable,
           progress: built?.progressEvents ?? [],

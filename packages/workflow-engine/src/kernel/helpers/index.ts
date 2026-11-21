@@ -17,7 +17,7 @@ export {
   withClaimedRun,
 } from "./claim.js";
 export { createStorageShim } from "./create-storage-shim.js";
-export { describeStageError, toErrorMessage } from "./error-message.js";
+export { describeThrown, toErrorMessage } from "./error-message.js";
 export {
   type CreateEventSinkMonitorOptions,
   createEventSinkMonitor,
