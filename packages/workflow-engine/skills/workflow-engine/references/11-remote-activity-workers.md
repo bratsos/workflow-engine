@@ -124,6 +124,7 @@ Workers PUT blobs directly to S3/R2 via the presigned URL — the broker server 
 - **Lease renewal / heartbeat**: workers heartbeat while running; the broker's stale-lease sweep re-leases tasks from crashed workers.
 - **Deploy safety**: set the same `stageCodeVersion` on `defineRemoteStage`, the broker, and the workers. After a deploy bumps the version, a task suspended under the old version is failed rather than resumed from a stale report.
 - **Output-key boundary**: worker-supplied artifact keys are prefix-validated (confused-deputy prevention).
+- **Retry verdict**: a stage that throws on a worker reports its message, the error's `name` and `retryable: false` when the kernel's classifier (`isRetryableStageError`, exported from `@bratsos/workflow-engine/kernel`) rejects it: a `NonRetryableError`, a Zod error from any copy of zod, a duplicate step key. Through the `ActivityExecutor` port, `createRemoteExecutor` passes both to `job.execute`, so the job is not retried and the stage records `"Name: message"` as a local stage would; a stage input that fails validation on the orchestrator is non-retryable too. Both fields are optional on the wire: a worker from an earlier release reports neither (retryable, bare message) and a broker from an earlier release drops them. A `defineRemoteStage` proxy fails the run on any failed outcome, retryable or not.
 
 ## Key API
 

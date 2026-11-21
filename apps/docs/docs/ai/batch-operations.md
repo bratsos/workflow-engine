@@ -89,7 +89,7 @@ Once a batch is submitted, its polls and collect go through the transport record
 
 ### Realtime path
 
-Each item is a durable step `${id}:${itemId}` run under an in-process semaphore of `concurrency`. A thrown model call (transport, quota, timeout) is retried **in-process** — wait `retryDelayMs`, bump the ledger row's `attempt`, call again — up to `realtime.retries` times; the stage never suspends for a map item. `budget` caps model calls including repairs per stage invocation: exceeding it before an item's first call throws `AiMapBudgetExceededError`; a repair that would exceed it returns the item as failed. `minDelayMs` is the minimum spacing between calls *on one concurrency slot* (with `concurrency: 4` and `minDelayMs: "1s"`, at most four calls per second) and replaces hand-written cooldowns.
+Each item is a durable step `${id}:${itemId}` run under an in-process semaphore of `concurrency`. A thrown model call (transport, quota, timeout) is retried **in-process** — wait `retryDelayMs`, bump the ledger row's `attempt`, call again — up to `realtime.retries` times; the stage never suspends for a map item. A model call that throws `NonRetryableError` fails its item at once, spending no retry and no repair. `budget` caps model calls including repairs per stage invocation: exceeding it before an item's first call throws `AiMapBudgetExceededError`; a repair that would exceed it returns the item as failed. `minDelayMs` is the minimum spacing between calls *on one concurrency slot* (with `concurrency: 4` and `minDelayMs: "1s"`, at most four calls per second) and replaces hand-written cooldowns.
 
 ### Batch path
 

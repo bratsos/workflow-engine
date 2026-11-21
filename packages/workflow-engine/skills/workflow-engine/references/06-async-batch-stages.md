@@ -176,11 +176,16 @@ async checkCompletion(suspendedState, ctx) {
   // Failed
   // ===================
   if (status.status === "failed") {
+    // A returned error is terminal: the stage and run fail at once.
     return {
       ready: false,
       error: `Batch ${batchId} failed`,
     };
   }
+  // A *thrown* error (a 503 from the status endpoint) is retried like a
+  // throwing stage body: the next poll calls checkCompletion again after a
+  // 2^attempt s backoff, within the job's attempts; only consecutive throws
+  // count. Throw NonRetryableError (or let a Zod error escape) to fail at once.
 
   // ===================
   // Completed

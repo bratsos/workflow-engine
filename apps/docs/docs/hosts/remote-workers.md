@@ -172,6 +172,11 @@ When a workflow is cancelled on the orchestrator, active jobs are marked as canc
 ### Version-Lock Safety
 Bumping `stageCodeVersion` acts as a deploy barrier. If a task was suspended using version `v1` but a worker attempts to fetch it with version `v2`, the broker rejects the lease, preventing code mismatch errors.
 
+### Failures and retries
+A stage that throws on a worker is reported as a failed outcome carrying the message, the error's `name` and the worker's retry verdict. The worker reaches the verdict with the kernel's own classifier: a `NonRetryableError`, a Zod error (from any copy of zod) and the other errors retrying cannot change are reported `retryable: false`. Through the `ActivityExecutor` port, the `RemoteExecutor` hands both to `job.execute`, so the job is not retried and the stage records the same text a local stage would (`"QuotaError: over quota"`). A stage input that fails validation on the orchestrator is non-retryable too, as with `LocalExecutor`.
+
+Both fields are optional on the wire. A report without them (a worker from an earlier release) is retryable and records the bare message, as before, and a broker from an earlier release drops them. A proxy stage built with `defineRemoteStage` fails the run on any failed outcome, retryable or not: its `checkCompletion` returns the failure as `{ error }`, which is terminal.
+
 ### What the worker's stage context carries
 The activity worker builds the stage context by hand, so a stage that runs remotely gets the full `StageContext` contract with these limits:
 * **`ctx.step`** is present but has no ledger: every `ctx.step.*` call throws `StepLedgerNotConfiguredError`. [Durable steps](../core-concepts/durable-steps.md) run on the orchestrator's stages, not on remote workers.

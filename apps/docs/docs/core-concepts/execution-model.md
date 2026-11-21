@@ -120,6 +120,17 @@ When a stage fails (by throwing an error), the engine increments the attempt cou
 * The job is returned to the queue if `attempt < maxAttempts` (the transport's `maxAttempts` is the retry budget; the built-in transports back off `2^attempt` seconds). The stage row stays `PENDING` with the error on `errorMessage`, `stage:retrying` is emitted, and the stage's durable step ledger is kept: the retry replays completed steps and re-opens failed ones.
 * The backoff strategy is managed by the host.
 * A suspended stage that throws while `stage.pollSuspended` replays it is retried under the same rule and with the same classifier, spending the attempts its `SUSPENDED` job row has left. The stage stays `SUSPENDED` with the error on `errorMessage`, `attempt` is bumped, `stage:retrying` is emitted and the next poll replays it after a `2^attempt` second backoff; the same single-flight claim applies to that replay as to any other.
+* A `checkCompletion` that **throws** is retried the same way: same classifier, same budget, and the next poll calls it again after the backoff. Only consecutive throws count: a poll that answers cleanly (ready or not) ends the streak and clears `errorMessage`. The retry is written only if the stage is still as the poller claimed it, so a poll whose stage a job completed, a cancel marked or another poller claimed in the meantime writes nothing. A `checkCompletion` that **returns** `{ error }` still fails the stage at once.
+
+### Which errors are retried
+One classifier decides, wherever the throw is met: `job.execute` (through the local or remote executor), a replay in `stage.pollSuspended`, and a throwing `checkCompletion`. These fail the stage attempt terminally, whatever budget is left:
+* `NonRetryableError` (exported from `@bratsos/workflow-engine`; detect it across bundled copies with `isNonRetryableError`), thrown by the stage or by a step, or made by a step's `retryIf` returning `false`;
+* a Zod error, from any copy of zod (the application's own, another major, `zod/mini`), recognised by its name and `issues` rather than by class;
+* `DuplicateStepKeyError`, an expired durable wait (`StepTimeoutError`) and an `onReclaim: "fail"` refusal (`StepNotReplaySafeError`): each is recorded on its ledger row, which every later attempt answers with the same error.
+
+Every other error is retried within the budget. The stage records the error as `"Name: message"` (a plain `Error` by its message alone) on every path.
+
+A suspended stage's retry budget is read from its `SUSPENDED` job row, and the failure count from `suspendedState.metadata.__replayFailures`, which a `checkCompletion` also sees in the state it is handed. When no `SUSPENDED` row is found (no host loop ran the stage, or the job acknowledgement has not landed yet), the host default of three attempts applies.
 
 ### Terminal Failures
 Once a stage exhausts its `maxAttempts`, it is marked as `FAILED` and `stage:failed` is emitted.
