@@ -132,27 +132,34 @@ async function failStageOnly(
   errorMessage: string,
   deps: KernelDeps,
   postCommits: Array<() => Promise<void>>,
-): Promise<void> {
-  await deps.persistence.withTransaction(async (tx) => {
-    await tx.updateStage(stageRecord.id, {
-      status: "FAILED",
-      completedAt: deps.clock.now(),
-      errorMessage,
-      nextPollAt: deps.clock.now(),
+): Promise<number> {
+  try {
+    await deps.persistence.withTransaction(async (tx) => {
+      await tx.updateStage(stageRecord.id, {
+        status: "FAILED",
+        completedAt: deps.clock.now(),
+        errorMessage,
+        nextPollAt: deps.clock.now(),
+        // A host that completed the stage since the claim keeps it.
+        expectedVersion: stageRecord.version,
+      });
+      await tx.appendOutboxEvents(
+        toOutboxEvents(stageRecord.workflowRunId, [
+          {
+            type: "stage:failed",
+            timestamp: deps.clock.now(),
+            workflowRunId: stageRecord.workflowRunId,
+            stageId: stageRecord.stageId,
+            stageName: stageRecord.stageName,
+            error: errorMessage,
+          },
+        ]),
+      );
     });
-    await tx.appendOutboxEvents(
-      toOutboxEvents(stageRecord.workflowRunId, [
-        {
-          type: "stage:failed",
-          timestamp: deps.clock.now(),
-          workflowRunId: stageRecord.workflowRunId,
-          stageId: stageRecord.stageId,
-          stageName: stageRecord.stageName,
-          error: errorMessage,
-        },
-      ]),
-    );
-  });
+  } catch (error) {
+    if (error instanceof StaleVersionError) return 0;
+    throw error;
+  }
   postCommits.push(() =>
     failSuspendedJobRow(
       stageRecord.workflowRunId,
@@ -161,6 +168,7 @@ async function failStageOnly(
       deps,
     ),
   );
+  return 1;
 }
 
 type ReplayOutcome = "resumed" | "suspended" | "retrying" | "failed" | "skip";
@@ -799,13 +807,12 @@ export async function handleStagePollSuspended(
     // 3b. Get workflow from registry
     const workflow = deps.registry.getWorkflow(run.workflowId);
     if (!workflow) {
-      await failStageOnly(
+      failed += await failStageOnly(
         stageRecord,
         `Workflow ${run.workflowId} not found in registry`,
         deps,
         postCommits,
       );
-      failed++;
       continue;
     }
 
@@ -859,8 +866,7 @@ export async function handleStagePollSuspended(
         ? `Stage ${stageRecord.stageId} not found in workflow ${run.workflowId}`
         : `Stage ${stageRecord.stageId} does not support checkCompletion`;
 
-      await failStageOnly(stageRecord, errorMsg, deps, postCommits);
-      failed++;
+      failed += await failStageOnly(stageRecord, errorMsg, deps, postCommits);
       continue;
     }
 

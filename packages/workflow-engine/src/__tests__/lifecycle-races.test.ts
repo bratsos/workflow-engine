@@ -519,6 +519,82 @@ describe(`lifecycle races on ${realDatabase ? (sqlite ? "SQLite" : "Postgres") :
       );
     });
 
+    it("a poller that cannot serve the workflow leaves a stage a host completed since the claim", async () => {
+      const legacy = new WorkflowBuilder(
+        "lifecycle-unserved",
+        "Lifecycle unserved",
+        "lifecycle-unserved",
+        schema,
+        z.any(),
+      )
+        .pipe(
+          defineAsyncBatchStage({
+            id: "s",
+            name: "S",
+            mode: "async-batch",
+            schemas: { input: schema, output: z.any(), config: schema },
+            async execute() {
+              const poll = { pollInterval: 1000, maxWaitTime: 3_600_000 };
+              return {
+                suspended: true,
+                state: {
+                  batchId: "b",
+                  submittedAt: new Date().toISOString(),
+                  ...poll,
+                },
+                pollConfig: { nextPollAt: new Date(0), ...poll },
+              };
+            },
+            async checkCompletion() {
+              return { ready: false } as never;
+            },
+          }),
+        )
+        .build();
+      const send = kernel({ registry: { getWorkflow: () => legacy } });
+      const runId = await createClaimed(send);
+      await send({
+        type: "job.execute",
+        workflowRunId: runId,
+        workflowId: legacy.id,
+        stageId: "s",
+        config: {},
+      });
+      const poll = kernel({
+        registry: {
+          getWorkflow: () => {
+            return undefined as never;
+          },
+        },
+      });
+      const persistence = ports.persistence as unknown as Record<
+        string,
+        unknown
+      >;
+      const getRun = ports.persistence.getRun.bind(ports.persistence);
+      // Between the claim and the registry lookup, a serving host
+      // completes the stage.
+      persistence.getRun = async (...args: Parameters<typeof getRun>) => {
+        delete persistence.getRun;
+        const stage = (await ports.persistence.getStage(runId, "s"))!;
+        await ports.persistence.updateStage(stage.id, {
+          status: "COMPLETED",
+          completedAt: new Date(),
+        });
+        return getRun(...args);
+      };
+      try {
+        await expect(
+          poll({ type: "stage.pollSuspended" }),
+        ).resolves.toMatchObject({ failed: 0 });
+      } finally {
+        delete persistence.getRun;
+      }
+      expect((await ports.persistence.getStage(runId, "s"))?.status).toBe(
+        "COMPLETED",
+      );
+    });
+
     it("a durable replay that finishes after a completed job", async () => {
       const held = gate();
       let calls = 0;
