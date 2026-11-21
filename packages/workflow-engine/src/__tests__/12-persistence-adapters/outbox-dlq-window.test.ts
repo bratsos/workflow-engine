@@ -1301,26 +1301,46 @@ describe.skipIf(!sqlite && !databaseUrl)(
         expect(() =>
           storeOver(omitClientMembers("$queryRaw", "$queryRawUnsafe")),
         ).toThrow(RootClaimUnsupportedError);
-        // A root that reads raw, with transaction views that cannot.
-        const wrapper = new Proxy(client, {
-          get(target, key) {
-            if (key === "$transaction")
-              return (work: (tx: typeof client) => unknown, options: unknown) =>
-                target.$transaction(
-                  (tx: typeof client) =>
-                    work(
-                      new Proxy(tx, {
-                        get: (view, member) =>
-                          member === "$queryRaw" || member === "$queryRawUnsafe"
-                            ? undefined
-                            : Reflect.get(view, member, view),
-                      }),
-                    ),
-                  options,
-                );
-            return Reflect.get(target, key, target);
-          },
-        });
+        // Records each raw statement and each claim transaction's timeout;
+        // `hideRaw` gives a root that reads raw, with transaction views that
+        // cannot.
+        const statements: string[] = [];
+        const timeouts: unknown[] = [];
+        const observe = (
+          prisma: typeof client,
+          hideRaw: boolean,
+          inTx = false,
+        ): typeof client =>
+          new Proxy(prisma, {
+            get(target, key) {
+              if (key === "$withColumns" && target.$withColumns)
+                return (...args: unknown[]) =>
+                  observe(target.$withColumns(...args), hideRaw, inTx);
+              if (key === "$transaction" && !inTx)
+                return (work: unknown, options?: { timeout?: number }) => {
+                  if (typeof work !== "function")
+                    return target.$transaction(work, options);
+                  timeouts.push(options?.timeout);
+                  return target.$transaction(
+                    (tx: typeof client) => work(observe(tx, hideRaw, true)),
+                    options,
+                  );
+                };
+              if (key === "$queryRaw" || key === "$queryRawUnsafe") {
+                if (inTx && hideRaw) return undefined;
+                return (
+                  sql: string | TemplateStringsArray,
+                  ...args: unknown[]
+                ) => {
+                  statements.push(
+                    typeof sql === "string" ? sql : sql.join("?"),
+                  );
+                  return target[key](sql, ...args);
+                };
+              }
+              return Reflect.get(target, key, target);
+            },
+          });
         const store = storeOver(client);
         const seed = `INSERT INTO outbox_events
         (id, "workflowRunId", sequence, "eventType", payload, "causationId", "occurredAt", "deliveryClaim")
@@ -1329,24 +1349,32 @@ describe.skipIf(!sqlite && !databaseUrl)(
         await client.$executeRawUnsafe(
           seed,
           "2099-01-01T00:00:00.000Z|held",
-          // The claim walks every leased head before z-ready: 25,000 took up to
-          // 6 s a flush on a loaded machine, against the 4 s bound below.
+          // The claim walks every leased head before z-ready, in one statement.
           5000,
         );
         // The wrapper's claim runs on the root without planner settings, so
         // its plan follows the statistics (see kernel-and-ports.md).
         await client.$executeRawUnsafe("ANALYZE outbox_events");
-        for (const shape of [store, storeOver(wrapper)]) {
+        for (const shape of [
+          storeOver(observe(client, false)),
+          storeOver(observe(client, true)),
+        ]) {
           await seedEvent("z-ready");
-          const start = performance.now();
+          statements.length = 0;
+          timeouts.length = 0;
           await expect(
             make({ async emit() {} }, shape).dispatch({
               type: "outbox.flush",
               maxEvents: 1,
-              claimDurationMs: 4000,
+              claimDurationMs: 60_000,
             }),
           ).resolves.toMatchObject({ published: 1 });
-          expect(performance.now() - start).toBeLessThan(4000);
+          // Work, not wall time: one claim statement walks every leased head,
+          // in a transaction bounded by the lease, not Prisma's 5 s default.
+          expect(
+            statements.filter((sql) => sql.startsWith("WITH RECURSIVE cursor")),
+          ).toHaveLength(1);
+          expect(timeouts).toContain(60_000);
           await client.outboxEvent.deleteMany({
             where: { workflowRunId: "z-ready" },
           });

@@ -1956,6 +1956,9 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       !this.skipTransactions &&
       this.prisma.$transaction
     ) {
+      // The walk may take as long as the lease (claimDurationMs); Prisma's 5 s default stays the floor.
+      const lease =
+        Date.parse(claim.slice(0, claim.indexOf("|"))) - now.getTime();
       const rows = await this.prisma.$transaction(
         async (tx: PrismaClient) => {
           if (signal?.aborted) return [];
@@ -1983,7 +1986,12 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
           );
           return claimRows(tx);
         },
-        { isolationLevel: "ReadCommitted" },
+        {
+          isolationLevel: "ReadCommitted",
+          timeout: Number.isNaN(lease)
+            ? 5_000
+            : Math.min(2_147_483_647, Math.max(5_000, lease)),
+        },
       );
       if (rows) return rows;
     }
