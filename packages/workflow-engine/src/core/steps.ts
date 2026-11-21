@@ -49,16 +49,15 @@ export interface StepRunOptions {
    * terminally instead of being retried by its job or by the poll loop. The
    * stage sees a `NonRetryableError` carrying the original error as `cause`.
    * Any other return value (`true`, `undefined`, `0`) leaves `retries` in
-   * charge. A predicate that throws or rejects is logged and counts as
-   * `true`. An async predicate is awaited.
+   * charge. The predicate must answer synchronously: one that throws, or
+   * returns a promise, is logged and counts as `true`.
    *
    * Without `retryIf`, a step retries every error but `NonRetryableError`,
-   * a Zod error from a response the body validates included.
+   * a Zod error from a response the body validates included. Neither
+   * changes when a step that failed is run again by anything other than its
+   * own `retries` (a stage retry, a lease takeover, `onReclaim`).
    */
-  retryIf?: (
-    error: unknown,
-    info: { attempt: number },
-  ) => boolean | Promise<boolean>;
+  retryIf?: (error: unknown, info: { attempt: number }) => boolean;
   /**
    * Delay before retrying a failed attempt. A number of milliseconds or a
    * duration string (`"30s"`, `"5m"`). Defaults to zero.
@@ -341,8 +340,9 @@ export function isStepControlFlowError(
 /**
  * Cross-bundle brand for a step failure no retry can change: an expired wait,
  * a refused replay, and a failure the stage classifier rejected as a ledger
- * replay rethrows it. `isRetryableStageError` reads it, so a second copy of
- * the engine reaches the same verdict as the one that threw.
+ * replay rethrows it. `isRetryableStageError` reads it, so another copy of
+ * this release or a later one reaches the same verdict (earlier releases
+ * throw these classes without it, and a JSON round trip drops it).
  */
 export const STEP_TERMINAL_FAILURE: unique symbol = Symbol.for(
   "@bratsos/workflow-engine/terminal-step-failure",
@@ -494,7 +494,7 @@ const STEP_NON_RETRYABLE: unique symbol = Symbol.for(
 ) as typeof STEP_NON_RETRYABLE;
 
 /**
- * Throw this from a stage body, a `checkCompletion` or a `ctx.step.run` body
+ * Throw this from a stage body or a `ctx.step.run` body
  * to say the failure will not change on a retry (a rejected input, a revoked
  * credential, a business rule). The stage attempt fails terminally: its job
  * is not retried and `stage.pollSuspended` does not retry it. Inside a step

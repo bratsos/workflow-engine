@@ -155,4 +155,70 @@ describe("dead job verdict", () => {
     });
     expect(await status()).toBe("RUNNING");
   });
+
+  it("does not take another kernel's missing workflow of the same id for its own", async () => {
+    // A second kernel without the workflow, reached from a custom executor
+    // with another stage and run: its error names the same workflow id.
+    const inner = createKernel({
+      persistence: new InMemoryWorkflowPersistence(),
+      jobTransport: new InMemoryJobQueue("w"),
+      blobStore: new InMemoryBlobStore(),
+      clock: new FakeClock(new Date()),
+      eventSink: new CollectingEventSink(),
+      registry: { getWorkflow: () => undefined },
+    });
+    const { kernel, jobTransport, message, status } = await claimedJob({
+      run: async () =>
+        inner.dispatch({
+          type: "job.execute",
+          workflowRunId: "inner-run",
+          workflowId: workflow.id,
+          stageId: "inner-stage",
+          config: {},
+        }) as never,
+    });
+
+    const failure = await executeJobWithHeartbeat(kernel, {
+      jobTransport,
+      job: message,
+    }).catch((error: unknown) => error);
+
+    expect(failure).toMatchObject({ name: "JobTargetMissingError" });
+    expect(await status()).toBe("RUNNING");
+  });
+
+  it.each([
+    [
+      "the plain Error an earlier release's kernel throws",
+      (text: string) => new Error(text),
+    ],
+    [
+      "a plain object carrying name and message",
+      (text: string) => ({ name: "JobTargetMissingError", message: text }),
+    ],
+  ])("acknowledges the missing run reported as %s", async (_case, make) => {
+    const { kernel, jobTransport, message, status } = await claimedJob();
+    const reporting = {
+      ...kernel,
+      dispatch: (async (command: Parameters<typeof kernel.dispatch>[0]) => {
+        try {
+          return await kernel.dispatch(command);
+        } catch (error) {
+          throw make((error as Error).message);
+        }
+      }) as typeof kernel.dispatch,
+    };
+
+    const outcome = await executeJobWithHeartbeat(reporting, {
+      jobTransport,
+      job: { ...message, workflowRunId: "gone" },
+    });
+
+    expect(outcome).toMatchObject({
+      outcome: "failed",
+      dead: true,
+      error: "WorkflowRun gone not found",
+    });
+    expect(await status()).toBe("FAILED");
+  });
 });

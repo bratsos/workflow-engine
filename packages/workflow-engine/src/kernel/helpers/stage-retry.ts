@@ -7,7 +7,6 @@
 
 import type { KernelDeps } from "../kernel.js";
 import { HOST_DEFAULTS } from "./host-support.js";
-import { readStepFailure, retryGrantedResult } from "./stage-error-class.js";
 
 export { isRetryableStageError } from "./stage-error-class.js";
 
@@ -37,10 +36,7 @@ export function willRetryStage(options: {
  * `failed attempt 3` re-runs as attempt 4), so the ledger keeps the
  * per-step history. The failure text stays on `error` until the re-run
  * overwrites it. Waits, signals and sleeps that failed (a deadline that
- * passed) are terminal and stay so, and so is a `run` step whose failure was
- * recorded as a final verdict (a `NonRetryableError`, a `retryIf` that said
- * no, any error the stage classifier rejects, a refused replay): the replay
- * answers it with the same error.
+ * passed) are terminal and stay so.
  */
 export async function reopenFailedSteps(
   stageRecordId: string,
@@ -51,18 +47,11 @@ export async function reopenFailedSteps(
   const rows = await ledger.list(stageRecordId);
   for (const row of rows) {
     if (row.status !== "failed" || row.kind !== "run") continue;
-    if (readStepFailure(row)?.final) continue;
-    // The grant lets a body that threw run again under onReclaim: "fail".
-    const result = retryGrantedResult(row);
     await ledger.compareAndSet(
       stageRecordId,
       row.stepId,
       { status: "failed", attempt: row.attempt },
-      {
-        status: "running",
-        leaseExpiresAt: null,
-        ...(result ? { result } : {}),
-      },
+      { status: "running", leaseExpiresAt: null },
     );
   }
 }

@@ -18,7 +18,6 @@ import { deriveStepExternalKey } from "../core/step-external-key.js";
 import {
   isNonRetryableError,
   NonRetryableError,
-  StepNotReplaySafeError,
   type StepRunOptions,
 } from "../core/steps.js";
 import { type Workflow, WorkflowBuilder } from "../core/workflow.js";
@@ -102,14 +101,14 @@ async function start(env: Env, workflow: Workflow<any, any>) {
     input: {},
   });
   await kernel.dispatch({ type: "run.claimPending", workerId: "w" });
-  const execute = (attempt?: number) =>
+  const execute = (attempt?: number, maxAttempts = 3) =>
     kernel.dispatch({
       type: "job.execute",
       workflowRunId,
       workflowId: workflow.id,
       stageId: "s",
       config: {},
-      ...(attempt !== undefined ? { attempt, maxAttempts: 3 } : {}),
+      ...(attempt !== undefined ? { attempt, maxAttempts } : {}),
     });
   const poll = async () => {
     env.clock.advance(POLL_GAP_MS);
@@ -134,6 +133,15 @@ function failing(n: number, make: () => unknown) {
   };
   body.calls = 0;
   return body;
+}
+
+/** A one-shot latch for ordering a schedule. */
+function signal() {
+  let open!: () => void;
+  const promise = new Promise<void>((resolve) => {
+    open = resolve;
+  });
+  return { open, promise };
 }
 
 class QuotaError extends Error {
@@ -202,19 +210,41 @@ const verdictCases: Array<
     "QuotaError: over quota",
   ],
   [
-    "an async retryIf that resolves false",
+    "an async retryIf resolving false (no verdict: it must be synchronous)",
     () => new QuotaError(),
-    { retryIf: async () => false },
-    false,
-    "NonRetryableError: over quota",
+    { retryIf: (async () => false) as unknown as () => boolean },
+    true,
+    "QuotaError: over quota",
+  ],
+  [
+    "a retryIf that throws a value with no string form",
+    () => new QuotaError(),
+    {
+      retryIf: () => {
+        throw Object.create(null);
+      },
+    },
+    true,
+    "QuotaError: over quota",
+  ],
+  [
+    "a retryIf property whose getter throws",
+    () => new QuotaError(),
+    Object.defineProperty({}, "retryIf", {
+      get() {
+        throw new Error("getter");
+      },
+    }) as StepRunOptions,
+    true,
+    "QuotaError: over quota",
   ],
   [
     "a rejecting async retryIf",
     () => new QuotaError(),
     {
-      retryIf: async () => {
+      retryIf: (async () => {
         throw new Error("predicate rejected");
-      },
+      }) as unknown as () => boolean,
     },
     true,
     "QuotaError: over quota",
@@ -361,21 +391,29 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
       });
     });
 
-    describe('a known thrown failure under onReclaim: "fail"', () => {
+    /**
+     * Who may run a protected step again is main's decision, unchanged by
+     * any verdict: each schedule below runs the body exactly as often as
+     * main does (round-2 gate, astra-rnarrow-2 P1s).
+     */
+    describe('reruns of an onReclaim: "fail" step stay as before', () => {
       const opts: StepRunOptions = { onReclaim: "fail" };
 
-      it("is re-run by a job retry, not refused as a dead worker", async () => {
+      it("refuses a step that threw once a job retry re-opens it", async () => {
         const body = failing(1, () => new QuotaError());
         const run = await start(
           env,
           workflowOf("r8-job", directStage(body, opts)),
         );
         expect(await run.execute(1)).toMatchObject({ willRetry: true });
-        expect(await run.execute(2)).toMatchObject({ outcome: "completed" });
-        expect(body.calls).toBe(2);
+        const retried = await run.execute(2);
+        expect((retried as { error: string }).error).toMatch(
+          /^StepNotReplaySafeError: /,
+        );
+        expect(body.calls).toBe(1);
       });
 
-      it("is re-run by a poll retry, not refused as a dead worker", async () => {
+      it("refuses a step that threw once a poll retry re-opens it", async () => {
         const body = failing(1, () => new QuotaError());
         const run = await start(
           env,
@@ -384,8 +422,198 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
         await run.execute(1);
         await run.poll();
         await run.poll();
-        expect(await run.stage()).toMatchObject({ status: "COMPLETED" });
-        expect(body.calls).toBe(2);
+        expect(await run.stage()).toMatchObject({ status: "FAILED" });
+        expect(body.calls).toBe(1);
+      });
+
+      it("keeps a newer refusal when a delayed retry's reopen lands on it", async () => {
+        let bodies = 0;
+        const stage = defineStage({
+          id: "s",
+          name: "s",
+          schemas: { input: z.object({}), output: out, config: z.object({}) },
+          async execute(ctx) {
+            try {
+              await ctx.step.run(
+                "work",
+                async () => {
+                  if (++bodies === 1) throw new Error("first failure");
+                  return "second body";
+                },
+                opts,
+              );
+              return { output: { ok: true } };
+            } catch (error) {
+              if ((error as Error).name !== "StepNotReplaySafeError") {
+                await ctx.step.sleep("settle", 1);
+              }
+              throw error;
+            }
+          },
+        });
+        const run = await start(env, workflowOf("stale-cas", stage));
+        expect(await run.execute(1)).toMatchObject({ outcome: "suspended" });
+        const ledger = env.stepLedger;
+        const cas = ledger.compareAndSet.bind(ledger);
+        const atCas = signal();
+        const resume = signal();
+        let held = false;
+        ledger.compareAndSet = async (...args) => {
+          const [, stepId, expected, patch] = args;
+          if (
+            !held &&
+            stepId === "work" &&
+            expected.status === "failed" &&
+            patch.status === "running"
+          ) {
+            held = true;
+            atCas.open();
+            await resume.promise;
+          }
+          return cas(...args);
+        };
+        try {
+          // The poll retry pauses just before re-opening the step.
+          const retry = run.poll();
+          await atCas.promise;
+          // The last delivery fails the stage, and running it again records
+          // a refusal on the same step attempt.
+          expect(await run.execute(2, 2)).toMatchObject({ outcome: "failed" });
+          const refused = await run.execute(2, 2);
+          expect((refused as { error: string }).error).toMatch(
+            /^StepNotReplaySafeError: /,
+          );
+          resume.open();
+          await retry;
+          const last = await run.execute(2, 2);
+          expect(last).toMatchObject({ outcome: "failed" });
+          expect(bodies).toBe(1);
+        } finally {
+          resume.open();
+          ledger.compareAndSet = cas;
+        }
+      });
+
+      it("keeps a delayed retry from granting a later delivery's step a rerun", async () => {
+        let bodies = 0;
+        let executions = 0;
+        let armed = false;
+        const stage = defineStage({
+          id: "s",
+          name: "s",
+          schemas: { input: z.object({}), output: out, config: z.object({}) },
+          async execute(ctx) {
+            await ctx.step.sleep("start", 1);
+            if (++executions === 1) {
+              armed = true;
+              throw new Error("service A unavailable");
+            }
+            try {
+              await ctx.step.run(
+                "request",
+                async () => {
+                  if (++bodies === 1) throw new Error("service B unavailable");
+                  return "second call";
+                },
+                opts,
+              );
+            } catch (error) {
+              if ((error as Error).name === "StepNotReplaySafeError")
+                throw error;
+            }
+            await ctx.step.sleep("later", 1);
+            return { output: { ok: true } };
+          },
+        });
+        const run = await start(env, workflowOf("late-reopen", stage));
+        expect(await run.execute(1)).toMatchObject({ outcome: "suspended" });
+        const ledger = env.stepLedger;
+        const list = ledger.list.bind(ledger);
+        const listed = signal();
+        const resume = signal();
+        let blocked = false;
+        ledger.list = async (...args) => {
+          if (armed && !blocked) {
+            blocked = true;
+            listed.open();
+            await resume.promise;
+          }
+          return list(...args);
+        };
+        try {
+          // The poll retry pauses before listing the rows to re-open.
+          const retry = run.poll();
+          await listed.promise;
+          // A new delivery calls the step, which fails, and suspends again.
+          expect(await run.execute(2)).toMatchObject({ outcome: "suspended" });
+          resume.open();
+          await retry;
+          await run.poll();
+          expect(bodies).toBe(1);
+          expect(await run.stage()).toMatchObject({ status: "FAILED" });
+        } finally {
+          resume.open();
+          ledger.list = list;
+        }
+      });
+
+      it("runs the step once when the poll retries before the queue acknowledges the suspension", async () => {
+        let bodies = 0;
+        const stage = defineStage({
+          id: "s",
+          name: "s",
+          schemas: { input: z.object({}), output: out, config: z.object({}) },
+          async execute(ctx) {
+            await ctx.step.sleep("start", 1);
+            await ctx.step.run(
+              "request",
+              async () => {
+                if (++bodies === 1) throw new Error("retryable response");
+                return "second call";
+              },
+              opts,
+            );
+            return { output: { ok: true } };
+          },
+        });
+        const run = await start(env, workflowOf("budget-gap", stage));
+        const job = (await env.jobTransport.dequeue())!;
+        expect(await run.execute(1)).toMatchObject({ outcome: "suspended" });
+        // The queue row is still RUNNING when the poll replays and retries.
+        await run.poll();
+        await env.jobTransport.suspend(job.jobId, env.clock.now());
+        await run.poll();
+        expect(bodies).toBe(1);
+        expect(await run.stage()).toMatchObject({ status: "FAILED" });
+      });
+
+      it("gives an async retryIf no verdict, so nothing waits on it past the lease", async () => {
+        let calls = 0;
+        let predicates = 0;
+        const never = new Promise<boolean>(() => {});
+        const run = await start(
+          env,
+          workflowOf(
+            "async-lease",
+            directStage(
+              async () => {
+                if (++calls === 1) throw new QuotaError();
+                return "ok";
+              },
+              {
+                lease: 10,
+                retryIf: (() => {
+                  predicates++;
+                  return never;
+                }) as unknown as () => boolean,
+              },
+            ),
+          ),
+        );
+        expect(await run.execute(1)).toMatchObject({ willRetry: true });
+        expect(await run.execute(2)).toMatchObject({ outcome: "completed" });
+        expect(calls).toBe(2);
+        expect(predicates).toBe(1);
       });
     });
 
@@ -578,59 +806,13 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
       });
     });
 
-    it("keeps refusing a refusal row written before refusals were recorded", async () => {
-      const body = failing(0, () => undefined);
-      let seeded = false;
-      const stage = defineStage({
-        id: "s",
-        name: "s",
-        schemas: { input: z.object({}), output: out, config: z.object({}) },
-        async execute(ctx) {
-          const stageRecordId = ctx.stageRecordId!;
-          const externalKey = deriveStepExternalKey(stageRecordId, "call");
-          if (!seeded) {
-            seeded = true;
-            // The row a 1.0.0-alpha.20 refusal left: failed, no record.
-            await env.stepLedger.claim({
-              stageRecordId,
-              stepId: "call",
-              seq: 1,
-              kind: "run",
-              status: "running",
-              attempt: 1,
-              leaseExpiresAt: null,
-              deadlineAt: null,
-              externalKey,
-            });
-            await env.stepLedger.compareAndSet(
-              stageRecordId,
-              "call",
-              { status: "running", attempt: 1 },
-              {
-                status: "failed",
-                error: new StepNotReplaySafeError(
-                  "call",
-                  externalKey,
-                  env.clock.now(),
-                ).message,
-                result: null,
-              },
-            );
-          }
-          await ctx.step.run("call", body, { onReclaim: "fail", retries: 2 });
-          return { output: { ok: true } };
-        },
-      });
-      const run = await start(env, workflowOf("legacy-refusal", stage));
-      const result = await run.execute(1);
-      expect(result).toMatchObject({ outcome: "failed", willRetry: false });
-      expect((result as { error: string }).error).toMatch(
-        /^StepNotReplaySafeError: /,
-      );
-      expect(body.calls).toBe(0);
-    });
-
     describe("the error a stage catches from a step", () => {
+      /** The text of a cause, whatever it is. */
+      const causeText = (cause: unknown) =>
+        typeof cause === "string"
+          ? cause
+          : (cause as { message?: string } | undefined)?.message;
+
       /** Records what the stage caught, directly and on the replay. */
       function observingStage(
         body: () => Promise<unknown>,
@@ -650,6 +832,7 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
                 name: e.name,
                 branded: isNonRetryableError(e),
                 cause: (e.cause as Error | undefined)?.name,
+                causeText: causeText(e.cause),
               });
             }
             await ctx.step.sleep("nap", 1000);
@@ -669,22 +852,57 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
           "an ordinary error declined by retryIf",
           () => new QuotaError(),
           { retryIf: (): boolean => false },
-          { name: "NonRetryableError", branded: true, cause: "QuotaError" },
+          {
+            name: "NonRetryableError",
+            branded: true,
+            cause: "QuotaError",
+            causeText: "over quota",
+          },
+        ],
+        [
+          "a thrown string declined by retryIf",
+          () => "bad answer",
+          { retryIf: (): boolean => false },
+          {
+            name: "NonRetryableError",
+            branded: true,
+            causeText: "bad answer",
+          },
+        ],
+        [
+          "an unnamed object declined by retryIf",
+          () => ({ message: "bad answer" }),
+          { retryIf: (): boolean => false },
+          {
+            name: "NonRetryableError",
+            branded: true,
+            causeText: "bad answer",
+          },
         ],
         [
           "a Zod error",
           zodParse,
           {},
-          { name: "ZodError", branded: false, cause: undefined },
+          {
+            name: "ZodError",
+            branded: false,
+            cause: undefined,
+            causeText: undefined,
+          },
         ],
         [
           "a NonRetryableError",
           () => new NonRetryableError("revoked"),
           {},
-          { name: "NonRetryableError", branded: true, cause: undefined },
+          {
+            name: "NonRetryableError",
+            branded: true,
+            cause: undefined,
+            causeText: undefined,
+          },
         ],
       ])("is the same directly and after a replay: %s", async (_case, make, opts, expected) => {
-        const seen: unknown[] = [];
+        const seen: Array<Record<string, unknown>> = [];
         const run = await start(
           env,
           workflowOf(
@@ -695,7 +913,10 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
         expect(await run.execute(1)).toMatchObject({ outcome: "suspended" });
         await run.poll();
         expect(await run.stage()).toMatchObject({ status: "COMPLETED" });
-        expect(seen).toEqual([expected, expected]);
+        expect(seen).toHaveLength(2);
+        expect(seen[0]).toMatchObject(expected);
+        expect(seen[1]).toMatchObject(expected);
+        expect(seen[1]!.causeText).toBe(seen[0]!.causeText);
       });
     });
   });

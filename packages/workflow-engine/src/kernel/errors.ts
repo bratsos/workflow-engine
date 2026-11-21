@@ -33,24 +33,36 @@ function missingTargetMessages(target: JobTarget) {
 /**
  * Thrown by `job.execute` when the job's workflow, stage or run does not
  * exist: the queue row is an orphan, and a host acknowledges it as dead.
+ * The text is the one earlier releases threw, so older readers still match
+ * it; `target` names the command it was thrown for.
  */
 export class JobTargetMissingError extends Error {
   readonly [JOB_TARGET_MISSING] = true as const;
+  readonly target: JobTarget;
 
   constructor(target: JobTarget, missing: "workflow" | "stage" | "run") {
     super(missingTargetMessages(target)[missing]);
     this.name = "JobTargetMissingError";
+    this.target = { ...target };
   }
 }
 
 /**
- * Whether `error` is the {@link JobTargetMissingError} `job.execute` throws
- * for this very job. It is recognised by its brand or its name (an
- * integration that carries dispatch errors across a boundary keeps the name
- * and message, not the brand), and only when its message names this job's
- * own workflow, stage or run: a missing target of a different dispatch made
- * inside the job (a custom executor) is that dispatch's verdict, not this
- * job's, and an ordinary error that reads the same way is neither.
+ * Whether `error` is the missing-target error `job.execute` throws for this
+ * very job, so a host may acknowledge the job as dead.
+ *
+ * - The error itself (branded): its `target` must be this job's workflow,
+ *   stage and run, all three. The missing target of another dispatch made
+ *   inside the job (a custom executor calling a kernel) names another
+ *   target, and is that dispatch's failure, not this job's.
+ * - The same error carried across a boundary that keeps only its name and
+ *   message, or the plain `Error` an earlier release's kernel throws: its
+ *   message must be exactly the text thrown for one of this job's own
+ *   workflow, stage or run. This cannot tell this job's missing workflow
+ *   from another dispatch's missing workflow of the same id; the branded
+ *   error can.
+ *
+ * An error that only reads like one (other text, other name) is neither.
  */
 export function isJobTargetMissingError(
   error: unknown,
@@ -59,14 +71,23 @@ export function isJobTargetMissingError(
   if (typeof error !== "object" || error === null) return false;
   const candidate = error as {
     [JOB_TARGET_MISSING]?: unknown;
+    target?: Partial<JobTarget>;
     name?: unknown;
     message?: unknown;
   };
+  if (candidate[JOB_TARGET_MISSING] === true && candidate.target) {
+    return (
+      candidate.target.workflowId === target.workflowId &&
+      candidate.target.stageId === target.stageId &&
+      candidate.target.workflowRunId === target.workflowRunId
+    );
+  }
   if (
-    candidate[JOB_TARGET_MISSING] !== true &&
-    candidate.name !== "JobTargetMissingError"
-  )
+    candidate.name !== "JobTargetMissingError" &&
+    candidate.name !== "Error"
+  ) {
     return false;
+  }
   return Object.values(missingTargetMessages(target)).includes(
     candidate.message as string,
   );
