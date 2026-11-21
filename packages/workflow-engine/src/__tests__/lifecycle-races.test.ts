@@ -449,6 +449,76 @@ describe(`lifecycle races on ${realDatabase ? (sqlite ? "SQLite" : "Postgres") :
       expect(await ports.blobStore.get(receipt)).toBe("stale poll");
     });
 
+    it("a read that fails once after a successful checkCompletion does not fail the stage", async () => {
+      let armed = false;
+      const legacy = new WorkflowBuilder(
+        "lifecycle-blip",
+        "Lifecycle blip",
+        "lifecycle-blip",
+        schema,
+        z.any(),
+      )
+        .pipe(
+          defineAsyncBatchStage({
+            id: "s",
+            name: "S",
+            mode: "async-batch",
+            schemas: { input: schema, output: z.any(), config: schema },
+            async execute() {
+              const poll = { pollInterval: 1000, maxWaitTime: 3_600_000 };
+              return {
+                suspended: true,
+                state: {
+                  batchId: "b",
+                  submittedAt: new Date().toISOString(),
+                  ...poll,
+                },
+                pollConfig: { nextPollAt: new Date(0), ...poll },
+              };
+            },
+            async checkCompletion() {
+              armed = true;
+              return { ready: true, output: { done: true } } as never;
+            },
+          }),
+        )
+        .build();
+      const send = kernel({ registry: { getWorkflow: () => legacy } });
+      const runId = await createClaimed(send);
+      await send({
+        type: "job.execute",
+        workflowRunId: runId,
+        workflowId: legacy.id,
+        stageId: "s",
+        config: {},
+      });
+      const persistence = ports.persistence as unknown as Record<
+        string,
+        unknown
+      >;
+      const getStage = ports.persistence.getStage.bind(ports.persistence);
+      persistence.getStage = async (...args: Parameters<typeof getStage>) => {
+        if (armed) {
+          armed = false;
+          throw new Error("read blip");
+        }
+        return getStage(...args);
+      };
+      try {
+        await expect(
+          send({ type: "stage.pollSuspended" }),
+        ).resolves.toMatchObject({ resumed: 1, failed: 0 });
+      } finally {
+        delete persistence.getStage;
+      }
+      expect((await ports.persistence.getStage(runId, "s"))?.status).toBe(
+        "COMPLETED",
+      );
+      expect((await ports.persistence.getRun(runId))?.status).not.toBe(
+        "FAILED",
+      );
+    });
+
     it("a durable replay that finishes after a completed job", async () => {
       const held = gate();
       let calls = 0;

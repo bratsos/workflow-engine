@@ -319,16 +319,16 @@ async function claimSuspendedStage(
  * over. Checked before the poller's first write, and every Phase-2 stage
  * write is fenced on the claimed version too, so a superseded poll writes
  * nothing of its own. What user code itself wrote meanwhile (`ctx.storage`,
- * `ctx.log`, step rows) is not covered.
+ * `ctx.log`, step rows) is not covered. A failed read proceeds: the fenced
+ * write is the guard, and a read error is not a failure of the user code.
  */
 async function superseded(
   stageRecord: WorkflowStageRecord,
   deps: KernelDeps,
 ): Promise<boolean> {
-  const current = await deps.persistence.getStage(
-    stageRecord.workflowRunId,
-    stageRecord.stageId,
-  );
+  const current = await deps.persistence
+    .getStage(stageRecord.workflowRunId, stageRecord.stageId)
+    .catch(() => stageRecord);
   return (
     current?.id !== stageRecord.id || current.version !== stageRecord.version
   );
