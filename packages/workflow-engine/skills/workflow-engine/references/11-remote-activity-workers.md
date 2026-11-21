@@ -142,6 +142,8 @@ Workers PUT blobs directly to S3/R2 via the presigned URL — the broker server 
 ## Limitations
 
 - No mid-activity cancellation — `execute()` itself is never interrupted; a fenced/reaped lease is only detected between heartbeats, so the worker finishes the activity and (as of v0.11) skips the doomed report rather than sending one, but it does not abort the run in progress. `ctx.abortSignal` is present on the worker but never fires.
+- The blocking `createRemoteExecutor` submits every attempt of a stage record under one task id (the record id): while the broker still holds the earlier task, a retry gets its report back instead of running the worker, so a stage that fails once can exhaust its retries after one call. If the broker forgets a task, the executor resubmits it and the worker runs again even when its durable report exists. Workers on that route must be safe to repeat.
+- `run.purge` does not remove worker reports under `remote-activity/<runId>/` (or the proxy's `artifactPrefix`); delete them with your own retention job.
 - No durable steps or injected AI services on the worker — `ctx.step.*` throws `StepLedgerNotConfiguredError` and `ctx.ai` throws `AIServicesNotConfiguredError` (see above).
 - Single-part PUT only — objects >5 GB need multipart.
 - Single-orchestrator — multi-instance HA needs a shared broker store (Prisma/Redis).

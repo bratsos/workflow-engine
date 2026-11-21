@@ -165,6 +165,12 @@ export default {
 ### Durable Reports
 To prevent duplicate execution when the orchestrator restarts, workers write their results to a deterministic key in object storage *before* calling the HTTP `/report` API. On restart, the proxy stage reads this object storage reference and recovers the completed state automatically.
 
+### Known limits of the blocking `createRemoteExecutor`
+The `ActivityExecutor` route (not the proxy stage) has these limits:
+* **One task id for every attempt.** The executor submits each stage attempt under the stage record id. While the broker still holds the earlier attempt's task, a retry of the same stage record (a job retry, a redrive that reopens the record in place) gets that task's report back instead of running the worker again. A stage that fails once can exhaust its retries after one worker call. Give a stage whose retries matter `maxAttempts` headroom, or route it through the proxy stage.
+* **Broker state loss repeats work.** The executor reads the outcome only from the broker. If the broker forgets a task (an in-memory broker restarts), the executor submits it again and the worker runs again, even when the worker already wrote its durable report. Workers behind this route must be safe to repeat.
+* **Reports outlive run retention.** Workers write reports under `remote-activity/<runId>/` (or the proxy's `artifactPrefix`). `run.purge` does not remove that prefix. Reports can hold outputs, logs and annotations; delete them with your own retention job, for example by listing `remote-activity/<runId>/` for each id `run.purge` returns.
+
 ### Fencing & Cancellation (v0.11+)
 When a workflow is cancelled on the orchestrator, active jobs are marked as cancelled. During the worker's heartbeat poll, the broker detects the cancellation and sends a cancel signal to the worker.
 * The worker ignores the output presigning and skips reporting to object storage, avoiding errors from executing reports on expired/fenced leases.
