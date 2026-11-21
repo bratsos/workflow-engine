@@ -9,6 +9,7 @@
  */
 
 import type {
+  ActiveStatusCounts,
   AnnotationActor,
   PurgeableRunStatus,
   ServedDefinition,
@@ -345,6 +346,10 @@ export interface LeaseReapStaleResult {
 export interface OutboxFlushCommand {
   readonly type: "outbox.flush";
   readonly maxEvents?: number;
+  /** Claim lifetime in milliseconds. Defaults to 60 seconds. */
+  readonly claimDurationMs?: number;
+  /** Stop starting claims or sink calls. Calls already in flight may settle. */
+  readonly signal?: Pick<AbortSignal, "aborted">;
 }
 
 /**
@@ -352,21 +357,21 @@ export interface OutboxFlushCommand {
  *
  * `"degraded"` is the named state for "the sink is refusing events": the
  * run keeps progressing (the poller, not the sink, is what advances a
- * run), events stay committed in the outbox, and delivery is retried on
- * the next flush. It is not an error — it is a state a host reports so it
+ * run), events stay committed in the outbox, and a failed delivery is
+ * retried on the next flush, up to the retry budget. It is not an error — it is a state a host reports so it
  * is visible *before* the dead-letter queue fills.
  */
 export type EventSinkStatus = "healthy" | "degraded";
 
 /** Result of an `outbox.flush` command. */
 export interface OutboxFlushResult {
+  /** The caller owns a transaction. Dispatch another flush after it commits. */
+  readonly deferred?: true;
   readonly published: number;
   /**
    * Events this flush claimed but could not publish **and which the next
-   * flush will retry** — the ones whose emit threw, plus the later events
-   * of those same runs, held back so nothing is redelivered out of order.
-   * They were released (their `publishedAt` cleared), so this is a
-   * delivery-lag signal, not data loss. Events that exhausted their retry
+   * flush will retry** — the ones whose emit threw and whose claim was
+   * released. Later events of that run are left pending. Events that exhausted their retry
    * budget in this same pass are not counted here; they are `deadLettered`.
    */
   readonly failed: number;
@@ -430,8 +435,10 @@ export interface RunReapStuckResult {
  * takes stages, logs, artifacts and annotations with it. After commit it
  * clears the `StepLedger` for every stage record, removes the job rows and
  * deletes the run's blobs (stage outputs, artifacts, spilled job payloads
- * and step results under the engine's own key prefixes). A run reopened
- * during the sweep is kept. Emits no events. Bounded by `limit` so a tick
+ * and step results under the engine's own key prefixes). The run's
+ * `outbox_events` and `ai_calls` rows stay: they have no foreign key to the
+ * run and nothing in the engine deletes them. A run reopened during the
+ * sweep is kept. Emits no events. Bounded by `limit` so a tick
  * stays short; repeat until `purged` is 0.
  */
 export interface RunPurgeCommand {
@@ -570,6 +577,65 @@ export interface RunListVersionsResult {
 }
 
 // ---------------------------------------------------------------------------
+// engine.stats
+// ---------------------------------------------------------------------------
+
+/**
+ * Reads the state of active work: runs, stages, jobs and outbox events that
+ * still need something to happen. Read-only: no transaction, no outbox
+ * event, no idempotency key. Bounded: it counts rows in PENDING, RUNNING and
+ * SUSPENDED (and unpublished or dead-lettered outbox rows) through the
+ * optional `Persistence.getActiveWorkStats` and `JobTransport.getJobStats`
+ * methods, and never counts terminal rows.
+ *
+ * The figures come from separate queries, not one snapshot: work that moves
+ * while they run can be counted in two places or in none.
+ */
+export interface EngineStatsCommand {
+  readonly type: "engine.stats";
+}
+
+/**
+ * One section of an `engine.stats` result. `available: false` means the port
+ * behind it does not implement the optional method that reports it; the
+ * figures are then absent, not zero.
+ */
+export type EngineStatsSection<T> =
+  | ({ readonly available: true } & T)
+  | { readonly available: false };
+
+/** Result of an `engine.stats` command. Ages are milliseconds on the kernel clock. */
+export interface EngineStatsResult {
+  /** The kernel clock's time the ages and the "due" cut-off are measured at. */
+  readonly at: Date;
+  readonly runs: EngineStatsSection<{
+    readonly byStatus: ActiveStatusCounts;
+    /** Age of the oldest PENDING run (from `createdAt`), or `null` when none is pending. */
+    readonly oldestPendingAgeMs: number | null;
+  }>;
+  readonly stages: EngineStatsSection<{
+    readonly byStatus: ActiveStatusCounts;
+    /** SUSPENDED stages whose `nextPollAt` has passed: what `stage.pollSuspended` would pick up. */
+    readonly suspendedDue: number;
+    /** How long past its `nextPollAt` the most overdue suspended stage is, or `null` when none is due. */
+    readonly mostOverdueMs: number | null;
+  }>;
+  readonly jobs: EngineStatsSection<{
+    readonly byStatus: ActiveStatusCounts;
+    /** Age of the oldest PENDING job (from `createdAt`), including one waiting out a retry delay. `null` when none is pending. */
+    readonly oldestPendingAgeMs: number | null;
+  }>;
+  readonly outbox: EngineStatsSection<{
+    /** Unpublished, non-dead-lettered events, including live claims. */
+    readonly unpublished: number;
+    /** Age of the oldest of those (from `occurredAt`), or `null` when there are none. */
+    readonly oldestUnpublishedAgeMs: number | null;
+    /** Events in the dead-letter queue: replay them with `plugin.replayDLQ`. */
+    readonly deadLettered: number;
+  }>;
+}
+
+// ---------------------------------------------------------------------------
 // Union & conditional result mapping
 // ---------------------------------------------------------------------------
 
@@ -582,6 +648,7 @@ export type KernelCommand =
   | RunRerunFromCommand
   | RunRedriveCommand
   | RunListVersionsCommand
+  | EngineStatsCommand
   | JobExecuteCommand
   | JobHeartbeatCommand
   | StagePollSuspendedCommand
@@ -610,22 +677,24 @@ export type CommandResult<T extends KernelCommand> = T extends RunCreateCommand
             ? RunRedriveResult
             : T extends RunListVersionsCommand
               ? RunListVersionsResult
-              : T extends JobExecuteCommand
-                ? JobExecuteResult
-                : T extends JobHeartbeatCommand
-                  ? JobHeartbeatResult
-                  : T extends StagePollSuspendedCommand
-                    ? StagePollSuspendedResult
-                    : T extends StepSignalCommand
-                      ? StepSignalResult
-                      : T extends LeaseReapStaleCommand
-                        ? LeaseReapStaleResult
-                        : T extends OutboxFlushCommand
-                          ? OutboxFlushResult
-                          : T extends PluginReplayDLQCommand
-                            ? PluginReplayDLQResult
-                            : T extends RunReapStuckCommand
-                              ? RunReapStuckResult
-                              : T extends RunPurgeCommand
-                                ? RunPurgeResult
-                                : never;
+              : T extends EngineStatsCommand
+                ? EngineStatsResult
+                : T extends JobExecuteCommand
+                  ? JobExecuteResult
+                  : T extends JobHeartbeatCommand
+                    ? JobHeartbeatResult
+                    : T extends StagePollSuspendedCommand
+                      ? StagePollSuspendedResult
+                      : T extends StepSignalCommand
+                        ? StepSignalResult
+                        : T extends LeaseReapStaleCommand
+                          ? LeaseReapStaleResult
+                          : T extends OutboxFlushCommand
+                            ? OutboxFlushResult
+                            : T extends PluginReplayDLQCommand
+                              ? PluginReplayDLQResult
+                              : T extends RunReapStuckCommand
+                                ? RunReapStuckResult
+                                : T extends RunPurgeCommand
+                                  ? RunPurgeResult
+                                  : never;

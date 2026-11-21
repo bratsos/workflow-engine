@@ -381,7 +381,12 @@ whose rows are interleaved with theirs.
   steps are one statement for a run of any number of stages, past every
   store's parameter limit (65,535 in Postgres's protocol, 32,767 in Prisma
   6's query engine, 32,766 in SQLite), and a run detail is at most 18
-  statements on Postgres and 12 on SQLite.
+  statements on Postgres and 12 on SQLite in its transaction. On SQLite a
+  client's first read also runs the engine's date-storage check, one
+  statement before that transaction (none once the check has seen a stored
+  date for that client object), so a client's first run detail is at most
+  13 statements. In the tests a SQLite run detail took 8 to 11 statements in
+  its transaction, plus the check on a client's first read.
 - After rows are deleted, until a vacuum, a walk of an index also visits the
   run's deleted entries in its range. That costs at most a page per deleted
   row of the run, and only when the run has fewer live rows than the walk
@@ -551,6 +556,8 @@ rows with plain statements. When a read fails on the client side inside your
 transaction, the reader closes its cursor if the transaction still takes
 statements; after a server error the transaction is aborted and the cursor
 ends with it (or with your rollback to a savepoint).
+
+On SQLite the read port also refuses a file that another Prisma major wrote (Prisma 6 stores dates as integer milliseconds, 7 and 8 as ISO text): its date filters and cursors would answer wrongly, so its reads reject with the engine's `SqliteDateStorageError`, the same check the engine's SQLite adapters run (before each read until it has seen a stored date), through `$queryRawUnsafe`, the one raw read the port's minimum client type has. A check that cannot run rejects with `SqliteDateStorageUnverifiedError` and reads nothing; the next read checks again. See [A SQLite file belongs to the Prisma major that created it](../persistence/prisma-setup.md#a-sqlite-file-belongs-to-the-prisma-major-that-created-it).
 
 The full reference — every option, the action vocabulary, custom read
 ports, and what the console deliberately does not do — is in the

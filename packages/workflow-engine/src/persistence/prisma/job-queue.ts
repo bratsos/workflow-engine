@@ -14,6 +14,7 @@ import {
 import type { Persistence } from "../../kernel/ports";
 import { createLogger } from "../../utils/logger";
 import {
+  ACTIVE_STATUSES,
   type DequeueOptions,
   type DequeueResult,
   type EnqueueJobInput,
@@ -21,11 +22,13 @@ import {
   type JobAckOutcome,
   type JobQueue,
   type JobQueueFairness,
+  type JobQueueStats,
   type JobRecord,
   LEASE_ABSOLUTE_CAP,
   LEASE_HEARTBEAT_LOST,
   type ServedDefinition,
 } from "../interface";
+import { countActiveByStatus } from "./active-stats";
 import { createEnumHelper, type PrismaEnumHelper } from "./enum-compat";
 import type { DatabaseType } from "./persistence";
 import {
@@ -34,6 +37,11 @@ import {
   rawFor,
   validateDatabaseType,
 } from "./prisma-client-type";
+import {
+  armSqliteAdapter,
+  guardSqliteAdapter,
+  shareSqliteGuard,
+} from "./sqlite-date-guard.js";
 import { hasBaseReads, sqliteTransactionReads } from "./transaction-reads";
 
 const logger = createLogger("JobQueue");
@@ -172,6 +180,7 @@ export class PrismaJobQueue implements JobQueue {
     this.enums = createEnumHelper(prisma);
     this.databaseType = options.databaseType ?? "postgresql";
     validateDatabaseType(prisma, this.databaseType);
+    if (this.databaseType === "sqlite") armSqliteAdapter(this, prisma);
     this.inSqliteTransaction =
       this.databaseType === "sqlite" && isNativeTransaction(prisma);
     this.now = options.now ?? (() => new Date());
@@ -922,6 +931,33 @@ export class PrismaJobQueue implements JobQueue {
   }
 
   /**
+   * Active jobs for `engine.stats`: one `GROUP BY status` over PENDING,
+   * RUNNING and SUSPENDED, served index-only by
+   * `job_queue_status_createdAt_idx`, which also yields the oldest PENDING
+   * `createdAt`. Terminal rows (COMPLETED, FAILED, CANCELLED) are retained
+   * rather than deleted and are never visited.
+   */
+  /**
+   * Nothing to do here: on SQLite every method of this class awaits the date
+   * check first (see `sqlite-date-guard.ts`), so this rejects with
+   * `SqliteDateStorageError` for a file another Prisma major wrote and
+   * resolves otherwise. On PostgreSQL it resolves at once.
+   */
+  async verifyStorage(): Promise<void> {}
+
+  async getJobStats(): Promise<JobQueueStats> {
+    const { byStatus, oldestPendingCreatedAt } = await countActiveByStatus(
+      this.prisma.jobQueue,
+      ACTIVE_STATUSES.map((status) => this.enums.status(status)),
+      true,
+      this.databaseType === "sqlite"
+        ? { prisma: this.prisma, table: "job_queue" }
+        : undefined,
+    );
+    return { byStatus, oldestPendingCreatedAt };
+  }
+
+  /**
    * Get all job rows for a workflow run (any status).
    */
   async getJobsByWorkflowRun(workflowRunId: string): Promise<JobRecord[]> {
@@ -966,6 +1002,7 @@ export class PrismaJobQueue implements JobQueue {
         workerId: this.workerId,
         now: this.now,
       });
+      shareSqliteGuard(reader, this);
       return { getJobsByWorkflowRun: reader.getJobsByWorkflowRun.bind(reader) };
     });
   }
@@ -1127,6 +1164,21 @@ export class PrismaJobQueue implements JobQueue {
     return result.count;
   }
 }
+
+// Every method but these synchronous ones checks a SQLite file's date storage
+// first (see the module); an instance that is not SQLite runs them as before.
+// A new synchronous helper must be added here, a new method needs nothing.
+guardSqliteAdapter(PrismaJobQueue.prototype, [
+  "ackOutcome",
+  "adoptWorkerId",
+  "enqueueData",
+  "enqueueDeleteFilter",
+  "fenceWhere",
+  "getWorkerId",
+  "servesParams",
+  "servesPayload",
+  "transactionReads",
+]);
 
 /**
  * Factory function to create PrismaJobQueue with prisma client

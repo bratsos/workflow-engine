@@ -19,19 +19,33 @@ import type {
   EnginePrismaClient,
   PrismaDelegate,
 } from "./prisma-client-type.js";
+import { validateDatabaseType } from "./prisma-client-type.js";
 import { hasBaseReads, sqliteTransactionReads } from "./transaction-reads.js";
+
+export interface PrismaBlobStoreOptions {
+  /** Database type. Defaults to the Prisma 8 target, or PostgreSQL. */
+  databaseType?: "postgresql" | "sqlite";
+}
 
 /** The one delegate the Prisma blob store needs. */
 export interface BlobPrismaClient
   extends Pick<
     EnginePrismaClient,
-    "$queryRaw" | "$queryRawUnsafe" | "$withColumns"
+    "$databaseType" | "$queryRaw" | "$queryRawUnsafe" | "$withColumns"
   > {
   workflowBlob: PrismaDelegate;
 }
 
 export class PrismaBlobStore implements BlobStore {
-  constructor(private readonly prisma: BlobPrismaClient) {
+  private readonly databaseType: "postgresql" | "sqlite";
+
+  constructor(
+    private readonly prisma: BlobPrismaClient,
+    options: PrismaBlobStoreOptions = {},
+  ) {
+    this.databaseType =
+      options.databaseType ?? prisma.$databaseType ?? "postgresql";
+    validateDatabaseType(prisma, this.databaseType);
     this.prisma = withTransactionWriteGuard(prisma);
   }
 
@@ -73,6 +87,7 @@ export class PrismaBlobStore implements BlobStore {
       "key",
       prefix,
       {
+        databaseType: this.databaseType,
         columns: { key: "text" },
         select: '"key"',
         suffix: ' ORDER BY "key" ASC',
@@ -96,6 +111,7 @@ export class PrismaBlobStore implements BlobStore {
         return undefined;
       const reader = new PrismaBlobStore(
         tx as EnginePrismaClient & BlobPrismaClient,
+        { databaseType: this.databaseType },
       );
       return {
         get: reader.get.bind(reader),
@@ -106,6 +122,9 @@ export class PrismaBlobStore implements BlobStore {
   }
 }
 
-export function createPrismaBlobStore(prisma: BlobPrismaClient): BlobStore {
-  return new PrismaBlobStore(prisma);
+export function createPrismaBlobStore(
+  prisma: BlobPrismaClient,
+  options?: PrismaBlobStoreOptions,
+): BlobStore {
+  return new PrismaBlobStore(prisma, options);
 }

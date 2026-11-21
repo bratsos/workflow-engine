@@ -99,6 +99,8 @@ export interface EnginePrismaClient {
    * member).
    */
   $transaction?(arg: any, options?: any): Promise<any>;
+  /** Explicit marker for a caller-owned transaction view. */
+  readonly $inTransaction?: boolean;
   /**
    * Raw parameterized SELECT (tagged template). Optional -- the two
    * Postgres-only call sites that need it (`claimNextPendingRunPostgres`,
@@ -116,11 +118,12 @@ export interface EnginePrismaClient {
    */
   $queryRawUnsafe?<T = unknown>(query: string, ...values: any[]): Promise<T>;
   /**
-   * Raw parameterized statement (tagged template). Optional -- already
-   * guarded with a `typeof ... === "function"` check at its one call site
-   * (the advisory-lock statement in `appendOutboxEventsForRun`).
+   * Raw parameterized statement (tagged template). Optional.
+   * Used to configure the local planner in an outbox claim transaction.
    */
   $executeRaw?(strings: TemplateStringsArray, ...values: any[]): Promise<any>;
+  /** Raw SQL execution with positional parameters. */
+  $executeRawUnsafe?(query: string, ...values: any[]): Promise<number>;
   /**
    * An enum namespace, if the client has one. Prisma 6 and 7 client
    * instances do not (their enums are module-level exports), nor does a
@@ -166,7 +169,7 @@ export function rawFor<C extends EnginePrismaClient>(
 
 /** Reject a configured dialect that disagrees with the wrapped client's contract. */
 export function validateDatabaseType(
-  prisma: EnginePrismaClient,
+  prisma: Pick<EnginePrismaClient, "$databaseType">,
   databaseType: string,
 ): void {
   if (prisma.$databaseType && databaseType !== prisma.$databaseType) {

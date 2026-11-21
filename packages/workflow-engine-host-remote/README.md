@@ -123,6 +123,8 @@ worker.start();
 
 The worker holds **zero standing credentials** — it receives a presigned URL from the broker for each artifact PUT/GET.
 
+Every option that reaches a timer must be a number of milliseconds from 1 to 2147483647 (the longest delay a timer honours, about 24.8 days): the worker's `heartbeatMs` (default 5000), `idleDelayMs` (500, also the base of the failure backoff) and `maxBackoffMs` (30000), and `createRemoteExecutor`'s `pollEveryMs` (5). `Infinity`, `NaN`, zero, a negative number or a larger value makes `createActivityWorker` or `createRemoteExecutor` throw a `RangeError` naming the option; a timer would fire after 1 ms on such a value. `pollIntervalMs` and `maxWaitMs` are not timers: they travel to the broker as a worker hint and a deadline.
+
 ### Real S3/R2/MinIO artifacts
 
 ```typescript

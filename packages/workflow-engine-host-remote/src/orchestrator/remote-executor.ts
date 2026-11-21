@@ -14,6 +14,7 @@ import {
   type ActivityExecutor,
   type ActivityRunInput,
   type ActivityRunResult,
+  assertTimerMs,
   type BufferedLog,
   type CreateAnnotationInput,
   describeThrown,
@@ -30,7 +31,11 @@ export interface RemoteExecutorOptions {
   maxWaitMs?: number;
   /** pollInterval passed to broker.submit — worker poll hint (ms). Default: 1_000. */
   pollIntervalMs?: number;
-  /** How often we call transport.poll while waiting (ms). Default: 5. */
+  /**
+   * How often we call transport.poll while waiting (ms). Default: 5. Must be a
+   * number from 1 to 2147483647 (a timer honours nothing else); anything else
+   * throws a `RangeError` from `createRemoteExecutor`.
+   */
   pollEveryMs?: number;
 }
 
@@ -42,7 +47,10 @@ export function createRemoteExecutor(
 ): ActivityExecutor {
   const pollIntervalMs = opts.pollIntervalMs ?? 1_000;
   const maxWaitMs = opts.maxWaitMs ?? 3_600_000;
-  const pollEveryMs = opts.pollEveryMs ?? 5;
+  // The delay of the `setTimeout` between two polls; checked before any task is
+  // submitted. `pollIntervalMs` and `maxWaitMs` are not timers here: they are
+  // sent to the broker as a worker hint and a deadline.
+  const pollEveryMs = assertTimerMs("pollEveryMs", opts.pollEveryMs ?? 5);
 
   return {
     async run(

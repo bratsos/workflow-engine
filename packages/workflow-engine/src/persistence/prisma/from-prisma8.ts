@@ -1,3 +1,4 @@
+import { UNCOMMITTED_READS } from "./sqlite-date-guard.js";
 import { maxTimerMs, rolledBackWrite } from "./transaction-writes.js";
 /**
  * `fromPrisma8(db)`: lets the Prisma adapters run on a Prisma 8 client.
@@ -359,7 +360,7 @@ const affected = async (x: Executor, q: Sql): Promise<number> => {
   if (!sqliteRoot(x, plan)) return (await x.execute(plan)).affectedRows;
   await inTurn(x);
   try {
-    return (await x.execute(plan)).affectedRows;
+    return (await othersClosed(gateOf(x), () => x.execute(plan))).affectedRows;
   } catch (error) {
     // WAL: a root read still handing over rows keeps the root on a snapshot
     // older than another connection's commit, and a write on it fails at once
@@ -703,7 +704,7 @@ async function rootWrite(
   // No other root read starts inside this transaction: it would see rows a
   // failed COMMIT then takes back. Those in flight get a bounded wait.
   const gate = gateOf(x);
-  const open = gate && !gate.closed ? await closeReads(gate) : undefined;
+  const open = gate && !gate.closed ? await closeFileReads(gate) : undefined;
   try {
     await affected(x, new Sql().t("BEGIN IMMEDIATE"));
     try {
@@ -747,9 +748,28 @@ interface ReadGate {
    * Set while the root connection is inside a transaction this layer did not
    * open (a raw BEGIN sent before the takeover): `ended` settles when it ends.
    */
-  foreign?: { ended: Promise<void>; end: () => void };
+  foreign?: Foreign;
   /** Reads the root's transaction state again (`ownRootConnection`). */
   recheck?: () => Promise<void>;
+  /**
+   * In WAL, whether this root could start a write now, without waiting: no
+   * connection holds the file's write lock. False on a rollback journal,
+   * where a reader also holds a commit back (`ownRootConnection`).
+   */
+  writable?: () => Promise<boolean>;
+  /** The gates of every root of this process on the same file (`joinFile`). */
+  file?: Set<ReadGate>;
+  /** The root driver was closed: it leaves, or never joins, its file. */
+  left?: boolean;
+  /** Removes the gate from its file, and the file once no root is left. */
+  leave?: () => void;
+}
+/** A transaction this layer did not open, on a root connection. */
+interface Foreign {
+  ended: Promise<void>;
+  end: () => void;
+  /** One of its statements may have written (`ownRootConnection`). */
+  wrote?: boolean;
 }
 const readGates = new WeakMap<object, ReadGate>();
 
@@ -766,33 +786,112 @@ function gateOf(x: object): ReadGate | undefined {
 const READ_WAIT_MS = 5000;
 
 /**
- * An engine write on a root connection that is inside a transaction this
- * layer did not open waits for that transaction to end, outside the write
- * queue so the consumer can still end it, for at most READ_WAIT_MS, and then
- * fails with this busy-class error. Joining it instead would let the
- * consumer's ROLLBACK, or a close without COMMIT, undo a write already
- * acknowledged.
+ * An engine write while a root of this process on the file is inside a
+ * transaction this layer did not open (a raw BEGIN sent before the takeover).
+ * The write's own root: it waits for that transaction to end. Another root:
+ * it waits while that transaction can hold its commit back, that is on a
+ * rollback journal (a reader holds a commit back), or in WAL once it has
+ * written or while any connection holds the write lock. It decides in its own
+ * queue turn, and a statement of such a transaction that may write waits for
+ * the turn in progress (`ownRootConnection`), so no write starts between the
+ * check and the engine write. A held write leaves the queue and waits for the
+ * transaction's end, which releases the held writes in call order, for at
+ * most READ_WAIT_MS in all, and then fails with this busy-class error.
+ * Joining the transaction instead would let the consumer's ROLLBACK, or a
+ * close without COMMIT, undo a write already acknowledged.
  */
-async function untilOwnRoot(db: object): Promise<void> {
+async function writeOutsideForeign<T>(
+  db: object,
+  queue: WriteQueue,
+  work: () => Promise<T>,
+): Promise<T> {
   const gate = gateOf(db);
   await gate?.ready;
-  const foreign = gate?.foreign;
-  if (!foreign) return;
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  await Promise.race([
-    foreign.ended,
-    new Promise<void>((resolve) => {
-      timer = setTimeout(resolve, READ_WAIT_MS);
-    }),
-  ]);
-  clearTimeout(timer);
-  if (gate.foreign)
-    throw Object.assign(
-      new Error(
-        "fromPrisma8: the SQLite root connection is inside a transaction this adapter did not open (a raw BEGIN sent through the client before the adapter's first call); the engine's write waited 5 s for it to end. COMMIT or ROLLBACK it, and open transactions with $transaction or db.transaction",
-      ),
-      { code: "SQLITE_BUSY", errcode: 5 },
-    );
+  if (!gate) return enqueue(queue, work);
+  const file = followQueue(queue);
+  const end = Date.now() + READ_WAIT_MS;
+  // The parking this write holds a place in, if any.
+  let mine: Parked | undefined;
+  const leave = () => {
+    if (mine && --mine.writes === 0 && file.parked === mine)
+      file.parked = undefined;
+    mine = undefined;
+  };
+  const park = (parked: Parked) => {
+    mine = parked;
+    parked.writes++;
+  };
+  for (;;) {
+    // While writes are parked, a later write parks behind them: they all
+    // wait on one promise and queue again in the order they parked, and the
+    // parking ends once the last of them is back in the queue.
+    if (file.parked && !mine) park(file.parked);
+    else {
+      let parked = false;
+      const result = await enqueue(queue, async () => {
+        if (mine) leave();
+        else if (file.parked) {
+          park(file.parked);
+          parked = true;
+          return undefined;
+        }
+        const held = await heldBy(gate);
+        if (!held) return work();
+        // In the turn, so the writes queued behind this one see it.
+        let mark = file.parked;
+        if (!mark || mark.over) {
+          const created: Parked = {
+            other: held.other,
+            over: false,
+            writes: 0,
+            done: held.open.ended.then(() => {
+              created.over = true;
+            }),
+          };
+          file.parked = mark = created;
+        }
+        park(mark);
+        parked = true;
+        return undefined;
+      });
+      if (!parked) return result as T;
+    }
+    const waiting = mine!;
+    const left = end - Date.now();
+    if (left <= 0) {
+      leave();
+      throw Object.assign(
+        new Error(
+          waiting.other
+            ? "fromPrisma8: another SQLite root connection of this process on the same file (another client over the file) is inside a transaction this adapter did not open (a raw BEGIN sent through that client before the adapter's first call on it); the engine's write waited 5 s for it to end. COMMIT or ROLLBACK it, and open transactions with $transaction or db.transaction. In WAL only such a transaction that has written holds engine writes back"
+            : "fromPrisma8: the SQLite root connection is inside a transaction this adapter did not open (a raw BEGIN sent through the client before the adapter's first call); the engine's write waited 5 s for it to end. COMMIT or ROLLBACK it, and open transactions with $transaction or db.transaction",
+        ),
+        { code: "SQLITE_BUSY", errcode: 5 },
+      );
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      waiting.done,
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, left);
+      }),
+    ]);
+    clearTimeout(timer);
+  }
+}
+
+/** In a queue turn: the raw transaction that holds this root's write back, if any. */
+async function heldBy(
+  gate: ReadGate,
+): Promise<{ open: Foreign; other: boolean } | undefined> {
+  const holder: ReadGate | undefined = [...(gate.file ?? [gate])].find(
+    (g) => g.foreign,
+  );
+  const open = holder?.foreign;
+  if (!holder || !open) return undefined;
+  if (holder === gate) return { open, other: false };
+  if (open.wrote || !(await gate.writable?.())) return { open, other: true };
+  return undefined;
 }
 
 /**
@@ -814,7 +913,7 @@ function transactionOf<T>(
   return db
     .transaction(async (raw: Executor) => {
       const result = await fn(raw);
-      const reading = gate.reading > 0;
+      const reading = readingFile(gate);
       const [mode] = reading
         ? await rowsOf(raw, new Sql().t("PRAGMA journal_mode"), {
             journal_mode: SQLITE_TYPES.text!,
@@ -823,12 +922,12 @@ function transactionOf<T>(
       // Without reads in flight the mode is not read: closing costs nothing.
       if (!reading || mode?.journal_mode !== "wal") {
         const start = Date.now();
-        open = await closeReads(gate);
+        open = await closeFileReads(gate);
         // Reads left in flight hold the file: COMMIT waits for them in its
         // busy timeout. This connection is the transaction's own, closed after
         // it: give COMMIT only what is left of the one wait, so it fails no
         // later than it would without the wait above.
-        if (gate.reading > 0)
+        if (readingFile(gate))
           await rowsOf(
             raw,
             new Sql().t(
@@ -879,8 +978,44 @@ async function closeReads(gate: ReadGate): Promise<() => void> {
   };
 }
 
+/** `closeReads` on every root of this process on the gate's file. */
+async function closeFileReads(gate: ReadGate): Promise<() => void> {
+  const gates = [...(gate.file ?? [gate])].filter((g) => !g.closed);
+  const opens = await Promise.all(gates.map(closeReads));
+  return () => {
+    for (const open of opens) open();
+  };
+}
+
+const readingFile = (gate: ReadGate) =>
+  [...(gate.file ?? [gate])].some((g) => g.reading > 0);
+
+/**
+ * Runs an autocommit write on a root while the other roots of its file hold
+ * no read: on a rollback-journal file its commit would wait for them
+ * synchronously (`joinFile`). Only around the statement, never a whole queue
+ * turn: a transaction's callback may read through another root, and its
+ * COMMIT closes the reads itself (`transactionOf`). The root's own reads
+ * stay open.
+ */
+async function othersClosed<T>(
+  gate: ReadGate | undefined,
+  work: () => Promise<T>,
+): Promise<T> {
+  const others = gate?.file
+    ? [...gate.file].filter((g) => g !== gate && !g.closed)
+    : [];
+  if (!others.length) return work();
+  const reopen = await Promise.all(others.map(closeReads));
+  try {
+    return await work();
+  } finally {
+    for (const release of reopen) release();
+  }
+}
+
 async function withoutReads<T>(gate: ReadGate, work: () => Promise<T>) {
-  const open = await closeReads(gate);
+  const open = await closeFileReads(gate);
   try {
     return await work();
   } finally {
@@ -1178,7 +1313,7 @@ const EQUALITY = ["equals", "not"];
 const LISTED = [...EQUALITY, "in", "notIn"];
 const ORDERED = [...LISTED, "lt", "lte", "gt", "gte"];
 const OPERATORS: Record<string, string[]> = {
-  [TEXT]: [...ORDERED, "startsWith"],
+  [TEXT]: [...ORDERED, "startsWith", "endsWith"],
   [INT4]: ORDERED,
   [FLOAT8]: ORDERED,
   [TIMESTAMP]: ORDERED,
@@ -1208,10 +1343,14 @@ function operator(q: Sql, c: Column, ref: string, op: string, x: unknown) {
         )
         .t(")");
     }
-  } else if (op === "startsWith") {
+  } else if (op === "startsWith" || op === "endsWith") {
     accept(c, x);
     // A LIKE pattern, as on 6 and 7: `%`, `_` and backslash keep their meaning.
-    q.t(`${ref} LIKE (`).v(x, castOf(c)).t(" || '%')");
+    q.t(`${ref} LIKE (`);
+    if (op === "endsWith") q.t("'%' || ");
+    q.v(x, castOf(c));
+    if (op === "startsWith") q.t(" || '%'");
+    q.t(")");
   } else if (x === null && kindOf(c) !== JSONB) {
     accept(c, x, c.nullable && EQUALITY.includes(op));
     q.t(`${ref} IS ${op === "not" ? "NOT " : ""}NULL`);
@@ -1602,6 +1741,20 @@ interface WriteQueue {
   tail: Promise<void>;
   /** Another client over the same driver owns the queue: use that one. */
   to?: WriteQueue;
+  /** Turns queued and not yet settled (`enqueue`). */
+  waiting?: number;
+  /** Set while engine writes wait for a raw transaction (`writeOutsideForeign`). */
+  parked?: Parked;
+}
+interface Parked {
+  /** Settles when the transaction that holds the writes back ends. */
+  done: Promise<void>;
+  /** `done` settled: a write held again starts a new parking. */
+  over: boolean;
+  /** That transaction is on another root of the file. */
+  other: boolean;
+  /** Writes holding a place in it and not yet queued again. */
+  writes: number;
 }
 function followQueue<Q extends WriteQueue | undefined>(queue: Q): Q {
   let q = queue;
@@ -1635,6 +1788,60 @@ const context = (): WriteContext =>
 type SharedRoot = { queue: WriteQueue; gate: ReadGate };
 const sharedRoot = (driver: object | undefined): SharedRoot | undefined =>
   driver && (driver as { [ROOT]?: SharedRoot })[ROOT];
+
+/**
+ * Root connections of this process on one database file. node:sqlite waits
+ * for a lock synchronously, on the event loop: a root's `BEGIN IMMEDIATE` or
+ * COMMIT waiting for another root of the same process blocks the thread that
+ * root needs to release it, for the whole busy timeout. So every root on a
+ * file writes through one queue, and a write closes the reads of all of them.
+ */
+interface SharedFile {
+  queue: WriteQueue;
+  gates: Set<ReadGate>;
+}
+const FILES = Symbol.for("@bratsos/workflow-engine/prisma8-files");
+const files = ((globalThis as { [FILES]?: Map<string, SharedFile> })[FILES] ??=
+  new Map());
+
+/** Joins the root to its file's queue and read gates; a memory or temporary database has no file. */
+async function joinFile(
+  query: RootDriver["query"],
+  queue: WriteQueue,
+  gate: ReadGate,
+): Promise<void> {
+  let file = "";
+  try {
+    for await (const row of query({ sql: "PRAGMA database_list", params: [] }))
+      if ((row as { name?: string }).name === "main")
+        file = String((row as { file?: unknown }).file ?? "");
+  } catch {
+    return; // a closed client: its own statement reports it
+  }
+  if (!file || gate.left) return;
+  let shared = files.get(file);
+  if (!shared) {
+    shared = { queue, gates: new Set() };
+    files.set(file, shared);
+  }
+  const target = followQueue(shared.queue);
+  if (target !== followQueue(queue)) queue.to = target;
+  shared.gates.add(gate);
+  gate.file = shared.gates;
+  const joined = shared;
+  // A root opened later starts a new entry once the last root left and the
+  // queue drained; until then it joins this one, behind the writes queued.
+  const drop = () => {
+    if (joined.gates.size || files.get(file) !== joined) return;
+    const target = followQueue(joined.queue);
+    if (target.waiting) void target.tail.then(drop);
+    else files.delete(file);
+  };
+  gate.leave = () => {
+    joined.gates.delete(gate);
+    drop();
+  };
+}
 
 function queueOf(db: object): WriteQueue {
   let queue = writeQueues.get(db);
@@ -1689,7 +1896,13 @@ async function enqueue<T>(
   const store = await context();
   const owner = store.getStore();
   const open = owner?.queue === queue ? owner.open : undefined;
+  // A turn queued behind another first yields a macrotask: node:sqlite runs
+  // each statement synchronously, so turns chained on microtasks alone would
+  // hold the event loop (timers, I/O) until the whole queue drained.
+  const behind = (queue.waiting ?? 0) > 0;
+  queue.waiting = (queue.waiting ?? 0) + 1;
   const pending = queue.tail.then(async () => {
+    if (behind) await new Promise<void>((resolve) => setImmediate(resolve));
     // A root write awaited by its own transaction cannot acquire this queue.
     // Its transaction times out and rolls back; the stale write must not run.
     // Any other write only waited here, whatever became of the transaction
@@ -1702,6 +1915,10 @@ async function enqueue<T>(
       turn.active = false;
     }
   });
+  pending.then(
+    () => queue.waiting!--,
+    () => queue.waiting!--,
+  );
   queue.tail = pending.then(
     () => {},
     () => {},
@@ -1721,6 +1938,7 @@ interface DriverRequest {
 interface RootDriver {
   query(request: DriverRequest): AsyncIterable<unknown>;
   execute(request: DriverRequest): Promise<unknown>;
+  close?(...args: unknown[]): unknown;
 }
 
 function driverOf(db: object): RootDriver | undefined {
@@ -1748,6 +1966,18 @@ function ownRootConnection(
   gate: ReadGate,
 ): void {
   Object.defineProperty(driver, ROOT, { value: { queue, gate } });
+  // `db.close()` closes the driver: the root leaves its file's registry.
+  const close = driver.close;
+  if (typeof close === "function")
+    driver.close = function (...args) {
+      gate.left = true;
+      gate.leave?.();
+      // Closing the connection ends its transaction: writers waiting on it go.
+      const foreign = gate.foreign;
+      gate.foreign = undefined;
+      foreign?.end();
+      return close.apply(this, args);
+    };
   const query = driver.query.bind(driver);
   const execute = driver.execute.bind(driver);
   const exec = (sql: string) => execute({ sql, params: [] });
@@ -1770,7 +2000,49 @@ function ownRootConnection(
     gate.foreign = undefined;
     end();
   };
-  gate.ready = inside().then((yes) => {
+  // Called in a queue turn (`heldBy`), so no adapter write is half-done.
+  const probe = async () => {
+    const one = async (sql: string) => {
+      for await (const row of query({ sql, params: [] }))
+        return row as Record<string, unknown>;
+      return undefined;
+    };
+    const mode = await one("PRAGMA journal_mode");
+    if (String(mode?.journal_mode).toLowerCase() !== "wal") return false;
+    const timeout = Number((await one("PRAGMA busy_timeout"))?.timeout);
+    await one("PRAGMA busy_timeout = 0");
+    try {
+      await exec("BEGIN IMMEDIATE");
+      await exec("ROLLBACK");
+      return true;
+    } catch {
+      return false;
+    } finally {
+      await one(
+        `PRAGMA busy_timeout = ${Number.isFinite(timeout) ? timeout : READ_WAIT_MS}`,
+      ).catch(() => {});
+    }
+  };
+  gate.writable = probe;
+  // A statement of that transaction that may write marks it, so other roots'
+  // writes from now on wait for its end, and waits for the write turn in
+  // progress: no engine write is then between its check and its commit.
+  const beforeForeignStatement = async (sql: string) => {
+    const open = gate.foreign;
+    if (!open || open.wrote) return;
+    const statement = statementOf(new Sql().t(sql));
+    if (
+      statement.read ||
+      /^(BEGIN|SAVEPOINT|COMMIT|END|ROLLBACK|RELEASE)$/.test(
+        statement.first ?? "",
+      )
+    )
+      return;
+    open.wrote = true;
+    await enqueue(queue, async () => {});
+  };
+  gate.ready = inside().then(async (yes) => {
+    await joinFile(query, queue, gate);
     if (!yes) return;
     let end!: () => void;
     const ended = new Promise<void>((resolve) => {
@@ -1781,7 +2053,7 @@ function ownRootConnection(
   const own = async () => {
     const store = (await context()).getStore();
     if (store?.read) return "adapter read";
-    return Boolean(store?.turn?.active && store.queue === queue);
+    return Boolean(store?.turn?.active && store.queue === followQueue(queue));
   };
   const classify = (sql: string) => {
     const statement = statementOf(new Sql().t(sql));
@@ -1836,7 +2108,8 @@ function ownRootConnection(
               rows = query(request)[Symbol.asyncIterator]();
             else if (!mine && gate.foreign) {
               // Inside the consumer's own transaction, as without this layer:
-              // no engine write runs on the root meanwhile (`untilOwnRoot`).
+              // no engine write runs on the root meanwhile (`writeOutsideForeign`).
+              await beforeForeignStatement(request.sql);
               const it = query(request)[Symbol.asyncIterator]();
               rows = {
                 next: () =>
@@ -1854,9 +2127,11 @@ function ownRootConnection(
                   Promise.resolve({ done: true as const, value }),
               };
             } else if (!mine && !classify(request.sql).read) {
-              rows = (await enqueue(queue, () => write(request)))[
-                Symbol.iterator
-              ]();
+              rows = (
+                await enqueue(queue, () =>
+                  othersClosed(gate, () => write(request)),
+                )
+              )[Symbol.iterator]();
             } else {
               if (!mine) while (gate.closed) await gate.closed;
               gate.reading++;
@@ -1887,9 +2162,12 @@ function ownRootConnection(
     await gate.ready;
     if ((await own()) === true) return execute(request);
     classify(request.sql);
-    if (gate.foreign) return execute(request).finally(() => gate.recheck?.());
+    if (gate.foreign) {
+      await beforeForeignStatement(request.sql);
+      return execute(request).finally(() => gate.recheck?.());
+    }
     return enqueue(queue, () =>
-      execute(request).catch((error: unknown) =>
+      othersClosed(gate, () => execute(request)).catch((error: unknown) =>
         afterStaleSnapshot(gate, error, () => execute(request)),
       ),
     );
@@ -2262,9 +2540,7 @@ export function fromPrisma8(
   ): Prisma8Client => {
     const schedule: Schedule | undefined =
       queue && !inTransaction
-        ? (work) => (
-            adopt(db), untilOwnRoot(db).then(() => enqueue(queue, work))
-          )
+        ? (work) => (adopt(db), writeOutsideForeign(db, queue, work))
         : undefined;
     if (!delegates.has(x)) {
       delegates.set(
@@ -2319,7 +2595,7 @@ export function fromPrisma8(
         );
       return q;
     };
-    // Ending a transaction must not wait for it to end (`untilOwnRoot`).
+    // Ending a transaction must not wait for it to end (`writeOutsideForeign`).
     const ending = (work: () => Promise<any>) => (
       adopt(db), enqueue(queue!, work).finally(() => gateOf(db)?.recheck?.())
     );
@@ -2414,7 +2690,12 @@ export function fromPrisma8(
       get $databaseType() {
         return sqlite ? "sqlite" : "postgresql";
       },
+      // A storage check that reads inside the consumer's transaction is not remembered.
+      get [UNCOMMITTED_READS]() {
+        return !inTransaction && Boolean(gateOf(db)?.foreign);
+      },
       ...delegates.get(x),
+      $inTransaction: inTransaction,
       ...(inTransaction || !root ? {} : { $transaction: transaction }),
       $queryRaw: (strings: TemplateStringsArray, ...values: any[]) =>
         rawRead(template(strings, values, sqlite)),

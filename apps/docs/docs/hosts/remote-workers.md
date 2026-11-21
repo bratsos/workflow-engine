@@ -100,6 +100,8 @@ const worker = createActivityWorker({
 worker.start();
 ```
 
+Every option that reaches a timer must be a number of milliseconds from `1` to `2147483647` (the longest delay a timer honours, about 24.8 days): the worker's `heartbeatMs` (default `5000`), `idleDelayMs` (`500`, also the base of the failure backoff) and `maxBackoffMs` (`30000`), and `createRemoteExecutor`'s `pollEveryMs` (`5`). `Infinity`, `NaN`, zero, a negative number or a larger value makes `createActivityWorker` or `createRemoteExecutor` throw a `RangeError` that names the option, because a timer fires after 1 ms on such a value (a heartbeat every millisecond, a poll loop with no pause). `pollIntervalMs` and `maxWaitMs` are not timers: they travel to the broker as a worker hint and a deadline.
+
 ---
 
 ## Configuring the Orchestrator (Broker)

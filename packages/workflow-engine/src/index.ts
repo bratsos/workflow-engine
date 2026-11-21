@@ -246,11 +246,15 @@ export {
   createPrismaStepLedger,
   createPrismaWorkflowPersistence,
   fromPrisma8,
+  OutboxClaimUnsupportedError,
+  OutboxSchemaMissingError,
   PrismaAICallLogger,
   PrismaBlobStore,
   PrismaJobQueue,
   PrismaStepLedger,
   PrismaWorkflowPersistence,
+  SqliteDateStorageError,
+  SqliteDateStorageUnverifiedError,
 } from "./persistence";
 // Batch Model Mapping
 export {
@@ -279,6 +283,9 @@ export {
 export type {
   CommandResult,
   DefinitionVersionSummary,
+  EngineStatsCommand,
+  EngineStatsResult,
+  EngineStatsSection,
   JobExecuteCommand,
   JobExecuteResult,
   JobHeartbeatCommand,
@@ -350,6 +357,7 @@ export type {
   EventSink,
   JobTransport,
   KernelServices,
+  OutboxDeliveryMetadata,
   Persistence,
   Scheduler,
   StepLedger,
@@ -367,16 +375,21 @@ export {
   withStepResultSpill,
 } from "./kernel/spill";
 export type {
+  ActiveStatus,
+  ActiveStatusCounts,
+  ActiveWorkStats,
   CreateDefinitionInput,
   CreateOutboxEventInput,
   DefinitionVersionCount,
   DefinitionVersionCountFilter,
   IdempotencyRecord,
+  JobQueueStats,
   OutboxRecord,
   ServedDefinition,
   WorkflowDefinitionRecord,
 } from "./persistence/interface";
 export {
+  ACTIVE_STATUSES,
   DefinitionRegistrationRetryableError,
   LEASE_ABSOLUTE_CAP,
   LEASE_HEARTBEAT_LOST,

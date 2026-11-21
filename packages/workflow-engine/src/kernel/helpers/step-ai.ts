@@ -52,7 +52,7 @@ import {
   StepTimeoutError,
 } from "../../core/steps";
 import { getBestProviderForModel } from "../../utils/batch/model-mapping";
-import { describeThrown, toErrorMessage } from "./error-message";
+import { describeThrown } from "./error-message";
 
 const DEFAULT_CONCURRENCY = 10;
 const DEFAULT_BATCH_ABOVE = 20;
@@ -232,7 +232,7 @@ function pickTranscribeResult(result: AITranscribeResult): AITranscribeResult {
 }
 
 // A decoded `{ name, message }` keeps both, like a thrown Error.
-const errorMessage = toErrorMessage;
+const errorMessage = (error: unknown) => describeThrown(error).message;
 const errorName = (error: unknown) => describeThrown(error).name;
 
 function formatIssues(error: z.ZodError): string {

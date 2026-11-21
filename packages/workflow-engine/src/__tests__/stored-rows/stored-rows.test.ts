@@ -191,19 +191,23 @@ async function replaySnapshot(
 
     await hostTick(runtime);
     const outbox = snapshot.tables.OutboxEvent ?? [];
-    const sinkEvents = runtime.eventSink.events as unknown as Record<
-      string,
-      unknown
-    >[];
+    const deliveries = runtime.deliveries;
     for (const row of outbox.filter((event) => event.publishedAt !== null)) {
       expect(
-        sinkEvents.some((event) => outboxMatches(event, row)),
+        deliveries.some((delivery) => delivery.eventId === row.id),
         `${path} republished ${row.id}`,
       ).toBe(false);
     }
     for (const row of outbox.filter((event) => event.publishedAt === null)) {
       expect(
-        sinkEvents.filter((event) => outboxMatches(event, row)),
+        deliveries.filter(
+          (delivery) =>
+            delivery.eventId === row.id &&
+            outboxMatches(
+              delivery.event as unknown as Record<string, unknown>,
+              row,
+            ),
+        ),
         `${path} did not publish ${row.id} exactly once`,
       ).toHaveLength(1);
     }

@@ -839,6 +839,8 @@ const stats = await ai.getStats();
 
 ## Provider-Reported Cost
 
+`aiLogger.listCalls(topicPrefix)` reads rows by literal topic prefix on SQLite and PostgreSQL, including when the Prisma client exposes only one raw-read method.
+
 Every result carries two cost numbers since 0.13:
 
 ```typescript

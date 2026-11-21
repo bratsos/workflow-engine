@@ -1,3 +1,4 @@
+import { AsyncResource } from "node:async_hooks";
 import { createRequire } from "node:module";
 import {
   afterAll,
@@ -9,6 +10,10 @@ import {
   it,
 } from "vitest";
 import type { KernelCommand } from "../kernel/commands.js";
+import {
+  createPrismaWorkflowPersistence,
+  fromPrisma8,
+} from "../persistence/prisma/index.js";
 import { isSqliteBusy } from "../persistence/prisma/sql-errors.js";
 import {
   type KernelDatabase,
@@ -841,6 +846,597 @@ describe
   },
 );
 
+// node:sqlite waits for a lock synchronously. Root clients of one process on
+// one file write through one queue and a write holds the other roots' reads
+// back, so none waits on another for its busy timeout with the event loop
+// blocked; an idle flush takes no write lock.
+describe
+  .skipIf(!sqlite || process.env.PRISMA_MAJOR !== "8")
+  .each(["delete", "wal"] as const)(
+  "several root clients of one process on the file, journal mode %s",
+  (mode) => {
+    const { DatabaseSync } =
+      process.env.PRISMA_MAJOR === "8"
+        ? createRequire(import.meta.url)("node:sqlite")
+        : ({} as any);
+    let db: KernelDatabase;
+    const roots: Array<{ close(): void }> = [];
+    beforeEach(async () => {
+      db = await kernelDatabase();
+      const raw = new DatabaseSync(db.file);
+      raw.exec(`PRAGMA journal_mode = ${mode}`);
+      raw.close();
+    }, 120_000);
+    afterEach(async () => {
+      for (const root of roots.splice(0)) root.close();
+      await db?.close();
+    });
+    const open = (count: number) =>
+      Array.from({ length: count }, (_, i) => {
+        const native =
+          i === 0
+            ? db.native
+            : createRequire(
+                createRequire(import.meta.url).resolve(
+                  "../../../prisma-fixtures/v8-sqlite/index.cjs",
+                ),
+              )("@prisma/orm-sqlite/runtime").default({
+                contract: db.native.contract,
+                path: db.file,
+              });
+        if (i > 0) roots.push(native);
+        const client = i === 0 ? db.client : fromPrisma8(native);
+        const persistence = createPrismaWorkflowPersistence(client, {
+          databaseType: "sqlite",
+        });
+        return { client, persistence, kernel: db.makeKernel({ persistence }) };
+      });
+    // The longest a 1 ms timer fired late while `work` ran, and how often it
+    // fired before `work` settled.
+    const loopDelay = async <T>(work: () => Promise<T>) => {
+      let late = 0;
+      let ticks = 0;
+      let due = Date.now() + 1;
+      const timer = setInterval(() => {
+        ticks++;
+        late = Math.max(late, Date.now() - due);
+        due = Date.now() + 1;
+      }, 1);
+      try {
+        const results = await Promise.allSettled([work()]);
+        const fired = ticks;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        return { result: results[0]!, late, ticks: fired };
+      } finally {
+        clearInterval(timer);
+      }
+    };
+
+    it.each([
+      [2, 0],
+      [2, 20],
+      [13, 0],
+      [13, 20],
+    ])(
+      "%i roots flush an outbox of %i events and create runs at once without blocking the event loop",
+      async (count, events) => {
+        const stacks = open(count);
+        for (let i = 0; i < events; i++)
+          await db.persistence.appendOutboxEvents([
+            {
+              workflowRunId: `run-${String(i).padStart(2, "0")}`,
+              eventType: "probe",
+              payload: { i },
+              causationId: `c-${i}`,
+              occurredAt: new Date(),
+            },
+          ]);
+        // Each root's storage check runs before the burst.
+        for (const { persistence } of stacks) await persistence.getRun("warm");
+        const { result, ticks } = await loopDelay(() =>
+          Promise.all(
+            stacks.flatMap(({ kernel }, i) => [
+              kernel.dispatch({ type: "outbox.flush", maxEvents: 1 }),
+              kernel.dispatch({
+                type: "run.create",
+                idempotencyKey: `root-${count}-${events}-${i}`,
+                workflowId: db.workflow.id,
+                input: { value: "root" },
+              }),
+            ]),
+          ),
+        );
+        expect(result.status).toBe("fulfilled");
+        const values = (result as PromiseFulfilledResult<any[]>).value;
+        expect(
+          values.reduce((sum, value) => sum + (value.published ?? 0), 0),
+        ).toBe(Math.min(count, events));
+        // Each queued turn yields a macrotask, so timers fire during the burst
+        // (without the yield none fired until it ended). No bound on the longest
+        // delay: one synchronous statement can stall for seconds on a loaded
+        // disk, and a lock wait fails the burst above instead.
+        expect(ticks).toBeGreaterThanOrEqual(count);
+        expect(await db.client.workflowRun.count()).toBe(count);
+      },
+      60_000,
+    );
+
+    it("commits one root's writes while another root's reads are in flight", async () => {
+      const [first, second] = open(2);
+      for (let i = 0; i < 60; i++)
+        await first!.kernel.dispatch({
+          type: "run.create",
+          idempotencyKey: `seed-${i}`,
+          workflowId: db.workflow.id,
+          input: { value: "seed" },
+        });
+      const run = (await db.client.workflowRun.findFirst({})).id;
+      await second!.persistence.getRun("warm");
+      let done = false;
+      const reads = Array.from({ length: 3 }, async () => {
+        while (!done) {
+          await second!.persistence.getRunsByStatus("PENDING");
+          await new Promise((resolve) => setImmediate(resolve));
+        }
+      });
+      // Versioned updates: a count-returning write (`updateMany`), which runs
+      // outside the returning-write path.
+      const { result, late } = await loopDelay(async () => {
+        for (let i = 0; i < 10; i++) {
+          const { version } = (await first!.persistence.getRun(run))!;
+          await first!.persistence.updateRun(run, {
+            totalTokens: i,
+            expectedVersion: version,
+          });
+        }
+      });
+      done = true;
+      await Promise.all(reads);
+      expect(result).toEqual({ status: "fulfilled", value: undefined });
+      expect(late).toBeLessThan(1000);
+    }, 60_000);
+
+    it("holds engine writes on every root of the file while another root is inside a raw transaction", async () => {
+      await db.persistence.getRun("warm");
+      const [, other] = open(2);
+      const native = roots.at(-1) as unknown as {
+        execute(plan: unknown): Promise<unknown>;
+        raw: any;
+      };
+      const sql = (text: string) =>
+        native.execute(
+          native.raw
+            .sql([text] as any)
+            .affectedCount()
+            .build(),
+        );
+      // Opened before the wrapper's first call on that root.
+      await sql("BEGIN IMMEDIATE");
+      await sql(`UPDATE "workflow_runs" SET priority = 7`);
+      await other!.persistence.getRun("warm");
+      const commit = setTimeout(() => void sql("COMMIT"), 100);
+      try {
+        const { result, late } = await loopDelay(() =>
+          db.kernel.dispatch({
+            type: "run.create",
+            idempotencyKey: "behind-foreign",
+            workflowId: db.workflow.id,
+            input: { value: "behind-foreign" },
+          }),
+        );
+        expect(result.status).toBe("fulfilled");
+        expect(late).toBeLessThan(1000);
+      } finally {
+        clearTimeout(commit);
+      }
+      expect(await db.client.workflowRun.count()).toBe(1);
+    }, 30_000);
+
+    // A raw BEGIN on another root, sent before the adapter's first call there.
+    const rawOn = (native: unknown) => {
+      const root = native as {
+        execute(plan: unknown): Promise<unknown>;
+        raw: any;
+      };
+      return (text: string) =>
+        root.execute(
+          root.raw
+            .sql([text] as any)
+            .affectedCount()
+            .build(),
+        );
+    };
+    const create = (key: string, kernel = db.kernel) =>
+      kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: key,
+        workflowId: db.workflow.id,
+        input: { value: key },
+      });
+
+    it("lets engine writes run while another root is inside a raw read-only transaction in WAL, and names that root otherwise", async () => {
+      await db.persistence.getRun("warm");
+      const [, other] = open(2);
+      const native = roots.at(-1) as any;
+      const sql = rawOn(native);
+      await sql("BEGIN");
+      // A read opens the transaction's snapshot; no write lock is taken.
+      await native
+        .query(
+          native.raw
+            .sql(["SELECT id FROM workflow_runs"])
+            .returnsRow({ id: "sqlite/text@1" })
+            .build(),
+        )
+        .toArray();
+      await other!.persistence.getRun("warm");
+      const start = Date.now();
+      try {
+        const write = create("beside-reader").then(
+          () => "ok",
+          (error: Error) => error.message,
+        );
+        if (mode === "wal") {
+          expect(await write).toBe("ok");
+          expect(Date.now() - start).toBeLessThan(2_000);
+        } else {
+          expect(await write).toMatch(
+            /another SQLite root connection of this process on the same file/,
+          );
+        }
+      } finally {
+        await sql("ROLLBACK");
+      }
+    }, 30_000);
+
+    it("holds engine writes without blocking the event loop when another root's raw transaction starts writing, and resumes them in call order after it commits", async () => {
+      const [, other, writer] = open(3);
+      const native = roots.at(-2) as any;
+      const sql = rawOn(native);
+      // A raw transaction on the other root, read-only so far, opened before
+      // the adapter's first call there.
+      await sql("BEGIN");
+      await native
+        .query(
+          native.raw
+            .sql(["SELECT id FROM workflow_runs"])
+            .returnsRow({ id: "sqlite/text@1" })
+            .build(),
+        )
+        .toArray();
+      await other!.persistence.getRun("warm");
+      const ids = Array.from(
+        { length: 20 },
+        (_, i) => `q-${String(i).padStart(2, "0")}`,
+      );
+      // Bound to this context: the consumer's call, not part of the engine
+      // turn whose statement triggers it below. Settled at once, so its
+      // rejection is never unhandled.
+      const insert = AsyncResource.bind(() =>
+        sql(
+          `INSERT INTO workflow_runs (id, "workflowId", "workflowName", "workflowType", input, status, priority, "createdAt", "updatedAt") VALUES ('a-raw', 'w', 'w', 't', '{}', 'PENDING', 5, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`,
+        ).then(
+          () => "ok",
+          (error: Error) => error.message,
+        ),
+      );
+      // It writes the moment the first engine write has checked the write
+      // lock (its last step restores the busy timeout): the race to lose.
+      let inserted: Promise<unknown> | undefined;
+      let armed = false;
+      const { StatementSync } = createRequire(import.meta.url)("node:sqlite");
+      const methods = ["all", "get", "run", "iterate"] as const;
+      const originals = methods.map((m) => StatementSync.prototype[m]);
+      methods.forEach((m, k) => {
+        StatementSync.prototype[m] = function (this: any, ...args: unknown[]) {
+          const result = originals[k].apply(this, args);
+          const text = String(this.sourceSQL);
+          if (text === "PRAGMA busy_timeout = 0") armed = true;
+          else if (armed && !inserted && /^PRAGMA busy_timeout = /.test(text))
+            inserted = insert();
+          return result;
+        };
+      });
+      await writer!.persistence.getRun("warm");
+      let commit: ReturnType<typeof setTimeout> | undefined;
+      const { result, late } = await loopDelay(async () => {
+        const writes = ids.map((id) =>
+          writer!.client.workflowRun.create({
+            data: {
+              id,
+              workflowId: "w",
+              workflowName: "w",
+              workflowType: "t",
+              status: "PENDING",
+              input: {},
+            },
+          }),
+        );
+        // A rollback journal never checks the lock (a reader holds a commit
+        // back): there it writes once the engine writes are queued.
+        await new Promise((resolve) => setImmediate(resolve));
+        if (mode === "delete") inserted = insert();
+        commit = setTimeout(() => void sql("COMMIT"), 300);
+        return await Promise.all(writes).finally(() =>
+          methods.forEach((m, k) => {
+            StatementSync.prototype[m] = originals[k];
+          }),
+        );
+      });
+      const raw = await inserted!;
+      clearTimeout(commit);
+      expect(result.status).toBe("fulfilled");
+      // A write that lost the race used to wait its busy timeout synchronously
+      // (5.2 s); a single statement on a loaded disk can take about 2 s.
+      expect(late).toBeLessThan(2_500);
+      const other2 = new DatabaseSync(db.file);
+      try {
+        const stored = other2
+          .prepare("SELECT id FROM workflow_runs ORDER BY rowid")
+          .all()
+          .map((row: { id: string }) => row.id);
+        // In WAL a read transaction cannot write once another connection has
+        // committed (SQLITE_BUSY_SNAPSHOT), as without this layer; otherwise
+        // its row commits with it.
+        if (raw === "ok") expect(stored).toContain("a-raw");
+        else expect(raw).toMatch(/database is locked/);
+        expect(stored.filter((id: string) => id !== "a-raw")).toEqual(ids);
+      } finally {
+        other2.close();
+      }
+    }, 30_000);
+
+    it("resumes engine writes held back by another root's raw transaction in call order", async () => {
+      const [, other, writer] = open(3);
+      const sql = rawOn(roots.at(-2));
+      await sql("BEGIN IMMEDIATE");
+      await sql(`UPDATE "workflow_runs" SET priority = 7`);
+      await other!.persistence.getRun("warm");
+      await writer!.persistence.getRun("warm");
+      const create = (id: string) =>
+        writer!.client.workflowRun.create({
+          data: {
+            id,
+            workflowId: "w",
+            workflowName: "w",
+            workflowType: "t",
+            status: "PENDING",
+            input: {},
+          },
+        });
+      const ids = ["w-0", "w-1", "w-2", "w-3", "w-4"];
+      // The transaction ends while a held write is looking at the lock: the
+      // others must not overtake it. (Without such looks, a timer ends it.)
+      const commitNow = AsyncResource.bind(() => sql("COMMIT"));
+      let armed = false;
+      let committed: Promise<unknown> | undefined;
+      const { StatementSync } = createRequire(import.meta.url)("node:sqlite");
+      const methods = ["all", "get", "run", "iterate"] as const;
+      const originals = methods.map((m) => StatementSync.prototype[m]);
+      methods.forEach((m, k) => {
+        StatementSync.prototype[m] = function (this: any, ...args: unknown[]) {
+          if (armed && !committed && this.sourceSQL === "PRAGMA journal_mode")
+            committed = commitNow();
+          return originals[k].apply(this, args);
+        };
+      });
+      const timer = setTimeout(() => {
+        committed ??= commitNow();
+      }, 400);
+      try {
+        // A delegate call runs when awaited, as Prisma's: start each now.
+        const writes = ids.map((id) => create(id).then((run: unknown) => run));
+        // Past every write's first look, so the end meets one of the later ones.
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        armed = true;
+        await Promise.all(writes);
+        await committed;
+      } finally {
+        clearTimeout(timer);
+        methods.forEach((m, k) => {
+          StatementSync.prototype[m] = originals[k];
+        });
+      }
+      const reader = new DatabaseSync(db.file);
+      try {
+        expect(
+          reader
+            .prepare("SELECT id FROM workflow_runs ORDER BY rowid")
+            .all()
+            .map((row: { id: string }) => row.id),
+        ).toEqual(ids);
+      } finally {
+        reader.close();
+      }
+    }, 30_000);
+
+    it("stops holding engine writes back when the root inside a raw transaction closes", async () => {
+      await db.persistence.getRun("warm");
+      const [, other] = open(2);
+      const native = roots.pop() as unknown as { close(): Promise<void> };
+      const sql = rawOn(native);
+      await sql("BEGIN IMMEDIATE");
+      await sql(`UPDATE "workflow_runs" SET priority = 7`);
+      await other!.persistence.getRun("warm");
+      const close = setTimeout(() => void native.close(), 100);
+      const start = Date.now();
+      try {
+        await expect(create("after-close")).resolves.toMatchObject({
+          status: "PENDING",
+        });
+        expect(Date.now() - start).toBeLessThan(2_000);
+      } finally {
+        clearTimeout(close);
+      }
+    }, 30_000);
+
+    it("keeps a file's queue while a transaction queued on its last root runs after that root closes", async () => {
+      await db.persistence.getRun("warm");
+      let entered!: () => void;
+      const inside = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const transaction = db.client.$transaction(
+        async (tx: any) => {
+          await tx.$executeRawUnsafe(`UPDATE "workflow_runs" SET priority = 7`);
+          entered();
+          await new Promise((resolve) => setTimeout(resolve, 300));
+        },
+        { timeout: 5_000 },
+      );
+      await inside;
+      await db.native.close();
+      const late = open(2)[1]!;
+      const { result, late: delay } = await loopDelay(() =>
+        create("behind-closed", late.kernel),
+      );
+      expect(result.status).toBe("fulfilled");
+      expect(delay).toBeLessThan(1000);
+      await expect(transaction).resolves.toBeUndefined();
+      expect(await late.persistence.getRunsByStatus("PENDING")).toHaveLength(1);
+    }, 30_000);
+
+    it.each([
+      "the same root",
+      "another root",
+    ])("rejects a $transaction on %s of the file started inside a transaction's callback, and commits neither", async (where) => {
+      const [, other] = open(2);
+      await other!.persistence.getRun("warm");
+      const inner = where === "the same root" ? db.client : other!.client;
+      let nested: unknown;
+      const outer = db.client.$transaction(
+        async (tx: any) => {
+          await tx.workflowRun.create({
+            data: {
+              workflowId: "w",
+              workflowName: "w",
+              workflowType: "t",
+              status: "PENDING",
+              input: {},
+            },
+          });
+          nested = await inner
+            .$transaction(async (tx2: any) => {
+              await tx2.workflowRun.create({
+                data: {
+                  workflowId: "w",
+                  workflowName: "w",
+                  workflowType: "t",
+                  status: "PENDING",
+                  input: {},
+                },
+              });
+            })
+            .catch((error: { code?: string }) => error.code);
+        },
+        { timeout: 400 },
+      );
+      await expect(outer).rejects.toMatchObject({ code: "P2028" });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(nested).toBe("P2028");
+      expect(await db.client.workflowRun.count()).toBe(0);
+    }, 30_000);
+
+    it("reads through another root of the file inside a root's transaction", async () => {
+      const [, other] = open(2);
+      await other!.persistence.getRun("warm");
+      await db.kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: "in-tx",
+        workflowId: db.workflow.id,
+        input: { value: "in-tx" },
+      });
+      const { result, late } = await loopDelay(() =>
+        db.client.$transaction(
+          async (tx: any) => {
+            await tx.$executeRawUnsafe(
+              `UPDATE "workflow_runs" SET "totalTokens" = 7`,
+            );
+            return other!.persistence.getRunsByStatus("PENDING");
+          },
+          { timeout: 2_000 },
+        ),
+      );
+      expect(result.status).toBe("fulfilled");
+      expect((result as PromiseFulfilledResult<unknown[]>).value).toHaveLength(
+        1,
+      );
+      expect(late).toBeLessThan(1000);
+      const [run] = await other!.persistence.getRunsByStatus("PENDING");
+      expect(run!.totalTokens).toBe(7);
+    }, 30_000);
+
+    it("drops a file's registry entry with its last root, and a root opened after one closed joins the live roots' queue", async () => {
+      const registry = () =>
+        (globalThis as Record<symbol, Map<string, { gates: Set<unknown> }>>)[
+          Symbol.for("@bratsos/workflow-engine/prisma8-files")
+        ]!;
+      const stacks = open(3);
+      for (const { persistence } of stacks) await persistence.getRun("warm");
+      const reader = stacks[2]!;
+      const file = [...registry().keys()].find((key) =>
+        key.endsWith(db.file!.split("/").pop()!),
+      )!;
+      expect(registry().get(file)!.gates.size).toBe(3);
+      // The root that opened the file's queue first closes.
+      await db.native.close();
+      expect(registry().get(file)!.gates.size).toBe(2);
+      const late = open(2)[1]!;
+      for (let i = 0; i < 30; i++)
+        await late.kernel.dispatch({
+          type: "run.create",
+          idempotencyKey: `late-${i}`,
+          workflowId: db.workflow.id,
+          input: { value: "late" },
+        });
+      const run = (await late.persistence.getRunsByStatus("PENDING"))[0]!.id;
+      let done = false;
+      const reads = Array.from({ length: 3 }, async () => {
+        while (!done) {
+          await reader.persistence.getRunsByStatus("PENDING");
+          await new Promise((resolve) => setImmediate(resolve));
+        }
+      });
+      const { result, late: delay } = await loopDelay(async () => {
+        for (let i = 0; i < 10; i++) {
+          const { version } = (await late.persistence.getRun(run))!;
+          await late.persistence.updateRun(run, {
+            totalTokens: i,
+            expectedVersion: version,
+          });
+        }
+      });
+      done = true;
+      await Promise.all(reads);
+      expect(result).toEqual({ status: "fulfilled", value: undefined });
+      expect(delay).toBeLessThan(1000);
+      for (const root of roots.splice(0))
+        await (root as unknown as { close(): Promise<void> }).close();
+      expect(registry().has(file)).toBe(false);
+    }, 60_000);
+
+    it("flushes an empty outbox while another connection holds the write lock", async () => {
+      const [{ kernel, persistence }] = open(1);
+      await persistence.getRun("warm");
+      const holder = new DatabaseSync(db.file);
+      holder.exec("BEGIN IMMEDIATE");
+      try {
+        const { result, late } = await loopDelay(() =>
+          kernel.dispatch({ type: "outbox.flush", maxEvents: 10 }),
+        );
+        expect(result).toMatchObject({
+          status: "fulfilled",
+          value: { published: 0 },
+        });
+        expect(late).toBeLessThan(1000);
+      } finally {
+        holder.exec("ROLLBACK");
+        holder.close();
+      }
+    }, 30_000);
+  },
+);
+
 // A transaction the consumer opens on the root connection itself, before the
 // adapter's first call (the takeover is installed then), must never take an
 // acknowledged engine write with it: engine writes wait for it to end, for
@@ -896,9 +1492,10 @@ describe
         other.close();
       }
     };
+    // Dates in the form the client binds: the storage check refuses a file that mixes forms.
     const seed = (id: string) =>
       sql(
-        `INSERT INTO workflow_runs (id, "workflowId", "workflowName", "workflowType", input, status, priority, "createdAt", "updatedAt") VALUES ('${id}', 'w', 'w', 't', '{}', 'PENDING', 5, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+        `INSERT INTO workflow_runs (id, "workflowId", "workflowName", "workflowType", input, status, priority, "createdAt", "updatedAt") VALUES ('${id}', 'w', 'w', 't', '{}', 'PENDING', 5, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`,
       );
 
     it.each([

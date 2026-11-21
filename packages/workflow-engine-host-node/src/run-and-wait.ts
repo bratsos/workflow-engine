@@ -1,5 +1,9 @@
 // packages/workflow-engine-host-node/src/run-and-wait.ts
-import type { Kernel, RunCreateCommand } from "@bratsos/workflow-engine/kernel";
+import {
+  assertTimerMs,
+  type Kernel,
+  type RunCreateCommand,
+} from "@bratsos/workflow-engine/kernel";
 import type { NodeHost } from "./host.js";
 
 export interface RunAndWaitPersistence {
@@ -77,6 +81,8 @@ export async function runAndWait(
     onStageChange,
     signal,
   } = options;
+  // Before the run is created: a bad option must not leave one behind.
+  assertTimerMs("pollIntervalMs", pollIntervalMs);
 
   const createResult = await kernel.dispatch(command);
   const runId = createResult.workflowRunId;

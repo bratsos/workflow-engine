@@ -487,7 +487,7 @@ const allAttempts = await kernel.annotations.list(runId, { keyPrefix: "decision.
 
 By default, writing an annotation does **not** emit an outbox event. If a plugin or external system needs push notifications on annotation writes (audit pipelines, SIEM, live dashboards), set `emitEvent: true` and the engine writes an `annotation:created` outbox event in the same transaction as the annotation row.
 
-**Caveat when combining `emitEvent` with `idempotencyKey`:** the engine skips duplicate `(workflowRunId, key, idempotencyKey)` rows under the unique constraint, but emits one `annotation:created` event per input regardless. On a retry with the same idempotency key, the row is deduplicated (correct) but the event fires again. If your downstream consumer cares about exactly-once delivery, dedupe events on `(causationId, key)` or use a stable identifier in the event payload — don't assume one event per persisted row.
+**Caveat when combining `emitEvent` with `idempotencyKey`:** the engine skips duplicate `(workflowRunId, key, idempotencyKey)` rows under the unique constraint, but emits one `annotation:created` event per input regardless. On a retry with the same idempotency key, the row is deduplicated (correct) but the event fires again. Deduplicate repeated delivery of one outbox event by its `eventId`. `(workflowRunId, sequence)` orders events within a run but is not a permanent identity: deleting the newest outbox rows by SQL can let Prisma reuse a sequence. To collapse distinct events for the same annotation operation, also use `(causationId, key)` or a stable operation identifier in the payload; do not assume one event per persisted row.
 
 ```ts
 // Stage-scope

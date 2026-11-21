@@ -22,6 +22,7 @@ export function literalPrefixQuery<T>(
   prefix: string,
   options: {
     columns?: RawColumns;
+    databaseType?: "postgresql" | "sqlite";
     select?: string;
     suffix?: string;
     values?: unknown[];
@@ -35,15 +36,22 @@ export function literalPrefixQuery<T>(
   const values = [pattern, ...(options.values ?? [])];
   let query: Promise<T[]>;
   if (client.$queryRaw) {
-    // Prisma chooses the driver's placeholders: native SQLite 7 binds '?',
-    // while PostgreSQL and the Prisma 8 positional facade use '$n'.
+    // Let Prisma choose the driver's placeholders for tagged reads.
     const parts = sql.split(/\$\d+/);
     query = client.$queryRaw<T[]>(
       Object.assign(parts, { raw: parts }),
       ...values,
     );
   } else {
-    query = client.$queryRawUnsafe!<T[]>(sql, ...values);
+    // Native Prisma 6/7 SQLite binds positional values with `?`. Prisma 8's
+    // facade and PostgreSQL use `$n`; the former is identified by its target,
+    // while native adapters get the configured database type from the caller.
+    const unsafeSql =
+      (options.databaseType ?? client.$databaseType) === "sqlite" &&
+      client.$databaseType !== "sqlite"
+        ? sql.replace(/\$\d+/g, "?")
+        : sql;
+    query = client.$queryRawUnsafe!<T[]>(unsafeSql, ...values);
   }
   return query.then((rows) => {
     for (const row of rows)

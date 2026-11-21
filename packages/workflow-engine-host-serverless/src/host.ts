@@ -11,14 +11,19 @@
  */
 
 import {
+  assertTimerMs,
   type EventSinkStatus,
   executeJobWithHeartbeat,
+  flushOutboxWithin,
   HOST_DEFAULTS,
   type JobTransport,
   type Kernel,
+  type MaintenanceTickHook,
   type RetentionOptions,
   runMaintenanceTick as runMaintenanceTickCommands,
+  runTickHook,
   type ServedDefinition,
+  toErrorMessage,
 } from "@bratsos/workflow-engine/kernel";
 
 // ============================================================================
@@ -72,6 +77,19 @@ export interface ServerlessHostConfig {
   retention?: RetentionOptions;
 
   /**
+   * Called at the end of every `runMaintenanceTick()` with a copy of the
+   * counts it computed (changing it affects nothing the method returns), before
+   * the method returns them. Use it to export gauges or counters (combine it
+   * with the `engine.stats` command for queue depth and age).
+   *
+   * A hook that throws or rejects is caught and logged; the tick still
+   * returns its counts. The hook is awaited for at most `onTickTimeoutMs`:
+   * after that the counts are returned, one warning is logged and the hook
+   * keeps running in the background (an invocation that ends may cut it off).
+   */
+  onTick?: MaintenanceTickHook;
+
+  /**
    * Publish this job's outbox events right after `handleJob` settles it
    * (default: true). There is no process lifecycle to hook a final flush
    * on, so without this a run completed by this invocation is announced by
@@ -80,10 +98,28 @@ export interface ServerlessHostConfig {
    */
   flushOutboxAfterJob?: boolean;
 
-  /** Upper bound (ms) on the post-job outbox flush (default: 5_000). */
+  /**
+   * Upper bound (ms) on post-job and maintenance outbox flushes (default: 5_000). Must be a number from 1 to 2147483647 (a timer honours nothing else); anything else throws a `RangeError` from `createServerlessHost`. Nothing
+   * switches the bound off: pass 2147483647 to wait for practically any flush.
+   */
   outboxFlushTimeoutMs?: number;
 
-  /** Job lease heartbeat interval in milliseconds (default: 60_000). */
+  /**
+   * Upper bound (ms) on how long `runMaintenanceTick()` waits for `onTick`
+   * (default: 5_000, the same as `outboxFlushTimeoutMs`: both bound optional
+   * work this host awaits after its own commands have finished, inside an
+   * invocation that has a time limit). A hook that never settles then costs
+   * one bounded wait per tick and never withholds the counts. Must be a
+   * number from 1 to 2147483647 (the longest delay a timer honours, about 24.8
+   * days); anything else, `Infinity`, `NaN`, zero or a negative number
+   * included, throws a `RangeError` from `createServerlessHost`. Nothing
+   * switches the bound off: pass 2147483647 to wait for practically any hook.
+   */
+  onTickTimeoutMs?: number;
+
+  /**
+   * Job lease heartbeat interval in milliseconds (default: 60_000). Must be a number from 1 to 2147483647 (a timer honours nothing else); anything else throws a `RangeError` from `createServerlessHost`.
+   */
   jobHeartbeatIntervalMs?: number;
 }
 
@@ -131,6 +167,8 @@ export interface MaintenanceTickResult {
   suspendedChecked: number;
   staleReleased: number;
   eventsFlushed: number;
+  /** Outbox delivery waits for the caller transaction to commit. */
+  outboxDeferred?: true;
   stuckReaped: number;
   /** Terminal runs deleted by `run.purge`; 0 unless `retention` is configured. */
   purged: number;
@@ -180,9 +218,11 @@ class ServerlessHostImpl implements ServerlessHost {
   private readonly maxSuspendedChecksPerTick: number;
   private readonly maxOutboxFlushPerTick: number;
   private readonly retention: RetentionOptions | undefined;
+  private readonly onTick: MaintenanceTickHook | undefined;
   private readonly jobHeartbeatIntervalMs: number;
   private readonly flushOutboxAfterJob: boolean;
   private readonly outboxFlushTimeoutMs: number;
+  private readonly onTickTimeoutMs: number;
 
   constructor(config: ServerlessHostConfig) {
     this.kernel = config.kernel;
@@ -201,13 +241,53 @@ class ServerlessHostImpl implements ServerlessHost {
     this.maxOutboxFlushPerTick =
       config.maxOutboxFlushPerTick ?? HOST_DEFAULTS.maxOutboxFlushPerTick;
     this.retention = config.retention;
-    this.jobHeartbeatIntervalMs =
-      config.jobHeartbeatIntervalMs ?? HOST_DEFAULTS.jobHeartbeatIntervalMs;
+    if (config.onTick !== undefined && typeof config.onTick !== "function") {
+      throw new TypeError(
+        `onTick must be a function, got ${toErrorMessage(config.onTick)}.`,
+      );
+    }
+    this.onTick = config.onTick;
+    this.jobHeartbeatIntervalMs = assertTimerMs(
+      "jobHeartbeatIntervalMs",
+      config.jobHeartbeatIntervalMs ?? HOST_DEFAULTS.jobHeartbeatIntervalMs,
+    );
     this.flushOutboxAfterJob = config.flushOutboxAfterJob ?? true;
-    this.outboxFlushTimeoutMs = config.outboxFlushTimeoutMs ?? 5_000;
+    this.outboxFlushTimeoutMs = assertTimerMs(
+      "outboxFlushTimeoutMs",
+      config.outboxFlushTimeoutMs ?? 5_000,
+      {
+        hint: "The bound cannot be switched off; pass 2147483647 (about 24.8 days) to wait for practically any flush.",
+      },
+    );
+    this.onTickTimeoutMs = assertTimerMs(
+      "onTickTimeoutMs",
+      config.onTickTimeoutMs ?? 5_000,
+      {
+        hint: "The bound cannot be switched off, because a hook that never settles would then withhold the counts; pass 2147483647 (about 24.8 days) to wait for practically any hook.",
+      },
+    );
+  }
+
+  /**
+   * There is no `start()` here, so every call of an entry point (`handleJob`,
+   * `processAvailableJobs`, `runMaintenanceTick`) checks that the storage may
+   * be used before it dispatches anything, and throws if not (a SQLite file
+   * another Prisma major wrote: `SqliteDateStorageError`; a check that could
+   * not be made: `SqliteDateStorageUnverifiedError`), instead of every command
+   * logging it. Nothing is remembered here: the adapter remembers a conclusive
+   * pass itself (one statement per client), and asks again after a check that
+   * failed or saw an empty file.
+   */
+  private async ready(): Promise<void> {
+    await this.jobTransport.verifyStorage?.();
   }
 
   async handleJob(msg: JobMessage): Promise<JobResult> {
+    await this.ready();
+    return this.runJob(msg);
+  }
+
+  private async runJob(msg: JobMessage): Promise<JobResult> {
     // Dispatch job.execute under a lease heartbeat and route the outcome
     // (complete/suspend/fail + terminal run.transition) — see
     // executeJobWithHeartbeat in @bratsos/workflow-engine/kernel for the
@@ -226,21 +306,15 @@ class ServerlessHostImpl implements ServerlessHost {
 
   /** Publish pending outbox events, bounded by `outboxFlushTimeoutMs`. */
   private async flushOutbox(): Promise<void> {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeout = new Promise<"timeout">((resolve) => {
-      timer = setTimeout(() => resolve("timeout"), this.outboxFlushTimeoutMs);
-    });
     try {
-      const outcome = await Promise.race([
-        this.kernel.dispatch({
-          type: "outbox.flush",
-          maxEvents: this.maxOutboxFlushPerTick,
-        }),
-        timeout,
-      ]);
-      if (outcome === "timeout") {
+      const outcome = await flushOutboxWithin(
+        this.kernel,
+        this.maxOutboxFlushPerTick,
+        this.outboxFlushTimeoutMs,
+      );
+      if (outcome === undefined) {
         console.error(
-          "[ServerlessHost] outbox.flush after job: timed out; the next maintenance tick publishes the rest",
+          "[ServerlessHost] outbox.flush after job timed out. Pending events remain for a later flush.",
         );
       } else if (outcome.eventSinkStatus === "degraded") {
         // Stateless: no transition to detect, so say it every time.
@@ -250,21 +324,20 @@ class ServerlessHostImpl implements ServerlessHost {
           }`,
         );
       }
-      if (outcome !== "timeout" && outcome.deadLettered > 0) {
+      if (outcome && outcome.deadLettered > 0) {
         console.error(
           `[ServerlessHost] event sink DEAD-LETTERED ${outcome.deadLettered} event(s): they will not be delivered until replayed with the plugin.replayDLQ command`,
         );
       }
     } catch (error) {
       console.error("[ServerlessHost] outbox.flush after job error:", error);
-    } finally {
-      if (timer) clearTimeout(timer);
     }
   }
 
   async processAvailableJobs(opts?: {
     maxJobs?: number;
   }): Promise<ProcessJobsResult> {
+    await this.ready();
     const maxJobs = opts?.maxJobs ?? 1;
     let processed = 0;
     let succeeded = 0;
@@ -277,7 +350,9 @@ class ServerlessHostImpl implements ServerlessHost {
       );
       if (!job) break;
 
-      const result = await this.handleJob({
+      // Storage was checked above. A second check here could throw after the
+      // dequeue counted an attempt and leave the job unrun.
+      const result = await this.runJob({
         jobId: job.jobId,
         workflowRunId: job.workflowRunId,
         workflowId: job.workflowId,
@@ -310,6 +385,7 @@ class ServerlessHostImpl implements ServerlessHost {
   }
 
   async runMaintenanceTick(): Promise<MaintenanceTickResult> {
+    await this.ready();
     // Claim pending runs, poll suspended stages, reap stale leases, flush
     // the outbox, and reap stuck runs — see runMaintenanceTick in
     // @bratsos/workflow-engine/kernel for the shared command sequence. The
@@ -321,6 +397,7 @@ class ServerlessHostImpl implements ServerlessHost {
       ...(this.serves !== undefined ? { serves: this.serves } : {}),
       maxSuspendedChecksPerTick: this.maxSuspendedChecksPerTick,
       maxOutboxFlushPerTick: this.maxOutboxFlushPerTick,
+      outboxFlushTimeoutMs: this.outboxFlushTimeoutMs,
       staleLeaseThresholdMs: this.staleLeaseThresholdMs,
       jobAbsoluteTimeoutMs: this.jobAbsoluteTimeoutMs,
       ...(this.retention !== undefined ? { retention: this.retention } : {}),
@@ -338,6 +415,12 @@ class ServerlessHostImpl implements ServerlessHost {
         `[ServerlessHost] event sink DEAD-LETTERED ${counts.eventsDeadLettered} event(s): they will not be delivered until replayed with the plugin.replayDLQ command`,
       );
     }
+    await runTickHook(
+      this.onTick,
+      counts,
+      "[ServerlessHost]",
+      this.onTickTimeoutMs,
+    );
     return counts;
   }
 }

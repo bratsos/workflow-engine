@@ -19,6 +19,7 @@ export {
 export { createStorageShim } from "./create-storage-shim.js";
 export { describeThrown, toErrorMessage } from "./error-message.js";
 export {
+  assertTimerMs,
   type CreateEventSinkMonitorOptions,
   createEventSinkMonitor,
   type EventSinkHealth,
@@ -27,13 +28,17 @@ export {
   type ExecuteJobOutcome,
   type ExecuteJobWithHeartbeatOptions,
   executeJobWithHeartbeat,
+  flushOutboxWithin,
   HOST_DEFAULTS,
   type HostJobMessage,
+  MAX_TIMER_MS,
   type MaintenanceTickCounts,
+  type MaintenanceTickHook,
   type RetentionOptions,
   type RunMaintenanceTickOptions,
   retryBackoffMs,
   runMaintenanceTick,
+  runTickHook,
   toEventSinkObservation,
 } from "./host-support.js";
 export {

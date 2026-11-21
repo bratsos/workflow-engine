@@ -7,7 +7,10 @@
 
 import type { Workflow } from "@bratsos/workflow-engine";
 import { defineStage, WorkflowBuilder } from "@bratsos/workflow-engine";
-import { createKernel } from "@bratsos/workflow-engine/kernel";
+import {
+  createKernel,
+  type MaintenanceTickCounts,
+} from "@bratsos/workflow-engine/kernel";
 import {
   CollectingEventSink,
   FakeClock,
@@ -18,7 +21,7 @@ import {
   InMemoryStepLedger,
   InMemoryWorkflowPersistence,
 } from "@bratsos/workflow-engine/testing";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { createServerlessHost, type JobMessage } from "../host.js";
 
@@ -756,6 +759,35 @@ describe("ServerlessHost", () => {
     expect(completed).toHaveLength(1);
   });
 
+  it("processAvailableJobs runs every job it dequeues without checking the storage again", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, persistence, jobTransport } = createTestEnv([workflow]);
+    const host = createServerlessHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+    });
+    await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "paj-check",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+    await host.runMaintenanceTick();
+    // Passes once, then refuses: a check made after the dequeue would throw
+    // with the job claimed and its attempt counted.
+    let checks = 0;
+    (jobTransport as any).verifyStorage = async () => {
+      if (++checks > 1) throw new Error("refused after the dequeue");
+    };
+    await expect(host.processAvailableJobs()).resolves.toMatchObject({
+      processed: 1,
+      succeeded: 1,
+    });
+    expect(checks).toBe(1);
+    expect(await persistence.getRunsByStatus("COMPLETED")).toHaveLength(1);
+  });
+
   it("processAvailableJobs completes a two-stage workflow across invocations", async () => {
     const workflow = createTwoStageWorkflow();
     const { kernel, persistence, jobTransport } = createTestEnv([workflow]);
@@ -871,5 +903,277 @@ describe("ServerlessHost", () => {
     expect(types).toContain("workflow:created");
     expect(types).toContain("workflow:started");
     expect(types).toContain("workflow:completed");
+  });
+  it("calls onTick with the counts the tick returns", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, jobTransport } = createTestEnv([workflow]);
+    const seen: MaintenanceTickCounts[] = [];
+    const host = createServerlessHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+      onTick: (counts) => {
+        seen.push(counts);
+      },
+    });
+    await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "on-tick-1",
+      workflowId: workflow.id,
+      input: { data: "hello" },
+    });
+
+    const tick = await host.runMaintenanceTick();
+    await host.runMaintenanceTick();
+
+    expect(tick.claimed).toBe(1);
+    expect(seen).toHaveLength(2);
+    expect(seen[0]).toEqual(tick);
+    expect(seen[1]?.claimed).toBe(0);
+  });
+
+  it("logs a hook that throws or rejects and still returns the counts", async () => {
+    const { kernel, jobTransport } = createTestEnv([]);
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      let calls = 0;
+      const host = createServerlessHost({
+        kernel,
+        jobTransport,
+        workerId: "test-worker",
+        onTick: async () => {
+          calls++;
+          if (calls === 1) throw new Error("hook threw");
+          return Promise.reject(new Error("hook rejected"));
+        },
+      });
+
+      const first = await host.runMaintenanceTick();
+      const second = await host.runMaintenanceTick();
+
+      expect(first.claimed).toBe(0);
+      expect(second.claimed).toBe(0);
+      expect(calls).toBe(2);
+      const messages = logged.mock.calls.map((args) => String(args[1]));
+      expect(messages).toContain("Error: hook threw");
+      expect(messages).toContain("Error: hook rejected");
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
+  it("returns the counts after onTickTimeoutMs (default 5 s) when a hook never settles", async () => {
+    const { kernel, jobTransport } = createTestEnv([]);
+    const warned = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.useFakeTimers();
+    try {
+      let calls = 0;
+      const host = createServerlessHost({
+        kernel,
+        jobTransport,
+        workerId: "test-worker",
+        onTick: () => {
+          calls++;
+          return new Promise<void>(() => {});
+        },
+      });
+      let result:
+        | Awaited<ReturnType<typeof host.runMaintenanceTick>>
+        | undefined;
+      const ticking = host.runMaintenanceTick().then((counts) => {
+        result = counts;
+      });
+
+      await vi.advanceTimersByTimeAsync(4_999);
+      expect(calls).toBe(1);
+      expect(result).toBeUndefined();
+      expect(warned).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(1);
+      await ticking;
+      expect(result?.claimed).toBe(0);
+      expect(String(warned.mock.calls[0]?.[0])).toContain(
+        "onTick hook did not settle within 5000 ms",
+      );
+      expect(warned).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+      warned.mockRestore();
+    }
+  });
+
+  it("uses onTickTimeoutMs as the bound", async () => {
+    const { kernel, jobTransport } = createTestEnv([]);
+    const warned = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const host = createServerlessHost({
+        kernel,
+        jobTransport,
+        workerId: "test-worker",
+        onTickTimeoutMs: 30,
+        onTick: () => new Promise<void>(() => {}),
+      });
+      const started = Date.now();
+      const counts = await host.runMaintenanceTick();
+      expect(Date.now() - started).toBeLessThan(2_000);
+      expect(counts.claimed).toBe(0);
+      expect(warned).toHaveBeenCalledTimes(1);
+    } finally {
+      warned.mockRestore();
+    }
+  });
+
+  // Every option that reaches setTimeout or setInterval is checked at
+  // construction: Infinity, NaN, zero, a negative number or more than 2**31 - 1
+  // would otherwise become a 1 ms timer (or none).
+  for (const option of [
+    "onTickTimeoutMs",
+    "outboxFlushTimeoutMs",
+    "jobHeartbeatIntervalMs",
+  ] as const) {
+    it(`rejects ${option} when a timer cannot honour it`, () => {
+      const { kernel, jobTransport } = createTestEnv([]);
+      const create = (value: unknown) =>
+        createServerlessHost({
+          kernel,
+          jobTransport,
+          workerId: "test-worker",
+          [option]: value,
+        });
+      for (const bad of [
+        Infinity,
+        -Infinity,
+        NaN,
+        0,
+        -5,
+        0.5,
+        2 ** 31,
+        "5000",
+      ]) {
+        expect(() => create(bad), `${option}: ${String(bad)}`).toThrow(
+          new RegExp(`${option} must be a number of milliseconds`),
+        );
+      }
+      expect(() => create(1)).not.toThrow();
+      expect(() => create(2 ** 31 - 1)).not.toThrow();
+    });
+  }
+
+  it("rejects an onTick that is not a function", () => {
+    const { kernel, jobTransport } = createTestEnv([]);
+    for (const [bad, message] of [
+      ["x", "x"],
+      [5, "5"],
+      [{}, "[object Object]"],
+      [Object.create(null), "Unprintable error"],
+    ]) {
+      expect(
+        () =>
+          createServerlessHost({
+            kernel,
+            jobTransport,
+            workerId: "test-worker",
+            onTick: bad as never,
+          }),
+        message,
+      ).toThrow(new TypeError(`onTick must be a function, got ${message}.`));
+    }
+  });
+
+  it("refuses every entry point when the storage is refused, and recovers when it is not", async () => {
+    const { kernel, jobTransport } = createTestEnv([]);
+    // What the SQLite adapters throw for a file another Prisma major wrote.
+    const refusal = Object.assign(new Error("a foreign SQLite file"), {
+      code: "SQLITE_DATE_STORAGE_MISMATCH",
+    });
+    let refusing = true;
+    (jobTransport as any).verifyStorage = async () => {
+      if (refusing) throw refusal;
+    };
+    const dispatched = vi.spyOn(kernel, "dispatch");
+    const host = createServerlessHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+    });
+
+    await expect(host.runMaintenanceTick()).rejects.toBe(refusal);
+    await expect(host.processAvailableJobs()).rejects.toBe(refusal);
+    await expect(
+      host.handleJob({
+        jobId: "j",
+        workflowRunId: "r",
+        workflowId: "w",
+        stageId: "s",
+        attempt: 1,
+        payload: {},
+      }),
+    ).rejects.toBe(refusal);
+    expect(dispatched).not.toHaveBeenCalled();
+
+    // The check is asked again on every call.
+    refusing = false;
+    await expect(host.runMaintenanceTick()).resolves.toMatchObject({
+      claimed: 0,
+    });
+    expect(dispatched).toHaveBeenCalled();
+  });
+
+  it("dispatches nothing until the storage check settles, and checks again on every call", async () => {
+    const { kernel, jobTransport } = createTestEnv([]);
+    const gates: { settle: (error?: Error) => void }[] = [];
+    (jobTransport as any).verifyStorage = () =>
+      new Promise<void>((resolve, reject) => {
+        gates.push({ settle: (error) => (error ? reject(error) : resolve()) });
+      });
+    const dispatched = vi.spyOn(kernel, "dispatch");
+    const host = createServerlessHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+    });
+
+    // A check that fails late: the tick rejects and nothing was dispatched.
+    const failing = host.runMaintenanceTick();
+    await vi.waitFor(() => expect(gates).toHaveLength(1));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(dispatched).not.toHaveBeenCalled();
+    const refusal = new Error("refused");
+    gates[0].settle(refusal);
+    await expect(failing).rejects.toBe(refusal);
+    expect(dispatched).not.toHaveBeenCalled();
+
+    // A check that passes late: the tick runs only then.
+    const passing = host.runMaintenanceTick();
+    await vi.waitFor(() => expect(gates).toHaveLength(2));
+    expect(dispatched).not.toHaveBeenCalled();
+    gates[1].settle();
+    await passing;
+    expect(dispatched).toHaveBeenCalled();
+
+    // The host remembers nothing: the next call asks the transport again (the
+    // Prisma queue answers from its own memo once the check was conclusive).
+    const third = host.runMaintenanceTick();
+    await vi.waitFor(() => expect(gates).toHaveLength(3));
+    gates[2].settle();
+    await third;
+  });
+
+  it("gives the hook its own copy of the counts", async () => {
+    const { kernel, jobTransport } = createTestEnv([]);
+    const host = createServerlessHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+      onTick: (counts) => {
+        counts.claimed = 99;
+        counts.eventSinkStatus = "degraded";
+      },
+    });
+
+    const counts = await host.runMaintenanceTick();
+
+    expect(counts.claimed).toBe(0);
+    expect(counts.eventSinkStatus).toBe("healthy");
   });
 });

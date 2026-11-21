@@ -5,18 +5,20 @@ const { generateOnce } = require("../generate-once.cjs");
 const schema = require("../schema.cjs");
 
 // `max`: the most connections the client's pool opens (the suites' pool of one).
-exports.createPostgresClient = (url, { max } = {}) => {
+// Other `options` are extra PrismaClient options, e.g. `log` to record the SQL.
+exports.createPostgresClient = (url, { max, ...options } = {}) => {
   const { PrismaClient } = require("@prisma/client");
   const { PrismaPg } = require("@prisma/adapter-pg");
   return new PrismaClient({
     adapter: new PrismaPg({ connectionString: url, ...(max ? { max } : {}) }),
+    ...options,
   });
 };
 
 const versions = ["prisma", "@prisma/client"].map((name) => require(`${name}/package.json`).version);
 
 // Generates a SQLite client once and creates every table in `file`, then connects.
-exports.createSqliteClient = (file) => {
+exports.createSqliteClient = (file, options = {}, adapterOptions) => {
   const sqlite = schema.sqlite(__dirname, { withUrl: false });
   const url = `file:${file}`;
   const prisma = (...args) =>
@@ -32,5 +34,8 @@ exports.createSqliteClient = (file) => {
   prisma("db", "push");
   const { PrismaClient } = require(join(__dirname, ".generated/sqlite-client"));
   const { PrismaBetterSqlite3 } = require("@prisma/adapter-better-sqlite3");
-  return new PrismaClient({ adapter: new PrismaBetterSqlite3({ url }) });
+  return new PrismaClient({
+    adapter: new PrismaBetterSqlite3({ url }, adapterOptions),
+    ...options,
+  });
 };
