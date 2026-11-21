@@ -17,6 +17,7 @@ import {
   type BufferedLog,
   type CreateAnnotationInput,
   type ExecutorDeps,
+  isRetryableStageError,
   type KernelEvent,
   normalizeAnnotateArgs,
   toErrorMessage,
@@ -80,6 +81,9 @@ export function createRemoteExecutor(
       } catch (e) {
         return {
           error: toErrorMessage(e),
+          errorName: e instanceof Error ? e.name : undefined,
+          // Bad input fails identically on every attempt, as in LocalExecutor.
+          retryable: isRetryableStageError(e) ? undefined : false,
           progress: [],
           annotations: [],
           logs: [],
@@ -163,6 +167,10 @@ export function createRemoteExecutor(
       if (outcome.kind === "failed") {
         return {
           error: outcome.error,
+          errorName: outcome.errorName,
+          // The worker's verdict, passed on to `job.execute`; a worker that
+          // sends none leaves the failure retryable.
+          retryable: outcome.retryable === false ? false : undefined,
           progress: [],
           annotations: [],
           logs,
