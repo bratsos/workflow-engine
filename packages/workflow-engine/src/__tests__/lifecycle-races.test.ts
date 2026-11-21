@@ -516,6 +516,131 @@ describe(`lifecycle races on ${realDatabase ? (sqlite ? "SQLite" : "Postgres") :
     });
   });
 
+  it("lets run.purge finish the ledger clear of records a restart deleted when its own clear failed", async () => {
+    const external = new InMemoryStepLedger();
+    const clear = external.clear.bind(external);
+    let failures = 1;
+    external.clear = async (id) => {
+      if (failures-- > 0) throw new Error("ledger unavailable");
+      return clear(id);
+    };
+    const send = kernel({ stepLedger: external });
+    const runId = await createClaimed(send);
+    const old = await stageRecordId(runId);
+    await send({
+      type: "step.signal",
+      workflowRunId: runId,
+      stageId: "s",
+      stepId: "ready",
+      payload: big,
+    });
+    await send({ type: "run.cancel", workflowRunId: runId });
+    await expect(
+      send({
+        type: "run.redrive",
+        workflowRunId: runId,
+        from: { kind: "start" },
+      }),
+    ).rejects.toThrow("ledger unavailable");
+    expect(await external.list(old)).toHaveLength(1);
+    await send({ type: "run.cancel", workflowRunId: runId });
+
+    await expect(
+      send({ type: "run.purge", olderThan: later() }),
+    ).resolves.toEqual({ purged: 1, workflowRunIds: [runId] });
+    expect(await external.list(old)).toEqual([]);
+    expect(await ports.blobStore.list(stepSpillPrefix(old))).toEqual([]);
+    expect((await wake(old, "ready")).status).toBe("acquired");
+    expect(
+      (
+        await ports.persistence.acquireIdempotencyKey(
+          runId,
+          "run.redrive.pendingLedgerClear",
+        )
+      ).status,
+    ).toBe("acquired");
+  });
+
+  it("keeps the output of a new attempt that completed during the restart's cleanup", async () => {
+    const send = kernel();
+    const runId = await createClaimed(send);
+    const execute = () =>
+      send({
+        type: "job.execute",
+        workflowRunId: runId,
+        workflowId: workflow.id,
+        stageId: "s",
+        config: {},
+      });
+    await execute();
+    await send({ type: "run.transition", workflowRunId: runId });
+    const { jobTransport } = ports;
+    const restart = kernel({
+      jobTransport: override(jobTransport, {
+        // The first post-commit step: the new record exists, its job not yet.
+        deleteByRunAndStages: async (...args) => {
+          await execute();
+          return jobTransport.deleteByRunAndStages(...args);
+        },
+      }),
+    });
+    await restart({
+      type: "run.redrive",
+      workflowRunId: runId,
+      from: { kind: "start" },
+    });
+
+    const stage = await ports.persistence.getStage(runId, "s");
+    expect(stage?.status).toBe("COMPLETED");
+    const output = (stage?.outputData as { _artifactKey: string })._artifactKey;
+    expect(await ports.blobStore.get(output)).toEqual({ done: true });
+  });
+
+  it.skipIf(!realDatabase)(
+    "leaves a restored record's output readable when the caller's transaction rolls a restart back",
+    async () => {
+      const send = kernel();
+      const runId = await createClaimed(send);
+      await send({
+        type: "job.execute",
+        workflowRunId: runId,
+        workflowId: workflow.id,
+        stageId: "s",
+        config: {},
+      });
+      await send({ type: "run.transition", workflowRunId: runId });
+      const before = await ports.persistence.getStage(runId, "s");
+      const { createPrismaWorkflowPersistence, createPrismaJobQueue } =
+        await import("../persistence/prisma/index.js");
+      const options = {
+        databaseType: sqlite ? "sqlite" : "postgresql",
+      } as const;
+
+      await expect(
+        (db!.client as any).$transaction(async (tx: unknown) => {
+          const inner = kernel({
+            persistence: createPrismaWorkflowPersistence(tx as any, options),
+            jobTransport: createPrismaJobQueue(tx as any, options),
+          });
+          // Its enqueue cannot run on a borrowed transaction; the cleanup
+          // before it has run by then.
+          await inner({
+            type: "run.redrive",
+            workflowRunId: runId,
+            from: { kind: "start" },
+          }).catch(() => {});
+          throw new Error("caller rollback");
+        }),
+      ).rejects.toThrow("caller rollback");
+
+      const after = await ports.persistence.getStage(runId, "s");
+      expect(after?.id).toBe(before?.id);
+      const output = (after?.outputData as { _artifactKey: string })
+        ._artifactKey;
+      expect(await ports.blobStore.get(output)).toEqual({ done: true });
+    },
+  );
+
   // On the databases the purge claim each redrive takes first serializes the
   // two commands, so the cancel cannot land inside this window.
   it.skipIf(realDatabase)(

@@ -137,6 +137,8 @@ the batch it already submitted; waits, signals, sleeps and failed rows with
 nothing to keep are dropped. A deleted stage's ledger is cleared — its rows
 are keyed by a stage record id nothing will ever look up again.
 
+The deleted records' ids are written, in the redrive's transaction, to an idempotency record of type `run.redrive.pendingLedgerClear` keyed by the run id, and their signal wake keys are released in that transaction too. The post-commit step releases the record once every clear succeeded. If a clear fails (an external ledger that is briefly unavailable), dispatch rejects after the commit, the record stays, and the next `run.purge` of the run clears those ledgers and their spilled step results before it reports the run deleted; a purge whose clear fails rejects and leaves the run for a later purge. Blob cleanup of deleted records is listed before the commit and deleted after it, and it keeps the keys a deleted record's `outputData` points at (they are overwritten by the new attempt or removed by `run.purge`). So a new attempt that writes its output while the post-commit step is still running keeps it, and a redrive run on a caller's transaction that the caller rolls back leaves the restored records' output readable. What is not covered: keys the stage wrote itself through `ctx.storage` under its stage prefix are still deleted after the commit, so a new attempt's write to the same key in that window, or a restored record's storage after a caller rollback, is lost; the step ledger of a record a caller's rolled-back transaction restores has been cleared too. The kernel cannot see when a caller's transaction commits.
+
 ### What the redrive abandons
 
 Dropping a row can strand an effect that is still live: a durable step that

@@ -65,7 +65,11 @@ import {
 import { isTransactionReadBound } from "../helpers/transaction-reads.js";
 import type { HandlerResult, KernelDeps } from "../kernel";
 import type { StepRecord } from "../ports";
-import { assertNotPurging } from "./run-purge.js";
+import {
+  addPendingLedgerClears,
+  assertNotPurging,
+  PENDING_LEDGER_CLEAR,
+} from "./run-purge.js";
 import { SIGNAL_WAKE, signalWakeKey } from "./step-signal.js";
 
 /**
@@ -88,6 +92,18 @@ function toAbandoned(rows: readonly StepRecord[]): AbandonedStep[] {
     status: row.status,
     externalKey: row.externalKey ?? null,
   }));
+}
+
+/** The blob keys a stage record's outputData points at. */
+function outputKeys(stage: WorkflowStageRecord): string[] {
+  const data = stage.outputData as {
+    _artifactKey?: unknown;
+    _artifactKeys?: Record<string, unknown>;
+  } | null;
+  return [
+    data?._artifactKey,
+    ...Object.values(data?._artifactKeys ?? {}),
+  ].filter((key): key is string => typeof key === "string");
 }
 
 /** Annotation key under which a superseded stage attempt is archived. */
@@ -361,14 +377,45 @@ export async function handleRunRedrive(
   // deleted record's blobs go: a reopened record's kept steps may hold
   // references into its own storage, and the new attempt overwrites its
   // output and artifacts by key anyway.
-  const blobPrefixesToDelete = stagesToDelete.map(
-    (stage) =>
-      `workflow-v2/${run.workflowType}/${workflowRunId}/${stage.stageId}/`,
-  );
+  //
+  // The keys are listed now, before the commit, and the keys a deleted
+  // record's outputData points at are kept: the new attempt writes the
+  // same stable keys, and a post-commit delete that runs after it started
+  // (a caller-owned job.execute) must not take its bytes, nor must a caller
+  // whose own transaction rolls this redrive back find its restored
+  // pointers dangling. Kept keys are overwritten by the new attempt or go
+  // with run.purge.
+  const keptBlobKeys = new Set(stagesToDelete.flatMap(outputKeys));
+  const blobKeysToDelete: string[] = [];
+  for (const stage of stagesToDelete) {
+    const keys = await deps.blobStore
+      .list(
+        `workflow-v2/${run.workflowType}/${workflowRunId}/${stage.stageId}/`,
+      )
+      .catch(() => [] as string[]);
+    blobKeysToDelete.push(...keys.filter((key) => !keptBlobKeys.has(key)));
+  }
 
   for (const stage of stagesToDelete) {
+    // In this transaction: nothing can name a deleted record afterwards.
+    for (const stepId of deletedSignalSteps.get(stage.id) ?? []) {
+      await deps.persistence.releaseIdempotencyKey(
+        signalWakeKey(stage.id, stepId),
+        SIGNAL_WAKE,
+      );
+    }
     await deps.persistence.deleteStage(stage.id);
   }
+  // Which deleted records still need their ledger cleared, written with
+  // the deletes, so run.purge can finish a post-commit clear that failed.
+  const pendingClears =
+    deps.stepLedger && stagesToDelete.length > 0
+      ? await addPendingLedgerClears(
+          deps.persistence,
+          workflowRunId,
+          stagesToDelete.map((stage) => stage.id),
+        )
+      : [];
 
   // A reopened record goes back to what a record that has never run looks
   // like - PENDING, no outcome - on its next attempt, fenced on the
@@ -458,14 +505,14 @@ export async function handleRunRedrive(
       // record of the superseded attempt. A reopened record's ledger gets
       // the reset planned above: completed rows and rows naming an
       // external effect stay, the rest go.
-      for (const stage of stagesToDelete) {
-        for (const stepId of deletedSignalSteps.get(stage.id) ?? []) {
-          await postDeps.persistence.releaseIdempotencyKey(
-            signalWakeKey(stage.id, stepId),
-            SIGNAL_WAKE,
-          );
-        }
-        await postDeps.stepLedger?.clear(stage.id);
+      for (const stageRecordId of pendingClears) {
+        await postDeps.stepLedger?.clear(stageRecordId);
+      }
+      if (pendingClears.length > 0) {
+        await postDeps.persistence.releaseIdempotencyKey(
+          workflowRunId,
+          PENDING_LEDGER_CLEAR,
+        );
       }
       if (postDeps.stepLedger) {
         for (const [stageRecordId, plan] of ledgerResets) {
@@ -473,13 +520,8 @@ export async function handleRunRedrive(
         }
       }
 
-      for (const prefix of blobPrefixesToDelete) {
-        const keys = await postDeps.blobStore
-          .list(prefix)
-          .catch(() => [] as string[]);
-        for (const key of keys) {
-          await postDeps.blobStore.delete(key).catch(() => {});
-        }
+      for (const key of blobKeysToDelete) {
+        await postDeps.blobStore.delete(key).catch(() => {});
       }
 
       await enqueue(postDeps);

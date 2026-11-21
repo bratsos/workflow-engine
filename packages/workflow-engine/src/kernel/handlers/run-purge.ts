@@ -85,6 +85,64 @@ export async function assertNotPurging(
 }
 
 /**
+ * Idempotency type of the record that names a run's deleted stage records
+ * whose step ledger (and spilled step results) are still to be cleared.
+ * `run.redrive` writes it in the transaction that deletes them, since
+ * nothing else can name a deleted record afterwards, and releases it once
+ * its post-commit clear succeeded; `run.purge` clears whatever it still
+ * names.
+ */
+export const PENDING_LEDGER_CLEAR = "run.redrive.pendingLedgerClear";
+
+/** The deleted stage records `workflowRunId` still has to clear. */
+export async function pendingLedgerClears(
+  persistence: KernelDeps["persistence"],
+  workflowRunId: string,
+): Promise<string[]> {
+  const pending = await persistence.acquireIdempotencyKey(
+    workflowRunId,
+    PENDING_LEDGER_CLEAR,
+  );
+  if (pending.status === "acquired") {
+    await persistence.releaseIdempotencyKey(
+      workflowRunId,
+      PENDING_LEDGER_CLEAR,
+    );
+  }
+  if (pending.status !== "replay") return [];
+  const ids = (pending.result as { stageRecordIds?: unknown } | null)
+    ?.stageRecordIds;
+  return Array.isArray(ids) ? ids.filter((id) => typeof id === "string") : [];
+}
+
+/**
+ * Adds `stageRecordIds` to the run's pending clears, in the caller's
+ * transaction. Returns every id now pending.
+ */
+export async function addPendingLedgerClears(
+  persistence: KernelDeps["persistence"],
+  workflowRunId: string,
+  stageRecordIds: readonly string[],
+): Promise<string[]> {
+  const pending = await persistence.acquireIdempotencyKey(
+    workflowRunId,
+    PENDING_LEDGER_CLEAR,
+  );
+  const previous =
+    pending.status === "replay"
+      ? ((pending.result as { stageRecordIds?: string[] } | null)
+          ?.stageRecordIds ?? [])
+      : [];
+  const ids = [...new Set([...previous, ...stageRecordIds])];
+  await persistence.completeIdempotencyKey(
+    workflowRunId,
+    PENDING_LEDGER_CLEAR,
+    { stageRecordIds: ids },
+  );
+  return ids;
+}
+
+/**
  * Blob key prefixes the engine writes for one run. Stage outputs and
  * artifacts live under `workflow-v2/<workflowType>/<runId>/`
  * (`save-stage-output.ts`, `save-stage-artifacts.ts`); spilled job
@@ -185,13 +243,28 @@ export async function handleRunPurge(
                 ) {
                   continue;
                 }
+                // Current records, and records a redrive deleted whose
+                // ledger clear has not succeeded yet.
+                const pending = await pendingLedgerClears(
+                  persistence,
+                  selected.id,
+                );
                 const run: PurgeableRun = {
                   ...selected,
-                  stageRecordIds: (
-                    await persistence.getStagesByRun(selected.id)
-                  ).map((stage) => stage.id),
+                  stageRecordIds: [
+                    ...(await persistence.getStagesByRun(selected.id)).map(
+                      (stage) => stage.id,
+                    ),
+                    ...pending,
+                  ],
                 };
                 await cleanUp(run);
+                if (pending.length > 0) {
+                  await persistence.releaseIdempotencyKey(
+                    selected.id,
+                    PENDING_LEDGER_CLEAR,
+                  );
+                }
                 // Keep the cleanup keys reachable until every port succeeds.
                 const removed = await persistence.deleteRun(
                   run.id,
