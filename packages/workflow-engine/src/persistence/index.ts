@@ -67,6 +67,8 @@ export {
   createPrismaStepLedger,
   createPrismaWorkflowPersistence,
   fromPrisma8,
+  OutboxClaimUnsupportedError,
+  OutboxSchemaMissingError,
   PrismaAICallLogger,
   PrismaBlobStore,
   PrismaJobQueue,

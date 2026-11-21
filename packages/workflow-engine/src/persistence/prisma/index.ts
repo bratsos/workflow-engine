@@ -29,6 +29,10 @@ export {
   type PrismaJobQueueOptions,
 } from "./job-queue";
 export {
+  OutboxClaimUnsupportedError,
+  OutboxSchemaMissingError,
+} from "./outbox-claim";
+export {
   createPrismaWorkflowPersistence,
   type DatabaseType,
   PrismaWorkflowPersistence,

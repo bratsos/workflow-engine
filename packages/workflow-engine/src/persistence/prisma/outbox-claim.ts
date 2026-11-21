@@ -71,14 +71,28 @@ export class OutboxSchemaMissingError extends Error {
 }
 
 const MISSING_SCHEMA =
-  /no such (?:index|column): [\w."]*(?:outbox_events_\w+_idx|deliveryClaim)|column [\w."]*deliveryClaim"? does not exist/;
+  /no such (?:index|column): [\w."]*(?:outbox_events_\w+_idx|deliveryClaim)|column [\w."]*deliveryClaim"? does not exist|has no column "?deliveryClaim/;
+
+/** Text of a rejection for matching only: any value, whatever its shape. */
+function rejectionText(error: unknown): string {
+  const part = (read: () => unknown) => {
+    try {
+      const value = read();
+      return typeof value === "string"
+        ? value
+        : (JSON.stringify(value, (_key, item) =>
+            typeof item === "bigint" ? String(item) : item,
+          ) ?? "");
+    } catch {
+      return ""; // circular, a throwing getter, a Symbol: nothing to match
+    }
+  };
+  return `${part(() => (error as Error).message)} ${part(() => (error as { meta?: unknown }).meta)}`;
+}
 
 /** The claim's error, or `OutboxSchemaMissingError` when the schema step is missing. */
 export function outboxSchemaError(error: unknown): unknown {
-  const meta = (error as { meta?: unknown })?.meta;
-  return MISSING_SCHEMA.test(
-    `${(error as Error)?.message ?? error} ${JSON.stringify(meta) ?? ""}`,
-  )
+  return MISSING_SCHEMA.test(rejectionText(error))
     ? new OutboxSchemaMissingError(error)
     : error;
 }

@@ -1875,7 +1875,9 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
         "outbox_events",
         sql,
         [effectiveLimit],
-      );
+      ).catch((error: unknown) => {
+        throw outboxSchemaError(error);
+      });
       return rows.map((row) => this.mapOutboxEvent(row));
     }
     const records = await this.prisma.outboxEvent.findMany({

@@ -20,6 +20,10 @@ import {
 import { z } from "zod";
 import { defineWorkflow } from "../../core/workflow.js";
 import {
+  OutboxClaimUnsupportedError as RootClaimUnsupportedError,
+  OutboxSchemaMissingError as RootSchemaMissingError,
+} from "../../index.js";
+import {
   createKernel,
   createPluginRunner,
   definePlugin,
@@ -30,6 +34,8 @@ import { FakeClock, InMemoryBlobStore } from "../../kernel/testing/index.js";
 import {
   createPrismaWorkflowPersistence,
   fromPrisma8,
+  OutboxClaimUnsupportedError,
+  OutboxSchemaMissingError,
 } from "../../persistence/prisma/index.js";
 import { rawFor } from "../../persistence/prisma/prisma-client-type.js";
 import { InMemoryJobQueue } from "../../testing/index.js";
@@ -96,6 +102,47 @@ describe.skipIf(!sqlite && !databaseUrl)(
         select: { publishedAt: true, dlqAt: true, retryCount: true },
       });
     const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
+
+    // Tests that take the delivery schema step back run DDL. On PostgreSQL it
+    // gives up after 5 s behind another session's lock instead of queueing
+    // for the test timeout, and every DDL statement goes through here.
+    const alterSchema = (sql: string) =>
+      sqlite
+        ? client.$executeRawUnsafe(sql)
+        : client.$transaction(async (tx: typeof client) => {
+            await tx.$executeRawUnsafe("SET LOCAL lock_timeout = '5s'");
+            await tx.$executeRawUnsafe(sql);
+          });
+    const DELIVERY_INDEXES = [
+      [
+        "outbox_events_delivery_run_idx",
+        '"publishedAt", "dlqAt", "workflowRunId", "deliveryClaim"',
+      ],
+      [
+        "outbox_events_live_run_sequence_idx",
+        '"publishedAt", "dlqAt", "workflowRunId", "sequence"',
+      ],
+      ["outbox_events_delivery_cursor_idx", '"deliveryClaim", "workflowRunId"'],
+    ] as const;
+    /** Puts the delivery column and indexes back, whichever test took them. */
+    async function restoreDeliverySchema() {
+      const reader =
+        major === "8" ? client.$withColumns({ name: "text" }) : client;
+      const columns: Array<{ name: string }> = await reader.$queryRawUnsafe(
+        sqlite
+          ? "SELECT name FROM pragma_table_info('outbox_events')"
+          : "SELECT column_name AS name FROM information_schema.columns WHERE table_name = 'outbox_events' AND table_schema = current_schema()",
+      );
+      for (const { name } of columns)
+        if (name === "legacyClaim" || name === "preUpgradeClaim")
+          await alterSchema(
+            `ALTER TABLE "outbox_events" RENAME COLUMN "${name}" TO "deliveryClaim"`,
+          );
+      for (const [name, indexed] of DELIVERY_INDEXES)
+        await alterSchema(
+          `CREATE INDEX IF NOT EXISTS "${name}" ON "outbox_events" (${indexed})`,
+        );
+    }
     const replay = () =>
       kernel.dispatch({ type: "plugin.replayDLQ" as const, maxEvents: 10 });
 
@@ -150,6 +197,8 @@ describe.skipIf(!sqlite && !databaseUrl)(
     }, 120_000);
 
     beforeEach(async () => {
+      // A test that timed out may have left the schema step taken back.
+      await restoreDeliverySchema();
       await client.outboxEvent.deleteMany({});
       await client.workflowRun.deleteMany({});
       shouldFail = true;
@@ -961,50 +1010,117 @@ describe.skipIf(!sqlite && !databaseUrl)(
         code: "OUTBOX_SCHEMA_MISSING",
         message: expect.stringContaining("outbox schema migration"),
       });
-      const indexes = [
-        [
-          "outbox_events_delivery_run_idx",
-          '"publishedAt", "dlqAt", "workflowRunId", "deliveryClaim"',
-        ],
-        [
-          "outbox_events_live_run_sequence_idx",
-          '"publishedAt", "dlqAt", "workflowRunId", "sequence"',
-        ],
-        [
-          "outbox_events_delivery_cursor_idx",
-          '"deliveryClaim", "workflowRunId"',
-        ],
-      ];
+      const rejection = (work: Promise<unknown>) =>
+        work.then(
+          () => undefined,
+          (error: unknown) => error,
+        );
+      // The engine's read of unpublished events: rows, or the same error.
+      const unpublished = () =>
+        persistence.getUnpublishedOutboxEvents().then(
+          (events) => events.length,
+          (error: { code?: string }) => error.code ?? error,
+        );
       const live = () =>
         client.outboxEvent.count({ where: { publishedAt: null } });
       // A rename keeps the column's position, so restored PostgreSQL row
       // types match the plans cached before.
-      const rename = (from: string, to: string) =>
-        client.$executeRawUnsafe(
-          `ALTER TABLE "outbox_events" RENAME COLUMN "${from}" TO "${to}"`,
-        );
-      await rename("deliveryClaim", "legacyClaim");
+      await alterSchema(
+        'ALTER TABLE "outbox_events" RENAME COLUMN "deliveryClaim" TO "legacyClaim"',
+      );
       try {
-        await expect(flushOnce()).rejects.toThrow(missing);
+        const error = await rejection(flushOnce());
+        expect(error).toEqual(missing);
+        expect(error).toBeInstanceOf(OutboxSchemaMissingError);
+        expect(error).toBeInstanceOf(RootSchemaMissingError);
+        // Prisma 6 and 7 map the rows without the column; Prisma 8 checks
+        // each row against the columns it declares. (On PostgreSQL 6 and 7 the
+        // rename itself fails the cached `SELECT *` plan of earlier tests.)
+        if (sqlite || major === "8")
+          expect(await unpublished()).toBe(
+            major === "8" ? "OUTBOX_SCHEMA_MISSING" : 1,
+          );
       } finally {
-        await rename("legacyClaim", "deliveryClaim");
+        await restoreDeliverySchema();
       }
       expect(await live()).toBe(1);
-      for (const [name] of indexes)
-        await client.$executeRawUnsafe(`DROP INDEX "${name}"`);
+      for (const [name] of DELIVERY_INDEXES)
+        await alterSchema(`DROP INDEX "${name}"`);
       try {
         // PostgreSQL claims without them, on slower plans.
-        if (sqlite) await expect(flushOnce()).rejects.toThrow(missing);
-        else expect(await flushOnce()).toMatchObject({ published: 1 });
+        if (sqlite) {
+          await expect(flushOnce()).rejects.toThrow(missing);
+          expect(await unpublished()).toBe("OUTBOX_SCHEMA_MISSING");
+        } else {
+          expect(await unpublished()).toBe(1);
+          expect(await flushOnce()).toMatchObject({ published: 1 });
+        }
         expect(await live()).toBe(sqlite ? 1 : 0);
       } finally {
-        for (const [name, columns] of indexes)
-          await client.$executeRawUnsafe(
-            `CREATE INDEX "${name}" ON "outbox_events" (${columns})`,
-          );
+        await restoreDeliverySchema();
       }
       expect(await flushOnce()).toMatchObject({ published: sqlite ? 1 : 0 });
       expect(await live()).toBe(0);
+    });
+
+    it("passes on any rejection of the claim unchanged, whatever its shape", async () => {
+      await seedEvent("a-odd");
+      const circular: Record<string, unknown> = {};
+      circular.self = circular;
+      const odd: unknown[] = [
+        Object.create(null),
+        Symbol("odd"),
+        Object.defineProperty({}, "message", {
+          get() {
+            throw new Error("getter");
+          },
+        }),
+        Object.assign(new Error("circular meta"), { meta: circular }),
+        Object.assign(new Error("bigint meta"), { meta: { n: 1n } }),
+      ];
+      for (const value of odd) {
+        // Rejects the claim's own statements only; every other read runs.
+        const view = (target: typeof client): typeof client =>
+          new Proxy(target, {
+            get(prisma, key) {
+              const member = Reflect.get(prisma, key, prisma);
+              if (key === "$queryRaw" || key === "$queryRawUnsafe")
+                return (...args: unknown[]) =>
+                  /deliveryClaim/.test(
+                    typeof args[0] === "string"
+                      ? args[0]
+                      : [...((args[0] as string[]) ?? [])].join(""),
+                  )
+                    ? Promise.reject(value)
+                    : member.apply(prisma, args);
+              if (key === "$withColumns" && typeof member === "function")
+                return (...args: unknown[]) => view(member.apply(prisma, args));
+              if (key === "$transaction" && typeof member === "function")
+                return (work: unknown, ...rest: unknown[]) =>
+                  member.call(
+                    prisma,
+                    typeof work === "function"
+                      ? (tx: typeof client) => work(view(tx))
+                      : work,
+                    ...rest,
+                  );
+              return typeof member === "function"
+                ? member.bind(prisma)
+                : member;
+            },
+          });
+        const flusher = make({ async emit() {} }, storeOver(view(client)));
+        const caught = await flusher
+          .dispatch({ type: "outbox.flush", maxEvents: 5 })
+          .then(
+            () => "resolved",
+            (error: unknown) => error,
+          );
+        expect(caught).toBe(value);
+      }
+      expect(
+        await client.outboxEvent.count({ where: { publishedAt: null } }),
+      ).toBe(1);
     });
 
     it("releases only the failed run's claim when runs of a page share the maximum rank", async () => {
@@ -1118,7 +1234,7 @@ describe.skipIf(!sqlite && !databaseUrl)(
     });
 
     it.skipIf(sqlite)(
-      "refuses a PostgreSQL root hiding raw reads when built, and passes 25,000 leased heads through each supported shape",
+      "refuses a PostgreSQL root hiding raw reads when built, and passes 5,000 leased heads through each supported shape",
       async () => {
         for (const hidden of [
           ["$queryRaw", "$queryRawUnsafe"],
@@ -1127,6 +1243,12 @@ describe.skipIf(!sqlite && !databaseUrl)(
           expect(() => storeOver(omitClientMembers(...hidden))).toThrow(
             expect.objectContaining({ code: "OUTBOX_CLAIM_UNSUPPORTED" }),
           );
+        expect(() =>
+          storeOver(omitClientMembers("$queryRaw", "$queryRawUnsafe")),
+        ).toThrow(OutboxClaimUnsupportedError);
+        expect(() =>
+          storeOver(omitClientMembers("$queryRaw", "$queryRawUnsafe")),
+        ).toThrow(RootClaimUnsupportedError);
         // A root that reads raw, with transaction views that cannot.
         const wrapper = new Proxy(client, {
           get(target, key) {
@@ -1155,7 +1277,9 @@ describe.skipIf(!sqlite && !databaseUrl)(
         await client.$executeRawUnsafe(
           seed,
           "2099-01-01T00:00:00.000Z|held",
-          25000,
+          // The claim walks every leased head before z-ready: 25,000 took up to
+          // 6 s a flush on a loaded machine, against the 4 s bound below.
+          5000,
         );
         // The wrapper's claim runs on the root without planner settings, so
         // its plan follows the statistics (see kernel-and-ports.md).
@@ -1775,7 +1899,7 @@ describe.skipIf(!sqlite && !databaseUrl)(
       await client.outboxEvent.updateMany({
         data: { publishedAt: clock.now() },
       });
-      await client.$executeRawUnsafe(
+      await alterSchema(
         'ALTER TABLE outbox_events RENAME COLUMN "deliveryClaim" TO "preUpgradeClaim"',
       );
       try {
@@ -1814,9 +1938,7 @@ describe.skipIf(!sqlite && !databaseUrl)(
           /deliveryClaim/i,
         );
       } finally {
-        await client.$executeRawUnsafe(
-          'ALTER TABLE outbox_events RENAME COLUMN "preUpgradeClaim" TO "deliveryClaim"',
-        );
+        await restoreDeliverySchema();
       }
       shouldFail = false;
       expect((await flush()).published).toBe(1);
