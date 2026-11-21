@@ -78,7 +78,12 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
     });
   }
 
-  it("refuses a SQLite file with dates from another Prisma major", async () => {
+  // On Prisma 6 and 7 the fixture runs `prisma db push` in a child process for
+  // the new file: 0.5-0.6 s here, 2.6 s and over 5 s on CI beside the other
+  // workspaces' tests.
+  it("refuses a SQLite file with dates from another Prisma major", {
+    timeout: 30_000,
+  }, async () => {
     const file = join(directory, "foreign-dates.db");
     const foreign = isPrisma8
       ? (() => {
@@ -476,7 +481,12 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
     });
   });
 
-  it("reads a JSON scalar in every JSON column it reads, though SQLite keeps a JSON number as a number", async () => {
+  // On Prisma 6 and 7 the fixture runs `prisma db push` in a child process for
+  // the new file: 0.5-0.6 s here, 2.6 s and over 5 s on CI beside the other
+  // workspaces' tests.
+  it("reads a JSON scalar in every JSON column it reads, though SQLite keeps a JSON number as a number", {
+    timeout: 30_000,
+  }, async () => {
     const file = join(directory, "json-scalars.db");
     const db: ConsolePrismaClient & Record<string, any> = isPrisma8
       ? (() => {
