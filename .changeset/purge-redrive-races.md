@@ -10,4 +10,6 @@
 - `run.redrive` releases the signal wake keys of the stage records it deletes. They were never released, since neither a later signal nor `run.purge` can find a deleted record.
 - `run.rerunFrom` checks COMPLETED/FAILED on the same read its run update is fenced on, so a run cancelled while it was deciding is refused instead of redriven.
 
+- `stage.pollSuspended` no longer fails a stage that a `job.execute` completed while the poll was running. A stale `checkCompletion` that returned or threw an error, a deadline that elapsed, or a durable replay that ran out of attempts used to write FAILED over the COMPLETED stage and fail its run. The failure is now fenced on the stage row's version and the poll moves on.
+
 No port changes. `job.execute` is unchanged; each post-commit enqueue reads the run once more.

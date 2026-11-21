@@ -5,7 +5,7 @@
  */
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
-import { defineStage } from "../core/stage-factory.js";
+import { defineAsyncBatchStage, defineStage } from "../core/stage-factory.js";
 import { WorkflowBuilder } from "../core/workflow.js";
 import { createKernel, type KernelConfig } from "../kernel/kernel.js";
 import {
@@ -343,6 +343,69 @@ describe(`lifecycle races on ${realDatabase ? (sqlite ? "SQLite" : "Postgres") :
     });
     expect(await stageRecordId(runId)).not.toBe(first);
     expect((await wake(first, "ready")).status).toBe("acquired");
+  });
+
+  it.each([
+    "returns",
+    "throws",
+  ] as const)("keeps a stage a job completed when a stale checkCompletion %s an error", async (how) => {
+    const held = gate();
+    let calls = 0;
+    const legacy = new WorkflowBuilder(
+      "lifecycle-legacy",
+      "Lifecycle legacy",
+      "lifecycle-legacy",
+      schema,
+      z.any(),
+    )
+      .pipe(
+        defineAsyncBatchStage({
+          id: "s",
+          name: "S",
+          mode: "async-batch",
+          schemas: { input: schema, output: z.any(), config: schema },
+          async execute() {
+            if (++calls > 1) return { output: { winner: "job" } };
+            const poll = { pollInterval: 1000, maxWaitTime: 3_600_000 };
+            return {
+              suspended: true,
+              state: {
+                batchId: "b",
+                submittedAt: new Date().toISOString(),
+                ...poll,
+              },
+              pollConfig: { nextPollAt: new Date(0), ...poll },
+            };
+          },
+          async checkCompletion() {
+            await held.pause();
+            if (how === "throws") throw new Error("stale poll");
+            return { ready: false, error: "stale poll" };
+          },
+        }),
+      )
+      .build();
+    const send = kernel({ registry: { getWorkflow: () => legacy } });
+    const runId = await createClaimed(send);
+    const execute = () =>
+      send({
+        type: "job.execute",
+        workflowRunId: runId,
+        workflowId: legacy.id,
+        stageId: "s",
+        config: {},
+      });
+    await execute();
+    const poll = send({ type: "stage.pollSuspended" });
+    await held.reached;
+    await expect(execute()).resolves.toMatchObject({ outcome: "completed" });
+    held.open();
+
+    await expect(poll).resolves.toMatchObject({ failed: 0 });
+    const stage = await ports.persistence.getStage(runId, "s");
+    expect(stage?.status).toBe("COMPLETED");
+    expect(stage?.errorMessage ?? null).toBeNull();
+    expect((await ports.persistence.getRun(runId))?.status).toBe("RUNNING");
   });
 
   // On the databases the purge claim each redrive takes first serializes the

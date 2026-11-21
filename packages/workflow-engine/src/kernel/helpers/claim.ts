@@ -175,11 +175,15 @@ export async function failStageAndRun(
     run.version,
     deps,
     async (tx) => {
+      // A job.execute that finished the stage meanwhile writes only the
+      // stage row, so the run version alone would let this poll overwrite
+      // its COMPLETED stage; a mismatch rolls back as "stale".
       await tx.updateStage(stageRecord.id, {
         status: "FAILED",
         completedAt: deps.clock.now(),
         errorMessage,
         nextPollAt: settlement?.nextPollAt ?? null,
+        expectedVersion: stageRecord.version,
       });
 
       await tx.updateRun(stageRecord.workflowRunId, {
