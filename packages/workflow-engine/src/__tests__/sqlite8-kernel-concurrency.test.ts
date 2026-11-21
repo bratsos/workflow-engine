@@ -884,24 +884,28 @@ describe
                 path: db.file,
               });
         if (i > 0) roots.push(native);
-        const persistence = createPrismaWorkflowPersistence(
-          i === 0 ? db.client : fromPrisma8(native),
-          { databaseType: "sqlite" },
-        );
-        return { persistence, kernel: db.makeKernel({ persistence }) };
+        const client = i === 0 ? db.client : fromPrisma8(native);
+        const persistence = createPrismaWorkflowPersistence(client, {
+          databaseType: "sqlite",
+        });
+        return { client, persistence, kernel: db.makeKernel({ persistence }) };
       });
-    // The longest a 1 ms timer fired late while `work` ran.
+    // The longest a 1 ms timer fired late while `work` ran, and how often it
+    // fired before `work` settled.
     const loopDelay = async <T>(work: () => Promise<T>) => {
       let late = 0;
+      let ticks = 0;
       let due = Date.now() + 1;
       const timer = setInterval(() => {
+        ticks++;
         late = Math.max(late, Date.now() - due);
         due = Date.now() + 1;
       }, 1);
       try {
         const results = await Promise.allSettled([work()]);
+        const fired = ticks;
         await new Promise((resolve) => setTimeout(resolve, 5));
-        return { result: results[0]!, late };
+        return { result: results[0]!, late, ticks: fired };
       } finally {
         clearInterval(timer);
       }
@@ -928,7 +932,7 @@ describe
           ]);
         // Each root's storage check runs before the burst.
         for (const { persistence } of stacks) await persistence.getRun("warm");
-        const { result, late } = await loopDelay(() =>
+        const { result, ticks } = await loopDelay(() =>
           Promise.all(
             stacks.flatMap(({ kernel }, i) => [
               kernel.dispatch({ type: "outbox.flush", maxEvents: 1 }),
@@ -946,7 +950,11 @@ describe
         expect(
           values.reduce((sum, value) => sum + (value.published ?? 0), 0),
         ).toBe(Math.min(count, events));
-        expect(late).toBeLessThan(1000);
+        // Each queued turn yields a macrotask, so timers fire during the burst
+        // (without the yield none fired until it ended). No bound on the longest
+        // delay: one synchronous statement can stall for seconds on a loaded
+        // disk, and a lock wait fails the burst above instead.
+        expect(ticks).toBeGreaterThanOrEqual(count);
         expect(await db.client.workflowRun.count()).toBe(count);
       },
       60_000,
@@ -1021,6 +1029,150 @@ describe
         clearTimeout(commit);
       }
       expect(await db.client.workflowRun.count()).toBe(1);
+    }, 30_000);
+
+    // A raw BEGIN on another root, sent before the adapter's first call there.
+    const rawOn = (native: unknown) => {
+      const root = native as {
+        execute(plan: unknown): Promise<unknown>;
+        raw: any;
+      };
+      return (text: string) =>
+        root.execute(
+          root.raw
+            .sql([text] as any)
+            .affectedCount()
+            .build(),
+        );
+    };
+    const create = (key: string, kernel = db.kernel) =>
+      kernel.dispatch({
+        type: "run.create",
+        idempotencyKey: key,
+        workflowId: db.workflow.id,
+        input: { value: key },
+      });
+
+    it("lets engine writes run while another root is inside a raw read-only transaction in WAL, and names that root otherwise", async () => {
+      await db.persistence.getRun("warm");
+      const [, other] = open(2);
+      const native = roots.at(-1) as any;
+      const sql = rawOn(native);
+      await sql("BEGIN");
+      // A read opens the transaction's snapshot; no write lock is taken.
+      await native
+        .query(
+          native.raw
+            .sql(["SELECT id FROM workflow_runs"])
+            .returnsRow({ id: "sqlite/text@1" })
+            .build(),
+        )
+        .toArray();
+      await other!.persistence.getRun("warm");
+      const start = Date.now();
+      try {
+        const write = create("beside-reader").then(
+          () => "ok",
+          (error: Error) => error.message,
+        );
+        if (mode === "wal") {
+          expect(await write).toBe("ok");
+          expect(Date.now() - start).toBeLessThan(2_000);
+        } else {
+          expect(await write).toMatch(
+            /another SQLite root connection of this process on the same file/,
+          );
+        }
+      } finally {
+        await sql("ROLLBACK");
+      }
+    }, 30_000);
+
+    it("stops holding engine writes back when the root inside a raw transaction closes", async () => {
+      await db.persistence.getRun("warm");
+      const [, other] = open(2);
+      const native = roots.pop() as unknown as { close(): Promise<void> };
+      const sql = rawOn(native);
+      await sql("BEGIN IMMEDIATE");
+      await sql(`UPDATE "workflow_runs" SET priority = 7`);
+      await other!.persistence.getRun("warm");
+      const close = setTimeout(() => void native.close(), 100);
+      const start = Date.now();
+      try {
+        await expect(create("after-close")).resolves.toMatchObject({
+          status: "PENDING",
+        });
+        expect(Date.now() - start).toBeLessThan(2_000);
+      } finally {
+        clearTimeout(close);
+      }
+    }, 30_000);
+
+    it("keeps a file's queue while a transaction queued on its last root runs after that root closes", async () => {
+      await db.persistence.getRun("warm");
+      let entered!: () => void;
+      const inside = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const transaction = db.client.$transaction(
+        async (tx: any) => {
+          await tx.$executeRawUnsafe(`UPDATE "workflow_runs" SET priority = 7`);
+          entered();
+          await new Promise((resolve) => setTimeout(resolve, 300));
+        },
+        { timeout: 5_000 },
+      );
+      await inside;
+      await db.native.close();
+      const late = open(2)[1]!;
+      const { result, late: delay } = await loopDelay(() =>
+        create("behind-closed", late.kernel),
+      );
+      expect(result.status).toBe("fulfilled");
+      expect(delay).toBeLessThan(1000);
+      await expect(transaction).resolves.toBeUndefined();
+      expect(await late.persistence.getRunsByStatus("PENDING")).toHaveLength(1);
+    }, 30_000);
+
+    it.each([
+      "the same root",
+      "another root",
+    ])("rejects a $transaction on %s of the file started inside a transaction's callback, and commits neither", async (where) => {
+      const [, other] = open(2);
+      await other!.persistence.getRun("warm");
+      const inner = where === "the same root" ? db.client : other!.client;
+      let nested: unknown;
+      const outer = db.client.$transaction(
+        async (tx: any) => {
+          await tx.workflowRun.create({
+            data: {
+              workflowId: "w",
+              workflowName: "w",
+              workflowType: "t",
+              status: "PENDING",
+              input: {},
+            },
+          });
+          nested = await inner
+            .$transaction(async (tx2: any) => {
+              await tx2.workflowRun.create({
+                data: {
+                  workflowId: "w",
+                  workflowName: "w",
+                  workflowType: "t",
+                  status: "PENDING",
+                  input: {},
+                },
+              });
+            })
+            .catch((error: { code?: string }) => error.code);
+        },
+        { timeout: 400 },
+      );
+      await expect(outer).rejects.toMatchObject({ code: "P2028" });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(nested).toBe("P2028");
+      expect(await db.client.workflowRun.count()).toBe(0);
     }, 30_000);
 
     it("reads through another root of the file inside a root's transaction", async () => {

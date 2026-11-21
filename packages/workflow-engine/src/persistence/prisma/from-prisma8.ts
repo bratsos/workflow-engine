@@ -751,6 +751,12 @@ interface ReadGate {
   foreign?: { ended: Promise<void>; end: () => void };
   /** Reads the root's transaction state again (`ownRootConnection`). */
   recheck?: () => Promise<void>;
+  /**
+   * In WAL, whether this root could start a write now, without waiting: no
+   * connection holds the file's write lock. False on a rollback journal,
+   * where a reader also holds a commit back (`ownRootConnection`).
+   */
+  writable?: () => Promise<boolean>;
   /** The gates of every root of this process on the same file (`joinFile`). */
   file?: Set<ReadGate>;
   /** The root driver was closed: it leaves, or never joins, its file. */
@@ -784,17 +790,26 @@ async function untilOwnRoot(db: object): Promise<void> {
   const gate = gateOf(db);
   await gate?.ready;
   if (!gate) return;
-  // Any root of this process on the file: its transaction holds the file's
-  // write lock, which this root's write would wait for synchronously.
-  const foreign = () =>
-    [...(gate.file ?? [gate])].find((g) => g.foreign)?.foreign;
   const end = Date.now() + READ_WAIT_MS;
-  for (let open = foreign(); open; open = foreign()) {
+  for (;;) {
+    // Any root of this process on the file: a transaction there that holds the
+    // file's write lock would make this root's write wait synchronously.
+    const holder: ReadGate | undefined = [...(gate.file ?? [gate])].find(
+      (g) => g.foreign,
+    );
+    const open = holder?.foreign;
+    if (!holder || !open) return;
+    // In WAL a transaction of another root that has not written blocks no
+    // writer: go ahead once no connection holds the write lock.
+    const other = holder !== gate;
+    if (other && (await gate.writable?.())) return;
     const left = end - Date.now();
     if (left <= 0)
       throw Object.assign(
         new Error(
-          "fromPrisma8: the SQLite root connection is inside a transaction this adapter did not open (a raw BEGIN sent through the client before the adapter's first call); the engine's write waited 5 s for it to end. COMMIT or ROLLBACK it, and open transactions with $transaction or db.transaction",
+          other
+            ? "fromPrisma8: another SQLite root connection of this process on the same file (another client over the file) is inside a transaction this adapter did not open (a raw BEGIN sent through that client before the adapter's first call on it); the engine's write waited 5 s for it to end. COMMIT or ROLLBACK it, and open transactions with $transaction or db.transaction. In WAL only such a transaction that has written holds engine writes back"
+            : "fromPrisma8: the SQLite root connection is inside a transaction this adapter did not open (a raw BEGIN sent through the client before the adapter's first call); the engine's write waited 5 s for it to end. COMMIT or ROLLBACK it, and open transactions with $transaction or db.transaction",
         ),
         { code: "SQLITE_BUSY", errcode: 5 },
       );
@@ -802,7 +817,9 @@ async function untilOwnRoot(db: object): Promise<void> {
     await Promise.race([
       open.ended,
       new Promise<void>((resolve) => {
-        timer = setTimeout(resolve, left);
+        // Another root's transaction may stop holding the write lock without
+        // ending (WAL): look again shortly.
+        timer = setTimeout(resolve, other ? Math.min(left, 25) : left);
       }),
     ]);
     clearTimeout(timer);
@@ -1656,8 +1673,6 @@ interface WriteQueue {
   tail: Promise<void>;
   /** Another client over the same driver owns the queue: use that one. */
   to?: WriteQueue;
-  /** The read gate of the root whose own queue this is (`joinFile`). */
-  gate?: ReadGate;
   /** Turns queued and not yet settled (`enqueue`). */
   waiting?: number;
 }
@@ -1733,12 +1748,18 @@ async function joinFile(
   if (target !== followQueue(queue)) queue.to = target;
   shared.gates.add(gate);
   gate.file = shared.gates;
-  queue.gate = gate;
   const joined = shared;
+  // A root opened later starts a new entry once the last root left and the
+  // queue drained; until then it joins this one, behind the writes queued.
+  const drop = () => {
+    if (joined.gates.size || files.get(file) !== joined) return;
+    const target = followQueue(joined.queue);
+    if (target.waiting) void target.tail.then(drop);
+    else files.delete(file);
+  };
   gate.leave = () => {
     joined.gates.delete(gate);
-    // A root opened later starts a new entry; the live roots keep the queue.
-    if (!joined.gates.size && files.get(file) === joined) files.delete(file);
+    drop();
   };
 }
 
@@ -1871,6 +1892,10 @@ function ownRootConnection(
     driver.close = function (...args) {
       gate.left = true;
       gate.leave?.();
+      // Closing the connection ends its transaction: writers waiting on it go.
+      const foreign = gate.foreign;
+      gate.foreign = undefined;
+      foreign?.end();
       return close.apply(this, args);
     };
   const query = driver.query.bind(driver);
@@ -1895,6 +1920,32 @@ function ownRootConnection(
     gate.foreign = undefined;
     end();
   };
+  // In a queue turn, so no adapter write of this root is half-done meanwhile;
+  // inline when already in one, which a queued probe would wait behind.
+  const probe = async () => {
+    const one = async (sql: string) => {
+      for await (const row of query({ sql, params: [] }))
+        return row as Record<string, unknown>;
+      return undefined;
+    };
+    const mode = await one("PRAGMA journal_mode");
+    if (String(mode?.journal_mode).toLowerCase() !== "wal") return false;
+    const timeout = Number((await one("PRAGMA busy_timeout"))?.timeout);
+    await one("PRAGMA busy_timeout = 0");
+    try {
+      await exec("BEGIN IMMEDIATE");
+      await exec("ROLLBACK");
+      return true;
+    } catch {
+      return false;
+    } finally {
+      await one(
+        `PRAGMA busy_timeout = ${Number.isFinite(timeout) ? timeout : READ_WAIT_MS}`,
+      ).catch(() => {});
+    }
+  };
+  gate.writable = async () =>
+    (await own()) === true ? probe() : enqueue(queue, probe);
   gate.ready = inside().then(async (yes) => {
     await joinFile(query, queue, gate);
     if (!yes) return;
