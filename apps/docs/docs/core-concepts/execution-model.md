@@ -126,8 +126,10 @@ When a stage fails (by throwing an error), the engine increments the attempt cou
 One classifier decides, wherever a stage throw is retried: `job.execute` (through the local or remote executor) and a replay in `stage.pollSuspended`. These fail the stage attempt terminally, whatever budget is left:
 * `NonRetryableError` (exported from `@bratsos/workflow-engine`; detect it across bundled copies with `isNonRetryableError`), thrown by the stage or by a step, or made by a step's `retryIf` returning `false`;
 * a Zod error, from any copy of zod (the application's own, another major, `zod/mini`), recognised by its name and `issues` rather than by class;
-* `DuplicateStepKeyError`, an expired durable wait (`StepTimeoutError`) and an `onReclaim: "fail"` refusal (`StepNotReplaySafeError`): each is recorded on its ledger row, which every later attempt answers with the same error.
-* any of these as a ledger replay rethrows it, and any of them thrown by another copy of the engine of this release or later: the checks read brands and shapes, not classes. Earlier releases throw `StepTimeoutError` and `StepNotReplaySafeError` without the brand, and an error that crossed a JSON boundary keeps only its name and message, so those are retried as before.
+* `DuplicateStepKeyError`, and an expired durable wait (`StepTimeoutError`) or an `onReclaim: "fail"` refusal (`StepNotReplaySafeError`) as the execution that records it throws it;
+* any of these thrown by another copy of the engine of this release or later: the checks read brands and shapes, not classes, and an unreadable diagnostic (a throwing getter) never hides a brand. Earlier releases throw `StepTimeoutError` and `StepNotReplaySafeError` without the brand, and an error that crossed a JSON boundary keeps only its fields, so those are retried as before.
+
+The classifier sees errors thrown in the current execution. A durable step failure replayed from the ledger is rebuilt from its message, as before, so it is retried within the budget (a later attempt can consume a remaining step retry and complete).
 
 Every other error is retried within the budget. `job.execute` records the error as `"Name: message"` (a plain `Error` by its message alone); `stage.pollSuspended` records the message.
 

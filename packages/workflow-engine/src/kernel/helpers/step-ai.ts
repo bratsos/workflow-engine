@@ -622,7 +622,7 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
         if (isStepControlFlowError(error)) throw error;
         // The call said a retry cannot succeed: no retry, no repair.
         if (isNonRetryableError(error)) {
-          return failed(errorMessage(error), error.name);
+          return failed(errorMessage(error), errorName(error));
         }
         const failure = asGenerationFailure(error);
         if (failure) {

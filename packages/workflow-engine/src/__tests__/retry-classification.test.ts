@@ -358,7 +358,7 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
         expect(body.calls).toBe(1);
       });
 
-      it("gets the same verdict and text from a poll after a ledger round trip", async () => {
+      it("is classified as on main after a ledger round trip: retried", async () => {
         const body = failing(1, make);
         const run = await start(
           env,
@@ -367,15 +367,15 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
         expect(await run.execute(1)).toMatchObject({ outcome: "suspended" });
         const polled = await run.poll();
         const stage = await run.stage();
-        expect(stage.status).toBe(retryable ? "SUSPENDED" : "FAILED");
+        // The replay rebuilds a plain Error from the row's text.
+        expect(stage.status).toBe("SUSPENDED");
         // The poll records the bare message, as it always has.
         if (typeof text === "string") {
           expect(stage.errorMessage).toBe(text.slice(text.indexOf(": ") + 2));
         }
-        expect(polled.failed).toBe(retryable ? 0 : 1);
-        expect(await run.retryEvents()).toBe(retryable ? 1 : 0);
+        expect(polled.failed).toBe(0);
+        expect(await run.retryEvents()).toBe(1);
         expect(body.calls).toBe(1);
-        if (!retryable) return;
         // The retry re-opens the step, and the next replay runs it again.
         await run.poll();
         expect(await run.stage()).toMatchObject({
@@ -405,7 +405,7 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
         expect(body.calls).toBe(2);
       });
 
-      it("stays ordinary through the ledger and recovers on the poll retry", async () => {
+      it("replays through the ledger as on main", async () => {
         const body = failing(1, () => new Error(message));
         const run = await start(
           env,
@@ -413,6 +413,12 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
         );
         await run.execute(1);
         await run.poll();
+        if (message === new StepTimeoutError("call").message) {
+          // Main rebuilds this step's timeout text as StepTimeoutError.
+          expect(await run.stage()).toMatchObject({ status: "FAILED" });
+          expect(body.calls).toBe(1);
+          return;
+        }
         expect(await run.stage()).toMatchObject({ status: "SUSPENDED" });
         await run.poll();
         expect(await run.stage()).toMatchObject({ status: "COMPLETED" });
@@ -802,6 +808,159 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
         await run.poll();
         expect(body.calls).toBe(1);
       });
+
+      it("keeps the job retry main grants a redelivery that replays it", async () => {
+        const text = new StepTimeoutError("call").message;
+        const body = failing(1, () => new Error(text));
+        const run = await start(
+          env,
+          workflowOf("legacy-redeliver", storedStage(body)),
+        );
+        expect(await run.execute(1)).toMatchObject({ outcome: "suspended" });
+        await env.stepLedger.compareAndSet(
+          (await run.stage()).id,
+          "call",
+          { status: "failed", attempt: 1 },
+          { result: null },
+        );
+        env.clock.advance(POLL_GAP_MS);
+        // The acknowledgement was lost; attempt 2 of 3 replays the row.
+        expect(await run.execute(2)).toMatchObject({
+          outcome: "failed",
+          willRetry: true,
+        });
+        expect(body.calls).toBe(1);
+      });
+    });
+
+    describe("a branded failure with an unreadable diagnostic", () => {
+      it.each([
+        [
+          "a NonRetryableError with a throwing issues getter",
+          () => withThrowingGetter(new NonRetryableError("revoked"), "issues"),
+        ],
+        [
+          "a NonRetryableError with a throwing name getter",
+          () => withThrowingGetter(new NonRetryableError("revoked"), "name"),
+        ],
+        [
+          "another copy's terminal failure with a throwing issues getter",
+          () =>
+            withThrowingGetter(
+              fromAnotherEngineCopy("StepTimeoutError"),
+              "issues",
+            ),
+        ],
+      ])("stays terminal: %s", async (_case, make) => {
+        const body = failing(9, make);
+        const run = await start(
+          env,
+          workflowOf("brand-getter", directStage(body)),
+        );
+        expect(await run.execute(1)).toMatchObject({
+          outcome: "failed",
+          willRetry: false,
+        });
+        expect(body.calls).toBe(1);
+      });
+
+      it("stays terminal: a duplicate step key with a throwing issues getter", async () => {
+        const stage = defineStage({
+          id: "s",
+          name: "s",
+          schemas: { input: z.object({}), output: out, config: z.object({}) },
+          async execute(ctx) {
+            await ctx.step.run("call", async () => 1);
+            try {
+              await ctx.step.run("call", async () => 2);
+            } catch (error) {
+              throw withThrowingGetter(error as Error, "issues");
+            }
+            return { output: { ok: true } };
+          },
+        });
+        const run = await start(env, workflowOf("dup-getter", stage));
+        expect(await run.execute(1)).toMatchObject({
+          outcome: "failed",
+          willRetry: false,
+        });
+      });
+    });
+
+    describe("a retryIf that misbehaves", () => {
+      it("throwing an error whose message is a Symbol leaves the failure recorded and retried", async () => {
+        const body = failing(1, () => new QuotaError());
+        const run = await start(
+          env,
+          workflowOf(
+            "symbol-predicate",
+            directStage(body, {
+              retries: 1,
+              retryIf: () => {
+                const odd = new Error("x");
+                Object.defineProperty(odd, "message", { value: Symbol("odd") });
+                throw odd;
+              },
+            }),
+          ),
+        );
+        expect(await run.execute(1)).toMatchObject({ outcome: "suspended" });
+        const [row] = await env.stepLedger.list((await run.stage()).id);
+        expect(row).toMatchObject({ status: "failed", error: "over quota" });
+        await run.poll();
+        expect(await run.stage()).toMatchObject({ status: "COMPLETED" });
+        expect(body.calls).toBe(2);
+      });
+
+      it.each([
+        [
+          "a rejected Promise whose then getter throws",
+          () => {
+            const p = Promise.reject(new Error("no"));
+            Object.defineProperty(p, "then", {
+              get() {
+                throw new Error("then getter");
+              },
+            });
+            return p;
+          },
+        ],
+        [
+          "a rejected Promise subclass whose species getter throws",
+          () => {
+            class Odd extends Promise<boolean> {
+              static override get [Symbol.species](): PromiseConstructor {
+                throw new Error("species getter");
+              }
+            }
+            return Odd.reject(new Error("no"));
+          },
+        ],
+      ])("returning %s leaves no unhandled rejection", async (_case, result) => {
+        const unhandled: unknown[] = [];
+        const onUnhandled = (reason: unknown) => unhandled.push(reason);
+        process.on("unhandledRejection", onUnhandled);
+        try {
+          const body = failing(1, () => new QuotaError());
+          const run = await start(
+            env,
+            workflowOf(
+              "promise-predicate",
+              directStage(body, {
+                retries: 1,
+                retryIf: result as unknown as () => boolean,
+              }),
+            ),
+          );
+          expect(await run.execute(1)).toMatchObject({ outcome: "suspended" });
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          expect(unhandled).toEqual([]);
+          await run.poll();
+          expect(body.calls).toBe(2);
+        } finally {
+          process.off("unhandledRejection", onUnhandled);
+        }
+      });
     });
 
     describe.each(
@@ -896,33 +1055,6 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
             /^StepNotReplaySafeError: /,
           );
         }
-        expect(effects).toBe(1);
-      });
-
-      it("does not read a completed step's own result as a failure record", async () => {
-        let effects = 0;
-        const stage = defineStage({
-          id: "s",
-          name: "s",
-          schemas: { input: z.object({}), output: out, config: z.object({}) },
-          async execute(ctx) {
-            await ctx.step.run(
-              "call",
-              async () => {
-                effects++;
-                return { receipt: 42, __failure: { attempt: 1 } };
-              },
-              { onReclaim: "fail" },
-            );
-            throw new NonRetryableError("later");
-          },
-        });
-        const run = await start(env, workflowOf("collision", stage));
-        expect(await run.execute(1)).toMatchObject({ willRetry: false });
-        const again = await run.execute(2);
-        expect((again as { error: string }).error).toMatch(
-          /^StepNotReplaySafeError: /,
-        );
         expect(effects).toBe(1);
       });
     });
@@ -1022,7 +1154,7 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
             causeText: undefined,
           },
         ],
-      ])("is the same directly and after a replay: %s", async (_case, make, opts, expected) => {
+      ])("is %s directly, and a plain Error after a replay", async (_case, make, opts, expected) => {
         const seen: Array<Record<string, unknown>> = [];
         const run = await start(
           env,
@@ -1036,8 +1168,8 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
         expect(await run.stage()).toMatchObject({ status: "COMPLETED" });
         expect(seen).toHaveLength(2);
         expect(seen[0]).toMatchObject(expected);
-        expect(seen[1]).toMatchObject(expected);
-        expect(seen[1]!.causeText).toBe(seen[0]!.causeText);
+        // A replayed step failure is classified as on main: rebuilt from text.
+        expect(seen[1]).toMatchObject({ name: "Error", branded: false });
       });
     });
   });

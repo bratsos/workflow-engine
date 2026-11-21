@@ -7,7 +7,8 @@
  */
 export function toErrorMessage(error: unknown): string {
   try {
-    if (error instanceof Error) return error.message;
+    // Always a string: a non-string `message` (a Symbol) falls through to
+    // `String`, and anything that cannot convert reads as unprintable.
     if (typeof error === "object" && error !== null) {
       const { message } = error as { message?: unknown };
       if (typeof message === "string") return message;

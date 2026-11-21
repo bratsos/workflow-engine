@@ -87,6 +87,28 @@ describe("dead job verdict", () => {
     expect(await status()).toBe("RUNNING");
   });
 
+  it.each([
+    "name",
+    Symbol.for("@bratsos/workflow-engine/job-target-missing"),
+  ])("rethrows an executor error whose %s getter throws as it is", async (key) => {
+    const infra = new Error("cache unavailable");
+    Object.defineProperty(infra, key, {
+      get() {
+        throw new Error("getter");
+      },
+    });
+    const { kernel, jobTransport, message, status } = await claimedJob({
+      run: async () => {
+        throw infra;
+      },
+    });
+
+    await expect(
+      executeJobWithHeartbeat(kernel, { jobTransport, job: message }),
+    ).rejects.toBe(infra);
+    expect(await status()).toBe("RUNNING");
+  });
+
   it("still acknowledges a job whose run no longer exists as dead", async () => {
     const { kernel, jobTransport, message, status } = await claimedJob();
 

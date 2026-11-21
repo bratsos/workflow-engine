@@ -17,6 +17,7 @@ import {
   parseStepDuration,
   STEP_API_PENDING_CONTROL_FLOW,
   STEP_API_SETTLE_IN_FLIGHT,
+  STEP_TERMINAL_FAILURE,
   StepInFlight,
   StepLeaseLostError,
   StepLedgerNotConfiguredError,
@@ -29,13 +30,7 @@ import {
 } from "../../core/steps.js";
 import { AIServicesNotConfiguredError } from "../errors.js";
 import type { Clock, StepLedger, StepRecord } from "../ports.js";
-import { describeThrown } from "./error-message.js";
-import {
-  isRetryableStageError,
-  readStepFailure,
-  replayedStepError,
-  stepFailureResult,
-} from "./stage-error-class.js";
+import { toErrorMessage } from "./error-message.js";
 import { createStepAi } from "./step-ai.js";
 
 const DEFAULT_LEASE_MS = 5 * 60 * 1000;
@@ -119,29 +114,46 @@ function parkedResult<T>(record: StepRecord): T {
 }
 
 function storedError(record: StepRecord): Error {
-  const failure = readStepFailure(record);
-  // Only a wait, signal or sleep fails by timing out; a `run` body whose
-  // message reads like a timeout is still the body's own error, which its
-  // failure record says. A row with no record (written by an earlier
-  // release) replays exactly as it did there.
-  if (record.kind !== "run" || failure === undefined) {
-    const timeout = new StepTimeoutError(record.stepId);
-    if (record.error === timeout.message) return timeout;
-  }
-  const message =
-    record.error ?? `Durable step "${record.stepId}" previously failed`;
-  // The failure comes back under its original `name` and with the verdict
-  // of the first throw (see `replayedStepError`).
-  return replayedStepError(message, failure);
+  const timeout = new StepTimeoutError(record.stepId);
+  if (record.error === timeout.message) return timeout;
+  return new Error(
+    record.error ?? `Durable step "${record.stepId}" previously failed`,
+  );
 }
 
-/** Text for a value that may not even convert to a string. */
-function printable(value: unknown): string {
+/**
+ * Mark a failure this execution just recorded as one no retry can change.
+ * Only live throws carry the brand: a replay rebuilds the error from the
+ * row's text and gets main's verdict.
+ */
+function terminal<E extends Error>(error: E): E {
+  Object.defineProperty(error, STEP_TERMINAL_FAILURE, { value: true });
+  return error;
+}
+
+/**
+ * Keep a returned promise's rejection from going unhandled, even when its
+ * `then` or species getter throws: an own `constructor` of `Promise` lets
+ * `await` subscribe without reading either.
+ * shortcut: a frozen Promise subclass with a throwing species getter still
+ * escapes; nothing short of the engine owning the value can catch that.
+ */
+function settleQuietly(value: object): void {
   try {
-    return describeThrown(value).message;
+    Object.defineProperty(value, "constructor", {
+      value: Promise,
+      configurable: true,
+    });
   } catch {
-    return "(unprintable value)";
+    // Not extensible: `await` below still handles every ordinary promise.
   }
+  void (async () => {
+    try {
+      await value;
+    } catch {
+      // A rejected predicate result gives no verdict.
+    }
+  })();
 }
 
 /**
@@ -170,21 +182,20 @@ function retryIfDeclines(
     const retryIf = opts.retryIf;
     if (typeof retryIf !== "function") return false;
     const verdict: unknown = retryIf(error, { attempt });
+    if (verdict === false) return true;
     if (
-      typeof verdict === "object" &&
-      verdict !== null &&
-      typeof (verdict as { then?: unknown }).then === "function"
+      (typeof verdict === "object" && verdict !== null) ||
+      typeof verdict === "function"
     ) {
-      (verdict as Promise<unknown>).then(undefined, () => {});
+      settleQuietly(verdict);
       warn(
-        "retryIf returned a promise; it must return a boolean synchronously. Treating the failure as retryable",
+        "retryIf returned an object (a promise?); it must return a boolean synchronously. Treating the failure as retryable",
       );
-      return false;
     }
-    return verdict === false;
+    return false;
   } catch (predicateError) {
     warn(
-      `retryIf threw (${printable(predicateError)}); treating the failure as retryable`,
+      `retryIf threw (${toErrorMessage(predicateError)}); treating the failure as retryable`,
     );
     return false;
   }
@@ -491,7 +502,7 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
       error: error.message,
       leaseExpiresAt: null,
     });
-    if (!outcome.parked) throw error;
+    if (!outcome.parked) throw terminal(error);
     return outcome.record;
   }
 
@@ -602,30 +613,17 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
           const refused = await commitOutcome(id, "running", {
             status: "failed",
             error: error.message,
-            // The verdict travels with the row (read-only: the row stays
-            // failed exactly as before, only its replayed error is named).
-            // An engine refusal is no body verdict, so it leaves the step's
-            // own retries as they were.
-            result: stepFailureResult(error, record.attempt, {
-              final: true,
-              stop: false,
-            }),
             leaseExpiresAt: null,
           });
           if (refused.parked) return parkedResult<T>(refused.record);
-          throw error;
+          throw terminal(error);
         }
         record = await reclaim(id, record, leaseMs);
         shouldExecute = true;
         isReclaim = true;
       }
       if (!claimResult.created && record.status === "failed") {
-        // The replay the step's own retry runs in: unless the body gave up
-        // (`NonRetryableError`, a `retryIf` that said no), a failure with
-        // `retries` left is executed again.
-        if (record.attempt > retries || readStepFailure(record)?.stop) {
-          throw storedError(record);
-        }
+        if (record.attempt > retries) throw storedError(record);
         record = await reclaim(id, record, leaseMs);
         shouldExecute = true;
         isReclaim = true;
@@ -686,14 +684,12 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
           abortSignal,
         });
       } catch (error) {
-        const { message, name: originalName } = describeThrown(error);
-        // Two verdicts, recorded with the row. Step level: only a
+        const message = toErrorMessage(error);
+        // Decided for this throw only, never written to the row: a
         // `NonRetryableError`, or a `retryIf` that says no, stops the step's
-        // own `retries`; any other error is retried as asked. Stage level:
-        // what `isRetryableStageError` says about the error the stage will
-        // see, so the stage reaches the same verdict directly and after a
-        // round trip through the ledger. A `retryIf` refusal is always thrown
-        // as a `NonRetryableError` with the original as `cause`.
+        // own `retries`, and a refusal is thrown as a `NonRetryableError`
+        // with the original as `cause`. A replay of the row rebuilds a
+        // plain error from its text, as on main.
         const declined =
           !isNonRetryableError(error) &&
           retryIfDeclines(opts, error, record.attempt, options.onLog);
@@ -706,12 +702,6 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
         const failure = await commitOutcome(id, "running", {
           status: "failed",
           error: message,
-          result: stepFailureResult(thrown, record.attempt, {
-            final: !isRetryableStageError(thrown),
-            stop,
-            ...(declined ? { wrapped: true } : {}),
-            ...(declined && originalName ? { causeName: originalName } : {}),
-          }),
           leaseExpiresAt: null,
         });
         if (failure.parked) return parkedResult<T>(failure.record);

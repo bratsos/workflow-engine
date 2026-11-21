@@ -62,12 +62,21 @@ export class JobTargetMissingError extends Error {
  *   any other error with that name and text matches too; the branded error
  *   does not.
  *
- * An error with any other name or text is neither.
+ * An error with any other name or text is neither, and so is one whose
+ * fields cannot be read (a throwing getter): the caller rethrows it as is.
  */
 export function isJobTargetMissingError(
   error: unknown,
   target: JobTarget,
 ): boolean {
+  try {
+    return matchesJobTarget(error, target);
+  } catch {
+    return false;
+  }
+}
+
+function matchesJobTarget(error: unknown, target: JobTarget): boolean {
   if (typeof error !== "object" || error === null) return false;
   const candidate = error as {
     [JOB_TARGET_MISSING]?: unknown;

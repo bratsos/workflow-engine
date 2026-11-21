@@ -338,11 +338,12 @@ export function isStepControlFlowError(
 }
 
 /**
- * Cross-bundle brand for a step failure no retry can change: an expired wait,
- * a refused replay, and a failure the stage classifier rejected as a ledger
- * replay rethrows it. `isRetryableStageError` reads it, so another copy of
- * this release or a later one reaches the same verdict (earlier releases
- * throw these classes without it, and a JSON round trip drops it).
+ * Cross-bundle brand for a step failure no retry can change: an expired wait
+ * or a refused replay, as the execution that records it throws it (a replay
+ * rebuilt from the ledger row does not carry it). `isRetryableStageError`
+ * reads it, so another copy of this release or a later one reaches the same
+ * verdict (earlier releases throw these classes without it, and a JSON round
+ * trip drops it).
  */
 export const STEP_TERMINAL_FAILURE: unique symbol = Symbol.for(
   "@bratsos/workflow-engine/terminal-step-failure",
@@ -350,7 +351,6 @@ export const STEP_TERMINAL_FAILURE: unique symbol = Symbol.for(
 
 /** Thrown after a durable wait reaches its original, non-sliding deadline. */
 export class StepTimeoutError extends Error {
-  readonly [STEP_TERMINAL_FAILURE] = true as const;
   readonly stepId: string;
 
   constructor(stepId: string) {
@@ -380,7 +380,6 @@ export class StepLedgerWriteError extends Error {
  * would carry so an operator can go and look.
  */
 export class StepNotReplaySafeError extends Error {
-  readonly [STEP_TERMINAL_FAILURE] = true as const;
   readonly stepId: string;
   readonly externalKey: string;
 
