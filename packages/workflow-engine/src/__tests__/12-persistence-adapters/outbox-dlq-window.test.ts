@@ -104,13 +104,14 @@ describe.skipIf(!sqlite && !databaseUrl)(
     const flush = () => kernel.dispatch({ type: "outbox.flush" as const });
 
     // Tests that take the delivery schema step back run DDL. On PostgreSQL it
-    // gives up after 5 s behind another session's lock instead of queueing
-    // for the test timeout, and every DDL statement goes through here.
+    // gives up after 2 s behind another session's lock (`55P03`), well inside
+    // the 5 s transaction timeout, instead of queueing for the test timeout,
+    // and every DDL statement goes through here.
     const alterSchema = (sql: string) =>
       sqlite
         ? client.$executeRawUnsafe(sql)
         : client.$transaction(async (tx: typeof client) => {
-            await tx.$executeRawUnsafe("SET LOCAL lock_timeout = '5s'");
+            await tx.$executeRawUnsafe("SET LOCAL lock_timeout = '2s'");
             await tx.$executeRawUnsafe(sql);
           });
     const DELIVERY_INDEXES = [
@@ -124,25 +125,42 @@ describe.skipIf(!sqlite && !databaseUrl)(
       ],
       ["outbox_events_delivery_cursor_idx", '"deliveryClaim", "workflowRunId"'],
     ] as const;
-    /** Puts the delivery column and indexes back, whichever test took them. */
+    /**
+     * Puts the delivery column and indexes back, whichever test took them. It
+     * reads the catalog first and runs DDL only for what is missing: even
+     * `CREATE INDEX IF NOT EXISTS` waits for a lock on PostgreSQL.
+     */
     async function restoreDeliverySchema() {
       const reader =
         major === "8" ? client.$withColumns({ name: "text" }) : client;
-      const columns: Array<{ name: string }> = await reader.$queryRawUnsafe(
+      const names = async (sql: string) =>
+        new Set(
+          ((await reader.$queryRawUnsafe(sql)) as Array<{ name: string }>).map(
+            (row) => row.name,
+          ),
+        );
+      const columns = await names(
         sqlite
           ? "SELECT name FROM pragma_table_info('outbox_events')"
           : "SELECT column_name AS name FROM information_schema.columns WHERE table_name = 'outbox_events' AND table_schema = current_schema()",
       );
-      for (const { name } of columns)
-        if (name === "legacyClaim" || name === "preUpgradeClaim")
+      for (const name of ["legacyClaim", "preUpgradeClaim"])
+        if (columns.has(name))
           await alterSchema(
             `ALTER TABLE "outbox_events" RENAME COLUMN "${name}" TO "deliveryClaim"`,
           );
+      const indexes = await names(
+        sqlite
+          ? "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'outbox_events'"
+          : "SELECT indexname AS name FROM pg_indexes WHERE tablename = 'outbox_events' AND schemaname = current_schema()",
+      );
       for (const [name, indexed] of DELIVERY_INDEXES)
-        await alterSchema(
-          `CREATE INDEX IF NOT EXISTS "${name}" ON "outbox_events" (${indexed})`,
-        );
+        if (!indexes.has(name))
+          await alterSchema(
+            `CREATE INDEX "${name}" ON "outbox_events" (${indexed})`,
+          );
     }
+
     const replay = () =>
       kernel.dispatch({ type: "plugin.replayDLQ" as const, maxEvents: 10 });
 
@@ -1000,6 +1018,40 @@ describe.skipIf(!sqlite && !databaseUrl)(
         `r9223372036854775807|${lease}`,
       ]);
     });
+
+    it.skipIf(sqlite)(
+      "restores the delivery schema without waiting for a lock when nothing is missing",
+      async () => {
+        // Another session's open claim transaction holds the table's lock.
+        let release!: () => void;
+        const held = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        let locked!: () => void;
+        const lockTaken = new Promise<void>((resolve) => {
+          locked = resolve;
+        });
+        const holder = client.$transaction(
+          async (tx: typeof client) => {
+            await tx.$executeRawUnsafe(
+              'UPDATE "outbox_events" SET "retryCount" = "retryCount" WHERE false',
+            );
+            locked();
+            await held;
+          },
+          { timeout: 15_000 },
+        );
+        await lockTaken;
+        const start = performance.now();
+        try {
+          await restoreDeliverySchema();
+          expect(performance.now() - start).toBeLessThan(1_000);
+        } finally {
+          release();
+          await holder;
+        }
+      },
+    );
 
     it("names the schema step when the delivery column or its indexes are missing, and keeps the events", async () => {
       await seedEvent("a-schema");
