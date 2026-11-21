@@ -21,7 +21,11 @@ import {
   normalizeAnnotateArgs,
   toErrorMessage,
 } from "@bratsos/workflow-engine/kernel";
-import type { BufferedProgress } from "../protocol.js";
+import {
+  ActivityReportSchema,
+  type BufferedProgress,
+  type PollResponse,
+} from "../protocol.js";
 import type { OrchestratorTransport } from "../transport.js";
 
 export interface RemoteExecutorOptions {
@@ -86,9 +90,13 @@ export function createRemoteExecutor(
         };
       }
 
-      // Fix 5: use stageRecordId as a stable taskId so a re-dispatch after a
-      // broker restart is idempotent (not a duplicate task).
-      const stableTaskId = stageRecordId;
+      // Fix 5: a stable taskId per stage record and attempt, so a re-dispatch
+      // of the same attempt (a broker restart, a lost acknowledgement) is
+      // idempotent, while a retry the kernel granted is a new task instead of
+      // the previous attempt's report played back. Attempt 1 keeps the bare
+      // record id, as before.
+      const stableTaskId =
+        attempt > 1 ? `${stageRecordId}-attempt-${attempt}` : stageRecordId;
 
       // Submit args captured for potential re-submit on "unknown" state.
       const submitArgs = {
@@ -105,14 +113,28 @@ export function createRemoteExecutor(
         taskId: stableTaskId,
       };
 
-      // Submit to broker
-      const submitted = await transport.submit(submitArgs);
+      // The worker stores its report under the broker's default prefix
+      // before it reports. A task the broker no longer knows that already
+      // reported (a broker restart after a lost acknowledgement or a lost
+      // process) is answered from that report rather than run again.
+      const reportKey = `remote-activity/${workflowRunId}/${stageId}/${stableTaskId}/report.json`;
+      const durableReport = async (): Promise<PollResponse | undefined> => {
+        const raw = await deps.blobStore.get(reportKey).catch(() => undefined);
+        const parsed = ActivityReportSchema.safeParse(raw);
+        if (!parsed.success || parsed.data.taskId !== stableTaskId) return;
+        const { outcome, logs, annotations, progress } = parsed.data;
+        return { state: "reported", outcome, logs, annotations, progress };
+      };
 
-      const { taskId } = submitted;
+      // Submit to broker, unless this task already reported.
+      let poll = await durableReport();
+      const taskId = poll
+        ? stableTaskId
+        : (await transport.submit(submitArgs)).taskId;
 
       // Block until the worker reports (or deadline/failure)
       const MAX_ITERS = 10_000;
-      let poll = await transport.poll(taskId);
+      poll ??= await transport.poll(taskId);
       let iters = 0;
       let resubmits = 0;
 
@@ -124,6 +146,11 @@ export function createRemoteExecutor(
         // Fix 5: broker forgot the task (e.g. broker restart). Re-submit the
         // same task (idempotent due to stable taskId) and keep polling.
         if (poll.state === "unknown") {
+          const reported = await durableReport();
+          if (reported) {
+            poll = reported;
+            break;
+          }
           if (resubmits < MAX_ITERS) {
             await transport.submit(submitArgs);
             resubmits++;
