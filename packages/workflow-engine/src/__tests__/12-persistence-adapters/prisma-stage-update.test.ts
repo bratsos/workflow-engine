@@ -30,6 +30,7 @@ describe("PrismaWorkflowPersistence stage updates", () => {
   it("writes attempt through upsertStage on a job retry", async () => {
     const upsert = vi.fn(async (args: any) => stageRow(args.update));
     const prisma = {
+      $queryRawUnsafe: vi.fn(),
       workflowStage: { upsert },
     } as unknown as EnginePrismaClient;
     const persistence = new PrismaWorkflowPersistence(prisma);
@@ -57,6 +58,7 @@ describe("PrismaWorkflowPersistence stage updates", () => {
   it("writes attempt and a null errorMessage through updateStage", async () => {
     const update = vi.fn(async (args: any) => stageRow(args.data));
     const prisma = {
+      $queryRawUnsafe: vi.fn(),
       workflowStage: { update },
     } as unknown as EnginePrismaClient;
     const persistence = new PrismaWorkflowPersistence(prisma);
@@ -75,6 +77,7 @@ describe("PrismaWorkflowPersistence stage updates", () => {
   it("leaves attempt untouched when the update does not name it", async () => {
     const update = vi.fn(async (args: any) => stageRow(args.data));
     const prisma = {
+      $queryRawUnsafe: vi.fn(),
       workflowStage: { update },
     } as unknown as EnginePrismaClient;
     const persistence = new PrismaWorkflowPersistence(prisma);

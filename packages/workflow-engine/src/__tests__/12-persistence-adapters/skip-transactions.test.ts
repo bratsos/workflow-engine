@@ -9,6 +9,7 @@ describe("skipInteractiveTransactions", () => {
     // the mock doesn't implement the full EnginePrismaClient shape. Cast
     // rather than widen the constructor's real parameter type.
     const mockPrisma = {
+      $queryRawUnsafe: vi.fn(),
       $transaction: vi.fn(),
     } as unknown as EnginePrismaClient;
     const persistence = new PrismaWorkflowPersistence(mockPrisma, {
@@ -27,6 +28,7 @@ describe("skipInteractiveTransactions", () => {
 
   it("uses $transaction when skipInteractiveTransactions is false", async () => {
     const mockPrisma = {
+      $queryRawUnsafe: vi.fn(),
       $transaction: vi.fn(async (fn: any) => fn(mockPrisma)),
     } as unknown as EnginePrismaClient;
     const persistence = new PrismaWorkflowPersistence(mockPrisma, {

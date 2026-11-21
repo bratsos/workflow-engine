@@ -165,6 +165,7 @@ const EVENT_COLUMNS: RawColumns = {
   eventType: "text",
   occurredAt: "timestamp",
   publishedAt: "timestamp",
+  deliveryClaim: "text",
   retryCount: "int",
   dlqAt: "timestamp",
 };
@@ -360,6 +361,7 @@ interface RawEventRow {
   eventType: string;
   occurredAt: RawTimestamp;
   publishedAt: RawNullableTimestamp;
+  deliveryClaim: string | null;
   retryCount: number | bigint;
   dlqAt: RawNullableTimestamp;
 }
@@ -548,6 +550,19 @@ function mapRunEvent(row: RawEventRow): RunEvent {
     eventType: String(row.eventType),
     occurredAt: toDate(row.occurredAt) ?? new Date(0),
     publishedAt: toDate(row.publishedAt),
+    ...(row.publishedAt === null &&
+    row.dlqAt === null &&
+    row.deliveryClaim &&
+    row.deliveryClaim.length > 24
+      ? {
+          claimExpiresAt: new Date(
+            // A ranked claim is `r`, 19 rank digits and `|` before the expiry.
+            row.deliveryClaim.startsWith("r")
+              ? row.deliveryClaim.slice(21, 45)
+              : row.deliveryClaim.slice(0, 24),
+          ),
+        }
+      : {}),
     retryCount: toNumber(row.retryCount),
     dlqAt: toDate(row.dlqAt),
   };
@@ -958,6 +973,29 @@ export class PrismaConsoleReadPort implements ConsoleReadPort {
         : NO_LIMIT_MS;
     const maxWait = ms > 0 ? ms : NO_LIMIT_MS;
     try {
+      // A SQLite file another Prisma major wrote answers every date filter and
+      // cursor wrongly: refuse it with the engine's own check (one statement
+      // per client, shared with the engine's adapters). Loaded only for
+      // SQLite. Queued behind a transaction, it gives up as the read would.
+      if (!postgres) {
+        const engine = "@bratsos/workflow-engine/persistence";
+        const check: Promise<void> = (
+          await import(engine)
+        ).assertSqliteDateStorage(this.prisma);
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await Promise.race([
+            check,
+            new Promise<never>((_, reject) => {
+              if (ms > 0)
+                timer = setTimeout(() => reject(new ConnectionWait()), maxWait);
+            }),
+          ]);
+        } finally {
+          clearTimeout(timer);
+          check.catch(() => {});
+        }
+      }
       if (
         (ms > 0 || snapshot) &&
         typeof this.prisma.$transaction === "function"
@@ -1423,7 +1461,7 @@ LIMIT ${logLimit + 1}`,
         const eventRows = await this.select<RawEventRow>(
           client,
           EVENT_COLUMNS,
-          `SELECT id, "workflowRunId", sequence, "eventType", "occurredAt", "publishedAt",
+          `SELECT id, "workflowRunId", sequence, "eventType", "occurredAt", "publishedAt", "outbox_events"."deliveryClaim",
        "retryCount", "dlqAt"
 FROM "outbox_events" WHERE "workflowRunId" = ${this.param(1)}
 ORDER BY sequence ASC
@@ -1697,7 +1735,7 @@ ORDER BY sequence ASC LIMIT 1`,
       return this.select<RawEventRow>(
         client,
         EVENT_COLUMNS,
-        `SELECT id, "workflowRunId", sequence, "eventType", "occurredAt", "publishedAt",
+        `SELECT id, "workflowRunId", sequence, "eventType", "occurredAt", "publishedAt", "outbox_events"."deliveryClaim",
        "retryCount", "dlqAt"
 FROM "outbox_events" WHERE "workflowRunId" = ${this.param(1)} AND sequence >= ${this.param(2)} AND sequence <= ${this.param(3)}
 ORDER BY sequence ASC LIMIT ${clampedLimit}`,

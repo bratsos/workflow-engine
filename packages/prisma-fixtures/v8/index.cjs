@@ -29,3 +29,5 @@ exports.createPostgresDb = (url, { max } = {}) => {
 
 exports.createSqliteDb = (file) =>
   require("../v8-sqlite").createSqliteDb(file);
+
+exports.openSqliteDb = (file) => require("../v8-sqlite").openSqliteDb(file);

@@ -132,6 +132,7 @@ describe("PrismaWorkflowPersistence.acquireIdempotencyKey on Postgres", () => {
       createdAt: now,
     }));
     const prisma = {
+      $queryRawUnsafe: vi.fn(),
       idempotencyKey: { create, createMany, findUnique },
     } as unknown as EnginePrismaClient;
     const persistence = new PrismaWorkflowPersistence(prisma);

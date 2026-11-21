@@ -4,7 +4,7 @@
  * object. The built-in hosts keep passing full ones.
  */
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { defineWorkflow } from "../../core/workflow.js";
 import {
@@ -12,6 +12,7 @@ import {
   HOST_DEFAULTS,
   runMaintenanceTick,
 } from "../../kernel/helpers/host-support.js";
+import type { EventSink } from "../../kernel/ports.js";
 import { createTestKernel } from "../utils/index.js";
 
 const In = z.object({ value: z.number() });
@@ -61,6 +62,117 @@ describe("host support defaults", () => {
     const counts = await runMaintenanceTick(kernel, { workerId: "w-1" });
     expect(counts.claimed).toBe(1);
     expect(counts.eventsFlushed).toBeGreaterThan(0);
+  });
+
+  it("continues maintenance when the event sink never settles", async () => {
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const { kernel } = createTestKernel<EventSink>([workflow], {
+      eventSink: {
+        async emit() {
+          await blocked;
+        },
+      },
+    });
+    await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "blocked-sink",
+      workflowId: "host-defaults",
+      input: { value: 1 },
+    });
+    const tick = runMaintenanceTick(kernel, { outboxFlushTimeoutMs: 5 });
+    const result = await Promise.race([
+      tick,
+      new Promise<"unbounded">((resolve) =>
+        setTimeout(() => resolve("unbounded"), 100),
+      ),
+    ]);
+    release();
+    await tick;
+    expect(result).not.toBe("unbounded");
+    if (result !== "unbounded") expect(result.eventSinkStatus).toBe("degraded");
+  });
+
+  it("stops a timed-out flush from claiming the next event after the sink settles", async () => {
+    let entered!: () => void;
+    let resume!: () => void;
+    const started = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      resume = resolve;
+    });
+    const attempted: number[] = [];
+    const { kernel, persistence } = createTestKernel<EventSink>([], {
+      eventSink: {
+        async emit(_, metadata) {
+          attempted.push(metadata!.sequence);
+          entered();
+          await gate;
+        },
+      },
+    });
+    await persistence.appendOutboxEvents(
+      Array.from({ length: 3 }, () => ({
+        workflowRunId: "timeout",
+        eventType: "workflow:created",
+        payload: {},
+        occurredAt: new Date(),
+        causationId: "timeout",
+      })),
+    );
+    const dispatch = kernel.dispatch.bind(kernel);
+    let flushing: Promise<unknown> | undefined;
+    const tracked = {
+      ...kernel,
+      dispatch: ((command: Parameters<typeof dispatch>[0]) => {
+        const result = dispatch(command);
+        if (command.type === "outbox.flush") flushing = result;
+        return result;
+      }) as typeof kernel.dispatch,
+    };
+    const tick = runMaintenanceTick(tracked, { outboxFlushTimeoutMs: 50 });
+    try {
+      await started;
+      expect(await tick).toMatchObject({ eventSinkStatus: "degraded" });
+    } finally {
+      resume();
+    }
+    expect(await flushing).toMatchObject({ published: 1 });
+    expect(attempted).toEqual([1]);
+  });
+
+  it("logs a delivery write error and reports degraded while leaving the claim recoverable", async () => {
+    const { kernel, persistence, clock } = createTestKernel([workflow]);
+    await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "write-error",
+      workflowId: "host-defaults",
+      input: { value: 1 },
+    });
+    const complete = persistence.completeOutboxDelivery.bind(persistence);
+    persistence.completeOutboxDelivery = async () => {
+      throw new Error("write failed");
+    };
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const counts = await runMaintenanceTick(kernel);
+      expect(counts.eventSinkStatus).toBe("degraded");
+      expect(counts.eventSinkError).toContain("write failed");
+      expect(log).toHaveBeenCalledWith(
+        expect.stringContaining("outbox.flush error"),
+        expect.objectContaining({ message: "write failed" }),
+      );
+    } finally {
+      persistence.completeOutboxDelivery = complete;
+      log.mockRestore();
+    }
+    clock.advance(65_001);
+    expect(
+      (await kernel.dispatch({ type: "outbox.flush" })).published,
+    ).toBeGreaterThan(0);
   });
 
   it("executes a job with only the transport and the job", async () => {

@@ -1,6 +1,8 @@
 // packages/workflow-engine-host-serverless/src/run-to-completion.ts
 import {
+  assertTimerMs,
   executeJobWithHeartbeat,
+  flushOutboxWithin,
   HOST_DEFAULTS,
   type JobTransport,
   type Kernel,
@@ -86,6 +88,8 @@ export interface RunToCompletionOptions {
   flushOutbox?: boolean;
   /** Max events published by that final flush. Defaults to 100. */
   maxOutboxFlush?: number;
+  /** Maximum time spent waiting for the final outbox flush (default 5,000 ms). */
+  outboxFlushTimeoutMs?: number;
   /** Log prefix for the job loop. Defaults to `"[runToCompletion]"`. */
   logPrefix?: string;
 }
@@ -169,8 +173,12 @@ export async function runToCompletion(
     jobHeartbeatIntervalMs = HOST_DEFAULTS.jobHeartbeatIntervalMs,
     flushOutbox = true,
     maxOutboxFlush = HOST_DEFAULTS.maxOutboxFlushPerTick,
+    outboxFlushTimeoutMs = HOST_DEFAULTS.outboxFlushTimeoutMs,
     logPrefix = "[runToCompletion]",
   } = options;
+  // Before the run is created: a bad option must not leave one behind.
+  assertTimerMs("jobHeartbeatIntervalMs", jobHeartbeatIntervalMs);
+  assertTimerMs("outboxFlushTimeoutMs", outboxFlushTimeoutMs);
 
   const created = await kernel.dispatch(command);
   const workflowRunId = created.workflowRunId;
@@ -246,10 +254,13 @@ export async function runToCompletion(
     // Best effort: the events are already durable in the outbox, and a
     // publish failure must not turn a finished run into a thrown request.
     try {
-      await kernel.dispatch({
-        type: "outbox.flush",
-        maxEvents: maxOutboxFlush,
-      });
+      const outcome = await flushOutboxWithin(
+        kernel,
+        maxOutboxFlush,
+        outboxFlushTimeoutMs,
+      );
+      if (outcome === undefined)
+        console.error(`${logPrefix} outbox.flush timed out`);
     } catch (error) {
       console.error(`${logPrefix} outbox.flush failed:`, error);
     }

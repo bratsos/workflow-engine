@@ -31,6 +31,7 @@ import type {
   EnqueueJobInput,
   JobAckFence,
   JobAckOutcome,
+  JobQueueStats,
   JobRecord,
   PersistenceCore,
 } from "../persistence/interface";
@@ -40,6 +41,9 @@ import type { KernelEvent } from "./events";
 
 // Re-export record and input types for convenience
 export type {
+  ActiveStatus,
+  ActiveStatusCounts,
+  ActiveWorkStats,
   AnnotationActor,
   AnnotationFilters,
   AnnotationScope,
@@ -58,6 +62,7 @@ export type {
   JobAckFence,
   JobAckOutcome,
   JobQueueFairness,
+  JobQueueStats,
   JobRecord,
   OutboxRecord,
   ServedDefinition,
@@ -414,6 +419,24 @@ export interface JobTransport {
   touchJob(jobId: string): Promise<void>;
 
   /**
+   * Optional. Jobs in each active status and the creation time of the oldest
+   * PENDING one, for `engine.stats`. Bounded: active rows only, served by an
+   * index that leads with `status`, no writes. A transport with no queue it
+   * can count (a push queue, say) omits it, and `engine.stats` reports
+   * `jobs` as `{ available: false }`.
+   */
+  getJobStats?(): Promise<JobQueueStats>;
+
+  /**
+   * Optional. Resolves when the storage behind the queue is fit to run on and
+   * rejects when it is not, so a host can refuse to start instead of logging
+   * the same failure on every tick: the SQLite adapters reject, with
+   * `SqliteDateStorageError`, a file whose dates another Prisma major stored.
+   * Cheap and read-only; omit it when there is nothing to check.
+   */
+  verifyStorage?(): Promise<void>;
+
+  /**
    * Optional. Offer the host's `workerId` to the transport, so the id
    * stamped on `job_queue.workerId` is the one that identifies the
    * process — transports are usually constructed before the host and
@@ -431,9 +454,22 @@ export interface JobTransport {
 // EventSink
 // ============================================================================
 
+/**
+ * Metadata for one durable outbox event. Deduplicate by `eventId`.
+ * `workflowRunId` and `sequence` order a run's events, but are not a
+ * permanent identity: deleting its newest outbox rows can allow the Prisma
+ * adapter to reuse a sequence.
+ */
+export interface OutboxDeliveryMetadata {
+  readonly eventId: string;
+  readonly workflowRunId: string;
+  readonly sequence: number;
+  readonly attempt: number;
+}
+
 /** Event publishing (replaces global EventBus). */
 export interface EventSink {
-  emit(event: KernelEvent): Promise<void>;
+  emit(event: KernelEvent, delivery?: OutboxDeliveryMetadata): Promise<void>;
 }
 
 // ============================================================================

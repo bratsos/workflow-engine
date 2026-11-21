@@ -1588,6 +1588,27 @@ WHERE n.nspname = 'console_plan_statistics' AND c.relkind = 'r'`,
       }
     });
 
+    it.each([
+      "",
+      "r0000000000000000042|",
+    ])("exposes the expiry of an unpublished delivery claim (rank prefix %j)", async (rank) => {
+      const expiry = new Date("2099-01-01T00:00:00.000Z");
+      await prisma.outboxEvent.updateMany({
+        where: { id: "evt-1" },
+        data: {
+          publishedAt: null,
+          deliveryClaim: `${rank}${expiry.toISOString()}|owner`,
+        },
+      });
+      expect((await reader().getRunDetail("run-1"))?.events[0]).toMatchObject({
+        publishedAt: null,
+        claimExpiresAt: expiry,
+      });
+      expect((await reader().listRunEvents("run-1", 0))[0]).toMatchObject({
+        claimExpiresAt: expiry,
+      });
+    });
+
     it("counts the queue and finds the oldest pending job and lease", async () => {
       const health = await reader().getQueueHealth();
       expect(health.countsByStatus.PENDING).toBe(2);

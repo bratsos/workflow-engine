@@ -10,16 +10,22 @@
  */
 
 import {
+  assertTimerMs,
   createEventSinkMonitor,
   type EventSinkHealth,
   type EventSinkMonitor,
   executeJobWithHeartbeat,
+  flushOutboxWithin,
   HOST_DEFAULTS,
   type JobTransport,
   type Kernel,
+  type MaintenanceTickCounts,
+  type MaintenanceTickHook,
   type RetentionOptions,
   runMaintenanceTick as runMaintenanceTickCommands,
+  runTickHook,
   type ServedDefinition,
+  toErrorMessage,
   toEventSinkObservation,
 } from "@bratsos/workflow-engine/kernel";
 
@@ -37,10 +43,14 @@ export interface NodeHostConfig {
   /** Unique worker identifier. */
   workerId: string;
 
-  /** Orchestration poll interval in milliseconds (default: 10_000). */
+  /**
+   * Orchestration poll interval in milliseconds (default: 10_000). Must be a number from 1 to 2147483647 (a timer honours nothing else); anything else throws a `RangeError` from `createNodeHost`.
+   */
   orchestrationIntervalMs?: number;
 
-  /** Job dequeue poll interval when queue is empty (default: 1_000). */
+  /**
+   * Job dequeue poll interval when queue is empty (default: 1_000). Must be a number from 1 to 2147483647 (a timer honours nothing else); anything else throws a `RangeError` from `createNodeHost`.
+   */
   jobPollIntervalMs?: number;
 
   /**
@@ -62,6 +72,9 @@ export interface NodeHostConfig {
    * It costs latency only while the worker is following a run it just
    * advanced: the pause is skipped as soon as the loop sees work from
    * another run (a backlog), and resumes when the queue next runs dry.
+   *
+   * Must be a number from 0 to 2147483647; anything else throws a
+   * `RangeError` from `createNodeHost`.
    *
    * Set to `0` to disable it entirely and restore the pre-0.4.4 behaviour
    * (lowest latency for a single-worker deployment; a multi-worker one
@@ -96,6 +109,8 @@ export interface NodeHostConfig {
 
   /** Max outbox events to flush per tick (default: 100). */
   maxOutboxFlushPerTick?: number;
+  /** Maximum time a maintenance tick waits for the outbox flush (default: 5,000 ms). */
+  outboxFlushTimeoutMs?: number;
 
   /**
    * Delete finished runs older than `retention.olderThanMs` (with their
@@ -105,13 +120,42 @@ export interface NodeHostConfig {
    */
   retention?: RetentionOptions;
 
-  /** Job lease heartbeat interval in milliseconds (default: 60_000). */
+  /**
+   * Called after every orchestration tick with a copy of the counts that tick
+   * computed (changing it affects nothing else). Use it to export gauges or
+   * counters (combine it with the `engine.stats` command for queue depth and
+   * age).
+   *
+   * The hook runs outside the tick: ticks never wait for it, so whatever it
+   * does cannot delay claiming, polling, lease reaping or the outbox flush. At
+   * most one call is in flight. A tick that finds the previous call still
+   * running skips the hook and logs one warning (with how long the call has
+   * run) the first time that happens, then calls it again after it settles.
+   * The warning is not repeated while the hook stays slower than the interval:
+   * it is logged again only after a call has finished without any tick
+   * skipping it. A hook that throws or rejects is caught and logged; it never
+   * stops the loop.
+   *
+   * `stop()` waits for a running hook for at most `shutdownTimeoutMs` and no
+   * hook starts once it began, so a hook must not await `host.stop()`: the
+   * call waits for the hook that is waiting for it until the timeout elapses
+   * (a hook may call `void host.stop()`).
+   */
+  onTick?: MaintenanceTickHook;
+
+  /**
+   * Job lease heartbeat interval in milliseconds (default: 60_000). Must be a number from 1 to 2147483647 (a timer honours nothing else); anything else throws a `RangeError` from `createNodeHost`.
+   */
   jobHeartbeatIntervalMs?: number;
 
   /**
-   * Upper bound (ms) on `stop()`: how long to wait for the in-flight job
-   * to finish, and separately for the final `outbox.flush`, before giving
-   * up on each (default: 10_000). Errors are logged, never thrown.
+   * Upper bound (ms) on `stop()`: how long to wait for the in-flight tick
+   * and `onTick` call, then for the in-flight job to finish, and separately
+   * for the final `outbox.flush`, before giving up on each (default:
+   * 10_000). Errors are logged, never thrown. Must be a number from 1 to
+   * 2147483647; anything else throws a `RangeError` from `createNodeHost`,
+   * and nothing switches the bound off (pass 2147483647 to wait for
+   * practically anything).
    */
   shutdownTimeoutMs?: number;
 
@@ -154,6 +198,21 @@ class NodeHostImpl implements NodeHost {
   private jobLoop: Promise<void> | null = null;
   /** The orchestration tick currently running, if any. */
   private tickInFlight: Promise<void> | null = null;
+  /** `start()` while it is still verifying the storage, so a second call joins it. */
+  private starting: Promise<void> | null = null;
+  /** Incremented by every stop(), so a start whose storage check settles after it does not begin. */
+  private lifecycle = 0;
+  /** The `onTick` call currently running, if any. */
+  private hookInFlight: Promise<void> | null = null;
+  private hookStartedAt = 0;
+  /** A tick skipped the hook while the current call ran. */
+  private hookSkippedDuringCall = false;
+  /**
+   * The skip warning was logged and no call has since finished without a
+   * tick skipping it: a hook slower than the interval is one episode, however
+   * many calls it takes.
+   */
+  private hookSkipLogged = false;
 
   private readonly kernel: Kernel;
   private readonly jobTransport: JobTransport;
@@ -168,7 +227,9 @@ class NodeHostImpl implements NodeHost {
   private readonly serves: readonly ServedDefinition[] | "all" | undefined;
   private readonly maxSuspendedChecksPerTick: number;
   private readonly maxOutboxFlushPerTick: number;
+  private readonly outboxFlushTimeoutMs: number;
   private readonly retention: RetentionOptions | undefined;
+  private readonly onTick: MaintenanceTickHook | undefined;
   private readonly jobHeartbeatIntervalMs: number;
   private readonly shutdownTimeoutMs: number;
   private readonly flushOutboxOnStop: boolean;
@@ -178,9 +239,20 @@ class NodeHostImpl implements NodeHost {
     this.kernel = config.kernel;
     this.jobTransport = config.jobTransport;
     this.workerId = config.workerId;
-    this.orchestrationIntervalMs = config.orchestrationIntervalMs ?? 10_000;
-    this.jobPollIntervalMs = config.jobPollIntervalMs ?? 1_000;
-    this.postJobYieldMs = config.postJobYieldMs ?? this.jobPollIntervalMs;
+    this.orchestrationIntervalMs = assertTimerMs(
+      "orchestrationIntervalMs",
+      config.orchestrationIntervalMs ?? 10_000,
+    );
+    this.jobPollIntervalMs = assertTimerMs(
+      "jobPollIntervalMs",
+      config.jobPollIntervalMs ?? 1_000,
+    );
+    // `0` turns the pause off (see the option); nothing is then timed.
+    this.postJobYieldMs = assertTimerMs(
+      "postJobYieldMs",
+      config.postJobYieldMs ?? this.jobPollIntervalMs,
+      { allowZero: true },
+    );
     this.staleLeaseThresholdMs =
       config.staleLeaseThresholdMs ?? HOST_DEFAULTS.staleLeaseThresholdMs;
     this.jobAbsoluteTimeoutMs =
@@ -193,10 +265,28 @@ class NodeHostImpl implements NodeHost {
       HOST_DEFAULTS.maxSuspendedChecksPerTick;
     this.maxOutboxFlushPerTick =
       config.maxOutboxFlushPerTick ?? HOST_DEFAULTS.maxOutboxFlushPerTick;
+    this.outboxFlushTimeoutMs = assertTimerMs(
+      "outboxFlushTimeoutMs",
+      config.outboxFlushTimeoutMs ?? HOST_DEFAULTS.outboxFlushTimeoutMs,
+    );
     this.retention = config.retention;
-    this.jobHeartbeatIntervalMs =
-      config.jobHeartbeatIntervalMs ?? HOST_DEFAULTS.jobHeartbeatIntervalMs;
-    this.shutdownTimeoutMs = config.shutdownTimeoutMs ?? 10_000;
+    if (config.onTick !== undefined && typeof config.onTick !== "function") {
+      throw new TypeError(
+        `onTick must be a function, got ${toErrorMessage(config.onTick)}.`,
+      );
+    }
+    this.onTick = config.onTick;
+    this.jobHeartbeatIntervalMs = assertTimerMs(
+      "jobHeartbeatIntervalMs",
+      config.jobHeartbeatIntervalMs ?? HOST_DEFAULTS.jobHeartbeatIntervalMs,
+    );
+    this.shutdownTimeoutMs = assertTimerMs(
+      "shutdownTimeoutMs",
+      config.shutdownTimeoutMs ?? 10_000,
+      {
+        hint: "The bound cannot be switched off; pass 2147483647 (about 24.8 days) to wait for practically anything.",
+      },
+    );
     this.flushOutboxOnStop = config.flushOutboxOnStop ?? true;
     this.eventSinkMonitor = createEventSinkMonitor({ logPrefix: "[NodeHost]" });
   }
@@ -207,7 +297,35 @@ class NodeHostImpl implements NodeHost {
 
   async start(): Promise<void> {
     if (this.running) return;
+    if (!this.starting) {
+      const starting = this.verifyThenBegin(this.lifecycle).finally(() => {
+        if (this.starting === starting) this.starting = null;
+      });
+      this.starting = starting;
+    }
+    return this.starting;
+  }
 
+  /**
+   * A host whose storage refuses to be used fails here, before any timer,
+   * loop or signal handler exists, instead of running and logging the same
+   * error on every tick: a SQLite file another Prisma major wrote makes
+   * `verifyStorage` reject with `SqliteDateStorageError` (a transport with no
+   * such check starts as before). A `stop()` while the check is pending
+   * cancels the start: when the check settles, nothing is installed and the
+   * pending `start()` resolves with the host stopped.
+   */
+  private async verifyThenBegin(lifecycle: number): Promise<void> {
+    await this.jobTransport.verifyStorage?.();
+    if (this.running || lifecycle !== this.lifecycle) return;
+    this.begin(lifecycle);
+  }
+
+  private isCurrent(lifecycle: number): boolean {
+    return this.running && lifecycle === this.lifecycle;
+  }
+
+  private begin(lifecycle: number): void {
     this.running = true;
     this.startTime = Date.now();
 
@@ -229,15 +347,26 @@ class NodeHostImpl implements NodeHost {
 
     // Start orchestration timer
     this.orchestrationTimer = setInterval(
-      () => this.startOrchestrationTick(),
+      () => this.startOrchestrationTick(lifecycle),
       this.orchestrationIntervalMs,
     );
 
     // Immediate first tick
-    this.startOrchestrationTick();
+    if (this.tickInFlight) {
+      void this.tickInFlight.then(() => this.startOrchestrationTick(lifecycle));
+    } else {
+      this.startOrchestrationTick(lifecycle);
+    }
 
     // Start job processing loop (runs until stop())
-    this.jobLoop = this.processJobs();
+    // A timed-out dequeue or job can still be settling from the last start.
+    // Queue its replacement behind it so we never have two job loops.
+    const loop = (this.jobLoop ?? Promise.resolve())
+      .then(() => this.processJobs(lifecycle))
+      .finally(() => {
+        if (this.jobLoop === loop) this.jobLoop = null;
+      });
+    this.jobLoop = loop;
 
     // Signal handlers — use wrapper functions so we can remove them on stop
     const onSignal = () => void this.stop();
@@ -251,6 +380,9 @@ class NodeHostImpl implements NodeHost {
   }
 
   async stop(): Promise<void> {
+    // Cancels a start() whose storage check is still pending (see verifyThenBegin).
+    this.lifecycle++;
+    this.starting = null;
     if (!this.running) return;
 
     this.running = false;
@@ -271,13 +403,17 @@ class NodeHostImpl implements NodeHost {
     // process. Without the flush, `workflow:completed` for a run this
     // process finished sits in the outbox until whichever process ticks
     // next. A tick cut short here leaves its claimed suspended stages on
-    // their poll lease; the next poller picks them up when it elapses.
-    if (this.tickInFlight) {
-      await withTimeout(this.tickInFlight, this.shutdownTimeoutMs);
+    // their poll lease; the next poller picks them up when it elapses. The
+    // `onTick` call in flight shares that bound; none starts after this point.
+    const jobLoop = this.jobLoop;
+    const winding = [this.tickInFlight, this.hookInFlight].filter(
+      (call) => call !== null,
+    );
+    if (winding.length > 0) {
+      await withTimeout(Promise.all(winding), this.shutdownTimeoutMs);
     }
-    if (this.jobLoop) {
-      await withTimeout(this.jobLoop, this.shutdownTimeoutMs);
-      this.jobLoop = null;
+    if (jobLoop) {
+      await withTimeout(jobLoop, this.shutdownTimeoutMs);
     }
     if (this.flushOutboxOnStop) {
       await this.flushOutbox();
@@ -297,11 +433,9 @@ class NodeHostImpl implements NodeHost {
           );
           return;
         }
-        const flushed = await withTimeout(
-          this.kernel.dispatch({
-            type: "outbox.flush",
-            maxEvents: this.maxOutboxFlushPerTick,
-          }),
+        const flushed = await flushOutboxWithin(
+          this.kernel,
+          this.maxOutboxFlushPerTick,
           remaining,
         );
         if (flushed === undefined) {
@@ -340,9 +474,9 @@ class NodeHostImpl implements NodeHost {
    * overlap the next tick in the same process. `orchestrationTicks` counts
    * only ticks that ran.
    */
-  private startOrchestrationTick(): void {
-    if (this.tickInFlight) return;
-    this.tickInFlight = this.orchestrationTick()
+  private startOrchestrationTick(lifecycle: number): void {
+    if (this.tickInFlight || !this.isCurrent(lifecycle)) return;
+    this.tickInFlight = this.orchestrationTick(lifecycle)
       .catch((error) => {
         console.error("[NodeHost] orchestration tick error:", error);
       })
@@ -362,7 +496,7 @@ class NodeHostImpl implements NodeHost {
     return this.serves ?? this.kernel.servedDefinitions?.();
   }
 
-  private async orchestrationTick(): Promise<void> {
+  private async orchestrationTick(lifecycle: number): Promise<void> {
     this.orchestrationTicks++;
 
     // Claim pending runs, poll suspended stages, reap stale leases, flush
@@ -370,32 +504,80 @@ class NodeHostImpl implements NodeHost {
     // and doesn't need the per-command counts (unlike the serverless host,
     // which returns them to its caller) — see runMaintenanceTick in
     // @bratsos/workflow-engine/kernel for the shared command sequence.
+    const host = this;
     const counts = await runMaintenanceTickCommands(this.kernel, {
+      outboxFlushSignal: {
+        get aborted() {
+          return !host.isCurrent(lifecycle);
+        },
+      },
       workerId: this.workerId,
       maxClaimsPerTick: this.maxClaimsPerTick,
       ...(this.serves !== undefined ? { serves: this.serves } : {}),
       maxSuspendedChecksPerTick: this.maxSuspendedChecksPerTick,
       maxOutboxFlushPerTick: this.maxOutboxFlushPerTick,
+      outboxFlushTimeoutMs: this.outboxFlushTimeoutMs,
       staleLeaseThresholdMs: this.staleLeaseThresholdMs,
       jobAbsoluteTimeoutMs: this.jobAbsoluteTimeoutMs,
       ...(this.retention !== undefined ? { retention: this.retention } : {}),
       logPrefix: "[NodeHost]",
     });
-    this.eventSinkMonitor.observe({
-      failed: counts.eventsFailed,
-      deadLettered: counts.eventsDeadLettered,
-      eventSinkStatus: counts.eventSinkStatus,
-      ...(counts.eventSinkError !== undefined
-        ? { eventSinkError: counts.eventSinkError }
-        : {}),
-    });
+    if (!this.isCurrent(lifecycle)) return;
+    if (!counts.outboxDeferred) {
+      this.eventSinkMonitor.observe({
+        failed: counts.eventsFailed,
+        deadLettered: counts.eventsDeadLettered,
+        eventSinkStatus: counts.eventSinkStatus,
+        ...(counts.eventSinkError !== undefined
+          ? { eventSinkError: counts.eventSinkError }
+          : {}),
+      });
+    }
+    this.startTickHook(counts, lifecycle);
+  }
+
+  /**
+   * Calls `onTick` without waiting for it, so the hook cannot hold a tick
+   * open. One call at a time: a tick that finds the previous call running
+   * skips the hook and, the first time in a row, says so. None starts once
+   * `stop()` has begun.
+   */
+  private startTickHook(
+    counts: MaintenanceTickCounts,
+    lifecycle: number,
+  ): void {
+    if (!this.onTick || !this.isCurrent(lifecycle)) return;
+    if (this.hookInFlight) {
+      this.hookSkippedDuringCall = true;
+      if (!this.hookSkipLogged) {
+        this.hookSkipLogged = true;
+        console.warn(
+          `[NodeHost] onTick hook is still running after ${Date.now() - this.hookStartedAt} ms and ticks skip it while it runs; this is logged once until a call finishes without being skipped`,
+        );
+      }
+      return;
+    }
+    this.hookStartedAt = Date.now();
+    this.hookSkippedDuringCall = false;
+    // Started a microtask later so `hookInFlight` is already set when the hook
+    // body first runs: a hook that calls `stop()` is then always waited for.
+    const hook = this.onTick;
+    this.hookInFlight = Promise.resolve()
+      .then(() => {
+        if (this.isCurrent(lifecycle))
+          return runTickHook(hook, counts, "[NodeHost]");
+      })
+      .finally(() => {
+        this.hookInFlight = null;
+        if (!this.hookSkippedDuringCall) this.hookSkipLogged = false;
+      });
   }
 
   // --------------------------------------------------------------------------
   // Job processing loop
   // --------------------------------------------------------------------------
 
-  private async processJobs(): Promise<void> {
+  private async processJobs(lifecycle: number): Promise<void> {
     // Run of the job this loop completed last, and whether the queue has
     // since handed it work from a different run. Together they separate
     // "I am following the run I just advanced" (yield, so another worker
@@ -405,12 +587,18 @@ class NodeHostImpl implements NodeHost {
     let lastRunId: string | null = null;
     let drainingBacklog = false;
 
-    while (this.running) {
+    while (this.isCurrent(lifecycle)) {
       try {
         const serves = this.dequeueServes();
         const job = await this.jobTransport.dequeue(
           serves !== undefined ? { serves } : undefined,
         );
+        if (!this.isCurrent(lifecycle)) {
+          // The dequeue counted an attempt. Give it back instead of leaving
+          // the job RUNNING for the reaper, which keeps the attempt.
+          if (job) await this.returnUnstartedJob(job);
+          return;
+        }
 
         if (!job) {
           lastRunId = null;
@@ -461,6 +649,41 @@ class NodeHostImpl implements NodeHost {
   // --------------------------------------------------------------------------
   // Helpers
   // --------------------------------------------------------------------------
+
+  /**
+   * Put a job this stopped loop dequeued but will not run back to PENDING
+   * with its attempt refunded (`defer`, fenced on this claim). A transport
+   * without `defer` leaves it RUNNING; the stale-lease reaper then releases
+   * it with the attempt still counted.
+   */
+  private async returnUnstartedJob(
+    job: NonNullable<Awaited<ReturnType<JobTransport["dequeue"]>>>,
+  ): Promise<void> {
+    if (!this.jobTransport.defer) return;
+    const fence = job.startedAt
+      ? { startedAt: job.startedAt, attempt: job.attempt }
+      : undefined;
+    try {
+      // A replacement job loop waits for this one: bound the wait. A defer
+      // that commits later is still fenced on this claim.
+      const returned = this.jobTransport
+        .defer(
+          job.jobId,
+          new Date(),
+          "host stopped before running the job",
+          fence,
+        )
+        .then(() => true);
+      if (!(await withTimeout(returned, this.shutdownTimeoutMs))) {
+        returned.catch(() => {});
+        console.error(
+          `[NodeHost] Returning an unstarted job took longer than shutdownTimeoutMs (${this.shutdownTimeoutMs} ms); the job is recovered when its lease expires if the return did not commit.`,
+        );
+      }
+    } catch (error) {
+      console.error("[NodeHost] Could not return an unstarted job:", error);
+    }
+  }
 
   private sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));

@@ -304,10 +304,14 @@ model OutboxEvent {
   causationId   String
   occurredAt    TimestampString(3)
   publishedAt   TimestampString(3)?
+  deliveryClaim String?
   retryCount    Int                @default(0)
   dlqAt         TimestampString(3)?
 
   @@index([workflowRunId, sequence], map: "outbox_events_workflowRunId_sequence_key", unique: true)
+  @@index([publishedAt, dlqAt, workflowRunId, deliveryClaim], map: "outbox_events_delivery_run_idx")
+  @@index([publishedAt, dlqAt, workflowRunId, sequence], map: "outbox_events_live_run_sequence_idx")
+  @@index([deliveryClaim, workflowRunId], map: "outbox_events_delivery_cursor_idx")
   @@index([publishedAt], map: "outbox_events_publishedAt_idx")
   // Dead letters are a subset of the unpublished rows. Prisma cannot express
   // a partial index in schema.prisma; this contract could (`where:`), but the

@@ -78,6 +78,43 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
     });
   }
 
+  // On Prisma 6 and 7 the fixture runs `prisma db push` in a child process for
+  // the new file: 0.5-0.6 s here, 2.6 s and over 5 s on CI beside the other
+  // workspaces' tests.
+  it("refuses a SQLite file with dates from another Prisma major", {
+    timeout: 30_000,
+  }, async () => {
+    const file = join(directory, "foreign-dates.db");
+    const foreign = isPrisma8
+      ? (() => {
+          const db = fixture.createSqliteDb(file);
+          return Object.assign(fromPrisma8!(db), {
+            $disconnect: () => db.close(),
+          });
+        })()
+      : fixture.createSqliteClient(file);
+    try {
+      await foreign.workflowRun.create({
+        data: mkRun("foreign", at(0), "COMPLETED", "wf", 0, 0),
+      });
+      const incompatible =
+        major === "8"
+          ? "2020-01-01T00:00:00.000+00:00"
+          : "2020-01-01T00:00:00.000Z";
+      await foreign.$executeRawUnsafe(
+        `UPDATE workflow_runs SET "createdAt" = '${incompatible}' WHERE id = 'foreign'`,
+      );
+      const port = createPrismaConsoleReadPort(foreign, {
+        databaseType: "sqlite",
+      });
+      await expect(port.getRunDetail("foreign")).rejects.toMatchObject({
+        code: "SQLITE_DATE_STORAGE_MISMATCH",
+      });
+    } finally {
+      await foreign.$disconnect();
+    }
+  });
+
   async function seed() {
     await prisma.workflowRun.createMany({
       data: [
@@ -407,7 +444,49 @@ describe(`I want the console read port to work against real SQLite on Prisma ${m
     expect(events[0]?.occurredAt.toISOString()).toBe(at(2).toISOString());
   });
 
-  it("reads a JSON scalar in every JSON column it reads, though SQLite keeps a JSON number as a number", async () => {
+  it("refuses an outbox timeline before the delivery claim column is migrated", async () => {
+    await prisma.$executeRawUnsafe!(
+      'ALTER TABLE "outbox_events" RENAME COLUMN "deliveryClaim" TO "legacyClaim"',
+    );
+    try {
+      await expect(reader().listRunEvents("run-day-1", 0)).rejects.toThrow(
+        /deliveryClaim/,
+      );
+    } finally {
+      await prisma.$executeRawUnsafe!(
+        'ALTER TABLE "outbox_events" RENAME COLUMN "legacyClaim" TO "deliveryClaim"',
+      );
+    }
+  });
+
+  it.each([
+    "",
+    "r0000000000000000042|",
+  ])("exposes the expiry of an unpublished delivery claim (rank prefix %j)", async (rank) => {
+    const expiry = new Date("2099-01-01T00:00:00.000Z");
+    await prisma.outboxEvent.updateMany({
+      where: { id: "event-1" },
+      data: {
+        publishedAt: null,
+        deliveryClaim: `${rank}${expiry.toISOString()}|owner`,
+      },
+    });
+    const detail = await reader().getRunDetail("run-day-1");
+    expect(detail?.events[0]).toMatchObject({
+      publishedAt: null,
+      claimExpiresAt: expiry,
+    });
+    expect((await reader().listRunEvents("run-day-1", 0))[0]).toMatchObject({
+      claimExpiresAt: expiry,
+    });
+  });
+
+  // On Prisma 6 and 7 the fixture runs `prisma db push` in a child process for
+  // the new file: 0.5-0.6 s here, 2.6 s and over 5 s on CI beside the other
+  // workspaces' tests.
+  it("reads a JSON scalar in every JSON column it reads, though SQLite keeps a JSON number as a number", {
+    timeout: 30_000,
+  }, async () => {
     const file = join(directory, "json-scalars.db");
     const db: ConsolePrismaClient & Record<string, any> = isPrisma8
       ? (() => {
@@ -2030,16 +2109,26 @@ SELECT run || '-l' || n, ${later("createdAt", "n")}, run, level, message FROM ($
       })),
     });
     const calls: RecordedStatement[] = [];
-    const detail = await createPrismaConsoleReadPort(
-      recordingClient(prisma, calls),
+    const probes: RecordedStatement[] = [];
+    // A new client object: its first read runs the date check.
+    const port = createPrismaConsoleReadPort(
+      recordingClient(prisma, calls, undefined, undefined, undefined, probes),
       { databaseType: "sqlite", now: () => at(100) },
-    ).getRunDetail("run-many-stages");
+    );
+    const detail = await port.getRunDetail("run-many-stages");
     // One steps statement whatever the number of stages, so a read is still
-    // at most twelve statements (the transaction limit counts on it).
+    // at most twelve statements (the transaction limit counts on it), and
+    // the client's first read one more: the date check, before the
+    // transaction.
     expect(
       calls.filter((c) => c.sql.includes('JOIN "workflow_steps"')),
     ).toHaveLength(1);
     expect(calls.length).toBeLessThanOrEqual(12);
+    expect(probes).toHaveLength(1);
+    calls.length = 0;
+    await port.getRunDetail("run-many-stages");
+    expect(calls.length).toBeLessThanOrEqual(12);
+    expect(probes).toHaveLength(1);
     expect(detail?.stages).toHaveLength(33_000);
     expect(detail?.steps.map((s) => s.stepId)).toEqual([
       "first",

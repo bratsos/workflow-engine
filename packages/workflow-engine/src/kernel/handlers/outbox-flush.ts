@@ -1,32 +1,22 @@
 /**
- * Handler: outbox.flush
+ * Deliver committed outbox events at least once. Claims expire and do not
+ * mark delivery: `publishedAt` is written only after the sink resolves.
+ * Delivery can duplicate when an effect happens without its durable
+ * acknowledgement, including on a crash, write error or ambiguous sink result.
+ * Deduplicate by the outbox event ID. Run ID and sequence order events, but
+ * SQL deletion of the newest rows can let the store reuse a sequence.
  *
- * Claims unpublished outbox events and publishes them through EventSink.
- * Events are claimed (their `publishedAt` stamped) atomically before they
- * are emitted, in (workflowRunId, sequence) order, so two hosts flushing
- * the same outbox concurrently — a cron tick and a request-kicked tick, or
- * two workers — never both deliver the same event.
+ * Order is decided at claim time. A replayed dead letter follows successors
+ * already claimed or published. Unclaimed successors wait behind it after
+ * replay. The engine's progress is independent of the sink.
+ * Nothing in the engine deletes outbox rows; run.purge leaves them, and
+ * an operator can remove them with SQL. For a purged run, a flush skips a
+ * live claim until completion or expiry, skips published rows, and skips
+ * dead letters until replay.
  *
- * On handler failure:
- * - The event is released (its `publishedAt` cleared) so the next flush
- *   retries it, together with the later events of the same run
- * - Increments retryCount on the outbox event
- * - If retryCount >= maxRetries, moves event to DLQ
- *
- * A process that dies between the claim and the emit leaves the event
- * stamped as published: the claim is what makes delivery once-only.
- *
- * The result names the sink's state: `eventSinkStatus: "degraded"` when at
- * least one event could not be published this pass, plus how many will be
- * retried by the next flush (`failed`) and how many exhausted their retry
- * budget (`deadLettered`). Those two populations are disjoint: a released
- * event that was also dead-lettered will not retry on its own, so it is
- * reported only as `deadLettered`. A degraded sink never stalls a run —
- * the poller, not the sink, is what advances one — so hosts surface the
- * state instead of throwing (see `createEventSinkMonitor` in
- * `helpers/host-support.ts`).
- *
- * This handler returns _events: [] — it does NOT produce new outbox events.
+ * A persistence write error rejects dispatch without a handler log. Host
+ * maintenance logs the error and reports degraded delivery; live claims
+ * remain recoverable after expiry unless the write already took effect.
  */
 
 import type { OutboxFlushCommand, OutboxFlushResult } from "../commands";
@@ -34,66 +24,190 @@ import type { KernelEvent } from "../events";
 import { toErrorMessage } from "../helpers/error-message.js";
 import type { HandlerResult, KernelDeps } from "../kernel";
 import type { PluginRunner } from "../plugins";
+import type { OutboxRecord } from "../ports";
 
 export async function handleOutboxFlush(
   command: OutboxFlushCommand,
   deps: KernelDeps,
 ): Promise<HandlerResult<OutboxFlushResult>> {
-  const limit = command.maxEvents ?? 100;
-  const events = await deps.persistence.claimUnpublishedOutboxEvents(limit);
-
-  // Determine maxRetries from EventSink (if it's a PluginRunner)
-  const maxRetries = (deps.eventSink as Partial<PluginRunner>).maxRetries ?? 3;
-
-  let published = 0;
-  let deadLettered = 0;
-  let firstError: string | undefined;
-  const releaseIds: string[] = [];
-  // Events are claimed ordered by (workflowRunId, sequence). Once a run's
-  // event N fails to publish, later events for that same run must not
-  // be published ahead of it — that would redeliver out of order on the
-  // next flush. Release (not fail) the rest of that run's events this
-  // pass; other runs are unaffected.
-  const failedRunIds = new Set<string>();
-
-  for (const outboxEvent of events) {
-    if (failedRunIds.has(outboxEvent.workflowRunId)) {
-      releaseIds.push(outboxEvent.id);
-      continue;
-    }
-
-    try {
-      await deps.eventSink.emit(outboxEvent.payload as KernelEvent);
-      published++;
-    } catch (error) {
-      firstError ??= toErrorMessage(error);
-      failedRunIds.add(outboxEvent.workflowRunId);
-      releaseIds.push(outboxEvent.id);
-      const newCount = await deps.persistence.incrementOutboxRetryCount(
-        outboxEvent.id,
-      );
-      if (newCount >= maxRetries) {
-        await deps.persistence.moveOutboxEventToDLQ(outboxEvent.id);
-        deadLettered++;
-      }
-      // Released below — will retry on next flush (unless DLQ'd)
-    }
+  if (deps.persistence.outboxDeliveryDeferred) {
+    return {
+      deferred: true,
+      published: 0,
+      failed: 0,
+      deadLettered: 0,
+      eventSinkStatus: "healthy",
+      _events: [],
+    };
   }
 
-  if (releaseIds.length > 0) {
-    await deps.persistence.releaseOutboxEvents(releaseIds);
+  const limit = command.maxEvents ?? 100;
+  const claimDurationMs = command.claimDurationMs ?? 60_000;
+  if (
+    !Number.isSafeInteger(claimDurationMs) ||
+    claimDurationMs < 1 ||
+    claimDurationMs > 2_147_483_647
+  ) {
+    throw new RangeError(
+      "outbox.flush claimDurationMs must be an integer from 1 to 2147483647",
+    );
+  }
+  const maxRetries = (deps.eventSink as Partial<PluginRunner>).maxRetries ?? 3;
+  const persistence = deps.persistence;
+  let stopAfterPage = false;
+  let attempted = 0;
+  let published = 0;
+  let failed = 0;
+  let deadLettered = 0;
+  let firstError: string | undefined;
+
+  const interrupted = (expiresAt?: number) => {
+    if (expiresAt !== undefined && deps.clock.now().getTime() >= expiresAt) {
+      const message = "outbox.flush claim expired before delivery";
+      console.warn(message);
+      firstError ??= message;
+      return true;
+    }
+    if (command.signal?.aborted) {
+      firstError ??= "outbox.flush cancelled";
+      return true;
+    }
+    return false;
+  };
+
+  while (attempted < limit && !interrupted()) {
+    // Start the lease before awaiting the database, so there is one deadline
+    // shared by the stored owner token and every pre-emit expiry check.
+    const now = deps.clock.now();
+    const expiresAt = now.getTime() + claimDurationMs;
+    const claim = `${new Date(expiresAt).toISOString()}|${crypto.randomUUID()}`;
+    // The claim statement returns only rows it now owns. A row revoked after
+    // it (an operator's DLQ move, a purge) can still reach the sink once; its
+    // acknowledgement, fenced on this claim, then changes nothing, and the
+    // flush ends after this page.
+    const events = await persistence.claimOutboxDelivery(
+      limit - attempted,
+      claim,
+      now,
+      [],
+      command.signal,
+    );
+    if (interrupted(expiresAt) || !events.length) break;
+    attempted += events.length;
+
+    // Acknowledge accepted events together: a run's when its share of the
+    // page ends, every run's that ends while a write is in flight in the next
+    // write, and the first write waits one turn so runs that end together
+    // share it. A run's next event does not wait for the acknowledgement of
+    // the one before it; a crash in between redelivers both, in order.
+    let accepted: string[] = [];
+    let writing: Promise<void> | undefined;
+    let writeError: { error: unknown } | undefined;
+    const write = async () => {
+      // Before any adapter call: `writing` is set when this body runs.
+      await undefined;
+      while (accepted.length) {
+        const batch = accepted;
+        accepted = [];
+        try {
+          const count = persistence.completeOutboxDeliveries
+            ? await persistence.completeOutboxDeliveries(
+                batch,
+                claim,
+                deps.clock.now(),
+              )
+            : (
+                await Promise.all(
+                  batch.map((id) =>
+                    persistence.completeOutboxDelivery(
+                      id,
+                      claim,
+                      deps.clock.now(),
+                    ),
+                  ),
+                )
+              ).filter(Boolean).length;
+          published += count;
+          if (count < batch.length) stopAfterPage = true;
+        } catch (error) {
+          writeError ??= { error };
+        }
+      }
+      writing = undefined;
+    };
+    const acknowledge = (ids: string[]) => {
+      if (!ids.length) return;
+      accepted.push(...ids);
+      writing ??= write();
+    };
+
+    // Runs are delivered concurrently, a run's events one after another.
+    const runs = new Map<string, OutboxRecord[]>();
+    for (const event of events) {
+      const run = runs.get(event.workflowRunId);
+      if (run) run.push(event);
+      else runs.set(event.workflowRunId, [event]);
+    }
+    const results = await Promise.allSettled(
+      [...runs.values()].map(async (run) => {
+        const sent: string[] = [];
+        try {
+          for (const event of run) {
+            if (writeError || interrupted(expiresAt)) return;
+            try {
+              await deps.eventSink.emit(event.payload as KernelEvent, {
+                eventId: event.id,
+                workflowRunId: event.workflowRunId,
+                sequence: event.sequence,
+                attempt: event.retryCount + 1,
+              });
+            } catch (error) {
+              stopAfterPage = true;
+              firstError ??= toErrorMessage(error);
+              // The failure write releases the run's other events under this
+              // claim: acknowledge the ones already accepted first.
+              acknowledge(sent.splice(0));
+              while (writing) await writing;
+              if (writeError) return;
+              let outcome: Awaited<
+                ReturnType<typeof persistence.failOutboxDelivery>
+              >;
+              try {
+                outcome = await persistence.failOutboxDelivery(
+                  event.id,
+                  claim,
+                  maxRetries,
+                  deps.clock.now(),
+                );
+              } catch (writeFailure) {
+                // A write error stops the whole page, as an acknowledgement's does.
+                writeError ??= { error: writeFailure };
+                return;
+              }
+              if (outcome === "dead-lettered") deadLettered++;
+              if (outcome === "retry") failed++;
+              return;
+            }
+            sent.push(event.id);
+          }
+        } finally {
+          acknowledge(sent);
+        }
+      }),
+    );
+    while (writing) await writing;
+    for (const result of results) {
+      if (result.status === "rejected") throw result.reason;
+    }
+    if (writeError) throw writeError.error;
+    // Finish the page but leave retries for the next flush. This avoids
+    // repeatedly scanning failed heads to find independent work.
+    if (stopAfterPage || deps.clock.now().getTime() >= expiresAt) break;
   }
 
   return {
     published,
-    // Every released id minus the ones that were also dead-lettered. A
-    // dead letter is released so a replay can still find it in sequence,
-    // but it does not retry on its own and `deadLettered` already counts
-    // it — leaving it in here reported one event twice and contradicted
-    // what `failed` documents. The remainder is homogeneous: events whose
-    // emit threw, plus the later events of those same runs held back to
-    // keep per-run order. Both come round again on the next flush.
-    failed: releaseIds.length - deadLettered,
+    failed,
     deadLettered,
     eventSinkStatus: firstError === undefined ? "healthy" : "degraded",
     ...(firstError !== undefined ? { eventSinkError: firstError } : {}),

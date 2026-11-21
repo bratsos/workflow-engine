@@ -105,9 +105,8 @@ boundary, not only the realtime one.
   [Retry, Restart and Rerun](../core-concepts/redriving-runs.md)).
   A redrive keeps the same run id and appends to its history with a
   `redriveCount`, and can re-pin the run onto another definition version.
-- **Transactional outbox.** The outbox is how system events reach your
-  `EventSink` at least once without phantom events. It is not how the engine
-  wakes its own consumer.
+- **Transactional outbox.** Events commit with the state change they describe. Events are delivered at least once while retries remain. Delivery can duplicate whenever the sink effect happens without a durable acknowledgement. Examples include a crash or write error after acceptance, an emit in flight at expiry, a sink that commits and then rejects, and partial plugin success. Deduplicate using the outbox `eventId` supplied to the sink or plugin. `workflowRunId` and `sequence` order events within a run, but are not a permanent identity: after an operator deletes the newest outbox rows, the Prisma store can reuse a sequence. Failures exhaust the retry budget and move the event to the DLQ; `plugin.replayDLQ` makes it eligible again. The engine’s progress never depends on the sink. After `run.purge`, a flush skips a live claim until it completes or expires, skips published rows, and skips dead letters until replay. The engine never deletes outbox rows; operators remove them with SQL. See [Kernel and Ports](../core-concepts/kernel-and-ports.md#transactional-outbox-events).
+
 - **No payload ceiling.** Nothing rejects a large value; it is bounded only by
   Postgres. Since 1.0 a step result over 64 KiB spills to the blob
   store behind a claim check

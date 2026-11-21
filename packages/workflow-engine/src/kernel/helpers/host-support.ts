@@ -26,6 +26,35 @@ import { toErrorMessage } from "./error-message.js";
 // ============================================================================
 
 /** Default tuning knobs shared by every host implementation. */
+/** The longest delay a timer honours: a longer one fires after 1 ms. */
+export const MAX_TIMER_MS = 2 ** 31 - 1;
+
+/**
+ * Checks a host option that ends up in `setTimeout` or `setInterval` and
+ * returns it. A timer cannot honour anything else than a finite number of
+ * milliseconds up to {@link MAX_TIMER_MS}: `Infinity`, `NaN`, a negative
+ * number or a value above it fires after 1 ms (Node logs a
+ * `TimeoutOverflowWarning`), which turns a bound meant as "no limit" into the
+ * tightest one and an interval into a busy loop. So it is refused, at
+ * construction, with a `RangeError` that names the option.
+ *
+ * `allowZero` is for an option whose documented `0` means "off" (the caller
+ * then does not start a timer at all). `hint` is appended to the message.
+ */
+export function assertTimerMs(
+  name: string,
+  value: unknown,
+  options: { allowZero?: boolean; hint?: string } = {},
+): number {
+  const min = options.allowZero ? 0 : 1;
+  if (typeof value !== "number" || !(value >= min) || value > MAX_TIMER_MS) {
+    throw new RangeError(
+      `${name} must be a number of milliseconds from ${min} to ${MAX_TIMER_MS} (the longest delay a timer honours, about 24.8 days), got ${toErrorMessage(value)}.${options.hint ? ` ${options.hint}` : ""}`,
+    );
+  }
+  return value;
+}
+
 export const HOST_DEFAULTS = {
   /** Worker id used when a caller does not supply one. */
   workerId: "worker",
@@ -49,6 +78,8 @@ export const HOST_DEFAULTS = {
   maxSuspendedChecksPerTick: 10,
   /** Max outbox events to flush per maintenance tick. */
   maxOutboxFlushPerTick: 100,
+  /** Maximum time a maintenance tick waits for the event sink. */
+  outboxFlushTimeoutMs: 5_000,
   /** Job lease heartbeat interval (ms). */
   jobHeartbeatIntervalMs: 60_000,
   /** Fallback max attempts when a job/queue doesn't specify one. */
@@ -188,6 +219,7 @@ export async function executeJobWithHeartbeat(
     jobHeartbeatIntervalMs = HOST_DEFAULTS.jobHeartbeatIntervalMs,
     logPrefix = HOST_DEFAULTS.logPrefix,
   } = options;
+  assertTimerMs("jobHeartbeatIntervalMs", jobHeartbeatIntervalMs);
 
   // A malformed message (a bridge that dropped `payload` or `workflowId`)
   // is a dead job: reject it up front with a clear message instead of
@@ -438,6 +470,46 @@ export interface RetentionOptions {
   limit?: number;
 }
 
+/**
+ * Bound the caller's wait and stop the dispatch before it starts more work.
+ * An already-started sink call can still settle and acknowledge its claim.
+ */
+export async function flushOutboxWithin(
+  kernel: Pick<Kernel, "dispatch">,
+  maxEvents: number,
+  timeoutMs: number,
+  parent?: Pick<AbortSignal, "aborted">,
+): Promise<OutboxFlushResult | undefined> {
+  const deadline = performance.now() + timeoutMs;
+  let timedOut = false;
+  const signal = {
+    get aborted() {
+      return (
+        timedOut || parent?.aborted === true || performance.now() >= deadline
+      );
+    },
+  };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      kernel.dispatch({
+        type: "outbox.flush",
+        maxEvents,
+        signal,
+        claimDurationMs: Math.min(MAX_TIMER_MS, Math.ceil(timeoutMs + 60_000)),
+      }),
+      new Promise<undefined>((resolve) => {
+        timer = setTimeout(() => {
+          timedOut = true;
+          resolve(undefined);
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 export interface RunMaintenanceTickOptions {
   /**
    * Unique worker identifier passed to `run.claimPending`. Defaults to
@@ -462,6 +534,10 @@ export interface RunMaintenanceTickOptions {
   maxSuspendedChecksPerTick?: number;
   /** Defaults to `HOST_DEFAULTS.maxOutboxFlushPerTick`. */
   maxOutboxFlushPerTick?: number;
+  /** Maximum wait for this tick's outbox flush, in milliseconds (default 5,000). */
+  outboxFlushTimeoutMs?: number;
+  /** Cancellation from the host's lifecycle for this tick's flush. */
+  outboxFlushSignal?: Pick<AbortSignal, "aborted">;
   /** Defaults to `HOST_DEFAULTS.staleLeaseThresholdMs`. */
   staleLeaseThresholdMs?: number;
   /** Defaults to `HOST_DEFAULTS.jobAbsoluteTimeoutMs`. Pass 0 to disable the absolute tier. */
@@ -490,14 +566,15 @@ export interface MaintenanceTickCounts {
   /** Jobs the absolute cap failed as runaways. */
   staleExpired: number;
   eventsFlushed: number;
+  /** Outbox delivery waits for the caller transaction to commit. */
+  outboxDeferred?: true;
   stuckReaped: number;
   /** Terminal runs `run.purge` deleted this tick; 0 unless `retention` is set. */
   purged: number;
   /**
-   * Events the flush claimed but could not publish and which the next
-   * flush will retry: the ones whose emit threw, plus the later events of
-   * those same runs, held back to keep per-run order. They stay committed
-   * in the outbox. Disjoint from `eventsDeadLettered`.
+   * Events whose emit failed and whose claims were released for retry.
+   * Later events remain pending and are not included. Disjoint from
+   * `eventsDeadLettered`.
    */
   eventsFailed: number;
   /** Events the flush moved to the DLQ (retry budget exhausted). */
@@ -505,11 +582,67 @@ export interface MaintenanceTickCounts {
   /**
    * `"degraded"` when the sink refused at least one event this tick. Runs
    * keep progressing regardless — the poller, not the sink, advances a run.
-   * A tick whose `outbox.flush` itself threw also reports `"degraded"`.
+   * A tick whose `outbox.flush` threw or timed out also reports `"degraded"`.
    */
   eventSinkStatus: EventSinkStatus;
   /** First publish failure of this tick, when degraded. */
   eventSinkError?: string;
+}
+
+/**
+ * A host's `onTick` option: called after every maintenance tick with that
+ * tick's counts. See {@link runTickHook}.
+ */
+export type MaintenanceTickHook = (
+  counts: MaintenanceTickCounts,
+) => void | Promise<void>;
+
+/**
+ * Calls a host's `onTick` hook with the counts of the tick that just ran.
+ *
+ * The hook gets its own copy of `counts`: mutating it changes nothing the host
+ * returns or reports. A hook that throws or rejects is caught and logged: it
+ * never fails the caller.
+ *
+ * Without `timeoutMs` the returned promise settles when the hook does, so a
+ * hook that never settles never returns. With it, the call returns once the
+ * hook settles or `timeoutMs` has elapsed, whichever is first; after the
+ * bound it logs one warning and leaves the hook running (a later throw or
+ * rejection is still caught and logged). `timeoutMs` must pass
+ * {@link assertTimerMs} (a number from 1 to 2147483647), or the call rejects
+ * with a `RangeError`; the serverless host checks its `onTickTimeoutMs` at
+ * construction. The Node host does not await the hook at all.
+ */
+export async function runTickHook(
+  hook: MaintenanceTickHook | undefined,
+  counts: MaintenanceTickCounts,
+  logPrefix: string = HOST_DEFAULTS.logPrefix,
+  timeoutMs?: number,
+): Promise<void> {
+  if (!hook) return;
+  if (timeoutMs !== undefined) assertTimerMs("timeoutMs", timeoutMs);
+  const call = (async () => {
+    try {
+      await hook({ ...counts });
+    } catch (error) {
+      console.error(`${logPrefix} onTick hook error:`, error);
+    }
+  })();
+  if (timeoutMs === undefined) return call;
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const bound = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => resolve("timeout"), timeoutMs);
+  });
+  try {
+    if ((await Promise.race([call, bound])) === "timeout") {
+      console.warn(
+        `${logPrefix} onTick hook did not settle within ${timeoutMs} ms; not waiting for it (it keeps running)`,
+      );
+    }
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 /**
@@ -529,18 +662,21 @@ export async function runMaintenanceTick(
     maxClaimsPerTick = HOST_DEFAULTS.maxClaimsPerTick,
     maxSuspendedChecksPerTick = HOST_DEFAULTS.maxSuspendedChecksPerTick,
     maxOutboxFlushPerTick = HOST_DEFAULTS.maxOutboxFlushPerTick,
+    outboxFlushTimeoutMs = HOST_DEFAULTS.outboxFlushTimeoutMs,
     staleLeaseThresholdMs = HOST_DEFAULTS.staleLeaseThresholdMs,
     jobAbsoluteTimeoutMs = HOST_DEFAULTS.jobAbsoluteTimeoutMs,
     logPrefix = HOST_DEFAULTS.logPrefix,
     serves,
     retention,
   } = options;
+  assertTimerMs("outboxFlushTimeoutMs", outboxFlushTimeoutMs);
 
   let claimed = 0;
   let suspendedChecked = 0;
   let staleReleased = 0;
   let staleExpired = 0;
   let eventsFlushed = 0;
+  let outboxDeferred: true | undefined;
   let stuckReaped = 0;
   let purged = 0;
   let eventsFailed = 0;
@@ -594,15 +730,24 @@ export async function runMaintenanceTick(
 
   // 4. Flush outbox → publish pending events through EventSink
   try {
-    const flushResult = await kernel.dispatch({
-      type: "outbox.flush",
-      maxEvents: maxOutboxFlushPerTick,
-    });
-    eventsFlushed = flushResult.published;
-    eventsFailed = flushResult.failed;
-    eventsDeadLettered = flushResult.deadLettered;
-    eventSinkStatus = flushResult.eventSinkStatus;
-    eventSinkError = flushResult.eventSinkError;
+    const flushResult = await flushOutboxWithin(
+      kernel,
+      maxOutboxFlushPerTick,
+      outboxFlushTimeoutMs,
+      options.outboxFlushSignal,
+    );
+    if (flushResult === undefined) {
+      eventSinkStatus = "degraded";
+      eventSinkError = `outbox.flush timed out after ${outboxFlushTimeoutMs}ms`;
+      console.error(`${logPrefix} ${eventSinkError}`);
+    } else {
+      eventsFlushed = flushResult.published;
+      outboxDeferred = flushResult.deferred;
+      eventsFailed = flushResult.failed;
+      eventsDeadLettered = flushResult.deadLettered;
+      eventSinkStatus = flushResult.eventSinkStatus;
+      eventSinkError = flushResult.eventSinkError;
+    }
   } catch (error) {
     // The flush itself failed (the outbox query, not an individual emit).
     // Nothing was delivered this tick either, so the sink is degraded from
@@ -648,6 +793,7 @@ export async function runMaintenanceTick(
     staleReleased,
     staleExpired,
     eventsFlushed,
+    ...(outboxDeferred ? { outboxDeferred } : {}),
     stuckReaped,
     purged,
     eventsFailed,
@@ -667,7 +813,7 @@ export async function runMaintenanceTick(
  * `"degraded"` is the named state for "the sink is refusing events". It is
  * deliberately not an error: an event sink is a *notification* channel, and
  * the committed poller is the truth that advances a run, so a degraded sink
- * costs delivery latency and nothing else. What it must not do is stay
+ * costs delivery latency and dead letters (replayable) and nothing else. What it must not do is stay
  * invisible until the dead-letter queue fills, which is what this report is
  * for — surface it from wherever the host reports its status, alert on
  * `status === "degraded"` and on `deadLettered` growing.

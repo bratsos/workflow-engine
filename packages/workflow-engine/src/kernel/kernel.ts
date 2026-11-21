@@ -34,6 +34,7 @@ import type {
 } from "../persistence/interface";
 import type {
   CommandResult,
+  EngineStatsResult,
   JobExecuteResult,
   JobHeartbeatResult,
   KernelCommand,
@@ -55,6 +56,7 @@ import type {
 import { IdempotencyInProgressError } from "./errors";
 import type { KernelEvent } from "./events";
 import { createLocalExecutor } from "./executor/local-executor.js";
+import { handleEngineStats } from "./handlers/engine-stats";
 import { handleJobExecute } from "./handlers/job-execute";
 import { handleJobHeartbeat } from "./handlers/job-heartbeat";
 import { handleLeaseReapStale } from "./handlers/lease-reap-stale";
@@ -291,6 +293,7 @@ type AnyCommandResult =
   | RunRerunFromResult
   | RunRedriveResult
   | RunListVersionsResult
+  | EngineStatsResult
   | JobExecuteResult
   | JobHeartbeatResult
   | StagePollSuspendedResult
@@ -314,6 +317,18 @@ function stripEvents<R>(result: HandlerResult<R>): R {
 export function createKernel(config: KernelConfig): Kernel {
   const { persistence, blobStore, jobTransport, eventSink, clock, registry } =
     config;
+
+  for (const method of [
+    "claimOutboxDelivery",
+    "completeOutboxDelivery",
+    "failOutboxDelivery",
+  ] as const) {
+    if (typeof persistence[method] !== "function") {
+      throw new Error(
+        `Persistence adapter is missing ${method}; upgrade its outbox implementation for at-least-once delivery`,
+      );
+    }
+  }
 
   // Default to LocalExecutor if none provided
   const executor = config.executor ?? createLocalExecutor();
@@ -451,6 +466,30 @@ export function createKernel(config: KernelConfig): Kernel {
     }
 
     // -----------------------------------------------------------------
+    // engine.stats routes directly — a handful of indexed reads of active
+    // rows, no outbox write, no idempotency, no transaction. The figures
+    // are not a snapshot, so a transaction would add nothing but a held
+    // connection.
+    // -----------------------------------------------------------------
+    if (command.type === "engine.stats") {
+      const result = await handleEngineStats(command, deps);
+      return stripEvents(result);
+    }
+
+    // -----------------------------------------------------------------
+    // run.listVersions routes directly for the same reason: it reads the
+    // capability flag and issues ONE aggregate (`countRunsByDefinitionVersion`),
+    // so there is no second read for a snapshot to keep consistent with,
+    // and it writes nothing. A transaction would only hold a connection
+    // (on Prisma 8 SQLite it queues behind writers too). The versioning
+    // probe it awaits first is a catalogue read that is safe either way.
+    // -----------------------------------------------------------------
+    if (command.type === "run.listVersions") {
+      const result = await handleRunListVersions(command, deps);
+      return stripEvents(result);
+    }
+
+    // -----------------------------------------------------------------
     // job.execute manages its own multi-phase transactions so that
     // RUNNING status is visible immediately and long-running stage
     // execution does not hold a database transaction open.
@@ -518,9 +557,6 @@ export function createKernel(config: KernelConfig): Kernel {
             break;
           case "run.redrive":
             result = await handleRunRedrive(command, txDeps);
-            break;
-          case "run.listVersions":
-            result = await handleRunListVersions(command, txDeps);
             break;
           case "run.reapStuck":
             result = await handleRunReapStuck(command, txDeps);

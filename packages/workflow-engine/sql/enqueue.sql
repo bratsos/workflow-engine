@@ -94,7 +94,6 @@ DECLARE
   v_existing jsonb;
   v_run_id   text;
   v_now      timestamp(3);
-  v_sequence integer;
 BEGIN
   IF p_idempotency_key IS NULL OR p_idempotency_key = '' THEN
     RAISE EXCEPTION
@@ -168,13 +167,7 @@ BEGIN
     p_definition_version
   );
 
-  -- 4. The workflow:created outbox event, sequenced per run under the same
-  --    advisory lock the TypeScript writer takes.
-  PERFORM pg_advisory_xact_lock(hashtext(v_run_id));
-  SELECT COALESCE(MAX("sequence"), 0) + 1 INTO v_sequence
-    FROM "outbox_events"
-   WHERE "workflowRunId" = v_run_id;
-
+  -- 4. The first outbox event for this newly created run.
   INSERT INTO "outbox_events" (
     "id", "createdAt", "workflowRunId", "sequence", "eventType",
     "payload", "causationId", "occurredAt"
@@ -182,7 +175,7 @@ BEGIN
     gen_random_uuid()::text,
     v_now,
     v_run_id,
-    v_sequence,
+    1,
     'workflow:created',
     jsonb_build_object(
       'type', 'workflow:created',

@@ -16,6 +16,7 @@
 
 import { randomUUID } from "crypto";
 import {
+  type ActiveWorkStats,
   type AnnotationFilters,
   type CreateAnnotationInput,
   type CreateDefinitionInput,
@@ -25,7 +26,9 @@ import {
   type CreateStageInput,
   type DefinitionVersionCount,
   type DefinitionVersionCountFilter,
+  emptyActiveStatusCounts,
   type IdempotencyRecord,
+  isActiveStatus,
   type OutboxRecord,
   type PurgeableRun,
   type PurgeableRunStatus,
@@ -100,6 +103,8 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
   private annotationSequence = new Map<string, number>();
   private nextAnnotationSequence = 0;
   private outbox: OutboxRecord[] = [];
+  private outboxClaims = new Map<string, string>();
+  private lastOutboxRun?: string;
   private idempotencyKeys = new Map<string, IdempotencyRecord>();
   /** Maps composite key -> the time the key was (re)acquired as in-progress. */
   private idempotencyInProgress = new Map<string, Date>();
@@ -250,6 +255,13 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
     }
     this.annotations = this.annotations.filter((a) => a.workflowRunId !== id);
     return true;
+  }
+
+  /** Every stage record once (stages are stored under two keys, by id and by run and stage id). */
+  private uniqueStages(): WorkflowStageRecord[] {
+    return Array.from(
+      new Map(Array.from(this.stages.values(), (s) => [s.id, s])).values(),
+    );
   }
 
   /** Stage records of a run, deduplicated (stages are stored under two keys). */
@@ -695,28 +707,123 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
       .map((r) => ({ ...r }));
   }
 
-  async claimUnpublishedOutboxEvents(limit?: number): Promise<OutboxRecord[]> {
-    const effectiveLimit = limit ?? 100;
-    const now = this.now();
-    // Filter and stamp are synchronous: a concurrent flush that awaits
-    // this call after us sees `publishedAt` set and claims nothing.
-    const claimed = this.outbox
-      .filter((r) => r.publishedAt === null && r.dlqAt === null)
-      .sort((a, b) => {
-        const runCmp = a.workflowRunId.localeCompare(b.workflowRunId);
-        if (runCmp !== 0) return runCmp;
-        return a.sequence - b.sequence;
-      })
-      .slice(0, effectiveLimit);
-    for (const record of claimed) record.publishedAt = now;
-    return claimed.map((r) => ({ ...r }));
+  async claimOutboxDelivery(
+    limit: number,
+    claim: string,
+    now: Date,
+    excludedRunIds: readonly string[],
+    signal?: Pick<AbortSignal, "aborted">,
+  ): Promise<OutboxRecord[]> {
+    if (limit <= 0 || signal?.aborted) return [];
+    const excluded = new Set(excludedRunIds);
+    const blocked = new Set<string>();
+    const live = new Map<string, OutboxRecord[]>();
+    const deadline = now.toISOString();
+    for (const row of this.outbox) {
+      if (row.publishedAt !== null || row.dlqAt !== null) continue;
+      if (excluded.has(row.workflowRunId)) continue;
+      const lease = this.outboxClaims.get(row.id);
+      if (lease && lease.slice(0, 24) > deadline)
+        blocked.add(row.workflowRunId);
+      const events = live.get(row.workflowRunId) ?? [];
+      events.push(row);
+      live.set(row.workflowRunId, events);
+    }
+    const runs = [...live.keys()].sort();
+    const after = this.lastOutboxRun;
+    const split =
+      after === undefined ? 0 : runs.findIndex((run) => run > after);
+    const ordered =
+      split > 0 ? runs.slice(split).concat(runs.slice(0, split)) : runs;
+    // One head per available run, then each claimed run takes its next live
+    // events up to an equal share of the page, as the SQL claim does.
+    const heads = ordered.filter((run) => !blocked.has(run)).slice(0, limit);
+    const share = Math.floor(limit / Math.max(heads.length, 1));
+    const result: OutboxRecord[] = [];
+    for (const run of heads) {
+      const events = live
+        .get(run)!
+        .sort((a, b) => a.sequence - b.sequence)
+        .slice(0, share);
+      for (const row of events) {
+        this.outboxClaims.set(row.id, claim);
+        result.push({ ...row });
+      }
+      this.lastOutboxRun = run;
+    }
+    return result;
   }
 
-  async releaseOutboxEvents(ids: string[]): Promise<void> {
-    const idSet = new Set(ids);
-    for (const record of this.outbox) {
-      if (idSet.has(record.id)) record.publishedAt = null;
+  async isOutboxDeliveryClaimActive(
+    id: string,
+    claim: string,
+    now: Date,
+  ): Promise<boolean> {
+    const row = this.outbox.find((event) => event.id === id);
+    return (
+      !!row &&
+      row.publishedAt === null &&
+      row.dlqAt === null &&
+      this.outboxClaims.get(id) === claim &&
+      claim.slice(0, 24) > now.toISOString()
+    );
+  }
+
+  async completeOutboxDeliveries(
+    ids: readonly string[],
+    claim: string,
+    now: Date,
+  ): Promise<number> {
+    let published = 0;
+    for (const id of ids)
+      if (await this.completeOutboxDelivery(id, claim, now)) published++;
+    return published;
+  }
+
+  async completeOutboxDelivery(
+    id: string,
+    claim: string,
+    now: Date,
+  ): Promise<boolean> {
+    const row = this.outbox.find((event) => event.id === id);
+    if (
+      !row ||
+      row.publishedAt !== null ||
+      row.dlqAt !== null ||
+      this.outboxClaims.get(id) !== claim
+    )
+      return false;
+    row.publishedAt = now;
+    this.outboxClaims.delete(id);
+    return true;
+  }
+
+  async failOutboxDelivery(
+    id: string,
+    claim: string,
+    maxRetries: number,
+    now: Date,
+  ): Promise<"retry" | "dead-lettered" | "lost"> {
+    const row = this.outbox.find((event) => event.id === id);
+    if (
+      !row ||
+      row.publishedAt !== null ||
+      row.dlqAt !== null ||
+      this.outboxClaims.get(id) !== claim
+    )
+      return "lost";
+    row.retryCount++;
+    // Release this claim's later events of the run for the next flush.
+    for (const [other, owner] of this.outboxClaims) {
+      const event = this.outbox.find((e) => e.id === other);
+      if (owner === claim && event?.workflowRunId === row.workflowRunId)
+        this.outboxClaims.delete(other);
     }
+    if (row.retryCount >= maxRetries) {
+      row.dlqAt = now;
+      return "dead-lettered";
+    }
+    return "retry";
   }
 
   async markOutboxEventsPublished(ids: string[]): Promise<void> {
@@ -739,6 +846,9 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
     const record = this.outbox.find((r) => r.id === id);
     if (!record) throw new Error(`Outbox event not found: ${id}`);
     record.dlqAt = this.now();
+    // One write: a dead letter never keeps the flush's claim stamp.
+    record.publishedAt = null;
+    this.outboxClaims.delete(id);
   }
 
   async replayDLQEvents(maxEvents: number): Promise<number> {
@@ -748,6 +858,8 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
     for (const record of dlqEvents) {
       record.dlqAt = null;
       record.retryCount = 0;
+      record.publishedAt = null;
+      this.outboxClaims.delete(record.id);
     }
     return dlqEvents.length;
   }
@@ -1032,7 +1144,9 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
       ) {
         continue;
       }
-      const key = `${run.workflowId}\u0000${run.definitionVersion ?? ""}\u0000${run.status}`;
+      const key = `${run.workflowId}\u0000${run.definitionVersion ?? ""}\u0000${
+        run.status
+      }`;
       const bucket = buckets.get(key);
       if (bucket) {
         bucket.count += 1;
@@ -1055,6 +1169,66 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
     return Array.from(buckets.values());
   }
 
+  async getActiveWorkStats(now: Date): Promise<ActiveWorkStats> {
+    const runs = emptyActiveStatusCounts();
+    let oldestPendingCreatedAt: Date | null = null;
+    for (const run of this.runs.values()) {
+      if (!isActiveStatus(run.status)) continue;
+      runs[run.status]++;
+      if (
+        run.status === "PENDING" &&
+        (oldestPendingCreatedAt === null ||
+          run.createdAt < oldestPendingCreatedAt)
+      ) {
+        oldestPendingCreatedAt = run.createdAt;
+      }
+    }
+
+    const stages = emptyActiveStatusCounts();
+    let suspendedDue = 0;
+    let oldestSuspendedDueAt: Date | null = null;
+    for (const stage of this.uniqueStages()) {
+      if (!isActiveStatus(stage.status)) continue;
+      stages[stage.status]++;
+      if (
+        stage.status === "SUSPENDED" &&
+        stage.nextPollAt !== null &&
+        stage.nextPollAt <= now
+      ) {
+        suspendedDue++;
+        if (
+          oldestSuspendedDueAt === null ||
+          stage.nextPollAt < oldestSuspendedDueAt
+        ) {
+          oldestSuspendedDueAt = stage.nextPollAt;
+        }
+      }
+    }
+
+    let unpublished = 0;
+    let deadLettered = 0;
+    let oldestUnpublishedAt: Date | null = null;
+    for (const event of this.outbox) {
+      if (event.dlqAt !== null) {
+        deadLettered++;
+      } else if (event.publishedAt === null) {
+        unpublished++;
+        if (
+          oldestUnpublishedAt === null ||
+          event.occurredAt < oldestUnpublishedAt
+        ) {
+          oldestUnpublishedAt = event.occurredAt;
+        }
+      }
+    }
+
+    return {
+      runs: { byStatus: runs, oldestPendingCreatedAt },
+      stages: { byStatus: stages, suspendedDue, oldestSuspendedDueAt },
+      outbox: { unpublished, oldestUnpublishedAt, deadLettered },
+    };
+  }
+
   // ============================================================================
   // Test Helpers
   // ============================================================================
@@ -1072,6 +1246,8 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
     this.annotationSequence.clear();
     this.nextAnnotationSequence = 0;
     this.outbox = [];
+    this.outboxClaims.clear();
+    this.lastOutboxRun = undefined;
     this.idempotencyKeys.clear();
     this.idempotencyInProgress.clear();
     this.outboxSequences.clear();
@@ -1088,10 +1264,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
    * Get all stages for inspection
    */
   getAllStages(): WorkflowStageRecord[] {
-    // Filter out composite key duplicates
-    return Array.from(this.stages.values())
-      .filter((s) => this.stages.get(s.id) === s)
-      .map((s) => ({ ...s }));
+    return this.uniqueStages().map((s) => ({ ...s }));
   }
 
   /**
