@@ -1126,8 +1126,8 @@ export async function handleStagePollSuspended(
           deps,
           async (tx) => {
             await tx.updateStage(stageRecord.id, {
-              nextPollAt,
               expectedVersion: stageRecord.version,
+              nextPollAt,
             });
 
             if (bufferedAnnotations.length > 0) {
