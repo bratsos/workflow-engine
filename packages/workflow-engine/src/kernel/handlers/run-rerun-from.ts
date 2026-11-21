@@ -17,6 +17,8 @@ import type { RunRerunFromCommand, RunRerunFromResult } from "../commands";
 import type { HandlerResult, KernelDeps } from "../kernel";
 import { handleRunRedrive } from "./run-redrive.js";
 
+const RERUNNABLE = new Set(["COMPLETED", "FAILED"]);
+
 export async function handleRunRerunFrom(
   command: RunRerunFromCommand,
   deps: KernelDeps,
@@ -26,15 +28,8 @@ export async function handleRunRerunFrom(
   // `run.rerunFrom` has always refused a CANCELLED run, and its message is
   // part of its documented surface. `run.redrive` allows one; keep the
   // narrower contract here rather than widening it under a deprecated
-  // command.
-  const run = await deps.persistence.getRun(workflowRunId);
-  if (!run) throw new Error(`WorkflowRun ${workflowRunId} not found`);
-  if (run.status !== "COMPLETED" && run.status !== "FAILED") {
-    throw new Error(
-      `Cannot rerun workflow in ${run.status} state. Must be COMPLETED or FAILED.`,
-    );
-  }
-
+  // command. The redrive checks it on the read its run update is fenced on,
+  // so a cancel that commits while this command decides is refused too.
   const result = await handleRunRedrive(
     {
       type: "run.redrive",
@@ -43,6 +38,11 @@ export async function handleRunRerunFrom(
       idempotencyKey: command.idempotencyKey,
     },
     deps,
+    {
+      states: RERUNNABLE,
+      refuse: (status) =>
+        `Cannot rerun workflow in ${status} state. Must be COMPLETED or FAILED.`,
+    },
   );
 
   return {

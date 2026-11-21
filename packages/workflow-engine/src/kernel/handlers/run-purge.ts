@@ -17,19 +17,30 @@
  * runs still discoverable by the next purge, including after a process exit.
  * Cleanup can be partial and must be safe to repeat.
  *
- * INVARIANT: selection is a snapshot, and a redrive can reopen a run at any
- * point of the sweep. `deleteRun` repeats selection's check atomically, so a
- * reopened run is never deleted and the job it enqueues is never orphaned.
- * The run is also re-read before its cleanup and before its jobs go, so one
- * reopened earlier keeps its data and its job, and the result names only the
- * runs that were deleted. Cleanup already done for a run reopened after the
- * last read is not undone: a job lost that way is re-enqueued by
- * `run.reapStuck`.
+ * INVARIANT: selection is a snapshot. Before it touches a run, the sweep
+ * takes that run's purge claim (an idempotency key of type `PURGE_CLAIM`)
+ * and re-reads the run and its current stage records under it. `run.redrive`
+ * and a signal's wake take the same key first in their transactions and
+ * refuse while a purge holds it, so a run cannot be reopened, nor a wake
+ * committed, between that read and the run's deletion: cleanup never removes
+ * a live generation's data, and it covers the stage records that exist now,
+ * not the ones selection saw. A run redriven before the claim is no longer
+ * eligible and is skipped. A claim left by a crashed sweep goes stale after
+ * `PURGE_CLAIM_STALE_MS`.
+ *
+ * INVARIANT: a writer that read the run before it was deleted can still land
+ * afterwards (a delayed post-commit enqueue, a signal's ledger write). The
+ * sweep repeats its cleanup once the run is gone, and those writers check
+ * for the run (or stage) after writing and remove what they wrote when it is
+ * gone: whichever finishes second removes the data.
  *
  * Nothing is emitted. Retention is housekeeping, not a lifecycle event.
  */
 
-import type { PurgeableRunStatus } from "../../persistence/interface.js";
+import type {
+  PurgeableRun,
+  PurgeableRunStatus,
+} from "../../persistence/interface.js";
 import type { RunPurgeCommand, RunPurgeResult } from "../commands";
 import type { HandlerResult, KernelDeps } from "../kernel";
 import { jobSpillPrefix, stepSpillPrefix } from "../spill.js";
@@ -42,6 +53,36 @@ export const DEFAULT_PURGE_STATUSES: readonly PurgeableRunStatus[] = [
 ];
 
 export const DEFAULT_PURGE_LIMIT = 100;
+
+/** Idempotency type of the claim `run.purge` holds on a run while it deletes it. */
+export const PURGE_CLAIM = "run.purge.claim";
+
+/** Age after which a purge claim left by a crashed sweep can be taken over. */
+export const PURGE_CLAIM_STALE_MS = 10 * 60 * 1000;
+
+/**
+ * Refuses while a purge holds `workflowRunId`'s claim. Call it first in the
+ * transaction that writes the run: on Postgres the claim row it inserts and
+ * deletes keeps a purge from taking the claim until that transaction ends,
+ * and on SQLite the insert takes the writer lock.
+ */
+export async function assertNotPurging(
+  persistence: KernelDeps["persistence"],
+  workflowRunId: string,
+  now: Date,
+): Promise<void> {
+  const claim = await persistence.acquireIdempotencyKey(
+    workflowRunId,
+    PURGE_CLAIM,
+    { now, staleInProgressAfterMs: PURGE_CLAIM_STALE_MS },
+  );
+  if (claim.status !== "acquired") {
+    throw new Error(
+      `Run ${workflowRunId} is being deleted by run.purge; retry once the purge has finished`,
+    );
+  }
+  await persistence.releaseIdempotencyKey(workflowRunId, PURGE_CLAIM);
+}
 
 /**
  * Blob key prefixes the engine writes for one run. Stage outputs and
@@ -91,58 +132,82 @@ export async function handleRunPurge(
       ? {
           _postCommit: async (postDeps: KernelDeps) => {
             const deleted: string[] = [];
-            const eligible = async (id: string) => {
-              const run = await postDeps.persistence.getRun(id);
-              return (
-                run !== null &&
-                statuses.some((status) => status === run.status) &&
-                (run.completedAt ?? run.updatedAt) <= command.olderThan
-              );
-            };
-            for (const run of runs) {
-              if (!(await eligible(run.id))) continue;
+            const { persistence, stepLedger, jobTransport, blobStore } =
+              postDeps;
+            const cleanUp = async (run: PurgeableRun) => {
               for (const stageRecordId of run.stageRecordIds) {
                 // Before the rows that name these keys. An unreadable row
                 // leaves a key behind, which must not stall retention.
-                const steps = await postDeps.stepLedger
+                const steps = await stepLedger
                   ?.list(stageRecordId)
                   .catch(() => []);
                 for (const step of steps ?? []) {
                   if (step.kind !== "signal") continue;
-                  await postDeps.persistence.releaseIdempotencyKey(
+                  await persistence.releaseIdempotencyKey(
                     signalWakeKey(stageRecordId, step.stepId),
                     SIGNAL_WAKE,
                   );
                 }
-                await postDeps.stepLedger?.clear(stageRecordId);
+                await stepLedger?.clear(stageRecordId);
               }
               // job_queue has no foreign key to workflow_runs.
-              const jobs = await postDeps.jobTransport.getJobsByWorkflowRun(
-                run.id,
-              );
-              if (!(await eligible(run.id))) continue;
+              const jobs = await jobTransport.getJobsByWorkflowRun(run.id);
               const stageIds = Array.from(
                 new Set(jobs.map((job) => job.stageId)),
               );
               if (stageIds.length > 0) {
-                await postDeps.jobTransport.deleteByRunAndStages(
-                  run.id,
-                  stageIds,
-                );
+                await jobTransport.deleteByRunAndStages(run.id, stageIds);
               }
               for (const prefix of runBlobPrefixes(run)) {
-                const keys = await postDeps.blobStore.list(prefix);
+                const keys = await blobStore.list(prefix);
                 for (const key of keys) {
-                  await postDeps.blobStore.delete(key);
+                  await blobStore.delete(key);
                 }
               }
-              // Keep the cleanup keys reachable until every port succeeds.
-              const removed = await postDeps.persistence.deleteRun(
-                run.id,
-                command.olderThan,
-                statuses,
+            };
+            for (const selected of runs) {
+              const claim = await persistence.acquireIdempotencyKey(
+                selected.id,
+                PURGE_CLAIM,
+                {
+                  now: postDeps.clock.now(),
+                  staleInProgressAfterMs: PURGE_CLAIM_STALE_MS,
+                },
               );
-              if (removed) deleted.push(run.id);
+              // Another sweep is deleting it.
+              if (claim.status !== "acquired") continue;
+              try {
+                const current = await persistence.getRun(selected.id);
+                if (
+                  current === null ||
+                  !statuses.some((status) => status === current.status) ||
+                  (current.completedAt ?? current.updatedAt) > command.olderThan
+                ) {
+                  continue;
+                }
+                const run: PurgeableRun = {
+                  ...selected,
+                  stageRecordIds: (
+                    await persistence.getStagesByRun(selected.id)
+                  ).map((stage) => stage.id),
+                };
+                await cleanUp(run);
+                // Keep the cleanup keys reachable until every port succeeds.
+                const removed = await persistence.deleteRun(
+                  run.id,
+                  command.olderThan,
+                  statuses,
+                );
+                if (!removed) continue;
+                deleted.push(run.id);
+                // What a writer that read the run before it went landed
+                // since. Best effort: the run is already gone.
+                await cleanUp(run).catch(() => {});
+              } finally {
+                await persistence
+                  .releaseIdempotencyKey(selected.id, PURGE_CLAIM)
+                  .catch(() => {});
+              }
             }
             return { purged: deleted.length, workflowRunIds: deleted };
           },
