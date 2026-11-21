@@ -358,6 +358,16 @@ async function dropPollBlobs(
   for (const key of keys) await deps.blobStore.delete(key).catch(() => {});
 }
 
+/** Removes all a poll wrote to its folder, for a publication that failed part-way. */
+async function dropPollFolder(
+  stageRecord: WorkflowStageRecord,
+  workflowType: string,
+  deps: KernelDeps,
+): Promise<void> {
+  const prefix = `workflow-v2/${workflowType}/${stageRecord.workflowRunId}/${stageRecord.stageId}/${pollScope(stageRecord)}/`;
+  await dropPollBlobs(await deps.blobStore.list(prefix).catch(() => []), deps);
+}
+
 async function releaseStageClaim(
   stageRecord: WorkflowStageRecord,
   deps: KernelDeps,
@@ -556,7 +566,10 @@ async function replayStage(
             stageResult.artifacts,
             deps,
             pollScope(stageRecord),
-          )
+          ).catch(async (error) => {
+            await dropPollFolder(stageRecord, run.workflowType, deps);
+            throw error;
+          })
         : undefined;
     const duration =
       deps.clock.now().getTime() -
@@ -602,7 +615,11 @@ async function replayStage(
           toOutboxEvents(stageRecord.workflowRunId, events),
         );
       },
-    );
+    ).catch(async (error) => {
+      // Nothing committed points at the folder.
+      await dropPollFolder(stageRecord, run.workflowType, deps);
+      throw error;
+    });
     if (await handleClaimOutcome(claimResult, stageRecord, deps)) {
       await dropPollBlobs(
         [outputKey, ...Object.values(artifactKeys ?? {})],

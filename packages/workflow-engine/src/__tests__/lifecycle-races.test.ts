@@ -713,6 +713,44 @@ describe(`lifecycle races on ${realDatabase ? (sqlite ? "SQLite" : "Postgres") :
     expect(durable.calls()).toBe(2);
   });
 
+  it("removes what a replay published before a failed write once the retry succeeds", async () => {
+    const durable = signalWorkflow(async (call) => ({
+      output: { call },
+      artifacts: { first: { call }, second: { call } },
+    }));
+    const { send, runId } = await suspendOnSignal(durable, 3);
+    const blobs = ports.blobStore as unknown as Record<string, unknown>;
+    const put = ports.blobStore.put.bind(ports.blobStore);
+    let failures = 1;
+    blobs.put = async (...args: Parameters<typeof put>) => {
+      if (args[0].includes("/poll-") && args[0].endsWith("second.json")) {
+        if (failures-- > 0) throw new Error("blob store unavailable");
+      }
+      return put(...args);
+    };
+    try {
+      await send({ type: "stage.pollSuspended" });
+      // Skip the retry backoff.
+      const retrying = (await ports.persistence.getStage(runId, "s"))!;
+      await ports.persistence.updateStage(retrying.id, {
+        nextPollAt: new Date(0),
+      });
+      await send({ type: "stage.pollSuspended" });
+    } finally {
+      delete blobs.put;
+    }
+    const stage = (await ports.persistence.getStage(runId, "s"))!;
+    expect(stage.status).toBe("COMPLETED");
+    const output = (stage.outputData as { _artifactKey: string })._artifactKey;
+    const folder = output.slice(0, -"output.json".length);
+    const prefix = folder.slice(0, folder.lastIndexOf("/poll-") + 1);
+    expect(
+      (await ports.blobStore.list(prefix)).filter(
+        (key) => key.includes("/poll-") && !key.startsWith(folder),
+      ),
+    ).toEqual([]);
+  });
+
   /** One durable stage that waits for signal "go"; `after` runs once it arrives. */
   function signalWorkflow(after: (call: number) => Promise<unknown>) {
     let calls = 0;
