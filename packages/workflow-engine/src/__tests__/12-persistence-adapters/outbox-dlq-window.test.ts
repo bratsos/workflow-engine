@@ -2043,10 +2043,24 @@ describe.skipIf(!sqlite && !databaseUrl)(
           .map((s) => s.replace(/;$/, ""));
         expect(statements[0]).toBe("BEGIN IMMEDIATE");
         expect(statements.at(-1)).toBe("COMMIT");
-        const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite");
+        // node:sqlite needs Node 22.13; below it (CI's Prisma 6/7 floor) use the
+        // better-sqlite3 that the Prisma 7 fixture installs. Both APIs fit here.
+        const sqliteModule: string = process.getBuiltinModule?.("node:sqlite")
+          ? "node:sqlite"
+          : createRequire(
+              createRequire(
+                new URL(
+                  "../../../../prisma-fixtures/v7/package.json",
+                  import.meta.url,
+                ),
+              ).resolve("@prisma/adapter-better-sqlite3"),
+            ).resolve("better-sqlite3");
+        const sqliteLib = createRequire(import.meta.url)(sqliteModule);
+        const DatabaseSync = sqliteLib.DatabaseSync ?? sqliteLib;
         // In the child: apply the statements, stop after one of them and wait
         // to be killed. A one-page cache spills the uncommitted pages to disk.
-        const child = `const { DatabaseSync } = require("node:sqlite");
+        const child = `const lib = require(${JSON.stringify(sqliteModule)});
+          const DatabaseSync = lib.DatabaseSync ?? lib;
           const [file, journal, stop, json] = process.argv.slice(1);
           const db = new DatabaseSync(file);
           db.exec("PRAGMA journal_mode = " + journal + "; PRAGMA cache_size = 1");
