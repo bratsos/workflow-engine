@@ -13,11 +13,8 @@ export async function saveStageOutput(
   stageId: string,
   output: unknown,
   deps: KernelDeps,
-  /** A folder under the stage's prefix, for a writer that may be superseded. */
-  scope?: string,
 ): Promise<string> {
-  const dir = scope ? `${stageId}/${scope}` : stageId;
-  const key = `workflow-v2/${workflowType}/${runId}/${dir}/output.json`;
+  const key = `workflow-v2/${workflowType}/${runId}/${stageId}/output.json`;
   await deps.blobStore.put(key, output);
   return key;
 }

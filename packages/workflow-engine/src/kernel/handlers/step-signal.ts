@@ -4,7 +4,6 @@ import type { KernelEvent } from "../events.js";
 import { toOutboxEvents } from "../helpers/outbox-events.js";
 import type { HandlerResult, KernelDeps } from "../kernel.js";
 import type { StepLedger, StepRecord, WorkflowStageRecord } from "../ports.js";
-import { withPurgeHeldOff } from "./run-purge.js";
 
 /** Idempotency type of a signal's wake. `run.purge` releases these keys. */
 export const SIGNAL_WAKE = "step.signal.wake";
@@ -75,43 +74,39 @@ async function deliverSignal(
   // next signal completes a new one and that delivery must wake the stage too.
   const wake = async (record: StepRecord, alreadyCompleted: boolean) => {
     const delivery = record.updatedAt.getTime();
-    // A purge deleting the run releases wake keys before the rows that name
-    // them go; a key committed after that would outlive the run.
-    await deps.persistence.withTransaction((tx) =>
-      withPurgeHeldOff(tx, command.workflowRunId, async () => {
-        const key = signalWakeKey(stage.id, command.stepId);
-        let claim = await tx.acquireIdempotencyKey(key, SIGNAL_WAKE);
-        if (
-          claim.status === "replay" &&
-          (claim.result as { delivery?: number }).delivery !== delivery
-        ) {
-          await tx.releaseIdempotencyKey(key, SIGNAL_WAKE);
-          claim = await tx.acquireIdempotencyKey(key, SIGNAL_WAKE);
-        }
-        if (claim.status === "replay") return;
-        if (claim.status === "in_progress") {
-          throw new Error(
-            `Durable signal step "${command.stepId}" wake is in progress`,
-          );
-        }
-        const event: KernelEvent = {
-          type: "step:signalled",
-          timestamp: deps.clock.now(),
-          workflowRunId: command.workflowRunId,
-          stageId: command.stageId,
-          stepId: command.stepId,
-          payload: record.result,
-        };
-        await tx.updateStage(stage.id, { nextPollAt: deps.clock.now() });
-        await tx.appendOutboxEvents(
-          toOutboxEvents(command.workflowRunId, [event]),
+    await deps.persistence.withTransaction(async (tx) => {
+      const key = signalWakeKey(stage.id, command.stepId);
+      let claim = await tx.acquireIdempotencyKey(key, SIGNAL_WAKE);
+      if (
+        claim.status === "replay" &&
+        (claim.result as { delivery?: number }).delivery !== delivery
+      ) {
+        await tx.releaseIdempotencyKey(key, SIGNAL_WAKE);
+        claim = await tx.acquireIdempotencyKey(key, SIGNAL_WAKE);
+      }
+      if (claim.status === "replay") return;
+      if (claim.status === "in_progress") {
+        throw new Error(
+          `Durable signal step "${command.stepId}" wake is in progress`,
         );
-        await tx.completeIdempotencyKey(key, SIGNAL_WAKE, {
-          signalled: true,
-          delivery,
-        });
-      }),
-    );
+      }
+      const event: KernelEvent = {
+        type: "step:signalled",
+        timestamp: deps.clock.now(),
+        workflowRunId: command.workflowRunId,
+        stageId: command.stageId,
+        stepId: command.stepId,
+        payload: record.result,
+      };
+      await tx.updateStage(stage.id, { nextPollAt: deps.clock.now() });
+      await tx.appendOutboxEvents(
+        toOutboxEvents(command.workflowRunId, [event]),
+      );
+      await tx.completeIdempotencyKey(key, SIGNAL_WAKE, {
+        signalled: true,
+        delivery,
+      });
+    });
     return {
       signalled: true as const,
       ok: true as const,

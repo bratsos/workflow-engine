@@ -1,5 +1,4 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { PURGE_CLAIM } from "../kernel/handlers/run-purge.js";
 import {
   type KernelDatabase,
   kernelDatabase,
@@ -153,7 +152,7 @@ describe.skipIf(!realDatabase)(
     it.each([
       "ledger",
       "blob",
-    ] as const)("refuses a redrive while the sweep is in its %s cleanup", async (where) => {
+    ] as const)("keeps a run and its job when it is redriven during its %s cleanup", async (where) => {
       const { id } = await seedPurge();
       const { reached, open, pause } = pauseOnce();
       const purge = pausing(where, pause).dispatch({
@@ -161,13 +160,45 @@ describe.skipIf(!realDatabase)(
         olderThan: new Date(),
       });
       await reached;
-      await expect(redrive(id)).rejects.toThrow(/being deleted by run\.purge/);
+      await redrive(id);
       open();
-      await expect(purge).resolves.toEqual({ purged: 1, workflowRunIds: [id] });
-      expect(await db.persistence.getRun(id)).toBeNull();
+      await expect(purge).resolves.toEqual({ purged: 0, workflowRunIds: [] });
+      expect((await db.persistence.getRun(id))?.status).toBe("RUNNING");
+      expect(
+        (await db.jobTransport.getJobsByWorkflowRun(id)).map(
+          (job) => job.status,
+        ),
+      ).toEqual(["PENDING"]);
+      await expect(
+        db.kernel.dispatch({ type: "run.purge", olderThan: new Date() }),
+      ).resolves.toEqual({ purged: 0, workflowRunIds: [] });
+    });
+
+    it("recovers through run.reapStuck a job the sweep removed after its last check", async () => {
+      const { id } = await seedPurge();
+      const { reached, open, pause } = pauseOnce();
+      const purge = db
+        .makeKernel({
+          jobTransport: override(db.jobTransport, {
+            deleteByRunAndStages: async (runId, stageIds) => {
+              await pause();
+              return db.jobTransport.deleteByRunAndStages(runId, stageIds);
+            },
+          }),
+        })
+        .dispatch({ type: "run.purge", olderThan: new Date() });
+      await reached;
+      await redrive(id);
+      open();
+      await expect(purge).resolves.toEqual({ purged: 0, workflowRunIds: [] });
       expect(await db.jobTransport.getJobsByWorkflowRun(id)).toEqual([]);
-      // The claim goes with the sweep.
-      await expect(redrive(id)).rejects.toThrow(/not found/);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await db.kernel.dispatch({ type: "run.reapStuck", stuckThresholdMs: 0 });
+      expect(
+        (await db.jobTransport.getJobsByWorkflowRun(id)).map(
+          (job) => job.status,
+        ),
+      ).toEqual(["PENDING"]);
     });
 
     it("leaves a selected run untouched when it is redriven before the sweep reaches it", async () => {
@@ -195,22 +226,13 @@ describe.skipIf(!realDatabase)(
       ).toHaveLength(1);
     });
 
-    it("keeps a run that was redriven and finished again before the sweep claimed it", async () => {
+    it("keeps a run that was redriven and finished again during the sweep", async () => {
       const { id } = await seedPurge();
       const { reached, open, pause } = pauseOnce();
-      const purge = db
-        .makeKernel({
-          persistence: override(db.persistence, {
-            acquireIdempotencyKey: async (key, type, options) => {
-              if (type === PURGE_CLAIM) await pause();
-              return db.persistence.acquireIdempotencyKey(key, type, options);
-            },
-          }),
-        })
-        .dispatch({
-          type: "run.purge",
-          olderThan: new Date("2021-01-01T00:00:00Z"),
-        });
+      const purge = pausing("blob", pause).dispatch({
+        type: "run.purge",
+        olderThan: new Date("2021-01-01T00:00:00Z"),
+      });
       await reached;
       await redrive(id);
       await db.persistence.updateRun(id, {

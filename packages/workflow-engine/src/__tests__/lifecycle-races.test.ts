@@ -172,46 +172,6 @@ describe(`lifecycle races on ${realDatabase ? (sqlite ? "SQLite" : "Postgres") :
     expect((await wake(current, "ready")).status).toBe("acquired");
   });
 
-  it("refuses a redrive while the sweep deletes the run, so no new attempt loses its data", async () => {
-    const send = kernel();
-    const runId = await createClaimed(send);
-    await send({
-      type: "job.execute",
-      workflowRunId: runId,
-      workflowId: workflow.id,
-      stageId: "s",
-      config: {},
-    });
-    await send({ type: "run.transition", workflowRunId: runId });
-    const { blobStore } = ports;
-    let redrive: unknown;
-    const purge = kernel({
-      blobStore: override(blobStore, {
-        list: async (prefix) => {
-          if (redrive === undefined && prefix.includes(runId)) {
-            redrive = await send({
-              type: "run.redrive",
-              workflowRunId: runId,
-            }).catch((error: Error) => error.message);
-          }
-          return blobStore.list(prefix);
-        },
-      }),
-    });
-
-    await expect(
-      purge({ type: "run.purge", olderThan: later() }),
-    ).resolves.toEqual({
-      purged: 1,
-      workflowRunIds: [runId],
-    });
-    expect(redrive).toMatch(/being deleted by run\.purge/);
-    expect(await ports.persistence.getRun(runId)).toBeNull();
-    expect(
-      await blobStore.list(`workflow-v2/${workflow.id}/${runId}/`),
-    ).toEqual([]);
-  });
-
   it("removes a first-stage job whose delayed enqueue lands after the run was purged", async () => {
     const send = kernel();
     const spilling = createSpillingJobTransport(ports.jobTransport, {
@@ -249,42 +209,6 @@ describe(`lifecycle races on ${realDatabase ? (sqlite ? "SQLite" : "Postgres") :
     });
     expect(await ports.jobTransport.getJobsByWorkflowRun(runId)).toEqual([]);
     expect(await ports.blobStore.list(jobSpillPrefix(runId))).toEqual([]);
-  });
-
-  it("refuses a signal's wake while the sweep deletes the run and leaves nothing behind", async () => {
-    const external = new InMemoryStepLedger();
-    const send = kernel({ stepLedger: external });
-    const runId = await createClaimed(send);
-    await send({ type: "run.cancel", workflowRunId: runId });
-    const id = await stageRecordId(runId);
-    const { persistence } = ports;
-    let signal: unknown;
-    const purge = kernel({
-      stepLedger: external,
-      persistence: override(persistence, {
-        deleteRun: async (...args) => {
-          signal = await send({
-            type: "step.signal",
-            workflowRunId: runId,
-            stageId: "s",
-            stepId: "late",
-            payload: big,
-          }).catch((error: Error) => error.message);
-          return persistence.deleteRun(...args);
-        },
-      }),
-    });
-
-    await expect(
-      purge({ type: "run.purge", olderThan: later() }),
-    ).resolves.toEqual({
-      purged: 1,
-      workflowRunIds: [runId],
-    });
-    expect(signal).toMatch(/being deleted by run\.purge/);
-    expect(await external.list(id)).toEqual([]);
-    expect(await ports.blobStore.list(stepSpillPrefix(id))).toEqual([]);
-    expect((await wake(id, "late")).status).toBe("acquired");
   });
 
   it("removes what a signal wrote after the sweep had finished with its stage", async () => {
@@ -432,10 +356,6 @@ describe(`lifecycle races on ${realDatabase ? (sqlite ? "SQLite" : "Postgres") :
       const output = (winner?.outputData as { _artifactKey: string })
         ._artifactKey;
       expect(await ports.blobStore.get(output)).toEqual({ winner: "job" });
-      const prefix = receipt.slice(0, -"receipt".length);
-      expect(
-        (await ports.blobStore.list(prefix)).filter((k) => k.includes("poll-")),
-      ).toEqual([]);
       const events = (await ports.persistence.getUnpublishedOutboxEvents(1000))
         .filter((e) => e.workflowRunId === runId)
         .map((e) => e.eventType);
@@ -654,11 +574,6 @@ describe(`lifecycle races on ${realDatabase ? (sqlite ? "SQLite" : "Postgres") :
       const output = (winner?.outputData as { _artifactKey: string })
         ._artifactKey;
       expect(await ports.blobStore.get(output)).toEqual({ winner: "job" });
-      expect(
-        await ports.blobStore.list(
-          `${output.slice(0, output.lastIndexOf("/") + 1)}poll-`,
-        ),
-      ).toEqual([]);
     });
 
     it.each([
@@ -711,44 +626,6 @@ describe(`lifecycle races on ${realDatabase ? (sqlite ? "SQLite" : "Postgres") :
     );
     expect((await ports.persistence.getRun(runId))?.status).toBe("FAILED");
     expect(durable.calls()).toBe(2);
-  });
-
-  it("removes what a replay published before a failed write once the retry succeeds", async () => {
-    const durable = signalWorkflow(async (call) => ({
-      output: { call },
-      artifacts: { first: { call }, second: { call } },
-    }));
-    const { send, runId } = await suspendOnSignal(durable, 3);
-    const blobs = ports.blobStore as unknown as Record<string, unknown>;
-    const put = ports.blobStore.put.bind(ports.blobStore);
-    let failures = 1;
-    blobs.put = async (...args: Parameters<typeof put>) => {
-      if (args[0].includes("/poll-") && args[0].endsWith("second.json")) {
-        if (failures-- > 0) throw new Error("blob store unavailable");
-      }
-      return put(...args);
-    };
-    try {
-      await send({ type: "stage.pollSuspended" });
-      // Skip the retry backoff.
-      const retrying = (await ports.persistence.getStage(runId, "s"))!;
-      await ports.persistence.updateStage(retrying.id, {
-        nextPollAt: new Date(0),
-      });
-      await send({ type: "stage.pollSuspended" });
-    } finally {
-      delete blobs.put;
-    }
-    const stage = (await ports.persistence.getStage(runId, "s"))!;
-    expect(stage.status).toBe("COMPLETED");
-    const output = (stage.outputData as { _artifactKey: string })._artifactKey;
-    const folder = output.slice(0, -"output.json".length);
-    const prefix = folder.slice(0, folder.lastIndexOf("/poll-") + 1);
-    expect(
-      (await ports.blobStore.list(prefix)).filter(
-        (key) => key.includes("/poll-") && !key.startsWith(folder),
-      ),
-    ).toEqual([]);
   });
 
   /** One durable stage that waits for signal "go"; `after` runs once it arrives. */
@@ -820,258 +697,6 @@ describe(`lifecycle races on ${realDatabase ? (sqlite ? "SQLite" : "Postgres") :
     });
     return { send, runId, execute };
   }
-
-  it("lets run.purge finish the ledger clear of records a restart deleted when its own clear failed", async () => {
-    const external = new InMemoryStepLedger();
-    const clear = external.clear.bind(external);
-    let failures = 1;
-    external.clear = async (id) => {
-      if (failures-- > 0) throw new Error("ledger unavailable");
-      return clear(id);
-    };
-    const send = kernel({ stepLedger: external });
-    const runId = await createClaimed(send);
-    const old = await stageRecordId(runId);
-    await send({
-      type: "step.signal",
-      workflowRunId: runId,
-      stageId: "s",
-      stepId: "ready",
-      payload: big,
-    });
-    await send({ type: "run.cancel", workflowRunId: runId });
-    await expect(
-      send({
-        type: "run.redrive",
-        workflowRunId: runId,
-        from: { kind: "start" },
-      }),
-    ).rejects.toThrow("ledger unavailable");
-    expect(await external.list(old)).toHaveLength(1);
-    await send({ type: "run.cancel", workflowRunId: runId });
-
-    await expect(
-      send({ type: "run.purge", olderThan: later() }),
-    ).resolves.toEqual({ purged: 1, workflowRunIds: [runId] });
-    expect(await external.list(old)).toEqual([]);
-    expect(await ports.blobStore.list(stepSpillPrefix(old))).toEqual([]);
-    expect((await wake(old, "ready")).status).toBe("acquired");
-    expect(
-      (
-        await ports.persistence.acquireIdempotencyKey(
-          runId,
-          "run.redrive.pendingLedgerClear",
-        )
-      ).status,
-    ).toBe("acquired");
-  });
-
-  describe("purge claim ownership", () => {
-    const stale = 11 * 60_000;
-    let offset = 0;
-    const clock = { now: () => new Date(Date.now() + offset) };
-    const redrive = (send: ReturnType<typeof kernel>, runId: string) =>
-      send({
-        type: "run.redrive",
-        workflowRunId: runId,
-        from: { kind: "start" },
-      });
-    const signalled = async (send: ReturnType<typeof kernel>) => {
-      const runId = await createClaimed(send);
-      await send({
-        type: "step.signal",
-        workflowRunId: runId,
-        stageId: "s",
-        stepId: "ready",
-        payload: big,
-      });
-      await send({ type: "run.cancel", workflowRunId: runId });
-      return runId;
-    };
-    beforeEach(() => {
-      offset = 0;
-    });
-
-    it("never lets a redrive take over a purge claim, however old", async () => {
-      const send = kernel({ clock });
-      const runId = await signalled(send);
-      await ports.persistence.acquireIdempotencyKey(runId, "run.purge.claim");
-      offset = stale;
-      await expect(redrive(send, runId)).rejects.toThrow(
-        "being deleted by run.purge",
-      );
-      await expect(
-        send({ type: "run.purge", olderThan: later() }),
-      ).resolves.toEqual({ purged: 1, workflowRunIds: [runId] });
-    });
-
-    it("keeps a run whose sweep failed part-way from redrive until the next purge finishes it", async () => {
-      let failures = 1;
-      const send = kernel({
-        blobStore: override(ports.blobStore, {
-          list: async (prefix: string) => {
-            // The sweep's own listing, after the ledger was cleared.
-            if (!prefix.startsWith("workflow-v2/spill/") && failures-- > 0)
-              throw new Error("blob store unavailable");
-            return ports.blobStore.list(prefix);
-          },
-        }),
-      });
-      const runId = await signalled(send);
-      await expect(
-        send({ type: "run.purge", olderThan: later() }),
-      ).rejects.toThrow("blob store unavailable");
-      await expect(redrive(send, runId)).rejects.toThrow(
-        "being deleted by run.purge",
-      );
-      await expect(
-        send({ type: "run.purge", olderThan: later() }),
-      ).resolves.toEqual({ purged: 1, workflowRunIds: [runId] });
-    });
-
-    it("stops a sweep that outlives its claim before its next delete and leaves the claim alone", async () => {
-      const send = kernel({
-        clock,
-        blobStore: override(ports.blobStore, {
-          list: async (prefix: string) => {
-            offset = stale;
-            return ports.blobStore.list(prefix);
-          },
-        }),
-      });
-      const runId = await signalled(send);
-      await expect(
-        send({ type: "run.purge", olderThan: later() }),
-      ).rejects.toThrow("went stale mid-sweep");
-      expect(await ports.persistence.getRun(runId)).not.toBeNull();
-      expect(
-        (
-          await ports.persistence.acquireIdempotencyKey(
-            runId,
-            "run.purge.claim",
-          )
-        ).status,
-      ).toBe("in_progress");
-    });
-  });
-
-  it("keeps the pending ledger clears a later restart added while an earlier one finished its own", async () => {
-    const external = new InMemoryStepLedger();
-    const clear = external.clear.bind(external);
-    const held = gate();
-    let pauseOn = "";
-    let failOn = "";
-    external.clear = async (id) => {
-      if (id === pauseOn) {
-        pauseOn = "";
-        await held.pause();
-      }
-      if (id === failOn) throw new Error("ledger unavailable");
-      return clear(id);
-    };
-    const send = kernel({ stepLedger: external });
-    const signal = (runId: string) =>
-      send({
-        type: "step.signal",
-        workflowRunId: runId,
-        stageId: "s",
-        stepId: "ready",
-        payload: big,
-      });
-    const runId = await createClaimed(send);
-    const first = await stageRecordId(runId);
-    await signal(runId);
-    await send({ type: "run.cancel", workflowRunId: runId });
-    pauseOn = first;
-    const earlier = send({
-      type: "run.redrive",
-      workflowRunId: runId,
-      from: { kind: "start" },
-    });
-    await held.reached;
-    const second = await stageRecordId(runId);
-    await signal(runId);
-    await send({ type: "run.cancel", workflowRunId: runId });
-    failOn = second;
-    await expect(
-      send({
-        type: "run.redrive",
-        workflowRunId: runId,
-        from: { kind: "start" },
-      }),
-    ).rejects.toThrow("ledger unavailable");
-    held.open();
-    await earlier;
-    failOn = "";
-    await send({ type: "run.cancel", workflowRunId: runId });
-
-    await send({ type: "run.purge", olderThan: later() });
-    expect(await external.list(second)).toEqual([]);
-  });
-
-  it("keeps a restart's deleted record pending until its spilled results are gone", async () => {
-    let failures = 1;
-    const send = kernel({
-      blobStore: override(ports.blobStore, {
-        delete: async (key: string) => {
-          if (key.startsWith("workflow-v2/spill/steps/") && failures-- > 0) {
-            throw new Error("blob store unavailable");
-          }
-          return ports.blobStore.delete(key);
-        },
-      }),
-    });
-    const runId = await createClaimed(send);
-    const old = await stageRecordId(runId);
-    await send({
-      type: "step.signal",
-      workflowRunId: runId,
-      stageId: "s",
-      stepId: "ready",
-      payload: big,
-    });
-    expect(await ports.blobStore.list(stepSpillPrefix(old))).not.toEqual([]);
-    await send({ type: "run.cancel", workflowRunId: runId });
-    await send({
-      type: "run.redrive",
-      workflowRunId: runId,
-      from: { kind: "start" },
-    });
-    expect(await ports.blobStore.list(stepSpillPrefix(old))).toEqual([]);
-  });
-
-  it("leaves the poll folder of a record the restart did not delete", async () => {
-    let poll = "";
-    const send = kernel({
-      blobStore: override(ports.blobStore, {
-        list: async (prefix: string) => {
-          const current = await ports.persistence.getStage(runId, "s");
-          if (!poll && current && prefix.endsWith("/s/")) {
-            // A poll of the new record writing just before the listing.
-            poll = `${prefix}poll-${current.id}-${current.version}/output.json`;
-            await ports.blobStore.put(poll, { winner: "poll" });
-          }
-          return ports.blobStore.list(prefix);
-        },
-      }),
-    });
-    const runId = await createClaimed(send);
-    await send({
-      type: "job.execute",
-      workflowRunId: runId,
-      workflowId: workflow.id,
-      stageId: "s",
-      config: {},
-    });
-    await send({ type: "run.cancel", workflowRunId: runId });
-    await send({
-      type: "run.redrive",
-      workflowRunId: runId,
-      from: { kind: "start" },
-    });
-    expect(poll).not.toBe("");
-    expect(await ports.blobStore.get(poll)).toEqual({ winner: "poll" });
-  });
 
   it("keeps the output of a new attempt that completed during the restart's cleanup", async () => {
     const send = kernel();
@@ -1159,8 +784,7 @@ describe(`lifecycle races on ${realDatabase ? (sqlite ? "SQLite" : "Postgres") :
     },
   );
 
-  // On the databases the purge claim each redrive takes first serializes the
-  // two commands, so the cancel cannot land inside this window.
+  // Memory only: the window is opened by patching the in-memory port.
   it.skipIf(realDatabase)(
     "refuses a rerunFrom whose run was cancelled while it decided",
     async () => {
@@ -1180,9 +804,8 @@ describe(`lifecycle races on ${realDatabase ? (sqlite ? "SQLite" : "Postgres") :
       persistence.getRun = async (id) => {
         const run = await getRun(id);
         persistence.getRun = getRun;
-        // A writer that does not take the purge claim (a cancel of the
-        // run a concurrent redrive reopened) moves the version on.
-        await persistence.updateRun(id, { status: "CANCELLED" });
+        await send({ type: "run.redrive", workflowRunId: runId });
+        await send({ type: "run.cancel", workflowRunId: runId });
         return run;
       };
 

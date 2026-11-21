@@ -325,8 +325,10 @@ async function claimSuspendedStage(
  * Whether the stage row moved on while this poller ran user code: a job
  * completed it, a cancel or redrive replaced it, another poller took it
  * over. Checked before the poller's first write, and every Phase-2 stage
- * write is fenced on the claimed version too, so a superseded poll writes
- * nothing of its own. What user code itself wrote meanwhile (`ctx.storage`,
+ * write is fenced on the claimed version too, so a superseded poll commits
+ * nothing. Output and artifacts go to the stage's own keys before the
+ * fenced write, as on main: a poll superseded between this check and that
+ * write has overwritten the winner's bytes. What user code itself wrote meanwhile (`ctx.storage`,
  * `ctx.log`, step rows) is not covered. A failed read proceeds: the fenced
  * write is the guard, and a read error is not a failure of the user code.
  */
@@ -340,32 +342,6 @@ async function superseded(
   return (
     current?.id !== stageRecord.id || current.version !== stageRecord.version
   );
-}
-
-/**
- * Folder for the output and artifacts a poll writes before its fenced
- * commit, so a poll that loses the fence never overwrites the bytes of the
- * execution that won it. Unique per stage record and claim.
- */
-const pollScope = (stageRecord: WorkflowStageRecord) =>
-  `poll-${stageRecord.id}-${stageRecord.version}`;
-
-/** Removes the bytes a poll wrote for a commit it lost. */
-async function dropPollBlobs(
-  keys: readonly string[],
-  deps: KernelDeps,
-): Promise<void> {
-  for (const key of keys) await deps.blobStore.delete(key).catch(() => {});
-}
-
-/** Removes all a poll wrote to its folder, for a publication that failed part-way. */
-async function dropPollFolder(
-  stageRecord: WorkflowStageRecord,
-  workflowType: string,
-  deps: KernelDeps,
-): Promise<void> {
-  const prefix = `workflow-v2/${workflowType}/${stageRecord.workflowRunId}/${stageRecord.stageId}/${pollScope(stageRecord)}/`;
-  await dropPollBlobs(await deps.blobStore.list(prefix).catch(() => []), deps);
 }
 
 async function releaseStageClaim(
@@ -555,7 +531,6 @@ async function replayStage(
       stageRecord.stageId,
       validatedOutput,
       deps,
-      pollScope(stageRecord),
     );
     const artifactKeys =
       stageResult.artifacts && Object.keys(stageResult.artifacts).length > 0
@@ -565,11 +540,7 @@ async function replayStage(
             stageRecord.stageId,
             stageResult.artifacts,
             deps,
-            pollScope(stageRecord),
-          ).catch(async (error) => {
-            await dropPollFolder(stageRecord, run.workflowType, deps);
-            throw error;
-          })
+          )
         : undefined;
     const duration =
       deps.clock.now().getTime() -
@@ -615,18 +586,8 @@ async function replayStage(
           toOutboxEvents(stageRecord.workflowRunId, events),
         );
       },
-    ).catch(async (error) => {
-      // Nothing committed points at the folder.
-      await dropPollFolder(stageRecord, run.workflowType, deps);
-      throw error;
-    });
-    if (await handleClaimOutcome(claimResult, stageRecord, deps)) {
-      await dropPollBlobs(
-        [outputKey, ...Object.values(artifactKeys ?? {})],
-        deps,
-      );
-      return "skip";
-    }
+    );
+    if (await handleClaimOutcome(claimResult, stageRecord, deps)) return "skip";
     postCommits.push(() =>
       completeSuspendedJobRow(
         stageRecord.workflowRunId,
@@ -1041,7 +1002,6 @@ export async function handleStagePollSuspended(
             stageRecord.stageId,
             validatedOutput,
             deps,
-            pollScope(stageRecord),
           );
           outputRef = { _artifactKey: outputKey };
         }
@@ -1088,10 +1048,7 @@ export async function handleStagePollSuspended(
           },
         );
 
-        if (await skipAfterClaim(claimResult)) {
-          if (outputRef) await dropPollBlobs([outputRef._artifactKey], deps);
-          continue;
-        }
+        if (await skipAfterClaim(claimResult)) continue;
 
         resumed++;
         resumedWorkflowRunIds.add(stageRecord.workflowRunId);

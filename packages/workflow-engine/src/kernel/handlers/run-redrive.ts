@@ -65,12 +65,6 @@ import {
 import { isTransactionReadBound } from "../helpers/transaction-reads.js";
 import type { HandlerResult, KernelDeps } from "../kernel";
 import type { StepRecord } from "../ports";
-import { stepSpillPrefix } from "../spill.js";
-import {
-  addPendingLedgerClears,
-  retirePendingLedgerClears,
-  withPurgeHeldOff,
-} from "./run-purge.js";
 import { SIGNAL_WAKE, signalWakeKey } from "./step-signal.js";
 
 /**
@@ -164,22 +158,10 @@ const REDRIVE_SOURCES: RedriveSourceStates = {
     `Cannot redrive a run in ${status} state. Must be COMPLETED, FAILED or CANCELLED.`,
 };
 
-export function handleRunRedrive(
+export async function handleRunRedrive(
   command: RunRedriveCommand,
   deps: KernelDeps,
   sources: RedriveSourceStates = REDRIVE_SOURCES,
-): Promise<HandlerResult<RunRedriveResult>> {
-  // First, so the status read below is the one the run update is fenced on
-  // and no purge can delete the run's data under the new attempt.
-  return withPurgeHeldOff(deps.persistence, command.workflowRunId, () =>
-    redrive(command, deps, sources),
-  );
-}
-
-async function redrive(
-  command: RunRedriveCommand,
-  deps: KernelDeps,
-  sources: RedriveSourceStates,
 ): Promise<HandlerResult<RunRedriveResult>> {
   const { workflowRunId } = command;
   const from: RunRedriveFrom = command.from ?? { kind: "lastFailure" };
@@ -387,7 +369,6 @@ async function redrive(
   // references into its own storage, and the new attempt overwrites its
   // output and artifacts by key anyway.
   //
-  //
   // Keys an outputData points at are kept: a deleted record's, so a caller
   // whose own transaction rolls this redrive back finds its restored
   // pointers intact, and a current record's, so a new attempt that
@@ -396,7 +377,6 @@ async function redrive(
   // run.purge. Listing waits for the commit: an unbound blob store read
   // inside the transaction can wait on the transaction's own lock.
   const deletedOutputKeys = stagesToDelete.flatMap(outputKeys);
-  const deletedRecordIds = stagesToDelete.map((stage) => stage.id);
   const blobPrefixesToDelete = stagesToDelete.map(
     (stage) =>
       `workflow-v2/${run.workflowType}/${workflowRunId}/${stage.stageId}/`,
@@ -412,16 +392,6 @@ async function redrive(
     }
     await deps.persistence.deleteStage(stage.id);
   }
-  // Which deleted records still need their ledger cleared, written with
-  // the deletes, so run.purge can finish a post-commit clear that failed.
-  const pendingClears =
-    deps.stepLedger && stagesToDelete.length > 0
-      ? await addPendingLedgerClears(
-          deps.persistence,
-          workflowRunId,
-          stagesToDelete.map((stage) => stage.id),
-        )
-      : [];
 
   // A reopened record goes back to what a record that has never run looks
   // like - PENDING, no outcome - on its next attempt, fenced on the
@@ -511,22 +481,8 @@ async function redrive(
       // record of the superseded attempt. A reopened record's ledger gets
       // the reset planned above: completed rows and rows naming an
       // external effect stay, the rest go.
-      for (const stageRecordId of pendingClears) {
-        await postDeps.stepLedger?.clear(stageRecordId);
-        // The ledger's own spill cleanup swallows errors; a record stays
-        // pending until its spilled results are really gone.
-        for (const key of await postDeps.blobStore.list(
-          stepSpillPrefix(stageRecordId),
-        )) {
-          await postDeps.blobStore.delete(key);
-        }
-      }
-      if (pendingClears.length > 0) {
-        await retirePendingLedgerClears(
-          postDeps.persistence,
-          workflowRunId,
-          pendingClears,
-        );
+      for (const stage of stagesToDelete) {
+        await postDeps.stepLedger?.clear(stage.id);
       }
       if (postDeps.stepLedger) {
         for (const [stageRecordId, plan] of ledgerResets) {
@@ -549,17 +505,6 @@ async function redrive(
         ]);
         for (const key of keys) {
           if (kept.has(key)) continue;
-          // A poll folder belongs to the record it names: only a deleted
-          // record's goes.
-          const poll = key.slice(prefix.length).startsWith("poll-");
-          if (
-            poll &&
-            !deletedRecordIds.some((id) =>
-              key.startsWith(`${prefix}poll-${id}-`),
-            )
-          ) {
-            continue;
-          }
           await postDeps.blobStore.delete(key).catch(() => {});
         }
       }
