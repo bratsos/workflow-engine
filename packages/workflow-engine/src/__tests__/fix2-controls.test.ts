@@ -721,10 +721,11 @@ describe.skipIf(!realDatabase)(
             stageId: "first",
             config: {},
             attempt,
-            maxAttempts: attempt,
+            maxAttempts: 1,
           });
         await signal("first");
-        // The last attempt fails, then a re-delivered job resets the ledger.
+        // The last attempt fails, then a re-delivered job past its budget
+        // resets the ledger.
         await execute(1);
         failing = false;
         expect((await execute(2)).outcome).toBe("suspended");

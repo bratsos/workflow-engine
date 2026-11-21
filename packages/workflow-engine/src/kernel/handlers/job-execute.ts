@@ -125,17 +125,19 @@ export async function handleJobExecute(
       _events: [],
     };
   }
-  // A numbered delivery past the first that meets a FAILED stage is the
-  // same job delivered again after its acknowledgement was lost (a terminal
-  // verdict FAILED the stage and the queue never heard). It is answered as
-  // the retry main would have run: completed steps stay completed, failed
-  // ones re-open (below). Any other execution of a FAILED stage starts it
+  // A numbered delivery within its budget, past the first, that meets a
+  // FAILED stage is the same job delivered again after its acknowledgement
+  // was lost: only a terminal verdict FAILs a stage with attempts left. It
+  // is answered as the retry main would have run: completed steps stay
+  // completed, failed ones re-open (below). Any other execution of a FAILED
+  // stage (a delivery past its budget, an unnumbered dispatch) starts it
   // fresh, as before.
   const redelivered =
     existingStage?.status === "FAILED" &&
     existingStage.errorMessage != null &&
     command.attempt !== undefined &&
-    command.attempt > 1;
+    command.attempt > 1 &&
+    command.attempt <= (command.maxAttempts ?? HOST_DEFAULTS.maxAttempts);
   if (existingStage?.status === "FAILED" && !redelivered) {
     await resetStageStepsForFreshAttempt(workflowRunId, existingStage.id, deps);
   }
