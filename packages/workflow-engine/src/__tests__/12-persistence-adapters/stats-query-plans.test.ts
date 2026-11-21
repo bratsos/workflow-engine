@@ -362,10 +362,14 @@ describe.skipIf(!sqlite && !databaseUrl)(
       // Only what touches an engine table: a driver also logs statements of its
       // own (the Prisma 6 engine's connection check is `SELECT 1`) and the
       // client's `BEGIN` and `COMMIT`, which are no query of the engine's.
-      // An asynchronous query event from the previous EXPLAIN can also
-      // arrive while recording the next operation.
+      // An asynchronous query event from the previous EXPLAIN, or from this
+      // file's catalog probes (`analysedTables`, which name the engine tables
+      // as `::regclass`), can also arrive while recording the next operation.
       return statements.filter(
-        (s) => ENGINE_TABLE.test(s.sql) && !/^\s*EXPLAIN\b/i.test(s.sql),
+        (s) =>
+          ENGINE_TABLE.test(s.sql) &&
+          !/^\s*EXPLAIN\b/i.test(s.sql) &&
+          !/\bFROM pg_(?:statistic|class)\b/.test(s.sql),
       );
     }
 
