@@ -698,6 +698,52 @@ describe(`lifecycle races on ${realDatabase ? (sqlite ? "SQLite" : "Postgres") :
     return { send, runId, execute };
   }
 
+  it("enqueues the restarted run when its cleanup cannot read the current records", async () => {
+    let armed = false;
+    const send = kernel({
+      persistence: override(ports.persistence, {
+        getStagesByRun: async (id: string) => {
+          if (armed) {
+            armed = false;
+            throw new Error("read blip");
+          }
+          return ports.persistence.getStagesByRun(id);
+        },
+      }),
+      blobStore: override(ports.blobStore, {
+        list: async (prefix: string) => {
+          if (prefix.endsWith("/s/")) armed = true;
+          return ports.blobStore.list(prefix);
+        },
+      }),
+    });
+    const runId = await createClaimed(send);
+    await send({
+      type: "job.execute",
+      workflowRunId: runId,
+      workflowId: workflow.id,
+      stageId: "s",
+      config: {},
+    });
+    const output = (
+      (await ports.persistence.getStage(runId, "s"))?.outputData as {
+        _artifactKey: string;
+      }
+    )._artifactKey;
+    await send({ type: "run.cancel", workflowRunId: runId });
+    await send({
+      type: "run.redrive",
+      workflowRunId: runId,
+      from: { kind: "start" },
+    });
+    expect(
+      (await ports.jobTransport.getJobsByWorkflowRun(runId)).filter(
+        (job) => job.status === "PENDING",
+      ),
+    ).toHaveLength(1);
+    expect(await ports.blobStore.get(output)).toEqual({ done: true });
+  });
+
   it("keeps the output of a new attempt that completed during the restart's cleanup", async () => {
     const send = kernel();
     const runId = await createClaimed(send);

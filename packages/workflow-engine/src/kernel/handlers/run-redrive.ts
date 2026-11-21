@@ -496,12 +496,14 @@ export async function handleRunRedrive(
           .catch(() => [] as string[]);
         if (keys.length === 0) continue;
         // Read after listing: a pointer committed before this read keeps
-        // the listed key it names.
+        // the listed key it names. Unreadable, nothing here is deleted.
+        const current = await postDeps.persistence
+          .getStagesByRun(workflowRunId)
+          .catch(() => null);
+        if (!current) continue;
         const kept = new Set([
           ...deletedOutputKeys,
-          ...(await postDeps.persistence.getStagesByRun(workflowRunId)).flatMap(
-            outputKeys,
-          ),
+          ...current.flatMap(outputKeys),
         ]);
         for (const key of keys) {
           if (kept.has(key)) continue;
