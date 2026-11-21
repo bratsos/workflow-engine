@@ -127,7 +127,7 @@ One classifier decides, wherever a stage throw is retried: `job.execute` (throug
 * `NonRetryableError` (exported from `@bratsos/workflow-engine`; detect it across bundled copies with `isNonRetryableError`), thrown by the stage or by a step, or made by a step's `retryIf` returning `false`;
 * a Zod error, from any copy of zod (the application's own, another major, `zod/mini`), recognised by its name and `issues` rather than by class;
 * `DuplicateStepKeyError`, an expired durable wait (`StepTimeoutError`) and an `onReclaim: "fail"` refusal (`StepNotReplaySafeError`): each is recorded on its ledger row, which every later attempt answers with the same error.
-* any of these as a ledger replay rethrows it, and any of them thrown by another copy of the engine: the checks read brands and shapes, not classes.
+* any of these as a ledger replay rethrows it, and any of them thrown by another copy of the engine of this release or later: the checks read brands and shapes, not classes. Earlier releases throw `StepTimeoutError` and `StepNotReplaySafeError` without the brand, and an error that crossed a JSON boundary keeps only its name and message, so those are retried as before.
 
 Every other error is retried within the budget. `job.execute` records the error as `"Name: message"` (a plain `Error` by its message alone); `stage.pollSuspended` records the message.
 
