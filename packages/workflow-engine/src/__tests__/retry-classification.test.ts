@@ -168,10 +168,10 @@ function fromAnotherEngineCopy(name: string) {
 }
 
 /** `target` with `key` turned into a getter that throws. */
-function withThrowingGetter<T extends object>(target: T, key: string): T {
+function withThrowingGetter<T extends object>(target: T, key: PropertyKey): T {
   Object.defineProperty(target, key, {
     get() {
-      throw new Error(`${key} getter`);
+      throw new Error(`${String(key)} getter`);
     },
     configurable: true,
   });
@@ -369,10 +369,11 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
         const stage = await run.stage();
         // The replay rebuilds a plain Error from the row's text.
         expect(stage.status).toBe("SUSPENDED");
-        // The poll records the bare message, as it always has.
-        if (typeof text === "string") {
-          expect(stage.errorMessage).toBe(text.slice(text.indexOf(": ") + 2));
-        }
+        // The poll records the step row's text, as it always has.
+        const rows = await env.stepLedger.list(stage.id);
+        expect(stage.errorMessage).toBe(
+          rows.find((row) => row.stepId === "call")!.error,
+        );
         expect(polled.failed).toBe(0);
         expect(await run.retryEvents()).toBe(1);
         expect(body.calls).toBe(1);
@@ -833,6 +834,73 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
       });
     });
 
+    describe("a job delivered again after a terminal failure", () => {
+      it.each([
+        ["a zod/v3 error", zodV3Parse],
+        ["a Zod error", zodParse],
+        [
+          "a NonRetryableError",
+          () => {
+            throw new NonRetryableError("declined");
+          },
+        ],
+      ])("answers a completed step from the ledger after %s", async (_case, fail) => {
+        let receipts = 0;
+        const stage = defineStage({
+          id: "s",
+          name: "s",
+          schemas: { input: z.object({}), output: out, config: z.object({}) },
+          async execute(ctx) {
+            await ctx.step.run("receipt", async () => ++receipts);
+            fail();
+            return { output: { ok: true } };
+          },
+        });
+        const run = await start(env, workflowOf("redeliver-done", stage));
+        expect(await run.execute(1)).toMatchObject({
+          outcome: "failed",
+          willRetry: false,
+        });
+        // The acknowledgement was lost: the reaped job arrives as attempt 2.
+        const again = await run.execute(2);
+        expect(again).toMatchObject({ outcome: "failed", willRetry: false });
+        expect((again as { error: string }).error).not.toMatch(
+          /StepNotReplaySafeError/,
+        );
+        expect(receipts).toBe(1);
+      });
+    });
+
+    describe("the text a failed step row stores", () => {
+      it("is main's for a decoded object, so a timeout-like message stays retryable", async () => {
+        const text = new StepTimeoutError("call").message;
+        const body = failing(1, () => ({ message: text }));
+        const run = await start(env, workflowOf("row-text", storedStage(body)));
+        await run.execute(1);
+        await run.poll();
+        expect(await run.stage()).toMatchObject({ status: "SUSPENDED" });
+        await run.poll();
+        expect(await run.stage()).toMatchObject({ status: "COMPLETED" });
+        expect(body.calls).toBe(2);
+      });
+
+      it("is main's for an object whose toString reads as the timeout", async () => {
+        const text = new StepTimeoutError("call").message;
+        const body = failing(1, () => ({
+          message: "provider said no",
+          toString: () => text,
+        }));
+        const run = await start(
+          env,
+          workflowOf("row-tostring", storedStage(body)),
+        );
+        await run.execute(1);
+        await run.poll();
+        expect(await run.stage()).toMatchObject({ status: "FAILED" });
+        expect(body.calls).toBe(1);
+      });
+    });
+
     describe("a branded failure with an unreadable diagnostic", () => {
       it.each([
         [
@@ -842,6 +910,25 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
         [
           "a NonRetryableError with a throwing name getter",
           () => withThrowingGetter(new NonRetryableError("revoked"), "name"),
+        ],
+        [
+          "a NonRetryableError with a throwing step-control-flow getter",
+          () =>
+            withThrowingGetter(
+              new NonRetryableError("revoked"),
+              Symbol.for("@bratsos/workflow-engine/step-control-flow"),
+            ),
+        ],
+        [
+          "a zod/v3 error with a throwing _zod getter",
+          () => {
+            try {
+              zodV3Parse();
+            } catch (error) {
+              return withThrowingGetter(error as Error, "_zod");
+            }
+            throw new Error("unreachable");
+          },
         ],
         [
           "another copy's terminal failure with a throwing issues getter",
@@ -925,17 +1012,6 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
             return p;
           },
         ],
-        [
-          "a rejected Promise subclass whose species getter throws",
-          () => {
-            class Odd extends Promise<boolean> {
-              static override get [Symbol.species](): PromiseConstructor {
-                throw new Error("species getter");
-              }
-            }
-            return Odd.reject(new Error("no"));
-          },
-        ],
       ])("returning %s leaves no unhandled rejection", async (_case, result) => {
         const unhandled: unknown[] = [];
         const onUnhandled = (reason: unknown) => unhandled.push(reason);
@@ -960,6 +1036,32 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
         } finally {
           process.off("unhandledRejection", onUnhandled);
         }
+      });
+
+      it("leaves the objects it returns unchanged", async () => {
+        class Receipt {}
+        class SdkPromise<T> extends Promise<T> {}
+        const receipt = new Receipt();
+        const pending = SdkPromise.resolve(true);
+        const results: object[] = [receipt, pending];
+        const body = failing(2, () => new QuotaError());
+        const run = await start(
+          env,
+          workflowOf(
+            "untouched-results",
+            directStage(body, {
+              retries: 2,
+              retryIf: (() => results.shift()) as unknown as () => boolean,
+            }),
+          ),
+        );
+        expect(await run.execute(1)).toMatchObject({ outcome: "suspended" });
+        await run.poll();
+        await run.poll();
+        expect(body.calls).toBe(3);
+        expect(Object.hasOwn(receipt, "constructor")).toBe(false);
+        expect(Object.hasOwn(pending, "constructor")).toBe(false);
+        expect(pending.then(() => 1)).toBeInstanceOf(SdkPromise);
       });
     });
 

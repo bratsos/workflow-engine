@@ -132,28 +132,33 @@ function terminal<E extends Error>(error: E): E {
 }
 
 /**
- * Keep a returned promise's rejection from going unhandled, even when its
- * `then` or species getter throws: an own `constructor` of `Promise` lets
- * `await` subscribe without reading either.
- * shortcut: a frozen Promise subclass with a throwing species getter still
- * escapes; nothing short of the engine owning the value can catch that.
+ * The text a failed `run` row stores: main's, exactly, because a replay
+ * reads it (a step's timeout text comes back as `StepTimeoutError`). Only
+ * a value whose properties cannot be read gets other text, so its failure
+ * is still recorded.
+ */
+function rowText(error: unknown): string {
+  try {
+    return error instanceof Error ? error.message : String(error);
+  } catch {
+    return toErrorMessage(error);
+  }
+}
+
+/**
+ * Keep a native Promise a predicate returned from rejecting unhandled. The
+ * application's value is never changed or wrapped, and no other thenable is
+ * touched: a Promise subclass or object whose `constructor`, species or
+ * `then` throws, or a non-Promise thenable, can still reject unhandled.
  */
 function settleQuietly(value: object): void {
   try {
-    Object.defineProperty(value, "constructor", {
-      value: Promise,
-      configurable: true,
-    });
-  } catch {
-    // Not extensible: `await` below still handles every ordinary promise.
-  }
-  void (async () => {
-    try {
-      await value;
-    } catch {
-      // A rejected predicate result gives no verdict.
+    if (value instanceof Promise) {
+      Promise.prototype.then.call(value, undefined, () => {});
     }
-  })();
+  } catch {
+    // See above: nothing more is attempted on the application's value.
+  }
 }
 
 /**
@@ -162,7 +167,7 @@ function settleQuietly(value: object): void {
  * an awaited verdict would hold the step open past its lease. Anything but
  * a plain `false` gives no verdict and leaves the failure retryable: a
  * predicate that throws, a missing or broken `retryIf`, and a promise
- * (logged, its rejection swallowed). Nothing here may throw: the body's own
+ * (logged; see `settleQuietly`). Nothing here may throw: the body's own
  * failure must still be recorded.
  */
 function retryIfDeclines(
@@ -684,7 +689,7 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
           abortSignal,
         });
       } catch (error) {
-        const message = toErrorMessage(error);
+        const message = rowText(error);
         // Decided for this throw only, never written to the row: a
         // `NonRetryableError`, or a `retryIf` that says no, stops the step's
         // own `retries`, and a refusal is thrown as a `NonRetryableError`

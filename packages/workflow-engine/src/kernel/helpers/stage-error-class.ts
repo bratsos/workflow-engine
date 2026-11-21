@@ -60,7 +60,9 @@ function holds(check: () => boolean): boolean {
  * the name and an `issues` array.
  */
 function isZodError(error: unknown): boolean {
-  if (error instanceof ZodError) return true;
+  // The class check reads zod's private fields; when that throws, the shape
+  // check below still decides.
+  if (holds(() => error instanceof ZodError)) return true;
   if (typeof error !== "object" || error === null) return false;
   const { name, issues } = error as { name?: unknown; issues?: unknown };
   return (name === "ZodError" || name === "$ZodError") && Array.isArray(issues);
