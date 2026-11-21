@@ -599,7 +599,11 @@ describe(`lifecycle races on ${realDatabase ? (sqlite ? "SQLite" : "Postgres") :
   it.skipIf(!realDatabase)(
     "leaves a restored record's output readable when the caller's transaction rolls a restart back",
     async () => {
-      const send = kernel();
+      // External stores, as in production: Prisma-backed ones on the
+      // same SQLite file would wait on the caller's write lock.
+      const stepLedger = new InMemoryStepLedger();
+      const blobStore = new InMemoryBlobStore();
+      const send = kernel({ blobStore, stepLedger });
       const runId = await createClaimed(send);
       await send({
         type: "job.execute",
@@ -621,6 +625,8 @@ describe(`lifecycle races on ${realDatabase ? (sqlite ? "SQLite" : "Postgres") :
           const inner = kernel({
             persistence: createPrismaWorkflowPersistence(tx as any, options),
             jobTransport: createPrismaJobQueue(tx as any, options),
+            blobStore,
+            stepLedger,
           });
           // Its enqueue cannot run on a borrowed transaction; the cleanup
           // before it has run by then.
@@ -637,7 +643,7 @@ describe(`lifecycle races on ${realDatabase ? (sqlite ? "SQLite" : "Postgres") :
       expect(after?.id).toBe(before?.id);
       const output = (after?.outputData as { _artifactKey: string })
         ._artifactKey;
-      expect(await ports.blobStore.get(output)).toEqual({ done: true });
+      expect(await blobStore.get(output)).toEqual({ done: true });
     },
   );
 

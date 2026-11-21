@@ -378,23 +378,19 @@ export async function handleRunRedrive(
   // references into its own storage, and the new attempt overwrites its
   // output and artifacts by key anyway.
   //
-  // The keys are listed now, before the commit, and the keys a deleted
-  // record's outputData points at are kept: the new attempt writes the
-  // same stable keys, and a post-commit delete that runs after it started
-  // (a caller-owned job.execute) must not take its bytes, nor must a caller
-  // whose own transaction rolls this redrive back find its restored
-  // pointers dangling. Kept keys are overwritten by the new attempt or go
-  // with run.purge.
-  const keptBlobKeys = new Set(stagesToDelete.flatMap(outputKeys));
-  const blobKeysToDelete: string[] = [];
-  for (const stage of stagesToDelete) {
-    const keys = await deps.blobStore
-      .list(
-        `workflow-v2/${run.workflowType}/${workflowRunId}/${stage.stageId}/`,
-      )
-      .catch(() => [] as string[]);
-    blobKeysToDelete.push(...keys.filter((key) => !keptBlobKeys.has(key)));
-  }
+  //
+  // Keys an outputData points at are kept: a deleted record's, so a caller
+  // whose own transaction rolls this redrive back finds its restored
+  // pointers intact, and a current record's, so a new attempt that
+  // completed before the cleanup (a caller-owned job.execute) keeps its
+  // output. Kept keys are overwritten by the new attempt or go with
+  // run.purge. Listing waits for the commit: an unbound blob store read
+  // inside the transaction can wait on the transaction's own lock.
+  const deletedOutputKeys = stagesToDelete.flatMap(outputKeys);
+  const blobPrefixesToDelete = stagesToDelete.map(
+    (stage) =>
+      `workflow-v2/${run.workflowType}/${workflowRunId}/${stage.stageId}/`,
+  );
 
   for (const stage of stagesToDelete) {
     // In this transaction: nothing can name a deleted record afterwards.
@@ -520,8 +516,22 @@ export async function handleRunRedrive(
         }
       }
 
-      for (const key of blobKeysToDelete) {
-        await postDeps.blobStore.delete(key).catch(() => {});
+      if (blobPrefixesToDelete.length > 0) {
+        const kept = new Set([
+          ...deletedOutputKeys,
+          ...(await postDeps.persistence.getStagesByRun(workflowRunId)).flatMap(
+            outputKeys,
+          ),
+        ]);
+        for (const prefix of blobPrefixesToDelete) {
+          const keys = await postDeps.blobStore
+            .list(prefix)
+            .catch(() => [] as string[]);
+          for (const key of keys) {
+            if (!kept.has(key))
+              await postDeps.blobStore.delete(key).catch(() => {});
+          }
+        }
       }
 
       await enqueue(postDeps);
