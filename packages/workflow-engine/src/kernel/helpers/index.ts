@@ -17,7 +17,7 @@ export {
   withClaimedRun,
 } from "./claim.js";
 export { createStorageShim } from "./create-storage-shim.js";
-export { describeThrown, toErrorMessage } from "./error-message.js";
+export { toErrorMessage } from "./error-message.js";
 export {
   assertTimerMs,
   type CreateEventSinkMonitorOptions,
@@ -61,7 +61,6 @@ export {
   saveStageOutput,
 } from "./save-stage-output.js";
 export {
-  classifyThrown,
   isRetryableStageError,
   reopenFailedSteps,
   willRetryStage,

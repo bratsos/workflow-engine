@@ -337,18 +337,6 @@ export function isStepControlFlowError(
   );
 }
 
-/**
- * Cross-bundle brand for a step failure no retry can change: an expired wait
- * or a refused replay, as the execution that records it throws it (a replay
- * rebuilt from the ledger row does not carry it). `isRetryableStageError`
- * reads it, so another copy of this release or a later one reaches the same
- * verdict (earlier releases throw these classes without it, and a JSON round
- * trip drops it).
- */
-export const STEP_TERMINAL_FAILURE: unique symbol = Symbol.for(
-  "@bratsos/workflow-engine/terminal-step-failure",
-) as typeof STEP_TERMINAL_FAILURE;
-
 /** Thrown after a durable wait reaches its original, non-sliding deadline. */
 export class StepTimeoutError extends Error {
   readonly stepId: string;
@@ -507,6 +495,17 @@ export class NonRetryableError extends Error {
     super(message, options);
     this.name = "NonRetryableError";
   }
+}
+
+/**
+ * Give a failure the engine itself knows no retry can change (an expired
+ * wait, a refused replay, as the execution that records it throws it) the
+ * {@link NonRetryableError} brand. A replay rebuilt from the ledger row does
+ * not carry it. Internal.
+ */
+export function brandNonRetryable<E extends object>(error: E): E {
+  Object.defineProperty(error, STEP_NON_RETRYABLE, { value: true });
+  return error;
 }
 
 /** Detect a {@link NonRetryableError} reliably across duplicated package bundles. */

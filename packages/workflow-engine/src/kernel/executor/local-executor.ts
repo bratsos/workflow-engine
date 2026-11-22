@@ -8,8 +8,8 @@
  */
 
 import { buildStageExecutionContext } from "../helpers/build-stage-execution-context.js";
-import { describeThrown, toErrorMessage } from "../helpers/error-message.js";
-import { retryableStageError } from "../helpers/stage-error-class.js";
+import { toErrorMessage } from "../helpers/error-message.js";
+import { isRetryableStageError } from "../helpers/stage-retry.js";
 import type {
   ActivityExecutor,
   ActivityRunInput,
@@ -35,29 +35,15 @@ export function createLocalExecutor(): ActivityExecutor {
           logs: [],
         };
       } catch (e) {
-        // An Error is read as main reads it, each field once: a throwing
-        // `name` or `stack` getter propagates as it always has. Any other
-        // value keeps its decoded `name` and `message` (never throws).
-        const isError = e instanceof Error;
-        let error: string;
-        let name: string | undefined;
-        if (isError) {
-          error = toErrorMessage(e);
-          name = e.name;
-        } else {
-          ({ name, message: error } = describeThrown(e));
-        }
-        // An error retrying cannot change (a Zod error, a duplicate durable
-        // step key, a NonRetryableError, an expired wait, a refused replay)
-        // is marked non-retryable rather than let hosts burn retry attempts
-        // on a doomed job. The verdict checks the name recorded below.
-        const retryable = retryableStageError(e, () => name)
-          ? undefined
-          : false;
+        const error = toErrorMessage(e);
+        // A deterministic error (Zod validation, a duplicate durable step
+        // key) is marked non-retryable rather than let hosts burn retry
+        // attempts on a doomed job.
+        const retryable = isRetryableStageError(e) ? undefined : false;
         return {
           error,
-          errorName: name,
-          errorStack: isError ? e.stack : undefined,
+          errorName: e instanceof Error ? e.name : undefined,
+          errorStack: e instanceof Error ? e.stack : undefined,
           retryable,
           progress: built?.progressEvents ?? [],
           annotations: built?.annotationBuffer.flush() ?? [],

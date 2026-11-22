@@ -104,28 +104,6 @@ describe("ctx.step.ai.map — consumer feedback surfaces", () => {
     expect(b && "cause" in b).toBe(false);
   });
 
-  it("keeps the message and name of a decoded error a call rejects with", async () => {
-    const workflow = mapWorkflow("map-decoded-error", {
-      realtime: { retries: 0, concurrency: 1 },
-    });
-    const harness = createTestHarness({ workflows: [workflow] });
-    harness.mockAi.setTextResponse("process", { text: "processed" });
-    // An error that crossed a JSON boundary: plain fields, no prototype.
-    harness.mockAi.failOnce("process a", {
-      name: "SubscriptionLimitError",
-      message: "subscription limit reached",
-    } as unknown as Error);
-
-    const result = await harness.run("map-decoded-error", { items: ["a"] });
-
-    expect(result.status).toBe("COMPLETED");
-    expect(results(result.output)[0]).toMatchObject({
-      status: "failed",
-      error: "subscription limit reached",
-      errorName: "SubscriptionLimitError",
-    });
-  });
-
   it("keeps routing realtime when choosing a batch provider throws a decoded error with no text", async () => {
     const batch = {};
     Object.defineProperty(batch, "provider", {
@@ -196,28 +174,66 @@ describe("ctx.step.ai.map — consumer feedback surfaces", () => {
     });
   });
 
-  it("records the decoded name it routed the item by", async () => {
-    const workflow = mapWorkflow("map-decoded-name", {
-      realtime: { retries: 0, concurrency: 1 },
-    });
-    const harness = createTestHarness({ workflows: [workflow] });
-    harness.mockAi.setTextResponse("process", { text: "processed" });
-    let names = 0;
-    const decoded = { message: "first diagnostic" };
-    Object.defineProperty(decoded, "name", {
-      get: () =>
-        ++names === 1 ? "TransportError" : "AI_NoObjectGeneratedError",
-    });
-    harness.mockAi.failOnce("process a", decoded as unknown as Error);
+  describe("reads a thrown model error as main does", () => {
+    const run = async (id: string, error: unknown) => {
+      const workflow = mapWorkflow(id, {
+        realtime: { retries: 0, concurrency: 1 },
+        repair: { attempts: 1 },
+      });
+      const harness = createTestHarness({ workflows: [workflow] });
+      harness.mockAi.setTextResponse("process", { text: "processed" });
+      harness.mockAi.failOnce("process a", error as Error);
+      const result = await harness.run(id, { items: ["a"] });
+      return { item: results(result.output)[0], harness };
+    };
 
-    const result = await harness.run("map-decoded-name", { items: ["a"] });
-
-    expect(results(result.output)[0]).toMatchObject({
-      status: "failed",
-      error: "first diagnostic",
-      errorName: "TransportError",
+    it("routes by the name its cause leaves, read after the cause", async () => {
+      const error = { name: "AI_NoObjectGeneratedError", message: "lazy" };
+      Object.defineProperty(error, "cause", {
+        get() {
+          error.name = "TransportError";
+          return undefined;
+        },
+      });
+      const { item, harness } = await run("map-lazy-cause", error);
+      expect(item).toMatchObject({
+        status: "failed",
+        error: "[object Object]",
+        attempts: 1,
+      });
+      // One failed call, no repair: the repair call would have succeeded.
+      expect(harness.mockAi.getCalls()).toHaveLength(0);
     });
-    expect(names).toBe(1);
+
+    it("reads an aliased text the way main does", async () => {
+      let reads = 0;
+      const error: Record<string, unknown> = {
+        name: "TransportError",
+        message: "transport failure",
+      };
+      error.cause = error;
+      Object.defineProperty(error, "text", {
+        get: () => (++reads === 2 ? "raw content" : undefined),
+      });
+      const { item, harness } = await run("map-self-cause", error);
+      expect(item).toMatchObject({ status: "failed", attempts: 1 });
+      expect(harness.mockAi.getCalls()).toHaveLength(0);
+    });
+
+    it("stores one string conversion of a foreign Error", async () => {
+      let reads = 0;
+      const foreign = runInNewContext("new Error()") as Error;
+      foreign.name = "";
+      Object.defineProperty(foreign, "message", {
+        get: () => (++reads === 1 ? "[object Object]" : "replacement text"),
+      });
+      const { item } = await run("map-foreign-placeholder", foreign);
+      expect(item).toMatchObject({
+        status: "failed",
+        error: "[object Object]",
+      });
+      expect(reads).toBe(1);
+    });
   });
 
   it("retries a thrown item call in-process and completes in one execution", async () => {

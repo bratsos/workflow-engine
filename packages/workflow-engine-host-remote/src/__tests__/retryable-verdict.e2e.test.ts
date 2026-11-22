@@ -8,7 +8,9 @@
  * `createBrokerHttpServer`, real sockets and JSON); the kernel runs the stage
  * through `RemoteExecutor`.
  */
+
 import type { AddressInfo } from "node:net";
+import { runInNewContext } from "node:vm";
 import {
   defineStage,
   NonRetryableError,
@@ -25,7 +27,6 @@ import {
 } from "@bratsos/workflow-engine/testing";
 import { afterEach, describe, expect, it } from "vitest";
 import { z } from "zod";
-import { z as zodV3 } from "zod/v3";
 import { Broker } from "../broker/broker.js";
 import { InMemoryBrokerStore } from "../broker/store.js";
 import { InMemoryObjectStore } from "../object-store.js";
@@ -162,17 +163,7 @@ describe("remote worker retry verdict over the HTTP transport pair", () => {
     [
       "a NonRetryableError",
       () => new NonRetryableError("card revoked"),
-      "NonRetryableError: card revoked",
-    ],
-    [
-      "a Zod error",
-      () => z.number().parse("not a number"),
-      expect.stringContaining("ZodError"),
-    ],
-    [
-      "a Zod error from another copy of zod",
-      () => zodV3.number().parse("not a number"),
-      expect.stringContaining("ZodError"),
+      "card revoked",
     ],
   ])(
     "fails the stage without a retry on %s",
@@ -190,45 +181,58 @@ describe("remote worker retry verdict over the HTTP transport pair", () => {
     30_000,
   );
 
-  it("still retries an error the classifier allows, with the text a local stage records", async () => {
+  it("still retries any other error, with the text main's worker reports", async () => {
     const { result, record } = await runOverHttp(
       stageThatThrows("s", () => new QuotaError()),
     );
 
     expect(result).toMatchObject({
       outcome: "failed",
-      error: "QuotaError: over quota",
+      error: "over quota",
       willRetry: true,
     });
     expect(result.retryable).toBeUndefined();
     expect(record).toMatchObject({
       status: "PENDING",
-      errorMessage: "QuotaError: over quota",
+      errorMessage: "over quota",
     });
   }, 30_000);
 
-  it("records a decoded Zod error from input validation as a local stage does", async () => {
-    const decoded = {
-      name: "ZodError",
-      message: "input is invalid",
-      issues: [],
-    };
+  /** A foreign-realm Error whose name reads `TransportError`, then `ZodError`. */
+  const shiftingName = () => {
+    let reads = 0;
+    const foreign = runInNewContext("new Error()") as Error;
+    Object.assign(foreign, { message: undefined, issues: [] });
+    Object.defineProperty(foreign, "name", {
+      get: () => (++reads === 1 ? "TransportError" : "ZodError"),
+    });
+    return foreign;
+  };
+
+  it("reports a foreign Error whose name changes between reads as main does", async () => {
+    const { result } = await runOverHttp(stageThatThrows("s", shiftingName));
+    expect(result).toMatchObject({
+      outcome: "failed",
+      error: "TransportError",
+      willRetry: true,
+    });
+    expect(result.retryable).toBeUndefined();
+  }, 30_000);
+
+  it("keeps such an error from input validation retryable, as main does", async () => {
     const stage = stageThatThrows("s", () => new Error("unreachable"));
-    // Validation that rejects with an error decoded from JSON.
     Object.assign(stage, {
       inputSchema: {
         parse() {
-          throw decoded;
+          throw shiftingName();
         },
       },
     });
     const { result } = await runOverHttp(stage);
-
     expect(result).toMatchObject({
       outcome: "failed",
-      error: "ZodError: input is invalid",
-      retryable: false,
-      willRetry: false,
+      error: "TransportError",
+      willRetry: true,
     });
   }, 30_000);
 
@@ -321,6 +325,9 @@ describe("a defineRemoteStage proxy", () => {
     expect(poll.failed).toBe(1);
     expect(
       await orch.persistence.getStage(workflowRunId, "heavy"),
-    ).toMatchObject({ status: "FAILED", errorMessage: "NonRetryableError" });
+    ).toMatchObject({
+      status: "FAILED",
+      errorMessage: "remote activity failed",
+    });
   });
 });

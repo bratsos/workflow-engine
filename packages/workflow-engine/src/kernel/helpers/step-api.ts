@@ -10,6 +10,7 @@ import type {
   StepWaitOptions,
 } from "../../core/steps.js";
 import {
+  brandNonRetryable,
   DuplicateStepKeyError,
   isNonRetryableError,
   NonRetryableError,
@@ -17,7 +18,6 @@ import {
   parseStepDuration,
   STEP_API_PENDING_CONTROL_FLOW,
   STEP_API_SETTLE_IN_FLIGHT,
-  STEP_TERMINAL_FAILURE,
   StepInFlight,
   StepLeaseLostError,
   StepLedgerNotConfiguredError,
@@ -127,20 +127,16 @@ function storedError(record: StepRecord): Error {
  * row's text and gets main's verdict.
  */
 function terminal<E extends Error>(error: E): E {
-  Object.defineProperty(error, STEP_TERMINAL_FAILURE, { value: true });
-  return error;
+  return brandNonRetryable(error);
 }
 
 /**
- * Keep a native Promise a predicate returned or threw from rejecting
- * unhandled, from this realm or another, whatever its `Symbol.toStringTag`:
- * `Promise.prototype.then` checks the internal promise slot before it reads
- * anything, so any other value throws a TypeError with no getter invoked.
- * Both reactions return `undefined`, so the derived promise settles with
- * nothing to resolve: a fulfilled value (even one that became a thenable) is
- * never resolved again. The application's value is never changed or wrapped, and no other
- * thenable is touched: a Promise whose `constructor` or species getter
- * throws, or a non-Promise thenable, can still reject unhandled.
+ * Best effort for a predicate that breaks its synchronous contract by
+ * returning or throwing a plain native Promise: attach a no-op handler
+ * (`Promise.prototype.then` checks the internal slot first, so nothing is
+ * read from any other value, and both reactions return `undefined`). If a
+ * Promise rejects and no handler can be attached, the rejection is the
+ * application's own unhandled rejection, as anywhere else in stage code.
  */
 function settleQuietly(value: object): void {
   try {

@@ -11,9 +11,6 @@
 import { runInNewContext } from "node:vm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
-import { z as zodMini } from "zod/mini";
-import { z as zodV3 } from "zod/v3";
-import { $ZodError } from "zod/v4/core";
 import { defineAsyncBatchStage, defineStage } from "../core/stage-factory.js";
 import { deriveStepExternalKey } from "../core/step-external-key.js";
 import {
@@ -163,7 +160,7 @@ function fromAnotherEngineCopy(name: string) {
   error.name = name;
   Object.defineProperty(
     error,
-    Symbol.for("@bratsos/workflow-engine/terminal-step-failure"),
+    Symbol.for("@bratsos/workflow-engine/non-retryable"),
     { value: true },
   );
   return error;
@@ -198,8 +195,6 @@ const brokenGetterCases: Array<[string, () => unknown]> = [
 ];
 
 const zodParse = () => z.number().parse("x");
-const zodV3Parse = () => zodV3.number().parse("x");
-const zodMiniParse = () => zodMini.parse(zodMini.number(), "x");
 
 /** [case, make error, step options, retryable, expected text]. */
 const verdictCases: Array<
@@ -220,8 +215,6 @@ const verdictCases: Array<
     "NonRetryableError: card revoked",
   ],
   ["a Zod error", zodParse, {}, false, /^ZodError: /],
-  ["a zod/v3 error", zodV3Parse, {}, false, /^ZodError: /],
-  ["a zod/mini error", zodMiniParse, {}, false, /^\$ZodError: /],
   [
     "retryIf false",
     () => new QuotaError(),
@@ -279,30 +272,6 @@ const verdictCases: Array<
     },
     true,
     "QuotaError: over quota",
-  ],
-  [
-    "a Zod error decoded from JSON",
-    () =>
-      JSON.parse(
-        JSON.stringify({
-          name: "ZodError",
-          message: "bad input",
-          issues: [{ code: "custom", path: [], message: "bad input" }],
-        }),
-      ),
-    {},
-    false,
-    "ZodError: bad input",
-  ],
-  [
-    "a zod core $ZodError, which is not an Error",
-    () =>
-      new $ZodError([
-        { code: "custom", path: [], message: "bad input", input: 1 },
-      ] as never),
-    {},
-    false,
-    /^\$ZodError: \[/,
   ],
   [
     "a StepTimeoutError from another engine copy",
@@ -847,7 +816,7 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
      */
     describe("a job delivered again after a terminal verdict", () => {
       const verdicts: Array<[string, () => never | void]> = [
-        ["a zod/v3 error", () => void zodV3Parse()],
+        ["a Zod error", () => void zodParse()],
         [
           "a NonRetryableError",
           () => {
@@ -912,7 +881,9 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
       });
 
       it("settles through the host as an exhausted attempt, and a redelivery runs as main's", async () => {
-        const verdict = await receiptRun("host-ack", () => void zodV3Parse());
+        const verdict = await receiptRun("host-ack", () => {
+          throw new NonRetryableError("declined");
+        });
         const job = (await env.jobTransport.dequeue())!;
         const message = {
           jobId: job.jobId,
@@ -1020,7 +991,9 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
 
         const verdict = await schedule(
           "p1-verdict",
-          () => void zodV3Parse(),
+          () => {
+            throw new NonRetryableError("declined");
+          },
           3,
         );
         const main = await schedule(
@@ -1143,17 +1116,6 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
         [
           "a NonRetryableError with a throwing issues getter",
           () => withThrowingGetter(new NonRetryableError("revoked"), "issues"),
-        ],
-        [
-          "a zod/v3 error with a throwing _zod getter",
-          () => {
-            try {
-              zodV3Parse();
-            } catch (error) {
-              return withThrowingGetter(error as Error, "_zod");
-            }
-            throw new Error("unreachable");
-          },
         ],
         [
           "another copy's terminal failure with a throwing issues getter",
@@ -1326,32 +1288,6 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
         expect(await run.execute(1)).toMatchObject({ outcome: "suspended" });
         expect(reads).toBe(0);
       });
-
-      it("leaves the objects it returns unchanged", async () => {
-        class Receipt {}
-        class SdkPromise<T> extends Promise<T> {}
-        const receipt = new Receipt();
-        const pending = SdkPromise.resolve(true);
-        const results: object[] = [receipt, pending];
-        const body = failing(2, () => new QuotaError());
-        const run = await start(
-          env,
-          workflowOf(
-            "untouched-results",
-            directStage(body, {
-              retries: 2,
-              retryIf: (() => results.shift()) as unknown as () => boolean,
-            }),
-          ),
-        );
-        expect(await run.execute(1)).toMatchObject({ outcome: "suspended" });
-        await run.poll();
-        await run.poll();
-        expect(body.calls).toBe(3);
-        expect(Object.hasOwn(receipt, "constructor")).toBe(false);
-        expect(Object.hasOwn(pending, "constructor")).toBe(false);
-        expect(pending.then(() => 1)).toBeInstanceOf(SdkPromise);
-      });
     });
 
     // Main reads an Error's message in the step, and its name and stack in
@@ -1393,6 +1329,37 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
         expect(await run.execute(2)).toMatchObject({ outcome: "completed" });
         expect(body.calls).toBe(2);
       });
+    });
+
+    it("classifies a foreign Error whose name changes between reads as main does", async () => {
+      let receipts = 0;
+      let entries = 0;
+      const stage = defineStage({
+        id: "s",
+        name: "s",
+        schemas: { input: z.object({}), output: out, config: z.object({}) },
+        async execute(ctx) {
+          await ctx.step.run("receipt", async () => ++receipts);
+          if (++entries === 1) {
+            let reads = 0;
+            const foreign = runInNewContext("new Error()") as Error;
+            Object.assign(foreign, { message: undefined, issues: [] });
+            Object.defineProperty(foreign, "name", {
+              get: () => (++reads === 1 ? "TransportError" : "ZodError"),
+            });
+            throw foreign;
+          }
+          return { output: { ok: true } };
+        },
+      });
+      const run = await start(env, workflowOf("foreign-name", stage));
+      expect(await run.execute(1)).toMatchObject({
+        outcome: "failed",
+        error: "TransportError",
+        willRetry: true,
+      });
+      expect(await run.execute(2)).toMatchObject({ outcome: "completed" });
+      expect(receipts).toBe(1);
     });
 
     describe("a body error main cannot format", () => {

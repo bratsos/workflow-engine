@@ -99,9 +99,7 @@ export {
 export {
   assertTimerMs,
   type CreateEventSinkMonitorOptions,
-  classifyThrown,
   createEventSinkMonitor,
-  describeThrown,
   type EventSinkHealth,
   type EventSinkMonitor,
   type EventSinkObservation,

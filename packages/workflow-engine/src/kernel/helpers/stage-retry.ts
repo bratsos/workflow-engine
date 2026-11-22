@@ -5,13 +5,27 @@
  * throw gets the same treatment" true by construction.
  */
 
+import { ZodError } from "zod";
+import {
+  isDuplicateStepKeyError,
+  isNonRetryableError,
+} from "../../core/steps.js";
 import type { KernelDeps } from "../kernel.js";
 import { HOST_DEFAULTS } from "./host-support.js";
 
-export {
-  classifyThrown,
-  isRetryableStageError,
-} from "./stage-error-class.js";
+/**
+ * `false` for an error that will fail identically on every attempt: Zod
+ * input/config validation (the same rawInput fails the same way) and a
+ * duplicate durable step key (a collision between two call sites in the
+ * stage body). Hosts must not burn attempts on those. Nor on a
+ * `NonRetryableError`: its brand alone is read, after the checks above.
+ */
+export function isRetryableStageError(error: unknown): boolean {
+  return (
+    !(error instanceof ZodError || isDuplicateStepKeyError(error)) &&
+    !isNonRetryableError(error)
+  );
+}
 
 /**
  * Whether a failed attempt is retried: the error is not deterministic and

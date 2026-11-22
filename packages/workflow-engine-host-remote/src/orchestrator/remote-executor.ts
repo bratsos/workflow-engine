@@ -10,6 +10,7 @@
  * Phase-1 proxy-stage pattern is the right tool there.
  */
 
+import { isNonRetryableError } from "@bratsos/workflow-engine";
 import {
   type ActivityExecutor,
   type ActivityRunInput,
@@ -17,10 +18,10 @@ import {
   assertTimerMs,
   type BufferedLog,
   type CreateAnnotationInput,
-  classifyThrown,
   type ExecutorDeps,
   type KernelEvent,
   normalizeAnnotateArgs,
+  toErrorMessage,
 } from "@bratsos/workflow-engine/kernel";
 import type { BufferedProgress } from "../protocol.js";
 import type { OrchestratorTransport } from "../transport.js";
@@ -86,12 +87,9 @@ export function createRemoteExecutor(
       try {
         validatedInput = stageDef.inputSchema.parse(input.rawInput);
       } catch (e) {
-        const { name, message, retryable } = classifyThrown(e);
         return {
-          error: message,
-          errorName: name,
-          // Bad input fails identically on every attempt, as in LocalExecutor.
-          retryable: retryable ? undefined : false,
+          error: toErrorMessage(e),
+          ...(isNonRetryableError(e) ? { retryable: false } : {}),
           progress: [],
           annotations: [],
           logs: [],
@@ -175,10 +173,8 @@ export function createRemoteExecutor(
       if (outcome.kind === "failed") {
         return {
           error: outcome.error,
-          errorName: outcome.errorName,
-          // The worker's verdict, passed on to `job.execute`; a worker that
-          // sends none leaves the failure retryable.
-          retryable: outcome.retryable === false ? false : undefined,
+          // The worker's verdict; a worker that sends none leaves it retryable.
+          ...(outcome.retryable === false ? { retryable: false } : {}),
           progress: [],
           annotations: [],
           logs,
