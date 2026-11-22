@@ -10,9 +10,17 @@
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import type { EngineBatchModel, EngineBatchRef } from "../../ai/batch/model.js";
-import { defineStage } from "../../core/stage-factory.js";
-import { StageAbortedError } from "../../core/steps.js";
+import {
+  defineAsyncBatchStage,
+  defineStage,
+} from "../../core/stage-factory.js";
+import {
+  isStepControlFlowError,
+  StageAbortedError,
+  type StepApi,
+} from "../../core/steps.js";
 import { batchRefsOfSubmitRow } from "../../kernel/helpers/batch-submit-record.js";
+import { stepSpillPrefix, stepWriteSpillPrefix } from "../../kernel/spill.js";
 import {
   BATCH_MODEL,
   createAiMapHarness,
@@ -41,7 +49,10 @@ interface SetupOptions {
   /** Time budgets of the cancel sweep. */
   batchCancelTimeouts?: { batchMs?: number; sweepMs?: number };
   /** Runs inside the stage body before it maps; the abort tests use it. */
-  beforeMap?: (ctx: { workflowRunId: string }) => void | Promise<void>;
+  beforeMap?: (ctx: {
+    workflowRunId: string;
+    step: StepApi;
+  }) => void | Promise<void>;
   /**
    * The provider keeps listing a batch it was told to cancel as running (Gemini
    * cancels asynchronously), so only the engine's own record excludes it.
@@ -52,6 +63,11 @@ interface SetupOptions {
    * `stage.pollSuspended` replay; a new id makes a redriven stage sleep again.
    */
   sleepFirst?: () => string;
+  /**
+   * A legacy async-batch stage instead: `execute` suspends and every
+   * `checkCompletion` maps, answering "not ready" while the map suspends.
+   */
+  legacyPoll?: boolean;
 }
 
 async function setup(id: string, opts: SetupOptions = {}) {
@@ -97,7 +113,42 @@ async function setup(id: string, opts: SetupOptions = {}) {
   let dying = false;
 
   let resolver: Resolver = () => model;
-  const stage = defineStage({
+  const spec = {
+    model: BATCH_MODEL,
+    schema: itemSchema,
+    policy: "batch" as const,
+    prompt: (item: number) => `Extract <<${item}>>`,
+    batch: {
+      pollEvery: "60s",
+      timeout: "24h",
+      ...(opts.maxRequestsPerBatch
+        ? { options: { maxRequestsPerBatch: opts.maxRequestsPerBatch } }
+        : {}),
+    },
+  };
+  const poll = { pollInterval: 60_000, maxWaitTime: 86_400_000 };
+  const legacy = defineAsyncBatchStage({
+    id,
+    name: id,
+    mode: "async-batch",
+    schemas: { input: inputSchema, output: outputSchema, config: z.object({}) },
+    async execute() {
+      return {
+        suspended: true,
+        state: { batchId: "legacy", submittedAt: new Date(0).toISOString() },
+        pollConfig: { nextPollAt: new Date(0), ...poll },
+      };
+    },
+    async checkCompletion(_state, ctx) {
+      try {
+        await ctx.step.ai.map("extract", [0, 1, 2], spec);
+      } catch (error) {
+        if (!isStepControlFlowError(error)) throw error;
+      }
+      return { ready: false, nextCheckIn: 60_000 };
+    },
+  });
+  const durable = defineStage({
     id,
     name: id,
     schemas: { input: inputSchema, output: outputSchema, config: z.object({}) },
@@ -105,25 +156,13 @@ async function setup(id: string, opts: SetupOptions = {}) {
       if (opts.sleepFirst) await ctx.step.sleep(opts.sleepFirst(), "1s");
       await opts.beforeMap?.(ctx);
       const items = Array.from({ length: ctx.input.count }, (_, i) => i);
-      const spec = {
-        model: BATCH_MODEL,
-        schema: itemSchema,
-        policy: "batch" as const,
-        prompt: (item: number) => `Extract <<${item}>>`,
-        batch: {
-          pollEvery: "60s",
-          timeout: "24h",
-          ...(opts.maxRequestsPerBatch
-            ? { options: { maxRequestsPerBatch: opts.maxRequestsPerBatch } }
-            : {}),
-        },
-      };
       let results = await ctx.step.ai.map("extract", items, spec);
       if (opts.secondMap)
         results = await ctx.step.ai.map("second", items, spec);
       return { output: { done: results.length } };
     },
   });
+  const stage = opts.legacyPoll ? legacy : durable;
   const h = await createAiMapHarness({
     stage,
     inputSchema,
@@ -401,6 +440,154 @@ describe("run.cancel: provider batches", () => {
         stepId: "extract:submit",
       }),
     ]);
+  });
+
+  it("finds an inline submit record when another row's spilled result cannot be read", async () => {
+    const h = await setup("cancel-unreadable-sibling", {
+      beforeMap: async (ctx) => {
+        // An ordinary checkpoint over the default threshold, in the same stage.
+        await ctx.step.run("checkpoint", async () => "x".repeat(70_000));
+      },
+    });
+    await h.execute();
+    const stageRecord = await h.stage();
+    const checkpoint = await h.ledger.get(stageRecord!.id, "checkpoint");
+    expect(checkpoint?.result).toMatchObject({ $wfSpill: 1 });
+    await h.blobStore.delete((checkpoint!.result as { key: string }).key);
+
+    const result = await h.cancel();
+
+    expect(result.batches).toEqual([
+      expect.objectContaining({
+        status: "cancelled",
+        stepId: "extract:submit",
+      }),
+    ]);
+    expect(h.cancelCalls).toEqual(["batch-1"]);
+  });
+
+  it("cancels the readable batches of a stage and warns for a submit record it cannot read", async () => {
+    const h = await setup("cancel-unreadable-submit", {
+      secondMap: true,
+      spillThresholdBytes: 1,
+    });
+    // The first map's batch ends at once, so the second map submits too.
+    vi.mocked(h.model.status).mockImplementation(async (ref) => ({
+      status:
+        ref.id === "batch-1" ? ("completed" as const) : ("pending" as const),
+    }));
+    await h.execute();
+    const sid = (await h.stage())!.id;
+    const key = (
+      (await h.ledger.get(sid, "extract:submit"))!.result as {
+        key: string;
+      }
+    ).key;
+    const read = h.blobStore.get.bind(h.blobStore);
+    h.blobStore.get = async (k) => {
+      if (k === key) throw new Error("object unavailable");
+      return read(k);
+    };
+
+    const result = await h.cancel();
+
+    expect(result.batches).toEqual([
+      expect.objectContaining({ status: "cancelled", stepId: "second:submit" }),
+    ]);
+    expect(h.cancelCalls).toEqual(["batch-2"]);
+    expect(
+      h.warnings().filter((w) => w.message.includes('"extract:submit"')),
+    ).toEqual([
+      expect.objectContaining({
+        message: expect.stringContaining(key),
+      }),
+    ]);
+  });
+
+  it("reads the current submit record when a concurrent cancel retired the blob it first read", async () => {
+    const h = await setup("cancel-stale-read", { spillThresholdBytes: 1 });
+    await h.execute();
+    const sid = (await h.stage())!.id;
+    const key = (
+      (await h.ledger.get(sid, "extract:submit"))!.result as {
+        key: string;
+      }
+    ).key;
+    let entered!: () => void;
+    let release!: () => void;
+    const reading = new Promise<void>((r) => (entered = r));
+    const go = new Promise<void>((r) => (release = r));
+    const read = h.blobStore.get.bind(h.blobStore);
+    let armed = true;
+    h.blobStore.get = async (k) => {
+      if (armed && k === key) {
+        armed = false;
+        entered();
+        await go;
+      }
+      return read(k);
+    };
+
+    const first = h.cancel();
+    await reading;
+    await h.cancel();
+    release();
+    const result = await first;
+
+    // Like a repeated run.cancel, it asks the provider again (idempotent).
+    expect(result.batches).toEqual([
+      expect.objectContaining({
+        status: "cancelled",
+        stepId: "extract:submit",
+      }),
+    ]);
+    expect(new Set(h.cancelCalls)).toEqual(new Set(["batch-1"]));
+  });
+
+  it("leaves the blob of a sibling whose id extends a submit row's, on rows an older release spilled", async () => {
+    const h = await setup("cancel-flat-sibling", {
+      spillThresholdBytes: 1,
+      beforeMap: async (ctx) => {
+        await ctx.step.run("extract:submit.json", async () => "sibling");
+      },
+    });
+    await h.execute();
+    const sid = (await h.stage())!.id;
+    // Move both rows to the flat layout of releases before 1.0.0-alpha.21.
+    const flat = (stepId: string) =>
+      `${stepSpillPrefix(sid)}${encodeURIComponent(stepId)}.json`;
+    for (const stepId of ["extract:submit", "extract:submit.json"]) {
+      const ref = (await h.ledger.get(sid, stepId))!.result as { key: string };
+      await h.blobStore.put(flat(stepId), await h.blobStore.get(ref.key));
+      await h.blobStore.delete(ref.key);
+      await h.ledger.update(sid, stepId, {
+        result: { ...ref, key: flat(stepId) },
+      });
+    }
+
+    const result = await h.cancel();
+
+    expect(result.batches).toEqual([
+      expect.objectContaining({
+        status: "cancelled",
+        stepId: "extract:submit",
+      }),
+    ]);
+    expect(await h.blobStore.get(flat("extract:submit.json"))).toBe("sibling");
+  });
+
+  it("keeps one spilled blob per submit row however often run.cancel is repeated", async () => {
+    const h = await setup("cancel-spill-footprint", { spillThresholdBytes: 1 });
+    await h.execute();
+    const prefix = stepWriteSpillPrefix((await h.stage())!.id);
+    const counts = [(await h.blobStore.list(prefix)).length];
+    for (let i = 0; i < 4; i++) {
+      await h.cancel();
+      counts.push((await h.blobStore.list(prefix)).length);
+    }
+
+    expect(counts).toEqual(counts.map(() => counts[0]));
+    expect((await h.submitRow())?.result).toMatchObject({ $wfSpill: 1 });
   });
 
   it("cancels a batch a legacy async-batch stage kept in suspendedState", async () => {
@@ -1394,6 +1581,18 @@ describe("a body that submits after the cancel committed", () => {
 
     expect((await h.stage())?.status).toBe("CANCELLED");
     expect(h.cancelCalls).toContain("batch-2");
+  });
+
+  it("stage.pollSuspended, a legacy checkCompletion whose map submits as the cancel commits", async () => {
+    const h = await setup("late-legacy-poll", { legacyPoll: true });
+    await h.execute();
+    expect((await h.stage())?.status).toBe("SUSPENDED");
+    cancelWhileSubmitting(h);
+
+    await h.tick(2 * 60 * 1000);
+
+    expect((await h.stage())?.status).toBe("CANCELLED");
+    expect(h.cancelCalls).toEqual(["batch-1"]);
   });
 
   it("does not touch the batches when the discarded run is FAILED, not CANCELLED", async () => {

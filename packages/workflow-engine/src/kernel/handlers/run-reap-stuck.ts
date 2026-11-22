@@ -3,7 +3,6 @@ import type { RunReapStuckCommand, RunReapStuckResult } from "../commands";
 import type { KernelEvent } from "../events";
 import { servesRun } from "../helpers/definition-pinning.js";
 import { enqueueForLiveRun } from "../helpers/prepare-execution-group.js";
-import { isTransactionReadBound } from "../helpers/transaction-reads.js";
 import type { HandlerResult, KernelDeps } from "../kernel";
 import {
   ACTIVE_STAGE_STATUSES,
@@ -66,17 +65,20 @@ export async function handleRunReapStuck(
           ),
       );
       if (missingJobStages.length > 0) {
-        if (isTransactionReadBound(deps.jobTransport)) {
-          // Scoped sweeps can queue behind each other before post-commit
-          // enqueues run. Refresh activity so they do not repeat that work.
-          try {
-            await deps.persistence.updateRun(run.id, {
-              expectedVersion: run.version,
-            });
-          } catch (error) {
-            if (error instanceof StaleVersionError) continue;
-            throw error;
-          }
+        // Refresh the run's activity and version on every transport. The
+        // re-enqueue below is a post-commit that touches neither the run
+        // nor a stage row, so without this the next sweep (a queued scoped
+        // one, or another host's before any worker dequeues the job) still
+        // finds the run stuck, sees the recovered PENDING job as nothing
+        // missing and reaps the run it just healed. The version bump also
+        // fences a sweep that read the run before this one committed.
+        try {
+          await deps.persistence.updateRun(run.id, {
+            expectedVersion: run.version,
+          });
+        } catch (error) {
+          if (error instanceof StaleVersionError) continue;
+          throw error;
         }
 
         // INVARIANT: no handler enqueues a job from inside the kernel

@@ -161,14 +161,18 @@ replay reads every step of the stage. Results above a **soft threshold** are
 written to the `blobStore` and the row keeps a reference:
 
 ```json
-{ "$wfSpill": 1, "key": "workflow-v2/spill/steps/<stageRecordId>/<stepId>/<uuid>.json", "bytes": 400018 }
+{ "$wfSpill": 1, "key": "workflow-v2/spill/step-writes/<stageRecordId>/<stepId>/<uuid>.json", "bytes": 400018 }
 ```
 
 Every write spills to a new key, so the blob a committed row names is never
 written again: a compare-and-set that does not apply (another execution won
-the row) leaves only its own blob, which it deletes. Rows written before
-1.0.0-alpha.21 name `<stepId>.json` and are still read through their
-reference.
+the row) leaves only its own blob, which it deletes, and one that replaces a
+spilled result deletes the blob the previous version named. Rows written
+before 1.0.0-alpha.21 name `workflow-v2/spill/steps/<stageRecordId>/<stepId>.json`
+and are still read through their reference; the new keys live under a
+separate prefix, so an older release's redrive, which clears the old prefix,
+cannot delete them. An older release's `run.purge` or `run.redrive` from
+the start leaves them in the blob store.
 
 This is on by default and needs no wiring: `createKernel` already has a
 `blobStore`, so it wraps the `stepLedger` you give it. Reads resolve the
@@ -312,3 +316,4 @@ To support safe retries in distributed networks, commands like `run.create`, `jo
 * **Duplicate Prevention**: If a key has already completed execution, re-submitting the command immediately returns the previously cached output from the `IdempotencyKey` table without running it again.
 * **In-Progress Guard**: If the command is currently running, subsequent dispatches throw an `IdempotencyInProgressError`.
 * **Stuck-Key Reclamation**: If a dispatcher process crashes midway, the key could stay in the `in_progress` state forever. **`idempotencyStaleInProgressMs`** (default: 10 minutes) bounds that: a key that has been in progress longer than the threshold is reclaimed and allowed to run again.
+* **Completed With the Command**: A command with no work after its commit, such as `run.create`, completes its key in the same transaction as its writes. If the worker dies after that commit, the key is already complete and a retry with it returns the run that was created. If the key write or the commit fails, nothing is written and the key is released, so a retry creates the run once. A command with work after its commit (an enqueue, a cancel or a cleanup) still completes its key after that work, as before.

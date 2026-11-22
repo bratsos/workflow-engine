@@ -11,8 +11,8 @@
  * a handler that executed a stage body finds the run CANCELLED afterwards,
  * because a body in another process can create a batch after the sweep read the
  * ledger (its abort signal had not fired yet): the four `ghost` exits of
- * `job.execute` that follow a body, a `stage.pollSuspended` replay whose stage
- * row the cancel moved while its body ran, and both CANCELLED branches of
+ * `job.execute` that follow a body, a `stage.pollSuspended` replay or legacy
+ * `checkCompletion` whose stage row the cancel moved while it ran, and both CANCELLED branches of
  * `handleClaimOutcome`, which every `stage.pollSuspended` replay ends in. The
  * handle such a body recorded is then in the ledger and is found here.
  *
@@ -140,6 +140,7 @@ import type {
 } from "../commands.js";
 import type { KernelDeps } from "../kernel.js";
 import type { StepRecord, StepRecordPatch } from "../ports.js";
+import { listStepRows } from "../spill.js";
 import {
   isEngineOwned,
   isFencedBySweep,
@@ -619,7 +620,21 @@ export async function cancelRunBatches(
       if (!ledger) continue;
       let rows: StepRecord[];
       try {
-        rows = await ledger.list(stage.id);
+        // Only the submit rows: another row's unreadable spilled result
+        // must not hide a batch.
+        const listed = await listStepRows(ledger, stage.id, isSubmitStepRow);
+        rows = listed.rows;
+        for (const lost of listed.unreadable) {
+          await warn(
+            `Run cancelled, but the stored submit record of step "${lost.stepId}" in stage "${stage.stageId}" could not be read from blob "${lost.key}" (${toErrorMessage(lost.error)}), so its provider batches were not cancelled. ${(await runStillCancelled()) ? "Repeat run.cancel to retry." : "Look them up at the provider and cancel them there."}`,
+            {
+              stageId: stage.stageId,
+              stepId: lost.stepId,
+              key: lost.key,
+              error: toErrorMessage(lost.error),
+            },
+          );
+        }
       } catch (error) {
         await warn(
           `Run cancelled, but the durable steps of stage "${stage.stageId}" could not be read (${toErrorMessage(error)}), so its provider batches were not cancelled. ${(await runStillCancelled()) ? "Repeat run.cancel to retry." : "Look them up at the provider and cancel them there."}`,

@@ -10,10 +10,12 @@ import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { defineWorkflow } from "../../core/workflow.js";
 import { SpilledPayloadUnavailableError } from "../../kernel/errors.js";
+import { runBlobPrefixes } from "../../kernel/handlers/run-purge.js";
 import {
   createPayloadSpill,
   isSpillRef,
   stepSpillPrefix,
+  stepWriteSpillPrefix,
   withStepResultSpill,
 } from "../../kernel/spill.js";
 import { FakeClock } from "../../kernel/testing/fake-clock.js";
@@ -136,7 +138,9 @@ describe("payload spill: step ledger", () => {
     // The row itself holds only the claim check.
     const raw = await ledger.get("stage-1", "big");
     expect(isSpillRef(raw?.result)).toBe(true);
-    expect(await blobStore.list(stepSpillPrefix("stage-1"))).toHaveLength(1);
+    expect(await blobStore.list(stepWriteSpillPrefix("stage-1"))).toHaveLength(
+      1,
+    );
     // Every read path resolves it.
     expect((await spilled.get("stage-1", "big"))?.result).toEqual(big);
     expect((await spilled.list("stage-1"))[0]?.result).toEqual(big);
@@ -167,12 +171,14 @@ describe("payload spill: step ledger", () => {
       result: { text: "y".repeat(5000) },
       leaseExpiresAt: null,
     });
-    expect(await blobStore.list(stepSpillPrefix("stage-1"))).toHaveLength(1);
+    expect(await blobStore.list(stepWriteSpillPrefix("stage-1"))).toHaveLength(
+      1,
+    );
 
     await spilled.clear("stage-1");
 
     expect(await ledger.list("stage-1")).toEqual([]);
-    expect(await blobStore.list(stepSpillPrefix("stage-1"))).toEqual([]);
+    expect(await blobStore.list(stepWriteSpillPrefix("stage-1"))).toEqual([]);
   });
 
   it("clearExcept keeps the spilled blob of a preserved row and drops the rest", async () => {
@@ -189,16 +195,134 @@ describe("payload spill: step ledger", () => {
         leaseExpiresAt: null,
       });
     }
-    expect(await blobStore.list(stepSpillPrefix("stage-1"))).toHaveLength(2);
+    expect(await blobStore.list(stepWriteSpillPrefix("stage-1"))).toHaveLength(
+      2,
+    );
 
     await spilled.clearExcept?.("stage-1", ["keep"]);
 
     expect((await ledger.list("stage-1")).map((r) => r.stepId)).toEqual([
       "keep",
     ]);
-    expect(await blobStore.list(stepSpillPrefix("stage-1"))).toHaveLength(1);
+    expect(await blobStore.list(stepWriteSpillPrefix("stage-1"))).toHaveLength(
+      1,
+    );
     expect(await spilled.get("stage-1", "keep")).toMatchObject({
       result: { text: `keep-${"y".repeat(5000)}` },
+    });
+  });
+});
+
+describe("payload spill: per-write keys", () => {
+  it("survive the clearExcept of a release before 1.0.0-alpha.21", async () => {
+    const { blobStore, ledger, spilled } = ledgerSetup();
+    await spilled.claim({ ...RUNNING_RUN_STEP, stepId: "keep" });
+    await spilled.update("stage-1", "keep", {
+      status: "completed",
+      result: { text: "y".repeat(5000) },
+      leaseExpiresAt: null,
+    });
+
+    // What an older host's redrive runs (main's `withStepResultSpill`): it
+    // deletes every key under the stage prefix but the flat `<step>.json` of
+    // each retained row.
+    const older = createPayloadSpill({ blobStore, thresholdBytes: 1000 });
+    const keepStepIds = ["keep"];
+    await ledger.clearExcept("stage-1", keepStepIds);
+    await older.deleteUnder(
+      stepSpillPrefix("stage-1"),
+      keepStepIds.map(
+        (stepId) =>
+          `${stepSpillPrefix("stage-1")}${encodeURIComponent(stepId)}.json`,
+      ),
+    );
+    // And its whole-ledger clear lists the same prefix.
+    await older.deleteUnder(stepSpillPrefix("other-stage"));
+
+    expect(await spilled.get("stage-1", "keep")).toMatchObject({
+      result: { text: "y".repeat(5000) },
+    });
+    // This release's purge lists both prefixes.
+    expect(
+      runBlobPrefixes({
+        id: "run-1",
+        workflowType: "wf",
+        stageRecordIds: ["stage-1"],
+      }),
+    ).toEqual(
+      expect.arrayContaining([
+        stepSpillPrefix("stage-1"),
+        stepWriteSpillPrefix("stage-1"),
+      ]),
+    );
+  });
+
+  it("a superseding write retires the blob the previous version named", async () => {
+    const { blobStore, ledger, spilled } = ledgerSetup();
+    await spilled.claim({ ...RUNNING_RUN_STEP });
+    const counts: number[] = [];
+    for (let i = 0; i < 4; i++) {
+      const row = await ledger.get("stage-1", "big");
+      const outcome = await spilled.compareAndSet(
+        "stage-1",
+        "big",
+        { status: row!.status, attempt: row!.attempt },
+        { result: { text: `${i}-${"y".repeat(5000)}` } },
+      );
+      expect(outcome.applied).toBe(true);
+      counts.push(
+        (await blobStore.list(stepWriteSpillPrefix("stage-1"))).length,
+      );
+    }
+
+    expect(counts).toEqual([1, 1, 1, 1]);
+    expect((await spilled.get("stage-1", "big"))?.result).toEqual({
+      text: `3-${"y".repeat(5000)}`,
+    });
+  });
+});
+
+describe("payload spill: rows an older release spilled to flat keys", () => {
+  it("a write over one deletes neither its own flat key nor a sibling's that extends it", async () => {
+    const { blobStore, ledger, spilled } = ledgerSetup();
+    // Before 1.0.0-alpha.21 a row's blob was `<prefix><stepId>.json`, so
+    // step "x.json" has a key that starts with step "x"'s.
+    const older = createPayloadSpill({ blobStore, thresholdBytes: 1000 });
+    const flat = (stepId: string) =>
+      `${stepSpillPrefix("stage-1")}${encodeURIComponent(stepId)}.json`;
+    for (const stepId of ["extract:0", "extract:0.json"]) {
+      await ledger.claim({ ...RUNNING_RUN_STEP, stepId });
+      await ledger.update("stage-1", stepId, {
+        status: "completed",
+        result: await older.pack(flat(stepId), { text: stepId.repeat(500) }),
+        leaseExpiresAt: null,
+      });
+    }
+    const deleted: string[] = [];
+    const remove = blobStore.delete.bind(blobStore);
+    blobStore.delete = async (key) => {
+      deleted.push(key);
+      return remove(key);
+    };
+
+    const outcome = await spilled.compareAndSet(
+      "stage-1",
+      "extract:0",
+      { status: "completed" },
+      { result: { text: "z".repeat(5000) } },
+    );
+    // An older writer that runs later reuses the flat key.
+    await older.pack(flat("extract:0"), {
+      text: "older writer again".repeat(100),
+    });
+
+    expect(outcome.applied).toBe(true);
+    expect(deleted).toEqual([]);
+    expect(await spilled.get("stage-1", "extract:0.json")).toMatchObject({
+      result: { text: "extract:0.json".repeat(500) },
+    });
+    expect(await blobStore.get(flat("extract:0"))).toEqual({
+      text: "older writer again".repeat(100),
     });
   });
 });
@@ -237,7 +361,7 @@ describe("payload spill: end to end through the kernel", () => {
     const raw = await harness.stepLedger.get(stages[0]!.id, "big");
     expect(isSpillRef(raw?.result)).toBe(true);
     expect(
-      await harness.blobStore.list("workflow-v2/spill/steps/"),
+      await harness.blobStore.list("workflow-v2/spill/step-writes/"),
     ).toHaveLength(1);
   });
 
@@ -300,7 +424,7 @@ describe("payload spill: end to end through the kernel", () => {
     ).toBe(true);
     // Two rows, two blobs, under one prefix per stage record.
     expect(
-      await harness.blobStore.list(stepSpillPrefix(stage!.id)),
+      await harness.blobStore.list(stepWriteSpillPrefix(stage!.id)),
     ).toHaveLength(2);
   });
 
@@ -336,7 +460,7 @@ describe("payload spill: end to end through the kernel", () => {
       failed.workflowRunId,
     );
     expect(
-      await harness.blobStore.list(stepSpillPrefix(before!.id)),
+      await harness.blobStore.list(stepWriteSpillPrefix(before!.id)),
     ).toHaveLength(1);
 
     failing = false;
@@ -347,7 +471,7 @@ describe("payload spill: end to end through the kernel", () => {
     });
     // The superseded stage record's rows are cleared, and its blobs with them.
     expect(
-      await harness.blobStore.list(stepSpillPrefix(before!.id)),
+      await harness.blobStore.list(stepWriteSpillPrefix(before!.id)),
     ).toHaveLength(0);
 
     await harness.tickUntil(async () => {
@@ -359,7 +483,7 @@ describe("payload spill: end to end through the kernel", () => {
     );
     expect(second!.id).not.toBe(before!.id);
     expect(
-      await harness.blobStore.list(stepSpillPrefix(second!.id)),
+      await harness.blobStore.list(stepWriteSpillPrefix(second!.id)),
     ).toHaveLength(1);
   });
 });
