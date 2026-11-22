@@ -188,16 +188,19 @@ export async function handleJobExecute(
       },
       update: {
         status: "RUNNING",
-        // Strictly later than the start it replaces, whatever the clocks
-        // say: (id, attempt, startedAt) is this delivery's ownership, so a
-        // takeover must change it (see `commit`).
-        startedAt: new Date(
-          Math.max(
-            deps.clock.now().getTime(),
-            (existingStage?.startedAt?.getTime() ?? Number.NEGATIVE_INFINITY) +
-              1,
-          ),
-        ),
+        // Taking over a RUNNING stage stamps a start strictly later than the
+        // one it replaces, whatever the clocks say: (id, attempt, startedAt)
+        // is a delivery's ownership, so a takeover must change it (see
+        // `commit`).
+        startedAt:
+          existingStage?.status === "RUNNING" && existingStage.startedAt
+            ? new Date(
+                Math.max(
+                  deps.clock.now().getTime(),
+                  existingStage.startedAt.getTime() + 1,
+                ),
+              )
+            : deps.clock.now(),
         // Each retry of the stage is one more attempt on its row, like a
         // `run.rerunFrom` rerun; a same-attempt re-delivery does not bump.
         ...(isRetryAttempt && existingStage
