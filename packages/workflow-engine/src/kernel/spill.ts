@@ -246,9 +246,20 @@ function legacyStepSpillKey(stageRecordId: string, stepId: string): string {
   return `${stepSpillPrefix(stageRecordId)}${encodeURIComponent(stepId)}.json`;
 }
 
+/**
+ * Prefix holding the per-write spilled results of one stage record's steps.
+ * A sibling of `stepSpillPrefix`, never under it: a release before
+ * 1.0.0-alpha.21 clears that prefix keeping only the flat `<stepId>.json`
+ * keys of the rows it retains, so a per-write key under it would lose its
+ * bytes to an older host's `run.redrive`.
+ */
+export function stepWriteSpillPrefix(stageRecordId: string): string {
+  return `workflow-v2/spill/step-writes/${encodeURIComponent(stageRecordId)}/`;
+}
+
 /** Every key a row's results are spilled to now (`encodeURIComponent` escapes `/`). */
 function stepSpillRowPrefix(stageRecordId: string, stepId: string): string {
-  return `${stepSpillPrefix(stageRecordId)}${encodeURIComponent(stepId)}/`;
+  return `${stepWriteSpillPrefix(stageRecordId)}${encodeURIComponent(stepId)}/`;
 }
 
 /**
@@ -291,6 +302,34 @@ export function withStepResultSpill(
     return { ...record, result: await spill.unpack(record.result) };
   }
 
+  /**
+   * After a write that replaced a row's result: delete the blob the previous
+   * version named, which nothing names any more (keys are never reused).
+   * Best-effort; whatever stays goes with `clear`, `clearExcept` or purge.
+   */
+  async function retire(previous: StepRecord | null, packed: unknown) {
+    const old = previous?.result;
+    if (isSpillRef(old) && !(isSpillRef(packed) && packed.key === old.key)) {
+      await spill.deleteUnder(old.key).catch(() => {});
+    }
+  }
+
+  /** The row before a write whose result spills, to retire its blob after. */
+  async function previousOf(
+    stageRecordId: string,
+    stepId: string,
+    packed: StepRecordPatch,
+    patch: StepRecordPatch,
+  ): Promise<StepRecord | null> {
+    // shortcut: only a spilled write reads first, so an inline write costs no
+    // statement; an inline write over a spilled one leaves that blob to
+    // `clear`, `clearExcept` or purge (one per row at most).
+    if (packed.result === patch.result || !isSpillRef(packed.result)) {
+      return null;
+    }
+    return ledger.get(stageRecordId, stepId).catch(() => null);
+  }
+
   /** Delete the blob a write that did not apply spilled; nothing names it. */
   async function discard(packed: unknown, original: unknown): Promise<void> {
     if (packed !== original && isSpillRef(packed)) {
@@ -313,7 +352,7 @@ export function withStepResultSpill(
     };
   }
 
-  return {
+  const decorated: StepLedger & TransactionReadPort<StepLedger> = {
     transactionReads(persistence) {
       const reader = withTransactionReads(ledger, persistence, ["get", "list"]);
       const readerSpill = withTransactionReads(spill, persistence, ["unpack"]);
@@ -341,11 +380,10 @@ export function withStepResultSpill(
     },
 
     async update(stageRecordId, stepId, patch) {
-      const updated = await ledger.update(
-        stageRecordId,
-        stepId,
-        await packPatch(stageRecordId, stepId, patch),
-      );
+      const packed = await packPatch(stageRecordId, stepId, patch);
+      const previous = await previousOf(stageRecordId, stepId, packed, patch);
+      const updated = await ledger.update(stageRecordId, stepId, packed);
+      await retire(previous, packed.result);
       return resolve(updated);
     },
 
@@ -356,6 +394,7 @@ export function withStepResultSpill(
       patch: StepRecordPatch,
     ) {
       const packed = await packPatch(stageRecordId, stepId, patch);
+      const previous = await previousOf(stageRecordId, stepId, packed, patch);
       const outcome = await ledger.compareAndSet(
         stageRecordId,
         stepId,
@@ -363,6 +402,7 @@ export function withStepResultSpill(
         packed,
       );
       if (!outcome.applied) await discard(packed.result, patch.result);
+      else await retire(previous, packed.result);
       return {
         applied: outcome.applied,
         record: outcome.record ? await resolve(outcome.record) : null,
@@ -377,6 +417,7 @@ export function withStepResultSpill(
     async clear(stageRecordId) {
       await ledger.clear(stageRecordId);
       await spill.deleteUnder(stepSpillPrefix(stageRecordId));
+      await spill.deleteUnder(stepWriteSpillPrefix(stageRecordId));
     },
 
     // `clearExcept` is optional on the port and the kernel branches on its
@@ -397,6 +438,10 @@ export function withStepResultSpill(
               keepStepIds.map((stepId) =>
                 legacyStepSpillKey(stageRecordId, stepId),
               ),
+            );
+            await spill.deleteUnder(
+              stepWriteSpillPrefix(stageRecordId),
+              [],
               keepStepIds.map((stepId) =>
                 stepSpillRowPrefix(stageRecordId, stepId),
               ),
@@ -405,6 +450,31 @@ export function withStepResultSpill(
         }
       : {}),
   };
+  unresolvedLists.set(decorated, { ledger, resolve });
+  return decorated;
+}
+
+const unresolvedLists = new WeakMap<
+  StepLedger,
+  { ledger: StepLedger; resolve: (record: StepRecord) => Promise<StepRecord> }
+>();
+
+/**
+ * The rows of a stage record that `wanted` selects, with only their results
+ * resolved: a spilled result of another row that cannot be read does not
+ * fail the call. `wanted` sees the row as stored (its `result` may be a
+ * spill reference). A ledger not built by `withStepResultSpill` is listed
+ * whole.
+ */
+export async function listStepRows(
+  ledger: StepLedger,
+  stageRecordId: string,
+  wanted: (row: StepRecord) => boolean,
+): Promise<StepRecord[]> {
+  const spilled = unresolvedLists.get(ledger);
+  if (!spilled) return (await ledger.list(stageRecordId)).filter(wanted);
+  const rows = (await spilled.ledger.list(stageRecordId)).filter(wanted);
+  return Promise.all(rows.map(spilled.resolve));
 }
 
 // ============================================================================

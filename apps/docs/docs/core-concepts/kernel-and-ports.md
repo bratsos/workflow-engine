@@ -161,14 +161,17 @@ replay reads every step of the stage. Results above a **soft threshold** are
 written to the `blobStore` and the row keeps a reference:
 
 ```json
-{ "$wfSpill": 1, "key": "workflow-v2/spill/steps/<stageRecordId>/<stepId>/<uuid>.json", "bytes": 400018 }
+{ "$wfSpill": 1, "key": "workflow-v2/spill/step-writes/<stageRecordId>/<stepId>/<uuid>.json", "bytes": 400018 }
 ```
 
 Every write spills to a new key, so the blob a committed row names is never
 written again: a compare-and-set that does not apply (another execution won
-the row) leaves only its own blob, which it deletes. Rows written before
-1.0.0-alpha.21 name `<stepId>.json` and are still read through their
-reference.
+the row) leaves only its own blob, which it deletes, and one that replaces a
+spilled result deletes the blob the previous version named. Rows written
+before 1.0.0-alpha.21 name `workflow-v2/spill/steps/<stageRecordId>/<stepId>.json`
+and are still read through their reference; the new keys live under a
+separate prefix, so an older release's redrive, which clears the old prefix,
+cannot delete them.
 
 This is on by default and needs no wiring: `createKernel` already has a
 `blobStore`, so it wraps the `stepLedger` you give it. Reads resolve the

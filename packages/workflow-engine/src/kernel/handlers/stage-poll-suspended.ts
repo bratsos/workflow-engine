@@ -998,7 +998,15 @@ export async function handleStagePollSuspended(
         stageRecord.suspendedState as any,
         checkContext,
       );
-      if (await superseded(stageRecord, deps)) continue;
+      const moved = await superseded(stageRecord, deps);
+      if (moved) {
+        // As after a durable replay: the callback may have created a batch
+        // after `run.cancel` read the ledger.
+        if (moved.status === "CANCELLED") {
+          await cancelRunBatches(stageRecord.workflowRunId, deps);
+        }
+        continue;
+      }
 
       // ── Phase 2: persist results (transaction) ─────────────────────
       if (checkResult.error) {

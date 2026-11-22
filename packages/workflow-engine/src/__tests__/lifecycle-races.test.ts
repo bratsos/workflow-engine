@@ -11,7 +11,7 @@ import { createKernel, type KernelConfig } from "../kernel/kernel.js";
 import {
   createSpillingJobTransport,
   jobSpillPrefix,
-  stepSpillPrefix,
+  stepWriteSpillPrefix,
 } from "../kernel/spill.js";
 import {
   CollectingEventSink,
@@ -168,7 +168,9 @@ describe(`lifecycle races on ${realDatabase ? (sqlite ? "SQLite" : "Postgres") :
       purged: 1,
       workflowRunIds: [runId],
     });
-    expect(await ports.blobStore.list(stepSpillPrefix(current))).toEqual([]);
+    expect(await ports.blobStore.list(stepWriteSpillPrefix(current))).toEqual(
+      [],
+    );
     expect((await wake(current, "ready")).status).toBe("acquired");
   });
 
@@ -244,7 +246,7 @@ describe(`lifecycle races on ${realDatabase ? (sqlite ? "SQLite" : "Postgres") :
 
     await expect(signal).rejects.toThrow();
     expect(await ledger.list(id)).toEqual([]);
-    expect(await ports.blobStore.list(stepSpillPrefix(id))).toEqual([]);
+    expect(await ports.blobStore.list(stepWriteSpillPrefix(id))).toEqual([]);
     expect((await wake(id, "late")).status).toBe("acquired");
   });
 
