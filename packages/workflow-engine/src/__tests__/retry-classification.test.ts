@@ -993,6 +993,9 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
       expect(await run.execute(1, 1)).toMatchObject({ willRetry: false });
       failing = false;
       expect(await run.execute(2, 2)).toMatchObject({ outcome: "suspended" });
+      // The wake key is the ledger row's updatedAt in ms: a second signal in the
+      // same millisecond as the first replays the first wake (main's behavior).
+      await new Promise((resolve) => setTimeout(resolve, 5));
       expect(await signal("second")).toMatchObject({
         signalled: true,
         alreadyCompleted: false,
