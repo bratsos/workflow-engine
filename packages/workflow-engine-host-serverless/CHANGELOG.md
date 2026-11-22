@@ -1,5 +1,46 @@
 # @bratsos/workflow-engine-host-serverless
 
+## 0.4.0-alpha.8
+
+### Minor Changes
+
+- 54da7b5: `createServerlessHost` accepts `onTick(counts)`, called at the end of every `runMaintenanceTick()` with a copy of the counts it computed (changing it does not change what the method returns), before the method returns them. Combine it with the `engine.stats` command to export gauges. A hook that throws or rejects is caught and logged, and the tick still returns its counts. The hook is awaited for at most the new option `onTickTimeoutMs` (default 5000, the same as `outboxFlushTimeoutMs`, the host's bound on its other optional wait after the maintenance commands finished; a number from 1 to 2147483647, anything else throws a `RangeError` from `createServerlessHost`, and nothing switches the bound off): after that the counts are returned, one warning is logged and the hook keeps running in the background. The bound covers a hook that yields: measured with a hook that never settles and `onTickTimeoutMs: 25`, `runMaintenanceTick()` returned after 28 ms. Synchronous code in the hook cannot be bounded: the timer fires only once it yields, so a body that computed for 60 ms delayed the return by 60 ms.
+- 54da7b5: Every call of `handleJob`, `processAvailableJobs` or `runMaintenanceTick` first calls the job transport's optional `verifyStorage()` and throws its error when the storage may not be used: with the Prisma SQLite adapters, a file another Prisma major wrote (`SqliteDateStorageError`), before anything is dispatched. The host remembers nothing: the transport decides (the Prisma job queue answers from its own cache once a check is conclusive, and checks again after a failure or on a file with no stored date). A transport without `verifyStorage` behaves as before. `createServerlessHost` also throws a `TypeError` when `onTick` is given and is not a function.
+- 54da7b5: Bound maintenance and `runToCompletion` outbox waits as well as post-job waits with `outboxFlushTimeoutMs` (default 5 seconds), and set claim lifetimes beyond that timeout. An in-flight sink call can finish or be recovered after its claim expires. `processAvailableJobs` runs every job it dequeued without checking storage a second time, so no dequeued job spends an attempt without running.
+
+### Patch Changes
+
+- 54da7b5: Stop starting outbox claims and sink calls when a host flush times out or Node shutdown cancels the tick. An in-flight sink call can settle under its original claim. Transactional ticks report deferred delivery until a root-client flush after commit.
+- 54da7b5: Report invalid `onTick` values with the intended `TypeError` even when the value cannot be formatted.
+- 54da7b5: `createServerlessHost` checks every option that reaches a timer at construction, with the rule `onTickTimeoutMs` already had: `outboxFlushTimeoutMs` and `jobHeartbeatIntervalMs` must be a number from 1 to 2147483647. `Infinity`, `NaN`, zero, a negative number or a larger value now throws a `RangeError` naming the option; before, a timer turned it into 1 ms (`outboxFlushTimeoutMs: Infinity` cut the post-job flush to 1 ms). `runToCompletion` applies the rule to `jobHeartbeatIntervalMs`, before it creates the run. A numeric string also throws now: an environment variable passed through unparsed (`jobHeartbeatIntervalMs: process.env.HEARTBEAT_MS`) worked before because a timer coerces `"20"`; pass `Number(process.env.HEARTBEAT_MS)`.
+- Updated dependencies [8f61a23]
+- Updated dependencies [79c2bdc]
+- Updated dependencies [54da7b5]
+- Updated dependencies [e44baf8]
+- Updated dependencies [8ecf45e]
+- Updated dependencies [0e3b18d]
+- Updated dependencies [54da7b5]
+- Updated dependencies [54da7b5]
+- Updated dependencies [54da7b5]
+- Updated dependencies [d10f610]
+- Updated dependencies [0b06546]
+- Updated dependencies [54da7b5]
+- Updated dependencies [54da7b5]
+- Updated dependencies [01f6566]
+- Updated dependencies [01f6566]
+- Updated dependencies [01f6566]
+- Updated dependencies [f224059]
+- Updated dependencies [01f6566]
+- Updated dependencies [01f6566]
+- Updated dependencies [01f6566]
+- Updated dependencies [54da7b5]
+- Updated dependencies [54da7b5]
+- Updated dependencies [ba13b3c]
+- Updated dependencies [54da7b5]
+- Updated dependencies [87654f3]
+- Updated dependencies [805fd81]
+  - @bratsos/workflow-engine@1.0.0-alpha.21
+
 ## 0.4.0-alpha.7
 
 ### Patch Changes

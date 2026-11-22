@@ -1,5 +1,48 @@
 # @bratsos/workflow-engine-host-node
 
+## 0.5.0-alpha.8
+
+### Minor Changes
+
+- 54da7b5: `createNodeHost` accepts `onTick(counts)`, called after every orchestration tick with a copy of the `MaintenanceTickCounts` the tick computed. Combine it with the `engine.stats` command to export gauges. The hook runs outside the tick: ticks never wait for what it awaits, so claiming, polling, lease reaping and the outbox flush do not depend on it. This holds for a hook that yields (awaits I/O or a timer): measured with a hook that never settles, the host ran 16 ticks in 155 ms against 15 without a hook. Synchronous code in the hook runs on the host's thread and no tick runs while it does: a hook that computed for 40 ms on each call at a 10 ms interval left room for five calls in 202 ms. Keep the hook's synchronous part short and await the rest. At most one call is in flight; a tick that finds the previous call still running skips the hook and logs one warning, with how long the call has run, at the first skip, and calls it again once it settles. The warning is not repeated while the hook stays slower than the interval; a call that finishes without any tick skipping it ends the episode. A hook that throws or rejects is caught and logged and never stops the loop. `stop()` waits for a running hook, together with the in-flight tick, for at most `shutdownTimeoutMs`, and no hook starts once it began. A hook must not await `host.stop()`: `stop()` waits for the hook that is waiting for it until `shutdownTimeoutMs` elapses.
+- 54da7b5: `createNodeHost(...).start()` calls the job transport's optional `verifyStorage()` before it starts a timer, a loop or a signal handler, and rejects with its error when the storage may not be used: with the Prisma SQLite adapters, a file another Prisma major wrote (`SqliteDateStorageError`). Without it the host ran and logged the same error on every tick and acted on nothing. A `stop()` that returns while that check is still pending cancels the start: when the check settles, nothing is installed, and a later `start()` checks again. A transport without `verifyStorage` starts as before. `createNodeHost` also throws a `TypeError` when `onTick` is given and is not a function, instead of failing on the first tick.
+- 54da7b5: Bound maintenance outbox waits with the new `outboxFlushTimeoutMs` option (default 5 seconds), and set claim lifetimes beyond the applicable maintenance or shutdown timeout. A slow in-flight sink call can finish or be recovered after its claim expires.
+
+  Each job loop and tick belongs to its host start. A stopped tick cannot call its hook after a restart. A replacement job loop waits for the old loop to settle. A job dequeued while the host stops is not run: the host returns it with the transport's `defer`, fenced by its lease, so it keeps its attempt count. The host waits for that return for at most `shutdownTimeoutMs`; a return that has not finished by then is still fenced, and the job is recovered when its lease expires if the return never commits.
+
+### Patch Changes
+
+- 54da7b5: Report invalid `onTick` values with the intended `TypeError` even when the value cannot be formatted.
+- 54da7b5: Stop starting outbox claims and sink calls when a host flush times out or Node shutdown cancels the tick. An in-flight sink call can settle under its original claim. Transactional ticks report deferred delivery until a root-client flush after commit.
+- 54da7b5: `createNodeHost` checks every option that reaches a timer at construction: `orchestrationIntervalMs`, `jobPollIntervalMs`, `jobHeartbeatIntervalMs` and `shutdownTimeoutMs` must be a number from 1 to 2147483647, and `postJobYieldMs` from 0 (0 turns the pause off). `Infinity`, `NaN`, zero (where it is not documented as off), a negative number or a larger value now throws a `RangeError` naming the option; before, a timer turned such a value into 1 ms (an interval became a busy loop, a bound meant as "no limit" the tightest one). `runAndWait` applies the same rule to `pollIntervalMs`, before it creates the run. A numeric string also throws now: an environment variable passed through unparsed (`orchestrationIntervalMs: process.env.TICK_MS`) worked before because a timer coerces `"20"`; pass `Number(process.env.TICK_MS)`.
+- Updated dependencies [8f61a23]
+- Updated dependencies [79c2bdc]
+- Updated dependencies [54da7b5]
+- Updated dependencies [e44baf8]
+- Updated dependencies [8ecf45e]
+- Updated dependencies [0e3b18d]
+- Updated dependencies [54da7b5]
+- Updated dependencies [54da7b5]
+- Updated dependencies [54da7b5]
+- Updated dependencies [d10f610]
+- Updated dependencies [0b06546]
+- Updated dependencies [54da7b5]
+- Updated dependencies [54da7b5]
+- Updated dependencies [01f6566]
+- Updated dependencies [01f6566]
+- Updated dependencies [01f6566]
+- Updated dependencies [f224059]
+- Updated dependencies [01f6566]
+- Updated dependencies [01f6566]
+- Updated dependencies [01f6566]
+- Updated dependencies [54da7b5]
+- Updated dependencies [54da7b5]
+- Updated dependencies [ba13b3c]
+- Updated dependencies [54da7b5]
+- Updated dependencies [87654f3]
+- Updated dependencies [805fd81]
+  - @bratsos/workflow-engine@1.0.0-alpha.21
+
 ## 0.5.0-alpha.7
 
 ### Patch Changes
