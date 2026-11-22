@@ -128,14 +128,27 @@ you an output existed and where it lived, not what it contained.
 
 ### What happens to the step ledger
 
-A reopened stage keeps its durable step ledger, through the same reset the
-engine gives a `FAILED` stage it is asked to run again: every `completed`
-row stays as it is, so a stage that completed 9 of 10 steps re-runs only the
-tenth; every `run` row that named an external effect but did not complete
-is re-opened, so its body runs again with `isReclaim: true` and re-adopts
-the batch it already submitted; waits, signals, sleeps and failed rows with
-nothing to keep are dropped. A deleted stage's ledger is cleared — its rows
-are keyed by a stage record id nothing will ever look up again.
+A reopened stage keeps its durable step ledger, through the `"resume"` mode
+of the reset the engine also uses for an explicit re-run of a `FAILED` stage
+(a `job.execute` dispatched without `attempt`), which runs in `"restart"`
+mode and keeps less. In `"resume"` mode every `completed` row stays as it is,
+so a stage that completed 9 of 10 steps re-runs only the tenth; every `run`
+row that named an external effect but did not complete is re-opened, so its
+body runs again with `isReclaim: true` and re-adopts the batch it already
+submitted; waits, signals, sleeps and failed rows with nothing to keep are
+dropped. In `"restart"` mode only the `run` rows that name an external effect
+(every `run` row with an `externalKey`) are kept, and every one of them is
+re-opened, the completed ones included, so their bodies run again with
+`isReclaim: true`; everything else, completed rows without an external key
+among it, is dropped. A deleted stage's ledger is cleared — its rows are
+keyed by a stage record id nothing will ever look up again.
+
+A signal's wake claim is released with its row only for a deleted record. A
+reopened stage whose ledger has no `clearExcept` drops its completed signal
+rows (the fallback clears everything) without releasing their claims, so a
+second signal that completes a replacement row with the same timestamp,
+creation time, position and attempt as the earlier one can replay the earlier
+wake and leave the stage `SUSPENDED` until its next poll finds it.
 
 The deleted records' signal wake keys are released in the redrive's transaction, and the run update is fenced on the version whose status the redrive checked, so a run cancelled or redriven meanwhile is refused (`run.rerunFrom` included). Blob cleanup of deleted records runs after the commit and keeps every key an `outputData` points at, the deleted records' and the current records' (read after each stage prefix is listed): a new attempt that completed before the cleanup reached its stage keeps its output, and a caller who rolls back the redrive's transaction keeps the restored records' output. Limits, all also on main: if a deleted record's post-commit ledger clear fails, dispatch rejects after the commit and nothing names that record again, so its external ledger rows and spilled step results stay (the step ledger's own spill cleanup ignores delete errors); output a new attempt writes to a listed key between the listing and that read, keys a stage wrote itself through `ctx.storage`, and a restored record's own storage after a caller rollback can be deleted; the step ledger of a record a caller's rolled-back transaction restores has already been cleared, since the kernel cannot see when a caller's transaction commits; on SQLite, a redrive dispatched on a caller's transaction with Prisma-backed blob or ledger ports on the same database waits in its post-commit step for that transaction's own write lock until the transaction times out.
 

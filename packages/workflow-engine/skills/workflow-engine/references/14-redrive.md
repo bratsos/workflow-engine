@@ -171,13 +171,13 @@ Durable step rows in `workflow_steps` are keyed by `stageRecordId` — the prima
 
 ### A reopened record keeps its progress
 
-For `lastFailure` and `stage`, the resumed group's records are reopened in place, and their ledgers go through the same reset a `FAILED` stage gets when `job.execute` is dispatched for it without `attempt` (an explicit re-run; the helper is shared, `kernel/helpers/step-ledger-reset.ts`), in its `"resume"` mode:
+For `lastFailure` and `stage`, the resumed group's records are reopened in place, and their ledgers go through the shared reset (`kernel/helpers/step-ledger-reset.ts`) in its `"resume"` mode. The explicit re-run of a `FAILED` stage (a `job.execute` dispatched without `attempt`) uses the same helper in `"restart"` mode, which keeps less: only the `run` rows naming an external effect (every `run` row with an `externalKey`), every one re-opened, completed ones included, so their bodies run again with `isReclaim: true`; waits, signals, sleeps and rows with no external key are dropped, completed or not. In `"resume"` mode:
 
 - Every `completed` row stays exactly as it is. The replay answers it from the ledger, so the step's body does not run again — a stage that completed 9 of 10 steps re-runs only the tenth — and the row keeps the external key it was given, so a provider deduping on that key still recognises the effect.
 - Every `run` row naming an external effect (`externalKey` set) that did not complete is **re-opened**: put back to `running` with no lease, so the replay takes it over, bumps `attempt` and executes the body with `isReclaim: true`, letting a `${id}:submit` re-adopt the batch a provider is still processing instead of creating and billing a second one.
 - Everything else is dropped through `StepLedger.clearExcept`: waits, signals and sleeps hold only timers and deadlines that a new attempt must re-derive, and a failed `run` row with no external key has nothing worth keeping.
 
-A ledger without `clearExcept` cannot keep some rows and drop others. When anything has to go, everything goes — completed rows included — exactly as `job.execute` falls back on the same ledger, and the rows naming an external effect are recorded as `abandonedSteps` before they are lost. Redriving onto a different definition version may leave rows the new code never requests; they are harmless and not detected.
+A ledger without `clearExcept` cannot keep some rows and drop others. When anything has to go, everything goes — completed rows included — exactly as `job.execute` falls back on the same ledger, and the rows naming an external effect are recorded as `abandonedSteps` before they are lost. Those dropped completed signal rows do not have their wake claims released (only a deleted record's are), so a second signal that completes a replacement row with the same timestamp, creation time, position and attempt as the earlier one can replay the earlier wake and leave the stage `SUSPENDED` until its next poll finds it. Redriving onto a different definition version may leave rows the new code never requests; they are harmless and not detected.
 
 ### A deleted record loses its ledger
 

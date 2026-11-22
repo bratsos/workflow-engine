@@ -85,7 +85,7 @@ describe(`signals in the same tick on ${realDatabase ? (sqlite ? "SQLite" : "Pos
   });
 
   /** A stage that waits for "approval" and, while `failing`, throws after it. */
-  async function waiting() {
+  async function waiting(bend?: (inner: StepLedger) => StepLedger) {
     const state = { failing: false };
     const workflow = new WorkflowBuilder(
       "signal-same-tick",
@@ -111,6 +111,7 @@ describe(`signals in the same tick on ${realDatabase ? (sqlite ? "SQLite" : "Pos
       .build();
     const kernel = createKernel({
       ...ports,
+      ...(bend ? { stepLedger: bend(ports.stepLedger!) } : {}),
       eventSink: new CollectingEventSink(),
       clock: { now: () => new Date() },
       registry: { getWorkflow: () => workflow },
@@ -190,6 +191,56 @@ describe(`signals in the same tick on ${realDatabase ? (sqlite ? "SQLite" : "Pos
     expect(
       (await ports.persistence.getStage(t.workflowRunId, "s"))?.status,
     ).toBe("COMPLETED");
+  });
+
+  it("does not wake twice for a signal sent again after a failed ledger clear", async () => {
+    const t = await waiting((inner) =>
+      wrapStepLedger(inner, {
+        async clear() {
+          throw new Error("clear failed");
+        },
+      }),
+    );
+    await t.signal("first");
+    t.state.failing = true;
+    await t.execute(true);
+    // The explicit re-run's clear fails: the signal row is still there.
+    await expect(t.execute()).rejects.toThrow("clear failed");
+
+    await expect(t.signal("first")).resolves.toMatchObject({
+      alreadyCompleted: true,
+    });
+
+    expect(await t.payloads()).toEqual(["first"]);
+  });
+
+  it("does not wake twice for a signal sent again while the ledger clear runs", async () => {
+    let again: (() => Promise<unknown>) | undefined;
+    let retried: unknown;
+    const t = await waiting((inner) =>
+      wrapStepLedger(inner, {
+        async clear(id) {
+          retried = await again?.();
+          return inner.clear(id);
+        },
+      }),
+    );
+    again = () => t.signal("first");
+    await t.signal("first");
+    t.state.failing = true;
+    await t.execute(true);
+    t.state.failing = false;
+
+    await expect(t.execute()).resolves.toMatchObject({ outcome: "suspended" });
+
+    expect(retried).toMatchObject({ alreadyCompleted: true });
+    expect(await t.payloads()).toEqual(["first"]);
+    // The claim went with the row: the next signal wakes the stage.
+    await t.park();
+    await expect(t.signal("second")).resolves.toMatchObject({
+      alreadyCompleted: false,
+    });
+    expect(await t.payloads()).toEqual(["first", "second"]);
   });
 
   it("wakes the stage for a signal row that replaced another outside the kernel", async () => {
