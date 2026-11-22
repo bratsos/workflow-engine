@@ -110,7 +110,9 @@ describe("runActivity", () => {
     const report = await runActivity(task, mapsBatches, worker);
     expect(report.outcome).toMatchObject({
       kind: "failed",
-      errorName: "StepLedgerNotConfiguredError",
+      error: expect.stringContaining(
+        "Durable steps require a configured StepLedger",
+      ),
     });
     expect(batchModelReached).toBe(false);
     expect(report.logs).toEqual([]);
