@@ -27,6 +27,15 @@
  * crashed submit is not recoverable and the engine says so loudly rather than
  * paying twice.
  *
+ * Neither is a batch the engine cancelled itself (`excludeBatchIds`): a cancel
+ * can be asynchronous, and Gemini keeps listing the batch as running until it
+ * lands, so the status alone cannot be trusted right after `run.cancel`.
+ *
+ * A batch that is cancelling or cancelled is never adopted. `run.cancel`
+ * cancels a run's provider batches, and `run.redrive` then replays the submit
+ * under the same key; the cancelled batch is still listed there, so the search
+ * skips it and the replay creates a new one.
+ *
  * The provider SDKs expose no hook for these fields, so — exactly as
  * `google-json-schema.ts` already does for the response schema — the engine
  * rewrites the creation body at the `fetch` boundary.
@@ -37,6 +46,18 @@ import type { EngineBatchRef, EngineBatchStatus } from "./model";
 
 /** Metadata key the engine stamps its external key into on OpenAI batches. */
 export const EXTERNAL_KEY_METADATA_FIELD = "workflow_engine_external_key";
+
+/**
+ * Whether a provider's own batch status says the batch is cancelling or
+ * cancelled: OpenAI `cancelling` / `cancelled`, Anthropic `canceling`, Gemini
+ * `JOB_STATE_CANCELLED` (also spelled `BATCH_STATE_*`).
+ */
+export function isCancelledRawStatus(raw: unknown): boolean {
+  return (
+    typeof raw === "string" &&
+    /^(?:(?:JOB|BATCH)_STATE_)?CANCEL(?:L?ING|L?ED)$/i.test(raw)
+  );
+}
 
 /** Reads the key the in-flight `start()` call is creating a batch under. */
 export type CurrentExternalKey = () => string | undefined;
@@ -119,12 +140,18 @@ export interface AdoptRequest {
   abortSignal?: AbortSignal;
   /** Pages of the provider's list endpoint to scan before giving up. */
   maxPages?: number;
+  /** Batch ids never to return: the engine cancelled them, whatever the list says. */
+  excludeBatchIds?: readonly string[];
 }
 
 const DEFAULT_MAX_PAGES = 5;
 const LIST_PAGE_SIZE = 100;
 
-/** Find an OpenAI batch stamped with `externalKey`, newest first. */
+/**
+ * Find an OpenAI batch stamped with `externalKey`, newest first. A batch that
+ * is cancelling or cancelled is skipped: it will never produce results, and
+ * `run.cancel` leaves one behind under the same key when a run is redriven.
+ */
 export async function adoptOpenAIBatch(
   request: AdoptRequest,
   externalKey: string,
@@ -157,7 +184,9 @@ export async function adoptOpenAIBatch(
     for (const row of rows) {
       if (
         typeof row.id === "string" &&
-        row.metadata?.[EXTERNAL_KEY_METADATA_FIELD] === externalKey
+        row.metadata?.[EXTERNAL_KEY_METADATA_FIELD] === externalKey &&
+        !isCancelledRawStatus(row.status) &&
+        !request.excludeBatchIds?.includes(row.id)
       ) {
         return { id: row.id, status: mapOpenAIStatus(row.status) };
       }
@@ -212,7 +241,10 @@ function mapGoogleState(raw: unknown): EngineBatchStatus["status"] {
   }
 }
 
-/** Find a Gemini batch job whose `displayName` is `externalKey`. */
+/**
+ * Find a Gemini batch job whose `displayName` is `externalKey`, skipping one
+ * that is cancelling or cancelled for the reason `adoptOpenAIBatch` does.
+ */
 export async function adoptGoogleBatch(
   request: AdoptRequest,
   externalKey: string,
@@ -247,7 +279,12 @@ export async function adoptGoogleBatch(
     const rows = body.operations ?? body.batches ?? [];
     for (const row of rows) {
       const displayName = row.metadata?.displayName ?? row.displayName;
-      if (typeof row.name === "string" && displayName === externalKey) {
+      if (
+        typeof row.name === "string" &&
+        displayName === externalKey &&
+        !isCancelledRawStatus(row.metadata?.state ?? row.state) &&
+        !request.excludeBatchIds?.includes(row.name)
+      ) {
         return {
           id: row.name,
           status: mapGoogleState(row.metadata?.state ?? row.state),

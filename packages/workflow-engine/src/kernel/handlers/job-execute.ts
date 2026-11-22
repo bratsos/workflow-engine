@@ -31,6 +31,7 @@ import {
   JobTargetMissingError,
 } from "../errors.js";
 import type { KernelEvent } from "../events";
+import { cancelBatchesOfDiscardedRun } from "../helpers/cancel-run-batches.js";
 import { assertServesRun } from "../helpers/definition-pinning.js";
 import { HOST_DEFAULTS } from "../helpers/host-support.js";
 import {
@@ -273,7 +274,13 @@ export async function handleJobExecute(
           deps,
           (tx) => write(tx, version),
         );
-        return claimed.status === "cancelled" ? claimed.message : undefined;
+        if (claimed.status !== "cancelled") return undefined;
+        await cancelBatchesOfDiscardedRun(
+          workflowRunId,
+          claimed.runStatus,
+          deps,
+        );
+        return claimed.message;
       } catch (error) {
         if (!(error instanceof StaleVersionError)) throw error;
         const current = await deps.persistence.getStage(workflowRunId, stageId);
@@ -478,6 +485,7 @@ export async function handleJobExecute(
     // Stage body succeeded — re-check run status (cancellation guard)
     const currentRunStatus = await deps.persistence.getRunStatus(workflowRunId);
     if (currentRunStatus !== "RUNNING") {
+      await cancelBatchesOfDiscardedRun(workflowRunId, currentRunStatus, deps);
       return {
         outcome: "failed" as const,
         ghost: true,

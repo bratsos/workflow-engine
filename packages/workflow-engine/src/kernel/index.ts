@@ -25,6 +25,8 @@ export type {
   OutboxFlushResult,
   PluginReplayDLQCommand,
   PluginReplayDLQResult,
+  RunCancelBatchOutcome,
+  RunCancelBatchStatus,
   RunCancelCommand,
   RunCancelResult,
   RunClaimPendingCommand,

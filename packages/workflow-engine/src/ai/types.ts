@@ -654,6 +654,30 @@ export interface AIBatchSubmitOptions {
    * regardless, accepting that the earlier one is orphaned and still billed.
    */
   onReclaim?: BatchReclaimPolicy;
+  /**
+   * Provider batch ids the engine cancelled for this submission. The search for
+   * the external key never returns one of them (a cancel can be asynchronous,
+   * so the provider may still list the batch as running).
+   */
+  excludeBatchIds?: readonly string[];
+  /**
+   * Batches an earlier execution of this submission already created, in
+   * partition order, because a later partition was rejected
+   * (`BatchSubmitError.createdRefs`). They are reused and the submission
+   * continues after them, so none is created twice.
+   */
+  existingRefs?: readonly EngineBatchRef[];
+}
+
+/** What `AIBatch.cancel` did to one provider batch of a handle. */
+export interface AIBatchCancelResult {
+  ref: EngineBatchRef;
+  /**
+   * `"cancelled"`: the provider has the batch cancelling or cancelled.
+   * `"already-terminal"`: it had ended on its own; nothing was cancelled.
+   * `"unsupported"`: the transport has no cancel call (OpenRouter).
+   */
+  outcome: "cancelled" | "already-terminal" | "unsupported";
 }
 
 /** Interface for batch operations on an AI model */
@@ -673,6 +697,22 @@ export interface AIBatch<T = string> {
     batchId: string,
     metadata?: Record<string, unknown>,
   ): Promise<AIBatchResult<T>[]>;
+  /**
+   * Ask the provider to cancel every batch of a handle that has not ended.
+   * Pass the same `metadata` as `getStatus` (it carries `batchRefs`). Tries
+   * every batch, then throws the first error if any call failed. Optional so
+   * an `AIBatch` implemented outside the engine keeps compiling.
+   */
+  cancel?(
+    batchId: string,
+    metadata?: Record<string, unknown>,
+  ): Promise<AIBatchCancelResult[]>;
+  /**
+   * Whether a replayed `submit` can find a batch this transport created by its
+   * external key (the transport implements `adopt`). Optional; when it is
+   * missing the engine assumes it can.
+   */
+  canAdopt?(): Promise<boolean>;
   /** Check if results have been recorded for this batch */
   isRecorded(batchId: string): Promise<boolean>;
   /** Record batch results manually when batch provider integration is not implemented */

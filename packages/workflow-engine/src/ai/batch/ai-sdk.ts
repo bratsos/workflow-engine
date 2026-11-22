@@ -15,6 +15,7 @@ import {
   adoptOpenAIBatch,
   createGoogleDisplayNameStamp,
   createOpenAIBatchFetch,
+  isCancelledRawStatus,
 } from "./adoption";
 import {
   createGoogleBatchFetch,
@@ -22,6 +23,7 @@ import {
   toGoogleResponseSchema,
 } from "./google-json-schema";
 import {
+  type EngineBatchCancelResult,
   type EngineBatchItemResult,
   type EngineBatchModel,
   type EngineBatchRef,
@@ -173,6 +175,8 @@ export type ProviderBatch = {
   doGetBatchResults(
     options: BatchOperationOptions,
   ): PromiseLike<ReadableStream<ProviderBatchItemResult>>;
+  /** Present on vendor releases that implement the batch cancel call. */
+  doCancelBatch?(options: BatchOperationOptions): PromiseLike<unknown>;
 };
 
 function isProviderBatch(b: unknown): b is ProviderBatch {
@@ -315,6 +319,26 @@ interface BatchSeamOps {
   ): PromiseLike<
     ReadableStream<BatchItemResult<LanguageModelV4GenerateResult>>
   >;
+  /**
+   * Absent on the per-model seam and on vendor releases without the cancel
+   * call; the engine model then has no `cancel`.
+   */
+  cancel?(options: BatchOperationOptions): PromiseLike<unknown>;
+}
+
+/**
+ * Where a batch stands for a cancel: `active` can be cancelled, `cancelled`
+ * already is (or is cancelling), `ended` finished on its own.
+ */
+function batchPhase(status: BatchStatus): "active" | "cancelled" | "ended" {
+  if (isCancelledRawStatus(status.rawStatus)) return "cancelled";
+  if (status.status === "pending") return "active";
+  // Anthropic reports a cancelled batch as `ended`; only the cancel
+  // timestamp tells it from one that ran to completion.
+  const anthropic = status.providerMetadata?.anthropic as
+    | { cancelInitiatedAt?: unknown }
+    | undefined;
+  return anthropic?.cancelInitiatedAt ? "cancelled" : "ended";
 }
 
 /**
@@ -365,6 +389,9 @@ export function fromAiSdkProviderBatch(
         }),
       status: (options) => batch.doGetBatchStatus(options),
       results: (options) => batch.doGetBatchResults(options),
+      ...(typeof batch.doCancelBatch === "function"
+        ? { cancel: (options) => batch.doCancelBatch!(options) }
+        : {}),
     },
     opts,
   );
@@ -475,8 +502,48 @@ function buildEngineBatchModel(
         rawStatus: res.rawStatus,
         requestCounts: mapRequestCounts(res.requestCounts),
         error: res.error?.message,
+        // Anthropic reports a cancelled batch as `ended`; only the cancel
+        // timestamp says so (see `batchPhase`).
+        ...(batchPhase(res) === "cancelled" ? { cancelled: true } : {}),
       };
     },
+
+    // Reads the status first: the vendors document no behaviour for a cancel
+    // sent to a batch that has ended, so only an active batch is sent one.
+    ...(seam.cancel
+      ? {
+          async cancel(
+            ref: EngineBatchRef,
+            callOpts?: {
+              abortSignal?: AbortSignal;
+              headers?: Record<string, string>;
+            },
+          ): Promise<EngineBatchCancelResult> {
+            const call = {
+              batchId: ref.id,
+              abortSignal: callOpts?.abortSignal,
+              headers: callOpts?.headers,
+            };
+            const current = await seam.status(call);
+            const phase = batchPhase(current);
+            if (phase === "ended") {
+              return {
+                outcome: "already-terminal" as const,
+                ...(current.rawStatus !== undefined
+                  ? { rawStatus: current.rawStatus }
+                  : {}),
+              };
+            }
+            if (phase === "active") await seam.cancel!(call);
+            return {
+              outcome: "cancelled" as const,
+              ...(current.rawStatus !== undefined
+                ? { rawStatus: current.rawStatus }
+                : {}),
+            };
+          },
+        }
+      : {}),
 
     async *results(
       ref: EngineBatchRef,
@@ -602,6 +669,9 @@ async function resolveGoogleBatchModel(
           ...(adoptOpts?.abortSignal
             ? { abortSignal: adoptOpts.abortSignal }
             : {}),
+          ...(adoptOpts?.excludeBatchIds
+            ? { excludeBatchIds: adoptOpts.excludeBatchIds }
+            : {}),
         },
         externalKey,
       );
@@ -677,6 +747,9 @@ async function resolveOpenAIBatchModel(
           ...(adoptOpts?.headers ? { headers: adoptOpts.headers } : {}),
           ...(adoptOpts?.abortSignal
             ? { abortSignal: adoptOpts.abortSignal }
+            : {}),
+          ...(adoptOpts?.excludeBatchIds
+            ? { excludeBatchIds: adoptOpts.excludeBatchIds }
             : {}),
         },
         externalKey,

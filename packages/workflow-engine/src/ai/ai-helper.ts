@@ -325,6 +325,7 @@ export type {
   AdapterTextResponse,
   AIAdapter,
   AIBatch,
+  AIBatchCancelResult,
   AIBatchHandle,
   AIBatchProvider,
   AIBatchRequest,

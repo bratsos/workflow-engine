@@ -13,6 +13,7 @@ import type { EngineBatchRef } from "../../ai/batch/model";
 import { getModel, type ModelKey } from "../../ai/model-helper";
 import { calculateCostWithDiscount } from "../../ai/shared";
 import type {
+  AIBatchCancelResult,
   AIBatchProvider,
   AIBatchRequest,
   AIBatchResult,
@@ -47,17 +48,44 @@ import {
   parseStepDuration,
   type StepApi,
   type StepControlFlowError,
+  StepLeaseLostError,
   type StepRunOptions,
   StepSuspend,
   StepTimeoutError,
+  stageAbortReason,
 } from "../../core/steps";
 import { getBestProviderForModel } from "../../utils/batch/model-mapping";
+import type { StepRecord } from "../ports.js";
+import {
+  dueOwedRefs,
+  excludedIdsOf,
+  generationTag,
+  hasCancelFence,
+  nextOwedRetry,
+  type OwedAnswer,
+  type OwedSettlement,
+  owedRefsOf,
+  owedRetryOf,
+  parseStoredSubmit,
+  rebaseMarkers,
+  type StoredSubmit,
+} from "./batch-submit-record.js";
+
+/** The `cancelledBatchIds` a row's result lists, whatever else it holds. */
+function cancelledIdsOf(result: unknown): string[] | undefined {
+  const ids = (result as { cancelledBatchIds?: unknown } | null | undefined)
+    ?.cancelledBatchIds;
+  return Array.isArray(ids)
+    ? ids.filter((x): x is string => typeof x === "string")
+    : undefined;
+}
 
 const DEFAULT_CONCURRENCY = 10;
 const DEFAULT_BATCH_ABOVE = 20;
 const DEFAULT_REPAIR_ATTEMPTS = 1;
 const DEFAULT_REALTIME_RETRIES = 1;
-const RESERVED_ITEM_IDS = new Set(["submit", "poll", "collect"]);
+// `poll.1`, `collect.1`, ... are the bookkeeping steps of a replaced batch.
+const RESERVED_ITEM_ID = /^(?:submit|poll|collect)(?:\.\d+)?$/;
 
 export interface StepAiDeps {
   run: StepApi["run"];
@@ -76,6 +104,48 @@ export interface StepAiDeps {
   loadFailedVerdict(stepId: string): Promise<unknown | undefined>;
   /** Wait before an in-process retry. Defaults to a real timer. */
   delay?(ms: number): Promise<void>;
+  /**
+   * The result a step's row holds, whatever its status: a re-opened row keeps
+   * the result of its last execution. Optional; without it a reclaimed batch
+   * submit cannot tell that the engine cancelled its batches.
+   */
+  storedResult?(stepId: string): Promise<unknown>;
+  /**
+   * Write a step's result onto its row while the step is still executing,
+   * pinned to (`running`, `attempt`). Throws `StepLeaseLostError` when the row
+   * is no longer this execution's (a replay or a cancel sweep took it over).
+   */
+  storeResult?(stepId: string, result: unknown, attempt: number): Promise<void>;
+  /** A step's row as it stands, or `null` when it does not exist. */
+  loadRow?(stepId: string): Promise<StepRecord | null>;
+  /**
+   * Record batches as owed a cancel (`cancelOwed`) on a completed or failed
+   * row, or a running one with no lease, pinned to the status and attempt in
+   * `row`. False when the row moved.
+   */
+  excludeBatches?(
+    stepId: string,
+    row: StepRecord,
+    refs: EngineBatchRef[],
+  ): Promise<boolean>;
+  /**
+   * Settle the owed cancels of the row `stepId` the provider has answered
+   * (`settleOwed`), and record one more failed attempt for `failed` (id to
+   * kind of failure, in `cancelRetry`), when nothing holds the row. Best
+   * effort; says what it wrote.
+   */
+  settleBatches?(
+    stepId: string,
+    answered: ReadonlyMap<string, OwedAnswer>,
+    failed?: ReadonlyMap<string, string>,
+  ): Promise<OwedSettlement>;
+  /** The engine clock. Without it a replay tries every owed cancel. */
+  now?(): Date;
+  /**
+   * A WARN that names a provider batch which may still be running: written
+   * on the run (it outlives the stage record), and never lost silently.
+   */
+  onBatchWarn?: (message: string) => void;
   /** Throws when durable steps are unavailable (no ledger / stage record). */
   assertReady(): void;
   ai(): AIHelper;
@@ -102,17 +172,15 @@ interface ItemEntry<TIn> {
   prompt: TextInput;
 }
 
-interface StoredSubmit {
-  handleId: string;
-  refs: EngineBatchRef[];
-  requestIds: string[];
-  totalRequests: number;
-  /** ISO time of the submit, for `durationMs` on the accounting rows. */
-  submittedAt?: string;
-}
-
 interface Budget {
   reserve(): boolean;
+}
+
+/** The batches a rejected submit had already created (`BatchSubmitError.createdRefs`). */
+function createdRefsOf(error: unknown): EngineBatchRef[] {
+  if (!(error instanceof Error) || error.name !== "BatchSubmitError") return [];
+  const refs = (error as { createdRefs?: unknown }).createdRefs;
+  return Array.isArray(refs) ? (refs as EngineBatchRef[]) : [];
 }
 
 /** A batch item the provider or the schema rejected (small: no output). */
@@ -564,7 +632,7 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
       if (!itemId) {
         throw new Error(`AI map "${id}": itemId for index ${index} is empty`);
       }
-      if (RESERVED_ITEM_IDS.has(itemId)) {
+      if (RESERVED_ITEM_ID.test(itemId)) {
         throw new Error(
           `AI map "${id}": itemId "${itemId}" is reserved for batch bookkeeping`,
         );
@@ -923,41 +991,604 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
       .batch<unknown>(spec.model, provider, spec.batch?.options);
     const requestIds = entries.map((e) => e.id);
 
-    const submitted = await deps.run(
-      `${id}:submit`,
-      async (step): Promise<StoredSubmit> => {
-        const requests: AIBatchRequest[] = entries.map((e) => ({
-          id: e.id,
-          prompt: e.prompt as string,
-          ...(spec.schema ? { schema: spec.schema } : {}),
-          ...(spec.system !== undefined ? { system: spec.system } : {}),
-          ...(spec.maxTokens !== undefined
-            ? { maxTokens: spec.maxTokens }
-            : {}),
-          ...(spec.temperature !== undefined
-            ? { temperature: spec.temperature }
-            : {}),
-        }));
-        // The provider bills a batch the moment it is created, so a replay
-        // of this step must find what a dead worker already created rather
-        // than create a second one. `step.externalKey` is the same on every
-        // replay; `step.isReclaim` is true only when an earlier execution of
-        // this body may have run.
-        const handle = await batch.submit(requests, {
-          externalKey: step.externalKey,
-          recovering: step.isReclaim,
-          ...(spec.batch?.onReclaim ? { onReclaim: spec.batch.onReclaim } : {}),
-        });
-        return {
-          handleId: handle.id,
-          refs: handle.refs ?? [],
-          requestIds,
-          totalRequests: handle.totalRequests ?? requests.length,
-          submittedAt: new Date().toISOString(),
-        };
-      },
-    );
+    // Batches this execution's submit body created, and the key they carry.
+    // The body's outcome write can lose the row (on a submit row it is pinned
+    // to the attempt it claimed, see `step-api.ts`): another execution of the
+    // step recorded its own outcome first, a run.cancel sweep holds the row,
+    // or the row is gone with its stage record. A batch the row does not list
+    // is then this execution's alone, and nothing would ever cancel it.
+    let made: EngineBatchRef[] = [];
+    let madeKey = "";
+    const batchWarn = (message: string) =>
+      deps.onBatchWarn
+        ? deps.onBatchWarn(message)
+        : deps.onLog?.("WARN", message);
+    /**
+     * Send one cancel for `refs` and sort the answers: settled (cancelled,
+     * ended, or a provider with no cancel call) and failed, by kind of failure
+     * (what a replay compares to decide whether to warn again).
+     */
+    const sendCancel = async (refs: EngineBatchRef[]) => {
+      let outcomes: AIBatchCancelResult[] | undefined;
+      let why: string | undefined;
+      try {
+        outcomes = await batch.cancel?.(refs[0]!.id, { batchRefs: refs });
+      } catch (error) {
+        why = errorMessage(error);
+      }
+      const answered = new Map<string, OwedAnswer>();
+      for (const o of outcomes ?? []) {
+        if (o.outcome === "cancelled") answered.set(o.ref.id, "cancelled");
+        else if (o.outcome === "already-terminal")
+          answered.set(o.ref.id, "ended");
+        else if (o.outcome === "unsupported")
+          answered.set(o.ref.id, "unsupported");
+      }
+      const kind =
+        why !== undefined
+          ? "error"
+          : outcomes
+            ? "unanswered"
+            : "no-transport-cancel";
+      const failed = new Map(
+        refs
+          .filter((ref) => !answered.has(ref.id))
+          .map((ref) => [ref.id, kind]),
+      );
+      return {
+        answered,
+        failed,
+        why:
+          why ?? (outcomes ? "no answer" : "its transport has no cancel call"),
+      };
+    };
+    const quoted = (ids: string[]) => ids.map((x) => `"${x}"`).join(", ");
+    /** Owed batches whose provider has no cancel call: settled, once. */
+    const warnNoCancel = (refs: EngineBatchRef[]) => {
+      if (refs.length === 0) return;
+      batchWarn(
+        `AI map "${id}": batch(es) ${quoted(refs.map((ref) => ref.id))}, created by an execution of the submit step that lost it, are owed a cancel, and their provider (${[...new Set(refs.map((ref) => ref.provider))].join(", ")}) has no cancel call. The engine cannot cancel them and will not try again: they run until they end and are billed. Cancel them in the provider's console if it has one, otherwise let them end. They are recorded on the step (noCancelBatchIds) and are never adopted.`,
+      );
+    };
+    const warnOwedFailed = (ids: string[], why: string, next: string) => {
+      if (ids.length === 0) return;
+      batchWarn(
+        `AI map "${id}": batch(es) ${quoted(ids)}, created by an earlier execution of the submit step that lost it, are owed a cancel and cancelling them failed (${why}). They may still be running and billed; they stay owed on the step and ${next}. Cancel them at the provider to stop the billing now.`,
+      );
+    };
+    /**
+     * Cancel batches this execution created that its row does not list. When
+     * `owed` they are recorded on the row as owed a cancel, which is settled
+     * (or its failure recorded) once the provider answers.
+     */
+    const cancelUnlisted = async (
+      lost: EngineBatchRef[],
+      why: string,
+      owed = false,
+    ) => {
+      const sent = await sendCancel(lost);
+      let notCancelled = lost.filter((ref) => !sent.answered.has(ref.id));
+      if (owed) {
+        await deps
+          .settleBatches?.(`${id}:submit`, sent.answered, sent.failed)
+          .catch(() => {});
+        warnNoCancel(
+          lost.filter((ref) => sent.answered.get(ref.id) === "unsupported"),
+        );
+      } else {
+        notCancelled = lost.filter(
+          (ref) =>
+            !sent.answered.has(ref.id) ||
+            sent.answered.get(ref.id) === "unsupported",
+        );
+      }
+      if (notCancelled.length > 0) {
+        const failure = sent.failed.size > 0 ? sent.why : "unsupported";
+        batchWarn(
+          `AI map "${id}": batch(es) ${quoted(notCancelled.map((ref) => ref.id))} were created by an execution of the submit step whose outcome was not recorded (${why}), and cancelling them failed (${failure}). They may still be running and billed; look them up by external key ${madeKey}.`,
+        );
+      }
+    };
+    const REPLAY_NEXT =
+      "the stage's next execution tries again on a backoff (a run.cancel or a run.redrive sends it at once)";
+    /**
+     * A replay's read of the submit row completes the cancels it owes. Only
+     * those due by the row's `cancelRetry` are sent, and a WARN names a batch
+     * only when its kind of failure is new or changed.
+     */
+    const completeOwed = async (result: unknown) => {
+      const now = deps.now?.();
+      const owed = now ? dueOwedRefs(result, now) : owedRefsOf(result);
+      if (owed.length === 0) return;
+      const sent = await sendCancel(owed);
+      const settled: OwedSettlement | undefined = await deps
+        .settleBatches?.(`${id}:submit`, sent.answered, sent.failed)
+        .catch(() => undefined);
+      warnOwedFailed(
+        settled ? settled.changed : [...sent.failed.keys()],
+        sent.why,
+        REPLAY_NEXT,
+      );
+      const noCancel = settled
+        ? settled.noCancel
+        : owed
+            .filter((ref) => sent.answered.get(ref.id) === "unsupported")
+            .map((ref) => ref.id);
+      warnNoCancel(owed.filter((ref) => noCancel.includes(ref.id)));
+    };
+    const releaseUnlisted = async () => {
+      if (made.length === 0 || !deps.loadRow) return;
+      for (let tries = 0; tries < 3; tries++) {
+        let row: StepRecord | null;
+        try {
+          row = await deps.loadRow(`${id}:submit`);
+        } catch {
+          break;
+        }
+        const record = parseStoredSubmit(row?.result);
+        const listed = new Set(record?.refs.map((ref) => ref.id) ?? []);
+        const lost = made.filter((ref) => !listed.has(ref.id));
+        if (lost.length === 0) return;
+        // Gone with its stage record (or a ledger cleared whole): no
+        // execution searches under this row's key again.
+        if (row === null) return cancelUnlisted(lost, "the step's row is gone");
+        // Already recorded as owed a cancel or cancelled (by an exclusion
+        // write of this execution whose answer was lost, or by a sweep): the
+        // record does not cancel them, so this execution does (idempotent:
+        // the transports read the batch first).
+        const excluded = excludedIdsOf(row.result);
+        if (lost.every((ref) => excluded.includes(ref.id))) {
+          return cancelUnlisted(
+            lost,
+            "they are recorded on the step as excluded",
+            true,
+          );
+        }
+        // A running row with a lease has a holder; one with no lease (a
+        // sweep's write-back, a reset, a re-open) has none until a takeover,
+        // which moves the attempt, so it is recorded on like a settled row.
+        if (row.status === "running" && row.leaseExpiresAt !== null) {
+          // A sweep holds the row: the run is cancelled and nothing will
+          // continue on these. Its writes are its own, so nothing is written.
+          if (hasCancelFence(row)) {
+            return cancelUnlisted(lost, "a run.cancel sweep holds the row");
+          }
+          // Another execution of the step holds it. Where its transport can
+          // search by the external key it may adopt them, and cancelling could
+          // cancel the batch it waits on. Where it cannot, it lists only what
+          // the row held when it claimed (listed above, on this fresh read)
+          // and batches it creates itself, so these are never listed.
+          if (!((await batch.canAdopt?.().catch(() => true)) ?? true)) {
+            return cancelUnlisted(
+              lost,
+              `another execution holds the step (attempt ${row.attempt}) and its transport cannot adopt them`,
+            );
+          }
+          batchWarn(
+            `AI map "${id}": batch(es) ${lost.map((ref) => `"${ref.id}"`).join(", ")} were created by an execution of the submit step that lost the step to another execution (attempt ${row.attempt}), which adopts them by external key ${madeKey} or leaves them running.`,
+          );
+          return;
+        }
+        // Recorded first as owed a cancel (never adopted, never waited on,
+        // and completed by whoever reads the row next if this process stops
+        // here), then cancelled. A write whose answer is lost may have
+        // applied: the row is read again.
+        const recorded = await deps
+          .excludeBatches?.(`${id}:submit`, row, lost)
+          .catch(() => false);
+        if (recorded) {
+          return cancelUnlisted(
+            lost,
+            "another execution recorded its outcome first",
+            true,
+          );
+        }
+      }
+      batchWarn(
+        `AI map "${id}": batch(es) ${made.map((ref) => `"${ref.id}"`).join(", ")} were created by an execution of the submit step whose outcome was not recorded, and they could not be recorded on the step; they were not cancelled. Look them up by external key ${madeKey}.`,
+      );
+    };
 
+    let submitted: StoredSubmit;
+    let ranBody = false;
+    try {
+      submitted = await deps.run(
+        `${id}:submit`,
+        async (step): Promise<StoredSubmit> => {
+          ranBody = true;
+          madeKey = step.externalKey;
+          const requests: AIBatchRequest[] = entries.map((e) => ({
+            id: e.id,
+            prompt: e.prompt as string,
+            ...(spec.schema ? { schema: spec.schema } : {}),
+            ...(spec.system !== undefined ? { system: spec.system } : {}),
+            ...(spec.maxTokens !== undefined
+              ? { maxTokens: spec.maxTokens }
+              : {}),
+            ...(spec.temperature !== undefined
+              ? { temperature: spec.temperature }
+              : {}),
+          }));
+          // What an earlier execution recorded on this row. After the engine
+          // cancelled every batch of it (`run.cancel`), the row carries a
+          // tombstone; the execution that takes the re-opened row over, and only
+          // that one, may create a new batch without the adoption search, which
+          // a transport that cannot adopt would refuse. A later takeover (a
+          // crash while creating the replacement) searches as usual. Batches the
+          // engine cancelled are excluded from every search: a provider that
+          // cancels asynchronously can still list one as running.
+          const earlier = step.isReclaim
+            ? await deps.storedResult?.(step.stepId)
+            : undefined;
+          let previous = parseStoredSubmit(earlier);
+          // Batches an execution of this step created and lost, and still owes
+          // a cancel (`cancelOwed`, see `releaseUnlisted`; its process may have
+          // stopped before the request left). Cancelled now, whatever else this
+          // execution does (idempotent); never adopted.
+          // Sent at once (an execution of the step is rare and bounded); the
+          // failures are recorded for the replays (`cancelRetry`), and a WARN
+          // names a batch only when its kind of failure changed.
+          const owed = owedRefsOf(earlier);
+          let owedLeft = owed;
+          const settled: string[] = [];
+          const noCancel: string[] = [
+            ...((earlier as { noCancelBatchIds?: string[] } | undefined)
+              ?.noCancelBatchIds ?? []),
+          ];
+          let retry = owedRetryOf(earlier);
+          if (owed.length > 0) {
+            const sent = await sendCancel(owed);
+            for (const [batchId, how] of sent.answered) {
+              if (how === "cancelled") settled.push(batchId);
+              if (how === "unsupported") noCancel.push(batchId);
+            }
+            owedLeft = owed.filter((ref) => !sent.answered.has(ref.id));
+            const prior = retry;
+            const now = deps.now?.();
+            retry = Object.fromEntries(
+              Object.entries(
+                now ? nextOwedRetry(prior, sent.failed, now) : prior,
+              ).filter(([batchId]) =>
+                owedLeft.some((ref) => ref.id === batchId),
+              ),
+            );
+            warnOwedFailed(
+              [...sent.failed.keys()],
+              sent.why,
+              "its next execution tries again",
+            );
+            warnNoCancel(
+              owed.filter((ref) => sent.answered.get(ref.id) === "unsupported"),
+            );
+            if (previous) {
+              const {
+                cancelOwed: _owed,
+                cancelRetry: _retry,
+                noCancelBatchIds: _none,
+                ...rest
+              } = previous;
+              const ids = [
+                ...new Set([...(previous.cancelledBatchIds ?? []), ...settled]),
+              ];
+              previous = {
+                ...rest,
+                ...(ids.length > 0 ? { cancelledBatchIds: ids } : {}),
+                ...(noCancel.length > 0 ? { noCancelBatchIds: noCancel } : {}),
+                ...(owedLeft.length > 0 ? { cancelOwed: owedLeft } : {}),
+                ...(Object.keys(retry).length > 0
+                  ? { cancelRetry: retry }
+                  : {}),
+              };
+            }
+          }
+          // A run.cancel sweep held this row. Its fence (the sweep died holding
+          // it) says nothing was sent unless the record also carries
+          // `cancelIntent`: batches a cancel may have been sent for, with no
+          // recorded outcome (a timeout, a lost response, a crash, a lost final
+          // write). Those are cancelled now (idempotent: the transports read the
+          // batch first) and the step goes on from the answer, never from an
+          // active status alone, which a provider that cancels asynchronously
+          // still reports after it accepted the cancel. When the cancel cannot be
+          // completed the step fails, keeping the intent, and its next attempt
+          // tries again: waiting on a batch a cancel may have reached could fail
+          // the stage, and the run.cancel asked for it to be cancelled anyway.
+          if (
+            previous !== undefined &&
+            (previous.cancelFence !== undefined ||
+              previous.cancelIntent !== undefined)
+          ) {
+            const { cancelFence, cancelIntent, ...rest } = previous;
+            const intentIds = cancelIntent?.batchIds ?? [];
+            // The hold moved the row's attempt without executing anything (and a
+            // takeover that failed here created nothing): the tombstone counts
+            // from the attempt before the hold, and this execution is the
+            // takeover that follows it.
+            let held = rebaseMarkers(
+              rest,
+              cancelFence
+                ? [cancelFence.fromAttempt, step.attempt - 1]
+                : [step.attempt - 1],
+              step.attempt - 1,
+            ) as StoredSubmit;
+            const pending = held.refs.filter((ref) =>
+              intentIds.includes(ref.id),
+            );
+            if (pending.length > 0) {
+              let outcomes: AIBatchCancelResult[] | undefined;
+              let why = "its transport has no cancel call";
+              try {
+                outcomes = await batch.cancel?.(held.handleId, {
+                  batchRefs: pending,
+                });
+              } catch (error) {
+                why = errorMessage(error);
+              }
+              if (
+                !outcomes ||
+                outcomes.some((o) => o.outcome === "unsupported")
+              ) {
+                const message = `AI map "${id}": run.cancel may have sent a cancel for batch(es) ${pending.map((ref) => `"${ref.id}"`).join(", ")} and its outcome is not recorded; completing the cancel failed (${why}). The step fails rather than wait on a batch that may be cancelled; its next attempt tries again.`;
+                batchWarn(message);
+                // Nothing is written: the row keeps its fence and intent, and
+                // the failure write puts the failure record beside them.
+                throw new Error(message);
+              }
+              const cancelledIds = outcomes
+                .filter((o) => o.outcome === "cancelled")
+                .map((o) => o.ref.id);
+              if (cancelledIds.length > 0) {
+                held = {
+                  ...held,
+                  cancelledBatchIds: [
+                    ...new Set([
+                      ...(held.cancelledBatchIds ?? []),
+                      ...cancelledIds,
+                    ]),
+                  ],
+                };
+              }
+            }
+            const dead = held.refs.filter((ref) =>
+              held.cancelledBatchIds?.includes(ref.id),
+            );
+            if (dead.length === held.refs.length && !held.engineCancelled) {
+              // This execution is the takeover that replaces the batch.
+              held = {
+                ...held,
+                engineCancelled: {
+                  attempt: step.attempt - 1,
+                  generation: (held.generation ?? 0) + 1,
+                },
+              };
+            }
+            // Nothing was cancelled: the batches are as recorded.
+            if (dead.length === 0 && !held.engineCancelled && !held.partial) {
+              return held;
+            }
+            // Recorded before anything is created, so a crash after the
+            // replacement was created cannot make the next takeover create
+            // another.
+            await deps.storeResult?.(step.stepId, held, step.attempt);
+            previous = held;
+          }
+          const tombstone = previous?.engineCancelled;
+          const replacing =
+            tombstone !== undefined && tombstone.attempt + 1 === step.attempt;
+          const generation = tombstone?.generation ?? previous?.generation;
+          // A row whose result is not a submit record can still list batches
+          // another execution of this step created and cancelled, or owes a
+          // cancel (see `releaseUnlisted` above). None of them is ever adopted.
+          const cancelledIds = [
+            ...new Set([
+              ...(previous?.cancelledBatchIds ?? cancelledIdsOf(earlier) ?? []),
+              ...settled,
+            ]),
+          ];
+          const excluded = [
+            ...new Set([
+              ...cancelledIds,
+              ...noCancel,
+              ...owed.map((ref) => ref.id),
+            ]),
+          ];
+          // Partitions an earlier execution created before a later one was
+          // rejected are reused, not created twice.
+          const resume =
+            previous?.partial === true &&
+            tombstone === undefined &&
+            previous.refs.every((ref) => !excluded.includes(ref.id))
+              ? previous.refs
+              : undefined;
+          const record = (
+            refs: EngineBatchRef[],
+            extra: Partial<StoredSubmit> = {},
+          ): StoredSubmit => ({
+            handleId: refs[0]!.id,
+            refs,
+            requestIds,
+            totalRequests: requests.length,
+            submittedAt: new Date().toISOString(),
+            // The engine's proof that it wrote this record (see
+            // `batch-submit-record.ts`): `run.cancel` cancels nothing without it.
+            externalKey: step.externalKey,
+            ...(generation !== undefined ? { generation } : {}),
+            ...(cancelledIds.length > 0
+              ? { cancelledBatchIds: [...cancelledIds] }
+              : {}),
+            ...(noCancel.length > 0 ? { noCancelBatchIds: noCancel } : {}),
+            ...(owedLeft.length > 0 ? { cancelOwed: owedLeft } : {}),
+            ...(owedLeft.length > 0 && Object.keys(retry).length > 0
+              ? { cancelRetry: retry }
+              : {}),
+            ...extra,
+          });
+          /**
+           * Cancel batches the provider accepted for a run that was cancelled;
+           * the row keeps the verdict. The row says first that a cancel may be
+           * sent (`cancelIntent`); the intent stays when the outcome is unknown,
+           * so whoever executes the step next completes the cancel.
+           */
+          const cancelCreated = async (
+            refs: EngineBatchRef[],
+            stored: StoredSubmit,
+          ): Promise<StoredSubmit> => {
+            // A complete record is the step's batch; a partial one resumes.
+            const intent = {
+              batchIds: refs.map((ref) => ref.id),
+              from: stored.partial
+                ? ("failed" as const)
+                : ("completed" as const),
+            };
+            let unsettled: string | undefined;
+            let outcomes: AIBatchCancelResult[] | undefined;
+            let uncertain = false;
+            try {
+              if (!deps.storeResult)
+                throw new Error("no step ledger to record it");
+              await deps.storeResult(
+                step.stepId,
+                { ...stored, cancelIntent: intent },
+                step.attempt,
+              );
+            } catch (error) {
+              // Another execution has the row: these are a loser's batches,
+              // which `releaseUnlisted` records and cancels.
+              if (error instanceof StepLeaseLostError) throw error;
+              unsettled = `the cancel could not be recorded first: ${errorMessage(error)}`;
+            }
+            if (unsettled === undefined) {
+              try {
+                outcomes = await batch.cancel?.(refs[0]!.id, {
+                  batchRefs: refs,
+                });
+                if (
+                  !outcomes ||
+                  outcomes.some((o) => o.outcome === "unsupported")
+                ) {
+                  unsettled = "its transport has no cancel call";
+                } else if (outcomes.some((o) => o.outcome !== "cancelled")) {
+                  unsettled = "a batch had already ended";
+                }
+              } catch (error) {
+                unsettled = errorMessage(error);
+                uncertain = true;
+              }
+            }
+            const cancelledIds = (outcomes ?? [])
+              .filter((o) => o.outcome === "cancelled")
+              .map((o) => o.ref.id);
+            const known: StoredSubmit = {
+              ...stored,
+              ...(cancelledIds.length > 0
+                ? {
+                    cancelledBatchIds: [
+                      ...new Set([
+                        ...(stored.cancelledBatchIds ?? []),
+                        ...cancelledIds,
+                      ]),
+                    ],
+                  }
+                : {}),
+            };
+            if (unsettled === undefined) {
+              return {
+                ...known,
+                engineCancelled: {
+                  attempt: step.attempt,
+                  generation: (generation ?? 0) + 1,
+                },
+              };
+            }
+            batchWarn(
+              `AI map "${id}": the run was cancelled while a batch submit was in flight, and batch(es) ${refs.map((ref) => `"${ref.id}"`).join(", ")} could not be cancelled (${unsettled}). They may still be running and billed; look them up by external key ${step.externalKey}.`,
+            );
+            return uncertain ? { ...known, cancelIntent: intent } : known;
+          };
+          const cancelled = () =>
+            stageAbortReason(step.abortSignal) === "cancelled";
+          // The provider bills a batch the moment it is created, so a replay
+          // of this step must find what a dead worker already created rather
+          // than create a second one. `step.externalKey` is the same on every
+          // replay; `step.isReclaim` is true only when an earlier execution of
+          // this body may have run.
+          let handle: Awaited<ReturnType<typeof batch.submit>>;
+          try {
+            handle = await batch.submit(requests, {
+              externalKey: step.externalKey,
+              recovering: step.isReclaim && !replacing,
+              ...(excluded.length > 0 ? { excludeBatchIds: excluded } : {}),
+              ...(resume ? { existingRefs: resume } : {}),
+              ...(spec.batch?.onReclaim
+                ? { onReclaim: spec.batch.onReclaim }
+                : {}),
+            });
+          } catch (error) {
+            // A later partition was rejected after earlier ones were accepted:
+            // those batches are running and billed. Keep them reachable in the
+            // row (a retry resumes after them, `run.cancel` can cancel them) and
+            // cancel them now when the run was cancelled.
+            const created = createdRefsOf(error);
+            made = created;
+            if (created.length > 0) {
+              let stored = record(created, { partial: true });
+              if (cancelled()) stored = await cancelCreated(created, stored);
+              await deps
+                .storeResult?.(step.stepId, stored, step.attempt)
+                .catch((writeError) =>
+                  batchWarn(
+                    `AI map "${id}": batch(es) ${created.map((ref) => `"${ref.id}"`).join(", ")} were accepted before the submit failed, and recording them failed (${errorMessage(writeError)}); look them up by external key ${step.externalKey}.`,
+                  ),
+                );
+            }
+            throw error;
+          }
+          const stored = record(handle.refs ?? [], {
+            handleId: handle.id,
+            totalRequests: handle.totalRequests ?? requests.length,
+          });
+          // The cancel can land while the provider call is in flight, after
+          // `run.cancel` read the ledger and before this result is recorded.
+          // `step.run` discards the result of a body that finished after a
+          // cancel, so the handle would be lost with the batch still billed:
+          // cancel it here, while the refs are in hand. When every batch is
+          // cancelled, the row keeps the record with the tombstone, so a redrive
+          // replaces them on any transport; otherwise it is warned about.
+          // Known as made first: a write here that loses the row leaves them
+          // to the loser's cleanup (`releaseUnlisted`).
+          made = stored.refs;
+          if (cancelled() && stored.refs.length > 0) {
+            await deps.storeResult?.(
+              step.stepId,
+              await cancelCreated(stored.refs, stored),
+              step.attempt,
+            );
+          }
+          return stored;
+        },
+      );
+    } catch (error) {
+      await releaseUnlisted();
+      // A failed submit with no retry left is replayed by throwing its
+      // stored error: that read completes the owed cancels too.
+      if (!ranBody) {
+        const row = await deps.loadRow?.(`${id}:submit`).catch(() => null);
+        if (row?.status === "failed") await completeOwed(row.result);
+      }
+      throw error;
+    }
+    if (made.some((ref) => !submitted.refs.some((r) => r.id === ref.id))) {
+      await releaseUnlisted();
+    }
+    // A recorded submit is replayed, never executed again, so the body's
+    // recovery above never sees a batch a loser recorded as owed after the
+    // row was completed (its process may have stopped before the cancel
+    // left). Every replay of the stage reads the row, so the replay completes
+    // the cancel; the provider's answer moves it to `cancelledBatchIds`.
+    if (!ranBody) await completeOwed(submitted);
+
+    // A replaced batch (see `batch-submit-record.ts`) polls and collects under
+    // its own step ids, so rows the cancelled batch left behind stay unread.
+    const tag = generationTag(submitted.generation);
     const refsMetadata =
       submitted.refs.length > 0 ? { batchRefs: submitted.refs } : {};
     const onExpiry = spec.batch?.onExpiry ?? "fail";
@@ -977,7 +1608,7 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
 
     let status: { status: string; error?: string };
     try {
-      status = await deps.waitFor(`${id}:poll`, {
+      status = await deps.waitFor(`${id}:poll${tag}`, {
         poll: () => batch.getStatus(submitted.handleId, refsMetadata),
         ready: (s) => s.status === "completed" || s.status === "failed",
         every: spec.batch?.pollEvery ?? "60s",
@@ -1097,7 +1728,7 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
     };
 
     const summary = await deps.run(
-      `${id}:collect`,
+      `${id}:collect${tag}`,
       async (): Promise<CollectSummary> => {
         fetched = await fetchVerdicts();
         let succeeded = 0;

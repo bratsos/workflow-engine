@@ -13,6 +13,7 @@ import type { KernelEvent } from "../events.js";
 import type { KernelDeps } from "../kernel.js";
 import type { WorkflowRunRecord, WorkflowStageRecord } from "../ports.js";
 import { buildAnnotationEvents } from "./annotation-events.js";
+import { cancelRunBatches } from "./cancel-run-batches.js";
 import { toOutboxEvents } from "./outbox-events.js";
 import { rollUpRunTotals } from "./run-totals.js";
 
@@ -112,9 +113,10 @@ export async function markStageCancelled(
  * Resolves the "stale" / "cancelled" branches of a `withClaimedRun` call
  * the same way at every call site: a stale claim re-checks for
  * cancellation (a sibling claim may have raced ahead), a cancelled claim
- * marks the stage cancelled when the run really is CANCELLED. Both signal
- * the caller to move on to the next suspended stage without further
- * processing.
+ * marks the stage cancelled when the run really is CANCELLED and cancels the
+ * provider batches the run created (a body that executed in this process may
+ * have created one after `run.cancel` read the ledger). Both signal the caller
+ * to move on to the next suspended stage without further processing.
  *
  * A run that is COMPLETED, FAILED or gone is a different story: another
  * orchestrator finished it (its lease on the stage elapsed while this one
@@ -142,6 +144,7 @@ export async function handleClaimOutcome<T>(
     );
     if (latestStatus === "CANCELLED") {
       await markStageCancelled(stageRecord.id, deps, stageRecord.version);
+      await cancelRunBatches(stageRecord.workflowRunId, deps);
     }
     return true;
   }
@@ -153,6 +156,9 @@ export async function handleClaimOutcome<T>(
     // status means another orchestrator finished the stage and the run.
     if (claimResult.runStatus === "CANCELLED") {
       await markStageCancelled(stageRecord.id, deps, stageRecord.version);
+      // The body that just ran may have created a batch after `run.cancel`
+      // read the ledger; see `cancel-run-batches.ts`.
+      await cancelRunBatches(stageRecord.workflowRunId, deps);
     }
     return true;
   }

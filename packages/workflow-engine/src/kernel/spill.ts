@@ -137,10 +137,15 @@ export interface PayloadSpill {
   unpack(value: unknown): Promise<unknown>;
   /**
    * Best-effort delete of every spilled value under a key prefix, except
-   * any key listed in `keep`. The exception exists for a partial ledger
-   * clear, which must leave the results of the rows it preserves readable.
+   * any key listed in `keep` or starting with one of `keepUnder`. The
+   * exception exists for a partial ledger clear, which must leave the
+   * results of the rows it preserves readable.
    */
-  deleteUnder(prefix: string, keep?: Iterable<string>): Promise<void>;
+  deleteUnder(
+    prefix: string,
+    keep?: Iterable<string>,
+    keepUnder?: Iterable<string>,
+  ): Promise<void>;
 }
 
 /**
@@ -211,11 +216,12 @@ export function createPayloadSpill(
       return blob;
     },
 
-    async deleteUnder(prefix, keep) {
+    async deleteUnder(prefix, keep, keepUnder) {
       const kept = new Set(keep ?? []);
+      const keptUnder = [...(keepUnder ?? [])];
       const keys = await blobStore.list(prefix).catch(() => [] as string[]);
       for (const key of keys) {
-        if (kept.has(key)) continue;
+        if (kept.has(key) || keptUnder.some((p) => key.startsWith(p))) continue;
         await blobStore.delete(key).catch(() => {});
       }
     },
@@ -231,8 +237,27 @@ export function stepSpillPrefix(stageRecordId: string): string {
   return `workflow-v2/spill/steps/${encodeURIComponent(stageRecordId)}/`;
 }
 
-function stepSpillKey(stageRecordId: string, stepId: string): string {
+/**
+ * Where a row's results were spilled before 1.0.0-alpha.21: one key per row,
+ * written again by every write, so a compare-and-set that lost had already
+ * replaced the blob the winning row names. Still read through its reference.
+ */
+function legacyStepSpillKey(stageRecordId: string, stepId: string): string {
   return `${stepSpillPrefix(stageRecordId)}${encodeURIComponent(stepId)}.json`;
+}
+
+/** Every key a row's results are spilled to now (`encodeURIComponent` escapes `/`). */
+function stepSpillRowPrefix(stageRecordId: string, stepId: string): string {
+  return `${stepSpillPrefix(stageRecordId)}${encodeURIComponent(stepId)}/`;
+}
+
+/**
+ * A new key for every write, so the bytes a committed row names are never
+ * written again: a write that does not apply leaves only a blob no row names,
+ * which it deletes.
+ */
+function stepSpillKey(stageRecordId: string, stepId: string): string {
+  return `${stepSpillRowPrefix(stageRecordId, stepId)}${crypto.randomUUID()}.json`;
 }
 
 /** Blob key prefix under which a run's spilled job payloads live. */
@@ -266,6 +291,13 @@ export function withStepResultSpill(
     return { ...record, result: await spill.unpack(record.result) };
   }
 
+  /** Delete the blob a write that did not apply spilled; nothing names it. */
+  async function discard(packed: unknown, original: unknown): Promise<void> {
+    if (packed !== original && isSpillRef(packed)) {
+      await spill.deleteUnder(packed.key).catch(() => {});
+    }
+  }
+
   async function packPatch(
     stageRecordId: string,
     stepId: string,
@@ -296,6 +328,7 @@ export function withStepResultSpill(
         record.result,
       );
       const outcome = await ledger.claim({ ...record, result });
+      if (!outcome.created) await discard(result, record.result);
       return {
         created: outcome.created,
         record: await resolve(outcome.record),
@@ -322,12 +355,14 @@ export function withStepResultSpill(
       expected: StepRecordExpectation,
       patch: StepRecordPatch,
     ) {
+      const packed = await packPatch(stageRecordId, stepId, patch);
       const outcome = await ledger.compareAndSet(
         stageRecordId,
         stepId,
         expected,
-        await packPatch(stageRecordId, stepId, patch),
+        packed,
       );
+      if (!outcome.applied) await discard(packed.result, patch.result);
       return {
         applied: outcome.applied,
         record: outcome.record ? await resolve(outcome.record) : null,
@@ -359,7 +394,12 @@ export function withStepResultSpill(
             // readable, so its spilled value has to stay too.
             await spill.deleteUnder(
               stepSpillPrefix(stageRecordId),
-              keepStepIds.map((stepId) => stepSpillKey(stageRecordId, stepId)),
+              keepStepIds.map((stepId) =>
+                legacyStepSpillKey(stageRecordId, stepId),
+              ),
+              keepStepIds.map((stepId) =>
+                stepSpillRowPrefix(stageRecordId, stepId),
+              ),
             );
           },
         }

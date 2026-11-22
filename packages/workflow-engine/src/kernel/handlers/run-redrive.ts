@@ -41,16 +41,33 @@
  * execution.
  */
 
+import type { EngineBatchRef } from "../../ai/batch/model.js";
 import type {
   CreateAnnotationInput,
   WorkflowStageRecord,
 } from "../../persistence/interface";
 import type {
+  RunCancelBatchOutcome,
   RunRedriveCommand,
   RunRedriveFrom,
   RunRedriveResult,
 } from "../commands";
 import type { KernelEvent } from "../events";
+import {
+  hasCancelFence,
+  isEngineOwned,
+  isSubmitStepRow,
+  owedRefsOf,
+  parseStoredSubmit,
+  settleOwedOnRow,
+} from "../helpers/batch-submit-record.js";
+import { writeBatchWarn } from "../helpers/batch-warn.js";
+import {
+  answeredOf,
+  cancelBatchesNow,
+  heldStepOutcomes,
+  refsOfSuspendedState,
+} from "../helpers/cancel-run-batches.js";
 import {
   assertServesRun,
   recordDefinitionVersion,
@@ -88,6 +105,15 @@ function toAbandoned(rows: readonly StepRecord[]): AbandonedStep[] {
     status: row.status,
     externalKey: row.externalKey ?? null,
   }));
+}
+
+/** A batch a redrive cancels, as its log lines name it. */
+function describeCancel(o: {
+  stage: { stageId: string };
+  row?: StepRecord;
+  ref: EngineBatchRef;
+}): string {
+  return `"${o.ref.id}" (${o.ref.provider}, stage "${o.stage.stageId}"${o.row ? `, step "${o.row.stepId}"` : ""}${o.row?.externalKey ? `, external key ${o.row.externalKey}` : ""})`;
 }
 
 /** Annotation key under which a superseded stage attempt is archived. */
@@ -257,6 +283,40 @@ export async function handleRunRedrive(
   // Wake keys name a stage record id; a deleted record's are released with
   // its ledger, since no later signal or purge can find them.
   const deletedSignalSteps = new Map<string, string[]>();
+  // Batches whose cancel is owed (`cancelOwed`, always safe to send: the step
+  // lost them and never adopts them) or was asked for on a record this
+  // redrive deletes. Read here because a deleted record takes its rows with
+  // it; named on the run in this transaction, sent after the commit, and
+  // reported in `batches`.
+  //
+  // On a CANCELLED run the cancel was asked for every batch of a stage that
+  // had not completed: a sweep may still be running, and an intent it records
+  // after these reads is deleted unread. So every batch such a sweep would
+  // cancel on a deleted record (the engine-owned refs of its submit rows, its
+  // legacy `suspendedState` refs) is sent here too, unless it is recorded as
+  // cancelled. Nothing can adopt them: their key names a deleted record.
+  const cancelAsked = run.status === "CANCELLED";
+  const owedCancels: Array<{
+    stage: (typeof existingStages)[number];
+    /** Absent for a legacy stage's `suspendedState` batch. */
+    row?: StepRecord;
+    ref: EngineBatchRef;
+    gone: boolean;
+  }> = [];
+  const addCancel = (entry: (typeof owedCancels)[number]) => {
+    if (entry.ref.id.startsWith("batch-empty-")) return;
+    if (
+      owedCancels.some(
+        (o) =>
+          o.stage === entry.stage &&
+          o.row === entry.row &&
+          o.ref.id === entry.ref.id,
+      )
+    ) {
+      return;
+    }
+    owedCancels.push(entry);
+  };
   if (deps.stepLedger) {
     const ledger = deps.stepLedger;
     for (const stage of stagesToSupersede) {
@@ -276,10 +336,47 @@ export async function handleRunRedrive(
         dropped = plan.dropped;
         reason = "fallback";
       }
+      for (const row of rows) {
+        if (!isSubmitStepRow(row)) continue;
+        const gone = dropped.includes(row);
+        // A kept row a sweep holds is reported `held` after the reset.
+        if (!gone && row.status === "running" && hasCancelFence(row)) continue;
+        const record = parseStoredSubmit(row.result);
+        const done = record?.cancelledBatchIds ?? [];
+        const refs: EngineBatchRef[] = [...owedRefsOf(row.result)];
+        // A cancel was asked for on a row this redrive deletes: the batches
+        // a sweep held, or the ones it recorded it may have sent to.
+        if (gone && record?.cancelFence) refs.push(...record.refs);
+        else if (gone && record?.cancelIntent) {
+          const ids = record.cancelIntent.batchIds;
+          refs.push(...record.refs.filter((ref) => ids.includes(ref.id)));
+        }
+        if (
+          gone &&
+          cancelAsked &&
+          stage.status !== "COMPLETED" &&
+          record &&
+          isEngineOwned(row, record)
+        ) {
+          refs.push(...record.refs);
+        }
+        for (const ref of refs) {
+          if (done.includes(ref.id)) continue;
+          addCancel({ stage, row, ref, gone });
+        }
+      }
       const abandoned = toAbandoned(dropped);
       if (abandoned.length > 0) {
         abandonedByStage.set(stage.id, abandoned);
         abandonReasons.add(reason);
+      }
+    }
+  }
+  if (cancelAsked) {
+    for (const stage of stagesToDelete) {
+      if (stage.status === "COMPLETED") continue;
+      for (const ref of refsOfSuspendedState(stage.suspendedState)) {
+        addCancel({ stage, ref, gone: true });
       }
     }
   }
@@ -339,17 +436,49 @@ export async function handleRunRedrive(
     if (abandonReasons.has("fallback")) {
       reasons.push("this StepLedger cannot clear selectively");
     }
-    await deps.persistence
-      .createLog({
-        workflowRunId,
-        level: "WARN",
-        message:
-          `Redriving this run abandoned ${steps.length} durable step row(s) that named an ` +
-          `external effect; ${reasons.join("; ")}. Any effect still in flight must be found ` +
-          `by its external key.`,
-        metadata: { steps },
-      })
-      .catch(() => {});
+    await writeBatchWarn(
+      deps.persistence,
+      workflowRunId,
+      `Redriving this run abandoned ${steps.length} durable step row(s) that named an ` +
+        `external effect; ${reasons.join("; ")}. Any effect still in flight must be found ` +
+        `by its external key.`,
+      { steps },
+    );
+  }
+
+  // The cancels are sent after the commit, which has deleted every record of
+  // the ones marked deleted: a process that stops in between leaves those
+  // batches running with nothing else naming them. So they are named here, on
+  // the run, in the same transaction, and each outcome follows in its own line.
+  if (owedCancels.length > 0) {
+    const named = owedCancels.map(describeCancel);
+    const gone = owedCancels.some((o) => o.gone);
+    const kept = owedCancels.some((o) => !o.gone);
+    await writeBatchWarn(
+      deps.persistence,
+      workflowRunId,
+      `Redriving this run sends a cancel to provider batch(es) ${named.join("; ")}. A line naming each batch follows with the outcome of its cancel. If none follows for a batch, the redrive stopped before the provider answered: ${[
+        ...(gone
+          ? [
+              "a batch of a record this redrive deletes has nothing else to cancel it, so cancel it at the provider",
+            ]
+          : []),
+        ...(kept
+          ? [
+              "a batch owed on a step this redrive keeps stays owed there, and the step's next execution sends its cancel again",
+            ]
+          : []),
+      ].join("; ")}.`,
+      {
+        batches: owedCancels.map((o) => ({
+          stageId: o.stage.stageId,
+          ...(o.row ? { stepId: o.row.stepId } : {}),
+          ...(o.row?.externalKey ? { externalKey: o.row.externalKey } : {}),
+          ref: o.ref,
+          deleted: o.gone,
+        })),
+      },
+    );
   }
 
   // Blob deletion is deferred to _postCommit: blob deletes are not part of
@@ -472,9 +601,33 @@ export async function handleRunRedrive(
       for (const stage of stagesToDelete) {
         await postDeps.stepLedger?.clear(stage.id);
       }
+      // A submit step a run.cancel sweep holds is left to it (see
+      // `applyStepLedgerReset`); the redriven step waits for it, and the
+      // caller is told until when.
+      const held: RunCancelBatchOutcome[] = [];
       if (postDeps.stepLedger) {
+        const ledger = postDeps.stepLedger;
         for (const [stageRecordId, plan] of ledgerResets) {
-          await applyStepLedgerReset(postDeps.stepLedger, stageRecordId, plan);
+          await applyStepLedgerReset(ledger, stageRecordId, plan);
+          const stageId = stagesToReopen.find(
+            (s) => s.id === stageRecordId,
+          )!.stageId;
+          for (const row of plan.reopen) {
+            if (row.status !== "running" || !hasCancelFence(row)) continue;
+            const current = await ledger
+              .get(stageRecordId, row.stepId)
+              .catch(() => null);
+            if (!current) continue;
+            held.push(
+              ...heldStepOutcomes(
+                stageId,
+                current,
+                postDeps.clock.now(),
+                (until) =>
+                  `a run.cancel sweep holds this step until ${until} (it may have stopped while holding it); the redriven step waits until the sweep gives it back or the hold ends, then completes any cancel the sweep recorded and goes on`,
+              ),
+            );
+          }
         }
       }
 
@@ -500,6 +653,73 @@ export async function handleRunRedrive(
       }
 
       await enqueue(postDeps);
+
+      // The cancels collected above, after the run is enqueued (they do not
+      // hold it up), with no gate: nothing can adopt these batches.
+      const verdicts = await cancelBatchesNow(
+        postDeps,
+        owedCancels.map((o) => o.ref),
+      );
+      const cancels: RunCancelBatchOutcome[] = [];
+      for (const [i, o] of owedCancels.entries()) {
+        const verdict = verdicts[i]!;
+        const answered =
+          verdict.status === "cancelled" ||
+          verdict.status === "already-terminal";
+        const outcome: RunCancelBatchOutcome = {
+          stageId: o.stage.stageId,
+          ...(o.row ? { stepId: o.row.stepId } : {}),
+          ...(o.row?.externalKey ? { externalKey: o.row.externalKey } : {}),
+          ref: o.ref,
+          ...verdict,
+          ...(!answered
+            ? {
+                error: `${verdict.error ? `${verdict.error}; ` : ""}${o.gone ? "this redrive deleted the record that named it, so nothing else will cancel this batch" : "the cancel stays owed on the step, and the step's next execution sends it again"}`,
+              }
+            : {}),
+        };
+        cancels.push(outcome);
+        if (answered) {
+          await postDeps.persistence
+            .createLog({
+              workflowRunId,
+              level: "INFO",
+              message: `Redriving this run: provider batch ${describeCancel(o)} ${verdict.status === "cancelled" ? "was cancelled" : "had already ended"}.`,
+              metadata: { ...outcome },
+            })
+            .catch(() => {});
+        } else {
+          await writeBatchWarn(
+            postDeps.persistence,
+            workflowRunId,
+            `Redriving this run: provider batch ${describeCancel(o)} was not cancelled (${verdict.status}: ${outcome.error}). It may still be running and billed; cancel it at the provider.`,
+            { ...outcome },
+          );
+        }
+      }
+      if (postDeps.stepLedger) {
+        const kept = new Map<StepRecord, EngineBatchRef[]>();
+        for (const o of owedCancels) {
+          if (!o.gone && o.row) {
+            kept.set(o.row, [...(kept.get(o.row) ?? []), o.ref]);
+          }
+        }
+        for (const [row, refs] of kept) {
+          const verdictOf = (ref: EngineBatchRef) =>
+            verdicts[
+              owedCancels.findIndex((o) => o.row === row && o.ref === ref)
+            ];
+          await settleOwedOnRow(
+            postDeps.stepLedger,
+            row.stageRecordId,
+            row.stepId,
+            answeredOf(refs, verdictOf),
+            postDeps.clock.now(),
+          ).catch(() => {});
+        }
+      }
+
+      return [...held, ...cancels];
     },
   };
 }

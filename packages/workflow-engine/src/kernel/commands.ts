@@ -8,6 +8,7 @@
  * This file contains ONLY types -- no runtime code.
  */
 
+import type { EngineBatchRef } from "../ai/batch/model";
 import type {
   ActiveStatusCounts,
   AnnotationActor,
@@ -123,9 +124,79 @@ export interface RunCancelCommand {
   readonly reason?: string;
 }
 
+/** What `run.cancel` did to one provider batch a run created. */
+export type RunCancelBatchStatus =
+  /** The provider now has the batch cancelling or cancelled. */
+  | "cancelled"
+  /** The batch had ended on its own; nothing was cancelled. */
+  | "already-terminal"
+  /** The batch's transport has no cancel call (OpenRouter). It may still run. */
+  | "unsupported"
+  /** No transport could be built here (no credentials, package or provider). */
+  | "unavailable"
+  /** The provider call threw, ran out of time, or was not reached; see `error`. The batch may still run. */
+  | "failed"
+  /**
+   * A submit step of the run holds no batch handle: it was executing, or
+   * failed before it recorded one, so a batch may exist that the engine cannot
+   * name. `externalKey` finds it at the provider (OpenAI `metadata`, Gemini
+   * `displayName`). Repeat `run.cancel` once the step has recorded its handle.
+   */
+  | "unrecorded"
+  /**
+   * The step holds a batch handle the engine cannot prove it created (an
+   * ordinary step that memoised a handle of its own, or a record written
+   * before the engine stamped its ownership). It is not cancelled.
+   */
+  | "unverified"
+  /**
+   * Another `run.cancel` sweep holds the submit step that lists the batch (a
+   * live sweep, or one that stopped while holding it), so this command did not
+   * touch it. The batch may still run. The hold ends at `heldUntil`; repeat
+   * `run.cancel` after then and the next sweep takes the step over and
+   * finishes the cancel. Reported per batch the step lists, or for the step
+   * when it lists none.
+   */
+  | "held";
+
+/** One provider batch found on a run, and what `run.cancel` did to it. */
+export interface RunCancelBatchOutcome {
+  /** The stage that created the batch. */
+  readonly stageId: string;
+  /**
+   * The durable step that holds the batch (`${id}:submit` of a
+   * `ctx.step.ai.map`). Absent for a batch found in the stage's
+   * `suspendedState.metadata.batchRefs`.
+   */
+  readonly stepId?: string;
+  /** Absent for `unrecorded`: no handle is recorded. */
+  readonly ref?: EngineBatchRef;
+  /** The submit step's external key, for `unrecorded` and `unverified`. */
+  readonly externalKey?: string;
+  readonly status: RunCancelBatchStatus;
+  /** The provider's own status for the batch, as read before the cancel. */
+  readonly providerStatus?: string;
+  /** Why the batch could not be cancelled (`unavailable`, `failed`, `held`). */
+  readonly error?: string;
+  /** For `held`: when the other sweep's hold on the step ends (ISO 8601). */
+  readonly heldUntil?: string;
+}
+
 /** Result of a `run.cancel` command. */
 export interface RunCancelResult {
+  /**
+   * `true` only when this command moved the run to CANCELLED. A run that was
+   * already CANCELLED, or finished, or does not exist answers `false`.
+   */
   readonly cancelled: boolean;
+  /**
+   * The provider batches the run created and what happened to each. Filled
+   * when this command cancelled the run, and again when it is repeated on a
+   * run that is already CANCELLED (which retries every cancel that did not
+   * take effect). Empty for a run that finished, failed or does not exist: a
+   * failed run keeps its batches because `run.redrive` re-adopts them.
+   */
+  readonly batches: readonly RunCancelBatchOutcome[];
 }
 
 // ---------------------------------------------------------------------------
@@ -522,6 +593,30 @@ export interface RunRedriveResult {
   readonly redriveCount: number;
   /** The definition version the run is pinned to after this command. */
   readonly definitionVersion: string | null;
+  /**
+   * Batches this redrive did not hand to an ordinary replay:
+   * - a submit step a `run.cancel` sweep holds (`held`): the redriven step
+   *   waits until `heldUntil`, then completes the cancel before it goes on;
+   * - a batch whose cancel was asked for on a step this redrive deleted (a
+   *   sweep held the step or recorded a cancel on it), or that a step owes a
+   *   cancel (an execution of the step created it and lost the step): the
+   *   redrive sends the cancel after its commit and reports the answer,
+   *   `cancelled` (or `already-terminal`) or, when it did not succeed, the
+   *   status with an `error` and a WARN on the run naming the batch, which
+   *   must then be cancelled at the provider (a deleted step leaves nothing
+   *   else that would cancel it);
+   * - on a CANCELLED run, every batch of a stage record this redrive deletes
+   *   whose stage had not completed (the engine-owned refs of its submit
+   *   steps, a legacy stage's `suspendedState` refs) that is not recorded as
+   *   cancelled: `run.cancel` asked for it, and a sweep still running when
+   *   the redrive read the records may record its cancel too late to be read.
+   * Before the commit a WARN on the run names every batch the redrive is about
+   * to cancel; a line naming each one follows with its outcome. A deleted step
+   * of a run that was not cancelled, with batches and no recorded cancel, is
+   * not cancelled: its batches are abandoned, as the WARN and the
+   * superseded-attempt annotation say. Absent when there are none.
+   */
+  readonly batches?: readonly RunCancelBatchOutcome[];
 }
 
 // ---------------------------------------------------------------------------

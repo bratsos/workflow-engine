@@ -39,6 +39,8 @@ import type {
   StagePollSuspendedCommand,
   StagePollSuspendedResult,
 } from "../commands";
+import { writeBatchWarn } from "../helpers/batch-warn.js";
+import { cancelRunBatches } from "../helpers/cancel-run-batches.js";
 import { servedDefinitions, servesRun } from "../helpers/definition-pinning.js";
 import {
   buildAnnotationEvents,
@@ -337,13 +339,14 @@ async function claimSuspendedStage(
 async function superseded(
   stageRecord: WorkflowStageRecord,
   deps: KernelDeps,
-): Promise<boolean> {
+): Promise<false | { status: string | undefined }> {
   const current = await deps.persistence
     .getStage(stageRecord.workflowRunId, stageRecord.stageId)
     .catch(() => stageRecord);
-  return (
-    current?.id !== stageRecord.id || current.version !== stageRecord.version
-  );
+  return current?.id !== stageRecord.id ||
+    current.version !== stageRecord.version
+    ? { status: current?.id === stageRecord.id ? current.status : undefined }
+    : false;
 }
 
 async function releaseStageClaim(
@@ -433,7 +436,15 @@ async function replayStage(
     };
     built = buildStageExecutionContext(input, deps);
     const result = await stageDef.execute(built.context);
-    if (await superseded(stageRecord, deps)) return "skip";
+    const moved = await superseded(stageRecord, deps);
+    if (moved) {
+      // A cancel moved the stage: the body that just ran may have created a
+      // batch after `run.cancel` read the ledger; see `cancel-run-batches.ts`.
+      if (moved.status === "CANCELLED") {
+        await cancelRunBatches(stageRecord.workflowRunId, deps);
+      }
+      return "skip";
+    }
 
     if (isSuspendedResult(result)) {
       const suspended = result as SuspendedResult;
@@ -967,6 +978,14 @@ export async function handleStagePollSuspended(
         stepLedger: deps.stepLedger,
         clock: deps.clock,
         onLog: (level, message) => void logFn(level, message),
+        // A WARN naming a provider batch goes on the run: a redrive from
+        // start deletes the stage record, and its logs with it.
+        onBatchWarn: (message) =>
+          void writeBatchWarn(
+            deps.persistence,
+            stageRecord.workflowRunId,
+            message,
+          ),
         onAnnotate: (key, value, opts) => annotateFn(key, value, opts),
         ai: () => checkContextBase.ai,
       }),

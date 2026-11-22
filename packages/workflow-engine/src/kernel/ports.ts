@@ -17,6 +17,7 @@
  *  - Scheduler      – deferred command triggers
  */
 
+import type { EngineBatchModelResolver } from "../ai/batch/model";
 import type {
   AIHelper,
   AIHelperOptions,
@@ -202,6 +203,24 @@ export interface StepLedger {
 export interface KernelServices {
   aiLogger?: AICallLogger;
   ai?: AIHelperFactory;
+  /**
+   * Finds the transport for a stored batch ref when `run.cancel` cancels the
+   * provider batches a run created. The process that dispatches the cancel
+   * need not be the one that ran the stage, so the ref (`provider`, `modelId`)
+   * is all it has. Defaults to `resolveBatchModelForRef`, which builds the
+   * built-in transport from the ref and takes credentials from the
+   * environment; set this when the credentials live elsewhere.
+   */
+  batchModels?: EngineBatchModelResolver;
+  /**
+   * Time budgets, in milliseconds, of the provider calls that cancelling a
+   * run's batches makes. `batchMs` (default 30000) bounds each batch: resolving
+   * its transport, reading it and cancelling it. `sweepMs` (default 60000)
+   * bounds the whole sweep; a batch it did not reach is reported as `failed`.
+   * `run.cancel` therefore waits at most `sweepMs` for providers, plus its
+   * database reads and writes.
+   */
+  batchCancelTimeouts?: { batchMs?: number; sweepMs?: number };
 }
 
 /** Factory signature matching `createAIHelper`. */

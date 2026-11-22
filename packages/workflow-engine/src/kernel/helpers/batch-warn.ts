@@ -1,0 +1,36 @@
+/**
+ * WARNs that name a provider batch which may still be running and billed.
+ *
+ * Such a WARN is often the only record of the batch, so it is written on the
+ * run, never on a stage record (a `run.redrive` that deletes the record would
+ * take a stage-scoped log with it), and a write that fails is tried once more
+ * and then reported on `console.error` rather than dropped.
+ */
+
+import type { KernelDeps } from "../kernel.js";
+import { toErrorMessage } from "./error-message.js";
+
+export async function writeBatchWarn(
+  persistence: KernelDeps["persistence"],
+  workflowRunId: string,
+  message: string,
+  metadata?: unknown,
+): Promise<void> {
+  let failure: unknown;
+  for (let tries = 0; tries < 2; tries++) {
+    try {
+      await persistence.createLog({
+        workflowRunId,
+        level: "WARN",
+        message,
+        ...(metadata !== undefined ? { metadata } : {}),
+      });
+      return;
+    } catch (error) {
+      failure = error;
+    }
+  }
+  console.error(
+    `[workflow-engine] run ${workflowRunId}: a WARN naming a provider batch could not be written (${toErrorMessage(failure)}): ${message}`,
+  );
+}
