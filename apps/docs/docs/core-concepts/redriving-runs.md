@@ -124,7 +124,9 @@ in a new table.
 
 One thing it records rather than copies: `outputData` keeps the blob key,
 not the blob. Every attempt writes its output and artifacts under keys of its
-own, so the archived key still names the superseded attempt's output until
+own (the stage's fixed `output.json` key only holds a copy of the latest
+committed attempt), so the archived key still names the superseded attempt's
+output until
 `run.purge` deletes the run (a stage record the redrive deleted loses its
 other blobs, but not the ones its pointer names).
 

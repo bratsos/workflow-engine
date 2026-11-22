@@ -226,7 +226,7 @@ async execute(ctx) {
 
 ### Storage
 
-`save`, `load`, `exists` and `delete` use the key as given: a bare key such as `"raw-data"` names one blob shared by every run of every workflow, and no engine command deletes it. Build keys with `getStageKey(stageId, suffix)`, which returns `workflow-v2/<workflowType>/<runId>/<stageId>/<suffix>`: that blob belongs to this run and stage, and `run.purge` deletes it with the run, as does a redrive that restarts the stage.
+`save`, `load`, `exists` and `delete` use the key as given: a bare key such as `"raw-data"` names one blob shared by every run of every workflow, and no engine command deletes it. Build keys with `getStageKey(stageId, suffix)`, which returns `workflow-v2/<workflowType>/<runId>/<stageId>/<suffix>`: that blob belongs to this run and stage, and `run.purge` deletes it with the run, as does a redrive that restarts the stage. With no suffix it returns `…/<stageId>/output.json`, where the engine copies a stage's output once its completion has committed (artifacts go to `…/<stageId>/artifacts/<name>.json`); that copy is best-effort and written after the commit, so read another stage's output from `ctx.workflowContext`, which follows the committed pointer, and do not write your own data to that key.
 
 ```typescript
 async execute(ctx) {
