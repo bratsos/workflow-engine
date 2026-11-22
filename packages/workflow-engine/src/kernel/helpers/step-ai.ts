@@ -42,6 +42,7 @@ import {
 } from "../../core/step-ai";
 import {
   isDuplicateStepKeyError,
+  isNonRetryableError,
   isStepControlFlowError,
   type StepApi,
   type StepControlFlowError,
@@ -628,11 +629,14 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
       ): Promise<"repair" | "retry" | AiMapResult<TOut>> {
         if (isStepControlFlowError(error)) throw error;
         const failure = asGenerationFailure(error);
-        if (failure) {
+        // A NonRetryableError gets no repair and no retry (its brand alone is
+        // read, after main's checks).
+        const terminal = isNonRetryableError(error);
+        if (failure && !terminal) {
           feedback = failure;
           return "repair";
         }
-        if (retriesLeft <= 0) {
+        if (terminal || retriesLeft <= 0) {
           return failed(
             errorMessage(error),
             error instanceof Error ? error.name : undefined,

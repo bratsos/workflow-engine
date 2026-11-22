@@ -10,9 +10,14 @@ import type {
   StepWaitOptions,
 } from "../../core/steps.js";
 import {
+  brandNonRetryable,
   DuplicateStepKeyError,
+  isNonRetryableError,
+  isStepControlFlowError,
+  NonRetryableError,
   neverAbortingSignal,
   parseStepDuration,
+  recordNonRetryable,
   STEP_API_PENDING_CONTROL_FLOW,
   STEP_API_SETTLE_IN_FLIGHT,
   StepInFlight,
@@ -27,6 +32,7 @@ import {
 } from "../../core/steps.js";
 import { AIServicesNotConfiguredError } from "../errors.js";
 import type { Clock, StepLedger, StepRecord } from "../ports.js";
+import { toErrorMessage } from "./error-message.js";
 import { assertTimerMs, timerDurationMs } from "./host-support.js";
 import { createStepAi } from "./step-ai.js";
 
@@ -116,6 +122,87 @@ function storedError(record: StepRecord): Error {
   return new Error(
     record.error ?? `Durable step "${record.stepId}" previously failed`,
   );
+}
+
+/**
+ * Mark a failure this execution just recorded as one no retry can change.
+ * Only live throws carry the brand: a replay rebuilds the error from the
+ * row's text and gets main's verdict.
+ */
+function terminal<E extends Error>(error: E): E {
+  return brandNonRetryable(error);
+}
+
+/**
+ * Best effort for a predicate that breaks its synchronous contract by
+ * returning or throwing a plain native Promise: attach a no-op handler
+ * (`Promise.prototype.then` checks the internal slot first, so nothing is
+ * read from any other value, and both reactions return `undefined`). If a
+ * Promise rejects and no handler can be attached, the rejection is the
+ * application's own unhandled rejection, as anywhere else in stage code.
+ */
+function settleQuietly(value: object): void {
+  try {
+    Promise.prototype.then.call(
+      value,
+      () => {},
+      () => {},
+    );
+  } catch {
+    // Not a real Promise after all, or one that refuses a handler: nothing
+    // more is attempted on the application's value.
+  }
+}
+
+/**
+ * Whether `retryIf` says this throw must not be retried. The predicate is
+ * synchronous: it runs between the body's throw and the failure write, so
+ * an awaited verdict would hold the step open past its lease. Anything but
+ * a plain `false` gives no verdict and leaves the failure retryable: a
+ * predicate that throws, a missing or broken `retryIf`, and a promise
+ * returned or thrown (logged; see `settleQuietly`). Nothing here may throw: the body's own
+ * failure must still be recorded.
+ */
+function retryIfDeclines(
+  opts: StepRunOptions,
+  error: unknown,
+  attempt: number,
+  onLog: CreateStepApiOptions["onLog"],
+): boolean {
+  const warn = (text: string) => {
+    try {
+      onLog?.("WARN", text);
+    } catch {
+      // A failing logger must not hide the body's error either.
+    }
+  };
+  try {
+    const retryIf = opts.retryIf;
+    if (typeof retryIf !== "function") return false;
+    const verdict: unknown = retryIf(error, { attempt });
+    if (verdict === false) return true;
+    if (
+      (typeof verdict === "object" && verdict !== null) ||
+      typeof verdict === "function"
+    ) {
+      settleQuietly(verdict);
+      warn(
+        "retryIf returned an object (a promise?); it must return a boolean synchronously. Treating the failure as retryable",
+      );
+    }
+    return false;
+  } catch (predicateError) {
+    if (
+      (typeof predicateError === "object" && predicateError !== null) ||
+      typeof predicateError === "function"
+    ) {
+      settleQuietly(predicateError);
+    }
+    warn(
+      `retryIf threw (${toErrorMessage(predicateError)}); treating the failure as retryable`,
+    );
+    return false;
+  }
 }
 
 function positiveDuration(value: number, name: string): number {
@@ -417,7 +504,7 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
       error: error.message,
       leaseExpiresAt: null,
     });
-    if (!outcome.parked) throw error;
+    if (!outcome.parked) throw terminal(error);
     return outcome.record;
   }
 
@@ -531,7 +618,7 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
             leaseExpiresAt: null,
           });
           if (refused.parked) return parkedResult<T>(refused.record);
-          throw error;
+          throw terminal(error);
         }
         record = await reclaim(id, record, leaseMs);
         shouldExecute = true;
@@ -599,7 +686,27 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
           abortSignal,
         });
       } catch (error) {
+        // Main's text: a value main could not format throws here as it did.
         const message = error instanceof Error ? error.message : String(error);
+        // Decided for this throw only, never written to the row: a
+        // `NonRetryableError`, or a `retryIf` that says no, stops the step's
+        // own `retries`, and a refusal is thrown as a `NonRetryableError`
+        // with the original as `cause`. A replay of the row rebuilds a
+        // plain error from its text, as on main.
+        // The engine's own control flow (a suspend) is no failure to judge:
+        // neither the brand nor `retryIf` sees it, as on main.
+        const control = isStepControlFlowError(error);
+        const nonRetryable = !control && isNonRetryableError(error);
+        const declined =
+          !control &&
+          !nonRetryable &&
+          retryIfDeclines(opts, error, record.attempt, options.onLog);
+        const stop = declined || nonRetryable;
+        const thrown = declined
+          ? new NonRetryableError(message, { cause: error })
+          : error;
+        // The stage consults this decision instead of reading the brand again.
+        if (stop) recordNonRetryable(thrown as object);
         // Under the same constraint as the success write: a body that threw
         // here must not bury an outcome another execution already recorded.
         const failure = await commitOutcome(id, "running", {
@@ -608,7 +715,7 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
           leaseExpiresAt: null,
         });
         if (failure.parked) return parkedResult<T>(failure.record);
-        if (record.attempt <= retries) {
+        if (!stop && record.attempt <= retries) {
           const retryDelayMs = retryDelayFor(
             opts,
             record.attempt,
@@ -628,7 +735,7 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
             }),
           );
         }
-        throw error;
+        throw thrown;
       } finally {
         if (heartbeatTimer) clearInterval(heartbeatTimer);
       }

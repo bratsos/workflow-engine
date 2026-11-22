@@ -1,0 +1,353 @@
+/**
+ * The shared host path acknowledges a job as dead only when `job.execute`
+ * says its own workflow, stage or run is missing. A branded error counts only
+ * when its target is the job's own; any other value goes through main's
+ * matcher, with main's reads and outcome. A nested dispatch's branded missing
+ * target is an ordinary failure the host must not swallow.
+ */
+
+import { describe, expect, it } from "vitest";
+import { z } from "zod";
+import { defineWorkflow } from "../../core/workflow.js";
+import { executeJobWithHeartbeat } from "../../kernel/helpers/host-support.js";
+import { createKernel, type Kernel } from "../../kernel/kernel.js";
+import type { ActivityExecutor } from "../../kernel/ports.js";
+import {
+  CollectingEventSink,
+  FakeClock,
+  InMemoryBlobStore,
+} from "../../kernel/testing/index.js";
+import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
+import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
+
+const workflow = defineWorkflow("dead-verdict", { input: z.object({}) })
+  .stage("only", {
+    schemas: {
+      input: z.object({}),
+      output: z.object({}),
+      config: z.object({}),
+    },
+    async execute() {
+      return { output: {} };
+    },
+  })
+  .build();
+
+async function claimedJob(executor?: ActivityExecutor) {
+  const persistence = new InMemoryWorkflowPersistence();
+  const jobTransport = new InMemoryJobQueue("w");
+  const kernel = createKernel({
+    persistence,
+    jobTransport,
+    blobStore: new InMemoryBlobStore(),
+    clock: new FakeClock(new Date()),
+    eventSink: new CollectingEventSink(),
+    registry: {
+      getWorkflow: (id) => (id === workflow.id ? workflow : undefined),
+    },
+    ...(executor ? { executor } : {}),
+  });
+  await kernel.dispatch({
+    type: "run.create",
+    idempotencyKey: "dead-verdict",
+    workflowId: workflow.id,
+    input: {},
+  });
+  await kernel.dispatch({ type: "run.claimPending", workerId: "w" });
+  const job = (await jobTransport.dequeue())!;
+  const message = {
+    jobId: job.jobId,
+    workflowRunId: job.workflowRunId,
+    workflowId: job.workflowId,
+    stageId: job.stageId,
+    attempt: job.attempt,
+    payload: job.payload,
+  };
+  const status = async () =>
+    (await jobTransport.getJobsByWorkflowRun(job.workflowRunId)).find(
+      (row) => row.id === job.jobId,
+    )?.status;
+  return { kernel, jobTransport, message, status };
+}
+
+describe("dead job verdict", () => {
+  it("takes an unbranded error whose text matches main's pattern for a dead job, as main does", async () => {
+    const infra = new Error(
+      "Workflow adapter-cache not found in registry; refresh and retry",
+    );
+    const { kernel, jobTransport, message, status } = await claimedJob({
+      run: async () => {
+        throw infra;
+      },
+    });
+
+    expect(
+      await executeJobWithHeartbeat(kernel, { jobTransport, job: message }),
+    ).toMatchObject({ dead: true, error: infra.message });
+    expect(await status()).toBe("FAILED");
+  });
+
+  it.each([
+    "name",
+    Symbol.for("@bratsos/workflow-engine/job-target-missing"),
+  ])("rethrows an executor error whose %s getter throws as it is", async (key) => {
+    const infra = new Error("cache unavailable");
+    Object.defineProperty(infra, key, {
+      get() {
+        throw new Error("getter");
+      },
+    });
+    const { kernel, jobTransport, message, status } = await claimedJob({
+      run: async () => {
+        throw infra;
+      },
+    });
+
+    await expect(
+      executeJobWithHeartbeat(kernel, { jobTransport, job: message }),
+    ).rejects.toBe(infra);
+    expect(await status()).toBe("RUNNING");
+  });
+
+  it.each([
+    ["missing text first", true],
+    ["other text first", false],
+  ])("reads the message once to decide and to name the reason (%s)", async (_case, missingFirst) => {
+    let reads = 0;
+    const missing = "Stage only not found in workflow dead-verdict";
+    const flaky = new Error();
+    Object.defineProperty(flaky, "message", {
+      get() {
+        reads++;
+        return (reads === 1) === missingFirst ? missing : "transport busy";
+      },
+    });
+    const { kernel, jobTransport, message, status } = await claimedJob({
+      run: async () => {
+        throw flaky;
+      },
+    });
+
+    const settled = executeJobWithHeartbeat(kernel, {
+      jobTransport,
+      job: message,
+    });
+    if (missingFirst) {
+      expect(await settled).toMatchObject({ dead: true, error: missing });
+      expect(await status()).toBe("FAILED");
+    } else {
+      await expect(settled).rejects.toBe(flaky);
+      expect(await status()).toBe("RUNNING");
+    }
+    expect(reads).toBe(1);
+  });
+
+  it("still acknowledges a job whose run no longer exists as dead", async () => {
+    const { kernel, jobTransport, message, status } = await claimedJob();
+
+    const outcome = await executeJobWithHeartbeat(kernel, {
+      jobTransport,
+      job: { ...message, workflowRunId: "gone" },
+    });
+
+    expect(outcome).toMatchObject({ outcome: "failed", dead: true });
+    expect(outcome.error).toBe("WorkflowRun gone not found");
+    expect(await status()).toBe("FAILED");
+  });
+
+  it("acknowledges the missing run when a dispatcher carries the error by name and message", async () => {
+    const { kernel, jobTransport, message, status } = await claimedJob();
+    // A decorator that transports dispatch errors keeps name and message only.
+    const serializing = {
+      ...kernel,
+      dispatch: (async (command: Parameters<typeof kernel.dispatch>[0]) => {
+        try {
+          return await kernel.dispatch(command);
+        } catch (error) {
+          const { name, message } = JSON.parse(
+            JSON.stringify({
+              name: (error as Error).name,
+              message: (error as Error).message,
+            }),
+          );
+          throw Object.assign(new Error(message), { name });
+        }
+      }) as typeof kernel.dispatch,
+    };
+
+    const outcome = await executeJobWithHeartbeat(serializing, {
+      jobTransport,
+      job: { ...message, workflowRunId: "gone" },
+    });
+
+    expect(outcome).toMatchObject({ outcome: "failed", dead: true });
+    expect(await status()).toBe("FAILED");
+  });
+
+  it("does not take a missing target of a dispatch made inside the job for its own", async () => {
+    let inner: Kernel | undefined;
+    const { kernel, jobTransport, message, status } = await claimedJob({
+      // A custom executor that dispatches another job, whose run is gone.
+      run: async () =>
+        inner!.dispatch({
+          type: "job.execute",
+          workflowRunId: "another-run",
+          workflowId: workflow.id,
+          stageId: "only",
+          config: {},
+        }) as never,
+    });
+    inner = kernel;
+
+    const failure = await executeJobWithHeartbeat(kernel, {
+      jobTransport,
+      job: message,
+    }).catch((error: unknown) => error);
+
+    expect(failure).toMatchObject({
+      name: "JobTargetMissingError",
+      message: "WorkflowRun another-run not found",
+    });
+    expect(await status()).toBe("RUNNING");
+  });
+
+  it("rethrows a plain object carrying name and message, as main does", async () => {
+    const { kernel, jobTransport, message, status } = await claimedJob();
+    const decoded = {
+      name: "JobTargetMissingError",
+      message: "WorkflowRun gone not found",
+    };
+    const reporting = {
+      ...kernel,
+      dispatch: (async (command: Parameters<typeof kernel.dispatch>[0]) => {
+        try {
+          return await kernel.dispatch(command);
+        } catch {
+          throw decoded;
+        }
+      }) as typeof kernel.dispatch,
+    };
+
+    await expect(
+      executeJobWithHeartbeat(reporting, {
+        jobTransport,
+        job: { ...message, workflowRunId: "gone" },
+      }),
+    ).rejects.toBe(decoded);
+    expect(await status()).toBe("RUNNING");
+  });
+
+  it("rethrows a nested missing target decoded from JSON, as main does", async () => {
+    // A custom executor relays a second kernel's failure through JSON: the
+    // decoded copy names this workflow but another stage and run.
+    const inner = createKernel({
+      persistence: new InMemoryWorkflowPersistence(),
+      jobTransport: new InMemoryJobQueue("w"),
+      blobStore: new InMemoryBlobStore(),
+      clock: new FakeClock(new Date()),
+      eventSink: new CollectingEventSink(),
+      registry: { getWorkflow: () => undefined },
+    });
+    const envelope = await inner
+      .dispatch({
+        type: "job.execute",
+        workflowRunId: "missing-nested-run",
+        workflowId: workflow.id,
+        stageId: "nested",
+        config: {},
+      })
+      .then(
+        () => {
+          throw new Error("unexpected nested success");
+        },
+        (error: unknown) =>
+          JSON.parse(
+            JSON.stringify(error, [
+              "name",
+              "message",
+              "target",
+              "workflowId",
+              "stageId",
+              "workflowRunId",
+            ]),
+          ),
+      );
+    expect(envelope).toMatchObject({
+      name: "JobTargetMissingError",
+      message: `Workflow ${workflow.id} not found in registry`,
+      target: { stageId: "nested", workflowRunId: "missing-nested-run" },
+    });
+    const { kernel, jobTransport, message, status } = await claimedJob({
+      run: async () => {
+        throw envelope;
+      },
+    });
+
+    await expect(
+      executeJobWithHeartbeat(kernel, { jobTransport, job: message }),
+    ).rejects.toBe(envelope);
+    expect(await status()).toBe("RUNNING");
+  });
+
+  it("does not take another kernel's missing workflow of the same id for its own", async () => {
+    // A second kernel without the workflow, reached from a custom executor
+    // with another stage and run: its error names the same workflow id.
+    const inner = createKernel({
+      persistence: new InMemoryWorkflowPersistence(),
+      jobTransport: new InMemoryJobQueue("w"),
+      blobStore: new InMemoryBlobStore(),
+      clock: new FakeClock(new Date()),
+      eventSink: new CollectingEventSink(),
+      registry: { getWorkflow: () => undefined },
+    });
+    const { kernel, jobTransport, message, status } = await claimedJob({
+      run: async () =>
+        inner.dispatch({
+          type: "job.execute",
+          workflowRunId: "inner-run",
+          workflowId: workflow.id,
+          stageId: "inner-stage",
+          config: {},
+        }) as never,
+    });
+
+    const failure = await executeJobWithHeartbeat(kernel, {
+      jobTransport,
+      job: message,
+    }).catch((error: unknown) => error);
+
+    expect(failure).toMatchObject({ name: "JobTargetMissingError" });
+    expect(await status()).toBe("RUNNING");
+  });
+
+  it.each([
+    [
+      "the plain Error an earlier release's kernel throws",
+      (text: string) => new Error(text),
+    ],
+  ])("acknowledges the missing run reported as %s", async (_case, make) => {
+    const { kernel, jobTransport, message, status } = await claimedJob();
+    const reporting = {
+      ...kernel,
+      dispatch: (async (command: Parameters<typeof kernel.dispatch>[0]) => {
+        try {
+          return await kernel.dispatch(command);
+        } catch (error) {
+          throw make((error as Error).message);
+        }
+      }) as typeof kernel.dispatch,
+    };
+
+    const outcome = await executeJobWithHeartbeat(reporting, {
+      jobTransport,
+      job: { ...message, workflowRunId: "gone" },
+    });
+
+    expect(outcome).toMatchObject({
+      outcome: "failed",
+      dead: true,
+      error: "WorkflowRun gone not found",
+    });
+    expect(await status()).toBe("FAILED");
+  });
+});

@@ -10,6 +10,119 @@ export class IdempotencyInProgressError extends Error {
   }
 }
 
+const JOB_TARGET_MISSING: unique symbol = Symbol.for(
+  "@bratsos/workflow-engine/job-target-missing",
+) as typeof JOB_TARGET_MISSING;
+
+/** The workflow, stage and run a `job.execute` command names. */
+export interface JobTarget {
+  workflowId: string;
+  stageId: string;
+  workflowRunId: string;
+}
+
+/** The message `job.execute` throws for each missing part of `target`. */
+function missingTargetMessages(target: JobTarget) {
+  return {
+    workflow: `Workflow ${target.workflowId} not found in registry`,
+    stage: `Stage ${target.stageId} not found in workflow ${target.workflowId}`,
+    run: `WorkflowRun ${target.workflowRunId} not found`,
+  };
+}
+
+/**
+ * Thrown by `job.execute` when the job's workflow, stage or run does not
+ * exist: the queue row is an orphan, and a host acknowledges it as dead.
+ * The text is the one earlier releases threw, so older readers still match
+ * it; `target` names the command it was thrown for.
+ */
+export class JobTargetMissingError extends Error {
+  readonly [JOB_TARGET_MISSING] = true as const;
+  readonly target: JobTarget;
+
+  constructor(target: JobTarget, missing: "workflow" | "stage" | "run") {
+    super(missingTargetMessages(target)[missing]);
+    this.name = "JobTargetMissingError";
+    // Named reads, not a spread: a non-enumerable id is still this target's.
+    this.target = {
+      workflowId: target.workflowId,
+      stageId: target.stageId,
+      workflowRunId: target.workflowRunId,
+    };
+  }
+}
+
+/** Main's dead-job texts, matched as main matches them. */
+const DEAD_JOB_PATTERN =
+  /^(WorkflowRun .* not found|Workflow .* not found in registry|Stage .* not found in workflow)/;
+
+/**
+ * Whether `error` is this job's missing target, so a host may acknowledge
+ * the job as dead (see {@link jobTargetMissingReason}). A field read that
+ * throws answers `false`.
+ */
+export function isJobTargetMissingError(
+  error: unknown,
+  target: JobTarget,
+): boolean {
+  try {
+    return jobTargetMissingReason(error, target) !== undefined;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The text a host fails the job with when `error` is this job's missing
+ * target, else `undefined`.
+ *
+ * - A {@link JobTargetMissingError} (branded): only when its `target` is this
+ *   job's workflow, stage and run, all three. The missing target of another
+ *   dispatch made inside the job names another target and is rethrown.
+ * - Any other value: exactly the matcher earlier releases used, with the
+ *   same reads (the message of an `Error`, otherwise the value converted to
+ *   a string) and the same outcome, so a getter that throws there throws.
+ */
+export function jobTargetMissingReason(
+  error: unknown,
+  target: JobTarget,
+): string | undefined {
+  const named = brandedTarget(error);
+  if (named !== undefined) {
+    if (
+      named.workflowId !== target.workflowId ||
+      named.stageId !== target.stageId ||
+      named.workflowRunId !== target.workflowRunId
+    ) {
+      return undefined;
+    }
+    return (error as JobTargetMissingError).message;
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  return DEAD_JOB_PATTERN.test(message) ? message : undefined;
+}
+
+/** The target a branded error carries; a value whose brand cannot be read has none. */
+function brandedTarget(error: unknown): Partial<JobTarget> | undefined {
+  try {
+    if (typeof error !== "object" || error === null) return undefined;
+    const candidate = error as {
+      [JOB_TARGET_MISSING]?: unknown;
+      target?: Partial<JobTarget>;
+    };
+    if (candidate[JOB_TARGET_MISSING] !== true) return undefined;
+    const named = candidate.target;
+    if (typeof named !== "object" || named === null) return {};
+    return {
+      workflowId: named.workflowId,
+      stageId: named.stageId,
+      workflowRunId: named.workflowRunId,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
 /** Thrown when a stage asks for AI without kernel AI services configured. */
 export class AIServicesNotConfiguredError extends Error {
   constructor() {

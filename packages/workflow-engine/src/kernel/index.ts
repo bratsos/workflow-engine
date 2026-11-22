@@ -56,6 +56,9 @@ export {
   DefinitionVersionConflictError,
   DefinitionVersionMismatchError,
   IdempotencyInProgressError,
+  isJobTargetMissingError,
+  type JobTarget,
+  JobTargetMissingError,
   SpilledPayloadUnavailableError,
 } from "./errors.js";
 
@@ -106,6 +109,7 @@ export {
   flushOutboxWithin,
   HOST_DEFAULTS,
   type HostJobMessage,
+  isRetryableStageError,
   loadWorkflowContext,
   MAX_TIMER_MS,
   type MaintenanceTickCounts,

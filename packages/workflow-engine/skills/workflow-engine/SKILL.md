@@ -120,6 +120,7 @@ await kernel.dispatch({
 | `createServerlessHost` | Function | `@bratsos/workflow-engine-host-serverless` | Create serverless host |
 | `defineRemoteStage` / `createActivityWorker` | Function | `@bratsos/workflow-engine-host-remote` | Run a stage on a credential-free remote worker (see 11-remote-activity-workers.md) |
 | `createRoutingExecutor` / `createLocalExecutor` | Function | `@bratsos/workflow-engine/kernel` | `ActivityExecutor` port: route specific stages to a remote executor / default in-process executor |
+| `NonRetryableError` / `isNonRetryableError` | Class / Function | `@bratsos/workflow-engine` | Throw from a stage or `ctx.step.run` body when a retry cannot help: no step `retries`, no job or poll retry (see 12-durable-steps.md); `retryIf` on `StepRunOptions` decides per error. During a rolling deploy, hosts on an earlier release do not honour it (see 12-durable-steps.md). |
 | `createAIHelper` | Function | `@bratsos/workflow-engine` | AI operations (text, object, embed, evaluate, transcribe, batch) with AI SDK & OpenRouter batch support |
 | `registerEmbeddingProvider` | Function | `@bratsos/workflow-engine` | Register custom embedding providers (Voyage, Cohere, etc.) |
 | `registerEvaluationProvider` | Function | `@bratsos/workflow-engine` | Register a custom evaluation (decision) model provider |

@@ -4,10 +4,12 @@
  * (`stream: true`), and one-shot failure scripting through the real kernel.
  */
 
+import { runInNewContext } from "node:vm";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { registerModels } from "../../ai/model-helper.js";
 import type { AiMapResult } from "../../core/step-ai.js";
+import { NonRetryableError } from "../../core/steps.js";
 import { defineWorkflow } from "../../core/workflow.js";
 import { MAX_TIMER_MS } from "../../kernel/helpers/host-support.js";
 import { createTestHarness } from "../../testing/index.js";
@@ -22,6 +24,19 @@ registerModels({
     outputCostPerMillion: 2,
     provider: "openrouter",
     supportsAsyncBatch: false,
+  },
+});
+
+const BATCH_MODEL = "ai-map-feedback-batch-model";
+
+registerModels({
+  [BATCH_MODEL]: {
+    id: "openai/gpt-4o-mini",
+    name: "AI Map Feedback Batch Model",
+    inputCostPerMillion: 1,
+    outputCostPerMillion: 2,
+    provider: "openrouter",
+    supportsAsyncBatch: true,
   },
 });
 
@@ -88,6 +103,138 @@ describe("ctx.step.ai.map — consumer feedback surfaces", () => {
     });
     // JSON-only: no `cause` on the stored result.
     expect(b && "cause" in b).toBe(false);
+  });
+
+  it("keeps routing realtime when choosing a batch provider throws a decoded error with no text", async () => {
+    const batch = {};
+    Object.defineProperty(batch, "provider", {
+      get() {
+        throw { name: "ProviderUnavailable", message: "" };
+      },
+    });
+    const workflow = mapWorkflow("map-provider-error", {
+      model: BATCH_MODEL,
+      policy: "auto",
+      auto: { batchAbove: 1 },
+      batch,
+    });
+    const harness = createTestHarness({ workflows: [workflow] });
+    harness.mockAi.setTextResponse("process", { text: "processed" });
+
+    const result = await harness.run("map-provider-error", { items: ["a"] });
+
+    // Main's text for the error is not empty, so the map stays realtime.
+    expect(result.status).toBe("COMPLETED");
+    expect(results(result.output)[0]?.status).toBe("succeeded");
+    expect(harness.mockAi.getCalls()).toHaveLength(1);
+  });
+
+  it("fails the stage without a model call when choosing a batch provider throws a value with no string form", async () => {
+    const batch = {};
+    Object.defineProperty(batch, "provider", {
+      get() {
+        throw Object.assign(Object.create(null), { code: "unavailable" });
+      },
+    });
+    const workflow = mapWorkflow("map-provider-unprintable", {
+      model: BATCH_MODEL,
+      policy: "auto",
+      auto: { batchAbove: 1 },
+      batch,
+    });
+    const harness = createTestHarness({ workflows: [workflow] });
+    harness.mockAi.setTextResponse("process", { text: "processed" });
+
+    const result = await harness.run("map-provider-unprintable", {
+      items: ["a"],
+    });
+
+    // Main could not format the error, so it propagated: no realtime call.
+    expect(result.status).not.toBe("COMPLETED");
+    expect(harness.mockAi.getCalls()).toHaveLength(0);
+  });
+
+  it("stores the text of another realm's Error from the one read main makes", async () => {
+    const workflow = mapWorkflow("map-foreign-error", {
+      realtime: { retries: 0, concurrency: 1 },
+    });
+    const harness = createTestHarness({ workflows: [workflow] });
+    harness.mockAi.setTextResponse("process", { text: "processed" });
+    let reads = 0;
+    const foreign = runInNewContext('new Error("initial")') as Error;
+    Object.defineProperty(foreign, "message", {
+      get: () => (++reads === 1 ? "original message" : "replacement message"),
+    });
+    harness.mockAi.failOnce("process a", foreign);
+
+    const result = await harness.run("map-foreign-error", { items: ["a"] });
+
+    expect(results(result.output)[0]).toMatchObject({
+      status: "failed",
+      error: "Error: original message",
+    });
+  });
+
+  describe("reads a thrown model error as main does", () => {
+    const run = async (id: string, error: unknown) => {
+      const workflow = mapWorkflow(id, {
+        realtime: { retries: 0, concurrency: 1 },
+        repair: { attempts: 1 },
+      });
+      const harness = createTestHarness({ workflows: [workflow] });
+      harness.mockAi.setTextResponse("process", { text: "processed" });
+      harness.mockAi.failOnce("process a", error as Error);
+      const result = await harness.run(id, { items: ["a"] });
+      return { item: results(result.output)[0], harness };
+    };
+
+    it("routes by the name its cause leaves, read after the cause", async () => {
+      const error = { name: "AI_NoObjectGeneratedError", message: "lazy" };
+      Object.defineProperty(error, "cause", {
+        get() {
+          error.name = "TransportError";
+          return undefined;
+        },
+      });
+      const { item, harness } = await run("map-lazy-cause", error);
+      expect(item).toMatchObject({
+        status: "failed",
+        error: "[object Object]",
+        attempts: 1,
+      });
+      // One failed call, no repair: the repair call would have succeeded.
+      expect(harness.mockAi.getCalls()).toHaveLength(0);
+    });
+
+    it("reads an aliased text the way main does", async () => {
+      let reads = 0;
+      const error: Record<string, unknown> = {
+        name: "TransportError",
+        message: "transport failure",
+      };
+      error.cause = error;
+      Object.defineProperty(error, "text", {
+        get: () => (++reads === 2 ? "raw content" : undefined),
+      });
+      const { item, harness } = await run("map-self-cause", error);
+      expect(item).toMatchObject({ status: "failed", attempts: 1 });
+      expect(harness.mockAi.getCalls()).toHaveLength(0);
+    });
+
+    it("stores one string conversion of a foreign Error", async () => {
+      let reads = 0;
+      const foreign = runInNewContext("new Error()") as Error;
+      foreign.name = "";
+      Object.defineProperty(foreign, "message", {
+        get: () => (++reads === 1 ? "[object Object]" : "replacement text"),
+      });
+      const { item } = await run("map-foreign-placeholder", foreign);
+      expect(item).toMatchObject({
+        status: "failed",
+        error: "[object Object]",
+      });
+      expect(reads).toBe(1);
+    });
   });
 
   it("retries a thrown item call in-process and completes in one execution", async () => {
@@ -206,6 +353,29 @@ describe("ctx.step.ai.map — consumer feedback surfaces", () => {
     expect(result.reports.flatMap((r) => r.outcomes)).toEqual([
       { stageId: "map", outcome: "completed" },
     ]);
+  });
+  it("gives an item its failed verdict at once when the model call throws NonRetryableError", async () => {
+    const workflow = mapWorkflow("map-non-retryable", {
+      realtime: { retries: 3, concurrency: 1 },
+    });
+    const harness = createTestHarness({ workflows: [workflow] });
+    harness.mockAi.setTextResponse("process", { text: "processed" });
+    harness.mockAi.failOnce("process a", new NonRetryableError("key revoked"));
+
+    const result = await harness.run("map-non-retryable", {
+      items: ["a", "b"],
+    });
+
+    // Three in-process retries were available and none was spent.
+    expect(result.status).toBe("COMPLETED");
+    const [a, b] = results(result.output);
+    expect(a).toMatchObject({
+      status: "failed",
+      error: "key revoked",
+      errorName: "NonRetryableError",
+      attempts: 1,
+    });
+    expect(b?.status).toBe("succeeded");
   });
   it("paces each concurrency slot with realtime.minDelayMs", async () => {
     const workflow = mapWorkflow("map-min-delay", {

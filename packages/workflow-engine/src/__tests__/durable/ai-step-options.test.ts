@@ -7,6 +7,7 @@ import { stepCountIs, tool } from "ai";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { registerModels } from "../../ai/model-helper.js";
+import { isNonRetryableError } from "../../core/steps.js";
 import { defineWorkflow } from "../../core/workflow.js";
 import { createTestHarness } from "../../testing/index.js";
 
@@ -94,6 +95,48 @@ describe("ctx.step.ai step options", () => {
     });
     expect(result.status).toBe("FAILED");
     expect(result.error).toContain("model is down");
+  });
+
+  it("stops retrying a model call that retryIf rejects and fails the stage terminally", async () => {
+    const decisions: Array<[string, number]> = [];
+    let caught: unknown;
+    const workflow = defineWorkflow("step-ai-retry-if", { input: In })
+      .stage("summarize", {
+        schemas: {
+          input: In,
+          output: z.object({ text: z.string() }),
+          config: z.object({}),
+        },
+        async execute(ctx) {
+          const result = await ctx.step.ai
+            .generateText("summary", MODEL, "summarize 400", undefined, {
+              retries: 3,
+              retryIf: (error, info) => {
+                decisions.push([(error as Error).message, info.attempt]);
+                return false;
+              },
+            })
+            .catch((error: unknown) => {
+              caught = error;
+              throw error;
+            });
+          return { output: { text: result.text } };
+        },
+      })
+      .build();
+
+    const harness = createTestHarness({ workflows: [workflow] });
+    harness.mockAi.setError(true, "400 invalid request");
+
+    const result = await harness.run("step-ai-retry-if", { topic: "steps" });
+
+    // Three retries and three job attempts were available; none was used.
+    expect(result.status).toBe("FAILED");
+    expect(decisions).toEqual([["400 invalid request", 1]]);
+    expect(isNonRetryableError(caught)).toBe(true);
+    expect(result.reports.flatMap((r) => r.outcomes)).toEqual([
+      { stageId: "summarize", outcome: "failed", error: expect.any(String) },
+    ]);
   });
 
   it("forwards tools, stopWhen and onStepEnd through step.ai.generateText", async () => {

@@ -47,7 +47,9 @@ export {
   DURABLE_SUSPEND_MARKER,
   DuplicateStepKeyError,
   isDuplicateStepKeyError,
+  isNonRetryableError,
   isStepControlFlowError,
+  NonRetryableError,
   neverAbortingSignal,
   StageAbortedError,
   type StageAbortReason,
@@ -324,6 +326,9 @@ export {
   DefinitionVersionConflictError,
   DefinitionVersionMismatchError,
   IdempotencyInProgressError,
+  isJobTargetMissingError,
+  type JobTarget,
+  JobTargetMissingError,
   SpilledPayloadUnavailableError,
 } from "./kernel/errors";
 export type {

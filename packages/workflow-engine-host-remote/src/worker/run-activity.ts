@@ -1,4 +1,8 @@
-import type { EnhancedStageContext, Stage } from "@bratsos/workflow-engine";
+import {
+  type EnhancedStageContext,
+  isNonRetryableError,
+  type Stage,
+} from "@bratsos/workflow-engine";
 import {
   AIServicesNotConfiguredError,
   createStepApi,
@@ -133,6 +137,8 @@ export async function runActivity(
       outcome: {
         kind: "failed",
         error: toErrorMessage(error),
+        // The NonRetryableError brand alone decides; omitted when retryable.
+        ...(isNonRetryableError(error) ? { retryable: false } : {}),
       },
       logs,
       annotations,

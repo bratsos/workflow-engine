@@ -53,7 +53,18 @@ export const ActivityOutcomeSchema = z.discriminatedUnion("kind", [
     artifacts: z.record(z.string(), ArtifactRefSchema).optional(),
     customMetrics: z.record(z.string(), z.number()).optional(),
   }),
-  z.object({ kind: z.literal("failed"), error: z.string() }),
+  z.object({
+    kind: z.literal("failed"),
+    error: z.string(),
+    /**
+     * `false` when the worker's body threw a `NonRetryableError` (also what
+     * a step's declining `retryIf` throws): the `RemoteExecutor` passes it
+     * to `job.execute`, which then spends no retry. Absent means retryable,
+     * so a worker that does not send it behaves as before, and a broker that
+     * does not know the field drops it.
+     */
+    retryable: z.boolean().optional(),
+  }),
 ]);
 export type ActivityOutcome = z.infer<typeof ActivityOutcomeSchema>;
 

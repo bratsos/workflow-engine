@@ -59,6 +59,15 @@ interface RemotePayload {
   stageCodeVersion?: string;
 }
 
+/**
+ * The error a failed outcome fails the stage with. Never empty: the kernel
+ * reads an empty `error` as "not ready", which would leave a failed activity
+ * suspended (a worker throwing `new NonRetryableError()` reports `""`).
+ */
+function failedOutcomeText(error: string): string {
+  return error || "remote activity failed";
+}
+
 function collectStrings(val: unknown): string[] {
   if (typeof val === "string") return [val];
   if (Array.isArray(val)) return val.flatMap(collectStrings);
@@ -252,7 +261,10 @@ export function defineRemoteStage(
 
               const outcome = durableReport.outcome;
               if (outcome.kind === "failed")
-                return { ready: false, error: outcome.error };
+                return {
+                  ready: false,
+                  error: failedOutcomeText(outcome.error),
+                };
 
               // Strict trust gate — same as the normal "reported" path.
               const outputParsed = real.outputSchema.safeParse(outcome.output);
@@ -347,7 +359,7 @@ export function defineRemoteStage(
       if (!outcome)
         return { ready: false, error: "reported task missing outcome" };
       if (outcome.kind === "failed")
-        return { ready: false, error: outcome.error };
+        return { ready: false, error: failedOutcomeText(outcome.error) };
 
       // strict trust gate — the engine's own resume-path validation is best-effort
       const parsed = real.outputSchema.safeParse(outcome.output);

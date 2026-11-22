@@ -10,6 +10,7 @@
  * Phase-1 proxy-stage pattern is the right tool there.
  */
 
+import { isNonRetryableError } from "@bratsos/workflow-engine";
 import {
   type ActivityExecutor,
   type ActivityRunInput,
@@ -88,6 +89,7 @@ export function createRemoteExecutor(
       } catch (e) {
         return {
           error: toErrorMessage(e),
+          ...(isNonRetryableError(e) ? { retryable: false } : {}),
           progress: [],
           annotations: [],
           logs: [],
@@ -171,6 +173,8 @@ export function createRemoteExecutor(
       if (outcome.kind === "failed") {
         return {
           error: outcome.error,
+          // The worker's verdict; a worker that sends none leaves it retryable.
+          ...(outcome.retryable === false ? { retryable: false } : {}),
           progress: [],
           annotations: [],
           logs,

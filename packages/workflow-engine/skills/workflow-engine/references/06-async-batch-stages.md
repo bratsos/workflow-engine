@@ -176,11 +176,15 @@ async checkCompletion(suspendedState, ctx) {
   // Failed
   // ===================
   if (status.status === "failed") {
+    // A returned error is terminal: the stage and run fail at once.
     return {
       ready: false,
       error: `Batch ${batchId} failed`,
     };
   }
+  // A *thrown* error fails the stage and the run on this poll too: it is not
+  // retried. Catch a transient status error (a 503) and return
+  // { ready: false } to poll again.
 
   // ===================
   // Completed

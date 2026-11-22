@@ -124,6 +124,7 @@ Workers PUT blobs directly to S3/R2 via the presigned URL — the broker server 
 - **Lease renewal / heartbeat**: workers heartbeat while running; the broker's stale-lease sweep re-leases tasks from crashed workers.
 - **Deploy safety**: set the same `stageCodeVersion` on `defineRemoteStage`, the broker, and the workers. After a deploy bumps the version, a task suspended under the old version is failed rather than resumed from a stale report.
 - **Output-key boundary**: worker-supplied artifact keys are prefix-validated (confused-deputy prevention).
+- **Retry verdict**: a stage that throws a value carrying the `NonRetryableError` brand on a worker reports its message (as before) plus `retryable: false`; through the `ActivityExecutor` port, `createRemoteExecutor` passes it to `job.execute`, so the job is not retried. Every other error is retried with the same text as before. The field is optional on the wire: a worker from an earlier release omits it and a broker from an earlier release drops it. A `defineRemoteStage` proxy fails the run on any failed outcome, retryable or not, as `remote activity failed` when the message is empty.
 
 ## Key API
 

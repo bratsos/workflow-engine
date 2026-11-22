@@ -41,6 +41,24 @@ export interface StepRunOptions {
   /** Number of retries after the first failed attempt. Defaults to zero. */
   retries?: number;
   /**
+   * Decide whether a thrown body is worth running again. Called with the
+   * error and this execution's step `attempt` (1 on the first) every time the
+   * body throws anything but a {@link NonRetryableError}. Returning `false`
+   * treats the failure exactly as if the body had thrown `NonRetryableError`:
+   * the step spends no further `retries`, and the stage attempt fails
+   * terminally instead of being retried by its job or by the poll loop. The
+   * stage sees a `NonRetryableError` carrying the original error as `cause`.
+   * Any other return value (`true`, `undefined`, `0`) leaves `retries` in
+   * charge. The predicate must answer synchronously: one that throws, or
+   * returns a promise, is logged and counts as `true`.
+   *
+   * Without `retryIf`, a step retries every error but `NonRetryableError`,
+   * a Zod error from a response the body validates included. Neither
+   * changes when a step that failed is run again by anything other than its
+   * own `retries` (a stage retry, a lease takeover, `onReclaim`).
+   */
+  retryIf?: (error: unknown, info: { attempt: number }) => boolean;
+  /**
    * Delay before retrying a failed attempt. A number of milliseconds or a
    * duration string (`"30s"`, `"5m"`). Defaults to zero.
    */
@@ -455,6 +473,78 @@ export function isDuplicateStepKeyError(
     error !== null &&
     (error as { [STEP_DUPLICATE_KEY]?: unknown })[STEP_DUPLICATE_KEY] === true
   );
+}
+
+/** Cross-bundle brand for {@link NonRetryableError}. */
+const STEP_NON_RETRYABLE: unique symbol = Symbol.for(
+  "@bratsos/workflow-engine/non-retryable",
+) as typeof STEP_NON_RETRYABLE;
+
+/**
+ * Throw this from a stage body or a `ctx.step.run` body
+ * to say the failure will not change on a retry (a rejected input, a revoked
+ * credential, a business rule). The stage attempt fails terminally: its job
+ * is not retried and `stage.pollSuspended` does not retry it. Inside a step
+ * it also stops the step's own `retries`. Pass the underlying error as
+ * `cause`.
+ */
+export class NonRetryableError extends Error {
+  readonly [STEP_NON_RETRYABLE] = true as const;
+
+  constructor(message?: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "NonRetryableError";
+  }
+}
+
+/**
+ * Give a failure the engine itself knows no retry can change (an expired
+ * wait, a refused replay, as the execution that records it throws it) the
+ * {@link NonRetryableError} brand. A replay rebuilt from the ledger row does
+ * not carry it. Internal.
+ */
+export function brandNonRetryable<E extends object>(error: E): E {
+  Object.defineProperty(error, STEP_NON_RETRYABLE, { value: true });
+  decidedNonRetryable.add(error);
+  return error;
+}
+
+/**
+ * Errors a step already decided are terminal. Later consumers (the stage
+ * classifier, a remote worker) ask this set, which reads no property, so the
+ * brand is read once per error and a decision is never reversed. Internal.
+ */
+const decidedNonRetryable = new WeakSet<object>();
+
+/** Record that the step decided `error` is terminal. Internal. */
+export function recordNonRetryable(error: object): void {
+  decidedNonRetryable.add(error);
+}
+
+/** Whether a step already decided `error` is terminal; reads no property. Internal. */
+export function wasDecidedNonRetryable(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    decidedNonRetryable.has(error)
+  );
+}
+
+/** Detect a {@link NonRetryableError} reliably across duplicated package bundles. */
+export function isNonRetryableError(
+  error: unknown,
+): error is NonRetryableError {
+  if (wasDecidedNonRetryable(error)) return true;
+  try {
+    return (
+      typeof error === "object" &&
+      error !== null &&
+      (error as { [STEP_NON_RETRYABLE]?: unknown })[STEP_NON_RETRYABLE] === true
+    );
+  } catch {
+    // A thrown value whose property read throws (a Proxy) carries no brand.
+    return false;
+  }
 }
 
 /** Thrown when a stage uses durable steps without a configured ledger. */

@@ -122,6 +122,18 @@ When a stage fails (by throwing an error), the engine increments the attempt cou
 * The job is returned to the queue if `attempt < maxAttempts` (the transport's `maxAttempts` is the retry budget; the built-in transports back off `2^attempt` seconds). The stage row stays `PENDING` with the error on `errorMessage`, `stage:retrying` is emitted, and the stage's durable step ledger is kept: the retry replays completed steps and re-opens failed ones.
 * The backoff strategy is managed by the host.
 * A suspended stage that throws while `stage.pollSuspended` replays it is retried under the same rule and with the same classifier, spending the attempts its `SUSPENDED` job row has left. The stage stays `SUSPENDED` with the error on `errorMessage`, `attempt` is bumped, `stage:retrying` is emitted and the next poll replays it after a `2^attempt` second backoff; the same single-flight claim applies to that replay as to any other.
+* A `checkCompletion` that **throws** fails the stage and the run on that poll, whatever the error: it is not retried. A `checkCompletion` that returns a non-empty `error` string fails it the same way; an empty one is ignored. Catch a transient provider error inside `checkCompletion` and return `{ ready: false }` to poll again.
+
+### Which errors are retried
+One classifier decides, wherever a stage throw is retried: `job.execute` (through the local executor) and a replay in `stage.pollSuspended`. It is the one earlier releases used, plus one brand. These fail the stage attempt terminally, whatever budget is left:
+* a value carrying the `NonRetryableError` brand (exported from `@bratsos/workflow-engine`; `isNonRetryableError` detects it across bundled copies): a `NonRetryableError` thrown by the stage or by a step, one made by a step's `retryIf` returning `false`, and an expired durable wait (`StepTimeoutError`) or an `onReclaim: "fail"` refusal (`StepNotReplaySafeError`) as the execution that records it throws it. The brand is one symbol property, read after the checks below;
+* a Zod error of the engine's own zod, and a `DuplicateStepKeyError`, as before.
+
+The engine reads no name, message, cause or other field of a thrown value to classify it. A remote worker reports `retryable: false` for the brand alone (see [Remote workers](../hosts/remote-workers.md)).
+
+The classifier sees errors thrown in the current execution. A durable step failure replayed from the ledger is rebuilt from its message, as before, so it is retried within the budget (a later attempt can consume a remaining step retry and complete). One exception is unchanged: `stage.pollSuspended` fails the stage at once on a `StepTimeoutError` or `StepNotReplaySafeError` of this engine copy, branded or not, including a timeout rebuilt from a step's stored timeout text; an instance from another copy goes through the classifier. A terminal verdict ends the job exactly as an exhausted final attempt does: the stage is FAILED, the queue row fails, the run fails, and a later delivery of the job (a lost acknowledgement, a lost lease) meets that FAILED stage and, on a host that includes #83's FAILED-stage handling, ends as a dead job with the stored error, exactly as after an exhausted final attempt: no step runs again and no retry is scheduled.
+
+Every other error is retried within the budget. `job.execute` records the error as `"Name: message"` through the local executor (a plain `Error` by its message alone) and as the bare message a remote worker reports; `stage.pollSuspended` records the message of an `Error`, and any other value as `String` converts it (a decoded object reads `[object Object]`).
 
 ### Terminal Failures
 Once a stage exhausts its `maxAttempts`, it is marked as `FAILED` and `stage:failed` is emitted.

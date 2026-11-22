@@ -26,7 +26,10 @@
 import { isSuspendedResult } from "../../core/types";
 import { StaleVersionError } from "../../persistence/interface.js";
 import type { JobExecuteCommand, JobExecuteResult } from "../commands";
-import { DefinitionVersionMismatchError } from "../errors.js";
+import {
+  DefinitionVersionMismatchError,
+  JobTargetMissingError,
+} from "../errors.js";
 import type { KernelEvent } from "../events";
 import { assertServesRun } from "../helpers/definition-pinning.js";
 import { HOST_DEFAULTS } from "../helpers/host-support.js";
@@ -63,16 +66,15 @@ export async function handleJobExecute(
   // ── Pre-flight (no transaction) ──────────────────────────────────
   // Read-only lookups: workflow def, stage def, run record, context.
 
+  const target = { workflowId, stageId, workflowRunId };
   const workflow = deps.registry.getWorkflow(workflowId);
-  if (!workflow)
-    throw new Error(`Workflow ${workflowId} not found in registry`);
+  if (!workflow) throw new JobTargetMissingError(target, "workflow");
 
   const stageDef = workflow.getStage(stageId);
-  if (!stageDef)
-    throw new Error(`Stage ${stageId} not found in workflow ${workflowId}`);
+  if (!stageDef) throw new JobTargetMissingError(target, "stage");
 
   const workflowRun = await deps.persistence.getRun(workflowRunId);
-  if (!workflowRun) throw new Error(`WorkflowRun ${workflowRunId} not found`);
+  if (!workflowRun) throw new JobTargetMissingError(target, "run");
 
   // Definition pinning: a run resolves against the definition it started
   // under. This build presenting a different structure means the job
