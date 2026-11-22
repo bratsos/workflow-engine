@@ -71,6 +71,18 @@ describe("parseArgs", () => {
     expect(() => parseArgs(["--port", "99999"])).toThrow(/--port/);
   });
 
+  it("rejects a --poll a browser timer cannot honour, and accepts its bounds", () => {
+    const message =
+      /--poll must be a number of milliseconds from 0 to 2147483647/;
+    for (const bad of ["-1", "abc", "Infinity", "NaN", "2147483648"]) {
+      expect(() => parseArgs(["--poll", bad]), bad).toThrow(message);
+    }
+    // 0 pauses polling (the UI's "Off").
+    for (const ok of ["0", "1", "2147483647"]) {
+      expect(parseArgs(["--poll", ok]).pollIntervalMs).toBe(Number(ok));
+    }
+  });
+
   it("rejects a flag whose value is missing", () => {
     expect(() => parseArgs(["--config"])).toThrow(/needs a value/);
     expect(() => parseArgs(["--config", "--actions"])).toThrow(/needs a value/);

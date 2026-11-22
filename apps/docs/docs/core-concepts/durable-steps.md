@@ -103,7 +103,7 @@ interface StepSignalOptions {
 }
 ```
 
-Every duration takes milliseconds or a string (`"30s"`, `"5m"`, `"24h"`). `lease` and `retryDelay` are the canonical names; `leaseMs` and `retryDelayMs` still work and the canonical name wins when both are given.
+Every duration takes milliseconds or a string (`"30s"`, `"5m"`, `"24h"`). `lease` and `retryDelay` are the canonical names; `leaseMs` and `retryDelayMs` still work and the canonical name wins when both are given. `lease` and `heartbeat` end up in timers (a heartbeat interval; the wait for in-flight steps before a suspension), so each must be a number of milliseconds from `1` to `2147483647` (the longest delay a timer honours, about 24.8 days): anything else (`0`, a fraction below 1, `NaN`, `Infinity`, a negative number, `"25d"`) throws a `RangeError` that names the option before the step is claimed.
 
 ```typescript
 const render = defineStage({

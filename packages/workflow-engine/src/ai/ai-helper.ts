@@ -22,6 +22,7 @@
 
 import type { ToolSet } from "ai";
 import type { z } from "zod";
+import { assertTimerMs } from "../kernel/helpers/host-support";
 import type { AICallLogger } from "../persistence";
 import { getBestProviderForModel } from "../utils/batch/model-mapping";
 import { AIBatchImpl } from "./batch-helper";
@@ -89,6 +90,9 @@ class AIHelperImpl implements AIHelper {
       throw new Error(
         "AIHelperImpl requires a logger. Create one using createPrismaAICallLogger(prisma).",
       );
+    }
+    if (options?.timeout?.perCallMs !== undefined) {
+      assertTimerMs("timeout.perCallMs", options.timeout.perCallMs);
     }
     this.topic = topic;
     this.aiCallLogger = aiCallLogger;

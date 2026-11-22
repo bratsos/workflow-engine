@@ -44,7 +44,6 @@ import {
   isDuplicateStepKeyError,
   isNonRetryableError,
   isStepControlFlowError,
-  parseStepDuration,
   type StepApi,
   type StepControlFlowError,
   type StepRunOptions,
@@ -52,6 +51,7 @@ import {
   StepTimeoutError,
 } from "../../core/steps";
 import { getBestProviderForModel } from "../../utils/batch/model-mapping";
+import { timerDurationMs } from "./host-support";
 
 const DEFAULT_CONCURRENCY = 10;
 const DEFAULT_BATCH_ABOVE = 20;
@@ -545,8 +545,17 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
       throw new Error("realtime.concurrency must be a positive integer");
     }
     const retries = spec.realtime?.retries ?? DEFAULT_REALTIME_RETRIES;
-    const retryDelayMs = parseStepDuration(spec.realtime?.retryDelayMs ?? 0);
-    const minDelayMs = parseStepDuration(spec.realtime?.minDelayMs ?? 0);
+    // 0 turns each delay off; anything else must fit a timer.
+    const retryDelayMs = timerDurationMs(
+      "realtime.retryDelayMs",
+      spec.realtime?.retryDelayMs ?? 0,
+      { allowZero: true },
+    );
+    const minDelayMs = timerDurationMs(
+      "realtime.minDelayMs",
+      spec.realtime?.minDelayMs ?? 0,
+      { allowZero: true },
+    );
     const wait =
       deps.delay ??
       ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));

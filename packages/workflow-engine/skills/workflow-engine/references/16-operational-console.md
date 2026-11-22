@@ -39,7 +39,7 @@ export interface WorkflowConsoleOptions {
   actions?: boolean;
   /** Mount path prefix if the handler cannot derive it from request.url. */
   basePath?: string;
-  /** UI poll interval in ms. Defaults to 5000. */
+  /** UI poll interval in ms. Defaults to 5000. 0 turns polling off; otherwise 1 to 2147483647 (else a RangeError at creation). */
   pollIntervalMs?: number;
   /** Fix the poll interval and hide the UI interval picker. */
   forcePollInterval?: boolean;
@@ -457,5 +457,5 @@ npx workflow-console --database-url postgres://localhost:5432/db --allow-direct-
 | `--port` | `<n>` | `7799` | Port to bind (1–65535) |
 | `--host` | `<addr>` | `127.0.0.1` | Loopback address (`127.0.0.1`, `localhost`, `::1`, `[::1]`) |
 | `--actions` | — | `false` | Enable write operations (requires `kernel` in `--config`) |
-| `--poll` | `<ms>` | `5000` | UI poll interval in milliseconds |
+| `--poll` | `<ms>` | `5000` | UI poll interval in milliseconds: `0` turns polling off, otherwise 1 to 2147483647 (anything else is refused with the option named) |
 | `--help`, `-h` | — | `false` | Display command help |
