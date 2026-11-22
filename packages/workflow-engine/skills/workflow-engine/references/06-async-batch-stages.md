@@ -185,8 +185,9 @@ async checkCompletion(suspendedState, ctx) {
   // A *thrown* error fails the stage and the run on this poll too: it is not
   // retried. Catch a transient status error (a 503) and return
   // { ready: false } to poll again. (A store or blob error while the engine
-  // persists your answer is not a throw of yours: the stage stays SUSPENDED
-  // and the next poll asks again.)
+  // persists your answer is not a throw of yours: it is retried like a replay
+  // that throws, within the job's attempt budget, and fails the run with the
+  // store's error only once that is spent.)
 
   // ===================
   // Completed

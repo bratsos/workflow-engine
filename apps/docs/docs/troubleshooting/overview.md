@@ -40,7 +40,7 @@ This guide covers common issues encountered when running **workflow-engine**, ho
   * Stuck runs are failed with the error code `STUCK_RUN_REAPED`. Their active child stages fail in the same transaction, with completion times and errors; terminal stages remain unchanged.
   * A run waiting on a `SUSPENDED` stage is not stuck: while that stage's `nextPollAt` is ahead, or came due less than one threshold ago, the run is left alone, so a long `ctx.step.sleep`, `waitFor` `every` or signal `keepalive` is safe.
   * In a parallel group the same rule covers the whole run: while one stage waits this way, the run is not reaped even if a sibling stage has stopped making progress. The reap follows once the waiting stage resumes, or once its `nextPollAt` is more than one threshold behind. A `PENDING` sibling whose job was lost is still re-enqueued in the meantime.
-  * A `PENDING` stage whose job was lost is re-enqueued instead of failing the run, and the sweep refreshes the run's activity, so the next sweep before a worker dequeues the recovered job does not reap it.
+  * A `PENDING` stage whose job was lost is re-enqueued instead of failing the run, and the sweep refreshes the run's activity, so the next sweep before a worker dequeues the recovered job does not reap it. If that refresh loses to another writer, or the post-commit enqueue fails, the stage stays without a job until the sweep one threshold later.
 * **Manual Recovery**:
   * If a run was completed but failed to transition, you can manually trigger a transition:
     ```typescript
