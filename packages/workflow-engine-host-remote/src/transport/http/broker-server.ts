@@ -235,7 +235,7 @@ function extractBlobParam(reqPath: string): string | null {
 /**
  * Thin node:http wrapper around handleBrokerRequest. The returned server can
  * be used as:
- *   server.listen(0)   // ephemeral port (tests)
+ *   server.listen(0, "127.0.0.1")   // ephemeral port (tests); bind the address the client dials
  *   server.listen(3000)
  */
 export function createBrokerHttpServer(deps: BrokerServerDeps): http.Server {
