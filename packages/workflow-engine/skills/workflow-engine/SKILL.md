@@ -604,9 +604,11 @@ const kernel = createKernel({
 await kernel.dispatch({ type: "run.create", idempotencyKey: "test", workflowId: "my-wf", input: {} });
 await kernel.dispatch({ type: "run.claimPending", workerId: "test-worker" });
 const job = await jobQueue.dequeue();
-await kernel.dispatch({ type: "job.execute", workflowRunId: job.workflowRunId, workflowId: job.workflowId, stageId: job.stageId, config: {} });
+await kernel.dispatch({ type: "job.execute", workflowRunId: job.workflowRunId, workflowId: job.workflowId, stageId: job.stageId, attempt: job.attempt, maxAttempts: job.maxAttempts, config: {} });
 await kernel.dispatch({ type: "run.transition", workflowRunId: job.workflowRunId });
 ```
+
+A custom host passes the job's `attempt` and `maxAttempts` to `job.execute`, as above (or calls `executeJobWithHeartbeat`, which does). With `attempt` the kernel knows the dispatch is a delivered job: a retryable failure with attempts left is a pending retry, and a redelivery that finds its stage already `FAILED` ends with the stored error without running a step. A dispatch without `attempt` is treated as an explicit rerun of a `FAILED` stage: it resets the stage's ledger and starts it again.
 
 Implementing a custom `WorkflowPersistence`/`JobQueue`/`AICallLogger`/`StepLedger` adapter? Validate it with the exported conformance suites (v0.11+) instead of hand-rolling parity tests — see [07-testing-patterns.md](references/07-testing-patterns.md#conformance-suites-for-custom-adapters-v011).
 

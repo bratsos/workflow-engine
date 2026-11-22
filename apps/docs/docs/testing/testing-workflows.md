@@ -222,6 +222,8 @@ await kernel.dispatch({ type: "outbox.flush" });
 expect(eventSink.events).toContainEqual(expect.objectContaining({ type: "workflow:completed" }));
 ```
 
+Pass the job's `attempt` and `maxAttempts`, as above, in any host you write yourself (or use `executeJobWithHeartbeat`). A `job.execute` without `attempt` is treated as an explicit rerun of a `FAILED` stage: it resets the stage's ledger and starts it again, where a delivered job whose stage already failed ends with the stored error without running a step.
+
 The in-memory ports are individually exported for tests that need only one of them:
 
 ```typescript

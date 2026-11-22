@@ -167,6 +167,10 @@ export default {
 ### Durable Reports
 To prevent duplicate execution when the orchestrator restarts, workers write their results to a deterministic key in object storage *before* calling the HTTP `/report` API. On restart, the proxy stage reads this object storage reference and recovers the completed state automatically.
 
+### Custom orchestrators
+
+An orchestrator you write yourself (the drive loops in `examples/end-to-end.ts` and `examples/cross-process/orchestrator.ts`) passes the dequeued job's `attempt` and `maxAttempts` to `job.execute`, or calls `executeJobWithHeartbeat`, which does. A `job.execute` without `attempt` is treated as an explicit rerun of a `FAILED` stage: it resets the stage's ledger and starts it again, so a job delivered again after its stage failed would run its completed steps a second time.
+
 ### Known limits of the blocking `createRemoteExecutor`
 The `ActivityExecutor` route (not the proxy stage) has these limits:
 * **One task id for every attempt.** The executor submits each stage attempt under the stage record id. While the broker still holds the earlier attempt's task, a retry of the same stage record (a job retry, a redrive that reopens the record in place) gets that task's report back instead of running the worker again. The broker keeps a reported task until it restarts, so every later delivery gets the first report back and the worker never runs again: a stage that fails once fails every retry, whatever its `maxAttempts`. Route a stage whose retries matter through the proxy stage.

@@ -659,10 +659,10 @@ describe("I want a cancelled or restarted stage never shown as one attempt with 
     expect(again!.steps).toEqual([]);
   });
 
-  // G7: a cancelled execution whose body keeps running records its outcome
-  // after a redrive started the stage again. The events carry which
-  // `job.execute` wrote them, so the page does not show that outcome on the
-  // rerun, in any of the three orders.
+  // G7: a cancelled execution whose body keeps running settles after a
+  // redrive started the stage again. Its stage write is fenced on the version
+  // it claimed, so the overtaken execution commits nothing: the page keeps
+  // showing the rerun alone, in any of the three orders.
   for (const variant of [
     "the old body completes after the rerun completed",
     "the old body fails after the rerun completed",
@@ -739,13 +739,19 @@ describe("I want a cancelled or restarted stage never shown as one attempt with 
       }
       release();
       await firstDone.catch(() => {});
-      // The old execution's outcome is recorded now: the page does not say
-      // which attempt it ended.
-      expect(await page()).toBe("unavailable:unproven-boundary");
+      // The old execution's late outcome was discarded: nothing of it is
+      // recorded, so the page shows what it showed before.
+      expect(await page()).toEqual([
+        ["initial", "cancelled"],
+        ["rerun", variant.includes("still running") ? "running" : "completed"],
+      ]);
       finishRerun();
       await secondDone;
       await drain(h, runId, 6);
-      expect(await page()).toBe("unavailable:unproven-boundary");
+      expect(await page()).toEqual([
+        ["initial", "cancelled"],
+        ["rerun", "completed"],
+      ]);
     });
   }
 });

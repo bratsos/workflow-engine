@@ -58,6 +58,7 @@ import {
 import {
   applyStepLedgerReset,
   namesExternalEffect,
+  outputKeys,
   planStepLedgerReset,
   prepareExecutionGroup,
   type StepLedgerResetPlan,
@@ -87,18 +88,6 @@ function toAbandoned(rows: readonly StepRecord[]): AbandonedStep[] {
     status: row.status,
     externalKey: row.externalKey ?? null,
   }));
-}
-
-/** The blob keys a stage record's outputData points at. */
-function outputKeys(stage: WorkflowStageRecord): string[] {
-  const data = stage.outputData as {
-    _artifactKey?: unknown;
-    _artifactKeys?: Record<string, unknown>;
-  } | null;
-  return [
-    data?._artifactKey,
-    ...Object.values(data?._artifactKeys ?? {}),
-  ].filter((key): key is string => typeof key === "string");
 }
 
 /** Annotation key under which a superseded stage attempt is archived. */
@@ -366,15 +355,14 @@ export async function handleRunRedrive(
   // Blob deletion is deferred to _postCommit: blob deletes are not part of
   // the database transaction and could not be rolled back with it. Only a
   // deleted record's blobs go: a reopened record's kept steps may hold
-  // references into its own storage, and the new attempt overwrites its
-  // output and artifacts by key anyway.
+  // references into its own storage, and the output and artifacts of its
+  // earlier attempts stay, under their own keys, for the archive's pointer.
   //
   // Keys an outputData points at are kept: a deleted record's, so a caller
   // whose own transaction rolls this redrive back finds its restored
   // pointers intact, and a current record's, so a new attempt that
   // completed before the cleanup (a caller-owned job.execute) keeps its
-  // output. Kept keys are overwritten by the new attempt or go with
-  // run.purge. Listing waits for the commit: an unbound blob store read
+  // output. Kept keys go with run.purge. Listing waits for the commit: an unbound blob store read
   // inside the transaction can wait on the transaction's own lock.
   const deletedOutputKeys = stagesToDelete.flatMap(outputKeys);
   const blobPrefixesToDelete = stagesToDelete.map(

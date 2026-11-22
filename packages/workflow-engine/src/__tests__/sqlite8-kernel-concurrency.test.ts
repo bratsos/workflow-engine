@@ -237,7 +237,9 @@ describe.skipIf(!realDatabase)(
             where: { status: "completed" },
           }),
         ).toBe(BURST);
-        expect(await db.client.workflowBlob.count()).toBe(BURST);
+        // Each output under its attempt's own key, plus the copy at the
+        // stage's fixed key.
+        expect(await db.client.workflowBlob.count()).toBe(2 * BURST);
         expect(await db.client.workflowLog.count()).toBe(BURST);
       },
       120_000,
