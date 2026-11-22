@@ -43,7 +43,8 @@ export function createCallTimeout(
       ? undefined
       : new AbortController();
   const timeoutSignal =
-    fallbackController?.signal ?? AbortSignal.timeout(timeoutMs);
+    // AbortSignal.timeout throws on a fractional delay; a timer rounds up anyway.
+    fallbackController?.signal ?? AbortSignal.timeout(Math.ceil(timeoutMs));
 
   if (fallbackController) {
     timer = setTimeout(() => {

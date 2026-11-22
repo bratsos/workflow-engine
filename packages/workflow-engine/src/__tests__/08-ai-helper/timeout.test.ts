@@ -55,6 +55,23 @@ describe("AI call timeouts", () => {
     });
   });
 
+  it("times out a fractional timeoutMs instead of throwing a range error", async () => {
+    vi.useFakeTimers();
+    const resolver: ProviderResolver = () => neverGeneratingModel();
+    const ai = createAIHelper(
+      "timeout.fraction",
+      new InMemoryAICallLogger(),
+      undefined,
+      resolver,
+    );
+
+    const pending = ai.generateText(MODEL, "never", { timeoutMs: 1.5 });
+    const assertion =
+      expect(pending).rejects.toBeInstanceOf(AICallTimeoutError);
+    await vi.advanceTimersByTimeAsync(2);
+    await assertion;
+  });
+
   it("applies the deadline to the whole stream", async () => {
     vi.useFakeTimers();
     const aiLogger = new InMemoryAICallLogger();

@@ -20,9 +20,8 @@ import { realpathSync } from "node:fs";
 import { createServer } from "node:http";
 import { resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { assertTimerMs } from "@bratsos/workflow-engine/kernel";
 import type { ConsoleKernel } from "./actions";
-import { createWorkflowConsole } from "./handler";
+import { assertPollMs, createWorkflowConsole } from "./handler";
 import { toNodeHandler } from "./node";
 import type { ConsoleReadPort } from "./read-port";
 
@@ -130,9 +129,7 @@ export function parseArgs(argv: string[]): CliOptions {
         break;
       case "--poll": {
         const poll = Number(next());
-        options.pollIntervalMs = assertTimerMs("--poll", poll, {
-          allowZero: true,
-        });
+        options.pollIntervalMs = assertPollMs("--poll", poll);
         break;
       }
       case "--help":
