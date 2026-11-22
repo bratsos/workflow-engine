@@ -1,5 +1,39 @@
 # @bratsos/workflow-engine-host-remote
 
+## 0.2.3-alpha.8
+
+### Patch Changes
+
+- 0e3b18d: A stage that throws a `NonRetryableError` on a remote worker (or a step whose `retryIf` declines) is not retried. The worker adds `retryable: false` to the failed outcome, decided by the `NonRetryableError` brand alone, and the `RemoteExecutor` passes it to `job.execute`; a stage input that fails validation with a `NonRetryableError` in the `RemoteExecutor` is handled the same way. The reported text and every other error are unchanged. The field is optional: a worker that does not send it behaves as before, and a broker that does not know it drops it. A `defineRemoteStage` proxy fails the run on a failed outcome with an empty message, such as a worker throwing `new NonRetryableError()`, with the text `remote activity failed`; it used to leave the stage suspended.
+- 54da7b5: `createActivityWorker` and `createRemoteExecutor` check every option that reaches a timer when they are called, with the rule and the error the Node and serverless hosts use (`assertTimerMs` from `@bratsos/workflow-engine/kernel`): the worker's `heartbeatMs` (a `setInterval`), `idleDelayMs` and `maxBackoffMs` (the idle wait and the failure backoff), and the executor's `pollEveryMs` (the pause between two polls) must be a number from 1 to 2147483647. `Infinity`, `NaN`, zero, a negative number or a larger value now throws a `RangeError` naming the option; before, a timer turned it into 1 ms (a heartbeat every millisecond, a poll loop with no pause, a backoff that is no backoff). A numeric string also throws now: an environment variable passed through unparsed (`heartbeatMs: process.env.HEARTBEAT_MS`) worked before because a timer coerces `"20"`; pass `Number(process.env.HEARTBEAT_MS)`. `pollIntervalMs` and `maxWaitMs` are not timers (a hint and a deadline sent to the broker) and are unchanged.
+- Updated dependencies [8f61a23]
+- Updated dependencies [79c2bdc]
+- Updated dependencies [54da7b5]
+- Updated dependencies [e44baf8]
+- Updated dependencies [8ecf45e]
+- Updated dependencies [0e3b18d]
+- Updated dependencies [54da7b5]
+- Updated dependencies [54da7b5]
+- Updated dependencies [54da7b5]
+- Updated dependencies [d10f610]
+- Updated dependencies [0b06546]
+- Updated dependencies [54da7b5]
+- Updated dependencies [54da7b5]
+- Updated dependencies [01f6566]
+- Updated dependencies [01f6566]
+- Updated dependencies [01f6566]
+- Updated dependencies [f224059]
+- Updated dependencies [01f6566]
+- Updated dependencies [01f6566]
+- Updated dependencies [01f6566]
+- Updated dependencies [54da7b5]
+- Updated dependencies [54da7b5]
+- Updated dependencies [ba13b3c]
+- Updated dependencies [54da7b5]
+- Updated dependencies [87654f3]
+- Updated dependencies [805fd81]
+  - @bratsos/workflow-engine@1.0.0-alpha.21
+
 ## 0.2.3-alpha.7
 
 ### Patch Changes
