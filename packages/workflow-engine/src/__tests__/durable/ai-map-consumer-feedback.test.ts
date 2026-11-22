@@ -25,6 +25,19 @@ registerModels({
   },
 });
 
+const BATCH_MODEL = "ai-map-feedback-batch-model";
+
+registerModels({
+  [BATCH_MODEL]: {
+    id: "openai/gpt-4o-mini",
+    name: "AI Map Feedback Batch Model",
+    inputCostPerMillion: 1,
+    outputCostPerMillion: 2,
+    provider: "openrouter",
+    supportsAsyncBatch: true,
+  },
+});
+
 class SubscriptionLimitError extends Error {
   constructor() {
     super("subscription limit reached");
@@ -110,6 +123,30 @@ describe("ctx.step.ai.map — consumer feedback surfaces", () => {
       error: "subscription limit reached",
       errorName: "SubscriptionLimitError",
     });
+  });
+
+  it("keeps routing realtime when choosing a batch provider throws a decoded error with no text", async () => {
+    const batch = {};
+    Object.defineProperty(batch, "provider", {
+      get() {
+        throw { name: "ProviderUnavailable", message: "" };
+      },
+    });
+    const workflow = mapWorkflow("map-provider-error", {
+      model: BATCH_MODEL,
+      policy: "auto",
+      auto: { batchAbove: 1 },
+      batch,
+    });
+    const harness = createTestHarness({ workflows: [workflow] });
+    harness.mockAi.setTextResponse("process", { text: "processed" });
+
+    const result = await harness.run("map-provider-error", { items: ["a"] });
+
+    // Main's text for the error is not empty, so the map stays realtime.
+    expect(result.status).toBe("COMPLETED");
+    expect(results(result.output)[0]?.status).toBe("succeeded");
+    expect(harness.mockAi.getCalls()).toHaveLength(1);
   });
 
   it("retries a thrown item call in-process and completes in one execution", async () => {

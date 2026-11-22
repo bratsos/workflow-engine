@@ -52,7 +52,7 @@ import {
   StepTimeoutError,
 } from "../../core/steps";
 import { getBestProviderForModel } from "../../utils/batch/model-mapping";
-import { describeThrown } from "./error-message";
+import { describeThrown, toErrorMessage } from "./error-message";
 
 const DEFAULT_CONCURRENCY = 10;
 const DEFAULT_BATCH_ABOVE = 20;
@@ -231,9 +231,13 @@ function pickTranscribeResult(result: AITranscribeResult): AITranscribeResult {
   };
 }
 
-// A decoded `{ name, message }` keeps both, like a thrown Error.
-const errorMessage = (error: unknown) => describeThrown(error).message;
-const errorName = (error: unknown) => describeThrown(error).name;
+/** A failed item's diagnostics, read once: a decoded `{ name, message }` keeps both. */
+function itemFailure(error: unknown): { error: string; errorName?: string } {
+  const { message, name } = describeThrown(error);
+  return name === undefined
+    ? { error: message }
+    : { error: message, errorName: name };
+}
 
 function formatIssues(error: z.ZodError): string {
   return error.issues
@@ -622,7 +626,8 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
         if (isStepControlFlowError(error)) throw error;
         // The call said a retry cannot succeed: no retry, no repair.
         if (isNonRetryableError(error)) {
-          return failed(errorMessage(error), errorName(error));
+          const diagnosed = itemFailure(error);
+          return failed(diagnosed.error, diagnosed.errorName);
         }
         const failure = asGenerationFailure(error);
         if (failure) {
@@ -630,7 +635,8 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
           return "repair";
         }
         if (retriesLeft <= 0) {
-          return failed(errorMessage(error), errorName(error));
+          const diagnosed = itemFailure(error);
+          return failed(diagnosed.error, diagnosed.errorName);
         }
         retriesLeft--;
         await deps.noteAttempt(stepId);
@@ -845,13 +851,11 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
           if (stored && stored.status === "failed" && stored.id === entry.id) {
             return stored;
           }
-          const name = errorName(error);
           const verdict: AiMapResult<TOut> = {
             id: entry.id,
             index: entry.index,
             status: "failed",
-            error: errorMessage(error),
-            ...(name !== undefined ? { errorName: name } : {}),
+            ...itemFailure(error),
             attempts: (prior?.attempts ?? 0) + 1,
             inputTokens: prior?.inputTokens ?? 0,
             outputTokens: prior?.outputTokens ?? 0,
@@ -889,7 +893,8 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
         }
       }
     } catch (error) {
-      batchBlocker = errorMessage(error);
+      // Main's text, read once: routing depends on whether it is empty.
+      batchBlocker = toErrorMessage(error);
     }
     if (!batchBlocker && entries.some((e) => typeof e.prompt !== "string")) {
       batchBlocker = "batch requests require string prompts";

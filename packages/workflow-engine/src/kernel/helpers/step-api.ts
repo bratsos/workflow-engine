@@ -146,18 +146,20 @@ function rowText(error: unknown): string {
 }
 
 /**
- * Keep a native Promise a predicate returned from rejecting unhandled. The
- * application's value is never changed or wrapped, and no other thenable is
- * touched: a Promise subclass or object whose `constructor`, species or
- * `then` throws, or a non-Promise thenable, can still reject unhandled.
+ * Keep a native Promise a predicate returned from rejecting unhandled, from
+ * this realm or another (the `Object.prototype.toString` tag finds both).
+ * The application's value is never changed or wrapped, and no other
+ * thenable is touched: a Promise whose `constructor` or species getter
+ * throws, or a non-Promise thenable, can still reject unhandled.
  */
 function settleQuietly(value: object): void {
   try {
-    if (value instanceof Promise) {
+    if (Object.prototype.toString.call(value) === "[object Promise]") {
       Promise.prototype.then.call(value, undefined, () => {});
     }
   } catch {
-    // See above: nothing more is attempted on the application's value.
+    // Not a real Promise after all, or one that refuses a handler: nothing
+    // more is attempted on the application's value.
   }
 }
 

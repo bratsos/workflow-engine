@@ -125,20 +125,7 @@ export async function handleJobExecute(
       _events: [],
     };
   }
-  // A numbered delivery within its budget, past the first, that meets a
-  // FAILED stage is the same job delivered again after its acknowledgement
-  // was lost: only a terminal verdict FAILs a stage with attempts left. It
-  // is answered as the retry main would have run: completed steps stay
-  // completed, failed ones re-open (below). Any other execution of a FAILED
-  // stage (a delivery past its budget, an unnumbered dispatch) starts it
-  // fresh, as before.
-  const redelivered =
-    existingStage?.status === "FAILED" &&
-    existingStage.errorMessage != null &&
-    command.attempt !== undefined &&
-    command.attempt > 1 &&
-    command.attempt <= (command.maxAttempts ?? HOST_DEFAULTS.maxAttempts);
-  if (existingStage?.status === "FAILED" && !redelivered) {
+  if (existingStage?.status === "FAILED") {
     await resetStageStepsForFreshAttempt(workflowRunId, existingStage.id, deps);
   }
 
@@ -149,11 +136,10 @@ export async function handleJobExecute(
   // of replaying the stored failure. A replay of the same attempt (a poll
   // of a suspended stage) never comes through here.
   const isRetryAttempt =
-    redelivered ||
-    (existingStage?.status === "PENDING" &&
-      existingStage.errorMessage != null &&
-      command.attempt !== undefined &&
-      command.attempt > 1);
+    existingStage?.status === "PENDING" &&
+    existingStage.errorMessage != null &&
+    command.attempt !== undefined &&
+    command.attempt > 1;
   if (isRetryAttempt && existingStage && deps.stepLedger) {
     await reopenFailedSteps(existingStage.id, deps);
   }

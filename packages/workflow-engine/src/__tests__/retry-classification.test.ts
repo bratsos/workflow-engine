@@ -8,6 +8,7 @@
  * same name and brand, whether `job.execute` meets it directly or a poll
  * meets it after a round trip through the step ledger.
  */
+import { runInNewContext } from "node:vm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
 import { z as zodMini } from "zod/mini";
@@ -22,6 +23,7 @@ import {
   StepTimeoutError,
 } from "../core/steps.js";
 import { type Workflow, WorkflowBuilder } from "../core/workflow.js";
+import { executeJobWithHeartbeat } from "../kernel/helpers/host-support.js";
 import { createKernel, type KernelConfig } from "../kernel/kernel.js";
 import type { JobTransport, StepLedger } from "../kernel/ports.js";
 import {
@@ -834,41 +836,170 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
       });
     });
 
-    describe("a job delivered again after a terminal failure", () => {
-      it.each([
-        ["a zod/v3 error", zodV3Parse],
-        ["a Zod error", zodParse],
+    /**
+     * A terminal verdict ends the job exactly as main ends an exhausted
+     * final attempt: every later delivery of the job meets the same FAILED
+     * stage and does what main does there. Each case runs the verdict and
+     * main's exhausted case (an ordinary error, `maxAttempts` equal to the
+     * attempt the verdict fired on) through the same deliveries.
+     */
+    describe("a job delivered again after a terminal verdict", () => {
+      const verdicts: Array<[string, () => never | void]> = [
+        ["a zod/v3 error", () => void zodV3Parse()],
         [
           "a NonRetryableError",
           () => {
             throw new NonRetryableError("declined");
           },
         ],
-      ])("answers a completed step from the ledger after %s", async (_case, fail) => {
-        let receipts = 0;
+      ];
+
+      /** A stage that completes a receipt step, then fails. */
+      async function receiptRun(id: string, fail: () => void) {
+        const counts = { receipts: 0 };
         const stage = defineStage({
           id: "s",
           name: "s",
           schemas: { input: z.object({}), output: out, config: z.object({}) },
           async execute(ctx) {
-            await ctx.step.run("receipt", async () => ++receipts);
+            await ctx.step.run("receipt", async () => ++counts.receipts);
             fail();
             return { output: { ok: true } };
           },
         });
-        const run = await start(env, workflowOf("redeliver-done", stage));
-        expect(await run.execute(1)).toMatchObject({
-          outcome: "failed",
-          willRetry: false,
-        });
-        // The acknowledgement was lost: the reaped job arrives as attempt 2.
-        const again = await run.execute(2);
-        expect(again).toMatchObject({ outcome: "failed", willRetry: false });
-        expect((again as { error: string }).error).not.toMatch(
-          /StepNotReplaySafeError/,
+        return { ...(await start(env, workflowOf(id, stage))), counts };
+      }
+
+      const exhausted = () => {
+        throw new QuotaError();
+      };
+
+      it.each(
+        verdicts,
+      )("matches main's exhausted case past the budget after %s (lease lost twice)", async (_case, fail) => {
+        const verdict = await receiptRun("past-budget-v", fail);
+        const main = await receiptRun("past-budget-m", exhausted);
+        // Delivery 1, then the queue's attempt 3 after two lost leases.
+        const first = [await verdict.execute(1, 2), await main.execute(1, 1)];
+        expect(first[0]).toMatchObject({ outcome: "failed", willRetry: false });
+        expect(first[1]).toMatchObject({ outcome: "failed", willRetry: false });
+        const again = [await verdict.execute(3, 2), await main.execute(3, 1)];
+        expect(again[0]).toMatchObject({ outcome: "failed", willRetry: false });
+        expect(again[1]).toMatchObject({ outcome: "failed", willRetry: false });
+        expect((await verdict.stage()).status).toBe(
+          (await main.stage()).status,
         );
-        expect(receipts).toBe(1);
+        // Main's own exhausted case runs the completed step again here.
+        expect(verdict.counts.receipts).toBe(main.counts.receipts);
+        expect(main.counts.receipts).toBe(2);
       });
+
+      it.each(
+        verdicts,
+      )("matches main's exhausted case within the budget after %s (lost acknowledgement, any host)", async (_case, fail) => {
+        const verdict = await receiptRun("in-budget-v", fail);
+        const main = await receiptRun("in-budget-m", exhausted);
+        await verdict.execute(1, 3);
+        await main.execute(1, 1);
+        // A main host takes the same FAILED stage the same way.
+        const again = [await verdict.execute(2, 3), await main.execute(2, 1)];
+        expect(again[0]).toMatchObject({ outcome: "failed", willRetry: false });
+        expect(again[1]).toMatchObject({ outcome: "failed", willRetry: false });
+        expect(verdict.counts.receipts).toBe(main.counts.receipts);
+        expect(main.counts.receipts).toBe(2);
+      });
+
+      it("settles through the host as an exhausted attempt, and a redelivery runs as main's", async () => {
+        const verdict = await receiptRun("host-ack", () => void zodV3Parse());
+        const job = (await env.jobTransport.dequeue())!;
+        const message = {
+          jobId: job.jobId,
+          workflowRunId: job.workflowRunId,
+          workflowId: job.workflowId,
+          stageId: job.stageId,
+          attempt: job.attempt,
+          maxAttempts: job.maxAttempts,
+          payload: job.payload,
+        };
+        const transport = env.jobTransport;
+        const fail = transport.fail.bind(transport);
+        transport.fail = async () => {
+          throw new Error("acknowledgement lost");
+        };
+        try {
+          await expect(
+            executeJobWithHeartbeat(verdict.kernel, {
+              jobTransport: transport,
+              job: message,
+            }),
+          ).rejects.toThrow("acknowledgement lost");
+        } finally {
+          transport.fail = fail;
+        }
+        expect(await verdict.stage()).toMatchObject({ status: "FAILED" });
+        await transport.releaseStaleJobs(-60_000);
+        const redelivered = (await transport.dequeue())!;
+        expect(redelivered.attempt).toBe(2);
+        await executeJobWithHeartbeat(verdict.kernel, {
+          jobTransport: transport,
+          job: { ...message, attempt: redelivered.attempt },
+        });
+        // Main's exhausted case: the FAILED stage starts fresh (see above).
+        expect(verdict.counts.receipts).toBe(2);
+      });
+    });
+
+    it("takes a new signal after an ordinary exhausted attempt, as main does", async () => {
+      let failing = true;
+      let receipts = 0;
+      const stage = defineStage({
+        id: "s",
+        name: "s",
+        schemas: {
+          input: z.object({}),
+          output: z.object({ value: z.string() }),
+          config: z.object({}),
+        },
+        async execute(ctx) {
+          const value = await ctx.step.waitForSignal("approval", {
+            timeout: "10m",
+          });
+          await ctx.step.run("receipt", async () => ++receipts);
+          if (failing) throw new QuotaError();
+          return { output: { value: String(value) } };
+        },
+      });
+      const run = await start(
+        env,
+        new WorkflowBuilder(
+          "signal-reset",
+          "signal-reset",
+          "",
+          z.object({}),
+          z.object({ value: z.string() }),
+        )
+          .pipe(stage)
+          .build(),
+      );
+      const signal = (payload: unknown) =>
+        run.kernel.dispatch({
+          type: "step.signal",
+          workflowRunId: run.workflowRunId,
+          stageId: "s",
+          stepId: "approval",
+          payload,
+        });
+      await signal("first");
+      expect(await run.execute(1, 1)).toMatchObject({ willRetry: false });
+      failing = false;
+      expect(await run.execute(2, 2)).toMatchObject({ outcome: "suspended" });
+      expect(await signal("second")).toMatchObject({
+        signalled: true,
+        alreadyCompleted: false,
+      });
+      await run.poll();
+      expect(await run.stage()).toMatchObject({ status: "COMPLETED" });
+      expect(receipts).toBe(2);
     });
 
     describe("the text a failed step row stores", () => {
@@ -899,6 +1030,22 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
         expect(await run.stage()).toMatchObject({ status: "FAILED" });
         expect(body.calls).toBe(1);
       });
+    });
+
+    it("reads a diagnostic once, so a getter that changes cannot break the job result", async () => {
+      let reads = 0;
+      const body = failing(1, () => {
+        const decoded = {};
+        Object.defineProperty(decoded, "message", {
+          get: () => (++reads === 1 ? "busy" : undefined),
+        });
+        return decoded;
+      });
+      const run = await start(env, workflowOf("read-once", directStage(body)));
+      const result = await run.execute(1);
+      expect(result).toMatchObject({ outcome: "failed", willRetry: true });
+      expect(typeof (result as { error: unknown }).error).toBe("string");
+      expect(await run.execute(2)).toMatchObject({ outcome: "completed" });
     });
 
     describe("a branded failure with an unreadable diagnostic", () => {
@@ -1000,6 +1147,10 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
       });
 
       it.each([
+        [
+          "a rejected native Promise from another realm",
+          () => runInNewContext("Promise.reject(new Error('no'))"),
+        ],
         [
           "a rejected Promise whose then getter throws",
           () => {

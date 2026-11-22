@@ -22,20 +22,30 @@ export function describeThrown(error: unknown): {
   name?: string;
   message: string;
 } {
-  let message = toErrorMessage(error);
+  let message: string | undefined;
   let name: string | undefined;
   try {
-    if (typeof error === "object" && error !== null) {
-      const fields = error as { name?: unknown; message?: unknown };
-      if (!(error instanceof Error) && typeof fields.message === "string") {
-        message = fields.message;
-      }
-      if (typeof fields.name === "string" && fields.name !== "") {
-        name = fields.name;
-      }
+    // Each property is read once, into a local: a getter that answers
+    // differently on a second read cannot change what was checked.
+    if (
+      typeof error === "object" &&
+      error !== null &&
+      !(error instanceof Error)
+    ) {
+      const read = (error as { message?: unknown }).message;
+      if (typeof read === "string") message = read;
     }
   } catch {
-    // A throwing getter: keep what was read.
+    // A throwing getter: fall back to the plain text below.
+  }
+  if (message === undefined) message = toErrorMessage(error);
+  try {
+    if (typeof error === "object" && error !== null) {
+      const read = (error as { name?: unknown }).name;
+      if (typeof read === "string" && read !== "") name = read;
+    }
+  } catch {
+    // A throwing getter: no name.
   }
   return name === undefined ? { message } : { name, message };
 }
