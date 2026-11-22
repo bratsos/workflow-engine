@@ -545,6 +545,54 @@ describe(`a stale attempt on ${realDatabase ? (sqlite ? "SQLite" : "Postgres") :
     );
   });
 
+  it("logs a failed fixed-key copy and copies again when a delivery finds the stage COMPLETED", async () => {
+    let failCopy = true;
+    const warnings: string[] = [];
+    const { blobStore, persistence } = ports;
+    ports = {
+      ...ports,
+      blobStore: override(blobStore, {
+        put: async (key: string, value: unknown) => {
+          if (failCopy && key.endsWith("/s/output.json")) {
+            failCopy = false;
+            throw new Error("blob store unavailable");
+          }
+          return blobStore.put(key, value);
+        },
+      }),
+      persistence: override(persistence, {
+        createLog: async (log: Parameters<typeof persistence.createLog>[0]) => {
+          if (log.level === "WARN") warnings.push(log.message);
+          return persistence.createLog(log);
+        },
+      }),
+    };
+    const t = await pipeline(() => ({ output: { who: "A" } }));
+    t.release();
+    await expect(t.stale).resolves.toMatchObject({ outcome: "completed" });
+    const fixed = `workflow-v2/attempt-owner/${t.workflowRunId}/s/output.json`;
+    expect(warnings).toEqual([
+      expect.stringContaining(`Copying stage s's output to`),
+    ]);
+    await expect(blobStore.get(fixed)).rejects.toThrow();
+
+    // A redelivery of the job finds the stage COMPLETED and repairs the copy.
+    await expect(
+      t.kernel.dispatch({
+        type: "job.execute",
+        idempotencyKey: crypto.randomUUID(),
+        workflowRunId: t.workflowRunId,
+        workflowId: "attempt-owner",
+        stageId: "s",
+        config: {},
+      }),
+    ).resolves.toMatchObject({ outcome: "completed" });
+    expect(await blobStore.get(fixed)).toEqual({ who: "A" });
+    await t.drain();
+    expect(t.entries()).toBe(1);
+    expect(t.tFixed).toEqual([{ output: { who: "A" }, raw: "missing" }]);
+  });
+
   it("moves the run on when a lost lease's delivery stalled before its start and took the stage over last", async () => {
     const inRead = gate();
     const holdRead = gate();

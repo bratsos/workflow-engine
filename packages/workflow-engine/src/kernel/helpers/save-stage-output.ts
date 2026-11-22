@@ -44,10 +44,9 @@ export async function saveStageOutput(
  * `<stage>/artifacts/<name>.json`), for code that reads them there. Only a
  * committed attempt calls this, never one that lost its fence, and a
  * delivery that finds the stage COMPLETED copies the pointer's output again.
- * The copy is skipped unless the stage's pointer still names `pointerKey`
- * when re-read, so an older winner's late copy rarely lands over a newer
- * one; the check is not atomic with the puts, so the fixed keys can briefly
- * lag behind or miss the committed output. Best-effort: the pointer in
+ * Unfenced: an older winner's late copy can land after a newer winner's,
+ * so the fixed keys can briefly lag, hold an older winner's bytes or miss
+ * the committed output. Best-effort: the pointer in
  * `outputData` (`workflowContext`) is authoritative, and a failed copy is
  * logged on the run (WARN).
  */
@@ -65,13 +64,6 @@ export async function publishStageKeys(
   // An earlier release's pointer is the fixed key itself: nothing to copy.
   if (pointerKey === `${base}/output.json`) return;
   try {
-    const current = await deps.persistence.getStage(runId, stageId);
-    if (
-      (current?.outputData as { _artifactKey?: unknown } | null)
-        ?._artifactKey !== pointerKey
-    ) {
-      return;
-    }
     await deps.blobStore.put(`${base}/output.json`, output);
     for (const [name, artifact] of Object.entries(artifacts ?? {})) {
       await deps.blobStore.put(
