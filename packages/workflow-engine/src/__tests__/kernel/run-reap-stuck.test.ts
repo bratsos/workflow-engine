@@ -2,7 +2,14 @@ import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { defineStage } from "../../core/stage-factory.js";
 import { WorkflowBuilder } from "../../core/workflow.js";
+import { createKernel } from "../../kernel/kernel.js";
 import { FakeClock } from "../../kernel/testing/fake-clock.js";
+import {
+  CollectingEventSink,
+  InMemoryBlobStore,
+} from "../../kernel/testing/index.js";
+import { InMemoryJobQueue } from "../../testing/in-memory-job-queue.js";
+import { InMemoryWorkflowPersistence } from "../../testing/in-memory-persistence.js";
 import { InMemoryStepLedger } from "../../testing/in-memory-step-ledger.js";
 import { createTestKernel } from "../utils/index.js";
 
@@ -305,6 +312,48 @@ describe("kernel: run.reapStuck", () => {
 
     expect(enqueuedInTransaction).toEqual([false]);
     expect(jobTransport.getAllJobs()).toHaveLength(1);
+  });
+
+  it("does not reap a run the previous sweep healed before its job is dequeued", async () => {
+    // Persistence and queue stamp the kernel's clock, so the heal's refresh of
+    // the run's activity is visible to the next sweep's stuck-run query.
+    const workflow = createSimpleWorkflow();
+    const clock = new FakeClock();
+    const now = () => clock.now();
+    const persistence = new InMemoryWorkflowPersistence({ now });
+    const jobQueue = new InMemoryJobQueue({ workerId: "w1", now });
+    const kernel = createKernel({
+      persistence,
+      jobTransport: jobQueue,
+      blobStore: new InMemoryBlobStore(),
+      eventSink: new CollectingEventSink(),
+      clock,
+      registry: {
+        getWorkflow: () => workflow,
+        listWorkflows: () => [workflow],
+      },
+    });
+    const { workflowRunId } = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "key-heal-twice",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    });
+    await kernel.dispatch({ type: "run.claimPending", workerId: "w1" });
+    // The claim committed; the process died before its enqueue ran.
+    await jobQueue.deleteByRunAndStages(workflowRunId, ["stage-1"]);
+    clock.advance(10 * 60 * 1000);
+
+    const sweep = {
+      type: "run.reapStuck",
+      stuckThresholdMs: 5 * 60 * 1000,
+    } as const;
+    await expect(kernel.dispatch(sweep)).resolves.toMatchObject({ failed: 0 });
+    // Another sweep before any worker dequeues the recovered job.
+    await expect(kernel.dispatch(sweep)).resolves.toMatchObject({ failed: 0 });
+
+    expect((await persistence.getRun(workflowRunId))!.status).toBe("RUNNING");
+    expect(jobQueue.getAllJobs().map((job) => job.status)).toEqual(["PENDING"]);
   });
 
   it("leaves a run pinned to a version this build does not serve", async () => {
