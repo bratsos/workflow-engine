@@ -350,15 +350,22 @@ describe.skipIf(!sqlite && !databaseUrl)(
       });
     }
 
-    async function record(run: () => Promise<unknown>): Promise<Statement[]> {
-      statements.length = 0;
-      await run();
-      // Prisma 6 delivers its query events after the call has resolved: wait
-      // until no more arrive.
+    /** Waits until no query event has arrived for `gapMs`. */
+    async function quiet(gapMs: number) {
       for (let seen = -1; seen !== statements.length; ) {
         seen = statements.length;
-        await new Promise((resolve) => setTimeout(resolve, 25));
+        await new Promise((resolve) => setTimeout(resolve, gapMs));
       }
+    }
+
+    async function record(run: () => Promise<unknown>): Promise<Statement[]> {
+      // Prisma 6 delivers its query events after the call has resolved, later
+      // still on a loaded machine: let the previous operation's events land
+      // before clearing, so none of them is counted as this operation's.
+      await quiet(100);
+      statements.length = 0;
+      await run();
+      await quiet(100);
       // Only what touches an engine table: a driver also logs statements of its
       // own (the Prisma 6 engine's connection check is `SELECT 1`) and the
       // client's `BEGIN` and `COMMIT`, which are no query of the engine's.
