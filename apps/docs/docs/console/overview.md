@@ -163,10 +163,11 @@ The attempt boundaries are:
   event: that attempt shows *Cancelled* from the stage's record and says no
   event records when it ended.
 - `workflow:started` is written by the first claim and by every redrive
-  (`run.redrive`, `run.rerunFrom`). A run's first start can be two of them:
-  `run.transition` dispatched for a pending run before `run.claimPending`
-  writes one, starts the first group's jobs and leaves the run `PENDING`, and
-  the claim writes the second. The page reads that pair as the run's one first
+  (`run.redrive`, `run.rerunFrom`). A run's first start is one of them, except
+  on a run that an earlier release started with `run.transition` dispatched for
+  a pending run before `run.claimPending`: that transition wrote one, started
+  the first group's jobs and left the run `PENDING`, and the claim wrote the
+  second. The page reads that pair as the run's one first
   start, wherever a job of the first group ran between them. By design it
   cannot tell that pair from one claim's start followed by one extra
   `workflow:started` (which the engine never writes, but SQL could) while
@@ -225,8 +226,8 @@ The checks against the records, none of which rests on the numbering:
 - **The run's events follow the engine's order and agree with the run's
   record.** `workflow:created` comes first; the claim writes one
   `workflow:started` (two, a transition's and the claim's, with no run end
-  between, when `run.transition` came first; the run is `PENDING` after the
-  first alone); every later `workflow:started` is a redrive and follows
+  between, when an earlier release's `run.transition` came first; the run is
+  `PENDING` after the first alone); every later `workflow:started` is a redrive and follows
   a `workflow:completed`, `workflow:failed` or `workflow:cancelled`, because a
   redrive takes only an ended run; `workflow:completed` comes only while the
   run is running. The redrives found that way must be exactly the run's

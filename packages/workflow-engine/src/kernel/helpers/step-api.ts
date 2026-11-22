@@ -13,6 +13,7 @@ import {
   brandNonRetryable,
   DuplicateStepKeyError,
   isNonRetryableError,
+  isStepControlFlowError,
   NonRetryableError,
   neverAbortingSignal,
   parseStepDuration,
@@ -742,8 +743,12 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
         // own `retries`, and a refusal is thrown as a `NonRetryableError`
         // with the original as `cause`. A replay of the row rebuilds a
         // plain error from its text, as on main.
-        const nonRetryable = isNonRetryableError(error);
+        // The engine's own control flow (a suspend) is no failure to judge:
+        // neither the brand nor `retryIf` sees it, as on main.
+        const control = isStepControlFlowError(error);
+        const nonRetryable = !control && isNonRetryableError(error);
         const declined =
+          !control &&
           !nonRetryable &&
           retryIfDeclines(opts, error, record.attempt, options.onLog);
         const stop = declined || nonRetryable;
