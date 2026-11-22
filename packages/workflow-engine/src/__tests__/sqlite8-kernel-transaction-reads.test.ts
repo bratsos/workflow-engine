@@ -347,31 +347,25 @@ describe.skipIf(!realDatabase)("kernel transaction-scoped port reads", () => {
 
     await db.kernel.dispatch({ type: "run.reapStuck", stuckThresholdMs: 1000 });
     const recovered = (await db.persistence.getRun(id))!;
-    expect(recovered.version).toBe(before.version + (sqlite ? 1 : 0));
-    if (sqlite) {
-      expect(recovered.updatedAt.getTime()).toBeGreaterThan(old.getTime());
-    } else {
-      expect(recovered.updatedAt).toEqual(old);
-    }
+    // The heal refreshes the run's activity on every backend, so the sweep
+    // that follows it before a worker dequeues the job leaves the run alone.
+    expect(recovered.version).toBe(before.version + 1);
+    expect(recovered.updatedAt.getTime()).toBeGreaterThan(old.getTime());
     const [job] = await db.jobTransport.getJobsByWorkflowRun(id);
     expect(job!.status).toBe("PENDING");
     const swept = await db.kernel.dispatch({
       type: "run.reapStuck",
       stuckThresholdMs: 1000,
     });
-    expect(swept).toMatchObject({ failed: sqlite ? 0 : 1, healed: 0 });
+    expect(swept).toMatchObject({ failed: 0, healed: 0 });
     expect(await db.persistence.getRun(id)).toMatchObject({
-      version: recovered.version + (sqlite ? 0 : 1),
-      status: sqlite ? "RUNNING" : "FAILED",
+      version: recovered.version,
+      status: "RUNNING",
     });
     expect(
       (await db.jobTransport.getJobsByWorkflowRun(id)).map((row) => row.id),
     ).toEqual([job!.id]);
-    expect(
-      (await db.persistence.getUnpublishedOutboxEvents(100)).map(
-        (event) => event.eventType,
-      ),
-    ).toEqual(sqlite ? [] : ["stage:failed", "workflow:failed"]);
+    expect(await db.persistence.getUnpublishedOutboxEvents(100)).toEqual([]);
   });
 
   it.skipIf(!sqlite)(
