@@ -19,6 +19,63 @@ pnpm lint        # biome check
 pnpm lint:fix     # biome check --write
 ```
 
+## Liveness sweep
+
+`packages/workflow-engine/src/__tests__/kernel/liveness-sweep.test.ts` exhausts single-write failures
+and post-write worker crashes against in-memory ports. The adjacent
+`packages/workflow-engine/src/__tests__/kernel/liveness-sweep-database.test.ts`
+runs the same scenarios against Prisma transactions when included by
+`test:sqlite` or `test:pg`; it faults each named persistence, ledger, job, and
+provider write used by the changed handlers. The database subset relies on
+the exhaustive in-memory sweep for writes outside those handler paths.
+The database file also runs focused `run.create` faults for the registered
+idempotency-key defects; those faults were absent from the handler-filtered
+matrix until the in-memory findings were traced to `run.create`.
+After the adapter and kernel suites, the SQLite script runs the sweep file as
+seven name-filtered groups in separate Vitest invocations; it splits the
+redrive sweeps by mode and the cancel sweeps by scenario so each invocation
+stays inside Vitest's worker RPC timeout. Together the groups cover every
+scenario, the late-delivery test and every selected handler write. A scenario
+or test added to the sweep must match one of those name filters.
+It injects faults while dispatching `job.execute`, `stage.pollSuspended`,
+`run.cancel`, and `run.redrive`; outside the focused known-defect reproductions,
+it does not sweep `run.create`, claim/transition, outbox maintenance, or worker
+interleavings. The database host loop expires
+simulated job leases between ticks and runs `run.reapStuck` with the fake clock
+cutoff. When a pending job's retry deadline elapses on the sweep clock, the
+adapter moves that deadline to database wall time so the real queue can dequeue
+it.
+
+The in-memory file enumerates all 3,432 command-level interleavings for the
+single-step and parallel-group cases. It samples eight evenly spaced schedules
+from the same interleaving set for larger cases, with both fault modes in worker
+A. It checks for duplicate completed-step execution, duplicate event delivery,
+and writes after a worker loses its stage claim. A poll that another worker
+superseded writes nothing. The late-delivery test delivers the job a
+`run.cancel` cancelled after the run was redriven from the start: jobs carry no
+generation, so that delivery executes the redriven stage once, the redriven
+job's own delivery then meets a COMPLETED stage, and the test checks one body
+run, one `stage:completed` and a completed run. A throwing `checkCompletion`
+is not retried: the poll fails the stage and the run, and the sweep expects that
+outcome after every fault. The batch transport records whether `cancelIntent` was
+durable before each provider cancel, and the redrive assertion checks that no
+batch with a sent cancel is polled by the new generation.
+
+The database sweep uses a fake AI batch transport and makes no provider calls.
+Run the SQLite variant with `SQLITE8_KERNEL_SQLITE=1 NODE_ENV=test` and the
+Prisma major set inline. Use Node 22.23.4 for Prisma 7 and Node 24.22.2 for
+Prisma 8, because Prisma 8 SQLite requires Node 24:
+
+```bash
+SQLITE8_KERNEL_SQLITE=1 PRISMA_MAJOR=8 NODE_ENV=test pnpm run test:sqlite
+SQLITE8_KERNEL_SQLITE=1 PRISMA_MAJOR=7 NODE_ENV=test pnpm run test:sqlite
+PRISMA_MAJOR=8 DATABASE_URL=postgresql://postgres:postgres@localhost:5432/workflow_engine_test NODE_ENV=test pnpm run test:pg
+```
+
+For Postgres, generate the matching Prisma client and push the fixture schema
+to a dedicated test database before running `test:pg`. Never point that suite
+at a database used by an application.
+
 Postgres-backed persistence tests (`prisma-postgres-conformance.test.ts`,
 `sql-enqueue.test.ts` and, on Prisma 8 only, `from-prisma8.test.ts`, all under
 `packages/workflow-engine/src/__tests__/12-persistence-adapters/`, plus
