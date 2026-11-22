@@ -123,8 +123,10 @@ superseded attempt lands on the surface built for exactly this, rather than
 in a new table.
 
 One thing it records rather than copies: `outputData` keeps the blob key,
-not the blob. The new attempt writes to the same key, so the archive tells
-you an output existed and where it lived, not what it contained.
+not the blob. Every attempt writes its output and artifacts under keys of its
+own, so the archived key still names the superseded attempt's output until
+`run.purge` deletes the run (a stage record the redrive deleted loses its
+other blobs, but not the ones its pointer names).
 
 ### What happens to the step ledger
 

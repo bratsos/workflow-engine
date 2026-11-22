@@ -135,7 +135,7 @@ interface SupersededAttemptPayload {
 }
 ```
 
-`outputData` retains the blob storage pointer (e.g., `{ _artifactKey: "..." }`), not a duplicate copy of the underlying blob. A subsequent execution attempt writes to the same storage key; retaining the pointer preserves the historical fact that an output existed and where it was located without duplicating storage bytes.
+`outputData` retains the blob storage pointer (e.g., `{ _artifactKey: "..." }`), not a duplicate copy of the underlying blob. Every execution attempt writes its output and artifacts under keys of its own (`<stage>/attempts/<id>/`), so the archived pointer still names the superseded attempt's bytes until `run.purge` deletes the run; nothing is duplicated.
 
 ### Querying superseded attempts
 
