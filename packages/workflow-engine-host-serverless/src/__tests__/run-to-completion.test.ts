@@ -11,7 +11,7 @@ import {
   InMemoryStepLedger,
   InMemoryWorkflowPersistence,
 } from "@bratsos/workflow-engine/testing";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { runToCompletion } from "../run-to-completion.js";
 
@@ -168,18 +168,12 @@ describe("runToCompletion", () => {
     const blocked = new Promise<void>((resolve) => {
       release = resolve;
     });
-    let sinkEntered!: () => void;
-    const entered = new Promise<void>((resolve) => {
-      sinkEntered = resolve;
-    });
     eventSink.emit = async () => {
-      sinkEntered();
       await blocked;
     };
-    // Fake timers, so the flush bound fires when the test says and not when a
-    // loaded runner gets to it. A regression that waits on the sink hangs the
-    // `await run` below and fails on the test timeout.
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    // Real timers: every flush is blocked, and each one returns only when its
+    // own 5 ms bound fires. A regression that waits on the sink hangs the
+    // `await run` below and fails on the test timeout; no wall-clock race.
     try {
       const run = runToCompletion({
         kernel,
@@ -193,12 +187,9 @@ describe("runToCompletion", () => {
         },
         outboxFlushTimeoutMs: 5,
       });
-      await entered;
-      await vi.advanceTimersByTimeAsync(5);
       expect((await run).outcome).toBe("completed");
     } finally {
       release();
-      vi.useRealTimers();
     }
   });
 
