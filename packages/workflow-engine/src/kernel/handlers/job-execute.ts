@@ -32,6 +32,7 @@ import { assertServesRun } from "../helpers/definition-pinning.js";
 import { HOST_DEFAULTS } from "../helpers/host-support.js";
 import {
   buildAnnotationEvents,
+  discardUnreferencedBlobs,
   loadWorkflowContext,
   reopenFailedSteps,
   resetStageStepsForFreshAttempt,
@@ -216,45 +217,62 @@ export async function handleJobExecute(
   });
 
   // Phase 3 commits through here. Its stage write is fenced on the version
-  // Phase 1 returned, folded into the write's WHERE (no extra read), so an
-  // attempt that was overtaken while its body ran (a redrive reopened the
-  // stage, another worker took it over) commits nothing and its result is
-  // discarded. A write that lost only to a writer that leaves the claim
-  // alone (a `step.signal` wake moves `nextPollAt` on a RUNNING stage) is
-  // repeated on the version now stored: it is still this attempt's row.
-  // Returns why the result was discarded, or `undefined` once committed.
+  // Phase 1 returned, folded into the write's WHERE (no extra read). The
+  // version is this delivery's ownership of the stage: every later write to
+  // a RUNNING stage comes from a new owner (another delivery's Phase 1, a
+  // redrive, a cancel, a reap), because `step.signal` leaves a RUNNING stage
+  // alone. So a write that finds another version commits nothing and the
+  // result is discarded. Returns undefined once committed.
   const commit = async (
     write: (tx: KernelDeps["persistence"], version: number) => Promise<void>,
-  ): Promise<string | undefined> => {
-    let version = stageRecord.version;
-    for (let tries = 0; ; tries++) {
-      try {
-        // expectedVersion omitted on the run: Phase 3 never writes the run
-        // row here (only the stage row), so — unlike stage-poll-suspended's
-        // claim — parallel sibling stages completing concurrently must not
-        // contend on the run's version.
-        const claimed = await withClaimedRun(
-          workflowRunId,
-          undefined,
-          deps,
-          (tx) => write(tx, version),
-        );
-        return claimed.status === "cancelled" ? claimed.message : undefined;
-      } catch (error) {
-        if (!(error instanceof StaleVersionError)) throw error;
-        const current = await deps.persistence.getStage(workflowRunId, stageId);
-        if (
-          current?.id !== stageRecord.id ||
-          current.status !== "RUNNING" ||
-          current.attempt !== stageRecord.attempt
-        ) {
-          return `Stage ${stageId} of run ${workflowRunId} was reopened or taken over while this attempt ran — result discarded`;
-        }
-        if (tries === 4) throw error;
-        version = current.version;
-      }
+  ): Promise<{ error: string; ghostReason: "orphan" | "race" } | undefined> => {
+    try {
+      // expectedVersion omitted on the run: Phase 3 never writes the run
+      // row here (only the stage row), so — unlike stage-poll-suspended's
+      // claim — parallel sibling stages completing concurrently must not
+      // contend on the run's version.
+      const claimed = await withClaimedRun(
+        workflowRunId,
+        undefined,
+        deps,
+        (tx) => write(tx, stageRecord.version),
+      );
+      return claimed.status === "cancelled"
+        ? { error: claimed.message, ghostReason: "orphan" }
+        : undefined;
+    } catch (error) {
+      if (!(error instanceof StaleVersionError)) throw error;
     }
+    // Still the row this delivery started (no Phase 1, reopen or end since):
+    // the write came from something that does not own the stage, such as a
+    // `step.signal` of an earlier release. The job is re-delivered ("race")
+    // rather than left with nothing live; a host that lost the lease gets a
+    // superseded acknowledgement, so this never undoes another owner.
+    const current = await deps.persistence
+      .getStage(workflowRunId, stageId)
+      .catch(() => null);
+    const unowned =
+      current?.id === stageRecord.id &&
+      current.status === "RUNNING" &&
+      current.attempt === stageRecord.attempt &&
+      current.startedAt?.getTime() === stageRecord.startedAt?.getTime();
+    return {
+      error: unowned
+        ? `Stage ${stageId} of run ${workflowRunId} was written by a non-owner while this attempt ran — result discarded; re-delivering`
+        : `Stage ${stageId} of run ${workflowRunId} was reopened or taken over while this attempt ran — result discarded`,
+      ghostReason: unowned ? "race" : "orphan",
+    };
   };
+  const discard = (lost: {
+    error: string;
+    ghostReason: "orphan" | "race";
+  }) => ({
+    outcome: "failed" as const,
+    ghost: true,
+    ghostReason: lost.ghostReason,
+    error: lost.error,
+    _events: [],
+  });
 
   // ── Phase 2: Execute (no transaction) ────────────────────────────
   // The stage's execute() function runs through deps.executor.run().
@@ -403,15 +421,7 @@ export async function handleJobExecute(
       );
     });
 
-    if (discarded !== undefined) {
-      return {
-        outcome: "failed" as const,
-        ghost: true,
-        ghostReason: "orphan" as const,
-        error: discarded,
-        _events: [],
-      };
-    }
+    if (discarded !== undefined) return discard(discarded);
 
     await deps.persistence
       .createLog({
@@ -508,28 +518,23 @@ export async function handleJobExecute(
       );
     });
 
-    if (discarded !== undefined) {
-      return {
-        outcome: "failed" as const,
-        ghost: true,
-        ghostReason: "orphan" as const,
-        error: discarded,
-        _events: [],
-      };
-    }
+    if (discarded !== undefined) return discard(discarded);
 
     return { outcome: "suspended" as const, nextPollAt, _events: [] };
   } else {
     const result = run.result!;
     const duration = deps.clock.now().getTime() - startTime;
 
-    // Save output to blob store (not a DB operation)
+    // Save output to blob store (not a DB operation), under keys of this
+    // attempt's own: only the fenced write below makes them the stage's.
+    const attemptKey = crypto.randomUUID();
     const outputKey = await saveStageOutput(
       workflowRunId,
       workflowRun.workflowType,
       stageId,
       result.output,
       deps,
+      attemptKey,
     );
     const artifactKeys =
       result.artifacts && Object.keys(result.artifacts).length > 0
@@ -539,6 +544,7 @@ export async function handleJobExecute(
             stageId,
             result.artifacts,
             deps,
+            attemptKey,
           )
         : undefined;
 
@@ -587,13 +593,12 @@ export async function handleJobExecute(
     });
 
     if (discarded !== undefined) {
-      return {
-        outcome: "failed" as const,
-        ghost: true,
-        ghostReason: "orphan" as const,
-        error: discarded,
-        _events: [],
-      };
+      await discardUnreferencedBlobs(
+        workflowRunId,
+        [outputKey, ...Object.values(artifactKeys ?? {})],
+        deps,
+      );
+      return discard(discarded);
     }
 
     return {

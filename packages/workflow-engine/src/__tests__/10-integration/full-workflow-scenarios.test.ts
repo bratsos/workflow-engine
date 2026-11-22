@@ -164,7 +164,9 @@ describe("I want to run complete workflow scenarios", () => {
 
       // Verify the last stage output via blobStore
       const keys = await blobStore.list("");
-      const outputKey = keys.find((k) => k.includes("/output/output.json"));
+      const outputKey = keys.find((k) =>
+        /\/output\/attempts\/[^/]+\/output\.json$/.test(k),
+      );
       expect(outputKey).toBeDefined();
       const finalOutput = (await blobStore.get(outputKey!)) as any;
       expect(finalOutput.summary.totalRecords).toBe(4); // 5 - 1 item containing "2"

@@ -666,7 +666,9 @@ describe("I want to implement real-world workflow patterns", () => {
 
       // Verify via the load stage output in blobStore
       const keys = await blobStore.list("");
-      const loadKey = keys.find((k) => k.includes("/load/output.json"));
+      const loadKey = keys.find((k) =>
+        /\/load\/attempts\/[^/]+\/output\.json$/.test(k),
+      );
       expect(loadKey).toBeDefined();
       const loadOutput = (await blobStore.get(loadKey!)) as any;
       expect(loadOutput.loaded).toBe(true);

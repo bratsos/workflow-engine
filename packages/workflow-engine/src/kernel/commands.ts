@@ -198,11 +198,16 @@ export interface JobExecuteResult {
    * Only set alongside `ghost`. Distinguishes the two reasons a job can
    * find its run not RUNNING:
    *  - `"orphan"` — the run is CANCELLED/COMPLETED/FAILED, or was made so
-   *    mid-execution. The job is meaningless and must be thrown away.
+   *    mid-execution, or the stage was reopened or taken over by another
+   *    delivery while the body ran (its result is discarded). The job is
+   *    meaningless and must be thrown away.
    *  - `"race"` — the run is still PENDING, i.e. its claim had not
    *    committed when this job was dequeued. The job is valid and simply
    *    arrived early: it must be re-delivered, not discarded, or the run
-   *    wedges RUNNING with no job until `run.reapStuck` sweeps it up.
+   *    wedges RUNNING with no job until `run.reapStuck` sweeps it up. Also
+   *    set when the stage row this attempt started was written by something
+   *    that does not own it (a `step.signal` from an earlier release): the
+   *    result is discarded and the job re-delivered to run the stage again.
    *  - `"version"` — the run is pinned to a definition version this build
    *    does not serve. The job is valid but belongs to another build: it
    *    must be re-delivered so a process running that definition executes

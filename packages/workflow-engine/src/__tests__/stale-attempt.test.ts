@@ -287,4 +287,266 @@ describe(`a stale attempt on ${realDatabase ? (sqlite ? "SQLite" : "Postgres") :
       "COMPLETED",
     );
   });
+
+  /**
+   * `s` then `t`, which records the input it got. Entry 1 of `s` holds in
+   * its body until `release` and then settles as `first`; entry 2 holds
+   * until `releaseSecond` when `holdSecond` is set. Every later entry
+   * succeeds with `{ who: "J<entry>" }` and an artifact holding the same.
+   */
+  async function pipeline(first: (ctx: never) => unknown, holdSecond = false) {
+    const held = gate();
+    const release = gate();
+    const heldSecond = gate();
+    const releaseSecond = gate();
+    let entries = 0;
+    const tInputs: unknown[] = [];
+    const workflow = new WorkflowBuilder(
+      "attempt-owner",
+      "Attempt owner",
+      "attempt-owner",
+      schema,
+      z.any(),
+    )
+      .pipe(
+        defineStage({
+          id: "s",
+          name: "S",
+          schemas: { input: schema, output: z.any(), config: schema },
+          async execute(ctx) {
+            const entry = ++entries;
+            if (entry === 1) {
+              held.open();
+              await release.opened;
+              return (await first(ctx as never)) as never;
+            }
+            if (entry === 2 && holdSecond) {
+              heldSecond.open();
+              await releaseSecond.opened;
+            }
+            const who = { who: `J${entry}` };
+            return { output: who, artifacts: { raw: who } };
+          },
+        }),
+      )
+      .pipe(
+        defineStage({
+          id: "t",
+          name: "T",
+          schemas: { input: z.any(), output: z.any(), config: schema },
+          async execute(ctx) {
+            tInputs.push(ctx.input);
+            return { output: ctx.input };
+          },
+        }),
+      )
+      .build();
+    const kernel = createKernel({
+      ...ports,
+      eventSink: new CollectingEventSink(),
+      clock: { now: () => new Date() },
+      registry: { getWorkflow: () => workflow },
+    });
+    const { workflowRunId } = await kernel.dispatch({
+      type: "run.create",
+      workflowId: workflow.id,
+      input: {},
+      idempotencyKey: crypto.randomUUID(),
+    });
+    await kernel.dispatch({ type: "run.claimPending", workerId: "w" });
+    const deliver = (job: DequeueResult) =>
+      executeJobWithHeartbeat(kernel, {
+        jobTransport: ports.jobTransport,
+        job: { ...job, maxAttempts: budget },
+      });
+    const drain = async () => {
+      for (let job = await ports.jobTransport.dequeue(); job; ) {
+        await deliver(job);
+        job = await ports.jobTransport.dequeue();
+      }
+    };
+    const stale = deliver((await ports.jobTransport.dequeue())!);
+    await held.opened;
+    const prefix = `workflow-v2/${workflow.id}/${workflowRunId}/s/`;
+    return {
+      kernel,
+      workflowRunId,
+      deliver,
+      drain,
+      stale,
+      release: release.open,
+      heldSecond: heldSecond.opened,
+      releaseSecond: releaseSecond.open,
+      entries: () => entries,
+      tInputs,
+      /** What the stage row points at, read through its pointers. */
+      committed: async () => {
+        const row = (await ports.persistence.getStage(workflowRunId, "s"))!;
+        const data = row.outputData as {
+          _artifactKey: string;
+          _artifactKeys?: Record<string, string>;
+        };
+        return {
+          output: await ports.blobStore.get(data._artifactKey),
+          raw: await ports.blobStore.get(data._artifactKeys!.raw),
+        };
+      },
+      /** Every blob value saved under the stage's prefix. */
+      blobs: async () =>
+        Promise.all(
+          (await ports.blobStore.list(prefix)).map((key) =>
+            ports.blobStore.get(key),
+          ),
+        ),
+    };
+  }
+
+  const overtakers = {
+    "a cancel and a redrive": async (
+      kernel: Awaited<ReturnType<typeof pipeline>>["kernel"],
+      workflowRunId: string,
+    ) => {
+      await kernel.dispatch({ type: "run.cancel", workflowRunId });
+      await kernel.dispatch({
+        type: "run.redrive",
+        workflowRunId,
+        from: { kind: "stage", stageId: "s" },
+      });
+    },
+    "a lost lease": async (
+      kernel: Awaited<ReturnType<typeof pipeline>>["kernel"],
+    ) => {
+      await sleep(20);
+      await kernel.dispatch({ type: "lease.reapStale", staleThresholdMs: 0 });
+    },
+  };
+
+  it.each(
+    Object.keys(overtakers),
+  )("keeps the output and artifacts of the attempt that took over after %s, for the next stage too", async (name) => {
+    const t = await pipeline(() => ({
+      output: { who: "A" },
+      artifacts: { raw: { who: "A" } },
+    }));
+    await overtakers[name as keyof typeof overtakers](
+      t.kernel,
+      t.workflowRunId,
+    );
+    await expect(
+      t.deliver((await ports.jobTransport.dequeue())!),
+    ).resolves.toMatchObject({ outcome: "completed" });
+    expect(await t.committed()).toEqual({
+      output: { who: "J2" },
+      raw: { who: "J2" },
+    });
+
+    // The overtaken attempt finishes last: its result and its blobs go.
+    t.release();
+    await expect(t.stale).resolves.toMatchObject({
+      outcome: "failed",
+      error: expect.stringContaining("result discarded"),
+    });
+    expect(await t.committed()).toEqual({
+      output: { who: "J2" },
+      raw: { who: "J2" },
+    });
+    expect(await t.blobs()).not.toContainEqual({ who: "A" });
+
+    await t.drain();
+    expect(t.tInputs).toEqual([{ who: "J2" }]);
+    expect((await ports.persistence.getRun(t.workflowRunId))?.status).toBe(
+      "COMPLETED",
+    );
+  });
+
+  it.each(
+    Object.keys(endings).flatMap((ending) =>
+      [false, true].map((signal) => [ending, signal] as const),
+    ),
+  )("lets the attempt that took over a lost lease finish when the stale one %s first (signal between: %s)", async (ending, signal) => {
+    const t = await pipeline(
+      endings[ending as keyof typeof endings] as never,
+      true,
+    );
+    await overtakers["a lost lease"](t.kernel);
+    const second = t.deliver((await ports.jobTransport.dequeue())!);
+    await t.heldSecond;
+    if (signal) {
+      // A wake on the RUNNING stage must not hand it back to the stale owner.
+      await t.kernel.dispatch({
+        type: "step.signal",
+        workflowRunId: t.workflowRunId,
+        stageId: "s",
+        stepId: "poke",
+        payload: 1,
+      });
+    }
+
+    t.release();
+    await expect(t.stale).resolves.toMatchObject({
+      outcome: "failed",
+      error: expect.stringContaining("result discarded"),
+    });
+    const stage = (await ports.persistence.getStage(t.workflowRunId, "s"))!;
+    expect(stage.status).toBe("RUNNING");
+    expect(stage.errorMessage).toBeNull();
+
+    t.releaseSecond();
+    await expect(second).resolves.toMatchObject({ outcome: "completed" });
+    await t.drain();
+    expect(t.entries()).toBe(2);
+    expect(t.tInputs).toEqual([{ who: "J2" }]);
+    expect((await ports.persistence.getRun(t.workflowRunId))?.status).toBe(
+      "COMPLETED",
+    );
+  });
+
+  it("re-delivers an attempt whose stage row was written by a non-owner while it ran", async () => {
+    const t = await pipeline(() => ({ output: { who: "A" } }));
+    // What `step.signal` of an earlier release did on a RUNNING stage.
+    const row = (await ports.persistence.getStage(t.workflowRunId, "s"))!;
+    await ports.persistence.updateStage(row.id, { nextPollAt: new Date() });
+
+    t.release();
+    await expect(t.stale).resolves.toMatchObject({
+      outcome: "failed",
+      willRetry: true,
+    });
+    expect(await t.blobs()).toEqual([]);
+    expect(
+      (await ports.jobTransport.getJobsByWorkflowRun(t.workflowRunId))[0]
+        ?.status,
+    ).toBe("PENDING");
+
+    // The queue's retry backoff, then the stage runs again and completes.
+    let job = await ports.jobTransport.dequeue();
+    for (let waited = 0; !job && waited < 10_000; waited += 250) {
+      await sleep(250);
+      job = await ports.jobTransport.dequeue();
+    }
+    await expect(t.deliver(job!)).resolves.toMatchObject({
+      outcome: "completed",
+    });
+    await t.drain();
+    expect(t.tInputs).toEqual([{ who: "J2" }]);
+    expect((await ports.persistence.getRun(t.workflowRunId))?.status).toBe(
+      "COMPLETED",
+    );
+  }, 30_000);
+
+  it("reads an output pointer stored by an earlier release", async () => {
+    const t = await pipeline(() => ({ output: { who: "A" } }));
+    t.release();
+    await t.stale;
+    // Rewrite the row the way an earlier release stored it: one key per stage.
+    const row = (await ports.persistence.getStage(t.workflowRunId, "s"))!;
+    const legacy = `workflow-v2/attempt-owner/${t.workflowRunId}/s/output.json`;
+    await ports.blobStore.put(legacy, { who: "legacy" });
+    await ports.persistence.updateStage(row.id, {
+      outputData: { _artifactKey: legacy },
+    });
+
+    await t.drain();
+    expect(t.tInputs).toEqual([{ who: "legacy" }]);
+  });
 });

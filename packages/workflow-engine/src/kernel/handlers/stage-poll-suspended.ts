@@ -48,6 +48,7 @@ import {
   createStepApi,
   createStorageShim,
   defineLazyAIContext,
+  discardUnreferencedBlobs,
   failStageAndRun,
   HOST_DEFAULTS,
   handleClaimOutcome,
@@ -525,12 +526,16 @@ async function replayStage(
       }
     }
 
+    // Under this poll's own keys: only its fenced write below makes them
+    // the stage's, and a poll that loses removes them again.
+    const attemptKey = crypto.randomUUID();
     const outputKey = await saveStageOutput(
       stageRecord.workflowRunId,
       run.workflowType,
       stageRecord.stageId,
       validatedOutput,
       deps,
+      attemptKey,
     );
     const artifactKeys =
       stageResult.artifacts && Object.keys(stageResult.artifacts).length > 0
@@ -540,6 +545,7 @@ async function replayStage(
             stageRecord.stageId,
             stageResult.artifacts,
             deps,
+            attemptKey,
           )
         : undefined;
     const duration =
@@ -587,7 +593,14 @@ async function replayStage(
         );
       },
     );
-    if (await handleClaimOutcome(claimResult, stageRecord, deps)) return "skip";
+    if (await handleClaimOutcome(claimResult, stageRecord, deps)) {
+      await discardUnreferencedBlobs(
+        stageRecord.workflowRunId,
+        [outputKey, ...Object.values(artifactKeys ?? {})],
+        deps,
+      );
+      return "skip";
+    }
     postCommits.push(() =>
       completeSuspendedJobRow(
         stageRecord.workflowRunId,
@@ -1048,7 +1061,16 @@ export async function handleStagePollSuspended(
           },
         );
 
-        if (await skipAfterClaim(claimResult)) continue;
+        if (await skipAfterClaim(claimResult)) {
+          // Saved under this poll's own key (saveStageOutput): a poll that
+          // lost removes it again.
+          await discardUnreferencedBlobs(
+            stageRecord.workflowRunId,
+            outputRef ? [outputRef._artifactKey] : [],
+            deps,
+          );
+          continue;
+        }
 
         resumed++;
         resumedWorkflowRunIds.add(stageRecord.workflowRunId);

@@ -165,9 +165,19 @@ describe("kernel: job.execute", () => {
     expect(result.outcome).toBe("completed");
     expect(blobStore.size()).toBe(3);
 
-    const rawArtifactKey =
-      "workflow-v2/artifact-workflow/" +
-      `${createResult.workflowRunId}/artifact-stage/artifacts/raw.json`;
+    // The attempt's own keys, which the stage row points at.
+    const stageRow = await persistence.getStage(
+      createResult.workflowRunId,
+      "artifact-stage",
+    );
+    const rawArtifactKey = (
+      stageRow?.outputData as { _artifactKeys: Record<string, string> }
+    )._artifactKeys.raw;
+    expect(rawArtifactKey).toMatch(
+      new RegExp(
+        `^workflow-v2/artifact-workflow/${createResult.workflowRunId}/artifact-stage/attempts/[^/]+/artifacts/raw\\.json$`,
+      ),
+    );
     expect(await blobStore.has(rawArtifactKey)).toBe(true);
   });
 
