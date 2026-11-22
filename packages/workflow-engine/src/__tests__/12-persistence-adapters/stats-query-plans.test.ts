@@ -365,9 +365,12 @@ describe.skipIf(!sqlite && !databaseUrl)(
       // An asynchronous query event from the previous EXPLAIN, or from this
       // file's catalog probes (`analysedTables`, which name the engine tables
       // as `::regclass`), can also arrive while recording the next operation.
+      // A late `ANALYZE "outbox_events"` or `TRUNCATE` event names an engine
+      // table too but is no plannable query: keep only what EXPLAIN accepts.
       return statements.filter(
         (s) =>
           ENGINE_TABLE.test(s.sql) &&
+          /^\s*(SELECT|INSERT|UPDATE|DELETE|WITH)\b/i.test(s.sql) &&
           !/^\s*EXPLAIN\b/i.test(s.sql) &&
           !/\bFROM pg_(?:statistic|class)\b/.test(s.sql),
       );
