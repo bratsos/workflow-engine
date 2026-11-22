@@ -4,6 +4,7 @@
  * (`stream: true`), and one-shot failure scripting through the real kernel.
  */
 
+import { runInNewContext } from "node:vm";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { registerModels } from "../../ai/model-helper.js";
@@ -172,6 +173,51 @@ describe("ctx.step.ai.map — consumer feedback surfaces", () => {
     // Main could not format the error, so it propagated: no realtime call.
     expect(result.status).not.toBe("COMPLETED");
     expect(harness.mockAi.getCalls()).toHaveLength(0);
+  });
+
+  it("stores the text of another realm's Error from the one read main makes", async () => {
+    const workflow = mapWorkflow("map-foreign-error", {
+      realtime: { retries: 0, concurrency: 1 },
+    });
+    const harness = createTestHarness({ workflows: [workflow] });
+    harness.mockAi.setTextResponse("process", { text: "processed" });
+    let reads = 0;
+    const foreign = runInNewContext('new Error("initial")') as Error;
+    Object.defineProperty(foreign, "message", {
+      get: () => (++reads === 1 ? "original message" : "replacement message"),
+    });
+    harness.mockAi.failOnce("process a", foreign);
+
+    const result = await harness.run("map-foreign-error", { items: ["a"] });
+
+    expect(results(result.output)[0]).toMatchObject({
+      status: "failed",
+      error: "Error: original message",
+    });
+  });
+
+  it("records the decoded name it routed the item by", async () => {
+    const workflow = mapWorkflow("map-decoded-name", {
+      realtime: { retries: 0, concurrency: 1 },
+    });
+    const harness = createTestHarness({ workflows: [workflow] });
+    harness.mockAi.setTextResponse("process", { text: "processed" });
+    let names = 0;
+    const decoded = { message: "first diagnostic" };
+    Object.defineProperty(decoded, "name", {
+      get: () =>
+        ++names === 1 ? "TransportError" : "AI_NoObjectGeneratedError",
+    });
+    harness.mockAi.failOnce("process a", decoded as unknown as Error);
+
+    const result = await harness.run("map-decoded-name", { items: ["a"] });
+
+    expect(results(result.output)[0]).toMatchObject({
+      status: "failed",
+      error: "first diagnostic",
+      errorName: "TransportError",
+    });
+    expect(names).toBe(1);
   });
 
   it("retries a thrown item call in-process and completes in one execution", async () => {

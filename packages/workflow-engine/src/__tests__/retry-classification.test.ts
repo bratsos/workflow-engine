@@ -464,7 +464,7 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
         expect(body.calls).toBe(1);
       });
 
-      it("keeps a newer refusal when a delayed retry's reopen lands on it", async () => {
+      it("ends a redelivery with the stored error while a delayed retry's reopen is held", async () => {
         let bodies = 0;
         const stage = defineStage({
           id: "s",
@@ -518,10 +518,11 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
           // the stored error, as main ends it, and re-opens nothing.
           expect(await run.execute(2, 2)).toMatchObject({ outcome: "failed" });
           const again = await run.execute(2, 2);
-          expect(again).toMatchObject({ outcome: "failed", willRetry: false });
-          expect((again as { error: string }).error).not.toMatch(
-            /^StepNotReplaySafeError: /,
-          );
+          expect(again).toMatchObject({
+            outcome: "failed",
+            willRetry: false,
+            error: "first failure",
+          });
           resume.open();
           await retry;
           const last = await run.execute(2, 2);
@@ -1245,6 +1246,22 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
               Symbol.toStringTag,
               { value: "Task" },
             ),
+        ],
+        [
+          "a fulfilled native Promise whose value later gains a rejecting then",
+          () => {
+            const value: { then?: unknown } = {};
+            const fulfilled = Promise.resolve(value);
+            value.then = (_ok: unknown, reject: (reason: unknown) => void) =>
+              reject(new Error("late then"));
+            return fulfilled;
+          },
+        ],
+        [
+          "a rejected native Promise thrown synchronously",
+          () => {
+            throw Promise.reject(new Error("predicate operation failed"));
+          },
         ],
         [
           "a rejected Promise whose then getter throws",

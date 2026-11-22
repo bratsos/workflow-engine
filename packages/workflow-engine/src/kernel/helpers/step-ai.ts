@@ -52,7 +52,6 @@ import {
   StepTimeoutError,
 } from "../../core/steps";
 import { getBestProviderForModel } from "../../utils/batch/model-mapping";
-import { describeThrown } from "./error-message";
 
 const DEFAULT_CONCURRENCY = 10;
 const DEFAULT_BATCH_ABOVE = 20;
@@ -237,27 +236,74 @@ function errorMessage(error: unknown): string {
 }
 
 /**
- * A failed item's diagnostics. An Error is read as main reads it, and any
- * other value is first coerced as main coerces it, so a value main could not
- * format still throws instead of becoming a verdict. A decoded
- * `{ name, message }` then keeps both, each read once.
+ * One read of a thrown model call's `name`, shared by every decision and
+ * record about it. Main reads an Error's name, and any object's name when
+ * routing a model call, without a guard (a throwing getter propagates);
+ * elsewhere a non-Error's name is an extra read, so it is guarded.
  */
-function itemFailure(error: unknown): { error: string; errorName?: string } {
+interface ThrownName {
+  error: unknown;
+  name: unknown;
+}
+
+function readThrownName(error: unknown, routed: boolean): ThrownName {
+  if (typeof error !== "object" || error === null) {
+    return { error, name: undefined };
+  }
+  if (routed || error instanceof Error) {
+    return { error, name: (error as { name?: unknown }).name };
+  }
+  try {
+    return { error, name: (error as { name?: unknown }).name };
+  } catch {
+    return { error, name: undefined };
+  }
+}
+
+/**
+ * A failed item's diagnostics, each field read once. An Error is read as
+ * main reads it; any other value is coerced as main coerces it, so a value
+ * main could not format still throws instead of becoming a verdict. Only a
+ * plain decoded object (one that converts to `[object Object]`, which reads
+ * neither field) keeps its string `message` and the `name` already read.
+ */
+function itemFailure(thrown: ThrownName): {
+  error: string;
+  errorName?: string;
+} {
+  const { error, name } = thrown;
   if (error instanceof Error) {
     const message = error.message;
-    const name = error.name;
     return name === undefined
       ? { error: message }
-      : { error: message, errorName: name };
+      : { error: message, errorName: name as string };
   }
-  const { message, name } = describeThrown(error, String(error));
-  return name === undefined
-    ? { error: message }
-    : { error: message, errorName: name };
+  const text = String(error);
+  if (
+    typeof error !== "object" ||
+    error === null ||
+    text !== "[object Object]"
+  ) {
+    return { error: text };
+  }
+  let message = text;
+  try {
+    const read = (error as { message?: unknown }).message;
+    if (typeof read === "string") message = read;
+  } catch {
+    // An unreadable decoded message keeps main's text.
+  }
+  return typeof name === "string" && name !== ""
+    ? { error: message, errorName: name }
+    : { error: message };
 }
 
 function formatIssues(error: z.ZodError): string {
-  return error.issues
+  return formatIssueList(error.issues);
+}
+
+function formatIssueList(issues: z.ZodError["issues"]): string {
+  return issues
     .map((issue) => {
       const path = issue.path.map(String).join(".");
       return `${path || "(root)"}: ${issue.message}`;
@@ -294,39 +340,55 @@ function withRepair(prompt: TextInput, feedback: Feedback): TextInput {
  * answer could not be parsed or validated. Anything else counts against
  * `realtime.retries`.
  */
-function asGenerationFailure(error: unknown): Feedback | undefined {
+function asGenerationFailure(thrown: ThrownName): Feedback | undefined {
+  const { error, name } = thrown;
   if (typeof error !== "object" || error === null) return undefined;
+  // Each field is read once: what routed the item is what is reported.
   const e = error as {
-    name?: unknown;
     text?: unknown;
     cause?: unknown;
-    message?: string;
+    message?: unknown;
     issues?: unknown;
   };
+  const rawCause = e.cause;
   const cause =
-    typeof e.cause === "object" && e.cause !== null
-      ? (e.cause as { name?: unknown; text?: unknown; issues?: unknown })
+    typeof rawCause === "object" && rawCause !== null
+      ? (rawCause as {
+          name?: unknown;
+          text?: unknown;
+          issues?: unknown;
+          message?: unknown;
+        })
       : undefined;
-  const text =
-    typeof e.text === "string"
-      ? e.text
-      : typeof cause?.text === "string"
-        ? cause.text
-        : undefined;
-  const isZod = (x: { name?: unknown; issues?: unknown } | undefined) =>
-    x !== undefined && x.name === "ZodError" && Array.isArray(x.issues);
+  const ownText = e.text;
+  let text: string | undefined;
+  if (typeof ownText === "string") text = ownText;
+  else if (cause) {
+    const causeText = cause.text;
+    if (typeof causeText === "string") text = causeText;
+  }
+  const ownIssues = name === "ZodError" ? e.issues : undefined;
+  const ownZod = Array.isArray(ownIssues);
   const repairable =
-    e.name === "AI_NoObjectGeneratedError" ||
+    name === "AI_NoObjectGeneratedError" ||
     text !== undefined ||
-    isZod(e) ||
+    ownZod ||
     error instanceof SyntaxError;
   if (!repairable) return undefined;
 
   let issues: string;
-  if (isZod(e)) issues = formatIssues(error as z.ZodError);
-  else if (isZod(cause)) issues = formatIssues(cause as z.ZodError);
-  else if (e.cause instanceof Error) issues = e.cause.message;
-  else issues = e.message || "No object generated";
+  if (ownZod) issues = formatIssueList(ownIssues as z.ZodError["issues"]);
+  else {
+    const causeIssues =
+      cause && cause.name === "ZodError" ? cause.issues : undefined;
+    if (Array.isArray(causeIssues)) {
+      issues = formatIssueList(causeIssues as z.ZodError["issues"]);
+    } else if (rawCause instanceof Error) {
+      issues = (cause as { message: string }).message;
+    } else {
+      issues = (e.message as string) || "No object generated";
+    }
+  }
   return { output: text, issues };
 }
 
@@ -643,16 +705,17 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
         if (isStepControlFlowError(error)) throw error;
         // The call said a retry cannot succeed: no retry, no repair.
         if (isNonRetryableError(error)) {
-          const diagnosed = itemFailure(error);
+          const diagnosed = itemFailure(readThrownName(error, true));
           return failed(diagnosed.error, diagnosed.errorName);
         }
-        const failure = asGenerationFailure(error);
+        const thrown = readThrownName(error, true);
+        const failure = asGenerationFailure(thrown);
         if (failure) {
           feedback = failure;
           return "repair";
         }
         if (retriesLeft <= 0) {
-          const diagnosed = itemFailure(error);
+          const diagnosed = itemFailure(thrown);
           return failed(diagnosed.error, diagnosed.errorName);
         }
         retriesLeft--;
@@ -872,7 +935,7 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
             id: entry.id,
             index: entry.index,
             status: "failed",
-            ...itemFailure(error),
+            ...itemFailure(readThrownName(error, false)),
             attempts: (prior?.attempts ?? 0) + 1,
             inputTokens: prior?.inputTokens ?? 0,
             outputTokens: prior?.outputTokens ?? 0,

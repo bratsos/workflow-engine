@@ -132,17 +132,23 @@ function terminal<E extends Error>(error: E): E {
 }
 
 /**
- * Keep a native Promise a predicate returned from rejecting unhandled, from
- * this realm or another, whatever its `Symbol.toStringTag`:
+ * Keep a native Promise a predicate returned or threw from rejecting
+ * unhandled, from this realm or another, whatever its `Symbol.toStringTag`:
  * `Promise.prototype.then` checks the internal promise slot before it reads
  * anything, so any other value throws a TypeError with no getter invoked.
- * The application's value is never changed or wrapped, and no other
+ * Both reactions return `undefined`, so the derived promise settles with
+ * nothing to resolve: a fulfilled value (even one that became a thenable) is
+ * never resolved again. The application's value is never changed or wrapped, and no other
  * thenable is touched: a Promise whose `constructor` or species getter
  * throws, or a non-Promise thenable, can still reject unhandled.
  */
 function settleQuietly(value: object): void {
   try {
-    Promise.prototype.then.call(value, undefined, () => {});
+    Promise.prototype.then.call(
+      value,
+      () => {},
+      () => {},
+    );
   } catch {
     // Not a real Promise after all, or one that refuses a handler: nothing
     // more is attempted on the application's value.
@@ -155,7 +161,7 @@ function settleQuietly(value: object): void {
  * an awaited verdict would hold the step open past its lease. Anything but
  * a plain `false` gives no verdict and leaves the failure retryable: a
  * predicate that throws, a missing or broken `retryIf`, and a promise
- * (logged; see `settleQuietly`). Nothing here may throw: the body's own
+ * returned or thrown (logged; see `settleQuietly`). Nothing here may throw: the body's own
  * failure must still be recorded.
  */
 function retryIfDeclines(
@@ -187,6 +193,12 @@ function retryIfDeclines(
     }
     return false;
   } catch (predicateError) {
+    if (
+      (typeof predicateError === "object" && predicateError !== null) ||
+      typeof predicateError === "function"
+    ) {
+      settleQuietly(predicateError);
+    }
     warn(
       `retryIf threw (${toErrorMessage(predicateError)}); treating the failure as retryable`,
     );
