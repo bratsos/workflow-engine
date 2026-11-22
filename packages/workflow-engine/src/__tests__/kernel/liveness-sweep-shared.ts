@@ -1549,6 +1549,44 @@ function throwingLegacyCheckCompletion(): SweepScenario {
   };
 }
 
+function legacyCheckCompletionReadyOnSecondPoll(): SweepScenario {
+  let polls = 0;
+  const stage = defineAsyncBatchStage({
+    id: "legacy-ready",
+    name: "Legacy async batch",
+    mode: "async-batch",
+    schemas: { input: In, output: Out, config: noConfig },
+    async execute(ctx) {
+      return {
+        suspended: true,
+        state: {
+          batchId: "legacy-ready",
+          metadata: { value: ctx.input.value },
+        },
+      };
+    },
+    async checkCompletion() {
+      polls++;
+      return polls < 2
+        ? { ready: false, nextCheckIn: 60_000 }
+        : { ready: true, output: { value: 21 } };
+    },
+  });
+  return {
+    workflow: new WorkflowBuilder(
+      "sweep-legacy-ready",
+      "Legacy ready",
+      "test",
+      In,
+      Out,
+    )
+      .pipe(stage)
+      .build(),
+    input: { value: 20 },
+    validate: () => (polls >= 1 ? [] : ["legacy checkCompletion never ran"]),
+  };
+}
+
 function nonRetryableStep(): SweepScenario {
   const calls = new Map<string, number>();
   const workflow = defineWorkflow("sweep-nonretry-step", { input: In })
@@ -1797,6 +1835,24 @@ export const SCENARIOS: Record<string, SweepCase> = {
     ],
   },
   "a throwing legacy checkCompletion": { build: throwingLegacyCheckCompletion },
+  "a legacy checkCompletion that is ready on the second poll": {
+    build: legacyCheckCompletionReadyOnSecondPoll,
+    // Finding 5: stage-poll-suspended.ts runs checkCompletion and the writes
+    // that persist its answer (the not-ready commit, the output blob, the
+    // ready commit) in one try block whose catch fails the stage and the run
+    // with the thrown text. A single store error in those writes is
+    // indistinguishable from a throwing checkCompletion and is not retried.
+    // The durable-replay path retries such errors; a crash leaves the stage
+    // SUSPENDED under its claim lease and passes. On main as well.
+    knownDefect: {
+      error:
+        "a store error while stage.pollSuspended persists a legacy checkCompletion's answer (commit, output blob) fails the stage and the run",
+    },
+    databaseKnownDefect: {
+      error:
+        "a store error while stage.pollSuspended persists a legacy checkCompletion's answer (commit, output blob) fails the stage and the run",
+    },
+  },
   "a NonRetryableError from a step": { build: nonRetryableStep },
   "a NonRetryableError from a stage body": { build: nonRetryableStageBody },
   "a step that spends its retries during replay": {

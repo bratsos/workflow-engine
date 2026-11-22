@@ -57,7 +57,9 @@ generation, so that delivery executes the redriven stage once, the redriven
 job's own delivery then meets a COMPLETED stage, and the test checks one body
 run, one `stage:completed` and a completed run. A throwing `checkCompletion`
 is not retried: the poll fails the stage and the run, and the sweep expects that
-outcome after every fault. The batch transport records whether `cancelIntent` was
+outcome after every fault. A legacy `checkCompletion` that is ready on its second
+poll is registered as a known defect for `error` faults: a store error while the
+poll persists its answer fails the stage and the run. The batch transport records whether `cancelIntent` was
 durable before each provider cancel, and the redrive assertion checks that no
 batch with a sent cancel is polled by the new generation.
 
