@@ -12,6 +12,7 @@ import {
   isNonRetryableError,
   STEP_TERMINAL_FAILURE,
 } from "../../core/steps.js";
+import { describeThrown } from "./error-message.js";
 
 /**
  * `false` for an error that retrying cannot change, so nothing may spend an
@@ -29,6 +30,36 @@ import {
  * or `name` getter) proves nothing, and never hides a brand.
  */
 export function isRetryableStageError(error: unknown): boolean {
+  return retryableStageError(error, () => readName(error));
+}
+
+/**
+ * `describeThrown`'s name and message with `isRetryableStageError`'s
+ * verdict, from one read of each property: the name the verdict checks is
+ * the name recorded.
+ */
+export function classifyThrown(error: unknown): {
+  name?: string;
+  message: string;
+  retryable: boolean;
+} {
+  const described = describeThrown(error);
+  return {
+    ...described,
+    retryable: retryableStageError(error, () => described.name),
+  };
+}
+
+/**
+ * `isRetryableStageError` with the error's `name` already read by the
+ * caller (`name()` is asked only when the Zod shape check needs it), so a
+ * getter that answers differently on a second read cannot split the verdict
+ * from the recorded name.
+ */
+export function retryableStageError(
+  error: unknown,
+  name: () => unknown,
+): boolean {
   return !(
     holds(() => isDuplicateStepKeyError(error)) ||
     holds(() => isNonRetryableError(error)) ||
@@ -40,7 +71,7 @@ export function isRetryableStageError(error: unknown): boolean {
           STEP_TERMINAL_FAILURE
         ] === true,
     ) ||
-    holds(() => isZodError(error))
+    holds(() => isZodError(error, name))
   );
 }
 
@@ -53,17 +84,29 @@ function holds(check: () => boolean): boolean {
   }
 }
 
+/** An object's `name`, read once; `undefined` when the read throws. */
+function readName(error: unknown): unknown {
+  try {
+    return typeof error === "object" && error !== null
+      ? (error as { name?: unknown }).name
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * A Zod error from any copy of zod. The application's own copy, another
  * major or `zod/mini` is not an instance of this package's `ZodError`, so the
  * class alone would let its failure be retried. What every flavour shares is
  * the name and an `issues` array.
  */
-function isZodError(error: unknown): boolean {
+function isZodError(error: unknown, name: () => unknown): boolean {
   // The class check reads zod's private fields; when that throws, the shape
   // check below still decides.
   if (holds(() => error instanceof ZodError)) return true;
   if (typeof error !== "object" || error === null) return false;
-  const { name, issues } = error as { name?: unknown; issues?: unknown };
-  return (name === "ZodError" || name === "$ZodError") && Array.isArray(issues);
+  const read = name();
+  if (read !== "ZodError" && read !== "$ZodError") return false;
+  return Array.isArray((error as { issues?: unknown }).issues);
 }

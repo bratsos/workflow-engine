@@ -330,17 +330,11 @@ export type StepControlFlowError = StepSuspend | StepInFlight;
 export function isStepControlFlowError(
   error: unknown,
 ): error is StepControlFlowError {
-  try {
-    return (
-      typeof error === "object" &&
-      error !== null &&
-      (error as { [STEP_CONTROL_FLOW]?: unknown })[STEP_CONTROL_FLOW] === true
-    );
-  } catch {
-    // An unreadable property carries no brand: the error passes through as
-    // thrown, so the classifier still sees it.
-    return false;
-  }
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    (error as { [STEP_CONTROL_FLOW]?: unknown })[STEP_CONTROL_FLOW] === true
+  );
 }
 
 /**

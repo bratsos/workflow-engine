@@ -17,10 +17,10 @@ import type {
   ServedDefinition,
 } from "../../persistence/interface.js";
 import type { EventSinkStatus, OutboxFlushResult } from "../commands.js";
-import { isJobTargetMissingError } from "../errors.js";
+import { jobTargetMissingReason } from "../errors.js";
 import type { Kernel } from "../kernel.js";
 import type { JobTransport } from "../ports.js";
-import { describeThrown, toErrorMessage } from "./error-message.js";
+import { toErrorMessage } from "./error-message.js";
 
 // ============================================================================
 // Shared defaults
@@ -295,8 +295,9 @@ export async function executeJobWithHeartbeat(
     // queue row: fail and acknowledge it so it stops re-delivering, and
     // return instead of throwing — for a consumer that runs a whole tick
     // inside one transaction, a throw here aborted every other job.
-    const message = describeThrown(error).message;
-    if (!isJobTargetMissingError(error, job)) throw error;
+    // One read decides and names the reason.
+    const message = jobTargetMissingReason(error, job);
+    if (message === undefined) throw error;
     console.error(
       `${logPrefix} dead job ${job.jobId} (run ${job.workflowRunId}, stage ${job.stageId}): ${message}`,
     );

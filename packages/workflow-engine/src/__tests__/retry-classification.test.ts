@@ -1058,18 +1058,6 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
           () => withThrowingGetter(new NonRetryableError("revoked"), "issues"),
         ],
         [
-          "a NonRetryableError with a throwing name getter",
-          () => withThrowingGetter(new NonRetryableError("revoked"), "name"),
-        ],
-        [
-          "a NonRetryableError with a throwing step-control-flow getter",
-          () =>
-            withThrowingGetter(
-              new NonRetryableError("revoked"),
-              Symbol.for("@bratsos/workflow-engine/step-control-flow"),
-            ),
-        ],
-        [
           "a zod/v3 error with a throwing _zod getter",
           () => {
             try {
@@ -1155,6 +1143,24 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
           () => runInNewContext("Promise.reject(new Error('no'))"),
         ],
         [
+          "a rejected native Promise with its own Symbol.toStringTag",
+          () =>
+            Object.defineProperty(
+              Promise.reject(new Error("no")),
+              Symbol.toStringTag,
+              { value: "Task" },
+            ),
+        ],
+        [
+          "a rejected native Promise from another realm with its own Symbol.toStringTag",
+          () =>
+            Object.defineProperty(
+              runInNewContext("Promise.reject(new Error('no'))"),
+              Symbol.toStringTag,
+              { value: "Task" },
+            ),
+        ],
+        [
           "a rejected Promise whose then getter throws",
           () => {
             const p = Promise.reject(new Error("no"));
@@ -1192,6 +1198,32 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
         }
       });
 
+      it("reads no property of a returned object that is not a Promise", async () => {
+        let reads = 0;
+        const returned = new Proxy(
+          {},
+          {
+            get() {
+              reads++;
+              return undefined;
+            },
+          },
+        );
+        const body = failing(1, () => new QuotaError());
+        const run = await start(
+          env,
+          workflowOf(
+            "object-predicate",
+            directStage(body, {
+              retries: 1,
+              retryIf: (() => returned) as unknown as () => boolean,
+            }),
+          ),
+        );
+        expect(await run.execute(1)).toMatchObject({ outcome: "suspended" });
+        expect(reads).toBe(0);
+      });
+
       it("leaves the objects it returns unchanged", async () => {
         class Receipt {}
         class SdkPromise<T> extends Promise<T> {}
@@ -1219,8 +1251,10 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
       });
     });
 
+    // Main reads an Error's message in the step, and its name and stack in
+    // the executor: a getter there throws as it does on main (see below).
     describe.each(
-      brokenGetterCases,
+      brokenGetterCases.filter(([key]) => key !== "message"),
     )("a body error with a throwing %s getter", (_case, make) => {
       it("is recorded, and the step's own retry runs", async () => {
         const body = failing(1, make);
@@ -1236,7 +1270,13 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
         expect(await run.stage()).toMatchObject({ status: "COMPLETED" });
         expect(body.calls).toBe(2);
       });
+    });
 
+    describe.each(
+      brokenGetterCases.filter(
+        ([key]) => !["message", "name", "stack"].includes(key),
+      ),
+    )("a body error with a throwing %s getter", (_case, make) => {
       it("fails the job retryably, and the retry runs the step again", async () => {
         const body = failing(1, make);
         const run = await start(
@@ -1249,6 +1289,62 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
         });
         expect(await run.execute(2)).toMatchObject({ outcome: "completed" });
         expect(body.calls).toBe(2);
+      });
+    });
+
+    describe("a body error main cannot format", () => {
+      it.each([
+        ["name", () => withThrowingGetter(new Error("boom"), "name")],
+        ["stack", () => withThrowingGetter(new Error("boom"), "stack")],
+        [
+          "NonRetryableError name",
+          () => withThrowingGetter(new NonRetryableError("revoked"), "name"),
+        ],
+      ])("propagates a throwing %s getter from job.execute, as main does", async (_case, make) => {
+        const body = failing(1, make);
+        const run = await start(
+          env,
+          workflowOf("getter-main", directStage(body)),
+        );
+        await expect(run.execute(1)).rejects.toThrow(/ getter$/);
+        expect(await run.stage()).toMatchObject({ status: "RUNNING" });
+        expect(body.calls).toBe(1);
+      });
+
+      it("leaves the step unrecorded when its message getter throws, as main does", async () => {
+        const body = failing(1, () =>
+          withThrowingGetter(new Error("boom"), "message"),
+        );
+        const run = await start(
+          env,
+          workflowOf("getter-message", directStage(body, { retries: 1 })),
+        );
+        expect(await run.execute(1)).toMatchObject({
+          outcome: "failed",
+          willRetry: true,
+          error: "message getter",
+        });
+        const [row] = await env.stepLedger.list((await run.stage()).id);
+        expect(row).toMatchObject({ status: "running" });
+        expect(body.calls).toBe(1);
+      });
+
+      it("fails with the control-flow getter's error, as main does", async () => {
+        const body = failing(1, () =>
+          withThrowingGetter(
+            new NonRetryableError("revoked"),
+            Symbol.for("@bratsos/workflow-engine/step-control-flow"),
+          ),
+        );
+        const run = await start(
+          env,
+          workflowOf("getter-control-flow", directStage(body)),
+        );
+        expect(await run.execute(1)).toMatchObject({
+          outcome: "failed",
+          willRetry: true,
+          error: expect.stringMatching(/step-control-flow\) getter$/),
+        });
       });
     });
 

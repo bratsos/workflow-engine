@@ -109,6 +109,39 @@ describe("dead job verdict", () => {
     expect(await status()).toBe("RUNNING");
   });
 
+  it.each([
+    ["missing text first", true],
+    ["other text first", false],
+  ])("reads the message once to decide and to name the reason (%s)", async (_case, missingFirst) => {
+    let reads = 0;
+    const missing = "Stage only not found in workflow dead-verdict";
+    const flaky = new Error();
+    Object.defineProperty(flaky, "message", {
+      get() {
+        reads++;
+        return (reads === 1) === missingFirst ? missing : "transport busy";
+      },
+    });
+    const { kernel, jobTransport, message, status } = await claimedJob({
+      run: async () => {
+        throw flaky;
+      },
+    });
+
+    const settled = executeJobWithHeartbeat(kernel, {
+      jobTransport,
+      job: message,
+    });
+    if (missingFirst) {
+      expect(await settled).toMatchObject({ dead: true, error: missing });
+      expect(await status()).toBe("FAILED");
+    } else {
+      await expect(settled).rejects.toBe(flaky);
+      expect(await status()).toBe("RUNNING");
+    }
+    expect(reads).toBe(1);
+  });
+
   it("still acknowledges a job whose run no longer exists as dead", async () => {
     const { kernel, jobTransport, message, status } = await claimedJob();
 

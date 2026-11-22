@@ -69,37 +69,60 @@ export function isJobTargetMissingError(
   error: unknown,
   target: JobTarget,
 ): boolean {
+  return jobTargetMissingReason(error, target) !== undefined;
+}
+
+/**
+ * The text a host fails the job with when `error` is this job's missing
+ * target (see {@link isJobTargetMissingError}), else `undefined`. Each field
+ * is read once, so the decision and the text come from the same read.
+ */
+export function jobTargetMissingReason(
+  error: unknown,
+  target: JobTarget,
+): string | undefined {
   try {
-    return matchesJobTarget(error, target);
+    return readJobTargetMissing(error, target);
   } catch {
-    return false;
+    return undefined;
   }
 }
 
-function matchesJobTarget(error: unknown, target: JobTarget): boolean {
-  if (typeof error !== "object" || error === null) return false;
+function readJobTargetMissing(
+  error: unknown,
+  target: JobTarget,
+): string | undefined {
+  if (typeof error !== "object" || error === null) return undefined;
   const candidate = error as {
     [JOB_TARGET_MISSING]?: unknown;
     target?: Partial<JobTarget>;
     name?: unknown;
     message?: unknown;
   };
-  if (candidate[JOB_TARGET_MISSING] === true && candidate.target) {
-    return (
-      candidate.target.workflowId === target.workflowId &&
-      candidate.target.stageId === target.stageId &&
-      candidate.target.workflowRunId === target.workflowRunId
-    );
+  const named = candidate[JOB_TARGET_MISSING] === true && candidate.target;
+  if (named) {
+    if (
+      named.workflowId !== target.workflowId ||
+      named.stageId !== target.stageId ||
+      named.workflowRunId !== target.workflowRunId
+    ) {
+      return undefined;
+    }
+    let message: unknown;
+    try {
+      message = candidate.message;
+    } catch {
+      // The target decided; an unreadable text only loses the reason.
+    }
+    return typeof message === "string" ? message : "JobTargetMissingError";
   }
-  if (
-    candidate.name !== "JobTargetMissingError" &&
-    candidate.name !== "Error"
-  ) {
-    return false;
-  }
-  return Object.values(missingTargetMessages(target)).includes(
-    candidate.message as string,
-  );
+  const name = candidate.name;
+  if (name !== "JobTargetMissingError" && name !== "Error") return undefined;
+  const message = candidate.message;
+  return typeof message === "string" &&
+    Object.values(missingTargetMessages(target)).includes(message)
+    ? message
+    : undefined;
 }
 
 /** Thrown when a stage asks for AI without kernel AI services configured. */

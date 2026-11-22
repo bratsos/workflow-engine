@@ -149,6 +149,31 @@ describe("ctx.step.ai.map — consumer feedback surfaces", () => {
     expect(harness.mockAi.getCalls()).toHaveLength(1);
   });
 
+  it("fails the stage without a model call when choosing a batch provider throws a value with no string form", async () => {
+    const batch = {};
+    Object.defineProperty(batch, "provider", {
+      get() {
+        throw Object.assign(Object.create(null), { code: "unavailable" });
+      },
+    });
+    const workflow = mapWorkflow("map-provider-unprintable", {
+      model: BATCH_MODEL,
+      policy: "auto",
+      auto: { batchAbove: 1 },
+      batch,
+    });
+    const harness = createTestHarness({ workflows: [workflow] });
+    harness.mockAi.setTextResponse("process", { text: "processed" });
+
+    const result = await harness.run("map-provider-unprintable", {
+      items: ["a"],
+    });
+
+    // Main could not format the error, so it propagated: no realtime call.
+    expect(result.status).not.toBe("COMPLETED");
+    expect(harness.mockAi.getCalls()).toHaveLength(0);
+  });
+
   it("retries a thrown item call in-process and completes in one execution", async () => {
     const workflow = mapWorkflow("map-fail-twice", {
       realtime: { retries: 2, concurrency: 2 },

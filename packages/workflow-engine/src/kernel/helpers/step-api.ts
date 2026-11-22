@@ -132,31 +132,17 @@ function terminal<E extends Error>(error: E): E {
 }
 
 /**
- * The text a failed `run` row stores: main's, exactly, because a replay
- * reads it (a step's timeout text comes back as `StepTimeoutError`). Only
- * a value whose properties cannot be read gets other text, so its failure
- * is still recorded.
- */
-function rowText(error: unknown): string {
-  try {
-    return error instanceof Error ? error.message : String(error);
-  } catch {
-    return toErrorMessage(error);
-  }
-}
-
-/**
  * Keep a native Promise a predicate returned from rejecting unhandled, from
- * this realm or another (the `Object.prototype.toString` tag finds both).
+ * this realm or another, whatever its `Symbol.toStringTag`:
+ * `Promise.prototype.then` checks the internal promise slot before it reads
+ * anything, so any other value throws a TypeError with no getter invoked.
  * The application's value is never changed or wrapped, and no other
  * thenable is touched: a Promise whose `constructor` or species getter
  * throws, or a non-Promise thenable, can still reject unhandled.
  */
 function settleQuietly(value: object): void {
   try {
-    if (Object.prototype.toString.call(value) === "[object Promise]") {
-      Promise.prototype.then.call(value, undefined, () => {});
-    }
+    Promise.prototype.then.call(value, undefined, () => {});
   } catch {
     // Not a real Promise after all, or one that refuses a handler: nothing
     // more is attempted on the application's value.
@@ -691,16 +677,18 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
           abortSignal,
         });
       } catch (error) {
-        const message = rowText(error);
+        // Main's text: a value main could not format throws here as it did.
+        const message = error instanceof Error ? error.message : String(error);
         // Decided for this throw only, never written to the row: a
         // `NonRetryableError`, or a `retryIf` that says no, stops the step's
         // own `retries`, and a refusal is thrown as a `NonRetryableError`
         // with the original as `cause`. A replay of the row rebuilds a
         // plain error from its text, as on main.
+        const nonRetryable = isNonRetryableError(error);
         const declined =
-          !isNonRetryableError(error) &&
+          !nonRetryable &&
           retryIfDeclines(opts, error, record.attempt, options.onLog);
-        const stop = declined || isNonRetryableError(error);
+        const stop = declined || nonRetryable;
         const thrown = declined
           ? new NonRetryableError(message, { cause: error })
           : error;

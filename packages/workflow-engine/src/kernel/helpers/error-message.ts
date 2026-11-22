@@ -16,9 +16,14 @@ export function toErrorMessage(error: unknown): string {
  * instance: a zod core `$ZodError`, or an error decoded from JSON, carries
  * both as plain string fields. Used where a failure is classified and
  * recorded, so the name and text survive with the verdict. An `Error`
- * gets `toErrorMessage`'s text. Never throws.
+ * gets `toErrorMessage`'s text. Without a string `message` the text is
+ * `fallback` (text the caller already formatted), else `toErrorMessage`'s.
+ * Never throws.
  */
-export function describeThrown(error: unknown): {
+export function describeThrown(
+  error: unknown,
+  fallback?: string,
+): {
   name?: string;
   message: string;
 } {
@@ -38,7 +43,7 @@ export function describeThrown(error: unknown): {
   } catch {
     // A throwing getter: fall back to the plain text below.
   }
-  if (message === undefined) message = toErrorMessage(error);
+  if (message === undefined) message = fallback ?? toErrorMessage(error);
   try {
     if (typeof error === "object" && error !== null) {
       const read = (error as { name?: unknown }).name;

@@ -1,9 +1,8 @@
 import type { EnhancedStageContext, Stage } from "@bratsos/workflow-engine";
 import {
   AIServicesNotConfiguredError,
+  classifyThrown,
   createStepApi,
-  describeThrown,
-  isRetryableStageError,
 } from "@bratsos/workflow-engine/kernel";
 import type { z } from "zod";
 import type {
@@ -128,7 +127,7 @@ export async function runActivity(
       progress,
     };
   } catch (error) {
-    const { name, message } = describeThrown(error);
+    const { name, message, retryable } = classifyThrown(error);
     return {
       taskId: task.taskId,
       leaseToken: task.leaseToken,
@@ -137,7 +136,7 @@ export async function runActivity(
         error: message,
         ...(name ? { errorName: name } : {}),
         // The verdict `LocalExecutor` reaches; omitted when retryable.
-        ...(isRetryableStageError(error) ? {} : { retryable: false }),
+        ...(retryable ? {} : { retryable: false }),
       },
       logs,
       annotations,

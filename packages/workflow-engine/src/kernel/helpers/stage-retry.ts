@@ -8,7 +8,10 @@
 import type { KernelDeps } from "../kernel.js";
 import { HOST_DEFAULTS } from "./host-support.js";
 
-export { isRetryableStageError } from "./stage-error-class.js";
+export {
+  classifyThrown,
+  isRetryableStageError,
+} from "./stage-error-class.js";
 
 /**
  * Whether a failed attempt is retried: the error is not deterministic and

@@ -17,9 +17,8 @@ import {
   assertTimerMs,
   type BufferedLog,
   type CreateAnnotationInput,
-  describeThrown,
+  classifyThrown,
   type ExecutorDeps,
-  isRetryableStageError,
   type KernelEvent,
   normalizeAnnotateArgs,
 } from "@bratsos/workflow-engine/kernel";
@@ -87,12 +86,12 @@ export function createRemoteExecutor(
       try {
         validatedInput = stageDef.inputSchema.parse(input.rawInput);
       } catch (e) {
-        const { name, message } = describeThrown(e);
+        const { name, message, retryable } = classifyThrown(e);
         return {
           error: message,
           errorName: name,
           // Bad input fails identically on every attempt, as in LocalExecutor.
-          retryable: isRetryableStageError(e) ? undefined : false,
+          retryable: retryable ? undefined : false,
           progress: [],
           annotations: [],
           logs: [],

@@ -52,7 +52,7 @@ import {
   StepTimeoutError,
 } from "../../core/steps";
 import { getBestProviderForModel } from "../../utils/batch/model-mapping";
-import { describeThrown, toErrorMessage } from "./error-message";
+import { describeThrown } from "./error-message";
 
 const DEFAULT_CONCURRENCY = 10;
 const DEFAULT_BATCH_ABOVE = 20;
@@ -231,9 +231,26 @@ function pickTranscribeResult(result: AITranscribeResult): AITranscribeResult {
   };
 }
 
-/** A failed item's diagnostics, read once: a decoded `{ name, message }` keeps both. */
+/** Main's text for a thrown value: a throwing getter or coercion propagates. */
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * A failed item's diagnostics. An Error is read as main reads it, and any
+ * other value is first coerced as main coerces it, so a value main could not
+ * format still throws instead of becoming a verdict. A decoded
+ * `{ name, message }` then keeps both, each read once.
+ */
 function itemFailure(error: unknown): { error: string; errorName?: string } {
-  const { message, name } = describeThrown(error);
+  if (error instanceof Error) {
+    const message = error.message;
+    const name = error.name;
+    return name === undefined
+      ? { error: message }
+      : { error: message, errorName: name };
+  }
+  const { message, name } = describeThrown(error, String(error));
   return name === undefined
     ? { error: message }
     : { error: message, errorName: name };
@@ -893,8 +910,9 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
         }
       }
     } catch (error) {
-      // Main's text, read once: routing depends on whether it is empty.
-      batchBlocker = toErrorMessage(error);
+      // Main's text, read once: routing depends on whether it is empty, and
+      // a value main could not format propagates as it did.
+      batchBlocker = errorMessage(error);
     }
     if (!batchBlocker && entries.some((e) => typeof e.prompt !== "string")) {
       batchBlocker = "batch requests require string prompts";
