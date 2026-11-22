@@ -87,6 +87,7 @@ describe("liveness sweep", () => {
             const clean = await drive(build, -1, "error");
             const failures: string[] = [];
             for (let point = 1; point <= clean.faults.points; point++) {
+              await yieldToHost();
               const result = await drive(build, point, mode);
               if (!result.faults.firedAt) continue;
               const invariants = await invariantErrors(result);
@@ -409,6 +410,12 @@ async function runTwoWorkerSchedule(
   };
 }
 
+/**
+ * A sweep runs on promises alone, which never let Vitest's worker answer its
+ * RPC: yield one macrotask per run so a long sweep keeps its heartbeat.
+ */
+const yieldToHost = () => new Promise<void>((resolve) => setImmediate(resolve));
+
 async function assertInterleavings(
   build: () => SweepScenario,
   schedules: readonly InterleavedCommand[][],
@@ -418,6 +425,7 @@ async function assertInterleavings(
   const failures: string[] = [];
 
   for (let index = 0; index < schedules.length; index++) {
+    await yieldToHost();
     const result = await runTwoWorkerSchedule(build, schedules[index]!, mode);
     const errors = await invariantErrors(result);
     const accepted =
