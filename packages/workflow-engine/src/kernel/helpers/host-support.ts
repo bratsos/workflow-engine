@@ -11,7 +11,7 @@
  */
 
 import { z } from "zod";
-import { StageAbortedError } from "../../core/steps.js";
+import { parseStepDuration, StageAbortedError } from "../../core/steps.js";
 import type {
   PurgeableRunStatus,
   ServedDefinition,
@@ -53,6 +53,24 @@ export function assertTimerMs(
     );
   }
   return value;
+}
+
+/**
+ * {@link assertTimerMs} for a duration option that takes milliseconds or a
+ * string such as `"30s"` (see `parseStepDuration`). A number goes to
+ * `assertTimerMs` as given, so `NaN`, `Infinity` and a negative number get its
+ * message; a malformed string keeps `parseStepDuration`'s own.
+ */
+export function timerDurationMs(
+  name: string,
+  value: number | string,
+  options?: { allowZero?: boolean; hint?: string },
+): number {
+  return assertTimerMs(
+    name,
+    typeof value === "number" ? value : parseStepDuration(value),
+    options,
+  );
 }
 
 export const HOST_DEFAULTS = {

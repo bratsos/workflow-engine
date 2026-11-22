@@ -8,7 +8,9 @@
     "declarationMap": true,
     "sourceMap": true,
     "noEmit": true,
+    "noUncheckedIndexedAccess": false,
     "verbatimModuleSyntax": false,
+    "noImplicitOverride": false,
     "types": ["node"],
     "paths": {
       "@bratsos/workflow-engine": ["../workflow-engine/src/index.ts"],

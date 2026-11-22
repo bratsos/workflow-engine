@@ -342,7 +342,7 @@ The `--allow-direct-connection` flag requires explicit acknowledgement that conn
 | `--port <n>` | number | `7799` | Port to bind (1–65535) |
 | `--host <addr>` | string | `127.0.0.1` | Loopback address to bind (`127.0.0.1`, `localhost`, `::1`) |
 | `--actions` | boolean | `false` | Enable write actions; requires `kernel` in `--config` |
-| `--poll <ms>` | number | `5000` | UI poll interval in milliseconds |
+| `--poll <ms>` | number | `5000` | UI poll interval in milliseconds: `0` turns polling off, otherwise 1 to 2147483647 (anything else is refused with the option named) |
 | `--help`, `-h` | boolean | `false` | Display command help |
 
 ## What it shows

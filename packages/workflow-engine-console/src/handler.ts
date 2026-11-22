@@ -1,3 +1,4 @@
+import { assertTimerMs } from "@bratsos/workflow-engine/kernel";
 import {
   type ConsoleAction,
   type ConsoleActionEvent,
@@ -221,6 +222,9 @@ export function createWorkflowConsole(
     cspNonce,
     onAction,
   } = options;
+
+  // 0 pauses polling; anything else becomes a browser timer.
+  assertTimerMs("pollIntervalMs", pollIntervalMs, { allowZero: true });
 
   if (actions && !kernel) {
     throw new Error(

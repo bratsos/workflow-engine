@@ -20,6 +20,7 @@ import { realpathSync } from "node:fs";
 import { createServer } from "node:http";
 import { resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { assertTimerMs } from "@bratsos/workflow-engine/kernel";
 import type { ConsoleKernel } from "./actions";
 import { createWorkflowConsole } from "./handler";
 import { toNodeHandler } from "./node";
@@ -129,10 +130,9 @@ export function parseArgs(argv: string[]): CliOptions {
         break;
       case "--poll": {
         const poll = Number(next());
-        if (!Number.isFinite(poll) || poll < 0) {
-          throw new Error("--poll must be a non-negative number.");
-        }
-        options.pollIntervalMs = poll;
+        options.pollIntervalMs = assertTimerMs("--poll", poll, {
+          allowZero: true,
+        });
         break;
       }
       case "--help":

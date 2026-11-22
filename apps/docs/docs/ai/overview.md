@@ -96,7 +96,7 @@ const result = await ai.generateText(
     maxTokens: 1000,
     maxRetries: 3,                 // passed to the provider SDK
     abortSignal: ctx.abortSignal,  // cancellation / lost lease reaches the call
-    timeoutMs: 120_000,            // per-call deadline; AICallTimeoutError on expiry
+    timeoutMs: 120_000,            // per-call deadline, 1 to 2147483647 ms (else a RangeError before the call); AICallTimeoutError on expiry
   }
 );
 
@@ -104,6 +104,8 @@ console.log(result.text);         // The generated string
 console.log(result.cost);         // Calculated USD cost (e.g. 0.00015)
 console.log(result.inputTokens);  // Input token count
 ```
+
+A per-call `timeoutMs` and the helper-level `timeout.perCallMs` must be a number of milliseconds from `1` to `2147483647` (the longest delay a timer honours, about 24.8 days): `0`, a fraction below 1, `NaN`, `Infinity`, a negative number or a larger value throws a `RangeError` that names the option (`timeoutMs` per call, `timeout.perCallMs` when the helper is created) before any request is made, because a timer fires after 1 ms on such a value. Leave both out for no deadline.
 
 #### Multimodal Input
 You can pass an array containing text and image/document buffers to `generateText`:

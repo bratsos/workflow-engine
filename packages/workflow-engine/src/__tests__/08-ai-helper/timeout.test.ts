@@ -6,6 +6,8 @@ import {
   type ProviderResolver,
 } from "../../ai/ai-helper.js";
 import { registerModels } from "../../ai/model-helper.js";
+import type { AIAdapter } from "../../ai/types.js";
+import { MAX_TIMER_MS } from "../../kernel/helpers/host-support.js";
 import { InMemoryAICallLogger } from "../../testing/in-memory-ai-logger.js";
 
 const MODEL = "timeout-test-model";
@@ -72,5 +74,78 @@ describe("AI call timeouts", () => {
     await assertion;
 
     expect(aiLogger.getCallsByTopic("timeout.stream")).toHaveLength(1);
+  });
+
+  const BAD = [0, -1, NaN, Infinity, 0.5, MAX_TIMER_MS + 1, "100"];
+  const message = (name: string) =>
+    new RegExp(
+      `${name} must be a number of milliseconds from 1 to ${MAX_TIMER_MS}`,
+    );
+  const echo = () => {
+    const calls: unknown[] = [];
+    const adapter: AIAdapter = {
+      generateText: async (request) => {
+        calls.push(request);
+        return { text: "ok", inputTokens: 1, outputTokens: 1 };
+      },
+    };
+    return { adapter, calls };
+  };
+
+  it("refuses a per-call timeoutMs a timer cannot honour before the call is made", async () => {
+    const { adapter, calls } = echo();
+    const aiLogger = new InMemoryAICallLogger();
+    const ai = createAIHelper("timeout.call", aiLogger, undefined, undefined, {
+      adapter,
+    });
+
+    for (const bad of BAD) {
+      await expect(
+        ai.generateText(MODEL, "x", { timeoutMs: bad as number }),
+        String(bad),
+      ).rejects.toThrow(message("timeoutMs"));
+    }
+    expect(calls).toHaveLength(0);
+    expect(aiLogger.getCallsByTopic("timeout.call")).toHaveLength(0);
+
+    for (const ok of [1, MAX_TIMER_MS]) {
+      await expect(
+        ai.generateText(MODEL, "x", { timeoutMs: ok }),
+      ).resolves.toMatchObject({ text: "ok" });
+    }
+    expect(calls).toHaveLength(2);
+  });
+
+  it("refuses a timeout.perCallMs a timer cannot honour when the helper is created", async () => {
+    const { adapter, calls } = echo();
+    const aiLogger = new InMemoryAICallLogger();
+
+    for (const bad of BAD) {
+      expect(
+        () =>
+          createAIHelper("timeout.config", aiLogger, undefined, undefined, {
+            adapter,
+            timeout: { perCallMs: bad as number },
+          }),
+        String(bad),
+      ).toThrow(message("timeout.perCallMs"));
+    }
+
+    for (const ok of [1, MAX_TIMER_MS]) {
+      const ai = createAIHelper(
+        "timeout.config",
+        aiLogger,
+        undefined,
+        undefined,
+        {
+          adapter,
+          timeout: { perCallMs: ok },
+        },
+      );
+      await expect(ai.generateText(MODEL, "x")).resolves.toMatchObject({
+        text: "ok",
+      });
+    }
+    expect(calls).toHaveLength(2);
   });
 });
