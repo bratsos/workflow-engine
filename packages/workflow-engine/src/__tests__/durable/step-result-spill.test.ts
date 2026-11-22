@@ -282,6 +282,51 @@ describe("payload spill: per-write keys", () => {
   });
 });
 
+describe("payload spill: rows an older release spilled to flat keys", () => {
+  it("a write over one deletes neither its own flat key nor a sibling's that extends it", async () => {
+    const { blobStore, ledger, spilled } = ledgerSetup();
+    // Before 1.0.0-alpha.21 a row's blob was `<prefix><stepId>.json`, so
+    // step "x.json" has a key that starts with step "x"'s.
+    const older = createPayloadSpill({ blobStore, thresholdBytes: 1000 });
+    const flat = (stepId: string) =>
+      `${stepSpillPrefix("stage-1")}${encodeURIComponent(stepId)}.json`;
+    for (const stepId of ["extract:0", "extract:0.json"]) {
+      await ledger.claim({ ...RUNNING_RUN_STEP, stepId });
+      await ledger.update("stage-1", stepId, {
+        status: "completed",
+        result: await older.pack(flat(stepId), { text: stepId.repeat(500) }),
+        leaseExpiresAt: null,
+      });
+    }
+    const deleted: string[] = [];
+    const remove = blobStore.delete.bind(blobStore);
+    blobStore.delete = async (key) => {
+      deleted.push(key);
+      return remove(key);
+    };
+
+    const outcome = await spilled.compareAndSet(
+      "stage-1",
+      "extract:0",
+      { status: "completed" },
+      { result: { text: "z".repeat(5000) } },
+    );
+    // An older writer that runs later reuses the flat key.
+    await older.pack(flat("extract:0"), {
+      text: "older writer again".repeat(100),
+    });
+
+    expect(outcome.applied).toBe(true);
+    expect(deleted).toEqual([]);
+    expect(await spilled.get("stage-1", "extract:0.json")).toMatchObject({
+      result: { text: "extract:0.json".repeat(500) },
+    });
+    expect(await blobStore.get(flat("extract:0"))).toEqual({
+      text: "older writer again".repeat(100),
+    });
+  });
+});
+
 describe("payload spill: end to end through the kernel", () => {
   it("a step result over the default threshold lives in the blob store and the stage still reads all of it", async () => {
     const In = z.object({});

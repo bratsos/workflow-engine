@@ -42,13 +42,19 @@ export interface PayloadSpill {
   readonly thresholdBytes: number;
   pack(key: string, value: unknown): Promise<unknown>;
   unpack(value: unknown): Promise<unknown>;
-  deleteUnder(prefix: string, keep?: Iterable<string>): Promise<void>;
+  deleteUnder(
+    prefix: string,
+    keep?: Iterable<string>,
+    keepUnder?: Iterable<string>,
+  ): Promise<void>;
+  deleteKey?(key: string): Promise<void>;
 }
 ```
 
 - `pack(key, value)` serialises `value` to JSON to compute its UTF-8 byte length. If `value` is `null`, `undefined`, not JSON-serialisable, already a `SpillRef`, or its serialised length does not exceed `thresholdBytes`, `pack` returns `value` untouched. If the byte length exceeds `thresholdBytes`, it writes `value` to `blobStore.put(key, value)` and returns a `SpillRef`.
 - `unpack(value)` checks `isSpillRef(value)`. If it is not a reference, it returns `value` untouched. If it is a `SpillRef`, it fetches the value via `blobStore.get(value.key)`. If `blobStore.get` throws or returns `null` or `undefined`, it throws `SpilledPayloadUnavailableError`.
 - `deleteUnder(prefix, keep)` lists keys under `prefix` using `blobStore.list(prefix)` and deletes all keys except those in `keep`. This partial retention is required when clearing a step ledger while preserving active external step keys.
+- `deleteKey(key)` (optional) deletes exactly one key. The step ledger decorator uses it to delete a blob nothing names any more; a hand-written `PayloadSpill` without it leaves those blobs to `deleteUnder`.
 
 ## Durable step results (automatic)
 
@@ -75,14 +81,14 @@ const stepLedger = config.stepLedger
 - `update`: Packs `patch.result` if present before calling the underlying ledger update, then resolves the returned record.
 - `compareAndSet`: Packs `patch.result` if present before executing the compare-and-set, then resolves the returned record. A compare-and-set that does not apply (and a `claim` that finds the row) deletes the blob it packed: nothing names it.
 - `list`: Resolves `record.result` across all returned records in parallel.
-- `update` / `compareAndSet` that applies a spilled result: deletes the blob the previous version of the row named (best-effort).
+- `update` / `compareAndSet` that applies a spilled result: deletes the exact per-write key the previous version of the row named (best-effort). A flat `<stepId>.json` key is never deleted this way, because a release before 1.0.0-alpha.21 writes the same key again.
 - `clear`: Clears the stage ledger rows first, then calls `spill.deleteUnder` on `stepSpillPrefix(stageRecordId)` and `stepWriteSpillPrefix(stageRecordId)` to purge spilled blobs. Cleaning up rows before deleting blobs ensures that an intermediate failure leaves an orphaned blob rather than an orphaned reference pointing to missing storage.
 - `clearExcept`: Forwards directly to the underlying ledger if implemented, retaining blobs for any `keepStepIds` so that preserved rows remain readable on subsequent replays.
 
 Blob keys for durable steps are structured predictably:
 - Step prefix (rows written before 1.0.0-alpha.21): `workflow-v2/spill/steps/${encodeURIComponent(stageRecordId)}/`
 - Per-write prefix: `workflow-v2/spill/step-writes/${encodeURIComponent(stageRecordId)}/`, a sibling, so an older release's `clearExcept` (which deletes everything under the step prefix but the flat keys of the rows it keeps) never lists it
-- Step key: `${stepWriteSpillPrefix(stageRecordId)}${encodeURIComponent(stepId)}/${crypto.randomUUID()}.json`, a new key for every write, so the blob a committed row names is never written again (an execution that loses the row cannot change what the winner's record resolves to). Rows written before 1.0.0-alpha.21 name `${stepSpillPrefix(stageRecordId)}${encodeURIComponent(stepId)}.json` and are read through their reference as before; `clearExcept` keeps both forms for the rows it keeps, and `run.purge` deletes both prefixes. A row rewritten inline over a spilled result leaves that one blob until the stage's ledger is cleared or the run purged. An older release's `run.purge` does not list the per-write prefix, so a run it purges leaves those blobs behind.
+- Step key: `${stepWriteSpillPrefix(stageRecordId)}${encodeURIComponent(stepId)}/${crypto.randomUUID()}.json`, a new key for every write, so the blob a committed row names is never written again (an execution that loses the row cannot change what the winner's record resolves to). Rows written before 1.0.0-alpha.21 name `${stepSpillPrefix(stageRecordId)}${encodeURIComponent(stepId)}.json` and are read through their reference as before; `clearExcept` keeps both forms for the rows it keeps, and `run.purge` deletes both prefixes. A row rewritten inline over a spilled result leaves that one blob until the stage's ledger is cleared or the run purged. An older release's `run.purge` and `run.redrive` from the start do not list the per-write prefix, so a run they purge or redrive leaves those blobs behind.
 
 Because the kernel owns all reads and writes to `StepLedger`, `ctx.step.run(...)` transparently receives the original value on both initial execution and replay without developer intervention. Every step outcome write spills the same way — `run` and `waitFor` results, `ctx.step.ai.*` results and a map item's failed verdict — and every read resolves, including a replay answered from the ledger and a worker parked on another worker's outcome. Spilled blobs go with their rows: clearing a stage's ledger (a redrive, a fresh attempt of a terminally failed stage) deletes them, a partial `clearExcept` keeps the blobs of the rows it keeps, and `run.purge` deletes both spill prefixes of a run along with its stage outputs and artifacts. Measured on one stage with two large step results: 520,022 inline bytes before spilling, 224 after; a 300,036-byte job payload becomes a 79-byte queue row.
 

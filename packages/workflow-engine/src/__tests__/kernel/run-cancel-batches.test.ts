@@ -20,7 +20,7 @@ import {
   type StepApi,
 } from "../../core/steps.js";
 import { batchRefsOfSubmitRow } from "../../kernel/helpers/batch-submit-record.js";
-import { stepWriteSpillPrefix } from "../../kernel/spill.js";
+import { stepSpillPrefix, stepWriteSpillPrefix } from "../../kernel/spill.js";
 import {
   BATCH_MODEL,
   createAiMapHarness,
@@ -464,6 +464,116 @@ describe("run.cancel: provider batches", () => {
       }),
     ]);
     expect(h.cancelCalls).toEqual(["batch-1"]);
+  });
+
+  it("cancels the readable batches of a stage and warns for a submit record it cannot read", async () => {
+    const h = await setup("cancel-unreadable-submit", {
+      secondMap: true,
+      spillThresholdBytes: 1,
+    });
+    // The first map's batch ends at once, so the second map submits too.
+    vi.mocked(h.model.status).mockImplementation(async (ref) => ({
+      status:
+        ref.id === "batch-1" ? ("completed" as const) : ("pending" as const),
+    }));
+    await h.execute();
+    const sid = (await h.stage())!.id;
+    const key = (
+      (await h.ledger.get(sid, "extract:submit"))!.result as {
+        key: string;
+      }
+    ).key;
+    const read = h.blobStore.get.bind(h.blobStore);
+    h.blobStore.get = async (k) => {
+      if (k === key) throw new Error("object unavailable");
+      return read(k);
+    };
+
+    const result = await h.cancel();
+
+    expect(result.batches).toEqual([
+      expect.objectContaining({ status: "cancelled", stepId: "second:submit" }),
+    ]);
+    expect(h.cancelCalls).toEqual(["batch-2"]);
+    expect(
+      h.warnings().filter((w) => w.message.includes('"extract:submit"')),
+    ).toEqual([
+      expect.objectContaining({
+        message: expect.stringContaining(key),
+      }),
+    ]);
+  });
+
+  it("reads the current submit record when a concurrent cancel retired the blob it first read", async () => {
+    const h = await setup("cancel-stale-read", { spillThresholdBytes: 1 });
+    await h.execute();
+    const sid = (await h.stage())!.id;
+    const key = (
+      (await h.ledger.get(sid, "extract:submit"))!.result as {
+        key: string;
+      }
+    ).key;
+    let entered!: () => void;
+    let release!: () => void;
+    const reading = new Promise<void>((r) => (entered = r));
+    const go = new Promise<void>((r) => (release = r));
+    const read = h.blobStore.get.bind(h.blobStore);
+    let armed = true;
+    h.blobStore.get = async (k) => {
+      if (armed && k === key) {
+        armed = false;
+        entered();
+        await go;
+      }
+      return read(k);
+    };
+
+    const first = h.cancel();
+    await reading;
+    await h.cancel();
+    release();
+    const result = await first;
+
+    // Like a repeated run.cancel, it asks the provider again (idempotent).
+    expect(result.batches).toEqual([
+      expect.objectContaining({
+        status: "cancelled",
+        stepId: "extract:submit",
+      }),
+    ]);
+    expect(new Set(h.cancelCalls)).toEqual(new Set(["batch-1"]));
+  });
+
+  it("leaves the blob of a sibling whose id extends a submit row's, on rows an older release spilled", async () => {
+    const h = await setup("cancel-flat-sibling", {
+      spillThresholdBytes: 1,
+      beforeMap: async (ctx) => {
+        await ctx.step.run("extract:submit.json", async () => "sibling");
+      },
+    });
+    await h.execute();
+    const sid = (await h.stage())!.id;
+    // Move both rows to the flat layout of releases before 1.0.0-alpha.21.
+    const flat = (stepId: string) =>
+      `${stepSpillPrefix(sid)}${encodeURIComponent(stepId)}.json`;
+    for (const stepId of ["extract:submit", "extract:submit.json"]) {
+      const ref = (await h.ledger.get(sid, stepId))!.result as { key: string };
+      await h.blobStore.put(flat(stepId), await h.blobStore.get(ref.key));
+      await h.blobStore.delete(ref.key);
+      await h.ledger.update(sid, stepId, {
+        result: { ...ref, key: flat(stepId) },
+      });
+    }
+
+    const result = await h.cancel();
+
+    expect(result.batches).toEqual([
+      expect.objectContaining({
+        status: "cancelled",
+        stepId: "extract:submit",
+      }),
+    ]);
+    expect(await h.blobStore.get(flat("extract:submit.json"))).toBe("sibling");
   });
 
   it("keeps one spilled blob per submit row however often run.cancel is repeated", async () => {

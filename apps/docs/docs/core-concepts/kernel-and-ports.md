@@ -171,7 +171,8 @@ spilled result deletes the blob the previous version named. Rows written
 before 1.0.0-alpha.21 name `workflow-v2/spill/steps/<stageRecordId>/<stepId>.json`
 and are still read through their reference; the new keys live under a
 separate prefix, so an older release's redrive, which clears the old prefix,
-cannot delete them.
+cannot delete them. An older release's `run.purge` or `run.redrive` from
+the start leaves them in the blob store.
 
 This is on by default and needs no wiring: `createKernel` already has a
 `blobStore`, so it wraps the `stepLedger` you give it. Reads resolve the

@@ -622,7 +622,19 @@ export async function cancelRunBatches(
       try {
         // Only the submit rows: another row's unreadable spilled result
         // must not hide a batch.
-        rows = await listStepRows(ledger, stage.id, isSubmitStepRow);
+        const listed = await listStepRows(ledger, stage.id, isSubmitStepRow);
+        rows = listed.rows;
+        for (const lost of listed.unreadable) {
+          await warn(
+            `Run cancelled, but the stored submit record of step "${lost.stepId}" in stage "${stage.stageId}" could not be read from blob "${lost.key}" (${toErrorMessage(lost.error)}), so its provider batches were not cancelled. ${(await runStillCancelled()) ? "Repeat run.cancel to retry." : "Look them up at the provider and cancel them there."}`,
+            {
+              stageId: stage.stageId,
+              stepId: lost.stepId,
+              key: lost.key,
+              error: toErrorMessage(lost.error),
+            },
+          );
+        }
       } catch (error) {
         await warn(
           `Run cancelled, but the durable steps of stage "${stage.stageId}" could not be read (${toErrorMessage(error)}), so its provider batches were not cancelled. ${(await runStillCancelled()) ? "Repeat run.cancel to retry." : "Look them up at the provider and cancel them there."}`,

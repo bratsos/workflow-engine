@@ -146,6 +146,12 @@ export interface PayloadSpill {
     keep?: Iterable<string>,
     keepUnder?: Iterable<string>,
   ): Promise<void>;
+  /**
+   * Best-effort delete of exactly one spilled value. Optional so that a
+   * hand-written `PayloadSpill` still type-checks; without it the step
+   * ledger decorator leaves superseded blobs to `deleteUnder`.
+   */
+  deleteKey?(key: string): Promise<void>;
 }
 
 /**
@@ -214,6 +220,10 @@ export function createPayloadSpill(
         throw new SpilledPayloadUnavailableError(value.key);
       }
       return blob;
+    },
+
+    async deleteKey(key) {
+      await blobStore.delete(key).catch(() => {});
     },
 
     async deleteUnder(prefix, keep, keepUnder) {
@@ -309,8 +319,14 @@ export function withStepResultSpill(
    */
   async function retire(previous: StepRecord | null, packed: unknown) {
     const old = previous?.result;
-    if (isSpillRef(old) && !(isSpillRef(packed) && packed.key === old.key)) {
-      await spill.deleteUnder(old.key).catch(() => {});
+    // Only a per-write key: a flat `<stepId>.json` key is written again by a
+    // release before 1.0.0-alpha.21, so a late delete could take its bytes.
+    if (
+      isSpillRef(old) &&
+      old.key.startsWith(stepWriteSpillPrefix(previous!.stageRecordId)) &&
+      !(isSpillRef(packed) && packed.key === old.key)
+    ) {
+      await spill.deleteKey?.(old.key).catch(() => {});
     }
   }
 
@@ -333,7 +349,7 @@ export function withStepResultSpill(
   /** Delete the blob a write that did not apply spilled; nothing names it. */
   async function discard(packed: unknown, original: unknown): Promise<void> {
     if (packed !== original && isSpillRef(packed)) {
-      await spill.deleteUnder(packed.key).catch(() => {});
+      await spill.deleteKey?.(packed.key).catch(() => {});
     }
   }
 
@@ -459,22 +475,54 @@ const unresolvedLists = new WeakMap<
   { ledger: StepLedger; resolve: (record: StepRecord) => Promise<StepRecord> }
 >();
 
+/** A row `listStepRows` selected whose spilled result could not be read. */
+export interface UnreadableStepRow {
+  stepId: string;
+  key: string;
+  error: unknown;
+}
+
 /**
- * The rows of a stage record that `wanted` selects, with only their results
- * resolved: a spilled result of another row that cannot be read does not
- * fail the call. `wanted` sees the row as stored (its `result` may be a
- * spill reference). A ledger not built by `withStepResultSpill` is listed
- * whole.
+ * The rows of a stage record that `wanted` selects, each resolved on its
+ * own: a spilled result that cannot be read (after one re-read of its row,
+ * in case a concurrent write retired the blob the first read named) is
+ * reported in `unreadable` and does not hide the other rows. `wanted` sees
+ * the row as stored (its `result` may be a spill reference). A ledger not
+ * built by `withStepResultSpill` is listed whole.
  */
 export async function listStepRows(
   ledger: StepLedger,
   stageRecordId: string,
   wanted: (row: StepRecord) => boolean,
-): Promise<StepRecord[]> {
+): Promise<{ rows: StepRecord[]; unreadable: UnreadableStepRow[] }> {
   const spilled = unresolvedLists.get(ledger);
-  if (!spilled) return (await ledger.list(stageRecordId)).filter(wanted);
-  const rows = (await spilled.ledger.list(stageRecordId)).filter(wanted);
-  return Promise.all(rows.map(spilled.resolve));
+  if (!spilled) {
+    return {
+      rows: (await ledger.list(stageRecordId)).filter(wanted),
+      unreadable: [],
+    };
+  }
+  const { ledger: raw, resolve } = spilled;
+  const rows: StepRecord[] = [];
+  const unreadable: UnreadableStepRow[] = [];
+  for (const row of (await raw.list(stageRecordId)).filter(wanted)) {
+    try {
+      rows.push(await resolve(row));
+    } catch (error) {
+      const current = await raw.get(stageRecordId, row.stepId).catch(() => row);
+      try {
+        if (current && wanted(current)) rows.push(await resolve(current));
+      } catch {
+        const key = isSpillRef(current?.result)
+          ? current.result.key
+          : isSpillRef(row.result)
+            ? row.result.key
+            : "";
+        unreadable.push({ stepId: row.stepId, key, error });
+      }
+    }
+  }
+  return { rows, unreadable };
 }
 
 // ============================================================================
