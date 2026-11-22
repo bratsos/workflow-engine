@@ -952,9 +952,7 @@ describe("I want to build multi-stage pipelines", () => {
 
       // Verify via blobStore
       const keys = await blobStore.list("");
-      const finalizeKey = keys.find((k) =>
-        /\/finalize\/attempts\/[^/]+\/output\.json$/.test(k),
-      );
+      const finalizeKey = keys.find((k) => k.includes("/finalize/output.json"));
       expect(finalizeKey).toBeDefined();
       const finalOutput = (await blobStore.get(finalizeKey!)) as any;
       expect(finalOutput.summary.fromInit).toBe(10);

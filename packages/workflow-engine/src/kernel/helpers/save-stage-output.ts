@@ -37,6 +37,36 @@ export async function saveStageOutput(
   return key;
 }
 
+/**
+ * After the stage write committed: copy the winner's output and artifacts
+ * to the fixed per-stage keys every earlier release wrote
+ * (`<stage>/output.json`, the default `getStageKey(stageId)`, and
+ * `<stage>/artifacts/<name>.json`), for code that reads them there. Only a
+ * committed attempt calls this, never one that lost its fence. Best-effort:
+ * the pointer in `outputData` is what the engine reads.
+ */
+export async function publishStageKeys(
+  runId: string,
+  workflowType: string,
+  stageId: string,
+  output: unknown,
+  artifacts: Record<string, unknown> | undefined,
+  deps: Pick<KernelDeps, "blobStore">,
+): Promise<void> {
+  const base = `workflow-v2/${workflowType}/${runId}/${stageId}`;
+  try {
+    await deps.blobStore.put(`${base}/output.json`, output);
+    for (const [name, artifact] of Object.entries(artifacts ?? {})) {
+      await deps.blobStore.put(
+        `${base}/artifacts/${encodeURIComponent(name)}.json`,
+        artifact,
+      );
+    }
+  } catch {
+    // The committed pointer stays authoritative.
+  }
+}
+
 /** The blob keys a stage record's outputData points at. */
 export function outputKeys(stage: WorkflowStageRecord): string[] {
   const data = stage.outputData as {

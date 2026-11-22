@@ -84,6 +84,84 @@ function mergeDefined<T extends object>(base: T, rest: Partial<T>): T {
   return merged;
 }
 
+const TX_JOURNAL = Symbol("inMemoryTxJournal");
+const JOURNALED_FIELDS = [
+  "runs",
+  "definitions",
+  "stages",
+  "logs",
+  "artifacts",
+  "annotations",
+  "annotationSequence",
+  "nextAnnotationSequence",
+  "outbox",
+  "outboxClaims",
+  "lastOutboxRun",
+  "idempotencyKeys",
+  "idempotencyInProgress",
+  "outboxSequences",
+] as const;
+
+/** A Map or array whose writes record their undo; anything else as it is. */
+function journaled(
+  value: unknown,
+  journal: Array<() => void>,
+  current: () => unknown,
+): unknown {
+  if (value instanceof Map) {
+    const map = value;
+    return new Proxy(map, {
+      get(target, prop) {
+        if (prop === "set" || prop === "delete") {
+          return (key: unknown, next?: unknown) => {
+            const had = target.has(key);
+            const previous = target.get(key);
+            journal.push(() => {
+              if (had) target.set(key, previous);
+              else target.delete(key);
+            });
+            return prop === "set"
+              ? (target.set(key, next), map)
+              : target.delete(key);
+          };
+        }
+        if (prop === "clear") {
+          return () => {
+            const entries = [...target.entries()];
+            journal.push(() => {
+              for (const [k, v] of entries) target.set(k, v);
+            });
+            target.clear();
+          };
+        }
+        const member = Reflect.get(target, prop, target);
+        return typeof member === "function" ? member.bind(target) : member;
+      },
+    });
+  }
+  if (Array.isArray(value)) {
+    return new Proxy(value, {
+      get(target, prop) {
+        if (prop === "push") {
+          return (...items: unknown[]) => {
+            journal.push(() => {
+              const list = current() as unknown[];
+              for (const item of items) {
+                const at = list.indexOf(item);
+                if (at >= 0) list.splice(at, 1);
+              }
+            });
+            return target.push(...items);
+          };
+        }
+        const member = Reflect.get(target, prop, target);
+        return typeof member === "function" ? member.bind(target) : member;
+      },
+    });
+  }
+  return value;
+}
+
 export class InMemoryWorkflowPersistence implements WorkflowPersistence {
   private runs = new Map<string, WorkflowRunRecord>();
   private definitions = new Map<string, WorkflowDefinitionRecord>();
@@ -129,10 +207,43 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
     return `${commandType}:${key}`;
   }
 
+  /**
+   * Rolls back like the Prisma adapter: `fn` gets a view of this store
+   * whose every container write is journaled, and a throw undoes them in
+   * reverse order. Writes made outside the transaction meanwhile (another
+   * caller on the store itself) are not touched. A nested call joins the
+   * outer transaction. shortcut: in-place field updates of an outbox record
+   * (the publish/DLQ methods, never used inside a kernel transaction) are
+   * not journaled.
+   */
   async withTransaction<T>(
     fn: (tx: WorkflowPersistence) => Promise<T>,
   ): Promise<T> {
-    return fn(this);
+    if (Object.prototype.hasOwnProperty.call(this, TX_JOURNAL)) return fn(this);
+    const journal: Array<() => void> = [];
+    const view = Object.create(this) as this;
+    Object.defineProperty(view, TX_JOURNAL, { value: journal });
+    // An uncommitted view, as on Prisma: outbox delivery waits for the root.
+    Object.defineProperty(view, "outboxDeliveryDeferred", { value: true });
+    const store = this as unknown as Record<string, unknown>;
+    for (const field of JOURNALED_FIELDS) {
+      Object.defineProperty(view, field, {
+        get: () => journaled(store[field], journal, () => store[field]),
+        set: (value: unknown) => {
+          const previous = store[field];
+          journal.push(() => {
+            store[field] = previous;
+          });
+          store[field] = value;
+        },
+      });
+    }
+    try {
+      return await fn(view);
+    } catch (error) {
+      for (const undo of journal.reverse()) undo();
+      throw error;
+    }
   }
 
   // ============================================================================

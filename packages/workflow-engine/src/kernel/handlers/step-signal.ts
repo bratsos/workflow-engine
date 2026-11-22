@@ -1,5 +1,4 @@
 import { StepResultNotSerializable } from "../../core/steps.js";
-import { StaleVersionError } from "../../persistence/interface.js";
 import type { StepSignalCommand, StepSignalResult } from "../commands.js";
 import type { KernelEvent } from "../events.js";
 import { toOutboxEvents } from "../helpers/outbox-events.js";
@@ -76,32 +75,7 @@ async function deliverSignal(
   // A row is told apart by its completion time and, for a replacement written
   // in the same tick, by its creation time, position and attempt. A claim
   // stored before `row` existed carries `delivery` alone and stays valid.
-  //
-  // The nudge (`nextPollAt` now) goes only to a stage that is not RUNNING,
-  // fenced on the version read. A RUNNING attempt sets `nextPollAt` itself
-  // when it settles, and its own write is fenced on the version it started
-  // with: a nudge there would have no effect but to discard its result.
-  let current: WorkflowStageRecord = stage;
-  const wake = async (
-    record: StepRecord,
-    alreadyCompleted: boolean,
-  ): Promise<HandlerResult<StepSignalResult>> => {
-    try {
-      return await wakeOnce(record, alreadyCompleted);
-    } catch (error) {
-      if (!(error instanceof StaleVersionError)) throw error;
-      // The stage moved between the read and the nudge: read it again.
-      const reread = await deps.persistence.getStage(
-        command.workflowRunId,
-        command.stageId,
-      );
-      if (reread?.id !== stage.id || reread.version === current.version)
-        throw error;
-      current = reread;
-      return wake(record, alreadyCompleted);
-    }
-  };
-  const wakeOnce = async (record: StepRecord, alreadyCompleted: boolean) => {
+  const wake = async (record: StepRecord, alreadyCompleted: boolean) => {
     const delivery = record.updatedAt.getTime();
     const row = [record.createdAt.getTime(), record.seq, record.attempt];
     await deps.persistence.withTransaction(async (tx) => {
@@ -131,12 +105,7 @@ async function deliverSignal(
         stepId: command.stepId,
         payload: record.result,
       };
-      if (current.status !== "RUNNING") {
-        await tx.updateStage(stage.id, {
-          nextPollAt: deps.clock.now(),
-          expectedVersion: current.version,
-        });
-      }
+      await tx.updateStage(stage.id, { nextPollAt: deps.clock.now() });
       await tx.appendOutboxEvents(
         toOutboxEvents(command.workflowRunId, [event]),
       );

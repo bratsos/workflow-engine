@@ -56,6 +56,7 @@ import {
   loadWorkflowContext,
   markStageCancelled,
   normalizeAnnotateArgs,
+  publishStageKeys,
   reopenFailedSteps,
   resolveStageInput,
   retryBackoffMs,
@@ -601,6 +602,14 @@ async function replayStage(
       );
       return "skip";
     }
+    await publishStageKeys(
+      stageRecord.workflowRunId,
+      run.workflowType,
+      stageRecord.stageId,
+      validatedOutput,
+      stageResult.artifacts,
+      deps,
+    );
     postCommits.push(() =>
       completeSuspendedJobRow(
         stageRecord.workflowRunId,
@@ -996,6 +1005,7 @@ export async function handleStagePollSuspended(
       } else if (checkResult.ready) {
         // Save output to blob store (not a DB operation)
         let outputRef: { _artifactKey: string } | undefined;
+        let committedOutput: unknown;
         if (checkResult.output !== undefined) {
           let validatedOutput = checkResult.output;
           try {
@@ -1017,6 +1027,7 @@ export async function handleStagePollSuspended(
             deps,
           );
           outputRef = { _artifactKey: outputKey };
+          committedOutput = validatedOutput;
         }
 
         const duration =
@@ -1070,6 +1081,16 @@ export async function handleStagePollSuspended(
             deps,
           );
           continue;
+        }
+        if (outputRef) {
+          await publishStageKeys(
+            stageRecord.workflowRunId,
+            run.workflowType,
+            stageRecord.stageId,
+            committedOutput,
+            undefined,
+            deps,
+          );
         }
 
         resumed++;

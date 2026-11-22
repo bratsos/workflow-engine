@@ -25,6 +25,7 @@ import {
 import {
   type KernelDatabase,
   kernelDatabase,
+  override,
   realDatabase,
   sqlite,
 } from "./sqlite8-kernel-utils.js";
@@ -294,13 +295,20 @@ describe(`a stale attempt on ${realDatabase ? (sqlite ? "SQLite" : "Postgres") :
    * until `releaseSecond` when `holdSecond` is set. Every later entry
    * succeeds with `{ who: "J<entry>" }` and an artifact holding the same.
    */
-  async function pipeline(first: (ctx: never) => unknown, holdSecond = false) {
+  async function pipeline(
+    first: (ctx: never) => unknown,
+    holdSecond = false,
+    { attempts = budget, frozen = false } = {},
+  ) {
     const held = gate();
     const release = gate();
     const heldSecond = gate();
     const releaseSecond = gate();
     let entries = 0;
+    const frozenAt = new Date();
     const tInputs: unknown[] = [];
+    /** What `t` read at the stage's fixed keys, as code on every release could. */
+    const tFixed: unknown[] = [];
     const workflow = new WorkflowBuilder(
       "attempt-owner",
       "Attempt owner",
@@ -336,6 +344,14 @@ describe(`a stale attempt on ${realDatabase ? (sqlite ? "SQLite" : "Postgres") :
           schemas: { input: z.any(), output: z.any(), config: schema },
           async execute(ctx) {
             tInputs.push(ctx.input);
+            const read = (key: string) =>
+              ctx.storage.load(key).catch(() => "missing");
+            tFixed.push({
+              output: await read(ctx.storage.getStageKey("s")),
+              raw: await read(
+                ctx.storage.getStageKey("s", "artifacts/raw.json"),
+              ),
+            });
             return { output: ctx.input };
           },
         }),
@@ -344,7 +360,8 @@ describe(`a stale attempt on ${realDatabase ? (sqlite ? "SQLite" : "Postgres") :
     const kernel = createKernel({
       ...ports,
       eventSink: new CollectingEventSink(),
-      clock: { now: () => new Date() },
+      // Frozen: a takeover in the same millisecond must still change owner.
+      clock: { now: () => (frozen ? frozenAt : new Date()) },
       registry: { getWorkflow: () => workflow },
     });
     const { workflowRunId } = await kernel.dispatch({
@@ -357,7 +374,7 @@ describe(`a stale attempt on ${realDatabase ? (sqlite ? "SQLite" : "Postgres") :
     const deliver = (job: DequeueResult) =>
       executeJobWithHeartbeat(kernel, {
         jobTransport: ports.jobTransport,
-        job: { ...job, maxAttempts: budget },
+        job: { ...job, maxAttempts: attempts },
       });
     const drain = async () => {
       for (let job = await ports.jobTransport.dequeue(); job; ) {
@@ -379,6 +396,7 @@ describe(`a stale attempt on ${realDatabase ? (sqlite ? "SQLite" : "Postgres") :
       releaseSecond: releaseSecond.open,
       entries: () => entries,
       tInputs,
+      tFixed,
       /** What the stage row points at, read through its pointers. */
       committed: async () => {
         const row = (await ports.persistence.getStage(workflowRunId, "s"))!;
@@ -454,6 +472,8 @@ describe(`a stale attempt on ${realDatabase ? (sqlite ? "SQLite" : "Postgres") :
 
     await t.drain();
     expect(t.tInputs).toEqual([{ who: "J2" }]);
+    // Only the committed winner wrote the stage's fixed keys.
+    expect(t.tFixed).toEqual([{ output: { who: "J2" }, raw: { who: "J2" } }]);
     expect((await ports.persistence.getRun(t.workflowRunId))?.status).toBe(
       "COMPLETED",
     );
@@ -461,12 +481,15 @@ describe(`a stale attempt on ${realDatabase ? (sqlite ? "SQLite" : "Postgres") :
 
   it.each(
     Object.keys(endings).flatMap((ending) =>
-      [false, true].map((signal) => [ending, signal] as const),
+      [false, true].flatMap((signal) =>
+        [false, true].map((frozen) => [ending, signal, frozen] as const),
+      ),
     ),
-  )("lets the attempt that took over a lost lease finish when the stale one %s first (signal between: %s)", async (ending, signal) => {
+  )("lets the attempt that took over a lost lease finish when the stale one %s first (signal between: %s, frozen clock: %s)", async (ending, signal, frozen) => {
     const t = await pipeline(
       endings[ending as keyof typeof endings] as never,
       true,
+      { frozen },
     );
     await overtakers["a lost lease"](t.kernel);
     const second = t.deliver((await ports.jobTransport.dequeue())!);
@@ -501,38 +524,163 @@ describe(`a stale attempt on ${realDatabase ? (sqlite ? "SQLite" : "Postgres") :
     );
   });
 
-  it("re-delivers an attempt whose stage row was written by a non-owner while it ran", async () => {
-    const t = await pipeline(() => ({ output: { who: "A" } }));
-    // What `step.signal` of an earlier release did on a RUNNING stage.
+  it.each([
+    3, 1,
+  ])("commits the attempt whose RUNNING stage a step.signal of an earlier release nudged (attempts: %i)", async (attempts) => {
+    const t = await pipeline(() => ({ output: { who: "A" } }), false, {
+      attempts,
+    });
+    // What `step.signal` of every release does to a RUNNING stage.
     const row = (await ports.persistence.getStage(t.workflowRunId, "s"))!;
     await ports.persistence.updateStage(row.id, { nextPollAt: new Date() });
 
     t.release();
-    await expect(t.stale).resolves.toMatchObject({
-      outcome: "failed",
-      willRetry: true,
-    });
-    expect(await t.blobs()).toEqual([]);
-    expect(
-      (await ports.jobTransport.getJobsByWorkflowRun(t.workflowRunId))[0]
-        ?.status,
-    ).toBe("PENDING");
-
-    // The queue's retry backoff, then the stage runs again and completes.
-    let job = await ports.jobTransport.dequeue();
-    for (let waited = 0; !job && waited < 10_000; waited += 250) {
-      await sleep(250);
-      job = await ports.jobTransport.dequeue();
-    }
-    await expect(t.deliver(job!)).resolves.toMatchObject({
-      outcome: "completed",
-    });
+    await expect(t.stale).resolves.toMatchObject({ outcome: "completed" });
     await t.drain();
-    expect(t.tInputs).toEqual([{ who: "J2" }]);
+    expect(t.entries()).toBe(1);
+    expect(t.tInputs).toEqual([{ who: "A" }]);
+    expect(t.tFixed).toEqual([{ output: { who: "A" }, raw: "missing" }]);
     expect((await ports.persistence.getRun(t.workflowRunId))?.status).toBe(
       "COMPLETED",
     );
-  }, 30_000);
+  });
+
+  /** A stage that waits for signal `approval`; `signal` goes through a store whose first `getStage` runs `hook`. */
+  async function signalWait(holdFirst: boolean) {
+    const bodyHeld = gate();
+    const bodyGo = gate();
+    let entries = 0;
+    let hook: ((row: unknown) => Promise<void>) | undefined;
+    const workflow = new WorkflowBuilder(
+      "signal-wait",
+      "Signal wait",
+      "signal-wait",
+      schema,
+      z.any(),
+    )
+      .pipe(
+        defineStage({
+          id: "s",
+          name: "S",
+          schemas: { input: schema, output: z.any(), config: schema },
+          async execute(ctx) {
+            if (++entries === 1 && holdFirst) {
+              bodyHeld.open();
+              await bodyGo.opened;
+            }
+            const value = await ctx.step.waitForSignal("approval", {
+              timeout: "1h",
+              keepalive: "30m",
+            });
+            return { output: value };
+          },
+        }),
+      )
+      .build();
+    const config = {
+      ...ports,
+      eventSink: new CollectingEventSink(),
+      clock: { now: () => new Date() },
+      registry: { getWorkflow: () => workflow },
+    };
+    const kernel = createKernel(config);
+    const hooked = createKernel({
+      ...config,
+      persistence: override(ports.persistence, {
+        getStage: async (runId: string, stageId: string) => {
+          const row = await ports.persistence.getStage(runId, stageId);
+          const run = hook;
+          hook = undefined;
+          await run?.(row);
+          return row;
+        },
+      }),
+    });
+    const { workflowRunId } = await kernel.dispatch({
+      type: "run.create",
+      workflowId: workflow.id,
+      input: {},
+      idempotencyKey: crypto.randomUUID(),
+    });
+    await kernel.dispatch({ type: "run.claimPending", workerId: "w" });
+    const job = (await ports.jobTransport.dequeue())!;
+    const execution = executeJobWithHeartbeat(kernel, {
+      jobTransport: ports.jobTransport,
+      job: { ...job, maxAttempts: budget },
+    });
+    const signal = (payload: string) =>
+      hooked.dispatch({
+        type: "step.signal",
+        workflowRunId,
+        stageId: "s",
+        stepId: "approval",
+        payload,
+      });
+    return {
+      workflowRunId,
+      execution,
+      signal,
+      bodyHeld: bodyHeld.opened,
+      bodyGo: bodyGo.open,
+      setHook: (next: (row: unknown) => Promise<void>) => {
+        hook = next;
+      },
+      stage: async () =>
+        (await ports.persistence.getStage(workflowRunId, "s"))!,
+      signalled: async () =>
+        (await ports.persistence.getUnpublishedOutboxEvents(1000)).filter(
+          (row) =>
+            row.workflowRunId === workflowRunId &&
+            row.eventType === "step:signalled",
+        ).length,
+    };
+  }
+
+  it("wakes a stage at once when the signal read it RUNNING and it suspended before the wake", async () => {
+    const t = await signalWait(true);
+    await t.bodyHeld;
+    const read = gate();
+    const go = gate();
+    t.setHook(async () => {
+      read.open();
+      await go.opened;
+    });
+    const signal = t.signal("one");
+    await read.opened;
+    // The attempt reaches the wait before the signal is stored and suspends
+    // for its keepalive.
+    t.bodyGo();
+    await expect(t.execution).resolves.toMatchObject({ outcome: "suspended" });
+    expect((await t.stage()).status).toBe("SUSPENDED");
+
+    go.open();
+    await expect(signal).resolves.toMatchObject({ signalled: true });
+    const stage = await t.stage();
+    expect(stage.nextPollAt!.getTime()).toBeLessThan(Date.now() + 60_000);
+    expect(await t.signalled()).toBe(1);
+  });
+
+  it("wakes the stage when another write lands between the signal's read and its wake", async () => {
+    const t = await signalWait(false);
+    await expect(t.execution).resolves.toMatchObject({ outcome: "suspended" });
+    t.setHook(async (row) => {
+      await ports.persistence.updateStage((row as { id: string }).id, {
+        nextPollAt: new Date("2099-01-01"),
+      });
+    });
+
+    await expect(t.signal("one")).resolves.toMatchObject({
+      signalled: true,
+      alreadyCompleted: false,
+    });
+    expect((await t.stage()).nextPollAt!.getTime()).toBeLessThan(
+      Date.now() + 60_000,
+    );
+    await expect(t.signal("two")).resolves.toMatchObject({
+      alreadyCompleted: true,
+    });
+    expect(await t.signalled()).toBe(1);
+  });
 
   it("reads an output pointer stored by an earlier release", async () => {
     const t = await pipeline(() => ({ output: { who: "A" } }));

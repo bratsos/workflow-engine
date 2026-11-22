@@ -57,6 +57,7 @@ export { saveStageArtifacts } from "./save-stage-artifacts.js";
 export {
   discardUnreferencedBlobs,
   outputKeys,
+  publishStageKeys,
   saveStageOutput,
 } from "./save-stage-output.js";
 export {

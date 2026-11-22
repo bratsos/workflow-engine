@@ -103,8 +103,9 @@ describe("kernel: job.execute", () => {
     const completedEvents = eventSink.getByType("stage:completed");
     expect(completedEvents).toHaveLength(1);
 
-    // Verify output was stored in blobStore (not persistence artifacts)
-    expect(blobStore.size()).toBe(1);
+    // Verify output was stored in blobStore (not persistence artifacts):
+    // under the attempt's own key, and copied to the stage's fixed key.
+    expect(blobStore.size()).toBe(2);
 
     const finalRun = await persistence.getRun(createResult.workflowRunId);
     expect(finalRun!.version).toBeGreaterThanOrEqual(1);
@@ -163,21 +164,12 @@ describe("kernel: job.execute", () => {
     });
 
     expect(result.outcome).toBe("completed");
-    expect(blobStore.size()).toBe(3);
+    // The attempt's own keys plus the stage's fixed keys.
+    expect(blobStore.size()).toBe(6);
 
-    // The attempt's own keys, which the stage row points at.
-    const stageRow = await persistence.getStage(
-      createResult.workflowRunId,
-      "artifact-stage",
-    );
-    const rawArtifactKey = (
-      stageRow?.outputData as { _artifactKeys: Record<string, string> }
-    )._artifactKeys.raw;
-    expect(rawArtifactKey).toMatch(
-      new RegExp(
-        `^workflow-v2/artifact-workflow/${createResult.workflowRunId}/artifact-stage/attempts/[^/]+/artifacts/raw\\.json$`,
-      ),
-    );
+    const rawArtifactKey =
+      "workflow-v2/artifact-workflow/" +
+      `${createResult.workflowRunId}/artifact-stage/artifacts/raw.json`;
     expect(await blobStore.has(rawArtifactKey)).toBe(true);
   });
 
