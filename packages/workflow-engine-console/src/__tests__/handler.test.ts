@@ -467,6 +467,22 @@ describe("mounting at any path", () => {
   });
 });
 
+describe("pollIntervalMs", () => {
+  it("is refused when a browser timer cannot honour it, and accepted at its bounds", () => {
+    const message =
+      /pollIntervalMs must be a number of milliseconds from 0 to 2147483647/;
+    for (const bad of [-1, NaN, Infinity, 2147483648, "5000" as never]) {
+      expect(() => build({ pollIntervalMs: bad }), String(bad)).toThrow(
+        message,
+      );
+    }
+    // 0 pauses polling (the UI's "Off").
+    for (const ok of [0, 1, 2147483647]) {
+      expect(() => build({ pollIntervalMs: ok }), String(ok)).not.toThrow();
+    }
+  });
+});
+
 describe("the injected config", () => {
   it("carries the mount path, read-only state and capabilities so the SPA boots without a round trip", async () => {
     const reader = createInMemoryConsoleReadPort(

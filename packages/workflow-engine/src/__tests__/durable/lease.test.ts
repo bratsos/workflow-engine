@@ -1,5 +1,6 @@
-import { describe, expect, it } from "vitest";
-import { StepInFlight } from "../../core/steps.js";
+import { describe, expect, it, vi } from "vitest";
+import { STEP_API_SETTLE_IN_FLIGHT, StepInFlight } from "../../core/steps.js";
+import { MAX_TIMER_MS } from "../../kernel/helpers/host-support.js";
 import { createStepApi } from "../../kernel/helpers/step-api.js";
 import { FakeClock } from "../../kernel/testing/fake-clock.js";
 import { InMemoryStepLedger } from "../../testing/in-memory-step-ledger.js";
@@ -69,5 +70,53 @@ describe("durable run leases", () => {
       ),
     ).toBe(true);
     expect(concurrentCalls).toBe(1);
+  });
+
+  it("refuses a lease a timer cannot honour, the bound settleInFlight waits on, and waits out the longest one", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const clock = new FakeClock();
+      const ledger = new InMemoryStepLedger({ now: clock.now.bind(clock) });
+      const api = () =>
+        createStepApi({ stageRecordId: "stage", stepLedger: ledger, clock });
+      const message = new RegExp(
+        `lease must be a number of milliseconds from 1 to ${MAX_TIMER_MS}`,
+      );
+      let ran = 0;
+
+      for (const bad of [0, -1, NaN, Infinity, 0.5, MAX_TIMER_MS + 1, "25d"]) {
+        // `run` reads the lease synchronously, so it throws rather than rejects.
+        expect(
+          () => api().run("slow", async () => ++ran, { lease: bad }),
+          String(bad),
+        ).toThrow(message);
+      }
+      expect(ran).toBe(0);
+      expect(await ledger.get("stage", "slow")).toBeNull();
+      expect(() =>
+        createStepApi({ clock, defaultLeaseMs: MAX_TIMER_MS + 1 }),
+      ).toThrow(/defaultLeaseMs must be a number of milliseconds/);
+
+      // At the bound the wait is a real timer: it does not fire at once.
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const steps = api();
+      const run = steps.run("slow", () => gate, { lease: MAX_TIMER_MS });
+      await Promise.resolve();
+      let settled = false;
+      const settling = steps[STEP_API_SETTLE_IN_FLIGHT]?.().then(() => {
+        settled = true;
+      });
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(settled).toBe(false);
+      release();
+      await run;
+      await settling;
+      expect(settled).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

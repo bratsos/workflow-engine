@@ -1,3 +1,4 @@
+import { assertTimerMs } from "../kernel/helpers/host-support.js";
 import { AICallTimeoutError } from "./errors.js";
 
 export interface CallTimeout {
@@ -26,9 +27,8 @@ export function createCallTimeout(
     };
   }
 
-  if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
-    throw new RangeError("AI timeoutMs must be a finite, non-negative number");
-  }
+  // Before any timer or signal exists. `undefined` is the only "no timeout".
+  assertTimerMs("timeoutMs", timeoutMs);
 
   const timeoutError = new AICallTimeoutError(timeoutMs, modelKey);
   let timedOut = false;
@@ -43,7 +43,8 @@ export function createCallTimeout(
       ? undefined
       : new AbortController();
   const timeoutSignal =
-    fallbackController?.signal ?? AbortSignal.timeout(timeoutMs);
+    // AbortSignal.timeout throws on a fractional delay; a timer rounds up anyway.
+    fallbackController?.signal ?? AbortSignal.timeout(Math.ceil(timeoutMs));
 
   if (fallbackController) {
     timer = setTimeout(() => {
