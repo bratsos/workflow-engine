@@ -523,6 +523,7 @@ export function createKernel(config: KernelConfig): Kernel {
       async () => {
         let postCommit: ((deps: KernelDeps) => Promise<unknown>) | undefined;
 
+        let completedHere = false;
         const publicResult = await persistence.withTransaction(async (tx) => {
           // A root-client read can wait on the very connection this transaction
           // holds. Supporting ports bind reads to its snapshot, keeping every
@@ -612,10 +613,13 @@ export function createKernel(config: KernelConfig): Kernel {
               command.type,
               stripped,
             );
-            completedInTransaction = true;
+            completedHere = true;
           }
           return stripped;
         });
+        // Only a committed completion counts: a failed COMMIT rolls the key
+        // back with the run, and the key must then be released as before.
+        completedInTransaction = completedHere;
 
         if (postCommit) {
           // Runs only now that the transaction has committed — the DB

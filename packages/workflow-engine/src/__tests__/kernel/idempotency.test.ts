@@ -434,7 +434,40 @@ describe("kernel: idempotency", () => {
       input: { data: "hello" },
     };
 
+    // The worker is dead: nothing after the commit runs, so no release either.
+    const release = persistence.releaseIdempotencyKey;
+    persistence.releaseIdempotencyKey = async () => {};
     await expect(kernel.dispatch(command)).rejects.toThrow("worker died");
+    persistence.releaseIdempotencyKey = release;
+    const retried = await kernel.dispatch(command);
+
+    expect(persistence.getAllRuns()).toHaveLength(1);
+    expect(retried.workflowRunId).toBe(persistence.getAllRuns()[0]!.id);
+  });
+
+  it("a failed COMMIT after the key completion releases the key, so a retry creates exactly one run", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, persistence } = createTestKernel([workflow]);
+    const commit = persistence.withTransaction.bind(persistence);
+    let failed = false;
+    persistence.withTransaction = (async (fn: any) =>
+      commit(async (tx: any) => {
+        const result = await fn(tx);
+        if (!failed) {
+          failed = true;
+          throw new Error("commit failed");
+        }
+        return result;
+      })) as typeof persistence.withTransaction;
+    const command = {
+      type: "run.create" as const,
+      idempotencyKey: "commit-fails",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    };
+
+    await expect(kernel.dispatch(command)).rejects.toThrow("commit failed");
+    expect(persistence.getAllRuns()).toHaveLength(0);
     const retried = await kernel.dispatch(command);
 
     expect(persistence.getAllRuns()).toHaveLength(1);
