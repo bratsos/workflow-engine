@@ -120,6 +120,23 @@ export async function handleJobExecute(
   // re-execute it.
   const existingStage = await deps.persistence.getStage(workflowRunId, stageId);
   if (existingStage?.status === "COMPLETED") {
+    // Repairs a fixed-key copy that failed or never ran (a crash after the
+    // commit); only on this redelivery path, never on a first execution.
+    const pointerKey = (
+      existingStage.outputData as { _artifactKey?: unknown } | null
+    )?._artifactKey;
+    if (typeof pointerKey === "string") {
+      await publishStageKeys(
+        workflowRunId,
+        workflowRun.workflowType,
+        stageId,
+        workflowContext[stageId],
+        undefined,
+        deps,
+        existingStage.id,
+        pointerKey,
+      );
+    }
     return {
       outcome: "completed" as const,
       output: workflowContext[stageId],
@@ -614,6 +631,8 @@ export async function handleJobExecute(
       result.output,
       result.artifacts,
       deps,
+      stageRecord.id,
+      outputKey,
     );
 
     return {

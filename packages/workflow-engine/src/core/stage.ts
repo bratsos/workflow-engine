@@ -203,8 +203,9 @@ export interface StageStorage {
   /**
    * `workflow-v2/<type>/<run>/<stageId>/<suffix>`. With no suffix,
    * `…/<stageId>/output.json`: the engine copies a stage's output there
-   * after its completion commits (best-effort). `workflowContext` follows
-   * the committed pointer and is the source to rely on.
+   * after its completion commits (best-effort: it can briefly lag behind
+   * or be missing). `workflowContext` follows the committed pointer and is
+   * the source to rely on.
    */
   getStageKey(stageId: string, suffix?: string): string;
 }

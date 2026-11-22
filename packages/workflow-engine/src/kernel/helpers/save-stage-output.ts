@@ -42,8 +42,14 @@ export async function saveStageOutput(
  * to the fixed per-stage keys every earlier release wrote
  * (`<stage>/output.json`, the default `getStageKey(stageId)`, and
  * `<stage>/artifacts/<name>.json`), for code that reads them there. Only a
- * committed attempt calls this, never one that lost its fence. Best-effort:
- * the pointer in `outputData` is what the engine reads.
+ * committed attempt calls this, never one that lost its fence, and a
+ * delivery that finds the stage COMPLETED copies the pointer's output again.
+ * The copy is skipped unless the stage's pointer still names `pointerKey`
+ * when re-read, so an older winner's late copy rarely lands over a newer
+ * one; the check is not atomic with the puts, so the fixed keys can briefly
+ * lag behind or miss the committed output. Best-effort: the pointer in
+ * `outputData` (`workflowContext`) is authoritative, and a failed copy is
+ * logged on the run (WARN).
  */
 export async function publishStageKeys(
   runId: string,
@@ -51,10 +57,21 @@ export async function publishStageKeys(
   stageId: string,
   output: unknown,
   artifacts: Record<string, unknown> | undefined,
-  deps: Pick<KernelDeps, "blobStore">,
+  deps: Pick<KernelDeps, "blobStore" | "persistence">,
+  workflowStageId: string,
+  pointerKey: string,
 ): Promise<void> {
   const base = `workflow-v2/${workflowType}/${runId}/${stageId}`;
+  // An earlier release's pointer is the fixed key itself: nothing to copy.
+  if (pointerKey === `${base}/output.json`) return;
   try {
+    const current = await deps.persistence.getStage(runId, stageId);
+    if (
+      (current?.outputData as { _artifactKey?: unknown } | null)
+        ?._artifactKey !== pointerKey
+    ) {
+      return;
+    }
     await deps.blobStore.put(`${base}/output.json`, output);
     for (const [name, artifact] of Object.entries(artifacts ?? {})) {
       await deps.blobStore.put(
@@ -62,8 +79,18 @@ export async function publishStageKeys(
         artifact,
       );
     }
-  } catch {
+  } catch (error) {
     // The committed pointer stays authoritative.
+    await deps.persistence
+      .createLog({
+        workflowRunId: runId,
+        workflowStageId,
+        level: "WARN",
+        message: `Copying stage ${stageId}'s output to ${base}/output.json failed; read it from workflowContext: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      })
+      .catch(() => {});
   }
 }
 

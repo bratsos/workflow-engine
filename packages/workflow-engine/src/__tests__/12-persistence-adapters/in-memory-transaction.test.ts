@@ -1,6 +1,7 @@
 /**
  * InMemoryWorkflowPersistence.withTransaction rolls back on a throw, as the
- * Prisma adapter does, and leaves writes made outside the transaction alone.
+ * Prisma adapter does, and keeps writes made outside the transaction, also
+ * to a row the transaction wrote before them.
  */
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
@@ -67,6 +68,34 @@ describe("InMemoryWorkflowPersistence transactions", () => {
       "acquired",
     );
     expect((await persistence.getRun(run.id))?.status).toBe("RUNNING");
+  });
+
+  it("keeps an outside write to a row the failed transaction wrote first", async () => {
+    const persistence = new InMemoryWorkflowPersistence();
+    const run = await persistence.createRun({
+      workflowId: "w",
+      workflowName: "W",
+      workflowType: "w",
+      input: {},
+    });
+    const stage = await persistence.createStage({
+      workflowRunId: run.id,
+      stageId: "s",
+      stageName: "S",
+      stageNumber: 1,
+      executionGroup: 1,
+      status: "SUSPENDED",
+    });
+
+    await expect(
+      persistence.withTransaction(async (tx) => {
+        await tx.updateStage(stage.id, { nextPollAt: new Date() });
+        await persistence.updateStage(stage.id, { status: "COMPLETED" });
+        throw new Error("outbox down");
+      }),
+    ).rejects.toThrow("outbox down");
+
+    expect((await persistence.getStage(run.id, "s"))?.status).toBe("COMPLETED");
   });
 
   it("lets a later signal wake the stage after a wake transaction failed", async () => {

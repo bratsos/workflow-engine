@@ -420,7 +420,15 @@ export async function executeJobWithHeartbeat(
   // run.reapStuck kills it minutes later with a generic "STUCK_RUN_REAPED"
   // error, losing the real stage error. Dispatch run.transition so the run
   // fails promptly with the actual error from the FAILED stage record.
-  if (!canRetry && !result.ghost) {
+  // An orphan whose stage another attempt took over and then committed
+  // (its own ack superseded, so it did not transition) leaves the run to
+  // this lease holder; run.transition is a noop on a terminal run or an
+  // active stage.
+  if (
+    !canRetry &&
+    (!result.ghost ||
+      (result.ghostReason === "orphan" && outcome !== "superseded"))
+  ) {
     try {
       await kernel.dispatch({
         type: "run.transition",

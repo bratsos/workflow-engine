@@ -609,6 +609,8 @@ async function replayStage(
       validatedOutput,
       stageResult.artifacts,
       deps,
+      stageRecord.id,
+      outputKey,
     );
     postCommits.push(() =>
       completeSuspendedJobRow(
@@ -1090,6 +1092,8 @@ export async function handleStagePollSuspended(
             committedOutput,
             undefined,
             deps,
+            stageRecord.id,
+            outputRef._artifactKey,
           );
         }
 

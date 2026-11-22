@@ -545,6 +545,107 @@ describe(`a stale attempt on ${realDatabase ? (sqlite ? "SQLite" : "Postgres") :
     );
   });
 
+  it("moves the run on when a lost lease's delivery stalled before its start and took the stage over last", async () => {
+    const inRead = gate();
+    const holdRead = gate();
+    const secondHeld = gate();
+    const secondGo = gate();
+    let armed = false;
+    let entries = 0;
+    const tInputs: unknown[] = [];
+    const workflow = new WorkflowBuilder(
+      "late-start",
+      "Late start",
+      "late-start",
+      schema,
+      z.any(),
+    )
+      .pipe(
+        defineStage({
+          id: "s",
+          name: "S",
+          schemas: { input: schema, output: z.any(), config: schema },
+          async execute() {
+            if (++entries === 1) {
+              secondHeld.open();
+              await secondGo.opened;
+              return { output: { who: "redelivery" } };
+            }
+            return { output: { who: "stale" } };
+          },
+        }),
+      )
+      .pipe(
+        defineStage({
+          id: "t",
+          name: "T",
+          schemas: { input: z.any(), output: z.any(), config: schema },
+          async execute(ctx) {
+            tInputs.push(ctx.input);
+            return { output: ctx.input };
+          },
+        }),
+      )
+      .build();
+    const config = {
+      ...ports,
+      eventSink: new CollectingEventSink(),
+      clock: { now: () => new Date() },
+      registry: { getWorkflow: () => workflow },
+    };
+    const kernel = createKernel(config);
+    // The stale delivery stalls (a frozen process) before it reads its stage.
+    const stalled = createKernel({
+      ...config,
+      persistence: override(ports.persistence, {
+        getStage: async (runId: string, stageId: string) => {
+          if (armed) {
+            armed = false;
+            inRead.open();
+            await holdRead.opened;
+          }
+          return ports.persistence.getStage(runId, stageId);
+        },
+      }),
+    });
+    const { workflowRunId } = await kernel.dispatch({
+      type: "run.create",
+      workflowId: workflow.id,
+      input: {},
+      idempotencyKey: crypto.randomUUID(),
+    });
+    await kernel.dispatch({ type: "run.claimPending", workerId: "w" });
+    const deliver = (on: typeof kernel, job: DequeueResult) =>
+      executeJobWithHeartbeat(on, {
+        jobTransport: ports.jobTransport,
+        job: { ...job, maxAttempts: budget },
+      });
+    armed = true;
+    const stale = deliver(stalled, (await ports.jobTransport.dequeue())!);
+    await inRead.opened;
+    await overtakers["a lost lease"](kernel);
+    const redelivery = deliver(kernel, (await ports.jobTransport.dequeue())!);
+    await secondHeld.opened;
+
+    // The stale start lands last and owns the stage; its ack is superseded.
+    holdRead.open();
+    await expect(stale).resolves.toMatchObject({ outcome: "completed" });
+    secondGo.open();
+    await expect(redelivery).resolves.toMatchObject({
+      outcome: "failed",
+      error: expect.stringContaining("result discarded"),
+    });
+
+    for (let job = await ports.jobTransport.dequeue(); job; ) {
+      await deliver(kernel, job);
+      job = await ports.jobTransport.dequeue();
+    }
+    expect(tInputs).toEqual([{ who: "stale" }]);
+    expect((await ports.persistence.getRun(workflowRunId))?.status).toBe(
+      "COMPLETED",
+    );
+  });
+
   /** A stage that waits for signal `approval`; `signal` goes through a store whose first `getStage` runs `hook`. */
   async function signalWait(holdFirst: boolean) {
     const bodyHeld = gate();

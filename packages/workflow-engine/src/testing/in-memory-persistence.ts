@@ -116,7 +116,11 @@ function journaled(
           return (key: unknown, next?: unknown) => {
             const had = target.has(key);
             const previous = target.get(key);
+            const deleted = prop === "delete";
+            // Undone only while the entry still holds what this write left:
+            // a later write from outside the transaction stays.
             journal.push(() => {
+              if (deleted ? target.has(key) : target.get(key) !== next) return;
               if (had) target.set(key, previous);
               else target.delete(key);
             });
@@ -129,7 +133,8 @@ function journaled(
           return () => {
             const entries = [...target.entries()];
             journal.push(() => {
-              for (const [k, v] of entries) target.set(k, v);
+              for (const [k, v] of entries)
+                if (!target.has(k)) target.set(k, v);
             });
             target.clear();
           };
@@ -210,11 +215,13 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
   /**
    * Rolls back like the Prisma adapter: `fn` gets a view of this store
    * whose every container write is journaled, and a throw undoes them in
-   * reverse order. Writes made outside the transaction meanwhile (another
-   * caller on the store itself) are not touched. A nested call joins the
-   * outer transaction. shortcut: in-place field updates of an outbox record
-   * (the publish/DLQ methods, never used inside a kernel transaction) are
-   * not journaled.
+   * reverse order. A nested call joins the outer transaction. A write is
+   * undone only while its row (map entry or
+   * field) still holds what the transaction wrote, so an outside write to
+   * the same row made after it is kept. shortcut: in-place field updates of
+   * an outbox record (the publish/DLQ methods) and of an annotation
+   * (`deleteStage` clearing its stage link) are not journaled, until a
+   * test needs them rolled back.
    */
   async withTransaction<T>(
     fn: (tx: WorkflowPersistence) => Promise<T>,
@@ -232,7 +239,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
         set: (value: unknown) => {
           const previous = store[field];
           journal.push(() => {
-            store[field] = previous;
+            if (store[field] === value) store[field] = previous;
           });
           store[field] = value;
         },
