@@ -11,7 +11,7 @@ import {
   InMemoryStepLedger,
   InMemoryWorkflowPersistence,
 } from "@bratsos/workflow-engine/testing";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { runToCompletion } from "../run-to-completion.js";
 
@@ -168,31 +168,38 @@ describe("runToCompletion", () => {
     const blocked = new Promise<void>((resolve) => {
       release = resolve;
     });
+    let sinkEntered!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      sinkEntered = resolve;
+    });
     eventSink.emit = async () => {
+      sinkEntered();
       await blocked;
     };
-    const run = runToCompletion({
-      kernel,
-      persistence,
-      jobTransport,
-      command: {
-        type: "run.create",
-        idempotencyKey: "blocked-final-sink",
-        workflowId: "simple-workflow",
-        input: { data: "x" },
-      },
-      outboxFlushTimeoutMs: 5,
-    });
-    const result = await Promise.race([
-      run,
-      new Promise<"unbounded">((resolve) =>
-        setTimeout(() => resolve("unbounded"), 100),
-      ),
-    ]);
-    release();
-    await run;
-    expect(result).not.toBe("unbounded");
-    if (result !== "unbounded") expect(result.outcome).toBe("completed");
+    // Fake timers, so the flush bound fires when the test says and not when a
+    // loaded runner gets to it. A regression that waits on the sink hangs the
+    // `await run` below and fails on the test timeout.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const run = runToCompletion({
+        kernel,
+        persistence,
+        jobTransport,
+        command: {
+          type: "run.create",
+          idempotencyKey: "blocked-final-sink",
+          workflowId: "simple-workflow",
+          input: { data: "x" },
+        },
+        outboxFlushTimeoutMs: 5,
+      });
+      await entered;
+      await vi.advanceTimersByTimeAsync(5);
+      expect((await run).outcome).toBe("completed");
+    } finally {
+      release();
+      vi.useRealTimers();
+    }
   });
 
   it("drives a multi-stage workflow to completion in one call", async () => {
