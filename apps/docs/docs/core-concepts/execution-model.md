@@ -49,7 +49,7 @@ A run moves through these statuses. `SUSPENDED` belongs to a stage, not a run: w
 ```mermaid
 stateDiagram-v2
     [*] --> PENDING: run.create
-    PENDING --> RUNNING: run.claimPending
+    PENDING --> RUNNING: run.claimPending or run.transition
     RUNNING --> COMPLETED: last group completes
     RUNNING --> FAILED: a stage fails terminally
     PENDING --> CANCELLED: run.cancel
@@ -58,6 +58,8 @@ stateDiagram-v2
     FAILED --> RUNNING: run.redrive
     CANCELLED --> RUNNING: run.redrive
 ```
+
+Every start of a run writes exactly one `workflow:started`, in the transaction that moves the run to `RUNNING` and before the run's first `stage:*` event. `run.claimPending` writes it for a run it claims. A `run.transition` of a `PENDING` run that no host has claimed yet starts it the same way (it sets `RUNNING`, creates the first group's stage records, queues their jobs and writes the event), and a `run.claimPending` after that finds nothing to claim. Each `run.redrive` (and the deprecated `run.rerunFrom`) writes one more, after the run's end. Releases before this fix left such a run `PENDING` after the transition, and the claim wrote a second `workflow:started`.
 
 ---
 

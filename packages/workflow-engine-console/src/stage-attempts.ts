@@ -82,7 +82,8 @@
  * The run's own events must follow the order the engine writes them in:
  * `workflow:created` first; one `workflow:started` for the claim, after
  * `workflow:created` and before any end (or two, a transition's and the
- * claim's, with the run PENDING after the first alone); every later `workflow:started` (a
+ * claim's, with the run PENDING after the first alone, as releases before
+ * the one-start fix wrote them); every later `workflow:started` (a
  * redrive) after a `workflow:completed`, `workflow:failed` or
  * `workflow:cancelled`, because a redrive takes only an ended run;
  * `workflow:completed` only while the run is running, `workflow:failed` also
@@ -978,9 +979,10 @@ function foldRunEvents(
 
   let run: RunState | null = null;
   let redrives = 0;
-  // The run's first `workflow:started`, with no run event since. A
-  // `run.transition` of a PENDING run with no stage rows writes one and
-  // leaves the run PENDING; the claim then writes its own.
+  // The run's first `workflow:started`, with no run event since. Releases
+  // before the one-start fix let a `run.transition` of a PENDING run with no
+  // stage rows write one and leave the run PENDING, and the claim then wrote
+  // its own; such stored histories are still read as one start.
   let firstStartOnly = false;
   for (const event of events) {
     if (event.stageId !== null) {
@@ -1018,7 +1020,7 @@ function foldRunEvents(
         break;
       case "workflow:started":
         if (run === "running" && firstStartOnly) {
-          // The claim after a transition: no redrive, no change to a row.
+          // An older release's claim after a transition: no redrive, no change to a row.
           firstStartOnly = false;
           claims.add(event.sequence);
           continue;
@@ -1076,7 +1078,7 @@ function foldRunEvents(
   if (runStatus !== undefined) {
     const expected =
       run === "created" ? "PENDING" : run === "running" ? "RUNNING" : run;
-    // After a transition's start alone the run is still PENDING.
+    // After an older release's transition start alone the run is still PENDING.
     const pendingAfterTransition =
       firstStartOnly && run === "running" && runStatus === "PENDING";
     if (runStatus !== expected && !pendingAfterTransition)
