@@ -54,10 +54,12 @@ const MAX_TRANSITION_ATTEMPTS = 3;
 async function claimRunTransition(
   run: WorkflowRunRecord,
   deps: KernelDeps,
+  start?: { status: "RUNNING"; startedAt: Date },
 ): Promise<boolean> {
   try {
     await deps.persistence.updateRun(run.id, {
       expectedVersion: run.version,
+      ...start,
     });
     return true;
   } catch (error) {
@@ -117,9 +119,21 @@ async function attemptRunTransition(
   // 4. Get all stages for this run
   const stages = await deps.persistence.getStagesByRun(command.workflowRunId);
 
-  // 5. If no stages exist, this is the first transition -- enqueue group 1
+  // 5. If no stages exist, this is the first transition -- enqueue group 1.
+  //    A PENDING run that gets here was never claimed: this transition is its
+  //    start, so it moves the run to RUNNING in the same version-guarded write
+  //    and writes the run's one `workflow:started`, exactly as
+  //    run.claimPending does. Left PENDING, the claim would start the run a
+  //    second time, and a job of the first group would be turned away as a
+  //    ghost until it did. An empty first group stays PENDING for the claim,
+  //    which fails that run with EMPTY_STAGE_GRAPH.
   if (stages.length === 0) {
-    if (!(await claimRunTransition(run, deps))) {
+    const start =
+      run.status === "PENDING" &&
+      workflow.getStagesInExecutionGroup(1).length > 0
+        ? { status: "RUNNING" as const, startedAt: deps.clock.now() }
+        : undefined;
+    if (!(await claimRunTransition(run, deps, start))) {
       return "stale";
     }
     const enqueue = await prepareExecutionGroup(run, workflow, deps, {
@@ -128,11 +142,13 @@ async function attemptRunTransition(
       createMode: "upsert",
     });
 
-    events.push({
-      type: "workflow:started",
-      timestamp: deps.clock.now(),
-      workflowRunId: run.id,
-    });
+    if (start) {
+      events.push({
+        type: "workflow:started",
+        timestamp: deps.clock.now(),
+        workflowRunId: run.id,
+      });
+    }
 
     return {
       action: "advanced" as const,
