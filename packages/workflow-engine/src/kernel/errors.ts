@@ -43,7 +43,12 @@ export class JobTargetMissingError extends Error {
   constructor(target: JobTarget, missing: "workflow" | "stage" | "run") {
     super(missingTargetMessages(target)[missing]);
     this.name = "JobTargetMissingError";
-    this.target = { ...target };
+    // Named reads, not a spread: a non-enumerable id is still this target's.
+    this.target = {
+      workflowId: target.workflowId,
+      stageId: target.stageId,
+      workflowRunId: target.workflowRunId,
+    };
   }
 }
 
@@ -106,7 +111,13 @@ function brandedTarget(error: unknown): Partial<JobTarget> | undefined {
       target?: Partial<JobTarget>;
     };
     if (candidate[JOB_TARGET_MISSING] !== true) return undefined;
-    return { ...candidate.target };
+    const named = candidate.target;
+    if (typeof named !== "object" || named === null) return {};
+    return {
+      workflowId: named.workflowId,
+      stageId: named.stageId,
+      workflowRunId: named.workflowRunId,
+    };
   } catch {
     return undefined;
   }

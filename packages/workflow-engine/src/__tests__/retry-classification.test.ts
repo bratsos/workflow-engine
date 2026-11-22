@@ -20,6 +20,7 @@ import {
   StepTimeoutError,
 } from "../core/steps.js";
 import { type Workflow, WorkflowBuilder } from "../core/workflow.js";
+import { JobTargetMissingError } from "../kernel/errors.js";
 import { executeJobWithHeartbeat } from "../kernel/helpers/host-support.js";
 import { createKernel, type KernelConfig } from "../kernel/kernel.js";
 import type { JobTransport, StepLedger } from "../kernel/ports.js";
@@ -1630,6 +1631,85 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
         // A replayed step failure is classified as on main: rebuilt from text.
         expect(seen[1]).toMatchObject({ name: "Error", branded: false });
       });
+    });
+
+    it("never shows the engine's own suspend to retryIf: a nested approval wait suspends", async () => {
+      const predicateSaw: string[] = [];
+      let provider = 0;
+      const stage = defineStage({
+        id: "s",
+        name: "s",
+        schemas: { input: z.object({}), output: out, config: z.object({}) },
+        async execute(ctx) {
+          await ctx.step.run(
+            "operation",
+            async () => {
+              await ctx.step.waitForSignal("approval", { timeout: "1h" });
+              provider++;
+              return "done";
+            },
+            {
+              retries: 1,
+              retryIf: (error) => {
+                predicateSaw.push((error as Error).name);
+                return (error as Error).message === "provider unavailable";
+              },
+            },
+          );
+          return { output: { ok: true } };
+        },
+      });
+      const run = await start(env, workflowOf("approval", stage));
+      expect(await run.execute(1, 1)).toMatchObject({ outcome: "suspended" });
+      expect(predicateSaw).toEqual([]);
+      expect(await run.stage()).toMatchObject({ status: "SUSPENDED" });
+      await run.kernel.dispatch({
+        type: "step.signal",
+        workflowRunId: run.workflowRunId,
+        stageId: "s",
+        stepId: "approval",
+        payload: { approved: true },
+      });
+      await run.poll();
+      expect(await run.stage()).toMatchObject({ status: "COMPLETED" });
+      expect(provider).toBe(1);
+      expect(predicateSaw).toEqual([]);
+    });
+
+    it("acknowledges this job's missing target when its ids are not enumerable", async () => {
+      const run = await start(
+        env,
+        workflowOf("orphan", directStage(failing(0, () => null))),
+      );
+      const job = (await env.jobTransport.dequeue())!;
+      const target = {
+        workflowId: job.workflowId,
+        stageId: job.stageId,
+        workflowRunId: job.workflowRunId,
+      };
+      const hidden = {} as typeof target;
+      for (const [key, value] of Object.entries(target)) {
+        Object.defineProperty(hidden, key, { value });
+      }
+      const error = new JobTargetMissingError(hidden, "workflow");
+      expect(error.target).toEqual(target);
+      Object.defineProperty(error.target, "workflowRunId", {
+        enumerable: false,
+      });
+      const kernel = {
+        dispatch: async () => {
+          throw error;
+        },
+      };
+      const outcome = await executeJobWithHeartbeat(kernel as never, {
+        jobTransport: env.jobTransport,
+        job,
+      });
+      expect(outcome).toMatchObject({ dead: true });
+      const rows = await env.jobTransport.getJobsByWorkflowRun(
+        run.workflowRunId,
+      );
+      expect(rows[0]?.status).toBe("FAILED");
     });
   });
 }
