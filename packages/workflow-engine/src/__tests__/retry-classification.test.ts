@@ -514,11 +514,12 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
           // The poll retry pauses just before re-opening the step.
           const retry = run.poll();
           await atCas.promise;
-          // The last delivery fails the stage, and running it again records
-          // a refusal on the same step attempt.
+          // The last delivery fails the stage; delivering it again ends with
+          // the stored error, as main ends it, and re-opens nothing.
           expect(await run.execute(2, 2)).toMatchObject({ outcome: "failed" });
-          const refused = await run.execute(2, 2);
-          expect((refused as { error: string }).error).toMatch(
+          const again = await run.execute(2, 2);
+          expect(again).toMatchObject({ outcome: "failed", willRetry: false });
+          expect((again as { error: string }).error).not.toMatch(
             /^StepNotReplaySafeError: /,
           );
           resume.open();
@@ -889,9 +890,9 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
         expect((await verdict.stage()).status).toBe(
           (await main.stage()).status,
         );
-        // Main's own exhausted case runs the completed step again here.
+        // Main ends the redelivery with the stored error: no step runs again.
         expect(verdict.counts.receipts).toBe(main.counts.receipts);
-        expect(main.counts.receipts).toBe(2);
+        expect(main.counts.receipts).toBe(1);
       });
 
       it.each(
@@ -906,7 +907,7 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
         expect(again[0]).toMatchObject({ outcome: "failed", willRetry: false });
         expect(again[1]).toMatchObject({ outcome: "failed", willRetry: false });
         expect(verdict.counts.receipts).toBe(main.counts.receipts);
-        expect(main.counts.receipts).toBe(2);
+        expect(main.counts.receipts).toBe(1);
       });
 
       it("settles through the host as an exhausted attempt, and a redelivery runs as main's", async () => {
@@ -944,12 +945,102 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
           jobTransport: transport,
           job: { ...message, attempt: redelivered.attempt },
         });
-        // Main's exhausted case: the FAILED stage starts fresh (see above).
-        expect(verdict.counts.receipts).toBe(2);
+        // Main's exhausted case: the redelivery ends as a dead job (see above).
+        expect(verdict.counts.receipts).toBe(1);
+      });
+
+      it("schedules no extra delivery when the failure acknowledgement is lost (astra round 7 P1)", async () => {
+        /**
+         * Delivery 1 completes a receipt and fails; its queue failure is
+         * lost. Delivery 2 would reach a provider that is briefly down, and
+         * a third delivery would succeed. `budget` is the queue budget the
+         * host passes to the kernel.
+         */
+        async function schedule(id: string, fail: () => void, budget: number) {
+          const counts = { entries: 0, receipts: 0, provider: 0 };
+          const stage = defineStage({
+            id: "s",
+            name: "s",
+            schemas: { input: z.object({}), output: out, config: z.object({}) },
+            async execute(ctx) {
+              counts.entries++;
+              await ctx.step.run("receipt", async () => ++counts.receipts);
+              if (counts.entries === 1) fail();
+              await ctx.step.run("provider", async () => {
+                counts.provider++;
+                if (counts.provider === 1)
+                  throw new QuotaError("provider down");
+                return "accepted";
+              });
+              return { output: { ok: true } };
+            },
+          });
+          const run = await start(env, workflowOf(id, stage));
+          const transport = env.jobTransport;
+          const serve = async (
+            job: NonNullable<Awaited<ReturnType<typeof transport.dequeue>>>,
+          ) =>
+            executeJobWithHeartbeat(run.kernel, {
+              jobTransport: transport,
+              job: {
+                jobId: job.jobId,
+                workflowRunId: job.workflowRunId,
+                workflowId: job.workflowId,
+                stageId: job.stageId,
+                attempt: job.attempt,
+                maxAttempts: budget,
+                payload: job.payload,
+              },
+            });
+          const first = (await transport.dequeue())!;
+          const ack = transport.fail.bind(transport);
+          transport.fail = async () => {
+            throw new Error("acknowledgement lost");
+          };
+          try {
+            await expect(serve(first)).rejects.toThrow("acknowledgement lost");
+          } finally {
+            transport.fail = ack;
+          }
+          expect(await run.stage()).toMatchObject({ status: "FAILED" });
+          await transport.releaseStaleJobs(-60_000);
+          for (let delivery = 0; delivery < 3; delivery++) {
+            const next = await transport.dequeue();
+            if (!next || next.workflowRunId !== run.workflowRunId) break;
+            await serve(next);
+          }
+          const runRow = await env.persistence.getRun(run.workflowRunId);
+          return {
+            ...counts,
+            stage: (await run.stage()).status,
+            run: runRow?.status,
+          };
+        }
+
+        const verdict = await schedule(
+          "p1-verdict",
+          () => void zodV3Parse(),
+          3,
+        );
+        const main = await schedule(
+          "p1-exhausted",
+          () => {
+            throw new QuotaError();
+          },
+          1,
+        );
+        expect(verdict).toEqual(main);
+        expect(main).toEqual({
+          entries: 1,
+          receipts: 1,
+          provider: 0,
+          stage: "FAILED",
+          run: "FAILED",
+        });
       });
     });
 
-    it("takes a new signal after an ordinary exhausted attempt, as main does", async () => {
+    it("ends a redelivery after an ordinary exhausted attempt without consuming a signal, as main does", async () => {
       let failing = true;
       let receipts = 0;
       const stage = defineStage({
@@ -992,17 +1083,12 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
       await signal("first");
       expect(await run.execute(1, 1)).toMatchObject({ willRetry: false });
       failing = false;
-      expect(await run.execute(2, 2)).toMatchObject({ outcome: "suspended" });
-      // The wake key is the ledger row's updatedAt in ms: a second signal in the
-      // same millisecond as the first replays the first wake (main's behavior).
-      await new Promise((resolve) => setTimeout(resolve, 5));
-      expect(await signal("second")).toMatchObject({
-        signalled: true,
-        alreadyCompleted: false,
+      expect(await run.execute(2, 2)).toMatchObject({
+        outcome: "failed",
+        willRetry: false,
       });
-      await run.poll();
-      expect(await run.stage()).toMatchObject({ status: "COMPLETED" });
-      expect(receipts).toBe(2);
+      expect(await run.stage()).toMatchObject({ status: "FAILED" });
+      expect(receipts).toBe(1);
     });
 
     describe("the text a failed step row stores", () => {
@@ -1394,17 +1480,15 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
           env,
           workflowOf("redeliver", directStage(body, { onReclaim: "fail" })),
         );
-        expect(await run.execute(attempt)).toMatchObject({
-          outcome: "failed",
-          willRetry: false,
-        });
+        const first = await run.execute(attempt);
+        expect(first).toMatchObject({ outcome: "failed", willRetry: false });
         // The acknowledgement was lost: the same delivery arrives again,
-        // then the next one. Re-running the FAILED stage re-opens the row.
+        // then the next one. Each ends with the stored error, as on main.
         for (const again of [attempt, attempt + 1]) {
           const result = await run.execute(again);
           expect(result).toMatchObject({ outcome: "failed", willRetry: false });
-          expect((result as { error: string }).error).toMatch(
-            /^StepNotReplaySafeError: /,
+          expect((result as { error: string }).error).toBe(
+            (first as { error: string }).error,
           );
         }
         expect(effects).toBe(1);
