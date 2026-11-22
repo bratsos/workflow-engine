@@ -384,6 +384,7 @@ export function createKernel(config: KernelConfig): Kernel {
     key: string | undefined,
     commandType: string,
     fn: () => Promise<R>,
+    completedInTransaction: () => boolean = () => false,
   ): Promise<R> {
     if (!key) return fn();
 
@@ -401,10 +402,18 @@ export function createKernel(config: KernelConfig): Kernel {
 
     try {
       const result = await fn();
-      await persistence.completeIdempotencyKey(key, commandType, result);
+      if (!completedInTransaction()) {
+        await persistence.completeIdempotencyKey(key, commandType, result);
+      }
       return result;
     } catch (error) {
-      await persistence.releaseIdempotencyKey(key, commandType).catch(() => {});
+      // A key completed in the command's transaction stays: releasing it
+      // after that commit would let a retry run the command a second time.
+      if (!completedInTransaction()) {
+        await persistence
+          .releaseIdempotencyKey(key, commandType)
+          .catch(() => {});
+      }
       throw error;
     }
   }
@@ -507,101 +516,124 @@ export function createKernel(config: KernelConfig): Kernel {
     // -----------------------------------------------------------------
     const idempotencyKey = getIdempotencyKey(command);
 
-    return withIdempotency(idempotencyKey, command.type, async () => {
-      let postCommit: ((deps: KernelDeps) => Promise<unknown>) | undefined;
+    let completedInTransaction = false;
+    return withIdempotency(
+      idempotencyKey,
+      command.type,
+      async () => {
+        let postCommit: ((deps: KernelDeps) => Promise<unknown>) | undefined;
 
-      const publicResult = await persistence.withTransaction(async (tx) => {
-        // A root-client read can wait on the very connection this transaction
-        // holds. Supporting ports bind reads to its snapshot, keeping every
-        // write on the original port for _postCommit.
-        const txDeps: KernelDeps = {
-          ...deps,
-          persistence: tx,
-          jobTransport: withTransactionReads(jobTransport, tx, [
-            "getJobsByWorkflowRun",
-          ]),
-          blobStore: withTransactionReads(blobStore, tx, [
-            "get",
-            "has",
-            "list",
-          ]),
-          stepLedger: stepLedger
-            ? withTransactionReads(stepLedger, tx, ["get", "list"])
-            : undefined,
-          services: services?.aiLogger
-            ? {
-                ...services,
-                aiLogger: withTransactionReads(services.aiLogger, tx, [
-                  "getStats",
-                ]),
-              }
-            : services,
-        };
-        let result: HandlerResult<any>;
+        let completedHere = false;
+        const publicResult = await persistence.withTransaction(async (tx) => {
+          // A root-client read can wait on the very connection this transaction
+          // holds. Supporting ports bind reads to its snapshot, keeping every
+          // write on the original port for _postCommit.
+          const txDeps: KernelDeps = {
+            ...deps,
+            persistence: tx,
+            jobTransport: withTransactionReads(jobTransport, tx, [
+              "getJobsByWorkflowRun",
+            ]),
+            blobStore: withTransactionReads(blobStore, tx, [
+              "get",
+              "has",
+              "list",
+            ]),
+            stepLedger: stepLedger
+              ? withTransactionReads(stepLedger, tx, ["get", "list"])
+              : undefined,
+            services: services?.aiLogger
+              ? {
+                  ...services,
+                  aiLogger: withTransactionReads(services.aiLogger, tx, [
+                    "getStats",
+                  ]),
+                }
+              : services,
+          };
+          let result: HandlerResult<any>;
 
-        switch (command.type) {
-          case "run.create":
-            result = await handleRunCreate(command, txDeps);
-            break;
-          case "run.claimPending":
-            result = await handleRunClaimPending(command, txDeps);
-            break;
-          case "run.transition":
-            result = await handleRunTransition(command, txDeps);
-            break;
-          case "run.cancel":
-            result = await handleRunCancel(command, txDeps);
-            break;
-          case "run.rerunFrom":
-            result = await handleRunRerunFrom(command, txDeps);
-            break;
-          case "run.redrive":
-            result = await handleRunRedrive(command, txDeps);
-            break;
-          case "run.reapStuck":
-            result = await handleRunReapStuck(command, txDeps);
-            break;
-          case "run.purge":
-            result = await handleRunPurge(command, txDeps);
-            break;
-          default: {
-            const _exhaustive: never = command;
-            throw new Error(
-              `Unknown command type: ${(_exhaustive as KernelCommand).type}`,
-            );
+          switch (command.type) {
+            case "run.create":
+              result = await handleRunCreate(command, txDeps);
+              break;
+            case "run.claimPending":
+              result = await handleRunClaimPending(command, txDeps);
+              break;
+            case "run.transition":
+              result = await handleRunTransition(command, txDeps);
+              break;
+            case "run.cancel":
+              result = await handleRunCancel(command, txDeps);
+              break;
+            case "run.rerunFrom":
+              result = await handleRunRerunFrom(command, txDeps);
+              break;
+            case "run.redrive":
+              result = await handleRunRedrive(command, txDeps);
+              break;
+            case "run.reapStuck":
+              result = await handleRunReapStuck(command, txDeps);
+              break;
+            case "run.purge":
+              result = await handleRunPurge(command, txDeps);
+              break;
+            default: {
+              const _exhaustive: never = command;
+              throw new Error(
+                `Unknown command type: ${(_exhaustive as KernelCommand).type}`,
+              );
+            }
           }
+
+          const events = result._events;
+          if (events.length > 0) {
+            const causationId = idempotencyKey ?? crypto.randomUUID();
+            const outboxEvents: CreateOutboxEventInput[] = events.map(
+              (event: KernelEvent) => ({
+                workflowRunId: event.workflowRunId,
+                eventType: event.type,
+                payload: event,
+                causationId,
+                occurredAt: event.timestamp,
+              }),
+            );
+            await tx.appendOutboxEvents(outboxEvents);
+          }
+
+          postCommit = result._postCommit;
+          const stripped = stripEvents(result);
+          // With nothing left to run after the commit, the key completes in
+          // the same transaction as the command's writes: a crash or a failed
+          // completion after the commit can no longer leave a committed run
+          // behind a released key, which a retry would create a second time.
+          if (idempotencyKey && !postCommit) {
+            await tx.completeIdempotencyKey(
+              idempotencyKey,
+              command.type,
+              stripped,
+            );
+            completedHere = true;
+          }
+          return stripped;
+        });
+        // Only a committed completion counts: a failed COMMIT rolls the key
+        // back with the run, and the key must then be released as before.
+        completedInTransaction = completedHere;
+
+        if (postCommit) {
+          // Runs only now that the transaction has committed — the DB
+          // state this side effect depends on (e.g. deleted stage rows)
+          // can no longer be rolled back out from under it.
+          const outcome = await postCommit(deps);
+          // A sweep reports what it deleted, not what selection found.
+          if (command.type === "run.purge") return outcome as RunPurgeResult;
         }
 
-        const events = result._events;
-        if (events.length > 0) {
-          const causationId = idempotencyKey ?? crypto.randomUUID();
-          const outboxEvents: CreateOutboxEventInput[] = events.map(
-            (event: KernelEvent) => ({
-              workflowRunId: event.workflowRunId,
-              eventType: event.type,
-              payload: event,
-              causationId,
-              occurredAt: event.timestamp,
-            }),
-          );
-          await tx.appendOutboxEvents(outboxEvents);
-        }
-
-        postCommit = result._postCommit;
-        return stripEvents(result);
-      });
-
-      if (postCommit) {
-        // Runs only now that the transaction has committed — the DB
-        // state this side effect depends on (e.g. deleted stage rows)
-        // can no longer be rolled back out from under it.
-        const outcome = await postCommit(deps);
-        // A sweep reports what it deleted, not what selection found.
-        if (command.type === "run.purge") return outcome as RunPurgeResult;
-      }
-
-      return publicResult;
-    });
+        return publicResult;
+      },
+      () => completedInTransaction,
+    );
   }
 
   let purgeTail = Promise.resolve();
