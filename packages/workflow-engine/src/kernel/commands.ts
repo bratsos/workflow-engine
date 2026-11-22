@@ -221,7 +221,10 @@ export interface JobExecuteResult {
    * PENDING with the error on `errorMessage`) because the command carried
    * `attempt`/`maxAttempts` with attempts remaining and the error was not
    * deterministic. The host must re-enqueue the job
-   * (`jobTransport.fail(jobId, error, true)`).
+   * (`jobTransport.fail(jobId, error, true)`). `false` with `outcome:
+   * "failed"` and no `ghost` is also what a delivery gets that finds its
+   * stage already `FAILED`: the job is dead, nothing ran, and the host fails
+   * the job and the run.
    */
   readonly willRetry?: boolean;
   /** The job attempt that ran, echoed from the command when it carried one. */

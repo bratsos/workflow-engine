@@ -628,6 +628,86 @@ describe("ServerlessHost", () => {
     );
   });
 
+  it("ends a job redelivered after its stage failed for good without running the stage again", async () => {
+    let receipts = 0;
+    const stage = defineStage({
+      id: "stage-1",
+      name: "Stage 1",
+      schemas: { input: schema, output: outputSchema, config: z.object({}) },
+      async execute(ctx) {
+        await ctx.step.run("receipt", async () => ++receipts);
+        throw new Error("provider unavailable");
+      },
+    });
+    const workflow = new WorkflowBuilder(
+      "receipt-wf",
+      "Receipt",
+      "Test",
+      schema,
+      outputSchema,
+    )
+      .pipe(stage)
+      .build();
+    const { kernel, persistence, jobTransport, eventSink } = createTestEnv(
+      [workflow],
+      { stepLedger: new InMemoryStepLedger() },
+    );
+    jobTransport.setDefaultMaxAttempts(1);
+    const host = createServerlessHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+    });
+    const created = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "redelivered-1",
+      workflowId: "receipt-wf",
+      input: { data: "hello" },
+    });
+    await host.runMaintenanceTick();
+
+    // The only attempt fails the stage for good; the worker dies before it
+    // acknowledges the job, so the lease is reaped and the job delivered again.
+    const first = (await dequeueAsMessage(jobTransport))!;
+    await kernel.dispatch({
+      type: "job.execute",
+      workflowRunId: first.workflowRunId,
+      workflowId: first.workflowId,
+      stageId: first.stageId,
+      config: {},
+      attempt: first.attempt,
+      maxAttempts: first.maxAttempts,
+    });
+    await jobTransport.releaseStaleJobs(-1);
+    const stagesBefore = await persistence.getStagesByRun(
+      created.workflowRunId,
+    );
+    expect(stagesBefore).toMatchObject([{ status: "FAILED" }]);
+    const again = (await dequeueAsMessage(jobTransport))!;
+    expect(again).toMatchObject({ attempt: 2, maxAttempts: 1 });
+
+    const result = await host.handleJob(again);
+
+    expect(result).toMatchObject({
+      outcome: "failed",
+      error: "provider unavailable",
+      willRetry: false,
+    });
+    expect(receipts).toBe(1);
+    expect(await persistence.getStagesByRun(created.workflowRunId)).toEqual(
+      stagesBefore,
+    );
+    expect((await persistence.getRun(created.workflowRunId))?.status).toBe(
+      "FAILED",
+    );
+    expect(
+      eventSink.events.filter((e) => e.type === "stage:started"),
+    ).toHaveLength(1);
+    expect(
+      eventSink.events.filter((e) => e.type === "workflow:failed"),
+    ).toHaveLength(1);
+  });
+
   it("publishes a completed run's events from handleJob without a maintenance tick", async () => {
     const workflow = createSimpleWorkflow();
     const { kernel, jobTransport, eventSink } = createTestEnv([workflow]);

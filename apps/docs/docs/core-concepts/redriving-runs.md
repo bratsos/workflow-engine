@@ -129,7 +129,7 @@ you an output existed and where it lived, not what it contained.
 ### What happens to the step ledger
 
 A reopened stage keeps its durable step ledger, through the same reset the
-engine gives an exhausted stage before its next attempt: every `completed`
+engine gives a `FAILED` stage it is asked to run again: every `completed`
 row stays as it is, so a stage that completed 9 of 10 steps re-runs only the
 tenth; every `run` row that named an external effect but did not complete
 is re-opened, so its body runs again with `isReclaim: true` and re-adopts

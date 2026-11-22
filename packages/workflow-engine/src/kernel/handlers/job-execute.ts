@@ -124,6 +124,26 @@ export async function handleJobExecute(
     };
   }
   if (existingStage?.status === "FAILED") {
+    // A job delivery (it carries its `attempt`) that finds its stage FAILED
+    // is a dead job, at any attempt number, in or past the budget the queue
+    // still holds: only a final attempt or a deterministic error writes
+    // FAILED, and only the acknowledgement was lost (a lost ack, a lost
+    // lease). Starting it would reset the ledger, run completed steps again
+    // and could schedule a retry, so it ends here with the stored error: the
+    // host fails the job and the run, and no stage event repeats. Redrive
+    // and rerunFrom reopen the stage as PENDING before they queue a job.
+    if (command.attempt !== undefined) {
+      return {
+        outcome: "failed" as const,
+        error: existingStage.errorMessage ?? `Stage ${stageId} already failed`,
+        retryable: false,
+        willRetry: false,
+        attempt: command.attempt,
+        maxAttempts: command.maxAttempts ?? HOST_DEFAULTS.maxAttempts,
+        _events: [],
+      };
+    }
+    // A direct dispatch without `attempt` is an explicit re-run.
     await resetStageStepsForFreshAttempt(workflowRunId, existingStage.id, deps);
   }
 

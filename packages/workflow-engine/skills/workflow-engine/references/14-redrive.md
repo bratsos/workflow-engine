@@ -171,7 +171,7 @@ Durable step rows in `workflow_steps` are keyed by `stageRecordId` — the prima
 
 ### A reopened record keeps its progress
 
-For `lastFailure` and `stage`, the resumed group's records are reopened in place, and their ledgers go through the same reset an exhausted stage gets before `job.execute` runs it again (the helper is shared, `kernel/helpers/step-ledger-reset.ts`), in its `"resume"` mode:
+For `lastFailure` and `stage`, the resumed group's records are reopened in place, and their ledgers go through the same reset a `FAILED` stage gets when `job.execute` is dispatched for it without `attempt` (an explicit re-run; the helper is shared, `kernel/helpers/step-ledger-reset.ts`), in its `"resume"` mode:
 
 - Every `completed` row stays exactly as it is. The replay answers it from the ledger, so the step's body does not run again — a stage that completed 9 of 10 steps re-runs only the tenth — and the row keeps the external key it was given, so a provider deduping on that key still recognises the effect.
 - Every `run` row naming an external effect (`externalKey` set) that did not complete is **re-opened**: put back to `running` with no lease, so the replay takes it over, bumps `attempt` and executes the body with `isReclaim: true`, letting a `${id}:submit` re-adopt the batch a provider is still processing instead of creating and billing a second one.

@@ -713,21 +713,21 @@ describe.skipIf(!realDatabase)(
             stepId: "approval",
             payload,
           });
-        const execute = (attempt: number) =>
+        const execute = (numbered: boolean) =>
           kernel.dispatch({
             type: "job.execute",
             workflowRunId: id,
             workflowId: workflow.id,
             stageId: "first",
             config: {},
-            attempt,
-            maxAttempts: attempt,
+            ...(numbered ? { attempt: 1, maxAttempts: 1 } : {}),
           });
         await signal("first");
-        // The last attempt fails, then a re-delivered job resets the ledger.
-        await execute(1);
+        // The last attempt fails, then an explicit re-run (a delivered job
+        // would be a dead job) resets the ledger.
+        await execute(true);
         failing = false;
-        expect((await execute(2)).outcome).toBe("suspended");
+        expect((await execute(false)).outcome).toBe("suspended");
         const events = async () =>
           (await db.persistence.getUnpublishedOutboxEvents(100))
             .filter((row) => row.eventType === "step:signalled")

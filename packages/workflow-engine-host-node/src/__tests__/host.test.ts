@@ -19,6 +19,7 @@ import {
 } from "@bratsos/workflow-engine/kernel/testing";
 import {
   InMemoryJobQueue,
+  InMemoryStepLedger,
   InMemoryWorkflowPersistence,
 } from "@bratsos/workflow-engine/testing";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -125,7 +126,10 @@ function createAsyncBatchWorkflow(): Workflow<any, any> {
     .build();
 }
 
-function createTestEnv(workflows: Workflow<any, any>[] = []) {
+function createTestEnv(
+  workflows: Workflow<any, any>[] = [],
+  extra: { stepLedger?: InMemoryStepLedger } = {},
+) {
   const persistence = new InMemoryWorkflowPersistence();
   const blobStore = new InMemoryBlobStore();
   const jobTransport = new InMemoryJobQueue("test-worker");
@@ -147,6 +151,7 @@ function createTestEnv(workflows: Workflow<any, any>[] = []) {
       getWorkflow: (id) => registry.get(id),
       listWorkflows: () => Array.from(registry.values()),
     },
+    ...extra,
   });
 
   return { kernel, persistence, blobStore, jobTransport, eventSink, clock };
@@ -1043,6 +1048,89 @@ describe("NodeHost", () => {
     );
     expect(failedEvents.length).toBeGreaterThan(0);
     expect((failedEvents[0] as any).error).toContain("deterministic failure");
+  });
+
+  it("ends a job redelivered after its stage failed for good without running the stage again", async () => {
+    let receipts = 0;
+    const stage = defineStage({
+      id: "receipt",
+      name: "Receipt",
+      schemas: { input: schema, output: outputSchema, config: z.object({}) },
+      async execute(ctx) {
+        await ctx.step.run("receipt", async () => ++receipts);
+        throw new Error("provider unavailable");
+      },
+    });
+    const workflow = new WorkflowBuilder(
+      "receipt-wf",
+      "Receipt",
+      "Test",
+      schema,
+      outputSchema,
+    )
+      .pipe(stage)
+      .build();
+    const { kernel, persistence, jobTransport, eventSink } = createTestEnv(
+      [workflow],
+      { stepLedger: new InMemoryStepLedger() },
+    );
+    jobTransport.setDefaultMaxAttempts(1);
+    const created = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "redelivered-1",
+      workflowId: "receipt-wf",
+      input: { data: "hello" },
+    });
+    await kernel.dispatch({
+      type: "run.claimPending",
+      workerId: "test-worker",
+    });
+    // The only attempt fails the stage for good; the worker dies before it
+    // acknowledges the job, so the lease is reaped and the job delivered again.
+    const first = (await jobTransport.dequeue())!;
+    await kernel.dispatch({
+      type: "job.execute",
+      workflowRunId: first.workflowRunId,
+      workflowId: first.workflowId,
+      stageId: first.stageId,
+      config: {},
+      attempt: first.attempt,
+      maxAttempts: first.maxAttempts,
+    });
+    await jobTransport.releaseStaleJobs(-1);
+    const stagesBefore = await persistence.getStagesByRun(
+      created.workflowRunId,
+    );
+    expect(stagesBefore).toMatchObject([{ status: "FAILED" }]);
+
+    host = createNodeHost({
+      kernel,
+      jobTransport,
+      workerId: "test-worker",
+      orchestrationIntervalMs: 50,
+      jobPollIntervalMs: 20,
+    });
+    await host.start();
+    await waitFor(async () => {
+      const run = await persistence.getRun(created.workflowRunId);
+      return run?.status === "FAILED";
+    }, 2_000);
+
+    expect(receipts).toBe(1);
+    expect(await persistence.getStagesByRun(created.workflowRunId)).toEqual(
+      stagesBefore,
+    );
+    const [job] = await jobTransport.getJobsByWorkflowRun(
+      created.workflowRunId,
+    );
+    expect(job).toMatchObject({ status: "FAILED", attempt: 2 });
+    await new Promise((r) => setTimeout(r, 100));
+    expect(
+      eventSink.events.filter((e) => e.type === "stage:started"),
+    ).toHaveLength(1);
+    expect(
+      eventSink.events.filter((e) => e.type === "workflow:failed"),
+    ).toHaveLength(1);
   });
 
   it("retries a failed stage through the queue and never marks it FAILED", async () => {
