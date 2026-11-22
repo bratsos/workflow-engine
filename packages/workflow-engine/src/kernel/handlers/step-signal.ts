@@ -3,7 +3,7 @@ import type { StepSignalCommand, StepSignalResult } from "../commands.js";
 import type { KernelEvent } from "../events.js";
 import { toOutboxEvents } from "../helpers/outbox-events.js";
 import type { HandlerResult, KernelDeps } from "../kernel.js";
-import type { StepRecord } from "../ports.js";
+import type { StepLedger, StepRecord, WorkflowStageRecord } from "../ports.js";
 
 /** Idempotency type of a signal's wake. `run.purge` releases these keys. */
 export const SIGNAL_WAKE = "step.signal.wake";
@@ -24,7 +24,8 @@ export async function handleStepSignal(
   command: StepSignalCommand,
   deps: KernelDeps,
 ): Promise<HandlerResult<StepSignalResult>> {
-  if (!deps.stepLedger) {
+  const ledger = deps.stepLedger;
+  if (!ledger) {
     throw new Error(
       "step.signal requires a configured StepLedger. Pass stepLedger to createKernel before signalling a stage.",
     );
@@ -40,6 +41,33 @@ export async function handleStepSignal(
     );
   }
 
+  try {
+    return await deliverSignal(command, { ...deps, stepLedger: ledger }, stage);
+  } catch (error) {
+    // The record went (purge, restart) after the read above: whatever this
+    // delivery wrote under it has no row left to name it, and whoever
+    // deleted the record may have cleaned up before the write landed.
+    const current = await deps.persistence
+      .getStage(command.workflowRunId, command.stageId)
+      .catch(() => stage);
+    if (current?.id !== stage.id) {
+      await ledger.clear(stage.id).catch(() => {});
+      await deps.persistence
+        .releaseIdempotencyKey(
+          signalWakeKey(stage.id, command.stepId),
+          SIGNAL_WAKE,
+        )
+        .catch(() => {});
+    }
+    throw error;
+  }
+}
+
+async function deliverSignal(
+  command: StepSignalCommand,
+  deps: KernelDeps & { stepLedger: StepLedger },
+  stage: WorkflowStageRecord,
+): Promise<HandlerResult<StepSignalResult>> {
   // The ledger is external to the stage transaction. A completed ledger row
   // must still retry its wake; this key commits with the wake and outbox event.
   // It records which row woke the stage: a ledger reset drops that row, so the

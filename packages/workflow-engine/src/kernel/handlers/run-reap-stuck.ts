@@ -2,6 +2,7 @@ import { StaleVersionError } from "../../persistence/interface.js";
 import type { RunReapStuckCommand, RunReapStuckResult } from "../commands";
 import type { KernelEvent } from "../events";
 import { servesRun } from "../helpers/definition-pinning.js";
+import { enqueueForLiveRun } from "../helpers/prepare-execution-group.js";
 import { isTransactionReadBound } from "../helpers/transaction-reads.js";
 import type { HandlerResult, KernelDeps } from "../kernel";
 import {
@@ -103,7 +104,7 @@ export async function handleRunReapStuck(
           definitionVersion: run.definitionVersion,
         }));
         postCommits.push(async (postDeps: KernelDeps) => {
-          await postDeps.jobTransport.enqueueParallel(jobsToEnqueue);
+          await enqueueForLiveRun(postDeps, run.id, jobsToEnqueue);
         });
         continue;
       }

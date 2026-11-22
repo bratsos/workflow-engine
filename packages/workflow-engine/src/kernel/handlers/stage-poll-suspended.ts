@@ -132,27 +132,34 @@ async function failStageOnly(
   errorMessage: string,
   deps: KernelDeps,
   postCommits: Array<() => Promise<void>>,
-): Promise<void> {
-  await deps.persistence.withTransaction(async (tx) => {
-    await tx.updateStage(stageRecord.id, {
-      status: "FAILED",
-      completedAt: deps.clock.now(),
-      errorMessage,
-      nextPollAt: deps.clock.now(),
+): Promise<number> {
+  try {
+    await deps.persistence.withTransaction(async (tx) => {
+      await tx.updateStage(stageRecord.id, {
+        status: "FAILED",
+        completedAt: deps.clock.now(),
+        errorMessage,
+        nextPollAt: deps.clock.now(),
+        // A host that completed the stage since the claim keeps it.
+        expectedVersion: stageRecord.version,
+      });
+      await tx.appendOutboxEvents(
+        toOutboxEvents(stageRecord.workflowRunId, [
+          {
+            type: "stage:failed",
+            timestamp: deps.clock.now(),
+            workflowRunId: stageRecord.workflowRunId,
+            stageId: stageRecord.stageId,
+            stageName: stageRecord.stageName,
+            error: errorMessage,
+          },
+        ]),
+      );
     });
-    await tx.appendOutboxEvents(
-      toOutboxEvents(stageRecord.workflowRunId, [
-        {
-          type: "stage:failed",
-          timestamp: deps.clock.now(),
-          workflowRunId: stageRecord.workflowRunId,
-          stageId: stageRecord.stageId,
-          stageName: stageRecord.stageName,
-          error: errorMessage,
-        },
-      ]),
-    );
-  });
+  } catch (error) {
+    if (error instanceof StaleVersionError) return 0;
+    throw error;
+  }
   postCommits.push(() =>
     failSuspendedJobRow(
       stageRecord.workflowRunId,
@@ -161,6 +168,7 @@ async function failStageOnly(
       deps,
     ),
   );
+  return 1;
 }
 
 type ReplayOutcome = "resumed" | "suspended" | "retrying" | "failed" | "skip";
@@ -187,9 +195,12 @@ async function replayAttemptBudget(
   const jobs = await deps.jobTransport.getJobsByWorkflowRun(
     stageRecord.workflowRunId,
   );
-  const job = jobs.find(
-    (j) => j.stageId === stageRecord.stageId && j.status === "SUSPENDED",
-  );
+  // The SUSPENDED row, or the RUNNING one whose suspension the host has
+  // not acknowledged yet: either carries the delivery's real budget.
+  const ofStage = jobs.filter((j) => j.stageId === stageRecord.stageId);
+  const job =
+    ofStage.find((j) => j.status === "SUSPENDED") ??
+    ofStage.find((j) => j.status === "RUNNING");
   const spent = (
     stageRecord.suspendedState as {
       metadata?: Record<string, unknown>;
@@ -310,6 +321,29 @@ async function claimSuspendedStage(
  * leaves the ready set it permanently occupies one of the tick's candidate
  * slots and pushes servable stages out of the window.
  */
+/**
+ * Whether the stage row moved on while this poller ran user code: a job
+ * completed it, a cancel or redrive replaced it, another poller took it
+ * over. Checked before the poller's first write, and every Phase-2 stage
+ * write is fenced on the claimed version too, so a superseded poll commits
+ * nothing. Output and artifacts go to the stage's own keys before the
+ * fenced write, as on main: a poll superseded between this check and that
+ * write has overwritten the winner's bytes. What user code itself wrote meanwhile (`ctx.storage`,
+ * `ctx.log`, step rows) is not covered. A failed read proceeds: the fenced
+ * write is the guard, and a read error is not a failure of the user code.
+ */
+async function superseded(
+  stageRecord: WorkflowStageRecord,
+  deps: KernelDeps,
+): Promise<boolean> {
+  const current = await deps.persistence
+    .getStage(stageRecord.workflowRunId, stageRecord.stageId)
+    .catch(() => stageRecord);
+  return (
+    current?.id !== stageRecord.id || current.version !== stageRecord.version
+  );
+}
+
 async function releaseStageClaim(
   stageRecord: WorkflowStageRecord,
   deps: KernelDeps,
@@ -397,6 +431,7 @@ async function replayStage(
     };
     built = buildStageExecutionContext(input, deps);
     const result = await stageDef.execute(built.context);
+    if (await superseded(stageRecord, deps)) return "skip";
 
     if (isSuspendedResult(result)) {
       const suspended = result as SuspendedResult;
@@ -432,6 +467,7 @@ async function replayStage(
             pollInterval: suspended.pollConfig.pollInterval,
             maxWaitUntil,
             metrics: suspended.metrics as any,
+            expectedVersion: stageRecord.version,
           });
           if (bufferedAnnotations.length > 0) {
             await tx.appendAnnotations(bufferedAnnotations);
@@ -529,6 +565,7 @@ async function replayStage(
           // A retried attempt that finished through a suspension: the
           // earlier attempt's error is stale, exactly as on direct completion.
           errorMessage: null,
+          expectedVersion: stageRecord.version,
         });
         if (bufferedAnnotations.length > 0) {
           await tx.appendAnnotations(bufferedAnnotations);
@@ -597,6 +634,8 @@ async function replayStage(
           await tx.updateStage(stageRecord.id, {
             attempt: stageRecord.attempt + 1,
             errorMessage: message,
+            // A job that finished the stage meanwhile keeps its outcome.
+            expectedVersion: stageRecord.version,
             nextPollAt: new Date(
               deps.clock.now().getTime() + retryBackoffMs(budget.attempt),
             ),
@@ -739,20 +778,19 @@ export async function handleStagePollSuspended(
 
     // 3a.1 Skip cancelled runs — mark the suspended stage as cancelled
     if (run.status === "CANCELLED") {
-      await markStageCancelled(stageRecord.id, deps);
+      await markStageCancelled(stageRecord.id, deps, stageRecord.version);
       continue;
     }
 
     // 3b. Get workflow from registry
     const workflow = deps.registry.getWorkflow(run.workflowId);
     if (!workflow) {
-      await failStageOnly(
+      failed += await failStageOnly(
         stageRecord,
         `Workflow ${run.workflowId} not found in registry`,
         deps,
         postCommits,
       );
-      failed++;
       continue;
     }
 
@@ -806,8 +844,7 @@ export async function handleStagePollSuspended(
         ? `Stage ${stageRecord.stageId} not found in workflow ${run.workflowId}`
         : `Stage ${stageRecord.stageId} does not support checkCompletion`;
 
-      await failStageOnly(stageRecord, errorMsg, deps, postCommits);
-      failed++;
+      failed += await failStageOnly(stageRecord, errorMsg, deps, postCommits);
       continue;
     }
 
@@ -918,6 +955,7 @@ export async function handleStagePollSuspended(
         stageRecord.suspendedState as any,
         checkContext,
       );
+      if (await superseded(stageRecord, deps)) continue;
 
       // ── Phase 2: persist results (transaction) ─────────────────────
       if (checkResult.error) {
@@ -987,6 +1025,7 @@ export async function handleStagePollSuspended(
               metrics: checkResult.metrics as any,
               embeddingInfo: checkResult.embeddings as any,
               errorMessage: null,
+              expectedVersion: stageRecord.version,
             });
 
             if (bufferedAnnotations.length > 0) {
@@ -1072,6 +1111,7 @@ export async function handleStagePollSuspended(
           deps,
           async (tx) => {
             await tx.updateStage(stageRecord.id, {
+              expectedVersion: stageRecord.version,
               nextPollAt,
             });
 

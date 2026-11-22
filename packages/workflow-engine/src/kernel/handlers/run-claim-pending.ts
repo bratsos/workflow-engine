@@ -56,7 +56,7 @@ export async function handleRunClaimPending(
   // on (workflowRunId, stageId), so the sweep cannot double-queue.
   const pendingEnqueues: Array<{
     entry: { workflowRunId: string; jobIds: string[] };
-    enqueue: () => Promise<string[]>;
+    enqueue: (postDeps: KernelDeps) => Promise<string[]>;
   }> = [];
 
   for (let i = 0; i < maxClaims; i++) {
@@ -205,7 +205,7 @@ export async function handleRunClaimPending(
   return {
     claimed,
     _events: events,
-    _postCommit: async () => {
+    _postCommit: async (postDeps) => {
       // Every claimed run gets its enqueue attempted, even if an earlier
       // one failed: a transport error on one run must not leave the rest
       // of the batch jobless. Failures are reported together afterwards
@@ -213,7 +213,7 @@ export async function handleRunClaimPending(
       const failures: string[] = [];
       for (const { entry, enqueue } of pendingEnqueues) {
         try {
-          entry.jobIds.push(...(await enqueue()));
+          entry.jobIds.push(...(await enqueue(postDeps)));
         } catch (err) {
           failures.push(`${entry.workflowRunId}: ${toErrorMessage(err)}`);
         }
