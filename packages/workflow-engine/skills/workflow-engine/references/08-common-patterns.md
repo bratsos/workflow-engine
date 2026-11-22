@@ -53,7 +53,11 @@ Uses a 3-phase pattern so that long-running stage execution doesn't hold a DB co
 2. **Phase 2 (Execute):** `stageDef.execute()` runs outside any database transaction. Progress events are collected in memory.
 3. **Phase 3 (Complete):** Update stage to `COMPLETED`/`SUSPENDED`/`FAILED` + write completion and progress outbox events in one transaction.
 
+Phase 3 fences its stage write on the version Phase 1 returned, so an attempt that was overtaken while its body ran (its run was cancelled and a redrive or `rerunFrom` reopened the stage) commits nothing: it returns `ghost: true, ghostReason: "orphan"`, the reopened stage and the redrive's job are untouched, and its host's fenced acknowledgement does not reach the redrive's job. A write that lost only to a `step.signal` wake on the same RUNNING stage is repeated on the stored version.
+
 If the process crashes between Phase 1 and Phase 3, the stage stays in `RUNNING` and `lease.reapStale` will eventually retry the job.
+
+A host passes the job's `attempt` and `maxAttempts` to `job.execute`. A dispatch without `attempt` is treated as an explicit rerun of a `FAILED` stage (it resets the ledger and starts it again).
 
 #### `stage.pollSuspended`
 

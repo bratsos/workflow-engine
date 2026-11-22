@@ -24,6 +24,7 @@
  */
 
 import { isSuspendedResult } from "../../core/types";
+import { StaleVersionError } from "../../persistence/interface.js";
 import type { JobExecuteCommand, JobExecuteResult } from "../commands";
 import { DefinitionVersionMismatchError } from "../errors.js";
 import type { KernelEvent } from "../events";
@@ -127,8 +128,8 @@ export async function handleJobExecute(
     // A job delivery (it carries its `attempt`) that finds its stage FAILED
     // is a dead job, at any attempt number, in or past the budget the queue
     // still holds: only a final attempt or a deterministic error writes
-    // FAILED, and only the acknowledgement was lost (a lost ack, a lost
-    // lease). Starting it would reset the ledger, run completed steps again
+    // FAILED (an overtaken attempt's write is fenced, see `commit`), and only
+    // the acknowledgement was lost (a lost ack, a lost lease). Starting it would reset the ledger, run completed steps again
     // and could schedule a retry, so it ends here with the stored error: the
     // host fails the job and the run, and no stage event repeats. Redrive
     // and rerunFrom reopen the stage as PENDING before they queue a job.
@@ -213,6 +214,47 @@ export async function handleJobExecute(
 
     return record;
   });
+
+  // Phase 3 commits through here. Its stage write is fenced on the version
+  // Phase 1 returned, folded into the write's WHERE (no extra read), so an
+  // attempt that was overtaken while its body ran (a redrive reopened the
+  // stage, another worker took it over) commits nothing and its result is
+  // discarded. A write that lost only to a writer that leaves the claim
+  // alone (a `step.signal` wake moves `nextPollAt` on a RUNNING stage) is
+  // repeated on the version now stored: it is still this attempt's row.
+  // Returns why the result was discarded, or `undefined` once committed.
+  const commit = async (
+    write: (tx: KernelDeps["persistence"], version: number) => Promise<void>,
+  ): Promise<string | undefined> => {
+    let version = stageRecord.version;
+    for (let tries = 0; ; tries++) {
+      try {
+        // expectedVersion omitted on the run: Phase 3 never writes the run
+        // row here (only the stage row), so — unlike stage-poll-suspended's
+        // claim — parallel sibling stages completing concurrently must not
+        // contend on the run's version.
+        const claimed = await withClaimedRun(
+          workflowRunId,
+          undefined,
+          deps,
+          (tx) => write(tx, version),
+        );
+        return claimed.status === "cancelled" ? claimed.message : undefined;
+      } catch (error) {
+        if (!(error instanceof StaleVersionError)) throw error;
+        const current = await deps.persistence.getStage(workflowRunId, stageId);
+        if (
+          current?.id !== stageRecord.id ||
+          current.status !== "RUNNING" ||
+          current.attempt !== stageRecord.attempt
+        ) {
+          return `Stage ${stageId} of run ${workflowRunId} was reopened or taken over while this attempt ran — result discarded`;
+        }
+        if (tries === 4) throw error;
+        version = current.version;
+      }
+    }
+  };
 
   // ── Phase 2: Execute (no transaction) ────────────────────────────
   // The stage's execute() function runs through deps.executor.run().
@@ -306,75 +348,67 @@ export async function handleJobExecute(
       retryable: run.retryable,
     });
 
-    // expectedVersion omitted: Phase 3 never writes the run row here (only
-    // the stage row), so — unlike stage-poll-suspended's claim — parallel
-    // sibling stages completing concurrently must not contend on the run's
-    // version. Any persistence failure other than a genuine cancellation
-    // still propagates (Stage stays RUNNING; re-throwing releases the
-    // idempotency key so lease.reapStale can retry the job).
-    const claimResult = await withClaimedRun(
-      workflowRunId,
-      undefined,
-      deps,
-      async (tx) => {
-        await tx.updateStage(
-          stageRecord.id,
-          willRetry
-            ? { status: "PENDING", duration, errorMessage }
-            : {
-                status: "FAILED",
-                completedAt: deps.clock.now(),
-                duration,
-                errorMessage,
-              },
-        );
-
-        if (bufferedAnnotations.length > 0) {
-          await tx.appendAnnotations(bufferedAnnotations);
-        }
-
-        // `stage:failed` only when the row becomes FAILED; a retry that
-        // is about to run is announced as `stage:retrying`.
-        const failedEvent: KernelEvent = willRetry
-          ? {
-              type: "stage:retrying",
-              timestamp: deps.clock.now(),
-              workflowRunId,
-              stageId,
-              stageName: stageDef.name,
-              attempt: command.attempt!,
-              maxAttempts: command.maxAttempts ?? HOST_DEFAULTS.maxAttempts,
-              error: errorMessage,
-            }
+    // Any persistence failure other than a genuine cancellation or an
+    // overtaken attempt still propagates (Stage stays RUNNING; re-throwing
+    // releases the idempotency key so lease.reapStale can retry the job).
+    const discarded = await commit(async (tx, version) => {
+      await tx.updateStage(stageRecord.id, {
+        ...(willRetry
+          ? { status: "PENDING" as const, duration, errorMessage }
           : {
-              type: "stage:failed",
-              timestamp: deps.clock.now(),
-              workflowRunId,
-              stageId,
-              stageName: stageDef.name,
-              error: errorMessage,
-            };
+              status: "FAILED" as const,
+              completedAt: deps.clock.now(),
+              duration,
+              errorMessage,
+            }),
+        expectedVersion: version,
+      });
 
-        await tx.appendOutboxEvents(
-          toOutboxEvents(
+      if (bufferedAnnotations.length > 0) {
+        await tx.appendAnnotations(bufferedAnnotations);
+      }
+
+      // `stage:failed` only when the row becomes FAILED; a retry that
+      // is about to run is announced as `stage:retrying`.
+      const failedEvent: KernelEvent = willRetry
+        ? {
+            type: "stage:retrying",
+            timestamp: deps.clock.now(),
             workflowRunId,
-            [
-              ...run.progress,
-              failedEvent,
-              ...buildAnnotationEvents(bufferedAnnotations, deps.clock.now()),
-            ],
-            causationId,
-          ),
-        );
-      },
-    );
+            stageId,
+            stageName: stageDef.name,
+            attempt: command.attempt!,
+            maxAttempts: command.maxAttempts ?? HOST_DEFAULTS.maxAttempts,
+            error: errorMessage,
+          }
+        : {
+            type: "stage:failed",
+            timestamp: deps.clock.now(),
+            workflowRunId,
+            stageId,
+            stageName: stageDef.name,
+            error: errorMessage,
+          };
 
-    if (claimResult.status === "cancelled") {
+      await tx.appendOutboxEvents(
+        toOutboxEvents(
+          workflowRunId,
+          [
+            ...run.progress,
+            failedEvent,
+            ...buildAnnotationEvents(bufferedAnnotations, deps.clock.now()),
+          ],
+          causationId,
+        ),
+      );
+    });
+
+    if (discarded !== undefined) {
       return {
         outcome: "failed" as const,
         ghost: true,
         ghostReason: "orphan" as const,
-        error: claimResult.message,
+        error: discarded,
         _events: [],
       };
     }
@@ -427,64 +461,59 @@ export async function handleJobExecute(
 
     const bufferedAnnotations = run.annotations;
 
-    // expectedVersion omitted — see the comment on the Phase 3b claim above.
-    const claimResult = await withClaimedRun(
-      workflowRunId,
-      undefined,
-      deps,
-      async (tx) => {
-        await tx.updateStage(stageRecord.id, {
-          status: "SUSPENDED",
-          suspendedState: state as any,
-          nextPollAt,
-          pollInterval: pollConfig.pollInterval,
-          maxWaitUntil: pollConfig.maxWaitTime
-            ? new Date(deps.clock.now().getTime() + pollConfig.maxWaitTime)
-            : undefined,
-          metrics: metrics as any,
-        });
+    const discarded = await commit(async (tx, version) => {
+      await tx.updateStage(stageRecord.id, {
+        expectedVersion: version,
+        status: "SUSPENDED",
+        suspendedState: state as any,
+        nextPollAt,
+        pollInterval: pollConfig.pollInterval,
+        maxWaitUntil: pollConfig.maxWaitTime
+          ? new Date(deps.clock.now().getTime() + pollConfig.maxWaitTime)
+          : undefined,
+        metrics: metrics as any,
+      });
 
-        if (bufferedAnnotations.length > 0) {
-          await tx.appendAnnotations(bufferedAnnotations);
-        }
+      if (bufferedAnnotations.length > 0) {
+        await tx.appendAnnotations(bufferedAnnotations);
+      }
 
-        const suspendedEvent: KernelEvent = {
-          type: "stage:suspended",
-          timestamp: deps.clock.now(),
+      const suspendedEvent: KernelEvent = {
+        type: "stage:suspended",
+        timestamp: deps.clock.now(),
+        workflowRunId,
+        stageId,
+        stageName: stageDef.name,
+        nextPollAt,
+      };
+
+      const workflowSuspendedEvent: KernelEvent = {
+        type: "workflow:suspended",
+        timestamp: deps.clock.now(),
+        workflowRunId,
+        stageId,
+      };
+
+      await tx.appendOutboxEvents(
+        toOutboxEvents(
           workflowRunId,
-          stageId,
-          stageName: stageDef.name,
-          nextPollAt,
-        };
+          [
+            ...run.progress,
+            suspendedEvent,
+            workflowSuspendedEvent,
+            ...buildAnnotationEvents(bufferedAnnotations, deps.clock.now()),
+          ],
+          causationId,
+        ),
+      );
+    });
 
-        const workflowSuspendedEvent: KernelEvent = {
-          type: "workflow:suspended",
-          timestamp: deps.clock.now(),
-          workflowRunId,
-          stageId,
-        };
-
-        await tx.appendOutboxEvents(
-          toOutboxEvents(
-            workflowRunId,
-            [
-              ...run.progress,
-              suspendedEvent,
-              workflowSuspendedEvent,
-              ...buildAnnotationEvents(bufferedAnnotations, deps.clock.now()),
-            ],
-            causationId,
-          ),
-        );
-      },
-    );
-
-    if (claimResult.status === "cancelled") {
+    if (discarded !== undefined) {
       return {
         outcome: "failed" as const,
         ghost: true,
         ghostReason: "orphan" as const,
-        error: claimResult.message,
+        error: discarded,
         _events: [],
       };
     }
@@ -515,59 +544,54 @@ export async function handleJobExecute(
 
     const bufferedAnnotations = run.annotations;
 
-    // expectedVersion omitted — see the comment on the Phase 3b claim above.
-    const claimResult = await withClaimedRun(
-      workflowRunId,
-      undefined,
-      deps,
-      async (tx) => {
-        await tx.updateStage(stageRecord.id, {
-          status: "COMPLETED",
-          completedAt: deps.clock.now(),
-          duration,
-          // A retried attempt succeeded: the earlier attempt's error is stale.
-          errorMessage: null,
-          outputData: {
-            _artifactKey: outputKey,
-            ...(artifactKeys ? { _artifactKeys: artifactKeys } : {}),
-          } as any,
-          metrics: result.metrics as any,
-          embeddingInfo: result.embeddings as any,
-        });
+    const discarded = await commit(async (tx, version) => {
+      await tx.updateStage(stageRecord.id, {
+        expectedVersion: version,
+        status: "COMPLETED",
+        completedAt: deps.clock.now(),
+        duration,
+        // A retried attempt succeeded: the earlier attempt's error is stale.
+        errorMessage: null,
+        outputData: {
+          _artifactKey: outputKey,
+          ...(artifactKeys ? { _artifactKeys: artifactKeys } : {}),
+        } as any,
+        metrics: result.metrics as any,
+        embeddingInfo: result.embeddings as any,
+      });
 
-        if (bufferedAnnotations.length > 0) {
-          await tx.appendAnnotations(bufferedAnnotations);
-        }
+      if (bufferedAnnotations.length > 0) {
+        await tx.appendAnnotations(bufferedAnnotations);
+      }
 
-        const completedEvent: KernelEvent = {
-          type: "stage:completed",
-          timestamp: deps.clock.now(),
+      const completedEvent: KernelEvent = {
+        type: "stage:completed",
+        timestamp: deps.clock.now(),
+        workflowRunId,
+        stageId,
+        stageName: stageDef.name,
+        duration,
+      };
+
+      await tx.appendOutboxEvents(
+        toOutboxEvents(
           workflowRunId,
-          stageId,
-          stageName: stageDef.name,
-          duration,
-        };
+          [
+            ...run.progress,
+            completedEvent,
+            ...buildAnnotationEvents(bufferedAnnotations, deps.clock.now()),
+          ],
+          causationId,
+        ),
+      );
+    });
 
-        await tx.appendOutboxEvents(
-          toOutboxEvents(
-            workflowRunId,
-            [
-              ...run.progress,
-              completedEvent,
-              ...buildAnnotationEvents(bufferedAnnotations, deps.clock.now()),
-            ],
-            causationId,
-          ),
-        );
-      },
-    );
-
-    if (claimResult.status === "cancelled") {
+    if (discarded !== undefined) {
       return {
         outcome: "failed" as const,
         ghost: true,
         ghostReason: "orphan" as const,
-        error: claimResult.message,
+        error: discarded,
         _events: [],
       };
     }
