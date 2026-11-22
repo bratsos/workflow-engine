@@ -71,6 +71,6 @@ describe("batch provider follows the stored refs", () => {
     });
 
     expect(status.provider).toBe("openrouter");
-    expect(urls[0]).toContain("openrouter.ai/api/beta/batches/batch-or-9");
+    expect(urls[0]).toContain("openrouter.ai/api/v1/batches/batch-or-9");
   });
 });

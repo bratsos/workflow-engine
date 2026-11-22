@@ -79,7 +79,7 @@ describe("vendor batch SDK missing", () => {
 
     expect(handle.id).toBe("batch-or-1");
     expect(handle.provider).toBe("openrouter");
-    expect(urls[0]).toContain("openrouter.ai/api/beta/batches");
+    expect(urls[0]).toContain("openrouter.ai/api/v1/batches");
     expect(
       logs.some(
         (l) => l.startsWith("WARN") && /Falling back to the OpenRouter/.test(l),

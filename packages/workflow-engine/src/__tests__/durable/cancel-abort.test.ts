@@ -97,6 +97,76 @@ describe("cancellation reaches running bodies", () => {
     });
   });
 
+  it("starts no step body once the signal reports a cancel, and writes no row", async () => {
+    const clock = new FakeClock();
+    const ledger = new InMemoryStepLedger({ now: clock.now.bind(clock) });
+    const abort = new AbortController();
+    abort.abort(new StageAbortedError("cancelled", "run-1"));
+    const api = createStepApi({
+      stageRecordId: "stage",
+      stepLedger: ledger,
+      clock,
+      abortSignal: abort.signal,
+    });
+    let started = 0;
+
+    const outcome = await api
+      .run("work", async () => ++started, { retries: 2 })
+      .catch((error: unknown) => error);
+
+    expect(outcome).toBeInstanceOf(StageAbortedError);
+    expect((outcome as StageAbortedError).reason).toBe("cancelled");
+    expect(started).toBe(0);
+    // A failed or running row would be counted as an attempt by a redrive.
+    expect(await ledger.list("stage")).toEqual([]);
+  });
+
+  it("still answers a completed step from the ledger after a cancel", async () => {
+    const clock = new FakeClock();
+    const ledger = new InMemoryStepLedger({ now: clock.now.bind(clock) });
+    await createStepApi({
+      stageRecordId: "stage",
+      stepLedger: ledger,
+      clock,
+    }).run("work", async () => "stored");
+    const abort = new AbortController();
+    abort.abort(new StageAbortedError("cancelled", "run-1"));
+    const api = createStepApi({
+      stageRecordId: "stage",
+      stepLedger: ledger,
+      clock,
+      abortSignal: abort.signal,
+    });
+    let started = 0;
+
+    await expect(api.run("work", async () => ++started)).resolves.toBe(
+      "stored",
+    );
+    expect(started).toBe(0);
+  });
+
+  it("keeps starting bodies after a lost lease: another worker owns the stage", async () => {
+    const clock = new FakeClock();
+    const ledger = new InMemoryStepLedger({ now: clock.now.bind(clock) });
+    const abort = new AbortController();
+    abort.abort(new StageAbortedError("lease-lost", "run-1"));
+    const api = createStepApi({
+      stageRecordId: "stage",
+      stepLedger: ledger,
+      clock,
+      abortSignal: abort.signal,
+    });
+    let started = 0;
+
+    // The body runs; its outcome is what the row records, as before.
+    await api.run("work", async () => ++started);
+
+    expect(started).toBe(1);
+    expect(await ledger.get("stage", "work")).toMatchObject({
+      status: "completed",
+    });
+  });
+
   it("waitFor checks the signal before polling", async () => {
     const clock = new FakeClock();
     const ledger = new InMemoryStepLedger({ now: clock.now.bind(clock) });
