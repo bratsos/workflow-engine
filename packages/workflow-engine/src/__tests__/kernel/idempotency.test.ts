@@ -414,6 +414,93 @@ describe("kernel: idempotency", () => {
     expect(result.status).toBe("PENDING");
   });
 
+  it("a crash after run.create commits replays the committed run instead of creating a second one", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, persistence } = createTestKernel([workflow]);
+    const commit = persistence.withTransaction.bind(persistence);
+    let crashed = false;
+    persistence.withTransaction = (async (fn: any) => {
+      const result = await commit(fn);
+      if (!crashed) {
+        crashed = true;
+        throw new Error("worker died after the commit");
+      }
+      return result;
+    }) as typeof persistence.withTransaction;
+    const command = {
+      type: "run.create" as const,
+      idempotencyKey: "crash-key",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    };
+
+    // The worker is dead: nothing after the commit runs, so no release either.
+    const release = persistence.releaseIdempotencyKey;
+    persistence.releaseIdempotencyKey = async () => {};
+    await expect(kernel.dispatch(command)).rejects.toThrow("worker died");
+    persistence.releaseIdempotencyKey = release;
+    const retried = await kernel.dispatch(command);
+
+    expect(persistence.getAllRuns()).toHaveLength(1);
+    expect(retried.workflowRunId).toBe(persistence.getAllRuns()[0]!.id);
+  });
+
+  it("a failed COMMIT after the key completion releases the key, so a retry creates exactly one run", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, persistence } = createTestKernel([workflow]);
+    const commit = persistence.withTransaction.bind(persistence);
+    let failed = false;
+    persistence.withTransaction = (async (fn: any) =>
+      commit(async (tx: any) => {
+        const result = await fn(tx);
+        if (!failed) {
+          failed = true;
+          throw new Error("commit failed");
+        }
+        return result;
+      })) as typeof persistence.withTransaction;
+    const command = {
+      type: "run.create" as const,
+      idempotencyKey: "commit-fails",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    };
+
+    await expect(kernel.dispatch(command)).rejects.toThrow("commit failed");
+    expect(persistence.getAllRuns()).toHaveLength(0);
+    const retried = await kernel.dispatch(command);
+
+    expect(persistence.getAllRuns()).toHaveLength(1);
+    expect(retried.workflowRunId).toBe(persistence.getAllRuns()[0]!.id);
+  });
+
+  it("a failed key completion rolls run.create back, so a retry creates exactly one run", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, persistence } = createTestKernel([workflow]);
+    const complete = persistence.completeIdempotencyKey;
+    let failed = false;
+    persistence.completeIdempotencyKey = async function (this: any, ...args) {
+      if (!failed) {
+        failed = true;
+        throw new Error("key completion failed");
+      }
+      return complete.apply(this, args);
+    } as typeof persistence.completeIdempotencyKey;
+    const command = {
+      type: "run.create" as const,
+      idempotencyKey: "complete-fails",
+      workflowId: "test-workflow",
+      input: { data: "hello" },
+    };
+
+    await expect(kernel.dispatch(command)).rejects.toThrow("key completion");
+    expect(persistence.getAllRuns()).toHaveLength(0);
+    const retried = await kernel.dispatch(command);
+
+    expect(persistence.getAllRuns()).toHaveLength(1);
+    expect(retried.workflowRunId).toBe(persistence.getAllRuns()[0]!.id);
+  });
+
   it("does not persist outbox events when command handler throws", async () => {
     const { kernel } = createTestKernel([]);
 
