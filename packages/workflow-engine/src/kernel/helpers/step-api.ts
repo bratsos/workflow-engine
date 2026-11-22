@@ -32,6 +32,12 @@ import {
 } from "../../core/steps.js";
 import { AIServicesNotConfiguredError } from "../errors.js";
 import type { Clock, StepLedger, StepRecord } from "../ports.js";
+import {
+  isSubmitStepRow,
+  owedRefsOf,
+  rebaseMarkers,
+  settleOwedOnRow,
+} from "./batch-submit-record.js";
 import { toErrorMessage } from "./error-message.js";
 import { assertTimerMs, timerDurationMs } from "./host-support.js";
 import { createStepAi } from "./step-ai.js";
@@ -56,6 +62,8 @@ export interface CreateStepApiOptions {
   stepLedger?: StepLedger;
   clock: Clock;
   onLog?: (level: "DEBUG" | "WARN", message: string) => void;
+  /** See `StepAiDeps.onBatchWarn`. */
+  onBatchWarn?: (message: string) => void;
   /**
    * Records a ledger-integrity finding on the run itself, so it survives the
    * log stream. Optional: a caller with no annotation sink still gets the
@@ -418,11 +426,19 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
    * first answer". The run stays correct — only the recorded outcome is ever
    * returned to a caller — but a duplicate external effect is possible, so
    * it is reported rather than swallowed.
+   *
+   * With `attempt` the write is pinned to that attempt too. The batch submit
+   * rows a `run.cancel` sweep can hold use it (`pinnedAttempt`): the sweep
+   * takes hold at `attempt + 1` and writes its fence, intent and tombstone
+   * under that attempt, so a body still alive after its lease ended cannot
+   * replace them. A row still open under another attempt holds no outcome to
+   * park on: the write throws `StepLeaseLostError`.
    */
   async function commitOutcome(
     stepId: string,
     open: StepRecord["status"],
     patch: Parameters<StepLedger["update"]>[2],
+    attempt?: number,
   ): Promise<{ parked: boolean; record: StepRecord }> {
     const { stageRecordId, ledger } = requireLedger();
     let outcome: Awaited<ReturnType<StepLedger["compareAndSet"]>>;
@@ -430,7 +446,7 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
       outcome = await ledger.compareAndSet(
         stageRecordId,
         stepId,
-        { status: open },
+        attempt === undefined ? { status: open } : { status: open, attempt },
         patch,
       );
     } catch (error) {
@@ -448,8 +464,20 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
         ),
       );
     }
+    if (attempt !== undefined && outcome.record.status === open) {
+      throw new StepLeaseLostError(stepId, attempt);
+    }
     reportDrift(stepId, open, outcome.record);
     return { parked: true, record: outcome.record };
+  }
+
+  /**
+   * The attempt a `run` step's outcome writes are pinned to: the attempt this
+   * execution claimed, on a row a `run.cancel` sweep can hold (a batch
+   * submit, `*:submit`); `undefined` elsewhere, where the first write wins.
+   */
+  function pinnedAttempt(stepId: string, attempt: number): number | undefined {
+    return isSubmitStepRow({ kind: "run", stepId }) ? attempt : undefined;
   }
 
   function reportDrift(
@@ -481,13 +509,19 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
     stepId: string,
     open: StepRecord["status"],
     result?: unknown,
+    attempt?: number,
   ): Promise<{ parked: boolean; record: StepRecord }> {
-    return commitOutcome(stepId, open, {
-      status: "completed",
-      result,
-      error: null,
-      leaseExpiresAt: null,
-    });
+    return commitOutcome(
+      stepId,
+      open,
+      {
+        status: "completed",
+        result,
+        error: null,
+        leaseExpiresAt: null,
+      },
+      attempt,
+    );
   }
 
   /**
@@ -573,6 +607,16 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
       const onReclaim = opts.onReclaim ?? "rerun";
       const now = options.clock.now();
       const { stageRecordId } = requireLedger();
+      // A run cancelled while this stage executes keeps nothing a body
+      // produces, so no new body may start. Throw before the claim: a row
+      // written now would be counted as an attempt by a redrive. A completed
+      // step still answers from the ledger, and a lost lease is not a
+      // cancellation (another worker owns the stage and must be able to run).
+      if (stageAbortReason(abortSignal) === "cancelled") {
+        const stored = await get(invocation, "run");
+        if (stored?.status === "completed") return stored.result as T;
+        throw abortError()!;
+      }
       // Derived, not generated: the same (stage record, step) pair yields the
       // same key in every process and on every replay, so the body can name
       // its external effect before making it.
@@ -612,11 +656,16 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
           // worker whose lease looked dead may have recorded its result
           // between the read above and here, and refusing to replay must
           // not overwrite an answer that exists.
-          const refused = await commitOutcome(id, "running", {
-            status: "failed",
-            error: error.message,
-            leaseExpiresAt: null,
-          });
+          const refused = await commitOutcome(
+            id,
+            "running",
+            {
+              status: "failed",
+              error: error.message,
+              leaseExpiresAt: null,
+            },
+            pinnedAttempt(id, record.attempt),
+          );
           if (refused.parked) return parkedResult<T>(refused.record);
           throw terminal(error);
         }
@@ -709,11 +758,19 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
         if (stop) recordNonRetryable(thrown as object);
         // Under the same constraint as the success write: a body that threw
         // here must not bury an outcome another execution already recorded.
-        const failure = await commitOutcome(id, "running", {
-          status: "failed",
-          error: message,
-          leaseExpiresAt: null,
-        });
+        // On a submit row the write is pinned to this attempt: a sweep that
+        // took the row over moved the attempt. The patch leaves `result`
+        // alone, so a batch submit's record the body wrote survives it.
+        const failure = await commitOutcome(
+          id,
+          "running",
+          {
+            status: "failed",
+            error: message,
+            leaseExpiresAt: null,
+          },
+          pinnedAttempt(id, attempt),
+        );
         if (failure.parked) return parkedResult<T>(failure.record);
         if (!stop && record.attempt <= retries) {
           const retryDelayMs = retryDelayFor(
@@ -748,17 +805,27 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
       // its own lease and compare-and-set, so the outcome is still valid.
       if (stageAbortReason(abortSignal) === "cancelled") {
         const cancellation = abortError()!;
-        const cancelled = await commitOutcome(id, "running", {
-          status: "failed",
-          error: cancellation.message,
-          leaseExpiresAt: null,
-        });
+        const cancelled = await commitOutcome(
+          id,
+          "running",
+          {
+            status: "failed",
+            error: cancellation.message,
+            leaseExpiresAt: null,
+          },
+          pinnedAttempt(id, attempt),
+        );
         if (cancelled.parked) return parkedResult<T>(cancelled.record);
         throw cancellation;
       }
 
       const encoded = jsonRoundTrip(value, id);
-      const completed = await complete(id, "running", encoded);
+      const completed = await complete(
+        id,
+        "running",
+        encoded,
+        pinnedAttempt(id, attempt),
+      );
       if (completed.parked) return parkedResult<T>(completed.record);
       return completed.record.result as T;
     },
@@ -1056,12 +1123,75 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
           ? result
           : undefined;
       },
+      async storedResult(stepId) {
+        const { stageRecordId, ledger } = requireLedger();
+        return (await ledger.get(stageRecordId, stepId))?.result;
+      },
+      async loadRow(stepId) {
+        const { stageRecordId, ledger } = requireLedger();
+        return ledger.get(stageRecordId, stepId);
+      },
+      async excludeBatches(stepId, row, refs) {
+        // Pinned to the status and attempt read. The caller writes only to a
+        // completed or failed row, or a running row with no lease (no holder).
+        // The refs are owed a cancel (`cancelOwed`) until it is answered. The
+        // write moves the attempt (as a sweep's hold does, carrying the
+        // markers that counted from it), so a writer that read the row before
+        // it (a sweep about to hold it) cannot put back a result without them.
+        const { stageRecordId, ledger } = requireLedger();
+        const result =
+          typeof row.result === "object" &&
+          row.result !== null &&
+          !Array.isArray(row.result)
+            ? (row.result as Record<string, unknown>)
+            : {};
+        const owed = owedRefsOf(result);
+        const outcome = await ledger.compareAndSet(
+          stageRecordId,
+          stepId,
+          { status: row.status, attempt: row.attempt },
+          {
+            attempt: row.attempt + 1,
+            result: {
+              ...rebaseMarkers(result, [row.attempt], row.attempt + 1),
+              cancelOwed: [
+                ...owed,
+                ...refs.filter((ref) => !owed.some((o) => o.id === ref.id)),
+              ],
+            },
+          },
+        );
+        return outcome.applied;
+      },
+      async settleBatches(stepId, answered, failed) {
+        const { stageRecordId, ledger } = requireLedger();
+        return settleOwedOnRow(
+          ledger,
+          stageRecordId,
+          stepId,
+          answered,
+          options.clock.now(),
+          failed,
+        );
+      },
+      now: () => options.clock.now(),
+      async storeResult(stepId, result, attempt) {
+        const { stageRecordId, ledger } = requireLedger();
+        const outcome = await ledger.compareAndSet(
+          stageRecordId,
+          stepId,
+          { status: "running", attempt },
+          { result },
+        );
+        if (!outcome.applied) throw new StepLeaseLostError(stepId, attempt);
+      },
       assertReady: () => void requireLedger(),
       ai: () => {
         if (!options.ai) throw new AIServicesNotConfiguredError();
         return options.ai();
       },
       onLog: options.onLog,
+      ...(options.onBatchWarn ? { onBatchWarn: options.onBatchWarn } : {}),
     }),
   });
 

@@ -14,7 +14,7 @@
       }
     },
     "skippedScenarios": [],
-    "captureTime": "2026-11-17T18:28:17.929Z"
+    "captureTime": "2026-11-22T20:33:57.358Z"
   },
   "columns": {
     "WorkflowRun": [
@@ -209,14 +209,14 @@
   "tables": {
     "WorkflowRun": [
       {
-        "id": "cmwl0zngt001yra3bkyoyocsi",
+        "id": "cmwsaoi9d001ykc3bohlbzlo1",
         "createdAt": {
           "$storedRows": "Date",
-          "value": "2026-11-17T18:28:17.933Z"
+          "value": "2026-11-22T20:33:57.361Z"
         },
         "updatedAt": {
           "$storedRows": "Date",
-          "value": "2026-11-17T18:28:17.929Z"
+          "value": "2026-11-22T20:33:57.358Z"
         },
         "version": 2,
         "workflowId": "stored-rows-ai-map-poll",
@@ -225,7 +225,7 @@
         "status": "RUNNING",
         "startedAt": {
           "$storedRows": "Date",
-          "value": "2026-11-17T18:28:17.929Z"
+          "value": "2026-11-22T20:33:57.358Z"
         },
         "completedAt": null,
         "duration": null,
@@ -250,7 +250,7 @@
         "version": "sha256-0f35ae84d53e816ba1ae350ae0c70f13",
         "createdAt": {
           "$storedRows": "Date",
-          "value": "2026-11-17T18:28:17.931Z"
+          "value": "2026-11-22T20:33:57.356Z"
         },
         "snapshot": {
           "format": 1,
@@ -321,17 +321,17 @@
     ],
     "WorkflowStage": [
       {
-        "id": "cmwl0zngx0020ra3bsdk9ortl",
+        "id": "cmwsaoi9g0020kc3bc86npf6k",
         "createdAt": {
           "$storedRows": "Date",
-          "value": "2026-11-17T18:28:17.937Z"
+          "value": "2026-11-22T20:33:57.364Z"
         },
         "updatedAt": {
           "$storedRows": "Date",
-          "value": "2026-11-17T18:28:17.965Z"
+          "value": "2026-11-22T20:33:57.387Z"
         },
         "version": 3,
-        "workflowRunId": "cmwl0zngt001yra3bkyoyocsi",
+        "workflowRunId": "cmwsaoi9d001ykc3bohlbzlo1",
         "stageId": "ai-map",
         "stageName": "ai-map",
         "stageNumber": 1,
@@ -340,7 +340,7 @@
         "status": "SUSPENDED",
         "startedAt": {
           "$storedRows": "Date",
-          "value": "2026-11-17T18:28:17.929Z"
+          "value": "2026-11-22T20:33:57.358Z"
         },
         "completedAt": null,
         "duration": null,
@@ -354,18 +354,18 @@
             "__durable": true
           },
           "maxWaitTime": 3600000,
-          "submittedAt": "2026-11-17T18:28:17.929Z",
+          "submittedAt": "2026-11-22T20:33:57.358Z",
           "pollInterval": 1000
         },
         "resumeData": null,
         "nextPollAt": {
           "$storedRows": "Date",
-          "value": "2026-11-17T18:28:18.929Z"
+          "value": "2026-11-22T20:33:58.358Z"
         },
         "pollInterval": 1000,
         "maxWaitUntil": {
           "$storedRows": "Date",
-          "value": "2026-11-17T19:28:17.929Z"
+          "value": "2026-11-22T21:33:57.358Z"
         },
         "metrics": {
           "endTime": 0,
@@ -378,8 +378,8 @@
     ],
     "WorkflowStep": [
       {
-        "id": "cmwl0znhb0026ra3b4hyjm2mc",
-        "stageRecordId": "cmwl0zngx0020ra3bsdk9ortl",
+        "id": "cmwsaoi9s0026kc3b9kbyioja",
+        "stageRecordId": "cmwsaoi9g0020kc3bc86npf6k",
         "stepId": "items:submit",
         "seq": 1,
         "kind": "run",
@@ -387,7 +387,7 @@
         "attempt": 1,
         "leaseExpiresAt": null,
         "deadlineAt": null,
-        "externalKey": "wfe-22acf911a943caff86840787613c2e05",
+        "externalKey": "wfe-1aa204c6221469edf8526d880a582d39",
         "result": {
           "refs": [
             {
@@ -400,23 +400,24 @@
           ],
           "handleId": "stored-rows-batch-1",
           "requestIds": ["0"],
-          "submittedAt": "2026-11-17T18:28:17.952Z",
+          "externalKey": "wfe-1aa204c6221469edf8526d880a582d39",
+          "submittedAt": "2026-11-22T20:33:57.380Z",
           "totalRequests": 1
         },
         "error": null,
         "waitState": null,
         "createdAt": {
           "$storedRows": "Date",
-          "value": "2026-11-17T18:28:17.951Z"
+          "value": "2026-11-22T20:33:57.376Z"
         },
         "updatedAt": {
           "$storedRows": "Date",
-          "value": "2026-11-17T18:28:17.953Z"
+          "value": "2026-11-22T20:33:57.380Z"
         }
       },
       {
-        "id": "cmwl0znhg0027ra3bdt35oa5u",
-        "stageRecordId": "cmwl0zngx0020ra3bsdk9ortl",
+        "id": "cmwsaoia00027kc3b93j72aut",
+        "stageRecordId": "cmwsaoi9g0020kc3bc86npf6k",
         "stepId": "items:poll",
         "seq": 2,
         "kind": "wait",
@@ -425,7 +426,7 @@
         "leaseExpiresAt": null,
         "deadlineAt": {
           "$storedRows": "Date",
-          "value": "2026-11-17T19:28:17.929Z"
+          "value": "2026-11-22T21:33:57.358Z"
         },
         "externalKey": null,
         "result": null,
@@ -435,11 +436,11 @@
         },
         "createdAt": {
           "$storedRows": "Date",
-          "value": "2026-11-17T18:28:17.956Z"
+          "value": "2026-11-22T20:33:57.384Z"
         },
         "updatedAt": {
           "$storedRows": "Date",
-          "value": "2026-11-17T18:28:17.956Z"
+          "value": "2026-11-22T20:33:57.384Z"
         }
       }
     ],
@@ -449,16 +450,16 @@
     "WorkflowAnnotation": [],
     "JobQueue": [
       {
-        "id": "cmwl0znh20022ra3b1io7uqzo",
+        "id": "cmwsaoi9i0022kc3b6sfbmrno",
         "createdAt": {
           "$storedRows": "Date",
-          "value": "2026-11-17T18:28:17.942Z"
+          "value": "2026-11-22T20:33:57.366Z"
         },
         "updatedAt": {
           "$storedRows": "Date",
-          "value": "2026-11-17T18:28:17.976Z"
+          "value": "2026-11-22T20:33:57.391Z"
         },
-        "workflowRunId": "cmwl0zngt001yra3bkyoyocsi",
+        "workflowRunId": "cmwsaoi9d001ykc3bohlbzlo1",
         "stageId": "ai-map",
         "status": "SUSPENDED",
         "priority": 5,
@@ -468,12 +469,12 @@
         "lockedAt": null,
         "startedAt": {
           "$storedRows": "Date",
-          "value": "2026-11-17T18:28:17.945Z"
+          "value": "2026-11-22T20:33:57.365Z"
         },
         "completedAt": null,
         "nextPollAt": {
           "$storedRows": "Date",
-          "value": "2026-11-17T18:28:18.929Z"
+          "value": "2026-11-22T20:33:58.358Z"
         },
         "payload": {
           "config": {
@@ -487,175 +488,175 @@
     ],
     "OutboxEvent": [
       {
-        "id": "cmwl0zngv001zra3bablnqn3b",
+        "id": "cmwsaoi9e001zkc3b7a91se9r",
         "createdAt": {
           "$storedRows": "Date",
-          "value": "2026-11-17T18:28:17.935Z"
+          "value": "2026-11-22T20:33:57.362Z"
         },
-        "workflowRunId": "cmwl0zngt001yra3bkyoyocsi",
+        "workflowRunId": "cmwsaoi9d001ykc3bohlbzlo1",
         "sequence": 1,
         "eventType": "workflow:created",
         "payload": {
           "type": "workflow:created",
-          "timestamp": "2026-11-17T18:28:17.929Z",
+          "timestamp": "2026-11-22T20:33:57.358Z",
           "workflowId": "stored-rows-ai-map-poll",
-          "workflowRunId": "cmwl0zngt001yra3bkyoyocsi"
+          "workflowRunId": "cmwsaoi9d001ykc3bohlbzlo1"
         },
         "causationId": "stored-rows:ai-map-poll",
         "occurredAt": {
           "$storedRows": "Date",
-          "value": "2026-11-17T18:28:17.929Z"
+          "value": "2026-11-22T20:33:57.358Z"
         },
         "publishedAt": {
           "$storedRows": "Date",
-          "value": "2026-11-17T18:28:17.929Z"
+          "value": "2026-11-22T20:33:57.358Z"
         },
-        "deliveryClaim": null,
+        "deliveryClaim": "r0000000000000000001|2026-11-22T20:35:02.358Z|a3ef7c76-3189-451c-a3f7-63e89ef2ee9f",
         "retryCount": 0,
         "dlqAt": null
       },
       {
-        "id": "cmwl0zngz0021ra3bx18m483f",
+        "id": "cmwsaoi9h0021kc3b2hiq99ot",
         "createdAt": {
           "$storedRows": "Date",
-          "value": "2026-11-17T18:28:17.939Z"
+          "value": "2026-11-22T20:33:57.365Z"
         },
-        "workflowRunId": "cmwl0zngt001yra3bkyoyocsi",
+        "workflowRunId": "cmwsaoi9d001ykc3bohlbzlo1",
         "sequence": 2,
         "eventType": "workflow:started",
         "payload": {
           "type": "workflow:started",
-          "timestamp": "2026-11-17T18:28:17.929Z",
-          "workflowRunId": "cmwl0zngt001yra3bkyoyocsi"
+          "timestamp": "2026-11-22T20:33:57.358Z",
+          "workflowRunId": "cmwsaoi9d001ykc3bohlbzlo1"
         },
-        "causationId": "05036e1b-932f-4f16-aca5-494584648455",
+        "causationId": "b1117ea1-d8fa-44d5-a530-a355486407c6",
         "occurredAt": {
           "$storedRows": "Date",
-          "value": "2026-11-17T18:28:17.929Z"
+          "value": "2026-11-22T20:33:57.358Z"
         },
         "publishedAt": {
           "$storedRows": "Date",
-          "value": "2026-11-17T18:28:17.929Z"
+          "value": "2026-11-22T20:33:57.358Z"
         },
-        "deliveryClaim": null,
+        "deliveryClaim": "r0000000000000000001|2026-11-22T20:35:02.358Z|a3ef7c76-3189-451c-a3f7-63e89ef2ee9f",
         "retryCount": 0,
         "dlqAt": null
       },
       {
-        "id": "cmwl0znh90025ra3by23afv19",
+        "id": "cmwsaoi9p0025kc3blr7q2uw3",
         "createdAt": {
           "$storedRows": "Date",
-          "value": "2026-11-17T18:28:17.949Z"
+          "value": "2026-11-22T20:33:57.373Z"
         },
-        "workflowRunId": "cmwl0zngt001yra3bkyoyocsi",
+        "workflowRunId": "cmwsaoi9d001ykc3bohlbzlo1",
         "sequence": 3,
         "eventType": "stage:started",
         "payload": {
           "type": "stage:started",
           "stageId": "ai-map",
           "stageName": "ai-map",
-          "timestamp": "2026-11-17T18:28:17.929Z",
+          "timestamp": "2026-11-22T20:33:57.358Z",
           "stageNumber": 1,
-          "workflowRunId": "cmwl0zngt001yra3bkyoyocsi"
+          "workflowRunId": "cmwsaoi9d001ykc3bohlbzlo1"
         },
-        "causationId": "job:cmwl0znh20022ra3b1io7uqzo:attempt:1",
+        "causationId": "job:cmwsaoi9i0022kc3b6sfbmrno:attempt:1",
         "occurredAt": {
           "$storedRows": "Date",
-          "value": "2026-11-17T18:28:17.929Z"
+          "value": "2026-11-22T20:33:57.358Z"
         },
         "publishedAt": {
           "$storedRows": "Date",
-          "value": "2026-11-17T18:28:17.929Z"
+          "value": "2026-11-22T20:33:57.358Z"
         },
-        "deliveryClaim": null,
+        "deliveryClaim": "r0000000000000000001|2026-11-22T20:35:02.358Z|a3ef7c76-3189-451c-a3f7-63e89ef2ee9f",
         "retryCount": 0,
         "dlqAt": null
       },
       {
-        "id": "cmwl0znhv0028ra3btlkmqb5f",
+        "id": "cmwsaoia50028kc3bxdxqcnvo",
         "createdAt": {
           "$storedRows": "Date",
-          "value": "2026-11-17T18:28:17.971Z"
+          "value": "2026-11-22T20:33:57.389Z"
         },
-        "workflowRunId": "cmwl0zngt001yra3bkyoyocsi",
+        "workflowRunId": "cmwsaoi9d001ykc3bohlbzlo1",
         "sequence": 4,
         "eventType": "stage:suspended",
         "payload": {
           "type": "stage:suspended",
           "stageId": "ai-map",
           "stageName": "ai-map",
-          "timestamp": "2026-11-17T18:28:17.929Z",
-          "nextPollAt": "2026-11-17T18:28:18.929Z",
-          "workflowRunId": "cmwl0zngt001yra3bkyoyocsi"
+          "timestamp": "2026-11-22T20:33:57.358Z",
+          "nextPollAt": "2026-11-22T20:33:58.358Z",
+          "workflowRunId": "cmwsaoi9d001ykc3bohlbzlo1"
         },
-        "causationId": "job:cmwl0znh20022ra3b1io7uqzo:attempt:1",
+        "causationId": "job:cmwsaoi9i0022kc3b6sfbmrno:attempt:1",
         "occurredAt": {
           "$storedRows": "Date",
-          "value": "2026-11-17T18:28:17.929Z"
+          "value": "2026-11-22T20:33:57.358Z"
         },
         "publishedAt": {
           "$storedRows": "Date",
-          "value": "2026-11-17T18:28:17.929Z"
+          "value": "2026-11-22T20:33:57.358Z"
         },
-        "deliveryClaim": null,
+        "deliveryClaim": "r0000000000000000001|2026-11-22T20:35:02.358Z|a3ef7c76-3189-451c-a3f7-63e89ef2ee9f",
         "retryCount": 0,
         "dlqAt": null
       },
       {
-        "id": "cmwl0znhv0029ra3b59mb8b9q",
+        "id": "cmwsaoia60029kc3ba22rskjt",
         "createdAt": {
           "$storedRows": "Date",
-          "value": "2026-11-17T18:28:17.971Z"
+          "value": "2026-11-22T20:33:57.390Z"
         },
-        "workflowRunId": "cmwl0zngt001yra3bkyoyocsi",
+        "workflowRunId": "cmwsaoi9d001ykc3bohlbzlo1",
         "sequence": 5,
         "eventType": "workflow:suspended",
         "payload": {
           "type": "workflow:suspended",
           "stageId": "ai-map",
-          "timestamp": "2026-11-17T18:28:17.929Z",
-          "workflowRunId": "cmwl0zngt001yra3bkyoyocsi"
+          "timestamp": "2026-11-22T20:33:57.358Z",
+          "workflowRunId": "cmwsaoi9d001ykc3bohlbzlo1"
         },
-        "causationId": "job:cmwl0znh20022ra3b1io7uqzo:attempt:1",
+        "causationId": "job:cmwsaoi9i0022kc3b6sfbmrno:attempt:1",
         "occurredAt": {
           "$storedRows": "Date",
-          "value": "2026-11-17T18:28:17.929Z"
+          "value": "2026-11-22T20:33:57.358Z"
         },
         "publishedAt": {
           "$storedRows": "Date",
-          "value": "2026-11-17T18:28:17.929Z"
+          "value": "2026-11-22T20:33:57.358Z"
         },
-        "deliveryClaim": null,
+        "deliveryClaim": "r0000000000000000001|2026-11-22T20:35:02.358Z|a3ef7c76-3189-451c-a3f7-63e89ef2ee9f",
         "retryCount": 0,
         "dlqAt": null
       }
     ],
     "IdempotencyKey": [
       {
-        "id": "cmwl0zngq001xra3ba4p63e5l",
+        "id": "cmwsaoi9a001xkc3bid8fhr0w",
         "createdAt": {
           "$storedRows": "Date",
-          "value": "2026-11-17T18:28:17.929Z"
+          "value": "2026-11-22T20:33:57.358Z"
         },
         "key": "stored-rows:ai-map-poll",
         "commandType": "run.create",
         "result": {
           "status": "PENDING",
-          "workflowRunId": "cmwl0zngt001yra3bkyoyocsi",
+          "workflowRunId": "cmwsaoi9d001ykc3bohlbzlo1",
           "definitionVersion": "sha256-0f35ae84d53e816ba1ae350ae0c70f13"
         }
       },
       {
-        "id": "cmwl0znh50023ra3b5lj9mchy",
+        "id": "cmwsaoi9l0023kc3bsxjxdlza",
         "createdAt": {
           "$storedRows": "Date",
-          "value": "2026-11-17T18:28:17.929Z"
+          "value": "2026-11-22T20:33:57.358Z"
         },
-        "key": "job:cmwl0znh20022ra3b1io7uqzo:attempt:1",
+        "key": "job:cmwsaoi9i0022kc3b6sfbmrno:attempt:1",
         "commandType": "job.execute",
         "result": {
           "outcome": "suspended",
-          "nextPollAt": "2026-11-17T18:28:18.929Z"
+          "nextPollAt": "2026-11-22T20:33:58.358Z"
         }
       }
     ],

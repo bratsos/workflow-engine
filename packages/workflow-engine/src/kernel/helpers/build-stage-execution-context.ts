@@ -14,6 +14,7 @@ import {
   createAnnotationBuffer,
   normalizeAnnotateArgs,
 } from "./annotation-buffer.js";
+import { writeBatchWarn } from "./batch-warn.js";
 import { createStorageShim } from "./create-storage-shim.js";
 import { toErrorMessage } from "./error-message.js";
 import { createStepApi } from "./step-api.js";
@@ -182,6 +183,8 @@ export function buildStageExecutionContext(
       clock: deps.clock,
       abortSignal,
       onLog: (level, message) => void logFn(level, message),
+      onBatchWarn: (message) =>
+        void writeBatchWarn(deps.persistence, workflowRunId, message),
       onAnnotate: (key, value, opts) => annotateFn(key, value, opts),
       ai: () => context.ai,
     }),

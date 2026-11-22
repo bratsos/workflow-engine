@@ -276,3 +276,109 @@ describe("adoptGoogleBatch", () => {
     ).rejects.toThrow(/Gemini batch lookup failed \(HTTP 500\)/);
   });
 });
+
+describe("a cancelled batch is never adopted", () => {
+  const openai = (rows: unknown[]) =>
+    adoptOpenAIBatch(
+      {
+        fetch: vi.fn(async () =>
+          jsonResponse({ data: rows, has_more: false }),
+        ) as never,
+        baseURL: "https://api.openai.com/v1",
+        apiKey: "k",
+      },
+      KEY,
+    );
+  const google = (operations: unknown[]) =>
+    adoptGoogleBatch(
+      {
+        fetch: vi.fn(async () => jsonResponse({ operations })) as never,
+        baseURL: "https://generativelanguage.googleapis.com/v1beta",
+        apiKey: "k",
+      },
+      KEY,
+    );
+  const stamped = { [EXTERNAL_KEY_METADATA_FIELD]: KEY };
+
+  it("skips an OpenAI batch that is cancelling or cancelled, and finds the live one", async () => {
+    await expect(
+      openai([
+        { id: "batch_new", status: "in_progress", metadata: stamped },
+        { id: "batch_old", status: "cancelled", metadata: stamped },
+      ]),
+    ).resolves.toEqual({ id: "batch_new", status: "pending" });
+    await expect(
+      openai([{ id: "batch_a", status: "cancelling", metadata: stamped }]),
+    ).resolves.toBeNull();
+    await expect(
+      openai([{ id: "batch_b", status: "cancelled", metadata: stamped }]),
+    ).resolves.toBeNull();
+  });
+
+  it("skips a Gemini batch whose state is cancelled, and finds the live one", async () => {
+    const op = (name: string, state: string) => ({
+      name,
+      metadata: { displayName: KEY, state },
+    });
+    await expect(
+      google([
+        op("batches/old", "JOB_STATE_CANCELLED"),
+        op("batches/new", "JOB_STATE_RUNNING"),
+      ]),
+    ).resolves.toEqual({ id: "batches/new", status: "pending" });
+    await expect(
+      google([op("batches/old", "BATCH_STATE_CANCELLED")]),
+    ).resolves.toBeNull();
+  });
+});
+
+describe("a batch the engine cancelled is never adopted, whatever the provider lists", () => {
+  const stamped = { [EXTERNAL_KEY_METADATA_FIELD]: KEY };
+
+  it("skips an excluded OpenAI batch that still lists as running, and finds its replacement", async () => {
+    const find = (rows: unknown[]) =>
+      adoptOpenAIBatch(
+        {
+          fetch: vi.fn(async () =>
+            jsonResponse({ data: rows, has_more: false }),
+          ) as never,
+          baseURL: "https://api.openai.com/v1",
+          apiKey: "k",
+          excludeBatchIds: ["batch_old"],
+        },
+        KEY,
+      );
+
+    await expect(
+      find([
+        { id: "batch_new", status: "in_progress", metadata: stamped },
+        { id: "batch_old", status: "in_progress", metadata: stamped },
+      ]),
+    ).resolves.toEqual({ id: "batch_new", status: "pending" });
+    await expect(
+      find([{ id: "batch_old", status: "in_progress", metadata: stamped }]),
+    ).resolves.toBeNull();
+  });
+
+  it("skips an excluded Gemini batch that still lists as running, and finds its replacement", async () => {
+    const op = (name: string) => ({
+      name,
+      metadata: { displayName: KEY, state: "JOB_STATE_RUNNING" },
+    });
+    const find = (operations: unknown[]) =>
+      adoptGoogleBatch(
+        {
+          fetch: vi.fn(async () => jsonResponse({ operations })) as never,
+          baseURL: "https://generativelanguage.googleapis.com/v1beta",
+          apiKey: "k",
+          excludeBatchIds: ["batches/old"],
+        },
+        KEY,
+      );
+
+    await expect(find([op("batches/new"), op("batches/old")])).resolves.toEqual(
+      { id: "batches/new", status: "pending" },
+    );
+    await expect(find([op("batches/old")])).resolves.toBeNull();
+  });
+});

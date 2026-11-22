@@ -19,6 +19,12 @@ export interface EngineBatchStatus {
     failed: number;
   };
   error?: string;
+  /**
+   * Set (to `true`) when the provider reports the batch cancelling or
+   * cancelled. Absent otherwise; a transport that does not set it is read
+   * through `rawStatus`.
+   */
+  cancelled?: boolean;
 }
 
 export interface EngineBatchRequest {
@@ -75,6 +81,23 @@ export type EngineBatchItemResult =
  */
 export type EngineBatchRecovery = "metadata" | "none";
 
+/**
+ * What a transport found and did when asked to cancel a batch.
+ *
+ * - `"cancelled"`: the provider now has the batch cancelling or cancelled. The
+ *   transport sent the cancel, or found the batch already cancelling or
+ *   cancelled. Cancelling is asynchronous at the providers: requests already
+ *   executing may still finish and be billed, and partial results may remain.
+ * - `"already-terminal"`: the batch had ended on its own (completed, failed or
+ *   expired) before the cancel; nothing was cancelled and its results stay at
+ *   the provider.
+ */
+export interface EngineBatchCancelResult {
+  outcome: "cancelled" | "already-terminal";
+  /** The provider's own status for the batch, as read before the cancel. */
+  rawStatus?: string;
+}
+
 export interface EngineBatchStartOptions {
   abortSignal?: AbortSignal;
   headers?: Record<string, string>;
@@ -100,10 +123,24 @@ export interface EngineBatchModel {
    * exists. Implemented only when `recovery` is `"metadata"`. Returns `null`
    * when the provider has no such batch — which, on a reclaim, means the
    * crashed worker died before the provider accepted the creation.
+   *
+   * Must not return a batch that is cancelling or cancelled: a cancelled
+   * batch will never produce results, so a reclaim that adopted it would wait
+   * on a batch that is already dead. Skip it, and return another batch under
+   * the same key or `null`.
    */
   adopt?(
     externalKey: string,
-    opts?: { abortSignal?: AbortSignal; headers?: Record<string, string> },
+    opts?: {
+      abortSignal?: AbortSignal;
+      headers?: Record<string, string>;
+      /**
+       * Provider batch ids the engine knows are dead (it cancelled them). Never
+       * return one: a cancel can be asynchronous, so the provider may still
+       * list the batch as running for a while.
+       */
+      excludeBatchIds?: readonly string[];
+    },
   ): Promise<(EngineBatchRef & EngineBatchStatus) | null>;
   status(
     ref: EngineBatchRef,
@@ -112,6 +149,21 @@ export interface EngineBatchModel {
       headers?: Record<string, string>;
     },
   ): Promise<EngineBatchStatus>;
+  /**
+   * Ask the provider to cancel a batch that has not ended. Left out by a
+   * transport whose provider documents no cancel call (OpenRouter's batch API
+   * says "There is no cancel endpoint yet"); callers treat a missing method
+   * as "cannot be cancelled here". Idempotent: a batch already cancelling,
+   * cancelled or ended is reported, not sent a second cancel. Throws when the
+   * provider rejects the call or cannot be reached.
+   */
+  cancel?(
+    ref: EngineBatchRef,
+    opts?: {
+      abortSignal?: AbortSignal;
+      headers?: Record<string, string>;
+    },
+  ): Promise<EngineBatchCancelResult>;
   results(
     ref: EngineBatchRef,
     opts?: {
@@ -120,6 +172,15 @@ export interface EngineBatchModel {
     },
   ): AsyncIterable<EngineBatchItemResult>;
 }
+
+/**
+ * Finds the transport that owns a stored batch ref, in a process that did not
+ * create the batch. Return `undefined` (or throw) when this process cannot
+ * reach the provider, for example because it holds no credentials for it.
+ */
+export type EngineBatchModelResolver = (
+  ref: EngineBatchRef,
+) => Promise<EngineBatchModel | undefined> | EngineBatchModel | undefined;
 
 /** Zod schema validating EngineBatchRef when restoring untrusted persisted state. */
 export const EngineBatchRefSchema = z.object({

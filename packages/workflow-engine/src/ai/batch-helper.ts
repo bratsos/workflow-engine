@@ -10,6 +10,7 @@ import {
   getProviderModelId,
   resolveModelForProvider,
 } from "../utils/batch/model-mapping";
+import { isCancelledRawStatus } from "./batch/adoption";
 import { isNotBatchCapableError, resolveAiSdkBatchModel } from "./batch/ai-sdk";
 import {
   type EngineBatchItemResult,
@@ -24,6 +25,7 @@ import { restorePortableValue } from "./schema-portability";
 import { calculateCostWithDiscount, logger } from "./shared";
 import type {
   AIBatch,
+  AIBatchCancelResult,
   AIBatchHandle,
   AIBatchProvider,
   AIBatchRequest,
@@ -500,7 +502,13 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
     }
 
     // Submit partitions sequentially so a rate limit stops at partition k instead of firing all N
-    const createdRefs: EngineBatchRef[] = [];
+    // Partitions an earlier execution already created (`BatchSubmitError`
+    // rejected a later one) are reused, not created twice.
+    const existing = (submitOptions.existingRefs ?? [])
+      .filter((ref) => ref.provider === batchModel.provider)
+      .slice(0, partitions.length);
+    const createdRefs: EngineBatchRef[] = [...existing];
+    const excluded = submitOptions.excludeBatchIds ?? [];
     // A replay of a crashed submit must find what the crashed worker created
     // before creating anything: the provider bills a batch nobody reads.
     // Each partition gets its own sub-key, because the partitioning is
@@ -512,11 +520,12 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
     if (
       recovering &&
       onReclaim === "adopt" &&
-      batchModel.recovery !== "metadata"
+      batchModel.recovery !== "metadata" &&
+      existing.length < partitions.length
     ) {
       throw new BatchNotAdoptableError(this.provider, externalKey);
     }
-    for (let i = 0; i < partitions.length; i++) {
+    for (let i = existing.length; i < partitions.length; i++) {
       const partition = partitions[i]!;
       const partitionKey =
         externalKey !== undefined
@@ -528,8 +537,16 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
             ...(this.options?.abortSignal
               ? { abortSignal: this.options.abortSignal }
               : {}),
+            ...(excluded.length > 0 ? { excludeBatchIds: excluded } : {}),
           });
-          if (adopted) {
+          // The transports skip a cancelling or cancelled batch, and one the
+          // engine cancelled, themselves; this covers an `adopt()` written
+          // outside the engine.
+          if (
+            adopted &&
+            !isCancelledRawStatus(adopted.rawStatus) &&
+            !excluded.includes(adopted.id)
+          ) {
             logger.debug(`adopted batch created before the worker crashed`, {
               provider: this.provider,
               batchId: adopted.id,
@@ -733,6 +750,49 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
       totalRequests: hasCounts ? totalCount : undefined,
       error: aggregatedError,
     };
+  }
+
+  async canAdopt(): Promise<boolean> {
+    return typeof (await this.provider$()).adopt === "function";
+  }
+
+  async cancel(
+    batchId: string,
+    metadata?: Record<string, unknown>,
+  ): Promise<AIBatchCancelResult[]> {
+    if (
+      this.requestCountsByBatch.get(batchId) === 0 ||
+      batchId.startsWith("batch-empty-")
+    ) {
+      return [];
+    }
+
+    this.adoptProviderFromRefs(metadata);
+    const batchModel = await this.provider$();
+    const refs = this.resolveRefs(batchId, metadata, batchModel);
+    const cancel = batchModel.cancel?.bind(batchModel);
+    if (!cancel) {
+      return refs.map((ref) => ({ ref, outcome: "unsupported" as const }));
+    }
+    const settled = await Promise.allSettled(
+      refs.map((ref) =>
+        cancel(ref, {
+          ...(this.options?.abortSignal
+            ? { abortSignal: this.options.abortSignal }
+            : {}),
+        }),
+      ),
+    );
+    const failed = settled.find(
+      (s): s is PromiseRejectedResult => s.status === "rejected",
+    );
+    if (failed) throw failed.reason;
+    return refs.map((ref, i) => ({
+      ref,
+      outcome: (
+        settled[i] as PromiseFulfilledResult<Awaited<ReturnType<typeof cancel>>>
+      ).value.outcome,
+    }));
   }
 
   async getResults(

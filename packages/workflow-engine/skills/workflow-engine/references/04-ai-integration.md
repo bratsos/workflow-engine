@@ -673,9 +673,31 @@ const results = await batch.getResults(handle.id, {
 //   { id: "req-2", result: { parsed: "object" }, inputTokens: 100, outputTokens: 50, status: "succeeded", validated: true },
 // ]
 
+// Cancel at the provider (every batch of the handle that has not ended).
+// Resolves to [{ ref, outcome: "cancelled" | "already-terminal" | "unsupported" }];
+// tries every batch, then throws the first error if a call failed.
+const cancelled = await batch.cancel?.(handle.id, { batchRefs: handle.refs });
+
 // Check if already recorded (avoid duplicate logging)
 const recorded = await batch.isRecorded(handle.id);
 ```
+
+### Cancelling batches
+
+`EngineBatchModel.cancel?(ref, opts)` is optional on the transport. It returns `{ outcome: "cancelled" | "already-terminal", rawStatus? }`: it reads the batch, sends the provider's cancel only to one still running, and reports a batch that is already cancelling, cancelled or ended without sending a second call. It throws when the provider rejects the call.
+
+| Transport | Cancel call |
+|---|---|
+| `openai` | `POST /v1/batches/{id}/cancel` (`cancelling` for up to 10 minutes, then `cancelled`) |
+| `anthropic` | `POST /v1/messages/batches/{id}/cancel` (`canceling`, then `ended`) |
+| `google` | `POST /v1beta/batches/{name}:cancel` (best effort, then `JOB_STATE_CANCELLED`) |
+| `openrouter` | none: the batch API documents "no cancel endpoint yet", so the model has no `cancel` |
+
+The vendor transports call the vendor SDK's `doCancelBatch`; a vendor release without it leaves `cancel` out. `run.cancel` uses this to cancel the batches a run created (see `06-async-batch-stages.md` and the docs page *Batch Operations → Cancelling a run*). Its per-batch outcomes are `cancelled`, `already-terminal`, `unsupported` (no `cancel` on the transport), `unavailable` (no transport could be built in that process), `failed`, `unrecorded` (a submit step holds no batch handle; the outcome carries its `externalKey`) and `unverified` (the engine cannot prove it created the handle, so it is left alone).
+
+`resolveBatchModelForRef(ref, options?)` builds the built-in transport a stored ref names, with credentials from `options` or the environment, for a process that did not create the batch. The kernel uses it unless `createKernel({ services: { batchModels } })` supplies another resolver `(ref) => EngineBatchModel | undefined`.
+
+A batch that is cancelling or cancelled is never adopted: `adopt()` skips it, so a redrive after a cancel creates a new batch. `EngineBatchStatus.cancelled` is `true` when the provider reports a batch cancelling or cancelled (Anthropic reports a cancelled batch as `ended`; its cancel timestamp is what says so). A submit step whose `run.cancel` sweep may have sent a cancel and died before recording the answer (the row's `cancelIntent`) sends the cancel again through `AIBatch.cancel` before it does anything, and goes on from the answer, never from an active status alone.
 
 ### Batch Options & Injected Credentials
 
@@ -763,7 +785,7 @@ Resolution order: the call's explicit provider, then the model's registry field 
 
 - **Text only:** Multimodal inputs (images, audio, video, files) are rejected.
 - **24-hour expiration without partial recovery:** OpenRouter returns `results: null` if a batch expires at 24 hours. No partial results are recoverable. Batches are automatically partitioned into chunks of `maxRequestsPerBatch` (default: 500) to bound risk.
-- **No cancel or list endpoint:** OpenRouter batch API does not support remote cancellation or listing batches.
+- **No cancel or list endpoint:** OpenRouter batch API does not support remote cancellation or listing batches. `run.cancel` reports an OpenRouter batch as `unsupported` and the batch keeps running and billing.
 - **No idempotency key:** POST submissions are not auto-retried.
 - **Schema partitioning:** Google models require all requests in a single batch to share the exact same response schema; `submit()` handles this by partitioning requests by schema automatically.
 

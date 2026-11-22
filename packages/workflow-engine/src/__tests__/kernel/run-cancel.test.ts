@@ -229,4 +229,64 @@ describe("kernel: run.cancel", () => {
     const run = await persistence.getRun(createResult.workflowRunId);
     expect(run!.status).toBe("CANCELLED");
   });
+
+  it("keeps the outcome of a stage another execution ended after the cancel read it", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, persistence } = createTestKernel([workflow]);
+    const { workflowRunId } = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "key-ended",
+      workflowId: "test-workflow",
+      input: { data: "x" },
+    });
+    await kernel.dispatch({ type: "run.claimPending", workerId: "w" });
+    const stage = (await persistence.getStage(workflowRunId, "stage-1"))!;
+    expect(stage.status).not.toBe("COMPLETED");
+
+    // A job's Phase 3 (fenced on the version it read) commits the stage
+    // right after the cancel read it.
+    const getStagesByRun = persistence.getStagesByRun.bind(persistence);
+    persistence.getStagesByRun = async (id) => {
+      const rows = await getStagesByRun(id);
+      persistence.getStagesByRun = getStagesByRun;
+      await persistence.updateStage(stage.id, {
+        status: "COMPLETED",
+        expectedVersion: stage.version,
+      });
+      return rows;
+    };
+    await kernel.dispatch({ type: "run.cancel", workflowRunId });
+
+    expect((await persistence.getRun(workflowRunId))?.status).toBe("CANCELLED");
+    expect((await persistence.getStage(workflowRunId, "stage-1"))?.status).toBe(
+      "COMPLETED",
+    );
+  });
+
+  it("re-reads a stage whose version moved without ending it, and cancels it", async () => {
+    const workflow = createSimpleWorkflow();
+    const { kernel, persistence } = createTestKernel([workflow]);
+    const { workflowRunId } = await kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "key-moved",
+      workflowId: "test-workflow",
+      input: { data: "x" },
+    });
+    await kernel.dispatch({ type: "run.claimPending", workerId: "w" });
+    const stage = (await persistence.getStage(workflowRunId, "stage-1"))!;
+
+    // A write that does not end the stage (a signal's wake) moves its version.
+    const getStagesByRun = persistence.getStagesByRun.bind(persistence);
+    persistence.getStagesByRun = async (id) => {
+      const rows = await getStagesByRun(id);
+      persistence.getStagesByRun = getStagesByRun;
+      await persistence.updateStage(stage.id, { nextPollAt: new Date() });
+      return rows;
+    };
+    await kernel.dispatch({ type: "run.cancel", workflowRunId });
+
+    expect((await persistence.getStage(workflowRunId, "stage-1"))?.status).toBe(
+      "CANCELLED",
+    );
+  });
 });

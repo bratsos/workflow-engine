@@ -42,7 +42,11 @@ import type {
 } from "../../persistence/interface.js";
 import type { RunPurgeCommand, RunPurgeResult } from "../commands";
 import type { HandlerResult, KernelDeps } from "../kernel";
-import { jobSpillPrefix, stepSpillPrefix } from "../spill.js";
+import {
+  jobSpillPrefix,
+  stepSpillPrefix,
+  stepWriteSpillPrefix,
+} from "../spill.js";
 import { SIGNAL_WAKE, signalWakeKey } from "./step-signal.js";
 
 export const DEFAULT_PURGE_STATUSES: readonly PurgeableRunStatus[] = [
@@ -58,7 +62,8 @@ export const DEFAULT_PURGE_LIMIT = 100;
  * artifacts live under `workflow-v2/<workflowType>/<runId>/`
  * (`save-stage-output.ts`, `save-stage-artifacts.ts`); spilled job
  * payloads under `workflow-v2/spill/jobs/<runId>/`; spilled step results
- * under `workflow-v2/spill/steps/<stageRecordId>/`. No engine key is
+ * under `workflow-v2/spill/steps/<stageRecordId>/` (flat, before
+ * 1.0.0-alpha.21) and `workflow-v2/spill/step-writes/<stageRecordId>/`. No engine key is
  * prefixed by the bare run id, so each family is listed by its own prefix.
  */
 export function runBlobPrefixes(run: {
@@ -69,9 +74,10 @@ export function runBlobPrefixes(run: {
   return [
     `workflow-v2/${run.workflowType}/${run.id}/`,
     jobSpillPrefix(run.id),
-    ...run.stageRecordIds.map((stageRecordId) =>
+    ...run.stageRecordIds.flatMap((stageRecordId) => [
       stepSpillPrefix(stageRecordId),
-    ),
+      stepWriteSpillPrefix(stageRecordId),
+    ]),
   ];
 }
 

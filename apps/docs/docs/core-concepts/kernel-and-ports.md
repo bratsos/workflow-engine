@@ -96,7 +96,7 @@ The key kernel commands are:
 * **`job.execute`**: Executes a single stage (runs `execute()`). Takes the job's `attempt`/`maxAttempts` to decide `willRetry`, and an optional `abortSignal` that becomes `ctx.abortSignal`.
 * **`job.heartbeat`**: One beat of a host's job lease heartbeat: renews the lease and reports the run's status and whether the worker still holds the job, which is what the host aborts `ctx.abortSignal` from.
 * **`run.transition`**: Evaluates completed stage outputs and transitions the workflow run to the next execution group or completes the run.
-* **`run.cancel`**: Authority that marks a run cancelled and sets open stages to cancelled; after that commits, it purges the run's jobs from the job queue.
+* **`run.cancel`**: Authority that marks a run cancelled and sets open stages to cancelled; after that commits, it purges the run's jobs from the job queue and cancels the provider batches the run created (`result.batches`, bounded to 60 seconds; see [Batch Operations](../ai/batch-operations.md#cancelling-a-run)).
 * **`run.redrive`**: Retry, restart or rerun a terminal run — `from: { kind: "lastFailure" | "start" | "stage" }` — keeping the resumed stage's step ledger and archiving every superseded attempt; optionally re-pins the run to another definition version. See [Retry, Restart and Rerun](./redriving-runs.md). `run.rerunFrom` still works but is deprecated and delegates to it.
 * **`stage.pollSuspended`**: Replays suspended durable stages whose `nextPollAt` has passed (and runs `checkCompletion` for the internal async-batch mode).
 * **`step.signal`**: Completes a `ctx.step.waitForSignal` step with a payload and nudges its stage for replay. Idempotent: a second signal reports `alreadyCompleted: true`.
@@ -161,8 +161,18 @@ replay reads every step of the stage. Results above a **soft threshold** are
 written to the `blobStore` and the row keeps a reference:
 
 ```json
-{ "$wfSpill": 1, "key": "workflow-v2/spill/steps/<stageRecordId>/<stepId>.json", "bytes": 400018 }
+{ "$wfSpill": 1, "key": "workflow-v2/spill/step-writes/<stageRecordId>/<stepId>/<uuid>.json", "bytes": 400018 }
 ```
+
+Every write spills to a new key, so the blob a committed row names is never
+written again: a compare-and-set that does not apply (another execution won
+the row) leaves only its own blob, which it deletes, and one that replaces a
+spilled result deletes the blob the previous version named. Rows written
+before 1.0.0-alpha.21 name `workflow-v2/spill/steps/<stageRecordId>/<stepId>.json`
+and are still read through their reference; the new keys live under a
+separate prefix, so an older release's redrive, which clears the old prefix,
+cannot delete them. An older release's `run.purge` or `run.redrive` from
+the start leaves them in the blob store.
 
 This is on by default and needs no wiring: `createKernel` already has a
 `blobStore`, so it wraps the `stepLedger` you give it. Reads resolve the

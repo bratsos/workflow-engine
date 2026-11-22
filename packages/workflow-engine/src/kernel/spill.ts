@@ -137,10 +137,21 @@ export interface PayloadSpill {
   unpack(value: unknown): Promise<unknown>;
   /**
    * Best-effort delete of every spilled value under a key prefix, except
-   * any key listed in `keep`. The exception exists for a partial ledger
-   * clear, which must leave the results of the rows it preserves readable.
+   * any key listed in `keep` or starting with one of `keepUnder`. The
+   * exception exists for a partial ledger clear, which must leave the
+   * results of the rows it preserves readable.
    */
-  deleteUnder(prefix: string, keep?: Iterable<string>): Promise<void>;
+  deleteUnder(
+    prefix: string,
+    keep?: Iterable<string>,
+    keepUnder?: Iterable<string>,
+  ): Promise<void>;
+  /**
+   * Best-effort delete of exactly one spilled value. Optional so that a
+   * hand-written `PayloadSpill` still type-checks; without it the step
+   * ledger decorator leaves superseded blobs to `deleteUnder`.
+   */
+  deleteKey?(key: string): Promise<void>;
 }
 
 /**
@@ -211,11 +222,16 @@ export function createPayloadSpill(
       return blob;
     },
 
-    async deleteUnder(prefix, keep) {
+    async deleteKey(key) {
+      await blobStore.delete(key).catch(() => {});
+    },
+
+    async deleteUnder(prefix, keep, keepUnder) {
       const kept = new Set(keep ?? []);
+      const keptUnder = [...(keepUnder ?? [])];
       const keys = await blobStore.list(prefix).catch(() => [] as string[]);
       for (const key of keys) {
-        if (kept.has(key)) continue;
+        if (kept.has(key) || keptUnder.some((p) => key.startsWith(p))) continue;
         await blobStore.delete(key).catch(() => {});
       }
     },
@@ -231,8 +247,38 @@ export function stepSpillPrefix(stageRecordId: string): string {
   return `workflow-v2/spill/steps/${encodeURIComponent(stageRecordId)}/`;
 }
 
-function stepSpillKey(stageRecordId: string, stepId: string): string {
+/**
+ * Where a row's results were spilled before 1.0.0-alpha.21: one key per row,
+ * written again by every write, so a compare-and-set that lost had already
+ * replaced the blob the winning row names. Still read through its reference.
+ */
+function legacyStepSpillKey(stageRecordId: string, stepId: string): string {
   return `${stepSpillPrefix(stageRecordId)}${encodeURIComponent(stepId)}.json`;
+}
+
+/**
+ * Prefix holding the per-write spilled results of one stage record's steps.
+ * A sibling of `stepSpillPrefix`, never under it: a release before
+ * 1.0.0-alpha.21 clears that prefix keeping only the flat `<stepId>.json`
+ * keys of the rows it retains, so a per-write key under it would lose its
+ * bytes to an older host's `run.redrive`.
+ */
+export function stepWriteSpillPrefix(stageRecordId: string): string {
+  return `workflow-v2/spill/step-writes/${encodeURIComponent(stageRecordId)}/`;
+}
+
+/** Every key a row's results are spilled to now (`encodeURIComponent` escapes `/`). */
+function stepSpillRowPrefix(stageRecordId: string, stepId: string): string {
+  return `${stepWriteSpillPrefix(stageRecordId)}${encodeURIComponent(stepId)}/`;
+}
+
+/**
+ * A new key for every write, so the bytes a committed row names are never
+ * written again: a write that does not apply leaves only a blob no row names,
+ * which it deletes.
+ */
+function stepSpillKey(stageRecordId: string, stepId: string): string {
+  return `${stepSpillRowPrefix(stageRecordId, stepId)}${crypto.randomUUID()}.json`;
 }
 
 /** Blob key prefix under which a run's spilled job payloads live. */
@@ -266,6 +312,47 @@ export function withStepResultSpill(
     return { ...record, result: await spill.unpack(record.result) };
   }
 
+  /**
+   * After a write that replaced a row's result: delete the blob the previous
+   * version named, which nothing names any more (keys are never reused).
+   * Best-effort; whatever stays goes with `clear`, `clearExcept` or purge.
+   */
+  async function retire(previous: StepRecord | null, packed: unknown) {
+    const old = previous?.result;
+    // Only a per-write key: a flat `<stepId>.json` key is written again by a
+    // release before 1.0.0-alpha.21, so a late delete could take its bytes.
+    if (
+      isSpillRef(old) &&
+      old.key.startsWith(stepWriteSpillPrefix(previous!.stageRecordId)) &&
+      !(isSpillRef(packed) && packed.key === old.key)
+    ) {
+      await spill.deleteKey?.(old.key).catch(() => {});
+    }
+  }
+
+  /** The row before a write whose result spills, to retire its blob after. */
+  async function previousOf(
+    stageRecordId: string,
+    stepId: string,
+    packed: StepRecordPatch,
+    patch: StepRecordPatch,
+  ): Promise<StepRecord | null> {
+    // shortcut: only a spilled write reads first, so an inline write costs no
+    // statement; an inline write over a spilled one leaves that blob to
+    // `clear`, `clearExcept` or purge (one per row at most).
+    if (packed.result === patch.result || !isSpillRef(packed.result)) {
+      return null;
+    }
+    return ledger.get(stageRecordId, stepId).catch(() => null);
+  }
+
+  /** Delete the blob a write that did not apply spilled; nothing names it. */
+  async function discard(packed: unknown, original: unknown): Promise<void> {
+    if (packed !== original && isSpillRef(packed)) {
+      await spill.deleteKey?.(packed.key).catch(() => {});
+    }
+  }
+
   async function packPatch(
     stageRecordId: string,
     stepId: string,
@@ -281,7 +368,7 @@ export function withStepResultSpill(
     };
   }
 
-  return {
+  const decorated: StepLedger & TransactionReadPort<StepLedger> = {
     transactionReads(persistence) {
       const reader = withTransactionReads(ledger, persistence, ["get", "list"]);
       const readerSpill = withTransactionReads(spill, persistence, ["unpack"]);
@@ -296,6 +383,7 @@ export function withStepResultSpill(
         record.result,
       );
       const outcome = await ledger.claim({ ...record, result });
+      if (!outcome.created) await discard(result, record.result);
       return {
         created: outcome.created,
         record: await resolve(outcome.record),
@@ -308,11 +396,10 @@ export function withStepResultSpill(
     },
 
     async update(stageRecordId, stepId, patch) {
-      const updated = await ledger.update(
-        stageRecordId,
-        stepId,
-        await packPatch(stageRecordId, stepId, patch),
-      );
+      const packed = await packPatch(stageRecordId, stepId, patch);
+      const previous = await previousOf(stageRecordId, stepId, packed, patch);
+      const updated = await ledger.update(stageRecordId, stepId, packed);
+      await retire(previous, packed.result);
       return resolve(updated);
     },
 
@@ -322,12 +409,16 @@ export function withStepResultSpill(
       expected: StepRecordExpectation,
       patch: StepRecordPatch,
     ) {
+      const packed = await packPatch(stageRecordId, stepId, patch);
+      const previous = await previousOf(stageRecordId, stepId, packed, patch);
       const outcome = await ledger.compareAndSet(
         stageRecordId,
         stepId,
         expected,
-        await packPatch(stageRecordId, stepId, patch),
+        packed,
       );
+      if (!outcome.applied) await discard(packed.result, patch.result);
+      else await retire(previous, packed.result);
       return {
         applied: outcome.applied,
         record: outcome.record ? await resolve(outcome.record) : null,
@@ -342,6 +433,7 @@ export function withStepResultSpill(
     async clear(stageRecordId) {
       await ledger.clear(stageRecordId);
       await spill.deleteUnder(stepSpillPrefix(stageRecordId));
+      await spill.deleteUnder(stepWriteSpillPrefix(stageRecordId));
     },
 
     // `clearExcept` is optional on the port and the kernel branches on its
@@ -359,12 +451,78 @@ export function withStepResultSpill(
             // readable, so its spilled value has to stay too.
             await spill.deleteUnder(
               stepSpillPrefix(stageRecordId),
-              keepStepIds.map((stepId) => stepSpillKey(stageRecordId, stepId)),
+              keepStepIds.map((stepId) =>
+                legacyStepSpillKey(stageRecordId, stepId),
+              ),
+            );
+            await spill.deleteUnder(
+              stepWriteSpillPrefix(stageRecordId),
+              [],
+              keepStepIds.map((stepId) =>
+                stepSpillRowPrefix(stageRecordId, stepId),
+              ),
             );
           },
         }
       : {}),
   };
+  unresolvedLists.set(decorated, { ledger, resolve });
+  return decorated;
+}
+
+const unresolvedLists = new WeakMap<
+  StepLedger,
+  { ledger: StepLedger; resolve: (record: StepRecord) => Promise<StepRecord> }
+>();
+
+/** A row `listStepRows` selected whose spilled result could not be read. */
+export interface UnreadableStepRow {
+  stepId: string;
+  key: string;
+  error: unknown;
+}
+
+/**
+ * The rows of a stage record that `wanted` selects, each resolved on its
+ * own: a spilled result that cannot be read (after one re-read of its row,
+ * in case a concurrent write retired the blob the first read named) is
+ * reported in `unreadable` and does not hide the other rows. `wanted` sees
+ * the row as stored (its `result` may be a spill reference). A ledger not
+ * built by `withStepResultSpill` is listed whole.
+ */
+export async function listStepRows(
+  ledger: StepLedger,
+  stageRecordId: string,
+  wanted: (row: StepRecord) => boolean,
+): Promise<{ rows: StepRecord[]; unreadable: UnreadableStepRow[] }> {
+  const spilled = unresolvedLists.get(ledger);
+  if (!spilled) {
+    return {
+      rows: (await ledger.list(stageRecordId)).filter(wanted),
+      unreadable: [],
+    };
+  }
+  const { ledger: raw, resolve } = spilled;
+  const rows: StepRecord[] = [];
+  const unreadable: UnreadableStepRow[] = [];
+  for (const row of (await raw.list(stageRecordId)).filter(wanted)) {
+    try {
+      rows.push(await resolve(row));
+    } catch (error) {
+      const current = await raw.get(stageRecordId, row.stepId).catch(() => row);
+      try {
+        if (current && wanted(current)) rows.push(await resolve(current));
+      } catch {
+        const key = isSpillRef(current?.result)
+          ? current.result.key
+          : isSpillRef(row.result)
+            ? row.result.key
+            : "";
+        unreadable.push({ stepId: row.stepId, key, error });
+      }
+    }
+  }
+  return { rows, unreadable };
 }
 
 // ============================================================================

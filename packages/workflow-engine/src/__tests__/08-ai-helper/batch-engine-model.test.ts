@@ -805,6 +805,38 @@ describe("Batch Subsystem - OpenRouter Fetch Client (createOpenRouterBatchModel)
     expect(requestsIdx).toBeGreaterThan(modelIdx);
   });
 
+  it("defaults to the documented /api/v1 base URL for every call", async () => {
+    // https://openrouter.ai/docs/projects/docs/batch-quickstart documents
+    // POST /api/v1/batches and GET /api/v1/batches/{id}; /api/beta is gone.
+    const seen: string[] = [];
+    const mockFetch = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        seen.push(`${init?.method ?? "GET"} ${url.toString()}`);
+        return new Response(
+          JSON.stringify({
+            id: "batch-or-1",
+            status: "validating",
+            request_counts: { total: 1, completed: 0, failed: 0 },
+          }),
+          { status: 202, headers: { "Content-Type": "application/json" } },
+        );
+      },
+    );
+    const model = createOpenRouterBatchModel({
+      apiKey: "sk-or-test-key",
+      modelId: "openai/gpt-4o",
+      fetch: mockFetch as any,
+    });
+
+    const ref = await model.start([{ id: "req-1", prompt: "Hello" }]);
+    await model.status(ref);
+
+    expect(seen).toEqual([
+      "POST https://openrouter.ai/api/v1/batches",
+      "GET https://openrouter.ai/api/v1/batches/batch-or-1",
+    ]);
+  });
+
   it("passes auth header, baseURL, and custom headers properly", async () => {
     let capturedUrl = "";
     let capturedHeaders: Record<string, string> = {};

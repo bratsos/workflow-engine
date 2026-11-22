@@ -54,6 +54,7 @@ interface RunRedriveResult {
   readonly supersededStages: string[];
   readonly redriveCount: number;
   readonly definitionVersion: string | null;
+  readonly batches?: readonly RunCancelBatchOutcome[];
 }
 ```
 
@@ -62,6 +63,7 @@ interface RunRedriveResult {
 - `supersededStages`: Array of stage identifiers whose records were superseded and archived: the resumed execution group's records, which are reopened in place, and every record in a later group, which is deleted. A restart (`from: { kind: "start" }`) deletes them all.
 - `redriveCount`: The updated total redrive count for this run.
 - `definitionVersion`: The definition version pinned to the run following the redrive.
+- `batches`: Provider batches this redrive did not hand to an ordinary replay. A submit step a `run.cancel` sweep holds is `held` (with `heldUntil`). A batch whose cancel was asked for on a step this redrive deletes (a sweep held the step, or recorded a cancel on it), or that a step owes a cancel (`cancelOwed`), is cancelled after the commit and reported with the provider's answer; one that was not cancelled carries an `error` and is named in a WARN on the run: cancel it at the provider. On a `CANCELLED` run, every batch of a stage record the redrive deletes whose stage had not completed (engine-owned submit refs, legacy `suspendedState` refs) is cancelled the same way unless recorded as cancelled, since a sweep still running may record its cancel after the redrive read the row. Before the commit a WARN on the run names every batch the redrive will cancel, and one line per batch follows with its outcome: a batch with no outcome line was not answered (the redrive stopped), so cancel it at the provider. On a run that was not cancelled, a deleted step with batches and no recorded cancel is abandoned, as before. Absent when there is nothing to report.
 
 ## Run identity and execution lifecycle
 

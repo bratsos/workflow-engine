@@ -45,6 +45,8 @@
 import { SIGNAL_WAKE, signalWakeKey } from "../handlers/step-signal.js";
 import type { KernelDeps } from "../kernel.js";
 import type { StepLedger, StepRecord } from "../ports.js";
+import { hasCancelFence } from "./batch-submit-record.js";
+import { writeBatchWarn } from "./batch-warn.js";
 
 /** How much of the ledger the next attempt inherits. */
 export type StepLedgerResetMode = "restart" | "resume";
@@ -109,6 +111,16 @@ export async function applyStepLedgerReset(
   }
   for (const row of plan.reopen) {
     if (row.status === "running" && row.leaseExpiresAt === null) continue;
+    // A `running` row a `run.cancel` sweep holds keeps its lease (a replay
+    // waits for the sweep to release it rather than proceed with a batch it is
+    // cancelling), and one a sweep left fenced and then died is not an
+    // ordinary reclaim: it is left as it is, fence and all, for the submit
+    // step (or the next sweep) to resolve against the provider, since whether
+    // the cancel was sent is recorded nowhere else. A `failed` row that still
+    // carries a fence (the step could not resolve it and failed) is re-opened
+    // as usual: its retry resolves the fence again.
+    if (row.status === "running" && hasCancelFence(row)) continue;
+
     await ledger.compareAndSet(
       stageRecordId,
       row.stepId,
@@ -149,24 +161,23 @@ export async function resetStageStepsForFreshAttempt(
 
   if (plan.fallback) {
     const lost = plan.dropped.filter(namesExternalEffect);
-    await deps.persistence
-      .createLog({
-        workflowRunId,
-        workflowStageId: stageRecordId,
-        level: "WARN" as any,
-        message:
-          `Re-running a failed stage cleared ${lost.length} durable step row(s) that named an ` +
-          `external effect; this StepLedger cannot clear selectively. Any effect still in flight ` +
-          `must be found by its external key.`,
-        metadata: {
-          steps: lost.map((row) => ({
-            stepId: row.stepId,
-            status: row.status,
-            externalKey: row.externalKey,
-          })),
-        },
-      })
-      .catch(() => {});
+    // On the run (a stage record a later redrive deletes would take it
+    // along), and never dropped silently: it is the only record left.
+    await writeBatchWarn(
+      deps.persistence,
+      workflowRunId,
+      `Re-running a failed stage cleared ${lost.length} durable step row(s) that named an ` +
+        `external effect; this StepLedger cannot clear selectively. Any effect still in flight ` +
+        `must be found by its external key.`,
+      {
+        stageRecordId,
+        steps: lost.map((row) => ({
+          stepId: row.stepId,
+          status: row.status,
+          externalKey: row.externalKey,
+        })),
+      },
+    );
   }
 
   await applyStepLedgerReset(ledger, stageRecordId, plan);

@@ -14,7 +14,11 @@ import type { AIHelper } from "../../ai/types.js";
 import type { defineStage } from "../../core/stage-factory.js";
 import { StepInFlight } from "../../core/steps.js";
 import { WorkflowBuilder } from "../../core/workflow.js";
-import type { AIHelperFactory, StepLedger } from "../../kernel/ports.js";
+import type {
+  AIHelperFactory,
+  KernelServices,
+  StepLedger,
+} from "../../kernel/ports.js";
 import { FakeClock } from "../../kernel/testing/fake-clock.js";
 import { InMemoryAICallLogger } from "../../testing/in-memory-ai-logger.js";
 import { InMemoryStepLedger } from "../../testing/in-memory-step-ledger.js";
@@ -281,6 +285,12 @@ export interface HarnessOptions {
   input: Record<string, unknown>;
   aiFactory?: AIHelperFactory;
   mock?: MockAIHelperFactory;
+  /** How `run.cancel` finds the transport for a stored batch ref. */
+  batchModels?: KernelServices["batchModels"];
+  /** Forwarded to the kernel; a small value spills step results to the blob store. */
+  spillThresholdBytes?: number;
+  /** Time budgets of the provider calls `run.cancel` makes. */
+  batchCancelTimeouts?: KernelServices["batchCancelTimeouts"];
 }
 
 /** Build a one-stage workflow on the real kernel and expose tick helpers. */
@@ -305,7 +315,17 @@ export async function createAiMapHarness(opts: HarnessOptions) {
   const harness = createTestKernel([workflow], {
     clock,
     stepLedger: ledger,
-    services: { aiLogger, ai: opts.aiFactory ?? mock },
+    ...(opts.spillThresholdBytes !== undefined
+      ? { spillThresholdBytes: opts.spillThresholdBytes }
+      : {}),
+    services: {
+      aiLogger,
+      ai: opts.aiFactory ?? mock,
+      ...(opts.batchModels ? { batchModels: opts.batchModels } : {}),
+      ...(opts.batchCancelTimeouts
+        ? { batchCancelTimeouts: opts.batchCancelTimeouts }
+        : {}),
+    },
   });
   const created = await harness.kernel.dispatch({
     type: "run.create",

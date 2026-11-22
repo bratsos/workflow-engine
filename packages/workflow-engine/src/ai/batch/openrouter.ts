@@ -19,7 +19,7 @@ export interface OpenRouterBatchConfig {
   /** REQUIRED and injected. Never read process.env in this module. */
   apiKey: string;
   modelId: string;
-  baseURL?: string; // default "https://openrouter.ai/api/beta"
+  baseURL?: string; // default "https://openrouter.ai/api/v1"
   fetch?: typeof globalThis.fetch; // default globalThis.fetch
   headers?: Record<string, string>;
   endpoint?:
@@ -242,7 +242,11 @@ async function fetchGetWithRetry(
 export function createOpenRouterBatchModel(
   cfg: OpenRouterBatchConfig,
 ): EngineBatchModel {
-  const baseURL = (cfg.baseURL ?? "https://openrouter.ai/api/beta").replace(
+  // The documented base URL of the Batch API: POST /api/v1/batches,
+  // GET /api/v1/batches/{id} (https://openrouter.ai/docs/projects/docs/batch-quickstart).
+  // The earlier default, /api/beta, is no longer in the documentation; pass
+  // `baseURL` to keep using it.
+  const baseURL = (cfg.baseURL ?? "https://openrouter.ai/api/v1").replace(
     /\/+$/,
     "",
   );
@@ -262,6 +266,12 @@ export function createOpenRouterBatchModel(
     // recoverable here; `AIBatchImpl` refuses to re-create rather than pay
     // for a second batch nobody reads.
     recovery: "none" as const,
+
+    // No `cancel`: OpenRouter's batch documentation says "There is no cancel
+    // endpoint yet" (https://openrouter.ai/docs/projects/docs/batch-quickstart).
+    // DELETE /batches/{id} only removes a batch already in a terminal status
+    // and answers 409 for one in progress, so it cannot stop a running batch.
+    // `run.cancel` reports such a batch as `unsupported`.
 
     async start(
       requests: EngineBatchRequest[],
@@ -426,6 +436,9 @@ export function createOpenRouterBatchModel(
         rawStatus: data.status,
         requestCounts,
         error: errorMessage,
+        ...(data.status === "cancelling" || data.status === "cancelled"
+          ? { cancelled: true }
+          : {}),
       };
     },
 

@@ -104,6 +104,7 @@ export {
   type AIAdapter,
   // High-level batch types (user-facing API)
   type AIBatch,
+  type AIBatchCancelResult,
   type AIBatchHandle,
   type AIBatchProvider,
   type AIBatchRequest,
@@ -151,8 +152,10 @@ export {
 // Batch Engine & OpenRouter Direct Driver
 export {
   createOpenRouterBatchModel,
+  type EngineBatchCancelResult,
   type EngineBatchItemResult,
   type EngineBatchModel,
+  type EngineBatchModelResolver,
   type EngineBatchRecovery,
   type EngineBatchRef,
   type EngineBatchRequest,
@@ -164,6 +167,7 @@ export {
   NotBatchCapableError,
   type OpenRouterBatchConfig,
   resolveAiSdkBatchModel,
+  resolveBatchModelForRef,
 } from "./ai/batch";
 export { BatchNotAdoptableError, BatchSubmitError } from "./ai/batch-helper";
 // Model Helper
@@ -297,6 +301,8 @@ export type {
   OutboxFlushResult,
   PluginReplayDLQCommand,
   PluginReplayDLQResult,
+  RunCancelBatchOutcome,
+  RunCancelBatchStatus,
   RunCancelCommand,
   RunCancelResult,
   RunClaimPendingCommand,

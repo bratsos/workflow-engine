@@ -31,6 +31,29 @@ const boom = defineStage({
   },
 });
 
+// A remote worker has no step ledger, so `ctx.step.ai.map` cannot create a
+// provider batch there: every WARN that names a batch (the loser's cleanup,
+// the step's recovery) is written by the engine process, on the run. The test
+// below fails if a worker ever gets a ledger; those WARNs would then travel
+// back as buffered logs, which `job.execute` writes on the stage record.
+let batchModelReached = false;
+const mapsBatches = defineStage({
+  id: "maps-batches",
+  name: "Maps batches",
+  schemas: { input: z.object({}), output: z.object({}), config: z.object({}) },
+  async execute(ctx) {
+    await ctx.step.ai.map("x", [1], {
+      get model(): string {
+        batchModelReached = true;
+        return "test-model";
+      },
+      policy: "batch",
+      prompt: (i) => String(i),
+    });
+    return { output: {} };
+  },
+});
+
 async function leaseFor(stageId: string) {
   const clock = { now: () => new Date(0) };
   const os = new InMemoryObjectStore(clock);
@@ -80,5 +103,18 @@ describe("runActivity", () => {
     const report = await runActivity(task, boom, worker);
     expect(report.outcome.kind).toBe("failed");
     expect((report.outcome as { error: string }).error).toMatch(/kaboom/);
+  });
+
+  it("cannot reach a provider batch from ctx.step.ai.map: the worker has no step ledger", async () => {
+    const { task, worker } = await leaseFor("maps-batches");
+    const report = await runActivity(task, mapsBatches, worker);
+    expect(report.outcome).toMatchObject({
+      kind: "failed",
+      error: expect.stringContaining(
+        "Durable steps require a configured StepLedger",
+      ),
+    });
+    expect(batchModelReached).toBe(false);
+    expect(report.logs).toEqual([]);
   });
 });

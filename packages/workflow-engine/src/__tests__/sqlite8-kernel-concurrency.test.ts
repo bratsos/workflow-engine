@@ -9,6 +9,9 @@ import {
   expect,
   it,
 } from "vitest";
+import { z } from "zod";
+import { defineAsyncBatchStage } from "../core/stage-factory.js";
+import { WorkflowBuilder } from "../core/workflow.js";
 import type { KernelCommand } from "../kernel/commands.js";
 import {
   createPrismaWorkflowPersistence,
@@ -23,8 +26,51 @@ import {
   realDatabase,
   sqlite,
 } from "./sqlite8-kernel-utils.js";
+import { cancelDeliveryScenarios } from "./utils/cancel-delivery-scenarios.js";
+import { owedCancelScenarios } from "./utils/owed-cancel-scenarios.js";
 
 const BURST = 100;
+
+/** A one-stage workflow whose body waits for `finish(0, "succeed")`. */
+function gatedWorkflow() {
+  const schema = z.object({ value: z.string() });
+  let entered!: () => void;
+  const inside = new Promise<void>((r) => {
+    entered = r;
+  });
+  let release!: () => void;
+  const done = new Promise<void>((r) => {
+    release = r;
+  });
+  const stage = defineAsyncBatchStage({
+    id: "gated",
+    name: "Gated",
+    mode: "async-batch",
+    schemas: { input: schema, output: schema, config: z.object({}) },
+    async execute() {
+      entered();
+      await done;
+      return { output: { value: "A" } };
+    },
+    async checkCompletion() {
+      return { ready: false };
+    },
+  });
+  const workflow = new WorkflowBuilder(
+    `gated-${crypto.randomUUID()}`,
+    "Gated",
+    "gated",
+    schema,
+    schema,
+  )
+    .pipe(stage)
+    .build();
+  return {
+    workflow,
+    entered: (_n: 0) => inside,
+    finish: (_n: 0, _outcome: "succeed") => release(),
+  };
+}
 
 describe.skipIf(!realDatabase)(
   "kernel job commands against a real database",
@@ -394,6 +440,114 @@ describe.skipIf(!realDatabase)(
       },
       30_000,
     );
+
+    describe("run.cancel's fenced stage writes", () => {
+      // run.cancel ends only stages that have not ended. Its transaction reads
+      // the stage, then a Phase 3 commits COMPLETED (Postgres: it reads the
+      // run as RUNNING, since the cancel has not committed), then the cancel
+      // writes: fenced on the version it read, it keeps the completion.
+      it("a run.cancel that read a stage before a Phase 3 committed it leaves the stage COMPLETED", async (context) => {
+        // SQLite runs one transaction at a time: the commit cannot interleave.
+        if (sqlite) context.skip();
+        const gated = gatedWorkflow();
+        const kernel = db.makeKernel({
+          registry: {
+            getWorkflow: (id) =>
+              id === gated.workflow.id ? gated.workflow : undefined,
+            listWorkflows: () => [gated.workflow],
+          },
+        });
+        const created = await kernel.dispatch({
+          type: "run.create",
+          idempotencyKey: crypto.randomUUID(),
+          workflowId: gated.workflow.id,
+          input: { value: "in" },
+        });
+        await kernel.dispatch({ type: "run.claimPending", workerId: "w" });
+        const runId = created.workflowRunId;
+        const job = kernel.dispatch({
+          type: "job.execute",
+          workflowRunId: runId,
+          workflowId: gated.workflow.id,
+          stageId: "gated",
+          config: {},
+        });
+        await gated.entered(0);
+
+        let read!: () => void;
+        const stagesRead = new Promise<void>((r) => {
+          read = r;
+        });
+        let go!: () => void;
+        const resume = new Promise<void>((r) => {
+          go = r;
+        });
+        const withTransaction = db.persistence.withTransaction;
+        db.persistence.withTransaction = ((fn) =>
+          withTransaction.call(db.persistence, (tx) =>
+            fn(
+              new Proxy(tx, {
+                get(object, key) {
+                  const value = Reflect.get(object, key);
+                  if (key === "getStagesByRun") {
+                    return async (...args: unknown[]) => {
+                      const rows = await value.apply(object, args);
+                      read();
+                      await resume;
+                      return rows;
+                    };
+                  }
+                  return typeof value === "function"
+                    ? value.bind(object)
+                    : value;
+                },
+              }),
+            ),
+          )) as typeof withTransaction;
+        const cancel = kernel.dispatch({
+          type: "run.cancel",
+          workflowRunId: runId,
+        });
+        await stagesRead;
+        db.persistence.withTransaction = withTransaction;
+
+        gated.finish(0, "succeed");
+        expect(await job).toMatchObject({ outcome: "completed" });
+        go();
+        expect(await cancel).toMatchObject({ cancelled: true });
+
+        expect(await db.persistence.getRun(runId)).toMatchObject({
+          status: "CANCELLED",
+        });
+        expect(await db.persistence.getStage(runId, "gated")).toMatchObject({
+          status: "COMPLETED",
+        });
+        const events = (await db.persistence.getUnpublishedOutboxEvents(10_000))
+          .filter((event) => event.workflowRunId === runId)
+          .map((event) => event.eventType);
+        expect(
+          events.filter((type) => type === "stage:completed"),
+        ).toHaveLength(1);
+        expect(
+          events.filter((type) => type === "workflow:cancelled"),
+        ).toHaveLength(1);
+      });
+    });
+
+    describe("a run.cancel sweep and the stage's job deliveries", () => {
+      cancelDeliveryScenarios(async () => ({
+        persistence: db.persistence,
+        jobTransport: db.jobTransport,
+        ledger: db.stepLedger,
+        blobStore: db.blobStore,
+        concurrentTransactions: !sqlite,
+        makeKernel: (config) => db.makeKernel(config),
+      }));
+    });
+
+    describe("provider batches owed a cancel, and those of rows a redrive deletes", () => {
+      owedCancelScenarios(() => db);
+    });
   },
 );
 

@@ -628,6 +628,22 @@ export function createKernel(config: KernelConfig): Kernel {
           const outcome = await postCommit(deps);
           // A sweep reports what it deleted, not what selection found.
           if (command.type === "run.purge") return outcome as RunPurgeResult;
+          // The provider batches cancelled after the commit are part of the answer.
+          if (command.type === "run.cancel") {
+            return {
+              ...(publicResult as RunCancelResult),
+              batches: outcome as RunCancelResult["batches"],
+            };
+          }
+          if (
+            command.type === "run.redrive" &&
+            (outcome as RunCancelResult["batches"]).length > 0
+          ) {
+            return {
+              ...(publicResult as RunRedriveResult),
+              batches: outcome as RunCancelResult["batches"],
+            };
+          }
         }
 
         return publicResult;
