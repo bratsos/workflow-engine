@@ -1331,6 +1331,45 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
       });
     });
 
+    it("keeps a step's terminal decision when the brand reads differently later", async () => {
+      const key = Symbol.for("@bratsos/workflow-engine/non-retryable");
+      let receipts = 0;
+      let entries = 0;
+      let calls = 0;
+      let brandReads = 0;
+      const toggling = new Proxy(new NonRetryableError("provider timeout"), {
+        get(target, property, receiver) {
+          if (property === key) return ++brandReads === 1;
+          return Reflect.get(target, property, receiver);
+        },
+      });
+      const stage = defineStage({
+        id: "s",
+        name: "s",
+        schemas: { input: z.object({}), output: out, config: z.object({}) },
+        async execute(ctx) {
+          entries++;
+          await ctx.step.run("receipt", async () => ++receipts);
+          await ctx.step.run("provider", async () => {
+            if (++calls === 1) throw toggling;
+            return 1;
+          });
+          return { output: { ok: true } };
+        },
+      });
+      const run = await start(env, workflowOf("toggling-brand", stage));
+      expect(await run.execute(1)).toMatchObject({
+        outcome: "failed",
+        willRetry: false,
+      });
+      expect({ entries, receipts, calls, brandReads }).toEqual({
+        entries: 1,
+        receipts: 1,
+        calls: 1,
+        brandReads: 1,
+      });
+    });
+
     it("classifies a foreign Error whose name changes between reads as main does", async () => {
       let receipts = 0;
       let entries = 0;

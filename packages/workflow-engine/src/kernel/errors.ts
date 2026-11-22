@@ -47,60 +47,43 @@ export class JobTargetMissingError extends Error {
   }
 }
 
+/** Main's dead-job texts, matched as main matches them. */
+const DEAD_JOB_PATTERN =
+  /^(WorkflowRun .* not found|Workflow .* not found in registry|Stage .* not found in workflow)/;
+
 /**
- * Whether `error` is the missing-target error `job.execute` throws for this
- * very job, so a host may acknowledge the job as dead.
- *
- * - The error itself (branded): its `target` must be this job's workflow,
- *   stage and run, all three. The missing target of another dispatch made
- *   inside the job (a custom executor calling a kernel) names another
- *   target, and is that dispatch's failure, not this job's.
- * - Otherwise, any value whose `name` is `JobTargetMissingError` or `Error`
- *   and whose `message` is exactly the text thrown for one of this job's own
- *   workflow, stage or run (the plain `Error` an earlier release's kernel
- *   throws, an error decoded from JSON). The texts do not name every id, so
- *   any other error with that name and text matches too; the branded error
- *   does not.
- *
- * An error with any other name or text is neither, and so is one whose
- * fields cannot be read (a throwing getter): the caller rethrows it as is.
+ * Whether `error` is this job's missing target, so a host may acknowledge
+ * the job as dead (see {@link jobTargetMissingReason}). A field read that
+ * throws answers `false`.
  */
 export function isJobTargetMissingError(
   error: unknown,
   target: JobTarget,
 ): boolean {
-  return jobTargetMissingReason(error, target) !== undefined;
+  try {
+    return jobTargetMissingReason(error, target) !== undefined;
+  } catch {
+    return false;
+  }
 }
 
 /**
  * The text a host fails the job with when `error` is this job's missing
- * target (see {@link isJobTargetMissingError}), else `undefined`. Each field
- * is read once, so the decision and the text come from the same read.
+ * target, else `undefined`.
+ *
+ * - A {@link JobTargetMissingError} (branded): only when its `target` is this
+ *   job's workflow, stage and run, all three. The missing target of another
+ *   dispatch made inside the job names another target and is rethrown.
+ * - Any other value: exactly the matcher earlier releases used, with the
+ *   same reads (the message of an `Error`, otherwise the value converted to
+ *   a string) and the same outcome, so a getter that throws there throws.
  */
 export function jobTargetMissingReason(
   error: unknown,
   target: JobTarget,
 ): string | undefined {
-  try {
-    return readJobTargetMissing(error, target);
-  } catch {
-    return undefined;
-  }
-}
-
-function readJobTargetMissing(
-  error: unknown,
-  target: JobTarget,
-): string | undefined {
-  if (typeof error !== "object" || error === null) return undefined;
-  const candidate = error as {
-    [JOB_TARGET_MISSING]?: unknown;
-    target?: Partial<JobTarget>;
-    name?: unknown;
-    message?: unknown;
-  };
-  const named = candidate[JOB_TARGET_MISSING] === true && candidate.target;
-  if (named) {
+  const named = brandedTarget(error);
+  if (named !== undefined) {
     if (
       named.workflowId !== target.workflowId ||
       named.stageId !== target.stageId ||
@@ -108,21 +91,25 @@ function readJobTargetMissing(
     ) {
       return undefined;
     }
-    let message: unknown;
-    try {
-      message = candidate.message;
-    } catch {
-      // The target decided; an unreadable text only loses the reason.
-    }
-    return typeof message === "string" ? message : "JobTargetMissingError";
+    return (error as JobTargetMissingError).message;
   }
-  const name = candidate.name;
-  if (name !== "JobTargetMissingError" && name !== "Error") return undefined;
-  const message = candidate.message;
-  return typeof message === "string" &&
-    Object.values(missingTargetMessages(target)).includes(message)
-    ? message
-    : undefined;
+  const message = error instanceof Error ? error.message : String(error);
+  return DEAD_JOB_PATTERN.test(message) ? message : undefined;
+}
+
+/** The target a branded error carries; a value whose brand cannot be read has none. */
+function brandedTarget(error: unknown): Partial<JobTarget> | undefined {
+  try {
+    if (typeof error !== "object" || error === null) return undefined;
+    const candidate = error as {
+      [JOB_TARGET_MISSING]?: unknown;
+      target?: Partial<JobTarget>;
+    };
+    if (candidate[JOB_TARGET_MISSING] !== true) return undefined;
+    return { ...candidate.target };
+  } catch {
+    return undefined;
+  }
 }
 
 /** Thrown when a stage asks for AI without kernel AI services configured. */

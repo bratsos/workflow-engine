@@ -505,13 +505,36 @@ export class NonRetryableError extends Error {
  */
 export function brandNonRetryable<E extends object>(error: E): E {
   Object.defineProperty(error, STEP_NON_RETRYABLE, { value: true });
+  decidedNonRetryable.add(error);
   return error;
+}
+
+/**
+ * Errors a step already decided are terminal. Later consumers (the stage
+ * classifier, a remote worker) ask this set, which reads no property, so the
+ * brand is read once per error and a decision is never reversed. Internal.
+ */
+const decidedNonRetryable = new WeakSet<object>();
+
+/** Record that the step decided `error` is terminal. Internal. */
+export function recordNonRetryable(error: object): void {
+  decidedNonRetryable.add(error);
+}
+
+/** Whether a step already decided `error` is terminal; reads no property. Internal. */
+export function wasDecidedNonRetryable(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    decidedNonRetryable.has(error)
+  );
 }
 
 /** Detect a {@link NonRetryableError} reliably across duplicated package bundles. */
 export function isNonRetryableError(
   error: unknown,
 ): error is NonRetryableError {
+  if (wasDecidedNonRetryable(error)) return true;
   try {
     return (
       typeof error === "object" &&

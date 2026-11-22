@@ -16,6 +16,7 @@ import {
   NonRetryableError,
   neverAbortingSignal,
   parseStepDuration,
+  recordNonRetryable,
   STEP_API_PENDING_CONTROL_FLOW,
   STEP_API_SETTLE_IN_FLIGHT,
   StepInFlight,
@@ -700,6 +701,8 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
         const thrown = declined
           ? new NonRetryableError(message, { cause: error })
           : error;
+        // The stage consults this decision instead of reading the brand again.
+        if (stop) recordNonRetryable(thrown as object);
         // Under the same constraint as the success write: a body that threw
         // here must not bury an outcome another execution already recorded.
         const failure = await commitOutcome(id, "running", {

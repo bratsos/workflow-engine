@@ -295,7 +295,7 @@ export async function executeJobWithHeartbeat(
     // queue row: fail and acknowledge it so it stops re-delivering, and
     // return instead of throwing — for a consumer that runs a whole tick
     // inside one transaction, a throw here aborted every other job.
-    // One read decides and names the reason.
+    // A branded error must name this job; any other value gets main's matcher.
     const message = jobTargetMissingReason(error, job);
     if (message === undefined) throw error;
     console.error(
