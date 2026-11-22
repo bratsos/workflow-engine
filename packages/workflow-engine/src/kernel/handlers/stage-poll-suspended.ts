@@ -27,6 +27,7 @@ import {
   StepTimeoutError,
 } from "../../core/steps.js";
 import {
+  type CompletionCheckResult,
   isSuspendedResult,
   type StageResult,
   type SuspendedResult,
@@ -972,13 +973,49 @@ export async function handleStagePollSuspended(
       }),
     });
 
+    // ── Phase 1: checkCompletion (no transaction) ────────────────────
+    // External HTTP calls happen here — no DB connection held open. A throw
+    // is checkCompletion's own verdict and fails the stage and the run on
+    // this poll. Only this call is covered: what persists its answer is the
+    // engine's, and is handled below.
+    let checkResult: CompletionCheckResult<unknown>;
     try {
-      // ── Phase 1: checkCompletion (no transaction) ──────────────────
-      // External HTTP calls happen here — no DB connection held open.
-      const checkResult = await stageDef.checkCompletion!(
+      checkResult = await stageDef.checkCompletion!(
         stageRecord.suspendedState as any,
         checkContext,
       );
+      // Its fault, not a store's: a missing answer must not read as one.
+      if (checkResult == null) {
+        throw new TypeError(`checkCompletion returned ${checkResult}`);
+      }
+    } catch (error) {
+      // Flush any annotations recorded before the throw so they persist
+      // alongside the FAILED outcome.
+      const message = toErrorMessage(error);
+      const claimResult = await failStageAndRun(
+        stageRecord,
+        run,
+        message,
+        annotationBuffer.flush(),
+        deps,
+        { nextPollAt: deps.clock.now() },
+      );
+
+      if (await skipAfterClaim(claimResult)) continue;
+      postCommits.push(() =>
+        failSuspendedJobRow(
+          stageRecord.workflowRunId,
+          stageRecord.stageId,
+          message,
+          deps,
+        ),
+      );
+
+      failed++;
+      continue;
+    }
+
+    try {
       if (await superseded(stageRecord, deps)) continue;
 
       // ── Phase 2: persist results (transaction) ─────────────────────
@@ -1171,30 +1208,21 @@ export async function handleStagePollSuspended(
         if (await skipAfterClaim(claimResult)) continue;
       }
     } catch (error) {
-      // Unexpected error during checkCompletion. Flush any annotations
-      // recorded before the throw so they persist alongside the FAILED
-      // outcome.
-      const message = toErrorMessage(error);
-      const claimResult = await failStageAndRun(
+      // checkCompletion answered; the engine's own write of that answer
+      // failed (a commit, the output blob). That is a store problem, not a
+      // verdict on the stage: it stays SUSPENDED with its claim handed back
+      // on a short backoff, as a replay that throws does, and the next poll
+      // asks again. The answer is dropped with the poll's annotations. If
+      // handing the claim back fails too, the claim lease still holds it.
+      logFn(
+        "WARN",
+        `Persisting the checkCompletion answer failed (${toErrorMessage(error)}); the stage stays suspended and is polled again`,
+      );
+      await releaseStageClaim(
         stageRecord,
-        run,
-        message,
-        annotationBuffer.flush(),
         deps,
-        { nextPollAt: deps.clock.now() },
-      );
-
-      if (await skipAfterClaim(claimResult)) continue;
-      postCommits.push(() =>
-        failSuspendedJobRow(
-          stageRecord.workflowRunId,
-          stageRecord.stageId,
-          message,
-          deps,
-        ),
-      );
-
-      failed++;
+        new Date(deps.clock.now().getTime() + retryBackoffMs(1)),
+      ).catch(() => {});
     }
   }
 

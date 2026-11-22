@@ -5,6 +5,7 @@ import {
   defineStage,
 } from "../../core/stage-factory.js";
 import type { StepApi } from "../../core/steps.js";
+import type { CompletionCheckResult } from "../../core/types.js";
 import { WorkflowBuilder } from "../../core/workflow.js";
 import type { Kernel } from "../../kernel/kernel.js";
 import { FakeClock } from "../../kernel/testing/fake-clock.js";
@@ -1106,6 +1107,108 @@ describe("kernel: stage.pollSuspended retries a replay that throws", () => {
     expect((await env.persistence.getRun(env.runId))?.status).toBe("FAILED");
     await env.flush();
     expect(env.eventSink.getByType("stage:retrying")).toHaveLength(0);
+  });
+});
+
+describe("kernel: stage.pollSuspended and a legacy checkCompletion answer the engine cannot persist", () => {
+  /** A legacy stage suspended through `job.execute`; `answer` is its poll. */
+  async function suspendLegacy(answer: () => CompletionCheckResult<unknown>) {
+    const out = z.object({ result: z.string() });
+    const clock = new FakeClock();
+    const stage = defineAsyncBatchStage({
+      id: "batch-stage",
+      name: "Batch Stage",
+      mode: "async-batch",
+      schemas: { input: z.object({}), output: out, config: z.object({}) },
+      async execute() {
+        return {
+          suspended: true,
+          state: { batchId: "batch-1" },
+          pollConfig: {
+            pollInterval: 1000,
+            maxWaitTime: 60 * 60 * 1000,
+            nextPollAt: new Date(clock.now().getTime() + 1000),
+          },
+        };
+      },
+      async checkCompletion() {
+        return answer() as { ready: boolean; output?: { result: string } };
+      },
+    });
+    const workflow = new WorkflowBuilder(
+      "legacy-persist",
+      "Legacy",
+      "test",
+      z.object({}),
+      out,
+    )
+      .pipe(stage)
+      .build();
+    const env = createTestKernel([workflow], { clock });
+    const created = await env.kernel.dispatch({
+      type: "run.create",
+      idempotencyKey: "legacy-persist",
+      workflowId: workflow.id,
+      input: {},
+    });
+    await env.kernel.dispatch({ type: "run.claimPending", workerId: "worker" });
+    await env.kernel.dispatch({
+      type: "job.execute",
+      workflowRunId: created.workflowRunId,
+      workflowId: workflow.id,
+      stageId: stage.id,
+      config: {},
+    });
+    env.eventSink.clear();
+    return { ...env, runId: created.workflowRunId };
+  }
+
+  it.each([
+    ["the output blob write", true, "blob"],
+    ["the commit of a ready answer", true, "commit"],
+    ["the commit of a not-ready answer", false, "commit"],
+  ] as const)("keeps the stage suspended and polls it again when %s fails", async (_case, ready, point) => {
+    let answer: CompletionCheckResult<unknown> = ready
+      ? { ready: true, output: { result: "done" } }
+      : { ready: false };
+    const env = await suspendLegacy(() => answer);
+    env.clock.advance(1_000);
+    if (point === "blob")
+      vi.spyOn(env.blobStore, "put").mockRejectedValueOnce(
+        new Error("blob store unavailable"),
+      );
+    else
+      vi.spyOn(env.persistence, "withTransaction").mockRejectedValueOnce(
+        new Error("commit failed"),
+      );
+
+    const first = await env.kernel.dispatch({ type: "stage.pollSuspended" });
+
+    // A store error is not a verdict on the stage: nothing fails.
+    expect(first).toMatchObject({ checked: 1, resumed: 0, failed: 0 });
+    expect(
+      await env.persistence.getStage(env.runId, "batch-stage"),
+    ).toMatchObject({
+      status: "SUSPENDED",
+      nextPollAt: new Date(env.clock.now().getTime() + 2_000),
+    });
+    expect((await env.persistence.getRun(env.runId))?.status).toBe("RUNNING");
+    await env.flush();
+    expect(env.eventSink.getByType("stage:failed")).toHaveLength(0);
+    expect(env.eventSink.getByType("workflow:failed")).toHaveLength(0);
+
+    // Nobody polls it before the backoff elapses; the next poll completes it.
+    expect(
+      (await env.kernel.dispatch({ type: "stage.pollSuspended" })).checked,
+    ).toBe(0);
+    answer = { ready: true, output: { result: "done" } };
+    env.clock.advance(2_000);
+    expect(
+      await env.kernel.dispatch({ type: "stage.pollSuspended" }),
+    ).toMatchObject({ resumed: 1, failed: 0 });
+    expect(
+      await env.persistence.getStage(env.runId, "batch-stage"),
+    ).toMatchObject({ status: "COMPLETED" });
   });
 });
 

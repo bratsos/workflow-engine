@@ -341,8 +341,8 @@ describe.skipIf(!realDatabase)(
       );
     });
 
-    it("keeps a suspended job when the poll outcome transaction rolls back", async () => {
-      const { id } = await db.seed("RUNNING", "SUSPENDED");
+    it("keeps the stage and its suspended job when the poll outcome transaction rolls back, and completes it on the next poll", async () => {
+      const { id, stage } = await db.seed("RUNNING", "SUSPENDED");
       const before = await db.persistence.getRun(id);
       const kernel = db.makeKernel({
         persistence: override(db.persistence, {
@@ -353,17 +353,32 @@ describe.skipIf(!realDatabase)(
             }),
         }),
       });
+      // The engine's own commit failed, not checkCompletion: nothing fails.
       await expect(
         kernel.dispatch({ type: "stage.pollSuspended" }),
-      ).rejects.toThrow("abort poll commit");
-      expect((await db.persistence.getStage(id, "first"))?.status).toBe(
-        "SUSPENDED",
-      );
+      ).resolves.toMatchObject({ checked: 1, resumed: 0, failed: 0 });
+      expect(await db.persistence.getStage(id, "first")).toMatchObject({
+        status: "SUSPENDED",
+        errorMessage: null,
+      });
+      expect((await db.persistence.getRun(id))?.status).toBe("RUNNING");
       expect((await db.persistence.getRun(id))?.version).toBe(before?.version);
       expect((await db.jobTransport.getJobsByWorkflowRun(id))[0]!.status).toBe(
         "SUSPENDED",
       );
       expect(await db.persistence.getUnpublishedOutboxEvents(100)).toEqual([]);
+
+      // Backed off, then polled again: the answer persists this time.
+      await db.client.workflowStage.update({
+        where: { id: stage.id },
+        data: { nextPollAt: new Date("2020-01-01T00:00:00Z") },
+      });
+      await expect(
+        db.kernel.dispatch({ type: "stage.pollSuspended" }),
+      ).resolves.toMatchObject({ checked: 1, resumed: 1, failed: 0 });
+      expect((await db.persistence.getStage(id, "first"))?.status).toBe(
+        "COMPLETED",
+      );
     });
 
     it("keeps the committed poll outcome when best-effort job cleanup fails", async () => {
