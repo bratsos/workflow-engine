@@ -65,6 +65,7 @@ import {
 import { isTransactionReadBound } from "../helpers/transaction-reads.js";
 import type { HandlerResult, KernelDeps } from "../kernel";
 import type { StepRecord } from "../ports";
+import { SIGNAL_WAKE, signalWakeKey } from "./step-signal.js";
 
 /**
  * A durable step row a redrive is about to drop that named an external
@@ -86,6 +87,18 @@ function toAbandoned(rows: readonly StepRecord[]): AbandonedStep[] {
     status: row.status,
     externalKey: row.externalKey ?? null,
   }));
+}
+
+/** The blob keys a stage record's outputData points at. */
+function outputKeys(stage: WorkflowStageRecord): string[] {
+  const data = stage.outputData as {
+    _artifactKey?: unknown;
+    _artifactKeys?: Record<string, unknown>;
+  } | null;
+  return [
+    data?._artifactKey,
+    ...Object.values(data?._artifactKeys ?? {}),
+  ].filter((key): key is string => typeof key === "string");
 }
 
 /** Annotation key under which a superseded stage attempt is archived. */
@@ -133,9 +146,22 @@ function resolveFromStageId(
   return last.stageId;
 }
 
+/** Which run states a caller accepts, and how it refuses the others. */
+export interface RedriveSourceStates {
+  states: ReadonlySet<string>;
+  refuse(status: string): string;
+}
+
+const REDRIVE_SOURCES: RedriveSourceStates = {
+  states: REDRIVABLE,
+  refuse: (status) =>
+    `Cannot redrive a run in ${status} state. Must be COMPLETED, FAILED or CANCELLED.`,
+};
+
 export async function handleRunRedrive(
   command: RunRedriveCommand,
   deps: KernelDeps,
+  sources: RedriveSourceStates = REDRIVE_SOURCES,
 ): Promise<HandlerResult<RunRedriveResult>> {
   const { workflowRunId } = command;
   const from: RunRedriveFrom = command.from ?? { kind: "lastFailure" };
@@ -144,10 +170,8 @@ export async function handleRunRedrive(
   const run = await deps.persistence.getRun(workflowRunId);
   if (!run) throw new Error(`WorkflowRun ${workflowRunId} not found`);
 
-  if (!REDRIVABLE.has(run.status)) {
-    throw new Error(
-      `Cannot redrive a run in ${run.status} state. Must be COMPLETED, FAILED or CANCELLED.`,
-    );
+  if (!sources.states.has(run.status)) {
+    throw new Error(sources.refuse(run.status));
   }
 
   const workflow = deps.registry.getWorkflow(run.workflowId);
@@ -241,6 +265,9 @@ export async function handleRunRedrive(
   const abandonedByStage = new Map<string, AbandonedStep[]>();
   const abandonReasons = new Set<AbandonReason>();
   const ledgerResets = new Map<string, StepLedgerResetPlan>();
+  // Wake keys name a stage record id; a deleted record's are released with
+  // its ledger, since no later signal or purge can find them.
+  const deletedSignalSteps = new Map<string, string[]>();
   if (deps.stepLedger) {
     const ledger = deps.stepLedger;
     for (const stage of stagesToSupersede) {
@@ -248,6 +275,10 @@ export async function handleRunRedrive(
         if (isTransactionReadBound(ledger)) throw error;
         return [] as StepRecord[];
       });
+      deletedSignalSteps.set(
+        stage.id,
+        rows.filter((row) => row.kind === "signal").map((row) => row.stepId),
+      );
       let dropped: readonly StepRecord[] = rows;
       let reason: AbandonReason = "deleted";
       if (stagesToReopen.includes(stage)) {
@@ -337,12 +368,28 @@ export async function handleRunRedrive(
   // deleted record's blobs go: a reopened record's kept steps may hold
   // references into its own storage, and the new attempt overwrites its
   // output and artifacts by key anyway.
+  //
+  // Keys an outputData points at are kept: a deleted record's, so a caller
+  // whose own transaction rolls this redrive back finds its restored
+  // pointers intact, and a current record's, so a new attempt that
+  // completed before the cleanup (a caller-owned job.execute) keeps its
+  // output. Kept keys are overwritten by the new attempt or go with
+  // run.purge. Listing waits for the commit: an unbound blob store read
+  // inside the transaction can wait on the transaction's own lock.
+  const deletedOutputKeys = stagesToDelete.flatMap(outputKeys);
   const blobPrefixesToDelete = stagesToDelete.map(
     (stage) =>
       `workflow-v2/${run.workflowType}/${workflowRunId}/${stage.stageId}/`,
   );
 
   for (const stage of stagesToDelete) {
+    // In this transaction: nothing can name a deleted record afterwards.
+    for (const stepId of deletedSignalSteps.get(stage.id) ?? []) {
+      await deps.persistence.releaseIdempotencyKey(
+        signalWakeKey(stage.id, stepId),
+        SIGNAL_WAKE,
+      );
+    }
     await deps.persistence.deleteStage(stage.id);
   }
 
@@ -379,6 +426,8 @@ export async function handleRunRedrive(
     ...(definitionVersion !== run.definitionVersion
       ? { definitionVersion }
       : {}),
+    // The status checked above must still hold when the run reopens.
+    expectedVersion: run.version,
   });
 
   // Restarting replaced every record, so the group is created outright and
@@ -445,12 +494,24 @@ export async function handleRunRedrive(
         const keys = await postDeps.blobStore
           .list(prefix)
           .catch(() => [] as string[]);
+        if (keys.length === 0) continue;
+        // Read after listing: a pointer committed before this read keeps
+        // the listed key it names. Unreadable, nothing here is deleted.
+        const current = await postDeps.persistence
+          .getStagesByRun(workflowRunId)
+          .catch(() => null);
+        if (!current) continue;
+        const kept = new Set([
+          ...deletedOutputKeys,
+          ...current.flatMap(outputKeys),
+        ]);
         for (const key of keys) {
+          if (kept.has(key)) continue;
           await postDeps.blobStore.delete(key).catch(() => {});
         }
       }
 
-      await enqueue();
+      await enqueue(postDeps);
     },
   };
 }

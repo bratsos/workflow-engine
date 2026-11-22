@@ -24,12 +24,22 @@
  * reopened earlier keeps its data and its job, and the result names only the
  * runs that were deleted. Cleanup already done for a run reopened after the
  * last read is not undone: a job lost that way is re-enqueued by
- * `run.reapStuck`.
+ * `run.reapStuck`. Cleanup covers the stage records the run has at that
+ * first re-read, not the ones selection saw.
+ *
+ * INVARIANT: a writer that read the run before it was deleted can still land
+ * afterwards (a delayed post-commit enqueue, a signal's ledger write). The
+ * sweep repeats its cleanup once the run is gone, and those writers check
+ * for the run (or stage) after writing and remove what they wrote when it is
+ * gone: whichever finishes second removes the data. Both are best effort.
  *
  * Nothing is emitted. Retention is housekeeping, not a lifecycle event.
  */
 
-import type { PurgeableRunStatus } from "../../persistence/interface.js";
+import type {
+  PurgeableRun,
+  PurgeableRunStatus,
+} from "../../persistence/interface.js";
 import type { RunPurgeCommand, RunPurgeResult } from "../commands";
 import type { HandlerResult, KernelDeps } from "../kernel";
 import { jobSpillPrefix, stepSpillPrefix } from "../spill.js";
@@ -99,8 +109,7 @@ export async function handleRunPurge(
                 (run.completedAt ?? run.updatedAt) <= command.olderThan
               );
             };
-            for (const run of runs) {
-              if (!(await eligible(run.id))) continue;
+            const clearLedgers = async (run: PurgeableRun) => {
               for (const stageRecordId of run.stageRecordIds) {
                 // Before the rows that name these keys. An unreadable row
                 // leaves a key behind, which must not stall retention.
@@ -116,6 +125,37 @@ export async function handleRunPurge(
                 }
                 await postDeps.stepLedger?.clear(stageRecordId);
               }
+            };
+            const clearJobsAndBlobs = async (run: PurgeableRun) => {
+              const jobs = await postDeps.jobTransport.getJobsByWorkflowRun(
+                run.id,
+              );
+              const stageIds = Array.from(
+                new Set(jobs.map((job) => job.stageId)),
+              );
+              if (stageIds.length > 0) {
+                await postDeps.jobTransport.deleteByRunAndStages(
+                  run.id,
+                  stageIds,
+                );
+              }
+              for (const prefix of runBlobPrefixes(run)) {
+                for (const key of await postDeps.blobStore.list(prefix)) {
+                  await postDeps.blobStore.delete(key);
+                }
+              }
+            };
+            for (const selected of runs) {
+              if (!(await eligible(selected.id))) continue;
+              // The records it has now: one redriven and finished again since
+              // selection has new ones.
+              const run: PurgeableRun = {
+                ...selected,
+                stageRecordIds: (
+                  await postDeps.persistence.getStagesByRun(selected.id)
+                ).map((stage) => stage.id),
+              };
+              await clearLedgers(run);
               // job_queue has no foreign key to workflow_runs.
               const jobs = await postDeps.jobTransport.getJobsByWorkflowRun(
                 run.id,
@@ -142,7 +182,12 @@ export async function handleRunPurge(
                 command.olderThan,
                 statuses,
               );
-              if (removed) deleted.push(run.id);
+              if (!removed) continue;
+              deleted.push(run.id);
+              // What a writer that read the run before it went landed since.
+              await clearLedgers(run)
+                .then(() => clearJobsAndBlobs(run))
+                .catch(() => {});
             }
             return { purged: deleted.length, workflowRunIds: deleted };
           },

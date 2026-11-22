@@ -32,6 +32,7 @@
  */
 
 import type { Workflow } from "../../core/workflow.js";
+import type { EnqueueJobInput } from "../../persistence/interface.js";
 import type { KernelDeps } from "../kernel.js";
 import type { WorkflowRunRecord } from "../ports.js";
 
@@ -69,7 +70,7 @@ export async function prepareExecutionGroup(
   workflow: Workflow<any, any>,
   deps: KernelDeps,
   options: PrepareExecutionGroupOptions,
-): Promise<() => Promise<string[]>> {
+): Promise<(postDeps: KernelDeps) => Promise<string[]>> {
   const { groupIndex, attemptMode, createMode, filterPending = true } = options;
   const stages = workflow.getStagesInExecutionGroup(groupIndex);
 
@@ -108,9 +109,11 @@ export async function prepareExecutionGroup(
     }
   }
 
-  return () => {
+  return (postDeps: KernelDeps) => {
     if (stagesToEnqueue.length === 0) return Promise.resolve([]);
-    return deps.jobTransport.enqueueParallel(
+    return enqueueForLiveRun(
+      postDeps,
+      run.id,
       stagesToEnqueue.map((stage) => ({
         workflowRunId: run.id,
         workflowId: run.workflowId,
@@ -123,4 +126,23 @@ export async function prepareExecutionGroup(
       })),
     );
   };
+}
+
+/**
+ * Enqueues post-commit jobs for one run, then removes them again if the run
+ * was deleted meanwhile. `run.purge` repeats its job cleanup after deleting
+ * the run, so between the two a job enqueued late never outlives its run.
+ */
+export async function enqueueForLiveRun(
+  deps: KernelDeps,
+  workflowRunId: string,
+  jobs: EnqueueJobInput[],
+): Promise<string[]> {
+  const ids = await deps.jobTransport.enqueueParallel(jobs);
+  if (await deps.persistence.getRun(workflowRunId)) return ids;
+  await deps.jobTransport.deleteByRunAndStages(
+    workflowRunId,
+    jobs.map((job) => job.stageId),
+  );
+  return [];
 }
