@@ -348,8 +348,9 @@ describe.skipIf(!realDatabase)(
         persistence: override(db.persistence, {
           withTransaction: (fn) =>
             db.persistence.withTransaction(async (tx) => {
-              await fn(tx);
+              const result = await fn(tx);
               if (aborts-- > 0) throw new Error("abort poll commit");
+              return result;
             }),
         }),
       });
