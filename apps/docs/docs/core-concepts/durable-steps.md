@@ -212,11 +212,13 @@ The default is `"rerun"`. `onReclaim` governs the lease-expiry takeover only; it
 
 A step's outcome is recorded with a compare-and-set against the row still being open: first write wins, and the loser parks on the outcome already recorded. Both callers are answered the same value. When that happens the engine logs a WARN and writes a `step.outcome-conflict` annotation on the run (step id, kind, recorded status, attempt, `externalKey`). It is a report, not a failure: what it tells you is that the body ran more than once, which is when a duplicate external effect is possible.
 
+**A `ctx.step.ai.map` submit step is the exception.** Its row (`${id}:submit`) can be held by a `run.cancel` sweep, which takes it over at `attempt + 1` and writes its fence, cancel intent and tombstone into the row. So an execution of a submit body records its outcome (success, failure, cancellation) only while the row is still open at the attempt it claimed. A body whose lease lapsed and whose row was taken over (by a replay or by a sweep) does not record anything: when the row has an outcome it parks on it as above, and when the row is still open under another attempt it throws `StepLeaseLostError`. The batches it created that the row does not list are then cancelled: first recorded in the row (`cancelledBatchIds`, so they are never adopted) when nothing holds it, cancelled without a write when a sweep holds it, and cancelled directly when the row is gone with its stage record. When another live execution holds the row, they are left for it to adopt by the external key, with a WARN naming the batch ids, on a transport that can search for them (OpenAI, Gemini). On one that cannot (Anthropic, OpenRouter) the other execution never lists them, so they are cancelled. Other `run` steps keep first write wins.
+
 ---
 
 ## Cancellation and lost leases: `ctx.abortSignal`
 
-`run.cancel` marks the run `CANCELLED` and purges the queue; the job executing at that moment has its outcome discarded when it finishes. Without a signal that is all that happens — a body in the middle of a ten-minute model call runs to completion for nothing. `ctx.abortSignal` is that signal: an `AbortSignal` on the stage context, and the same object as `step.abortSignal` inside every `run` body (named `abortSignal`, not `signal`, so it is not confused with `waitForSignal`).
+`run.cancel` marks the run `CANCELLED`, purges the queue and cancels the provider batches the run created (see [Batch Operations](../ai/batch-operations.md#cancelling-a-run)); the job executing at that moment has its outcome discarded when it finishes. Without a signal that is all that happens — a body in the middle of a ten-minute model call runs to completion for nothing. `ctx.abortSignal` is that signal: an `AbortSignal` on the stage context, and the same object as `step.abortSignal` inside every `run` body (named `abortSignal`, not `signal`, so it is not confused with `waitForSignal`).
 
 ```typescript
 async execute(ctx) {
@@ -230,7 +232,7 @@ async execute(ctx) {
 
 It is aborted from the host's job lease heartbeat (`job.heartbeat`, every `jobHeartbeatIntervalMs`, default 60 s), so the latency is one heartbeat interval. `abortSignal.reason` is a `StageAbortedError` whose `reason` is:
 
-- **`"cancelled"`** — the run is `CANCELLED`. A `run` body that finishes after this is recorded as `failed` with the cancellation as its error, not as completed; no retry is spent. `waitFor` checks the signal before it calls `poll`.
+- **`"cancelled"`** — the run is `CANCELLED`. No `run` body starts once the signal reports this: `ctx.step.run`, and every step built on it (`ctx.step.ai.*`), throws the `StageAbortedError` before the body and writes no row, so a redrive does not count the step as an attempt; a step that already completed still answers from the ledger. A body that was already running and finishes after this is recorded as `failed` with the cancellation as its error, not as completed; no retry is spent. `waitFor` checks the signal before it calls `poll`.
 - **`"lease-lost"`** — the job lease was released (a stale-lease reap, the absolute cap) or re-claimed by another worker. Another worker may already be executing the same stage. A `run` body that finishes after this *is* still recorded — the step row's own lease and compare-and-set decide the owner.
 
 `stageAbortReason(signal)` returns the reason or `undefined`. A context built without a host loop (a direct `job.execute` dispatch, a `stage.pollSuspended` replay, a remote activity worker) carries a signal that never fires. Honouring it is optional: the engine discards a cancelled invocation's result either way.
