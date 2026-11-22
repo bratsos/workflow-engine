@@ -30,7 +30,7 @@ interface TestSetup {
   serverClose: () => Promise<void>;
 }
 
-function setup(opts: { useAuth?: boolean } = {}): TestSetup {
+async function setup(opts: { useAuth?: boolean } = {}): Promise<TestSetup> {
   const clock = new FakeClock(new Date(0));
   const os = new InMemoryObjectStore(clock);
   const broker = new Broker({
@@ -54,8 +54,11 @@ function setup(opts: { useAuth?: boolean } = {}): TestSetup {
     authToken,
   });
 
-  // Listen on an ephemeral loopback port (OS picks the port, guaranteed unique).
-  server.listen(0);
+  // Bind loopback explicitly, not the wildcard. The client dials 127.0.0.1,
+  // and on macOS a process that binds 127.0.0.1:<port> shadows a wildcard
+  // listener on the same port, so an unrelated local server could answer the
+  // lease with its own 404. A loopback-specific bind cannot be shadowed.
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const { port } = server.address() as AddressInfo;
   const baseUrl = `http://127.0.0.1:${port}`;
 
@@ -104,7 +107,7 @@ describe("HTTP transport — broker server + worker client (real network)", () =
   it("drives a workflow to COMPLETED over a real TCP connection: doubled === 6", {
     timeout: 10_000,
   }, async () => {
-    const { orch, worker, os, serverClose } = setup();
+    const { orch, worker, os, serverClose } = await setup();
     teardowns.push(serverClose);
 
     // 1. Create + claim the workflow run.
@@ -202,7 +205,7 @@ describe("HTTP transport — broker server + worker client (real network)", () =
       objectStore: os2,
       authToken: "real-token",
     });
-    srv.listen(0);
+    await new Promise<void>((resolve) => srv.listen(0, "127.0.0.1", resolve));
     const p = (srv.address() as AddressInfo).port;
     teardowns.push(
       () =>
@@ -227,7 +230,7 @@ describe("HTTP transport — broker server + worker client (real network)", () =
   it("uses bearer auth when configured and succeeds end-to-end", {
     timeout: 10_000,
   }, async () => {
-    const { orch, worker, serverClose } = setup({ useAuth: true });
+    const { orch, worker, serverClose } = await setup({ useAuth: true });
     teardowns.push(serverClose);
 
     const { workflowRunId } = await orch.kernel.dispatch({
