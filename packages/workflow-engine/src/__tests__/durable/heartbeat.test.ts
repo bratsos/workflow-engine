@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { StepLeaseLostError, type StepRunContext } from "../../core/steps.js";
+import { MAX_TIMER_MS } from "../../kernel/helpers/host-support.js";
 import { createStepApi } from "../../kernel/helpers/step-api.js";
 import { FakeClock } from "../../kernel/testing/fake-clock.js";
 import { InMemoryStepLedger } from "../../testing/in-memory-step-ledger.js";
@@ -128,5 +129,37 @@ describe("durable run lease heartbeat", () => {
     await expect(
       api().run("export", async () => "done", { lease: "1m", heartbeat: "1m" }),
     ).rejects.toThrow("heartbeat");
+  });
+
+  it("refuses a heartbeat a timer cannot honour before the step is claimed, and accepts its bounds", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    const { api, ledger } = setup();
+    const lease = MAX_TIMER_MS;
+    let ran = 0;
+    const body = async () => {
+      ran += 1;
+      return "done";
+    };
+
+    for (const bad of [0, -1, NaN, Infinity, 0.5, MAX_TIMER_MS + 1, "25d"]) {
+      await expect(
+        api().run("export", body, { lease, heartbeat: bad }),
+        String(bad),
+      ).rejects.toThrow(
+        new RegExp(
+          `heartbeat must be a number of milliseconds from 1 to ${MAX_TIMER_MS}`,
+        ),
+      );
+    }
+    expect(ran).toBe(0);
+    expect(await ledger.get("stage", "export")).toBeNull();
+
+    await expect(
+      api().run("min", body, { lease: "1m", heartbeat: 1 }),
+    ).resolves.toBe("done");
+    await expect(
+      api().run("max", body, { lease, heartbeat: MAX_TIMER_MS - 1 }),
+    ).resolves.toBe("done");
+    expect(vi.getTimerCount()).toBe(0);
   });
 });

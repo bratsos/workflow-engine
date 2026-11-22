@@ -11,6 +11,7 @@ import { registerModels } from "../../ai/model-helper.js";
 import type { AiMapResult } from "../../core/step-ai.js";
 import { NonRetryableError } from "../../core/steps.js";
 import { defineWorkflow } from "../../core/workflow.js";
+import { MAX_TIMER_MS } from "../../kernel/helpers/host-support.js";
 import { createTestHarness } from "../../testing/index.js";
 
 const MODEL = "ai-map-feedback-model";
@@ -391,6 +392,38 @@ describe("ctx.step.ai.map — consumer feedback surfaces", () => {
     expect(result.status).toBe("COMPLETED");
     // Two gaps between three items on one slot; none after the last.
     expect(elapsed).toBeGreaterThanOrEqual(70);
+  });
+
+  it.each([
+    "retryDelayMs",
+    "minDelayMs",
+  ] as const)("refuses a realtime.%s a timer cannot honour before any model call, and accepts its bounds", async (option) => {
+    for (const bad of [-1, NaN, Infinity, MAX_TIMER_MS + 1, "25d"]) {
+      const harness = createTestHarness({
+        workflows: [
+          mapWorkflow(`map-bad-${option}`, { realtime: { [option]: bad } }),
+        ],
+      });
+      const result = await harness.run(`map-bad-${option}`, { items: ["a"] });
+
+      expect(result.status, String(bad)).toBe("FAILED");
+      expect(result.error).toContain(
+        `realtime.${option} must be a number of milliseconds from 0 to ${MAX_TIMER_MS}`,
+      );
+      expect(harness.mockAi.helper.getAllCallsRecursive()).toHaveLength(0);
+    }
+
+    // 0 turns the delay off; the longest delay is only waited on after a
+    // retry or a second item, so one item completes with either.
+    for (const ok of [0, 1, MAX_TIMER_MS, "24d"]) {
+      const harness = createTestHarness({
+        workflows: [
+          mapWorkflow(`map-ok-${option}`, { realtime: { [option]: ok } }),
+        ],
+      });
+      const result = await harness.run(`map-ok-${option}`, { items: ["a"] });
+      expect(result.status, String(ok)).toBe("COMPLETED");
+    }
   });
 
   it("streams realtime items and still validates the collected text", async () => {

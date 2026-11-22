@@ -65,7 +65,7 @@ export const batchAnalysisStage = defineStage({
 | `policy?` | `"auto"` (default), `"realtime"` or `"batch"`. Forcing batch on a model that cannot batch throws. |
 | `auto?` | `{ batchAbove }` — item count at or above which `auto` uses batch (default 20). |
 | `batch?` | `provider`, `options` (`BatchOptions`), `pollEvery` (default `"60s"`), `timeout` (default `"24h"`, non-sliding), `onExpiry: "fail" \| "partial"`, `onReclaim: "adopt" \| "resubmit"`. |
-| `realtime?` | `concurrency` (default 10), `budget` (max model calls per stage invocation), `retries` (default 1), `retryDelayMs`, `minDelayMs`. |
+| `realtime?` | `concurrency` (default 10), `budget` (max model calls per stage invocation), `retries` (default 1), `retryDelayMs`, `minDelayMs` (milliseconds or a duration string; `0`, the default, turns each off, otherwise from 1 to 2147483647 ms, else a `RangeError` names the option before any call). |
 | `stream?` | Run realtime items through `ctx.ai.streamText` and collect the text (for hosts that kill an idle connection). Ignored by the batch path. |
 | `system?`, `maxTokens?`, `temperature?` | Forwarded to the model call. No default `temperature` is sent. |
 

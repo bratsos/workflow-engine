@@ -142,7 +142,7 @@ const ai = createAIHelper(topic, aiLogger, undefined, undefined, {
 });
 ```
 
-Per-call `timeoutMs` on text, object, embed and stream options overrides `timeout.perCallMs`. An adapter response may carry `costUsd`, recorded as the reported cost; `AIStreamResult.rawResult` is `undefined` when the stream came from an adapter. Child helpers inherit all three options.
+Per-call `timeoutMs` on text, object, embed and stream options overrides `timeout.perCallMs`. Both must be a number of milliseconds from 1 to 2147483647 (the longest delay a timer honours, about 24.8 days); anything else (`0`, `NaN`, `Infinity`, a negative number, a larger value) throws a `RangeError` naming the option before any request is made (`timeout.perCallMs` when the helper is created); leave both out for no deadline. An adapter response may carry `costUsd`, recorded as the reported cost; `AIStreamResult.rawResult` is `undefined` when the stream came from an adapter. Child helpers inherit all three options.
 
 OpenRouter's "No endpoints found that can handle the requested parameters" is the outcome of `requireParameters: true` excluding endpoints that ignore a requested parameter (typically `maxTokens`); the error names `routing: { requireParameters: false }` as the change to make.
 

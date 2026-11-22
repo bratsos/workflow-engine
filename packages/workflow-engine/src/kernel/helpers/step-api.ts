@@ -39,6 +39,7 @@ import {
   settleOwedOnRow,
 } from "./batch-submit-record.js";
 import { toErrorMessage } from "./error-message.js";
+import { assertTimerMs, timerDurationMs } from "./host-support.js";
 import { createStepAi } from "./step-ai.js";
 
 const DEFAULT_LEASE_MS = 5 * 60 * 1000;
@@ -228,14 +229,15 @@ function nonNegativeInteger(value: number, name: string): number {
 
 /**
  * The lease a `run` step asked for, in milliseconds. `lease` is canonical;
- * `leaseMs` is the deprecated alias and yields to it when both are given.
+ * `leaseMs` is the deprecated alias and yields to it when both are given. It
+ * must fit a timer: `settleInFlight` waits on a timer of the longest remaining
+ * lease, and one above 2147483647 ms fires at once and abandons the step.
  */
 function resolveLeaseMs(opts: StepRunOptions, defaultLeaseMs: number): number {
   const requested = opts.lease ?? opts.leaseMs;
-  return positiveDuration(
-    requested === undefined ? defaultLeaseMs : parseStepDuration(requested),
-    "lease",
-  );
+  return requested === undefined
+    ? defaultLeaseMs
+    : timerDurationMs("lease", requested);
 }
 
 /**
@@ -270,10 +272,7 @@ function resolveHeartbeatMs(
 ): number | undefined {
   if (opts.heartbeat === undefined || opts.heartbeat === false)
     return undefined;
-  const heartbeatMs = positiveDuration(
-    parseStepDuration(opts.heartbeat),
-    "heartbeat",
-  );
+  const heartbeatMs = timerDurationMs("heartbeat", opts.heartbeat);
   if (heartbeatMs >= leaseMs) {
     throw new Error(
       `heartbeat (${heartbeatMs}ms) must be shorter than the lease (${leaseMs}ms) it extends`,
@@ -294,9 +293,9 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
    */
   const requestedIds = new Map<string, StepKeyUse>();
   let pendingControlFlow: StepControlFlowError | undefined;
-  const defaultLeaseMs = positiveDuration(
-    options.defaultLeaseMs ?? DEFAULT_LEASE_MS,
+  const defaultLeaseMs = assertTimerMs(
     "defaultLeaseMs",
+    options.defaultLeaseMs ?? DEFAULT_LEASE_MS,
   );
   const abortSignal = options.abortSignal ?? neverAbortingSignal();
 

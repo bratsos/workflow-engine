@@ -15,6 +15,20 @@ import {
 import { renderIndexHtml, UI_ASSETS } from "./ui-assets";
 
 /**
+ * A poll interval a browser timer can honour: 0 ("off") or
+ * milliseconds up to 2147483647. Local, so the console needs no engine
+ * runtime import.
+ */
+export function assertPollMs(name: string, value: unknown): number {
+  if (typeof value !== "number" || !(value >= 0) || value > 2_147_483_647) {
+    throw new RangeError(
+      `${name} must be a number of milliseconds from 0 to 2147483647 (the longest delay a timer honours, about 24.8 days), got ${String(value)}.`,
+    );
+  }
+  return value;
+}
+
+/**
  * The engine's `RunRedriveFrom`, restated rather than imported: the console
  * types kernel commands structurally (`ConsoleKernel.dispatch`) so it can be
  * mounted against any compatible kernel without a value dependency on one.
@@ -221,6 +235,9 @@ export function createWorkflowConsole(
     cspNonce,
     onAction,
   } = options;
+
+  // 0 pauses polling; anything else becomes a browser timer.
+  assertPollMs("pollIntervalMs", pollIntervalMs);
 
   if (actions && !kernel) {
     throw new Error(
