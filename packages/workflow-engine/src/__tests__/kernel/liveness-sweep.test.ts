@@ -413,10 +413,9 @@ async function assertInterleavings(
   build: () => SweepScenario,
   schedules: readonly InterleavedCommand[][],
   mode: Mode,
-): Promise<number> {
+): Promise<void> {
   const clean = await drive(build, -1, "error");
   const failures: string[] = [];
-  let knownClaimCrashReproductions = 0;
 
   for (let index = 0; index < schedules.length; index++) {
     const result = await runTwoWorkerSchedule(build, schedules[index]!, mode);
@@ -424,25 +423,6 @@ async function assertInterleavings(
     const accepted =
       (await result.scenario.acceptsFaultOutcome?.(result, mode, clean)) ??
       false;
-    const persisted = result.runId
-      ? await result.harness.persistence.getRun(result.runId)
-      : null;
-    const outputError = (
-      persisted?.output as { error?: { code?: string } } | undefined
-    )?.error;
-    // Registered below as a focused it.fails reproduction. At the threshold,
-    // both workers have already dequeued; worker A's reaper enqueues the
-    // missing job, then worker B's reaper can fail its still-PENDING stage
-    // before either worker dequeues again.
-    if (
-      mode === "crash" &&
-      result.faults.firedAt === "persistence.commit" &&
-      persisted?.status === "FAILED" &&
-      outputError?.code === "STUCK_RUN_REAPED"
-    ) {
-      knownClaimCrashReproductions++;
-      continue;
-    }
     if (
       !result.faults.firedAt ||
       (!sameOutcome(result, clean) && !accepted) ||
@@ -458,7 +438,6 @@ async function assertInterleavings(
     failures.length,
     `${failures.length} interleavings failed:\n${failures.slice(0, 12).join("\n")}`,
   ).toBe(0);
-  return knownClaimCrashReproductions;
 }
 
 describe("two interleaved host workers", () => {
@@ -478,40 +457,13 @@ describe("two interleaved host workers", () => {
 
   it("survives one fault across bounded large schedules", async () => {
     const bounded = boundedInterleavings(8);
-    let knownClaimCrashReproductions = 0;
     for (const [name, { build }] of Object.entries(SCENARIOS)) {
       if (small.has(name)) continue;
       for (const mode of ["error", "crash"] as const) {
-        knownClaimCrashReproductions += await assertInterleavings(
-          build,
-          bounded,
-          mode,
-        );
+        await assertInterleavings(build, bounded, mode);
       }
     }
-    expect(knownClaimCrashReproductions).toBeGreaterThan(0);
   }, 300_000);
-
-  // Known defect: after the threshold, worker A's run.reapStuck re-enqueues
-  // the missing job; worker B's later run.reapStuck can fail the still-PENDING
-  // stage before either worker gets another dequeue command. Cause:
-  // run-reap-stuck.ts refreshes the run's activity after a re-enqueue only when
-  // the job transport is transaction-read-bound (the Prisma queue is, the
-  // in-memory one is not), so the run still looks stuck, and the second pass,
-  // which no longer sees a missing job, falls through to the reap.
-  it.fails(
-    "known defect: a second stuck-run reaper fails the recovered PENDING job before dequeue",
-    async () => {
-      const result = await runTwoWorkerSchedule(
-        SCENARIOS["two sequential stages"]!.build,
-        boundedInterleavings(8)[1]!,
-        "crash",
-      );
-      expect(result.faults.firedAt).toBe("persistence.commit");
-      expect(result.status).toBe("COMPLETED");
-    },
-    SWEEP_TIMEOUT_MS,
-  );
 
   it(
     "runs the stage once when a cancelled job is delivered after the redrive",

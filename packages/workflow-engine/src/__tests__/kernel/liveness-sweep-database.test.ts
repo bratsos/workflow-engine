@@ -98,15 +98,19 @@ describe.skipIf(!realDatabase)(
         await db.reset();
       },
       async advanceTime(clock) {
-        // The Prisma queue compares retry deadlines against the database's
-        // wall clock. Translate deadlines that have elapsed on the sweep's
-        // virtual clock so each simulated minute can advance a retry.
+        // The Prisma queue stamps a retry deadline from the host clock and
+        // compares it with the database's clock when it dequeues. Make the
+        // deadlines that have elapsed on the sweep's virtual clock due on any
+        // database clock: restamping them with the host's current time left
+        // them in the future whenever the database clock ran behind the host
+        // by more than the real time of fifteen ticks, and the reaper then
+        // failed the run (STUCK_RUN_REAPED, its job still PENDING).
         await db.client.jobQueue.updateMany({
           where: {
             status: "PENDING",
             nextPollAt: { lte: clock.now() },
           },
-          data: { nextPollAt: new Date() },
+          data: { nextPollAt: new Date(0) },
         });
       },
       create(scenario, clock) {

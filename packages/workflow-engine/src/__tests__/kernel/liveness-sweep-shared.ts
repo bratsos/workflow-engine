@@ -1769,34 +1769,6 @@ export const SCENARIOS: Record<string, SweepCase> = {
         adoptable: true,
         cancelDuringPoll: true,
       }),
-    // Finding 1: the global sweep's #3 write is run.create's completion of its
-    // idempotency key. That write fails after the run transaction committed;
-    // retrying creates an unreturned second run and the batch from the first
-    // run is outside the cancellation target. The same focused fault fails on
-    // Prisma; the default DB sweep omits run.create, so it is registered below.
-    // Fixed on fix/idempotent-create: delete these entries when it is merged.
-    knownDefect: {
-      error:
-        "run.create persistence.completeIdempotencyKey error returns no run after commit; retry creates a second run and strands the first run's batch",
-      crash:
-        "run.create persistence.commit crash leaves its idempotency key in progress after commit; retry creates a second run and strands the first run's batch",
-    },
-    databaseKnownFaults: [
-      {
-        mode: "error",
-        command: "run.create",
-        label: "persistence.completeIdempotencyKey",
-        reason:
-          "run.create completion-key error after commit creates a duplicate run on retry",
-      },
-      {
-        mode: "crash",
-        command: "run.create",
-        label: "persistence.commit",
-        reason:
-          "run.create post-commit crash leaves an in-progress key and creates a duplicate run on retry",
-      },
-    ],
   },
   "run.cancel then redrive replaces the batch": {
     build: () =>
@@ -1807,51 +1779,10 @@ export const SCENARIOS: Record<string, SweepCase> = {
         cancelDuringPoll: true,
         redriveAfterCancel: true,
       }),
-    // Finding 2: the same run.create duplicate after an ambiguous completion
-    // leaves a provider batch owned by an unreturned run; the tracked run is
-    // cancelled and cannot redrive that batch. Fixed on fix/idempotent-create:
-    // delete these entries when it is merged.
-    knownDefect: {
-      error:
-        "run.create persistence.completeIdempotencyKey error returns no run after commit; retry leaves a batch owned by an unreturned run, so the tracked run cannot replace it",
-      crash:
-        "run.create persistence.commit crash leaves its idempotency key in progress after commit; retry leaves a batch owned by an unreturned run, so the tracked run cannot replace it",
-    },
-    databaseKnownFaults: [
-      {
-        mode: "error",
-        command: "run.create",
-        label: "persistence.completeIdempotencyKey",
-        reason:
-          "run.create completion-key error after commit creates a duplicate run and strands its provider batch",
-      },
-      {
-        mode: "crash",
-        command: "run.create",
-        label: "persistence.commit",
-        reason:
-          "run.create post-commit crash leaves an in-progress key and strands its provider batch on retry",
-      },
-    ],
   },
   "a throwing legacy checkCompletion": { build: throwingLegacyCheckCompletion },
   "a legacy checkCompletion that is ready on the second poll": {
     build: legacyCheckCompletionReadyOnSecondPoll,
-    // Finding 5: stage-poll-suspended.ts runs checkCompletion and the writes
-    // that persist its answer (the not-ready commit, the output blob, the
-    // ready commit) in one try block whose catch fails the stage and the run
-    // with the thrown text. A single store error in those writes is
-    // indistinguishable from a throwing checkCompletion and is not retried.
-    // The durable-replay path retries such errors; a crash leaves the stage
-    // SUSPENDED under its claim lease and passes. On main as well.
-    knownDefect: {
-      error:
-        "a store error while stage.pollSuspended persists a legacy checkCompletion's answer (commit, output blob) fails the stage and the run",
-    },
-    databaseKnownDefect: {
-      error:
-        "a store error while stage.pollSuspended persists a legacy checkCompletion's answer (commit, output blob) fails the stage and the run",
-    },
   },
   "a NonRetryableError from a step": { build: nonRetryableStep },
   "a NonRetryableError from a stage body": { build: nonRetryableStageBody },

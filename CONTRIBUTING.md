@@ -28,9 +28,6 @@ runs the same scenarios against Prisma transactions when included by
 `test:sqlite` or `test:pg`; it faults each named persistence, ledger, job, and
 provider write used by the changed handlers. The database subset relies on
 the exhaustive in-memory sweep for writes outside those handler paths.
-The database file also runs focused `run.create` faults for the registered
-idempotency-key defects; those faults were absent from the handler-filtered
-matrix until the in-memory findings were traced to `run.create`.
 After the adapter and kernel suites, the SQLite script runs the sweep file as
 seven name-filtered groups in separate Vitest invocations; it splits the
 redrive sweeps by mode and the cancel sweeps by scenario so each invocation
@@ -38,13 +35,14 @@ stays inside Vitest's worker RPC timeout. Together the groups cover every
 scenario, the late-delivery test and every selected handler write. A scenario
 or test added to the sweep must match one of those name filters.
 It injects faults while dispatching `job.execute`, `stage.pollSuspended`,
-`run.cancel`, and `run.redrive`; outside the focused known-defect reproductions,
-it does not sweep `run.create`, claim/transition, outbox maintenance, or worker
-interleavings. The database host loop expires
-simulated job leases between ticks and runs `run.reapStuck` with the fake clock
-cutoff. When a pending job's retry deadline elapses on the sweep clock, the
-adapter moves that deadline to database wall time so the real queue can dequeue
-it.
+`run.cancel`, and `run.redrive`; it does not sweep `run.create`,
+claim/transition, outbox maintenance, or worker interleavings. The database
+host loop expires simulated job leases between ticks and runs `run.reapStuck`
+with the fake clock cutoff. When a pending job's retry deadline elapses on the
+sweep clock, the adapter makes that deadline due on any clock (the queue stamps
+it from the host clock but dequeues against the database clock), so a database
+clock that runs behind the host cannot hold a retry back until the reaper fails
+the run.
 
 The in-memory file enumerates all 3,432 command-level interleavings for the
 single-step and parallel-group cases. It samples eight evenly spaced schedules
@@ -57,11 +55,18 @@ generation, so that delivery executes the redriven stage once, the redriven
 job's own delivery then meets a COMPLETED stage, and the test checks one body
 run, one `stage:completed` and a completed run. A throwing `checkCompletion`
 is not retried: the poll fails the stage and the run, and the sweep expects that
-outcome after every fault. A legacy `checkCompletion` that is ready on its second
-poll is registered as a known defect for `error` faults: a store error while the
-poll persists its answer fails the stage and the run. The batch transport records whether `cancelIntent` was
-durable before each provider cancel, and the redrive assertion checks that no
-batch with a sent cancel is polled by the new generation.
+outcome after every fault, while a legacy `checkCompletion` that is ready on its
+second poll must complete after any single write failure. The batch transport
+records whether `cancelIntent` was durable before each provider cancel, and the
+redrive assertion checks that no batch with a sent cancel is polled by the new
+generation.
+
+No known defect is registered at present. A defect the sweep finds goes on its
+scenario in `liveness-sweep-shared.ts`: `knownDefect` for the in-memory sweep,
+`databaseKnownDefect` or `backendKnownDefects` for the database sweep, and
+`databaseKnownFaults` for a focused database reproduction. A registered case runs
+under `it.fails`, so it goes red the day the defect is fixed; delete the entry
+then.
 
 The database sweep uses a fake AI batch transport and makes no provider calls.
 Run the SQLite variant with `SQLITE8_KERNEL_SQLITE=1 NODE_ENV=test` and the
