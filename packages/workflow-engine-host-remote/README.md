@@ -63,7 +63,7 @@ const worker = createActivityWorker({
 worker.start();
 ```
 
-See `examples/end-to-end.ts` for the full running example.
+See `examples/end-to-end.ts` for the full running example. Its drive loop is a custom host: it passes the dequeued job's `attempt` and `maxAttempts` to `job.execute`, and so should yours (or call `executeJobWithHeartbeat`). A `job.execute` without `attempt` is treated as an explicit rerun of a `FAILED` stage, which resets its ledger and starts it again.
 
 ## Quickstart — cross-machine model (production)
 
@@ -194,7 +194,7 @@ const kernel = createKernel({
 pnpm dlx tsx examples/cross-process/orchestrator.ts
 ```
 
-The orchestrator spawns the worker via `spawn("pnpm", ["dlx", "tsx", "worker.ts", url, token])`. The worker connects over TCP, leases the "heavy" task, writes its artifact via a presigned `/blob` PUT to the broker's HTTP endpoint, and reports. The orchestrator reads the artifact from the shared `InMemoryObjectStore` and runs the downstream core stage in-process. Output: `doubled=8` (seed 4 → artifact of 4 items → doubled).
+The orchestrator's drive loop passes each dequeued job's `attempt` and `maxAttempts` to `job.execute`; a custom host must, because a dispatch without `attempt` is treated as an explicit rerun of a `FAILED` stage. The orchestrator spawns the worker via `spawn("pnpm", ["dlx", "tsx", "worker.ts", url, token])`. The worker connects over TCP, leases the "heavy" task, writes its artifact via a presigned `/blob` PUT to the broker's HTTP endpoint, and reports. The orchestrator reads the artifact from the shared `InMemoryObjectStore` and runs the downstream core stage in-process. Output: `doubled=8` (seed 4 → artifact of 4 items → doubled).
 
 ## Hosting on other platforms
 

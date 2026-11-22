@@ -42,6 +42,7 @@
  * takes no part in that transaction — only after the commit.
  */
 
+import { SIGNAL_WAKE, signalWakeKey } from "../handlers/step-signal.js";
 import type { KernelDeps } from "../kernel.js";
 import type { StepLedger, StepRecord } from "../ports.js";
 
@@ -169,4 +170,17 @@ export async function resetStageStepsForFreshAttempt(
   }
 
   await applyStepLedgerReset(ledger, stageRecordId, plan);
+
+  // A dropped signal row takes its wake claim with it, so the next signal
+  // wakes the stage again whatever its timestamps are. Only once the clear
+  // has gone through: while the row is still there, or if the clear fails, a
+  // signal sent again for it is still answered by its claim and wakes
+  // nothing twice.
+  for (const row of plan.dropped) {
+    if (row.kind !== "signal") continue;
+    await deps.persistence.releaseIdempotencyKey(
+      signalWakeKey(stageRecordId, row.stepId),
+      SIGNAL_WAKE,
+    );
+  }
 }

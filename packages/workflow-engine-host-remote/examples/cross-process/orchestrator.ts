@@ -157,6 +157,9 @@ async function main(): Promise<void> {
         workflowRunId,
         workflowId: WORKFLOW_ID,
         stageId: job.stageId,
+        // A delivery without `attempt` is an explicit rerun of a FAILED stage.
+        attempt: job.attempt,
+        maxAttempts: job.maxAttempts,
         config: {},
       });
 

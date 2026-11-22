@@ -50,7 +50,7 @@ describe("missing blob on replay", () => {
     // key and the requirement instead of "missing the output of execution
     // group 1".
     await expect(harness.run("missing-blob", { v: 1 })).rejects.toThrow(
-      /Blob ".*\/first\/output\.json" .*share one BlobStore/,
+      /Blob ".*\/first\/attempts\/[^/]+\/output\.json" .*share one BlobStore/,
     );
   });
 });

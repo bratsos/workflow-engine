@@ -72,17 +72,24 @@ async function deliverSignal(
   // must still retry its wake; this key commits with the wake and outbox event.
   // It records which row woke the stage: a ledger reset drops that row, so the
   // next signal completes a new one and that delivery must wake the stage too.
+  // A row is told apart by its completion time and, for a replacement written
+  // in the same tick, by its creation time, position and attempt. A claim
+  // stored before `row` existed carries `delivery` alone and stays valid.
   const wake = async (record: StepRecord, alreadyCompleted: boolean) => {
     const delivery = record.updatedAt.getTime();
+    const row = [record.createdAt.getTime(), record.seq, record.attempt];
     await deps.persistence.withTransaction(async (tx) => {
       const key = signalWakeKey(stage.id, command.stepId);
       let claim = await tx.acquireIdempotencyKey(key, SIGNAL_WAKE);
-      if (
-        claim.status === "replay" &&
-        (claim.result as { delivery?: number }).delivery !== delivery
-      ) {
-        await tx.releaseIdempotencyKey(key, SIGNAL_WAKE);
-        claim = await tx.acquireIdempotencyKey(key, SIGNAL_WAKE);
+      if (claim.status === "replay") {
+        const woken = claim.result as { delivery?: number; row?: number[] };
+        if (
+          woken.delivery !== delivery ||
+          (woken.row && woken.row.join() !== row.join())
+        ) {
+          await tx.releaseIdempotencyKey(key, SIGNAL_WAKE);
+          claim = await tx.acquireIdempotencyKey(key, SIGNAL_WAKE);
+        }
       }
       if (claim.status === "replay") return;
       if (claim.status === "in_progress") {
@@ -105,6 +112,7 @@ async function deliverSignal(
       await tx.completeIdempotencyKey(key, SIGNAL_WAKE, {
         signalled: true,
         delivery,
+        row,
       });
     });
     return {

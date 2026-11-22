@@ -198,7 +198,9 @@ export interface JobExecuteResult {
    * Only set alongside `ghost`. Distinguishes the two reasons a job can
    * find its run not RUNNING:
    *  - `"orphan"` — the run is CANCELLED/COMPLETED/FAILED, or was made so
-   *    mid-execution. The job is meaningless and must be thrown away.
+   *    mid-execution, or the stage was reopened or taken over by another
+   *    delivery while the body ran (its result is discarded). The job is
+   *    meaningless and must be thrown away.
    *  - `"race"` — the run is still PENDING, i.e. its claim had not
    *    committed when this job was dequeued. The job is valid and simply
    *    arrived early: it must be re-delivered, not discarded, or the run
@@ -221,7 +223,10 @@ export interface JobExecuteResult {
    * PENDING with the error on `errorMessage`) because the command carried
    * `attempt`/`maxAttempts` with attempts remaining and the error was not
    * deterministic. The host must re-enqueue the job
-   * (`jobTransport.fail(jobId, error, true)`).
+   * (`jobTransport.fail(jobId, error, true)`). `false` with `outcome:
+   * "failed"` and no `ghost` is also what a delivery gets that finds its
+   * stage already `FAILED`: the job is dead, nothing ran, and the host fails
+   * the job and the run.
    */
   readonly willRetry?: boolean;
   /** The job attempt that ran, echoed from the command when it carried one. */
