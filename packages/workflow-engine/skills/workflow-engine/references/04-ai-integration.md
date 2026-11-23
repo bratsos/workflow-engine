@@ -196,14 +196,15 @@ and pass their USD `cost`. A supplied cost bypasses the model registry and
 uses the supplied `modelKey` as the recorded model ID. It defaults to
 `costSource: "reported"`; set `"estimated"` for a supplied estimate.
 
-Callers receive provider errors unchanged. Under `store: "none"` or a TTL,
-the engine's own outputs describe a failed AI call by its error name and HTTP
-status instead of its message. These outputs are AI call rows, stage and step
-error columns, engine-written logs, events, outbox payloads, console reads and
-the engine's console and trace lines. This covers helper errors, stream and
-tool errors read from `rawResult`, errors carrying one as `cause`, and
-messages that repeat their text. Text your stage writes itself is not
-covered. Detailed provider warnings and error text require both trace flags.
+Text capture controls the AI call row and trace output only. Under
+`store: "none"` or a TTL, a failed call's row records the error's name and
+HTTP status instead of its message, and a failed batch item's row records
+`Batch request failed`. A provider error message can contain text the
+provider echoed from the request. Outside the row, provider errors are
+stored and passed on as in earlier releases: values thrown to callers and
+the SDK, stage and step error columns, events, outbox payloads, workflow logs
+and console reads. The engine's console lines include provider warnings and
+error text only with both trace flags.
 Use those flags only for data you intend to send to process diagnostics.
 
 The accounting policy covers the prompt, response and top-level instructions.
