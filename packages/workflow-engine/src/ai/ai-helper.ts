@@ -38,7 +38,10 @@ import {
   generateText as generateTextImpl,
 } from "./generate";
 import { getModel, type ModelKey } from "./model-helper";
-import { traceProviderDiagnostic } from "./provider-diagnostics.js";
+import {
+  forwardingProxy,
+  traceProviderDiagnostic,
+} from "./provider-diagnostics.js";
 import { calculateCostWithDiscount, logger } from "./shared";
 import { streamText as streamTextImpl } from "./stream";
 import { transcribe as transcribeImpl } from "./transcribe";
@@ -78,6 +81,19 @@ import { AICallWriteTracker } from "./write-tracker";
 // ============================================================================
 // AIHelper Implementation
 // ============================================================================
+
+const callLoggers = new WeakMap<AIHelper, AICallLogger>();
+const withholding = new WeakSet<AIHelper>();
+
+/** Whether a helper made here keeps call text out of engine outputs. */
+export function helperWithholdsText(helper: AIHelper): boolean {
+  return withholding.has(helper);
+}
+
+/** The policy-applying logger of a helper made here, including children. */
+export function callLoggerOf(helper: AIHelper): AICallLogger | undefined {
+  return callLoggers.get(helper);
+}
 
 class AIHelperImpl implements AIHelper {
   readonly topic: string;
@@ -125,14 +141,12 @@ class AIHelperImpl implements AIHelper {
       flush: (config) => this.flush(config),
     };
     // Reads and any logger-specific members are those of the configured logger.
-    this.trackedLogger = new Proxy(aiCallLogger, {
-      get(target, key) {
-        if (Object.hasOwn(writes, key))
-          return writes[key as keyof AICallLogger];
-        const value: unknown = Reflect.get(target, key, target);
-        return typeof value === "function" ? value.bind(target) : value;
-      },
-    });
+    this.trackedLogger = forwardingProxy(aiCallLogger, (key, value) =>
+      Object.hasOwn(writes, key) ? writes[key as keyof AICallLogger] : value,
+    );
+    callLoggers.set(this, this.trackedLogger);
+    if (options?.text?.store === "none" || options?.text?.ttlMs !== undefined)
+      withholding.add(this);
 
     // Create batch log function if logContext is provided
     if (logContext) {
@@ -238,6 +252,7 @@ class AIHelperImpl implements AIHelper {
       aiCallLogger: this.trackedLogger,
       beginOperation: () => this.writes.begin(),
       onAccountingError: () => this.writes.fail(),
+      withholdsText: withholding.has(this),
       providerResolver: this.providerResolver,
       routing: this.options?.routing,
       adapter: this.options?.adapter,

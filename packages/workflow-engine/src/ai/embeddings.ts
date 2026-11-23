@@ -12,10 +12,7 @@ import { openrouter } from "@openrouter/ai-sdk-provider";
 import { embed as aiEmbed, embedMany } from "ai";
 import { logFailure } from "./generate";
 import { getModel, type ModelConfig, type ModelKey } from "./model-helper";
-import {
-  protectProviderWarnings,
-  providerError,
-} from "./provider-diagnostics.js";
+import { protectProviderWarnings } from "./provider-diagnostics.js";
 import {
   assertAdapterProviderPolicy,
   assertDirectProviderPolicy,
@@ -272,7 +269,7 @@ export async function embed(
       error: errorMessage,
       durationMs,
     });
-    throw providerError(error, "Provider embedding call failed");
+    throw error;
   } finally {
     timeout.cleanup();
   }

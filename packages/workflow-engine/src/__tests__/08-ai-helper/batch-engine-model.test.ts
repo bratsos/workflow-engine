@@ -274,7 +274,7 @@ describe("Batch Subsystem - AI SDK Adapter (fromAiSdk)", () => {
       completed: 9,
       failed: 1,
     });
-    expect(status.error).toBe("The provider reported a batch failure");
+    expect(status.error).toBe("Partial failure");
   });
 
   it("streams and maps results for all four item statuses (succeeded, failed, cancelled, expired)", async () => {
@@ -353,19 +353,19 @@ describe("Batch Subsystem - AI SDK Adapter (fromAiSdk)", () => {
     expect(items[1]).toEqual({
       id: "req-2",
       status: "failed",
-      error: "The provider reported a batch item failure",
+      error: "Content policy violation",
     });
 
     expect(items[2]).toEqual({
       id: "req-3",
       status: "cancelled",
-      error: "The provider reported a batch item failure",
+      error: "Batch was cancelled",
     });
 
     expect(items[3]).toEqual({
       id: "req-4",
       status: "expired",
-      error: "The provider reported a batch item failure",
+      error: "Batch expired before processing",
     });
   });
 
@@ -681,11 +681,7 @@ describe("Batch Subsystem - AI SDK Adapter (fromAiSdk)", () => {
         inputTokens: 7,
         outputTokens: 3,
       },
-      {
-        id: "r2",
-        status: "failed",
-        error: "The provider reported a batch item failure",
-      },
+      { id: "r2", status: "failed", error: "content filtered" },
     ]);
   });
 
@@ -999,8 +995,10 @@ describe("Batch Subsystem - OpenRouter Fetch Client (createOpenRouterBatchModel)
       modelId: "openai/gpt-4o",
     });
     expect(status.status).toBe("failed");
-    expect(status.rawStatus).toBeUndefined();
-    expect(status.error).toMatch(/Unrecognized OpenRouter batch status/);
+    expect(status.rawStatus).toBe("quota_exceeded");
+    expect(status.error).toMatch(
+      /Unrecognized OpenRouter batch status "quota_exceeded"/,
+    );
   });
 
   it("accepts null for optional fields and never synthesizes a zero total", async () => {
@@ -1235,7 +1233,7 @@ describe("Batch Subsystem - OpenRouter Fetch Client (createOpenRouterBatchModel)
     expect(items[1]).toEqual({
       id: "req-err-field",
       status: "failed",
-      error: "OpenRouter reported a batch item failure",
+      error: "Provider rate limit exceeded on item",
       inputTokens: 0,
       outputTokens: 0,
     });
@@ -1243,7 +1241,7 @@ describe("Batch Subsystem - OpenRouter Fetch Client (createOpenRouterBatchModel)
     expect(items[2]).toEqual({
       id: "req-http-err",
       status: "failed",
-      error: "OpenRouter batch item failed with status 400",
+      error: "Invalid response schema requested",
       inputTokens: 0,
       outputTokens: 0,
     });

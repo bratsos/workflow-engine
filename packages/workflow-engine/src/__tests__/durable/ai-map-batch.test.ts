@@ -237,7 +237,7 @@ describe("step.ai.map batch policy", () => {
     expect(warns).toHaveLength(1);
     expect(warns[0]!.message).toContain("20 of 25 results in batch batch-1");
     expect(warns[0]!.message).toContain("20 failed schema validation");
-    expect(warns[0]!.message).not.toContain("first issue:");
+    expect(warns[0]!.message).toContain("first issue:");
     // The repair pass still fixed every item realtime.
     expect(h.mock.getCalls()).toHaveLength(20);
     expect(h.results().every((r) => r.status === "succeeded")).toBe(true);
@@ -270,7 +270,7 @@ describe("step.ai.map batch policy", () => {
         "20 of 25 requests in batch batch-1 failed at the provider",
       ),
       expect.stringContaining(
-        "20 of 25 results in batch batch-1 failed: 20 failed at the provider.",
+        "20 of 25 results in batch batch-1 failed: 20 failed at the provider (first error: Request contains an invalid argument.)",
       ),
     ]);
     // Every provider-failed item was re-run realtime by the repair pass.
@@ -416,10 +416,7 @@ describe("step.ai.map batch policy", () => {
     const results = h.results();
     expect(results).toHaveLength(25);
     expect(results.every((r) => r.status === "failed")).toBe(true);
-    expect(results[0]).toMatchObject({
-      error: "The provider reported a batch failure",
-      attempts: 1,
-    });
+    expect(results[0]).toMatchObject({ error: "expired", attempts: 1 });
     expect(h.mock.getCalls()).toHaveLength(0);
   });
 
@@ -429,7 +426,7 @@ describe("step.ai.map batch policy", () => {
     const result = await h.execute();
     expect(result.outcome).toBe("failed");
     expect(String((result as { error?: string }).error)).toMatch(
-      /batch "batch-1" failed: The provider reported a batch failure/,
+      /batch "batch-1" failed: expired/,
     );
   });
 });

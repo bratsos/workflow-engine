@@ -15,10 +15,7 @@ import { transcribe as aiTranscribe } from "ai";
 import { isMissingPackageError } from "./batch/ai-sdk";
 import { logFailure } from "./generate";
 import { getModel, type ModelConfig, type ModelKey } from "./model-helper";
-import {
-  protectProviderWarnings,
-  providerError,
-} from "./provider-diagnostics.js";
+import { protectProviderWarnings } from "./provider-diagnostics.js";
 import {
   assertDirectProviderPolicy,
   calculateCostWithDiscount,
@@ -294,7 +291,7 @@ export async function transcribe(
       error: errorMessage,
       durationMs,
     });
-    throw providerError(error, "Provider transcribe call failed");
+    throw error;
   } finally {
     timeout.cleanup();
   }

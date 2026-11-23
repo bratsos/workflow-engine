@@ -8,6 +8,8 @@
  * response data. Use both flags only when debugging with safe data.
  */
 
+import { withheldErrorSummary } from "../kernel/helpers/error-message.js";
+
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
 export interface Logger {
@@ -37,6 +39,11 @@ const textFields = new Set([
   "responseBody",
 ]);
 
+/** A withheld AI call error prints as its summary, at every level. */
+function printable(args: unknown[]): unknown[] {
+  return args.map((arg) => withheldErrorSummary(arg) ?? arg);
+}
+
 function traceArgs(args: unknown[]): unknown[] {
   return args.map((arg) => {
     if (arg === null || typeof arg !== "object" || Array.isArray(arg))
@@ -60,7 +67,7 @@ function trace(prefix: string, message: string, args: unknown[]): void {
     if (prefix === "JobQueue") {
       message = message.replace(/^(Job .+? failed permanently):[\s\S]*$/, "$1");
     }
-    args = traceArgs(args);
+    args = printable(traceArgs(args));
   }
   console.log(formatMessage(prefix, message), ...args);
 }
@@ -84,10 +91,10 @@ export function createLogger(prefix: string): Logger {
       trace(prefix, message, args),
     info: (message: string, ...args: unknown[]) => trace(prefix, message, args),
     warn: (message: string, ...args: unknown[]) => {
-      console.warn(formatMessage(prefix, message), ...args);
+      console.warn(formatMessage(prefix, message), ...printable(args));
     },
     error: (message: string, ...args: unknown[]) => {
-      console.error(formatMessage(prefix, message), ...args);
+      console.error(formatMessage(prefix, message), ...printable(args));
     },
   };
 }

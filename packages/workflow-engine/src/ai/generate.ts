@@ -10,12 +10,12 @@ import type { SharedV4ProviderOptions } from "@ai-sdk/provider";
 import type { ToolSet } from "ai";
 import { generateText as aiGenerateText, Output } from "ai";
 import type { z } from "zod";
-import { AICallTimeoutError } from "./errors";
+import { toErrorMessage } from "../kernel/helpers/error-message.js";
 import { getModel, type ModelKey } from "./model-helper";
 import {
-  originalProviderError,
+  markAICallError,
   protectProviderWarnings,
-  providerError,
+  traceProviderDiagnostic,
 } from "./provider-diagnostics.js";
 import {
   assertAdapterProviderPolicy,
@@ -234,18 +234,15 @@ export function logFailure(
   },
 ): { errorMessage: string; durationMs: number } {
   const durationMs = Date.now() - params.startTime;
-  const safeError =
-    params.error instanceof AICallTimeoutError
-      ? `Timed out after ${params.error.timeoutMs}ms`
-      : "Provider call failed";
-  const errorMessage = safeError;
+  const errorMessage = toErrorMessage(markAICallError(ctx, params.error));
+  traceProviderDiagnostic(`${params.callType} call failed`, params.error);
   const steps = params.steps ?? [];
   // A call that reached the model and failed afterwards still consumed tokens.
   const accounting =
     params.accounting ??
     resolveFailureAccounting(
       params.modelKey,
-      originalProviderError(params.error),
+      params.error,
       steps,
       params.result,
     );
@@ -283,7 +280,7 @@ export function logFailure(
       ...(servedBySteps !== undefined ? { servedBySteps } : {}),
       durationMs,
       status: "error",
-      error: safeError,
+      error: errorMessage,
     },
   });
 
@@ -582,9 +579,9 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
       error: errorMessage,
       durationMs,
     });
-    throw providerError(
+    throw markAICallError(
+      ctx,
       explainRoutingError(error, ctx.routing, modelKey),
-      "Provider generation failed",
     );
   } finally {
     timeout.cleanup();
@@ -818,9 +815,9 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
       error: errorMessage,
       durationMs,
     });
-    throw providerError(
+    throw markAICallError(
+      ctx,
       explainRoutingError(error, ctx.routing, modelKey),
-      "Provider structured generation failed",
     );
   } finally {
     timeout.cleanup();

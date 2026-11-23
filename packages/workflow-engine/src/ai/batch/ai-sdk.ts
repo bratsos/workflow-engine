@@ -8,12 +8,6 @@ import type {
   SharedV4ProviderOptions,
   SharedV4Warning,
 } from "@ai-sdk/provider";
-import {
-  callProvider,
-  knownProviderBatchStatus,
-  providerError,
-  providerStatus,
-} from "../provider-diagnostics.js";
 import { toPortableJsonSchema } from "../schema-portability";
 import { assertDirectProviderPolicy } from "../shared";
 import {
@@ -475,16 +469,10 @@ function buildEngineBatchModel(
         };
       });
 
-      const startResult = await callProvider(
-        "Provider batch creation failed",
-        () =>
-          seam.start(batchRequests, {
-            ...(callOpts?.abortSignal
-              ? { abortSignal: callOpts.abortSignal }
-              : {}),
-            ...(callOpts?.headers ? { headers: callOpts.headers } : {}),
-          }),
-      );
+      const startResult = await seam.start(batchRequests, {
+        ...(callOpts?.abortSignal ? { abortSignal: callOpts.abortSignal } : {}),
+        ...(callOpts?.headers ? { headers: callOpts.headers } : {}),
+      });
 
       const ref: EngineBatchRef = {
         version: 1,
@@ -497,12 +485,9 @@ function buildEngineBatchModel(
       return {
         ...ref,
         status: mapAiSdkStatus(startResult.status),
-        rawStatus: knownProviderBatchStatus(startResult.rawStatus),
+        rawStatus: startResult.rawStatus,
         requestCounts: mapRequestCounts(startResult.requestCounts),
-        error: providerStatus(
-          startResult.error?.message,
-          "The provider reported a batch creation failure",
-        ),
+        error: startResult.error?.message,
       };
     },
 
@@ -513,22 +498,17 @@ function buildEngineBatchModel(
         headers?: Record<string, string>;
       },
     ): Promise<EngineBatchStatus> {
-      const res = await callProvider("Provider batch status check failed", () =>
-        seam.status({
-          batchId: ref.id,
-          abortSignal: callOpts?.abortSignal,
-          headers: callOpts?.headers,
-        }),
-      );
+      const res = await seam.status({
+        batchId: ref.id,
+        abortSignal: callOpts?.abortSignal,
+        headers: callOpts?.headers,
+      });
 
       return {
         status: mapAiSdkStatus(res.status),
-        rawStatus: knownProviderBatchStatus(res.rawStatus),
+        rawStatus: res.rawStatus,
         requestCounts: mapRequestCounts(res.requestCounts),
-        error: providerStatus(
-          res.error?.message,
-          "The provider reported a batch failure",
-        ),
+        error: res.error?.message,
         // Anthropic reports a cancelled batch as `ended`; only the cancel
         // timestamp says so (see `batchPhase`).
         ...(batchPhase(res) === "cancelled" ? { cancelled: true } : {}),
@@ -551,25 +531,22 @@ function buildEngineBatchModel(
               abortSignal: callOpts?.abortSignal,
               headers: callOpts?.headers,
             };
-            const current = await callProvider(
-              "Provider batch status check failed",
-              () => seam.status(call),
-            );
+            const current = await seam.status(call);
             const phase = batchPhase(current);
-            const rawStatus = knownProviderBatchStatus(current.rawStatus);
             if (phase === "ended") {
               return {
                 outcome: "already-terminal" as const,
-                ...(rawStatus !== undefined ? { rawStatus } : {}),
+                ...(current.rawStatus !== undefined
+                  ? { rawStatus: current.rawStatus }
+                  : {}),
               };
             }
-            if (phase === "active")
-              await callProvider("Provider batch cancellation failed", () =>
-                seam.cancel!(call),
-              );
+            if (phase === "active") await seam.cancel!(call);
             return {
               outcome: "cancelled" as const,
-              ...(rawStatus !== undefined ? { rawStatus } : {}),
+              ...(current.rawStatus !== undefined
+                ? { rawStatus: current.rawStatus }
+                : {}),
             };
           },
         }
@@ -582,41 +559,34 @@ function buildEngineBatchModel(
         headers?: Record<string, string>;
       },
     ): AsyncIterable<EngineBatchItemResult> {
-      try {
-        const stream = await seam.results({
-          batchId: ref.id,
-          abortSignal: callOpts?.abortSignal,
-          headers: callOpts?.headers,
-        });
+      const stream = await seam.results({
+        batchId: ref.id,
+        abortSignal: callOpts?.abortSignal,
+        headers: callOpts?.headers,
+      });
 
-        for await (const item of readableStreamToAsyncIterable(stream)) {
-          if (item.status === "succeeded") {
-            const textParts = (item.result.content ?? []).filter(
-              (part): part is LanguageModelV4Text => part.type === "text",
-            );
-            const text = textParts.map((p) => p.text).join("");
-            const inputTokens = item.result.usage?.inputTokens?.total ?? 0;
-            const outputTokens = item.result.usage?.outputTokens?.total ?? 0;
-            yield {
-              id: item.id,
-              status: "succeeded",
-              text,
-              inputTokens,
-              outputTokens,
-            };
-          } else {
-            yield {
-              id: item.id,
-              status: item.status,
-              error: providerStatus(
-                item.error?.message,
-                "The provider reported a batch item failure",
-              ),
-            };
-          }
+      for await (const item of readableStreamToAsyncIterable(stream)) {
+        if (item.status === "succeeded") {
+          const textParts = (item.result.content ?? []).filter(
+            (part): part is LanguageModelV4Text => part.type === "text",
+          );
+          const text = textParts.map((p) => p.text).join("");
+          const inputTokens = item.result.usage?.inputTokens?.total ?? 0;
+          const outputTokens = item.result.usage?.outputTokens?.total ?? 0;
+          yield {
+            id: item.id,
+            status: "succeeded",
+            text,
+            inputTokens,
+            outputTokens,
+          };
+        } else {
+          yield {
+            id: item.id,
+            status: item.status,
+            error: item.error?.message,
+          };
         }
-      } catch (error) {
-        throw providerError(error, "Provider batch results fetch failed");
       }
     },
   };

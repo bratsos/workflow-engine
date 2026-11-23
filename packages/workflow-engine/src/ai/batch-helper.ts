@@ -7,10 +7,13 @@
 import { z } from "zod";
 import { stepExternalKeyPart } from "../core/step-external-key";
 import {
+  toErrorMessage,
+  withholdErrorText,
+} from "../kernel/helpers/error-message.js";
+import {
   getProviderModelId,
   resolveModelForProvider,
 } from "../utils/batch/model-mapping";
-import { isTraceTextEnabled } from "../utils/logger";
 import { isCancelledRawStatus } from "./batch/adoption";
 import { isNotBatchCapableError, resolveAiSdkBatchModel } from "./batch/ai-sdk";
 import {
@@ -27,10 +30,7 @@ import {
   openRouterBatchProvider,
 } from "./batch/openrouter";
 import { getModel, type ModelKey } from "./model-helper";
-import {
-  providerError,
-  traceProviderDiagnostic,
-} from "./provider-diagnostics.js";
+import { markAICallError } from "./provider-diagnostics.js";
 import { restorePortableValue } from "./schema-portability";
 import {
   assertAdapterProviderPolicy,
@@ -632,8 +632,13 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
           createdRefs.length > 0
             ? `. Successfully created ${createdRefs.length} batch(es) before failure: [${createdIds}]`
             : ""
-        }: ${providerError(err, "Provider batch submission failed").message}`;
-        throw new BatchSubmitError(errMsg, createdRefs);
+        }: ${err instanceof Error ? err.message : String(err)}`;
+        const batchError = new BatchSubmitError(errMsg, createdRefs);
+        if (err instanceof Error && err.stack) {
+          batchError.stack = `${batchError.stack}\nCaused by: ${err.stack}`;
+        }
+        markAICallError(this.ctx, err);
+        throw markAICallError(this.ctx, batchError);
       }
     }
 
@@ -722,19 +727,18 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
     const { batchModel, provider } = await this.transport(this.provider);
     const refs = this.resolveRefs(batchId, metadata, batchModel);
 
-    const statuses = await Promise.all(
-      refs.map((ref) =>
-        Promise.resolve()
-          .then(() =>
-            batchModel.status(ref, {
-              abortSignal: this.options?.abortSignal,
-            }),
-          )
-          .catch((error: unknown) => {
-            throw providerError(error, "Provider batch status check failed");
+    let statuses: Awaited<ReturnType<typeof batchModel.status>>[];
+    try {
+      statuses = await Promise.all(
+        refs.map((ref) =>
+          batchModel.status(ref, {
+            abortSignal: this.options?.abortSignal,
           }),
-      ),
-    );
+        ),
+      );
+    } catch (error) {
+      throw markAICallError(this.ctx, error);
+    }
 
     // Aggregate status across refs: failed if any failed; completed only if all completed; else processing/pending
     let aggregatedStatus: "pending" | "processing" | "completed" | "failed";
@@ -770,12 +774,8 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
     const errors = statuses
       .map((s) => s.error)
       .filter((e): e is string => typeof e === "string" && e.length > 0);
-    if (errors.length > 0)
-      traceProviderDiagnostic("Provider batch status", errors.join("; "));
-    const aggregatedError =
-      hasFailed || errors.length > 0
-        ? "The provider reported a batch failure"
-        : undefined;
+    const aggregatedError = errors.length > 0 ? errors.join("; ") : undefined;
+    if (this.ctx.withholdsText) withholdErrorText(aggregatedError);
 
     // Per-item provider failures are visible in the counts as soon as the
     // batch settles; say so at the poll, not only after collect.
@@ -835,20 +835,17 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
     }
     const settled = await Promise.allSettled(
       refs.map((ref) =>
-        Promise.resolve().then(() =>
-          cancel(ref, {
-            ...(this.options?.abortSignal
-              ? { abortSignal: this.options.abortSignal }
-              : {}),
-          }),
-        ),
+        cancel(ref, {
+          ...(this.options?.abortSignal
+            ? { abortSignal: this.options.abortSignal }
+            : {}),
+        }),
       ),
     );
     const failed = settled.find(
       (s): s is PromiseRejectedResult => s.status === "rejected",
     );
-    if (failed)
-      throw providerError(failed.reason, "Provider batch cancellation failed");
+    if (failed) throw markAICallError(this.ctx, failed.reason);
     return refs.map((ref, i) => ({
       ref,
       outcome: (
@@ -861,7 +858,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
     try {
       yield* model.results(ref, { abortSignal: this.options?.abortSignal });
     } catch (error) {
-      throw providerError(error, "Provider batch results fetch failed");
+      throw markAICallError(this.ctx, error);
     }
   }
 
@@ -974,7 +971,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
             inputTokens,
             outputTokens,
             status: "failed",
-            error: "The provider reported a batch item failure",
+            error,
             validated: false,
             ...accountingFields(item),
           });
@@ -1022,7 +1019,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
               inputTokens,
               outputTokens,
               status: "failed",
-              error: "Failed to parse JSON response for schema validation",
+              error: `Failed to parse JSON response for schema validation: ${parseError}`,
               validated: false,
               responseText: item.text,
               ...accountingFields(item),
@@ -1042,17 +1039,17 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
                 : parsedJson;
             validation = schema.safeParse(candidate);
           } catch (schemaErr) {
-            traceProviderDiagnostic(
-              "Batch response validation threw",
-              schemaErr,
-            );
+            const errText =
+              schemaErr instanceof Error
+                ? schemaErr.message
+                : String(schemaErr);
             results.push({
               id: customId,
               prompt: promptFor(customId),
               inputTokens,
               outputTokens,
               status: "failed",
-              error: "Schema validation threw an error",
+              error: `Schema validation threw an error: ${errText}`,
               validated: false,
               responseText: item.text,
               ...accountingFields(item),
@@ -1069,7 +1066,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
               inputTokens,
               outputTokens,
               status: "failed",
-              error: "Response did not match the request's schema",
+              error: `Response did not match the request's schema: ${validation.error.message}`,
               validated: false,
               responseText: item.text,
               ...accountingFields(item),
@@ -1125,6 +1122,9 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
       }
     }
 
+    // Item errors quote provider responses and model output.
+    const withhold = this.ctx.withholdsText;
+    if (withhold) for (const r of results) withholdErrorText(r.error);
     const failures = schemaFailures + providerFailures;
     if (results.length > 0 && failures * 2 > results.length) {
       // Every failed item is re-run realtime by the map's repair pass, so
@@ -1133,19 +1133,12 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
       // provider failures are the endpoint rejecting the request itself.
       const classes = [
         schemaFailures > 0
-          ? `${schemaFailures} failed schema validation`
+          ? `${schemaFailures} failed schema validation${withhold ? "" : ` (first issue: ${firstSchemaIssue ?? "unknown"})`}`
           : undefined,
         providerFailures > 0
-          ? `${providerFailures} failed at the provider`
+          ? `${providerFailures} failed at the provider${withhold ? "" : ` (first error: ${firstProviderError ?? "unknown"})`}`
           : undefined,
       ].filter((c): c is string => c !== undefined);
-      if (isTraceTextEnabled()) {
-        logger.debug("Batch result errors", {
-          batchId,
-          firstSchemaIssue,
-          firstProviderError,
-        });
-      }
       const warnMsg = `[Batch] ${failures} of ${results.length} results in batch ${batchId} failed: ${classes.join("; ")}.`;
       const meta = {
         batchId,
@@ -1191,14 +1184,14 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
       return inFlight;
     }
 
+    // Visible to flush before the duplicate check's first await.
     const endCheck = this.ctx.beginOperation?.();
     const recordPromise = (async () => {
       try {
         if (
           await this.isRecorded(batchId).catch((error: unknown) => {
             this.ctx.onAccountingError?.(error);
-            traceProviderDiagnostic("Batch accounting lookup failed", error);
-            throw new Error("Batch accounting lookup failed");
+            throw error;
           })
         ) {
           logger.debug(`Batch ${batchId} already recorded, skipping.`);
@@ -1209,6 +1202,8 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
         const modelConfig = getModel(this.modelKey);
         const provider = extra.provider ?? this.provider;
 
+        if (this.ctx.withholdsText)
+          for (const r of results) withholdErrorText(r.error);
         const write = this.ctx.aiCallLogger.logBatchResults(
           batchId,
           results.map((r) => {
@@ -1264,7 +1259,15 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
                 ...(extra.batchDurationMs !== undefined
                   ? { batchDurationMs: extra.batchDurationMs }
                   : {}),
-                ...(r.status === "failed" ? { status: "failed" } : {}),
+                ...(r.status === "failed"
+                  ? {
+                      status: "failed",
+                      error:
+                        this.ctx.withholdsText && r.error !== undefined
+                          ? toErrorMessage(r.error)
+                          : r.error,
+                    }
+                  : {}),
               },
             };
           }),

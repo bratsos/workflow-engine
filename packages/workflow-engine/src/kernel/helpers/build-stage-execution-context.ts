@@ -1,4 +1,4 @@
-import { createAIHelper } from "../../ai/ai-helper.js";
+import { callLoggerOf, createAIHelper } from "../../ai/ai-helper.js";
 import type {
   AIHelper,
   LogContext,
@@ -118,7 +118,8 @@ export function defineLazyAIContext<T extends object>(
       enumerable: true,
       configurable: true,
       get: () => {
-        getHelper();
+        const own = callLoggerOf(getHelper());
+        if (own) return own;
         if (!boundLogger) {
           // A custom implementation can omit the binding supplied by createAIHelper.
           // Its capture policy is unknown, so use a text-free logger for direct writes.

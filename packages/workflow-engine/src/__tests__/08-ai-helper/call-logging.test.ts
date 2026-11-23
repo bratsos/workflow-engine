@@ -8,6 +8,7 @@ import {
   registerEvaluationProvider,
 } from "../../ai/ai-helper.js";
 import { registerModels } from "../../ai/model-helper.js";
+import { toErrorMessage } from "../../kernel/helpers/error-message.js";
 import { isRetryableStageError } from "../../kernel/helpers/stage-retry.js";
 import type {
   AICallLogger,
@@ -102,6 +103,7 @@ it("only emits request, response and provider error text with the text trace fla
   try {
     const logger = new InMemoryAICallLogger();
     const ai = createAIHelper("accounting", logger, undefined, undefined, {
+      text: { store: "none" },
       adapter: {
         async generateText({ prompt }) {
           if (prompt === "fail") throw new Error("error body marker");
@@ -121,9 +123,10 @@ it("only emits request, response and provider error text with the text trace fla
       });
       await ai.generateText(modelKey, "request marker");
       await ai.embed(modelKey, "embedding marker");
-      const failure = ai.generateText(modelKey, "fail");
-      await expect(failure).rejects.toThrow("Provider generation failed");
-      await expect(failure).rejects.not.toHaveProperty("cause");
+      // The caller gets the provider's error unchanged.
+      await expect(ai.generateText(modelKey, "fail")).rejects.toThrow(
+        "error body marker",
+      );
     };
     await call();
     expect(trace.mock.calls.flat()).toContain(
@@ -261,7 +264,7 @@ it.each([
   "rejected call",
   "error part",
   "broken stream",
-] as const)("keeps a %s out of the SDK stream result while the SDK still retries", async (failure) => {
+] as const)("passes a %s through the SDK unchanged and keeps it out of engine outputs", async (failure) => {
   vi.stubEnv("WORKFLOW_ENGINE_TRACE", "1");
   vi.stubEnv("WORKFLOW_ENGINE_TRACE_TEXT", "");
   const trace = vi.spyOn(console, "log").mockImplementation(() => {});
@@ -323,19 +326,33 @@ it.each([
     } catch (error) {
       seen.push(error);
     }
-    // A stream that fails in transport never reaches the SDK's onError.
-    await ai.flush({ timeoutMs: 20 });
-    expect(seen).not.toHaveLength(0);
+    // A stream that ended, even in a read rejection, is no longer pending.
+    expect(await ai.flush({ timeoutMs: 50 })).toEqual({
+      failed: 0,
+      pending: 0,
+    });
     expect(calls).toBe(failure === "rejected call" ? 2 : 1);
-    const text = (value: unknown): string =>
-      value instanceof Error
-        ? `${value.message} ${JSON.stringify(value)} ${text((value as { errors?: unknown }).errors ?? "")}`
-        : (JSON.stringify(value) ?? "");
+    expect(seen).not.toHaveLength(0);
+    const messages = seen.map((error) => (error as Error).message);
+    expect(messages.join(" ")).toContain(marker);
+    if (failure === "rejected call") {
+      // The SDK's retry error, holding the provider's own error.
+      const last = (seen[0] as { lastError?: unknown }).lastError;
+      expect(APICallError.isInstance(last)).toBe(true);
+    }
+    for (const error of seen)
+      expect(toErrorMessage(error)).not.toContain(marker);
     expect(
-      seen.map(text).join(" ") +
-        JSON.stringify(logger.getAllCalls()) +
-        JSON.stringify(trace.mock.calls),
+      JSON.stringify(logger.getAllCalls()) + JSON.stringify(trace.mock.calls),
     ).not.toContain(marker);
+    if (failure === "error part") {
+      // The usage after the error is charged, as in earlier releases.
+      expect(
+        logger
+          .getAllCalls()
+          .map((call) => [call.inputTokens, call.outputTokens]),
+      ).toContainEqual([1, 1]);
+    }
     vi.stubEnv("WORKFLOW_ENGINE_TRACE_TEXT", "1");
     calls = 0;
     const second = ai.streamText(
@@ -357,16 +374,17 @@ it.each([
   }
 });
 
-it("keeps an adapter's Zod error terminal for the stage classifier", async () => {
+it("keeps an adapter's Zod error unchanged and terminal, with its text withheld from engine outputs", async () => {
   const ai = createAIHelper(
     "accounting",
     new InMemoryAICallLogger(),
     undefined,
     undefined,
     {
+      text: { store: "none" },
       adapter: {
         async generateText() {
-          z.string().min(1).parse("");
+          z.strictObject({}).parse({ [marker]: 1 });
           return { text: "", inputTokens: 0, outputTokens: 0 };
         },
       },
@@ -376,7 +394,59 @@ it("keeps an adapter's Zod error terminal for the stage classifier", async () =>
     .generateText(modelKey, "request marker")
     .catch((e: unknown) => e);
   expect(error).toBeInstanceOf(z.ZodError);
+  expect((error as Error).message).toContain(marker);
   expect(isRetryableStageError(error)).toBe(false);
+  expect(toErrorMessage(error)).not.toContain(marker);
+  expect(toErrorMessage(new Error("wrapped", { cause: error }))).not.toContain(
+    marker,
+  );
+});
+
+it("works with frozen loggers and providers", async () => {
+  const base = new InMemoryAICallLogger();
+  const logger = Object.freeze({
+    logCall: (call: CreateAICallInput) => base.logCall(call),
+    logBatchResults: (batchId: string, calls: CreateAICallInput[]) =>
+      base.logBatchResults(batchId, calls),
+    isRecorded: (batchId: string) => base.isRecorded(batchId),
+    getStats: (topic: string) => base.getStats(topic),
+  });
+  registerModels({
+    "call-logging/frozen": {
+      id: "call-logging/frozen",
+      name: "Frozen evaluation fixture",
+      provider: "call-logging-frozen",
+      isEvaluationModel: true,
+      inputCostPerMillion: 0,
+      outputCostPerMillion: 0,
+    },
+  });
+  registerEvaluationProvider(
+    "call-logging-frozen",
+    () =>
+      Object.freeze({
+        specificationVersion: "v4",
+        provider: "call-logging-frozen",
+        modelId: "call-logging/frozen",
+        supportedQuestionTypes: ["boolean"],
+        async doEvaluate() {
+          return {
+            answers: { ok: { type: "boolean", probability: 0.9 } },
+            usage: { inputTokens: 1, outputTokens: 1 },
+            warnings: [],
+          };
+        },
+      }) as never,
+  );
+  const ai = createAIHelper("accounting", logger);
+  ai.recordCall(externalCall);
+  const result = await ai.evaluate("call-logging/frozen", {
+    state: "state",
+    questions: { ok: { type: "boolean", instructions: "yes or no" } },
+  });
+  expect(result.answers.ok).toBeDefined();
+  expect(await ai.flush()).toEqual({ failed: 0, pending: 0 });
+  expect(base.getAllCalls()).toHaveLength(2);
 });
 
 it("rejects an awaited failed write safely, reports every failure and forwards logger members", async () => {

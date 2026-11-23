@@ -1,159 +1,66 @@
-import { APICallError, LoadAPIKeyError } from "@ai-sdk/provider";
-import { NoObjectGeneratedError } from "ai";
-import { ZodError } from "zod";
-import { brandNonRetryable, isNonRetryableError } from "../core/steps.js";
-import { toErrorMessage } from "../kernel/helpers/error-message.js";
+import { withholdErrorText } from "../kernel/helpers/error-message.js";
 import { createLogger, isTraceTextEnabled } from "../utils/logger.js";
 import { AICallTimeoutError } from "./errors.js";
 import { UnportableSchemaError } from "./schema-portability.js";
 
 const logger = createLogger("AIHelper");
 
-const originalErrors = new WeakMap<Error, unknown>();
-
-/** Provider failures have no public cause. The repair path can still inspect the original in process. */
-export class ProviderCallError extends Error {
-  readonly statusCode?: number;
-  readonly isRetryable?: boolean;
-  readonly retryable?: boolean;
-  readonly retryAfterSeconds?: number;
-
-  constructor(message: string, error?: unknown) {
-    const value = (key: string): unknown => {
-      try {
-        return (error as Record<string, unknown> | undefined)?.[key];
-      } catch {
-        return undefined;
-      }
-    };
-    const status = value("statusCode");
-    const statusCode =
-      typeof status === "number" &&
-      Number.isInteger(status) &&
-      status >= 100 &&
-      status <= 599
-        ? status
-        : undefined;
-    super(
-      statusCode === undefined ? message : `${message} (HTTP ${statusCode})`,
-    );
-    this.name = "ProviderCallError";
-    this.statusCode = statusCode;
-    const isRetryable = value("isRetryable");
-    const retryable = value("retryable");
-    const retryAfter = value("retryAfterSeconds");
-    if (typeof isRetryable === "boolean") this.isRetryable = isRetryable;
-    if (typeof retryable === "boolean") this.retryable = retryable;
-    if (typeof retryAfter === "number" && Number.isFinite(retryAfter)) {
-      this.retryAfterSeconds = retryAfter;
-    }
-    if (isNonRetryableError(error)) brandNonRetryable(this);
-    if (error !== undefined) originalErrors.set(this, error);
-  }
-}
-
-export function providerError(error: unknown, message: string): Error {
+/**
+ * Leave an AI call failure unchanged for the caller and the SDK. Under a
+ * policy that withholds text, mark it so the engine's own outputs describe it
+ * instead of repeating its message. Engine-made errors carry no call text.
+ */
+export function markAICallError<T>(
+  ctx: { readonly withholdsText?: boolean },
+  error: T,
+): T {
   if (
-    error instanceof ProviderCallError ||
-    error instanceof AICallTimeoutError ||
-    error instanceof UnportableSchemaError ||
-    // The stage classifier fails a Zod error without a retry. Its issues carry
-    // paths and expectations, not the input.
-    error instanceof ZodError
+    ctx.withholdsText &&
+    !(error instanceof AICallTimeoutError) &&
+    !(error instanceof UnportableSchemaError)
   )
-    return error;
-  traceProviderDiagnostic(message, error);
-  if (
-    LoadAPIKeyError.isInstance(error) ||
-    (error instanceof Error && error.name === "AI_LoadAPIKeyError")
-  ) {
-    return new LoadAPIKeyError({ message: "Provider API key is missing." });
-  }
-  if (NoObjectGeneratedError.isInstance(error)) {
-    const safe = new ProviderCallError(
-      "No object generated. The response did not match the required format.",
-      error,
-    );
-    safe.name = "AI_NoObjectGeneratedError";
-    return safe;
-  }
-  return new ProviderCallError(message, error);
-}
-
-export async function callProvider<T>(
-  message: string,
-  call: () => T,
-): Promise<Awaited<T>> {
-  try {
-    return await call();
-  } catch (error) {
-    throw providerError(error, message);
-  }
-}
-
-export function providerStatus(
-  detail: unknown,
-  message: string,
-): string | undefined {
-  if (detail === undefined || detail === null || detail === "")
-    return undefined;
-  traceProviderDiagnostic(message, detail);
-  return message;
-}
-
-export function originalProviderError(error: unknown): unknown {
-  return error instanceof ProviderCallError && originalErrors.has(error)
-    ? originalErrors.get(error)
-    : error;
+    withholdErrorText(error);
+  return error;
 }
 
 export function traceProviderDiagnostic(
   message: string,
   detail: unknown,
 ): void {
-  if (isTraceTextEnabled())
-    logger.debug(message, { detail: toErrorMessage(detail) });
-}
-
-function isAbortError(error: unknown): boolean {
-  return (
-    error instanceof Error &&
-    (error.name === "AbortError" ||
-      error.name === "ResponseAborted" ||
-      error.name === "TimeoutError")
-  );
+  if (!isTraceTextEnabled()) return;
+  let text: string;
+  try {
+    text = detail instanceof Error ? detail.message : String(detail);
+  } catch {
+    text = "Unprintable error";
+  }
+  logger.debug(message, { detail: text });
 }
 
 /**
- * A stream error reaches the caller through the SDK result, so it is made safe
- * before the SDK sees it. The SDK still sees an abort, and a retryable failure
- * remains a retryable `APICallError` with its status and headers.
+ * Forward every read to `target`, replacing what `override` returns. A fresh
+ * proxy target keeps frozen targets usable: their own members would bind
+ * the proxy to report them unchanged.
  */
-function safeStreamError(error: unknown): unknown {
-  if (isAbortError(error)) return error;
-  const safe = providerError(error, "Provider stream failed");
-  if (safe === error) return error;
-  const apiError = APICallError.isInstance(error) ? error : undefined;
-  let retryable: unknown;
-  try {
-    retryable = (error as { isRetryable?: unknown } | undefined)?.isRetryable;
-  } catch {
-    retryable = undefined;
-  }
-  if (!apiError && retryable !== true) return safe;
-  return new APICallError({
-    message: "Provider stream failed",
-    url: "",
-    requestBodyValues: undefined,
-    statusCode: (safe as ProviderCallError).statusCode,
-    responseHeaders: apiError?.responseHeaders,
-    isRetryable: retryable === true,
+export function forwardingProxy<T extends object>(
+  target: T,
+  override: (key: string | symbol, value: unknown) => unknown,
+): T {
+  return new Proxy(Object.create(Object.getPrototypeOf(target)) as T, {
+    get(_, key) {
+      const value: unknown = Reflect.get(target, key, target);
+      const replaced = override(key, value);
+      if (replaced !== value) return replaced;
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+    has: (_, key) => Reflect.has(target, key),
   });
 }
 
-function protectStream<T extends { type: string }>(
+function observeStream<T extends { type: string }>(
   stream: ReadableStream<T>,
   keepWarnings: boolean,
+  onReadError: (error: unknown) => void,
 ): ReadableStream<T> {
   const reader = stream.getReader();
   return new ReadableStream<T>({
@@ -162,21 +69,14 @@ function protectStream<T extends { type: string }>(
       try {
         next = await reader.read();
       } catch (error) {
-        controller.error(safeStreamError(error));
+        onReadError(error);
+        controller.error(error);
         return;
       }
-      if (next.done) {
-        controller.close();
-        return;
-      }
-      const part = next.value as T & { error?: unknown };
-      if (part.type === "error") {
-        controller.enqueue({ ...part, error: safeStreamError(part.error) });
-      } else if (part.type === "stream-start" && !keepWarnings) {
-        controller.enqueue({ ...part, warnings: [] });
-      } else {
-        controller.enqueue(part);
-      }
+      if (next.done) controller.close();
+      else if (next.value.type === "stream-start" && !keepWarnings)
+        controller.enqueue({ ...next.value, warnings: [] });
+      else controller.enqueue(next.value);
     },
     cancel: (reason) => reader.cancel(reason),
   });
@@ -185,45 +85,40 @@ function protectStream<T extends { type: string }>(
 /**
  * The SDK emits provider warnings via a process-wide logger. Remove warning
  * text at the provider boundary to leave unrelated SDK callers' settings alone.
- * Stream errors are replaced there too, since the SDK result exposes them.
+ * `onStreamError` sees a stream that ends in a read rejection, which the SDK
+ * reports to no callback; the error still reaches the SDK unchanged.
  */
-export function protectProviderWarnings<T extends object>(model: T): T {
-  return new Proxy(model, {
-    get(target, key) {
-      const method: unknown = Reflect.get(target, key, target);
-      if (typeof method !== "function") return method;
-      if (
-        key !== "doGenerate" &&
+export function protectProviderWarnings<T extends object>(
+  model: T,
+  onStreamError?: { call?(error: unknown): void; read?(error: unknown): void },
+): T {
+  return forwardingProxy(model, (key, method) => {
+    if (
+      typeof method !== "function" ||
+      (key !== "doGenerate" &&
         key !== "doEmbed" &&
         key !== "doEvaluate" &&
-        key !== "doStream"
-      ) {
-        return method.bind(target);
+        key !== "doStream")
+    )
+      return method;
+    return async (...args: unknown[]) => {
+      if (key !== "doStream") {
+        const result = await method.apply(model, args);
+        return isTraceTextEnabled() ? result : { ...result, warnings: [] };
       }
-      return async (...args: unknown[]) => {
-        if (key !== "doStream") {
-          const result = await method.apply(target, args);
-          return isTraceTextEnabled() ? result : { ...result, warnings: [] };
-        }
-        let result: { stream: ReadableStream<{ type: string }> };
-        try {
-          result = await method.apply(target, args);
-        } catch (error) {
-          throw safeStreamError(error);
-        }
-        return {
-          ...result,
-          stream: protectStream(result.stream, isTraceTextEnabled()),
-        };
+      let result: { stream: ReadableStream<{ type: string }> };
+      try {
+        result = await method.apply(model, args);
+      } catch (error) {
+        onStreamError?.call?.(error);
+        throw error;
+      }
+      return {
+        ...result,
+        stream: observeStream(result.stream, isTraceTextEnabled(), (error) =>
+          onStreamError?.read?.(error),
+        ),
       };
-    },
+    };
   });
-}
-
-/** Only recognized status values can enter persisted diagnostics. */
-export function knownProviderBatchStatus(status: unknown): string | undefined {
-  if (typeof status !== "string") return undefined;
-  const known =
-    /^(?:(?:JOB|BATCH)_STATE_)?(?:PENDING|QUEUED|VALIDATING|IN_PROGRESS|PROCESSING|RUNNING|FINALIZING|COMPLETED|SUCCEEDED|FAILED|EXPIRED|CANCEL(?:L?ING|L?ED)|ENDED|PAUSED|UNSPECIFIED)$/i;
-  return known.test(status) ? status : undefined;
 }

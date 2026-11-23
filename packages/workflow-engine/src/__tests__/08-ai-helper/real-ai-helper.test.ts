@@ -439,9 +439,7 @@ describe("batch getResults() validates structured output against the schema", ()
 
     expect(results[0]?.status).toBe("failed");
     expect(results[0]?.result).toBeUndefined();
-    expect(results[0]?.error).toBe(
-      "The provider reported a batch item failure",
-    );
+    expect(results[0]?.error).toBe("Rate limit exceeded");
     expect(results[0]?.validated).toBe(false);
   });
 

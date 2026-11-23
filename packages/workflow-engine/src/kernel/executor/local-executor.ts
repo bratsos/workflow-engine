@@ -8,7 +8,10 @@
  */
 
 import { buildStageExecutionContext } from "../helpers/build-stage-execution-context.js";
-import { toErrorMessage } from "../helpers/error-message.js";
+import {
+  toErrorMessage,
+  withheldErrorSummary,
+} from "../helpers/error-message.js";
 import { isRetryableStageError } from "../helpers/stage-retry.js";
 import type {
   ActivityExecutor,
@@ -43,7 +46,10 @@ export function createLocalExecutor(): ActivityExecutor {
         return {
           error,
           errorName: e instanceof Error ? e.name : undefined,
-          errorStack: e instanceof Error ? e.stack : undefined,
+          errorStack:
+            e instanceof Error && withheldErrorSummary(e) === undefined
+              ? e.stack
+              : undefined,
           retryable,
           progress: built?.progressEvents ?? [],
           annotations: built?.annotationBuffer.flush() ?? [],

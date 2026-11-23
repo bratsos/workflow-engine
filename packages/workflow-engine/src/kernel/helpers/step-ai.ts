@@ -9,12 +9,9 @@
  */
 
 import type { z } from "zod";
+import { helperWithholdsText } from "../../ai/ai-helper.js";
 import type { EngineBatchRef } from "../../ai/batch/model";
 import { getModel, type ModelKey } from "../../ai/model-helper";
-import {
-  originalProviderError,
-  providerError,
-} from "../../ai/provider-diagnostics.js";
 import { calculateCostWithDiscount } from "../../ai/shared";
 import type {
   AIBatchCancelResult,
@@ -73,6 +70,7 @@ import {
   rebaseMarkers,
   type StoredSubmit,
 } from "./batch-submit-record.js";
+import { isWithheldText, withholdErrorText } from "./error-message.js";
 import { timerDurationMs } from "./host-support";
 
 /** The `cancelledBatchIds` a row's result lists, whatever else it holds. */
@@ -315,14 +313,6 @@ function formatIssues(error: z.ZodError): string {
     .join("\n");
 }
 
-function validateMapResult<T>(schema: z.ZodType<T>, value: unknown) {
-  try {
-    return schema.safeParse(value);
-  } catch (error) {
-    throw providerError(error, "AI map response validation failed");
-  }
-}
-
 function stringify(value: unknown): string {
   if (typeof value === "string") return value;
   try {
@@ -353,7 +343,6 @@ function withRepair(prompt: TextInput, feedback: Feedback): TextInput {
  * `realtime.retries`.
  */
 function asGenerationFailure(error: unknown): Feedback | undefined {
-  error = originalProviderError(error);
   if (typeof error !== "object" || error === null) return undefined;
   const e = error as {
     name?: unknown;
@@ -523,6 +512,22 @@ async function collectStream(
 }
 
 export function createStepAi(deps: StepAiDeps): StepAiApi {
+  // Under a policy that withholds text, model output and its validation
+  // diagnostics remain outside the ledger's error column.
+  const withholds = () => helperWithholdsText(deps.ai());
+  const storeVerdict = (stepId: string, verdict: { error?: string }) => {
+    if (withholds()) withholdErrorText(verdict.error);
+    return deps.storeFailedVerdict(stepId, verdict);
+  };
+  const parseOutput = <T>(schema: z.ZodType<T>, value: unknown) => {
+    try {
+      return schema.safeParse(value);
+    } catch (error) {
+      if (withholds()) withholdErrorText(error);
+      throw error;
+    }
+  };
+
   async function generateText(
     id: string,
     modelKey: ModelKey,
@@ -745,13 +750,10 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
 
       for (;;) {
         if (feedback) {
-          if (repairsLeft <= 0)
-            return failed(
-              "The response did not satisfy the required output format",
-            );
+          if (repairsLeft <= 0) return failed(feedback.issues);
           if (!budget.reserve()) {
             return failed(
-              "The response did not satisfy the required output format (realtime budget exhausted before repair)",
+              `${feedback.issues}\n(realtime budget exhausted before repair)`,
             );
           }
           repairsLeft--;
@@ -800,7 +802,7 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
             };
             continue;
           }
-          const validated = validateMapResult(spec.schema, streamed);
+          const validated = parseOutput(spec.schema, streamed);
           if (validated.success) {
             return {
               ...base,
@@ -862,7 +864,7 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
           return routed;
         }
 
-        const parsed = validateMapResult(spec.schema, object);
+        const parsed = parseOutput(spec.schema, object);
         if (parsed.success) {
           return {
             ...base,
@@ -930,7 +932,7 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
           // would lose `errorName`, attempts and tokens), while a new job
           // attempt re-opens the row and re-prompts the item.
           if (error instanceof AiMapItemFailedSignal) {
-            await deps.storeFailedVerdict(stepId, error.verdict);
+            await storeVerdict(stepId, error.verdict);
             return error.verdict as AiMapResult<TOut>;
           }
           const stored = (await deps.loadFailedVerdict(stepId)) as
@@ -950,7 +952,7 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
             outputTokens: prior?.outputTokens ?? 0,
             cost: prior?.cost ?? 0,
           };
-          await deps.storeFailedVerdict(stepId, verdict);
+          await storeVerdict(stepId, verdict);
           return verdict;
         }
       });
@@ -1656,7 +1658,10 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
       if (onExpiry === "partial") {
         return allFailed(reason, "AiMapBatchFailedError");
       }
-      throw new AiMapBatchFailedError(id, submitted.handleId, reason);
+      const failure = new AiMapBatchFailedError(id, submitted.handleId, reason);
+      // The reason quotes the provider, as the batch helper's policy decided.
+      if (isWithheldText(reason)) withholdErrorText(failure);
+      throw failure;
     }
 
     // ---- Collect ----------------------------------------------------------
@@ -1847,7 +1852,7 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
         // silence the guard exists to remove.
         if (isDuplicateStepKeyError(error)) throw error;
         if (error instanceof AiMapItemFailedSignal) {
-          await deps.storeFailedVerdict(stepId, error.verdict);
+          await storeVerdict(stepId, error.verdict);
           return error.verdict as AiMapResult<TOut>;
         }
         const stored = (await deps.loadFailedVerdict(stepId)) as

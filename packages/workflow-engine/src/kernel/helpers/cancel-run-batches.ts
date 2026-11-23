@@ -134,10 +134,6 @@ import {
   EngineBatchRefSchema,
 } from "../../ai/batch/model.js";
 import { resolveBatchModelForRef } from "../../ai/batch/resolve-ref.js";
-import {
-  knownProviderBatchStatus,
-  providerError,
-} from "../../ai/provider-diagnostics.js";
 import type {
   RunCancelBatchOutcome,
   RunCancelBatchStatus,
@@ -333,13 +329,7 @@ export async function cancelBatchesNow(
         try {
           model = await resolve(ref);
         } catch (error) {
-          return {
-            status: "unavailable",
-            error: providerError(
-              error,
-              "The batch transport could not be resolved",
-            ).message,
-          };
+          return { status: "unavailable", error: toErrorMessage(error) };
         }
         if (!model) {
           return {
@@ -350,16 +340,16 @@ export async function cancelBatchesNow(
         if (!model.cancel) return { status: "unsupported" };
         try {
           const result = await model.cancel(ref, { abortSignal: signal });
-          const providerStatus = knownProviderBatchStatus(result.rawStatus);
           return {
             status: result.outcome,
-            ...(providerStatus !== undefined ? { providerStatus } : {}),
+            ...(result.rawStatus !== undefined
+              ? { providerStatus: result.rawStatus }
+              : {}),
           };
         } catch (error) {
           return {
             status: isMissingCredentials(error) ? "unavailable" : "failed",
-            error: providerError(error, "Provider batch cancellation failed")
-              .message,
+            error: toErrorMessage(error),
           };
         }
       });
@@ -873,13 +863,7 @@ export async function cancelRunBatches(
             try {
               model = await modelFor(ref);
             } catch (error) {
-              return {
-                status: "unavailable",
-                error: providerError(
-                  error,
-                  "The batch transport could not be resolved",
-                ).message,
-              };
+              return { status: "unavailable", error: toErrorMessage(error) };
             }
             if (!model) {
               return {
@@ -924,18 +908,16 @@ export async function cancelRunBatches(
             for (const h of rows) h.sent.add(ref.id);
             try {
               const result = await model.cancel(ref, { abortSignal: signal });
-              const providerStatus = knownProviderBatchStatus(result.rawStatus);
               return {
                 status: result.outcome,
-                ...(providerStatus !== undefined ? { providerStatus } : {}),
+                ...(result.rawStatus !== undefined
+                  ? { providerStatus: result.rawStatus }
+                  : {}),
               };
             } catch (error) {
               return {
                 status: isMissingCredentials(error) ? "unavailable" : "failed",
-                error: providerError(
-                  error,
-                  "Provider batch cancellation failed",
-                ).message,
+                error: toErrorMessage(error),
               };
             }
           },

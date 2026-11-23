@@ -1,10 +1,4 @@
 import { z } from "zod";
-import {
-  knownProviderBatchStatus,
-  ProviderCallError,
-  providerError,
-  traceProviderDiagnostic,
-} from "../provider-diagnostics.js";
 import { toPortableJsonSchema } from "../schema-portability";
 import {
   eligibleProviderSlugs,
@@ -149,28 +143,32 @@ async function parseOpenRouterResponse(
   let text: string;
   try {
     text = await res.text();
-  } catch (error) {
-    throw providerError(
-      error,
-      `OpenRouter batch ${site} failed to read response body (HTTP ${res.status})`,
+  } catch (err) {
+    throw new Error(
+      `OpenRouter batch ${site} failed to read response body (${res.url}, HTTP ${res.status}): ${err instanceof Error ? err.message : String(err)}`,
     );
   }
+
+  const bodyExcerpt = text.length > 200 ? `${text.slice(0, 200)}...` : text;
+
   let json: unknown;
   try {
     json = JSON.parse(text);
   } catch {
-    traceProviderDiagnostic("Non-JSON batch response", text);
-    throw new ProviderCallError(
-      `Non-JSON response received for OpenRouter batch ${site} (HTTP ${res.status})`,
+    throw new Error(
+      `Non-JSON response received for OpenRouter batch ${site} (${res.url}, HTTP ${res.status}): ${bodyExcerpt}`,
     );
   }
+
   const parsed = OpenRouterBatchResponseSchema.safeParse(json);
   if (!parsed.success) {
-    traceProviderDiagnostic("Invalid batch response", text);
-    throw new ProviderCallError(
-      `OpenRouter batch ${site} returned an invalid batch object (HTTP ${res.status})`,
+    throw new Error(
+      `OpenRouter batch ${site} returned an invalid batch object (HTTP ${res.status}): ` +
+        `${parsed.error.issues.map((i) => `${i.path.join(".") || "<root>"}: ${i.message}`).join("; ")}. ` +
+        `Body: ${bodyExcerpt}`,
     );
   }
+
   return parsed.data;
 }
 
@@ -199,8 +197,7 @@ function extractOpenRouterError(
   const explicitError =
     typeof data.error === "string" ? data.error : data.error?.message;
   if (explicitError) {
-    traceProviderDiagnostic("OpenRouter batch failure", explicitError);
-    return "OpenRouter reported a batch failure";
+    return explicitError;
   }
 
   const knownStatuses = [
@@ -215,7 +212,7 @@ function extractOpenRouterError(
   ];
 
   if (!knownStatuses.includes(data.status)) {
-    return "Unrecognized OpenRouter batch status.";
+    return `Unrecognized OpenRouter batch status "${data.status}".`;
   }
 
   const mapped = mapOpenRouterStatus(data.status);
@@ -242,8 +239,6 @@ async function fetchGetWithRetry(
       method: "GET",
       headers,
       signal: abortSignal,
-    }).catch((error: unknown) => {
-      throw providerError(error, "OpenRouter batch request failed");
     });
     if (res.status === 429 && attempt < maxRetries) {
       attempt++;
@@ -254,8 +249,8 @@ async function fetchGetWithRetry(
         if (!Number.isNaN(parsedSeconds)) {
           if (parsedSeconds > 60) {
             throw Object.assign(
-              new ProviderCallError(
-                `OpenRouter rate limit Retry-After (${parsedSeconds}s) exceeds 60s ceiling`,
+              new Error(
+                `OpenRouter rate limit Retry-After (${parsedSeconds}s) exceeds 60s ceiling for GET ${url}`,
               ),
               { retryable: true, retryAfterSeconds: parsedSeconds },
             );
@@ -391,18 +386,17 @@ export function createOpenRouterBatchModel(
         },
         body: payload,
         signal: opts?.abortSignal,
-      }).catch((error: unknown) => {
-        throw providerError(error, "OpenRouter batch creation failed");
       });
 
       if (!res.ok) {
         const errText = await res.text().catch(() => "");
-        traceProviderDiagnostic("OpenRouter batch response", errText);
+        const excerpt =
+          errText.length > 200 ? `${errText.slice(0, 200)}...` : errText;
         const hint = /does not have a :batch endpoint/.test(errText)
           ? ` OpenRouter's Batch API only serves models with a live ":batch" endpoint (the catalog row alone is not enough); pick a model that has one or batch through the vendor transport (ai.batch(modelKey, "<vendor>")).`
           : "";
-        throw new ProviderCallError(
-          `OpenRouter batch creation failed (HTTP ${res.status}).${hint}`,
+        throw new Error(
+          `OpenRouter batch creation failed (HTTP ${res.status}): ${excerpt}${hint}`,
         );
       }
 
@@ -426,7 +420,7 @@ export function createOpenRouterBatchModel(
       return {
         ...ref,
         status: mapOpenRouterStatus(data.status),
-        rawStatus: knownProviderBatchStatus(data.status),
+        rawStatus: data.status,
         requestCounts: data.request_counts
           ? { total, pending, completed, failed }
           : undefined,
@@ -454,9 +448,10 @@ export function createOpenRouterBatchModel(
 
       if (!res.ok) {
         const errText = await res.text().catch(() => "");
-        traceProviderDiagnostic("OpenRouter batch response", errText);
-        throw new ProviderCallError(
-          `OpenRouter batch status check failed (HTTP ${res.status})`,
+        const excerpt =
+          errText.length > 200 ? `${errText.slice(0, 200)}...` : errText;
+        throw new Error(
+          `OpenRouter batch status check failed (HTTP ${res.status}): ${excerpt}`,
         );
       }
 
@@ -484,7 +479,7 @@ export function createOpenRouterBatchModel(
 
       return {
         status: mapOpenRouterStatus(data.status),
-        rawStatus: knownProviderBatchStatus(data.status),
+        rawStatus: data.status,
         requestCounts,
         error: errorMessage,
         ...(data.status === "cancelling" || data.status === "cancelled"
@@ -513,23 +508,24 @@ export function createOpenRouterBatchModel(
 
       if (!res.ok) {
         const errText = await res.text().catch(() => "");
-        traceProviderDiagnostic("OpenRouter batch response", errText);
-        throw new ProviderCallError(
-          `OpenRouter batch results fetch failed (HTTP ${res.status})`,
+        const excerpt =
+          errText.length > 200 ? `${errText.slice(0, 200)}...` : errText;
+        throw new Error(
+          `OpenRouter batch results fetch failed (HTTP ${res.status}): ${excerpt}`,
         );
       }
 
       const data = await parseOpenRouterResponse(res, "results fetch");
 
       if (data.status !== "completed") {
-        throw new ProviderCallError(
-          `Batch ${ref.id} is not completed. ` +
+        throw new Error(
+          `Batch ${ref.id} is not completed (status: ${data.status}). ` +
             `OpenRouter returns results: null for in-progress/failed/expired/cancelled batches and no partial results are recoverable on this transport.`,
         );
       }
 
       if (!data.results) {
-        throw new ProviderCallError(
+        throw new Error(
           `Batch ${ref.id} has status "completed" but returned null or missing results.`,
         );
       }
@@ -541,11 +537,10 @@ export function createOpenRouterBatchModel(
             typeof item.error === "string"
               ? item.error
               : (item.error.message ?? "Unknown batch item error");
-          traceProviderDiagnostic("OpenRouter batch item failure", errorMsg);
           yield {
             id: customId,
             status: "failed",
-            error: "OpenRouter reported a batch item failure",
+            error: errorMsg,
             inputTokens: 0,
             outputTokens: 0,
           };
@@ -604,11 +599,10 @@ export function createOpenRouterBatchModel(
             const errorMsg =
               body?.error?.message ??
               `OpenRouter batch item failed with status ${statusCode}`;
-            traceProviderDiagnostic("OpenRouter batch item failure", errorMsg);
             yield {
               id: customId,
               status: "failed",
-              error: `OpenRouter batch item failed with status ${statusCode}`,
+              error: errorMsg,
               inputTokens: 0,
               outputTokens: 0,
             };

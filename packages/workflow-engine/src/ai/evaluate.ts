@@ -13,10 +13,7 @@ import { openrouter } from "@openrouter/ai-sdk-provider";
 import { experimental_evaluate as aiEvaluate } from "ai";
 import { logFailure } from "./generate";
 import { getModel, type ModelConfig, type ModelKey } from "./model-helper";
-import {
-  protectProviderWarnings,
-  providerError,
-} from "./provider-diagnostics.js";
+import { protectProviderWarnings } from "./provider-diagnostics.js";
 import {
   buildOpenRouterRoutingProvider,
   logger,
@@ -263,7 +260,7 @@ export async function evaluate<const Q extends EvaluationQuestions>(
       error: errorMessage,
       durationMs,
     });
-    throw providerError(error, "Provider evaluate call failed");
+    throw error;
   } finally {
     timeout.cleanup();
   }

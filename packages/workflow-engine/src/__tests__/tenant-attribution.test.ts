@@ -350,9 +350,10 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
         },
       },
     });
+    // The caller gets the provider's error unchanged.
     await expect(
       ai.generateText(modelKey, "request marker", { maxRetries: 0 }),
-    ).rejects.toThrow("Provider generation failed");
+    ).rejects.toThrow("error body marker");
     await ai.generateObject(modelKey, "request marker", schema);
     await ai.embed(modelKey, "request marker");
     await ai.evaluate(modelKey, {
@@ -726,6 +727,40 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
                 controller.error(new Error(sensitive));
                 return;
               }
+              if (path === "stream abort") {
+                controller.error(
+                  Object.assign(new Error(sensitive), { name: "AbortError" }),
+                );
+                return;
+              }
+              if (path === "stream tool") {
+                // Model-written arguments that fail the tool's schema.
+                controller.enqueue({
+                  type: "tool-call",
+                  toolCallId: "call-1",
+                  toolName: "count",
+                  input: JSON.stringify({ n: sensitive }),
+                });
+                controller.enqueue({
+                  type: "finish",
+                  finishReason: { unified: "tool-calls", raw: "tool_calls" },
+                  usage: {
+                    inputTokens: {
+                      total: 1,
+                      noCache: undefined,
+                      cacheRead: undefined,
+                      cacheWrite: undefined,
+                    },
+                    outputTokens: {
+                      total: 1,
+                      text: undefined,
+                      reasoning: undefined,
+                    },
+                  },
+                });
+                controller.close();
+                return;
+              }
               controller.enqueue({
                 type: "error",
                 error: new Error(sensitive),
@@ -748,6 +783,9 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
     ["stream transport", "full"],
     ["stream part", "none"],
     ["stream call", "full"],
+    ["stream abort", "none"],
+    ["stream tool", "full"],
+    ["zod adapter", "none"],
   ] as const)("keeps %s provider diagnostics out of host, console, events and traces with %s capture", async (path, store) => {
     vi.stubEnv("WORKFLOW_ENGINE_TRACE", "1");
     vi.stubEnv("WORKFLOW_ENGINE_TRACE_TEXT", "");
@@ -791,11 +829,21 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
         } else if (path.startsWith("stream")) {
           // No log call or explicit wrapping: the SDK's own surface propagates.
           await ctx.step.run("read", async () => {
-            const { rawResult } = ctx.ai.streamText(modelKey, {
-              prompt: "request marker",
-            });
+            const { rawResult } = ctx.ai.streamText(
+              modelKey,
+              { prompt: "request marker" },
+              {
+                tools: {
+                  count: {
+                    inputSchema: z.object({ n: z.number() }),
+                    execute: async () => 1,
+                  },
+                },
+              },
+            );
             for await (const part of rawResult!.fullStream) {
-              if (part.type === "error") throw part.error;
+              if (part.type === "error" || part.type === "tool-error")
+                throw part.error;
             }
             return null;
           });
@@ -833,6 +881,9 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
                     },
                   }),
               async generateText() {
+                // Zod's unrecognized-key message names the model's key.
+                if (path === "zod adapter")
+                  z.strictObject({}).parse({ [sensitive]: 1 });
                 throw new Error(sensitive);
               },
             },
@@ -873,15 +924,18 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
       expect(eventSink.getByType("workflow:failed").length).toBe(
         path === "validation" ? 0 : 1,
       );
-      if (path === "validation") {
-        expect(JSON.stringify(reads[4])).toContain(
-          "AI map response validation failed",
-        );
-      }
       expect(
         JSON.stringify([
           result,
-          ...reads,
+          // A map's item verdicts are repair data with their own lifecycle;
+          // the step's error column is the engine's.
+          ...(path === "validation"
+            ? reads.map((read, i) =>
+                i === 4
+                  ? (read as { error: string | null }[]).map((s) => s.error)
+                  : read,
+              )
+            : reads),
           eventSink.events,
           ...output.map((spy) => spy.mock.calls),
           warnings.mock.calls,
@@ -1105,58 +1159,56 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
       }),
   };
 
-  it("rolls back a batch whose recording fails partway, so recordResults restores all of it", async () => {
-    const refuse = sqlite
-      ? [
-          `CREATE TRIGGER refuse_second BEFORE INSERT ON "ai_calls" WHEN NEW."requestId" = 'second' BEGIN SELECT RAISE(ABORT, 'refused'); END`,
-        ]
-      : [
-          `CREATE FUNCTION refuse_second() RETURNS trigger AS $$ BEGIN IF NEW."requestId" = 'second' THEN RAISE EXCEPTION 'refused'; END IF; RETURN NEW; END $$ LANGUAGE plpgsql`,
-          `CREATE TRIGGER refuse_second BEFORE INSERT ON "ai_calls" FOR EACH ROW EXECUTE FUNCTION refuse_second()`,
-        ];
-    const allow = sqlite
-      ? [`DROP TRIGGER IF EXISTS refuse_second`]
-      : [
-          `DROP TRIGGER IF EXISTS refuse_second ON "ai_calls"`,
-          `DROP FUNCTION IF EXISTS refuse_second()`,
-        ];
-    const onLogError = vi.fn();
-    const helper = () =>
-      createAIHelper("accounting", db.aiLogger, undefined, undefined, {
-        attribution,
-        onLogError,
-      }).batch(modelKey, "openrouter", batchTransport);
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    try {
-      for (const sql of refuse) await db.client.$executeRawUnsafe(sql);
-      // Recording is awaited by getResults, as in earlier releases.
-      await expect(helper().getResults("batch-1")).rejects.toThrow(
-        "AI call accounting write failed",
-      );
-      expect(onLogError).toHaveBeenCalledTimes(2);
-      expect(await db.client.aICall.count()).toBe(0);
-    } finally {
-      for (const sql of allow) await db.client.$executeRawUnsafe(sql);
-      warn.mockRestore();
-    }
-    const batch = helper();
-    await batch.recordResults("batch-1", await batch.getResults("batch-1"));
-    const rows = await db.client.aICall.findMany({
-      orderBy: { requestId: "asc" },
-    });
-    expect(rows).toEqual([
-      expect.objectContaining({
-        ...attribution,
-        requestId: "first",
-        cost: 1.25,
-      }),
-      expect.objectContaining({
-        ...attribution,
-        requestId: "second",
-        cost: 1.25,
-      }),
-    ]);
-  });
+  // SQLite writes a batch row by row, as in earlier releases.
+  it.skipIf(sqlite)(
+    "rolls back a batch whose recording fails partway, so recordResults restores all of it",
+    async () => {
+      const refuse = [
+        `CREATE FUNCTION refuse_second() RETURNS trigger AS $$ BEGIN IF NEW."requestId" = 'second' THEN RAISE EXCEPTION 'refused'; END IF; RETURN NEW; END $$ LANGUAGE plpgsql`,
+        `CREATE TRIGGER refuse_second BEFORE INSERT ON "ai_calls" FOR EACH ROW EXECUTE FUNCTION refuse_second()`,
+      ];
+      const allow = [
+        `DROP TRIGGER IF EXISTS refuse_second ON "ai_calls"`,
+        `DROP FUNCTION IF EXISTS refuse_second()`,
+      ];
+      const onLogError = vi.fn();
+      const helper = () =>
+        createAIHelper("accounting", db.aiLogger, undefined, undefined, {
+          attribution,
+          onLogError,
+        }).batch(modelKey, "openrouter", batchTransport);
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        for (const sql of refuse) await db.client.$executeRawUnsafe(sql);
+        // Recording is awaited by getResults, as in earlier releases.
+        await expect(helper().getResults("batch-1")).rejects.toThrow(
+          "AI call accounting write failed",
+        );
+        expect(onLogError).toHaveBeenCalledTimes(2);
+        expect(await db.client.aICall.count()).toBe(0);
+      } finally {
+        for (const sql of allow) await db.client.$executeRawUnsafe(sql);
+        warn.mockRestore();
+      }
+      const batch = helper();
+      await batch.recordResults("batch-1", await batch.getResults("batch-1"));
+      const rows = await db.client.aICall.findMany({
+        orderBy: { requestId: "asc" },
+      });
+      expect(rows).toEqual([
+        expect.objectContaining({
+          ...attribution,
+          requestId: "first",
+          cost: 1.25,
+        }),
+        expect.objectContaining({
+          ...attribution,
+          requestId: "second",
+          cost: 1.25,
+        }),
+      ]);
+    },
+  );
 
   it("counts batch accounting in the run total as soon as the stage completes", async () => {
     const stage = defineStage({
@@ -1292,5 +1344,204 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
     expect(
       await db.client.workflowStage.findFirst({ where: { workflowRunId } }),
     ).toMatchObject({ status: "FAILED" });
+  });
+
+  it("hands a durable step's retryIf the provider's retryable error, as earlier releases did", async () => {
+    const seen: unknown[] = [];
+    const stage = defineStage({
+      ...diagnosticsStage,
+      async execute(ctx) {
+        await ctx.step.run(
+          "call",
+          () => ctx.ai.generateText(modelKey, "request marker"),
+          {
+            retries: 1,
+            retryIf: (error) => {
+              seen.push(error);
+              return APICallError.isInstance(error) && error.isRetryable;
+            },
+          },
+        );
+        return { output: {} };
+      },
+    });
+    const { kernel, job, workflowRunId } = await queueJob(stage, {
+      services: {
+        aiLogger: db.aiLogger,
+        ai: (topic, logger, context, resolver, options) =>
+          createAIHelper(topic, logger, context, resolver, {
+            ...options,
+            text: { store: "none" },
+            adapter: {
+              async generateText() {
+                throw new APICallError({
+                  message: sensitive,
+                  url: "https://provider.invalid/v1",
+                  requestBodyValues: {},
+                  statusCode: 503,
+                  isRetryable: true,
+                });
+              },
+            },
+          }),
+      },
+    });
+    const { createServerlessHost } = await import(integration.serverless);
+    const host = createServerlessHost({
+      kernel,
+      jobTransport: db.jobTransport,
+      workerId: "kernel-worker",
+    });
+    await host.handleJob({ ...job, maxAttempts: 3 });
+    expect(seen).toHaveLength(1);
+    expect(APICallError.isInstance(seen[0])).toBe(true);
+    expect(
+      await db.client.workflowStage.findFirst({ where: { workflowRunId } }),
+    ).toMatchObject({ status: "SUSPENDED" });
+    const steps = await db.client.workflowStep.findMany({
+      where: { stage: { workflowRunId } },
+    });
+    expect(JSON.stringify(steps)).not.toContain(sensitive);
+  });
+
+  it.each([
+    "none",
+    "full",
+  ] as const)("applies a child helper's %s capture and labels to direct stage writes", async (store) => {
+    const stage = defineStage({
+      ...diagnosticsStage,
+      async execute(ctx) {
+        ctx.ai.recordCall({ ...manual, response: sensitive });
+        await ctx.aiLogger.logCall({
+          ...manual,
+          response: sensitive,
+          modelId: manual.modelKey,
+          topic: "scope",
+          metadata: { instructions: sensitive },
+        });
+        return { output: {} };
+      },
+    });
+    const { kernel, job, workflowRunId } = await queueJob(stage, {
+      services: {
+        aiLogger: db.aiLogger,
+        // The documented factory shape, returning a child helper.
+        ai: (topic, logger, context, resolver, options) =>
+          createAIHelper(topic, logger, context, resolver, options).createChild(
+            "private",
+            undefined,
+            {
+              text: { store, ttlMs: 60_000 },
+              attribution: { labels: { scope: "child" } },
+            },
+          ),
+      },
+    });
+    expect(
+      (
+        await executeJobWithHeartbeat(kernel, {
+          job,
+          jobTransport: db.jobTransport,
+        })
+      ).outcome,
+    ).toBe("completed");
+    await kernel.flush();
+    const rows = await db.client.aICall.findMany({ where: { workflowRunId } });
+    expect(rows).toHaveLength(2);
+    for (const row of rows) {
+      expect(row).toMatchObject({
+        tenantId: attribution.tenantId,
+        labels: { ...attribution.labels, scope: "child" },
+        workflowRunId,
+      });
+      if (store === "none") {
+        expect(row).toMatchObject({ response: "", textExpiresAt: null });
+        expect(JSON.stringify(row)).not.toContain(sensitive);
+      } else {
+        expect(row.response).toBe(sensitive);
+        expect(row.textExpiresAt).toBeInstanceOf(Date);
+      }
+    }
+  });
+
+  it("charges a stream's usage after an error part and counts it in the run total", async () => {
+    const stage = defineStage({
+      ...diagnosticsStage,
+      async execute(ctx) {
+        const { rawResult } = ctx.ai.streamText(modelKey, {
+          prompt: "request marker",
+        });
+        for await (const _ of rawResult!.fullStream) {
+          // Consume every part, including the error.
+        }
+        await ctx.ai.flush();
+        return { output: {} };
+      },
+    });
+    const { kernel, job, workflowRunId } = await queueJob(stage, {
+      services: {
+        aiLogger: db.aiLogger,
+        ai: (topic, logger, context, _resolver, options) =>
+          createAIHelper(
+            topic,
+            logger,
+            context,
+            () =>
+              new MockLanguageModelV4({
+                async doStream() {
+                  return {
+                    stream: new ReadableStream({
+                      start(controller) {
+                        controller.enqueue({
+                          type: "stream-start",
+                          warnings: [],
+                        });
+                        controller.enqueue({
+                          type: "error",
+                          error: new Error("stream error"),
+                        });
+                        controller.enqueue({
+                          type: "finish",
+                          finishReason: { unified: "stop", raw: "stop" },
+                          usage: {
+                            inputTokens: {
+                              total: 2,
+                              noCache: undefined,
+                              cacheRead: undefined,
+                              cacheWrite: undefined,
+                            },
+                            outputTokens: {
+                              total: 3,
+                              text: undefined,
+                              reasoning: undefined,
+                            },
+                          },
+                        });
+                        controller.close();
+                      },
+                    }),
+                  };
+                },
+              }),
+            options,
+          ),
+      },
+    });
+    expect(
+      (
+        await executeJobWithHeartbeat(kernel, {
+          job,
+          jobTransport: db.jobTransport,
+        })
+      ).outcome,
+    ).toBe("completed");
+    await kernel.dispatch({ type: "run.transition", workflowRunId });
+    const rows = await db.client.aICall.findMany({ where: { workflowRunId } });
+    expect(
+      rows.map((row: CreateAICallInput) => row.inputTokens + row.outputTokens),
+    ).toContain(5);
+    expect(
+      await db.client.workflowRun.findUnique({ where: { id: workflowRunId } }),
+    ).toMatchObject({ status: "COMPLETED", totalTokens: 5 });
   });
 });

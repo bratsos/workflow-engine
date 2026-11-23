@@ -1,9 +1,6 @@
 import { literalPrefixQuery, prefixCandidates } from "./literal-prefix.js";
 import { prefixRange, pruneRows, writeRetentionSql } from "./retention-sql.js";
-import {
-  isNativeTransaction,
-  withTransactionWriteGuard,
-} from "./transaction-writes.js";
+import { withTransactionWriteGuard } from "./transaction-writes.js";
 /**
  * PrismaAICallLogger - Prisma implementation of AICallLogger
  *
@@ -165,8 +162,6 @@ export interface PrismaAICallLoggerOptions {
 export class PrismaAICallLogger implements AICallLogger {
   private readonly databaseType: DatabaseType;
   private readonly writes = new AICallWriteTracker();
-  /** Built on a transaction client, whose transaction already keeps a batch whole. */
-  private readonly inTransaction: boolean;
 
   constructor(
     private readonly prisma: PrismaClient,
@@ -177,8 +172,6 @@ export class PrismaAICallLogger implements AICallLogger {
       options.databaseType ?? "postgresql",
     );
     this.databaseType = options.databaseType ?? "postgresql";
-    this.inTransaction =
-      prisma.$inTransaction === true || isNativeTransaction(prisma);
     validateDatabaseType(prisma, this.databaseType);
     if (this.databaseType === "sqlite") armSqliteAdapter(this, prisma);
   }
@@ -284,22 +277,13 @@ export class PrismaAICallLogger implements AICallLogger {
 
     // SQLite does not support skipDuplicates, but a unique violation leaves
     // the transaction usable, as in the annotation and step adapters.
-    const insert = async (client: PrismaClient) => {
-      for (const row of data) {
-        try {
-          await client.aICall.create({ data: row });
-        } catch (error) {
-          if (!isUniqueViolation(error)) throw error;
-        }
+    for (const row of data) {
+      try {
+        await this.prisma.aICall.create({ data: row });
+      } catch (error) {
+        if (!isUniqueViolation(error)) throw error;
       }
-    };
-    // One transaction keeps a batch whole, as the single PostgreSQL statement
-    // does: isRecorded treats any row of a batch as all of it.
-    if (this.inTransaction || typeof this.prisma.$transaction !== "function") {
-      await insert(this.prisma);
-      return;
     }
-    await this.prisma.$transaction(insert);
   }
 
   /**

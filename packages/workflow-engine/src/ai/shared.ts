@@ -21,7 +21,6 @@ import {
   type ModelConfig,
   type ModelKey,
 } from "./model-helper";
-import { ProviderCallError, providerError } from "./provider-diagnostics.js";
 import { schemaTargetForModel, withPortableSchema } from "./schema-portability";
 import type { AIHelperContext } from "./types";
 
@@ -390,15 +389,10 @@ export function resolveLanguageModel(
   modelConfig: ModelConfig,
 ): LanguageModelV4 {
   const policy = ctx.routing?.provider;
-  let resolved: LanguageModelV4 | null | undefined;
-  try {
-    resolved =
-      policy === undefined
-        ? ctx.providerResolver?.(modelConfig)
-        : ctx.providerResolver?.(modelConfig, policy);
-  } catch (error) {
-    throw providerError(error, "Provider resolution failed");
-  }
+  const resolved =
+    policy === undefined
+      ? ctx.providerResolver?.(modelConfig)
+      : ctx.providerResolver?.(modelConfig, policy);
   const model = resolved ?? getModelProvider(modelConfig, ctx.routing);
   return withPortableSchema(model, schemaTargetForModel(modelConfig, model));
 }
@@ -820,11 +814,12 @@ export function explainRoutingError(
   if (!(error instanceof Error) || !NO_ENDPOINTS.test(error.message)) {
     return error;
   }
-  return new ProviderCallError(
-    routing?.requireParameters === false
-      ? "No endpoints found that can handle the requested parameters."
-      : `OpenRouter found no endpoint honouring every requested parameter for "${modelKey}". ` +
-          "Set routing: { requireParameters: false } on createAIHelper / AIHelperOptions to accept such endpoints, or drop the parameter.",
-    error,
+  if (routing?.requireParameters === false) return error;
+  const explained = new Error(
+    `OpenRouter found no endpoint honouring every requested parameter for "${modelKey}" (routing.requireParameters is true by default, so an endpoint that ignores e.g. maxTokens or temperature is excluded). ` +
+      `Set routing: { requireParameters: false } on createAIHelper / AIHelperOptions to accept such endpoints, or drop the parameter. Original: ${error.message}`,
+    { cause: error },
   );
+  explained.name = error.name;
+  return explained;
 }
