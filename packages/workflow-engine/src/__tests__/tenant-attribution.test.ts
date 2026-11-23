@@ -1,5 +1,6 @@
 import { runInNewContext } from "node:vm";
 import { APICallError } from "@ai-sdk/provider";
+import { stepCountIs } from "ai";
 import { MockLanguageModelV4 } from "ai/test";
 import {
   afterAll,
@@ -1789,6 +1790,331 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
         row.inputTokens,
         row.outputTokens,
       ]),
+    ).toContainEqual([2, 3]);
+  });
+
+  // A provider stream of the given parts; `held` delays the rest, and an
+  // abort fails the held request as a transport would.
+  const partsStream = (
+    parts: object[],
+    held?: Promise<object[]>,
+    signal?: AbortSignal,
+  ) =>
+    new ReadableStream({
+      start(controller) {
+        for (const part of parts) controller.enqueue(part);
+        if (!held) return controller.close();
+        signal?.addEventListener("abort", () =>
+          controller.error(signal.reason),
+        );
+        void held.then((rest) => {
+          for (const part of rest) controller.enqueue(part);
+          controller.close();
+        });
+      },
+    });
+
+  it.each([
+    ["resumed", false, [[3, 4]]],
+    ["aborted", false, []],
+    // The usage reader writes its failure row after the abort.
+    ["aborted", true, [[0, 0]]],
+  ] as const)("keeps a paused stream pending until its request is %s (usage reader: %s)", async (end, usageReader, charges) => {
+    const finish = Promise.withResolvers<object[]>();
+    const abort = new AbortController();
+    const observed: {
+      paused?: number;
+      parentFlush?: unknown;
+      rowsAtFlush?: CreateAICallInput[];
+    } = {};
+    let calls = 0;
+    const model = new MockLanguageModelV4({
+      async doStream({ abortSignal }) {
+        calls++;
+        return {
+          stream:
+            calls === 1
+              ? partsStream([
+                  { type: "stream-start", warnings: [] },
+                  {
+                    type: "tool-call",
+                    toolCallId: "call-1",
+                    toolName: "lookup",
+                    input: "{}",
+                  },
+                  {
+                    type: "finish",
+                    finishReason: { unified: "tool-calls", raw: "tool_calls" },
+                    usage: v4Usage(1, 1),
+                  },
+                ])
+              : partsStream(
+                  [
+                    { type: "stream-start", warnings: [] },
+                    { type: "text-start", id: "1" },
+                    { type: "text-delta", id: "1", delta: "a" },
+                  ],
+                  finish.promise,
+                  abortSignal,
+                ),
+        };
+      },
+    });
+    const stage = defineStage({
+      ...diagnosticsStage,
+      async execute(ctx) {
+        const child = ctx.ai.createChild("chat");
+        const result = child.streamText(
+          modelKey,
+          { prompt: "request marker" },
+          {
+            abortSignal: abort.signal,
+            stopWhen: stepCountIs(2),
+            tools: {
+              lookup: { inputSchema: z.object({}), execute: async () => "ok" },
+            },
+          },
+        );
+        // The consumer reads one chunk and stops.
+        const reader = result.stream[Symbol.asyncIterator]();
+        await reader.next();
+        observed.paused = (await child.flush({ timeoutMs: 50 })).pending;
+        const reading = usageReader
+          ? result.getUsage()
+          : (async () => {
+              while (!(await reader.next()).done);
+            })();
+        if (end === "aborted") abort.abort();
+        else
+          finish.resolve([
+            { type: "text-end", id: "1" },
+            {
+              type: "finish",
+              finishReason: { unified: "stop", raw: "stop" },
+              usage: v4Usage(2, 3),
+            },
+          ]);
+        observed.parentFlush = await ctx.ai.flush({ timeoutMs: 2_000 });
+        observed.rowsAtFlush = await db.client.aICall.findMany({
+          where: { workflowRunId: ctx.workflowRunId },
+        });
+        await reading;
+        return { output: {} };
+      },
+    });
+    // Slow inserts, so a flush that returns early cannot see the row.
+    const aiLogger = Object.assign(Object.create(db.aiLogger), {
+      async logCall(call: CreateAICallInput) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        return db.aiLogger.logCall(call);
+      },
+    });
+    const { kernel, job } = await queueJob(stage, {
+      services: {
+        aiLogger,
+        ai: (topic, logger, context, _resolver, options) =>
+          createAIHelper(topic, logger, context, () => model, options),
+      },
+    });
+    expect(
+      (
+        await executeJobWithHeartbeat(kernel, {
+          job,
+          jobTransport: db.jobTransport,
+        })
+      ).outcome,
+    ).toBe("completed");
+    expect(observed.paused).toBe(1);
+    expect(observed.parentFlush).toEqual({ failed: 0, pending: 0 });
+    expect(
+      observed.rowsAtFlush!.map((row) => [row.inputTokens, row.outputTokens]),
+    ).toEqual(charges);
+  });
+
+  it.each([
+    "tool output",
+    "unfinished step",
+  ] as const)("ends a child's tool stream when the %s ends the request without a row", async (path) => {
+    const observed: { flushes?: unknown[]; failed: boolean } = {
+      failed: false,
+    };
+    let calls = 0;
+    const model = new MockLanguageModelV4({
+      async doStream() {
+        calls++;
+        return {
+          stream: partsStream(
+            calls === 1
+              ? [
+                  { type: "stream-start", warnings: [] },
+                  {
+                    type: "tool-call",
+                    toolCallId: "call-1",
+                    toolName: "lookup",
+                    input: "{}",
+                  },
+                  {
+                    type: "finish",
+                    finishReason: { unified: "tool-calls", raw: "tool_calls" },
+                    usage: v4Usage(1, 1),
+                  },
+                ]
+              : // The second step closes without a finish.
+                [{ type: "stream-start", warnings: [] }],
+          ),
+        };
+      },
+    });
+    const stage = defineStage({
+      ...diagnosticsStage,
+      async execute(ctx) {
+        const child = ctx.ai.createChild("item");
+        const { rawResult } = child.streamText(
+          modelKey,
+          { prompt: "request marker" },
+          {
+            maxRetries: 0,
+            stopWhen: stepCountIs(2),
+            tools: {
+              lookup: {
+                inputSchema: z.object({}),
+                execute: async () => "result-1",
+                // Fetching the referenced result for the next step fails.
+                ...(path === "tool output" && {
+                  toModelOutput: async () => {
+                    throw new TypeError("fetch failed");
+                  },
+                }),
+              },
+            },
+          },
+        );
+        try {
+          for await (const _ of rawResult!.fullStream) {
+            // Drain the stream.
+          }
+        } catch {
+          observed.failed = true;
+        }
+        observed.flushes = [
+          await child.flush({ timeoutMs: 2_000 }),
+          await ctx.ai.flush({ timeoutMs: 2_000 }),
+        ];
+        return { output: {} };
+      },
+    });
+    const { kernel, job } = await queueJob(stage, {
+      services: {
+        aiLogger: db.aiLogger,
+        ai: (topic, logger, context, _resolver, options) =>
+          createAIHelper(topic, logger, context, () => model, options),
+      },
+    });
+    expect(
+      (
+        await executeJobWithHeartbeat(kernel, {
+          job,
+          jobTransport: db.jobTransport,
+        })
+      ).outcome,
+    ).toBe("completed");
+    expect(observed.failed).toBe(path === "tool output");
+    expect(observed.flushes).toEqual([
+      { failed: 0, pending: 0 },
+      { failed: 0, pending: 0 },
+    ]);
+  });
+
+  it("keeps a stream pending after its client disconnects until the usage reader's charge is written", async () => {
+    const finish = Promise.withResolvers<object[]>();
+    const observed: {
+      childPending?: number;
+      parentFlush?: unknown;
+      rowsAtFlush?: CreateAICallInput[];
+    } = {};
+    const model = new MockLanguageModelV4({
+      async doStream() {
+        return {
+          stream: partsStream(
+            [
+              { type: "stream-start", warnings: [] },
+              { type: "text-start", id: "1" },
+              { type: "text-delta", id: "1", delta: "a" },
+              { type: "text-delta", id: "1", delta: "b" },
+            ],
+            finish.promise,
+          ),
+        };
+      },
+    });
+    const stage = defineStage({
+      ...diagnosticsStage,
+      async execute(ctx) {
+        const child = ctx.ai.createChild("chat");
+        let delivered = 0;
+        const result = child.streamText(
+          modelKey,
+          { prompt: "request marker" },
+          {
+            // The client's response body is cancelled after one chunk.
+            onChunk: () => {
+              if (++delivered > 1)
+                throw new TypeError(
+                  "Invalid state: Controller is already closed",
+                );
+            },
+          },
+        );
+        const usage = result.getUsage();
+        try {
+          for await (const _ of result.stream) {
+            // Deliver to the client.
+          }
+        } catch {
+          // The delivery ended; the usage reader continues.
+        }
+        // The delivery error's row settles; the request is still open.
+        observed.childPending = (await child.flush({ timeoutMs: 200 })).pending;
+        const parentFlush = ctx.ai.flush({ timeoutMs: 2_000 });
+        setTimeout(
+          () =>
+            finish.resolve([
+              { type: "text-end", id: "1" },
+              {
+                type: "finish",
+                finishReason: { unified: "stop", raw: "stop" },
+                usage: v4Usage(2, 3),
+              },
+            ]),
+          150,
+        );
+        observed.parentFlush = await parentFlush;
+        observed.rowsAtFlush = await db.client.aICall.findMany({
+          where: { workflowRunId: ctx.workflowRunId },
+        });
+        await usage;
+        return { output: {} };
+      },
+    });
+    const { kernel, job } = await queueJob(stage, {
+      services: {
+        aiLogger: db.aiLogger,
+        ai: (topic, logger, context, _resolver, options) =>
+          createAIHelper(topic, logger, context, () => model, options),
+      },
+    });
+    expect(
+      (
+        await executeJobWithHeartbeat(kernel, {
+          job,
+          jobTransport: db.jobTransport,
+        })
+      ).outcome,
+    ).toBe("completed");
+    expect(observed.childPending).toBe(1);
+    expect(observed.parentFlush).toEqual({ failed: 0, pending: 0 });
+    expect(
+      observed.rowsAtFlush!.map((row) => [row.inputTokens, row.outputTokens]),
     ).toContainEqual([2, 3]);
   });
 });

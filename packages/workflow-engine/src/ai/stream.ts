@@ -8,10 +8,9 @@
 
 import type { SharedV4ProviderOptions } from "@ai-sdk/provider";
 import type { GenerateTextEndEvent, TextStreamPart, ToolSet } from "ai";
-import { streamText as aiStreamText } from "ai";
+import { streamText as aiStreamText, NoOutputGeneratedError } from "ai";
 import { type CallAccounting, logFailure } from "./generate";
 import { getModel, type ModelKey } from "./model-helper";
-import { observeStreamReadErrors } from "./provider-diagnostics.js";
 import {
   assertAdapterProviderPolicy,
   logger,
@@ -44,11 +43,7 @@ export function streamText(
     assertAdapterProviderPolicy(ctx.routing?.provider);
   const model = ctx.adapter?.streamText
     ? undefined
-    : observeStreamReadErrors(
-        resolveLanguageModel(ctx, modelConfig),
-        // The stream has ended without a row.
-        () => closeStream?.(),
-      );
+    : resolveLanguageModel(ctx, modelConfig);
   const startTime = Date.now();
   const timeout = createCallTimeout(
     options.abortSignal,
@@ -63,8 +58,16 @@ export function streamText(
       ? input.prompt
       : (JSON.stringify(input.messages) ?? "");
 
-  // Pending from the call until its row is written or it ends without one.
+  // Pending from the call until its row is written, or until the SDK ends the
+  // request without one and no usage reader is still writing it (getUsage
+  // writes after an abort). A consumer that stops reading does not end it.
   let closeStream: (() => void) | undefined;
+  let requestEnded = false;
+  let usageReads = 0;
+  const endRequest = () => {
+    requestEnded = true;
+    if (usageReads === 0) closeStream?.();
+  };
   // Both SDK callbacks and consumer accessors can observe the same failure.
   let errorLogged = false;
   let streamError: { error: unknown } | undefined;
@@ -296,21 +299,33 @@ export function streamText(
     }),
     onStepEnd,
     onError: ({ error }: { error: unknown }) => recordStreamError(error),
-    onAbort: () => closeStream?.(),
-    // An error part can precede a billable finish. A stream that ends with no
-    // finished step gets no onEnd and so no row; one that has one waits for it.
+    onAbort: endRequest,
+    // Sees the request's parts before the SDK's own end handling. An error
+    // part can precede a billable finish, so the end decides: the SDK calls
+    // onEnd (and writes the row) only for a finished step and no
+    // NoOutputGeneratedError. A provider, tool or transport failure errors
+    // the stream and cancels this transform.
     experimental_transform: () => {
       let finishedStep = false;
+      let noOutput = false;
       return new TransformStream<
         TextStreamPart<ToolSet>,
         TextStreamPart<ToolSet>
       >({
         transform(part, controller) {
           if (part.type === "finish-step") finishedStep = true;
+          if (
+            part.type === "error" &&
+            NoOutputGeneratedError.isInstance(part.error)
+          )
+            noOutput = true;
           controller.enqueue(part);
         },
         flush() {
-          if (!finishedStep) closeStream?.();
+          if (!finishedStep || noOutput) endRequest();
+        },
+        cancel() {
+          endRequest();
         },
       });
     },
@@ -377,7 +392,7 @@ export function streamText(
           : result!.textStream[Symbol.asyncIterator]();
       } catch (error) {
         logError(error);
-        closeStream?.();
+        if (adapterResponse) closeStream?.();
         throw error;
       }
       return {
@@ -385,7 +400,11 @@ export function streamText(
           try {
             const { done, value } = await runWithCallTimeout(timeout, () =>
               reader.next(),
-            );
+            ).catch((error: unknown) => {
+              // An adapter's stream has ended; the SDK reports its own end.
+              if (adapterResponse) closeStream?.();
+              throw error;
+            });
             if (done) {
               if (adapterResponse) persistAdapterUsage(adapterResponse);
               return { done: true, value: undefined };
@@ -396,7 +415,6 @@ export function streamText(
             return { done: false, value };
           } catch (error) {
             recordStreamError(error);
-            closeStream?.();
             throw timeoutErrorIfExpired(timeout, error);
           }
         },
@@ -412,7 +430,7 @@ export function streamText(
 
   // Create usage getter that waits for stream completion and persists
   // (or reuses the persistence already done by onEnd).
-  const getUsage = async () => {
+  const readUsage = async () => {
     try {
       if (timeout.timedOut() && timeout.error) throw timeout.error;
       if (adapterResponse) return persistAdapterUsage(adapterResponse);
@@ -431,6 +449,16 @@ export function streamText(
     } catch (error) {
       logError(streamError ? streamError.error : error);
       throw timeoutErrorIfExpired(timeout, error);
+    }
+  };
+
+  const getUsage = async () => {
+    if (adapterResponse) return readUsage();
+    usageReads++;
+    try {
+      return await readUsage();
+    } finally {
+      if (--usageReads === 0 && requestEnded) closeStream?.();
     }
   };
 
