@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
 import { defineStage } from "../core/stage-factory.js";
@@ -966,6 +967,105 @@ describe.skipIf(!realDatabase)(
       });
       expect(continued).toBe(false);
       await expect(t.signal(t.worker(), "late")).rejects.toThrow("has failed");
+    });
+
+    it.each([
+      "before its write registers",
+      "while its write is registered",
+    ] as const)("writes nothing for a run cancelled and erased while a poll times out its wait %s", async (pause) => {
+      const t = await start(async (step) => {
+        const answer = await step.waitForSignal<string>("answer", {
+          onTimeout: "return",
+          timeout: 100,
+        });
+        return answer.timedOut ? "timeout" : answer.value;
+      });
+      await expect(t.execute()).resolves.toMatchObject({
+        outcome: "suspended",
+      });
+      const { workflowRunId } = (await t.getStage())!;
+      clock.advance(100);
+
+      // The poll's first run write is the timeout of the expired wait.
+      const gate = barrier();
+      let paused = false;
+      const once = async () => {
+        if (paused) return;
+        paused = true;
+        await gate.pause();
+      };
+      const poller = t.worker(
+        pause === "before its write registers"
+          ? {
+              persistence: override(db.persistence, {
+                beginRunWrite: async (...args) => {
+                  await once();
+                  return db.persistence.beginRunWrite!(...args);
+                },
+              }),
+            }
+          : {
+              stepLedger: override(db.stepLedger, {
+                compareAndSet: async (...args) => {
+                  await once();
+                  return db.stepLedger.compareAndSet(...args);
+                },
+              }),
+            },
+      );
+      const polling = poller.dispatch({ type: "stage.pollSuspended" });
+      await gate.reached;
+
+      // Installations add erasure's indexes with the attribution columns.
+      const ddl = await readFile(
+        new URL(
+          `../../sql/retention-indexes.${sqlite ? "sqlite" : "postgresql"}.sql`,
+          import.meta.url,
+        ),
+        "utf8",
+      );
+      for (const statement of ddl.split(";").filter((sql) => sql.trim())) {
+        await db.client.$executeRawUnsafe(statement);
+      }
+      const admin = t.worker({ services: { aiLogger: db.aiLogger } });
+      const erase = {
+        type: "run.purge",
+        workflowRunIds: [workflowRunId],
+      } as const;
+      try {
+        await admin.dispatch({ type: "run.cancel", workflowRunId });
+        // A registered write holds the erasure until it ends.
+        await expect(admin.dispatch(erase)).resolves.toMatchObject(
+          pause === "before its write registers"
+            ? { removed: { runs: 1 }, incomplete: [] }
+            : {
+                removed: { runs: 0 },
+                incomplete: [{ workflowRunId, failed: ["writers"] }],
+              },
+        );
+      } finally {
+        gate.release();
+        await polling;
+      }
+      if (pause === "while its write is registered") {
+        await expect(admin.dispatch(erase)).resolves.toMatchObject({
+          removed: { runs: 1 },
+          incomplete: [],
+        });
+      }
+
+      // Nothing the poll did after the erasure left a row behind.
+      const counts = await Promise.all([
+        db.client.workflowRun.count(),
+        db.client.workflowStage.count(),
+        db.client.workflowStep.count(),
+        db.client.workflowBlob.count(),
+        db.client.jobQueue.count(),
+        db.client.outboxEvent.count(),
+        db.client.idempotencyKey.count(),
+      ]);
+      expect(counts).toEqual([0, 0, 0, 0, 0, 0, 0]);
+      expect(events.getByType("step:signalled")).toEqual([]);
     });
   },
 );

@@ -530,7 +530,8 @@ async function replayStage(
     if (!workflow) {
       throw new Error(`Workflow ${run.workflowId} not found in registry`);
     }
-    await settleExpiredDurableWait(stageRecord.id, deps);
+    // The deadline's own write is a run write like the body's.
+    await settleExpiredDurableWait(stageRecord.id, writes);
     const workflowContext = await loadWorkflowContext(run.id, deps);
     const rawInput = resolveStageInput(
       workflow,
