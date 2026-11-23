@@ -41,6 +41,7 @@ interface RunSummary {
   workflowId: string;
   workflowName: string;
   workflowType: string;
+  tenantId?: string | null;
   status: string;
   startedAt: string | null;
   completedAt: string | null;
@@ -567,10 +568,12 @@ function RunsView({
 }) {
   const [selectedStatuses, setSelectedStatuses] = useState<string[]>([]);
   const [workflowIdInput, setWorkflowIdInput] = useState<string>("");
+  const [tenantIdInput, setTenantIdInput] = useState("");
   const [definitionVersionInput, setDefinitionVersionInput] = useState<string>("");
   const [fromInput, setFromInput] = useState<string>("");
   const [toInput, setToInput] = useState<string>("");
   const debouncedWorkflowId = useDebounced(workflowIdInput);
+  const debouncedTenantId = useDebounced(tenantIdInput);
   const debouncedDefinitionVersion = useDebounced(definitionVersionInput);
 
   const [cursor, setCursor] = useState<string | undefined>(undefined);
@@ -583,6 +586,7 @@ function RunsView({
   }, [
     selectedStatuses,
     debouncedWorkflowId,
+    debouncedTenantId,
     debouncedDefinitionVersion,
     fromInput,
     toInput,
@@ -601,6 +605,9 @@ function RunsView({
     }
     if (debouncedWorkflowId.trim()) {
       params.set("workflowId", debouncedWorkflowId.trim());
+    }
+    if (debouncedTenantId !== "") {
+      params.set("tenantId", debouncedTenantId);
     }
     if (debouncedDefinitionVersion.trim()) {
       params.set("definitionVersion", debouncedDefinitionVersion.trim());
@@ -622,6 +629,7 @@ function RunsView({
     config,
     selectedStatuses,
     debouncedWorkflowId,
+    debouncedTenantId,
     debouncedDefinitionVersion,
     fromInput,
     toInput,
@@ -637,6 +645,7 @@ function RunsView({
 
   const activeError = error === dismissedError ? null : error;
   const isForbidden = activeError && "code" in activeError && activeError.code === "forbidden";
+  const showTenant = data?.runs.some((run) => typeof run.tenantId === "string");
 
   const handleNext = () => {
     if (data?.nextCursor) {
@@ -681,6 +690,14 @@ function RunsView({
             value={workflowIdInput}
             onInput={(e) => setWorkflowIdInput((e.target as HTMLInputElement).value)}
           />
+          <label class="sr-only" for="wc-filter-tenant">Tenant ID</label>
+          <input
+            id="wc-filter-tenant"
+            type="text"
+            placeholder="Filter tenant ID..."
+            value={tenantIdInput}
+            onInput={(e) => setTenantIdInput((e.target as HTMLInputElement).value)}
+          />
           <label class="sr-only" for="wc-filter-version">Definition version</label>
           <input
             id="wc-filter-version"
@@ -720,6 +737,7 @@ function RunsView({
                   <th scope="col">Status</th>
                   <th scope="col">Run ID</th>
                   <th scope="col">Workflow</th>
+                  {showTenant && <th scope="col">Tenant</th>}
                   <th scope="col">Version</th>
                   <th scope="col">Started</th>
                   <th scope="col">Duration</th>
@@ -739,6 +757,7 @@ function RunsView({
                       </a>
                     </td>
                     <td>{run.workflowName || run.workflowId}</td>
+                    {showTenant && <td>{run.tenantId ?? "—"}</td>}
                     <td title={run.definitionVersion ?? undefined}>
                       {formatVersion(run.definitionVersion)}
                       {run.redriveCount > 0 && (
@@ -755,7 +774,7 @@ function RunsView({
                 ))}
                 {data && data.runs.length === 0 && (
                   <tr>
-                    <td colspan={8} class="empty-state">No workflow runs found.</td>
+                    <td colspan={showTenant ? 9 : 8} class="empty-state">No workflow runs found.</td>
                   </tr>
                 )}
               </tbody>

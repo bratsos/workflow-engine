@@ -88,6 +88,7 @@ const RUN_COLUMNS: RawColumns = {
   workflowId: "text",
   workflowName: "text",
   workflowType: "text",
+  tenantId: "text",
   status: "text",
   startedAt: "timestamp",
   completedAt: "timestamp",
@@ -276,6 +277,7 @@ interface RawRunRow {
   workflowId: string;
   workflowName: string;
   workflowType: string;
+  tenantId: string | null;
   status: string;
   startedAt: RawNullableTimestamp;
   completedAt: RawNullableTimestamp;
@@ -427,6 +429,7 @@ function mapRunSummary(row: RawRunRow): RunSummary {
     workflowId: String(row.workflowId),
     workflowName: String(row.workflowName),
     workflowType: String(row.workflowType),
+    tenantId: row.tenantId ?? null,
     status: row.status as ConsoleStatus,
     startedAt: toDate(row.startedAt),
     completedAt: toDate(row.completedAt),
@@ -1171,6 +1174,12 @@ export class PrismaConsoleReadPort implements ConsoleReadPort {
       paramIdx += 1;
     }
 
+    if (query.filters?.tenantId !== undefined) {
+      where.push(`"tenantId" = ${this.param(paramIdx)}`);
+      params.push(query.filters.tenantId);
+      paramIdx += 1;
+    }
+
     if (query.filters?.definitionVersion !== undefined) {
       where.push(`"definitionVersion" = ${this.param(paramIdx)}`);
       params.push(query.filters.definitionVersion);
@@ -1193,7 +1202,7 @@ export class PrismaConsoleReadPort implements ConsoleReadPort {
       where.length > 0 ? `\nWHERE ${where.join(" AND ")}` : "";
     const sql = `SELECT id, "createdAt", "updatedAt", "workflowId", "workflowName", "workflowType",
        status, "startedAt", "completedAt", duration, "totalCost", "totalTokens", priority,
-       "definitionVersion", "redriveCount"
+       "definitionVersion", "redriveCount", "tenantId"
 FROM "workflow_runs"${whereClause}
 ORDER BY "createdAt" DESC, id DESC
 LIMIT ${limit + 1}`;
@@ -1385,7 +1394,7 @@ WHERE "workflowRunId" = ${this.param(1)} AND sequence > ${this.param(2)} AND seq
           RUN_DETAIL_COLUMNS,
           `SELECT id, "createdAt", "updatedAt", "workflowId", "workflowName", "workflowType",
        status, "startedAt", "completedAt", duration, "totalCost", "totalTokens", priority,
-       "definitionVersion", "redriveCount",
+       "definitionVersion", "redriveCount", "tenantId",
        ${["input", "output", "config", "metadata"].map((c) => this.jsonColumn(c)).join(", ")}
 FROM "workflow_runs" WHERE id = ${this.param(1)}`,
           [runId],

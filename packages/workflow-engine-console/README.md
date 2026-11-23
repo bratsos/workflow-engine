@@ -425,7 +425,7 @@ const handler = createWorkflowConsole({
 The operational console separates storage queries, API serialization, and UI presentation. `ConsoleReadPort` is a decoupled interface, and the JSON API can be mounted independently if you choose to build custom operational dashboards:
 
 - `GET /api/meta`: System capabilities and runtime configuration
-- `GET /api/runs`: Keyset-paginated workflow runs
+- `GET /api/runs`: Keyset-paginated workflow runs. The Tenant ID control sends `tenantId` for an exact match. The list shows a Tenant column on pages with tenant IDs. Omit the parameter to include all runs available to the reader, including runs with no tenant ID. The filter only changes the view. Anyone who can open the console can clear it and see every tenant available to the reader.
 - `GET /api/runs/:id`: Complete run detail graph
 - `GET /api/runs/:id/events?afterSequence=N&limit=L`: Incremental outbox event stream: the run's rows with a sequence above `N`, in order, at most `L` (`ConsoleReadPort.listRunEvents`). An answer may hold fewer than `L` rows while more remain (the Prisma reader reads at most `L` sequences past the first row it finds, so removed rows or a gap shorten it); only an empty answer means no row remains past `N`. Read again from the last sequence returned until the answer is empty.
 - `GET /api/queue`: Queue metrics and lease telemetry

@@ -85,6 +85,7 @@ function toRunSummary(run: FixtureRun): RunSummary {
     workflowId: run.workflowId,
     workflowName: run.workflowName,
     workflowType: run.workflowType,
+    tenantId: run.tenantId ?? null,
     status: run.status,
     startedAt: run.startedAt ?? null,
     completedAt: run.completedAt ?? null,
@@ -141,6 +142,7 @@ export class InMemoryConsoleReadPort implements ConsoleReadPort {
     const statuses = query.filters?.status;
     const workflowId = query.filters?.workflowId;
     const workflowType = query.filters?.workflowType;
+    const tenantId = query.filters?.tenantId;
     const definitionVersion = query.filters?.definitionVersion;
     const createdAfter = query.filters?.createdAfter;
     const createdBefore = query.filters?.createdBefore;
@@ -165,6 +167,9 @@ export class InMemoryConsoleReadPort implements ConsoleReadPort {
         return false;
       }
       if (workflowType !== undefined && run.workflowType !== workflowType) {
+        return false;
+      }
+      if (tenantId !== undefined && run.tenantId !== tenantId) {
         return false;
       }
       if (

@@ -52,6 +52,7 @@ export interface RunSummary {
   workflowId: string;
   workflowName: string;
   workflowType: string;
+  tenantId?: string | null;
   status: ConsoleStatus;
   startedAt: Date | null;
   completedAt: Date | null;
@@ -303,6 +304,8 @@ export interface RunListFilters {
   status?: ConsoleStatus[];
   workflowId?: string;
   workflowType?: string;
+  /** Exact match on the run's tenant ID. For display filtering only. */
+  tenantId?: string;
   createdAfter?: Date;
   createdBefore?: Date;
   definitionVersion?: string;

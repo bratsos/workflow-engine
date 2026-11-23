@@ -554,6 +554,30 @@ describe("query parameters", () => {
     );
   });
 
+  it("matches the tenantId query parameter exactly and returns it on the list row", async () => {
+    const reader = fixtureReader();
+    const run = reader.fixtures.runs[0]!;
+    run.tenantId = "tenant + A";
+    reader.fixtures.runs.push(
+      { ...run, id: "run-2", tenantId: "tenant + A-extra" },
+      { ...run, id: "run-3", tenantId: null },
+    );
+    const handler = build({ reader });
+    const response = await handler(
+      get("/console/api/runs?tenantId=tenant+%2B+A"),
+    );
+    expect(response.status).toBe(200);
+    expect((await body(response)).runs).toMatchObject([
+      { id: "run-1", tenantId: "tenant + A" },
+    ]);
+    const all = await handler(get("/console/api/runs")).then(body);
+    expect(all.runs.map((row: { id: string }) => row.id)).toEqual([
+      "run-3",
+      "run-2",
+      "run-1",
+    ]);
+  });
+
   it("rejects an unparseable date", async () => {
     expect((await build()(get("/console/api/runs?from=soon"))).status).toBe(
       400,
