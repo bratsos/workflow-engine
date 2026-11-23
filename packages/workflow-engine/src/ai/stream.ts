@@ -58,7 +58,8 @@ export function streamText(
       ? input.prompt
       : JSON.stringify(input.messages);
 
-  // Track whether we've logged an error (to avoid duplicate logs)
+  const closeStream = ctx.beginStream?.();
+  // Both SDK callbacks and consumer accessors can observe the same failure.
   let errorLogged = false;
   let streamError: { error: unknown } | undefined;
   const steps: ProviderResultLike[] = [];
@@ -77,7 +78,7 @@ export function streamText(
     errorLogged = true;
     const callError = timeoutErrorIfExpired(timeout, error);
 
-    logFailure(ctx.aiCallLogger, {
+    logFailure(ctx, {
       topic: ctx.topic,
       callType: "stream",
       modelKey,
@@ -103,6 +104,7 @@ export function streamText(
         ...(input.instructions ? { instructions: input.instructions } : {}),
       },
     });
+    closeStream?.();
     timeout.cleanup();
   };
 
@@ -239,6 +241,7 @@ export function streamText(
       },
     });
 
+    closeStream?.();
     timeout.cleanup();
 
     return cachedUsage;
@@ -285,6 +288,9 @@ export function streamText(
     }),
     onStepEnd,
     onError: ({ error }: { error: unknown }) => recordStreamError(error),
+    onAbort: ({ reason }: { reason?: unknown }) => {
+      logError(reason ?? new Error("Stream aborted"));
+    },
     // Ensure the call is always logged once the stream finishes, even if
     // the consumer never calls getUsage(). Dedup'd against getUsage() via
     // the usageResolved flag in persistUsage.

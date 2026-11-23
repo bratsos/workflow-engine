@@ -10,7 +10,8 @@ import type { SharedV4ProviderOptions } from "@ai-sdk/provider";
 import type { ToolSet } from "ai";
 import { generateText as aiGenerateText, Output } from "ai";
 import type { z } from "zod";
-import type { AICallLogger } from "../persistence";
+import { isTraceTextEnabled } from "../utils/logger";
+import { AICallTimeoutError } from "./errors";
 import { getModel, type ModelKey } from "./model-helper";
 import {
   assertAdapterProviderPolicy,
@@ -213,7 +214,7 @@ function resolveFailureAccounting(
  * accounting as a successful call when the provider already returned its bill.
  */
 export function logFailure(
-  aiCallLogger: AICallLogger,
+  ctx: AIHelperContext,
   params: {
     topic: string;
     callType: AICallType;
@@ -229,8 +230,17 @@ export function logFailure(
   },
 ): { errorMessage: string; durationMs: number } {
   const durationMs = Date.now() - params.startTime;
-  const errorMessage =
-    params.error instanceof Error ? params.error.message : String(params.error);
+  const safeError =
+    params.error instanceof AICallTimeoutError
+      ? `Timed out after ${params.error.timeoutMs}ms`
+      : params.error instanceof Error
+        ? params.error.name
+        : "Error";
+  const errorMessage = isTraceTextEnabled()
+    ? params.error instanceof Error
+      ? params.error.message
+      : String(params.error)
+    : safeError;
   const steps = params.steps ?? [];
   const accounting =
     params.accounting ??
@@ -247,7 +257,7 @@ export function logFailure(
   const servedBy = providerHistory.servedBy ?? accounting.servedBy;
   const servedBySteps =
     providerHistory.servedBySteps ?? accounting.servedBySteps;
-  aiCallLogger.logCall({
+  ctx.aiCallLogger.logCall({
     topic: params.topic,
     callType: params.callType,
     modelKey: params.modelKey,
@@ -274,7 +284,7 @@ export function logFailure(
       ...(servedBySteps !== undefined ? { servedBySteps } : {}),
       durationMs,
       status: "error",
-      error: errorMessage,
+      error: safeError,
     },
   });
 
@@ -551,7 +561,7 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
       ...(hasOutputSchema && { output }),
     };
   } catch (error) {
-    const { errorMessage, durationMs } = logFailure(ctx.aiCallLogger, {
+    const { errorMessage, durationMs } = logFailure(ctx, {
       topic: ctx.topic,
       callType: "text",
       modelKey,
@@ -784,7 +794,7 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
       ...(reasoning ? { reasoning } : {}),
     };
   } catch (error) {
-    const { errorMessage, durationMs } = logFailure(ctx.aiCallLogger, {
+    const { errorMessage, durationMs } = logFailure(ctx, {
       topic: ctx.topic,
       callType: "object",
       modelKey,

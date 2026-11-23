@@ -1342,7 +1342,12 @@ describe.skipIf(!sqlite)(`sqlite date guard on Prisma ${major}`, () => {
       [persistence, PrismaWorkflowPersistence, SYNC_PERSISTENCE, 40],
       [queue, PrismaJobQueue, SYNC_QUEUE, 10],
       [ledger, PrismaStepLedger, ["transactionReads"], 6],
-      [ai, PrismaAICallLogger, ["logCall", "transactionReads"], 3],
+      [
+        ai,
+        PrismaAICallLogger,
+        ["flush", "logBatchResults", "logCall", "transactionReads"],
+        3,
+      ],
     ] as const) {
       const { guarded, unguardedNames } = auditNames(klass.prototype);
       expect(unguardedNames, `${klass.name}: unguarded methods`).toEqual(
@@ -1357,27 +1362,28 @@ describe.skipIf(!sqlite)(`sqlite date guard on Prisma ${major}`, () => {
       }
     }
 
-    // logCall returns nothing to await: it checks itself, writes nothing and logs the refusal.
-    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    // Writes run the guard themselves. A refusal rejects but the logger also
+    // handles it if the caller discards the promise.
+    const logged = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
-      ai.logCall({
-        topic: "t",
-        callType: "text",
-        modelKey: "m",
-        modelId: "m",
-        prompt: "p",
-        response: "r",
-        inputTokens: 1,
-        outputTokens: 1,
-        cost: 0,
-      });
-      await vi.waitFor(() =>
-        expect(
-          logged.mock.calls.some((args) =>
-            args.some((a) => a instanceof SqliteDateStorageError),
-          ),
-        ).toBe(true),
+      await expect(
+        ai.logCall({
+          topic: "t",
+          callType: "text",
+          modelKey: "m",
+          modelId: "m",
+          prompt: "p",
+          response: "r",
+          inputTokens: 1,
+          outputTokens: 1,
+          cost: 0,
+        }),
+      ).rejects.toBeInstanceOf(SqliteDateStorageError);
+      await expect(ai.logBatchResults("batch-1", [])).rejects.toBeInstanceOf(
+        SqliteDateStorageError,
       );
+      expect(await ai.flush()).toEqual({ failed: 2, pending: 0 });
+      expect(logged).toHaveBeenCalledTimes(2);
     } finally {
       logged.mockRestore();
     }

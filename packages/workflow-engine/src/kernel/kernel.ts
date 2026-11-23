@@ -22,8 +22,11 @@
  */
 
 import { createAIHelper } from "../ai/ai-helper.js";
+import { DEFAULT_AI_FLUSH_TIMEOUT_MS } from "../ai/write-tracker.js";
 import type { Workflow } from "../core/workflow";
 import type {
+  AICallFlushOptions,
+  AICallFlushResult,
   AnnotationActor,
   AnnotationFilters,
   AnnotationScope,
@@ -76,6 +79,7 @@ import { handleRunTransition } from "./handlers/run-transition";
 import { handleStagePollSuspended } from "./handlers/stage-poll-suspended";
 import { handleStepSignal } from "./handlers/step-signal.js";
 import { servedDefinitions } from "./helpers/definition-pinning.js";
+import { assertTimerMs } from "./helpers/host-support.js";
 import {
   buildAnnotationEvents,
   filterCouldMatchLegacy,
@@ -159,6 +163,8 @@ export interface KernelConfig {
   stepLedger?: StepLedger;
   /** Optional services exposed lazily through stage contexts. */
   services?: KernelServices;
+  /** Maximum wait for AI writes at the end of a stage attempt. Defaults to 5 s. */
+  aiFlushTimeoutMs?: number;
   /**
    * How long an idempotency key may sit `in_progress` before a subsequent
    * dispatch is allowed to reclaim it. Guards against a dispatcher that
@@ -230,6 +236,8 @@ export interface KernelAnnotations {
 export interface Kernel {
   dispatch<T extends KernelCommand>(command: T): Promise<CommandResult<T>>;
   annotations: KernelAnnotations;
+  /** Wait for buffered writes in the configured AI logger. */
+  flush(options?: AICallFlushOptions): Promise<AICallFlushResult>;
   /**
    * The `(workflowId, version)` pairs this kernel's registry presents, or
    * `undefined` when the registry cannot enumerate (in which case nothing
@@ -256,6 +264,7 @@ export interface KernelDeps {
   executor: ActivityExecutor;
   stepLedger?: StepLedger;
   services?: KernelServices;
+  aiFlushTimeoutMs?: number;
 }
 
 // ============================================================================
@@ -375,6 +384,11 @@ export function createKernel(config: KernelConfig): Kernel {
     executor,
     stepLedger,
     services,
+    aiFlushTimeoutMs: assertTimerMs(
+      "aiFlushTimeoutMs",
+      config.aiFlushTimeoutMs ?? DEFAULT_AI_FLUSH_TIMEOUT_MS,
+      { allowZero: true },
+    ),
   };
 
   /**
@@ -861,6 +875,14 @@ export function createKernel(config: KernelConfig): Kernel {
   return {
     dispatch,
     annotations,
+    async flush(options) {
+      return (
+        (await services?.aiLogger?.flush?.(options)) ?? {
+          failed: 0,
+          pending: 0,
+        }
+      );
+    },
     servedDefinitions: () => servedDefinitions(config.registry),
   };
 }

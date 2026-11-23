@@ -345,6 +345,8 @@ export async function handleJobExecute(
         workflowId,
         workflowRunId,
         workflowType: workflowRun.workflowType,
+        tenantId: workflowRun.tenantId ?? undefined,
+        labels: workflowRun.labels ?? undefined,
         stageId,
         stageName: stageDef.name,
         stageNumber: stageRecord.stageNumber,

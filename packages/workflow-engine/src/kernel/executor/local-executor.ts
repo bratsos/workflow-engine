@@ -49,6 +49,8 @@ export function createLocalExecutor(): ActivityExecutor {
           annotations: built?.annotationBuffer.flush() ?? [],
           logs: [],
         };
+      } finally {
+        await built?.flushAI();
       }
     },
   };

@@ -111,6 +111,55 @@ When a workflow run completes or fails, the kernel queries `services.aiLogger.ge
 
 ---
 
+## Call attribution, text retention, and pending writes
+
+Set `AIHelperOptions.attribution` to attach an opaque `tenantId` and string
+`labels` to calls made by a standalone helper. Stage helpers inherit both from
+the run and also record the workflow run ID. A custom `KernelServices.ai`
+factory must forward its fifth argument to `createAIHelper`.
+
+```typescript
+const ai = createAIHelper("requests", logger, undefined, undefined, {
+  attribution: { tenantId: "tenant-a", labels: { queue: "interactive" } },
+  text: { store: "none" },
+  onLogError: (_error, call) => countFailedWrite(call.callType),
+});
+
+const worker = ai.createChild("worker", "1", {
+  attribution: { labels: { queue: "background" } },
+  text: { store: "full", ttlMs: 86_400_000 },
+});
+```
+
+Child helpers inherit the tenant and merge labels by key. A child text policy
+inherits the parent's TTL when omitted. The default stores full text without
+expiry. `store: "none"` leaves the prompt and response empty and drops stream
+instructions from the accounting row, including when the logger is custom.
+A full-text TTL sets `textExpiresAt` on the row so
+`engine.prune({ aiCallText: { now } })` can clear it when due. Trace output
+requires `WORKFLOW_ENGINE_TRACE_TEXT=1` in addition to
+`WORKFLOW_ENGINE_TRACE=1` to include request, response, and error text.
+
+The Prisma logger's `costByTenant({ tenantId, from, to, groupBy })` returns the
+total USD cost in the half-open period `[from, to)`. With a label key in
+`groupBy`, it also returns `groups` of `{ label, cost }`. A null group
+contains rows without the selected label.
+
+Use `recordCall` with `callType: "realtime"` for externally handled sessions
+and pass their USD `cost`. A supplied cost bypasses the model registry and
+uses the supplied `modelKey` as the recorded model ID. It defaults to
+`costSource: "reported"`; set `"estimated"` for a supplied estimate.
+
+At the end of a request, `await ai.flush({ timeoutMs: 5_000 })` returns
+`{ failed, pending }`. Failed writes are cumulative for that helper and its
+children. Pending includes open streams and writes still in progress when
+the timeout expires. Stage attempts flush before recording their outcome
+using `createKernel({ aiFlushTimeoutMs })`, which defaults to five seconds.
+The kernel logs a run warning with the counts if either is nonzero.
+`kernel.flush()` drains the configured logger when it implements `flush`.
+The Node host calls it during shutdown and the serverless host calls it
+before returning from an invocation.
+
 ## Core Operations
 
 ### 1. `generateText`

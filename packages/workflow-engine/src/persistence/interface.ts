@@ -613,6 +613,9 @@ export interface CreateAICallInput {
   cost: number;
   batchId?: string;
   requestId?: string;
+  tenantId?: string;
+  labels?: Record<string, string>;
+  textExpiresAt?: Date;
   /** The catalogue estimate, always computed by the helper even when the provider reported a cost. */
   estimatedCost?: number;
   /** The provider's own USD figure, when it reported one. */
@@ -1245,6 +1248,17 @@ export interface AIHelperStats {
   >;
 }
 
+export interface AICallFlushOptions {
+  timeoutMs?: number;
+}
+
+export interface AICallFlushResult {
+  /** Cumulative failed writes for this logger or helper. */
+  failed: number;
+  /** Writes or streams still open when the wait ended. */
+  pending: number;
+}
+
 export interface AICallLogger {
   /** Delete calls attributed to runs, including legacy workflow topics. */
   deleteForRuns?(runIds: readonly string[]): Promise<number>;
@@ -1252,10 +1266,14 @@ export interface AICallLogger {
   clearExpiredText?(now: Date, limit: number): Promise<number>;
 
   /**
-   * Log a single call. An asynchronous logger must return its write promise
-   * when used with targeted erasure, so the kernel can drain the operation.
+   * Log a single call. An asynchronous logger rejects when the write fails,
+   * and must return its write promise when used with targeted erasure, so
+   * the kernel can drain the operation.
    */
   logCall(call: CreateAICallInput): void | Promise<void>;
+
+  /** Wait for buffered writes, up to the given timeout. */
+  flush?(options?: AICallFlushOptions): Promise<AICallFlushResult | void>;
 
   /**
    * Log batch results (for recording batch API results)

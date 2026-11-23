@@ -156,6 +156,55 @@ The `providerResolver` and the factories registered with `registerEmbeddingProvi
 
 `max_price` is an exclusive filter on OpenRouter's side — a request whose price ceiling is below the live price fails outright rather than costing more — so the default headroom absorbs ordinary price drift between `workflow-engine-sync` runs. It bounds the per-token price of a routed call, not spend, and not the non-token charges OpenRouter documents as uncovered.
 
+## Call attribution, text retention, and pending writes
+
+Set `AIHelperOptions.attribution` to attach an opaque `tenantId` and string
+`labels` to calls made by a standalone helper. Stage helpers inherit both from
+the run and also record the workflow run ID. A custom `KernelServices.ai`
+factory must forward its fifth argument to `createAIHelper`.
+
+```typescript
+const ai = createAIHelper("requests", logger, undefined, undefined, {
+  attribution: { tenantId: "tenant-a", labels: { queue: "interactive" } },
+  text: { store: "none" },
+  onLogError: (_error, call) => countFailedWrite(call.callType),
+});
+
+const worker = ai.createChild("worker", "1", {
+  attribution: { labels: { queue: "background" } },
+  text: { store: "full", ttlMs: 86_400_000 },
+});
+```
+
+Child helpers inherit the tenant and merge labels by key. A child text policy
+inherits the parent's TTL when omitted. The default stores full text without
+expiry. `store: "none"` leaves the prompt and response empty and drops stream
+instructions from the accounting row, including when the logger is custom.
+A full-text TTL sets `textExpiresAt` on the row so
+`engine.prune({ aiCallText: { now } })` can clear it when due. Trace output
+requires `WORKFLOW_ENGINE_TRACE_TEXT=1` in addition to
+`WORKFLOW_ENGINE_TRACE=1` to include request, response, and error text.
+
+The Prisma logger's `costByTenant({ tenantId, from, to, groupBy })` returns the
+total USD cost in the half-open period `[from, to)`. With a label key in
+`groupBy`, it also returns `groups` of `{ label, cost }`. A null group
+contains rows without the selected label.
+
+Use `recordCall` with `callType: "realtime"` for externally handled sessions
+and pass their USD `cost`. A supplied cost bypasses the model registry and
+uses the supplied `modelKey` as the recorded model ID. It defaults to
+`costSource: "reported"`; set `"estimated"` for a supplied estimate.
+
+At the end of a request, `await ai.flush({ timeoutMs: 5_000 })` returns
+`{ failed, pending }`. Failed writes are cumulative for that helper and its
+children. Pending includes open streams and writes still in progress when
+the timeout expires. Stage attempts flush before recording their outcome
+using `createKernel({ aiFlushTimeoutMs })`, which defaults to five seconds.
+The kernel logs a run warning with the counts if either is nonzero.
+`kernel.flush()` drains the configured logger when it implements `flush`.
+The Node host calls it during shutdown and the serverless host calls it
+before returning from an invocation.
+
 ## AIHelper Interface
 
 ```typescript
@@ -172,6 +221,7 @@ interface AIHelper {
 
   createChild(segment, id?): AIHelper;
   recordCall(params): void;
+  flush(options?: { timeoutMs?: number }): Promise<{ failed: number; pending: number }>;
   getStats(): Promise<AIHelperStats>;
 }
 ```
@@ -898,7 +948,7 @@ Every call row (`AICallRecord`, read back with `aiLogger.listCalls(topicPrefix)`
 | `cachedInputTokens` | Input tokens served from the prompt cache. Part of `inputTokens`, not in addition to it. |
 | `reasoningTokens` | Reasoning tokens the model emitted. Part of `outputTokens` and billed as output; no separate charge. |
 
-The estimate bills `cachedInputTokens` at the model's `cachedInputCostPerMillion` (from OpenRouter's `pricing.input_cache_read`, which `workflow-engine-sync` emits when the catalogue publishes it) and the remaining input at the full rate; a registry entry without a cached rate bills every input token at the full rate. The token counts come from the AI SDK's `usage.inputTokenDetails.cacheReadTokens` / `usage.outputTokenDetails.reasoningTokens`, with OpenRouter's `promptTokensDetails.cachedTokens` / `completionTokensDetails.reasoningTokens` as the fallback. `AIHelper.recordCall` (an adapter recording its own call) writes `estimatedCost === cost` and `costSource: "estimated"`.
+The estimate bills `cachedInputTokens` at the model's `cachedInputCostPerMillion` (from OpenRouter's `pricing.input_cache_read`, which `workflow-engine-sync` emits when the catalogue publishes it) and the remaining input at the full rate; a registry entry without a cached rate bills every input token at the full rate. The token counts come from the AI SDK's `usage.inputTokenDetails.cacheReadTokens` / `usage.outputTokenDetails.reasoningTokens`, with OpenRouter's `promptTokensDetails.cachedTokens` / `completionTokensDetails.reasoningTokens` as the fallback. `AIHelper.recordCall` uses the registry estimate when the caller omits `cost`.
 
 A related figure that is *not* a cost: OpenRouter's `max_price` routing guard is the registry price times `routing.priceHeadroom` (default 1.25), so the estimate and the guard read the same price table. However, a `reportedCost` above `estimatedCost × priceHeadroom` does not prove an extra charge: cache-read rates are not guarded by `max_price` and setting `priceHeadroom: 0` disables the guard entirely. Treat the comparison as a diagnostic that prompts checking the endpoint's rates, prompt caching, routing configuration, and provider fees rather than proof of an overcharge.
 

@@ -247,7 +247,7 @@ export async function embed(
       costSource,
     };
   } catch (error) {
-    const { errorMessage, durationMs } = logFailure(ctx.aiCallLogger, {
+    const { errorMessage, durationMs } = logFailure(ctx, {
       topic: ctx.topic,
       callType: "embed",
       modelKey,

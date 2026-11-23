@@ -502,6 +502,8 @@ async function replayStage(
     const input: ActivityRunInput = {
       stageDef,
       workflowId: run.workflowId,
+      tenantId: run.tenantId ?? undefined,
+      labels: run.labels ?? undefined,
       workflowRunId: run.id,
       workflowType: run.workflowType,
       stageId: stageRecord.stageId,
@@ -517,7 +519,12 @@ async function replayStage(
       workflowContext,
     };
     built = buildStageExecutionContext(input, writes);
-    const result = await stageDef.execute(built.context);
+    let result: Awaited<ReturnType<typeof stageDef.execute>>;
+    try {
+      result = await stageDef.execute(built.context);
+    } finally {
+      await built.flushAI();
+    }
     const moved = await superseded(stageRecord, deps);
     if (moved) {
       // A cancel moved the stage: the body that just ran may have created a
@@ -999,7 +1006,7 @@ export async function handleStagePollSuspended(
     }) as CheckCompletionContext<unknown>["annotate"];
 
     // 3e. Build check context
-    const checkContextBase = defineLazyAIContext(
+    const { context: checkContextBase, flushAI } = defineLazyAIContext(
       {
         workflowRunId: run.id,
         stageId: stageRecord.stageId,
@@ -1014,6 +1021,8 @@ export async function handleStagePollSuspended(
         workflowRunId: run.id,
         stageId: stageRecord.stageId,
         stageRecordId: stageRecord.id,
+        tenantId: run.tenantId ?? undefined,
+        labels: run.labels ?? undefined,
       },
       writes,
     );
@@ -1077,11 +1086,13 @@ export async function handleStagePollSuspended(
         throw new TypeError(`checkCompletion returned ${checkResult}`);
       }
     } catch (error) {
+      await flushAI();
       // Annotations recorded before the throw persist alongside the FAILED
       // outcome.
       await failPolledStage(toErrorMessage(error));
       continue;
     }
+    await flushAI();
 
     try {
       const moved = await superseded(stageRecord, deps);

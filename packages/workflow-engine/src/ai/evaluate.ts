@@ -241,7 +241,7 @@ export async function evaluate<const Q extends EvaluationQuestions>(
       costSource,
     };
   } catch (error) {
-    const { errorMessage, durationMs } = logFailure(ctx.aiCallLogger, {
+    const { errorMessage, durationMs } = logFailure(ctx, {
       topic: ctx.topic,
       callType: "evaluate",
       modelKey,

@@ -10,6 +10,7 @@ import {
   getProviderModelId,
   resolveModelForProvider,
 } from "../utils/batch/model-mapping";
+import { isTraceTextEnabled } from "../utils/logger";
 import { isCancelledRawStatus } from "./batch/adoption";
 import { isNotBatchCapableError, resolveAiSdkBatchModel } from "./batch/ai-sdk";
 import {
@@ -1112,12 +1113,19 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
       // provider failures are the endpoint rejecting the request itself.
       const classes = [
         schemaFailures > 0
-          ? `${schemaFailures} failed schema validation (first issue: ${firstSchemaIssue ?? "unknown"})`
+          ? `${schemaFailures} failed schema validation`
           : undefined,
         providerFailures > 0
-          ? `${providerFailures} failed at the provider (first error: ${firstProviderError ?? "unknown"})`
+          ? `${providerFailures} failed at the provider`
           : undefined,
       ].filter((c): c is string => c !== undefined);
+      if (isTraceTextEnabled()) {
+        logger.debug("Batch result errors", {
+          batchId,
+          firstSchemaIssue,
+          firstProviderError,
+        });
+      }
       const warnMsg = `[Batch] ${failures} of ${results.length} results in batch ${batchId} failed: ${classes.join("; ")}.`;
       const meta = {
         batchId,
@@ -1229,9 +1237,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
                 ...(extra.batchDurationMs !== undefined
                   ? { batchDurationMs: extra.batchDurationMs }
                   : {}),
-                ...(r.status === "failed"
-                  ? { status: "failed", error: r.error }
-                  : {}),
+                ...(r.status === "failed" ? { status: "failed" } : {}),
               },
             };
           }),

@@ -22,6 +22,7 @@ import { createStepApi } from "./step-api.js";
 export interface BuiltStageExecutionContext {
   context: StageContext<any, any, any>;
   progressEvents: KernelEvent[];
+  flushAI: () => Promise<void>;
   annotationBuffer: ReturnType<typeof createAnnotationBuffer>;
 }
 
@@ -32,9 +33,14 @@ export function defineLazyAIContext<T extends object>(
     workflowRunId: string;
     stageId: string;
     stageRecordId?: string;
+    tenantId?: string;
+    labels?: Record<string, string>;
   },
   deps: ExecutorDeps,
-): T & { readonly ai: AIHelper; readonly aiLogger: AICallLogger } {
+): {
+  context: T & { readonly ai: AIHelper; readonly aiLogger: AICallLogger };
+  flushAI: () => Promise<void>;
+} {
   let helper: AIHelper | undefined;
   const topic = `workflow.${params.workflowRunId}.stage.${params.stageId}`;
   const stageRecordId = params.stageRecordId ?? params.stageId;
@@ -88,7 +94,13 @@ export function defineLazyAIContext<T extends object>(
             services.aiLogger,
             logContext,
             undefined,
-            undefined,
+            {
+              attribution: {
+                tenantId: params.tenantId,
+                labels: params.labels,
+                workflowRunId: params.workflowRunId,
+              },
+            },
           );
         }
         return helper;
@@ -101,9 +113,26 @@ export function defineLazyAIContext<T extends object>(
     },
   });
 
-  return target as T & {
-    readonly ai: AIHelper;
-    readonly aiLogger: AICallLogger;
+  return {
+    context: target as T & {
+      readonly ai: AIHelper;
+      readonly aiLogger: AICallLogger;
+    },
+    async flushAI() {
+      if (!helper?.flush) return;
+      const counts = await helper
+        .flush({ timeoutMs: deps.aiFlushTimeoutMs })
+        .catch(() => ({ failed: 1, pending: 0 }));
+      if (counts.failed === 0 && counts.pending === 0) return;
+      await deps.persistence
+        .createLog({
+          workflowRunId: params.workflowRunId,
+          level: "WARN",
+          message: "AI call logging did not finish successfully",
+          metadata: counts,
+        })
+        .catch(() => {});
+    },
   };
 }
 
@@ -227,9 +256,9 @@ export function buildStageExecutionContext(
     workflowContext,
   } as StageContext<any, any, any>;
 
-  defineLazyAIContext(context, { workflowRunId, stageId, stageRecordId }, deps);
+  const { flushAI } = defineLazyAIContext(context, input, deps);
 
-  return { context, progressEvents, annotationBuffer };
+  return { context, progressEvents, annotationBuffer, flushAI };
 }
 
 /** Resolve the same stage input used by job.execute for a replay. */

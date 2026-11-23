@@ -237,7 +237,7 @@ describe("step.ai.map batch policy", () => {
     expect(warns).toHaveLength(1);
     expect(warns[0]!.message).toContain("20 of 25 results in batch batch-1");
     expect(warns[0]!.message).toContain("20 failed schema validation");
-    expect(warns[0]!.message).toContain("first issue:");
+    expect(warns[0]!.message).not.toContain("first issue:");
     // The repair pass still fixed every item realtime.
     expect(h.mock.getCalls()).toHaveLength(20);
     expect(h.results().every((r) => r.status === "succeeded")).toBe(true);
@@ -270,7 +270,7 @@ describe("step.ai.map batch policy", () => {
         "20 of 25 requests in batch batch-1 failed at the provider",
       ),
       expect.stringContaining(
-        "20 of 25 results in batch batch-1 failed: 20 failed at the provider (first error: Request contains an invalid argument.)",
+        "20 of 25 results in batch batch-1 failed: 20 failed at the provider.",
       ),
     ]);
     // Every provider-failed item was re-run realtime by the repair pass.

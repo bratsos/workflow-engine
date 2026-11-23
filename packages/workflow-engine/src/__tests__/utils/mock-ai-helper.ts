@@ -611,6 +611,10 @@ export class MockAIHelper implements AIHelper {
     });
   }
 
+  async flush() {
+    return (await this.callLogger?.flush?.()) ?? { failed: 0, pending: 0 };
+  }
+
   async getStats(): Promise<AIHelperStats> {
     const allCalls = this.getAllCallsRecursive();
     const stats: AIHelperStats = {

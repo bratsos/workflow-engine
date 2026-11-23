@@ -448,6 +448,7 @@ class NodeHostImpl implements NodeHost {
     if (this.flushOutboxOnStop) {
       await this.flushOutbox();
     }
+    await this.kernel.flush?.({ timeoutMs: this.shutdownTimeoutMs });
   }
 
   /** Publish pending outbox events, bounded by `shutdownTimeoutMs`. */

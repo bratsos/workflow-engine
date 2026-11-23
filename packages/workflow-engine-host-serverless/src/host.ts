@@ -289,9 +289,17 @@ class ServerlessHostImpl implements ServerlessHost {
     await this.jobTransport.verifyStorage?.();
   }
 
-  async handleJob(msg: JobMessage): Promise<JobResult> {
+  private async invoke<T>(work: () => Promise<T>): Promise<T> {
     await this.ready();
-    return this.runJob(msg);
+    try {
+      return await work();
+    } finally {
+      await this.kernel.flush?.();
+    }
+  }
+
+  handleJob(msg: JobMessage): Promise<JobResult> {
+    return this.invoke(() => this.runJob(msg));
   }
 
   private async runJob(msg: JobMessage): Promise<JobResult> {
@@ -344,8 +352,10 @@ class ServerlessHostImpl implements ServerlessHost {
   async processAvailableJobs(opts?: {
     maxJobs?: number;
   }): Promise<ProcessJobsResult> {
-    await this.ready();
-    const maxJobs = opts?.maxJobs ?? 1;
+    return this.invoke(() => this.processJobs(opts?.maxJobs ?? 1));
+  }
+
+  private async processJobs(maxJobs: number): Promise<ProcessJobsResult> {
     let processed = 0;
     let succeeded = 0;
     let failed = 0;
@@ -392,7 +402,10 @@ class ServerlessHostImpl implements ServerlessHost {
   }
 
   async runMaintenanceTick(): Promise<MaintenanceTickResult> {
-    await this.ready();
+    return this.invoke(() => this.maintenanceTick());
+  }
+
+  private async maintenanceTick(): Promise<MaintenanceTickResult> {
     // Claim pending runs, poll suspended stages, reap stale leases, flush
     // the outbox, and reap stuck runs — see runMaintenanceTick in
     // @bratsos/workflow-engine/kernel for the shared command sequence. The
