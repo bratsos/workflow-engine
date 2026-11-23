@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { defineWorkflow, type Workflow } from "@bratsos/workflow-engine";
 import {
@@ -40,6 +41,14 @@ describe.skipIf(!realDatabase)(
     let hosts: NodeHost[];
     beforeAll(async () => {
       db = await kernelDatabase();
+      const sql = await readFile(
+        new URL(
+          `../../../workflow-engine/sql/job-workflow-index.${sqlite ? "sqlite" : "postgresql"}.sql`,
+          import.meta.url,
+        ),
+        "utf8",
+      );
+      await db.client.$executeRawUnsafe(sql);
     }, 120_000);
     beforeEach(async () => {
       hosts = [];
@@ -366,8 +375,9 @@ describe.skipIf(!realDatabase)(
           })
           .build();
       const capped = makeWorkflow("capped", 1);
-      const free = makeWorkflow("free");
-      const workflows = [capped, free];
+      const later = makeWorkflow("free-a");
+      const older = makeWorkflow("free-z");
+      const workflows = [capped, later, older];
       const first = makeHost(workflows, db.client, { concurrency: 2 });
       const fixtures = createRequire(import.meta.url)(
         "../../../prisma-fixtures/index.cjs",
@@ -399,7 +409,8 @@ describe.skipIf(!realDatabase)(
         const ids: string[] = [];
         for (let i = 0; i < 3; i++)
           ids.push(await createRun(first.kernel, capped.id, 10));
-        for (let i = 0; i < 2; i++) await createRun(first.kernel, free.id, 1);
+        await createRun(first.kernel, later.id, 1);
+        const oldest = await createRun(first.kernel, older.id, 1);
         await first.kernel.dispatch({
           type: "run.claimPending",
           workerId: "runtime-1",
@@ -409,6 +420,10 @@ describe.skipIf(!realDatabase)(
         await db.client.jobQueue.updateMany({
           where: { workflowId: capped.id },
           data: { workflowId: null },
+        });
+        await db.client.jobQueue.updateMany({
+          where: { workflowRunId: oldest },
+          data: { createdAt: new Date(0) },
         });
         const options = {
           serves: first.kernel.servedDefinitions(),
@@ -423,6 +438,9 @@ describe.skipIf(!realDatabase)(
             (job) => job && ids.includes(job.workflowRunId),
           ),
         ).toHaveLength(1);
+        expect(claimsByWorker.map((job) => job?.workflowRunId)).toContain(
+          oldest,
+        );
         for (const [index, job] of claimsByWorker.entries()) {
           expect(job).toMatchObject({ leaseMs: 120_000, attempt: 1 });
           const row = await jobOf(job!.workflowRunId);

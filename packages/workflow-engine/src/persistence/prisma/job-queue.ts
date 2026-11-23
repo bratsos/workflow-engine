@@ -704,8 +704,11 @@ export class PrismaJobQueue implements JobQueue {
         SELECT 1::int AS locked FROM pg_advisory_xact_lock(1464223045, 413)
       `;
 
+        // Seek to each distinct workflow key. Saturated workflows appear
+        // in this walk, but only eligible keys get an ordered candidate read.
+        // The ':' prefix keeps the NULL/unknown bucket separate from any ID.
         return rawFor(tx, DEQUEUED_JOB_COLUMNS).$queryRaw!<DequeuedJobRow[]>`
-        WITH saturated AS MATERIALIZED (
+        WITH RECURSIVE saturated AS MATERIALIZED (
           SELECT l.wf
           FROM unnest(${limits.map((limit) => limit.workflowId)}::text[],
                       ${limits.map((limit) => limit.maxConcurrent)}::integer[]) AS l(wf, cap)
@@ -726,6 +729,25 @@ export class PrismaJobQueue implements JobQueue {
           FROM "job_queue"
           WHERE ${this.fairnessPath !== null}::boolean AND status = 'RUNNING'
           GROUP BY 1
+        ), pending_workflows(bucket) AS (
+          SELECT (
+            SELECT COALESCE(':' || COALESCE(j."workflowId", j.payload ->> '_workflowId'), '')
+            FROM "job_queue" j WHERE j.status = 'PENDING'
+            ORDER BY 1 LIMIT 1
+          )
+          UNION ALL
+          SELECT (
+            SELECT COALESCE(':' || COALESCE(j."workflowId", j.payload ->> '_workflowId'), '')
+            FROM "job_queue" j WHERE j.status = 'PENDING'
+              AND COALESCE(':' || COALESCE(j."workflowId", j.payload ->> '_workflowId'), '') > w.bucket
+            ORDER BY 1 LIMIT 1
+          )
+          FROM pending_workflows w WHERE w.bucket IS NOT NULL
+        ), eligible AS MATERIALIZED (
+          SELECT w.bucket FROM pending_workflows w
+          WHERE w.bucket IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM saturated s WHERE ':' || s.wf = w.bucket
+          )
         )
         UPDATE "job_queue"
         SET status = 'RUNNING',
@@ -738,27 +760,29 @@ export class PrismaJobQueue implements JobQueue {
               + "absoluteTimeoutMs" * interval '1 millisecond',
             attempt = attempt + 1
         WHERE id = (
-          SELECT j.id
-          FROM "job_queue" j
-          LEFT JOIN group_load g
-            ON g.grp = COALESCE(j.payload #>> ${this.fairnessPath ?? []}::text[], j.payload ->> '_groupKey', '')
-          WHERE j.status = 'PENDING'
-            AND (j."nextPollAt" IS NULL OR j."nextPollAt" <= (statement_timestamp() AT TIME ZONE 'UTC'))
-            AND NOT EXISTS (
-              SELECT 1 FROM saturated s
-              WHERE s.wf = COALESCE(j."workflowId", j.payload ->> '_workflowId')
-            )
-            AND (${this.fairnessPath === null}::boolean OR COALESCE(g.running, 0) < ${this.fairnessLimit}::bigint)
-            AND (
-              NOT ${active}::boolean OR (j.payload ->> '_workflowId') IS NULL OR EXISTS (
-                SELECT 1 FROM unnest(${workflowIds}::text[], ${versions}::text[]) AS s(wf, ver)
-                WHERE s.wf = j.payload ->> '_workflowId'
-                  AND ((j.payload ->> '_definitionVersion') IS NULL OR s.ver = j.payload ->> '_definitionVersion')
+          SELECT head.id FROM eligible e
+          CROSS JOIN LATERAL (
+            SELECT j.id, j.priority, j."createdAt"
+            FROM "job_queue" j
+            LEFT JOIN group_load g
+              ON g.grp = COALESCE(j.payload #>> ${this.fairnessPath ?? []}::text[], j.payload ->> '_groupKey', '')
+            WHERE j.status = 'PENDING'
+              AND (j."nextPollAt" IS NULL OR j."nextPollAt" <= (statement_timestamp() AT TIME ZONE 'UTC'))
+              AND COALESCE(':' || COALESCE(j."workflowId", j.payload ->> '_workflowId'), '') = e.bucket
+              AND (${this.fairnessPath === null}::boolean OR COALESCE(g.running, 0) < ${this.fairnessLimit}::bigint)
+              AND (
+                NOT ${active}::boolean OR (j.payload ->> '_workflowId') IS NULL OR EXISTS (
+                  SELECT 1 FROM unnest(${workflowIds}::text[], ${versions}::text[]) AS s(wf, ver)
+                  WHERE s.wf = j.payload ->> '_workflowId'
+                    AND ((j.payload ->> '_definitionVersion') IS NULL OR s.ver = j.payload ->> '_definitionVersion')
+                )
               )
-            )
-          ORDER BY j.priority DESC, j."createdAt" ASC
+            ORDER BY j.priority DESC, j."createdAt" ASC
+            LIMIT 1
+            FOR UPDATE OF j SKIP LOCKED
+          ) head
+          ORDER BY head.priority DESC, head."createdAt" ASC
           LIMIT 1
-          FOR UPDATE OF j SKIP LOCKED
         )
         RETURNING id, "workflowRunId", "stageId", priority, attempt, "maxAttempts", "retryPolicy", "leaseTimeoutMs", payload, "startedAt"
       `;
@@ -787,7 +811,7 @@ export class PrismaJobQueue implements JobQueue {
     for (let attempt = 0; attempt < MAX_DEQUEUE_ATTEMPTS; attempt++) {
       const now = new Date();
       const [candidate] = await reader.$queryRaw!<Candidate[]>`
-        WITH saturated AS MATERIALIZED (
+        WITH RECURSIVE saturated AS MATERIALIZED (
           SELECT json_extract(l.value, '$.workflowId') AS wf
           FROM json_each(${JSON.stringify(limits)}) l
           WHERE (
@@ -797,16 +821,35 @@ export class PrismaJobQueue implements JobQueue {
               AND q."workflowId" IS NULL
               AND json_extract(q.payload, '$._workflowId') = json_extract(l.value, '$.workflowId'))
           ) >= json_extract(l.value, '$.maxConcurrent')
+        ), pending_workflows(bucket) AS (
+          SELECT (
+            SELECT COALESCE(':' || COALESCE(j."workflowId", json_extract(j.payload, '$._workflowId')), '')
+            FROM "job_queue" j INDEXED BY "job_queue_status_workflow_priority_idx" WHERE j.status = 'PENDING'
+            ORDER BY 1 LIMIT 1
+          )
+          UNION ALL
+          SELECT (
+            SELECT COALESCE(':' || COALESCE(j."workflowId", json_extract(j.payload, '$._workflowId')), '')
+            FROM "job_queue" j INDEXED BY "job_queue_status_workflow_priority_idx" WHERE j.status = 'PENDING'
+              AND COALESCE(':' || COALESCE(j."workflowId", json_extract(j.payload, '$._workflowId')), '') > w.bucket
+            ORDER BY 1 LIMIT 1
+          )
+          FROM pending_workflows w WHERE w.bucket IS NOT NULL
+        ), eligible AS MATERIALIZED (
+          SELECT w.bucket FROM pending_workflows w
+          WHERE w.bucket IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM saturated s WHERE ':' || s.wf = w.bucket
+          )
         )
         SELECT j.id, j."leaseTimeoutMs", j."absoluteTimeoutMs",
                COALESCE(j."workflowId", json_extract(j.payload, '$._workflowId')) AS "workflowId"
-        FROM "job_queue" j
+        FROM eligible e
+        CROSS JOIN "job_queue" j
+        WHERE j.id = (
+          SELECT j.id FROM "job_queue" j INDEXED BY "job_queue_status_workflow_priority_idx"
           WHERE j.status = 'PENDING'
             AND (j."nextPollAt" IS NULL OR j."nextPollAt" <= ${now})
-            AND NOT EXISTS (
-              SELECT 1 FROM saturated s
-              WHERE s.wf = COALESCE(j."workflowId", json_extract(j.payload, '$._workflowId'))
-            )
+            AND COALESCE(':' || COALESCE(j."workflowId", json_extract(j.payload, '$._workflowId')), '') = e.bucket
             AND (
               ${options.serves === undefined ? 1 : 0} = 1
               OR json_type(j.payload, '$._workflowId') IS NOT 'text'
@@ -819,6 +862,9 @@ export class PrismaJobQueue implements JobQueue {
             )
           ORDER BY j.priority DESC, j."createdAt" ASC
           LIMIT 1
+        )
+        ORDER BY j.priority DESC, j."createdAt" ASC
+        LIMIT 1
       `;
       if (!candidate) return null;
 

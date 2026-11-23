@@ -466,6 +466,6 @@ Both forms of `defineWorkflow` accept:
 - `jobRetry: { maxAttempts, backoff: { initialDelayMs, factor?, maxDelayMs? } }`. The budget includes the first attempt. The first retry waits `initialDelayMs`, and subsequent delays grow by `factor` (default 2) up to `maxDelayMs`. The same policy applies to failed suspended-stage polls.
 - `leaseTimeoutMs` sets how long a claim can go without a heartbeat. The host's stale lease threshold supplies the default.
 - `absoluteTimeoutMs` sets a wall-clock deadline for one job attempt. The host's runaway cap supplies the default.
-- `maxConcurrent` caps RUNNING jobs across workers using the same Prisma queue. Use `createWorkflowRegistry` and set the same cap on every worker claiming the workflow.
+- `maxConcurrent` caps RUNNING jobs across workers using the same Prisma queue. Use `createWorkflowRegistry` and set the same cap on every worker claiming the workflow. Install the SQL expression index before enabling it. See the [job runtime controls migration](../migrations/job-runtime-controls.md).
 
 Set any retry or timeout option on `defineStage` or inline `.stage()` to override the workflow value for that stage. Each job stores its resolved settings when enqueued, including during redrive and missing-job recovery. Apply the [job runtime controls schema upgrade](../migrations/job-runtime-controls.md) before deployment.
