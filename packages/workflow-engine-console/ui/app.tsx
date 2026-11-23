@@ -606,8 +606,8 @@ function RunsView({
     if (debouncedWorkflowId.trim()) {
       params.set("workflowId", debouncedWorkflowId.trim());
     }
-    if (debouncedTenantId !== "") {
-      params.set("tenantId", debouncedTenantId);
+    if (debouncedTenantId.trim()) {
+      params.set("tenantId", debouncedTenantId.trim());
     }
     if (debouncedDefinitionVersion.trim()) {
       params.set("definitionVersion", debouncedDefinitionVersion.trim());

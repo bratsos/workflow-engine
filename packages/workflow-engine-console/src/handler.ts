@@ -195,7 +195,7 @@ function parseFilters(params: URLSearchParams): RunListFilters {
   const workflowType = params.get("workflowType");
   if (workflowType) filters.workflowType = workflowType;
   const tenantId = params.get("tenantId");
-  if (tenantId !== null) filters.tenantId = tenantId;
+  if (tenantId) filters.tenantId = tenantId;
   const definitionVersion = params.get("definitionVersion");
   if (definitionVersion) filters.definitionVersion = definitionVersion;
   const after = parseDate(params.get("from"), "from");

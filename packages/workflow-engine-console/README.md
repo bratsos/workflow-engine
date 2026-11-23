@@ -362,11 +362,12 @@ To maintain performant queries against operational tables without degraded index
 - `workflow_runs(createdAt DESC, id DESC)`
 - `workflow_runs(status, createdAt DESC, id DESC)`
 - `workflow_runs(workflowId, createdAt DESC, id DESC)`
+- `workflow_runs(tenantId, createdAt DESC, id DESC)` for the tenant filter
 - `workflow_runs(definitionVersion)` and `workflow_runs(status, workflowId, definitionVersion)` for the version filter
 - `job_queue(status, createdAt)`
 - `outbox_events(dlqAt)`
 
-When upgrading existing deployments, apply these database migrations before enabling the console to avoid sequential scans over high-volume tables. On Prisma 8 the three `DESC` indexes come from the engine's `mixed-order-indexes.sql`, not from the contract; see Prisma Setup.
+When upgrading existing deployments, apply these database migrations before enabling the console to avoid sequential scans over high-volume tables. On Prisma 8 the `DESC` indexes come from the engine's `mixed-order-indexes.sql`, not from the contract; see Prisma Setup.
 
 ### Keyset pagination
 

@@ -576,6 +576,8 @@ describe("query parameters", () => {
       "run-2",
       "run-1",
     ]);
+    const empty = await handler(get("/console/api/runs?tenantId=")).then(body);
+    expect(empty.runs).toEqual(all.runs);
   });
 
   it("rejects an unparseable date", async () => {
