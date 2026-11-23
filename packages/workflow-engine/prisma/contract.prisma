@@ -313,7 +313,7 @@ model JobQueue {
   @@index([status, leaseExpiresAt], map: "job_queue_status_leaseExpiresAt_idx")
   @@index([status, absoluteExpiresAt], map: "job_queue_status_absoluteExpiresAt_idx")
   @@index([status, workflowId], map: "job_queue_status_workflowId_idx")
-  // Install sql/job-workflow-index.postgresql.sql before enabling maxConcurrent.
+  // Install sql/job-workflow-index.postgresql.sql for bounded maxConcurrent claims.
   @@map("job_queue")
 }
 

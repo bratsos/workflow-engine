@@ -1273,7 +1273,7 @@ Pass `prisma` to the same factories shown above with `{ databaseType: "sqlite" }
 
 ## Workflow concurrency index
 
-Before enabling workflow `maxConcurrent`, install the expression index from `sql/job-workflow-index.postgresql.sql` or `sql/job-workflow-index.sqlite.sql` in the engine package. Run the PostgreSQL file outside a transaction so the index builds concurrently. The SQL upgrade for job runtime controls includes this index. Databases provisioned from a Prisma schema or contract need the matching SQL file.
+The expression index is required for bounded workflow `maxConcurrent` claims. Install it from `sql/job-workflow-index.postgresql.sql` or `sql/job-workflow-index.sqlite.sql` in the engine package. Run the PostgreSQL file outside a transaction so the index builds concurrently. The SQL upgrade for job runtime controls includes the index. Databases provisioned from a Prisma schema or contract need the matching SQL file. With the index missing, the queue still enforces the cap and warns once per adapter that the fallback can scan the backlog. Restart workers after installing the index so their adapters detect it.
 
 ## Environments
 

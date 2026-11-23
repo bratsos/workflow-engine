@@ -13,6 +13,7 @@ import {
   describe,
   expect,
   it,
+  vi,
 } from "vitest";
 import { z } from "zod";
 import {
@@ -41,14 +42,6 @@ describe.skipIf(!realDatabase)(
     let hosts: NodeHost[];
     beforeAll(async () => {
       db = await kernelDatabase();
-      const sql = await readFile(
-        new URL(
-          `../../../workflow-engine/sql/job-workflow-index.${sqlite ? "sqlite" : "postgresql"}.sql`,
-          import.meta.url,
-        ),
-        "utf8",
-      );
-      await db.client.$executeRawUnsafe(sql);
     }, 120_000);
     beforeEach(async () => {
       hosts = [];
@@ -348,7 +341,23 @@ describe.skipIf(!realDatabase)(
       }
     });
 
-    it("keeps a workflow at its cap across two workers with two slots each", async () => {
+    it.each([
+      "without",
+      "with",
+    ] as const)("keeps a workflow at its cap across two workers %s the claim index", async (indexState) => {
+      const claimIndex = "job_queue_status_workflow_priority_idx";
+      const indexFile = `sql/job-workflow-index.${sqlite ? "sqlite" : "postgresql"}.sql`;
+      if (indexState === "with") {
+        const sql = await readFile(
+          new URL(`../../../workflow-engine/${indexFile}`, import.meta.url),
+          "utf8",
+        );
+        await db.client.$executeRawUnsafe(sql);
+      } else {
+        await db.client.$executeRawUnsafe(
+          `DROP INDEX IF EXISTS "${claimIndex}"`,
+        );
+      }
       const gate = Promise.withResolvers<void>();
       let executing = 0;
       let peak = 0;
@@ -405,6 +414,7 @@ describe.skipIf(!realDatabase)(
         workerId: "runtime-2",
         concurrency: 2,
       });
+      const warned = vi.spyOn(console, "warn");
       try {
         const ids: string[] = [];
         for (let i = 0; i < 3; i++)
@@ -483,7 +493,15 @@ describe.skipIf(!realDatabase)(
           )
           .toBe(5);
         expect(peak).toBe(1);
+        const indexWarnings = warned.mock.calls.filter(([message]) =>
+          message.includes(claimIndex),
+        );
+        // Two host queues plus the separate client used in the claim race.
+        expect(indexWarnings).toHaveLength(indexState === "without" ? 3 : 0);
+        for (const [message] of indexWarnings)
+          expect(message).toContain(indexFile);
       } finally {
+        warned.mockRestore();
         gate.resolve();
         await Promise.all([first.host.stop(), second.host.stop()]);
         await secondClient.$disconnect();

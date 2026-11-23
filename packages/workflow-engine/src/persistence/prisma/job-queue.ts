@@ -37,6 +37,7 @@ import {
   type EnginePrismaClient,
   type RawColumns,
   rawFor,
+  readPrismaSql,
   validateDatabaseType,
 } from "./prisma-client-type";
 import {
@@ -47,6 +48,7 @@ import {
 import { hasBaseReads, sqliteTransactionReads } from "./transaction-reads";
 
 const logger = createLogger("JobQueue");
+const WORKFLOW_CLAIM_INDEX = "job_queue_status_workflow_priority_idx";
 const absoluteCapReason = `${LEASE_ABSOLUTE_CAP}: exceeded its absolute lease deadline; failed as a runaway`;
 
 /**
@@ -98,6 +100,29 @@ const DEQUEUED_JOB_COLUMNS: RawColumns = {
   payload: "json",
   startedAt: "timestamp",
 };
+
+/** Seek to each pending workflow's key, then drop saturated workflows before reading any heads. */
+function workflowBuckets(bucket: string, from: string): string {
+  return `, pending_workflows(bucket) AS (
+    SELECT (
+      SELECT ${bucket} FROM ${from}
+      WHERE j.status = 'PENDING'
+      ORDER BY 1 LIMIT 1
+    )
+    UNION ALL
+    SELECT (
+      SELECT ${bucket} FROM ${from}
+      WHERE j.status = 'PENDING' AND ${bucket} > w.bucket
+      ORDER BY 1 LIMIT 1
+    )
+    FROM pending_workflows w WHERE w.bucket IS NOT NULL
+  ), eligible AS MATERIALIZED (
+    SELECT w.bucket FROM pending_workflows w
+    WHERE w.bucket IS NOT NULL AND NOT EXISTS (
+      SELECT 1 FROM saturated s WHERE ':' || s.wf = w.bucket
+    )
+  )`;
+}
 
 /**
  * Splits a dotted payload path into the segments Postgres's `#>>` operator
@@ -167,6 +192,7 @@ export class PrismaJobQueue implements JobQueue {
   private readonly inSqliteTransaction: boolean;
   private readonly fairnessPath: string[] | null;
   private readonly fairnessLimit: number;
+  private workflowClaimIndex?: Promise<boolean>;
 
   /**
    * The dotted `groupBy` path this queue's fairness cap reads, or `null` when
@@ -686,6 +712,41 @@ export class PrismaJobQueue implements JobQueue {
     }
   }
 
+  private async hasWorkflowClaimIndex(): Promise<boolean> {
+    // Share the catalog read across simultaneous first claims by this adapter.
+    this.workflowClaimIndex ??= this.probeWorkflowClaimIndex().catch(
+      (error) => {
+        this.workflowClaimIndex = undefined;
+        throw error;
+      },
+    );
+    return this.workflowClaimIndex;
+  }
+
+  private async probeWorkflowClaimIndex(): Promise<boolean> {
+    const raw = rawFor(this.prisma, { found: "int" });
+    const [index] =
+      this.databaseType === "sqlite"
+        ? await raw.$queryRaw!<Array<{ found: number }>>`
+            SELECT 1 AS found FROM pragma_index_list('job_queue')
+            WHERE name = ${WORKFLOW_CLAIM_INDEX}
+          `
+        : await raw.$queryRaw!<Array<{ found: number }>>`
+            SELECT 1 AS found
+            FROM pg_catalog.pg_index i
+            JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid
+            WHERE i.indrelid = pg_catalog.to_regclass('"job_queue"')
+              AND c.relname = ${WORKFLOW_CLAIM_INDEX}
+              AND i.indisvalid AND i.indisready
+          `;
+    if (!index) {
+      logger.warn(
+        `Missing usable index ${WORKFLOW_CLAIM_INDEX}. Workflow concurrency limits still apply with a slower claim. Apply sql/job-workflow-index.${this.databaseType}.sql and restart the worker to use bounded claims.`,
+      );
+    }
+    return Boolean(index);
+  }
+
   private async claimPostgresLimited(
     limits: readonly WorkflowJobLimit[],
     serves?: readonly ServedDefinition[],
@@ -694,98 +755,97 @@ export class PrismaJobQueue implements JobQueue {
       throw new Error("Workflow job limits require a PostgreSQL transaction");
     }
 
+    const indexed = await this.hasWorkflowClaimIndex();
     const { active, workflowIds, versions } = this.servesParams(serves);
+    const key = `COALESCE(j."workflowId", j.payload ->> '_workflowId')`;
+    // The ':' prefix keeps the unknown workflow bucket separate from any ID.
+    const bucket = `COALESCE(':' || ${key}, '')`;
+    const candidates = `
+      SELECT ${indexed ? 'j.id, j.priority, j."createdAt"' : "j.id"}
+      FROM "job_queue" j
+      LEFT JOIN group_load g
+        ON g.grp = COALESCE(j.payload #>> $3::text[], j.payload ->> '_groupKey', '')
+      WHERE j.status = 'PENDING'
+        AND (j."nextPollAt" IS NULL OR j."nextPollAt" <= (statement_timestamp() AT TIME ZONE 'UTC'))
+        AND ${
+          indexed
+            ? `${bucket} = e.bucket`
+            : `NOT EXISTS (SELECT 1 FROM saturated s WHERE s.wf = ${key})`
+        }
+        AND (NOT $4::boolean OR COALESCE(g.running, 0) < $6::bigint)
+        AND (
+          NOT $7::boolean OR (j.payload ->> '_workflowId') IS NULL OR EXISTS (
+            SELECT 1 FROM unnest($8::text[], $9::text[]) AS s(wf, ver)
+            WHERE s.wf = j.payload ->> '_workflowId'
+              AND ((j.payload ->> '_definitionVersion') IS NULL OR s.ver = j.payload ->> '_definitionVersion')
+          )
+        )
+      ORDER BY j.priority DESC, j."createdAt" ASC
+      LIMIT 1
+      FOR UPDATE OF j SKIP LOCKED`;
     return this.prisma.$transaction(
       async (tx: PrismaClient) => {
-        // Take the transaction-scoped lock in its own statement, before the
-        // claim takes a READ COMMITTED snapshot. A lock inside the claim would
-        // let a waiter count jobs using a snapshot from before the last commit.
+        // Take the lock before the claim takes its READ COMMITTED snapshot.
         await rawFor(tx, { locked: "int" }).$queryRaw!`
-        SELECT 1::int AS locked FROM pg_advisory_xact_lock(1464223045, 413)
-      `;
+          SELECT 1::int AS locked FROM pg_advisory_xact_lock(1464223045, 413)
+        `;
 
-        // Seek to each distinct workflow key. Saturated workflows appear
-        // in this walk, but only eligible keys get an ordered candidate read.
-        // The ':' prefix keeps the NULL/unknown bucket separate from any ID.
-        return rawFor(tx, DEQUEUED_JOB_COLUMNS).$queryRaw!<DequeuedJobRow[]>`
-        WITH RECURSIVE saturated AS MATERIALIZED (
-          SELECT l.wf
-          FROM unnest(${limits.map((limit) => limit.workflowId)}::text[],
-                      ${limits.map((limit) => limit.maxConcurrent)}::integer[]) AS l(wf, cap)
-          WHERE EXISTS (
-            SELECT 1 FROM (
-              SELECT 1 FROM "job_queue" q
-                WHERE q.status = 'RUNNING' AND q."workflowId" = l.wf
-              UNION ALL
-              SELECT 1 FROM "job_queue" q
-                WHERE q.status = 'RUNNING' AND q."workflowId" IS NULL
-                  AND q.payload ->> '_workflowId' = l.wf
-            ) running
-            OFFSET (l.cap - 1) LIMIT 1
-          )
-        ), group_load AS (
-          SELECT COALESCE(payload #>> ${this.fairnessPath ?? []}::text[], payload ->> '_groupKey', '') AS grp,
-                 count(*) AS running
-          FROM "job_queue"
-          WHERE ${this.fairnessPath !== null}::boolean AND status = 'RUNNING'
-          GROUP BY 1
-        ), pending_workflows(bucket) AS (
-          SELECT (
-            SELECT COALESCE(':' || COALESCE(j."workflowId", j.payload ->> '_workflowId'), '')
-            FROM "job_queue" j WHERE j.status = 'PENDING'
-            ORDER BY 1 LIMIT 1
-          )
-          UNION ALL
-          SELECT (
-            SELECT COALESCE(':' || COALESCE(j."workflowId", j.payload ->> '_workflowId'), '')
-            FROM "job_queue" j WHERE j.status = 'PENDING'
-              AND COALESCE(':' || COALESCE(j."workflowId", j.payload ->> '_workflowId'), '') > w.bucket
-            ORDER BY 1 LIMIT 1
-          )
-          FROM pending_workflows w WHERE w.bucket IS NOT NULL
-        ), eligible AS MATERIALIZED (
-          SELECT w.bucket FROM pending_workflows w
-          WHERE w.bucket IS NOT NULL AND NOT EXISTS (
-            SELECT 1 FROM saturated s WHERE ':' || s.wf = w.bucket
-          )
-        )
-        UPDATE "job_queue"
-        SET status = 'RUNNING',
-            "workerId" = ${this.workerId},
-            "lockedAt" = (statement_timestamp() AT TIME ZONE 'UTC'),
-            "startedAt" = (statement_timestamp() AT TIME ZONE 'UTC'),
-            "leaseExpiresAt" = (statement_timestamp() AT TIME ZONE 'UTC')
-              + "leaseTimeoutMs" * interval '1 millisecond',
-            "absoluteExpiresAt" = (statement_timestamp() AT TIME ZONE 'UTC')
-              + "absoluteTimeoutMs" * interval '1 millisecond',
-            attempt = attempt + 1
-        WHERE id = (
-          SELECT head.id FROM eligible e
-          CROSS JOIN LATERAL (
-            SELECT j.id, j.priority, j."createdAt"
-            FROM "job_queue" j
-            LEFT JOIN group_load g
-              ON g.grp = COALESCE(j.payload #>> ${this.fairnessPath ?? []}::text[], j.payload ->> '_groupKey', '')
-            WHERE j.status = 'PENDING'
-              AND (j."nextPollAt" IS NULL OR j."nextPollAt" <= (statement_timestamp() AT TIME ZONE 'UTC'))
-              AND COALESCE(':' || COALESCE(j."workflowId", j.payload ->> '_workflowId'), '') = e.bucket
-              AND (${this.fairnessPath === null}::boolean OR COALESCE(g.running, 0) < ${this.fairnessLimit}::bigint)
-              AND (
-                NOT ${active}::boolean OR (j.payload ->> '_workflowId') IS NULL OR EXISTS (
-                  SELECT 1 FROM unnest(${workflowIds}::text[], ${versions}::text[]) AS s(wf, ver)
-                  WHERE s.wf = j.payload ->> '_workflowId'
-                    AND ((j.payload ->> '_definitionVersion') IS NULL OR s.ver = j.payload ->> '_definitionVersion')
-                )
-              )
-            ORDER BY j.priority DESC, j."createdAt" ASC
-            LIMIT 1
-            FOR UPDATE OF j SKIP LOCKED
-          ) head
-          ORDER BY head.priority DESC, head."createdAt" ASC
-          LIMIT 1
-        )
-        RETURNING id, "workflowRunId", "stageId", priority, attempt, "maxAttempts", "retryPolicy", "leaseTimeoutMs", payload, "startedAt"
-      `;
+        return readPrismaSql<DequeuedJobRow>(
+          tx,
+          "postgresql",
+          DEQUEUED_JOB_COLUMNS,
+          `
+          WITH RECURSIVE saturated AS MATERIALIZED (
+            SELECT l.wf
+            FROM unnest($1::text[], $2::integer[]) AS l(wf, cap)
+            WHERE EXISTS (
+              SELECT 1 FROM (
+                SELECT 1 FROM "job_queue" q
+                  WHERE q.status = 'RUNNING' AND q."workflowId" = l.wf
+                UNION ALL
+                SELECT 1 FROM "job_queue" q
+                  WHERE q.status = 'RUNNING' AND q."workflowId" IS NULL
+                    AND q.payload ->> '_workflowId' = l.wf
+              ) running
+              OFFSET (l.cap - 1) LIMIT 1
+            )
+          ), group_load AS (
+            SELECT COALESCE(payload #>> $3::text[], payload ->> '_groupKey', '') AS grp,
+                   count(*) AS running
+            FROM "job_queue"
+            WHERE $4::boolean AND status = 'RUNNING'
+            GROUP BY 1
+          )${indexed ? workflowBuckets(bucket, '"job_queue" j') : ""}
+          UPDATE "job_queue"
+          SET status = 'RUNNING',
+              "workerId" = $5,
+              "lockedAt" = (statement_timestamp() AT TIME ZONE 'UTC'),
+              "startedAt" = (statement_timestamp() AT TIME ZONE 'UTC'),
+              "leaseExpiresAt" = (statement_timestamp() AT TIME ZONE 'UTC')
+                + "leaseTimeoutMs" * interval '1 millisecond',
+              "absoluteExpiresAt" = (statement_timestamp() AT TIME ZONE 'UTC')
+                + "absoluteTimeoutMs" * interval '1 millisecond',
+              attempt = attempt + 1
+          WHERE id = (${
+            indexed
+              ? `SELECT head.id FROM eligible e
+                 CROSS JOIN LATERAL (${candidates}) head
+                 ORDER BY head.priority DESC, head."createdAt" ASC LIMIT 1`
+              : candidates
+          })
+          RETURNING id, "workflowRunId", "stageId", priority, attempt, "maxAttempts", "retryPolicy", "leaseTimeoutMs", payload, "startedAt"`,
+          [
+            limits.map((limit) => limit.workflowId),
+            limits.map((limit) => limit.maxConcurrent),
+            this.fairnessPath ?? [],
+            this.fairnessPath !== null,
+            this.workerId,
+            this.fairnessLimit,
+            active,
+            workflowIds,
+            versions,
+          ],
+        );
       },
       { isolationLevel: "ReadCommitted" },
     );
@@ -801,71 +861,71 @@ export class PrismaJobQueue implements JobQueue {
       leaseTimeoutMs: number | null;
       absoluteTimeoutMs: number | null;
     };
-    const reader = rawFor(this.prisma, {
-      id: "text",
-      workflowId: "text",
-      leaseTimeoutMs: "int",
-      absoluteTimeoutMs: "int",
-    });
+    const indexed = await this.hasWorkflowClaimIndex();
+    const key = `COALESCE(j."workflowId", json_extract(j.payload, '$._workflowId'))`;
+    const bucket = `COALESCE(':' || ${key}, '')`;
+    const from = `"job_queue" j${indexed ? ` INDEXED BY "${WORKFLOW_CLAIM_INDEX}"` : ""}`;
+    const columns = `j.id, j."leaseTimeoutMs", j."absoluteTimeoutMs", ${key} AS "workflowId"`;
+    const candidates = `
+      SELECT ${indexed ? "j.id" : columns} FROM ${from}
+      WHERE j.status = 'PENDING'
+        AND (j."nextPollAt" IS NULL OR j."nextPollAt" <= $2)
+        AND ${
+          indexed
+            ? `${bucket} = e.bucket`
+            : `NOT EXISTS (SELECT 1 FROM saturated s WHERE s.wf = ${key})`
+        }
+        AND (
+          $3 = 1
+          OR json_type(j.payload, '$._workflowId') IS NOT 'text'
+          OR EXISTS (
+            SELECT 1 FROM json_each($4) s
+            WHERE json_extract(s.value, '$.workflowId') = json_extract(j.payload, '$._workflowId')
+              AND (json_type(j.payload, '$._definitionVersion') IS NOT 'text'
+                OR json_extract(s.value, '$.version') = json_extract(j.payload, '$._definitionVersion'))
+          )
+        )
+      ORDER BY j.priority DESC, j."createdAt" ASC
+      LIMIT 1`;
+    const sql = `
+      WITH RECURSIVE saturated AS MATERIALIZED (
+        SELECT json_extract(l.value, '$.workflowId') AS wf
+        FROM json_each($1) l
+        WHERE (
+          (SELECT count(*) FROM "job_queue" q WHERE q.status = 'RUNNING'
+            AND q."workflowId" = json_extract(l.value, '$.workflowId'))
+          + (SELECT count(*) FROM "job_queue" q WHERE q.status = 'RUNNING'
+            AND q."workflowId" IS NULL
+            AND json_extract(q.payload, '$._workflowId') = json_extract(l.value, '$.workflowId'))
+        ) >= json_extract(l.value, '$.maxConcurrent')
+      )${indexed ? workflowBuckets(bucket, from) : ""}
+      ${
+        indexed
+          ? `SELECT ${columns} FROM eligible e CROSS JOIN "job_queue" j
+           WHERE j.id = (${candidates})
+           ORDER BY j.priority DESC, j."createdAt" ASC LIMIT 1`
+          : candidates
+      }`;
     const writer = rawFor(this.prisma, { id: "text" });
     for (let attempt = 0; attempt < MAX_DEQUEUE_ATTEMPTS; attempt++) {
       const now = new Date();
-      const [candidate] = await reader.$queryRaw!<Candidate[]>`
-        WITH RECURSIVE saturated AS MATERIALIZED (
-          SELECT json_extract(l.value, '$.workflowId') AS wf
-          FROM json_each(${JSON.stringify(limits)}) l
-          WHERE (
-            (SELECT count(*) FROM "job_queue" q WHERE q.status = 'RUNNING'
-              AND q."workflowId" = json_extract(l.value, '$.workflowId'))
-            + (SELECT count(*) FROM "job_queue" q WHERE q.status = 'RUNNING'
-              AND q."workflowId" IS NULL
-              AND json_extract(q.payload, '$._workflowId') = json_extract(l.value, '$.workflowId'))
-          ) >= json_extract(l.value, '$.maxConcurrent')
-        ), pending_workflows(bucket) AS (
-          SELECT (
-            SELECT COALESCE(':' || COALESCE(j."workflowId", json_extract(j.payload, '$._workflowId')), '')
-            FROM "job_queue" j INDEXED BY "job_queue_status_workflow_priority_idx" WHERE j.status = 'PENDING'
-            ORDER BY 1 LIMIT 1
-          )
-          UNION ALL
-          SELECT (
-            SELECT COALESCE(':' || COALESCE(j."workflowId", json_extract(j.payload, '$._workflowId')), '')
-            FROM "job_queue" j INDEXED BY "job_queue_status_workflow_priority_idx" WHERE j.status = 'PENDING'
-              AND COALESCE(':' || COALESCE(j."workflowId", json_extract(j.payload, '$._workflowId')), '') > w.bucket
-            ORDER BY 1 LIMIT 1
-          )
-          FROM pending_workflows w WHERE w.bucket IS NOT NULL
-        ), eligible AS MATERIALIZED (
-          SELECT w.bucket FROM pending_workflows w
-          WHERE w.bucket IS NOT NULL AND NOT EXISTS (
-            SELECT 1 FROM saturated s WHERE ':' || s.wf = w.bucket
-          )
-        )
-        SELECT j.id, j."leaseTimeoutMs", j."absoluteTimeoutMs",
-               COALESCE(j."workflowId", json_extract(j.payload, '$._workflowId')) AS "workflowId"
-        FROM eligible e
-        CROSS JOIN "job_queue" j
-        WHERE j.id = (
-          SELECT j.id FROM "job_queue" j INDEXED BY "job_queue_status_workflow_priority_idx"
-          WHERE j.status = 'PENDING'
-            AND (j."nextPollAt" IS NULL OR j."nextPollAt" <= ${now})
-            AND COALESCE(':' || COALESCE(j."workflowId", json_extract(j.payload, '$._workflowId')), '') = e.bucket
-            AND (
-              ${options.serves === undefined ? 1 : 0} = 1
-              OR json_type(j.payload, '$._workflowId') IS NOT 'text'
-              OR EXISTS (
-                SELECT 1 FROM json_each(${JSON.stringify(options.serves ?? [])}) s
-                WHERE json_extract(s.value, '$.workflowId') = json_extract(j.payload, '$._workflowId')
-                  AND (json_type(j.payload, '$._definitionVersion') IS NOT 'text'
-                    OR json_extract(s.value, '$.version') = json_extract(j.payload, '$._definitionVersion'))
-              )
-            )
-          ORDER BY j.priority DESC, j."createdAt" ASC
-          LIMIT 1
-        )
-        ORDER BY j.priority DESC, j."createdAt" ASC
-        LIMIT 1
-      `;
+      const [candidate] = await readPrismaSql<Candidate>(
+        this.prisma,
+        "sqlite",
+        {
+          id: "text",
+          workflowId: "text",
+          leaseTimeoutMs: "int",
+          absoluteTimeoutMs: "int",
+        },
+        sql,
+        [
+          JSON.stringify(limits),
+          now,
+          options.serves === undefined ? 1 : 0,
+          JSON.stringify(options.serves ?? []),
+        ],
+      );
       if (!candidate) return null;
 
       const cap =

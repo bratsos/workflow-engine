@@ -2,7 +2,7 @@
 
 Apply this schema upgrade before deploying the engine that supports workflow and stage runtime controls. Use the updated Prisma schema or contract, or apply the equivalent SQL below as one upgrade. Existing rows need no backfill.
 
-Prisma models do not declare expression indexes. After provisioning with a Prisma schema or contract, install the index using the packaged `sql/job-workflow-index.postgresql.sql` or `sql/job-workflow-index.sqlite.sql` before enabling `maxConcurrent`. The SQL upgrade below already includes the index. If you applied an earlier version of this upgrade, run only the matching index file.
+Prisma models do not declare expression indexes. After provisioning with a Prisma schema or contract, install the index using the packaged `sql/job-workflow-index.postgresql.sql` or `sql/job-workflow-index.sqlite.sql` for bounded `maxConcurrent` claims. Without it, workers enforce the cap with a slower scan and log one warning per adapter. Restart workers after installing the index. The SQL upgrade below already includes the index. If you applied an earlier version of this upgrade, run only the matching index file.
 
 ## PostgreSQL
 
