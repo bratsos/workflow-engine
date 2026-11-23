@@ -1,5 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, expectTypeOf, it } from "vitest";
 import { z } from "zod";
+import type { StepSignalOptions, StepWaitOptions } from "../../core/steps.js";
 import { defineWorkflow } from "../../core/workflow.js";
 import type { StepLedger, StepRecord } from "../../kernel/ports.js";
 import { FakeClock } from "../../kernel/testing/fake-clock.js";
@@ -124,7 +125,7 @@ describe("harness step mocks", () => {
           config: z.object({}),
         },
         async execute(ctx) {
-          const value = await ctx.step.waitFor("ready", {
+          const opts: StepWaitOptions<number> = {
             poll: async () => {
               polls++;
               return 1;
@@ -132,7 +133,9 @@ describe("harness step mocks", () => {
             ready: () => false,
             every: "30s",
             timeout: "1h",
-          });
+          };
+          const value = await ctx.step.waitFor("ready", opts);
+          expectTypeOf(value).toEqualTypeOf<number>();
           return { output: { value } };
         },
       })
@@ -147,6 +150,62 @@ describe("harness step mocks", () => {
     expect(result.error).toContain("exceeded its timeout");
     expect(polls).toBe(0);
     expect(await h.steps.status("ready")).toBe("failed");
+  });
+
+  it("mocks returned timeouts and wraps a successful narrowed wait result", async () => {
+    const workflow = defineWorkflow("mock-timeout-outcome", { input: In })
+      .stage("wait-stage", {
+        schemas: {
+          input: In,
+          output: z.object({ value: z.number() }),
+          config: z.object({}),
+        },
+        async execute(ctx) {
+          const signalOptions = {
+            timeout: "20m",
+            onTimeout: "return",
+          } satisfies StepSignalOptions<"return">;
+          const signal = await ctx.step.waitForSignal("answer", signalOptions);
+          const defaultOptions: StepSignalOptions = { timeout: "20m" };
+          const next = await ctx.step.waitForSignal<number>(
+            "next",
+            defaultOptions,
+          );
+          expectTypeOf(next).toEqualTypeOf<number>();
+          const status = await ctx.step.waitFor("ready", {
+            timeout: "20m",
+            every: "1m",
+            onTimeout: "return",
+            poll: async (): Promise<number | null> => null,
+            ready: (value): value is number => value !== null,
+          });
+          expectTypeOf(signal).toEqualTypeOf<
+            { timedOut: true } | { timedOut: false; value: unknown }
+          >();
+          expectTypeOf(status).toEqualTypeOf<
+            { timedOut: true } | { timedOut: false; value: number }
+          >();
+          return {
+            output: {
+              value:
+                signal.timedOut && !status.timedOut ? status.value + next : 0,
+            },
+          };
+        },
+      })
+      .build();
+
+    const h = createTestHarness({ workflows: [workflow] });
+    h.steps.mockTimeout("answer");
+    h.steps.mockResult("next", 1);
+    h.steps.mockResult("ready", 7);
+
+    const result = await h.run("mock-timeout-outcome", { value: 1 });
+    expect(result).toMatchObject({ status: "COMPLETED", output: { value: 8 } });
+    expect(await h.steps.record("answer")).toMatchObject({
+      status: "completed",
+      waitState: { timedOut: true },
+    });
   });
 
   it("skips a durable sleep so a suspending stage completes in one tick", async () => {

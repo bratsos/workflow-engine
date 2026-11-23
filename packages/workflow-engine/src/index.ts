@@ -68,6 +68,7 @@ export {
   StepSuspend,
   StepTimeoutError,
   type StepWaitOptions,
+  type StepWaitResult,
   stageAbortReason,
 } from "./core/steps";
 export { type StageResult } from "./core/types";

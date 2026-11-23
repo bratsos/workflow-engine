@@ -124,6 +124,21 @@ async function deliverSignal(
     };
   };
 
+  const wakeCompleted = async (
+    record: StepRecord,
+  ): Promise<HandlerResult<StepSignalResult>> => {
+    if (record.waitState?.timedOut) {
+      return {
+        ok: true,
+        signalled: false,
+        alreadyCompleted: true,
+        timedOut: true,
+        _events: [],
+      };
+    }
+    return wake(record, true);
+  };
+
   const existing = await deps.stepLedger.get(stage.id, command.stepId);
   if (existing?.kind !== undefined && existing.kind !== "signal") {
     throw new Error(
@@ -136,7 +151,7 @@ async function deliverSignal(
     );
   }
   if (existing?.status === "completed") {
-    return wake(existing, true);
+    return wakeCompleted(existing);
   }
 
   const payload = jsonRoundTrip(command.payload, command.stepId);
@@ -155,7 +170,7 @@ async function deliverSignal(
     if (!completed.applied) {
       const winner = await deps.stepLedger.get(stage.id, command.stepId);
       if (winner?.status === "completed") {
-        return wake(winner, true);
+        return wakeCompleted(winner);
       }
       if (winner?.status === "failed") {
         throw new Error(
@@ -191,7 +206,7 @@ async function deliverSignal(
         );
       }
       if (claimed.record.status === "completed") {
-        return wake(claimed.record, true);
+        return wakeCompleted(claimed.record);
       }
       const completed = await deps.stepLedger.compareAndSet(
         stage.id,
@@ -207,7 +222,7 @@ async function deliverSignal(
       if (!completed.applied) {
         const winner = await deps.stepLedger.get(stage.id, command.stepId);
         if (winner?.status === "completed") {
-          return wake(winner, true);
+          return wakeCompleted(winner);
         }
         if (winner?.status === "failed") {
           throw new Error(

@@ -71,6 +71,7 @@ import {
   withClaimedRun,
 } from "../helpers/index.js";
 import { fenceRunWrites } from "../helpers/run-writes.js";
+import { waitTimeoutPatch } from "../helpers/step-api.js";
 import type { HandlerResult, KernelDeps } from "../kernel";
 import type {
   ActivityRunInput,
@@ -444,33 +445,33 @@ async function releaseStageClaim(
   }
 }
 
-async function failExpiredDurableWait(
+async function settleExpiredDurableWait(
   stageRecordId: string,
   deps: KernelDeps,
 ): Promise<void> {
   if (!deps.stepLedger) return;
   const now = deps.clock.now().getTime();
-  const expired = (await deps.stepLedger.list(stageRecordId)).find(
-    (record) =>
-      (record.kind === "wait" || record.kind === "signal") &&
-      record.status === "pending" &&
-      record.deadlineAt !== null &&
-      record.deadlineAt.getTime() <= now,
-  );
-  if (!expired) return;
-
-  const error = new StepTimeoutError(expired.stepId);
-  const failed = await deps.stepLedger.compareAndSet(
-    stageRecordId,
-    expired.stepId,
-    { status: expired.status, attempt: expired.attempt },
-    {
-      status: "failed",
-      error: error.message,
-      leaseExpiresAt: null,
-    },
-  );
-  if (failed.applied) throw error;
+  // Concurrent waits can expire together. Settle every deadline before a
+  // different wait in the replay can suspend the stage again.
+  for (const record of await deps.stepLedger.list(stageRecordId)) {
+    if (
+      (record.kind !== "wait" && record.kind !== "signal") ||
+      record.status !== "pending" ||
+      record.deadlineAt === null ||
+      record.deadlineAt.getTime() > now
+    ) {
+      continue;
+    }
+    const error = new StepTimeoutError(record.stepId);
+    const patch = waitTimeoutPatch(record, error);
+    const settled = await deps.stepLedger.compareAndSet(
+      stageRecordId,
+      record.stepId,
+      { status: "pending", attempt: record.attempt },
+      patch,
+    );
+    if (settled.applied && patch.status === "failed") throw error;
+  }
 }
 
 /** Replays a durable stage's full execute context outside a transaction. */
@@ -491,7 +492,7 @@ async function replayStage(
     if (!workflow) {
       throw new Error(`Workflow ${run.workflowId} not found in registry`);
     }
-    await failExpiredDurableWait(stageRecord.id, deps);
+    await settleExpiredDurableWait(stageRecord.id, deps);
     const workflowContext = await loadWorkflowContext(run.id, deps);
     const rawInput = resolveStageInput(
       workflow,

@@ -72,9 +72,9 @@ export interface StepMockApi {
   mockError(stepId: string, error: unknown, opts?: { attempt?: number }): void;
   /**
    * The next claim of `stepId` records a wait whose deadline has already
-   * passed, so the step fails with `StepTimeoutError` through the engine's
-   * own timeout path. Only `step.waitFor` and `step.waitForSignal` have a
-   * deadline; mocking any other kind this way throws.
+   * passed. The engine uses the wait's `onTimeout` policy to throw
+   * `StepTimeoutError` or return `{ timedOut: true }`. Only `step.waitFor`
+   * and `step.waitForSignal` have a deadline; any other kind throws.
    */
   mockTimeout(stepId: string): void;
   /** `step.sleep(stepId, …)` returns immediately instead of suspending. */
@@ -201,7 +201,7 @@ export function createMockStepLedger(
           ...record,
           status: "pending",
           // One millisecond in the past: the engine's own deadline check
-          // fires on the first claim and writes the timeout itself.
+          // fires on the first claim and applies the supplied waitState policy.
           deadlineAt: new Date(now.getTime() - 1),
         }),
         kinds: WAIT_KINDS,

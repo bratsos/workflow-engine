@@ -112,6 +112,10 @@ export interface StepRecord {
   waitState?: {
     everyMs?: number;
     wakeAt?: string;
+    /** Omitted on waits that use the default and on early signals. */
+    onTimeout?: "throw" | "return";
+    /** A completed wait whose deadline settled before an answer. */
+    timedOut?: true;
     /** Consecutive `poll` throws of a wait step (reset by a poll that returns). */
     pollFailures?: number;
   };

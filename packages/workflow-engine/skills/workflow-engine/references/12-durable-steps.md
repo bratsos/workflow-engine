@@ -67,13 +67,19 @@ The `prisma` in the snippet above is your Prisma 6 or 7 client, or `fromPrisma8(
 ```typescript
 interface StepApi {
   run<T>(id: string, fn: (step: StepRunContext) => Promise<T>, options?: StepRunOptions): Promise<T>;
-  waitFor<T, U extends T>(id: string, opts: StepWaitOptionsNarrowing<T, U>): Promise<U>; // `ready` is a type guard
+  waitFor<T, U extends T>(id: string, opts: StepWaitOptionsNarrowing<T, U, "return"> & { onTimeout: "return" }): Promise<StepWaitResult<U>>;
+  waitFor<T, U extends T>(id: string, opts: StepWaitOptionsNarrowing<T, U>): Promise<U>;
+  waitFor<T>(id: string, opts: StepWaitOptions<T, "return"> & { onTimeout: "return" }): Promise<StepWaitResult<T>>;
   waitFor<T>(id: string, opts: StepWaitOptions<T>): Promise<T>;
+  waitForSignal<T = unknown>(id: string, opts: StepSignalOptions<"return"> & { onTimeout: "return" }): Promise<StepWaitResult<T>>;
   waitForSignal<T = unknown>(id: string, opts: StepSignalOptions): Promise<T>;
   sleep(id: string, duration: number | string): Promise<void>;
   /** generateText / generateObject / streamText / map — see below. */
   readonly ai: StepAiApi;
 }
+
+type StepTimeoutMode = "throw" | "return";
+type StepWaitResult<T> = { timedOut: false; value: T } | { timedOut: true };
 
 interface StepRunOptions {
   lease?: number | string;      // lease held while fn runs ("2m"); default 5 minutes --
@@ -101,21 +107,24 @@ interface StepRunContext {
   readonly abortSignal: AbortSignal; // same as ctx.abortSignal; see "Cancellation"
 }
 
-interface StepSignalOptions {
+interface StepSignalOptions<Mode extends StepTimeoutMode = "throw"> {
   timeout: number | string;    // non-sliding deadline from the first wait
+  onTimeout?: Mode;
   keepalive?: number | string; // re-suspend interval while no signal; default 5m
 }
 
-interface StepWaitOptions<T> {
+interface StepWaitOptions<T, Mode extends StepTimeoutMode = "throw"> {
   poll: () => Promise<T>;
   ready: (value: T) => boolean;
   every: number | string;    // "30s", "5m", or milliseconds
   timeout: number | string;  // non-sliding deadline from the first wait
+  onTimeout?: Mode;
   pollBackoffMs?: number;    // backoff after poll() throws; default = every
 }
 
 /** `waitFor` options whose `ready` is a type guard: the result narrows to `U`. */
-interface StepWaitOptionsNarrowing<T, U extends T> extends Omit<StepWaitOptions<T>, "ready"> {
+interface StepWaitOptionsNarrowing<T, U extends T, Mode extends StepTimeoutMode = "throw">
+  extends Omit<StepWaitOptions<T, Mode>, "ready"> {
   ready: (value: T) => value is U;
 }
 ```
@@ -162,11 +171,32 @@ Suspension is a thrown control-flow error (`StepSuspend`, or `StepInFlight` when
 - **A replayed step failure is classified as on main.** The ledger row of a failed step holds the message and nothing else. A replay that meets it rebuilds a plain `Error` with that message (or `StepTimeoutError` when the message is that step's timeout text), with no brand, so a `NonRetryableError` or a `retryIf` refusal is terminal only in the execution that threw it. A replay with `retries` left runs the body again, as it always has.
 - A stage that is still waiting on the same step re-suspends silently on every poll: `stage:suspended` / `workflow:suspended` are emitted when the wait starts and again only when the stage moves on to a different step, not once per poll. The step id is the identity of the wait — a `waitFor`, a `run` retry and the in-flight polls against a dead worker's live lease on the same step all count as one wait.
 - `waitFor`'s `ready` may be a type guard (`(v): v is Done => ...`); the awaited value then narrows to the guarded type. The boolean form is unchanged.
-- `waitFor`'s `timeout` is computed once, when the wait is first recorded, and stored on the step. Every replay compares against that stored deadline, so it never slides. Past the deadline the step is marked failed and the stage fails with `StepTimeoutError`.
+- `waitFor` and `waitForSignal` store the deadline and timeout policy when the wait is first recorded. The deadline never slides. The default policy, `onTimeout: "throw"`, fails the wait with `StepTimeoutError`.
 - A `poll` that throws does not fail the stage: the stage suspends for `pollBackoffMs`. The first three consecutive failures are logged at DEBUG — a batch provider is eventually consistent right after a submit (OpenRouter answers 404 to the first status check) — and the streak escalates to WARN from the fourth on; the count lives on the row (`waitState.pollFailures`) so it survives a replay in another process, and a poll that returns resets it.
-- Signalling a step twice keeps the first payload; the result carries `alreadyCompleted: true`. If the ledger accepted a signal but its stage wake or outbox transaction failed, retrying the same signal completes that wake and writes its event once. The wake is recorded per ledger row (completion time, creation time, position, attempt), and the ledger reset of an explicit `job.execute` re-run releases the claim of every signal row it drops, once the clear has committed, so a signal that completes a new row after that reset wakes the stage again even when its timestamp equals the earlier one. Limits: the release happens only on that reset. A reset by a host still on an earlier release during a rolling deploy, and a `run.redrive` on a ledger without `clearExcept` (it drops completed signal rows without releasing their claims), can still lose the wake of a second signal whose row has the same timestamp, creation time, position and attempt. Signalling a timed-out step (its row is `failed`), or a step id that was used as a `run`, `wait` or `sleep`, is rejected with an error naming the step. A signal that lands before the stage has reached the wait is stored and answered when the stage gets there; a signal delivered while a timeout is about to be written wins the compare-and-set, so a delivered signal beats the timeout that would have failed it.
+- Signalling a step twice keeps the first payload; the result carries `alreadyCompleted: true`. If the ledger accepted a signal but its stage wake or outbox transaction failed, retrying the same signal completes that wake and writes its event once. The wake is recorded per ledger row (completion time, creation time, position, attempt), and the ledger reset of an explicit `job.execute` re-run releases the claim of every signal row it drops, once the clear has committed, so a signal that completes a new row after that reset wakes the stage again even when its timestamp equals the earlier one. Limits: the release happens only on that reset. A reset by a host still on an earlier release during a rolling deploy, and a `run.redrive` on a ledger without `clearExcept` (it drops completed signal rows without releasing their claims), can still lose the wake of a second signal whose row has the same timestamp, creation time, position and attempt. Signalling a wait that failed under the default timeout policy throws. Signalling a wait that completed with a timeout returns `{ ok: true, signalled: false, alreadyCompleted: true, timedOut: true }` without waking the stage or emitting `step:signalled`. Signalling a step id used as a `run`, `wait` or `sleep` throws an error naming the step. A signal that arrives before the stage reaches the wait is stored for its first invocation.
 - If `fn` succeeded but the ledger write failed, `run` throws `StepLedgerWriteError` and does not record a failure, because the side effect already happened; the lease expiry path re-claims on the next replay.
 - **The step lease stores an absolute deadline, unlike the job lease.** `workflow_steps.leaseExpiresAt` is written as `clock.now() + lease` by the host that claims the step and compared against `clock.now()` by whichever host replays the stage next — both through the Prisma model API, so it is immune to the session-timezone skew raw statements have, but not to two hosts' system clocks disagreeing. The *job* lease avoids that by storing only the lock time and deriving the deadline in-database (see 03-runtime-setup.md); the step lease cannot follow without either a raw predicate the portable `StepLedger` port has no place for, or splitting the column into a lock time plus a duration — a schema migration. Until then, keep host clocks in NTP sync if you rely on short `lease` values; the exposure is bounded by the skew, and with the five-minute default a second or two of drift is immaterial.
+
+### Branch on a deadline
+
+Set `onTimeout: "return"` on `waitForSignal` or `waitFor` when the stage can continue after the deadline.
+
+```typescript
+const answer = await ctx.step.waitForSignal<{ accepted: boolean }>("business-answer", {
+  timeout: "20m",
+  onTimeout: "return",
+});
+if (answer.timedOut) {
+  return { output: { next: "try-next-business" } };
+}
+return { output: { next: answer.value.accepted ? "book" : "try-next-business" } };
+```
+
+The return type is `{ timedOut: false; value: T } | { timedOut: true }`. With `waitFor`, `value` is the ready poll's result and follows any type guard in `ready`. A signal sent before the wait also returns `{ timedOut: false, value }`. A reply and a timeout compete to complete the pending step. The first completion wins, and every replay reads the same outcome.
+
+For a reusable options object, use `satisfies StepWaitOptions<T, "return">` or `satisfies StepSignalOptions<"return">` to preserve the literal timeout mode. The default options types keep returning `T`. If the options type allows either mode, the return type includes both the raw value and the wrapped outcome.
+
+Upgrade all workers and signal dispatchers before using `onTimeout: "return"`. Keep the policy stable for a recorded wait across replays.
 
 ### Non-idempotent external calls: `step.externalKey` and `onReclaim`
 

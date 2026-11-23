@@ -205,18 +205,24 @@ export function neverAbortingSignal(): AbortSignal {
   return new AbortController().signal;
 }
 
-export interface StepWaitOptions<T> {
+export type StepTimeoutMode = "throw" | "return";
+
+export interface StepWaitOptions<T, Mode extends StepTimeoutMode = "throw"> {
   poll: () => Promise<T>;
   ready: (value: T) => boolean;
   every: number | string;
   timeout: number | string;
+  /** Return a durable timeout outcome instead of throwing. Defaults to "throw". */
+  onTimeout?: Mode;
   /** Backoff after `poll` throws. Defaults to `every`. */
   pollBackoffMs?: number;
 }
 
-export interface StepSignalOptions {
+export interface StepSignalOptions<Mode extends StepTimeoutMode = "throw"> {
   /** Non-sliding deadline from the first wait. Milliseconds or a duration string. */
   timeout: number | string;
+  /** Return a durable timeout outcome instead of throwing. Defaults to "throw". */
+  onTimeout?: Mode;
   /**
    * How often the suspended stage re-suspends while no signal has arrived.
    * Milliseconds or a duration string; defaults to five minutes, and is
@@ -232,10 +238,18 @@ export interface StepSignalOptions {
 }
 
 /** `waitFor` options whose `ready` is a type guard: the result narrows to `U`. */
-export interface StepWaitOptionsNarrowing<T, U extends T>
-  extends Omit<StepWaitOptions<T>, "ready"> {
+export interface StepWaitOptionsNarrowing<
+  T,
+  U extends T,
+  Mode extends StepTimeoutMode = "throw",
+> extends Omit<StepWaitOptions<T, Mode>, "ready"> {
   ready: (value: T) => value is U;
 }
+
+/** The result of a durable wait with `onTimeout: "return"`. */
+export type StepWaitResult<T> =
+  | { timedOut: false; value: T }
+  | { timedOut: true };
 
 /**
  * Durable operations available to a stage.
@@ -257,10 +271,34 @@ export interface StepApi {
   ): Promise<T>;
   waitFor<T, U extends T>(
     id: string,
+    opts: StepWaitOptionsNarrowing<T, U, "return"> & { onTimeout: "return" },
+  ): Promise<StepWaitResult<U>>;
+  waitFor<T, U extends T>(
+    id: string,
     opts: StepWaitOptionsNarrowing<T, U>,
   ): Promise<U>;
+  waitFor<T, U extends T>(
+    id: string,
+    opts: StepWaitOptionsNarrowing<T, U, StepTimeoutMode>,
+  ): Promise<U | StepWaitResult<U>>;
+  waitFor<T>(
+    id: string,
+    opts: StepWaitOptions<T, "return"> & { onTimeout: "return" },
+  ): Promise<StepWaitResult<T>>;
   waitFor<T>(id: string, opts: StepWaitOptions<T>): Promise<T>;
+  waitFor<T>(
+    id: string,
+    opts: StepWaitOptions<T, StepTimeoutMode>,
+  ): Promise<T | StepWaitResult<T>>;
+  waitForSignal<T = unknown>(
+    id: string,
+    opts: StepSignalOptions<"return"> & { onTimeout: "return" },
+  ): Promise<StepWaitResult<T>>;
   waitForSignal<T = unknown>(id: string, opts: StepSignalOptions): Promise<T>;
+  waitForSignal<T = unknown>(
+    id: string,
+    opts: StepSignalOptions<StepTimeoutMode>,
+  ): Promise<T | StepWaitResult<T>>;
   sleep(id: string, duration: number | string): Promise<void>;
   /** Durable AI calls and the realtime/batch `map` primitive. */
   readonly ai: StepAiApi;

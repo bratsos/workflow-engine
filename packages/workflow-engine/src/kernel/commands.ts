@@ -353,6 +353,8 @@ export interface StepSignalResult {
   readonly signalled: boolean;
   readonly ok: true;
   readonly alreadyCompleted: boolean;
+  /** The wait had already completed with a timeout. No signal was delivered. */
+  readonly timedOut?: true;
 }
 
 // ---------------------------------------------------------------------------
