@@ -150,17 +150,21 @@ interface PersistenceCore {
   // been in progress for at least that long, measured against
   // `options.now`. The kernel passes this automatically -- see
   // `KernelConfig.idempotencyStaleInProgressMs` (default 10 minutes).
+  // `options.workflowRunId` stamps the key with the run it acts on, so
+  // erasure removes it with that run.
   acquireIdempotencyKey(
     key: string,
     commandType: string,
-    options?: { now?: Date; staleInProgressAfterMs?: number },
+    options?: { now?: Date; staleInProgressAfterMs?: number; workflowRunId?: string },
   ): Promise<
     | { status: "acquired" }
     | { status: "replay"; result: unknown }
     | { status: "in_progress" }
   >;
-  completeIdempotencyKey(key: string, commandType: string, result: unknown, workflowRunId: string | null): Promise<void>;
-  releaseIdempotencyKey(key: string, commandType: string): Promise<void>;
+  // `acquiredAt` is the `now` the key was acquired with: complete or delete
+  // only the in-progress row created then. Completion never creates a row.
+  completeIdempotencyKey(key: string, commandType: string, result: unknown, workflowRunId: string | null, acquiredAt?: Date): Promise<void>;
+  releaseIdempotencyKey(key: string, commandType: string, acquiredAt?: Date): Promise<void>;
 }
 ```
 

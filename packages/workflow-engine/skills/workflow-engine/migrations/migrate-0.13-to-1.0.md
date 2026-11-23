@@ -536,7 +536,7 @@ For table retention, also add this column to the same migration:
 | `outbox_events` | `pruneTerminal` | `BOOLEAN NOT NULL DEFAULT FALSE` | `INTEGER NOT NULL DEFAULT 0` |
 
 Run the matching `sql/retention-eligibility.postgresql.sql` or
-`sql/retention-eligibility.sqlite.sql` after adding the columns. The script
+`sql/retention-eligibility.sqlite.sql` after adding the column. The script
 installs the outbox triggers, backfills existing events and creates the
 eligible-only pruning indexes. Include these statements alongside Prisma's
 generated migration. The triggers track event publication, dead letters,
@@ -554,6 +554,13 @@ stopped refreshing it stops counting after one minute (`RUN_WRITE_LEASE_MS`).
 A custom asynchronous `AICallLogger` that buffers calls must return, from
 `logCall`, a promise that settles once the call is stored: erasure waits for
 that promise, not for the buffer.
+
+Custom persistence adapters receive the run ID in
+`acquireIdempotencyKey`'s `options.workflowRunId` and the acquisition time as
+the optional last argument of `completeIdempotencyKey` and
+`releaseIdempotencyKey`. When it is given, complete or delete only the
+in-progress row whose `createdAt` equals it. `completeIdempotencyKey` must not
+create a row: a key erased with its run stays erased.
 
 ### Custom port implementations
 
