@@ -79,7 +79,7 @@ An OpenRouter variant slug such as `baseten/fp4` can include regional endpoints 
 
 OpenRouter text batches, including fallback from a native transport, send supported constraints in the top-level `provider` object. A single eligible preference with fallbacks disabled can be sent as an allowlist, including a regional endpoint. The helper refuses rankings that need multiple eligible providers or backups, data-collection denial, and provider restrictions on the embeddings batch endpoint. [OpenRouter Batch Quickstart](https://openrouter.ai/docs/batch-quickstart#choose-a-provider)
 
-Each submission checks its provider policy against the transport that builds the batch. Polling, collecting, and cancelling a saved batch use its stored refs for that operation. A batch client can poll a saved batch while submitting new work through its configured provider.
+Each submission checks its provider policy against the transport that builds the batch. Polling, collecting, and cancelling a saved batch use its stored refs, and the batch client keeps that transport for its later calls, including new submissions. A call fixes its transport when it starts, so a concurrent poll does not change where an in-flight submission sends.
 
 `providerResolver(modelConfig, policy)` and the factories registered with `registerEmbeddingProvider`, `registerEvaluationProvider` and `registerTranscriptionProvider` receive the policy as their second argument. The application is responsible for enforcing it in those models. Calls handled by an `AIAdapter` refuse a configured provider policy.
 

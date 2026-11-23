@@ -444,7 +444,7 @@ interface BatchOptions {
 }
 ```
 
-Saved-ref operations use the current client options. With a provider policy, an explicit URL outside the saved provider's canonical base URL makes the operation use its default URL and environment credential. The injected `fetch` applies across transports. Inside a stage, pass `ctx.abortSignal` so a cancelled run stops polling.
+Saved-ref operations use the current client options, and the client keeps the saved provider for later calls. With a provider policy, an explicit URL outside that provider's canonical base URL makes reads use its default URL and environment credential and refuses submissions through it. The injected `fetch` applies across transports. Inside a stage, pass `ctx.abortSignal` so a cancelled run stops polling.
 
 Through `ctx.step.ai.map` the same options travel as `batch.options`, next to `batch.provider`, `batch.pollEvery` (default `"60s"`), `batch.timeout` (a non-sliding deadline, default `"24h"`), `batch.onExpiry` (`"fail"`, the default, throws `AiMapBatchFailedError`; `"partial"` returns every item as failed with that error) and `batch.onReclaim` (below).
 

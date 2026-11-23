@@ -389,13 +389,9 @@ describe("vendor batch SDK missing", () => {
         "Bearer test-openrouter-option",
       ],
       [
-        withPolicy
-          ? `${openRouterBatches}/batch-1`
-          : "https://router.example.test/api/v1/batches/batch-1",
+        "https://router.example.test/api/v1/batches/batch-1",
         "GET",
-        withPolicy
-          ? `Bearer ${openRouterKey}`
-          : "Bearer test-openrouter-option",
+        "Bearer test-openrouter-option",
       ],
     ]);
   });

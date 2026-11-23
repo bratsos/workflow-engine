@@ -641,9 +641,24 @@ describe("helper provider policy", () => {
         },
       });
 
-      // Resolving a historical ref must also leave later submissions on the configured transport.
-      await expect(batch.submit(requests)).rejects.toThrow(error);
-      expect(fetchMock).toHaveBeenCalledTimes(1);
+      // As in alpha.21, the saved ref moves later calls to OpenRouter, which carries the policy.
+      fetchMock.mockClear();
+      if ("dataCollection" in policy) {
+        await expect(batch.submit(requests)).rejects.toThrow(
+          /cannot enforce provider policy dataCollection/,
+        );
+        expect(fetchMock).not.toHaveBeenCalled();
+      } else {
+        await expect(batch.submit(requests)).resolves.toMatchObject({
+          provider: "openrouter",
+        });
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+        const [url, init] = fetchMock.mock.calls[0]!;
+        expect(String(url)).toBe("https://openrouter.ai/api/v1/batches");
+        expect(JSON.parse(String(init?.body))).toMatchObject({
+          provider: { only: ["azure"] },
+        });
+      }
     });
   });
 
@@ -692,6 +707,82 @@ describe("helper provider policy", () => {
       provider: "anthropic",
       refs: [{ id: "batch-next", provider: "anthropic.messages" }],
     });
+  });
+
+  it.each([
+    ["without", undefined],
+    ["with", { only: ["anthropic"] }],
+  ] as [
+    string,
+    { only: string[] } | undefined,
+  ][])("collects a polled saved OpenRouter batch by id during a native submission %s a policy", async (_label, policy) => {
+    const options = { apiKey: "test", fetch: fetchMock };
+    fetchMock.mockImplementation(async (url, init) => {
+      const path = String(url);
+      if (path === "https://openrouter.ai/api/v1/batches") {
+        return Response.json(
+          { id: "batch-previous", status: "validating" },
+          { status: 202 },
+        );
+      }
+      if (path === "https://openrouter.ai/api/v1/batches/batch-previous") {
+        return Response.json({
+          id: "batch-previous",
+          status: "completed",
+          request_counts: { total: 1, completed: 1, failed: 0 },
+          results: [
+            {
+              custom_id: "job-1",
+              response: {
+                status_code: 200,
+                body: { choices: [{ message: { content: "Summary" } }] },
+              },
+            },
+          ],
+        });
+      }
+      if (path === "https://api.anthropic.com/v1/messages/batches") {
+        return anthropicBatchStarted();
+      }
+      return Response.json(
+        { error: { message: "Unexpected request" } },
+        { status: 404 },
+      );
+    });
+    const ai = createAIHelper(
+      "policy",
+      new InMemoryAICallLogger(),
+      undefined,
+      undefined,
+      policy ? { routing: { provider: policy } } : undefined,
+    );
+    const previous = await ai
+      .batch("policy-anthropic", "openrouter", options)
+      .submit(requests);
+    const metadata = JSON.parse(JSON.stringify({ batchRefs: previous.refs }));
+    const current = ai.batch("policy-anthropic", "anthropic", options);
+    const [submitted] = await Promise.all([
+      current.submit(requests),
+      current.getStatus(previous.id, metadata),
+    ]);
+    // As in alpha.21, the poll's refs choose the transport for the id-only collection.
+    await expect(current.getResults(previous.id)).resolves.toMatchObject([
+      { id: "job-1", status: "succeeded", result: "Summary" },
+    ]);
+    expect(submitted).toMatchObject({
+      provider: "anthropic",
+      refs: [{ id: "batch-next", provider: "anthropic.messages" }],
+    });
+    expect(
+      fetchMock.mock.calls
+        .map(([url, init]) => `${init?.method ?? "GET"} ${String(url)}`)
+        .sort(),
+    ).toEqual([
+      "GET https://openrouter.ai/api/v1/batches/batch-previous",
+      "GET https://openrouter.ai/api/v1/batches/batch-previous",
+      "POST https://api.anthropic.com/v1/messages/batches",
+      "POST https://openrouter.ai/api/v1/batches",
+    ]);
   });
 
   it("checks the policy when building each native batch partition", async () => {

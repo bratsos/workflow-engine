@@ -6,9 +6,9 @@ Set `AIHelperOptions.routing.provider` to configure an upstream allowlist, provi
 
 Regional endpoints remain in the merged ranking when a matching variant is allowed. OpenRouter batches can pin a single eligible regional endpoint with fallbacks disabled.
 
-New batch submissions enforce the policy on the transport that builds each request. A concurrent poll of a saved batch follows that batch's stored refs, and new handles identify the transport that submitted them.
+Each batch call fixes its transport when it starts and enforces the policy on that transport, so a concurrent poll of a saved batch cannot move an in-flight submission. As before, stored refs and an automatic OpenRouter fallback switch the batch client's later calls to their transport, and new handles identify the transport that submitted them.
 
-Automatic fallback and saved-ref operations carry the client's batch options without a provider policy. With a policy, fallback requires an unset URL or the canonical OpenRouter base URL. A saved-ref operation with a noncanonical URL uses the saved provider's default URL and environment credential.
+Without a provider policy, batch calls send the same requests as before. With a policy, a client that has switched away from its configured provider submits only when its `baseURL` is unset or that provider's canonical base URL. Reads with another URL use that provider's default URL and environment credential.
 
 Multi-step call rows store the distinct serving providers in `servedBy` and the ordered provider for each step in `metadata.servedBySteps`, including steps the SDK reported before a call failed. Calls keep their billable usage and cost if reading structured output fails or a stream callback throws.
 

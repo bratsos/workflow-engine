@@ -150,7 +150,7 @@ Set `routing.provider` with `only` (provider slugs), `order`, `allowFallbacks` a
 
 The helper preserves an eligible regional preference within a variant such as `baseten/fp4/us` within `baseten/fp4`. OpenRouter text batches and native-to-OpenRouter fallbacks send allowlists and fallback settings at the top level. A single eligible regional preference can be pinned there with fallbacks disabled. The helper refuses rankings that need multiple eligible providers or backups, data-collection denial, and provider restrictions on the embeddings batch endpoint. [OpenRouter endpoint matching](https://openrouter.ai/docs/guides/routing/provider-selection#base-slug-matching), [OpenRouter Batch Quickstart](https://openrouter.ai/docs/batch-quickstart#choose-a-provider)
 
-Each batch submission checks the helper policy against the transport building the request. Stored refs select the transport for a poll, collection, or cancellation of that batch. The configured provider continues to select the transport for new submissions.
+Each batch submission checks the helper policy against the transport building the request. Stored refs select the transport for a poll, collection, or cancellation of that batch, and the client keeps that transport for its later calls, including new submissions. A call fixes its transport when it starts, so a concurrent call cannot change where it sends or which provider it is checked as.
 
 The `providerResolver` and the factories registered with `registerEmbeddingProvider`, `registerEvaluationProvider` and `registerTranscriptionProvider` receive the policy as their second argument and must honour it. Calls handled by an `AIAdapter` refuse a configured provider policy.
 
@@ -723,7 +723,7 @@ interface BatchOptions {
 }
 ```
 
-Polling, collecting and cancelling use the provider named by the saved refs and carry the current client options. With a provider policy, a noncanonical `baseURL` for that provider makes these operations use its default URL and environment credential. A matching or unset URL preserves the inline key. The injected `fetch` applies in every case.
+Polling, collecting and cancelling use the provider named by the saved refs, carry the current client options, and leave the client on that provider for later calls. With a provider policy, a noncanonical `baseURL` for a provider other than the configured one makes reads use its default URL and environment credential and refuses submissions through it. A matching or unset URL preserves the inline key. The injected `fetch` applies in every case.
 
 ### Batch Request Configuration (`AIBatchRequest`)
 
