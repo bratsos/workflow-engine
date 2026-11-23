@@ -543,7 +543,8 @@ function suite(name: string, makeEnv: () => Promise<Env>) {
         const resume = signal();
         let blocked = false;
         ledger.list = async (...args) => {
-          if (armed && !blocked) {
+          // Only the re-open scan, which runs once the retry is on record.
+          if (armed && !blocked && (await run.stage()).errorMessage) {
             blocked = true;
             listed.open();
             await resume.promise;

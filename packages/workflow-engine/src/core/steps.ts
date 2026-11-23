@@ -10,6 +10,8 @@ import type { StepAiApi } from "./step-ai";
 
 /** Internal marker carried in suspended-state metadata for durable replay. */
 export const DURABLE_SUSPEND_MARKER = "__durable" as const;
+/** Suspended-state metadata key holding `StepWaitPolls`. */
+export const DURABLE_WAIT_POLLS = "__waitPolls" as const;
 
 /** Cross-bundle brand for durable-step control-flow errors. */
 export const STEP_CONTROL_FLOW: unique symbol = Symbol.for(
@@ -313,13 +315,27 @@ export interface StepApi {
    */
   readonly [STEP_API_SETTLE_IN_FLIGHT]?: (
     suspension?: StepControlFlowError,
-  ) => Promise<StepPollSchedule | undefined>;
+  ) => Promise<StepSuspendSchedule | undefined>;
 }
 
 export interface StepPollSchedule {
   nextPollAt: Date;
   maxWaitUntil: Date;
   pollInterval?: number;
+}
+
+/**
+ * The next poll of each pending durable wait, by step id. Stored in the
+ * suspended state under `DURABLE_WAIT_POLLS` so a replay that does not reach
+ * a wait keeps that wait's poll.
+ */
+export type StepWaitPolls = Record<
+  string,
+  { nextPollAt: string; pollInterval: number }
+>;
+
+export interface StepSuspendSchedule extends StepPollSchedule {
+  polls: StepWaitPolls;
 }
 
 export interface StepSuspendOptions extends StepPollSchedule {

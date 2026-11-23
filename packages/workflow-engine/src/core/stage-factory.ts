@@ -35,13 +35,14 @@ import { NoInputSchema } from "./schema-helpers";
 import type { CheckCompletionContext, Stage, StageContext } from "./stage";
 import {
   DURABLE_SUSPEND_MARKER,
+  DURABLE_WAIT_POLLS,
   isStepControlFlowError,
   STEP_API_PENDING_CONTROL_FLOW,
   STEP_API_SETTLE_IN_FLIGHT,
   type StepApi,
   type StepInFlight,
-  type StepPollSchedule,
   type StepSuspend,
+  type StepSuspendSchedule,
 } from "./steps.js";
 import type {
   CompletionCheckResult,
@@ -637,7 +638,7 @@ function createEnhancedContext<
 
 function durableControlFlowResult(
   error: StepSuspend | StepInFlight,
-  schedule?: StepPollSchedule,
+  schedule?: StepSuspendSchedule,
 ): SuspendedResult {
   const now = error.at;
   const suspension =
@@ -665,7 +666,11 @@ function durableControlFlowResult(
       submittedAt: now.toISOString(),
       pollInterval,
       maxWaitTime,
-      metadata: { [DURABLE_SUSPEND_MARKER]: true, stepId: error.stepId },
+      metadata: {
+        [DURABLE_SUSPEND_MARKER]: true,
+        stepId: error.stepId,
+        ...(schedule ? { [DURABLE_WAIT_POLLS]: schedule.polls } : {}),
+      },
     },
     pollConfig: { pollInterval, maxWaitTime, nextPollAt, maxWaitUntil },
     metrics: {

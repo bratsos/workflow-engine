@@ -8,8 +8,10 @@ import type {
   StepRunContext,
   StepRunOptions,
   StepSignalOptions,
+  StepSuspendSchedule,
   StepTimeoutMode,
   StepWaitOptions,
+  StepWaitPolls,
   StepWaitResult,
 } from "../../core/steps.js";
 import {
@@ -92,6 +94,8 @@ export interface CreateStepApiOptions {
   abortSignal?: AbortSignal;
   /** Lazy accessor for the stage's AI helper, used by `step.ai.*`. */
   ai?: () => AIHelper;
+  /** The wait polls the stage's last suspension stored (see `StepWaitPolls`). */
+  waitPolls?: StepWaitPolls;
   /**
    * Uniform source in [0, 1) for `retryBackoff.jitter`. Defaults to
    * `Math.random`; injectable so a test can pin the drawn delay.
@@ -640,7 +644,7 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
    */
   async function settleInFlight(
     suspension?: StepControlFlowError,
-  ): Promise<StepPollSchedule | undefined> {
+  ): Promise<StepSuspendSchedule | undefined> {
     while (inFlight.size > 0) {
       const pending = [...inFlight];
       const boundMs = Math.max(
@@ -681,9 +685,54 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
     // An outstanding poll can finish after this snapshot. Its result can be
     // recorded, but a continuation must start new steps on replay.
     suspendedBy = suspension;
+    const schedules = [...waitSchedules.values()];
+    const polls: StepWaitPolls = {};
+    // A branch can stop short of a wait it reached before. Schedule from
+    // every pending wait row, keeping the poll the last suspension stored
+    // for a wait this invocation did not evaluate.
+    if (options.stepLedger && options.stageRecordId) {
+      const now = suspension.at.getTime();
+      const rows = await options.stepLedger.list(options.stageRecordId);
+      for (const row of rows) {
+        if (row.status !== "pending" || !row.deadlineAt) continue;
+        const fresh = waitSchedules.get(row.stepId);
+        const carried = options.waitPolls?.[row.stepId];
+        const carriedAt = Date.parse(carried?.nextPollAt ?? "");
+        const wakeAt = Date.parse(row.waitState?.wakeAt ?? "");
+        let nextPoll: number;
+        let pollInterval: number | undefined;
+        if (fresh) {
+          nextPoll = fresh.nextPollAt.getTime();
+          pollInterval = fresh.pollInterval;
+        } else if (Number.isFinite(wakeAt)) {
+          // A sleep's wake time is on its row.
+          nextPoll = wakeAt > now ? wakeAt : row.deadlineAt.getTime();
+        } else if (
+          Number.isFinite(carriedAt) &&
+          Number.isFinite(carried?.pollInterval)
+        ) {
+          pollInterval = carried!.pollInterval;
+          // Overdue and still not reached: the next poll follows its interval.
+          nextPoll = carriedAt > now ? carriedAt : now + pollInterval;
+        } else {
+          nextPoll = row.deadlineAt.getTime();
+        }
+        nextPoll = Math.min(nextPoll, row.deadlineAt.getTime());
+        pollInterval ??= Math.max(0, nextPoll - now);
+        polls[row.stepId] = {
+          nextPollAt: new Date(nextPoll).toISOString(),
+          pollInterval,
+        };
+        schedules.push({
+          nextPollAt: new Date(nextPoll),
+          maxWaitUntil: row.deadlineAt,
+          pollInterval,
+        });
+      }
+    }
     let earliest: StepPollSchedule | undefined;
     let maxWaitUntil: Date | undefined;
-    for (const schedule of waitSchedules.values()) {
+    for (const schedule of schedules) {
       if (!earliest || schedule.nextPollAt < earliest.nextPollAt) {
         earliest = schedule;
       }
@@ -696,6 +745,7 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
         nextPollAt: earliest.nextPollAt,
         pollInterval: earliest.pollInterval,
         maxWaitUntil,
+        polls,
       };
     }
   }
@@ -1043,7 +1093,14 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
         );
       }
 
-      if (opts.ready(value)) {
+      const afterPoll = options.clock.now();
+      const expired = afterPoll.getTime() >= record.deadlineAt.getTime();
+      // Under "return" the deadline decides: a ready answer seen at or after
+      // it is too late, like a signal delivered at that instant.
+      if (
+        opts.ready(value) &&
+        !(expired && record.waitState?.onTimeout === "return")
+      ) {
         const result = jsonRoundTrip(value, id);
         // A wait row is open while `pending`: an out-of-band completion
         // (a signal delivered, another poller ahead of this one) wins.
@@ -1051,8 +1108,7 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
         return waitResult<T>(completed.record, opts.onTimeout);
       }
 
-      const afterPoll = options.clock.now();
-      if (afterPoll.getTime() >= record.deadlineAt.getTime()) {
+      if (expired) {
         return waitResult<T>(await timeout(record), opts.onTimeout);
       }
       if (record.waitState?.pollFailures) {

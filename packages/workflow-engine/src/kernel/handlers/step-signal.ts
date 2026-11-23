@@ -160,13 +160,13 @@ async function deliverSignal(
     }
     if (record.status === "completed") return finish(record, true);
 
-    // At the deadline the signal and poller still race for the pending
-    // row. After that tick an opted-in wait can only settle as timed out.
+    // From its deadline on, an opted-in wait can only settle as timed out,
+    // the same verdict the poller and the stage replay reach.
     const expired =
       record.status === "pending" &&
       record.waitState?.onTimeout === "return" &&
       record.deadlineAt !== null &&
-      record.deadlineAt < deps.clock.now();
+      record.deadlineAt <= deps.clock.now();
     const completed = await deps.stepLedger.compareAndSet(
       stage.id,
       command.stepId,

@@ -255,6 +255,10 @@ async function recordStageRetry(
       metadata?: Record<string, unknown>;
     } | null
   )?.metadata;
+  const retryAt = deps.clock.now().getTime() + retryBackoffMs(budget.attempt);
+  const waitDeadline = await nextWaitDeadline(stageRecord, deps).catch(
+    () => undefined,
+  );
   return withClaimedRun(
     stageRecord.workflowRunId,
     run.version,
@@ -265,9 +269,7 @@ async function recordStageRetry(
         errorMessage: message,
         // A job that finished the stage meanwhile keeps its outcome.
         expectedVersion: stageRecord.version,
-        nextPollAt: new Date(
-          deps.clock.now().getTime() + retryBackoffMs(budget.attempt),
-        ),
+        nextPollAt: new Date(Math.min(retryAt, waitDeadline ?? retryAt)),
         suspendedState: {
           ...(stageRecord.suspendedState as object),
           metadata: {
@@ -375,6 +377,14 @@ async function claimSuspendedStage(
   if (deadline !== undefined && deadline > now && deadline < leaseUntil) {
     leaseUntil = deadline;
   }
+  // `maxWaitUntil` may name the deadline this pass settles; a later one must
+  // still bound the lease in case this poller dies mid-replay.
+  const waitDeadline = await nextWaitDeadline(stageRecord, deps).catch(
+    () => undefined,
+  );
+  if (waitDeadline !== undefined && waitDeadline < leaseUntil) {
+    leaseUntil = waitDeadline;
+  }
   const nextPollAt = new Date(leaseUntil);
   try {
     await deps.persistence.updateStage(stageRecord.id, {
@@ -443,6 +453,34 @@ async function releaseStageClaim(
     if (error instanceof StaleVersionError) return;
     throw error;
   }
+}
+
+/**
+ * The earliest deadline among a durable stage's pending waits that is still
+ * ahead, read from the ledger. No claim lease or retry backoff may pass it.
+ */
+async function nextWaitDeadline(
+  stageRecord: WorkflowStageRecord,
+  deps: KernelDeps,
+): Promise<number | undefined> {
+  const metadata = (
+    stageRecord.suspendedState as { metadata?: Record<string, unknown> } | null
+  )?.metadata;
+  if (!deps.stepLedger || metadata?.[DURABLE_SUSPEND_MARKER] !== true) return;
+  const now = deps.clock.now().getTime();
+  let earliest: number | undefined;
+  for (const record of await deps.stepLedger.list(stageRecord.id)) {
+    const deadline = record.deadlineAt?.getTime();
+    if (
+      record.status === "pending" &&
+      deadline !== undefined &&
+      deadline > now &&
+      (earliest === undefined || deadline < earliest)
+    ) {
+      earliest = deadline;
+    }
+  }
+  return earliest;
 }
 
 async function settleExpiredDurableWait(
