@@ -13,7 +13,7 @@
       }
     },
     "skippedScenarios": [],
-    "captureTime": "2026-11-23T10:04:36.820Z"
+    "captureTime": "2026-11-23T15:20:34.690Z"
   },
   "columns": {
     "WorkflowRun": [
@@ -24,12 +24,14 @@
       "duration",
       "id",
       "input",
+      "labels",
       "metadata",
       "output",
       "priority",
       "redriveCount",
       "startedAt",
       "status",
+      "tenantId",
       "totalCost",
       "totalTokens",
       "updatedAt",
@@ -120,6 +122,7 @@
       "estimatedCost",
       "id",
       "inputTokens",
+      "labels",
       "metadata",
       "modelId",
       "modelKey",
@@ -130,7 +133,10 @@
       "requestId",
       "response",
       "servedBy",
-      "topic"
+      "tenantId",
+      "textExpiresAt",
+      "topic",
+      "workflowRunId"
     ],
     "WorkflowAnnotation": [
       "actorId",
@@ -175,16 +181,24 @@
       "id",
       "occurredAt",
       "payload",
+      "pruneTerminal",
       "publishedAt",
       "retryCount",
       "sequence",
       "workflowRunId"
     ],
-    "IdempotencyKey": ["commandType", "createdAt", "id", "key", "result"],
+    "IdempotencyKey": [
+      "commandType",
+      "createdAt",
+      "id",
+      "key",
+      "result",
+      "workflowRunId"
+    ],
     "WorkflowBlob": ["createdAt", "data", "key", "updatedAt"]
   },
   "jsonColumns": {
-    "WorkflowRun": ["config", "input", "metadata", "output"],
+    "WorkflowRun": ["config", "input", "labels", "metadata", "output"],
     "WorkflowDefinition": ["snapshot"],
     "WorkflowStage": [
       "config",
@@ -198,7 +212,7 @@
     "WorkflowStep": ["result", "waitState"],
     "WorkflowLog": ["metadata"],
     "WorkflowArtifact": ["data", "metadata"],
-    "AICall": ["metadata"],
+    "AICall": ["labels", "metadata"],
     "WorkflowAnnotation": ["payload", "value"],
     "JobQueue": ["payload"],
     "OutboxEvent": ["payload"],
@@ -208,14 +222,14 @@
   "tables": {
     "WorkflowRun": [
       {
-        "id": "cmwt3n0qs0001at3bluzujbi2",
+        "id": "cmwtexcqj0001733bfkxj7di9",
         "createdAt": {
           "$storedRows": "Date",
-          "value": "2026-11-23T10:04:36.868Z"
+          "value": "2026-11-23T15:20:34.747Z"
         },
         "updatedAt": {
           "$storedRows": "Date",
-          "value": "2026-11-23T10:04:36.868Z"
+          "value": "2026-11-23T15:20:34.747Z"
         },
         "version": 1,
         "workflowId": "stored-rows-pending-unclaimed",
@@ -235,6 +249,8 @@
         "totalCost": 0,
         "totalTokens": 0,
         "priority": 5,
+        "tenantId": null,
+        "labels": null,
         "metadata": null,
         "definitionVersion": "sha256-b6075b2114aa2ba286d542979d346efa",
         "redriveCount": 0
@@ -246,7 +262,7 @@
         "version": "sha256-b6075b2114aa2ba286d542979d346efa",
         "createdAt": {
           "$storedRows": "Date",
-          "value": "2026-11-23T10:04:36.859Z"
+          "value": "2026-11-23T15:20:34.732Z"
         },
         "snapshot": {
           "format": 1,
@@ -305,42 +321,44 @@
     "JobQueue": [],
     "OutboxEvent": [
       {
-        "id": "cmwt3n0qx0002at3bv5levw0r",
+        "id": "cmwtexcqp0002733bjsy5bfp2",
         "createdAt": {
           "$storedRows": "Date",
-          "value": "2026-11-23T10:04:36.873Z"
+          "value": "2026-11-23T15:20:34.753Z"
         },
-        "workflowRunId": "cmwt3n0qs0001at3bluzujbi2",
+        "workflowRunId": "cmwtexcqj0001733bfkxj7di9",
         "sequence": 1,
         "eventType": "workflow:created",
         "payload": {
           "type": "workflow:created",
-          "timestamp": "2026-11-23T10:04:36.820Z",
-          "workflowRunId": "cmwt3n0qs0001at3bluzujbi2",
+          "timestamp": "2026-11-23T15:20:34.690Z",
+          "workflowRunId": "cmwtexcqj0001733bfkxj7di9",
           "workflowId": "stored-rows-pending-unclaimed"
         },
         "causationId": "stored-rows:pending-unclaimed",
         "occurredAt": {
           "$storedRows": "Date",
-          "value": "2026-11-23T10:04:36.820Z"
+          "value": "2026-11-23T15:20:34.690Z"
         },
         "publishedAt": null,
         "deliveryClaim": null,
         "retryCount": 0,
-        "dlqAt": null
+        "dlqAt": null,
+        "pruneTerminal": false
       }
     ],
     "IdempotencyKey": [
       {
-        "id": "cmwt3n0qc0000at3bah1ymqe2",
+        "id": "cmwtexcpp0000733bmzmnop01",
         "createdAt": {
           "$storedRows": "Date",
-          "value": "2026-11-23T10:04:36.820Z"
+          "value": "2026-11-23T15:20:34.690Z"
         },
         "key": "stored-rows:pending-unclaimed",
         "commandType": "run.create",
+        "workflowRunId": "cmwtexcqj0001733bfkxj7di9",
         "result": {
-          "workflowRunId": "cmwt3n0qs0001at3bluzujbi2",
+          "workflowRunId": "cmwtexcqj0001733bfkxj7di9",
           "status": "PENDING",
           "definitionVersion": "sha256-b6075b2114aa2ba286d542979d346efa"
         }
