@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,43 +14,48 @@ const sqlPath = (file: string) =>
   fileURLToPath(new URL(`../../../sql/${file}`, import.meta.url));
 const enqueue = sqlPath("enqueue.sql");
 const schemaUpgrade = sqlPath("tenant-attribution.sql");
-const oldSignature =
-  "workflow_engine_enqueue(text,text,text,jsonb,jsonb,integer,text)";
 const newSignature =
-  "workflow_engine_enqueue(text,text,text,jsonb,jsonb,integer,text,text,jsonb)";
+  "workflow_engine_enqueue(text, text, text, jsonb, jsonb, integer, text, text, jsonb)";
 
 describe.skipIf(!databaseUrl)("tenant attribution PostgreSQL upgrade", () => {
   let admin: Client;
   let schema: string;
+  let other: string;
 
   beforeEach(async () => {
-    schema = `tenant_upgrade_${crypto.randomUUID().replaceAll("-", "")}`;
+    const id = crypto.randomUUID().replaceAll("-", "");
+    schema = `tenant_upgrade_${id}`;
+    other = `tenant_other_${id}`;
     admin = new Client({ connectionString: databaseUrl });
     await admin.connect();
     await admin.query(
-      `CREATE SCHEMA "${schema}"; SET search_path TO "${schema}", public`,
+      `CREATE SCHEMA "${schema}"; CREATE SCHEMA "${other}"; SET search_path TO "${schema}", public`,
     );
   });
 
   afterEach(async () => {
     try {
-      await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+      await admin.query(
+        `DROP SCHEMA IF EXISTS "${schema}", "${other}" CASCADE`,
+      );
     } finally {
       await admin.end();
     }
   });
 
-  async function psql(...args: string[]) {
+  async function psqlWith(
+    { stop = true, searchPath = schema },
+    ...args: string[]
+  ) {
     const url = new URL(databaseUrl!);
     const password = decodeURIComponent(url.password);
     url.password = "";
     try {
-      await promisify(execFile)(
+      const { stderr } = await promisify(execFile)(
         "psql",
         [
           "-X",
-          "-v",
-          "ON_ERROR_STOP=1",
+          ...(stop ? ["-v", "ON_ERROR_STOP=1"] : []),
           "-v",
           "VERBOSITY=verbose",
           "--dbname",
@@ -62,122 +67,296 @@ describe.skipIf(!databaseUrl)("tenant attribution PostgreSQL upgrade", () => {
           env: {
             ...process.env,
             PGPASSWORD: password,
-            PGOPTIONS: `-c search_path=${schema}`,
+            PGOPTIONS: `-c search_path=${searchPath}`,
           },
         },
       );
-      return { code: 0, stderr: "" };
+      return { code: 0, stderr };
     } catch (error) {
       const failure = error as { code?: number; stderr?: string };
       if (typeof failure.code !== "number") throw error;
       return { code: failure.code, stderr: failure.stderr };
     }
   }
+  const psql = (...args: string[]) => psqlWith({}, ...args);
 
-  async function privileges(signature: string) {
-    const {
-      rows: [row],
-    } = await admin.query(
-      `SELECT
-         has_function_privilege('pg_read_all_settings', p.oid, 'EXECUTE') AS allowed,
-         EXISTS (SELECT FROM aclexplode(coalesce(p.proacl, acldefault('f', p.proowner)))
-                 WHERE grantee = 0 AND privilege_type = 'EXECUTE') AS public
-       FROM pg_proc p WHERE p.oid = to_regprocedure($1)`,
-      [`${schema}.${signature}`],
-    );
-    return row;
+  // A migration tool that sends the file as one query, or each statement
+  // as a prepared statement; the second only accepts a single statement.
+  async function viaClient(prepared: boolean) {
+    const text = await readFile(enqueue, "utf8");
+    try {
+      await admin.query(prepared ? { name: "install-enqueue", text } : text);
+      return { code: 0, stderr: "" };
+    } catch (error) {
+      return { code: 1, stderr: String((error as { code?: string }).code) };
+    }
   }
 
-  it("installs with the intended ACL and rolls back when ACL installation fails", async () => {
-    const acl = `REVOKE EXECUTE ON FUNCTION ${newSignature} FROM PUBLIC;
-                 GRANT EXECUTE ON FUNCTION ${newSignature} TO pg_read_all_settings`;
-    expect(
-      await psql("--single-transaction", "-f", enqueue, "-c", "SELECT 1/0"),
-    ).toMatchObject({
-      code: 1,
-      stderr: expect.stringContaining("22012"),
-    });
-    expect(await privileges(newSignature)).toBeUndefined();
-    expect(
-      await psql("--single-transaction", "-f", enqueue, "-c", acl),
-    ).toMatchObject({ code: 0 });
-    expect(await privileges(newSignature)).toEqual({
-      allowed: true,
-      public: false,
-    });
-  });
-
-  it("fails on tracked dependents and replaces the function, wrapper and ACL atomically", async () => {
-    const wrapper = `CREATE FUNCTION enqueue_order(k text) RETURNS text LANGUAGE SQL
-      RETURN "${schema}".workflow_engine_enqueue(k, 'orders', 'Orders', '{}', '{}', 5, NULL)`;
+  async function engineTables(target: string) {
     await admin.query(`
-      CREATE TABLE workflow_runs (LIKE public.workflow_runs INCLUDING ALL);
-      CREATE TABLE idempotency_keys (LIKE public.idempotency_keys INCLUDING ALL);
-      CREATE TABLE outbox_events (LIKE public.outbox_events INCLUDING ALL);
-      CREATE FUNCTION workflow_engine_enqueue(text, text, text, jsonb, jsonb, integer, text)
-      RETURNS text LANGUAGE SQL RETURN 'old';
-      ${wrapper};
-      REVOKE EXECUTE ON FUNCTION ${oldSignature} FROM PUBLIC;
-      GRANT EXECUTE ON FUNCTION ${oldSignature} TO pg_read_all_settings;
+      CREATE TABLE "${target}".workflow_runs (LIKE public.workflow_runs INCLUDING ALL);
+      CREATE TABLE "${target}".idempotency_keys (LIKE public.idempotency_keys INCLUDING ALL);
+      CREATE TABLE "${target}".outbox_events (LIKE public.outbox_events INCLUDING ALL);
     `);
-    expect(await psql("--single-transaction", "-f", enqueue)).toMatchObject({
-      code: 3,
+  }
+
+  // The released seven-argument signature, by default owned by another role
+  // with a restricted ACL. The schema's default privileges would add a grant
+  // to any function created later.
+  async function releasedFunction(target: string, restricted = true) {
+    const fn = `"${target}".workflow_engine_enqueue(text, text, text, jsonb, jsonb, integer, text)`;
+    await admin.query(`
+      CREATE FUNCTION "${target}".workflow_engine_enqueue(text, text, text, jsonb,
+        jsonb DEFAULT '{}', integer DEFAULT 5, text DEFAULT NULL)
+      RETURNS text LANGUAGE SQL RETURN 'old';
+      ${
+        restricted
+          ? `REVOKE EXECUTE ON FUNCTION ${fn} FROM PUBLIC;
+             GRANT EXECUTE ON FUNCTION ${fn} TO pg_monitor WITH GRANT OPTION;
+             ALTER FUNCTION ${fn} OWNER TO pg_read_all_settings;`
+          : ""
+      }
+      ALTER DEFAULT PRIVILEGES IN SCHEMA "${target}"
+        GRANT EXECUTE ON FUNCTIONS TO pg_read_all_stats;
+    `);
+  }
+
+  async function installed() {
+    const { rows } = await admin.query(
+      `SELECT n.nspname AS schema, p.pronargs AS args,
+              p.proowner::regrole::text AS owner, p.proacl::text[] AS acl
+         FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+        WHERE p.proname = 'workflow_engine_enqueue' AND n.nspname IN ($1, $2)
+        ORDER BY n.nspname, p.pronargs`,
+      [schema, other],
+    );
+    return rows;
+  }
+
+  const wrapper =
+    () => `CREATE FUNCTION enqueue_order(k text) RETURNS text LANGUAGE SQL
+    RETURN "${schema}".workflow_engine_enqueue(k, 'orders', 'Orders', '{}', '{}', 5, NULL)`;
+
+  it.each([
+    [
+      "the alpha.21 command, psql -f",
+      () => psqlWith({ stop: false }, "-f", enqueue),
+      0,
+    ],
+    ["psql -v ON_ERROR_STOP=1 -f", () => psql("-f", enqueue), 3],
+    [
+      "psql --single-transaction -f",
+      () => psqlWith({ stop: false }, "--single-transaction", "-f", enqueue),
+      0,
+    ],
+    [
+      "the documented psql command",
+      () => psql("--single-transaction", "-f", enqueue),
+      3,
+    ],
+    ["one query holding the whole file", () => viaClient(false), 1],
+    ["one prepared statement", () => viaClient(true), 1],
+  ] as const)("installs atomically through %s, keeping the old owner and ACL", async (_style, run, failureCode) => {
+    await engineTables(schema);
+    await releasedFunction(schema);
+    await admin.query(wrapper());
+    const before = await installed();
+    expect(before).toEqual([
+      {
+        schema,
+        args: 7,
+        owner: "pg_read_all_settings",
+        acl: [
+          "pg_read_all_settings=X/pg_read_all_settings",
+          "pg_monitor=X*/pg_read_all_settings",
+        ],
+      },
+    ]);
+
+    // A tracked dependent fails the install and leaves the old function.
+    expect(await run()).toMatchObject({
+      code: failureCode,
       stderr: expect.stringContaining("2BP01"),
     });
-    expect(await privileges(newSignature)).toBeUndefined();
-    expect(await privileges(oldSignature)).toEqual({
-      allowed: true,
-      public: false,
-    });
-    expect(
-      (await admin.query("SELECT enqueue_order('before') AS id")).rows,
-    ).toEqual([{ id: "old" }]);
+    expect(await installed()).toEqual(before);
+    expect((await admin.query("SELECT enqueue_order('k') AS id")).rows).toEqual(
+      [{ id: "old" }],
+    );
 
-    const dir = await mkdtemp(join(tmpdir(), "enqueue-upgrade-"));
-    try {
-      const before = join(dir, "before.sql");
-      const after = join(dir, "after.sql");
-      await writeFile(before, "DROP FUNCTION enqueue_order(text);\n");
-      await writeFile(
-        after,
-        `
-        REVOKE EXECUTE ON FUNCTION ${newSignature} FROM PUBLIC;
-        GRANT EXECUTE ON FUNCTION ${newSignature} TO pg_read_all_settings;
-        ${wrapper};
-      `,
-      );
-      expect(
-        await psql(
-          "--single-transaction",
-          "-f",
-          before,
-          "-f",
-          enqueue,
-          "-f",
-          after,
-        ),
-      ).toMatchObject({ code: 0 });
-      expect(await privileges(oldSignature)).toBeUndefined();
-      expect(await privileges(newSignature)).toEqual({
-        allowed: true,
-        public: false,
+    await admin.query("DROP FUNCTION enqueue_order(text)");
+    // The second pass re-runs a completed install.
+    for (const _rerun of [1, 2]) {
+      expect(await run()).toMatchObject({
+        code: 0,
+        stderr: expect.not.stringContaining("ERROR"),
       });
+      expect(await installed()).toEqual([{ ...before[0], args: 9 }]);
+    }
+    const {
+      rows: [created],
+    } = await admin.query(
+      `SELECT "${schema}".workflow_engine_enqueue('k', 'wf', 'Workflow', '{}') AS id`,
+    );
+    expect(
+      (await admin.query(`SELECT id FROM "${schema}".workflow_runs`)).rows,
+    ).toEqual([created]);
+  });
+
+  it("replaces the function around recreated wrappers in one transaction", async () => {
+    await engineTables(schema);
+    await releasedFunction(schema);
+    await admin.query(wrapper());
+    const before = await installed();
+    const dir = await mkdtemp(join(tmpdir(), "enqueue-upgrade-"));
+    const upgrade = (after: string) =>
+      psql(
+        "--single-transaction",
+        "-c",
+        "SET LOCAL lock_timeout = '500ms'",
+        "-f",
+        join(dir, "before-enqueue.sql"),
+        "-f",
+        enqueue,
+        "-f",
+        join(dir, after),
+      );
+    try {
+      await writeFile(
+        join(dir, "before-enqueue.sql"),
+        "DROP FUNCTION enqueue_order(text);\n",
+      );
+      await writeFile(join(dir, "after-enqueue.sql"), `${wrapper()};\n`);
+      await writeFile(join(dir, "broken.sql"), `${wrapper()};\nSELECT 1/0;\n`);
+
+      expect(await upgrade("broken.sql")).toMatchObject({
+        code: 3,
+        stderr: expect.stringContaining("22012"),
+      });
+      expect(await installed()).toEqual(before);
+      expect(
+        (await admin.query("SELECT enqueue_order('k') AS id")).rows,
+      ).toEqual([{ id: "old" }]);
+
+      expect(await upgrade("after-enqueue.sql")).toMatchObject({ code: 0 });
+      expect(await installed()).toEqual([{ ...before[0], args: 9 }]);
       const {
         rows: [created],
       } = await admin.query("SELECT enqueue_order($1) AS id", [
         `upgrade-${schema}`,
       ]);
-      expect(created?.id).toBeTruthy();
-      expect(
-        (
-          await admin.query("SELECT id FROM workflow_runs WHERE id = $1", [
-            created?.id,
-          ])
-        ).rows,
-      ).toEqual([created]);
+      expect((await admin.query("SELECT id FROM workflow_runs")).rows).toEqual([
+        created,
+      ]);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+
+  it("installs beside the tables the search path finds and leaves another schema's function alone", async () => {
+    await engineTables(schema);
+    await engineTables(other);
+    await releasedFunction(other);
+    const [untouched] = await installed();
+
+    expect(
+      await psqlWith(
+        { searchPath: `${schema},${other}` },
+        "--single-transaction",
+        "-f",
+        enqueue,
+      ),
+    ).toMatchObject({ code: 0 });
+    expect(await installed()).toEqual([
+      untouched,
+      expect.objectContaining({ schema, args: 9, acl: null }),
+    ]);
+    expect(
+      (
+        await admin.query(
+          `SELECT "${other}".workflow_engine_enqueue('k', 'wf', 'Workflow', '{}') AS id`,
+        )
+      ).rows,
+    ).toEqual([{ id: "old" }]);
+
+    // The new function writes its own schema's tables whatever the caller's
+    // search path.
+    await admin.query(`SET search_path TO "${other}", "${schema}"`);
+    const {
+      rows: [created],
+    } = await admin.query(
+      `SELECT "${schema}".workflow_engine_enqueue('k', 'wf', 'Workflow', '{}') AS id`,
+    );
+    expect(
+      (await admin.query(`SELECT id FROM "${schema}".workflow_runs`)).rows,
+    ).toEqual([created]);
+    expect(
+      (await admin.query(`SELECT id FROM "${other}".workflow_runs`)).rows,
+    ).toEqual([]);
+  });
+
+  it("replaces the engine schema's function in place when an earlier schema on the search path has no tables", async () => {
+    await engineTables(schema);
+    await releasedFunction(schema);
+    const before = await installed();
+
+    expect(await psqlWith({ searchPath: other }, "-f", enqueue)).toMatchObject({
+      code: 3,
+      stderr: expect.stringContaining("42P01"),
+    });
+    expect(await installed()).toEqual(before);
+
+    expect(
+      await psqlWith({ searchPath: `${other},${schema}` }, "-f", enqueue),
+    ).toMatchObject({ code: 0 });
+    expect(await installed()).toEqual([{ ...before[0], args: 9 }]);
+  });
+
+  it("copies a default ACL on upgrade instead of the schema's default privileges", async () => {
+    await engineTables(schema);
+    await releasedFunction(schema, false);
+    const [{ owner }] = await installed();
+
+    expect(await psql("-f", enqueue)).toMatchObject({ code: 0 });
+    expect(await installed()).toEqual([
+      { schema, args: 9, owner, acl: [`=X/${owner}`, `${owner}=X/${owner}`] },
+    ]);
+  });
+
+  it("keeps the default ACL on a fresh install and commits the documented REVOKE and GRANT with it", async () => {
+    await engineTables(schema);
+    await engineTables(other);
+    expect(
+      await psql("--single-transaction", "-f", enqueue, "-c", "SELECT 1/0"),
+    ).toMatchObject({ code: 1, stderr: expect.stringContaining("22012") });
+    expect(await installed()).toEqual([]);
+    expect(await psql("--single-transaction", "-f", enqueue)).toMatchObject({
+      code: 0,
+    });
+    expect(await installed()).toEqual([
+      expect.objectContaining({ schema, args: 9, acl: null }),
+    ]);
+
+    const restricted = (role: string) =>
+      psqlWith(
+        { searchPath: other },
+        "--single-transaction",
+        "-f",
+        enqueue,
+        "-c",
+        `REVOKE EXECUTE ON FUNCTION ${newSignature} FROM PUBLIC`,
+        "-c",
+        `GRANT EXECUTE ON FUNCTION ${newSignature} TO ${role}`,
+      );
+    expect(await restricted("missing_enqueue_role")).toMatchObject({
+      code: 1,
+      stderr: expect.stringContaining("42704"),
+    });
+    expect(await installed()).toHaveLength(1);
+    expect(await restricted("pg_monitor")).toMatchObject({ code: 0 });
+    const { owner, acl } = (await installed()).find(
+      (fn) => fn.schema === other,
+    );
+    expect(acl).toEqual([`${owner}=X/${owner}`, `pg_monitor=X/${owner}`]);
   });
 
   it.skipIf(process.env.PRISMA_MAJOR !== "6")(

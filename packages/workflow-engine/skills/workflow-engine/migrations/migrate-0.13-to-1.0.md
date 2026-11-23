@@ -384,6 +384,11 @@ Run the shipped PostgreSQL upgrade against the engine schema. Each `ALTER`
 has its own transaction. The six `CREATE INDEX CONCURRENTLY` statements follow
 outside any transaction block.
 
+psql takes a libpq connection string, not the application's Prisma URL.
+Remove Prisma-only parameters such as `schema`, `connection_limit` and
+`statement_cache_size`. For a non-public engine schema, select it with
+`PGOPTIONS='-c search_path=<schema>'` on both psql commands in this section.
+
 ```bash
 psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 \
   -f node_modules/@bratsos/workflow-engine/sql/tenant-attribution.sql
@@ -437,47 +442,43 @@ CREATE INDEX IF NOT EXISTS "idempotency_keys_createdAt_idx" ON "idempotency_keys
 
 #### Replace an existing PostgreSQL enqueue function
 
-After the column and index script succeeds, replace the optional enqueue
-function in a separate transaction. Its trailing defaults preserve valid
-seven-argument calls. PostgreSQL reports SQLSTATE `2BP01` when an object
-has a catalog dependency on the old signature. This includes views and
-SQL-language functions defined with a `RETURN` or `BEGIN ATOMIC` body.
-Check for direct dependents in the same schema search path you use to
-install the function.
+After the column and index script succeeds, apply the new enqueue function.
+Its trailing defaults preserve valid seven-argument calls. The file is one
+`DO` statement, so it commits or rolls back as a whole however it is run:
+psql with or without `ON_ERROR_STOP` or `--single-transaction`, or a
+migration runner that sends it whole or statement by statement. It installs
+into the schema of the `workflow_runs` table that the search path finds and
+fails with SQLSTATE `42P01` when there is none. There it drops the released
+seven-argument signature and gives the new signature that function's owner
+and ACL, including any `PUBLIC` revocation. Functions in other schemas are
+left alone.
+
+PostgreSQL reports SQLSTATE `2BP01` when an object has a catalog dependency
+on the old signature, and the install then changes nothing. This includes
+views and SQL-language functions defined with a `RETURN` or `BEGIN ATOMIC`
+body. List the direct dependents in the engine schema with the same search
+path.
 
 ```sql
 SELECT pg_describe_object(classid, objid, objsubid) AS dependent
 FROM pg_depend
 WHERE refclassid = 'pg_proc'::regclass
   AND refobjid = to_regprocedure(
-    'workflow_engine_enqueue(text,text,text,jsonb,jsonb,integer,text)'
+    (SELECT relnamespace::regnamespace::text FROM pg_class
+      WHERE oid = to_regclass('workflow_runs'))
+    || '.workflow_engine_enqueue(text,text,text,jsonb,jsonb,integer,text)'
   );
 ```
 
 Save definitions, owners and ACLs. Inspect dependents of the listed objects
 as well. Put explicit drops in `before-enqueue.sql` in dependent-first order.
-Put recreation in `after-enqueue.sql` in dependency-first order. Use
-non-cascading drops so any dependency you missed aborts the upgrade. Recreate
-tracked wrappers even when their call text still passes seven arguments.
-
-Add the old function's `EXECUTE` grants and any `PUBLIC` revocation to
-`after-enqueue.sql`. Check the intended ACL before committing the replacement.
-For a function restricted to `app_role`, those statements are as follows.
-
-```sql
-REVOKE EXECUTE ON FUNCTION
-  workflow_engine_enqueue(text, text, text, jsonb, jsonb, integer, text, text, jsonb)
-  FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION
-  workflow_engine_enqueue(text, text, text, jsonb, jsonb, integer, text, text, jsonb)
-  TO app_role;
-```
-
-Prepare both companion files for your database before running this command.
-Use an empty file for a phase where your database needs no changes.
+Put recreation, with each wrapper's own grants, in `after-enqueue.sql` in
+dependency-first order. Use non-cascading drops so any dependency you missed
+aborts the upgrade. Recreate tracked wrappers even when their call text still
+passes seven arguments. Run all three files in one transaction. Use empty
+companion files when nothing depends on the old signature.
 
 ```bash
-# Upgrade only after writing the dependency and ACL statements for this database.
 psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction \
   -c "SET LOCAL lock_timeout = '500ms'" \
   -f before-enqueue.sql \
@@ -485,9 +486,11 @@ psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction \
   -f after-enqueue.sql
 ```
 
-On error, psql exits nonzero and the previous function and its ACL remain
-in place. Resolve a reported dependency or lock conflict before retrying.
-Use the same atomic sequence in a migration runner that stops on SQL errors.
+On error, psql exits nonzero and the previous function, its wrappers and its
+ACL remain in place. Without `ON_ERROR_STOP`, psql prints the error and exits
+0, so automation cannot see the failure. Resolve a reported dependency or lock
+conflict before retrying. Use the same transaction in a migration runner that
+stops on SQL errors.
 
 Custom persistence adapters receive the run ID as the fourth argument to
 `completeIdempotencyKey(key, commandType, result, workflowRunId)`. The argument

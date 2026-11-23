@@ -709,30 +709,37 @@ PERFORM workflow_engine_enqueue(
 The function ships in `node_modules/@bratsos/workflow-engine/sql/enqueue.sql`.
 Install it after creating the engine tables.
 
+The file is one statement, so it commits or rolls back as a whole however
+it is run. It installs into the schema of the `workflow_runs` table that the
+search path finds. psql takes a libpq connection string: remove Prisma-only
+parameters such as `schema` and `statement_cache_size`, and select a
+non-public engine schema with `PGOPTIONS='-c search_path=<schema>'`.
+
 #### Fresh install
 
-Use the standalone command only on a fresh install where the database's
-default function ACL gives the intended access. If you restrict execution,
-prepare a file with your `REVOKE` and `GRANT` statements and add it as the last
-`-f` argument so the ACL takes effect in the same transaction.
+A new function gets the database's default function ACL, which lets `PUBLIC`
+execute it. To restrict it to an application role, commit the `REVOKE` and
+`GRANT` with the install:
 
 ```bash
-# Fresh install with the intended default function ACL.
+# Fresh install. Omit both -c lines to keep the default ACL.
 psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction \
-  -f node_modules/@bratsos/workflow-engine/sql/enqueue.sql
+  -f node_modules/@bratsos/workflow-engine/sql/enqueue.sql \
+  -c 'REVOKE EXECUTE ON FUNCTION workflow_engine_enqueue(text, text, text, jsonb, jsonb, integer, text, text, jsonb) FROM PUBLIC' \
+  -c 'GRANT EXECUTE ON FUNCTION workflow_engine_enqueue(text, text, text, jsonb, jsonb, integer, text, text, jsonb) TO app_role'
 ```
 
 #### Upgrade an existing function
 
+Running the file again replaces the released seven-argument signature and
+keeps that function's owner and ACL, so its grants and any `PUBLIC`
+revocation carry over. A view or SQL function that depends on the old
+signature makes the install fail with SQLSTATE `2BP01` and change nothing.
 Follow the [PostgreSQL upgrade](../migrations/migrate-0.13-to-1.0.md#tenant-attribution-and-sql-enqueue)
-for the separate table migrations, tracked wrappers, and atomic function
-and ACL replacement. Dropping the original signature removes its privileges.
-Prepare the before and after files in the upgrade guide even when your
-wrapper still passes seven arguments.
+to apply the table migrations first and to recreate such wrappers in the same
+transaction, even when they still pass seven arguments.
 
-The same scripts work with Prisma 6, 7 and 8. If you use a custom migration,
-run the function change and its ACL statements in one transaction with error
-checking.
+The same scripts work with Prisma 6, 7 and 8.
 
 Requires PostgreSQL 13 or newer (for the built-in `gen_random_uuid()`).
 

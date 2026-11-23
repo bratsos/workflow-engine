@@ -1486,27 +1486,35 @@ work atomically with the rows that justify it. It ships as SQL in the package
 (`sql/enqueue.sql`), not as something the engine creates at runtime, so the
 consumer's migration owns it.
 
+The file is one statement, so it commits or rolls back as a whole however
+it is run. It installs into the schema of the `workflow_runs` table that the
+search path finds. psql takes a libpq connection string: remove Prisma-only
+parameters such as `schema` and `statement_cache_size`, and select a
+non-public engine schema with `PGOPTIONS='-c search_path=<schema>'`.
+
 ### Fresh install
 
-Run the standalone command after creating the engine tables and confirm that
-the database's default function ACL gives the intended access. For a
-restricted fresh install, add a final `-f` with the application's `REVOKE` and
-`GRANT` statements so they commit with the function.
+Run it after creating the engine tables. A new function gets the database's
+default function ACL, which lets `PUBLIC` execute it. To restrict it to an
+application role, commit the `REVOKE` and `GRANT` with the install:
 
 ```bash
-# Fresh install with the intended default function ACL.
+# Fresh install. Omit both -c lines to keep the default ACL.
 psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction \
-  -f node_modules/@bratsos/workflow-engine/sql/enqueue.sql
+  -f node_modules/@bratsos/workflow-engine/sql/enqueue.sql \
+  -c 'REVOKE EXECUTE ON FUNCTION workflow_engine_enqueue(text, text, text, jsonb, jsonb, integer, text, text, jsonb) FROM PUBLIC' \
+  -c 'GRANT EXECUTE ON FUNCTION workflow_engine_enqueue(text, text, text, jsonb, jsonb, integer, text, text, jsonb) TO app_role'
 ```
 
 ### Upgrade an existing function
 
-Follow the [migration guide](../migrations/migrate-0.13-to-1.0.md#tenant-attribution-and-sql-enqueue)
-for the separate table steps and atomic replacement. Prepare the dependent
-wrapper and ACL files before running the upgrade command. A PostgreSQL
-`2BP01` error identifies a tracked dependency that must be recreated in the
-same transaction. Valid seven-argument calls still use the two trailing
-defaults.
+Running the file again replaces the released seven-argument signature and
+keeps that function's owner and ACL. A PostgreSQL `2BP01` error identifies a
+view or SQL function that depends on the old signature; the install then
+changes nothing. Follow the
+[migration guide](../migrations/migrate-0.13-to-1.0.md#tenant-attribution-and-sql-enqueue)
+to apply the table steps first and recreate such wrappers in the same
+transaction. Valid seven-argument calls still use the two trailing defaults.
 
 The same function works on Prisma 8. The call through a Prisma 8 transaction
 is under [Prisma 8](#prisma-8).

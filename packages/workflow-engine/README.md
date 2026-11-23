@@ -1179,7 +1179,7 @@ With a registry built by `createWorkflowRegistry`, a host claims and polls only 
 
 ### Enqueue from SQL
 
-`sql/enqueue.sql` defines `workflow_engine_enqueue(idempotency_key, workflow_id, workflow_name, input, config?, priority?, definition_version?, tenant_id?, labels?)`. Install it after creating the engine tables. Follow the migration guide for an existing function so the replacement preserves its intended grants and tracked dependents. A trigger or a non-TypeScript service can then create a run in its own transaction.
+`sql/enqueue.sql` defines `workflow_engine_enqueue(idempotency_key, workflow_id, workflow_name, input, config?, priority?, definition_version?, tenant_id?, labels?)`. Install it after creating the engine tables. The install is one atomic statement in the engine tables' schema; replacing an existing function keeps its owner and grants. Follow the migration guide when a view or SQL function depends on the old signature. A trigger or a non-TypeScript service can then create a run in its own transaction.
 
 ```sql
 PERFORM workflow_engine_enqueue(

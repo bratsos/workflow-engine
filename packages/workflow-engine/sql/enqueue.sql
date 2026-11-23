@@ -14,11 +14,16 @@
 -- This file is part of the schema, not something the engine creates at
 -- runtime: run it in your own migration, next to the tables it writes, so
 -- your migration history owns it. Apply it AFTER the workflow engine tables
--- exist. Use a transaction with error checking, for example
--- psql -X -v ON_ERROR_STOP=1 --single-transaction -f enqueue.sql.
--- For upgrades, include the dependent-object changes and ACL restoration
--- in that transaction. Restore EXECUTE grants and any PUBLIC revocation
--- before committing the new signature.
+-- exist, with error checking, for example
+-- psql -X -v ON_ERROR_STOP=1 -f enqueue.sql.
+--
+-- The install is one DO statement, so it commits or rolls back as a whole
+-- however it is run. It installs into the schema of the "workflow_runs"
+-- table that the search path finds and touches no other schema. Replacing
+-- the released seven-argument signature keeps that function's owner and
+-- ACL. A view or SQL function that depends on the old signature makes it
+-- fail with SQLSTATE 2BP01 and change nothing: drop and recreate those
+-- dependents around it in one transaction (see the migration guide).
 --
 -- Requires PostgreSQL 13+ (for the built-in gen_random_uuid()).
 --
@@ -78,9 +83,37 @@
 --
 -- ---------------------------------------------------------------------------
 
-DROP FUNCTION IF EXISTS workflow_engine_enqueue(text, text, text, jsonb, jsonb, integer, text);
+DO $install$
+DECLARE
+  v_schema  text;
+  v_old_sig text;
+  v_new_sig text;
+  v_owner   regrole;
+  v_acl     aclitem[];
+  v_item    record;
+BEGIN
+  SELECT n.nspname INTO v_schema
+    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+   WHERE c.oid = to_regclass('workflow_runs');
+  IF v_schema IS NULL THEN
+    RAISE EXCEPTION 'workflow_engine_enqueue: no "workflow_runs" table on the search path; create the engine tables first'
+      USING ERRCODE = '42P01';
+  END IF;
+  v_old_sig := format('%I.workflow_engine_enqueue(text, text, text, jsonb, jsonb, integer, text)', v_schema);
+  v_new_sig := format('%I.workflow_engine_enqueue(text, text, text, jsonb, jsonb, integer, text, text, jsonb)', v_schema);
 
-CREATE OR REPLACE FUNCTION workflow_engine_enqueue(
+  -- Dropping the released signature drops its owner and ACL with it; keep
+  -- both to copy onto the new signature. No CASCADE: a dependent object
+  -- raises 2BP01 and rolls the whole statement back.
+  IF to_regprocedure(v_old_sig) IS NOT NULL THEN
+    SELECT proowner, proacl INTO v_owner, v_acl
+      FROM pg_proc WHERE oid = to_regprocedure(v_old_sig);
+    EXECUTE 'DROP FUNCTION ' || v_old_sig;
+  END IF;
+
+  -- format() writes the engine schema for %1$I; %% is a literal %.
+  EXECUTE format($create$
+CREATE OR REPLACE FUNCTION %1$I.workflow_engine_enqueue(
   -- Deduplicates the enqueue exactly as `run.create`'s does: calling twice
   -- with one key returns the same run id and creates nothing the second time.
   p_idempotency_key    text,
@@ -118,7 +151,7 @@ BEGIN
 
   -- 1. Claim the idempotency key. The unique index on (key, commandType) is
   --    what makes two concurrent callers agree on one run.
-  INSERT INTO "idempotency_keys" ("id", "createdAt", "key", "commandType", "result")
+  INSERT INTO %1$I."idempotency_keys" ("id", "createdAt", "key", "commandType", "result")
   VALUES (
     gen_random_uuid()::text,
     v_now,
@@ -130,7 +163,7 @@ BEGIN
 
   IF NOT FOUND THEN
     SELECT "result" INTO v_existing
-      FROM "idempotency_keys"
+      FROM %1$I."idempotency_keys"
      WHERE "key" = p_idempotency_key AND "commandType" = 'run.create';
 
     -- A marker left behind by a TypeScript dispatch that has not settled.
@@ -138,7 +171,7 @@ BEGIN
     -- creating a second run under a key that already owns one.
     IF v_existing ? '__workflowEngineState' THEN
       RAISE EXCEPTION
-        'workflow_engine_enqueue: run.create for idempotency key % is already in progress',
+        'workflow_engine_enqueue: run.create for idempotency key %% is already in progress',
         p_idempotency_key
         USING ERRCODE = '55006';
     END IF;
@@ -159,12 +192,12 @@ BEGIN
   --    nothing and no host will ever serve it.
   IF p_definition_version IS NOT NULL THEN
     PERFORM 1
-       FROM "workflow_definitions"
+       FROM %1$I."workflow_definitions"
       WHERE "workflowId" = p_workflow_id
         AND "version" = p_definition_version;
     IF NOT FOUND THEN
       RAISE EXCEPTION
-        'workflow_engine_enqueue: no workflow_definitions row for (%, %); a version is registered by the TypeScript definition that computed it, so create one run from TypeScript first or pass NULL to create this run unpinned',
+        'workflow_engine_enqueue: no workflow_definitions row for (%%, %%); a version is registered by the TypeScript definition that computed it, so create one run from TypeScript first or pass NULL to create this run unpinned',
         p_workflow_id, p_definition_version;
     END IF;
   END IF;
@@ -173,7 +206,7 @@ BEGIN
   --    enqueues no job, exactly as run.create enqueues none.
   v_run_id := gen_random_uuid()::text;
 
-  INSERT INTO "workflow_runs" (
+  INSERT INTO %1$I."workflow_runs" (
     "id", "createdAt", "updatedAt", "workflowId", "workflowName",
     "workflowType", "status", "input", "config", "priority",
     "definitionVersion", "tenantId", "labels"
@@ -185,7 +218,7 @@ BEGIN
   );
 
   -- 4. The first outbox event for this newly created run.
-  INSERT INTO "outbox_events" (
+  INSERT INTO %1$I."outbox_events" (
     "id", "createdAt", "workflowRunId", "sequence", "eventType",
     "payload", "causationId", "occurredAt"
   ) VALUES (
@@ -208,7 +241,7 @@ BEGIN
 
   -- 5. Record the result under the key, so a replay returns this run
   --    instead of creating another. Same shape as RunCreateResult.
-  UPDATE "idempotency_keys"
+  UPDATE %1$I."idempotency_keys"
      SET "workflowRunId" = v_run_id,
          "result" = jsonb_build_object(
            'workflowRunId', v_run_id,
@@ -220,7 +253,31 @@ BEGIN
   PERFORM pg_notify('workflow_engine_runs', v_run_id);
   RETURN v_run_id;
 END;
-$$;
+$$
+$create$, v_schema);
 
-COMMENT ON FUNCTION workflow_engine_enqueue(text, text, text, jsonb, jsonb, integer, text, text, jsonb) IS
-  'Create a PENDING workflow run in the caller''s transaction. Accepts optional tenant attribution and notifies workflow_engine_runs on commit. Mirrors run.create; see sql/enqueue.sql for what it cannot do (input validation, definition-version stamping, stage config defaults).';
+  EXECUTE format('COMMENT ON FUNCTION %s IS %L', v_new_sig,
+    'Create a PENDING workflow run in the caller''s transaction. Accepts optional tenant attribution and notifies workflow_engine_runs on commit. Mirrors run.create; see sql/enqueue.sql for what it cannot do (input validation, definition-version stamping, stage config defaults).');
+
+  -- On an upgrade, give the new signature exactly the old owner and ACL,
+  -- replacing whatever CREATE gave it (default privileges, earlier grants).
+  IF v_owner IS NOT NULL THEN
+    EXECUTE format('ALTER FUNCTION %s OWNER TO %s', v_new_sig, v_owner);
+    IF (SELECT proacl FROM pg_proc WHERE oid = to_regprocedure(v_new_sig)) IS DISTINCT FROM v_acl THEN
+      FOR v_item IN
+        SELECT DISTINCT a.grantee
+          FROM pg_proc p, aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a
+         WHERE p.oid = to_regprocedure(v_new_sig)
+      LOOP
+        EXECUTE format('REVOKE ALL ON FUNCTION %s FROM %s', v_new_sig,
+          CASE v_item.grantee WHEN 0 THEN 'PUBLIC' ELSE v_item.grantee::regrole::text END);
+      END LOOP;
+      FOR v_item IN SELECT * FROM aclexplode(coalesce(v_acl, acldefault('f', v_owner))) LOOP
+        EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO %s%s', v_new_sig,
+          CASE v_item.grantee WHEN 0 THEN 'PUBLIC' ELSE v_item.grantee::regrole::text END,
+          CASE WHEN v_item.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END);
+      END LOOP;
+    END IF;
+  END IF;
+END;
+$install$;
