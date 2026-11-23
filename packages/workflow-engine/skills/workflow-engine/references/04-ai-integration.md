@@ -196,9 +196,14 @@ and pass their USD `cost`. A supplied cost bypasses the model registry and
 uses the supplied `modelKey` as the recorded model ID. It defaults to
 `costSource: "reported"`; set `"estimated"` for a supplied estimate.
 
-Failed calls report safe diagnostics to callers and workflow history,
-including errors read from the SDK stream result (`rawResult`). Detailed
-provider warnings and error text require both trace flags.
+Callers receive provider errors unchanged. Under `store: "none"` or a TTL,
+the engine's own outputs describe a failed AI call by its error name and HTTP
+status instead of its message. These outputs are AI call rows, stage and step
+error columns, engine-written logs, events, outbox payloads, console reads and
+the engine's console and trace lines. This covers helper errors, stream and
+tool errors read from `rawResult`, errors carrying one as `cause`, and
+messages that repeat their text. Text your stage writes itself is not
+covered. Detailed provider warnings and error text require both trace flags.
 Use those flags only for data you intend to send to process diagnostics.
 
 The accounting policy covers the prompt, response and top-level instructions.
@@ -215,8 +220,7 @@ children. Pending includes open streams and writes still in progress when
 the timeout expires. A write the database refuses reaches `onLogError`. A
 caller that awaits a `ctx.aiLogger` write gets a rejection with a safe
 message; an ignored one is handled, and the Prisma logger logs a warning. `getResults` records a batch before it returns, as before, and
-rejects if that write fails; `recordResults` retries it. A batch's rows are
-written together on both SQLite and PostgreSQL.
+rejects if that write fails; `recordResults` retries it.
 
 Stage helpers do not wait for their accounting writes, so stage outcomes,
 retries and deadlines do not depend on them. Run totals sum the ledger rows
