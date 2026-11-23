@@ -519,14 +519,6 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
     if (withholds()) withholdErrorText(verdict.error);
     return deps.storeFailedVerdict(stepId, verdict);
   };
-  const parseOutput = <T>(schema: z.ZodType<T>, value: unknown) => {
-    try {
-      return schema.safeParse(value);
-    } catch (error) {
-      if (withholds()) withholdErrorText(error);
-      throw error;
-    }
-  };
 
   async function generateText(
     id: string,
@@ -802,7 +794,7 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
             };
             continue;
           }
-          const validated = parseOutput(spec.schema, streamed);
+          const validated = spec.schema.safeParse(streamed);
           if (validated.success) {
             return {
               ...base,
@@ -864,7 +856,7 @@ export function createStepAi(deps: StepAiDeps): StepAiApi {
           return routed;
         }
 
-        const parsed = parseOutput(spec.schema, object);
+        const parsed = spec.schema.safeParse(object);
         if (parsed.success) {
           return {
             ...base,
