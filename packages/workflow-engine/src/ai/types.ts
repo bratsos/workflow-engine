@@ -862,8 +862,6 @@ export interface AIHelperContext {
   readonly aiCallLogger: AICallLogger;
   readonly beginOperation?: () => () => void;
   readonly onAccountingError?: (error: unknown) => void;
-  /** The text policy keeps call text out of stored rows (`none` or a TTL). */
-  readonly withholdsText?: boolean;
   readonly providerResolver?: ProviderResolver;
   readonly routing?: OpenRouterRoutingOptions;
   readonly adapter?: AIAdapter;

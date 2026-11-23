@@ -15,7 +15,6 @@ import { isTraceTextEnabled } from "../utils/logger.js";
 import { getModel, type ModelKey } from "./model-helper";
 import {
   describeAICallError,
-  protectProviderWarnings,
   traceProviderDiagnostic,
 } from "./provider-diagnostics.js";
 import {
@@ -283,7 +282,7 @@ export function logFailure(
       ...(servedBySteps !== undefined ? { servedBySteps } : {}),
       durationMs,
       status: "error",
-      error: ctx.withholdsText ? described : message,
+      error: message,
     },
   });
 
@@ -305,7 +304,7 @@ export async function generateText<TTools extends ToolSet = ToolSet>(
     assertAdapterProviderPolicy(ctx.routing?.provider);
   const model = ctx.adapter?.generateText
     ? undefined
-    : protectProviderWarnings(resolveLanguageModel(ctx, modelConfig));
+    : resolveLanguageModel(ctx, modelConfig);
   const startTime = Date.now();
   const timeout = createCallTimeout(
     options.abortSignal,
@@ -604,7 +603,7 @@ export async function generateObject<TSchema extends z.ZodTypeAny>(
     assertAdapterProviderPolicy(ctx.routing?.provider);
   const model = ctx.adapter?.generateObject
     ? undefined
-    : protectProviderWarnings(resolveLanguageModel(ctx, modelConfig));
+    : resolveLanguageModel(ctx, modelConfig);
   const startTime = Date.now();
   const timeout = createCallTimeout(
     options.abortSignal,

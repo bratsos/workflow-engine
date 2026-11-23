@@ -177,6 +177,16 @@ class AIHelperImpl implements AIHelper {
       workflowRunId:
         attribution?.workflowRunId ?? this.logContext?.workflowRunId,
     };
+    if (
+      (text?.store === "none" || text?.ttlMs !== undefined) &&
+      call.metadata &&
+      typeof call.metadata === "object" &&
+      Object.hasOwn(call.metadata, "error")
+    ) {
+      // A provider can quote the request in its error, and text retention
+      // does not clear metadata.
+      call.metadata = { ...call.metadata, error: "AI call failed" };
+    }
     if (text?.store === "none") {
       call.prompt = "";
       call.response = "";
@@ -248,9 +258,6 @@ class AIHelperImpl implements AIHelper {
       aiCallLogger: this.trackedLogger,
       beginOperation: () => this.writes.begin(),
       onAccountingError: () => this.writes.fail(),
-      withholdsText:
-        this.options?.text?.store === "none" ||
-        this.options?.text?.ttlMs !== undefined,
       providerResolver: this.providerResolver,
       routing: this.options?.routing,
       adapter: this.options?.adapter,

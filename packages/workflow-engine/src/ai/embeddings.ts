@@ -12,7 +12,6 @@ import { openrouter } from "@openrouter/ai-sdk-provider";
 import { embed as aiEmbed, embedMany } from "ai";
 import { logFailure } from "./generate";
 import { getModel, type ModelConfig, type ModelKey } from "./model-helper";
-import { protectProviderWarnings } from "./provider-diagnostics.js";
 import {
   assertAdapterProviderPolicy,
   assertDirectProviderPolicy,
@@ -139,12 +138,10 @@ export async function embed(
     if (isAdapter) assertAdapterProviderPolicy(ctx.routing?.provider);
     const embeddingModel = isAdapter
       ? undefined
-      : protectProviderWarnings(
-          getEmbeddingModelProvider(
-            modelConfig,
-            ctx.routing,
-            options.providerOptions?.openrouter?.provider,
-          ),
+      : getEmbeddingModelProvider(
+          modelConfig,
+          ctx.routing,
+          options.providerOptions?.openrouter?.provider,
         );
     const providerOptions = {
       ...(modelConfig.provider === "google" && {

@@ -7,11 +7,11 @@
  */
 
 import type { SharedV4ProviderOptions } from "@ai-sdk/provider";
-import type { GenerateTextEndEvent, ToolSet } from "ai";
+import type { GenerateTextEndEvent, TextStreamPart, ToolSet } from "ai";
 import { streamText as aiStreamText } from "ai";
 import { type CallAccounting, logFailure } from "./generate";
 import { getModel, type ModelKey } from "./model-helper";
-import { protectProviderWarnings } from "./provider-diagnostics.js";
+import { observeStreamReadErrors } from "./provider-diagnostics.js";
 import {
   assertAdapterProviderPolicy,
   logger,
@@ -44,9 +44,9 @@ export function streamText(
     assertAdapterProviderPolicy(ctx.routing?.provider);
   const model = ctx.adapter?.streamText
     ? undefined
-    : protectProviderWarnings(
+    : observeStreamReadErrors(
         resolveLanguageModel(ctx, modelConfig),
-        // The stream has ended; the SDK reports this to no callback.
+        // The stream has ended without a row.
         () => closeStream?.(),
       );
   const startTime = Date.now();
@@ -63,6 +63,7 @@ export function streamText(
       ? input.prompt
       : (JSON.stringify(input.messages) ?? "");
 
+  // Pending from the call until its row is written or it ends without one.
   let closeStream: (() => void) | undefined;
   // Both SDK callbacks and consumer accessors can observe the same failure.
   let errorLogged = false;
@@ -109,7 +110,6 @@ export function streamText(
         ...(input.instructions ? { instructions: input.instructions } : {}),
       },
     });
-    closeStream?.();
     timeout.cleanup();
   };
 
@@ -205,7 +205,10 @@ export function streamText(
     };
 
     // The SDK can finish with buffered step usage after emitting an error.
-    if (errorLogged) return cachedUsage;
+    if (errorLogged) {
+      closeStream?.();
+      return cachedUsage;
+    }
 
     logger.debug(`streamText response`, {
       model: modelKey,
@@ -294,6 +297,23 @@ export function streamText(
     onStepEnd,
     onError: ({ error }: { error: unknown }) => recordStreamError(error),
     onAbort: () => closeStream?.(),
+    // An error part can precede a billable finish. A stream that ends with no
+    // finished step gets no onEnd and so no row; one that has one waits for it.
+    experimental_transform: () => {
+      let finishedStep = false;
+      return new TransformStream<
+        TextStreamPart<ToolSet>,
+        TextStreamPart<ToolSet>
+      >({
+        transform(part, controller) {
+          if (part.type === "finish-step") finishedStep = true;
+          controller.enqueue(part);
+        },
+        flush() {
+          if (!finishedStep) closeStream?.();
+        },
+      });
+    },
     // Ensure the call is always logged once the stream finishes, even if
     // the consumer never calls getUsage(). Dedup'd against getUsage() via
     // the usageResolved flag in persistUsage.
@@ -341,6 +361,7 @@ export function streamText(
     }
   } catch (error) {
     logError(error);
+    closeStream?.();
     throw timeoutErrorIfExpired(timeout, error);
   }
 
@@ -356,6 +377,7 @@ export function streamText(
           : result!.textStream[Symbol.asyncIterator]();
       } catch (error) {
         logError(error);
+        closeStream?.();
         throw error;
       }
       return {
@@ -374,6 +396,7 @@ export function streamText(
             return { done: false, value };
           } catch (error) {
             recordStreamError(error);
+            closeStream?.();
             throw timeoutErrorIfExpired(timeout, error);
           }
         },

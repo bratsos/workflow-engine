@@ -70,9 +70,8 @@ export function forwardingProxy<T extends object>(
   });
 }
 
-function observeStream<T extends { type: string }>(
+function observeStream<T>(
   stream: ReadableStream<T>,
-  keepWarnings: boolean,
   onReadError: (error: unknown) => void,
 ): ReadableStream<T> {
   const reader = stream.getReader();
@@ -87,8 +86,6 @@ function observeStream<T extends { type: string }>(
         return;
       }
       if (next.done) controller.close();
-      else if (next.value.type === "stream-start" && !keepWarnings)
-        controller.enqueue({ ...next.value, warnings: [] });
       else controller.enqueue(next.value);
     },
     cancel: (reason) => reader.cancel(reason),
@@ -96,34 +93,18 @@ function observeStream<T extends { type: string }>(
 }
 
 /**
- * The SDK emits provider warnings via a process-wide logger. Remove warning
- * text at the provider boundary to leave unrelated SDK callers' settings alone.
- * `onStreamReadError` sees a stream that ends in a read rejection, which the
- * SDK reports to no callback; the error still reaches the SDK unchanged.
+ * Report a provider stream that ends in a read rejection, which the SDK
+ * reports to no callback. Every part and the error reach the SDK unchanged.
  */
-export function protectProviderWarnings<T extends object>(
+export function observeStreamReadErrors<T extends object>(
   model: T,
-  onStreamReadError?: (error: unknown) => void,
+  onReadError: (error: unknown) => void,
 ): T {
   return forwardingProxy(model, (key, method) => {
-    if (
-      typeof method !== "function" ||
-      (key !== "doGenerate" &&
-        key !== "doEmbed" &&
-        key !== "doEvaluate" &&
-        key !== "doStream")
-    )
-      return method;
+    if (key !== "doStream" || typeof method !== "function") return method;
     return async (...args: unknown[]) => {
       const result = await method.apply(model, args);
-      if (key !== "doStream")
-        return isTraceTextEnabled() ? result : { ...result, warnings: [] };
-      return {
-        ...result,
-        stream: observeStream(result.stream, isTraceTextEnabled(), (error) =>
-          onStreamReadError?.(error),
-        ),
-      };
+      return { ...result, stream: observeStream(result.stream, onReadError) };
     };
   });
 }

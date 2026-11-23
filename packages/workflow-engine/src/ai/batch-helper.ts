@@ -1242,14 +1242,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
                   ? { batchDurationMs: extra.batchDurationMs }
                   : {}),
                 ...(r.status === "failed"
-                  ? {
-                      status: "failed",
-                      // Item errors quote provider responses and model output.
-                      error:
-                        this.ctx.withholdsText && r.error !== undefined
-                          ? "Batch request failed"
-                          : r.error,
-                    }
+                  ? { status: "failed", error: r.error }
                   : {}),
               },
             };

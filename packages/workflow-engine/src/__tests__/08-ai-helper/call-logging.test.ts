@@ -153,53 +153,6 @@ it("only emits request, response and provider error text with the text trace fla
   }
 });
 
-it("does not send provider warnings to process diagnostics", async () => {
-  vi.stubEnv("WORKFLOW_ENGINE_TRACE", "");
-  vi.stubEnv("WORKFLOW_ENGINE_TRACE_TEXT", "");
-  const warnings = vi
-    .spyOn(process, "emitWarning")
-    .mockImplementation(() => {});
-  try {
-    const { MockLanguageModelV4 } = await import("ai/test");
-    const model = new MockLanguageModelV4({
-      async doGenerate() {
-        return {
-          content: [{ type: "text", text: "reply" }],
-          finishReason: { unified: "stop", raw: "stop" },
-          usage: {
-            inputTokens: {
-              total: 1,
-              noCache: undefined,
-              cacheRead: undefined,
-              cacheWrite: undefined,
-            },
-            outputTokens: { total: 1, text: undefined, reasoning: undefined },
-          },
-          warnings: [{ type: "other", message: "private warning marker" }],
-        };
-      },
-    });
-    const ai = createAIHelper(
-      "accounting",
-      new InMemoryAICallLogger(),
-      undefined,
-      () => model,
-      {
-        text: { store: "none" },
-      },
-    );
-    expect((await ai.generateText(modelKey, "request marker")).text).toBe(
-      "reply",
-    );
-    expect(JSON.stringify(warnings.mock.calls)).not.toContain(
-      "private warning marker",
-    );
-  } finally {
-    warnings.mockRestore();
-    vi.unstubAllEnvs();
-  }
-});
-
 it("does not leave an open write after normalizing an empty stream prompt", async () => {
   const ai = createAIHelper(
     "accounting",

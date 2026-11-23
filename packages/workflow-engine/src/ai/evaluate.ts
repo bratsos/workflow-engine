@@ -13,7 +13,6 @@ import { openrouter } from "@openrouter/ai-sdk-provider";
 import { experimental_evaluate as aiEvaluate } from "ai";
 import { logFailure } from "./generate";
 import { getModel, type ModelConfig, type ModelKey } from "./model-helper";
-import { protectProviderWarnings } from "./provider-diagnostics.js";
 import {
   buildOpenRouterRoutingProvider,
   logger,
@@ -156,9 +155,7 @@ export async function evaluate<const Q extends EvaluationQuestions>(
   });
 
   try {
-    const model = protectProviderWarnings(
-      getEvaluationModelProvider(modelConfig, ctx.routing),
-    );
+    const model = getEvaluationModelProvider(modelConfig, ctx.routing);
     const callProviderOptions = options.providerOptions as Parameters<
       typeof aiEvaluate
     >[0]["providerOptions"];
