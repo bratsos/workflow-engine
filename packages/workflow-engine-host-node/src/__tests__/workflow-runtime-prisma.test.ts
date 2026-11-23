@@ -4,6 +4,7 @@ import { defineWorkflow, type Workflow } from "@bratsos/workflow-engine";
 import {
   createWorkflowRegistry,
   type Kernel,
+  setLogger,
 } from "@bratsos/workflow-engine/kernel";
 import {
   afterAll,
@@ -414,7 +415,8 @@ describe.skipIf(!realDatabase)(
         workerId: "runtime-2",
         concurrency: 2,
       });
-      const warned = vi.spyOn(console, "warn");
+      const warn = vi.fn();
+      setLogger({ debug: vi.fn(), info: vi.fn(), warn, error: vi.fn() });
       try {
         const ids: string[] = [];
         for (let i = 0; i < 3; i++)
@@ -493,15 +495,20 @@ describe.skipIf(!realDatabase)(
           )
           .toBe(5);
         expect(peak).toBe(1);
-        const indexWarnings = warned.mock.calls.filter(([message]) =>
-          message.includes(claimIndex),
+        const indexWarnings = warn.mock.calls.filter(
+          ([, fields]) => fields?.indexName === claimIndex,
         );
         // Two host queues plus the separate client used in the claim race.
         expect(indexWarnings).toHaveLength(indexState === "without" ? 3 : 0);
-        for (const [message] of indexWarnings)
-          expect(message).toContain(indexFile);
+        for (const [, fields] of indexWarnings) {
+          expect(fields).toMatchObject({
+            workflowId: capped.id,
+            indexName: claimIndex,
+            sqlFile: indexFile,
+          });
+        }
       } finally {
-        warned.mockRestore();
+        setLogger(undefined);
         gate.resolve();
         await Promise.all([first.host.stop(), second.host.stop()]);
         await secondClient.$disconnect();

@@ -712,9 +712,9 @@ export class PrismaJobQueue implements JobQueue {
     }
   }
 
-  private async hasWorkflowClaimIndex(): Promise<boolean> {
+  private async hasWorkflowClaimIndex(workflowId: string): Promise<boolean> {
     // Share the catalog read across simultaneous first claims by this adapter.
-    this.workflowClaimIndex ??= this.probeWorkflowClaimIndex().catch(
+    this.workflowClaimIndex ??= this.probeWorkflowClaimIndex(workflowId).catch(
       (error) => {
         this.workflowClaimIndex = undefined;
         throw error;
@@ -723,7 +723,7 @@ export class PrismaJobQueue implements JobQueue {
     return this.workflowClaimIndex;
   }
 
-  private async probeWorkflowClaimIndex(): Promise<boolean> {
+  private async probeWorkflowClaimIndex(workflowId: string): Promise<boolean> {
     const raw = rawFor(this.prisma, { found: "int" });
     const [index] =
       this.databaseType === "sqlite"
@@ -741,7 +741,13 @@ export class PrismaJobQueue implements JobQueue {
           `;
     if (!index) {
       logger.warn(
-        `Missing usable index ${WORKFLOW_CLAIM_INDEX}. Workflow concurrency limits still apply with a slower claim. Apply sql/job-workflow-index.${this.databaseType}.sql and restart the worker to use bounded claims.`,
+        "Missing usable workflow claim index. Workflow concurrency limits still apply with a slower claim. Apply the bundled SQL file and restart the worker to use bounded claims.",
+        {
+          workflowId,
+          indexName: WORKFLOW_CLAIM_INDEX,
+          sqlFile: `sql/job-workflow-index.${this.databaseType}.sql`,
+          workerId: this.workerId,
+        },
       );
     }
     return Boolean(index);
@@ -755,7 +761,7 @@ export class PrismaJobQueue implements JobQueue {
       throw new Error("Workflow job limits require a PostgreSQL transaction");
     }
 
-    const indexed = await this.hasWorkflowClaimIndex();
+    const indexed = await this.hasWorkflowClaimIndex(limits[0]!.workflowId);
     const { active, workflowIds, versions } = this.servesParams(serves);
     const key = `COALESCE(j."workflowId", j.payload ->> '_workflowId')`;
     // The ':' prefix keeps the unknown workflow bucket separate from any ID.
@@ -861,7 +867,7 @@ export class PrismaJobQueue implements JobQueue {
       leaseTimeoutMs: number | null;
       absoluteTimeoutMs: number | null;
     };
-    const indexed = await this.hasWorkflowClaimIndex();
+    const indexed = await this.hasWorkflowClaimIndex(limits[0]!.workflowId);
     const key = `COALESCE(j."workflowId", json_extract(j.payload, '$._workflowId'))`;
     const bucket = `COALESCE(':' || ${key}, '')`;
     const from = `"job_queue" j${indexed ? ` INDEXED BY "${WORKFLOW_CLAIM_INDEX}"` : ""}`;
@@ -1611,6 +1617,11 @@ export class PrismaJobQueue implements JobQueue {
       if (expired.length > 0) {
         logger.warn(
           `Expired ${expired.length} runaway job(s) past their absolute lease deadlines`,
+          {
+            expiredCount: expired.length,
+            absoluteTimeoutMs,
+            workerId: this.workerId,
+          },
         );
       }
       return expired.length;
