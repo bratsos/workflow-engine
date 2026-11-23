@@ -5,16 +5,20 @@
  */
 
 import type { StageStorage } from "../../core/stage.js";
-import type { BlobStore } from "../ports.js";
+import type { BlobStore, Persistence } from "../ports.js";
+import { writeForRun } from "./run-writes.js";
 
 export function createStorageShim(
   workflowRunId: string,
   workflowType: string,
-  deps: { blobStore: BlobStore },
+  deps: { blobStore: BlobStore; persistence?: Persistence },
 ): StageStorage {
   return {
     async save<T>(key: string, data: T): Promise<void> {
-      await deps.blobStore.put(key, data);
+      const put = () => deps.blobStore.put(key, data);
+      if (deps.persistence)
+        await writeForRun(deps.persistence, workflowRunId, put);
+      else await put();
     },
 
     async load<T>(key: string): Promise<T> {

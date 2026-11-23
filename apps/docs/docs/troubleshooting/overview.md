@@ -162,6 +162,11 @@ await kernel.dispatch({ type: "run.purge", tenantId: "tenant-a", limit: 100 });
 
 Both forms return `removed` with per-table and blob counts, `skipped` with live runs and their statuses, and `incomplete` with the failing cleanup phase for each affected run. Cancel live runs first. Retry incomplete requests to finish erasing them. A reservation keeps the run discoverable for retry and prevents redrive during erasure. Tenant requests select terminal runs first and default to 100 runs per batch.
 
+An incomplete `writers` phase means the run still has writes in flight.
+Retry after those writes settle. An `archive` phase indicates legacy redrive
+history that needs verified archived stage ownership before erasure.
+Custom blob stores and step ledgers must support atomic purge counts.
+
 ### Table retention
 
 ```typescript

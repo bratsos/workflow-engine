@@ -434,11 +434,6 @@ CREATE INDEX IF NOT EXISTS "workflow_runs_tenantId_createdAt_id_idx"
   ON "workflow_runs" ("tenantId", "createdAt" DESC, "id" DESC);
 CREATE INDEX IF NOT EXISTS "ai_calls_tenantId_createdAt_idx"
   ON "ai_calls" ("tenantId", "createdAt");
-CREATE INDEX IF NOT EXISTS "workflow_artifacts_workflowStageId_idx"
-  ON "workflow_artifacts" ("workflowStageId");
-CREATE INDEX IF NOT EXISTS "workflow_annotations_workflowStageRecordId_idx"
-  ON "workflow_annotations" ("workflowStageRecordId");
-CREATE INDEX IF NOT EXISTS "ai_calls_createdAt_idx" ON "ai_calls" ("createdAt");
 CREATE INDEX IF NOT EXISTS "ai_calls_workflowRunId_idx" ON "ai_calls" ("workflowRunId");
 CREATE INDEX IF NOT EXISTS "ai_calls_textExpiresAt_idx" ON "ai_calls" ("textExpiresAt");
 CREATE INDEX IF NOT EXISTS "idempotency_keys_workflowRunId_idx"
@@ -504,18 +499,56 @@ identify older keys that lack the column value, use `result->>'workflowRunId'`
 where present. For older `job.execute` keys, the original job ID binds a
 `job:<jobId>:attempt:` prefix while the job rows still exist.
 
-#### Retention and erasure indexes
+#### Retention and erasure schema
 
-Put these indexes in the same release's migration as the column and index
-upgrade above. Include `sql/retention-indexes.postgresql.sql` or
-`sql/retention-indexes.sqlite.sql` from the engine package. These indexes
-serve literal AI topic and idempotency key prefixes and the legacy idempotency
-result's JSON run ID. Keep them in the migration SQL since the Prisma schemas
-cannot express their expressions and collations.
+Put these changes in the same release's migration as the column and index
+upgrade above. Prisma's generated migration from the updated schema or
+contract creates the columns and the four plain indexes; for hand-written
+SQL, the indexes are:
+
+```sql
+CREATE INDEX IF NOT EXISTS "idempotency_keys_workflowRunId_commandType_idx"
+  ON "idempotency_keys" ("workflowRunId", "commandType");
+CREATE INDEX IF NOT EXISTS "workflow_artifacts_workflowStageId_idx"
+  ON "workflow_artifacts" ("workflowStageId");
+CREATE INDEX IF NOT EXISTS "workflow_annotations_workflowStageRecordId_idx"
+  ON "workflow_annotations" ("workflowStageRecordId");
+CREATE INDEX IF NOT EXISTS "ai_calls_createdAt_idx" ON "ai_calls" ("createdAt");
+```
+
+Include `sql/retention-indexes.postgresql.sql` or
+`sql/retention-indexes.sqlite.sql` from the engine package in the same
+migration. These indexes serve literal AI topic and idempotency key prefixes
+and the legacy idempotency result's JSON run ID. Keep them in the migration
+SQL since the Prisma schemas cannot express their expressions and collations.
 
 The indexes are rolling-safe. Upgrade or stop all older hosts before using
 targeted `run.purge` with run IDs or a tenant ID. Redrive and rerun commands on
 older hosts do not check the reservation that protects erasure.
+
+For erasure and table retention, also add these columns to the same migration:
+
+| Table | Column | PostgreSQL | SQLite |
+| --- | --- | --- | --- |
+| `workflow_runs` | `archivedStageRecordIds` | `JSONB`, nullable | `JSONB`, nullable |
+| `outbox_events` | `pruneTerminal` | `BOOLEAN NOT NULL DEFAULT FALSE` | `INTEGER NOT NULL DEFAULT 0` |
+
+Run the matching `sql/retention-eligibility.postgresql.sql` or
+`sql/retention-eligibility.sqlite.sql` after adding the columns. The script
+installs the outbox triggers, backfills existing events and creates the
+eligible-only pruning indexes. Include these statements alongside Prisma's
+generated migration. The triggers track event publication, dead letters,
+and run transitions and deletion. The indexes exclude live or orphaned events,
+dead letters, unpublished events and in-progress idempotency keys.
+
+Targeted erasure requires all hosts to use the new writer fence. It reports
+`writers` while writes are registered and `archive` when a run has legacy
+redrives whose archived stage ownership was never recorded. For historical
+redrives, populate `archivedStageRecordIds` from independently verified stage
+ownership before erasing that run. Caller annotation payloads do not establish
+ownership. If a process exits with a writer registration, verify it and its
+external write are fully stopped before releasing that registration using
+`endRunWrite(token)`.
 
 ### Custom port implementations
 

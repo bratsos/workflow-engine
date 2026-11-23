@@ -436,13 +436,9 @@ export function withStepResultSpill(
       await spill.deleteUnder(stepWriteSpillPrefix(stageRecordId));
     },
 
-    async deleteForPurge(stageRecordId, persistence) {
-      if (ledger.deleteForPurge)
-        return ledger.deleteForPurge(stageRecordId, persistence);
-      const rows = await ledger.list(stageRecordId);
-      await ledger.clear(stageRecordId);
-      return rows.length;
-    },
+    ...(ledger.deleteForPurge && {
+      deleteForPurge: ledger.deleteForPurge.bind(ledger),
+    }),
 
     // `clearExcept` is optional on the port and the kernel branches on its
     // presence: a ledger without it gets the whole-ledger clear that

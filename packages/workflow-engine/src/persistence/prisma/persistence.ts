@@ -49,6 +49,7 @@ import {
   ACTIVE_STATUSES,
   DefinitionRegistrationRetryableError,
   RUN_PURGE_RESERVATION,
+  RunWritersActiveError,
   StaleVersionError,
 } from "../interface";
 import { countActiveByStatus, SQLITE_RARE, sqliteDate } from "./active-stats";
@@ -223,6 +224,8 @@ function truthy(value: unknown): boolean {
   if (typeof value === "number") return value !== 0;
   return false;
 }
+
+const RUN_WRITER = "run.write";
 
 const IDEMPOTENCY_IN_PROGRESS_MARKER = {
   __workflowEngineState: "in_progress",
@@ -613,6 +616,107 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     );
   }
 
+  private async lockRunById(id: string): Promise<boolean> {
+    if (this.databaseType === "postgresql") {
+      const rows = await readOutboxSql<{ id: string }>(
+        this.prisma,
+        this.databaseType,
+        { id: "text" },
+        `SELECT "id" FROM "workflow_runs" WHERE "id" = $1 FOR NO KEY UPDATE`,
+        [id],
+      );
+      return rows.length !== 0;
+    }
+    return (
+      (await writeRetentionSql(
+        this.prisma,
+        this.databaseType,
+        `UPDATE "workflow_runs" SET "version" = "version" WHERE "id" = $1`,
+        [id],
+      )) !== 0
+    );
+  }
+
+  private async lockRunWriters(workflowRunId: string): Promise<void> {
+    if (this.databaseType !== "postgresql") return;
+    // Stage completion can commit while cancellation holds the run row.
+    // Register independent writers without waiting for that row lock.
+    await readOutboxSql<{ locked: boolean }>(
+      this.prisma,
+      this.databaseType,
+      { locked: "bool" },
+      `SELECT TRUE AS "locked" FROM pg_advisory_xact_lock(hashtextextended('workflow-engine:erasure:' || $1, 0))`,
+      [workflowRunId],
+    );
+  }
+
+  private async allowsRunWrite(workflowRunId: string): Promise<boolean> {
+    // Read existence and reservation in one snapshot. The final purge
+    // removes both atomically, even when it commits during admission.
+    const rows = await readOutboxSql<{ id: string }>(
+      this.prisma,
+      this.databaseType,
+      { id: "text" },
+      `SELECT "id" FROM "workflow_runs" WHERE "id" = $1
+        AND NOT EXISTS (SELECT 1 FROM "idempotency_keys" WHERE "key" = $1 AND "commandType" = $2)`,
+      [workflowRunId, RUN_PURGE_RESERVATION],
+    );
+    return rows.length !== 0;
+  }
+
+  async beginRunWrite(workflowRunId: string, token: string): Promise<boolean> {
+    if (this.databaseType === "sqlite") {
+      // The INSERT takes the writer lock before evaluating either predicate.
+      // A separate read transaction would scan the same keys and add a round trip.
+      return (
+        (await writeRetentionSql(
+          this.prisma,
+          this.databaseType,
+          `INSERT INTO "idempotency_keys" ("id", "key", "commandType", "workflowRunId", "createdAt", "result")
+            SELECT $1, $1, $2, $3, $4, $5
+            WHERE EXISTS (SELECT 1 FROM "workflow_runs" WHERE "id" = $3)
+              AND NOT EXISTS (SELECT 1 FROM "idempotency_keys" WHERE "key" = $3 AND "commandType" = $6)`,
+          [
+            token,
+            RUN_WRITER,
+            workflowRunId,
+            this.now(),
+            JSON.stringify(IDEMPOTENCY_IN_PROGRESS_MARKER),
+            RUN_PURGE_RESERVATION,
+          ],
+        )) !== 0
+      );
+    }
+    return this.withTransaction(async (tx) => {
+      const adapter = tx as PrismaWorkflowPersistence;
+      await adapter.lockRunWriters(workflowRunId);
+      if (!(await adapter.allowsRunWrite(workflowRunId))) return false;
+      await adapter.prisma.idempotencyKey.create({
+        data: {
+          key: token,
+          commandType: RUN_WRITER,
+          workflowRunId,
+          createdAt: this.now(),
+          result: IDEMPOTENCY_IN_PROGRESS_MARKER,
+        },
+      });
+      return true;
+    });
+  }
+
+  async endRunWrite(token: string): Promise<void> {
+    await this.releaseIdempotencyKey(token, RUN_WRITER);
+  }
+
+  private async hasRunWriters(workflowRunId: string): Promise<boolean> {
+    return Boolean(
+      await this.prisma.idempotencyKey.findFirst({
+        where: { workflowRunId, commandType: RUN_WRITER },
+        select: { id: true },
+      }),
+    );
+  }
+
   async reserveRunPurge(
     fence: RunPurgeFence,
     jobIds: readonly string[],
@@ -630,6 +734,9 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       const adapter = tx as PrismaWorkflowPersistence;
       // Serialize with redrive's run update before publishing the reservation.
       await adapter.lockPurgeFence(fence);
+      await adapter.lockRunWriters(fence.id);
+      if (await adapter.hasRunWriters(fence.id))
+        throw new RunWritersActiveError();
       const where = {
         key_commandType: { key: fence.id, commandType: RUN_PURGE_RESERVATION },
       };
@@ -673,28 +780,6 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       [fence.id, fence.version, fence.status],
     );
     if (locked !== 1) throw new Error("Run changed during erasure");
-  }
-
-  async listArchivedStageIdsForPurge(
-    workflowRunId: string,
-    archiveKey: string,
-  ): Promise<string[]> {
-    const rows = await this.prisma.workflowAnnotation.findMany({
-      where: {
-        workflowRunId,
-        key: archiveKey,
-        scope: "stage",
-        actorKind: "engine",
-        actorId: "run.redrive",
-      },
-      select: { payload: true },
-    });
-    return rows.flatMap(
-      ({ payload }: { payload: { stageRecordId?: unknown } | null }) =>
-        typeof payload?.stageRecordId === "string"
-          ? [payload.stageRecordId]
-          : [],
-    );
   }
 
   async purgeRun(
@@ -852,13 +937,18 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     cutoff: Date,
     statuses: readonly PurgeableRunStatus[],
   ): Promise<boolean> {
-    // deleteMany rather than delete: a missing row is a no-op, not P2025.
-    // Stages, logs, artifacts, annotations and (via workflow_stages) the
-    // workflow_steps ledger go with it through the schema's cascades.
-    const { count } = await this.prisma.workflowRun.deleteMany({
-      where: { id, ...this.purgeable(cutoff, statuses) },
+    return this.withTransaction(async (tx) => {
+      const adapter = tx as PrismaWorkflowPersistence;
+      // Check after taking the same run lock as reserveRunPurge. Checking
+      // before the lock could read a snapshot older than the reservation.
+      if (!(await adapter.lockRunById(id))) return false;
+      await adapter.lockRunWriters(id);
+      if (await adapter.isRunPurgeReserved(id)) return false;
+      const { count } = await adapter.prisma.workflowRun.deleteMany({
+        where: { id, ...this.purgeable(cutoff, statuses) },
+      });
+      return count > 0;
     });
-    return count > 0;
   }
 
   /** One statement decides, so a redrive commits either before it or not at all. */
@@ -1532,6 +1622,7 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       output: data.output as unknown,
       totalCost: data.totalCost,
       totalTokens: data.totalTokens,
+      archivedStageRecordIds: data.archivedStageRecordIds,
       ...(this.versioning.enabled
         ? {
             definitionVersion: data.definitionVersion,
@@ -2430,15 +2521,41 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
   async acquireIdempotencyKey(
     key: string,
     commandType: string,
-    options?: { now?: Date; staleInProgressAfterMs?: number },
-  ): Promise<
-    | { status: "acquired" }
-    | { status: "replay"; result: unknown }
-    | { status: "in_progress" }
-  > {
+    options?: {
+      now?: Date;
+      staleInProgressAfterMs?: number;
+      workflowRunId?: string;
+    },
+  ): ReturnType<WorkflowPersistence["acquireIdempotencyKey"]> {
+    const runId = options?.workflowRunId;
+    if (runId === undefined) return this.acquireKey(key, commandType, options);
+    return this.withTransaction(async (tx) => {
+      const adapter = tx as PrismaWorkflowPersistence;
+      if (
+        !(await adapter.lockRunById(runId)) ||
+        (await adapter.isRunPurgeReserved(runId))
+      ) {
+        return { status: "unavailable" };
+      }
+      return adapter.acquireKey(key, commandType, options);
+    });
+  }
+
+  private async acquireKey(
+    key: string,
+    commandType: string,
+    options?: {
+      now?: Date;
+      staleInProgressAfterMs?: number;
+      workflowRunId?: string;
+    },
+  ): ReturnType<WorkflowPersistence["acquireIdempotencyKey"]> {
     const row = {
       key,
       commandType,
+      ...(options?.workflowRunId !== undefined
+        ? { workflowRunId: options.workflowRunId }
+        : {}),
       result: IDEMPOTENCY_IN_PROGRESS_MARKER as any,
       // Explicit rather than relying on the schema's `@default(now())`
       // so a caller-supplied `options.now` (e.g. a FakeClock in tests,
@@ -2500,6 +2617,9 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
           },
           data: {
             createdAt: now,
+            ...(options?.workflowRunId !== undefined
+              ? { workflowRunId: options.workflowRunId }
+              : {}),
             result: IDEMPOTENCY_IN_PROGRESS_MARKER as any,
           },
         });
@@ -2529,10 +2649,45 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     commandType: string,
     result: unknown,
     workflowRunId: string | null,
+    options?: { requireExistingRun?: boolean },
   ): Promise<void> {
-    await this.prisma.idempotencyKey.update({
-      where: { key_commandType: { key, commandType } },
-      data: { result: result as any, workflowRunId },
+    const data = { result: result as any, workflowRunId };
+    if (!options?.requireExistingRun || workflowRunId === null) {
+      await this.prisma.idempotencyKey.update({
+        where: { key_commandType: { key, commandType } },
+        data,
+      });
+      return;
+    }
+    if (this.databaseType === "sqlite") {
+      await writeRetentionSql(
+        this.prisma,
+        this.databaseType,
+        `UPDATE "idempotency_keys" SET "result" = $1, "workflowRunId" = $2
+          WHERE "key" = $3 AND "commandType" = $4
+            AND EXISTS (SELECT 1 FROM "workflow_runs" WHERE "id" = $2)
+            AND NOT EXISTS (SELECT 1 FROM "idempotency_keys" WHERE "key" = $2 AND "commandType" = $5)`,
+        [
+          JSON.stringify(result),
+          workflowRunId,
+          key,
+          commandType,
+          RUN_PURGE_RESERVATION,
+        ],
+      );
+      return;
+    }
+    await this.withTransaction(async (tx) => {
+      const adapter = tx as PrismaWorkflowPersistence;
+      if (
+        !(await adapter.lockRunById(workflowRunId)) ||
+        (await adapter.isRunPurgeReserved(workflowRunId))
+      )
+        return;
+      await adapter.prisma.idempotencyKey.updateMany({
+        where: { key, commandType },
+        data,
+      });
     });
   }
 
@@ -2570,6 +2725,9 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       version: run.version ?? 0,
       definitionVersion: run.definitionVersion ?? null,
       redriveCount: run.redriveCount ?? 0,
+      ...(Array.isArray(run.archivedStageRecordIds) && {
+        archivedStageRecordIds: run.archivedStageRecordIds,
+      }),
     };
   }
 

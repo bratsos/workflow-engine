@@ -38,6 +38,7 @@ model WorkflowRun {
   // How many times `run.redrive` has re-driven this run (Step Functions'
   // redrive count). Never reset -- it counts the whole life of the run.
   redriveCount      Int     @default(0)
+  archivedStageRecordIds Json?
 
   stages      WorkflowStage[]
   logs        WorkflowLog[]
@@ -338,6 +339,7 @@ model OutboxEvent {
   deliveryClaim String?
   retryCount    Int       @default(0)
   dlqAt         DateTime?
+  pruneTerminal Int      @default(0)
 
   @@unique([workflowRunId, sequence])
   @@index([publishedAt, dlqAt, workflowRunId, deliveryClaim], map: "outbox_events_delivery_run_idx")
@@ -364,6 +366,7 @@ model IdempotencyKey {
 
   @@unique([key, commandType])
   @@index([workflowRunId], map: "idempotency_keys_workflowRunId_idx")
+  @@index([workflowRunId, commandType], map: "idempotency_keys_workflowRunId_commandType_idx")
   @@index([createdAt], map: "idempotency_keys_createdAt_idx")
   @@map("idempotency_keys")
 }

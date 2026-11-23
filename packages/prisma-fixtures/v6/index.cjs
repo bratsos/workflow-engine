@@ -31,6 +31,11 @@ exports.createSqliteClient = (file, options = {}) => {
     prisma("generate"),
   );
   prisma("db", "push", "--skip-generate");
+  return exports.openSqliteClient(file, options);
+};
+
+exports.openSqliteClient = (file, options = {}) => {
+  const url = `file:${file}?connection_limit=1`;
   const { PrismaClient } = require(join(__dirname, ".generated/sqlite-client"));
   return new PrismaClient({ datasourceUrl: url, ...options });
 };

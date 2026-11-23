@@ -1,3 +1,4 @@
+import { RunWritersActiveError } from "../../persistence/interface.js";
 /**
  * Handler: run.purge
  *
@@ -53,7 +54,6 @@ import {
   stepSpillPrefix,
   stepWriteSpillPrefix,
 } from "../spill.js";
-import { SUPERSEDED_ATTEMPT_KEY } from "./run-redrive.js";
 import { SIGNAL_WAKE, signalWakeKey } from "./step-signal.js";
 
 export const DEFAULT_PURGE_STATUSES: readonly PurgeableRunStatus[] = [
@@ -239,10 +239,18 @@ export async function handleTargetedRunPurge(
   if (
     !persistence.reserveRunPurge ||
     !persistence.purgeRun ||
-    !persistence.isRunPurgeReserved
+    !persistence.isRunPurgeReserved ||
+    !persistence.beginRunWrite ||
+    !persistence.endRunWrite
   ) {
     throw new Error(
       "Targeted run erasure requires a persistence adapter with purge support",
+    );
+  }
+
+  if (!blobStore.deleteForPurge || (stepLedger && !stepLedger.deleteForPurge)) {
+    throw new Error(
+      "Targeted run erasure requires atomic blob and ledger delete counts",
     );
   }
 
@@ -289,15 +297,19 @@ export async function handleTargetedRunPurge(
         skipped.push({ workflowRunId: id, status: run.status });
         continue;
       }
+      // Older redrives archived caller-writable annotation payloads. A
+      // verified owner list is required before erasing those spill prefixes.
+      if (run.redriveCount > 0 && run.archivedStageRecordIds === undefined) {
+        incomplete.push({ workflowRunId: id, failed: ["archive"] });
+        continue;
+      }
       const fence = { id, status: terminal, version: run.version };
       const stages = await persistence.getStagesByRun(id);
-      const archived =
-        (await persistence.listArchivedStageIdsForPurge?.(
-          id,
-          SUPERSEDED_ATTEMPT_KEY,
-        )) ?? [];
       const stageRecordIds = [
-        ...new Set([...stages.map((stage) => stage.id), ...archived]),
+        ...new Set([
+          ...stages.map((stage) => stage.id),
+          ...(run.archivedStageRecordIds ?? []),
+        ]),
       ];
       phase = "jobs";
       const jobs = await (jobTransport.getJobsForPurge?.(id) ??
@@ -317,8 +329,7 @@ export async function handleTargetedRunPurge(
       })) {
         for (const key of await blobStore.list(prefix)) {
           if (!key.startsWith(prefix)) continue;
-          await blobStore.delete(key);
-          removed.blobs++;
+          if (await blobStore.deleteForPurge(key)) removed.blobs++;
         }
       }
       phase = "aiCalls";
@@ -346,8 +357,11 @@ export async function handleTargetedRunPurge(
       for (const key of Object.keys(counts) as (keyof typeof counts)[]) {
         removed[key] += counts[key];
       }
-    } catch {
-      incomplete.push({ workflowRunId: id, failed: [phase] });
+    } catch (error) {
+      incomplete.push({
+        workflowRunId: id,
+        failed: [error instanceof RunWritersActiveError ? "writers" : phase],
+      });
     }
   }
   return { removed, skipped, incomplete };

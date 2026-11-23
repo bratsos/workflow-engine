@@ -547,7 +547,15 @@ export interface RunPurgeByTargetResult {
   readonly skipped: { workflowRunId: string; status: Status }[];
   readonly incomplete: {
     workflowRunId: string;
-    failed: ("blobs" | "aiCalls" | "jobs" | "steps" | "persistence")[];
+    failed: (
+      | "blobs"
+      | "aiCalls"
+      | "jobs"
+      | "steps"
+      | "persistence"
+      | "writers"
+      | "archive"
+    )[];
   }[];
 }
 

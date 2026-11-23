@@ -13,6 +13,7 @@
 
 import type { WorkflowStageRecord } from "../../persistence/interface.js";
 import type { KernelDeps } from "../kernel.js";
+import { writeForRun } from "./run-writes.js";
 
 /** The prefix under which one attempt of a stage writes its output and artifacts. */
 export function stageAttemptPrefix(
@@ -33,7 +34,9 @@ export async function saveStageOutput(
   attemptKey: string = crypto.randomUUID(),
 ): Promise<string> {
   const key = `${stageAttemptPrefix(runId, workflowType, stageId, attemptKey)}/output.json`;
-  await deps.blobStore.put(key, output);
+  await writeForRun(deps.persistence, runId, () =>
+    deps.blobStore.put(key, output),
+  );
   return key;
 }
 
@@ -64,13 +67,15 @@ export async function publishStageKeys(
   // An earlier release's pointer is the fixed key itself: nothing to copy.
   if (pointerKey === `${base}/output.json`) return;
   try {
-    await deps.blobStore.put(`${base}/output.json`, output);
-    for (const [name, artifact] of Object.entries(artifacts ?? {})) {
-      await deps.blobStore.put(
-        `${base}/artifacts/${encodeURIComponent(name)}.json`,
-        artifact,
-      );
-    }
+    await writeForRun(deps.persistence, runId, async () => {
+      await deps.blobStore.put(`${base}/output.json`, output);
+      for (const [name, artifact] of Object.entries(artifacts ?? {})) {
+        await deps.blobStore.put(
+          `${base}/artifacts/${encodeURIComponent(name)}.json`,
+          artifact,
+        );
+      }
+    });
   } catch (error) {
     // The committed pointer stays authoritative.
     await deps.persistence

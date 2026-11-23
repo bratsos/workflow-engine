@@ -117,6 +117,13 @@ export interface RunPurgePersistenceCounts {
   idempotencyKeys: number;
 }
 
+export class RunWritersActiveError extends Error {
+  constructor() {
+    super("Run still has active writers");
+    this.name = "RunWritersActiveError";
+  }
+}
+
 export const RUN_PURGE_RESERVATION = "run.purge.reserve";
 
 export interface WorkflowRunRecord {
@@ -149,6 +156,7 @@ export interface WorkflowRunRecord {
   definitionVersion: string | null;
   /** How many times `run.redrive` has re-driven this run. */
   redriveCount: number;
+  archivedStageRecordIds?: readonly string[];
 }
 
 export interface WorkflowStageRecord {
@@ -429,6 +437,7 @@ export interface UpdateRunInput {
   definitionVersion?: string | null;
   /** Absolute redrive count to store. `run.redrive` sets `current + 1`. */
   redriveCount?: number;
+  archivedStageRecordIds?: readonly string[];
 }
 
 /** A stored workflow definition snapshot, keyed by (workflowId, version). */
@@ -594,6 +603,7 @@ export interface AnnotationFilters {
 }
 
 export interface CreateAICallInput {
+  workflowRunId?: string;
   topic: string;
   callType: string;
   modelKey: string;
@@ -814,10 +824,6 @@ export interface PersistenceCore {
 
   /** Terminal runs are listed first, then live runs, up to the batch limit. */
   listTenantRunsForPurge?(tenantId: string, limit: number): Promise<string[]>;
-  listArchivedStageIdsForPurge?(
-    workflowRunId: string,
-    archiveKey: string,
-  ): Promise<string[]>;
   /** Reserve the generation for erasure and remember the legacy job ids across retries. */
   reserveRunPurge?(
     fence: RunPurgeFence,
@@ -829,6 +835,9 @@ export interface PersistenceCore {
     stageRecordIds: readonly string[],
   ): Promise<RunPurgePersistenceCounts>;
   isRunPurgeReserved?(id: string): Promise<boolean>;
+  /** Register a writer or refuse it if the run is gone or reserved for erasure. */
+  beginRunWrite?(workflowRunId: string, token: string): Promise<boolean>;
+  endRunWrite?(token: string): Promise<void>;
   pruneOutbox?(publishedOlderThan: Date, limit: number): Promise<number>;
   pruneIdempotencyKeys?(olderThan: Date, limit: number): Promise<number>;
 
@@ -1144,11 +1153,16 @@ export interface PersistenceCore {
   acquireIdempotencyKey(
     key: string,
     commandType: string,
-    options?: { now?: Date; staleInProgressAfterMs?: number },
+    options?: {
+      now?: Date;
+      staleInProgressAfterMs?: number;
+      workflowRunId?: string;
+    },
   ): Promise<
     | { status: "acquired" }
     | { status: "replay"; result: unknown }
     | { status: "in_progress" }
+    | { status: "unavailable" }
   >;
 
   /** Cache the completed result and stamp the run id when known. */
@@ -1157,6 +1171,7 @@ export interface PersistenceCore {
     commandType: string,
     result: unknown,
     workflowRunId: string | null,
+    options?: { requireExistingRun?: boolean },
   ): Promise<void>;
 
   /**
@@ -1210,9 +1225,10 @@ export interface AICallLogger {
   clearExpiredText?(now: Date, limit: number): Promise<number>;
 
   /**
-   * Log a single AI call (fire and forget)
+   * Log a single call. An asynchronous logger must return its write promise
+   * when used with targeted erasure, so the kernel can drain the operation.
    */
-  logCall(call: CreateAICallInput): void;
+  logCall(call: CreateAICallInput): void | Promise<void>;
 
   /**
    * Log batch results (for recording batch API results)

@@ -17,6 +17,7 @@ import {
 import { writeBatchWarn } from "./batch-warn.js";
 import { createStorageShim } from "./create-storage-shim.js";
 import { toErrorMessage } from "./error-message.js";
+import { runStepLedger, writeForRun } from "./run-writes.js";
 import { createStepApi } from "./step-api.js";
 
 export interface BuiltStageExecutionContext {
@@ -39,6 +40,32 @@ export function defineLazyAIContext<T extends object>(
   const topic = `workflow.${params.workflowRunId}.stage.${params.stageId}`;
   const stageRecordId = params.stageRecordId ?? params.stageId;
 
+  let scopedLogger: AICallLogger | undefined;
+  const loggerForRun = (logger: AICallLogger): AICallLogger => {
+    if (!deps.persistence.beginRunWrite) return logger;
+    return (scopedLogger ??= {
+      logCall(call) {
+        return writeForRun(deps.persistence, params.workflowRunId, () =>
+          logger.logCall({ ...call, workflowRunId: params.workflowRunId }),
+        ).catch(() => {});
+      },
+      async logBatchResults(batchId, calls) {
+        await writeForRun(deps.persistence, params.workflowRunId, () =>
+          logger.logBatchResults(
+            batchId,
+            calls.map((call) => ({
+              ...call,
+              workflowRunId: params.workflowRunId,
+            })),
+          ),
+        );
+      },
+      getStats: logger.getStats.bind(logger),
+      isRecorded: logger.isRecorded.bind(logger),
+      ...(logger.listCalls && { listCalls: logger.listCalls.bind(logger) }),
+    });
+  };
+
   const configured = () => {
     const services = deps.services;
     if (!services?.aiLogger || !services.ai) {
@@ -46,14 +73,18 @@ export function defineLazyAIContext<T extends object>(
     }
     return {
       ai: services.ai,
-      aiLogger: services.aiLogger,
+      aiLogger: loggerForRun(services.aiLogger),
     };
   };
 
   const logContext: LogContext = {
     workflowRunId: params.workflowRunId,
     stageRecordId,
-    createLog: (data) => deps.persistence.createLog(data),
+    createLog: async (data) => {
+      await writeForRun(deps.persistence, params.workflowRunId, () =>
+        deps.persistence.createLog(data),
+      );
+    },
   };
 
   Object.defineProperties(target, {
@@ -119,15 +150,15 @@ export function buildStageExecutionContext(
     message: string,
     meta?: Record<string, unknown>,
   ): void => {
-    void deps.persistence
-      .createLog({
+    void writeForRun(deps.persistence, workflowRunId, () =>
+      deps.persistence.createLog({
         workflowRunId,
         workflowStageId: stageRecordId,
         level,
         message,
         metadata: meta,
-      })
-      .catch(() => {});
+      }),
+    ).catch(() => {});
   };
 
   const validatedInput = stageDef.inputSchema.parse(rawInput);
@@ -179,12 +210,18 @@ export function buildStageExecutionContext(
     resumeState: resumeState as any,
     step: createStepApi({
       stageRecordId,
-      stepLedger: deps.stepLedger,
+      stepLedger: runStepLedger(
+        deps.persistence,
+        workflowRunId,
+        deps.stepLedger,
+      ),
       clock: deps.clock,
       abortSignal,
       onLog: (level, message) => void logFn(level, message),
       onBatchWarn: (message) =>
-        void writeBatchWarn(deps.persistence, workflowRunId, message),
+        void writeForRun(deps.persistence, workflowRunId, () =>
+          writeBatchWarn(deps.persistence, workflowRunId, message),
+        ).catch(() => {}),
       onAnnotate: (key, value, opts) => annotateFn(key, value, opts),
       ai: () => context.ai,
     }),

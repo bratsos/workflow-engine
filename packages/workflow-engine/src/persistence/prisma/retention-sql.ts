@@ -48,14 +48,28 @@ export function pruneRows(
 ): Promise<number> {
   const pg = databaseType === "postgresql";
   const cutoff = pg ? utcTimestampParam(1) : "$1";
-  const candidates = (table: string, column: string, filter: string) =>
-    `SELECT "id" FROM "${table}" WHERE "${column}" <= ${cutoff} ${filter}
-     ORDER BY "${column}" LIMIT $2`;
+  const candidates = (
+    table: string,
+    column: string,
+    filter: string,
+    index?: string,
+  ) => {
+    const from = `"${table}"${index && !pg ? ` INDEXED BY "${index}"` : ""}`;
+    // On PostgreSQL the eligible expression index is the ordered path for
+    // these queries. The general age index cannot serve their order.
+    const age =
+      pg && index ? `("${column}" + interval '0 seconds')` : `"${column}"`;
+    return `SELECT "id" FROM ${from} WHERE ${age} <= ${cutoff} ${filter}
+            ORDER BY ${age} LIMIT $2`;
+  };
   // PostgreSQL can plan IN (SELECT ... LIMIT ...) as a hash join that
   // reads the whole target table. A scalar array gives it one bounded key
   // lookup, while retaining the outer predicates for concurrent row changes.
   const selected = (query: string) =>
     pg ? `"id" = ANY(ARRAY(${query}))` : `"id" IN (${query})`;
+  // SQLite takes the statement's writer lock before selecting candidates.
+  // Keep its outer mutation on the primary key, even with skewed statistics.
+  const recheck = (filter: string) => (pg ? ` AND ${filter}` : "");
   let sql: string;
   switch (clause) {
     case "aiCalls":
@@ -67,25 +81,28 @@ export function pruneRows(
         : `CASE WHEN json_type("metadata") = 'object' THEN json_remove("metadata", '$.instructions') ELSE "metadata" END`;
       sql = `UPDATE "ai_calls" SET "prompt" = '', "response" = '',
         "metadata" = ${metadata}, "textExpiresAt" = NULL
-        WHERE ${selected(candidates("ai_calls", "textExpiresAt", ""))} AND "textExpiresAt" <= ${cutoff}`;
+        WHERE ${selected(candidates("ai_calls", "textExpiresAt", ""))}${recheck(`"textExpiresAt" <= ${cutoff}`)}`;
       break;
     }
     case "outbox": {
-      const terminal = `r."status" IN ('COMPLETED', 'FAILED', 'CANCELLED')`;
-      const published = `"dlqAt" IS NULL AND "publishedAt" <= ${cutoff}`;
+      const indexed = `"pruneTerminal" = ${pg ? "TRUE" : "1"} AND "dlqAt" IS NULL AND "publishedAt" IS NOT NULL`;
+      const batch = candidates(
+        "outbox_events",
+        "publishedAt",
+        `AND ${indexed}`,
+        "outbox_events_prune_idx",
+      );
+      // Take run locks after the bounded index walk. A concurrent reopening
+      // can shrink this batch, and cannot make it examine more candidates.
       const eligible = pg
         ? `SELECT e."id" FROM "outbox_events" e
            JOIN "workflow_runs" r ON r."id" = e."workflowRunId"
-           WHERE e.${published} AND ${terminal}
-           ORDER BY e."publishedAt" LIMIT $2 FOR NO KEY UPDATE OF r SKIP LOCKED`
-        : candidates(
-            "outbox_events",
-            "publishedAt",
-            `AND "dlqAt" IS NULL AND EXISTS (
-              SELECT 1 FROM "workflow_runs" r WHERE r."id" = "outbox_events"."workflowRunId" AND ${terminal}
-            )`,
-          );
-      sql = `DELETE FROM "outbox_events" WHERE ${selected(eligible)} AND ${published}`;
+           WHERE e.${selected(batch)}
+             AND r."status" IN ('COMPLETED', 'FAILED', 'CANCELLED')
+           FOR NO KEY UPDATE OF r SKIP LOCKED`
+        : batch;
+      sql = `DELETE FROM "outbox_events" WHERE ${selected(eligible)}
+        ${recheck(`${indexed} AND "publishedAt" <= ${cutoff}`)}`;
       break;
     }
     case "idempotencyKeys": {
@@ -93,8 +110,8 @@ export function pruneRows(
         ? `("result"->>'__workflowEngineState') IS DISTINCT FROM 'in_progress'`
         : `json_extract("result", '$.__workflowEngineState') IS NOT 'in_progress'`;
       sql = `DELETE FROM "idempotency_keys" WHERE
-        ${selected(candidates("idempotency_keys", "createdAt", `AND ${completed}`))}
-        AND "createdAt" <= ${cutoff} AND ${completed}`;
+        ${selected(candidates("idempotency_keys", "createdAt", `AND ${completed}`, "idempotency_keys_prune_idx"))}
+        ${recheck(`"createdAt" <= ${cutoff} AND ${completed}`)}`;
       break;
     }
   }

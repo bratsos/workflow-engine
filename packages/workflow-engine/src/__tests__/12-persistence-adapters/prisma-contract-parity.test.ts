@@ -25,6 +25,7 @@ const SCALARS: Record<string, string> = {
   String: "String",
   Int: "Int",
   Float: "Float",
+  Boolean: "Boolean",
   DateTime: "TimestampString(3)",
   Json: "Jsonb",
 };
@@ -110,7 +111,9 @@ function summarise(
             ? "DateTime"
             : target === "sqlite" && rawType === "Json"
               ? "Json"
-              : SCALARS[rawType]
+              : target === "sqlite" && rawType === "Boolean"
+                ? "Int"
+                : SCALARS[rawType]
           : rawType;
       const given = rest.match(/@default\(((?:[^()]|\([^()]*\))*)\)/)?.[1];
       // Generated values: a schema writes `@default(cuid())` / `@updatedAt`, a
@@ -123,9 +126,14 @@ function summarise(
       const defaultValue = /^cuid\(/.test(given ?? "")
         ? ""
         : (given ?? "").replace(/^json`|[`"]/g, "");
-      const normalizedDefault = /^dbgenerated\('\{\}'\)$/.test(defaultValue)
-        ? "{}"
-        : defaultValue;
+      const normalizedDefault =
+        target === "sqlite" && rawType === "Boolean"
+          ? (({ false: "0", true: "1" } as Record<string, string>)[
+              defaultValue
+            ] ?? defaultValue)
+          : /^dbgenerated\('\{\}'\)$/.test(defaultValue)
+            ? "{}"
+            : defaultValue;
       columns.push(
         `${column} ${type}${modifier} default=${normalizedDefault} generated=${generated}`,
       );

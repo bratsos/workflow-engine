@@ -162,9 +162,9 @@ export class PrismaAICallLogger implements AICallLogger {
 
   /**
    * Log a single AI call (fire and forget)
-   * Does not await - logs asynchronously to avoid blocking AI operations
+   * Returns the write for callers coordinating run erasure.
    */
-  logCall(call: CreateAICallInput): void {
+  logCall(call: CreateAICallInput): Promise<void> {
     // Not awaited by the caller, so the SQLite date check runs here (it is
     // `undefined` on PostgreSQL); a refusal is logged like any failed write.
     const check = sqliteCheckFor(this);
@@ -172,6 +172,9 @@ export class PrismaAICallLogger implements AICallLogger {
       this.prisma.aICall.create({
         data: {
           topic: call.topic,
+          ...(call.workflowRunId !== undefined
+            ? { workflowRunId: call.workflowRunId }
+            : {}),
           callType: call.callType,
           modelKey: call.modelKey,
           modelId: call.modelId,
@@ -188,8 +191,9 @@ export class PrismaAICallLogger implements AICallLogger {
             : {}),
         },
       });
-    (check ? check.then(write) : write()).catch((error: unknown) =>
-      logger.error("Failed to persist AI call:", error),
+    return Promise.resolve(check ? check.then(write) : write()).then(
+      () => {},
+      (error: unknown) => logger.error("Failed to persist AI call:", error),
     );
   }
 
@@ -213,6 +217,9 @@ export class PrismaAICallLogger implements AICallLogger {
 
       return {
         topic: call.topic,
+        ...(call.workflowRunId !== undefined
+          ? { workflowRunId: call.workflowRunId }
+          : {}),
         callType: call.callType,
         modelKey: call.modelKey,
         modelId: call.modelId,

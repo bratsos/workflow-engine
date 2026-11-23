@@ -12,6 +12,7 @@ import { InMemoryJobQueue } from "@bratsos/workflow-engine/testing";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { z } from "zod";
 import {
+  createPrismaAICallLogger,
   createPrismaJobQueue,
   createPrismaWorkflowPersistence,
   fromPrisma8,
@@ -60,6 +61,51 @@ describe.skipIf(!sqlite && !databaseUrl)(
       createPrismaWorkflowPersistence(prisma, {
         databaseType: sqlite ? "sqlite" : "postgresql",
       });
+
+    it("applies configured table retention through the host", async () => {
+      const databaseType = sqlite ? "sqlite" : "postgresql";
+      const id = crypto.randomUUID();
+      await client.aICall.create({
+        data: {
+          id,
+          topic: "retention",
+          callType: "text",
+          modelKey: "model",
+          modelId: "model",
+          createdAt: new Date("2020-01-01T00:00:00Z"),
+          prompt: "",
+          response: "",
+          inputTokens: 0,
+          outputTokens: 0,
+          cost: 0,
+        },
+      });
+      const jobTransport = createPrismaJobQueue(client, { databaseType });
+      const kernel = createKernel({
+        persistence: store(client),
+        jobTransport,
+        blobStore: new InMemoryBlobStore(),
+        clock: { now: () => new Date() },
+        registry: { getWorkflow: () => undefined },
+        eventSink: { async emit() {} },
+        services: {
+          aiLogger: createPrismaAICallLogger(client, { databaseType }),
+        },
+      });
+      const prune = { aiCalls: { olderThanMs: 60_000 }, limit: 1 };
+      try {
+        const host = createServerlessHost({
+          kernel,
+          jobTransport,
+          workerId: "prune",
+          prune,
+        });
+        expect((await host.runMaintenanceTick()).pruned?.aiCalls).toBe(1);
+        expect(await client.aICall.count({ where: { id } })).toBe(0);
+      } finally {
+        await client.aICall.deleteMany({ where: { id } });
+      }
+    });
 
     const seed = (persistence: ReturnType<typeof store>, run: string, n = 1) =>
       persistence.appendOutboxEvents(

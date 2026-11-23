@@ -218,6 +218,8 @@ export async function loadSnapshot(
     const allowed = new Set(currentShapes[model]!.columns);
     const rows = (snapshot.tables[model] ?? []).map((encoded) => {
       const decoded = decodeValue(encoded) as Record<string, unknown>;
+      // The current database derives eligibility from the event and its run.
+      if (model === "OutboxEvent") delete decoded.pruneTerminal;
       return Object.fromEntries(
         Object.entries(decoded).filter(([column]) => allowed.has(column)),
       );

@@ -294,6 +294,8 @@ export interface BlobStore {
   get(key: string): Promise<unknown>;
   has(key: string): Promise<boolean>;
   delete(key: string): Promise<void>;
+  /** Atomically delete and report whether this call removed a blob. */
+  deleteForPurge?(key: string): Promise<boolean>;
   list(prefix: string): Promise<string[]>;
 }
 

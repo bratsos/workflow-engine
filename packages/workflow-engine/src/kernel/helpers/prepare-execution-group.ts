@@ -35,6 +35,7 @@ import type { Workflow } from "../../core/workflow.js";
 import type { EnqueueJobInput } from "../../persistence/interface.js";
 import type { KernelDeps } from "../kernel.js";
 import type { WorkflowRunRecord } from "../ports.js";
+import { writeForRun } from "./run-writes.js";
 
 export interface PrepareExecutionGroupOptions {
   /** Execution group to create/upsert stage records for. */
@@ -138,11 +139,15 @@ export async function enqueueForLiveRun(
   workflowRunId: string,
   jobs: EnqueueJobInput[],
 ): Promise<string[]> {
-  const ids = await deps.jobTransport.enqueueParallel(jobs);
-  if (await deps.persistence.getRun(workflowRunId)) return ids;
-  await deps.jobTransport.deleteByRunAndStages(
-    workflowRunId,
-    jobs.map((job) => job.stageId),
+  return (
+    (await writeForRun(deps.persistence, workflowRunId, async () => {
+      const ids = await deps.jobTransport.enqueueParallel(jobs);
+      if (await deps.persistence.getRun(workflowRunId)) return ids;
+      await deps.jobTransport.deleteByRunAndStages(
+        workflowRunId,
+        jobs.map((job) => job.stageId),
+      );
+      return [];
+    })) ?? []
   );
-  return [];
 }
