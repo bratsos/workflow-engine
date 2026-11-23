@@ -55,6 +55,24 @@ jobs:
         env:
           NODE_ENV: test
 
+  # A change to the Prisma schemas or the SQL needs a changeset that says
+  # "rolling-safe" or "stop old hosts first" (CONTRIBUTING.md).
+  changeset-rollout:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Check that a schema or SQL change states its rollout
+        run: >-
+          git diff --name-only
+          "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}"
+          | node scripts/check-changeset-rollout.mjs
+
   postgres-conformance:
     runs-on: ubuntu-latest
 
@@ -223,3 +241,122 @@ jobs:
         run: |
           pnpm --filter @bratsos/workflow-engine-console exec node scripts/build-ui.mjs
           pnpm --filter @bratsos/workflow-engine-console exec vitest run --hookTimeout=30000 --testTimeout=30000 src/__tests__/prisma-read-port.sqlite.test.ts
+
+  # The Prisma 8 Postgres and SQLite suites with Bun as the runtime, for
+  # users who run the engine on Bun. `bun --bun` makes Bun run the `vitest`
+  # and `prisma` binaries (whose shebang says node). Node installs the
+  # packages and provides the 24.x that Prisma 8 SQLite requires.
+  bun-conformance:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        database: ["postgres", "sqlite"]
+
+    # Known red: under Bun's node:sqlite, the journal-mode and root-connection
+    # cases in sqlite8-kernel-concurrency.test.ts and from-prisma8-sqlite.test.ts
+    # fail with "database is locked" where Node passes them; they are listed in
+    # the ci lane report. The Postgres row stays a hard gate.
+    continue-on-error: ${{ matrix.database == 'sqlite' }}
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: workflow_engine_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      PRISMA_MAJOR: "8"
+      NODE_ENV: test
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          cache: "pnpm"
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.2"
+
+      - name: Install dependencies
+        run: >-
+          pnpm install --frozen-lockfile
+          --filter @bratsos/workflow-engine
+          --filter @bratsos/workflow-engine-console
+          --filter @bratsos/workflow-engine-host-node
+          --filter @bratsos/workflow-engine-host-serverless
+          --filter "./packages/prisma-fixtures/*"
+
+      - name: Build engine for the console Prisma 8 shim import
+        run: pnpm --filter @bratsos/workflow-engine run build
+
+      - name: Generate Prisma client
+        if: matrix.database == 'postgres'
+        run: bun --bun run --cwd packages/workflow-engine prisma:generate
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/workflow_engine_test
+
+      - name: Push Prisma schema to Postgres
+        if: matrix.database == 'postgres'
+        run: bun --bun run --cwd packages/workflow-engine prisma:db-push
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/workflow_engine_test
+
+      - name: Run Postgres conformance tests
+        if: matrix.database == 'postgres'
+        run: bun --bun run --cwd packages/workflow-engine test:pg
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/workflow_engine_test
+
+      - name: Run host outbox recovery tests on Postgres
+        if: matrix.database == 'postgres'
+        run: |
+          bun --bun run --cwd packages/workflow-engine-host-node vitest run --hookTimeout=30000 --testTimeout=30000 src/__tests__/outbox-prisma.test.ts
+          bun --bun run --cwd packages/workflow-engine-host-serverless vitest run --hookTimeout=30000 --testTimeout=30000 src/__tests__/outbox-prisma.test.ts
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/workflow_engine_test
+
+      - name: Run console Postgres tests
+        if: matrix.database == 'postgres'
+        run: |
+          bun --bun packages/workflow-engine-console/scripts/build-ui.mjs
+          bun --bun run --cwd packages/workflow-engine-console vitest run --hookTimeout=30000 --testTimeout=30000 src/__tests__/prisma-read-port.postgres.test.ts src/__tests__/cli.test.ts
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/workflow_engine_test
+
+      - name: Run engine SQLite conformance tests
+        if: matrix.database == 'sqlite'
+        run: bun --bun run --cwd packages/workflow-engine test:sqlite
+        env:
+          SQLITE8_KERNEL_SQLITE: "1"
+
+      - name: Run host outbox recovery tests on SQLite
+        if: matrix.database == 'sqlite'
+        run: |
+          bun --bun run --cwd packages/workflow-engine-host-node vitest run --hookTimeout=30000 --testTimeout=30000 src/__tests__/outbox-prisma.test.ts
+          bun --bun run --cwd packages/workflow-engine-host-serverless vitest run --hookTimeout=30000 --testTimeout=30000 src/__tests__/outbox-prisma.test.ts
+
+      - name: Run console SQLite conformance tests
+        if: matrix.database == 'sqlite'
+        run: |
+          bun --bun packages/workflow-engine-console/scripts/build-ui.mjs
+          bun --bun run --cwd packages/workflow-engine-console vitest run --hookTimeout=30000 --testTimeout=30000 src/__tests__/prisma-read-port.sqlite.test.ts

@@ -211,8 +211,18 @@ This is a pnpm monorepo (`packages/*`):
 
    Pick the affected package(s) and a semver bump (patch/minor/major), and describe the change. Commit the generated file under `.changeset/`.
 
+   A changeset for a change to `packages/workflow-engine/prisma/*.prisma` or `packages/workflow-engine/sql/*.sql` must also say how to roll it out, with the reason: write **rolling-safe** when old and new hosts can run against the same database at once (for example an added nullable column or index that old code ignores), or **stop old hosts first** when they cannot (for example new SQL that needs a column old hosts do not write, or a changed constraint). The `changeset-rollout` CI job fails a pull request that changes either path without a changed `.changeset/*.md` containing one of those phrases.
+
 4. Open a PR against `main`. The `changesets/action` release workflow opens (or updates) a "Version Packages" PR from accumulated changesets; merging that PR publishes to npm.
 
 ## CI
 
 `.github/workflows/ci.yml` runs lint, build, typecheck, and tests across a Node 22/24 matrix, plus a separate job that runs the Postgres conformance suite against a real `postgres:16` service container, and a `sqlite-conformance` job that runs the SQLite suites against a real file for each Prisma major (Node 24, plus the floor rows described under SQLite conformance above).
+
+Three more checks cover other runtimes, newer Prisma releases and rollouts:
+
+- `bun-conformance` runs the Prisma 8 Postgres and SQLite suites with Bun (the pinned `bun-version`) as the runtime, using `bun --bun` so Bun also runs `vitest` and the `prisma` CLI. Run it locally the same way, for example `PRISMA_MAJOR=8 DATABASE_URL=... bun --bun run --cwd packages/workflow-engine test:pg`. The Postgres row is a gate; the SQLite row is marked `continue-on-error` while Bun's `node:sqlite` fails the journal-mode cases described in the comment above the job. Move the pinned Bun version in `ci.yml` only after the Postgres row passes on it; release notes read it from there.
+- `.github/workflows/prisma-8-rc.yml` runs every Monday (and on demand) against the newest Prisma 8 release-candidate versions of `prisma`, `@prisma/orm-postgres` and `@prisma/orm-sqlite` on npm, found by `scripts/latest-prisma8.mjs`, instead of the exact pair the workspace pins. A failure opens (or comments on) an issue labelled `prisma-8-rc`.
+- `changeset-rollout` (pull requests only) runs `scripts/check-changeset-rollout.mjs`, described under Making changes.
+
+The release workflow runs `pnpm run version`, which runs `changeset version` and then `scripts/tested-on.mjs`; that appends a `Tested on: Node ..., Bun ..., Prisma 6 ..., 7 ..., 8 ...` line to each new changelog section, read from the `ci` Node matrix, the Bun pin and `pnpm-lock.yaml`.

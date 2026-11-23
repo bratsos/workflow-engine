@@ -1,0 +1,202 @@
+name: Prisma 8 release candidates
+
+# The workspace pins an exact Prisma 8 release-candidate pair (see
+# packages/prisma-fixtures/v8/package.json). This workflow installs the newest
+# pair on npm instead, runs the Prisma 8 Postgres and SQLite suites, and opens
+# an issue when they fail, so a break shows up here before the pin is moved.
+
+on:
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      prisma: ${{ steps.pair.outputs.prisma }}
+      orm-postgres: ${{ steps.pair.outputs.orm-postgres }}
+      orm-sqlite: ${{ steps.pair.outputs.orm-sqlite }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+
+      - name: Find the newest Prisma 8 versions on npm
+        id: pair
+        run: node scripts/latest-prisma8.mjs
+
+  postgres:
+    needs: resolve
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: workflow_engine_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/workflow_engine_test
+      PRISMA_MAJOR: "8"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: >-
+          pnpm install --frozen-lockfile
+          --filter @bratsos/workflow-engine
+          --filter @bratsos/workflow-engine-console
+          --filter @bratsos/workflow-engine-host-node
+          --filter @bratsos/workflow-engine-host-serverless
+          --filter "./packages/prisma-fixtures/*"
+
+      - name: Install the newest Prisma 8 pair
+        run: >-
+          pnpm --filter workflow-engine-prisma-v8
+          add --save-exact
+          "prisma@${{ needs.resolve.outputs.prisma }}"
+          "@prisma/orm-postgres@${{ needs.resolve.outputs.orm-postgres }}"
+
+      - name: Generate Prisma client
+        run: pnpm --filter @bratsos/workflow-engine run prisma:generate
+
+      - name: Push Prisma schema to Postgres
+        run: pnpm --filter @bratsos/workflow-engine run prisma:db-push
+
+      - name: Provision Prisma 7 as the reference and diff the Prisma 8 schema against it
+        run: |
+          psql "$DATABASE_URL" -c 'CREATE DATABASE workflow_engine_reference'
+          PRISMA_MAJOR=7 DATABASE_URL=postgresql://postgres:postgres@localhost:5432/workflow_engine_reference \
+            pnpm --filter @bratsos/workflow-engine run prisma:db-push
+          node packages/prisma-fixtures/v8/scripts/schema-diff.mjs \
+            postgresql://postgres:postgres@localhost:5432/workflow_engine_reference "$DATABASE_URL"
+
+      - name: Run Postgres conformance tests
+        run: pnpm --filter @bratsos/workflow-engine run test:pg
+        env:
+          NODE_ENV: test
+
+      - name: Run host outbox recovery tests on Postgres
+        run: |
+          pnpm --filter @bratsos/workflow-engine-host-node exec vitest run --hookTimeout=30000 --testTimeout=30000 src/__tests__/outbox-prisma.test.ts
+          pnpm --filter @bratsos/workflow-engine-host-serverless exec vitest run --hookTimeout=30000 --testTimeout=30000 src/__tests__/outbox-prisma.test.ts
+        env:
+          NODE_ENV: test
+
+      - name: Run console Postgres tests
+        run: |
+          pnpm --filter @bratsos/workflow-engine-console exec node scripts/build-ui.mjs
+          pnpm --filter @bratsos/workflow-engine-console exec vitest run --hookTimeout=30000 --testTimeout=30000 src/__tests__/prisma-read-port.postgres.test.ts src/__tests__/cli.test.ts
+        env:
+          NODE_ENV: test
+
+  sqlite:
+    needs: resolve
+    runs-on: ubuntu-latest
+
+    env:
+      PRISMA_MAJOR: "8"
+      SQLITE8_KERNEL_SQLITE: "1"
+      NODE_ENV: test
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: >-
+          pnpm install --frozen-lockfile
+          --filter @bratsos/workflow-engine
+          --filter @bratsos/workflow-engine-console
+          --filter @bratsos/workflow-engine-host-node
+          --filter @bratsos/workflow-engine-host-serverless
+          --filter "./packages/prisma-fixtures/*"
+
+      - name: Install the newest Prisma 8 pair
+        run: >-
+          pnpm --filter workflow-engine-prisma-v8-sqlite
+          add --save-exact
+          "prisma@${{ needs.resolve.outputs.prisma }}"
+          "@prisma/orm-sqlite@${{ needs.resolve.outputs.orm-sqlite }}"
+
+      - name: Build engine for the console Prisma 8 shim import
+        run: pnpm --filter @bratsos/workflow-engine run build
+
+      - name: Run engine SQLite conformance tests
+        run: pnpm --filter @bratsos/workflow-engine run test:sqlite
+
+      - name: Run host outbox recovery tests on SQLite
+        run: |
+          pnpm --filter @bratsos/workflow-engine-host-node exec vitest run --hookTimeout=30000 --testTimeout=30000 src/__tests__/outbox-prisma.test.ts
+          pnpm --filter @bratsos/workflow-engine-host-serverless exec vitest run --hookTimeout=30000 --testTimeout=30000 src/__tests__/outbox-prisma.test.ts
+
+      - name: Run console SQLite conformance tests
+        run: |
+          pnpm --filter @bratsos/workflow-engine-console exec node scripts/build-ui.mjs
+          pnpm --filter @bratsos/workflow-engine-console exec vitest run --hookTimeout=30000 --testTimeout=30000 src/__tests__/prisma-read-port.sqlite.test.ts
+
+  report:
+    needs: [resolve, postgres, sqlite]
+    # True when any job above failed, including `resolve`.
+    if: failure()
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      PRISMA: ${{ needs.resolve.outputs.prisma }}
+      ORM_POSTGRES: ${{ needs.resolve.outputs.orm-postgres }}
+      ORM_SQLITE: ${{ needs.resolve.outputs.orm-sqlite }}
+    steps:
+      - name: Open or update the issue
+        run: |
+          label="prisma-8-rc"
+          gh label create "$label" --color D93F0B --description "Newest Prisma 8 release candidates break the suites" 2>/dev/null || true
+          body="The weekly run against the newest Prisma 8 pair failed: prisma ${PRISMA:-unresolved}, @prisma/orm-postgres ${ORM_POSTGRES:-unresolved}, @prisma/orm-sqlite ${ORM_SQLITE:-unresolved}.
+
+          Run: ${RUN_URL}"
+          existing="$(gh issue list --label "$label" --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --label "$label" --title "Prisma 8 release candidates break the suites" --body "$body"
+          fi
