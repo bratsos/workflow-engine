@@ -120,6 +120,8 @@ export interface WorkflowRunRecord {
   totalTokens: number;
   priority: number;
   metadata: unknown | null;
+  tenantId?: string | null;
+  labels?: Record<string, string> | null;
   /**
    * The definition version this run is pinned to, or `null` for a run
    * created before the consumer migrated to definition versioning (or on a
@@ -265,6 +267,7 @@ export interface IdempotencyRecord {
   commandType: string;
   result: unknown;
   createdAt: Date;
+  workflowRunId: string | null;
 }
 
 // ============================================================================
@@ -384,6 +387,8 @@ export interface CreateRunInput {
   input: unknown;
   config?: unknown;
   priority?: number;
+  tenantId?: string;
+  labels?: Record<string, string>;
   /** Optional metadata stored as JSON on the run record. NOT spread into Prisma fields. */
   metadata?: Record<string, unknown>;
   /**
@@ -774,6 +779,9 @@ export interface PersistenceCore {
 
   // WorkflowRun operations
   createRun(data: CreateRunInput): Promise<WorkflowRunRecord>;
+
+  /** Notify listeners of a new run from inside the run.create transaction. */
+  notifyRunCreated?(workflowRunId: string): Promise<void>;
   /**
    * Updates a run's fields. `version` is incremented on every call,
    * whether or not `expectedVersion` is supplied -- callers relying on
@@ -1105,11 +1113,12 @@ export interface PersistenceCore {
     | { status: "in_progress" }
   >;
 
-  /** Mark an idempotency key as completed and cache the command result. */
+  /** Cache the completed result and stamp the run id when known. */
   completeIdempotencyKey(
     key: string,
     commandType: string,
     result: unknown,
+    workflowRunId: string | null,
   ): Promise<void>;
 
   /**

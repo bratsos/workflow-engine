@@ -12,15 +12,15 @@
 // pushed from schema.prisma, because the engine's raw SQL depends on them:
 // - Timestamps are naive `timestamp(3)` columns, read and written as ISO text
 //   (`TimestampString(3)`), never as JavaScript `Date`.
-// - `Status` is a native Postgres enum named "Status": the raw SQL casts to
-//   `::"Status"`.
+// - The status fields use a native Postgres enum. If you rename it, set
+//   `statusEnumName` on createPrismaWorkflowPersistence for the raw claim.
 // - Index names are pinned with `map:` to the names Prisma 6 and 7 generate, so
 //   adopting a database from either needs no renames. Primary and foreign key
 //   names are left to the defaults, which are the same.
 // - `updatedAt` has no database default: the client fills it, as it did on 6
 //   and 7. `createdAt` keeps its `now()` default for the raw inserts.
 //
-// A contract cannot give an index column a sort direction, so the five indexes
+// A contract cannot give an index column a sort direction, so the six indexes
 // that need one (marked below) are declared ascending here, and
 // mixed-order-indexes.sql gives them their direction. `db verify` and
 // `migration plan` read an index by its columns, so they accept both.
@@ -53,6 +53,8 @@ model WorkflowRun {
   totalCost    Float              @default(0)
   totalTokens  Int                @default(0)
   priority     Int                @default(5)
+  tenantId     String?
+  labels       Jsonb?
   metadata     Jsonb?
 
   // The definition version this run is pinned to. NULL means the run was
@@ -69,12 +71,13 @@ model WorkflowRun {
   artifacts   WorkflowArtifact[]
   annotations WorkflowAnnotation[]
 
-  // List orderings: newest-first, optionally narrowed by status or workflow,
+  // List orderings: newest-first, optionally narrowed by status, workflow or tenant,
   // paged on the keyset (createdAt, id). See schema.prisma for the reasoning.
-  // The next three are createdAt DESC, id DESC (mixed-order-indexes.sql).
+  // The next four are createdAt DESC, id DESC (mixed-order-indexes.sql).
   @@index([createdAt, id], map: "workflow_runs_createdAt_id_idx")
   @@index([status, createdAt, id], map: "workflow_runs_status_createdAt_id_idx")
   @@index([workflowId, createdAt, id], map: "workflow_runs_workflowId_createdAt_id_idx")
+  @@index([tenantId, createdAt, id], map: "workflow_runs_tenantId_createdAt_id_idx")
   // The claim: status = 'PENDING' ORDER BY priority DESC, "createdAt" ASC
   // LIMIT 1 FOR UPDATE SKIP LOCKED. priority DESC (mixed-order-indexes.sql).
   @@index([status, priority, createdAt], map: "workflow_runs_status_priority_createdAt_idx")
@@ -223,11 +226,18 @@ model AICall {
   reasoningTokens   Int?
   batchId           String?
   requestId         String?
+  workflowRunId String?
+  tenantId      String?
+  labels        Jsonb?
+  textExpiresAt TimestampString(3)?
   metadata          Jsonb?
 
   @@index([batchId, requestId], map: "ai_calls_batch_request_unique", unique: true)
   @@index([batchId], map: "ai_calls_batchId_idx")
   @@index([topic], map: "ai_calls_topic_idx")
+  @@index([tenantId, createdAt], map: "ai_calls_tenantId_createdAt_idx")
+  @@index([workflowRunId], map: "ai_calls_workflowRunId_idx")
+  @@index([textExpiresAt], map: "ai_calls_textExpiresAt_idx")
   @@map("ai_calls")
 }
 
@@ -325,9 +335,12 @@ model IdempotencyKey {
   createdAt   TimestampString(3) @default(now()) @onCreate(now())
   key         String
   commandType String
+  workflowRunId String?
   result      Jsonb
 
   @@index([key, commandType], map: "idempotency_keys_key_commandType_key", unique: true)
+  @@index([workflowRunId], map: "idempotency_keys_workflowRunId_idx")
+  @@index([createdAt], map: "idempotency_keys_createdAt_idx")
   @@map("idempotency_keys")
 }
 

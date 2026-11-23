@@ -38,7 +38,7 @@ Before creating persistence instances, verify your Prisma schema:
 - [ ] `IdempotencyKey` model exists (required for command idempotency keys)
 - [ ] `Status` has all values: PENDING, RUNNING, SUSPENDED, COMPLETED, FAILED, CANCELLED, SKIPPED. PostgreSQL uses a native enum; Prisma 8 SQLite uses text.
 - [ ] Table names use `@@map` (e.g., `@@map("workflow_runs")`)
-- [ ] Run `prisma db push` or `prisma migrate dev` after schema changes (Prisma 8: `prisma contract emit`, then `prisma db init` / `db update`, then re-apply `mixed-order-indexes.sql` if the step recreated one of the five descending indexes; see [Prisma 8](#prisma-8))
+- [ ] Run `prisma db push` or `prisma migrate dev` after schema changes (Prisma 8: `prisma contract emit`, then `prisma db init` / `db update`, then re-apply `mixed-order-indexes.sql` if the step recreated one of the six descending indexes; see [Prisma 8](#prisma-8))
 
 **Common Errors:**
 | Error | Cause | Fix |
@@ -159,7 +159,7 @@ interface PersistenceCore {
     | { status: "replay"; result: unknown }
     | { status: "in_progress" }
   >;
-  completeIdempotencyKey(key: string, commandType: string, result: unknown): Promise<void>;
+  completeIdempotencyKey(key: string, commandType: string, result: unknown, workflowRunId: string | null): Promise<void>;
   releaseIdempotencyKey(key: string, commandType: string): Promise<void>;
 }
 ```
@@ -446,7 +446,7 @@ enum Status {
 }
 ```
 
-On Prisma 8 PostgreSQL the same enum is `native_enum Status { ... }` with `pg.enum(Status)` fields in `contract.prisma`: it must stay a native Postgres enum named `Status`, because the raw SQL casts to `::"Status"`. The SQLite contract uses text status values instead.
+On Prisma 8 PostgreSQL the same enum is `native_enum Status { ... }` with `pg.enum(Status)` fields in `contract.prisma`: you can rename it and pass the custom name as `statusEnumName` to `createPrismaWorkflowPersistence`. The SQLite contract uses text status values instead.
 
 `LogLevel` and `ArtifactType` are **not** enums -- `WorkflowLog.level` and `WorkflowArtifact.type` are plain `String` columns (the engine validates the values at the TypeScript layer).
 
@@ -484,6 +484,8 @@ model WorkflowRun {
   totalCost     Float          @default(0)
   totalTokens   Int            @default(0)
   priority      Int            @default(5)
+  tenantId      String?
+  labels        Json?
   metadata      Json?
 
   // The definition version this run is pinned to. NULL means the run was
@@ -501,7 +503,7 @@ model WorkflowRun {
   annotations   WorkflowAnnotation[]
 
   // List orderings. Every "recent runs" view -- the console's included --
-  // is newest-first, optionally narrowed by status or workflow, and pages
+  // is newest-first, optionally narrowed by status, workflow or tenant, and pages
   // on the keyset (createdAt, id), so the tiebreaker travels in the index
   // and a page is one index range scan with no sort node. These replace
   // the bare @@index([status]) / @@index([workflowId]): a composite whose
@@ -510,6 +512,7 @@ model WorkflowRun {
   @@index([createdAt(sort: Desc), id(sort: Desc)])
   @@index([status, createdAt(sort: Desc), id(sort: Desc)])
   @@index([workflowId, createdAt(sort: Desc), id(sort: Desc)])
+  @@index([tenantId, createdAt(sort: Desc), id(sort: Desc)])
   // The claim: status = 'PENDING' ORDER BY priority DESC, "createdAt" ASC
   // LIMIT 1 FOR UPDATE SKIP LOCKED, run maxClaimsPerTick times per tick
   // per host. The same shape job_queue already indexes, and it needs its
@@ -831,14 +834,17 @@ model IdempotencyKey {
   createdAt   DateTime @default(now())
   key         String
   commandType String
+  workflowRunId String?
   result      Json
 
   @@unique([key, commandType])
+  @@index([workflowRunId])
+  @@index([createdAt])
   @@map("idempotency_keys")
 }
 ```
 
-Backs `acquireIdempotencyKey` / `completeIdempotencyKey` / `releaseIdempotencyKey`. A row's `result` holds an internal in-progress marker until the command completes, at which point it's overwritten with the cached command result (so a replayed dispatch with the same key returns it without re-executing). `createdAt` doubles as the "acquired at" timestamp: if a dispatcher crashes after committing its transaction but before calling `completeIdempotencyKey`, the row is left stuck with the in-progress marker forever. The kernel guards against this by reclaiming keys that have been `in_progress` for longer than `KernelConfig.idempotencyStaleInProgressMs` (default 10 minutes) -- see `acquireIdempotencyKey`'s `staleInProgressAfterMs` option above.
+Backs `acquireIdempotencyKey` / `completeIdempotencyKey` / `releaseIdempotencyKey`. Completion stamps the owning `workflowRunId` when available. A row's `result` holds an internal in-progress marker until the command completes, at which point it's overwritten with the cached command result (so a replayed dispatch with the same key returns it without re-executing). `createdAt` doubles as the "acquired at" timestamp: if a dispatcher crashes after committing its transaction but before calling `completeIdempotencyKey`, the row is left stuck with the in-progress marker forever. The kernel guards against this by reclaiming keys that have been `in_progress` for longer than `KernelConfig.idempotencyStaleInProgressMs` (default 10 minutes) -- see `acquireIdempotencyKey`'s `staleInProgressAfterMs` option above.
 
 ### AICall Model
 
@@ -855,6 +861,10 @@ model AICall {
   inputTokens   Int
   outputTokens  Int
   cost          Float
+  workflowRunId String?
+  tenantId      String?
+  labels        Json?
+  textExpiresAt DateTime?
   metadata      Json?
 
   batchId      String?
@@ -863,6 +873,9 @@ model AICall {
   @@unique([batchId, requestId], map: "ai_calls_batch_request_unique")
   @@index([batchId])
   @@index([topic])
+  @@index([tenantId, createdAt])
+  @@index([workflowRunId])
+  @@index([textExpiresAt])
   @@map("ai_calls")
 }
 ```
@@ -1041,7 +1054,7 @@ export default definePrismaConfig({
 **The contract.** `prisma/contract.prisma` ships in the package with the same 12 models, names and relations as `schema.prisma` (copy the `native_enum Status` and the models into an existing contract if you have one). Two things must stay, and `fromPrisma8` throws at construction, naming the fix, when they do not:
 
 - Timestamps are `TimestampString(3)`, never `DateTime`: naive `timestamp(3)` holding UTC, read and written as ISO text. A `Date` is rejected by the column; `fromPrisma8` converts for the engine.
-- `Status` is a native Postgres enum named `Status` (`native_enum` plus `pg.enum(Status)`), because the raw SQL casts to `::"Status"`. A plain `enum` block is a text column with a `CHECK` and breaks the cast.
+- `status` uses a native Postgres enum (`native_enum` plus `pg.enum(...)`). Pass the enum name as `statusEnumName` to `createPrismaWorkflowPersistence` if it differs from `Status`. SQL enqueue uses the type of the column.
 
 **Provision an empty database.**
 
@@ -1053,7 +1066,7 @@ psql "$DATABASE_URL" -f node_modules/@bratsos/workflow-engine/prisma/mixed-order
 npx prisma db verify --strict
 ```
 
-**The mixed-order indexes.** A Prisma 8 contract cannot express a sort direction, so `contract.prisma` declares five indexes ascending: `(status, priority DESC, createdAt)` on `workflow_runs` and `job_queue` (the claim and dequeue), and `(createdAt DESC, id DESC)` plus its `status` / `workflowId` prefixes on `workflow_runs` (every newest-first listing). `mixed-order-indexes.sql` drops and recreates them with their direction in one transaction; it is idempotent. Without it everything works, but the claim slows as pending rows pile up: with every pending row at the default priority a job claim took 3.1 ms at 10,000 pending jobs and 51.6 ms at 100,000 (a sequential scan and sort of every row), against 0.04 ms and 0.03 ms with the indexes. `db verify`, `db verify --strict` (exit 0) and `migration plan` cannot see sort direction, so nothing warns when they are ascending: check with `\d workflow_runs` (four of the indexes show `DESC`) and `\d job_queue` (the fifth). **Re-apply the file after anything that recreates one of the five**: renaming one in the contract, or a manual `DROP INDEX` followed by `db update`; the recreated index is ascending. (Changing an index's columns under the same name does not recreate it: `migration plan` and `db update` fail with `MIGRATION.PLANNING_FAILED`.) If the project uses `migration plan` and `db migrate`, put the five statements in the baseline migration instead (`migration plan --from @empty --name baseline`, then replace `columns: [...]` of each of the five `createIndex` calls, found by index name, with its column list from the SQL file, such as ``expression: sql`"status", "priority" DESC, "createdAt"` ``, run the file with `node`, then `db migrate --advance-ref db`) so every environment gets them.
+**The mixed-order indexes.** A Prisma 8 contract cannot express a sort direction, so `contract.prisma` declares six indexes ascending: `(status, priority DESC, createdAt)` on `workflow_runs` and `job_queue` (the claim and dequeue), and `(createdAt DESC, id DESC)` plus its `status`, `workflowId` and `tenantId` prefixes on `workflow_runs` (every newest-first listing). `mixed-order-indexes.sql` drops and recreates them with their direction in one transaction; it is idempotent. Without it everything works, but the claim slows as pending rows pile up: with every pending row at the default priority a job claim took 3.1 ms at 10,000 pending jobs and 51.6 ms at 100,000 (a sequential scan and sort of every row), against 0.04 ms and 0.03 ms with the indexes. `db verify`, `db verify --strict` (exit 0) and `migration plan` cannot see sort direction, so nothing warns when they are ascending: check with `\d workflow_runs` (five of the indexes show `DESC`) and `\d job_queue` (the sixth). **Re-apply the file after anything that recreates one of the six**: renaming one in the contract, or a manual `DROP INDEX` followed by `db update`; the recreated index is ascending. (Changing an index's columns under the same name does not recreate it: `migration plan` and `db update` fail with `MIGRATION.PLANNING_FAILED`.) If the project uses `migration plan` and `db migrate`, put the six index definitions in the baseline migration instead (`migration plan --from @empty --name baseline`, then replace `columns: [...]` of each of the six `createIndex` calls, found by index name, with its column list from the SQL file, such as ``expression: sql`"status", "priority" DESC, "createdAt"` ``, run the file with `node`, then `db migrate --advance-ref db`) so every environment gets them.
 
 **The client.**
 
@@ -1122,7 +1135,7 @@ await db.transaction(async (tx) => {
 
 **Prepared statements.** The adapters do not use `db.prepare`. It relies on named statements, which PgBouncer in transaction mode cannot keep between transactions, and it gave no measurable gain at the default poll intervals.
 
-**Adopting a PostgreSQL database that Prisma 6 or 7 created.** The tables do not change and the five descending indexes already exist, so skip `mixed-order-indexes.sql`. Replace the Prisma 6 or 7 packages with the pinned Prisma 8 PostgreSQL pair, copy `contract.prisma`, add `prisma.config.ts`, then:
+**Adopting a PostgreSQL database that Prisma 6 or 7 created.** The tables do not change and the six descending indexes already exist, so skip `mixed-order-indexes.sql`. Replace the Prisma 6 or 7 packages with the pinned Prisma 8 PostgreSQL pair, copy `contract.prisma`, add `prisma.config.ts`, then:
 
 ```bash
 npx prisma contract emit
@@ -1463,7 +1476,7 @@ npx prisma migrate deploy
 npx prisma generate
 ```
 
-On Prisma 8 edit `prisma/contract.prisma`, run `npx prisma contract emit`, then `npx prisma db update` (no migration history) or `npx prisma migration plan` and `npx prisma db migrate --advance-ref db`, because plain `db migrate` leaves the next `migration plan` failing with `MIGRATION.PLAN_ORIGIN_UNKNOWN`. The error prints three commands; run the first or the second: `npx prisma migration ref set db <contract>`, or `npx prisma migration plan --from <contract>`, where `<contract>` is the hash `npx prisma migration status` shows next to `@db`. Do not run the third, `migration plan --from @empty`, on a database that already has the tables: it plans every table again. Re-apply `mixed-order-indexes.sql` after any step that recreates one of the five descending indexes (renaming one in the contract, or a manual `DROP INDEX` then `db update`; the recreated index is ascending and `db verify --strict` does not notice).
+On Prisma 8 edit `prisma/contract.prisma`, run `npx prisma contract emit`, then `npx prisma db update` (no migration history) or `npx prisma migration plan` and `npx prisma db migrate --advance-ref db`, because plain `db migrate` leaves the next `migration plan` failing with `MIGRATION.PLAN_ORIGIN_UNKNOWN`. The error prints three commands; run the first or the second: `npx prisma migration ref set db <contract>`, or `npx prisma migration plan --from <contract>`, where `<contract>` is the hash `npx prisma migration status` shows next to `@db`. Do not run the third, `migration plan --from @empty`, on a database that already has the tables: it plans every table again. Re-apply `mixed-order-indexes.sql` after any step that recreates one of the six descending indexes (renaming one in the contract, or a manual `DROP INDEX` then `db update`; the recreated index is ascending and `db verify --strict` does not notice).
 
 ## Transactional enqueue from SQL (PostgreSQL)
 
@@ -1487,13 +1500,24 @@ workflow_engine_enqueue(
   p_input              jsonb,
   p_config             jsonb   DEFAULT '{}'::jsonb,
   p_priority           integer DEFAULT 5,
-  p_definition_version text    DEFAULT NULL
+  p_definition_version text    DEFAULT NULL,
+  p_tenant_id          text    DEFAULT NULL,
+  p_labels             jsonb   DEFAULT NULL
 ) RETURNS text
 ```
 
 It writes exactly what `run.create` writes, in the same order — the idempotency
 key, the run, the `workflow:created` outbox event — and leaves the run `PENDING`
-for `run.claimPending`. Replaying one key returns the same run id.
+for `run.claimPending`. Both paths store optional `tenantId` and `labels`
+(the SQL parameters default to NULL), attribute the key to the run, and send
+its ID to `workflow_engine_runs` when the transaction commits. Replaying one
+key returns the same run ID without a new notification. Rollback discards
+the notification.
+
+The migration replaces the old seven-argument signature in a transaction. Its
+callers can keep omitting the two trailing arguments. Re-grant `EXECUTE` on
+the nine-argument signature before committing if the old one had role grants.
+
 `sql-enqueue.test.ts` (gated on `DATABASE_URL`) creates one run each way and
 asserts the rows, idempotency results and outbox events agree, and that both
 execute to the same output; that is what stops the two paths drifting.
@@ -1518,9 +1542,11 @@ Requires PostgreSQL 13+ (built-in `gen_random_uuid()`).
 
 ### Indexes
 
-The schema includes indexes for common query patterns (on Prisma 8 the five with a `DESC` column come from `mixed-order-indexes.sql`, not the contract):
+The schema includes indexes for common query patterns (on Prisma 8 the six with a `DESC` column come from `mixed-order-indexes.sql`, not the contract):
 - `(status, priority DESC, createdAt)` on `workflow_runs` and `job_queue` - the run claim and the dequeue, `FOR UPDATE SKIP LOCKED`, flat with depth
-- `(createdAt DESC, id DESC)` and its `status` / `workflowId` prefixes on `workflow_runs` - newest-first listings, keyset paginated
+- `(createdAt DESC, id DESC)` and its `status`, `workflowId` and `tenantId` prefixes on `workflow_runs` - newest-first listings, keyset paginated
+- `(tenantId, createdAt)`, `(workflowRunId)` and `(textExpiresAt)` on `ai_calls` - nullable attribution and expiry fields
+- `(workflowRunId)` and `(createdAt)` on `idempotency_keys` - run attribution and key age
 - `(definitionVersion)` and `(status, workflowId, definitionVersion)` on `workflow_runs` - version lookups and the version-filtered claim
 - `nextPollAt` - for suspended stage polling (`stage.pollSuspended` reads `SUSPENDED` rows with `nextPollAt <= now`, then claims each by moving `nextPollAt` forward with `expectedVersion`; a custom adapter needs the version guard on `updateStage` for two orchestrators to poll safely)
 - `workflowRunId` / `stageRecordId` - for stage/log/step lookups

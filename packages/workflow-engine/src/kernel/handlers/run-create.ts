@@ -61,6 +61,8 @@ export async function handleRunCreate(
     config: mergedConfig,
     priority,
     definitionVersion,
+    tenantId: command.tenantId,
+    labels: command.labels,
   });
 
   // 8. Attach run-creation annotations, if any (atomic with createRun

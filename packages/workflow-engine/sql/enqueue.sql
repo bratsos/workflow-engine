@@ -14,7 +14,9 @@
 -- This file is part of the schema, not something the engine creates at
 -- runtime: run it in your own migration, next to the tables it writes, so
 -- your migration history owns it. Apply it AFTER the workflow engine tables
--- exist. It is idempotent (CREATE OR REPLACE) and safe to re-run.
+-- exist. This replaces the original seven-argument signature atomically.
+-- If you granted EXECUTE to application roles, restore those grants on the
+-- new signature before COMMIT. Restore any revocation from PUBLIC as well.
 --
 -- Requires PostgreSQL 13+ (for the built-in gen_random_uuid()).
 --
@@ -74,6 +76,10 @@
 --
 -- ---------------------------------------------------------------------------
 
+BEGIN;
+
+DROP FUNCTION IF EXISTS workflow_engine_enqueue(text, text, text, jsonb, jsonb, integer, text);
+
 CREATE OR REPLACE FUNCTION workflow_engine_enqueue(
   -- Deduplicates the enqueue exactly as `run.create`'s does: calling twice
   -- with one key returns the same run id and creates nothing the second time.
@@ -86,7 +92,9 @@ CREATE OR REPLACE FUNCTION workflow_engine_enqueue(
   p_config             jsonb   DEFAULT '{}'::jsonb,
   p_priority           integer DEFAULT 5,
   -- NULL creates the run unpinned. See note 2 above.
-  p_definition_version text    DEFAULT NULL
+  p_definition_version text    DEFAULT NULL,
+  p_tenant_id          text    DEFAULT NULL,
+  p_labels             jsonb   DEFAULT NULL
 ) RETURNS text
 LANGUAGE plpgsql
 AS $$
@@ -138,6 +146,14 @@ BEGIN
     RETURN v_existing ->> 'workflowRunId';
   END IF;
 
+  IF p_labels IS NOT NULL AND (
+    jsonb_typeof(p_labels) <> 'object' OR
+    jsonb_path_exists(p_labels, '$.* ? (@.type() != "string")')
+  ) THEN
+    RAISE EXCEPTION 'workflow_engine_enqueue: labels must be a JSON object with string values'
+      USING ERRCODE = '22023';
+  END IF;
+
   -- 2. A pinned run must name a definition that exists, or it is pinned to
   --    nothing and no host will ever serve it.
   IF p_definition_version IS NOT NULL THEN
@@ -159,12 +175,12 @@ BEGIN
   INSERT INTO "workflow_runs" (
     "id", "createdAt", "updatedAt", "workflowId", "workflowName",
     "workflowType", "status", "input", "config", "priority",
-    "definitionVersion"
+    "definitionVersion", "tenantId", "labels"
   ) VALUES (
     v_run_id, v_now, v_now, p_workflow_id, p_workflow_name,
-    p_workflow_id, 'PENDING'::"Status", p_input,
+    p_workflow_id, 'PENDING', p_input,
     COALESCE(p_config, '{}'::jsonb), COALESCE(p_priority, 5),
-    p_definition_version
+    p_definition_version, p_tenant_id, p_labels
   );
 
   -- 4. The first outbox event for this newly created run.
@@ -192,16 +208,21 @@ BEGIN
   -- 5. Record the result under the key, so a replay returns this run
   --    instead of creating another. Same shape as RunCreateResult.
   UPDATE "idempotency_keys"
-     SET "result" = jsonb_build_object(
-       'workflowRunId', v_run_id,
-       'status', 'PENDING',
-       'definitionVersion', p_definition_version
-     )
+     SET "workflowRunId" = v_run_id,
+         "result" = jsonb_build_object(
+           'workflowRunId', v_run_id,
+           'status', 'PENDING',
+           'definitionVersion', p_definition_version
+         )
    WHERE "key" = p_idempotency_key AND "commandType" = 'run.create';
 
+  PERFORM pg_notify('workflow_engine_runs', v_run_id);
   RETURN v_run_id;
 END;
 $$;
 
-COMMENT ON FUNCTION workflow_engine_enqueue(text, text, text, jsonb, jsonb, integer, text) IS
-  'Create a PENDING workflow run in the caller''s transaction. Mirrors the run.create kernel command; see sql/enqueue.sql for what it cannot do (input validation, definition-version stamping, stage config defaults).';
+COMMENT ON FUNCTION workflow_engine_enqueue(text, text, text, jsonb, jsonb, integer, text, text, jsonb) IS
+  'Create a PENDING workflow run in the caller''s transaction. Accepts optional tenant attribution and notifies workflow_engine_runs on commit. Mirrors run.create; see sql/enqueue.sql for what it cannot do (input validation, definition-version stamping, stage config defaults).';
+
+-- Restore any application-specific EXECUTE grants here.
+COMMIT;

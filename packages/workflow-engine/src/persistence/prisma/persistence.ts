@@ -484,6 +484,8 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
         input: data.input as unknown,
         config: (data.config ?? {}) as unknown,
         priority: data.priority ?? 5,
+        tenantId: data.tenantId,
+        labels: data.labels,
         metadata: (data.metadata ?? null) as unknown,
         // Only written when the schema has the column: on an unmigrated
         // database Prisma would reject the unknown argument and every
@@ -494,6 +496,20 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       },
     });
     return this.mapWorkflowRun(run);
+  }
+
+  async notifyRunCreated(workflowRunId: string): Promise<void> {
+    // A transaction-less port cannot tie a notification to the run's commit.
+    if (this.databaseType !== "postgresql" || !this.isOutboxTransaction) return;
+    const raw = rawFor(this.prisma, { sent: "int" });
+    if (raw.$queryRaw) {
+      await raw.$queryRaw`SELECT 1 AS sent FROM pg_notify('workflow_engine_runs', ${workflowRunId})`;
+    } else {
+      await raw.$queryRawUnsafe?.(
+        "SELECT 1 AS sent FROM pg_notify('workflow_engine_runs', $1)",
+        workflowRunId,
+      );
+    }
   }
 
   async updateRun(id: string, data: UpdateRunInput): Promise<void> {
@@ -2258,10 +2274,11 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
     key: string,
     commandType: string,
     result: unknown,
+    workflowRunId: string | null,
   ): Promise<void> {
     await this.prisma.idempotencyKey.update({
       where: { key_commandType: { key, commandType } },
-      data: { result: result as any },
+      data: { result: result as any, workflowRunId },
     });
   }
 
@@ -2294,6 +2311,8 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
       totalTokens: run.totalTokens,
       priority: run.priority,
       metadata: run.metadata ?? null,
+      tenantId: run.tenantId ?? null,
+      labels: run.labels ?? null,
       version: run.version ?? 0,
       definitionVersion: run.definitionVersion ?? null,
       redriveCount: run.redriveCount ?? 0,

@@ -267,10 +267,12 @@ describe(`signals in the same tick on ${realDatabase ? (sqlite ? "SQLite" : "Pos
     const key = JSON.stringify([t.stage.id, "approval"]);
     await ports.persistence.releaseIdempotencyKey(key, "step.signal.wake");
     await ports.persistence.acquireIdempotencyKey(key, "step.signal.wake");
-    await ports.persistence.completeIdempotencyKey(key, "step.signal.wake", {
-      signalled: true,
-      delivery: tick.getTime(),
-    });
+    await ports.persistence.completeIdempotencyKey(
+      key,
+      "step.signal.wake",
+      { signalled: true, delivery: tick.getTime() },
+      null,
+    );
     await t.park();
 
     await expect(t.signal("again")).resolves.toMatchObject({

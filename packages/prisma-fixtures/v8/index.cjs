@@ -7,12 +7,15 @@ const { join } = require("node:path");
 // engine's source, which this CommonJS package cannot load.
 // `max`: the most connections the client's pool opens (the suites' pool of
 // one), through a `pg` pool of the runtime's own `pg`.
-exports.createPostgresDb = (url, { max } = {}) => {
+exports.createPostgresDb = (url, { max, statusEnumName = "Status" } = {}) => {
   const runtime = require.resolve("@prisma/orm-postgres/runtime");
   const postgres = require(runtime).default;
   const { contractFromJson } = require("@prisma/orm-postgres/static");
   const contract = contractFromJson(
-    JSON.parse(readFileSync(join(__dirname, ".generated/contract.json"), "utf8")),
+    JSON.parse(
+      readFileSync(join(__dirname, ".generated/contract.json"), "utf8")
+        .replaceAll('"Status"', JSON.stringify(statusEnumName)),
+    ),
   );
   if (max === undefined) return postgres({ contract, url });
   const { Pool } = createRequire(runtime)("pg");

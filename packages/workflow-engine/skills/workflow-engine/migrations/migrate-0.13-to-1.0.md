@@ -19,7 +19,7 @@ The first real-world runs of the 1.0 alphas also found and fixed behaviour that 
 
 Verified against `git diff` of the package's `prisma/schema.prisma` between 0.13.0 and 1.0.0, plus every column the 1.0 Prisma adapters write. Apply in order; every statement is idempotent on Postgres (`IF NOT EXISTS`).
 
-On Prisma 8 there is no `schema.prisma` or generated client: update `prisma/contract.prisma` from the package's `contract.prisma`, run `npx prisma contract emit`, then `npx prisma db update` (or `npx prisma migration plan` and `npx prisma db migrate --advance-ref db`). Renaming one of the five descending indexes, or dropping and recreating it, brings it back ascending, and `db verify --strict` does not notice, so re-run `psql "$DATABASE_URL" -f node_modules/@bratsos/workflow-engine/prisma/mixed-order-indexes.sql` afterwards. (A change to an index's columns under the same name fails planning with `MIGRATION.PLANNING_FAILED` instead.) See [Prisma 8](../references/05-persistence-setup.md#prisma-8).
+On Prisma 8 there is no `schema.prisma` or generated client: update `prisma/contract.prisma` from the package's `contract.prisma`, run `npx prisma contract emit`, then `npx prisma db update` (or `npx prisma migration plan` and `npx prisma db migrate --advance-ref db`). Renaming one of the six descending indexes, or dropping and recreating it, brings it back ascending, and `db verify --strict` does not notice, so re-run `psql "$DATABASE_URL" -f node_modules/@bratsos/workflow-engine/prisma/mixed-order-indexes.sql` afterwards. (A change to an index's columns under the same name fails planning with `MIGRATION.PLANNING_FAILED` instead.) See [Prisma 8](../references/05-persistence-setup.md#prisma-8).
 
 - [ ] **Add the `workflow_steps` table** (new in 1.0; used by `createPrismaStepLedger`).
 
@@ -354,6 +354,99 @@ On Prisma 8 there is no `schema.prisma` or generated client: update `prisma/cont
   CREATE INDEX CONCURRENTLY IF NOT EXISTS "outbox_events_dlqAt_idx"
     ON "outbox_events" ("dlqAt");
   ```
+
+### Tenant attribution and SQL enqueue
+
+Add the nullable attribution columns and indexes before deploying the new
+clients. Existing rows have NULL in the new columns. Keep `ai_calls.prompt`
+and `ai_calls.response` required so older clients can still read every row.
+Use an empty string when a text value is omitted or cleared on expiry.
+`labels` has its own column, leaving the legacy metadata shim intact.
+
+The additive schema is rolling-safe with fresh connections or with prepared
+statement caching disabled. For PostgreSQL Prisma 6, stop old hosts first
+and close their cached connections before the migration, or roll them onto
+`statement_cache_size=0` ahead of it. The old run claim uses `RETURNING *`.
+A cached claim across the schema change fails with PostgreSQL `0A000`
+(`cached plan must not change result type`) until the connection is recycled.
+
+Use the updated schema or contract for your Prisma major. The SQL below
+adds the columns in a hand-written PostgreSQL migration.
+
+```sql
+ALTER TABLE "workflow_runs"
+  ADD COLUMN IF NOT EXISTS "tenantId" TEXT,
+  ADD COLUMN IF NOT EXISTS "labels" JSONB;
+ALTER TABLE "ai_calls"
+  ADD COLUMN IF NOT EXISTS "workflowRunId" TEXT,
+  ADD COLUMN IF NOT EXISTS "tenantId" TEXT,
+  ADD COLUMN IF NOT EXISTS "labels" JSONB,
+  ADD COLUMN IF NOT EXISTS "textExpiresAt" TIMESTAMP(3);
+ALTER TABLE "idempotency_keys"
+  ADD COLUMN IF NOT EXISTS "workflowRunId" TEXT;
+```
+
+On SQLite, add each column in its own statement. Use the declared types from
+your major's schema. Prisma 6 and 7 use `JSONB` for labels and `DATETIME` for
+`textExpiresAt`. Prisma 8 uses `TEXT` for both through its SQLite codecs.
+
+```sql
+ALTER TABLE "workflow_runs" ADD COLUMN "tenantId" TEXT;
+ALTER TABLE "workflow_runs" ADD COLUMN "labels" JSONB;
+ALTER TABLE "ai_calls" ADD COLUMN "workflowRunId" TEXT;
+ALTER TABLE "ai_calls" ADD COLUMN "tenantId" TEXT;
+ALTER TABLE "ai_calls" ADD COLUMN "labels" JSONB;
+ALTER TABLE "ai_calls" ADD COLUMN "textExpiresAt" DATETIME;
+ALTER TABLE "idempotency_keys" ADD COLUMN "workflowRunId" TEXT;
+```
+
+Create the following indexes on either database. Prisma 8 PostgreSQL users
+who generate a migration can set the sort directions for the new run index
+the same way as the other indexes in `mixed-order-indexes.sql`. On Prisma 8
+SQLite, the contract emits an ascending index. Scanning it backwards serves
+the same descending order within one tenant. To declare the directions in a
+hand-written migration, use the definition below.
+
+```sql
+CREATE INDEX IF NOT EXISTS "workflow_runs_tenantId_createdAt_id_idx"
+  ON "workflow_runs" ("tenantId", "createdAt" DESC, "id" DESC);
+CREATE INDEX IF NOT EXISTS "ai_calls_tenantId_createdAt_idx"
+  ON "ai_calls" ("tenantId", "createdAt");
+CREATE INDEX IF NOT EXISTS "ai_calls_workflowRunId_idx" ON "ai_calls" ("workflowRunId");
+CREATE INDEX IF NOT EXISTS "ai_calls_textExpiresAt_idx" ON "ai_calls" ("textExpiresAt");
+CREATE INDEX IF NOT EXISTS "idempotency_keys_workflowRunId_idx"
+  ON "idempotency_keys" ("workflowRunId");
+CREATE INDEX IF NOT EXISTS "idempotency_keys_createdAt_idx" ON "idempotency_keys" ("createdAt");
+```
+
+If you installed PostgreSQL's `workflow_engine_enqueue`, include the body of
+the new `sql/enqueue.sql` after the schema changes in the same migration. Use
+one transaction for the upgrade. If your migration already wraps its SQL in
+a transaction, omit the script's outer `BEGIN` and `COMMIT`. The new script
+drops the seven-argument function and creates the nine-argument function
+with two trailing defaults. Existing calls that omit the new parameters
+still work. Update any application wrapper that supplies the new parameters
+in the same migration.
+
+`DROP FUNCTION` drops the old signature's privileges. Restore your
+`EXECUTE` grants on the new signature before committing. This example grants
+execution to an application role named `app_role`.
+
+```sql
+GRANT EXECUTE ON FUNCTION
+  workflow_engine_enqueue(text, text, text, jsonb, jsonb, integer, text, text, jsonb)
+  TO app_role;
+```
+
+If your previous ACL revoked execution from `PUBLIC`, apply that revocation to
+the new signature in the same transaction.
+
+Custom persistence adapters receive the run ID as the fourth argument to
+`completeIdempotencyKey(key, commandType, result, workflowRunId)`. The argument
+is `null` when the caller has no run ID. Existing keys need no backfill. To
+identify older keys that lack the column value, use `result->>'workflowRunId'`
+where present. For older `job.execute` keys, the original job ID binds a
+`job:<jobId>:attempt:` prefix while the job rows still exist.
 
 ### Custom port implementations
 

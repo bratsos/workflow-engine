@@ -2422,10 +2422,12 @@ export function persistenceConformanceSuite(
 
       it("should return replay after completion", async () => {
         await persistence.acquireIdempotencyKey("idem-key-1", "run.create");
-        await persistence.completeIdempotencyKey("idem-key-1", "run.create", {
-          workflowRunId: "run-123",
-          status: "PENDING",
-        });
+        await persistence.completeIdempotencyKey(
+          "idem-key-1",
+          "run.create",
+          { workflowRunId: "run-123", status: "PENDING" },
+          "run-123",
+        );
 
         const replay = await persistence.acquireIdempotencyKey(
           "idem-key-1",
@@ -2453,9 +2455,12 @@ export function persistenceConformanceSuite(
 
       it("should scope idempotency keys by command type", async () => {
         await persistence.acquireIdempotencyKey("shared", "run.create");
-        await persistence.completeIdempotencyKey("shared", "run.create", {
-          type: "create",
-        });
+        await persistence.completeIdempotencyKey(
+          "shared",
+          "run.create",
+          { type: "create" },
+          null,
+        );
 
         const execute = await persistence.acquireIdempotencyKey(
           "shared",
@@ -2533,6 +2538,7 @@ export function persistenceConformanceSuite(
             {
               workflowRunId: "run-456",
             },
+            "run-456",
           );
 
           const muchLater = new Date(start.getTime() + 24 * 60 * 60 * 1000);

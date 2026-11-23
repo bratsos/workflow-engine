@@ -278,6 +278,8 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
       totalTokens: 0,
       priority: data.priority ?? 5,
       metadata: data.metadata ?? null,
+      tenantId: data.tenantId ?? null,
+      labels: data.labels ?? null,
       definitionVersion: data.definitionVersion ?? null,
       redriveCount: 0,
     };
@@ -1032,6 +1034,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
     key: string,
     commandType: string,
     result: unknown,
+    workflowRunId: string | null,
   ): Promise<void> {
     const compositeKey = this.idempotencyCompositeKey(commandType, key);
     this.idempotencyInProgress.delete(compositeKey);
@@ -1039,6 +1042,7 @@ export class InMemoryWorkflowPersistence implements WorkflowPersistence {
       key,
       commandType,
       result,
+      workflowRunId,
       createdAt: this.now(),
     });
   }

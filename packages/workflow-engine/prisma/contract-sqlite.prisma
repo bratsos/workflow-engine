@@ -26,6 +26,8 @@ model WorkflowRun {
   totalCost    Float     @default(0)
   totalTokens  Int       @default(0)
   priority     Int       @default(5)
+  tenantId     String?
+  labels       Json?
   metadata     Json?
 
   // The definition version this run is pinned to. NULL means the run was
@@ -43,7 +45,7 @@ model WorkflowRun {
   annotations WorkflowAnnotation[]
 
   // List orderings. Every "recent runs" view -- the console's included --
-  // is newest-first, optionally narrowed by status or workflow, and pages
+  // is newest-first, optionally narrowed by status, workflow or tenant, and pages
   // on the keyset (createdAt, id), so the tiebreaker travels in the index
   // and a page is one index range scan with no sort node. These replace
   // the bare @@index([status]) / @@index([workflowId]): a composite whose
@@ -52,6 +54,7 @@ model WorkflowRun {
   @@index([createdAt, id])
   @@index([status, createdAt, id])
   @@index([workflowId, createdAt, id])
+  @@index([tenantId, createdAt, id], map: "workflow_runs_tenantId_createdAt_id_idx")
   // The claim: status = 'PENDING' ORDER BY priority DESC, "createdAt" ASC
   // LIMIT 1 FOR UPDATE SKIP LOCKED, run maxClaimsPerTick times per tick
   // per host. The same shape job_queue already indexes, and it needs its
@@ -224,11 +227,18 @@ model AICall {
   reasoningTokens   Int?
   batchId       String?
   requestId     String?
+  workflowRunId String?
+  tenantId      String?
+  labels        Json?
+  textExpiresAt DateTime?
   metadata      Json?
 
   @@unique([batchId, requestId], map: "ai_calls_batch_request_unique")
   @@index([batchId])
   @@index([topic])
+  @@index([tenantId, createdAt], map: "ai_calls_tenantId_createdAt_idx")
+  @@index([workflowRunId], map: "ai_calls_workflowRunId_idx")
+  @@index([textExpiresAt], map: "ai_calls_textExpiresAt_idx")
   @@map("ai_calls")
 }
 
@@ -346,9 +356,12 @@ model IdempotencyKey {
   createdAt   DateTime @default(now()) @onCreate(now())
   key         String
   commandType String
+  workflowRunId String?
   result      Json
 
   @@unique([key, commandType])
+  @@index([workflowRunId], map: "idempotency_keys_workflowRunId_idx")
+  @@index([createdAt], map: "idempotency_keys_createdAt_idx")
   @@map("idempotency_keys")
 }
 

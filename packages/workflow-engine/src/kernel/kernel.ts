@@ -383,6 +383,7 @@ export function createKernel(config: KernelConfig): Kernel {
   async function withIdempotency<R>(
     key: string | undefined,
     commandType: string,
+    getWorkflowRunId: (result: R) => string | null,
     fn: () => Promise<R>,
     completedInTransaction: () => boolean = () => false,
   ): Promise<R> {
@@ -403,7 +404,12 @@ export function createKernel(config: KernelConfig): Kernel {
     try {
       const result = await fn();
       if (!completedInTransaction()) {
-        await persistence.completeIdempotencyKey(key, commandType, result);
+        await persistence.completeIdempotencyKey(
+          key,
+          commandType,
+          result,
+          getWorkflowRunId(result),
+        );
       }
       return result;
     } catch (error) {
@@ -504,10 +510,15 @@ export function createKernel(config: KernelConfig): Kernel {
     // execution does not hold a database transaction open.
     // -----------------------------------------------------------------
     if (command.type === "job.execute") {
-      return withIdempotency(command.idempotencyKey, command.type, async () => {
-        const result = await handleJobExecute(command, deps);
-        return stripEvents(result);
-      });
+      return withIdempotency(
+        command.idempotencyKey,
+        command.type,
+        () => command.workflowRunId,
+        async () => {
+          const result = await handleJobExecute(command, deps);
+          return stripEvents(result);
+        },
+      );
     }
 
     // -----------------------------------------------------------------
@@ -515,11 +526,18 @@ export function createKernel(config: KernelConfig): Kernel {
     // handler + append outbox events in one transaction.
     // -----------------------------------------------------------------
     const idempotencyKey = getIdempotencyKey(command);
+    const getWorkflowRunId = (result: AnyCommandResult) =>
+      command.type === "run.create"
+        ? (result as RunCreateResult).workflowRunId
+        : "workflowRunId" in command
+          ? command.workflowRunId
+          : null;
 
     let completedInTransaction = false;
     return withIdempotency(
       idempotencyKey,
       command.type,
+      getWorkflowRunId,
       async () => {
         let postCommit: ((deps: KernelDeps) => Promise<unknown>) | undefined;
 
@@ -612,8 +630,14 @@ export function createKernel(config: KernelConfig): Kernel {
               idempotencyKey,
               command.type,
               stripped,
+              getWorkflowRunId(stripped),
             );
             completedHere = true;
+          }
+          if (command.type === "run.create") {
+            await tx.notifyRunCreated?.(
+              (stripped as RunCreateResult).workflowRunId,
+            );
           }
           return stripped;
         });
