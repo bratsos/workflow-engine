@@ -37,7 +37,15 @@ export async function writeRetentionSql(
   throw new Error("Erasure and retention require a Prisma raw write method");
 }
 
-type PruneClause = "aiCalls" | "aiCallText" | "outbox" | "idempotencyKeys";
+/** The command type of a run writer's registration in `idempotency_keys`. */
+export const RUN_WRITER = "run.write";
+
+type PruneClause =
+  | "aiCalls"
+  | "aiCallText"
+  | "outbox"
+  | "idempotencyKeys"
+  | "runWriters";
 
 export function pruneRows(
   prisma: EnginePrismaClient,
@@ -53,8 +61,10 @@ export function pruneRows(
     column: string,
     filter: string,
     index?: string,
+    // SQLite only: the index its select must walk, whatever statistics say.
+    hint = index,
   ) => {
-    const from = `"${table}"${index && !pg ? ` INDEXED BY "${index}"` : ""}`;
+    const from = `"${table}"${hint && !pg ? ` INDEXED BY "${hint}"` : ""}`;
     // On PostgreSQL the eligible expression index is the ordered path for
     // these queries. The general age index cannot serve their order.
     const age =
@@ -68,7 +78,11 @@ export function pruneRows(
   const selected = (query: string) =>
     pg ? `"id" = ANY(ARRAY(${query}))` : `"id" IN (${query})`;
   // SQLite takes the statement's writer lock before selecting candidates.
-  // Keep its outer mutation on the primary key, even with skewed statistics.
+  // Keep its outer mutation on the primary key, even with skewed statistics:
+  // after an ANALYZE of a near-empty table the planner scans the table for
+  // `"id" IN (...)`, and for `rowid IN (...)` as well, so it is told the index.
+  const target = (table: string) =>
+    `"${table}"${pg ? "" : ` INDEXED BY "sqlite_autoindex_${table}_1"`}`;
   // PostgreSQL rechecks rows changed concurrently through a sub-select, which
   // no index or partial index predicate can match: statistics taken before a
   // backlog became eligible cannot route the mutation through that backlog.
@@ -76,15 +90,15 @@ export function pruneRows(
   let sql: string;
   switch (clause) {
     case "aiCalls":
-      sql = `DELETE FROM "ai_calls" WHERE ${selected(candidates("ai_calls", "createdAt", ""))}`;
+      sql = `DELETE FROM ${target("ai_calls")} WHERE ${selected(candidates("ai_calls", "createdAt", "", undefined, "ai_calls_createdAt_idx"))}`;
       break;
     case "aiCallText": {
       const metadata = pg
         ? `CASE WHEN jsonb_typeof("metadata") = 'object' THEN "metadata" - 'instructions' ELSE "metadata" END`
         : `CASE WHEN json_type("metadata") = 'object' THEN json_remove("metadata", '$.instructions') ELSE "metadata" END`;
-      sql = `UPDATE "ai_calls" SET "prompt" = '', "response" = '',
+      sql = `UPDATE ${target("ai_calls")} SET "prompt" = '', "response" = '',
         "metadata" = ${metadata}, "textExpiresAt" = NULL
-        WHERE ${selected(candidates("ai_calls", "textExpiresAt", ""))}${recheck(`"textExpiresAt" <= ${cutoff}`)}`;
+        WHERE ${selected(candidates("ai_calls", "textExpiresAt", "", undefined, "ai_calls_textExpiresAt_idx"))}${recheck(`"textExpiresAt" <= ${cutoff}`)}`;
       break;
     }
     case "outbox": {
@@ -104,7 +118,7 @@ export function pruneRows(
              AND r."status" IN ('COMPLETED', 'FAILED', 'CANCELLED')
            FOR NO KEY UPDATE OF r SKIP LOCKED`
         : batch;
-      sql = `DELETE FROM "outbox_events" WHERE ${selected(eligible)}
+      sql = `DELETE FROM ${target("outbox_events")} WHERE ${selected(eligible)}
         ${recheck(`${indexed} AND "publishedAt" <= ${cutoff}`)}`;
       break;
     }
@@ -112,9 +126,18 @@ export function pruneRows(
       const completed = pg
         ? `("result"->>'__workflowEngineState') IS DISTINCT FROM 'in_progress'`
         : `json_extract("result", '$.__workflowEngineState') IS NOT 'in_progress'`;
-      sql = `DELETE FROM "idempotency_keys" WHERE
+      sql = `DELETE FROM ${target("idempotency_keys")} WHERE
         ${selected(candidates("idempotency_keys", "createdAt", `AND ${completed}`, "idempotency_keys_prune_idx"))}
         ${recheck(`"createdAt" <= ${cutoff} AND ${completed}`)}`;
+      break;
+    }
+    case "runWriters": {
+      // `date` is the lease cutoff: a registration last refreshed before it
+      // no longer counts as a writer, and its process is not coming back.
+      const writer = `AND "commandType" = '${RUN_WRITER}'`;
+      sql = `DELETE FROM ${target("idempotency_keys")} WHERE
+        ${selected(candidates("idempotency_keys", "createdAt", writer, "idempotency_keys_writer_prune_idx"))}
+        ${recheck(`"createdAt" <= ${cutoff} ${writer}`)}`;
       break;
     }
   }

@@ -1,0 +1,7 @@
+---
+"@bratsos/workflow-engine": patch
+---
+
+A run writer whose lease lapsed can no longer revive it. `refreshRunWrite` renews a registration only while it was refreshed within `RUN_WRITE_LEASE_MS`; a writer that stalled for longer than that, after targeted erasure saw no writer, falls back to a registration of its own, which is refused once the run has ended or is gone, so it cannot write behind the erasure. `engine.prune` with `idempotencyKeys` now also removes run writer registrations older than the lease, such as those a crashed host left, within the clause's limit. On SQLite, every `engine.prune` clause now reads and mutates its rows through named indexes (the primary key, `ai_calls_createdAt_idx`, `ai_calls_textExpiresAt_idx`), so statistics taken while a table was small no longer turn a prune into a scan of the whole table.
+
+The change is **rolling-safe**: it adds no column and changes no command. Old and new hosts can run side by side, because the refresh condition only narrows what a host may renew and a host without it keeps registering as before. Pruning the registrations needs the additive partial index `idempotency_keys_writer_prune_idx` from the updated `sql/retention-eligibility.postgresql.sql` or `sql/retention-eligibility.sqlite.sql` (`CREATE INDEX IF NOT EXISTS`, so running the script again is safe). Add it before dispatching `engine.prune` with `idempotencyKeys` from the new version: on SQLite that clause fails without it, and on PostgreSQL it loses its bound.

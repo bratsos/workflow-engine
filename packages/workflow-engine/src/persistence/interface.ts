@@ -879,7 +879,11 @@ export interface PersistenceCore {
     token: string,
     options?: { unchecked?: boolean },
   ): Promise<boolean>;
-  /** Renew the registration's lease; `false` when it no longer exists. */
+  /**
+   * Renew the registration's lease; `false` when it no longer exists or its
+   * lease had already lapsed, which is never revived: erasure may have seen
+   * no writer by then.
+   */
   refreshRunWrite?(token: string): Promise<boolean>;
   endRunWrite?(token: string): Promise<void>;
   /** Whether a registration refreshed within `RUN_WRITE_LEASE_MS` exists. */

@@ -68,7 +68,12 @@ import {
   rawFor,
   validateDatabaseType,
 } from "./prisma-client-type";
-import { prefixRange, pruneRows, writeRetentionSql } from "./retention-sql.js";
+import {
+  prefixRange,
+  pruneRows,
+  RUN_WRITER,
+  writeRetentionSql,
+} from "./retention-sql.js";
 import {
   isSerializationFailure,
   isSqliteBusy,
@@ -223,8 +228,6 @@ function truthy(value: unknown): boolean {
   if (typeof value === "number") return value !== 0;
   return false;
 }
-
-const RUN_WRITER = "run.write";
 
 const IDEMPOTENCY_IN_PROGRESS_MARKER = {
   __workflowEngineState: "in_progress",
@@ -700,9 +703,15 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
   }
 
   async refreshRunWrite(token: string): Promise<boolean> {
+    const now = this.now();
+    // A lapsed lease stays lapsed: erasure may already have seen no writers.
     const { count } = await this.prisma.idempotencyKey.updateMany({
-      where: { key: token, commandType: RUN_WRITER },
-      data: { createdAt: this.now() },
+      where: {
+        key: token,
+        commandType: RUN_WRITER,
+        createdAt: { gt: new Date(now.getTime() - RUN_WRITE_LEASE_MS) },
+      },
+      data: { createdAt: now },
     });
     return count > 0;
   }
@@ -853,12 +862,26 @@ export class PrismaWorkflowPersistence implements WorkflowPersistence {
   }
 
   async pruneIdempotencyKeys(olderThan: Date, limit: number): Promise<number> {
-    return pruneRows(
+    const completed = await pruneRows(
       this.prisma,
       this.databaseType,
       "idempotencyKeys",
       olderThan,
       limit,
+    );
+    if (completed >= limit) return completed;
+    // Registrations of writers that stopped refreshing them, such as a host
+    // that crashed. Live ones are in progress and are never pruned.
+    const lapsed = new Date(this.now().getTime() - RUN_WRITE_LEASE_MS);
+    return (
+      completed +
+      (await pruneRows(
+        this.prisma,
+        this.databaseType,
+        "runWriters",
+        lapsed,
+        limit - completed,
+      ))
     );
   }
 
