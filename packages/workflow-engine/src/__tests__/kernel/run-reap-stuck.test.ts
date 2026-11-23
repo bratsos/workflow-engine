@@ -40,9 +40,12 @@ function createSimpleWorkflow(id: string = "test-workflow") {
 describe("kernel: run.reapStuck", () => {
   it("marks stuck RUNNING run as FAILED when no activity past threshold", async () => {
     const workflow = createSimpleWorkflow();
-    const { kernel, persistence, clock } = createTestKernel([workflow], {
-      clockStart: new Date(),
-    });
+    const { kernel, persistence, jobTransport, clock } = createTestKernel(
+      [workflow],
+      {
+        clockStart: new Date(),
+      },
+    );
 
     await kernel.dispatch({
       type: "run.create",
@@ -51,6 +54,7 @@ describe("kernel: run.reapStuck", () => {
       input: { data: "hello" },
     });
     await kernel.dispatch({ type: "run.claimPending", workerId: "w1" });
+    await jobTransport.dequeue();
 
     // Advance clock past stuck threshold
     clock.advance(10 * 60 * 1000); // 10 minutes
@@ -162,7 +166,7 @@ describe("kernel: run.reapStuck", () => {
 
   it("reports transitioned equal to failed (the only transition it performs)", async () => {
     const workflow = createSimpleWorkflow();
-    const { kernel, clock } = createTestKernel([workflow], {
+    const { kernel, jobTransport, clock } = createTestKernel([workflow], {
       clockStart: new Date(),
     });
 
@@ -173,6 +177,7 @@ describe("kernel: run.reapStuck", () => {
       input: { data: "hello" },
     });
     await kernel.dispatch({ type: "run.claimPending", workerId: "w1" });
+    await jobTransport.dequeue();
 
     clock.advance(10 * 60 * 1000);
 
@@ -411,9 +416,12 @@ describe("kernel: run.reapStuck", () => {
 describe("kernel: run.reapStuck dropped-transition heal", () => {
   it("heals a wedged run (all stages terminal, transition dropped) instead of failing it", async () => {
     const workflow = createSimpleWorkflow();
-    const { kernel, persistence, clock } = createTestKernel([workflow], {
-      clockStart: new Date(),
-    });
+    const { kernel, persistence, jobTransport, clock } = createTestKernel(
+      [workflow],
+      {
+        clockStart: new Date(),
+      },
+    );
 
     const { workflowRunId } = await kernel.dispatch({
       type: "run.create",
@@ -423,6 +431,7 @@ describe("kernel: run.reapStuck dropped-transition heal", () => {
     });
     await kernel.dispatch({ type: "run.claimPending", workerId: "w1" });
 
+    const job = (await jobTransport.dequeue())!;
     // Execute the only stage, but never fire run.transition — the state a
     // dead host (or a double stale-claim noop) leaves behind: every stage
     // terminal, run still RUNNING.
@@ -433,6 +442,8 @@ describe("kernel: run.reapStuck dropped-transition heal", () => {
       stageId: "stage-1",
       config: {},
     });
+
+    await jobTransport.complete(job.jobId);
 
     clock.advance(10 * 60 * 1000);
 
@@ -487,6 +498,7 @@ describe("kernel: run.reapStuck leaves a run that is waiting on a later poll", (
       input: {},
     });
     await env.kernel.dispatch({ type: "run.claimPending", workerId: "w1" });
+    const job = (await env.jobTransport.dequeue())!;
     await env.kernel.dispatch({
       type: "job.execute",
       workflowRunId,
@@ -496,6 +508,7 @@ describe("kernel: run.reapStuck leaves a run that is waiting on a later poll", (
     });
     const suspended = await env.persistence.getStage(workflowRunId, stage.id);
     expect(suspended!.status).toBe("SUSPENDED");
+    await env.jobTransport.suspend(job.jobId, suspended!.nextPollAt!);
     return { ...env, clock, workflowRunId, stage: suspended! };
   }
 

@@ -2,6 +2,7 @@ import { StaleVersionError } from "../../persistence/interface.js";
 import type { RunReapStuckCommand, RunReapStuckResult } from "../commands";
 import type { KernelEvent } from "../events";
 import { servesRun } from "../helpers/definition-pinning.js";
+import { HOST_DEFAULTS } from "../helpers/host-support.js";
 import {
   enqueueForLiveRun,
   stageJobOptions,
@@ -18,17 +19,17 @@ export async function handleRunReapStuck(
 ): Promise<HandlerResult<RunReapStuckResult>> {
   const events: KernelEvent[] = [];
   const postCommits: Array<(deps: KernelDeps) => Promise<unknown>> = [];
-  const stuckSince = new Date(
-    deps.clock.now().getTime() - command.stuckThresholdMs,
-  );
+  const now = deps.clock.now().getTime();
+  const stuckSince = new Date(now - command.stuckThresholdMs);
+  const legacyLeaseCutoff =
+    now -
+    (command.staleLeaseThresholdMs ?? HOST_DEFAULTS.staleLeaseThresholdMs);
 
   const stuckRuns = await deps.persistence.getStuckRuns(stuckSince);
   let failed = 0;
   let healed = 0;
 
   for (const run of stuckRuns) {
-    const stages = await deps.persistence.getStagesByRun(run.id);
-
     // Status guard: only update if run is still RUNNING to avoid
     // overwriting a run that recovered between query and update.
     const currentStatus = await deps.persistence.getRunStatus(run.id);
@@ -49,6 +50,24 @@ export async function handleRunReapStuck(
       continue;
     }
 
+    const jobs = await deps.jobTransport.getJobsByWorkflowRun(run.id, {
+      includePayload: false,
+    });
+    if (
+      jobs.some(
+        (job) =>
+          job.status === "PENDING" ||
+          (job.status === "RUNNING" &&
+            (job.leaseExpiresAt
+              ? job.leaseExpiresAt.getTime() >= now
+              : job.lockedAt !== null &&
+                job.lockedAt.getTime() >= legacyLeaseCutoff)),
+      )
+    ) {
+      continue;
+    }
+
+    const stages = await deps.persistence.getStagesByRun(run.id);
     // Recovery sweep: a PENDING stage with no queued job means the run
     // isn't actually dead, it's just missing the job that job.execute
     // needs to pick it up — the classic symptom of the enqueue-outside-
@@ -58,7 +77,6 @@ export async function handleRunReapStuck(
     // instead of failing the run.
     const pendingStages = stages.filter((s) => s.status === "PENDING");
     if (pendingStages.length > 0) {
-      const jobs = await deps.jobTransport.getJobsByWorkflowRun(run.id);
       const missingJobStages = pendingStages.filter(
         (stage) =>
           !jobs.some(

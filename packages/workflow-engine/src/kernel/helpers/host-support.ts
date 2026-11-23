@@ -847,6 +847,7 @@ export async function runMaintenanceTick(
   try {
     const reapStuckResult = await kernel.dispatch({
       type: "run.reapStuck",
+      staleLeaseThresholdMs,
       stuckThresholdMs: HOST_DEFAULTS.computeStuckThresholdMs(
         staleLeaseThresholdMs,
       ),

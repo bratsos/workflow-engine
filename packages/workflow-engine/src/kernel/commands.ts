@@ -492,6 +492,8 @@ export interface PluginReplayDLQResult {
 export interface RunReapStuckCommand {
   readonly type: "run.reapStuck";
   readonly stuckThresholdMs: number;
+  /** Fallback lease threshold for jobs without a recorded deadline. */
+  readonly staleLeaseThresholdMs?: number;
 }
 
 /** Result of a `run.reapStuck` command. */

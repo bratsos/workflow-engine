@@ -225,5 +225,71 @@ describe.skipIf(!realDatabase)(
         .poll(async () => (await db.persistence.getRun(id))?.status, poll)
         .toBe("COMPLETED");
     });
+
+    it("keeps old runs with queued or leased jobs and restores policy on a missing job", async () => {
+      const gate = Promise.withResolvers<void>();
+      const workflow = defineWorkflow("stuck", {
+        input: schemas.input,
+        leaseTimeoutMs: 120_000,
+        jobRetry: { maxAttempts: 7, backoff: { initialDelayMs: 42 } },
+      })
+        .stage("work", {
+          schemas,
+          async execute() {
+            await gate.promise;
+            return { output: {} };
+          },
+        })
+        .build();
+      const { host, kernel } = makeHost([workflow]);
+      const active = await createRun(kernel, workflow.id);
+      const waiting = await createRun(kernel, workflow.id);
+      const missing = await createRun(kernel, workflow.id);
+      await kernel.dispatch({
+        type: "run.claimPending",
+        workerId: "runtime-1",
+        maxClaims: 3,
+      });
+      await db.client.jobQueue.deleteMany({
+        where: { workflowRunId: missing },
+      });
+      const reap = () =>
+        kernel.dispatch({ type: "run.reapStuck", stuckThresholdMs: 1000 });
+      const age = async (ids: string[]) => {
+        const data = { updatedAt: new Date(0) };
+        await db.client.workflowRun.updateMany({
+          where: { id: { in: ids } },
+          data,
+        });
+        await db.client.workflowStage.updateMany({
+          where: { workflowRunId: { in: ids } },
+          data,
+        });
+      };
+      try {
+        await age([active, waiting, missing]);
+        expect(await reap()).toMatchObject({ failed: 0 });
+        expect(await jobOf(missing)).toMatchObject({
+          maxAttempts: 7,
+          retryPolicy: { initialDelayMs: 42 },
+          leaseTimeoutMs: 120_000,
+        });
+        await host.start();
+        await expect
+          .poll(
+            async () =>
+              db.client.jobQueue.count({ where: { status: "RUNNING" } }),
+            poll,
+          )
+          .toBe(1);
+        await age([active, waiting, missing]);
+        expect(await reap()).toMatchObject({ failed: 0 });
+        expect(
+          await db.client.workflowRun.count({ where: { status: "RUNNING" } }),
+        ).toBe(3);
+      } finally {
+        gate.resolve();
+      }
+    });
   },
 );
