@@ -31,6 +31,9 @@ import { owedCancelScenarios } from "./utils/owed-cancel-scenarios.js";
 
 const BURST = 100;
 
+// Bun's node:sqlite close() leaves the connection (locks, WAL membership) open until its statements are collected.
+const bun = !!process.versions.bun;
+
 /** A one-stage workflow whose body waits for `finish(0, "succeed")`. */
 function gatedWorkflow() {
   const schema = z.object({ value: z.string() });
@@ -650,36 +653,40 @@ describe
     );
 
     // The mode can change after the first commit: the next commit follows it.
-    it("follows a journal mode changed after the client's first commit", async () => {
-      const other = mode === "wal" ? "delete" : "wal";
-      const journal = (to: string) =>
-        db.client
-          .$withColumns({ journal_mode: "text" })
-          .$queryRawUnsafe(`PRAGMA journal_mode = ${to}`);
-      try {
-        await journal(other);
-        let done = false;
-        const reads = Array.from({ length: 3 }, async () => {
-          while (!done) await db.persistence.getRunsByStatus("PENDING");
-        });
-        const created = await db.kernel
-          .dispatch({
-            type: "run.create",
-            idempotencyKey: `switched-${mode}`,
-            workflowId: db.workflow.id,
-            input: { value: "switched" },
-          })
-          .then(
-            () => "ok",
-            (error: unknown) => error,
-          );
-        done = true;
-        await Promise.all(reads);
-        expect(created).toBe("ok");
-      } finally {
-        await journal(mode);
-      }
-    }, 120_000);
+    it.skipIf(bun)(
+      "follows a journal mode changed after the client's first commit",
+      async () => {
+        const other = mode === "wal" ? "delete" : "wal";
+        const journal = (to: string) =>
+          db.client
+            .$withColumns({ journal_mode: "text" })
+            .$queryRawUnsafe(`PRAGMA journal_mode = ${to}`);
+        try {
+          await journal(other);
+          let done = false;
+          const reads = Array.from({ length: 3 }, async () => {
+            while (!done) await db.persistence.getRunsByStatus("PENDING");
+          });
+          const created = await db.kernel
+            .dispatch({
+              type: "run.create",
+              idempotencyKey: `switched-${mode}`,
+              workflowId: db.workflow.id,
+              input: { value: "switched" },
+            })
+            .then(
+              () => "ok",
+              (error: unknown) => error,
+            );
+          done = true;
+          await Promise.all(reads);
+          expect(created).toBe("ok");
+        } finally {
+          await journal(mode);
+        }
+      },
+      120_000,
+    );
 
     it("does not hold back a root read made inside a transaction's own callback", async () => {
       let early: Promise<unknown> | undefined;
@@ -773,9 +780,11 @@ describe.skipIf(!sqlite || process.env.PRISMA_MAJOR !== "8")(
       rows,
     });
 
-    it.each(
-      vias.flatMap((via) => spellings.map((statement) => [via, statement])),
-    )(
+    it
+      .skipIf(bun)
+      .each(
+        vias.flatMap((via) => spellings.map((statement) => [via, statement])),
+      )(
       "keeps every row and index of the file, switched through %s with %j",
       async (via, statement) => {
         const db = await kernelDatabase();
@@ -798,43 +807,45 @@ describe.skipIf(!sqlite || process.env.PRISMA_MAJOR !== "8")(
     );
 
     // An unqualified `journal_mode` change reaches every attached database.
-    it.each(
-      vias,
-    )("keeps every row of an attached database, switched through %s", async (via) => {
-      const db = await kernelDatabase();
-      try {
-        await send(db, "the wrapped client", "PRAGMA journal_mode = WAL");
-        const aux = `${db.file}.aux`;
-        const seed = new DatabaseSync(aux);
-        seed.exec(
-          "CREATE TABLE r (id TEXT PRIMARY KEY, a TEXT); CREATE INDEX ra ON r(a); PRAGMA journal_mode = WAL",
-        );
-        for (let i = 0; i < 70; i++)
-          seed.prepare("INSERT INTO r VALUES (?, ?)").run(`id${i}`, `x${i}`);
-        seed.close();
-        const exec = (statement: string) =>
-          db.native.execute(
-            db.native.raw.sql([statement]).affectedCount().build(),
+    it.skipIf(bun).each(vias)(
+      "keeps every row of an attached database, switched through %s",
+      async (via) => {
+        const db = await kernelDatabase();
+        try {
+          await send(db, "the wrapped client", "PRAGMA journal_mode = WAL");
+          const aux = `${db.file}.aux`;
+          const seed = new DatabaseSync(aux);
+          seed.exec(
+            "CREATE TABLE r (id TEXT PRIMARY KEY, a TEXT); CREATE INDEX ra ON r(a); PRAGMA journal_mode = WAL",
           );
-        await exec(`ATTACH DATABASE '${aux}' AS aux`);
-        await db.native
-          .query(
-            db.native.raw
-              .sql(["SELECT id FROM aux.r"])
-              .returnsRow({ id: "sqlite/text@1" })
-              .build(),
-          )
-          .toArray();
-        const other = new DatabaseSync(aux);
-        other.exec("INSERT INTO r VALUES ('engine', 'xe')");
-        other.close();
-        await send(db, via, "PRAGMA journal_mode = DELETE");
-        await exec("INSERT INTO aux.r VALUES ('root', 'xr')");
-        expect(stored(aux, "r")).toEqual(intact(72));
-      } finally {
-        await db.close();
-      }
-    }, 60_000);
+          for (let i = 0; i < 70; i++)
+            seed.prepare("INSERT INTO r VALUES (?, ?)").run(`id${i}`, `x${i}`);
+          seed.close();
+          const exec = (statement: string) =>
+            db.native.execute(
+              db.native.raw.sql([statement]).affectedCount().build(),
+            );
+          await exec(`ATTACH DATABASE '${aux}' AS aux`);
+          await db.native
+            .query(
+              db.native.raw
+                .sql(["SELECT id FROM aux.r"])
+                .returnsRow({ id: "sqlite/text@1" })
+                .build(),
+            )
+            .toArray();
+          const other = new DatabaseSync(aux);
+          other.exec("INSERT INTO r VALUES ('engine', 'xe')");
+          other.close();
+          await send(db, via, "PRAGMA journal_mode = DELETE");
+          await exec("INSERT INTO aux.r VALUES ('root', 'xr')");
+          expect(stored(aux, "r")).toEqual(intact(72));
+        } finally {
+          await db.close();
+        }
+      },
+      60_000,
+    );
 
     // The change fails busy after the 5 s wait; nothing may stay open on the root.
     it.each(

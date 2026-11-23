@@ -30,6 +30,8 @@ const require = createRequire(import.meta.url);
 // Every suite here is for Prisma 8. The Prisma 6 and 7 floor (Node 22.12) has
 // no node:sqlite to load, and a skipped suite still evaluates this file.
 const prisma8 = process.env.PRISMA_MAJOR === "8";
+// Bun's node:sqlite close() leaves the connection (locks, WAL membership) open until its statements are collected.
+const bun = !!process.versions.bun;
 const { DatabaseSync } = prisma8 ? require("node:sqlite") : ({} as any);
 const fixtureDir = process.env.PRISMA8_SQLITE_FIXTURE
   ? resolve(process.env.PRISMA8_SQLITE_FIXTURE)
@@ -1771,101 +1773,104 @@ describe
       if (dir) rmSync(dir, { recursive: true, force: true });
     });
 
-    it("acknowledges no root write it then loses", async () => {
-      const timeout = (ms: number) =>
-        prisma
-          .$withColumns({ timeout: "int" })
-          .$queryRawUnsafe(`PRAGMA busy_timeout = ${ms}`);
-      // Another connection keeps the root out: it holds the file (rollback
-      // journal), or takes it over to switch to WAL with exclusive locking, as
-      // another process starting on the file would.
-      const holder = new DatabaseSync(file);
-      if (mode === "delete") holder.exec("BEGIN EXCLUSIVE");
-      else {
-        holder.exec("PRAGMA journal_mode = WAL");
-        holder.exec("PRAGMA locking_mode = EXCLUSIVE");
-        holder.prepare("SELECT count(*) FROM sqlite_master").all();
-      }
-      await timeout(1);
-      expect(
-        isSqliteBusy(
-          await prisma.workflowRun.findMany().catch((e: unknown) => e),
-        ),
-      ).toBe(true);
-      // A write that needs no rows back fails BUSY too, and leaves nothing behind.
-      expect(
-        isSqliteBusy(
-          await prisma
-            .$withColumns({})
-            .$queryRawUnsafe(
-              "WITH q AS (SELECT 1) UPDATE workflow_runs SET priority = 9 WHERE id = 'seed'",
-            )
-            .catch((e: unknown) => e),
-        ),
-      ).toBe(true);
-      if (mode === "delete") holder.exec("COMMIT");
-      holder.close();
-      // In WAL another connection commits after the root's snapshot was pinned.
-      if (mode === "wal") observer.exec("INSERT INTO probe VALUES (1)");
-      await timeout(5000);
-
-      const writes: Array<[string, () => Promise<unknown>]> = [
-        ["create", () => prisma.workflowRun.create({ data: run("created") })],
-        [
-          "raw RETURNING",
-          () =>
-            prisma
-              .$withColumns({ id: "text" })
-              .$queryRawUnsafe(
-                "UPDATE workflow_runs SET priority = 4 WHERE id = 'seed' RETURNING id",
-              ),
-        ],
-        [
-          "raw CTE",
-          () =>
-            prisma
+    it.skipIf(bun && mode === "wal")(
+      "acknowledges no root write it then loses",
+      async () => {
+        const timeout = (ms: number) =>
+          prisma
+            .$withColumns({ timeout: "int" })
+            .$queryRawUnsafe(`PRAGMA busy_timeout = ${ms}`);
+        // Another connection keeps the root out: it holds the file (rollback
+        // journal), or takes it over to switch to WAL with exclusive locking, as
+        // another process starting on the file would.
+        const holder = new DatabaseSync(file);
+        if (mode === "delete") holder.exec("BEGIN EXCLUSIVE");
+        else {
+          holder.exec("PRAGMA journal_mode = WAL");
+          holder.exec("PRAGMA locking_mode = EXCLUSIVE");
+          holder.prepare("SELECT count(*) FROM sqlite_master").all();
+        }
+        await timeout(1);
+        expect(
+          isSqliteBusy(
+            await prisma.workflowRun.findMany().catch((e: unknown) => e),
+          ),
+        ).toBe(true);
+        // A write that needs no rows back fails BUSY too, and leaves nothing behind.
+        expect(
+          isSqliteBusy(
+            await prisma
               .$withColumns({})
               .$queryRawUnsafe(
-                "WITH q AS (SELECT 1) UPDATE workflow_runs SET \"workflowName\" = 'cte' WHERE id = 'seed'",
-              ),
-        ],
-        [
-          "deleteMany",
-          () => prisma.workflowRun.deleteMany({ where: { id: "created" } }),
-        ],
-      ];
-      const committed = () =>
-        observer
-          .prepare(
-            'SELECT id, priority, "workflowName" AS name FROM workflow_runs ORDER BY id',
-          )
-          .all()
-          .map((r: any) => `${r.id}:${r.priority}:${r.name}`);
-      const outcomes: string[] = [];
-      for (const [name, write] of writes) {
-        const before = committed();
-        const error = await write().then(
-          () => undefined,
-          (e: unknown) => e,
-        );
-        // Acknowledged means committed; refused means nothing changed.
-        if (error) {
-          expect(isSqliteBusy(error)).toBe(true);
-          expect(committed()).toEqual(before);
-        } else expect(committed()).not.toEqual(before);
-        outcomes.push(`${name}:${error ? "refused" : "committed"}`);
-      }
-      // With a rollback journal the root still holds its read lock and can
-      // upgrade: every write commits. In WAL a write may be refused while the
-      // stale snapshot lasts, never acknowledged and dropped.
-      if (mode === "delete")
-        expect(outcomes).toEqual([
-          "create:committed",
-          "raw RETURNING:committed",
-          "raw CTE:committed",
-          "deleteMany:committed",
-        ]);
-    });
+                "WITH q AS (SELECT 1) UPDATE workflow_runs SET priority = 9 WHERE id = 'seed'",
+              )
+              .catch((e: unknown) => e),
+          ),
+        ).toBe(true);
+        if (mode === "delete") holder.exec("COMMIT");
+        holder.close();
+        // In WAL another connection commits after the root's snapshot was pinned.
+        if (mode === "wal") observer.exec("INSERT INTO probe VALUES (1)");
+        await timeout(5000);
+
+        const writes: Array<[string, () => Promise<unknown>]> = [
+          ["create", () => prisma.workflowRun.create({ data: run("created") })],
+          [
+            "raw RETURNING",
+            () =>
+              prisma
+                .$withColumns({ id: "text" })
+                .$queryRawUnsafe(
+                  "UPDATE workflow_runs SET priority = 4 WHERE id = 'seed' RETURNING id",
+                ),
+          ],
+          [
+            "raw CTE",
+            () =>
+              prisma
+                .$withColumns({})
+                .$queryRawUnsafe(
+                  "WITH q AS (SELECT 1) UPDATE workflow_runs SET \"workflowName\" = 'cte' WHERE id = 'seed'",
+                ),
+          ],
+          [
+            "deleteMany",
+            () => prisma.workflowRun.deleteMany({ where: { id: "created" } }),
+          ],
+        ];
+        const committed = () =>
+          observer
+            .prepare(
+              'SELECT id, priority, "workflowName" AS name FROM workflow_runs ORDER BY id',
+            )
+            .all()
+            .map((r: any) => `${r.id}:${r.priority}:${r.name}`);
+        const outcomes: string[] = [];
+        for (const [name, write] of writes) {
+          const before = committed();
+          const error = await write().then(
+            () => undefined,
+            (e: unknown) => e,
+          );
+          // Acknowledged means committed; refused means nothing changed.
+          if (error) {
+            expect(isSqliteBusy(error)).toBe(true);
+            expect(committed()).toEqual(before);
+          } else expect(committed()).not.toEqual(before);
+          outcomes.push(`${name}:${error ? "refused" : "committed"}`);
+        }
+        // With a rollback journal the root still holds its read lock and can
+        // upgrade: every write commits. In WAL a write may be refused while the
+        // stale snapshot lasts, never acknowledged and dropped.
+        if (mode === "delete")
+          expect(outcomes).toEqual([
+            "create:committed",
+            "raw RETURNING:committed",
+            "raw CTE:committed",
+            "deleteMany:committed",
+          ]);
+      },
+    );
   },
 );
 
