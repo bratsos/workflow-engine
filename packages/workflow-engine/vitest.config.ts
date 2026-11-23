@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 import { defineConfig } from "vitest/config";
 
 /**
@@ -12,6 +13,18 @@ import { defineConfig } from "vitest/config";
  * only this package's suite, exactly as before.
  */
 export default defineConfig({
+  // Tests that load a host package's source resolve its kernel import to this
+  // package's source, so they run without a build (as vitest.shared.ts does).
+  resolve: {
+    alias: [
+      {
+        find: /^@bratsos\/workflow-engine\/kernel$/,
+        replacement: fileURLToPath(
+          new URL("./src/kernel/index.ts", import.meta.url),
+        ),
+      },
+    ],
+  },
   test: {
     // Vitest on Bun drops zod's named `z` export (it reads `export default z`
     // as CJS interop); inlining zod avoids that. Nothing changes under Node.
