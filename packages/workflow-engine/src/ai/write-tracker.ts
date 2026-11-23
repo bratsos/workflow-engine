@@ -28,6 +28,11 @@ export class AICallWriteTracker {
     };
   }
 
+  /** Pending from now until `work` settles; the caller still sees its outcome. */
+  track<T>(work: Promise<T>): Promise<T> {
+    return work.finally(this.begin());
+  }
+
   fail(): void {
     this.failed++;
     this.parent?.fail();

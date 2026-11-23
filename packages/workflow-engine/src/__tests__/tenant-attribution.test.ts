@@ -1783,7 +1783,8 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
         })
       ).outcome,
     ).toBe("completed");
-    expect(observed.childPending).toBe(1);
+    // The request and the usage read that writes its charge.
+    expect(observed.childPending).toBeGreaterThan(0);
     expect(observed.parentFlush).toEqual({ failed: 0, pending: 0 });
     expect(
       (observed.rowsAtFlush as CreateAICallInput[]).map((row) => [
@@ -2111,10 +2112,244 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
         })
       ).outcome,
     ).toBe("completed");
-    expect(observed.childPending).toBe(1);
+    // The open request and the usage readers still writing its row.
+    expect(observed.childPending).toBeGreaterThan(0);
     expect(observed.parentFlush).toEqual({ failed: 0, pending: 0 });
     expect(
       observed.rowsAtFlush!.map((row) => [row.inputTokens, row.outputTokens]),
     ).toContainEqual([2, 3]);
+  });
+
+  it.each([
+    // Only the usage reader writes a row after an abort.
+    ["getUsage", "after abort", "abort", true],
+    ["getText", "after abort", "abort", false],
+    ["getReasoning", "after abort", "abort", false],
+    ["getUsage", "before flush", "tool failure", true],
+    ["getText", "before flush", "tool failure", true],
+    ["getReasoning", "before flush", "tool failure", true],
+    ["stream", "before flush", "tool failure", true],
+    ["getText", "during flush", "tool failure", true],
+    ["getUsage", "during flush", "finish", true],
+    ["getText", "before flush", "error part then finish", true],
+  ] as const)("waits for a %s reader started %s when the request ends by %s", async (reader, start, end, writes) => {
+    const release = Promise.withResolvers<void>();
+    const secondStep = Promise.withResolvers<void>();
+    const abort = new AbortController();
+    const observed: { flush?: unknown; atFlush?: unknown[]; rows?: unknown[] } =
+      {};
+    let calls = 0;
+    const model = new MockLanguageModelV4({
+      async doStream({ abortSignal }) {
+        if (++calls === 1)
+          return {
+            stream: partsStream([
+              { type: "stream-start", warnings: [] },
+              {
+                type: "tool-call",
+                toolCallId: "call-1",
+                toolName: "lookup",
+                input: "{}",
+              },
+              {
+                type: "finish",
+                finishReason: { unified: "tool-calls", raw: "tool_calls" },
+                usage: v4Usage(1, 1),
+              },
+            ]),
+          };
+        secondStep.resolve();
+        const finish = [
+          { type: "text-end", id: "1" },
+          {
+            type: "finish",
+            finishReason: { unified: "stop", raw: "stop" },
+            usage: v4Usage(2, 3),
+          },
+        ];
+        return {
+          stream: partsStream(
+            [
+              { type: "stream-start", warnings: [] },
+              { type: "text-start", id: "1" },
+              { type: "text-delta", id: "1", delta: "a" },
+            ],
+            release.promise.then(() =>
+              end === "error part then finish"
+                ? [{ type: "error", error: new Error("overloaded") }, ...finish]
+                : finish,
+            ),
+            abortSignal,
+          ),
+        };
+      },
+    });
+    const stage = defineStage({
+      ...diagnosticsStage,
+      async execute(ctx) {
+        const result = ctx.ai.createChild("chat").streamText(
+          modelKey,
+          { prompt: "request marker" },
+          {
+            abortSignal: abort.signal,
+            stopWhen: stepCountIs(2),
+            tools: {
+              lookup: {
+                inputSchema: z.object({}),
+                execute: async () => "ref-1",
+                // Fetching the referenced result fails once the flush waits.
+                ...(end === "tool failure" && {
+                  toModelOutput: async () => {
+                    await release.promise;
+                    throw new TypeError("fetch failed");
+                  },
+                }),
+              },
+            },
+          },
+        );
+        // The SDK's own reader drives the request.
+        const raw = (async () => {
+          for await (const _ of result.rawResult!.fullStream) {
+            // Drain the stream.
+          }
+        })().catch(() => {});
+        // The stage handles the reader's outcome; flush must still wait for it.
+        const read = () =>
+          (reader === "stream"
+            ? (async () => {
+                for await (const _ of result.stream) {
+                  // Deliver to the client.
+                }
+              })()
+            : result[reader]()
+          ).catch(() => {});
+        const rows = async () =>
+          (
+            await db.client.aICall.findMany({
+              where: { workflowRunId: ctx.workflowRunId },
+            })
+          )
+            .map((row: CreateAICallInput) => [
+              row.inputTokens,
+              row.outputTokens,
+              row.cost,
+            ])
+            .sort();
+        let reading: Promise<unknown>;
+        let flush: Promise<unknown>;
+        if (start === "after abort") {
+          await secondStep.promise;
+          abort.abort();
+          await raw;
+          await ctx.ai.flush();
+          reading = read();
+          flush = ctx.ai.flush({ timeoutMs: 2_000 });
+        } else if (start === "before flush") {
+          reading = read();
+          flush = ctx.ai.flush({ timeoutMs: 2_000 });
+          release.resolve();
+        } else {
+          flush = ctx.ai.flush({ timeoutMs: 2_000 });
+          reading = read();
+          release.resolve();
+        }
+        observed.flush = await flush;
+        observed.atFlush = await rows();
+        await reading;
+        await ctx.ai.flush();
+        observed.rows = await rows();
+        return { output: {} };
+      },
+    });
+    const { kernel, job } = await queueJob(stage, {
+      services: {
+        // Slow inserts, so a flush that returns early cannot see the row.
+        aiLogger: override(db.aiLogger, {
+          async logCall(call) {
+            await new Promise((resolve) => setTimeout(resolve, 100));
+            await db.aiLogger.logCall(call);
+          },
+        }),
+        ai: (topic, logger, context, _resolver, options) =>
+          createAIHelper(topic, logger, context, () => model, options),
+      },
+    });
+    expect(
+      (
+        await executeJobWithHeartbeat(kernel, {
+          job,
+          jobTransport: db.jobTransport,
+        })
+      ).outcome,
+    ).toBe("completed");
+    expect(observed.flush).toEqual({ failed: 0, pending: 0 });
+    expect(observed.rows!.length > 0).toBe(writes);
+    expect(observed.atFlush).toEqual(observed.rows);
+  });
+
+  it.each([
+    "text generation",
+    "batch results",
+  ] as const)("waits for %s requested before the flush", async (work) => {
+    const observed: { flush?: unknown; rows?: number } = {};
+    const model = new MockLanguageModelV4({
+      async doGenerate() {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        return {
+          content: [{ type: "text", text: "reply" }],
+          finishReason: { unified: "stop", raw: "stop" },
+          usage: v4Usage(2, 3),
+          warnings: [],
+        };
+      },
+    });
+    const stage = defineStage({
+      ...diagnosticsStage,
+      async execute(ctx) {
+        const child = ctx.ai.createChild("work");
+        const requested =
+          work === "batch results"
+            ? child
+                .batch(modelKey, "openrouter", batchTransport)
+                .getResults("batch-1")
+            : child.generateText(modelKey, "request marker");
+        observed.flush = await ctx.ai.flush({ timeoutMs: 2_000 });
+        observed.rows = await db.client.aICall.count({
+          where: { workflowRunId: ctx.workflowRunId },
+        });
+        await requested;
+        return { output: {} };
+      },
+    });
+    const slowly = () => new Promise((resolve) => setTimeout(resolve, 100));
+    const { kernel, job } = await queueJob(stage, {
+      services: {
+        aiLogger: override(db.aiLogger, {
+          async logCall(call) {
+            await slowly();
+            await db.aiLogger.logCall(call);
+          },
+          async logBatchResults(batchId, rows) {
+            await slowly();
+            await db.aiLogger.logBatchResults(batchId, rows);
+          },
+        }),
+        ai: (topic, logger, context, _resolver, options) =>
+          createAIHelper(topic, logger, context, () => model, options),
+      },
+    });
+    expect(
+      (
+        await executeJobWithHeartbeat(kernel, {
+          job,
+          jobTransport: db.jobTransport,
+        })
+      ).outcome,
+    ).toBe("completed");
+    expect(observed).toEqual({
+      flush: { failed: 0, pending: 0 },
+      rows: work === "batch results" ? 2 : 1,
+    });
   });
 });

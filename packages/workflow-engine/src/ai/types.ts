@@ -860,7 +860,8 @@ export interface AIHelper {
 export interface AIHelperContext {
   readonly topic: string;
   readonly aiCallLogger: AICallLogger;
-  readonly beginOperation?: () => () => void;
+  /** Counts engine work that can end in an AI call write until it settles. */
+  readonly track?: <T>(work: Promise<T>) => Promise<T>;
   readonly onAccountingError?: (error: unknown) => void;
   readonly providerResolver?: ProviderResolver;
   readonly routing?: OpenRouterRoutingOptions;

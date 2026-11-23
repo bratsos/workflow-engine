@@ -317,6 +317,8 @@ it.each([
     } catch {
       // Expected for every case.
     }
+    // The failure row, and its trace, follow the SDK's own end.
+    await ai.flush();
     expect(JSON.stringify(trace.mock.calls)).toContain(marker);
   } finally {
     trace.mockRestore();

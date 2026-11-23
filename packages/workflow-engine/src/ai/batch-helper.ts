@@ -843,7 +843,14 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
     }));
   }
 
-  async getResults(
+  getResults(
+    batchId: string,
+    metadata?: Record<string, unknown>,
+  ): Promise<AIBatchResult<T>[]> {
+    return this.track(this.collectResults(batchId, metadata));
+  }
+
+  private async collectResults(
     batchId: string,
     metadata?: Record<string, unknown>,
   ): Promise<AIBatchResult<T>[]> {
@@ -1146,6 +1153,11 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
     return results;
   }
 
+  /** Pending for flush until it settles, since it can write AI call rows. */
+  private track<R>(work: Promise<R>): Promise<R> {
+    return this.ctx.track ? this.ctx.track(work) : work;
+  }
+
   async isRecorded(batchId: string): Promise<boolean> {
     if (this.recordedBatchIds.has(batchId)) {
       return true;
@@ -1168,9 +1180,7 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
       return inFlight;
     }
 
-    // Visible to flush before the duplicate check's first await.
-    const endCheck = this.ctx.beginOperation?.();
-    const recordPromise = (async () => {
+    const recording = (async () => {
       try {
         if (
           await this.isRecorded(batchId).catch((error: unknown) => {
@@ -1248,17 +1258,16 @@ export class AIBatchImpl<T = string> implements AIBatch<T> {
             };
           }),
         );
-        endCheck?.();
         await write;
         // Only after the ledger write succeeded. Marking before the await
         // meant one transient DB error left the id in the set, and every
         // later getResults() in this process skipped recording for good.
         this.recordedBatchIds.add(batchId);
       } finally {
-        endCheck?.();
         this.recordingPromises.delete(batchId);
       }
     })();
+    const recordPromise = this.track(recording);
 
     this.recordingPromises.set(batchId, recordPromise);
     return recordPromise;

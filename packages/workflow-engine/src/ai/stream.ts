@@ -58,16 +58,11 @@ export function streamText(
       ? input.prompt
       : (JSON.stringify(input.messages) ?? "");
 
-  // Pending from the call until its row is written, or until the SDK ends the
-  // request without one and no usage reader is still writing it (getUsage
-  // writes after an abort). A consumer that stops reading does not end it.
+  // Each piece of work that can write this call's row is pending from its
+  // start until it settles: the SDK request until its row is written or it
+  // ends without one, and every reader below. A paused consumer keeps it open.
+  const track = ctx.track ?? (<T>(work: Promise<T>) => work);
   let closeStream: (() => void) | undefined;
-  let requestEnded = false;
-  let usageReads = 0;
-  const endRequest = () => {
-    requestEnded = true;
-    if (usageReads === 0) closeStream?.();
-  };
   // Both SDK callbacks and consumer accessors can observe the same failure.
   let errorLogged = false;
   let streamError: { error: unknown } | undefined;
@@ -125,9 +120,7 @@ export function streamText(
     }
     // Reading usage keeps the SDK draining when a consumer stops at an error.
     // onEnd or getUsage will persist the bill once the SDK has reported it.
-    void Promise.resolve()
-      .then(() => getUsage())
-      .catch(() => {});
+    void track(Promise.resolve().then(() => getUsage())).catch(() => {});
   };
 
   // Trace log before stream starts
@@ -299,7 +292,7 @@ export function streamText(
     }),
     onStepEnd,
     onError: ({ error }: { error: unknown }) => recordStreamError(error),
-    onAbort: endRequest,
+    onAbort: () => closeStream?.(),
     // Sees the request's parts before the SDK's own end handling. An error
     // part can precede a billable finish, so the end decides: the SDK calls
     // onEnd (and writes the row) only for a finished step and no
@@ -322,10 +315,10 @@ export function streamText(
           controller.enqueue(part);
         },
         flush() {
-          if (!finishedStep || noOutput) endRequest();
+          if (!finishedStep || noOutput) closeStream?.();
         },
         cancel() {
-          endRequest();
+          closeStream?.();
         },
       });
     },
@@ -350,7 +343,9 @@ export function streamText(
   let adapterResponse: AdapterStreamResponse | undefined;
   let result: ReturnType<typeof aiStreamText> | undefined;
   try {
-    closeStream = ctx.beginOperation?.();
+    const request = Promise.withResolvers<void>();
+    void track(request.promise);
+    closeStream = () => request.resolve();
     if (ctx.adapter?.streamText) {
       adapterResponse = ctx.adapter.streamText({
         model: modelConfig,
@@ -395,7 +390,7 @@ export function streamText(
         if (adapterResponse) closeStream?.();
         throw error;
       }
-      return {
+      const iterator: AsyncIterator<string> = {
         async next() {
           try {
             const { done, value } = await runWithCallTimeout(timeout, () =>
@@ -419,6 +414,7 @@ export function streamText(
           }
         },
       };
+      return { next: () => track(iterator.next()) };
     },
   };
 
@@ -430,7 +426,7 @@ export function streamText(
 
   // Create usage getter that waits for stream completion and persists
   // (or reuses the persistence already done by onEnd).
-  const readUsage = async () => {
+  const getUsage = async () => {
     try {
       if (timeout.timedOut() && timeout.error) throw timeout.error;
       if (adapterResponse) return persistAdapterUsage(adapterResponse);
@@ -449,16 +445,6 @@ export function streamText(
     } catch (error) {
       logError(streamError ? streamError.error : error);
       throw timeoutErrorIfExpired(timeout, error);
-    }
-  };
-
-  const getUsage = async () => {
-    if (adapterResponse) return readUsage();
-    usageReads++;
-    try {
-      return await readUsage();
-    } finally {
-      if (--usageReads === 0 && requestEnded) closeStream?.();
     }
   };
 
@@ -500,9 +486,9 @@ export function streamText(
 
   return {
     stream: streamIterable,
-    getUsage,
-    getText,
-    getReasoning,
+    getUsage: () => track(getUsage()),
+    getText: () => track(getText()),
+    getReasoning: () => track(getReasoning()),
     rawResult: result,
   };
 }

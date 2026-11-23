@@ -256,7 +256,7 @@ class AIHelperImpl implements AIHelper {
     return {
       topic: this.topic,
       aiCallLogger: this.trackedLogger,
-      beginOperation: () => this.writes.begin(),
+      track: (work) => this.writes.track(work),
       onAccountingError: () => this.writes.fail(),
       providerResolver: this.providerResolver,
       routing: this.options?.routing,
@@ -270,7 +270,9 @@ class AIHelperImpl implements AIHelper {
     prompt: TextInput,
     options?: TextOptions<TTools>,
   ): Promise<AITextResult> {
-    return generateTextImpl(this.context(), modelKey, prompt, options);
+    return this.writes.track(
+      generateTextImpl(this.context(), modelKey, prompt, options),
+    );
   }
 
   generateObject<TSchema extends z.ZodTypeAny>(
@@ -279,12 +281,8 @@ class AIHelperImpl implements AIHelper {
     schema: TSchema,
     options?: ObjectOptions,
   ): Promise<AIObjectResult<z.infer<TSchema>>> {
-    return generateObjectImpl(
-      this.context(),
-      modelKey,
-      prompt,
-      schema,
-      options,
+    return this.writes.track(
+      generateObjectImpl(this.context(), modelKey, prompt, schema, options),
     );
   }
 
@@ -293,7 +291,9 @@ class AIHelperImpl implements AIHelper {
     text: string | string[],
     options?: EmbedOptions,
   ): Promise<AIEmbedResult> {
-    return embedImpl(this.context(), modelKey, text, options);
+    return this.writes.track(
+      embedImpl(this.context(), modelKey, text, options),
+    );
   }
 
   streamText(
@@ -309,7 +309,9 @@ class AIHelperImpl implements AIHelper {
     spec: EvaluationSpec<Q>,
     options?: EvaluateOptions,
   ): Promise<AIEvaluateResult<Q>> {
-    return evaluateImpl(this.context(), modelKey, spec, options);
+    return this.writes.track(
+      evaluateImpl(this.context(), modelKey, spec, options),
+    );
   }
 
   transcribe(
@@ -317,7 +319,9 @@ class AIHelperImpl implements AIHelper {
     audio: TranscriptionAudio,
     options?: TranscribeOptions,
   ): Promise<AITranscribeResult> {
-    return transcribeImpl(this.context(), modelKey, audio, options);
+    return this.writes.track(
+      transcribeImpl(this.context(), modelKey, audio, options),
+    );
   }
 
   batch<T = string>(
