@@ -20,6 +20,7 @@ import {
 } from "../ai/ai-helper.js";
 import { registerModels } from "../ai/model-helper.js";
 import type { AIAdapter, AIHelper } from "../ai/types.js";
+import { AICallWriteTracker } from "../ai/write-tracker.js";
 import type { Stage } from "../core/stage.js";
 import { defineAsyncBatchStage, defineStage } from "../core/stage-factory.js";
 import { defineWorkflow } from "../core/workflow.js";
@@ -27,6 +28,7 @@ import { executeJobWithHeartbeat } from "../kernel/helpers/host-support.js";
 import type { Kernel, KernelConfig } from "../kernel/kernel.js";
 import { CollectingEventSink } from "../kernel/testing/index.js";
 import type {
+  AICallFlushOptions,
   AICallLogger,
   CreateAICallInput,
 } from "../persistence/interface.js";
@@ -38,6 +40,7 @@ import {
   realDatabase,
   sqlite,
 } from "./sqlite8-kernel-utils.js";
+import { createPostgresClient } from "./utils/postgres-client.js";
 
 // Vitest loads the published integration surfaces from their workspace sources.
 const integration = {
@@ -2233,6 +2236,294 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
     expect(await db.client.aICall.count({ where: { topic: "direct" } })).toBe(
       count,
     );
+  });
+
+  // Alpha.21's ctx.aiLogger.flush was the configured logger's flush. It still
+  // is, plus what the run's write fence holds: compared here in the same
+  // state, across kinds of configured logger.
+  describe("ctx.aiLogger.flush against the configured flush", () => {
+    type Stock = ReturnType<typeof createPrismaAICallLogger>;
+    type Configured = AICallLogger & Pick<Stock, "transactionReads">;
+    let sibling: any;
+    beforeAll(() => {
+      if (!sqlite) sibling = createPostgresClient(process.env.DATABASE_URL!);
+    });
+    afterAll(() => sibling?.$disconnect());
+
+    const reads = (stock: Stock) => ({
+      getStats: (topic: string) => stock.getStats(topic),
+      isRecorded: (batchId: string) => stock.isRecorded(batchId),
+      transactionReads: (
+        persistence: Parameters<Stock["transactionReads"]>[0],
+      ) => stock.transactionReads(persistence),
+    });
+    // Buffers keep writes until their flush sends them, then wait for the
+    // inserts within what is left of the caller's timeout.
+    class CountingBuffer implements Configured {
+      readonly writes = new AICallWriteTracker();
+      readonly queue: (() => void)[] = [];
+      sending = Promise.resolve();
+      constructor(readonly stock: Stock) {}
+      buffer(insert: () => Promise<void>) {
+        const done = this.writes.begin();
+        const written = Promise.withResolvers<void>();
+        this.queue.push(() => {
+          void insert()
+            .then(written.resolve, (error: unknown) => {
+              this.writes.fail();
+              written.reject(error);
+            })
+            .finally(done);
+        });
+        return written.promise;
+      }
+      logCall(call: CreateAICallInput) {
+        return this.buffer(() => this.stock.logCall(call));
+      }
+      logBatchResults(batchId: string, calls: CreateAICallInput[]) {
+        return this.buffer(() => this.stock.logBatchResults(batchId, calls));
+      }
+      getStats(topic: string) {
+        return this.stock.getStats(topic);
+      }
+      isRecorded(batchId: string) {
+        return this.stock.isRecorded(batchId);
+      }
+      transactionReads(persistence: Parameters<Stock["transactionReads"]>[0]) {
+        return this.stock.transactionReads(persistence);
+      }
+      async flush({ timeoutMs = 5_000 }: AICallFlushOptions = {}) {
+        const deadline = Date.now() + timeoutMs;
+        this.sending = this.sending.then(() => {
+          for (const send of this.queue.splice(0)) send();
+        });
+        await this.sending;
+        return this.writes.flush({
+          timeoutMs: Math.max(0, deadline - Date.now()),
+        });
+      }
+    }
+    const objectBuffer = (stock: Stock): Configured => {
+      const queue: (() => void)[] = [];
+      let sending = Promise.resolve();
+      const buffer = (insert: () => Promise<void>) => {
+        const written = Promise.withResolvers<void>();
+        queue.push(() => void insert().then(written.resolve, written.reject));
+        return written.promise;
+      };
+      return {
+        logCall: (call) => buffer(() => stock.logCall(call)),
+        logBatchResults: (batchId, calls) =>
+          buffer(() => stock.logBatchResults(batchId, calls)),
+        ...reads(stock),
+        async flush({ timeoutMs = 5_000 } = {}) {
+          const deadline = Date.now() + timeoutMs;
+          sending = sending.then(() => {
+            for (const send of queue.splice(0)) send();
+          });
+          await sending;
+          return stock.flush({
+            timeoutMs: Math.max(0, deadline - Date.now()),
+          });
+        },
+      };
+    };
+    const direct = (stock: Stock) => ({
+      logCall: (call: CreateAICallInput) => stock.logCall(call),
+      logBatchResults: (batchId: string, calls: CreateAICallInput[]) =>
+        stock.logBatchResults(batchId, calls),
+      ...reads(stock),
+    });
+    const kinds: Record<string, (stock: Stock) => Configured> = {
+      "the stock Prisma logger": (stock) => stock,
+      "a class buffer with its own counts": (stock) =>
+        new CountingBuffer(stock),
+      "a plain-object buffer": objectBuffer,
+      "a logger without flush": direct,
+      "a logger whose flush ignores its options": (stock) => ({
+        ...direct(stock),
+        flush: () => stock.flush({ timeoutMs: 0 }),
+      }),
+    };
+
+    // Holds inserts into ai_calls until released: a table lock from a second
+    // connection on PostgreSQL. A second SQLite connection in this process
+    // cannot wait without blocking it, so there the stock logger's inserts
+    // wait at its client.
+    const holdInserts = async (stock: Stock) => {
+      const release = Promise.withResolvers<void>();
+      if (!sqlite) {
+        const locked = Promise.withResolvers<void>();
+        const lock = sibling.$transaction(async (tx: any) => {
+          await tx.$executeRawUnsafe("LOCK TABLE ai_calls IN SHARE MODE");
+          locked.resolve();
+          await release.promise;
+        });
+        lock.catch(locked.reject);
+        await locked.promise;
+        return async () => {
+          release.resolve();
+          await lock;
+        };
+      }
+      const port = stock as unknown as { prisma: any };
+      const client = port.prisma;
+      const bind = (target: any, key: PropertyKey) => {
+        const value = Reflect.get(target, key);
+        return typeof value === "function" ? value.bind(target) : value;
+      };
+      const aICall = new Proxy(client.aICall, {
+        get: (delegate, key) =>
+          key === "create" || key === "createMany"
+            ? async (...args: unknown[]) => {
+                await release.promise;
+                return delegate[key](...args);
+              }
+            : bind(delegate, key),
+      });
+      port.prisma = new Proxy(client, {
+        get: (target, key) => (key === "aICall" ? aICall : bind(target, key)),
+      });
+      // The stock logger's transaction reads match its own client.
+      return async () => {
+        port.prisma = client;
+        release.resolve();
+      };
+    };
+
+    type Case = {
+      kind: string;
+      fence: "with" | "without";
+      locked: boolean;
+      refused: boolean;
+      timeoutMs: number;
+    };
+    // A stage with an optional refused duplicate, then a call and a
+    // single-item batch the logger has taken, flushed while inserts are
+    // held or after they settle.
+    const flushes = async ({
+      kind,
+      fence,
+      locked,
+      refused,
+      timeoutMs,
+    }: Case) => {
+      const stock = freshLogger();
+      const configured = kinds[kind]!(stock);
+      const row = { ...manual, modelId: manual.modelKey, topic: "direct" };
+      const seed = { ...row, batchId: "seed", requestId: "seed-1" };
+      const observed: Record<string, unknown> = {};
+      const stage = defineStage({
+        ...diagnosticsStage,
+        async execute(ctx) {
+          // The fence hands writes on; a buffered logger then sends them.
+          const send = async () => {
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            await configured.flush?.({ timeoutMs: 0 });
+          };
+          if (refused) {
+            const stored = ctx.aiLogger.logCall(seed);
+            await send();
+            await stored;
+            const duplicate = Promise.resolve(ctx.aiLogger.logCall(seed));
+            await send();
+            await duplicate.catch(() => {});
+          }
+          const release = locked ? await holdInserts(stock) : async () => {};
+          const writes = [
+            ctx.aiLogger.logCall(row),
+            ctx.aiLogger.logBatchResults("batch-1", [
+              { ...row, requestId: "item-1" },
+            ]),
+          ];
+          await send();
+          if (!locked) await Promise.all(writes);
+          const flushed = await ctx.aiLogger.flush?.({ timeoutMs });
+          observed.stage = flushed;
+          observed.decision =
+            flushed && flushed.failed > 0 ? "review-failed-charge" : "proceed";
+          observed.configured = await configured.flush?.({ timeoutMs });
+          await release();
+          await Promise.all(writes);
+          observed.settled = await ctx.aiLogger.flush?.();
+          return { output: {} };
+        },
+      });
+      const { kernel, job, workflowRunId } = await queueJob(stage, {
+        ...(fence === "without" && {
+          persistence: override(db.persistence, { beginRunWrite: undefined }),
+        }),
+        services: { aiLogger: configured, ai: createAIHelper },
+      });
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        expect(
+          (
+            await executeJobWithHeartbeat(kernel, {
+              job,
+              jobTransport: db.jobTransport,
+            })
+          ).outcome,
+        ).toBe("completed");
+      } finally {
+        warn.mockRestore();
+      }
+      observed.rows = await db.client.aICall.count({
+        where: { workflowRunId },
+      });
+      return observed;
+    };
+
+    const cases: Case[] = Object.keys(kinds).flatMap((kind) =>
+      (["with", "without"] as const).flatMap((fence) =>
+        [false, true].flatMap((locked) =>
+          [false, true].flatMap((refused) =>
+            [0, 25, 50, 100].map((timeoutMs) => ({
+              kind,
+              fence,
+              locked,
+              refused,
+              timeoutMs,
+            })),
+          ),
+        ),
+      ),
+    );
+    it.each(
+      cases,
+    )("$kind, $fence the fence, inserts held $locked, prior refusal $refused, $timeoutMs ms", async (scenario) => {
+      const observed = await flushes(scenario);
+      const failed = scenario.refused ? 1 : 0;
+      const counts = { failed, pending: scenario.locked ? 2 : 0 };
+      if (scenario.kind === "a logger without flush") {
+        expect(observed.configured).toBeUndefined();
+      } else {
+        expect(observed.configured).toEqual(counts);
+      }
+      expect(observed).toMatchObject({
+        stage: counts,
+        settled: { failed, pending: 0 },
+        rows: failed + 2,
+      });
+    });
+
+    it("keeps a buffered logger's refusal and both held writes, so the stage reviews the failed charge (gate round 12)", async () => {
+      expect(
+        await flushes({
+          kind: "a class buffer with its own counts",
+          fence: "with",
+          locked: true,
+          refused: true,
+          timeoutMs: 50,
+        }),
+      ).toEqual({
+        stage: { failed: 1, pending: 2 },
+        decision: "review-failed-charge",
+        configured: { failed: 1, pending: 2 },
+        settled: { failed: 1, pending: 0 },
+        rows: 3,
+      });
+    });
   });
 
   it.each([

@@ -185,12 +185,12 @@ it without one, each `getUsage()`, `getText()`, `getReasoning()` or chunk
 read, batch `getResults()` and `recordResults()`, and writes in progress.
 An error part or a consumer that stops reading does not end a stream
 request. A helper write the database refuses reaches `onLogError`.
-`ctx.aiLogger.flush()` counts each direct write made through `ctx.aiLogger`
-once: `ctx.aiLogger` counts it until the configured logger takes it, past
-the run's write fence, and a logger with `flush` counts it from then on. The
-call waits for the writes `ctx.aiLogger` counts, flushes the configured
-logger within the same bound, and adds the two results;
-`ctx.ai.flush()` covers the stage helper's own. A
+`ctx.aiLogger.flush(options)` returns the configured logger's own
+`flush` result, as in earlier releases, once the run's write fence has
+handed on the direct writes it holds (waiting within the same bound), plus
+the direct writes the fence still holds or refused. With a logger that has
+no `flush`, it returns counts for the direct writes made through
+`ctx.aiLogger`; `ctx.ai.flush()` covers the stage helper's own. A
 caller that awaits a `ctx.aiLogger` write gets a rejection with a safe
 message; an ignored one is handled, and the Prisma logger logs a warning. `getResults` records a batch before it returns, as before, and
 rejects if that write fails; `recordResults` retries it.
