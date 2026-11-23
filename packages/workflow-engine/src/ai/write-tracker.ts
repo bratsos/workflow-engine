@@ -61,20 +61,26 @@ export class AICallWriteTracker {
 }
 
 /**
- * Run a logger write that `writes` counts until it settles. A failure is
- * counted and reported to `onFailure`; a rejection reaches the caller as a
- * safe error, because a database error can quote the row it refused, and is
- * handled when the caller ignores it. A synchronous throw still reaches the
- * caller, as in earlier releases.
+ * Run a logger write that `writes` counts until it settles, or until the
+ * write calls `release` to leave its counting to the logger that took it. A
+ * failure is counted unless released and reported to `onFailure`; a
+ * rejection reaches the caller as a safe error, because a database error can
+ * quote the row it refused, and is handled when the caller ignores it. A
+ * synchronous throw still reaches the caller, as in earlier releases.
  */
 export function trackedWrite(
   writes: AICallWriteTracker,
-  write: () => void | Promise<void>,
+  write: (release: () => void) => void | Promise<void>,
   onFailure: (error: unknown) => void = () => {},
 ): Promise<void> {
   const done = writes.begin();
+  let counted = true;
+  const release = () => {
+    counted = false;
+    done();
+  };
   const failed = (error: unknown) => {
-    writes.fail();
+    if (counted) writes.fail();
     try {
       onFailure(error);
     } catch {
@@ -84,7 +90,7 @@ export function trackedWrite(
   };
   let result: void | Promise<void>;
   try {
-    result = write();
+    result = write(release);
   } catch (error) {
     failed(error);
     throw error;

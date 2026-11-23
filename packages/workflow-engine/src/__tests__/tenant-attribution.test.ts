@@ -1456,7 +1456,7 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
     ]);
   });
 
-  it("rejects an awaited stage write that the database refuses and counts both failures in ctx.aiLogger.flush, with the configured logger's own", async () => {
+  it("rejects an awaited stage write that the database refuses and counts both failures in ctx.aiLogger.flush", async () => {
     const call = {
       ...manual,
       modelId: manual.modelKey,
@@ -1497,10 +1497,9 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
     } finally {
       warn.mockRestore();
     }
-    // ctx.aiLogger and the configured Prisma logger each count both.
     expect(outcomes).toEqual([
       "AI call accounting write failed",
-      { failed: 4, pending: 0 },
+      { failed: 2, pending: 0 },
     ]);
     expect(
       await db.client.aICall.findMany({ where: { workflowRunId } }),
@@ -1881,7 +1880,7 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
   it.each([
     "stored",
     "refused",
-  ] as const)("counts a held direct write that is %s in ctx.aiLogger.flush", async (result) => {
+  ] as const)("counts a held direct write that is %s in ctx.aiLogger.flush when the configured logger has no flush", async (result) => {
     const entered = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
     const observed: Record<string, unknown> = {};
@@ -1912,14 +1911,18 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
     const configured = freshLogger();
     const { kernel, job } = await queueJob(stage, {
       services: {
-        aiLogger: override(configured, {
+        aiLogger: {
           async logCall(call: CreateAICallInput) {
             entered.resolve();
             await release.promise;
             if (result === "refused") throw new Error(`refused ${sensitive}`);
             await configured.logCall(call);
           },
-        }),
+          logBatchResults: (batchId, calls) =>
+            configured.logBatchResults(batchId, calls),
+          getStats: (topic) => configured.getStats(topic),
+          isRecorded: (batchId) => configured.isRecorded(batchId),
+        },
         ai: createAIHelper,
       },
     });
@@ -1941,6 +1944,108 @@ describe.skipIf(!realDatabase)("AI call rows", () => {
     expect(await db.client.aICall.count({ where: { topic: "direct" } })).toBe(
       result === "stored" ? 1 : 0,
     );
+  });
+
+  it("counts a direct write the run's write fence refuses once, in ctx.aiLogger.flush", async () => {
+    const configured = freshLogger();
+    // The job's own registration is refused, so each write registers alone;
+    // the stage's write is refused with a database error.
+    let registration: "allow" | "refuse job" | "fail" = "allow";
+    const persistence = override(db.persistence, {
+      async beginRunWrite(workflowRunId: string, id: string) {
+        if (registration === "refuse job") return false;
+        if (registration === "fail") throw new Error(`refused ${sensitive}`);
+        return db.persistence.beginRunWrite!(workflowRunId, id);
+      },
+    });
+    const observed: Record<string, unknown> = {};
+    const stage = defineStage({
+      ...diagnosticsStage,
+      async execute(ctx) {
+        registration = "fail";
+        observed.write = await Promise.resolve(
+          ctx.aiLogger.logCall({
+            ...manual,
+            modelId: manual.modelKey,
+            topic: "direct",
+          }),
+        ).then(
+          () => "stored",
+          (error: Error) => error.message,
+        );
+        registration = "allow";
+        observed.stage = await ctx.aiLogger.flush?.();
+        observed.configured = await configured.flush();
+        return { output: {} };
+      },
+    });
+    const { kernel, job } = await queueJob(stage, {
+      persistence,
+      services: { aiLogger: configured, ai: createAIHelper },
+    });
+    registration = "refuse job";
+    expect(
+      (
+        await executeJobWithHeartbeat(kernel, {
+          job,
+          jobTransport: db.jobTransport,
+        })
+      ).outcome,
+    ).toBe("completed");
+    expect(observed).toEqual({
+      write: "AI call accounting write failed",
+      stage: { failed: 1, pending: 0 },
+      configured: { failed: 0, pending: 0 },
+    });
+    expect(await db.client.aICall.count({ where: { topic: "direct" } })).toBe(
+      0,
+    );
+  });
+
+  it("leaves a direct write the configured logger rejects to that logger's flush, counted once", async () => {
+    const configured = freshLogger();
+    const call = {
+      ...manual,
+      modelId: manual.modelKey,
+      topic: "external",
+      batchId: "batch-1",
+      requestId: "item-1",
+    };
+    const observed: Record<string, unknown> = {};
+    const stage = defineStage({
+      ...diagnosticsStage,
+      async execute(ctx) {
+        await ctx.aiLogger.logCall(call);
+        observed.write = await Promise.resolve(ctx.aiLogger.logCall(call)).then(
+          () => "stored",
+          (error: Error) => error.message,
+        );
+        observed.stage = await ctx.aiLogger.flush?.();
+        observed.configured = await configured.flush();
+        return { output: {} };
+      },
+    });
+    const { kernel, job } = await queueJob(stage, {
+      services: { aiLogger: configured, ai: createAIHelper },
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      expect(
+        (
+          await executeJobWithHeartbeat(kernel, {
+            job,
+            jobTransport: db.jobTransport,
+          })
+        ).outcome,
+      ).toBe("completed");
+    } finally {
+      warn.mockRestore();
+    }
+    expect(observed).toEqual({
+      write: "AI call accounting write failed",
+      stage: { failed: 1, pending: 0 },
+      configured: { failed: 1, pending: 0 },
+    });
   });
 
   it("sends a buffered logger's direct write when the stage flushes ctx.aiLogger, so the run total and completion event count it", async () => {

@@ -30,10 +30,8 @@ import { writeBatchWarn } from "./batch-warn.js";
 import { createStorageShim } from "./create-storage-shim.js";
 import { toErrorMessage } from "./error-message.js";
 import { assertTimerMs } from "./host-support.js";
+import { aiWriteFence } from "./run-writes.js";
 import { createStepApi } from "./step-api.js";
-
-/** How often ctx.aiLogger.flush flushes the configured logger again while direct writes are pending. */
-const DIRECT_WRITE_RECHECK_MS = 10;
 
 export interface BuiltStageExecutionContext {
   context: StageContext<any, any, any>;
@@ -125,18 +123,32 @@ export function defineLazyAIContext<T extends object>(
       logBatchResults: (batchId, calls) =>
         logger.logBatchResults(batchId, calls.map(stamp)),
     }));
-  // ctx.aiLogger stores direct writes as given. Its flush covers them from
-  // the call until they settle, and flushes the configured logger. A direct
-  // write reaches that logger once the run's write fence admits it, and a
-  // buffered logger sends it only when flushed, so the flush repeats until
-  // the direct writes settle, then once more for the logger's final counts.
+  // ctx.aiLogger stores direct writes as given. Each write is counted once:
+  // by this layer until the configured logger takes it (past the run's write
+  // fence), and from then on by that logger when it has a flush. Its flush
+  // waits for the writes it counts, then flushes the configured logger, and
+  // repeats while it counts a write still on its way to a buffered logger.
   let stageLogger: AICallLogger | undefined;
   const directLogger = (logger: AICallLogger): AICallLogger => {
     const writes = new AICallWriteTracker();
+    const fence = aiWriteFence(logger);
+    const direct = (
+      method: "logCall" | "logBatchResults",
+      write: (configured: AICallLogger) => void | Promise<void>,
+    ) =>
+      trackedWrite(writes, (release) => {
+        const handOff = (configured: AICallLogger) => {
+          if (configured.flush) release();
+          return write(configured);
+        };
+        return fence ? fence(method, handOff) : handOff(logger);
+      });
     return overriding(logger, {
-      logCall: (call) => trackedWrite(writes, () => logger.logCall(call)),
+      logCall: (call) => direct("logCall", (to) => to.logCall(stamp(call))),
       logBatchResults: (batchId, calls) =>
-        trackedWrite(writes, () => logger.logBatchResults(batchId, calls)),
+        direct("logBatchResults", (to) =>
+          to.logBatchResults(batchId, calls.map(stamp)),
+        ),
       flush: async (options = {}) => {
         const timeoutMs = assertTimerMs(
           "timeoutMs",
@@ -147,18 +159,16 @@ export function defineLazyAIContext<T extends object>(
         if (!flush) return writes.flush({ timeoutMs });
         const deadline = Date.now() + timeoutMs;
         const left = () => Math.max(0, deadline - Date.now());
-        let direct = await writes.flush({ timeoutMs: 0 });
+        let own = await writes.flush({ timeoutMs: 0 });
         for (;;) {
           const configured = await boundedAIFlush(flush, left());
-          if (direct.pending === 0 || left() === 0) {
+          if (own.pending === 0 || left() === 0) {
             return {
-              failed: direct.failed + configured.failed,
-              pending: direct.pending + configured.pending,
+              failed: own.failed + configured.failed,
+              pending: own.pending + configured.pending,
             };
           }
-          direct = await writes.flush({
-            timeoutMs: Math.min(left(), DIRECT_WRITE_RECHECK_MS),
-          });
+          own = await writes.flush({ timeoutMs: left() });
         }
       },
     });
@@ -172,6 +182,7 @@ export function defineLazyAIContext<T extends object>(
     return {
       ai: services.ai,
       aiLogger: loggerForRun(services.aiLogger),
+      logger: services.aiLogger,
     };
   };
 
@@ -211,7 +222,7 @@ export function defineLazyAIContext<T extends object>(
     aiLogger: {
       enumerable: true,
       configurable: true,
-      get: () => (stageLogger ??= directLogger(configured().aiLogger)),
+      get: () => (stageLogger ??= directLogger(configured().logger)),
     },
   });
 
