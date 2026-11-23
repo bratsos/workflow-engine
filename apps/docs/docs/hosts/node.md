@@ -110,6 +110,100 @@ await host.start();
 
 ---
 
+## Starting Runs Promptly with `wake()`
+
+A run created between two ticks waits for the next orchestration tick (up to `orchestrationIntervalMs`) to be claimed, and then for the job loop's idle wait (up to `jobPollIntervalMs`) to end before its first stage is dequeued. `host.wake()` removes both waits for a host that learns of new runs some other way.
+
+`wake()` returns at once and:
+
+- ends the job loop's idle wait and runs an orchestration tick now; when that tick ends the job loop looks for work again, so the first stage of a run the tick claimed is dequeued without waiting;
+- coalesces: a call that arrives while a tick or a job pass is running is remembered, and exactly one more pass of that kind follows it, however many calls came. Two passes of a kind never run at once;
+- does nothing before `start()` and after `stop()`;
+- leaves the timers as they are. They remain the fallback for a notification that never arrives. A job loop that is pausing after a completed job (`postJobYieldMs`) or backing off after an error finishes that pause first.
+
+The tick a wake runs is the whole tick (claim, poll, lease reaping, outbox flush, and `run.purge` when `retention` is set), and it claims at most `maxClaimsPerTick` runs. A burst of more runs than that continues on the next wake or timer tick; raise `maxClaimsPerTick` if you create bursts and cannot wait for it. A source that notifies on every run of a heavy stream makes the host tick back to back; debounce it in your handler if that is more than you want.
+
+The engine adds no dependency and opens no `LISTEN` connection (Prisma cannot hold one). On PostgreSQL, `run.create` issues `pg_notify('workflow_engine_runs', <run id>)` when it creates a run (not when an idempotent replay returns an existing one); PostgreSQL delivers it when the creating transaction commits and drops it if the transaction rolls back. Your process opens its own connection, listens on that channel, and calls `host.wake()`. A process that creates runs and hosts them can skip the listener and call `host.wake()` after the creating transaction commits; that also works on SQLite.
+
+`LISTEN` needs a session-level connection to PostgreSQL. A pooler in transaction mode (PgBouncer, Supavisor) does not deliver notifications, so point the listener at the database directly. Notifications are delivered only to connected listeners: a run created while the listener is reconnecting is not announced, so the examples call `host.wake()` after every (re)subscribe, and the tick covers anything else.
+
+### With `pg` (node-postgres)
+
+```typescript
+import pg from "pg";
+import type { NodeHost } from "@bratsos/workflow-engine-host-node";
+
+export function listenForRuns(host: NodeHost, connectionString: string) {
+  let client: pg.Client | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let closed = false;
+
+  const connect = async () => {
+    if (closed) return;
+    const next = new pg.Client({ connectionString });
+    let lost = false;
+    const retry = () => {
+      if (lost || closed) return;
+      lost = true;
+      timer = setTimeout(connect, 1_000);
+    };
+    next.on("error", (error) => {
+      console.error("[run listener]", error.message);
+      retry();
+    });
+    next.on("end", retry);
+    next.on("notification", () => host.wake());
+    try {
+      await next.connect();
+      await next.query("LISTEN workflow_engine_runs");
+      if (closed) {
+        await next.end(); // stopped while this connection was being made
+        return;
+      }
+      client = next;
+      host.wake(); // runs created while nothing was listening
+    } catch (error) {
+      console.error("[run listener]", (error as Error).message);
+      retry();
+      next.end().catch(() => {});
+    }
+  };
+  void connect();
+
+  return async () => {
+    closed = true;
+    clearTimeout(timer);
+    await client?.end();
+  };
+}
+
+await host.start();
+const stopListening = listenForRuns(host, process.env.DATABASE_URL!);
+// on shutdown: await stopListening(); await host.stop();
+```
+
+### With Bun's SQL client
+
+Bun 1.4 supports `LISTEN` through its built-in client (checked on Bun 1.4.2): `sql.listen(channel, onNotification, onConnect)` resolves once PostgreSQL has acknowledged the subscription, keeps one dedicated connection for all of its subscriptions, and reconnects with backoff. The third callback runs after the first subscribe and after every reconnect, which is where the catch-up wake goes.
+
+```typescript
+import { SQL } from "bun";
+
+const sql = new SQL(process.env.DATABASE_URL!);
+
+await host.start();
+const subscription = await sql.listen(
+  "workflow_engine_runs",
+  () => host.wake(),
+  () => host.wake(), // after the first subscribe and every reconnect
+);
+// on shutdown: await subscription.unlisten(); await host.stop();
+```
+
+The serverless host has no `wake()`: it has no loop and no idle wait to interrupt, because each call does one unit of work. See [Serverless Host](./serverless.md).
+
+---
+
 ## Runtime Monitoring
 
 You can inspect the operational health of your worker at runtime using `host.getStats()`:

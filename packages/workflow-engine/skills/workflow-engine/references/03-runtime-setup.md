@@ -219,6 +219,30 @@ const host = createNodeHost({
 - Serverless host: the hook is awaited for at most `onTickTimeoutMs` (default 5000, the same as `outboxFlushTimeoutMs`; a number from 1 to 2147483647, anything else throws a `RangeError` from `createServerlessHost`, and nothing switches the bound off). Every option that reaches a timer follows that rule and is checked at construction (`assertTimerMs`, exported from `@bratsos/workflow-engine/kernel`): Node `orchestrationIntervalMs`, `jobPollIntervalMs`, `postJobYieldMs` (0 allowed: off), `jobHeartbeatIntervalMs`, `shutdownTimeoutMs`, and `runAndWait`'s `pollIntervalMs`; serverless `outboxFlushTimeoutMs`, `onTickTimeoutMs`, `jobHeartbeatIntervalMs`, and `runToCompletion`'s `jobHeartbeatIntervalMs`; then `runMaintenanceTick()` returns the counts, logs `[ServerlessHost] onTick hook did not settle within <n> ms; ...` and leaves the hook running. The bound covers a hook that yields (a never-settling hook with a 25 ms bound: returned after 28 ms); synchronous code in the hook cannot be bounded (a 60 ms body delayed the return by 60 ms).
 - `engine.stats` returns `{ at, runs, stages, jobs, outbox }`. Each section is `{ available: true, ... }` or `{ available: false }` when the port behind it has no `getActiveWorkStats` (runs, stages, outbox) or `getJobStats` (jobs). It counts PENDING, RUNNING and SUSPENDED rows only, never terminal ones, and writes nothing. Ages are milliseconds on the kernel clock; `null` means nothing is waiting.
 
+### Starting runs promptly (`host.wake()`)
+
+`host.wake()` ends the job loop's idle wait (`jobPollIntervalMs`) and runs an orchestration tick now, so a run created between ticks starts within about a second instead of at the next tick. Calls coalesce: one that arrives while a tick or a job pass runs is remembered and exactly one more pass of that kind follows (never two at once). It is a no-op before `start()` and after `stop()`. The timers remain the fallback; a pause after a completed job (`postJobYieldMs`) or an error back-off finishes first. The tick is the whole tick and claims at most `maxClaimsPerTick` runs.
+
+The engine opens no `LISTEN` connection and adds no dependency (Prisma cannot listen). On PostgreSQL, `run.create` issues `pg_notify('workflow_engine_runs', <run id>)` for a new run (not for an idempotent replay), delivered at commit and dropped on rollback. Listen from your own session-level connection (not a transaction-mode pooler) and call `host.wake()`; wake once after every (re)subscribe, because notifications reach only connected listeners.
+
+```typescript
+// node-postgres
+import pg from "pg";
+const listener = new pg.Client({ connectionString: process.env.DATABASE_URL });
+listener.on("notification", () => host.wake());
+await listener.connect();
+await listener.query("LISTEN workflow_engine_runs");
+host.wake();
+
+// Bun 1.4 (sql.listen is supported; checked on 1.4.2): reconnects itself, and the
+// third callback runs after the first subscribe and after every reconnect
+import { SQL } from "bun";
+const sql = new SQL(process.env.DATABASE_URL!);
+await sql.listen("workflow_engine_runs", () => host.wake(), () => host.wake());
+```
+
+A process that creates and hosts runs can call `host.wake()` after the creating transaction commits (also on SQLite). The serverless host has no `wake()`: it has no loop to interrupt; call `runMaintenanceTick()` / `processAvailableJobs()` from whatever learns of the run. The reconnecting `pg` listener is in the docs site's Node host page.
+
 ### Worker Process Pattern
 
 ```typescript
