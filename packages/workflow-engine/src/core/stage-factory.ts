@@ -40,6 +40,7 @@ import {
   STEP_API_SETTLE_IN_FLIGHT,
   type StepApi,
   type StepInFlight,
+  type StepPollSchedule,
   type StepSuspend,
 } from "./steps.js";
 import type {
@@ -463,11 +464,11 @@ function buildStage<
         result = await definition.execute(enhancedContext);
       } catch (error) {
         if (isStepControlFlowError(error)) {
-          // Steps may run concurrently under Promise.all. Let the siblings
-          // still in flight finish and record before the stage suspends —
-          // otherwise the replay meets their live leases as StepInFlight.
-          await enhancedContext.step?.[STEP_API_SETTLE_IN_FLIGHT]?.();
-          return durableControlFlowResult(error);
+          // Let sibling runs finish and sibling waits record their schedules
+          // before committing the suspension.
+          const schedule =
+            await enhancedContext.step?.[STEP_API_SETTLE_IN_FLIGHT]?.(error);
+          return durableControlFlowResult(error, schedule);
         }
         await enhancedContext.step?.[STEP_API_SETTLE_IN_FLIGHT]?.();
         throw error;
@@ -480,8 +481,11 @@ function buildStage<
           "WARN",
           "execute() returned after a durable step requested suspension; the return value was discarded",
         );
-        await enhancedContext.step?.[STEP_API_SETTLE_IN_FLIGHT]?.();
-        return durableControlFlowResult(pendingSuspend);
+        const schedule =
+          await enhancedContext.step?.[STEP_API_SETTLE_IN_FLIGHT]?.(
+            pendingSuspend,
+          );
+        return durableControlFlowResult(pendingSuspend, schedule);
       }
 
       // If suspended, pass through with auto-filled metrics and derived poll config
@@ -631,69 +635,45 @@ function createEnhancedContext<
   return enhancedContext;
 }
 
-function durableSuspendedResult(error: StepSuspend): SuspendedResult {
-  const now = error.at;
-  const nextPollAt = error.nextPollAt;
-  const maxWaitTime = Math.max(0, error.maxWaitUntil.getTime() - now.getTime());
-  const pollInterval =
-    error.pollInterval ?? Math.max(0, nextPollAt.getTime() - now.getTime());
-
-  return {
-    suspended: true,
-    state: {
-      batchId: `step:${error.stepId}`,
-      submittedAt: now.toISOString(),
-      pollInterval,
-      maxWaitTime,
-      metadata: { [DURABLE_SUSPEND_MARKER]: true, stepId: error.stepId },
-    },
-    pollConfig: {
-      pollInterval,
-      maxWaitTime,
-      nextPollAt,
-    },
-    metrics: {
-      startTime: 0,
-      endTime: 0,
-      duration: 0,
-    },
-  };
-}
-
-function durableInFlightResult(error: StepInFlight): SuspendedResult {
-  const now = error.at;
-  const nextPollAt = new Date(now.getTime() + 5_000);
-  const maxWaitTime = DEFAULT_MAX_WAIT_TIME_MS;
-
-  return {
-    suspended: true,
-    state: {
-      batchId: `step:${error.stepId}`,
-      submittedAt: now.toISOString(),
-      pollInterval: 5_000,
-      maxWaitTime,
-      metadata: { [DURABLE_SUSPEND_MARKER]: true, stepId: error.stepId },
-    },
-    pollConfig: {
-      pollInterval: 5_000,
-      maxWaitTime,
-      nextPollAt,
-    },
-    metrics: {
-      startTime: 0,
-      endTime: 0,
-      duration: 0,
-    },
-  };
-}
-
 function durableControlFlowResult(
   error: StepSuspend | StepInFlight,
+  schedule?: StepPollSchedule,
 ): SuspendedResult {
-  if (error.name === "StepSuspend") {
-    return durableSuspendedResult(error as StepSuspend);
-  }
-  return durableInFlightResult(error as StepInFlight);
+  const now = error.at;
+  const suspension =
+    error.name === "StepSuspend" ? (error as StepSuspend) : undefined;
+  const originalPollAt =
+    suspension?.nextPollAt ?? new Date(now.getTime() + 5_000);
+  const originalDeadline =
+    suspension?.maxWaitUntil ??
+    new Date(now.getTime() + DEFAULT_MAX_WAIT_TIME_MS);
+  const earlierPoll = schedule && schedule.nextPollAt < originalPollAt;
+  const nextPollAt = earlierPoll ? schedule.nextPollAt : originalPollAt;
+  const maxWaitUntil =
+    schedule && schedule.maxWaitUntil < originalDeadline
+      ? schedule.maxWaitUntil
+      : originalDeadline;
+  const maxWaitTime = Math.max(0, maxWaitUntil.getTime() - now.getTime());
+  const pollInterval =
+    (earlierPoll ? schedule.pollInterval : suspension?.pollInterval) ??
+    Math.max(0, nextPollAt.getTime() - now.getTime());
+
+  return {
+    suspended: true,
+    state: {
+      batchId: `step:${error.stepId}`,
+      submittedAt: now.toISOString(),
+      pollInterval,
+      maxWaitTime,
+      metadata: { [DURABLE_SUSPEND_MARKER]: true, stepId: error.stepId },
+    },
+    pollConfig: { pollInterval, maxWaitTime, nextPollAt, maxWaitUntil },
+    metrics: {
+      startTime: 0,
+      endTime: 0,
+      duration: 0,
+    },
+  };
 }
 
 // ============================================================================

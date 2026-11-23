@@ -535,9 +535,9 @@ async function replayStage(
       const suspended = result as SuspendedResult;
       const nextPollAt = suspended.pollConfig.nextPollAt;
       const bufferedAnnotations = built.annotationBuffer.flush();
-      const maxWaitUntil = new Date(
-        deps.clock.now().getTime() + suspended.pollConfig.maxWaitTime,
-      );
+      const maxWaitUntil =
+        suspended.pollConfig.maxWaitUntil ??
+        new Date(deps.clock.now().getTime() + suspended.pollConfig.maxWaitTime);
       // A replay that is still waiting on the same durable step re-suspends
       // silently: the run already announced this suspension, and a poll
       // every few seconds must not re-emit `stage:suspended` /

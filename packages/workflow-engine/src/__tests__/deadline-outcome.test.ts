@@ -123,9 +123,9 @@ describe.skipIf(!realDatabase)(
       const t = await start(async (step) => {
         const answer = await step.waitForSignal<string>("answer", {
           onTimeout: "return",
-          timeout: "20m",
+          timeout: "15m",
         });
-        return answer.timedOut ? "try the next business" : answer.value;
+        return answer.timedOut ? "approval expired" : answer.value;
       });
 
       await expect(t.execute()).resolves.toMatchObject({
@@ -135,14 +135,14 @@ describe.skipIf(!realDatabase)(
         status: "pending",
         waitState: { onTimeout: "return" },
       });
-      clock.advance(20 * 60_000);
+      clock.advance(15 * 60_000);
       await t.tick();
       expect(await t.status()).toBe("COMPLETED");
       const { _artifactKey } = (await t.getStage())?.outputData as {
         _artifactKey: string;
       };
       expect(await db.blobStore.get(_artifactKey)).toEqual({
-        branch: "try the next business",
+        branch: "approval expired",
       });
       expect(await t.record()).toMatchObject({
         status: "completed",
@@ -163,6 +163,316 @@ describe.skipIf(!realDatabase)(
           (event) => event.eventType === "step:signalled",
         ),
       ).toEqual([]);
+    });
+
+    it.each([
+      { entry: "job", keepalive: "1h" },
+      { entry: "replay", keepalive: "1h" },
+      { entry: "job", keepalive: 35 },
+    ] as const)("wakes at the earliest parallel deadline during $entry suspension with a $keepalive keepalive", async ({
+      entry,
+      keepalive,
+    }) => {
+      let advanced = false;
+      const longSuspended = Promise.withResolvers<void>();
+      const stepLedger = override(db.stepLedger, {
+        async get(stageId, stepId) {
+          // Let the long wait reject first while preserving both claims.
+          if (stepId === "approval") await longSuspended.promise;
+          return db.stepLedger.get(stageId, stepId);
+        },
+      });
+      const t = await start(
+        async (step) => {
+          if (entry === "replay") {
+            await step.waitForSignal("start", {
+              timeout: 50,
+              onTimeout: "return",
+            });
+          }
+          const [, approval] = await Promise.all([
+            step
+              .waitForSignal("long", { timeout: "2h", keepalive })
+              .finally(() => longSuspended.resolve()),
+            step
+              .waitForSignal<string>("approval", {
+                timeout: 100,
+                onTimeout: "return",
+              })
+              .finally(() => {
+                // Exercise the gap between the short suspension and the
+                // stage write without moving the original deadline.
+                if (!advanced && keepalive === "1h") {
+                  advanced = true;
+                  clock.advance(10);
+                }
+              }),
+          ]);
+          return approval.timedOut ? "expired" : approval.value;
+        },
+        { stepLedger },
+      );
+      const started = clock.now().getTime() + (entry === "replay" ? 50 : 0);
+      await expect(t.execute()).resolves.toMatchObject({
+        outcome: "suspended",
+      });
+      const worker = t.worker({ stepLedger });
+      if (entry === "replay") {
+        clock.advance(50);
+        await t.tick(worker, "second");
+      }
+      const deadline = new Date(started + 100);
+      expect(clock.now().getTime()).toBe(
+        started + (keepalive === "1h" ? 10 : 0),
+      );
+      expect(await t.getStage()).toMatchObject({
+        nextPollAt:
+          typeof keepalive === "number"
+            ? new Date(started + keepalive)
+            : deadline,
+        maxWaitUntil: deadline,
+      });
+      if (typeof keepalive === "number") {
+        for (const time of [35, 70]) {
+          clock.set(new Date(started + time));
+          await t.tick(worker, "second");
+          expect(await t.getStage()).toMatchObject({
+            nextPollAt: new Date(started + Math.min(time + keepalive, 100)),
+            maxWaitUntil: deadline,
+          });
+        }
+      }
+      clock.set(new Date(started + 99));
+      await t.tick(worker, "second");
+      expect(await t.record("approval")).toMatchObject({ status: "pending" });
+      clock.advance(1);
+      await t.tick(worker, "second");
+      expect(await t.record("approval")).toMatchObject({
+        status: "completed",
+        waitState: { timedOut: true },
+      });
+      clock.advance(60_000);
+      await t.tick(worker, "second");
+      await expect(t.signal(worker, "late", "approval")).resolves.toMatchObject(
+        {
+          signalled: false,
+          timedOut: true,
+        },
+      );
+      await t.signal(worker, null, "long");
+      await t.tick(worker, "second");
+      expect(await t.status()).toBe("COMPLETED");
+      const { _artifactKey } = (await t.getStage())?.outputData as {
+        _artifactKey: string;
+      };
+      expect(await db.blobStore.get(_artifactKey)).toEqual({
+        branch: "expired",
+      });
+      expect(
+        events.getByType("step:signalled").map((event) => event.stepId),
+      ).toEqual(["long"]);
+    });
+
+    it("schedules a parallel poll's deadline while its external check is still running", async () => {
+      const checking = barrier();
+      const t = await start(async (step) => {
+        const [, approval] = await Promise.all([
+          step.waitForSignal("long", { timeout: "2h", keepalive: "1h" }),
+          step.waitFor("approval", {
+            timeout: 100,
+            every: "1h",
+            onTimeout: "return",
+            async poll() {
+              await checking.pause();
+              return false;
+            },
+            ready: (value) => value,
+          }),
+        ]);
+        return approval.timedOut ? "expired" : "approved";
+      });
+      const execution = t.execute();
+      try {
+        await checking.reached;
+        await expect(execution).resolves.toMatchObject({
+          outcome: "suspended",
+        });
+        expect((await t.getStage())?.nextPollAt).toEqual(
+          new Date(clock.now().getTime() + 100),
+        );
+        clock.advance(100);
+        await t.tick(t.worker(), "second");
+        expect(await t.record("approval")).toMatchObject({
+          status: "completed",
+          waitState: { timedOut: true },
+        });
+      } finally {
+        checking.release();
+        await execution;
+      }
+    });
+
+    it("includes a wait started by a parallel branch after a completed step", async () => {
+      const longSuspended = Promise.withResolvers<void>();
+      const t = await start(
+        async (step) => {
+          await Promise.all([
+            step
+              .waitForSignal("long", { timeout: "2h", keepalive: "1h" })
+              .finally(() => longSuspended.resolve()),
+            (async () => {
+              await step.waitForSignal("prerequisite", { timeout: "1h" });
+              await step.waitForSignal("approval", {
+                onTimeout: "return",
+                timeout: 100,
+              });
+            })(),
+          ]);
+          return "finished";
+        },
+        {
+          stepLedger: override(db.stepLedger, {
+            async get(stageId, stepId) {
+              if (stepId === "prerequisite") await longSuspended.promise;
+              return db.stepLedger.get(stageId, stepId);
+            },
+          }),
+        },
+      );
+      const worker = t.worker();
+      await t.signal(worker, null, "prerequisite");
+      await expect(t.execute()).resolves.toMatchObject({
+        outcome: "suspended",
+      });
+      const deadline = new Date(clock.now().getTime() + 100);
+      expect(await t.getStage()).toMatchObject({
+        nextPollAt: deadline,
+        maxWaitUntil: deadline,
+      });
+      clock.advance(100);
+      await t.tick(worker, "second");
+      expect(await t.record("approval")).toMatchObject({
+        status: "completed",
+        waitState: { timedOut: true },
+      });
+    });
+
+    it("starts a parallel branch's next wait on replay after an outstanding poll finishes", async () => {
+      const checking = barrier();
+      const branchFinished = Promise.withResolvers<void>();
+      const t = await start(async (step) => {
+        await Promise.all([
+          step.waitForSignal("long", { timeout: "2h", keepalive: "1h" }),
+          (async () => {
+            try {
+              await step.waitFor("ready", {
+                every: "5m",
+                timeout: "1h",
+                async poll() {
+                  await checking.pause();
+                  return true;
+                },
+                ready: (value) => value,
+              });
+              await step.waitForSignal("approval", {
+                onTimeout: "return",
+                timeout: 100,
+              });
+            } finally {
+              branchFinished.resolve();
+            }
+          })(),
+        ]);
+        return "finished";
+      });
+
+      const execution = t.execute();
+      try {
+        await checking.reached;
+        await expect(execution).resolves.toMatchObject({
+          outcome: "suspended",
+        });
+      } finally {
+        checking.release();
+        await execution;
+      }
+      await branchFinished.promise;
+      expect(await t.record("approval")).toBeNull();
+
+      clock.advance(5 * 60_000);
+      const worker = t.worker();
+      await t.tick(worker, "second");
+      const deadline = new Date(clock.now().getTime() + 100);
+      expect(await t.getStage()).toMatchObject({
+        nextPollAt: deadline,
+        maxWaitUntil: deadline,
+      });
+      clock.advance(100);
+      await t.tick(worker, "second");
+      expect(await t.record("approval")).toMatchObject({
+        status: "completed",
+        waitState: { timedOut: true },
+      });
+    });
+
+    it.each([
+      "existing wait",
+      "concurrent claim",
+    ] as const)("records a timeout when a signal finds an overdue %s before the next tick", async (path) => {
+      const t = await start(async (step) => {
+        const approval = await step.waitForSignal<string>("approval", {
+          timeout: 100,
+          onTimeout: "return",
+        });
+        return approval.timedOut ? "expired" : approval.value;
+      });
+      const missed = barrier();
+      const worker = t.worker(
+        path === "concurrent claim"
+          ? {
+              stepLedger: override(db.stepLedger, {
+                async get(stageId, stepId) {
+                  const record = await db.stepLedger.get(stageId, stepId);
+                  if (!record) await missed.pause();
+                  return record;
+                },
+              }),
+            }
+          : {},
+      );
+      const late =
+        path === "concurrent claim"
+          ? t.signal(worker, "late", "approval")
+          : undefined;
+      try {
+        if (late) await Promise.race([missed.reached, late]);
+        await expect(t.execute()).resolves.toMatchObject({
+          outcome: "suspended",
+        });
+        clock.advance(101);
+      } finally {
+        missed.release();
+      }
+      await expect(
+        late ?? t.signal(worker, "late", "approval"),
+      ).resolves.toMatchObject({
+        signalled: false,
+        alreadyCompleted: true,
+        timedOut: true,
+      });
+      expect(await t.record("approval")).toMatchObject({
+        status: "completed",
+        waitState: { timedOut: true },
+      });
+      await t.tick(worker, "second");
+      expect(await t.status()).toBe("COMPLETED");
+      const { _artifactKey } = (await t.getStage())?.outputData as {
+        _artifactKey: string;
+      };
+      expect(await db.blobStore.get(_artifactKey)).toEqual({
+        branch: "expired",
+      });
+      expect(events.getByType("step:signalled")).toEqual([]);
     });
 
     it("recovers after a worker stops after reading the timeout but before stage completion", async () => {

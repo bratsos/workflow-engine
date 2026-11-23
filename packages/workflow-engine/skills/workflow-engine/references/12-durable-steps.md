@@ -182,17 +182,19 @@ Suspension is a thrown control-flow error (`StepSuspend`, or `StepInFlight` when
 Set `onTimeout: "return"` on `waitForSignal` or `waitFor` when the stage can continue after the deadline.
 
 ```typescript
-const answer = await ctx.step.waitForSignal<{ accepted: boolean }>("business-answer", {
-  timeout: "20m",
+const approval = await ctx.step.waitForSignal<{ approved: boolean }>("approval", {
+  timeout: "15m",
   onTimeout: "return",
 });
-if (answer.timedOut) {
-  return { output: { next: "try-next-business" } };
+if (approval.timedOut) {
+  return { output: { status: "expired" } };
 }
-return { output: { next: answer.value.accepted ? "book" : "try-next-business" } };
+return { output: { status: approval.value.approved ? "approved" : "declined" } };
 ```
 
-The return type is `{ timedOut: false; value: T } | { timedOut: true }`. With `waitFor`, `value` is the ready poll's result and follows any type guard in `ready`. A signal sent before the wait also returns `{ timedOut: false, value }`. A reply and a timeout compete to complete the pending step. The first completion wins, and every replay reads the same outcome.
+The return type is `{ timedOut: false; value: T } | { timedOut: true }`. With `waitFor`, `value` is the ready poll's result and follows any type guard in `ready`. A signal sent before the wait also returns `{ timedOut: false, value }`. A signal and a deadline in the same tick compete to complete the pending step. The first completion wins, and every replay reads the same outcome. A signal strictly past an opted-in wait's deadline returns the timeout outcome even when the next maintenance tick has yet to process the wait.
+
+When waits run concurrently, the stage wakes at the earliest scheduled poll or deadline. A shorter wait keeps its original deadline across replays. A wake from another wait can run a polling callback before its own interval. If a poll finishes after the stage suspends, its branch starts new steps on replay.
 
 For a reusable options object, use `satisfies StepWaitOptions<T, "return">` or `satisfies StepSignalOptions<"return">` to preserve the literal timeout mode. The default options types keep returning `T`. If the options type allows either mode, the return type includes both the raw value and the wrapped outcome.
 

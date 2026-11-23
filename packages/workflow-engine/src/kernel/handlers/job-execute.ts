@@ -512,9 +512,11 @@ export async function handleJobExecute(
         suspendedState: state as any,
         nextPollAt,
         pollInterval: pollConfig.pollInterval,
-        maxWaitUntil: pollConfig.maxWaitTime
-          ? new Date(deps.clock.now().getTime() + pollConfig.maxWaitTime)
-          : undefined,
+        maxWaitUntil:
+          pollConfig.maxWaitUntil ??
+          (pollConfig.maxWaitTime
+            ? new Date(deps.clock.now().getTime() + pollConfig.maxWaitTime)
+            : undefined),
         metrics: metrics as any,
       });
 

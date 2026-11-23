@@ -22,8 +22,8 @@ export const STEP_API_PENDING_CONTROL_FLOW: unique symbol = Symbol.for(
 ) as typeof STEP_API_PENDING_CONTROL_FLOW;
 
 /**
- * Internal accessor used by the stage factory to let in-flight `run` steps
- * finish (and record) before a suspension leaves `execute()`.
+ * Internal accessor used by the stage factory to settle in-flight steps
+ * and collect their schedules before a suspension leaves `execute()`.
  */
 export const STEP_API_SETTLE_IN_FLIGHT: unique symbol = Symbol.for(
   "@bratsos/workflow-engine/step-api-settle-in-flight",
@@ -308,19 +308,23 @@ export interface StepApi {
   /**
    * Wait for every `run` step still executing in this invocation to settle,
    * bounded by the longest remaining lease. Steps may run concurrently under
-   * `Promise.all`; when one of them suspends, the siblings are given the
-   * chance to finish and record before the stage suspends, so the replay
-   * finds completed rows instead of live leases (`StepInFlight`).
+   * `Promise.all`. When suspending, also let sibling waits record their
+   * deadlines and collect their schedule for the next replay.
    */
-  readonly [STEP_API_SETTLE_IN_FLIGHT]?: () => Promise<void>;
+  readonly [STEP_API_SETTLE_IN_FLIGHT]?: (
+    suspension?: StepControlFlowError,
+  ) => Promise<StepPollSchedule | undefined>;
 }
 
-export interface StepSuspendOptions {
-  stepId: string;
-  at?: Date;
+export interface StepPollSchedule {
   nextPollAt: Date;
   maxWaitUntil: Date;
   pollInterval?: number;
+}
+
+export interface StepSuspendOptions extends StepPollSchedule {
+  stepId: string;
+  at?: Date;
   kind?: "wait" | "retry";
 }
 

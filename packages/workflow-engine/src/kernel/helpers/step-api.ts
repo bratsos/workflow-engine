@@ -4,6 +4,7 @@ import type {
   StepApi,
   StepControlFlowError,
   StepKeyUse,
+  StepPollSchedule,
   StepRunContext,
   StepRunOptions,
   StepSignalOptions,
@@ -329,6 +330,9 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
    */
   const requestedIds = new Map<string, StepKeyUse>();
   let pendingControlFlow: StepControlFlowError | undefined;
+  let suspendedBy: StepControlFlowError | undefined;
+  const waitCheckpoints = new Set<Promise<void>>();
+  const waitSchedules = new Map<string, StepPollSchedule>();
   const defaultLeaseMs = assertTimerMs(
     "defaultLeaseMs",
     options.defaultLeaseMs ?? DEFAULT_LEASE_MS,
@@ -344,10 +348,12 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
 
   function suspend(error: StepControlFlowError): never {
     pendingControlFlow ??= error;
+    if (error instanceof StepSuspend) waitSchedules.set(error.stepId, error);
     throw error;
   }
 
   function begin(id: string, kind: StepRecord["kind"]): StepInvocation {
+    if (suspendedBy) throw suspendedBy;
     if (!id) throw new Error("Durable step id must not be empty");
     const seq = ++nextSeq;
     const first = requestedIds.get(id);
@@ -597,6 +603,34 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
 
   const inFlight = new Set<InFlightRun>();
 
+  /** A wait's ledger setup can outlive the first rejection from Promise.all. */
+  function trackWait<T>(
+    id: string,
+    execute: (beforePoll: (schedule: StepPollSchedule) => void) => Promise<T>,
+  ): Promise<T> {
+    const { promise: checkpoint, resolve } = Promise.withResolvers<void>();
+    waitCheckpoints.add(checkpoint);
+    function checkpointReached() {
+      waitCheckpoints.delete(checkpoint);
+      resolve();
+    }
+    let polling: StepPollSchedule | undefined;
+    const result = execute((schedule) => {
+      polling = schedule;
+      waitSchedules.set(id, schedule);
+      checkpointReached();
+    });
+    const settled = () => {
+      if (polling && waitSchedules.get(id) === polling)
+        waitSchedules.delete(id);
+      checkpointReached();
+    };
+    // Release the checkpoint from the same promise the stage awaits, so a
+    // branch that resumes from this result can start its next wait.
+    void result.then(settled, settled);
+    return result;
+  }
+
   /**
    * Let every in-flight `run` finish so its ledger row is written before the
    * stage suspends. Bounded by the longest remaining lease: a step that
@@ -604,7 +638,9 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
    * that would otherwise block forever. Failures need no handling here —
    * `run` already recorded them as failed rows.
    */
-  async function settleInFlight(): Promise<void> {
+  async function settleInFlight(
+    suspension?: StepControlFlowError,
+  ): Promise<StepPollSchedule | undefined> {
     while (inFlight.size > 0) {
       const pending = [...inFlight];
       const boundMs = Math.max(
@@ -635,8 +671,32 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
           "WARN",
           `${pending.length} durable run step(s) outlived their lease while the stage was suspending`,
         );
-        return;
+        break;
       }
+    }
+    if (!suspension) return;
+    // Track only checkpointing. An external poll can still be in progress
+    // when another wait suspends the stage, so use its provisional schedule.
+    while (waitCheckpoints.size > 0) await Promise.all(waitCheckpoints);
+    // An outstanding poll can finish after this snapshot. Its result can be
+    // recorded, but a continuation must start new steps on replay.
+    suspendedBy = suspension;
+    let earliest: StepPollSchedule | undefined;
+    let maxWaitUntil: Date | undefined;
+    for (const schedule of waitSchedules.values()) {
+      if (!earliest || schedule.nextPollAt < earliest.nextPollAt) {
+        earliest = schedule;
+      }
+      if (!maxWaitUntil || schedule.maxWaitUntil < maxWaitUntil) {
+        maxWaitUntil = schedule.maxWaitUntil;
+      }
+    }
+    if (earliest && maxWaitUntil) {
+      return {
+        nextPollAt: earliest.nextPollAt,
+        pollInterval: earliest.pollInterval,
+        maxWaitUntil,
+      };
     }
   }
 
@@ -879,7 +939,11 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
       return completed.record.result as T;
     },
 
-    async waitFor<T>(id: string, opts: StepWaitOptions<T, StepTimeoutMode>) {
+    async waitFor<T>(
+      id: string,
+      opts: StepWaitOptions<T, StepTimeoutMode>,
+      beforePoll: (schedule: StepPollSchedule) => void,
+    ) {
       const invocation = begin(id, "wait");
       const existing = await get(invocation, "wait");
       if (existing?.status === "completed" || existing?.status === "failed") {
@@ -928,6 +992,12 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
       const aborted = abortError();
       if (aborted) throw aborted;
 
+      const savedEveryMs = record.waitState?.everyMs ?? everyMs;
+      beforePoll({
+        nextPollAt: boundedNextPoll(current, savedEveryMs, record.deadlineAt),
+        maxWaitUntil: record.deadlineAt,
+        pollInterval: savedEveryMs,
+      });
       let value: T;
       try {
         value = await opts.poll();
@@ -993,7 +1063,6 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
           return waitResult<T>(settled, opts.onTimeout);
         }
       }
-      const savedEveryMs = record.waitState?.everyMs ?? everyMs;
       suspend(
         new StepSuspend({
           stepId: id,
@@ -1117,7 +1186,18 @@ export function createStepApi(options: CreateStepApiOptions): StepApi {
   };
 
   const api = {
-    ...impl,
+    waitFor<T>(id: string, opts: StepWaitOptions<T, StepTimeoutMode>) {
+      return trackWait(id, (beforePoll) => impl.waitFor(id, opts, beforePoll));
+    },
+    waitForSignal<T = unknown>(
+      id: string,
+      opts: StepSignalOptions<StepTimeoutMode>,
+    ) {
+      return trackWait(id, () => impl.waitForSignal<T>(id, opts));
+    },
+    sleep(id: string, duration: number | string) {
+      return trackWait(id, () => impl.sleep(id, duration));
+    },
     /**
      * Steps may run concurrently under `Promise.all`. Each `run` is tracked
      * while it executes so a suspension elsewhere can wait for it (see
