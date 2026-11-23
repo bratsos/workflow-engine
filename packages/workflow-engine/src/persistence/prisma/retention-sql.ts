@@ -69,7 +69,10 @@ export function pruneRows(
     pg ? `"id" = ANY(ARRAY(${query}))` : `"id" IN (${query})`;
   // SQLite takes the statement's writer lock before selecting candidates.
   // Keep its outer mutation on the primary key, even with skewed statistics.
-  const recheck = (filter: string) => (pg ? ` AND ${filter}` : "");
+  // PostgreSQL rechecks rows changed concurrently through a sub-select, which
+  // no index or partial index predicate can match: statistics taken before a
+  // backlog became eligible cannot route the mutation through that backlog.
+  const recheck = (filter: string) => (pg ? ` AND (SELECT ${filter})` : "");
   let sql: string;
   switch (clause) {
     case "aiCalls":
